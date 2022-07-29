@@ -1,0 +1,23 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build Native: Debug Test",
+            "command": "cmake -DCMAKE_BUILD_TYPE=Debug . && make ukv_test",
+            "args": [],
+            "type": "shell"
+        },
+        {
+            "label": "Build Native: Debug",
+            "command": "cmake -DCMAKE_BUILD_TYPE=Debug . && make",
+            "args": [],
+            "type": "shell"
+        },
+        {
+            "label": "Build Native: Release",
+            "command": "cmake -DCMAKE_BUILD_TYPE=Release . && make",
+            "args": [],
+            "type": "shell"
+        }
+    ]
+}

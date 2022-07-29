@@ -1,0 +1,133 @@
+import org.gradle.internal.jvm.Jvm
+
+plugins {
+    id 'java-library'
+    id 'c'
+    id 'maven-publish'
+}
+
+group "com.unum.ukv"
+version = file("VERSION").text.trim()
+
+sourceCompatibility = 1.8
+targetCompatibility = 1.8
+
+repositories {
+    mavenCentral()
+}
+
+sourceSets {
+    main {
+        java {
+            srcDir "java/"
+            exclude "test/"
+        }
+    }
+    test {
+        java {
+            srcDir "java/test"
+        }
+    }
+}
+
+dependencies {
+    testImplementation('junit:junit:4.13.2')
+}
+
+model {
+    buildTypes{
+        stl
+        rocks
+        level
+    }
+
+    components {
+        ukv(NativeLibrarySpec) {
+            sources {
+                c {
+                    source {
+                        srcDirs "java/com/unum/ukv"
+                        include "**/*.c"
+                    }
+                    exportedHeaders {
+                        srcDirs "include", "${Jvm.current().javaHome}/include"
+                    }
+                }
+            }
+            binaries.withType(StaticLibraryBinarySpec) {
+                buildable = false
+            }
+            binaries.withType(SharedLibraryBinarySpec) {
+                if (targetPlatform.operatingSystem.linux) {
+                    cCompiler.args '-I', "${Jvm.current().javaHome}/include/linux"
+                    cCompiler.args '-D_FILE_OFFSET_BITS=64'
+                }
+
+                if (buildType == buildTypes.stl) {
+                    linker.args '-L', "${projectDir}/build/lib", "-l", "ukv_stl", "-l", "c"
+                } else if (buildType == buildTypes.rocks) {
+                    linker.args '-L', "${projectDir}/build/lib", "-l", "ukv_rocksdb", "-l", "rocksdb", "-l", "c"
+                } else if (buildType == buildTypes.level) {
+                    linker.args '-L', "${projectDir}/build/lib", "-l", "ukv_leveldb", "-l", "leveldb", "-l", "c"
+                }
+            }
+        }
+    }
+}
+
+test {
+    forkEvery 1
+
+    dependsOn jar
+
+    // Rearrange test classpath, add compiled JAR instead of main classes
+    classpath = project.sourceSets.test.output + configurations.testRuntimeClasspath + files(jar.archiveFile)
+}
+
+jar {
+    dependsOn("ukvStlSharedLibrary")
+    dependsOn("ukvRocksSharedLibrary")
+    dependsOn("ukvLevelSharedLibrary")
+
+    into("stl") {
+        from("$buildDir/libs/ukv/shared/stl/libukv.so")
+    }
+
+    into("rocks") {
+        from("$buildDir/libs/ukv/shared/rocks/libukv.so")
+    }
+
+    into("level") {
+        from("$buildDir/libs/ukv/shared/level/libukv.so")
+    }
+}
+
+publishing {
+    publications {
+        library(MavenPublication) {
+            from components.java
+
+            pom {
+                name = "UKV"
+                description = "Universal Key-Value store interface for both in-memory and persistent transactional collections for Java"
+                url = "https://github.com/unum-cloud/UKV"
+                licenses {
+                    license {
+                        name = 'The Apache License, Version 2.0'
+                        url = 'http://www.apache.org/licenses/LICENSE-2.0.txt'
+                    }
+                }
+            }
+        }
+    }
+    repositories {
+         maven {
+             name = "OSSRH"
+             url = "https://oss.sonatype.org/service/local/staging/deploy/maven2/"
+             credentials {
+                 username = System.getenv("MAVEN_USERNAME")
+                 password = System.getenv("MAVEN_PASSWORD")
+             }
+         }
+    }
+}
