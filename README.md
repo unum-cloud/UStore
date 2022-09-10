@@ -211,6 +211,6 @@ Having collections of both kinds would solve that.
 <details>
 <summary>Why not adapt MQL or Cypher?</summary>
 Mongo Query Language and Cypher by Neo4J are widely adopted, but are both vendor-specific.
-Futhermore, as for core functionality, using text-based protocols in 2022 is inefficient.
+Furthermore, as for core functionality, using text-based protocols in 2022 is inefficient.
 CRUD operations are implemented in all binary interfaces and for document-level patches well standardized JSON-Pointer, JSON-Patch and JSON-MergePAth RFCs have been implemented.
 </details>
