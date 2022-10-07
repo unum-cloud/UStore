@@ -311,52 +311,30 @@ TEST(db, paths) {
 
     arena_t arena(db);
     status_t status;
-    ukv_paths_write( //
-        db,
-        nullptr,
-        keys_count,
-        nullptr,
-        0,
-        nullptr,
-        0,
-        nullptr,
-        0,
-        keys,
-        sizeof(char const*),
-        nullptr,
-        nullptr,
-        0,
-        nullptr,
-        0,
-        reinterpret_cast<ukv_bytes_cptr_t*>(vals),
-        sizeof(char const*),
-        ukv_options_default_k,
-        separator,
-        arena.member_ptr(),
-        status.member_ptr());
-
+    ukv_paths_write_t paths_write {
+        .db = db,
+        .error = status.member_ptr(),
+        .arena = arena.member_ptr(),
+        .tasks_count = keys_count,
+        .path_separator = separator,
+        .paths = keys,
+        .paths_stride = sizeof(char const*),
+        .values_bytes = reinterpret_cast<ukv_bytes_cptr_t*>(vals),
+        .values_bytes_stride = sizeof(char const*),
+    };
+    ukv_paths_write(&paths_write);
     char* vals_recovered = nullptr;
-    ukv_paths_read( //
-        db,
-        nullptr,
-        keys_count,
-        nullptr,
-        0,
-        nullptr,
-        0,
-        nullptr,
-        0,
-        keys,
-        sizeof(char const*),
-        ukv_options_default_k,
-        separator,
-        nullptr,
-        nullptr,
-        nullptr,
-        reinterpret_cast<ukv_bytes_ptr_t*>(&vals_recovered),
-        arena.member_ptr(),
-        status.member_ptr());
-
+    ukv_paths_read_t paths_read {
+        .db = db,
+        .error = status.member_ptr(),
+        .arena = arena.member_ptr(),
+        .tasks_count = keys_count,
+        .path_separator = separator,
+        .paths = keys,
+        .paths_stride = sizeof(char const*),
+        .values = reinterpret_cast<ukv_bytes_ptr_t*>(&vals_recovered),
+    };
+    ukv_paths_read(&paths_read);
     EXPECT_TRUE(status);
     EXPECT_EQ(std::string_view(vals_recovered, keys_count * 2),
               std::string_view("F\0A\0A\0N\0G\0N\0A\0", keys_count * 2));
@@ -369,13 +347,13 @@ TEST(db, paths) {
     ukv_char_t* tape_begin = nullptr;
     ukv_paths_match_t paths_match {
         .db = db,
+        .error = status.member_ptr(),
+        .arena = arena.member_ptr(),
         .patterns = &prefix,
         .match_counts_limits = &max_count,
         .match_counts = &results_counts,
         .paths_offsets = &tape_offsets,
         .paths_strings = &tape_begin,
-        .arena = arena.member_ptr(),
-        .error = status.member_ptr(),
     };
     ukv_paths_match(&paths_match);
     auto first_match_for_a = std::string_view(tape_begin);
@@ -447,6 +425,23 @@ TEST(db, paths_linked_list) {
     ukv_char_t separator = '\0';
     status_t status;
 
+    ukv_paths_write_t paths_write {
+        .db = db,
+        .error = status.member_ptr(),
+        .arena = arena.member_ptr(),
+        .path_separator = separator,
+    };
+
+    ukv_paths_read_t paths_read {
+        .db = db,
+        .error = status.member_ptr(),
+        .arena = arena.member_ptr(),
+        .path_separator = separator,
+        // .paths = keys,
+        // .paths_stride = sizeof(char const*),
+        // .values = reinterpret_cast<ukv_bytes_ptr_t*>(&vals_recovered),
+    };
+
     // Generate some random strings for our tests
     constexpr auto alphabet = "abcdefghijklmnop";
     auto make_random_str = []() {
@@ -470,53 +465,16 @@ TEST(db, paths_linked_list) {
     for (std::size_t i = 0; i + 1 != begins.size(); ++i) {
         ukv_str_view_t smaller = begins[i];
         ukv_str_view_t bigger = begins[i + 1];
-        ukv_paths_write( //
-            db,
-            nullptr,
-            1,
-            nullptr,
-            0,
-            nullptr,
-            0,
-            nullptr,
-            0,
-            &smaller,
-            0,
-            nullptr,
-            nullptr,
-            0,
-            nullptr,
-            0,
-            reinterpret_cast<ukv_bytes_cptr_t*>(&bigger),
-            0,
-            ukv_options_default_k,
-            separator,
-            arena.member_ptr(),
-            status.member_ptr());
+        paths_write.paths = &smaller;
+        paths_write.values_bytes = reinterpret_cast<ukv_bytes_cptr_t*>(&bigger);
+        ukv_paths_write(&paths_write);
         EXPECT_TRUE(status);
 
         // Check if it was successfully written:
         ukv_str_span_t bigger_received = nullptr;
-        ukv_paths_read( //
-            db,
-            nullptr,
-            1,
-            nullptr,
-            0,
-            nullptr,
-            0,
-            nullptr,
-            0,
-            &smaller,
-            0,
-            ukv_options_default_k,
-            separator,
-            nullptr,
-            nullptr,
-            nullptr,
-            reinterpret_cast<ukv_bytes_ptr_t*>(&bigger_received),
-            arena.member_ptr(),
-            status.member_ptr());
+        paths_read.paths = &smaller;
+        paths_read.values = reinterpret_cast<ukv_bytes_ptr_t*>(&bigger_received);
+        ukv_paths_read(&paths_read);
         EXPECT_TRUE(status);
         EXPECT_EQ(std::string_view(bigger), std::string_view(bigger_received));
     }
@@ -526,26 +484,9 @@ TEST(db, paths_linked_list) {
         ukv_str_view_t smaller = begins[i];
         ukv_str_view_t bigger = begins[i + 1];
         ukv_str_span_t bigger_received = nullptr;
-        ukv_paths_read( //
-            db,
-            nullptr,
-            1,
-            nullptr,
-            0,
-            nullptr,
-            0,
-            nullptr,
-            0,
-            &smaller,
-            0,
-            ukv_options_default_k,
-            separator,
-            nullptr,
-            nullptr,
-            nullptr,
-            reinterpret_cast<ukv_bytes_ptr_t*>(&bigger_received),
-            arena.member_ptr(),
-            status.member_ptr());
+        paths_read.paths = &smaller;
+        paths_read.values = reinterpret_cast<ukv_bytes_ptr_t*>(&bigger_received);
+        ukv_paths_read(&paths_read);
         EXPECT_TRUE(status);
         EXPECT_EQ(std::string_view(bigger), std::string_view(bigger_received));
     }
@@ -554,53 +495,16 @@ TEST(db, paths_linked_list) {
     for (std::size_t i = 0; i + 1 != begins.size(); ++i) {
         ukv_str_view_t smaller = begins[i];
         ukv_str_view_t bigger = begins[i + 1];
-        ukv_paths_write( //
-            db,
-            nullptr,
-            1,
-            nullptr,
-            0,
-            nullptr,
-            0,
-            nullptr,
-            0,
-            &bigger,
-            0,
-            nullptr,
-            nullptr,
-            0,
-            nullptr,
-            0,
-            reinterpret_cast<ukv_bytes_cptr_t*>(&smaller),
-            0,
-            ukv_options_default_k,
-            separator,
-            arena.member_ptr(),
-            status.member_ptr());
+        paths_write.paths = &smaller;
+        paths_write.values_bytes = reinterpret_cast<ukv_bytes_cptr_t*>(&bigger);
+        ukv_paths_write(&paths_write);
         EXPECT_TRUE(status);
 
         // Check if it was successfully over-written:
         ukv_str_span_t smaller_received = nullptr;
-        ukv_paths_read( //
-            db,
-            nullptr,
-            1,
-            nullptr,
-            0,
-            nullptr,
-            0,
-            nullptr,
-            0,
-            &bigger,
-            0,
-            ukv_options_default_k,
-            separator,
-            nullptr,
-            nullptr,
-            nullptr,
-            reinterpret_cast<ukv_bytes_ptr_t*>(&smaller_received),
-            arena.member_ptr(),
-            status.member_ptr());
+        paths_read.paths = &bigger;
+        paths_read.values = reinterpret_cast<ukv_bytes_ptr_t*>(&smaller_received);
+        ukv_paths_read(&paths_read);
         EXPECT_TRUE(status);
         EXPECT_EQ(std::string_view(smaller), std::string_view(smaller_received));
     }
@@ -610,26 +514,9 @@ TEST(db, paths_linked_list) {
         ukv_str_view_t smaller = begins[i];
         ukv_str_view_t bigger = begins[i + 1];
         ukv_str_span_t smaller_received = nullptr;
-        ukv_paths_read( //
-            db,
-            nullptr,
-            1,
-            nullptr,
-            0,
-            nullptr,
-            0,
-            nullptr,
-            0,
-            &bigger,
-            0,
-            ukv_options_default_k,
-            separator,
-            nullptr,
-            nullptr,
-            nullptr,
-            reinterpret_cast<ukv_bytes_ptr_t*>(&smaller_received),
-            arena.member_ptr(),
-            status.member_ptr());
+        paths_read.paths = &bigger;
+        paths_read.values = reinterpret_cast<ukv_bytes_ptr_t*>(&smaller_received);
+        ukv_paths_read(&paths_read);
         EXPECT_TRUE(status);
         EXPECT_EQ(std::string_view(smaller), std::string_view(smaller_received));
     }

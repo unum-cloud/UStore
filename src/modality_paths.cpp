@@ -242,56 +242,25 @@ void upsert_in_bucket( //
     bucket = {new_begin, new_bytes};
 }
 
-void ukv_paths_write( //
-    ukv_database_t const c_db,
-    ukv_transaction_t const c_txn,
-    ukv_size_t const c_tasks_count,
+void ukv_paths_write(ukv_paths_write_t* c_ptr) {
 
-    ukv_collection_t const* c_collections,
-    ukv_size_t const c_collections_stride,
-
-    ukv_length_t const* c_paths_offsets,
-    ukv_size_t const c_paths_offsets_stride,
-
-    ukv_length_t const* c_paths_lengths,
-    ukv_size_t const c_paths_lengths_stride,
-
-    ukv_str_view_t const* c_paths,
-    ukv_size_t const c_paths_stride,
-
-    ukv_octet_t const* c_values_presences,
-
-    ukv_length_t const* c_values_offsets,
-    ukv_size_t const c_values_offsets_stride,
-
-    ukv_length_t const* c_values_lengths,
-    ukv_size_t const c_values_lengths_stride,
-
-    ukv_bytes_cptr_t const* c_values_bytes,
-    ukv_size_t const c_values_bytes_stride,
-
-    ukv_options_t const c_options,
-    ukv_char_t const c_separator,
-
-    ukv_arena_t* c_arena,
-    ukv_error_t* c_error) {
-
-    stl_arena_t arena = prepare_arena(c_arena, c_options, c_error);
-    return_on_error(c_error);
+    ukv_paths_write_t& c = *c_ptr;
+    stl_arena_t arena = prepare_arena(c.arena, c.options, c.error);
+    return_on_error(c.error);
 
     contents_arg_t keys_str_args;
-    keys_str_args.offsets_begin = {c_paths_offsets, c_paths_offsets_stride};
-    keys_str_args.lengths_begin = {c_paths_lengths, c_paths_lengths_stride};
-    keys_str_args.contents_begin = {(ukv_bytes_cptr_t const*)c_paths, c_paths_stride};
-    keys_str_args.count = c_tasks_count;
+    keys_str_args.offsets_begin = {c.paths_offsets, c.paths_offsets_stride};
+    keys_str_args.lengths_begin = {c.paths_lengths, c.paths_lengths_stride};
+    keys_str_args.contents_begin = {(ukv_bytes_cptr_t const*)c.paths, c.paths_stride};
+    keys_str_args.count = c.tasks_count;
 
-    auto unique_col_keys = arena.alloc<collection_key_t>(c_tasks_count, c_error);
-    return_on_error(c_error);
+    auto unique_col_keys = arena.alloc<collection_key_t>(c.tasks_count, c.error);
+    return_on_error(c.error);
 
     // Parse and hash input string unique_col_keys
     hash_t hash;
-    strided_iterator_gt<ukv_collection_t const> collections {c_collections, c_collections_stride};
-    for (std::size_t i = 0; i != c_tasks_count; ++i)
+    strided_iterator_gt<ukv_collection_t const> collections {c.collections, c.collections_stride};
+    for (std::size_t i = 0; i != c.tasks_count; ++i)
         unique_col_keys[i] = {collections ? collections[i] : ukv_collection_main_k, hash(keys_str_args[i])};
 
     // We must sort and deduplicate this bucket IDs
@@ -311,10 +280,10 @@ void ukv_paths_write( //
     unique_places.keys_begin = unique_col_keys_strided.members(&collection_key_t::key).begin();
     unique_places.fields_begin = {};
     unique_places.count = static_cast<ukv_size_t>(unique_col_keys.size());
-    auto opts = c_txn ? ukv_options_t(c_options & ~ukv_option_transaction_dont_watch_k) : c_options;
+    auto opts = c.transaction ? ukv_options_t(c.options & ~ukv_option_transaction_dont_watch_k) : c.options;
     ukv_read( //
-        c_db,
-        c_txn,
+        c.db,
+        c.transaction,
         unique_places.count,
         unique_places.collections_begin.get(),
         unique_places.collections_begin.stride(),
@@ -326,22 +295,22 @@ void ukv_paths_write( //
         nullptr,
         &buckets_values,
         &buckets_arena,
-        c_error);
-    return_on_error(c_error);
+        c.error);
+    return_on_error(c.error);
 
     joined_bins_t joined_buckets {unique_places.count, buckets_offsets, buckets_values};
-    uninitialized_vector_gt<value_view_t> updated_buckets(unique_places.count, arena, c_error);
-    return_on_error(c_error);
+    uninitialized_vector_gt<value_view_t> updated_buckets(unique_places.count, arena, c.error);
+    return_on_error(c.error);
     transform_n(joined_buckets.begin(), unique_places.count, updated_buckets.begin());
 
-    strided_iterator_gt<ukv_octet_t const> presences {c_values_presences, sizeof(ukv_octet_t)};
-    strided_iterator_gt<ukv_length_t const> offs {c_values_offsets, c_values_offsets_stride};
-    strided_iterator_gt<ukv_length_t const> lens {c_values_lengths, c_values_lengths_stride};
-    strided_iterator_gt<ukv_bytes_cptr_t const> vals {c_values_bytes, c_values_bytes_stride};
-    contents_arg_t contents {presences, offs, lens, vals, c_tasks_count};
+    strided_iterator_gt<ukv_octet_t const> presences {c.values_presences, sizeof(ukv_octet_t)};
+    strided_iterator_gt<ukv_length_t const> offs {c.values_offsets, c.values_offsets_stride};
+    strided_iterator_gt<ukv_length_t const> lens {c.values_lengths, c.values_lengths_stride};
+    strided_iterator_gt<ukv_bytes_cptr_t const> vals {c.values_bytes, c.values_bytes_stride};
+    contents_arg_t contents {presences, offs, lens, vals, c.tasks_count};
 
     // Update every unique bucket
-    for (std::size_t i = 0; i != c_tasks_count; ++i) {
+    for (std::size_t i = 0; i != c.tasks_count; ++i) {
         std::string_view key_str = keys_str_args[i];
         ukv_key_t key = hash(key_str);
         value_view_t new_val = contents[i];
@@ -350,8 +319,8 @@ void ukv_paths_write( //
         value_view_t& bucket = updated_buckets[bucket_idx];
 
         if (new_val) {
-            upsert_in_bucket(bucket, key_str, new_val, arena, c_error);
-            return_on_error(c_error);
+            upsert_in_bucket(bucket, key_str, new_val, arena, c.error);
+            return_on_error(c.error);
         }
         else
             remove_from_bucket(bucket, key_str);
@@ -359,8 +328,8 @@ void ukv_paths_write( //
 
     // Once all is updated, we can safely write back
     ukv_write( //
-        c_db,
-        c_txn,
+        c.db,
+        c.transaction,
         unique_places.count,
         unique_places.collections_begin.get(),
         unique_places.collections_begin.stride(),
@@ -375,56 +344,31 @@ void ukv_paths_write( //
         sizeof(value_view_t),
         opts,
         &buckets_arena,
-        c_error);
+        c.error);
 }
 
-void ukv_paths_read( //
-    ukv_database_t const c_db,
-    ukv_transaction_t const c_txn,
-    ukv_size_t const c_tasks_count,
+void ukv_paths_read(ukv_paths_read_t* c_ptr) {
 
-    ukv_collection_t const* c_collections,
-    ukv_size_t const c_collections_stride,
-
-    ukv_length_t const* c_paths_offsets,
-    ukv_size_t const c_paths_offsets_stride,
-
-    ukv_length_t const* c_paths_lengths,
-    ukv_size_t const c_paths_lengths_stride,
-
-    ukv_str_view_t const* c_paths,
-    ukv_size_t const c_paths_stride,
-
-    ukv_options_t const c_options,
-    ukv_char_t const,
-
-    ukv_octet_t** c_presences,
-    ukv_length_t** c_offsets,
-    ukv_length_t** c_lengths,
-    ukv_byte_t** c_values,
-
-    ukv_arena_t* c_arena,
-    ukv_error_t* c_error) {
-
-    stl_arena_t arena = prepare_arena(c_arena, c_options, c_error);
-    return_on_error(c_error);
+    ukv_paths_read_t& c = *c_ptr;
+    stl_arena_t arena = prepare_arena(c.arena, c.options, c.error);
+    return_on_error(c.error);
 
     contents_arg_t keys_str_args;
-    keys_str_args.offsets_begin = {c_paths_offsets, c_paths_offsets_stride};
-    keys_str_args.lengths_begin = {c_paths_lengths, c_paths_lengths_stride};
-    keys_str_args.contents_begin = {(ukv_bytes_cptr_t const*)c_paths, c_paths_stride};
-    keys_str_args.count = c_tasks_count;
+    keys_str_args.offsets_begin = {c.paths_offsets, c.paths_offsets_stride};
+    keys_str_args.lengths_begin = {c.paths_lengths, c.paths_lengths_stride};
+    keys_str_args.contents_begin = {(ukv_bytes_cptr_t const*)c.paths, c.paths_stride};
+    keys_str_args.count = c.tasks_count;
 
     // Getting hash-collisions is such a rare case, that we will not
     // optimize for it in the current implementation. Sorting and
     // deduplicating the IDs will cost more overall, than a repeated
     // read every once in a while.
-    auto buckets_keys = arena.alloc<ukv_key_t>(c_tasks_count, c_error);
-    return_on_error(c_error);
+    auto buckets_keys = arena.alloc<ukv_key_t>(c.tasks_count, c.error);
+    return_on_error(c.error);
 
     // Parse and hash input string buckets_keys
     hash_t hash;
-    for (std::size_t i = 0; i != c_tasks_count; ++i)
+    for (std::size_t i = 0; i != c.tasks_count; ++i)
         buckets_keys[i] = hash(keys_str_args[i]);
 
     // Read from disk
@@ -436,32 +380,32 @@ void ukv_paths_read( //
     ukv_length_t* buckets_offsets = nullptr;
     ukv_byte_t* buckets_values = nullptr;
     ukv_read( //
-        c_db,
-        c_txn,
-        c_tasks_count,
-        c_collections,
-        c_collections_stride,
+        c.db,
+        c.transaction,
+        c.tasks_count,
+        c.collections,
+        c.collections_stride,
         buckets_keys.begin(),
         sizeof(ukv_key_t),
-        c_options,
+        c.options,
         nullptr,
         &buckets_offsets,
         nullptr,
         &buckets_values,
         &buckets_arena,
-        c_error);
-    return_on_error(c_error);
+        c.error);
+    return_on_error(c.error);
 
     // Some of the entries will contain more then one key-value pair in case of collisions.
     ukv_length_t exported_volume = 0;
-    joined_bins_t buckets {c_tasks_count, buckets_offsets, buckets_values};
-    auto presences = arena.alloc_or_dummy<ukv_octet_t>(divide_round_up<std::size_t>(c_tasks_count, bits_in_byte_k),
-                                                       c_error,
-                                                       c_presences);
-    auto lengths = arena.alloc_or_dummy<ukv_length_t>(c_tasks_count, c_error, c_lengths);
-    auto offsets = arena.alloc_or_dummy<ukv_length_t>(c_tasks_count, c_error, c_offsets);
+    joined_bins_t buckets {c.tasks_count, buckets_offsets, buckets_values};
+    auto presences = arena.alloc_or_dummy<ukv_octet_t>(divide_round_up<std::size_t>(c.tasks_count, bits_in_byte_k),
+                                                       c.error,
+                                                       c.presences);
+    auto lengths = arena.alloc_or_dummy<ukv_length_t>(c.tasks_count, c.error, c.lengths);
+    auto offsets = arena.alloc_or_dummy<ukv_length_t>(c.tasks_count, c.error, c.offsets);
 
-    for (std::size_t i = 0; i != c_tasks_count; ++i) {
+    for (std::size_t i = 0; i != c.tasks_count; ++i) {
         std::string_view key_str = keys_str_args[i];
         value_view_t bucket = buckets[i];
 
@@ -471,7 +415,7 @@ void ukv_paths_read( //
             presences[i] = true;
             offsets[i] = exported_volume;
             lengths[i] = static_cast<ukv_length_t>(val.size());
-            if (c_values)
+            if (c.values)
                 std::memmove(buckets_values + exported_volume, val.data(), val.size());
             buckets_values[exported_volume + val.size()] = ukv_byte_t {0};
             exported_volume += static_cast<ukv_length_t>(val.size()) + 1;
@@ -483,9 +427,9 @@ void ukv_paths_read( //
         }
     }
 
-    offsets[c_tasks_count] = exported_volume;
-    if (c_values)
-        *c_values = buckets_values;
+    offsets[c.tasks_count] = exported_volume;
+    if (c.values)
+        *c.values = buckets_values;
 }
 
 /**
@@ -496,7 +440,7 @@ void ukv_paths_read( //
 template <typename predicate_at>
 void scan_predicate( //
     ukv_database_t const c_db,
-    ukv_transaction_t const c_txn,
+    ukv_transaction_t const c_transaction,
     ukv_collection_t c_collection,
     std::string_view previous_path,
     ukv_length_t c_scan_limit,
@@ -518,7 +462,7 @@ void scan_predicate( //
         ukv_key_t* found_buckets_keys = nullptr;
         ukv_scan( //
             c_db,
-            c_txn,
+            c_transaction,
             1,
             &c_collection,
             0,
@@ -545,7 +489,7 @@ void scan_predicate( //
         ukv_byte_t* found_buckets_data = nullptr;
         ukv_read( //
             c_db,
-            c_txn,
+            c_transaction,
             found_buckets_count[0],
             &c_collection,
             0,
@@ -598,7 +542,7 @@ void scan_predicate( //
 
 void scan_prefix( //
     ukv_database_t const c_db,
-    ukv_transaction_t const c_txn,
+    ukv_transaction_t const c_transaction,
     ukv_collection_t c_collection,
     std::string_view prefix,
     std::string_view previous_path,
@@ -611,7 +555,7 @@ void scan_prefix( //
 
     scan_predicate( //
         c_db,
-        c_txn,
+        c_transaction,
         c_collection,
         previous_path,
         c_scan_limit,
@@ -639,7 +583,7 @@ static void pcre2_free(void*, void*) noexcept {
 
 void scan_regex( //
     ukv_database_t const c_db,
-    ukv_transaction_t const c_txn,
+    ukv_transaction_t const c_transaction,
     ukv_collection_t c_collection,
     std::string_view pattern,
     std::string_view previous_path,
@@ -677,7 +621,7 @@ void scan_regex( //
     if (!*c_error)
         scan_predicate( //
             c_db,
-            c_txn,
+            c_transaction,
             c_collection,
             previous_path,
             c_scan_limit,
@@ -707,7 +651,7 @@ void scan_regex( //
     pcre2_general_context_free(pcre2_context);
 }
 
-void ukv_paths_match(ukv_paths_match_t const* c_ptr) {
+void ukv_paths_match(ukv_paths_match_t* c_ptr) {
 
     ukv_paths_match_t const& c = *c_ptr;
     stl_arena_t arena = prepare_arena(c.arena, c.options, c.error);
@@ -741,7 +685,17 @@ void ukv_paths_match(ukv_paths_match_t const* c_ptr) {
         auto previous = previous_args[i];
         auto limit = scan_limits[i];
         auto func = is_prefix(pattern) ? &scan_prefix : &scan_regex;
-        func(c.db, c.txn, col, pattern, previous, limit, c.options, found_counts[i], found_paths, arena, c.error);
+        func(c.db,
+             c.transaction,
+             col,
+             pattern,
+             previous,
+             limit,
+             c.options,
+             found_counts[i],
+             found_paths,
+             arena,
+             c.error);
     }
 
     // Export the results
