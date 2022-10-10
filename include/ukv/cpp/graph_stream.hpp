@@ -20,7 +20,7 @@ class graph_stream_t {
 
     ukv_database_t db_ = nullptr;
     ukv_collection_t collection_ = ukv_collection_main_k;
-    ukv_transaction_t txn_ = nullptr;
+    ukv_transaction_t transaction_ = nullptr;
 
     edges_span_t fetched_edges_ = {};
     std::size_t fetched_offset_ = 0;
@@ -34,26 +34,29 @@ class graph_stream_t {
 
         status_t status;
         ukv_vertex_degree_t* degrees_per_vertex = nullptr;
-        ukv_key_t* neighborships_per_vertex = nullptr;
+        ukv_key_t* edges_per_vertex = nullptr;
         ukv_vertex_role_t role = ukv_vertex_role_any_k;
-        ukv_graph_find_edges(db_,
-                             txn_,
-                             vertices.count(),
-                             &collection_,
-                             0,
-                             vertices.begin().get(),
-                             vertices.stride(),
-                             &role,
-                             0,
-                             ukv_options_default_k,
-                             &degrees_per_vertex,
-                             &neighborships_per_vertex,
-                             arena_.member_ptr(),
-                             status.member_ptr());
+
+        ukv_graph_find_edges_t graph_find_edges {
+            .db = db_,
+            .error = status.member_ptr(),
+            .transaction = transaction_,
+            .arena = arena_.member_ptr(),
+            .tasks_count = vertices.count(),
+            .collections = &collection_,
+            .vertices_ids = vertices.begin().get(),
+            .vertices_stride = vertices.stride(),
+            .roles = &role,
+            .degrees_per_vertex = &degrees_per_vertex,
+            .edges_per_vertex = &edges_per_vertex,
+        };
+
+        ukv_graph_find_edges(&graph_find_edges);
+
         if (!status)
             return status;
 
-        auto edges_begin = reinterpret_cast<edge_t*>(neighborships_per_vertex);
+        auto edges_begin = reinterpret_cast<edge_t*>(edges_per_vertex);
         auto edges_count = transform_reduce_n(degrees_per_vertex, vertices.size(), 0ul, [](ukv_vertex_degree_t deg) {
             return deg == ukv_vertex_degree_missing_k ? 0 : deg;
         });
@@ -75,7 +78,7 @@ class graph_stream_t {
                    ukv_collection_t collection = ukv_collection_main_k,
                    std::size_t read_ahead_vertices = keys_stream_t::default_read_ahead_k,
                    ukv_transaction_t txn = nullptr)
-        : db_(db), collection_(collection), txn_(txn), arena_(db),
+        : db_(db), collection_(collection), transaction_(txn), arena_(db),
           vertex_stream_(db, collection, read_ahead_vertices, txn) {}
 
     graph_stream_t(graph_stream_t&&) = default;

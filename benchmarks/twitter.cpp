@@ -408,21 +408,21 @@ static void graph_construct_from_docs(bm::State& state) {
 
         // Insert or update those edges
         auto strided = edges(edges_array);
-        ukv_graph_upsert_edges( //
-            db,
-            nullptr,
-            count,
-            &collection_graph_k,
-            0,
-            strided.edge_ids.begin().get(),
-            strided.edge_ids.stride(),
-            strided.source_ids.begin().get(),
-            strided.source_ids.stride(),
-            strided.target_ids.begin().get(),
-            strided.target_ids.stride(),
-            ukv_options_default_k,
-            arena.member_ptr(),
-            status.member_ptr());
+        ukv_graph_upsert_edges_t graph_upsert_edges {
+            .db = db,
+            .error = status.member_ptr(),
+            .arena = arena.member_ptr(),
+            .tasks_count = count,
+            .collections = &collection_graph_k,
+            .edges_ids = strided.edge_ids.begin().get(),
+            .edges_stride = strided.edge_ids.stride(),
+            .sources_ids = strided.source_ids.begin().get(),
+            .sources_stride = strided.source_ids.stride(),
+            .targets_ids = strided.target_ids.begin().get(),
+            .targets_stride = strided.target_ids.stride(),
+        };
+
+        ukv_graph_upsert_edges(&graph_upsert_edges);
         status.throw_unhandled();
 
         received_bytes += fields_k * sizeof(std::uint64_t) * count;
@@ -450,21 +450,21 @@ static void graph_traverse_two_hops(bm::State& state) {
         ukv_vertex_role_t const role = ukv_vertex_role_any_k;
         ukv_vertex_degree_t* degrees = nullptr;
         ukv_key_t* ids_in_edges = nullptr;
-        ukv_graph_find_edges( //
-            db,
-            nullptr,
-            count,
-            &collection_graph_k,
-            0,
-            ids_tweets,
-            sizeof(ukv_key_t),
-            &role,
-            0,
-            ukv_options_default_k,
-            &degrees,
-            &ids_in_edges,
-            arena.member_ptr(),
-            status.member_ptr());
+
+        ukv_graph_find_edges_t graph_find_edges_first {
+            .db = db,
+            .error = status.member_ptr(),
+            .arena = arena.member_ptr(),
+            .tasks_count = count,
+            .collections = &collection_graph_k,
+            .vertices_ids = ids_tweets,
+            .vertices_stride = sizeof(ukv_key_t),
+            .roles = &role,
+            .degrees_per_vertex = &degrees,
+            .edges_per_vertex = &ids_in_edges,
+        };
+
+        ukv_graph_find_edges(&graph_find_edges_first);
         status.throw_unhandled();
 
         // Now keep only the unique objects
@@ -474,22 +474,22 @@ static void graph_traverse_two_hops(bm::State& state) {
         auto total_ids = total_edges * 3;
         auto unique_ids = sort_and_deduplicate(ids_in_edges, ids_in_edges + total_ids);
 
+        ukv_graph_find_edges_t graph_find_edges_second {
+            .db = db,
+            .error = status.member_ptr(),
+            .arena = arena.member_ptr(),
+            .options = ukv_option_dont_discard_memory_k,
+            .tasks_count = unique_ids,
+            .collections = &collection_graph_k,
+            .vertices_ids = ids_in_edges,
+            .vertices_stride = sizeof(ukv_key_t),
+            .roles = &role,
+            .degrees_per_vertex = &degrees,
+            .edges_per_vertex = &ids_in_edges,
+        };
+
         // Second hop
-        ukv_graph_find_edges( //
-            db,
-            nullptr,
-            unique_ids,
-            &collection_graph_k,
-            0,
-            ids_in_edges,
-            sizeof(ukv_key_t),
-            &role,
-            0,
-            ukv_option_dont_discard_memory_k,
-            &degrees,
-            &ids_in_edges,
-            arena.member_ptr(),
-            status.member_ptr());
+        ukv_graph_find_edges(&graph_find_edges_second);
         status.throw_unhandled();
 
         total_edges += std::transform_reduce(degrees, degrees + count, 0ul, plus, [](ukv_vertex_degree_t d) {

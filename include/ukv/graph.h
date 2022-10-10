@@ -114,27 +114,32 @@ extern ukv_vertex_degree_t ukv_vertex_degree_missing_k;
  * to `ukv_vertex_degree_missing_k`. For edges, you will have to check the
  * collection that stores the metadata of the edges.
  */
-void ukv_graph_find_edges( //
-    ukv_database_t const db,
-    ukv_transaction_t const txn,
-    ukv_size_t const tasks_count,
 
-    ukv_collection_t const* collections,
-    ukv_size_t const collections_stride,
+typedef struct ukv_graph_find_edges_t {
 
-    ukv_key_t const* vertices_ids,
-    ukv_size_t const vertices_stride,
+    ukv_database_t const db;
+    ukv_error_t* error;
+    ukv_transaction_t const transaction = NULL;
+    ukv_arena_t* arena = NULL;
+    ukv_options_t const options = ukv_options_default_k;
+    ukv_size_t const tasks_count = 1;
 
-    ukv_vertex_role_t const* roles,
-    ukv_size_t const roles_stride,
+    // Inputs:
+    ukv_collection_t const* collections = NULL;
+    ukv_size_t collections_stride = 0;
 
-    ukv_options_t const options,
+    ukv_key_t const* vertices_ids = NULL;
+    ukv_size_t vertices_stride = 0;
 
-    ukv_vertex_degree_t** degrees_per_vertex,
-    ukv_key_t** edges_per_vertex,
+    ukv_vertex_role_t const* roles = NULL;
+    ukv_size_t roles_stride = 0;
 
-    ukv_arena_t* arena,
-    ukv_error_t* error);
+    ukv_vertex_degree_t** degrees_per_vertex = NULL;
+    ukv_key_t** edges_per_vertex = NULL;
+
+} ukv_graph_find_edges_t;
+
+void ukv_graph_find_edges(ukv_graph_find_edges_t*);
 
 /**
  * @brief Inserts edges between provided vertices.
@@ -143,27 +148,32 @@ void ukv_graph_find_edges( //
  *                      Necessary for edges storing a lot of metadata.
  *                      Normal graphs would use `ukv_default_edge_id_k`.
  */
-void ukv_graph_upsert_edges( //
-    ukv_database_t const db,
-    ukv_transaction_t const txn,
-    ukv_size_t const tasks_count,
 
-    ukv_collection_t const* collections,
-    ukv_size_t const collections_stride,
+typedef struct ukv_graph_upsert_edges_t { //
 
-    ukv_key_t const* edges_ids,
-    ukv_size_t const edges_stride,
+    ukv_database_t const db;
+    ukv_error_t* error;
+    ukv_transaction_t const transaction = NULL;
+    ukv_arena_t* arena = NULL;
+    ukv_options_t const options = ukv_options_default_k;
+    ukv_size_t const tasks_count = 1;
 
-    ukv_key_t const* sources_ids,
-    ukv_size_t const sources_stride,
+    // Inputs:
+    ukv_collection_t const* collections = NULL;
+    ukv_size_t collections_stride = 0;
 
-    ukv_key_t const* targets_ids,
-    ukv_size_t const targets_stride,
+    ukv_key_t const* edges_ids = NULL;
+    ukv_size_t edges_stride = 0;
 
-    ukv_options_t const options,
+    ukv_key_t const* sources_ids = NULL;
+    ukv_size_t sources_stride = 0;
 
-    ukv_arena_t* arena,
-    ukv_error_t* error);
+    ukv_key_t const* targets_ids = NULL;
+    ukv_size_t targets_stride = 0;
+
+} ukv_graph_upsert_edges_t;
+
+void ukv_graph_upsert_edges(ukv_graph_upsert_edges_t*);
 
 /**
  * @brief Removed edges between provided vertices.
@@ -173,50 +183,60 @@ void ukv_graph_upsert_edges( //
  *                      If NULL is provided for a multi-graph with a deletion
  *                      request, all edges between mentioned nodes will be removed.
  */
-void ukv_graph_remove_edges( //
-    ukv_database_t const db,
-    ukv_transaction_t const txn,
-    ukv_size_t const tasks_count,
 
-    ukv_collection_t const* collections,
-    ukv_size_t const collections_stride,
+typedef struct ukv_graph_remove_edges_t { //
 
-    ukv_key_t const* edges_ids,
-    ukv_size_t const edges_stride,
+    ukv_database_t const db;
+    ukv_error_t* error;
+    ukv_transaction_t const transaction = NULL;
+    ukv_arena_t* arena = NULL;
+    ukv_options_t const options = ukv_options_default_k;
+    ukv_size_t const tasks_count = 1;
 
-    ukv_key_t const* sources_ids,
-    ukv_size_t const sources_stride,
+    // Inputs:
+    ukv_collection_t const* collections = NULL;
+    ukv_size_t collections_stride = 0;
 
-    ukv_key_t const* targets_ids,
-    ukv_size_t const targets_stride,
+    ukv_key_t const* edges_ids = NULL;
+    ukv_size_t edges_stride = 0;
 
-    ukv_options_t const options,
+    ukv_key_t const* sources_ids = NULL;
+    ukv_size_t sources_stride = 0;
 
-    ukv_arena_t* arena,
-    ukv_error_t* error);
+    ukv_key_t const* targets_ids = NULL;
+    ukv_size_t targets_stride = 0;
+
+} ukv_graph_remove_edges_t;
+
+void ukv_graph_remove_edges(ukv_graph_remove_edges_t*);
 
 /**
  * @brief Removes vertices and all connected edges from the graph.
  * @param roles[in] Needed only for @b Joining graphs.
  */
-void ukv_graph_remove_vertices( //
-    ukv_database_t const db,
-    ukv_transaction_t const txn,
-    ukv_size_t const tasks_count,
 
-    ukv_collection_t const* collections,
-    ukv_size_t const collections_stride,
+typedef struct ukv_graph_remove_vertices_t { //
 
-    ukv_key_t const* vertices_ids,
-    ukv_size_t const vertices_stride,
+    ukv_database_t const db;
+    ukv_error_t* error;
+    ukv_transaction_t const transaction = NULL;
+    ukv_arena_t* arena = NULL;
+    ukv_options_t const options = ukv_options_default_k;
+    ukv_size_t const tasks_count = 1;
 
-    ukv_vertex_role_t const* roles,
-    ukv_size_t const roles_stride,
+    // Inputs:
+    ukv_collection_t const* collections = NULL;
+    ukv_size_t collections_stride = 0;
 
-    ukv_options_t const options,
+    ukv_key_t const* vertices_ids = NULL;
+    ukv_size_t vertices_stride = 0;
 
-    ukv_arena_t* arena,
-    ukv_error_t* error);
+    ukv_vertex_role_t const* roles = NULL;
+    ukv_size_t roles_stride = 0;
+
+} ukv_graph_remove_vertices_t;
+
+void ukv_graph_remove_vertices(ukv_graph_remove_vertices_t*);
 
 #ifdef __cplusplus
 } /* end extern "C" */
