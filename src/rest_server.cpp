@@ -6,147 +6,6 @@
  * @brief A web server implementing @b REST backend on top of any other
  * UKV implementation using pre-release draft of C++23 Networking TS,
  * through the means of @b Boost.Beast, @b Boost.ASIO and @b NLohmann.JSON.
- *
- * @section Supported Endpoints
- *
- * Modifying single entries:
- * > PUT /one/id?col=str&txn=int&field=str:     Upserts data.
- * > POST /one/id?col=str&txn=int&field=str:    Inserts data.
- * > GET /one/id?col=str&txn=int&field=str:     Retrieves data.
- * > HEAD /one/id?col=str&txn=int&field=str:    Retrieves data length.
- * > DELETE /one/id?col=str&txn=int&field=str:  Deletes data.
- * This API drastically differs from batch APIs, as we can always provide
- * just a single collection name and a single key. In batch APIs we can't
- * properly pass that inside the query URI.
- *
- * Modifying collections:
- * > PUT /col/name:     Upserts a collection.
- * > DELETE /col/name:  Drops the entire collection.
- * > DELETE /col:       Clears the main collection.
- *
- * Global operations:
- * > DELETE /all/:              Clears the entire DB.
- * > GET /all/meta?query=str:   Retrieves DB metadata.
- *
- * Supporting transactions:
- * > GET /txn/client:   Returns: {id?: int, error?: str}
- * > DELETE /txn/id:    Drops the transaction and it's contents.
- * > POST /txn/id:      Commits and drops the transaction.
- *
- * @section Object Structure
- *
- * Every Key-Value pair can be encapsulated in a dictionary-like
- * or @b JSON-object-like structure. In it's most degenerate form it can be:
- *      {
- *          "_id": 42,      // Like with MongoDB, stores the identifier
- *          "_col": null,   // Stores NULL, or the string for named collections
- *          "_bin": "a6cd"  // Base64-encoded binary content of the value
- *      }
- *
- * When working with JSON exports, we can't properly represent binary values.
- * To be more efficient, we allow @b BSON, @b MsgPack, @b CBOR and other formats
- * for content exchange. Furthermore, a document may not have `_bin`, in which case
- * the entire body of the document (aside from `_id` and `_bin`) will be exported:
- *      {
- *          "_id": 42,                 ->       example/42:
- *          "_col": "example",         ->           { "name": "isaac",
- *          "name": "isaac",           ->             "lastname": "newton" }
- *          "lastname": "newton"
- *      }
- *
- * The final pruned object will be converted into MsgPack and serialized into the DB
- * as a binary value. On each export, the decoding will be done again for @b MIMEs:
- * > application/json:      https://datatracker.ietf.org/doc/html/rfc4627
- * > application/msgpack:   https://datatracker.ietf.org/doc/html/rfc6838
- * > application/cbor:      https://datatracker.ietf.org/doc/html/rfc7049
- * > application/bson:      https://bsonspec.org/
- * > application/ubjson
- * All of that is supported through the infamous "nlohmann/json" library with
- * native support for round-trip conversions between mentioned formats.
- *
- * @section Accessing Object Fields
- *
- * We support the JSON Pointer (RFC 6901) to access nested document fields via
- * a simple string path. On batched requests we support the optional "fields"
- * argument, which is a list of strings like: ["/name", "/mother/name"].
- * This allows users to only sample the parts of data they are need, without
- * overloading the network with useless transfers.
- *
- * Furthermore, we support JSON Patches (RFC 6902), for inplace modificiations.
- * So instead of using a custom proprietary protocol and query language, like in
- * MongoDB, one can perform standardized queries.
- *
- * @section Batched Operations
- *
- * Working with @b batched data in @b AOS:
- * > PUT /aos/:
- *      Receives: {objs:[obj], txn?: int, cols?: [str]|str, keys?: [int]}
- *      Returns: {error?: str}
- *      If `keys` aren't given, they are being sampled as `[x['_id'] for x in objs]`.
- *      If `cols` aren't given, they are being sampled as `[x['_col'] for x in objs]`.
- * > PATCH /aos/:
- *      Receives: {cols?: [str]|str, keys?: [int], patch: obj, txn?: int}
- *      Returns: {error?: str}
- *      If `keys` aren't given, the whole collection(s) is being patched.
- *      If `cols` are also skipped, the entire DB is patched.
- * > GET /aos/:
- *      Receives: {cols?: [str]|str, keys?: [int], fields?: [str], txn?: int}
- *      Returns: {objs?: [obj], error?: str}
- *      If `keys` aren't given, the whole collection(s) is being retrieved.
- *      If `cols` are also skipped, the entire DB is retrieved.
- * > DELETE /aos/:
- *      Receives: {cols?: [str]|str, keys?: [int], fields?: [str], txn?: int}
- *      Returns: {error?: str}
- * > HEAD /aos/:
- *      Receives: {cols?: [str]|str, keys?: [int], fields?: [str], txn?: int}
- *      Returns: {len?: int, error?: str}
- * The otional payload members define how to parse the payload:
- * > col: Means we should put all into one collection, disregarding the `_col` fields.
- * > txn: Means we should do the operation from within a specified transaction context.
- *
- * @section Supported HTTP Headers
- * Most of the HTTP headers aren't supported by this web server, as it implements
- * a very specific set of CRUD operations. However, the following headers are at
- * least partially implemented:
- *
- * > Cache-Control: no-store
- *      Means, that we should avoid caching the value in the DB on any request.
- *      https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Cache-Control
- * > If-Match: hash
- *      Performs conditional checks on the existing value before overwriting it.
- *      Those can be implemented by using Boosts CRC32 hash implementations for
- *      portability.
- *      https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/If-Match
- * > If-Unmodified-Since: <day-name>, <day> <month> <year> <hour>:<minute>:<second> GMT
- *      Performs conditional checks on operations, similar to transactions,
- *      but of preventive nature and on the scope of a single request.
- *      https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/If-Unmodified-Since
- * > Transfer-Encoding: gzip|deflate
- *      Describes, how the payload is compressed. Is different from `Content-Encoding`,
- *      which controls the entire session.
- *      https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Transfer-Encoding
- *
- * @section Upcoming Endpoints
- *
- * Working with @b batched data in tape-like @b SOA:
- * > PUT /soa/:
- *      Receives: {cols?: [str], keys: [int], txn?: int, lens: [int], tape: str}
- *      Returns: {error?: str}
- * > GET /soa/:
- *      Receives: {cols?: [str], keys: [int], fields?: [str], txn?: int}
- *      Returns: {lens?: [int], tape?: str, error?: str}
- * > DELETE /soa/:
- *      Receives: {cols?: [str], keys: [int], fields?: [str], txn?: int}
- *      Returns: {error?: str}
- * > HEAD /soa/:
- *      Receives: {col?: str, key: int, fields?: [str], txn?: int}
- *      Returns: {len?: int, error?: str}
- *
- * Working with @b batched data in @b Apache.Arrow format:
- * > GET /arrow/:
- *      Receives: {cols?: [str], keys: [int], fields: [str], txn?: int}
- *      Returns: Apache Arrow buffers
- * The result object will have the "application/vnd.apache.arrow.stream" @b MIME.
  */
 
 #include <cstdlib>
@@ -205,9 +64,9 @@ static constexpr char const* mime_cbor_k = "application/cbor";
 static constexpr char const* mime_bson_k = "application/bson";
 static constexpr char const* mime_ubjson_k = "application/ubjson";
 
-ukv_format_t mime_to_format(beast::string_view mime) {
+ukv_doc_field_type_t mime_to_format(beast::string_view mime) {
     if (mime == mime_json_k)
-        return ukv_format_json_k;
+        return ukv_field_json_k;
     else if (mime == "application/json-patch+json")
         return ukv_format_json_patch_k;
     else if (mime == mime_msgpack_k)
@@ -223,11 +82,11 @@ ukv_format_t mime_to_format(beast::string_view mime) {
     else if (mime == "application/vnd.apache.parquet")
         return ukv_format_parquet_k;
     else
-        return ukv_format_unknown_k;
+        return ukv_doc_field_default_k;
 }
 
 struct db_w_clients_t : public std::enable_shared_from_this<db_w_clients_t> {
-    db_t session;
+    database_t session;
     int running_transactions;
 };
 
@@ -278,8 +137,8 @@ void respond_to_one(db_session_t& session,
     http::verb received_verb = req.method();
     beast::string_view received_path = req.target();
 
-    txn_t txn(session.db());
-    collection_t collection;
+    transaction_t txn(session.db());
+    blobs_collection_t collection;
     ukv_key_t key = 0;
     ukv_options_t options = ukv_options_default_k;
 
@@ -300,17 +159,24 @@ void respond_to_one(db_session_t& session,
     }
 
     // Parse the collection name string.
-    if (auto col_val = param_value(params_str, "col="); col_val) {
-        char col_name_buffer[65] = {0};
-        std::memcpy(col_name_buffer, col_val->data(), std::min(col_val->size(), 64ul));
+    if (auto collection_val = param_value(params_str, "col="); collection_val) {
+        char collection_name_buffer[65] = {0};
+        std::memcpy(collection_name_buffer, collection_val->data(), std::min(collection_val->size(), 64ul));
 
         status_t status;
-        ukv_collection_open(session.db(), col_name_buffer, NULL, &collection.raw, error.member_ptr());
+        ukv_collection_create_t collection_init {
+            .db = session.db(),
+            .error = error.member_ptr(),
+            .name = collection_name_buffer,
+            .id = &collection.raw,
+        };
+
+        ukv_collection_create(&collection_init);
         if (!status)
             return send_response(make_error(req, http::status::internal_server_error, error.raw));
     }
 
-    // Once we know, which collection, key and transation user is
+    // Once we know, which collection, key and transaction user is
     // interested in - perform the actions depending on verbs.
     switch (received_verb) {
 
@@ -319,22 +185,24 @@ void respond_to_one(db_session_t& session,
 
         arena_t tape(session.db());
         status_t status;
-        ukv_read(session.db(),
-                 txn.raw,
-                 &collection.raw,
-                 0,
-                 &key,
-                 1,
-                 0,
-                 options,
-                 &tape.ptr,
-                 &tape.capacity,
-                 error.member_ptr());
+        ukv_read_t read {
+            .db = session.db(),
+            .error = error.member_ptr(),
+            .transaction = txn.raw,
+            .options = options,
+            .collections = &collection.raw,
+            .keys = &key,
+            .keys_stride = 1,
+            .lengths = &tape.capacity,
+            .values = &tape.ptr,
+        };
+
+        ukv_read(&read);
         if (!status)
             return send_response(make_error(req, http::status::internal_server_error, error.raw));
 
-        ukv_val_ptr_t begin = tape.ptr + sizeof(ukv_val_len_t);
-        ukv_val_len_t len = reinterpret_cast<ukv_val_len_t*>(tape.ptr)[0];
+        ukv_bytes_ptr_t begin = tape.ptr + sizeof(ukv_length_t);
+        ukv_length_t len = reinterpret_cast<ukv_length_t*>(tape.ptr)[0];
         if (!len)
             return send_response(make_error(req, http::status::not_found, "Missing key"));
 
@@ -361,21 +229,23 @@ void respond_to_one(db_session_t& session,
         arena_t tape(session.db());
         status_t status;
         options = ukv_option_read_lengths_k;
-        ukv_read(session.db(),
-                 txn.raw,
-                 &collection.raw,
-                 0,
-                 &key,
-                 1,
-                 0,
-                 options,
-                 &tape.ptr,
-                 &tape.capacity,
-                 error.member_ptr());
+        ukv_read_t read {
+            .db = session.db(),
+            .transaction = txn.raw,
+            .collections = &collection.raw,
+            .keys = &key,
+            .keys_stride = 1,
+            .options = options,
+            .lengths = &tape.capacity,
+            .values = &tape.ptr,
+            .error = error.member_ptr(),
+        };
+
+        ukv_read(&read);
         if (!status)
             return send_response(make_error(req, http::status::internal_server_error, error.raw));
 
-        ukv_val_len_t len = reinterpret_cast<ukv_val_len_t*>(tape.ptr)[0];
+        ukv_length_t len = reinterpret_cast<ukv_length_t*>(tape.ptr)[0];
         if (!len)
             return send_response(make_error(req, http::status::not_found, "Missing key"));
 
@@ -392,21 +262,23 @@ void respond_to_one(db_session_t& session,
         arena_t tape(session.db());
         status_t status;
         options = ukv_option_read_lengths_k;
-        ukv_read(session.db(),
-                 txn.raw,
-                 &collection.raw,
-                 0,
-                 &key,
-                 1,
-                 0,
-                 options,
-                 &tape.ptr,
-                 &tape.capacity,
-                 error.member_ptr());
+        ukv_read_t read {
+            .db = session.db(),
+            .transaction = txn.raw,
+            .collections = &collection.raw,
+            .keys = &key,
+            .keys_stride = 1,
+            .options = options,
+            .lengths = &tape.capacity,
+            .values = &tape.ptr,
+            .error = error.member_ptr(),
+        };
+
+        ukv_read(&read);
         if (!status)
             return send_response(make_error(req, http::status::internal_server_error, error.raw));
 
-        ukv_val_len_t len = reinterpret_cast<ukv_val_len_t*>(tape.ptr)[0];
+        ukv_length_t len = reinterpret_cast<ukv_length_t*>(tape.ptr)[0];
         if (len)
             return send_response(make_error(req, http::status::conflict, "Duplicate key"));
 
@@ -429,24 +301,23 @@ void respond_to_one(db_session_t& session,
 
         status_t status;
         auto value = req.body();
-        auto value_ptr = reinterpret_cast<ukv_val_ptr_t>(value.data());
-        auto value_len = static_cast<ukv_val_len_t>(*opt_payload_len);
-        ukv_val_len_t value_off = 0;
-        ukv_write(session.db(),
-                  txn.raw,
-                  &collection.raw,
-                  0,
-                  &key,
-                  1,
-                  0,
-                  &value_ptr,
-                  0,
-                  &value_off,
-                  0,
-                  &value_len,
-                  0,
-                  options,
-                  error.member_ptr());
+        auto value_ptr = reinterpret_cast<ukv_bytes_ptr_t>(value.data());
+        auto value_len = static_cast<ukv_length_t>(*opt_payload_len);
+        ukv_length_t value_off = 0;
+
+        ukv_write_t write {
+            .db = session.db(),
+            .error = error.member_ptr(),
+            .transaction = txn.raw,
+            .options = options.collections = &collection.raw,
+            .keys = &key,
+            .keys_stride = 1,
+            .offsets = &value_off,
+            .lengths = &value_len,
+            .values = &value_ptr,
+        };
+
+        ukv_write(&write);
         if (!status)
             return send_response(make_error(req, http::status::internal_server_error, error.raw));
 
@@ -461,24 +332,23 @@ void respond_to_one(db_session_t& session,
     case http::verb::delete_: {
 
         status_t status;
-        ukv_val_ptr_t value_ptr = nullptr;
-        ukv_val_len_t value_len = 0;
-        ukv_val_len_t value_off = 0;
-        ukv_write(session.db(),
-                  txn.raw,
-                  &collection.raw,
-                  0,
-                  &key,
-                  1,
-                  0,
-                  &value_ptr,
-                  0,
-                  &value_off,
-                  0,
-                  &value_len,
-                  0,
-                  options,
-                  error.member_ptr());
+        ukv_bytes_ptr_t value_ptr = nullptr;
+        ukv_length_t value_len = 0;
+        ukv_length_t value_off = 0;
+
+        ukv_write_t write {
+            .db = session.db(),
+            .error = error.member_ptr(),
+            .transaction = txn.raw,
+            .options = options.collections = &collection.raw,
+            .keys = &key,
+            .keys_stride = 1,
+            .offsets = &value_off,
+            .lengths = &value_len,
+            .values = &value_ptr,
+        };
+
+        ukv_write(&write);
         if (!status)
             return send_response(make_error(req, http::status::internal_server_error, error.raw));
 
@@ -504,8 +374,8 @@ void respond_to_aos(db_session_t& session,
     http::verb received_verb = req.method();
     beast::string_view received_path = req.target();
 
-    txn_t txn(session.db());
-    std::vector<collection_t> collections(session.db());
+    transaction_t txn(session.db());
+    std::vector<blobs_collection_t> collections(session.db());
     ukv_options_t options = ukv_options_default_k;
     std::vector<ukv_key_t> keys;
 
@@ -520,13 +390,20 @@ void respond_to_aos(db_session_t& session,
     }
 
     // Parse the collection name string.
-    if (auto col_val = param_value(params_str, "col="); col_val) {
-        char col_name_buffer[65] = {0};
-        std::memcpy(col_name_buffer, col_val->data(), std::min(col_val->size(), 64ul));
+    if (auto collection_val = param_value(params_str, "col="); collection_val) {
+        char collection_name_buffer[65] = {0};
+        std::memcpy(collection_name_buffer, collection_val->data(), std::min(collection_val->size(), 64ul));
 
         status_t status;
-        collection_t collection(session.db());
-        ukv_collection_open(session.db(), col_name_buffer, NULL, &collection.raw, error.member_ptr());
+        blobs_collection_t collection(session.db());
+        ukv_collection_create_t collection_init {
+            .db = session.db(),
+            .error = error.member_ptr(),
+            .name = collection_name_buffer,
+            .id = &collection.raw,
+        };
+
+        ukv_collection_create(&collection_init);
         if (!status)
             return send_response(make_error(req, http::status::internal_server_error, error.raw));
 
@@ -554,7 +431,7 @@ void respond_to_aos(db_session_t& session,
     auto payload_len = static_cast<ukv_size_t>(*opt_payload_len);
 
 #if 0
-    // Once we know, which collection, key and transation user is
+    // Once we know, which collection, key and transaction user is
     // interested in - perform the actions depending on verbs.
     //
     // Just write: PUT, DELETE without `fields`.
@@ -597,14 +474,14 @@ void respond_to_aos(db_session_t& session,
         if (!status)
             return send_response(make_error(req, http::status::internal_server_error, error.raw));
 
-        ukv_val_len_t const* values_lens = reinterpret_cast<ukv_val_len_t*>(tape.ptr);
-        ukv_val_ptr_t values_begin = tape.ptr + sizeof(ukv_val_len_t) * keys.size();
+        ukv_length_t const* values_lens = reinterpret_cast<ukv_length_t*>(tape.ptr);
+        ukv_bytes_ptr_t values_begin = tape.ptr + sizeof(ukv_length_t) * keys.size();
 
         std::size_t exported_bytes = 0;
         std::vector<json_t> parsed_vals(keys.size());
         for (std::size_t key_idx = 0; key_idx != keys.size(); ++key_idx) {
-            ukv_val_ptr_t begin = values_begin + exported_bytes;
-            ukv_val_len_t len = values_lens[key_idx];
+            ukv_bytes_ptr_t begin = values_begin + exported_bytes;
+            ukv_length_t len = values_lens[key_idx];
             json_t& val = parsed_vals[key_idx];
             if (!len)
                 continue;
@@ -666,7 +543,7 @@ void respond_to_aos(db_session_t& session,
 }
 
 /**
- * @brief Primary dispatch point, rounting incoming HTTP requests
+ * @brief Primary dispatch point, routing incoming HTTP requests
  *        into underlying UKV calls, preparing results and sending back.
  */
 template <typename body_at, typename allocator_at, typename send_response_at>
@@ -822,7 +699,7 @@ class web_db_session_t : public std::enable_shared_from_this<web_db_session_t> {
 
 /**
  * @brief Spins on sockets, listening for new connection requests.
- *        Once accepted, allocates and dispatches a new @c `web_db_session_t`.
+ *        Once accepted, allocates and dispatches a new @c web_db_session_t.
  */
 class listener_t : public std::enable_shared_from_this<listener_t> {
     net::io_context& io_context_;
@@ -913,7 +790,13 @@ int main(int argc, char* argv[]) {
     // Check if we can initialize the DB
     auto session = std::make_shared<db_w_clients_t>();
     status_t status;
-    ukv_open(db_config.c_str(), &session->raw, error.member_ptr());
+    ukv_database_init_t database {
+        .config = db_config.c_str(),
+        .db = &session->raw,
+        .error = error.member_ptr(),
+    };
+
+    ukv_database_init(&database);
     if (!status) {
         std::cerr << "Couldn't initialize DB: " << error.raw << std::endl;
         return EXIT_FAILURE;
