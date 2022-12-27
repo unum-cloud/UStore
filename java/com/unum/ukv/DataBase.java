@@ -14,47 +14,50 @@ import java.util.Arrays; // Arrays.equals
  *        ACID Transactions and mind-boggling speed,
  *        implemented in C/C++/CUDA and wrapped into JNI.
  *
- * @section API Usage
- *          We provide two primary classes: `Context` and `Transaction`.
- *          You start by creating a `Context` to link to the underlying DB,
- *          allocate memory and perform CRUD operations on the "HEAD" state.
- *          Those operations will not be consistent and may even partially fail
- *          without you knowing, which part of the input was absorbed.
+ * ## API Usage
  *
- *          To make your operations ACID, you must request a `ctx.transaction()`
- *          which will encapsulate all your reads & updates. The interface of
- *          the "HEAD" and transaction-based operations is identical.
+ * We provide two primary classes: `Context` and `Transaction`.
+ * You start by creating a `Context` to link to the underlying DB,
+ * allocate memory and perform CRUD operations on the "HEAD" state.
+ * Those operations will not be consistent and may even partially fail
+ * without you knowing, which part of the input was absorbed.
  *
- *          In both cases we mimic native Java `HashMap` & `Dictionary` classes.
- *          Aside from that, most objects are `AutoCloseable`, to simplify the
- *          resource usage and potentially auto-commit transactions on cleanup.
+ * To make your operations ACID, you must request a `ctx.transaction()`
+ * which will encapsulate all your reads & updates. The interface of
+ * the "HEAD" and transaction-based operations is identical.
  *
- *          Furthermore, each DB has both a "primary" collection and "named"
- *          collections. To access those, pass the `String` name of the target
- *          collection as the first argument to any of the following functions:
- *          > containsKey(key)
- *          > put(key, value)
- *          > get(key)
- *          > remove(key)
- *          > remove(key, value)
- *          > replace(key, value)
- *          > putIfAbsent(key, value)
- *          > getOrDefault(key, defaultValue)
- *          > putAll(Map<Key, Value>)
- *          You can expect similar behavior to native classes described here:
- *          https://docs.oracle.com/javase/7/docs/api/java/util/Dictionary.html
- *          https://docs.oracle.com/javase/7/docs/api/java/util/Hashtable.html
+ * In both cases we mimic native Java `HashMap` & `Dictionary` classes.
+ * Aside from that, most objects are `AutoCloseable`, to simplify the
+ * resource usage and potentially auto-commit transactions on cleanup.
  *
- *          In case of transactions you also get:
- *          > rollback: To reset the state of the transaction.
- *          > commit: To submit the transaction to underlying DBMS.
+ * Furthermore, each DB has both a "primary" collection and "named"
+ * collections. To access those, pass the `String` name of the target
+ * collection as the first argument to any of the following functions:
+ * - containsKey(key)
+ * - put(key, value)
+ * - get(key)
+ * - remove(key)
+ * - remove(key, value)
+ * - replace(key, value)
+ * - putIfAbsent(key, value)
+ * - getOrDefault(key, defaultValue)
+ * - putAll(Map<Key, Value>)
+ 
+ * You can expect similar behavior to native classes described here:
+ * https://docs.oracle.com/javase/7/docs/api/java/util/Dictionary.html
+ * https://docs.oracle.com/javase/7/docs/api/java/util/Hashtable.html
  *
- * @section Alternatives
- *          Aside from classical C/C++ implementations of RocksDB, WiredTiger,
- *          LMDB and LevelDB being wrapped into JNI, there are some KVS written
- *          purely in Java:
- *          * https://github.com/jankotek/mapdb/
- *          * https://github.com/yahoo/HaloDB
+ * In case of transactions you also get:
+ * - rollback: To reset the state of the transaction.
+ * - commit: To submit the transaction to underlying DBMS.
+ *
+ * ## Alternatives
+ *
+ * Aside from classical C/C++ implementations of RocksDB, WiredTiger,
+ * LMDB and LevelDB being wrapped into JNI, there are some KVS written
+ * purely in Java:
+ * - https://github.com/jankotek/mapdb/
+ * - https://github.com/yahoo/HaloDB
  */
 public abstract class DataBase {
 

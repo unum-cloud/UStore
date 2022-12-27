@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set -e
 
 ### Set JAVA_HOME!
 # Must have `incldue` dir inside for jni headers
@@ -10,4 +11,6 @@
 #       brew install java
 #       export JAVA_HOME="/usr/libexec/java_home -v 1.8"
 
-./java/gradlew build
+cmake -DUKV_BUILD_ENGINE_UMEM=1 -DUKV_BUILD_ENGINE_ROCKSDB=1 -DUKV_BUILD_ENGINE_LEVELDB=1 . 
+make -j16
+./java/gradlew build #--info
