@@ -1,0 +1,192 @@
+[
+    {
+        "doc": {
+            "a": "b"
+        },
+        "merge": {
+            "a": "c"
+        },
+        "expected": {
+            "a": "c"
+        }
+    },
+    {
+        "doc": {
+            "a": "b"
+        },
+        "merge": {
+            "b": "c"
+        },
+        "expected": {
+            "a": "b",
+            "b": "c"
+        }
+    },
+    {
+        "doc": {
+            "a": "b"
+        },
+        "merge": {
+            "a": null
+        },
+        "expected": {}
+    },
+    {
+        "doc": {
+            "a": "b",
+            "b": "c"
+        },
+        "merge": {
+            "a": null
+        },
+        "expected": {
+            "b": "c"
+        }
+    },
+    {
+        "doc": {
+            "a": [
+                "b"
+            ]
+        },
+        "merge": {
+            "a": "c"
+        },
+        "expected": {
+            "a": "c"
+        }
+    },
+    {
+        "doc": {
+            "a": "c"
+        },
+        "merge": {
+            "a": [
+                "b"
+            ]
+        },
+        "expected": {
+            "a": [
+                "b"
+            ]
+        }
+    },
+    {
+        "doc": {
+            "a": [
+                {
+                    "b": "c"
+                }
+            ]
+        },
+        "merge": {
+            "a": [
+                1
+            ]
+        },
+        "expected": {
+            "a": [
+                1
+            ]
+        }
+    },
+    {
+        "doc": {
+            "a": [
+                {
+                    "b": "c"
+                }
+            ]
+        },
+        "merge": {
+            "a": {
+                "b": "d",
+                "c": null
+            }
+        },
+        "expected": {
+            "a": {
+                "b": "d"
+            }
+        }
+    },
+    {
+        "doc": [
+            "a",
+            "b"
+        ],
+        "merge": [
+            "c",
+            "d"
+        ],
+        "expected": [
+            "c",
+            "d"
+        ]
+    },
+    {
+        "doc": {
+            "a": "b"
+        },
+        "merge": [
+            "c"
+        ],
+        "expected": [
+            "c"
+        ]
+    },
+    {
+        "doc": {
+            "a": "foo"
+        },
+        "merge": null,
+        "expected": null
+    },
+    {
+        "doc": {
+            "a": "foo"
+        },
+        "merge": "bar",
+        "expected": "bar"
+    },
+    {
+        "doc": {
+            "e": null
+        },
+        "merge": {
+            "a": 1
+        },
+        "expected": {
+            "e": null,
+            "a": 1
+        }
+    },
+    {
+        "doc": [
+            1,
+            2
+        ],
+        "merge": {
+            "a": "b",
+            "c": null
+        },
+        "expected": {
+            "a": "b"
+        }
+    },
+    {
+        "doc": {},
+        "merge": {
+            "a": {
+                "bb": {
+                    "ccc": null
+                }
+            }
+        },
+        "expected": {
+            "a": {
+                "bb": {}
+            }
+        }
+    }
+]
