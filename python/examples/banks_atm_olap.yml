@@ -1,0 +1,30 @@
+name: ukv-banks-atm-olap
+
+# This can't be set inside the file,
+# but should be configured from CLI.
+# We keep it as a reminder.
+channel_priority: flexible
+
+channels:
+  - rapidsai
+  - nvidia
+  - numba
+  - conda-forge
+
+dependencies:
+  - python=3.9
+  - cudatoolkit=11.5
+  - cuxfilter=22.10
+  - cudf=22.10
+  - cuml=22.10
+  - cugraph=22.10
+  - cuspatial=22.10
+  - pip
+  - pip:
+      - numpy
+      - scipy
+      - tqdm
+      - pandas
+      - pyarrow
+      - autopep8
+      - geojson
