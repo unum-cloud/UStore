@@ -2,28 +2,31 @@
  * @file graph_stream.hpp
  * @author Ashot Vardanian
  * @date 30 Jun 2022
- * @brief C++ bindings for @see "ukv/graph.h".
+ * @addtogroup Cpp
+ *
+ * @brief C++ bindings for "ukv/graph.h".
  */
 
 #pragma once
 #include "ukv/graph.h"
-#include "ukv/cpp/ranges.hpp"     // `edges_span_t`
-#include "ukv/cpp/bins_range.hpp" // `keys_stream_t`
+#include "ukv/cpp/ranges.hpp"      // `edges_span_t`
+#include "ukv/cpp/blobs_range.hpp" // `keys_stream_t`
 
 namespace unum::ukv {
 
 /**
- * @brief A stream of all @c `edge_t`s in a graph.
+ * @brief A stream of all @c edge_t's in a graph.
  * No particular order is guaranteed.
  */
 class graph_stream_t {
 
-    ukv_database_t db_ = nullptr;
-    ukv_collection_t collection_ = ukv_collection_main_k;
-    ukv_transaction_t transaction_ = nullptr;
+    ukv_database_t db_ {nullptr};
+    ukv_collection_t collection_ {ukv_collection_main_k};
+    ukv_transaction_t transaction_ {nullptr};
+    ukv_vertex_role_t role_ = ukv_vertex_role_any_k;
 
-    edges_span_t fetched_edges_ = {};
-    std::size_t fetched_offset_ = 0;
+    edges_span_t fetched_edges_ {};
+    std::size_t fetched_offset_ {0};
 
     arena_t arena_;
     keys_stream_t vertex_stream_;
@@ -35,7 +38,6 @@ class graph_stream_t {
         status_t status;
         ukv_vertex_degree_t* degrees_per_vertex = nullptr;
         ukv_key_t* edges_per_vertex = nullptr;
-        ukv_vertex_role_t role = ukv_vertex_role_any_k;
 
         ukv_graph_find_edges_t graph_find_edges {
             .db = db_,
@@ -44,9 +46,9 @@ class graph_stream_t {
             .arena = arena_.member_ptr(),
             .tasks_count = vertices.count(),
             .collections = &collection_,
-            .vertices_ids = vertices.begin().get(),
+            .vertices = vertices.begin().get(),
             .vertices_stride = vertices.stride(),
-            .roles = &role,
+            .roles = &role_,
             .degrees_per_vertex = &degrees_per_vertex,
             .edges_per_vertex = &edges_per_vertex,
         };
@@ -76,9 +78,10 @@ class graph_stream_t {
 
     graph_stream_t(ukv_database_t db,
                    ukv_collection_t collection = ukv_collection_main_k,
+                   ukv_transaction_t txn = nullptr,
                    std::size_t read_ahead_vertices = keys_stream_t::default_read_ahead_k,
-                   ukv_transaction_t txn = nullptr)
-        : db_(db), collection_(collection), transaction_(txn), arena_(db),
+                   ukv_vertex_role_t role = ukv_vertex_role_any_k)
+        : db_(db), collection_(collection), transaction_(txn), role_(role), arena_(db),
           vertex_stream_(db, collection, read_ahead_vertices, txn) {}
 
     graph_stream_t(graph_stream_t&&) = default;
