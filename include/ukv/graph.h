@@ -115,8 +115,8 @@ extern ukv_vertex_degree_t ukv_vertex_degree_missing_k;
  * collection that stores the metadata of the edges.
  */
 void ukv_graph_find_edges( //
-    ukv_t const db,
-    ukv_txn_t const txn,
+    ukv_database_t const db,
+    ukv_transaction_t const txn,
     ukv_size_t const tasks_count,
 
     ukv_collection_t const* collections,
@@ -144,8 +144,8 @@ void ukv_graph_find_edges( //
  *                      Normal graphs would use `ukv_default_edge_id_k`.
  */
 void ukv_graph_upsert_edges( //
-    ukv_t const db,
-    ukv_txn_t const txn,
+    ukv_database_t const db,
+    ukv_transaction_t const txn,
     ukv_size_t const tasks_count,
 
     ukv_collection_t const* collections,
@@ -174,8 +174,8 @@ void ukv_graph_upsert_edges( //
  *                      request, all edges between mentioned nodes will be removed.
  */
 void ukv_graph_remove_edges( //
-    ukv_t const db,
-    ukv_txn_t const txn,
+    ukv_database_t const db,
+    ukv_transaction_t const txn,
     ukv_size_t const tasks_count,
 
     ukv_collection_t const* collections,
@@ -200,8 +200,8 @@ void ukv_graph_remove_edges( //
  * @param roles[in] Needed only for @b Joining graphs.
  */
 void ukv_graph_remove_vertices( //
-    ukv_t const db,
-    ukv_txn_t const txn,
+    ukv_database_t const db,
+    ukv_transaction_t const txn,
     ukv_size_t const tasks_count,
 
     ukv_collection_t const* collections,

@@ -2,50 +2,51 @@
  * @file ukv.h
  * @author Ashot Vardanian
  * @date 12 Jun 2022
- * @brief C bindings for Universal Key-Value stores, that provide:
- * > @b ABI stability for the essential CRUD operations,
- * > @b Interoperability with higher-level languages.
- * > @b Flexibility in choosing the underlying implementation.
- * > Both transactional and "HEAD" operations.
+ * @addtogroup C
  *
- * @section Assumptions and Limitations (in current version):
- * > Keys are preset to @b 8-byte unsigned integers.
- * > Values must be @b under 4GB long, zero length is OK too.
- * > Fully @b synchronous for the simplicity of interface.
- * > Collection names should be under 64 characters long. Postgres does 59 :)
+ * @brief Binary Interface Standard for Multi-Modal Databases.
  *
- * @section Extended Functionality: @b Docs, @b Graphs
- * We add "Document" and "Graph" typed collections, which store more than
- * just raw bytes in the underlying system. It allows to create arbitrarily
- * complex DBMS on top of it.
+ * Provides:
+ * - @b ABI stability for the essential CRUD operations,
+ * - @b Interoperability with higher-level languages.
+ * - @b Flexibility in choosing the underlying engine.
+ * - @b ACID transactions and snapshots support.
+ * - @b Batch operations support.
  *
- * @section Backends
+ * ## Hourglass Design
  *
- * @subsection Embedded Backends
- * Any of the following systems runs within the same process as a
- * library of persistent associative data-structures:
- * * FOSS LevelDB: https://github.com/google/leveldb/
- * * FOSS RocksDB: https://github.com/facebook/rocksdb
- * * FOSS STL-based In-Memory
- * * Unums Persistent Transactional Embedded Key-Value Store
- * * Unums In-Memory Transactional Key-Value Store
+ * Most of todays advanced software is written in C++, both the programs
+ * and the libraries. Still, maintaining shared ABI-stable C++ interface
+ * is essentially impossible in todays reality.
  *
- * @subsection Standalone Backends
- * Any of the above embedded stores can be wrapped into any of
- * the following standalone systems, running as separate processes:
- * * FOSS RESTful Server with Boost.Beast: https://github.com/boostorg/beast
- * * FOSS gRPC Server:
- * * Unum RPC Server
- * * Unum Distributed RPCs server
- * The RPC variants are compatible with all frontends.
+ * That is why the "hourglass" pattern is used. The implementation is in
+ * C++, the heavily templated convenient wrappers are in C++, but the
+ * intermediate layer is C99 to maintain ABI stability and allow rolling
+ * minor updates without recompilation of the user code.
  *
- * @section Frontends
- * * Python: transactions ✓, batch ops ✓, NetworkX-like graphs ✓
- * * Java: transactions ✓, Apache Arrow support
- * * GoLang
+ * ## Interface Conventions
+ *
+ * - Choosing more arguments over more functions.
+ *   Aiming for flexibility, we have functions have 4 allowed outputs or more.
+ *   To cover all the combinations requests we will need 4!=24 functions just
+ *   to replace that one.
+ *
+ * - Strides! Higher level systems may pack groups of arguments into AoS
+ *   instead of SoA. To minimize the need of copies and data re-layout,
+ *   we use @b byte-length strides arguments, similar to BLAS libraries.
+ *   Passing Zero as a "stride" means repeating the same value.
+ *
+ * - Wrapping function arguments into structs.
+ *   Some functions have over 20 arguments, accounting for all the options
+ *   and strides. The majority of those are optional. This makes it impossible
+ *   to remember the exact order. Using `struct`, the order becomes irrelevant.
+ *   All arguments get names and default values can be skipped.
  */
 
 #pragma once
 #include "ukv/db.h"
+#include "ukv/blobs.h"
+#include "ukv/paths.h"
 #include "ukv/docs.h"
 #include "ukv/graph.h"
+#include "ukv/vectors.h"
