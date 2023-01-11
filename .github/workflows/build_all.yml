@@ -1,0 +1,62 @@
+name: Build all
+
+on:
+  schedule:
+    - cron: "0 0 * * 1"
+
+concurrency:
+  group: ${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  # Customize the CMake build type here (Release, Debug, RelWithDebInfo, etc.)
+  BUILD_TYPE: Release
+
+jobs:
+  build:
+    # The CMake configure and build commands are platform agnostic and should work equally well on Windows or Mac.
+    # You can convert this to a matrix build if you need cross-platform coverage.
+    # See: https://docs.github.com/en/free-pro-team@latest/actions/learn-github-actions/managing-complex-workflows#using-a-build-matrix
+    runs-on: ubuntu-20.04
+    strategy:
+      matrix:
+        backend: [umem, rocksdb, leveldb]
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: apt dependencies
+        run: chmod +x cmake/arrow.sh && ./cmake/arrow.sh
+
+      - name: pip dependencies
+        run: python3.9 -m pip install --force-reinstall pytest numpy pyarrow cmake
+
+      - name: Configure CMake
+        # Configure CMake in a 'build' subdirectory. `CMAKE_BUILD_TYPE` is only required if you are using a single-configuration generator such as make.
+        # See https://cmake.org/cmake/help/latest/variable/CMAKE_BUILD_TYPE.html?highlight=cmake_build_type
+        run: cmake -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} .
+
+      - name: Build
+        run: make -j4 ukv_${{ matrix.backend }} test_units_ukv_embedded_${{ matrix.backend }}
+
+      - name: Upload Binaries
+        uses: actions/upload-artifact@v3.1.1
+        with:
+          name: ubuntu_binaries
+          path: build/bin/*
+
+  test:
+    runs-on: ubuntu-20.04
+    needs: build
+
+    steps:
+      - uses: actions/checkout@v3
+      - name: Download a Build Artifact
+        uses: actions/download-artifact@v3.0.1
+        with:
+          name: ubuntu_binaries
+
+      - name: Change Permissions
+        run: chmod +x /home/runner/work/ukv/ukv/*
+      - name: Run tests
+        run: for test in $(ls /home/runner/work/ukv/ukv/*unit_test); do  echo -e "------ \e[93mRunning $test\e[0m ------"; timeout -v --kill-after=5 300 $test; done

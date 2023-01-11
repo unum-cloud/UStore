@@ -30,6 +30,7 @@
 *.exe
 *.out
 *.app
+dist/
 
 # OS-specific
 .DS_Store
@@ -55,6 +56,8 @@ openapitools.json
 build_version.cc
 CPackConfig.cmake
 CPackSourceConfig.cmake
+doxygen_docs/html
+wheelhouse
 
 # Allow
 !gradle/wrapper/gradle-wrapper.jar

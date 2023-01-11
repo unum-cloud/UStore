@@ -1,0 +1,3 @@
+[submodule "go-ukv"]
+	path = go-ukv
+	url = https://github.com/unum-cloud/go-ukv

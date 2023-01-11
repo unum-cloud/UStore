@@ -36,9 +36,9 @@ dependencies {
 
 model {
     buildTypes{
-        stl
-        rocks
-        level
+        umem
+        rocksdb
+        leveldb
     }
 
     components {
@@ -63,12 +63,12 @@ model {
                     cCompiler.args '-D_FILE_OFFSET_BITS=64'
                 }
 
-                if (buildType == buildTypes.stl) {
-                    linker.args '-L', "${projectDir}/build/lib", "-l", "ukv_stl", "-l", "c"
-                } else if (buildType == buildTypes.rocks) {
-                    linker.args '-L', "${projectDir}/build/lib", "-l", "ukv_rocksdb", "-l", "rocksdb", "-l", "c"
-                } else if (buildType == buildTypes.level) {
-                    linker.args '-L', "${projectDir}/build/lib", "-l", "ukv_leveldb", "-l", "leveldb", "-l", "c"
+                if (buildType == buildTypes.umem) {
+                    linker.args '-L', "${projectDir}/build/lib", "-l", "ukv_embedded_umem", "-l", "c"
+                } else if (buildType == buildTypes.rocksdb) {
+                    linker.args '-L', "${projectDir}/build/lib", "-l", "ukv_embedded_rocksdb", "-l", "rocksdb", "-l", "c"
+                } else if (buildType == buildTypes.leveldb) {
+                    linker.args '-L', "${projectDir}/build/lib", "-l", "ukv_embedded_leveldb", "-l", "leveldb", "-l", "c"
                 }
             }
         }
@@ -85,20 +85,20 @@ test {
 }
 
 jar {
-    dependsOn("ukvStlSharedLibrary")
-    dependsOn("ukvRocksSharedLibrary")
-    dependsOn("ukvLevelSharedLibrary")
+    dependsOn("ukvUmemSharedLibrary")
+    dependsOn("ukvRocksdbSharedLibrary")
+    dependsOn("ukvLeveldbSharedLibrary")
 
-    into("stl") {
-        from("$buildDir/libs/ukv/shared/stl/libukv.so")
+    into("umem") {
+        from("$buildDir/libs/ukv/shared/umem/libukv.so")
     }
 
-    into("rocks") {
-        from("$buildDir/libs/ukv/shared/rocks/libukv.so")
+    into("rocksdb") {
+        from("$buildDir/libs/ukv/shared/rocksdb/libukv.so")
     }
 
-    into("level") {
-        from("$buildDir/libs/ukv/shared/level/libukv.so")
+    into("leveldb") {
+        from("$buildDir/libs/ukv/shared/leveldb/libukv.so")
     }
 }
 
@@ -110,7 +110,7 @@ publishing {
             pom {
                 name = "UKV"
                 description = "Universal Key-Value store interface for both in-memory and persistent transactional collections for Java"
-                url = "https://github.com/unum-cloud/UKV"
+                url = "https://github.com/unum-cloud/ukv"
                 licenses {
                     license {
                         name = 'The Apache License, Version 2.0'

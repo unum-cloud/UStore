@@ -12,9 +12,9 @@
 # )
 # FetchContent_MakeAvailable(fpfor)
 
-if(${UKV_PREINSTALLED_TURBOPFOR})
-#
-else()
+include(ExternalProject)
+
+if(${UKV_REBUILD_TURBOPFOR})
     include(ExternalProject)
     find_package(Git REQUIRED)
     find_program(MAKE_EXE NAMES gmake nmake make)
