@@ -1,0 +1,23 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "http://github.com/unum-cloud/ukv/collection.schema.json",
+    "type": "object",
+    "properties": {
+        "type": {
+            "type": "string",
+            "default": "binary",
+            "pattern": "binary|graph|doc",
+            "enum": [
+                "binary",
+                "graph",
+                "doc"
+            ]
+        },
+        "value_length_bytes": {
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 4096
+        },
+        "expected_max_size": {}
+    }
+}
