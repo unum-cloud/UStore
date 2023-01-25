@@ -421,8 +421,8 @@ Thank you!
 [ukv-keys-size]: https://unum.cloud/ukv/c#integer-keys
 [ukv-values-size]: https://unum.cloud/ukv/c#smallish-values
 [ukv-acid]: https://unum.cloud/ukv/c#acid-transactions
-[ukv-vs-rocks]: https://unum.cloud/ukv/related#leveldb-rocksdb
-[ukv-vs-sql]: https://unum.cloud/ukv/related#sql-mql-cypher
+[ukv-vs-rocks]: https://unum.cloud/ukv/details/related.html#leveldb-rocksdb
+[ukv-vs-sql]: https://unum.cloud/ukv/details/related.html#sql-mql-cypher
 [ukv-c-headers]: https://github.com/unum-cloud/ukv/tree/main/include/ukv
 [ukv-roadmap]: https://github.com/orgs/unum-cloud/projects/2
 [ukv-compression]: https://github.com/unum-cloud/ukv/discussions/232
