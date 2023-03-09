@@ -1,0 +1,15 @@
+{
+    "version": "1.0",
+    "directory": "./tmp/main/",
+    "data_directories": [
+        {
+            "path": "./tmp/storage/",
+            "max_size": "100GB"
+        },
+        {
+            "path": "./tmp/storage/",
+            "max_size": "100GB"
+        }
+    ],
+    "engine_config_path": ""
+}

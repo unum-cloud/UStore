@@ -241,14 +241,11 @@ extern bool const ukv_supports_snapshots_k;
 typedef struct ukv_database_init_t {
     /**
      * @brief Configuration parameter for the DBMS.
+     * @see `db.config.json` file.
      *
-     * For embedded distributions should be the root directory,
-     * under which the DBMS and it's files will be organized.
+     * For embedded distributions should be a json string containing DB options.
      *
-     * Recommendations:
-     * - UMem: empty or `/var/lib/ukv/umem/` for eventually persistent.
-     * - RocksDB: `/var/lib/ukv/rocksdb/` optionally storing `config_rocksdb.ini`.
-     * - LevelDB: `/var/lib/ukv/leveldb/` optionally storing `config_leveldb.json`.
+     * Special:
      * - Flight API Client: `grpc://0.0.0.0:38709`.
      */
     ukv_str_view_t config;

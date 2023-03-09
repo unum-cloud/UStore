@@ -40,8 +40,6 @@ using level_status_t = leveldb::Status;
 using level_options_t = leveldb::Options;
 using level_iter_uptr_t = std::unique_ptr<leveldb::Iterator>;
 
-static constexpr char const* config_name_k = "config_leveldb.json";
-
 struct key_comparator_t final : public leveldb::Comparator {
 
     inline int Compare(leveldb::Slice const& a, leveldb::Slice const& b) const override {
@@ -116,14 +114,25 @@ void ukv_database_init(ukv_database_init_t* c_ptr) {
         options.compression = leveldb::kNoCompression;
         options.create_if_missing = true;
 
-        // Check if the directory contains a config
-        stdfs::path root = c.config;
+        return_error_if_m(c.config, c.error, args_wrong_k, "Null config specified");
+        // Load config
+        config_t config;
+        auto status = config_loader_t::load(c.config, config);
+        return_error_if_m(status, c.error, args_wrong_k, status.member_ptr());
+
+        // Root path
+        stdfs::path root = config.directory;
         stdfs::file_status root_status = stdfs::status(root);
         return_error_if_m(root_status.type() == stdfs::file_type::directory,
                           c.error,
                           args_wrong_k,
                           "Root isn't a directory");
-        stdfs::path config_path = stdfs::path(root) / config_name_k;
+
+        // Storage paths
+        return_error_if_m(config.data_directories.empty(), c.error, args_wrong_k, "Multi disk not supported");
+
+        // Engine config
+        stdfs::path config_path = config.engine_config_path;
         stdfs::file_status config_status = stdfs::status(config_path);
         if (config_status.type() == stdfs::file_type::not_found) {
             log_warning_m(
@@ -132,7 +141,7 @@ void ukv_database_init(ukv_database_init_t* c_ptr) {
                 config_path.c_str());
         }
         else {
-            std::ifstream ifs(config_path.c_str());
+            std::ifstream ifs(config_path);
             json_t js = json_t::parse(ifs);
             if (js.contains("write_buffer_size"))
                 options.write_buffer_size = js["write_buffer_size"];

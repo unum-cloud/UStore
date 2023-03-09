@@ -36,6 +36,7 @@
 #include "helpers/file.hpp"
 #include "helpers/linked_memory.hpp" // `linked_memory_t`
 #include "helpers/linked_array.hpp"  // `unintialized_vector_gt`
+#include "helpers/config_loader.hpp" // `config_loader_t`
 #include "ukv/cpp/ranges_args.hpp"   // `places_arg_t`
 
 /*********************************************************/
@@ -61,8 +62,6 @@ namespace stdfs = std::filesystem;
 using json_t = nlohmann::json;
 
 using blob_allocator_t = std::allocator<byte_t>;
-
-static constexpr char const* config_name_k = "config_umem.json";
 
 struct pair_t {
     collection_key_t collection_key;
@@ -425,17 +424,26 @@ void ukv_database_init(ukv_database_init_t* c_ptr) {
         return_error_if_m(maybe_pairs, c.error, error_unknown_k, "Couldn't build consistent set");
         auto db = database_t(std::move(maybe_pairs).value());
         auto db_ptr = std::make_unique<database_t>(std::move(db)).release();
-        auto len = c.config ? std::strlen(c.config) : 0;
-        if (len) {
 
-            // Check if the directory contains a config
-            stdfs::path root = c.config;
+        if (c.config) {
+            // Load config
+            config_t config;
+            auto status = config_loader_t::load(c.config, config);
+            return_error_if_m(status, c.error, args_wrong_k, status.member_ptr());
+
+            // Root path
+            stdfs::path root = config.directory;
             stdfs::file_status root_status = stdfs::status(root);
             return_error_if_m(root_status.type() == stdfs::file_type::directory,
                               c.error,
                               args_wrong_k,
                               "Root isn't a directory");
-            stdfs::path config_path = stdfs::path(root) / config_name_k;
+
+            // Storage paths
+            return_error_if_m(config.data_directories.empty(), c.error, args_wrong_k, "Multi disk not supported");
+
+            // Engine config
+            stdfs::path config_path = config.engine_config_path;
             stdfs::file_status config_status = stdfs::status(config_path);
             if (config_status.type() == stdfs::file_type::not_found) {
                 log_warning_m(
@@ -444,7 +452,7 @@ void ukv_database_init(ukv_database_init_t* c_ptr) {
                     config_path.c_str());
             }
             else {
-                std::ifstream ifs(config_path.c_str());
+                std::ifstream ifs(config_path);
                 json_t js = json_t::parse(ifs);
             }
 

@@ -51,8 +51,6 @@ using rocks_value_t = rocksdb::PinnableSlice;
 using rocks_txn_t = rocksdb::Transaction;
 using rocks_collection_t = rocksdb::ColumnFamilyHandle;
 
-static constexpr char const* config_name_k = "config_rocksdb.ini";
-
 struct key_comparator_t final : public rocksdb::Comparator {
     inline int Compare(rocksdb::Slice const& a, rocksdb::Slice const& b) const override {
         auto ai = *reinterpret_cast<ukv_key_t const*>(a.data());
@@ -127,15 +125,23 @@ void ukv_database_init(ukv_database_init_t* c_ptr) {
         rocks_db_t* db_ptr = new rocks_db_t;
         rocks_status_t status;
 
-        stdfs::path root = c.config;
+        return_error_if_m(c.config, c.error, args_wrong_k, "Null config specified");
+        // Load config
+        config_t config;
+        auto st = config_loader_t::load(c.config, config);
+        return_error_if_m(st, c.error, args_wrong_k, st.member_ptr());
+
+        // Root path
+        stdfs::path root = config.directory;
         stdfs::file_status root_status = stdfs::status(root);
         return_error_if_m(root_status.type() == stdfs::file_type::directory,
                           c.error,
                           args_wrong_k,
                           "Root isn't a directory");
-        stdfs::path config_path = stdfs::path(root) / config_name_k;
-        stdfs::file_status config_status = stdfs::status(config_path);
 
+        // Engine config
+        stdfs::path config_path = config.engine_config_path;
+        stdfs::file_status config_status = stdfs::status(config_path);
         // Recovering RocksDB isn't trivial and depends on a number of configuration parameters:
         // http://rocksdb.org/blog/2016/03/07/rocksdb-options-file.html
         // https://github.com/facebook/rocksdb/wiki/RocksDB-Options-File
@@ -173,6 +179,10 @@ void ukv_database_init(ukv_database_init_t* c_ptr) {
 
         options.create_if_missing = true;
         options.comparator = &key_comparator_k;
+
+        // Storage paths
+        for (auto const& disk : config.data_directories)
+            options.db_paths.push_back(disk.path, disk.max_size);
 
         rocks_native_t* native_db = nullptr;
         rocksdb::OptimisticTransactionDBOptions txn_options;
