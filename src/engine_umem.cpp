@@ -22,10 +22,11 @@
 #include <filesystem> // Enumerating the directory
 #include <fstream>    // Passing file contents to JSON parser
 
+// TODO: These alternative containers need further testing:
+// #include <ucset/consistent_avl.hpp> // `ucset::consistent_avl_gt`
+// #include <ucset/partitioned.hpp>    // `ucset::partitioned_gt`
 #include <ucset/consistent_set.hpp> // `ucset::consistent_set_gt`
-#include <ucset/consistent_avl.hpp> // `ucset::consistent_avl_gt`
 #include <ucset/locked.hpp>         // `ucset::locked_gt`
-#include <ucset/partitioned.hpp>    // `ucset::partitioned_gt`
 
 #include <nlohmann/json.hpp>       // `nlohmann::json`
 #include <arrow/io/file.h>         // `arrow::io::ReadableFile`
@@ -62,6 +63,12 @@ namespace stdfs = std::filesystem;
 using json_t = nlohmann::json;
 
 using blob_allocator_t = std::allocator<byte_t>;
+
+struct umem_options_t {
+    bool encryption = false;
+    bool compression = false;
+    size_t memory_limit = 0;
+};
 
 struct pair_t {
     collection_key_t collection_key;
@@ -425,11 +432,11 @@ void ukv_database_init(ukv_database_init_t* c_ptr) {
         auto db = database_t(std::move(maybe_pairs).value());
         auto db_ptr = std::make_unique<database_t>(std::move(db)).release();
 
-        if (c.config) {
+        if (c.config && std::strlen(c.config) > 0) {
             // Load config
             config_t config;
-            auto status = config_loader_t::load(c.config, config);
-            return_error_if_m(status, c.error, args_wrong_k, status.member_ptr());
+            auto status = config_loader_t::load_from_json_string(c.config, config);
+            return_error_if_m(status, c.error, args_wrong_k, status.message());
 
             // Root path
             stdfs::path root = config.directory;
@@ -440,27 +447,53 @@ void ukv_database_init(ukv_database_init_t* c_ptr) {
                               "Root isn't a directory");
 
             // Storage paths
-            return_error_if_m(config.data_directories.empty(), c.error, args_wrong_k, "Multi disk not supported");
+            return_error_if_m(config.data_directories.empty(), c.error, args_wrong_k, "Multi-disk not supported");
 
             // Engine config
-            stdfs::path config_path = config.engine_config_path;
-            stdfs::file_status config_status = stdfs::status(config_path);
-            if (config_status.type() == stdfs::file_type::not_found) {
-                log_warning_m(
-                    "Configuration file is missing under the path %s. "
-                    "Default will be used\n",
-                    config_path.c_str());
-            }
-            else {
-                std::ifstream ifs(config_path);
-                json_t js = json_t::parse(ifs);
-            }
+            return_error_if_m(config.engine.config_url.empty(), c.error, args_wrong_k, "Doesn't support URL configs");
+            return_error_if_m(config.engine.config.empty(), c.error, args_wrong_k, "Doesn't support nested configs");
 
-            db_ptr->persisted_directory = std::string(c.config, len);
+            auto fill_options = [](json_t const& js, umem_options_t& options) {
+                if (js.contains("encryption"))
+                    options.encryption = js["encryption"];
+                if (js.contains("compression"))
+                    options.compression = js["compression"];
+                if (js.contains("memory_limit"))
+                    options.memory_limit = js["memory_limit"];
+            };
+
+            // Load from file
+            umem_options_t options;
+            if (!config.engine.config_file_path.empty()) {
+                std::ifstream ifs(config.engine.config_file_path);
+                return_error_if_m(ifs, c.error, args_wrong_k, "Config file not found");
+                auto js = json_t::parse(ifs);
+                fill_options(js, options);
+            }
+            // Override with nested
+            if (!config.engine.config.empty())
+                fill_options(config.engine.config, options);
+
+            db_ptr->persisted_directory = root;
             read(*db_ptr, db_ptr->persisted_directory, c.error);
         }
         *c.db = db_ptr;
     });
+}
+
+void ukv_snapshot_list(ukv_snapshot_list_t* c_ptr) {
+    ukv_snapshot_list_t& c = *c_ptr;
+    *c.count = 0;
+    if (c.ids)
+        *c.ids = nullptr;
+}
+
+void ukv_snapshot_create(ukv_snapshot_create_t*) {
+    // TODO
+}
+
+void ukv_snapshot_drop(ukv_snapshot_drop_t*) {
+    // TODO
 }
 
 void ukv_read(ukv_read_t* c_ptr) {

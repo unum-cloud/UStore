@@ -18,6 +18,7 @@
  */
 
 #include <mutex>
+#include <fstream>
 #include <filesystem>
 
 #include <rocksdb/db.h>
@@ -26,9 +27,10 @@
 #include <rocksdb/utilities/optimistic_transaction_db.h>
 
 #include "ukv/db.h"
-#include "ukv/cpp/ranges_args.hpp"  // `places_arg_t`
-#include "helpers/linked_array.hpp" // `uninitialized_array_gt`
-#include "helpers/full_scan.hpp"    // `reservoir_sample_iterator`
+#include "ukv/cpp/ranges_args.hpp"   // `places_arg_t`
+#include "helpers/linked_array.hpp"  // `uninitialized_array_gt`
+#include "helpers/full_scan.hpp"     // `reservoir_sample_iterator`
+#include "helpers/config_loader.hpp" // `config_loader_t`
 
 namespace stdfs = std::filesystem;
 using namespace unum::ukv;
@@ -43,7 +45,7 @@ ukv_length_t const ukv_length_missing_k = std::numeric_limits<ukv_length_t>::max
 ukv_key_t const ukv_key_unknown_k = std::numeric_limits<ukv_key_t>::max();
 bool const ukv_supports_transactions_k = true;
 bool const ukv_supports_named_collections_k = true;
-bool const ukv_supports_snapshots_k = false;
+bool const ukv_supports_snapshots_k = true;
 
 using rocks_native_t = rocksdb::OptimisticTransactionDB;
 using rocks_status_t = rocksdb::Status;
@@ -72,8 +74,13 @@ struct key_comparator_t final : public rocksdb::Comparator {
 
 static key_comparator_t key_comparator_k = {};
 
+struct rocks_snapshot_t {
+    rocksdb::Snapshot const* snapshot = nullptr;
+};
+
 struct rocks_db_t {
     std::vector<rocks_collection_t*> columns;
+    std::unordered_map<ukv_size_t, rocks_snapshot_t*> snapshots;
     std::unique_ptr<rocks_native_t> native;
     std::mutex mutex;
 };
@@ -128,8 +135,8 @@ void ukv_database_init(ukv_database_init_t* c_ptr) {
         return_error_if_m(c.config, c.error, args_wrong_k, "Null config specified");
         // Load config
         config_t config;
-        auto st = config_loader_t::load(c.config, config);
-        return_error_if_m(st, c.error, args_wrong_k, st.member_ptr());
+        auto st = config_loader_t::load_from_json_string(c.config, config);
+        return_error_if_m(st, c.error, args_wrong_k, st.message());
 
         // Root path
         stdfs::path root = config.directory;
@@ -140,22 +147,19 @@ void ukv_database_init(ukv_database_init_t* c_ptr) {
                           "Root isn't a directory");
 
         // Engine config
-        stdfs::path config_path = config.engine_config_path;
-        stdfs::file_status config_status = stdfs::status(config_path);
         // Recovering RocksDB isn't trivial and depends on a number of configuration parameters:
         // http://rocksdb.org/blog/2016/03/07/rocksdb-options-file.html
         // https://github.com/facebook/rocksdb/wiki/RocksDB-Options-File
         rocksdb::Options options;
         options.compression = rocksdb::kNoCompression;
+        auto cf_options = rocksdb::ColumnFamilyOptions();
         std::vector<rocksdb::ColumnFamilyDescriptor> column_descriptors;
-        if (config_status.type() == stdfs::file_type::not_found) {
-            log_warning_m(
-                "Configuration file is missing under the path %s. "
-                "Default will be used\n",
-                config_path.c_str());
-        }
-        else {
-            status = rocksdb::LoadOptionsFromFile(config_path, rocksdb::Env::Default(), &options, &column_descriptors);
+        return_error_if_m(config.engine.config_url.empty(), c.error, args_wrong_k, "Doesn't support URL configs");
+
+        // Load from file
+        auto config_file = config.engine.config_file_path;
+        if (!config_file.empty()) {
+            status = rocksdb::LoadOptionsFromFile(config_file, rocksdb::Env::Default(), &options, &column_descriptors);
             return_error_if_m(status.ok(), c.error, error_unknown_k, "Couldn't parse RocksDB config");
             log_warning_m("Initializing RocksDB from config: %s\n", config_path.c_str());
             if (options.compression != rocksdb::kNoCompression)
@@ -163,12 +167,51 @@ void ukv_database_init(ukv_database_init_t* c_ptr) {
                     "We discourage general-purpose compression in favour "
                     "of modality-aware compression in UKV\n");
         }
+        // Override with nested
+        if (!config.engine.config.empty()) {
+            auto const& js = config.engine.config;
+            if (js.contains("DBOptions")) {
+                auto j_db = js["DBOptions"];
+                if (j_db.contains("create_if_missing"))
+                    options.create_if_missing = j_db["create_if_missing"];
+                if (j_db.contains("writable_file_max_buffer_size"))
+                    options.writable_file_max_buffer_size = j_db["writable_file_max_buffer_size"];
+                if (j_db.contains("max_open_files"))
+                    options.max_open_files = j_db["max_open_files"];
+                if (j_db.contains("max_file_opening_threads"))
+                    options.max_file_opening_threads = j_db["max_file_opening_threads"];
+            }
+
+            if (js.contains("CFOptions")) {
+                auto j_cf = js["CFOptions"];
+                if (j_cf.contains("max_write_buffer_number"))
+                    cf_options.max_write_buffer_number = j_cf["max_write_buffer_number"];
+                if (j_cf.contains("write_buffer_size"))
+                    cf_options.write_buffer_size = j_cf["write_buffer_size"];
+                if (j_cf.contains("target_file_size_base"))
+                    cf_options.target_file_size_base = j_cf["target_file_size_base"];
+                if (j_cf.contains("max_compaction_bytes"))
+                    cf_options.max_compaction_bytes = j_cf["max_compaction_bytes"];
+                if (j_cf.contains("level_compaction_dynamic_level_bytes"))
+                    cf_options.level_compaction_dynamic_level_bytes = j_cf["level_compaction_dynamic_level_bytes"];
+                if (j_cf.contains("level0_stop_writes_trigger"))
+                    cf_options.level0_stop_writes_trigger = j_cf["level0_stop_writes_trigger"];
+                if (j_cf.contains("target_file_size_multiplier"))
+                    cf_options.target_file_size_multiplier = j_cf["target_file_size_multiplier"];
+                if (j_cf.contains("max_bytes_for_level_multiplier"))
+                    cf_options.max_bytes_for_level_multiplier = j_cf["max_bytes_for_level_multiplier"];
+                if (j_cf.contains("compression"))
+                    if (j_cf["compression"] != "kNoCompression")
+                        log_warning_m(
+                            "We discourage general-purpose compression in favour "
+                            "of modality-aware compression in UKV\n");
+            }
+        }
 
         rocksdb::ConfigOptions config_options;
         status = rocksdb::LoadLatestOptions(config_options, root, &options, &column_descriptors);
         return_error_if_m(status.ok() || status.IsNotFound(), c.error, error_unknown_k, "Recovering RocksDB state");
 
-        auto cf_options = rocksdb::ColumnFamilyOptions();
         cf_options.comparator = &key_comparator_k;
         if (column_descriptors.empty())
             column_descriptors.push_back({rocksdb::kDefaultColumnFamilyName, std::move(cf_options)});
@@ -182,7 +225,7 @@ void ukv_database_init(ukv_database_init_t* c_ptr) {
 
         // Storage paths
         for (auto const& disk : config.data_directories)
-            options.db_paths.push_back(disk.path, disk.max_size);
+            options.db_paths.push_back({disk.path, disk.max_size});
 
         rocks_native_t* native_db = nullptr;
         rocksdb::OptimisticTransactionDBOptions txn_options;
@@ -192,6 +235,75 @@ void ukv_database_init(ukv_database_init_t* c_ptr) {
         db_ptr->native = std::unique_ptr<rocks_native_t>(native_db);
         *c.db = db_ptr;
     });
+}
+
+void ukv_snapshot_list(ukv_snapshot_list_t* c_ptr) {
+
+    ukv_snapshot_list_t& c = *c_ptr;
+    return_error_if_m(c.db, c.error, uninitialized_state_k, "DataBase is uninitialized");
+    return_error_if_m(c.count && c.ids, c.error, args_combo_k, "Need outputs!");
+
+    linked_memory_lock_t arena = linked_memory(c.arena, c.options, c.error);
+    return_if_error_m(c.error);
+
+    rocks_db_t& db = *reinterpret_cast<rocks_db_t*>(c.db);
+    std::lock_guard<std::mutex> locker(db.mutex);
+    std::size_t snapshots_count = db.snapshots.size();
+    *c.count = static_cast<ukv_size_t>(snapshots_count);
+
+    // For every snapshot we also need to export IDs
+    auto ids = arena.alloc_or_dummy(snapshots_count, c.error, c.ids);
+    return_if_error_m(c.error);
+
+    std::size_t i = 0;
+    for (const auto& [id, _] : db.snapshots)
+        ids[i++] = id;
+}
+
+void ukv_snapshot_create(ukv_snapshot_create_t* c_ptr) {
+
+    ukv_snapshot_create_t& c = *c_ptr;
+    return_error_if_m(c.db, c.error, uninitialized_state_k, "DataBase is uninitialized");
+
+    rocks_db_t& db = *reinterpret_cast<rocks_db_t*>(c.db);
+    std::lock_guard<std::mutex> locker(db.mutex);
+    auto it = db.snapshots.find(*c.id);
+    if (it != db.snapshots.end())
+        return_error_if_m(it->second, c.error, args_wrong_k, "Such snapshot already exists!");
+
+    rocks_snapshot_t* rocks_snapshot = nullptr;
+    safe_section("Allocating snapshot handle", c.error, [&] { rocks_snapshot = new rocks_snapshot_t(); });
+    return_if_error_m(c.error);
+
+    rocks_snapshot->snapshot = db.native->GetSnapshot();
+    if (!rocks_snapshot->snapshot)
+        *c.error = "Couldn't get a snapshot!";
+
+    *c.id = reinterpret_cast<std::size_t>(rocks_snapshot);
+    db.snapshots[*c.id] = rocks_snapshot;
+}
+
+void ukv_snapshot_drop(ukv_snapshot_drop_t* c_ptr) {
+
+    if (!c_ptr)
+        return;
+
+    ukv_snapshot_drop_t& c = *c_ptr;
+    if (!c.id)
+        return;
+
+    rocks_db_t& db = *reinterpret_cast<rocks_db_t*>(c.db);
+    rocks_snapshot_t& snap = *reinterpret_cast<rocks_snapshot_t*>(c.id);
+    if (!snap.snapshot)
+        return;
+
+    db.native->ReleaseSnapshot(snap.snapshot);
+    snap.snapshot = nullptr;
+
+    auto id = reinterpret_cast<std::size_t>(c.id);
+    db.mutex.lock();
+    db.snapshots.erase(id);
+    db.mutex.unlock();
 }
 
 void write_one( //
@@ -316,14 +428,18 @@ template <typename value_enumerator_at>
 void read_one( //
     rocks_db_t& db,
     rocks_txn_t* txn_ptr,
+    rocks_snapshot_t* snap_ptr,
     places_arg_t places,
     ukv_options_t const c_options,
     value_enumerator_at enumerator,
     ukv_error_t* c_error) noexcept(false) {
 
     rocksdb::ReadOptions options;
-    if (txn_ptr)
-        options.snapshot = txn_ptr->GetSnapshot();
+    if (snap_ptr) {
+        auto it = db.snapshots.find(reinterpret_cast<std::size_t>(snap_ptr));
+        return_error_if_m(it != db.snapshots.end(), c_error, args_wrong_k, "The snapshot does'nt exist!");
+        options.snapshot = snap_ptr->snapshot;
+    }
 
     bool watch = !(c_options & ukv_option_transaction_dont_watch_k);
 
@@ -355,14 +471,18 @@ template <typename value_enumerator_at>
 void read_many( //
     rocks_db_t& db,
     rocks_txn_t* txn_ptr,
+    rocks_snapshot_t* snap_ptr,
     places_arg_t places,
     ukv_options_t const c_options,
     value_enumerator_at enumerator,
     ukv_error_t* c_error) noexcept(false) {
 
     rocksdb::ReadOptions options;
-    if (txn_ptr)
-        options.snapshot = txn_ptr->GetSnapshot();
+    if (snap_ptr) {
+        auto it = db.snapshots.find(reinterpret_cast<std::size_t>(snap_ptr));
+        return_error_if_m(it != db.snapshots.end(), c_error, args_wrong_k, "The snapshot does'nt exist!");
+        options.snapshot = snap_ptr->snapshot;
+    }
 
     bool watch = !(c_options & ukv_option_transaction_dont_watch_k);
     std::vector<rocks_collection_t*> cols(places.count);
@@ -406,6 +526,7 @@ void ukv_read(ukv_read_t* c_ptr) {
 
     rocks_db_t& db = *reinterpret_cast<rocks_db_t*>(c.db);
     rocks_txn_t& txn = *reinterpret_cast<rocks_txn_t*>(c.transaction);
+    rocks_snapshot_t& snap = *reinterpret_cast<rocks_snapshot_t*>(c.snapshot);
 
     strided_iterator_gt<ukv_collection_t const> collections {c.collections, c.collections_stride};
     strided_iterator_gt<ukv_key_t const> keys {c.keys, c.keys_stride};
@@ -435,8 +556,8 @@ void ukv_read(ukv_read_t* c_ptr) {
 
     safe_section("Reading from RocksDB", c.error, [&] {
         c.tasks_count == 1 //
-            ? read_one(db, &txn, places, c.options, data_enumerator, c.error)
-            : read_many(db, &txn, places, c.options, data_enumerator, c.error);
+            ? read_one(db, &txn, &snap, places, c.options, data_enumerator, c.error)
+            : read_many(db, &txn, &snap, places, c.options, data_enumerator, c.error);
         offs[places.count] = contents.size();
 
         if (needs_export)
@@ -454,6 +575,7 @@ void ukv_scan(ukv_scan_t* c_ptr) {
 
     rocks_db_t& db = *reinterpret_cast<rocks_db_t*>(c.db);
     rocks_txn_t& txn = *reinterpret_cast<rocks_txn_t*>(c.transaction);
+    rocks_snapshot_t& snap = *reinterpret_cast<rocks_snapshot_t*>(c.snapshot);
     strided_iterator_gt<ukv_collection_t const> collections {c.collections, c.collections_stride};
     strided_iterator_gt<ukv_key_t const> start_keys {c.start_keys, c.start_keys_stride};
     strided_iterator_gt<ukv_length_t const> limits {c.count_limits, c.count_limits_stride};
@@ -476,8 +598,8 @@ void ukv_scan(ukv_scan_t* c_ptr) {
     rocksdb::ReadOptions options;
     options.fill_cache = false;
 
-    if (c.transaction)
-        options.snapshot = txn.GetSnapshot();
+    if (c.snapshot)
+        options.snapshot = snap.snapshot;
 
     for (ukv_size_t i = 0; i != c.tasks_count; ++i) {
         scan_t task = tasks[i];
@@ -485,7 +607,7 @@ void ukv_scan(ukv_scan_t* c_ptr) {
 
         std::unique_ptr<rocksdb::Iterator> it;
         safe_section("Creating a RocksDB iterator", c.error, [&] {
-            it = &txn //
+            it = c.transaction //
                      ? std::unique_ptr<rocksdb::Iterator>(txn.GetIterator(options, collection))
                      : std::unique_ptr<rocksdb::Iterator>(db.native->NewIterator(options, collection));
         });
@@ -520,6 +642,7 @@ void ukv_sample(ukv_sample_t* c_ptr) {
 
     rocks_db_t& db = *reinterpret_cast<rocks_db_t*>(c.db);
     rocks_txn_t& txn = *reinterpret_cast<rocks_txn_t*>(c.transaction);
+    rocks_snapshot_t& snap = *reinterpret_cast<rocks_snapshot_t*>(c.snapshot);
     strided_iterator_gt<ukv_collection_t const> collections {c.collections, c.collections_stride};
     strided_iterator_gt<ukv_length_t const> lens {c.count_limits, c.count_limits_stride};
     sample_args_t samples {collections, lens, c.tasks_count};
@@ -538,8 +661,8 @@ void ukv_sample(ukv_sample_t* c_ptr) {
     rocksdb::ReadOptions options;
     options.fill_cache = false;
 
-    if (c.transaction)
-        options.snapshot = txn.GetSnapshot();
+    if (c.snapshot)
+        options.snapshot = snap.snapshot;
 
     for (std::size_t task_idx = 0; task_idx != samples.count; ++task_idx) {
         sample_arg_t task = samples[task_idx];
@@ -548,7 +671,7 @@ void ukv_sample(ukv_sample_t* c_ptr) {
 
         std::unique_ptr<rocksdb::Iterator> it;
         safe_section("Creating a RocksDB iterator", c.error, [&] {
-            it = &txn //
+            it = c.transaction //
                      ? std::unique_ptr<rocksdb::Iterator>(txn.GetIterator(options, collection))
                      : std::unique_ptr<rocksdb::Iterator>(db.native->NewIterator(options, collection));
         });
