@@ -1,9 +1,9 @@
 # Apache Arrow Flight API
 
-Apache Arrow wraps a huge ecosystem of projects, just like UKV.
+Apache Arrow wraps a huge ecosystem of projects, just like UStore.
 With standardized Arrow columnar in-memory representations any content can be exported into analytics engine of your choosing.
 
-![UKV: Arrow](../../assets/charts/Arrow.png)
+![UStore: Arrow](../assets/charts/Arrow.png)
 
 The Flight API pushes this interoperability to the next level.
 Think of it as a binary analytics alternative to REST.

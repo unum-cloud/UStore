@@ -2,7 +2,7 @@
 Apache Arrow Flight API
 =======================
 
-.. mdinclude:: ../page-flight-api.md
+.. mdinclude:: index.md
 
 .. toctree::
    :hidden:

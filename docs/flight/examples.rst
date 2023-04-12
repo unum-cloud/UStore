@@ -4,5 +4,5 @@ Examples
 ==================================
 Denial of Service Attack
 ==================================
-.. literalinclude:: ../page-flight-api.py
+.. literalinclude:: ddos.py
    :language: python
