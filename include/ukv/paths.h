@@ -117,6 +117,8 @@ typedef struct ukv_paths_read_t {
     ukv_error_t* error;
     /** @brief The transaction in which the operation will be watched. */
     ukv_transaction_t transaction;
+    /** @brief The snapshot captures a view of the database at the time it's created. */
+    ukv_snapshot_t snapshot;
     /** @brief Reusable memory handle. */
     ukv_arena_t* arena;
     /** @brief Read options. @see `ukv_read_t`. */

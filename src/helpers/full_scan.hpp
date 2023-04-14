@@ -25,21 +25,20 @@ void full_scan_collection( //
 
     read_ahead = std::max<ukv_length_t>(read_ahead, 2u);
     while (!*error) {
-        ukv_length_t* found_blobs_count = nullptr;
-        ukv_key_t* found_blobs_keys = nullptr;
-        ukv_scan_t scan {
-            .db = db,
-            .error = error,
-            .transaction = transaction,
-            .arena = arena,
-            .options = options,
-            .tasks_count = 1,
-            .collections = &collection,
-            .start_keys = &start_key,
-            .count_limits = &read_ahead,
-            .counts = &found_blobs_count,
-            .keys = &found_blobs_keys,
-        };
+        ukv_length_t* found_blobs_count {};
+        ukv_key_t* found_blobs_keys {};
+        ukv_scan_t scan {};
+        scan.db = db;
+        scan.error = error;
+        scan.transaction = transaction;
+        scan.arena = arena;
+        scan.options = options;
+        scan.tasks_count = 1;
+        scan.collections = &collection;
+        scan.start_keys = &start_key;
+        scan.count_limits = &read_ahead;
+        scan.counts = &found_blobs_count;
+        scan.keys = &found_blobs_keys;
 
         ukv_scan(&scan);
         if (*error)
@@ -49,22 +48,22 @@ void full_scan_collection( //
             // We have reached the end of collection
             break;
 
-        ukv_length_t* found_blobs_offsets = nullptr;
-        ukv_byte_t* found_blobs_data = nullptr;
-        ukv_read_t read {
-            .db = db,
-            .error = error,
-            .transaction = transaction,
-            .arena = arena,
-            .options = ukv_options_t(options | ukv_option_dont_discard_memory_k),
-            .tasks_count = found_blobs_count[0],
-            .collections = &collection,
-            .collections_stride = 0,
-            .keys = found_blobs_keys,
-            .keys_stride = sizeof(ukv_key_t),
-            .offsets = &found_blobs_offsets,
-            .values = &found_blobs_data,
-        };
+        ukv_length_t* found_blobs_offsets {};
+        ukv_byte_t* found_blobs_data {};
+        ukv_read_t read {};
+        read.db = db;
+        read.error = error;
+        read.transaction = transaction;
+        read.arena = arena;
+        read.options = ukv_options_t(options | ukv_option_dont_discard_memory_k);
+        read.tasks_count = found_blobs_count[0];
+        read.collections = &collection;
+        read.collections_stride = 0;
+        read.keys = found_blobs_keys;
+        read.keys_stride = sizeof(ukv_key_t);
+        read.offsets = &found_blobs_offsets;
+        read.values = &found_blobs_data;
+
         ukv_read(&read);
         if (*error)
             break;

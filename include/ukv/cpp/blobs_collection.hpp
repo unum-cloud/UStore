@@ -44,6 +44,7 @@ class blobs_collection_t {
     ukv_database_t db_ {nullptr};
     ukv_collection_t collection_ {ukv_collection_main_k};
     ukv_transaction_t txn_ {nullptr};
+    ukv_snapshot_t snap_ {};
     any_arena_t arena_ {nullptr};
 
   public:
@@ -51,28 +52,32 @@ class blobs_collection_t {
     inline blobs_collection_t(ukv_database_t db_ptr,
                               ukv_collection_t collection = ukv_collection_main_k,
                               ukv_transaction_t txn = nullptr,
+                              ukv_snapshot_t snap = {},
                               ukv_arena_t* arena = nullptr) noexcept
-        : db_(db_ptr), collection_(collection), txn_(txn), arena_(db_, arena) {}
+        : db_(db_ptr), collection_(collection), txn_(txn), snap_(snap), arena_(db_, arena) {}
 
     inline blobs_collection_t(blobs_collection_t&& other) noexcept
         : db_(other.db_), collection_(std::exchange(other.collection_, ukv_collection_main_k)),
-          txn_(std::exchange(other.txn_, nullptr)), arena_(std::exchange(other.arena_, {nullptr})) {}
+          txn_(std::exchange(other.txn_, nullptr)), snap_(std::exchange(other.snap_, {})),
+          arena_(std::exchange(other.arena_, {nullptr})) {}
 
     inline blobs_collection_t& operator=(blobs_collection_t&& other) noexcept {
         std::swap(db_, other.db_);
         std::swap(collection_, other.collection_);
         std::swap(txn_, other.txn_);
+        std::swap(snap_, other.snap_);
         std::swap(arena_, other.arena_);
         return *this;
     }
 
     inline blobs_collection_t(blobs_collection_t const& other) noexcept
-        : db_(other.db_), collection_(other.collection_), txn_(other.txn_), arena_(other.db_) {}
+        : db_(other.db_), collection_(other.collection_), txn_(other.txn_), snap_(other.snap_), arena_(other.db_) {}
 
     inline blobs_collection_t& operator=(blobs_collection_t const& other) noexcept {
         db_ = other.db_;
         collection_ = other.collection_;
         txn_ = other.txn_;
+        snap_ = other.snap_;
         arena_ = any_arena_t(other.db_);
         return *this;
     }
@@ -82,11 +87,12 @@ class blobs_collection_t {
     inline ukv_arena_t* member_arena() noexcept { return arena_.member_ptr(); }
     inline ukv_database_t db() const noexcept { return db_; }
     inline ukv_transaction_t txn() const noexcept { return txn_; }
+    inline ukv_snapshot_t snap() const noexcept { return snap_; }
 
     inline blobs_range_t members( //
         ukv_key_t min_key = std::numeric_limits<ukv_key_t>::min(),
         ukv_key_t max_key = std::numeric_limits<ukv_key_t>::max()) const noexcept {
-        return {db_, txn_, collection_, min_key, max_key};
+        return {db_, txn_, snap_, collection_, min_key, max_key};
     }
     inline keys_range_t keys( //
         ukv_key_t min_key = std::numeric_limits<ukv_key_t>::min(),
@@ -97,7 +103,7 @@ class blobs_collection_t {
     inline pairs_range_t items( //
         ukv_key_t min_key = std::numeric_limits<ukv_key_t>::min(),
         ukv_key_t max_key = std::numeric_limits<ukv_key_t>::max()) const noexcept {
-        return {blobs_range_t {db_, txn_, collection_, min_key, max_key}};
+        return {blobs_range_t {db_, txn_, snap_, collection_, min_key, max_key}};
     }
 
     inline expected_gt<size_range_t> size_range() const noexcept {
@@ -111,36 +117,33 @@ class blobs_collection_t {
 
     status_t clear_values() noexcept {
         status_t status;
-        ukv_collection_drop_t collection_drop {
-            .db = db_,
-            .error = status.member_ptr(),
-            .id = collection_,
-            .mode = ukv_drop_vals_k,
-        };
+        ukv_collection_drop_t collection_drop {};
+        collection_drop.db = db_;
+        collection_drop.error = status.member_ptr();
+        collection_drop.id = collection_;
+        collection_drop.mode = ukv_drop_vals_k;
         ukv_collection_drop(&collection_drop);
         return status;
     }
 
     status_t clear() noexcept {
         status_t status;
-        ukv_collection_drop_t collection_drop {
-            .db = db_,
-            .error = status.member_ptr(),
-            .id = collection_,
-            .mode = ukv_drop_keys_vals_k,
-        };
+        ukv_collection_drop_t collection_drop {};
+        collection_drop.db = db_;
+        collection_drop.error = status.member_ptr();
+        collection_drop.id = collection_;
+        collection_drop.mode = ukv_drop_keys_vals_k;
         ukv_collection_drop(&collection_drop);
         return status;
     }
 
     status_t drop() noexcept {
         status_t status;
-        ukv_collection_drop_t collection_drop {
-            .db = db_,
-            .error = status.member_ptr(),
-            .id = collection_,
-            .mode = ukv_drop_keys_vals_handle_k,
-        };
+        ukv_collection_drop_t collection_drop {};
+        collection_drop.db = db_;
+        collection_drop.error = status.member_ptr();
+        collection_drop.id = collection_;
+        collection_drop.mode = ukv_drop_keys_vals_handle_k;
         ukv_collection_drop(&collection_drop);
         return status;
     }
@@ -156,7 +159,7 @@ class blobs_collection_t {
         arg.collections_begin = &collection_;
         arg.keys_begin = keys.begin();
         arg.count = keys.size();
-        return {db_, txn_, {std::move(arg)}, arena_};
+        return {db_, txn_, snap_, {std::move(arg)}, arena_};
     }
 
     template <typename keys_arg_at>
@@ -181,12 +184,12 @@ class blobs_collection_t {
 
             if constexpr (sfinae_has_field_gt<plain_t>::value)
                 arg.field = keys.field;
-            return result_t {db_, txn_, std::move(arg), arena_};
+            return result_t {db_, txn_, snap_, std::move(arg), arena_};
         }
         else {
             using locations_t = locations_in_collection_gt<keys_arg_at>;
             using result_t = blobs_ref_gt<locations_t>;
-            return result_t {db_, txn_, locations_t {std::forward<keys_arg_at>(keys), collection_}, arena_};
+            return result_t {db_, txn_, snap_, locations_t {std::forward<keys_arg_at>(keys), collection_}, arena_};
         }
     }
 };

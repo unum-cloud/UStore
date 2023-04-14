@@ -6,12 +6,17 @@
  */
 #pragma once
 
+#include <limits>            // `std::numeric_limit`
 #include <string>            // `std::string`
+#include <vector>            // `std::vector`
 #include <nlohmann/json.hpp> // `nlohmann::json`
+#include <fmt/format.h>      // `fmt::format`
 
 #include "ukv/cpp/status.hpp" // `status_t`
 
 namespace unum::ukv {
+
+using json_t = nlohmann::json;
 
 /**
  * @brief Storage disk configuration
@@ -20,10 +25,23 @@ namespace unum::ukv {
  * @max_size: Space limit used by DBMS
  */
 struct disk_config_t {
-    constexpr size_t unlimited_space_k = std::numeric_limit<size_t>::max(); // Not limited by software
+    static constexpr size_t unlimited_space_k = std::numeric_limits<size_t>::max(); // Not limited by software
 
     std::string path;
     size_t max_size = unlimited_space_k;
+};
+
+/**
+ * @brief Engine configuration
+ *
+ * @config_url: URL where is located the config.
+ * @config_file_path: Local config file path.
+ * @config: Config in key-value format.
+ */
+struct engine_config_t {
+    std::string config_url;
+    std::string config_file_path;
+    json_t config;
 };
 
 /**
@@ -31,76 +49,138 @@ struct disk_config_t {
  *
  * @directory: Main path where DB stores metadata, e.g schema, log, etc.
  * @data_directories: Storage paths where DB stores data.
- * @engine_config_path: Engine specific config file path.
+ * @engine_config_path: Engine specific config.
  */
 struct config_t {
     std::string directory;
-    darray_gt<disk_config_t> data_directories;
-    std::string engine_config_path;
+    std::vector<disk_config_t> data_directories;
+    engine_config_t engine;
 };
 
 /**
- * @brief Loads DBMS configuration from json
+ * @brief DBMS configurations loader
  */
 class config_loader_t {
   public:
-    using json_t = nlohmann::json;
+    static constexpr uint8_t current_major_version_k = 1;
+    static constexpr uint8_t current_minor_version_k = 0;
 
   public:
-    static constexpr u8_t current_major_version_k = 1;
-    static constexpr u8_t current_minor_version_k = 0;
+    static inline status_t load_from_json(json_t const& json, config_t& config);
+    static inline status_t load_from_json_string(std::string const& str_json,
+                                                 config_t& config,
+                                                 bool ignore_comments = false);
 
-  public:
-    static inline status_t load(json_t const& json, config_t& config) noexcept;
+    static inline status_t save_to_json(config_t const& config, json_t& json);
+    static inline status_t save_to_json_string(config_t const& config, std::string& str_json);
 
   private:
-    static inline status_t validate_config(json_t const& json);
+    static inline std::string current_version() noexcept;
+    static inline status_t validate_config(json_t const& json) noexcept;
 
-    static inline bool_t parse_version(std::string const& str_version, u8_t& major, u8_t& minor) noexcept;
-    static inline bool_t parse_volume(json_t const& json, string_t const& key, size_t& bytes) noexcept;
-    static inline bool_t parse_bytes(string_t const& str, size_t& bytes) noexcept;
+    static inline bool parse_version(std::string const& str_version, uint8_t& major, uint8_t& minor) noexcept;
+    static inline bool parse_volume(json_t const& json, std::string const& key, size_t& bytes) noexcept;
+    static inline bool parse_bytes(std::string const& str, size_t& bytes) noexcept;
 };
 
-inline status_t config_loader_t::load(json_t const& json, config_t& config) noexcept {
+inline status_t config_loader_t::load_from_json(json_t const& json, config_t& config) {
 
     try {
         auto status = validate_config(json);
         if (!status)
             return status;
 
-        config.directory = json.value("directory");
-        config.engine_config_path = json.value("engine_config_path");
+        // Main directory
+        config.directory = json.value("directory", "");
 
+        // Storage disks
         if (json.contains("data_directories")) {
             auto j_disks = json["data_directories"];
             if (j_disks.is_array()) {
                 for (auto j_disk : j_disks) {
-                    disk_config_t disk;
-                    disk.path = j_disk.value("path");
-                    disk.max_size = j_disk.value("max_size");
-                    if (disk.path.empty())
+                    disk_config_t disk_config;
+                    disk_config.path = j_disk.value("path", "");
+                    if (disk_config.path.empty())
                         return "Empty data directory path";
-                    if (!parse_volume(j_disk, "max_size", disk.max_size))
+                    if (!parse_volume(j_disk, "max_size", disk_config.max_size))
                         return "Invalid volume format";
-                    config.data_directories.push_back(std::move(disk));
+                    config.data_directories.push_back(std::move(disk_config));
                 }
             }
             else
                 return "Invalid data directories config";
         }
+
+        // Engine
+        if (json.contains("engine")) {
+            auto engine = json["engine"];
+            config.engine.config_url = engine.value("config_url", "");
+            config.engine.config_file_path = engine.value("config_file_path", "");;
+            if (engine.contains("config"))
+                config.engine.config = engine["config"];
+        }
     }
     catch (...) {
-        return "Exception occurred: Failed to load configs";
+        return "Exception occurred: Invalid json config file";
     }
 
     return {};
 }
 
-inline status_t config_loader_t::validate_config(json_t const& json) {
+inline status_t config_loader_t::load_from_json_string(std::string const& str_json,
+                                                       config_t& config,
+                                                       bool ignore_comments) {
+    auto json = json_t::parse(str_json, nullptr, true, ignore_comments);
+    return load_from_json(json, config);
+}
+
+inline status_t config_loader_t::save_to_json(config_t const& config, json_t& json) {
+
+    json.clear();
+    json["version"] = current_version();
+
+    // Main directory
+    json["directory"] = config.directory;
+
+    // Storage disks
+    std::vector<json_t> j_data_directories;
+    for (auto const& directory : config.data_directories) {
+        json_t j_directory;
+        j_directory["path"] = directory.path;
+        j_directory["max_size"] = directory.max_size;
+        j_data_directories.push_back(j_directory);
+    }
+    json["data_directories"] = j_data_directories;
+
+    // Engine
+    json_t j_engine;
+    j_engine["config_url"] = config.engine.config_url;
+    j_engine["config_file_path"] = config.engine.config_file_path;
+    j_engine["config"] = config.engine.config;
+    json["engine"] = j_engine;
+
+    return {};
+}
+
+inline status_t config_loader_t::save_to_json_string(config_t const& config, std::string& str_json) {
+    json_t json;
+    auto status = save_to_json(config, json);
+    if (!status)
+        return status;
+
+    str_json = json.dump();
+    return {};
+}
+
+inline std::string config_loader_t::current_version() noexcept {
+    return fmt::format("{}.{}", current_major_version_k, current_minor_version_k);
+}
+
+inline status_t config_loader_t::validate_config(json_t const& json) noexcept {
 
     std::string version = json.value("version", std::string());
-    u8_t major_version = 0;
-    u8_t minor_version = 0;
+    uint8_t major_version = 0;
+    uint8_t minor_version = 0;
     if (!parse_version(version.c_str(), major_version, minor_version))
         return "Invalid version format";
     if (major_version != current_major_version_k || minor_version != current_minor_version_k)
@@ -108,7 +188,7 @@ inline status_t config_loader_t::validate_config(json_t const& json) {
     return {};
 }
 
-inline bool_t config_loader_t::parse_version(std::string const& str_version, u8_t& major, u8_t& minor) noexcept {
+inline bool config_loader_t::parse_version(std::string const& str_version, uint8_t& major, uint8_t& minor) noexcept {
 
     int mj = 0;
     int mn = 0;
@@ -126,15 +206,16 @@ inline bool_t config_loader_t::parse_version(std::string const& str_version, u8_
     catch (...) {
         return false;
     }
-    if (mj < 0 || mn < 0 || mj > int(std::numeric_limits<u8_t>::max()) || mn > int(std::numeric_limits<u8_t>::max()))
+    if (mj < 0 || mn < 0 || mj > int(std::numeric_limits<uint8_t>::max()) ||
+        mn > int(std::numeric_limits<uint8_t>::max()))
         return false;
 
-    major = static_cast<u8_t>(mj);
-    minor = static_cast<u8_t>(mn);
+    major = static_cast<uint8_t>(mj);
+    minor = static_cast<uint8_t>(mn);
     return true;
 }
 
-inline bool_t config_loader_t::parse_volume(json_t const& json, string_t const& key, size_t& bytes) noexcept {
+inline bool config_loader_t::parse_volume(json_t const& json, std::string const& key, size_t& bytes) noexcept {
 
     auto it = json.find(key.c_str());
     if (it == json.end())
@@ -146,7 +227,7 @@ inline bool_t config_loader_t::parse_volume(json_t const& json, string_t const& 
         return true;
     }
     case json_t::value_t::string: {
-        string_t value = std::string(it.value()).c_str();
+        std::string value = std::string(it.value()).c_str();
         return parse_bytes(value, bytes);
     }
     default: break;
@@ -155,13 +236,17 @@ inline bool_t config_loader_t::parse_volume(json_t const& json, string_t const& 
     return false;
 }
 
-inline bool_t config_loader_t::parse_bytes(string_t const& str, size_t& bytes) noexcept {
+inline bool config_loader_t::parse_bytes(std::string const& str, size_t& bytes) noexcept {
 
-    std::stringstream ss(str.c_str());
+    if (str.empty()) { // Just set zero if it is empty
+        bytes = 0;
+        return true;
+    }
 
     // Parse number
     double number = 0.0;
-    if (str.view().starts_with(".") || (ss >> number).fail() || std::isnan(number))
+    std::stringstream ss(str.c_str());
+    if (str.rfind('.', 0) == 0 || (ss >> number).fail() || std::isnan(number))
         return false;
 
     // Parse unite
@@ -175,10 +260,10 @@ inline bool_t config_loader_t::parse_bytes(string_t const& str, size_t& bytes) n
             number *= 1024 * 1024 * 1024ull;
         else if (metric == "TB")
             number *= 1024 * 1024 * 1024 * 1024ull;
-        else if (metric != "B" || str.find('.') != size_max_k)
+        else if (metric != "B" || str.find('.') != std::string::npos)
             return false;
     }
-    else if (str.find('.') != size_max_k)
+    else if (str.find('.') != std::string::npos)
         return false;
 
     if (!ss.eof())

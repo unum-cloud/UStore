@@ -273,29 +273,28 @@ void ukv_paths_write(ukv_paths_write_t* c_ptr) {
     // > presences: zero length buckets are impossible here.
     // > lengths: value lengths are always smaller than buckets.
     // We can infer those and export differently.
-    ukv_length_t* buckets_offsets = nullptr;
-    ukv_byte_t* buckets_values = nullptr;
-    places_arg_t unique_places;
+    ukv_length_t* buckets_offsets {};
+    ukv_byte_t* buckets_values {};
+    places_arg_t unique_places {};
     auto unique_col_keys_strided = strided_range(unique_col_keys.begin(), unique_col_keys.end()).immutable();
     unique_places.collections_begin = unique_col_keys_strided.members(&collection_key_t::collection).begin();
     unique_places.keys_begin = unique_col_keys_strided.members(&collection_key_t::key).begin();
     unique_places.fields_begin = {};
     unique_places.count = static_cast<ukv_size_t>(unique_col_keys.size());
     auto opts = c.transaction ? ukv_options_t(c.options & ~ukv_option_transaction_dont_watch_k) : c.options;
-    ukv_read_t read {
-        .db = c.db,
-        .error = c.error,
-        .transaction = c.transaction,
-        .arena = c.arena,
-        .options = opts,
-        .tasks_count = unique_places.count,
-        .collections = unique_places.collections_begin.get(),
-        .collections_stride = unique_places.collections_begin.stride(),
-        .keys = unique_places.keys_begin.get(),
-        .keys_stride = unique_places.keys_begin.stride(),
-        .offsets = &buckets_offsets,
-        .values = &buckets_values,
-    };
+    ukv_read_t read {};
+    read.db = c.db;
+    read.error = c.error;
+    read.transaction = c.transaction;
+    read.arena = c.arena;
+    read.options = opts;
+    read.tasks_count = unique_places.count;
+    read.collections = unique_places.collections_begin.get();
+    read.collections_stride = unique_places.collections_begin.stride();
+    read.keys = unique_places.keys_begin.get();
+    read.keys_stride = unique_places.keys_begin.stride();
+    read.offsets = &buckets_offsets;
+    read.values = &buckets_values;
 
     ukv_read(&read);
     return_if_error_m(c.error);
@@ -328,22 +327,21 @@ void ukv_paths_write(ukv_paths_write_t* c_ptr) {
             remove_from_bucket(bucket, key_str);
     }
 
-    ukv_write_t write {
-        .db = c.db,
-        .error = c.error,
-        .transaction = c.transaction,
-        .arena = arena,
-        .options = opts,
-        .tasks_count = unique_places.count,
-        .collections = unique_places.collections_begin.get(),
-        .collections_stride = unique_places.collections_begin.stride(),
-        .keys = unique_places.keys_begin.get(),
-        .keys_stride = unique_places.keys_begin.stride(),
-        .lengths = updated_buckets[0].member_length(),
-        .lengths_stride = sizeof(value_view_t),
-        .values = updated_buckets[0].member_ptr(),
-        .values_stride = sizeof(value_view_t),
-    };
+    ukv_write_t write {};
+    write.db = c.db;
+    write.error = c.error;
+    write.transaction = c.transaction;
+    write.arena = arena;
+    write.options = opts;
+    write.tasks_count = unique_places.count;
+    write.collections = unique_places.collections_begin.get();
+    write.collections_stride = unique_places.collections_begin.stride();
+    write.keys = unique_places.keys_begin.get();
+    write.keys_stride = unique_places.keys_begin.stride();
+    write.lengths = updated_buckets[0].member_length();
+    write.lengths_stride = sizeof(value_view_t);
+    write.values = updated_buckets[0].member_ptr();
+    write.values_stride = sizeof(value_view_t);
 
     // Once all is updated, we can safely write back
     ukv_write(&write);
@@ -378,22 +376,21 @@ void ukv_paths_read(ukv_paths_read_t* c_ptr) {
     // > presences: zero length buckets are impossible here.
     // > lengths: value lengths are always smaller than buckets.
     // We can infer those and export differently.
-    ukv_length_t* buckets_offsets = nullptr;
-    ukv_byte_t* buckets_values = nullptr;
-    ukv_read_t read {
-        .db = c.db,
-        .error = c.error,
-        .transaction = c.transaction,
-        .arena = arena,
-        .options = c.options,
-        .tasks_count = c.tasks_count,
-        .collections = c.collections,
-        .collections_stride = c.collections_stride,
-        .keys = buckets_keys.begin(),
-        .keys_stride = sizeof(ukv_key_t),
-        .offsets = &buckets_offsets,
-        .values = &buckets_values,
-    };
+    ukv_length_t* buckets_offsets {};
+    ukv_byte_t* buckets_values {};
+    ukv_read_t read {};
+    read.db = c.db;
+    read.error = c.error;
+    read.transaction = c.transaction;
+    read.arena = arena;
+    read.options = c.options;
+    read.tasks_count = c.tasks_count;
+    read.collections = c.collections;
+    read.collections_stride = c.collections_stride;
+    read.keys = buckets_keys.begin();
+    read.keys_stride = sizeof(ukv_key_t);
+    read.offsets = &buckets_offsets;
+    read.values = &buckets_values;
 
     ukv_read(&read);
     return_if_error_m(c.error);

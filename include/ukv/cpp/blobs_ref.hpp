@@ -66,10 +66,11 @@ class blobs_ref_gt {
     using length_t = std::conditional_t<is_one_k, ukv_length_t, ptr_range_gt<ukv_length_t>>;
 
   protected:
-    ukv_database_t db_ {nullptr};
-    ukv_transaction_t txn_ {nullptr};
-    ukv_arena_t* arena_ {nullptr};
-    locations_store_t locations_;
+    ukv_database_t db_ {};
+    ukv_transaction_t txn_ {};
+    ukv_snapshot_t snap_ {};
+    ukv_arena_t* arena_ {};
+    locations_store_t locations_ {};
 
     template <typename contents_arg_at>
     status_t any_assign(contents_arg_at&&, ukv_options_t) noexcept;
@@ -81,8 +82,12 @@ class blobs_ref_gt {
     expected_gt<expected_at> any_gather(contents_arg_at&&, ukv_options_t) noexcept;
 
   public:
-    blobs_ref_gt(ukv_database_t db, ukv_transaction_t txn, locations_at&& locations, ukv_arena_t* arena) noexcept
-        : db_(db), txn_(txn), arena_(arena), locations_(std::forward<locations_at>(locations)) {}
+    blobs_ref_gt(ukv_database_t db,
+                 ukv_transaction_t txn,
+                 ukv_snapshot_t snap,
+                 locations_at&& locations,
+                 ukv_arena_t* arena) noexcept
+        : db_(db), txn_(txn), snap_(snap), arena_(arena), locations_(std::forward<locations_at>(locations)) {}
 
     blobs_ref_gt(blobs_ref_gt&&) = default;
     blobs_ref_gt& operator=(blobs_ref_gt&&) = default;
@@ -141,12 +146,11 @@ class blobs_ref_gt {
     status_t clear(bool flush = false) noexcept {
         ukv_bytes_ptr_t any = reinterpret_cast<ukv_bytes_ptr_t>(this);
         ukv_length_t len = 0;
-        contents_arg_t arg {
-            .offsets_begin = {},
-            .lengths_begin = {&len},
-            .contents_begin = {&any},
-            .count = 1,
-        };
+        contents_arg_t arg {};
+        arg.offsets_begin = {};
+        arg.lengths_begin = {&len};
+        arg.contents_begin = {&any};
+        arg.count = 1;
         return assign(arg, flush);
     }
 
@@ -189,22 +193,22 @@ expected_gt<expected_at> blobs_ref_gt<locations_at>::any_get(ukv_options_t optio
     auto count = keys_extractor_t {}.count(locs);
     auto keys = keys_extractor_t {}.keys(locs);
     auto collections = keys_extractor_t {}.collections(locs);
-    ukv_read_t read {
-        .db = db_,
-        .error = status.member_ptr(),
-        .transaction = txn_,
-        .arena = arena_,
-        .options = options,
-        .tasks_count = count,
-        .collections = collections.get(),
-        .collections_stride = collections.stride(),
-        .keys = keys.get(),
-        .keys_stride = keys.stride(),
-        .presences = wants_present ? &found_presences : nullptr,
-        .offsets = wants_value ? &found_offsets : nullptr,
-        .lengths = wants_value || wants_length ? &found_lengths : nullptr,
-        .values = wants_value ? &found_values : nullptr,
-    };
+    ukv_read_t read {};
+    read.db = db_;
+    read.error = status.member_ptr();
+    read.transaction = txn_;
+    read.snapshot = snap_;
+    read.arena = arena_;
+    read.options = options;
+    read.tasks_count = count;
+    read.collections = collections.get();
+    read.collections_stride = collections.stride();
+    read.keys = keys.get();
+    read.keys_stride = keys.stride();
+    read.presences = wants_present ? &found_presences : nullptr;
+    read.offsets = wants_value ? &found_offsets : nullptr;
+    read.lengths = wants_value || wants_length ? &found_lengths : nullptr;
+    read.values = wants_value ? &found_values : nullptr;
 
     ukv_read(&read);
 
@@ -250,24 +254,23 @@ status_t blobs_ref_gt<locations_at>::any_assign(contents_arg_at&& vals_ref, ukv_
     auto offsets = value_extractor_t {}.offsets(vals);
     auto lengths = value_extractor_t {}.lengths(vals);
 
-    ukv_write_t write {
-        .db = db_,
-        .error = status.member_ptr(),
-        .transaction = txn_,
-        .arena = arena_,
-        .options = options,
-        .tasks_count = count,
-        .collections = collections.get(),
-        .collections_stride = collections.stride(),
-        .keys = keys.get(),
-        .keys_stride = keys.stride(),
-        .offsets = offsets.get(),
-        .offsets_stride = offsets.stride(),
-        .lengths = lengths.get(),
-        .lengths_stride = lengths.stride(),
-        .values = contents.get(),
-        .values_stride = contents.stride(),
-    };
+    ukv_write_t write {};
+    write.db = db_;
+    write.error = status.member_ptr();
+    write.transaction = txn_;
+    write.arena = arena_;
+    write.options = options;
+    write.tasks_count = count;
+    write.collections = collections.get();
+    write.collections_stride = collections.stride();
+    write.keys = keys.get();
+    write.keys_stride = keys.stride();
+    write.offsets = offsets.get();
+    write.offsets_stride = offsets.stride();
+    write.lengths = lengths.get();
+    write.lengths_stride = lengths.stride();
+    write.values = contents.get();
+    write.values_stride = contents.stride();
 
     ukv_write(&write);
     return status;

@@ -68,6 +68,7 @@ class docs_ref_gt {
   protected:
     ukv_database_t db_ = nullptr;
     ukv_transaction_t transaction_ = nullptr;
+    ukv_snapshot_t snapshot_ = nullptr;
     ukv_arena_t* arena_ = nullptr;
     locations_store_t locations_;
     ukv_doc_field_type_t type_ = ukv_doc_field_default_k;
@@ -84,10 +85,12 @@ class docs_ref_gt {
   public:
     docs_ref_gt(ukv_database_t db,
                 ukv_transaction_t txn,
+                ukv_snapshot_t snap,
                 locations_at&& locations,
                 ukv_arena_t* arena,
                 ukv_doc_field_type_t type = ukv_doc_field_default_k) noexcept
-        : db_(db), transaction_(txn), arena_(arena), locations_(std::forward<locations_at>(locations)), type_(type) {}
+        : db_(db), transaction_(txn), snapshot_(snap), arena_(arena), locations_(std::forward<locations_at>(locations)),
+          type_(type) {}
 
     docs_ref_gt(docs_ref_gt&&) = default;
     docs_ref_gt& operator=(docs_ref_gt&&) = default;
@@ -164,13 +167,13 @@ class docs_ref_gt {
      */
     status_t clear(bool flush = false) noexcept {
         ukv_bytes_ptr_t any = reinterpret_cast<ukv_bytes_ptr_t>(this);
-        ukv_length_t len = 0;
-        contents_arg_t arg {
-            .offsets_begin = {},
-            .lengths_begin = {&len},
-            .contents_begin = {&any},
-            .count = 1,
-        };
+        ukv_length_t len {};
+        contents_arg_t arg {};
+        arg.offsets_begin = {};
+        arg.lengths_begin = {&len};
+        arg.contents_begin = {&any};
+        arg.count = 1;
+
         return assign(arg, flush);
     }
 
@@ -296,6 +299,7 @@ expected_gt<expected_at> docs_ref_gt<locations_at>::any_get(ukv_doc_field_type_t
     docs_read.db = db_;
     docs_read.error = status.member_ptr();
     docs_read.transaction = transaction_;
+    docs_read.snapshot = snapshot_;
     docs_read.arena = arena_;
     docs_read.options = options;
     docs_read.type = type;
@@ -404,6 +408,7 @@ expected_gt<joined_strs_t> docs_ref_gt<locations_at>::gist(bool watch) noexcept 
     docs_gist.db = db_;
     docs_gist.error = status.member_ptr();
     docs_gist.transaction = transaction_;
+    docs_gist.snapshot = snapshot_;
     docs_gist.arena = arena_;
     docs_gist.options = options;
     docs_gist.docs_count = count;
@@ -444,6 +449,7 @@ expected_gt<expected_at> docs_ref_gt<locations_at>::any_gather(layout_at&& layou
     docs_gather.db = db_;
     docs_gather.error = status.member_ptr();
     docs_gather.transaction = transaction_;
+    docs_gather.snapshot = snapshot_;
     docs_gather.arena = arena_;
     docs_gather.options = options;
     docs_gather.docs_count = count;

@@ -23,8 +23,9 @@ namespace unum::ukv {
  */
 class graph_collection_t {
     ukv_database_t db_ = nullptr;
-    ukv_transaction_t transaction_ = nullptr;
     ukv_collection_t collection_ = ukv_collection_main_k;
+    ukv_transaction_t transaction_ = nullptr;
+    ukv_snapshot_t snapshot_ = {};
     any_arena_t arena_;
 
   public:
@@ -32,8 +33,9 @@ class graph_collection_t {
     graph_collection_t(ukv_database_t db,
                        ukv_collection_t collection = ukv_collection_main_k,
                        ukv_transaction_t txn = nullptr,
+                       ukv_snapshot_t snap = {},
                        ukv_arena_t* arena = nullptr) noexcept
-        : db_(db), transaction_(txn), collection_(collection), arena_(db_, arena) {}
+        : db_(db), collection_(collection), transaction_(txn), snapshot_(snap), arena_(db_, arena) {}
 
     graph_collection_t(graph_collection_t&&) = default;
     graph_collection_t& operator=(graph_collection_t&&) = default;
@@ -42,16 +44,15 @@ class graph_collection_t {
 
     status_t upsert_vertices(strided_range_gt<ukv_key_t const> vertices) noexcept {
         status_t status;
-        ukv_graph_upsert_vertices_t upsert {
-            .db = db_,
-            .error = status.member_ptr(),
-            .transaction = transaction_,
-            .arena = arena_,
-            .tasks_count = vertices.size(),
-            .collections = &collection_,
-            .vertices = vertices.data(),
-            .vertices_stride = vertices.stride(),
-        };
+        ukv_graph_upsert_vertices_t upsert {};
+        upsert.db = db_;
+        upsert.error = status.member_ptr();
+        upsert.transaction = transaction_;
+        upsert.arena = arena_;
+        upsert.tasks_count = vertices.size();
+        upsert.collections = &collection_;
+        upsert.vertices = vertices.data();
+        upsert.vertices_stride = vertices.stride();
 
         ukv_graph_upsert_vertices(&upsert);
         return status;
@@ -60,20 +61,19 @@ class graph_collection_t {
     status_t upsert_edges(edges_view_t const& edges) noexcept {
         status_t status;
 
-        ukv_graph_upsert_edges_t graph_upsert_edges {
-            .db = db_,
-            .error = status.member_ptr(),
-            .transaction = transaction_,
-            .arena = arena_,
-            .tasks_count = edges.size(),
-            .collections = &collection_,
-            .edges_ids = edges.edge_ids.begin().get(),
-            .edges_stride = edges.edge_ids.stride(),
-            .sources_ids = edges.source_ids.begin().get(),
-            .sources_stride = edges.source_ids.stride(),
-            .targets_ids = edges.target_ids.begin().get(),
-            .targets_stride = edges.target_ids.stride(),
-        };
+        ukv_graph_upsert_edges_t graph_upsert_edges {};
+        graph_upsert_edges.db = db_;
+        graph_upsert_edges.error = status.member_ptr();
+        graph_upsert_edges.transaction = transaction_;
+        graph_upsert_edges.arena = arena_;
+        graph_upsert_edges.tasks_count = edges.size();
+        graph_upsert_edges.collections = &collection_;
+        graph_upsert_edges.edges_ids = edges.edge_ids.begin().get();
+        graph_upsert_edges.edges_stride = edges.edge_ids.stride();
+        graph_upsert_edges.sources_ids = edges.source_ids.begin().get();
+        graph_upsert_edges.sources_stride = edges.source_ids.stride();
+        graph_upsert_edges.targets_ids = edges.target_ids.begin().get();
+        graph_upsert_edges.targets_stride = edges.target_ids.stride();
 
         ukv_graph_upsert_edges(&graph_upsert_edges);
         return status;
@@ -87,19 +87,18 @@ class graph_collection_t {
         status_t status;
         ukv_options_t options = flush ? ukv_option_write_flush_k : ukv_options_default_k;
 
-        ukv_graph_remove_vertices_t graph_remove_vertices {
-            .db = db_,
-            .error = status.member_ptr(),
-            .transaction = transaction_,
-            .arena = arena_,
-            .options = options,
-            .tasks_count = vertices.count(),
-            .collections = &collection_,
-            .vertices = vertices.begin().get(),
-            .vertices_stride = vertices.stride(),
-            .roles = roles.begin().get(),
-            .roles_stride = roles.stride(),
-        };
+        ukv_graph_remove_vertices_t graph_remove_vertices {};
+        graph_remove_vertices.db = db_;
+        graph_remove_vertices.error = status.member_ptr();
+        graph_remove_vertices.transaction = transaction_;
+        graph_remove_vertices.arena = arena_;
+        graph_remove_vertices.options = options;
+        graph_remove_vertices.tasks_count = vertices.count();
+        graph_remove_vertices.collections = &collection_;
+        graph_remove_vertices.vertices = vertices.begin().get();
+        graph_remove_vertices.vertices_stride = vertices.stride();
+        graph_remove_vertices.roles = roles.begin().get();
+        graph_remove_vertices.roles_stride = roles.stride();
 
         ukv_graph_remove_vertices(&graph_remove_vertices);
         return status;
@@ -108,20 +107,19 @@ class graph_collection_t {
     status_t remove_edges(edges_view_t const& edges) noexcept {
         status_t status;
 
-        ukv_graph_remove_edges_t graph_remove_edges {
-            .db = db_,
-            .error = status.member_ptr(),
-            .transaction = transaction_,
-            .arena = arena_,
-            .tasks_count = edges.size(),
-            .collections = &collection_,
-            .edges_ids = edges.edge_ids.begin().get(),
-            .edges_stride = edges.edge_ids.stride(),
-            .sources_ids = edges.source_ids.begin().get(),
-            .sources_stride = edges.source_ids.stride(),
-            .targets_ids = edges.target_ids.begin().get(),
-            .targets_stride = edges.target_ids.stride(),
-        };
+        ukv_graph_remove_edges_t graph_remove_edges {};
+        graph_remove_edges.db = db_;
+        graph_remove_edges.error = status.member_ptr();
+        graph_remove_edges.transaction = transaction_;
+        graph_remove_edges.arena = arena_;
+        graph_remove_edges.tasks_count = edges.size();
+        graph_remove_edges.collections = &collection_;
+        graph_remove_edges.edges_ids = edges.edge_ids.begin().get();
+        graph_remove_edges.edges_stride = edges.edge_ids.stride();
+        graph_remove_edges.sources_ids = edges.source_ids.begin().get();
+        graph_remove_edges.sources_stride = edges.source_ids.stride();
+        graph_remove_edges.targets_ids = edges.target_ids.begin().get();
+        graph_remove_edges.targets_stride = edges.target_ids.stride();
 
         ukv_graph_remove_edges(&graph_remove_edges);
         return status;
@@ -151,36 +149,36 @@ class graph_collection_t {
 
     status_t remove_edges() noexcept {
         status_t status;
-        ukv_collection_drop_t collection_drop {
-            .db = db_,
-            .error = status.member_ptr(),
-            .id = collection_,
-            .mode = ukv_drop_vals_k,
-        };
+        ukv_collection_drop_t collection_drop {};
+        collection_drop.db = db_;
+        collection_drop.error = status.member_ptr();
+        collection_drop.id = collection_;
+        collection_drop.mode = ukv_drop_vals_k;
+
         ukv_collection_drop(&collection_drop);
         return status;
     }
 
     status_t clear() noexcept {
         status_t status;
-        ukv_collection_drop_t collection_drop {
-            .db = db_,
-            .error = status.member_ptr(),
-            .id = collection_,
-            .mode = ukv_drop_keys_vals_k,
-        };
+        ukv_collection_drop_t collection_drop {};
+        collection_drop.db = db_;
+        collection_drop.error = status.member_ptr();
+        collection_drop.id = collection_;
+        collection_drop.mode = ukv_drop_keys_vals_k;
+
         ukv_collection_drop(&collection_drop);
         return status;
     }
 
     status_t remove() noexcept {
         status_t status;
-        ukv_collection_drop_t collection_drop {
-            .db = db_,
-            .error = status.member_ptr(),
-            .id = collection_,
-            .mode = ukv_drop_keys_vals_handle_k,
-        };
+        ukv_collection_drop_t collection_drop {};
+        collection_drop.db = db_;
+        collection_drop.error = status.member_ptr();
+        collection_drop.id = collection_;
+        collection_drop.mode = ukv_drop_keys_vals_handle_k;
+
         ukv_collection_drop(&collection_drop);
         return status;
     }
@@ -206,20 +204,20 @@ class graph_collection_t {
         ukv_vertex_degree_t* degrees_per_vertex = nullptr;
         ukv_options_t options = !watch ? ukv_option_transaction_dont_watch_k : ukv_options_default_k;
 
-        ukv_graph_find_edges_t graph_find_edges {
-            .db = db_,
-            .error = status.member_ptr(),
-            .transaction = transaction_,
-            .arena = arena_,
-            .options = options,
-            .tasks_count = vertices.count(),
-            .collections = &collection_,
-            .vertices = vertices.begin().get(),
-            .vertices_stride = vertices.stride(),
-            .roles = roles.begin().get(),
-            .roles_stride = roles.stride(),
-            .degrees_per_vertex = &degrees_per_vertex,
-        };
+        ukv_graph_find_edges_t graph_find_edges {};
+        graph_find_edges.db = db_;
+        graph_find_edges.error = status.member_ptr();
+        graph_find_edges.transaction = transaction_;
+        graph_find_edges.snapshot = snapshot_;
+        graph_find_edges.arena = arena_;
+        graph_find_edges.options = options;
+        graph_find_edges.tasks_count = vertices.count();
+        graph_find_edges.collections = &collection_;
+        graph_find_edges.vertices = vertices.begin().get();
+        graph_find_edges.vertices_stride = vertices.stride();
+        graph_find_edges.roles = roles.begin().get();
+        graph_find_edges.roles_stride = roles.stride();
+        graph_find_edges.degrees_per_vertex = &degrees_per_vertex;
 
         ukv_graph_find_edges(&graph_find_edges);
 
@@ -230,7 +228,8 @@ class graph_collection_t {
     }
 
     expected_gt<bool> contains(ukv_key_t vertex, bool watch = true) noexcept {
-        return blobs_ref_gt<collection_key_field_t>(db_, transaction_, ckf(collection_, vertex), arena_).present(watch);
+        return blobs_ref_gt<collection_key_field_t>(db_, transaction_, snapshot_, ckf(collection_, vertex), arena_)
+            .present(watch);
     }
 
     /**
@@ -244,7 +243,39 @@ class graph_collection_t {
         arg.collections_begin = {&collection_, 0};
         arg.keys_begin = vertices.begin();
         arg.count = vertices.count();
-        return blobs_ref_gt<places_arg_t>(db_, transaction_, std::move(arg), arena_).present(watch);
+        return blobs_ref_gt<places_arg_t>(db_, transaction_, snapshot_, std::move(arg), arena_).present(watch);
+    }
+
+    expected_gt<keys_stream_t> vertex_stream(
+        std::size_t vertices_read_ahead = keys_stream_t::default_read_ahead_k) const noexcept {
+        blobs_range_t members(db_, transaction_, snapshot_, collection_);
+        keys_range_t range {members};
+        keys_stream_t stream = range.begin();
+        if (auto status = stream.seek_to_first(); !status)
+            return {std::move(status), {db_}};
+        return stream;
+    }
+
+    std::size_t number_of_vertices() noexcept(false) {
+        blobs_range_t members(db_, transaction_, snapshot_, collection_);
+        keys_range_t range {members};
+        return range.size();
+    }
+
+    std::size_t number_of_edges() noexcept(false) {
+        graph_stream_t stream {
+            db_,
+            collection_,
+            transaction_,
+            snapshot_,
+            keys_stream_t::default_read_ahead_k,
+            ukv_vertex_source_k,
+        };
+        stream.seek_to_first().throw_unhandled();
+        std::size_t count_results = 0;
+        for (; !stream.is_end(); ++stream)
+            ++count_results;
+        return count_results;
     }
 
     using adjacency_range_t = range_gt<graph_stream_t>;
@@ -253,8 +284,8 @@ class graph_collection_t {
         ukv_vertex_role_t role = ukv_vertex_role_any_k,
         std::size_t vertices_read_ahead = keys_stream_t::default_read_ahead_k) const noexcept {
 
-        graph_stream_t b {db_, collection_, transaction_, vertices_read_ahead, role};
-        graph_stream_t e {db_, collection_, transaction_, vertices_read_ahead, role};
+        graph_stream_t b {db_, collection_, transaction_, snapshot_, vertices_read_ahead, role};
+        graph_stream_t e {db_, collection_, transaction_, snapshot_, vertices_read_ahead, role};
         status_t status = b.seek_to_first();
         if (!status)
             return status;
@@ -266,28 +297,28 @@ class graph_collection_t {
         return result;
     }
 
-    expected_gt<edges_span_t> edges( //
+    expected_gt<edges_span_t> edges_containing( //
         ukv_key_t vertex,
         ukv_vertex_role_t role = ukv_vertex_role_any_k,
         bool watch = true) noexcept {
 
-        status_t status;
-        ukv_vertex_degree_t* degrees_per_vertex = nullptr;
-        ukv_key_t* edges_per_vertex = nullptr;
+        status_t status {};
+        ukv_vertex_degree_t* degrees_per_vertex {};
+        ukv_key_t* edges_per_vertex {};
 
-        ukv_graph_find_edges_t graph_find_edges {
-            .db = db_,
-            .error = status.member_ptr(),
-            .transaction = transaction_,
-            .arena = arena_,
-            .options = !watch ? ukv_option_transaction_dont_watch_k : ukv_options_default_k,
-            .tasks_count = 1,
-            .collections = &collection_,
-            .vertices = &vertex,
-            .roles = &role,
-            .degrees_per_vertex = &degrees_per_vertex,
-            .edges_per_vertex = &edges_per_vertex,
-        };
+        ukv_graph_find_edges_t graph_find_edges {};
+        graph_find_edges.db = db_;
+        graph_find_edges.error = status.member_ptr();
+        graph_find_edges.transaction = transaction_;
+        graph_find_edges.snapshot = snapshot_;
+        graph_find_edges.arena = arena_;
+        graph_find_edges.options = !watch ? ukv_option_transaction_dont_watch_k : ukv_options_default_k;
+        graph_find_edges.tasks_count = 1;
+        graph_find_edges.collections = &collection_;
+        graph_find_edges.vertices = &vertex;
+        graph_find_edges.roles = &role;
+        graph_find_edges.degrees_per_vertex = &degrees_per_vertex;
+        graph_find_edges.edges_per_vertex = &edges_per_vertex;
 
         ukv_graph_find_edges(&graph_find_edges);
 
@@ -302,8 +333,8 @@ class graph_collection_t {
         return edges_span_t {edges_begin, edges_begin + edges_count};
     }
 
-    expected_gt<edges_span_t> edges(ukv_key_t source, ukv_key_t target, bool watch = true) noexcept {
-        auto maybe_all = edges(source, ukv_vertex_source_k, watch);
+    expected_gt<edges_span_t> edges_between(ukv_key_t source, ukv_key_t target, bool watch = true) noexcept {
+        auto maybe_all = edges_containing(source, ukv_vertex_source_k, watch);
         if (!maybe_all)
             return maybe_all;
 
@@ -330,21 +361,21 @@ class graph_collection_t {
         ukv_vertex_degree_t* degrees_per_vertex = nullptr;
         ukv_key_t* edges_per_vertex = nullptr;
 
-        ukv_graph_find_edges_t graph_find_edges {
-            .db = db_,
-            .error = status.member_ptr(),
-            .transaction = transaction_,
-            .arena = arena_,
-            .options = !watch ? ukv_option_transaction_dont_watch_k : ukv_options_default_k,
-            .tasks_count = vertices.count(),
-            .collections = &collection_,
-            .vertices = vertices.begin().get(),
-            .vertices_stride = vertices.stride(),
-            .roles = roles.begin().get(),
-            .roles_stride = roles.stride(),
-            .degrees_per_vertex = &degrees_per_vertex,
-            .edges_per_vertex = &edges_per_vertex,
-        };
+        ukv_graph_find_edges_t graph_find_edges {};
+        graph_find_edges.db = db_;
+        graph_find_edges.error = status.member_ptr();
+        graph_find_edges.transaction = transaction_;
+        graph_find_edges.snapshot = snapshot_;
+        graph_find_edges.arena = arena_;
+        graph_find_edges.options = !watch ? ukv_option_transaction_dont_watch_k : ukv_options_default_k;
+        graph_find_edges.tasks_count = vertices.count();
+        graph_find_edges.collections = &collection_;
+        graph_find_edges.vertices = vertices.begin().get();
+        graph_find_edges.vertices_stride = vertices.stride();
+        graph_find_edges.roles = roles.begin().get();
+        graph_find_edges.roles_stride = roles.stride();
+        graph_find_edges.degrees_per_vertex = &degrees_per_vertex;
+        graph_find_edges.edges_per_vertex = &edges_per_vertex;
 
         ukv_graph_find_edges(&graph_find_edges);
 
@@ -360,24 +391,25 @@ class graph_collection_t {
     }
 
     expected_gt<strided_range_gt<ukv_key_t>> successors(ukv_key_t vertex) noexcept {
-        auto maybe = edges(vertex, ukv_vertex_source_k);
+        auto maybe = edges_containing(vertex, ukv_vertex_source_k);
         if (!maybe)
             return maybe.release_status();
         return strided_range_gt<ukv_key_t> {maybe->target_ids};
     }
 
     expected_gt<strided_range_gt<ukv_key_t>> predecessors(ukv_key_t vertex) noexcept {
-        auto maybe = edges(vertex, ukv_vertex_target_k);
+        auto maybe = edges_containing(vertex, ukv_vertex_target_k);
         if (!maybe)
             return maybe.release_status();
         return strided_range_gt<ukv_key_t> {maybe->source_ids};
     }
 
-    expected_gt<strided_range_gt<ukv_key_t>> neighbors(ukv_key_t vertex) noexcept {
+    expected_gt<strided_range_gt<ukv_key_t>> neighbors(ukv_key_t vertex,
+                                                       ukv_vertex_role_t role = ukv_vertex_role_any_k) noexcept {
         // Retrieving neighbors in directed graphs is trickier than just `successors` or `predecessors`.
         // We are receiving an adjacency list, where both incoming an edges exist.
         // So the stride/offset is not uniform across the entire list.
-        auto maybe = edges(vertex, ukv_vertex_role_any_k);
+        auto maybe = edges_containing(vertex, role);
         if (!maybe)
             return maybe.release_status();
 
@@ -392,7 +424,9 @@ class graph_collection_t {
                 std::swap(u, v);
         }
 
-        return strided_range_gt<ukv_key_t> {es.target_ids};
+        auto neighbors = es.target_ids;
+        count = sort_and_deduplicate(neighbors.begin(), neighbors.end());
+        return strided_range_gt<ukv_key_t> {{neighbors.begin()}, count};
     }
 
     status_t export_adjacency_list(std::string const& path,

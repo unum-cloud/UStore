@@ -95,6 +95,8 @@ class strided_iterator_gt {
 
     bool operator==(strided_iterator_gt const& other) const noexcept { return raw_ == other.raw_; }
     bool operator!=(strided_iterator_gt const& other) const noexcept { return raw_ != other.raw_; }
+    bool operator<(strided_iterator_gt const& other) const noexcept { return raw_ < other.raw_; }
+    bool operator>(strided_iterator_gt const& other) const noexcept { return raw_ > other.raw_; }
 
     template <typename member_at, typename parent_at = element_t>
     auto members(member_at parent_at::*member_ptr) const noexcept {

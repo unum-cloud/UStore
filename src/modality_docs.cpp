@@ -230,6 +230,11 @@ yyjson_mut_val* json_lookupn(yyjson_mut_val* json, ukv_str_view_t field, size_t 
                              : yyjson_mut_obj_getn(json, field, len);
 }
 
+simdjson::ondemand::object& reset(simdjson::ondemand::object& doc) noexcept {
+    doc.reset();
+    return doc;
+}
+
 json_t json_parse(value_view_t bytes, linked_memory_lock_t& arena, ukv_error_t* c_error) noexcept {
 
     if (bytes.empty())
@@ -1096,7 +1101,7 @@ void modify_field( //
         }
         else if (c_modification == doc_modification_t::remove_k) {
             yyjson_mut_val* key = yyjson_mut_strncpy(original_doc, last_key_or_idx.data(), last_key_or_idx.size());
-            return_error_if_m(yyjson_mut_obj_remove(val, key), c_error, 0, "Failed To Insert!");
+            return_error_if_m(yyjson_mut_obj_remove(val, key), c_error, 0, "Failed To Remove!");
         }
         else if (c_modification == doc_modification_t::update_k) {
             yyjson_mut_val* key = yyjson_mut_strncpy(original_doc, last_key_or_idx.data(), last_key_or_idx.size());
@@ -1262,24 +1267,23 @@ void read_unique_docs( //
     ukv_error_t* c_error,
     callback_at callback) noexcept {
 
-    ukv_byte_t* found_binary_begin = nullptr;
-    ukv_length_t* found_binary_offs = nullptr;
-    ukv_length_t* found_binary_lens = nullptr;
-    ukv_read_t read {
-        .db = c_db,
-        .error = c_error,
-        .transaction = c_txn,
-        .arena = arena,
-        .options = c_options,
-        .tasks_count = places.count,
-        .collections = places.collections_begin.get(),
-        .collections_stride = places.collections_begin.stride(),
-        .keys = places.keys_begin.get(),
-        .keys_stride = places.keys_begin.stride(),
-        .offsets = &found_binary_offs,
-        .lengths = &found_binary_lens,
-        .values = &found_binary_begin,
-    };
+    ukv_byte_t* found_binary_begin {};
+    ukv_length_t* found_binary_offs {};
+    ukv_length_t* found_binary_lens {};
+    ukv_read_t read {};
+    read.db = c_db;
+    read.error = c_error;
+    read.transaction = c_txn;
+    read.arena = arena;
+    read.options = c_options;
+    read.tasks_count = places.count;
+    read.collections = places.collections_begin.get();
+    read.collections_stride = places.collections_begin.stride();
+    read.keys = places.keys_begin.get();
+    read.keys_stride = places.keys_begin.stride();
+    read.offsets = &found_binary_offs;
+    read.lengths = &found_binary_lens;
+    read.values = &found_binary_begin;
 
     ukv_read(&read);
 
@@ -1288,7 +1292,7 @@ void read_unique_docs( //
 
     ukv_length_t max_length =
         *std::max_element(found_binary_lens, found_binary_lens + places.count, [](ukv_length_t lhs, ukv_length_t rhs) {
-            return (lhs < rhs) && (lhs != ukv_length_missing_k) && rhs != ukv_length_missing_k;
+            return ((lhs < rhs) | (lhs == ukv_length_missing_k)) & (rhs != ukv_length_missing_k);
         });
 
     if (max_length == ukv_length_missing_k) {
@@ -1331,22 +1335,21 @@ void read_modify_unique_docs( //
         has_fields || c_modification == doc_modification_t::patch_k || c_modification == doc_modification_t::merge_k;
 
     if (need_values) {
-        ukv_byte_t* found_binary_begin = nullptr;
-        ukv_length_t* found_binary_offs = nullptr;
-        ukv_read_t read {
-            .db = c_db,
-            .error = c_error,
-            .transaction = c_txn,
-            .arena = arena,
-            .options = c_options,
-            .tasks_count = places.count,
-            .collections = places.collections_begin.get(),
-            .collections_stride = places.collections_begin.stride(),
-            .keys = places.keys_begin.get(),
-            .keys_stride = places.keys_begin.stride(),
-            .offsets = &found_binary_offs,
-            .values = &found_binary_begin,
-        };
+        ukv_byte_t* found_binary_begin {};
+        ukv_length_t* found_binary_offs {};
+        ukv_read_t read {};
+        read.db = c_db;
+        read.error = c_error;
+        read.transaction = c_txn;
+        read.arena = arena;
+        read.options = c_options;
+        read.tasks_count = places.count;
+        read.collections = places.collections_begin.get();
+        read.collections_stride = places.collections_begin.stride();
+        read.keys = places.keys_begin.get();
+        read.keys_stride = places.keys_begin.stride();
+        read.offsets = &found_binary_offs;
+        read.values = &found_binary_begin;
 
         ukv_read(&read);
         return_if_error_m(c_error);
@@ -1367,20 +1370,20 @@ void read_modify_unique_docs( //
         }
     }
     else {
-        ukv_octet_t* found_presences = nullptr;
-        ukv_read_t read {
-            .db = c_db,
-            .error = c_error,
-            .transaction = c_txn,
-            .arena = arena,
-            .options = c_options,
-            .tasks_count = places.count,
-            .collections = places.collections_begin.get(),
-            .collections_stride = places.collections_begin.stride(),
-            .keys = places.keys_begin.get(),
-            .keys_stride = places.keys_begin.stride(),
-            .presences = &found_presences,
-        };
+        ukv_octet_t* found_presences {};
+        ukv_read_t read {};
+        read.db = c_db;
+        read.error = c_error;
+        read.transaction = c_txn;
+        read.arena = arena;
+        read.options = c_options;
+        read.tasks_count = places.count;
+        read.collections = places.collections_begin.get();
+        read.collections_stride = places.collections_begin.stride();
+        read.keys = places.keys_begin.get();
+        read.keys_stride = places.keys_begin.stride();
+        read.presences = &found_presences;
+
         ukv_read(&read);
         return_if_error_m(c_error);
 
@@ -1457,20 +1460,19 @@ void read_modify_docs( //
     unique_places.keys_begin = unique_col_keys_strided.members(&collection_key_t::key).begin();
     unique_places.fields_begin = {};
     unique_places.count = static_cast<ukv_size_t>(unique_col_keys.size());
-    ukv_read_t read {
-        .db = c_db,
-        .error = c_error,
-        .transaction = c_txn,
-        .arena = arena,
-        .options = c_options,
-        .tasks_count = unique_places.count,
-        .collections = unique_places.collections_begin.get(),
-        .collections_stride = unique_places.collections_begin.stride(),
-        .keys = unique_places.keys_begin.get(),
-        .keys_stride = unique_places.keys_begin.stride(),
-        .offsets = &found_binary_offs,
-        .values = &found_binary_begin,
-    };
+    ukv_read_t read {};
+    read.db = c_db;
+    read.error = c_error;
+    read.transaction = c_txn;
+    read.arena = arena;
+    read.options = c_options;
+    read.tasks_count = unique_places.count;
+    read.collections = unique_places.collections_begin.get();
+    read.collections_stride = unique_places.collections_begin.stride();
+    read.keys = unique_places.keys_begin.get();
+    read.keys_stride = unique_places.keys_begin.stride();
+    read.offsets = &found_binary_offs;
+    read.values = &found_binary_begin;
 
     ukv_read(&read);
     return_if_error_m(c_error);
@@ -1512,6 +1514,10 @@ void read_modify_write( //
     yyjson_alc allocator = wrap_allocator(arena);
     auto safe_callback = [&](ukv_size_t task_idx, ukv_str_view_t field, value_view_t binary_doc) {
         json_t parsed = any_parse(binary_doc, internal_format_k, arena, c_error);
+        if (!contents[task_idx]) {
+            any_dump({nullptr, parsed.mut_handle->root}, internal_format_k, arena, growing_tape, c_error);
+            return;
+        }
 
         // This error is extremely unlikely, as we have previously accepted the data into the store.
         return_if_error_m(c_error);
@@ -1523,7 +1529,7 @@ void read_modify_write( //
 
         // Perform modifications
         modify(parsed, parsed_task.mut_handle->root, field, c_modification, arena, c_error);
-        any_dump({.mut_handle = parsed.mut_handle->root}, internal_format_k, arena, growing_tape, c_error);
+        any_dump({nullptr, parsed.mut_handle->root}, internal_format_k, arena, growing_tape, c_error);
         return_if_error_m(c_error);
     };
 
@@ -1534,23 +1540,22 @@ void read_modify_write( //
 
     // By now, the tape contains concatenated updates docs:
     ukv_byte_t* tape_begin = reinterpret_cast<ukv_byte_t*>(growing_tape.contents().begin().get());
-    ukv_write_t write {
-        .db = c_db,
-        .error = c_error,
-        .transaction = c_txn,
-        .arena = arena,
-        .options = c_options,
-        .tasks_count = unique_places.count,
-        .collections = unique_places.collections_begin.get(),
-        .collections_stride = unique_places.collections_begin.stride(),
-        .keys = unique_places.keys_begin.get(),
-        .keys_stride = unique_places.keys_begin.stride(),
-        .offsets = growing_tape.offsets().begin().get(),
-        .offsets_stride = growing_tape.offsets().stride(),
-        .lengths = growing_tape.lengths().begin().get(),
-        .lengths_stride = growing_tape.lengths().stride(),
-        .values = &tape_begin,
-    };
+    ukv_write_t write {};
+    write.db = c_db;
+    write.error = c_error;
+    write.transaction = c_txn;
+    write.arena = arena;
+    write.options = c_options;
+    write.tasks_count = unique_places.count;
+    write.collections = unique_places.collections_begin.get();
+    write.collections_stride = unique_places.collections_begin.stride();
+    write.keys = unique_places.keys_begin.get();
+    write.keys_stride = unique_places.keys_begin.stride();
+    write.offsets = growing_tape.offsets().begin().get();
+    write.offsets_stride = growing_tape.offsets().stride();
+    write.lengths = growing_tape.lengths().begin().get();
+    write.lengths_stride = growing_tape.lengths().stride();
+    write.values = &tape_begin;
 
     ukv_write(&write);
 }
@@ -1565,17 +1570,40 @@ void ukv_docs_write(ukv_docs_write_t* c_ptr) {
     linked_memory_lock_t arena = linked_memory(c.arena, c.options, c.error);
     return_if_error_m(c.error);
 
+    ptr_range_gt<ukv_key_t> tape;
+    if (!c.keys) {
+        return_error_if_m(c.values, c.error, uninitialized_state_k, "Keys and values is uninitialized");
+        return_error_if_m(c.id_field, c.error, uninitialized_state_k, "Keys and id_field is uninitialized");
+
+        tape = arena.alloc<ukv_key_t>(c.tasks_count, c.error);
+        strided_iterator_gt<ukv_bytes_cptr_t const> vals {c.values, c.values_stride};
+        strided_iterator_gt<ukv_length_t const> lens {c.lengths, c.lengths_stride};
+
+        simdjson::ondemand::parser parser;
+        for (size_t idx = 0; idx < c.tasks_count; ++idx, ++vals, ++lens) {
+            simdjson::ondemand::document doc = parser.iterate(*vals, *lens, 1000000ul);
+            simdjson::ondemand::object data = doc.get_object().value();
+
+            auto result = reset(data)[c.id_field];
+            return_error_if_m((simdjson::SUCCESS == result.error()),
+                            c.error,
+                            uninitialized_state_k,
+                            "Keys and values is uninitialized");
+
+            tape[idx] = result;
+        }
+        c.keys_stride = sizeof(ukv_key_t);
+    }
     // If user wants the entire doc in the same format, as the one we use internally,
     // this request can be passed entirely to the underlying Key-Value store.
     strided_iterator_gt<ukv_str_view_t const> fields {c.fields, c.fields_stride};
     auto has_fields = fields && (!fields.repeats() || *fields);
     strided_iterator_gt<ukv_collection_t const> collections {c.collections, c.collections_stride};
-    strided_iterator_gt<ukv_key_t const> keys {c.keys, c.keys_stride};
+    strided_iterator_gt<ukv_key_t const> keys {c.keys ? c.keys : tape.begin(), c.keys_stride};
     bits_view_t presences {c.presences};
     strided_iterator_gt<ukv_length_t const> offs {c.offsets, c.offsets_stride};
     strided_iterator_gt<ukv_length_t const> lens {c.lengths, c.lengths_stride};
     strided_iterator_gt<ukv_bytes_cptr_t const> vals {c.values, c.values_stride};
-
     places_arg_t places {collections, keys, fields, c.tasks_count};
     contents_arg_t contents {presences, offs, lens, vals, c.tasks_count};
 
@@ -1608,25 +1636,24 @@ void ukv_docs_write(ukv_docs_write_t* c_ptr) {
         return_error_if_m(result.error() == sj::SUCCESS, c.error, 0, "Invalid Json!");
     }
 
-    ukv_write_t write {
-        .db = c.db,
-        .error = c.error,
-        .transaction = c.transaction,
-        .arena = arena,
-        .options = c.options,
-        .tasks_count = c.tasks_count,
-        .collections = c.collections,
-        .collections_stride = c.collections_stride,
-        .keys = c.keys,
-        .keys_stride = c.keys_stride,
-        .presences = c.presences,
-        .offsets = c.offsets,
-        .offsets_stride = c.offsets_stride,
-        .lengths = c.lengths,
-        .lengths_stride = c.lengths_stride,
-        .values = c.values,
-        .values_stride = c.values_stride,
-    };
+    ukv_write_t write {};
+    write.db = c.db;
+    write.error = c.error;
+    write.transaction = c.transaction;
+    write.arena = arena;
+    write.options = c.options;
+    write.tasks_count = c.tasks_count;
+    write.collections = c.collections;
+    write.collections_stride = c.collections_stride;
+    write.keys = c.keys ? c.keys : tape.begin();
+    write.keys_stride = c.keys_stride;
+    write.presences = c.presences;
+    write.offsets = c.offsets;
+    write.offsets_stride = c.offsets_stride;
+    write.lengths = c.lengths;
+    write.lengths_stride = c.lengths_stride;
+    write.values = c.values;
+    write.values_stride = c.values_stride;
 
     ukv_write(&write);
 }
@@ -1645,22 +1672,23 @@ void ukv_docs_read(ukv_docs_read_t* c_ptr) {
     strided_iterator_gt<ukv_str_view_t const> fields {c.fields, c.fields_stride};
     auto has_fields = fields && (!fields.repeats() || *fields);
     if (!has_fields && c.type == internal_format_k) {
-        ukv_read_t read {
-            .db = c.db,
-            .error = c.error,
-            .transaction = c.transaction,
-            .arena = arena,
-            .options = c.options,
-            .tasks_count = c.tasks_count,
-            .collections = c.collections,
-            .collections_stride = c.collections_stride,
-            .keys = c.keys,
-            .keys_stride = c.keys_stride,
-            .presences = c.presences,
-            .offsets = c.offsets,
-            .lengths = c.lengths,
-            .values = c.values,
-        };
+        ukv_read_t read {};
+        read.db = c.db;
+        read.error = c.error;
+        read.transaction = c.transaction;
+        read.snapshot = c.snapshot;
+        read.arena = arena;
+        read.options = c.options;
+        read.tasks_count = c.tasks_count;
+        read.collections = c.collections;
+        read.collections_stride = c.collections_stride;
+        read.keys = c.keys;
+        read.keys_stride = c.keys_stride;
+        read.presences = c.presences;
+        read.offsets = c.offsets;
+        read.lengths = c.lengths;
+        read.values = c.values;
+
         return ukv_read(&read);
     }
 
@@ -1818,24 +1846,24 @@ void ukv_docs_gist(ukv_docs_gist_t* c_ptr) {
     linked_memory_lock_t arena = linked_memory(c.arena, c.options, c.error);
     return_if_error_m(c.error);
 
-    ukv_byte_t* found_binary_begin = nullptr;
-    ukv_length_t* found_binary_offs = nullptr;
-    ukv_read_t read {
-        .db = c.db,
-        .error = c.error,
-        .transaction = c.transaction,
-        .arena = arena,
-        .options = c.options,
-        .tasks_count = c.docs_count,
-        .collections = c.collections,
-        .collections_stride = c.collections_stride,
-        .keys = c.keys,
-        .keys_stride = c.keys_stride,
-        .presences = nullptr,
-        .offsets = &found_binary_offs,
-        .lengths = nullptr,
-        .values = &found_binary_begin,
-    };
+    ukv_byte_t* found_binary_begin {};
+    ukv_length_t* found_binary_offs {};
+    ukv_read_t read {};
+    read.db = c.db;
+    read.error = c.error;
+    read.transaction = c.transaction;
+    read.snapshot = c.snapshot;
+    read.arena = arena;
+    read.options = c.options;
+    read.tasks_count = c.docs_count;
+    read.collections = c.collections;
+    read.collections_stride = c.collections_stride;
+    read.keys = c.keys;
+    read.keys_stride = c.keys_stride;
+    read.presences = nullptr;
+    read.offsets = &found_binary_offs;
+    read.lengths = nullptr;
+    read.values = &found_binary_begin;
 
     ukv_read(&read);
     return_if_error_m(c.error);
@@ -1965,22 +1993,22 @@ void ukv_docs_gather(ukv_docs_gather_t* c_ptr) {
     return_if_error_m(c.error);
 
     // Retrieve the entire documents before we can sample internal fields
-    ukv_byte_t* found_binary_begin = nullptr;
-    ukv_length_t* found_binary_offs = nullptr;
-    ukv_read_t read {
-        .db = c.db,
-        .error = c.error,
-        .transaction = c.transaction,
-        .arena = arena,
-        .options = c.options,
-        .tasks_count = c.docs_count,
-        .collections = c.collections,
-        .collections_stride = c.collections_stride,
-        .keys = c.keys,
-        .keys_stride = c.keys_stride,
-        .offsets = &found_binary_offs,
-        .values = &found_binary_begin,
-    };
+    ukv_byte_t* found_binary_begin {};
+    ukv_length_t* found_binary_offs {};
+    ukv_read_t read {};
+    read.db = c.db;
+    read.error = c.error;
+    read.transaction = c.transaction;
+    read.snapshot = c.snapshot;
+    read.arena = arena;
+    read.options = c.options;
+    read.tasks_count = c.docs_count;
+    read.collections = c.collections;
+    read.collections_stride = c.collections_stride;
+    read.keys = c.keys;
+    read.keys_stride = c.keys_stride;
+    read.offsets = &found_binary_offs;
+    read.values = &found_binary_begin;
 
     ukv_read(&read);
     return_if_error_m(c.error);
@@ -2115,14 +2143,13 @@ void ukv_docs_gather(ukv_docs_gather_t* c_ptr) {
             ukv_str_view_t field = fields[field_idx];
             yyjson_val* found_value = json_lookup(root, field);
 
-            column_begin_t column {
-                .validities = (*c.columns_validities)[field_idx],
-                .conversions = (*(c.columns_conversions ? c.columns_conversions : c.columns_validities))[field_idx],
-                .collisions = (*(c.columns_collisions ? c.columns_collisions : c.columns_validities))[field_idx],
-                .scalars = addresses_scalars[field_idx],
-                .str_offsets = addresses_offs[field_idx],
-                .str_lengths = addresses_lens[field_idx],
-            };
+            column_begin_t column {};
+            column.validities = (*c.columns_validities)[field_idx];
+            column.conversions = (*(c.columns_conversions ? c.columns_conversions : c.columns_validities))[field_idx];
+            column.collisions = (*(c.columns_collisions ? c.columns_collisions : c.columns_validities))[field_idx];
+            column.scalars = addresses_scalars[field_idx];
+            column.str_offsets = addresses_offs[field_idx];
+            column.str_lengths = addresses_lens[field_idx];
 
             bool is_last = doc_idx == c.docs_count - 1;
             // Export the types

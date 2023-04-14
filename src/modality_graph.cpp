@@ -307,6 +307,7 @@ template <bool export_center_ak = true, bool export_neighbor_ak = true, bool exp
 void export_edge_tuples( //
     ukv_database_t const c_db,
     ukv_transaction_t const c_transaction,
+    ukv_snapshot_t const c_snapshot,
     ukv_size_t const c_vertices_count,
 
     ukv_collection_t const* c_collections,
@@ -328,22 +329,22 @@ void export_edge_tuples( //
 
     // Even if we need just the node degrees, we can't limit ourselves to just entry lengths.
     // Those may be compressed. We need to read the first bytes to parse the degree of the node.
-    ukv_bytes_ptr_t c_found_values = nullptr;
-    ukv_length_t* c_found_offsets = nullptr;
-    ukv_read_t read {
-        .db = c_db,
-        .error = c_error,
-        .transaction = c_transaction,
-        .arena = arena,
-        .options = c_options,
-        .tasks_count = c_vertices_count,
-        .collections = c_collections,
-        .collections_stride = c_collections_stride,
-        .keys = c_vertices,
-        .keys_stride = c_vertices_stride,
-        .offsets = &c_found_offsets,
-        .values = &c_found_values,
-    };
+    ukv_bytes_ptr_t c_found_values {};
+    ukv_length_t* c_found_offsets {};
+    ukv_read_t read {};
+    read.db = c_db;
+    read.error = c_error;
+    read.transaction = c_transaction;
+    read.snapshot = c_snapshot;
+    read.arena = arena;
+    read.options = c_options;
+    read.tasks_count = c_vertices_count;
+    read.collections = c_collections;
+    read.collections_stride = c_collections_stride;
+    read.keys = c_vertices;
+    read.keys_stride = c_vertices_stride;
+    read.offsets = &c_found_offsets;
+    read.values = &c_found_values;
 
     ukv_read(&read);
     return_if_error_m(c_error);
@@ -385,11 +386,10 @@ void export_edge_tuples( //
             continue;
         }
 
-        bool has_self_loop = false;
         ukv_vertex_degree_t degree = 0;
-        if (find_edge.role & ukv_vertex_source_k) {
-            auto ns = neighbors(value, ukv_vertex_source_k);
-            if constexpr (tuple_size_k != 0)
+        if ((find_edge.role & ukv_vertex_source_k) || (find_edge.role & ukv_vertex_target_k)) {
+            auto ns = neighbors(value, find_edge.role);
+            if constexpr (tuple_size_k != 0) {
                 for (neighborship_t n : ns) {
                     if constexpr (export_center_ak)
                         ids[passed_ids + 0] = find_edge.vertex_id;
@@ -397,31 +397,11 @@ void export_edge_tuples( //
                         ids[passed_ids + export_center_ak] = n.neighbor_id;
                     if constexpr (export_edge_ak)
                         ids[passed_ids + export_center_ak + export_neighbor_ak] = n.edge_id;
-                    if (find_edge.vertex_id == n.neighbor_id)
-                        has_self_loop = true;
                     passed_ids += tuple_size_k;
                 }
+            }
             degree += static_cast<ukv_vertex_degree_t>(ns.size());
         }
-        if (find_edge.role & ukv_vertex_target_k) {
-            auto ns = neighbors(value, ukv_vertex_target_k);
-            if constexpr (tuple_size_k != 0)
-                for (neighborship_t n : ns) {
-                    if (n.neighbor_id == find_edge.vertex_id && has_self_loop) {
-                        --degree;
-                        continue;
-                    }
-                    if constexpr (export_neighbor_ak)
-                        ids[passed_ids + 0] = n.neighbor_id;
-                    if constexpr (export_center_ak)
-                        ids[passed_ids + export_neighbor_ak] = find_edge.vertex_id;
-                    if constexpr (export_edge_ak)
-                        ids[passed_ids + export_center_ak + export_neighbor_ak] = n.edge_id;
-                    passed_ids += tuple_size_k;
-                }
-            degree += static_cast<ukv_vertex_degree_t>(ns.size());
-        }
-
         degrees[i] = degree;
     }
 }
@@ -441,20 +421,19 @@ void pull_and_link_for_updates( //
     auto collections = unique_entries.immutable().members(&updated_entry_t::collection);
     auto keys = unique_entries.immutable().members(&updated_entry_t::key);
     auto opts = c_transaction ? ukv_options_t(c_options & ~ukv_option_transaction_dont_watch_k) : c_options;
-    ukv_read_t read {
-        .db = c_db,
-        .error = c_error,
-        .transaction = c_transaction,
-        .arena = arena,
-        .options = opts,
-        .tasks_count = unique_count,
-        .collections = collections.begin().get(),
-        .collections_stride = collections.begin().stride(),
-        .keys = keys.begin().get(),
-        .keys_stride = keys.begin().stride(),
-        .offsets = &found_binary_offs,
-        .values = &found_binary_begin,
-    };
+    ukv_read_t read {};
+    read.db = c_db;
+    read.error = c_error;
+    read.transaction = c_transaction;
+    read.arena = arena;
+    read.options = opts;
+    read.tasks_count = unique_count;
+    read.collections = collections.begin().get();
+    read.collections_stride = collections.begin().stride();
+    read.keys = keys.begin().get();
+    read.keys_stride = keys.begin().stride();
+    read.offsets = &found_binary_offs;
+    read.values = &found_binary_begin;
 
     ukv_read(&read);
     return_if_error_m(c_error);
@@ -567,22 +546,21 @@ void update_neighborhoods( //
     auto contents = unique_strided.immutable().members(&updated_entry_t::content);
     auto lengths = unique_strided.immutable().members(&updated_entry_t::length);
 
-    ukv_write_t write {
-        .db = c_db,
-        .error = c_error,
-        .transaction = c_transaction,
-        .arena = arena,
-        .options = c_options,
-        .tasks_count = unique_count,
-        .collections = collections.begin().get(),
-        .collections_stride = collections.begin().stride(),
-        .keys = keys.begin().get(),
-        .keys_stride = keys.begin().stride(),
-        .lengths = lengths.begin().get(),
-        .lengths_stride = lengths.begin().stride(),
-        .values = contents.begin().get(),
-        .values_stride = contents.begin().stride(),
-    };
+    ukv_write_t write {};
+    write.db = c_db;
+    write.error = c_error;
+    write.transaction = c_transaction;
+    write.arena = arena;
+    write.options = c_options;
+    write.tasks_count = unique_count;
+    write.collections = collections.begin().get();
+    write.collections_stride = collections.begin().stride();
+    write.keys = keys.begin().get();
+    write.keys_stride = keys.begin().stride();
+    write.lengths = lengths.begin().get();
+    write.lengths_stride = lengths.begin().stride();
+    write.values = contents.begin().get();
+    write.values_stride = contents.begin().stride();
 
     ukv_write(&write);
 }
@@ -603,6 +581,7 @@ void ukv_graph_find_edges(ukv_graph_find_edges_t* c_ptr) {
     return func( //
         c.db,
         c.transaction,
+        c.snapshot,
         c.tasks_count,
         c.collections,
         c.collections_stride,
@@ -677,21 +656,20 @@ void ukv_graph_upsert_vertices(ukv_graph_upsert_vertices_t* c_ptr) {
 
     linked_memory_lock_t arena = linked_memory(c.arena, c.options, c.error);
     return_if_error_m(c.error);
-    ukv_length_t* c_found_lengths = nullptr;
 
-    ukv_read_t read {
-        .db = c.db,
-        .error = c.error,
-        .transaction = c.transaction,
-        .arena = arena,
-        .options = c.options,
-        .tasks_count = c.tasks_count,
-        .collections = c.collections,
-        .collections_stride = c.collections_stride,
-        .keys = c.vertices,
-        .keys_stride = c.vertices_stride,
-        .lengths = &c_found_lengths,
-    };
+    ukv_length_t* c_found_lengths {};
+    ukv_read_t read {};
+    read.db = c.db;
+    read.error = c.error;
+    read.transaction = c.transaction;
+    read.arena = arena;
+    read.options = c.options;
+    read.tasks_count = c.tasks_count;
+    read.collections = c.collections;
+    read.collections_stride = c.collections_stride;
+    read.keys = c.vertices;
+    read.keys_stride = c.vertices_stride;
+    read.lengths = &c_found_lengths;
 
     ukv_read(&read);
     return_if_error_m(c.error);
@@ -706,21 +684,20 @@ void ukv_graph_upsert_vertices(ukv_graph_upsert_vertices_t* c_ptr) {
         }
     }
 
-    ukv_length_t length = 0;
-    value_view_t empty_value = "";
-    ukv_write_t write {
-        .db = c.db,
-        .error = c.error,
-        .transaction = c.transaction,
-        .arena = arena,
-        .tasks_count = idx,
-        .collections = c.collections,
-        .collections_stride = c.collections_stride,
-        .keys = vertices_to_upsert.begin(),
-        .keys_stride = sizeof(ukv_key_t),
-        .lengths = &length,
-        .values = empty_value.member_ptr(),
-    };
+    ukv_length_t length {};
+    value_view_t empty_value {""};
+    ukv_write_t write {};
+    write.db = c.db;
+    write.error = c.error;
+    write.transaction = c.transaction;
+    write.arena = arena;
+    write.tasks_count = idx;
+    write.collections = c.collections;
+    write.collections_stride = c.collections_stride;
+    write.keys = vertices_to_upsert.begin();
+    write.keys_stride = sizeof(ukv_key_t);
+    write.lengths = &length;
+    write.values = empty_value.member_ptr();
 
     ukv_write(&write);
 }
@@ -744,6 +721,7 @@ void ukv_graph_remove_vertices(ukv_graph_remove_vertices_t* c_ptr) {
     export_edge_tuples<false, true, false>( //
         c.db,
         c.transaction,
+        0,
         c.tasks_count,
         c.collections,
         c.collections_stride,
@@ -816,22 +794,21 @@ void ukv_graph_remove_vertices(ukv_graph_remove_vertices_t* c_ptr) {
     auto lengths = unique_strided.immutable().members(&updated_entry_t::length);
     auto contents = unique_strided.immutable().members(&updated_entry_t::content);
 
-    ukv_write_t write {
-        .db = c.db,
-        .error = c.error,
-        .transaction = c.transaction,
-        .arena = arena,
-        .options = c.options,
-        .tasks_count = unique_count,
-        .collections = collections.begin().get(),
-        .collections_stride = collections.begin().stride(),
-        .keys = keys.begin().get(),
-        .keys_stride = keys.begin().stride(),
-        .lengths = lengths.begin().get(),
-        .lengths_stride = lengths.begin().stride(),
-        .values = contents.begin().get(),
-        .values_stride = contents.begin().stride(),
-    };
+    ukv_write_t write {};
+    write.db = c.db;
+    write.error = c.error;
+    write.transaction = c.transaction;
+    write.arena = arena;
+    write.options = c.options;
+    write.tasks_count = unique_count;
+    write.collections = collections.begin().get();
+    write.collections_stride = collections.begin().stride();
+    write.keys = keys.begin().get();
+    write.keys_stride = keys.begin().stride();
+    write.lengths = lengths.begin().get();
+    write.lengths_stride = lengths.begin().stride();
+    write.values = contents.begin().get();
+    write.values_stride = contents.begin().stride();
 
     ukv_write(&write);
 }

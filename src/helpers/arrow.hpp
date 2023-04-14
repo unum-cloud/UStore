@@ -25,6 +25,10 @@
 
 namespace unum::ukv {
 
+/// This is the "Arrow way" of dealing with empty values in the last buffer.
+/// https://github.com/apache/arrow/blob/2078af7c710d688c14313b9486b99c981550a7b7/cpp/src/arrow/memory_pool_internal.h#L34
+static std::int64_t zero_size_data_k[1] = {0};
+
 constexpr std::size_t arrow_extra_offsets_k = 1;
 constexpr std::size_t arrow_bytes_alignment_k = 64;
 
@@ -32,8 +36,13 @@ namespace arf = arrow::flight;
 namespace ar = arrow;
 
 inline static std::string const kFlightListCols = "list_collections";   /// `DoGet`
+inline static std::string const kFlightSample = "sample";               /// `DoGet`
 inline static std::string const kFlightColCreate = "create_collection"; /// `DoAction`
 inline static std::string const kFlightColDrop = "remove_collection";   /// `DoAction`
+
+inline static std::string const kFlightListSnap = "list_snapshots";    /// `DoGet`
+inline static std::string const kFlightSnapCreate = "create_snapshot"; /// `DoAction`
+inline static std::string const kFlightSnapDrop = "remove_snapshot";   /// `DoAction`
 
 inline static std::string const kFlightTxnBegin = "begin_transaction";   /// `DoAction`
 inline static std::string const kFlightTxnCommit = "commit_transaction"; /// `DoAction`
@@ -46,6 +55,7 @@ inline static std::string const kFlightReadPath = "read_path";   /// `DoExchange
 inline static std::string const kFlightScan = "scan";            /// `DoExchange`
 inline static std::string const kFlightMeasure = "measure";      /// `DoExchange`
 
+inline static std::string const kArgSnaps = "snapshots";
 inline static std::string const kArgCols = "collections";
 inline static std::string const kArgKeys = "keys";
 inline static std::string const kArgVals = "values";
@@ -61,6 +71,7 @@ inline static std::string const kArgPrevPatterns = "prev_patterns";
 
 inline static std::string const kParamCollectionID = "collection_id";
 inline static std::string const kParamCollectionName = "collection_name";
+inline static std::string const kParamSnapshotID = "snapshot_id";
 inline static std::string const kParamTransactionID = "transaction_id";
 inline static std::string const kParamReadPart = "part";
 inline static std::string const kParamDropMode = "mode";
@@ -87,6 +98,13 @@ class arrow_mem_pool_t final : public ar::MemoryPool {
     ~arrow_mem_pool_t() {}
 
     ar::Status Allocate(int64_t size, uint8_t** ptr) override {
+        if (size < 0)
+            return ar::Status::Invalid("negative malloc size");
+
+        if (size == 0) {
+            *ptr = reinterpret_cast<uint8_t*>(&zero_size_data_k);
+            return ar::Status::OK();
+        }
         auto new_ptr = resource_.alloc(size, alignment_);
         if (!new_ptr)
             return ar::Status::OutOfMemory("");
@@ -96,6 +114,15 @@ class arrow_mem_pool_t final : public ar::MemoryPool {
         return ar::Status::OK();
     }
     ar::Status Reallocate(int64_t old_size, int64_t new_size, uint8_t** ptr) override {
+        if (new_size < 0)
+            return ar::Status::Invalid("negative malloc size");
+        if (*ptr == reinterpret_cast<uint8_t*>(&zero_size_data_k))
+            return Allocate(new_size, ptr);
+        if (new_size == 0) {
+            *ptr = reinterpret_cast<uint8_t*>(&zero_size_data_k);
+            bytes_allocated_ -= old_size;
+            return ar::Status::OK();
+        }
         auto new_ptr = resource_.alloc(new_size, alignment_);
         if (!new_ptr)
             return ar::Status::OutOfMemory("");
@@ -106,6 +133,7 @@ class arrow_mem_pool_t final : public ar::MemoryPool {
         bytes_allocated_ += new_size - old_size;
         return ar::Status::OK();
     }
+
     void Free(uint8_t* buffer, int64_t size) override {
         // resource_.deallocate(buffer, size); // deallocation is no-op
         bytes_allocated_ -= size;
@@ -132,30 +160,28 @@ ar::ipc::IpcWriteOptions arrow_write_options(arrow_mem_pool_t& pool) {
     return options;
 }
 
-ar::Result<std::shared_ptr<ar::RecordBatch>> combined_batch(std::shared_ptr<ar::Table> table) {
-    return table->num_rows() ? table->CombineChunksToBatch() : ar::RecordBatch::MakeEmpty(table->schema());
+ar::Result<std::shared_ptr<ar::RecordBatch>> combined_batch(std::shared_ptr<ar::Table> table,
+                                                            ar::MemoryPool* pool = ar::default_memory_pool()) {
+    return table->num_rows() ? table->CombineChunksToBatch(pool) : ar::RecordBatch::MakeEmpty(table->schema(), pool);
 }
 
 ar::Status unpack_table( //
     ar::Result<std::shared_ptr<ar::Table>> const& maybe_table,
     ArrowSchema& schema_c,
-    ArrowArray& batch_c) {
+    ArrowArray& batch_c,
+    ar::MemoryPool* pool = ar::default_memory_pool()) {
 
     if (!maybe_table.ok())
         return maybe_table.status();
-
     std::shared_ptr<ar::Table> const& table = maybe_table.ValueUnsafe();
-    ar::Status ar_status = ar::ExportSchema(*table->schema(), &schema_c);
-    if (!ar_status.ok())
-        return ar_status;
 
     // Join all the chunks to form a single table
-    auto maybe_batch = combined_batch(table);
+    auto maybe_batch = combined_batch(table, pool);
     if (!maybe_batch.ok())
         return maybe_batch.status();
 
     std::shared_ptr<ar::RecordBatch> const& batch_ptr = maybe_batch.ValueUnsafe();
-    ar_status = ar::ExportRecordBatch(*batch_ptr, &batch_c, nullptr);
+    ar::Status ar_status = ar::ExportRecordBatch(*batch_ptr, &batch_c, &schema_c);
     return ar_status;
 }
 

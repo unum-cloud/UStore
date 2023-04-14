@@ -61,6 +61,12 @@ extern "C" {
 typedef void* ukv_database_t;
 
 /**
+ * @brief
+ *
+ */
+typedef uint64_t ukv_snapshot_t;
+
+/**
  * @brief Opaque Transaction handle.
  * @see `ukv_transaction_free()`.
  * @see https://unum.cloud/ukv/c#transactions
@@ -262,6 +268,72 @@ typedef struct ukv_database_init_t {
 void ukv_database_init(ukv_database_init_t*);
 
 /*********************************************************/
+/***************** Snapshot Management  ****************/
+/*********************************************************/
+
+typedef struct ukv_snapshot_list_t { /// @name Context
+    /// @{
+
+    /** @brief Already open database instance. */
+    ukv_database_t db;
+    /**
+     * @brief Pointer to exported error message.
+     * If not NULL, must be deallocated with `ukv_error_free()`.
+     */
+    ukv_error_t* error;
+    /**
+     * @brief Reusable memory handle.
+     * @see `ukv_arena_free()`.
+     */
+    ukv_arena_t* arena;
+    /**
+     * @brief Listing options.
+     *
+     * Possible values:
+     * - `::ukv_option_dont_discard_memory_k`: Won't reset the `arena` before the operation begins.
+     */
+    ukv_options_t options;
+
+    /// @}
+    /// @name Contents
+    /// @{
+
+    /** @brief Number of present snapshots. */
+    ukv_size_t* count;
+    /** @brief All snapshots id. */
+    ukv_snapshot_t** ids;
+    /// @}
+} ukv_snapshot_list_t;
+
+/**
+ * @brief Lists all snapshots in the DB.
+ * @see `ukv_snapshot_list_t`.
+ */
+void ukv_snapshot_list(ukv_snapshot_list_t*);
+
+typedef struct ukv_snapshot_create_t {
+    /** @brief Already open database instance. */
+    ukv_database_t db;
+    /** @brief Pointer to exported error message. */
+    ukv_error_t* error;
+    /** @brief Output for the snapshot id. */
+    ukv_snapshot_t* id;
+} ukv_snapshot_create_t;
+
+void ukv_snapshot_create(ukv_snapshot_create_t*);
+
+typedef struct ukv_snapshot_drop_t {
+    /** @brief Already open database instance. */
+    ukv_database_t db;
+    /** @brief Pointer to exported error message. */
+    ukv_error_t* error;
+    /** @brief Existing snapshot id. */
+    ukv_snapshot_t id;
+} ukv_snapshot_drop_t;
+
+void ukv_snapshot_drop(ukv_snapshot_drop_t*);
+
+/*********************************************************/
 /***************** Collection Management  ****************/
 /*********************************************************/
 
@@ -291,6 +363,11 @@ typedef struct ukv_collection_list_t {
      * @see `ukv_transaction_init()`, `ukv_transaction_commit()`, `ukv_transaction_free()`.
      */
     ukv_transaction_t transaction;
+    /**
+     * @brief A snapshot captures a point-in-time view of the DB at the time it's created.
+     * @see `ukv_snapshot_list()`, `ukv_snapshot_create()`, `ukv_snapshot_drop()`.
+     */
+    ukv_snapshot_t snapshot;
     /**
      * @brief Reusable memory handle.
      * @see `ukv_arena_free()`.

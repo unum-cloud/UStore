@@ -3,7 +3,7 @@
  * @author Ashot Vardanian
  * @date 08 Jun 2022
  * @addtogroup C
- * 
+ *
  * @brief Implements bindings for the Apache Arrow.
  *
  * Internally replicates the bare-minimum defintions required
@@ -26,9 +26,9 @@ extern "C" {
 
 #include "ukv/docs.h"
 
-#if __has_include("arrow/c/abi.h") && !defined(ARROW_C_DATA_INTERFACE)
-#define ARROW_C_DATA_INTERFACE 1
-#define ARROW_C_STREAM_INTERFACE 1
+#if !__has_include("arrow/c/abi.h") && !defined(ARROW_C_DATA_INTERFACE)
+#define ARROW_C_DATA_INTERFACE
+#define ARROW_C_STREAM_INTERFACE
 #endif
 
 #ifndef ARROW_C_DATA_INTERFACE
@@ -38,7 +38,7 @@ extern "C" {
 #define ARROW_FLAG_NULLABLE 2
 #define ARROW_FLAG_MAP_KEYS_SORTED 4
 
-struct ArrowSchema {
+typedef struct ArrowSchema {
     const char* format;
     const char* name;
     const char* metadata;
@@ -48,9 +48,9 @@ struct ArrowSchema {
     struct ArrowSchema* dictionary;
     void (*release)(struct ArrowSchema*);
     void* private_data;
-};
+} ArrowSchema;
 
-struct ArrowArray {
+typedef struct ArrowArray {
     // Array data description
     int64_t length;
     int64_t null_count;
@@ -62,20 +62,20 @@ struct ArrowArray {
     struct ArrowArray* dictionary;
     void (*release)(struct ArrowArray*);
     void* private_data;
-};
+} ArrowArray;
 
 #endif // ARROW_C_DATA_INTERFACE
 
 #ifndef ARROW_C_STREAM_INTERFACE
 #define ARROW_C_STREAM_INTERFACE
 
-struct ArrowArrayStream {
+typedef struct ArrowArrayStream {
     int (*get_schema)(struct ArrowArrayStream*, struct ArrowSchema* out);
     int (*get_next)(struct ArrowArrayStream*, struct ArrowArray* out);
     char const* (*get_last_error)(struct ArrowArrayStream*);
     void (*release)(struct ArrowArrayStream*);
     void* private_data;
-};
+} ArrowArrayStream;
 
 #endif // ARROW_C_STREAM_INTERFACE
 
@@ -158,17 +158,17 @@ static void ukv_to_arrow_schema( //
     schema->name = "";
     schema->metadata = NULL;
     schema->flags = 0;
-    schema->n_children = static_cast<int64_t>(fields_count);
+    schema->n_children = (int64_t)(fields_count);
     schema->dictionary = NULL;
     schema->release = &release_malloced_schema;
     schema->children = (ArrowSchema**)malloc(sizeof(struct ArrowSchema*) * schema->n_children);
 
     // Data
-    array->length = static_cast<int64_t>(docs_count);
+    array->length = (int64_t)(docs_count);
     array->offset = 0;
     array->null_count = 0;
     array->n_buffers = 1;
-    array->n_children = static_cast<int64_t>(fields_count);
+    array->n_children = (int64_t)(fields_count);
     array->dictionary = NULL;
     array->release = &release_malloced_array;
     array->buffers = (void const**)malloc(sizeof(void*) * array->n_buffers);
@@ -317,8 +317,8 @@ static void ukv_to_arrow_list( //
     ukv_to_arrow_column(column_offsets[docs_count],
                         "chunks",
                         field_type,
-                        nullptr,
-                        nullptr,
+                        NULL,
+                        NULL,
                         column_contents,
                         schema->children[0],
                         array->children[0],
@@ -348,6 +348,11 @@ static void ukv_to_arrow_stream( //
 
     struct ArrowArrayStream*,
     ukv_arena_t*) {
+}
+
+
+static bool check_presence(ukv_octet_t const* begin, size_t idx) {
+    return *(begin + idx / CHAR_BIT) & ((ukv_octet_t)(1 << (idx % CHAR_BIT)));
 }
 
 #ifdef __cplusplus
