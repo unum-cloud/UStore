@@ -1,13 +1,13 @@
 #include <string.h>
 
-#include "com_unum_ukv_Shared.h"
+#include "cloud_unum_ukv_Shared.h"
 
 jfieldID find_db_field(JNIEnv* env_java) {
     static jfieldID db_ptr_field = NULL;
     if (!db_ptr_field) {
         // https://docs.oracle.com/javase/8/docs/technotes/guides/jni/spec/types.html
         // https://docs.oracle.com/javase/tutorial/java/nutsandbolts/datatypes.html
-        jclass txn_class_java = (*env_java)->FindClass(env_java, "com/unum/ukv/DataBase$Transaction");
+        jclass txn_class_java = (*env_java)->FindClass(env_java, "cloud/unum/ukv/DataBase$Transaction");
         db_ptr_field = (*env_java)->GetFieldID(env_java, txn_class_java, "databaseAddress", "J");
     }
     return db_ptr_field;
@@ -18,7 +18,7 @@ jfieldID find_txn_field(JNIEnv* env_java) {
     if (!txn_ptr_field) {
         // https://docs.oracle.com/javase/8/docs/technotes/guides/jni/spec/types.html
         // https://docs.oracle.com/javase/tutorial/java/nutsandbolts/datatypes.html
-        jclass txn_class_java = (*env_java)->FindClass(env_java, "com/unum/ukv/DataBase$Transaction");
+        jclass txn_class_java = (*env_java)->FindClass(env_java, "cloud/unum/ukv/DataBase$Transaction");
         txn_ptr_field = (*env_java)->GetFieldID(env_java, txn_class_java, "transactionAddress", "J");
     }
     return txn_ptr_field;
@@ -67,7 +67,7 @@ ukv_collection_t collection_ptr(JNIEnv* env_java, ukv_database_t db_ptr, jstring
     ukv_collection_t collection_c = 0;
     ukv_collection_list(&collection_list);
     if (error_c == NULL) {
-        for (ukv_size_t i = 0, j = 0; i < count; ++i, j+= strlen(names + j)) {
+        for (ukv_size_t i = 0, j = 0; i < count; ++i, j += strlen(names + j)) {
             if (strcmp(names + j, name_c) != 0)
                 continue;
             collection_c = ids[i];

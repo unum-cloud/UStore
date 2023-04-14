@@ -63,7 +63,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GoLang basic interface for single-entry operations.
 - JNI interface with support for single operations and transactions.
 
-[Unreleased]: https://github.com/unum-cloud/ukv/compare/v0.3.0...HEAD
-[0.3.0]: https://github.com/unum-cloud/ukv/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/unum-cloud/ukv/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/unum-cloud/ukv/releases/tag/v0.1.0
+[Unreleased]: https://github.com/unum-cloud/ustore/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/unum-cloud/ustore/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/unum-cloud/ustore/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/unum-cloud/ustore/releases/tag/v0.1.0

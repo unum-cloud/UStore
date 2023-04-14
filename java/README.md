@@ -1,4 +1,4 @@
-# UKV Java SDK
+# UStore Java SDK
 
 These bindings are implemented via [Java Native Interface](https://docs.oracle.com/javase/8/docs/technotes/guides/jni/spec/jniTOC.html).
 This interface is more performant than Python, but is not feature complete yet.

@@ -37,6 +37,7 @@ dist/
 
 # Temporary Files
 Makefile
+!docs/Makefile
 CMakeCache.txt
 cmake_install.cmake
 CMakeFiles
@@ -58,6 +59,8 @@ CPackConfig.cmake
 CPackSourceConfig.cmake
 doxygen_docs/html
 wheelhouse
+registry/
+package-lock.json
 
 # Allow
 !gradle/wrapper/gradle-wrapper.jar

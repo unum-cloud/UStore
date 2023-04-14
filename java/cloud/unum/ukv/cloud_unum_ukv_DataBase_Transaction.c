@@ -1,7 +1,7 @@
-#include "com_unum_ukv_Shared.h"
-#include "com_unum_ukv_DataBase_Transaction.h"
+#include "cloud_unum_ukv_Shared.h"
+#include "cloud_unum_ukv_DataBase_Transaction.h"
 
-JNIEXPORT void JNICALL Java_com_unum_ukv_DataBase_00024Transaction_put( //
+JNIEXPORT void JNICALL Java_cloud_unum_ukv_DataBase_00024Transaction_put( //
     JNIEnv* env_java,
     jobject txn_java,
     jstring collection_java,
@@ -58,7 +58,7 @@ JNIEXPORT void JNICALL Java_com_unum_ukv_DataBase_00024Transaction_put( //
     forward_ukv_error(env_java, error_c);
 }
 
-JNIEXPORT jboolean JNICALL Java_com_unum_ukv_DataBase_00024Transaction_containsKey( //
+JNIEXPORT jboolean JNICALL Java_cloud_unum_ukv_DataBase_00024Transaction_containsKey( //
     JNIEnv* env_java,
     jobject txn_java,
     jstring collection_java,
@@ -104,7 +104,7 @@ JNIEXPORT jboolean JNICALL Java_com_unum_ukv_DataBase_00024Transaction_containsK
     return result;
 }
 
-JNIEXPORT jbyteArray JNICALL Java_com_unum_ukv_DataBase_00024Transaction_get( //
+JNIEXPORT jbyteArray JNICALL Java_cloud_unum_ukv_DataBase_00024Transaction_get( //
     JNIEnv* env_java,
     jobject txn_java,
     jstring collection_java,
@@ -169,7 +169,7 @@ JNIEXPORT jbyteArray JNICALL Java_com_unum_ukv_DataBase_00024Transaction_get( //
     return result_java;
 }
 
-JNIEXPORT void JNICALL Java_com_unum_ukv_DataBase_00024Transaction_erase( //
+JNIEXPORT void JNICALL Java_cloud_unum_ukv_DataBase_00024Transaction_erase( //
     JNIEnv* env_java,
     jobject txn_java,
     jstring collection_java,
@@ -207,7 +207,7 @@ JNIEXPORT void JNICALL Java_com_unum_ukv_DataBase_00024Transaction_erase( //
     forward_ukv_error(env_java, error_c);
 }
 
-JNIEXPORT void JNICALL Java_com_unum_ukv_DataBase_00024Transaction_rollback( //
+JNIEXPORT void JNICALL Java_cloud_unum_ukv_DataBase_00024Transaction_rollback( //
     JNIEnv* env_java,
     jobject txn_java) {
 
@@ -234,7 +234,7 @@ JNIEXPORT void JNICALL Java_com_unum_ukv_DataBase_00024Transaction_rollback( //
     forward_ukv_error(env_java, error_c);
 }
 
-JNIEXPORT jboolean JNICALL Java_com_unum_ukv_DataBase_00024Transaction_commit( //
+JNIEXPORT jboolean JNICALL Java_cloud_unum_ukv_DataBase_00024Transaction_commit( //
     JNIEnv* env_java,
     jobject txn_java) {
 

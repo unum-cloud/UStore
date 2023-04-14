@@ -1,0 +1,11 @@
+cff-version: 0.11.2
+message: "If you use this software, please cite it as below."
+authors:
+- family-names: "Vardanian"
+  given-names: "Ashot"
+  orcid: "https://orcid.org/0000-0002-4882-1815"
+title: "UKV"
+version: 0.11.2
+doi: 10.5281/zenodo.7537043
+date-released: 2022-06-12
+url: "https://github.com/unum-cloud/ukv"

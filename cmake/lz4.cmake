@@ -10,8 +10,8 @@ find_program(MAKE_EXE NAMES gmake nmake make)
 ExternalProject_Add(
     lz4_src
     PREFIX "_deps/lz4"
-    GIT_REPOSITORY "https://github.com/lz4/lz4.git"
-    GIT_TAG v1.9.3
+    GIT_REPOSITORY https://github.com/lz4/lz4.git
+    GIT_TAG v1.9.4
     TIMEOUT 10
     CONFIGURE_COMMAND ""
     BUILD_IN_SOURCE TRUE

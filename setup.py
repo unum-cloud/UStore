@@ -1,46 +1,50 @@
 import os
 import re
-import subprocess
 import sys
+import json
 from distutils.dir_util import copy_tree
-import time
+from os.path import abspath, exists, dirname, join
 import multiprocessing
+from setuptools import setup, Extension, Command
+import subprocess
+import multiprocessing
+from distutils.dir_util import copy_tree
 from setuptools import setup, Extension
 from setuptools.command.build_ext import build_ext
 
-__version__ = open('VERSION', 'r').read()
-__libname__ = 'ukv'
+__version__ = open('VERSION', 'r').read().strip()
+__lib_name__ = 'ukv'
 
 
-this_directory = os.path.abspath(os.path.dirname(__file__))
+this_directory = os.path.abspath(dirname(__file__))
 with open(os.path.join(this_directory, 'README.md')) as f:
     long_description = f.read()
 
 
 class CMakeExtension(Extension):
-    def __init__(self, name, sourcedir=''):
+    def __init__(self, name, source_dir=''):
         Extension.__init__(self, name, sources=[])
-        self.sourcedir = os.path.abspath(sourcedir)
+        self.source_dir = os.path.abspath(source_dir)
 
 
 class CMakeBuild(build_ext):
     def build_extension(self, ext):
         self.parallel = multiprocessing.cpu_count() // 2
-        extdir = os.path.abspath(os.path.dirname(
+        extension_dir = os.path.abspath(dirname(
             self.get_ext_fullpath(ext.name)))
 
-        # required for auto-detection & inclusion of auxiliary "native" libs
-        if not extdir.endswith(os.path.sep):
-            extdir += os.path.sep
+        # required for auto-detection & inclusion of auxiliary 'native' libs
+        if not extension_dir.endswith(os.path.sep):
+            extension_dir += os.path.sep
 
-        if 'PYTHON_DEBUG' in os.environ:
-            os.makedirs(extdir, exist_ok=True)
-            copy_tree("./build/lib/", extdir)
+        if 'UKV_DEBUG_PYTHON' in os.environ:
+            os.makedirs(extension_dir, exist_ok=True)
+            copy_tree('./build/lib/', extension_dir)
             return
 
         cmake_args = [
-            f'-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extdir}',
-            f'-DCMAKE_ARCHIVE_OUTPUT_DIRECTORY={extdir}',
+            f'-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extension_dir}',
+            f'-DCMAKE_ARCHIVE_OUTPUT_DIRECTORY={extension_dir}',
             f'-DPYTHON_EXECUTABLE={sys.executable}',
             '-DUKV_BUILD_ENGINE_UMEM=1',
             '-DUKV_BUILD_ENGINE_LEVELDB=1',
@@ -74,13 +78,74 @@ class CMakeBuild(build_ext):
             if hasattr(self, 'parallel') and self.parallel:
                 build_args += [f'-j{self.parallel}']
 
-        subprocess.check_call(['cmake', ext.sourcedir] + cmake_args)
+        subprocess.check_call(['cmake', ext.source_dir] + cmake_args)
         subprocess.check_call(
             ['cmake', '--build', '.', '--target', ext.name.replace('ukv.', 'py_')] + build_args)
 
+    def run(self):
+        build_ext.run(self)
+        if 'UKV_DEBUG_PYTHON' not in os.environ:
+            self.run_command('build_pyi')
+
+
+class BuildPyi(Command):
+    command_name = 'build_pyi'
+    description = 'Generates pyi files from built extensions'
+
+    def initialize_options(self):
+        self.build_lib = None
+
+    def finalize_options(self):
+        self.set_undefined_options('build', ('build_lib', 'build_lib'))
+
+    def run(self):
+        # Gather information for needed stubs
+        data = {'mapping': {}, 'stubs': []}
+        env = os.environ.copy()
+
+        # Requires information from build_ext to work
+        build_ext = self.distribution.get_command_obj('build_ext')
+        if build_ext.inplace:
+            inst_command = self.distribution.get_command_obj('install')
+            inst_command.ensure_finalized()
+            data['out'] = inst_command.install_platlib
+        else:
+            data['out'] = self.build_lib
+
+        wrappers = ['ukv']
+        # Ensure that the associated packages can always be found locally
+        for wrapper in wrappers:
+            pkgdir = wrapper.split('.')
+            init_py = abspath(join(self.build_lib, *pkgdir, '__init__.py'))
+            data['mapping'][wrapper] = init_py
+            if not exists(init_py):
+                open(init_py, 'w').close()
+
+        for ext in build_ext.extensions:
+            fname = build_ext.get_ext_filename(ext.name)
+            data['mapping'][ext.name] = abspath(join(self.build_lib, fname))
+            data['stubs'].append(ext.name)
+
+        data_json = json.dumps(data)
+        # Execute in a subprocess in case it crashes
+        args = [sys.executable, '-m', 'python.py11stubs', data_json]
+
+        proc = subprocess.run(args, env=env, capture_output=True)
+        print('exit status:', proc.returncode)
+        print('stdout:', proc.stdout.decode())
+        print('stderr:', proc.stderr.decode())
+        if proc.returncode != 0:
+            raise RuntimeError(
+                'Failed to generate .pyi file via %s' % (args,)
+            ) from None
+
+        # Create a py.typed for PEP 561
+        with open(join(data['out'], 'ukv', 'py.typed'), 'w'):
+            pass
+
 
 setup(
-    name=__libname__,
+    name=__lib_name__,
     version=__version__,
 
     author='Ashot Vardanian',
@@ -89,31 +154,43 @@ setup(
     description='Python bindings for Unum\'s Universal Key-Value store.',
     long_description=long_description,
     long_description_content_type='text/markdown',
+    license='Apache-2.0',
+
     classifiers=[
-        'Development Status :: 4 - Beta',
+        'Development Status :: 5 - Production/Stable',
+
+        'Natural Language :: English',
         'Intended Audience :: Developers',
         'Intended Audience :: Information Technology',
-        'License :: OSI Approved :: Apache Software License 2.0 (Apache-2.0)',
-        'Natural Language :: English',
+        'License :: OSI Approved :: Apache Software License',
+
+        'Operating System :: Unix',
         'Operating System :: POSIX',
         'Operating System :: POSIX :: Linux',
+
         'Programming Language :: C',
         'Programming Language :: C++',
-        'Programming Language :: Python :: 3 :: Only',
         'Programming Language :: Python :: Implementation :: CPython',
+        'Programming Language :: Python :: 3 :: Only',
+        'Programming Language :: Python :: 3.7',
+        'Programming Language :: Python :: 3.8',
+        'Programming Language :: Python :: 3.9',
+        'Programming Language :: Python :: 3.10',
+
         'Topic :: Database',
-        # More classifiers to come later:
-        # https://pypi.org/classifiers/
-        # 'Environment :: GPU',
-        # 'Framework :: Apache Airflow :: Provider',
-        # 'Framework :: IPython',
+        'Topic :: Database :: Database Engines/Servers',
+        'Topic :: Database :: Front-Ends',
     ],
+
     ext_modules=[
         CMakeExtension('ukv.umem'),
         CMakeExtension('ukv.rocksdb'),
         CMakeExtension('ukv.leveldb'),
-        CMakeExtension('ukv.flight_client')],
-    cmdclass={'build_ext': CMakeBuild},
+        CMakeExtension('ukv.flight_client'),
+    ],
+    cmdclass={
+        'build_ext': CMakeBuild,
+        'build_pyi': BuildPyi},
     zip_safe=False,
     install_requires=[
         'numpy>=1.16',

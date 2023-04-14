@@ -1,4 +1,4 @@
-# UKV Rust SDK
+# UStore Rust SDK
 
 Rust implementation is designed to support:
 

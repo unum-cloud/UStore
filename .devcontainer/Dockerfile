@@ -20,11 +20,7 @@ RUN if [ "${REINSTALL_CMAKE_VERSION_FROM_SOURCE}" != "none" ]; then \
 
 # [Optional] Uncomment this section to install additional packages.
 RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
-    && apt-get -y install --no-install-recommends clang-format autoconf 
-
-
-# Install Arrow and Documentation Tools
-RUN python3.10 python3-pip python3-dbg python3.10-dev
+    && apt-get -y install --no-install-recommends clang-format autoconf python3.10 python3-pip python3-dbg python3.10-dev
 
 # Pip installations
 RUN pip install pytest twine numpy pyarrow wheel gdb-tools sphinx breathe furo sphinx_mdinclude

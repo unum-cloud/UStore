@@ -1,0 +1,22 @@
+name: Pre-Release
+
+on:
+  push:
+    branches: ["main-dev"]
+
+env:
+  GH_TOKEN: ${{ secrets.SEMANTIC_RELEASE_TOKEN }}
+
+
+jobs:
+
+  versioning:
+    name: Semantic Release
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        persist-credentials: false
+        ref: 'main-dev'
+    - uses: actions/setup-node@v3
+    - run: cp .github/workflows/package.json . && npm install && npx semantic-release

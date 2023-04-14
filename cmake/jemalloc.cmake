@@ -1,7 +1,8 @@
 
 include(ExternalProject)
-set(JEMALLOC_DISABLE_TLS )
-if (${UKV_BUILD_SDK_PYTHON})
+set(JEMALLOC_DISABLE_TLS)
+
+if(${UKV_BUILD_SDK_PYTHON})
     set(JEMALLOC_DISABLE_TLS --disable-initial-exec-tls)
 endif()
 
@@ -49,32 +50,31 @@ if(${UKV_REBUILD_JEMALLOC})
     include_directories(${JEMALLOC_SOURCE_DIR}/include)
 
 else()
+    find_path(JEMALLOC_ROOT_DIR
+        NAMES include/jemalloc/jemalloc.h
+    )
 
-find_path(JEMALLOC_ROOT_DIR
-    NAMES include/jemalloc/jemalloc.h
-)
+    find_library(JEMALLOC_LIBRARIES
+        NAMES jemalloc
+        HINTS ${JEMALLOC_ROOT_DIR}/lib
+    )
 
-find_library(JEMALLOC_LIBRARIES
-    NAMES jemalloc
-    HINTS ${JEMALLOC_ROOT_DIR}/lib
-)
+    find_path(JEMALLOC_INCLUDE_DIR
+        NAMES jemalloc/jemalloc.h
+        HINTS ${JEMALLOC_ROOT_DIR}/include
+    )
 
-find_path(JEMALLOC_INCLUDE_DIR
-    NAMES jemalloc/jemalloc.h
-    HINTS ${JEMALLOC_ROOT_DIR}/include
-)
+    include(FindPackageHandleStandardArgs)
+    find_package_handle_standard_args(JeMalloc DEFAULT_MSG
+        JEMALLOC_LIBRARIES
+        JEMALLOC_INCLUDE_DIR
+    )
 
-include(FindPackageHandleStandardArgs)
-find_package_handle_standard_args(JeMalloc DEFAULT_MSG
-    JEMALLOC_LIBRARIES
-    JEMALLOC_INCLUDE_DIR
-)
-
-mark_as_advanced(
-    JEMALLOC_ROOT_DIR
-    JEMALLOC_LIBRARIES
-    JEMALLOC_INCLUDE_DIR
-)
+    mark_as_advanced(
+        JEMALLOC_ROOT_DIR
+        JEMALLOC_LIBRARIES
+        JEMALLOC_INCLUDE_DIR
+    )
 endif()
 
 message("JEMALLOC_LIBRARIES:" ${JEMALLOC_LIBRARIES})

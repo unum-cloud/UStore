@@ -44,13 +44,13 @@ RUN chmod +x /tini
 WORKDIR /var/lib/ukv/
 
 COPY --from=builder /usr/src/ukv/build/bin/ukv_flight_server_umem ./umem_server
-COPY ./assets/config_umem.json ./umem/config_umem.json
+COPY ./assets/db.config.json /var/lib/ukv/config.json
 
 COPY --from=builder /usr/src/ukv/build/bin/ukv_flight_server_leveldb ./leveldb_server
-COPY ./assets/config_leveldb.json ./leveldb/config_leveldb.json
+COPY ./assets/db.config.json /var/lib/ukv/config.json
 
 COPY --from=builder /usr/src/ukv/build/bin/ukv_flight_server_rocksdb ./rocksdb_server
-COPY ./assets/config_rocksdb.ini ./rocksdb/config_rocksdb.ini
+COPY ./assets/db.config.json /var/lib/ukv/config.json
 
 EXPOSE 38709
 ENTRYPOINT ["/tini", "--"]

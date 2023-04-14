@@ -1,4 +1,4 @@
-# UKV JavaScript SDK
+# UStore JavaScript SDK
 
 * Node.js
 * V8

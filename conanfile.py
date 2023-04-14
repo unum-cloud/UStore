@@ -14,7 +14,7 @@ class ConanUKV(ConanFile):
         'with_arrow': False,
     }
 
-    name = 'UKV'
+    name = 'ukv'
     version = open('VERSION').read()
     # Take just the first line
     license = open('LICENSE').read().split('\n', 1)[0]

@@ -6,7 +6,7 @@ plugins {
     id 'maven-publish'
 }
 
-group "com.unum.ukv"
+group "cloud.unum.ukv"
 version = file("VERSION").text.trim()
 
 sourceCompatibility = 1.8
@@ -46,7 +46,7 @@ model {
             sources {
                 c {
                     source {
-                        srcDirs "java/com/unum/ukv"
+                        srcDirs "java/cloud/unum/ukv"
                         include "**/*.c"
                     }
                     exportedHeaders {
@@ -64,11 +64,11 @@ model {
                 }
 
                 if (buildType == buildTypes.umem) {
-                    linker.args '-L', "${projectDir}/build/lib", "-l", "ukv_embedded_umem", "-l", "c"
+                    linker.args '-L', "${projectDir}/build/lib", "-l", "ukv_umem_bundle", "-l", "c"
                 } else if (buildType == buildTypes.rocksdb) {
-                    linker.args '-L', "${projectDir}/build/lib", "-l", "ukv_embedded_rocksdb", "-l", "rocksdb", "-l", "c"
+                    linker.args '-L', "${projectDir}/build/lib", "-l", "ukv_rocksdb_bundle", "-l", "c"
                 } else if (buildType == buildTypes.leveldb) {
-                    linker.args '-L', "${projectDir}/build/lib", "-l", "ukv_embedded_leveldb", "-l", "leveldb", "-l", "c"
+                    linker.args '-L', "${projectDir}/build/lib", "-l", "ukv_leveldb_bundle", "-l", "c"
                 }
             }
         }

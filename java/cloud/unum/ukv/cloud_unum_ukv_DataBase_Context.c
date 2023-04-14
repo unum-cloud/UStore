@@ -1,9 +1,9 @@
-#include "com_unum_ukv_Shared.h"
-#include "com_unum_ukv_DataBase_Context.h"
+#include "cloud_unum_ukv_Shared.h"
+#include "cloud_unum_ukv_DataBase_Context.h"
 
-JNIEXPORT void JNICALL Java_com_unum_ukv_DataBase_00024Context_open(JNIEnv* env_java,
-                                                                    jobject db_java,
-                                                                    jstring config_java) {
+JNIEXPORT void JNICALL Java_cloud_unum_ukv_DataBase_00024Context_open(JNIEnv* env_java,
+                                                                      jobject db_java,
+                                                                      jstring config_java) {
 
     ukv_database_t db_ptr_c = db_ptr(env_java, db_java);
     if (db_ptr_c) {
@@ -36,7 +36,7 @@ JNIEXPORT void JNICALL Java_com_unum_ukv_DataBase_00024Context_open(JNIEnv* env_
     (*env_java)->SetLongField(env_java, db_java, db_ptr_field, (long int)db_ptr_c);
 }
 
-JNIEXPORT jobject JNICALL Java_com_unum_ukv_DataBase_00024Context_transaction(JNIEnv* env_java, jobject db_java) {
+JNIEXPORT jobject JNICALL Java_cloud_unum_ukv_DataBase_00024Context_transaction(JNIEnv* env_java, jobject db_java) {
 
     ukv_database_t db_ptr_c = db_ptr(env_java, db_java);
     ukv_transaction_t txn_ptr_c = txn_ptr(env_java, db_java);
@@ -56,7 +56,7 @@ JNIEXPORT jobject JNICALL Java_com_unum_ukv_DataBase_00024Context_transaction(JN
     if (forward_error(env_java, error_c))
         return NULL;
 
-    jclass txn_class_java = (*env_java)->FindClass(env_java, "com/unum/ukv/DataBase$Transaction");
+    jclass txn_class_java = (*env_java)->FindClass(env_java, "cloud/unum/ukv/DataBase$Transaction");
     jmethodID txn_constructor_java = (*env_java)->GetMethodID(env_java, txn_class_java, "<init>", "()V");
     jobject txn_java = (*env_java)->NewObject(env_java, txn_class_java, txn_constructor_java);
 
@@ -69,7 +69,7 @@ JNIEXPORT jobject JNICALL Java_com_unum_ukv_DataBase_00024Context_transaction(JN
     return txn_java;
 }
 
-JNIEXPORT void JNICALL Java_com_unum_ukv_DataBase_00024Context_close_1(JNIEnv* env_java, jobject db_java) {
+JNIEXPORT void JNICALL Java_cloud_unum_ukv_DataBase_00024Context_close_1(JNIEnv* env_java, jobject db_java) {
 
     ukv_database_t db_ptr_c = db_ptr(env_java, db_java);
     if (!db_ptr_c)
@@ -84,7 +84,7 @@ JNIEXPORT void JNICALL Java_com_unum_ukv_DataBase_00024Context_close_1(JNIEnv* e
     ukv_database_free(db_ptr_c);
 }
 
-JNIEXPORT void JNICALL Java_com_unum_ukv_DataBase_00024Context_clear__(JNIEnv* env_java, jobject db_java) {
+JNIEXPORT void JNICALL Java_cloud_unum_ukv_DataBase_00024Context_clear__(JNIEnv* env_java, jobject db_java) {
 
     ukv_database_t db_ptr_c = db_ptr(env_java, db_java);
     ukv_error_t error_c = NULL;

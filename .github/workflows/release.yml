@@ -1,4 +1,4 @@
-name: Deploy static content to Pages
+name: Release
 
 on:
   # Runs on pushes targeting the default branch
@@ -7,7 +7,7 @@ on:
 
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
- 
+
 # Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
 permissions:
   contents: read
@@ -19,27 +19,50 @@ concurrency:
   group: "pages"
   cancel-in-progress: true
 
+
+env:
+  GH_TOKEN: ${{ secrets.SEMANTIC_RELEASE_TOKEN }}
+
+
 jobs:
+
+  versioning:
+    name: Semantic Release
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        persist-credentials: false
+    - uses: actions/setup-node@v3
+    - run: cp .github/workflows/package.json . && npm install && npx semantic-release
+
+
   # Single deploy job since we're just deploying
   deploy:
+    name: Deploy Docs
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-22.04
+    needs: versioning
     steps:
       - name: Checkout
         uses: actions/checkout@v3
-      - name: Setup Pages
+        with:
+          ref: 'main'   
+      - name: Setup GitHub Pages
         uses: actions/configure-pages@v2
-      - name: Install Deps
-        run: sudo apt update && sudo apt install -y doxygen graphviz dia git && pip install sphinx breathe furo m2r2 sphinxcontrib-googleanalytics==0.2.dev20220708
-      - name: Install ukv from pip
+      - name: Install dependencies
+        run: sudo apt update && sudo apt install -y doxygen graphviz dia git && pip install sphinx breathe furo m2r2 sphinxcontrib-googleanalytics==0.2.dev20220708 sphinxcontrib-jquery
+      - name: Install UKV from PyPi
         run: pip install ukv
-      - name: Build Documentation
-        run: cd assets/docs && doxygen config.dox && make html
+      - name: Fetch GoLang repo
+        run: git submodule update --init --recursive --remote go-ukv/
+      - name: Build documentation
+        run: cd docs && doxygen conf.dox && make html
       - name: Copy assets
         run: cp -r assets build/docs/html/
-      - name: Upload artifact
+      - name: Upload artifacts
         uses: actions/upload-pages-artifact@v1
         with:
           # Upload entire repository

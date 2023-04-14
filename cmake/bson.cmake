@@ -4,7 +4,7 @@ include(ExternalProject)
 ExternalProject_Add(
     mongo_c_driver
     GIT_REPOSITORY https://github.com/mongodb/mongo-c-driver.git
-    GIT_TAG 1.23.0
+    GIT_TAG 1.23.2
     GIT_SHALLOW 1
     GIT_PROGRESS 0
 
