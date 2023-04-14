@@ -1,25 +1,25 @@
-# UKV Python SDK
+# UStore Python SDK
 
 Current implementation relies on [PyBind11](https://github.com/pybind/pybind11).
-It's feature-rich, but not very performant, supporting:
+It's feature-rich, but not the most performant, supporting:
 
-* Named Collections
-* ACID Transactions
-* Single & Batch Operations
-* Tensors support via [Buffer Protocol](https://docs.python.org/3/c-api/buffer.html)
-* [NetworkX][networkx]-like interface for Graphs
-* [Pandas][pandas]-like interface for Document collections
-* [FAISS][faiss]-like interface for Vector collections
+- Named Collections
+- ACID Transactions
+- Single & Batch Operations
+- Tensors support via [Buffer Protocol](https://docs.python.org/3/c-api/buffer.html)
+- [NetworkX][networkx]-like interface for Graphs
+- [Pandas][pandas]-like interface for Document collections
+- [FAISS][faiss]-like interface for Vector collections
 
 Using it can be as easy as:
 
 ```python
-import ukv.umem as ukv
-# import ukv.udisk as ukv
-# import ukv.leveldb as ukv
-# import ukv.rocksdb as ukv
+import ustore.umem as ustore
+# import ustore.udisk as ustore
+# import ustore.leveldb as ustore
+# import ustore.rocksdb as ustore
 
-db = ukv.DataBase()
+db = ustore.DataBase()
 main_collection = db.main
 archive_collection = db['archive']
 
@@ -84,14 +84,14 @@ One thing to note, the `.main` collection can't be removed, only cleared.
 Similar to Python ORM tools, transactions scope can be controlled manually, or with context managers.
 
 ```python
-with ukv.Transaction(db) as txn:
+with ustore.Transaction(db) as txn:
     txn.main[42] = binary_string # Not the same as `db.main[42]`
 ```
 
 You can configure teh transaction behavior with additional arguments.
 
 ```python
-txn = ukv.Transaction(db, begin=True, watch=True, flush_writes=False, snapshot=False)
+txn = ustore.Transaction(db, begin=True, watch=True, flush_writes=False, snapshot=False)
 ```
 
 Transactions that conflict with each other, will fail, raising an exception.
@@ -121,7 +121,7 @@ strings: pa.StringArray = pa.array(['some', 'text'])
 main_collection[keys] = strings
 ```
 
-If you are exchanging representations like this between UKV and any other runtime, we will entirely avoid copying data.
+If you are exchanging representations like this between UStore and any other runtime, we will entirely avoid copying data.
 This method is recommended for higher performance.
 
 ## Converting Collections
@@ -131,55 +131,146 @@ You can convert a collection handle into a structured binding:
 ```python
 main_collection.graph # for NetworkX-like feel
 main_collection.docs # for `dict`-like values, that we map into JSONs
-main_collection.docs.table # for Pandas experience when working with docs
-main_collection.paths # for string keys
+main_collection.table # for Pandas experience when working with docs
 main_collection.vectors # for high-dimensional vector values and k-ANN
+main_collection.paths # for string keys
 ```
 
 ### Graphs: NetworkX
 
 With over 10'000 stars on GitHub NetworkX might just be the most popular network-science package across all languages.
 We adapt part of its interface for labeled directed graphs to preserve familiar look.
-But if NetworkX hardly scales beyond a thousand nodes, our Graph engine is designed to handle billions.
+But if NetworkX hardly scales beyond a thousand nodes, we aim to support persistent memory Graphs, that can span tens of Terabytes.
 
-* `.order()`, `.number_of_nodes()`, `len`
-* `.nodes()`, `.has_node()`, `in`, `nbunch_iter()`
-* `.edges()`, `.in_edges()`, `.out_edges()`
-* `.has_edge()`, `.get_edge_data()`
-* `.degree[]`, `.in_degree[]`, `.out_degree[]`
-* `.neighbors()`, `.successors()`, `.predecessors()`
-* `.add_edge()`, `.add_edges_from()`
-* `.remove_edge()`, `.remove_edges_from()`
-* `.clear_edges()`, `.clear()`
-* `.subgraph()`, `.edge_subgraph()`
-* `.write_adjlist()`
+```python
+import numpy as np
 
-We are now bridging UKV with [CuGraph][cugraph] for GPU acceleration.
+# Let's build a random sparse graph:
+g = db.main.graph
+node_ids = np.arange(1_000_000)
+source_ids = np.random.choice(node_ids, 10_000_000)
+target_ids = np.random.choice(node_ids, 10_000_000)
+g.add_edges_from(source_ids, target_ids)
+
+# Let's export an adjacency matrix for a small subset of nodes:
+subset_size = 1_000
+subset_ids = np.random.choice(node_ids, subset_size)
+adjacency_matrix = np.zeros((subset_size, subset_size), dtype=bool)
+for i, subset_id in enumerate(subset_ids):
+    neighbors_ids = g[subset_id]
+    for j, subset_id in enumerate(subset_ids):
+        adjacency_matrix[i, j] = subset_id in neighbors_ids
+```
+
+This allows you to very large graphs in parts, that fit into memory.
+Need vertex degrees to compute the normalized **Laplacian**?
+
+```python
+normalizer = np.diag(np.power(adjacency_matrix.sum(axis=0), -0.5))
+laplacian_matrix = np.identity(subset_size) - normalizer @ adjacency_matrix @ normalizer
+```
+
+Want to **Page-Rank**?
+
+```python
+d = 0.85
+tolerance = 1e-2
+max_iterations = 100
+weight = adjacency_matrix / adjacency_matrix.sum(axis=0)
+page_rank = np.ones(subset_size).reshape(subset_size, 1) * 1. / subset_size
+
+for _ in range(max_iterations):
+    old_page_rank = page_rank[:]
+    page_rank = d * weight @ page_rank + (1 - d) / subset_size
+    shift = np.absolute(page_rank - old_page_rank).sum()
+    if shift < tolerance:
+        break
+```
+
+Want to build a **Knowledge Graph** using a 1000 "worker" processes reasoning on the same graph representation, computing different metrics and performing updates?
+You can't do that in NetworkX, but you can in UStore!
+
+```python
+import ustore.flight_client as remote
+
+db = remote.DataBase('remote.server.ip.address:38709')
+controversial_articles_category: int = ...
+is_controversial = lambda text: 'scandal' in text
+
+with ustore.Transaction(db) as txn:
+    descriptions_collection = txn['descriptions']
+    articles_ids = descriptions_collection.sample(100)
+    articles = descriptions_collection[articles_ids]
+    controversial_ids = [article_id for article_id, article in zip(articles_ids, articles) if is_controversial(article)]
+
+    g = txn['categories'].graph
+    g.add_edges_from(controversial_ids, [controversial_articles_category] * len(controversial_ids))
+```
+
+We also support Attributed Graphs.
+You only need to specify the names of document collections, where the attributes will be stored or pulled from:
+
+```python
+g = ustore.Network(db, 'graph', 'node_attributes', 'edge_attributes')
+source_ids = np.arange(100)
+target_ids = np.arange(1, 101)
+edge_ids = np.arange(100)
+g.add_edges_from(source_ids, target_ids, edge_ids, weight=2)
+assert g.degree(
+    [100, 1, 2, 0], 
+    weight='weight',
+) == [(100, 2), (1, 4), (2, 4), (0, 2)]
+```
+
+---
+
+Primary functions:
+
+- `.order()`, `.number_of_nodes()`, `len`: to estimate size.
+- `.nodes()`, `.has_node()`, `in`, `nbunch_iter()`: to work with nodes.
+- `.edges()`, `.in_edges()`, `.out_edges()`: to iterate through edges.
+- `.has_edge()`, `.get_edge_data()`: to check for specific edges.
+- `.degree[]`, `.in_degree[]`, `.out_degree[]`: to get node degrees.
+- `.__getitem__()`, `.successors()`, `.predecessors()`: to traverse the graph.
+- `.add_edge()`, `.add_edges_from()`: to add edges.
+- `.remove_edge()`, `.remove_edges_from()`: to remove edges.
+- `.clear_edges()`, `.clear()`: to clear the graph.
+
+Our next milestones for Graphs are:
+
+- attributes in vertices and edges,
+- easier subgraph extraction methods: `.subgraph()`, `.edge_subgraph()`,
+- imports and exports from files: `.write_adjlist()`,
+- integrating [CuGraph][cugraph] for GPU acceleration.
 
 ### Tables: Pandas
 
-We can't currently cover the whole Pandas interface.
-It has over a hundred functions.
-The implemented ones include:
+The original Pandas interface has over a hundred functions.
+We don't yet support the full range, but the implemented ones include:
 
-* `[]` to select a subset of columns.
-* `.loc[]` to select a subset or a subrange of rows.
-* `.head()` to take the first few rows.
-* `.tail()` to take the last few rows.
-* `.update()` to inplace join another table.
+- `[]` to select a subset of columns.
+- `.loc[]` to select a subset or a subrange of rows.
+- `.head()` to take the first few rows.
+- `.tail()` to take the last few rows.
+- `.update()` to in-place join another table.
 
 Once you have selected your range:
 
-* `.astype()`: to cast the contents.
-* `.df` to materialize the view.
-* `.to_arrow()`: to export into Arrow Table.
+- `.astype()`: to cast the contents.
+- `.df` to materialize the view.
+- `.to_arrow()`: to export into Arrow Table.
 
 From there, its a piece of cake.
 Pass it to Pandas, Modin, Arrow, Spark, CuDF, Dask, Ray or any other package of your choosing.
+Let's try those together to window-scan a flexible-schema collection, sampling some fields into PyArrow `DataFrame`:
 
-> [Comprehensive overview of tabular processing tools in Python](https://unum.cloud/post/).
+```python
+TODO:
+```
 
-We are now bridging UKV with [CuDF][cudf] for GPU acceleration.
+> TODO: [Comprehensive overview of tabular processing tools in Python](https://unum.cloud/post/).
+
+We are now bridging UStore with [CuDF][cudf] for GPU acceleration.
 
 ### Vectors: FAISS
 

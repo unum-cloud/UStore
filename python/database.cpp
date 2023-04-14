@@ -51,7 +51,7 @@ static std::unique_ptr<py_blobs_collection_t> punned_db_collection(py_db_t& db, 
 
 static std::unique_ptr<py_blobs_collection_t> punned_txn_collection(py_transaction_t& txn,
                                                                     std::string const& collection) {
-    return punned_collection<blobs_collection_t>(txn.py_db_ptr.lock(), txn.shared_from_this(), collection);
+    return punned_collection<blobs_collection_t>(txn.py_db_ptr, txn.shared_from_this(), collection);
 }
 
 template <typename range_at>
@@ -162,9 +162,12 @@ void ukv::wrap_database(py::module& m) {
     py_txn.def( //
         py::init([](py_db_t& py_db, bool begin, bool watch, bool flush_writes, bool snapshot) {
             auto db_ptr = py_db.shared_from_this();
-            auto maybe_txn = py_db.native.transact(snapshot);
-            maybe_txn.throw_unhandled();
-            auto py_txn_ptr = std::make_shared<py_transaction_t>(*std::move(maybe_txn), db_ptr);
+            auto txn = py_db.native.transact().throw_or_release();
+            if (snapshot) {
+                auto snap = py_db.native.snapshot().throw_or_release();
+                txn.set_snapshot(snap.snap());
+            }
+            auto py_txn_ptr = std::make_shared<py_transaction_t>(std::move(txn), db_ptr);
             py_txn_ptr->dont_watch = !watch;
             py_txn_ptr->flush_writes = flush_writes;
             return py_txn_ptr;
@@ -229,24 +232,25 @@ void ukv::wrap_database(py::module& m) {
 
     py_db.def("collection_names", [](py_db_t& py_db) {
         status_t status;
-        ukv_size_t count {0};
-        ukv_collection_t* ids {nullptr};
+        ukv_size_t count {};
+        ukv_collection_t* ids {};
         arena_t arena(py_db.native);
-        ukv_str_span_t names {nullptr};
-        ukv_collection_list_t collection_list {
-            .db = py_db.native,
-            .error = status.member_ptr(),
-            .arena = arena.member_ptr(),
-            .count = &count,
-            .ids = &ids,
-            .names = &names,
-        };
+        ukv_str_span_t names {};
+        ukv_collection_list_t collection_list {};
+        collection_list.db = py_db.native;
+        collection_list.error = status.member_ptr();
+        collection_list.arena = arena.member_ptr();
+        collection_list.count = &count;
+        collection_list.ids = &ids;
+        collection_list.names = &names;
+
         ukv_collection_list(&collection_list);
         status.throw_unhandled();
         std::vector<std::string> names_copy {count};
         strings_tape_iterator_t names_it {count, names};
-        while (!names_it.is_end())
-            names_copy.push_back(*names_it);
+        for (std::size_t i = 0; i != count; ++i, ++names_it)
+            names_copy[i] = *names_it;
+
         return names_copy;
     });
 
@@ -269,12 +273,12 @@ void ukv::wrap_database(py::module& m) {
     });
     py_collection.def_property_readonly("table", [](py_blobs_collection_t& py_collection) {
         auto py_table = std::make_shared<py_table_collection_t>();
-        py_table->binary = py_collection;
+        py_table->binary = py_collection.native;
         return py::cast(py_table);
     });
     py_collection.def_property_readonly("docs", [](py_blobs_collection_t& py_collection) {
-        return punned_collection<docs_collection_t>(py_collection.py_db_ptr.lock(),
-                                                    py_collection.py_txn_ptr.lock(),
+        return punned_collection<docs_collection_t>(py_collection.py_db_ptr,
+                                                    py_collection.py_txn_ptr,
                                                     py_collection.name);
     });
     py_collection.def_property_readonly("media", [](py_blobs_collection_t& py_collection) { return 0; });
@@ -323,12 +327,12 @@ void ukv::wrap_database(py::module& m) {
     });
 
     py_collection.def_property_readonly("keys", [](py_blobs_collection_t& py_collection) {
-        blobs_range_t members(py_collection.db(), py_collection.txn(), *py_collection.member_collection());
+        blobs_range_t members(py_collection.db(), py_collection.txn(), 0, *py_collection.member_collection());
         keys_range_t range {members};
         return py::cast(std::make_unique<keys_range_t>(range));
     });
     py_collection.def_property_readonly("items", [](py_blobs_collection_t& py_collection) {
-        blobs_range_t members(py_collection.db(), py_collection.txn(), *py_collection.member_collection());
+        blobs_range_t members(py_collection.db(), py_collection.txn(), 0, *py_collection.member_collection());
         pairs_range_t range {members};
         return py::cast(std::make_unique<pairs_range_t>(range));
     });

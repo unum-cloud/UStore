@@ -1,11 +1,18 @@
+#include <fmt/os.h>
 #include <fmt/format.h>
 
+#include <arrow/io/api.h>
+#include <arrow/csv/api.h>
+#include <arrow/ipc/api.h>
 #include <arrow/c/bridge.h>
+#include <arrow/util/type_fwd.h>
 #include <arrow/python/pyarrow.h>
+#include <parquet/arrow/writer.h>
 
-#define ARROW_C_DATA_INTERFACE 1
-#define ARROW_C_STREAM_INTERFACE 1
+#define ARROW_C_DATA_INTERFACE
+#define ARROW_C_STREAM_INTERFACE
 #include "ukv/arrow.h"
+#include "nlohmann.hpp"
 
 #include "pybind.hpp"
 #include "crud.hpp"
@@ -52,7 +59,7 @@ static ukv_doc_field_type_t ukv_doc_field_from_str(ukv_str_view_t type_name) {
 }
 
 void scan_rows(py_table_collection_t& df) {
-    auto keys_range = df.binary.native.keys();
+    auto keys_range = df.binary.keys();
     auto keys_stream = keys_range.begin();
     std::vector<ukv_key_t> keys_found;
     while (!keys_stream.is_end()) {
@@ -64,7 +71,7 @@ void scan_rows(py_table_collection_t& df) {
 
 void scan_rows_range(py_table_collection_t& df) {
     auto& range = std::get<py_table_keys_range_t>(df.rows_keys);
-    auto keys_range = df.binary.native.keys(range.min);
+    auto keys_range = df.binary.keys(range.min);
     auto keys_stream = keys_range.begin();
     std::vector<ukv_key_t> keys_found;
     while (!keys_stream.is_end()) {
@@ -128,13 +135,12 @@ void correct_table(docs_table_t& table) {
     }
 }
 
-static py::object materialize(py_table_collection_t& df) {
+static std::shared_ptr<arrow::RecordBatch> materialize(py_table_collection_t& df) {
 
     // Extract the keys, if not explicitly defined
     if (std::holds_alternative<std::monostate>(df.rows_keys))
-        throw std::invalid_argument("Full collection table materialization is not allowed");
-
-    if (std::holds_alternative<py_table_keys_range_t>(df.rows_keys))
+        scan_rows(df);
+    else if (std::holds_alternative<py_table_keys_range_t>(df.rows_keys))
         scan_rows_range(df);
 
     // Slice the keys using `head` and `tail`
@@ -162,10 +168,8 @@ static py::object materialize(py_table_collection_t& df) {
         keys_found.resize(keys_count);
     }
 
-    auto collection = docs_collection_t(df.binary.native.db(),
-                                        df.binary.native,
-                                        df.binary.native.txn(),
-                                        df.binary.native.member_arena());
+    auto collection =
+        docs_collection_t(df.binary.db(), df.binary, df.binary.txn(), df.binary.snap(), df.binary.member_arena());
     auto members = collection[keys_found];
 
     // Extract the present fields
@@ -223,13 +227,8 @@ static py::object materialize(py_table_collection_t& df) {
         status.throw_unhandled();
     }
 
-    // Pass C to C++ and then to Python:
-    // https://github.com/apache/arrow/blob/master/cpp/src/arrow/c/bridge.h#L138
-    arrow::Result<std::shared_ptr<arrow::RecordBatch>> table_arrow =
-        arrow::ImportRecordBatch(&c_arrow_array, &c_arrow_schema);
-    // https://github.com/apache/arrow/blob/a270afc946398a0279b1971a315858d8b5f07e2d/cpp/src/arrow/python/pyarrow.h#L52
-    PyObject* table_python = arrow::py::wrap_batch(table_arrow.ValueOrDie());
-    return py::reinterpret_steal<py::object>(table_python);
+    // https://github.com/apache/arrow/blob/e0e740bd7a24de68262c0b7e47eeed62a6cbd2a0/cpp/src/arrow/c/bridge.h#L163
+    return arrow::ImportRecordBatch(&c_arrow_array, &c_arrow_schema).ValueOrDie();
 }
 
 template <typename array_type_at>
@@ -266,7 +265,7 @@ void update(py_table_collection_t& df, py::object obj) {
         scan_rows_range(df);
 
     auto& keys = std::get<std::vector<ukv_key_t>>(df.rows_keys);
-    auto collection = docs_collection_t(df.binary.native.db(), df.binary.native, df.binary.native.txn());
+    auto collection = docs_collection_t(df.binary.db(), df.binary, df.binary.txn());
 
     arrow::Result<std::shared_ptr<arrow::RecordBatch>> maybe_record_batch = arrow::py::unwrap_batch(obj.ptr());
     std::shared_ptr<arrow::RecordBatch> record_batch = maybe_record_batch.ValueOrDie();
@@ -314,10 +313,9 @@ void update(py_table_collection_t& df, py::object obj) {
 
     offsets.back() = jsons_to_merge.size();
     auto vals_begin = reinterpret_cast<ukv_bytes_ptr_t>(jsons_to_merge.data());
-    contents_arg_t values {
-        .offsets_begin = {offsets.data(), sizeof(ukv_length_t)},
-        .contents_begin = {&vals_begin, 0},
-    };
+    contents_arg_t values {};
+    values.offsets_begin = {offsets.data(), sizeof(ukv_length_t)};
+    values.contents_begin = {&vals_begin, 0};
 
     collection[keys].merge(values);
 }
@@ -326,11 +324,14 @@ void ukv::wrap_pandas(py::module& m) {
 
     auto df =
         py::class_<py_table_collection_t, std::shared_ptr<py_table_collection_t>>(m, "DataFrame", py::module_local());
-    df.def(py::init([](py::handle dtype) {
-        // `dtype` can be a `dict` or a `list[tuple[str, str]]`, where every pair of
-        // strings contains a column name and Python type descriptor
-        return std::make_shared<py_table_collection_t>();
-    }));
+    df.def(py::init([](std::shared_ptr<py_db_t> py_db, std::string const& index) {
+               auto py_table = std::make_shared<py_table_collection_t>();
+               database_t& db = py_db->native;
+               py_table->binary = db.find_or_create(index.c_str()).throw_or_release();
+               return py_table;
+           }),
+           py::arg("db"),
+           py::arg("index") = "");
 
 #pragma region Managing Columns
 
@@ -409,14 +410,83 @@ void ukv::wrap_pandas(py::module& m) {
     // Addresses may be: specific IDs or a slice.
     // https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.loc.html#pandas.DataFrame.loc
     // https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.iloc.html#pandas.DataFrame.iloc
-    df.def("to_arrow", &materialize);
+    df.def("to_arrow", [](py_table_collection_t& df) {
+        auto record_batch = materialize(df);
+        // https://github.com/apache/arrow/blob/a270afc946398a0279b1971a315858d8b5f07e2d/cpp/src/arrow/python/pyarrow.h#L52
+        PyObject* table_python = arrow::py::wrap_batch(record_batch);
+        return py::reinterpret_steal<py::object>(table_python);
+    });
 
     // https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.to_json.html
-    // df.def("to_json", [](py_table_collection_t& df, py::object const& path_or_buf) {});
+    df.def(
+        "to_json",
+        [](py_table_collection_t& df, std::string const& path) -> py::object {
+            auto batch = materialize(df);
+            auto& keys_found = std::get<std::vector<ukv_key_t>>(df.rows_keys);
+
+            std::string result = "{";
+            for (std::size_t i = 0; i != batch->num_columns(); ++i) {
+                auto str = batch->column(i)->ToString();
+                str.erase(std::remove_if(str.begin(), str.end(), [](auto c) { return std::isspace(c) || c == '\x00'; }),
+                          str.end());
+                result.reserve(result.size() + str.size() + 7);
+                fmt::format_to(std::back_inserter(result), "\"{}\":", batch->column_name(i));
+
+                auto key_index = 0;
+                auto pos = str.find("[");
+                str.replace(pos, 1, fmt::format("{{\"{}\":", keys_found[key_index]));
+
+                pos = str.find(",", pos);
+                while (pos != std::string::npos) {
+                    ++key_index;
+                    str.replace(pos, 1, fmt::format(",\"{}\":", keys_found[key_index]));
+                    pos = str.find(",", pos + 1);
+                }
+                str.replace(str.size() - 1, 1, fmt::format("}},", keys_found[key_index]));
+                result += str;
+            }
+            result[result.size() - 1] = '}';
+
+            if (!path.size())
+                return py::cast(result);
+            fmt::output_file(path).print("{}", result);
+            return py::none();
+        },
+        py::arg("path") = "");
+
     // https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.to_parquet.html
-    // df.def("to_parquet", [](py_table_collection_t& df, py::object const& path_or_buf) {});
+    df.def("to_parquet", [](py_table_collection_t& df, std::string const& path) {
+        auto batch = materialize(df);
+        auto outfile = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+        std::unique_ptr<parquet::arrow::FileWriter> writer;
+        parquet::arrow::FileWriter::Open(*batch->schema(),
+                                         arrow::default_memory_pool(),
+                                         outfile,
+                                         parquet::default_writer_properties(),
+                                         &writer);
+
+        auto table = arrow::Table::FromRecordBatches(batch->schema(), {batch}).ValueOrDie();
+        if (!(writer->WriteTable(*table, batch->num_rows()).ok()))
+            throw std::runtime_error("Write Failure");
+
+        if (!writer->Close().ok())
+            throw std::runtime_error("Close Failure");
+    });
+
     // https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.to_csv.html
-    // df.def("to_csv", [](py_table_collection_t& df, py::object const& path_or_buf) {});
+    df.def("to_csv", [](py_table_collection_t& df, std::string const& path) {
+        auto batch = materialize(df);
+        auto output = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+
+        auto writer =
+            arrow::csv::MakeCSVWriter(output, batch->schema(), arrow::csv::WriteOptions::Defaults()).ValueOrDie();
+        if (!writer->WriteRecordBatch(*batch).ok())
+            throw std::runtime_error("Write Failure");
+
+        if (!writer->Close().ok() || !writer->Close().ok())
+            throw std::runtime_error("Close Failure");
+    });
+
     // https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.to_numpy.html
     // df.def("to_numpy", [](py_table_collection_t& df, py::handle mat) {});
 
@@ -428,7 +498,14 @@ void ukv::wrap_pandas(py::module& m) {
     // df.def("dtypes", [](py_table_collection_t& df) {});
 
     // https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.sample.html
-    // df.def("sample", [](py_table_collection_t& df, std::size_t count, bool replace) {});
+    df.def("sample", [](py_table_collection_t& df, std::size_t count) {
+        auto collection =
+            docs_collection_t(df.binary.db(), df.binary, df.binary.txn(), df.binary.snap(), df.binary.member_arena());
+
+        auto keys = collection.keys().sample(count, df.binary.member_arena()).throw_or_release();
+        df.rows_keys = std::vector<ukv_key_t>(keys.begin(), keys.end());
+        return df.shared_from_this();
+    });
 
     // https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.concat.html
     // df.def("concat", [](py_table_collection_t const& df, py_table_collection_t const& df_other) {});
@@ -437,8 +514,266 @@ void ukv::wrap_pandas(py::module& m) {
 
     // https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.replace.html
     // df.def("replace", [](py_table_collection_t& df) {});
+
     // https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.merge.html
-    // df.def("merge", [](py_table_collection_t& df) {});
+    df.def("merge", [](py_table_collection_t& df, py_table_collection_t& df_to_merge) {
+        auto collection_to_merge = docs_collection_t(df_to_merge.binary.db(),
+                                                     df_to_merge.binary,
+                                                     df_to_merge.binary.txn(),
+                                                     df_to_merge.binary.snap(),
+                                                     df_to_merge.binary.member_arena());
+        auto collection =
+            docs_collection_t(df.binary.db(), df.binary, df.binary.txn(), df.binary.snap(), df.binary.member_arena());
+
+        scan_rows(df_to_merge);
+        auto& keys = std::get<std::vector<ukv_key_t>>(df_to_merge.rows_keys);
+        auto members = collection_to_merge[keys];
+        auto values = members.value().throw_or_release();
+        auto values_begin = reinterpret_cast<ukv_bytes_ptr_t>(values.contents());
+
+        contents_arg_t args {};
+        args.offsets_begin = {values.offsets(), sizeof(ukv_length_t)};
+        args.lengths_begin = {values.lengths(), sizeof(ukv_length_t)};
+        args.contents_begin = {&values_begin, 0};
+        collection[keys].merge(args).throw_unhandled();
+    });
+
+    df.def("insert", [](py_table_collection_t& df, std::string const& column_name, py::object obj) {
+        auto collection =
+            docs_collection_t(df.binary.db(), df.binary, df.binary.txn(), df.binary.snap(), df.binary.member_arena());
+
+        if (std::holds_alternative<std::monostate>(df.rows_keys))
+            scan_rows(df);
+        else if (std::holds_alternative<py_table_keys_range_t>(df.rows_keys))
+            scan_rows_range(df);
+        auto& keys = std::get<std::vector<ukv_key_t>>(df.rows_keys);
+
+        if (!PySequence_Check(obj.ptr()))
+            throw std::invalid_argument("Values must be sequence!");
+        auto size = PySequence_Size(obj.ptr());
+
+        std::string values;
+        std::vector<ukv_length_t> offsets(size + 1);
+        std::string field = "/" + column_name;
+        std::vector<collection_key_field_t> keys_with_fields(keys.size());
+        for (std::size_t i = 0; i != size; ++i) {
+            offsets[i] = values.size();
+            to_string(PySequence_GetItem(obj.ptr(), i), values);
+            keys_with_fields[i] = ckf(keys[i], field.c_str());
+        }
+        offsets[size] = values.size();
+        auto values_begin = reinterpret_cast<ukv_bytes_ptr_t>(values.data());
+
+        contents_arg_t args {};
+        args.offsets_begin = {offsets.data(), sizeof(ukv_length_t)};
+        args.contents_begin = {&values_begin, 0};
+
+        collection[keys_with_fields].insert(args).throw_unhandled();
+    });
+
+    df.def("insert", [](py_table_collection_t& df, py::object obj) {
+        auto collection =
+            docs_collection_t(df.binary.db(), df.binary, df.binary.txn(), df.binary.snap(), df.binary.member_arena());
+
+        if (std::holds_alternative<std::monostate>(df.rows_keys))
+            scan_rows(df);
+        else if (std::holds_alternative<py_table_keys_range_t>(df.rows_keys))
+            scan_rows_range(df);
+        auto& keys = std::get<std::vector<ukv_key_t>>(df.rows_keys);
+        std::vector<collection_key_field_t> keys_with_fields(keys.size());
+
+        if (!PyDict_Check(obj.ptr()))
+            throw std::invalid_argument("Expected dictionary!");
+
+        std::string values;
+        contents_arg_t args {};
+
+        PyObject *key, *value;
+        Py_ssize_t pos = 0;
+        while (PyDict_Next(obj.ptr(), &pos, &key, &value)) {
+            if (!PySequence_Check(value))
+                throw std::invalid_argument("Value must be sequence!");
+            if (!PyUnicode_Check(key))
+                throw std::invalid_argument("Key must be string!");
+
+            std::string field = "/";
+            field += PyUnicode_AsUTF8(key);
+
+            auto size = PySequence_Size(value);
+            std::vector<ukv_length_t> offsets(size + 1);
+            values.clear();
+            for (std::size_t i = 0; i != size; ++i) {
+                offsets[i] = values.size();
+                to_string(PySequence_GetItem(value, i), values);
+                keys_with_fields[i] = ckf(keys[i], field.c_str());
+            }
+            offsets[size] = values.size();
+
+            args.offsets_begin = {offsets.data(), sizeof(ukv_length_t)};
+            auto values_begin = reinterpret_cast<ukv_bytes_ptr_t>(values.data());
+            args.contents_begin = {&values_begin, 0};
+            collection[keys_with_fields].insert(args).throw_unhandled();
+        }
+    });
+
     // https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.join.html
     // df.def("join", [](py_table_collection_t& df) {});
+
+    df.def("drop", [](py_table_collection_t& df, py::object cols) {
+        auto collection =
+            docs_collection_t(df.binary.db(), df.binary, df.binary.txn(), df.binary.snap(), df.binary.member_arena());
+
+        if (std::holds_alternative<std::monostate>(df.rows_keys))
+            scan_rows(df);
+        else if (std::holds_alternative<py_table_keys_range_t>(df.rows_keys))
+            scan_rows_range(df);
+
+        auto& keys = std::get<std::vector<ukv_key_t>>(df.rows_keys);
+        if (PyUnicode_Check(cols.ptr())) {
+            collection[keys]
+                .patch(fmt::format("[{{\"op\": \"remove\",\"path\": \"/{}\"}}]", py_to_bytes(cols.ptr())).c_str())
+                .throw_unhandled();
+        }
+        else if (PySequence_Check(cols.ptr())) {
+            auto size = PySequence_Size(cols.ptr());
+            std::string patch_command = "[";
+            patch_command.reserve(27 * size);
+            for (std::size_t i = 0; i != size; ++i)
+                patch_command += fmt::format("{{\"op\":\"remove\",\"path\":\"/{}\"}},",
+                                             py_to_bytes(PySequence_GetItem(cols.ptr(), i)));
+
+            patch_command[patch_command.size() - 1] = ']';
+            collection[keys].patch(patch_command.c_str()).throw_unhandled();
+        }
+        else
+            throw std::invalid_argument("Invalid Argument!");
+    });
+
+    df.def("rename", [](py_table_collection_t& df, py::object columns) {
+        if (!PyDict_Check(columns.ptr()))
+            throw std::invalid_argument("Expect dictionary");
+
+        scan_rows(df);
+        auto& keys = std::get<std::vector<ukv_key_t>>(df.rows_keys);
+        auto collection =
+            docs_collection_t(df.binary.db(), df.binary, df.binary.txn(), df.binary.snap(), df.binary.member_arena());
+
+        PyObject *key, *value;
+        Py_ssize_t pos = 0;
+        std::string patch_command = "[";
+        while (PyDict_Next(columns.ptr(), &pos, &key, &value))
+            patch_command += fmt::format("{{\"op\": \"move\",\"from\": \"/{}\",\"path\": \"/{}\"}},",
+                                         py_to_bytes(key),
+                                         py_to_bytes(value));
+        patch_command[patch_command.size() - 1] = ']';
+        collection[keys].patch(patch_command.c_str()).throw_unhandled();
+    });
+
+    df.def_property_readonly("size", [](py_table_collection_t& df) {
+        if (std::holds_alternative<std::monostate>(df.rows_keys))
+            scan_rows(df);
+        else if (std::holds_alternative<py_table_keys_range_t>(df.rows_keys))
+            scan_rows_range(df);
+        auto& keys = std::get<std::vector<ukv_key_t>>(df.rows_keys);
+
+        if (std::holds_alternative<std::monostate>(df.columns_names)) {
+            auto collection = docs_collection_t(df.binary.db(),
+                                                df.binary,
+                                                df.binary.txn(),
+                                                df.binary.snap(),
+                                                df.binary.member_arena());
+            auto fields = collection[keys].gist().throw_or_release();
+            auto names = std::vector<ukv_str_view_t>(fields.size());
+            transform_n(fields, names.size(), names.begin(), std::mem_fn(&std::string_view::data));
+            df.columns_names = names;
+        }
+        auto& fields = std::get<std::vector<ukv_str_view_t>>(df.columns_names);
+
+        return keys.size() * fields.size();
+    });
+
+    df.def_property_readonly("shape", [](py_table_collection_t& df) {
+        if (std::holds_alternative<std::monostate>(df.rows_keys))
+            scan_rows(df);
+        else if (std::holds_alternative<py_table_keys_range_t>(df.rows_keys))
+            scan_rows_range(df);
+        auto& keys = std::get<std::vector<ukv_key_t>>(df.rows_keys);
+
+        if (std::holds_alternative<std::monostate>(df.columns_names)) {
+            auto collection = docs_collection_t(df.binary.db(),
+                                                df.binary,
+                                                df.binary.txn(),
+                                                df.binary.snap(),
+                                                df.binary.member_arena());
+            auto fields = collection[keys].gist().throw_or_release();
+            auto names = std::vector<ukv_str_view_t>(fields.size());
+            transform_n(fields, names.size(), names.begin(), std::mem_fn(&std::string_view::data));
+            df.columns_names = names;
+        }
+        auto& fields = std::get<std::vector<ukv_str_view_t>>(df.columns_names);
+
+        return py::make_tuple(keys.size(), fields.size());
+    });
+
+    df.def_property_readonly("empty", [](py_table_collection_t& df) { return !df.binary.size(); });
+
+    m.def("from_dict", [](py_blobs_collection_t& binary, py::object data) {
+        if (!PyDict_Check(data.ptr()))
+            throw std::invalid_argument("Expect dictionary");
+        auto collection = docs_collection_t(binary.native.db(),
+                                            binary.native,
+                                            binary.native.txn(),
+                                            binary.native.snap(),
+                                            binary.native.member_arena());
+
+        PyObject *key, *value;
+        Py_ssize_t pos = 0;
+        std::string json, k, v;
+        while (PyDict_Next(data.ptr(), &pos, &key, &value)) {
+            k.clear();
+            to_string(key, k);
+            for (std::size_t i = 0; i != PySequence_Size(value); ++i) {
+                v.clear();
+                to_string(PySequence_GetItem(value, i), v);
+                json = fmt::format("{{{}:{}}}", k, v);
+                collection[i].merge(json.c_str()).throw_unhandled();
+            }
+        }
+
+        auto df = std::make_shared<py_table_collection_t>();
+        df->binary = binary.native;
+        return df;
+    });
+
+    m.def("from_records", [](py_blobs_collection_t& binary, py::object data) {
+        if (!PySequence_Check(data.ptr()))
+            throw std::invalid_argument("Expect Sequence of Dictionaries");
+
+        auto collection = docs_collection_t(binary.native.db(),
+                                            binary.native,
+                                            binary.native.txn(),
+                                            binary.native.snap(),
+                                            binary.native.member_arena());
+
+        auto size = PySequence_Size(data.ptr());
+        std::string jsons;
+        std::vector<ukv_key_t> keys(size);
+        std::vector<ukv_length_t> offsets(size + 1);
+        for (std::size_t i = 0; i != size; ++i) {
+            keys[i] = i;
+            offsets[i] = jsons.size();
+            to_string(PySequence_GetItem(data.ptr(), i), jsons);
+        }
+        offsets[size] = jsons.size();
+
+        contents_arg_t args {};
+        auto values_begin = reinterpret_cast<ukv_bytes_ptr_t>(jsons.data());
+        args.contents_begin = {&values_begin, 0};
+        args.offsets_begin = {offsets.data(), sizeof(ukv_length_t)};
+        collection[keys].insert(args).throw_unhandled();
+
+        auto df = std::make_shared<py_table_collection_t>();
+        df->binary = binary.native;
+        return df;
+    });
 }

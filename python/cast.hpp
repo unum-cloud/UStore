@@ -175,6 +175,11 @@ void py_transform_n(PyObject* obj,
         for (std::size_t i = 0; i != max_count; ++i, ++output_iterator)
             *output_iterator = transform(PyList_GetItem(obj, i));
     }
+    else if (PySet_Check(obj)) {
+        max_count = std::min<std::size_t>(PySet_Size(obj), max_count);
+        for (std::size_t i = 0; i != max_count; ++i, ++output_iterator)
+            *output_iterator = transform(PySet_Pop(obj));
+    }
     else if (PyIter_Check(obj)) {
         PyObject* item = nullptr;
         while ((item = PyIter_Next(obj))) {

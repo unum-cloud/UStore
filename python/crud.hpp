@@ -35,18 +35,17 @@ static void write_one_binary(py_collection_gt<collection_at>& collection, PyObje
 
     [[maybe_unused]] py::gil_scoped_release release;
 
-    ukv_write_t write {
-        .db = collection.db(),
-        .error = status.member_ptr(),
-        .transaction = collection.txn(),
-        .arena = collection.member_arena(),
-        .options = collection.options(),
-        .tasks_count = 1,
-        .collections = collection.member_collection(),
-        .keys = &key,
-        .lengths = val.member_length(),
-        .values = val.member_ptr(),
-    };
+    ukv_write_t write {};
+    write.db = collection.db();
+    write.error = status.member_ptr();
+    write.transaction = collection.txn();
+    write.arena = collection.member_arena();
+    write.options = collection.options();
+    write.tasks_count = 1;
+    write.collections = collection.member_collection();
+    write.keys = &key;
+    write.lengths = val.member_length();
+    write.values = val.member_ptr();
 
     ukv_write(&write);
     status.throw_unhandled();
@@ -63,24 +62,23 @@ static void write_many_binaries(py_collection_gt<collection_at>& collection, PyO
 
     [[maybe_unused]] py::gil_scoped_release release;
 
-    ukv_write_t write {
-        .db = collection.db(),
-        .error = status.member_ptr(),
-        .transaction = collection.txn(),
-        .arena = collection.member_arena(),
-        .options = collection.options(),
-        .tasks_count = places.count,
-        .collections = collection.member_collection(),
-        .keys = places.keys_begin.get(),
-        .keys_stride = places.keys_begin.stride(),
-        .presences = contents.presences_begin.get(),
-        .offsets = contents.offsets_begin.get(),
-        .offsets_stride = contents.offsets_begin.stride(),
-        .lengths = contents.lengths_begin.get(),
-        .lengths_stride = contents.lengths_begin.stride(),
-        .values = contents.contents_begin.get(),
-        .values_stride = contents.contents_begin.stride(),
-    };
+    ukv_write_t write {};
+    write.db = collection.db();
+    write.error = status.member_ptr();
+    write.transaction = collection.txn();
+    write.arena = collection.member_arena();
+    write.options = collection.options();
+    write.tasks_count = places.count;
+    write.collections = collection.member_collection();
+    write.keys = places.keys_begin.get();
+    write.keys_stride = places.keys_begin.stride();
+    write.presences = contents.presences_begin.get();
+    write.offsets = contents.offsets_begin.get();
+    write.offsets_stride = contents.offsets_begin.stride();
+    write.lengths = contents.lengths_begin.get();
+    write.lengths_stride = contents.lengths_begin.stride();
+    write.values = contents.contents_begin.get();
+    write.values_stride = contents.contents_begin.stride();
 
     ukv_write(&write);
 
@@ -96,19 +94,18 @@ static void broadcast_binary(py_blobs_collection_t& collection, py::object keys_
 
     [[maybe_unused]] py::gil_scoped_release release;
 
-    ukv_write_t write {
-        .db = collection.db(),
-        .error = status.member_ptr(),
-        .transaction = collection.txn(),
-        .arena = collection.member_arena(),
-        .options = collection.options(),
-        .tasks_count = places.count,
-        .collections = collection.member_collection(),
-        .keys = places.keys_begin.get(),
-        .keys_stride = places.keys_begin.stride(),
-        .lengths = val.member_length(),
-        .values = val.member_ptr(),
-    };
+    ukv_write_t write {};
+    write.db = collection.db();
+    write.error = status.member_ptr();
+    write.transaction = collection.txn();
+    write.arena = collection.member_arena();
+    write.options = collection.options();
+    write.tasks_count = places.count;
+    write.collections = collection.member_collection();
+    write.keys = places.keys_begin.get();
+    write.keys_stride = places.keys_begin.stride();
+    write.lengths = val.member_length();
+    write.values = val.member_ptr();
 
     ukv_write(&write);
 
@@ -126,17 +123,16 @@ static py::object has_one_binary(py_collection_gt<collection_at>& collection, Py
 
     {
         [[maybe_unused]] py::gil_scoped_release release;
-        ukv_read_t read {
-            .db = collection.db(),
-            .error = status.member_ptr(),
-            .transaction = collection.txn(),
-            .arena = collection.member_arena(),
-            .options = collection.options(),
-            .tasks_count = 1,
-            .collections = collection.member_collection(),
-            .keys = &key,
-            .presences = &found_presences,
-        };
+        ukv_read_t read {};
+        read.db = collection.db();
+        read.error = status.member_ptr();
+        read.transaction = collection.txn();
+        read.arena = collection.member_arena();
+        read.options = collection.options();
+        read.tasks_count = 1;
+        read.collections = collection.member_collection();
+        read.keys = &key;
+        read.presences = &found_presences;
 
         ukv_read(&read);
         status.throw_unhandled();
@@ -162,18 +158,18 @@ static py::object read_one_binary(py_blobs_collection_t& collection, PyObject* k
 
     {
         [[maybe_unused]] py::gil_scoped_release release;
-        ukv_read_t read {
-            .db = collection.db(),
-            .error = status.member_ptr(),
-            .transaction = collection.txn(),
-            .arena = collection.member_arena(),
-            .options = collection.options(),
-            .tasks_count = 1,
-            .collections = collection.member_collection(),
-            .keys = &key,
-            .lengths = &found_lengths,
-            .values = &found_values,
-        };
+        ukv_read_t read {};
+        read.db = collection.db();
+        read.error = status.member_ptr();
+        read.transaction = collection.txn();
+        read.arena = collection.member_arena();
+        read.options = collection.options();
+        read.tasks_count = 1;
+        read.collections = collection.member_collection();
+        read.keys = &key;
+        read.lengths = &found_lengths;
+        read.values = &found_values;
+
         ukv_read(&read);
         status.throw_unhandled();
     }
@@ -201,18 +197,17 @@ static py::object has_many_binaries(py_collection_gt<collection_at>& collection,
 
     {
         [[maybe_unused]] py::gil_scoped_release release;
-        ukv_read_t read {
-            .db = collection.db(),
-            .error = status.member_ptr(),
-            .transaction = collection.txn(),
-            .arena = collection.member_arena(),
-            .options = collection.options(),
-            .tasks_count = places.count,
-            .collections = collection.member_collection(),
-            .keys = places.keys_begin.get(),
-            .keys_stride = places.keys_begin.stride(),
-            .presences = &found_presences,
-        };
+        ukv_read_t read {};
+        read.db = collection.db();
+        read.error = status.member_ptr();
+        read.transaction = collection.txn();
+        read.arena = collection.member_arena();
+        read.options = collection.options();
+        read.tasks_count = places.count;
+        read.collections = collection.member_collection();
+        read.keys = places.keys_begin.get();
+        read.keys_stride = places.keys_begin.stride();
+        read.presences = &found_presences;
 
         ukv_read(&read);
         status.throw_unhandled();
@@ -241,22 +236,21 @@ static py::object read_many_binaries(py_blobs_collection_t& collection, PyObject
 
     {
         [[maybe_unused]] py::gil_scoped_release release;
-        ukv_read_t read {
-            .db = collection.db(),
-            .error = status.member_ptr(),
-            .transaction = collection.txn(),
-            .arena = collection.member_arena(),
-            .options = collection.options(),
-            .tasks_count = places.count,
-            .collections = collection.member_collection(),
-            .collections_stride = 0,
-            .keys = places.keys_begin.get(),
-            .keys_stride = places.keys_begin.stride(),
-            .presences = export_arrow ? &found_presences : nullptr,
-            .offsets = &found_offsets,
-            .lengths = !export_arrow ? &found_lengths : nullptr,
-            .values = &found_values,
-        };
+        ukv_read_t read {};
+        read.db = collection.db();
+        read.error = status.member_ptr();
+        read.transaction = collection.txn();
+        read.arena = collection.member_arena();
+        read.options = collection.options();
+        read.tasks_count = places.count;
+        read.collections = collection.member_collection();
+        read.collections_stride = 0;
+        read.keys = places.keys_begin.get();
+        read.keys_stride = places.keys_begin.stride();
+        read.presences = export_arrow ? &found_presences : nullptr;
+        read.offsets = &found_offsets;
+        read.lengths = !export_arrow ? &found_lengths : nullptr;
+        read.values = &found_values;
 
         ukv_read(&read);
         status.throw_unhandled();
@@ -335,23 +329,22 @@ static void update_binary(py_blobs_collection_t& collection, py::object dict_py)
 
     [[maybe_unused]] py::gil_scoped_release release;
 
-    ukv_write_t write {
-        .db = collection.db(),
-        .error = status.member_ptr(),
-        .transaction = collection.txn(),
-        .arena = collection.member_arena(),
-        .options = collection.options(),
-        .tasks_count = static_cast<ukv_size_t>(keys.size()),
-        .collections = collection.member_collection(),
-        .keys = &keys[0].key,
-        .keys_stride = step,
-        .offsets = &keys[0].off,
-        .offsets_stride = step,
-        .lengths = &keys[0].len,
-        .lengths_stride = step,
-        .values = &keys[0].ptr,
-        .values_stride = step,
-    };
+    ukv_write_t write {};
+    write.db = collection.db();
+    write.error = status.member_ptr();
+    write.transaction = collection.txn();
+    write.arena = collection.member_arena();
+    write.options = collection.options();
+    write.tasks_count = static_cast<ukv_size_t>(keys.size());
+    write.collections = collection.member_collection();
+    write.keys = &keys[0].key;
+    write.keys_stride = step;
+    write.offsets = &keys[0].off;
+    write.offsets_stride = step;
+    write.lengths = &keys[0].len;
+    write.lengths_stride = step;
+    write.values = &keys[0].ptr;
+    write.values_stride = step;
 
     ukv_write(&write);
     status.throw_unhandled();
@@ -367,19 +360,18 @@ static py::array_t<ukv_key_t> scan_binary( //
     ukv_length_t* found_lengths = nullptr;
     ukv_key_t* found_keys = nullptr;
     bool const export_arrow = collection.export_into_arrow();
-    ukv_scan_t scan {
-        .db = collection.db(),
-        .error = status.member_ptr(),
-        .transaction = collection.txn(),
-        .arena = collection.member_arena(),
-        .options = collection.options(),
-        .tasks_count = 1,
-        .collections = collection.member_collection(),
-        .start_keys = &min_key,
-        .count_limits = &count_limit,
-        .counts = &found_lengths,
-        .keys = &found_keys,
-    };
+    ukv_scan_t scan {};
+    scan.db = collection.db();
+    scan.error = status.member_ptr();
+    scan.transaction = collection.txn();
+    scan.arena = collection.member_arena();
+    scan.options = collection.options();
+    scan.tasks_count = 1;
+    scan.collections = collection.member_collection();
+    scan.start_keys = &min_key;
+    scan.count_limits = &count_limit;
+    scan.counts = &found_lengths;
+    scan.keys = &found_keys;
 
     ukv_scan(&scan);
 
@@ -502,19 +494,18 @@ void fill_tensor( //
     ukv_length_t* found_lengths = nullptr;
     ukv_bytes_ptr_t found_values = nullptr;
     ukv_options_t options = ukv_options_default_k;
-    ukv_read_t read {
-        .db = db_ptr,
-        .error = status.internal_cptr(),
-        .transaction = txn_ptr,
-        .arena = arena.internal_cptr(),
-        .options = options,
-        .tasks_count = tasks_count,
-        .collections = &collection_ptr,
-        .keys = keys_ptr,
-        .keys_stride = sizeof(ukv_key_t),
-        .lengths = &found_lengths,
-        .values = &found_values,
-    };
+    ukv_read_t read {};
+    read.db = db_ptr;
+    read.error = status.internal_cptr();
+    read.transaction = txn_ptr;
+    read.arena = arena.internal_cptr();
+    read.options = options;
+    read.tasks_count = tasks_count;
+    read.collections = &collection_ptr;
+    read.keys = keys_ptr;
+    read.keys_stride = sizeof(ukv_key_t);
+    read.lengths = &found_lengths;
+    read.values = &found_values;
 
     ukv_read(&read);
 

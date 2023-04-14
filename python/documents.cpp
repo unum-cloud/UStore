@@ -1,7 +1,7 @@
 #include "pybind.hpp"
-#include <cast.hpp>
-#include <crud.hpp>
-#include <nlohmann.hpp>
+#include "cast.hpp"
+#include "crud.hpp"
+#include "nlohmann.hpp"
 
 using namespace unum::ukv::pyb;
 using namespace unum::ukv;
@@ -12,6 +12,7 @@ class docs_pairs_stream_t {
     ukv_database_t db_ = nullptr;
     ukv_collection_t collection_ = ukv_collection_main_k;
     ukv_transaction_t txn_ = nullptr;
+    ukv_snapshot_t snap_ = 0;
 
     arena_t arena_scan_;
     arena_t arena_read_;
@@ -27,26 +28,25 @@ class docs_pairs_stream_t {
         if (next_min_key_ == ukv_key_unknown_k)
             return {};
 
-        ukv_key_t* found_keys = nullptr;
-        ukv_length_t* found_offsets = nullptr;
-        ukv_length_t* found_counts = nullptr;
-        ukv_length_t* found_lengths = nullptr;
-        ukv_bytes_ptr_t found_values = nullptr;
-        ukv_str_view_t fields = nullptr;
-        status_t status;
-        ukv_scan_t scan {
-            .db = db_,
-            .error = status.member_ptr(),
-            .transaction = txn_,
-            .arena = arena_scan_.member_ptr(),
-            .tasks_count = 1,
-            .collections = &collection_,
-            .start_keys = &next_min_key_,
-            .count_limits = &read_ahead_,
-            .offsets = &found_offsets,
-            .counts = &found_counts,
-            .keys = &found_keys,
-        };
+        ukv_key_t* found_keys {};
+        ukv_length_t* found_offsets {};
+        ukv_length_t* found_counts {};
+        ukv_length_t* found_lengths {};
+        ukv_bytes_ptr_t found_values {};
+        ukv_str_view_t fields {};
+        status_t status {};
+        ukv_scan_t scan {};
+        scan.db = db_;
+        scan.error = status.member_ptr();
+        scan.transaction = txn_;
+        scan.arena = arena_scan_.member_ptr();
+        scan.tasks_count = 1;
+        scan.collections = &collection_;
+        scan.start_keys = &next_min_key_;
+        scan.count_limits = &read_ahead_;
+        scan.offsets = &found_offsets;
+        scan.counts = &found_counts;
+        scan.keys = &found_keys;
 
         ukv_scan(&scan);
         if (!status)
@@ -55,22 +55,22 @@ class docs_pairs_stream_t {
         fetched_keys_ = ptr_range_gt<ukv_key_t> {found_keys, found_keys + *found_counts};
         fetched_offset_ = 0;
         auto count = static_cast<ukv_size_t>(fetched_keys_.size());
-        ukv_docs_read_t docs_read {
-            .db = db_,
-            .error = status.member_ptr(),
-            .transaction = txn_,
-            .arena = arena_read_.member_ptr(),
-            .type = ukv_doc_field_json_k,
-            .tasks_count = count,
-            .collections = &collection_,
-            .keys = found_keys,
-            .keys_stride = sizeof(ukv_key_t),
-            .fields = &fields,
-            .fields_stride = 0,
-            .offsets = &found_offsets,
-            .lengths = &found_lengths,
-            .values = &found_values,
-        };
+        ukv_docs_read_t docs_read {};
+        docs_read.db = db_;
+        docs_read.error = status.member_ptr();
+        docs_read.transaction = txn_;
+        docs_read.snapshot = snap_;
+        docs_read.arena = arena_read_.member_ptr();
+        docs_read.type = ukv_doc_field_json_k;
+        docs_read.tasks_count = count;
+        docs_read.collections = &collection_;
+        docs_read.keys = found_keys;
+        docs_read.keys_stride = sizeof(ukv_key_t);
+        docs_read.fields = &fields;
+        docs_read.fields_stride = 0;
+        docs_read.offsets = &found_offsets;
+        docs_read.lengths = &found_lengths;
+        docs_read.values = &found_values;
 
         ukv_docs_read(&docs_read);
         if (!status)
@@ -87,8 +87,9 @@ class docs_pairs_stream_t {
     docs_pairs_stream_t(ukv_database_t db,
                         ukv_collection_t collection = ukv_collection_main_k,
                         std::size_t read_ahead = docs_pairs_stream_t::default_read_ahead_k,
-                        ukv_transaction_t txn = nullptr)
-        : db_(db), collection_(collection), txn_(txn), arena_scan_(db_), arena_read_(db_),
+                        ukv_transaction_t txn = nullptr,
+                        ukv_snapshot_t snap = {})
+        : db_(db), collection_(collection), txn_(txn), snap_(snap), arena_scan_(db_), arena_read_(db_),
           read_ahead_(static_cast<ukv_size_t>(read_ahead)) {}
 
     status_t seek(ukv_key_t key) noexcept {
@@ -198,11 +199,10 @@ static void write_many_docs(py_docs_collection_t& py_collection, PyObject* keys_
     py_transform_n(vals_py, generate_values, dummy_iterator_t {});
 
     auto vals_begin = reinterpret_cast<ukv_bytes_ptr_t>(jsons.data());
-    contents_arg_t values {
-        .offsets_begin = {offs.data(), sizeof(ukv_length_t)},
-        .contents_begin = {&vals_begin, 0},
-        .count = keys_count,
-    };
+    contents_arg_t values {};
+    values.offsets_begin = {offs.data(), sizeof(ukv_length_t)};
+    values.contents_begin = {&vals_begin, 0};
+    values.count = keys_count;
 
     auto ref = py_collection.native[keys];
     ref.assign(values).throw_unhandled();
@@ -309,7 +309,7 @@ void ukv::wrap_document(py::module& m) {
     py_docs_collection.def("patch", &patch);
 
     py_docs_collection.def_property_readonly("keys", [](py_docs_collection_t& py_collection) {
-        blobs_range_t members(py_collection.db(), py_collection.txn(), *py_collection.member_collection());
+        blobs_range_t members(py_collection.db(), py_collection.txn(), 0, *py_collection.member_collection());
         keys_range_t range {members};
         return py::cast(std::make_unique<keys_range_t>(range));
     });

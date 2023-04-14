@@ -22,7 +22,7 @@ inline void char_to_hex(uint8_t const c, uint8_t* hex) noexcept {
     hex[1] = int_to_hex_k[c & 0x0F];
 }
 
-PyObject* from_json(nlohmann::json const& js) {
+inline PyObject* from_json(nlohmann::json const& js) {
     if (js.is_null())
         return Py_None;
     else if (js.is_boolean())
