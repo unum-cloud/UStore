@@ -4,7 +4,7 @@ marp: true
 
 # C++ Bindings 101
 
-**[github.com/unum-cloud/ukv](https://github.com/unum-cloud/ukv)**
+**[github.com/unum-cloud/ustore](https://github.com/unum-cloud/ustore)**
 
 By Ashot Vardanian
 Founder @ Unum.cloud
@@ -132,7 +132,7 @@ Often, **automatically**.
 Let's visualize again:
 
 ```python
-db = ukv.DataBase()
+db = ustore.DataBase()
 col[1] = 'a'.encode()
 col[2] = 'bb'.encode()
 
@@ -150,7 +150,7 @@ del col[2]
 Let's visualize again:
 
 ```python
-db = ukv.DataBase()
+db = ustore.DataBase()
 col['main'][1] = 'a'.encode()
 col['other'][2] = 'bb'.encode()
 
@@ -168,9 +168,9 @@ del col['other'][2]
 ... across different collections<br/>
 
 ```python
-db = ukv.DataBase()
+db = ustore.DataBase()
 
-with ukv.Transaction(db) as txn:
+with ustore.Transaction(db) as txn:
 
     txn['balance'][bob_id] = db['balance'][bob_id] - serious_money
     txn['balance'][alice_id] = db['balance'][alice_id] + serious_money
@@ -181,13 +181,13 @@ with ukv.Transaction(db) as txn:
 ## What we want to reach? Backend-Invariance
 
 ```python
-db = ukv.DataBase('umem')
-db = ukv.DataBase('rocksdb')
-db = ukv.DataBase('leveldb')
-db = ukv.DataBase('leveldb://0.0.0.0:8080')
-db = ukv.DataBase('unumdb://0.0.0.0:8080')
+db = ustore.DataBase('umem')
+db = ustore.DataBase('rocksdb')
+db = ustore.DataBase('leveldb')
+db = ustore.DataBase('leveldb://0.0.0.0:8080')
+db = ustore.DataBase('unumdb://0.0.0.0:8080')
 
-with ukv.Transaction(db) as txn:
+with ustore.Transaction(db) as txn:
 
     txn['balance'][bob_id] = db['balance'][bob_id] - serious_money
     txn['balance'][alice_id] = db['balance'][alice_id] + serious_money
@@ -200,15 +200,15 @@ with ukv.Transaction(db) as txn:
 ... may be different
 
 ```c
-typedef void* ukv_database_t;
-typedef void* ukv_transaction_t;
+typedef void* ustore_database_t;
+typedef void* ustore_transaction_t;
 
-typedef uint64_t ukv_collection_t;
-typedef int64_t ukv_key_t;
-typedef uint32_t ukv_length_t;
-typedef uint8_t* ukv_bytes_ptr_t;
-typedef uint64_t ukv_size_t;
-typedef char const* ukv_error_t;
+typedef uint64_t ustore_collection_t;
+typedef int64_t ustore_key_t;
+typedef uint32_t ustore_length_t;
+typedef uint8_t* ustore_bytes_ptr_t;
+typedef uint64_t ustore_size_t;
+typedef char const* ustore_error_t;
 ```
 
 ---
@@ -227,13 +227,13 @@ typedef char const* ukv_error_t;
  * @param[out] db     A pointer to the opened KVS, unless @p `error` is filled.
  * @param[out] error  The error message to be handled by callee.
  */
-typedef struct ukv_database_init_t {
-    ukv_str_view_t config = NULL;
-    ukv_database_t* db;
-    ukv_error_t* error;
-} ukv_database_init_t;
+typedef struct ustore_database_init_t {
+    ustore_str_view_t config = NULL;
+    ustore_database_t* db;
+    ustore_error_t* error;
+} ustore_database_init_t;
 
-void ukv_database_init(ukv_database_init_t* c_ptr);
+void ustore_database_init(ustore_database_init_t* c_ptr);
 ```
 
 ---
@@ -262,21 +262,21 @@ std::vector<float> z;
 ## Designing a C API: Strides
 
 ```c
-typedef struct ukv_measure_t {
+typedef struct ustore_measure_t {
 
-    ukv_database_t db;
-    ukv_error_t* error;
-    ukv_transaction_t transaction = NULL;
-    ukv_arena_t* arena = NULL;
-    ukv_options_t options = ukv_options_default_k;
-    ukv_size_t tasks_count = 1;
+    ustore_database_t db;
+    ustore_error_t* error;
+    ustore_transaction_t transaction = NULL;
+    ustore_arena_t* arena = NULL;
+    ustore_options_t options = ustore_options_default_k;
+    ustore_size_t tasks_count = 1;
 
     // Inputs: //...//
 
     // Outputs //...//
-} ukv_measure_t;
+} ustore_measure_t;
 
-void ukv_write(ukv_write_t* c_ptr);
+void ustore_write(ustore_write_t* c_ptr);
 ```
 
 ---
@@ -298,17 +298,17 @@ PYBIND11_MODULE(example, m) {
 
 ---
 
-## Wrapping: PyBind11 in UKV
+## Wrapping: PyBind11 in UStore
 
 ```cpp
-PYBIND11_MODULE(ukv, m) {
+PYBIND11_MODULE(ustore, m) {
     auto db = py::class_<py_db_t, std::shared_ptr<py_db_t>>(m, "DataBase");
     auto collection = py::class_<py_collection_t, std::shared_ptr<py_collection_t>>(m, "Collection");
     auto txn = py::class_<py_transaction_t, std::shared_ptr<py_transaction_t>>(m, "Transaction");
     
     db.def(py::init([](std::string const& config) { ... });
     db.def("get",
-           [](py_db_t& db, std::string const& collection, ukv_key_t key) { ... },
+           [](py_db_t& db, std::string const& collection, ustore_key_t key) { ... },
            py::arg("collection"),
            py::arg("key"));
 ```
@@ -371,13 +371,15 @@ void fill_tensor( //
 
 ### Wrapping: Java
 
-"~/ukv/java/com/unum/ukv/com_unum_ukv_DataBase_Context.c"
+"~/ustore/java/com/unum/ustore/cloud_unum_ustore_DataBase_Context.c"
 
 ```java
-JNIEXPORT void JNICALL Java_com_unum_ukv_DataBase_00024Context_open(JNIEnv* env_java,
-                                                                    jobject db_java,
-                                                                    jstring config_java) {
-    ukv_database_t db_ptr_c = db_ptr(env_java, db_java);
+JNIEXPORT void JNICALL Java_cloud_unum_ustore_DataBase_00024Context_open(
+    JNIEnv* env_java,
+    jobject db_java,
+    jstring config_java) {
+        
+    ustore_database_t db_ptr_c = db_ptr(env_java, db_java);
     if (db_ptr_c) {
         forward_error(env_java, "Database is already opened. Close it's current state first!");
         return;
@@ -389,13 +391,13 @@ JNIEXPORT void JNICALL Java_com_unum_ukv_DataBase_00024Context_open(JNIEnv* env_
     if ((*env_java)->ExceptionCheck(env_java))
         return;
 
-    ukv_error_t error_c = NULL;
-    ukv_database_init_t database {
+    ustore_error_t error_c = NULL;
+    ustore_database_init_t database {
         .config = config_c,
         .db = &db_ptr_c,
         .error = &error_c,
     };
-    ukv_database_init(&database);
+    ustore_database_init(&database);
     if (config_is_copy_java == JNI_TRUE)
         (*env_java)->ReleaseStringUTFChars(env_java, config_java, config_c);
     if (forward_error(env_java, error_c))
@@ -414,7 +416,7 @@ JNIEXPORT void JNICALL Java_com_unum_ukv_DataBase_00024Context_open(JNIEnv* env_
 public class DataBase {
     static {
         try {
-            System.loadLibrary("ukv_java");
+            System.loadLibrary("ustore_java");
         } catch (UnsatisfiedLinkError e) {
             System.err.println("Native code library failed to load.\n" + e);
             System.exit(1);
@@ -436,12 +438,12 @@ public class DataBase {
 ### GoLang starts with "import C"
 
 ```go
-package ukv
+package ustore
 
 /*
 #cgo CFLAGS: -g -Wall -I${SRCDIR}/../include
-#cgo LDFLAGS: -L${SRCDIR}/../build/lib -lukv_embedded_umem -lstdc++
-#include "ukv/ukv.h"
+#cgo LDFLAGS: -L${SRCDIR}/../build/lib -lustore_embedded_umem -lstdc++
+#include "ustore/ustore.h"
 #include <stdlib.h>
 */
 import "C"
@@ -454,34 +456,34 @@ import "C"
 
 ```go
 type DataBase struct {
-	raw C.ukv_database_t
+	raw C.ustore_database_t
 }
 
-func forwardError(error_c C.ukv_error_t) error {
+func forwardError(error_c C.ustore_error_t) error {
 	if error_c != nil {
 		error_go := C.GoString(error_c)
-		C.ukv_error_free(error_c)
+		C.ustore_error_free(error_c)
 		return errors.New(error_go)
 	}
 	return nil
 }
 
-func cleanArena(db *DataBase, tape_c C.ukv_bytes_ptr_t, tape_length_c C.ukv_size_t) {
-	C.ukv_arena_free(db.raw, tape_c, tape_length_c)
+func cleanArena(db *DataBase, tape_c C.ustore_bytes_ptr_t, tape_length_c C.ustore_size_t) {
+	C.ustore_arena_free(db.raw, tape_c, tape_length_c)
 }
 
 func (db *DataBase) ReConnect(config string) error {
 
-	error_c := C.ukv_error_t(nil)
+	error_c := C.ustore_error_t(nil)
 	config_c := C.CString(config)
 	defer C.free(unsafe.Pointer(config_c))
-    ukv_database_init_t database {
+    ustore_database_init_t database {
         .config = config_c,
         .db = &db.raw,
         .error = &error_c,
     };
 
-	C.ukv_database_init(&database)
+	C.ustore_database_init(&database)
 	return forwardError(error_c)
 }
 ```
@@ -500,4 +502,4 @@ func (db *DataBase) ReConnect(config string) error {
 
 PS: Looking for Senior C++ Engineers
 
-**[github.com/unum-cloud/ukv](https://github.com/unum-cloud/ukv)**
+**[github.com/unum-cloud/ustore](https://github.com/unum-cloud/ustore)**

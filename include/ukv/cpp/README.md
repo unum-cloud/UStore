@@ -1,6 +1,6 @@
-# UKV C++ SDK
+# UStore C++ SDK
 
-Most of UKV is implemented in C++, but the C++ implementation is isolated from the C++ interface.
+Most of UStore is implemented in C++, but the C++ implementation is isolated from the C++ interface.
 That is the "Hour-Glass" pattern.
 C layer provides stability and the top C++ layer brings back the syntactic sugar we all love.
 
@@ -56,8 +56,8 @@ _ = main[{43, 44}].erase();
 _ = main[{43, 44}].present();
 _ = main[{43, 44}].length();
 _ = main[{43, 44}].value();
-_ = main[std::array<ukv_key_t, 3> {65, 66, 67}];
-_ = main[std::vector<ukv_key_t> {65, 66, 67, 68}];
+_ = main[std::array<ustore_key_t, 3> {65, 66, 67}];
+_ = main[std::vector<ustore_key_t> {65, 66, 67, 68}];
 for (value_view_t value : *main[{100, 101}].value())
     (void)value;
 ```
@@ -118,7 +118,7 @@ In addition to basic BLOB operations you also get those:
 ## Tables
 
 Just like in Python, we allow exporting document collections into a tabular form.
-Those are all based on the `ukv_docs_gather()` standard function.
+Those are all based on the `ustore_docs_gather()` standard function.
 The C++ abstractions come in two flavors:
 
 * Compile-time: `::table_header_gt<...>`.
@@ -143,9 +143,9 @@ The dynamic analog would be:
 
 ```cpp
 table_header_t header {{
-    field_type_t {"age", ukv_doc_field_i32_k},
-    field_type_t {"age", ukv_doc_field_str_k},
-    field_type_t {"person", ukv_doc_field_str_k},
+    field_type_t {"age", ustore_doc_field_i32_k},
+    field_type_t {"age", ustore_doc_field_str_k},
+    field_type_t {"person", ustore_doc_field_str_k},
 }};
 
 auto maybe_table = collection[{1, 2, 3, 123456, 654321}].gather(header);
