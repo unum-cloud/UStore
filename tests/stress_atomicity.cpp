@@ -8,6 +8,7 @@
 #include <unordered_map>
 
 #include <gtest/gtest.h>
+#include <fmt/format.h>
 
 #include "ukv/ukv.hpp"
 
@@ -17,7 +18,7 @@ using namespace unum;
 static char const* path() {
     char* path = std::getenv("UKV_TEST_PATH");
     if (path)
-        return path;
+        return std::strlen(path) ? path : nullptr;
 
 #if defined(UKV_FLIGHT_CLIENT)
     return nullptr;
@@ -26,6 +27,13 @@ static char const* path() {
 #else
     return nullptr;
 #endif
+}
+
+static std::string config() {
+    auto dir = path();
+    if (!dir)
+        return {};
+    return fmt::format(R"({{"version": "1.0", "directory": "{}"}})", dir);
 }
 
 /**
@@ -42,7 +50,7 @@ static char const* path() {
 template <std::size_t threads_count_ak, std::size_t batch_size_ak, std::size_t deletes_periodicity_ak>
 void insert_atomic_isolated(std::size_t count_batches) {
     database_t db;
-    EXPECT_TRUE(db.open(path()));
+    EXPECT_TRUE(db.open(config().c_str()));
     EXPECT_TRUE(db.clear());
 
     auto task = [&](size_t thread_idx) {
@@ -62,11 +70,10 @@ void insert_atomic_isolated(std::size_t count_batches) {
             while (true) {
                 transaction_t txn = db.transact().throw_or_release();
                 auto collection = txn.main();
-                if (!will_delete)
-                    collection[keys].assign(value);
-                else
-                    collection[keys].erase();
-                status_t status = txn.commit();
+                status_t status = !will_delete ? collection[keys].assign(value) : collection[keys].erase();
+                if (!status)
+                    continue;
+                status = txn.commit();
                 if (status)
                     break;
             }

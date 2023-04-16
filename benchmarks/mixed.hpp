@@ -123,7 +123,7 @@ void docs_upsert( //
     std::vector<value_view_t> batch_values(batch_size);
 
     // Define the shape of the tasks
-    ukv_docs_write_t docs_write;
+    ukv_docs_write_t docs_write {};
     docs_write.db = db;
     docs_write.error = status.member_ptr();
     docs_write.modification = ukv_doc_modify_upsert_k;
@@ -140,11 +140,11 @@ void docs_upsert( //
 
     // All the upserts must be transactional
     ukv_transaction_t transaction = nullptr;
-    ukv_transaction_init_t transaction_init;
+    ukv_transaction_init_t transaction_init {};
     transaction_init.db = db;
     transaction_init.error = status.member_ptr();
     transaction_init.transaction = &transaction;
-    ukv_transaction_commit_t transaction_commit;
+    ukv_transaction_commit_t transaction_commit {};
     transaction_commit.db = db;
     transaction_commit.error = status.member_ptr();
 
@@ -215,7 +215,7 @@ void edges_upsert( //
 
     // Define the shape of the tasks
     auto strided = edges(batch_edges);
-    ukv_graph_upsert_edges_t graph_upsert_edges;
+    ukv_graph_upsert_edges_t graph_upsert_edges {};
     graph_upsert_edges.db = db;
     graph_upsert_edges.error = status.member_ptr();
     graph_upsert_edges.arena = arena.member_ptr();
@@ -230,11 +230,11 @@ void edges_upsert( //
 
     // All the upserts must be transactional
     ukv_transaction_t transaction = nullptr;
-    ukv_transaction_init_t transaction_init;
+    ukv_transaction_init_t transaction_init {};
     transaction_init.db = db;
     transaction_init.error = status.member_ptr();
     transaction_init.transaction = &transaction;
-    ukv_transaction_commit_t transaction_commit;
+    ukv_transaction_commit_t transaction_commit {};
     transaction_commit.db = db;
     transaction_commit.error = status.member_ptr();
 
@@ -301,7 +301,7 @@ void paths_upsert( //
     std::vector<value_view_t> batch_values(batch_size);
 
     // Define the shape of the tasks
-    ukv_paths_write_t paths_write;
+    ukv_paths_write_t paths_write {};
     paths_write.db = db;
     paths_write.error = status.member_ptr();
     paths_write.arena = arena.member_ptr();
@@ -318,11 +318,11 @@ void paths_upsert( //
 
     // All the upserts must be transactional
     ukv_transaction_t transaction = nullptr;
-    ukv_transaction_init_t transaction_init;
+    ukv_transaction_init_t transaction_init {};
     transaction_init.db = db;
     transaction_init.error = status.member_ptr();
     transaction_init.transaction = &transaction;
-    ukv_transaction_commit_t transaction_commit;
+    ukv_transaction_commit_t transaction_commit {};
     transaction_commit.db = db;
     transaction_commit.error = status.member_ptr();
 

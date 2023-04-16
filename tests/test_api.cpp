@@ -2,22 +2,38 @@
 #include <filesystem>
 
 #include <gtest/gtest.h>
+#include <fmt/format.h>
 
 #include "ukv/ukv.hpp"
 
 using namespace unum::ukv;
 using namespace unum;
 
-#if defined(UKV_TEST_PATH)
-constexpr char const* path_k = UKV_TEST_PATH;
+static char const* path() {
+    char* path = std::getenv("UKV_TEST_PATH");
+    if (path)
+        return std::strlen(path) ? path : nullptr;
+
+#if defined(UKV_FLIGHT_CLIENT)
+    return nullptr;
+#elif defined(UKV_TEST_PATH)
+    return UKV_TEST_PATH;
 #else
-constexpr char const* path_k = "";
+    return nullptr;
 #endif
+}
+
+static std::string config() {
+    auto dir = path();
+    if (!dir)
+        return {};
+    return fmt::format(R"({{"version": "1.0", "directory": "{}"}})", dir);
+}
 
 TEST(db, validation) {
 
     database_t db;
-    EXPECT_TRUE(db.open(path_k));
+    EXPECT_TRUE(db.open(config().c_str()));
     blobs_collection_t collection = db.main();
     blobs_collection_t named_collection = *db.find_or_create("col");
     transaction_t txn = *db.transact();
@@ -409,7 +425,7 @@ TEST(db, validation) {
 }
 
 int main(int argc, char** argv) {
-    std::filesystem::create_directory(path_k);
+    std::filesystem::create_directory(path());
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }
