@@ -1,6 +1,6 @@
 API Reference
 ==============
 
-.. automodule:: ukv.rocksdb
+.. automodule:: ustore.rocksdb
     :members:
     :undoc-members:

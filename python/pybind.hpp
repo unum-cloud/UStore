@@ -8,9 +8,9 @@
 
 #include <arrow/python/pyarrow.h>
 
-#include "ukv/ukv.hpp"
+#include "ustore/ustore.hpp"
 
-namespace unum::ukv {
+namespace unum::ustore {
 
 namespace py = pybind11;
 
@@ -24,7 +24,7 @@ struct py_table_collection_t;
 struct py_task_ctx_t;
 
 /**
- * @brief Wrapper for `ukv::database_t`.
+ * @brief Wrapper for `ustore::database_t`.
  * Assumes that the Python client won't use more than one
  * concurrent session, as multithreading in Python is
  * prohibitively expensive.
@@ -46,7 +46,7 @@ struct py_db_t : public std::enable_shared_from_this<py_db_t> {
 };
 
 /**
- * @brief Wrapper for `ukv::transaction_t`.
+ * @brief Wrapper for `ustore::transaction_t`.
  * Only adds reference counting to the native C++ interface.
  */
 struct py_transaction_t : public std::enable_shared_from_this<py_transaction_t> {
@@ -66,7 +66,7 @@ struct py_transaction_t : public std::enable_shared_from_this<py_transaction_t> 
 };
 
 /**
- * @brief Wrapper for `ukv::blobs_collection_t`.
+ * @brief Wrapper for `ustore::blobs_collection_t`.
  * We need to preserve the `name`, to upsert again, after removing it in `clear`.
  * We also keep the transaction pointer, to persist the context of operation.
  */
@@ -79,19 +79,19 @@ struct py_collection_gt {
     std::string name;
     bool in_txn {false};
 
-    ukv_collection_t* member_collection() noexcept { return native.member_ptr(); }
-    ukv_arena_t* member_arena() noexcept { return native.member_arena(); }
-    ukv_options_t options() noexcept {
-        auto base = ukv_options_default_k;
-        return py_txn_ptr ? static_cast<ukv_options_t>( //
+    ustore_collection_t* member_collection() noexcept { return native.member_ptr(); }
+    ustore_arena_t* member_arena() noexcept { return native.member_arena(); }
+    ustore_options_t options() noexcept {
+        auto base = ustore_options_default_k;
+        return py_txn_ptr ? static_cast<ustore_options_t>( //
                                 base |                  //
-                                (py_txn_ptr->dont_watch ? ukv_option_transaction_dont_watch_k : base) |
-                                (py_txn_ptr->flush_writes ? ukv_option_write_flush_k : base))
+                                (py_txn_ptr->dont_watch ? ustore_option_transaction_dont_watch_k : base) |
+                                (py_txn_ptr->flush_writes ? ustore_option_write_flush_k : base))
                           : base;
     }
-    ukv_database_t db() noexcept(false) { return native.db(); }
-    ukv_transaction_t txn() noexcept(false) {
-        return in_txn ? ukv_transaction_t(py_txn_ptr->native) : ukv_transaction_t(nullptr);
+    ustore_database_t db() noexcept(false) { return native.db(); }
+    ustore_transaction_t txn() noexcept(false) {
+        return in_txn ? ustore_transaction_t(py_txn_ptr->native) : ustore_transaction_t(nullptr);
     }
 
     /**
@@ -140,8 +140,8 @@ struct py_graph_t : public std::enable_shared_from_this<py_graph_t> {
 };
 
 struct py_table_keys_range_t {
-    ukv_key_t min {std::numeric_limits<ukv_key_t>::min()};
-    ukv_key_t max {std::numeric_limits<ukv_key_t>::max()};
+    ustore_key_t min {std::numeric_limits<ustore_key_t>::min()};
+    ustore_key_t max {std::numeric_limits<ustore_key_t>::max()};
 };
 
 /**
@@ -151,9 +151,9 @@ struct py_table_keys_range_t {
 struct py_table_collection_t : public std::enable_shared_from_this<py_table_collection_t> {
 
     blobs_collection_t binary;
-    std::variant<std::monostate, std::vector<ukv_str_view_t>> columns_names;
-    std::variant<std::monostate, ukv_doc_field_type_t, std::vector<ukv_doc_field_type_t>> columns_types;
-    std::variant<std::monostate, py_table_keys_range_t, std::vector<ukv_key_t>> rows_keys;
+    std::variant<std::monostate, std::vector<ustore_str_view_t>> columns_names;
+    std::variant<std::monostate, ustore_doc_field_type_t, std::vector<ustore_doc_field_type_t>> columns_types;
+    std::variant<std::monostate, py_table_keys_range_t, std::vector<ustore_key_t>> rows_keys;
     std::size_t head {std::numeric_limits<std::size_t>::max()};
     std::size_t tail {std::numeric_limits<std::size_t>::max()};
     bool head_was_defined_last {true};
@@ -190,7 +190,7 @@ struct py_table_collection_t : public std::enable_shared_from_this<py_table_coll
 template <typename native_at>
 struct py_stream_with_ending_gt {
     native_at native;
-    ukv_key_t terminal {ukv_key_unknown_k};
+    ustore_key_t terminal {ustore_key_unknown_k};
     bool stop {false};
 };
 
@@ -257,7 +257,7 @@ void wrap_database(py::module&);
  *      | MultiGraph     | undirected   | Yes        | Yes            |
  *      | MultiDiGraph   | directed     | Yes        | Yes            |
  *
- * Aside from those, you can instantiate the most generic `ukv.Network`,
+ * Aside from those, you can instantiate the most generic `ustore.Network`,
  * controlling whether graph should be directed, allow loops, or have
  * attrs in source/target vertices or edges.
  * Beyond that, source and target vertices can belong to different collections.
@@ -334,4 +334,4 @@ void wrap_pandas(py::module&);
 
 void wrap_document(py::module&);
 
-} // namespace unum::ukv
+} // namespace unum::ustore

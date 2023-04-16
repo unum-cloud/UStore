@@ -4,7 +4,7 @@
  * @date 2022-06-18
  *
  * @brief A web server implementing @b REST backend on top of any other
- * UKV implementation using pre-release draft of C++23 Networking TS,
+ * UStore implementation using pre-release draft of C++23 Networking TS,
  * through the means of @b Boost.Beast, @b Boost.ASIO and @b NLohmann.JSON.
  */
 
@@ -46,17 +46,17 @@
 #elif defined(_MSC_VER)
 #endif
 
-#include "ukv/ukv.hpp"
+#include "ustore/ustore.hpp"
 
 namespace beast = boost::beast;   // from <boost/beast.hpp>
 namespace http = beast::http;     // from <boost/beast/http.hpp>
 namespace net = boost::asio;      // from <boost/asio.hpp>
 using tcp = boost::asio::ip::tcp; // from <boost/asio/ip/tcp.hpp>
 
-using namespace unum::ukv;
+using namespace unum::ustore;
 using namespace unum;
 
-static constexpr char const* server_name_k = "unum-cloud/ukv/beast_server";
+static constexpr char const* server_name_k = "unum-cloud/ustore/beast_server";
 static constexpr char const* mime_binary_k = "application/octet-stream";
 static constexpr char const* mime_json_k = "application/json";
 static constexpr char const* mime_msgpack_k = "application/msgpack";
@@ -64,25 +64,25 @@ static constexpr char const* mime_cbor_k = "application/cbor";
 static constexpr char const* mime_bson_k = "application/bson";
 static constexpr char const* mime_ubjson_k = "application/ubjson";
 
-ukv_doc_field_type_t mime_to_format(beast::string_view mime) {
+ustore_doc_field_type_t mime_to_format(beast::string_view mime) {
     if (mime == mime_json_k)
-        return ukv_field_json_k;
+        return ustore_field_json_k;
     else if (mime == "application/json-patch+json")
-        return ukv_format_json_patch_k;
+        return ustore_format_json_patch_k;
     else if (mime == mime_msgpack_k)
-        return ukv_format_msgpack_k;
+        return ustore_format_msgpack_k;
     else if (mime == mime_bson_k)
-        return ukv_format_bson_k;
+        return ustore_format_bson_k;
     else if (mime == mime_cbor_k)
-        return ukv_format_cbor_k;
+        return ustore_format_cbor_k;
     else if (mime == mime_ubjson_k)
-        return ukv_format_ubjson_k;
+        return ustore_format_ubjson_k;
     else if (mime == "application/vnd.apache.arrow.stream" || mime == "application/vnd.apache.arrow.file")
-        return ukv_format_arrow_k;
+        return ustore_format_arrow_k;
     else if (mime == "application/vnd.apache.parquet")
-        return ukv_format_parquet_k;
+        return ustore_format_parquet_k;
     else
-        return ukv_doc_field_default_k;
+        return ustore_doc_field_default_k;
 }
 
 struct db_w_clients_t : public std::enable_shared_from_this<db_w_clients_t> {
@@ -139,8 +139,8 @@ void respond_to_one(db_session_t& session,
 
     transaction_t txn(session.db());
     blobs_collection_t collection;
-    ukv_key_t key = 0;
-    ukv_options_t options = ukv_options_default_k;
+    ustore_key_t key = 0;
+    ustore_options_t options = ustore_options_default_k;
 
     // Parse the `key`
     auto key_begin = received_path.substr(5).begin();
@@ -164,14 +164,14 @@ void respond_to_one(db_session_t& session,
         std::memcpy(collection_name_buffer, collection_val->data(), std::min(collection_val->size(), 64ul));
 
         status_t status;
-        ukv_collection_create_t collection_init {
+        ustore_collection_create_t collection_init {
             .db = session.db(),
             .error = error.member_ptr(),
             .name = collection_name_buffer,
             .id = &collection.raw,
         };
 
-        ukv_collection_create(&collection_init);
+        ustore_collection_create(&collection_init);
         if (!status)
             return send_response(make_error(req, http::status::internal_server_error, error.raw));
     }
@@ -185,7 +185,7 @@ void respond_to_one(db_session_t& session,
 
         arena_t tape(session.db());
         status_t status;
-        ukv_read_t read {
+        ustore_read_t read {
             .db = session.db(),
             .error = error.member_ptr(),
             .transaction = txn.raw,
@@ -197,12 +197,12 @@ void respond_to_one(db_session_t& session,
             .values = &tape.ptr,
         };
 
-        ukv_read(&read);
+        ustore_read(&read);
         if (!status)
             return send_response(make_error(req, http::status::internal_server_error, error.raw));
 
-        ukv_bytes_ptr_t begin = tape.ptr + sizeof(ukv_length_t);
-        ukv_length_t len = reinterpret_cast<ukv_length_t*>(tape.ptr)[0];
+        ustore_bytes_ptr_t begin = tape.ptr + sizeof(ustore_length_t);
+        ustore_length_t len = reinterpret_cast<ustore_length_t*>(tape.ptr)[0];
         if (!len)
             return send_response(make_error(req, http::status::not_found, "Missing key"));
 
@@ -228,8 +228,8 @@ void respond_to_one(db_session_t& session,
 
         arena_t tape(session.db());
         status_t status;
-        options = ukv_option_read_lengths_k;
-        ukv_read_t read {
+        options = ustore_option_read_lengths_k;
+        ustore_read_t read {
             .db = session.db(),
             .transaction = txn.raw,
             .collections = &collection.raw,
@@ -241,11 +241,11 @@ void respond_to_one(db_session_t& session,
             .error = error.member_ptr(),
         };
 
-        ukv_read(&read);
+        ustore_read(&read);
         if (!status)
             return send_response(make_error(req, http::status::internal_server_error, error.raw));
 
-        ukv_length_t len = reinterpret_cast<ukv_length_t*>(tape.ptr)[0];
+        ustore_length_t len = reinterpret_cast<ustore_length_t*>(tape.ptr)[0];
         if (!len)
             return send_response(make_error(req, http::status::not_found, "Missing key"));
 
@@ -261,8 +261,8 @@ void respond_to_one(db_session_t& session,
     case http::verb::post: {
         arena_t tape(session.db());
         status_t status;
-        options = ukv_option_read_lengths_k;
-        ukv_read_t read {
+        options = ustore_option_read_lengths_k;
+        ustore_read_t read {
             .db = session.db(),
             .transaction = txn.raw,
             .collections = &collection.raw,
@@ -274,11 +274,11 @@ void respond_to_one(db_session_t& session,
             .error = error.member_ptr(),
         };
 
-        ukv_read(&read);
+        ustore_read(&read);
         if (!status)
             return send_response(make_error(req, http::status::internal_server_error, error.raw));
 
-        ukv_length_t len = reinterpret_cast<ukv_length_t*>(tape.ptr)[0];
+        ustore_length_t len = reinterpret_cast<ustore_length_t*>(tape.ptr)[0];
         if (len)
             return send_response(make_error(req, http::status::conflict, "Duplicate key"));
 
@@ -301,11 +301,11 @@ void respond_to_one(db_session_t& session,
 
         status_t status;
         auto value = req.body();
-        auto value_ptr = reinterpret_cast<ukv_bytes_ptr_t>(value.data());
-        auto value_len = static_cast<ukv_length_t>(*opt_payload_len);
-        ukv_length_t value_off = 0;
+        auto value_ptr = reinterpret_cast<ustore_bytes_ptr_t>(value.data());
+        auto value_len = static_cast<ustore_length_t>(*opt_payload_len);
+        ustore_length_t value_off = 0;
 
-        ukv_write_t write {
+        ustore_write_t write {
             .db = session.db(),
             .error = error.member_ptr(),
             .transaction = txn.raw,
@@ -317,7 +317,7 @@ void respond_to_one(db_session_t& session,
             .values = &value_ptr,
         };
 
-        ukv_write(&write);
+        ustore_write(&write);
         if (!status)
             return send_response(make_error(req, http::status::internal_server_error, error.raw));
 
@@ -332,11 +332,11 @@ void respond_to_one(db_session_t& session,
     case http::verb::delete_: {
 
         status_t status;
-        ukv_bytes_ptr_t value_ptr = nullptr;
-        ukv_length_t value_len = 0;
-        ukv_length_t value_off = 0;
+        ustore_bytes_ptr_t value_ptr = nullptr;
+        ustore_length_t value_len = 0;
+        ustore_length_t value_off = 0;
 
-        ukv_write_t write {
+        ustore_write_t write {
             .db = session.db(),
             .error = error.member_ptr(),
             .transaction = txn.raw,
@@ -348,7 +348,7 @@ void respond_to_one(db_session_t& session,
             .values = &value_ptr,
         };
 
-        ukv_write(&write);
+        ustore_write(&write);
         if (!status)
             return send_response(make_error(req, http::status::internal_server_error, error.raw));
 
@@ -376,8 +376,8 @@ void respond_to_aos(db_session_t& session,
 
     transaction_t txn(session.db());
     std::vector<blobs_collection_t> collections(session.db());
-    ukv_options_t options = ukv_options_default_k;
-    std::vector<ukv_key_t> keys;
+    ustore_options_t options = ustore_options_default_k;
+    std::vector<ustore_key_t> keys;
 
     // Parse the free-order parameters, starting with transaction identifier.
     auto params_begin = std::find(received_path.begin(), received_path.end(), '?');
@@ -396,19 +396,19 @@ void respond_to_aos(db_session_t& session,
 
         status_t status;
         blobs_collection_t collection(session.db());
-        ukv_collection_create_t collection_init {
+        ustore_collection_create_t collection_init {
             .db = session.db(),
             .error = error.member_ptr(),
             .name = collection_name_buffer,
             .id = &collection.raw,
         };
 
-        ukv_collection_create(&collection_init);
+        ustore_collection_create(&collection_init);
         if (!status)
             return send_response(make_error(req, http::status::internal_server_error, error.raw));
 
         collections.raw_array.emplace_back(std::exchange(collection.raw, nullptr));
-        // ukv_option_read_colocated(&options, true);
+        // ustore_option_read_colocated(&options, true);
     }
 
     // Make sure we support the requested content type
@@ -428,7 +428,7 @@ void respond_to_aos(db_session_t& session,
     // Parse the payload, that will contain auxiliary data
     auto payload = req.body();
     auto payload_ptr = reinterpret_cast<char const*>(payload.data());
-    auto payload_len = static_cast<ukv_size_t>(*opt_payload_len);
+    auto payload_len = static_cast<ustore_size_t>(*opt_payload_len);
 
 #if 0
     // Once we know, which collection, key and transaction user is
@@ -456,13 +456,13 @@ void respond_to_aos(db_session_t& session,
                 return send_response(make_error(req,
                                                 http::status::bad_request,
                                                 "GET request must provide a non-empty list of integer keys"));
-            keys.push_back(key_json.template get<ukv_key_t>());
+            keys.push_back(key_json.template get<ustore_key_t>());
         }
 
         // Pull the entire objects before we start sampling their fields
         arena_t tape(session.db());
         status_t status;
-        // ukv_read(session.db(),
+        // ustore_read(session.db(),
         //          txn.raw,
         //          keys.data(),
         //          keys.size(),
@@ -474,14 +474,14 @@ void respond_to_aos(db_session_t& session,
         if (!status)
             return send_response(make_error(req, http::status::internal_server_error, error.raw));
 
-        ukv_length_t const* values_lens = reinterpret_cast<ukv_length_t*>(tape.ptr);
-        ukv_bytes_ptr_t values_begin = tape.ptr + sizeof(ukv_length_t) * keys.size();
+        ustore_length_t const* values_lens = reinterpret_cast<ustore_length_t*>(tape.ptr);
+        ustore_bytes_ptr_t values_begin = tape.ptr + sizeof(ustore_length_t) * keys.size();
 
         std::size_t exported_bytes = 0;
         std::vector<json_t> parsed_vals(keys.size());
         for (std::size_t key_idx = 0; key_idx != keys.size(); ++key_idx) {
-            ukv_bytes_ptr_t begin = values_begin + exported_bytes;
-            ukv_length_t len = values_lens[key_idx];
+            ustore_bytes_ptr_t begin = values_begin + exported_bytes;
+            ustore_length_t len = values_lens[key_idx];
             json_t& val = parsed_vals[key_idx];
             if (!len)
                 continue;
@@ -544,7 +544,7 @@ void respond_to_aos(db_session_t& session,
 
 /**
  * @brief Primary dispatch point, routing incoming HTTP requests
- *        into underlying UKV calls, preparing results and sending back.
+ *        into underlying UStore calls, preparing results and sending back.
  */
 template <typename body_at, typename allocator_at, typename send_response_at>
 void route_request(db_session_t& session,
@@ -764,10 +764,10 @@ int main(int argc, char* argv[]) {
 
     // Check command line arguments
     if (argc < 4) {
-        std::cerr << "Usage: ukv_beast_server <address> <port> <threads> <db_config_path>?\n"
+        std::cerr << "Usage: ustore_beast_server <address> <port> <threads> <db_config_path>?\n"
                   << "Example:\n"
-                  << "    ukv_beast_server 0.0.0.0 8080 1\n"
-                  << "    ukv_beast_server 0.0.0.0 8080 1 ./config.json\n"
+                  << "    ustore_beast_server 0.0.0.0 8080 1\n"
+                  << "    ustore_beast_server 0.0.0.0 8080 1 ./config.json\n"
                   << "";
         return EXIT_FAILURE;
     }
@@ -790,13 +790,13 @@ int main(int argc, char* argv[]) {
     // Check if we can initialize the DB
     auto session = std::make_shared<db_w_clients_t>();
     status_t status;
-    ukv_database_init_t database {
+    ustore_database_init_t database {
         .config = db_config.c_str(),
         .db = &session->raw,
         .error = error.member_ptr(),
     };
 
-    ukv_database_init(&database);
+    ustore_database_init(&database);
     if (!status) {
         std::cerr << "Couldn't initialize DB: " << error.raw << std::endl;
         return EXIT_FAILURE;

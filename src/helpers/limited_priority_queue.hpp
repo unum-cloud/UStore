@@ -7,7 +7,7 @@
 #pragma once
 #include <algorithm> // `std::destroy_n`
 
-namespace unum::ukv {
+namespace unum::ustore {
 
 /**
  * @brief Max-heap or Priority-Queue-like structure, keeping the biggest
@@ -113,4 +113,4 @@ class limited_priority_queue_gt {
     }
 };
 
-} // namespace unum::ukv
+} // namespace unum::ustore

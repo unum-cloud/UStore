@@ -8,9 +8,9 @@
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
 
-#include "ukv/cpp/ranges.hpp" // `value_view_t`
+#include "ustore/cpp/ranges.hpp" // `value_view_t`
 
-namespace unum::ukv::pyb {
+namespace unum::ustore::pyb {
 
 /**
  * @brief Defines Pythons type marker for primitive types.
@@ -61,8 +61,8 @@ strided_range_gt<scalar_at> py_strided_range(py_buffer_t const& buf) {
         throw std::invalid_argument("Scalar type mismatch");
 
     strided_range_gt<scalar_at> result {
-        {reinterpret_cast<scalar_at*>(buf.raw.buf), static_cast<ukv_size_t>(buf.raw.strides[0])},
-        static_cast<ukv_size_t>(buf.raw.shape[0]),
+        {reinterpret_cast<scalar_at*>(buf.raw.buf), static_cast<ustore_size_t>(buf.raw.strides[0])},
+        static_cast<ustore_size_t>(buf.raw.shape[0]),
     };
     return result;
 }
@@ -81,10 +81,10 @@ strided_matrix_gt<scalar_at> py_strided_matrix(py_buffer_t const& buf) {
 
     strided_matrix_gt<scalar_at> result {
         reinterpret_cast<scalar_at*>(buf.raw.buf),
-        static_cast<ukv_size_t>(buf.raw.shape[0]),
-        static_cast<ukv_size_t>(buf.raw.shape[1]),
-        static_cast<ukv_size_t>(buf.raw.strides[0]),
-        static_cast<ukv_size_t>(buf.raw.strides[1]),
+        static_cast<ustore_size_t>(buf.raw.shape[0]),
+        static_cast<ustore_size_t>(buf.raw.shape[1]),
+        static_cast<ustore_size_t>(buf.raw.strides[0]),
+        static_cast<ustore_size_t>(buf.raw.strides[1]),
     };
     return result;
 }
@@ -127,7 +127,7 @@ inline value_view_t py_to_bytes(PyObject* obj) {
         char* buffer = nullptr;
         Py_ssize_t length = 0;
         PyBytes_AsStringAndSize(obj, &buffer, &length);
-        return {reinterpret_cast<ukv_bytes_ptr_t>(buffer), static_cast<ukv_length_t>(length)};
+        return {reinterpret_cast<ustore_bytes_ptr_t>(buffer), static_cast<ustore_length_t>(length)};
     }
 
     if (obj == Py_None) // Means the object must be deleted
@@ -137,7 +137,7 @@ inline value_view_t py_to_bytes(PyObject* obj) {
     return {};
 }
 
-inline ukv_str_view_t py_to_str(PyObject* obj) {
+inline ustore_str_view_t py_to_str(PyObject* obj) {
     return py_to_bytes(obj).c_str();
 }
 
@@ -253,7 +253,7 @@ scalar_at py_cast_scalar(byte_t* data, char format) {
     case format_code_gt<long long>::value[0]: return *reinterpret_cast<long long*>(data);
     case format_code_gt<unsigned long long>::value[0]: return *reinterpret_cast<unsigned long long*>(data);
 
-    default: throw std::invalid_argument("Cant cast this type to `ukv_key_t`");
+    default: throw std::invalid_argument("Cant cast this type to `ustore_key_t`");
     }
 }
 
@@ -310,4 +310,4 @@ bool can_view_as_strided_matrix(py_buffer_t const& buf) {
     return buf.raw.ndim == 2 && can_cast_internal_scalars<scalar_at>(buf);
 }
 
-} // namespace unum::ukv::pyb
+} // namespace unum::ustore::pyb

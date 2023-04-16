@@ -28,14 +28,14 @@
 #include <fmt/format.h>
 #include <argparse/argparse.hpp>
 
-#include <ukv/ukv.hpp>
+#include <ustore/ustore.hpp>
 #include <dataset.h>
 
 namespace bm = benchmark;
-using namespace unum::ukv;
+using namespace unum::ustore;
 
 constexpr size_t max_batch_size_k = 1024 * 1024 * 1024;
-constexpr ukv_str_view_t path_k = "./";
+constexpr ustore_str_view_t path_k = "./";
 
 static database_t db;
 
@@ -94,7 +94,7 @@ static void bench_docs_import(bm::State& state, args_t const& args) {
 
     auto start = std::chrono::high_resolution_clock::now();
     for (auto _ : state) {
-        ukv_docs_import_t docs {};
+        ustore_docs_import_t docs {};
         docs.db = db;
         docs.error = status.member_ptr();
         docs.arena = arena.member_ptr();
@@ -102,7 +102,7 @@ static void bench_docs_import(bm::State& state, args_t const& args) {
         docs.paths_pattern = source_files[pos + idx].c_str();
         docs.max_batch_size = max_batch_size_k;
         docs.id_field = args.id.c_str();
-        ukv_docs_import(&docs);
+        ustore_docs_import(&docs);
 
         if (status)
             size += source_sizes[pos + idx];
@@ -148,14 +148,14 @@ static void bench_docs_export(bm::State& state, args_t const& args) {
 
     auto start = std::chrono::high_resolution_clock::now();
     for (auto _ : state) {
-        ukv_docs_export_t docs {};
+        ustore_docs_export_t docs {};
         docs.db = db;
         docs.error = status.member_ptr();
         docs.arena = arena.member_ptr();
         docs.collection = collection;
         docs.paths_extension = args.extension.c_str();
         docs.max_batch_size = max_batch_size_k;
-        ukv_docs_export(&docs);
+        ustore_docs_export(&docs);
         if (status)
             size += find_and_delete();
         else

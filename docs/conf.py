@@ -6,7 +6,7 @@
 # -- Project information -----------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
-project = 'Unum · UKV'
+project = 'Unum · UStore'
 copyright = '2023, Unum'
 author = 'Unum'
 release = open('../VERSION', 'r').read().strip()
@@ -44,5 +44,5 @@ html_css_files = ['custom.css']
 html_js_files = ['custom.js']
 
 
-breathe_projects = {'UKV': '../build/xml'}
-breathe_default_project = 'UKV'
+breathe_projects = {'UStore': '../build/xml'}
+breathe_default_project = 'UStore'

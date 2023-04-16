@@ -1,0 +1,39 @@
+{
+    "version": "1.0",
+    "directory": "./tmp/ustore/",
+    "data_directories": [
+        {
+            "path": "./tmp/storage/",
+            "max_size": "100GB"
+        },
+    ],
+    "engine": {
+        "config_url": "",
+        "config_file_path": "./engine_rocksdb.ini",
+        "config": {
+            "Version": {
+                "rocksdb_version": "7.2.9",
+                "options_file_version": "1.1"
+            },
+            "DBOptions": {
+                "create_if_missing": true,
+                "writable_file_max_buffer_size": 134217728,
+                "max_open_files": -1,
+                "max_file_opening_threads": 32
+            },
+            "CFOptions": {
+                "max_write_buffer_number": 4,
+                "write_buffer_size": 134217728,
+                "target_file_size_base": 134217728,
+                "max_bytes_for_level_base": 2147483648,
+                "max_compaction_bytes": 4294967296,
+                "level_compaction_dynamic_level_bytes": false,
+                "level0_stop_writes_trigger": 16,
+                "target_file_size_multiplier": 2,
+                "max_bytes_for_level_multiplier": 4,
+                "compression": "kNoCompression",
+                "compaction_style": "kCompactionStyleLevel"
+            }
+        }
+    }
+}

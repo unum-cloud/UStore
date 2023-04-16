@@ -7,7 +7,7 @@
 #pragma once
 #include "helpers.hpp"
 
-namespace unum::ukv {
+namespace unum::ustore {
 
 /**
  * @brief Extension of Boosts LRU cache.
@@ -112,4 +112,4 @@ class lru_cache_gt {
     }
 };
 
-} // namespace unum::ukv
+} // namespace unum::ustore

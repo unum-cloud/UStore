@@ -27,7 +27,7 @@ before-build = [
     "pip install pyarrow==10.0.0",
     "export PYST=$(python -c 'import site; print(site.getsitepackages()[0])')",
     "echo \"-DCMAKE_BUILD_TYPE=Release -DPYARROW_DIR=${PYST}/pyarrow/\" > ${CMAKE_ARGS_F}",
-    "mkdir -p build/ukv",
+    "mkdir -p build/ustore",
 ]
 
 skip = ["*musllinux*", "*i686*", "pp*", "cp36-*", "cp311-*"]

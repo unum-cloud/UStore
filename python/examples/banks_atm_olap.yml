@@ -1,4 +1,4 @@
-name: ukv-banks-atm-olap
+name: ustore-banks-atm-olap
 
 # This can't be set inside the file,
 # but should be configured from CLI.

@@ -7,9 +7,9 @@
 #pragma once
 #include <cstdio> // `std::FILE`
 
-#include "ukv/cpp/status.hpp" // `status_t`
+#include "ustore/cpp/status.hpp" // `status_t`
 
-namespace unum::ukv {
+namespace unum::ustore {
 
 class file_handle_t {
     std::FILE* handle_ = nullptr;
@@ -42,4 +42,4 @@ class file_handle_t {
     operator std::FILE*() const noexcept { return handle_; }
 };
 
-} // namespace unum::ukv
+} // namespace unum::ustore

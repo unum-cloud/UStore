@@ -3,7 +3,7 @@
  * @author Ashot Vardanian
  *
  * @brief Vectors compatibility layer.
- * Sits on top of any @see "ukv.h"-compatible system.
+ * Sits on top of any @see "ustore.h"-compatible system.
  *
  * Internally quantizes often f32/f16 vectors into i8 representations,
  * later constructing a Navigable Small World Graph on those vectors.
@@ -12,8 +12,8 @@
  */
 #include <cmath> // `std::sqrt`
 
-#include "ukv/vectors.h"
-#include "ukv/cpp/ranges_args.hpp" // `places_arg_t`
+#include "ustore/vectors.h"
+#include "ustore/cpp/ranges_args.hpp" // `places_arg_t`
 
 #include "helpers/linked_memory.hpp"          // `linked_memory_lock_t`
 #include "helpers/algorithm.hpp"              // `transform_n`
@@ -24,7 +24,7 @@
 /*****************	 C++ Implementation	  ****************/
 /*********************************************************/
 
-using namespace unum::ukv;
+using namespace unum::ustore;
 using namespace unum;
 
 using real_t = float;
@@ -32,8 +32,8 @@ using quant_t = std::int8_t;
 using quant_product_t = std::int16_t;
 
 struct match_t {
-    ukv_key_t key;
-    ukv_float_t metric;
+    ustore_key_t key;
+    ustore_float_t metric;
 };
 
 struct lower_similarity_t {
@@ -107,64 +107,64 @@ void quantize(float_at const* originals, std::size_t dims, quant_t* quants) noex
         quants[i] = static_cast<quant_t>(originals[i] * float_scaling_k);
 }
 
-void quantize(byte_t const* bytes, ukv_vector_scalar_t scalar_type, std::size_t dims, quant_t* quants) noexcept {
+void quantize(byte_t const* bytes, ustore_vector_scalar_t scalar_type, std::size_t dims, quant_t* quants) noexcept {
     switch (scalar_type) {
-    case ukv_vector_scalar_f32_k: return quantize((real_t const*)bytes, dims, quants);
-    case ukv_vector_scalar_f64_k: return quantize((double const*)bytes, dims, quants);
-    case ukv_vector_scalar_f16_k: return quantize((std::int16_t const*)bytes, dims, quants);
-    case ukv_vector_scalar_i8_k: return quantize((quant_t const*)bytes, dims, quants);
+    case ustore_vector_scalar_f32_k: return quantize((real_t const*)bytes, dims, quants);
+    case ustore_vector_scalar_f64_k: return quantize((double const*)bytes, dims, quants);
+    case ustore_vector_scalar_f16_k: return quantize((std::int16_t const*)bytes, dims, quants);
+    case ustore_vector_scalar_i8_k: return quantize((quant_t const*)bytes, dims, quants);
     }
 }
 
-real_t metric(quant_t const* a, quant_t const* b, std::size_t dims, ukv_vector_metric_t kind) noexcept {
+real_t metric(quant_t const* a, quant_t const* b, std::size_t dims, ustore_vector_metric_t kind) noexcept {
     switch (kind) {
-    case ukv_vector_metric_dot_k: return metric_dot_t {}(a, b, dims);
-    case ukv_vector_metric_cos_k: return metric_cos_t {}(a, b, dims);
-    case ukv_vector_metric_l2_k: return metric_l2_t {}(a, b, dims);
+    case ustore_vector_metric_dot_k: return metric_dot_t {}(a, b, dims);
+    case ustore_vector_metric_cos_k: return metric_cos_t {}(a, b, dims);
+    case ustore_vector_metric_l2_k: return metric_l2_t {}(a, b, dims);
     default: return 0;
     }
 }
 
-ukv_length_t size_bytes(ukv_vector_scalar_t scalar_type) noexcept {
+ustore_length_t size_bytes(ustore_vector_scalar_t scalar_type) noexcept {
     switch (scalar_type) {
-    case ukv_vector_scalar_f32_k: return sizeof(real_t);
-    case ukv_vector_scalar_f64_k: return sizeof(double);
-    case ukv_vector_scalar_f16_k: return sizeof(std::int16_t);
-    case ukv_vector_scalar_i8_k: return sizeof(quant_t);
+    case ustore_vector_scalar_f32_k: return sizeof(real_t);
+    case ustore_vector_scalar_f64_k: return sizeof(double);
+    case ustore_vector_scalar_f16_k: return sizeof(std::int16_t);
+    case ustore_vector_scalar_i8_k: return sizeof(quant_t);
     default: return 0;
     }
 }
 
 struct vectors_arg_t {
-    strided_iterator_gt<ukv_bytes_cptr_t const> contents;
-    strided_iterator_gt<ukv_length_t const> offsets;
-    ukv_size_t vectors_stride;
-    ukv_vector_scalar_t scalar_type;
-    ukv_length_t dimensions;
-    ukv_size_t tasks_count = 1;
+    strided_iterator_gt<ustore_bytes_cptr_t const> contents;
+    strided_iterator_gt<ustore_length_t const> offsets;
+    ustore_size_t vectors_stride;
+    ustore_vector_scalar_t scalar_type;
+    ustore_length_t dimensions;
+    ustore_size_t tasks_count = 1;
 
     value_view_t operator[](std::size_t i) const noexcept {
         if (!contents)
             return {};
-        ukv_bytes_cptr_t begin = contents[i];
+        ustore_bytes_cptr_t begin = contents[i];
         begin += offsets ? offsets[i] : 0u;
         begin += vectors_stride * i;
         return {begin, dimensions * size_bytes(scalar_type)};
     }
 };
 
-void ukv_vectors_write(ukv_vectors_write_t* c_ptr) {
+void ustore_vectors_write(ustore_vectors_write_t* c_ptr) {
 
-    ukv_vectors_write_t& c = *c_ptr;
+    ustore_vectors_write_t& c = *c_ptr;
     linked_memory_lock_t arena = linked_memory(c.arena, c.options, c.error);
     return_if_error_m(c.error);
 
-    strided_iterator_gt<ukv_collection_t const> collections {c.collections, c.collections_stride};
-    strided_iterator_gt<ukv_key_t const> keys {c.keys, c.keys_stride};
+    strided_iterator_gt<ustore_collection_t const> collections {c.collections, c.collections_stride};
+    strided_iterator_gt<ustore_key_t const> keys {c.keys, c.keys_stride};
     places_arg_t places_args {collections, keys, {}, c.tasks_count};
 
-    strided_iterator_gt<ukv_bytes_cptr_t const> starts {c.vectors_starts, c.vectors_starts_stride};
-    strided_iterator_gt<ukv_length_t const> offs {c.offsets, c.offsets_stride};
+    strided_iterator_gt<ustore_bytes_cptr_t const> starts {c.vectors_starts, c.vectors_starts_stride};
+    strided_iterator_gt<ustore_length_t const> offs {c.offsets, c.offsets_stride};
     vectors_arg_t vectors_args {starts, offs, c.vectors_stride, c.scalar_type, c.dimensions, c.tasks_count};
 
     // For each input key we must get its
@@ -189,22 +189,22 @@ void ukv_vectors_write(ukv_vectors_write_t* c_ptr) {
         entry_t& entry = quantized_entries[c.tasks_count + task_idx];
         entry.collection_key.collection = places_args[task_idx].collection;
         entry.collection_key.key = -places_args[task_idx].key;
-        entry.value = value_view_t {(ukv_bytes_cptr_t)quantized_begin, c.dimensions};
+        entry.value = value_view_t {(ustore_bytes_cptr_t)quantized_begin, c.dimensions};
         quantize(original_begin, c.scalar_type, c.dimensions, quantized_begin);
     }
 
 #if 0 // Future Complex Index Logic
 
     // Search greedily for closest entries to the provided vectors.
-    ukv_length_t starting_samples_limit = 128;
+    ustore_length_t starting_samples_limit = 128;
     std::size_t max_search_rounds = 10;
     std::size_t max_neighbors = 4;
 
     // First, we need to random sample some starting points.
-    ukv_length_t* starting_samples_offsets = NULL;
-    ukv_length_t* starting_samples_counts = NULL;
-    ukv_key_t* starting_samples_keys = NULL;
-    ukv_sample_t sample {};
+    ustore_length_t* starting_samples_offsets = NULL;
+    ustore_length_t* starting_samples_counts = NULL;
+    ustore_key_t* starting_samples_keys = NULL;
+    ustore_sample_t sample {};
     sample.db = c.db;
     sample.error = c.error;
     sample.transaction = c.transaction;
@@ -217,7 +217,7 @@ void ukv_vectors_write(ukv_vectors_write_t* c_ptr) {
     sample.offsets = &starting_samples_offsets;
     sample.counts = &starting_samples_counts;
     sample.keys = &starting_samples_keys;
-    ukv_sample(&sample);
+    ustore_sample(&sample);
     return_if_error_m(c.error);
 
     // Allocate two priority queues per request.
@@ -256,7 +256,7 @@ void ukv_vectors_write(ukv_vectors_write_t* c_ptr) {
 
     // Submit both original and quantized entries
     entry_t& first = quantized_entries[0];
-    ukv_write_t write {};
+    ustore_write_t write {};
     write.db = c.db;
     write.error = c.error;
     write.transaction = c.transaction;
@@ -271,23 +271,23 @@ void ukv_vectors_write(ukv_vectors_write_t* c_ptr) {
     write.lengths_stride = sizeof(entry_t);
     write.values = first.value.member_ptr();
     write.values_stride = sizeof(entry_t);
-    ukv_write(&write);
+    ustore_write(&write);
 }
 
-void ukv_vectors_read(ukv_vectors_read_t* c_ptr) {
+void ustore_vectors_read(ustore_vectors_read_t* c_ptr) {
 
-    ukv_vectors_read_t& c = *c_ptr;
+    ustore_vectors_read_t& c = *c_ptr;
     linked_memory_lock_t arena = linked_memory(c.arena, c.options, c.error);
     return_if_error_m(c.error);
 
-    strided_iterator_gt<ukv_collection_t const> collections {c.collections, c.collections_stride};
-    strided_iterator_gt<ukv_key_t const> keys {c.keys, c.keys_stride};
+    strided_iterator_gt<ustore_collection_t const> collections {c.collections, c.collections_stride};
+    strided_iterator_gt<ustore_key_t const> keys {c.keys, c.keys_stride};
     places_arg_t places_args {collections, keys, {}, c.tasks_count};
 
     auto vector_size = c.dimensions * size_bytes(c.scalar_type);
 
     // Read from disk, but potentially re-layout the data response.
-    ukv_read_t read {};
+    ustore_read_t read {};
     read.db = c.db;
     read.error = c.error;
     read.transaction = c.transaction;
@@ -301,29 +301,29 @@ void ukv_vectors_read(ukv_vectors_read_t* c_ptr) {
     read.offsets = c.offsets;
     read.presences = c.presences;
     read.values = c.vectors;
-    ukv_read(&read);
+    ustore_read(&read);
     return_if_error_m(c.error);
 
     // From here on, if we have the offsets don't form identical-length chunks,
     // we must compact the range:
 }
 
-void ukv_vectors_search(ukv_vectors_search_t* c_ptr) {
+void ustore_vectors_search(ustore_vectors_search_t* c_ptr) {
 
-    ukv_vectors_search_t const& c = *c_ptr;
+    ustore_vectors_search_t const& c = *c_ptr;
     linked_memory_lock_t arena = linked_memory(c.arena, c.options, c.error);
     return_if_error_m(c.error);
 
-    strided_iterator_gt<ukv_bytes_cptr_t const> starts {c.queries_starts, c.queries_starts_stride};
-    strided_iterator_gt<ukv_length_t const> offs {c.queries_offsets, c.queries_offsets_stride};
+    strided_iterator_gt<ustore_bytes_cptr_t const> starts {c.queries_starts, c.queries_starts_stride};
+    strided_iterator_gt<ustore_length_t const> offs {c.queries_offsets, c.queries_offsets_stride};
     vectors_arg_t queries_args {starts, offs, c.queries_stride, c.scalar_type, c.dimensions, c.tasks_count};
 
-    strided_iterator_gt<ukv_collection_t const> collections {c.collections, c.collections_stride};
-    strided_range_gt<ukv_length_t const> count_limits {{c.match_counts_limits, c.match_counts_limits_stride},
+    strided_iterator_gt<ustore_collection_t const> collections {c.collections, c.collections_stride};
+    strided_range_gt<ustore_length_t const> count_limits {{c.match_counts_limits, c.match_counts_limits_stride},
                                                        c.tasks_count};
 
-    auto count_limits_max = ukv_length_t {0};
-    auto count_limits_sum = transform_reduce_n(count_limits.begin(), c.tasks_count, 0ul, [&](ukv_length_t l) {
+    auto count_limits_max = ustore_length_t {0};
+    auto count_limits_sum = transform_reduce_n(count_limits.begin(), c.tasks_count, 0ul, [&](ustore_length_t l) {
         count_limits_max = std::max(count_limits_max, l);
         return l;
     });
@@ -342,16 +342,16 @@ void ukv_vectors_search(ukv_vectors_search_t* c_ptr) {
     auto quant_query = arena.alloc<quant_t>(c.dimensions, c.error);
     return_if_error_m(c.error);
 
-    ukv_length_t total_exported_matches = 0;
+    ustore_length_t total_exported_matches = 0;
     for (std::size_t i = 0; i != c.tasks_count && !*c.error; ++i) {
-        auto col = collections ? collections[i] : ukv_collection_main_k;
+        auto col = collections ? collections[i] : ustore_collection_main_k;
         auto query = queries_args[i];
         auto limit = count_limits[i];
         quantize(query.begin(), c.scalar_type, c.dimensions, quant_query.begin());
 
         pq_t pq {temp_matches.begin(), temp_matches.begin() + limit};
 
-        auto callback = [&](ukv_key_t key, value_view_t vector) noexcept {
+        auto callback = [&](ustore_key_t key, value_view_t vector) noexcept {
             if (key >= 0)
                 return false;
             match_t match;
@@ -364,7 +364,7 @@ void ukv_vectors_search(ukv_vectors_search_t* c_ptr) {
             return true;
         };
 
-        auto min_key = std::numeric_limits<ukv_key_t>::min();
+        auto min_key = std::numeric_limits<ustore_key_t>::min();
         full_scan_collection(c.db, c.transaction, col, c.options, min_key, limit, arena, c.error, callback);
         auto count = pq.size();
 

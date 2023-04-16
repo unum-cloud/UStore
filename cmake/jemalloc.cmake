@@ -2,11 +2,11 @@
 include(ExternalProject)
 set(JEMALLOC_DISABLE_TLS)
 
-if(${UKV_BUILD_SDK_PYTHON})
+if(${USTORE_BUILD_SDK_PYTHON})
     set(JEMALLOC_DISABLE_TLS --disable-initial-exec-tls)
 endif()
 
-if(${UKV_REBUILD_JEMALLOC})
+if(${USTORE_REBUILD_JEMALLOC})
     set(JEMALLOC_PREFIX_DIR ${CMAKE_BINARY_DIR}/_deps/jemalloc)
     set(JEMALLOC_SRC_DIR ${JEMALLOC_PREFIX_DIR}/src/jemalloc)
     set(JEMALLOC_INSTALL_DIR ${JEMALLOC_PREFIX_DIR}/install)

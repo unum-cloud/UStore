@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <memory>
 
-namespace unum::ukv {
+namespace unum::ustore {
 
 /**
  * @brief Implements a "reserving" allocator for objects bigger than pointer size.
@@ -108,4 +108,4 @@ bool operator!=(reserve_allocator_gt<base_at> const& a, reserve_allocator_gt<oth
     return a.base != b.base;
 }
 
-} // namespace unum::ukv
+} // namespace unum::ustore

@@ -10,20 +10,20 @@
 #include <gtest/gtest.h>
 #include <fmt/format.h>
 
-#include "ukv/ukv.hpp"
+#include "ustore/ustore.hpp"
 
-using namespace unum::ukv;
+using namespace unum::ustore;
 using namespace unum;
 
 static char const* path() {
-    char* path = std::getenv("UKV_TEST_PATH");
+    char* path = std::getenv("USTORE_TEST_PATH");
     if (path)
         return std::strlen(path) ? path : nullptr;
 
-#if defined(UKV_FLIGHT_CLIENT)
+#if defined(USTORE_FLIGHT_CLIENT)
     return nullptr;
-#elif defined(UKV_TEST_PATH)
-    return UKV_TEST_PATH;
+#elif defined(USTORE_TEST_PATH)
+    return USTORE_TEST_PATH;
 #else
     return nullptr;
 #endif
@@ -59,8 +59,8 @@ void insert_atomic_isolated(std::size_t count_batches) {
 
         for (std::size_t idx_batch = 0; idx_batch != count_batches; ++idx_batch) {
 
-            std::array<ukv_key_t, batch_size_ak> keys;
-            ukv_key_t const first_key_in_batch = idx_batch * batch_size_ak;
+            std::array<ustore_key_t, batch_size_ak> keys;
+            ustore_key_t const first_key_in_batch = idx_batch * batch_size_ak;
             std::iota(keys.begin(), keys.end(), first_key_in_batch);
 
             bool const will_delete = deletes_periodicity_ak ? random_generator() % deletes_periodicity_ak == 0 : 0;
@@ -89,8 +89,8 @@ void insert_atomic_isolated(std::size_t count_batches) {
     blobs_collection_t collection = db.main();
 
     for (std::size_t idx_batch = 0; idx_batch != count_batches; ++idx_batch) {
-        std::array<ukv_key_t, batch_size_ak> keys;
-        ukv_key_t const first_key_in_batch = idx_batch * batch_size_ak;
+        std::array<ustore_key_t, batch_size_ak> keys;
+        ustore_key_t const first_key_in_batch = idx_batch * batch_size_ak;
         std::iota(keys.begin(), keys.end(), first_key_in_batch);
 
         embedded_blobs_t retrieved = collection[keys].value().throw_or_release();
@@ -118,8 +118,8 @@ TEST(db, inserts_and_deletes) {
 
 int main(int argc, char** argv) {
 
-    if (!ukv_supports_transactions_k) {
-        std::printf("Selected UKV Engine doesn't support ACID transactions\n");
+    if (!ustore_supports_transactions_k) {
+        std::printf("Selected UStore Engine doesn't support ACID transactions\n");
         return 1;
     }
 

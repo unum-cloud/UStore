@@ -3,7 +3,7 @@
  * @author Ashot Vardanian
  *
  * @brief Document storage using "nlohmann/JSON" lib.
- * Sits on top of any @see "ukv.h"-compatible system.
+ * Sits on top of any @see "ustore.h"-compatible system.
  */
 
 #include <vector>
@@ -16,7 +16,7 @@
 
 #include <nlohmann/json.hpp>
 
-#include "ukv/media.h"               // `ukv_format_field_type_t`
+#include "ustore/media.h"               // `ustore_format_field_type_t`
 #include "helpers/linked_memory.hpp" // `linked_memory_lock_t`
 #include "helpers/linked_array.hpp"  // `uninitialized_array_gt`
 
@@ -24,7 +24,7 @@
 /*****************	 C++ Implementation	  ****************/
 /*********************************************************/
 
-using namespace unum::ukv;
+using namespace unum::ustore;
 using namespace unum;
 
 using json_t = nlohmann::basic_json< //
@@ -46,8 +46,8 @@ using json_t = nlohmann::basic_json< //
     polymorphic_allocator_gt>;
 using json_ptr_t = json_t::json_pointer;
 
-constexpr ukv_format_field_type_t internal_format_k = ukv_format_msgpack_k;
-// ukv_doc_field_type_t ukv_doc_field_default_k = internal_format_k;
+constexpr ustore_format_field_type_t internal_format_k = ustore_format_msgpack_k;
+// ustore_doc_field_type_t ustore_doc_field_default_k = internal_format_k;
 
 static constexpr char const* true_k = "true";
 static constexpr char const* false_k = "false";
@@ -70,7 +70,7 @@ value_view_t to_view(char const* str, std::size_t len) noexcept {
 struct export_to_value_t final : public nlohmann::detail::output_adapter_protocol<char>,
                                  public std::enable_shared_from_this<export_to_value_t> {
     uninitialized_array_gt<byte_t>* value_ptr = nullptr;
-    ukv_error_t* c_error = nullptr;
+    ustore_error_t* c_error = nullptr;
 
     export_to_value_t() = default;
     export_to_value_t(uninitialized_array_gt<byte_t>& value) noexcept : value_ptr(&value) {}
@@ -88,7 +88,7 @@ struct export_to_value_t final : public nlohmann::detail::output_adapter_protoco
 
 json_t& lookup_field( //
     json_t& json,
-    ukv_str_view_t field,
+    ustore_str_view_t field,
     json_t& default_json) noexcept(false) {
 
     if (!field)
@@ -107,22 +107,22 @@ json_t& lookup_field( //
 
 json_t parse_any( //
     value_view_t bytes,
-    ukv_doc_field_type_t const c.format,
-    ukv_error_t* c_error) noexcept {
+    ustore_doc_field_type_t const c.format,
+    ustore_error_t* c_error) noexcept {
 
     json_t result;
     safe_section("Parsing document", c_error, [&] {
         auto str = reinterpret_cast<char const*>(bytes.begin());
         auto len = bytes.size();
         switch (c.format) {
-        case ukv_format_json_patch_k:
-        case ukv_format_json_merge_patch_k:
-        case ukv_field_json_k: result = json_t::parse(str, str + len, nullptr, false, true); break;
-        case ukv_format_msgpack_k: result = json_t::from_msgpack(str, str + len, false, false); break;
-        case ukv_format_bson_k: result = json_t::from_bson(str, str + len, false, false); break;
-        case ukv_format_cbor_k: result = json_t::from_cbor(str, str + len, false, false); break;
-        case ukv_format_ubjson_k: result = json_t::from_ubjson(str, str + len, false, false); break;
-        case ukv_format_field_default_k:
+        case ustore_format_json_patch_k:
+        case ustore_format_json_merge_patch_k:
+        case ustore_field_json_k: result = json_t::parse(str, str + len, nullptr, false, true); break;
+        case ustore_format_msgpack_k: result = json_t::from_msgpack(str, str + len, false, false); break;
+        case ustore_format_bson_k: result = json_t::from_bson(str, str + len, false, false); break;
+        case ustore_format_cbor_k: result = json_t::from_cbor(str, str + len, false, false); break;
+        case ustore_format_ubjson_k: result = json_t::from_ubjson(str, str + len, false, false); break;
+        case ustore_format_field_default_k:
             result = json_t::binary({reinterpret_cast<std::int8_t const*>(bytes.begin()),
                                      reinterpret_cast<std::int8_t const*>(bytes.end())});
             break;
@@ -141,23 +141,23 @@ json_t parse_any( //
  */
 void dump_any( //
     json_t const& json,
-    ukv_doc_field_type_t const c.format,
+    ustore_doc_field_type_t const c.format,
     std::shared_ptr<export_to_value_t> const& value,
-    ukv_error_t* c_error) noexcept {
+    ustore_error_t* c_error) noexcept {
 
     using text_serializer_t = nlohmann::detail::serializer<json_t>;
     using binary_serializer_t = nlohmann::detail::binary_writer<json_t, char>;
 
     safe_section("Dumping document", c_error, [&] {
         switch (c.format) {
-        case ukv_format_json_patch_k:
-        case ukv_format_json_merge_patch_k:
-        case ukv_field_json_k: return text_serializer_t(value, ' ').dump(json, false, false, 0, 0);
-        case ukv_format_msgpack_k: return binary_serializer_t(value).write_msgpack(json);
-        case ukv_format_bson_k: return binary_serializer_t(value).write_bson(json);
-        case ukv_format_cbor_k: return binary_serializer_t(value).write_cbor(json);
-        case ukv_format_ubjson_k: return binary_serializer_t(value).write_ubjson(json, true, true);
-        case ukv_format_field_default_k: {
+        case ustore_format_json_patch_k:
+        case ustore_format_json_merge_patch_k:
+        case ustore_field_json_k: return text_serializer_t(value, ' ').dump(json, false, false, 0, 0);
+        case ustore_format_msgpack_k: return binary_serializer_t(value).write_msgpack(json);
+        case ustore_format_bson_k: return binary_serializer_t(value).write_bson(json);
+        case ustore_format_cbor_k: return binary_serializer_t(value).write_cbor(json);
+        case ustore_format_ubjson_k: return binary_serializer_t(value).write_ubjson(json, true, true);
+        case ustore_format_field_default_k: {
             switch (json.type()) {
             case json_t::value_t::null: break;
             case json_t::value_t::discarded: break;
@@ -192,7 +192,7 @@ void dump_any( //
 
 struct serializing_tape_ref_t {
 
-    serializing_tape_ref_t(linked_memory_lock_t& a, ukv_error_t* c_error) noexcept
+    serializing_tape_ref_t(linked_memory_lock_t& a, ustore_error_t* c_error) noexcept
         : arena_(a), single_doc_buffer_(a), growing_tape(arena_), c_error(c_error) {
         safe_section("Allocating doc exporter", c_error, [&] {
             using allocator_t = std::pmr::polymorphic_allocator<export_to_value_t>;
@@ -202,15 +202,15 @@ struct serializing_tape_ref_t {
         });
     }
 
-    void push_back(json_t const& doc, ukv_doc_field_type_t c.format) noexcept {
+    void push_back(json_t const& doc, ustore_doc_field_type_t c.format) noexcept {
 
         single_doc_buffer_.clear();
         dump_any(doc, c.format, shared_exporter_, c_error);
         return_if_error_m(c_error);
 
-        if ((c.format == ukv_field_json_k) |        //
-            (c.format == ukv_format_json_patch_k) | //
-            (c.format == ukv_format_json_merge_patch_k)) {
+        if ((c.format == ustore_field_json_k) |        //
+            (c.format == ustore_format_json_patch_k) | //
+            (c.format == ustore_format_json_merge_patch_k)) {
             single_doc_buffer_.push_back(byte_t {0}, c_error);
             return_if_error_m(c_error);
         }
@@ -228,23 +228,23 @@ struct serializing_tape_ref_t {
 
   public:
     growing_tape_t growing_tape;
-    ukv_error_t* c_error = nullptr;
+    ustore_error_t* c_error = nullptr;
 };
 
 template <typename callback_at>
 places_arg_t const& read_unique_docs( //
-    ukv_database_t const c_db,
-    ukv_transaction_t const c_txn,
+    ustore_database_t const c_db,
+    ustore_transaction_t const c_txn,
     places_arg_t const& places,
-    ukv_options_t const c.options,
+    ustore_options_t const c.options,
     linked_memory_lock_t& arena,
-    ukv_error_t* c_error,
+    ustore_error_t* c_error,
     callback_at callback) noexcept {
 
-    ukv_arena_t arena_ptr = &arena;
-    ukv_byte_t* found_binary_begin = nullptr;
-    ukv_length_t* found_binary_offs = nullptr;
-    ukv_read_t read {
+    ustore_arena_t arena_ptr = &arena;
+    ustore_byte_t* found_binary_begin = nullptr;
+    ustore_length_t* found_binary_offs = nullptr;
+    ustore_read_t read {
         .db = c_db,
         .error = c_error,
         .transaction = c_txn,
@@ -259,7 +259,7 @@ places_arg_t const& read_unique_docs( //
         .values = &found_binary_begin,
     };
 
-    ukv_read(&read);
+    ustore_read(&read);
 
     auto found_binaries = joined_blobs_t(places.count, found_binary_offs, found_binary_begin);
     auto found_binary_it = found_binaries.begin();
@@ -272,7 +272,7 @@ places_arg_t const& read_unique_docs( //
         if (*c_error)
             return places;
 
-        ukv_str_view_t field = places.fields_begin ? places.fields_begin[task_idx] : nullptr;
+        ustore_str_view_t field = places.fields_begin ? places.fields_begin[task_idx] : nullptr;
         callback(task_idx, field, parsed);
     }
 
@@ -284,12 +284,12 @@ places_arg_t const& read_unique_docs( //
  */
 template <typename callback_at>
 places_arg_t read_docs( //
-    ukv_database_t const c_db,
-    ukv_transaction_t const c_txn,
+    ustore_database_t const c_db,
+    ustore_transaction_t const c_txn,
     places_arg_t const& places,
-    ukv_options_t const c.options,
+    ustore_options_t const c.options,
     linked_memory_lock_t& arena,
-    ukv_error_t* c_error,
+    ustore_error_t* c_error,
     callback_at callback) {
 
     // Handle the common case of requesting the non-colliding
@@ -315,14 +315,14 @@ places_arg_t read_docs( //
 
     // Otherwise, let's retrieve the sublist of unique docs,
     // which may be in a very different order from original.
-    ukv_arena_t arena_ptr = &arena;
-    ukv_byte_t* found_binary_begin = nullptr;
-    ukv_length_t* found_binary_offs = nullptr;
-    ukv_size_t unique_places_count = static_cast<ukv_size_t>(unique_places.size());
+    ustore_arena_t arena_ptr = &arena;
+    ustore_byte_t* found_binary_begin = nullptr;
+    ustore_length_t* found_binary_offs = nullptr;
+    ustore_size_t unique_places_count = static_cast<ustore_size_t>(unique_places.size());
     auto unique_places_strided = strided_range(unique_places.begin(), unique_places.end()).immutable();
     auto collections = unique_places_strided.members(&collection_key_t::collection);
     auto keys = unique_places_strided.members(&collection_key_t::key);
-    ukv_read_t read {
+    ustore_read_t read {
         .db = c_db,
         .error = c_error,
         .transaction = c_txn,
@@ -337,7 +337,7 @@ places_arg_t read_docs( //
         .values = &found_binary_begin,
     };
 
-    ukv_read(&read);
+    ustore_read(&read);
     if (*c_error)
         return {};
 
@@ -358,7 +358,7 @@ places_arg_t read_docs( //
     // Parse all the unique documents
     auto found_binaries = joined_blobs_t(places.count, found_binary_offs, found_binary_begin);
     auto found_binary_it = found_binaries.begin();
-    for (ukv_size_t doc_idx = 0; doc_idx != unique_places_count; ++doc_idx, ++found_binary_it) {
+    for (ustore_size_t doc_idx = 0; doc_idx != unique_places_count; ++doc_idx, ++found_binary_it) {
         value_view_t binary_doc = *found_binary_it;
         json_t& parsed = (*parsed_docs)[doc_idx];
         parsed = parse_any(binary_doc, internal_format_k, c_error);
@@ -380,14 +380,14 @@ places_arg_t read_docs( //
 }
 
 void replace_docs( //
-    ukv_database_t const c_db,
-    ukv_transaction_t const c_txn,
+    ustore_database_t const c_db,
+    ustore_transaction_t const c_txn,
     places_arg_t const& places,
     contents_arg_t const& contents,
-    ukv_options_t const c.options,
-    ukv_doc_field_type_t const c.format,
+    ustore_options_t const c.options,
+    ustore_doc_field_type_t const c.format,
     linked_memory_lock_t& arena,
-    ukv_error_t* c_error) noexcept {
+    ustore_error_t* c_error) noexcept {
 
     serializing_tape_ref_t serializing_tape {arena, c_error};
     return_if_error_m(c_error);
@@ -411,9 +411,9 @@ void replace_docs( //
     }
 
     auto tape_begin = growing_tape.contents().begin().get();
-    ukv_byte_t* tape_begin_punned = reinterpret_cast<ukv_byte_t*>(tape_begin);
-    ukv_arena_t arena_ptr = &arena;
-    ukv_write_t {
+    ustore_byte_t* tape_begin_punned = reinterpret_cast<ustore_byte_t*>(tape_begin);
+    ustore_arena_t arena_ptr = &arena;
+    ustore_write_t {
         .db = c_db,
         .error = c_error,
         .transaction = c_txn,
@@ -432,21 +432,21 @@ void replace_docs( //
         .values = &tape_begin_punned,
     };
 
-    ukv_write(&write);
+    ustore_write(&write);
 }
 
 void read_modify_write( //
-    ukv_database_t const c_db,
-    ukv_transaction_t const c_txn,
+    ustore_database_t const c_db,
+    ustore_transaction_t const c_txn,
     places_arg_t const& places,
     contents_arg_t const& contents,
-    ukv_options_t const c.options,
-    ukv_doc_field_type_t const c.format,
+    ustore_options_t const c.options,
+    ustore_doc_field_type_t const c.format,
     linked_memory_lock_t& arena,
-    ukv_error_t* c_error) noexcept {
+    ustore_error_t* c_error) noexcept {
 
     serializing_tape_ref_t serializing_tape {arena, c_error};
-    auto safe_callback = [&](ukv_size_t task_idx, ukv_str_view_t field, json_t& parsed) {
+    auto safe_callback = [&](ustore_size_t task_idx, ustore_str_view_t field, json_t& parsed) {
         try {
             json_t parsed_task = parse_any(contents[task_idx], c.format, c_error);
             return_if_error_m(c_error);
@@ -456,12 +456,12 @@ void read_modify_write( //
             json_t& parsed_part = lookup_field(parsed, field, null_object);
             if (&parsed != &null_object) {
                 switch (c.format) {
-                case ukv_format_json_patch_k: parsed_part = parsed_part.patch(parsed_task); break;
-                case ukv_format_json_merge_patch_k: parsed_part.merge_patch(parsed_task); break;
+                case ustore_format_json_patch_k: parsed_part = parsed_part.patch(parsed_task); break;
+                case ustore_format_json_merge_patch_k: parsed_part.merge_patch(parsed_task); break;
                 default: parsed_part = parsed_task; break;
                 }
             }
-            else if (c.format != ukv_format_json_patch_k && c.format != ukv_format_json_merge_patch_k) {
+            else if (c.format != ustore_format_json_patch_k && c.format != ustore_format_json_merge_patch_k) {
                 json_t::string_t heapy_field {field};
                 parsed = parsed.flatten();
                 parsed.emplace(heapy_field, parsed_task);
@@ -486,11 +486,11 @@ void read_modify_write( //
         safe_callback);
 
     // By now, the tape contains concatenated updates docs:
-    ukv_size_t unique_places_count = static_cast<ukv_size_t>(read_order.size());
-    ukv_byte_t* found_binary_begin =
-        reinterpret_cast<ukv_byte_t*>(serializing_tape.growing_tape.contents().begin().get());
-    ukv_arena_t arena_ptr = &arena;
-    ukv_write_t {
+    ustore_size_t unique_places_count = static_cast<ustore_size_t>(read_order.size());
+    ustore_byte_t* found_binary_begin =
+        reinterpret_cast<ustore_byte_t*>(serializing_tape.growing_tape.contents().begin().get());
+    ustore_arena_t arena_ptr = &arena;
+    ustore_write_t {
         .db = c_db,
         .error = c_error,
         .transaction = c_txn,
@@ -509,20 +509,20 @@ void read_modify_write( //
         .values = &found_binary_begin,
     };
 
-    ukv_write(&write);
+    ustore_write(&write);
 }
 
 void parse_fields( //
-    strided_iterator_gt<ukv_str_view_t const> fields,
-    ukv_size_t n,
+    strided_iterator_gt<ustore_str_view_t const> fields,
+    ustore_size_t n,
     heapy_fields_t& fields_parsed,
-    ukv_error_t* c_error) noexcept {
+    ustore_error_t* c_error) noexcept {
 
     try {
         fields_parsed = std::vector<heapy_field_t>(n);
-        ukv_str_view_t joined_fields_ptr = *fields;
-        for (ukv_size_t field_idx = 0; field_idx != n; ++field_idx) {
-            ukv_str_view_t field = fields.repeats() ? joined_fields_ptr : fields[field_idx];
+        ustore_str_view_t joined_fields_ptr = *fields;
+        for (ustore_size_t field_idx = 0; field_idx != n; ++field_idx) {
+            ustore_str_view_t field = fields.repeats() ? joined_fields_ptr : fields[field_idx];
             if (!field && (*c_error = "NULL JSON-Pointers are not allowed!"))
                 return;
 
@@ -543,19 +543,19 @@ void parse_fields( //
     }
 }
 
-void ukv_docs_write(ukv_docs_write_t* c_ptr) {
+void ustore_docs_write(ustore_docs_write_t* c_ptr) {
 
-    ukv_docs_write_t& c = *c_ptr;
+    ustore_docs_write_t& c = *c_ptr;
     linked_memory_lock_t arena = linked_memory(c.arena, c.options, c.error);
     return_if_error_m(c.error);
-    ukv_arena_t new_arena = &arena;
+    ustore_arena_t new_arena = &arena;
 
     // If user wants the entire doc in the same format, as the one we use internally,
     // this request can be passed entirely to the underlying Key-Value store.
-    strided_iterator_gt<ukv_str_view_t const> fields {c.fields, c.fields_stride};
+    strided_iterator_gt<ustore_str_view_t const> fields {c.fields, c.fields_stride};
     auto has_fields = fields && (!fields.repeats() || *fields);
     if (!has_fields && c.format == internal_format_k) {
-        ukv_write_t {
+        ustore_write_t {
             .db = c.db,
             .error = c.error,
             .transaction = c.transaction,
@@ -575,41 +575,41 @@ void ukv_docs_write(ukv_docs_write_t* c_ptr) {
             .values_stride = c.values_stride,
         };
 
-        return ukv_write(&write);
+        return ustore_write(&write);
     }
 
     return_error_if_m(c.db, c.error, uninitialized_state_k, "DataBase is uninitialized");
 
-    strided_iterator_gt<ukv_collection_t const> collections {c.collections, c.collections_stride};
-    strided_iterator_gt<ukv_key_t const> keys {c.keys, c.keys_stride};
-    strided_iterator_gt<ukv_bytes_cptr_t const> vals {c.values, c.values_stride};
-    strided_iterator_gt<ukv_length_t const> offs {c.offsets, c.offsets_stride};
-    strided_iterator_gt<ukv_length_t const> lens {c.lengths, c.lengths_stride};
+    strided_iterator_gt<ustore_collection_t const> collections {c.collections, c.collections_stride};
+    strided_iterator_gt<ustore_key_t const> keys {c.keys, c.keys_stride};
+    strided_iterator_gt<ustore_bytes_cptr_t const> vals {c.values, c.values_stride};
+    strided_iterator_gt<ustore_length_t const> offs {c.offsets, c.offsets_stride};
+    strided_iterator_gt<ustore_length_t const> lens {c.lengths, c.lengths_stride};
     bits_view_t presences {c.presences};
 
     places_arg_t places {collections, keys, fields, c.tasks_count};
     contents_arg_t contents {presences, offs, lens, vals, c.tasks_count};
 
-    auto func = has_fields || c.format == ukv_format_json_patch_k || c.format == ukv_format_json_merge_patch_k
+    auto func = has_fields || c.format == ustore_format_json_patch_k || c.format == ustore_format_json_merge_patch_k
                     ? &read_modify_write
                     : &replace_docs;
 
     func(c.db, c.transaction, places, contents, c.options, c.format, arena, c.error);
 }
 
-void ukv_docs_read(ukv_docs_read_t* c_ptr) {
+void ustore_docs_read(ustore_docs_read_t* c_ptr) {
 
-    ukv_docs_read_t& c = *c_ptr;
+    ustore_docs_read_t& c = *c_ptr;
     linked_memory_lock_t arena = linked_memory(c.arena, c.options, c.error);
     return_if_error_m(c.error);
-    ukv_arena_t new_arena = &arena;
+    ustore_arena_t new_arena = &arena;
 
     // If user wants the entire doc in the same format, as the one we use internally,
     // this request can be passed entirely to the underlying Key-Value store.
-    strided_iterator_gt<ukv_str_view_t const> fields {c.fields, c.fields_stride};
+    strided_iterator_gt<ustore_str_view_t const> fields {c.fields, c.fields_stride};
     auto has_fields = fields && (!fields.repeats() || *fields);
     if (!has_fields && c.format == internal_format_k) {
-        ukv_read_t read {
+        ustore_read_t read {
             .db = c.db,
             .error = c.error,
             .transaction = c.transaction,
@@ -626,13 +626,13 @@ void ukv_docs_read(ukv_docs_read_t* c_ptr) {
             .lengths = c.lengths,
             .values = c.values,
         };
-        return ukv_read(&read);
+        return ustore_read(&read);
     }
 
     return_error_if_m(c.db, c.error, uninitialized_state_k, "DataBase is uninitialized");
 
-    strided_iterator_gt<ukv_collection_t const> collections {c.collections, c.collections_stride};
-    strided_iterator_gt<ukv_key_t const> keys {c.keys, c.keys_stride};
+    strided_iterator_gt<ustore_collection_t const> collections {c.collections, c.collections_stride};
+    strided_iterator_gt<ustore_key_t const> keys {c.keys, c.keys_stride};
     places_arg_t places {collections, keys, fields, c.tasks_count};
 
     // Now, we need to parse all the entries to later export them into a target format.
@@ -642,7 +642,7 @@ void ukv_docs_read(ukv_docs_read_t* c_ptr) {
     return_if_error_m(c.error);
 
     json_t null_object;
-    auto safe_callback = [&](ukv_size_t, ukv_str_view_t field, json_t& parsed) {
+    auto safe_callback = [&](ustore_size_t, ustore_str_view_t field, json_t& parsed) {
         try {
             json_t& parsed_part = lookup_field(parsed, field, null_object);
             serializing_tape.push_back(parsed_part, c.format);
@@ -656,7 +656,7 @@ void ukv_docs_read(ukv_docs_read_t* c_ptr) {
 
     auto serialized_view = serializing_tape.view();
     if (c.values)
-        *c.values = reinterpret_cast<ukv_byte_t*>(serialized_view.contents());
+        *c.values = reinterpret_cast<ustore_byte_t*>(serialized_view.contents());
     if (c.offsets)
         *c.offsets = serialized_view.offsets();
     if (c.lengths)
@@ -667,16 +667,16 @@ void ukv_docs_read(ukv_docs_read_t* c_ptr) {
 /*****************	 Tabular Exports	  ****************/
 /*********************************************************/
 
-void ukv_docs_gist(ukv_docs_gist_t* c_ptr) {
+void ustore_docs_gist(ustore_docs_gist_t* c_ptr) {
 
-    ukv_docs_gist_t& c = *c_ptr;
+    ustore_docs_gist_t& c = *c_ptr;
     linked_memory_lock_t arena = linked_memory(c.arena, c.options, c.error);
     return_if_error_m(c.error);
-    ukv_arena_t new_arena = &arena;
+    ustore_arena_t new_arena = &arena;
 
-    ukv_byte_t* found_binary_begin = nullptr;
-    ukv_length_t* found_binary_offs = nullptr;
-    ukv_read_t read {
+    ustore_byte_t* found_binary_begin = nullptr;
+    ustore_length_t* found_binary_offs = nullptr;
+    ustore_read_t read {
         .db = c.db,
         .error = c.error,
         .transaction = c.transaction,
@@ -692,11 +692,11 @@ void ukv_docs_gist(ukv_docs_gist_t* c_ptr) {
         .values = &found_binary_begin,
     };
 
-    ukv_read(&read);
+    ustore_read(&read);
     return_if_error_m(c.error);
 
-    strided_iterator_gt<ukv_collection_t const> collections {c.collections, c.collections_stride};
-    strided_iterator_gt<ukv_key_t const> keys {c.keys, c.keys_stride};
+    strided_iterator_gt<ustore_collection_t const> collections {c.collections, c.collections_stride};
+    strided_iterator_gt<ustore_key_t const> keys {c.keys, c.keys_stride};
 
     joined_blobs_t found_binaries {c.docs_count, found_binary_offs, found_binary_begin};
     joined_blobs_iterator_t found_binary_it = found_binaries.begin();
@@ -705,7 +705,7 @@ void ukv_docs_gist(ukv_docs_gist_t* c_ptr) {
     std::optional<std::unordered_set<std::string>> paths;
     try {
         paths = std::unordered_set<std::string> {};
-        for (ukv_size_t doc_idx = 0; doc_idx != c.docs_count; ++doc_idx, ++found_binary_it) {
+        for (ustore_size_t doc_idx = 0; doc_idx != c.docs_count; ++doc_idx, ++found_binary_it) {
             value_view_t binary_doc = *found_binary_it;
             json_t parsed = parse_any(binary_doc, internal_format_k, c.error);
             return_if_error_m(c.error);
@@ -722,11 +722,11 @@ void ukv_docs_gist(ukv_docs_gist_t* c_ptr) {
     }
 
     // Estimate the final memory consumption on-tape and export offsets
-    auto offs = arena.alloc<ukv_length_t>(paths->size() + 1, c.error);
+    auto offs = arena.alloc<ustore_length_t>(paths->size() + 1, c.error);
     return_if_error_m(c.error);
 
     std::size_t path_idx = 0;
-    ukv_length_t total_length = 0;
+    ustore_length_t total_length = 0;
     for (auto const& path : *paths) {
         offs[path_idx] = total_length;
         total_length += path.size() + 1;
@@ -743,45 +743,45 @@ void ukv_docs_gist(ukv_docs_gist_t* c_ptr) {
     for (auto const& path : *paths)
         std::memcpy(std::exchange(tape_ptr, tape_ptr + path.size() + 1), path.c_str(), path.size() + 1);
 
-    *c.fields_count = static_cast<ukv_size_t>(paths->size());
-    *c.offsets = reinterpret_cast<ukv_length_t*>(offs.begin());
-    *c.fields = reinterpret_cast<ukv_char_t*>(tape.begin());
+    *c.fields_count = static_cast<ustore_size_t>(paths->size());
+    *c.offsets = reinterpret_cast<ustore_length_t*>(offs.begin());
+    *c.fields = reinterpret_cast<ustore_char_t*>(tape.begin());
 }
 
-std::size_t min_memory_usage(ukv_doc_field_type_t type) {
+std::size_t min_memory_usage(ustore_doc_field_type_t type) {
     switch (type) {
     default: return 0;
-    case ukv_doc_field_null_k: return 0;
-    case ukv_doc_field_bool_k: return 1;
-    case ukv_doc_field_uuid_k: return 16;
+    case ustore_doc_field_null_k: return 0;
+    case ustore_doc_field_bool_k: return 1;
+    case ustore_doc_field_uuid_k: return 16;
 
-    case ukv_doc_field_i8_k: return 1;
-    case ukv_doc_field_i16_k: return 2;
-    case ukv_doc_field_i32_k: return 4;
-    case ukv_doc_field_i64_k: return 8;
+    case ustore_doc_field_i8_k: return 1;
+    case ustore_doc_field_i16_k: return 2;
+    case ustore_doc_field_i32_k: return 4;
+    case ustore_doc_field_i64_k: return 8;
 
-    case ukv_doc_field_u8_k: return 1;
-    case ukv_doc_field_u16_k: return 2;
-    case ukv_doc_field_u32_k: return 4;
-    case ukv_doc_field_u64_k: return 8;
+    case ustore_doc_field_u8_k: return 1;
+    case ustore_doc_field_u16_k: return 2;
+    case ustore_doc_field_u32_k: return 4;
+    case ustore_doc_field_u64_k: return 8;
 
-    case ukv_doc_field_f16_k: return 2;
-    case ukv_doc_field_f32_k: return 4;
-    case ukv_doc_field_f64_k: return 8;
+    case ustore_doc_field_f16_k: return 2;
+    case ustore_doc_field_f32_k: return 4;
+    case ustore_doc_field_f64_k: return 8;
 
     // Offsets and lengths:
-    case ukv_doc_field_bin_k: return 8;
-    case ukv_doc_field_str_k: return 8;
+    case ustore_doc_field_bin_k: return 8;
+    case ustore_doc_field_str_k: return 8;
     }
 }
 
 struct column_begin_t {
-    ukv_octet_t* validities;
-    ukv_octet_t* conversions;
-    ukv_octet_t* collisions;
-    ukv_byte_t* scalars;
-    ukv_length_t* str_offsets;
-    ukv_length_t* str_lengths;
+    ustore_octet_t* validities;
+    ustore_octet_t* conversions;
+    ustore_octet_t* collisions;
+    ustore_byte_t* scalars;
+    ustore_length_t* str_offsets;
+    ustore_length_t* str_lengths;
 };
 
 template <typename at>
@@ -834,10 +834,10 @@ void export_scalar_column(json_t const& value, size_t doc_idx, column_begin_t co
 
     // Bitmaps are indexed from the last bit within every byte
     // https://arrow.apache.org/docs/format/Columnar.html#validity-bitmaps
-    ukv_octet_t mask_bitmap = static_cast<ukv_octet_t>(1 << (doc_idx % CHAR_BIT));
-    ukv_octet_t& ref_valid = column.validities[doc_idx / CHAR_BIT];
-    ukv_octet_t& ref_convert = column.conversions[doc_idx / CHAR_BIT];
-    ukv_octet_t& ref_collide = column.collisions[doc_idx / CHAR_BIT];
+    ustore_octet_t mask_bitmap = static_cast<ustore_octet_t>(1 << (doc_idx % CHAR_BIT));
+    ustore_octet_t& ref_valid = column.validities[doc_idx / CHAR_BIT];
+    ustore_octet_t& ref_convert = column.conversions[doc_idx / CHAR_BIT];
+    ustore_octet_t& ref_collide = column.collisions[doc_idx / CHAR_BIT];
     scalar_at& ref_scalar = reinterpret_cast<scalar_at*>(column.scalars)[doc_idx];
 
     switch (value.type()) {
@@ -924,7 +924,7 @@ void export_scalar_column(json_t const& value, size_t doc_idx, column_begin_t co
 }
 
 template <typename scalar_at, typename alloc_at = std::allocator<scalar_at>>
-ukv_length_t print_scalar(scalar_at scalar, std::vector<byte_t, alloc_at>& output) {
+ustore_length_t print_scalar(scalar_at scalar, std::vector<byte_t, alloc_at>& output) {
 
     /// The length of buffer to be used to convert/format/print numerical values into strings.
     constexpr std::size_t print_buf_len_k = 32;
@@ -937,10 +937,10 @@ ukv_length_t print_scalar(scalar_at scalar, std::vector<byte_t, alloc_at>& outpu
         *result.ptr = '\0';
         auto view = to_view(print_buf, result.ptr + 1 - print_buf);
         output.insert(output.end(), view.begin(), view.end());
-        return static_cast<ukv_length_t>(view.size());
+        return static_cast<ustore_length_t>(view.size());
     }
     else
-        return ukv_length_missing_k;
+        return ustore_length_missing_k;
 }
 
 template <typename alloc_at = std::allocator<byte_t>>
@@ -951,21 +951,21 @@ void export_string_column(json_t const& value,
 
     // Bitmaps are indexed from the last bit within every byte
     // https://arrow.apache.org/docs/format/Columnar.html#validity-bitmaps
-    ukv_octet_t mask_bitmap = static_cast<ukv_octet_t>(1 << (doc_idx % CHAR_BIT));
-    ukv_octet_t& ref_valid = column.validities[doc_idx / CHAR_BIT];
-    ukv_octet_t& ref_convert = column.conversions[doc_idx / CHAR_BIT];
-    ukv_octet_t& ref_collide = column.collisions[doc_idx / CHAR_BIT];
-    ukv_length_t& ref_off = column.str_offsets[doc_idx];
-    ukv_length_t& ref_len = column.str_lengths[doc_idx];
+    ustore_octet_t mask_bitmap = static_cast<ustore_octet_t>(1 << (doc_idx % CHAR_BIT));
+    ustore_octet_t& ref_valid = column.validities[doc_idx / CHAR_BIT];
+    ustore_octet_t& ref_convert = column.conversions[doc_idx / CHAR_BIT];
+    ustore_octet_t& ref_collide = column.collisions[doc_idx / CHAR_BIT];
+    ustore_length_t& ref_off = column.str_offsets[doc_idx];
+    ustore_length_t& ref_len = column.str_lengths[doc_idx];
 
-    ref_off = static_cast<ukv_length_t>(output.size());
+    ref_off = static_cast<ustore_length_t>(output.size());
 
     switch (value.type()) {
     case json_t::value_t::null:
         ref_convert &= ~mask_bitmap;
         ref_collide &= ~mask_bitmap;
         ref_valid &= ~mask_bitmap;
-        ref_off = ref_len = ukv_length_missing_k;
+        ref_off = ref_len = ustore_length_missing_k;
         break;
     case json_t::value_t::discarded:
     case json_t::value_t::object:
@@ -973,12 +973,12 @@ void export_string_column(json_t const& value,
         ref_convert &= ~mask_bitmap;
         ref_collide |= mask_bitmap;
         ref_valid &= ~mask_bitmap;
-        ref_off = ref_len = ukv_length_missing_k;
+        ref_off = ref_len = ustore_length_missing_k;
         break;
 
     case json_t::value_t::binary: {
         json_t::binary_t const& str = value.get_ref<json_t::binary_t const&>();
-        ref_len = static_cast<ukv_length_t>(str.size());
+        ref_len = static_cast<ustore_length_t>(str.size());
         auto view = to_view((char*)str.data(), str.size());
         output.insert(output.end(), view.begin(), view.end());
         ref_convert &= ~mask_bitmap;
@@ -988,7 +988,7 @@ void export_string_column(json_t const& value,
     }
     case json_t::value_t::string: {
         json_t::string_t const& str = value.get_ref<json_t::string_t const&>();
-        ref_len = static_cast<ukv_length_t>(str.size());
+        ref_len = static_cast<ustore_length_t>(str.size());
         auto view = to_view((char*)str.data(), str.size() + 1);
         output.insert(output.end(), view.begin(), view.end());
         ref_convert &= ~mask_bitmap;
@@ -1017,37 +1017,37 @@ void export_string_column(json_t const& value,
     case json_t::value_t::number_integer:
         ref_len = print_scalar(value.get<json_t::number_integer_t>(), output);
         ref_convert |= mask_bitmap;
-        ref_collide = ref_len != ukv_length_missing_k ? (ref_collide & ~mask_bitmap) : (ref_collide | mask_bitmap);
-        ref_valid = ref_len == ukv_length_missing_k ? (ref_valid & ~mask_bitmap) : (ref_valid | mask_bitmap);
+        ref_collide = ref_len != ustore_length_missing_k ? (ref_collide & ~mask_bitmap) : (ref_collide | mask_bitmap);
+        ref_valid = ref_len == ustore_length_missing_k ? (ref_valid & ~mask_bitmap) : (ref_valid | mask_bitmap);
         break;
 
     case json_t::value_t::number_unsigned:
         ref_len = print_scalar(value.get<json_t::number_unsigned_t>(), output);
         ref_convert |= mask_bitmap;
-        ref_collide = ref_len != ukv_length_missing_k ? (ref_collide & ~mask_bitmap) : (ref_collide | mask_bitmap);
-        ref_valid = ref_len == ukv_length_missing_k ? (ref_valid & ~mask_bitmap) : (ref_valid | mask_bitmap);
+        ref_collide = ref_len != ustore_length_missing_k ? (ref_collide & ~mask_bitmap) : (ref_collide | mask_bitmap);
+        ref_valid = ref_len == ustore_length_missing_k ? (ref_valid & ~mask_bitmap) : (ref_valid | mask_bitmap);
         break;
     case json_t::value_t::number_float:
         ref_len = print_scalar(value.get<json_t::number_float_t>(), output);
         ref_convert |= mask_bitmap;
-        ref_collide = ref_len != ukv_length_missing_k ? (ref_collide & ~mask_bitmap) : (ref_collide | mask_bitmap);
-        ref_valid = ref_len == ukv_length_missing_k ? (ref_valid & ~mask_bitmap) : (ref_valid | mask_bitmap);
+        ref_collide = ref_len != ustore_length_missing_k ? (ref_collide & ~mask_bitmap) : (ref_collide | mask_bitmap);
+        ref_valid = ref_len == ustore_length_missing_k ? (ref_valid & ~mask_bitmap) : (ref_valid | mask_bitmap);
         break;
     }
 }
 
-void ukv_docs_gather(ukv_docs_gather_t* c_ptr) {
+void ustore_docs_gather(ustore_docs_gather_t* c_ptr) {
 
-    ukv_docs_gather_t& c = *c_ptr;
+    ustore_docs_gather_t& c = *c_ptr;
     linked_memory_lock_t arena = linked_memory(c.arena, c.options, c.error);
     return_if_error_m(c.error);
-    ukv_arena_t new_arena = &arena;
+    ustore_arena_t new_arena = &arena;
     // Validate the input arguments
 
     // Retrieve the entire documents before we can sample internal fields
-    ukv_byte_t* found_binary_begin = nullptr;
-    ukv_length_t* found_binary_offs = nullptr;
-    ukv_read_t read {
+    ustore_byte_t* found_binary_begin = nullptr;
+    ustore_length_t* found_binary_offs = nullptr;
+    ustore_read_t read {
         .db = c.db,
         .error = c.error,
         .transaction = c.transaction,
@@ -1063,13 +1063,13 @@ void ukv_docs_gather(ukv_docs_gather_t* c_ptr) {
         .values = &found_binary_begin,
     };
 
-    ukv_read(&read);
+    ustore_read(&read);
     return_if_error_m(c.error);
 
-    strided_iterator_gt<ukv_collection_t const> collections {c.collections, c.collections_stride};
-    strided_iterator_gt<ukv_key_t const> keys {c.keys, c.keys_stride};
-    strided_iterator_gt<ukv_str_view_t const> fields {c.fields, c.fields_stride};
-    strided_iterator_gt<ukv_doc_field_type_t const> types {c.types, c.types_stride};
+    strided_iterator_gt<ustore_collection_t const> collections {c.collections, c.collections_stride};
+    strided_iterator_gt<ustore_key_t const> keys {c.keys, c.keys_stride};
+    strided_iterator_gt<ustore_str_view_t const> fields {c.fields, c.fields_stride};
+    strided_iterator_gt<ustore_doc_field_type_t const> types {c.types, c.types_stride};
 
     joined_blobs_t found_binaries {c.docs_count, found_binary_offs, found_binary_begin};
     joined_blobs_iterator_t found_binary_it = found_binaries.begin();
@@ -1088,7 +1088,7 @@ void ukv_docs_gather(ukv_docs_gather_t* c_ptr) {
     bool wants_collisions = c.result_bitmap_collision;
     std::size_t slots_per_bitmap = c.docs_count / 8 + (c.docs_count % 8 != 0);
     std::size_t count_bitmaps = 1ul + wants_conversions + wants_collisions;
-    std::size_t bytes_per_bitmap = sizeof(ukv_octet_t) * slots_per_bitmap;
+    std::size_t bytes_per_bitmap = sizeof(ustore_octet_t) * slots_per_bitmap;
     std::size_t bytes_per_addresses_row = sizeof(void*) * c.fields_count;
     std::size_t bytes_for_addresses = bytes_per_addresses_row * 6;
     std::size_t bytes_for_bitmaps = bytes_per_bitmap * count_bitmaps * c.fields_count * c.fields_count;
@@ -1111,32 +1111,32 @@ void ukv_docs_gather(ukv_docs_gather_t* c_ptr) {
     // It will allow us to avoid extra checks later.
     // ! Still, in every sequence of updates, validity is the last bit to be set,
     // ! to avoid overwriting.
-    auto first_collection_validities = reinterpret_cast<ukv_octet_t*>(tape_ptr + bytes_for_addresses);
+    auto first_collection_validities = reinterpret_cast<ustore_octet_t*>(tape_ptr + bytes_for_addresses);
     auto first_collection_conversions = wants_conversions //
                                             ? first_collection_validities + slots_per_bitmap * c.fields_count
                                             : first_collection_validities;
     auto first_collection_collisions = wants_collisions //
                                            ? first_collection_conversions + slots_per_bitmap * c.fields_count
                                            : first_collection_validities;
-    auto first_collection_scalars = reinterpret_cast<ukv_byte_t*>(tape_ptr + bytes_for_addresses + bytes_for_bitmaps);
+    auto first_collection_scalars = reinterpret_cast<ustore_byte_t*>(tape_ptr + bytes_for_addresses + bytes_for_bitmaps);
 
     // 1, 2, 3. Export validity maps addresses
     std::size_t tape_progress = 0;
     {
-        auto addresses = *c.result_bitmap_valid = reinterpret_cast<ukv_octet_t**>(tape_ptr + tape_progress);
-        for (ukv_size_t field_idx = 0; field_idx != c.fields_count; ++field_idx)
+        auto addresses = *c.result_bitmap_valid = reinterpret_cast<ustore_octet_t**>(tape_ptr + tape_progress);
+        for (ustore_size_t field_idx = 0; field_idx != c.fields_count; ++field_idx)
             addresses[field_idx] = first_collection_validities + field_idx * slots_per_bitmap;
         tape_progress += bytes_per_addresses_row;
     }
     if (wants_conversions) {
-        auto addresses = *c.result_bitmap_converted = reinterpret_cast<ukv_octet_t**>(tape_ptr + tape_progress);
-        for (ukv_size_t field_idx = 0; field_idx != c.fields_count; ++field_idx)
+        auto addresses = *c.result_bitmap_converted = reinterpret_cast<ustore_octet_t**>(tape_ptr + tape_progress);
+        for (ustore_size_t field_idx = 0; field_idx != c.fields_count; ++field_idx)
             addresses[field_idx] = first_collection_conversions + field_idx * slots_per_bitmap;
         tape_progress += bytes_per_addresses_row;
     }
     if (wants_collisions) {
-        auto addresses = *c.result_bitmap_collision = reinterpret_cast<ukv_octet_t**>(tape_ptr + tape_progress);
-        for (ukv_size_t field_idx = 0; field_idx != c.fields_count; ++field_idx)
+        auto addresses = *c.result_bitmap_collision = reinterpret_cast<ustore_octet_t**>(tape_ptr + tape_progress);
+        for (ustore_size_t field_idx = 0; field_idx != c.fields_count; ++field_idx)
             addresses[field_idx] = first_collection_collisions + field_idx * slots_per_bitmap;
         tape_progress += bytes_per_addresses_row;
     }
@@ -1144,26 +1144,26 @@ void ukv_docs_gather(ukv_docs_gather_t* c_ptr) {
     // 4, 5, 6. Export addresses for scalars, strings offsets and strings lengths
     {
         auto addresses_offs = *c.result_strs_offsets =
-            reinterpret_cast<ukv_length_t**>(tape_ptr + tape_progress + bytes_per_addresses_row * 0);
+            reinterpret_cast<ustore_length_t**>(tape_ptr + tape_progress + bytes_per_addresses_row * 0);
         auto addresses_lens = *c.result_strs_lengths =
-            reinterpret_cast<ukv_length_t**>(tape_ptr + tape_progress + bytes_per_addresses_row * 1);
+            reinterpret_cast<ustore_length_t**>(tape_ptr + tape_progress + bytes_per_addresses_row * 1);
         auto addresses_scalars = *c.result_scalars =
-            reinterpret_cast<ukv_byte_t**>(tape_ptr + tape_progress + bytes_per_addresses_row * 2);
+            reinterpret_cast<ustore_byte_t**>(tape_ptr + tape_progress + bytes_per_addresses_row * 2);
 
         auto scalars_tape = first_collection_scalars;
-        for (ukv_size_t field_idx = 0; field_idx != c.fields_count; ++field_idx) {
-            ukv_doc_field_type_t type = types[field_idx];
+        for (ustore_size_t field_idx = 0; field_idx != c.fields_count; ++field_idx) {
+            ustore_doc_field_type_t type = types[field_idx];
             switch (type) {
-            case ukv_doc_field_str_k:
-            case ukv_doc_field_bin_k:
-                addresses_offs[field_idx] = reinterpret_cast<ukv_length_t*>(scalars_tape);
+            case ustore_doc_field_str_k:
+            case ustore_doc_field_bin_k:
+                addresses_offs[field_idx] = reinterpret_cast<ustore_length_t*>(scalars_tape);
                 addresses_lens[field_idx] = addresses_offs[field_idx] + c.docs_count;
                 addresses_scalars[field_idx] = nullptr;
                 break;
             default:
                 addresses_offs[field_idx] = nullptr;
                 addresses_lens[field_idx] = nullptr;
-                addresses_scalars[field_idx] = reinterpret_cast<ukv_byte_t*>(scalars_tape);
+                addresses_scalars[field_idx] = reinterpret_cast<ustore_byte_t*>(scalars_tape);
                 break;
             }
             scalars_tape += min_memory_usage(type) * c.docs_count;
@@ -1175,15 +1175,15 @@ void ukv_docs_gather(ukv_docs_gather_t* c_ptr) {
 
     std::pmr::vector<byte_t> string_tape(&arena.resource);
     // Go though all the documents extracting and type-checking the relevant parts
-    for (ukv_size_t doc_idx = 0; doc_idx != c.docs_count; ++doc_idx, ++found_binary_it) {
+    for (ustore_size_t doc_idx = 0; doc_idx != c.docs_count; ++doc_idx, ++found_binary_it) {
         value_view_t binary_doc = *found_binary_it;
         json_t parsed = parse_any(binary_doc, internal_format_k, c.error);
         return_if_error_m(c.error);
 
-        for (ukv_size_t field_idx = 0; field_idx != c.fields_count; ++field_idx) {
+        for (ustore_size_t field_idx = 0; field_idx != c.fields_count; ++field_idx) {
 
             // Find this field within document
-            ukv_doc_field_type_t type = types[field_idx];
+            ustore_doc_field_type_t type = types[field_idx];
             heapy_field_t const& name_or_path = (*heapy_fields)[field_idx];
             json_t::iterator found_value_it = parsed.end();
             json_t const& found_value =
@@ -1210,28 +1210,28 @@ void ukv_docs_gather(ukv_docs_gather_t* c_ptr) {
             // Export the types
             switch (type) {
 
-            case ukv_doc_field_bool_k: export_scalar_column<bool>(found_value, doc_idx, column); break;
+            case ustore_doc_field_bool_k: export_scalar_column<bool>(found_value, doc_idx, column); break;
 
-            case ukv_doc_field_i8_k: export_scalar_column<std::int8_t>(found_value, doc_idx, column); break;
-            case ukv_doc_field_i16_k: export_scalar_column<std::int16_t>(found_value, doc_idx, column); break;
-            case ukv_doc_field_i32_k: export_scalar_column<std::int32_t>(found_value, doc_idx, column); break;
-            case ukv_doc_field_i64_k: export_scalar_column<std::int64_t>(found_value, doc_idx, column); break;
+            case ustore_doc_field_i8_k: export_scalar_column<std::int8_t>(found_value, doc_idx, column); break;
+            case ustore_doc_field_i16_k: export_scalar_column<std::int16_t>(found_value, doc_idx, column); break;
+            case ustore_doc_field_i32_k: export_scalar_column<std::int32_t>(found_value, doc_idx, column); break;
+            case ustore_doc_field_i64_k: export_scalar_column<std::int64_t>(found_value, doc_idx, column); break;
 
-            case ukv_doc_field_u8_k: export_scalar_column<std::uint8_t>(found_value, doc_idx, column); break;
-            case ukv_doc_field_u16_k: export_scalar_column<std::uint16_t>(found_value, doc_idx, column); break;
-            case ukv_doc_field_u32_k: export_scalar_column<std::uint32_t>(found_value, doc_idx, column); break;
-            case ukv_doc_field_u64_k: export_scalar_column<std::uint64_t>(found_value, doc_idx, column); break;
+            case ustore_doc_field_u8_k: export_scalar_column<std::uint8_t>(found_value, doc_idx, column); break;
+            case ustore_doc_field_u16_k: export_scalar_column<std::uint16_t>(found_value, doc_idx, column); break;
+            case ustore_doc_field_u32_k: export_scalar_column<std::uint32_t>(found_value, doc_idx, column); break;
+            case ustore_doc_field_u64_k: export_scalar_column<std::uint64_t>(found_value, doc_idx, column); break;
 
-            case ukv_doc_field_f32_k: export_scalar_column<float>(found_value, doc_idx, column); break;
-            case ukv_doc_field_f64_k: export_scalar_column<double>(found_value, doc_idx, column); break;
+            case ustore_doc_field_f32_k: export_scalar_column<float>(found_value, doc_idx, column); break;
+            case ustore_doc_field_f64_k: export_scalar_column<double>(found_value, doc_idx, column); break;
 
-            case ukv_doc_field_str_k: export_string_column(found_value, doc_idx, column, string_tape); break;
-            case ukv_doc_field_bin_k: export_string_column(found_value, doc_idx, column, string_tape); break;
+            case ustore_doc_field_str_k: export_string_column(found_value, doc_idx, column, string_tape); break;
+            case ustore_doc_field_bin_k: export_string_column(found_value, doc_idx, column, string_tape); break;
 
             default: break;
             }
         }
     }
 
-    *c.joined_strings = reinterpret_cast<ukv_byte_t*>(string_tape.data());
+    *c.joined_strings = reinterpret_cast<ustore_byte_t*>(string_tape.data());
 }

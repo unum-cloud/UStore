@@ -1,6 +1,6 @@
 #pragma once
 
-namespace unum::ukv {
+namespace unum::ustore {
 
 /**
  * @brief TODO: A hybrid `shared_mutex` with upgrade and downgrade ability.
@@ -14,4 +14,4 @@ namespace unum::ukv {
  */
 struct shared_mutex_t {};
 
-} // namespace unum::ukv
+} // namespace unum::ustore

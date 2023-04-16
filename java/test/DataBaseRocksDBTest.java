@@ -4,7 +4,7 @@ import java.util.Arrays;
 
 import org.junit.Test;
 
-import cloud.unum.ukv.DataBaseRocksDB;
+import cloud.unum.ustore.DataBaseRocksDB;
 
 public class DataBaseRocksDBTest {
     static {

@@ -11,7 +11,7 @@ set(Boost_USE_MULTITHREADED ON)
 # https://cmake.org/cmake/help/latest/module/FindBoost.html
 # We need to build some Boost libraries, just fetching headers won't be enough.
 # https://stackoverflow.com/a/13604163/2766161
-if(NOT ${UKV_REBUILD_BOOST})
+if(NOT ${USTORE_REBUILD_BOOST})
     find_package(Boost 1.71.0)
 
 else()

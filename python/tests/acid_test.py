@@ -1,13 +1,13 @@
 
 import pytest
-import ukv.umem as ukv
+import ustore.ucset as ustore
 
 
 def test_transaction_set():
     keys_count = 100
-    db = ukv.DataBase()
+    db = ustore.DataBase()
 
-    with ukv.Transaction(db) as txn:
+    with ustore.Transaction(db) as txn:
         for index in range(keys_count):
             txn.main.set(index, str(index).encode())
     for index in range(keys_count):
@@ -16,11 +16,11 @@ def test_transaction_set():
 
 def test_transaction_remove():
     keys_count = 100
-    db = ukv.DataBase()
+    db = ustore.DataBase()
     for index in range(keys_count):
         db.main.set(index, str(index).encode())
 
-    with ukv.Transaction(db) as txn:
+    with ustore.Transaction(db) as txn:
         for index in range(keys_count):
             txn.main.pop(index)
     for index in range(keys_count):
@@ -30,9 +30,9 @@ def test_transaction_remove():
 def test_set_with_2_transactions():
     keys_count = 100
 
-    db = ukv.DataBase()
-    txn1 = ukv.Transaction(db)
-    txn2 = ukv.Transaction(db)
+    db = ustore.DataBase()
+    txn1 = ustore.Transaction(db)
+    txn2 = ustore.Transaction(db)
 
     for index in range(0, keys_count, 2):
         txn1.main.set(index, str(index).encode())
@@ -49,12 +49,12 @@ def test_set_with_2_transactions():
 def test_remove_with_2_transactions():
     keys_count = 100
 
-    db = ukv.DataBase()
+    db = ustore.DataBase()
     for index in range(keys_count):
         db.main.set(index, str(index).encode())
 
-    txn1 = ukv.Transaction(db)
-    txn2 = ukv.Transaction(db)
+    txn1 = ustore.Transaction(db)
+    txn2 = ustore.Transaction(db)
     for index in range(0, keys_count, 2):
         txn1.main.pop(index)
     for index in range(1, keys_count, 2):
@@ -70,9 +70,9 @@ def test_remove_with_2_transactions():
 def test_set_with_2_interleaving_transactions():
     keys_count = 100
 
-    db = ukv.DataBase()
-    txn1 = ukv.Transaction(db)
-    txn2 = ukv.Transaction(db)
+    db = ustore.DataBase()
+    txn1 = ustore.Transaction(db)
+    txn2 = ustore.Transaction(db)
 
     for index in range(keys_count):
         txn1.main.set(index, 'a'.encode())
@@ -87,12 +87,12 @@ def test_set_with_2_interleaving_transactions():
 def test_remove_with_2_interleaving_transactions():
     keys_count = 100
 
-    db = ukv.DataBase()
+    db = ustore.DataBase()
     for index in range(keys_count):
         db.main.set(index, str(index).encode())
 
-    txn1 = ukv.Transaction(db)
-    txn2 = ukv.Transaction(db)
+    txn1 = ustore.Transaction(db)
+    txn2 = ustore.Transaction(db)
     for index in range(keys_count):
         txn1.main.pop(index)
     with pytest.raises(Exception):
@@ -106,9 +106,9 @@ def test_remove_with_2_interleaving_transactions():
 def test_transaction_with_multiple_collections():
     col_count = 100
     keys_count = 100
-    db = ukv.DataBase()
+    db = ustore.DataBase()
 
-    with ukv.Transaction(db) as txn:
+    with ustore.Transaction(db) as txn:
         for col_index in range(col_count):
             col_name = str(col_index)
 
@@ -137,7 +137,7 @@ def test_transaction_with_multiple_collections():
             assert db[col_name][key_index] == value
 
     # Let's make sure, that updates are visible to other transactions
-    with ukv.Transaction(db) as txn:
+    with ustore.Transaction(db) as txn:
         for col_index in range(col_count):
             col_name = str(col_index)
 
@@ -150,18 +150,18 @@ def test_transaction_with_multiple_collections():
 
 
 def test_conflict():
-    db = ukv.DataBase()
-    txn1 = ukv.Transaction(db)
+    db = ustore.DataBase()
+    txn1 = ustore.Transaction(db)
     txn1.main.get(0)
-    with ukv.Transaction(db) as txn2:
+    with ustore.Transaction(db) as txn2:
         txn2.main.set(0, 'value'.encode())
     with pytest.raises(Exception):
         txn1.commit()
 
 
 def test_dont_watch():
-    db = ukv.DataBase()
-    txn = ukv.Transaction(db, watch=False)
+    db = ustore.DataBase()
+    txn = ustore.Transaction(db, watch=False)
     txn.main.get(0)
     db.main.set(0, 'value'.encode())
     txn.commit()

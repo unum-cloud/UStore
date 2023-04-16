@@ -1,10 +1,10 @@
 """
-Compares the simplest usage of `dict` and `Collection`-s from UKV.
+Compares the simplest usage of `dict` and `Collection`-s from UStore.
 Benchmarks basic and batch consistent operations against native Python.
 """
 from time import perf_counter
 
-import ukv.umem as ukv
+import ustore.ucset as ustore
 import numpy as np
 from random import sample
 
@@ -24,7 +24,7 @@ for key in keys:
 
 t2 = perf_counter()
 
-db = ukv.DataBase()
+db = ustore.DataBase()
 acid_dict = db.main
 for key in keys:
     acid_dict[key] = value

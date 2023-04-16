@@ -14,7 +14,7 @@ It's feature-rich, but not the most performant, supporting:
 Using it can be as easy as:
 
 ```python
-import ustore.umem as ustore
+import ustore.ucset as ustore
 # import ustore.udisk as ustore
 # import ustore.leveldb as ustore
 # import ustore.rocksdb as ustore

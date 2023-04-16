@@ -1,4 +1,4 @@
-import ukv.umem as ukv
+import ustore.ucset as ustore
 import numpy as np
 
 
@@ -29,12 +29,12 @@ def lower_triangular(col):
 
 
 def test_main_collection():
-    db = ukv.DataBase()
+    db = ustore.DataBase()
     lower_triangular(db.main)
 
 
 def test_main_collection_txn():
 
-    with ukv.DataBase() as db:
-        with ukv.Transaction(db) as txn:
+    with ustore.DataBase() as db:
+        with ustore.Transaction(db) as txn:
             lower_triangular(txn.main)

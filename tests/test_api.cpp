@@ -4,20 +4,20 @@
 #include <gtest/gtest.h>
 #include <fmt/format.h>
 
-#include "ukv/ukv.hpp"
+#include "ustore/ustore.hpp"
 
-using namespace unum::ukv;
+using namespace unum::ustore;
 using namespace unum;
 
 static char const* path() {
-    char* path = std::getenv("UKV_TEST_PATH");
+    char* path = std::getenv("USTORE_TEST_PATH");
     if (path)
         return std::strlen(path) ? path : nullptr;
 
-#if defined(UKV_FLIGHT_CLIENT)
+#if defined(USTORE_FLIGHT_CLIENT)
     return nullptr;
-#elif defined(UKV_TEST_PATH)
-    return UKV_TEST_PATH;
+#elif defined(USTORE_TEST_PATH)
+    return USTORE_TEST_PATH;
 #else
     return nullptr;
 #endif
@@ -37,15 +37,15 @@ TEST(db, validation) {
     blobs_collection_t collection = db.main();
     blobs_collection_t named_collection = *db.find_or_create("col");
     transaction_t txn = *db.transact();
-    std::vector<ukv_key_t> keys {34, 35, 36};
+    std::vector<ustore_key_t> keys {34, 35, 36};
     std::vector<std::uint64_t> vals {34, 35, 36};
-    ukv_length_t val_len = sizeof(std::uint64_t);
-    std::vector<ukv_length_t> offs {0, val_len, val_len * 2};
-    auto vals_begin = reinterpret_cast<ukv_bytes_ptr_t>(vals.data());
-    constexpr ukv_length_t count = 3;
+    ustore_length_t val_len = sizeof(std::uint64_t);
+    std::vector<ustore_length_t> offs {0, val_len, val_len * 2};
+    auto vals_begin = reinterpret_cast<ustore_bytes_ptr_t>(vals.data());
+    constexpr ustore_length_t count = 3;
 
     contents_arg_t values {
-        .offsets_begin = {offs.data(), sizeof(ukv_length_t)},
+        .offsets_begin = {offs.data(), sizeof(ustore_length_t)},
         .lengths_begin = {&val_len, 0},
         .contents_begin = {&vals_begin, 0},
         .count = count,
@@ -57,16 +57,16 @@ TEST(db, validation) {
     auto lengths = value_extractor_t {}.lengths(values);
 
     status_t status;
-    std::vector<ukv_options_t> options {ukv_options_default_k, ukv_option_write_flush_k};
+    std::vector<ustore_options_t> options {ustore_options_default_k, ustore_option_write_flush_k};
 
-    ukv_write_t write_options {
+    ustore_write_t write_options {
         .db = db,
         .error = status.member_ptr(),
         .arena = collection.member_arena(),
         .tasks_count = count,
         .collections = collection.member_ptr(),
         .keys = keys.data(),
-        .keys_stride = sizeof(ukv_key_t),
+        .keys_stride = sizeof(ustore_key_t),
         .offsets = offsets.get(),
         .offsets_stride = offsets.stride(),
         .lengths = lengths.get(),
@@ -77,22 +77,22 @@ TEST(db, validation) {
 
     for (auto& option : options) {
         write_options.options = option;
-        ukv_write(&write_options);
+        ustore_write(&write_options);
 
         EXPECT_TRUE(status);
     }
 
-    if (!ukv_supports_named_collections_k) {
-        ukv_collection_t collections[count] = {1, 2, 3};
-        ukv_write_t write {
+    if (!ustore_supports_named_collections_k) {
+        ustore_collection_t collections[count] = {1, 2, 3};
+        ustore_write_t write {
             .db = db,
             .error = status.member_ptr(),
             .arena = collection.member_arena(),
             .tasks_count = count,
             .collections = &collections[0],
-            .collections_stride = sizeof(ukv_collection_t),
+            .collections_stride = sizeof(ustore_collection_t),
             .keys = keys.data(),
-            .keys_stride = sizeof(ukv_key_t),
+            .keys_stride = sizeof(ustore_key_t),
             .offsets = offsets.get(),
             .offsets_stride = offsets.stride(),
             .lengths = lengths.get(),
@@ -101,21 +101,21 @@ TEST(db, validation) {
             .values_stride = contents.stride(),
         };
 
-        ukv_write(&write);
+        ustore_write(&write);
 
         EXPECT_FALSE(status);
         status.release_error();
 
-        ukv_collection_t collections_only_default[count] = {0, 0, 0};
-        ukv_write_t write_rel {
+        ustore_collection_t collections_only_default[count] = {0, 0, 0};
+        ustore_write_t write_rel {
             .db = db,
             .error = status.member_ptr(),
             .arena = collection.member_arena(),
             .tasks_count = count,
             .collections = &collections_only_default[0],
-            .collections_stride = sizeof(ukv_collection_t),
+            .collections_stride = sizeof(ustore_collection_t),
             .keys = keys.data(),
-            .keys_stride = sizeof(ukv_key_t),
+            .keys_stride = sizeof(ustore_key_t),
             .offsets = offsets.get(),
             .offsets_stride = offsets.stride(),
             .lengths = lengths.get(),
@@ -124,20 +124,20 @@ TEST(db, validation) {
             .values_stride = contents.stride(),
         };
 
-        ukv_write(&write_rel);
+        ustore_write(&write_rel);
 
         EXPECT_TRUE(status);
     }
 
-    ukv_collection_t* null_collection = nullptr;
-    ukv_write_t write_null_coll {
+    ustore_collection_t* null_collection = nullptr;
+    ustore_write_t write_null_coll {
         .db = db,
         .error = status.member_ptr(),
         .arena = collection.member_arena(),
         .tasks_count = count,
         .collections = null_collection,
         .keys = keys.data(),
-        .keys_stride = sizeof(ukv_key_t),
+        .keys_stride = sizeof(ustore_key_t),
         .offsets = offsets.get(),
         .offsets_stride = offsets.stride(),
         .lengths = lengths.get(),
@@ -145,18 +145,18 @@ TEST(db, validation) {
         .values = contents.get(),
         .values_stride = contents.stride(),
     };
-    ukv_write(&write_null_coll);
+    ustore_write(&write_null_coll);
 
     EXPECT_TRUE(status);
 
-    ukv_write_t write_named {
+    ustore_write_t write_named {
         .db = db,
         .error = status.member_ptr(),
         .arena = collection.member_arena(),
         .tasks_count = count,
         .collections = named_collection.member_ptr(),
         .keys = keys.data(),
-        .keys_stride = sizeof(ukv_key_t),
+        .keys_stride = sizeof(ustore_key_t),
         .offsets = offsets.get(),
         .offsets_stride = offsets.stride(),
         .lengths = lengths.get(),
@@ -165,16 +165,16 @@ TEST(db, validation) {
         .values_stride = contents.stride(),
     };
     // Named Collection
-    ukv_write(&write_named);
+    ustore_write(&write_named);
 
-    if (ukv_supports_named_collections_k)
+    if (ustore_supports_named_collections_k)
         EXPECT_TRUE(status);
     else {
         EXPECT_FALSE(status);
         status.release_error();
     }
 
-    ukv_write_t write {
+    ustore_write_t write {
         .db = db,
         .error = status.member_ptr(),
         .transaction = txn,
@@ -182,7 +182,7 @@ TEST(db, validation) {
         .tasks_count = count,
         .collections = collection.member_ptr(),
         .keys = keys.data(),
-        .keys_stride = sizeof(ukv_key_t),
+        .keys_stride = sizeof(ustore_key_t),
         .offsets = offsets.get(),
         .offsets_stride = offsets.stride(),
         .lengths = lengths.get(),
@@ -191,9 +191,9 @@ TEST(db, validation) {
         .values_stride = contents.stride(),
     };
 
-    ukv_write(&write);
+    ustore_write(&write);
 
-    if (ukv_supports_transactions_k)
+    if (ustore_supports_transactions_k)
         EXPECT_TRUE(status);
     else {
         EXPECT_FALSE(status);
@@ -201,8 +201,8 @@ TEST(db, validation) {
     }
 
     // Transaction With Flush
-    write.options = ukv_option_write_flush_k;
-    ukv_write(&write);
+    write.options = ustore_option_write_flush_k;
+    ustore_write(&write);
 
     EXPECT_FALSE(status);
     status.release_error();
@@ -211,20 +211,20 @@ TEST(db, validation) {
     write.transaction = nullptr;
     write.tasks_count = 0;
     write.collections_stride = 0;
-    write.options = ukv_options_default_k;
-    ukv_write(&write);
+    write.options = ustore_options_default_k;
+    ustore_write(&write);
 
     EXPECT_FALSE(status);
     status.release_error();
 
     // Count > 0; Keys == nullptr
-    ukv_write_t write_null_keys {
+    ustore_write_t write_null_keys {
         .db = db,
         .error = status.member_ptr(),
         .arena = collection.member_arena(),
         .tasks_count = count,
         .collections = collection.member_ptr(),
-        .keys_stride = sizeof(ukv_key_t),
+        .keys_stride = sizeof(ustore_key_t),
         .offsets = offsets.get(),
         .offsets_stride = offsets.stride(),
         .lengths = lengths.get(),
@@ -232,24 +232,24 @@ TEST(db, validation) {
         .values = contents.get(),
         .values_stride = contents.stride(),
     };
-    ukv_write(&write_null_keys);
+    ustore_write(&write_null_keys);
 
     EXPECT_FALSE(status);
     status.release_error();
 
     // Wrong Write Options
-    std::vector<ukv_options_t> wrong_write_options {
-        ukv_option_transaction_dont_watch_k,
+    std::vector<ustore_options_t> wrong_write_options {
+        ustore_option_transaction_dont_watch_k,
     };
 
-    ukv_write_t write_wrong_options {
+    ustore_write_t write_wrong_options {
         .db = db,
         .error = status.member_ptr(),
         .arena = collection.member_arena(),
         .tasks_count = count,
         .collections = collection.member_ptr(),
         .keys = keys.data(),
-        .keys_stride = sizeof(ukv_key_t),
+        .keys_stride = sizeof(ustore_key_t),
         .offsets = offsets.get(),
         .offsets_stride = offsets.stride(),
         .lengths = lengths.get(),
@@ -259,60 +259,60 @@ TEST(db, validation) {
     };
     for (auto& option : wrong_write_options) {
         write_wrong_options.options = option;
-        ukv_write(&write_wrong_options);
+        ustore_write(&write_wrong_options);
 
         EXPECT_FALSE(status);
         status.release_error();
     }
 
-    ukv_length_t* found_offsets = nullptr;
-    ukv_length_t* found_lengths = nullptr;
-    ukv_bytes_ptr_t found_values = nullptr;
-    ukv_read_t read_no_txn {
+    ustore_length_t* found_offsets = nullptr;
+    ustore_length_t* found_lengths = nullptr;
+    ustore_bytes_ptr_t found_values = nullptr;
+    ustore_read_t read_no_txn {
         .db = db,
         .error = status.member_ptr(),
         .arena = collection.member_arena(),
         .tasks_count = count,
         .collections = collection.member_ptr(),
         .keys = keys.data(),
-        .keys_stride = sizeof(ukv_key_t),
+        .keys_stride = sizeof(ustore_key_t),
         .offsets = &found_offsets,
         .lengths = &found_lengths,
         .values = &found_values,
     };
 
-    ukv_read(&read_no_txn);
+    ustore_read(&read_no_txn);
 
     EXPECT_TRUE(status);
 
-    ukv_read_t read {
+    ustore_read_t read {
         .db = db,
         .error = status.member_ptr(),
         .transaction = txn,
         .arena = collection.member_arena(),
-        .options = ukv_option_transaction_dont_watch_k,
+        .options = ustore_option_transaction_dont_watch_k,
         .tasks_count = count,
         .collections = collection.member_ptr(),
         .keys = keys.data(),
-        .keys_stride = sizeof(ukv_key_t),
+        .keys_stride = sizeof(ustore_key_t),
         .offsets = &found_offsets,
         .lengths = &found_lengths,
         .values = &found_values,
     };
 
-    ukv_read(&read);
+    ustore_read(&read);
 
     EXPECT_TRUE(status);
 
     // Wrong Read Options
-    std::vector<ukv_options_t> wrong_read_options {
-        ukv_option_write_flush_k,
-        ukv_option_transaction_dont_watch_k,
+    std::vector<ustore_options_t> wrong_read_options {
+        ustore_option_write_flush_k,
+        ustore_option_transaction_dont_watch_k,
     };
 
     for (auto& option : wrong_read_options) {
         read_no_txn.options = option;
-        ukv_read(&read_no_txn);
+        ustore_read(&read_no_txn);
 
         EXPECT_FALSE(status);
         status.release_error();
@@ -320,41 +320,41 @@ TEST(db, validation) {
 
     // Transaction
 
-    ukv_transaction_t ukv_txn = nullptr;
-    ukv_transaction_init_t txn_init {
+    ustore_transaction_t ustore_txn = nullptr;
+    ustore_transaction_init_t txn_init {
         .db = db,
         .error = status.member_ptr(),
-        .transaction = &ukv_txn,
+        .transaction = &ustore_txn,
     };
 
-    ukv_transaction_init(&txn_init);
+    ustore_transaction_init(&txn_init);
     EXPECT_TRUE(status);
 
     txn_init.transaction = nullptr;
-    ukv_transaction_init(&txn_init);
+    ustore_transaction_init(&txn_init);
     EXPECT_FALSE(status);
     status.release_error();
 
     // Wrong Transaction Begin Options
-    std::vector<ukv_options_t> wrong_txn_begin_options {
-        ukv_option_write_flush_k,
-        ukv_option_dont_discard_memory_k,
+    std::vector<ustore_options_t> wrong_txn_begin_options {
+        ustore_option_write_flush_k,
+        ustore_option_dont_discard_memory_k,
     };
 
-    txn_init.transaction = &ukv_txn;
+    txn_init.transaction = &ustore_txn;
     for (auto& option : wrong_txn_begin_options) {
         txn_init.options = option;
-        ukv_transaction_init(&txn_init);
+        ustore_transaction_init(&txn_init);
         EXPECT_FALSE(status);
         status.release_error();
     }
 
     // Wrong Transaction Commit Options
-    std::vector<ukv_options_t> wrong_txn_commit_options {
-        ukv_option_dont_discard_memory_k,
+    std::vector<ustore_options_t> wrong_txn_commit_options {
+        ustore_option_dont_discard_memory_k,
     };
 
-    ukv_transaction_commit_t txn_commit {
+    ustore_transaction_commit_t txn_commit {
         .db = db,
         .error = status.member_ptr(),
         .transaction = txn,
@@ -362,15 +362,15 @@ TEST(db, validation) {
 
     for (auto& option : wrong_txn_commit_options) {
         txn_commit.options = option;
-        ukv_transaction_commit(&txn_commit);
+        ustore_transaction_commit(&txn_commit);
         EXPECT_FALSE(status);
         status.release_error();
     }
 
     // Scans
-    ukv_key_t* found_keys = nullptr;
-    ukv_length_t* found_counts = nullptr;
-    ukv_scan_t scan {
+    ustore_key_t* found_keys = nullptr;
+    ustore_length_t* found_counts = nullptr;
+    ustore_scan_t scan {
         .db = db,
         .error = status.member_ptr(),
         .transaction = txn,
@@ -383,12 +383,12 @@ TEST(db, validation) {
         .keys = &found_keys,
     };
 
-    ukv_scan(&scan);
+    ustore_scan(&scan);
 
     EXPECT_TRUE(status);
 
     // Count > 0, Keys = nullptr
-    ukv_scan_t scan_no_keys {
+    ustore_scan_t scan_no_keys {
         .db = db,
         .error = status.member_ptr(),
         .transaction = txn,
@@ -400,13 +400,13 @@ TEST(db, validation) {
         .keys = &found_keys,
     };
 
-    ukv_scan(&scan_no_keys);
+    ustore_scan(&scan_no_keys);
 
     EXPECT_FALSE(status);
     status.release_error();
 
     // Limits == nullptr
-    ukv_scan_t scan_no_limits {
+    ustore_scan_t scan_no_limits {
         .db = db,
         .error = status.member_ptr(),
         .transaction = txn,
@@ -418,7 +418,7 @@ TEST(db, validation) {
         .keys = &found_keys,
     };
 
-    ukv_scan(&scan_no_limits);
+    ustore_scan(&scan_no_limits);
 
     EXPECT_FALSE(status);
     status.release_error();

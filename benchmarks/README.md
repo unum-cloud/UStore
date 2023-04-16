@@ -50,9 +50,9 @@ You can obtain results for your hardware and your sample of Tweets using the fol
 ```sh
 cmake \
     -DCMAKE_BUILD_TYPE=Release \
-    -DUKV_BUILD_BENCHMARKS=1 .. \
-    && make bench_twitter_ustore_embedded_umem \
-    && ./build/bin/bench_twitter_ustore_embedded_umem
+    -DUSTORE_BUILD_BENCHMARKS=1 .. \
+    && make bench_twitter_ustore_embedded_ucset \
+    && ./build/bin/bench_twitter_ustore_embedded_ucset
 ```
 
 We manually repeated this same benchmark for a few other DBMS brands.
@@ -68,8 +68,8 @@ For document-like workloads:
 |                                   |           |           |
 | UStore on RocksDB                 |   22 K    |   742 K   |
 | UStore on RocksDB with Flight API |   23 K    |   282 K   |
-| UStore on UMem                    |   350 K   |   4.8 M   |
-| UStore on UMem with Flight API    |   206 K   |   371 K   |
+| UStore on UCSet                   |   350 K   |   4.8 M   |
+| UStore on UCSet with Flight API   |   206 K   |   371 K   |
 
 For graphs, we show the number of edges per second handled by different queries:
 
@@ -79,8 +79,8 @@ For graphs, we show the number of edges per second handled by different queries:
 |                                   |           |                   |
 | UStore on RocksDB                 |   241 K   |       3.7 M       |
 | UStore on RocksDB with Flight API |   119 K   |      1.48 M       |
-| UStore on UMem                    |   201 K   |       21 M        |
-| UStore on UMem with Flight API    |   163 K   |       17 M        |
+| UStore on UCSet                   |   201 K   |       21 M        |
+| UStore on UCSet with Flight API   |   163 K   |       17 M        |
 
 For MongoDB, we also tried the official <code class="docutils literal notranslate"><a href="https://www.mongodb.com/docs/database-tools/mongoimport/" class="pre">mongoimport</a></code> tool, which supports both `.csv` and `.ndjson`.
 The results are mixed compared to a multi-process setup.
@@ -92,7 +92,7 @@ Generalizing the Twitter benchmark, we wrote a Python and a C++ benchmark for ta
 Unlike the previous benchmark, the schema must be fixed, but you can input `.json`, `.csv`, and `.parquet` files.
 
 ```sh
-cmake -DCMAKE_BUILD_TYPE=Release -DUKV_BUILD_BENCHMARKS=1 .. && make benchmark_tabular_graph_ustore_embedded_umem && ./build/bin/benchmark_tabular_graph_ustore_embedded_umem
+cmake -DCMAKE_BUILD_TYPE=Release -DUSTORE_BUILD_BENCHMARKS=1 .. && make benchmark_tabular_graph_ustore_embedded_ucset && ./build/bin/benchmark_tabular_graph_ustore_embedded_ucset
 ```
 
 For Python:

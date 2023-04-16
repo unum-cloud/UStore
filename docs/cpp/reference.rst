@@ -7,9 +7,9 @@ db
 .. doxygenfile:: db.hpp
 
 ===============
-ukv
+ustore
 ===============
-.. doxygenfile:: ukv.hpp
+.. doxygenfile:: ustore.hpp
 
 ================
 blobs_collection

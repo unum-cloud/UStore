@@ -3,97 +3,97 @@
     "tasks": [
         {
             "label": "Build Debug",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUKV_BUILD_BENCHMARKS=0 -DUKV_BUILD_TESTS=1 -DUKV_BUILD_ENGINE_UMEM=1 -DUKV_BUILD_ENGINE_LEVELDB=1 -DUKV_BUILD_ENGINE_ROCKSDB=1 -B ./build_debug && make -j 12 -C ./build_debug",
+            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUSTORE_BUILD_BENCHMARKS=0 -DUSTORE_BUILD_TESTS=1 -DUSTORE_BUILD_ENGINE_UCSET=1 -DUSTORE_BUILD_ENGINE_LEVELDB=1 -DUSTORE_BUILD_ENGINE_ROCKSDB=1 -B ./build_debug && make -j 12 -C ./build_debug",
             "args": [],
             "type": "shell"
         },
         {
             "label": "Build Release",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Release -DUKV_BUILD_BENCHMARKS=0 -DUKV_BUILD_TESTS=0 -DUKV_BUILD_ENGINE_UMEM=1 -DUKV_BUILD_ENGINE_LEVELDB=1 -DUKV_BUILD_ENGINE_ROCKSDB=1 -B ./build_release && make -j12 --silent -C ./build_release",
+            "command": "cmake -DCMAKE_BUILD_TYPE=Release -DUSTORE_BUILD_BENCHMARKS=0 -DUSTORE_BUILD_TESTS=0 -DUSTORE_BUILD_ENGINE_UCSET=1 -DUSTORE_BUILD_ENGINE_LEVELDB=1 -DUSTORE_BUILD_ENGINE_ROCKSDB=1 -B ./build_release && make -j12 --silent -C ./build_release",
             "args": [],
             "type": "shell"
         },
         {
-            "label": "Build Debug UMem Test",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUKV_BUILD_TESTS=1 -DUKV_BUILD_BENCHMARKS=0 -DUKV_BUILD_ENGINE_UMEM=1 -DUKV_BUILD_ENGINE_LEVELDB=0 -DUKV_BUILD_ENGINE_ROCKSDB=0 -B ./build_debug && make test_units_ukv_embedded_umem -j8 --silent -C ./build_debug",
+            "label": "Build Debug UCSet Test",
+            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUSTORE_BUILD_TESTS=1 -DUSTORE_BUILD_BENCHMARKS=0 -DUSTORE_BUILD_ENGINE_UCSET=1 -DUSTORE_BUILD_ENGINE_LEVELDB=0 -DUSTORE_BUILD_ENGINE_ROCKSDB=0 -B ./build_debug && make test_units_ustore_embedded_ucset -j8 --silent -C ./build_debug",
             "args": [],
             "type": "shell"
         },
         {
             "label": "Build Debug LevelDB Test",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUKV_BUILD_TESTS=1 -DUKV_BUILD_BENCHMARKS=0 -DUKV_BUILD_ENGINE_UMEM=0 -DUKV_BUILD_ENGINE_LEVELDB=1 -DUKV_BUILD_ENGINE_ROCKSDB=0 -B ./build_debug && make test_units_ukv_embedded_leveldb -j8 --silent -C ./build_debug",
+            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUSTORE_BUILD_TESTS=1 -DUSTORE_BUILD_BENCHMARKS=0 -DUSTORE_BUILD_ENGINE_UCSET=0 -DUSTORE_BUILD_ENGINE_LEVELDB=1 -DUSTORE_BUILD_ENGINE_ROCKSDB=0 -B ./build_debug && make test_units_ustore_embedded_leveldb -j8 --silent -C ./build_debug",
             "args": [],
             "type": "shell"
         },
         {
             "label": "Build Debug RocksDB Test",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUKV_BUILD_TESTS=1 -DUKV_BUILD_BENCHMARKS=0 -DUKV_BUILD_ENGINE_UMEM=0 -DUKV_BUILD_ENGINE_LEVELDB=0 -DUKV_BUILD_ENGINE_ROCKSDB=1 -B ./build_debug && make test_units_ukv_embedded_rocksdb -j8 --silent -C ./build_debug",
+            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUSTORE_BUILD_TESTS=1 -DUSTORE_BUILD_BENCHMARKS=0 -DUSTORE_BUILD_ENGINE_UCSET=0 -DUSTORE_BUILD_ENGINE_LEVELDB=0 -DUSTORE_BUILD_ENGINE_ROCKSDB=1 -B ./build_debug && make test_units_ustore_embedded_rocksdb -j8 --silent -C ./build_debug",
             "args": [],
             "type": "shell"
         },
         {
             "label": "Build Debug UDisk Test",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUKV_BUILD_TESTS=1 -DUKV_ENGINE_UDISK_PATH=lib/libudisk.a -B ./build_debug && make test_units_ukv_embedded_udisk -j8 --silent -C ./build_debug",
+            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUSTORE_BUILD_TESTS=1 -DUSTORE_ENGINE_UDISK_PATH=lib/libudisk.a -B ./build_debug && make test_units_ustore_embedded_udisk -j8 --silent -C ./build_debug",
             "args": [],
             "type": "shell"
         },
         {
-            "label": "Build Stress Atomicity UMem",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUKV_BUILD_TESTS=1 -DUKV_BUILD_BENCHMARKS=0 -B ./build_debug && make stress_atomicity_ukv_embedded_umem -j8 --silent -C ./build_debug",
+            "label": "Build Stress Atomicity UCSet",
+            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUSTORE_BUILD_TESTS=1 -DUSTORE_BUILD_BENCHMARKS=0 -B ./build_debug && make stress_atomicity_ustore_embedded_ucset -j8 --silent -C ./build_debug",
             "args": [],
             "type": "shell"
         },
         {
             "label": "Build Stress Atomicity RocksDB",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUKV_BUILD_TESTS=1 -DUKV_BUILD_BENCHMARKS=0 -DUKV_BUILD_ENGINE_ROCKSDB=1 -B ./build_debug && make stress_atomicity_ukv_embedded_rocksdb -j8 --silent -C ./build_debug",
+            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUSTORE_BUILD_TESTS=1 -DUSTORE_BUILD_BENCHMARKS=0 -DUSTORE_BUILD_ENGINE_ROCKSDB=1 -B ./build_debug && make stress_atomicity_ustore_embedded_rocksdb -j8 --silent -C ./build_debug",
             "args": [],
             "type": "shell"
         },
         {
-            "label": "Build Stress Linearizability UMem",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUKV_BUILD_TESTS=1 -DUKV_BUILD_BENCHMARKS=0 -B ./build_debug && make stress_linearizability_ukv_embedded_umem -j8 --silent -C ./build_debug",
+            "label": "Build Stress Linearizability UCSet",
+            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUSTORE_BUILD_TESTS=1 -DUSTORE_BUILD_BENCHMARKS=0 -B ./build_debug && make stress_linearizability_ustore_embedded_ucset -j8 --silent -C ./build_debug",
             "args": [],
             "type": "shell"
         },
         {
             "label": "Build Stress Linearizability RocksDB",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUKV_BUILD_TESTS=1 -DUKV_BUILD_BENCHMARKS=0 -DUKV_BUILD_ENGINE_ROCKSDB=1 -B ./build_debug && make stress_linearizability_ukv_embedded_rocksdb -j8 --silent -C ./build_debug",
+            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUSTORE_BUILD_TESTS=1 -DUSTORE_BUILD_BENCHMARKS=0 -DUSTORE_BUILD_ENGINE_ROCKSDB=1 -B ./build_debug && make stress_linearizability_ustore_embedded_rocksdb -j8 --silent -C ./build_debug",
             "args": [],
             "type": "shell"
         },
         {
-            "label": "Build Debug UMem Benchmark",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUKV_BUILD_TESTS=0 -DUKV_BUILD_BENCHMARKS=1 -B ./build_debug && make bench_twitter_ukv_embedded_umem -j8 --silent -C ./build_debug",
+            "label": "Build Debug UCSet Benchmark",
+            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUSTORE_BUILD_TESTS=0 -DUSTORE_BUILD_BENCHMARKS=1 -B ./build_debug && make bench_twitter_ustore_embedded_ucset -j8 --silent -C ./build_debug",
             "args": [],
             "type": "shell"
         },
         {
             "label": "Build Debug RocksDB Benchmark",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUKV_BUILD_TESTS=0 -DUKV_BUILD_BENCHMARKS=1 -DUKV_BUILD_ENGINE_ROCKSDB=1 -B ./build_debug && make bench_twitter_ukv_embedded_rocksdb -j8 --silent -C ./build_debug",
+            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUSTORE_BUILD_TESTS=0 -DUSTORE_BUILD_BENCHMARKS=1 -DUSTORE_BUILD_ENGINE_ROCKSDB=1 -B ./build_debug && make bench_twitter_ustore_embedded_rocksdb -j8 --silent -C ./build_debug",
             "args": [],
             "type": "shell"
         },
         {
             "label": "Build Debug Arrow Benchmark",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUKV_BUILD_TESTS=0 -DUKV_BUILD_BENCHMARKS=1 -DUKV_BUILD_API_FLIGHT_CLIENT=1 -B ./build_debug && make bench_twitter_ukv_flight_client -j8 --silent -C ./build_debug",
+            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUSTORE_BUILD_TESTS=0 -DUSTORE_BUILD_BENCHMARKS=1 -DUSTORE_BUILD_API_FLIGHT_CLIENT=1 -B ./build_debug && make bench_twitter_ustore_flight_client -j8 --silent -C ./build_debug",
             "args": [],
             "type": "shell"
         },
         {
             "label": "Build Debug UDisk Benchmark",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUKV_BUILD_TESTS=0 -DUKV_BUILD_BENCHMARKS=1 -DUKV_ENGINE_UDISK_PATH=lib/libudisk.a -B ./build_debug && make bench_twitter_ukv_embedded_udisk -j8 --silent -C ./build_debug",
+            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUSTORE_BUILD_TESTS=0 -DUSTORE_BUILD_BENCHMARKS=1 -DUSTORE_ENGINE_UDISK_PATH=lib/libudisk.a -B ./build_debug && make bench_twitter_ustore_embedded_udisk -j8 --silent -C ./build_debug",
             "args": [],
             "type": "shell"
         },
         {
             "label": "Build Debug Arrow Client",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUKV_BUILD_API_FLIGHT_CLIENT=1 -B ./build_debug && make test_units_ukv_flight_client -j8 --silent -C ./build_debug && sleep 5",
+            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUSTORE_BUILD_API_FLIGHT_CLIENT=1 -B ./build_debug && make test_units_ustore_flight_client -j8 --silent -C ./build_debug && sleep 5",
             "args": [],
             "type": "shell"
         },
         {
             "label": "Build Debug Arrow Server",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUKV_BUILD_API_FLIGHT_SERVER=1 -B ./build_debug && make ukv_flight_server_umem -j8 --silent -C ./build_debug",
+            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUSTORE_BUILD_API_FLIGHT_SERVER=1 -B ./build_debug && make ustore_flight_server_ucset -j8 --silent -C ./build_debug",
             "args": [],
             "type": "shell"
         },

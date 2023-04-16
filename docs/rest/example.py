@@ -74,7 +74,7 @@ def test_write():
 
 
 def serve():
-    os.system('./build/bin/ukv_beast_server 0.0.0.0 8080 1')
+    os.system('./build/bin/ustore_beast_server 0.0.0.0 8080 1')
 
 
 def killall():

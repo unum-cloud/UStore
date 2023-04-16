@@ -1,6 +1,6 @@
 import requests as re
 
-import ukv.umem as ukv
+import ustore.ucset as ustore
 import streamlit as st
 
 collection_name_docs = 'Docs'
@@ -10,7 +10,7 @@ collection_name_images = 'Images'
 
 @st.experimental_singleton
 def get_database_session(url=None):
-    db = ukv.DataBase()
+    db = ustore.DataBase()
     col_docs = db[collection_name_docs].docs
     col_network = db[collection_name_network].graph
     col_images = db[collection_name_images]

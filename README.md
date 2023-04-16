@@ -479,7 +479,7 @@ That can be extended to utilize multiple devices or directories, or to forward a
         }
     ],
     "engine": {
-        "config_file_path": "./config_rocksdb.json",
+        "config_file_path": "./engine_rocksdb.ini",
     }
 }
 ```

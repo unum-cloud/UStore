@@ -6,7 +6,7 @@ plugins {
     id 'maven-publish'
 }
 
-group "cloud.unum.ukv"
+group "cloud.unum.ustore"
 version = file("VERSION").text.trim()
 
 sourceCompatibility = 1.8
@@ -36,17 +36,17 @@ dependencies {
 
 model {
     buildTypes{
-        umem
+        ucset
         rocksdb
         leveldb
     }
 
     components {
-        ukv(NativeLibrarySpec) {
+        ustore(NativeLibrarySpec) {
             sources {
                 c {
                     source {
-                        srcDirs "java/cloud/unum/ukv"
+                        srcDirs "java/cloud/unum/ustore"
                         include "**/*.c"
                     }
                     exportedHeaders {
@@ -63,12 +63,12 @@ model {
                     cCompiler.args '-D_FILE_OFFSET_BITS=64'
                 }
 
-                if (buildType == buildTypes.umem) {
-                    linker.args '-L', "${projectDir}/build/lib", "-l", "ukv_umem_bundle", "-l", "c"
+                if (buildType == buildTypes.ucset) {
+                    linker.args '-L', "${projectDir}/build/lib", "-l", "ustore_ucset_bundle", "-l", "c"
                 } else if (buildType == buildTypes.rocksdb) {
-                    linker.args '-L', "${projectDir}/build/lib", "-l", "ukv_rocksdb_bundle", "-l", "c"
+                    linker.args '-L', "${projectDir}/build/lib", "-l", "ustore_rocksdb_bundle", "-l", "c"
                 } else if (buildType == buildTypes.leveldb) {
-                    linker.args '-L', "${projectDir}/build/lib", "-l", "ukv_leveldb_bundle", "-l", "c"
+                    linker.args '-L', "${projectDir}/build/lib", "-l", "ustore_leveldb_bundle", "-l", "c"
                 }
             }
         }
@@ -85,20 +85,20 @@ test {
 }
 
 jar {
-    dependsOn("ukvUmemSharedLibrary")
-    dependsOn("ukvRocksdbSharedLibrary")
-    dependsOn("ukvLeveldbSharedLibrary")
+    dependsOn("ustoreUmemSharedLibrary")
+    dependsOn("ustoreRocksdbSharedLibrary")
+    dependsOn("ustoreLeveldbSharedLibrary")
 
-    into("umem") {
-        from("$buildDir/libs/ukv/shared/umem/libukv.so")
+    into("ucset") {
+        from("$buildDir/libs/ustore/shared/ucset/libustore.so")
     }
 
     into("rocksdb") {
-        from("$buildDir/libs/ukv/shared/rocksdb/libukv.so")
+        from("$buildDir/libs/ustore/shared/rocksdb/libustore.so")
     }
 
     into("leveldb") {
-        from("$buildDir/libs/ukv/shared/leveldb/libukv.so")
+        from("$buildDir/libs/ustore/shared/leveldb/libustore.so")
     }
 }
 
@@ -108,9 +108,9 @@ publishing {
             from components.java
 
             pom {
-                name = "UKV"
+                name = "UStore"
                 description = "Universal Key-Value store interface for both in-memory and persistent transactional collections for Java"
-                url = "https://github.com/unum-cloud/ukv"
+                url = "https://github.com/unum-cloud/ustore"
                 licenses {
                     license {
                         name = 'The Apache License, Version 2.0'

@@ -7,27 +7,27 @@
 #pragma once
 #include <random>
 
-#include "ukv/blobs.h"
+#include "ustore/blobs.h"
 
-namespace unum::ukv {
+namespace unum::ustore {
 
 template <typename callback_should_continue_at>
 void full_scan_collection( //
-    ukv_database_t db,
-    ukv_transaction_t transaction,
-    ukv_collection_t collection,
-    ukv_options_t options,
-    ukv_key_t start_key,
-    ukv_length_t read_ahead,
+    ustore_database_t db,
+    ustore_transaction_t transaction,
+    ustore_collection_t collection,
+    ustore_options_t options,
+    ustore_key_t start_key,
+    ustore_length_t read_ahead,
     linked_memory_lock_t& arena,
-    ukv_error_t* error,
+    ustore_error_t* error,
     callback_should_continue_at&& callback_should_continue) noexcept {
 
-    read_ahead = std::max<ukv_length_t>(read_ahead, 2u);
+    read_ahead = std::max<ustore_length_t>(read_ahead, 2u);
     while (!*error) {
-        ukv_length_t* found_blobs_count {};
-        ukv_key_t* found_blobs_keys {};
-        ukv_scan_t scan {};
+        ustore_length_t* found_blobs_count {};
+        ustore_key_t* found_blobs_keys {};
+        ustore_scan_t scan {};
         scan.db = db;
         scan.error = error;
         scan.transaction = transaction;
@@ -40,7 +40,7 @@ void full_scan_collection( //
         scan.counts = &found_blobs_count;
         scan.keys = &found_blobs_keys;
 
-        ukv_scan(&scan);
+        ustore_scan(&scan);
         if (*error)
             break;
 
@@ -48,27 +48,27 @@ void full_scan_collection( //
             // We have reached the end of collection
             break;
 
-        ukv_length_t* found_blobs_offsets {};
-        ukv_byte_t* found_blobs_data {};
-        ukv_read_t read {};
+        ustore_length_t* found_blobs_offsets {};
+        ustore_byte_t* found_blobs_data {};
+        ustore_read_t read {};
         read.db = db;
         read.error = error;
         read.transaction = transaction;
         read.arena = arena;
-        read.options = ukv_options_t(options | ukv_option_dont_discard_memory_k);
+        read.options = ustore_options_t(options | ustore_option_dont_discard_memory_k);
         read.tasks_count = found_blobs_count[0];
         read.collections = &collection;
         read.collections_stride = 0;
         read.keys = found_blobs_keys;
-        read.keys_stride = sizeof(ukv_key_t);
+        read.keys_stride = sizeof(ustore_key_t);
         read.offsets = &found_blobs_offsets;
         read.values = &found_blobs_data;
 
-        ukv_read(&read);
+        ustore_read(&read);
         if (*error)
             break;
 
-        ukv_length_t const count_blobs = found_blobs_count[0];
+        ustore_length_t const count_blobs = found_blobs_count[0];
         joined_blobs_iterator_t found_blobs {found_blobs_offsets, found_blobs_data};
         for (std::size_t i = 0; i != count_blobs; ++i, ++found_blobs) {
             value_view_t bucket = *found_blobs;
@@ -86,24 +86,24 @@ void full_scan_collection( //
  */
 template <typename level_or_rocks_iterator_at>
 void reservoir_sample_iterator(level_or_rocks_iterator_at&& iterator,
-                               ptr_range_gt<ukv_key_t> sampled_keys,
-                               ukv_error_t* c_error) noexcept {
+                               ptr_range_gt<ustore_key_t> sampled_keys,
+                               ustore_error_t* c_error) noexcept {
 
     std::random_device random_device;
     std::mt19937 random_generator(random_device());
-    std::uniform_int_distribution<ukv_key_t> dist(std::numeric_limits<ukv_key_t>::min());
+    std::uniform_int_distribution<ustore_key_t> dist(std::numeric_limits<ustore_key_t>::min());
 
     std::size_t i = 0;
     for (iterator->SeekToFirst(); i < sampled_keys.size(); ++i, iterator->Next()) {
         return_error_if_m(iterator->Valid(), c_error, 0, "Sample Failure!");
-        std::memcpy(&sampled_keys[i], iterator->key().data(), sizeof(ukv_key_t));
+        std::memcpy(&sampled_keys[i], iterator->key().data(), sizeof(ustore_key_t));
     }
 
     for (std::size_t j = 0; iterator->Valid(); ++i, iterator->Next()) {
         j = dist(random_generator) % (i + 1);
         if (j < sampled_keys.size())
-            std::memcpy(&sampled_keys[j], iterator->key().data(), sizeof(ukv_key_t));
+            std::memcpy(&sampled_keys[j], iterator->key().data(), sizeof(ustore_key_t));
     }
 }
 
-} // namespace unum::ukv
+} // namespace unum::ustore

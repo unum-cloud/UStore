@@ -11,9 +11,9 @@
 
 #include <nlohmann/json.hpp>
 
-#include "ukv/ukv.hpp"
+#include "ustore/ustore.hpp"
 
-using namespace unum::ukv;
+using namespace unum::ustore;
 using namespace unum;
 
 #define macro_concat_(prefix, suffix) prefix##suffix
@@ -44,8 +44,8 @@ int main(int argc, char** argv) {
     _ = main[{43, 44}].present();
     _ = main[{43, 44}].length();
     _ = main[{43, 44}].value();
-    _ = main[std::array<ukv_key_t, 3> {65, 66, 67}];
-    _ = main[std::vector<ukv_key_t> {65, 66, 67, 68}];
+    _ = main[std::array<ustore_key_t, 3> {65, 66, 67}];
+    _ = main[std::vector<ustore_key_t> {65, 66, 67, 68}];
     for (value_view_t value : *main[{100, 101}].value())
         (void)value;
 
@@ -66,13 +66,13 @@ int main(int argc, char** argv) {
     _ = main[{43, 44}].on(arena).value();
 
     // Batch-assignment: many keys to many values
-    // main[std::array<ukv_key_t, 3> {65, 66, 67}] = std::array {"A", "B", "C"};
+    // main[std::array<ustore_key_t, 3> {65, 66, 67}] = std::array {"A", "B", "C"};
     // main[std::array {ckf(prefixes, 65), ckf(66), ckf(67)}] = std::array {"A", "B", "C"};
 
     // Iterating over collections
-    for (ukv_key_t key : main.keys())
+    for (ustore_key_t key : main.keys())
         (void)key;
-    for (ukv_key_t key : main.keys(100, 200))
+    for (ustore_key_t key : main.keys(100, 200))
         (void)key;
 
     _ = main.members(100, 200).size_estimates()->cardinality;

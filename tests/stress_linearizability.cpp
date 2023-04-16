@@ -12,20 +12,20 @@
 #include <gtest/gtest.h>
 #include <fmt/format.h>
 
-#include "ukv/ukv.hpp"
+#include "ustore/ustore.hpp"
 
-using namespace unum::ukv;
+using namespace unum::ustore;
 using namespace unum;
 
 static char const* path() {
-    char* path = std::getenv("UKV_TEST_PATH");
+    char* path = std::getenv("USTORE_TEST_PATH");
     if (path)
         return std::strlen(path) ? path : nullptr;
 
-#if defined(UKV_FLIGHT_CLIENT)
+#if defined(USTORE_FLIGHT_CLIENT)
     return nullptr;
-#elif defined(UKV_TEST_PATH)
-    return UKV_TEST_PATH;
+#elif defined(USTORE_TEST_PATH)
+    return USTORE_TEST_PATH;
 #else
     return nullptr;
 #endif
@@ -46,9 +46,9 @@ enum class operation_code_t : std::uint8_t {
 
 using payload_t = std::size_t;
 struct operation_t {
-    ukv_key_t key;
+    ustore_key_t key;
     payload_t value;
-    ukv_sequence_number_t sequence;
+    ustore_sequence_number_t sequence;
     operation_code_t code;
     bool commited;
 
@@ -173,14 +173,14 @@ void linear_writes( //
     std::size_t concurrent_threads,
     std::size_t max_checkpoints = 1'000) {
 
-    std::unordered_map<ukv_key_t, payload_t> sequential;
+    std::unordered_map<ustore_key_t, payload_t> sequential;
 
     barrier_t sync_point(concurrent_threads);
 
     constexpr std::size_t parts_total_k = part_inserts_ak + part_removes_ak;
     constexpr std::size_t mean_key_frequency_k = 4;
-    ukv_key_t max_key = parts_total_k * transactions_between_checkpoints * concurrent_threads / mean_key_frequency_k;
-    std::uniform_int_distribution<ukv_key_t> dist_keys(1, max_key);
+    ustore_key_t max_key = parts_total_k * transactions_between_checkpoints * concurrent_threads / mean_key_frequency_k;
+    std::uniform_int_distribution<ustore_key_t> dist_keys(1, max_key);
 
     std::size_t operations_per_thread = transactions_between_checkpoints * parts_total_k;
     std::vector<operation_t> operations_across_threads {concurrent_threads * operations_per_thread};
@@ -215,7 +215,7 @@ void linear_writes( //
                 auto maybe_sequence = txn.sequenced_commit();
                 auto commited = bool(maybe_sequence);
                 auto sequence =
-                    commited ? maybe_sequence.throw_or_ref() : std::numeric_limits<ukv_sequence_number_t>::max();
+                    commited ? maybe_sequence.throw_or_ref() : std::numeric_limits<ustore_sequence_number_t>::max();
                 for (std::size_t part = 0; part != parts_total_k; ++part) {
                     operation_t& op = operations[iteration * parts_total_k + part];
                     op.commited = commited;
@@ -324,8 +324,8 @@ class test_one_config_t : public testing::Test {
 
 int main(int argc, char** argv) {
 
-    if (!ukv_supports_transactions_k) {
-        std::printf("Selected UKV Engine doesn't support ACID transactions\n");
+    if (!ustore_supports_transactions_k) {
+        std::printf("Selected UStore Engine doesn't support ACID transactions\n");
         return 1;
     }
 

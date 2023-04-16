@@ -3,7 +3,7 @@ C++ SDK
 =======
 
 
-.. mdinclude:: ../../include/ukv/cpp/README.md
+.. mdinclude:: ../../include/ustore/cpp/README.md
 
 .. toctree::
    :hidden:

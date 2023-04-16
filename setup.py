@@ -13,7 +13,7 @@ from setuptools import setup, Extension
 from setuptools.command.build_ext import build_ext
 
 __version__ = open('VERSION', 'r').read().strip()
-__lib_name__ = 'ukv'
+__lib_name__ = 'ustore'
 
 
 this_directory = os.path.abspath(dirname(__file__))
@@ -37,7 +37,7 @@ class CMakeBuild(build_ext):
         if not extension_dir.endswith(os.path.sep):
             extension_dir += os.path.sep
 
-        if 'UKV_DEBUG_PYTHON' in os.environ:
+        if 'USTORE_DEBUG_PYTHON' in os.environ:
             os.makedirs(extension_dir, exist_ok=True)
             copy_tree('./build/lib/', extension_dir)
             return
@@ -46,11 +46,11 @@ class CMakeBuild(build_ext):
             f'-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extension_dir}',
             f'-DCMAKE_ARCHIVE_OUTPUT_DIRECTORY={extension_dir}',
             f'-DPYTHON_EXECUTABLE={sys.executable}',
-            '-DUKV_BUILD_ENGINE_UMEM=1',
-            '-DUKV_BUILD_ENGINE_LEVELDB=1',
-            '-DUKV_BUILD_ENGINE_ROCKSDB=1',
-            '-DUKV_BUILD_API_FLIGHT_CLIENT=1',
-            '-DUKV_BUILD_SDK_PYTHON=1'
+            '-DUSTORE_BUILD_ENGINE_UCSET=1',
+            '-DUSTORE_BUILD_ENGINE_LEVELDB=1',
+            '-DUSTORE_BUILD_ENGINE_ROCKSDB=1',
+            '-DUSTORE_BUILD_API_FLIGHT_CLIENT=1',
+            '-DUSTORE_BUILD_SDK_PYTHON=1'
         ]
 
         # Adding CMake arguments set as environment variable
@@ -80,11 +80,11 @@ class CMakeBuild(build_ext):
 
         subprocess.check_call(['cmake', ext.source_dir] + cmake_args)
         subprocess.check_call(
-            ['cmake', '--build', '.', '--target', ext.name.replace('ukv.', 'py_')] + build_args)
+            ['cmake', '--build', '.', '--target', ext.name.replace('ustore.', 'py_')] + build_args)
 
     def run(self):
         build_ext.run(self)
-        if 'UKV_DEBUG_PYTHON' not in os.environ:
+        if 'USTORE_DEBUG_PYTHON' not in os.environ:
             self.run_command('build_pyi')
 
 
@@ -112,7 +112,7 @@ class BuildPyi(Command):
         else:
             data['out'] = self.build_lib
 
-        wrappers = ['ukv']
+        wrappers = ['ustore']
         # Ensure that the associated packages can always be found locally
         for wrapper in wrappers:
             pkgdir = wrapper.split('.')
@@ -140,7 +140,7 @@ class BuildPyi(Command):
             ) from None
 
         # Create a py.typed for PEP 561
-        with open(join(data['out'], 'ukv', 'py.typed'), 'w'):
+        with open(join(data['out'], 'ustore', 'py.typed'), 'w'):
             pass
 
 
@@ -150,7 +150,7 @@ setup(
 
     author='Ashot Vardanian',
     author_email='info@unum.cloud',
-    url='https://github.com/unum-cloud/ukv',
+    url='https://github.com/unum-cloud/ustore',
     description='Python bindings for Unum\'s Universal Key-Value store.',
     long_description=long_description,
     long_description_content_type='text/markdown',
@@ -183,10 +183,10 @@ setup(
     ],
 
     ext_modules=[
-        CMakeExtension('ukv.umem'),
-        CMakeExtension('ukv.rocksdb'),
-        CMakeExtension('ukv.leveldb'),
-        CMakeExtension('ukv.flight_client'),
+        CMakeExtension('ustore.ucset'),
+        CMakeExtension('ustore.rocksdb'),
+        CMakeExtension('ustore.leveldb'),
+        CMakeExtension('ustore.flight_client'),
     ],
     cmdclass={
         'build_ext': CMakeBuild,

@@ -1,0 +1,9 @@
+{
+    "version": "1.0",
+    "directory": "/var/lib/ustore/",
+    "engine": {
+        "config_url": "",
+        "config_file_path": "",
+        "config": {}
+    }
+}

@@ -6,7 +6,7 @@ import json
 import networkx as nx
 import numpy as np
 
-import ukv.umem as ukv
+import ustore.ucset as ustore
 
 
 def flatten(l):
@@ -72,7 +72,7 @@ def fill_db(all_follows, all_views, all_posters, all_people, all_movies):
 
 
 def test():
-    db = ukv.DataBase()
+    db = ustore.DataBase()
 
     all_follows = db['people->people'].graph
     all_views = db['people->movies'].graph

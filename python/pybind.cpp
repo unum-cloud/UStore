@@ -30,14 +30,14 @@
 
 #include "pybind.hpp"
 
-using namespace unum::ukv;
+using namespace unum::ustore;
 using namespace unum;
 
 #define stringify_value_m(a) stringify_m(a)
 #define stringify_m(a) #a
 
-PYBIND11_MODULE(UKV_PYTHON_MODULE_NAME, m) {
-    m.attr("__name__") = "ukv." stringify_value_m(UKV_PYTHON_MODULE_NAME);
+PYBIND11_MODULE(USTORE_PYTHON_MODULE_NAME, m) {
+    m.attr("__name__") = "ustore." stringify_value_m(USTORE_PYTHON_MODULE_NAME);
 
     m.doc() = R"doc(
     ======================================================

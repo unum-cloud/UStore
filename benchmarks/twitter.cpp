@@ -17,14 +17,14 @@
 
 #include <argparse/argparse.hpp>
 
-#include <ukv/ukv.hpp>
-#include <ukv/cpp/ranges.hpp> // `sort_and_deduplicate`
+#include <ustore/ustore.hpp>
+#include <ustore/cpp/ranges.hpp> // `sort_and_deduplicate`
 
 #include "mixed.hpp"
 
 namespace bm = benchmark;
-using namespace unum::ukv::bench;
-using namespace unum::ukv;
+using namespace unum::ustore::bench;
+using namespace unum::ustore;
 using uniform_idx_t = std::uniform_int_distribution<std::size_t>;
 
 constexpr std::size_t id_str_max_length_k = 24;
@@ -58,7 +58,7 @@ static inline std::uint64_t hash_mix_rrxmrrxmsx_0(std::uint64_t v) {
     return v ^ v >> 28;
 }
 
-static inline ukv_key_t hash(id_str_t const& id_str) {
+static inline ustore_key_t hash(id_str_t const& id_str) {
     auto u64s = reinterpret_cast<std::uint64_t const*>(id_str);
     auto mix = hash_mix_rrxmrrxmsx_0(u64s[0]) ^ hash_mix_rrxmrrxmsx_0(u64s[1]) ^ hash_mix_rrxmrrxmsx_0(u64s[2]);
     return mix;
@@ -86,9 +86,9 @@ static std::vector<std::vector<doc_w_key_t>> dataset_docs;
 static std::vector<std::vector<edge_t>> dataset_graph;
 
 static database_t db;
-static ukv_collection_t collection_docs_k = ukv_collection_main_k;
-static ukv_collection_t collection_graph_k = ukv_collection_main_k;
-static ukv_collection_t collection_paths_k = ukv_collection_main_k;
+static ustore_collection_t collection_docs_k = ustore_collection_main_k;
+static ustore_collection_t collection_graph_k = ustore_collection_main_k;
+static ustore_collection_t collection_paths_k = ustore_collection_main_k;
 
 void parse_args(int argc, char* argv[], settings_t& settings) {
     argparse::ArgumentParser program(argv[0]);
@@ -218,16 +218,16 @@ static void index_tweet_doc( //
     if (maybe_user.error() != simdjson::SUCCESS)
         return;
     simdjson::ondemand::object user = maybe_user.value();
-    ukv_key_t id = rewound(tweet)["id"];
+    ustore_key_t id = rewound(tweet)["id"];
 
-    ukv_key_t user_id = rewound(user)["id"];
+    ustore_key_t user_id = rewound(user)["id"];
     std::string_view body = rewound(tweet).raw_json();
     std::string_view user_body = rewound(user).raw_json();
     std::string_view id_str = rewound(tweet)["id_str"].raw_json_token();
     std::string_view user_screen_name = rewound(user)["screen_name"].raw_json_token();
 
-    ukv_key_t re_id;
-    ukv_key_t re_user_id;
+    ustore_key_t re_id;
+    ustore_key_t re_user_id;
     auto maybe_retweet = rewound(tweet)["retweeted_status"];
     if (maybe_retweet.error() == simdjson::SUCCESS) {
         auto retweet = maybe_retweet.get_object().value();
@@ -350,8 +350,8 @@ void sample_tweet_id_batches(bm::State& state, callback_at callback) {
     uniform_idx_t choose_part(0, dataset_docs.size() - 1);
     uniform_idx_t choose_hash(0, copies_per_tweet_k - 1);
 
-    auto const batch_size = static_cast<ukv_size_t>(state.range(0));
-    std::vector<ukv_key_t> batch_keys(batch_size);
+    auto const batch_size = static_cast<ustore_size_t>(state.range(0));
+    std::vector<ustore_key_t> batch_keys(batch_size);
 
     std::size_t iterations = 0;
     std::size_t successes = 0;
@@ -363,7 +363,7 @@ void sample_tweet_id_batches(bm::State& state, callback_at callback) {
             std::size_t const tweet_idx = choose_tweet(gen);
             auto const& tweet = tweets[tweet_idx];
 
-            ukv_key_t tweet_key = tweet.first;
+            ustore_key_t tweet_key = tweet.first;
             if constexpr (copies_per_tweet_k != 1) {
                 std::size_t const hash_idx = choose_hash(gen);
                 tweet_key *= primes_k[hash_idx];
@@ -385,23 +385,23 @@ static void docs_sample_blobs(bm::State& state) {
     arena_t arena(db);
 
     std::size_t received_bytes = 0;
-    sample_tweet_id_batches(state, [&](ukv_key_t const* ids_tweets, ukv_size_t count) {
-        ukv_length_t* offsets = nullptr;
-        ukv_byte_t* values = nullptr;
+    sample_tweet_id_batches(state, [&](ustore_key_t const* ids_tweets, ustore_size_t count) {
+        ustore_length_t* offsets = nullptr;
+        ustore_byte_t* values = nullptr;
 
         status_t status;
-        ukv_read_t read {};
+        ustore_read_t read {};
         read.db = db;
         read.error = status.member_ptr();
         read.arena = arena.member_ptr();
         read.tasks_count = count;
         read.collections = &collection_docs_k;
         read.keys = ids_tweets;
-        read.keys_stride = sizeof(ukv_key_t);
+        read.keys_stride = sizeof(ustore_key_t);
         read.offsets = &offsets;
         read.values = &values;
 
-        ukv_read(&read);
+        ustore_read(&read);
         if (!status)
             return false;
 
@@ -419,24 +419,24 @@ static void docs_sample_objects(bm::State& state) {
     arena_t arena(db);
 
     std::size_t received_bytes = 0;
-    sample_tweet_id_batches(state, [&](ukv_key_t const* ids_tweets, ukv_size_t count) {
-        ukv_length_t* offsets = nullptr;
-        ukv_byte_t* values = nullptr;
+    sample_tweet_id_batches(state, [&](ustore_key_t const* ids_tweets, ustore_size_t count) {
+        ustore_length_t* offsets = nullptr;
+        ustore_byte_t* values = nullptr;
 
         status_t status;
-        ukv_docs_read_t docs_read {};
+        ustore_docs_read_t docs_read {};
         docs_read.db = db;
         docs_read.error = status.member_ptr();
         docs_read.arena = arena.member_ptr();
-        docs_read.type = ukv_doc_field_json_k;
+        docs_read.type = ustore_doc_field_json_k;
         docs_read.tasks_count = count;
         docs_read.collections = &collection_docs_k;
         docs_read.keys = ids_tweets;
-        docs_read.keys_stride = sizeof(ukv_key_t);
+        docs_read.keys_stride = sizeof(ustore_key_t);
         docs_read.offsets = &offsets;
         docs_read.values = &values;
 
-        ukv_docs_read(&docs_read);
+        ustore_docs_read(&docs_read);
         if (!status)
             return false;
 
@@ -450,28 +450,28 @@ static void docs_sample_objects(bm::State& state) {
 static void docs_sample_field(bm::State& state) {
 
     arena_t arena(db);
-    ukv_str_view_t field = "text";
+    ustore_str_view_t field = "text";
 
     std::size_t received_bytes = 0;
-    sample_tweet_id_batches(state, [&](ukv_key_t const* ids_tweets, ukv_size_t count) {
-        ukv_length_t* offsets = nullptr;
-        ukv_byte_t* values = nullptr;
+    sample_tweet_id_batches(state, [&](ustore_key_t const* ids_tweets, ustore_size_t count) {
+        ustore_length_t* offsets = nullptr;
+        ustore_byte_t* values = nullptr;
 
         status_t status;
-        ukv_docs_read_t docs_read {};
+        ustore_docs_read_t docs_read {};
         docs_read.db = db;
         docs_read.error = status.member_ptr();
         docs_read.arena = arena.member_ptr();
-        docs_read.type = ukv_doc_field_str_k;
+        docs_read.type = ustore_doc_field_str_k;
         docs_read.tasks_count = count;
         docs_read.collections = &collection_docs_k;
         docs_read.keys = ids_tweets;
-        docs_read.keys_stride = sizeof(ukv_key_t);
+        docs_read.keys_stride = sizeof(ustore_key_t);
         docs_read.fields = &field;
         docs_read.offsets = &offsets;
         docs_read.values = &values;
 
-        ukv_docs_read(&docs_read);
+        ustore_docs_read(&docs_read);
         if (!status)
             return false;
 
@@ -485,25 +485,25 @@ static void docs_sample_field(bm::State& state) {
 static void docs_sample_table(bm::State& state) {
     arena_t arena(db);
 
-    constexpr ukv_size_t fields_k = 4;
-    ukv_str_view_t names[fields_k] {"timestamp_ms", "reply_count", "retweet_count", "favorite_count"};
-    ukv_doc_field_type_t types[fields_k] {
-        ukv_doc_field_str_k,
-        ukv_doc_field_u32_k,
-        ukv_doc_field_u32_k,
-        ukv_doc_field_u32_k,
+    constexpr ustore_size_t fields_k = 4;
+    ustore_str_view_t names[fields_k] {"timestamp_ms", "reply_count", "retweet_count", "favorite_count"};
+    ustore_doc_field_type_t types[fields_k] {
+        ustore_doc_field_str_k,
+        ustore_doc_field_u32_k,
+        ustore_doc_field_u32_k,
+        ustore_doc_field_u32_k,
     };
 
     std::size_t received_bytes = 0;
-    sample_tweet_id_batches(state, [&](ukv_key_t const* ids_tweets, ukv_size_t count) {
-        ukv_octet_t** validities = nullptr;
-        ukv_byte_t** scalars = nullptr;
-        ukv_length_t** offsets = nullptr;
-        ukv_length_t** lengths = nullptr;
-        ukv_byte_t* strings = nullptr;
+    sample_tweet_id_batches(state, [&](ustore_key_t const* ids_tweets, ustore_size_t count) {
+        ustore_octet_t** validities = nullptr;
+        ustore_byte_t** scalars = nullptr;
+        ustore_length_t** offsets = nullptr;
+        ustore_length_t** lengths = nullptr;
+        ustore_byte_t* strings = nullptr;
 
         status_t status;
-        ukv_docs_gather_t docs_gather {};
+        ustore_docs_gather_t docs_gather {};
         docs_gather.db = db;
         docs_gather.error = status.member_ptr();
         docs_gather.arena = arena.member_ptr();
@@ -511,18 +511,18 @@ static void docs_sample_table(bm::State& state) {
         docs_gather.fields_count = fields_k;
         docs_gather.collections = &collection_docs_k;
         docs_gather.keys = ids_tweets;
-        docs_gather.keys_stride = sizeof(ukv_key_t);
+        docs_gather.keys_stride = sizeof(ustore_key_t);
         docs_gather.fields = names;
-        docs_gather.fields_stride = sizeof(ukv_str_view_t);
+        docs_gather.fields_stride = sizeof(ustore_str_view_t);
         docs_gather.types = types;
-        docs_gather.types_stride = sizeof(ukv_doc_field_type_t);
+        docs_gather.types_stride = sizeof(ustore_doc_field_type_t);
         docs_gather.columns_validities = &validities;
         docs_gather.columns_scalars = &scalars;
         docs_gather.columns_offsets = &offsets;
         docs_gather.columns_lengths = &lengths;
         docs_gather.joined_strings = &strings;
 
-        ukv_docs_gather(&docs_gather);
+        ustore_docs_gather(&docs_gather);
         if (!status)
             return false;
 
@@ -531,8 +531,8 @@ static void docs_sample_table(bm::State& state) {
                                                 &lengths[0][count],
                                                 0ul,
                                                 std::plus<std::size_t> {},
-                                                [](ukv_length_t length) -> std::size_t { //
-                                                    return length == ukv_length_missing_k ? 0u : length;
+                                                [](ustore_length_t length) -> std::size_t { //
+                                                    return length == ustore_length_missing_k ? 0u : length;
                                                 });
         // Others are scalars
         received_bytes += (fields_k - 1) * sizeof(std::uint32_t) * count;
@@ -554,60 +554,60 @@ static void graph_traverse_two_hops(bm::State& state) {
 
     std::size_t received_bytes = 0;
     std::size_t received_edges = 0;
-    sample_tweet_id_batches(state, [&](ukv_key_t const* ids_tweets, ukv_size_t count) {
+    sample_tweet_id_batches(state, [&](ustore_key_t const* ids_tweets, ustore_size_t count) {
         // First hop
-        ukv_vertex_role_t const role = ukv_vertex_role_any_k;
-        ukv_vertex_degree_t* degrees = nullptr;
-        ukv_key_t* ids_in_edges = nullptr;
+        ustore_vertex_role_t const role = ustore_vertex_role_any_k;
+        ustore_vertex_degree_t* degrees = nullptr;
+        ustore_key_t* ids_in_edges = nullptr;
 
         status_t status;
-        ukv_graph_find_edges_t graph_find_edges_first {};
+        ustore_graph_find_edges_t graph_find_edges_first {};
         graph_find_edges_first.db = db;
         graph_find_edges_first.error = status.member_ptr();
         graph_find_edges_first.arena = arena.member_ptr();
         graph_find_edges_first.tasks_count = count;
         graph_find_edges_first.collections = &collection_graph_k;
         graph_find_edges_first.vertices = ids_tweets;
-        graph_find_edges_first.vertices_stride = sizeof(ukv_key_t);
+        graph_find_edges_first.vertices_stride = sizeof(ustore_key_t);
         graph_find_edges_first.roles = &role;
         graph_find_edges_first.degrees_per_vertex = &degrees;
         graph_find_edges_first.edges_per_vertex = &ids_in_edges;
 
-        ukv_graph_find_edges(&graph_find_edges_first);
+        ustore_graph_find_edges(&graph_find_edges_first);
         if (!status)
             return false;
 
         // Now keep only the unique objects
-        auto total_edges = std::transform_reduce(degrees, degrees + count, 0ul, plus, [](ukv_vertex_degree_t d) {
-            return d != ukv_vertex_degree_missing_k ? d : 0;
+        auto total_edges = std::transform_reduce(degrees, degrees + count, 0ul, plus, [](ustore_vertex_degree_t d) {
+            return d != ustore_vertex_degree_missing_k ? d : 0;
         });
         // Compact ~ Remove edge IDs from three-tuples
         for (std::size_t i = 0; i != total_edges; ++i)
             ids_in_edges[i * 2] = ids_in_edges[i * 3], ids_in_edges[i * 2 + 1] = ids_in_edges[i * 3 + 1];
         auto unique_ids = sort_and_deduplicate(ids_in_edges, ids_in_edges + total_edges * 2);
 
-        ukv_graph_find_edges_t graph_find_edges_second {};
+        ustore_graph_find_edges_t graph_find_edges_second {};
         graph_find_edges_second.db = db;
         graph_find_edges_second.error = status.member_ptr();
         graph_find_edges_second.arena = arena.member_ptr();
-        graph_find_edges_second.options = ukv_option_dont_discard_memory_k;
+        graph_find_edges_second.options = ustore_option_dont_discard_memory_k;
         graph_find_edges_second.tasks_count = unique_ids;
         graph_find_edges_second.collections = &collection_graph_k;
         graph_find_edges_second.vertices = ids_in_edges;
-        graph_find_edges_second.vertices_stride = sizeof(ukv_key_t);
+        graph_find_edges_second.vertices_stride = sizeof(ustore_key_t);
         graph_find_edges_second.roles = &role;
         graph_find_edges_second.degrees_per_vertex = &degrees;
         graph_find_edges_second.edges_per_vertex = &ids_in_edges;
 
         // Second hop
-        ukv_graph_find_edges(&graph_find_edges_second);
+        ustore_graph_find_edges(&graph_find_edges_second);
         if (!status)
             return false;
 
-        total_edges += std::transform_reduce(degrees, degrees + unique_ids, 0ul, plus, [](ukv_vertex_degree_t d) {
-            return d != ukv_vertex_degree_missing_k ? d : 0;
+        total_edges += std::transform_reduce(degrees, degrees + unique_ids, 0ul, plus, [](ustore_vertex_degree_t d) {
+            return d != ustore_vertex_degree_missing_k ? d : 0;
         });
-        received_bytes += total_edges * 3 * sizeof(ukv_key_t);
+        received_bytes += total_edges * 3 * sizeof(ustore_key_t);
         received_edges += total_edges;
         return true;
     });
@@ -624,7 +624,7 @@ int main(int argc, char** argv) {
     settings_t settings;
     parse_args(argc, argv, settings);
 
-#if defined(UKV_DEBUG)
+#if defined(USTORE_DEBUG)
     settings.max_input_files = 1;
     settings.max_tweets_count = 100'000;
     settings.threads_count = 1;
@@ -728,11 +728,11 @@ int main(int argc, char** argv) {
     std::printf("- indexed %zu paths\n", pass_through_size(dataset_paths));
 
 // 4. Run the actual benchmarks
-#if defined(UKV_ENGINE_IS_LEVELDB)
+#if defined(USTORE_ENGINE_IS_LEVELDB)
     db.open(R"({"version": "1.0", "directory": "/mnt/md0/Twitter/LevelDB"})").throw_unhandled();
-#elif defined(UKV_ENGINE_IS_ROCKSDB)
+#elif defined(USTORE_ENGINE_IS_ROCKSDB)
     db.open(R"({"version": "1.0", "directory": "/mnt/md0/Twitter/RocksDB"})").throw_unhandled();
-#elif defined(UKV_ENGINE_IS_UDISK)
+#elif defined(USTORE_ENGINE_IS_UDISK)
     db.open(R"({"version": "1.0", "directory": "/mnt/md0/Twitter/UnumDB"})").throw_unhandled();
 #else
     db.open().throw_unhandled();
@@ -740,27 +740,27 @@ int main(int argc, char** argv) {
 
     bool can_build_graph = false;
     bool can_build_paths = false;
-    if (ukv_supports_named_collections_k) {
+    if (ustore_supports_named_collections_k) {
         status_t status;
-        ukv_collection_create_t collection_init {};
+        ustore_collection_create_t collection_init {};
         collection_init.db = db;
         collection_init.error = status.member_ptr();
         collection_init.name = "twitter.docs";
         collection_init.config = "";
         collection_init.id = &collection_docs_k;
 
-        ukv_collection_create(&collection_init);
+        ustore_collection_create(&collection_init);
         status.throw_unhandled();
 
         collection_init.name = "twitter.graph";
         collection_init.id = &collection_graph_k;
-        ukv_collection_create(&collection_init);
+        ustore_collection_create(&collection_init);
         status.throw_unhandled();
         can_build_graph = true;
 
         collection_init.name = "twitter.nicks";
         collection_init.id = &collection_paths_k;
-        ukv_collection_create(&collection_init);
+        ustore_collection_create(&collection_init);
         status.throw_unhandled();
         can_build_paths = true;
     }
@@ -786,7 +786,7 @@ int main(int argc, char** argv) {
             ->Threads(settings.threads_count)
             ->Arg(settings.big_batch_size);
 
-    if (ukv_doc_field_default_k != ukv_doc_field_json_k)
+    if (ustore_doc_field_default_k != ustore_doc_field_json_k)
         bm::RegisterBenchmark("docs_sample_blobs", &docs_sample_blobs) //
             ->MinTime(settings.min_seconds)
             ->UseRealTime()

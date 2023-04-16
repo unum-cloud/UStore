@@ -6,7 +6,7 @@ import networkx as nx
 from networkx.algorithms.community import louvain_communities as networkx_louvain
 
 
-import ukv.umem as ukv
+import ustore.ucset as ustore
 import louvain
 
 dataset_dir = 'tmp/'
@@ -35,7 +35,7 @@ if __name__ == "__main__":
         t2 = time.perf_counter()
         print('Elapsed time for {} dataset with NetworkX: {:.3f}s '.format(name, t2-t1))
 
-        graph = ukv.DataBase().main.graph
+        graph = ustore.DataBase().main.graph
         for v1, v2 in G.edges:
             graph.add_edge(v1, v2)
         G.clear()
@@ -44,10 +44,11 @@ if __name__ == "__main__":
         louvain.best_partition(graph)
         t2 = time.perf_counter()
 
-        print('Elapsed time for {} dataset with UKV Python: {:.3f}s '.format(name, t2-t1))
+        print('Elapsed time for {} dataset with UStore Python: {:.3f}s '.format(
+            name, t2-t1))
 
         t1 = time.perf_counter()
         graph.community_louvain()
         t2 = time.perf_counter()
 
-        print('Elapsed time for {} dataset with UKV CPP: {:.3f}s '.format(name, t2-t1))
+        print('Elapsed time for {} dataset with UStore C++: {:.3f}s '.format(name, t2-t1))

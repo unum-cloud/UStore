@@ -61,9 +61,9 @@
         "variant": "cpp",
         "*.ipp": "cpp",
         "valarray": "cpp",
-        "cloud_unum_ukv_database.h": "c",
-        "cloud_unum_ukv_transaction.h": "c",
-        "cloud_unum_ukv_shared.h": "c",
+        "cloud_unum_ustore_database.h": "c",
+        "cloud_unum_ustore_transaction.h": "c",
+        "cloud_unum_ustore_shared.h": "c",
         "complex": "cpp",
         "cwctype": "cpp",
         "list": "cpp",
@@ -132,7 +132,7 @@
     "java.test.config": {},
     "java.project.sourcePaths": [
         "java",
-        "java/com/unum/ukv"
+        "java/com/unum/ustore"
     ],
     "java.project.referencedLibraries": [
         "build/lib/**/*.jar"
@@ -173,7 +173,7 @@
         "txns",
         "ucset",
         "ujrpc",
-        "umem",
+        "ucset",
         "UNUMDB",
         "upsert",
         "upserting",

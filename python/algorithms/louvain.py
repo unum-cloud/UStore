@@ -1,6 +1,6 @@
 # Baseline Python implementation of Louvain Community detection algorithm,
 # similar to the one in NetworkX, designed to operate with both in-memory
-# graphs and the ones persisted in UKV.
+# graphs and the ones persisted in UStore.
 from typing import Mapping, Tuple
 
 import networkx as nx

@@ -18,9 +18,9 @@ If you are using VSCode, as we do, the `.vscode` top-level directory already com
 ```sh
 cmake \
     -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-    -DUKV_BUILD_BENCHMARKS=0 \
-    -DUKV_BUILD_TESTS=1 \
-    -DUKV_BUILD_ENGINE_ROCKSDB=1 \
+    -DUSTORE_BUILD_BENCHMARKS=0 \
+    -DUSTORE_BUILD_TESTS=1 \
+    -DUSTORE_BUILD_ENGINE_ROCKSDB=1 \
     -B ./build_release && \
     make -j 12 -C ./build_release
 ```

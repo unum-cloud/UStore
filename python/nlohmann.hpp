@@ -2,14 +2,14 @@
  * @brief Unlike @see "pybind11/nlohmann.hpp" provides a more fine-grained
  * control over how the conversion is implemented.
  *
- * TODO: Revert to this: https://github.com/ashvardanian/ukv/commit/6d6df13188efb0ad12d67c96ce2904fda6c838d0
+ * TODO: Revert to this: https://github.com/ashvardanian/ustore/commit/6d6df13188efb0ad12d67c96ce2904fda6c838d0
  */
 #pragma once
 #include <fmt/core.h>
 #include <pybind11/pybind11.h>
 #include <nlohmann/json.hpp>
 
-namespace unum::ukv::pyb {
+namespace unum::ustore::pyb {
 
 namespace py = pybind11;
 using json_t = nlohmann::json;
@@ -149,4 +149,4 @@ inline void to_string(PyObject* obj, std::string& output) {
         throw std::runtime_error("invalid type for conversion.");
 }
 
-} // namespace unum::ukv::pyb
+} // namespace unum::ustore::pyb

@@ -1,0 +1,19 @@
+{
+    "version": "1.0",
+    "directory": "./tmp/ustore_embedded_leveldb/",
+    "data_directories": [],
+    "engine": {
+        "config_url": "",
+        "config_file_path": "./engine_leveldb.json",
+        "config": {
+            "write_buffer_size": 134217728,
+            "max_file_size": 134217728,
+            "max_open_files": -1,
+            "cache_size": 200000,
+            "create_if_missing": true,
+            "error_if_exists": false,
+            "paranoid_checks": false,
+            "compression": null
+        }
+    }
+}

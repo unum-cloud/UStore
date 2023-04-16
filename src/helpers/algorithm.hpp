@@ -9,7 +9,7 @@
 #include <numeric>   // `std::accumulate`
 #include <forward_list>
 
-namespace unum::ukv {
+namespace unum::ustore {
 
 template <typename range_at, typename comparable_at>
 inline range_at equal_subrange(range_at range, comparable_at&& comparable) {
@@ -44,4 +44,4 @@ element_at inplace_inclusive_prefix_sum(element_at* begin, element_at* const end
 inline void deduplicate_gather_join_scatter() {
 }
 
-} // namespace unum::ukv
+} // namespace unum::ustore

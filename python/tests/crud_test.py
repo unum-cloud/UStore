@@ -1,7 +1,7 @@
 import pytest
 import numpy as np
 
-import ukv.umem as ukv
+import ustore.ucset as ustore
 
 
 def only_explicit(col):
@@ -168,7 +168,7 @@ def iterate(col):
 
 
 def test_main_collection():
-    db = ukv.DataBase()
+    db = ustore.DataBase()
     main = db.main
     only_explicit(main)
     only_explicit_batch(main)
@@ -180,7 +180,7 @@ def test_main_collection():
 
 
 def test_named_collections():
-    db = ukv.DataBase()
+    db = ustore.DataBase()
     col_sub = db['sub']
     col_dub = db['dub']
     scan(col_sub)
@@ -199,37 +199,37 @@ def test_named_collections():
 
 def test_main_collection_txn():
 
-    db = ukv.DataBase()
+    db = ustore.DataBase()
 
-    txn = ukv.Transaction(db)
+    txn = ustore.Transaction(db)
     only_explicit(txn.main)
     txn.commit()
 
-    txn = ukv.Transaction(db)
+    txn = ustore.Transaction(db)
     only_explicit_batch(txn.main)
     txn.commit()
 
-    txn = ukv.Transaction(db)
+    txn = ustore.Transaction(db)
     only_overwrite(txn.main)
     txn.commit()
 
-    txn = ukv.Transaction(db)
+    txn = ustore.Transaction(db)
     only_operators(txn.main)
     txn.commit()
 
 
 def test_main_collection_txn_ctx():
 
-    with ukv.DataBase() as db:
-        with ukv.Transaction(db) as txn:
+    with ustore.DataBase() as db:
+        with ustore.Transaction(db) as txn:
             only_explicit(txn.main)
 
-    with ukv.DataBase() as db:
-        with ukv.Transaction(db) as txn:
+    with ustore.DataBase() as db:
+        with ustore.Transaction(db) as txn:
             only_operators(txn.main)
 
-    with ukv.DataBase() as db:
-        with ukv.Transaction(db) as txn:
+    with ustore.DataBase() as db:
+        with ustore.Transaction(db) as txn:
             only_explicit_batch(txn.main)
 
 
@@ -322,7 +322,7 @@ def doc_merging(col):
 
 
 def test_docs():
-    db = ukv.DataBase()
+    db = ustore.DataBase()
     col = db['doc_col'].docs
     doc_scan(col)
     doc_iterate(col)
@@ -339,7 +339,7 @@ def test_docs():
 
 
 def test_docs_batch():
-    db = ukv.DataBase()
+    db = ustore.DataBase()
     doc_col = db['batch_col'].docs
 
     # Batch Set

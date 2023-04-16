@@ -7,17 +7,17 @@
 #include <arrow/array.h>
 #include <arrow/python/pyarrow.h>
 
-#include "ukv/ukv.h"
+#include "ustore/ustore.h"
 #include "cast_args.hpp"
 
-namespace unum::ukv::pyb {
+namespace unum::ustore::pyb {
 
 struct py_bin_req_t {
-    ukv_key_t key {ukv_key_unknown_k};
-    ukv_str_view_t field {nullptr};
-    ukv_bytes_ptr_t ptr {nullptr};
-    ukv_length_t off {0};
-    ukv_length_t len {0};
+    ustore_key_t key {ustore_key_unknown_k};
+    ustore_str_view_t field {nullptr};
+    ustore_bytes_ptr_t ptr {nullptr};
+    ustore_length_t off {0};
+    ustore_length_t len {0};
 };
 
 #pragma region Writes
@@ -30,12 +30,12 @@ template <typename collection_at>
 static void write_one_binary(py_collection_gt<collection_at>& collection, PyObject* key_py, PyObject* val_py) {
 
     status_t status;
-    ukv_key_t key = py_to_scalar<ukv_key_t>(key_py);
+    ustore_key_t key = py_to_scalar<ustore_key_t>(key_py);
     value_view_t val = py_to_bytes(val_py);
 
     [[maybe_unused]] py::gil_scoped_release release;
 
-    ukv_write_t write {};
+    ustore_write_t write {};
     write.db = collection.db();
     write.error = status.member_ptr();
     write.transaction = collection.txn();
@@ -47,7 +47,7 @@ static void write_one_binary(py_collection_gt<collection_at>& collection, PyObje
     write.lengths = val.member_length();
     write.values = val.member_ptr();
 
-    ukv_write(&write);
+    ustore_write(&write);
     status.throw_unhandled();
 }
 
@@ -62,7 +62,7 @@ static void write_many_binaries(py_collection_gt<collection_at>& collection, PyO
 
     [[maybe_unused]] py::gil_scoped_release release;
 
-    ukv_write_t write {};
+    ustore_write_t write {};
     write.db = collection.db();
     write.error = status.member_ptr();
     write.transaction = collection.txn();
@@ -80,7 +80,7 @@ static void write_many_binaries(py_collection_gt<collection_at>& collection, PyO
     write.values = contents.contents_begin.get();
     write.values_stride = contents.contents_begin.stride();
 
-    ukv_write(&write);
+    ustore_write(&write);
 
     status.throw_unhandled();
 }
@@ -94,7 +94,7 @@ static void broadcast_binary(py_blobs_collection_t& collection, py::object keys_
 
     [[maybe_unused]] py::gil_scoped_release release;
 
-    ukv_write_t write {};
+    ustore_write_t write {};
     write.db = collection.db();
     write.error = status.member_ptr();
     write.transaction = collection.txn();
@@ -107,7 +107,7 @@ static void broadcast_binary(py_blobs_collection_t& collection, py::object keys_
     write.lengths = val.member_length();
     write.values = val.member_ptr();
 
-    ukv_write(&write);
+    ustore_write(&write);
 
     status.throw_unhandled();
 }
@@ -118,12 +118,12 @@ template <typename collection_at>
 static py::object has_one_binary(py_collection_gt<collection_at>& collection, PyObject* key_py) {
 
     status_t status;
-    ukv_key_t key = py_to_scalar<ukv_key_t>(key_py);
-    ukv_octet_t* found_presences = nullptr;
+    ustore_key_t key = py_to_scalar<ustore_key_t>(key_py);
+    ustore_octet_t* found_presences = nullptr;
 
     {
         [[maybe_unused]] py::gil_scoped_release release;
-        ukv_read_t read {};
+        ustore_read_t read {};
         read.db = collection.db();
         read.error = status.member_ptr();
         read.transaction = collection.txn();
@@ -134,7 +134,7 @@ static py::object has_one_binary(py_collection_gt<collection_at>& collection, Py
         read.keys = &key;
         read.presences = &found_presences;
 
-        ukv_read(&read);
+        ustore_read(&read);
         status.throw_unhandled();
     }
 
@@ -152,13 +152,13 @@ static py::object has_one_binary(py_collection_gt<collection_at>& collection, Py
 static py::object read_one_binary(py_blobs_collection_t& collection, PyObject* key_py) {
 
     status_t status;
-    ukv_key_t key = py_to_scalar<ukv_key_t>(key_py);
-    ukv_length_t* found_lengths = nullptr;
-    ukv_bytes_ptr_t found_values = nullptr;
+    ustore_key_t key = py_to_scalar<ustore_key_t>(key_py);
+    ustore_length_t* found_lengths = nullptr;
+    ustore_bytes_ptr_t found_values = nullptr;
 
     {
         [[maybe_unused]] py::gil_scoped_release release;
-        ukv_read_t read {};
+        ustore_read_t read {};
         read.db = collection.db();
         read.error = status.member_ptr();
         read.transaction = collection.txn();
@@ -170,7 +170,7 @@ static py::object read_one_binary(py_blobs_collection_t& collection, PyObject* k
         read.lengths = &found_lengths;
         read.values = &found_values;
 
-        ukv_read(&read);
+        ustore_read(&read);
         status.throw_unhandled();
     }
 
@@ -190,14 +190,14 @@ template <typename collection_at>
 static py::object has_many_binaries(py_collection_gt<collection_at>& collection, PyObject* keys_py) {
 
     status_t status;
-    ukv_octet_t* found_presences = nullptr;
+    ustore_octet_t* found_presences = nullptr;
 
     parsed_places_t parsed_places {keys_py, collection.native};
     places_arg_t places = parsed_places;
 
     {
         [[maybe_unused]] py::gil_scoped_release release;
-        ukv_read_t read {};
+        ustore_read_t read {};
         read.db = collection.db();
         read.error = status.member_ptr();
         read.transaction = collection.txn();
@@ -209,7 +209,7 @@ static py::object has_many_binaries(py_collection_gt<collection_at>& collection,
         read.keys_stride = places.keys_begin.stride();
         read.presences = &found_presences;
 
-        ukv_read(&read);
+        ustore_read(&read);
         status.throw_unhandled();
     }
 
@@ -225,10 +225,10 @@ static py::object has_many_binaries(py_collection_gt<collection_at>& collection,
 static py::object read_many_binaries(py_blobs_collection_t& collection, PyObject* keys_py) {
 
     status_t status;
-    ukv_octet_t* found_presences = nullptr;
-    ukv_length_t* found_offsets = nullptr;
-    ukv_length_t* found_lengths = nullptr;
-    ukv_bytes_ptr_t found_values = nullptr;
+    ustore_octet_t* found_presences = nullptr;
+    ustore_length_t* found_offsets = nullptr;
+    ustore_length_t* found_lengths = nullptr;
+    ustore_bytes_ptr_t found_values = nullptr;
     bool const export_arrow = collection.export_into_arrow();
 
     parsed_places_t parsed_places {keys_py, collection.native};
@@ -236,7 +236,7 @@ static py::object read_many_binaries(py_blobs_collection_t& collection, PyObject
 
     {
         [[maybe_unused]] py::gil_scoped_release release;
-        ukv_read_t read {};
+        ustore_read_t read {};
         read.db = collection.db();
         read.error = status.member_ptr();
         read.transaction = collection.txn();
@@ -252,7 +252,7 @@ static py::object read_many_binaries(py_blobs_collection_t& collection, PyObject
         read.lengths = !export_arrow ? &found_lengths : nullptr;
         read.values = &found_values;
 
-        ukv_read(&read);
+        ustore_read(&read);
         status.throw_unhandled();
     }
 
@@ -260,7 +260,7 @@ static py::object read_many_binaries(py_blobs_collection_t& collection, PyObject
         auto shared_length = static_cast<int64_t>(places.count);
         auto shared_offsets = std::make_shared<arrow::Buffer>( //
             reinterpret_cast<uint8_t*>(found_offsets),
-            (shared_length + 1) * sizeof(ukv_length_t));
+            (shared_length + 1) * sizeof(ustore_length_t));
         auto shared_data = std::make_shared<arrow::Buffer>( //
             reinterpret_cast<uint8_t*>(found_values),
             static_cast<int64_t>(found_offsets[places.count]));
@@ -312,7 +312,7 @@ static void remove_binary(py_collection_gt<collection_at>& collection, py::objec
 
 static void update_binary(py_blobs_collection_t& collection, py::object dict_py) {
     status_t status;
-    ukv_size_t step = sizeof(py_bin_req_t);
+    ustore_size_t step = sizeof(py_bin_req_t);
 
     std::vector<py_bin_req_t> keys;
     keys.reserve(PyDict_Size(dict_py.ptr()));
@@ -321,21 +321,21 @@ static void update_binary(py_blobs_collection_t& collection, py::object dict_py)
     py_scan_dict(dict_py.ptr(), [&](PyObject* key_obj, PyObject* val_obj) {
         auto val = py_to_bytes(val_obj);
         py_bin_req_t& req = keys[key_idx];
-        req.key = py_to_scalar<ukv_key_t>(key_obj);
-        req.ptr = ukv_bytes_ptr_t(val.begin());
-        req.len = static_cast<ukv_length_t>(val.size());
+        req.key = py_to_scalar<ustore_key_t>(key_obj);
+        req.ptr = ustore_bytes_ptr_t(val.begin());
+        req.len = static_cast<ustore_length_t>(val.size());
         ++key_idx;
     });
 
     [[maybe_unused]] py::gil_scoped_release release;
 
-    ukv_write_t write {};
+    ustore_write_t write {};
     write.db = collection.db();
     write.error = status.member_ptr();
     write.transaction = collection.txn();
     write.arena = collection.member_arena();
     write.options = collection.options();
-    write.tasks_count = static_cast<ukv_size_t>(keys.size());
+    write.tasks_count = static_cast<ustore_size_t>(keys.size());
     write.collections = collection.member_collection();
     write.keys = &keys[0].key;
     write.keys_stride = step;
@@ -346,21 +346,21 @@ static void update_binary(py_blobs_collection_t& collection, py::object dict_py)
     write.values = &keys[0].ptr;
     write.values_stride = step;
 
-    ukv_write(&write);
+    ustore_write(&write);
     status.throw_unhandled();
 }
 
 template <typename collection_at>
-static py::array_t<ukv_key_t> scan_binary( //
+static py::array_t<ustore_key_t> scan_binary( //
     py_collection_gt<collection_at>& collection,
-    ukv_key_t min_key,
-    ukv_length_t count_limit) {
+    ustore_key_t min_key,
+    ustore_length_t count_limit) {
 
     status_t status;
-    ukv_length_t* found_lengths = nullptr;
-    ukv_key_t* found_keys = nullptr;
+    ustore_length_t* found_lengths = nullptr;
+    ustore_key_t* found_keys = nullptr;
     bool const export_arrow = collection.export_into_arrow();
-    ukv_scan_t scan {};
+    ustore_scan_t scan {};
     scan.db = collection.db();
     scan.error = status.member_ptr();
     scan.transaction = collection.txn();
@@ -373,7 +373,7 @@ static py::array_t<ukv_key_t> scan_binary( //
     scan.counts = &found_lengths;
     scan.keys = &found_keys;
 
-    ukv_scan(&scan);
+    ustore_scan(&scan);
 
     status.throw_unhandled();
 
@@ -381,14 +381,14 @@ static py::array_t<ukv_key_t> scan_binary( //
         auto shared_length = static_cast<int64_t>(found_lengths[0]);
         auto shared_data = std::make_shared<arrow::Buffer>( //
             reinterpret_cast<uint8_t*>(found_keys),
-            shared_length * sizeof(ukv_key_t));
-        static_assert(std::is_same_v<ukv_key_t, int64_t>, "Change the following line!");
+            shared_length * sizeof(ustore_key_t));
+        static_assert(std::is_same_v<ustore_key_t, int64_t>, "Change the following line!");
         auto shared = std::make_shared<arrow::NumericArray<arrow::Int64Type>>(shared_length, shared_data);
         PyObject* obj_ptr = arrow::py::wrap_array(std::static_pointer_cast<arrow::Array>(shared));
         return py::reinterpret_steal<py::object>(obj_ptr);
     }
     else
-        return py::array_t<ukv_key_t>(found_lengths[0], found_keys);
+        return py::array_t<ustore_key_t>(found_lengths[0], found_keys);
 }
 
 template <typename collection_at>
@@ -421,9 +421,9 @@ static std::size_t get_length(py_collection_gt<collection_at>& collection) {
  * https://docs.python.org/3/c-api/buffer.html
  */
 void fill_tensor( //
-    ukv_database_t db_ptr,
-    ukv_transaction_t txn_ptr,
-    ukv_collection_t collection_ptr,
+    ustore_database_t db_ptr,
+    ustore_transaction_t txn_ptr,
+    ustore_collection_t collection_ptr,
     managed_arena_t& arena,
     py::handle keys_arr,
     py::handle values_arr,
@@ -450,14 +450,14 @@ void fill_tensor( //
         throw std::invalid_argument("Outputs shape wasn't inferred");
 
     // Validate the format of `keys`
-    if (keys.py.itemsize != sizeof(ukv_key_t))
+    if (keys.py.itemsize != sizeof(ustore_key_t))
         throw std::invalid_argument("Keys type mismatch");
     if (keys.py.ndim != 1 || !PyBuffer_IsContiguous(&keys.py, 'A'))
         throw std::invalid_argument("Keys must be placed in a continuous 1 dimensional array");
-    if (keys.py.strides[0] != sizeof(ukv_key_t))
+    if (keys.py.strides[0] != sizeof(ustore_key_t))
         throw std::invalid_argument("Keys can't be strided");
-    ukv_size_t const tasks_count = static_cast<ukv_size_t>(keys.py.len / keys.py.itemsize);
-    ukv_key_t const* keys_ptr = reinterpret_cast<ukv_key_t const*>(keys.py.buf);
+    ustore_size_t const tasks_count = static_cast<ustore_size_t>(keys.py.len / keys.py.itemsize);
+    ustore_key_t const* keys_ptr = reinterpret_cast<ustore_key_t const*>(keys.py.buf);
 
     // Validate the format of `values`
     if (values.py.ndim != 2)
@@ -468,22 +468,22 @@ void fill_tensor( //
         throw std::invalid_argument("Output tensor sides can't be zero");
     if ((values.py.strides[0] <= 0) || values.py.strides[1] <= 0)
         throw std::invalid_argument("Output tensor strides can't be negative");
-    if (tasks_count != static_cast<ukv_size_t>(values.py.shape[0]))
+    if (tasks_count != static_cast<ustore_size_t>(values.py.shape[0]))
         throw std::invalid_argument("Number of input keys and output slots doesn't match");
     auto outputs_bytes = reinterpret_cast<std::uint8_t*>(values.py.buf);
     auto outputs_bytes_stride = static_cast<std::size_t>(values.py.strides[0]);
-    auto output_bytes_cap = static_cast<ukv_length_t>(values.py.shape[1]);
+    auto output_bytes_cap = static_cast<ustore_length_t>(values.py.shape[1]);
 
     // Validate the format of `values_lengths`
     if (values_lengths.py.ndim != 1)
         throw std::invalid_argument("Lengths tensor must have rank 1");
-    if (values_lengths.py.itemsize != sizeof(ukv_length_t))
+    if (values_lengths.py.itemsize != sizeof(ustore_length_t))
         throw std::invalid_argument("Lengths tensor must have 4-byte entries");
     if (values_lengths.py.shape[0] <= 0)
         throw std::invalid_argument("Lengths tensor sides can't be zero");
     if (values_lengths.py.strides[0] <= 0)
         throw std::invalid_argument("Lengths tensor strides can't be negative");
-    if (tasks_count != static_cast<ukv_size_t>(values_lengths.py.shape[0]))
+    if (tasks_count != static_cast<ustore_size_t>(values_lengths.py.shape[0]))
         throw std::invalid_argument("Number of input keys and output slots doesn't match");
     auto outputs_lengths_bytes = reinterpret_cast<std::uint8_t*>(values_lengths.py.buf);
     auto outputs_lengths_bytes_stride = static_cast<std::size_t>(values_lengths.py.strides[0]);
@@ -491,10 +491,10 @@ void fill_tensor( //
     // Perform the read
     [[maybe_unused]] py::gil_scoped_release release;
     status_t status;
-    ukv_length_t* found_lengths = nullptr;
-    ukv_bytes_ptr_t found_values = nullptr;
-    ukv_options_t options = ukv_options_default_k;
-    ukv_read_t read {};
+    ustore_length_t* found_lengths = nullptr;
+    ustore_bytes_ptr_t found_values = nullptr;
+    ustore_options_t options = ustore_options_default_k;
+    ustore_read_t read {};
     read.db = db_ptr;
     read.error = status.internal_cptr();
     read.transaction = txn_ptr;
@@ -503,24 +503,24 @@ void fill_tensor( //
     read.tasks_count = tasks_count;
     read.collections = &collection_ptr;
     read.keys = keys_ptr;
-    read.keys_stride = sizeof(ukv_key_t);
+    read.keys_stride = sizeof(ustore_key_t);
     read.lengths = &found_lengths;
     read.values = &found_values;
 
-    ukv_read(&read);
+    ustore_read(&read);
 
     status.throw_unhandled();
 
     // Export the data into the matrix
     taped_values_view_t inputs {found_lengths, found_values, tasks_count};
     tape_iterator_t input_it = inputs.begin();
-    for (ukv_size_t i = 0; i != tasks_count; ++i, ++input_it) {
+    for (ustore_size_t i = 0; i != tasks_count; ++i, ++input_it) {
         value_view_t input = *input_it;
         auto input_bytes = reinterpret_cast<std::uint8_t const*>(input.begin());
-        auto input_length = static_cast<ukv_length_t const>(input.size());
+        auto input_length = static_cast<ustore_length_t const>(input.size());
         std::uint8_t* output_bytes = outputs_bytes + outputs_bytes_stride * i;
-        ukv_length_t& output_length =
-            *reinterpret_cast<ukv_length_t*>(outputs_lengths_bytes + outputs_lengths_bytes_stride * i);
+        ustore_length_t& output_length =
+            *reinterpret_cast<ustore_length_t*>(outputs_lengths_bytes + outputs_lengths_bytes_stride * i);
 
         std::size_t count_copy = std::min(output_bytes_cap, input_length);
         std::size_t count_pads = output_bytes_cap - count_copy;
@@ -532,4 +532,4 @@ void fill_tensor( //
 }
 #endif
 
-} // namespace unum::ukv::pyb
+} // namespace unum::ustore::pyb

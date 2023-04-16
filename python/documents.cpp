@@ -3,39 +3,39 @@
 #include "crud.hpp"
 #include "nlohmann.hpp"
 
-using namespace unum::ukv::pyb;
-using namespace unum::ukv;
+using namespace unum::ustore::pyb;
+using namespace unum::ustore;
 using namespace unum;
 
 class docs_pairs_stream_t {
 
-    ukv_database_t db_ = nullptr;
-    ukv_collection_t collection_ = ukv_collection_main_k;
-    ukv_transaction_t txn_ = nullptr;
-    ukv_snapshot_t snap_ = 0;
+    ustore_database_t db_ = nullptr;
+    ustore_collection_t collection_ = ustore_collection_main_k;
+    ustore_transaction_t txn_ = nullptr;
+    ustore_snapshot_t snap_ = 0;
 
     arena_t arena_scan_;
     arena_t arena_read_;
-    ukv_length_t read_ahead_ = 0;
+    ustore_length_t read_ahead_ = 0;
 
-    ukv_key_t next_min_key_ = std::numeric_limits<ukv_key_t>::min();
-    ptr_range_gt<ukv_key_t> fetched_keys_;
+    ustore_key_t next_min_key_ = std::numeric_limits<ustore_key_t>::min();
+    ptr_range_gt<ustore_key_t> fetched_keys_;
     embedded_blobs_t values_view;
     std::size_t fetched_offset_ = 0;
 
     status_t prefetch() noexcept {
 
-        if (next_min_key_ == ukv_key_unknown_k)
+        if (next_min_key_ == ustore_key_unknown_k)
             return {};
 
-        ukv_key_t* found_keys {};
-        ukv_length_t* found_offsets {};
-        ukv_length_t* found_counts {};
-        ukv_length_t* found_lengths {};
-        ukv_bytes_ptr_t found_values {};
-        ukv_str_view_t fields {};
+        ustore_key_t* found_keys {};
+        ustore_length_t* found_offsets {};
+        ustore_length_t* found_counts {};
+        ustore_length_t* found_lengths {};
+        ustore_bytes_ptr_t found_values {};
+        ustore_str_view_t fields {};
         status_t status {};
-        ukv_scan_t scan {};
+        ustore_scan_t scan {};
         scan.db = db_;
         scan.error = status.member_ptr();
         scan.transaction = txn_;
@@ -48,51 +48,51 @@ class docs_pairs_stream_t {
         scan.counts = &found_counts;
         scan.keys = &found_keys;
 
-        ukv_scan(&scan);
+        ustore_scan(&scan);
         if (!status)
             return status;
 
-        fetched_keys_ = ptr_range_gt<ukv_key_t> {found_keys, found_keys + *found_counts};
+        fetched_keys_ = ptr_range_gt<ustore_key_t> {found_keys, found_keys + *found_counts};
         fetched_offset_ = 0;
-        auto count = static_cast<ukv_size_t>(fetched_keys_.size());
-        ukv_docs_read_t docs_read {};
+        auto count = static_cast<ustore_size_t>(fetched_keys_.size());
+        ustore_docs_read_t docs_read {};
         docs_read.db = db_;
         docs_read.error = status.member_ptr();
         docs_read.transaction = txn_;
         docs_read.snapshot = snap_;
         docs_read.arena = arena_read_.member_ptr();
-        docs_read.type = ukv_doc_field_json_k;
+        docs_read.type = ustore_doc_field_json_k;
         docs_read.tasks_count = count;
         docs_read.collections = &collection_;
         docs_read.keys = found_keys;
-        docs_read.keys_stride = sizeof(ukv_key_t);
+        docs_read.keys_stride = sizeof(ustore_key_t);
         docs_read.fields = &fields;
         docs_read.fields_stride = 0;
         docs_read.offsets = &found_offsets;
         docs_read.lengths = &found_lengths;
         docs_read.values = &found_values;
 
-        ukv_docs_read(&docs_read);
+        ustore_docs_read(&docs_read);
         if (!status)
             return status;
 
         values_view = embedded_blobs_t {count, found_offsets, found_lengths, found_values};
-        next_min_key_ = count <= read_ahead_ ? ukv_key_unknown_k : fetched_keys_[count - 1] + 1;
+        next_min_key_ = count <= read_ahead_ ? ustore_key_unknown_k : fetched_keys_[count - 1] + 1;
         return {};
     }
 
   public:
     static constexpr std::size_t default_read_ahead_k = 256;
 
-    docs_pairs_stream_t(ukv_database_t db,
-                        ukv_collection_t collection = ukv_collection_main_k,
+    docs_pairs_stream_t(ustore_database_t db,
+                        ustore_collection_t collection = ustore_collection_main_k,
                         std::size_t read_ahead = docs_pairs_stream_t::default_read_ahead_k,
-                        ukv_transaction_t txn = nullptr,
-                        ukv_snapshot_t snap = {})
+                        ustore_transaction_t txn = nullptr,
+                        ustore_snapshot_t snap = {})
         : db_(db), collection_(collection), txn_(txn), snap_(snap), arena_scan_(db_), arena_read_(db_),
-          read_ahead_(static_cast<ukv_size_t>(read_ahead)) {}
+          read_ahead_(static_cast<ustore_size_t>(read_ahead)) {}
 
-    status_t seek(ukv_key_t key) noexcept {
+    status_t seek(ustore_key_t key) noexcept {
         fetched_keys_ = {};
         fetched_offset_ = 0;
         next_min_key_ = key;
@@ -113,11 +113,11 @@ class docs_pairs_stream_t {
 
         fetched_keys_ = {};
         fetched_offset_ = 0;
-        next_min_key_ = ukv_key_unknown_k;
+        next_min_key_ = ustore_key_unknown_k;
         return *this;
     }
 
-    ukv_key_t key() const noexcept { return fetched_keys_[fetched_offset_]; }
+    ustore_key_t key() const noexcept { return fetched_keys_[fetched_offset_]; }
     value_view_t value() const noexcept {
         auto it = values_view.begin();
         for (size_t i = 0; i != fetched_offset_; ++i)
@@ -126,36 +126,36 @@ class docs_pairs_stream_t {
     }
 
     bool is_end() const noexcept {
-        return next_min_key_ == ukv_key_unknown_k && fetched_offset_ >= fetched_keys_.size();
+        return next_min_key_ == ustore_key_unknown_k && fetched_offset_ >= fetched_keys_.size();
     }
 };
 
 class py_docs_kvrange_t {
 
-    ukv_database_t db_;
-    ukv_transaction_t txn_;
-    ukv_collection_t collection_;
-    ukv_key_t min_key_;
-    ukv_key_t max_key_;
+    ustore_database_t db_;
+    ustore_transaction_t txn_;
+    ustore_collection_t collection_;
+    ustore_key_t min_key_;
+    ustore_key_t max_key_;
 
   public:
-    py_docs_kvrange_t(ukv_database_t db,
-                      ukv_transaction_t txn = nullptr,
-                      ukv_collection_t collection = ukv_collection_main_k,
-                      ukv_key_t min_key = std::numeric_limits<ukv_key_t>::min(),
-                      ukv_key_t max_key = ukv_key_unknown_k) noexcept
+    py_docs_kvrange_t(ustore_database_t db,
+                      ustore_transaction_t txn = nullptr,
+                      ustore_collection_t collection = ustore_collection_main_k,
+                      ustore_key_t min_key = std::numeric_limits<ustore_key_t>::min(),
+                      ustore_key_t max_key = ustore_key_unknown_k) noexcept
         : db_(db), txn_(txn), collection_(collection), min_key_(min_key), max_key_(max_key) {}
 
-    py_docs_kvrange_t& since(ukv_key_t min_key) noexcept {
+    py_docs_kvrange_t& since(ustore_key_t min_key) noexcept {
         min_key_ = min_key;
         return *this;
     }
-    py_docs_kvrange_t& until(ukv_key_t max_key) noexcept {
+    py_docs_kvrange_t& until(ustore_key_t max_key) noexcept {
         max_key_ = max_key;
         return *this;
     }
 
-    ukv_key_t max_key() noexcept { return max_key_; }
+    ustore_key_t max_key() noexcept { return max_key_; }
     docs_pairs_stream_t begin() noexcept(false) {
         docs_pairs_stream_t stream {db_, collection_, docs_pairs_stream_t::default_read_ahead_k, txn_};
         status_t status = stream.seek(min_key_);
@@ -166,7 +166,7 @@ class py_docs_kvrange_t {
 static void write_one_doc(py_docs_collection_t& py_collection, PyObject* key_py, PyObject* val_py) {
     std::string json_str;
     to_string(val_py, json_str);
-    ukv_key_t key = py_to_scalar<ukv_key_t>(key_py);
+    ustore_key_t key = py_to_scalar<ustore_key_t>(key_py);
     py_collection.native[key].assign(value_view_t(json_str)).throw_unhandled();
 }
 
@@ -182,8 +182,8 @@ static void write_many_docs(py_docs_collection_t& py_collection, PyObject* keys_
     if (keys_count != PySequence_Size(vals_py))
         throw std::invalid_argument("Keys Count Must Match Values Count");
 
-    std::vector<ukv_key_t> keys(keys_count);
-    std::vector<ukv_length_t> offs(keys_count + 1);
+    std::vector<ustore_key_t> keys(keys_count);
+    std::vector<ustore_length_t> offs(keys_count + 1);
     std::string jsons;
     offs[0] = 0;
     size_t idx = 1;
@@ -195,12 +195,12 @@ static void write_many_docs(py_docs_collection_t& py_collection, PyObject* keys_
         return dummy_iterator_t {};
     };
 
-    py_transform_n(keys_py, &py_to_scalar<ukv_key_t>, keys.begin());
+    py_transform_n(keys_py, &py_to_scalar<ustore_key_t>, keys.begin());
     py_transform_n(vals_py, generate_values, dummy_iterator_t {});
 
-    auto vals_begin = reinterpret_cast<ukv_bytes_ptr_t>(jsons.data());
+    auto vals_begin = reinterpret_cast<ustore_bytes_ptr_t>(jsons.data());
     contents_arg_t values {};
-    values.offsets_begin = {offs.data(), sizeof(ukv_length_t)};
+    values.offsets_begin = {offs.data(), sizeof(ustore_length_t)};
     values.contents_begin = {&vals_begin, 0};
     values.count = keys_count;
 
@@ -211,8 +211,8 @@ static void write_many_docs(py_docs_collection_t& py_collection, PyObject* keys_
 static void write_same_doc(py_docs_collection_t& py_collection, PyObject* keys_py, PyObject* val_py) {
     if (!PySequence_Check(keys_py))
         throw std::invalid_argument("Keys Must Be Sequence");
-    std::vector<ukv_key_t> keys(PySequence_Size(keys_py));
-    py_transform_n(keys_py, &py_to_scalar<ukv_key_t>, keys.begin());
+    std::vector<ustore_key_t> keys(PySequence_Size(keys_py));
+    py_transform_n(keys_py, &py_to_scalar<ustore_key_t>, keys.begin());
     std::string json_str;
     to_string(val_py, json_str);
     py_collection.native[keys].assign(value_view_t(json_str)).throw_unhandled();
@@ -229,7 +229,7 @@ static void broadcast_doc(py_docs_collection_t& py_collection, py::object key_py
 }
 
 static py::object read_one_doc(py_docs_collection_t& py_collection, PyObject* key_py) {
-    ukv_key_t key = py_to_scalar<ukv_key_t>(key_py);
+    ustore_key_t key = py_to_scalar<ustore_key_t>(key_py);
     auto value = py_collection.native[key].value();
     return value->empty() ? py::none {} : py::reinterpret_steal<py::object>(from_json(json_t::parse(*value)));
 }
@@ -237,8 +237,8 @@ static py::object read_one_doc(py_docs_collection_t& py_collection, PyObject* ke
 static py::object read_many_docs(py_docs_collection_t& py_collection, PyObject* keys_py) {
     if (!PySequence_Check(keys_py))
         throw std::invalid_argument("Keys Must Be Sequence");
-    std::vector<ukv_key_t> keys(PySequence_Size(keys_py));
-    py_transform_n(keys_py, &py_to_scalar<ukv_key_t>, keys.begin());
+    std::vector<ustore_key_t> keys(PySequence_Size(keys_py));
+    py_transform_n(keys_py, &py_to_scalar<ustore_key_t>, keys.begin());
     py::list values(keys.size());
 
     auto maybe_retrieved = py_collection.native[keys].value();
@@ -265,25 +265,25 @@ static py::object has_doc(py_docs_collection_t& py_collection, py::object key_py
     return has_binary(py_collection, key_py);
 }
 
-static py::object scan_doc(py_docs_collection_t& py_collection, ukv_key_t min_key, ukv_size_t count_limit) {
+static py::object scan_doc(py_docs_collection_t& py_collection, ustore_key_t min_key, ustore_size_t count_limit) {
     return scan_binary(py_collection, min_key, count_limit);
 }
 
 static void merge(py_docs_collection_t& py_collection, py::object key_py, py::object val_py) {
-    ukv_key_t key = py_to_scalar<ukv_key_t>(key_py.ptr());
+    ustore_key_t key = py_to_scalar<ustore_key_t>(key_py.ptr());
     std::string json_str;
     to_string(val_py.ptr(), json_str);
     py_collection.native[key].merge(value_view_t(json_str));
 }
 
 static void patch(py_docs_collection_t& py_collection, py::object key_py, py::object val_py) {
-    ukv_key_t key = py_to_scalar<ukv_key_t>(key_py.ptr());
+    ustore_key_t key = py_to_scalar<ustore_key_t>(key_py.ptr());
     std::string json_str;
     to_string(val_py.ptr(), json_str);
     py_collection.native[key].patch(value_view_t(json_str));
 }
 
-void ukv::wrap_document(py::module& m) {
+void ustore::wrap_document(py::module& m) {
     using py_docs_kvstream_t = py_stream_with_ending_gt<docs_pairs_stream_t>;
 
     auto py_docs_collection = py::class_<py_docs_collection_t>(m, "DocsCollection", py::module_local());
@@ -325,11 +325,11 @@ void ukv::wrap_document(py::module& m) {
         return std::make_unique<py_stream_with_ending_gt<docs_pairs_stream_t>>(std::move(wrap));
     });
 
-    py_docs_kvrange.def("since", [](py_docs_kvrange_t& range, ukv_key_t key) { return range.since(key); });
-    py_docs_kvrange.def("until", [](py_docs_kvrange_t& range, ukv_key_t key) { return range.until(key); });
+    py_docs_kvrange.def("since", [](py_docs_kvrange_t& range, ustore_key_t key) { return range.since(key); });
+    py_docs_kvrange.def("until", [](py_docs_kvrange_t& range, ustore_key_t key) { return range.until(key); });
 
     py_docs_kvstream.def("__next__", [](py_docs_kvstream_t& kvstream) {
-        ukv_key_t key = kvstream.native.key();
+        ustore_key_t key = kvstream.native.key();
         if (kvstream.native.is_end() || kvstream.stop)
             throw py::stop_iteration();
         kvstream.stop = kvstream.terminal == key;

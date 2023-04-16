@@ -4,12 +4,12 @@ import networkx as nx
 import matplotlib.cm as cm
 import matplotlib.pyplot as plt
 
-import ukv.umem as ukv
+import ustore.ucset as ustore
 sys.path.insert(0, 'python/algorithms/')
 from louvain import best_partition # autopep8: off
 
 G = nx.karate_club_graph()
-db = ukv.DataBase()
+db = ustore.DataBase()
 main = db.main
 graph = main.graph
 for v1,v2 in G.edges:

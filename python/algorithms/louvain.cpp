@@ -16,9 +16,9 @@
  *
  * @copyright Copyright (c) 2023
  */
-#include "ukv/ukv.hpp"
+#include "ustore/ustore.hpp"
 
-using namespace unum::ukv;
+using namespace unum::ustore;
 using namespace unum;
 
 struct community_degree_t {
@@ -26,10 +26,10 @@ struct community_degree_t {
     double tot_degree {};
 };
 
-using partition_t = std::unordered_map<ukv_key_t, ukv_key_t>;
-using vertex_degrees_t = std::unordered_map<ukv_key_t, double>;
-using graph_t = std::unordered_map<ukv_key_t, std::unordered_map<ukv_key_t, double>>;
-using community_degrees_t = std::unordered_map<ukv_key_t, community_degree_t>;
+using partition_t = std::unordered_map<ustore_key_t, ustore_key_t>;
+using vertex_degrees_t = std::unordered_map<ustore_key_t, double>;
+using graph_t = std::unordered_map<ustore_key_t, std::unordered_map<ustore_key_t, double>>;
+using community_degrees_t = std::unordered_map<ustore_key_t, community_degree_t>;
 
 bool first_phase(graph_collection_t& graph,
                  partition_t& partition,

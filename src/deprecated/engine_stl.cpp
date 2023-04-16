@@ -27,8 +27,8 @@
 
 #include <fmt/core.h>
 
-#include "ukv/db.h"
-#include "ukv/cpp/ranges_args.hpp"   // `places_arg_t`
+#include "ustore/db.h"
+#include "ustore/cpp/ranges_args.hpp"   // `places_arg_t`
 #include "helpers/linked_memory.hpp" // `linked_memory_lock_t`
 #include "helpers/file.hpp"          // `file_handle_t`
 
@@ -36,18 +36,18 @@
 /*****************   Structures & Consts  ****************/
 /*********************************************************/
 
-ukv_collection_t const ukv_collection_main_k = 0;
-ukv_length_t const ukv_length_missing_k = std::numeric_limits<ukv_length_t>::max();
-ukv_key_t const ukv_key_unknown_k = std::numeric_limits<ukv_key_t>::max();
-bool const ukv_supports_transactions_k = true;
-bool const ukv_supports_named_collections_k = true;
-bool const ukv_supports_snapshots_k = false;
+ustore_collection_t const ustore_collection_main_k = 0;
+ustore_length_t const ustore_length_missing_k = std::numeric_limits<ustore_length_t>::max();
+ustore_key_t const ustore_key_unknown_k = std::numeric_limits<ustore_key_t>::max();
+bool const ustore_supports_transactions_k = true;
+bool const ustore_supports_named_collections_k = true;
+bool const ustore_supports_snapshots_k = false;
 
 /*********************************************************/
 /*****************	 C++ Implementation	  ****************/
 /*********************************************************/
 
-using namespace unum::ukv;
+using namespace unum::ustore;
 using namespace unum;
 namespace fs = std::filesystem;
 
@@ -62,8 +62,8 @@ struct collection_t;
 struct transaction_t;
 
 struct entry_t {
-    ukv_collection_t collection {ukv_collection_main_k};
-    ukv_key_t key {ukv_key_unknown_k};
+    ustore_collection_t collection {ustore_collection_main_k};
+    ustore_key_t key {ustore_key_unknown_k};
     mutable generation_t generation {missing_data_generation_k};
     mutable byte_ptr_t value_begin {nullptr};
     mutable byte_ptr_t value_end {nullptr};
@@ -160,8 +160,8 @@ struct entry_compare_t {
     bool operator()(collection_key_t a, entry_t const& b) const noexcept {
         return a.collection == b.collection ? a.key < b.key : a.collection < b.collection;
     }
-    bool operator()(entry_t const& a, ukv_collection_t b) const noexcept { return a.collection < b; }
-    bool operator()(ukv_collection_t a, entry_t const& b) const noexcept { return a < b.collection; }
+    bool operator()(entry_t const& a, ustore_collection_t b) const noexcept { return a.collection < b; }
+    bool operator()(ustore_collection_t a, entry_t const& b) const noexcept { return a < b.collection; }
 };
 
 using entry_allocator_t = std::allocator<entry_t>;
@@ -195,7 +195,7 @@ struct database_t {
      * It's cleaner to implement it with heterogenous lookups as
      * an @c std::unordered_map, but it requires GCC11 and C++20.
      */
-    std::map<std::string, ukv_collection_t, string_less_t> names;
+    std::map<std::string, ustore_collection_t, string_less_t> names;
     /**
      * @brief The generation/transactions ID of the most recent update.
      * This can be updated even outside of the main @p `mutex` on HEAD state.
@@ -211,14 +211,14 @@ struct database_t {
         //  pairs.reserve(pairs.size() + n);
     }
 
-    ukv_collection_t new_collection() const noexcept {
+    ustore_collection_t new_collection() const noexcept {
         bool is_new = false;
-        ukv_collection_t new_handle = ukv_collection_main_k;
+        ustore_collection_t new_handle = ustore_collection_main_k;
         while (!is_new) {
             auto top = static_cast<std::uint64_t>(std::rand());
             auto bottom = static_cast<std::uint64_t>(std::rand());
-            new_handle = static_cast<ukv_collection_t>((top << 32) | bottom);
-            is_new = new_handle != ukv_collection_main_k;
+            new_handle = static_cast<ustore_collection_t>((top << 32) | bottom);
+            is_new = new_handle != ustore_collection_main_k;
             for (auto const& [name, existing_handle] : names)
                 is_new &= new_handle != existing_handle;
         }
@@ -248,22 +248,22 @@ template <typename entries_iterator_at>
 void write_entries(file_handle_t const& handle,
                    entries_iterator_at begin,
                    entries_iterator_at end,
-                   ukv_error_t* c_error) {
+                   ustore_error_t* c_error) {
 
     for (; begin != end; ++begin) {
         entry_t const& entry = *begin;
         if (!entry)
             continue;
 
-        auto saved_len = std::fwrite(&entry.collection, sizeof(ukv_collection_t), 1, handle);
+        auto saved_len = std::fwrite(&entry.collection, sizeof(ustore_collection_t), 1, handle);
         return_error_if_m(saved_len == 1, c_error, 0, "Write partially failed on collection.");
 
-        saved_len = std::fwrite(&entry.key, sizeof(ukv_key_t), 1, handle);
+        saved_len = std::fwrite(&entry.key, sizeof(ustore_key_t), 1, handle);
         return_error_if_m(saved_len == 1, c_error, 0, "Write partially failed on key.");
 
         auto buf = value_view_t(entry);
-        auto buf_len = static_cast<ukv_length_t>(buf.size());
-        saved_len = std::fwrite(&buf_len, sizeof(ukv_length_t), 1, handle);
+        auto buf_len = static_cast<ustore_length_t>(buf.size());
+        saved_len = std::fwrite(&buf_len, sizeof(ustore_length_t), 1, handle);
         return_error_if_m(saved_len == 1, c_error, 0, "Write partially failed on value len.");
 
         saved_len = std::fwrite(buf.data(), sizeof(byte_t), buf.size(), handle);
@@ -272,23 +272,23 @@ void write_entries(file_handle_t const& handle,
 }
 
 template <typename entries_iterator_at>
-void read_entries(file_handle_t const& handle, entries_iterator_at output, ukv_error_t* c_error) {
+void read_entries(file_handle_t const& handle, entries_iterator_at output, ustore_error_t* c_error) {
 
     while (std::feof(handle) == 0) {
         entry_t entry;
 
         // An empty row may contain no content
-        auto read_len = std::fread(&entry.collection, sizeof(ukv_collection_t), 1, handle);
+        auto read_len = std::fread(&entry.collection, sizeof(ustore_collection_t), 1, handle);
         if (read_len == 0)
             break;
         return_error_if_m(read_len <= 1, c_error, 0, "Read yielded unexpected result on key.");
 
         // .. but if the row exists, it shouldn't be partial
-        read_len = std::fread(&entry.key, sizeof(ukv_key_t), 1, handle);
+        read_len = std::fread(&entry.key, sizeof(ustore_key_t), 1, handle);
         return_error_if_m(read_len == 1, c_error, 0, "Read partially failed on key.");
 
-        auto buf_len = ukv_length_t(0);
-        read_len = std::fread(&buf_len, sizeof(ukv_length_t), 1, handle);
+        auto buf_len = ustore_length_t(0);
+        read_len = std::fread(&buf_len, sizeof(ustore_length_t), 1, handle);
         return_error_if_m(read_len == 1, c_error, 0, "Read partially failed on value len.");
 
         return_error_if_m(entry.alloc_blob(buf_len, 0),
@@ -303,7 +303,7 @@ void read_entries(file_handle_t const& handle, entries_iterator_at output, ukv_e
     }
 }
 
-void write(database_t const& db, std::string const& path, ukv_error_t* c_error) {
+void write(database_t const& db, std::string const& path, ustore_error_t* c_error) {
     // Using the classical C++ IO mechanisms is a bad tone in the modern world.
     // They are ugly and, more importantly, painfully slow.
     // https://www.reddit.com/r/cpp_questions/comments/e2xia9/performance_comparison_of_various_ways_of_reading/
@@ -335,7 +335,7 @@ void write(database_t const& db, std::string const& path, ukv_error_t* c_error) 
     log_error_m(c_error, 0, handle.close().release_error());
 }
 
-void read(database_t& db, std::string const& path, ukv_error_t* c_error) {
+void read(database_t& db, std::string const& path, ustore_error_t* c_error) {
     db.entries.clear();
     db.names.clear();
 
@@ -385,7 +385,7 @@ void populate( //
     contents_arg_t contents,
     generation_t generation,
     entries_set_t& entries,
-    ukv_error_t* c_error) noexcept {
+    ustore_error_t* c_error) noexcept {
 
     safe_section("Building batch tree", c_error, [&] {
         for (std::size_t i = 0; i != places.size(); ++i) {
@@ -403,8 +403,8 @@ void write( //
     database_t& db,
     places_arg_t places,
     contents_arg_t contents,
-    ukv_options_t const c_options,
-    ukv_error_t* c_error) noexcept {
+    ustore_options_t const c_options,
+    ustore_error_t* c_error) noexcept {
 
     // In here we don't care about the consistency,
     // just the fact of either writing all values or not.
@@ -419,7 +419,7 @@ void write( //
     merge_overwrite(db.entries, entries);
 
     // TODO: Degrade the lock to "shared" state before starting expensive IO
-    if (c_options & ukv_option_write_flush_k)
+    if (c_options & ustore_option_write_flush_k)
         write(db, db.persisted_path, c_error);
 }
 
@@ -427,13 +427,13 @@ void write( //
     transaction_t& txn,
     places_arg_t places,
     contents_arg_t contents,
-    ukv_options_t const c_options,
-    ukv_error_t* c_error) noexcept {
+    ustore_options_t const c_options,
+    ustore_error_t* c_error) noexcept {
 
     // No need for locking here, until we commit, unless, of course,
     // a collection is being deleted.
     database_t& db = *txn.db_ptr;
-    bool dont_watch = c_options & ukv_option_transaction_dont_watch_k;
+    bool dont_watch = c_options & ustore_option_transaction_dont_watch_k;
 
     // Track potential future changes
     if (!dont_watch) {
@@ -456,9 +456,9 @@ template <typename value_enumerator_at>
 void read_under_lock( //
     database_t& db,
     places_arg_t tasks,
-    ukv_options_t const,
+    ustore_options_t const,
     value_enumerator_at enumerator,
-    ukv_error_t*) noexcept {
+    ustore_error_t*) noexcept {
 
     for (std::size_t i = 0; i != tasks.size(); ++i) {
         place_t place = tasks[i];
@@ -472,13 +472,13 @@ template <typename value_enumerator_at>
 void read_under_lock( //
     transaction_t& txn,
     places_arg_t tasks,
-    ukv_options_t const c_options,
+    ustore_options_t const c_options,
     value_enumerator_at enumerator,
-    ukv_error_t* c_error) noexcept {
+    ustore_error_t* c_error) noexcept {
 
     database_t& db = *txn.db_ptr;
     generation_t const youngest_generation = db.youngest_generation.load();
-    bool const dont_watch = c_options & ukv_option_transaction_dont_watch_k;
+    bool const dont_watch = c_options & ustore_option_transaction_dont_watch_k;
 
     for (std::size_t i = 0; i != tasks.size(); ++i) {
         place_t place = tasks[i];
@@ -512,12 +512,12 @@ void read_under_lock( //
 void scan( //
     database_t& db,
     scans_arg_t tasks,
-    ukv_options_t const options,
-    ukv_length_t** c_found_offsets,
-    ukv_length_t** c_found_counts,
-    ukv_key_t** c_found_keys,
+    ustore_options_t const options,
+    ustore_length_t** c_found_offsets,
+    ustore_length_t** c_found_counts,
+    ustore_key_t** c_found_keys,
     linked_memory_lock_t& arena,
-    ukv_error_t* c_error) noexcept {
+    ustore_error_t* c_error) noexcept {
 
     std::shared_lock _ {db.mutex};
 
@@ -528,7 +528,7 @@ void scan( //
     return_if_error_m(c_error);
 
     auto total_keys = reduce_n(tasks.limits, tasks.count, 0ul);
-    auto keys_output = *c_found_keys = arena.alloc<ukv_key_t>(total_keys, c_error).begin();
+    auto keys_output = *c_found_keys = arena.alloc<ustore_key_t>(total_keys, c_error).begin();
     return_if_error_m(c_error);
 
     // 2. Fetch the data
@@ -536,7 +536,7 @@ void scan( //
         scan_t scan = tasks[i];
         offsets[i] = keys_output - *c_found_keys;
 
-        ukv_length_t j = 0;
+        ustore_length_t j = 0;
         auto db_iterator = db.entries.lower_bound(collection_key_t {scan.collection, scan.min_key});
         while (j != scan.limit &&                            //
                db_iterator != db.entries.end() &&            //
@@ -562,16 +562,16 @@ void scan( //
 void scan( //
     transaction_t& txn,
     scans_arg_t tasks,
-    ukv_options_t const c_options,
-    ukv_length_t** c_found_offsets,
-    ukv_length_t** c_found_counts,
-    ukv_key_t** c_found_keys,
+    ustore_options_t const c_options,
+    ustore_length_t** c_found_offsets,
+    ustore_length_t** c_found_counts,
+    ustore_key_t** c_found_keys,
     linked_memory_lock_t& arena,
-    ukv_error_t* c_error) noexcept {
+    ustore_error_t* c_error) noexcept {
 
     database_t& db = *txn.db_ptr;
     std::shared_lock _ {db.mutex};
-    bool const dont_watch = c_options & ukv_option_transaction_dont_watch_k;
+    bool const dont_watch = c_options & ustore_option_transaction_dont_watch_k;
 
     // 1. Allocate a tape for all the values to be fetched
     auto offsets = arena.alloc_or_dummy(tasks.count + 1, c_error, c_found_offsets);
@@ -580,7 +580,7 @@ void scan( //
     return_if_error_m(c_error);
 
     auto total_keys = reduce_n(tasks.limits, tasks.count, 0ul);
-    auto keys_output = *c_found_keys = arena.alloc<ukv_key_t>(total_keys, c_error).begin();
+    auto keys_output = *c_found_keys = arena.alloc<ustore_key_t>(total_keys, c_error).begin();
     return_if_error_m(c_error);
 
     // 2. Fetch the data
@@ -588,7 +588,7 @@ void scan( //
         scan_t scan = tasks[i];
         offsets[i] = keys_output - *c_found_keys;
 
-        ukv_length_t j = 0;
+        ustore_length_t j = 0;
         auto db_iterator = db.entries.lower_bound(collection_key_t {scan.collection, scan.min_key});
         auto txn_iterator = txn.changes.lower_bound(collection_key_t {scan.collection, scan.min_key});
         while (j != scan.limit && db_iterator != db.entries.end() && db_iterator->collection == scan.collection) {
@@ -641,9 +641,9 @@ void scan( //
 /*****************	    C Interface 	  ****************/
 /*********************************************************/
 
-void ukv_database_init(ukv_database_init_t* c_ptr) {
+void ustore_database_init(ustore_database_init_t* c_ptr) {
 
-    ukv_database_init_t& c = *c_ptr;
+    ustore_database_init_t& c = *c_ptr;
     safe_section("Initializing DBMS", c.error, [&] {
         auto db_ptr = new database_t {};
         auto len = c.config ? std::strlen(c.config) : 0;
@@ -655,9 +655,9 @@ void ukv_database_init(ukv_database_init_t* c_ptr) {
     });
 }
 
-void ukv_read(ukv_read_t* c_ptr) {
+void ustore_read(ustore_read_t* c_ptr) {
 
-    ukv_read_t& c = *c_ptr;
+    ustore_read_t& c = *c_ptr;
     return_error_if_m(c.db, c.error, uninitialized_state_k, "DataBase is uninitialized");
     if (!c.tasks_count)
         return;
@@ -667,8 +667,8 @@ void ukv_read(ukv_read_t* c_ptr) {
 
     database_t& db = *reinterpret_cast<database_t*>(c.db);
     transaction_t& txn = *reinterpret_cast<transaction_t*>(c.transaction);
-    strided_iterator_gt<ukv_collection_t const> collections {c.collections, c.collections_stride};
-    strided_iterator_gt<ukv_key_t const> keys {c.keys, c.keys_stride};
+    strided_iterator_gt<ustore_collection_t const> collections {c.collections, c.collections_stride};
+    strided_iterator_gt<ustore_key_t const> keys {c.keys, c.keys_stride};
     places_arg_t places {collections, keys, {}, c.tasks_count};
     validate_read(c.transaction, places, c.options, c.error);
     return_if_error_m(c.error);
@@ -684,12 +684,12 @@ void ukv_read(ukv_read_t* c_ptr) {
     return_if_error_m(c.error);
 
     // 2. Pull metadata
-    ukv_length_t total_length = 0;
+    ustore_length_t total_length = 0;
     auto meta_enumerator = [&](std::size_t i, value_view_t value) {
         presences[i] = bool(value);
         offs[i] = total_length;
-        lens[i] = value ? static_cast<ukv_length_t>(value.size()) : ukv_length_missing_k;
-        total_length += static_cast<ukv_length_t>(value.size());
+        lens[i] = value ? static_cast<ustore_length_t>(value.size()) : ustore_length_missing_k;
+        total_length += static_cast<ustore_length_t>(value.size());
     };
 
     std::shared_lock _ {db.mutex};
@@ -706,26 +706,26 @@ void ukv_read(ukv_read_t* c_ptr) {
         std::memcpy(std::exchange(tape, tape + value.size()), value.begin(), value.size());
     };
 
-    *c.values = reinterpret_cast<ukv_byte_t*>(tape);
+    *c.values = reinterpret_cast<ustore_byte_t*>(tape);
     c.transaction //
         ? read_under_lock(txn, places, c.options, data_enumerator, c.error)
         : read_under_lock(db, places, c.options, data_enumerator, c.error);
 }
 
-void ukv_write(ukv_write_t* c_ptr) {
+void ustore_write(ustore_write_t* c_ptr) {
 
-    ukv_write_t& c = *c_ptr;
+    ustore_write_t& c = *c_ptr;
     return_error_if_m(c.db, c.error, uninitialized_state_k, "DataBase is uninitialized");
     if (!c.tasks_count)
         return;
 
     database_t& db = *reinterpret_cast<database_t*>(c.db);
     transaction_t& txn = *reinterpret_cast<transaction_t*>(c.transaction);
-    strided_iterator_gt<ukv_collection_t const> collections {c.collections, c.collections_stride};
-    strided_iterator_gt<ukv_key_t const> keys {c.keys, c.keys_stride};
-    strided_iterator_gt<ukv_bytes_cptr_t const> vals {c.values, c.values_stride};
-    strided_iterator_gt<ukv_length_t const> offs {c.offsets, c.offsets_stride};
-    strided_iterator_gt<ukv_length_t const> lens {c.lengths, c.lengths_stride};
+    strided_iterator_gt<ustore_collection_t const> collections {c.collections, c.collections_stride};
+    strided_iterator_gt<ustore_key_t const> keys {c.keys, c.keys_stride};
+    strided_iterator_gt<ustore_bytes_cptr_t const> vals {c.values, c.values_stride};
+    strided_iterator_gt<ustore_length_t const> offs {c.offsets, c.offsets_stride};
+    strided_iterator_gt<ustore_length_t const> lens {c.lengths, c.lengths_stride};
     bits_view_t presences {c.presences};
 
     places_arg_t places {collections, keys, {}, c.tasks_count};
@@ -739,9 +739,9 @@ void ukv_write(ukv_write_t* c_ptr) {
                : write(db, places, contents, c.options, c.error);
 }
 
-void ukv_scan(ukv_scan_t* c_ptr) {
+void ustore_scan(ustore_scan_t* c_ptr) {
 
-    ukv_scan_t& c = *c_ptr;
+    ustore_scan_t& c = *c_ptr;
     return_error_if_m(c.db, c.error, uninitialized_state_k, "DataBase is uninitialized");
     if (!c.tasks_count)
         return;
@@ -751,9 +751,9 @@ void ukv_scan(ukv_scan_t* c_ptr) {
 
     database_t& db = *reinterpret_cast<database_t*>(c.db);
     transaction_t& txn = *reinterpret_cast<transaction_t*>(c.transaction);
-    strided_iterator_gt<ukv_collection_t const> collections {c.collections, c.collections_stride};
-    strided_iterator_gt<ukv_key_t const> start_keys {c.start_keys, c.start_keys_stride};
-    strided_iterator_gt<ukv_length_t const> lens {c.count_limits, c.count_limits_stride};
+    strided_iterator_gt<ustore_collection_t const> collections {c.collections, c.collections_stride};
+    strided_iterator_gt<ustore_key_t const> start_keys {c.start_keys, c.start_keys_stride};
+    strided_iterator_gt<ustore_length_t const> lens {c.count_limits, c.count_limits_stride};
     scans_arg_t scans {collections, start_keys, lens, c.tasks_count};
 
     validate_scan(c.transaction, scans, c.options, c.error);
@@ -764,9 +764,9 @@ void ukv_scan(ukv_scan_t* c_ptr) {
                : scan(db, scans, c.options, c.offsets, c.counts, c.keys, arena, c.error);
 }
 
-void ukv_measure(ukv_measure_t* c_ptr) {
+void ustore_measure(ustore_measure_t* c_ptr) {
 
-    ukv_measure_t& c = *c_ptr;
+    ustore_measure_t& c = *c_ptr;
     return_error_if_m(c.db, c.error, uninitialized_state_k, "DataBase is uninitialized");
     if (!c.tasks_count)
         return;
@@ -784,16 +784,16 @@ void ukv_measure(ukv_measure_t* c_ptr) {
 
     database_t& db = *reinterpret_cast<database_t*>(c.db);
     transaction_t& txn = *reinterpret_cast<transaction_t*>(c.transaction);
-    strided_iterator_gt<ukv_collection_t const> collections {c.collections, c.collections_stride};
-    strided_iterator_gt<ukv_key_t const> start_keys {c.start_keys, c.start_keys_stride};
-    strided_iterator_gt<ukv_key_t const> end_keys {c.end_keys, c.end_keys_stride};
+    strided_iterator_gt<ustore_collection_t const> collections {c.collections, c.collections_stride};
+    strided_iterator_gt<ustore_key_t const> start_keys {c.start_keys, c.start_keys_stride};
+    strided_iterator_gt<ustore_key_t const> end_keys {c.end_keys, c.end_keys_stride};
 
     std::shared_lock _ {db.mutex};
 
-    for (ukv_size_t i = 0; i != c.tasks_count; ++i) {
-        ukv_collection_t const collection = collections[i];
-        ukv_key_t const min_key = start_keys[i];
-        ukv_key_t const max_key = end_keys[i];
+    for (ustore_size_t i = 0; i != c.tasks_count; ++i) {
+        ustore_collection_t const collection = collections[i];
+        ustore_key_t const min_key = start_keys[i];
+        ustore_key_t const max_key = end_keys[i];
         std::size_t deleted_count = 0;
 
         // Estimate the presence in the main store
@@ -821,14 +821,14 @@ void ukv_measure(ukv_measure_t* c_ptr) {
         }
 
         //
-        ukv_size_t estimate[6];
-        min_cardinalities[i] = estimate[0] = static_cast<ukv_size_t>(main_count);
-        max_cardinalities[i] = estimate[1] = static_cast<ukv_size_t>(main_count + txn_count);
-        min_value_bytes[i] = estimate[2] = static_cast<ukv_size_t>(main_bytes);
-        max_value_bytes[i] = estimate[3] = static_cast<ukv_size_t>(main_bytes + txn_bytes);
-        min_space_usages[i] = estimate[4] = estimate[0] * (sizeof(ukv_key_t) + sizeof(ukv_length_t)) + estimate[2];
+        ustore_size_t estimate[6];
+        min_cardinalities[i] = estimate[0] = static_cast<ustore_size_t>(main_count);
+        max_cardinalities[i] = estimate[1] = static_cast<ustore_size_t>(main_count + txn_count);
+        min_value_bytes[i] = estimate[2] = static_cast<ustore_size_t>(main_bytes);
+        max_value_bytes[i] = estimate[3] = static_cast<ustore_size_t>(main_bytes + txn_bytes);
+        min_space_usages[i] = estimate[4] = estimate[0] * (sizeof(ustore_key_t) + sizeof(ustore_length_t)) + estimate[2];
         max_space_usages[i] = estimate[5] =
-            (estimate[1] + deleted_count) * (sizeof(ukv_key_t) + sizeof(ukv_length_t)) + estimate[3];
+            (estimate[1] + deleted_count) * (sizeof(ustore_key_t) + sizeof(ustore_length_t)) + estimate[3];
     }
 }
 
@@ -836,9 +836,9 @@ void ukv_measure(ukv_measure_t* c_ptr) {
 /*****************	Collections Management	****************/
 /*********************************************************/
 
-void ukv_collection_create(ukv_collection_create_t* c_ptr) {
+void ustore_collection_create(ustore_collection_create_t* c_ptr) {
 
-    ukv_collection_create_t& c = *c_ptr;
+    ustore_collection_create_t& c = *c_ptr;
     auto name_len = c.name ? std::strlen(c.name) : 0;
     return_error_if_m(name_len, c.error, args_wrong_k, "Default collection is always present");
     return_error_if_m(c.db, c.error, uninitialized_state_k, "DataBase is uninitialized");
@@ -854,13 +854,13 @@ void ukv_collection_create(ukv_collection_create_t* c_ptr) {
     *c.id = new_collection;
 }
 
-void ukv_collection_drop(ukv_collection_drop_t* c_ptr) {
+void ustore_collection_drop(ustore_collection_drop_t* c_ptr) {
 
-    ukv_collection_drop_t& c = *c_ptr;
+    ustore_collection_drop_t& c = *c_ptr;
     return_error_if_m(c.db, c.error, uninitialized_state_k, "DataBase is uninitialized");
 
-    bool invalidate = c.mode == ukv_drop_keys_vals_handle_k;
-    return_error_if_m(c.id != ukv_collection_main_k || !invalidate,
+    bool invalidate = c.mode == ustore_drop_keys_vals_handle_k;
+    return_error_if_m(c.id != ustore_collection_main_k || !invalidate,
                     c.error,
                     args_combo_k,
                     "Default collection can't be invalidated.");
@@ -869,7 +869,7 @@ void ukv_collection_drop(ukv_collection_drop_t* c_ptr) {
     std::unique_lock _ {db.mutex};
 
     auto [begin, end] = db.entries.equal_range(c.id);
-    if (c.mode == ukv_drop_keys_vals_handle_k) {
+    if (c.mode == ustore_drop_keys_vals_handle_k) {
         db.entries.erase(begin, end);
         for (auto it = db.names.begin(); it != db.names.end(); ++it) {
             if (c.id != it->second)
@@ -879,19 +879,19 @@ void ukv_collection_drop(ukv_collection_drop_t* c_ptr) {
         }
     }
 
-    else if (c.mode == ukv_drop_keys_vals_k)
+    else if (c.mode == ustore_drop_keys_vals_k)
         db.entries.erase(begin, end);
 
-    else if (c.mode == ukv_drop_vals_k) {
+    else if (c.mode == ustore_drop_vals_k) {
         generation_t gen = ++db.youngest_generation;
         for (; begin != end; ++begin)
             begin->assign_empty(gen);
     }
 }
 
-void ukv_collection_list(ukv_collection_list_t* c_ptr) {
+void ustore_collection_list(ustore_collection_list_t* c_ptr) {
 
-    ukv_collection_list_t& c = *c_ptr;
+    ustore_collection_list_t& c = *c_ptr;
     return_error_if_m(c.db, c.error, uninitialized_state_k, "DataBase is uninitialized");
     return_error_if_m(c.count && c.names, c.error, args_combo_k, "Need names and outputs!");
 
@@ -901,7 +901,7 @@ void ukv_collection_list(ukv_collection_list_t* c_ptr) {
     database_t& db = *reinterpret_cast<database_t*>(c.db);
     std::shared_lock _ {db.mutex};
     std::size_t collections_count = db.names.size();
-    *c.count = static_cast<ukv_size_t>(collections_count);
+    *c.count = static_cast<ustore_size_t>(collections_count);
 
     // Every string will be null-terminated
     std::size_t strings_length = 0;
@@ -923,16 +923,16 @@ void ukv_collection_list(ukv_collection_list_t* c_ptr) {
         std::memcpy(names, name_and_handle.first.data(), len);
         names[len] = '\0';
         ids[i] = name_and_handle.second;
-        offs[i] = static_cast<ukv_length_t>(names - *c.names);
+        offs[i] = static_cast<ustore_length_t>(names - *c.names);
         names += len + 1;
         ++i;
     }
-    offs[i] = static_cast<ukv_length_t>(names - *c.names);
+    offs[i] = static_cast<ustore_length_t>(names - *c.names);
 }
 
-void ukv_database_control(ukv_database_control_t* c_ptr) {
+void ustore_database_control(ustore_database_control_t* c_ptr) {
 
-    ukv_database_control_t& c = *c_ptr;
+    ustore_database_control_t& c = *c_ptr;
     return_error_if_m(c.db, c.error, uninitialized_state_k, "DataBase is uninitialized");
     return_error_if_m(c.request, c.error, uninitialized_state_k, "Request is uninitialized");
 
@@ -944,9 +944,9 @@ void ukv_database_control(ukv_database_control_t* c_ptr) {
 /*****************		Transactions	  ****************/
 /*********************************************************/
 
-void ukv_transaction_init(ukv_transaction_init_t* c_ptr) {
+void ustore_transaction_init(ustore_transaction_init_t* c_ptr) {
 
-    ukv_transaction_init_t& c = *c_ptr;
+    ustore_transaction_init_t& c = *c_ptr;
     return_error_if_m(c.db, c.error, uninitialized_state_k, "DataBase is uninitialized");
     validate_transaction_begin(c.transaction, c.options, c.error);
     return_if_error_m(c.error);
@@ -965,9 +965,9 @@ void ukv_transaction_init(ukv_transaction_init_t* c_ptr) {
     txn.changes.clear();
 }
 
-void ukv_transaction_commit(ukv_transaction_commit_t* c_ptr) {
+void ustore_transaction_commit(ustore_transaction_commit_t* c_ptr) {
 
-    ukv_transaction_commit_t& c = *c_ptr;
+    ustore_transaction_commit_t& c = *c_ptr;
     return_error_if_m(c.db, c.error, uninitialized_state_k, "DataBase is uninitialized");
     database_t& db = *reinterpret_cast<database_t*>(c.db);
 
@@ -998,7 +998,7 @@ void ukv_transaction_commit(ukv_transaction_commit_t* c_ptr) {
     merge_overwrite(db.entries, txn.changes);
 
     // TODO: Degrade the lock to "shared" state before starting expensive IO
-    if (c.options & ukv_option_write_flush_k)
+    if (c.options & ustore_option_write_flush_k)
         write(db, db.persisted_path, c.error);
 }
 
@@ -1006,32 +1006,32 @@ void ukv_transaction_commit(ukv_transaction_commit_t* c_ptr) {
 /*****************	  Memory Management   ****************/
 /*********************************************************/
 
-void ukv_arena_free(ukv_arena_t c_arena) {
+void ustore_arena_free(ustore_arena_t c_arena) {
     if (!c_arena)
         return;
     linked_memory_lock_t& arena = *reinterpret_cast<linked_memory_lock_t*>(c_arena);
     delete &arena;
 }
 
-void ukv_transaction_free(ukv_transaction_t const c_txn) {
+void ustore_transaction_free(ustore_transaction_t const c_txn) {
     if (!c_txn)
         return;
     transaction_t& txn = *reinterpret_cast<transaction_t*>(c_txn);
     delete &txn;
 }
 
-void ukv_database_free(ukv_database_t c_db) {
+void ustore_database_free(ustore_database_t c_db) {
     if (!c_db)
         return;
 
     database_t& db = *reinterpret_cast<database_t*>(c_db);
     if (!db.persisted_path.empty()) {
-        ukv_error_t c_error = nullptr;
+        ustore_error_t c_error = nullptr;
         write(db, db.persisted_path, &c_error);
     }
 
     delete &db;
 }
 
-void ukv_error_free(ukv_error_t) {
+void ustore_error_free(ustore_error_t) {
 }

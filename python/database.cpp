@@ -1,13 +1,13 @@
 #include <arrow/c/bridge.h>
 #include <arrow/python/pyarrow.h>
 
-#include "ukv/arrow.h"
+#include "ustore/arrow.h"
 #include "pybind.hpp"
 #include "crud.hpp"
 #include "cast.hpp"
 
-using namespace unum::ukv::pyb;
-using namespace unum::ukv;
+using namespace unum::ustore::pyb;
+using namespace unum::ustore;
 using namespace unum;
 
 enum class read_format_t {
@@ -28,7 +28,7 @@ static std::unique_ptr<py_collection_gt<collection_at>> punned_collection( //
     std::shared_ptr<py_transaction_t> py_txn_ptr,
     std::string const& name) {
 
-    ukv_collection_t collection = py_db_ptr->native.find_or_create<collection_at>(name.c_str()).throw_or_release();
+    ustore_collection_t collection = py_db_ptr->native.find_or_create<collection_at>(name.c_str()).throw_or_release();
 
     auto py_collection = std::make_unique<py_collection_gt<collection_at>>();
     py_collection->name = name;
@@ -39,8 +39,8 @@ static std::unique_ptr<py_collection_gt<collection_at>> punned_collection( //
         py_db_ptr->native,
         collection,
         py_txn_ptr //
-            ? ukv_transaction_t(py_txn_ptr->native)
-            : ukv_transaction_t(nullptr),
+            ? ustore_transaction_t(py_txn_ptr->native)
+            : ustore_transaction_t(nullptr),
     };
     return py_collection;
 }
@@ -55,13 +55,13 @@ static std::unique_ptr<py_blobs_collection_t> punned_txn_collection(py_transacti
 }
 
 template <typename range_at>
-range_at& since(range_at& range, ukv_key_t key) {
+range_at& since(range_at& range, ustore_key_t key) {
     range.members.since(key);
     return range;
 }
 
 template <typename range_at>
-range_at& until(range_at& range, ukv_key_t key) {
+range_at& until(range_at& range, ustore_key_t key) {
     range.members.until(key);
     return range;
 }
@@ -69,15 +69,15 @@ range_at& until(range_at& range, ukv_key_t key) {
 py::object sample(py_blobs_collection_t& py_collection, std::size_t count) {
     blobs_range_t members(py_collection.db(), py_collection.txn(), *py_collection.member_collection());
     keys_range_t range {members};
-    ptr_range_gt<ukv_key_t> samples = range.sample(count, py_collection.member_arena()).throw_or_release();
+    ptr_range_gt<ustore_key_t> samples = range.sample(count, py_collection.member_arena()).throw_or_release();
 
     status_t status;
     ArrowSchema c_arrow_schema;
     ArrowArray c_arrow_array;
-    ukv_to_arrow_schema(count, 0, &c_arrow_schema, &c_arrow_array, status.member_ptr());
-    ukv_to_arrow_column(count,
+    ustore_to_arrow_schema(count, 0, &c_arrow_schema, &c_arrow_array, status.member_ptr());
+    ustore_to_arrow_column(count,
                         "samples",
-                        ukv_doc_field_i64_k,
+                        ustore_doc_field_i64_k,
                         nullptr,
                         nullptr,
                         samples.begin(),
@@ -99,7 +99,7 @@ auto iterate(range_at& range) {
     return std::make_unique<wrap_t>(std::move(wrap));
 }
 
-void ukv::wrap_database(py::module& m) {
+void ustore::wrap_database(py::module& m) {
     // Define our primary classes: `DataBase`, `Collection`, `Transaction`
     auto py_db = py::class_<py_db_t, std::shared_ptr<py_db_t>>(m, "DataBase", py::module_local());
     auto py_txn = py::class_<py_transaction_t, std::shared_ptr<py_transaction_t>>(m, "Transaction", py::module_local());
@@ -232,11 +232,11 @@ void ukv::wrap_database(py::module& m) {
 
     py_db.def("collection_names", [](py_db_t& py_db) {
         status_t status;
-        ukv_size_t count {};
-        ukv_collection_t* ids {};
+        ustore_size_t count {};
+        ustore_collection_t* ids {};
         arena_t arena(py_db.native);
-        ukv_str_span_t names {};
-        ukv_collection_list_t collection_list {};
+        ustore_str_span_t names {};
+        ustore_collection_list_t collection_list {};
         collection_list.db = py_db.native;
         collection_list.error = status.member_ptr();
         collection_list.arena = arena.member_ptr();
@@ -244,7 +244,7 @@ void ukv::wrap_database(py::module& m) {
         collection_list.ids = &ids;
         collection_list.names = &names;
 
-        ukv_collection_list(&collection_list);
+        ustore_collection_list(&collection_list);
         status.throw_unhandled();
         std::vector<std::string> names_copy {count};
         strings_tape_iterator_t names_it {count, names};
@@ -308,7 +308,7 @@ void ukv::wrap_database(py::module& m) {
     // });
 
     py_kstream.def("__next__", [](py_kstream_t& kstream) {
-        ukv_key_t key = kstream.native.key();
+        ustore_key_t key = kstream.native.key();
         if (kstream.native.is_end() || kstream.stop)
             throw py::stop_iteration();
         kstream.stop = kstream.terminal == key;
@@ -316,7 +316,7 @@ void ukv::wrap_database(py::module& m) {
         return key;
     });
     py_kvstream.def("__next__", [](py_kvstream_t& kvstream) {
-        ukv_key_t key = kvstream.native.key();
+        ustore_key_t key = kvstream.native.key();
         if (kvstream.native.is_end() || kvstream.stop)
             throw py::stop_iteration();
         kvstream.stop = kvstream.terminal == key;

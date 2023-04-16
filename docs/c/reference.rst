@@ -7,9 +7,9 @@ db
 .. doxygenfile:: db.h
 
 ===============
-ukv
+ustore
 ===============
-.. doxygenfile:: ukv.h
+.. doxygenfile:: ustore.h
 
 ===============
 docs

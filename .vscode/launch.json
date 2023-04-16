@@ -21,10 +21,10 @@
             "cppAttachName": "(GDB) Attach Python",
         },
         {
-            "name": "C++: Test UMem",
+            "name": "C++: Test UCSet",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build_debug/build/bin/test_units_ukv_embedded_umem",
+            "program": "${workspaceFolder}/build_debug/build/bin/test_units_ustore_embedded_ucset",
             "args": [
                 "--gtest_break_on_failure",
                 "--gtest_catch_exceptions=0"
@@ -39,7 +39,7 @@
             "showDisplayString": true,
             "stopAtEntry": false,
             "externalConsole": false,
-            "preLaunchTask": "Build Debug UMem Test",
+            "preLaunchTask": "Build Debug UCSet Test",
             "MIMode": "gdb",
             "miDebuggerPath": "/usr/bin/gdb"
         },
@@ -47,7 +47,7 @@
             "name": "C++: Test LevelDB",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build_debug/build/bin/test_units_ukv_embedded_leveldb",
+            "program": "${workspaceFolder}/build_debug/build/bin/test_units_ustore_embedded_leveldb",
             "args": [
                 "--gtest_break_on_failure",
                 "--gtest_catch_exceptions=0"
@@ -65,7 +65,7 @@
             "name": "C++: Test RocksDB",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build_debug/build/bin/test_units_ukv_embedded_rocksdb",
+            "program": "${workspaceFolder}/build_debug/build/bin/test_units_ustore_embedded_rocksdb",
             "args": [
                 "--gtest_break_on_failure",
                 "--gtest_catch_exceptions=0"
@@ -83,7 +83,7 @@
             "name": "C++: Test UDisk",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build_debug/build/bin/test_units_ukv_embedded_udisk",
+            "program": "${workspaceFolder}/build_debug/build/bin/test_units_ustore_embedded_udisk",
             "args": [
                 "--gtest_break_on_failure",
                 "--gtest_catch_exceptions=0"
@@ -98,10 +98,10 @@
             "miDebuggerPath": "/usr/bin/gdb"
         },
         {
-            "name": "C++: Test UMem Stateless",
+            "name": "C++: Test UCSet Stateless",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build_debug/build/bin/test_units_ukv_embedded_umem",
+            "program": "${workspaceFolder}/build_debug/build/bin/test_units_ustore_embedded_ucset",
             "args": [
                 "--gtest_break_on_failure",
                 "--gtest_catch_exceptions=0"
@@ -113,22 +113,22 @@
                     "value": "detect_leaks=0:atexit=1:strict_init_order=1:strict_string_checks=1"
                 },
                 {
-                    "name": "UKV_TEST_PATH",
+                    "name": "USTORE_TEST_PATH",
                     "value": ""
                 }
             ],
             "showDisplayString": true,
             "stopAtEntry": false,
             "externalConsole": false,
-            "preLaunchTask": "Build Debug UMem Test",
+            "preLaunchTask": "Build Debug UCSet Test",
             "MIMode": "gdb",
             "miDebuggerPath": "/usr/bin/gdb"
         },
         {
-            "name": "C++: Stress Atomicity UMem",
+            "name": "C++: Stress Atomicity UCSet",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build_debug/build/bin/stress_atomicity_ukv_embedded_umem",
+            "program": "${workspaceFolder}/build_debug/build/bin/stress_atomicity_ustore_embedded_ucset",
             "args": [
                 "--gtest_break_on_failure",
                 "--gtest_catch_exceptions=0"
@@ -140,14 +140,14 @@
                     "value": "detect_leaks=0:atexit=1:strict_init_order=1:strict_string_checks=1"
                 },
                 {
-                    "name": "UKV_TEST_PATH",
+                    "name": "USTORE_TEST_PATH",
                     "value": ""
                 }
             ],
             "showDisplayString": true,
             "stopAtEntry": false,
             "externalConsole": false,
-            "preLaunchTask": "Build Stress Atomicity UMem",
+            "preLaunchTask": "Build Stress Atomicity UCSet",
             "MIMode": "gdb",
             "miDebuggerPath": "/usr/bin/gdb"
         },
@@ -155,7 +155,7 @@
             "name": "C++: Stress Atomicity RocksDB",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build_debug/build/bin/stress_atomicity_ukv_embedded_rocksdb",
+            "program": "${workspaceFolder}/build_debug/build/bin/stress_atomicity_ustore_embedded_rocksdb",
             "args": [
                 "--gtest_break_on_failure",
                 "--gtest_catch_exceptions=0"
@@ -175,10 +175,10 @@
             "miDebuggerPath": "/usr/bin/gdb"
         },
         {
-            "name": "C++: Stress Linearizability UMem",
+            "name": "C++: Stress Linearizability UCSet",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build_debug/build/bin/stress_linearizability_ukv_embedded_umem",
+            "program": "${workspaceFolder}/build_debug/build/bin/stress_linearizability_ustore_embedded_ucset",
             "args": [
                 "--gtest_break_on_failure",
                 "--gtest_catch_exceptions=0"
@@ -190,14 +190,14 @@
                     "value": "detect_leaks=0:atexit=1:strict_init_order=1:strict_string_checks=1"
                 },
                 {
-                    "name": "UKV_TEST_PATH",
+                    "name": "USTORE_TEST_PATH",
                     "value": ""
                 }
             ],
             "showDisplayString": true,
             "stopAtEntry": false,
             "externalConsole": false,
-            "preLaunchTask": "Build Stress Linearizability UMem",
+            "preLaunchTask": "Build Stress Linearizability UCSet",
             "MIMode": "gdb",
             "miDebuggerPath": "/usr/bin/gdb"
         },
@@ -205,7 +205,7 @@
             "name": "C++: Stress Linearizability RocksDB",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build_debug/build/bin/stress_linearizability_ukv_embedded_rocksdb",
+            "program": "${workspaceFolder}/build_debug/build/bin/stress_linearizability_ustore_embedded_rocksdb",
             "args": [
                 "--gtest_break_on_failure",
                 "--gtest_catch_exceptions=0"
@@ -225,10 +225,10 @@
             "miDebuggerPath": "/usr/bin/gdb"
         },
         {
-            "name": "C++: Benchmark UMem",
+            "name": "C++: Benchmark UCSet",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build_debug/build/bin/bench_twitter_ukv_embedded_umem",
+            "program": "${workspaceFolder}/build_debug/build/bin/bench_twitter_ustore_embedded_ucset",
             "args": [
                 "--gtest_break_on_failure",
                 "--gtest_catch_exceptions=0"
@@ -238,7 +238,7 @@
             "showDisplayString": true,
             "stopAtEntry": false,
             "externalConsole": false,
-            "preLaunchTask": "Build Debug UMem Benchmark",
+            "preLaunchTask": "Build Debug UCSet Benchmark",
             "MIMode": "gdb",
             "miDebuggerPath": "/usr/bin/gdb"
         },
@@ -246,7 +246,7 @@
             "name": "C++: Benchmark RocksDB",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build_debug/build/bin/bench_twitter_ukv_embedded_rocksdb",
+            "program": "${workspaceFolder}/build_debug/build/bin/bench_twitter_ustore_embedded_rocksdb",
             "args": [
                 "--gtest_break_on_failure",
                 "--gtest_catch_exceptions=0"
@@ -264,7 +264,7 @@
             "name": "C++: Benchmark UDisk",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build_debug/build/bin/bench_twitter_ukv_embedded_udisk",
+            "program": "${workspaceFolder}/build_debug/build/bin/bench_twitter_ustore_embedded_udisk",
             "args": [
                 "--gtest_break_on_failure",
                 "--gtest_catch_exceptions=0"
@@ -282,7 +282,7 @@
             "name": "C++: Benchmark Arrow",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build_debug/build/bin/bench_twitter_ukv_flight_client",
+            "program": "${workspaceFolder}/build_debug/build/bin/bench_twitter_ustore_flight_client",
             "args": [
                 "--gtest_break_on_failure",
                 "--gtest_catch_exceptions=0"
@@ -300,7 +300,7 @@
             "name": "C++: Test Arrow Client",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build_debug/build/bin/test_units_ukv_flight_client",
+            "program": "${workspaceFolder}/build_debug/build/bin/test_units_ustore_flight_client",
             "args": [
                 "--gtest_break_on_failure",
                 "--gtest_catch_exceptions=0"
@@ -318,7 +318,7 @@
             "name": "C++: Test Arrow Server",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build_debug/build/bin/ukv_flight_server_umem",
+            "program": "${workspaceFolder}/build_debug/build/bin/ustore_flight_server_ucset",
             "cwd": "${workspaceFolder}",
             "environment": [],
             "showDisplayString": true,
@@ -359,7 +359,7 @@
             "name": "C++: Test Tools",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build_debug/build/bin/test_tools_ukv_embedded_umem",
+            "program": "${workspaceFolder}/build_debug/build/bin/test_tools_ustore_embedded_ucset",
             "args": [
                 "--gtest_break_on_failure",
                 "--gtest_catch_exceptions=0"
@@ -371,7 +371,7 @@
                     "value": "detect_leaks=0:atexit=1:strict_init_order=1:strict_string_checks=1"
                 },
                 {
-                    "name": "UKV_TEST_PATH",
+                    "name": "USTORE_TEST_PATH",
                     "value": ""
                 }
             ],

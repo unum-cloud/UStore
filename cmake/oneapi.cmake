@@ -1,5 +1,5 @@
 
-if(${UKV_REBUILD_ONEAPI})
+if(${USTORE_REBUILD_ONEAPI})
     include(FetchContent)
     FetchContent_Declare(
         TBB

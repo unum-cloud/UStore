@@ -30,29 +30,29 @@
 #include <fmt/format.h>
 #include <gtest/gtest.h>
 
-#include <ukv/ukv.hpp>
+#include <ustore/ustore.hpp>
 #include "dataset.h"
 
-using namespace unum::ukv;
-using docs_t = std::unordered_map<ukv_key_t, std::string>;
+using namespace unum::ustore;
+using docs_t = std::unordered_map<ustore_key_t, std::string>;
 
 namespace fs = std::filesystem;
 
 constexpr size_t max_batch_size_k = 1024 * 1024 * 1024;
 
-constexpr ukv_str_view_t dataset_path_k = "~/Datasets/tweets32K.ndjson";
-constexpr ukv_str_view_t parquet_path_k = "~/Datasets/tweets32K-clean.parquet";
-constexpr ukv_str_view_t csv_path_k = "~/Datasets/tweets32K-clean.csv";
-constexpr ukv_str_view_t ndjson_path_k = "sample_docs.ndjson";
-constexpr ukv_str_view_t path_k = "./";
+constexpr ustore_str_view_t dataset_path_k = "~/Datasets/tweets32K.ndjson";
+constexpr ustore_str_view_t parquet_path_k = "~/Datasets/tweets32K-clean.parquet";
+constexpr ustore_str_view_t csv_path_k = "~/Datasets/tweets32K-clean.csv";
+constexpr ustore_str_view_t ndjson_path_k = "sample_docs.ndjson";
+constexpr ustore_str_view_t path_k = "./";
 constexpr size_t rows_count_k = 1000;
 
-static constexpr ukv_str_view_t ext_parquet_k = ".parquet";
-static constexpr ukv_str_view_t ext_ndjson_k = ".ndjson";
-static constexpr ukv_str_view_t ext_csv_k = ".csv";
+static constexpr ustore_str_view_t ext_parquet_k = ".parquet";
+static constexpr ustore_str_view_t ext_ndjson_k = ".ndjson";
+static constexpr ustore_str_view_t ext_csv_k = ".csv";
 
 constexpr size_t prefixes_count_k = 4;
-constexpr ukv_str_view_t prefixes_ak[prefixes_count_k] = {
+constexpr ustore_str_view_t prefixes_ak[prefixes_count_k] = {
     "id",
     "id_str",
     "user",
@@ -60,7 +60,7 @@ constexpr ukv_str_view_t prefixes_ak[prefixes_count_k] = {
 };
 
 constexpr size_t fields_paths_count_k = 13;
-static constexpr ukv_str_view_t fields_paths_ak[fields_paths_count_k] = {
+static constexpr ustore_str_view_t fields_paths_ak[fields_paths_count_k] = {
     "id",
     "id_str",
     "/user/id",
@@ -77,7 +77,7 @@ static constexpr ukv_str_view_t fields_paths_ak[fields_paths_count_k] = {
 };
 
 constexpr size_t fields_columns_count_k = 7;
-static constexpr ukv_str_view_t fields_columns_ak[fields_columns_count_k] = {
+static constexpr ustore_str_view_t fields_columns_ak[fields_columns_count_k] = {
     "id",
     "id_str",
     "user_id",
@@ -87,8 +87,8 @@ static constexpr ukv_str_view_t fields_columns_ak[fields_columns_count_k] = {
     "retweeted",
 };
 
-static constexpr ukv_str_view_t doc_k = "doc";
-static constexpr ukv_str_view_t id_k = "_id";
+static constexpr ustore_str_view_t doc_k = "doc";
+static constexpr ustore_str_view_t id_k = "_id";
 
 std::filesystem::path home_path(std::getenv("HOME"));
 std::vector<std::string> paths;
@@ -241,7 +241,7 @@ class arrow_visitor_at {
 
     std::string& json;
     bool id_field = false;
-    ukv_key_t key;
+    ustore_key_t key;
     size_t idx = 0;
 
   private:
@@ -329,7 +329,7 @@ void make_ndjson_docs() {
     std::string_view mapped_content = std::string_view(reinterpret_cast<char const*>(begin), size);
     madvise(begin, size, MADV_SEQUENTIAL);
 
-    auto get_value = [](simdjson::ondemand::object& obj, ukv_str_view_t field) {
+    auto get_value = [](simdjson::ondemand::object& obj, ustore_str_view_t field) {
         return (field[0] == '/') ? rewind(obj).at_pointer(field) : rewind(obj)[field];
     };
 
@@ -421,7 +421,7 @@ void fill_from_table(std::shared_ptr<arrow::Table>& table) {
     }
 }
 
-void fill_from_ndjson(ukv_str_view_t file_name) {
+void fill_from_ndjson(ustore_str_view_t file_name) {
 
     std::filesystem::path pt {file_name};
     size_t size = std::filesystem::file_size(pt);
@@ -441,13 +441,13 @@ void fill_from_ndjson(ukv_str_view_t file_name) {
         simdjson::ondemand::object obj = doc.get_object().value();
         auto data = rewind(obj)[doc_k].get_object().value().raw_json().value();
         auto str = std::string(data.data(), data.size());
-        ukv_key_t key = rewind(obj)[id_k];
+        ustore_key_t key = rewind(obj)[id_k];
         docs_w_keys[key] = str;
     }
     close(handle);
 }
 
-void fill_docs_w_keys(ukv_str_view_t file_name) {
+void fill_docs_w_keys(ustore_str_view_t file_name) {
 
     docs_w_keys.clear();
     auto ext = std::filesystem::path(file_name).extension();
@@ -478,7 +478,7 @@ void fill_docs_w_keys(ukv_str_view_t file_name) {
     }
 }
 
-bool cmp_ndjson_docs_sub(ukv_str_view_t lhs, ukv_str_view_t rhs) {
+bool cmp_ndjson_docs_sub(ustore_str_view_t lhs, ustore_str_view_t rhs) {
 
     std::filesystem::path pt {lhs};
     size_t size = std::filesystem::file_size(pt);
@@ -489,7 +489,7 @@ bool cmp_ndjson_docs_sub(ukv_str_view_t lhs, ukv_str_view_t rhs) {
     madvise(begin, size, MADV_SEQUENTIAL);
     fill_docs_w_keys(rhs);
 
-    auto get_value = [](simdjson::ondemand::object& obj, ukv_str_view_t field) {
+    auto get_value = [](simdjson::ondemand::object& obj, ustore_str_view_t field) {
         return (field[0] == '/') ? rewind(obj).at_pointer(field) : rewind(obj)[field];
     };
 
@@ -523,7 +523,7 @@ bool cmp_ndjson_docs_sub(ukv_str_view_t lhs, ukv_str_view_t rhs) {
                 break;
             case simdjson::ondemand::json_type::number: {
                 if (data_l.is_integer())
-                    EXPECT_EQ(ukv_key_t(data_l), ukv_key_t(data_r));
+                    EXPECT_EQ(ustore_key_t(data_l), ustore_key_t(data_r));
                 else
                     EXPECT_EQ(double(data_l), double(data_r));
             } break;
@@ -538,7 +538,7 @@ bool cmp_ndjson_docs_sub(ukv_str_view_t lhs, ukv_str_view_t rhs) {
     return true;
 }
 
-bool cmp_ndjson_docs_whole(ukv_str_view_t lhs, ukv_str_view_t rhs) {
+bool cmp_ndjson_docs_whole(ustore_str_view_t lhs, ustore_str_view_t rhs) {
 
     std::filesystem::path pt {lhs};
     size_t size = std::filesystem::file_size(pt);
@@ -549,7 +549,7 @@ bool cmp_ndjson_docs_whole(ukv_str_view_t lhs, ukv_str_view_t rhs) {
     madvise(begin, size, MADV_SEQUENTIAL);
     fill_docs_w_keys(rhs);
 
-    auto get_value = [](simdjson::ondemand::object& obj, ukv_str_view_t field) {
+    auto get_value = [](simdjson::ondemand::object& obj, ustore_str_view_t field) {
         return (field[0] == '/') ? rewind(obj).at_pointer(field) : rewind(obj)[field];
     };
 
@@ -579,11 +579,11 @@ bool cmp_ndjson_docs_whole(ukv_str_view_t lhs, ukv_str_view_t rhs) {
     return true;
 }
 
-bool cmp_table_docs_whole(ukv_str_view_t lhs, ukv_str_view_t rhs) {
+bool cmp_table_docs_whole(ustore_str_view_t lhs, ustore_str_view_t rhs) {
 
     docs_t docs_w_keys_;
     std::string json = "{";
-    std::vector<ukv_key_t> keys;
+    std::vector<ustore_key_t> keys;
     arrow_visitor_at visitor(json);
     std::shared_ptr<arrow::Table> table;
     auto ext = std::filesystem::path(lhs).extension();
@@ -643,11 +643,11 @@ bool cmp_table_docs_whole(ukv_str_view_t lhs, ukv_str_view_t rhs) {
     return true;
 }
 
-bool cmp_table_docs_sub(ukv_str_view_t lhs, ukv_str_view_t rhs) {
+bool cmp_table_docs_sub(ustore_str_view_t lhs, ustore_str_view_t rhs) {
 
     docs_t docs_w_keys_;
     std::string json = "{";
-    std::vector<ukv_key_t> keys;
+    std::vector<ustore_key_t> keys;
     arrow_visitor_at visitor(json);
     std::shared_ptr<arrow::Table> table;
     auto ext = std::filesystem::path(lhs).extension();
@@ -704,7 +704,7 @@ bool cmp_table_docs_sub(ukv_str_view_t lhs, ukv_str_view_t rhs) {
 }
 
 template <typename comparator>
-bool test_sub_docs(ukv_str_view_t file, ukv_str_view_t ext, comparator cmp, bool state = false) {
+bool test_sub_docs(ustore_str_view_t file, ustore_str_view_t ext, comparator cmp, bool state = false) {
 
     auto collection = db.main();
     arena_t arena(db);
@@ -717,11 +717,11 @@ bool test_sub_docs(ukv_str_view_t file, ukv_str_view_t ext, comparator cmp, bool
     if (std::strcmp(ndjson_path_k, file) != 0)
         dataset_path = home_path / dataset_path.substr(2);
 
-    ukv_docs_import_t docs {
+    ustore_docs_import_t docs {
         .db = db,
         .error = status.member_ptr(),
         .arena = arena.member_ptr(),
-        .options = ukv_options_default_k,
+        .options = ustore_options_default_k,
         .collection = collection,
         .paths_pattern = dataset_path.c_str(),
         .max_batch_size = max_batch_size_k,
@@ -729,18 +729,18 @@ bool test_sub_docs(ukv_str_view_t file, ukv_str_view_t ext, comparator cmp, bool
         .callback_payload = nullptr,
         .fields_count = state ? fields_columns_count_k : fields_paths_count_k,
         .fields = state ? fields_columns_ak : fields_paths_ak,
-        .fields_stride = sizeof(ukv_str_view_t),
+        .fields_stride = sizeof(ustore_str_view_t),
         .id_field = fields_columns_ak[0],
     };
-    ukv_docs_import(&docs);
+    ustore_docs_import(&docs);
 
     EXPECT_TRUE(status);
 
-    ukv_docs_export_t exdocs {
+    ustore_docs_export_t exdocs {
         .db = db,
         .error = status.member_ptr(),
         .arena = arena.member_ptr(),
-        .options = ukv_options_default_k,
+        .options = ustore_options_default_k,
         .collection = collection,
         .paths_extension = ext,
         .max_batch_size = max_batch_size_k,
@@ -748,9 +748,9 @@ bool test_sub_docs(ukv_str_view_t file, ukv_str_view_t ext, comparator cmp, bool
         .callback_payload = nullptr,
         .fields_count = state ? fields_columns_count_k : fields_paths_count_k,
         .fields = state ? fields_columns_ak : fields_paths_ak,
-        .fields_stride = sizeof(ukv_str_view_t),
+        .fields_stride = sizeof(ustore_str_view_t),
     };
-    ukv_docs_export(&exdocs);
+    ustore_docs_export(&exdocs);
 
     EXPECT_TRUE(status);
 
@@ -777,7 +777,7 @@ bool test_sub_docs(ukv_str_view_t file, ukv_str_view_t ext, comparator cmp, bool
 }
 
 template <typename comparator>
-bool test_whole_docs(ukv_str_view_t file, ukv_str_view_t ext, comparator cmp, bool state = false) {
+bool test_whole_docs(ustore_str_view_t file, ustore_str_view_t ext, comparator cmp, bool state = false) {
 
     auto collection = db.main();
     arena_t arena(db);
@@ -790,11 +790,11 @@ bool test_whole_docs(ukv_str_view_t file, ukv_str_view_t ext, comparator cmp, bo
     if (std::strcmp(ndjson_path_k, file) != 0)
         dataset_path = home_path / dataset_path.substr(2);
 
-    ukv_docs_import_t docs {
+    ustore_docs_import_t docs {
         .db = db,
         .error = status.member_ptr(),
         .arena = arena.member_ptr(),
-        .options = ukv_options_default_k,
+        .options = ustore_options_default_k,
         .collection = collection,
         .paths_pattern = dataset_path.c_str(),
         .max_batch_size = max_batch_size_k,
@@ -802,22 +802,22 @@ bool test_whole_docs(ukv_str_view_t file, ukv_str_view_t ext, comparator cmp, bo
         .callback_payload = nullptr,
         .id_field = fields_paths_ak[0],
     };
-    ukv_docs_import(&docs);
+    ustore_docs_import(&docs);
 
     EXPECT_TRUE(status);
 
-    ukv_docs_export_t exdocs {
+    ustore_docs_export_t exdocs {
         .db = db,
         .error = status.member_ptr(),
         .arena = arena.member_ptr(),
-        .options = ukv_options_default_k,
+        .options = ustore_options_default_k,
         .collection = collection,
         .paths_extension = ext,
         .max_batch_size = max_batch_size_k,
         .callback = nullptr,
         .callback_payload = nullptr,
     };
-    ukv_docs_export(&exdocs);
+    ustore_docs_export(&exdocs);
 
     EXPECT_TRUE(status);
 
@@ -843,7 +843,7 @@ bool test_whole_docs(ukv_str_view_t file, ukv_str_view_t ext, comparator cmp, bo
     return true;
 }
 
-bool test_crash_cases_docs_import(ukv_str_view_t file) {
+bool test_crash_cases_docs_import(ustore_str_view_t file) {
     auto collection = db.main();
     arena_t arena(db);
     status_t status;
@@ -852,11 +852,11 @@ bool test_crash_cases_docs_import(ukv_str_view_t file) {
     if (std::strcmp(ndjson_path_k, file) != 0)
         dataset_path = home_path / dataset_path.substr(2);
 
-    ukv_docs_import_t imp_path_null {
+    ustore_docs_import_t imp_path_null {
         .db = db,
         .error = status.member_ptr(),
         .arena = arena.member_ptr(),
-        .options = ukv_options_default_k,
+        .options = ustore_options_default_k,
         .collection = collection,
         .paths_pattern = nullptr,
         .max_batch_size = max_batch_size_k,
@@ -864,17 +864,17 @@ bool test_crash_cases_docs_import(ukv_str_view_t file) {
         .callback_payload = nullptr,
         .fields_count = prefixes_count_k,
         .fields = prefixes_ak,
-        .fields_stride = sizeof(ukv_str_view_t),
+        .fields_stride = sizeof(ustore_str_view_t),
     };
-    ukv_docs_import(&imp_path_null);
+    ustore_docs_import(&imp_path_null);
     EXPECT_FALSE(status);
     status.release_error();
 
-    ukv_docs_import_t imp_count_null {
+    ustore_docs_import_t imp_count_null {
         .db = db,
         .error = status.member_ptr(),
         .arena = arena.member_ptr(),
-        .options = ukv_options_default_k,
+        .options = ustore_options_default_k,
         .collection = collection,
         .paths_pattern = dataset_path.c_str(),
         .max_batch_size = max_batch_size_k,
@@ -882,17 +882,17 @@ bool test_crash_cases_docs_import(ukv_str_view_t file) {
         .callback_payload = nullptr,
         .fields_count = 0,
         .fields = prefixes_ak,
-        .fields_stride = sizeof(ukv_str_view_t),
+        .fields_stride = sizeof(ustore_str_view_t),
     };
-    ukv_docs_import(&imp_count_null);
+    ustore_docs_import(&imp_count_null);
     EXPECT_FALSE(status);
     status.release_error();
 
-    ukv_docs_import_t imp_fields_null {
+    ustore_docs_import_t imp_fields_null {
         .db = db,
         .error = status.member_ptr(),
         .arena = arena.member_ptr(),
-        .options = ukv_options_default_k,
+        .options = ustore_options_default_k,
         .collection = collection,
         .paths_pattern = dataset_path.c_str(),
         .max_batch_size = max_batch_size_k,
@@ -900,17 +900,17 @@ bool test_crash_cases_docs_import(ukv_str_view_t file) {
         .callback_payload = nullptr,
         .fields_count = prefixes_count_k,
         .fields = nullptr,
-        .fields_stride = sizeof(ukv_str_view_t),
+        .fields_stride = sizeof(ustore_str_view_t),
     };
-    ukv_docs_import(&imp_fields_null);
+    ustore_docs_import(&imp_fields_null);
     EXPECT_FALSE(status);
     status.release_error();
 
-    ukv_docs_import_t imp_stride_null {
+    ustore_docs_import_t imp_stride_null {
         .db = db,
         .error = status.member_ptr(),
         .arena = arena.member_ptr(),
-        .options = ukv_options_default_k,
+        .options = ustore_options_default_k,
         .collection = collection,
         .paths_pattern = dataset_path.c_str(),
         .max_batch_size = max_batch_size_k,
@@ -920,11 +920,11 @@ bool test_crash_cases_docs_import(ukv_str_view_t file) {
         .fields = prefixes_ak,
         .fields_stride = 0,
     };
-    ukv_docs_import(&imp_stride_null);
+    ustore_docs_import(&imp_stride_null);
     EXPECT_FALSE(status);
     status.release_error();
 
-    ukv_docs_import_t imp_db_null {
+    ustore_docs_import_t imp_db_null {
         .db = nullptr,
         .error = status.member_ptr(),
         .arena = arena.member_ptr(),
@@ -932,24 +932,24 @@ bool test_crash_cases_docs_import(ukv_str_view_t file) {
         .paths_pattern = dataset_path.c_str(),
         .fields_count = prefixes_count_k,
         .fields = prefixes_ak,
-        .fields_stride = sizeof(ukv_str_view_t),
+        .fields_stride = sizeof(ustore_str_view_t),
     };
-    ukv_docs_import(&imp_db_null);
+    ustore_docs_import(&imp_db_null);
     EXPECT_FALSE(status);
     db.clear().throw_unhandled();
     return true;
 }
 
-bool test_crash_cases_docs_export(ukv_str_view_t ext) {
+bool test_crash_cases_docs_export(ustore_str_view_t ext) {
     auto collection = db.main();
     arena_t arena(db);
     status_t status;
 
-    ukv_docs_export_t imp_path_null {
+    ustore_docs_export_t imp_path_null {
         .db = db,
         .error = status.member_ptr(),
         .arena = arena.member_ptr(),
-        .options = ukv_options_default_k,
+        .options = ustore_options_default_k,
         .collection = collection,
         .paths_extension = nullptr,
         .max_batch_size = max_batch_size_k,
@@ -957,17 +957,17 @@ bool test_crash_cases_docs_export(ukv_str_view_t ext) {
         .callback_payload = nullptr,
         .fields_count = prefixes_count_k,
         .fields = prefixes_ak,
-        .fields_stride = sizeof(ukv_str_view_t),
+        .fields_stride = sizeof(ustore_str_view_t),
     };
-    ukv_docs_export(&imp_path_null);
+    ustore_docs_export(&imp_path_null);
     EXPECT_FALSE(status);
     status.release_error();
 
-    ukv_docs_export_t imp_count_null {
+    ustore_docs_export_t imp_count_null {
         .db = db,
         .error = status.member_ptr(),
         .arena = arena.member_ptr(),
-        .options = ukv_options_default_k,
+        .options = ustore_options_default_k,
         .collection = collection,
         .paths_extension = ext,
         .max_batch_size = max_batch_size_k,
@@ -975,17 +975,17 @@ bool test_crash_cases_docs_export(ukv_str_view_t ext) {
         .callback_payload = nullptr,
         .fields_count = 0,
         .fields = prefixes_ak,
-        .fields_stride = sizeof(ukv_str_view_t),
+        .fields_stride = sizeof(ustore_str_view_t),
     };
-    ukv_docs_export(&imp_count_null);
+    ustore_docs_export(&imp_count_null);
     EXPECT_FALSE(status);
     status.release_error();
 
-    ukv_docs_export_t imp_fields_null {
+    ustore_docs_export_t imp_fields_null {
         .db = db,
         .error = status.member_ptr(),
         .arena = arena.member_ptr(),
-        .options = ukv_options_default_k,
+        .options = ustore_options_default_k,
         .collection = collection,
         .paths_extension = ext,
         .max_batch_size = max_batch_size_k,
@@ -993,17 +993,17 @@ bool test_crash_cases_docs_export(ukv_str_view_t ext) {
         .callback_payload = nullptr,
         .fields_count = prefixes_count_k,
         .fields = nullptr,
-        .fields_stride = sizeof(ukv_str_view_t),
+        .fields_stride = sizeof(ustore_str_view_t),
     };
-    ukv_docs_export(&imp_fields_null);
+    ustore_docs_export(&imp_fields_null);
     EXPECT_FALSE(status);
     status.release_error();
 
-    ukv_docs_export_t imp_stride_null {
+    ustore_docs_export_t imp_stride_null {
         .db = db,
         .error = status.member_ptr(),
         .arena = arena.member_ptr(),
-        .options = ukv_options_default_k,
+        .options = ustore_options_default_k,
         .collection = collection,
         .paths_extension = ext,
         .max_batch_size = max_batch_size_k,
@@ -1013,15 +1013,15 @@ bool test_crash_cases_docs_export(ukv_str_view_t ext) {
         .fields = prefixes_ak,
         .fields_stride = 0,
     };
-    ukv_docs_export(&imp_stride_null);
+    ustore_docs_export(&imp_stride_null);
     EXPECT_FALSE(status);
     status.release_error();
 
-    ukv_docs_export_t imp_db_null {
+    ustore_docs_export_t imp_db_null {
         .db = nullptr,
         .error = status.member_ptr(),
         .arena = arena.member_ptr(),
-        .options = ukv_options_default_k,
+        .options = ustore_options_default_k,
         .collection = collection,
         .paths_extension = ext,
         .max_batch_size = max_batch_size_k,
@@ -1029,9 +1029,9 @@ bool test_crash_cases_docs_export(ukv_str_view_t ext) {
         .callback_payload = nullptr,
         .fields_count = prefixes_count_k,
         .fields = prefixes_ak,
-        .fields_stride = sizeof(ukv_str_view_t),
+        .fields_stride = sizeof(ustore_str_view_t),
     };
-    ukv_docs_export(&imp_db_null);
+    ustore_docs_export(&imp_db_null);
     EXPECT_FALSE(status);
     db.clear().throw_unhandled();
     return true;
@@ -1124,7 +1124,7 @@ TEST(crash_cases, docs_export) {
 int main(int argc, char** argv) {
     make_ndjson_docs();
     for (const auto& entry : fs::directory_iterator(path_k))
-        paths.push_back(ukv_str_span_t(entry.path().c_str()));
+        paths.push_back(ustore_str_span_t(entry.path().c_str()));
 
     db.open().throw_unhandled();
     ::testing::InitGoogleTest(&argc, argv);

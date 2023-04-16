@@ -7,7 +7,7 @@
 #pragma once
 #include "linked_memory.hpp" // `linked_memory_lock_t`
 
-namespace unum::ukv {
+namespace unum::ustore {
 
 /**
  * @brief An `std::vector`-like class, with open layout,
@@ -23,8 +23,8 @@ class uninitialized_array_gt {
 
   private:
     ptr_t ptr_ = nullptr;
-    ukv_length_t length_ = 0;
-    ukv_length_t cap_ = 0;
+    ustore_length_t length_ = 0;
+    ustore_length_t cap_ = 0;
     linked_memory_lock_t* arena_ptr_ = nullptr;
 
   public:
@@ -43,12 +43,12 @@ class uninitialized_array_gt {
         return *this;
     }
     uninitialized_array_gt(linked_memory_lock_t& arena) : arena_ptr_(&arena) {}
-    uninitialized_array_gt(std::size_t size, linked_memory_lock_t& arena, ukv_error_t* c_error) : arena_ptr_(&arena) {
+    uninitialized_array_gt(std::size_t size, linked_memory_lock_t& arena, ustore_error_t* c_error) : arena_ptr_(&arena) {
         if (!size)
             return;
         auto tape = arena_ptr_->alloc<element_t>(size, c_error);
         ptr_ = tape.begin();
-        cap_ = length_ = static_cast<ukv_length_t>(size);
+        cap_ = length_ = static_cast<ustore_length_t>(size);
     }
 
     uninitialized_array_gt(value_view_t view) : uninitialized_array_gt(view.size()) {
@@ -62,11 +62,11 @@ class uninitialized_array_gt {
         cap_ = 0;
     }
 
-    void resize(std::size_t size, ukv_error_t* c_error) {
+    void resize(std::size_t size, ustore_error_t* c_error) {
         if (size == length_)
             return;
         if (size <= cap_) {
-            length_ = static_cast<ukv_length_t>(size);
+            length_ = static_cast<ustore_length_t>(size);
             return;
         }
 
@@ -76,11 +76,11 @@ class uninitialized_array_gt {
         return_if_error_m(c_error);
 
         ptr_ = tape.begin();
-        cap_ = static_cast<ukv_length_t>(new_cap);
-        length_ = static_cast<ukv_length_t>(size);
+        cap_ = static_cast<ustore_length_t>(new_cap);
+        length_ = static_cast<ustore_length_t>(size);
     }
 
-    void reserve(std::size_t new_cap, ukv_error_t* c_error) {
+    void reserve(std::size_t new_cap, ustore_error_t* c_error) {
         if (new_cap <= cap_)
             return;
         new_cap = next_power_of_two(new_cap);
@@ -89,10 +89,10 @@ class uninitialized_array_gt {
         return_if_error_m(c_error);
 
         ptr_ = tape.begin();
-        cap_ = static_cast<ukv_length_t>(new_cap);
+        cap_ = static_cast<ustore_length_t>(new_cap);
     }
 
-    void push_back(element_t val, ukv_error_t* c_error) {
+    void push_back(element_t val, ustore_error_t* c_error) {
         auto new_size = length_ + 1;
         reserve(new_size, c_error);
         return_if_error_m(c_error);
@@ -101,11 +101,11 @@ class uninitialized_array_gt {
         length_ = new_size;
     }
 
-    void insert(std::size_t offset, ptrc_t inserted_begin, ptrc_t inserted_end, ukv_error_t* c_error) {
+    void insert(std::size_t offset, ptrc_t inserted_begin, ptrc_t inserted_end, ustore_error_t* c_error) {
         return_error_if_m(size() >= offset, c_error, out_of_range_k, "Can't insert");
 
-        auto inserted_len = static_cast<ukv_length_t>(inserted_end - inserted_begin);
-        auto following_len = static_cast<ukv_length_t>(length_ - offset);
+        auto inserted_len = static_cast<ustore_length_t>(inserted_end - inserted_begin);
+        auto following_len = static_cast<ustore_length_t>(length_ - offset);
         auto new_size = length_ + inserted_len;
 
         if (new_size > cap_) {
@@ -121,7 +121,7 @@ class uninitialized_array_gt {
         std::memcpy(ptr_ + offset, inserted_begin, inserted_len * sizeof(element_t));
     }
 
-    void erase(std::size_t offset, std::size_t length, ukv_error_t* c_error) {
+    void erase(std::size_t offset, std::size_t length, ustore_error_t* c_error) {
         return_error_if_m(size() >= offset + length, c_error, out_of_range_k, "Can't erase");
 
         auto following_len = length_ - (offset + length);
@@ -139,8 +139,8 @@ class uninitialized_array_gt {
     inline void clear() noexcept { length_ = 0; }
 
     inline ptr_t* member_ptr() noexcept { return &ptr_; }
-    inline ukv_length_t* member_length() noexcept { return &length_; }
-    inline ukv_length_t* member_cap() noexcept { return &cap_; }
+    inline ustore_length_t* member_length() noexcept { return &length_; }
+    inline ustore_length_t* member_cap() noexcept { return &cap_; }
 };
 
 template <typename element_at>
@@ -165,9 +165,9 @@ class initialized_range_gt {
  * Is suited for data preparation before passing to the C API.
  */
 class growing_tape_t {
-    uninitialized_array_gt<ukv_octet_t> presences_;
-    uninitialized_array_gt<ukv_length_t> offsets_;
-    uninitialized_array_gt<ukv_length_t> lengths_;
+    uninitialized_array_gt<ustore_octet_t> presences_;
+    uninitialized_array_gt<ustore_length_t> offsets_;
+    uninitialized_array_gt<ustore_length_t> lengths_;
     uninitialized_array_gt<byte_t> contents_;
 
   public:
@@ -177,12 +177,12 @@ class growing_tape_t {
     /**
      * @return Memory region occupied by the new copy.
      */
-    value_view_t push_back(value_view_t value, ukv_error_t* c_error) {
-        auto offset = static_cast<ukv_length_t>(contents_.size());
-        auto length = static_cast<ukv_length_t>(value.size());
+    value_view_t push_back(value_view_t value, ustore_error_t* c_error) {
+        auto offset = static_cast<ustore_length_t>(contents_.size());
+        auto length = static_cast<ustore_length_t>(value.size());
         auto old_count = lengths_.size();
 
-        lengths_.push_back(value ? length : ukv_length_missing_k, c_error);
+        lengths_.push_back(value ? length : ustore_length_missing_k, c_error);
 
         presences_.resize(divide_round_up(old_count + 1, bits_in_byte_k), c_error);
         if (*c_error)
@@ -203,13 +203,13 @@ class growing_tape_t {
         return value_view_t {contents_.data() + contents_.size() - value.size(), value.size()};
     }
 
-    void add_terminator(byte_t terminator, ukv_error_t* c_error) {
+    void add_terminator(byte_t terminator, ustore_error_t* c_error) {
         contents_.push_back(terminator, c_error);
         return_if_error_m(c_error);
         offsets_[lengths_.size()] += 1;
     }
 
-    void reserve(size_t new_cap, ukv_error_t* c_error) {
+    void reserve(size_t new_cap, ustore_error_t* c_error) {
         presences_.reserve(divide_round_up(new_cap, bits_in_byte_k), c_error);
         offsets_.reserve(new_cap + 1, c_error);
         lengths_.reserve(new_cap, c_error);
@@ -223,19 +223,19 @@ class growing_tape_t {
     }
 
     bits_span_t presences() noexcept { return bits_span_t(presences_.begin()); }
-    strided_range_gt<ukv_length_t> offsets() noexcept {
-        return strided_range<ukv_length_t>(offsets_.begin(), offsets_.end());
+    strided_range_gt<ustore_length_t> offsets() noexcept {
+        return strided_range<ustore_length_t>(offsets_.begin(), offsets_.end());
     }
-    strided_range_gt<ukv_length_t> lengths() noexcept {
-        return strided_range<ukv_length_t>(lengths_.begin(), lengths_.end());
+    strided_range_gt<ustore_length_t> lengths() noexcept {
+        return strided_range<ustore_length_t>(lengths_.begin(), lengths_.end());
     }
     strided_range_gt<byte_t> contents() noexcept { return strided_range<byte_t>(contents_.begin(), contents_.end()); }
 
-    operator joined_blobs_t() noexcept { return {lengths_.size(), offsets_.data(), ukv_bytes_ptr_t(contents_.data())}; }
+    operator joined_blobs_t() noexcept { return {lengths_.size(), offsets_.data(), ustore_bytes_ptr_t(contents_.data())}; }
 
     operator embedded_blobs_t() noexcept {
-        return {lengths_.size(), offsets_.data(), lengths_.data(), ukv_bytes_ptr_t(contents_.data())};
+        return {lengths_.size(), offsets_.data(), lengths_.data(), ustore_bytes_ptr_t(contents_.data())};
     }
 };
 
-} // namespace unum::ukv
+} // namespace unum::ustore

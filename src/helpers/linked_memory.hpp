@@ -13,11 +13,11 @@
 #include <vector>     // `std::vector`
 #include <numeric>    // `std::accumulate`
 
-#include "ukv/cpp/types.hpp"  // `byte_t`, `next_power_of_two`
-#include "ukv/cpp/ranges.hpp" // `strided_range_gt`
-#include "ukv/cpp/status.hpp" // `out_of_memory_k`
+#include "ustore/cpp/types.hpp"  // `byte_t`, `next_power_of_two`
+#include "ustore/cpp/ranges.hpp" // `strided_range_gt`
+#include "ustore/cpp/status.hpp" // `out_of_memory_k`
 
-namespace unum::ukv {
+namespace unum::ustore {
 
 struct linked_memory_t {
     static constexpr std::size_t initial_size_k = 1024ul * 1024ul;
@@ -164,7 +164,7 @@ struct linked_memory_lock_t {
     linked_memory_t& memory;
     bool owns_the_lock = false;
 
-    operator ukv_arena_t*() const noexcept { return (ukv_arena_t*)&memory.first_ptr_; }
+    operator ustore_arena_t*() const noexcept { return (ustore_arena_t*)&memory.first_ptr_; }
 
     linked_memory_lock_t(linked_memory_t& memory, linked_memory_t::kind_t kind, bool keep_old_data = false) noexcept
         : memory(memory) {
@@ -179,7 +179,7 @@ struct linked_memory_lock_t {
     }
 
     template <typename at>
-    ptr_range_gt<at> alloc(std::size_t size, ukv_error_t* c_error, std::size_t alignment = sizeof(at)) noexcept {
+    ptr_range_gt<at> alloc(std::size_t size, ustore_error_t* c_error, std::size_t alignment = sizeof(at)) noexcept {
         if (!size)
             return {};
         void* result = memory.alloc(sizeof(at) * size, alignment);
@@ -191,7 +191,7 @@ struct linked_memory_lock_t {
     ptr_range_gt<at> grow( //
         ptr_range_gt<at> span,
         std::size_t additional_size,
-        ukv_error_t* c_error,
+        ustore_error_t* c_error,
         std::size_t alignment = sizeof(at)) noexcept {
 
         if (!additional_size)
@@ -211,14 +211,14 @@ struct linked_memory_lock_t {
 
     range_or_dummy_gt<bits_span_t> alloc_or_dummy( //
         std::size_t size,
-        ukv_error_t* c_error,
-        ukv_octet_t** output,
-        std::size_t alignment = sizeof(ukv_octet_t)) noexcept {
+        ustore_error_t* c_error,
+        ustore_octet_t** output,
+        std::size_t alignment = sizeof(ustore_octet_t)) noexcept {
 
         using range_t = bits_span_t;
         auto slots = divide_round_up(size, bits_in_byte_k);
         auto range = output //
-                         ? range_t {(*output = alloc<ukv_octet_t>(slots, c_error, alignment).begin())}
+                         ? range_t {(*output = alloc<ustore_octet_t>(slots, c_error, alignment).begin())}
                          : range_t {nullptr};
         return {range, {}};
     }
@@ -226,11 +226,11 @@ struct linked_memory_lock_t {
     template <typename at>
     range_or_dummy_gt<ptr_range_gt<at>> alloc_or_dummy( //
         std::size_t size,
-        ukv_error_t* c_error,
+        ustore_error_t* c_error,
         at** output,
         std::size_t alignment = sizeof(at)) noexcept {
 
-        static_assert(!std::is_same<at, ukv_octet_t>());
+        static_assert(!std::is_same<at, ustore_octet_t>());
         using range_t = ptr_range_gt<at>;
         auto range = output //
                          ? range_t {(*output = alloc<at>(size, c_error, alignment).begin()), size}
@@ -239,26 +239,26 @@ struct linked_memory_lock_t {
     }
 };
 
-inline linked_memory_lock_t linked_memory(ukv_arena_t* c_arena, ukv_options_t options, ukv_error_t* c_error) noexcept {
+inline linked_memory_lock_t linked_memory(ustore_arena_t* c_arena, ustore_options_t options, ustore_error_t* c_error) noexcept {
 
-    static_assert(sizeof(ukv_arena_t) == sizeof(linked_memory_t));
+    static_assert(sizeof(ustore_arena_t) == sizeof(linked_memory_t));
     linked_memory_t& ref = *reinterpret_cast<linked_memory_t*>(c_arena);
-    linked_memory_t::kind_t kind = (options & ukv_option_read_shared_memory_k) //
+    linked_memory_t::kind_t kind = (options & ustore_option_read_shared_memory_k) //
                                        ? linked_memory_t::kind_t::shared_k
                                        : linked_memory_t::kind_t::sys_k;
-    bool keep_old_data = options & ukv_option_dont_discard_memory_k;
+    bool keep_old_data = options & ustore_option_dont_discard_memory_k;
 
     return linked_memory_lock_t(ref, kind, keep_old_data);
 }
 
-inline void clear_linked_memory(ukv_arena_t& c_arena) noexcept {
-    static_assert(sizeof(ukv_arena_t) == sizeof(linked_memory_t));
+inline void clear_linked_memory(ustore_arena_t& c_arena) noexcept {
+    static_assert(sizeof(ustore_arena_t) == sizeof(linked_memory_t));
     linked_memory_t& ref = reinterpret_cast<linked_memory_t&>(c_arena);
     ref.release_all();
 }
 
 template <typename dangerous_at>
-void safe_section(ukv_str_view_t name, ukv_error_t* c_error, dangerous_at&& dangerous) try {
+void safe_section(ustore_str_view_t name, ustore_error_t* c_error, dangerous_at&& dangerous) try {
     dangerous();
 }
 catch (std::bad_alloc const&) {
@@ -268,4 +268,4 @@ catch (...) {
     log_error_m(c_error, error_unknown_k, name);
 }
 
-} // namespace unum::ukv
+} // namespace unum::ustore

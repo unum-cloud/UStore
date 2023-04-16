@@ -11,7 +11,7 @@
 
 #define ARROW_C_DATA_INTERFACE
 #define ARROW_C_STREAM_INTERFACE
-#include "ukv/arrow.h"
+#include "ustore/arrow.h"
 #include "nlohmann.hpp"
 
 #include "pybind.hpp"
@@ -20,48 +20,48 @@
 
 using namespace std::literals;
 
-using namespace unum::ukv::pyb;
-using namespace unum::ukv;
+using namespace unum::ustore::pyb;
+using namespace unum::ustore;
 using namespace unum;
 
-static ukv_doc_field_type_t ukv_doc_field_from_str(ukv_str_view_t type_name) {
+static ustore_doc_field_type_t ustore_doc_field_from_str(ustore_str_view_t type_name) {
     if (type_name == "bool"sv)
-        return ukv_doc_field_bool_k;
+        return ustore_doc_field_bool_k;
     else if (type_name == "int8"sv)
-        return ukv_doc_field_i8_k;
+        return ustore_doc_field_i8_k;
     else if (type_name == "int16"sv)
-        return ukv_doc_field_i16_k;
+        return ustore_doc_field_i16_k;
     else if (type_name == "int32"sv)
-        return ukv_doc_field_i32_k;
+        return ustore_doc_field_i32_k;
     else if (type_name == "int64"sv)
-        return ukv_doc_field_i64_k;
+        return ustore_doc_field_i64_k;
     else if (type_name == "uint8"sv)
-        return ukv_doc_field_u8_k;
+        return ustore_doc_field_u8_k;
     else if (type_name == "uint16"sv)
-        return ukv_doc_field_u16_k;
+        return ustore_doc_field_u16_k;
     else if (type_name == "uint32"sv)
-        return ukv_doc_field_u32_k;
+        return ustore_doc_field_u32_k;
     else if (type_name == "uint64"sv)
-        return ukv_doc_field_u64_k;
+        return ustore_doc_field_u64_k;
     else if (type_name == "float16"sv)
-        return ukv_doc_field_f16_k;
+        return ustore_doc_field_f16_k;
     else if (type_name == "float32"sv)
-        return ukv_doc_field_f32_k;
+        return ustore_doc_field_f32_k;
     else if (type_name == "float64"sv)
-        return ukv_doc_field_f64_k;
+        return ustore_doc_field_f64_k;
     else if (type_name == "bytes"sv)
-        return ukv_doc_field_bin_k;
+        return ustore_doc_field_bin_k;
     else if (type_name == "str"sv)
-        return ukv_doc_field_str_k;
+        return ustore_doc_field_str_k;
 
     throw std::invalid_argument("Unknown type name");
-    return ukv_doc_field_json_k;
+    return ustore_doc_field_json_k;
 }
 
 void scan_rows(py_table_collection_t& df) {
     auto keys_range = df.binary.keys();
     auto keys_stream = keys_range.begin();
-    std::vector<ukv_key_t> keys_found;
+    std::vector<ustore_key_t> keys_found;
     while (!keys_stream.is_end()) {
         keys_found.insert(keys_found.end(), keys_stream.keys_batch().begin(), keys_stream.keys_batch().end());
         keys_stream.seek_to_next_batch();
@@ -73,7 +73,7 @@ void scan_rows_range(py_table_collection_t& df) {
     auto& range = std::get<py_table_keys_range_t>(df.rows_keys);
     auto keys_range = df.binary.keys(range.min);
     auto keys_stream = keys_range.begin();
-    std::vector<ukv_key_t> keys_found;
+    std::vector<ustore_key_t> keys_found;
     while (!keys_stream.is_end()) {
         auto max_key_pos =
             std::upper_bound(keys_stream.keys_batch().begin(), keys_stream.keys_batch().end(), range.max);
@@ -90,7 +90,7 @@ void correct_table(docs_table_t& table) {
     std::vector<std::size_t> binary_column_indexes;
     for (std::size_t collection_idx = 0; collection_idx != table.collections(); ++collection_idx) {
         column_view_t column = table.column(collection_idx);
-        if (column.type() == ukv_doc_field_str_k || column.type() == ukv_doc_field_bin_k)
+        if (column.type() == ustore_doc_field_str_k || column.type() == ustore_doc_field_bin_k)
             binary_column_indexes.push_back(collection_idx);
     }
 
@@ -99,14 +99,14 @@ void correct_table(docs_table_t& table) {
 
     // Collecting old offsets and lengths
     std::size_t offset_index = 0;
-    ukv_length_t contents_length = 0;
+    ustore_length_t contents_length = 0;
     std::size_t offsets_per_column = table.rows() + 1;
-    std::vector<ukv_length_t> offs(binary_column_indexes.size() * offsets_per_column);
-    std::vector<ukv_length_t> lens(binary_column_indexes.size() * offsets_per_column);
+    std::vector<ustore_length_t> offs(binary_column_indexes.size() * offsets_per_column);
+    std::vector<ustore_length_t> lens(binary_column_indexes.size() * offsets_per_column);
 
     for (std::size_t column_idx : binary_column_indexes) {
         column_view_t column = table.column(column_idx);
-        for (ukv_length_t idx = 0; idx != column.size(); ++idx) {
+        for (ustore_length_t idx = 0; idx != column.size(); ++idx) {
             offs[offset_index] = column.offsets()[idx];
             lens[offset_index] = column.lengths()[idx];
             contents_length += column.lengths()[idx];
@@ -116,7 +116,7 @@ void correct_table(docs_table_t& table) {
     }
 
     // Correctly write contents and offsets in temporary buffers
-    ukv_length_t offset = 0;
+    ustore_length_t offset = 0;
     auto contents_begin = table.column(0).contents();
     char buffer[contents_length];
     for (std::size_t idx = 0; idx != lens.size(); ++idx) {
@@ -130,7 +130,7 @@ void correct_table(docs_table_t& table) {
     std::memcpy(contents_begin, buffer, contents_length);
     for (std::size_t column_idx : binary_column_indexes) {
         column_view_t column = table.column(column_idx);
-        std::memcpy(column.offsets(), offs.data() + offset_index, offsets_per_column * sizeof(ukv_length_t));
+        std::memcpy(column.offsets(), offs.data() + offset_index, offsets_per_column * sizeof(ustore_length_t));
         offset_index += offsets_per_column;
     }
 }
@@ -144,7 +144,7 @@ static std::shared_ptr<arrow::RecordBatch> materialize(py_table_collection_t& df
         scan_rows_range(df);
 
     // Slice the keys using `head` and `tail`
-    auto& keys_found = std::get<std::vector<ukv_key_t>>(df.rows_keys);
+    auto& keys_found = std::get<std::vector<ustore_key_t>>(df.rows_keys);
     auto keys_begin = keys_found.data();
     auto keys_end = keys_found.data() + keys_found.size();
     auto keys_count = keys_found.size();
@@ -175,7 +175,7 @@ static std::shared_ptr<arrow::RecordBatch> materialize(py_table_collection_t& df
     // Extract the present fields
     if (std::holds_alternative<std::monostate>(df.columns_names)) {
         auto fields = members.gist().throw_or_release();
-        auto names = std::vector<ukv_str_view_t>(fields.size());
+        auto names = std::vector<ustore_str_view_t>(fields.size());
         transform_n(fields, names.size(), names.begin(), std::mem_fn(&std::string_view::data));
         df.columns_names = names;
     }
@@ -185,16 +185,16 @@ static std::shared_ptr<arrow::RecordBatch> materialize(py_table_collection_t& df
         throw std::invalid_argument("Column types must be specified");
 
     // Now the primary part, performing the exports
-    auto fields = strided_range(std::get<std::vector<ukv_str_view_t>>(df.columns_names)).immutable();
+    auto fields = strided_range(std::get<std::vector<ustore_str_view_t>>(df.columns_names)).immutable();
     table_header_view_t header;
     header.count = fields.size();
     header.fields_begin = fields.begin();
     header.types_begin =
-        std::holds_alternative<ukv_doc_field_type_t>(df.columns_types)
-            ? strided_iterator_gt<ukv_doc_field_type_t const>(&std::get<ukv_doc_field_type_t>(df.columns_types), 0)
-            : strided_iterator_gt<ukv_doc_field_type_t const>(
-                  std::get<std::vector<ukv_doc_field_type_t>>(df.columns_types).data(),
-                  sizeof(ukv_doc_field_type_t));
+        std::holds_alternative<ustore_doc_field_type_t>(df.columns_types)
+            ? strided_iterator_gt<ustore_doc_field_type_t const>(&std::get<ustore_doc_field_type_t>(df.columns_types), 0)
+            : strided_iterator_gt<ustore_doc_field_type_t const>(
+                  std::get<std::vector<ustore_doc_field_type_t>>(df.columns_types).data(),
+                  sizeof(ustore_doc_field_type_t));
     docs_table_t table = members.gather(header).throw_or_release();
     table_header_view_t table_header = table.header();
 
@@ -202,7 +202,7 @@ static std::shared_ptr<arrow::RecordBatch> materialize(py_table_collection_t& df
     status_t status;
     ArrowSchema c_arrow_schema;
     ArrowArray c_arrow_array;
-    ukv_to_arrow_schema( //
+    ustore_to_arrow_schema( //
         table.rows(),
         table.collections(),
         &c_arrow_schema,
@@ -214,7 +214,7 @@ static std::shared_ptr<arrow::RecordBatch> materialize(py_table_collection_t& df
     // Exports columns one-by-one
     for (std::size_t collection_idx = 0; collection_idx != table.collections(); ++collection_idx) {
         column_view_t column = table.column(collection_idx);
-        ukv_to_arrow_column( //
+        ustore_to_arrow_column( //
             table.rows(),
             table_header.fields_begin[collection_idx],
             table_header.types_begin[collection_idx],
@@ -264,7 +264,7 @@ void update(py_table_collection_t& df, py::object obj) {
     else if (std::holds_alternative<py_table_keys_range_t>(df.rows_keys))
         scan_rows_range(df);
 
-    auto& keys = std::get<std::vector<ukv_key_t>>(df.rows_keys);
+    auto& keys = std::get<std::vector<ustore_key_t>>(df.rows_keys);
     auto collection = docs_collection_t(df.binary.db(), df.binary, df.binary.txn());
 
     arrow::Result<std::shared_ptr<arrow::RecordBatch>> maybe_record_batch = arrow::py::unwrap_batch(obj.ptr());
@@ -279,7 +279,7 @@ void update(py_table_collection_t& df, py::object obj) {
 
     std::string jsons_to_merge;
     jsons_to_merge.reserve(record_batch->num_rows() * (column_names_length + (record_batch->num_columns() * 3) + 2));
-    std::vector<ukv_length_t> offsets(keys.size() + 1);
+    std::vector<ustore_length_t> offsets(keys.size() + 1);
 
     for (size_t row_idx = 0; row_idx != record_batch->num_rows(); ++row_idx) {
 
@@ -312,15 +312,15 @@ void update(py_table_collection_t& df, py::object obj) {
     }
 
     offsets.back() = jsons_to_merge.size();
-    auto vals_begin = reinterpret_cast<ukv_bytes_ptr_t>(jsons_to_merge.data());
+    auto vals_begin = reinterpret_cast<ustore_bytes_ptr_t>(jsons_to_merge.data());
     contents_arg_t values {};
-    values.offsets_begin = {offsets.data(), sizeof(ukv_length_t)};
+    values.offsets_begin = {offsets.data(), sizeof(ustore_length_t)};
     values.contents_begin = {&vals_begin, 0};
 
     collection[keys].merge(values);
 }
 
-void ukv::wrap_pandas(py::module& m) {
+void ustore::wrap_pandas(py::module& m) {
 
     auto df =
         py::class_<py_table_collection_t, std::shared_ptr<py_table_collection_t>>(m, "DataFrame", py::module_local());
@@ -340,11 +340,11 @@ void ukv::wrap_pandas(py::module& m) {
         // `dtype` can be one string, one enum, a `dict` or a `list[tuple[str, str]]`,
         // where every pair of strings contains a column name and Python type descriptor.
         if (PyDict_Check(dtype_py.ptr())) {
-            std::vector<ukv_str_view_t> columns_names;
-            std::vector<ukv_doc_field_type_t> columns_types;
+            std::vector<ustore_str_view_t> columns_names;
+            std::vector<ustore_doc_field_type_t> columns_types;
             py_scan_dict(dtype_py.ptr(), [&](PyObject* key, PyObject* val) {
                 columns_names.push_back(py_to_str(key));
-                columns_types.push_back(ukv_doc_field_from_str(py_to_str(val)));
+                columns_types.push_back(ustore_doc_field_from_str(py_to_str(val)));
             });
 
             df.columns_names = columns_names;
@@ -353,7 +353,7 @@ void ukv::wrap_pandas(py::module& m) {
         // One type definition for all the columns
         // https://stackoverflow.com/a/45063514/2766161
         else if (PyUnicode_Check(dtype_py.ptr())) {
-            df.columns_types = ukv_doc_field_from_str(py_to_str(dtype_py.ptr()));
+            df.columns_types = ustore_doc_field_from_str(py_to_str(dtype_py.ptr()));
         }
         return df.shared_from_this();
     });
@@ -364,7 +364,7 @@ void ukv::wrap_pandas(py::module& m) {
         if (columns_count == std::nullopt || !*columns_count)
             throw std::invalid_argument("Columns must be a non-empty tuple or list");
 
-        auto columns_names = std::vector<ukv_str_view_t>(*columns_count);
+        auto columns_names = std::vector<ustore_str_view_t>(*columns_count);
         py_transform_n(columns_py.ptr(), &py_to_str, columns_names.begin(), *columns_count);
         df.columns_names = columns_names;
         return df.shared_from_this();
@@ -378,15 +378,15 @@ void ukv::wrap_pandas(py::module& m) {
             Py_ssize_t start = 0, stop = 0, step = 0;
             if (PySlice_Unpack(rows_py.ptr(), &start, &stop, &step) || step != 1 || start >= stop)
                 throw std::invalid_argument("Invalid Slice");
-            df.rows_keys = py_table_keys_range_t {static_cast<ukv_key_t>(start), static_cast<ukv_key_t>(stop)};
+            df.rows_keys = py_table_keys_range_t {static_cast<ustore_key_t>(start), static_cast<ustore_key_t>(stop)};
         }
         else {
             auto rows_count = py_sequence_length(rows_py.ptr());
             if (rows_count == std::nullopt || !*rows_count)
                 throw std::invalid_argument("Rows keys must be a non-empty tuple or list");
 
-            auto rows_keys = std::vector<ukv_key_t>(*rows_count);
-            py_transform_n(rows_py.ptr(), &py_to_scalar<ukv_key_t>, rows_keys.begin(), *rows_count);
+            auto rows_keys = std::vector<ustore_key_t>(*rows_count);
+            py_transform_n(rows_py.ptr(), &py_to_scalar<ustore_key_t>, rows_keys.begin(), *rows_count);
             df.rows_keys = rows_keys;
         }
         return df.shared_from_this();
@@ -422,7 +422,7 @@ void ukv::wrap_pandas(py::module& m) {
         "to_json",
         [](py_table_collection_t& df, std::string const& path) -> py::object {
             auto batch = materialize(df);
-            auto& keys_found = std::get<std::vector<ukv_key_t>>(df.rows_keys);
+            auto& keys_found = std::get<std::vector<ustore_key_t>>(df.rows_keys);
 
             std::string result = "{";
             for (std::size_t i = 0; i != batch->num_columns(); ++i) {
@@ -503,7 +503,7 @@ void ukv::wrap_pandas(py::module& m) {
             docs_collection_t(df.binary.db(), df.binary, df.binary.txn(), df.binary.snap(), df.binary.member_arena());
 
         auto keys = collection.keys().sample(count, df.binary.member_arena()).throw_or_release();
-        df.rows_keys = std::vector<ukv_key_t>(keys.begin(), keys.end());
+        df.rows_keys = std::vector<ustore_key_t>(keys.begin(), keys.end());
         return df.shared_from_this();
     });
 
@@ -526,14 +526,14 @@ void ukv::wrap_pandas(py::module& m) {
             docs_collection_t(df.binary.db(), df.binary, df.binary.txn(), df.binary.snap(), df.binary.member_arena());
 
         scan_rows(df_to_merge);
-        auto& keys = std::get<std::vector<ukv_key_t>>(df_to_merge.rows_keys);
+        auto& keys = std::get<std::vector<ustore_key_t>>(df_to_merge.rows_keys);
         auto members = collection_to_merge[keys];
         auto values = members.value().throw_or_release();
-        auto values_begin = reinterpret_cast<ukv_bytes_ptr_t>(values.contents());
+        auto values_begin = reinterpret_cast<ustore_bytes_ptr_t>(values.contents());
 
         contents_arg_t args {};
-        args.offsets_begin = {values.offsets(), sizeof(ukv_length_t)};
-        args.lengths_begin = {values.lengths(), sizeof(ukv_length_t)};
+        args.offsets_begin = {values.offsets(), sizeof(ustore_length_t)};
+        args.lengths_begin = {values.lengths(), sizeof(ustore_length_t)};
         args.contents_begin = {&values_begin, 0};
         collection[keys].merge(args).throw_unhandled();
     });
@@ -546,14 +546,14 @@ void ukv::wrap_pandas(py::module& m) {
             scan_rows(df);
         else if (std::holds_alternative<py_table_keys_range_t>(df.rows_keys))
             scan_rows_range(df);
-        auto& keys = std::get<std::vector<ukv_key_t>>(df.rows_keys);
+        auto& keys = std::get<std::vector<ustore_key_t>>(df.rows_keys);
 
         if (!PySequence_Check(obj.ptr()))
             throw std::invalid_argument("Values must be sequence!");
         auto size = PySequence_Size(obj.ptr());
 
         std::string values;
-        std::vector<ukv_length_t> offsets(size + 1);
+        std::vector<ustore_length_t> offsets(size + 1);
         std::string field = "/" + column_name;
         std::vector<collection_key_field_t> keys_with_fields(keys.size());
         for (std::size_t i = 0; i != size; ++i) {
@@ -562,10 +562,10 @@ void ukv::wrap_pandas(py::module& m) {
             keys_with_fields[i] = ckf(keys[i], field.c_str());
         }
         offsets[size] = values.size();
-        auto values_begin = reinterpret_cast<ukv_bytes_ptr_t>(values.data());
+        auto values_begin = reinterpret_cast<ustore_bytes_ptr_t>(values.data());
 
         contents_arg_t args {};
-        args.offsets_begin = {offsets.data(), sizeof(ukv_length_t)};
+        args.offsets_begin = {offsets.data(), sizeof(ustore_length_t)};
         args.contents_begin = {&values_begin, 0};
 
         collection[keys_with_fields].insert(args).throw_unhandled();
@@ -579,7 +579,7 @@ void ukv::wrap_pandas(py::module& m) {
             scan_rows(df);
         else if (std::holds_alternative<py_table_keys_range_t>(df.rows_keys))
             scan_rows_range(df);
-        auto& keys = std::get<std::vector<ukv_key_t>>(df.rows_keys);
+        auto& keys = std::get<std::vector<ustore_key_t>>(df.rows_keys);
         std::vector<collection_key_field_t> keys_with_fields(keys.size());
 
         if (!PyDict_Check(obj.ptr()))
@@ -600,7 +600,7 @@ void ukv::wrap_pandas(py::module& m) {
             field += PyUnicode_AsUTF8(key);
 
             auto size = PySequence_Size(value);
-            std::vector<ukv_length_t> offsets(size + 1);
+            std::vector<ustore_length_t> offsets(size + 1);
             values.clear();
             for (std::size_t i = 0; i != size; ++i) {
                 offsets[i] = values.size();
@@ -609,8 +609,8 @@ void ukv::wrap_pandas(py::module& m) {
             }
             offsets[size] = values.size();
 
-            args.offsets_begin = {offsets.data(), sizeof(ukv_length_t)};
-            auto values_begin = reinterpret_cast<ukv_bytes_ptr_t>(values.data());
+            args.offsets_begin = {offsets.data(), sizeof(ustore_length_t)};
+            auto values_begin = reinterpret_cast<ustore_bytes_ptr_t>(values.data());
             args.contents_begin = {&values_begin, 0};
             collection[keys_with_fields].insert(args).throw_unhandled();
         }
@@ -628,7 +628,7 @@ void ukv::wrap_pandas(py::module& m) {
         else if (std::holds_alternative<py_table_keys_range_t>(df.rows_keys))
             scan_rows_range(df);
 
-        auto& keys = std::get<std::vector<ukv_key_t>>(df.rows_keys);
+        auto& keys = std::get<std::vector<ustore_key_t>>(df.rows_keys);
         if (PyUnicode_Check(cols.ptr())) {
             collection[keys]
                 .patch(fmt::format("[{{\"op\": \"remove\",\"path\": \"/{}\"}}]", py_to_bytes(cols.ptr())).c_str())
@@ -654,7 +654,7 @@ void ukv::wrap_pandas(py::module& m) {
             throw std::invalid_argument("Expect dictionary");
 
         scan_rows(df);
-        auto& keys = std::get<std::vector<ukv_key_t>>(df.rows_keys);
+        auto& keys = std::get<std::vector<ustore_key_t>>(df.rows_keys);
         auto collection =
             docs_collection_t(df.binary.db(), df.binary, df.binary.txn(), df.binary.snap(), df.binary.member_arena());
 
@@ -674,7 +674,7 @@ void ukv::wrap_pandas(py::module& m) {
             scan_rows(df);
         else if (std::holds_alternative<py_table_keys_range_t>(df.rows_keys))
             scan_rows_range(df);
-        auto& keys = std::get<std::vector<ukv_key_t>>(df.rows_keys);
+        auto& keys = std::get<std::vector<ustore_key_t>>(df.rows_keys);
 
         if (std::holds_alternative<std::monostate>(df.columns_names)) {
             auto collection = docs_collection_t(df.binary.db(),
@@ -683,11 +683,11 @@ void ukv::wrap_pandas(py::module& m) {
                                                 df.binary.snap(),
                                                 df.binary.member_arena());
             auto fields = collection[keys].gist().throw_or_release();
-            auto names = std::vector<ukv_str_view_t>(fields.size());
+            auto names = std::vector<ustore_str_view_t>(fields.size());
             transform_n(fields, names.size(), names.begin(), std::mem_fn(&std::string_view::data));
             df.columns_names = names;
         }
-        auto& fields = std::get<std::vector<ukv_str_view_t>>(df.columns_names);
+        auto& fields = std::get<std::vector<ustore_str_view_t>>(df.columns_names);
 
         return keys.size() * fields.size();
     });
@@ -697,7 +697,7 @@ void ukv::wrap_pandas(py::module& m) {
             scan_rows(df);
         else if (std::holds_alternative<py_table_keys_range_t>(df.rows_keys))
             scan_rows_range(df);
-        auto& keys = std::get<std::vector<ukv_key_t>>(df.rows_keys);
+        auto& keys = std::get<std::vector<ustore_key_t>>(df.rows_keys);
 
         if (std::holds_alternative<std::monostate>(df.columns_names)) {
             auto collection = docs_collection_t(df.binary.db(),
@@ -706,11 +706,11 @@ void ukv::wrap_pandas(py::module& m) {
                                                 df.binary.snap(),
                                                 df.binary.member_arena());
             auto fields = collection[keys].gist().throw_or_release();
-            auto names = std::vector<ukv_str_view_t>(fields.size());
+            auto names = std::vector<ustore_str_view_t>(fields.size());
             transform_n(fields, names.size(), names.begin(), std::mem_fn(&std::string_view::data));
             df.columns_names = names;
         }
-        auto& fields = std::get<std::vector<ukv_str_view_t>>(df.columns_names);
+        auto& fields = std::get<std::vector<ustore_str_view_t>>(df.columns_names);
 
         return py::make_tuple(keys.size(), fields.size());
     });
@@ -757,8 +757,8 @@ void ukv::wrap_pandas(py::module& m) {
 
         auto size = PySequence_Size(data.ptr());
         std::string jsons;
-        std::vector<ukv_key_t> keys(size);
-        std::vector<ukv_length_t> offsets(size + 1);
+        std::vector<ustore_key_t> keys(size);
+        std::vector<ustore_length_t> offsets(size + 1);
         for (std::size_t i = 0; i != size; ++i) {
             keys[i] = i;
             offsets[i] = jsons.size();
@@ -767,9 +767,9 @@ void ukv::wrap_pandas(py::module& m) {
         offsets[size] = jsons.size();
 
         contents_arg_t args {};
-        auto values_begin = reinterpret_cast<ukv_bytes_ptr_t>(jsons.data());
+        auto values_begin = reinterpret_cast<ustore_bytes_ptr_t>(jsons.data());
         args.contents_begin = {&values_begin, 0};
-        args.offsets_begin = {offsets.data(), sizeof(ukv_length_t)};
+        args.offsets_begin = {offsets.data(), sizeof(ustore_length_t)};
         collection[keys].insert(args).throw_unhandled();
 
         auto df = std::make_shared<py_table_collection_t>();

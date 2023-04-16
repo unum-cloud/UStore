@@ -12,9 +12,9 @@
 #include <nlohmann/json.hpp> // `nlohmann::json`
 #include <fmt/format.h>      // `fmt::format`
 
-#include "ukv/cpp/status.hpp" // `status_t`
+#include "ustore/cpp/status.hpp" // `status_t`
 
-namespace unum::ukv {
+namespace unum::ustore {
 
 using json_t = nlohmann::json;
 
@@ -275,4 +275,4 @@ inline bool config_loader_t::parse_bytes(std::string const& str, size_t& bytes) 
     return true;
 }
 
-} // namespace unum::ukv
+} // namespace unum::ustore

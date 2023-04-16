@@ -5,7 +5,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.csv as csv
 import pyarrow.dataset as ds
-import ukv.umem as ukv
+import ustore.ucset as ustore
 
 pa.get_include()
 
@@ -23,7 +23,7 @@ def create_table(db):
 
 
 def test_to_arrow():
-    db = ukv.DataBase()
+    db = ustore.DataBase()
     table = create_table(db)
     # Tweets
     df_tweets = pd.DataFrame({'tweets': [2221, 3935, 45900]}, dtype=np.int32)
@@ -79,7 +79,7 @@ def test_to_arrow():
 
 
 def test_update():
-    db = ukv.DataBase()
+    db = ustore.DataBase()
     col = db.main
     docs = col.docs
     table = col.table
@@ -103,7 +103,7 @@ def test_update():
 
 
 def test_csv():
-    db = ukv.DataBase()
+    db = ustore.DataBase()
     table = create_table(db)
     table.astype({'name': 'str', 'tweets': 'int64'}
                  ).to_csv('tmp/pandas.csv')
@@ -118,7 +118,7 @@ def test_csv():
 
 
 def test_parquet():
-    db = ukv.DataBase()
+    db = ustore.DataBase()
     table = create_table(db)
     table.astype({'name': 'str', 'tweets': 'int32'}
                  ).to_parquet('tmp/pandas.parquet')
@@ -134,7 +134,7 @@ def test_parquet():
 
 
 def test_json():
-    db = ukv.DataBase()
+    db = ustore.DataBase()
     table = create_table(db)
     table.astype({'name': 'str', 'tweets': 'int32'})
 
@@ -153,7 +153,7 @@ def test_json():
 
 
 def test_merge():
-    db = ukv.DataBase()
+    db = ustore.DataBase()
     col1 = db['table1']
     docs1 = col1.docs
     table1 = col1.table
@@ -184,7 +184,7 @@ def test_merge():
 
 
 def test_sample():
-    col = ukv.DataBase().main
+    col = ustore.DataBase().main
     docs = col.docs
     table = col.table
 
@@ -207,7 +207,7 @@ def test_sample():
 
 
 def test_drop():
-    col = ukv.DataBase().main
+    col = ustore.DataBase().main
     docs = col.docs
     table = col.table
 
@@ -242,7 +242,7 @@ def test_drop():
 
 
 def test_size():
-    col = ukv.DataBase().main
+    col = ustore.DataBase().main
     docs = col.docs
     table = col.table
 
@@ -256,7 +256,7 @@ def test_size():
 
 
 def test_shape():
-    col = ukv.DataBase().main
+    col = ustore.DataBase().main
     docs = col.docs
     table = col.table
 
@@ -269,7 +269,7 @@ def test_shape():
 
 
 def test_empty():
-    col = ukv.DataBase().main
+    col = ustore.DataBase().main
     docs = col.docs
     table = col.table
 
@@ -285,7 +285,7 @@ def test_empty():
 
 def test_insert():
 
-    col = ukv.DataBase().main
+    col = ustore.DataBase().main
     docs = col.docs
     table = col.table
 
@@ -313,27 +313,27 @@ def test_insert():
 
 
 def test_from_dict():
-    main = ukv.DataBase().main
+    main = ustore.DataBase().main
     data = {'col1': [3, 2, 1, 0], 'col2': [b'a', b'b', b'c', b'd']}
-    table = ukv.from_dict(main, data)
+    table = ustore.from_dict(main, data)
     table.astype({'col1': 'int64', 'col2': 'bytes'})
     assert pa.RecordBatch.from_pydict(data) == table.to_arrow()
 
 
 def test_from_records():
-    main = ukv.DataBase().main
+    main = ustore.DataBase().main
     data = [{'col1': 3, 'col2': b'a'},
             {'col1': 2, 'col2': b'b'},
             {'col1': 1, 'col2': b'c'},
             {'col1': 0, 'col2': b'd'}]
 
-    table = ukv.from_records(main, data)
+    table = ustore.from_records(main, data)
     table.astype({'col1': 'int64', 'col2': 'bytes'})
     assert pa.RecordBatch.from_pylist(data) == table.to_arrow()
 
 
 def test_rename():
-    main = ukv.DataBase().main
+    main = ustore.DataBase().main
     data = [{'col1': 3, 'col2': b'a'},
             {'col1': 2, 'col2': b'b'},
             {'col1': 1, 'col2': b'c'},
@@ -344,7 +344,7 @@ def test_rename():
                     {'col1': 1, 'col2': b'c'},
                     {'col1': 0, 'col2': b'd'}]
 
-    table = ukv.from_records(main, data)
+    table = ustore.from_records(main, data)
 
     table.rename({'col1': 'column_1', 'col2': 'column_2'})
     table.astype({'column_1': 'int64', 'column_2': 'bytes'})

@@ -1,11 +1,11 @@
-import ukv.umem as ukv
+import ustore.ucset as ustore
 import numpy as np
 import pytest
 import networkx as nx
 
 
 def test_line():
-    net = ukv.DataBase().main.graph
+    net = ustore.DataBase().main.graph
 
     # 1 -> 2
     assert not net.has_node(1)
@@ -29,7 +29,7 @@ def test_line():
 
 
 def test_triangle():
-    net = ukv.DataBase().main.graph
+    net = ustore.DataBase().main.graph
 
     # 1 -> 2 -> 3 -> 1
     net.add_edge(1, 2)
@@ -62,7 +62,7 @@ def test_triangle():
 
 
 def test_triangle_batch():
-    net = ukv.DataBase().main.graph
+    net = ustore.DataBase().main.graph
 
     # TODO: Check why matrix casting fails!
     # edges = np.array([[1, 2], [2, 3], [3, 1]])
@@ -88,7 +88,7 @@ def test_triangle_batch():
 
 
 def test_random_fill():
-    net = ukv.DataBase().main.graph
+    net = ustore.DataBase().main.graph
 
     sources = np.random.randint(1000, size=100)
     targets = np.random.randint(1000, size=100)
@@ -103,7 +103,7 @@ def test_random_fill():
 
 
 def test_neighbors():
-    db = ukv.DataBase()
+    db = ustore.DataBase()
     net = db.main.graph
 
     sources = np.arange(100)
@@ -128,8 +128,8 @@ def test_neighbors():
 
 
 def test_degree():
-    db = ukv.DataBase()
-    net = ukv.Network(db, 'graph', 'nodes', 'edges')
+    db = ustore.DataBase()
+    net = ustore.Network(db, 'graph', 'nodes', 'edges')
 
     sources = np.arange(100)
     targets = np.arange(1, 101)
@@ -176,7 +176,7 @@ def test_degree():
 
 
 def test_upsert_remove_nodes_batch():
-    net = ukv.DataBase().main.graph
+    net = ustore.DataBase().main.graph
 
     nodes = np.arange(100)
 
@@ -192,7 +192,7 @@ def test_upsert_remove_nodes_batch():
 
 
 def test_remove_edges():
-    net = ukv.DataBase().main.graph
+    net = ustore.DataBase().main.graph
 
     sources = np.arange(100)
     targets = np.arange(100, 200)
@@ -216,7 +216,7 @@ def test_remove_edges():
 
 
 def test_remove_nodes_and_related_edges():
-    net = ukv.DataBase().main.graph
+    net = ustore.DataBase().main.graph
 
     sources = np.arange(100)
     targets = np.arange(100, 200)
@@ -235,7 +235,7 @@ def test_remove_nodes_and_related_edges():
 
 
 def test_clear():
-    net = ukv.DataBase().main.graph
+    net = ustore.DataBase().main.graph
 
     sources = np.arange(100)
     targets = np.arange(100, 200)
@@ -262,8 +262,8 @@ def test_clear():
 
 
 def test_size():
-    db = ukv.DataBase()
-    net = ukv.Network(db, 'graph', 'nodes', 'edges')
+    db = ustore.DataBase()
+    net = ustore.Network(db, 'graph', 'nodes', 'edges')
     size = 1000
     weighted_size = 0
     for node in range(size):
@@ -279,8 +279,8 @@ def test_size():
 
 
 def test_nodes_attributes():
-    db = ukv.DataBase()
-    net = ukv.Network(db, 'graph', 'nodes')
+    db = ustore.DataBase()
+    net = ustore.Network(db, 'graph', 'nodes')
 
     expected_node_data = {}
     retrieved_node_data = {}
@@ -317,8 +317,8 @@ def test_nodes_attributes():
 
 
 def test_edges_attributes():
-    db = ukv.DataBase()
-    net = ukv.Network(db, 'graph', 'nodes', 'edges')
+    db = ustore.DataBase()
+    net = ustore.Network(db, 'graph', 'nodes', 'edges')
 
     for i in range(100):
         net.add_edge(i, i+1, i, weight=i) if i % 2 else net.add_edge(i, i+1, i)
@@ -377,8 +377,8 @@ def test_edges_attributes():
 
 
 def test_get_node_attributes():
-    db = ukv.DataBase()
-    net = ukv.Network(db, 'graph', 'nodes')
+    db = ustore.DataBase()
+    net = ustore.Network(db, 'graph', 'nodes')
 
     for node in range(1000):
         net.add_node(node, weight=node)
@@ -389,8 +389,8 @@ def test_get_node_attributes():
 
 
 def test_get_edge_attributes():
-    db = ukv.DataBase()
-    net = ukv.Network(db, 'graph', 'nodes', 'edges')
+    db = ustore.DataBase()
+    net = ustore.Network(db, 'graph', 'nodes', 'edges')
 
     for node in range(1000):
         net.add_edge(node, node+1, node, weight=node)
@@ -404,8 +404,8 @@ def test_get_edge_attributes():
 
 
 def test_set_node_attributes():
-    db = ukv.DataBase()
-    net = ukv.Network(db, 'graph', 'nodes')
+    db = ustore.DataBase()
+    net = ustore.Network(db, 'graph', 'nodes')
 
     net.add_node(0)
     net.add_node(1)
@@ -446,8 +446,8 @@ def test_set_node_attributes():
 
 
 def test_set_edge_attributes():
-    db = ukv.DataBase()
-    net = ukv.Network(db, relations='edges')
+    db = ustore.DataBase()
+    net = ustore.Network(db, relations='edges')
 
     net.add_edge(0, 1, 0)
     net.add_edge(1, 2, 1)
@@ -487,13 +487,13 @@ def test_set_edge_attributes():
 
 
 def test_transaction_watch():
-    db = ukv.DataBase()
+    db = ustore.DataBase()
     net = db.main.graph
 
     net.add_edge(1, 2)
     net.add_edge(2, 3)
 
-    txn = ukv.Transaction(db)
+    txn = ustore.Transaction(db)
     txn_net = txn.main.graph
 
     assert txn_net.has_edge(1, 2)
@@ -505,10 +505,10 @@ def test_transaction_watch():
 
 
 def test_conflicting_transactions():
-    db = ukv.DataBase()
+    db = ustore.DataBase()
 
-    txn1 = ukv.Transaction(db)
-    txn2 = ukv.Transaction(db)
+    txn1 = ustore.Transaction(db)
+    txn2 = ustore.Transaction(db)
 
     txn_net1 = txn1.main.graph
     txn_net2 = txn2.main.graph

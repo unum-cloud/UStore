@@ -3,22 +3,22 @@
  * @brief Implements function-specific casting mechanisms relying on @see "cast.hpp".
  */
 #pragma once
-#include "ukv/cpp/ranges_args.hpp" // `places_arg_t`
+#include "ustore/cpp/ranges_args.hpp" // `places_arg_t`
 #include "cast.hpp"
 
 #include <arrow/api.h>
 #include <arrow/array.h>
 #include <arrow/table.h>
 
-namespace unum::ukv::pyb {
+namespace unum::ustore::pyb {
 
 /**
  * May view:
- * - NumPy (strided) column of @c ukv_key_t scalars.
- * - Apache Arrow array of @c ukv_key_t scalars.
- * - Apache Arrow table with "keys" column of @c ukv_key_t scalars
+ * - NumPy (strided) column of @c ustore_key_t scalars.
+ * - Apache Arrow array of @c ustore_key_t scalars.
+ * - Apache Arrow table with "keys" column of @c ustore_key_t scalars
  *   and, optionally, "collections" column of IDs.
- * - Buffer-protocol 1D implementation with @c ukv_key_t scalars.
+ * - Buffer-protocol 1D implementation with @c ustore_key_t scalars.
  *
  * May be copied from:
  * - list of any integer-convertible PyObjects.
@@ -33,7 +33,7 @@ struct parsed_places_t {
     using viewed_t = places_arg_t;
     using owned_t = std::vector<collection_key_field_t>;
     std::variant<std::monostate, viewed_t, owned_t> viewed_or_owned;
-    ukv_collection_t single_col = ukv_collection_main_k;
+    ustore_collection_t single_col = ustore_collection_main_k;
 
     operator places_arg_t() const noexcept {
         if (std::holds_alternative<std::monostate>(viewed_or_owned))
@@ -52,8 +52,8 @@ struct parsed_places_t {
             return std::get<viewed_t>(viewed_or_owned);
     }
 
-    parsed_places_t(PyObject* keys, std::optional<ukv_collection_t> col) {
-        single_col = col.value_or(ukv_collection_main_k);
+    parsed_places_t(PyObject* keys, std::optional<ustore_collection_t> col) {
+        single_col = col.value_or(ustore_collection_main_k);
 
         if (arrow::py::is_array(keys)) {
             auto result = arrow::py::unwrap_array(keys);
@@ -99,7 +99,7 @@ struct parsed_places_t {
                 keys_vec.reserve(*cont_len);
 
             auto py_to_key = [&](PyObject* obj) {
-                return collection_key_field_t {col.value_or(ukv_collection_main_k), py_to_scalar<ukv_key_t>(obj)};
+                return collection_key_field_t {col.value_or(ustore_collection_main_k), py_to_scalar<ustore_key_t>(obj)};
             };
 
             py_transform_n(keys, py_to_key, std::back_inserter(keys_vec));
@@ -109,7 +109,7 @@ struct parsed_places_t {
 
   private:
     void view_numpy(py_buffer_t const& keys_buffer) {
-        auto rng = py_strided_range<ukv_key_t const>(keys_buffer);
+        auto rng = py_strided_range<ustore_key_t const>(keys_buffer);
 
         places_arg_t places;
         places.collections_begin = {&single_col};
@@ -128,7 +128,7 @@ struct parsed_places_t {
         byte_t* buf_ptr = reinterpret_cast<byte_t*>(buf->buf);
         for (std::size_t i = 0; i < size; i++)
             casted_keys.emplace_back(single_col,
-                                     py_cast_scalar<ukv_key_t>(buf_ptr + (i * buf->itemsize), buf->format[0]));
+                                     py_cast_scalar<ustore_key_t>(buf_ptr + (i * buf->itemsize), buf->format[0]));
 
         viewed_or_owned = std::move(casted_keys);
     }
@@ -139,28 +139,28 @@ struct parsed_places_t {
 
         if (col_array) {
             if (col_array->type_id() != arrow::Type::INT64 || col_array->type_id() != arrow::Type::UINT64)
-                throw std::runtime_error("Can't cast given type to `ukv_collection_t`");
+                throw std::runtime_error("Can't cast given type to `ustore_collection_t`");
             auto collections = std::static_pointer_cast<arrow::UInt64Array>(key_array);
-            places.collections_begin = {collections->raw_values(), sizeof(ukv_collection_t)};
+            places.collections_begin = {collections->raw_values(), sizeof(ustore_collection_t)};
         }
         else
             places.collections_begin = {&single_col};
         places.count = arrow_array->length();
-        places.keys_begin = {reinterpret_cast<ukv_key_t const*>(arrow_array->raw_values()), sizeof(ukv_key_t)};
+        places.keys_begin = {reinterpret_cast<ustore_key_t const*>(arrow_array->raw_values()), sizeof(ustore_key_t)};
 
         viewed_or_owned = std::move(places);
     }
 
     void copy_arrow(std::shared_ptr<arrow::Array> key_array, std::shared_ptr<arrow::Array> col_array) {
         if (key_array->type_id() > arrow::Type::INT64)
-            throw std::runtime_error("Can't cast given type to `ukv_key_t`");
+            throw std::runtime_error("Can't cast given type to `ustore_key_t`");
 
-        strided_iterator_gt<ukv_collection_t const> collections;
+        strided_iterator_gt<ustore_collection_t const> collections;
         if (col_array) {
             if (col_array->type_id() != arrow::Type::INT64 || col_array->type_id() != arrow::Type::UINT64)
-                throw std::runtime_error("Can't cast given type to `ukv_collection_t`");
+                throw std::runtime_error("Can't cast given type to `ustore_collection_t`");
             auto cols = std::static_pointer_cast<arrow::UInt64Array>(key_array);
-            collections = {cols->raw_values(), sizeof(ukv_collection_t)};
+            collections = {cols->raw_values(), sizeof(ustore_collection_t)};
         }
         else
             collections = {&single_col};
@@ -193,7 +193,7 @@ struct parsed_contents_t {
     using viewed_t = contents_arg_t;
     using owned_t = std::vector<value_view_t>;
     std::variant<std::monostate, viewed_t, owned_t> viewed_or_owned;
-    ukv_bytes_cptr_t values_tape_start = nullptr;
+    ustore_bytes_cptr_t values_tape_start = nullptr;
 
     operator contents_arg_t() const noexcept {
         if (std::holds_alternative<std::monostate>(viewed_or_owned))
@@ -237,12 +237,12 @@ struct parsed_contents_t {
             values_tape_start = arrow_array->value_data()->data();
             contents_arg_t viewed_contents;
             viewed_contents.offsets_begin = {
-                reinterpret_cast<ukv_length_t const*>(arrow_array->value_offsets()->data()),
-                sizeof(ukv_length_t)};
+                reinterpret_cast<ustore_length_t const*>(arrow_array->value_offsets()->data()),
+                sizeof(ustore_length_t)};
             viewed_contents.contents_begin = {&values_tape_start, 0};
-            viewed_contents.count = static_cast<ukv_size_t>(arrow_array->length());
+            viewed_contents.count = static_cast<ustore_size_t>(arrow_array->length());
             viewed_contents.presences_begin =
-                arrow_array->null_count() ? reinterpret_cast<ukv_octet_t const*>(arrow_array->null_bitmap()->data())
+                arrow_array->null_count() ? reinterpret_cast<ustore_octet_t const*>(arrow_array->null_bitmap()->data())
                                           : nullptr;
 
             viewed_or_owned = std::move(viewed_contents);
@@ -261,10 +261,10 @@ struct parsed_contents_t {
 
 /**
  * May view:
- * - NumPy (strided) column of @c ukv_key_t scalars.
- * - 3x Apache Arrow array of @c ukv_key_t scalars.
- * - Apache Arrow table with "source", "target", (optional) "edge" @c ukv_key_t columns.
- * - Buffer-protocol 2D implementation with 3x columns of @c ukv_key_t scalars.
+ * - NumPy (strided) column of @c ustore_key_t scalars.
+ * - 3x Apache Arrow array of @c ustore_key_t scalars.
+ * - Apache Arrow table with "source", "target", (optional) "edge" @c ustore_key_t columns.
+ * - Buffer-protocol 2D implementation with 3x columns of @c ustore_key_t scalars.
  *
  * May be copied from:
  * - list/tuple of lists/tuples of any integer-convertible PyObjects.
@@ -290,9 +290,9 @@ struct parsed_adjacency_list_t {
         // Check if we can do zero-copy
         if (PyObject_CheckBuffer(adjacency_list)) {
             py_buffer_t buf = py_buffer(adjacency_list);
-            if (!can_cast_internal_scalars<ukv_key_t>(buf))
-                throw std::invalid_argument("Expecting @c ukv_key_t scalars in zero-copy interface");
-            auto mat = py_strided_matrix<ukv_key_t const>(buf);
+            if (!can_cast_internal_scalars<ustore_key_t>(buf))
+                throw std::invalid_argument("Expecting @c ustore_key_t scalars in zero-copy interface");
+            auto mat = py_strided_matrix<ustore_key_t const>(buf);
             auto columns = mat.columns();
             if (columns != 2 && columns != 3)
                 throw std::invalid_argument("Expecting 2 or 3 columns: sources, targets, edge IDs");
@@ -301,7 +301,7 @@ struct parsed_adjacency_list_t {
                 mat.column(0),
                 mat.column(1),
                 columns == 3 ? mat.column(2)
-                             : strided_range_gt<ukv_key_t const>({&ukv_default_edge_id_k, 0}, mat.rows()),
+                             : strided_range_gt<ustore_key_t const>({&ustore_default_edge_id_k, 0}, mat.rows()),
             };
             viewed_or_owned = edges_view;
         }
@@ -320,9 +320,9 @@ struct parsed_adjacency_list_t {
                     throw std::invalid_argument("Expecting 2 or 3 columns: sources, targets, edge IDs");
 
                 edge_t result;
-                result.source_id = py_to_scalar<ukv_key_t>(PyTuple_GetItem(obj, 0));
-                result.target_id = py_to_scalar<ukv_key_t>(PyTuple_GetItem(obj, 1));
-                result.id = columns == 3 ? py_to_scalar<ukv_key_t>(PyTuple_GetItem(obj, 2)) : ukv_default_edge_id_k;
+                result.source_id = py_to_scalar<ustore_key_t>(PyTuple_GetItem(obj, 0));
+                result.target_id = py_to_scalar<ustore_key_t>(PyTuple_GetItem(obj, 1));
+                result.id = columns == 3 ? py_to_scalar<ustore_key_t>(PyTuple_GetItem(obj, 2)) : ustore_default_edge_id_k;
                 return result;
             };
             py_transform_n(adjacency_list, to_edge, std::back_inserter(edges_vec));
@@ -343,15 +343,15 @@ struct parsed_adjacency_list_t {
         // Check if we can do zero-copy
         if (source_ids_is_buf) {
             if (!all_same)
-                throw std::invalid_argument("Expecting @c ukv_key_t scalars in zero-copy interface");
+                throw std::invalid_argument("Expecting @c ustore_key_t scalars in zero-copy interface");
 
             auto sources_handle = py_buffer(source_ids);
-            auto sources = py_strided_range<ukv_key_t const>(sources_handle);
+            auto sources = py_strided_range<ustore_key_t const>(sources_handle);
             auto targets_handle = py_buffer(target_ids);
-            auto targets = py_strided_range<ukv_key_t const>(targets_handle);
+            auto targets = py_strided_range<ustore_key_t const>(targets_handle);
             if (edge_ids != Py_None) {
                 auto edge_ids_handle = py_buffer(edge_ids);
-                auto edge_ids = py_strided_range<ukv_key_t const>(edge_ids_handle);
+                auto edge_ids = py_strided_range<ustore_key_t const>(edge_ids_handle);
                 edges_view_t edges_view {sources, targets, edge_ids};
                 viewed_or_owned = edges_view;
             }
@@ -371,14 +371,14 @@ struct parsed_adjacency_list_t {
             std::vector<edge_t> edges_vec(n);
             edges_span_t edges_span = edges(edges_vec);
 
-            py_transform_n(source_ids, &py_to_scalar<ukv_key_t>, edges_span.source_ids.begin(), n);
-            py_transform_n(target_ids, &py_to_scalar<ukv_key_t>, edges_span.target_ids.begin(), n);
+            py_transform_n(source_ids, &py_to_scalar<ustore_key_t>, edges_span.source_ids.begin(), n);
+            py_transform_n(target_ids, &py_to_scalar<ustore_key_t>, edges_span.target_ids.begin(), n);
             if (edge_ids != Py_None)
-                py_transform_n(edge_ids, &py_to_scalar<ukv_key_t>, edges_span.edge_ids.begin(), n);
+                py_transform_n(edge_ids, &py_to_scalar<ustore_key_t>, edges_span.edge_ids.begin(), n);
 
             viewed_or_owned = std::move(edges_vec);
         }
     }
 };
 
-} // namespace unum::ukv::pyb
+} // namespace unum::ustore::pyb

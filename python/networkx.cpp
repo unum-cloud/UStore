@@ -6,29 +6,29 @@
 #include "cast_args.hpp"
 #include "algorithms/louvain.cpp"
 
-using namespace unum::ukv::pyb;
-using namespace unum::ukv;
+using namespace unum::ustore::pyb;
+using namespace unum::ustore;
 using namespace unum;
 
 embedded_blobs_t read_attributes( //
     docs_collection_t& collection,
-    strided_range_gt<ukv_key_t const> keys,
-    ukv_str_view_t field) {
+    strided_range_gt<ustore_key_t const> keys,
+    ustore_str_view_t field) {
 
     status_t status;
-    ukv_length_t* found_offsets = nullptr;
-    ukv_length_t* found_lengths = nullptr;
-    ukv_bytes_ptr_t found_values = nullptr;
-    auto count = static_cast<ukv_size_t>(keys.size());
+    ustore_length_t* found_offsets = nullptr;
+    ustore_length_t* found_lengths = nullptr;
+    ustore_bytes_ptr_t found_values = nullptr;
+    auto count = static_cast<ustore_size_t>(keys.size());
 
-    ukv_docs_read_t docs_read {};
+    ustore_docs_read_t docs_read {};
     docs_read.db = collection.db();
     docs_read.error = status.member_ptr();
-    docs_read.options = ukv_option_dont_discard_memory_k;
+    docs_read.options = ustore_option_dont_discard_memory_k;
     docs_read.transaction = collection.txn();
     docs_read.snapshot = collection.snap();
     docs_read.arena = collection.member_arena();
-    docs_read.type = ukv_doc_field_json_k;
+    docs_read.type = ustore_doc_field_json_k;
     docs_read.tasks_count = count;
     docs_read.collections = collection.member_ptr();
     docs_read.keys = keys.begin().get();
@@ -38,22 +38,22 @@ embedded_blobs_t read_attributes( //
     docs_read.lengths = &found_lengths;
     docs_read.values = &found_values;
 
-    ukv_docs_read(&docs_read);
+    ustore_docs_read(&docs_read);
     status.throw_unhandled();
     return embedded_blobs_t {count, found_offsets, found_lengths, found_values};
 }
 
 void compute_degrees(py_graph_t& graph,
-                     strided_range_gt<ukv_key_t const> vertices,
-                     ukv_vertex_role_t role,
-                     ukv_str_view_t weight,
-                     ukv_vertex_degree_t** degrees) {
+                     strided_range_gt<ustore_key_t const> vertices,
+                     ustore_vertex_role_t role,
+                     ustore_str_view_t weight,
+                     ustore_vertex_degree_t** degrees) {
 
     status_t status;
-    ukv_key_t* edges_per_vertex = nullptr;
-    auto count = static_cast<ukv_size_t>(vertices.size());
+    ustore_key_t* edges_per_vertex = nullptr;
+    auto count = static_cast<ustore_size_t>(vertices.size());
 
-    ukv_graph_find_edges_t graph_find_edges {};
+    ustore_graph_find_edges_t graph_find_edges {};
     graph_find_edges.db = graph.index.db();
     graph_find_edges.error = status.member_ptr();
     graph_find_edges.transaction = graph.index.txn();
@@ -66,27 +66,27 @@ void compute_degrees(py_graph_t& graph,
     graph_find_edges.degrees_per_vertex = degrees;
     graph_find_edges.edges_per_vertex = &edges_per_vertex;
 
-    ukv_graph_find_edges(&graph_find_edges);
+    ustore_graph_find_edges(&graph_find_edges);
     status.throw_unhandled();
     if (!weight)
         return;
 
     auto edges_begin = reinterpret_cast<edge_t*>(edges_per_vertex);
-    auto all_edges_count = transform_reduce_n(*degrees, count, 0ul, [](ukv_vertex_degree_t deg) {
-        return deg == ukv_vertex_degree_missing_k ? 0 : deg;
+    auto all_edges_count = transform_reduce_n(*degrees, count, 0ul, [](ustore_vertex_degree_t deg) {
+        return deg == ustore_vertex_degree_missing_k ? 0 : deg;
     });
     auto edges = edges_span_t {edges_begin, edges_begin + all_edges_count};
 
-    ukv_length_t* found_offsets = nullptr;
-    ukv_length_t* found_lengths = nullptr;
-    ukv_bytes_ptr_t found_values = nullptr;
+    ustore_length_t* found_offsets = nullptr;
+    ustore_length_t* found_lengths = nullptr;
+    ustore_bytes_ptr_t found_values = nullptr;
 
     auto values = read_attributes(graph.relations_attrs, edges.edge_ids.immutable(), weight);
     auto value_iterator = values.begin();
     for (std::size_t i = 0; i != count; ++i) {
         auto edges_count = (*degrees)[i];
         (*degrees)[i] = transform_reduce_n(value_iterator, edges_count, 0ul, [](value_view_t edge_weight) {
-            ukv_vertex_degree_t weight;
+            ustore_vertex_degree_t weight;
             std::from_chars(edge_weight.c_str(), edge_weight.c_str() + edge_weight.size(), weight);
             return weight;
         });
@@ -101,7 +101,7 @@ struct nodes_stream_t {
     std::string default_value;
 
     embedded_blobs_t attrs;
-    ptr_range_gt<ukv_key_t const> nodes;
+    ptr_range_gt<ustore_key_t const> nodes;
     std::size_t index = 0;
 
     nodes_stream_t(
@@ -210,13 +210,13 @@ struct degrees_stream_t {
     keys_stream_t keys_stream;
     py_graph_t& graph;
     std::string weight_field;
-    ukv_vertex_role_t vertex_role;
+    ustore_vertex_role_t vertex_role;
 
-    ptr_range_gt<ukv_key_t const> fetched_nodes;
-    ukv_vertex_degree_t* degrees = nullptr;
+    ptr_range_gt<ustore_key_t const> fetched_nodes;
+    ustore_vertex_degree_t* degrees = nullptr;
     std::size_t index = 0;
 
-    degrees_stream_t(keys_stream_t&& stream, py_graph_t& net, std::string field, ukv_vertex_role_t role)
+    degrees_stream_t(keys_stream_t&& stream, py_graph_t& net, std::string field, ustore_vertex_role_t role)
         : keys_stream(std::move(stream)), graph(net), weight_field(field), vertex_role(role) {
         fetched_nodes = keys_stream.keys_batch();
         compute_degrees(graph,
@@ -258,7 +258,7 @@ struct nodes_range_t : public std::enable_shared_from_this<nodes_range_t> {
 
 struct edges_range_t : public std::enable_shared_from_this<edges_range_t> {
     std::weak_ptr<py_graph_t> net_ptr;
-    std::vector<ukv_key_t> vertices;
+    std::vector<ustore_key_t> vertices;
     bool read_data = false;
     std::string field;
     std::string default_value;
@@ -266,7 +266,7 @@ struct edges_range_t : public std::enable_shared_from_this<edges_range_t> {
 
 struct degree_view_t {
     std::weak_ptr<py_graph_t> net_ptr;
-    ukv_vertex_role_t roles = ukv_vertex_role_any_k;
+    ustore_vertex_role_t roles = ustore_vertex_role_any_k;
     std::string weight = "";
 };
 
@@ -297,11 +297,11 @@ py::object wrap_into_buffer(py_graph_t& g, strided_range_gt<element_at> range) {
     return py::reinterpret_steal<py::object>(obj);
 }
 
-void ukv::wrap_networkx(py::module& m) {
+void ustore::wrap_networkx(py::module& m) {
 
     auto degs = py::class_<degree_view_t>(m, "DegreeView", py::module_local());
     auto degs_stream = py::class_<degrees_stream_t>(m, "DegreesStream", py::module_local());
-    degs.def("__getitem__", [](degree_view_t& degs, ukv_key_t v) {
+    degs.def("__getitem__", [](degree_view_t& degs, ustore_key_t v) {
         py_graph_t& g = *degs.net_ptr.lock().get();
         auto result = g.ref().degree(v, degs.roles).throw_or_release();
         return result;
@@ -311,21 +311,21 @@ void ukv::wrap_networkx(py::module& m) {
         "__call__",
         [](degree_view_t& degs, py::object vs, std::string weight = "") {
             py_graph_t& g = *degs.net_ptr.lock().get();
-            ukv_vertex_degree_t* degrees;
+            ustore_vertex_degree_t* degrees;
 
             if (PyObject_CheckBuffer(vs.ptr())) {
                 auto vs_handle = py_buffer(vs.ptr());
-                auto vertices = py_strided_range<ukv_key_t const>(vs_handle);
+                auto vertices = py_strided_range<ustore_key_t const>(vs_handle);
                 compute_degrees(g, vertices, degs.roles, weight.size() ? weight.c_str() : nullptr, &degrees);
-                return wrap_into_buffer<ukv_vertex_degree_t const>(
+                return wrap_into_buffer<ustore_vertex_degree_t const>(
                     g,
-                    strided_range<ukv_vertex_degree_t const>(degrees, degrees + vertices.size()));
+                    strided_range<ustore_vertex_degree_t const>(degrees, degrees + vertices.size()));
             }
             if (!PySequence_Check(vs.ptr()))
                 throw std::invalid_argument("Nodes Must Be Sequence");
 
-            std::vector<ukv_key_t> vertices(PySequence_Size(vs.ptr()));
-            py_transform_n(vs.ptr(), &py_to_scalar<ukv_key_t>, vertices.begin());
+            std::vector<ustore_key_t> vertices(PySequence_Size(vs.ptr()));
+            py_transform_n(vs.ptr(), &py_to_scalar<ustore_key_t>, vertices.begin());
             compute_degrees(g,
                             strided_range(vertices).immutable(),
                             degs.roles,
@@ -395,14 +395,14 @@ void ukv::wrap_networkx(py::module& m) {
         py_graph_t& g = *range.net_ptr.lock().get();
         if (range.vertices.size()) {
             auto vertices = strided_range(range.vertices).immutable();
-            auto role = ukv_vertex_source_k;
+            auto role = ustore_vertex_source_k;
             auto edges = g.ref().edges_containing(vertices, {{&role}, 1}).throw_or_release();
             auto attrs = read_attributes(g.relations_attrs,
                                          edges.edge_ids.immutable(),
                                          range.field.size() ? range.field.c_str() : nullptr);
             return py::cast(edges_nbunch_iter_t(edges, attrs, range.read_data, range.default_value));
         }
-        auto edges = g.ref().edges(ukv_vertex_source_k).throw_or_release();
+        auto edges = g.ref().edges(ustore_vertex_source_k).throw_or_release();
         return py::cast(edges_stream_t(std::move(edges).begin(),
                                        g.relations_attrs,
                                        range.read_data,
@@ -439,10 +439,10 @@ void ukv::wrap_networkx(py::module& m) {
             range.default_value = "{}";
 
             if (PyNumber_Check(vs.ptr()))
-                range.vertices.push_back(py_to_scalar<ukv_key_t>(vs.ptr()));
+                range.vertices.push_back(py_to_scalar<ustore_key_t>(vs.ptr()));
             else {
                 range.vertices.resize(PySequence_Size(vs.ptr()));
-                py_transform_n(vs.ptr(), &py_to_scalar<ukv_key_t>, range.vertices.begin());
+                py_transform_n(vs.ptr(), &py_to_scalar<ustore_key_t>, range.vertices.begin());
             }
             return range.shared_from_this();
         },
@@ -459,10 +459,10 @@ void ukv::wrap_networkx(py::module& m) {
             range.default_value = std::move(str);
 
             if (PyNumber_Check(vs.ptr()))
-                range.vertices.push_back(py_to_scalar<ukv_key_t>(vs.ptr()));
+                range.vertices.push_back(py_to_scalar<ustore_key_t>(vs.ptr()));
             else {
                 range.vertices.resize(PySequence_Size(vs.ptr()));
-                py_transform_n(vs.ptr(), &py_to_scalar<ukv_key_t>, range.vertices.begin());
+                py_transform_n(vs.ptr(), &py_to_scalar<ustore_key_t>, range.vertices.begin());
             }
             return range.shared_from_this();
         },
@@ -537,7 +537,7 @@ void ukv::wrap_networkx(py::module& m) {
         [](py_graph_t& g) {
             auto degs_ptr = std::make_unique<degree_view_t>();
             degs_ptr->net_ptr = g.shared_from_this();
-            degs_ptr->roles = ukv_vertex_role_any_k;
+            degs_ptr->roles = ustore_vertex_role_any_k;
             return degs_ptr;
         },
         "A DegreeView for the graph.");
@@ -546,7 +546,7 @@ void ukv::wrap_networkx(py::module& m) {
         [](py_graph_t& g) {
             auto degs_ptr = std::make_unique<degree_view_t>();
             degs_ptr->net_ptr = g.shared_from_this();
-            degs_ptr->roles = ukv_vertex_target_k;
+            degs_ptr->roles = ustore_vertex_target_k;
             return degs_ptr;
         },
         "A DegreeView with the number incoming edges for each Vertex.");
@@ -555,7 +555,7 @@ void ukv::wrap_networkx(py::module& m) {
         [](py_graph_t& g) {
             auto degs_ptr = std::make_unique<degree_view_t>();
             degs_ptr->net_ptr = g.shared_from_this();
-            degs_ptr->roles = ukv_vertex_source_k;
+            degs_ptr->roles = ustore_vertex_source_k;
             return degs_ptr;
         },
         "A DegreeView with the number outgoing edges for each Vertex.");
@@ -566,7 +566,7 @@ void ukv::wrap_networkx(py::module& m) {
                 return g.ref().number_of_edges();
 
             std::size_t size = 0;
-            auto stream = g.ref().edges(ukv_vertex_source_k).throw_or_release().begin();
+            auto stream = g.ref().edges(ustore_vertex_source_k).throw_or_release().begin();
             while (!stream.is_end()) {
                 auto edge_ids = stream.edges_batch().edge_ids.immutable();
                 auto attrs = read_attributes(g.relations_attrs, edge_ids, weight.c_str());
@@ -592,7 +592,7 @@ void ukv::wrap_networkx(py::module& m) {
         "Returns the number of attributed edges.");
     g.def(
         "number_of_edges",
-        [](py_graph_t& g, ukv_key_t v1, ukv_key_t v2) {
+        [](py_graph_t& g, ustore_key_t v1, ustore_key_t v2) {
             return g.ref().edges_between(v1, v2).throw_or_release().size();
         },
         "Returns the number of edges between two nodes.");
@@ -619,7 +619,7 @@ void ukv::wrap_networkx(py::module& m) {
         "Iterate over the nodes.");
     g.def(
         "has_node",
-        [](py_graph_t& g, ukv_key_t v) {
+        [](py_graph_t& g, ustore_key_t v) {
             auto maybe = g.ref().contains(v);
             maybe.throw_unhandled();
             return *maybe;
@@ -628,7 +628,7 @@ void ukv::wrap_networkx(py::module& m) {
         "Returns True if the graph contains the node n.");
     g.def(
         "__contains__",
-        [](py_graph_t& g, ukv_key_t v) { return g.ref().contains(v).throw_or_release(); },
+        [](py_graph_t& g, ustore_key_t v) { return g.ref().contains(v).throw_or_release(); },
         py::arg("n"),
         "Returns True if the graph contains the node n.");
 
@@ -642,7 +642,7 @@ void ukv::wrap_networkx(py::module& m) {
                 Py_ssize_t pos = 0;
                 while (PyDict_Next(obj.ptr(), &pos, &key, &value)) {
                     json_to_merge.clear();
-                    auto vertex = py_to_scalar<ukv_key_t>(key);
+                    auto vertex = py_to_scalar<ustore_key_t>(key);
                     if (!PyDict_Check(value)) {
                         fmt::format_to(std::back_inserter(json_to_merge), "{{\"{}\":", name.value());
                         to_string(value, json_to_merge);
@@ -675,7 +675,7 @@ void ukv::wrap_networkx(py::module& m) {
     g.def(
         "get_node_attributes",
         [](py_graph_t& g, std::string& name) {
-            std::unordered_map<ukv_key_t, py::object> map;
+            std::unordered_map<ustore_key_t, py::object> map;
             auto stream = g.ref().vertex_stream().throw_or_release();
             while (!stream.is_end()) {
                 auto keys = stream.keys_batch().strided();
@@ -697,14 +697,14 @@ void ukv::wrap_networkx(py::module& m) {
 
     g.def(
         "has_edge",
-        [](py_graph_t& g, ukv_key_t v1, ukv_key_t v2) {
+        [](py_graph_t& g, ustore_key_t v1, ustore_key_t v2) {
             return g.ref().edges_between(v1, v2).throw_or_release().size() != 0;
         },
         py::arg("u"),
         py::arg("v"));
     g.def(
         "has_edge",
-        [](py_graph_t& g, ukv_key_t v1, ukv_key_t v2, ukv_key_t e) {
+        [](py_graph_t& g, ustore_key_t v1, ustore_key_t v2, ustore_key_t e) {
             auto ids = g.ref().edges_between(v1, v2).throw_or_release().edge_ids;
             return std::find(ids.begin(), ids.end(), e) != ids.end();
         },
@@ -713,7 +713,7 @@ void ukv::wrap_networkx(py::module& m) {
         py::arg("key"));
     g.def(
         "get_edge_data",
-        [](py_graph_t& g, ukv_key_t v1, ukv_key_t v2, py::object default_value) -> py::object {
+        [](py_graph_t& g, ustore_key_t v1, ustore_key_t v2, py::object default_value) -> py::object {
             std::string default_value_str;
             to_string(default_value.ptr(), default_value_str);
             auto edges = g.ref().edges_between(v1, v2).throw_or_release();
@@ -736,7 +736,7 @@ void ukv::wrap_networkx(py::module& m) {
         "get_edge_attributes",
         [](py_graph_t& g, std::string& name) {
             auto hash = [](py::tuple const& tuple) {
-                return py_to_scalar<ukv_key_t>(PyTuple_GetItem(tuple.ptr(), 2));
+                return py_to_scalar<ustore_key_t>(PyTuple_GetItem(tuple.ptr(), 2));
             };
             std::unordered_map<py::tuple, py::object, decltype(hash)> map(0, hash);
 
@@ -774,7 +774,7 @@ void ukv::wrap_networkx(py::module& m) {
                     json_to_merge.clear();
                     if (!PyTuple_Check(key) || PyTuple_Size(key) != 3)
                         throw std::invalid_argument("Invalid Argument");
-                    auto attr_key = py_to_scalar<ukv_key_t>(PyTuple_GetItem(key, 2));
+                    auto attr_key = py_to_scalar<ustore_key_t>(PyTuple_GetItem(key, 2));
                     if (!PyDict_Check(value)) {
                         fmt::format_to(std::back_inserter(json_to_merge), "{{\"{}\":", name.value());
                         to_string(value, json_to_merge);
@@ -806,32 +806,32 @@ void ukv::wrap_networkx(py::module& m) {
 
     g.def(
         "__getitem__",
-        [](py_graph_t& g, ukv_key_t n) { return wrap_into_buffer(g, g.ref().neighbors(n).throw_or_release()); },
+        [](py_graph_t& g, ustore_key_t n) { return wrap_into_buffer(g, g.ref().neighbors(n).throw_or_release()); },
         py::arg("n"),
         "Returns an iterable of incoming and outgoing nodes of n. Potentially with duplicates.");
     g.def(
         "neighbors",
-        [](py_graph_t& g, ukv_key_t n) { return wrap_into_buffer(g, g.ref().neighbors(n).throw_or_release()); },
+        [](py_graph_t& g, ustore_key_t n) { return wrap_into_buffer(g, g.ref().neighbors(n).throw_or_release()); },
         py::arg("n"),
         "Returns an iterable of incoming and outgoing nodes of n. Potentially with duplicates.");
     g.def(
         "successors",
-        [](py_graph_t& g, ukv_key_t n) { return wrap_into_buffer(g, g.ref().successors(n).throw_or_release()); },
+        [](py_graph_t& g, ustore_key_t n) { return wrap_into_buffer(g, g.ref().successors(n).throw_or_release()); },
         py::arg("n"),
         "Returns an iterable of successor nodes of n.");
     g.def(
         "predecessors",
-        [](py_graph_t& g, ukv_key_t n) { return wrap_into_buffer(g, g.ref().predecessors(n).throw_or_release()); },
+        [](py_graph_t& g, ustore_key_t n) { return wrap_into_buffer(g, g.ref().predecessors(n).throw_or_release()); },
         py::arg("n"),
         "Returns an iterable of follower nodes of n.");
     g.def(
         "nbunch_iter",
         [](py_graph_t& g, PyObject* vs) {
             auto ids_handle = py_buffer(vs);
-            auto ids = py_strided_range<ukv_key_t const>(ids_handle);
+            auto ids = py_strided_range<ustore_key_t const>(ids_handle);
             auto result = g.ref().contains(ids).throw_or_release();
 
-            py::array_t<ukv_key_t> res_array(ids.size());
+            py::array_t<ustore_key_t> res_array(ids.size());
             size_t j = 0;
             for (size_t i = 0; i < ids.size(); i++)
                 if (result[i])
@@ -846,7 +846,7 @@ void ukv::wrap_networkx(py::module& m) {
     // https://networkx.org/documentation/stable/reference/classes/multidigraph.html#adding-and-removing-nodes-and-edges
     g.def(
         "add_node",
-        [](py_graph_t& g, ukv_key_t v, py::kwargs const& attrs) {
+        [](py_graph_t& g, ustore_key_t v, py::kwargs const& attrs) {
             g.ref().upsert_vertex(v).throw_unhandled();
             if (!attrs.size())
                 return;
@@ -857,14 +857,14 @@ void ukv::wrap_networkx(py::module& m) {
         py::arg("v_to_upsert"));
     g.def(
         "add_edge",
-        [](py_graph_t& g, ukv_key_t v1, ukv_key_t v2) {
+        [](py_graph_t& g, ustore_key_t v1, ustore_key_t v2) {
             g.ref().upsert_edge(edge_t {v1, v2}).throw_unhandled();
         },
         py::arg("u_for_edge"),
         py::arg("v_for_edge"));
     g.def(
         "add_edge",
-        [](py_graph_t& g, ukv_key_t v1, ukv_key_t v2, ukv_key_t e, py::kwargs const& attrs) {
+        [](py_graph_t& g, ustore_key_t v1, ustore_key_t v2, ustore_key_t e, py::kwargs const& attrs) {
             g.ref().upsert_edge(edge_t {v1, v2, e}).throw_unhandled();
             if (!attrs.size())
                 return;
@@ -877,7 +877,7 @@ void ukv::wrap_networkx(py::module& m) {
         py::arg("id"));
     g.def(
         "remove_node",
-        [](py_graph_t& g, ukv_key_t v) {
+        [](py_graph_t& g, ustore_key_t v) {
             g.ref().remove_vertex(v).throw_unhandled();
             if (g.vertices_attrs.db())
                 g.vertices_attrs[v].clear().throw_unhandled();
@@ -885,14 +885,14 @@ void ukv::wrap_networkx(py::module& m) {
         py::arg("v_to_remove"));
     g.def(
         "remove_edge",
-        [](py_graph_t& g, ukv_key_t v1, ukv_key_t v2) {
+        [](py_graph_t& g, ustore_key_t v1, ustore_key_t v2) {
             g.ref().remove_edge(edge_t {v1, v2}).throw_unhandled();
         },
         py::arg("u_for_edge"),
         py::arg("v_for_edge"));
     g.def(
         "remove_edge",
-        [](py_graph_t& g, ukv_key_t v1, ukv_key_t v2, ukv_key_t e) {
+        [](py_graph_t& g, ustore_key_t v1, ustore_key_t v2, ustore_key_t e) {
             g.ref().remove_edge(edge_t {v1, v2, e}).throw_unhandled();
         },
         py::arg("u_for_edge"),
@@ -901,9 +901,9 @@ void ukv::wrap_networkx(py::module& m) {
     g.def("add_nodes_from", [](py_graph_t& g, py::object vs, py::kwargs const& attrs) {
         if (PyObject_CheckBuffer(vs.ptr())) {
             py_buffer_t buf = py_buffer(vs.ptr());
-            if (!can_cast_internal_scalars<ukv_key_t>(buf))
-                throw std::invalid_argument("Expecting @c ukv_key_t scalars in zero-copy interface");
-            auto vertices = py_strided_range<ukv_key_t const>(buf);
+            if (!can_cast_internal_scalars<ustore_key_t>(buf))
+                throw std::invalid_argument("Expecting @c ustore_key_t scalars in zero-copy interface");
+            auto vertices = py_strided_range<ustore_key_t const>(buf);
             g.ref().upsert_vertices(vertices).throw_unhandled();
             if (!attrs.size())
                 return;
@@ -914,8 +914,8 @@ void ukv::wrap_networkx(py::module& m) {
         else {
             if (!PySequence_Check(vs.ptr()))
                 throw std::invalid_argument("Nodes Must Be Sequence");
-            std::vector<ukv_key_t> vertices(PySequence_Size(vs.ptr()));
-            py_transform_n(vs.ptr(), &py_to_scalar<ukv_key_t>, vertices.begin());
+            std::vector<ustore_key_t> vertices(PySequence_Size(vs.ptr()));
+            py_transform_n(vs.ptr(), &py_to_scalar<ustore_key_t>, vertices.begin());
             g.ref().upsert_vertices(vertices).throw_unhandled();
             if (!attrs.size())
                 return;
@@ -934,9 +934,9 @@ void ukv::wrap_networkx(py::module& m) {
     g.def("remove_nodes_from", [](py_graph_t& g, py::object vs) {
         if (PyObject_CheckBuffer(vs.ptr())) {
             py_buffer_t buf = py_buffer(vs.ptr());
-            if (!can_cast_internal_scalars<ukv_key_t>(buf))
-                throw std::invalid_argument("Expecting @c ukv_key_t scalars in zero-copy interface");
-            auto vertices = py_strided_range<ukv_key_t const>(buf);
+            if (!can_cast_internal_scalars<ustore_key_t>(buf))
+                throw std::invalid_argument("Expecting @c ustore_key_t scalars in zero-copy interface");
+            auto vertices = py_strided_range<ustore_key_t const>(buf);
             g.ref().remove_vertices(vertices).throw_unhandled();
             if (g.vertices_attrs.db())
                 g.vertices_attrs[vertices].clear().throw_unhandled();
@@ -944,8 +944,8 @@ void ukv::wrap_networkx(py::module& m) {
         else {
             if (!PySequence_Check(vs.ptr()))
                 throw std::invalid_argument("Nodes Must Be Sequence");
-            std::vector<ukv_key_t> vertices(PySequence_Size(vs.ptr()));
-            py_transform_n(vs.ptr(), &py_to_scalar<ukv_key_t>, vertices.begin());
+            std::vector<ustore_key_t> vertices(PySequence_Size(vs.ptr()));
+            py_transform_n(vs.ptr(), &py_to_scalar<ustore_key_t>, vertices.begin());
             g.ref().remove_vertices(vertices).throw_unhandled();
             if (g.vertices_attrs.db())
                 g.vertices_attrs[vertices].clear().throw_unhandled();
@@ -971,16 +971,16 @@ void ukv::wrap_networkx(py::module& m) {
             to_string(attrs.ptr(), json_str);
             if (PyObject_CheckBuffer(es.ptr())) {
                 py_buffer_t buf = py_buffer(es.ptr());
-                if (!can_cast_internal_scalars<ukv_key_t>(buf))
-                    throw std::invalid_argument("Expecting @c ukv_key_t scalars in zero-copy interface");
-                auto edge_ids = py_strided_range<ukv_key_t const>(buf);
+                if (!can_cast_internal_scalars<ustore_key_t>(buf))
+                    throw std::invalid_argument("Expecting @c ustore_key_t scalars in zero-copy interface");
+                auto edge_ids = py_strided_range<ustore_key_t const>(buf);
                 g.relations_attrs[edge_ids].assign(value_view_t(json_str)).throw_unhandled();
             }
             else {
                 if (!PySequence_Check(es.ptr()))
                     throw std::invalid_argument("Edge Ids Must Be Sequence");
-                std::vector<ukv_key_t> edge_ids(PySequence_Size(es.ptr()));
-                py_transform_n(es.ptr(), &py_to_scalar<ukv_key_t>, edge_ids.begin());
+                std::vector<ustore_key_t> edge_ids(PySequence_Size(es.ptr()));
+                py_transform_n(es.ptr(), &py_to_scalar<ustore_key_t>, edge_ids.begin());
                 g.relations_attrs[edge_ids].assign(value_view_t(json_str)).throw_unhandled();
             }
         },
@@ -998,16 +998,16 @@ void ukv::wrap_networkx(py::module& m) {
 
             if (PyObject_CheckBuffer(es.ptr())) {
                 py_buffer_t buf = py_buffer(es.ptr());
-                if (!can_cast_internal_scalars<ukv_key_t>(buf))
-                    throw std::invalid_argument("Expecting @c ukv_key_t scalars in zero-copy interface");
-                auto edge_ids = py_strided_range<ukv_key_t const>(buf);
+                if (!can_cast_internal_scalars<ustore_key_t>(buf))
+                    throw std::invalid_argument("Expecting @c ustore_key_t scalars in zero-copy interface");
+                auto edge_ids = py_strided_range<ustore_key_t const>(buf);
                 g.relations_attrs[edge_ids].clear().throw_unhandled();
             }
             else {
                 if (!PySequence_Check(es.ptr()))
                     throw std::invalid_argument("Edge Ids Must Be Sequence");
-                std::vector<ukv_key_t> edge_ids(PySequence_Size(es.ptr()));
-                py_transform_n(es.ptr(), &py_to_scalar<ukv_key_t>, edge_ids.begin());
+                std::vector<ustore_key_t> edge_ids(PySequence_Size(es.ptr()));
+                py_transform_n(es.ptr(), &py_to_scalar<ustore_key_t>, edge_ids.begin());
                 g.relations_attrs[edge_ids].clear().throw_unhandled();
             }
         },
@@ -1059,7 +1059,7 @@ void ukv::wrap_networkx(py::module& m) {
         "contains at least one vertex from the supplied list. Some edges may be duplicated.");
     g.def(
         "subgraph",
-        [](py_graph_t& g, ukv_key_t n, std::size_t hops) { throw_not_implemented(); },
+        [](py_graph_t& g, ustore_key_t n, std::size_t hops) { throw_not_implemented(); },
         "Returns a subgraph in a form of an adjacency list with 3 columns, where every edge (row) "
         "contains at least one vertex from the supplied list at a distance withing a given number "
         "`hops` from the supplied `n`.");

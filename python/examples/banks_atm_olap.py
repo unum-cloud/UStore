@@ -1,5 +1,5 @@
 """
-Example of building an application-specific OLAP DBMS on top of binary collections of UKV.
+Example of building an application-specific OLAP DBMS on top of binary collections of UStore.
 
 Imagine owning a big bank with thousands of ATMs all across the US.
 You are aggregating the withdrawals and, once it happens, count the number of 
@@ -30,7 +30,7 @@ from cuxfilter import charts
 from bokeh.server.server import Server
 from bokeh.document.document import Document
 
-# import ukv.umem as ukv
+# import ustore.ucset as ustore
 
 MAPBOX_API_KEY = 'pk.eyJ1IjoiYXRob3J2ZSIsImEiOiJjazBmcmlhYzAwYXc2M25wMnE3bGttbzczIn0.JCDQliLc-XTU52iKa8L8-Q'
 GEOJSON_URL = 'https://raw.githubusercontent.com/rapidsai/cuxfilter/GTC-2018-mortgage-visualization/javascript/demos/GTC%20demo/public/data/zip3-ms-rhs-lessprops.json'
@@ -199,7 +199,7 @@ if __name__ == '__main__':
     assert tmp['amounts'].equals(recovered['amounts'])
 
     # Using persistent store will be identical to using this
-    # db = ukv.DataBase()
+    # db = ustore.DataBase()
     # measurements = db.main
     measurements: dict[int, bytes] = {}
 
