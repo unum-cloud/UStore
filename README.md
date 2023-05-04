@@ -89,7 +89,7 @@ Java
 
 <a href="https://www.youtube.com/watch?v=ybWeUf_hC7o">Youtube</a> intro • 
 <a href="https://discord.gg/4mxGrenbNt">Discord</a> chat • 
-Full <a href="https://unum.cloud/ustore">documentation</a>
+Full <a href="https://unum-cloud.github.io/ustore">documentation</a>
 
 <a href="https://discord.gg/4mxGrenbNt"><img src="https://img.shields.io/discord/1063947616615923875?label=discord"></a>
 &nbsp;&nbsp;
@@ -114,9 +114,9 @@ Installing UStore is a breeze, and the usage is about as simple as a Python `dic
 $ pip install ukv
 $ python
 
-from ustore import ucset
+from ukv import umem
 
-db = ucset.DataBase()
+db = umem.DataBase()
 db.main[42] = 'Hi'
 ```
 
@@ -125,7 +125,7 @@ Would you prefer that data on disk?
 Change one line.
 
 ```python
-from ustore import rocksdb
+from ukv import rocksdb
 
 db = rocksdb.DataBase('/some-folder/')
 ```
@@ -134,7 +134,7 @@ Would you prefer to connect to a remote UStore server?
 UStore comes with an Apache Arrow Flight RPC interface!
 
 ```python
-from ustore import flight_client
+from ukv import flight_client
 
 db = flight_client.DataBase('grpc://0.0.0.0:38709')
 ```
