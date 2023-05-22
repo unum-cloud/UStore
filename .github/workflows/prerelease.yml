@@ -10,8 +10,30 @@ env:
 
 jobs:
 
+  build_docs:
+    name: Build Docs
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          ref: 'main-dev'
+      - name: Install dependencies
+        run: sudo apt update && sudo apt install -y doxygen graphviz dia git && pip install sphinx breathe furo m2r2 sphinxcontrib-googleanalytics==0.2.dev20220708 sphinxcontrib-jquery
+      - name: Install UKV from PyPi
+        run: pip install ukv
+      - name: Fetch GoLang repo
+        run: git submodule update --init --recursive --remote go-ustore/
+      - name: Build documentation
+        run: cd docs && doxygen conf.dox && make html
+      - name: Copy assets
+        run: cp -r assets build/docs/html/
+      - name: Compress assets
+        run: tar -czvf build/docs-html.tar.gz build/docs/html/
+
   versioning:
     name: Semantic Release
+    needs: build_docs
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v3

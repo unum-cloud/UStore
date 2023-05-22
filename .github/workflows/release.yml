@@ -26,8 +26,30 @@ env:
 
 jobs:
 
+  build_docs:
+    name: Build Docs
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          ref: 'main'
+      - name: Install dependencies
+        run: sudo apt update && sudo apt install -y doxygen graphviz dia git && pip install sphinx breathe furo m2r2 sphinxcontrib-googleanalytics==0.2.dev20220708 sphinxcontrib-jquery
+      - name: Install UKV from PyPi
+        run: pip install ukv
+      - name: Fetch GoLang repo
+        run: git submodule update --init --recursive --remote go-ustore/
+      - name: Build documentation
+        run: cd docs && doxygen conf.dox && make html
+      - name: Copy assets
+        run: cp -r assets build/docs/html/
+      - name: Compress assets
+        run: tar -czvf build/docs-html.tar.gz build/docs/html/
+
   versioning:
     name: Semantic Release
+    needs: build_docs
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v3
@@ -46,22 +68,8 @@ jobs:
     runs-on: ubuntu-22.04
     needs: versioning
     steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-        with:
-          ref: 'main'   
       - name: Setup GitHub Pages
         uses: actions/configure-pages@v2
-      - name: Install dependencies
-        run: sudo apt update && sudo apt install -y doxygen graphviz dia git && pip install sphinx breathe furo m2r2 sphinxcontrib-googleanalytics==0.2.dev20220708 sphinxcontrib-jquery
-      - name: Install UStore from PyPi
-        run: pip install ustore
-      - name: Fetch GoLang repo
-        run: git submodule update --init --recursive --remote go-ustore/
-      - name: Build documentation
-        run: cd docs && doxygen conf.dox && make html
-      - name: Copy assets
-        run: cp -r assets build/docs/html/
       - name: Upload artifacts
         uses: actions/upload-pages-artifact@v1
         with:
