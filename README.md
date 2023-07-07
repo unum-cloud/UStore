@@ -81,7 +81,7 @@ GoLang
 Java
 <br/>
 <b>packages</b>:
-<a href="https://pypi.org/project/ustore/">PyPI</a>
+<a href="https://pypi.org/project/ukv/">PyPI</a>
 •
 <a href="#cmake">CMake</a>
 •
