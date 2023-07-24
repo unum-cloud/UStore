@@ -26,11 +26,6 @@ extern "C" {
 
 #include "ustore/docs.h"
 
-#if !__has_include("arrow/c/abi.h") && !defined(ARROW_C_DATA_INTERFACE)
-#define ARROW_C_DATA_INTERFACE
-#define ARROW_C_STREAM_INTERFACE
-#endif
-
 #ifndef ARROW_C_DATA_INTERFACE
 #define ARROW_C_DATA_INTERFACE
 

@@ -67,15 +67,6 @@ class context_t : public std::enable_shared_from_this<context_t> {
     inline ~context_t() noexcept {
         ustore_transaction_free(txn_);
         txn_ = nullptr;
-
-        status_t status;
-        ustore_snapshot_drop_t snap_drop {
-            .db = db_,
-            .error = status.member_ptr(),
-            .id = snap_,
-        };
-        ustore_snapshot_drop(&snap_drop);
-        snap_ = 0;
     }
 
     inline ustore_database_t db() const noexcept { return db_; }
@@ -146,7 +137,6 @@ class context_t : public std::enable_shared_from_this<context_t> {
 
     expected_gt<snapshots_list_t> snapshots() noexcept {
         ustore_size_t count = 0;
-        ustore_str_span_t names = nullptr;
         ustore_snapshot_t* ids = nullptr;
         status_t status;
         ustore_snapshot_list_t snapshots_list {};
@@ -254,6 +244,20 @@ class context_t : public std::enable_shared_from_this<context_t> {
         ustore_transaction_commit(&txn_commit);
         return {std::move(status), std::move(sequence_number)};
     }
+
+    /**
+     * @brief Exports the snapshot as a new database into the specified path
+     */
+    status_t export_to(ustore_str_view_t path) noexcept {
+        status_t status;
+        ustore_snapshot_export_t snap_export {};
+        snap_export.db = db_;
+        snap_export.error = status.member_ptr();
+        snap_export.id = snap_;
+        snap_export.path = path;
+        ustore_snapshot_export(&snap_export);
+        return status;
+    }
 };
 
 using transaction_t = context_t;
@@ -271,6 +275,19 @@ using transaction_t = context_t;
  */
 class database_t : public std::enable_shared_from_this<database_t> {
     ustore_database_t db_ = nullptr;
+
+    ustore_metadata_t get_metadata() {
+        status_t status {};
+        ustore_metadata_t metadata {};
+        ustore_get_metadata_t get_metadata {};
+
+        get_metadata.db = db_;
+        get_metadata.metadata = &metadata;
+        get_metadata.error = status.member_ptr();
+
+        ustore_get_metadata(&get_metadata);
+        return metadata;
+    }
 
   public:
     database_t() = default;
@@ -296,6 +313,21 @@ class database_t : public std::enable_shared_from_this<database_t> {
     ~database_t() noexcept {
         if (db_)
             close();
+    }
+
+    bool supports_named_collections() {
+        ustore_metadata_t metadata = get_metadata();
+        return metadata & ustore_supports_named_collections_k;
+    }
+
+    bool supports_transactions() {
+        ustore_metadata_t metadata = get_metadata();
+        return metadata & ustore_supports_transactions_k;
+    }
+
+    bool supports_snapshots() {
+        ustore_metadata_t metadata = get_metadata();
+        return metadata & ustore_supports_snapshots_k;
     }
 
     expected_gt<context_t> transact() noexcept {
@@ -327,6 +359,17 @@ class database_t : public std::enable_shared_from_this<database_t> {
             return {std::move(status), context_t {db_, nullptr}};
         else
             return context_t {db_, nullptr, raw};
+    }
+
+    status_t drop_snapshot(ustore_snapshot_t id) noexcept {
+        status_t status;
+        ustore_snapshot_drop_t snap_drop {
+            .db = db_,
+            .error = status.member_ptr(),
+            .id = id,
+        };
+        ustore_snapshot_drop(&snap_drop);
+        return status;
     }
 
     template <typename collection_at = blobs_collection_t>

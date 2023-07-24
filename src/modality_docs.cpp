@@ -17,11 +17,11 @@
 #include <bson.h>              // Converting from/to BSON
 #include <mpack_header_only.h> // Converting from/to MsgPack
 
-#include "ustore/docs.h"                //
-#include "helpers/linked_memory.hpp" // `linked_memory_lock_t`
-#include "helpers/linked_array.hpp"  // `growing_tape_t`
-#include "helpers/algorithm.hpp"     // `transform_n`
-#include "ustore/cpp/ranges_args.hpp"   // `places_arg_t`
+#include "ustore/docs.h"              //
+#include "helpers/linked_memory.hpp"  // `linked_memory_lock_t`
+#include "helpers/linked_array.hpp"   // `growing_tape_t`
+#include "helpers/algorithm.hpp"      // `transform_n`
+#include "ustore/cpp/ranges_args.hpp" // `places_arg_t`
 
 /*********************************************************/
 /*****************	 C++ Implementation	  ****************/
@@ -1124,9 +1124,9 @@ void modify_field( //
 }
 
 ustore_str_view_t field_concat(ustore_str_view_t field,
-                            ustore_str_view_t suffix,
-                            linked_memory_lock_t& arena,
-                            ustore_error_t* c_error) {
+                               ustore_str_view_t suffix,
+                               linked_memory_lock_t& arena,
+                               ustore_error_t* c_error) {
     auto field_len = field ? std::strlen(field) : 0;
     auto suffix_len = suffix ? std::strlen(suffix) : 0;
 
@@ -1290,10 +1290,12 @@ void read_unique_docs( //
     auto found_binaries = joined_blobs_t(places.count, found_binary_offs, found_binary_begin);
     auto found_binary_it = found_binaries.begin();
 
-    ustore_length_t max_length =
-        *std::max_element(found_binary_lens, found_binary_lens + places.count, [](ustore_length_t lhs, ustore_length_t rhs) {
-            return ((lhs < rhs) | (lhs == ustore_length_missing_k)) & (rhs != ustore_length_missing_k);
-        });
+    ustore_length_t max_length = *std::max_element(found_binary_lens,
+                                                   found_binary_lens + places.count,
+                                                   [](ustore_length_t lhs, ustore_length_t rhs) {
+                                                       return ((lhs < rhs) | (lhs == ustore_length_missing_k)) &
+                                                              (rhs != ustore_length_missing_k);
+                                                   });
 
     if (max_length == ustore_length_missing_k) {
         for (std::size_t task_idx = 0; task_idx != places.size(); ++task_idx, ++found_binary_it)
@@ -1586,10 +1588,13 @@ void ustore_docs_write(ustore_docs_write_t* c_ptr) {
 
             auto result = reset(data)[c.id_field];
             return_error_if_m((simdjson::SUCCESS == result.error()),
-                            c.error,
-                            uninitialized_state_k,
-                            "Keys and values is uninitialized");
-
+                              c.error,
+                              uninitialized_state_k,
+                              "Keys and values is uninitialized");
+            return_error_if_m(result.type() == simdjson::ondemand::json_type::number,
+                              c.error,
+                              args_wrong_k,
+                              "The id field does not have the ustore key type");
             tape[idx] = result;
         }
         c.keys_stride = sizeof(ustore_key_t);
@@ -1630,6 +1635,9 @@ void ustore_docs_write(ustore_docs_write_t* c_ptr) {
 
     sj::dom::parser parser;
     for (std::size_t i = 0; i < contents.size(); ++i) {
+        if (!contents[i].size())
+            continue;
+
         std::memcpy(document.begin(), contents[i].data(), contents[i].size());
         std::memset(document.begin() + contents[i].size(), 0, sj::SIMDJSON_PADDING);
         auto result = parser.parse((const char*)document.begin(), contents[i].size(), false);
@@ -2064,7 +2072,8 @@ void ustore_docs_gather(ustore_docs_gather_t* c_ptr) {
     auto first_collection_collisions = wants_collisions //
                                            ? first_collection_conversions + slots_per_bitmap * c.fields_count
                                            : first_collection_validities;
-    auto first_collection_scalars = reinterpret_cast<ustore_byte_t*>(tape_ptr + bytes_for_addresses + bytes_for_bitmaps);
+    auto first_collection_scalars =
+        reinterpret_cast<ustore_byte_t*>(tape_ptr + bytes_for_addresses + bytes_for_bitmaps);
 
     // 1, 2, 3. Export validity maps addresses
     std::size_t tape_progress = 0;

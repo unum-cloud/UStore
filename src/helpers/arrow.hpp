@@ -20,7 +20,7 @@
 #include <arrow/c/bridge.h>
 #pragma GCC diagnostic pop
 
-#include "linked_memory.hpp"       // `linked_memory_lock_t`
+#include "linked_memory.hpp"          // `linked_memory_lock_t`
 #include "ustore/cpp/ranges_args.hpp" // `contents_arg_t`
 
 namespace unum::ustore {
@@ -35,25 +35,27 @@ constexpr std::size_t arrow_bytes_alignment_k = 64;
 namespace arf = arrow::flight;
 namespace ar = arrow;
 
-inline static std::string const kFlightListCols = "list_collections";   /// `DoGet`
-inline static std::string const kFlightSample = "sample";               /// `DoGet`
-inline static std::string const kFlightColCreate = "create_collection"; /// `DoAction`
-inline static std::string const kFlightColDrop = "remove_collection";   /// `DoAction`
+inline static std::string const kFlightRetrieveMetadata = "retrieve_metadata"; /// `DoGet`
+inline static std::string const kFlightListCols = "list_collections";          /// `DoGet`
+inline static std::string const kFlightSample = "sample";                      /// `DoGet`
+inline static std::string const kFlightColCreate = "create_collection";        /// `DoAction`
+inline static std::string const kFlightColDrop = "remove_collection";          /// `DoAction`
 
-inline static std::string const kFlightListSnap = "list_snapshots";    /// `DoGet`
-inline static std::string const kFlightSnapCreate = "create_snapshot"; /// `DoAction`
-inline static std::string const kFlightSnapDrop = "remove_snapshot";   /// `DoAction`
+inline static std::string const kFlightListSnap = "list_snapshots";            /// `DoGet`
+inline static std::string const kFlightSnapCreate = "create_snapshot";         /// `DoAction`
+inline static std::string const kFlightSnapExport = "export_snapshot";         /// `DoAction`
+inline static std::string const kFlightSnapDrop = "remove_snapshot";           /// `DoAction`
 
-inline static std::string const kFlightTxnBegin = "begin_transaction";   /// `DoAction`
-inline static std::string const kFlightTxnCommit = "commit_transaction"; /// `DoAction`
+inline static std::string const kFlightTxnBegin = "begin_transaction";         /// `DoAction`
+inline static std::string const kFlightTxnCommit = "commit_transaction";       /// `DoAction`
 
-inline static std::string const kFlightWrite = "write";          /// `DoPut`
-inline static std::string const kFlightRead = "read";            /// `DoExchange`
-inline static std::string const kFlightWritePath = "write_path"; /// `DoPut`
-inline static std::string const kFlightMatchPath = "match_path"; /// `DoExchange`
-inline static std::string const kFlightReadPath = "read_path";   /// `DoExchange`
-inline static std::string const kFlightScan = "scan";            /// `DoExchange`
-inline static std::string const kFlightMeasure = "measure";      /// `DoExchange`
+inline static std::string const kFlightWrite = "write";                        /// `DoPut`
+inline static std::string const kFlightRead = "read";                          /// `DoExchange`
+inline static std::string const kFlightWritePath = "write_path";               /// `DoPut`
+inline static std::string const kFlightMatchPath = "match_path";               /// `DoExchange`
+inline static std::string const kFlightReadPath = "read_path";                 /// `DoExchange`
+inline static std::string const kFlightScan = "scan";                          /// `DoExchange`
+inline static std::string const kFlightMeasure = "measure";                    /// `DoExchange`
 
 inline static std::string const kArgSnaps = "snapshots";
 inline static std::string const kArgCols = "collections";
@@ -72,6 +74,7 @@ inline static std::string const kArgPrevPatterns = "prev_patterns";
 inline static std::string const kParamCollectionID = "collection_id";
 inline static std::string const kParamCollectionName = "collection_name";
 inline static std::string const kParamSnapshotID = "snapshot_id";
+inline static std::string const kParamSnapshotExportPath = "snapshot_export_path";
 inline static std::string const kParamTransactionID = "transaction_id";
 inline static std::string const kParamReadPart = "part";
 inline static std::string const kParamDropMode = "mode";

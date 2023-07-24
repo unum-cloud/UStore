@@ -8,7 +8,7 @@
  */
 
 #pragma once
-#include <limits> // `std::numeric_limits`
+#include <limits>                // `std::numeric_limits`
 
 #include "ustore/cpp/ranges.hpp" // `strided_iterator_gt`
 #include "ustore/cpp/status.hpp" // `return_error_if_m`
@@ -275,18 +275,6 @@ inline void validate_write(ustore_transaction_t const c_txn,
                           c_error,
                           args_wrong_k,
                           "Can't address NULLs!");
-
-    if (!places.same_collection() || same_collections_are_named(places.collections_begin))
-        return_error_if_m(ustore_supports_named_collections_k,
-                          c_error,
-                          args_wrong_k,
-                          "Current engine does not support named collections!");
-
-    if (c_txn)
-        return_error_if_m(ustore_supports_transactions_k,
-                          c_error,
-                          args_wrong_k,
-                          "Current engine does not support transactions!");
 }
 
 inline void validate_read(ustore_transaction_t const c_txn,
@@ -301,18 +289,6 @@ inline void validate_read(ustore_transaction_t const c_txn,
     return_error_if_m(enum_is_subset(c_options, allowed_options), c_error, args_wrong_k, "Invalid options!");
 
     return_error_if_m(places.keys_begin, c_error, args_wrong_k, "No keys were provided!");
-
-    if (!places.same_collection() || same_collections_are_named(places.collections_begin))
-        return_error_if_m(ustore_supports_named_collections_k,
-                          c_error,
-                          args_wrong_k,
-                          "Current engine does not support named collections!");
-
-    if (c_txn)
-        return_error_if_m(ustore_supports_transactions_k,
-                          c_error,
-                          args_wrong_k,
-                          "Current engine does not support transactions!");
 }
 
 inline void validate_scan(ustore_transaction_t const c_txn,
@@ -328,18 +304,6 @@ inline void validate_scan(ustore_transaction_t const c_txn,
     return_error_if_m(enum_is_subset(c_options, allowed_options), c_error, args_wrong_k, "Invalid options!");
 
     return_error_if_m(args.limits, c_error, args_wrong_k, "Full scans aren't supported - paginate!");
-
-    if (!args.same_collection() || same_collections_are_named(args.collections))
-        return_error_if_m(ustore_supports_named_collections_k,
-                          c_error,
-                          args_wrong_k,
-                          "Current engine does not support named collections!");
-
-    if (c_txn)
-        return_error_if_m(ustore_supports_transactions_k,
-                          c_error,
-                          args_wrong_k,
-                          "Current engine does not support transactions!");
 }
 
 inline void validate_transaction_begin(ustore_transaction_t const c_txn,

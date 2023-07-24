@@ -7,8 +7,9 @@
 #pragma once
 
 #include <limits>            // `std::numeric_limit`
-#include <string>            // `std::string`
 #include <vector>            // `std::vector`
+#include <string>            // `std::string`
+#include <sstream>           // `std::stringstream`
 #include <nlohmann/json.hpp> // `nlohmann::json`
 #include <fmt/format.h>      // `fmt::format`
 
@@ -268,7 +269,7 @@ inline bool config_loader_t::parse_bytes(std::string const& str, size_t& bytes) 
 
     if (!ss.eof())
         return false;
-    if (std::isnan(number) || number > std::numeric_limits<size_t>::max())
+    if (std::isnan(number) || number > static_cast<double>(std::numeric_limits<size_t>::max()))
         return false;
 
     bytes = static_cast<size_t>(number);

@@ -387,9 +387,9 @@ void export_edge_tuples( //
         }
 
         ustore_vertex_degree_t degree = 0;
-        if ((find_edge.role & ustore_vertex_source_k) || (find_edge.role & ustore_vertex_target_k)) {
-            auto ns = neighbors(value, find_edge.role);
-            if constexpr (tuple_size_k != 0) {
+        if (find_edge.role & ustore_vertex_source_k) {
+            auto ns = neighbors(value, ustore_vertex_source_k);
+            if constexpr (tuple_size_k != 0)
                 for (neighborship_t n : ns) {
                     if constexpr (export_center_ak)
                         ids[passed_ids + 0] = find_edge.vertex_id;
@@ -399,7 +399,20 @@ void export_edge_tuples( //
                         ids[passed_ids + export_center_ak + export_neighbor_ak] = n.edge_id;
                     passed_ids += tuple_size_k;
                 }
-            }
+            degree += static_cast<ustore_vertex_degree_t>(ns.size());
+        }
+        if (find_edge.role & ustore_vertex_target_k) {
+            auto ns = neighbors(value, ustore_vertex_target_k);
+            if constexpr (tuple_size_k != 0)
+                for (neighborship_t n : ns) {
+                    if constexpr (export_neighbor_ak)
+                        ids[passed_ids + 0] = n.neighbor_id;
+                    if constexpr (export_center_ak)
+                        ids[passed_ids + export_neighbor_ak] = find_edge.vertex_id;
+                    if constexpr (export_edge_ak)
+                        ids[passed_ids + export_center_ak + export_neighbor_ak] = n.edge_id;
+                    passed_ids += tuple_size_k;
+                }
             degree += static_cast<ustore_vertex_degree_t>(ns.size());
         }
         degrees[i] = degree;
@@ -443,7 +456,8 @@ void pull_and_link_for_updates( //
     for (std::size_t i = 0; i != unique_count; ++i) {
         auto found_binary = found_binaries[i];
         unique_entries[i].content = ustore_bytes_ptr_t(found_binary.data());
-        unique_entries[i].length = found_binary ? static_cast<ustore_length_t>(found_binary.size()) : ustore_length_missing_k;
+        unique_entries[i].length =
+            found_binary ? static_cast<ustore_length_t>(found_binary.size()) : ustore_length_missing_k;
     }
 }
 

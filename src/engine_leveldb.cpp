@@ -15,10 +15,10 @@
 #include <nlohmann/json.hpp>
 
 #include "ustore/db.h"
-#include "ustore/cpp/ranges_args.hpp"   // `places_arg_t`
-#include "helpers/linked_array.hpp"  // `uninitialized_array_gt`
-#include "helpers/full_scan.hpp"     // `reservoir_sample_iterator`
-#include "helpers/config_loader.hpp" // `config_loader_t`
+#include "ustore/cpp/ranges_args.hpp" // `places_arg_t`
+#include "helpers/linked_array.hpp"   // `uninitialized_array_gt`
+#include "helpers/full_scan.hpp"      // `reservoir_sample_iterator`
+#include "helpers/config_loader.hpp"  // `config_loader_t`
 
 using namespace unum::ustore;
 using namespace unum;
@@ -33,9 +33,6 @@ using json_t = nlohmann::json;
 ustore_collection_t const ustore_collection_main_k = 0;
 ustore_length_t const ustore_length_missing_k = std::numeric_limits<ustore_length_t>::max();
 ustore_key_t const ustore_key_unknown_k = std::numeric_limits<ustore_key_t>::max();
-bool const ustore_supports_transactions_k = false;
-bool const ustore_supports_named_collections_k = false;
-bool const ustore_supports_snapshots_k = true;
 
 using level_native_t = leveldb::DB;
 using level_status_t = leveldb::Status;
@@ -69,6 +66,7 @@ struct level_snapshot_t {
 };
 
 struct level_db_t {
+    level_options_t options;
     std::unordered_map<ustore_size_t, level_snapshot_t*> snapshots;
     std::unique_ptr<level_native_t> native;
     std::mutex mutex;
@@ -172,15 +170,13 @@ void ustore_database_init(ustore_database_init_t* c_ptr) {
         if (!config.engine.config.empty())
             fill_options(config.engine.config, options);
 
-        level_db_t* db_ptr = new level_db_t;
+        auto db_ptr = std::make_unique<level_db_t>();
         level_native_t* native_db = nullptr;
         level_status_t status = leveldb::DB::Open(options, root, &native_db);
-        if (!status.ok()) {
-            *c.error = "Couldn't open LevelDB";
-            return;
-        }
+        return_error_if_m(status.ok(), c.error, args_wrong_k, "Couldn't open LevelDB");
         db_ptr->native = std::unique_ptr<level_native_t>(native_db);
-        *c.db = db_ptr;
+        db_ptr->options = options;
+        *c.db = db_ptr.release();
     }
     catch (json_t::type_error const&) {
         *c.error = "Unsupported type in LevelDB configuration key";
@@ -188,6 +184,11 @@ void ustore_database_init(ustore_database_init_t* c_ptr) {
     catch (...) {
         *c.error = "Open Failure";
     }
+}
+
+void ustore_get_metadata(ustore_get_metadata_t* c_ptr) {
+    ustore_get_metadata_t& c = *c_ptr;
+    *c.metadata = ustore_supports_snapshots_k;
 }
 
 void ustore_snapshot_list(ustore_snapshot_list_t* c_ptr) {
@@ -230,8 +231,46 @@ void ustore_snapshot_create(ustore_snapshot_create_t* c_ptr) {
     if (!level_snapshot->snapshot)
         *c.error = "Couldn't get a snapshot!";
 
-    *c.id = reinterpret_cast<std::size_t>(level_snapshot);
+    *c.id = reinterpret_cast<ustore_snapshot_t>(level_snapshot);
     db.snapshots[*c.id] = level_snapshot;
+}
+
+void ustore_snapshot_export(ustore_snapshot_export_t* c_ptr) {
+    ustore_snapshot_export_t& c = *c_ptr;
+    return_error_if_m(c.db, c.error, uninitialized_state_k, "DataBase is uninitialized");
+    level_db_t& db = *reinterpret_cast<level_db_t*>(c.db);
+
+    // Find snapshot
+    leveldb::ReadOptions scan_options;
+    scan_options.fill_cache = false;
+    if (c.id) {
+        auto it = db.snapshots.find(c.id);
+        return_error_if_m(it != db.snapshots.end(), c.error, args_wrong_k, "The snapshot does'nt exist!");
+        level_snapshot_t& snap = *reinterpret_cast<level_snapshot_t*>(c.id);
+        scan_options.snapshot = snap.snapshot;
+    }
+
+    // Create new DB
+    level_native_t* native_db = nullptr;
+    level_status_t status = leveldb::DB::Open(db.options, c.path, &native_db);
+    return_error_if_m(status.ok(), c.error, args_wrong_k, "Couldn't create a new database");
+
+    // Copy all data into new DB
+    try {
+        auto it = level_iter_uptr_t(db.native->NewIterator(scan_options));
+        for (it->SeekToFirst(); it->Valid() & status.ok(); it->Next())
+            status = native_db->Put(leveldb::WriteOptions(), it->key(), it->value());
+    }
+    catch (...) {
+        *c.error = "Fail To Copy Database";
+    }
+
+    // Close
+    delete native_db;
+
+    if (!status.ok())
+        leveldb::DestroyDB(c.path, db.options);
+    export_error(status, c.error);
 }
 
 void ustore_snapshot_drop(ustore_snapshot_drop_t* c_ptr) {
@@ -250,7 +289,7 @@ void ustore_snapshot_drop(ustore_snapshot_drop_t* c_ptr) {
     db.native->ReleaseSnapshot(snap.snapshot);
     snap.snapshot = nullptr;
 
-    auto id = reinterpret_cast<std::size_t>(c.id);
+    auto id = reinterpret_cast<ustore_size_t>(c.id);
     db.mutex.lock();
     db.snapshots.erase(id);
     db.mutex.unlock();

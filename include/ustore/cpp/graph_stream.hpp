@@ -46,6 +46,7 @@ class graph_stream_t {
         graph_find_edges.transaction = transaction_;
         graph_find_edges.snapshot = snapshot_;
         graph_find_edges.arena = arena_.member_ptr();
+        graph_find_edges.options = ustore_option_dont_discard_memory_k;
         graph_find_edges.tasks_count = vertices.count();
         graph_find_edges.collections = &collection_;
         graph_find_edges.vertices = vertices.begin().get();

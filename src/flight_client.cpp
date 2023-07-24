@@ -11,7 +11,7 @@
 #include <mutex>       // `std::mutex`
 #include <string_view> // `std::string_view`
 
-#include <fmt/core.h> // `fmt::format_to`
+#include <fmt/core.h>  // `fmt::format_to`
 #include <arrow/c/abi.h>
 #include <arrow/flight/client.h>
 #include <arrow/array/array_binary.h>
@@ -29,9 +29,6 @@
 ustore_collection_t const ustore_collection_main_k = 0;
 ustore_length_t const ustore_length_missing_k = std::numeric_limits<ustore_length_t>::max();
 ustore_key_t const ustore_key_unknown_k = std::numeric_limits<ustore_key_t>::max();
-bool const ustore_supports_transactions_k = true;
-bool const ustore_supports_named_collections_k = true;
-bool const ustore_supports_snapshots_k = true;
 
 /*********************************************************/
 /*****************	 C++ Implementation	  ****************/
@@ -45,6 +42,7 @@ struct rpc_client_t {
     std::vector<std::unique_ptr<arf::FlightStreamReader>> readers;
     linked_memory_t arena;
     std::mutex arena_lock;
+    ustore_metadata_t metadata;
 };
 
 arf::FlightCallOptions arrow_call_options(arrow_mem_pool_t& pool) {
@@ -79,7 +77,7 @@ void ustore_database_init(ustore_database_init_t* c_ptr) {
         if (!c.config || !std::strlen(c.config))
             c.config = "grpc://0.0.0.0:38709";
 
-        auto db_ptr = new rpc_client_t {};
+        auto db_ptr = std::make_unique<rpc_client_t>();
         auto maybe_location = arf::Location::Parse(c.config);
         return_error_if_m(maybe_location.ok(), c.error, args_wrong_k, "Server URI");
 
@@ -89,8 +87,24 @@ void ustore_database_init(ustore_database_init_t* c_ptr) {
         linked_memory(reinterpret_cast<ustore_arena_t*>(&db_ptr->arena), ustore_option_dont_discard_memory_k, c.error);
         return_error_if_m(maybe_location.ok(), c.error, args_wrong_k, "Failed to allocate default arena.");
         db_ptr->flight = maybe_flight_ptr.MoveValueUnsafe();
-        *c.db = db_ptr;
+
+        arf::Ticket ticket {kFlightRetrieveMetadata};
+        auto maybe_stream = db_ptr->flight->DoGet(ticket);
+        return_error_if_m(maybe_stream.ok(), c.error, network_k, "Failed to act on Arrow server");
+        auto& stream_ptr = maybe_stream.ValueUnsafe();
+        auto maybe_table = stream_ptr->ToTable();
+        return_error_if_m(maybe_table.ok(), c.error, error_unknown_k, "Failed to create table");
+        auto table = maybe_table.ValueUnsafe();
+        auto array = std::static_pointer_cast<ar::NumericArray<ar::Int8Type>>(table->column(0)->chunk(0));
+        db_ptr->metadata = ustore_metadata_t(array->Value(0));
+        *c.db = db_ptr.release();
     });
+}
+
+void ustore_get_metadata(ustore_get_metadata_t* c_ptr) {
+    ustore_get_metadata_t& c = *c_ptr;
+    rpc_client_t& db = *reinterpret_cast<rpc_client_t*>(c.db);
+    *c.metadata = db.metadata;
 }
 
 void ustore_read(ustore_read_t* c_ptr) {
@@ -117,7 +131,7 @@ void ustore_read(ustore_read_t* c_ptr) {
     bool const same_named_collection = same_collection && same_collections_are_named(places.collections_begin);
     bool const request_only_presences = c.presences && !c.lengths && !c.values;
     bool const request_only_lengths = c.lengths && !c.values;
-    char const* partial_mode = request_only_presences //
+    char const* partial_mode = request_only_presences     //
                                    ? kParamReadPartPresences.c_str()
                                    : request_only_lengths //
                                          ? kParamReadPartLengths.c_str()
@@ -843,7 +857,7 @@ void ustore_paths_read(ustore_paths_read_t* c_ptr) {
     bool const same_named_collection = same_collection && same_collections_are_named(places.collections_begin);
     bool const request_only_presences = c.presences && !c.lengths && !c.values;
     bool const request_only_lengths = c.lengths && !c.values;
-    char const* partial_mode = request_only_presences //
+    char const* partial_mode = request_only_presences     //
                                    ? kParamReadPartPresences.c_str()
                                    : request_only_lengths //
                                          ? kParamReadPartLengths.c_str()
@@ -1492,6 +1506,33 @@ void ustore_snapshot_create(ustore_snapshot_create_t* c_ptr) {
     std::memcpy(c.id, id_ptr->body->data(), sizeof(ustore_snapshot_t));
 }
 
+void ustore_snapshot_export(ustore_snapshot_export_t* c_ptr) {
+    ustore_snapshot_export_t& c = *c_ptr;
+    return_error_if_m(c.db, c.error, uninitialized_state_k, "DataBase is uninitialized");
+
+    try {
+        rpc_client_t& db = *reinterpret_cast<rpc_client_t*>(c.db);
+
+        arf::Action action;
+        fmt::format_to(std::back_inserter(action.type),
+                       "{}?{}={}{}={}",
+                       kFlightSnapExport,
+                       kParamSnapshotID,
+                       c.id,
+                       kParamSnapshotExportPath,
+                       c.path);
+
+        std::lock_guard<std::mutex> lk(db.arena_lock);
+        arrow_mem_pool_t pool(db.arena);
+        arf::FlightCallOptions options = arrow_call_options(pool);
+        ar::Result<std::unique_ptr<arf::ResultStream>> maybe_stream = db.flight->DoAction(options, action);
+        return_error_if_m(maybe_stream.ok(), c.error, network_k, "Failed to act on Arrow server");
+    }
+    catch (...) {
+        *c.error = "Snapshot Export Failure";
+    }
+}
+
 void ustore_snapshot_drop(ustore_snapshot_drop_t* c_ptr) {
     ustore_snapshot_drop_t& c = *c_ptr;
     return_error_if_m(c.db, c.error, uninitialized_state_k, "DataBase is uninitialized");
@@ -1499,7 +1540,7 @@ void ustore_snapshot_drop(ustore_snapshot_drop_t* c_ptr) {
     rpc_client_t& db = *reinterpret_cast<rpc_client_t*>(c.db);
 
     arf::Action action;
-    fmt::format_to(std::back_inserter(action.type), "{}?{}={}", kFlightSnapCreate, kParamSnapshotID, c.id);
+    fmt::format_to(std::back_inserter(action.type), "{}?{}={}", kFlightSnapDrop, kParamSnapshotID, c.id);
 
     std::lock_guard<std::mutex> lk(db.arena_lock);
     arrow_mem_pool_t pool(db.arena);

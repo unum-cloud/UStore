@@ -68,7 +68,7 @@ class docs_ref_gt {
   protected:
     ustore_database_t db_ = nullptr;
     ustore_transaction_t transaction_ = nullptr;
-    ustore_snapshot_t snapshot_ = nullptr;
+    ustore_snapshot_t snapshot_ = {};
     ustore_arena_t* arena_ = nullptr;
     locations_store_t locations_;
     ustore_doc_field_type_t type_ = ustore_doc_field_default_k;

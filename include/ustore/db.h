@@ -217,6 +217,18 @@ typedef enum {
 } ustore_drop_mode_t;
 
 /**
+ * @brief The "metadata support types".
+ */
+typedef enum {
+    /** @brief DataBase supports transactions. */
+    ustore_supports_transactions_k = 1,
+    /** @brief DataBase supports named collections. */
+    ustore_supports_named_collections_k = 2,
+    /** @brief DataBase supports snapshots. */
+    ustore_supports_snapshots_k = 4,
+} ustore_metadata_t;
+
+/**
  * @brief The handle to the default nameless collection.
  * It exists from start, doesn't have to be created and can't be fully dropped.
  * Only `::ustore_drop_keys_vals_k` and `::ustore_drop_vals_k` apply to it.
@@ -224,10 +236,6 @@ typedef enum {
 extern ustore_collection_t const ustore_collection_main_k;
 extern ustore_length_t const ustore_length_missing_k;
 extern ustore_key_t const ustore_key_unknown_k;
-
-extern bool const ustore_supports_transactions_k;
-extern bool const ustore_supports_named_collections_k;
-extern bool const ustore_supports_snapshots_k;
 
 /*********************************************************/
 /*****************	 Primary Functions	  ****************/
@@ -266,6 +274,24 @@ typedef struct ustore_database_init_t {
  * @see `ustore_database_init()`.
  */
 void ustore_database_init(ustore_database_init_t*);
+
+typedef struct ustore_get_metadata_t {
+    /// @{
+
+    /** @brief Already open database instance. */
+    ustore_database_t db;
+    /** @brief Pointer to exported error message. */
+    ustore_error_t* error;
+    /** @brief Output for the metadata. */
+    ustore_metadata_t* metadata;
+    /// @}
+} ustore_get_metadata_t;
+
+/**
+ * @brief Retrive Metadata
+ * @see `ustore_metadata_t`.
+ */
+void ustore_get_metadata(ustore_get_metadata_t*);
 
 /*********************************************************/
 /***************** Snapshot Management  ****************/
@@ -321,6 +347,19 @@ typedef struct ustore_snapshot_create_t {
 } ustore_snapshot_create_t;
 
 void ustore_snapshot_create(ustore_snapshot_create_t*);
+
+typedef struct ustore_snapshot_export_t {
+    /** @brief Already open database instance. */
+    ustore_database_t db;
+    /** @brief Pointer to exported error message. */
+    ustore_error_t* error;
+    /** @brief Snapshot id. */
+    ustore_snapshot_t id;
+    /** @brief The specified directory path. */
+    ustore_str_view_t path;
+} ustore_snapshot_export_t;
+
+void ustore_snapshot_export(ustore_snapshot_export_t*);
 
 typedef struct ustore_snapshot_drop_t {
     /** @brief Already open database instance. */

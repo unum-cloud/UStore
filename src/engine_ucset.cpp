@@ -28,17 +28,17 @@
 #include <ucset/consistent_set.hpp> // `ucset::consistent_set_gt`
 #include <ucset/locked.hpp>         // `ucset::locked_gt`
 
-#include <nlohmann/json.hpp>       // `nlohmann::json`
-#include <arrow/io/file.h>         // `arrow::io::ReadableFile`
-#include <parquet/stream_reader.h> // `parquet::StreamReader`
-#include <parquet/stream_writer.h> // `parquet::StreamWriter`
+#include <nlohmann/json.hpp>        // `nlohmann::json`
+#include <arrow/io/file.h>          // `arrow::io::ReadableFile`
+#include <parquet/stream_reader.h>  // `parquet::StreamReader`
+#include <parquet/stream_writer.h>  // `parquet::StreamWriter`
 
 #include "ustore/db.h"
 #include "helpers/file.hpp"
-#include "helpers/linked_memory.hpp" // `linked_memory_t`
-#include "helpers/linked_array.hpp"  // `unintialized_vector_gt`
-#include "helpers/config_loader.hpp" // `config_loader_t`
-#include "ustore/cpp/ranges_args.hpp"   // `places_arg_t`
+#include "helpers/linked_memory.hpp"  // `linked_memory_t`
+#include "helpers/linked_array.hpp"   // `unintialized_vector_gt`
+#include "helpers/config_loader.hpp"  // `config_loader_t`
+#include "ustore/cpp/ranges_args.hpp" // `places_arg_t`
 
 /*********************************************************/
 /*****************   Structures & Consts  ****************/
@@ -47,9 +47,6 @@
 ustore_collection_t const ustore_collection_main_k = 0;
 ustore_length_t const ustore_length_missing_k = std::numeric_limits<ustore_length_t>::max();
 ustore_key_t const ustore_key_unknown_k = std::numeric_limits<ustore_key_t>::max();
-bool const ustore_supports_transactions_k = true;
-bool const ustore_supports_named_collections_k = true;
-bool const ustore_supports_snapshots_k = false;
 
 /*********************************************************/
 /*****************	 C++ Implementation	  ****************/
@@ -430,7 +427,7 @@ void ustore_database_init(ustore_database_init_t* c_ptr) {
         auto maybe_pairs = ucset_t::make();
         return_error_if_m(maybe_pairs, c.error, error_unknown_k, "Couldn't build consistent set");
         auto db = database_t(std::move(maybe_pairs).value());
-        auto db_ptr = std::make_unique<database_t>(std::move(db)).release();
+        auto db_ptr = std::make_unique<database_t>(std::move(db));
 
         if (c.config && std::strlen(c.config) > 0) {
             // Load config
@@ -477,23 +474,33 @@ void ustore_database_init(ustore_database_init_t* c_ptr) {
             db_ptr->persisted_directory = root;
             read(*db_ptr, db_ptr->persisted_directory, c.error);
         }
-        *c.db = db_ptr;
+        *c.db = db_ptr.release();
     });
+}
+
+void ustore_get_metadata(ustore_get_metadata_t* c_ptr) {
+    ustore_get_metadata_t& c = *c_ptr;
+    *c.metadata = ustore_metadata_t(ustore_supports_transactions_k | ustore_supports_named_collections_k);
 }
 
 void ustore_snapshot_list(ustore_snapshot_list_t* c_ptr) {
     ustore_snapshot_list_t& c = *c_ptr;
-    *c.count = 0;
-    if (c.ids)
-        *c.ids = nullptr;
+    *c.error = "Snapshots not supported by UCSet!";
 }
 
-void ustore_snapshot_create(ustore_snapshot_create_t*) {
-    // TODO
+void ustore_snapshot_create(ustore_snapshot_create_t* c_ptr) {
+    ustore_snapshot_create_t& c = *c_ptr;
+    *c.error = "Snapshots not supported by UCSet!";
 }
 
-void ustore_snapshot_drop(ustore_snapshot_drop_t*) {
-    // TODO
+void ustore_snapshot_export(ustore_snapshot_export_t* c_ptr) {
+    ustore_snapshot_export_t& c = *c_ptr;
+    *c.error = "Snapshots not supported by UCSet!";
+}
+
+void ustore_snapshot_drop(ustore_snapshot_drop_t* c_ptr) {
+    ustore_snapshot_drop_t& c = *c_ptr;
+    *c.error = "Snapshots not supported by UCSet!";
 }
 
 void ustore_read(ustore_read_t* c_ptr) {
@@ -692,7 +699,7 @@ struct key_from_pair_t {
     key_from_pair_t& operator=(pair_t const& pair) {
         *key_ptr = pair.collection_key.key;
         return *this;
-    };
+    }
 };
 
 struct key_iterator_t {
@@ -704,7 +711,7 @@ struct key_iterator_t {
 
     ustore_key_t* begin_;
     key_iterator_t(ustore_key_t* key) : begin_(key) {}
-    key_from_pair_t operator[](std::size_t idx) { return &begin_[idx]; };
+    key_from_pair_t operator[](std::size_t idx) { return &begin_[idx]; }
 };
 
 void ustore_sample(ustore_sample_t* c_ptr) {

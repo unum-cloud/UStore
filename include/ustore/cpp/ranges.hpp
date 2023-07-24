@@ -97,6 +97,8 @@ class strided_iterator_gt {
     bool operator!=(strided_iterator_gt const& other) const noexcept { return raw_ != other.raw_; }
     bool operator<(strided_iterator_gt const& other) const noexcept { return raw_ < other.raw_; }
     bool operator>(strided_iterator_gt const& other) const noexcept { return raw_ > other.raw_; }
+    bool operator<=(strided_iterator_gt const& other) const noexcept { return raw_ <= other.raw_; }
+    bool operator>=(strided_iterator_gt const& other) const noexcept { return raw_ >= other.raw_; }
 
     template <typename member_at, typename parent_at = element_t>
     auto members(member_at parent_at::*member_ptr) const noexcept {
@@ -281,6 +283,7 @@ struct indexed_range_gt {
     indexed_range_gt(pointer_t begin, pointer_t end) noexcept : begin_(begin), end_(end) {}
     indexed_range_gt(pointer_t ptr, std::size_t sz) noexcept : begin_(ptr), end_(ptr + sz) {}
 
+    pointer_t data() const noexcept { return begin_; }
     pointer_t begin() const noexcept { return begin_; }
     pointer_t end() const noexcept { return end_; }
     decltype(auto) operator[](std::size_t i) noexcept { return begin_[i]; }
