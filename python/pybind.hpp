@@ -18,7 +18,10 @@ struct py_db_t;
 struct py_transaction_t;
 struct py_collection_t;
 
-struct py_graph_t;
+typedef enum { graph_k = 0, digraph_k = 1, multigraph_k = 2, multidigraph_k = 3 } graph_type_t;
+template <graph_type_t>
+struct py_graph_gt;
+
 struct py_table_collection_t;
 
 struct py_task_ctx_t;
@@ -84,7 +87,7 @@ struct py_collection_gt {
     ustore_options_t options() noexcept {
         auto base = ustore_options_default_k;
         return py_txn_ptr ? static_cast<ustore_options_t>( //
-                                base |                  //
+                                base |                     //
                                 (py_txn_ptr->dont_watch ? ustore_option_transaction_dont_watch_k : base) |
                                 (py_txn_ptr->flush_writes ? ustore_option_write_flush_k : base))
                           : base;
@@ -113,7 +116,8 @@ struct py_buffer_memory_t {
     Py_ssize_t strides[4];
 };
 
-struct py_graph_t : public std::enable_shared_from_this<py_graph_t> {
+template <graph_type_t type_ak>
+struct py_graph_gt : public std::enable_shared_from_this<py_graph_gt<type_ak>> {
 
     std::shared_ptr<py_db_t> py_db_ptr;
     std::shared_ptr<py_transaction_t> py_txn_ptr;
@@ -121,22 +125,23 @@ struct py_graph_t : public std::enable_shared_from_this<py_graph_t> {
     blobs_collection_t index;
     docs_collection_t vertices_attrs;
     docs_collection_t relations_attrs;
+    ustore_key_t key_ = 0;
 
     bool in_txn {false};
-    bool is_directed {false};
-    bool is_multi {false};
-    bool allow_self_loops {false};
+    graph_type_t type {type_ak};
 
     py_buffer_memory_t last_buffer;
 
-    py_graph_t() {}
-    py_graph_t(py_graph_t&&) = delete;
-    py_graph_t(py_graph_t const&) = delete;
-    ~py_graph_t() {}
+    py_graph_gt() {}
+    py_graph_gt(py_graph_gt&&) = delete;
+    py_graph_gt(py_graph_gt const&) = delete;
+    ~py_graph_gt() {}
 
     graph_collection_t ref() {
         return graph_collection_t(index.db(), index, index.txn(), index.snap(), index.member_arena());
     }
+
+    ustore_key_t get_key() { return key_++; }
 };
 
 struct py_table_keys_range_t {
@@ -294,7 +299,8 @@ void wrap_database(py::module&);
  * - Implement subgraph selection
  * - Implement attributes
  */
-void wrap_networkx(py::module&);
+template <graph_type_t>
+void wrap_networkx(py::module&, std::string const&);
 
 /**
  * @brief Python bindings for a Document Store, that mimics Pandas.

@@ -322,7 +322,8 @@ struct parsed_adjacency_list_t {
                 edge_t result;
                 result.source_id = py_to_scalar<ustore_key_t>(PyTuple_GetItem(obj, 0));
                 result.target_id = py_to_scalar<ustore_key_t>(PyTuple_GetItem(obj, 1));
-                result.id = columns == 3 ? py_to_scalar<ustore_key_t>(PyTuple_GetItem(obj, 2)) : ustore_default_edge_id_k;
+                result.id =
+                    columns == 3 ? py_to_scalar<ustore_key_t>(PyTuple_GetItem(obj, 2)) : ustore_default_edge_id_k;
                 return result;
             };
             py_transform_n(adjacency_list, to_edge, std::back_inserter(edges_vec));

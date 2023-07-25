@@ -76,14 +76,14 @@ py::object sample(py_blobs_collection_t& py_collection, std::size_t count) {
     ArrowArray c_arrow_array;
     ustore_to_arrow_schema(count, 0, &c_arrow_schema, &c_arrow_array, status.member_ptr());
     ustore_to_arrow_column(count,
-                        "samples",
-                        ustore_doc_field_i64_k,
-                        nullptr,
-                        nullptr,
-                        samples.begin(),
-                        &c_arrow_schema,
-                        &c_arrow_array,
-                        status.member_ptr());
+                           "samples",
+                           ustore_doc_field_i64_k,
+                           nullptr,
+                           nullptr,
+                           samples.begin(),
+                           &c_arrow_schema,
+                           &c_arrow_array,
+                           status.member_ptr());
 
     arrow::Result<std::shared_ptr<arrow::Array>> array = arrow::ImportArray(&c_arrow_array, &c_arrow_schema);
     PyObject* array_python = arrow::py::wrap_array(array.ValueOrDie());
@@ -97,6 +97,16 @@ auto iterate(range_at& range) {
     native_t stream = range.begin();
     wrap_t wrap {std::move(stream), range.members.max_key()};
     return std::make_unique<wrap_t>(std::move(wrap));
+}
+
+template <graph_type_t type_ak>
+auto create_graph(py_blobs_collection_t& py_collection) {
+    auto py_graph = std::make_shared<py_graph_gt<type_ak>>();
+    py_graph->py_db_ptr = py_collection.py_db_ptr;
+    py_graph->py_txn_ptr = py_collection.py_txn_ptr;
+    py_graph->in_txn = py_collection.in_txn;
+    py_graph->index = py_collection.native;
+    return py::cast(py_graph);
 }
 
 void ustore::wrap_database(py::module& m) {
@@ -263,14 +273,10 @@ void ustore::wrap_database(py::module& m) {
         [](py_db_t& py_db, std::string const& name) { py_db.native.drop(name.c_str()).throw_unhandled(); },
         py::arg("collection"));
 
-    py_collection.def_property_readonly("graph", [](py_blobs_collection_t& py_collection) {
-        auto py_graph = std::make_shared<py_graph_t>();
-        py_graph->py_db_ptr = py_collection.py_db_ptr;
-        py_graph->py_txn_ptr = py_collection.py_txn_ptr;
-        py_graph->in_txn = py_collection.in_txn;
-        py_graph->index = py_collection.native;
-        return py::cast(py_graph);
-    });
+    py_collection.def_property_readonly("graph", &create_graph<graph_k>);
+    py_collection.def_property_readonly("digraph", &create_graph<digraph_k>);
+    py_collection.def_property_readonly("multigraph", &create_graph<multigraph_k>);
+    py_collection.def_property_readonly("multidigraph", &create_graph<multidigraph_k>);
     py_collection.def_property_readonly("table", [](py_blobs_collection_t& py_collection) {
         auto py_table = std::make_shared<py_table_collection_t>();
         py_table->binary = py_collection.native;

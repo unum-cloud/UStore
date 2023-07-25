@@ -59,6 +59,9 @@ PYBIND11_MODULE(USTORE_PYTHON_MODULE_NAME, m) {
 
     wrap_database(m);
     wrap_pandas(m);
-    wrap_networkx(m);
+    wrap_networkx<graph_k>(m, "Graph");
+    wrap_networkx<digraph_k>(m, "DiGraph");
+    wrap_networkx<multigraph_k>(m, "MultiGraph");
+    wrap_networkx<multidigraph_k>(m, "MultiDiGraph");
     wrap_document(m);
 }
