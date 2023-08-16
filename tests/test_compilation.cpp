@@ -9,6 +9,7 @@
 #include <array>
 #include <vector>
 
+#include <fmt/core.h>
 #include <nlohmann/json.hpp>
 
 #include "ustore/ustore.hpp"
@@ -20,10 +21,31 @@ using namespace unum;
 #define macro_concat(prefix, suffix) macro_concat_(prefix, suffix)
 #define _ [[maybe_unused]] auto macro_concat(_, __LINE__)
 
+static char const* path() {
+    char* path = std::getenv("USTORE_TEST_PATH");
+    if (path)
+        return std::strlen(path) ? path : nullptr;
+
+#if defined(USTORE_FLIGHT_CLIENT)
+    return nullptr;
+#elif defined(USTORE_TEST_PATH)
+    return USTORE_TEST_PATH;
+#else
+    return nullptr;
+#endif
+}
+
+static std::string config() {
+    auto dir = path();
+    if (!dir)
+        return {};
+    return fmt::format(R"({{"version": "1.0", "directory": "{}"}})", dir);
+}
+
 int main(int argc, char** argv) {
 
     database_t db;
-    _ = db.open();
+    _ = db.open(config().c_str());
 
     // Try getting the main collection
     _ = db.main();

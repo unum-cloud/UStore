@@ -82,7 +82,7 @@ TEST(db, validation) {
         EXPECT_TRUE(status);
     }
 
-    if (!ustore_supports_named_collections_k) {
+    if (!db.supports_named_collections()) {
         ustore_collection_t collections[count] = {1, 2, 3};
         ustore_write_t write {
             .db = db,
@@ -167,7 +167,7 @@ TEST(db, validation) {
     // Named Collection
     ustore_write(&write_named);
 
-    if (ustore_supports_named_collections_k)
+    if (db.supports_named_collections())
         EXPECT_TRUE(status);
     else {
         EXPECT_FALSE(status);
@@ -193,7 +193,7 @@ TEST(db, validation) {
 
     ustore_write(&write);
 
-    if (ustore_supports_transactions_k)
+    if (db.supports_transactions())
         EXPECT_TRUE(status);
     else {
         EXPECT_FALSE(status);

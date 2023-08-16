@@ -1,15 +1,15 @@
-#include <fcntl.h>    // `open` files
-#include <sys/stat.h> // `stat` to obtain file metadata
-#include <sys/mman.h> // `mmap` to read datasets faster
+#include <fcntl.h>      // `open` files
+#include <sys/stat.h>   // `stat` to obtain file metadata
+#include <sys/mman.h>   // `mmap` to read datasets faster
 
-#include <cstring>     // `std::memchr`
-#include <algorithm>   // `std::search`
-#include <filesystem>  // Listing directories is too much pain in C
-#include <string_view> //
-#include <vector>      //
-#include <thread>      //
-#include <random>      // `std::random_device` for each thread
-#include <fstream>     // `std::ifstream`, `std::istreambuf_iterator`
+#include <cstring>      // `std::memchr`
+#include <algorithm>    // `std::search`
+#include <filesystem>   // Listing directories is too much pain in C
+#include <string_view>  //
+#include <vector>       //
+#include <thread>       //
+#include <random>       // `std::random_device` for each thread
+#include <fstream>      // `std::ifstream`, `std::istreambuf_iterator`
 
 #include <fmt/printf.h> // `fmt::sprintf`
 #include <benchmark/benchmark.h>
@@ -96,7 +96,7 @@ void parse_args(int argc, char* argv[], settings_t& settings) {
     program.add_argument("-t", "--threads")
         .default_value(std::to_string((std::thread::hardware_concurrency() / 2)))
         .help("Threads count");
-    program.add_argument("-tw", "--max_tweets_count").default_value("1'000'000").help("Maximum tweets count");
+    program.add_argument("-tw", "--max_tweets_count").default_value("1000000").help("Maximum tweets count");
     program.add_argument("-i", "--max_input_files").default_value("1000").help("Maximum input files count");
     program.add_argument("-c", "--con_factor").default_value("4").help("Connectivity factor");
     program.add_argument("-n", "--min_seconds").default_value("10").help("Minimal seconds");
@@ -378,6 +378,60 @@ void sample_tweet_id_batches(bm::State& state, callback_at callback) {
     state.counters["items/s"] = bm::Counter(iterations * batch_size, bm::Counter::kIsRate);
     state.counters["batches/s"] = bm::Counter(iterations, bm::Counter::kIsRate);
     state.counters["fails,%"] = bm::Counter((iterations - successes) * 100.0, bm::Counter::kAvgThreads);
+}
+
+template <typename callback_at>
+void native_sample(bm::State& state, callback_at callback) {
+
+    auto const batch_size = static_cast<ustore_size_t>(state.range(0));
+    std::vector<ustore_key_t> batch_keys(batch_size);
+
+    std::size_t iterations = 0;
+    std::size_t successes = 0;
+    for (auto _ : state) {
+        successes += callback(batch_size);
+        iterations++;
+    }
+
+    state.counters["items/s"] = bm::Counter(iterations * batch_size, bm::Counter::kIsRate);
+    state.counters["batches/s"] = bm::Counter(iterations, bm::Counter::kIsRate);
+    state.counters["fails,%"] = bm::Counter((iterations - successes) * 100.0, bm::Counter::kAvgThreads);
+}
+
+static void docs_sample_keys(bm::State& state) {
+
+    arena_t arena(db);
+
+    std::size_t received_bytes = 0;
+    native_sample(state, [&](ustore_size_t count) {
+        ustore_length_t limit_count = 1;
+        ustore_length_t* found_offsets = nullptr;
+        ustore_length_t* found_counts = nullptr;
+        ustore_key_t* found_keys = nullptr;
+
+        status_t status;
+        ustore_sample_t sample {};
+        sample.db = db;
+        sample.error = status.member_ptr();
+        sample.arena = arena.member_ptr();
+        sample.tasks_count = count;
+        sample.collections = &collection_docs_k;
+        sample.count_limits = &limit_count;
+        sample.count_limits_stride = 0;
+        sample.offsets = &found_offsets;
+        sample.counts = &found_counts;
+        sample.keys = &found_keys;
+
+        ustore_sample(&sample);
+        if (!status)
+            return false;
+
+        received_bytes += found_offsets[count];
+        return true;
+    });
+
+    state.counters["bytes/s"] = bm::Counter(received_bytes, bm::Counter::kIsRate);
+    state.counters["bytes/it"] = bm::Counter(received_bytes, bm::Counter::kAvgIterations);
 }
 
 static void docs_sample_blobs(bm::State& state) {
@@ -734,13 +788,15 @@ int main(int argc, char** argv) {
     db.open(R"({"version": "1.0", "directory": "/mnt/md0/Twitter/RocksDB"})").throw_unhandled();
 #elif defined(USTORE_ENGINE_IS_UDISK)
     db.open(R"({"version": "1.0", "directory": "/mnt/md0/Twitter/UnumDB"})").throw_unhandled();
+#elif defined(USTORE_ENGINE_IS_UCSET)
+    db.open(R"({"version": "1.0", "directory": "/mnt/md0/Twitter/UCSet"})").throw_unhandled();
 #else
     db.open().throw_unhandled();
 #endif
 
     bool can_build_graph = false;
     bool can_build_paths = false;
-    if (ustore_supports_named_collections_k) {
+    if (db.supports_named_collections()) {
         status_t status;
         ustore_collection_create_t collection_init {};
         collection_init.db = db;
@@ -766,11 +822,12 @@ int main(int argc, char** argv) {
     }
 
     std::printf("Will benchmark...\n");
-    bm::RegisterBenchmark("construct_docs", &construct_docs) //
-        ->Iterations(pass_through_size(dataset_docs) / (settings.threads_count * settings.big_batch_size))
-        ->UseRealTime()
-        ->Threads(settings.threads_count)
-        ->Arg(settings.big_batch_size);
+    if (db.supports_transactions())
+        bm::RegisterBenchmark("construct_docs", &construct_docs) //
+            ->Iterations(pass_through_size(dataset_docs) / (settings.threads_count * settings.big_batch_size))
+            ->UseRealTime()
+            ->Threads(settings.threads_count)
+            ->Arg(settings.big_batch_size);
 
     if (can_build_graph)
         bm::RegisterBenchmark("construct_graph", &construct_graph) //
@@ -794,6 +851,14 @@ int main(int argc, char** argv) {
             ->Arg(settings.small_batch_size)
             ->Arg(settings.mid_batch_size)
             ->Arg(settings.big_batch_size);
+
+    bm::RegisterBenchmark("docs_sample_keys", &docs_sample_keys) //
+        ->MinTime(settings.min_seconds)
+        ->UseRealTime()
+        ->Threads(settings.threads_count)
+        ->Arg(settings.small_batch_size)
+        ->Arg(settings.mid_batch_size)
+        ->Arg(settings.big_batch_size);
 
     bm::RegisterBenchmark("docs_sample_objects", &docs_sample_objects) //
         ->MinTime(settings.min_seconds)
@@ -836,6 +901,9 @@ int main(int argc, char** argv) {
 
     // Clear DB after benchmark
     db.clear().throw_unhandled();
+
+    // Close DB
+    db.close();
 
     return 0;
 }

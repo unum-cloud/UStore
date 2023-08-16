@@ -51,6 +51,10 @@ template <std::size_t threads_count_ak, std::size_t batch_size_ak, std::size_t d
 void insert_atomic_isolated(std::size_t count_batches) {
     database_t db;
     EXPECT_TRUE(db.open(config().c_str()));
+    if (!db.supports_transactions()) {
+        std::printf("Selected UStore Engine doesn't support ACID transactions\n");
+        return;
+    }
     EXPECT_TRUE(db.clear());
 
     auto task = [&](size_t thread_idx) {
@@ -117,11 +121,6 @@ TEST(db, inserts_and_deletes) {
 }
 
 int main(int argc, char** argv) {
-
-    if (!ustore_supports_transactions_k) {
-        std::printf("Selected UStore Engine doesn't support ACID transactions\n");
-        return 1;
-    }
 
     if (path() && std::strlen(path())) {
         std::filesystem::remove_all(path());

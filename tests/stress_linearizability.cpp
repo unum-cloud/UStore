@@ -324,10 +324,13 @@ class test_one_config_t : public testing::Test {
 
 int main(int argc, char** argv) {
 
-    if (!ustore_supports_transactions_k) {
+    database_t db;
+    db.open(path());
+    if (!db.supports_transactions()) {
         std::printf("Selected UStore Engine doesn't support ACID transactions\n");
         return 1;
     }
+    db.close();
 
     if (path() && std::strlen(path())) {
         std::filesystem::remove_all(path());
