@@ -24,7 +24,7 @@ RUN cmake \
     -DUSTORE_BUILD_ENGINE_ROCKSDB=1 \
     -DUSTORE_BUILD_API_FLIGHT_CLIENT=0 \
     -DUSTORE_BUILD_API_FLIGHT_SERVER=1 . && \
-    make -j32 \
+    make -j \
     ustore_flight_server_ucset \
     ustore_flight_server_leveldb \
     ustore_flight_server_rocksdb

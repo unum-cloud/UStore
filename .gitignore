@@ -64,3 +64,6 @@ package-lock.json
 
 # Allow
 !gradle/wrapper/gradle-wrapper.jar
+
+# Sphinx Theme:
+www.unum.cloud-furo

@@ -9,6 +9,27 @@ We split tests into:
 
 The in-memory embedded variant is generally used for debugging any non-engine level logic validation.
 
+## Compilation
+
+Before testing specific parts, you may want to check that the compilation passes entirely for all the optional parts of UStore.
+
+```sh
+cmake \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DUSTORE_BUILD_BENCHMARKS=1 \
+    -DUSTORE_BUILD_TOOLS=1 \
+    -DUSTORE_BUILD_TESTS=1 \
+    -DUSTORE_BUILD_BUNDLES=1 \
+    -DUSTORE_BUILD_SANITIZE=1 \
+    -DUSTORE_BUILD_ENGINE_UCSET=1 \
+    -DUSTORE_BUILD_ENGINE_LEVELDB=1 \
+    -DUSTORE_BUILD_ENGINE_ROCKSDB=1 \
+    -DUSTORE_BUILD_API_FLIGHT=1 \
+    -DUSTORE_USE_JEMALLOC=1 \
+    -B ./build_release && \
+    make -j -C ./build_release
+```
+
 ## Unit Tests
 
 Unit tests are small and generally challenge just one functionality.
@@ -22,7 +43,7 @@ cmake \
     -DUSTORE_BUILD_TESTS=1 \
     -DUSTORE_BUILD_ENGINE_ROCKSDB=1 \
     -B ./build_release && \
-    make -j 12 -C ./build_release
+    make -j -C ./build_release
 ```
 
 Primary unit tests are in one file - [`test_units.cpp`](https://github.com/unum-cloud/ustore/blob/main/tests/test_units.cpp).

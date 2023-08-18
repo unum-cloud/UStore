@@ -297,7 +297,7 @@
             "miDebuggerPath": "/usr/bin/gdb"
         },
         {
-            "name": "C++: Test Arrow Client",
+            "name": "C++: Test Arrow Client Server",
             "type": "cppdbg",
             "request": "launch",
             "program": "${workspaceFolder}/build_debug/build/bin/test_units_ustore_flight_client",
@@ -305,12 +305,17 @@
                 "--gtest_break_on_failure",
                 "--gtest_catch_exceptions=0"
             ],
+            "environment": [
+                {
+                    "name": "USTORE_ENGINE_NAME",
+                    "value": "${input:USTORE_ENGINE_NAME}"
+                }
+            ],
             "cwd": "${workspaceFolder}",
-            "environment": [],
             "showDisplayString": true,
             "stopAtEntry": false,
             "externalConsole": false,
-            "preLaunchTask": "Build Debug Arrow Client",
+            "preLaunchTask": "Build Debug Arrow Client Server",
             "MIMode": "gdb",
             "miDebuggerPath": "/usr/bin/gdb"
         },
@@ -378,7 +383,7 @@
             "showDisplayString": true,
             "stopAtEntry": false,
             "externalConsole": false,
-            "preLaunchTask": "Build Debug Tools Test",
+            "preLaunchTask": "Build Debug Test Tools",
             "MIMode": "gdb",
             "miDebuggerPath": "/usr/bin/gdb"
         }
@@ -391,6 +396,27 @@
                 "C++: Test Arrow Server",
                 "C++: Test Arrow Client"
             ]
+        },
+        {
+            "name": "C++: Test All Tools",
+            "stopAll": true,
+            "configurations": [
+                "C++: Test Arrow Server",
+                "C++: Test Tools"
+            ]
         }
-    ]
+    ],
+    "inputs": [
+        {
+            "id": "USTORE_ENGINE_NAME",
+            "type": "pickString",
+            "description": "Enter the engine name:",
+            "default": "ucset",
+            "options": [
+                "ucset",
+                "rocksdb",
+                "leveldb"
+            ]
+        }
+    ],
 }

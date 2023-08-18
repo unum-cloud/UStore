@@ -1,5 +1,5 @@
 ========================
-Implementation Details
+Architecture
 ========================
 
 .. mdinclude:: ../src/README.md

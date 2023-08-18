@@ -10,7 +10,7 @@ on:
 
 # Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
 permissions:
-  contents: read
+  contents: write
   pages: write
   id-token: write
 
@@ -22,34 +22,12 @@ concurrency:
 
 env:
   GH_TOKEN: ${{ secrets.SEMANTIC_RELEASE_TOKEN }}
+  BUILD_TYPE: Release
 
 
 jobs:
-
-  build_docs:
-    name: Build Docs
-    runs-on: ubuntu-22.04
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-        with:
-          ref: 'main'
-      - name: Install dependencies
-        run: sudo apt update && sudo apt install -y doxygen graphviz dia git && pip install sphinx breathe furo m2r2 sphinxcontrib-googleanalytics==0.2.dev20220708 sphinxcontrib-jquery
-      - name: Install UKV from PyPi
-        run: pip install ukv
-      - name: Fetch GoLang repo
-        run: git submodule update --init --recursive --remote go-ustore/
-      - name: Build documentation
-        run: cd docs && doxygen conf.dox && make html
-      - name: Copy assets
-        run: cp -r assets build/docs/html/
-      - name: Compress assets
-        run: tar -czvf build/docs-html.tar.gz build/docs/html/
-
   versioning:
     name: Semantic Release
-    needs: build_docs
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v3
@@ -58,23 +36,253 @@ jobs:
     - uses: actions/setup-node@v3
     - run: cp .github/workflows/package.json . && npm install && npx semantic-release
 
-
   # Single deploy job since we're just deploying
   deploy:
     name: Deploy Docs
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     needs: versioning
     steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          ref: 'main'   
       - name: Setup GitHub Pages
         uses: actions/configure-pages@v2
+      - name: Install dependencies
+        run: sudo apt update && sudo apt install -y doxygen graphviz dia git && pip install sphinx breathe m2r2 sphinxcontrib-googleanalytics==0.2.dev20220708 sphinxcontrib-jquery
+      - name: Clone Theme
+        run: git clone https://github.com/unum-cloud/www.unum.cloud-furo && cd www.unum.cloud-furo && pip install . && cd ../
+      - name: Install UKV from PyPi
+        run: pip install ukv
+      # - name: Fetch GoLang repo
+      #   run: git submodule update --init --recursive --remote go-ustore/
+      - name: Build documentation
+        run: cd docs && doxygen conf.dox && make html
+      - name: Copy assets
+        run: cp -r assets build/docs/html/
       - name: Upload artifacts
         uses: actions/upload-pages-artifact@v1
         with:
-          # Upload entire repository
           path: "./build/docs/html/"
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v1
+
+
+  build_ustore_amd64:
+    name: Build Libraries on AMD
+    runs-on: ubuntu-latest
+    needs: versioning
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          persist-credentials: false
+          ref: 'main'
+          
+      - run: git submodule update --init --recursive
+
+      - name: Prepare CMake, Conan and PyArrow
+        run: python -m pip install --force-reinstall numpy pyarrow cmake conan==1.60.1
+
+      - name: Install Conan dependencies
+        run: |
+          last_tag=$(curl https://api.github.com/repos/unum-cloud/ustore-deps/releases/latest | grep -i 'tag_name' | awk -F '\"' '{print $4}')
+          wget -q https://github.com/unum-cloud/ustore-deps/releases/download/"$last_tag"/ustore_deps_x86_linux.tar.gz
+          conan profile new --detect default
+          conan profile update settings.compiler.libcxx=libstdc++11 default
+          tar -xzf ./ustore_deps_x86_linux.tar.gz -C ~/.conan
+          package_version=$(ls ~/.conan/data/ustore_deps/)
+          conan install ustore_deps/"$package_version"@unum/x86_linux -g cmake -s compiler.version=11
+          rm -rf ./ustore_deps_x86_linux.tar.gz
+
+      - name: Configure CMake
+        run: |
+          cmake -DCMAKE_BUILD_TYPE=Release \
+                -DUSTORE_BUILD_TESTS=0 \
+                -DUSTORE_BUILD_BENCHMARKS=0 \
+                -DUSTORE_BUILD_ENGINE_UCSET=1 \
+                -DUSTORE_BUILD_ENGINE_LEVELDB=1 \
+                -DUSTORE_BUILD_ENGINE_ROCKSDB=1 \
+                -DUSTORE_BUILD_API_FLIGHT_CLIENT=0 \
+                -DUSTORE_BUILD_API_FLIGHT_SERVER=1 \
+                -DUSE_CONAN=1 \
+                -B ./build_release .
+                
+      - name: Build   
+        run: make -j 4 -C ./build_release
+
+      - name: Upload Precompiled binaries to Release Assets
+        uses: xresloader/upload-to-github-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          file: "./build_release/build/bin/ustore_flight_server*"
+          update_latest_release: true
+
+  
+  build_wheel:
+    name: Build Python ${{ matrix.python }} on ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    needs: deploy
+    strategy:
+      matrix:
+        arch: ["x86_64", "aarch64"]
+        python: ["cp39-*", "cp310-*"]
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          persist-credentials: false
+          ref: 'main'
+      - name: Prepare CMake, Conan and PyArrow
+        run: python -m pip install --force-reinstall numpy pyarrow cmake conan==1.60.1
+
+      - name: Set up QEMU
+        if: runner.os == 'Linux'
+        uses: docker/setup-qemu-action@v2
+        with:
+          platforms: 'arm64,amd64'
+
+      - name: Build wheel
+        run: |
+          pip install cibuildwheel twine
+          CIBW_BUILD=${{ matrix.python }} cibuildwheel --platform linux
+        env:
+          CIBW_ARCHS_LINUX: ${{ matrix.arch }}
+          
+      - uses: actions/upload-artifact@v3
+        with:
+          path: ./wheelhouse/*.whl
+
+    
+  publish_python:
+    name: Publish Python
+    needs: build_wheel
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/ustore
+    permissions:
+      id-token: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v3.0.2
+        with:
+          path: ./dist/
+
+      - name: Publish to PyPi
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: ./dist/artifact
+          verbose: true
+          print-hash: true
+
+  
+  build_and_publish_java:
+    name: Build and Publish Java
+    needs: versioning
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          persist-credentials: false
+          ref: 'main'
+      - name: Prepare CMake, Conan and PyArrow
+        run: python -m pip install --force-reinstall numpy pyarrow cmake conan==1.60.1
+
+      - name: Install default jdk
+        run: |
+          sudo apt update
+          sudo apt install default-jdk -y
+
+      - name: Install UStore dependencies using conan
+        run: |
+          last_tag=$(curl https://api.github.com/repos/unum-cloud/ustore-deps/releases/latest | grep -i 'tag_name' | awk -F '\"' '{print $4}')
+          wget -q https://github.com/unum-cloud/ustore-deps/releases/download/"$last_tag"/ustore_deps_x86_linux.tar.gz
+          conan profile new --detect default
+          conan profile update settings.compiler.libcxx=libstdc++11 default
+          tar -xzf ./ustore_deps_x86_linux.tar.gz -C ~/.conan
+          package_version=$(ls ~/.conan/data/ustore_deps/)
+          conan install ustore_deps/"$package_version"@unum/x86_linux -g cmake -s compiler.version=11
+          rm -rf ./ustore_deps_x86_linux.tar.gz
+
+      - name: Build and test java
+        run: |
+          mkdir -p ./tmp
+          export USTORE_TEST_PATH="./tmp/"
+          sed -i 's/make -j/make -j4/' /home/runner/work/ustore/ustore/java/pack.sh
+          export JAVA_HOME="/usr/lib/jvm/java-11-openjdk-amd64"
+          bash java/pack.sh
+      
+      - name: Publish java
+        run: ./java/gradlew publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+
+  build_and_publish_docker:
+    name: Build and Publish Docker
+    needs: versioning
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        arch: ["amd64", "arm64"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          persist-credentials: false
+          ref: 'main'
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+        with:
+          platforms: 'amd64,arm64'
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+        with:
+          platforms: linux/amd64, linux/arm64
+        
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USER }}
+          password: ${{ secrets.DOCKER_PASS }}
+
+      - name: Log in to GitHub Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare Dockerfile and ARGS
+        id: args
+        run: |
+          sed -i 's/make -j32/make -j4/' ./Dockerfile
+          echo "version=$(cat VERSION)" >> $GITHUB_OUTPUT
+
+      - name: Build and push
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          platforms: linux/${{ matrix.arch }}
+          build-args: |
+            version=${{ steps.args.outputs.version }}
+            TEST_USTORE="False"
+          tags: |
+            unum/ustore:${{ steps.args.outputs.version }}-jammy
+            unum/ustore:latest
+            ghcr.io/unum-cloud/ustore:${{ steps.args.outputs.version }}-jammy
+            ghcr.io/unum-cloud/ustore:latest

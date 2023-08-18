@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=42", "wheel", "cmake>=3.22", "pybind11-stubgen", "pyarrow>=10.0.0,<11"]
+requires = ["setuptools>=42", "wheel", "cmake>=3.22", "pybind11-stubgen", "pyarrow>=10.0.1,<11"]
 build-backend = "setuptools.build_meta"
 
 [tool.pytest.ini_options]
@@ -9,28 +9,43 @@ xfail_strict = true
 filterwarnings = ["error"]
 testpaths = ["python/tests"]
 
-
 [tool.cibuildwheel]
 build-verbosity = 0
+#manylinux-x86_64-image = "manylinux_2_28"
+environment = "CMAKE_ARGS_F=/tmp/cmake_args"
+
 before-all = [
-    "yum install -y bzip2-devel libffi-devel zlib-devel wget python3-devel perl-IPC-Cmd perl-Test-Simple",
-    "cd /usr/src && wget https://www.openssl.org/source/openssl-3.1.0.tar.gz",
-    "tar -zxf openssl-3.1.0.tar.gz && rm openssl-3.1.0.tar.gz && cd /usr/src/openssl-3.1.0",
-    "./config && make -j16 && make install",
-    "ln -s /usr/local/lib64/libssl.so.3 /usr/lib64/libssl.so.3",
-    "ln -s /usr/local/lib64/libcrypto.so.3 /usr/lib64/libcrypto.so.3"
+    "yum install -y wget python3-devel bzip2-devel libffi-devel zlib-devel perl-IPC-Cmd perl-Test-Simple",
 ]
 
-environment = "CMAKE_ARGS_F=/tmp/cmake_args"
 before-build = [
+    # Removing the contents of previous builds from project if they exist
+    "cd {project}",
     "rm -rf {project}/CMakeCache.txt {project}/build {project}/CMakeFiles.txt {project}/_deps",
-    "pip install pyarrow==10.0.0",
+
+    "pip install pyarrow==10.0.1 auditwheel",
     "export PYST=$(python -c 'import site; print(site.getsitepackages()[0])')",
+    # Install dependency using conan
+    "pip install cmake conan==1.60.1",
+    "conan profile new --detect default",
+    "conan profile update settings.compiler=gcc default",
+    "conan profile update settings.compiler.version=11 default",
+    "conan profile update settings.compiler.libcxx=libstdc++11 default",
+    "arch=$(rpm --eval '%{_arch}')",
+    "if [ $arch == 'x86_64' ]; then export package_name='ustore_deps_x86_linux_python'; elif [ $arch == 'aarch64' ]; then export package_name='ustore_deps_arm_linux_python'; fi",
+    "last_tag=$(curl https://api.github.com/repos/unum-cloud/ustore-deps/releases/latest | grep -i 'tag_name' | awk -F '\"' '{print $4}')",
+    "wget -q https://github.com/unum-cloud/ustore-deps/releases/download/${last_tag}/${package_name}.tar.gz",
+    "tar -xzf {project}/${package_name}.tar.gz -C ~/.conan",
+    "package_version=$(ls ~/.conan/data/ustore_deps/)",
+    "if [ $arch == 'x86_64' ]; then export package_arch='x86_linux'; elif [ $arch == 'aarch64' ]; then export package_arch='arm_linux'; fi",
+    "conan install ustore_deps/${package_version}@unum/${package_arch} -g cmake",
+    "rm -rf {project}/${package_name}.tar.gz",
+
     "echo \"-DCMAKE_BUILD_TYPE=Release -DPYARROW_DIR=${PYST}/pyarrow/\" > ${CMAKE_ARGS_F}",
     "mkdir -p build/ustore",
 ]
 
-skip = ["*musllinux*", "*i686*", "pp*", "cp36-*", "cp311-*"]
+skip = ["*musllinux*", "*i686*", "pp*", "cp36-*"]
 
 # test-command = "pytest {project}/python/tests/"
 # test-requires = ["pandas"]

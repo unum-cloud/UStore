@@ -21,9 +21,13 @@ public class DataBaseLevelDBTest {
 
     @Test
     public void test() {
-        String path = "./tmp/";
+        String path = System.getenv("USTORE_TEST_PATH");
+        if(path == null || path.trim().isEmpty())
+            path = "./tmp/";
+
         deleteDirectoryFiles(path);
-        DataBaseLevelDB.Context ctx = new DataBaseLevelDB.Context(path);
+        String config = String.format("{\"version\": \"1.0\", \"directory\": \"%s\"}", path);
+        DataBaseLevelDB.Context ctx = new DataBaseLevelDB.Context(config);
 
         ctx.put(42, "hey".getBytes());
         assert Arrays.equals(ctx.get(42), "hey".getBytes()) : "Received wrong value";

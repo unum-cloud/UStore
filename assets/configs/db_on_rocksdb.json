@@ -1,11 +1,11 @@
 {
     "version": "1.0",
-    "directory": "./tmp/ustore/",
+    "directory": "./tmp/ustore_embedded_rocksdb/",
     "data_directories": [
         {
             "path": "./tmp/storage/",
             "max_size": "100GB"
-        },
+        }
     ],
     "engine": {
         "config_url": "",

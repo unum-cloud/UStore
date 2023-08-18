@@ -18,6 +18,7 @@ cmake \
     -DUSTORE_BUILD_BUNDLES=1 \
     -DUSTORE_BUILD_TESTS=0 \
     -DUSTORE_BUILD_BENCHMARKS=0 \
+    -DUSE_CONAN=1 \
     . 
-make -j16
+make -j
 ./java/gradlew build #--info
