@@ -49,4 +49,3 @@
 #include "ustore/paths.h"
 #include "ustore/docs.h"
 #include "ustore/graph.h"
-#include "ustore/vectors.h"

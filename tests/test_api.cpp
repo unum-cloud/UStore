@@ -14,9 +14,7 @@ static char const* path() {
     if (path)
         return std::strlen(path) ? path : nullptr;
 
-#if defined(USTORE_FLIGHT_CLIENT)
-    return nullptr;
-#elif defined(USTORE_TEST_PATH)
+#if defined(USTORE_TEST_PATH)
     return USTORE_TEST_PATH;
 #else
     return nullptr;

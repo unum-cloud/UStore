@@ -42,7 +42,7 @@ ExternalProject_Add(
     -DARROW_PARQUET=ON
     -DARROW_WITH_RE2=ON
     -DARROW_COMPUTE=ON
-    -DARROW_FLIGHT=ON
+    -DARROW_FLIGHT=OFF
     -DARROW_WITH_UTF8PROC=ON
 
     -DPARQUET_REQUIRE_ENCRYPTION=OFF
@@ -86,10 +86,6 @@ message("ARROW_INCLUDE_DIR: " ${ARROW_INCLUDE_DIR})
 add_library(arrow::arrow STATIC IMPORTED)
 set_property(TARGET arrow::arrow PROPERTY IMPORTED_LOCATION ${BINARY_DIR}/release/libarrow.a)
 add_dependencies(arrow::arrow Arrow-external)
-
-add_library(arrow::flight STATIC IMPORTED)
-set_property(TARGET arrow::flight PROPERTY IMPORTED_LOCATION ${BINARY_DIR}/release/libarrow_flight.a)
-add_dependencies(arrow::flight Arrow-external)
 
 add_library(arrow::cuda STATIC IMPORTED)
 set_property(TARGET arrow::cuda PROPERTY IMPORTED_LOCATION ${BINARY_DIR}/release/libarrow_cuda.a)

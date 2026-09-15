@@ -66,10 +66,6 @@ static json_t json_parse(char const* begin, char const* end) {
     EXPECT_EQ(json_t::from_msgpack(str_begin(str1), str_end(str1)), json_parse(str_begin(str2), str_end(str2)));
 
 static char const* path() {
-#if defined(USTORE_FLIGHT_CLIENT)
-    return nullptr;
-#endif
-
     char* path = std::getenv("USTORE_TEST_PATH");
     if (path)
         return std::strlen(path) ? path : nullptr;
@@ -2208,87 +2204,7 @@ TEST(db, graph_neighbors) {
     EXPECT_EQ(neighbors[1], 3);
 }
 
-#pragma region Vectors Modality
-
-/**
- * Tests "Vector Modality", including both CRUD and more analytical approximate search
- * operations with just three distinctly different vectors in R3 space with Cosine metric.
- */
-TEST(db, vectors) {
-    database_t db;
-    EXPECT_TRUE(db.open(config().c_str()));
-    EXPECT_TRUE(db.clear());
-
-    constexpr std::size_t dims_k = 3;
-    ustore_key_t keys[3] = {'a', 'b', 'c'};
-    float vectors[3][dims_k] = {
-        {0.3, 0.1, 0.2},
-        {0.35, 0.1, 0.2},
-        {-0.1, 0.2, 0.5},
-    };
-
-    arena_t arena(db);
-    status_t status;
-
-    float* vector_first_begin = &vectors[0][0];
-    ustore_vectors_write_t write {};
-    write.db = db;
-    write.arena = arena.member_ptr();
-    write.error = status.member_ptr();
-    write.dimensions = dims_k;
-    write.keys = keys;
-    write.keys_stride = sizeof(ustore_key_t);
-    write.vectors_starts = (ustore_bytes_cptr_t*)&vector_first_begin;
-    write.vectors_stride = sizeof(float) * dims_k;
-    write.tasks_count = 3;
-    ustore_vectors_write(&write);
-    EXPECT_TRUE(status);
-
-    ustore_length_t max_results = 2;
-    ustore_length_t* found_results = nullptr;
-    ustore_key_t* found_keys = nullptr;
-    ustore_float_t* found_distances = nullptr;
-    ustore_vectors_search_t search {};
-    search.db = db;
-    search.arena = arena.member_ptr();
-    search.error = status.member_ptr();
-    search.dimensions = dims_k;
-    search.tasks_count = 1;
-    search.match_counts_limits = &max_results;
-    search.queries_starts = (ustore_bytes_cptr_t*)&vector_first_begin;
-    search.queries_stride = sizeof(float) * dims_k;
-    search.match_counts = &found_results;
-    search.match_keys = &found_keys;
-    search.match_metrics = &found_distances;
-    search.metric = ustore_vector_metric_cos_k;
-    ustore_vectors_search(&search);
-    EXPECT_TRUE(status);
-
-    EXPECT_EQ(found_results[0], max_results);
-    EXPECT_EQ(found_keys[0], ustore_key_t('a'));
-    EXPECT_EQ(found_keys[1], ustore_key_t('b'));
-}
-
 int main(int argc, char** argv) {
-
-#if defined(USTORE_FLIGHT_CLIENT)
-
-    char* ustore_engine_name = std::getenv("USTORE_ENGINE_NAME");
-    std::string engine_name = ustore_engine_name ? ustore_engine_name : "ucset";
-
-    std::string srv_path = argv[0];
-    srv_path = srv_path.substr(0, srv_path.find_last_of("/") + 1) + "ustore_flight_server_" + engine_name;
-
-    auto srv_id = fork();
-    if (srv_id == 0) {
-        usleep(1); // TODO Any statement is required to be run for successful `execl` run...
-        std::string cli_args = "--quiet" + (path() ? fmt::format(" --config {}", path()) : "");
-        execl(srv_path.c_str(), srv_path.c_str(), cli_args.c_str(), (char*)(NULL));
-        exit(0);
-    }
-    usleep(1000000); // 1 sec
-#endif
-
     auto directory_str = path() ? std::string_view(path()) : "";
     if (directory_str.size())
         std::printf("Will work in directory: %s\n", directory_str.data());
@@ -2298,10 +2214,5 @@ int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     int status = RUN_ALL_TESTS();
     clear_environment();
-
-#if defined(USTORE_FLIGHT_CLIENT)
-    kill(srv_id, SIGKILL);
-    waitpid(srv_id, nullptr, 0);
-#endif
     return status;
 }

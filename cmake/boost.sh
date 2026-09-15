@@ -1,1 +1,0 @@
-apt-get install libboost1.71-*

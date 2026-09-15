@@ -48,11 +48,9 @@ class CMakeBuild(build_ext):
             "-DUSTORE_BUILD_ENGINE_UCSET=1",
             "-DUSTORE_BUILD_ENGINE_LEVELDB=1",
             "-DUSTORE_BUILD_ENGINE_ROCKSDB=1",
-            "-DUSTORE_BUILD_API_FLIGHT_CLIENT=1",
             "-DUSTORE_BUILD_SDK_PYTHON=1",
             "-DUSTORE_BUILD_TESTS=0",
             "-DUSTORE_USE_PYARROW=1",
-            "-DUSE_CONAN=1",
         ]
 
         # Adding CMake arguments set as environment variable
@@ -186,7 +184,6 @@ setup(
         CMakeExtension("ustore.ucset"),
         CMakeExtension("ustore.rocksdb"),
         CMakeExtension("ustore.leveldb"),
-        CMakeExtension("ustore.flight_client"),
     ],
     cmdclass={
         "build_ext": CMakeBuild,

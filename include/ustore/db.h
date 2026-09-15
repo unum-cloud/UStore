@@ -249,8 +249,6 @@ extern ustore_key_t const ustore_key_unknown_k;
  *
  * - embedded persistent transactional KVS
  * - embedded in-memory transactional KVS
- * - remote persistent transactional KVS
- * - remote in-memory transactional KVS
  */
 typedef struct ustore_database_init_t {
     /**
@@ -258,9 +256,6 @@ typedef struct ustore_database_init_t {
      * @see `db_config.json` file.
      *
      * For embedded distributions should be a json string containing DB options.
-     *
-     * Special:
-     * - Flight API Client: `grpc://0.0.0.0:38709`.
      */
     ustore_str_view_t config;
     /** @brief A pointer to the opened KVS, unless `error` is filled. */
