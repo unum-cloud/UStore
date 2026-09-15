@@ -1,0 +1,259 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 25,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "description": "Ninja, LLVM, a build tree named after the preset, and a compilation database for the language server. `lld` links several times faster than `bfd`. Export CMAKE_CXX_COMPILER_LAUNCHER=ccache to cache objects; point CC/CXX elsewhere for GCC or MSVC. No preset adds instruction-set flags, so every tree runs on any CPU of its architecture.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build_${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_EXE_LINKER_FLAGS": "-fuse-ld=lld",
+        "CMAKE_SHARED_LINKER_FLAGS": "-fuse-ld=lld",
+        "CMAKE_OPTIMIZE_DEPENDENCIES": "ON",
+        "USTORE_USE_ROCKSDB": "ON",
+        "USTORE_USE_LEVELDB": "ON"
+      }
+    },
+    {
+      "name": "debug",
+      "inherits": "base",
+      "displayName": "Debug - suites under AddressSanitizer",
+      "description": "Unoptimized suites and the CLI on every engine, with AddressSanitizer and UndefinedBehaviorSanitizer.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_FLAGS_DEBUG": "-O0 -g -fsanitize=address,undefined -fsanitize-address-use-after-scope -fno-omit-frame-pointer",
+        "CMAKE_CXX_FLAGS_DEBUG": "-O0 -g -fsanitize=address,undefined -fsanitize-address-use-after-scope -fno-omit-frame-pointer",
+        "USTORE_BUILD_TEST_CPP": "ON",
+        "USTORE_BUILD_BENCH_CPP": "OFF",
+        "USTORE_BUILD_TOOLS_CPP": "ON",
+        "USTORE_BUILD_LIB_C": "ON"
+      }
+    },
+    {
+      "name": "check",
+      "inherits": "base",
+      "displayName": "Check - fastest compile cycle",
+      "description": "Does it still compile, nothing more: -O0 without debug information over every UStore target.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_C_FLAGS_RELWITHDEBINFO": "-O0 -g0 -DNDEBUG",
+        "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O0 -g0 -DNDEBUG",
+        "USTORE_BUILD_TEST_CPP": "ON",
+        "USTORE_BUILD_BENCH_CPP": "ON",
+        "USTORE_BUILD_TOOLS_CPP": "ON",
+        "USTORE_BUILD_LIB_C": "ON"
+      }
+    },
+    {
+      "name": "relwithdebinfo",
+      "inherits": "base",
+      "displayName": "RelWithDebInfo - optimized suites with symbols",
+      "description": "Optimized, with full DWARF for stepping through the suites.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "USTORE_BUILD_TEST_CPP": "ON",
+        "USTORE_BUILD_BENCH_CPP": "OFF",
+        "USTORE_BUILD_TOOLS_CPP": "ON",
+        "USTORE_BUILD_LIB_C": "ON"
+      }
+    },
+    {
+      "name": "release",
+      "inherits": "base",
+      "displayName": "Release - every CPU target",
+      "description": "Libraries, suites, benchmarks and the CLI on every engine.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "USTORE_BUILD_TEST_CPP": "ON",
+        "USTORE_BUILD_BENCH_CPP": "ON",
+        "USTORE_BUILD_TOOLS_CPP": "ON",
+        "USTORE_BUILD_LIB_C": "ON"
+      }
+    },
+    {
+      "name": "profile",
+      "inherits": "base",
+      "displayName": "Profile - benchmarks under perf",
+      "description": "The profiling tree behind bench/README.md: full optimization, plus the symbols `perf` needs to attribute samples.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_C_FLAGS_RELWITHDEBINFO": "-O3 -g -DNDEBUG",
+        "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O3 -g -DNDEBUG",
+        "USTORE_BUILD_TEST_CPP": "OFF",
+        "USTORE_BUILD_BENCH_CPP": "ON",
+        "USTORE_BUILD_TOOLS_CPP": "OFF",
+        "USTORE_BUILD_LIB_C": "ON"
+      }
+    },
+    {
+      "name": "tsan",
+      "inherits": "base",
+      "displayName": "TSan - concurrency suites under ThreadSanitizer",
+      "description": "-fsanitize=thread over RelWithDebInfo, in a tree of its own because Debug arms AddressSanitizer, which cannot share a process with it. -O1 keeps the instrumented stress suites tolerable.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_C_FLAGS_RELWITHDEBINFO": "-O1 -g -DNDEBUG -fsanitize=thread -fno-omit-frame-pointer",
+        "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O1 -g -DNDEBUG -fsanitize=thread -fno-omit-frame-pointer",
+        "USTORE_BUILD_TEST_CPP": "ON",
+        "USTORE_BUILD_BENCH_CPP": "OFF",
+        "USTORE_BUILD_TOOLS_CPP": "OFF",
+        "USTORE_BUILD_LIB_C": "OFF"
+      }
+    },
+    {
+      "name": "dev",
+      "inherits": "base",
+      "displayName": "Dev - everything",
+      "description": "The iteration tree that `.clangd` reads: every CPU target, optimized enough to run, with line tables instead of full DWARF.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_C_FLAGS_RELWITHDEBINFO": "-O2 -gline-tables-only -DNDEBUG",
+        "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O2 -gline-tables-only -DNDEBUG",
+        "USTORE_BUILD_TEST_CPP": "ON",
+        "USTORE_BUILD_BENCH_CPP": "ON",
+        "USTORE_BUILD_TOOLS_CPP": "ON",
+        "USTORE_BUILD_LIB_C": "ON"
+      }
+    },
+    {
+      "name": "trace",
+      "inherits": "dev",
+      "displayName": "Trace - where the build time goes",
+      "description": "Emits a .json next to every object; open them in a flame-graph viewer or aggregate with ClangBuildAnalyzer to see which instantiations dominate.",
+      "cacheVariables": {
+        "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O2 -gline-tables-only -DNDEBUG -ftime-trace"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "debug",
+      "jobs": 0
+    },
+    {
+      "name": "check",
+      "configurePreset": "check",
+      "jobs": 0
+    },
+    {
+      "name": "relwithdebinfo",
+      "configurePreset": "relwithdebinfo",
+      "jobs": 0
+    },
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "jobs": 0
+    },
+    {
+      "name": "profile",
+      "configurePreset": "profile",
+      "jobs": 0
+    },
+    {
+      "name": "tsan",
+      "configurePreset": "tsan",
+      "jobs": 0
+    },
+    {
+      "name": "dev",
+      "configurePreset": "dev",
+      "jobs": 0
+    },
+    {
+      "name": "trace",
+      "configurePreset": "trace",
+      "jobs": 0
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "stopOnFailure": true
+      }
+    },
+    {
+      "name": "debug",
+      "inherits": "base",
+      "configurePreset": "debug",
+      "environment": {
+        "ASAN_OPTIONS": "detect_leaks=1 halt_on_error=1",
+        "UBSAN_OPTIONS": "halt_on_error=1 print_stacktrace=1"
+      }
+    },
+    {
+      "name": "relwithdebinfo",
+      "inherits": "base",
+      "configurePreset": "relwithdebinfo"
+    },
+    {
+      "name": "release",
+      "inherits": "base",
+      "configurePreset": "release"
+    },
+    {
+      "name": "tsan",
+      "inherits": "base",
+      "configurePreset": "tsan",
+      "environment": {
+        "TSAN_OPTIONS": "halt_on_error=1 second_deadlock_stack=1"
+      }
+    },
+    {
+      "name": "dev",
+      "inherits": "base",
+      "configurePreset": "dev"
+    }
+  ],
+  "workflowPresets": [
+    {
+      "name": "release",
+      "steps": [
+        {
+          "type": "configure",
+          "name": "release"
+        },
+        {
+          "type": "build",
+          "name": "release"
+        },
+        {
+          "type": "test",
+          "name": "release"
+        }
+      ]
+    },
+    {
+      "name": "dev",
+      "steps": [
+        {
+          "type": "configure",
+          "name": "dev"
+        },
+        {
+          "type": "build",
+          "name": "dev"
+        },
+        {
+          "type": "test",
+          "name": "dev"
+        }
+      ]
+    }
+  ]
+}

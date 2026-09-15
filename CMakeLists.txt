@@ -2,361 +2,232 @@ cmake_minimum_required(VERSION 3.16)
 
 file(READ "VERSION" USTORE_VERSION)
 string(STRIP ${USTORE_VERSION} USTORE_VERSION)
-project(UStore
-  LANGUAGES C CXX
-  VERSION ${USTORE_VERSION}
-  HOMEPAGE_URL "https://github.com/unum-cloud/ustore"
-  DESCRIPTION "Embedded Multi-Modal Transactional Database for Docs • Graphs • Blobs • Paths × RocksDB • LevelDB • UCSet • UDisk × from C • C++ • Python"
+project(
+    UStore
+    LANGUAGES C CXX
+    VERSION ${USTORE_VERSION}
+    HOMEPAGE_URL "https://github.com/unum-cloud/UStore"
+    DESCRIPTION "GPU-Accelerated Embedded Transactional Database for High-Throughput NVMe Devices"
 )
 
+# Determine if UStore is built as a subproject (using `add_subdirectory`) or if it is the main project
+set(USTORE_IS_MAIN_PROJECT OFF)
+if (CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
+    set(USTORE_IS_MAIN_PROJECT ON)
+endif ()
+
 # Git does not run hooks shipped inside a clone, so configuring the build points `core.hooksPath` at `.githooks`.
-if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
-  execute_process(
-    COMMAND git config core.hooksPath .githooks
-    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-    RESULT_VARIABLE ustore_hooks_status
-    OUTPUT_QUIET ERROR_QUIET
-  )
-  if(ustore_hooks_status EQUAL 0)
-    message(STATUS "UStore: Git hooks enabled (core.hooksPath -> .githooks)")
-  endif()
-endif()
+if (USTORE_IS_MAIN_PROJECT AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
+    execute_process(
+        COMMAND git config core.hooksPath .githooks
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        RESULT_VARIABLE ustore_hooks_status
+        OUTPUT_QUIET ERROR_QUIET
+    )
+    if (ustore_hooks_status EQUAL 0)
+        message(STATUS "UStore: Git hooks enabled (core.hooksPath -> .githooks)")
+    endif ()
+endif ()
 
-option(USTORE_BUILD_ENGINE_UCSET "Building the in-memory UCSet engine" ON)
-option(USTORE_BUILD_ENGINE_LEVELDB "Building the LevelDB engine")
-option(USTORE_BUILD_ENGINE_ROCKSDB "Building the RocksDB engine")
+# Options
+option(USTORE_INSTALL "Install CMake targets" OFF)
 
-option(USTORE_BUILD_TESTS "Building C/C++ native tests" ON)
-option(USTORE_BUILD_SANITIZE "Use memory sanitizers for debug builds" ON)
-option(USTORE_BUILD_BENCHMARKS "Building C/C++ native benchmarks")
+option(USTORE_USE_ROCKSDB "Use RocksDB for a persistent engine" OFF)
+option(USTORE_USE_LEVELDB "Use LevelDB for a persistent engine" OFF)
+option(USTORE_USE_SPDK "Use SPDK for user-space NVMe access in UDisk" OFF)
 
-option(USTORE_BUILD_CLI "Building CLI for UStore")
-option(USTORE_BUILD_TOOLS "Building tools for UStore")
-option(USTORE_BUILD_SDK_PYTHON "Building Python bidings for all SDKs")
+option(USTORE_BUILD_TEST_CPP "Compile a native unit test in C++" ${USTORE_IS_MAIN_PROJECT})
+option(USTORE_BUILD_BENCH_CPP "Compile a native benchmark in C++" ${USTORE_IS_MAIN_PROJECT})
+option(USTORE_BUILD_TOOLS_CPP "Compile the CLI and the dataset tools in C++" OFF)
+option(USTORE_BUILD_LIB_C "Compile a native library for the C interface, one per engine" OFF)
+option(USTORE_BUILD_LIB_PYTHON "Compile the CPython extension; `scikit-build-core` switches it on" OFF)
+option(USTORE_BUILD_UDISK "Compile the in-tree UDisk engine" OFF)
+option(USTORE_BUILD_CUDA "Compile UDisk's GPU compaction" OFF)
 
-option(USTORE_USE_PYARROW "Ready-made arrow libraries from the installed pip package pyarrow")
-option(USTORE_USE_JEMALLOC "Faster allocator, that requires autoconf to be installed")
-option(USTORE_USE_ONEAPI "Faster concurrency primitives from Intel")
-option(USTORE_USE_UUID "Replaces default 64-bit keys with 128-bit UUID compatible integers")
+if (USTORE_BUILD_UDISK)
+    message(FATAL_ERROR "UStore: USTORE_BUILD_UDISK stays off until src/udisk builds")
+endif ()
 
-set(USTORE_ENGINE_UDISK_PATH "" CACHE STRING "Pass a path to UDisk binary to produce a full range of bindings")
-
-if(USTORE_BUILD_SDK_PYTHON)
-  set(USTORE_USE_PYARROW ON)
-endif()
-
-# Some settings are mutually dependant
-include(CMakeDependentOption)
-cmake_dependent_option(USTORE_REBUILD_JEMALLOC "Enable to attempt to source and build JeMalloc locally" ON "USTORE_USE_JEMALLOC" OFF)
-cmake_dependent_option(USTORE_REBUILD_ONEAPI "Enable to attempt to source and build Intel OneAPI locally" ON "USTORE_USE_ONEAPI" OFF)
-
-set(CMAKE_EXPORT_COMPILE_COMMANDS OFF)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/")
 set(CMAKE_CACHEFILE_DIR "${CMAKE_SOURCE_DIR}/build")
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/build/lib" CACHE PATH "Path to static libs")
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/build/lib" CACHE PATH "Path to shared libs")
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY
+    "${CMAKE_BINARY_DIR}/build/lib"
+    CACHE PATH "Path to static libs"
+)
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY
+    "${CMAKE_BINARY_DIR}/build/lib"
+    CACHE PATH "Path to shared libs"
+)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/build/bin")
 
 message("CMAKE_CXX_COMPILER_ID: ${CMAKE_CXX_COMPILER_ID}")
 message("CMAKE_CXX_COMPILER_VERSION: ${CMAKE_CXX_COMPILER_VERSION}")
 message("CMAKE_CXX_COMPILER: ${CMAKE_CXX_COMPILER}")
 
-if(NOT CMAKE_BUILD_TYPE)
-  set(CMAKE_BUILD_TYPE Release)
-endif()
+if (NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif ()
 
-if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fstrict-vtable-pointers")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wunknown-attributes")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -ferror-limit=1")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pedantic")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wc++20-designator")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wgnu-zero-variadic-macro-arguments")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wformat-pedantic")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wextra-semi")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wunused-result")
+# No instruction-set flags: artifacts run on any CPU of the target architecture.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(CMAKE_C_VISIBILITY_PRESET hidden)
+set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 
-elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-builtin-memcmp -fPIC")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wfatal-errors")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -w")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pedantic -pedantic-errors")
-
-elseif(CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -w")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -ferror-limit=1")
-
-elseif(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /Za")
-  set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /w2 /DEBUG")
-  set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /MP /INCREMENTAL:NO")
-endif()
-
-# Optimizations for common x86 CPUs.
-# https://gcc.gnu.org/onlinedocs/gcc/x86-Options.html
-if(${CMAKE_SYSTEM_PROCESSOR} MATCHES "(x86)|(X86)|(amd64)|(AMD64)")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -msse -msse4.2 -mavx2") # -march=native
-endif()
-
-# Optimizations for ARM CPUs.
-if(${CMAKE_SYSTEM_PROCESSOR} MATCHES "arm")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mfloat-abi=softfp -mfpu=neon -march=armv8-a+simd")
-endif()
-
-# Risky optimizations, that require tuning.
-set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -fno-omit-frame-pointer")
-set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -momit-leaf-frame-pointer")
-set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -funsafe-math-optimizations")
-set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -funroll-loops")
-
-# Other release build specs.
-set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -DNDEBUG -O3")
-set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -DNDEBUG -O3")
-set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -fvisibility=hidden")
-set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -fvisibility=hidden")
-
-# Debugging flags.
-set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -DUSTORE_DEBUG -g")
-set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -DUSTORE_DEBUG -g")
+# Warnings apply to UStore's own targets only, so fetched dependencies build with their own flags.
+add_library(ustore_warnings INTERFACE)
+if (MSVC)
+    target_compile_options(ustore_warnings INTERFACE /W4 /permissive- /Zc:__cplusplus)
+else ()
+    # The C ABI takes named arguments as partially designated structs, leaving the rest zeroed.
+    target_compile_options(
+        ustore_warnings INTERFACE -Wall -Wextra -Wpedantic -Wno-unknown-pragmas -Wno-missing-field-initializers
+    )
+endif ()
 
 find_package(Threads REQUIRED)
-set(CMAKE_FIND_LIBRARY_SUFFIXES .a)
-
-if(${USTORE_BUILD_SANITIZE} AND NOT ${USTORE_BUILD_SDK_PYTHON})
-  set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -fsanitize=address -fsanitize-address-use-after-scope")
-  set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -fsanitize=address -fsanitize-address-use-after-scope")
-  set(CMAKE_LINKER_FLAGS_DEBUG "${CMAKE_LINKER_FLAGS_DEBUG} -fsanitize=address -fsanitize-address-use-after-scope")
-endif()
 
 # Install 3rd Party Packages
 include(FetchContent)
 include_directories(include/)
 include_directories(numkong/include stringzilla/include forkunion/include smashtable/include)
-include_directories(src/tools)
+include_directories(tools)
+include_directories(src)
 include_directories(src/helpers)
 
-if(CMAKE_BUILD_TYPE MATCHES "Debug")
-  set(FETCHCONTENT_QUIET OFF)
-else()
-  set(FETCHCONTENT_QUIET ON)
-endif()
+if (CMAKE_BUILD_TYPE MATCHES "Debug")
+    set(FETCHCONTENT_QUIET OFF)
+else ()
+    set(FETCHCONTENT_QUIET ON)
+endif ()
 
 # Engines:
-if(${USTORE_BUILD_ENGINE_UCSET})
-  include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/ucset.cmake")
-endif()
+if (${USTORE_USE_LEVELDB})
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/leveldb.cmake")
+    set(LIB_LEVELDB leveldb)
+endif ()
 
-# Engines:
-if(${USTORE_BUILD_ENGINE_LEVELDB})
-  include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/leveldb.cmake")
-  set(LIB_LEVELDB leveldb)
-endif()
-
-if(${USTORE_BUILD_ENGINE_ROCKSDB})
-  include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/rocksdb.cmake")
-  set(LIB_ROCKSDB rocksdb)
-endif()
+if (${USTORE_USE_ROCKSDB})
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/rocksdb.cmake")
+    set(LIB_ROCKSDB rocksdb)
+endif ()
 
 # Modalities:
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/fmt.cmake")
-include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/json.cmake")
-include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/bson.cmake")
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/yyjson.cmake")
-include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/simdjson.cmake")
-include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/pcre2.cmake")
-include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/mpack.cmake")
 
-if(${USTORE_USE_JEMALLOC})
-  include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/jemalloc.cmake")
-endif()
+# ForkUnion's C ABI, linked statically into every engine and suite
+set(FORKUNION_BUILD_TESTS OFF)
+set(FORKUNION_INSTALL OFF)
+add_subdirectory(forkunion EXCLUDE_FROM_ALL)
 
-if(${USTORE_USE_ONEAPI})
-  include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/oneapi.cmake")
-endif()
-
-# Distributions:
-# > USTORE_BUILD_ENGINE_UCSET: Uses Arrow Parquet format to save binary collections on disk.
-# > USTORE_BUILD_SDK_PYTHON: Uses Arrow for zero-copy data exchage with the Python runtime.
-
-if(${USTORE_BUILD_SDK_PYTHON} OR ${USTORE_BUILD_CLI} OR ${USTORE_BUILD_ENGINE_UCSET} OR ${USTORE_BUILD_TESTS})
-  if(NOT ${USTORE_USE_PYARROW})
-    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/arrow.cmake")
-  else()
-    include_directories(ustore_embedded_ucset PRIVATE ${PYARROW_DIR}/include)
-
-    set(LIB_ARROW ${PYARROW_DIR}/libarrow.so.1000)
-    set(LIB_ARROW_PARQUET ${PYARROW_DIR}/libparquet.so.1000)
-    set(LIB_ARROW_DATASET ${PYARROW_DIR}/libarrow_dataset.so.1000)
-    set(LIB_ARROW_PYTHON ${PYARROW_DIR}/libarrow_python.so)
-    set(LIB_ARROW_BUNDLED)
-  endif()
-endif()
-
-if(${USTORE_BUILD_CLI})
-  include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/readline.cmake")
-endif()
-
-if(${USTORE_BUILD_CLI})
-  include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/clipp.cmake")
-endif()
-
-if(${USTORE_BUILD_TESTS})
-  include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/gtest.cmake")
-endif()
-
-if(${USTORE_BUILD_BENCHMARKS})
-  include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/gbench.cmake")
-  include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/argparse.cmake")
-endif()
-
-if(NOT ${USTORE_USE_PYARROW})
-  set(LIB_ARROW arrow::arrow)
-  set(LIB_ARROW_DATASET arrow::dataset)
-  set(LIB_ARROW_PARQUET arrow::parquet)
-  set(LIB_ARROW_BUNDLED arrow::bundled)
-endif()
+if (${USTORE_BUILD_BENCH_CPP})
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/gbench.cmake")
+endif ()
 
 set(LIB_FMT fmt::fmt)
-set(LIB_BSON bson)
-set(LIB_PCRE2 pcre2)
 
-set(USTORE_ENGINE_NAMES)
-set(USTORE_CLIENT_LIBS)
-set(USTORE_TEST_NAMES "test_tools" "test_compilation" "test_units" "stress_atomicity" "stress_linearizability")
+if (USTORE_BUILD_CUDA)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/udisk_compaction.cmake")
+endif ()
 
-# Define the Engine libraries we will need to build
-if(${USTORE_BUILD_ENGINE_UCSET})
-  add_library(ustore_embedded_ucset src/engine_ucset.cpp src/modality_docs.cpp src/modality_paths.cpp src/modality_graph.cpp)
-  target_link_libraries(ustore_embedded_ucset pthread yyjson simdjson ${LIB_BSON} ${LIB_PCRE2} ${LIB_ARROW_PARQUET} ${LIB_ARROW} ${LIB_ARROW_BUNDLED} ${JEMALLOC_LIBRARIES} ${TBB_LIBRARIES})
-  target_compile_definitions(ustore_embedded_ucset INTERFACE USTORE_VERSION="${USTORE_VERSION}")
-  target_compile_definitions(ustore_embedded_ucset INTERFACE USTORE_ENGINE_IS_UCSET=1)
+# Without `USTORE_BUILD_LIB_C`, an engine library builds only for the targets that link it
+if (NOT USTORE_BUILD_LIB_C AND NOT USTORE_INSTALL)
+    set(USTORE_LIB_C_EXCLUSION EXCLUDE_FROM_ALL)
+endif ()
 
-  list(APPEND USTORE_ENGINE_NAMES "ucset")
-  list(APPEND USTORE_CLIENT_LIBS "ustore_embedded_ucset")
-endif()
+set(USTORE_ENGINE_NAMES "smashtable")
+add_library(
+    ustore_embedded_smashtable STATIC ${USTORE_LIB_C_EXCLUSION} src/smashtable/engine.cpp c/docs.cpp c/graph.cpp
+)
+target_link_libraries(ustore_embedded_smashtable Threads::Threads yyjson forkunion::static)
+target_compile_definitions(ustore_embedded_smashtable INTERFACE USTORE_VERSION="${USTORE_VERSION}")
 
-if(${USTORE_BUILD_ENGINE_ROCKSDB})
-  add_library(ustore_embedded_rocksdb src/engine_rocksdb.cpp src/modality_docs.cpp src/modality_paths.cpp src/modality_graph.cpp)
-  target_link_libraries(ustore_embedded_rocksdb ${LIB_ROCKSDB} pthread yyjson simdjson ${LIB_BSON} ${LIB_PCRE2} ${LIB_ARROW_BUNDLED} ${JEMALLOC_LIBRARIES})
-  target_compile_definitions(ustore_embedded_rocksdb INTERFACE USTORE_VERSION="${USTORE_VERSION}")
-  target_compile_definitions(ustore_embedded_rocksdb INTERFACE USTORE_ENGINE_IS_ROCKSDB=1)
+if (${USTORE_USE_ROCKSDB})
+    add_library(ustore_embedded_rocksdb STATIC ${USTORE_LIB_C_EXCLUSION} src/rocksdb/engine.cpp c/docs.cpp c/graph.cpp)
+    target_link_libraries(ustore_embedded_rocksdb ${LIB_ROCKSDB} Threads::Threads yyjson)
+    target_compile_definitions(ustore_embedded_rocksdb INTERFACE USTORE_VERSION="${USTORE_VERSION}")
+    list(APPEND USTORE_ENGINE_NAMES "rocksdb")
+endif ()
 
-  list(APPEND USTORE_ENGINE_NAMES "rocksdb")
-  list(APPEND USTORE_CLIENT_LIBS "ustore_embedded_rocksdb")
-endif()
+if (${USTORE_USE_LEVELDB})
+    add_library(ustore_embedded_leveldb STATIC ${USTORE_LIB_C_EXCLUSION} src/leveldb/engine.cpp c/docs.cpp c/graph.cpp)
+    target_link_libraries(ustore_embedded_leveldb ${LIB_LEVELDB} Threads::Threads yyjson)
+    if (NOT MSVC)
+        set_source_files_properties(src/leveldb/engine.cpp PROPERTIES COMPILE_FLAGS -fno-rtti)
+    endif ()
+    target_compile_definitions(ustore_embedded_leveldb INTERFACE USTORE_VERSION="${USTORE_VERSION}")
+    list(APPEND USTORE_ENGINE_NAMES "leveldb")
+endif ()
 
-if(${USTORE_BUILD_ENGINE_LEVELDB})
-  add_library(ustore_embedded_leveldb src/engine_leveldb.cpp src/modality_docs.cpp src/modality_paths.cpp src/modality_graph.cpp)
-  target_link_libraries(ustore_embedded_leveldb ${LIB_LEVELDB} pthread yyjson simdjson ${LIB_BSON} ${LIB_PCRE2} ${JEMALLOC_LIBRARIES})
-  set_source_files_properties(src/engine_leveldb.cpp PROPERTIES COMPILE_FLAGS -fno-rtti)
-  target_compile_definitions(ustore_embedded_leveldb INTERFACE USTORE_VERSION="${USTORE_VERSION}")
-  target_compile_definitions(ustore_embedded_leveldb INTERFACE USTORE_ENGINE_IS_LEVELDB=1)
+foreach (engine_name IN ITEMS ${USTORE_ENGINE_NAMES})
+    target_link_libraries(ustore_embedded_${engine_name} ustore_warnings ${LIB_FMT} forkunion::static)
+endforeach ()
 
-  list(APPEND USTORE_ENGINE_NAMES "leveldb")
-  list(APPEND USTORE_CLIENT_LIBS "ustore_embedded_leveldb")
-endif()
+# A static engine library links only beside the archives it depends on, so they install together, apart from system
+# copies.
+if (USTORE_INSTALL)
+    include(GNUInstallDirs)
+    list(TRANSFORM USTORE_ENGINE_NAMES PREPEND "ustore_embedded_" OUTPUT_VARIABLE USTORE_ENGINE_LIBS)
+    install(TARGETS ${USTORE_ENGINE_LIBS} ${LIB_ROCKSDB} ${LIB_LEVELDB} fmt yyjson forkunion_static
+            ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}/ustore
+    )
+    install(DIRECTORY include/ustore DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+endif ()
 
-if(EXISTS ${USTORE_ENGINE_UDISK_PATH})
-  add_library(udisk STATIC IMPORTED)
-  target_link_libraries(udisk INTERFACE dl pthread explain uring numa)
-  set_property(TARGET udisk PROPERTY IMPORTED_LOCATION ${USTORE_ENGINE_UDISK_PATH})
-  set_property(TARGET udisk PROPERTY LINK_LIBRARIES "")
-  add_library(ustore_embedded_udisk src/modality_docs.cpp src/modality_paths.cpp src/modality_graph.cpp)
-  target_link_libraries(ustore_embedded_udisk udisk pthread yyjson simdjson ${LIB_BSON} ${LIB_PCRE2} nlohmann_json::nlohmann_json ${JEMALLOC_LIBRARIES})
-  target_compile_definitions(ustore_embedded_udisk INTERFACE USTORE_VERSION="${USTORE_VERSION}")
-  target_compile_definitions(ustore_embedded_udisk INTERFACE USTORE_ENGINE_IS_UDISK=1)
+if (${USTORE_BUILD_TOOLS_CPP})
+    foreach (engine_name IN ITEMS ${USTORE_ENGINE_NAMES})
+        add_executable(ustore_cli_${engine_name} tools/cli.cpp tools/dataset.cpp)
+        target_link_libraries(ustore_cli_${engine_name} ${LIB_FMT} ustore_embedded_${engine_name})
+    endforeach ()
+endif ()
 
-  list(APPEND USTORE_ENGINE_NAMES "udisk")
-  list(APPEND USTORE_CLIENT_LIBS "ustore_embedded_udisk")
-endif()
+if (${USTORE_BUILD_TEST_CPP})
+    enable_testing()
+    set(USTORE_TEST_NAMES "test_api" "test_compilation" "test_units" "stress_atomicity" "stress_linearizability")
 
-# The targets below apply to every embedded engine library
-set(USTORE_CLIENT_NAMES ${USTORE_ENGINE_NAMES})
+    foreach (engine_name IN ITEMS ${USTORE_ENGINE_NAMES})
+        set(client_lib ustore_embedded_${engine_name})
 
-if(${USTORE_BUILD_CLI})
-  foreach(engine_name IN ITEMS ${USTORE_ENGINE_NAMES})
-    string(CONCAT embedded_lib_name "ustore_embedded_" ${engine_name})
-    get_target_property(embedded_dependencies ${embedded_lib_name} LINK_LIBRARIES)
-    string(CONCAT cli_exe_name "ustore_cli_" ${engine_name})
-    add_executable(${cli_exe_name} src/tools/ustore_cli.cpp src/tools/dataset.cpp)
-    target_link_libraries(${cli_exe_name} simdjson ${LIB_FMT} ${LIB_ARROW_PARQUET} ${LIB_ARROW} ${LIB_ARROW_BUNDLED} ${embedded_lib_name} ${embedded_dependencies} readline::readline readline::history ncurses)
-  endforeach()
-endif()
+        foreach (test_name IN ITEMS ${USTORE_TEST_NAMES})
+            set(test_exe ${test_name}_${client_lib})
+            add_executable(${test_exe} tests/${test_name}.cpp)
+            target_link_libraries(${test_exe} ${LIB_FMT} ${client_lib})
+            add_test(NAME ${test_exe} COMMAND ${test_exe} --directory ${CMAKE_BINARY_DIR}/test_data)
+        endforeach ()
 
-# Enable warning and sanitization for our primary targets
-foreach(client_lib IN ITEMS ${USTORE_CLIENT_LIBS})
-  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    set_target_properties(${client_lib} PROPERTIES CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-builtin-memcmp -fPIC")
-    set_target_properties(${client_lib} PROPERTIES CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wfatal-errors")
-    set_target_properties(${client_lib} PROPERTIES CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra")
-    set_target_properties(${client_lib} PROPERTIES CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unknown-pragmas") # Allow "pragma region" source sections
-    set_target_properties(${client_lib} PROPERTIES CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-error=deprecated-copy -Wno-deprecated-copy -Wno-error=pessimizing-move -Wno-pessimizing-move")
-  endif()
-endforeach()
-
-# Generate tests
-# We build them with the original sources (instead of linking with already compiled libraries)
-# to maximize the number of exposed symbols and make debugging easier.
-if(${USTORE_BUILD_TESTS})
-  foreach(client_lib IN ITEMS ${USTORE_CLIENT_LIBS})
-    get_target_property(client_dependencies ${client_lib} LINK_LIBRARIES)
-
-    foreach(test_name IN ITEMS ${USTORE_TEST_NAMES})
-      string(CONCAT test_exe ${test_name} "_" ${client_lib})
-      if(${test_name} MATCHES test_tools)
-        add_executable(${test_exe} tests/${test_name}.cpp src/tools/dataset.cpp)
-        if(${USTORE_BUILD_CLI})
-          string(REPLACE "ustore_embedded_" "ustore_cli_" cli_exe_name ${client_lib})
-          target_compile_definitions(${test_exe} PRIVATE USTORE_CLI="${cli_exe_name}")
-          add_dependencies(${test_exe} ${cli_exe_name})
-        endif()
-      else()
-        add_executable(${test_exe} tests/${test_name}.cpp)
-      endif()
-      target_compile_definitions(${test_exe} PUBLIC USTORE_TEST_PATH="tmp/${client_lib}")
-      target_link_libraries(${test_exe} gtest simdjson ${LIB_FMT} ${LIB_ARROW_PARQUET} ${LIB_ARROW} ${LIB_ARROW_BUNDLED} ${client_lib} ${client_dependencies})
-      add_test(NAME "${test_exe}" COMMAND "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${test_exe}")
-    endforeach()
-  endforeach()
-endif()
+        # The tools test drives the CLI of the same engine
+        if (${USTORE_BUILD_TOOLS_CPP})
+            set(test_exe test_tools_${client_lib})
+            add_executable(${test_exe} tests/test_tools.cpp tools/dataset.cpp)
+            target_link_libraries(${test_exe} ${LIB_FMT} ${client_lib})
+            add_dependencies(${test_exe} ustore_cli_${engine_name})
+            add_test(NAME ${test_exe} COMMAND ${test_exe} --directory ${CMAKE_BINARY_DIR}/test_data --cli
+                                              $<TARGET_FILE:ustore_cli_${engine_name}>
+            )
+        endif ()
+    endforeach ()
+endif ()
 
 # Generate benchmarks: Bitcoin Core & Twitter
-if(${USTORE_BUILD_BENCHMARKS})
-  foreach(client_lib IN ITEMS ${USTORE_CLIENT_LIBS})
-    get_target_property(client_dependencies ${client_lib} LINK_LIBRARIES)
-    
-    string(CONCAT bench_name "bench_twitter_" ${client_lib})
-    add_executable(${bench_name} benchmarks/twitter.cpp)
-    target_link_libraries(${bench_name} benchmark argparse ${LIB_FMT} ${client_lib} ${client_dependencies})
-    
-    string(CONCAT bench_name "bench_tabular_graph_" ${client_lib})
-    add_executable(${bench_name} benchmarks/tabular_graph.cpp src/tools/dataset.cpp)
-    target_link_libraries(${bench_name} benchmark argparse ${LIB_FMT} ${LIB_ARROW_PARQUET} ${LIB_ARROW} ${LIB_ARROW_BUNDLED} ${client_lib} ${client_dependencies})
-  endforeach()
-endif()
+if (${USTORE_BUILD_BENCH_CPP})
+    foreach (engine_name IN ITEMS ${USTORE_ENGINE_NAMES})
+        set(client_lib ustore_embedded_${engine_name})
 
-# Build Python bindings linking to precompiled client SDKs
-if(${USTORE_BUILD_SDK_PYTHON})
-  # find_package(Python 3.9 REQUIRED COMPONENTS Interpreter Development.module)
-  set(PYARROW_DIR "" CACHE PATH "Path to pyarrow install dir")
-  include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/pybind11.cmake")
-  file(MAKE_DIRECTORY ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/ustore)
-  
-  foreach(client_lib_name IN ITEMS ${USTORE_CLIENT_NAMES})
-    string(CONCAT client_lib "ustore_embedded_" ${client_lib_name})
+        set(bench_name bench_twitter_${client_lib})
+        add_executable(${bench_name} bench/twitter.cpp)
+        target_link_libraries(${bench_name} benchmark ${LIB_FMT} ${client_lib})
 
-    string(CONCAT wrap_lib "py_" ${client_lib_name})
-    get_target_property(client_dependencies ${client_lib} LINK_LIBRARIES)
+        set(bench_name bench_tabular_graph_${client_lib})
+        add_executable(${bench_name} bench/tabular_graph.cpp tools/dataset.cpp)
+        target_link_libraries(${bench_name} benchmark ${LIB_FMT} ${client_lib})
+    endforeach ()
+endif ()
 
-    pybind11_add_module(${wrap_lib} MODULE python/pybind.cpp python/database.cpp python/networkx.cpp python/documents.cpp python/pandas.cpp)
-    target_include_directories(${wrap_lib} PUBLIC python/ ${PYARROW_DIR}/include)
-    target_link_directories(${wrap_lib} PUBLIC ${PYARROW_DIR})
-    target_link_libraries(${wrap_lib} PRIVATE pthread ${LIB_FMT} ${LIB_ARROW_PARQUET} ${LIB_ARROW} ${LIB_ARROW_PYTHON} ${client_lib} ${client_dependencies})
-    target_compile_definitions(${wrap_lib} PRIVATE USTORE_VERSION="${USTORE_VERSION}" USTORE_PYTHON_MODULE_NAME=${client_lib_name})
-    set_target_properties(${wrap_lib} PROPERTIES OUTPUT_NAME ${client_lib_name})
-  endforeach()
-endif()
+if (${USTORE_BUILD_LIB_PYTHON})
+    add_subdirectory(python)
+endif ()

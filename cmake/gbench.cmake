@@ -9,7 +9,7 @@ set(BENCHMARK_USE_BUNDLED_GTEST ON)
 FetchContent_Declare(
     benchmark
     GIT_REPOSITORY https://github.com/google/benchmark.git
-    GIT_TAG v1.7.1
+    GIT_TAG v1.9.5
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(benchmark)
