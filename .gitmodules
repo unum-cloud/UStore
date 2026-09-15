@@ -1,0 +1,16 @@
+[submodule "numkong"]
+	path = numkong
+	url = https://github.com/ashvardanian/NumKong.git
+	branch = main-v8
+[submodule "stringzilla"]
+	path = stringzilla
+	url = https://github.com/ashvardanian/StringZilla.git
+	branch = main-v6
+[submodule "forkunion"]
+	path = forkunion
+	url = https://github.com/ashvardanian/ForkUnion.git
+	branch = main-v4
+[submodule "smashtable"]
+	path = smashtable
+	url = https://github.com/ashvardanian/SmashTable.git
+	branch = main-v1

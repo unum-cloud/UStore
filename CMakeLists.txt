@@ -51,7 +51,7 @@ cmake_dependent_option(USTORE_REBUILD_JEMALLOC "Enable to attempt to source and 
 cmake_dependent_option(USTORE_REBUILD_ONEAPI "Enable to attempt to source and build Intel OneAPI locally" ON "USTORE_USE_ONEAPI" OFF)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS OFF)
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -135,6 +135,7 @@ endif()
 # Install 3rd Party Packages
 include(FetchContent)
 include_directories(include/)
+include_directories(numkong/include stringzilla/include forkunion/include smashtable/include)
 include_directories(src/tools)
 include_directories(src/helpers)
 
