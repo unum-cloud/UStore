@@ -96,10 +96,10 @@ struct snapshot_t {
 };
 
 /** Identifiers of the live snapshots. */
-using snapshots_t = ashvardanian::smashtable::hash_set<ustore_snapshot_t>;
+using snapshots_t = st::hash_set<ustore_snapshot_t>;
 
 /** Column family handles, which the database destroys before it closes. */
-using columns_t = ashvardanian::smashtable::basic_vector<column_t*>;
+using columns_t = st::basic_vector<column_t*>;
 
 /** The open database, its column families and its snapshots. */
 struct database_t {
@@ -456,7 +456,7 @@ void database_init(ustore_database_init_t& arguments) {
     }
     database->native.reset(native);
 
-    if (ashvardanian::smashtable::failed(database->columns.reserve(handles.size()))) {
+    if (st::failed(database->columns.reserve(handles.size()))) {
         for (column_t* const handle : handles) database->native->DestroyColumnFamilyHandle(handle);
         *arguments.error = "Failed to allocate the collection handles";
         return;
@@ -527,7 +527,7 @@ void snapshot_create(ustore_snapshot_create_t& arguments) {
     }
 
     auto const id = reinterpret_cast<ustore_snapshot_t>(snapshot.get());
-    if (ashvardanian::smashtable::failed(database.snapshots.upsert(id))) {
+    if (st::failed(database.snapshots.upsert(id))) {
         database.native->ReleaseSnapshot(snapshot->native);
         *arguments.error = "Failed to register the snapshot";
         return;
@@ -884,7 +884,7 @@ void collection_create(ustore_collection_create_t& arguments) {
         }
 
     // Room for the handle comes first, so a created column family is never left unrecorded
-    bool const reserved = !ashvardanian::smashtable::failed(database.columns.reserve(database.columns.size() + 1));
+    bool const reserved = !st::failed(database.columns.reserve(database.columns.size() + 1));
     if (!reserved) {
         *arguments.error = "Failed to allocate a collection handle";
         return;

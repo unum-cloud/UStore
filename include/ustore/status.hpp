@@ -1,177 +1,100 @@
 /**
- * @file status.hpp
- * @author Ashot Vardanian
- * @date 4 Jul 2022
- * @addtogroup Cpp
- *
- * @brief Smart Pointers, Monads and Range-like abstractions for C++ bindings.
+ *  @file include/ustore/status.hpp
+ *  @author Ash Vardanian
+ *  @date July 4, 2022
+ *  @brief Owning error statuses and the expected wrapper that every fallible C++ call returns.
  */
 
 #pragma once
-#include <optional>  // `std::optional`
-#include <stdexcept> // `std::runtime_error`
 
-#include "ustore/cpp/types.hpp"
+#include <type_traits> // `std::is_integral_v`
+#include <utility>     // `std::cmp_equal`, `std::exchange`, `std::move`, `std::swap`
+
+#include <ustore/types.hpp>
 
 namespace unum::ustore {
 
+/** An error message from the C ABI that frees itself, where no message means success. */
 class [[nodiscard]] status_t {
-    ustore_error_t raw_ {nullptr};
-    bool is_view_ {false};
+
+    /** Whether the destructor frees the message or leaves it to a static owner. */
+    enum class ownership_t : bool { borrowed_k, owned_k };
+
+    ustore_error_t message_ {nullptr};
+    ownership_t ownership_ {ownership_t::owned_k};
 
   public:
-    static status_t status_view(char const* msg) noexcept {
-        status_t st(msg);
-        st.is_view_ = true;
-        return st;
+
+    /** Wraps a static message that must never reach @c ustore_error_free. */
+    static status_t status_view(ustore_error_t message) noexcept {
+        status_t status {message};
+        status.ownership_ = ownership_t::borrowed_k;
+        return status;
     }
 
-    status_t(ustore_error_t err = nullptr) noexcept : raw_(err) {}
-    operator bool() const noexcept { return !raw_; }
+    status_t(ustore_error_t message = nullptr) noexcept : message_(message) {}
 
     status_t(status_t const&) = delete;
     status_t& operator=(status_t const&) = delete;
 
     status_t(status_t&& other) noexcept
-        : raw_(std::exchange(other.raw_, nullptr)), is_view_(std::exchange(other.is_view_, false)) {}
+        : message_(std::exchange(other.message_, nullptr)),
+          ownership_(std::exchange(other.ownership_, ownership_t::owned_k)) {}
+
     status_t& operator=(status_t&& other) noexcept {
-        std::swap(raw_, other.raw_);
-        std::swap(is_view_, other.is_view_);
+        std::swap(message_, other.message_);
+        std::swap(ownership_, other.ownership_);
         return *this;
     }
+
     ~status_t() noexcept {
-        if (raw_ && !is_view_)
-            ustore_error_free(raw_);
-        raw_ = nullptr;
+        if (message_ && ownership_ == ownership_t::owned_k) ustore_error_free(message_);
+        message_ = nullptr;
     }
 
-    std::runtime_error release_exception() {
-        std::runtime_error result(raw_);
-        if (!is_view_)
-            ustore_error_free(std::exchange(raw_, nullptr));
-        return result;
-    }
+    operator bool() const noexcept { return !message_; }
 
-    void throw_unhandled() {
-        if (raw_ != nullptr) // C++20: [[unlikely]]
-            throw release_exception();
-    }
-
-    ustore_error_t* member_ptr() noexcept { return &raw_; }
-    ustore_error_t release_error() noexcept { return std::exchange(raw_, nullptr); }
-    ustore_error_t message() const noexcept { return raw_; }
+    ustore_error_t* member_ptr() noexcept { return &message_; }
+    ustore_error_t release_error() noexcept { return std::exchange(message_, nullptr); }
+    ustore_error_t message() const noexcept { return message_; }
 };
 
-/**
- * @brief Extends `std::optional` to support a status, describing empty state.
- */
-template <typename object_at>
-class [[nodiscard]] expected_gt {
-  protected:
+/** A value together with the status that explains its absence. */
+template <typename value_>
+class [[nodiscard]] expected {
     status_t status_;
-    object_at object_;
+    value_ object_;
 
   public:
-    expected_gt() = default;
-    expected_gt(object_at&& object) noexcept : object_(std::move(object)) {}
-    expected_gt(status_t&& status, object_at&& default_object = object_at {}) noexcept
-        : status_(std::move(status)), object_(std::move(default_object)) {}
+    expected() = default;
+    expected(value_&& object) noexcept : object_(std::move(object)) {}
+    expected(status_t&& status, value_&& fallback = value_ {}) noexcept
+        : status_(std::move(status)), object_(std::move(fallback)) {}
 
-    expected_gt(expected_gt&& other) noexcept : status_(std::move(other.status_)), object_(std::move(other.object_)) {}
-
-    expected_gt& operator=(expected_gt&& other) noexcept {
-        std::swap(status_, other.status_);
-        std::swap(object_, other.object_);
-        return *this;
-    }
+    expected(expected&&) noexcept = default;
+    expected& operator=(expected&&) noexcept = default;
 
     operator bool() const noexcept { return status_; }
-    object_at operator*() && noexcept { return std::move(object_); }
-    object_at const& operator*() const& noexcept { return object_; }
-    object_at* operator->() noexcept { return &object_; }
-    object_at const* operator->() const noexcept { return &object_; }
-    operator std::optional<object_at>() && noexcept {
-        return !status_ ? std::nullopt : std::optional<object_at> {std::move(object_)};
-    }
 
-    void throw_unhandled() { return status_.throw_unhandled(); }
+    value_& operator*() & noexcept { return object_; }
+    value_ const& operator*() const& noexcept { return object_; }
+    value_ operator*() && noexcept { return std::move(object_); }
+    value_* operator->() noexcept { return &object_; }
+    value_ const* operator->() const noexcept { return &object_; }
+
     status_t release_status() noexcept { return std::exchange(status_, status_t {}); }
-    object_at& throw_or_ref() & {
-        status_.throw_unhandled();
-        return object_;
-    }
-    object_at throw_or_release() && {
-        status_.throw_unhandled();
-        return std::move(object_);
-    }
 
-    template <typename hetero_at>
-    bool operator==(expected_gt<hetero_at> const& other) const noexcept {
-        return status_ == other.status_ && object_ == other.object_;
-    }
-
-    template <typename hetero_at>
-    bool operator!=(expected_gt<hetero_at> const& other) const noexcept {
-        return status_ != other.status_ || object_ != other.object_;
-    }
-
-    template <typename hetero_at>
-    bool operator==(hetero_at const& other) const noexcept {
-        return status_ && object_ == other;
-    }
-
-    template <typename hetero_at>
-    bool operator!=(hetero_at const& other) const noexcept {
-        return status_ || object_ != other;
+    /** Whether the value is present and equals @p other. */
+    template <typename other_type_>
+    bool operator==(other_type_ const& other) const noexcept {
+        if (!status_) return false;
+        if constexpr (std::is_integral_v<value_> && std::is_integral_v<other_type_>)
+            return std::cmp_equal(object_, other);
+        else return object_ == other;
     }
 };
 
-/**
- * @brief Wraps a potentially non-trivial type, like "optional",
- * often controlling the underlying memory of the object.
- */
-template <typename object_at>
-class [[nodiscard]] given_gt : public expected_gt<object_at> {
-  protected:
-    using base_t = expected_gt<object_at>;
-    using base_t::object_;
-    using base_t::status_;
-    arena_t arena_;
-
-  public:
-    // given_gt() : an;
-    given_gt(object_at&& object, arena_t&& arena) : base_t(std::move(object)), arena_(std::move(arena)) {}
-
-    given_gt(status_t&& status, object_at&& default_object = object_at {}, arena_t&& arena = {nullptr})
-        : base_t(std::move(status), std::move(default_object)), arena_(std::move(arena)) {}
-
-    given_gt(given_gt&& other) noexcept
-        : base_t(std::move(other.status_, other.object_)), arena_(std::move(other.arena_)) {}
-
-    given_gt& operator=(given_gt&& other) noexcept {
-        std::swap(status_, other.status_);
-        std::swap(object_, other.object_);
-        std::swap(arena_, other.arena_);
-        return *this;
-    }
-
-    using base_t::operator bool;
-    using base_t::operator==;
-    using base_t::operator!=;
-    using base_t::release_status;
-    using base_t::throw_unhandled;
-
-    object_at const& operator*() const& noexcept { return object_; }
-    object_at const* operator->() const& noexcept { return &object_; }
-
-    // operator std::optional<object_at>() && = delete;
-    // object_at&& operator*() && noexcept = delete;
-    // object_at* operator->() && noexcept = delete;
-
-    inline arena_t release_arena() noexcept { return std::exchange(arena_, {arena_.db()}); }
-    inline base_t release_expected() noexcept { return {std::move(status_), std::move(object_)}; }
-};
-
+/** Error categories the engines report. */
 enum error_code_t {
     success_k = 0,
     out_of_memory_k,
@@ -186,33 +109,3 @@ enum error_code_t {
 };
 
 } // namespace unum::ustore
-
-// #define log_warning_m(format, ...) fprintf(stderr, format, __VA_ARGS__)
-#define log_warning_m(format, ...) \
-    {}
-
-#define log_error_m(c_error, code, message) \
-    { *c_error = message; }
-
-#define log_error_if_m(must_be_true, c_error, code, message) \
-    if (!(must_be_true)) {                                   \
-        *c_error = message;                                  \
-    }
-
-#define return_error_if_m(must_be_true, c_error, code, message) \
-    if (!(must_be_true)) {                                      \
-        *c_error = message;                                     \
-        return;                                                 \
-    }
-
-#define return_if_error_m(c_error) \
-    {                              \
-        if (*c_error)              \
-            return;                \
-    }
-
-#define return_error_m(c_error, message) \
-    {                                    \
-        *c_error = message;              \
-        return;                          \
-    }

@@ -1,478 +1,346 @@
 /**
- * @file docs_ref.hpp
- * @author Ashot Vardanian
- * @date 26 Jun 2022
- * @addtogroup Cpp
- *
- * @brief C++ bindings for "ustore/db.h".
+ *  @file include/ustore/docs_ref.hpp
+ *  @author Ash Vardanian
+ *  @date June 26, 2022
+ *  @brief Proxy reading and modifying a batch of documents or fields inside them.
  */
 
 #pragma once
-#include "ustore/ustore.h"
-#include "ustore/cpp/types.hpp"      // `arena_t`
-#include "ustore/cpp/status.hpp"     // `status_t`
-#include "ustore/cpp/sfinae.hpp"     // `location_store_gt`
-#include "ustore/cpp/docs_table.hpp" // `docs_table_t`
+
+#include <cstddef> // `std::nullptr_t`
+
+#include <type_traits> // `std::conditional_t`, `std::decay_t`
+#include <utility>     // `std::forward`, `std::move`
+
+#include <ustore/docs.h>
+#include <ustore/docs_table.hpp>  // `docs_table`, `table_header`, `table_header_view_t`
+#include <ustore/ranges.hpp>      // `embedded_blobs_t`, `bits_span_t`, `joined_strs_t`, `ptr_range`
+#include <ustore/ranges_args.hpp> // `location_store`, `places_arg_extractor`, `contents_arg_extractor`
+#include <ustore/status.hpp>      // `status_t`, `expected`
+#include <ustore/types.hpp>       // `arena_t`
 
 namespace unum::ustore {
 
-template <typename locations_store_t>
-class docs_ref_gt;
-
 /**
- * @brief A proxy object, that allows both lookups and writes
- * with `[]` and assignment operators for a batch of keys
- * and @b sub-keys/fields across different documents.
- * Following assignment combinations are possible:
- * - one value to many keys
- * - many values to many keys
- * - one value to one key
- * The only impossible combination is assigning many values to one key.
+ *  @brief Proxy reading and writing documents, or fields inside them, at a batch of locations.
  *
- * @tparam locations_at Type describing the address of a value in DBMS.
- * - (ustore_collection_t?, ustore_key_t, ustore_field_t?): Single KV-pair location.
- * - (ustore_collection_t*, ustore_key_t*, ustore_field_t*): Externally owned range of keys.
- * - (ustore_collection_t[x], ustore_key_t[x], ustore_field_t[x]): On-stack array of addresses.
+ *  A proxy assigns one value to one or many locations, or many values to as many locations.
+ *  It allocates results in the arena of the collection that produced it, so threads sharing a collection,
+ *  or reads interleaved with new requests, pass a dedicated @c arena_t through @c on.
+ *  Copying is cheap and nothing throws.
  *
- * ## Memory Management
- *
- * Every "container" that overloads the @b [] operator has an internal "arena",
- * that is shared between all the @c docs_ref_gt's produced from it. That will
- * work great, unless:
- * - multiple threads are working with same collection handle or transaction.
- * - reading responses interleaves with new requests, which gobbles temporary memory.
- * For those cases, you can create a separate @c arena_t and pass it to `.on(...)`
- * member function. In such HPC environments we would recommend to @b reuse one such
- * are on every thread.
- *
- * ## Class Specs
- *
- * - Copyable: Yes.
- * - Exceptions: Never.
+ *  @tparam locations_ Addresses of the values: one key with an optional collection and field,
+ *      an externally owned range of such addresses, or an array of them.
  */
-template <typename locations_at>
-class docs_ref_gt {
+template <typename locations_>
+    requires(!std::is_rvalue_reference_v<locations_>)
+class docs_ref {
   public:
-    static_assert(!std::is_rvalue_reference_v<locations_at>, //
-                  "The internal object can't be an R-value Reference");
-
-    using locations_store_t = location_store_gt<locations_at>;
+    using locations_store_t = location_store<locations_>;
     using locations_plain_t = typename locations_store_t::plain_t;
-    using keys_extractor_t = places_arg_extractor_gt<locations_plain_t>;
+    using keys_extractor_t = places_arg_extractor<locations_plain_t>;
     static constexpr bool is_one_k = keys_extractor_t::is_one_k;
 
     using value_t = std::conditional_t<is_one_k, value_view_t, embedded_blobs_t>;
     using present_t = std::conditional_t<is_one_k, bool, bits_span_t>;
-    using length_t = std::conditional_t<is_one_k, ustore_length_t, ptr_range_gt<ustore_length_t>>;
+    using length_t = std::conditional_t<is_one_k, ustore_length_t, ptr_range<ustore_length_t>>;
 
   protected:
-    ustore_database_t db_ = nullptr;
-    ustore_transaction_t transaction_ = nullptr;
-    ustore_snapshot_t snapshot_ = {};
-    ustore_arena_t* arena_ = nullptr;
-    locations_store_t locations_;
-    ustore_doc_field_type_t type_ = ustore_doc_field_default_k;
-
-    template <typename contents_arg_at>
-    status_t any_write(contents_arg_at&&, ustore_doc_modification_t, ustore_doc_field_type_t, ustore_options_t) noexcept;
-
-    template <typename expected_at = value_t>
-    expected_gt<expected_at> any_get(ustore_doc_field_type_t, ustore_options_t) noexcept;
-
-    template <typename expected_at, typename layout_at>
-    expected_gt<expected_at> any_gather(layout_at&&, ustore_options_t) noexcept;
+    ustore_database_t db_ {nullptr};
+    ustore_transaction_t transaction_ {nullptr};
+    ustore_snapshot_t snapshot_ {};
+    ustore_arena_t* arena_ {nullptr};
+    locations_store_t locations_store_;
+    ustore_doc_field_type_t type_ {ustore_doc_field_json_k};
 
   public:
-    docs_ref_gt(ustore_database_t db,
-                ustore_transaction_t txn,
-                ustore_snapshot_t snap,
-                locations_at&& locations,
-                ustore_arena_t* arena,
-                ustore_doc_field_type_t type = ustore_doc_field_default_k) noexcept
-        : db_(db), transaction_(txn), snapshot_(snap), arena_(arena), locations_(std::forward<locations_at>(locations)),
-          type_(type) {}
+    docs_ref(ustore_database_t db, ustore_transaction_t transaction, ustore_snapshot_t snapshot, locations_&& locations,
+             ustore_arena_t* arena, ustore_doc_field_type_t type = ustore_doc_field_json_k) noexcept
+        : db_(db), transaction_(transaction), snapshot_(snapshot), arena_(arena),
+          locations_store_(std::forward<locations_>(locations)), type_(type) {}
 
-    docs_ref_gt(docs_ref_gt&&) = default;
-    docs_ref_gt& operator=(docs_ref_gt&&) = default;
-    docs_ref_gt(docs_ref_gt const&) = default;
-    docs_ref_gt& operator=(docs_ref_gt const&) = default;
-
-    docs_ref_gt& on(arena_t& arena) noexcept {
+    docs_ref& on(arena_t& arena) noexcept {
         arena_ = arena.member_ptr();
         return *this;
     }
 
-    docs_ref_gt& as(ustore_doc_field_type_t type) noexcept {
+    docs_ref& as(ustore_doc_field_type_t type) noexcept {
         type_ = type;
         return *this;
     }
 
-    expected_gt<value_t> value(bool watch = true) noexcept {
-        return any_get<value_t>(type_, !watch ? ustore_option_transaction_dont_watch_k : ustore_options_default_k);
+    expected<value_t> value(ustore_options_t options = ustore_options_default_k) noexcept {
+        return any_get<value_t>(type_, options);
     }
 
-    expected_gt<value_t> value(ustore_doc_field_type_t type, bool watch = true) noexcept {
-        return any_get<value_t>(type, !watch ? ustore_option_transaction_dont_watch_k : ustore_options_default_k);
+    expected<value_t> value(ustore_doc_field_type_t type,
+                            ustore_options_t options = ustore_options_default_k) noexcept {
+        return any_get<value_t>(type, options);
     }
 
-    operator expected_gt<value_t>() noexcept { return value(); }
+    operator expected<value_t>() noexcept { return value(); }
 
-    expected_gt<length_t> length(bool watch = true) noexcept {
-        return any_get<length_t>(type_, !watch ? ustore_option_transaction_dont_watch_k : ustore_options_default_k);
+    expected<length_t> length(ustore_options_t options = ustore_options_default_k) noexcept {
+        return any_get<length_t>(type_, options);
     }
 
-    /**
-     * @brief Checks if requested keys are present in the store.
-     * ! Related values may be empty strings.
-     */
-    expected_gt<present_t> present(bool watch = true) noexcept {
-        return any_get<present_t>(type_, !watch ? ustore_option_transaction_dont_watch_k : ustore_options_default_k);
+    /** Checks which locations hold a value, which may be empty. */
+    expected<present_t> present(ustore_options_t options = ustore_options_default_k) noexcept {
+        return any_get<present_t>(type_, options);
     }
 
-    /**
-     * @brief Pair-wise assigns values to keys located in this proxy objects.
-     * @param vals Values to be assigned.
-     * @param flush Pass true, if you need the data to be persisted before returning.
-     * @return status_t Non-NULL if only an error had occurred.
-     */
-    template <typename contents_arg_at>
-    status_t assign(contents_arg_at&& vals, bool flush = false) noexcept {
-        return any_write(std::forward<contents_arg_at>(vals),
-                         ustore_doc_modify_upsert_k,
-                         type_,
-                         flush ? ustore_option_write_flush_k : ustore_options_default_k);
+    /** Upserts @p contents pair-wise into the locations, in the format of the proxy. */
+    template <typename contents_>
+    status_t assign(contents_&& contents, ustore_options_t options = ustore_options_default_k) noexcept {
+        return any_write(std::forward<contents_>(contents), ustore_doc_modify_upsert_k, type_, options);
     }
 
-    template <typename contents_arg_at>
-    status_t assign(contents_arg_at&& vals, ustore_doc_field_type_t type, bool flush = false) noexcept {
-        return any_write(std::forward<contents_arg_at>(vals),
-                         ustore_doc_modify_upsert_k,
-                         type,
-                         flush ? ustore_option_write_flush_k : ustore_options_default_k);
+    /** Upserts @p contents pair-wise into the locations, in the format @p type. */
+    template <typename contents_>
+    status_t assign(contents_&& contents, ustore_doc_field_type_t type,
+                    ustore_options_t options = ustore_options_default_k) noexcept {
+        return any_write(std::forward<contents_>(contents), ustore_doc_modify_upsert_k, type, options);
     }
 
-    /**
-     * @brief Removes both the keys and the associated values.
-     * @param flush Pass true, if you need the data to be persisted before returning.
-     * @return status_t Non-NULL if only an error had occurred.
-     */
-    status_t erase(bool flush = false) noexcept { //
-        return assign(nullptr, flush);
+    /** Removes the documents, or the fields inside them. */
+    status_t erase(ustore_options_t options = ustore_options_default_k) noexcept { return assign(nullptr, options); }
+
+    /** Keeps the keys, but empties the associated values. */
+    status_t clear(ustore_options_t options = ustore_options_default_k) noexcept {
+        ustore_bytes_ptr_t non_null = reinterpret_cast<ustore_bytes_ptr_t>(this);
+        ustore_length_t length = 0;
+        contents_arg_t empty {};
+        empty.offsets_begin = {};
+        empty.lengths_begin = {&length};
+        empty.contents_begin = {&non_null};
+        empty.count = 1;
+        return assign(empty, options);
     }
 
-    /**
-     * @brief Keeps the keys, but clears the contents of associated values.
-     * @param flush Pass true, if you need the data to be persisted before returning.
-     * @return status_t Non-NULL if only an error had occurred.
-     */
-    status_t clear(bool flush = false) noexcept {
-        ustore_bytes_ptr_t any = reinterpret_cast<ustore_bytes_ptr_t>(this);
-        ustore_length_t len {};
-        contents_arg_t arg {};
-        arg.offsets_begin = {};
-        arg.lengths_begin = {&len};
-        arg.contents_begin = {&any};
-        arg.count = 1;
+    locations_plain_t& locations() noexcept { return locations_store_.ref(); }
+    locations_plain_t const& locations() const noexcept { return locations_store_.ref(); }
 
-        return assign(arg, flush);
+    /** Patches the documents with RFC 6902 JSON Patches. */
+    template <typename contents_>
+    status_t patch(contents_&& contents, ustore_options_t options = ustore_options_default_k) noexcept {
+        return any_write(std::forward<contents_>(contents), ustore_doc_modify_patch_k, type_, options);
     }
 
-    template <typename contents_arg_at>
-    docs_ref_gt& operator=(contents_arg_at&& vals) noexcept(false) {
-        auto status = assign(std::forward<contents_arg_at>(vals));
-        status.throw_unhandled();
-        return *this;
+    /** Patches the documents with RFC 7386 JSON Merge Patches. */
+    template <typename contents_>
+    status_t merge(contents_&& contents, ustore_options_t options = ustore_options_default_k) noexcept {
+        return any_write(std::forward<contents_>(contents), ustore_doc_modify_merge_k, type_, options);
     }
 
-    docs_ref_gt& operator=(std::nullptr_t) noexcept(false) {
-        auto status = erase();
-        status.throw_unhandled();
-        return *this;
+    /** Inserts @p contents, failing where a document already exists. */
+    template <typename contents_>
+    status_t insert(contents_&& contents, ustore_options_t options = ustore_options_default_k) noexcept {
+        return any_write(std::forward<contents_>(contents), ustore_doc_modify_insert_k, type_, options);
     }
 
-    locations_plain_t& locations() noexcept { return locations_.ref(); }
-    locations_plain_t& locations() const noexcept { return locations_.ref(); }
-
-    /**
-     * @brief Patches hierarchical documents with RFC 6902 JSON Patches.
-     */
-    template <typename contents_arg_at>
-    status_t patch(contents_arg_at&& vals, bool flush = false) noexcept {
-        return any_write(std::forward<contents_arg_at>(vals),
-                         ustore_doc_modify_patch_k,
-                         type_,
-                         flush ? ustore_option_write_flush_k : ustore_options_default_k);
+    /** Inserts @p contents, replacing existing documents. */
+    template <typename contents_>
+    status_t upsert(contents_&& contents, ustore_options_t options = ustore_options_default_k) noexcept {
+        return any_write(std::forward<contents_>(contents), ustore_doc_modify_upsert_k, type_, options);
     }
 
-    /**
-     * @brief Patches hierarchical documents with RFC 7386 JSON Merge Patches.
-     */
-    template <typename contents_arg_at>
-    status_t merge(contents_arg_at&& vals, bool flush = false) noexcept {
-        return any_write(std::forward<contents_arg_at>(vals),
-                         ustore_doc_modify_merge_k,
-                         type_,
-                         flush ? ustore_option_write_flush_k : ustore_options_default_k);
+    /** Replaces existing documents or fields with @p contents. */
+    template <typename contents_>
+    status_t update(contents_&& contents, ustore_options_t options = ustore_options_default_k) noexcept {
+        return any_write(std::forward<contents_>(contents), ustore_doc_modify_update_k, type_, options);
     }
 
-    template <typename contents_arg_at>
-    status_t insert(contents_arg_at&& vals, bool flush = false) noexcept {
-        return any_write(std::forward<contents_arg_at>(vals),
-                         ustore_doc_modify_insert_k,
-                         type_,
-                         flush ? ustore_option_write_flush_k : ustore_options_default_k);
+    /** Lists the unique paths to the leaves of the documents. */
+    expected<joined_strs_t> gist(ustore_options_t options = ustore_options_default_k) noexcept {
+        status_t status;
+        ustore_size_t found_count = 0;
+        ustore_length_t* found_offsets = nullptr;
+        ustore_str_span_t found_strings = nullptr;
+
+        decltype(auto) places = locations_store_.ref();
+        auto const collections = keys_extractor_t {}.collections(places);
+        auto const keys = keys_extractor_t {}.keys(places);
+
+        ustore_docs_gist_t docs_gist {};
+        docs_gist.db = db_;
+        docs_gist.error = status.member_ptr();
+        docs_gist.transaction = transaction_;
+        docs_gist.snapshot = snapshot_;
+        docs_gist.arena = arena_;
+        docs_gist.options = options;
+        docs_gist.docs_count = keys_extractor_t {}.count(places);
+        docs_gist.collections = collections.get();
+        docs_gist.collections_stride = collections.stride();
+        docs_gist.keys = keys.get();
+        docs_gist.keys_stride = keys.stride();
+        docs_gist.fields_count = &found_count;
+        docs_gist.offsets = &found_offsets;
+        docs_gist.fields = &found_strings;
+
+        ustore_docs_gist(&docs_gist);
+
+        joined_strs_t view {found_count, found_offsets, found_strings};
+        return {std::move(status), std::move(view)};
     }
 
-    template <typename contents_arg_at>
-    status_t upsert(contents_arg_at&& vals, bool flush = false) noexcept {
-        return any_write(std::forward<contents_arg_at>(vals),
-                         ustore_doc_modify_upsert_k,
-                         type_,
-                         flush ? ustore_option_write_flush_k : ustore_options_default_k);
+    /** Gathers every column of @p header from every document into a table typed at runtime. */
+    expected<docs_table_t> gather(table_header_view_t const& header,
+                                  ustore_options_t options = ustore_options_default_k) noexcept {
+        return any_gather<docs_table_t>(header, options);
     }
 
-    template <typename contents_arg_at>
-    status_t update(contents_arg_at&& vals, bool flush = false) noexcept {
-        return any_write(std::forward<contents_arg_at>(vals),
-                         ustore_doc_modify_update_k,
-                         type_,
-                         flush ? ustore_option_write_flush_k : ustore_options_default_k);
+    /** Gathers every column of @p header from every document into a table typed at compile time. */
+    template <typename... column_types_>
+    expected<docs_table<column_types_...>> gather(table_header<column_types_...> const& header,
+                                                  ustore_options_t options = ustore_options_default_k) noexcept {
+        return any_gather<docs_table<column_types_...>>(header, options);
     }
 
-    /**
-     * @brief Find the names of all unique fields in requested documents.
-     */
-    expected_gt<joined_strs_t> gist(bool watch = true) noexcept;
+  protected:
+    template <typename contents_>
+    status_t any_write(contents_&& contents, ustore_doc_modification_t modification, ustore_doc_field_type_t type,
+                       ustore_options_t options) noexcept {
+        status_t status;
+        using values_t = std::decay_t<contents_>;
+        using value_extractor_t = contents_arg_extractor<values_t>;
 
-    /**
-     * @brief For N documents and M fields gather (N * M) responses.
-     * You put in a @c table_layout_view_gt and you receive a @c `docs_table_gt`.
-     * Any column type annotation is optional.
-     */
-    expected_gt<docs_table_t> gather(table_header_t const& header, bool watch = true) noexcept {
-        auto options = !watch ? ustore_option_transaction_dont_watch_k : ustore_options_default_k;
-        return any_gather<docs_table_t, table_header_t const&>(header, options);
+        decltype(auto) places = locations_store_.ref();
+        auto const collections = keys_extractor_t {}.collections(places);
+        auto const keys = keys_extractor_t {}.keys(places);
+        auto const fields = keys_extractor_t {}.fields(places);
+
+        values_t const& values = contents;
+        auto const values_contents = value_extractor_t {}.contents(values);
+        auto const values_offsets = value_extractor_t {}.offsets(values);
+        auto const values_lengths = value_extractor_t {}.lengths(values);
+
+        ustore_docs_write_t docs_write {};
+        docs_write.db = db_;
+        docs_write.error = status.member_ptr();
+        docs_write.transaction = transaction_;
+        docs_write.arena = arena_;
+        docs_write.options = options;
+        docs_write.type = type;
+        docs_write.modification = modification;
+        docs_write.tasks_count = keys_extractor_t {}.count(places);
+        docs_write.collections = collections.get();
+        docs_write.collections_stride = collections.stride();
+        docs_write.keys = keys.get();
+        docs_write.keys_stride = keys.stride();
+        docs_write.fields = fields.get();
+        docs_write.fields_stride = fields.stride();
+        docs_write.offsets = values_offsets.get();
+        docs_write.offsets_stride = values_offsets.stride();
+        docs_write.lengths = values_lengths.get();
+        docs_write.lengths_stride = values_lengths.stride();
+        docs_write.values = values_contents.get();
+        docs_write.values_stride = values_contents.stride();
+
+        ustore_docs_write(&docs_write);
+        return status;
     }
 
-    expected_gt<docs_table_t> gather(table_header_view_t const& header, bool watch = true) noexcept {
-        auto options = !watch ? ustore_option_transaction_dont_watch_k : ustore_options_default_k;
-        return any_gather<docs_table_t, table_header_view_t const&>(header, options);
+    template <typename expected_ = value_t>
+    expected<expected_> any_get(ustore_doc_field_type_t type, ustore_options_t options) noexcept {
+        status_t status;
+        ustore_length_t* found_offsets = nullptr;
+        ustore_length_t* found_lengths = nullptr;
+        ustore_bytes_ptr_t found_values = nullptr;
+        ustore_octet_t* found_presences = nullptr;
+        constexpr bool wants_value_k = std::is_same_v<value_t, expected_>;
+        constexpr bool wants_length_k = std::is_same_v<length_t, expected_>;
+        constexpr bool wants_present_k = std::is_same_v<present_t, expected_>;
+
+        decltype(auto) places = locations_store_.ref();
+        auto const count = keys_extractor_t {}.count(places);
+        auto const collections = keys_extractor_t {}.collections(places);
+        auto const keys = keys_extractor_t {}.keys(places);
+        auto const fields = keys_extractor_t {}.fields(places);
+
+        ustore_docs_read_t docs_read {};
+        docs_read.db = db_;
+        docs_read.error = status.member_ptr();
+        docs_read.transaction = transaction_;
+        docs_read.snapshot = snapshot_;
+        docs_read.arena = arena_;
+        docs_read.options = options;
+        docs_read.type = type;
+        docs_read.tasks_count = count;
+        docs_read.collections = collections.get();
+        docs_read.collections_stride = collections.stride();
+        docs_read.keys = keys.get();
+        docs_read.keys_stride = keys.stride();
+        docs_read.fields = fields.get();
+        docs_read.fields_stride = fields.stride();
+        docs_read.presences = wants_present_k ? &found_presences : nullptr;
+        docs_read.offsets = wants_value_k ? &found_offsets : nullptr;
+        docs_read.lengths = wants_value_k || wants_length_k ? &found_lengths : nullptr;
+        docs_read.values = wants_value_k ? &found_values : nullptr;
+
+        ustore_docs_read(&docs_read);
+        if (!status) return std::move(status);
+
+        if constexpr (wants_length_k) {
+            ptr_range<ustore_length_t> const many {found_lengths, found_lengths + count};
+            if constexpr (is_one_k) return ustore_length_t {many[0]};
+            else return ptr_range<ustore_length_t> {many};
+        }
+        else if constexpr (wants_present_k) {
+            bits_span_t many {found_presences};
+            if constexpr (is_one_k) return bool(many[0]);
+            else return many;
+        }
+        else {
+            embedded_blobs_t many {count, found_offsets, found_lengths, found_values};
+            if constexpr (is_one_k) return many[0];
+            else return many;
+        }
     }
 
-    template <typename... column_types_at>
-    expected_gt<docs_table_gt<column_types_at...>> gather( //
-        table_header_gt<column_types_at...> const& header,
-        bool watch = true) noexcept {
-        auto options = !watch ? ustore_option_transaction_dont_watch_k : ustore_options_default_k;
-        using input_t = table_header_gt<column_types_at...>;
-        using output_t = docs_table_gt<column_types_at...>;
-        return any_gather<output_t, input_t const&>(header, options);
+    template <typename table_, typename header_>
+    expected<table_> any_gather(header_ const& header, ustore_options_t options) noexcept {
+        decltype(auto) places = locations_store_.ref();
+        auto const count = keys_extractor_t {}.count(places);
+        auto const collections = keys_extractor_t {}.collections(places);
+        auto const keys = keys_extractor_t {}.keys(places);
+
+        status_t status;
+        table_ view {
+            count, header.fields().size(), collections, keys, header.fields().begin(), header.types().begin(),
+        };
+
+        ustore_docs_gather_t docs_gather {};
+        docs_gather.db = db_;
+        docs_gather.error = status.member_ptr();
+        docs_gather.transaction = transaction_;
+        docs_gather.snapshot = snapshot_;
+        docs_gather.arena = arena_;
+        docs_gather.options = options;
+        docs_gather.docs_count = count;
+        docs_gather.fields_count = header.fields().size();
+        docs_gather.collections = collections.get();
+        docs_gather.collections_stride = collections.stride();
+        docs_gather.keys = keys.get();
+        docs_gather.keys_stride = keys.stride();
+        docs_gather.fields = header.fields().begin().get();
+        docs_gather.fields_stride = header.fields().stride();
+        docs_gather.types = header.types().begin().get();
+        docs_gather.types_stride = header.types().stride();
+        docs_gather.columns_validities = view.member_validities();
+        docs_gather.columns_conversions = view.member_conversions();
+        docs_gather.columns_collisions = view.member_collisions();
+        docs_gather.columns_scalars = view.member_scalars();
+        docs_gather.columns_offsets = view.member_offsets();
+        docs_gather.columns_lengths = view.member_lengths();
+        docs_gather.joined_strings = view.member_tape();
+
+        ustore_docs_gather(&docs_gather);
+        return {std::move(status), std::move(view)};
     }
 };
 
-static_assert(docs_ref_gt<ustore_key_t>::is_one_k);
-static_assert(std::is_same<docs_ref_gt<ustore_key_t>::value_t, value_view_t>());
-static_assert(docs_ref_gt<ustore_key_t>::is_one_k);
-static_assert(!docs_ref_gt<places_arg_t>::is_one_k);
-
-template <typename locations_at>
-template <typename expected_at>
-expected_gt<expected_at> docs_ref_gt<locations_at>::any_get(ustore_doc_field_type_t type, ustore_options_t options) noexcept {
-
-    status_t status;
-    ustore_length_t* found_offsets = nullptr;
-    ustore_length_t* found_lengths = nullptr;
-    ustore_bytes_ptr_t found_values = nullptr;
-    ustore_octet_t* found_presences = nullptr;
-    constexpr bool wants_value = std::is_same<value_t, expected_at>();
-    constexpr bool wants_length = std::is_same<length_t, expected_at>();
-    constexpr bool wants_present = std::is_same<present_t, expected_at>();
-
-    decltype(auto) locs = locations_.ref();
-    auto count = keys_extractor_t {}.count(locs);
-    auto keys = keys_extractor_t {}.keys(locs);
-    auto collections = keys_extractor_t {}.collections(locs);
-    auto fields = keys_extractor_t {}.fields(locs);
-    auto has_fields = fields && (!fields.repeats() || *fields);
-
-    ustore_docs_read_t docs_read {};
-    docs_read.db = db_;
-    docs_read.error = status.member_ptr();
-    docs_read.transaction = transaction_;
-    docs_read.snapshot = snapshot_;
-    docs_read.arena = arena_;
-    docs_read.options = options;
-    docs_read.type = type;
-    docs_read.tasks_count = count;
-    docs_read.collections = collections.get();
-    docs_read.collections_stride = collections.stride();
-    docs_read.keys = keys.get();
-    docs_read.keys_stride = keys.stride();
-    docs_read.fields = fields.get();
-    docs_read.fields_stride = fields.stride();
-    docs_read.presences = wants_present ? &found_presences : nullptr;
-    docs_read.offsets = wants_value ? &found_offsets : nullptr;
-    docs_read.lengths = wants_value || wants_length ? &found_lengths : nullptr;
-    docs_read.values = wants_value ? &found_values : nullptr;
-
-    ustore_docs_read(&docs_read);
-
-    if (!status)
-        return std::move(status);
-
-    if constexpr (wants_length) {
-        ptr_range_gt<ustore_length_t> many {found_lengths, found_lengths + count};
-        if constexpr (is_one_k)
-            return many[0];
-        else
-            return many;
-    }
-    else if constexpr (wants_present) {
-        bits_span_t many {found_presences};
-        if constexpr (is_one_k)
-            return bool(many[0]);
-        else
-            return many;
-    }
-    else {
-        embedded_blobs_t many {count, found_offsets, found_lengths, found_values};
-        if constexpr (is_one_k)
-            return many[0];
-        else
-            return many;
-    }
-}
-
-template <typename locations_at>
-template <typename contents_arg_at>
-status_t docs_ref_gt<locations_at>::any_write(contents_arg_at&& vals_ref,
-                                              ustore_doc_modification_t modification,
-                                              ustore_doc_field_type_t type,
-                                              ustore_options_t options) noexcept {
-    status_t status;
-    using value_extractor_t = contents_arg_extractor_gt<std::remove_reference_t<contents_arg_at>>;
-
-    decltype(auto) locs = locations_.ref();
-    auto count = keys_extractor_t {}.count(locs);
-    auto keys = keys_extractor_t {}.keys(locs);
-    auto collections = keys_extractor_t {}.collections(locs);
-    auto fields = keys_extractor_t {}.fields(locs);
-
-    auto vals = vals_ref;
-    auto contents = value_extractor_t {}.contents(vals);
-    auto offsets = value_extractor_t {}.offsets(vals);
-    auto lengths = value_extractor_t {}.lengths(vals);
-
-    ustore_docs_write_t docs_write {};
-    docs_write.db = db_;
-    docs_write.error = status.member_ptr();
-    docs_write.transaction = transaction_;
-    docs_write.arena = arena_;
-    docs_write.options = options;
-    docs_write.type = type;
-    docs_write.modification = modification;
-    docs_write.tasks_count = count;
-    docs_write.collections = collections.get();
-    docs_write.collections_stride = collections.stride();
-    docs_write.keys = keys.get();
-    docs_write.keys_stride = keys.stride();
-    docs_write.fields = fields.get();
-    docs_write.fields_stride = fields.stride();
-    docs_write.offsets = offsets.get();
-    docs_write.offsets_stride = offsets.stride();
-    docs_write.lengths = lengths.get();
-    docs_write.lengths_stride = lengths.stride();
-    docs_write.values = contents.get();
-    docs_write.values_stride = contents.stride();
-
-    ustore_docs_write(&docs_write);
-
-    return status;
-}
-
-template <typename locations_at>
-expected_gt<joined_strs_t> docs_ref_gt<locations_at>::gist(bool watch) noexcept {
-
-    status_t status;
-    ustore_size_t found_count = 0;
-    ustore_length_t* found_offsets = nullptr;
-    ustore_str_span_t found_strings = nullptr;
-
-    auto options = !watch ? ustore_option_transaction_dont_watch_k : ustore_options_default_k;
-    decltype(auto) locs = locations_.ref();
-    auto count = keys_extractor_t {}.count(locs);
-    auto keys = keys_extractor_t {}.keys(locs);
-    auto collections = keys_extractor_t {}.collections(locs);
-
-    ustore_docs_gist_t docs_gist {};
-    docs_gist.db = db_;
-    docs_gist.error = status.member_ptr();
-    docs_gist.transaction = transaction_;
-    docs_gist.snapshot = snapshot_;
-    docs_gist.arena = arena_;
-    docs_gist.options = options;
-    docs_gist.docs_count = count;
-    docs_gist.collections = collections.get();
-    docs_gist.collections_stride = collections.stride();
-    docs_gist.keys = keys.get();
-    docs_gist.keys_stride = keys.stride();
-    docs_gist.fields_count = &found_count;
-    docs_gist.offsets = &found_offsets;
-    docs_gist.fields = &found_strings;
-
-    ustore_docs_gist(&docs_gist);
-
-    joined_strs_t view {found_count, found_offsets, found_strings};
-    return {std::move(status), std::move(view)};
-}
-
-template <typename locations_at>
-template <typename expected_at, typename layout_at>
-expected_gt<expected_at> docs_ref_gt<locations_at>::any_gather(layout_at&& layout, ustore_options_t options) noexcept {
-
-    decltype(auto) locs = locations_.ref();
-    auto count = keys_extractor_t {}.count(locs);
-    auto keys = keys_extractor_t {}.keys(locs);
-    auto collections = keys_extractor_t {}.collections(locs);
-
-    status_t status;
-    expected_at view {
-        count,
-        layout.fields().size(),
-        collections,
-        keys,
-        layout.fields().begin(),
-        layout.types().begin(),
-    };
-
-    ustore_docs_gather_t docs_gather {};
-    docs_gather.db = db_;
-    docs_gather.error = status.member_ptr();
-    docs_gather.transaction = transaction_;
-    docs_gather.snapshot = snapshot_;
-    docs_gather.arena = arena_;
-    docs_gather.options = options;
-    docs_gather.docs_count = count;
-    docs_gather.fields_count = layout.fields().size();
-    docs_gather.collections = collections.get();
-    docs_gather.collections_stride = collections.stride();
-    docs_gather.keys = keys.get();
-    docs_gather.keys_stride = keys.stride();
-    docs_gather.fields = layout.fields().begin().get();
-    docs_gather.fields_stride = layout.fields().stride();
-    docs_gather.types = layout.types().begin().get();
-    docs_gather.types_stride = layout.types().stride();
-    docs_gather.columns_validities = view.member_validities();
-    docs_gather.columns_conversions = view.member_conversions();
-    docs_gather.columns_collisions = view.member_collisions();
-    docs_gather.columns_scalars = view.member_scalars();
-    docs_gather.columns_offsets = view.member_offsets();
-    docs_gather.columns_lengths = view.member_lengths();
-    docs_gather.joined_strings = view.member_tape();
-
-    ustore_docs_gather(&docs_gather);
-
-    return {std::move(status), std::move(view)};
-}
+static_assert(docs_ref<ustore_key_t>::is_one_k);
+static_assert(std::is_same_v<docs_ref<ustore_key_t>::value_t, value_view_t>);
+static_assert(!docs_ref<places_arg_t>::is_one_k);
 
 } // namespace unum::ustore

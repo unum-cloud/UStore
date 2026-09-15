@@ -1,92 +1,61 @@
 /**
- * @file docs.h
- * @author Ashot Vardanian
- * @date 27 Jun 2022
- * @addtogroup C
+ *  @file include/ustore/docs.h
+ *  @author Ash Vardanian
+ *  @date June 27, 2022
+ *  @brief The binary interface for collections of JSON documents.
  *
- * @brief Binary Interface Standard for JSON-like @b Documents collections.
+ *  Documents extend the binary values of @c blobs.h with hierarchical contents stored as JSON text,
+ *  so reading a document back through the binary interface may not return the exact bytes written.
  *
- * It extends the basic "ustore.h" towards values storing hierarchical documents.
- * Examples: JSONs, MsgPacks, BSONs and a number of other similar formats.
- * Yet no guarantees are provided regarding the internal representation of the
- * values, so if if you want to access same values through binary interface,
- * you may not get the exact same bytes as you have provided in.
- *
- * ## Understanding Fields
- *
- * A field is an intra-document @b potentially-nested key, like: "_id" or "user".
- * To define a nested path, build an RFC 6901 JSON-Pointer, starting with a slash:
- * - "/user/followers_count"
- * - "/posts/0/text"
- *
- * ## Number of Keys vs Number of Fields
- *
- * One of the biggest questions to API is preferring "Zips" vs the "Cartesian Product"
- * of "Key" and "Field" combinations. When writing we may want to discard a certain
- * subset of fields in every document, but we may also be interested in having a
- * more targetted approach.
- *
- * ## Type Checking and Casting
- *
- * Ideally, the data shouldn't be parsed more than once, to avoid performance loss.
- * So the primary interfaces of Docs Store are type-agnostic. Vectorized "gather"
- * operations perform the best effort to convert into the requested format, but
- * it's not always possible.
+ *  A field addresses a value inside a document: a top-level key such as "_id", or an RFC 6901 JSON
+ *  Pointer starting with a slash, such as "/user/followers_count" or "/posts/0/text". Reads, writes
+ *  and gists take one field per task, while a gather reads every field of every document into
+ *  columns, converting each value into the requested type on a best-effort basis.
  */
 
 #pragma once
+
+#include <ustore/db.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#include "ustore/db.h"
-
-/*********************************************************/
-/*****************   Structures & Consts  ****************/
-/*********************************************************/
+#pragma region Types
 
 /**
- * @brief Type IDs needed to describing (sub-) document contents.
- * Most types mimic what's present in Apache Arrow. Others, describe
- * hierarchical documents, like JSON, BSON and MessagePack.
+ *  @brief Type of a document, or of a value extracted from one.
  *
- * For Business Intelligence and Analytics mostly the `::ustore_doc_field_i64_k`
- * and `::ustore_doc_field_f64_k` are used.
+ *  @c ustore_doc_field_json_k is JSON text, @c ustore_doc_field_str_k is a value printed as text, and
+ *  @c ustore_doc_field_bin_k is the same text without a null terminator; the rest are fixed-width scalars.
  */
 typedef enum ustore_doc_field_type_t {
-
     ustore_doc_field_json_k = 0,
-    ustore_doc_field_bson_k = 1,
-    ustore_doc_field_msgpack_k = 2,
-    ustore_doc_field_default_k = ustore_doc_field_json_k,
 
     ustore_doc_field_null_k = 10,
     ustore_doc_field_bool_k = 11,
     ustore_doc_field_uuid_k = 12,
 
-    ustore_doc_field_i8_k = 20,
-    ustore_doc_field_i16_k = 21,
-    ustore_doc_field_i32_k = 22,
-    ustore_doc_field_i64_k = 23,
-
-    ustore_doc_field_u8_k = 30,
-    ustore_doc_field_u16_k = 31,
-    ustore_doc_field_u32_k = 32,
-    ustore_doc_field_u64_k = 33,
-
-    ustore_doc_field_f16_k = 40,
-    ustore_doc_field_f32_k = 41,
     ustore_doc_field_f64_k = 42,
+    ustore_doc_field_f32_k = 41,
+    ustore_doc_field_f16_k = 40,
+
+    ustore_doc_field_i64_k = 23,
+    ustore_doc_field_i32_k = 22,
+    ustore_doc_field_i16_k = 21,
+    ustore_doc_field_i8_k = 20,
+
+    ustore_doc_field_u64_k = 33,
+    ustore_doc_field_u32_k = 32,
+    ustore_doc_field_u16_k = 31,
+    ustore_doc_field_u8_k = 30,
 
     ustore_doc_field_bin_k = 50,
     ustore_doc_field_str_k = 51,
-
 } ustore_doc_field_type_t;
 
-/**
- * @brief Kind of document modification to be applied on `ustore_docs_write()`.
- */
+/** Modification @c ustore_docs_write applies: an upsert, update or insert, an RFC 6902 patch, or an
+ *  RFC 7386 merge. */
 typedef enum ustore_doc_modification_t {
     ustore_doc_modify_upsert_k = 0,
     ustore_doc_modify_update_k = 1,
@@ -95,292 +64,307 @@ typedef enum ustore_doc_modification_t {
     ustore_doc_modify_merge_k = 4,
 } ustore_doc_modification_t;
 
-/*********************************************************/
-/*****************	 Primary Functions	  ****************/
-/*********************************************************/
+#pragma endregion Types
+
+#pragma region Primary Functions
 
 /**
- * @brief Main "setter" interface for (sub-)document-level data.
- * Generalization of @c ustore_write_t to structured values.
- * @see `ustore_docs_write()`, `ustore_write_t`, `ustore_write()`.
+ *  @brief The arguments of @c ustore_docs_write, which writes whole documents or fields inside them.
  *
- * ## Inferring Document IDs
- *
- * In other interfaces it's necessary to explicitly provide the @c ustore_key_t keys.
- * With documents, you can skip the `keys` and pass just `fields`, which will be
- * used to dynamically extract the keys. To make it compatible with MongoDB and
- * ElasticSearch you can pass @b "_id" into `fields`.
+ *  Without @c keys, the key of every document is read from its @c id_field, which must hold an integer.
  */
-
 typedef struct ustore_docs_write_t {
 
-    /// @name Context
-    /// @{
-
-    /** @brief Already open database instance. */
+    /** An open database. */
     ustore_database_t db;
-    /** @brief Pointer to exported error message. */
+
+    /** Output for the error message. */
     ustore_error_t* error;
-    /** @brief The transaction in which the operation will be watched. */
+
+    /** Transaction the write belongs to, or @c NULL. */
     ustore_transaction_t transaction;
-    /** @brief Reusable memory handle. */
+
+    /** Reusable memory for intermediate results. */
     ustore_arena_t* arena;
-    /** @brief Write or Read+Write options for Read-Modify-Write operations. @see `ustore_write_t`. */
+
+    /** Write options, or read and write options for modifications that read the document first. */
     ustore_options_t options;
 
-    /// @}
-    /// @name Inputs
-    /// @{
-
+    /** Number of documents or fields to write. */
     ustore_size_t tasks_count;
+
+    /** Format of the written values. */
     ustore_doc_field_type_t type;
+
+    /** Modification applied to every document. */
     ustore_doc_modification_t modification;
 
+    /** Collections of the documents, where @c NULL stands for the main collection. */
     ustore_collection_t const* collections;
+
+    /** Bytes between consecutive collections, where zero repeats the first one. */
     ustore_size_t collections_stride;
 
+    /** Keys of the documents, or @c NULL to read them from @c id_field. */
     ustore_key_t const* keys;
+
+    /** Bytes between consecutive keys, where zero repeats the first one. */
     ustore_size_t keys_stride;
 
+    /** Fields to modify inside the documents, or @c NULL for whole documents. */
     ustore_str_view_t const* fields;
+
+    /** Bytes between consecutive fields, where zero repeats the first one. */
     ustore_size_t fields_stride;
 
+    /** Bitmap of present values, or @c NULL when every value is present. */
     ustore_octet_t const* presences;
 
+    /** Offsets of the values inside their buffers, or @c NULL. */
     ustore_length_t const* offsets;
+
+    /** Bytes between consecutive offsets, where zero repeats the first one. */
     ustore_size_t offsets_stride;
 
+    /** Lengths of the values, or @c NULL to derive them from @c offsets or null terminators. */
     ustore_length_t const* lengths;
+
+    /** Bytes between consecutive lengths, where zero repeats the first one. */
     ustore_size_t lengths_stride;
 
+    /** Buffers holding the values. */
     ustore_bytes_cptr_t const* values;
+
+    /** Bytes between consecutive buffer pointers, where zero repeats the first one. */
     ustore_size_t values_stride;
 
-    ustore_str_view_t id_field; // "_id"
-    /// @}
+    /** Field holding the key of every document when @c keys is @c NULL, such as "_id". */
+    ustore_str_view_t id_field;
 
 } ustore_docs_write_t;
 
 /**
- * @brief Main "setter" interface for (sub-)document-level data.
- * Generalization of @c ustore_write_t to structured values.
- * @see `ustore_docs_write_t`, `ustore_write_t`, `ustore_write()`.
+ *  @brief Writes whole documents or fields inside them.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_docs_write(ustore_docs_write_t*);
+void ustore_docs_write(ustore_docs_write_t* arguments);
 
 /**
- * @brief Main "getter" interface for (sub-)document-level data.
- * Generalization of @c ustore_read_t to structured values.
- * @see `ustore_docs_read()`, `ustore_read_t`, `ustore_read()`.
+ *  @brief The arguments of @c ustore_docs_read, which reads whole documents or fields inside them.
+ *
+ *  Whole documents read as JSON pass straight through to the engine; everything else is parsed and
+ *  exported, printing scalars as text for @c ustore_doc_field_str_k and nested values as JSON text.
  */
 typedef struct ustore_docs_read_t {
 
-    /// @name Context
-    /// @{
-
-    /** @brief Already open database instance. */
+    /** An open database. */
     ustore_database_t db;
-    /** @brief Pointer to exported error message. */
+
+    /** Output for the error message. */
     ustore_error_t* error;
-    /** @brief The transaction in which the operation will be watched. */
+
+    /** Transaction that watches the read documents, or @c NULL. */
     ustore_transaction_t transaction;
-    /** @brief A snapshot captures a point-in-time view of the DB at the time it's created. */
+
+    /** Snapshot whose view is read. */
     ustore_snapshot_t snapshot;
-    /** @brief Reusable memory handle. */
+
+    /** Reusable memory for the results. */
     ustore_arena_t* arena;
-    /** @brief Read options. @see `ustore_read_t`. */
+
+    /** Read options. */
     ustore_options_t options;
 
-    /// @}
-    /// @name Inputs
-    /// @{
-
+    /** Format to export the values in, either JSON or a string. */
     ustore_doc_field_type_t type;
+
+    /** Number of documents or fields to read. */
     ustore_size_t tasks_count;
 
+    /** Collections of the documents, where @c NULL stands for the main collection. */
     ustore_collection_t const* collections;
+
+    /** Bytes between consecutive collections, where zero repeats the first one. */
     ustore_size_t collections_stride;
 
+    /** Keys of the documents. */
     ustore_key_t const* keys;
+
+    /** Bytes between consecutive keys, where zero repeats the first one. */
     ustore_size_t keys_stride;
 
+    /** Fields to read inside the documents, or @c NULL for whole documents. */
     ustore_str_view_t const* fields;
+
+    /** Bytes between consecutive fields, where zero repeats the first one. */
     ustore_size_t fields_stride;
 
-    /// @}
-    /// @name Outputs
-    /// @{
-
+    /** Optional output for a bitmap of found values. */
     ustore_octet_t** presences;
-    ustore_length_t** offsets;
-    ustore_length_t** lengths;
-    ustore_bytes_ptr_t* values;
 
-    /// @}
+    /** Optional output for the offsets of the values inside @c values. */
+    ustore_length_t** offsets;
+
+    /** Optional output for the lengths of the values. */
+    ustore_length_t** lengths;
+
+    /** Optional output for the joined contents of the values. */
+    ustore_bytes_ptr_t* values;
 
 } ustore_docs_read_t;
 
 /**
- * @brief Main "getter" interface for (sub-)document-level data.
- * Generalization of @c ustore_read_t to structured values.
- * @see `ustore_docs_read_t`, `ustore_read_t`, `ustore_read()`.
+ *  @brief Reads whole documents or fields inside them.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_docs_read(ustore_docs_read_t*);
+void ustore_docs_read(ustore_docs_read_t* arguments);
 
-/**
- * @brief Lists fields & paths present in wanted documents or entire collections.
- * @see `ustore_docs_gist()`.
- */
+/** The arguments of @c ustore_docs_gist, which lists the unique paths to the leaves of the requested
+ *  documents. */
 typedef struct ustore_docs_gist_t {
 
-    /// @name Context
-    /// @{
-
-    /** @brief Already open database instance. */
+    /** An open database. */
     ustore_database_t db;
-    /** @brief Pointer to exported error message. */
+
+    /** Output for the error message. */
     ustore_error_t* error;
-    /** @brief The transaction in which the operation will be watched. */
+
+    /** Transaction that watches the read documents, or @c NULL. */
     ustore_transaction_t transaction;
-    /** @brief A snapshot captures a point-in-time view of the DB at the time it's created. */
+
+    /** Snapshot whose view is read. */
     ustore_snapshot_t snapshot;
-    /** @brief Reusable memory handle. */
+
+    /** Reusable memory for the results. */
     ustore_arena_t* arena;
-    /** @brief Read options. @see `ustore_read_t`. */
+
+    /** Read options. */
     ustore_options_t options;
 
-    /// @}
-    /// @name Inputs
-    /// @{
-
+    /** Number of documents to inspect. */
     ustore_size_t docs_count;
 
+    /** Collections of the documents, where @c NULL stands for the main collection. */
     ustore_collection_t const* collections;
+
+    /** Bytes between consecutive collections, where zero repeats the first one. */
     ustore_size_t collections_stride;
 
+    /** Keys of the documents. */
     ustore_key_t const* keys;
+
+    /** Bytes between consecutive keys, where zero repeats the first one. */
     ustore_size_t keys_stride;
 
-    /// @}
-    /// @name Outputs
-    /// @{
-
+    /** Output for the number of unique paths. */
     ustore_size_t* fields_count;
-    ustore_length_t** offsets;
-    ustore_char_t** fields;
 
-    /// @}
+    /** Output for the offsets of the paths inside @c fields. */
+    ustore_length_t** offsets;
+
+    /** Output for the joined null-terminated JSON Pointers. */
+    ustore_char_t** fields;
 
 } ustore_docs_gist_t;
 
 /**
- * @brief Lists fields & paths present in wanted documents or entire collections.
- * @see `ustore_docs_gist_t`.
+ *  @brief Lists the unique paths to the leaves of the requested documents.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_docs_gist(ustore_docs_gist_t*);
+void ustore_docs_gist(ustore_docs_gist_t* arguments);
 
 /**
- * @brief Gathers `N*M` values matching `M` fields from `N` docs in @b columnar form.
- * @see `ustore_docs_gather()`.
+ *  @brief The arguments of @c ustore_docs_gather, which reads @c fields_count fields of
+ *      @c docs_count documents into columns.
  *
- * ## Validity Columns
- *
- * Just like Apache Arrow, we export bitsets indicating the validity of matches.
- * Unlike Apache Arrow, we return @b three such bitsets for every array of content:
- *
- * - `columns_validities`: same as in Arrow.
- * - `columns_conversions`: with ones where "string to int" or similar conversions took place.
- * - `columns_collisions`: with ones where non-convertible entry was found under given path.
- *
- * More explicitly, "conversions" mean, that the export/cast changes the semantics.
- * We identify following type groups: booleans, integers, floats, strings.
- * Any downcasting conversion between them will be done with best-effort,
- * but may not be lossless. Meaning that:
- *
- * - `bool` to `int` or `float` isn't a downcast.
- * - `int`, `bool`, `str` to `bool` is a downcast.
- *
- * ## Columns Layout
- *
- * All of `columns_validities`, `columns_conversions`, `columns_collisions`,
- * `columns_scalars`, `columns_offsets` and `columns_lengths` are triple pointers.
- * Meaning that they are pointer to where an array of arrays will exported:
- *
- * - Number of columns will be `== fields_count`.
- * - Number of entries in each column will be `>= docs_count`.
- *
- * ## Strings Layout
- *
- * Texts requested with `::ustore_doc_field_str_k` will be appended with a null-termination
- * character. Binary strings requested with `::ustore_doc_field_bin_k` - will not.
- * Offsets and lengths will be organized in a @b column-major layout with `docs_count`
- * entries in every column, but the contents of the joined string will be organized
- * in a @b row-major order. It will make the data easier to pass into bulk text-search
- * systems or Language Models training pipelines.
+ *  Every output points to an array of @c fields_count columns, each holding @c docs_count entries.
+ *  Validity, conversion and collision columns are bitmaps, least significant bit first. A value is
+ *  valid when it was found and converted, converted when the conversion changed its semantics, such
+ *  as a string parsed into an integer, and colliding when a value of an inconvertible type sits under
+ *  the field. Strings requested as @c ustore_doc_field_str_k end with a null terminator, and binary
+ *  strings do not; their offsets and lengths are laid out column by column, their contents row by row.
  */
-
 typedef struct ustore_docs_gather_t {
 
-    /// @name Context
-    /// @{
-
-    /** @brief Already open database instance. */
+    /** An open database. */
     ustore_database_t db;
-    /** @brief Pointer to exported error message. */
+
+    /** Output for the error message. */
     ustore_error_t* error;
-    /** @brief The transaction in which the operation will be watched. */
+
+    /** Transaction that watches the read documents, or @c NULL. */
     ustore_transaction_t transaction;
-    /** @brief A snapshot captures a point-in-time view of the DB at the time it's created. */
+
+    /** Snapshot whose view is read. */
     ustore_snapshot_t snapshot;
-    /** @brief Reusable memory handle. */
+
+    /** Reusable memory for the results. */
     ustore_arena_t* arena;
-    /** @brief Read options. @see `ustore_read_t`. */
+
+    /** Read options. */
     ustore_options_t options;
 
-    /// @}
-    /// @name Inputs
-    /// @{
-
+    /** Number of documents, the rows of the output. */
     ustore_size_t docs_count;
+
+    /** Number of fields, the columns of the output. */
     ustore_size_t fields_count;
 
+    /** Collections of the documents, where @c NULL stands for the main collection. */
     ustore_collection_t const* collections;
+
+    /** Bytes between consecutive collections, where zero repeats the first one. */
     ustore_size_t collections_stride;
 
+    /** Keys of the documents. */
     ustore_key_t const* keys;
+
+    /** Bytes between consecutive keys, where zero repeats the first one. */
     ustore_size_t keys_stride;
 
+    /** Fields to gather from every document. */
     ustore_str_view_t const* fields;
+
+    /** Bytes between consecutive fields, where zero repeats the first one. */
     ustore_size_t fields_stride;
 
+    /** Types to convert every field into. */
     ustore_doc_field_type_t const* types;
+
+    /** Bytes between consecutive types, where zero repeats the first one. */
     ustore_size_t types_stride;
 
-    /// @}
-    /// @name Outputs
-    /// @{
-
+    /** Optional output for the validity bitmaps. */
     ustore_octet_t*** columns_validities;
+
+    /** Optional output for the conversion bitmaps. */
     ustore_octet_t*** columns_conversions;
+
+    /** Optional output for the collision bitmaps. */
     ustore_octet_t*** columns_collisions;
 
+    /** Output for the scalar columns, with @c NULL for string columns. */
     ustore_byte_t*** columns_scalars;
 
+    /** Output for the offsets of strings inside @c joined_strings, with @c NULL for scalar columns. */
     ustore_length_t*** columns_offsets;
-    ustore_length_t*** columns_lengths;
-    ustore_byte_t** joined_strings;
 
-    /// @}
+    /** Output for the lengths of strings, with @c NULL for scalar columns. */
+    ustore_length_t*** columns_lengths;
+
+    /** Output for the contents of all strings, joined row by row. */
+    ustore_byte_t** joined_strings;
 
 } ustore_docs_gather_t;
 
 /**
- * @brief Vectorized "gather" interface, that collects, type-checks and
- * casts `N*M` values matching `M` fields from `N` docs into a @b columnar form.
- * @see `ustore_docs_gather_t`.
+ *  @brief Reads, type-checks and converts @c fields_count fields of @c docs_count documents into columns.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_docs_gather(ustore_docs_gather_t*);
+void ustore_docs_gather(ustore_docs_gather_t* arguments);
+
+#pragma endregion Primary Functions
 
 #ifdef __cplusplus
-} /* end extern "C" */
+}
 #endif

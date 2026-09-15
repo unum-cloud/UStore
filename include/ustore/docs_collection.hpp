@@ -1,208 +1,177 @@
 /**
- * @file docs_collection.hpp
- * @author Ashot Vardanian
- * @date 26 Jun 2022
- * @addtogroup Cpp
- *
- * @brief C++ bindings for "ustore/db.h".
+ *  @file include/ustore/docs_collection.hpp
+ *  @author Ash Vardanian
+ *  @date June 26, 2022
+ *  @brief Handle to a collection of JSON documents.
  */
 
 #pragma once
-#include "ustore/cpp/docs_ref.hpp"
+
+#include <cstddef> // `std::size_t`
+
+#include <concepts>         // `std::integral`
+#include <initializer_list> // `std::initializer_list`
+#include <limits>           // `std::numeric_limits`
+#include <type_traits>      // `std::remove_cvref_t`
+#include <utility>          // `std::exchange`, `std::forward`, `std::swap`
+
+#include <ustore/blobs_range.hpp> // `blobs_range_t`, `keys_range_t`, `size_range_t`
+#include <ustore/docs.h>
+#include <ustore/docs_ref.hpp>    // `docs_ref`
+#include <ustore/ranges.hpp>      // `batch_concept`, `strided`
+#include <ustore/ranges_args.hpp> // `keys_view_t`, `places_arg_t`, `locations_in_collection`
+#include <ustore/status.hpp>      // `status_t`, `expected`
+#include <ustore/types.hpp>       // `any_arena_t`, `collection_key_field_t`, `has_field_concept`
 
 namespace unum::ustore {
 
 /**
- * @brief Collection is persistent associative container,
- * essentially a transactional @b map<id,std::map<..>>.
- * Or in Python terms: @b dict[int,dict].
+ *  @brief Transactional map from keys to JSON documents, cheap to construct.
  *
- * Generally cheap to construct. Can address @b both collections
- * "HEAD" state, as well as some "snapshot"/"transaction" view.
- *
- * ## Class Specs
- *
- * - Concurrency: Thread-safe, for @b unique arenas.
- *   For details, see @c docs_ref_gt section on "Memory Management"
- * - Lifetime: @b Must live shorter then the DB it belongs to.
- * - Exceptions: Only the `size` method.
- * - Copyable: Will create a new empty arena.
- *   Will remain attached to same transaction context, if any was set.
- *
- * ## Types
- *
- * Types @b loosely describe the data stored in the collection
- * and @b exactly define the communication through this exact handle.
- * Example: Same collection can accept similar types, such
- * as `::ustore_doc_field_json_k` and `::ustore_doc_field_msgpack_k`. Both will be
- * converted into some internal hierarchical representation
- * in "Document Collections", and can later be queried with
- * any "Document type".
+ *  A handle addresses either the current state of a collection or its view inside a transaction or a snapshot,
+ *  and never outlives its database.
+ *  Handles are thread-safe while every thread reads through its own arena, and a copy starts with a new empty arena
+ *  attached to the same transaction.
+ *  The type of a handle shapes only how values cross it, since documents are stored as JSON whatever they arrive as.
  */
 class docs_collection_t {
     ustore_database_t db_ {nullptr};
     ustore_collection_t collection_ {ustore_collection_main_k};
-    ustore_transaction_t txn_ {nullptr};
-    ustore_snapshot_t snap_ = {};
+    ustore_transaction_t transaction_ {nullptr};
+    ustore_snapshot_t snapshot_ {};
     any_arena_t arena_ {nullptr};
-    ustore_doc_field_type_t type_ {ustore_doc_field_default_k};
+    ustore_doc_field_type_t type_ {ustore_doc_field_json_k};
+
+    status_t drop_with(ustore_drop_mode_t mode) noexcept {
+        status_t status;
+        ustore_collection_drop_t collection_drop {};
+        collection_drop.db = db_;
+        collection_drop.error = status.member_ptr();
+        collection_drop.id = collection_;
+        collection_drop.mode = mode;
+        ustore_collection_drop(&collection_drop);
+        return status;
+    }
 
   public:
-    inline docs_collection_t() noexcept : arena_(nullptr) {}
-    inline docs_collection_t(ustore_database_t db_ptr,
-                             ustore_collection_t collection = ustore_collection_main_k,
-                             ustore_transaction_t txn = nullptr,
-                             ustore_snapshot_t snap = {},
-                             ustore_arena_t* arena = nullptr,
-                             ustore_doc_field_type_t type = ustore_doc_field_default_k) noexcept
-        : db_(db_ptr), collection_(collection), txn_(txn), snap_(snap), arena_(db_, arena), type_(type) {}
+    docs_collection_t() noexcept = default;
 
-    inline docs_collection_t(docs_collection_t&& other) noexcept
+    docs_collection_t(ustore_database_t db, ustore_collection_t collection = ustore_collection_main_k,
+                      ustore_transaction_t transaction = nullptr, ustore_snapshot_t snapshot = {},
+                      ustore_arena_t* arena = nullptr, ustore_doc_field_type_t type = ustore_doc_field_json_k) noexcept
+        : db_(db), collection_(collection), transaction_(transaction), snapshot_(snapshot), arena_(db_, arena),
+          type_(type) {}
+
+    docs_collection_t(docs_collection_t&& other) noexcept
         : db_(other.db_), collection_(std::exchange(other.collection_, ustore_collection_main_k)),
-          txn_(std::exchange(other.txn_, nullptr)), snap_(std::exchange(other.snap_, 0)),
-          arena_(std::exchange(other.arena_, {nullptr})), type_(std::exchange(other.type_, ustore_doc_field_default_k)) {}
+          transaction_(std::exchange(other.transaction_, nullptr)), snapshot_(std::exchange(other.snapshot_, {})),
+          arena_(std::exchange(other.arena_, {nullptr})), type_(std::exchange(other.type_, ustore_doc_field_json_k)) {}
 
-    inline docs_collection_t& operator=(docs_collection_t&& other) noexcept {
+    docs_collection_t& operator=(docs_collection_t&& other) noexcept {
         std::swap(db_, other.db_);
         std::swap(collection_, other.collection_);
-        std::swap(txn_, other.txn_);
-        std::swap(snap_, other.snap_);
+        std::swap(transaction_, other.transaction_);
+        std::swap(snapshot_, other.snapshot_);
         std::swap(arena_, other.arena_);
         std::swap(type_, other.type_);
         return *this;
     }
 
-    inline docs_collection_t(docs_collection_t const& other) noexcept
-        : db_(other.db_), collection_(other.collection_), txn_(other.txn_), snap_(other.snap_), arena_(other.db_),
-          type_(other.type_) {}
+    docs_collection_t(docs_collection_t const& other) noexcept
+        : db_(other.db_), collection_(other.collection_), transaction_(other.transaction_), snapshot_(other.snapshot_),
+          arena_(other.db_), type_(other.type_) {}
 
-    inline docs_collection_t& operator=(docs_collection_t const& other) noexcept {
+    docs_collection_t& operator=(docs_collection_t const& other) noexcept {
         db_ = other.db_;
         collection_ = other.collection_;
-        txn_ = other.txn_;
-        snap_ = other.snap_;
+        transaction_ = other.transaction_;
+        snapshot_ = other.snapshot_;
         arena_ = any_arena_t(other.db_);
         type_ = other.type_;
         return *this;
     }
 
-    inline operator ustore_collection_t() const noexcept { return collection_; }
-    inline ustore_collection_t* member_ptr() noexcept { return &collection_; }
-    inline ustore_arena_t* member_arena() noexcept { return arena_.member_ptr(); }
-    inline ustore_database_t db() const noexcept { return db_; }
-    inline ustore_transaction_t txn() const noexcept { return txn_; }
-    inline ustore_snapshot_t snap() const noexcept { return snap_; }
+    operator ustore_collection_t() const noexcept { return collection_; }
+    ustore_collection_t* member_ptr() noexcept { return &collection_; }
+    ustore_arena_t* member_arena() noexcept { return arena_.member_ptr(); }
+    ustore_database_t db() const noexcept { return db_; }
+    ustore_transaction_t transaction() const noexcept { return transaction_; }
+    ustore_snapshot_t snapshot() const noexcept { return snapshot_; }
 
-    inline blobs_range_t members( //
+    blobs_range_t members( //
         ustore_key_t min_key = std::numeric_limits<ustore_key_t>::min(),
         ustore_key_t max_key = std::numeric_limits<ustore_key_t>::max()) const noexcept {
-        return {db_, txn_, snap_, collection_, min_key, max_key};
+        return {db_, transaction_, snapshot_, collection_, min_key, max_key};
     }
 
-    inline keys_range_t keys( //
+    keys_range_t keys( //
         ustore_key_t min_key = std::numeric_limits<ustore_key_t>::min(),
         ustore_key_t max_key = std::numeric_limits<ustore_key_t>::max()) const noexcept {
         return {members(min_key, max_key)};
     }
 
-    inline expected_gt<size_range_t> size_range() const noexcept {
+    expected<size_range_t> size_range() const noexcept {
         auto maybe = members().size_estimates();
         return {maybe.release_status(), std::move(maybe->cardinality)};
     }
 
-    std::size_t size() const noexcept(false) {
+    /** Estimates the number of documents as the middle of @c size_range. */
+    expected<std::size_t> size() const noexcept {
         auto maybe = size_range();
-        maybe.throw_unhandled();
+        if (!maybe) return maybe.release_status();
         return (maybe->min + maybe->max) / 2;
     }
 
-    status_t clear_values() noexcept {
-        status_t status;
-        ustore_collection_drop_t collection_drop {};
-        collection_drop.db = db_;
-        collection_drop.error = status.member_ptr();
-        collection_drop.id = collection_;
-        collection_drop.mode = ustore_drop_vals_k;
-        ustore_collection_drop(&collection_drop);
-        return status;
+    /** Empties every document, keeping the keys. */
+    status_t clear_values() noexcept { return drop_with(ustore_drop_vals_k); }
+
+    /** Removes every document, keeping the collection. */
+    status_t clear() noexcept { return drop_with(ustore_drop_keys_vals_k); }
+
+    /** Removes the collection with all its documents. */
+    status_t drop() noexcept { return drop_with(ustore_drop_keys_vals_handle_k); }
+
+    docs_ref<places_arg_t> operator[](std::initializer_list<ustore_key_t> keys) noexcept { return at(keys); }
+    docs_ref<places_arg_t> at(std::initializer_list<ustore_key_t> keys) noexcept { return at(strided(keys)); }
+
+    docs_ref<places_arg_t> operator[](keys_view_t keys) noexcept { return at(keys); }
+    docs_ref<places_arg_t> at(keys_view_t keys) noexcept { return at(keys, type_); }
+
+    docs_ref<places_arg_t> at(keys_view_t keys, ustore_doc_field_type_t type) noexcept {
+        places_arg_t places;
+        places.collections_begin = &collection_;
+        places.keys_begin = keys.begin();
+        places.count = keys.size();
+        return {db_, transaction_, snapshot_, std::move(places), arena_, type};
     }
 
-    status_t clear() noexcept {
-        status_t status;
-        ustore_collection_drop_t collection_drop {};
-        collection_drop.db = db_;
-        collection_drop.error = status.member_ptr();
-        collection_drop.id = collection_;
-        collection_drop.mode = ustore_drop_keys_vals_k;
-        ustore_collection_drop(&collection_drop);
-        return status;
+    template <typename keys_argument_>
+    auto operator[](keys_argument_&& keys) noexcept {
+        return at(std::forward<keys_argument_>(keys));
     }
 
-    status_t drop() noexcept {
-        status_t status;
-        ustore_collection_drop_t collection_drop {};
-        collection_drop.db = db_;
-        collection_drop.error = status.member_ptr();
-        collection_drop.id = collection_;
-        collection_drop.mode = ustore_drop_keys_vals_handle_k;
-        ustore_collection_drop(&collection_drop);
-        return status;
+    template <typename keys_argument_>
+    auto at(keys_argument_&& keys) noexcept {
+        return at(std::forward<keys_argument_>(keys), type_);
     }
 
-    inline docs_ref_gt<places_arg_t> operator[](std::initializer_list<ustore_key_t> keys) noexcept { return at(keys); }
-    inline docs_ref_gt<places_arg_t> at(std::initializer_list<ustore_key_t> keys) noexcept { //
-        return at(strided_range(keys));
-    }
+    template <typename keys_argument_>
+    auto at(keys_argument_&& keys, ustore_doc_field_type_t type) noexcept {
+        if constexpr (!batch_concept<keys_argument_>) {
+            using plain_t = std::remove_cvref_t<keys_argument_>;
+            collection_key_field_t location;
+            location.collection = collection_;
+            if constexpr (std::integral<plain_t>) location.key = keys;
+            else location.key = keys.key;
 
-    inline docs_ref_gt<places_arg_t> operator[](keys_view_t keys) noexcept { return at(keys); }
-    inline docs_ref_gt<places_arg_t> at(keys_view_t keys) noexcept { return at(keys, type_); }
-
-    inline docs_ref_gt<places_arg_t> at(keys_view_t keys, ustore_doc_field_type_t type) noexcept {
-        places_arg_t arg;
-        arg.collections_begin = &collection_;
-        arg.keys_begin = keys.begin();
-        arg.count = keys.size();
-        return {db_, txn_, snap_, {std::move(arg)}, arena_, type};
-    }
-
-    template <typename keys_arg_at>
-    auto operator[](keys_arg_at&& keys) noexcept {
-        return at(std::forward<keys_arg_at>(keys));
-    }
-
-    template <typename keys_arg_at>
-    auto at(keys_arg_at&& keys) noexcept {
-        return at(std::forward<keys_arg_at>(keys), type_);
-    }
-
-    template <typename keys_arg_at>
-    auto at(keys_arg_at&& keys, ustore_doc_field_type_t type) noexcept {
-        constexpr bool is_one_k = is_one<keys_arg_at>();
-        if constexpr (is_one_k) {
-            using result_t = docs_ref_gt<collection_key_field_t>;
-            using plain_t = std::remove_reference_t<keys_arg_at>;
-            // ? We may want to warn the users, that the collection property will be shadowed:
-            // static_assert(!sfinae_has_collection_gt<plain_t>::value, "Overwriting existing collection!");
-            collection_key_field_t arg;
-            arg.collection = collection_;
-            if constexpr (std::is_integral_v<plain_t>)
-                arg.key = keys;
-            else
-                arg.key = keys.key;
-
-            if constexpr (sfinae_has_field_gt<plain_t>::value)
-                arg.field = keys.field;
-            return result_t {db_, txn_, snap_, std::move(arg), arena_, type};
+            if constexpr (has_field_concept<plain_t>) location.field = keys.field;
+            return docs_ref<collection_key_field_t> {db_, transaction_, snapshot_, std::move(location), arena_, type};
         }
         else {
-            using locations_t = locations_in_collection_gt<keys_arg_at>;
-            using result_t = docs_ref_gt<locations_t>;
-            return result_t {db_,
-                             txn_,
-                             snap_,
-                             locations_t {std::forward<keys_arg_at>(keys), collection_},
-                             arena_,
-                             type};
+            using locations_t = locations_in_collection<keys_argument_>;
+            return docs_ref<locations_t> {db_,       transaction_,
+                                          snapshot_, locations_t {std::forward<keys_argument_>(keys), collection_},
+                                          arena_,    type};
         }
     }
 };

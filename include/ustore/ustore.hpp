@@ -1,13 +1,10 @@
 /**
- * @file ustore.hpp
- * @author Ashot Vardanian
- * @date 26 Jun 2022
- * @addtogroup Cpp
- *
- * @brief C++ bindings for any "ustore.h" implementation, providing:
- * - @b RAII controls for non-trivial & potentially heavy objects.
- * - syntactic @b sugar, iterators, containers and other typed stuff we love.
+ *  @file include/ustore/ustore.hpp
+ *  @author Ash Vardanian
+ *  @date June 26, 2022
+ *  @brief The C++ wrappers of the C ABI in @c ustore.h, with RAII handles, typed proxies and iterators.
  */
 
 #pragma once
-#include "ustore/cpp/db.hpp"
+
+#include <ustore/db.hpp>

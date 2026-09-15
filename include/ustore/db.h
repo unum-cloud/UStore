@@ -1,648 +1,537 @@
 /**
- * @file db.h
- * @author Ashot Vardanian
- * @date 12 Jun 2022
- * @addtogroup C
- *
- * @brief Binary Interface Standard for Transactional @b Key-Value Stores.
+ *  @file include/ustore/db.h
+ *  @author Ash Vardanian
+ *  @date June 12, 2022
+ *  @brief The binary interface every engine implements: databases, snapshots, collections,
+ *      transactions, arenas and errors.
  */
 
 #pragma once
-
-#ifdef __cplusplus
-extern "C" {
-#endif
 
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
-/*********************************************************/
-/*****************   Structures & Consts  ****************/
-/*********************************************************/
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#pragma region Handles and Constants
 
 /**
- * @brief Opaque multi-modal Database handle.
- * @see `ustore_database_free()`.
+ *  @brief An opaque handle to an open database, safe to share across threads from open until free.
  *
- * Properties:
- * - Thread safety: Safe to use across threads after open and before free.
- * - Lifetime: Must live longer than all the transactions.
- *
- * ## Concurrency
- *
- * In embedded setup this handle manages the lifetime of the database.
- * In that case user must guarantee, that concurrent processes won't be
- * opening the same database (generally same directory).
- *
- * In standalone "client-server" setup, manages the lifetime of the "client".
- * Many concurrent clients can be connecting to the same server from the same
- * process.
- *
- * ## Collections
- *
- * Every database always has at least one collection - the `::ustore_collection_main_k`.
- * That one has no name and can't be deleted. Others are referenced by names.
- * The same database can have many collections, of different modalities:
- * - Binary Large Objects or BLOBs.
- * - Hierarchical documents, like JSONs, BSONs, MessagePacks.
- * - Discrete labeled and potentially directed Graphs.
- * - Paths or collections of string keys.
- *
- * ## Choosing the Engine
- *
- * Dynamic dispatch of engines isn't yet supported.
- *
- * ## CAP Theorem
- *
- * Distributed engines are not yet supported.
+ *  An embedded database owns its directory, so no two processes may open the same one at once. Every
+ *  database holds the nameless @c ustore_collection_main_k, which can be cleared but never dropped,
+ *  next to named collections of binary values, documents or graphs.
  */
 typedef void* ustore_database_t;
 
-/**
- * @brief
- *
- */
+/** An identifier of a point-in-time view of the whole database. */
 typedef uint64_t ustore_snapshot_t;
 
-/**
- * @brief Opaque Transaction handle.
- * @see `ustore_transaction_free()`.
- * @see https://unum.cloud/ustore/c#transactions
- *
- * Allows ACID-ly grouping operations across different collections and even modalities.
- * This means, that the same transaction might be:
- * - inserting a blob of media data into a collection of images.
- * - updating users metadata in a documents collection to reference new avatar.
- * - introducing links between the user and other in a graph collection...
- * and all of the operations here either succeed or fail together. DBMS will
- * do the synchronization heavy-lifting, so you don't have to.
- *
- * Properties:
- * - Thread safety: None.
- * - Lifetime: Must be freed before the @c ustore_database_t is closed.
- * - Concurrency Control: Optimistic.
- */
+/** An opaque handle to an optimistic transaction that groups operations across collections and
+ *  modalities. Not thread-safe, and freed with @c ustore_transaction_free before its database closes. */
 typedef void* ustore_transaction_t;
 
-/**
- * @brief Some unique integer identifier of a collection.
- * A @c ustore_database_t database can have many of those,
- * but never with repeating names or identifiers.
- * Those identifiers are not guaranteed to remain the same
- * between DBMS restarts.
- */
+/** An identifier of a collection, unique within its database but not stable across restarts. */
 typedef uint64_t ustore_collection_t;
 
-/**
- * @brief The unique identifier of any value within a single collection.
- */
+/** The identifier of a value within one collection. */
 typedef int64_t ustore_key_t;
 
-/**
- * @brief The elementary binary piece of any value.
- */
+/** The elementary piece of a binary value. */
 typedef uint8_t ustore_byte_t;
 
-/**
- * @brief Single-precisions floating-point number.
- */
+/** A single-precision floating-point number. */
 typedef float ustore_float_t;
 
-/**
- * @brief The elementary piece of any string, like collection name.
- */
+/** The elementary piece of a string, such as a collection name. */
 typedef char ustore_char_t;
 
-/**
- * @brief The length of any value in the DB.
- */
+/** The length of a value in bytes. */
 typedef uint32_t ustore_length_t;
 
-/**
- * @brief Pointer-sized integer type.
- */
+/** A pointer-sized unsigned integer. */
 typedef uint64_t ustore_size_t;
 
-/**
- * @brief The smallest possible "bitset" type, storing eight zeros or ones.
- */
+/** The smallest bitset, holding eight bits. */
 typedef uint8_t ustore_octet_t;
 
-/**
- * @brief Monotonically increasing unique identifier that reflects the order of applied transactions
- */
+/** A monotonically increasing identifier of the order in which transactions applied. */
 typedef uint64_t ustore_sequence_number_t;
 
-/**
- * @brief Owning error message string.
- * If not null, must be deallocated via `ustore_error_free()`.
- */
+/** An owning error message, which the caller frees with @c ustore_error_free unless it is @c NULL. */
 typedef char const* ustore_error_t;
 
-/**
- * @brief Non-owning string reference.
- * Always provided by user and we don't participate
- * in its lifetime management in any way.
- */
+/** A string the caller owns and the database never frees. */
 typedef char const* ustore_str_view_t;
+
+/** A mutable string the caller owns and the database never frees. */
 typedef char* ustore_str_span_t;
 
-/**
- * @brief Temporary memory handle, used mostly for read requests.
- * It's allocated, resized and deallocated only by UStore itself.
- * Once done, must be deallocated with `ustore_arena_free()`.
- * @see `ustore_arena_free()`.
- */
+/** Temporary memory for results, which the database allocates and grows and the caller frees with
+ *  @c ustore_arena_free. */
 typedef void* ustore_arena_t;
 
+/** A pointer to mutable bytes. */
 typedef uint8_t* ustore_bytes_ptr_t;
+
+/** A pointer to read-only bytes. */
 typedef uint8_t const* ustore_bytes_cptr_t;
 
+/** The argument a callback receives. */
 typedef void* ustore_callback_payload_t;
+
+/** A callback over its payload. */
 typedef void (*ustore_callback_t)(ustore_callback_payload_t);
 
+/** Flags that adjust reads, writes, scans and transactions. */
 typedef enum {
 
+    /** No flags. */
     ustore_options_default_k = 0,
-    /**
-     * @brief Forces absolute consistency on the write operations
-     * flushing all the data to disk after each write. It's usage
-     * may cause severe performance degradation in some implementations.
-     * Yet the users must be warned, that modern IO drivers still often
-     * can't guarantee that everything will reach the disk.
-     */
+
+    /** Flushes writes to disk before returning, at a cost that varies by engine and drive. */
     ustore_option_write_flush_k = 1 << 1,
-    /**
-     * @brief When reading from a transaction, we track the requested keys.
-     * If the requested key was updated since the read, the transaction
-     * will fail on commit or prior to that. This option disables collision
-     * detection on separate parts of transactional reads and writes.
-     */
+
+    /** Stops a transaction from watching the keys it reads or writes for conflicts. */
     ustore_option_transaction_dont_watch_k = 1 << 2,
-    /**
-     * @brief On every API call, the arena is cleared for reuse.
-     * If the arguments of the function are results of another UStore call,
-     * you can use this flag to avoid discarding the memory.
-     */
+
+    /** Keeps the results of earlier calls in the arena, so they may be passed back in as arguments. */
     ustore_option_dont_discard_memory_k = 1 << 4,
-    /**
-     * @brief Will output data into shared memory, not the one privately
-     * to do further transformations without any copies.
-     * Is relevant for standalone distributions used with drivers supporting
-     * Apache Arrow buffers or standardized Tensor representations.
-     */
+
+    /** Places results in shared memory that another process can map without copies. */
     ustore_option_read_shared_memory_k = 1 << 5,
-    /**
-     * @brief When set, the underlying engine may avoid strict keys ordering
-     * and may include irrelevant (deleted & duplicate) keys in order to maximize
-     * throughput. The purpose is not accelerating the `ustore_scan()`, but the
-     * following `ustore_read()`. Generally used for Machine Learning applications.
-     */
-    ustore_option_scan_bulk_k = 0, // TODO
+
+    /** Lets a scan return keys out of order, deleted or repeated, to speed up the read after it;
+     *  has no effect yet. */
+    ustore_option_scan_bulk_k = 0,
 
 } ustore_options_t;
 
-/**
- * @brief The "mode" of collection removal.
- */
+/** What dropping a collection removes. */
 typedef enum {
-    /** @brief Remove the handle and all of the contents. */
+
+    /** The collection handle together with all of its contents. */
     ustore_drop_keys_vals_handle_k = 0,
-    /** @brief Remove keys and values, but keep the collection. */
+
+    /** Every key and value, keeping the collection. */
     ustore_drop_keys_vals_k = 1,
-    /** @brief Clear the values, but keep the keys. */
+
+    /** Every value, keeping the keys. */
     ustore_drop_vals_k = 2,
+
 } ustore_drop_mode_t;
 
-/**
- * @brief The "metadata support types".
- */
+/** Capabilities an engine reports. */
 typedef enum {
-    /** @brief DataBase supports transactions. */
+
+    /** The engine supports transactions. */
     ustore_supports_transactions_k = 1,
-    /** @brief DataBase supports named collections. */
+
+    /** The engine supports named collections. */
     ustore_supports_named_collections_k = 2,
-    /** @brief DataBase supports snapshots. */
+
+    /** The engine supports snapshots. */
     ustore_supports_snapshots_k = 4,
+
 } ustore_metadata_t;
 
-/**
- * @brief The handle to the default nameless collection.
- * It exists from start, doesn't have to be created and can't be fully dropped.
- * Only `::ustore_drop_keys_vals_k` and `::ustore_drop_vals_k` apply to it.
- */
+/** The nameless collection every database holds, which @c ustore_drop_keys_vals_k and
+ *  @c ustore_drop_vals_k may only clear. */
 extern ustore_collection_t const ustore_collection_main_k;
+
+/** The length reported for a missing value. */
 extern ustore_length_t const ustore_length_missing_k;
+
+/** The key that stands for no key. */
 extern ustore_key_t const ustore_key_unknown_k;
 
-/*********************************************************/
-/*****************	 Primary Functions	  ****************/
-/*********************************************************/
+#pragma endregion Handles and Constants
 
-/**
- * @brief Opens the underlying Key-Value Store.
- * @see `ustore_database_init()`.
- *
- * Depending on the selected distribution can be any of:
- *
- * - embedded persistent transactional KVS
- * - embedded in-memory transactional KVS
- */
+#pragma region Database
+
+/** The arguments of @c ustore_database_init. */
 typedef struct ustore_database_init_t {
-    /**
-     * @brief Configuration parameter for the DBMS.
-     * @see `db_config.json` file.
-     *
-     * For embedded distributions should be a json string containing DB options.
-     */
+
+    /** Configuration of the engine as a JSON string. */
     ustore_str_view_t config;
-    /** @brief A pointer to the opened KVS, unless `error` is filled. */
+
+    /** Output for the opened database, unless @c error is set. */
     ustore_database_t* db;
-    /** @brief Pointer to exported error message. */
+
+    /** Output for the error message. */
     ustore_error_t* error;
+
 } ustore_database_init_t;
 
 /**
- * @brief Opens the underlying Key-Value Store.
- * @see `ustore_database_init()`.
+ *  @brief Opens an embedded database, persistent or in memory.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_database_init(ustore_database_init_t*);
+void ustore_database_init(ustore_database_init_t* arguments);
 
+/** The arguments of @c ustore_get_metadata. */
 typedef struct ustore_get_metadata_t {
-    /// @{
 
-    /** @brief Already open database instance. */
+    /** An open database. */
     ustore_database_t db;
-    /** @brief Pointer to exported error message. */
+
+    /** Output for the error message. */
     ustore_error_t* error;
-    /** @brief Output for the metadata. */
+
+    /** Output for the capabilities of the engine. */
     ustore_metadata_t* metadata;
-    /// @}
+
 } ustore_get_metadata_t;
 
 /**
- * @brief Retrive Metadata
- * @see `ustore_metadata_t`.
+ *  @brief Reports the capabilities of the engine.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_get_metadata(ustore_get_metadata_t*);
+void ustore_get_metadata(ustore_get_metadata_t* arguments);
 
-/*********************************************************/
-/***************** Snapshot Management  ****************/
-/*********************************************************/
+/**
+ *  @brief The arguments of @c ustore_database_control, a free-form tunnel to the engine.
+ *
+ *  Requests have no stable format and are expensive: "clear" removes all data and keeps collection
+ *  names, "reset" removes both, "compact" flushes and compacts LSM trees, "info" describes the build,
+ *  and "usage" estimates the sizes of collections and the use of memory and disk.
+ */
+typedef struct ustore_database_control_t {
 
-typedef struct ustore_snapshot_list_t { /// @name Context
-    /// @{
-
-    /** @brief Already open database instance. */
+    /** An open database. */
     ustore_database_t db;
-    /**
-     * @brief Pointer to exported error message.
-     * If not NULL, must be deallocated with `ustore_error_free()`.
-     */
-    ustore_error_t* error;
-    /**
-     * @brief Reusable memory handle.
-     * @see `ustore_arena_free()`.
-     */
+
+    /** Reusable memory for the response. */
     ustore_arena_t* arena;
-    /**
-     * @brief Listing options.
-     *
-     * Possible values:
-     * - `::ustore_option_dont_discard_memory_k`: Won't reset the `arena` before the operation begins.
-     */
+
+    /** Output for the error message. */
+    ustore_error_t* error;
+
+    /** The request as a null-terminated string. */
+    ustore_str_view_t request;
+
+    /** Output for the response as a null-terminated string. */
+    ustore_str_view_t* response;
+
+} ustore_database_control_t;
+
+/**
+ *  @brief Sends a free-form request to the engine.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ */
+void ustore_database_control(ustore_database_control_t* arguments);
+
+#pragma endregion Database
+
+#pragma region Snapshots
+
+/** The arguments of @c ustore_snapshot_list. */
+typedef struct ustore_snapshot_list_t {
+
+    /** An open database. */
+    ustore_database_t db;
+
+    /** Output for the error message. */
+    ustore_error_t* error;
+
+    /** Reusable memory for the results. */
+    ustore_arena_t* arena;
+
+    /** Accepts @c ustore_option_dont_discard_memory_k. */
     ustore_options_t options;
 
-    /// @}
-    /// @name Contents
-    /// @{
-
-    /** @brief Number of present snapshots. */
+    /** Output for the number of snapshots. */
     ustore_size_t* count;
-    /** @brief All snapshots id. */
+
+    /** Output for the identifiers of the snapshots. */
     ustore_snapshot_t** ids;
-    /// @}
+
 } ustore_snapshot_list_t;
 
 /**
- * @brief Lists all snapshots in the DB.
- * @see `ustore_snapshot_list_t`.
+ *  @brief Lists every snapshot of the database.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_snapshot_list(ustore_snapshot_list_t*);
+void ustore_snapshot_list(ustore_snapshot_list_t* arguments);
 
+/** The arguments of @c ustore_snapshot_create. */
 typedef struct ustore_snapshot_create_t {
-    /** @brief Already open database instance. */
+
+    /** An open database. */
     ustore_database_t db;
-    /** @brief Pointer to exported error message. */
+
+    /** Output for the error message. */
     ustore_error_t* error;
-    /** @brief Output for the snapshot id. */
+
+    /** Output for the identifier of the new snapshot. */
     ustore_snapshot_t* id;
+
 } ustore_snapshot_create_t;
 
-void ustore_snapshot_create(ustore_snapshot_create_t*);
+/**
+ *  @brief Captures a point-in-time view of the database.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ */
+void ustore_snapshot_create(ustore_snapshot_create_t* arguments);
 
+/** The arguments of @c ustore_snapshot_export. */
 typedef struct ustore_snapshot_export_t {
-    /** @brief Already open database instance. */
+
+    /** An open database. */
     ustore_database_t db;
-    /** @brief Pointer to exported error message. */
+
+    /** Output for the error message. */
     ustore_error_t* error;
-    /** @brief Snapshot id. */
+
+    /** Identifier of the snapshot. */
     ustore_snapshot_t id;
-    /** @brief The specified directory path. */
+
+    /** Directory that receives the exported database. */
     ustore_str_view_t path;
+
 } ustore_snapshot_export_t;
 
-void ustore_snapshot_export(ustore_snapshot_export_t*);
+/**
+ *  @brief Exports a snapshot as a new database.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ */
+void ustore_snapshot_export(ustore_snapshot_export_t* arguments);
 
+/** The arguments of @c ustore_snapshot_drop. */
 typedef struct ustore_snapshot_drop_t {
-    /** @brief Already open database instance. */
+
+    /** An open database. */
     ustore_database_t db;
-    /** @brief Pointer to exported error message. */
+
+    /** Output for the error message. */
     ustore_error_t* error;
-    /** @brief Existing snapshot id. */
+
+    /** Identifier of an existing snapshot. */
     ustore_snapshot_t id;
+
 } ustore_snapshot_drop_t;
 
-void ustore_snapshot_drop(ustore_snapshot_drop_t*);
+/**
+ *  @brief Releases a snapshot.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ */
+void ustore_snapshot_drop(ustore_snapshot_drop_t* arguments);
 
-/*********************************************************/
-/***************** Collection Management  ****************/
-/*********************************************************/
+#pragma endregion Snapshots
+
+#pragma region Collections
 
 /**
- * @brief Lists all named collections in the DB.
- * @see `ustore_collection_list()`.
+ *  @brief The arguments of @c ustore_collection_list, which exports identifiers and a tape of
+ *      null-terminated names.
  *
- * Retrieves a list of collection IDs & names in a NULL-delimited form.
- * The default nameless collection won't be described in any form, as its always
- * present. This is the only collection-management operation that can be performed
- * on a DB state snapshot, and not just on the HEAD state.
+ *  The main collection is never listed. Listing is the only collection operation that runs on a snapshot.
  */
 typedef struct ustore_collection_list_t {
 
-    /// @name Context
-    /// @{
-
-    /** @brief Already open database instance. */
+    /** An open database. */
     ustore_database_t db;
-    /**
-     * @brief Pointer to exported error message.
-     * If not NULL, must be deallocated with `ustore_error_free()`.
-     */
+
+    /** Output for the error message. */
     ustore_error_t* error;
-    /**
-     * @brief The snapshot in which the retrieval will be conducted.
-     * @see `ustore_transaction_init()`, `ustore_transaction_commit()`, `ustore_transaction_free()`.
-     */
+
+    /** Transaction whose view is listed. */
     ustore_transaction_t transaction;
-    /**
-     * @brief A snapshot captures a point-in-time view of the DB at the time it's created.
-     * @see `ustore_snapshot_list()`, `ustore_snapshot_create()`, `ustore_snapshot_drop()`.
-     */
+
+    /** Snapshot whose view is listed. */
     ustore_snapshot_t snapshot;
-    /**
-     * @brief Reusable memory handle.
-     * @see `ustore_arena_free()`.
-     */
+
+    /** Reusable memory for the results. */
     ustore_arena_t* arena;
-    /**
-     * @brief Listing options.
-     *
-     * Possible values:
-     * - `::ustore_option_dont_discard_memory_k`: Won't reset the `arena` before the operation begins.
-     */
+
+    /** Accepts @c ustore_option_dont_discard_memory_k. */
     ustore_options_t options;
 
-    /// @}
-    /// @name Contents
-    /// @{
-
-    /** @brief Number of present collections. */
+    /** Output for the number of named collections. */
     ustore_size_t* count;
-    /** @brief Handles of all the collections in same order as `names`. */
+
+    /** Output for the identifiers, in the order of @c names. */
     ustore_collection_t** ids;
-    /** @brief Offsets of separate strings in the `names` tape. */
+
+    /** Output for the offsets of every name inside @c names. */
     ustore_length_t** offsets;
-    /** @brief NULL-terminated collection names tape in same order as `ids`. */
+
+    /** Output for the tape of null-terminated names, in the order of @c ids. */
     ustore_char_t** names;
-    /// @}
 
 } ustore_collection_list_t;
 
 /**
- * @brief Lists all named collections in the DB.
- * @see `ustore_collection_list_t`.
+ *  @brief Lists the named collections of the database.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_collection_list(ustore_collection_list_t*);
+void ustore_collection_list(ustore_collection_list_t* arguments);
 
-/**
- * @brief Creates a new uniquely named collection in the DB.
- * @see `ustore_collection_create()`.
- *
- * This function may never be called, as the default nameless collection
- * always exists and can be addressed via `::ustore_collection_main_k`.
- * You can "re-create" an empty collection with a new config.
- */
+/** The arguments of @c ustore_collection_create, which also recreates an empty collection with a
+ *  new configuration. */
 typedef struct ustore_collection_create_t {
-    /** @brief Already open database instance. */
+
+    /** An open database. */
     ustore_database_t db;
-    /** @brief Pointer to exported error message. */
+
+    /** Output for the error message. */
     ustore_error_t* error;
-    /** @brief Unique name for the new collection. */
+
+    /** Unique name of the new collection. */
     ustore_str_view_t name;
-    /** @brief Optional configuration JSON string. */
+
+    /** Optional configuration as a JSON string. */
     ustore_str_view_t config;
-    /** @brief Output for the collection handle. */
+
+    /** Output for the identifier of the collection. */
     ustore_collection_t* id;
+
 } ustore_collection_create_t;
 
 /**
- * @brief Creates a new uniquely named collection in the DB.
- * @see `ustore_collection_create_t`.
+ *  @brief Creates a uniquely named collection.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_collection_create(ustore_collection_create_t*);
+void ustore_collection_create(ustore_collection_create_t* arguments);
 
-/**
- * @brief Removes or clears an existing collection.
- * @see `ustore_collection_drop()`.
- *
- * Removes a collection or its contents depending on `mode`.
- * The default nameless collection can't be removed, only cleared.
- */
+/** The arguments of @c ustore_collection_drop, where the main collection can only be cleared. */
 typedef struct ustore_collection_drop_t {
-    /** @brief Already open database instance. */
+
+    /** An open database. */
     ustore_database_t db;
-    /** @brief Pointer to exported error message. */
+
+    /** Output for the error message. */
     ustore_error_t* error;
-    /** @brief Existing collection handle. */
+
+    /** Identifier of an existing collection. */
     ustore_collection_t id;
-    /** @brief Controls if values, pairs or the whole collection must be dropped. */
+
+    /** Whether values, pairs or the whole collection go. */
     ustore_drop_mode_t mode;
+
 } ustore_collection_drop_t;
 
 /**
- * @brief Removes or clears an existing collection.
- * @see `ustore_collection_drop_t`.
+ *  @brief Removes or clears a collection.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_collection_drop(ustore_collection_drop_t*);
+void ustore_collection_drop(ustore_collection_drop_t* arguments);
 
-/**
- * @brief Free-form communication tunnel with the underlying engine.
- * @see `ustore_database_control()`.
- *
- * Performs free-form queries on the DB, that may not necessarily
- * have a stable API and a fixed format output. Generally, those requests
- * are very expensive and shouldn't be executed in most applications.
- * This is the "kitchen-sink" of UStore interface, similar to `fcntl` & `ioctl`.
- *
- * ## Possible Commands
- * - "clear":   Removes all the data from DB, while keeping collection names.
- * - "reset":   Removes all the data from DB, including collection names.
- * - "compact": Flushes and compacts all the data in LSM-tree implementations.
- * - "info":    Metadata about the current software version, used for debugging.
- * - "usage":   Metadata about approximate collection sizes, RAM and disk usage.
- */
-typedef struct ustore_database_control_t {
-    /** @brief Already open database instance. */
-    ustore_database_t db;
-    /** @brief Reusable memory handle. */
-    ustore_arena_t* arena;
-    /** @brief Pointer to exported error message. */
-    ustore_error_t* error;
-    /** @brief The input command as a NULL-terminated string. */
-    ustore_str_view_t request;
-    /** @brief The output response as a NULL-terminated string. */
-    ustore_str_view_t* response;
-} ustore_database_control_t;
+#pragma endregion Collections
 
-/**
- * @brief Free-form communication tunnel with the underlying engine.
- * @see `ustore_database_control()`.
- */
-void ustore_database_control(ustore_database_control_t*);
+#pragma region Transactions
 
-/*********************************************************/
-/*****************		Transactions	  ****************/
-/*********************************************************/
-
-/**
- * @brief Begins a new ACID transaction or resets an existing one.
- * @see `ustore_transaction_init()`.
- */
+/** The arguments of @c ustore_transaction_init. */
 typedef struct ustore_transaction_init_t {
 
-    /** @brief Already open database instance. */
+    /** An open database. */
     ustore_database_t db;
-    /** @brief Pointer to exported error message. */
+
+    /** Output for the error message. */
     ustore_error_t* error;
 
-    /**
-     * @brief Transaction options.
-     *
-     * Possible values:
-     * - `::ustore_option_dont_discard_memory_k`: Won't reset the `arena` before the operation begins.
-     */
+    /** Accepts @c ustore_option_dont_discard_memory_k. */
     ustore_options_t options;
 
-    /** @brief In-out transaction handle. */
+    /** The transaction to begin or to reset for reuse. */
     ustore_transaction_t* transaction;
+
 } ustore_transaction_init_t;
 
 /**
- * @brief Begins a new ACID transaction or resets an existing one.
- * @see `ustore_transaction_init_t`.
+ *  @brief Begins a transaction, or resets an existing one.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_transaction_init(ustore_transaction_init_t*);
+void ustore_transaction_init(ustore_transaction_init_t* arguments);
 
-/**
- * @brief Stages an ACID transaction for Two Phase Commits.
- * @see `ustore_transaction_stage()`.
- *
- * Regardless of result, the content is preserved to allow further
- * logging, serialization or retries. The underlying memory can be
- * cleaned and reused by consecutive `ustore_transaction_init()` call.
- */
+/** The arguments of @c ustore_transaction_stage, which keeps the contents for logging or retries
+ *  whatever the outcome. */
 typedef struct ustore_transaction_stage_t {
 
-    /** @brief Already open database instance. */
+    /** An open database. */
     ustore_database_t db;
-    /** @brief Pointer to exported error message. */
+
+    /** Output for the error message. */
     ustore_error_t* error;
-    /** @brief Initialized transaction handle. */
+
+    /** An initialized transaction. */
     ustore_transaction_t transaction;
-    /** @brief Staging options. */
+
+    /** Options of the stage. */
     ustore_options_t options;
-    /** @brief Optional output for the transaction stage sequence number. */
+
+    /** Optional output for the sequence number of the stage. */
     ustore_sequence_number_t* sequence_number;
 
 } ustore_transaction_stage_t;
 
 /**
- * @brief Stages an ACID transaction for Two Phase Commits.
- * @see `ustore_transaction_stage_t`.
+ *  @brief Stages a transaction as the first phase of a two-phase commit.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_transaction_stage(ustore_transaction_stage_t*);
+void ustore_transaction_stage(ustore_transaction_stage_t* arguments);
 
-/**
- * @brief Commits an ACID transaction.
- * @see `ustore_transaction_commit()`.
- *
- * Regardless of result, the content is preserved to allow further
- * logging, serialization or retries. The underlying memory can be
- * cleaned and reused by consecutive `ustore_transaction_init()` call.
- */
+/** The arguments of @c ustore_transaction_commit, which keeps the contents for logging or retries
+ *  whatever the outcome. */
 typedef struct ustore_transaction_commit_t {
 
-    /** @brief Already open database instance. */
+    /** An open database. */
     ustore_database_t db;
-    /** @brief Pointer to exported error message. */
+
+    /** Output for the error message. */
     ustore_error_t* error;
-    /** @brief Initialized transaction handle. */
+
+    /** An initialized transaction. */
     ustore_transaction_t transaction;
-    /** @brief Staging options. */
+
+    /** Accepts @c ustore_option_write_flush_k. */
     ustore_options_t options;
-    /** @brief Optional output for the transaction commit sequence number. */
+
+    /** Optional output for the sequence number of the commit. */
     ustore_sequence_number_t* sequence_number;
 
 } ustore_transaction_commit_t;
 
 /**
- * @brief Commits an ACID transaction.
- * @see `ustore_transaction_commit_t`.
+ *  @brief Commits a transaction.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_transaction_commit(ustore_transaction_commit_t*);
+void ustore_transaction_commit(ustore_transaction_commit_t* arguments);
 
-/*********************************************************/
-/*****************	 Memory Reclamation   ****************/
-/*********************************************************/
+#pragma endregion Transactions
 
-/**
- * @brief Deallocates reusable memory arenas.
- * Passing NULLs is safe.
- */
-void ustore_arena_free(ustore_arena_t);
+#pragma region Memory Reclamation
 
 /**
- * @brief Resets the transaction and deallocates the underlying memory.
- * Passing NULLs is safe.
+ *  @brief Frees a reusable arena and everything exported into it.
+ *  @param[inout] arena The arena to be freed; @c NULL is safe.
  */
-void ustore_transaction_free(ustore_transaction_t);
+void ustore_arena_free(ustore_arena_t arena);
 
 /**
- * @brief Closes the DB and deallocates used memory.
- * The database would still persist on disk.
- * Passing NULLs is safe.
+ *  @brief Resets a transaction and frees its memory.
+ *  @param[inout] transaction The transaction to be freed; @c NULL is safe.
  */
-void ustore_database_free(ustore_database_t);
+void ustore_transaction_free(ustore_transaction_t transaction);
 
 /**
- * @brief Deallocates error messages.
- * Passing NULLs is safe.
+ *  @brief Closes the database and frees its memory, while the data persists on disk.
+ *  @param[inout] database The database to be closed; @c NULL is safe.
  */
-void ustore_error_free(ustore_error_t);
+void ustore_database_free(ustore_database_t database);
+
+/**
+ *  @brief Frees an error message.
+ *  @param[inout] error The message to be freed; @c NULL is safe.
+ */
+void ustore_error_free(ustore_error_t error);
+
+#pragma endregion Memory Reclamation
 
 #ifdef __cplusplus
-} /* end extern "C" */
+}
 #endif

@@ -82,7 +82,7 @@ struct snapshot_t {
 };
 
 /** Identifiers of the live snapshots. */
-using snapshots_t = ashvardanian::smashtable::hash_set<ustore_snapshot_t>;
+using snapshots_t = st::hash_set<ustore_snapshot_t>;
 
 /** The open database, its options and its snapshots. */
 struct database_t {
@@ -367,7 +367,7 @@ void snapshot_create(ustore_snapshot_create_t& arguments) {
     }
 
     auto const id = reinterpret_cast<ustore_snapshot_t>(snapshot.get());
-    if (ashvardanian::smashtable::failed(database.snapshots.upsert(id))) {
+    if (st::failed(database.snapshots.upsert(id))) {
         database.native->ReleaseSnapshot(snapshot->native);
         *arguments.error = "Failed to register the snapshot";
         return;

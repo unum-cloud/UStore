@@ -1,805 +1,360 @@
 /**
- * @file blobs.h
- * @author Ashot Vardanian
- * @date 12 Jun 2022
- * @addtogroup C
+ *  @file include/ustore/blobs.h
+ *  @author Ash Vardanian
+ *  @date June 12, 2022
+ *  @brief The binary interface for collections of binary values: writes, reads, scans, samples and
+ *      measurements.
  *
- * @brief Binary Interface Standard for trivial @b BLOB collections.
- *
- * ## Usage Recommendations
- *
- * ### Pack operations into batches wherever possible
- *
- * Using the batch APIs to issue a single read/write request is trivial, but achieving
- * batch-level performance with singular operations is impossible. Especially, with
- * a client-server setup. Regardless of IO layer, a lot of synchronization and locks
- * must be issued to provide consistency.
- *
- * ## Why use offsets?
- *
- * In the underlying layer, using offsets to adds no additional overhead,
- * but what is the point of using them, if we can immediately pass adjusted
- * pointers? It serves two primary purposes:
- *
- * - Supporting input tapes (values_stride = 0, offsets_stride != 0).
- * - List-oriented wrappers (values_stride != 0, offsets_stride = 0).
- *
- * In the first case, we may have received a tape from `ustore_read()`, which we
- * update in-place and write back, without changing the size of the original
- * entries.
- *
- * In the second case, we may be working with higher-level runtimes, like
- * CPython, where objects metadata (like its length) is stored in front of
- * the allocated region. In such cases, we may still need additional memory
- * to store the lengths of the objects, unless those are NULL-terminated
- * strings (lengths = NULL) or if all have the same length (length_stride = 0).
- *
- * Further reading on the implementation of strings and arrays of strings in
- * different languages:
- *
- * - Python/CPython:
- *      https://docs.python.org/3/c-api/bytes.html
- * - JavaScript/V8:
- *      https://github.com/v8/v8/blob/main/include/v8-data.h
- *      https://github.com/v8/v8/blob/main/include/v8-array-buffer.h
- * - GoLang:
- *      https://boakye.yiadom.org/go/strings/
- *      https://github.com/golang/go/blob/master/src/runtime/string.go (`stringStruct`)
- *      https://github.com/golang/go/blob/master/src/runtime/slice.go (`slice`)
+ *  Every call takes a batch, so a single operation is a batch of one, while no sequence of single
+ *  operations reaches the throughput of one batch. Values address their bytes through a pointer, an
+ *  offset and a length, each strided. Offsets let a tape returned by @c ustore_read be updated in place
+ *  and written back, and let runtimes like CPython skip the header in front of every object's bytes.
+ *  Lengths may be left out for null-terminated strings, or strided by zero when every value is as long.
  */
 
 #pragma once
+
+#include <ustore/db.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#include "ustore/db.h"
+#pragma region Writes
 
 /**
- * @brief Main "setter" or "scatter" interface.
- * @see `ustore_write()`.
- * @see https://unum.cloud/ustore/c#writes
+ *  @brief The arguments of @c ustore_write, which upserts, clears or removes values in a batch.
  *
- * ## Functionality
- *
- * This is one of the two primary methods, together with `ustore_read()`,
- * so its functionality is wide. It knots together various kinds of updates:
- *
- * - Single writes and Batches.
- * - On Head state or a Transactional.
- * - Transparent or Watching through Transactions.
- * - Upserting, Clearing or Removing values.
- *
- * Check docs below to see how different variants can be invoked.
- *
- * ## Upserts, Updates & Inserts
- *
- * Higher-level interfaces may choose to implement any of those verbs:
- *
- * 1. Insert: add if missing.
- * 2. Update: overwrite if present.
- * 3. Upsert: write.
- * 4. Remove: overwrite with `NULL` if present.
- *
- * Instead of adding all three to the binary C interface, we focus on better ACID transactions,
- * which can be used to implement any advanced multi-step operations (often including conditionals),
- * like Compare-And-Swap, without losing atomicity.
+ *  Inserts, updates and compare-and-swap are left to transactions, which compose them atomically out
+ *  of reads and writes, so the interface needs no verb for each of them.
  */
 typedef struct ustore_write_t {
 
-    /// @name Context
-    /// @{
-
-    /** @brief Already open database instance. */
+    /** An open database. */
     ustore_database_t db;
-    /**
-     * @brief Pointer to exported error message.
-     * If not NULL, must be deallocated with `ustore_error_free()`.
-     */
+
+    /** Output for the error message. */
     ustore_error_t* error;
-    /**
-     * @brief The transaction in which the operation will be watched.
-     * @see `ustore_transaction_init()`, `ustore_transaction_commit()`, `ustore_transaction_free()`.
-     */
+
+    /** Transaction that watches the written keys. */
     ustore_transaction_t transaction;
-    /**
-     * @brief Reusable memory handle.
-     * @see `ustore_arena_free()`.
-     */
+
+    /** Reusable memory for intermediate results. */
     ustore_arena_t* arena;
-    /**
-     * @brief Write options.
-     *
-     * Possible values:
-     * - `::ustore_option_write_flush_k`: Forces to persist non-transactional writes on disk before returning.
-     * - `::ustore_option_transaction_dont_watch_k`: Disables collision-detection for transactional writes.
-     * - `::ustore_option_dont_discard_memory_k`: Won't reset the `arena` before the operation begins.
-     */
+
+    /** Accepts @c ustore_option_write_flush_k without a transaction, @c ustore_option_transaction_dont_watch_k
+     *  with one, and @c ustore_option_dont_discard_memory_k. */
     ustore_options_t options;
 
-    /// @}
-    /// @name Locations
-    /// @{
-
-    /**
-     * @brief Number of separate operations packed in this read.
-     * Always equal to the number of provided `keys`.
-     */
+    /** Number of tasks, one per key. */
     ustore_size_t tasks_count;
-    /**
-     * @brief Sequence of collections owning the `keys`.
-     *
-     * If `NULL` is passed, the default collection is assumed.
-     * If multiple collections are passed, the step between them is defined by `collections_stride`.
-     * Use `ustore_collection_create()` or `ustore_collection_list()` to obtain collection IDs for string names.
-     * Is @b optional.
-     */
+
+    /** Collections owning the keys, where @c NULL stands for the main collection. */
     ustore_collection_t const* collections;
-    /**
-     * @brief Step between `collections`.
-     *
-     * Contains the number of bytes separating entries in the `collections` array.
-     * Zero stride would reuse the same address for all tasks.
-     * You can use it to retrieve different keys from the same collection in one call.
-     * Is @b optional.
-     */
+
+    /** Bytes between consecutive collections, where zero repeats the first one. */
     ustore_size_t collections_stride;
-    /**
-     * @brief Sequence of keys to update.
-     *
-     * Contains the pointer to the first of `tasks_count` keys to be collected from `collections`.
-     * If multiple keys are passed, the step between them is defined by `keys_stride`.
-     */
+
+    /** Keys to write, @c NULL only when there are no tasks. */
     ustore_key_t const* keys;
-    /**
-     * @brief Step between `keys`.
-     *
-     * The number of bytes separating entries in the `keys` array.
-     * Zero stride would reuse the same address for all tasks.
-     * You can use it to retrieve the same key from different collections in one call.
-     * Is @b optional.
-     */
+
+    /** Bytes between consecutive keys, where zero repeats the first one. */
     ustore_size_t keys_stride;
 
-    /// @}
-    /// @name Contents
-    /// @{
-
-    /**
-     * @brief Bitmask of "presence" indicators with at least `tasks_count` bits.
-     *
-     * Each set bit means that the respective content chunk isn't `NULL`.
-     * Is addressed the same way as in Apache Arrow.
-     * Is @b optional.
-     */
+    /** Optional bitset of at least @c tasks_count bits, where a set bit marks a value that is not
+     *  null, addressed as Apache Arrow does. */
     ustore_octet_t const* presences;
-    /**
-     * @brief The pointer to the offset (in bytes) of the first content within
-     * the first chunk of `values`.
-     *
-     * If tasks are executing, the step between offsets is defined by `offsets_stride`.
-     * Not only it allows addressing different parts of a concatenated tape,
-     * but also allows to skip some structure header, like the @c PyObject_HEAD
-     * in every CPython runtime object.
-     */
-    ustore_length_t const* offsets;
-    /**
-     * @brief Step between `offsets`.
-     *
-     * The number of bytes separating entries in the `offsets` array.
-     * Zero stride would reuse the same address for all tasks.
-     * Is @b optional.
-     */
-    ustore_size_t offsets_stride;
-    /**
-     * @brief The pointer to the offset (in bytes) of the first content within
-     * the first chunk of `values`. Zero-length entries are allowed.
-     *
-     * Is @b optional, as lengths can be inferred from consecutive offsets.
-     * If neither `offsets` nor `lengths` are passed, we assume values
-     * to be `NULL`-terminated and infer the length from `values` themselves.
-     */
-    ustore_length_t const* lengths;
-    /**
-     * @brief Step between `keys`.
-     *
-     * The number of bytes separating entries in the `keys` array.
-     * Zero stride would reuse the same address for all tasks.
-     * Is @b optional.
-     */
-    ustore_size_t lengths_stride;
-    /**
-     * @brief An array of pointers to data chunks.
-     * If `NULL`, will simply delete all the `keys` from respective `collections`.
-     *
-     * Generally, we expect each chunk to be identical to the content we want to write,
-     * but we can specify subspans by using `offsets` and `lengths`.
-     */
-    ustore_bytes_cptr_t const* values;
-    /**
-     * @brief The number of bytes separating entries in the `values` array.
-     * Zero stride would reuse the same address for all tasks.
-     * Is @b optional.
-     */
-    ustore_size_t values_stride;
 
-    /// @}
+    /** Offsets of the values within the chunks of @c values, which may skip the header of a runtime object. */
+    ustore_length_t const* offsets;
+
+    /** Bytes between consecutive offsets, where zero repeats the first one. */
+    ustore_size_t offsets_stride;
+
+    /** Optional lengths of the values, inferred from consecutive offsets or null terminators when absent. */
+    ustore_length_t const* lengths;
+
+    /** Bytes between consecutive lengths, where zero repeats the first one. */
+    ustore_size_t lengths_stride;
+
+    /** Pointers to the chunks holding the values, where @c NULL removes every key. */
+    ustore_bytes_cptr_t const* values;
+
+    /** Bytes between consecutive chunk pointers, where zero repeats the first one. */
+    ustore_size_t values_stride;
 
 } ustore_write_t;
 
 /**
- * @brief Main "setter" or "scatter" interface.
- * @see `ustore_write_t`.
+ *  @brief Writes a batch of values.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_write(ustore_write_t*);
+void ustore_write(ustore_write_t* arguments);
 
-/**
- * @brief Main "getter" or "gather" interface.
- * @see `ustore_read()`.
- * @see https://unum.cloud/ustore/c#reads
- *
- * ## Functionality
- *
- * This is one of the two primary methods, together with `ustore_write()`,
- * so its functionality is wide. It knots together various kinds of reads:
- *
- * - Single reads and Batches.
- * - On Head state or a Snapshot.
- * - Transparent or Watching through Transactions.
- * - Reading the entire values or just checking existence or lengths.
- *
- * Check docs below to see how different variants can be invoked.
- */
+#pragma endregion Writes
+
+#pragma region Reads
+
+/** The arguments of @c ustore_read, which reads values, their lengths or their presence in a batch. */
 typedef struct ustore_read_t {
 
-    /// @name Context
-    /// @{
-
-    /** @brief Already open database instance. */
+    /** An open database. */
     ustore_database_t db;
-    /**
-     * @brief Pointer to exported error message.
-     * If not NULL, must be deallocated with `ustore_error_free()`.
-     */
+
+    /** Output for the error message. */
     ustore_error_t* error;
-    /**
-     * @brief The transaction in which the operation will be watched.
-     * @see `ustore_transaction_init()`, `ustore_transaction_commit()`, `ustore_transaction_free()`.
-     */
+
+    /** Transaction that watches the read keys. */
     ustore_transaction_t transaction;
-    /**
-     * @brief The snapshot captures a view of the database at the time it's created.
-     * @see `ustore_snapshot_list()`, `ustore_snapshot_create()`, `ustore_snapshot_drop()`.
-     */
+
+    /** Snapshot whose view is read. */
     ustore_snapshot_t snapshot;
-    /**
-     * @brief Reusable memory handle.
-     * @see `ustore_arena_free()`.
-     */
+
+    /** Reusable memory for the results. */
     ustore_arena_t* arena;
-    /**
-     * @brief Read options.
-     *
-     * Possible values:
-     * - `::ustore_option_transaction_dont_watch_k`: Disables collision-detection for transactional reads.
-     * - `::ustore_option_read_shared_memory_k`: Exports to shared memory to accelerate inter-process communication.
-     * - `::ustore_option_scan_bulk_k`: Suggests that the list of keys was received from a bulk scan.
-     * - `::ustore_option_dont_discard_memory_k`: Won't reset the `arena` before the operation begins.
-     */
+
+    /** Accepts @c ustore_option_transaction_dont_watch_k with a transaction, @c ustore_option_read_shared_memory_k,
+     *  @c ustore_option_scan_bulk_k and @c ustore_option_dont_discard_memory_k. */
     ustore_options_t options;
 
-    /// @}
-    /// @name Inputs
-    /// @{
-
-    /**
-     * @brief Number of separate operations packed in this read.
-     * Always equal to the number of provided `keys`.
-     */
+    /** Number of tasks, one per key. */
     ustore_size_t tasks_count;
-    /**
-     * @brief Sequence of collections owning the `keys`.
-     *
-     * If `NULL` is passed, the default collection is assumed.
-     * If multiple collections are passed, the step between them is defined by `collections_stride`.
-     * Use `ustore_collection_create()` or `ustore_collection_list()` to obtain collection IDs for string names.
-     * Is @b optional.
-     */
+
+    /** Collections owning the keys, where @c NULL stands for the main collection. */
     ustore_collection_t const* collections;
-    /**
-     * @brief Step between `collections`.
-     *
-     * Contains the number of bytes separating entries in the `collections` array.
-     * Zero stride would reuse the same address for all tasks.
-     * You can use it to retrieve different keys from the same collection in one call.
-     * Is @b optional.
-     */
+
+    /** Bytes between consecutive collections, where zero repeats the first one. */
     ustore_size_t collections_stride;
-    /**
-     * @brief Sequence of `keys` to retrieve.
-     *
-     * Contains the pointer to the first of `tasks_count` keys to be collected from `collections`.
-     * If multiple keys are passed, the step between them is defined by `keys_stride`.
-     */
+
+    /** Keys to read. */
     ustore_key_t const* keys;
-    /**
-     * @brief Step between `keys`.
-     *
-     * The number of bytes separating entries in the `keys` array.
-     * Zero stride would reuse the same address for all tasks.
-     * You can use it to retrieve the same key from different collections in one call.
-     * Is @b optional.
-     */
+
+    /** Bytes between consecutive keys, where zero repeats the first one. */
     ustore_size_t keys_stride;
 
-    /// @}
-    /// @name Outputs
-    /// @{
-
-    /**
-     * @brief Output presence (non-NULL) indicators.
-     *
-     * Will contain a bitset with at least `tasks_count` bits.
-     * Each set bit means that such key is present in DB.
-     * Is addressed the same way as in Apache Arrow.
-     * Is @b optional.
-     */
+    /** Optional output for a bitset of at least @c tasks_count bits marking present keys, addressed
+     *  as Apache Arrow does. */
     ustore_octet_t** presences;
-    /**
-     * @brief Output content offsets within `values`.
-     *
-     * Will contain a pointer to an array of `tasks_count` integer offsets.
-     * Each marks a response offset in bytes starting from `values`.
-     * To be fully compatible with Apache Arrow we append one more offset at
-     * the end to allow inferring the length of the last entry without using `lengths`.
-     * Is @b optional, as you may only want to get `lengths` or check `presences`.
-     */
+
+    /** Optional output for @c tasks_count plus one offsets into @c values, the last one closing the
+     *  final value as Apache Arrow expects. */
     ustore_length_t** offsets;
-    /**
-     * @brief Output content lengths within `values`.
-     *
-     * Will contain a pointer to an array of `tasks_count` integer offsets.
-     * Each defines a response length in bytes within `values`.
-     * Is @b optional.
-     */
+
+    /** Optional output for the lengths of the values, with @c ustore_length_missing_k for missing keys. */
     ustore_length_t** lengths;
-    /**
-     * @brief Output content tape.
-     *
-     * Will contain the base pointer for the `tasks_count` strings.
-     * Instead of allocating every "string" separately, we join them into
-     * a single "tape" structure, which later be exported into (often disjoint)
-     * runtime- or library-specific implementations.
-     * You should use `presences`, `offsets` and `lengths` to split the contents.
-     * - If `offsets` and `lengths` are exported, entries aren't guaranteed to be in any order.
-     * - If only `offsets` are exported, entries are concatenated in-order without any gaps.
-     *   The resulting `offsets` are guaranteed to have `tasks_count + 1` entries for Apache Arrow.
-     *   The last offset will be used to determine the length of the last entry.
-     *   Zero-length and Missing entries will be indistinguishable unless you also check `presences`.
-     * - If only `lengths` are exported, entries are concatenated in-order without any gaps.
-     *   Missing entries will have a length equal to `::ustore_length_missing_k`.
-     *
-     * Is @b optional, as you may only want to get `lengths` or check `presences`.
-     */
+
+    /** Optional output for the tape of values. With offsets and lengths the values may sit in any
+     *  order; with only one of them they follow each other without gaps, and with only offsets an
+     *  empty value reads the same as a missing one unless the presences are exported too. */
     ustore_byte_t** values;
-    /// @}
+
 } ustore_read_t;
 
 /**
- * @brief Main "getter" interface.
- * @see `ustore_read_t`.
+ *  @brief Reads a batch of values.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_read(ustore_read_t*);
+void ustore_read(ustore_read_t* arguments);
+
+#pragma endregion Reads
+
+#pragma region Scans
 
 /**
- * @brief Main "scanning", "range selection", "iteration", "enumeration" interface.
- * @see `ustore_scan()`.
+ *  @brief The arguments of @c ustore_scan, which lists up to a limit of keys from a start key in
+ *      every collection.
  *
- * Retrieves the following (upto) `count_limits[i]` keys starting
- * from `start_key[i]` or the smallest following key in each collection.
- * Values are not exported, for that - follow up with a `ustore_read()` or
- * a higher-level interface for Graphs, Docs or other modalities.
- *
- * ## Scans vs Iterators
- *
- * Implementing consistent iterators over concurrent state is exceptionally
- * expensive, thus we plan to implement those via "Pagination".
- *
- * ## Bulk Scans
- *
+ *  Values are not exported, so a read or a modality follows the scan. Consistent iterators over
+ *  concurrent state are costly, so scans paginate instead.
  */
 typedef struct ustore_scan_t {
 
-    /// @name Context
-    /// @{
-
-    /** @brief Already open database instance. */
+    /** An open database. */
     ustore_database_t db;
-    /**
-     * @brief Pointer to exported error message.
-     * If not NULL, must be deallocated with `ustore_error_free()`.
-     */
+
+    /** Output for the error message. */
     ustore_error_t* error;
-    /**
-     * @brief The transaction in which the operation will be watched.
-     * @see `ustore_transaction_init()`, `ustore_transaction_commit()`, `ustore_transaction_free()`.
-     */
+
+    /** Transaction that watches the scanned keys. */
     ustore_transaction_t transaction;
-    /**
-     * @brief A snapshot captures a point-in-time view of the DB at the time it's created.
-     * @see `ustore_snapshot_list()`, `ustore_snapshot_create()`, `ustore_snapshot_drop()`.
-     */
+
+    /** Snapshot whose view is scanned. */
     ustore_snapshot_t snapshot;
-    /**
-     * @brief Reusable memory handle.
-     * @see `ustore_arena_free()`.
-     */
+
+    /** Reusable memory for the results. */
     ustore_arena_t* arena;
-    /**
-     * @brief Scan options.
-     *
-     * Possible values:
-     * - `::ustore_option_scan_bulk_k`: Allows out-of-order retrieval for higher throughput.
-     * - `::ustore_option_transaction_dont_watch_k`: Disables collision-detection for transactional reads.
-     * - `::ustore_option_read_shared_memory_k`: Exports to shared memory to accelerate inter-process communication.
-     * - `::ustore_option_dont_discard_memory_k`: Won't reset the `arena` before the operation begins.
-     */
+
+    /** Accepts @c ustore_option_scan_bulk_k, @c ustore_option_transaction_dont_watch_k,
+     *  @c ustore_option_read_shared_memory_k and @c ustore_option_dont_discard_memory_k. */
     ustore_options_t options;
 
-    /// @}
-    /// @name Inputs
-    /// @{
-
-    /**
-     * @brief Number of separate operations packed in this read.
-     * Always equal to the number of provided `start_keys`.
-     */
+    /** Number of scans. */
     ustore_size_t tasks_count;
-    /**
-     * @brief Sequence of collections owning the `start_keys`.
-     *
-     * If `NULL` is passed, the default collection is assumed.
-     * If multiple collections are passed, the step between them is defined by `collections_stride`.
-     * Use `ustore_collection_create()` or `ustore_collection_list()` to obtain collection IDs for string names.
-     * Is @b optional.
-     */
+
+    /** Collections to scan, where @c NULL stands for the main collection. */
     ustore_collection_t const* collections;
-    /**
-     * @brief Step between `collections`.
-     *
-     * Contains the number of bytes separating entries in the `collections` array.
-     * Zero stride would reuse the same address for all tasks.
-     * You can use it to retrieve different keys from the same collection in one call.
-     * Is @b optional.
-     */
+
+    /** Bytes between consecutive collections, where zero repeats the first one. */
     ustore_size_t collections_stride;
-    /**
-     * @brief Starting points for each scan or "range select".
-     *
-     * Contains the pointer to the first of `tasks_count` starting points.
-     * If multiple scan tasks are passed, the step between them is defined by `start_keys_stride`.
-     */
+
+    /** Smallest key every scan may return, never @c NULL. */
     ustore_key_t const* start_keys;
-    /**
-     * @brief Step between `start_keys`.
-     *
-     * Contains the number of bytes separating entries in the `start_keys` array.
-     * Zero stride would reuse the same address for all tasks.
-     * You can use it to retrieve the same "ray" of keys from different `collections`.
-     * Is @b optional.
-     */
+
+    /** Bytes between consecutive start keys, where zero repeats the first one. */
     ustore_size_t start_keys_stride;
-    /**
-     * @brief Number of consecutive entries to read in each request.
-     *
-     * Contains the pointer to the first of `tasks_count` starting points.
-     * If multiple scan tasks are passed, the step between them is defined by `count_limits_stride`.
-     */
+
+    /** Most keys every scan returns, never @c NULL. */
     ustore_length_t const* count_limits;
-    /**
-     * @brief Step between `count_limits`.
-     *
-     * Contains the number of bytes separating entries in the `count_limits` array.
-     * Zero stride would reuse the same address for all tasks.
-     * You can use it to retrieve identical number of entries from different start points.
-     * Is @b optional.
-     */
+
+    /** Bytes between consecutive limits, where zero repeats the first one. */
     ustore_size_t count_limits_stride;
 
-    /// @}
-    /// @name Outputs
-    /// @{
-
-    /**
-     * @brief Output number of exported entries before for each scan.
-     *
-     * Will contain a pointer to an array of `tasks_count` integer offsets.
-     * Each marks a response offset in number of @c ustore_key_t keys starting from `*keys`.
-     * To be fully compatible with Apache Arrow we append one more offset at
-     * the end to allow inferring the length of the last entry without using `lengths`.
-     * Is @b optional, as you may only want to get `lengths` or check `presences`.
-     */
+    /** Optional output for @c tasks_count plus one offsets into @c keys, the last one closing the final scan. */
     ustore_length_t** offsets;
-    /**
-     * @brief Output number of found entries for each scan.
-     *
-     * Will contain a pointer to an array of `tasks_count` integer offsets.
-     * Each defines a response length in bytes within `keys`.
-     * For any `i` under `tasks_count`, this holds: `count_limits[i] >= counts[i]`.
-     * Is @b optional.
-     */
+
+    /** Optional output for the number of keys every scan found, never above its limit. */
     ustore_length_t** counts;
-    /**
-     * @brief Output keys tape.
-     *
-     * Will contain the base pointer for the `tasks_count` variable length arrays.
-     * Instead of allocating every array of key ranges separately, we join them into
-     * a single "tape" structure, which later be exported into (often disjoint)
-     * runtime- or library-specific implementations.
-     */
+
+    /** Output for the tape of found keys. */
     ustore_key_t** keys;
-    /// @}
 
 } ustore_scan_t;
 
 /**
- * @brief Main "scanning", "range selection", "iteration", "enumeration" interface.
- * @see `ustore_scan_t`.
+ *  @brief Scans a batch of key ranges.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_scan(ustore_scan_t*);
+void ustore_scan(ustore_scan_t* arguments);
 
-/**
- * @brief Uniformly randomly samples keys from provided collections.
- * @see `ustore_sample()`.
- */
+#pragma endregion Scans
+
+#pragma region Samples and Measurements
+
+/** The arguments of @c ustore_sample, which draws keys uniformly at random from every collection. */
 typedef struct ustore_sample_t {
 
-    /// @name Context
-    /// @{
-
-    /** @brief Already open database instance. */
+    /** An open database. */
     ustore_database_t db;
-    /**
-     * @brief Pointer to exported error message.
-     * If not NULL, must be deallocated with `ustore_error_free()`.
-     */
+
+    /** Output for the error message. */
     ustore_error_t* error;
-    /**
-     * @brief The transaction in which the operation will be watched.
-     * @see `ustore_transaction_init()`, `ustore_transaction_commit()`, `ustore_transaction_free()`.
-     */
+
+    /** Transaction that watches the sampled keys. */
     ustore_transaction_t transaction;
-    /**
-     * @brief The snapshot captures a view of the database at the time it's created.
-     * @see `ustore_snapshot_list()`, `ustore_snapshot_create()`, `ustore_snapshot_drop()`.
-     */
+
+    /** Snapshot whose view is sampled. */
     ustore_snapshot_t snapshot;
-    /**
-     * @brief Reusable memory handle.
-     * @see `ustore_arena_free()`.
-     */
+
+    /** Reusable memory for the results. */
     ustore_arena_t* arena;
-    /**
-     * @brief Sampling options.
-     *
-     * Possible values:
-     * - `::ustore_option_scan_bulk_k`: Allows out-of-order retrieval for higher throughput.
-     * - `::ustore_option_transaction_dont_watch_k`: Disables collision-detection for transactional reads.
-     * - `::ustore_option_read_shared_memory_k`: Exports to shared memory to accelerate inter-process communication.
-     * - `::ustore_option_dont_discard_memory_k`: Won't reset the `arena` before the operation begins.
-     */
+
+    /** Accepts @c ustore_option_scan_bulk_k, @c ustore_option_transaction_dont_watch_k,
+     *  @c ustore_option_read_shared_memory_k and @c ustore_option_dont_discard_memory_k. */
     ustore_options_t options;
 
-    /// @}
-    /// @name Inputs
-    /// @{
-
-    /**
-     * @brief Number of separate operations packed in this read.
-     * Always equal to the number of provided `start_keys`.
-     */
+    /** Number of samples. */
     ustore_size_t tasks_count;
-    /**
-     * @brief Sequence of collections owning the `start_keys`.
-     *
-     * If `NULL` is passed, the default collection is assumed.
-     * If multiple collections are passed, the step between them is defined by `collections_stride`.
-     * Use `ustore_collection_create()` or `ustore_collection_list()` to obtain collection IDs for string names.
-     * Is @b optional.
-     */
+
+    /** Collections to sample, where @c NULL stands for the main collection. */
     ustore_collection_t const* collections;
-    /**
-     * @brief Step between `collections`.
-     *
-     * Contains the number of bytes separating entries in the `collections` array.
-     * Zero stride would reuse the same address for all tasks.
-     * You can use it to retrieve different keys from the same collection in one call.
-     * Is @b optional.
-     */
+
+    /** Bytes between consecutive collections, where zero repeats the first one. */
     ustore_size_t collections_stride;
-    /**
-     * @brief Number of samples to be gathered for each request.
-     *
-     * Contains the pointer to the first of `tasks_count` starting points.
-     * If multiple samples are requested, the step between them is defined by `count_limits_stride`.
-     */
+
+    /** Number of keys every sample draws. */
     ustore_length_t const* count_limits;
-    /**
-     * @brief Step between `count_limits`.
-     *
-     * Contains the number of bytes separating entries in the `count_limits` array.
-     * Zero stride would reuse the same address for all tasks.
-     * You can use it to retrieve identical number of entries from different collections.
-     * Is @b optional.
-     */
+
+    /** Bytes between consecutive limits, where zero repeats the first one. */
     ustore_size_t count_limits_stride;
 
-    /// @}
-    /// @name Outputs
-    /// @{
-
-    /**
-     * @brief Output number of exported entries before for each scan.
-     *
-     * Will contain a pointer to an array of `tasks_count` integer offsets.
-     * Each marks a response offset in number of @c ustore_key_t keys starting from `*keys`.
-     * To be fully compatible with Apache Arrow we append one more offset at
-     * the end to allow inferring the length of the last entry without using `lengths`.
-     * Is @b optional, as you may only want to get `lengths` or check `presences`.
-     */
+    /** Optional output for @c tasks_count plus one offsets into @c keys, the last one closing the final sample. */
     ustore_length_t** offsets;
-    /**
-     * @brief Output number of found entries for each scan.
-     *
-     * Will contain a pointer to an array of `tasks_count` integer offsets.
-     * Each defines a response length in bytes within `keys`.
-     * For any `i` under `tasks_count`, this holds: `count_limits[i] >= counts[i]`.
-     * Is @b optional.
-     */
+
+    /** Optional output for the number of keys every sample drew, never above its limit. */
     ustore_length_t** counts;
-    /**
-     * @brief Output keys tape.
-     *
-     * Will contain the base pointer for the `tasks_count` variable length arrays.
-     * Instead of allocating every array of key ranges separately, we join them into
-     * a single "tape" structure, which later be exported into (often disjoint)
-     * runtime- or library-specific implementations.
-     */
+
+    /** Output for the tape of sampled keys. */
     ustore_key_t** keys;
-    /// @}
 
 } ustore_sample_t;
 
 /**
- * @brief Uniformly randomly samples keys from provided collections.
- * @see `ustore_sample_t`.
+ *  @brief Samples keys from a batch of collections.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_sample(ustore_sample_t*);
+void ustore_sample(ustore_sample_t* arguments);
 
-/**
- * @brief Estimates the number of entries and memory usage for a range of keys.
- * @see `ustore_measure()`.
- */
+/** The arguments of @c ustore_measure, which estimates the entries and the space inside key ranges. */
 typedef struct ustore_measure_t {
 
-    /// @name Context
-    /// @{
-
-    /** @brief Already open database instance. */
+    /** An open database. */
     ustore_database_t db;
-    /**
-     * @brief Pointer to exported error message.
-     * If not NULL, must be deallocated with `ustore_error_free()`.
-     */
+
+    /** Output for the error message. */
     ustore_error_t* error;
-    /**
-     * @brief The transaction in which the operation will be watched.
-     * @see `ustore_transaction_init()`, `ustore_transaction_commit()`, `ustore_transaction_free()`.
-     */
+
+    /** Transaction whose view is measured. */
     ustore_transaction_t transaction;
-    /**
-     * @brief A snapshot captures a point-in-time view of the DB at the time it's created.
-     * @see `ustore_snapshot_list()`, `ustore_snapshot_create()`, `ustore_snapshot_drop()`.
-     */
+
+    /** Snapshot whose view is measured. */
     ustore_snapshot_t snapshot;
-    /**
-     * @brief Reusable memory handle.
-     * @see `ustore_arena_free()`.
-     */
+
+    /** Reusable memory for the results. */
     ustore_arena_t* arena;
-    /**
-     * @brief Scan options.
-     *
-     * Possible values:
-     * - `::ustore_option_scan_bulk_k`: Allows out-of-order retrieval for higher throughput.
-     * - `::ustore_option_transaction_dont_watch_k`: Disables collision-detection for transactional reads.
-     * - `::ustore_option_read_shared_memory_k`: Exports to shared memory to accelerate inter-process communication.
-     * - `::ustore_option_dont_discard_memory_k`: Won't reset the `arena` before the operation begins.
-     */
+
+    /** Accepts @c ustore_option_scan_bulk_k, @c ustore_option_transaction_dont_watch_k,
+     *  @c ustore_option_read_shared_memory_k and @c ustore_option_dont_discard_memory_k. */
     ustore_options_t options;
 
-    /// @}
-    /// @name Inputs
-    /// @{
-
-    /**
-     * @brief Number of separate operations packed in this read.
-     * Always equal to the number of provided `start_keys`.
-     */
+    /** Number of measured ranges. */
     ustore_size_t tasks_count;
-    /**
-     * @brief Sequence of collections owning the `start_keys`.
-     *
-     * If `NULL` is passed, the default collection is assumed.
-     * If multiple collections are passed, the step between them is defined by `collections_stride`.
-     * Use `ustore_collection_create()` or `ustore_collection_list()` to obtain collection IDs for string names.
-     * Is @b optional.
-     */
+
+    /** Collections to measure, where @c NULL stands for the main collection. */
     ustore_collection_t const* collections;
-    /**
-     * @brief Step between `collections`.
-     *
-     * Contains the number of bytes separating entries in the `collections` array.
-     * Zero stride would reuse the same address for all tasks.
-     * You can use it to retrieve different keys from the same collection in one call.
-     * Is @b optional.
-     */
+
+    /** Bytes between consecutive collections, where zero repeats the first one. */
     ustore_size_t collections_stride;
-    /**
-     * @brief Starting points for each estimate.
-     *
-     * Contains the pointer to the first of `tasks_count` starting points.
-     * If multiple scan tasks are passed, the step between them is defined by `start_keys_stride`.
-     */
+
+    /** First key of every range. */
     ustore_key_t const* start_keys;
-    /**
-     * @brief Step between `start_keys`.
-     *
-     * Contains the number of bytes separating entries in the `start_keys` array.
-     * Zero stride would reuse the same address for all tasks.
-     * You can use it to retrieve the same "ray" of keys from different `collections`.
-     * Is @b optional.
-     */
+
+    /** Bytes between consecutive start keys, where zero repeats the first one. */
     ustore_size_t start_keys_stride;
-    /**
-     * @brief Ending points for each estimate.
-     *
-     * Contains the pointer to the first of `tasks_count` ending points.
-     * If multiple scan tasks are passed, the step between them is defined by `end_keys_stride`.
-     */
+
+    /** Last key of every range. */
     ustore_key_t const* end_keys;
-    /**
-     * @brief Step between `end_keys`.
-     *
-     * Contains the number of bytes separating entries in the `end_keys` array.
-     * Zero stride would reuse the same address for all tasks.
-     * You can use it to retrieve the same "ray" of keys from different `collections`.
-     * Is @b optional.
-     */
+
+    /** Bytes between consecutive end keys, where zero repeats the first one. */
     ustore_size_t end_keys_stride;
 
-    /// @}
-    /// @name Outputs
-    /// @{
-
+    /** Output for the lower bound on the entries in every range. */
     ustore_size_t** min_cardinalities;
-    ustore_size_t** max_cardinalities;
-    ustore_size_t** min_value_bytes;
-    ustore_size_t** max_value_bytes;
-    ustore_size_t** min_space_usages;
-    ustore_size_t** max_space_usages;
 
-    /// @}
+    /** Output for the upper bound on the entries in every range. */
+    ustore_size_t** max_cardinalities;
+
+    /** Output for the lower bound on the bytes of values in every range. */
+    ustore_size_t** min_value_bytes;
+
+    /** Output for the upper bound on the bytes of values in every range. */
+    ustore_size_t** max_value_bytes;
+
+    /** Output for the lower bound on the disk space every range takes. */
+    ustore_size_t** min_space_usages;
+
+    /** Output for the upper bound on the disk space every range takes. */
+    ustore_size_t** max_space_usages;
 
 } ustore_measure_t;
 
 /**
- * @brief Estimates the number of entries and memory usage for a range of keys.
- * @see `ustore_measure()`.
+ *  @brief Estimates the entries and the space inside a batch of key ranges.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_measure(ustore_measure_t*);
+void ustore_measure(ustore_measure_t* arguments);
+
+#pragma endregion Samples and Measurements
 
 #ifdef __cplusplus
-} /* end extern "C" */
+}
 #endif

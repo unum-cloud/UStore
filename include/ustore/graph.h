@@ -1,365 +1,322 @@
 /**
- * @file graph.h
- * @author Ashot Vardanian
- * @date 27 Jun 2022
- * @addtogroup C
+ *  @file include/ustore/graph.h
+ *  @author Ash Vardanian
+ *  @date June 27, 2022
+ *  @brief The binary interface for graph collections, stored as an inverted index from every vertex
+ *      to its edges.
  *
- * @brief Binary Interface Standard for @b Graph collections.
- *
- * It essentially extends "ustore.h", to store @b Graphs.
- * Unlike raw values and docs collections, this is an index
- * and the data is transformed into @b Multi-Way @b Inverted-Index.
- *
- * Edges are represented as triplets: (first ID, second ID, edge ID), where the
- * last argument is optional. Multiple edges between same vertices are possible,
- * potentially forming a @b Directed-Multi-Graph, but only if you set edge IDs.
- * Every vertex ID is mapped to an entire list of relations that it forms.
- *
- * ## Supported Graph Kinds
- *
- * 1. @b Undirected (Multi) Graph over vertices of the same collection: (movies.graph)
- * 2. @b Directed (Multi) Graph over vertices of the same collection: (movies.digraph)
- * 3. @b Joining (Multi) Graph linking two different collections: (movies->people.digraph)
- * In the last one, you can't choose directions at the level of edges, only collections.
- * In any one of those collections, storing metadata (a dictionary per each vertex/edge ID)
- * is @b optional. In theory, you may want to store metadata in a different DB, but that
- * would mean loosing ACID guarantees.
- *
- * ## Linking keys across collections
- *
- * It's impossible to foresee every higher-level usage pattern, so certain
- * things are left for users to decide. Generally, if you would have graphs
- * with a lot of metadata, one could structure them as a set of following collections:
- *  - objs.docs
- *  - objs.graph
- *
- * Or if it's a bipartite graph of `person_t` and `movie_t`, like in
- * recommendation systems, one could imagine:
- *  - people.docs
- *  - movies.docs
- *  - people->movies.digraph
- *
- * Which means that in every edge the first ID will be a person and target
- * will be a movie. If you want to keep edge directed in an opposite way, add:
- *  - movies->people.digraph
- *
- * ## Hyper-Graphs
- *
- * If working with Hyper-Graphs (multiple vertices linked by one edge), you are expected
- * to use Undirected Graphs, with vertices and hyper-edges mixed together. You would be
- * differentiating them not by parent collection, but by stored metadata at runtime.
+ *  An edge is a source, a target and an optional edge identifier, so distinct identifiers let a pair
+ *  of vertices share several edges. One collection holds an undirected or a directed graph over its
+ *  own vertices, or a joining graph between two collections whose direction is fixed per collection.
+ *  Metadata of vertices and edges lives in separate document collections under the same transaction,
+ *  such as people and movies next to a people to movies graph. A hypergraph mixes vertices and
+ *  hyperedges in one undirected graph and tells them apart by their metadata.
  */
 
 #pragma once
+
+#include <ustore/db.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#include "ustore/db.h"
+#pragma region Constants
 
-/*********************************************************/
-/*****************   Structures & Consts  ****************/
-/*********************************************************/
+/** The edge identifier of an edge that was given none. */
+extern ustore_key_t const ustore_default_edge_id_k;
 
-extern ustore_key_t ustore_default_edge_id_k;
-
-/**
- * @brief Every vertex can be either a source or a target in a Directed Graph.
- *
- * When working with undirected graphs, this argument is irrelevant and
- * should be set to `::ustore_vertex_role_any_k`. With directed graphs, where
- * source and target can belong to different collections its @b crucial
- * that members of each collection are fixed to be either only sources
- * or only edges.
- */
+/** The role a vertex plays in an edge, where undirected graphs use @c ustore_vertex_role_any_k.
+ *  In a joining graph the members of each collection must stay either sources or targets. */
 typedef enum ustore_vertex_role_t {
+
+    /** No role. */
     ustore_vertex_role_unknown_k = 0,
+
+    /** The vertex an edge leaves. */
     ustore_vertex_source_k = 1,
+
+    /** The vertex an edge enters. */
     ustore_vertex_target_k = 2,
+
+    /** Either end of an edge. */
     ustore_vertex_role_any_k = 3,
+
 } ustore_vertex_role_t;
 
-/**
- * @brief Type to describe the number of edges a vertex connects to.
- */
+/** The number of edges a vertex connects to. */
 typedef uint32_t ustore_vertex_degree_t;
-extern ustore_vertex_degree_t ustore_vertex_degree_missing_k;
 
-/*********************************************************/
-/*****************	 Primary Functions	  ****************/
-/*********************************************************/
+/** The degree reported for a missing vertex. */
+extern ustore_vertex_degree_t const ustore_vertex_degree_missing_k;
+
+#pragma endregion Constants
+
+#pragma region Edges
 
 /**
- * @brief Finds all the edges, connected to given vertices.
- * @see `ustore_graph_find_edges()`.
+ *  @brief The arguments of @c ustore_graph_find_edges, which exports the degree and the edges of every vertex.
  *
- * ## Output Form
- *
- * Similar to `ustore_read()`, this function exports a tape-like data
- * to minimize memory copies and colocate the relevant data in the
- * global address space.
- *
- * Every edge will be represented by @b three @c ustore_key_t's:
- * source, target and edge IDs respectively. It's not very
- * space-efficient, but will simplify the iteration over the
- * data in higher-level functions.
- *
- * Missing nodes will be exported with a "degree" set
- * to `::ustore_vertex_degree_missing_k`.
- *
- * ## Output Order
- *
- * When only source or target roles are requested, a subsequence of edges
- * related to the same input vertex ID will be sorted by the neighbor ID.
- * When both are requested:
- *
- * - First outgoing edges will arrive, sorted by targets.
- * - Then the incoming edges, sorted by the source.
- *
- * ## Checking Entity Existence
- *
- * To check if a node or edge is present - a simpler query is possible.
- * The `ustore_read()` on these same `collections` will return the presence
- * indicators for vertices. For edges, you will have to check the
- * collection that stores the metadata of the edges.
+ *  Every edge takes three keys on the tape: the source, the target and the edge identifier. Edges of
+ *  one vertex in one role come sorted by neighbor; with both roles the outgoing edges, sorted by
+ *  target, precede the incoming ones, sorted by source. Whether a vertex exists is cheaper to ask
+ *  from @c ustore_read on the same collection.
  */
 typedef struct ustore_graph_find_edges_t {
 
-    /// @name Context
-    /// @{
-
-    /** @brief Already open database instance. */
+    /** An open database. */
     ustore_database_t db;
-    /** @brief Pointer to exported error message. */
+
+    /** Output for the error message. */
     ustore_error_t* error;
-    /** @brief The transaction in which the operation will be watched. */
+
+    /** Transaction that watches the read vertices. */
     ustore_transaction_t transaction;
-    /** @brief A snapshot captures a point-in-time view of the DB at the time it's created. */
+
+    /** Snapshot whose view is read. */
     ustore_snapshot_t snapshot;
-    /** @brief Reusable memory handle. */
+
+    /** Reusable memory for the results. */
     ustore_arena_t* arena;
-    /** @brief Read options. @see `ustore_read_t`. */
+
+    /** Read options, as @c ustore_read_t accepts them. */
     ustore_options_t options;
 
-    /// @}
-    /// @name Inputs
-    /// @{
-
+    /** Number of vertices. */
     ustore_size_t tasks_count;
 
+    /** Graph collections, where @c NULL stands for the main collection. */
     ustore_collection_t const* collections;
+
+    /** Bytes between consecutive collections, where zero repeats the first one. */
     ustore_size_t collections_stride;
 
+    /** Vertices whose edges are found. */
     ustore_key_t const* vertices;
+
+    /** Bytes between consecutive vertices, where zero repeats the first one. */
     ustore_size_t vertices_stride;
 
-    /** @brief The roles of passed `vertices` within edges. */
+    /** Roles the vertices play in the wanted edges. */
     ustore_vertex_role_t const* roles;
-    /** @brief Step between `roles`. */
+
+    /** Bytes between consecutive roles, where zero repeats the first one. */
     ustore_size_t roles_stride;
 
-    /// @}
-    /// @name Outputs
-    /// @{
-
+    /** Output for the degree of every vertex, with @c ustore_vertex_degree_missing_k for missing ones. */
     ustore_vertex_degree_t** degrees_per_vertex;
-    ustore_key_t** edges_per_vertex;
 
-    /// @}
+    /** Optional output for the tape of edges, three keys per edge. */
+    ustore_key_t** edges_per_vertex;
 
 } ustore_graph_find_edges_t;
 
 /**
- * @brief Finds all the edges, connected to given vertices.
- * @see `ustore_graph_find_edges_t`.
+ *  @brief Finds the edges connected to a batch of vertices.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_graph_find_edges(ustore_graph_find_edges_t*);
+void ustore_graph_find_edges(ustore_graph_find_edges_t* arguments);
 
-/**
- * @brief Inserts edges between provided vertices.
- * @see `ustore_graph_upsert_edges()`.
- */
+/** The arguments of @c ustore_graph_upsert_edges. */
 typedef struct ustore_graph_upsert_edges_t {
 
-    /// @name Context
-    /// @{
-
-    /** @brief Already open database instance. */
+    /** An open database. */
     ustore_database_t db;
-    /** @brief Pointer to exported error message. */
+
+    /** Output for the error message. */
     ustore_error_t* error;
-    /** @brief The transaction in which the operation will be watched. */
+
+    /** Transaction that watches the updated vertices. */
     ustore_transaction_t transaction;
-    /** @brief Reusable memory handle. */
+
+    /** Reusable memory for intermediate results. */
     ustore_arena_t* arena;
-    /** @brief Read and Write options. @see `ustore_read_t`, `ustore_write_t`. */
+
+    /** Read and write options, as @c ustore_read_t and @c ustore_write_t accept them. */
     ustore_options_t options;
 
-    /// @}
-    /// @name Inputs
-    /// @{
+    /** Number of edges. */
     ustore_size_t tasks_count;
 
+    /** Graph collections, where @c NULL stands for the main collection. */
     ustore_collection_t const* collections;
+
+    /** Bytes between consecutive collections, where zero repeats the first one. */
     ustore_size_t collections_stride;
 
+    /** Identifiers of the edges. */
     ustore_key_t const* edges_ids;
+
+    /** Bytes between consecutive edge identifiers, where zero repeats the first one. */
     ustore_size_t edges_stride;
 
+    /** Sources of the edges. */
     ustore_key_t const* sources_ids;
+
+    /** Bytes between consecutive sources, where zero repeats the first one. */
     ustore_size_t sources_stride;
 
+    /** Targets of the edges. */
     ustore_key_t const* targets_ids;
-    ustore_size_t targets_stride;
 
-    /// @}
+    /** Bytes between consecutive targets, where zero repeats the first one. */
+    ustore_size_t targets_stride;
 
 } ustore_graph_upsert_edges_t;
 
 /**
- * @brief Inserts edges between provided vertices.
- * @see `ustore_graph_upsert_edges_t`.
+ *  @brief Inserts a batch of edges between existing or new vertices.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_graph_upsert_edges(ustore_graph_upsert_edges_t*);
+void ustore_graph_upsert_edges(ustore_graph_upsert_edges_t* arguments);
 
-/**
- * @brief Removed edges between provided vertices.
- * @see `ustore_graph_remove_edges()`.
- */
-typedef struct ustore_graph_remove_edges_t { //
+/** The arguments of @c ustore_graph_remove_edges. */
+typedef struct ustore_graph_remove_edges_t {
 
-    /// @name Context
-    /// @{
-
-    /** @brief Already open database instance. */
+    /** An open database. */
     ustore_database_t db;
-    /** @brief Pointer to exported error message. */
+
+    /** Output for the error message. */
     ustore_error_t* error;
-    /** @brief The transaction in which the operation will be watched. */
+
+    /** Transaction that watches the updated vertices. */
     ustore_transaction_t transaction;
-    /** @brief Reusable memory handle. */
+
+    /** Reusable memory for intermediate results. */
     ustore_arena_t* arena;
-    /** @brief Read and Write options. @see `ustore_read_t`, `ustore_write_t`. */
+
+    /** Read and write options, as @c ustore_read_t and @c ustore_write_t accept them. */
     ustore_options_t options;
 
-    /// @}
-    /// @name Inputs
-    /// @{
-
+    /** Number of edges. */
     ustore_size_t tasks_count;
 
+    /** Graph collections, where @c NULL stands for the main collection. */
     ustore_collection_t const* collections;
+
+    /** Bytes between consecutive collections, where zero repeats the first one. */
     ustore_size_t collections_stride;
 
+    /** Identifiers of the edges. */
     ustore_key_t const* edges_ids;
+
+    /** Bytes between consecutive edge identifiers, where zero repeats the first one. */
     ustore_size_t edges_stride;
 
+    /** Sources of the edges. */
     ustore_key_t const* sources_ids;
+
+    /** Bytes between consecutive sources, where zero repeats the first one. */
     ustore_size_t sources_stride;
 
+    /** Targets of the edges. */
     ustore_key_t const* targets_ids;
-    ustore_size_t targets_stride;
 
-    /// @}
+    /** Bytes between consecutive targets, where zero repeats the first one. */
+    ustore_size_t targets_stride;
 
 } ustore_graph_remove_edges_t;
 
 /**
- * @brief Removed edges between provided vertices.
- * @see `ustore_graph_remove_edges_t`.
+ *  @brief Removes a batch of edges.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_graph_remove_edges(ustore_graph_remove_edges_t*);
+void ustore_graph_remove_edges(ustore_graph_remove_edges_t* arguments);
 
-/**
- * @brief Upsert vertices.
- * @see `ustore_graph_upsert_vertices()`.
- */
-typedef struct ustore_graph_upsert_vertices_t { //
+#pragma endregion Edges
 
-    /// @name Context
-    /// @{
+#pragma region Vertices
 
-    /** @brief Already open database instance. */
+/** The arguments of @c ustore_graph_upsert_vertices. */
+typedef struct ustore_graph_upsert_vertices_t {
+
+    /** An open database. */
     ustore_database_t db;
-    /** @brief Pointer to exported error message. */
+
+    /** Output for the error message. */
     ustore_error_t* error;
-    /** @brief The transaction in which the operation will be watched. */
+
+    /** Transaction that watches the vertices. */
     ustore_transaction_t transaction;
-    /** @brief Reusable memory handle. */
+
+    /** Reusable memory for intermediate results. */
     ustore_arena_t* arena;
-    /** @brief Read and Write options. @see `ustore_read_t`, `ustore_write_t`. */
+
+    /** Read and write options, as @c ustore_read_t and @c ustore_write_t accept them. */
     ustore_options_t options;
 
-    /// @}
-    /// @name Inputs
-    /// @{
-
+    /** Number of vertices. */
     ustore_size_t tasks_count;
 
+    /** Graph collections, where @c NULL stands for the main collection. */
     ustore_collection_t const* collections;
+
+    /** Bytes between consecutive collections, where zero repeats the first one. */
     ustore_size_t collections_stride;
 
+    /** Vertices to insert unless present. */
     ustore_key_t const* vertices;
-    ustore_size_t vertices_stride;
 
-    /// @}
+    /** Bytes between consecutive vertices, where zero repeats the first one. */
+    ustore_size_t vertices_stride;
 
 } ustore_graph_upsert_vertices_t;
 
 /**
- * @brief Upsert vertices.
- * @see `ustore_graph_upsert_vertices_t`.
+ *  @brief Inserts a batch of vertices without edges, keeping those already present.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_graph_upsert_vertices(ustore_graph_upsert_vertices_t*);
+void ustore_graph_upsert_vertices(ustore_graph_upsert_vertices_t* arguments);
 
-/**
- * @brief Removes vertices and all related edges from the graph.
- * @see `ustore_graph_remove_vertices()`.
- */
-typedef struct ustore_graph_remove_vertices_t { //
+/** The arguments of @c ustore_graph_remove_vertices. */
+typedef struct ustore_graph_remove_vertices_t {
 
-    /// @name Context
-    /// @{
-
-    /** @brief Already open database instance. */
+    /** An open database. */
     ustore_database_t db;
-    /** @brief Pointer to exported error message. */
+
+    /** Output for the error message. */
     ustore_error_t* error;
-    /** @brief The transaction in which the operation will be watched. */
+
+    /** Transaction that watches the vertices and their neighbors. */
     ustore_transaction_t transaction;
-    /** @brief Reusable memory handle. */
+
+    /** Reusable memory for intermediate results. */
     ustore_arena_t* arena;
-    /** @brief Read and Write options. @see `ustore_read_t`, `ustore_write_t`. */
+
+    /** Read and write options, as @c ustore_read_t and @c ustore_write_t accept them. */
     ustore_options_t options;
 
-    /// @}
-    /// @name Inputs
-    /// @{
-
+    /** Number of vertices. */
     ustore_size_t tasks_count;
 
+    /** Graph collections, where @c NULL stands for the main collection. */
     ustore_collection_t const* collections;
+
+    /** Bytes between consecutive collections, where zero repeats the first one. */
     ustore_size_t collections_stride;
 
+    /** Vertices to remove. */
     ustore_key_t const* vertices;
+
+    /** Bytes between consecutive vertices, where zero repeats the first one. */
     ustore_size_t vertices_stride;
 
-    /** @brief Needed only for @b Joining graphs. */
+    /** Roles of the vertices, needed only by joining graphs. */
     ustore_vertex_role_t const* roles;
-    /** @brief Step between `roles`. */
-    ustore_size_t roles_stride;
 
-    /// @}
+    /** Bytes between consecutive roles, where zero repeats the first one. */
+    ustore_size_t roles_stride;
 
 } ustore_graph_remove_vertices_t;
 
 /**
- * @brief Removes vertices and all related edges from the graph.
- * @see `ustore_graph_remove_vertices_t`.
+ *  @brief Removes a batch of vertices together with every edge they belong to.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_graph_remove_vertices(ustore_graph_remove_vertices_t*);
+void ustore_graph_remove_vertices(ustore_graph_remove_vertices_t* arguments);
+
+#pragma endregion Vertices
 
 #ifdef __cplusplus
-} /* end extern "C" */
+}
 #endif

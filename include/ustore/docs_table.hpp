@@ -1,148 +1,85 @@
 /**
- * @file docs_table.hpp
- * @author Ashot Vardanian
- * @date 4 Jul 2022
- * @addtogroup Cpp
- *
- * @brief C++ bindings for "ustore/docs.h".
- *
- * Most field-level operations are still accessible through normal @c member_refs_t.
- * This interface mostly helps with tabular and SoA <-> AoS operations involving:
- * - ::ustore_docs_gist
- * - ::ustore_docs_gather_t
+ *  @file include/ustore/docs_table.hpp
+ *  @author Ash Vardanian
+ *  @date July 4, 2022
+ *  @brief Columnar views over the results of @c ustore_docs_gather.
  */
 
 #pragma once
-#include <limits.h>    // `CHAR_BIT`
-#include <string_view> // `std::basic_string_view`
-#include <vector>      // `std::vector`
-#include <variant>     // `std::monostate`
-#include <array>       // `std::array`
 
-#include "ustore/docs.h"
-#include "ustore/cpp/ranges.hpp"
+#include <cstddef> // `std::size_t`
+
+#include <algorithm>   // `std::copy_n`
+#include <array>       // `std::array`
+#include <concepts>    // `std::same_as`
+#include <span>        // `std::span`
+#include <string_view> // `std::string_view`
+#include <tuple>       // `std::tuple`
+#include <type_traits> // `std::conditional_t`
+#include <variant>     // `std::monostate`
+
+#include <ustore/docs.h>
+#include <ustore/ranges.hpp> // `strided_iterator`, `strided_range`, `bits_view_t`
+#include <ustore/types.hpp>  // `value_view_t`, `ustore_doc_field`
 
 namespace unum::ustore {
 
-template <typename element_at>
-constexpr bool is_variable_length() {
-    return std::is_same_v<element_at, value_view_t> || std::is_same_v<element_at, std::string_view>;
-}
+#pragma region Cells and Columns
 
-template <typename element_at>
-struct cell_gt;
+/** Element types stored as offsets and lengths into a joined tape rather than as fixed-width scalars. */
+template <typename element_>
+concept variable_length_element_concept = std::same_as<element_, value_view_t> ||
+                                          std::same_as<element_, std::string_view>;
 
-template <typename element_at>
-struct field_type_gt;
+/** One entry of a column, with the flags @c ustore_docs_gather reports for it. */
+template <typename element_>
+struct cell {
 
-class column_view_t;
-
-template <typename element_at>
-class column_view_varlen_gt;
-
-template <typename element_at>
-class column_view_scalar_gt;
-
-template <typename element_at>
-using column_view_gt = std::conditional_t<is_variable_length<element_at>(),
-                                          column_view_varlen_gt<element_at>,
-                                          column_view_scalar_gt<element_at>>;
-
-template <typename... column_types_at>
-class docs_table_gt;
-
-template <typename... column_types_at>
-class table_header_gt;
-
-using docs_table_t = docs_table_gt<std::monostate>;
-
-using field_type_t = field_type_gt<std::monostate>;
-
-using table_header_t = table_header_gt<std::monostate>;
-
-/**
- * @brief The first column of the table, describing its contents.
- */
-struct table_index_view_t {
-    strided_iterator_gt<ustore_collection_t const> collections_begin;
-    strided_iterator_gt<ustore_key_t const> keys_begin;
-    std::size_t count {0};
-
-    strided_range_gt<ustore_collection_t const> collections() const noexcept { return {collections_begin, count}; }
-    strided_range_gt<ustore_key_t const> keys() const noexcept { return {keys_begin, count}; }
-};
-
-struct table_header_view_t {
-    strided_iterator_gt<ustore_str_view_t const> fields_begin;
-    strided_iterator_gt<ustore_doc_field_type_t const> types_begin;
-    std::size_t count {0};
-
-    strided_range_gt<ustore_str_view_t const> fields() const noexcept { return {fields_begin, count}; }
-    strided_range_gt<ustore_doc_field_type_t const> types() const noexcept { return {types_begin, count}; }
-};
-
-template <typename element_at>
-struct cell_gt {
+    /** Whether the value was found and converted. */
     bool valid {false};
+
+    /** Whether the conversion changed the semantics of the value. */
     bool converted {false};
+
+    /** Whether an inconvertible value sits under the field. */
     bool collides {false};
-    element_at value;
+
+    /** The value, meaningful only when @c valid. */
+    element_ value {};
 };
 
-template <>
-struct cell_gt<value_view_t> {
-    bool valid {false};
-    bool converted {false};
-    bool collides {false};
-    value_view_t value;
-};
-
-template <typename element_at>
-class column_view_scalar_gt {
+/** Column of fixed-width scalars. */
+template <typename element_>
+class column_view_scalar {
     ustore_octet_t* validities_ {nullptr};
     ustore_octet_t* conversions_ {nullptr};
     ustore_octet_t* collisions_ {nullptr};
-    element_at* scalars_ {nullptr};
+    element_* scalars_ {nullptr};
     ustore_size_t count_ {0};
     ustore_str_view_t name_ {nullptr};
 
   public:
-    using scalar_t = element_at;
-    using cell_t = cell_gt<scalar_t>;
+    using cell_t = cell<element_>;
     using value_type = cell_t;
 
-    column_view_scalar_gt( //
-        ustore_octet_t* validities,
-        ustore_octet_t* conversions,
-        ustore_octet_t* collisions,
-        scalar_t* scalars,
-        ustore_size_t count,
-        ustore_str_view_t name = nullptr) noexcept
+    column_view_scalar( //
+        ustore_octet_t* validities, ustore_octet_t* conversions, ustore_octet_t* collisions, element_* scalars,
+        ustore_size_t count, ustore_str_view_t name = nullptr) noexcept
         : validities_(validities), conversions_(conversions), collisions_(collisions), scalars_(scalars), count_(count),
           name_(name) {}
 
-    column_view_scalar_gt(column_view_scalar_gt&&) = default;
-    column_view_scalar_gt(column_view_scalar_gt const&) = default;
-    column_view_scalar_gt& operator=(column_view_scalar_gt&&) = default;
-    column_view_scalar_gt& operator=(column_view_scalar_gt const&) = default;
-
     ustore_str_view_t name() const noexcept { return name_; }
     std::size_t size() const noexcept { return count_; }
-    cell_t operator[](std::size_t i) const noexcept {
-        // Bitmaps are indexed from the last bit within every byte
-        // https://arrow.apache.org/docs/format/Columnar.html#validity-bitmaps
-        ustore_octet_t mask_bitmap = static_cast<ustore_octet_t>(1 << (i % CHAR_BIT));
-        cell_t result;
-        result.valid = validities_[i / CHAR_BIT] & mask_bitmap;
-        result.converted = conversions_[i / CHAR_BIT] & mask_bitmap;
-        result.collides = collisions_[i / CHAR_BIT] & mask_bitmap;
-        result.value = scalars_[i];
-        return result;
+
+    cell_t operator[](std::size_t index) const noexcept {
+        return {bits_view_t {validities_}[index], bits_view_t {conversions_}[index], bits_view_t {collisions_}[index],
+                scalars_[index]};
     }
 };
 
-template <typename element_at>
-class column_view_varlen_gt {
+/** Column of strings, stored as offsets and lengths into a joined tape. */
+template <typename element_>
+class column_view_varlen {
     ustore_octet_t* validities_ {nullptr};
     ustore_octet_t* conversions_ {nullptr};
     ustore_octet_t* collisions_ {nullptr};
@@ -153,44 +90,33 @@ class column_view_varlen_gt {
     ustore_str_view_t name_ {nullptr};
 
   public:
-    using cell_t = cell_gt<element_at>;
+    using cell_t = cell<element_>;
     using value_type = cell_t;
 
-    column_view_varlen_gt( //
-        ustore_octet_t* validities,
-        ustore_octet_t* conversions,
-        ustore_octet_t* collisions,
-        ustore_byte_t* tape,
-        ustore_length_t* offsets,
-        ustore_length_t* lengths,
-        ustore_size_t count,
+    column_view_varlen( //
+        ustore_octet_t* validities, ustore_octet_t* conversions, ustore_octet_t* collisions, ustore_byte_t* tape,
+        ustore_length_t* offsets, ustore_length_t* lengths, ustore_size_t count,
         ustore_str_view_t name = nullptr) noexcept
         : validities_(validities), conversions_(conversions), collisions_(collisions), tape_(tape), offsets_(offsets),
           lengths_(lengths), count_(count), name_(name) {}
 
-    column_view_varlen_gt(column_view_varlen_gt&&) = default;
-    column_view_varlen_gt(column_view_varlen_gt const&) = default;
-    column_view_varlen_gt& operator=(column_view_varlen_gt&&) = default;
-    column_view_varlen_gt& operator=(column_view_varlen_gt const&) = default;
-
     ustore_str_view_t name() const noexcept { return name_; }
     std::size_t size() const noexcept { return count_; }
-    cell_t operator[](std::size_t i) const noexcept {
-        // Bitmaps are indexed from the last bit within every byte
-        // https://arrow.apache.org/docs/format/Columnar.html#validity-bitmaps
-        using str_char_t = typename element_at::value_type;
-        auto str_begin = reinterpret_cast<str_char_t const*>(tape_ + offsets_[i]);
 
-        ustore_octet_t mask_bitmap = static_cast<ustore_octet_t>(1 << (i % CHAR_BIT));
-        cell_t result;
-        result.valid = validities_[i / CHAR_BIT] & mask_bitmap;
-        result.converted = conversions_[i / CHAR_BIT] & mask_bitmap;
-        result.collides = collisions_[i / CHAR_BIT] & mask_bitmap;
-        result.value = element_at {str_begin, lengths_[i]};
-        return result;
+    cell_t operator[](std::size_t index) const noexcept {
+        using character_t = typename element_::value_type;
+        auto const begin = reinterpret_cast<character_t const*>(tape_ + offsets_[index]);
+        return {bits_view_t {validities_}[index], bits_view_t {conversions_}[index], bits_view_t {collisions_}[index],
+                element_ {begin, lengths_[index]}};
     }
 };
 
+/** Column view matching how @p element_ is stored. */
+template <typename element_>
+using column_view = std::conditional_t<variable_length_element_concept<element_>, //
+                                       column_view_varlen<element_>, column_view_scalar<element_>>;
+
+/** Column whose type is known only at runtime, viewed as a typed column through @c as. */
 class column_view_t {
     ustore_octet_t* validities_ {nullptr};
     ustore_octet_t* conversions_ {nullptr};
@@ -205,34 +131,21 @@ class column_view_t {
 
   public:
     column_view_t( //
-        ustore_octet_t* validities,
-        ustore_octet_t* conversions,
-        ustore_octet_t* collisions,
-        ustore_byte_t* scalars,
-        ustore_byte_t* tape,
-        ustore_length_t* offsets,
-        ustore_length_t* lengths,
-        ustore_size_t count,
-        ustore_str_view_t name = nullptr,
-        ustore_doc_field_type_t type = ustore_doc_field_json_k) noexcept
+        ustore_octet_t* validities, ustore_octet_t* conversions, ustore_octet_t* collisions, ustore_byte_t* scalars,
+        ustore_byte_t* tape, ustore_length_t* offsets, ustore_length_t* lengths, ustore_size_t count,
+        ustore_str_view_t name = nullptr, ustore_doc_field_type_t type = ustore_doc_field_json_k) noexcept
         : validities_(validities), conversions_(conversions), collisions_(collisions), scalars_(scalars), tape_(tape),
           offsets_(offsets), lengths_(lengths), count_(count), name_(name), type_(type) {}
-
-    column_view_t(column_view_t&&) = default;
-    column_view_t(column_view_t const&) = default;
-    column_view_t& operator=(column_view_t&&) = default;
-    column_view_t& operator=(column_view_t const&) = default;
 
     ustore_str_view_t name() const noexcept { return name_; }
     ustore_doc_field_type_t type() const noexcept { return type_; }
     std::size_t size() const noexcept { return count_; }
 
-    template <typename element_at>
-    column_view_gt<element_at> as() const noexcept {
-        if constexpr (is_variable_length<element_at>())
+    template <typename element_>
+    column_view<element_> as() const noexcept {
+        if constexpr (variable_length_element_concept<element_>)
             return {validities_, conversions_, collisions_, tape_, offsets_, lengths_, count_, name_};
-        else
-            return {validities_, conversions_, collisions_, reinterpret_cast<element_at*>(scalars_), count_, name_};
+        else return {validities_, conversions_, collisions_, reinterpret_cast<element_*>(scalars_), count_, name_};
     }
 
     ustore_octet_t* validities() const noexcept { return validities_; }
@@ -241,104 +154,149 @@ class column_view_t {
     ustore_byte_t* contents() const noexcept { return scalars_ ? scalars_ : tape_; }
 };
 
+#pragma endregion Cells and Columns
+
+#pragma region Headers
+
+/** A column of a table header: the field to gather and the type to convert it into. */
+struct field_type_t {
+
+    /** Field inside every document. */
+    ustore_str_view_t field {nullptr};
+
+    /** Type the field converts into. */
+    ustore_doc_field_type_t type {ustore_doc_field_json_k};
+};
+
+/** The first column of a table, naming the document of every row. */
+struct table_index_view_t {
+    strided_iterator<ustore_collection_t const> collections_begin;
+    strided_iterator<ustore_key_t const> keys_begin;
+    std::size_t count {0};
+
+    strided_range<ustore_collection_t const> collections() const noexcept { return {collections_begin, count}; }
+    strided_range<ustore_key_t const> keys() const noexcept { return {keys_begin, count}; }
+};
+
+/** The header row of a table, naming the field and type of every column. */
+struct table_header_view_t {
+    strided_iterator<ustore_str_view_t const> fields_begin;
+    strided_iterator<ustore_doc_field_type_t const> types_begin;
+    std::size_t count {0};
+
+    strided_range<ustore_str_view_t const> fields() const noexcept { return {fields_begin, count}; }
+    strided_range<ustore_doc_field_type_t const> types() const noexcept { return {types_begin, count}; }
+};
+
+/** Header of a table whose column types are known at compile time, built column by column through @c with. */
+template <typename... column_types_>
+struct table_header {
+
+    /** Field and type of every column, in order. */
+    std::array<field_type_t, sizeof...(column_types_)> columns;
+
+    template <typename element_>
+    table_header<column_types_..., element_> with(ustore_str_view_t name) && noexcept {
+        table_header<column_types_..., element_> extended;
+        std::copy_n(columns.begin(), columns.size(), extended.columns.begin());
+        extended.columns.back() = field_type_t {name, ustore_doc_field<element_>()};
+        return extended;
+    }
+
+    strided_range<ustore_str_view_t const> fields() const noexcept {
+        return strided(columns).members(&field_type_t::field);
+    }
+
+    strided_range<ustore_doc_field_type_t const> types() const noexcept {
+        return strided(columns).members(&field_type_t::type);
+    }
+};
+
+/** Starts a header whose column types are known at compile time. */
+inline table_header<> make_table_header() noexcept { return {}; }
+
+/** Views @p columns, whose types are known only at runtime, as a table header. */
+inline table_header_view_t make_table_header(std::span<field_type_t const> columns) noexcept {
+    auto const range = strided(columns.data(), columns.data() + columns.size());
+    return {range.members(&field_type_t::field).begin(), range.members(&field_type_t::type).begin(), columns.size()};
+}
+
+#pragma endregion Headers
+
+#pragma region Tables
+
 /**
- * @brief
+ *  @brief Results of @c ustore_docs_gather, with documents as rows and fields as columns.
  *
- * @tparam column_types_at Optional type-annotation for columns.
+ *  @tparam column_types_ Types of the columns, or @c std::monostate alone when they are known only at runtime.
  */
-template <typename... column_types_at>
-class docs_table_gt {
+template <typename... column_types_>
+class docs_table {
+    using types_tuple_t = std::tuple<column_types_...>;
+    static constexpr bool is_dynamic_k = std::is_same_v<std::tuple<std::monostate>, types_tuple_t>;
 
-    using empty_tuple_t = std::tuple<std::monostate>;
-    using types_tuple_t = std::tuple<column_types_at...>;
-    using row_tuple_t = std::tuple<cell_gt<column_types_at>...>;
-    static constexpr bool is_dynamic_k = std::is_same_v<empty_tuple_t, types_tuple_t>;
-
-    template <std::size_t idx_ak>
-    using column_at_gt =
-        std::conditional_t<is_dynamic_k, column_view_t, column_view_gt<std::tuple_element_t<idx_ak, types_tuple_t>>>;
+    template <std::size_t index_>
+    using column_of = std::conditional_t<is_dynamic_k, //
+                                         column_view_t, column_view<std::tuple_element_t<index_, types_tuple_t>>>;
 
     ustore_size_t docs_count_;
     ustore_size_t fields_count_;
 
-    strided_iterator_gt<ustore_collection_t const> collections_;
-    strided_iterator_gt<ustore_key_t const> keys_;
-    strided_iterator_gt<ustore_str_view_t const> fields_;
-    strided_iterator_gt<ustore_doc_field_type_t const> types_;
+    strided_iterator<ustore_collection_t const> collections_;
+    strided_iterator<ustore_key_t const> keys_;
+    strided_iterator<ustore_str_view_t const> fields_;
+    strided_iterator<ustore_doc_field_type_t const> types_;
 
-    ustore_octet_t** columns_validities_ = nullptr;
-    ustore_octet_t** columns_conversions_ = nullptr;
-    ustore_octet_t** columns_collisions_ = nullptr;
-    ustore_byte_t** columns_scalars_ = nullptr;
-    ustore_length_t** columns_offsets_ = nullptr;
-    ustore_length_t** columns_lengths_ = nullptr;
-    ustore_byte_t* tape_ = nullptr;
+    ustore_octet_t** columns_validities_ {nullptr};
+    ustore_octet_t** columns_conversions_ {nullptr};
+    ustore_octet_t** columns_collisions_ {nullptr};
+    ustore_byte_t** columns_scalars_ {nullptr};
+    ustore_length_t** columns_offsets_ {nullptr};
+    ustore_length_t** columns_lengths_ {nullptr};
+    ustore_byte_t* tape_ {nullptr};
 
   public:
-    docs_table_gt( //
-        ustore_size_t docs_count,
-        ustore_size_t fields_count,
-        strided_iterator_gt<ustore_collection_t const> collections,
-        strided_iterator_gt<ustore_key_t const> keys,
-        strided_iterator_gt<ustore_str_view_t const> fields,
-        strided_iterator_gt<ustore_doc_field_type_t const> types,
-        ustore_octet_t** columns_validities = nullptr,
-        ustore_octet_t** columns_conversions = nullptr,
-        ustore_octet_t** columns_collisions = nullptr,
-        ustore_byte_t** columns_scalars = nullptr,
-        ustore_length_t** columns_offsets = nullptr,
-        ustore_length_t** columns_lengths = nullptr,
-        ustore_byte_t* tape = nullptr) noexcept
+    docs_table( //
+        ustore_size_t docs_count, ustore_size_t fields_count, strided_iterator<ustore_collection_t const> collections,
+        strided_iterator<ustore_key_t const> keys, strided_iterator<ustore_str_view_t const> fields,
+        strided_iterator<ustore_doc_field_type_t const> types, ustore_octet_t** columns_validities = nullptr,
+        ustore_octet_t** columns_conversions = nullptr, ustore_octet_t** columns_collisions = nullptr,
+        ustore_byte_t** columns_scalars = nullptr, ustore_length_t** columns_offsets = nullptr,
+        ustore_length_t** columns_lengths = nullptr, ustore_byte_t* tape = nullptr) noexcept
         : docs_count_(docs_count), fields_count_(fields_count), collections_(collections), keys_(keys), fields_(fields),
           types_(types), columns_validities_(columns_validities), columns_conversions_(columns_conversions),
           columns_collisions_(columns_collisions), columns_scalars_(columns_scalars), columns_offsets_(columns_offsets),
           columns_lengths_(columns_lengths), tape_(tape) {}
 
-    docs_table_gt(docs_table_gt&&) = default;
-    docs_table_gt(docs_table_gt const&) = default;
-    docs_table_gt& operator=(docs_table_gt&&) = default;
-    docs_table_gt& operator=(docs_table_gt const&) = default;
-
     table_index_view_t index() const noexcept { return {collections_, keys_, docs_count_}; }
-    table_header_view_t header() const noexcept { return {fields_, types_, docs_count_}; }
+    table_header_view_t header() const noexcept { return {fields_, types_, fields_count_}; }
 
-    template <typename element_at = std::monostate>
-    auto column(std::size_t i) const noexcept {
-        column_view_t punned {
-            columns_validities_[i],
-            columns_conversions_[i],
-            columns_collisions_[i],
-            columns_scalars_[i],
+    template <typename element_ = std::monostate>
+    auto column(std::size_t index) const noexcept {
+        column_view_t const punned {
+            columns_validities_[index],
+            columns_conversions_[index],
+            columns_collisions_[index],
+            columns_scalars_[index],
             tape_,
-            columns_offsets_[i],
-            columns_lengths_[i],
+            columns_offsets_[index],
+            columns_lengths_[index],
             docs_count_,
-            fields_[i],
-            types_[i],
+            fields_[index],
+            types_[index],
         };
-        if constexpr (std::is_same_v<element_at, std::monostate>)
-            return punned;
-        else
-            return punned.template as<element_at>();
+        if constexpr (std::is_same_v<element_, std::monostate>) return punned;
+        else return punned.template as<element_>();
     }
 
-    template <std::size_t idx_ak>
-    column_at_gt<idx_ak> column() const noexcept {
-        if constexpr (!is_dynamic_k) {
-            using scalar_t = std::tuple_element_t<idx_ak, types_tuple_t>;
-            return this->template column<scalar_t>(idx_ak);
-        }
-        else
-            return column(idx_ak);
-    }
-
-    row_tuple_t row(std::size_t i) const noexcept {
-        // TODO:
-        return {};
+    template <std::size_t index_>
+    column_of<index_> column() const noexcept {
+        if constexpr (is_dynamic_k) return column(index_);
+        else return this->template column<std::tuple_element_t<index_, types_tuple_t>>(index_);
     }
 
     std::size_t rows() const noexcept { return docs_count_; }
-    std::size_t collections() const noexcept { return fields_count_; }
+    std::size_t columns() const noexcept { return fields_count_; }
 
     ustore_octet_t*** member_validities() noexcept { return &columns_validities_; }
     ustore_octet_t*** member_conversions() noexcept { return &columns_conversions_; }
@@ -349,83 +307,8 @@ class docs_table_gt {
     ustore_byte_t** member_tape() noexcept { return &tape_; }
 };
 
-template <typename element_at>
-struct field_type_gt {
-    ustore_str_view_t field = nullptr;
-    ustore_doc_field_type_t type = ustore_doc_field_json_k;
-};
+using docs_table_t = docs_table<std::monostate>;
 
-template <>
-struct field_type_gt<std::monostate> {
-    ustore_str_view_t field = nullptr;
-    ustore_doc_field_type_t type = ustore_doc_field_json_k;
-};
-
-/**
- * @brief Combination of index column and header row,
- * defining the order of @b statically-typed contents in the table.
- */
-template <typename... column_types_at>
-struct table_header_gt {
-
-    using types_tuple_t = std::tuple<column_types_at...>;
-    static constexpr std::size_t collections_count_k = std::tuple_size_v<types_tuple_t>;
-    using columns_t = std::array<field_type_t, collections_count_k>;
-
-    columns_t columns;
-
-    template <typename element_at>
-    table_header_gt<column_types_at..., element_at> with(ustore_str_view_t name) && {
-        using new_columns_t = std::array<field_type_t, collections_count_k + 1>;
-        new_columns_t new_columns;
-        std::copy_n(columns.begin(), collections_count_k, new_columns.begin());
-        new_columns[collections_count_k] = field_type_t {name, ustore_doc_field<element_at>()};
-        return {new_columns};
-    }
-
-    strided_range_gt<ustore_str_view_t const> fields() const noexcept {
-        return strided_range(columns).members(&field_type_t::field);
-    }
-
-    strided_range_gt<ustore_doc_field_type_t const> types() const noexcept {
-        return strided_range(columns).members(&field_type_t::type);
-    }
-};
-
-inline table_header_gt<> table_header() {
-    return {};
-}
-
-/**
- * @brief Combination of index column and header row,
- * defining the order of @b dynamically-typed contents in the table.
- */
-template <>
-struct table_header_gt<std::monostate> {
-
-    std::vector<field_type_t> columns;
-
-    void clear() noexcept { columns.clear(); }
-    table_header_view_t view() const noexcept { return {fields().begin(), types().begin(), columns.size()}; }
-    operator table_header_view_t() const noexcept { return view(); }
-
-    template <typename element_at>
-    table_header_gt& with(ustore_str_view_t name) & {
-        return with(name, ustore_doc_field<element_at>());
-    }
-
-    table_header_gt& with(ustore_str_view_t name, ustore_doc_field_type_t type) & {
-        columns.push_back({name, type});
-        return *this;
-    }
-
-    strided_range_gt<ustore_str_view_t const> fields() const noexcept {
-        return strided_range(columns).members(&field_type_t::field);
-    }
-
-    strided_range_gt<ustore_doc_field_type_t const> types() const noexcept {
-        return strided_range(columns).members(&field_type_t::type);
-    }
-};
+#pragma endregion Tables
 
 } // namespace unum::ustore

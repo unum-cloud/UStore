@@ -1,279 +1,280 @@
 /**
- * @file config_loader.hpp
- * @author Ashot Vardanian
- *
- * @brief DBMS configurations
+ *  @file src/helpers/config_loader.hpp
+ *  @author Mesrop Gevorgyan
+ *  @date March 9, 2023
+ *  @brief Database configuration, parsed and validated from JSON through yyjson.
  */
+
 #pragma once
 
-#include <limits>            // `std::numeric_limit`
-#include <vector>            // `std::vector`
-#include <string>            // `std::string`
-#include <sstream>           // `std::stringstream`
-#include <nlohmann/json.hpp> // `nlohmann::json`
-#include <fmt/format.h>      // `fmt::format`
+#include <cstddef>    // `std::size_t`
+#include <cstdint>    // `std::int64_t`, `std::uint64_t`, `std::uint8_t`
+#include <sys/stat.h> // `stat`, `S_ISDIR`
 
-#include "ustore/cpp/status.hpp" // `status_t`
+#include <charconv>     // `std::from_chars`
+#include <concepts>     // `std::floating_point`, `std::integral`, `std::same_as`
+#include <limits>       // `std::numeric_limits`
+#include <string_view>  // `std::string_view`
+#include <system_error> // `std::errc`
+#include <utility>      // `std::exchange`, `std::in_range`, `std::swap`
+
+#include <yyjson.h>
+
+#include <smashtable/basic_vector.hpp>
+
+#include <ustore/status.hpp> // `status_t`
 
 namespace unum::ustore {
 
-using json_t = nlohmann::json;
+#pragma region Documents
 
-/**
- * @brief Storage disk configuration
- *
- * @path: Data directory path on the disk
- * @max_size: Space limit used by DBMS
- */
-struct disk_config_t {
-    static constexpr size_t unlimited_space_k = std::numeric_limits<size_t>::max(); // Not limited by software
-
-    std::string path;
-    size_t max_size = unlimited_space_k;
-};
-
-/**
- * @brief Engine configuration
- *
- * @config_url: URL where is located the config.
- * @config_file_path: Local config file path.
- * @config: Config in key-value format.
- */
-struct engine_config_t {
-    std::string config_url;
-    std::string config_file_path;
-    json_t config;
-};
-
-/**
- * @brief DBMS configuration
- *
- * @directory: Main path where DB stores metadata, e.g schema, log, etc.
- * @data_directories: Storage paths where DB stores data.
- * @engine_config_path: Engine specific config.
- */
-struct config_t {
-    std::string directory;
-    std::vector<disk_config_t> data_directories;
-    engine_config_t engine;
-};
-
-/**
- * @brief DBMS configurations loader
- */
-class config_loader_t {
-  public:
-    static constexpr uint8_t current_major_version_k = 1;
-    static constexpr uint8_t current_minor_version_k = 0;
+/** Owns a parsed yyjson document and frees it on destruction. */
+class json_document_t {
+    yyjson_doc* document_ = nullptr;
 
   public:
-    static inline status_t load_from_json(json_t const& json, config_t& config);
-    static inline status_t load_from_json_string(std::string const& str_json,
-                                                 config_t& config,
-                                                 bool ignore_comments = false);
+    json_document_t() noexcept = default;
+    explicit json_document_t(yyjson_doc* document) noexcept : document_(document) {}
 
-    static inline status_t save_to_json(config_t const& config, json_t& json);
-    static inline status_t save_to_json_string(config_t const& config, std::string& str_json);
+    json_document_t(json_document_t const&) = delete;
+    json_document_t& operator=(json_document_t const&) = delete;
 
-  private:
-    static inline std::string current_version() noexcept;
-    static inline status_t validate_config(json_t const& json) noexcept;
+    json_document_t(json_document_t&& other) noexcept : document_(std::exchange(other.document_, nullptr)) {}
 
-    static inline bool parse_version(std::string const& str_version, uint8_t& major, uint8_t& minor) noexcept;
-    static inline bool parse_volume(json_t const& json, std::string const& key, size_t& bytes) noexcept;
-    static inline bool parse_bytes(std::string const& str, size_t& bytes) noexcept;
+    json_document_t& operator=(json_document_t&& other) noexcept {
+        std::swap(document_, other.document_);
+        return *this;
+    }
+
+    ~json_document_t() noexcept {
+        if (document_) yyjson_doc_free(document_);
+    }
+
+    /** The root value, or null when nothing is parsed. */
+    yyjson_val* root() const noexcept { return document_ ? yyjson_doc_get_root(document_) : nullptr; }
 };
 
-inline status_t config_loader_t::load_from_json(json_t const& json, config_t& config) {
-
-    try {
-        auto status = validate_config(json);
-        if (!status)
-            return status;
-
-        // Main directory
-        config.directory = json.value("directory", "");
-
-        // Storage disks
-        if (json.contains("data_directories")) {
-            auto j_disks = json["data_directories"];
-            if (j_disks.is_array()) {
-                for (auto j_disk : j_disks) {
-                    disk_config_t disk_config;
-                    disk_config.path = j_disk.value("path", "");
-                    if (disk_config.path.empty())
-                        return "Empty data directory path";
-                    if (!parse_volume(j_disk, "max_size", disk_config.max_size))
-                        return "Invalid volume format";
-                    config.data_directories.push_back(std::move(disk_config));
-                }
-            }
-            else
-                return "Invalid data directories config";
-        }
-
-        // Engine
-        if (json.contains("engine")) {
-            auto engine = json["engine"];
-            config.engine.config_url = engine.value("config_url", "");
-            config.engine.config_file_path = engine.value("config_file_path", "");;
-            if (engine.contains("config"))
-                config.engine.config = engine["config"];
-        }
-    }
-    catch (...) {
-        return "Exception occurred: Invalid json config file";
-    }
-
+/** Parses JSON text that may carry comments into @p document. */
+inline status_t parse_json(std::string_view text, json_document_t& document) noexcept {
+    yyjson_doc* const parsed = yyjson_read(text.data(), text.size(), YYJSON_READ_ALLOW_COMMENTS);
+    if (!parsed) return "Invalid JSON";
+    document = json_document_t(parsed);
     return {};
 }
 
-inline status_t config_loader_t::load_from_json_string(std::string const& str_json,
-                                                       config_t& config,
-                                                       bool ignore_comments) {
-    auto json = json_t::parse(str_json, nullptr, true, ignore_comments);
-    return load_from_json(json, config);
-}
-
-inline status_t config_loader_t::save_to_json(config_t const& config, json_t& json) {
-
-    json.clear();
-    json["version"] = current_version();
-
-    // Main directory
-    json["directory"] = config.directory;
-
-    // Storage disks
-    std::vector<json_t> j_data_directories;
-    for (auto const& directory : config.data_directories) {
-        json_t j_directory;
-        j_directory["path"] = directory.path;
-        j_directory["max_size"] = directory.max_size;
-        j_data_directories.push_back(j_directory);
-    }
-    json["data_directories"] = j_data_directories;
-
-    // Engine
-    json_t j_engine;
-    j_engine["config_url"] = config.engine.config_url;
-    j_engine["config_file_path"] = config.engine.config_file_path;
-    j_engine["config"] = config.engine.config;
-    json["engine"] = j_engine;
-
+/** Parses the JSON file at the null-terminated @p path into @p document. */
+inline status_t load_json_file(char const* path, json_document_t& document) noexcept {
+    yyjson_doc* const parsed = yyjson_read_file(path, YYJSON_READ_ALLOW_COMMENTS, nullptr, nullptr);
+    if (!parsed) return "Config file not found or invalid";
+    document = json_document_t(parsed);
     return {};
 }
 
-inline status_t config_loader_t::save_to_json_string(config_t const& config, std::string& str_json) {
-    json_t json;
-    auto status = save_to_json(config, json);
-    if (!status)
-        return status;
+#pragma endregion Documents
 
-    str_json = json.dump();
-    return {};
-}
+#pragma region Members
 
-inline std::string config_loader_t::current_version() noexcept {
-    return fmt::format("{}.{}", current_major_version_k, current_minor_version_k);
-}
-
-inline status_t config_loader_t::validate_config(json_t const& json) noexcept {
-
-    std::string version = json.value("version", std::string());
-    uint8_t major_version = 0;
-    uint8_t minor_version = 0;
-    if (!parse_version(version.c_str(), major_version, minor_version))
-        return "Invalid version format";
-    if (major_version != current_major_version_k || minor_version != current_minor_version_k)
-        return "Version not supported";
-    return {};
-}
-
-inline bool config_loader_t::parse_version(std::string const& str_version, uint8_t& major, uint8_t& minor) noexcept {
-
-    int mj = 0;
-    int mn = 0;
-    try {
-        size_t pos = 0;
-        std::string str = str_version.c_str();
-        mj = std::stoul(str, &pos);
-        if (pos == str.size())
-            return false;
-        str = str.substr(++pos);
-        mn = std::stoul(str, &pos);
-        if (pos < str.size())
-            return false;
-    }
-    catch (...) {
-        return false;
-    }
-    if (mj < 0 || mn < 0 || mj > int(std::numeric_limits<uint8_t>::max()) ||
-        mn > int(std::numeric_limits<uint8_t>::max()))
-        return false;
-
-    major = static_cast<uint8_t>(mj);
-    minor = static_cast<uint8_t>(mn);
-    return true;
-}
-
-inline bool config_loader_t::parse_volume(json_t const& json, std::string const& key, size_t& bytes) noexcept {
-
-    auto it = json.find(key.c_str());
-    if (it == json.end())
-        return true; // Skip if not exist
-
-    switch (it->type()) {
-    case json_t::value_t::number_unsigned: {
-        bytes = it.value();
+/** Reads an integer member of @p object, answering false only when it is present but does not fit. */
+template <typename integral_type_>
+    requires(std::integral<integral_type_> && !std::same_as<integral_type_, bool>)
+bool read_json_member(yyjson_val* object, char const* name, integral_type_& number) noexcept {
+    yyjson_val* const member = yyjson_obj_get(object, name);
+    if (!member) return true;
+    if (yyjson_is_uint(member) && std::in_range<integral_type_>(yyjson_get_uint(member))) {
+        number = static_cast<integral_type_>(yyjson_get_uint(member));
         return true;
     }
-    case json_t::value_t::string: {
-        std::string value = std::string(it.value()).c_str();
-        return parse_bytes(value, bytes);
+    if (yyjson_is_sint(member) && std::in_range<integral_type_>(yyjson_get_sint(member))) {
+        number = static_cast<integral_type_>(yyjson_get_sint(member));
+        return true;
     }
-    default: break;
-    }
-
     return false;
 }
 
-inline bool config_loader_t::parse_bytes(std::string const& str, size_t& bytes) noexcept {
+/** Reads a numeric member of @p object, answering false only when it is present but not a number. */
+template <typename floating_type_>
+    requires std::floating_point<floating_type_>
+bool read_json_member(yyjson_val* object, char const* name, floating_type_& number) noexcept {
+    yyjson_val* const member = yyjson_obj_get(object, name);
+    if (!member) return true;
+    if (yyjson_is_real(member)) number = static_cast<floating_type_>(yyjson_get_real(member));
+    else if (yyjson_is_uint(member)) number = static_cast<floating_type_>(yyjson_get_uint(member));
+    else if (yyjson_is_sint(member)) number = static_cast<floating_type_>(yyjson_get_sint(member));
+    else return false;
+    return true;
+}
 
-    if (str.empty()) { // Just set zero if it is empty
+/** Reads a boolean member of @p object, answering false only when it is present but not a boolean. */
+inline bool read_json_member(yyjson_val* object, char const* name, bool& flag) noexcept {
+    yyjson_val* const member = yyjson_obj_get(object, name);
+    if (!member) return true;
+    if (!yyjson_is_bool(member)) return false;
+    flag = yyjson_get_bool(member);
+    return true;
+}
+
+/** Reads a string member of @p object as a null-terminated view into its document. */
+inline bool read_json_member(yyjson_val* object, char const* name, std::string_view& text) noexcept {
+    yyjson_val* const member = yyjson_obj_get(object, name);
+    if (!member) return true;
+    if (!yyjson_is_str(member)) return false;
+    text = std::string_view(yyjson_get_str(member), yyjson_get_len(member));
+    return true;
+}
+
+#pragma endregion Members
+
+#pragma region Parsing
+
+/** Parses a volume such as "512", "512 B" or "1.5 GB" into bytes; only the scaled units take a fraction. */
+inline bool parse_bytes(std::string_view text, std::size_t& bytes) noexcept {
+    if (text.empty()) {
         bytes = 0;
         return true;
     }
+    if (text.front() == '.') return false;
 
-    // Parse number
-    double number = 0.0;
-    std::stringstream ss(str.c_str());
-    if (str.rfind('.', 0) == 0 || (ss >> number).fail() || std::isnan(number))
-        return false;
+    double number = 0;
+    char const* const text_end = text.data() + text.size();
+    auto const [number_end, error] = std::from_chars(text.data(), text_end, number);
+    if (error != std::errc {}) return false;
 
-    // Parse unite
-    std::string metric;
-    if (ss >> metric) {
-        if (metric == "KB")
-            number *= 1024ull;
-        else if (metric == "MB")
-            number *= 1024 * 1024ull;
-        else if (metric == "GB")
-            number *= 1024 * 1024 * 1024ull;
-        else if (metric == "TB")
-            number *= 1024 * 1024 * 1024 * 1024ull;
-        else if (metric != "B" || str.find('.') != std::string::npos)
-            return false;
-    }
-    else if (str.find('.') != std::string::npos)
-        return false;
+    std::string_view const digits(text.data(), static_cast<std::size_t>(number_end - text.data()));
+    std::string_view unit(number_end, static_cast<std::size_t>(text_end - number_end));
+    while (!unit.empty() && unit.front() == ' ') unit.remove_prefix(1);
 
-    if (!ss.eof())
-        return false;
-    if (std::isnan(number) || number > static_cast<double>(std::numeric_limits<size_t>::max()))
-        return false;
+    if (unit == "KB") number *= 1024.0;
+    else if (unit == "MB") number *= 1024.0 * 1024.0;
+    else if (unit == "GB") number *= 1024.0 * 1024.0 * 1024.0;
+    else if (unit == "TB") number *= 1024.0 * 1024.0 * 1024.0 * 1024.0;
+    else if ((!unit.empty() && unit != "B") || digits.find('.') != std::string_view::npos) return false;
 
-    bytes = static_cast<size_t>(number);
+    if (!(number >= 0) || number >= static_cast<double>(std::numeric_limits<std::size_t>::max())) return false;
+    bytes = static_cast<std::size_t>(number);
     return true;
 }
+
+/** Reads a volume member given either as a byte count or as a string with a unit. */
+inline bool read_json_volume(yyjson_val* object, char const* name, std::size_t& bytes) noexcept {
+    yyjson_val* const member = yyjson_obj_get(object, name);
+    if (yyjson_is_str(member))
+        return parse_bytes(std::string_view(yyjson_get_str(member), yyjson_get_len(member)), bytes);
+    return !member || (yyjson_is_uint(member) && read_json_member(object, name, bytes));
+}
+
+/** Parses a "major.minor" version whose parts each fit a byte. */
+inline bool parse_version(std::string_view text, std::uint8_t& major, std::uint8_t& minor) noexcept {
+    char const* const text_end = text.data() + text.size();
+    auto const [major_end, major_error] = std::from_chars(text.data(), text_end, major);
+    if (major_error != std::errc {} || major_end == text_end || *major_end != '.') return false;
+    auto const [minor_end, minor_error] = std::from_chars(major_end + 1, text_end, minor);
+    return minor_error == std::errc {} && minor_end == text_end;
+}
+
+/** Whether the null-terminated @p path names an existing directory. */
+inline bool is_directory(char const* path) noexcept {
+    struct stat information;
+    return ::stat(path, &information) == 0 && S_ISDIR(information.st_mode);
+}
+
+#pragma endregion Parsing
+
+#pragma region Configuration
+
+/** Major version of the configuration format this build reads. */
+inline constexpr std::uint8_t config_major_version_k = 1;
+
+/** Minor version of the configuration format this build reads. */
+inline constexpr std::uint8_t config_minor_version_k = 0;
+
+/** A storage directory and the space the database may occupy in it. */
+struct disk_config_t {
+
+    /** Marks space that only the disk itself limits. */
+    static constexpr std::size_t unlimited_space_k = std::numeric_limits<std::size_t>::max();
+
+    /** Directory path, null-terminated inside the configuration document. */
+    std::string_view path = "";
+
+    /** Space limit in bytes. */
+    std::size_t max_size = unlimited_space_k;
+};
+
+/** Where the engine reads its own options from. */
+struct engine_config_t {
+
+    /** Remote location of the options, which no engine supports. */
+    std::string_view config_url = "";
+
+    /** Local options file, null-terminated inside the configuration document. */
+    std::string_view config_file_path = "";
+
+    /** Non-empty options object nested in the configuration, or null. */
+    yyjson_val* config = nullptr;
+};
+
+/** Database configuration, whose strings and nested options point into its own document. */
+struct config_t {
+
+    /** Parsed configuration every other member points into. */
+    json_document_t document;
+
+    /** Main directory for metadata and data, null-terminated. */
+    std::string_view directory = "";
+
+    /** Additional storage directories. */
+    st::basic_vector<disk_config_t> data_directories;
+
+    /** Engine-specific options. */
+    engine_config_t engine;
+};
+
+/** Parses and validates a configuration, filling @p config only as far as it is valid. */
+inline status_t load_config(std::string_view text, config_t& config) noexcept {
+    if (status_t parsed = parse_json(text, config.document); !parsed) return parsed;
+
+    yyjson_val* const root = config.document.root();
+    if (!yyjson_is_obj(root)) return "Config isn't a JSON object";
+
+    // A configuration without a version reads as the current format.
+    if (yyjson_obj_get(root, "version")) {
+        std::string_view version;
+        std::uint8_t major = 0;
+        std::uint8_t minor = 0;
+        if (!read_json_member(root, "version", version) || !parse_version(version, major, minor))
+            return "Invalid version format";
+        if (major != config_major_version_k || minor != config_minor_version_k) return "Version not supported";
+    }
+
+    if (!read_json_member(root, "directory", config.directory)) return "Invalid directory";
+
+    yyjson_val* const directories = yyjson_obj_get(root, "data_directories");
+    if (directories && !yyjson_is_arr(directories)) return "Invalid data directories config";
+    if (st::failed(config.data_directories.reserve(yyjson_arr_size(directories))))
+        return "Out of memory for data directories";
+
+    yyjson_arr_iter directories_iterator;
+    yyjson_arr_iter_init(directories, &directories_iterator);
+    while (yyjson_val* const entry = yyjson_arr_iter_next(&directories_iterator)) {
+        disk_config_t disk;
+        if (!read_json_member(entry, "path", disk.path) || disk.path.empty()) return "Empty data directory path";
+        if (!read_json_volume(entry, "max_size", disk.max_size)) return "Invalid volume format";
+        if (st::failed(config.data_directories.push_back(std::move(disk)))) return "Out of memory for data directories";
+    }
+
+    yyjson_val* const engine = yyjson_obj_get(root, "engine");
+    if (!engine) return {};
+    if (!yyjson_is_obj(engine) || !read_json_member(engine, "config_url", config.engine.config_url) ||
+        !read_json_member(engine, "config_file_path", config.engine.config_file_path))
+        return "Invalid engine config";
+
+    yyjson_val* const nested = yyjson_obj_get(engine, "config");
+    if (!nested || yyjson_is_null(nested)) return {};
+    if (!yyjson_is_obj(nested)) return "Invalid engine config";
+    if (yyjson_obj_size(nested) != 0) config.engine.config = nested;
+    return {};
+}
+
+#pragma endregion Configuration
 
 } // namespace unum::ustore

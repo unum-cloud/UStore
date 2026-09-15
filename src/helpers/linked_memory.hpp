@@ -1,271 +1,288 @@
 /**
- * @file pmr.hpp
- * @author Ashot Vardanian
- *
- * @brief Helper functions Polymorphic Memory Allocators.
+ *  @file src/helpers/linked_memory.hpp
+ *  @author Ash Vardanian
+ *  @date January 11, 2023
+ *  @brief Growing arenas behind @c ustore_arena_t, whose private blocks ForkUnion places on a memory domain.
  */
-#pragma once
-#include <sys/mman.h> // `mmap`
-#include <limits.h>   // `CHAR_BIT`
-#include <cstring>    // `std::memcpy`
-#include <stdexcept>  // `std::runtime_error`
-#include <memory>     // `std::allocator`
-#include <vector>     // `std::vector`
-#include <numeric>    // `std::accumulate`
 
-#include "ustore/cpp/types.hpp"  // `byte_t`, `next_power_of_two`
-#include "ustore/cpp/ranges.hpp" // `strided_range_gt`
-#include "ustore/cpp/status.hpp" // `out_of_memory_k`
+#pragma once
+
+#include <cstddef>    // `std::size_t`
+#include <cstdint>    // `std::uintptr_t`
+#include <cstring>    // `std::memcpy`
+#include <sys/mman.h> // `mmap`, `munmap`
+
+#include <algorithm>   // `std::max`
+#include <new>         // placement `new`
+#include <type_traits> // `std::is_same_v`
+#include <utility>     // `std::exchange`
+
+#include <forkunion.h>
+
+#include <ustore/ranges.hpp> // `ptr_range`, `bits_span_t`
+#include <ustore/status.hpp> // `status_t`
+#include <ustore/types.hpp>  // `next_multiple`, `divide_round_up`
 
 namespace unum::ustore {
 
+/** A chain of ever larger blocks that bump-allocates and frees as a whole,
+ *  one pointer wide to fit @c ustore_arena_t. */
 struct linked_memory_t {
+
+    /** Bytes in the first block. */
     static constexpr std::size_t initial_size_k = 1024ul * 1024ul;
+
+    /** How many times larger each block is than the one before it. */
     static constexpr std::size_t growth_factor_k = 2ul;
 
-    struct arena_header_t;
-    arena_header_t* first_ptr_ = nullptr;
+    /** Memory domain of private blocks until an executor supplies the caller's own. */
+    static constexpr fu_memory_domain_id_t domain_id_k = 0;
 
-    enum class kind_t { sys_k = 0, shared_k, unified_k };
+    /** Where the pages of a block come from. */
+    enum class kind_t { private_k, shared_k };
+
+    /** Whether a new call may drop the blocks that earlier calls filled. */
+    enum class release_t : bool { forbidden_k, allowed_k };
+
+    /** The header at the start of every block. */
     struct arena_header_t {
+
+        /** Next, larger block of the chain. */
         arena_header_t* next = nullptr;
+
+        /** Bytes the block spans, its header included. */
         std::size_t capacity = 0;
+
+        /** Bytes handed out so far, the header included. */
         std::size_t used = 0;
-        kind_t kind = kind_t::sys_k;
-        bool can_release_memory = false;
+
+        /** Where the pages of the block come from. */
+        kind_t kind = kind_t::private_k;
+
+        /** Whether a lock may release the chain, kept on the first block only. */
+        release_t release = release_t::forbidden_k;
 
         void* alloc_internally(std::size_t length, std::size_t alignment) noexcept {
-            auto arena_start = std::intptr_t(this);
-            auto arena_end = arena_start + capacity;
-            auto potential_start = next_multiple(arena_start + used, alignment);
-            auto potential_end = potential_start + length;
-            if (potential_end > arena_end)
-                return nullptr;
-
+            auto const arena_start = reinterpret_cast<std::uintptr_t>(this);
+            std::uintptr_t const arena_end = arena_start + capacity;
+            std::uintptr_t const potential_start = next_multiple<std::uintptr_t>(arena_start + used, alignment);
+            std::uintptr_t const potential_end = potential_start + length;
+            if (potential_end > arena_end) return nullptr;
             used = potential_end - arena_start;
-            return (void*)potential_start;
+            return reinterpret_cast<void*>(potential_start);
         }
     };
+
+    /** First and smallest block of the chain. */
+    arena_header_t* first = nullptr;
 
     static arena_header_t* alloc_arena(std::size_t length, kind_t kind) noexcept {
         void* begin = nullptr;
         switch (kind) {
-        case kind_t::sys_k: begin = std::malloc(length); break;
-        case kind_t::shared_k:
-            begin = mmap(nullptr, length, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_SHARED, -1, 0);
+        case kind_t::private_k:
+            if (fu_allocate_on_domain_id(domain_id_k, length, &begin) != fu_success_k) return nullptr;
             break;
-        case kind_t::unified_k: break;
+        case kind_t::shared_k:
+            begin = ::mmap(nullptr, length, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_SHARED, -1, 0);
+            if (begin == MAP_FAILED) return nullptr;
+            break;
         }
-        auto header_ptr = (arena_header_t*)begin;
-        if (!header_ptr)
-            return nullptr;
+        if (!begin) return nullptr;
 
-        std::memset(header_ptr, 0, sizeof(arena_header_t));
-        header_ptr->kind = kind;
-        header_ptr->capacity = length;
-        header_ptr->used = sizeof(arena_header_t);
-        return header_ptr;
+        arena_header_t* const header = new (begin) arena_header_t {};
+        header->capacity = length;
+        header->used = sizeof(arena_header_t);
+        header->kind = kind;
+        return header;
     }
 
     static void release_arena(arena_header_t* arena) noexcept {
         switch (arena->kind) {
-        case kind_t::sys_k: std::free(arena); break;
-        case kind_t::shared_k: munmap(arena, arena->capacity); break;
-        case kind_t::unified_k: break;
+        case kind_t::private_k: fu_free_on_domain_id(domain_id_k, arena, arena->capacity); break;
+        case kind_t::shared_k: ::munmap(arena, arena->capacity); break;
         }
     }
 
-    arena_header_t& first_ref() noexcept { return *reinterpret_cast<arena_header_t*>(first_ptr_); }
-
+    /** Starts a chain of @p kind unless one already exists, and reports whether a chain is ready. */
     bool start_if_null(kind_t kind) noexcept {
-        if (first_ptr_ && first_ptr_->kind == kind)
-            return true;
-
-        first_ptr_ = alloc_arena(initial_size_k, kind);
-        first_ptr_->can_release_memory = true;
-        return first_ptr_;
+        if (first && first->kind == kind) return true;
+        first = alloc_arena(initial_size_k, kind);
+        if (!first) return false;
+        first->release = release_t::allowed_k;
+        return true;
     }
 
-    bool lock_release_calls() noexcept { return std::exchange(first_ref().can_release_memory, false); }
-    void unlock_release_calls() noexcept { first_ref().can_release_memory = true; }
+    release_t lock_release_calls() noexcept { return std::exchange(first->release, release_t::forbidden_k); }
+    void unlock_release_calls() noexcept { first->release = release_t::allowed_k; }
 
-    bool cheap_extend(void* ptr, size_t additional_size, size_t alignment) const noexcept {
-        arena_header_t* current = first_ptr_;
-        while (current != nullptr) {
-            bool is_continuation = ptr == (void*)((uint8_t*)current + current->used);
-            bool can_fit = (current->capacity - current->used) >= additional_size;
-            if (is_continuation && can_fit) {
-                current->alloc_internally(additional_size, alignment);
-                return true;
-            }
-            current = current->next;
+    /** Grows the allocation that ends at @p pointer in place, when a block still has room right after it. */
+    bool cheap_extend(void* pointer, std::size_t additional_size, std::size_t alignment) const noexcept {
+        for (arena_header_t* current = first; current != nullptr; current = current->next) {
+            bool const is_continuation = pointer ==
+                                         static_cast<void*>(reinterpret_cast<char*>(current) + current->used);
+            bool const can_fit = current->capacity - current->used >= additional_size;
+            if (!is_continuation || !can_fit) continue;
+            [[maybe_unused]] void* const extension = current->alloc_internally(additional_size, alignment);
+            return true;
         }
         return false;
     }
 
     void* alloc(std::size_t length, std::size_t alignment) noexcept {
+        if (!length || !first) return nullptr;
 
-        if (!length)
-            return nullptr;
-
-        arena_header_t* current = first_ptr_;
         arena_header_t* last = nullptr;
-        while (current != nullptr) {
-            if (auto ptr = current->alloc_internally(length, alignment); ptr)
-                return ptr;
+        for (arena_header_t* current = first; current != nullptr; current = current->next) {
+            if (void* const result = current->alloc_internally(length, alignment)) return result;
             last = current;
-            current = current->next;
         }
 
-        // We need to append a new even bigger bucket.
-        auto new_capacity = std::max(last->capacity * growth_factor_k, length + alignment + sizeof(arena_header_t));
-        auto new_arena = alloc_arena(new_capacity, first_ref().kind);
-        if (!new_arena)
-            return nullptr;
+        std::size_t const new_capacity = std::max(last->capacity * growth_factor_k,
+                                                  length + alignment + sizeof(arena_header_t));
+        arena_header_t* const new_arena = alloc_arena(new_capacity, first->kind);
+        if (!new_arena) return nullptr;
 
         last->next = new_arena;
         return new_arena->alloc_internally(length, alignment);
     }
 
     void release_all() noexcept {
-        arena_header_t* current = first_ptr_;
-        while (current != nullptr)
-            release_arena(std::exchange(current, current->next));
-        first_ptr_ = nullptr;
+        arena_header_t* current = first;
+        while (current != nullptr) release_arena(std::exchange(current, current->next));
+        first = nullptr;
     }
 
+    /** Frees every block but the first, and empties the first one for reuse. */
     void release_partially() noexcept {
-        if (!first_ptr_)
-            return;
-        arena_header_t* current = first_ptr_->next;
-        while (current != nullptr)
-            release_arena(std::exchange(current, current->next));
-        first_ptr_->next = nullptr;
-        first_ptr_->used = sizeof(arena_header_t);
+        if (!first) return;
+        arena_header_t* current = first->next;
+        while (current != nullptr) release_arena(std::exchange(current, current->next));
+        first->next = nullptr;
+        first->used = sizeof(arena_header_t);
     }
 };
 
-template <typename range_at>
-struct range_or_dummy_gt {
-    using range_t = range_at;
-    using value_type = typename range_t::value_type;
-    using reference = typename range_t::reference;
+/** A range that absorbs writes into a scratch element when the caller asked for no output. */
+template <typename range_>
+class range_or_dummy {
+  public:
+    using range_t = range_;
+    using value_type = typename range_::value_type;
+    using reference = typename range_::reference;
 
-    range_t range_;
-    value_type dummy_;
+  private:
+    range_ elements_;
+    mutable value_type dummy_ {};
 
-    reference operator[](std::size_t i) & noexcept { return range_ ? reference(range_[i]) : reference(dummy_); }
-    reference operator[](std::size_t i) const& noexcept { return range_ ? reference(range_[i]) : reference(dummy_); }
-    std::size_t size() const noexcept { return range_.size(); }
-    explicit operator bool() const noexcept { return range_; }
+  public:
+    explicit range_or_dummy(range_ elements) noexcept : elements_(elements) {}
+
+    reference operator[](std::size_t index) const noexcept {
+        return elements_ ? reference(elements_[index]) : reference(dummy_);
+    }
+    std::size_t size() const noexcept { return elements_.size(); }
+    explicit operator bool() const noexcept { return static_cast<bool>(elements_); }
 };
 
-struct linked_memory_lock_t {
-    linked_memory_t& memory;
-    bool owns_the_lock = false;
+/** Holds an arena for one C ABI call, emptying it first unless an outer call already holds it. */
+class linked_memory_lock_t {
 
-    operator ustore_arena_t*() const noexcept { return (ustore_arena_t*)&memory.first_ptr_; }
+    /** Whether this lock took the right to release the arena from an outer one. */
+    enum class ownership_t : bool { borrowed_k, owned_k };
 
-    linked_memory_lock_t(linked_memory_t& memory, linked_memory_t::kind_t kind, bool keep_old_data = false) noexcept
-        : memory(memory) {
-        if (memory.start_if_null(kind))
-            if ((owns_the_lock = memory.lock_release_calls()) && !keep_old_data)
-                memory.release_partially();
+    linked_memory_t& memory_;
+    ownership_t ownership_ {ownership_t::borrowed_k};
+
+  public:
+
+    /** Whether a lock keeps what earlier calls left in the arena. */
+    enum class retention_t : bool { discard_k, keep_k };
+
+    linked_memory_lock_t(linked_memory_t& memory, linked_memory_t::kind_t kind, retention_t retention) noexcept
+        : memory_(memory) {
+        if (!memory_.start_if_null(kind)) return;
+        if (memory_.lock_release_calls() == linked_memory_t::release_t::forbidden_k) return;
+        ownership_ = ownership_t::owned_k;
+        if (retention == retention_t::discard_k) memory_.release_partially();
     }
+
+    linked_memory_lock_t(linked_memory_lock_t const&) = delete;
+    linked_memory_lock_t& operator=(linked_memory_lock_t const&) = delete;
 
     ~linked_memory_lock_t() noexcept {
-        if (owns_the_lock)
-            memory.unlock_release_calls();
+        if (ownership_ == ownership_t::owned_k) memory_.unlock_release_calls();
     }
 
-    template <typename at>
-    ptr_range_gt<at> alloc(std::size_t size, ustore_error_t* c_error, std::size_t alignment = sizeof(at)) noexcept {
-        if (!size)
-            return {};
-        void* result = memory.alloc(sizeof(at) * size, alignment);
-        log_error_if_m(result, c_error, out_of_memory_k, "Couldn't allocate new sub-arena");
-        return {reinterpret_cast<at*>(result), size};
+    operator ustore_arena_t*() const noexcept { return reinterpret_cast<ustore_arena_t*>(&memory_); }
+
+    template <typename element_>
+    ptr_range<element_> alloc(std::size_t count, ustore_error_t* error,
+                              std::size_t alignment = sizeof(element_)) noexcept {
+        if (!count) return {};
+        void* const result = memory_.alloc(sizeof(element_) * count, alignment);
+        if (!result) *error = "Couldn't allocate new sub-arena";
+        return {static_cast<element_*>(result), count};
     }
 
-    template <typename at>
-    ptr_range_gt<at> grow( //
-        ptr_range_gt<at> span,
-        std::size_t additional_size,
-        ustore_error_t* c_error,
-        std::size_t alignment = sizeof(at)) noexcept {
+    template <typename element_>
+    ptr_range<element_> grow( //
+        ptr_range<element_> span, std::size_t additional_count, ustore_error_t* error,
+        std::size_t alignment = sizeof(element_)) noexcept {
 
-        if (!additional_size)
-            return span;
+        if (!additional_count) return span;
 
-        size_t new_size = span.size() + additional_size;
-        if (memory.cheap_extend(span.end(), sizeof(at) * additional_size, alignment))
-            return {span.begin(), new_size};
+        std::size_t const new_count = span.size() + additional_count;
+        if (memory_.cheap_extend(span.end(), sizeof(element_) * additional_count, alignment))
+            return {span.begin(), new_count};
 
-        void* result = memory.alloc(sizeof(at) * new_size, alignment);
-        if (result)
-            std::memcpy(result, span.begin(), span.size_bytes());
-        else
-            log_error_m(c_error, out_of_memory_k, "Couldn't grow a memory buffer");
-        return {reinterpret_cast<at*>(result), new_size};
+        void* const result = memory_.alloc(sizeof(element_) * new_count, alignment);
+        if (result) std::memcpy(result, span.begin(), span.size_bytes());
+        else *error = "Couldn't grow a memory buffer";
+        return {static_cast<element_*>(result), new_count};
     }
 
-    range_or_dummy_gt<bits_span_t> alloc_or_dummy( //
-        std::size_t size,
-        ustore_error_t* c_error,
-        ustore_octet_t** output,
+    /** Allocates @p count presence bits into @p output, or a scratch bit when @p output is null. */
+    range_or_dummy<bits_span_t> alloc_or_dummy( //
+        std::size_t count, ustore_error_t* error, ustore_octet_t** output,
         std::size_t alignment = sizeof(ustore_octet_t)) noexcept {
 
-        using range_t = bits_span_t;
-        auto slots = divide_round_up(size, bits_in_byte_k);
-        auto range = output //
-                         ? range_t {(*output = alloc<ustore_octet_t>(slots, c_error, alignment).begin())}
-                         : range_t {nullptr};
-        return {range, {}};
+        std::size_t const slots = divide_round_up(count, bits_in_byte_k);
+        if (!output) return range_or_dummy<bits_span_t> {bits_span_t {nullptr}};
+        *output = alloc<ustore_octet_t>(slots, error, alignment).begin();
+        return range_or_dummy<bits_span_t> {bits_span_t {*output}};
     }
 
-    template <typename at>
-    range_or_dummy_gt<ptr_range_gt<at>> alloc_or_dummy( //
-        std::size_t size,
-        ustore_error_t* c_error,
-        at** output,
-        std::size_t alignment = sizeof(at)) noexcept {
+    /** Allocates @p count elements into @p output, or a scratch element when @p output is null. */
+    template <typename element_>
+    range_or_dummy<ptr_range<element_>> alloc_or_dummy( //
+        std::size_t count, ustore_error_t* error, element_** output,
+        std::size_t alignment = sizeof(element_)) noexcept {
 
-        static_assert(!std::is_same<at, ustore_octet_t>());
-        using range_t = ptr_range_gt<at>;
-        auto range = output //
-                         ? range_t {(*output = alloc<at>(size, c_error, alignment).begin()), size}
-                         : range_t {nullptr, nullptr};
-        return {range, {}};
+        static_assert(!std::is_same_v<element_, ustore_octet_t>);
+        if (!output) return range_or_dummy<ptr_range<element_>> {ptr_range<element_> {}};
+        *output = alloc<element_>(count, error, alignment).begin();
+        return range_or_dummy<ptr_range<element_>> {ptr_range<element_> {*output, count}};
     }
 };
 
-inline linked_memory_lock_t linked_memory(ustore_arena_t* c_arena, ustore_options_t options, ustore_error_t* c_error) noexcept {
+/** Locks the arena of a C ABI call, choosing shared pages and retention from @p options. */
+inline linked_memory_lock_t linked_memory(ustore_arena_t* arena, ustore_options_t options,
+                                          [[maybe_unused]] ustore_error_t* error) noexcept {
 
     static_assert(sizeof(ustore_arena_t) == sizeof(linked_memory_t));
-    linked_memory_t& ref = *reinterpret_cast<linked_memory_t*>(c_arena);
-    linked_memory_t::kind_t kind = (options & ustore_option_read_shared_memory_k) //
-                                       ? linked_memory_t::kind_t::shared_k
-                                       : linked_memory_t::kind_t::sys_k;
-    bool keep_old_data = options & ustore_option_dont_discard_memory_k;
-
-    return linked_memory_lock_t(ref, kind, keep_old_data);
+    linked_memory_t& memory = *reinterpret_cast<linked_memory_t*>(arena);
+    linked_memory_t::kind_t const kind = (options & ustore_option_read_shared_memory_k)
+                                             ? linked_memory_t::kind_t::shared_k
+                                             : linked_memory_t::kind_t::private_k;
+    linked_memory_lock_t::retention_t const retention = (options & ustore_option_dont_discard_memory_k)
+                                                            ? linked_memory_lock_t::retention_t::keep_k
+                                                            : linked_memory_lock_t::retention_t::discard_k;
+    return linked_memory_lock_t(memory, kind, retention);
 }
 
-inline void clear_linked_memory(ustore_arena_t& c_arena) noexcept {
+inline void clear_linked_memory(ustore_arena_t& arena) noexcept {
     static_assert(sizeof(ustore_arena_t) == sizeof(linked_memory_t));
-    linked_memory_t& ref = reinterpret_cast<linked_memory_t&>(c_arena);
-    ref.release_all();
-}
-
-template <typename dangerous_at>
-void safe_section(ustore_str_view_t name, ustore_error_t* c_error, dangerous_at&& dangerous) try {
-    dangerous();
-}
-catch (std::bad_alloc const&) {
-    log_error_m(c_error, out_of_memory_k, name);
-}
-catch (...) {
-    log_error_m(c_error, error_unknown_k, name);
+    reinterpret_cast<linked_memory_t&>(arena).release_all();
 }
 
 } // namespace unum::ustore
