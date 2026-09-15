@@ -1,69 +1,74 @@
+# Temporary files
+.DS_Store
+.cache
+*.log
+tmp/
+
+# Datasets arrive through `data/<name>` symlinks
+data/*
+!data/.gitkeep
+
+# C++ builds
+/build*/
+_deps
+CMakeCache.txt
+CMakeUserPresets.json
+CMakeFiles
+cmake_install.cmake
+compile_commands.json
+
+# Profiling with GProf and `perf` on Linux
+gmon.out
+perf.data
+
+# Documentation builds
+docs/_build/
+docs/doxygen/
+doxygen_docs/
+
+# Python SDK
+__pycache__
+.pytest_cache/
+*.egg-info
+dist/
+wheelhouse/
+venv/
+.venv/
+uv.lock
+
+# Rust SDK
+Cargo.lock
+target/
+
 # Prerequisites
 *.d
-*.deb
 
-# Compiled Object files
+# Compiled object files
 *.slo
 *.lo
 *.o
 *.obj
-*.class
-*.egg-info
-*.jar
 
-# Precompiled Headers
+# Precompiled headers
 *.gch
 *.pch
 
-# Compiled Dynamic libraries
+# Compiled dynamic libraries
 *.so
 *.dylib
 *.dll
 
-# Compiled Static libraries
+# Compiled static libraries
 *.lai
 *.la
-#*.a
+*.a
 *.lib
 
 # Executables
 *.exe
 *.out
 *.app
-dist/
 
-# OS-specific
-.DS_Store
-
-# Temporary Files
-Makefile
-!docs/Makefile
-CMakeCache.txt
-cmake_install.cmake
-CMakeFiles
-build/
-build_debug/
-build_release/
-tmp/
-lib/
-*.log
-bin/
-__pycache__
-.pytest_cache/
+# Editor and agent local state
+.claude/
 .gradle/
-_deps/
-protos/
-openapitools.json
-build_version.cc
-CPackConfig.cmake
-CPackSourceConfig.cmake
-doxygen_docs/html
-wheelhouse
-registry/
-package-lock.json
-
-# Allow
-!gradle/wrapper/gradle-wrapper.jar
-
-# Sphinx Theme:
-www.unum.cloud-furo

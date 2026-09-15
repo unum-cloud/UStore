@@ -142,6 +142,26 @@ check_sibling_justification() {
         "            not which repository it was copied from:"
 }
 
+# Asterisk banners - `/*****  C++ Implementation  *****/` and their all-asterisk frames - are not section markers
+# here: a section starts with `#pragma region Name`, and `/**` opens a docblock, never a ruler.
+check_asterisk_banners() {
+    local banners
+    banners=$(printf '%s\n' "$added" | grep -E '^\+[[:space:]]*/\*{3,}|\*{4,}/[[:space:]]*$' || true)
+    [ -z "$banners" ] || fail "$banners" \
+        "$file draws an asterisk banner - write \`#pragma region Name\` where the section starts" \
+        "            and \`#pragma endregion Name\` where it ends:"
+}
+
+# Markdown structure inside a docblock - `* ## Class Specs`, `* - Copyable: Yes.`, `* 1. First` - prints literally in
+# Doxygen and hides what the tags would say. Headings become prose, and specs become @note, @throws or @param lines.
+check_markdown_docblocks() {
+    local structure
+    structure=$(printf '%s\n' "$added" | grep -E '^\+[[:space:]]*\*[[:space:]]+(#{1,4}[[:space:]]|-[[:space:]]|[0-9]+\.[[:space:]])' || true)
+    [ -z "$structure" ] || fail "$structure" \
+        "$file puts a Markdown heading or list inside a docblock - use Doxygen tags such as @note," \
+        "            @throws and @param, or plain sentences:"
+}
+
 # endregion Comments and Prose
 
 # region Doxygen Blocks
@@ -274,6 +294,70 @@ check_brief_length() {
     [ -z "$sprawling" ] || fail "$sprawling" \
         "$file lets a @brief summary run past three lines - keep the summary short and move" \
         "            the rest into an unindented body paragraph below a blank comment line:"
+}
+
+# Docblock text sits two spaces past its asterisk, so tags and prose align one column inside the gutter.
+check_docblock_indent() {
+    local misindented
+    misindented=$(awk '
+        NR == FNR { added[$1 + 0]; next }
+        {
+            if (inside && $0 ~ /\*\//) { inside = 0; next }
+            if (inside && (FNR in added)) {
+                if ($0 ~ /^[[:space:]]*\*[^[:space:]\/]/) printf "line %d: text glued to the asterisk\n", FNR
+                else if ($0 ~ /^[[:space:]]*\* [^[:space:]]/) printf "line %d: one space past the asterisk\n", FNR
+            }
+            if ($0 ~ /^[[:space:]]*\/\*\*[[:space:]]*$/) inside = 1
+        }' <(printf '%s\n' "$added_lines") <(git show ":$file"))
+    [ -z "$misindented" ] || fail "$misindented" \
+        "$file indents docblock text one space past the asterisk - use two, as in \` *  @brief\`:"
+}
+
+# Includes form groups in a fixed order with a blank line between them: the C library, the C++ standard
+# library, external libraries, sibling projects, UStore's public <ustore/...> headers, then project headers
+# in quotes.
+check_include_groups() {
+    local misgrouped
+    misgrouped=$(awk '
+        BEGIN {
+            split("cassert cctype cerrno cfenv cfloat cinttypes climits clocale cmath csetjmp csignal cstdarg " \
+                  "cstddef cstdint cstdio cstdlib cstring ctime cuchar cwchar cwctype " \
+                  "dirent.h dlfcn.h errno.h fcntl.h ftw.h poll.h pthread.h sched.h signal.h stdio.h stdlib.h " \
+                  "string.h time.h unistd.h io.h windows.h", names, " ")
+            for (n in names) clibrary[names[n]] = 1
+            split("smashtable stringzilla forkunion numkong", names, " ")
+            for (n in names) sibling[names[n]] = 1
+            split("C-library C++-standard external sibling public-ustore project", labels, " ")
+        }
+        NR == FNR { added[$1 + 0]; next }
+        {
+            if ($0 ~ /^[[:space:]]*#[[:space:]]*include[[:space:]]*[<"]/) {
+                header = $0
+                quoted = ($0 ~ /include[[:space:]]*"/)
+                sub(/^[^<"]*[<"]/, "", header); sub(/[>"].*$/, "", header)
+                root = header; sub(/\/.*$/, "", root)
+                touched = (FNR in added)
+                if (quoted && root == "ustore") {
+                    if (touched) printf "line %d: public header in quotes - write <%s>\n", FNR, header
+                    rank = 5
+                }
+                else if (quoted) rank = 6
+                else if ((header in clibrary) || header ~ /^(sys|linux|arpa|netinet|asm)\//) rank = 1
+                else if (header !~ /[\/.]/) rank = 2
+                else if (root in sibling) rank = 4
+                else if (root == "ustore") rank = 5
+                else rank = 3
+                if (touched && block && rank != block)
+                    printf "line %d: a %s header shares its group with %s ones\n", FNR, labels[rank], labels[block]
+                if (touched && !block && rank < previous)
+                    printf "line %d: a %s group follows a %s group\n", FNR, labels[rank], labels[previous]
+                if (!block) block = rank
+            }
+            else if ($0 !~ /^[[:space:]]*#/) { if (block) previous = block; block = 0 }
+        }' <(printf '%s\n' "$added_lines") <(git show ":$file"))
+    [ -z "$misgrouped" ] || fail "$misgrouped" \
+        "$file misgroups its includes - C library, C++ standard, external, siblings, <ustore/...>, then \"project\"," \
+        "            each group separated by a blank line:"
 }
 
 # A docblock's brackets say whether it is structured. With no block tag it is prose, so the text
@@ -468,6 +552,58 @@ check_redundant_nodiscard() {
         "            marked [[nodiscard]] themselves, so drop the annotation:"
 }
 
+# A class template takes a bare name - `class blobs_ref`, never `class blobs_ref_gt` - and `_at` belongs to no
+# identifier at all: template parameters end in a single underscore, and `_t` marks only a materialized type.
+check_suffixed_template_names() {
+    local suffixed
+    suffixed=$(printf '%s\n' "$added" | grep -vE '^\+[[:space:]]*(\*|//|/\*)' |
+        grep -E '\b(class|struct|union|using)[[:space:]]+[A-Za-z_][A-Za-z0-9_]*_(gt|at)\b|\b[A-Za-z_][A-Za-z0-9_]*_at\b' || true)
+    [ -z "$suffixed" ] || fail "$suffixed" \
+        "$file names a symbol with a _gt or _at suffix - write \`template <typename store_> class blobs_ref\`:"
+}
+
+# Private and protected data members end in an underscore, so a reader tells state from locals at a glance. The
+# staged file is read whole, since access is context: a class starts private, a struct public, and every access
+# specifier changes the section; only the added declarations are reported.
+check_private_member_underscores() {
+    local members
+    members=$(awk '
+        NR == FNR { added[$1 + 0]; next }
+        {
+            line = $0
+            if (in_comment) { if (match(line, /\*\//)) { line = substr(line, RSTART + 2); in_comment = 0 } else next }
+            gsub(/\/\*([^*]|\*[^\/])*\*\//, " ", line)
+            if (match(line, /\/\*/)) { line = substr(line, 1, RSTART - 1); in_comment = 1 }
+            sub(/\/\/.*/, "", line)
+            if (kind[depth] ~ /^record/ && line ~ /^[[:space:]]*(public|protected|private)[[:space:]]*:/) {
+                match(line, /(public|protected|private)/); access[depth] = substr(line, RSTART, RLENGTH)
+            }
+            else if (kind[depth] ~ /^record/ && access[depth] != "public" && (FNR in added) &&
+                     line ~ /^[[:space:]]*[A-Za-z_][A-Za-z0-9_:<>,*& ]*[[:space:]*&]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*(\[[^]]*\])?[[:space:]]*(=[^;]*|\{[^}]*\})?;[[:space:]]*$/ &&
+                     line !~ /^[[:space:]]*(using|typedef|friend|return|static[[:space:]]+constexpr|enum|class|struct)[[:space:]]/ &&
+                     line !~ /\(/) {
+                name = line; sub(/[[:space:]]*(\[[^]]*\])?[[:space:]]*(=[^;]*|\{[^}]*\})?;[[:space:]]*$/, "", name); sub(/.*[[:space:]*&]/, "", name)
+                if (name !~ /_$/ && name !~ /_k$/) printf "line %d: %s\n", FNR, $0
+            }
+            statement = statement " " line
+            for (position = 1; position <= length(line); ++position) {
+                character = substr(line, position, 1)
+                if (character == "{") {
+                    ++depth
+                    if (kind[depth - 1] == "code") kind[depth] = "code"
+                    else if (statement ~ /(^|[^A-Za-z0-9_])class([^A-Za-z0-9_]|$)/) { kind[depth] = "record"; access[depth] = "private" }
+                    else if (statement ~ /(^|[^A-Za-z0-9_])(struct|union)([^A-Za-z0-9_]|$)/) { kind[depth] = "record"; access[depth] = "public" }
+                    else if (statement ~ /(^|[^A-Za-z0-9_])(namespace|extern)([^A-Za-z0-9_]|$)/) kind[depth] = "namespace"
+                    else kind[depth] = "code"
+                    statement = ""
+                } else if (character == "}") { if (depth > 0) { delete kind[depth]; delete access[depth]; --depth }; statement = "" }
+                else if (character == ";") statement = ""
+            }
+        }' <(printf '%s\n' "$added_lines") <(git show ":$file") || true)
+    [ -z "$members" ] || fail "$members" \
+        "$file declares a private or protected data member without a trailing underscore - write \`size_\`:"
+}
+
 # endregion Naming and Vocabulary
 
 # region C++ Surface and Containers
@@ -568,38 +704,6 @@ check_iterator_laundering() {
     laundered=$(printf '%s\n' "$added" | grep -E '&\*[A-Za-z_]' || true)
     [ -z "$laundered" ] || fail "$laundered" \
         "$file launders an iterator through &* - write \`values.data() + offset\`, or address the element:"
-}
-
-# The `<c*>` trampolines of LibC are their own group, a blank line away from the pure C++ headers.
-# Spelled as a list because `<chrono>`, `<concepts>`, `<compare>` and `<coroutine>` merely start with a c.
-check_include_groups() {
-    local mixed
-    mixed=$(awk '
-        BEGIN {
-            split("cassert cctype cerrno cfenv cfloat cinttypes climits clocale cmath csetjmp csignal " \
-                  "cstdarg cstddef cstdint cstdio cstdlib cstring ctime cuchar cwchar cwctype", names, " ")
-            for (n in names) trampoline[names[n]] = 1
-        }
-        NR == FNR { added[$1 + 0]; next }
-        {
-            if ($0 ~ /^[[:space:]]*#[[:space:]]*include[[:space:]]*</) {
-                header = $0
-                sub(/^[^<]*</, "", header); sub(/>.*$/, "", header)
-                if (header in trampoline) sawc = 1
-                else if (header !~ /\// && header !~ /\.h$/) sawcpp = 1
-                if (FNR in added) touched = 1
-                first = first ? first : FNR
-            }
-            else if ($0 !~ /[^[:space:]]/) {
-                if (sawc && sawcpp && touched) printf "line %d: a <c*> header shares its group with a C++ one\n", first
-                sawc = 0; sawcpp = 0; touched = 0; first = 0
-            }
-        }
-        END { if (sawc && sawcpp && touched) printf "line %d: a <c*> header shares its group with a C++ one\n", first }
-        ' <(printf '%s\n' "$added_lines") <(git show ":$file"))
-    [ -z "$mixed" ] || fail "$mixed" \
-        "$file mixes the <c*> trampolines of LibC with pure C++ headers - they are separate groups," \
-        "            a blank line apart, each sorted alphabetically:"
 }
 
 # endregion C++ Surface and Containers
@@ -751,6 +855,8 @@ for file in "${staged[@]}"; do
     *.c | *.h | *.hpp | *.cpp | *.cc | *.cxx | *.cu | *.cuh)
         check_ascii_arrows
         check_glued_arrows
+        check_asterisk_banners
+        check_markdown_docblocks
         check_backward_references
         check_rulers
         check_region_labels
@@ -762,15 +868,18 @@ for file in "${staged[@]}"; do
         check_lone_brief
         check_brief_length
         check_file_header
+        check_docblock_indent
+        check_include_groups
         check_docblock_brackets
         check_bare_member_docs
-        check_include_groups
         check_trailing_returns
         check_iterator_laundering
         ;;&
     # Every C++ source: the C bindings under c/ and the C ABI headers keep their C idioms.
     *.hpp | *.cpp | *.cc | *.cxx | *.cu | *.cuh)
         check_qualified_namespace
+        check_suffixed_template_names
+        check_private_member_underscores
         check_template_parameter_underscores
         check_function_like_macros
         check_redundant_nodiscard
