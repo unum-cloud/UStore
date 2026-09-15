@@ -1,12 +1,19 @@
 Language: Cpp
-BasedOnStyle:  LLVM
+BasedOnStyle: LLVM
 IndentWidth: 4
 TabWidth: 4
 NamespaceIndentation: None
+# A docblock takes an empty line above it everywhere, an access specifier included, so the blank
+# one writes there must survive formatting - LLVM's default strips it.
+EmptyLineAfterAccessModifier: Leave
+# Code wraps at 120. Prose wraps at 100 by hand - `@brief` text, `@param` descriptions, and the
+# paragraphs after a tag block - so a docblock reads as a narrower column than the code below it.
+# `ReflowComments` only reflows past the limit, so it never widens prose already inside 100.
 ColumnLimit: 120
 ReflowComments: true
+# A URL cannot wrap, so reflow would split it from its `@see` and drop the hanging indent.
+CommentPragmas: '^ IWYU pragma:|https?://'
 UseTab: Never
-PointerAlignment: Left
 
 AlignConsecutiveAssignments: false
 AlignConsecutiveDeclarations: false
@@ -17,19 +24,18 @@ AlignTrailingComments: true
 AllowAllArgumentsOnNextLine: false
 AllowAllConstructorInitializersOnNextLine: true
 AllowAllParametersOfDeclarationOnNextLine: true
-AllowShortBlocksOnASingleLine: false
+AllowShortBlocksOnASingleLine: Always
+AllowShortIfStatementsOnASingleLine: AllIfsAndElse
 AllowShortCaseLabelsOnASingleLine: true
-AllowShortFunctionsOnASingleLine: InlineOnly
-AllowShortIfStatementsOnASingleLine: Never
-AllowShortLambdasOnASingleLine: Inline
-AllowShortLoopsOnASingleLine: false
-AlwaysBreakBeforeMultilineStrings: true
+AllowShortFunctionsOnASingleLine: true
+AllowShortLambdasOnASingleLine: true
+AllowShortLoopsOnASingleLine: true
 AlwaysBreakTemplateDeclarations: Yes
-AlwaysBreakBeforeMultilineStrings: true
 AlwaysBreakAfterReturnType: None
 PenaltyReturnTypeOnItsOwnLine: 200
 
 BreakBeforeBraces: Custom
+BreakAdjacentStringLiterals: false
 BraceWrapping:
   AfterCaseLabel: false
   AfterClass: false
@@ -47,9 +53,8 @@ BraceWrapping:
   SplitEmptyNamespace: false
   IndentBraces: false
 
-
 SortIncludes: false
-SortUsingDeclarations: true 
+SortUsingDeclarations: true
 
 SpaceAfterCStyleCast: false
 SpaceAfterLogicalNot: false
@@ -68,5 +73,35 @@ SpacesInContainerLiterals: false
 SpacesInParentheses: false
 SpacesInSquareBrackets: false
 
-BinPackArguments: false
-BinPackParameters: false
+BinPackArguments: true
+BinPackParameters: true
+# Requires clang-format 22+; older versions will error on unknown keys below.
+BinPackLongBracedList: true
+BreakBeforeCloseBracketBracedList: false
+PenaltyBreakBeforeFirstCallParameter: 1
+
+# NumKong visibility macros treated as attributes so they don't confuse declarations.
+AttributeMacros:
+  - NK_PUBLIC
+  - NK_INTERNAL
+  - NK_DYNAMIC
+
+# Align consecutive macro definitions (useful for NK_TARGET_* flags)
+AlignConsecutiveMacros:
+  Enabled: true
+  AcrossEmptyLines: false
+  AcrossComments: false
+
+# Preprocessor directive indentation: None (flat), AfterHash (#  if), BeforeHash (  #if)
+IndentPPDirectives: None
+
+# C++ convention `int* x`.
+PointerAlignment: Left
+DerivePointerAlignment: false
+
+# Preserve user line breaks in intrinsic-heavy code
+BreakBeforeBinaryOperators: None
+PenaltyBreakAssignment: 50
+
+# Ensure files end with a newline
+InsertNewlineAtEOF: true

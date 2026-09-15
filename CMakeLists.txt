@@ -9,6 +9,19 @@ project(UStore
   DESCRIPTION "Embedded Multi-Modal Transactional Database for Docs • Graphs • Blobs • Paths × RocksDB • LevelDB • UCSet • UDisk × from C • C++ • Python"
 )
 
+# Git does not run hooks shipped inside a clone, so configuring the build points `core.hooksPath` at `.githooks`.
+if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
+  execute_process(
+    COMMAND git config core.hooksPath .githooks
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    RESULT_VARIABLE ustore_hooks_status
+    OUTPUT_QUIET ERROR_QUIET
+  )
+  if(ustore_hooks_status EQUAL 0)
+    message(STATUS "UStore: Git hooks enabled (core.hooksPath -> .githooks)")
+  endif()
+endif()
+
 option(USTORE_BUILD_ENGINE_UCSET "Building the in-memory UCSet engine" ON)
 option(USTORE_BUILD_ENGINE_LEVELDB "Building the LevelDB engine")
 option(USTORE_BUILD_ENGINE_ROCKSDB "Building the RocksDB engine")

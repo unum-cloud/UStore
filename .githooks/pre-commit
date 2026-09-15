@@ -1,0 +1,929 @@
+#!/usr/bin/env bash
+#
+# UStore pre-commit: enforce the house style on staged changes before they land.
+#
+# Each check inspects only the added lines of a staged file, so legacy code migrates on its own
+# schedule while no new violation sneaks in, and each prints the specific reason when it fires.
+# The checks are grouped by what they enforce; the dispatch loop below diffs every staged file
+# exactly once and routes it through four tiers - every C and C++ source, every C++ source, the
+# CUDA sources, and the shipped library - handing the added lines to each check through the
+# `file` / `added` globals. A check that needs scope reads the staged file whole and keeps only
+# the hits whose line number is in `added_lines`, the same contract reached from the other side.
+# Configuring the CMake build arms these hooks; see the `core.hooksPath` block in CMakeLists.txt.
+#
+# Bypass knowingly (you almost never should) with: git commit --no-verify
+
+set -u
+LC_ALL=C # ? Byte-wise regexes, immune to the committer's locale
+
+failed=0
+
+# Prints the reason and the first offending lines, and marks the commit rejected.
+fail() { # fail <matches> <message-line>...
+    local matches=$1
+    shift
+    local line
+    for line in "$@"; do echo "pre-commit: $line"; done
+    printf '%s\n' "$matches" | head -5
+    failed=1
+}
+
+# The line numbers a staged file gained, read off the `@@ -a,b +c,d @@` headers of a zero-context
+# diff: the hunk adds lines `c` through `c + d - 1`, and a missing `,d` adds exactly one.
+added_line_numbers() { # added_line_numbers <path>
+    git diff --cached --unified=0 -- "$1" | awk '
+        /^@@/ {
+            split($3, range, ",")
+            start = substr(range[1], 2) + 0
+            count = (range[2] == "") ? 1 : range[2] + 0
+            for (line = start; line < start + count; ++line) print line
+        }'
+}
+
+# region Comments and Prose
+
+# ASCII "->" arrows inside comments & docstrings - prose uses the Unicode arrow (→). The pattern
+# targets " -> " with surrounding spaces on comment-looking lines, so real member access like
+# `pointer->field` in code never trips it.
+check_ascii_arrows() {
+    local arrows
+    arrows=$(printf '%s\n' "$added" | grep -E '((//|/\*|^\+[[:space:]]*\*).* -> )' || true)
+    [ -z "$arrows" ] || fail "$arrows" \
+        "$file uses the ASCII '->' arrow in a comment - prose arrows are the Unicode →:"
+}
+
+# The same arrow rule for Markdown prose, where every added line is prose.
+check_ascii_arrows_prose() {
+    local arrows
+    arrows=$(printf '%s\n' "$added" | grep -E ' -> ' || true)
+    [ -z "$arrows" ] || fail "$arrows" \
+        "$file uses the ASCII '->' arrow - prose arrows are the Unicode →:"
+}
+
+# A Unicode arrow glued to its neighbor - `key→id` - reads as one token to searchers and
+# renderers alike; the arrow always gets whitespace on both sides.
+check_glued_arrows() {
+    local glued
+    glued=$(printf '%s\n' "$added" | grep -E '[^[:space:]]→|→[^[:space:]]' || true)
+    [ -z "$glued" ] || fail "$glued" \
+        "$file glues a Unicode arrow to its neighbor - write \`key → identifier\`, never \`key→identifier\`:"
+}
+
+# Markdown paragraphs are separated by one blank line, so a run of two carries no meaning and only
+# shows as noise in a diff. Fenced blocks keep whatever they hold.
+check_blank_line_runs() {
+    local runs
+    runs=$(awk '
+        /^```/ || /^~~~/ { fence = !fence }
+        !fence && /^[[:space:]]*$/ { blanks++; if (blanks > 1) print NR ": consecutive blank lines"; next }
+        { blanks = 0 }
+    ' "$file" || true)
+    [ -z "$runs" ] || fail "$runs" \
+        "$file separates paragraphs with more than one blank line - Markdown needs exactly one:"
+}
+
+# Backward-looking prose in comments - "v2", "v3", "the previous implementation" - rots the moment
+# the rewrite ships and reads as changelog noise. Docstrings describe behavior on its own terms,
+# forward-looking; history belongs in commit messages and design documents.
+check_backward_references() {
+    local backrefs
+    # Case-sensitive on purpose: lowercase `v2` is a version reference, while uppercase `V2` names
+    # real hardware, like the Arm Neoverse cores. Three digits name a SIMD tier like `v128`, never a version.
+    backrefs=$(printf '%s\n' "$added" | grep -E '(//|/\*|^\+[[:space:]]*\*)' |
+        grep -E '\bv[0-9]{1,2}\b|[Tt]he (previous|old|legacy) (design|implementation|version|draft|approach|convention|code)|\bused to (be|do|work)\b' || true)
+    [ -z "$backrefs" ] || fail "$backrefs" \
+        "$file cites a past version in a comment - describe the behavior on its own terms;" \
+        "            history belongs in commit messages and design docs:"
+}
+
+# Decorative comment separators - runs of three or more `-` or `=` used purely as visual dividers
+# inside a comment. Sections are named by `#pragma region`, and a paragraph that needs a heading gets
+# a sentence. A ruler carries no information that the sentence beneath it does not already carry.
+check_rulers() {
+    local rulers
+    rulers=$(printf '%s\n' "$added" | grep -E '^\+(.*(//|/\*)|[[:space:]]*\*).*[-=]{3,}' || true)
+    [ -z "$rulers" ] || fail "$rulers" \
+        "$file adds a decorative comment separator - write \`#pragma region Traversal Scratch\`" \
+        "            where a section starts, or a plain sentence where a paragraph does:"
+}
+
+# Boxed and ruled banners are not section markers here: code uses `#pragma region` / `# region`,
+# and printed output uses plain lines.
+check_banner_rules() {
+    local banners
+    banners=$(printf '%s\n' "$added" | grep -nE '(^\+|["'"'"'])[[:space:]]*(={4,}|-{4,}|#{4,})|(={3,}|-{3,}|#{3,})[[:space:]]*["'"'"']' || true)
+    [ -z "$banners" ] || fail "$banners" \
+        "$file draws a ===/---/### banner - sections are \`#pragma region\` or \`# region\`," \
+        "            and printed output takes a plain line:"
+}
+
+# A `#pragma region` label must be letters, digits & spaces only. clang-format tokenises the label
+# as code, so a dash, ampersand, colon, or any other symbol makes it reflow the marker and the
+# regions drift out of place on the next format run. Keep the label a plain phrase:
+# `#pragma region Name`.
+check_region_labels() {
+    local symbolic
+    symbolic=$(printf '%s\n' "$added" |
+        grep -E '^\+[[:space:]]*#pragma[[:space:]]+(end)?region[[:space:]]' |
+        grep -E '#pragma[[:space:]]+(end)?region[[:space:]]+.*[^A-Za-z0-9 ]' || true)
+    [ -z "$symbolic" ] || fail "$symbolic" \
+        "$file has a symbol in a #pragma region label - write \`#pragma region Traversal Scratch\`;" \
+        "            clang-format reflows a label carrying anything but letters, digits & spaces:"
+}
+
+# A design justified by another project's design ages into a lie the moment that project moves,
+# and it tells a reader nothing about the code in front of them. State what it does and why.
+check_sibling_justification() {
+    local borrowed
+    borrowed=$(printf '%s\n' "$added" | grep -inE \
+        '(the (way|split|shape|idiom|dialect|convention|form|style|precedent))[^.]{0,40}(numkong|stringzilla|forkunion|smashtable|usearch|sibling)|(numkong|stringzilla|forkunion|smashtable|usearch|sibling)[^.]{0,40}(idiom|dialect|house style|does it|spells it|takes|would)|(matching|mirror(s|ing)?|mimic(s|king)?|copie[sd]|borrow(s|ed)?|same as) (how )?(numkong|stringzilla|forkunion|smashtable|usearch|the sibling)' || true)
+    [ -z "$borrowed" ] || fail "$borrowed" \
+        "$file justifies a design by a sibling project - say what this code does and why," \
+        "            not which repository it was copied from:"
+}
+
+# endregion Comments and Prose
+
+# region Doxygen Blocks
+
+# Every @param declares its direction - [in]/[out]/[inout] - so a reader knows whether the callee
+# reads, writes, or mutates the argument. A bare @param and the comma form @param[in,out] are both
+# rejected; the one spelling for a mutated argument is @param[inout].
+check_param_directions() {
+    local bare
+    bare=$(printf '%s\n' "$added" | grep -E '@param' | grep -vE '@param\[(in|out|inout)\]' || true)
+    [ -z "$bare" ] || fail "$bare" \
+        "$file has a @param without an [in]/[out]/[inout] direction - never a bare @param" \
+        "            nor the comma form @param[in,out] (write @param[inout]):"
+}
+
+# Doxygen renders @b / @c, not Markdown: `__bold__` / `**bold**` in a `/** */` or `//` comment print
+# literally. Use @b for a one/two-token emphasis and plain prose for anything longer. C `__keyword__`
+# spellings are exempt; Markdown files never route here.
+check_markdown_doxygen() {
+    local emphasis
+    emphasis=$(printf '%s\n' "$added" | grep -E '^\+[[:space:]]*(\*|//)' |
+        grep -oE '\*\*[^*]+\*\*|__[^_]+__' |
+        grep -vE '^__(restrict|inline|volatile|asm|attribute|builtin[A-Za-z0-9_]*|STDC)__$' |
+        grep -vE '^__[a-z][a-z0-9_]*__$' || true)
+    [ -z "$emphasis" ] || fail "$emphasis" \
+        "$file uses Markdown emphasis in a Doxygen comment (it prints literally) - use @b" \
+        "            for a 1-2 token emphasis, plain prose otherwise:"
+}
+
+# A Doxygen command glued to the preceding character - `(@c foo)`, `-@ref bar` - breaks syntax
+# highlighting in most viewers, which only recognize the command after whitespace. Reword the
+# sentence so the command stands free; parentheses around a command are the usual offender.
+check_doxygen_glued() {
+    local glued
+    glued=$(printf '%s\n' "$added" | grep -E '^\+[[:space:]]*(\*|//)' |
+        grep -E '[^[:space:]]@(brief|section|subsection|param|tparam|returns?|ref|see|note|file|date|author|c|p|b)\b' || true)
+    [ -z "$glued" ] || fail "$glued" \
+        "$file glues a Doxygen command to the previous character - write \`as @c foo does\`," \
+        "            never \`(@c foo)\`; a highlighter only sees a command that follows whitespace:"
+}
+
+# An `@section` line reads as a heading only when air surrounds it: the comment lines directly
+# above and below must be empty (`*` alone). Spacing is context, not a line, so this reads the
+# whole staged file and reports only the headings the commit itself added.
+check_section_spacing() {
+    git show ":$file" | grep -q '@section' || return 0
+    local cramped
+    cramped=$(awk '
+        NR == FNR { added[$1 + 0]; next }
+        { lines[FNR] = $0; last = FNR }
+        END {
+            for (i = 1; i <= last; ++i)
+                if (lines[i] ~ /@section/ && (i in added)) {
+                    if (lines[i - 1] !~ /^[[:space:]]*\*[[:space:]]*$/) printf "line %d: no empty comment line above the @section\n", i
+                    if (lines[i + 1] !~ /^[[:space:]]*\*[[:space:]]*$/) printf "line %d: no empty comment line below the @section\n", i
+                }
+        }' <(printf '%s\n' "$added_lines") <(git show ":$file"))
+    [ -z "$cramped" ] || fail "$cramped" \
+        "$file crams an @section against its neighbors - keep one empty comment line" \
+        "            above and below every @section heading:"
+}
+
+# A docblock reads as the start of something only when air sits above it, with no exception: an opening
+# brace and an access specifier earn their blank line like anything else. Spacing is context rather than
+# a line, so this reads the whole staged file and reports only the docblocks the commit itself added.
+check_docblock_spacing() {
+    local cramped
+    cramped=$(awk '
+        NR == FNR { added[$1 + 0]; next }
+        { lines[FNR] = $0; last = FNR }
+        END {
+            for (i = 2; i <= last; ++i)
+                if (lines[i] ~ /^[[:space:]]*\/\*\*/ && (i in added) && lines[i - 1] !~ /^[[:space:]]*$/)
+                    printf "line %d: no empty line above the docblock\n", i
+        }' <(printf '%s\n' "$added_lines") <(git show ":$file"))
+    [ -z "$cramped" ] || fail "$cramped" \
+        "$file opens a docblock against the line above - every /** takes an empty line above it," \
+        "            an opening brace and an access specifier included:"
+}
+
+# A `@brief` separates a summary from what follows it, so a block with nothing following carries no
+# tag. Block tags are the contract trio, the file header's, and the cross-references; `@c`, `@p`,
+# `@b` and `@ref` are inline markup and open nothing. A blank comment line counts too - it starts a
+# body paragraph. Whole staged file, since a block is context, and only the blocks this commit added.
+check_lone_brief() {
+    local lone
+    lone=$(awk '
+        NR == FNR { added[$1 + 0]; next }
+        { lines[FNR] = $0; last = FNR }
+        END {
+            for (i = 1; i <= last; ++i) {
+                if (lines[i] !~ /^[[:space:]]*\/\*\*/) continue
+                brief = 0; section = 0; blank = 0; touched = 0
+                for (j = i; j <= last; ++j) {
+                    if (j in added) touched = 1
+                    if (lines[j] ~ /@brief/) brief = 1
+                    if (lines[j] ~ /^[[:space:]]*(\/\*\*|\*)[[:space:]]*@(param|tparam|return|retval|sa|see|note|file|author|date|section|code)([^a-z]|$)/) section = 1
+                    if (lines[j] ~ /^[[:space:]]*\*[[:space:]]*$/) blank = 1
+                    if (lines[j] ~ /\*\//) break
+                }
+                if (brief && touched && !section && !blank)
+                    printf "line %d: @brief with nothing to separate it from\n", i
+                i = j
+            }
+        }' <(printf '%s\n' "$added_lines") <(git show ":$file"))
+    [ -z "$lone" ] || fail "$lone" \
+        "$file tags a docblock that is one unstructured paragraph - drop the @brief," \
+        "            it earns its place only above a body paragraph or a tag section:"
+}
+
+# The indented summary runs at most three lines; past that the remainder is a body paragraph, which
+# is unindented and sits below a blank comment line.
+check_brief_length() {
+    local sprawling
+    sprawling=$(awk '
+        NR == FNR { added[$1 + 0]; next }
+        { lines[FNR] = $0; last = FNR }
+        END {
+            for (i = 1; i <= last; ++i) {
+                if (lines[i] !~ /@brief/) continue
+                span = 1
+                for (j = i + 1; j <= last; ++j) {
+                    if (lines[j] !~ /^[[:space:]]*\*[[:space:]]{5,}[^[:space:]]/) break
+                    if (lines[j] ~ /^[[:space:]]*\*[[:space:]]*@(param|tparam|return|retval|sa|see|note|file|author|date|section|code)([^a-z]|$)/) break
+                    ++span
+                }
+                if (span > 3 && (i in added)) printf "line %d: @brief runs %d lines\n", i, span
+            }
+        }' <(printf '%s\n' "$added_lines") <(git show ":$file"))
+    [ -z "$sprawling" ] || fail "$sprawling" \
+        "$file lets a @brief summary run past three lines - keep the summary short and move" \
+        "            the rest into an unindented body paragraph below a blank comment line:"
+}
+
+# A docblock's brackets say whether it is structured. With no block tag it is prose, so the text
+# starts on the opener and closes on its last line; with one it earns dedicated `/**` and `*/` lines.
+# A file's own header names itself before it describes itself: @file, @author, @date, @brief, in that
+# order, contiguous, with any prose below them. The whole staged file, since the header is context.
+check_file_header() {
+    local header
+    header=$(awk '
+        NR == FNR { added[$1 + 0]; next }
+        { lines[FNR] = $0; last = FNR }
+        END {
+            for (i = 1; i <= last; ++i) if (lines[i] ~ /^[[:space:]]*\/\*\*/) break
+            if (i > last) { print "line 1: no header docblock"; exit }
+            wanted = "file author date brief"; split(wanted, order, " ")
+            seen = 0; blank = 0; touched = 0
+            for (j = i; j <= last; ++j) {
+                if (j in added) touched = 1
+                if (lines[j] ~ /^[[:space:]]*\*[[:space:]]*$/) blank = 1
+                if (match(lines[j], /@(file|author|date|brief)/)) {
+                    tag = substr(lines[j], RSTART + 1, RLENGTH - 1)
+                    ++seen
+                    if (seen <= 4 && tag != order[seen])
+                        printf "line %d: @%s where @%s belongs\n", j, tag, order[seen]
+                    if (blank) printf "line %d: @%s sits below a blank line, outside the tag block\n", j, tag
+                }
+                if (lines[j] ~ /\*\//) break
+            }
+            if (touched && seen < 4) printf "line %d: the header names only %d of @file, @author, @date, @brief\n", i, seen
+        }' <(printf '%s\n' "$added_lines") <(git show ":$file"))
+    [ -z "$header" ] || fail "$header" \
+        "$file misorders its file header - name the file, then the author, the date, and the summary," \
+        "            contiguously, with any prose below them:"
+}
+
+check_docblock_brackets() {
+    local shape
+    shape=$(awk '
+        NR == FNR { added[$1 + 0]; next }
+        { lines[FNR] = $0; last = FNR }
+        END {
+            for (i = 1; i <= last; ++i) {
+                if (lines[i] !~ /^[[:space:]]*\/\*\*/) continue
+                tagged = 0; touched = 0; single = (lines[i] ~ /\*\//)
+                for (j = i; j <= last; ++j) {
+                    if (j in added) touched = 1
+                    if (lines[j] ~ /^[[:space:]]*(\/\*\*|\*)[[:space:]]*@(brief|param|tparam|return|retval|sa|see|note|file|author|date|section|code)([^a-z]|$)/) tagged = 1
+                    if (lines[j] ~ /\*\//) break
+                }
+                bare_open = (lines[i] ~ /^[[:space:]]*\/\*\*[[:space:]]*$/)
+                bare_close = (lines[j] ~ /^[[:space:]]*\*\/[[:space:]]*$/)
+                expanded = (bare_open || bare_close)
+                if (touched && !single) {
+                    if (tagged && !expanded) printf "line %d: tagged docblock without its own /** and */ lines\n", i
+                    if (!tagged && expanded) printf "line %d: untagged docblock spending lines on bare /** and */\n", i
+                }
+                i = j
+            }
+        }' <(printf '%s\n' "$added_lines") <(git show ":$file"))
+    [ -z "$shape" ] || fail "$shape" \
+        "$file mismatches a docblock's brackets to its content - prose opens on the /** and closes" \
+        "            on its last line, a tagged block takes dedicated /** and */ lines:"
+}
+
+# Member documentation is Doxygen: a bare `//` line directly above a declaration (a member or a type)
+# is the banned doc style - those entities get `/** @brief ... */`. The same `Type name = ...;` shape
+# inside a function body is a local variable and its `//` note is a legal implementation note, and
+# this library is header-only so headers carry both - so the staged file is read whole and the brace
+# stack says which scope each declaration sits in, with only the added pairings reported.
+check_bare_member_docs() {
+    local member_docs
+    member_docs=$(awk '
+        NR == FNR { added[$1 + 0]; next }
+        {
+            line = $0
+            # Block comments are stripped first, so a brace inside a docblock never moves the stack.
+            if (in_comment) { if (match(line, /\*\//)) { line = substr(line, RSTART + 2); in_comment = 0 } else next }
+            gsub(/\/\*([^*]|\*[^\/])*\*\//, " ", line)
+            if (match(line, /\/\*/)) { line = substr(line, 1, RSTART - 1); in_comment = 1 }
+            comment_at = index(line, "//")
+            code = comment_at ? substr(line, 1, comment_at - 1) : line
+            if (comment_at && substr(line, comment_at + 2, 1) != "/" && code ~ /^[[:space:]]*$/) { pending = $0; pending_line = FNR }
+            else if (kind[depth] == "record" && pending &&
+                     code ~ /^[[:space:]]*[A-Za-z_][A-Za-z0-9_:<>,* ]* [A-Za-z_][A-Za-z0-9_]* *([={;]|$)/) {
+                if ((pending_line in added) || (FNR in added)) printf "line %d:%s\n", pending_line, pending
+                pending = ""
+            }
+            else if (code !~ /^[[:space:]]*$/) pending = ""
+            # `statement` holds the declaration text since the last terminator, so a class whose
+            # brace sits on a continuation line still opens a record scope.
+            statement = statement " " code
+            for (position = 1; position <= length(code); ++position) {
+                character = substr(code, position, 1)
+                if (character == "{") {
+                    ++depth
+                    kind[depth] = (kind[depth - 1] == "code") ? "code" \
+                        : (statement ~ /(^|[^A-Za-z0-9_])(class|struct|union|enum)([^A-Za-z0-9_]|$)/) ? "record" \
+                        : (statement ~ /(^|[^A-Za-z0-9_])namespace([^A-Za-z0-9_]|$)/) ? "namespace" : "code"
+                    statement = ""
+                } else if (character == "}") { if (depth > 0) delete kind[depth--]; statement = "" }
+                else if (character == ";") statement = ""
+            }
+        }' <(printf '%s\n' "$added_lines") <(git show ":$file") || true)
+    [ -z "$member_docs" ] || fail "$member_docs" \
+        "$file documents a declaration with a bare \`//\` comment - docs are" \
+        "            /** @brief ... */ blocks; \`//\` is for implementation notes inside bodies:"
+}
+
+# endregion Doxygen Blocks
+
+# region Naming and Vocabulary
+
+# The full `unum::ustore::` spelling belongs to two places: the `using namespace` and `namespace` lines,
+# and the specializations of foreign templates - `std::hash<unum::ustore::...>`, `fmt::formatter<...>` - which
+# have to name the type from outside. Everywhere else the name is already in scope - through the directive a
+# translation unit opened with, or the enclosing namespace itself.
+check_qualified_namespace() {
+    local spelled
+    spelled=$(printf '%s\n' "$added" |
+        grep -vE '^\+[[:space:]]*(\*|//|/\*)' |
+        grep -vE 'using namespace unum::ustore|namespace unum::ustore' |
+        grep -vE 'struct (std|fmt)::[A-Za-z_]+<unum::ustore::' |
+        grep -E 'unum::ustore::' || true)
+    [ -z "$spelled" ] || fail "$spelled" \
+        "$file spells unum::ustore:: in full - the name is already in scope through a \`using\` directive" \
+        "            or the enclosing namespace; only a foreign template specialization earns it:"
+}
+
+# Template type parameters carry a trailing underscore - `typename variant_type_`, never
+# `typename multi_t` - a special case of the underscore marking internal symbols: a
+# parameter is internal to its template, exists only to be materialized, and must never
+# collide with the public `_t` aliases and `_k` constants it produces. Dependent-name uses
+# (`typename foo_::bar`) never match, since the `::` breaks the identifier early.
+check_template_parameter_underscores() {
+    local bare
+    bare=$(printf '%s\n' "$added" |
+        grep -vE '^\+[[:space:]]*(\*|//|/\*)' |
+        grep -E 'typename ?(\.\.\.)? +([A-Za-z][A-Za-z_0-9]*[A-Za-z0-9]|[A-Za-z]) *(,|>|=|$)' || true)
+    [ -z "$bare" ] || fail "$bare" \
+        "$file declares a template type parameter without the trailing underscore - write" \
+        "            \`template <typename scalar_type_>\`, so it cannot collide with the _t alias it materializes:"
+}
+
+# Function-like ALL_CAPS macros - every macro here is object-like: include guards, config
+# flags, platform shims. Preprocessor codegen hides the very lines a reader greps for, so
+# write the expansion out; a truly unavoidable file-local generator is snake_case_ + #undef.
+check_function_like_macros() {
+    local generators
+    generators=$(printf '%s\n' "$added" | grep -E '^\+[[:space:]]*#[[:space:]]*define[[:space:]]+[A-Z][A-Z0-9_]*\(' || true)
+    [ -z "$generators" ] || fail "$generators" \
+        "$file defines a function-like ALL_CAPS macro - write the expansion out, or name a" \
+        "            file-local generator snake_case_ and #undef it after use:"
+}
+
+# A bare `bool` parameter is unreadable at the call site - `setup(n, true, false)` names
+# nothing. Public headers spell the choice with a two-value enum; predicate helpers in
+# tests & benches, where the bool IS the domain, stay out of scope.
+check_boolean_parameters() {
+    local flags
+    flags=$(printf '%s\n' "$added" | grep -E '[(,] ?bool [a-z_]+' || true)
+    [ -z "$flags" ] || fail "$flags" \
+        "$file takes a bare bool parameter - name both states, as in" \
+        "            \`enum class ordering_t : bool { ascending_k, descending_k };\`:"
+}
+
+# A function that opens with `auto` and names its result after the signature buries the one thing a
+# reader scans a header for. Spell the type first, qualifying it where an out-of-class definition
+# needs it. Lambdas, deduction guides and `requires` clauses keep their arrows - they have no other
+# spelling - so the rejected shapes are a declaration opening with `auto`, and a wrapped signature
+# whose continuation line opens with the arrow. Member access binds its arrow tight, which is what
+# separates `index->search` from a return type.
+check_trailing_returns() {
+    local trailing
+    trailing=$(printf '%s\n' "$added" |
+        grep -nE '^\+[[:space:]]*((static|inline|constexpr|friend)[[:space:]]+)*auto[[:space:]]+[A-Za-z_].*->[[:space:]]|^\+[[:space:]]*->[[:space:]]' |
+        grep -vE '\[[^]]*\][[:space:]]*\(|requires|concept' || true)
+    [ -z "$trailing" ] || fail "$trailing" \
+        "$file declares a trailing return type - write \`status_t insert(key_t key)\`," \
+        "            not \`auto insert(key_t key) -> status_t\`:"
+}
+
+# Redundant result annotations in C++ sources - `status_t` and `expected` carry a type-level
+# `[[nodiscard]]`, so repeating it on a signature returning them is noise the type already
+# enforces; the attribute on a function should mean something the type cannot say.
+check_redundant_nodiscard() {
+    local redundant
+    redundant=$(printf '%s\n' "$added" |
+        grep -E '\[\[nodiscard\]\][[:space:]]+((static|inline|constexpr|virtual)[[:space:]]+)*(status_t|expected<)' |
+        grep -vE 'struct|enum' || true)
+    [ -z "$redundant" ] || fail "$redundant" \
+        "$file repeats [[nodiscard]] on a status_t/expected signature - both types are" \
+        "            marked [[nodiscard]] themselves, so drop the annotation:"
+}
+
+# endregion Naming and Vocabulary
+
+# region C++ Surface and Containers
+
+# C stdio printing in C++ sources - tests & headers print through fmt::. The C bindings under c/
+# keep their stdio; the dispatch below only routes C++ translation units here.
+check_printf() {
+    local prints
+    prints=$(printf '%s\n' "$added" | grep -E '\b(std::)?(f|s)?printf[[:space:]]*\(|\bputs[[:space:]]*\(' || true)
+    [ -z "$prints" ] || fail "$prints" \
+        "$file prints through the C stdio family - write fmt::println(\"{} rows\", count):"
+}
+
+# A `fmt::print` whose literal does not end in a newline is half a line, and the other half
+# arrives in a second call - `fmt::styled` and `fmt::join` fold both halves into one `println`.
+# A literal opening with a carriage return is a redraw, never a fragment.
+check_partial_prints() {
+    local partial
+    partial=$(printf '%s\n' "$added" | grep -E 'fmt::print\(' | grep -vE '\\n"' | grep -vE 'fmt::print\("\\r' || true)
+    [ -z "$partial" ] || fail "$partial" \
+        "$file prints half a line - fold it into one fmt::println, with fmt::styled or fmt::join:"
+}
+
+# C++ iostreams - `std::cout`, `std::ifstream`, `std::ostringstream`, and the rest of the
+# `std::*stream` family - are banned wholesale: locale-dependent, allocation-happy, and verbose.
+# Printing goes through fmt::, file reading through the C stdio family or mmap views.
+check_stl_streams() {
+    local streams
+    streams=$(printf '%s\n' "$added" |
+        grep -E 'std::[a-z_]*stream|std::(cout|cerr|cin|clog|endl)\b|#[[:space:]]*include[[:space:]]*<(iostream|sstream|fstream|ostream|istream|iomanip)>' || true)
+    [ -z "$streams" ] || fail "$streams" \
+        "$file uses C++ iostreams - print through fmt::, read files through C stdio or mmap:"
+}
+
+# `std::deque` - a chunked indirection-heavy container with unpredictable locality. Address
+# stability comes from reserved vectors of `unique_ptr`, arenas, or ForkUnion's containers.
+check_deque() {
+    local deques
+    deques=$(printf '%s\n' "$added" |
+        grep -E 'std::deque\b|#[[:space:]]*include[[:space:]]*<deque>' || true)
+    [ -z "$deques" ] || fail "$deques" \
+        "$file uses std::deque - reach for reserved unique_ptr vectors, arenas, or ForkUnion containers:"
+}
+
+# Reinterpreting copies in C++ sources - a `memcpy` between two objects whose byte count is one
+# object's `sizeof` is a type pun, and `std::bit_cast` states it outright. Byte moves keep their
+# memcpy: a runtime-sized bulk copy, or one object serialized into or out of a byte run.
+check_memcpy() {
+    local puns
+    # A pun takes the address of both objects and a lone `sizeof(...)` byte count; a copy whose
+    # source or destination is a byte pointer is a serialization and passes.
+    puns=$(printf '%s\n' "$added" | grep -E '\bmemcpy[[:space:]]*\([[:space:]]*&[^,]*,[[:space:]]*&' |
+        grep -E ',[[:space:]]*sizeof[[:space:]]*\([^)]*\)[[:space:]]*\)' || true)
+    [ -z "$puns" ] || fail "$puns" \
+        "$file reinterprets one object through memcpy - write \`auto bits = std::bit_cast<u64_t>(value);\`:"
+}
+
+# A range rebuilt from its own parts - `{x.data(), x.size()}` - means a conversion or an
+# accessor is missing: `std::vector` converts to `std::span`, NumKong spans convert to views,
+# and containers can grow `begin()`/`end()`. Pass the range itself.
+check_range_reconstruction() {
+    local rebuilt
+    rebuilt=$(printf '%s\n' "$added" |
+        grep -E '\{ *([A-Za-z_][A-Za-z0-9_.]*)\.data\(\), *\1\.size\(\) *\}' || true)
+    [ -z "$rebuilt" ] || fail "$rebuilt" \
+        "$file rebuilds a range from its own .data()/.size() - pass the range itself," \
+        "            or add the missing accessor or conversion:"
+}
+
+# `.data()` as an emptiness probe reads as pointer plumbing; every NumKong tensor, view,
+# and span - like the STL containers - spells it `empty()`.
+check_data_null_probe() {
+    local probes
+    probes=$(printf '%s\n' "$added" |
+        grep -E '![A-Za-z_][A-Za-z0-9_.]*\.data\(\)|\.data\(\) *== *nullptr' || true)
+    [ -z "$probes" ] || fail "$probes" \
+        "$file probes emptiness through .data() - write \`if (values.empty())\`:"
+}
+
+# Subscripting a call's result chains two accessors where the container offers one:
+# `matrix.row(i)[j]`, `pool.begin()[i]`, and `.data()[i]` all hide the same raw-pointer hop.
+# Use the multi-index `operator()` - `matrix(i, j)` - or the container's own `operator[]`;
+# a bare `.data()` pointer is reserved for one-time lifts handed to syscalls and SIMD kernels.
+check_call_chained_subscript() {
+    local chained
+    # An identifier must sit against the opening parenthesis, so a dereference `(*owner)[i]` and
+    # an array-reference parameter `(&ids)[width]` stay out of it - neither is a call.
+    chained=$(printf '%s\n' "$added" | grep -E '[A-Za-z0-9_>]\([^()]*\)\[' || true)
+    [ -z "$chained" ] || fail "$chained" \
+        "$file subscripts a call result - write matrix(row, column) or results[index]," \
+        "            never results.data()[index]:"
+}
+
+# The `&*iterator` antipattern - laundering an iterator through a reference into a pointer. Take the
+# container's `data()`, or address the element itself.
+check_iterator_laundering() {
+    local laundered
+    laundered=$(printf '%s\n' "$added" | grep -E '&\*[A-Za-z_]' || true)
+    [ -z "$laundered" ] || fail "$laundered" \
+        "$file launders an iterator through &* - write \`values.data() + offset\`, or address the element:"
+}
+
+# The `<c*>` trampolines of LibC are their own group, a blank line away from the pure C++ headers.
+# Spelled as a list because `<chrono>`, `<concepts>`, `<compare>` and `<coroutine>` merely start with a c.
+check_include_groups() {
+    local mixed
+    mixed=$(awk '
+        BEGIN {
+            split("cassert cctype cerrno cfenv cfloat cinttypes climits clocale cmath csetjmp csignal " \
+                  "cstdarg cstddef cstdint cstdio cstdlib cstring ctime cuchar cwchar cwctype", names, " ")
+            for (n in names) trampoline[names[n]] = 1
+        }
+        NR == FNR { added[$1 + 0]; next }
+        {
+            if ($0 ~ /^[[:space:]]*#[[:space:]]*include[[:space:]]*</) {
+                header = $0
+                sub(/^[^<]*</, "", header); sub(/>.*$/, "", header)
+                if (header in trampoline) sawc = 1
+                else if (header !~ /\// && header !~ /\.h$/) sawcpp = 1
+                if (FNR in added) touched = 1
+                first = first ? first : FNR
+            }
+            else if ($0 !~ /[^[:space:]]/) {
+                if (sawc && sawcpp && touched) printf "line %d: a <c*> header shares its group with a C++ one\n", first
+                sawc = 0; sawcpp = 0; touched = 0; first = 0
+            }
+        }
+        END { if (sawc && sawcpp && touched) printf "line %d: a <c*> header shares its group with a C++ one\n", first }
+        ' <(printf '%s\n' "$added_lines") <(git show ":$file"))
+    [ -z "$mixed" ] || fail "$mixed" \
+        "$file mixes the <c*> trampolines of LibC with pure C++ headers - they are separate groups," \
+        "            a blank line apart, each sorted alphabetically:"
+}
+
+# endregion C++ Surface and Containers
+
+# region Concurrency and Atomics
+
+# Host threads managing GPUs in CUDA sources - fleets of NVLink-resident devices are
+# orchestrated with per-device non-blocking streams and events from one host thread: kernel
+# launches are already asynchronous, cross-device ordering is `cudaStreamWaitEvent`, and
+# completion is an event-sync loop, so `std::thread` adds nothing but scheduling noise.
+check_host_threads() {
+    local threads
+    threads=$(printf '%s\n' "$added" |
+        grep -E '\bstd::(thread|jthread|async)\b|#include[[:space:]]*<thread>|\bpthread_' || true)
+    [ -z "$threads" ] || fail "$threads" \
+        "$file spawns host threads in a GPU backend - orchestrate devices with per-device" \
+        "            non-blocking cudaStream_t + cudaEvent_t from one host thread:"
+}
+
+# GCC atomic builtins fork the memory-model dialect. In-place words go through
+# `std::atomic_ref` with explicit `std::memory_order` - the same currency the ForkUnion
+# waiters monitor, so loads, stores & waits compose.
+check_gcc_atomics() {
+    local builtins
+    builtins=$(printf '%s\n' "$added" | grep -E '__atomic_[a-z_]+|__builtin_[a-z_]+|__ATOMIC_[A-Z_]+' || true)
+    [ -z "$builtins" ] || fail "$builtins" \
+        "$file uses a GCC atomic builtin - write std::atomic_ref{word}.load(std::memory_order_acquire)," \
+        "            naming the memory order at every access:"
+}
+
+# A TSan unlock bracket hides the word's own atomics, so the raw release that pairs with a
+# wait-free probe's `annotate_acquire` has to come right before `annotate_unlock*_started`,
+# never inside the bracket - or the probe's edge vanishes under TSan.
+check_annotate_release_before_unlock() {
+    printf '%s\n' "$added" | grep -q 'annotate_' || return 0
+    local probed misplaced
+    probed=$(grep -o 'annotate_acquire(&[a-z_]*' "$file" | sed 's/.*(//' | sort -u | tr '\n' ' ')
+    [ -n "$probed" ] || return 0
+    misplaced=$(awk -v probed=" $probed" '
+        /annotate_unlock(_shared)?_started\(&[a-z_]+\)/ {
+            match($0, /&[a-z_]+/); word = substr($0, RSTART, RLENGTH); inside = 1
+            if (index(probed, " " word " ") && previous !~ ("annotate_release\\(" word "\\)")) print FILENAME ":" NR ": " $0
+        }
+        /annotate_unlock(_shared)?_finished\(/ { inside = 0 }
+        inside && /annotate_release\(/ { print FILENAME ":" NR ": " $0 }
+        NF && $0 !~ /^[[:space:]]*\/\// { previous = $0 }
+    ' "$file")
+    [ -z "$misplaced" ] || fail "$misplaced" \
+        "$file misplaces the release of a probed word - write annotate_release(&word) immediately" \
+        "            before annotate_unlock_started(&word), never inside the bracket:"
+}
+
+# endregion Concurrency and Atomics
+
+# region Build CI and Packaging
+
+# CI workflows - every job and every step carries a `name:`. An unnamed step renders as its raw
+# command in the Actions UI, and job names are what branch protection's required checks reference,
+# so an anonymous one can't be pinned. Names are structure, not lines, so unlike the checks above
+# this validates the whole staged file - the workflows are small and already conform.
+check_workflow_names() {
+    local nameless
+    nameless=$(
+        git show ":$file" | awk '
+            # Jobs: two-space keys under the top-level `jobs:` section, named by a four-space `name:`.
+            /^jobs:[[:space:]]*$/ { in_jobs = 1; next }
+            in_jobs && /^[^ #]/ { in_jobs = 0 }
+            in_jobs && /^  [A-Za-z_][A-Za-z0-9_-]*:[[:space:]]*$/ {
+                if (job != "" && !job_named) printf "line %d: job `%s` has no name\n", job_line, job
+                job = substr($1, 1, length($1) - 1); job_line = NR; job_named = 0
+            }
+            in_jobs && /^    name:/ { job_named = 1 }
+            # Steps: list items two deeper than their `steps:`, named inline or by a key two deeper.
+            /^[[:space:]]*steps:[[:space:]]*$/ { steps_at = index($0, "steps:") - 1; item_at = steps_at + 2; pending = 0; next }
+            steps_at {
+                indent = match($0, /[^ ]/) - 1
+                if ($0 ~ /^[[:space:]]*(#|$)/) next
+                if (indent <= steps_at) { if (pending) printf "line %d: unnamed step\n", pending; steps_at = 0; next }
+                if (indent == item_at && substr($0, item_at + 1, 2) == "- ") {
+                    if (pending) printf "line %d: unnamed step\n", pending
+                    pending = ($0 ~ /^[[:space:]]*- name:/) ? 0 : NR
+                } else if (pending && indent == item_at + 2 && $0 ~ /^[[:space:]]*name:/) pending = 0
+            }
+            END {
+                if (job != "" && !job_named) printf "line %d: job `%s` has no name\n", job_line, job
+                if (pending) printf "line %d: unnamed step\n", pending
+            }
+        '
+    )
+    [ -z "$nameless" ] || fail "$nameless" \
+        "$file has a CI job or step without a name - write \`- name: Build the wheels\`;" \
+        "            the Actions UI and branch protection both reference it by name:"
+}
+
+# `sys.version` is a display string whose shape is not contractual; every question about the
+# running interpreter has a structured answer.
+check_python_version_probe() {
+    local probes
+    probes=$(printf '%s\n' "$added" | grep -nE 'sys\.version[^_]' || true)
+    [ -z "$probes" ] || fail "$probes" \
+        "$file parses \`sys.version\`, a human-readable string - use \`sys.version_info\` for" \
+        "            comparisons or \`platform.python_version()\` for display:"
+}
+
+# endregion Build CI and Packaging
+
+# region Dispatch
+
+# The staged list is read once, NUL-delimited so a filename with spaces can never split, and every
+# loop below filters this array rather than asking git again.
+staged=()
+while IFS= read -r -d '' file; do staged+=("$file"); done < <(git diff --cached --name-only --diff-filter=ACM -z)
+
+# The staged paths matching any of the given globs, NUL-delimited for the readers below.
+staged_matching() { # staged_matching <glob>...
+    local path pattern
+    for path in "${staged[@]}"; do
+        for pattern in "$@"; do
+            case "$path" in
+            $pattern)
+                printf '%s\0' "$path"
+                break
+                ;;
+            esac
+        done
+    done
+}
+
+# Whether at least one staged path matches one of the given globs.
+staged_any() { # staged_any <glob>...
+    local path pattern
+    for path in "${staged[@]}"; do
+        for pattern in "$@"; do
+            case "$path" in
+            $pattern) return 0 ;;
+            esac
+        done
+    done
+    return 1
+}
+
+# Four tiers, each a superset test rather than a hand-kept file list: a path falls through every tier
+# it belongs to, so a new directory is covered the day it appears and no check runs twice.
+for file in "${staged[@]}"; do
+    added=$(git diff --cached --unified=0 -- "$file" | grep '^+' | grep -v '^+++' || true)
+    added_lines=$(added_line_numbers "$file")
+    case "$file" in
+    # Every C and C++ source, wherever it lives: prose, Doxygen and the shared vocabulary.
+    *.c | *.h | *.hpp | *.cpp | *.cc | *.cxx | *.cu | *.cuh)
+        check_ascii_arrows
+        check_glued_arrows
+        check_backward_references
+        check_rulers
+        check_region_labels
+        check_param_directions
+        check_markdown_doxygen
+        check_doxygen_glued
+        check_section_spacing
+        check_docblock_spacing
+        check_lone_brief
+        check_brief_length
+        check_file_header
+        check_docblock_brackets
+        check_bare_member_docs
+        check_include_groups
+        check_trailing_returns
+        check_iterator_laundering
+        ;;&
+    # Every C++ source: the C bindings under c/ and the C ABI headers keep their C idioms.
+    *.hpp | *.cpp | *.cc | *.cxx | *.cu | *.cuh)
+        check_qualified_namespace
+        check_template_parameter_underscores
+        check_function_like_macros
+        check_redundant_nodiscard
+        check_printf
+        check_partial_prints
+        check_stl_streams
+        check_deque
+        check_memcpy
+        check_range_reconstruction
+        check_data_null_probe
+        check_call_chained_subscript
+        check_gcc_atomics
+        check_annotate_release_before_unlock
+        ;;&
+    # CUDA translation units and the headers they compile into.
+    *.cu | *.cuh)
+        check_host_threads
+        ;;&
+    # The shipped library: public headers under include/ and the ABI sources under src/.
+    include/*.h | include/*.hpp | include/*.cuh | src/*.cpp | src/*.cuh)
+        check_boolean_parameters
+        ;;&
+    *.md)
+        check_ascii_arrows_prose
+        check_blank_line_runs
+        check_glued_arrows
+        check_sibling_justification
+        ;;
+    *.py | *.pyi)
+        check_sibling_justification
+        check_banner_rules
+        check_python_version_probe
+        ;;
+    .github/workflows/*.yml | .github/workflows/*.yaml) check_workflow_names ;;
+    esac
+done
+
+# endregion Dispatch
+
+# region Formatter Gates
+
+# Each gate runs whole-file, the way its formatter does, and only when that tool and its profile are
+# present. Every one takes explicit paths: `ruff format` on a directory also rewrites README examples.
+if command -v clang-format > /dev/null 2>&1 && [ -f .clang-format ]; then
+    while IFS= read -r -d '' file; do
+        if ! clang-format --dry-run -Werror "$file" > /dev/null 2>&1; then
+            echo "pre-commit: $file is not clang-format clean - run \`clang-format -i $file\` (the pip-installed 22.x)"
+            failed=1
+        fi
+    done < <(staged_matching '*.c' '*.h' '*.hpp' '*.cpp' '*.cc' '*.cu' '*.cuh')
+fi
+
+if command -v ruff > /dev/null 2>&1 && [ -f pyproject.toml ]; then
+    while IFS= read -r -d '' file; do
+        if ! ruff format --check "$file" > /dev/null 2>&1; then
+            echo "pre-commit: $file is not ruff-format clean - run \`ruff format $file\`"
+            failed=1
+        fi
+        if ! ruff check --quiet "$file" > /dev/null 2>&1; then
+            echo "pre-commit: $file fails ruff's lints - run \`ruff check --fix $file\`"
+            failed=1
+        fi
+    done < <(staged_matching '*.py' '*.pyi')
+fi
+
+# JSON and YAML must satisfy the checked-in .dprint.json. Skips without dprint, installed from https://dprint.dev/install.
+if command -v dprint > /dev/null 2>&1; then
+    dprint_staged=()
+    while IFS= read -r -d '' file; do dprint_staged+=("$file"); done \
+        < <(staged_matching '*.json' '*.jsonc' '*.yml' '*.yaml')
+    if [ ${#dprint_staged[@]} -gt 0 ] && ! dprint check "${dprint_staged[@]}" > /dev/null 2>&1; then
+        echo "pre-commit: staged JSON or YAML is not dprint clean - run \`dprint fmt\`"
+        failed=1
+    fi
+fi
+
+if command -v cmake-format > /dev/null 2>&1 && [ -f .cmake-format.py ]; then
+    while IFS= read -r -d '' file; do
+        if ! cmake-format --check "$file" > /dev/null 2>&1; then
+            echo "pre-commit: $file is not cmake-format clean - run \`cmake-format -i $file\` with the repo profile"
+            failed=1
+        fi
+        # A bare `CMakeLists.txt` pattern matches the whole path, so every SDK's own list needs its prefix.
+    done < <(staged_matching 'CMakeLists.txt' '*/CMakeLists.txt' '*.cmake')
+fi
+
+# endregion Formatter Gates
+
+# region Whole Tree Gates
+
+# An integer quotient compared against zero says `a < b` the long way round, and it reads as a
+# second divisibility test beside the `%` it usually sits next to. Every source language, added
+# lines only, with line comments stripped so prose about a quotient does not trip it.
+while IFS= read -r -d '' file; do
+    quotients=$(awk '
+        NR == FNR { added[$1 + 0]; next }
+        FNR in added {
+            line = $0
+            sub(/\/\/.*/, "", line)
+            sub(/#.*/, "", line)
+            if (line ~ /\/[[:space:]]*[A-Za-z_][A-Za-z0-9_.()]*[[:space:]]*[=!]=+[[:space:]]*0([^.0-9]|$)/)
+                printf "%d:%s\n", FNR, $0
+        }' <(added_line_numbers "$file") <(git show ":$file"))
+    if [ -n "$quotients" ]; then
+        echo "pre-commit: $file compares an integer quotient against zero - write \`numerator < denominator\`:"
+        printf '%s\n' "$quotients" | head -3
+        failed=1
+    fi
+done < <(staged_matching '*.c' '*.h' '*.hpp' '*.cpp' '*.cu' '*.cuh' '*.rs' '*.zig' '*.go' '*.cs' '*.java' '*.swift' '*.ts' '*.js' '*.mojo' '*.py')
+
+# Abbreviated identifiers are banned in favor of whole words: lo/hi/bot must be low/high/bottom.
+# Word-boundary match on the staged content, added lines only.
+while IFS= read -r -d '' file; do
+    added_lines=$(added_line_numbers "$file")
+    abbreviations=$(awk '
+        NR == FNR { added[$1 + 0]; next }
+        (FNR in added) && $0 !~ /@/ && $0 ~ /(^|[^A-Za-z0-9_])(lo|hi|bot)([^A-Za-z0-9_]|$)/ { printf "%d:%s\n", FNR, $0 }' \
+        <(printf '%s\n' "$added_lines") <(git show ":$file"))
+    if [ -n "$abbreviations" ]; then
+        echo "pre-commit: $file uses an abbreviated identifier - write low, high, bottom, never lo, hi, bot:"
+        printf '%s\n' "$abbreviations" | head -3
+        failed=1
+    fi
+done < <(staged_matching '*.c' '*.h' '*.hpp' '*.cpp' '*.cc' '*.cu' '*.cuh')
+
+# Editor settings and extension lists stay sorted case-insensitively, so every addition has one place to go.
+editor_lists=$(staged_matching '.vscode/settings.json' '.vscode/extensions.json' '.zed/settings.json' | tr '\0' '\n')
+if [ -n "$editor_lists" ]; then
+    unsorted=$(printf '%s\n' "$editor_lists" | python3 -c '
+import json, re, subprocess, sys
+def load(path):
+    text = subprocess.run(["git", "show", ":" + path], capture_output=True, text=True).stdout
+    text = re.sub(r"\"(?:\\.|[^\"\\])*\"|//[^\n]*|/\*.*?\*/", lambda match: match.group(0) if match.group(0)[0] == "\"" else "", text, flags=re.S)
+    return json.loads(re.sub(r",(\s*[}\]])", r"\1", text))
+for path in sys.stdin.read().split():
+    data = load(path)
+    lists = [list(data)] if path.endswith("settings.json") else []
+    lists += [data.get(key, []) for key in ("cSpell.words", "recommendations", "unwantedRecommendations")]
+    if any(list(items) != sorted(items, key=str.lower) for items in lists):
+        print(path)
+')
+    if [ -n "$unsorted" ]; then
+        echo "pre-commit: sort top-level settings keys, cSpell.words and extension recommendations case-insensitively in:"
+        printf '    %s\n' $unsorted
+        failed=1
+    fi
+fi
+
+# endregion Whole Tree Gates
+
+if [ "$failed" -ne 0 ]; then
+    echo ""
+    echo "Fix the staged changes and commit again. Bypass knowingly with: git commit --no-verify"
+    exit 1
+fi
+exit 0
