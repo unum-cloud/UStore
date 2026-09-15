@@ -1,709 +1,965 @@
 /**
- * @file engine_leveldb.cpp
- * @author Ashot Vardanian
- *
- * @brief Embedded Persistent Key-Value Store on top of @b LevelDB.
- * Has no support for collections, transactions or any non-CRUD jobs.
+ *  @file src/leveldb/engine.cpp
+ *  @author Ash Vardanian
+ *  @date January 9, 2023
+ *  @brief Embedded persistent key-value store on LevelDB, without named collections or transactions.
  */
-#include <mutex>
-#include <fstream>
 
-#include <leveldb/db.h>
-#include <leveldb/comparator.h>
-#include <leveldb/write_batch.h>
+#include <cstdint> // `std::uint64_t`
+#include <cstring> // `std::memcpy`
+
+#include <charconv>    // `std::from_chars`
+#include <limits>      // `std::numeric_limits`
+#include <memory>      // `std::unique_ptr`
+#include <mutex>       // `std::lock_guard`, `std::mutex`
+#include <new>         // `std::bad_alloc`, `std::nothrow`
+#include <string>      // `std::string`, the path, property and value type LevelDB takes
+#include <string_view> // `std::string_view`
+
 #include <leveldb/cache.h> // `NewLRUCache`
-#include <nlohmann/json.hpp>
+#include <leveldb/comparator.h>
+#include <leveldb/db.h>
+#include <leveldb/write_batch.h>
 
-#include "ustore/db.h"
-#include "ustore/cpp/ranges_args.hpp" // `places_arg_t`
-#include "helpers/linked_array.hpp"   // `uninitialized_array_gt`
-#include "helpers/full_scan.hpp"      // `reservoir_sample_iterator`
-#include "helpers/config_loader.hpp"  // `config_loader_t`
+#include <smashtable/basic_hash_table.hpp>
 
-using namespace unum::ustore;
-using namespace unum;
+#include <ustore/db.h>
+#include <ustore/ranges_args.hpp> // `places_arg_t`
 
-namespace stdfs = std::filesystem;
-using json_t = nlohmann::json;
-
-/*********************************************************/
-/*****************   Structures & Consts  ****************/
-/*********************************************************/
+#include "helpers/config_loader.hpp" // `load_config`
+#include "helpers/full_scan.hpp"     // `reservoir_sample_iterator`
+#include "helpers/linked_array.hpp"  // `uninitialized_array`
 
 ustore_collection_t const ustore_collection_main_k = 0;
 ustore_length_t const ustore_length_missing_k = std::numeric_limits<ustore_length_t>::max();
 ustore_key_t const ustore_key_unknown_k = std::numeric_limits<ustore_key_t>::max();
 
-using level_native_t = leveldb::DB;
-using level_status_t = leveldb::Status;
-using level_options_t = leveldb::Options;
-using level_iter_uptr_t = std::unique_ptr<leveldb::Iterator>;
+namespace unum::ustore::leveldb {
 
-struct key_comparator_t final : public leveldb::Comparator {
+#pragma region Database
 
-    inline int Compare(leveldb::Slice const& a, leveldb::Slice const& b) const override {
-        auto ai = *reinterpret_cast<ustore_key_t const*>(a.data());
-        auto bi = *reinterpret_cast<ustore_key_t const*>(b.data());
-        if (ai == bi)
-            return 0;
-        return ai < bi ? -1 : 1;
+/** The open LevelDB database. */
+using native_t = ::leveldb::DB;
+
+/** Status LevelDB answers. */
+using native_status_t = ::leveldb::Status;
+
+/** An owned LevelDB iterator. */
+using iterator_pointer_t = std::unique_ptr<::leveldb::Iterator>;
+
+/** Reads the key @p slice holds, whose bytes LevelDB leaves unaligned. */
+inline ustore_key_t key_of(::leveldb::Slice const& slice) noexcept {
+    ustore_key_t key;
+    std::memcpy(&key, slice.data(), sizeof(ustore_key_t));
+    return key;
+}
+
+/** Orders keys as the integers they hold. */
+struct key_comparator_t final : public ::leveldb::Comparator {
+
+    int Compare(::leveldb::Slice const& left, ::leveldb::Slice const& right) const override {
+        ustore_key_t const left_key = key_of(left);
+        ustore_key_t const right_key = key_of(right);
+        if (left_key == right_key) return 0;
+        return left_key < right_key ? -1 : 1;
     }
 
     char const* Name() const override { return "Integral"; }
 
-    void FindShortestSeparator(std::string*, leveldb::Slice const&) const override {}
+    void FindShortestSeparator(std::string*, ::leveldb::Slice const&) const override {}
 
-    void FindShortSuccessor(std::string* key) const override {
-        auto& int_key = *reinterpret_cast<ustore_key_t*>(key->data());
-        ++int_key;
-    }
+    /** Leaves @p key as it is, since LevelDB keeps a successor only when it is physically shorter. */
+    void FindShortSuccessor(std::string*) const override {}
 };
 
-static key_comparator_t const key_comparator_k = {};
+key_comparator_t const key_comparator_k {};
 
-struct level_snapshot_t {
-    leveldb::Snapshot const* snapshot = nullptr;
+/** A snapshot handle, whose address is its identifier. */
+struct snapshot_t {
+
+    /** The LevelDB snapshot. */
+    ::leveldb::Snapshot const* native = nullptr;
 };
 
-struct level_db_t {
-    level_options_t options;
-    std::unordered_map<ustore_size_t, level_snapshot_t*> snapshots;
-    std::unique_ptr<level_native_t> native;
+/** Identifiers of the live snapshots. */
+using snapshots_t = ashvardanian::smashtable::hash_set<ustore_snapshot_t>;
+
+/** The open database, its options and its snapshots. */
+struct database_t {
+
+    /** Options the database opened with, reused to create exports. */
+    ::leveldb::Options options;
+
+    /** Block cache the options point to, or null for the default one. */
+    std::unique_ptr<::leveldb::Cache> cache;
+
+    /** Identifiers of the live snapshots. */
+    snapshots_t snapshots;
+
+    /** The open database. */
+    std::unique_ptr<native_t> native;
+
+    /** Guards the snapshots. */
     std::mutex mutex;
 };
 
-/*********************************************************/
-/*****************	 C++ Implementation	  ****************/
-/*********************************************************/
-
-inline leveldb::Slice to_slice(ustore_key_t const& key) noexcept {
+inline ::leveldb::Slice to_slice(ustore_key_t const& key) noexcept {
     return {reinterpret_cast<char const*>(&key), sizeof(ustore_key_t)};
 }
 
-inline leveldb::Slice to_slice(value_view_t value) noexcept {
-    return {reinterpret_cast<const char*>(value.begin()), value.size()};
+inline ::leveldb::Slice to_slice(value_view_t value) noexcept {
+    return {reinterpret_cast<char const*>(value.begin()), value.size()};
 }
 
-inline std::unique_ptr<std::string> make_value(ustore_error_t* c_error) noexcept {
-    std::unique_ptr<std::string> value_uptr;
-    try {
-        value_uptr = std::make_unique<std::string>();
-    }
-    catch (...) {
-        *c_error = "Fail to allocate value";
-    }
-    return value_uptr;
+inline value_view_t to_value(::leveldb::Slice const& slice) noexcept {
+    return {reinterpret_cast<ustore_bytes_cptr_t>(slice.data()), static_cast<ustore_length_t>(slice.size())};
 }
 
-bool export_error(level_status_t const& status, ustore_error_t* c_error) {
-    if (status.ok())
-        return false;
+/** Exports a failed status into @p error, answering whether it failed. */
+bool export_error(native_status_t const& status, ustore_error_t* error) noexcept {
+    if (status.ok()) return false;
 
-    if (status.IsCorruption())
-        *c_error = "Failure: DB Corruption";
-    else if (status.IsIOError())
-        *c_error = "Failure: IO  Error";
-    else if (status.IsInvalidArgument())
-        *c_error = "Failure: Invalid Argument";
-    else
-        *c_error = "Failure";
+    if (status.IsCorruption()) *error = "Failure: DB Corruption";
+    else if (status.IsIOError()) *error = "Failure: IO  Error";
+    else if (status.IsInvalidArgument()) *error = "Failure: Invalid Argument";
+    else *error = "Failure";
     return true;
 }
 
-void ustore_database_init(ustore_database_init_t* c_ptr) {
-
-    ustore_database_init_t& c = *c_ptr;
-    try {
-        level_options_t options;
-        options.comparator = &key_comparator_k;
-        options.compression = leveldb::kNoCompression;
-        options.create_if_missing = true;
-
-        return_error_if_m(c.config, c.error, args_wrong_k, "Null config specified");
-        // Load config
-        config_t config;
-        auto st = config_loader_t::load_from_json_string(c.config, config);
-        return_error_if_m(st, c.error, args_wrong_k, st.message());
-
-        // Root path
-        stdfs::path root = config.directory;
-        stdfs::file_status root_status = stdfs::status(root);
-        return_error_if_m(root_status.type() == stdfs::file_type::directory,
-                          c.error,
-                          args_wrong_k,
-                          "Root isn't a directory");
-
-        // Storage paths
-        return_error_if_m(config.data_directories.empty(), c.error, args_wrong_k, "Multi-disk not supported");
-
-        // Engine config
-        return_error_if_m(config.engine.config_url.empty(), c.error, args_wrong_k, "Doesn't support URL configs");
-
-        auto fill_options = [](json_t const& js, level_options_t& options) {
-            if (js.contains("write_buffer_size"))
-                options.write_buffer_size = js["write_buffer_size"];
-            if (js.contains("max_file_size"))
-                options.max_file_size = js["max_file_size"];
-            if (js.contains("max_open_files"))
-                options.max_open_files = js["max_open_files"];
-            if (js.contains("cache_size"))
-                options.block_cache = leveldb::NewLRUCache(js["cache_size"]);
-            if (js.contains("create_if_missing"))
-                options.create_if_missing = js["create_if_missing"];
-            if (js.contains("error_if_exists"))
-                options.error_if_exists = js["error_if_exists"];
-            if (js.contains("paranoid_checks"))
-                options.paranoid_checks = js["paranoid_checks"];
-            if (js.contains("compression"))
-                if (js["compression"] == "kSnappyCompression" || js["compression"] == "snappy")
-                    options.compression = leveldb::kSnappyCompression;
-        };
-
-        // Load from file
-        if (!config.engine.config_file_path.empty()) {
-            std::ifstream ifs(config.engine.config_file_path);
-            return_error_if_m(ifs, c.error, args_wrong_k, "Config file not found");
-            auto js = json_t::parse(ifs);
-            fill_options(js, options);
-        }
-        // Override with nested
-        if (!config.engine.config.empty())
-            fill_options(config.engine.config, options);
-
-        auto db_ptr = std::make_unique<level_db_t>();
-        level_native_t* native_db = nullptr;
-        level_status_t status = leveldb::DB::Open(options, root, &native_db);
-        return_error_if_m(status.ok(), c.error, args_wrong_k, "Couldn't open LevelDB");
-        db_ptr->native = std::unique_ptr<level_native_t>(native_db);
-        db_ptr->options = options;
-        *c.db = db_ptr.release();
+/** Refuses tasks addressing any collection but the main one, answering whether it refused. */
+bool refuse_named_collections(strided_iterator<ustore_collection_t const> collections, std::size_t count,
+                              ustore_error_t* error) noexcept {
+    if (!collections) return false;
+    for (std::size_t task_index = 0; task_index != count; ++task_index) {
+        if (collections[task_index] == ustore_collection_main_k) continue;
+        *error = "Collections not supported by LevelDB!";
+        return true;
     }
-    catch (json_t::type_error const&) {
-        *c.error = "Unsupported type in LevelDB configuration key";
-    }
-    catch (...) {
-        *c.error = "Open Failure";
-    }
+    return false;
 }
 
-void ustore_get_metadata(ustore_get_metadata_t* c_ptr) {
-    ustore_get_metadata_t& c = *c_ptr;
-    *c.metadata = ustore_supports_snapshots_k;
-}
+/** Applies the options of one JSON object, answering whether every present member has the right type. */
+bool read_options(yyjson_val* json, database_t& database) {
+    ::leveldb::Options& options = database.options;
+    std::size_t cache_size = 0;
+    std::string_view compression;
+    bool const valid = //
+        read_json_member(json, "write_buffer_size", options.write_buffer_size) &&
+        read_json_member(json, "max_file_size", options.max_file_size) &&
+        read_json_member(json, "max_open_files", options.max_open_files) &&
+        read_json_member(json, "cache_size", cache_size) &&
+        read_json_member(json, "create_if_missing", options.create_if_missing) &&
+        read_json_member(json, "error_if_exists", options.error_if_exists) &&
+        read_json_member(json, "paranoid_checks", options.paranoid_checks) &&
+        read_json_member(json, "compression", compression);
+    if (!valid) return false;
 
-void ustore_snapshot_list(ustore_snapshot_list_t* c_ptr) {
-    ustore_snapshot_list_t& c = *c_ptr;
-    return_error_if_m(c.db, c.error, uninitialized_state_k, "DataBase is uninitialized");
-    return_error_if_m(c.count && c.ids, c.error, args_combo_k, "Need outputs!");
-
-    linked_memory_lock_t arena = linked_memory(c.arena, c.options, c.error);
-    return_if_error_m(c.error);
-
-    level_db_t& db = *reinterpret_cast<level_db_t*>(c.db);
-    std::lock_guard<std::mutex> locker(db.mutex);
-    std::size_t snapshots_count = db.snapshots.size();
-    *c.count = static_cast<ustore_size_t>(snapshots_count);
-
-    // For every snapshot we also need to export IDs
-    auto ids = arena.alloc_or_dummy(snapshots_count, c.error, c.ids);
-    return_if_error_m(c.error);
-
-    std::size_t i = 0;
-    for (const auto& [id, _] : db.snapshots)
-        ids[i++] = id;
-}
-
-void ustore_snapshot_create(ustore_snapshot_create_t* c_ptr) {
-    ustore_snapshot_create_t& c = *c_ptr;
-    return_error_if_m(c.db, c.error, uninitialized_state_k, "DataBase is uninitialized");
-
-    level_db_t& db = *reinterpret_cast<level_db_t*>(c.db);
-    std::lock_guard<std::mutex> locker(db.mutex);
-    auto it = db.snapshots.find(*c.id);
-    if (it != db.snapshots.end())
-        return_error_if_m(it->second, c.error, args_wrong_k, "Such snapshot already exists!");
-
-    level_snapshot_t* level_snapshot = nullptr;
-    safe_section("Allocating snapshot handle", c.error, [&] { level_snapshot = new level_snapshot_t(); });
-    return_if_error_m(c.error);
-
-    level_snapshot->snapshot = db.native->GetSnapshot();
-    if (!level_snapshot->snapshot)
-        *c.error = "Couldn't get a snapshot!";
-
-    *c.id = reinterpret_cast<ustore_snapshot_t>(level_snapshot);
-    db.snapshots[*c.id] = level_snapshot;
-}
-
-void ustore_snapshot_export(ustore_snapshot_export_t* c_ptr) {
-    ustore_snapshot_export_t& c = *c_ptr;
-    return_error_if_m(c.db, c.error, uninitialized_state_k, "DataBase is uninitialized");
-    level_db_t& db = *reinterpret_cast<level_db_t*>(c.db);
-
-    // Find snapshot
-    leveldb::ReadOptions scan_options;
-    scan_options.fill_cache = false;
-    if (c.id) {
-        auto it = db.snapshots.find(c.id);
-        return_error_if_m(it != db.snapshots.end(), c.error, args_wrong_k, "The snapshot does'nt exist!");
-        level_snapshot_t& snap = *reinterpret_cast<level_snapshot_t*>(c.id);
-        scan_options.snapshot = snap.snapshot;
+    if (yyjson_obj_get(json, "cache_size")) {
+        database.cache.reset(::leveldb::NewLRUCache(cache_size));
+        options.block_cache = database.cache.get();
     }
-
-    // Create new DB
-    level_native_t* native_db = nullptr;
-    level_status_t status = leveldb::DB::Open(db.options, c.path, &native_db);
-    return_error_if_m(status.ok(), c.error, args_wrong_k, "Couldn't create a new database");
-
-    // Copy all data into new DB
-    try {
-        auto it = level_iter_uptr_t(db.native->NewIterator(scan_options));
-        for (it->SeekToFirst(); it->Valid() & status.ok(); it->Next())
-            status = native_db->Put(leveldb::WriteOptions(), it->key(), it->value());
-    }
-    catch (...) {
-        *c.error = "Fail To Copy Database";
-    }
-
-    // Close
-    delete native_db;
-
-    if (!status.ok())
-        leveldb::DestroyDB(c.path, db.options);
-    export_error(status, c.error);
+    if (compression == "kSnappyCompression" || compression == "snappy")
+        options.compression = ::leveldb::kSnappyCompression;
+    return true;
 }
 
-void ustore_snapshot_drop(ustore_snapshot_drop_t* c_ptr) {
-    if (!c_ptr)
+/** Points @p options at the snapshot @p id, leaving them untouched for the zero identifier. */
+void use_snapshot(database_t& database, ustore_snapshot_t id, ::leveldb::ReadOptions& options, ustore_error_t* error) {
+    if (!id) return;
+    std::lock_guard lock {database.mutex};
+    if (database.snapshots.find(id) == database.snapshots.end()) {
+        *error = "The snapshot doesn't exist!";
         return;
-
-    ustore_snapshot_drop_t& c = *c_ptr;
-    if (!c.id)
-        return;
-
-    level_db_t& db = *reinterpret_cast<level_db_t*>(c.db);
-    level_snapshot_t& snap = *reinterpret_cast<level_snapshot_t*>(c.id);
-    if (!snap.snapshot)
-        return;
-
-    db.native->ReleaseSnapshot(snap.snapshot);
-    snap.snapshot = nullptr;
-
-    auto id = reinterpret_cast<ustore_size_t>(c.id);
-    db.mutex.lock();
-    db.snapshots.erase(id);
-    db.mutex.unlock();
+    }
+    options.snapshot = reinterpret_cast<snapshot_t*>(id)->native;
 }
 
-void write_one( //
-    level_db_t& db,
-    places_arg_t const& places,
-    contents_arg_t const& contents,
-    leveldb::WriteOptions const& options,
-    ustore_error_t* c_error) {
+#pragma endregion Database
+
+#pragma region Reads and Writes
+
+/** From this many keys one iterator, sharing a version and its loaded blocks, beats a `Get` that copies each value. */
+constexpr std::size_t iterator_read_threshold_k = 16;
+
+void write_one(database_t& database, places_arg_t const& places, contents_arg_t const& contents,
+               ::leveldb::WriteOptions const& options, ustore_error_t* error) {
 
     auto place = places[0];
     auto content = contents[0];
-    auto key = to_slice(place.key);
-    level_status_t status =
-        !content ? db.native->Delete(options, key) : db.native->Put(options, key, to_slice(content));
-    export_error(status, c_error);
+    auto const key = to_slice(place.key);
+    native_status_t const status = !content ? database.native->Delete(options, key)
+                                            : database.native->Put(options, key, to_slice(content));
+    export_error(status, error);
 }
 
-void write_many( //
-    level_db_t& db,
-    places_arg_t const& places,
-    contents_arg_t const& contents,
-    leveldb::WriteOptions const& options,
-    ustore_error_t* c_error) {
+void write_many(database_t& database, places_arg_t const& places, contents_arg_t const& contents,
+                ::leveldb::WriteOptions const& options, ustore_error_t* error) {
 
-    leveldb::WriteBatch batch;
-    for (std::size_t i = 0; i != places.size(); ++i) {
-        auto place = places[i];
-        auto content = contents[i];
-
-        auto key = to_slice(place.key);
-        if (!content)
-            batch.Delete(key);
-        else
-            batch.Put(key, to_slice(content));
+    ::leveldb::WriteBatch batch;
+    for (std::size_t task_index = 0; task_index != places.size(); ++task_index) {
+        auto place = places[task_index];
+        auto content = contents[task_index];
+        auto const key = to_slice(place.key);
+        if (!content) batch.Delete(key);
+        else batch.Put(key, to_slice(content));
     }
 
-    level_status_t status = db.native->Write(options, &batch);
-    export_error(status, c_error);
+    native_status_t const status = database.native->Write(options, &batch);
+    export_error(status, error);
 }
 
-void ustore_write(ustore_write_t* c_ptr) {
+/** Reads every place with its own `Get`, handing each value to @p enumerator with its index. */
+template <typename value_enumerator_type_>
+void get_each(database_t& database, places_arg_t const& places, ::leveldb::ReadOptions const& options,
+              value_enumerator_type_&& enumerator, ustore_error_t* error) {
 
-    ustore_write_t& c = *c_ptr;
-    return_error_if_m(c.db, c.error, uninitialized_state_k, "DataBase is uninitialized");
-
-    level_db_t& db = *reinterpret_cast<level_db_t*>(c.db);
-    strided_iterator_gt<ustore_collection_t const> collections {c.collections, c.collections_stride};
-    strided_iterator_gt<ustore_key_t const> keys {c.keys, c.keys_stride};
-    strided_iterator_gt<ustore_bytes_cptr_t const> vals {c.values, c.values_stride};
-    strided_iterator_gt<ustore_length_t const> offs {c.offsets, c.offsets_stride};
-    strided_iterator_gt<ustore_length_t const> lens {c.lengths, c.lengths_stride};
-    bits_view_t presences {c.presences};
-
-    places_arg_t places {collections, keys, {}, c.tasks_count};
-    contents_arg_t contents {presences, offs, lens, vals, c.tasks_count};
-
-    validate_write(c.transaction, places, contents, c.options, c.error);
-    return_if_error_m(c.error);
-
-    leveldb::WriteOptions options;
-    if (c.options & ustore_option_write_flush_k)
-        options.sync = true;
-
-    try {
-        auto func = c.tasks_count == 1 ? &write_one : &write_many;
-        func(db, places, contents, options, c.error);
-    }
-    catch (...) {
-        *c.error = "Write Failure";
-    }
-}
-
-template <typename value_enumerator_at>
-void read_enumerate( //
-    level_db_t& db,
-    places_arg_t tasks,
-    leveldb::ReadOptions const& options,
-    std::string& value,
-    value_enumerator_at enumerator,
-    ustore_error_t* c_error) {
-
-    for (std::size_t i = 0; i != tasks.size(); ++i) {
-        place_t place = tasks[i];
-        level_status_t status = db.native->Get(options, to_slice(place.key), &value);
-        if (!status.IsNotFound()) {
-            if (export_error(status, c_error))
-                return;
-            auto begin = reinterpret_cast<ustore_bytes_cptr_t>(value.data());
-            auto length = static_cast<ustore_length_t>(value.size());
-            enumerator(i, value_view_t {begin, length});
+    // `Get` writes only into a string, so one buffer serves the whole batch
+    std::string value;
+    for (std::size_t task_index = 0; task_index != places.size(); ++task_index) {
+        native_status_t const status = database.native->Get(options, to_slice(places[task_index].key), &value);
+        if (status.IsNotFound()) {
+            enumerator(task_index, value_view_t {});
+            continue;
         }
-        else
-            enumerator(i, value_view_t {});
+        if (export_error(status, error)) return;
+        enumerator(task_index, to_value(value));
     }
 }
 
-void ustore_read(ustore_read_t* c_ptr) {
+/** Reads every place through one iterator, handing each value to @p enumerator straight from its block. */
+template <typename value_enumerator_type_>
+void seek_each(database_t& database, places_arg_t const& places, ::leveldb::ReadOptions const& options,
+               value_enumerator_type_&& enumerator, ustore_error_t* error) {
 
-    ustore_read_t& c = *c_ptr;
-    return_error_if_m(c.db, c.error, uninitialized_state_k, "DataBase is uninitialized");
-
-    linked_memory_lock_t arena = linked_memory(c.arena, c.options, c.error);
-    return_if_error_m(c.error);
-
-    level_db_t& db = *reinterpret_cast<level_db_t*>(c.db);
-    level_snapshot_t& snap = *reinterpret_cast<level_snapshot_t*>(c.snapshot);
-    strided_iterator_gt<ustore_key_t const> keys {c.keys, c.keys_stride};
-    places_arg_t places {{}, keys, {}, c.tasks_count};
-
-    validate_read(c.transaction, places, c.options, c.error);
-    return_if_error_m(c.error);
-
-    // 1. Allocate a tape for all the values to be pulled
-    auto offs = arena.alloc_or_dummy(places.count + 1, c.error, c.offsets);
-    return_if_error_m(c.error);
-    auto lens = arena.alloc_or_dummy(places.count, c.error, c.lengths);
-    return_if_error_m(c.error);
-    auto presences = arena.alloc_or_dummy(places.count, c.error, c.presences);
-    return_if_error_m(c.error);
-    bool const needs_export = c.values != nullptr;
-
-    uninitialized_array_gt<byte_t> contents(arena);
-
-    // 2. Pull metadata & data in one run, as reading from disk is expensive
-    try {
-        leveldb::ReadOptions options;
-        if (c.snapshot) {
-            auto it = db.snapshots.find(c.snapshot);
-            return_error_if_m(it != db.snapshots.end(), c.error, args_wrong_k, "The snapshot does'nt exist!");
-            options.snapshot = snap.snapshot;
+    iterator_pointer_t iterator {database.native->NewIterator(options)};
+    for (std::size_t task_index = 0; task_index != places.size(); ++task_index) {
+        ::leveldb::Slice const key = to_slice(places[task_index].key);
+        iterator->Seek(key);
+        if (iterator->Valid() && iterator->key().compare(key) == 0) {
+            enumerator(task_index, to_value(iterator->value()));
+            continue;
         }
-
-        std::string value_buffer;
-        ustore_length_t progress_in_tape = 0;
-        auto data_enumerator = [&](std::size_t i, value_view_t value) {
-            presences[i] = bool(value);
-            lens[i] = value ? value.size() : ustore_length_missing_k;
-            offs[i] = contents.size();
-            if (needs_export)
-                contents.insert(contents.size(), value.begin(), value.end(), c.error);
-        };
-        read_enumerate(db, places, options, value_buffer, data_enumerator, c.error);
-        offs[places.count] = contents.size();
-        if (needs_export)
-            *c.values = reinterpret_cast<ustore_bytes_ptr_t>(contents.begin());
-    }
-    catch (...) {
-        *c.error = "Read Failure";
+        if (export_error(iterator->status(), error)) return;
+        enumerator(task_index, value_view_t {});
     }
 }
 
-void ustore_scan(ustore_scan_t* c_ptr) {
+#pragma endregion Reads and Writes
 
-    ustore_scan_t& c = *c_ptr;
-    return_error_if_m(c.db, c.error, uninitialized_state_k, "DataBase is uninitialized");
+#pragma region Lifetime
 
-    linked_memory_lock_t arena = linked_memory(c.arena, c.options, c.error);
-    return_if_error_m(c.error);
-
-    level_db_t& db = *reinterpret_cast<level_db_t*>(c.db);
-    level_snapshot_t& snap = *reinterpret_cast<level_snapshot_t*>(c.snapshot);
-    strided_iterator_gt<ustore_key_t const> start_keys {c.start_keys, c.start_keys_stride};
-    strided_iterator_gt<ustore_length_t const> limits {c.count_limits, c.count_limits_stride};
-    scans_arg_t scans {{}, start_keys, limits, c.tasks_count};
-
-    return_if_error_m(c.error);
-
-    // 1. Allocate a tape for all the values to be fetched
-    auto offsets = arena.alloc_or_dummy(scans.count + 1, c.error, c.offsets);
-    return_if_error_m(c.error);
-    auto counts = arena.alloc_or_dummy(scans.count, c.error, c.counts);
-    return_if_error_m(c.error);
-
-    auto total_keys = reduce_n(scans.limits, scans.count, 0ul);
-    auto keys_output = *c.keys = arena.alloc<ustore_key_t>(total_keys, c.error).begin();
-    return_if_error_m(c.error);
-
-    // 2. Fetch the data
-    leveldb::ReadOptions options;
-    options.fill_cache = false;
-    if (c.snapshot) {
-        auto it = db.snapshots.find(c.snapshot);
-        return_error_if_m(it != db.snapshots.end(), c.error, args_wrong_k, "The snapshot does'nt exist!");
-        options.snapshot = snap.snapshot;
-    }
-
-    level_iter_uptr_t it;
-    try {
-        it = level_iter_uptr_t(db.native->NewIterator(options));
-    }
-    catch (...) {
-        *c.error = "Fail To Create Iterator";
+void database_init(ustore_database_init_t& arguments) {
+    if (!arguments.config) {
+        *arguments.error = "Null config specified";
         return;
     }
-    for (ustore_size_t i = 0; i != c.tasks_count; ++i) {
-        scan_t task = scans[i];
-        it->Seek(to_slice(task.min_key));
-        offsets[i] = keys_output - *c.keys;
 
-        ustore_size_t j = 0;
-        while (it->Valid() && j != task.limit) {
-            std::memcpy(keys_output, it->key().data(), sizeof(ustore_key_t));
+    config_t config;
+    auto loaded = load_config(arguments.config, config);
+    if (!loaded) {
+        *arguments.error = loaded.message();
+        return;
+    }
+
+    if (!is_directory(config.directory.data())) {
+        *arguments.error = "Root isn't a directory";
+        return;
+    }
+    if (config.data_directories.size() != 0) {
+        *arguments.error = "Multi-disk not supported";
+        return;
+    }
+    if (!config.engine.config_url.empty()) {
+        *arguments.error = "Doesn't support URL configs";
+        return;
+    }
+
+    std::unique_ptr<database_t> database {new (std::nothrow) database_t};
+    if (!database) {
+        *arguments.error = "Failed to allocate the database";
+        return;
+    }
+    database->options.comparator = &key_comparator_k;
+    database->options.compression = ::leveldb::kNoCompression;
+    database->options.create_if_missing = true;
+
+    if (!config.engine.config_file_path.empty()) {
+        json_document_t file_config;
+        auto file_loaded = load_json_file(config.engine.config_file_path.data(), file_config);
+        if (!file_loaded) {
+            *arguments.error = file_loaded.message();
+            return;
+        }
+        if (!read_options(file_config.root(), *database)) {
+            *arguments.error = "Unsupported type in LevelDB configuration key";
+            return;
+        }
+    }
+    if (!read_options(config.engine.config, *database)) {
+        *arguments.error = "Unsupported type in LevelDB configuration key";
+        return;
+    }
+
+    native_t* native = nullptr;
+    native_status_t const status = native_t::Open(database->options, std::string(config.directory), &native);
+    if (!status.ok()) {
+        *arguments.error = "Couldn't open LevelDB";
+        return;
+    }
+    database->native.reset(native);
+    *arguments.db = database.release();
+}
+
+void get_metadata(ustore_get_metadata_t& arguments) { *arguments.metadata = ustore_supports_snapshots_k; }
+
+#pragma endregion Lifetime
+
+#pragma region Snapshots
+
+void snapshot_list(ustore_snapshot_list_t& arguments) {
+    if (!arguments.db) {
+        *arguments.error = "DataBase is uninitialized";
+        return;
+    }
+    if (!arguments.count || !arguments.ids) {
+        *arguments.error = "Need outputs!";
+        return;
+    }
+
+    linked_memory_lock_t arena = linked_memory(arguments.arena, arguments.options, arguments.error);
+    if (*arguments.error) return;
+
+    database_t& database = *reinterpret_cast<database_t*>(arguments.db);
+    std::lock_guard lock {database.mutex};
+    std::size_t const snapshots_count = database.snapshots.size();
+    *arguments.count = static_cast<ustore_size_t>(snapshots_count);
+
+    auto ids = arena.alloc_or_dummy(snapshots_count, arguments.error, arguments.ids);
+    if (*arguments.error) return;
+
+    std::size_t index = 0;
+    [[maybe_unused]] auto const walked = database.snapshots.for_each(
+        [&](auto const& slot) noexcept { ids[index++] = slot.key(); });
+}
+
+void snapshot_create(ustore_snapshot_create_t& arguments) {
+    if (!arguments.db) {
+        *arguments.error = "DataBase is uninitialized";
+        return;
+    }
+
+    database_t& database = *reinterpret_cast<database_t*>(arguments.db);
+    std::lock_guard lock {database.mutex};
+    if (database.snapshots.find(*arguments.id) != database.snapshots.end()) {
+        *arguments.error = "Such snapshot already exists!";
+        return;
+    }
+
+    std::unique_ptr<snapshot_t> snapshot {new (std::nothrow) snapshot_t};
+    if (!snapshot) {
+        *arguments.error = "Allocating snapshot handle";
+        return;
+    }
+    snapshot->native = database.native->GetSnapshot();
+    if (!snapshot->native) {
+        *arguments.error = "Couldn't get a snapshot!";
+        return;
+    }
+
+    auto const id = reinterpret_cast<ustore_snapshot_t>(snapshot.get());
+    if (ashvardanian::smashtable::failed(database.snapshots.upsert(id))) {
+        database.native->ReleaseSnapshot(snapshot->native);
+        *arguments.error = "Failed to register the snapshot";
+        return;
+    }
+    [[maybe_unused]] snapshot_t* const registered = snapshot.release();
+    *arguments.id = id;
+}
+
+void snapshot_export(ustore_snapshot_export_t& arguments) {
+    if (!arguments.db) {
+        *arguments.error = "DataBase is uninitialized";
+        return;
+    }
+    database_t& database = *reinterpret_cast<database_t*>(arguments.db);
+
+    ::leveldb::ReadOptions scan_options;
+    scan_options.fill_cache = false;
+    use_snapshot(database, arguments.id, scan_options, arguments.error);
+    if (*arguments.error) return;
+
+    native_t* exported_native = nullptr;
+    native_status_t status = native_t::Open(database.options, arguments.path, &exported_native);
+    if (!status.ok()) {
+        *arguments.error = "Couldn't create a new database";
+        return;
+    }
+    std::unique_ptr<native_t> exported {exported_native};
+
+    // Batches the size of a memtable keep writes few without holding the whole export in memory
+    ::leveldb::WriteBatch batch;
+    iterator_pointer_t iterator {database.native->NewIterator(scan_options)};
+    for (iterator->SeekToFirst(); iterator->Valid() && status.ok(); iterator->Next()) {
+        batch.Put(iterator->key(), iterator->value());
+        if (batch.ApproximateSize() < database.options.write_buffer_size) continue;
+        status = exported->Write(::leveldb::WriteOptions(), &batch);
+        batch.Clear();
+    }
+    if (status.ok()) status = iterator->status();
+    if (status.ok()) status = exported->Write(::leveldb::WriteOptions(), &batch);
+    iterator.reset();
+    exported.reset();
+
+    if (!status.ok()) ::leveldb::DestroyDB(arguments.path, database.options);
+    export_error(status, arguments.error);
+}
+
+void snapshot_drop(ustore_snapshot_drop_t& arguments) {
+    if (!arguments.id) return;
+
+    database_t& database = *reinterpret_cast<database_t*>(arguments.db);
+    std::lock_guard lock {database.mutex};
+    if (!database.snapshots.erase(arguments.id)) return;
+
+    snapshot_t* const snapshot = reinterpret_cast<snapshot_t*>(arguments.id);
+    database.native->ReleaseSnapshot(snapshot->native);
+    delete snapshot;
+}
+
+#pragma endregion Snapshots
+
+#pragma region Reads and Writes
+
+void write(ustore_write_t& arguments) {
+    if (!arguments.db) {
+        *arguments.error = "DataBase is uninitialized";
+        return;
+    }
+
+    database_t& database = *reinterpret_cast<database_t*>(arguments.db);
+    strided_iterator<ustore_collection_t const> collections {arguments.collections, arguments.collections_stride};
+    strided_iterator<ustore_key_t const> keys {arguments.keys, arguments.keys_stride};
+    strided_iterator<ustore_bytes_cptr_t const> values {arguments.values, arguments.values_stride};
+    strided_iterator<ustore_length_t const> offsets {arguments.offsets, arguments.offsets_stride};
+    strided_iterator<ustore_length_t const> lengths {arguments.lengths, arguments.lengths_stride};
+    bits_view_t presences {arguments.presences};
+
+    places_arg_t places {collections, keys, {}, arguments.tasks_count};
+    contents_arg_t contents {presences, offsets, lengths, values, arguments.tasks_count};
+
+    validate_write(arguments.transaction, places, contents, arguments.options, arguments.error);
+    if (*arguments.error) return;
+    if (refuse_named_collections(collections, arguments.tasks_count, arguments.error)) return;
+    if (!arguments.tasks_count) return;
+
+    ::leveldb::WriteOptions options;
+    options.sync = arguments.options & ustore_option_write_flush_k;
+
+    if (arguments.tasks_count == 1) write_one(database, places, contents, options, arguments.error);
+    else write_many(database, places, contents, options, arguments.error);
+}
+
+void read(ustore_read_t& arguments) {
+    if (!arguments.db) {
+        *arguments.error = "DataBase is uninitialized";
+        return;
+    }
+
+    linked_memory_lock_t arena = linked_memory(arguments.arena, arguments.options, arguments.error);
+    if (*arguments.error) return;
+
+    database_t& database = *reinterpret_cast<database_t*>(arguments.db);
+    strided_iterator<ustore_collection_t const> collections {arguments.collections, arguments.collections_stride};
+    strided_iterator<ustore_key_t const> keys {arguments.keys, arguments.keys_stride};
+    places_arg_t places {{}, keys, {}, arguments.tasks_count};
+
+    validate_read(arguments.transaction, places, arguments.options, arguments.error);
+    if (*arguments.error) return;
+    if (refuse_named_collections(collections, arguments.tasks_count, arguments.error)) return;
+
+    ::leveldb::ReadOptions options;
+    use_snapshot(database, arguments.snapshot, options, arguments.error);
+    if (*arguments.error) return;
+
+    auto offsets = arena.alloc_or_dummy(places.count + 1, arguments.error, arguments.offsets);
+    if (*arguments.error) return;
+    auto lengths = arena.alloc_or_dummy(places.count, arguments.error, arguments.lengths);
+    if (*arguments.error) return;
+    auto presences = arena.alloc_or_dummy(places.count, arguments.error, arguments.presences);
+    if (*arguments.error) return;
+    bool const needs_export = arguments.values != nullptr;
+
+    uninitialized_array<byte_t> contents(arena);
+
+    // Metadata and data come in one pass, as reading from disk is expensive
+    auto data_enumerator = [&](std::size_t index, value_view_t value) {
+        presences[index] = bool(value);
+        lengths[index] = value ? value.size() : ustore_length_missing_k;
+        offsets[index] = contents.size();
+        if (needs_export) contents.insert(contents.size(), value.begin(), value.end(), arguments.error);
+    };
+    if (places.count < iterator_read_threshold_k) get_each(database, places, options, data_enumerator, arguments.error);
+    else seek_each(database, places, options, data_enumerator, arguments.error);
+    offsets[places.count] = contents.size();
+    if (needs_export) *arguments.values = reinterpret_cast<ustore_bytes_ptr_t>(contents.begin());
+}
+
+void scan(ustore_scan_t& arguments) {
+    if (!arguments.db) {
+        *arguments.error = "DataBase is uninitialized";
+        return;
+    }
+
+    linked_memory_lock_t arena = linked_memory(arguments.arena, arguments.options, arguments.error);
+    if (*arguments.error) return;
+
+    database_t& database = *reinterpret_cast<database_t*>(arguments.db);
+    strided_iterator<ustore_collection_t const> collections {arguments.collections, arguments.collections_stride};
+    strided_iterator<ustore_key_t const> start_keys {arguments.start_keys, arguments.start_keys_stride};
+    strided_iterator<ustore_length_t const> limits {arguments.count_limits, arguments.count_limits_stride};
+    scans_arg_t scans {{}, start_keys, limits, arguments.tasks_count};
+
+    validate_scan(arguments.transaction, scans, arguments.options, arguments.error);
+    if (*arguments.error) return;
+    if (refuse_named_collections(collections, arguments.tasks_count, arguments.error)) return;
+
+    auto offsets = arena.alloc_or_dummy(scans.count + 1, arguments.error, arguments.offsets);
+    if (*arguments.error) return;
+    auto counts = arena.alloc_or_dummy(scans.count, arguments.error, arguments.counts);
+    if (*arguments.error) return;
+
+    auto const total_keys = reduce_n(scans.limits, scans.count, 0ul);
+    auto keys_output = *arguments.keys = arena.alloc<ustore_key_t>(total_keys, arguments.error).begin();
+    if (*arguments.error) return;
+
+    ::leveldb::ReadOptions options;
+    options.fill_cache = false;
+    use_snapshot(database, arguments.snapshot, options, arguments.error);
+    if (*arguments.error) return;
+
+    iterator_pointer_t iterator {database.native->NewIterator(options)};
+    for (ustore_size_t task_index = 0; task_index != arguments.tasks_count; ++task_index) {
+        scan_t task = scans[task_index];
+        iterator->Seek(to_slice(task.min_key));
+        offsets[task_index] = keys_output - *arguments.keys;
+
+        ustore_size_t matched_count = 0;
+        while (iterator->Valid() && matched_count != task.limit) {
+            std::memcpy(keys_output, iterator->key().data(), sizeof(ustore_key_t));
             ++keys_output;
-            ++j;
-            it->Next();
+            ++matched_count;
+            iterator->Next();
         }
+        if (export_error(iterator->status(), arguments.error)) return;
 
-        counts[i] = j;
+        counts[task_index] = matched_count;
     }
 
-    offsets[scans.size()] = keys_output - *c.keys;
+    offsets[scans.size()] = keys_output - *arguments.keys;
 }
 
-void ustore_sample(ustore_sample_t* c_ptr) {
-
-    ustore_sample_t& c = *c_ptr;
-    return_error_if_m(c.db, c.error, uninitialized_state_k, "DataBase is uninitialized");
-    if (!c.tasks_count)
+void sample(ustore_sample_t& arguments) {
+    if (!arguments.db) {
+        *arguments.error = "DataBase is uninitialized";
         return;
-
-    linked_memory_lock_t arena = linked_memory(c.arena, c.options, c.error);
-    return_if_error_m(c.error);
-
-    level_db_t& db = *reinterpret_cast<level_db_t*>(c.db);
-    level_snapshot_t& snap = *reinterpret_cast<level_snapshot_t*>(c.snapshot);
-    strided_iterator_gt<ustore_length_t const> lens {c.count_limits, c.count_limits_stride};
-    sample_args_t samples {{}, lens, c.tasks_count};
-
-    // 1. Allocate a tape for all the values to be fetched
-    auto offsets = arena.alloc_or_dummy(samples.count + 1, c.error, c.offsets);
-    return_if_error_m(c.error);
-    auto counts = arena.alloc_or_dummy(samples.count, c.error, c.counts);
-    return_if_error_m(c.error);
-
-    auto total_keys = reduce_n(samples.limits, samples.count, 0ul);
-    auto keys_output = *c.keys = arena.alloc<ustore_key_t>(total_keys, c.error).begin();
-    return_if_error_m(c.error);
-
-    // 2. Fetch the data
-    leveldb::ReadOptions options;
-    options.fill_cache = false;
-    if (c.snapshot) {
-        auto it = db.snapshots.find(c.snapshot);
-        return_error_if_m(it != db.snapshots.end(), c.error, args_wrong_k, "The snapshot does'nt exist!");
-        options.snapshot = snap.snapshot;
     }
+    if (!arguments.tasks_count) return;
 
-    for (std::size_t task_idx = 0; task_idx != samples.count; ++task_idx) {
-        sample_arg_t task = samples[task_idx];
-        offsets[task_idx] = keys_output - *c.keys;
+    linked_memory_lock_t arena = linked_memory(arguments.arena, arguments.options, arguments.error);
+    if (*arguments.error) return;
 
-        level_iter_uptr_t it;
-        safe_section("Creating a LevelDB iterator", c.error, [&] {
-            it = level_iter_uptr_t(db.native->NewIterator(options));
-        });
-        return_if_error_m(c.error);
+    database_t& database = *reinterpret_cast<database_t*>(arguments.db);
+    strided_iterator<ustore_collection_t const> collections {arguments.collections, arguments.collections_stride};
+    strided_iterator<ustore_length_t const> limits {arguments.count_limits, arguments.count_limits_stride};
+    sample_args_t samples {{}, limits, arguments.tasks_count};
+    if (refuse_named_collections(collections, arguments.tasks_count, arguments.error)) return;
 
-        ptr_range_gt<ustore_key_t> sampled_keys(keys_output, task.limit);
-        reservoir_sample_iterator(it, sampled_keys, c.error);
+    auto offsets = arena.alloc_or_dummy(samples.count + 1, arguments.error, arguments.offsets);
+    if (*arguments.error) return;
+    auto counts = arena.alloc_or_dummy(samples.count, arguments.error, arguments.counts);
+    if (*arguments.error) return;
 
-        counts[task_idx] = task.limit;
+    auto const total_keys = reduce_n(samples.limits, samples.count, 0ul);
+    auto keys_output = *arguments.keys = arena.alloc<ustore_key_t>(total_keys, arguments.error).begin();
+    if (*arguments.error) return;
+
+    ::leveldb::ReadOptions options;
+    options.fill_cache = false;
+    use_snapshot(database, arguments.snapshot, options, arguments.error);
+    if (*arguments.error) return;
+
+    iterator_pointer_t iterator {database.native->NewIterator(options)};
+    for (std::size_t task_index = 0; task_index != samples.count; ++task_index) {
+        sample_arg_t task = samples[task_index];
+        offsets[task_index] = keys_output - *arguments.keys;
+
+        ptr_range<ustore_key_t> sampled_keys(keys_output, task.limit);
+        reservoir_sample_iterator(iterator, sampled_keys, arguments.error);
+
+        counts[task_index] = task.limit;
         keys_output += task.limit;
     }
-    offsets[samples.count] = keys_output - *c.keys;
+    offsets[samples.count] = keys_output - *arguments.keys;
 }
 
-void ustore_measure(ustore_measure_t* c_ptr) {
+void measure(ustore_measure_t& arguments) {
+    if (!arguments.db) {
+        *arguments.error = "DataBase is uninitialized";
+        return;
+    }
 
-    ustore_measure_t& c = *c_ptr;
-    return_error_if_m(c.db, c.error, uninitialized_state_k, "DataBase is uninitialized");
+    linked_memory_lock_t arena = linked_memory(arguments.arena, arguments.options, arguments.error);
+    if (*arguments.error) return;
 
-    linked_memory_lock_t arena = linked_memory(c.arena, c.options, c.error);
-    return_if_error_m(c.error);
+    auto min_cardinalities = arena.alloc_or_dummy(arguments.tasks_count, arguments.error, arguments.min_cardinalities);
+    auto max_cardinalities = arena.alloc_or_dummy(arguments.tasks_count, arguments.error, arguments.max_cardinalities);
+    auto min_value_bytes = arena.alloc_or_dummy(arguments.tasks_count, arguments.error, arguments.min_value_bytes);
+    auto max_value_bytes = arena.alloc_or_dummy(arguments.tasks_count, arguments.error, arguments.max_value_bytes);
+    auto min_space_usages = arena.alloc_or_dummy(arguments.tasks_count, arguments.error, arguments.min_space_usages);
+    auto max_space_usages = arena.alloc_or_dummy(arguments.tasks_count, arguments.error, arguments.max_space_usages);
+    if (*arguments.error) return;
 
-    auto min_cardinalities = arena.alloc_or_dummy(c.tasks_count, c.error, c.min_cardinalities);
-    auto max_cardinalities = arena.alloc_or_dummy(c.tasks_count, c.error, c.max_cardinalities);
-    auto min_value_bytes = arena.alloc_or_dummy(c.tasks_count, c.error, c.min_value_bytes);
-    auto max_value_bytes = arena.alloc_or_dummy(c.tasks_count, c.error, c.max_value_bytes);
-    auto min_space_usages = arena.alloc_or_dummy(c.tasks_count, c.error, c.min_space_usages);
-    auto max_space_usages = arena.alloc_or_dummy(c.tasks_count, c.error, c.max_space_usages);
-    return_if_error_m(c.error);
+    database_t& database = *reinterpret_cast<database_t*>(arguments.db);
+    strided_iterator<ustore_collection_t const> collections {arguments.collections, arguments.collections_stride};
+    strided_iterator<ustore_key_t const> start_keys {arguments.start_keys, arguments.start_keys_stride};
+    strided_iterator<ustore_key_t const> end_keys {arguments.end_keys, arguments.end_keys_stride};
+    if (refuse_named_collections(collections, arguments.tasks_count, arguments.error)) return;
 
-    level_db_t& db = *reinterpret_cast<level_db_t*>(c.db);
-    strided_iterator_gt<ustore_key_t const> start_keys {c.start_keys, c.start_keys_stride};
-    strided_iterator_gt<ustore_key_t const> end_keys {c.end_keys, c.end_keys_stride};
-    uint64_t approximate_size = 0;
-    std::optional<std::string> memory_usage;
-    level_status_t status;
+    // Memory usage describes the whole database, so one property read serves every task
+    std::uint64_t memory_bytes = 0;
+    std::string memory_usage;
+    if (database.native->GetProperty("leveldb.approximate-memory-usage", &memory_usage)) {
+        [[maybe_unused]] auto const parsed = std::from_chars(memory_usage.data(),
+                                                             memory_usage.data() + memory_usage.size(), memory_bytes);
+    }
 
-    for (ustore_size_t i = 0; i != c.tasks_count; ++i) {
-        min_cardinalities[i] = static_cast<ustore_size_t>(0);
-        max_cardinalities[i] = static_cast<ustore_size_t>(0);
-        min_value_bytes[i] = static_cast<ustore_size_t>(0);
-        max_value_bytes[i] = static_cast<ustore_size_t>(0);
+    for (ustore_size_t task_index = 0; task_index != arguments.tasks_count; ++task_index) {
+        min_cardinalities[task_index] = static_cast<ustore_size_t>(0);
+        max_cardinalities[task_index] = static_cast<ustore_size_t>(0);
+        min_value_bytes[task_index] = static_cast<ustore_size_t>(0);
+        max_value_bytes[task_index] = static_cast<ustore_size_t>(0);
 
-        ustore_key_t const min_key = start_keys[i];
-        ustore_key_t const max_key = end_keys[i];
-        leveldb::Range range(to_slice(min_key), to_slice(max_key));
-        try {
-            db.native->GetApproximateSizes(&range, 1, &approximate_size);
-            min_space_usages[i] = approximate_size;
-
-            memory_usage = "0";
-            db.native->GetProperty("leveldb.approximate-memory-usage", &memory_usage.value());
-            max_space_usages[i] = std::stoi(memory_usage.value());
-        }
-        catch (...) {
-            *c.error = "Property Read Failure";
-        }
+        ustore_key_t const min_key = start_keys[task_index];
+        ustore_key_t const max_key = end_keys[task_index];
+        ::leveldb::Range const range(to_slice(min_key), to_slice(max_key));
+        std::uint64_t approximate_size = 0;
+        database.native->GetApproximateSizes(&range, 1, &approximate_size);
+        min_space_usages[task_index] = approximate_size;
+        max_space_usages[task_index] = memory_bytes;
     }
 }
 
-/*********************************************************/
-/*****************	Collections Management	****************/
-/*********************************************************/
+#pragma endregion Reads and Writes
 
-void ustore_collection_create(ustore_collection_create_t* c_ptr) {
+#pragma region Collections
 
-    ustore_collection_create_t& c = *c_ptr;
-    auto name_len = c.name ? std::strlen(c.name) : 0;
-    return_error_if_m(name_len, c.error, args_wrong_k, "Collections not supported by LevelDB!");
+void collection_create(ustore_collection_create_t& arguments) {
+    *arguments.error = "Collections not supported by LevelDB!";
 }
 
-void ustore_collection_drop(ustore_collection_drop_t* c_ptr) {
-
-    ustore_collection_drop_t& c = *c_ptr;
-    return_error_if_m(c.db, c.error, uninitialized_state_k, "DataBase is uninitialized");
-    bool invalidate = c.mode == ustore_drop_keys_vals_handle_k;
-    return_error_if_m(c.id == ustore_collection_main_k && !invalidate,
-                      c.error,
-                      args_combo_k,
-                      "Collections not supported by LevelDB!");
-
-    level_db_t& db = *reinterpret_cast<level_db_t*>(c.db);
-
-    leveldb::WriteBatch batch;
-    auto it = std::unique_ptr<leveldb::Iterator>(db.native->NewIterator(leveldb::ReadOptions()));
-
-    if (c.mode == ustore_drop_keys_vals_k) {
-        for (it->SeekToFirst(); it->Valid(); it->Next())
-            batch.Delete(it->key());
+void collection_drop(ustore_collection_drop_t& arguments) {
+    if (!arguments.db) {
+        *arguments.error = "DataBase is uninitialized";
+        return;
+    }
+    bool const invalidate = arguments.mode == ustore_drop_keys_vals_handle_k;
+    if (arguments.id != ustore_collection_main_k || invalidate) {
+        *arguments.error = "Collections not supported by LevelDB!";
+        return;
     }
 
-    else if (c.mode == ustore_drop_vals_k) {
-        for (it->SeekToFirst(); it->Valid(); it->Next())
-            batch.Put(it->key(), leveldb::Slice());
+    database_t& database = *reinterpret_cast<database_t*>(arguments.db);
+
+    ::leveldb::WriteBatch batch;
+    iterator_pointer_t iterator {database.native->NewIterator(::leveldb::ReadOptions())};
+
+    if (arguments.mode == ustore_drop_keys_vals_k) {
+        for (iterator->SeekToFirst(); iterator->Valid(); iterator->Next()) batch.Delete(iterator->key());
+    }
+    else if (arguments.mode == ustore_drop_vals_k) {
+        for (iterator->SeekToFirst(); iterator->Valid(); iterator->Next())
+            batch.Put(iterator->key(), ::leveldb::Slice());
     }
 
-    leveldb::WriteOptions options;
+    ::leveldb::WriteOptions options;
     options.sync = true;
-    level_status_t status = db.native->Write(options, &batch);
-    export_error(status, c.error);
+    native_status_t const status = database.native->Write(options, &batch);
+    export_error(status, arguments.error);
 }
 
-void ustore_collection_list(ustore_collection_list_t* c_ptr) {
-
-    ustore_collection_list_t& c = *c_ptr;
-    *c.count = 0;
-    if (c.ids)
-        *c.ids = nullptr;
-    if (c.offsets)
-        *c.offsets = nullptr;
-    if (c.names)
-        *c.names = nullptr;
+void collection_list(ustore_collection_list_t& arguments) {
+    *arguments.count = 0;
+    if (arguments.ids) *arguments.ids = nullptr;
+    if (arguments.offsets) *arguments.offsets = nullptr;
+    if (arguments.names) *arguments.names = nullptr;
 }
 
-void ustore_database_control(ustore_database_control_t* c_ptr) {
-
-    ustore_database_control_t& c = *c_ptr;
-    return_error_if_m(c.db, c.error, uninitialized_state_k, "DataBase is uninitialized");
-
-    if (!c.request && (*c.error = "Request is NULL!"))
+void database_control(ustore_database_control_t& arguments) {
+    if (!arguments.db) {
+        *arguments.error = "DataBase is uninitialized";
         return;
-
-    *c.response = NULL;
-    *c.error = "Controls aren't supported in this implementation!";
-}
-
-/*********************************************************/
-/*****************		Transactions	  ****************/
-/*********************************************************/
-
-void ustore_transaction_init(ustore_transaction_init_t* c_ptr) {
-
-    ustore_transaction_init_t& c = *c_ptr;
-    *c.error = "Transactions not supported by LevelDB!";
-}
-
-void ustore_transaction_commit(ustore_transaction_commit_t* c_ptr) {
-
-    ustore_transaction_commit_t& c = *c_ptr;
-    *c.error = "Transactions not supported by LevelDB!";
-}
-
-/*********************************************************/
-/*****************	  Memory Management   ****************/
-/*********************************************************/
-
-void ustore_arena_free(ustore_arena_t c_arena) {
-    clear_linked_memory(c_arena);
-}
-
-void ustore_transaction_free(ustore_transaction_t) {
-}
-
-void ustore_database_free(ustore_database_t c_db) {
-    if (!c_db)
+    }
+    if (!arguments.request) {
+        *arguments.error = "Request is NULL!";
         return;
-    level_db_t* db = reinterpret_cast<level_db_t*>(c_db);
-    delete db;
+    }
+
+    *arguments.response = nullptr;
+    *arguments.error = "Controls aren't supported in this implementation!";
 }
 
-void ustore_error_free(ustore_error_t) {
+#pragma endregion Collections
+
+#pragma region Transactions
+
+void transaction_init(ustore_transaction_init_t& arguments) {
+    *arguments.error = "Transactions not supported by LevelDB!";
 }
+
+void transaction_stage(ustore_transaction_stage_t& arguments) {
+    *arguments.error = "Transactions not supported by LevelDB!";
+}
+
+void transaction_commit(ustore_transaction_commit_t& arguments) {
+    *arguments.error = "Transactions not supported by LevelDB!";
+}
+
+#pragma endregion Transactions
+
+} // namespace unum::ustore::leveldb
+
+using namespace unum::ustore;
+using namespace unum::ustore::leveldb;
+
+#pragma region Exception Boundaries
+
+void ustore_database_init(ustore_database_init_t* arguments) {
+    try {
+        database_init(*arguments);
+    }
+    catch (std::bad_alloc const&) {
+        *arguments->error = "Out of memory";
+    }
+    catch (...) {
+        *arguments->error = "Unexpected engine failure";
+    }
+}
+
+void ustore_get_metadata(ustore_get_metadata_t* arguments) {
+    try {
+        get_metadata(*arguments);
+    }
+    catch (std::bad_alloc const&) {
+        *arguments->error = "Out of memory";
+    }
+    catch (...) {
+        *arguments->error = "Unexpected engine failure";
+    }
+}
+
+void ustore_snapshot_list(ustore_snapshot_list_t* arguments) {
+    try {
+        snapshot_list(*arguments);
+    }
+    catch (std::bad_alloc const&) {
+        *arguments->error = "Out of memory";
+    }
+    catch (...) {
+        *arguments->error = "Unexpected engine failure";
+    }
+}
+
+void ustore_snapshot_create(ustore_snapshot_create_t* arguments) {
+    try {
+        snapshot_create(*arguments);
+    }
+    catch (std::bad_alloc const&) {
+        *arguments->error = "Out of memory";
+    }
+    catch (...) {
+        *arguments->error = "Unexpected engine failure";
+    }
+}
+
+void ustore_snapshot_export(ustore_snapshot_export_t* arguments) {
+    try {
+        snapshot_export(*arguments);
+    }
+    catch (std::bad_alloc const&) {
+        *arguments->error = "Out of memory";
+    }
+    catch (...) {
+        *arguments->error = "Unexpected engine failure";
+    }
+}
+
+void ustore_snapshot_drop(ustore_snapshot_drop_t* arguments) {
+    if (!arguments) return;
+    try {
+        snapshot_drop(*arguments);
+    }
+    catch (std::bad_alloc const&) {
+        *arguments->error = "Out of memory";
+    }
+    catch (...) {
+        *arguments->error = "Unexpected engine failure";
+    }
+}
+
+void ustore_write(ustore_write_t* arguments) {
+    try {
+        write(*arguments);
+    }
+    catch (std::bad_alloc const&) {
+        *arguments->error = "Out of memory";
+    }
+    catch (...) {
+        *arguments->error = "Unexpected engine failure";
+    }
+}
+
+void ustore_read(ustore_read_t* arguments) {
+    try {
+        read(*arguments);
+    }
+    catch (std::bad_alloc const&) {
+        *arguments->error = "Out of memory";
+    }
+    catch (...) {
+        *arguments->error = "Unexpected engine failure";
+    }
+}
+
+void ustore_scan(ustore_scan_t* arguments) {
+    try {
+        scan(*arguments);
+    }
+    catch (std::bad_alloc const&) {
+        *arguments->error = "Out of memory";
+    }
+    catch (...) {
+        *arguments->error = "Unexpected engine failure";
+    }
+}
+
+void ustore_sample(ustore_sample_t* arguments) {
+    try {
+        sample(*arguments);
+    }
+    catch (std::bad_alloc const&) {
+        *arguments->error = "Out of memory";
+    }
+    catch (...) {
+        *arguments->error = "Unexpected engine failure";
+    }
+}
+
+void ustore_measure(ustore_measure_t* arguments) {
+    try {
+        measure(*arguments);
+    }
+    catch (std::bad_alloc const&) {
+        *arguments->error = "Out of memory";
+    }
+    catch (...) {
+        *arguments->error = "Unexpected engine failure";
+    }
+}
+
+void ustore_collection_create(ustore_collection_create_t* arguments) {
+    try {
+        collection_create(*arguments);
+    }
+    catch (std::bad_alloc const&) {
+        *arguments->error = "Out of memory";
+    }
+    catch (...) {
+        *arguments->error = "Unexpected engine failure";
+    }
+}
+
+void ustore_collection_drop(ustore_collection_drop_t* arguments) {
+    try {
+        collection_drop(*arguments);
+    }
+    catch (std::bad_alloc const&) {
+        *arguments->error = "Out of memory";
+    }
+    catch (...) {
+        *arguments->error = "Unexpected engine failure";
+    }
+}
+
+void ustore_collection_list(ustore_collection_list_t* arguments) {
+    try {
+        collection_list(*arguments);
+    }
+    catch (std::bad_alloc const&) {
+        *arguments->error = "Out of memory";
+    }
+    catch (...) {
+        *arguments->error = "Unexpected engine failure";
+    }
+}
+
+void ustore_database_control(ustore_database_control_t* arguments) {
+    try {
+        database_control(*arguments);
+    }
+    catch (std::bad_alloc const&) {
+        *arguments->error = "Out of memory";
+    }
+    catch (...) {
+        *arguments->error = "Unexpected engine failure";
+    }
+}
+
+void ustore_transaction_init(ustore_transaction_init_t* arguments) {
+    try {
+        transaction_init(*arguments);
+    }
+    catch (std::bad_alloc const&) {
+        *arguments->error = "Out of memory";
+    }
+    catch (...) {
+        *arguments->error = "Unexpected engine failure";
+    }
+}
+
+void ustore_transaction_stage(ustore_transaction_stage_t* arguments) {
+    try {
+        transaction_stage(*arguments);
+    }
+    catch (std::bad_alloc const&) {
+        *arguments->error = "Out of memory";
+    }
+    catch (...) {
+        *arguments->error = "Unexpected engine failure";
+    }
+}
+
+void ustore_transaction_commit(ustore_transaction_commit_t* arguments) {
+    try {
+        transaction_commit(*arguments);
+    }
+    catch (std::bad_alloc const&) {
+        *arguments->error = "Out of memory";
+    }
+    catch (...) {
+        *arguments->error = "Unexpected engine failure";
+    }
+}
+
+#pragma endregion Exception Boundaries
+
+#pragma region Memory
+
+void ustore_arena_free(ustore_arena_t arena) { clear_linked_memory(arena); }
+
+void ustore_transaction_free(ustore_transaction_t) {}
+
+void ustore_database_free(ustore_database_t database) { delete reinterpret_cast<database_t*>(database); }
+
+void ustore_error_free(ustore_error_t) {}
+
+#pragma endregion Memory
