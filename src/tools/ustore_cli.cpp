@@ -167,7 +167,7 @@ void docs_export(database_t& db,
 // List of CLI arguments
 struct cli_args_t {
     bool help = false;
-    std::string url;
+    std::string directory;
 
     std::string action;
     std::string db_object;
@@ -207,7 +207,7 @@ bool parse_cli_args(int argc, char* argv[], cli_args_t& arg) {
                       (required("drop").set(arg.action, std::string("drop")) & value("snapshot id", arg.snap_id)) |
                       (required("list").set(arg.action, std::string("list")))));
 
-    auto cli = ((required("--url") & value("URL", arg.url)).doc("Server URL"),
+    auto cli = ((required("--directory") & value("directory", arg.directory)).doc("Database directory"),
                 (collection | snapshot),
                 option("-h", "--help").set(arg.help).doc("Print this help information on this tool and exit"));
 
@@ -461,7 +461,8 @@ int main(int argc, char* argv[]) {
         return !result | !arg.help;
 
     database_t db;
-    status_t status = db.open(arg.url.c_str());
+    std::string const config = fmt::format(R"({{"version": "1.0", "directory": "{}"}})", arg.directory);
+    status_t status = db.open(config.c_str());
 
     if (!status) {
         print(red_k, status.message());

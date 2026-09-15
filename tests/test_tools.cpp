@@ -101,13 +101,11 @@ static char const* path() {
     if (path)
         return std::strlen(path) ? path : nullptr;
 
-#if defined(USTORE_CLI)
-    return nullptr;
-#elif defined(USTORE_TEST_PATH)
+#if defined(USTORE_TEST_PATH)
     return USTORE_TEST_PATH;
 #else
     return nullptr;
-#endif // USTORE_CLI
+#endif
 }
 
 static std::string config() {
@@ -118,27 +116,10 @@ static std::string config() {
 }
 
 #if defined(USTORE_CLI)
-static pid_t srv_id = -1;
-static std::string srv_path;
 static std::string cli_path;
 #endif // USTORE_CLI
 
 void clear_environment() {
-#if defined(USTORE_CLI)
-    if (srv_id > 0) {
-        kill(srv_id, SIGKILL);
-        waitpid(srv_id, nullptr, 0);
-    }
-
-    srv_id = fork();
-    if (srv_id == 0) {
-        usleep(1); // TODO Any statement is requiered to be run for successful `execl` run...
-        execl(srv_path.c_str(), srv_path.c_str(), "--quiet", (char*)(NULL));
-        exit(0);
-    }
-    usleep(100000); // 0.1 sec
-#endif // USTORE_CLI
-
     namespace stdfs = std::filesystem;
     auto directory_str = path() ? std::string_view(path()) : "";
     if (!directory_str.empty()) {
@@ -1653,15 +1634,15 @@ void run_command(const char* command, args... arguments) {
         wait(NULL);
 }
 
-bool test_import_export_cli(database_t& db, ustore_str_view_t url, ustore_str_view_t coll_name = nullptr) {
+bool test_import_export_cli(ustore_str_view_t directory, ustore_str_view_t coll_name = nullptr) {
 
     std::vector<std::string> updated_paths;
     std::string new_file;
 
     if (coll_name) {
         run_command(cli_path.c_str(),
-                    "--url",
-                    url,
+                    "--directory",
+                    directory,
                     "collection",
                     "import",
                     "--input",
@@ -1674,8 +1655,8 @@ bool test_import_export_cli(database_t& db, ustore_str_view_t url, ustore_str_vi
                     coll_name);
 
         run_command(cli_path.c_str(),
-                    "--url",
-                    url,
+                    "--directory",
+                    directory,
                     "collection",
                     "export",
                     "--output",
@@ -1687,8 +1668,8 @@ bool test_import_export_cli(database_t& db, ustore_str_view_t url, ustore_str_vi
     }
     else {
         run_command(cli_path.c_str(),
-                    "--url",
-                    url,
+                    "--directory",
+                    directory,
                     "collection",
                     "import",
                     "--input",
@@ -1699,8 +1680,8 @@ bool test_import_export_cli(database_t& db, ustore_str_view_t url, ustore_str_vi
                     "1073741824");
 
         run_command(cli_path.c_str(),
-                    "--url",
-                    url,
+                    "--directory",
+                    directory,
                     "collection",
                     "export",
                     "--output",
@@ -1734,27 +1715,37 @@ bool test_import_export_cli(database_t& db, ustore_str_view_t url, ustore_str_vi
 
 TEST(db, cli) {
     clear_environment();
+    auto directory = path();
+    ASSERT_NE(directory, nullptr) << "The CLI test runs against the directory USTORE_TEST_PATH names";
 
-    database_t db;
-    auto url = "grpc://0.0.0.0:38709";
-    EXPECT_TRUE(db.open(url));
-    EXPECT_TRUE(db.clear());
-    auto context = context_t {db, nullptr};
-    auto maybe_cols = context.collections();
-    EXPECT_TRUE(maybe_cols);
-    EXPECT_EQ(maybe_cols->ids.size(), 0);
+    {
+        database_t db;
+        EXPECT_TRUE(db.open(config().c_str()));
+        auto context = context_t {db, nullptr};
+        auto maybe_cols = context.collections();
+        EXPECT_TRUE(maybe_cols);
+        EXPECT_EQ(maybe_cols->ids.size(), 0);
+    }
 
-    run_command(cli_path.c_str(), "--url", url, "collection", "create", "--name", "collection1");
-    EXPECT_TRUE(db.contains("collection1"));
-    EXPECT_TRUE(*db.contains("collection1"));
+    run_command(cli_path.c_str(), "--directory", directory, "collection", "create", "--name", "collection1");
+    {
+        database_t db;
+        EXPECT_TRUE(db.open(config().c_str()));
+        EXPECT_TRUE(db.contains("collection1"));
+        EXPECT_TRUE(*db.contains("collection1"));
+    }
 
-    EXPECT_TRUE(test_import_export_cli(db, url, "collection1"));
+    EXPECT_TRUE(test_import_export_cli(directory, "collection1"));
 
-    run_command(cli_path.c_str(), "--url", url, "collection", "drop", "--name", "collection1");
-    EXPECT_TRUE(db.contains("collection1"));
-    EXPECT_FALSE(*db.contains("collection1"));
+    run_command(cli_path.c_str(), "--directory", directory, "collection", "drop", "--name", "collection1");
+    {
+        database_t db;
+        EXPECT_TRUE(db.open(config().c_str()));
+        EXPECT_TRUE(db.contains("collection1"));
+        EXPECT_FALSE(*db.contains("collection1"));
+    }
 
-    EXPECT_TRUE(test_import_export_cli(db, url));
+    EXPECT_TRUE(test_import_export_cli(directory));
 }
 
 #endif // USTORE_CLI
@@ -1763,8 +1754,7 @@ int main(int argc, char** argv) {
 
 #if defined(USTORE_CLI)
     std::string exec_path = argv[0];
-    cli_path = exec_path.substr(0, exec_path.find_last_of("/") + 1) + "ustore";
-    srv_path = exec_path.substr(0, exec_path.find_last_of("/") + 1) + "ustore_flight_server_ucset";
+    cli_path = exec_path.substr(0, exec_path.find_last_of("/") + 1) + USTORE_CLI;
 #endif // USTORE_CLI
 
     make_ndjson_docs();
@@ -1774,11 +1764,6 @@ int main(int argc, char** argv) {
 
     ::testing::InitGoogleTest(&argc, argv);
     int result = RUN_ALL_TESTS();
-
-#if defined(USTORE_CLI)
-    kill(srv_id, SIGKILL);
-    waitpid(srv_id, nullptr, 0);
-#endif // USTORE_CLI
 
     delete_test_file();
     return result;
