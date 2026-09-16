@@ -9,12 +9,13 @@
 
 #include <cstddef> // `std::nullptr_t`
 
+#include <span>        // `std::span`
 #include <type_traits> // `std::conditional_t`, `std::decay_t`
 #include <utility>     // `std::forward`, `std::move`
 
 #include <ustore/docs.h>
 #include <ustore/docs_table.hpp>  // `docs_table`, `table_header`, `table_header_view_t`
-#include <ustore/ranges.hpp>      // `embedded_blobs_t`, `bits_span_t`, `joined_strs_t`, `ptr_range`
+#include <ustore/ranges.hpp>      // `embedded_blobs_t`, `bits_span_t`, `joined_strs_t`
 #include <ustore/ranges_args.hpp> // `location_store`, `places_arg_extractor`, `contents_arg_extractor`
 #include <ustore/status.hpp>      // `status_t`, `expected`
 #include <ustore/types.hpp>       // `arena_t`
@@ -43,7 +44,7 @@ class docs_ref {
 
     using value_t = std::conditional_t<is_one_k, value_view_t, embedded_blobs_t>;
     using present_t = std::conditional_t<is_one_k, bool, bits_span_t>;
-    using length_t = std::conditional_t<is_one_k, ustore_length_t, ptr_range<ustore_length_t>>;
+    using length_t = std::conditional_t<is_one_k, ustore_length_t, std::span<ustore_length_t>>;
 
   protected:
     ustore_database_t db_ {nullptr};
@@ -152,7 +153,7 @@ class docs_ref {
 
     /** Lists the unique paths to the leaves of the documents. */
     expected<joined_strs_t> gist(ustore_options_t options = ustore_options_default_k) noexcept {
-        status_t status;
+        ustore_error_t error {};
         ustore_size_t found_count = 0;
         ustore_length_t* found_offsets = nullptr;
         ustore_str_span_t found_strings = nullptr;
@@ -163,7 +164,7 @@ class docs_ref {
 
         ustore_docs_gist_t docs_gist {};
         docs_gist.db = db_;
-        docs_gist.error = status.member_ptr();
+        docs_gist.error = &error;
         docs_gist.transaction = transaction_;
         docs_gist.snapshot = snapshot_;
         docs_gist.arena = arena_;
@@ -178,9 +179,8 @@ class docs_ref {
         docs_gist.fields = &found_strings;
 
         ustore_docs_gist(&docs_gist);
-
-        joined_strs_t view {found_count, found_offsets, found_strings};
-        return {std::move(status), std::move(view)};
+        if (error.status) return status_t {error};
+        return joined_strs_t {found_count, found_offsets, found_strings};
     }
 
     /** Gathers every column of @p header from every document into a table typed at runtime. */
@@ -200,7 +200,7 @@ class docs_ref {
     template <typename contents_>
     status_t any_write(contents_&& contents, ustore_doc_modification_t modification, ustore_doc_field_type_t type,
                        ustore_options_t options) noexcept {
-        status_t status;
+        ustore_error_t error {};
         using values_t = std::decay_t<contents_>;
         using value_extractor_t = contents_arg_extractor<values_t>;
 
@@ -216,7 +216,7 @@ class docs_ref {
 
         ustore_docs_write_t docs_write {};
         docs_write.db = db_;
-        docs_write.error = status.member_ptr();
+        docs_write.error = &error;
         docs_write.transaction = transaction_;
         docs_write.arena = arena_;
         docs_write.options = options;
@@ -237,12 +237,12 @@ class docs_ref {
         docs_write.values_stride = values_contents.stride();
 
         ustore_docs_write(&docs_write);
-        return status;
+        return status_t {error};
     }
 
     template <typename expected_ = value_t>
     expected<expected_> any_get(ustore_doc_field_type_t type, ustore_options_t options) noexcept {
-        status_t status;
+        ustore_error_t error {};
         ustore_length_t* found_offsets = nullptr;
         ustore_length_t* found_lengths = nullptr;
         ustore_bytes_ptr_t found_values = nullptr;
@@ -259,7 +259,7 @@ class docs_ref {
 
         ustore_docs_read_t docs_read {};
         docs_read.db = db_;
-        docs_read.error = status.member_ptr();
+        docs_read.error = &error;
         docs_read.transaction = transaction_;
         docs_read.snapshot = snapshot_;
         docs_read.arena = arena_;
@@ -278,12 +278,12 @@ class docs_ref {
         docs_read.values = wants_value_k ? &found_values : nullptr;
 
         ustore_docs_read(&docs_read);
-        if (!status) return std::move(status);
+        if (error.status) return status_t {error};
 
         if constexpr (wants_length_k) {
-            ptr_range<ustore_length_t> const many {found_lengths, found_lengths + count};
+            std::span<ustore_length_t> const many {found_lengths, found_lengths + count};
             if constexpr (is_one_k) return ustore_length_t {many[0]};
-            else return ptr_range<ustore_length_t> {many};
+            else return std::span<ustore_length_t> {many};
         }
         else if constexpr (wants_present_k) {
             bits_span_t many {found_presences};
@@ -304,14 +304,14 @@ class docs_ref {
         auto const collections = keys_extractor_t {}.collections(places);
         auto const keys = keys_extractor_t {}.keys(places);
 
-        status_t status;
+        ustore_error_t error {};
         table_ view {
             count, header.fields().size(), collections, keys, header.fields().begin(), header.types().begin(),
         };
 
         ustore_docs_gather_t docs_gather {};
         docs_gather.db = db_;
-        docs_gather.error = status.member_ptr();
+        docs_gather.error = &error;
         docs_gather.transaction = transaction_;
         docs_gather.snapshot = snapshot_;
         docs_gather.arena = arena_;
@@ -335,7 +335,8 @@ class docs_ref {
         docs_gather.joined_strings = view.member_tape();
 
         ustore_docs_gather(&docs_gather);
-        return {std::move(status), std::move(view)};
+        if (error.status) return status_t {error};
+        return view;
     }
 };
 

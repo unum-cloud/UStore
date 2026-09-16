@@ -1,53 +1,346 @@
 /**
- * @file modality_docs.cpp
- * @author Ashot Vardanian
+ *  @file c/docs.cpp
+ *  @author Ash Vardanian
+ *  @date December 26, 2022
+ *  @brief Documents modality on yyjson, running on top of any engine that implements <ustore/db.h>.
  *
- * @brief Document storage using "YYJSON" lib.
- * Sits on top of any @see "ustore.h"-compatible system.
+ *  Documents are stored as JSON text.
+ *  Whole-document reads and upserts pass straight through to the engine, while field access, conversions
+ *  and modifications parse every document with yyjson, allocating from the arena of the request.
  */
-#include <cstdio>      // `std::snprintf`
-#include <cctype>      // `std::isdigit`
-#include <charconv>    // `std::to_chars`
-#include <string_view> // `std::string_view`
 
-#include <fmt/format.h> // `fmt::format_int`
+#include <cstddef> // `std::size_t`, `std::max_align_t`
+#include <cstring> // `std::memcpy`, `std::memset`, `std::strlen`
 
-#include <simdjson.h>          // Secondary internal JSON representation
-#include <yyjson.h>            // Primary internal JSON representation
-#include <bson.h>              // Converting from/to BSON
-#include <mpack_header_only.h> // Converting from/to MsgPack
+#include <algorithm>    // `std::lower_bound`
+#include <charconv>     // `std::from_chars`
+#include <concepts>     // `std::invocable`
+#include <span>         // `std::span`
+#include <string_view>  // `std::string_view`
+#include <system_error> // `std::errc`
+#include <type_traits>  // `std::is_same_v`
+#include <utility>      // `std::exchange`
 
-#include "ustore/docs.h"              //
-#include "helpers/linked_memory.hpp"  // `linked_memory_lock_t`
-#include "helpers/linked_array.hpp"   // `growing_tape_t`
-#include "helpers/algorithm.hpp"      // `transform_n`
-#include "ustore/cpp/ranges_args.hpp" // `places_arg_t`
+#include <fmt/format.h> // `fmt::format_to_n`
+#include <yyjson.h>     // `yyjson_read_opts`, `yyjson_mut_doc`
 
-/*********************************************************/
-/*****************	 C++ Implementation	  ****************/
-/*********************************************************/
+#include <ustore/docs.h>          // `ustore_docs_write_t`, `ustore_docs_read_t`
+#include <ustore/ranges_args.hpp> // `places_arg_t`, `contents_arg_t`
 
-using namespace unum::ustore;
-using namespace unum;
+#include "helpers/algorithm.hpp"     // `offset_in_sorted`
+#include "helpers/linked_array.hpp"  // `growing_tape_t`, `uninitialized_array`
+#include "helpers/linked_memory.hpp" // `linked_memory_lock_t`
 
-namespace sj = simdjson;
+namespace unum::ustore {
 
-constexpr ustore_doc_field_type_t internal_format_k = ustore_doc_field_json_k;
+#pragma region Number Formatting
 
-static constexpr char const* null_k = "null";
+/** Longest text a printed number takes, including the null terminator. */
+constexpr std::size_t printed_number_length_limit_k = 32;
 
-static constexpr char const* true_k = "true";
-static constexpr char const* false_k = "false";
+/** Longest path @c ustore_docs_gist exports, including the null terminator. */
+constexpr std::size_t field_path_length_limit_k = 512;
 
-static constexpr const char* open_k = "{";
-static constexpr const char* close_k = "}";
+using printed_number_buffer_t = char[printed_number_length_limit_k];
+using field_path_buffer_t = char[field_path_length_limit_k];
 
-static constexpr const char* open_arr_k = "[";
-static constexpr const char* close_arr_k = "]";
+constexpr std::string_view true_k = "true";
+constexpr std::string_view false_k = "false";
 
-static constexpr const char* separator_k = ",";
+/** Parses the whole of @p text as a number or a boolean, answering whether every character was consumed. */
+template <typename scalar_>
+static bool parse_entire_number(std::string_view text, scalar_& scalar) noexcept {
+    if constexpr (std::is_same_v<scalar_, bool>) {
+        if (text != true_k && text != false_k) return false;
+        scalar = text == true_k;
+        return true;
+    }
+    else {
+        auto const [end, error] = std::from_chars(text.data(), text.data() + text.size(), scalar);
+        return error == std::errc() && end == text.data() + text.size();
+    }
+}
 
-enum class doc_modification_t {
+/** Prints @p scalar between @p begin and @p end with a null terminator, or an empty view when it does not fit. */
+template <typename scalar_>
+static std::string_view print_number(char* begin, char* end, scalar_ scalar) noexcept {
+    std::size_t const capacity = static_cast<std::size_t>(end - begin);
+    auto const [written_end, written_size] = fmt::format_to_n(begin, capacity - 1, "{}", scalar);
+    if (written_size >= capacity) return {};
+    *written_end = '\0';
+    return {begin, written_size};
+}
+
+#pragma endregion Number Formatting
+
+#pragma region JSON Handles
+
+/** Document parsed from the request arena, which owns all of its memory. */
+struct json_t {
+
+    /** Document as read, or @c nullptr. */
+    yyjson_doc* handle = nullptr;
+
+    /** Mutable copy of the document, or @c nullptr until a modification needs one. */
+    yyjson_mut_doc* mutable_handle = nullptr;
+
+    explicit operator bool() const noexcept { return handle || mutable_handle; }
+};
+
+/** Value inside a parsed or a mutable document. */
+struct json_value_t {
+
+    /** Value inside a parsed document, or @c nullptr. */
+    yyjson_val* handle = nullptr;
+
+    /** Value inside a mutable document, or @c nullptr. */
+    yyjson_mut_val* mutable_handle = nullptr;
+
+    explicit operator bool() const noexcept { return handle || mutable_handle; }
+};
+
+static void* arena_allocate(void* context, std::size_t size) noexcept {
+    ustore_error_t error {};
+    linked_memory_lock_t& arena = *static_cast<linked_memory_lock_t*>(context);
+    return arena.alloc<byte_t>(size, &error, alignof(std::max_align_t)).data();
+}
+
+static void* arena_reallocate(void* context, void* pointer, std::size_t old_size, std::size_t size) noexcept {
+    if (size <= old_size) return pointer;
+    ustore_error_t error {};
+    linked_memory_lock_t& arena = *static_cast<linked_memory_lock_t*>(context);
+    std::span<byte_t> const old_bytes {static_cast<byte_t*>(pointer), old_size};
+    return arena.grow<byte_t>(old_bytes, size - old_size, &error, alignof(std::max_align_t)).data();
+}
+
+/** Arena memory is released with the arena, never one allocation at a time. */
+static void arena_free(void*, void*) noexcept {}
+
+static yyjson_alc arena_allocator(linked_memory_lock_t& arena) noexcept {
+    return {arena_allocate, arena_reallocate, arena_free, &arena};
+}
+
+/** Finds @p field in @p json, as a JSON Pointer when it starts with a slash and as a top-level key otherwise. */
+static yyjson_val* json_lookup(yyjson_val* json, ustore_str_view_t field) noexcept {
+    if (!field) return json;
+    return field[0] == '/' ? yyjson_ptr_get(json, field) : yyjson_obj_get(json, field);
+}
+
+/** Spells @p field as a JSON Pointer, escaping a top-level key into the arena. */
+static std::string_view field_pointer(ustore_str_view_t field, linked_memory_lock_t& arena,
+                                      ustore_error_t* error) noexcept {
+    std::string_view const key {field};
+    if (key.starts_with('/')) return key;
+
+    std::size_t escapes = 0;
+    for (char const character : key) escapes += character == '~' || character == '/';
+
+    auto pointer = arena.alloc<char>(key.size() + escapes + 1, error);
+    if (error->status) return {};
+
+    std::size_t length = 0;
+    pointer[length++] = '/';
+    for (char const character : key) {
+        if (character == '~' || character == '/') {
+            pointer[length++] = '~';
+            pointer[length++] = character == '~' ? '0' : '1';
+        }
+        else pointer[length++] = character;
+    }
+    return {pointer.data(), length};
+}
+
+/** Parses a JSON document, leaving the result empty for an empty or a missing value. */
+static json_t json_parse(value_view_t bytes, linked_memory_lock_t& arena, ustore_error_t* error) noexcept {
+    json_t document;
+    if (bytes.empty()) return document;
+
+    yyjson_alc const allocator = arena_allocator(arena);
+    yyjson_read_flag const flags = YYJSON_READ_ALLOW_COMMENTS | YYJSON_READ_ALLOW_INF_AND_NAN;
+    // yyjson writes into its input only with `YYJSON_READ_INSITU`, which is never set.
+    char* const text = const_cast<char*>(bytes.c_str());
+    document.handle = yyjson_read_opts(text, bytes.size(), flags, &allocator, nullptr);
+    if (!document.handle) *error = {ustore_error_malformed_k, "Failed to parse the document"};
+    return document;
+}
+
+/** Makes @p document mutable, copying what was parsed or starting an empty document. */
+static yyjson_mut_doc* json_mutable(json_t& document, linked_memory_lock_t& arena, ustore_error_t* error) noexcept {
+    if (document.mutable_handle) return document.mutable_handle;
+
+    yyjson_alc const allocator = arena_allocator(arena);
+    document.mutable_handle = document.handle //
+                                  ? yyjson_doc_mut_copy(document.handle, &allocator)
+                                  : yyjson_mut_doc_new(&allocator);
+    if (!document.mutable_handle) *error = {ustore_error_out_of_memory_k, "Failed to allocate a mutable document"};
+    return document.mutable_handle;
+}
+
+/** Appends @p value to @p output as null-terminated JSON text, or appends a missing value when there is none. */
+static void json_dump(json_value_t value, linked_memory_lock_t& arena, growing_tape_t& output,
+                      ustore_error_t* error) noexcept {
+    if (!value) {
+        output.push_back(value_view_t {}, error);
+        return;
+    }
+
+    yyjson_alc const allocator = arena_allocator(arena);
+    yyjson_write_flag const flags = YYJSON_WRITE_ALLOW_INF_AND_NAN;
+    std::size_t length = 0;
+    char const* const text = value.mutable_handle
+                                 ? yyjson_mut_val_write_opts(value.mutable_handle, flags, &allocator, &length, nullptr)
+                                 : yyjson_val_write_opts(value.handle, flags, &allocator, &length, nullptr);
+    if (!text) {
+        *error = {ustore_error_out_of_memory_k, "Failed to serialize the document"};
+        return;
+    }
+    output.push_back(value_view_t {text, length}, error);
+    if (error->status) return;
+    output.add_terminator(byte_t {0}, error);
+}
+
+#pragma endregion JSON Handles
+
+#pragma region Conversions
+
+/** How faithfully a value under a field converts into the requested type. */
+enum class conversion_t {
+    missing_k,
+    exact_k,
+    converted_k,
+    collides_k,
+};
+
+/** Records @p conversion of one cell, setting the validity bit last since the other bitmaps may alias it. */
+static void record_conversion(conversion_t conversion, ustore_octet_t mask, ustore_octet_t& valid,
+                              ustore_octet_t& converted, ustore_octet_t& collides) noexcept {
+    ustore_octet_t const cleared = static_cast<ustore_octet_t>(~mask);
+    bool const is_valid = conversion == conversion_t::exact_k || conversion == conversion_t::converted_k;
+    converted = static_cast<ustore_octet_t>((converted & cleared) |
+                                            (conversion == conversion_t::converted_k ? mask : 0));
+    collides = static_cast<ustore_octet_t>((collides & cleared) | (conversion == conversion_t::collides_k ? mask : 0));
+    valid = static_cast<ustore_octet_t>((valid & cleared) | (is_valid ? mask : 0));
+}
+
+/** Converts @p value into @p scalar. */
+template <typename scalar_>
+static conversion_t json_to_scalar(yyjson_val* value, scalar_& scalar) noexcept {
+    if (!value) return conversion_t::missing_k;
+
+    switch (yyjson_get_type(value)) {
+    case YYJSON_TYPE_NULL: return conversion_t::missing_k;
+
+    case YYJSON_TYPE_BOOL:
+        scalar = static_cast<scalar_>(yyjson_get_bool(value));
+        return std::is_same_v<scalar_, bool> ? conversion_t::exact_k : conversion_t::converted_k;
+
+    case YYJSON_TYPE_STR: {
+        std::string_view const text {yyjson_get_str(value), yyjson_get_len(value)};
+        return parse_entire_number(text, scalar) ? conversion_t::converted_k : conversion_t::collides_k;
+    }
+
+    case YYJSON_TYPE_NUM:
+        switch (yyjson_get_subtype(value)) {
+        case YYJSON_SUBTYPE_REAL:
+            scalar = static_cast<scalar_>(yyjson_get_real(value));
+            return std::is_floating_point_v<scalar_> ? conversion_t::exact_k : conversion_t::converted_k;
+        case YYJSON_SUBTYPE_SINT:
+            scalar = static_cast<scalar_>(yyjson_get_sint(value));
+            return std::is_integral_v<scalar_> && std::is_signed_v<scalar_> ? conversion_t::exact_k
+                                                                            : conversion_t::converted_k;
+        case YYJSON_SUBTYPE_UINT:
+            scalar = static_cast<scalar_>(yyjson_get_uint(value));
+            return std::is_unsigned_v<scalar_> && !std::is_same_v<scalar_, bool> ? conversion_t::exact_k
+                                                                                 : conversion_t::converted_k;
+        default: return conversion_t::collides_k;
+        }
+
+    default: return conversion_t::collides_k;
+    }
+}
+
+/** Converts @p value into @p text, printing numbers into @p print_buffer. */
+static conversion_t json_to_string(yyjson_val* value, printed_number_buffer_t& print_buffer,
+                                   std::string_view& text) noexcept {
+    if (!value) return conversion_t::missing_k;
+
+    char* const buffer_end = print_buffer + printed_number_length_limit_k;
+    switch (yyjson_get_type(value)) {
+    case YYJSON_TYPE_NULL: return conversion_t::missing_k;
+
+    case YYJSON_TYPE_BOOL: text = yyjson_get_bool(value) ? true_k : false_k; return conversion_t::converted_k;
+
+    case YYJSON_TYPE_STR: text = {yyjson_get_str(value), yyjson_get_len(value)}; return conversion_t::exact_k;
+
+    case YYJSON_TYPE_NUM:
+        switch (yyjson_get_subtype(value)) {
+        case YYJSON_SUBTYPE_REAL: text = print_number(print_buffer, buffer_end, yyjson_get_real(value)); break;
+        case YYJSON_SUBTYPE_SINT: text = print_number(print_buffer, buffer_end, yyjson_get_sint(value)); break;
+        case YYJSON_SUBTYPE_UINT: text = print_number(print_buffer, buffer_end, yyjson_get_uint(value)); break;
+        default: return conversion_t::collides_k;
+        }
+        return text.empty() ? conversion_t::collides_k : conversion_t::converted_k;
+
+    default: return conversion_t::collides_k;
+    }
+}
+
+/** Wraps the fixed-width scalar stored in @p bytes into a mutable value, or returns @c nullptr for too few bytes. */
+template <typename scalar_>
+static yyjson_mut_val* mutable_scalar(yyjson_mut_doc* document, value_view_t bytes) noexcept {
+    if (bytes.size() < sizeof(scalar_)) return nullptr;
+    scalar_ scalar {};
+    std::memcpy(&scalar, bytes.data(), sizeof(scalar_));
+
+    if constexpr (std::is_same_v<scalar_, bool>) return yyjson_mut_bool(document, scalar);
+    else if constexpr (std::is_floating_point_v<scalar_>) return yyjson_mut_real(document, scalar);
+    else if constexpr (std::is_signed_v<scalar_>) return yyjson_mut_sint(document, scalar);
+    else return yyjson_mut_uint(document, scalar);
+}
+
+/** Parses @p bytes of @p type into a document, wrapping a scalar into a document of its own. */
+static json_t any_parse(value_view_t bytes, ustore_doc_field_type_t type, linked_memory_lock_t& arena,
+                        ustore_error_t* error) noexcept {
+    if (type == ustore_doc_field_json_k) return json_parse(bytes, arena, error);
+
+    json_t document;
+    yyjson_alc const allocator = arena_allocator(arena);
+    document.mutable_handle = yyjson_mut_doc_new(&allocator);
+    if (!document.mutable_handle) {
+        *error = {ustore_error_out_of_memory_k, "Failed to allocate a mutable document"};
+        return document;
+    }
+
+    yyjson_mut_doc* const handle = document.mutable_handle;
+    yyjson_mut_val* root = nullptr;
+    switch (type) {
+    case ustore_doc_field_null_k: root = yyjson_mut_null(handle); break;
+    case ustore_doc_field_bool_k: root = mutable_scalar<bool>(handle, bytes); break;
+    case ustore_doc_field_f64_k: root = mutable_scalar<double>(handle, bytes); break;
+    case ustore_doc_field_f32_k: root = mutable_scalar<float>(handle, bytes); break;
+    case ustore_doc_field_i64_k: root = mutable_scalar<std::int64_t>(handle, bytes); break;
+    case ustore_doc_field_i32_k: root = mutable_scalar<std::int32_t>(handle, bytes); break;
+    case ustore_doc_field_i16_k: root = mutable_scalar<std::int16_t>(handle, bytes); break;
+    case ustore_doc_field_i8_k: root = mutable_scalar<std::int8_t>(handle, bytes); break;
+    case ustore_doc_field_u64_k: root = mutable_scalar<std::uint64_t>(handle, bytes); break;
+    case ustore_doc_field_u32_k: root = mutable_scalar<std::uint32_t>(handle, bytes); break;
+    case ustore_doc_field_u16_k: root = mutable_scalar<std::uint16_t>(handle, bytes); break;
+    case ustore_doc_field_u8_k: root = mutable_scalar<std::uint8_t>(handle, bytes); break;
+    case ustore_doc_field_str_k: root = yyjson_mut_strncpy(handle, bytes.c_str(), bytes.size()); break;
+    default: break;
+    }
+
+    if (!root) *error = {ustore_error_unsupported_k, "Input type is not supported"};
+    yyjson_mut_doc_set_root(handle, root);
+    return document;
+}
+
+#pragma endregion Conversions
+
+#pragma region Modifications
+
+/** Modifications a request applies, extending @c ustore_doc_modification_t with reads and removals. */
+enum class modification_t {
     nothing_k = -1,
     remove_k = -2,
     upsert_k = ustore_doc_modify_upsert_k,
@@ -57,2139 +350,743 @@ enum class doc_modification_t {
     merge_k = ustore_doc_modify_merge_k,
 };
 
-/// The length of buffer to be used to convert/format/print numerical values into strings.
-constexpr std::size_t printed_number_length_limit_k = 32;
-constexpr std::size_t field_path_len_limit_k = 512;
+/** Adds @p value at the non-empty @p path of @p root, replacing an object member and inserting into an array. */
+static bool patch_add(yyjson_mut_doc* document, yyjson_mut_val* root, std::string_view path,
+                      yyjson_mut_val* value) noexcept {
+    std::size_t const parent_length = path.rfind('/');
+    if (parent_length == std::string_view::npos) return false;
+    yyjson_mut_val const* const parent = parent_length
+                                             ? yyjson_mut_ptr_getx(root, path.data(), parent_length, nullptr, nullptr)
+                                             : root;
+    if (yyjson_mut_is_obj(parent))
+        return yyjson_mut_ptr_setx(root, path.data(), path.size(), value, document, false, nullptr, nullptr);
+    return yyjson_mut_ptr_addx(root, path.data(), path.size(), value, document, false, nullptr, nullptr);
+}
 
-using printed_number_buffer_t = char[printed_number_length_limit_k];
-using field_path_buffer_t = char[field_path_len_limit_k];
+/** Applies the RFC 6902 @p patch to @p root in place, answering the patched root or @c nullptr on failure. */
+static yyjson_mut_val* patch_value(yyjson_mut_doc* document, yyjson_mut_val* root, yyjson_mut_val* patch) noexcept {
+    if (!root || !yyjson_mut_is_arr(patch)) return nullptr;
 
-/*********************************************************/
-/*****************	 STL Compatibility	  ****************/
-/*********************************************************/
+    yyjson_mut_arr_iter iterator;
+    yyjson_mut_arr_iter_init(patch, &iterator);
+    while (yyjson_mut_val* const operation = yyjson_mut_arr_iter_next(&iterator)) {
+        yyjson_mut_val* const name_value = yyjson_mut_obj_get(operation, "op");
+        yyjson_mut_val* const path_value = yyjson_mut_obj_get(operation, "path");
+        if (!yyjson_mut_is_str(name_value) || !yyjson_mut_is_str(path_value)) return nullptr;
+        std::string_view const name {yyjson_mut_get_str(name_value), yyjson_mut_get_len(name_value)};
+        std::string_view const path {yyjson_mut_get_str(path_value), yyjson_mut_get_len(path_value)};
+        yyjson_mut_val* const value = yyjson_mut_obj_get(operation, "value");
+        yyjson_mut_val* const from_value = yyjson_mut_obj_get(operation, "from");
+        std::string_view const from = yyjson_mut_is_str(from_value) ? std::string_view {yyjson_mut_get_str(from_value),
+                                                                                        yyjson_mut_get_len(from_value)}
+                                                                    : std::string_view {};
 
-/**
- * @brief Parses `float`, `double`, `bool` or any integral type from string.
- * @return true If not the entire string was recognized as a number.
- */
-template <typename at>
-bool parse_entire_number(char const* begin, char const* end, at& result) {
-    // Floats:
-    if constexpr (std::is_same_v<at, float>) {
-        char* number_end = nullptr;
-        result = std::strtof(begin, &number_end);
-        return end == number_end;
-    }
-    // Doubles:
-    else if constexpr (std::is_same_v<at, double>) {
-        char* number_end = nullptr;
-        result = std::strtod(begin, &number_end);
-        return end == number_end;
-    }
-    // Booleans:
-    else if constexpr (std::is_same_v<at, bool>) {
-        bool is_true = (end - begin) == 4 && std::equal(begin, end, true_k);
-        bool is_false = (end - begin) == 5 && std::equal(begin, end, false_k);
-        if (is_true | is_false) {
-            result = is_true;
-            return true;
+        if (name == "test") {
+            yyjson_mut_val const* const target =
+                path.empty() ? root : yyjson_mut_ptr_getx(root, path.data(), path.size(), nullptr, nullptr);
+            if (!value || !target || !yyjson_mut_equals(value, target)) return nullptr;
+            continue;
         }
-        else
-            return false;
-    }
-    // Integers:
-    else {
-        return std::from_chars(begin, end, result).ptr == end;
-    }
-}
-
-/**
- * @brief Prints a number into a string buffer. Terminates with zero character.
- * @return The string-vew until the termination character. Empty string on failure.
- */
-template <typename at>
-std::string_view print_number(char* begin, char* end, at scalar) {
-    if constexpr (std::is_floating_point_v<at>) {
-        // Parsing and dumping floating-point numbers is still not fully implemented in STL:
-        //  std::to_chars_result result = std::to_chars(&print_buffer[0], print_buffer + printed_number_length_limit_k,
-        //  scalar); bool fits_terminator = result.ec != std::errc() && result.ptr < print_buffer +
-        //  printed_number_length_limit_k;
-        // Using FMT would cause an extra dependency:
-        //  auto end_ptr = fmt::format_to(print_buffer, "{}", scalar);
-        //  bool fits_terminator = end_ptr < print_buffer + printed_number_length_limit_k;
-        // If we use `std::snprintf`, the result will @b already be NULL-terminated:
-        auto result = std::snprintf(begin, end - begin, "%f", scalar);
-        return result > 0 //
-                   ? std::string_view {begin, static_cast<std::size_t>(result - 1)}
-                   : std::string_view {};
-    }
-    else {
-        // `std::to_chars` won't NULL-terminate the string, but we should.
-        auto result = std::to_chars(begin, end, scalar);
-        if (result.ec != std::errc() || result.ptr == end)
-            return {};
-
-        *result.ptr = '\0';
-        return {begin, static_cast<std::size_t>(result.ptr - begin)};
-    }
-}
-
-/*********************************************************/
-/*****************	 Working with JSONs	  ****************/
-/*********************************************************/
-
-struct json_t {
-    yyjson_doc* handle = nullptr;
-    yyjson_mut_doc* mut_handle = nullptr;
-
-    ~json_t() noexcept {
-        if (mut_handle)
-            yyjson_mut_doc_free(mut_handle);
-        if (handle)
-            yyjson_doc_free(handle);
-    }
-
-    json_t() = default;
-    json_t(json_t const&) = delete;
-    json_t& operator=(json_t const&) = delete;
-
-    json_t(json_t&& other) noexcept
-        : handle(std::exchange(other.handle, nullptr)), mut_handle(std::exchange(other.mut_handle, nullptr)) {}
-    json_t& operator=(json_t&& other) noexcept {
-        std::swap(handle, other.handle);
-        std::swap(mut_handle, other.mut_handle);
-        return *this;
-    }
-
-    explicit operator bool() const noexcept { return handle || mut_handle; }
-};
-
-struct json_branch_t {
-    yyjson_val* handle = nullptr;
-    yyjson_mut_val* mut_handle = nullptr;
-
-    explicit operator bool() const noexcept { return handle || mut_handle; }
-    yyjson_val* punned() const noexcept { return mut_handle ? (yyjson_val*)(mut_handle) : handle; }
-};
-
-static void* json_yy_malloc(void* ctx, size_t length) noexcept {
-    ustore_error_t error = nullptr;
-    linked_memory_lock_t& arena = *reinterpret_cast<linked_memory_lock_t*>(ctx);
-    auto result = arena.alloc<byte_t>(length + sizeof(length), &error).begin();
-    if (!result)
-        return result;
-    std::memcpy(result, &length, sizeof(length));
-    return result + sizeof(length);
-}
-
-static void* json_yy_realloc(void* ctx, void* ptr, size_t length) noexcept {
-    ustore_error_t error = nullptr;
-    linked_memory_lock_t& arena = *reinterpret_cast<linked_memory_lock_t*>(ctx);
-    auto bytes = reinterpret_cast<byte_t*>(ptr) - sizeof(length);
-    auto old_length = *reinterpret_cast<size_t*>(bytes);
-    auto old_size = old_length + sizeof(length);
-    auto new_size = length + sizeof(length);
-    auto result = arena.grow<byte_t>({bytes, old_size}, new_size - old_size, &error).begin();
-    if (!result)
-        return result;
-    std::memcpy(result, &length, sizeof(length));
-    return result + sizeof(length);
-}
-
-static void json_yy_free(void*, void* ptr) noexcept {
-}
-
-yyjson_alc wrap_allocator(linked_memory_lock_t& arena) {
-    yyjson_alc allocator;
-    allocator.malloc = json_yy_malloc;
-    allocator.realloc = json_yy_realloc;
-    allocator.free = json_yy_free;
-    allocator.ctx = &arena;
-    return allocator;
-}
-
-auto simdjson_lookup(sj::ondemand::value& json, ustore_str_view_t field) noexcept {
-    return !field ? json : field[0] == '/' ? json.at_pointer(field) : json[field];
-}
-
-yyjson_val* json_lookup(yyjson_val* json, ustore_str_view_t field) noexcept {
-    return !field ? json : field[0] == '/' ? yyjson_get_pointer(json, field) : yyjson_obj_get(json, field);
-}
-
-yyjson_val* json_lookupn(yyjson_val* json, ustore_str_view_t field, size_t len) noexcept {
-    return !field ? json : field[0] == '/' ? yyjson_get_pointern(json, field, len) : yyjson_obj_getn(json, field, len);
-}
-
-yyjson_mut_val* json_lookup(yyjson_mut_val* json, ustore_str_view_t field) noexcept {
-    return !field ? json : field[0] == '/' ? yyjson_mut_get_pointer(json, field) : yyjson_mut_obj_get(json, field);
-}
-
-yyjson_mut_val* json_lookupn(yyjson_mut_val* json, ustore_str_view_t field, size_t len) noexcept {
-    return !field            ? json
-           : field[0] == '/' ? yyjson_mut_get_pointern(json, field, len)
-                             : yyjson_mut_obj_getn(json, field, len);
-}
-
-simdjson::ondemand::object& reset(simdjson::ondemand::object& doc) noexcept {
-    doc.reset();
-    return doc;
-}
-
-json_t json_parse(value_view_t bytes, linked_memory_lock_t& arena, ustore_error_t* c_error) noexcept {
-
-    if (bytes.empty())
-        return {};
-
-    json_t result;
-    yyjson_alc allocator = wrap_allocator(arena);
-    yyjson_read_flag flg = YYJSON_READ_ALLOW_COMMENTS | YYJSON_READ_ALLOW_INF_AND_NAN;
-    result.handle = yyjson_read_opts((char*)bytes.data(), (size_t)bytes.size(), flg, &allocator, NULL);
-    log_error_if_m(result.handle, c_error, 0, "Failed to parse document!");
-    result.mut_handle = yyjson_doc_mut_copy(result.handle, &allocator);
-    return result;
-}
-
-value_view_t json_dump(json_branch_t json,
-                       linked_memory_lock_t& arena,
-                       growing_tape_t& output,
-                       ustore_error_t* c_error) noexcept {
-
-    if (!json)
-        return output.push_back(value_view_t {}, c_error);
-
-    size_t result_length = 0;
-    yyjson_write_flag flg = 0;
-    yyjson_alc allocator = wrap_allocator(arena);
-    char* result_begin = json.mut_handle
-                             ? yyjson_mut_val_write_opts(json.mut_handle, flg, &allocator, &result_length, NULL)
-                             : yyjson_val_write_opts(json.handle, flg, &allocator, &result_length, NULL);
-    log_error_if_m(result_begin, c_error, 0, "Failed to serialize the document!");
-    auto result = value_view_t {reinterpret_cast<byte_t const*>(result_begin), result_length};
-    result = output.push_back(result, c_error);
-    output.add_terminator(byte_t {0}, c_error);
-    return result;
-}
-
-template <typename scalar_at>
-void json_to_scalar(yyjson_val* value,
-                    ustore_octet_t mask,
-                    ustore_octet_t& valid,
-                    ustore_octet_t& convert,
-                    ustore_octet_t& collide,
-                    scalar_at& scalar) noexcept {
-
-    yyjson_type const type = yyjson_get_type(value);
-    yyjson_subtype const subtype = yyjson_get_subtype(value);
-
-    switch (type) {
-    case YYJSON_TYPE_NULL:
-        convert &= ~mask;
-        collide &= ~mask;
-        valid &= ~mask;
-        break;
-    case YYJSON_TYPE_NONE:
-    case YYJSON_TYPE_OBJ:
-    case YYJSON_TYPE_ARR:
-        convert &= ~mask;
-        collide |= mask;
-        valid &= ~mask;
-        break;
-
-    case YYJSON_TYPE_BOOL:
-        scalar = yyjson_is_true(value);
-        if constexpr (std::is_same_v<scalar_at, bool>)
-            convert &= ~mask;
-        else
-            convert |= mask;
-        collide &= ~mask;
-        valid |= mask;
-        break;
-
-    case YYJSON_TYPE_STR: {
-        char const* str_begin = yyjson_get_str(value);
-        size_t str_len = yyjson_get_len(value);
-        if (parse_entire_number(str_begin, str_begin + str_len, scalar)) {
-            convert |= mask;
-            collide &= ~mask;
-            valid |= mask;
+        if (name == "remove") {
+            if (path.empty() || !yyjson_mut_ptr_removex(root, path.data(), path.size(), nullptr, nullptr))
+                return nullptr;
+            continue;
         }
-        else {
-            convert &= ~mask;
-            collide |= mask;
-            valid &= ~mask;
+
+        // Every other operation places one value at `path`
+        yyjson_mut_val* placed = nullptr;
+        if (name == "add" || name == "replace") placed = value ? yyjson_mut_val_mut_copy(document, value) : nullptr;
+        else if (name == "copy" && from_value) {
+            yyjson_mut_val const* const source =
+                from.empty() ? root : yyjson_mut_ptr_getx(root, from.data(), from.size(), nullptr, nullptr);
+            placed = source ? yyjson_mut_val_mut_copy(document, source) : nullptr;
         }
-        break;
-    }
-
-    case YYJSON_TYPE_NUM: {
-
-        switch (subtype) {
-        case YYJSON_SUBTYPE_UINT:
-            scalar = static_cast<scalar_at>(yyjson_get_uint(value));
-            if constexpr (std::is_unsigned_v<scalar_at>)
-                convert &= ~mask;
-            else
-                convert |= mask;
-            collide &= ~mask;
-            valid |= mask;
-            break;
-
-        case YYJSON_SUBTYPE_SINT:
-            scalar = static_cast<scalar_at>(yyjson_get_sint(value));
-            if constexpr (std::is_integral_v<scalar_at> && std::is_signed_v<scalar_at>)
-                convert &= ~mask;
-            else
-                convert |= mask;
-            collide &= ~mask;
-            valid |= mask;
-            break;
-
-        case YYJSON_SUBTYPE_REAL:
-            scalar = static_cast<scalar_at>(yyjson_get_real(value));
-            if constexpr (std::is_floating_point_v<scalar_at>)
-                convert &= ~mask;
-            else
-                convert |= mask;
-            collide &= ~mask;
-            valid |= mask;
-            break;
+        else if (name == "move" && from_value) {
+            if (from == path) continue;
+            placed = from.empty() ? nullptr : yyjson_mut_ptr_removex(root, from.data(), from.size(), nullptr, nullptr);
         }
+        if (!placed) return nullptr;
+
+        if (path.empty()) root = placed;
+        else if (name == "replace") {
+            if (!yyjson_mut_ptr_replacex(root, path.data(), path.size(), placed, nullptr, nullptr)) return nullptr;
+        }
+        else if (!patch_add(document, root, path, placed)) return nullptr;
     }
-    }
+    return root;
 }
 
-std::string_view json_to_string(yyjson_val* value,
-                                ustore_octet_t mask,
-                                ustore_octet_t& valid,
-                                ustore_octet_t& convert,
-                                ustore_octet_t& collide,
-                                printed_number_buffer_t& print_buffer) noexcept {
+/** Applies @p modifier to @p field of @p original, or to the whole document when @p field is @c nullptr. */
+static void modify(json_t& original, yyjson_mut_val* modifier, ustore_str_view_t field, modification_t modification,
+                   linked_memory_lock_t& arena, ustore_error_t* error) noexcept {
 
-    yyjson_type const type = yyjson_get_type(value);
-    yyjson_subtype const subtype = yyjson_get_subtype(value);
-    std::string_view result;
+    yyjson_mut_doc* const document = json_mutable(original, arena, error);
+    if (error->status) return;
 
-    switch (type) {
-    case YYJSON_TYPE_NULL:
-        convert &= ~mask;
-        collide &= ~mask;
-        valid &= ~mask;
-        break;
-    case YYJSON_TYPE_NONE:
-    case YYJSON_TYPE_OBJ:
-    case YYJSON_TYPE_ARR:
-        convert &= ~mask;
-        collide |= mask;
-        valid &= ~mask;
-        break;
-
-    case YYJSON_TYPE_BOOL: {
-        result = yyjson_is_true(value) ? std::string_view(true_k, 5) : std::string_view(false_k, 6);
-        convert |= mask;
-        collide &= ~mask;
-        valid |= mask;
-        break;
-    }
-
-    case YYJSON_TYPE_STR: {
-        char const* str_begin = yyjson_get_str(value);
-        size_t str_len = yyjson_get_len(value);
-
-        result = std::string_view(str_begin, str_len);
-        convert &= ~mask;
-        collide &= ~mask;
-        valid |= mask;
-        break;
-    }
-
-    case YYJSON_TYPE_NUM: {
-
-        switch (subtype) {
-        case YYJSON_SUBTYPE_UINT:
-            result = print_number(print_buffer, print_buffer + printed_number_length_limit_k, yyjson_get_uint(value));
-            convert |= mask;
-            collide = !result.empty() ? (collide & ~mask) : (collide | mask);
-            valid = result.empty() ? (valid & ~mask) : (valid | mask);
-            break;
-
-        case YYJSON_SUBTYPE_SINT:
-            result = print_number(print_buffer, print_buffer + printed_number_length_limit_k, yyjson_get_sint(value));
-            convert |= mask;
-            collide = !result.empty() ? (collide & ~mask) : (collide | mask);
-            valid = result.empty() ? (valid & ~mask) : (valid | mask);
-            break;
-
-        case YYJSON_SUBTYPE_REAL:
-            result = print_number(print_buffer, print_buffer + printed_number_length_limit_k, yyjson_get_real(value));
-            convert |= mask;
-            collide = !result.empty() ? (collide & ~mask) : (collide | mask);
-            valid = result.empty() ? (valid & ~mask) : (valid | mask);
-            break;
+    if (!field) {
+        yyjson_mut_val* const root = yyjson_mut_doc_get_root(document);
+        yyjson_mut_val* modified = nullptr;
+        switch (modification) {
+        case modification_t::merge_k: modified = yyjson_mut_merge_patch(document, root, modifier); break;
+        case modification_t::patch_k: modified = patch_value(document, root, modifier); break;
+        case modification_t::upsert_k:
+        case modification_t::update_k:
+        case modification_t::insert_k: modified = yyjson_mut_val_mut_copy(document, modifier); break;
         default: break;
         }
-    }
-    default: break;
+        if (!modified) {
+            *error = {ustore_error_out_of_memory_k, "Failed to modify the document"};
+            return;
+        }
+        yyjson_mut_doc_set_root(document, modified);
+        return;
     }
 
-    return result;
+    std::string_view const pointer = field_pointer(field, arena, error);
+    if (error->status) return;
+
+    yyjson_mut_val* replacement = nullptr;
+    switch (modification) {
+    case modification_t::remove_k: break;
+    case modification_t::merge_k: {
+        yyjson_mut_val* const existing = yyjson_mut_doc_ptr_getn(document, pointer.data(), pointer.size());
+        replacement = yyjson_mut_merge_patch(document, existing, modifier);
+        break;
+    }
+    case modification_t::patch_k: {
+        yyjson_mut_val* const existing = yyjson_mut_doc_ptr_getn(document, pointer.data(), pointer.size());
+        replacement = patch_value(document, yyjson_mut_val_mut_copy(document, existing), modifier);
+        break;
+    }
+    default: replacement = yyjson_mut_val_mut_copy(document, modifier); break;
+    }
+    if (!replacement && modification != modification_t::remove_k) {
+        *error = {ustore_error_invalid_argument_k, "The modifier does not apply to the field"};
+        return;
+    }
+
+    bool succeeded = false;
+    switch (modification) {
+    case modification_t::insert_k:
+        succeeded = yyjson_mut_doc_ptr_addn(document, pointer.data(), pointer.size(), replacement);
+        break;
+    case modification_t::update_k:
+        succeeded = yyjson_mut_doc_ptr_replacen(document, pointer.data(), pointer.size(), replacement) != nullptr;
+        break;
+    case modification_t::remove_k:
+        succeeded = yyjson_mut_doc_ptr_removen(document, pointer.data(), pointer.size()) != nullptr;
+        break;
+    default: succeeded = yyjson_mut_doc_ptr_setn(document, pointer.data(), pointer.size(), replacement); break;
+    }
+    if (!succeeded) {
+        *error = {ustore_error_not_found_k, "The field path does not resolve inside the document"};
+        return;
+    }
 }
 
-template <typename value_at>
-std::string_view get_value( //
-    value_at& value,
-    ustore_doc_field_type_t field_type,
-    printed_number_buffer_t& print_buffer) noexcept {
+#pragma endregion Modifications
 
-    std::string_view result;
+#pragma region Reading Documents
 
-    if (field_type == ustore_doc_field_json_k) {
-        if (value.type().value() == sj::ondemand::json_type::object)
-            result = value.get_object().value().raw_json();
-        else if (value.type().value() == sj::ondemand::json_type::array)
-            result = value.get_array().value().raw_json();
-        else
-            result = value.raw_json_token();
+/** Receives the index of a task, its field, and the binary document it addresses. */
+template <typename callback_>
+concept document_callback = std::invocable<callback_&, std::size_t, ustore_str_view_t, value_view_t>;
+
+/** Binary documents found by one read, indexed by task. */
+struct found_documents_t {
+
+    /** Offsets of the documents inside @c contents. */
+    ustore_length_t* offsets = nullptr;
+
+    /** Lengths of the documents, with @c ustore_length_missing_k for missing ones. */
+    ustore_length_t* lengths = nullptr;
+
+    /** Joined contents of the documents. */
+    ustore_byte_t* contents = nullptr;
+
+    value_view_t operator[](std::size_t index) const noexcept {
+        if (lengths[index] == ustore_length_missing_k) return value_view_t {};
+        return value_view_t {contents + offsets[index], lengths[index]};
     }
-    else if (field_type == ustore_doc_field_str_k) {
-        auto type = value.type().value();
-        switch (type) {
-        case sj::ondemand::json_type::null: break;
-        case sj::ondemand::json_type::object: {
-            result = value.get_object().value().raw_json();
-            break;
-        }
-        case sj::ondemand::json_type::array: {
-            result = value.get_object().value().raw_json();
-            break;
-        }
-        case sj::ondemand::json_type::boolean: {
-            result = value.get_bool() ? std::string_view(true_k, 5) : std::string_view(false_k, 6);
-            break;
-        }
-        case sj::ondemand::json_type::string: {
-            result = value.get_string();
-            break;
-        }
-        case sj::ondemand::json_type::number: {
-            auto number_type = value.get_number_type().value();
-            switch (number_type) {
-            case sj::ondemand::number_type::signed_integer: {
-                result =
-                    print_number(print_buffer, print_buffer + printed_number_length_limit_k, value.get_int64().value());
-                break;
-            }
-            case sj::ondemand::number_type::unsigned_integer: {
-                result = print_number(print_buffer,
-                                      print_buffer + printed_number_length_limit_k,
-                                      value.get_uint64().value());
-                break;
-            }
-            default: break;
-            }
-        }
-        default: break;
-        }
-    }
-
-    return result;
-}
-
-/*********************************************************/
-/*****************	 Format Conversions	  ****************/
-/*********************************************************/
-
-using string_t = uninitialized_array_gt<char>;
-struct json_state_t {
-    string_t& json_str;
-    ustore_error_t* c_error;
-
-    uint32_t count;
-    bool keys;
-    ssize_t error_offset;
 };
 
-template <std::size_t count_ak>
-void to_json_string(string_t& json_str, char (&str)[count_ak], ustore_error_t* c_error) {
-    json_str.insert(json_str.size(), str, str + count_ak, c_error);
-}
-
-void to_json_string(string_t& json_str, char const* str, size_t count, ustore_error_t* c_error) {
-    json_str.insert(json_str.size(), str, str + count, c_error);
-}
-
-void to_json_string(string_t& json_str, char const* str, ustore_error_t* c_error) {
-    json_str.insert(json_str.size(), str, str + std::strlen(str), c_error);
-}
-
-template <typename at>
-void to_json_number(string_t& json_str, at scalar, ustore_error_t* c_error) {
-    printed_number_buffer_t print_buffer;
-    auto result = print_number(print_buffer, print_buffer + printed_number_length_limit_k, scalar);
-    json_str.insert(json_str.size(), result.data(), result.data() + result.size(), c_error);
-}
-
-static bool bson_visit_array(bson_iter_t const*, char const*, bson_t const*, void*);
-static bool bson_visit_document(bson_iter_t const*, char const*, bson_t const*, void*);
-
-static bool bson_visit_before(bson_iter_t const*, char const* key, void* data) {
-    json_state_t& state = *reinterpret_cast<json_state_t*>(data);
-
-    if (state.count)
-        to_json_string(state.json_str, ", ", state.c_error);
-
-    if (state.keys) {
-        char* escaped = bson_utf8_escape_for_json(key, -1);
-        if (escaped) {
-            to_json_string(state.json_str, "\"", state.c_error);
-            to_json_string(state.json_str, escaped, state.c_error);
-            to_json_string(state.json_str, "\" : ", state.c_error);
-
-            bson_free(escaped);
-        }
-        else
-            return true;
-    }
-
-    state.count++;
-    return false;
-}
-static bool bson_visit_after(bson_iter_t const*, char const*, void*) {
-    return false;
-}
-static void bson_visit_corrupt(bson_iter_t const* iter, void* data) {
-    json_state_t& state = *reinterpret_cast<json_state_t*>(data);
-    state.error_offset = iter->off;
-}
-static bool bson_visit_double(bson_iter_t const*, char const*, double v_double, void* data) {
-    json_state_t& state = *reinterpret_cast<json_state_t*>(data);
-    if (v_double != v_double)
-        to_json_string(state.json_str, "NaN", state.c_error);
-    else if (v_double * 0 != 0)
-        to_json_string(state.json_str, v_double > 0 ? "Infinity" : "-Infinity", state.c_error);
-    else
-        to_json_number(state.json_str, v_double, state.c_error);
-
-    to_json_string(state.json_str, "\" }", state.c_error);
-
-    return false;
-}
-static bool bson_visit_utf8(bson_iter_t const*, char const*, size_t v_utf8_len, char const* v_utf8, void* data) {
-    json_state_t& state = *reinterpret_cast<json_state_t*>(data);
-    char* escaped = bson_utf8_escape_for_json(v_utf8, v_utf8_len); // TODO
-
-    if (escaped) {
-        to_json_string(state.json_str, "\"", state.c_error);
-        to_json_string(state.json_str, escaped, state.c_error);
-        to_json_string(state.json_str, "\"", state.c_error);
-        bson_free(escaped);
-        return false;
-    }
-
-    return true;
-}
-static bool bson_visit_binary(bson_iter_t const*,
-                              char const*,
-                              bson_subtype_t v_subtype,
-                              size_t v_binary_len,
-                              uint8_t const* v_binary,
-                              void* data) {
-    json_state_t& state = *reinterpret_cast<json_state_t*>(data);
-    char* b64 = (char*)(v_binary);
-
-    to_json_string(state.json_str, "{ \"$binary\" : { \"base64\" : \"", state.c_error);
-    to_json_string(state.json_str, b64, state.c_error);
-    to_json_string(state.json_str, "\", \"subType\" : \"", state.c_error);
-    to_json_number(state.json_str, static_cast<int>(v_subtype), state.c_error);
-    to_json_string(state.json_str, "\" } }", state.c_error);
-
-    return false;
-}
-static bool bson_visit_undefined(bson_iter_t const*, char const*, void* data) {
-    json_state_t& state = *reinterpret_cast<json_state_t*>(data);
-    to_json_string(state.json_str, "{ \"$undefined\" : true }", state.c_error);
-    return false;
-}
-static bool bson_visit_oid(bson_iter_t const*, char const*, const bson_oid_t*, void* data) {
-    json_state_t& state = *reinterpret_cast<json_state_t*>(data);
-    log_error_m(state.c_error, 0, "Unsupported type");
-    return false;
-}
-static bool bson_visit_bool(bson_iter_t const*, char const*, bool v_bool, void* data) {
-    json_state_t& state = *reinterpret_cast<json_state_t*>(data);
-    to_json_string(state.json_str, v_bool ? true_k : false_k, state.c_error);
-    return false;
-}
-static bool bson_visit_date_time(bson_iter_t const*, char const*, int64_t msec_since_epoch, void* data) {
-    json_state_t& state = *reinterpret_cast<json_state_t*>(data);
-    to_json_string(state.json_str, "{ \"$date\" : { \"$numberLong\" : \"", state.c_error);
-    to_json_number(state.json_str, msec_since_epoch, state.c_error);
-    to_json_string(state.json_str, "\" } }", state.c_error);
-    return false;
-}
-static bool bson_visit_null(bson_iter_t const*, char const*, void* data) {
-    json_state_t& state = *reinterpret_cast<json_state_t*>(data);
-    to_json_string(state.json_str, null_k, state.c_error);
-    return false;
-}
-static bool bson_visit_regex(bson_iter_t const*, char const*, char const*, char const*, void* data) {
-    json_state_t& state = *reinterpret_cast<json_state_t*>(data);
-    log_error_m(state.c_error, 0, "Unsupported type");
-    return false;
-}
-static bool bson_visit_dbpointer(bson_iter_t const*, char const*, size_t, char const*, bson_oid_t const*, void* data) {
-    json_state_t& state = *reinterpret_cast<json_state_t*>(data);
-    log_error_m(state.c_error, 0, "Unsupported type");
-    return false;
-}
-static bool bson_visit_code(bson_iter_t const*, char const*, size_t, char const*, void* data) {
-    json_state_t& state = *reinterpret_cast<json_state_t*>(data);
-    log_error_m(state.c_error, 0, "Unsupported type");
-    return false;
-}
-static bool bson_visit_symbol(bson_iter_t const*, char const*, size_t, char const*, void* data) {
-    json_state_t& state = *reinterpret_cast<json_state_t*>(data);
-    log_error_m(state.c_error, 0, "Unsupported type");
-    return false;
-}
-static bool bson_visit_codewscope(bson_iter_t const*, char const*, size_t, char const*, bson_t const*, void* data) {
-    json_state_t* state = reinterpret_cast<json_state_t*>(data);
-    log_error_m(state->c_error, 0, "Unsupported type");
-    return false;
-}
-static bool bson_visit_int32(bson_iter_t const*, char const*, int32_t v_int32, void* data) {
-    json_state_t& state = *reinterpret_cast<json_state_t*>(data);
-    to_json_number(state.json_str, v_int32, state.c_error);
-    return false;
-}
-static bool bson_visit_timestamp(
-    bson_iter_t const*, char const*, uint32_t v_timestamp, uint32_t v_increment, void* data) {
-    json_state_t& state = *reinterpret_cast<json_state_t*>(data);
-
-    to_json_string(state.json_str, "{ \"$timestamp\" : { \"t\" : ", state.c_error);
-    to_json_number(state.json_str, v_timestamp, state.c_error);
-    to_json_string(state.json_str, ", \"i\" : ", state.c_error);
-    to_json_number(state.json_str, v_increment, state.c_error);
-    to_json_string(state.json_str, " } }", state.c_error);
-
-    return false;
-}
-static bool bson_visit_int64(bson_iter_t const*, char const*, int64_t v_int64, void* data) {
-    json_state_t& state = *reinterpret_cast<json_state_t*>(data);
-    to_json_number(state.json_str, v_int64, state.c_error);
-    return false;
-}
-static bool bson_visit_maxkey(bson_iter_t const*, char const*, void* data) {
-    json_state_t& state = *reinterpret_cast<json_state_t*>(data);
-    to_json_string(state.json_str, "{ \"$maxKey\" : 1 }", state.c_error);
-    return false;
-}
-static bool bson_visit_minkey(bson_iter_t const*, char const*, void* data) {
-    json_state_t& state = *reinterpret_cast<json_state_t*>(data);
-    to_json_string(state.json_str, "{ \"$minKey\" : 1 }", state.c_error);
-    return false;
-}
-static void bson_visit_unsupported_type(bson_iter_t const* iter, char const*, uint32_t, void* data) {
-    json_state_t& state = *reinterpret_cast<json_state_t*>(data);
-    // state.error_offset = iter->off; //TODO
-    return_error_m(state.c_error, "BSON unsupported type");
-}
-static bool bson_visit_decimal128(bson_iter_t const*, char const*, bson_decimal128_t const*, void* data) {
-    json_state_t& state = *reinterpret_cast<json_state_t*>(data);
-    log_error_m(state.c_error, 0, "Unsupported type");
-    return false;
-}
-
-static bson_visitor_t const bson_visitor = {
-    bson_visit_before,   bson_visit_after,     bson_visit_corrupt,    bson_visit_double,    bson_visit_utf8,
-    bson_visit_document, bson_visit_array,     bson_visit_binary,     bson_visit_undefined, bson_visit_oid,
-    bson_visit_bool,     bson_visit_date_time, bson_visit_null,       bson_visit_regex,     bson_visit_dbpointer,
-    bson_visit_code,     bson_visit_symbol,    bson_visit_codewscope, bson_visit_int32,     bson_visit_timestamp,
-    bson_visit_int64,    bson_visit_maxkey,    bson_visit_minkey,
-};
-
-static bool bson_visit_array(bson_iter_t const*, char const*, bson_t const* v_array, void* data) {
-    json_state_t& state = *reinterpret_cast<json_state_t*>(data);
-    json_state_t child_state = {state.json_str, state.c_error, 0, true, state.error_offset};
-    bson_iter_t child;
-
-    if (bson_iter_init(&child, v_array)) {
-        to_json_string(child_state.json_str, open_arr_k, state.c_error);
-
-        if (bson_iter_visit_all(&child, &bson_visitor, &child_state))
-            log_error_m(state.c_error, 0, "Failed to iterate the BSON array!");
-
-        to_json_string(child_state.json_str, close_arr_k, state.c_error);
-    }
-    return false;
-}
-static bool bson_visit_document(bson_iter_t const*, char const*, bson_t const* v_document, void* data) {
-    json_state_t& state = *reinterpret_cast<json_state_t*>(data);
-    json_state_t child_state = {state.json_str, state.c_error, 0, true, state.error_offset};
-    bson_iter_t child;
-
-    if (bson_iter_init(&child, v_document)) {
-        to_json_string(child_state.json_str, open_k, state.c_error);
-
-        if (bson_iter_visit_all(&child, &bson_visitor, &child_state))
-            log_error_m(state.c_error, 0, "Failed to iterate the BSON document!");
-
-        to_json_string(child_state.json_str, close_k, state.c_error);
-    }
-    return false;
-}
-
-// MsgPack to Json
-void object_reading(mpack_reader_t& reader, string_t& builder, ustore_error_t* c_error) {
-    if (mpack_reader_error(&reader) != mpack_ok) // C++20: [[unlikely]]
-        return;
-
-    mpack_tag_t tag = mpack_read_tag(&reader);
-
-    switch (mpack_tag_type(&tag)) {
-    case mpack_type_nil: {
-        to_json_string(builder, null_k, c_error);
-        break;
-    }
-    case mpack_type_bool: {
-        bool v_bool = mpack_tag_bool_value(&tag);
-        to_json_string(builder, v_bool ? true_k : false_k, c_error);
-        break;
-    }
-    case mpack_type_int: {
-        to_json_number(builder, mpack_tag_int_value(&tag), c_error);
-        break;
-    }
-    case mpack_type_uint: {
-        to_json_number(builder, mpack_tag_uint_value(&tag), c_error);
-        break;
-    }
-    case mpack_type_float: {
-        to_json_number(builder, mpack_tag_float_value(&tag), c_error);
-        break;
-    }
-    case mpack_type_double: {
-        to_json_number(builder, mpack_tag_double_value(&tag), c_error);
-        break;
-    }
-    case mpack_type_str: {
-        size_t length = mpack_tag_str_length(&tag);
-        auto data = mpack_read_bytes_inplace(&reader, length);
-        to_json_string(builder, "\"", c_error);
-        to_json_string(builder, data, c_error);
-        to_json_string(builder, "\"", c_error);
-        mpack_done_str(&reader);
-        break;
-    }
-    case mpack_type_bin: {
-        size_t length = mpack_tag_bin_length(&tag);
-        auto data = mpack_read_bytes_inplace(&reader, length);
-        to_json_string(builder, data, c_error);
-        break;
-    }
-    case mpack_type_array: {
-        to_json_string(builder, open_arr_k, c_error);
-
-        uint32_t count = mpack_tag_array_count(&tag);
-        // Recursively call for kids.
-        for (uint32_t i = 0; i != count; ++i) {
-            object_reading(reader, builder, c_error);
-
-            if (mpack_reader_error(&reader) != mpack_ok) // critical check!
-                break;
-        }
-        mpack_done_array(&reader);
-
-        to_json_string(builder, close_arr_k, c_error);
-        break;
-    }
-    case mpack_type_map: {
-        to_json_string(builder, open_k, c_error);
-
-        uint32_t count = mpack_tag_map_count(&tag);
-        for (uint32_t i = 0; i != count; ++i) {
-            if (i != 0)
-                to_json_string(builder, ",", c_error);
-
-            mpack_tag_t tag = mpack_read_tag(&reader);
-            uint32_t length = mpack_tag_str_length(&tag);
-            const char* key = mpack_read_bytes_inplace(&reader, length);
-            // Write key into json string
-            to_json_string(builder, "\"", c_error);
-            to_json_string(builder, key, length, c_error);
-            to_json_string(builder, "\":", c_error);
-
-            object_reading(reader, builder, c_error);
-            if (mpack_reader_error(&reader) != mpack_ok) // critical check!
-                break;
-        }
-        mpack_done_map(&reader);
-
-        to_json_string(builder, close_k, c_error);
-        break;
-    }
-    default: mpack_reader_flag_error(&reader, mpack_error_unsupported); break;
-    }
-}
-bool iterate_over_mpack_data(value_view_t data, string_t& json_str, ustore_error_t* c_error) {
-    mpack_reader_t reader;
-    mpack_reader_init_data(&reader, data.c_str(), data.size());
-
-    // Export all the content without any allocations
-    while (reader.data != reader.end)
-        object_reading(reader, json_str, c_error);
-
-    // Cleanup the state
-    mpack_reader_destroy(&reader);
-
-    return true;
-}
-
-// Json to MsgPack
-void sample_leafs(mpack_writer_t& writer, sj::simdjson_result<sj::ondemand::value> value) {
-    auto type = value.type().value();
-    switch (type) {
-    case sj::ondemand::json_type::object: {
-        mpack_build_map(&writer);
-        auto object = value.get_object().value();
-        auto begin = object.begin().value();
-        auto end = object.end().value();
-        while (begin != end) {
-            auto field = *begin;
-            std::string_view key = field.unescaped_key();
-            mpack_write_str(&writer, key.data(), key.size());
-            sample_leafs(writer, field.value().value());
-            ++begin;
-        }
-        mpack_complete_map(&writer);
-        break;
-    }
-    case sj::ondemand::json_type::array: {
-        mpack_build_array(&writer);
-        auto array = value.get_array();
-        auto begin = array.begin().value();
-        auto end = array.end().value();
-        while (begin != end) {
-            auto value = *begin;
-            sample_leafs(writer, value);
-            ++begin;
-        }
-        mpack_complete_array(&writer);
-        break;
-    }
-    case sj::ondemand::json_type::null: {
-        mpack_write_nil(&writer);
-        break;
-    }
-    case sj::ondemand::json_type::boolean: {
-        mpack_write_bool(&writer, value.get_bool().value());
-        break;
-    }
-    case sj::ondemand::json_type::string: {
-        mpack_write_str(&writer, value.get_string().value().data(), value.get_string().value().size());
-        break;
-    }
-    case sj::ondemand::json_type::number: {
-        auto number_type = value.get_number_type().value();
-        switch (number_type) {
-        case sj::ondemand::number_type::floating_point_number: {
-            mpack_write_double(&writer, value.get_double().value());
-            break;
-        }
-        case sj::ondemand::number_type::signed_integer: {
-            mpack_write_i64(&writer, value.get_int64().value());
-            break;
-        }
-        case sj::ondemand::number_type::unsigned_integer: {
-            mpack_write_u64(&writer, value.get_uint64().value());
-            break;
-        }
-        }
-        break;
-    }
-    default: break;
-    }
-}
-
-void json_to_mpack(sj::padded_string_view doc, string_t& output, ustore_error_t* c_error) {
-    sj::ondemand::parser parser;
-
-    output.resize(doc.size(), c_error);
-    return_if_error_m(c_error);
-
-    mpack_writer_t writer;
-    mpack_writer_init(&writer, output.data(), doc.size());
-
-    auto result = parser.iterate(doc);
-    mpack_build_map(&writer);
-    auto object = result.get_object().value();
-    auto begin = object.begin().value();
-    auto end = object.end().value();
-    while (begin != end) {
-        auto field = *begin;
-        std::string_view key = field.unescaped_key();
-        mpack_write_str(&writer, key.data(), key.size());
-        sample_leafs(writer, field.value().value());
-        ++begin;
-    }
-    mpack_complete_map(&writer);
-
-    auto end_ptr = writer.position;
-    size_t new_size = end_ptr - writer.buffer;
-
-    output.resize(new_size, c_error);
-    mpack_writer_destroy(&writer);
-    return_if_error_m(c_error);
-}
-
-json_t any_parse(value_view_t bytes,
-                 ustore_doc_field_type_t const field_type,
-                 linked_memory_lock_t& arena,
-                 ustore_error_t* c_error) noexcept {
-
-    if (field_type == ustore_doc_field_bson_k) {
-        bson_t bson;
-        bool success = bson_init_static(&bson, reinterpret_cast<uint8_t const*>(bytes.data()), bytes.size());
-        // Using `bson_as_canonical_extended_json` is a bad idea, as it allocates dynamically.
-        // Instead we will manually iterate over the document, using the "visitor" pattern
-        bson_iter_t iter;
-        string_t json(arena);
-        json_state_t state {json, c_error, 0, true, -1};
-
-        if (!bson_iter_init(&iter, &bson)) {
-            *c_error = "Failed to parse the BSON document!";
-            return {};
-        }
-
-        to_json_string(json, open_k, c_error);
-        if (bson_iter_visit_all(&iter, &bson_visitor, &state) || state.error_offset != -1) {
-            *c_error = "Failed to iterate the BSON document!";
-            return {};
-        }
-        to_json_string(json, close_k, c_error);
-
-        return json_parse({json.data(), json.size()}, arena, c_error);
-    }
-
-    if (field_type == ustore_doc_field_msgpack_k) {
-        string_t json(arena);
-        if (!iterate_over_mpack_data(bytes, json, c_error)) {
-            *c_error = "Failed to parse the MsgPack document!";
-            return {};
-        }
-        return json_parse({json.data(), json.size()}, arena, c_error);
-    }
-
-    if (field_type == ustore_doc_field_json_k)
-        return json_parse(bytes, arena, c_error);
-
-    // Wrapping binary data into a JSON object
-    yyjson_alc allocator = wrap_allocator(arena);
-    yyjson_mut_doc* doc = yyjson_mut_doc_new(&allocator);
-    yyjson_mut_val* root = nullptr;
-    switch (field_type) {
-    case ustore_doc_field_null_k:
-    case ustore_doc_field_uuid_k:
-    case ustore_doc_field_f16_k:
-    case ustore_doc_field_bin_k: *c_error = "Input type not supported";
-    case ustore_doc_field_str_k: root = yyjson_mut_strn(doc, bytes.c_str(), bytes.size()); break;
-    case ustore_doc_field_u8_k: root = yyjson_mut_uint(doc, *reinterpret_cast<uint8_t const*>(bytes.data())); break;
-    case ustore_doc_field_u16_k: root = yyjson_mut_uint(doc, *reinterpret_cast<uint16_t const*>(bytes.data())); break;
-    case ustore_doc_field_u32_k: root = yyjson_mut_uint(doc, *reinterpret_cast<uint32_t const*>(bytes.data())); break;
-    case ustore_doc_field_u64_k: root = yyjson_mut_uint(doc, *reinterpret_cast<uint64_t const*>(bytes.data())); break;
-    case ustore_doc_field_i8_k: root = yyjson_mut_sint(doc, *reinterpret_cast<int8_t const*>(bytes.data())); break;
-    case ustore_doc_field_i16_k: root = yyjson_mut_sint(doc, *reinterpret_cast<int16_t const*>(bytes.data())); break;
-    case ustore_doc_field_i32_k: root = yyjson_mut_sint(doc, *reinterpret_cast<int32_t const*>(bytes.data())); break;
-    case ustore_doc_field_i64_k: root = yyjson_mut_sint(doc, *reinterpret_cast<int64_t const*>(bytes.data())); break;
-    case ustore_doc_field_f32_k: root = yyjson_mut_real(doc, *reinterpret_cast<float const*>(bytes.data())); break;
-    case ustore_doc_field_f64_k: root = yyjson_mut_real(doc, *reinterpret_cast<double const*>(bytes.data())); break;
-    case ustore_doc_field_bool_k: root = yyjson_mut_bool(doc, *reinterpret_cast<bool const*>(bytes.data())); break;
-
-    case ustore_doc_field_bson_k:
-    case ustore_doc_field_json_k:
-    case ustore_doc_field_msgpack_k: break;
-    }
-    yyjson_mut_doc_set_root(doc, root);
-    json_t result;
-    result.mut_handle = doc;
-    return result;
-}
-
-value_view_t any_dump(json_branch_t json,
-                      ustore_doc_field_type_t const field_type,
-                      linked_memory_lock_t& arena,
-                      growing_tape_t& output,
-                      ustore_error_t* c_error) noexcept {
-
-    if (field_type == ustore_doc_field_str_k) {
-        ustore_octet_t dummy;
-        printed_number_buffer_t print_buffer;
-        auto str = json_to_string(json.punned(), 0, dummy, dummy, dummy, print_buffer);
-        auto result = output.push_back(str, c_error);
-        output.add_terminator(byte_t {0}, c_error);
-        return result;
-    }
-
-    else if (field_type == ustore_doc_field_json_k)
-        return json_dump(json, arena, output, c_error);
-
-    *c_error = "Output type not supported!";
-    return {};
-}
-
-/*********************************************************/
-/*****************	 Primary Functions	  ****************/
-/*********************************************************/
-
-void modify_field( //
-    yyjson_mut_doc* original_doc,
-    yyjson_mut_val* modifier,
-    ustore_str_view_t field,
-    doc_modification_t const c_modification,
-    ustore_error_t* c_error) {
-
-    std::string_view json_ptr(field);
-    auto last_key_pos = json_ptr.rfind('/');
-    auto last_key_or_idx = json_ptr.substr(last_key_pos + 1);
-    auto is_idx = std::all_of(last_key_or_idx.begin(), last_key_or_idx.end(), [](char c) { return std::isdigit(c); });
-
-    yyjson_mut_val* val = json_lookupn(original_doc->root, json_ptr.data(), last_key_pos);
-    return_error_if_m(val, c_error, 0, "Invalid field!");
-
-    if (yyjson_mut_is_arr(val)) {
-        return_error_if_m(is_idx || last_key_or_idx == "-", c_error, 0, "Invalid field!");
-        size_t idx = 0;
-        std::from_chars(last_key_or_idx.begin(), last_key_or_idx.end(), idx);
-        if (c_modification == doc_modification_t::merge_k) {
-            yyjson_mut_val* mergeable = yyjson_mut_arr_get(val, idx);
-            return_error_if_m(mergeable, c_error, 0, "Invalid field!");
-            yyjson_mut_val* merge_result = yyjson_mut_merge_patch(original_doc, mergeable, modifier);
-            return_error_if_m(merge_result, c_error, 0, "Failed To Merge!");
-            return_error_if_m(yyjson_mut_arr_replace(val, idx, merge_result), c_error, 0, "Failed To Merge!");
-        }
-        else if (c_modification == doc_modification_t::insert_k) {
-            auto result = is_idx //
-                              ? yyjson_mut_arr_insert(val, modifier, idx)
-                              : yyjson_mut_arr_add_val(val, modifier);
-            return_error_if_m(result, c_error, 0, "Failed To Insert!");
-        }
-        else if (c_modification == doc_modification_t::remove_k) {
-            return_error_if_m(yyjson_mut_arr_remove(val, idx), c_error, 0, "Failed To Remove!");
-        }
-        else if (c_modification == doc_modification_t::update_k) {
-            return_error_if_m(yyjson_mut_arr_replace(val, idx, modifier), c_error, 0, "Failed To Update!");
-        }
-        else if (c_modification == doc_modification_t::upsert_k) {
-            auto result = yyjson_mut_arr_get(val, idx) //
-                              ? yyjson_mut_arr_replace(val, idx, modifier) != nullptr
-                              : yyjson_mut_arr_append(val, modifier);
-            return_error_if_m(result, c_error, 0, "Failed To Upsert!");
-        }
-        else {
-            return_error_m(c_error, "Invalid Modification Mode!");
-        }
-    }
-    else if (yyjson_mut_is_obj(val)) {
-        if (c_modification == doc_modification_t::merge_k) {
-            yyjson_mut_val* mergeable = yyjson_mut_obj_getn(val, last_key_or_idx.data(), last_key_or_idx.size());
-            yyjson_mut_val* merge_result = yyjson_mut_merge_patch(original_doc, mergeable, modifier);
-            yyjson_mut_val* key = yyjson_mut_strncpy(original_doc, last_key_or_idx.data(), last_key_or_idx.size());
-            yyjson_mut_obj_replace(val, key, merge_result);
-        }
-        else if (c_modification == doc_modification_t::insert_k) {
-            yyjson_mut_val* key = yyjson_mut_strncpy(original_doc, last_key_or_idx.data(), last_key_or_idx.size());
-            return_error_if_m(yyjson_mut_obj_add(val, key, modifier), c_error, 0, "Failed To Insert!");
-        }
-        else if (c_modification == doc_modification_t::remove_k) {
-            yyjson_mut_val* key = yyjson_mut_strncpy(original_doc, last_key_or_idx.data(), last_key_or_idx.size());
-            return_error_if_m(yyjson_mut_obj_remove(val, key), c_error, 0, "Failed To Remove!");
-        }
-        else if (c_modification == doc_modification_t::update_k) {
-            yyjson_mut_val* key = yyjson_mut_strncpy(original_doc, last_key_or_idx.data(), last_key_or_idx.size());
-            return_error_if_m(yyjson_mut_obj_replace(val, key, modifier), c_error, 0, "Failed To Update!");
-        }
-        else if (c_modification == doc_modification_t::upsert_k) {
-            if (yyjson_mut_obj_get(val, last_key_or_idx.data())) {
-                yyjson_mut_val* key = yyjson_mut_strncpy(original_doc, last_key_or_idx.data(), last_key_or_idx.size());
-                return_error_if_m(yyjson_mut_obj_replace(val, key, modifier), c_error, 0, "Failed To Update!");
-            }
-            else {
-                yyjson_mut_val* key = yyjson_mut_strncpy(original_doc, last_key_or_idx.data(), last_key_or_idx.size());
-                return_error_if_m(yyjson_mut_obj_add(val, key, modifier), c_error, 0, "Failed To Update!");
-            }
-        }
-        else {
-            return_error_m(c_error, "Invalid Modification Mode!");
-        }
-    }
-}
-
-ustore_str_view_t field_concat(ustore_str_view_t field,
-                               ustore_str_view_t suffix,
-                               linked_memory_lock_t& arena,
-                               ustore_error_t* c_error) {
-    auto field_len = field ? std::strlen(field) : 0;
-    auto suffix_len = suffix ? std::strlen(suffix) : 0;
-
-    if (!(field_len | suffix_len))
-        return nullptr;
-    if (!field_len)
-        return suffix;
-    if (!suffix_len)
-        return field;
-
-    auto result = arena.alloc<char>(field_len + suffix_len + 1, c_error).begin();
-    std::memcpy(result, field, field_len);
-    std::memcpy(result + field_len, suffix, suffix_len);
-    result[field_len + suffix_len] = '\0';
-    return result;
-}
-
-void patch( //
-    yyjson_mut_doc* original_doc,
-    yyjson_mut_val* patch_doc,
-    ustore_str_view_t field,
-    linked_memory_lock_t& arena,
-    ustore_error_t* c_error) {
-
-    return_error_if_m(yyjson_mut_is_arr(patch_doc), c_error, 0, "Invalid Patch Doc!");
-    yyjson_mut_val* obj;
-    yyjson_mut_arr_iter arr_iter;
-    yyjson_mut_arr_iter_init(patch_doc, &arr_iter);
-    while ((obj = yyjson_mut_arr_iter_next(&arr_iter))) {
-        return_error_if_m(yyjson_mut_is_obj(obj), c_error, 0, "Invalid Patch Doc!");
-        yyjson_mut_obj_iter obj_iter;
-        yyjson_mut_obj_iter_init(obj, &obj_iter);
-        yyjson_mut_val* op = yyjson_mut_obj_iter_get(&obj_iter, "op");
-        return_error_if_m(op, c_error, 0, "Invalid Patch Doc!");
-        if (yyjson_mut_equals_str(op, "add")) {
-            return_error_if_m((yyjson_mut_obj_size(obj) == 3), c_error, 0, "Invalid Patch Doc!");
-            yyjson_mut_val* path = yyjson_mut_obj_iter_get(&obj_iter, "path");
-            return_error_if_m(path, c_error, 0, "Invalid Patch Doc!");
-            yyjson_mut_val* value = yyjson_mut_obj_iter_get(&obj_iter, "value");
-            return_error_if_m(value, c_error, 0, "Invalid Patch Doc!");
-            auto nested_path = field_concat(field, yyjson_mut_get_str(path), arena, c_error);
-            return_if_error_m(c_error);
-            nested_path ? modify_field(original_doc, value, nested_path, doc_modification_t::insert_k, c_error)
-                        : yyjson_mut_doc_set_root(original_doc, value);
-        }
-        else if (yyjson_mut_equals_str(op, "remove")) {
-            return_error_if_m((yyjson_mut_obj_size(obj) == 2), c_error, 0, "Invalid Patch Doc!");
-            yyjson_mut_val* path = yyjson_mut_obj_iter_get(&obj_iter, "path");
-            return_error_if_m(path, c_error, 0, "Invalid Patch Doc!");
-            auto nested_path = field_concat(field, yyjson_mut_get_str(path), arena, c_error);
-            return_if_error_m(c_error);
-            nested_path ? modify_field(original_doc, nullptr, nested_path, doc_modification_t::remove_k, c_error)
-                        : yyjson_mut_doc_set_root(original_doc, NULL);
-        }
-        else if (yyjson_mut_equals_str(op, "replace")) {
-            return_error_if_m((yyjson_mut_obj_size(obj) == 3), c_error, 0, "Invalid Patch Doc!");
-            yyjson_mut_val* path = yyjson_mut_obj_iter_get(&obj_iter, "path");
-            return_error_if_m(path, c_error, 0, "Invalid Patch Doc!");
-            yyjson_mut_val* value = yyjson_mut_obj_iter_get(&obj_iter, "value");
-            return_error_if_m(value, c_error, 0, "Invalid Patch Doc!");
-            auto nested_path = field_concat(field, yyjson_mut_get_str(path), arena, c_error);
-            return_if_error_m(c_error);
-            nested_path ? modify_field(original_doc, value, nested_path, doc_modification_t::update_k, c_error)
-                        : yyjson_mut_doc_set_root(original_doc, value);
-        }
-        else if (yyjson_mut_equals_str(op, "copy")) {
-            return_error_if_m((yyjson_mut_obj_size(obj) == 3), c_error, 0, "Invalid Patch Doc!");
-            yyjson_mut_val* path = yyjson_mut_obj_iter_get(&obj_iter, "path");
-            return_error_if_m(path, c_error, 0, "Invalid Patch Doc!");
-            yyjson_mut_val* from = yyjson_mut_obj_iter_get(&obj_iter, "from");
-            return_error_if_m(from, c_error, 0, "Invalid Patch Doc!");
-            yyjson_mut_val* value =
-                yyjson_mut_val_mut_copy(original_doc, json_lookup(original_doc->root, yyjson_mut_get_str(from)));
-            return_error_if_m(value, c_error, 0, "Invalid Patch Doc!");
-            auto nested_path = field_concat(field, yyjson_mut_get_str(path), arena, c_error);
-            return_if_error_m(c_error);
-            modify_field(original_doc, value, nested_path, doc_modification_t::upsert_k, c_error);
-        }
-        else if (yyjson_mut_equals_str(op, "move")) {
-            return_error_if_m((yyjson_mut_obj_size(obj) == 3), c_error, 0, "Invalid Patch Doc!");
-            yyjson_mut_val* path = yyjson_mut_obj_iter_get(&obj_iter, "path");
-            return_error_if_m(path, c_error, 0, "Invalid Patch Doc!");
-            yyjson_mut_val* from = yyjson_mut_obj_iter_get(&obj_iter, "from");
-            return_error_if_m(from, c_error, 0, "Invalid Patch Doc!");
-            yyjson_mut_val* value =
-                yyjson_mut_val_mut_copy(original_doc, json_lookup(original_doc->root, yyjson_mut_get_str(from)));
-            return_error_if_m(value, c_error, 0, "Invalid Patch Doc!");
-            auto nested_from_path = field_concat(field, yyjson_mut_get_str(from), arena, c_error);
-            return_if_error_m(c_error);
-            modify_field(original_doc, nullptr, nested_from_path, doc_modification_t::remove_k, c_error);
-            auto nested_to_path = field_concat(field, yyjson_mut_get_str(path), arena, c_error);
-            return_if_error_m(c_error);
-            modify_field(original_doc, value, nested_to_path, doc_modification_t::upsert_k, c_error);
-        }
-    }
-}
-
-void modify( //
-    json_t& original,
-    yyjson_mut_val* modifier,
-    ustore_str_view_t field,
-    doc_modification_t const c_modification,
-    linked_memory_lock_t& arena,
-    ustore_error_t* c_error) {
-
-    if (!original.mut_handle) {
-        original.mut_handle = yyjson_mut_doc_new(nullptr);
-        original.mut_handle->root = yyjson_mut_val_mut_copy(original.mut_handle, modifier);
-        return;
-    }
-
-    if (field && c_modification != doc_modification_t::patch_k) {
-        modify_field(original.mut_handle, modifier, field, c_modification, c_error);
-        return_error_if_m(original.mut_handle->root, c_error, 0, "Failed To Modify!");
-        return;
-    }
-
-    if (c_modification == doc_modification_t::merge_k)
-        original.mut_handle->root = yyjson_mut_merge_patch(original.mut_handle, original.mut_handle->root, modifier);
-
-    else if (c_modification == doc_modification_t::patch_k)
-        patch(original.mut_handle, modifier, field, arena, c_error);
-
-    else
-        original.mut_handle->root = yyjson_mut_val_mut_copy(original.mut_handle, modifier);
-
-    return_error_if_m(original.mut_handle->root, c_error, 0, "Failed To Modify!");
-}
-
-template <typename callback_at>
-void read_unique_docs( //
-    ustore_database_t const c_db,
-    ustore_transaction_t const c_txn,
-    places_arg_t const& places,
-    ustore_options_t const c_options,
-    linked_memory_lock_t& arena,
-    places_arg_t& unique_places,
-    ustore_error_t* c_error,
-    callback_at callback) noexcept {
-
-    ustore_byte_t* found_binary_begin {};
-    ustore_length_t* found_binary_offs {};
-    ustore_length_t* found_binary_lens {};
+static found_documents_t read_documents(ustore_database_t database, ustore_transaction_t transaction,
+                                        ustore_snapshot_t snapshot, places_arg_t const& places,
+                                        ustore_options_t options, linked_memory_lock_t& arena,
+                                        ustore_error_t* error) noexcept {
+    found_documents_t found;
     ustore_read_t read {};
-    read.db = c_db;
-    read.error = c_error;
-    read.transaction = c_txn;
+    read.db = database;
+    read.error = error;
+    read.transaction = transaction;
+    read.snapshot = snapshot;
     read.arena = arena;
-    read.options = c_options;
+    read.options = options;
     read.tasks_count = places.count;
     read.collections = places.collections_begin.get();
     read.collections_stride = places.collections_begin.stride();
     read.keys = places.keys_begin.get();
     read.keys_stride = places.keys_begin.stride();
-    read.offsets = &found_binary_offs;
-    read.lengths = &found_binary_lens;
-    read.values = &found_binary_begin;
-
+    read.offsets = &found.offsets;
+    read.lengths = &found.lengths;
+    read.values = &found.contents;
     ustore_read(&read);
-
-    auto found_binaries = joined_blobs_t(places.count, found_binary_offs, found_binary_begin);
-    auto found_binary_it = found_binaries.begin();
-
-    ustore_length_t max_length = *std::max_element(found_binary_lens,
-                                                   found_binary_lens + places.count,
-                                                   [](ustore_length_t lhs, ustore_length_t rhs) {
-                                                       return ((lhs < rhs) | (lhs == ustore_length_missing_k)) &
-                                                              (rhs != ustore_length_missing_k);
-                                                   });
-
-    if (max_length == ustore_length_missing_k) {
-        for (std::size_t task_idx = 0; task_idx != places.size(); ++task_idx, ++found_binary_it)
-            callback(task_idx, {}, value_view_t::make_empty());
-        return;
-    }
-
-    auto document = arena.alloc<byte_t>(max_length + sj::SIMDJSON_PADDING, c_error);
-    return_if_error_m(c_error);
-
-    for (std::size_t task_idx = 0; task_idx != places.size(); ++task_idx, ++found_binary_it) {
-        value_view_t binary_doc = *found_binary_it;
-        std::memcpy(document.begin(), binary_doc.data(), binary_doc.size());
-        std::memset(document.begin() + binary_doc.size(), 0, sj::SIMDJSON_PADDING);
-        ustore_str_view_t field = places.fields_begin ? places.fields_begin[task_idx] : nullptr;
-        callback(task_idx, field, value_view_t(document.begin(), binary_doc.size()));
-    }
-
-    unique_places = places;
+    return found;
 }
 
-template <typename callback_at>
-void read_modify_unique_docs( //
-    ustore_database_t const c_db,
-    ustore_transaction_t const c_txn,
-    places_arg_t const& places,
-    ustore_options_t const c_options,
-    doc_modification_t const c_modification,
-    linked_memory_lock_t& arena,
-    places_arg_t& unique_places,
-    ustore_error_t* c_error,
-    callback_at callback) noexcept {
+/**
+ *  @brief Calls @p callback on the document of every task, in order.
+ *
+ *  Fails a field modification of a missing document, and an insertion of a whole document that already exists.
+ */
+template <document_callback callback_>
+static void read_each_document(ustore_database_t database, ustore_transaction_t transaction, ustore_snapshot_t snapshot,
+                               places_arg_t const& places, ustore_options_t options, modification_t modification,
+                               linked_memory_lock_t& arena, ustore_error_t* error, callback_&& callback) noexcept {
 
-    if (c_modification == doc_modification_t::nothing_k)
-        return read_unique_docs(c_db, c_txn, places, c_options, arena, unique_places, c_error, callback);
+    bool const has_fields = places.fields_begin && (!places.fields_begin.repeats() || *places.fields_begin);
+    found_documents_t const found = read_documents(database, transaction, snapshot, places, options, arena, error);
+    if (error->status) return;
 
-    auto has_fields = places.fields_begin && (!places.fields_begin.repeats() || *places.fields_begin);
-    bool need_values =
-        has_fields || c_modification == doc_modification_t::patch_k || c_modification == doc_modification_t::merge_k;
-
-    if (need_values) {
-        ustore_byte_t* found_binary_begin {};
-        ustore_length_t* found_binary_offs {};
-        ustore_read_t read {};
-        read.db = c_db;
-        read.error = c_error;
-        read.transaction = c_txn;
-        read.arena = arena;
-        read.options = c_options;
-        read.tasks_count = places.count;
-        read.collections = places.collections_begin.get();
-        read.collections_stride = places.collections_begin.stride();
-        read.keys = places.keys_begin.get();
-        read.keys_stride = places.keys_begin.stride();
-        read.offsets = &found_binary_offs;
-        read.values = &found_binary_begin;
-
-        ustore_read(&read);
-        return_if_error_m(c_error);
-
-        auto found_binaries = joined_blobs_t(places.count, found_binary_offs, found_binary_begin);
-        auto found_binary_it = found_binaries.begin();
-
-        for (std::size_t task_idx = 0; task_idx != places.size(); ++task_idx, ++found_binary_it) {
-
-            return_error_if_m(has_fields || c_modification != doc_modification_t::insert_k,
-                              c_error,
-                              0,
-                              "Key Already Exists!");
-            ustore_str_view_t field = places.fields_begin ? places.fields_begin[task_idx] : nullptr;
-            value_view_t binary_doc = *found_binary_it;
-            callback(task_idx, field, binary_doc);
-            return_if_error_m(c_error);
+    for (std::size_t index = 0; index != places.size(); ++index) {
+        value_view_t const document = found[index];
+        if (!document && has_fields && modification != modification_t::nothing_k) {
+            *error = {ustore_error_not_found_k, "Modified field belongs to a missing document"};
+            return;
         }
-    }
-    else {
-        ustore_octet_t* found_presences {};
-        ustore_read_t read {};
-        read.db = c_db;
-        read.error = c_error;
-        read.transaction = c_txn;
-        read.arena = arena;
-        read.options = c_options;
-        read.tasks_count = places.count;
-        read.collections = places.collections_begin.get();
-        read.collections_stride = places.collections_begin.stride();
-        read.keys = places.keys_begin.get();
-        read.keys_stride = places.keys_begin.stride();
-        read.presences = &found_presences;
-
-        ustore_read(&read);
-        return_if_error_m(c_error);
-
-        bits_view_t presents {found_presences};
-        for (std::size_t task_idx = 0; task_idx != places.size(); ++task_idx) {
-            ustore_str_view_t field = places.fields_begin ? places.fields_begin[task_idx] : nullptr;
-            return_error_if_m(presents[task_idx] || !has_fields, c_error, 0, "Key Not Exists!");
-            return_error_if_m(!presents[task_idx] || c_modification != doc_modification_t::insert_k,
-                              c_error,
-                              0,
-                              "Invalid Arguments!");
-            callback(task_idx, field, value_view_t::make_empty());
-            return_if_error_m(c_error);
+        if (document && !has_fields && modification == modification_t::insert_k) {
+            *error = {ustore_error_already_exists_k, "Inserted document already exists"};
+            return;
         }
+        callback(index, places.fields_begin ? places.fields_begin[index] : nullptr, document);
+        if (error->status) return;
     }
-
-    unique_places = places;
 }
 
-template <typename callback_at>
-void read_modify_docs( //
-    ustore_database_t const c_db,
-    ustore_transaction_t const c_txn,
-    places_arg_t const& places,
-    ustore_options_t const c_options,
-    doc_modification_t const c_modification,
-    linked_memory_lock_t& arena,
-    places_arg_t& unique_places,
-    ustore_error_t* c_error,
-    callback_at callback) {
+/** Calls @p callback on the document of every task, reading every distinct document once. */
+template <document_callback callback_>
+static void read_distinct_documents(ustore_database_t database, ustore_transaction_t transaction,
+                                    ustore_snapshot_t snapshot, places_arg_t const& places, ustore_options_t options,
+                                    linked_memory_lock_t& arena, ustore_error_t* error, callback_&& callback) noexcept {
 
-    // Handle the common case of requesting the non-colliding
-    // all-ascending input sequences of document IDs received
-    // during scans without the sort and extra memory.
     if (all_ascending(places.keys_begin, places.count))
-        return read_modify_unique_docs(c_db,
-                                       c_txn,
-                                       places,
-                                       c_options,
-                                       c_modification,
-                                       arena,
-                                       unique_places,
-                                       c_error,
-                                       callback);
+        return read_each_document(database, transaction, snapshot, places, options, modification_t::nothing_k, arena,
+                                  error, callback);
 
-    // If it's not one of the trivial consecutive lookups, we want
-    // to sort & deduplicate the entries to minimize the random reads
-    // from disk.
-    auto unique_col_keys = arena.alloc<collection_key_t>(places.count, c_error);
-    return_if_error_m(c_error);
+    auto distinct = arena.alloc<collection_key_t>(places.count, error);
+    if (error->status) return;
+    transform_n(places, places.count, distinct.begin(), [](place_t const& place) { return place.collection_key(); });
+    std::size_t const distinct_count = sort_and_deduplicate(distinct.begin(), distinct.end());
+    if (distinct_count == places.count)
+        return read_each_document(database, transaction, snapshot, places, options, modification_t::nothing_k, arena,
+                                  error, callback);
 
-    transform_n(places, places.count, unique_col_keys, std::mem_fn(&place_t::collection_key));
-    unique_col_keys = {unique_col_keys.begin(), sort_and_deduplicate(unique_col_keys.begin(), unique_col_keys.end())};
+    std::span<collection_key_t> const sorted = distinct.first(distinct_count);
+    auto const sorted_strided = strided(sorted).immutable();
+    places_arg_t distinct_places;
+    distinct_places.collections_begin = sorted_strided.members(&collection_key_t::collection).begin();
+    distinct_places.keys_begin = sorted_strided.members(&collection_key_t::key).begin();
+    distinct_places.count = static_cast<ustore_size_t>(distinct_count);
 
-    // There is a chance, all the entries are unique.
-    // In such case, let's free-up the memory.
-    if (unique_col_keys.size() == places.count)
-        return read_modify_unique_docs(c_db,
-                                       c_txn,
-                                       places,
-                                       c_options,
-                                       c_modification,
-                                       arena,
-                                       unique_places,
-                                       c_error,
-                                       callback);
+    found_documents_t const found = read_documents(database, transaction, snapshot, distinct_places, options, arena,
+                                                   error);
+    if (error->status) return;
 
-    // Otherwise, let's retrieve the sublist of unique docs,
-    // which may be in a very different order from original.
-    ustore_byte_t* found_binary_begin = nullptr;
-    ustore_length_t* found_binary_offs = nullptr;
-    auto unique_col_keys_strided = strided_range(unique_col_keys.begin(), unique_col_keys.end()).immutable();
-    unique_places.collections_begin = unique_col_keys_strided.members(&collection_key_t::collection).begin();
-    unique_places.keys_begin = unique_col_keys_strided.members(&collection_key_t::key).begin();
-    unique_places.fields_begin = {};
-    unique_places.count = static_cast<ustore_size_t>(unique_col_keys.size());
-    ustore_read_t read {};
-    read.db = c_db;
-    read.error = c_error;
-    read.transaction = c_txn;
-    read.arena = arena;
-    read.options = c_options;
-    read.tasks_count = unique_places.count;
-    read.collections = unique_places.collections_begin.get();
-    read.collections_stride = unique_places.collections_begin.stride();
-    read.keys = unique_places.keys_begin.get();
-    read.keys_stride = unique_places.keys_begin.stride();
-    read.offsets = &found_binary_offs;
-    read.values = &found_binary_begin;
-
-    ustore_read(&read);
-    return_if_error_m(c_error);
-
-    // We will later need to locate the data for every separate request.
-    // Doing it in O(N) tape iterations every time is too slow.
-    // Once we transform to inclusive sums, it will be O(1).
-    //      inplace_inclusive_prefix_sum(found_binary_lens, found_binary_lens + found_binary_count);
-    // Alternatively we can compensate it with additional memory:
-
-    // Parse all the unique documents
-    auto found_binaries = joined_blobs_t(places.count, found_binary_offs, found_binary_begin);
-
-    // Join docs and fields with binary search
-    for (std::size_t task_idx = 0; task_idx != places.size(); ++task_idx) {
-        auto place = places[task_idx];
-        auto parsed_idx = offset_in_sorted(unique_col_keys, place.collection_key());
-
-        value_view_t binary_doc = found_binaries[parsed_idx];
-        callback(task_idx, place.field, binary_doc);
+    for (std::size_t index = 0; index != places.size(); ++index) {
+        place_t const place = places[index];
+        callback(index, place.field, found[offset_in_sorted(sorted, place.collection_key())]);
+        if (error->status) return;
     }
 }
 
-void read_modify_write( //
-    ustore_database_t const c_db,
-    ustore_transaction_t const c_txn,
-    places_arg_t const& places,
-    contents_arg_t const& contents,
-    ustore_options_t const c_options,
-    doc_modification_t const c_modification,
-    ustore_doc_field_type_t const c_type,
-    linked_memory_lock_t& arena,
-    ustore_error_t* c_error) noexcept {
+#pragma endregion Reading Documents
 
-    growing_tape_t growing_tape {arena};
-    growing_tape.reserve(places.size(), c_error);
-    return_if_error_m(c_error);
+#pragma region Writing
 
-    yyjson_alc allocator = wrap_allocator(arena);
-    auto safe_callback = [&](ustore_size_t task_idx, ustore_str_view_t field, value_view_t binary_doc) {
-        json_t parsed = any_parse(binary_doc, internal_format_k, arena, c_error);
-        if (!contents[task_idx]) {
-            any_dump({nullptr, parsed.mut_handle->root}, internal_format_k, arena, growing_tape, c_error);
+/** Parses, modifies and writes back the documents at @p places. */
+static void read_modify_write(ustore_database_t database, ustore_transaction_t transaction, places_arg_t const& places,
+                              contents_arg_t const& contents, ustore_options_t options, modification_t modification,
+                              ustore_doc_field_type_t type, linked_memory_lock_t& arena,
+                              ustore_error_t* error) noexcept {
+
+    growing_tape_t modified {arena};
+    modified.reserve(places.size(), error);
+    if (error->status) return;
+
+    auto modify_one = [&](std::size_t index, ustore_str_view_t field, value_view_t binary_document) {
+        json_t document = json_parse(binary_document, arena, error);
+        if (error->status) return;
+
+        value_view_t const content = contents[index];
+        if (!content && !field) {
+            modified.push_back(value_view_t {}, error);
             return;
         }
 
-        // This error is extremely unlikely, as we have previously accepted the data into the store.
-        return_if_error_m(c_error);
-        if (!parsed.mut_handle)
-            parsed.mut_handle = yyjson_doc_mut_copy(parsed.handle, &allocator);
-
-        json_t parsed_task = any_parse(contents[task_idx], c_type, arena, c_error);
-        return_if_error_m(c_error);
-
-        // Perform modifications
-        modify(parsed, parsed_task.mut_handle->root, field, c_modification, arena, c_error);
-        any_dump({nullptr, parsed.mut_handle->root}, internal_format_k, arena, growing_tape, c_error);
-        return_if_error_m(c_error);
+        if (!content) modify(document, nullptr, field, modification_t::remove_k, arena, error);
+        else {
+            json_t modifier = any_parse(content, type, arena, error);
+            if (error->status) return;
+            yyjson_mut_doc* const modifier_document = json_mutable(modifier, arena, error);
+            if (error->status) return;
+            modify(document, yyjson_mut_doc_get_root(modifier_document), field, modification, arena, error);
+        }
+        if (error->status) return;
+        json_dump({nullptr, yyjson_mut_doc_get_root(document.mutable_handle)}, arena, modified, error);
     };
 
-    places_arg_t unique_places;
-    auto opts = c_txn ? ustore_options_t(c_options & ~ustore_option_transaction_dont_watch_k) : c_options;
-    read_modify_docs(c_db, c_txn, places, opts, c_modification, arena, unique_places, c_error, safe_callback);
-    return_if_error_m(c_error);
+    ustore_options_t const read_options = transaction //
+                                              ? ustore_options_t(options & ~ustore_option_transaction_dont_watch_k)
+                                              : options;
+    read_each_document(database, transaction, {}, places, read_options, modification, arena, error, modify_one);
+    if (error->status) return;
 
-    // By now, the tape contains concatenated updates docs:
-    ustore_byte_t* tape_begin = reinterpret_cast<ustore_byte_t*>(growing_tape.contents().begin().get());
+    ustore_byte_t* const modified_contents = reinterpret_cast<ustore_byte_t*>(modified.contents().begin().get());
     ustore_write_t write {};
-    write.db = c_db;
-    write.error = c_error;
-    write.transaction = c_txn;
+    write.db = database;
+    write.error = error;
+    write.transaction = transaction;
     write.arena = arena;
-    write.options = c_options;
-    write.tasks_count = unique_places.count;
-    write.collections = unique_places.collections_begin.get();
-    write.collections_stride = unique_places.collections_begin.stride();
-    write.keys = unique_places.keys_begin.get();
-    write.keys_stride = unique_places.keys_begin.stride();
-    write.offsets = growing_tape.offsets().begin().get();
-    write.offsets_stride = growing_tape.offsets().stride();
-    write.lengths = growing_tape.lengths().begin().get();
-    write.lengths_stride = growing_tape.lengths().stride();
-    write.values = &tape_begin;
-
+    write.options = options;
+    write.tasks_count = places.count;
+    write.collections = places.collections_begin.get();
+    write.collections_stride = places.collections_begin.stride();
+    write.keys = places.keys_begin.get();
+    write.keys_stride = places.keys_begin.stride();
+    write.offsets = modified.offsets().begin().get();
+    write.offsets_stride = modified.offsets().stride();
+    write.lengths = modified.lengths().begin().get();
+    write.lengths_stride = modified.lengths().stride();
+    write.values = &modified_contents;
     ustore_write(&write);
 }
 
-void ustore_docs_write(ustore_docs_write_t* c_ptr) {
-
-    ustore_docs_write_t& c = *c_ptr;
-    if (!c.tasks_count)
-        return;
-
-    return_error_if_m(c.db, c.error, uninitialized_state_k, "DataBase is uninitialized");
-    linked_memory_lock_t arena = linked_memory(c.arena, c.options, c.error);
-    return_if_error_m(c.error);
-
-    ptr_range_gt<ustore_key_t> tape;
-    if (!c.keys) {
-        return_error_if_m(c.values, c.error, uninitialized_state_k, "Keys and values is uninitialized");
-        return_error_if_m(c.id_field, c.error, uninitialized_state_k, "Keys and id_field is uninitialized");
-
-        tape = arena.alloc<ustore_key_t>(c.tasks_count, c.error);
-        strided_iterator_gt<ustore_bytes_cptr_t const> vals {c.values, c.values_stride};
-        strided_iterator_gt<ustore_length_t const> lens {c.lengths, c.lengths_stride};
-
-        simdjson::ondemand::parser parser;
-        for (size_t idx = 0; idx < c.tasks_count; ++idx, ++vals, ++lens) {
-            simdjson::ondemand::document doc = parser.iterate(*vals, *lens, 1000000ul);
-            simdjson::ondemand::object data = doc.get_object().value();
-
-            auto result = reset(data)[c.id_field];
-            return_error_if_m((simdjson::SUCCESS == result.error()),
-                              c.error,
-                              uninitialized_state_k,
-                              "Keys and values is uninitialized");
-            return_error_if_m(result.type() == simdjson::ondemand::json_type::number,
-                              c.error,
-                              args_wrong_k,
-                              "The id field does not have the ustore key type");
-            tape[idx] = result;
+/** Reads the integer key of every document from its @p id_field into @p keys. */
+static void extract_keys(contents_arg_t const& contents, ustore_str_view_t id_field, linked_memory_lock_t& arena,
+                         std::span<ustore_key_t> keys, ustore_error_t* error) noexcept {
+    for (std::size_t index = 0; index != contents.size(); ++index) {
+        json_t const document = json_parse(contents[index], arena, error);
+        if (error->status) return;
+        yyjson_val* const identifier = json_lookup(yyjson_doc_get_root(document.handle), id_field);
+        if (!yyjson_is_int(identifier)) {
+            *error = {ustore_error_malformed_k, "The id field does not hold an integer key"};
+            return;
         }
-        c.keys_stride = sizeof(ustore_key_t);
+        keys[index] = yyjson_get_sint(identifier);
     }
-    // If user wants the entire doc in the same format, as the one we use internally,
-    // this request can be passed entirely to the underlying Key-Value store.
-    strided_iterator_gt<ustore_str_view_t const> fields {c.fields, c.fields_stride};
-    auto has_fields = fields && (!fields.repeats() || *fields);
-    strided_iterator_gt<ustore_collection_t const> collections {c.collections, c.collections_stride};
-    strided_iterator_gt<ustore_key_t const> keys {c.keys ? c.keys : tape.begin(), c.keys_stride};
-    bits_view_t presences {c.presences};
-    strided_iterator_gt<ustore_length_t const> offs {c.offsets, c.offsets_stride};
-    strided_iterator_gt<ustore_length_t const> lens {c.lengths, c.lengths_stride};
-    strided_iterator_gt<ustore_bytes_cptr_t const> vals {c.values, c.values_stride};
-    places_arg_t places {collections, keys, fields, c.tasks_count};
-    contents_arg_t contents {presences, offs, lens, vals, c.tasks_count};
+}
 
-    if (has_fields || c.type != internal_format_k || c.modification != ustore_doc_modify_upsert_k)
-        return read_modify_write(c.db,
-                                 c.transaction,
-                                 places,
-                                 contents,
-                                 c.options,
-                                 static_cast<doc_modification_t>(c.modification),
-                                 c.type,
-                                 arena,
-                                 c.error);
+#pragma endregion Writing
 
-    // Validate JSONs Before Write
-    ustore_length_t max_length = 0;
-    for (std::size_t i = 0; i != contents.size(); ++i) {
-        if (max_length < contents[i].size() && contents[i].size() != ustore_length_missing_k)
-            max_length = contents[i].size();
+#pragma region Gist
+
+/** Collects the unique paths to the leaves under @p node, extending the null-terminated @p path. */
+static void gist_paths(yyjson_val* node, field_path_buffer_t& path, uninitialized_array<std::string_view>& sorted_paths,
+                       growing_tape_t& exported_paths, ustore_error_t* error) noexcept {
+
+    std::size_t const path_length = std::strlen(path);
+
+    if (yyjson_is_obj(node)) {
+        yyjson_obj_iter iterator;
+        yyjson_obj_iter_init(node, &iterator);
+        yyjson_val* key = nullptr;
+        while ((key = yyjson_obj_iter_next(&iterator)) && !error->status) {
+            std::string_view const name {yyjson_get_str(key), yyjson_get_len(key)};
+            if (path_length + 1 + name.size() >= field_path_length_limit_k) {
+                *error = {ustore_error_capacity_exhausted_k, "Path is too long"};
+                return;
+            }
+            path[path_length] = '/';
+            std::memcpy(path + path_length + 1, name.data(), name.size());
+            path[path_length + 1 + name.size()] = '\0';
+            gist_paths(yyjson_obj_iter_get_val(key), path, sorted_paths, exported_paths, error);
+        }
+        path[path_length] = '\0';
+        return;
     }
 
-    auto document = arena.alloc<byte_t>(max_length + sj::SIMDJSON_PADDING, c.error);
-    return_if_error_m(c.error);
+    if (yyjson_is_arr(node)) {
+        std::size_t element_index = 0;
+        yyjson_arr_iter iterator;
+        yyjson_arr_iter_init(node, &iterator);
+        yyjson_val* element = nullptr;
+        while ((element = yyjson_arr_iter_next(&iterator)) && !error->status) {
+            path[path_length] = '/';
+            std::string_view const printed = print_number(path + path_length + 1, path + field_path_length_limit_k,
+                                                          element_index++);
+            if (printed.empty()) {
+                *error = {ustore_error_capacity_exhausted_k, "Path is too long"};
+                return;
+            }
+            gist_paths(element, path, sorted_paths, exported_paths, error);
+        }
+        path[path_length] = '\0';
+        return;
+    }
 
-    sj::dom::parser parser;
-    for (std::size_t i = 0; i < contents.size(); ++i) {
-        if (!contents[i].size())
-            continue;
+    std::string_view const leaf {path, path_length};
+    std::size_t const position = std::lower_bound(sorted_paths.begin(), sorted_paths.end(), leaf) -
+                                 sorted_paths.begin();
+    if (position != sorted_paths.size() && sorted_paths[position] == leaf) return;
 
-        std::memcpy(document.begin(), contents[i].data(), contents[i].size());
-        std::memset(document.begin() + contents[i].size(), 0, sj::SIMDJSON_PADDING);
-        auto result = parser.parse((const char*)document.begin(), contents[i].size(), false);
-        return_error_if_m(result.error() == sj::SUCCESS, c.error, 0, "Invalid Json!");
+    value_view_t const exported = exported_paths.push_back(leaf, error);
+    if (error->status) return;
+    exported_paths.add_terminator(byte_t {0}, error);
+    if (error->status) return;
+
+    std::string_view const stored {exported.c_str(), exported.size()};
+    sorted_paths.insert(position, &stored, &stored + 1, error);
+}
+
+#pragma endregion Gist
+
+#pragma region Gather
+
+/** Bytes a column of @p type takes per document: the scalar, or an offset and a length for strings. */
+static std::size_t field_size_bytes(ustore_doc_field_type_t type) noexcept {
+    switch (type) {
+    case ustore_doc_field_bool_k: return sizeof(bool);
+    case ustore_doc_field_uuid_k: return 16;
+    case ustore_doc_field_f64_k: return sizeof(double);
+    case ustore_doc_field_f32_k: return sizeof(float);
+    case ustore_doc_field_f16_k: return 2;
+    case ustore_doc_field_i64_k: return sizeof(std::int64_t);
+    case ustore_doc_field_i32_k: return sizeof(std::int32_t);
+    case ustore_doc_field_i16_k: return sizeof(std::int16_t);
+    case ustore_doc_field_i8_k: return sizeof(std::int8_t);
+    case ustore_doc_field_u64_k: return sizeof(std::uint64_t);
+    case ustore_doc_field_u32_k: return sizeof(std::uint32_t);
+    case ustore_doc_field_u16_k: return sizeof(std::uint16_t);
+    case ustore_doc_field_u8_k: return sizeof(std::uint8_t);
+    case ustore_doc_field_bin_k:
+    case ustore_doc_field_str_k: return 2 * sizeof(ustore_length_t);
+    default: return 0;
+    }
+}
+
+/** Bytes one column of @p type takes for @p docs_count documents, with the closing offset, aligned for any scalar. */
+static std::size_t column_size_bytes(ustore_doc_field_type_t type, std::size_t docs_count) noexcept {
+    std::size_t const bytes = field_size_bytes(type) * docs_count + sizeof(ustore_length_t);
+    return next_multiple<std::size_t>(bytes, alignof(std::max_align_t));
+}
+
+/** Converts @p value into the scalar at @p index of @p column. */
+template <typename scalar_>
+static conversion_t gather_scalar(yyjson_val* value, ustore_byte_t* column, std::size_t index) noexcept {
+    scalar_ scalar {};
+    conversion_t const conversion = json_to_scalar(value, scalar);
+    std::memcpy(column + index * sizeof(scalar_), &scalar, sizeof(scalar_));
+    return conversion;
+}
+
+#pragma endregion Gather
+
+} // namespace unum::ustore
+
+using namespace unum::ustore;
+
+#pragma region C Interface
+
+void ustore_docs_write(ustore_docs_write_t* request_pointer) {
+    ustore_docs_write_t& request = *request_pointer;
+    if (!request.tasks_count) return;
+
+    if (!request.db) {
+        *request.error = {ustore_error_uninitialized_k, "Database is uninitialized"};
+        return;
+    }
+    linked_memory_lock_t arena = linked_memory(request.arena, request.options, request.error);
+    if (request.error->status) return;
+
+    strided_iterator<ustore_str_view_t const> fields {request.fields, request.fields_stride};
+    strided_iterator<ustore_collection_t const> collections {request.collections, request.collections_stride};
+    bits_view_t presences {request.presences};
+    strided_iterator<ustore_length_t const> offsets {request.offsets, request.offsets_stride};
+    strided_iterator<ustore_length_t const> lengths {request.lengths, request.lengths_stride};
+    strided_iterator<ustore_bytes_cptr_t const> values {request.values, request.values_stride};
+    contents_arg_t contents {presences, offsets, lengths, values, request.tasks_count};
+
+    strided_iterator<ustore_key_t const> keys {request.keys, request.keys_stride};
+    if (!request.keys) {
+        if (!request.values || !request.id_field) {
+            *request.error = {ustore_error_invalid_argument_k, "Documents without keys need values and an id field"};
+            return;
+        }
+        auto extracted = arena.alloc<ustore_key_t>(request.tasks_count, request.error);
+        if (request.error->status) return;
+        extract_keys(contents, request.id_field, arena, extracted, request.error);
+        if (request.error->status) return;
+        keys = {extracted.data(), sizeof(ustore_key_t)};
+    }
+    places_arg_t const places {collections, keys, fields, request.tasks_count};
+
+    bool const has_fields = fields && (!fields.repeats() || *fields);
+    if (has_fields || request.type != ustore_doc_field_json_k || request.modification != ustore_doc_modify_upsert_k)
+        return read_modify_write(request.db, request.transaction, places, contents, request.options,
+                                 static_cast<modification_t>(request.modification), request.type, arena, request.error);
+
+    // Whole JSON documents pass through once they parse, which extracting the keys has already checked.
+    for (std::size_t index = 0; request.keys && index != contents.size(); ++index) {
+        [[maybe_unused]] json_t const document = json_parse(contents[index], arena, request.error);
+        if (request.error->status) return;
     }
 
     ustore_write_t write {};
-    write.db = c.db;
-    write.error = c.error;
-    write.transaction = c.transaction;
+    write.db = request.db;
+    write.error = request.error;
+    write.transaction = request.transaction;
     write.arena = arena;
-    write.options = c.options;
-    write.tasks_count = c.tasks_count;
-    write.collections = c.collections;
-    write.collections_stride = c.collections_stride;
-    write.keys = c.keys ? c.keys : tape.begin();
-    write.keys_stride = c.keys_stride;
-    write.presences = c.presences;
-    write.offsets = c.offsets;
-    write.offsets_stride = c.offsets_stride;
-    write.lengths = c.lengths;
-    write.lengths_stride = c.lengths_stride;
-    write.values = c.values;
-    write.values_stride = c.values_stride;
-
+    write.options = request.options;
+    write.tasks_count = request.tasks_count;
+    write.collections = request.collections;
+    write.collections_stride = request.collections_stride;
+    write.keys = keys.get();
+    write.keys_stride = keys.stride();
+    write.presences = request.presences;
+    write.offsets = request.offsets;
+    write.offsets_stride = request.offsets_stride;
+    write.lengths = request.lengths;
+    write.lengths_stride = request.lengths_stride;
+    write.values = request.values;
+    write.values_stride = request.values_stride;
     ustore_write(&write);
 }
 
-void ustore_docs_read(ustore_docs_read_t* c_ptr) {
+void ustore_docs_read(ustore_docs_read_t* request_pointer) {
+    ustore_docs_read_t& request = *request_pointer;
+    if (!request.tasks_count) return;
 
-    ustore_docs_read_t& c = *c_ptr;
-    if (!c.tasks_count)
-        return;
+    linked_memory_lock_t arena = linked_memory(request.arena, request.options, request.error);
+    if (request.error->status) return;
 
-    linked_memory_lock_t arena = linked_memory(c.arena, c.options, c.error);
-    return_if_error_m(c.error);
-
-    // If user wants the entire doc in the same format, as the one we use internally,
-    // this request can be passed entirely to the underlying Key-Value store.
-    strided_iterator_gt<ustore_str_view_t const> fields {c.fields, c.fields_stride};
-    auto has_fields = fields && (!fields.repeats() || *fields);
-    if (!has_fields && c.type == internal_format_k) {
+    strided_iterator<ustore_str_view_t const> fields {request.fields, request.fields_stride};
+    bool const has_fields = fields && (!fields.repeats() || *fields);
+    if (!has_fields && request.type == ustore_doc_field_json_k) {
         ustore_read_t read {};
-        read.db = c.db;
-        read.error = c.error;
-        read.transaction = c.transaction;
-        read.snapshot = c.snapshot;
+        read.db = request.db;
+        read.error = request.error;
+        read.transaction = request.transaction;
+        read.snapshot = request.snapshot;
         read.arena = arena;
-        read.options = c.options;
-        read.tasks_count = c.tasks_count;
-        read.collections = c.collections;
-        read.collections_stride = c.collections_stride;
-        read.keys = c.keys;
-        read.keys_stride = c.keys_stride;
-        read.presences = c.presences;
-        read.offsets = c.offsets;
-        read.lengths = c.lengths;
-        read.values = c.values;
-
+        read.options = request.options;
+        read.tasks_count = request.tasks_count;
+        read.collections = request.collections;
+        read.collections_stride = request.collections_stride;
+        read.keys = request.keys;
+        read.keys_stride = request.keys_stride;
+        read.presences = request.presences;
+        read.offsets = request.offsets;
+        read.lengths = request.lengths;
+        read.values = request.values;
         return ustore_read(&read);
     }
 
-    return_error_if_m(c.db, c.error, uninitialized_state_k, "DataBase is uninitialized");
+    if (!request.db) {
+        *request.error = {ustore_error_uninitialized_k, "Database is uninitialized"};
+        return;
+    }
+    if (request.type != ustore_doc_field_json_k && request.type != ustore_doc_field_str_k) {
+        *request.error = {ustore_error_unsupported_k, "Documents read only as JSON or strings"};
+        return;
+    }
 
-    strided_iterator_gt<ustore_collection_t const> collections {c.collections, c.collections_stride};
-    strided_iterator_gt<ustore_key_t const> keys {c.keys, c.keys_stride};
-    places_arg_t places {collections, keys, fields, c.tasks_count};
+    strided_iterator<ustore_collection_t const> collections {request.collections, request.collections_stride};
+    strided_iterator<ustore_key_t const> keys {request.keys, request.keys_stride};
+    places_arg_t const places {collections, keys, fields, request.tasks_count};
 
-    // Now, we need to parse all the entries to later export them into a target format.
-    // Potentially sampling certain sub-fields again along the way.
-    growing_tape_t growing_tape {arena};
-    growing_tape.reserve(places.size(), c.error);
-    return_if_error_m(c.error);
-    sj::ondemand::parser parser;
+    growing_tape_t exported {arena};
+    exported.reserve(places.size(), request.error);
+    if (request.error->status) return;
 
-    auto safe_callback = [&](ustore_size_t, ustore_str_view_t field, value_view_t binary_doc) {
-        if (binary_doc.empty()) {
-            growing_tape.push_back(binary_doc, c.error);
-            return;
-        }
+    auto export_one = [&](std::size_t, ustore_str_view_t field, value_view_t binary_document) {
+        json_t const document = json_parse(binary_document, arena, request.error);
+        if (request.error->status) return;
 
-        std::string_view result;
-        auto padded_doc =
-            sj::padded_string_view(binary_doc.c_str(), binary_doc.size(), binary_doc.size() + sj::SIMDJSON_PADDING);
+        yyjson_val* const value = json_lookup(yyjson_doc_get_root(document.handle), field);
+        if (request.type == ustore_doc_field_json_k || !value || yyjson_is_ctn(value))
+            return json_dump({value, nullptr}, arena, exported, request.error);
 
-        string_t output {arena};
-        if (c.type == ustore_doc_field_msgpack_k) {
-            json_to_mpack(padded_doc, output, c.error);
-            result = {output.data(), output.size()};
-        }
-        else if (c.type == ustore_doc_field_bson_k) {
-            bson_error_t error;
-            bson_t* b = bson_new_from_json((uint8_t*)binary_doc.c_str(), -1, &error);
-            result = {(const char*)bson_get_data(b), b->len};
-            growing_tape.push_back(result, c.error);
-            growing_tape.add_terminator(byte_t {0}, c.error);
-            return_if_error_m(c.error);
-            bson_clear(&b);
-            return;
-        }
-        else {
-            auto maybe_doc = parser.iterate(padded_doc);
-            return_error_if_m(maybe_doc.error() == sj::SUCCESS, c.error, 0, "Fail To Parse Document!");
-            printed_number_buffer_t print_buffer;
-            if (maybe_doc.value().is_scalar())
-                result = get_value(maybe_doc.value(), c.type, print_buffer);
-            else {
-                auto parsed = maybe_doc.value().get_value();
-                auto branch = simdjson_lookup(parsed.value(), field);
-                result = get_value(branch, c.type, print_buffer);
-            }
-        }
-        growing_tape.push_back(result, c.error);
-        growing_tape.add_terminator(byte_t {0}, c.error);
-        return_if_error_m(c.error);
+        printed_number_buffer_t print_buffer;
+        std::string_view text;
+        [[maybe_unused]] conversion_t const conversion = json_to_string(value, print_buffer, text);
+        exported.push_back(text, request.error);
+        if (request.error->status) return;
+        exported.add_terminator(byte_t {0}, request.error);
     };
 
-    places_arg_t unique_places;
-    read_modify_docs(c.db,
-                     c.transaction,
-                     places,
-                     c.options,
-                     doc_modification_t::nothing_k,
-                     arena,
-                     unique_places,
-                     c.error,
-                     safe_callback);
+    read_distinct_documents(request.db, request.transaction, request.snapshot, places, request.options, arena,
+                            request.error, export_one);
+    if (request.error->status) return;
 
-    if (c.offsets)
-        *c.offsets = growing_tape.offsets().begin().get();
-    if (c.lengths)
-        *c.lengths = growing_tape.lengths().begin().get();
-    if (c.values)
-        *c.values = reinterpret_cast<ustore_byte_t*>(growing_tape.contents().begin().get());
+    if (request.presences) *request.presences = exported.presences().get();
+    if (request.offsets) *request.offsets = exported.offsets().begin().get();
+    if (request.lengths) *request.lengths = exported.lengths().begin().get();
+    if (request.values) *request.values = reinterpret_cast<ustore_bytes_ptr_t>(exported.contents().begin().get());
 }
 
-/*********************************************************/
-/*****************	 Tabular Exports	  ****************/
-/*********************************************************/
+void ustore_docs_gist(ustore_docs_gist_t* request_pointer) {
+    ustore_docs_gist_t& request = *request_pointer;
+    if (!request.docs_count) return;
 
-void gist_recursively(yyjson_val* node,
-                      field_path_buffer_t& path,
-                      uninitialized_array_gt<std::string_view>& sorted_paths,
-                      growing_tape_t& exported_paths,
-                      ustore_error_t* c_error) {
+    linked_memory_lock_t arena = linked_memory(request.arena, request.options, request.error);
+    if (request.error->status) return;
 
-    auto path_len = std::strlen(path);
-    auto constexpr slash_len = 1;
-    auto constexpr terminator_len = 1;
+    strided_iterator<ustore_collection_t const> collections {request.collections, request.collections_stride};
+    strided_iterator<ustore_key_t const> keys {request.keys, request.keys_stride};
+    places_arg_t const places {collections, keys, {}, request.docs_count};
+    found_documents_t const found = read_documents(request.db, request.transaction, request.snapshot, places,
+                                                   request.options, arena, request.error);
+    if (request.error->status) return;
 
-    if (yyjson_is_obj(node)) {
-        yyjson_val *key, *val;
-        yyjson_obj_iter iter;
-        yyjson_obj_iter_init(node, &iter);
-        while ((key = yyjson_obj_iter_next(&iter)) && !*c_error) {
-            val = yyjson_obj_iter_get_val(key);
-            char const* key_name = yyjson_get_str(key);
-            size_t key_len = yyjson_get_len(key);
-            if (path_len + slash_len + key_len + terminator_len >= field_path_len_limit_k) {
-                *c_error = "Path is too long!";
-                return;
-            }
-
-            path[path_len] = '/';
-            std::memcpy(path + path_len + slash_len, key_name, key_len);
-            path[path_len + slash_len + key_len] = 0;
-            gist_recursively(val, path, sorted_paths, exported_paths, c_error);
-        }
-        path[path_len] = 0;
+    field_path_buffer_t path = {0};
+    uninitialized_array<std::string_view> sorted_paths {arena};
+    growing_tape_t exported_paths {arena};
+    for (std::size_t index = 0; index != request.docs_count; ++index) {
+        json_t const document = json_parse(found[index], arena, request.error);
+        if (request.error->status) return;
+        if (!document) continue;
+        gist_paths(yyjson_doc_get_root(document.handle), path, sorted_paths, exported_paths, request.error);
+        if (request.error->status) return;
     }
-    else if (yyjson_is_arr(node)) {
-        std::size_t idx = 0;
-        yyjson_val* val;
-        yyjson_arr_iter iter;
-        yyjson_arr_iter_init(node, &iter);
-        while ((val = yyjson_arr_iter_next(&iter)) && !*c_error) {
 
-            path[path_len] = '/';
-            auto result = print_number(path + path_len + slash_len, path + field_path_len_limit_k, idx);
-            if (result.empty()) {
-                *c_error = "Path is too long!";
-                return;
-            }
-
-            gist_recursively(val, path, sorted_paths, exported_paths, c_error);
-            ++idx;
-        }
-        path[path_len] = 0;
-    }
-    else {
-
-        std::string_view path_str = std::string_view(path, path_len);
-        std::size_t idx = std::lower_bound(sorted_paths.begin(), sorted_paths.end(), path_str) - sorted_paths.begin();
-        if (idx != sorted_paths.size() && sorted_paths[idx] == path_str)
-            // This same path is already exported
-            return;
-
-        auto exported_path = exported_paths.push_back(path, c_error);
-        return_if_error_m(c_error);
-        exported_paths.add_terminator(byte_t {0}, c_error);
-        return_if_error_m(c_error);
-
-        path_str = std::string_view(exported_path.c_str(), exported_path.size());
-        sorted_paths.insert(idx, &path_str, &path_str + 1, c_error);
-    }
+    if (request.fields_count) *request.fields_count = static_cast<ustore_size_t>(sorted_paths.size());
+    if (request.offsets) *request.offsets = exported_paths.offsets().begin().get();
+    if (request.fields) *request.fields = reinterpret_cast<ustore_char_t*>(exported_paths.contents().begin().get());
 }
 
-void ustore_docs_gist(ustore_docs_gist_t* c_ptr) {
+void ustore_docs_gather(ustore_docs_gather_t* request_pointer) {
+    ustore_docs_gather_t& request = *request_pointer;
+    if (!request.docs_count || !request.fields_count) return;
 
-    ustore_docs_gist_t& c = *c_ptr;
-    if (!c.docs_count)
-        return;
+    linked_memory_lock_t arena = linked_memory(request.arena, request.options, request.error);
+    if (request.error->status) return;
 
-    linked_memory_lock_t arena = linked_memory(c.arena, c.options, c.error);
-    return_if_error_m(c.error);
+    strided_iterator<ustore_collection_t const> collections {request.collections, request.collections_stride};
+    strided_iterator<ustore_key_t const> keys {request.keys, request.keys_stride};
+    strided_iterator<ustore_str_view_t const> fields {request.fields, request.fields_stride};
+    strided_iterator<ustore_doc_field_type_t const> types {request.types, request.types_stride};
+    places_arg_t const places {collections, keys, {}, request.docs_count};
+    found_documents_t const found = read_documents(request.db, request.transaction, request.snapshot, places,
+                                                   request.options, arena, request.error);
+    if (request.error->status) return;
 
-    ustore_byte_t* found_binary_begin {};
-    ustore_length_t* found_binary_offs {};
-    ustore_read_t read {};
-    read.db = c.db;
-    read.error = c.error;
-    read.transaction = c.transaction;
-    read.snapshot = c.snapshot;
-    read.arena = arena;
-    read.options = c.options;
-    read.tasks_count = c.docs_count;
-    read.collections = c.collections;
-    read.collections_stride = c.collections_stride;
-    read.keys = c.keys;
-    read.keys_stride = c.keys_stride;
-    read.presences = nullptr;
-    read.offsets = &found_binary_offs;
-    read.lengths = nullptr;
-    read.values = &found_binary_begin;
+    // One tape holds six rows of column addresses, then the zeroed bitmaps, then the columns themselves.
+    std::size_t const fields_count = request.fields_count;
+    std::size_t const docs_count = request.docs_count;
+    std::size_t const bitmap_bytes = divide_round_up<std::size_t>(docs_count, bits_in_byte_k);
+    std::size_t const bitmaps_count = 1u + (request.columns_conversions != nullptr) +
+                                      (request.columns_collisions != nullptr);
+    std::size_t const address_row_bytes = sizeof(void*) * fields_count;
+    std::size_t const addresses_bytes = address_row_bytes * 6;
+    std::size_t const bitmaps_bytes = next_multiple<std::size_t>(bitmap_bytes * bitmaps_count * fields_count,
+                                                                 alignof(std::max_align_t));
+    std::size_t const columns_bytes = transform_reduce_n(
+        types, fields_count, std::size_t {0},
+        [docs_count](ustore_doc_field_type_t type) { return column_size_bytes(type, docs_count); });
 
-    ustore_read(&read);
-    return_if_error_m(c.error);
+    auto tape = arena.alloc<byte_t>(addresses_bytes + bitmaps_bytes + columns_bytes, request.error,
+                                    alignof(std::max_align_t));
+    if (request.error->status) return;
+    std::memset(tape.data() + addresses_bytes, 0, bitmaps_bytes);
 
-    strided_iterator_gt<ustore_collection_t const> collections {c.collections, c.collections_stride};
-    strided_iterator_gt<ustore_key_t const> keys {c.keys, c.keys_stride};
+    auto const validities = reinterpret_cast<ustore_octet_t**>(tape.data());
+    auto const conversions = reinterpret_cast<ustore_octet_t**>(tape.data() + address_row_bytes);
+    auto const collisions = reinterpret_cast<ustore_octet_t**>(tape.data() + address_row_bytes * 2);
+    auto const offsets = reinterpret_cast<ustore_length_t**>(tape.data() + address_row_bytes * 3);
+    auto const lengths = reinterpret_cast<ustore_length_t**>(tape.data() + address_row_bytes * 4);
+    auto const scalars = reinterpret_cast<ustore_byte_t**>(tape.data() + address_row_bytes * 5);
 
-    joined_blobs_t found_binaries {c.docs_count, found_binary_offs, found_binary_begin};
-    joined_blobs_iterator_t found_binary_it = found_binaries.begin();
+    auto bitmap = reinterpret_cast<ustore_octet_t*>(tape.data() + addresses_bytes);
+    byte_t* column = tape.data() + addresses_bytes + bitmaps_bytes;
+    for (std::size_t field_index = 0; field_index != fields_count; ++field_index) {
+        validities[field_index] = std::exchange(bitmap, bitmap + bitmap_bytes);
+        conversions[field_index] = request.columns_conversions ? std::exchange(bitmap, bitmap + bitmap_bytes)
+                                                               : validities[field_index];
+        collisions[field_index] = request.columns_collisions ? std::exchange(bitmap, bitmap + bitmap_bytes)
+                                                             : validities[field_index];
 
-    // Export all the elements into a heap-allocated hash-set, keeping only unique entries
-    field_path_buffer_t field_name = {0};
-    uninitialized_array_gt<std::string_view> sorted_paths(arena);
-    growing_tape_t exported_paths(arena);
-    for (ustore_size_t doc_idx = 0; doc_idx != c.docs_count; ++doc_idx, ++found_binary_it) {
-        value_view_t binary_doc = *found_binary_it;
-        if (!binary_doc)
-            continue;
-
-        json_t doc = any_parse(binary_doc, internal_format_k, arena, c.error);
-        return_if_error_m(c.error);
-        if (!doc)
-            continue;
-
-        yyjson_val* root = yyjson_doc_get_root(doc.handle);
-        gist_recursively(root, field_name, sorted_paths, exported_paths, c.error);
-        return_if_error_m(c.error);
+        ustore_doc_field_type_t const type = types[field_index];
+        bool const is_string = type == ustore_doc_field_str_k || type == ustore_doc_field_bin_k;
+        offsets[field_index] = is_string ? reinterpret_cast<ustore_length_t*>(column) : nullptr;
+        lengths[field_index] = is_string ? offsets[field_index] + docs_count + 1 : nullptr;
+        scalars[field_index] = is_string ? nullptr : reinterpret_cast<ustore_byte_t*>(column);
+        column += column_size_bytes(type, docs_count);
     }
 
-    if (c.fields_count)
-        *c.fields_count = static_cast<ustore_size_t>(sorted_paths.size());
-    if (c.offsets)
-        *c.offsets = exported_paths.offsets().begin().get();
-    if (c.fields)
-        *c.fields = reinterpret_cast<ustore_char_t*>(exported_paths.contents().begin().get());
-}
+    if (request.columns_validities) *request.columns_validities = validities;
+    if (request.columns_conversions) *request.columns_conversions = conversions;
+    if (request.columns_collisions) *request.columns_collisions = collisions;
+    if (request.columns_offsets) *request.columns_offsets = offsets;
+    if (request.columns_lengths) *request.columns_lengths = lengths;
+    if (request.columns_scalars) *request.columns_scalars = scalars;
 
-std::size_t doc_field_size_bytes(ustore_doc_field_type_t type) {
-    switch (type) {
-    default: return 0;
-    case ustore_doc_field_null_k: return 0;
-    case ustore_doc_field_bool_k: return 1;
-    case ustore_doc_field_uuid_k: return 16;
-
-    case ustore_doc_field_i8_k: return 1;
-    case ustore_doc_field_i16_k: return 2;
-    case ustore_doc_field_i32_k: return 4;
-    case ustore_doc_field_i64_k: return 8;
-
-    case ustore_doc_field_u8_k: return 1;
-    case ustore_doc_field_u16_k: return 2;
-    case ustore_doc_field_u32_k: return 4;
-    case ustore_doc_field_u64_k: return 8;
-
-    case ustore_doc_field_f16_k: return 2;
-    case ustore_doc_field_f32_k: return 4;
-    case ustore_doc_field_f64_k: return 8;
-
-    // Offsets and lengths:
-    case ustore_doc_field_bin_k: return 8;
-    case ustore_doc_field_str_k: return 8;
-    }
-}
-
-bool doc_field_is_variable_length(ustore_doc_field_type_t type) {
-    switch (type) {
-    case ustore_doc_field_bin_k: return true;
-    case ustore_doc_field_str_k: return true;
-    default: return false;
-    }
-}
-
-struct column_begin_t {
-    ustore_octet_t* validities;
-    ustore_octet_t* conversions;
-    ustore_octet_t* collisions;
-    ustore_byte_t* scalars;
-    ustore_length_t* str_offsets;
-    ustore_length_t* str_lengths;
-
-    template <typename scalar_at>
-    inline void set(std::size_t doc_idx, yyjson_val* value) noexcept {
-
-        ustore_octet_t mask = static_cast<ustore_octet_t>(1 << (doc_idx % CHAR_BIT));
-        ustore_octet_t& valid = validities[doc_idx / CHAR_BIT];
-        ustore_octet_t& convert = conversions[doc_idx / CHAR_BIT];
-        ustore_octet_t& collide = collisions[doc_idx / CHAR_BIT];
-        scalar_at& scalar = reinterpret_cast<scalar_at*>(scalars)[doc_idx];
-
-        json_to_scalar(value, mask, valid, convert, collide, scalar);
-    }
-
-    inline void set_str(std::size_t doc_idx,
-                        yyjson_val* value,
-                        printed_number_buffer_t& print_buffer,
-                        string_t& output,
-                        bool with_separator,
-                        bool is_last,
-                        ustore_error_t* c_error) noexcept {
-
-        ustore_octet_t mask = static_cast<ustore_octet_t>(1 << (doc_idx % CHAR_BIT));
-        ustore_octet_t& valid = validities[doc_idx / CHAR_BIT];
-        ustore_octet_t& convert = conversions[doc_idx / CHAR_BIT];
-        ustore_octet_t& collide = collisions[doc_idx / CHAR_BIT];
-        ustore_length_t& off = str_offsets[doc_idx];
-        ustore_length_t& len = str_lengths[doc_idx];
-
-        auto str = json_to_string(value, mask, valid, convert, collide, print_buffer);
-        off = static_cast<ustore_length_t>(output.size());
-        len = static_cast<ustore_length_t>(str.size());
-        output.insert(output.size(), str.begin(), str.end(), c_error);
-        return_if_error_m(c_error);
-        if (with_separator)
-            output.push_back('\0', c_error);
-        if (is_last)
-            str_offsets[doc_idx + 1] = static_cast<ustore_length_t>(output.size());
-    }
-};
-
-void ustore_docs_gather(ustore_docs_gather_t* c_ptr) {
-
-    ustore_docs_gather_t& c = *c_ptr;
-    if (!c.docs_count || !c.fields_count)
-        return;
-
-    linked_memory_lock_t arena = linked_memory(c.arena, c.options, c.error);
-    return_if_error_m(c.error);
-
-    // Retrieve the entire documents before we can sample internal fields
-    ustore_byte_t* found_binary_begin {};
-    ustore_length_t* found_binary_offs {};
-    ustore_read_t read {};
-    read.db = c.db;
-    read.error = c.error;
-    read.transaction = c.transaction;
-    read.snapshot = c.snapshot;
-    read.arena = arena;
-    read.options = c.options;
-    read.tasks_count = c.docs_count;
-    read.collections = c.collections;
-    read.collections_stride = c.collections_stride;
-    read.keys = c.keys;
-    read.keys_stride = c.keys_stride;
-    read.offsets = &found_binary_offs;
-    read.values = &found_binary_begin;
-
-    ustore_read(&read);
-    return_if_error_m(c.error);
-
-    strided_iterator_gt<ustore_collection_t const> collections {c.collections, c.collections_stride};
-    strided_iterator_gt<ustore_key_t const> keys {c.keys, c.keys_stride};
-    strided_iterator_gt<ustore_str_view_t const> fields {c.fields, c.fields_stride};
-    strided_iterator_gt<ustore_doc_field_type_t const> types {c.types, c.types_stride};
-
-    joined_blobs_t found_binaries {c.docs_count, found_binary_offs, found_binary_begin};
-    joined_blobs_iterator_t found_binary_it = found_binaries.begin();
-
-    // Estimate the amount of memory needed to store at least scalars and columns addresses
-    // TODO: Align offsets of bitmaps to 64-byte boundaries for Arrow
-    // https://arrow.apache.org/docs/format/Columnar.html#buffer-alignment-and-padding
-    // TODO: Align offsets of bitmaps to 64-byte boundaries for Arrow
-    // https://arrow.apache.org/docs/format/Columnar.html#buffer-alignment-and-padding
-    bool wants_conversions = c.columns_conversions;
-    bool wants_collisions = c.columns_collisions;
-    std::size_t slots_per_bitmap = divide_round_up<std::size_t>(c.docs_count, bits_in_byte_k);
-    std::size_t count_bitmaps = 1ul + wants_conversions + wants_collisions;
-    std::size_t bytes_per_bitmap = sizeof(ustore_octet_t) * slots_per_bitmap;
-    std::size_t bytes_per_addresses_row = sizeof(void*) * c.fields_count;
-    std::size_t bytes_for_addresses = bytes_per_addresses_row * 6 + sizeof(ustore_length_t);
-    std::size_t bytes_for_bitmaps = bytes_per_bitmap * count_bitmaps * c.fields_count * c.fields_count;
-    std::size_t bytes_per_scalars_row = transform_reduce_n(types, c.fields_count, 0ul, &doc_field_size_bytes);
-    std::size_t bytes_for_scalars = bytes_per_scalars_row * c.docs_count;
-
-    std::size_t string_columns = transform_reduce_n(types, c.fields_count, 0ul, doc_field_is_variable_length);
-    bool has_string_columns = string_columns != 0;
-    bool has_scalar_columns = string_columns != c.fields_count;
-
-    // Preallocate at least a minimum amount of memory.
-    // It will be organized in the following way:
-    // 1. validity bitmaps for all fields
-    // 2. optional conversion bitmaps for all fields
-    // 3. optional collision bitmaps for all fields
-    // 4. offsets of all strings
-    // 5. lengths of all strings
-    // 6. scalars for all fields
-
-    auto tape = arena.alloc<byte_t>(bytes_for_addresses + bytes_for_bitmaps + bytes_for_scalars, c.error);
-    byte_t* const tape_ptr = tape.begin();
-
-    // If those pointers were not provided, we can reuse the validity bitmap
-    // It will allow us to avoid extra checks later.
-    // ! Still, in every sequence of updates, validity is the last bit to be set,
-    // ! to avoid overwriting.
-    auto first_collection_validities = reinterpret_cast<ustore_octet_t*>(tape_ptr + bytes_for_addresses);
-    auto first_collection_conversions = wants_conversions //
-                                            ? first_collection_validities + slots_per_bitmap * c.fields_count
-                                            : first_collection_validities;
-    auto first_collection_collisions = wants_collisions //
-                                           ? first_collection_conversions + slots_per_bitmap * c.fields_count
-                                           : first_collection_validities;
-    auto first_collection_scalars =
-        reinterpret_cast<ustore_byte_t*>(tape_ptr + bytes_for_addresses + bytes_for_bitmaps);
-
-    // 1, 2, 3. Export validity maps addresses
-    std::size_t tape_progress = 0;
-    {
-        auto addresses = reinterpret_cast<ustore_octet_t**>(tape_ptr + tape_progress);
-        if (c.columns_validities)
-            *c.columns_validities = addresses;
-        for (ustore_size_t field_idx = 0; field_idx != c.fields_count; ++field_idx)
-            addresses[field_idx] = first_collection_validities + field_idx * slots_per_bitmap;
-        tape_progress += bytes_per_addresses_row;
-    }
-    if (wants_conversions) {
-        auto addresses = reinterpret_cast<ustore_octet_t**>(tape_ptr + tape_progress);
-        if (c.columns_conversions)
-            *c.columns_conversions = addresses;
-        for (ustore_size_t field_idx = 0; field_idx != c.fields_count; ++field_idx)
-            addresses[field_idx] = first_collection_conversions + field_idx * slots_per_bitmap;
-        tape_progress += bytes_per_addresses_row;
-    }
-    if (wants_collisions) {
-        auto addresses = reinterpret_cast<ustore_octet_t**>(tape_ptr + tape_progress);
-        if (c.columns_collisions)
-            *c.columns_collisions = addresses;
-        for (ustore_size_t field_idx = 0; field_idx != c.fields_count; ++field_idx)
-            addresses[field_idx] = first_collection_collisions + field_idx * slots_per_bitmap;
-        tape_progress += bytes_per_addresses_row;
-    }
-
-    // 4, 5, 6. Export addresses for scalars, strings offsets and strings lengths
-    auto addresses_offs = reinterpret_cast<ustore_length_t**>(tape_ptr + tape_progress + bytes_per_addresses_row * 0);
-    if (c.columns_offsets)
-        *c.columns_offsets = addresses_offs;
-    auto addresses_lens = reinterpret_cast<ustore_length_t**>(tape_ptr + tape_progress + bytes_per_addresses_row * 1);
-    if (c.columns_lengths)
-        *c.columns_lengths = addresses_lens;
-    auto addresses_scalars = reinterpret_cast<ustore_byte_t**>(tape_ptr + tape_progress + bytes_per_addresses_row * 2);
-    if (c.columns_scalars)
-        *c.columns_scalars = addresses_scalars;
-
-    {
-        auto scalars_tape = first_collection_scalars;
-        for (ustore_size_t field_idx = 0; field_idx != c.fields_count; ++field_idx) {
-            ustore_doc_field_type_t type = types[field_idx];
-            switch (type) {
-            case ustore_doc_field_str_k:
-            case ustore_doc_field_bin_k:
-                addresses_offs[field_idx] = reinterpret_cast<ustore_length_t*>(scalars_tape);
-                addresses_lens[field_idx] = addresses_offs[field_idx] + c.docs_count + 1;
-                addresses_scalars[field_idx] = nullptr;
-                break;
-            default:
-                addresses_offs[field_idx] = nullptr;
-                addresses_lens[field_idx] = nullptr;
-                addresses_scalars[field_idx] = reinterpret_cast<ustore_byte_t*>(scalars_tape);
-                break;
-            }
-            scalars_tape += doc_field_size_bytes(type) * c.docs_count + sizeof(ustore_length_t);
-        }
-    }
-
-    // Go though all the documents extracting and type-checking the relevant parts
     printed_number_buffer_t print_buffer;
-    string_t string_tape(arena);
-    for (ustore_size_t doc_idx = 0; doc_idx != c.docs_count; ++doc_idx, ++found_binary_it) {
-        value_view_t binary_doc = *found_binary_it;
-        json_t doc = any_parse(binary_doc, internal_format_k, arena, c.error);
-        return_if_error_m(c.error);
-        if (!doc)
-            continue;
-        yyjson_val* root = yyjson_doc_get_root(doc.handle);
+    uninitialized_array<char> joined {arena};
+    for (std::size_t document_index = 0; document_index != docs_count; ++document_index) {
+        json_t const document = json_parse(found[document_index], arena, request.error);
+        if (request.error->status) return;
+        yyjson_val* const root = yyjson_doc_get_root(document.handle);
+        std::size_t const slot = document_index / bits_in_byte_k;
+        ustore_octet_t const mask = static_cast<ustore_octet_t>(1u << (document_index % bits_in_byte_k));
 
-        for (ustore_size_t field_idx = 0; field_idx != c.fields_count; ++field_idx) {
+        for (std::size_t field_index = 0; field_index != fields_count; ++field_index) {
+            yyjson_val* const value = json_lookup(root, fields[field_index]);
+            ustore_doc_field_type_t const type = types[field_index];
+            ustore_byte_t* const scalar_column = scalars[field_index];
+            conversion_t conversion = conversion_t::collides_k;
 
-            // Find this field within document
-            ustore_doc_field_type_t type = types[field_idx];
-            ustore_str_view_t field = fields[field_idx];
-            yyjson_val* found_value = json_lookup(root, field);
-
-            column_begin_t column {};
-            column.validities = (*c.columns_validities)[field_idx];
-            column.conversions = (*(c.columns_conversions ? c.columns_conversions : c.columns_validities))[field_idx];
-            column.collisions = (*(c.columns_collisions ? c.columns_collisions : c.columns_validities))[field_idx];
-            column.scalars = addresses_scalars[field_idx];
-            column.str_offsets = addresses_offs[field_idx];
-            column.str_lengths = addresses_lens[field_idx];
-
-            bool is_last = doc_idx == c.docs_count - 1;
-            // Export the types
             switch (type) {
-
-            case ustore_doc_field_bool_k: column.set<bool>(doc_idx, found_value); break;
-
-            case ustore_doc_field_i8_k: column.set<std::int8_t>(doc_idx, found_value); break;
-            case ustore_doc_field_i16_k: column.set<std::int16_t>(doc_idx, found_value); break;
-            case ustore_doc_field_i32_k: column.set<std::int32_t>(doc_idx, found_value); break;
-            case ustore_doc_field_i64_k: column.set<std::int64_t>(doc_idx, found_value); break;
-
-            case ustore_doc_field_u8_k: column.set<std::uint8_t>(doc_idx, found_value); break;
-            case ustore_doc_field_u16_k: column.set<std::uint16_t>(doc_idx, found_value); break;
-            case ustore_doc_field_u32_k: column.set<std::uint32_t>(doc_idx, found_value); break;
-            case ustore_doc_field_u64_k: column.set<std::uint64_t>(doc_idx, found_value); break;
-
-            case ustore_doc_field_f32_k: column.set<float>(doc_idx, found_value); break;
-            case ustore_doc_field_f64_k: column.set<double>(doc_idx, found_value); break;
-
+            case ustore_doc_field_bool_k: conversion = gather_scalar<bool>(value, scalar_column, document_index); break;
+            case ustore_doc_field_f64_k:
+                conversion = gather_scalar<double>(value, scalar_column, document_index);
+                break;
+            case ustore_doc_field_f32_k: conversion = gather_scalar<float>(value, scalar_column, document_index); break;
+            case ustore_doc_field_i64_k:
+                conversion = gather_scalar<std::int64_t>(value, scalar_column, document_index);
+                break;
+            case ustore_doc_field_i32_k:
+                conversion = gather_scalar<std::int32_t>(value, scalar_column, document_index);
+                break;
+            case ustore_doc_field_i16_k:
+                conversion = gather_scalar<std::int16_t>(value, scalar_column, document_index);
+                break;
+            case ustore_doc_field_i8_k:
+                conversion = gather_scalar<std::int8_t>(value, scalar_column, document_index);
+                break;
+            case ustore_doc_field_u64_k:
+                conversion = gather_scalar<std::uint64_t>(value, scalar_column, document_index);
+                break;
+            case ustore_doc_field_u32_k:
+                conversion = gather_scalar<std::uint32_t>(value, scalar_column, document_index);
+                break;
+            case ustore_doc_field_u16_k:
+                conversion = gather_scalar<std::uint16_t>(value, scalar_column, document_index);
+                break;
+            case ustore_doc_field_u8_k:
+                conversion = gather_scalar<std::uint8_t>(value, scalar_column, document_index);
+                break;
             case ustore_doc_field_str_k:
-                column.set_str(doc_idx, found_value, print_buffer, string_tape, true, is_last, c.error);
+            case ustore_doc_field_bin_k: {
+                std::string_view text;
+                conversion = json_to_string(value, print_buffer, text);
+                offsets[field_index][document_index] = static_cast<ustore_length_t>(joined.size());
+                lengths[field_index][document_index] = static_cast<ustore_length_t>(text.size());
+                joined.insert(joined.size(), text.data(), text.data() + text.size(), request.error);
+                if (request.error->status) return;
+                if (type == ustore_doc_field_str_k) joined.push_back('\0', request.error);
+                if (request.error->status) return;
+                offsets[field_index][document_index + 1] = static_cast<ustore_length_t>(joined.size());
                 break;
-            case ustore_doc_field_bin_k:
-                column.set_str(doc_idx, found_value, print_buffer, string_tape, false, is_last, c.error);
-                break;
-
+            }
             default: break;
             }
+
+            record_conversion(conversion, mask, validities[field_index][slot], conversions[field_index][slot],
+                              collisions[field_index][slot]);
         }
     }
 
-    *c.joined_strings = reinterpret_cast<ustore_byte_t*>(string_tape.data());
+    if (request.joined_strings) *request.joined_strings = reinterpret_cast<ustore_byte_t*>(joined.data());
 }
+
+#pragma endregion C Interface

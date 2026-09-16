@@ -43,14 +43,14 @@ class docs_collection_t {
     ustore_doc_field_type_t type_ {ustore_doc_field_json_k};
 
     status_t drop_with(ustore_drop_mode_t mode) noexcept {
-        status_t status;
+        ustore_error_t error {};
         ustore_collection_drop_t collection_drop {};
         collection_drop.db = db_;
-        collection_drop.error = status.member_ptr();
+        collection_drop.error = &error;
         collection_drop.id = collection_;
         collection_drop.mode = mode;
         ustore_collection_drop(&collection_drop);
-        return status;
+        return status_t {error};
     }
 
   public:
@@ -112,13 +112,14 @@ class docs_collection_t {
 
     expected<size_range_t> size_range() const noexcept {
         auto maybe = members().size_estimates();
-        return {maybe.release_status(), std::move(maybe->cardinality)};
+        if (!maybe) return maybe.status();
+        return maybe->cardinality;
     }
 
     /** Estimates the number of documents as the middle of @c size_range. */
     expected<std::size_t> size() const noexcept {
         auto maybe = size_range();
-        if (!maybe) return maybe.release_status();
+        if (!maybe) return maybe.status();
         return (maybe->min + maybe->max) / 2;
     }
 
