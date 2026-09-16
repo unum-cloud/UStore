@@ -279,51 +279,6 @@ strided_range<element_> strided(element_* begin, element_* end) noexcept {
     return {{begin, sizeof(element_)}, static_cast<std::size_t>(end - begin)};
 }
 
-/** A pointer pair whose empty and null states differ, with null standing for a missing range. */
-template <typename pointer_>
-class indexed_range {
-  public:
-    using pointer_t = pointer_;
-    using element_t = std::remove_pointer_t<pointer_>;
-    using strided_t = strided_range<element_t>;
-    using value_type = std::remove_cv_t<element_t>;
-    using reference = element_t&;
-
-  private:
-    pointer_ begin_ {nullptr};
-    pointer_ end_ {nullptr};
-
-  public:
-    indexed_range() = default;
-    indexed_range(pointer_ begin, pointer_ end) noexcept : begin_(begin), end_(end) {}
-    indexed_range(pointer_ begin, std::size_t count) noexcept : begin_(begin), end_(begin + count) {}
-
-    pointer_ data() const noexcept { return begin_; }
-    pointer_ begin() const noexcept { return begin_; }
-    pointer_ end() const noexcept { return end_; }
-    reference operator[](std::size_t index) const noexcept { return begin_[index]; }
-    reference at(std::size_t index) const noexcept { return begin_[index]; }
-
-    std::size_t size() const noexcept { return static_cast<std::size_t>(end_ - begin_); }
-    std::size_t size_bytes() const noexcept { return size() * sizeof(element_t); }
-    bool empty() const noexcept { return end_ == begin_; }
-    explicit operator bool() const noexcept { return end_ != begin_; }
-    operator strided_t() const noexcept { return strided(); }
-    strided_t strided() const noexcept { return {{begin_, sizeof(element_t)}, size()}; }
-
-    template <typename other_>
-    indexed_range<other_*> cast() const noexcept {
-        return {reinterpret_cast<other_*>(begin_), size_bytes() / sizeof(other_)};
-    }
-
-    indexed_range<byte_t const*> span_bytes() const noexcept {
-        return {reinterpret_cast<byte_t const*>(begin_), size_bytes()};
-    }
-};
-
-template <typename element_>
-using ptr_range = indexed_range<element_*>;
-
 /** A pair of iterators, so that a move-only stream can drive a range-based loop. */
 template <typename iterator_>
 class range {

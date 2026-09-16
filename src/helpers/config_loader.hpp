@@ -7,9 +7,8 @@
 
 #pragma once
 
-#include <cstddef>    // `std::size_t`
-#include <cstdint>    // `std::int64_t`, `std::uint64_t`, `std::uint8_t`
-#include <sys/stat.h> // `stat`, `S_ISDIR`
+#include <cstddef> // `std::size_t`
+#include <cstdint> // `std::int64_t`, `std::uint64_t`, `std::uint8_t`
 
 #include <charconv>     // `std::from_chars`
 #include <concepts>     // `std::floating_point`, `std::integral`, `std::same_as`
@@ -57,7 +56,7 @@ class json_document_t {
 /** Parses JSON text that may carry comments into @p document. */
 inline status_t parse_json(std::string_view text, json_document_t& document) noexcept {
     yyjson_doc* const parsed = yyjson_read(text.data(), text.size(), YYJSON_READ_ALLOW_COMMENTS);
-    if (!parsed) return "Invalid JSON";
+    if (!parsed) return {status_code_t::malformed_k, "Invalid JSON"};
     document = json_document_t(parsed);
     return {};
 }
@@ -65,7 +64,7 @@ inline status_t parse_json(std::string_view text, json_document_t& document) noe
 /** Parses the JSON file at the null-terminated @p path into @p document. */
 inline status_t load_json_file(char const* path, json_document_t& document) noexcept {
     yyjson_doc* const parsed = yyjson_read_file(path, YYJSON_READ_ALLOW_COMMENTS, nullptr, nullptr);
-    if (!parsed) return "Config file not found or invalid";
+    if (!parsed) return {status_code_t::io_k, "Config file not found or invalid"};
     document = json_document_t(parsed);
     return {};
 }
@@ -171,12 +170,6 @@ inline bool parse_version(std::string_view text, std::uint8_t& major, std::uint8
     return minor_error == std::errc {} && minor_end == text_end;
 }
 
-/** Whether the null-terminated @p path names an existing directory. */
-inline bool is_directory(char const* path) noexcept {
-    struct stat information;
-    return ::stat(path, &information) == 0 && S_ISDIR(information.st_mode);
-}
-
 #pragma endregion Parsing
 
 #pragma region Configuration
@@ -231,10 +224,10 @@ struct config_t {
 
 /** Parses and validates a configuration, filling @p config only as far as it is valid. */
 inline status_t load_config(std::string_view text, config_t& config) noexcept {
-    if (status_t parsed = parse_json(text, config.document); !parsed) return parsed;
+    if (status_t const parsed = parse_json(text, config.document); parsed.failed()) return parsed;
 
     yyjson_val* const root = config.document.root();
-    if (!yyjson_is_obj(root)) return "Config isn't a JSON object";
+    if (!yyjson_is_obj(root)) return {status_code_t::malformed_k, "Config isn't a JSON object"};
 
     // A configuration without a version reads as the current format.
     if (yyjson_obj_get(root, "version")) {
@@ -242,35 +235,41 @@ inline status_t load_config(std::string_view text, config_t& config) noexcept {
         std::uint8_t major = 0;
         std::uint8_t minor = 0;
         if (!read_json_member(root, "version", version) || !parse_version(version, major, minor))
-            return "Invalid version format";
-        if (major != config_major_version_k || minor != config_minor_version_k) return "Version not supported";
+            return {status_code_t::malformed_k, "Invalid version format"};
+        if (major != config_major_version_k || minor != config_minor_version_k)
+            return {status_code_t::unsupported_k, "Version not supported"};
     }
 
-    if (!read_json_member(root, "directory", config.directory)) return "Invalid directory";
+    if (!read_json_member(root, "directory", config.directory))
+        return {status_code_t::malformed_k, "Invalid directory"};
 
     yyjson_val* const directories = yyjson_obj_get(root, "data_directories");
-    if (directories && !yyjson_is_arr(directories)) return "Invalid data directories config";
+    if (directories && !yyjson_is_arr(directories))
+        return {status_code_t::malformed_k, "Invalid data directories config"};
     if (st::failed(config.data_directories.reserve(yyjson_arr_size(directories))))
-        return "Out of memory for data directories";
+        return {status_code_t::out_of_memory_k, "Out of memory for data directories"};
 
     yyjson_arr_iter directories_iterator;
     yyjson_arr_iter_init(directories, &directories_iterator);
     while (yyjson_val* const entry = yyjson_arr_iter_next(&directories_iterator)) {
         disk_config_t disk;
-        if (!read_json_member(entry, "path", disk.path) || disk.path.empty()) return "Empty data directory path";
-        if (!read_json_volume(entry, "max_size", disk.max_size)) return "Invalid volume format";
-        if (st::failed(config.data_directories.push_back(std::move(disk)))) return "Out of memory for data directories";
+        if (!read_json_member(entry, "path", disk.path) || disk.path.empty())
+            return {status_code_t::malformed_k, "Empty data directory path"};
+        if (!read_json_volume(entry, "max_size", disk.max_size))
+            return {status_code_t::malformed_k, "Invalid volume format"};
+        if (st::failed(config.data_directories.push_back(std::move(disk))))
+            return {status_code_t::out_of_memory_k, "Out of memory for data directories"};
     }
 
     yyjson_val* const engine = yyjson_obj_get(root, "engine");
     if (!engine) return {};
     if (!yyjson_is_obj(engine) || !read_json_member(engine, "config_url", config.engine.config_url) ||
         !read_json_member(engine, "config_file_path", config.engine.config_file_path))
-        return "Invalid engine config";
+        return {status_code_t::malformed_k, "Invalid engine config"};
 
     yyjson_val* const nested = yyjson_obj_get(engine, "config");
     if (!nested || yyjson_is_null(nested)) return {};
-    if (!yyjson_is_obj(nested)) return "Invalid engine config";
+    if (!yyjson_is_obj(nested)) return {status_code_t::malformed_k, "Invalid engine config"};
     if (yyjson_obj_size(nested) != 0) config.engine.config = nested;
     return {};
 }

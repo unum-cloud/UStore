@@ -7,8 +7,8 @@
 
 #pragma once
 
-#include <cstddef> // `std::size_t`
-#include <cstdint> // `SIZE_MAX`, `std::uint8_t`
+#include <cstddef> // `std::byte`, `std::size_t`
+#include <cstdint> // `SIZE_MAX`, `std::int64_t`, `std::uint64_t`
 #include <cstring> // `std::strlen`
 
 #include <algorithm>   // `std::ranges::equal`
@@ -35,8 +35,21 @@ namespace sz = ashvardanian::stringzilla;
 
 namespace unum::ustore {
 
+using f64_t = double;
+using f32_t = float;
+
+using i64_t = std::int64_t;
+using i32_t = std::int32_t;
+using i16_t = std::int16_t;
+using i8_t = std::int8_t;
+
+using u64_t = std::uint64_t;
+using u32_t = std::uint32_t;
+using u16_t = std::uint16_t;
+using u8_t = std::uint8_t;
+
 /** A single byte of a stored value, kept distinct from characters and integers. */
-enum class byte_t : std::uint8_t {};
+using byte_t = std::byte;
 
 #pragma region Access Modes
 
@@ -379,16 +392,16 @@ integer_ next_multiple(integer_ value, integer_ divisor) noexcept {
 template <typename element_>
 constexpr ustore_doc_field_type_t ustore_doc_field() noexcept {
     if constexpr (std::is_same_v<element_, bool>) return ustore_doc_field_bool_k;
-    if constexpr (std::is_same_v<element_, std::int8_t>) return ustore_doc_field_i8_k;
-    if constexpr (std::is_same_v<element_, std::int16_t>) return ustore_doc_field_i16_k;
-    if constexpr (std::is_same_v<element_, std::int32_t>) return ustore_doc_field_i32_k;
-    if constexpr (std::is_same_v<element_, std::int64_t>) return ustore_doc_field_i64_k;
-    if constexpr (std::is_same_v<element_, std::uint8_t>) return ustore_doc_field_u8_k;
-    if constexpr (std::is_same_v<element_, std::uint16_t>) return ustore_doc_field_u16_k;
-    if constexpr (std::is_same_v<element_, std::uint32_t>) return ustore_doc_field_u32_k;
-    if constexpr (std::is_same_v<element_, std::uint64_t>) return ustore_doc_field_u64_k;
-    if constexpr (std::is_same_v<element_, float>) return ustore_doc_field_f32_k;
-    if constexpr (std::is_same_v<element_, double>) return ustore_doc_field_f64_k;
+    if constexpr (std::is_same_v<element_, f64_t>) return ustore_doc_field_f64_k;
+    if constexpr (std::is_same_v<element_, f32_t>) return ustore_doc_field_f32_k;
+    if constexpr (std::is_same_v<element_, i64_t>) return ustore_doc_field_i64_k;
+    if constexpr (std::is_same_v<element_, i32_t>) return ustore_doc_field_i32_k;
+    if constexpr (std::is_same_v<element_, i16_t>) return ustore_doc_field_i16_k;
+    if constexpr (std::is_same_v<element_, i8_t>) return ustore_doc_field_i8_k;
+    if constexpr (std::is_same_v<element_, u64_t>) return ustore_doc_field_u64_k;
+    if constexpr (std::is_same_v<element_, u32_t>) return ustore_doc_field_u32_k;
+    if constexpr (std::is_same_v<element_, u16_t>) return ustore_doc_field_u16_k;
+    if constexpr (std::is_same_v<element_, u8_t>) return ustore_doc_field_u8_k;
     if constexpr (std::is_same_v<element_, value_view_t>) return ustore_doc_field_bin_k;
     if constexpr (std::is_same_v<element_, std::string_view> || std::is_same_v<element_, ustore_str_view_t>)
         return ustore_doc_field_str_k;

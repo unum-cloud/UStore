@@ -1,49 +1,82 @@
-# Implementation Details
+# Engines
 
-## Architecture
+Every engine implements the C ABI of `include/ustore/*.h` over its own storage, and links with `c/docs.cpp` and `c/graph.cpp` into one `ustore_embedded_<engine>` library, so documents and graphs work on each of them.
+The engines fill three roles: SmashTable is the reference engine in memory, UDisk is the hyper-converged engine on NVMe drives and GPUs, and RocksDB and LevelDB bring third-party key-value stores behind the same calls.
+Engines aim for the highest isolation SmashTable delivers, each reports the level its transactions actually deliver, and the conformance suite checks every advertised level against behaviour.
 
-Every supported Key-Value Store has it's own wrapper:
+| Engine     | Directory         | Role                  | Builds today | Isolation                                    |
+| :--------- | :---------------- | :-------------------- | :----------- | :------------------------------------------- |
+| SmashTable | `src/smashtable/` | reference, in memory  | always       | `strict_serializable` or `snapshot`, at open |
+| RocksDB    | `src/rocksdb/`    | third-party key-value | optional     | optimistic, reads see the latest commit      |
+| LevelDB    | `src/leveldb/`    | third-party key-value | optional     | snapshot reads, no transactions              |
+| UDisk      | `src/udisk/`      | hyper-converged       | v1 target    | optimistic, SmashTable's levels in v1        |
 
-- `engine_ucset.cpp` for [unum-cloud/ucset](github.com/unum-cloud/ucset) in-memory AVL trees,
-- `engine_leveldb.cpp` for [google/leveldb](github.com/google/leveldb) persistent B trees,
-- `engine_rocksdb.cpp` for [facebook/rocksdb](github.com/facebook/rocksdb) persistent LSM trees.
+## SmashTable
 
-Every server protocol has it's own implementation file:
+`src/smashtable/` is the reference in-memory engine, and the one every other engine is checked against.
+All collections and the catalog of their names share one stamp-based SmashTable `partitioned_store` ordered by collection and key, because collections appear at runtime while a `transaction_group` spans stores fixed at compile time.
+One library serves both isolation levels: the `"isolation"` key picks one at open, each exported call visits the chosen instantiation once, and the `info` request of `ustore_database_control` reports it.
 
-- `flight_server.cpp` for Apache Arrow Flight RPC server,
-- `rest_server.cpp` for now **deprecated** REST server,
-- `json_rpc_server.c` for the minimalistic JSON-RPC server.
+- `strict_serializable_k` validates every read and window, so `ustore_option_transaction_dont_watch_k` has nothing to switch off.
+- `snapshot_k` validates only the reads a transaction watches, trading write skew for cheaper commits.
 
-Some protocols, come with pre-built wrappers:
+Snapshots map onto the versions the store already keeps.
+A database opened with a directory persists as one binary image, rewritten whole on a flush and on close.
 
-- `flight_client.cpp` for Apache Arrow Flight RPC client.
+## RocksDB
 
-On top of the binary layer, every structured modality has it's own serialization:
+`src/rocksdb/` keeps each named collection as a column family of a RocksDB `OptimisticTransactionDB`, with fixed-width keys under a custom comparator.
+A transaction reads through `GetForUpdate` unless the call passes `ustore_option_transaction_dont_watch_k`, and RocksDB validates the keys it tracked at commit.
+Transactions begin without a snapshot, so each read sees the latest value committed when it runs.
 
-- `modality_docs.cpp` for JSON, BSON and MessagePack documents,
-- `modality_graph.cpp` for Directed Multi-Graphs,
-- `modality_vectors.cpp` for Approximate Vector Search,
-- `modality_paths.cpp` for String and Path-like keys.
+## LevelDB
+
+`src/leveldb/` wraps one LevelDB database with snapshots, but without named collections or transactions: `ustore_transaction_init` fails with an error.
+Its isolation ends at reading from a snapshot.
+
+## UDisk
+
+`src/udisk/` is the hyper-converged engine, and the one UStore's hardware paths serve.
+A `database` holds `collection`s, each an `lsm_tree` of `lsm_level`s whose `lsm_sorted_run` files open with a `sorted_run_index` of `key_slot`s ahead of their `stored_value`s, with optimistic transactions, snapshots and backups.
+Its graph database keeps adjacency in UDisk's own databases, as a fast path beside `c/graph.cpp`.
+CMake refuses `USTORE_BUILD_UDISK` until the sources in this directory build in tree, so everything below is a v1 target:
+
+- __Kernel bypass__ — a transport chosen at mount reaches each data directory through io_uring on `O_DIRECT` files, io_uring on NVMe block devices, NVMe passthrough, or SPDK's user-space driver, and falls back to blocking positioned I/O on macOS, Windows and wherever io_uring is refused.
+- __SIMD point lookups__ — sorted run indexes, micro-sets and ring buffers become SmashTable components with compile-time SIMD kits, one artifact carrying all of them and a database choosing one when it opens.
+- __GPU bulk operations__ — compaction merges sorted runs on the CPU or on a CUDA GPU, runs on both Hopper and Blackwell, and produces the same output as CPU compaction.
+- __GPUDirect Storage__ — sorted runs move between NVMe drives and GPU memory without staging in host memory.
+- __Isolation__ — in-flight transactions reach SmashTable's levels once they run on SmashTable, after an analysis shows no loss of consistency or efficiency.
+
+See [`udisk/README.md`](udisk/README.md) for its layers.
+
+## Helpers
+
+`src/helpers/` holds what several engines share:
+
+- `config_loader.hpp` — the JSON database configuration on yyjson, until a schema-backed loader of intent keys replaces it.
+- `linked_memory.hpp` and `linked_array.hpp` — the arena behind each C ABI call, and the non-throwing arrays grown inside it.
+- `algorithm.hpp` and `full_scan.hpp` — STL algorithms over strided iterators, and a callback-driven full scan of a blob collection.
+- `blocking_files.hpp` — positional file reads and writes, and directory queries, that block the calling thread and report a `status_t`.
+
+All but the configuration loader give way to `std::ranges`, SmashTable walks and ForkUnion allocators.
+Beside the engine directories, `src/executor.hpp` is the one owner of threads, topology and domain-placed memory over ForkUnion's C ABI, and nothing else calls `fu_*` directly, while `src/cuda.hpp` is the CUDA device layer GPU compaction builds on.
 
 ## Dependencies
 
-All implementations of all modalities try to avoid dynamic memory allocations.
-Every call uses its own arena, until he needs to grow beyond it.
-Largely for that reason we chose to use the following libraries for the implementation of logic across different modalities:
+| Dependency        | Used by                    | Role                                                              |
+| :---------------- | :------------------------- | :---------------------------------------------------------------- |
+| SmashTable        | SmashTable engine, UDisk   | Ordered and hash collections, transactions, snapshots, `expected` |
+| StringZilla       | Every engine               | Strings                                                           |
+| ForkUnion         | `executor.hpp`             | Threads, topology and domain-placed memory                        |
+| NumKong           | UDisk's components         | SIMD kernels                                                      |
+| yyjson            | Every engine               | JSON documents and configuration                                  |
+| RocksDB           | RocksDB engine             | Persistent LSM trees with optimistic transactions                 |
+| LevelDB           | LevelDB engine             | Persistent LSM tree with snapshots                                |
+| fmt               | UDisk                      | Formatting logs and file names                                    |
+| Thrust            | UDisk                      | Sorting and merging key slots on the host                         |
+| CUDA and CUB      | UDisk, optional            | GPU compaction                                                    |
+| GPUDirect Storage | UDisk, optional, v1 target | Reads and writes between NVMe drives and GPU memory               |
+| liburing          | UDisk                      | Asynchronous file I/O, until v1's raw io_uring system calls       |
+| SPDK              | UDisk, optional            | User-space NVMe access                                            |
 
-- For Documents:
-  - `yyjson`: to update the state of documents.
-  - `simdjson`: to sample fields from immutable documents.
-  - `mongo-c-driver`: to support BSON inputs.
-  - `zlib` for document compression. 🔜
-- For Paths:
-  - `pcre2`: to JIT Regular Expressions.
-- For Graphs:
-  - `turbopfor` for graph compression. 🔜
-
-More broadly:
-
-- `jemalloc` for faster NUMA-aware allocations.
-- `arrow` for shared memory columnar representations.
-- `arrow_flight` for gRPC implementation.
-- `fmt` for string formatting of gRPC requests.
+UDisk's sources also include the `container`, `primitive`, `algo`, `utils` and `io` headers of a library that is not in this tree, and those give way to SmashTable, NumKong, StringZilla and ForkUnion.

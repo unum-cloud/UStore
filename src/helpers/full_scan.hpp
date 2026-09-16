@@ -12,8 +12,9 @@
 
 #include <chrono> // `std::chrono::steady_clock`
 #include <random> // `std::minstd_rand`, `std::uniform_int_distribution`
+#include <span>   // `std::span`
 
-#include <ustore/ranges.hpp> // `ptr_range`
+#include <ustore/types.hpp> // `ustore_key_t`
 
 namespace unum::ustore {
 
@@ -25,7 +26,7 @@ namespace unum::ustore {
  *  @see https://en.wikipedia.org/wiki/Reservoir_sampling
  */
 template <typename iterator_>
-void reservoir_sample_iterator(iterator_&& iterator, ptr_range<ustore_key_t> sampled_keys, ustore_error_t* error) {
+void reservoir_sample_iterator(iterator_&& iterator, std::span<ustore_key_t> sampled_keys, ustore_error_t* error) {
 
     auto const seed = static_cast<std::minstd_rand::result_type>(
         std::chrono::steady_clock::now().time_since_epoch().count());
@@ -34,7 +35,7 @@ void reservoir_sample_iterator(iterator_&& iterator, ptr_range<ustore_key_t> sam
     std::size_t visited = 0;
     for (iterator->SeekToFirst(); visited < sampled_keys.size(); ++visited, iterator->Next()) {
         if (!iterator->Valid()) {
-            *error = "Sample Failure!";
+            *error = {ustore_error_invalid_argument_k, "The collection holds fewer keys than the sample needs"};
             return;
         }
         std::memcpy(&sampled_keys[visited], iterator->key().data(), sizeof(ustore_key_t));

@@ -494,26 +494,27 @@ inline void validate_write(ustore_transaction_t const transaction, places_arg_t 
     auto const allowed_options = ustore_option_transaction_dont_watch_k | ustore_option_dont_discard_memory_k |
                                  ustore_option_write_flush_k;
     if (!enum_is_subset(options, allowed_options)) {
-        *error = "Invalid options!";
+        *error = {ustore_error_invalid_argument_k, "Invalid options"};
         return;
     }
     if (transaction && (options & ustore_option_write_flush_k)) {
-        *error = "A transaction flushes at commit, not at a write";
+        *error = {ustore_error_invalid_argument_k, "A transaction flushes at commit, not at a write"};
         return;
     }
     if (!transaction && (options & ustore_option_transaction_dont_watch_k)) {
-        *error = "Only a transaction watches keys";
+        *error = {ustore_error_invalid_argument_k, "Only a transaction watches keys"};
         return;
     }
     if (!places.count) {
-        if (places.keys_begin) *error = "Keys were given for no tasks";
+        if (places.keys_begin) *error = {ustore_error_invalid_argument_k, "Keys were given for no tasks"};
         return;
     }
     if (!places.keys_begin) {
-        *error = "No keys were provided!";
+        *error = {ustore_error_invalid_argument_k, "No keys were provided"};
         return;
     }
-    if (!contents.contents_begin && (contents.lengths_begin || contents.offsets_begin)) *error = "Can't address NULLs!";
+    if (!contents.contents_begin && (contents.lengths_begin || contents.offsets_begin))
+        *error = {ustore_error_invalid_argument_k, "Lengths or offsets were given without contents"};
 }
 
 inline void validate_read(ustore_transaction_t const transaction, places_arg_t const& places,
@@ -522,14 +523,14 @@ inline void validate_read(ustore_transaction_t const transaction, places_arg_t c
     auto const allowed_options = ustore_option_transaction_dont_watch_k | ustore_option_dont_discard_memory_k |
                                  ustore_option_read_shared_memory_k;
     if (!enum_is_subset(options, allowed_options)) {
-        *error = "Invalid options!";
+        *error = {ustore_error_invalid_argument_k, "Invalid options"};
         return;
     }
     if (!transaction && (options & ustore_option_transaction_dont_watch_k)) {
-        *error = "Only a transaction watches keys";
+        *error = {ustore_error_invalid_argument_k, "Only a transaction watches keys"};
         return;
     }
-    if (!places.keys_begin) *error = "No keys were provided!";
+    if (!places.keys_begin) *error = {ustore_error_invalid_argument_k, "No keys were provided"};
 }
 
 inline void validate_scan([[maybe_unused]] ustore_transaction_t const transaction, scans_arg_t const& scans,
@@ -538,34 +539,36 @@ inline void validate_scan([[maybe_unused]] ustore_transaction_t const transactio
     auto const allowed_options = ustore_option_transaction_dont_watch_k | ustore_option_dont_discard_memory_k |
                                  ustore_option_read_shared_memory_k | ustore_option_scan_bulk_k;
     if (!enum_is_subset(options, allowed_options)) {
-        *error = "Invalid options!";
+        *error = {ustore_error_invalid_argument_k, "Invalid options"};
         return;
     }
     if (!scans.start_keys) {
-        *error = "No start keys were provided!";
+        *error = {ustore_error_invalid_argument_k, "No start keys were provided"};
         return;
     }
-    if (!scans.limits) *error = "Full scans aren't supported - paginate!";
+    if (!scans.limits) *error = {ustore_error_unsupported_k, "Full scans are not supported, paginate with limits"};
 }
 
 inline void validate_transaction_begin(ustore_transaction_t const transaction, ustore_options_t const options,
                                        ustore_error_t* error) noexcept {
 
     if (!transaction) {
-        *error = "Transaction is uninitialized";
+        *error = {ustore_error_uninitialized_k, "Transaction is uninitialized"};
         return;
     }
-    if (!enum_is_subset(options, ustore_option_transaction_dont_watch_k)) *error = "Invalid options!";
+    if (!enum_is_subset(options, ustore_option_transaction_dont_watch_k))
+        *error = {ustore_error_invalid_argument_k, "Invalid options"};
 }
 
 inline void validate_transaction_commit(ustore_transaction_t const transaction, ustore_options_t const options,
                                         ustore_error_t* error) noexcept {
 
     if (!transaction) {
-        *error = "Transaction is uninitialized";
+        *error = {ustore_error_uninitialized_k, "Transaction is uninitialized"};
         return;
     }
-    if (!enum_is_subset(options, ustore_option_write_flush_k)) *error = "Invalid options!";
+    if (!enum_is_subset(options, ustore_option_write_flush_k))
+        *error = {ustore_error_invalid_argument_k, "Invalid options"};
 }
 
 #pragma endregion Validation

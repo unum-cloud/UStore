@@ -14,13 +14,13 @@
 
 #include <algorithm>   // `std::max`
 #include <new>         // placement `new`
+#include <span>        // `std::span`
 #include <type_traits> // `std::is_same_v`
 #include <utility>     // `std::exchange`
 
 #include <forkunion.h>
 
-#include <ustore/ranges.hpp> // `ptr_range`, `bits_span_t`
-#include <ustore/status.hpp> // `status_t`
+#include <ustore/ranges.hpp> // `bits_span_t`
 #include <ustore/types.hpp>  // `next_multiple`, `divide_round_up`
 
 namespace unum::ustore {
@@ -178,10 +178,18 @@ class range_or_dummy {
     explicit range_or_dummy(range_ elements) noexcept : elements_(elements) {}
 
     reference operator[](std::size_t index) const noexcept {
-        return elements_ ? reference(elements_[index]) : reference(dummy_);
+        return present() ? reference(elements_[index]) : reference(dummy_);
     }
     std::size_t size() const noexcept { return elements_.size(); }
-    explicit operator bool() const noexcept { return static_cast<bool>(elements_); }
+    explicit operator bool() const noexcept { return present(); }
+
+  private:
+
+    /** Whether the caller asked for the output, which a null range declines. */
+    bool present() const noexcept {
+        if constexpr (requires { elements_.data(); }) return elements_.data() != nullptr;
+        else return static_cast<bool>(elements_);
+    }
 };
 
 /** Holds an arena for one C ABI call, emptying it first unless an outer call already holds it. */
@@ -216,28 +224,34 @@ class linked_memory_lock_t {
     operator ustore_arena_t*() const noexcept { return reinterpret_cast<ustore_arena_t*>(&memory_); }
 
     template <typename element_>
-    ptr_range<element_> alloc(std::size_t count, ustore_error_t* error,
+    std::span<element_> alloc(std::size_t count, ustore_error_t* error,
                               std::size_t alignment = sizeof(element_)) noexcept {
         if (!count) return {};
         void* const result = memory_.alloc(sizeof(element_) * count, alignment);
-        if (!result) *error = "Couldn't allocate new sub-arena";
+        if (!result) {
+            *error = {ustore_error_out_of_memory_k, "Failed to allocate arena memory"};
+            return {};
+        }
         return {static_cast<element_*>(result), count};
     }
 
     template <typename element_>
-    ptr_range<element_> grow( //
-        ptr_range<element_> span, std::size_t additional_count, ustore_error_t* error,
+    std::span<element_> grow( //
+        std::span<element_> elements, std::size_t additional_count, ustore_error_t* error,
         std::size_t alignment = sizeof(element_)) noexcept {
 
-        if (!additional_count) return span;
+        if (!additional_count) return elements;
 
-        std::size_t const new_count = span.size() + additional_count;
-        if (memory_.cheap_extend(span.end(), sizeof(element_) * additional_count, alignment))
-            return {span.begin(), new_count};
+        std::size_t const new_count = elements.size() + additional_count;
+        if (memory_.cheap_extend(elements.data() + elements.size(), sizeof(element_) * additional_count, alignment))
+            return {elements.data(), new_count};
 
         void* const result = memory_.alloc(sizeof(element_) * new_count, alignment);
-        if (result) std::memcpy(result, span.begin(), span.size_bytes());
-        else *error = "Couldn't grow a memory buffer";
+        if (!result) {
+            *error = {ustore_error_out_of_memory_k, "Failed to grow arena memory"};
+            return {};
+        }
+        std::memcpy(result, elements.data(), elements.size_bytes());
         return {static_cast<element_*>(result), new_count};
     }
 
@@ -248,20 +262,21 @@ class linked_memory_lock_t {
 
         std::size_t const slots = divide_round_up(count, bits_in_byte_k);
         if (!output) return range_or_dummy<bits_span_t> {bits_span_t {nullptr}};
-        *output = alloc<ustore_octet_t>(slots, error, alignment).begin();
+        *output = alloc<ustore_octet_t>(slots, error, alignment).data();
         return range_or_dummy<bits_span_t> {bits_span_t {*output}};
     }
 
     /** Allocates @p count elements into @p output, or a scratch element when @p output is null. */
     template <typename element_>
-    range_or_dummy<ptr_range<element_>> alloc_or_dummy( //
+    range_or_dummy<std::span<element_>> alloc_or_dummy( //
         std::size_t count, ustore_error_t* error, element_** output,
         std::size_t alignment = sizeof(element_)) noexcept {
 
         static_assert(!std::is_same_v<element_, ustore_octet_t>);
-        if (!output) return range_or_dummy<ptr_range<element_>> {ptr_range<element_> {}};
-        *output = alloc<element_>(count, error, alignment).begin();
-        return range_or_dummy<ptr_range<element_>> {ptr_range<element_> {*output, count}};
+        if (!output) return range_or_dummy<std::span<element_>> {std::span<element_> {}};
+        std::span<element_> const elements = alloc<element_>(count, error, alignment);
+        *output = elements.data();
+        return range_or_dummy<std::span<element_>> {elements};
     }
 };
 

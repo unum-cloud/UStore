@@ -10,6 +10,7 @@
 #include <cstddef> // `std::size_t`
 
 #include <memory>      // `std::uninitialized_default_construct`, `std::destroy`
+#include <span>        // `std::span`
 #include <type_traits> // `std::is_nothrow_constructible_v`
 #include <utility>     // `std::exchange`, `std::move`, `std::swap`
 
@@ -49,9 +50,9 @@ class uninitialized_array {
     uninitialized_array(std::size_t size, linked_memory_lock_t& arena, ustore_error_t* error) noexcept
         : arena_(&arena) {
         if (!size) return;
-        ptr_range<element_> const tape = arena_->alloc<element_>(size, error);
-        if (*error) return;
-        data_ = tape.begin();
+        std::span<element_> const tape = arena_->alloc<element_>(size, error);
+        if (error->status) return;
+        data_ = tape.data();
         capacity_ = length_ = static_cast<ustore_length_t>(size);
     }
 
@@ -64,24 +65,24 @@ class uninitialized_array {
 
     void resize(std::size_t size, ustore_error_t* error) noexcept {
         reserve(size, error);
-        if (*error) return;
+        if (error->status) return;
         length_ = static_cast<ustore_length_t>(size);
     }
 
     void reserve(std::size_t capacity, ustore_error_t* error) noexcept {
         if (capacity <= capacity_) return;
         std::size_t const grown_capacity = next_power_of_two(capacity);
-        ptr_range<element_> const tape = data_ ? arena_->grow<element_>({data_, capacity_}, grown_capacity - capacity_,
+        std::span<element_> const tape = data_ ? arena_->grow<element_>({data_, capacity_}, grown_capacity - capacity_,
                                                                         error)
                                                : arena_->alloc<element_>(grown_capacity, error);
-        if (*error) return;
-        data_ = tape.begin();
+        if (error->status) return;
+        data_ = tape.data();
         capacity_ = static_cast<ustore_length_t>(grown_capacity);
     }
 
     void push_back(element_ value, ustore_error_t* error) noexcept {
         reserve(length_ + 1u, error);
-        if (*error) return;
+        if (error->status) return;
         data_[length_] = std::move(value);
         ++length_;
     }
@@ -89,17 +90,17 @@ class uninitialized_array {
     void insert(std::size_t offset, element_ const* inserted_begin, element_ const* inserted_end,
                 ustore_error_t* error) noexcept {
         if (offset > length_) {
-            *error = "Can't insert";
+            *error = {ustore_error_invalid_argument_k, "Insertion offset is out of bounds"};
             return;
         }
         reserve(length_ + static_cast<std::size_t>(inserted_end - inserted_begin), error);
-        if (*error) return;
+        if (error->status) return;
         length_ = static_cast<ustore_length_t>(trivial_insert(data_, length_, offset, inserted_begin, inserted_end));
     }
 
     void erase(std::size_t offset, std::size_t count, ustore_error_t* error) noexcept {
         if (offset + count > length_) {
-            *error = "Can't erase";
+            *error = {ustore_error_invalid_argument_k, "Erased range is out of bounds"};
             return;
         }
         length_ = static_cast<ustore_length_t>(trivial_erase(data_, length_, offset, count));
@@ -150,20 +151,20 @@ class growing_tape_t {
         std::size_t const old_count = lengths_.size();
 
         lengths_.push_back(value ? length : ustore_length_missing_k, error);
-        if (*error) return {};
+        if (error->status) return {};
 
         presences_.resize(divide_round_up<std::size_t>(old_count + 1, bits_in_byte_k), error);
-        if (*error) return {};
+        if (error->status) return {};
         presences()[old_count] = bool(value);
 
         // One offset more than values, so the length of the last value follows from the offsets alone
         offsets_.resize(lengths_.size() + 1, error);
-        if (*error) return {};
+        if (error->status) return {};
         offsets_[old_count] = offset;
         offsets_[old_count + 1] = offset + length;
 
         contents_.insert(contents_.size(), value.begin(), value.end(), error);
-        if (*error) return {};
+        if (error->status) return {};
 
         return value_view_t {contents_.data() + contents_.size() - value.size(), value.size()};
     }
@@ -171,15 +172,15 @@ class growing_tape_t {
     /** Appends @p terminator to the last value without counting it in the value's length. */
     void add_terminator(byte_t terminator, ustore_error_t* error) noexcept {
         contents_.push_back(terminator, error);
-        if (*error) return;
+        if (error->status) return;
         offsets_[lengths_.size()] += 1;
     }
 
     void reserve(std::size_t capacity, ustore_error_t* error) noexcept {
         presences_.reserve(divide_round_up<std::size_t>(capacity, bits_in_byte_k), error);
-        if (*error) return;
+        if (error->status) return;
         offsets_.reserve(capacity + 1, error);
-        if (*error) return;
+        if (error->status) return;
         lengths_.reserve(capacity, error);
     }
 
