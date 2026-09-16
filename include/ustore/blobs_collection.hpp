@@ -97,7 +97,8 @@ class blobs_collection_t {
 
     expected<size_range_t> size_range() const noexcept {
         auto maybe = members().size_estimates();
-        return {maybe.release_status(), std::move(maybe->cardinality)};
+        if (!maybe) return maybe.status();
+        return maybe->cardinality;
     }
 
     /** Counts the keys by streaming through all of them. */
@@ -145,14 +146,14 @@ class blobs_collection_t {
 
   private:
     status_t drop(ustore_drop_mode_t mode) noexcept {
-        status_t status;
+        ustore_error_t error {};
         ustore_collection_drop_t collection_drop {};
         collection_drop.db = database_;
-        collection_drop.error = status.member_ptr();
+        collection_drop.error = &error;
         collection_drop.id = collection_;
         collection_drop.mode = mode;
         ustore_collection_drop(&collection_drop);
-        return status;
+        return status_t {error};
     }
 };
 

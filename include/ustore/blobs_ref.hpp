@@ -9,6 +9,7 @@
 
 #include <cstddef> // `std::nullptr_t`
 
+#include <span>        // `std::span`
 #include <type_traits> // `std::conditional_t`, `std::decay_t`
 #include <utility>     // `std::forward`, `std::move`
 
@@ -41,7 +42,7 @@ class blobs_ref {
 
     using value_t = std::conditional_t<is_one_k, value_view_t, embedded_blobs_t>;
     using present_t = std::conditional_t<is_one_k, bool, bits_span_t>;
-    using length_t = std::conditional_t<is_one_k, ustore_length_t, ptr_range<ustore_length_t>>;
+    using length_t = std::conditional_t<is_one_k, ustore_length_t, std::span<ustore_length_t>>;
 
   protected:
     ustore_database_t database_ {};
@@ -123,7 +124,7 @@ template <typename locations_>
 template <typename expected_>
 expected<expected_> blobs_ref<locations_>::any_get(ustore_options_t options) noexcept {
 
-    status_t status;
+    ustore_error_t error {};
     ustore_length_t* found_offsets = nullptr;
     ustore_length_t* found_lengths = nullptr;
     ustore_bytes_ptr_t found_values = nullptr;
@@ -136,7 +137,7 @@ expected<expected_> blobs_ref<locations_>::any_get(ustore_options_t options) noe
 
     ustore_read_t read {};
     read.db = database_;
-    read.error = status.member_ptr();
+    read.error = &error;
     read.transaction = transaction_;
     read.snapshot = snapshot_;
     read.arena = arena_;
@@ -152,12 +153,12 @@ expected<expected_> blobs_ref<locations_>::any_get(ustore_options_t options) noe
     read.values = std::is_same_v<expected_, value_t> ? &found_values : nullptr;
 
     ustore_read(&read);
-    if (!status) return std::move(status);
+    if (error.status) return status_t {error};
 
     if constexpr (std::is_same_v<expected_, length_t>) {
-        ptr_range<ustore_length_t> const many {found_lengths, found_lengths + count};
+        std::span<ustore_length_t> const many {found_lengths, found_lengths + count};
         if constexpr (is_one_k) return ustore_length_t {many[0]};
-        else return ptr_range<ustore_length_t> {many};
+        else return std::span<ustore_length_t> {many};
     }
     else if constexpr (std::is_same_v<expected_, present_t>) {
         bits_span_t const many {found_presences};
@@ -189,10 +190,10 @@ status_t blobs_ref<locations_>::any_assign(contents_arg_&& values_ref, ustore_op
     auto const offsets = value_extractor_t {}.offsets(values);
     auto const lengths = value_extractor_t {}.lengths(values);
 
-    status_t status;
+    ustore_error_t error {};
     ustore_write_t write {};
     write.db = database_;
-    write.error = status.member_ptr();
+    write.error = &error;
     write.transaction = transaction_;
     write.arena = arena_;
     write.options = options;
@@ -209,7 +210,7 @@ status_t blobs_ref<locations_>::any_assign(contents_arg_&& values_ref, ustore_op
     write.values_stride = contents.stride();
 
     ustore_write(&write);
-    return status;
+    return status_t {error};
 }
 
 } // namespace unum::ustore

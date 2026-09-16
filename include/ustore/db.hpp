@@ -10,6 +10,7 @@
 #include <cstddef> // `std::size_t`
 
 #include <limits>      // `std::numeric_limits`
+#include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 #include <utility>     // `std::exchange`, `std::forward`, `std::move`, `std::swap`
 
@@ -17,7 +18,7 @@
 #include <ustore/blobs_ref.hpp>        // `blobs_ref`
 #include <ustore/docs_collection.hpp>  // `docs_collection_t`
 #include <ustore/graph_collection.hpp> // `graph_collection_t`
-#include <ustore/ranges.hpp>           // `ptr_range`, `strided_range`, `strings_tape_iterator_t`
+#include <ustore/ranges.hpp>           // `strided_range`, `strings_tape_iterator_t`
 #include <ustore/ranges_args.hpp>      // `keys_view_t`, `places_arg_t`
 #include <ustore/status.hpp>           // `status_t`, `expected`
 #include <ustore/types.hpp>            // `arena_t`, `collection_key_t`, `collection_key_field_t`
@@ -25,11 +26,11 @@
 
 namespace unum::ustore {
 
-using snapshots_list_t = ptr_range<ustore_snapshot_t>;
+using snapshots_list_t = std::span<ustore_snapshot_t>;
 
 /** The named collections of a database, identifiers and names in the same order. */
 struct collections_list_t {
-    ptr_range<ustore_collection_t> ids;
+    std::span<ustore_collection_t> ids;
     strings_tape_iterator_t names;
 };
 
@@ -115,10 +116,10 @@ class context_t {
         ustore_size_t count = 0;
         ustore_str_span_t names = nullptr;
         ustore_collection_t* ids = nullptr;
-        status_t status;
+        ustore_error_t error {};
         ustore_collection_list_t collection_list {};
         collection_list.db = database_;
-        collection_list.error = status.member_ptr();
+        collection_list.error = &error;
         collection_list.transaction = transaction_;
         collection_list.snapshot = snapshot_;
         collection_list.arena = arena_.member_ptr();
@@ -127,25 +128,28 @@ class context_t {
         collection_list.names = &names;
 
         ustore_collection_list(&collection_list);
+        if (error.status) return status_t {error};
+
         collections_list_t result;
         result.ids = {ids, ids + count};
         result.names = {count, names};
-        return {std::move(status), std::move(result)};
+        return result;
     }
 
     expected<snapshots_list_t> snapshots() noexcept {
         ustore_size_t count = 0;
         ustore_snapshot_t* ids = nullptr;
-        status_t status;
+        ustore_error_t error {};
         ustore_snapshot_list_t snapshots_list {};
         snapshots_list.db = database_;
-        snapshots_list.error = status.member_ptr();
+        snapshots_list.error = &error;
         snapshots_list.arena = arena_.member_ptr();
         snapshots_list.count = &count;
         snapshots_list.ids = &ids;
 
         ustore_snapshot_list(&snapshots_list);
-        return {std::move(status), snapshots_list_t {ids, ids + count}};
+        if (error.status) return status_t {error};
+        return snapshots_list_t {ids, ids + count};
     }
 
     /** Whether a collection named @p name exists, where the empty name is the main collection. */
@@ -153,7 +157,7 @@ class context_t {
         if (name.empty()) return true;
 
         auto maybe_listed = collections();
-        if (!maybe_listed) return maybe_listed.release_status();
+        if (!maybe_listed) return maybe_listed.status();
 
         strings_tape_iterator_t names = maybe_listed->names;
         for (std::size_t index = 0; index != maybe_listed->ids.size(); ++index, ++names)
@@ -171,26 +175,26 @@ class context_t {
             return collection_ {database_, ustore_collection_main_k, transaction_, {}, arena_.member_ptr()};
 
         auto maybe_listed = collections();
-        if (!maybe_listed) return maybe_listed.release_status();
+        if (!maybe_listed) return maybe_listed.status();
 
         strings_tape_iterator_t names = maybe_listed->names;
         for (ustore_collection_t const id : maybe_listed->ids) {
             if (*names == name) return collection_ {database_, id, transaction_, {}, arena_.member_ptr()};
             ++names;
         }
-        return status_t::status_view("No such collection is present");
+        return status_t {status_code_t::not_found_k, "No such collection"};
     }
 
     /** Clears the transaction for reuse, keeping its memory and starting a new generation. */
     status_t reset() noexcept {
-        status_t status;
+        ustore_error_t error {};
         ustore_transaction_init_t transaction_init {};
         transaction_init.db = database_;
-        transaction_init.error = status.member_ptr();
+        transaction_init.error = &error;
         transaction_init.transaction = &transaction_;
 
         ustore_transaction_init(&transaction_init);
-        return status;
+        return status_t {error};
     }
 
     /**
@@ -198,14 +202,14 @@ class context_t {
      *  @param[in] flush Whether the call returns only after the data reaches the disk.
      */
     status_t commit(flush_t flush = flush_t::dont_flush_k) noexcept {
-        status_t status;
+        ustore_error_t error {};
         ustore_transaction_commit_t transaction_commit {};
         transaction_commit.db = database_;
-        transaction_commit.error = status.member_ptr();
+        transaction_commit.error = &error;
         transaction_commit.transaction = transaction_;
         transaction_commit.options = to_options(flush);
         ustore_transaction_commit(&transaction_commit);
-        return status;
+        return status_t {error};
     }
 
     /**
@@ -213,28 +217,29 @@ class context_t {
      *  @param[in] flush Whether the call returns only after the data reaches the disk.
      */
     expected<ustore_sequence_number_t> sequenced_commit(flush_t flush = flush_t::dont_flush_k) noexcept {
-        status_t status;
+        ustore_error_t error {};
         ustore_sequence_number_t sequence_number = std::numeric_limits<ustore_sequence_number_t>::max();
         ustore_transaction_commit_t transaction_commit {};
         transaction_commit.db = database_;
-        transaction_commit.error = status.member_ptr();
+        transaction_commit.error = &error;
         transaction_commit.transaction = transaction_;
         transaction_commit.options = to_options(flush);
         transaction_commit.sequence_number = &sequence_number;
         ustore_transaction_commit(&transaction_commit);
-        return {std::move(status), std::move(sequence_number)};
+        if (error.status) return status_t {error};
+        return sequence_number;
     }
 
     /** Exports the snapshot as a new database at @p path. */
     status_t export_to(ustore_str_view_t path) noexcept {
-        status_t status;
+        ustore_error_t error {};
         ustore_snapshot_export_t snapshot_export {};
         snapshot_export.db = database_;
-        snapshot_export.error = status.member_ptr();
+        snapshot_export.error = &error;
         snapshot_export.id = snapshot_;
         snapshot_export.path = path;
         ustore_snapshot_export(&snapshot_export);
-        return status;
+        return status_t {error};
     }
 };
 
@@ -246,12 +251,12 @@ class database_t {
     ustore_database_t database_ = nullptr;
 
     ustore_metadata_t get_metadata() noexcept {
-        status_t status {};
+        ustore_error_t error {};
         ustore_metadata_t metadata {};
         ustore_get_metadata_t request {};
         request.db = database_;
         request.metadata = &metadata;
-        request.error = status.member_ptr();
+        request.error = &error;
         ustore_get_metadata(&request);
         return metadata;
     }
@@ -263,13 +268,13 @@ class database_t {
     operator ustore_database_t() const noexcept { return database_; }
 
     status_t open(ustore_str_view_t config = nullptr) noexcept {
-        status_t status;
+        ustore_error_t error {};
         ustore_database_init_t database_init {};
         database_init.config = config;
         database_init.db = &database_;
-        database_init.error = status.member_ptr();
+        database_init.error = &error;
         ustore_database_init(&database_init);
-        return status;
+        return status_t {error};
     }
 
     void close() noexcept {
@@ -286,40 +291,40 @@ class database_t {
     bool supports_snapshots() noexcept { return get_metadata() & ustore_supports_snapshots_k; }
 
     expected<context_t> transact() noexcept {
-        status_t status {};
+        ustore_error_t error {};
         ustore_transaction_t raw {};
         ustore_transaction_init_t transaction_init {};
         transaction_init.db = database_;
-        transaction_init.error = status.member_ptr();
+        transaction_init.error = &error;
         transaction_init.transaction = &raw;
 
         ustore_transaction_init(&transaction_init);
-        if (!status) return {std::move(status), context_t {database_, nullptr}};
+        if (error.status) return status_t {error};
         return context_t {database_, raw};
     }
 
     expected<context_t> snapshot() noexcept {
-        status_t status;
+        ustore_error_t error {};
         ustore_snapshot_t raw = {};
         ustore_snapshot_create_t snapshot_create {
             .db = database_,
-            .error = status.member_ptr(),
+            .error = &error,
             .id = &raw,
         };
         ustore_snapshot_create(&snapshot_create);
-        if (!status) return {std::move(status), context_t {database_, nullptr}};
+        if (error.status) return status_t {error};
         return context_t {database_, nullptr, raw};
     }
 
     status_t drop_snapshot(ustore_snapshot_t id) noexcept {
-        status_t status;
+        ustore_error_t error {};
         ustore_snapshot_drop_t snapshot_drop {
             .db = database_,
-            .error = status.member_ptr(),
+            .error = &error,
             .id = id,
         };
         ustore_snapshot_drop(&snapshot_drop);
-        return status;
+        return status_t {error};
     }
 
     template <typename collection_ = blobs_collection_t>
@@ -333,24 +338,24 @@ class database_t {
 
     template <typename collection_ = blobs_collection_t>
     expected<collection_> create(ustore_str_view_t name, ustore_str_view_t config = "") noexcept {
-        status_t status;
+        ustore_error_t error {};
         ustore_collection_t collection = ustore_collection_main_k;
         ustore_collection_create_t collection_create {};
         collection_create.db = database_;
-        collection_create.error = status.member_ptr();
+        collection_create.error = &error;
         collection_create.name = name;
         collection_create.config = config;
         collection_create.id = &collection;
 
         ustore_collection_create(&collection_create);
-        if (!status) return std::move(status);
+        if (error.status) return status_t {error};
         return collection_ {database_, collection, nullptr};
     }
 
     template <typename collection_ = blobs_collection_t>
     expected<collection_> find(std::string_view name = {}) noexcept {
         auto maybe_found = context_t {database_, nullptr}.find(name);
-        if (!maybe_found) return maybe_found.release_status();
+        if (!maybe_found) return maybe_found.status();
         return collection_ {database_, *maybe_found, nullptr};
     }
 
@@ -363,44 +368,44 @@ class database_t {
 
     status_t drop(std::string_view name) noexcept {
         auto maybe_collection = find(name);
-        if (!maybe_collection) return maybe_collection.release_status();
+        if (!maybe_collection) return maybe_collection.status();
         return maybe_collection->drop();
     }
 
     /** Drops every snapshot and named collection, then empties the main collection. */
     status_t clear() noexcept {
         context_t context {database_, nullptr};
-        status_t status;
+        ustore_error_t error {};
 
         auto maybe_snapshots = context.snapshots();
-        if (!maybe_snapshots) return maybe_snapshots.release_status();
+        if (!maybe_snapshots) return maybe_snapshots.status();
 
         ustore_snapshot_drop_t snapshot_drop {};
         snapshot_drop.db = database_;
-        snapshot_drop.error = status.member_ptr();
+        snapshot_drop.error = &error;
         for (ustore_snapshot_t const id : *maybe_snapshots) {
             snapshot_drop.id = id;
             ustore_snapshot_drop(&snapshot_drop);
-            if (!status) return status;
+            if (error.status) return status_t {error};
         }
 
         auto maybe_listed = context.collections();
-        if (!maybe_listed) return maybe_listed.release_status();
+        if (!maybe_listed) return maybe_listed.status();
 
         ustore_collection_drop_t collection_drop {};
         collection_drop.db = database_;
-        collection_drop.error = status.member_ptr();
+        collection_drop.error = &error;
         collection_drop.mode = ustore_drop_keys_vals_handle_k;
         for (ustore_collection_t const id : maybe_listed->ids) {
             collection_drop.id = id;
             ustore_collection_drop(&collection_drop);
-            if (!status) return status;
+            if (error.status) return status_t {error};
         }
 
         collection_drop.id = ustore_collection_main_k;
         collection_drop.mode = ustore_drop_keys_vals_k;
         ustore_collection_drop(&collection_drop);
-        return status;
+        return status_t {error};
     }
 };
 

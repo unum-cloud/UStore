@@ -11,9 +11,10 @@
 
 #include <iterator> // `std::forward_iterator_tag`
 #include <limits>   // `std::numeric_limits`
+#include <span>     // `std::span`
 #include <utility>  // `std::pair`, `std::move`
 
-#include <ustore/ranges.hpp> // `ptr_range`, `joined_blobs_t`
+#include <ustore/ranges.hpp> // `joined_blobs_t`
 #include <ustore/status.hpp> // `status_t`, `expected`
 #include <ustore/types.hpp>  // `arena_t`
 #include <ustore/ustore.h>
@@ -32,7 +33,7 @@ class keys_stream_t {
     ustore_length_t read_ahead_ {0};
 
     ustore_key_t next_min_key_ {std::numeric_limits<ustore_key_t>::min()};
-    ptr_range<ustore_key_t> fetched_keys_ {};
+    std::span<ustore_key_t> fetched_keys_ {};
     std::size_t fetched_offset_ {0};
 
     status_t prefetch() noexcept {
@@ -45,10 +46,10 @@ class keys_stream_t {
         ustore_length_t* found_counts = nullptr;
         ustore_key_t* found_keys = nullptr;
 
-        status_t status;
+        ustore_error_t error {};
         ustore_scan_t scan {};
         scan.db = database_;
-        scan.error = status.member_ptr();
+        scan.error = &error;
         scan.transaction = transaction_;
         scan.arena = arena_.member_ptr();
         scan.tasks_count = 1;
@@ -59,9 +60,9 @@ class keys_stream_t {
         scan.keys = &found_keys;
 
         ustore_scan(&scan);
-        if (!status) return status;
+        if (error.status) return status_t {error};
 
-        fetched_keys_ = ptr_range<ustore_key_t> {found_keys, found_keys + *found_counts};
+        fetched_keys_ = std::span<ustore_key_t> {found_keys, found_keys + *found_counts};
         fetched_offset_ = 0;
 
         auto const count = static_cast<ustore_length_t>(fetched_keys_.size());
@@ -102,7 +103,7 @@ class keys_stream_t {
 
     /** Advances like @c advance, but a failed fetch ends the stream since a reference carries no status. */
     keys_stream_t& operator++() noexcept {
-        if (status_t const status = advance(); status) return *this;
+        if (advance().succeeded()) return *this;
         fetched_keys_ = {};
         fetched_offset_ = 0;
         next_min_key_ = ustore_key_unknown_k;
@@ -115,9 +116,9 @@ class keys_stream_t {
     status_t seek_to_next_batch() noexcept { return seek(next_min_key_); }
 
     /** Exposes the whole fetched page, passed keys included, for use with @c seek_to_next_batch. */
-    ptr_range<ustore_key_t const> keys_batch() noexcept {
+    std::span<ustore_key_t const> keys_batch() noexcept {
         fetched_offset_ = fetched_keys_.size();
-        return {fetched_keys_.begin(), fetched_keys_.end()};
+        return fetched_keys_;
     }
 
     bool is_end() const noexcept {
@@ -142,7 +143,7 @@ class pairs_stream_t {
     ustore_length_t read_ahead_ {0};
 
     ustore_key_t next_min_key_ {std::numeric_limits<ustore_key_t>::min()};
-    ptr_range<ustore_key_t> fetched_keys_ {};
+    std::span<ustore_key_t> fetched_keys_ {};
     joined_blobs_t values_view_ {};
     joined_blobs_iterator_t values_iterator_ {};
     std::size_t fetched_offset_ {0};
@@ -156,10 +157,10 @@ class pairs_stream_t {
 
         ustore_length_t* found_counts = nullptr;
         ustore_key_t* found_keys = nullptr;
-        status_t status;
+        ustore_error_t error {};
         ustore_scan_t scan {};
         scan.db = database_;
-        scan.error = status.member_ptr();
+        scan.error = &error;
         scan.transaction = transaction_;
         scan.arena = arena_.member_ptr();
         scan.tasks_count = 1;
@@ -170,9 +171,9 @@ class pairs_stream_t {
         scan.keys = &found_keys;
 
         ustore_scan(&scan);
-        if (!status) return status;
+        if (error.status) return status_t {error};
 
-        fetched_keys_ = ptr_range<ustore_key_t> {found_keys, found_keys + *found_counts};
+        fetched_keys_ = std::span<ustore_key_t> {found_keys, found_keys + *found_counts};
         fetched_offset_ = 0;
         auto const count = static_cast<ustore_size_t>(fetched_keys_.size());
 
@@ -180,7 +181,7 @@ class pairs_stream_t {
         ustore_length_t* found_offsets {};
         ustore_read_t read {};
         read.db = database_;
-        read.error = status.member_ptr();
+        read.error = &error;
         read.transaction = transaction_;
         read.arena = arena_.member_ptr();
         read.options = ustore_option_dont_discard_memory_k;
@@ -192,7 +193,7 @@ class pairs_stream_t {
         read.values = &found_values;
 
         ustore_read(&read);
-        if (!status) return status;
+        if (error.status) return status_t {error};
 
         values_view_ = joined_blobs_t {count, found_offsets, found_values};
         values_iterator_ = values_view_.begin();
@@ -234,7 +235,7 @@ class pairs_stream_t {
 
     /** Advances like @c advance, but a failed fetch ends the stream since a reference carries no status. */
     pairs_stream_t& operator++() noexcept {
-        if (status_t const status = advance(); status) return *this;
+        if (advance().succeeded()) return *this;
         fetched_keys_ = {};
         values_iterator_ = {};
         fetched_offset_ = 0;
@@ -251,9 +252,9 @@ class pairs_stream_t {
     status_t seek_to_next_batch() noexcept { return seek(next_min_key_); }
 
     /** Exposes the whole fetched page, passed keys included, for use with @c seek_to_next_batch. */
-    ptr_range<ustore_key_t const> keys_batch() noexcept {
+    std::span<ustore_key_t const> keys_batch() noexcept {
         fetched_offset_ = fetched_keys_.size();
-        return {fetched_keys_.begin(), fetched_keys_.end()};
+        return fetched_keys_;
     }
 
     bool is_end() const noexcept {
@@ -293,8 +294,8 @@ class blobs_range_t {
     template <typename stream_>
     expected<stream_> make_stream(ustore_key_t target, std::size_t read_ahead) noexcept {
         stream_ stream {database_, collection_, read_ahead, transaction_};
-        status_t status = stream.seek(target);
-        return {std::move(status), std::move(stream)};
+        if (status_t const sought = stream.seek(target); sought.failed()) return sought;
+        return stream;
     }
 
   public:
@@ -327,7 +328,7 @@ class blobs_range_t {
     }
 
     expected<size_estimates_t> size_estimates() noexcept {
-        status_t status;
+        ustore_error_t error {};
         arena_t arena(database_);
         ustore_size_t* min_cardinalities = nullptr;
         ustore_size_t* max_cardinalities = nullptr;
@@ -338,7 +339,7 @@ class blobs_range_t {
 
         ustore_measure_t measure {};
         measure.db = database_;
-        measure.error = status.member_ptr();
+        measure.error = &error;
         measure.transaction = transaction_;
         measure.snapshot = snapshot_;
         measure.arena = arena.member_ptr();
@@ -354,7 +355,7 @@ class blobs_range_t {
         measure.max_space_usages = &max_space_usages;
 
         ustore_measure(&measure);
-        if (!status) return std::move(status);
+        if (error.status) return status_t {error};
         return size_estimates_t {{min_cardinalities[0], max_cardinalities[0]},
                                  {min_value_bytes[0], max_value_bytes[0]},
                                  {min_space_usages[0], max_space_usages[0]}};
@@ -376,16 +377,16 @@ class blobs_range_t {
 
 /** The keys of a collection slice, counted by streaming or sampled at random. */
 struct keys_range_t {
-    using sample_t = ptr_range<ustore_key_t>;
+    using sample_t = std::span<ustore_key_t>;
 
     blobs_range_t members;
 
     /** Counts the keys by streaming through all of them. */
     expected<std::size_t> size() noexcept {
         auto maybe_begin = members.keys_begin();
-        if (!maybe_begin) return maybe_begin.release_status();
+        if (!maybe_begin) return maybe_begin.status();
         auto maybe_end = members.keys_end();
-        if (!maybe_end) return maybe_end.release_status();
+        if (!maybe_end) return maybe_end.status();
 
         std::size_t count = 0;
         for (keys_stream_t& stream = *maybe_begin; stream != *maybe_end; ++stream) ++count;
@@ -395,13 +396,13 @@ struct keys_range_t {
     expected<sample_t> sample(std::size_t count, ustore_arena_t* arena) noexcept {
         ustore_length_t* found_counts = nullptr;
         ustore_key_t* found_keys = nullptr;
-        status_t status;
+        ustore_error_t error {};
         auto const count_limit = static_cast<ustore_length_t>(count);
         ustore_collection_t const collection = members.collection();
 
         ustore_sample_t sample {};
         sample.db = members.db();
-        sample.error = status.member_ptr();
+        sample.error = &error;
         sample.transaction = members.txn();
         sample.snapshot = members.snap();
         sample.arena = arena;
@@ -412,7 +413,7 @@ struct keys_range_t {
         sample.keys = &found_keys;
         ustore_sample(&sample);
 
-        if (!status) return std::move(status);
+        if (error.status) return status_t {error};
         return sample_t {found_keys, found_keys + found_counts[0]};
     }
 };
@@ -424,9 +425,9 @@ struct pairs_range_t {
     /** Counts the pairs by streaming through all of them. */
     expected<std::size_t> size() noexcept {
         auto maybe_begin = members.pairs_begin();
-        if (!maybe_begin) return maybe_begin.release_status();
+        if (!maybe_begin) return maybe_begin.status();
         auto maybe_end = members.pairs_end();
-        if (!maybe_end) return maybe_end.release_status();
+        if (!maybe_end) return maybe_end.status();
 
         std::size_t count = 0;
         for (pairs_stream_t& stream = *maybe_begin; stream != *maybe_end; ++stream) ++count;
