@@ -1,47 +1,37 @@
-==========
+========
 Overview
-==========
+========
 .. mdinclude:: ../README.md
 
-.. toctree:: 
+.. toctree::
    :hidden:
 
    self
-.. toctree:: 
-   :hidden:
-   :caption: �
 
-   install
+.. toctree::
+   :hidden:
+   :caption: C and C++
+
    c/index
 
-.. toctree:: 
+.. toctree::
    :hidden:
-   :caption: �
+   :caption: Bindings
 
-   cpp/index
    python/index
-   java/index
-   golang/index
 
-.. toctree:: 
+.. toctree::
    :hidden:
-   :caption: �
+   :caption: Internals
 
-   flight/index
-   rest/index
-
-.. toctree:: 
-   :hidden:
-   :caption: �
-
+   engines
+   udisk
    tests
    benchmarks
-   implementation
    contributing
-   related
 
-.. toctree:: 
+.. toctree::
    :hidden:
-   :caption: �
+   :caption: Index
 
    genindex

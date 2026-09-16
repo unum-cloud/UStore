@@ -1,37 +1,31 @@
 API Reference
 ===============
 
-===============
-db
-===============
-.. doxygenfile:: db.h
-
-===============
-ustore
-===============
+ustore/ustore.h
+---------------
 .. doxygenfile:: ustore.h
 
-===============
-docs
-===============
+ustore/db.h
+-----------
+.. doxygenfile:: db.h
+
+ustore/blobs.h
+--------------
+.. doxygenfile:: blobs.h
+
+ustore/docs.h
+-------------
 .. doxygenfile:: docs.h
 
-===============
-graph
-===============
+ustore/graph.h
+--------------
 .. doxygenfile:: graph.h
 
-===============
-media
-===============
-.. doxygenfile:: media.h
+ustore/strings.h
+----------------
+.. doxygenfile:: strings.h
 
-===============
-paths
-===============
-.. doxygenfile:: paths.h
-
-===============
-arrow
-===============
-.. doxygenfile:: arrow.h
+C++ Wrappers
+------------
+.. doxygennamespace:: unum::ustore
+   :members:

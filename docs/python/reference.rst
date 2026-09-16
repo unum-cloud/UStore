@@ -1,6 +1,6 @@
 API Reference
 ==============
 
-.. automodule:: ustore.rocksdb
+.. automodule:: ustore.lib
     :members:
     :undoc-members:

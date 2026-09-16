@@ -1,5 +1,1 @@
-========================
-Benchmark Results
-========================
-
-.. mdinclude:: ../benchmarks/README.md
+.. mdinclude:: ../bench/README.md

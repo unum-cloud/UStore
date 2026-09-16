@@ -1,112 +1,119 @@
-# UStore Benchmarks
+# Benchmarks
 
-It is always best to implement an application-specific benchmark, as every use case is different.
-The second best is to estimate a few common use cases.
-Here is our list:
+UStore's speed claims rest on one hyper-converged machine, so this suite measures on one: its NVMe drives, its CPU cores and its GPUs, on Hopper and Blackwell boxes alike.
+Comparisons against other databases live in a separate harness.
+This suite answers _which engine configuration_ and _which component_: SmashTable, RocksDB, LevelDB and UDisk behind the same C ABI, and UDisk's databases, LSM trees, graph database and disk router against their own configurations.
+Every binary prints a machine block and one block per measured phase to standard output and nothing else, so a run is its own transcript.
 
-- [UCSB]() for binary layer.
-- 
+## The Suite
 
+| Source                                | What it measures                                                    |
+| :------------------------------------ | :------------------------------------------------------------------ |
+| `twitter.cpp`                         | Building documents and a graph from tweets, then sampling them      |
+| `tabular_graph.cpp`                   | NDJSON or CSV imported as documents and a graph, then exported back |
+| `udisk/single_collection_database.cu` | Inserts, lookups, scans and deletions, per value width              |
+| `udisk/lsm_tree.cu`                   | Inserts, lookups, selections and scans, per value width             |
+| `udisk/graph_store.cpp`               | Vertex and edge writes and reads, with and without a transaction    |
+| `udisk/disk_router.cpp`               | Random 4 KiB `O_DIRECT` reads over cores, disks and queue depths    |
 
-For more advanced modality-specific workloads, we have the following benchmarks provided in this repo:
+The Twitter benchmark samples keys, parsed objects, one field, a four-column table and two-hop traversals.
+`mixed.hpp` holds the transactional batch upserts of documents and graph edges that the Twitter benchmark issues.
+The two engine benchmarks compile once per engine, as `bench_twitter_ustore_embedded_<engine>` and `bench_tabular_graph_ustore_embedded_<engine>`.
 
-- **Twitter**. It takes the `.ndjson` dump of their <code class="docutils literal notranslate"><a href="https://developer.twitter.com/en/docs/twitter-api/v1/tweets/sample-realtime/overview" class="pre">GET statuses/sample</a></code> API and imports it into the Documents collection. We then measure random-gathers' speed at document-level, field-level, and multi-field tabular exports. We also construct a graph from the same data in a separate collection. And evaluate Graph construction time and traversals from random starting points.
-- **Tabular**. Similar to the previous benchmark, but generalizes it to arbitrary datasets with some additional context. It supports Parquet and CSV input files. 🔜
-- **Vector**. Given a memory-mapped file with a big matrix, builds an Approximate Nearest Neighbors Search index from the rows of that matrix. Evaluates both construction and query time. 🔜
+### Building
 
-We are working hard to prepare a comprehensive overview of different parts of UStore compared to industry-standard tools.
-On both our hardware and most common instances across public clouds.
-
-
-## [UCSB][ucsb]
-
-For low-level binary workloads, we have a separate project called UCSB.
-It covers LMDB, LevelDB, RocksDB, WiredTiger, Redis, MongoDB, and our Key-Value Stores.
-It doesn't depend on UStore and uses native interfaces of all the engines to put everyone in the same shoes.
-
-* [Results][ucsb-1] for 1 TB collections.
-* [Results][ucsb-10] for 10 TB collections.
-
-As of December 2022, typical results can look like:
-
-| Operation           | RocksDB | UDisk |
-| :------------------ | :-----: | :---: |
-| Scan                |  17 M   | 17 M  |
-| **Batch Read**      |  650 K  | 4.5 M |
-| Read                |  420 K  |  1 M  |
-| Read & Update, 1:1  |  64 K   | 173 K |
-| Read & Upsert, 19:1 |  128 K  | 270 K |
-| **Batch Upsert**    |  57 K   | 260 K |
-| Remove              |  420 K  | 874 K |
-
-## Twitter
-
-Twitter benchmark operated on real-world sample of Tweets obtained via [Twitter Stream API][twitter-samples].
-It is frequently used across the industry, but the current "User Agreement" bans publicly sharing such datasets.
-
-We took over 1 TB of tweets packed consecutively into `.ndjson` files and simulated constructing collections of Documents, Graphs, and Paths.
-You can obtain results for your hardware and your sample of Tweets using the following command.
+Every number comes from the `release` preset, which builds into `build_release`.
+The SmashTable engine is always built, and each other engine is switched on by its option.
 
 ```sh
-cmake \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DUSTORE_BUILD_BENCHMARKS=1 .. \
-    && make bench_twitter_ustore_embedded_ucset \
-    && ./build/bin/bench_twitter_ustore_embedded_ucset
+cmake --preset release -DUSTORE_BUILD_BENCH_CPP=1 -DUSTORE_USE_ROCKSDB=1 -DUSTORE_USE_LEVELDB=1
+cmake --build --preset release --target bench_twitter_ustore_embedded_rocksdb bench_tabular_graph_ustore_embedded_rocksdb
 ```
 
-We manually repeated this same benchmark for a few other DBMS brands.
-We tried to keep the RAM usage identical and limited the number of clients to 16 processes on the same machine on which the server was running.
-The following results should be taken with the grain of salt and aren't as accurate as [UCSB](#ucsb) but they might be relevant for general perception.
-
-For document-like workloads:
-
-|                                   | Insertion | Retrieval |
-| :-------------------------------- | :-------: | :-------: |
-| Yugabyte                          |    2 K    |   82 K    |
-| MongoDB                           |   18 K    |   210 K   |
-|                                   |           |           |
-| UStore on RocksDB                 |   22 K    |   742 K   |
-| UStore on RocksDB with Flight API |   23 K    |   282 K   |
-| UStore on UCSet                   |   350 K   |   4.8 M   |
-| UStore on UCSet with Flight API   |   206 K   |   371 K   |
-
-For graphs, we show the number of edges per second handled by different queries:
-
-|                                   | Insertion | Two-hop Retrieval |
-| :-------------------------------- | :-------: | :---------------: |
-| Neo4J                             |    2 K    |       1.5 K       |
-|                                   |           |                   |
-| UStore on RocksDB                 |   241 K   |       3.7 M       |
-| UStore on RocksDB with Flight API |   119 K   |      1.48 M       |
-| UStore on UCSet                   |   201 K   |       21 M        |
-| UStore on UCSet with Flight API   |   163 K   |       17 M        |
-
-For MongoDB, we also tried the official <code class="docutils literal notranslate"><a href="https://www.mongodb.com/docs/database-tools/mongoimport/" class="pre">mongoimport</a></code> tool, which supports both `.csv` and `.ndjson`.
-The results are mixed compared to a multi-process setup.
-For Neo4J, significantly better results are possible if you are doing initialization with a pre-processed `.csv` file, but the same applies to UStore.
-
-## Tables and Graphs
-
-Generalizing the Twitter benchmark, we wrote a Python and a C++ benchmark for tabular datasets.
-Unlike the previous benchmark, the schema must be fixed, but you can input `.json`, `.csv`, and `.parquet` files.
+Executables land in `build_release/build/bin/`.
+Imports hold whole batches in memory, so every run goes under a cgroup cap rather than trusting the benchmark to refuse.
 
 ```sh
-cmake -DCMAKE_BUILD_TYPE=Release -DUSTORE_BUILD_BENCHMARKS=1 .. && make benchmark_tabular_graph_ustore_embedded_ucset && ./build/bin/benchmark_tabular_graph_ustore_embedded_ucset
+systemd-run --user --scope -p MemoryMax=16G -p MemorySwapMax=0 -- build_release/build/bin/bench_twitter_ustore_embedded_rocksdb ...
 ```
 
-For Python:
+### Flags
+
+Both engine benchmarks take their inputs as flags, read no environment variable, and print their flags with `--help`.
+Flags starting with `--benchmark_` go to Google Benchmark, which reads them before the benchmark's own flags are parsed.
+
+### Twitter
 
 ```sh
-python benchmarks/tabular_graph.py
+build_release/build/bin/bench_twitter_ustore_embedded_rocksdb \
+    --dataset data/twitter --directory /dev/shm/ustore-twitter --threads 16 --max-input-files 100
 ```
 
-We manually repeated this same benchmark for several other DBMS brands and multiple publicly available datasets.
-Below are the results.
+| Flag                        | Meaning                                                       | Default                |
+| :-------------------------- | :------------------------------------------------------------ | :--------------------- |
+| `--directory <path>`        | Directory the database lives in; required                     | None                   |
+| `--dataset <path>`          | Directory of `.ndjson` tweet dumps                            | Generated tweets       |
+| `--threads <count>`         | Threads per benchmark, which also index the dataset files     | Half the logical cores |
+| `--max-tweets <count>`      | Tweets to generate without a dataset                          | `1000000`              |
+| `--max-input-files <count>` | `.ndjson` files to map from the dataset                       | `1000`                 |
+| `--connectivity <count>`    | Average mentions per generated tweet                          | `4`                    |
+| `--duration <duration>`     | Minimal time each sampling benchmark runs                     | `10s`                  |
+| `--batch-sizes <counts>`    | Three sampling batch sizes, ascending; building uses the last | `32,64,128`            |
 
-> Coming soon!
+### Tables and Graphs
 
-[ucsb-10]: https://unum.cloud/post/2022-03-22-ucsb
-[ucsb-1]: https://unum.cloud/post/2021-11-25-ycsb
-[ucsb]: https://github.com/unum-cloud/ucsb
+```sh
+build_release/build/bin/bench_tabular_graph_ustore_embedded_rocksdb \
+    --dataset data/<name> --format csv --directory /dev/shm/ustore-tabular \
+    --id-field id --source-field source --target-field target --edge-field edge \
+    --threads 4 --max-input-files 10
+```
+
+| Flag                        | Meaning                                                          | Default          |
+| :-------------------------- | :--------------------------------------------------------------- | :--------------- |
+| `--dataset <path>`          | Directory of input files; required                               | None             |
+| `--format ndjson\|csv`      | Format of the input files, which the exports also take           | `ndjson`         |
+| `--directory <path>`        | Holds the exports, and the database without `--config`; required | None             |
+| `--config <path>`           | JSON file configuring the database                               | In `--directory` |
+| `--id-field <field>`        | Field holding each document's key; required                      | None             |
+| `--source-field <field>`    | Integer field holding the source vertex; required                | None             |
+| `--target-field <field>`    | Integer field holding the target vertex; required                | None             |
+| `--edge-field <field>`      | Field holding the edge key; required                             | None             |
+| `--threads <count>`         | Import threads                                                   | `1`              |
+| `--max-input-files <count>` | Files each import thread takes                                   | `10`             |
+
+Every row becomes one document and one edge between its source and target, labeled by its edge field.
+
+### UDisk Components
+
+`single_collection_database.cu` and `lsm_tree.cu` read their workloads from `single_collection_database.json` and `lsm_tree.json`.
+Each entry names one value width from 1 byte upward, switches on with `enabled`, and sizes the population, the cache, the write buffer and the LSM levels.
+The region, city and graph benchmarks write under the `--directory` they are given.
+`disk_router.cpp` reads the existing files of every directory listed in `--data-directories`, and without that flag generates its files under `--directory`.
+
+### Louvain
+
+`louvain.py` times Louvain community detection three ways on SNAP graphs: NetworkX's `louvain_communities`, its own pure-Python `best_partition` over a UStore graph, and the C++ `community_louvain` from `louvain.cpp`.
+It reads the unpacked edge lists from `tmp/`, and runs on the pre-v1 Python API, as does the `community_louvain` binding it calls.
+`louvain.cpp` has no `main` and no CMake target: it is the algorithm alone, over the C++ graph wrappers.
+
+| Dataset  | NetworkX | UStore Python | UStore C++ |
+| :------- | :------- | :------------ | :--------- |
+| Email    | 0.150 s  | 0.125 s       | 0.013 s    |
+| Facebook | 0.670 s  | 0.582 s       | 0.065 s    |
+| Amazon   | 36.72 s  | 46.27 s       | 11.40 s    |
+| YouTube  | 161.2 s  | 107.6 s       | 77.51 s    |
+| Orkut    | 10155 s  | 7453 s        | 3689 s     |
+
+## Datasets
+
+Datasets live on the shared filesystem under `/mnt/data/sources/` and are reached through `data/<name>` symlinks, lowercase with dashes and the scale suffix last.
+
+```sh
+ln -sfn /mnt/data/sources/twitter data/twitter
+```
+
+The Twitter benchmark reads dumps of the [`GET statuses/sample`][twitter-samples] stream as `.ndjson` files, and Twitter's terms forbid redistributing them, so every machine brings its own sample.
+The tabular benchmark takes any directory of `.ndjson` or `.csv` files with a fixed schema and integer source and target columns.
+
 [twitter-samples]: https://developer.twitter.com/en/docs/twitter-api/v1/tweets/sample-realtime/overview

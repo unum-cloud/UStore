@@ -1,11 +1,95 @@
-cff-version: 0.13.12
+cff-version: 1.2.0
+title: "UStore: GPU-Accelerated Embedded Transactional Database for High-Throughput NVMe Devices"
 message: "If you use this software, please cite it as below."
+type: software
+license: Apache-2.0
+version: 1.0.0-rc.1
+doi: 10.5281/zenodo.7537042
+repository-code: https://github.com/unum-cloud/UStore
+url: https://www.unum.cloud/ustore
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.7537042
+    description: "Concept DOI — all versions"
+  - type: doi
+    value: 10.5281/zenodo.8263173
+    description: "v0.13.12 — version DOI"
+abstract: >-
+  UStore is a GPU-accelerated embedded transactional database built for high-throughput NVMe
+  devices, taking a hyper-converged design where storage and compute share one node rather than
+  being disaggregated across a network. Point lookups stay on the CPU, reaching the drive through
+  kernel bypass with io_uring passthrough and SPDK and searching tree nodes sized to the medium
+  with SIMD kits chosen once when a database opens, while GPUs take over LSM compaction and other
+  bulk operations, loading sorted runs straight into device memory through GPUDirect Storage.
+  Blobs, documents, and graphs live in multi-modal collections addressed by 128-bit UUID keys,
+  with transactions spanning collections, all exposed through one engine-agnostic C ABI and thin
+  Python and Rust bindings that forward each call without copying results into language
+  containers. A reference in-memory backend on SmashTable ships alongside support for third-party
+  key-value stores such as RocksDB and LevelDB behind the same interface.
+keywords:
+  - database
+  - transactional
+  - key-value
+  - multi-modal
+  - nvme
+  - io-uring
+  - spdk
+  - gpu
+  - simd
+
 authors:
-- family-names: "Vardanian"
-  given-names: "Ash"
-  orcid: "https://orcid.org/0000-0002-4882-1815"
-title: "UStore by Unum Cloud"
-version: 0.13.12
-doi: 10.5281/zenodo.7537043
-date-released: 2022-06-12
-url: "https://github.com/unum-cloud/ustore"
+  - family-names: Vardanian
+    given-names: Ash
+    alias: ashvardanian
+    orcid: https://orcid.org/0000-0002-4882-1815
+
+references:
+  - type: article
+    title: "Networks Processing Performance Report"
+    url: https://www.unum.cloud/blog/graphs
+    date-published: 2020-11-12
+    authors:
+      - family-names: Vardanian
+        given-names: Ash
+  - type: article
+    title: "Why Build a Custom DBMS?"
+    url: https://www.unum.cloud/blog/why-build-dbms
+    date-published: 2021-01-02
+    authors:
+      - family-names: Vardanian
+        given-names: Ash
+  - type: article
+    title: "Text Indexing in ElasticSearch, MongoDB and UDisk"
+    url: https://www.unum.cloud/blog/texts
+    date-published: 2021-01-03
+    authors:
+      - family-names: Vardanian
+        given-names: Ash
+  - type: article
+    title: "UDisk Crushing Benchmarks: YCSB, pt. 2"
+    url: https://www.unum.cloud/blog/ycsb-udisk
+    date-published: 2021-11-25
+    authors:
+      - family-names: Vardanian
+        given-names: Ash
+  - type: article
+    title: "Unbranding and Extending the Yahoo Cloud Serving Benchmark"
+    url: https://www.unum.cloud/blog/ucsb
+    date-published: 2022-03-22
+    authors:
+      - family-names: Vardanian
+        given-names: Ash
+  - type: article
+    title: "Beating RocksDB by up to 7x in almost every workload"
+    url: https://www.unum.cloud/blog/ucsb-10tb
+    date-published: 2022-09-13
+    authors:
+      - family-names: Vardanian
+        given-names: Ash
+  - type: article
+    title: "Making the Edge Efficient with Gcore and Intel"
+    url: https://www.unum.cloud/blog/intel-gcore-unum
+    date-published: 2023-06-08
+    authors:
+      - family-names: Vardanian
+        given-names: Ash

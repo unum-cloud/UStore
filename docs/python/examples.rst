@@ -4,23 +4,23 @@ Examples
 =================
 Browser
 =================
-.. literalinclude:: ../../python/examples/browser.py
+.. literalinclude:: ../../examples/browser.py
    :language: python
 
 =================
 Consistent Dict
 =================
-.. literalinclude:: ../../python/examples/consistent_dict.py
+.. literalinclude:: ../../examples/consistent_dict.py
    :language: python
 
 =================
 Banks ATM OLAP
 =================
-.. literalinclude:: ../../python/examples/banks_atm_olap.py
+.. literalinclude:: ../../examples/banks_atm_olap.py
    :language: python
 
 =====================
 Movie Recommendations
 =====================
-.. literalinclude:: ../../python/examples/movie_recommendations.py
+.. literalinclude:: ../../examples/movie_recommendations.py
    :language: python
