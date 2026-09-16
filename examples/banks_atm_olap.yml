@@ -1,0 +1,28 @@
+name: ustore-banks-atm-olap
+
+# This can't be set inside the file,
+# but should be configured from CLI.
+# We keep it as a reminder.
+channel_priority: flexible
+
+# cuxfilter's final release is 26.06, so the whole RAPIDS stack pins there.
+channels:
+  - rapidsai
+  - conda-forge
+
+dependencies:
+  - python=3.12
+  - cuda-version=12.9
+  - cudf=26.06
+  - cuxfilter=26.06
+  - cuml=26.06
+  - cugraph=26.06
+  - pip
+  - pip:
+      - geojson
+      - numpy
+      - pandas
+      - pyarrow
+      - requests
+      - scipy
+      - tqdm

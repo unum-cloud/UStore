@@ -1,0 +1,46 @@
+[package]
+name = "ustore"
+version = "1.0.0-rc.1"
+edition = "2021"
+authors = ["Ash Vardanian <info@unum.cloud>"]
+description = "GPU-Accelerated Embedded Transactional Database for High-Throughput NVMe Devices"
+license = "Apache-2.0"
+repository = "https://github.com/unum-cloud/UStore"
+links = "ustore"
+include = [
+  "/Cargo.toml",
+  "/build.rs",
+  "/rust/**",
+  "/CMakeLists.txt",
+  "/VERSION",
+  "/cmake/**",
+  "/include/**",
+  "/c/**",
+  "/src/**",
+  "/tools/**",
+  "/smashtable/CMakeLists.txt",
+  "/smashtable/cmake/**",
+  "/smashtable/include/**",
+  "/stringzilla/CMakeLists.txt",
+  "/stringzilla/cmake/**",
+  "/stringzilla/c/**",
+  "/stringzilla/include/**",
+  "/forkunion/CMakeLists.txt",
+  "/forkunion/VERSION",
+  "/forkunion/cmake/**",
+  "/forkunion/c/**",
+  "/forkunion/include/**",
+]
+
+[lib]
+name = "ustore"
+path = "rust/lib.rs"
+
+# SmashTable always builds and links; `rocksdb` and `leveldb` build their engines too, linked once `c/lib.cpp` dispatches.
+# UDisk joins as a feature once it builds.
+[features]
+leveldb = []
+rocksdb = []
+
+[build-dependencies]
+cmake = "0.1"

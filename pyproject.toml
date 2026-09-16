@@ -1,40 +1,119 @@
+# Wheels for CPython 3.12 to 3.14 and the free-threaded 3.14t, from the project's own CMake tree.
 [build-system]
-requires = ["setuptools>=42", "wheel", "cmake>=3.22", "pybind11-stubgen", "pyarrow>=10.0.1,<11"]
-build-backend = "setuptools.build_meta"
+build-backend = "scikit_build_core.build"
+requires = ["scikit-build-core>=0.10"]
+
+[project]
+name = "ustore"
+version = "1.0.0-rc.1"
+description = "GPU-Accelerated Embedded Transactional Database for High-Throughput NVMe Devices"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+authors = [{ name = "Ash Vardanian", email = "info@unum.cloud" }]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Natural Language :: English",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Information Technology",
+  "Programming Language :: C",
+  "Programming Language :: C++",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Programming Language :: Python :: Free Threading :: 2 - Beta",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: Microsoft :: Windows",
+  "Topic :: Database",
+  "Topic :: Database :: Database Engines/Servers",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://unum.cloud/ustore"
+Documentation = "https://unum.cloud/ustore"
+Repository = "https://github.com/unum-cloud/UStore"
+Issues = "https://github.com/unum-cloud/UStore/issues"
+
+# SmashTable alone by default; `CMAKE_ARGS="-DUSTORE_USE_ROCKSDB=ON"` or
+# `--config-settings=cmake.define.USTORE_USE_ROCKSDB=ON` adds an engine.
+[tool.scikit-build]
+build-dir = "build_python/{wheel_tag}"
+build.targets = ["ustore_python"]
+cmake.build-type = "Release"
+cmake.version = ">=3.25"
+install.components = ["ustore_python"]
+minimum-version = "build-system.requires"
+sdist.exclude = ["/v1.md", "/numkong/**", "/stringzilla/**", "/smashtable/**", "/forkunion/**"]
+sdist.include = [
+  "/CMakeLists.txt",
+  "/CMakePresets.json",
+  "/VERSION",
+  "/include/**",
+  "/c/**",
+  "/src/**",
+  "/cmake/**",
+  "/tools/**",
+  "/python/**",
+  "/numkong/include/**",
+  "/stringzilla/include/**",
+  "/smashtable/include/**",
+  "/forkunion/CMakeLists.txt",
+  "/forkunion/VERSION",
+  "/forkunion/cmake/**",
+  "/forkunion/c/**",
+  "/forkunion/include/**",
+]
+wheel.packages = ["python/ustore"]
+
+[tool.scikit-build.cmake.define]
+USTORE_BUILD_BENCH_CPP = "OFF"
+USTORE_BUILD_LIB_PYTHON = "ON"
+USTORE_BUILD_TEST_CPP = "OFF"
+USTORE_BUILD_TOOLS_CPP = "OFF"
+
+# Groups rather than extras, so none of this reaches the published wheel's metadata.
+[dependency-groups]
+lint = ["ruff"]
+test = ["pytest>=8", "numpy", "pandas", "networkx"]
 
 [tool.pytest.ini_options]
 minversion = "6.0"
 addopts = ["-ra", "--showlocals", "--strict-markers", "--strict-config"]
 xfail_strict = true
 filterwarnings = ["error"]
-testpaths = ["python/tests"]
+python_files = ["*.py"]
+testpaths = ["tests"]
+
+[tool.ruff.lint.per-file-ignores]
+# Each module skips before importing the pre-v1 bindings it would fail on.
+"tests/*.py" = ["E402"]
+# cmake-format evaluates its profile with `section` already in scope.
+".cmake-format.py" = ["F821"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
 
 [tool.cibuildwheel]
+build = ["cp312-*", "cp313-*", "cp314-*", "cp314t-*"]
 build-verbosity = 0
-#manylinux-x86_64-image = "manylinux_2_28"
-environment = "CMAKE_ARGS_F=/tmp/cmake_args"
+skip = ["*musllinux*"]
 
-before-all = [
-    "yum install -y wget python3-devel bzip2-devel libffi-devel zlib-devel perl-IPC-Cmd perl-Test-Simple",
-]
-
-before-build = [
-    # Removing the contents of previous builds from project if they exist
-    "cd {project}",
-    "rm -rf {project}/CMakeCache.txt {project}/build {project}/CMakeFiles.txt {project}/_deps",
-
-    "pip install pyarrow==10.0.1 auditwheel cmake",
-    "export PYST=$(python -c 'import site; print(site.getsitepackages()[0])')",
-
-    "echo \"-DCMAKE_BUILD_TYPE=Release -DPYARROW_DIR=${PYST}/pyarrow/\" > ${CMAKE_ARGS_F}",
-    "mkdir -p build/ustore",
-]
-
-skip = ["*musllinux*", "*i686*", "pp*", "cp36-*"]
-
-# test-command = "pytest {project}/python/tests/"
-# test-requires = ["pandas"]
-# test-extras = ["test"]
-
+# Every architecture's baseline instruction set, since the CMake tree adds no `-march` of its own.
 [tool.cibuildwheel.linux]
-repair-wheel-command = "auditwheel repair --lib-sdir . -w {dest_dir} {wheel}"
+archs = ["x86_64", "aarch64"]
+before-build = ["rm -rf {project}/build_python"]
+manylinux-aarch64-image = "manylinux_2_28"
+manylinux-x86_64-image = "manylinux_2_28"
+repair-wheel-command = "auditwheel repair -w {dest_dir} {wheel}"
+
+[tool.cibuildwheel.macos]
+archs = ["arm64"]
+
+[tool.cibuildwheel.windows]
+archs = ["AMD64"]

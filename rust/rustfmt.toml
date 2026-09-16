@@ -1,0 +1,2 @@
+# Code wraps at 120. Comment and doc-comment wrapping needs nightly, so it stays unset.
+max_width = 120
