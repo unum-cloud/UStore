@@ -1,9 +1,9 @@
 {
-    "configurations": [
-        {
-            "name": "Linux",
-            "configurationProvider": "ms-vscode.cmake-tools"
-        }
-    ],
-    "version": 4
+  "configurations": [
+    {
+      "name": "Linux",
+      "configurationProvider": "ms-vscode.cmake-tools"
+    }
+  ],
+  "version": 4
 }

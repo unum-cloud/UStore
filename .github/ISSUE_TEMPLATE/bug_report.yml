@@ -35,14 +35,14 @@ body:
     id: version
     attributes:
       label: UStore version
-      placeholder: v0.4.X
+      placeholder: v1.0.X
     validations:
       required: true
   - type: input
     id: os
     attributes:
       label: Operating System
-      placeholder: Ubuntu 22.04
+      placeholder: Ubuntu 24.04
     validations:
       required: true
   - type: dropdown
@@ -50,28 +50,20 @@ body:
     attributes:
       label: Hardware architecture
       options:
-        - x86
-        - Arm
+        - x86-64
+        - AArch64
     validations:
       required: true
-  - type: checkboxes
-    id: check
-    attributes:
-      label: Are you using an embedded version?
-      description: Embedded version is the one that has no client-server communication, everything is packed into one library.
-      options:
-        - label: I use the embedded version
   - type: dropdown
     id: frontend
     attributes:
       label: Which interface are you using?
       options:
-        - Native C interface
-        - Official C++ bindings
-        - Official Python bindings
-        - Official Java bindings
-        - Official GoLang bindings
-        - Other
+        - C ABI
+        - C++ wrappers
+        - Python bindings
+        - Rust crate
+        - Command-line interface
     validations:
       required: true
   - type: dropdown
@@ -79,11 +71,10 @@ body:
     attributes:
       label: Which engine are you using?
       options:
-        - UCSet
-        - LevelDB
+        - SmashTable
         - RocksDB
+        - LevelDB
         - UDisk
-        - Other
     validations:
       required: true
   - type: input
@@ -98,7 +89,7 @@ body:
     id: duplicate
     attributes:
       label: Is there an existing issue for this?
-      description: Please search [our issues](https://github.com/unum-cloud/ustore/issues) to see if this bug already exists.
+      description: Please search [our issues](https://github.com/unum-cloud/UStore/issues) to see if this bug already exists.
       options:
         - label: I have searched the existing issues
           required: true
@@ -106,7 +97,7 @@ body:
     id: terms
     attributes:
       label: Code of Conduct
-      description: By submitting this issue, you agree to follow our [Code of Conduct](https://github.com/unum-cloud/ustore/blob/main/CODE_OF_CONDUCT.md)
+      description: By submitting this issue, you agree to follow our [Code of Conduct](https://github.com/unum-cloud/UStore/blob/main/CODE_OF_CONDUCT.md)
       options:
         - label: I agree to follow this project's Code of Conduct
           required: true

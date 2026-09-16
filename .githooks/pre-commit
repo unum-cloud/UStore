@@ -111,7 +111,12 @@ check_rulers() {
 # and printed output uses plain lines.
 check_banner_rules() {
     local banners
-    banners=$(printf '%s\n' "$added" | grep -nE '(^\+|["'"'"'])[[:space:]]*(={4,}|-{4,}|#{4,})|(={3,}|-{3,}|#{3,})[[:space:]]*["'"'"']' || true)
+    banners=$(printf '%s\n' "$added" | grep -nE \
+        -e '^\+[[:space:]]*(#|;|//)+[[:space:]]*(-{2,}|={2,})([[:space:]]|$)' \
+        -e '^\+.*[^-=#[:space:]|].*[[:space:]](-{3,}|={3,}|#{3,})[[:space:]]*$' \
+        -e '^\+[[:space:]]*(={4,}|-{4,}|#{4,})[[:space:]]*$' \
+        -e '(={3,}|-{3,}|#{3,})[[:space:]]*["'"'"']' \
+        -e '["'"'"'][[:space:]]*(={4,}|-{4,}|#{4,})' || true)
     [ -z "$banners" ] || fail "$banners" \
         "$file draws a ===/---/### banner - sections are \`#pragma region\` or \`# region\`," \
         "            and printed output takes a plain line:"
@@ -294,6 +299,22 @@ check_brief_length() {
     [ -z "$sprawling" ] || fail "$sprawling" \
         "$file lets a @brief summary run past three lines - keep the summary short and move" \
         "            the rest into an unindented body paragraph below a blank comment line:"
+}
+
+# Markdown tables align every pipe by display width and stay within 120 columns, so they read unwrapped.
+check_markdown_tables() {
+    local tables
+    tables=$(git show ":$file" | python3 .githooks/markdown_tables.py --check --lines "$(printf '%s ' $added_lines)" - 2>&1 || true)
+    [ -z "$tables" ] || fail "$tables" \
+        "$file has misaligned or overwide tables - run \`.githooks/markdown_tables.py --fix $file\`, then shorten rows past 120 columns:"
+}
+
+# Colors come from fmt styles, which stay empty when output is piped, never from raw ANSI escape sequences.
+check_ansi_escapes() {
+    local escapes
+    escapes=$(printf '%s\n' "$added" | grep -E '\\033\[|\\x1[bB]\[|\\e\[|\\u001[bB]\[' || true)
+    [ -z "$escapes" ] || fail "$escapes" \
+        "$file writes a raw ANSI escape - style output with \`fmt::fg\` or \`fmt::styled\`, empty when the stream is piped:"
 }
 
 # Docblock text sits two spaces past its asterisk, so tags and prose align one column inside the gutter.
@@ -479,7 +500,7 @@ check_qualified_namespace() {
     spelled=$(printf '%s\n' "$added" |
         grep -vE '^\+[[:space:]]*(\*|//|/\*)' |
         grep -vE 'using namespace unum::ustore|namespace unum::ustore' |
-        grep -vE 'struct (std|fmt)::[A-Za-z_]+<unum::ustore::' |
+        grep -vE 'struct (std|fmt)::[A-Za-z_]+<([^<>]*, *)?unum::ustore::' |
         grep -E 'unum::ustore::' || true)
     [ -z "$spelled" ] || fail "$spelled" \
         "$file spells unum::ustore:: in full - the name is already in scope through a \`using\` directive" \
@@ -557,6 +578,7 @@ check_redundant_nodiscard() {
 check_suffixed_template_names() {
     local suffixed
     suffixed=$(printf '%s\n' "$added" | grep -vE '^\+[[:space:]]*(\*|//|/\*)' |
+        sed -e 's/R"(.*)"/""/g' -e 's/"[^"]*"/""/g' |
         grep -E '\b(class|struct|union|using)[[:space:]]+[A-Za-z_][A-Za-z0-9_]*_(gt|at)\b|\b[A-Za-z_][A-Za-z0-9_]*_at\b' || true)
     [ -z "$suffixed" ] || fail "$suffixed" \
         "$file names a symbol with a _gt or _at suffix - write \`template <typename store_> class blobs_ref\`:"
@@ -869,6 +891,7 @@ for file in "${staged[@]}"; do
         check_brief_length
         check_file_header
         check_docblock_indent
+        check_ansi_escapes
         check_include_groups
         check_docblock_brackets
         check_bare_member_docs
@@ -904,15 +927,21 @@ for file in "${staged[@]}"; do
         ;;&
     *.md)
         check_ascii_arrows_prose
+        check_markdown_tables
         check_blank_line_runs
         check_glued_arrows
         check_sibling_justification
+        check_banner_rules
         ;;
     *.py | *.pyi)
         check_sibling_justification
         check_banner_rules
         check_python_version_probe
         ;;
+    # Scripts, CMake, YAML and plain config files - a workflow file also gets its own name check below.
+    *.sh | *.bash | *.cmake | CMakeLists.txt | */CMakeLists.txt | *.yml | *.yaml | *.cfg | *.ini | *.toml)
+        check_banner_rules
+        ;;&
     .github/workflows/*.yml | .github/workflows/*.yaml) check_workflow_names ;;
     esac
 done

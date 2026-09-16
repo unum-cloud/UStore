@@ -1,0 +1,5 @@
+{
+  "encryption": false,
+  "compression": false,
+  "memory_limit": "100GB"
+}

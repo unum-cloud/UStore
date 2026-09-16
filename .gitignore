@@ -71,4 +71,3 @@ target/
 
 # Editor and agent local state
 .claude/
-.gradle/

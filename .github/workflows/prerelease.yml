@@ -3,204 +3,191 @@ name: Pre-Release
 on:
   push:
     branches: ["main-dev"]
-
-  workflow_dispatch: {}
+    paths-ignore: ["**/*.md", "LICENSE", ".gitignore", "assets/**"]
+  pull_request:
+    branches: ["main-dev"]
+    paths-ignore: ["**/*.md", "LICENSE", ".gitignore", "assets/**"]
 
 env:
   GH_TOKEN: ${{ secrets.SEMANTIC_RELEASE_TOKEN }}
-  BUILD_TYPE: Release
+  PYTHONUTF8: 1
+  PYTHONFAULTHANDLER: 1
 
+permissions:
+  contents: read
+
+# Superseded pull request runs cancel; pushes to `main-dev` finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   versioning:
-    name: Semantic Release
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v3
-      with:
-        persist-credentials: false
-        ref: 'main-dev'
-    - uses: actions/setup-node@v3
-    - run: cp .github/workflows/package.json . && npm install && npx semantic-release
-  
-  
-  build_ustore_amd64:
-    name: Build Libraries on AMD
-    runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'push' }}
-    steps:
-      - uses: actions/checkout@v3
-        with:
-          persist-credentials: false
-          ref: 'main-dev'
-          
-      - run: git submodule update --init --recursive
-
-      - name: Prepare CMake, Conan and PyArrow
-        run: python -m pip install --force-reinstall numpy pyarrow cmake conan==1.60.1
-
-      - name: Install Conan dependencies
-        run: |
-          last_tag=$(curl https://api.github.com/repos/unum-cloud/ustore-deps/releases/latest | grep -i 'tag_name' | awk -F '\"' '{print $4}')
-          wget -q https://github.com/unum-cloud/ustore-deps/releases/download/"$last_tag"/ustore_deps_x86_linux.tar.gz
-          conan profile new --detect default
-          conan profile update settings.compiler.libcxx=libstdc++11 default
-          tar -xzf ./ustore_deps_x86_linux.tar.gz -C ~/.conan
-          package_version=$(ls ~/.conan/data/ustore_deps/)
-          conan install ustore_deps/"$package_version"@unum/x86_linux -g cmake -s compiler.version=11
-          rm -rf ./ustore_deps_x86_linux.tar.gz
-
-      - name: Configure CMake
-        run: |
-          cmake -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
-                -DUSTORE_BUILD_ENGINE_UCSET=1 \
-                -DUSTORE_BUILD_ENGINE_LEVELDB=1 \
-                -DUSTORE_BUILD_ENGINE_ROCKSDB=1 \
-                -DUSTORE_BUILD_API_FLIGHT=1 \
-                -DUSTORE_BUILD_TESTS=1 \
-                -DUSE_CONAN=1 \
-                -B ./build_release .
-                
-      - name: Build   
-        run: make -j 4 -C ./build_release
-
-      - name: Upload Binaries
-        uses: actions/upload-artifact@v3.1.1
-        with:
-          name: binaries
-          path: build_release/build/bin/*
-  
-
-  test_ustore_amd64:
-    name: Test Libraries on AMD
-    runs-on: ubuntu-latest
-    needs: build_ustore_amd64
-    steps:
-      - uses: actions/checkout@v3
-        with:
-          persist-credentials: false
-          ref: 'main-dev'
-
-      - name: Download a Build Artifact
-        uses: actions/download-artifact@v3.0.1
-        with:
-          name: binaries
-
-      - name: Change permissions
-        run: chmod +x /home/runner/work/ustore/ustore/*
-      
-      - name: Run embeded tests
-        run: |
-          mkdir -p ./tmp/ustore/
-          export USTORE_TEST_PATH="./tmp/"
-          for test in $(ls /home/runner/work/ustore/ustore/*test_units_ustore_embedded*); do
-            echo -e "------ \e[93mRunning $test\e[0m ------"
-            timeout -v --kill-after=5 300 $test
-          done
-      - name: Run Arrow Flight tests
-        run: /home/runner/work/ustore/ustore/test_units_ustore_flight_client
-
-
-  build_test_ustore_arm64:
-    name: Build and Test Libraries on ARM
-    runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'workflow_dispatch' }}
+    name: Update Version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v7
         with:
+          fetch-depth: 0
           persist-credentials: false
-          ref: 'main-dev'
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v2
+      - name: Run TinySemVer
+        uses: ashvardanian/tinysemver@v3
         with:
-          platforms: 'arm64'
+          verbose: "true"
+          version-file: "VERSION"
+          update-version-in: |
+            CITATION.cff:^version: (\d+\.\d+\.\d+)
+            pyproject.toml:^version = "(\d+\.\d+\.\d+)"
+            Cargo.toml:^version = "(\d+\.\d+\.\d+)"
+          update-major-version-in: |
+            include/ustore/ustore.h:^#define USTORE_VERSION_MAJOR (\d+)
+          update-minor-version-in: |
+            include/ustore/ustore.h:^#define USTORE_VERSION_MINOR (\d+)
+          update-patch-version-in: |
+            include/ustore/ustore.h:^#define USTORE_VERSION_PATCH (\d+)
+          dry-run: "true"
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
-        with:
-          platforms: linux/arm64
-
-      - name: Build and Test in ARM
-        run: |
-          export version=$(cat VERSION)
-          sed -i 's/make -j32/make -j4/' ./Dockerfile
-          docker buildx create --use
-          docker buildx build \
-          --platform "linux/arm64" \
-          --build-arg version=$version \
-          --build-arg TEST_USTORE="True" \
-          --file ./Dockerfile \
-          --tag unum/ustore:latest \
-          --load .
-
-
-  build_and_test_python:
-    name: Build and Test Python ${{ matrix.python }} on ${{ matrix.arch }}
-    runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'workflow_dispatch' }}
+  test_cpp:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
     strategy:
+      fail-fast: false
       matrix:
-        arch: ["x86_64", "aarch64"]
-        python: ["cp39-*", "cp310-*"]
-    steps:
-      - uses: actions/checkout@v3
-        with:
-          persist-credentials: false
-          ref: 'main-dev'
-
-      - name: Prepare CMake, Conan and PyArrow
-        run: python -m pip install --force-reinstall numpy pyarrow cmake conan==1.60.1
-
-      - name: Set up QEMU
-        if: runner.os == 'Linux'
-        uses: docker/setup-qemu-action@v2
-        with:
-          platforms: 'arm64,amd64'
-
-      - name: Build wheel
-        run: |
-          pip install cibuildwheel twine
-          CIBW_BUILD=${{ matrix.python }} cibuildwheel --platform linux
-        env:
-          CIBW_ARCHS_LINUX: ${{ matrix.arch }}
-  
-
-  build_and_test_java:
-    name: Build and Test Java on AMD
-    runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'workflow_dispatch' }}
+        # The base preset's clang and lld are installed on Linux only: macOS links with ld64, Windows builds with MSVC.
+        include:
+          - { name: "Linux x86-64", os: ubuntu-24.04, preset: release, configure: "" }
+          - { name: "Linux AArch64", os: ubuntu-24.04-arm, preset: release, configure: "" }
+          - {
+              name: "macOS arm64",
+              os: macos-15,
+              preset: release,
+              configure: "-DCMAKE_EXE_LINKER_FLAGS= -DCMAKE_SHARED_LINKER_FLAGS=",
+            }
+          - {
+              name: "Windows x86-64",
+              os: windows-2025,
+              preset: release,
+              configure: "-DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl -DCMAKE_EXE_LINKER_FLAGS= -DCMAKE_SHARED_LINKER_FLAGS=",
+            }
+          - { name: "Linux x86-64 (ASan, UBSan)", os: ubuntu-24.04, preset: debug, configure: "" }
+          - { name: "Linux x86-64 (TSan)", os: ubuntu-24.04, preset: tsan, configure: "" }
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v7
+      - name: Pull Git submodules
+        run: git submodule update --init --recursive
+
+      - name: Install Toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang lld ninja-build
+      - name: Install Toolchain (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja
+      - name: Install Toolchain (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ninja -y
+      - name: Set Up MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # Sanitizer runtimes crash under the runner kernel's 32-bit mmap randomization.
+      - name: Lower ASLR Entropy
+        if: matrix.preset != 'release'
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: Restore Fetched Dependencies
+        uses: actions/cache@v6
         with:
-          persist-credentials: false
-          ref: 'main-dev'
+          path: build_${{ matrix.preset }}/_deps
+          key: deps-${{ runner.os }}-${{ runner.arch }}-${{ matrix.preset }}-${{ hashFiles('cmake/*.cmake') }}
 
-      - name: Prepare CMake, Conan and PyArrow
-        run: python -m pip install --force-reinstall numpy pyarrow cmake conan==1.60.1
-      
-      - name: Install JDK
-        run: |
-          sudo apt update
-          sudo apt install default-jdk -y
-      
-      - name: Install Conan dependencies
-        run: |
-          last_tag=$(curl https://api.github.com/repos/unum-cloud/ustore-deps/releases/latest | grep -i 'tag_name' | awk -F '\"' '{print $4}')
-          wget -q https://github.com/unum-cloud/ustore-deps/releases/download/"$last_tag"/ustore_deps_x86_linux.tar.gz
-          conan profile new --detect default
-          conan profile update settings.compiler.libcxx=libstdc++11 default
-          tar -xzf ./ustore_deps_x86_linux.tar.gz -C ~/.conan
-          package_version=$(ls ~/.conan/data/ustore_deps/)
-          conan install ustore_deps/"$package_version"@unum/x86_linux -g cmake -s compiler.version=11
-          rm -rf ./ustore_deps_x86_linux.tar.gz
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }} ${{ matrix.configure }}
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+      - name: Test
+        run: ctest --preset ${{ matrix.preset }}
 
-      - name: Test Java
+  test_python:
+    name: Python ${{ matrix.python-version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, windows-2025]
+        python-version: ["3.12", "3.14t"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Pull Git submodules
+        run: git submodule update --init --recursive
+      - name: Set Up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+      - name: Build and Install
         run: |
-          mkdir -p ./tmp
-          export USTORE_TEST_PATH="./tmp/"
-          sed -i 's/make -j/make -j4/' /home/runner/work/ustore/ustore/java/pack.sh
-          export JAVA_HOME="/usr/lib/jvm/java-11-openjdk-amd64"
-          bash /home/runner/work/ustore/ustore/java/pack.sh
+          python -m pip install --upgrade pip
+          python -m pip install -v .
+
+      - name: Assert the GIL Stays Disabled
+        if: ${{ endsWith(matrix.python-version, 't') }}
+        run: python -c "import sys, ustore; assert not sys._is_gil_enabled(), 'importing ustore re-enabled the GIL'"
+
+      - name: Test
+        shell: bash
+        run: |
+          python -m pip install --group test
+          python -m pytest tests -x -q
+
+  test_rust:
+    name: Rust on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, windows-2025]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Pull Git submodules
+        run: git submodule update --init --recursive
+      - name: Set Up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Lint Rust
+        if: matrix.os == 'ubuntu-24.04'
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Test Rust
+        run: cargo test --all-features
+
+  # A smoke subset only; the full matrix runs on release.
+  build_wheels:
+    name: Wheels ${{ matrix.os }} cp${{ matrix.python-version }}
+    needs: test_python
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+        python-version: ["312", "314t"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Pull Git submodules
+        run: git submodule update --init --recursive
+      - name: Build Wheels
+        uses: pypa/cibuildwheel@v4.2.0
+        env:
+          CIBW_BUILD: cp${{ matrix.python-version }}-*
+          CIBW_ARCHS: native
+          CIBW_SKIP: "*-musllinux_*"
+          CIBW_TEST_COMMAND: python -c "import ustore"

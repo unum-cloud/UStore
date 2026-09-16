@@ -1,125 +1,158 @@
 {
-    "version": "2.0.0",
-    "tasks": [
-        {
-            "label": "Build Debug",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUSTORE_BUILD_BENCHMARKS=0 -DUSTORE_BUILD_TESTS=1 -DUSTORE_BUILD_ENGINE_UCSET=1 -DUSTORE_BUILD_ENGINE_LEVELDB=1 -DUSTORE_BUILD_ENGINE_ROCKSDB=1 -B ./build_debug && make -j -C ./build_debug",
-            "args": [],
-            "type": "shell"
-        },
-        {
-            "label": "Build Release",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Release -DUSTORE_BUILD_BENCHMARKS=0 -DUSTORE_BUILD_TESTS=0 -DUSTORE_BUILD_ENGINE_UCSET=1 -DUSTORE_BUILD_ENGINE_LEVELDB=1 -DUSTORE_BUILD_ENGINE_ROCKSDB=1 -B ./build_release && make -j --silent -C ./build_release",
-            "args": [],
-            "type": "shell"
-        },
-        {
-            "label": "Build Debug UCSet Test",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUSTORE_BUILD_TESTS=1 -DUSTORE_BUILD_BENCHMARKS=0 -DUSTORE_BUILD_ENGINE_UCSET=1 -DUSTORE_BUILD_ENGINE_LEVELDB=0 -DUSTORE_BUILD_ENGINE_ROCKSDB=0 -B ./build_debug && make test_units_ustore_embedded_ucset -j --silent -C ./build_debug",
-            "args": [],
-            "type": "shell"
-        },
-        {
-            "label": "Build Debug Test Tools",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUSTORE_BUILD_TESTS=1 -DUSTORE_BUILD_BENCHMARKS=0 -DUSTORE_BUILD_ENGINE_UCSET=1 -DUSTORE_BUILD_ENGINE_LEVELDB=0 -DUSTORE_BUILD_ENGINE_ROCKSDB=0 -B ./build_debug && make test_tools_ustore_embedded_ucset -j --silent -C ./build_debug",
-            "args": [],
-            "type": "shell"
-        },
-        {
-            "label": "Build Debug LevelDB Test",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUSTORE_BUILD_TESTS=1 -DUSTORE_BUILD_BENCHMARKS=0 -DUSTORE_BUILD_ENGINE_UCSET=0 -DUSTORE_BUILD_ENGINE_LEVELDB=1 -DUSTORE_BUILD_ENGINE_ROCKSDB=0 -B ./build_debug && make test_units_ustore_embedded_leveldb -j --silent -C ./build_debug",
-            "args": [],
-            "type": "shell"
-        },
-        {
-            "label": "Build Debug RocksDB Test",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUSTORE_BUILD_TESTS=1 -DUSTORE_BUILD_BENCHMARKS=0 -DUSTORE_BUILD_ENGINE_UCSET=0 -DUSTORE_BUILD_ENGINE_LEVELDB=0 -DUSTORE_BUILD_ENGINE_ROCKSDB=1 -B ./build_debug && make test_units_ustore_embedded_rocksdb -j --silent -C ./build_debug",
-            "args": [],
-            "type": "shell"
-        },
-        {
-            "label": "Build Debug UDisk Test",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUSTORE_BUILD_TESTS=1 -DUSTORE_ENGINE_UDISK_PATH=lib/libudisk.a -B ./build_debug && make test_units_ustore_embedded_udisk -j --silent -C ./build_debug",
-            "args": [],
-            "type": "shell"
-        },
-        {
-            "label": "Build Stress Atomicity UCSet",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUSTORE_BUILD_TESTS=1 -DUSTORE_BUILD_BENCHMARKS=0 -B ./build_debug && make stress_atomicity_ustore_embedded_ucset -j --silent -C ./build_debug",
-            "args": [],
-            "type": "shell"
-        },
-        {
-            "label": "Build Stress Atomicity RocksDB",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUSTORE_BUILD_TESTS=1 -DUSTORE_BUILD_BENCHMARKS=0 -DUSTORE_BUILD_ENGINE_ROCKSDB=1 -B ./build_debug && make stress_atomicity_ustore_embedded_rocksdb -j --silent -C ./build_debug",
-            "args": [],
-            "type": "shell"
-        },
-        {
-            "label": "Build Stress Linearizability UCSet",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUSTORE_BUILD_TESTS=1 -DUSTORE_BUILD_BENCHMARKS=0 -B ./build_debug && make stress_linearizability_ustore_embedded_ucset -j --silent -C ./build_debug",
-            "args": [],
-            "type": "shell"
-        },
-        {
-            "label": "Build Stress Linearizability RocksDB",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUSTORE_BUILD_TESTS=1 -DUSTORE_BUILD_BENCHMARKS=0 -DUSTORE_BUILD_ENGINE_ROCKSDB=1 -B ./build_debug && make stress_linearizability_ustore_embedded_rocksdb -j --silent -C ./build_debug",
-            "args": [],
-            "type": "shell"
-        },
-        {
-            "label": "Build Debug UCSet Benchmark",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUSTORE_BUILD_TESTS=0 -DUSTORE_BUILD_BENCHMARKS=1 -B ./build_debug && make bench_twitter_ustore_embedded_ucset -j --silent -C ./build_debug",
-            "args": [],
-            "type": "shell"
-        },
-        {
-            "label": "Build Debug RocksDB Benchmark",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUSTORE_BUILD_TESTS=0 -DUSTORE_BUILD_BENCHMARKS=1 -DUSTORE_BUILD_ENGINE_ROCKSDB=1 -B ./build_debug && make bench_twitter_ustore_embedded_rocksdb -j --silent -C ./build_debug",
-            "args": [],
-            "type": "shell"
-        },
-        {
-            "label": "Build Debug Arrow Benchmark",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUSTORE_BUILD_TESTS=0 -DUSTORE_BUILD_BENCHMARKS=1 -DUSTORE_BUILD_API_FLIGHT_CLIENT=1 -B ./build_debug && make bench_twitter_ustore_flight_client -j --silent -C ./build_debug",
-            "args": [],
-            "type": "shell"
-        },
-        {
-            "label": "Build Debug UDisk Benchmark",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUSTORE_BUILD_TESTS=0 -DUSTORE_BUILD_BENCHMARKS=1 -DUSTORE_ENGINE_UDISK_PATH=lib/libudisk.a -B ./build_debug && make bench_twitter_ustore_embedded_udisk -j --silent -C ./build_debug",
-            "args": [],
-            "type": "shell"
-        },
-        {
-            "label": "Build Debug Arrow Client Server",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUSTORE_BUILD_API_FLIGHT_CLIENT=1 -B ./build_debug && make test_units_ustore_flight_client -j --silent -C ./build_debug && sleep 5",
-            "args": [],
-            "type": "shell"
-        },
-        {
-            "label": "Build Debug Arrow Server",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUSTORE_BUILD_API_FLIGHT_SERVER=1 -B ./build_debug && make ustore_flight_server_ucset -j --silent -C ./build_debug",
-            "args": [],
-            "type": "shell"
-        },
-        {
-            "label": "Build Debug Tools Test",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -DUSTORE_BUILD_CLI=1 -B ./build_debug && make ustore test_tools_ustore_embedded_ucset -j --silent -C ./build_debug && sleep 5",
-            "args": [],
-            "type": "shell"
-        },
-        {
-            "label": "Clear Build",
-            "command": "rm -rf ./build ./build_* ./bin ./build_version.cc ./.pytest_cache ./tmp/* ./Makefile ./CMakeCache* ./CMakeFiles ./cmake_install.cmake",
-            "args": [],
-            "type": "shell"
-        },
-        {
-            "label": "Count Lines of Code",
-            "command": "cloc $(git ls-files)",
-            "args": [],
-            "type": "shell"
-        }
-    ]
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Build Debug",
+      "detail": "Every engine and suite, unoptimized, with AddressSanitizer and UndefinedBehaviorSanitizer",
+      "command": "cmake --preset debug && cmake --build --preset debug",
+      "args": [],
+      "type": "shell",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "Build Release",
+      "detail": "Libraries, suites, benchmarks and the CLI on every engine",
+      "command": "cmake --preset release && cmake --build --preset release",
+      "args": [],
+      "type": "shell",
+      "group": "build",
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "Test Debug",
+      "detail": "CTest over the sanitized tree",
+      "command": "ctest --preset debug",
+      "args": [],
+      "type": "shell",
+      "group": {
+        "kind": "test",
+        "isDefault": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Build Debug SmashTable Test",
+      "detail": "Unit suite on the in-memory engine",
+      "command": "cmake --preset debug && cmake --build --preset debug --target test_units_ustore_embedded_smashtable",
+      "args": [],
+      "type": "shell",
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "Build Debug RocksDB Test",
+      "detail": "Unit suite on RocksDB",
+      "command": "cmake --preset debug && cmake --build --preset debug --target test_units_ustore_embedded_rocksdb",
+      "args": [],
+      "type": "shell",
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "Build Debug LevelDB Test",
+      "detail": "Unit suite on LevelDB",
+      "command": "cmake --preset debug && cmake --build --preset debug --target test_units_ustore_embedded_leveldb",
+      "args": [],
+      "type": "shell",
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "Build Debug UDisk Test",
+      "detail": "Unit suite on UDisk, which configures only once src/udisk compiles",
+      "command": "cmake --preset debug -DUSTORE_BUILD_UDISK=ON && cmake --build --preset debug --target test_units_ustore_embedded_udisk",
+      "args": [],
+      "type": "shell",
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "Build Debug Strings Test",
+      "detail": "Strings modality suite on the in-memory engine",
+      "command": "cmake --preset debug && cmake --build --preset debug --target test_strings_ustore_embedded_smashtable",
+      "args": [],
+      "type": "shell",
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "Build Debug Test Tools",
+      "detail": "CLI suite and the CLI it drives",
+      "command": "cmake --preset debug && cmake --build --preset debug --target test_tools_ustore_embedded_smashtable",
+      "args": [],
+      "type": "shell",
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "Build Stress Atomicity SmashTable",
+      "detail": "Atomicity stress suite on the in-memory engine",
+      "command": "cmake --preset debug && cmake --build --preset debug --target stress_atomicity_ustore_embedded_smashtable",
+      "args": [],
+      "type": "shell",
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "Build Stress Atomicity RocksDB",
+      "detail": "Atomicity stress suite on RocksDB",
+      "command": "cmake --preset debug && cmake --build --preset debug --target stress_atomicity_ustore_embedded_rocksdb",
+      "args": [],
+      "type": "shell",
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "Build Stress Linearizability SmashTable",
+      "detail": "Linearizability stress suite on the in-memory engine",
+      "command": "cmake --preset debug && cmake --build --preset debug --target stress_linearizability_ustore_embedded_smashtable",
+      "args": [],
+      "type": "shell",
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "Build Stress Linearizability RocksDB",
+      "detail": "Linearizability stress suite on RocksDB",
+      "command": "cmake --preset debug && cmake --build --preset debug --target stress_linearizability_ustore_embedded_rocksdb",
+      "args": [],
+      "type": "shell",
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "Build Debug SmashTable Benchmark",
+      "detail": "Twitter benchmark on the in-memory engine",
+      "command": "cmake --preset profile && cmake --build --preset profile --target bench_twitter_ustore_embedded_smashtable",
+      "args": [],
+      "type": "shell",
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "Build Debug RocksDB Benchmark",
+      "detail": "Twitter benchmark on RocksDB",
+      "command": "cmake --preset profile && cmake --build --preset profile --target bench_twitter_ustore_embedded_rocksdb",
+      "args": [],
+      "type": "shell",
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "Build Debug UDisk Benchmark",
+      "detail": "Twitter benchmark on UDisk, which configures only once src/udisk compiles",
+      "command": "cmake --preset profile -DUSTORE_BUILD_UDISK=ON && cmake --build --preset profile --target bench_twitter_ustore_embedded_udisk",
+      "args": [],
+      "type": "shell",
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "Clear Build",
+      "detail": "Remove every preset tree and the caches beside them",
+      "command": "rm -rf ./build_* ./.pytest_cache ./tmp/*",
+      "args": [],
+      "type": "shell",
+      "problemMatcher": []
+    },
+    {
+      "label": "Count Lines of Code",
+      "detail": "cloc over the tracked files",
+      "command": "cloc $(git ls-files)",
+      "args": [],
+      "type": "shell",
+      "problemMatcher": []
+    }
+  ]
 }
