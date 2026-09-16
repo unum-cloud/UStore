@@ -14,7 +14,7 @@
 
 #include <ustore/blobs_range.hpp> // `keys_stream_t`
 #include <ustore/graph.h>
-#include <ustore/ranges.hpp>      // `transform_reduce_n`
+#include <ustore/ranges.hpp>      // `strided`, `transform_reduce_n`
 #include <ustore/ranges_args.hpp> // `edges_span_t`
 #include <ustore/status.hpp>      // `status_t`
 #include <ustore/types.hpp>       // `arena_t`, `edge_t`
@@ -38,15 +38,15 @@ class graph_stream_t {
 
     status_t prefetch_gather() noexcept {
 
-        strided_range<ustore_key_t const> const vertices = vertex_stream_.keys_batch().strided();
+        strided_range<ustore_key_t const> const vertices = strided(vertex_stream_.keys_batch());
 
-        status_t status;
+        ustore_error_t error {};
         ustore_vertex_degree_t* degrees_per_vertex = nullptr;
         ustore_key_t* edges_per_vertex = nullptr;
 
         ustore_graph_find_edges_t graph_find_edges {};
         graph_find_edges.db = database_;
-        graph_find_edges.error = status.member_ptr();
+        graph_find_edges.error = &error;
         graph_find_edges.transaction = transaction_;
         graph_find_edges.snapshot = snapshot_;
         graph_find_edges.arena = arena_.member_ptr();
@@ -60,7 +60,7 @@ class graph_stream_t {
         graph_find_edges.edges_per_vertex = &edges_per_vertex;
 
         ustore_graph_find_edges(&graph_find_edges);
-        if (!status) return status;
+        if (error.status) return status_t {error};
 
         auto const edges_begin = reinterpret_cast<edge_t*>(edges_per_vertex);
         std::size_t const edges_count = transform_reduce_n(
@@ -91,7 +91,7 @@ class graph_stream_t {
     graph_stream_t& operator=(graph_stream_t const&) = delete;
 
     status_t seek(ustore_key_t vertex_id) noexcept {
-        if (status_t status = vertex_stream_.seek(vertex_id); !status) return status;
+        if (status_t const sought = vertex_stream_.seek(vertex_id); sought.failed()) return sought;
         return prefetch_gather();
     }
 
@@ -103,7 +103,7 @@ class graph_stream_t {
 
     /** Advances like @c advance, but a failed fetch ends the stream since a reference carries no status. */
     graph_stream_t& operator++() noexcept {
-        if (status_t const status = advance(); status) return *this;
+        if (advance().succeeded()) return *this;
         fetched_edges_ = {};
         fetched_offset_ = 0;
         return *this;
@@ -113,7 +113,7 @@ class graph_stream_t {
     edge_t operator*() const noexcept { return edge(); }
     status_t seek_to_first() noexcept { return seek(std::numeric_limits<ustore_key_t>::min()); }
     status_t seek_to_next_batch() noexcept {
-        if (status_t status = vertex_stream_.seek_to_next_batch(); !status) return status;
+        if (status_t const sought = vertex_stream_.seek_to_next_batch(); sought.failed()) return sought;
         return prefetch_gather();
     }
 

@@ -10,6 +10,7 @@
 #include <cstddef> // `std::size_t`
 
 #include <algorithm> // `std::ranges::equal_range`
+#include <span>      // `std::span`
 #include <utility>   // `std::forward`, `std::move`, `std::swap`
 
 #include <ustore/blobs_range.hpp> // `keys_range_t`
@@ -34,14 +35,14 @@ class graph_collection_t {
     any_arena_t arena_;
 
     status_t drop(ustore_drop_mode_t mode) noexcept {
-        status_t status;
+        ustore_error_t error {};
         ustore_collection_drop_t collection_drop {};
         collection_drop.db = database_;
-        collection_drop.error = status.member_ptr();
+        collection_drop.error = &error;
         collection_drop.id = collection_;
         collection_drop.mode = mode;
         ustore_collection_drop(&collection_drop);
-        return status;
+        return status_t {error};
     }
 
   public:
@@ -62,10 +63,10 @@ class graph_collection_t {
     ustore_collection_t* member_ptr() noexcept { return &collection_; }
 
     status_t upsert_vertices(strided_range<ustore_key_t const> vertices) noexcept {
-        status_t status;
+        ustore_error_t error {};
         ustore_graph_upsert_vertices_t upsert {};
         upsert.db = database_;
-        upsert.error = status.member_ptr();
+        upsert.error = &error;
         upsert.transaction = transaction_;
         upsert.arena = arena_;
         upsert.tasks_count = vertices.size();
@@ -74,7 +75,7 @@ class graph_collection_t {
         upsert.vertices_stride = vertices.stride();
 
         ustore_graph_upsert_vertices(&upsert);
-        return status;
+        return status_t {error};
     }
 
     template <typename keys_arg_>
@@ -85,10 +86,10 @@ class graph_collection_t {
     status_t upsert_vertex(ustore_key_t const vertex) noexcept { return upsert_vertices({{&vertex}, 1}); }
 
     status_t upsert_edges(edges_view_t const& edges) noexcept {
-        status_t status;
+        ustore_error_t error {};
         ustore_graph_upsert_edges_t graph_upsert_edges {};
         graph_upsert_edges.db = database_;
-        graph_upsert_edges.error = status.member_ptr();
+        graph_upsert_edges.error = &error;
         graph_upsert_edges.transaction = transaction_;
         graph_upsert_edges.arena = arena_;
         graph_upsert_edges.tasks_count = edges.size();
@@ -101,7 +102,7 @@ class graph_collection_t {
         graph_upsert_edges.targets_stride = edges.target_ids.stride();
 
         ustore_graph_upsert_edges(&graph_upsert_edges);
-        return status;
+        return status_t {error};
     }
 
     status_t upsert_edge(edge_t const& edge) noexcept { return upsert_edges(edges_view_t {&edge, &edge + 1}); }
@@ -110,10 +111,10 @@ class graph_collection_t {
         strided_range<ustore_key_t const> vertices, strided_range<ustore_vertex_role_t const> roles = {},
         flush_t flush = flush_t::dont_flush_k) noexcept {
 
-        status_t status;
+        ustore_error_t error {};
         ustore_graph_remove_vertices_t graph_remove_vertices {};
         graph_remove_vertices.db = database_;
-        graph_remove_vertices.error = status.member_ptr();
+        graph_remove_vertices.error = &error;
         graph_remove_vertices.transaction = transaction_;
         graph_remove_vertices.arena = arena_;
         graph_remove_vertices.options = to_options(flush);
@@ -125,7 +126,7 @@ class graph_collection_t {
         graph_remove_vertices.roles_stride = roles.stride();
 
         ustore_graph_remove_vertices(&graph_remove_vertices);
-        return status;
+        return status_t {error};
     }
 
     template <typename keys_arg_>
@@ -140,10 +141,10 @@ class graph_collection_t {
     }
 
     status_t remove_edges(edges_view_t const& edges) noexcept {
-        status_t status;
+        ustore_error_t error {};
         ustore_graph_remove_edges_t graph_remove_edges {};
         graph_remove_edges.db = database_;
-        graph_remove_edges.error = status.member_ptr();
+        graph_remove_edges.error = &error;
         graph_remove_edges.transaction = transaction_;
         graph_remove_edges.arena = arena_;
         graph_remove_edges.tasks_count = edges.size();
@@ -156,7 +157,7 @@ class graph_collection_t {
         graph_remove_edges.targets_stride = edges.target_ids.stride();
 
         ustore_graph_remove_edges(&graph_remove_edges);
-        return status;
+        return status_t {error};
     }
 
     status_t remove_edge(edge_t const& edge) noexcept { return remove_edges(edges_view_t {&edge, &edge + 1}); }
@@ -172,20 +173,20 @@ class graph_collection_t {
         watch_t watch = watch_t::watch_k) noexcept {
 
         auto maybe_degrees = degrees({{&vertex}, 1}, {{&role}, 1}, watch);
-        if (!maybe_degrees) return maybe_degrees.release_status();
+        if (!maybe_degrees) return maybe_degrees.status();
         return ustore_vertex_degree_t {(*maybe_degrees)[0]};
     }
 
-    expected<ptr_range<ustore_vertex_degree_t>> degrees( //
+    expected<std::span<ustore_vertex_degree_t>> degrees( //
         strided_range<ustore_key_t const> vertices, strided_range<ustore_vertex_role_t const> roles = {},
         watch_t watch = watch_t::watch_k) noexcept {
 
-        status_t status;
+        ustore_error_t error {};
         ustore_vertex_degree_t* degrees_per_vertex = nullptr;
 
         ustore_graph_find_edges_t graph_find_edges {};
         graph_find_edges.db = database_;
-        graph_find_edges.error = status.member_ptr();
+        graph_find_edges.error = &error;
         graph_find_edges.transaction = transaction_;
         graph_find_edges.snapshot = snapshot_;
         graph_find_edges.arena = arena_;
@@ -199,8 +200,8 @@ class graph_collection_t {
         graph_find_edges.degrees_per_vertex = &degrees_per_vertex;
 
         ustore_graph_find_edges(&graph_find_edges);
-        if (!status) return status;
-        return ptr_range<ustore_vertex_degree_t> {degrees_per_vertex, degrees_per_vertex + vertices.size()};
+        if (error.status) return status_t {error};
+        return std::span<ustore_vertex_degree_t> {degrees_per_vertex, degrees_per_vertex + vertices.size()};
     }
 
     expected<bool> contains(ustore_key_t vertex, watch_t watch = watch_t::watch_k) noexcept {
@@ -240,7 +241,7 @@ class graph_collection_t {
             keys_stream_t::default_read_ahead_k,
             ustore_vertex_source_k,
         };
-        if (status_t status = stream.seek_to_first(); !status) return std::move(status);
+        if (status_t const sought = stream.seek_to_first(); sought.failed()) return sought;
 
         std::size_t count = 0;
         for (; !stream.is_end(); ++stream) ++count;
@@ -253,8 +254,8 @@ class graph_collection_t {
 
         graph_stream_t begin {database_, collection_, transaction_, snapshot_, vertices_read_ahead, role};
         graph_stream_t end {database_, collection_, transaction_, snapshot_, vertices_read_ahead, role};
-        if (status_t status = begin.seek_to_first(); !status) return std::move(status);
-        if (status_t status = end.seek(ustore_key_unknown_k); !status) return std::move(status);
+        if (status_t const sought = begin.seek_to_first(); sought.failed()) return sought;
+        if (status_t const sought = end.seek(ustore_key_unknown_k); sought.failed()) return sought;
         return adjacency_range_t {std::move(begin), std::move(end)};
     }
 
@@ -262,13 +263,13 @@ class graph_collection_t {
         ustore_key_t vertex, ustore_vertex_role_t role = ustore_vertex_role_any_k,
         watch_t watch = watch_t::watch_k) noexcept {
 
-        status_t status {};
+        ustore_error_t error {};
         ustore_vertex_degree_t* degrees_per_vertex {};
         ustore_key_t* edges_per_vertex {};
 
         ustore_graph_find_edges_t graph_find_edges {};
         graph_find_edges.db = database_;
-        graph_find_edges.error = status.member_ptr();
+        graph_find_edges.error = &error;
         graph_find_edges.transaction = transaction_;
         graph_find_edges.snapshot = snapshot_;
         graph_find_edges.arena = arena_;
@@ -281,7 +282,7 @@ class graph_collection_t {
         graph_find_edges.edges_per_vertex = &edges_per_vertex;
 
         ustore_graph_find_edges(&graph_find_edges);
-        if (!status) return status;
+        if (error.status) return status_t {error};
 
         ustore_vertex_degree_t const edges_count = degrees_per_vertex[0];
         if (edges_count == ustore_vertex_degree_missing_k) return edges_span_t {};
@@ -311,13 +312,13 @@ class graph_collection_t {
         strided_range<ustore_key_t const> vertices, strided_range<ustore_vertex_role_t const> roles = {},
         watch_t watch = watch_t::watch_k) noexcept {
 
-        status_t status;
+        ustore_error_t error {};
         ustore_vertex_degree_t* degrees_per_vertex = nullptr;
         ustore_key_t* edges_per_vertex = nullptr;
 
         ustore_graph_find_edges_t graph_find_edges {};
         graph_find_edges.db = database_;
-        graph_find_edges.error = status.member_ptr();
+        graph_find_edges.error = &error;
         graph_find_edges.transaction = transaction_;
         graph_find_edges.snapshot = snapshot_;
         graph_find_edges.arena = arena_;
@@ -332,7 +333,7 @@ class graph_collection_t {
         graph_find_edges.edges_per_vertex = &edges_per_vertex;
 
         ustore_graph_find_edges(&graph_find_edges);
-        if (!status) return status;
+        if (error.status) return status_t {error};
 
         auto const edges_begin = reinterpret_cast<edge_t*>(edges_per_vertex);
         std::size_t const edges_count = transform_reduce_n(
@@ -343,13 +344,13 @@ class graph_collection_t {
 
     expected<strided_range<ustore_key_t>> successors(ustore_key_t vertex) noexcept {
         auto maybe = edges_containing(vertex, ustore_vertex_source_k);
-        if (!maybe) return maybe.release_status();
+        if (!maybe) return maybe.status();
         return strided_range<ustore_key_t> {maybe->target_ids};
     }
 
     expected<strided_range<ustore_key_t>> predecessors(ustore_key_t vertex) noexcept {
         auto maybe = edges_containing(vertex, ustore_vertex_target_k);
-        if (!maybe) return maybe.release_status();
+        if (!maybe) return maybe.status();
         return strided_range<ustore_key_t> {maybe->source_ids};
     }
 
@@ -357,7 +358,7 @@ class graph_collection_t {
     expected<strided_range<ustore_key_t>> neighbors(ustore_key_t vertex,
                                                     ustore_vertex_role_t role = ustore_vertex_role_any_k) noexcept {
         auto maybe = edges_containing(vertex, role);
-        if (!maybe) return maybe.release_status();
+        if (!maybe) return maybe.status();
 
         // Incoming and outgoing edges hold the neighbor in different columns, so every edge is flipped to target it
         edges_span_t edges = *maybe;
