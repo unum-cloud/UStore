@@ -23,8 +23,8 @@ extern "C" {
  *  @brief An opaque handle to an open database, safe to share across threads from open until free.
  *
  *  An embedded database owns its directory, so no two processes may open the same one at once. Every
- *  database holds the nameless @c ustore_collection_main_k, which can be cleared but never dropped,
- *  next to named collections of binary values, documents or graphs.
+ *  database holds @c ustore_collection_main_k, which can be cleared but never dropped, next to the
+ *  collections of binary values, documents or graphs it creates.
  */
 typedef void* ustore_database_t;
 
@@ -62,8 +62,67 @@ typedef uint8_t ustore_octet_t;
 /** A monotonically increasing identifier of the order in which transactions applied. */
 typedef uint64_t ustore_sequence_number_t;
 
-/** An owning error message, which the caller frees with @c ustore_error_free unless it is @c NULL. */
-typedef char const* ustore_error_t;
+/** What went wrong, in one vocabulary shared by every engine and binding. */
+typedef enum ustore_status_t {
+
+    /** The call completed; @c message carries nothing. */
+    ustore_success_k = 0,
+
+    /** An allocation could not be satisfied. */
+    ustore_error_out_of_memory_k = 1,
+
+    /** An argument is null, contradicts another one, or carries options the call does not accept. */
+    ustore_error_invalid_argument_k = 2,
+
+    /** The call needs a database or transaction that was never opened. */
+    ustore_error_uninitialized_k = 3,
+
+    /** The engine or build does not implement what the call asks for. */
+    ustore_error_unsupported_k = 4,
+
+    /** A file or directory could not be opened, read, written, or closed. */
+    ustore_error_io_k = 5,
+
+    /** Stored or supplied data could not be decoded, like a corrupted file or an invalid document. */
+    ustore_error_malformed_k = 6,
+
+    /** A snapshot, collection, or document the call addresses does not exist. */
+    ustore_error_not_found_k = 7,
+
+    /** A snapshot, collection, or document the call creates already exists. */
+    ustore_error_already_exists_k = 8,
+
+    /** A concurrent writer changed a key this transaction wrote; retry the transaction. */
+    ustore_error_write_conflict_k = 9,
+
+    /** A concurrent writer changed a key this transaction read; retry the transaction. */
+    ustore_error_read_conflict_k = 10,
+
+    /** A concurrent writer inserted into a range this transaction scanned; retry the transaction. */
+    ustore_error_phantom_conflict_k = 11,
+
+    /** A hard design ceiling was reached, where a smaller request would fit. */
+    ustore_error_capacity_exhausted_k = 12,
+
+    /** A device could not be selected, or its memory could not be claimed. */
+    ustore_error_device_k = 13,
+
+    /** The engine failed in a way no other status names, which points at a defect. */
+    ustore_error_internal_k = 14,
+
+} ustore_status_t;
+
+/** Outcome of one call: a status to branch on, and a static message that is never freed and is @c NULL exactly
+ *  when the status is @c ustore_success_k. */
+typedef struct ustore_error_t {
+
+    /** What went wrong, or @c ustore_success_k. */
+    ustore_status_t status;
+
+    /** Static detail the status cannot carry. */
+    char const* message;
+
+} ustore_error_t;
 
 /** A string the caller owns and the database never frees. */
 typedef char const* ustore_str_view_t;
@@ -131,17 +190,22 @@ typedef enum {
     /** The engine supports transactions. */
     ustore_supports_transactions_k = 1,
 
-    /** The engine supports named collections. */
-    ustore_supports_named_collections_k = 2,
+    /** The engine supports collections beyond the main one. */
+    ustore_supports_collections_k = 2,
 
     /** The engine supports snapshots. */
     ustore_supports_snapshots_k = 4,
 
 } ustore_metadata_t;
 
-/** The nameless collection every database holds, which @c ustore_drop_keys_vals_k and
+/** The collection every database holds, which @c ustore_drop_keys_vals_k and
  *  @c ustore_drop_vals_k may only clear. */
 extern ustore_collection_t const ustore_collection_main_k;
+
+/** The collection reserved for the strings modality that maps names onto identifiers, which
+ *  @c ustore_collection_create never hands out and @c ustore_collection_list never reports. An engine
+ *  without collections of its own refuses it, as it refuses every collection but the main one. */
+extern ustore_collection_t const ustore_collection_names_k;
 
 /** The length reported for a missing value. */
 extern ustore_length_t const ustore_length_missing_k;
@@ -196,8 +260,8 @@ void ustore_get_metadata(ustore_get_metadata_t* arguments);
 /**
  *  @brief The arguments of @c ustore_database_control, a free-form tunnel to the engine.
  *
- *  Requests have no stable format and are expensive: "clear" removes all data and keeps collection
- *  names, "reset" removes both, "compact" flushes and compacts LSM trees, "info" describes the build,
+ *  Requests have no stable format and are expensive: "clear" removes all data and keeps the
+ *  collections, "reset" removes both, "compact" flushes and compacts LSM trees, "info" describes the build,
  *  and "usage" estimates the sizes of collections and the use of memory and disk.
  */
 typedef struct ustore_database_control_t {
@@ -326,10 +390,10 @@ void ustore_snapshot_drop(ustore_snapshot_drop_t* arguments);
 #pragma region Collections
 
 /**
- *  @brief The arguments of @c ustore_collection_list, which exports identifiers and a tape of
- *      null-terminated names.
+ *  @brief The arguments of @c ustore_collection_list, which exports the identifiers of the collections.
  *
  *  The main collection is never listed. Listing is the only collection operation that runs on a snapshot.
+ *  A name a caller gives a collection lives in the strings modality, never in the catalog of an engine.
  */
 typedef struct ustore_collection_list_t {
 
@@ -351,28 +415,22 @@ typedef struct ustore_collection_list_t {
     /** Accepts @c ustore_option_dont_discard_memory_k. */
     ustore_options_t options;
 
-    /** Output for the number of named collections. */
+    /** Output for the number of collections. */
     ustore_size_t* count;
 
-    /** Output for the identifiers, in the order of @c names. */
+    /** Output for the identifiers of the collections. */
     ustore_collection_t** ids;
-
-    /** Output for the offsets of every name inside @c names. */
-    ustore_length_t** offsets;
-
-    /** Output for the tape of null-terminated names, in the order of @c ids. */
-    ustore_char_t** names;
 
 } ustore_collection_list_t;
 
 /**
- *  @brief Lists the named collections of the database.
+ *  @brief Lists the collections of the database.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
 void ustore_collection_list(ustore_collection_list_t* arguments);
 
-/** The arguments of @c ustore_collection_create, which also recreates an empty collection with a
- *  new configuration. */
+/** The arguments of @c ustore_collection_create, which always creates an empty collection and answers
+ *  the identifier addressing it. */
 typedef struct ustore_collection_create_t {
 
     /** An open database. */
@@ -380,9 +438,6 @@ typedef struct ustore_collection_create_t {
 
     /** Output for the error message. */
     ustore_error_t* error;
-
-    /** Unique name of the new collection. */
-    ustore_str_view_t name;
 
     /** Optional configuration as a JSON string. */
     ustore_str_view_t config;
@@ -393,7 +448,7 @@ typedef struct ustore_collection_create_t {
 } ustore_collection_create_t;
 
 /**
- *  @brief Creates a uniquely named collection.
+ *  @brief Creates an empty collection.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
 void ustore_collection_create(ustore_collection_create_t* arguments);
@@ -523,12 +578,6 @@ void ustore_transaction_free(ustore_transaction_t transaction);
  *  @param[inout] database The database to be closed; @c NULL is safe.
  */
 void ustore_database_free(ustore_database_t database);
-
-/**
- *  @brief Frees an error message.
- *  @param[inout] error The message to be freed; @c NULL is safe.
- */
-void ustore_error_free(ustore_error_t error);
 
 #pragma endregion Memory Reclamation
 

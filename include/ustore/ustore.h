@@ -17,7 +17,17 @@
 
 #pragma once
 
+/** The major version of UStore, which changes when the C ABI breaks. */
+#define USTORE_VERSION_MAJOR 1
+
+/** The minor version of UStore, which changes when the C ABI gains calls. */
+#define USTORE_VERSION_MINOR 0
+
+/** The patch version of UStore, which changes for fixes that keep the C ABI. */
+#define USTORE_VERSION_PATCH 0
+
 #include <ustore/blobs.h>
 #include <ustore/db.h>
 #include <ustore/docs.h>
 #include <ustore/graph.h>
+#include <ustore/strings.h>

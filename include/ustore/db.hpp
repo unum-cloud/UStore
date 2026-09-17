@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cstddef> // `std::size_t`
+#include <cstring> // `std::memcpy`
 
 #include <limits>      // `std::numeric_limits`
 #include <span>        // `std::span`
@@ -18,7 +19,7 @@
 #include <ustore/blobs_ref.hpp>        // `blobs_ref`
 #include <ustore/docs_collection.hpp>  // `docs_collection_t`
 #include <ustore/graph_collection.hpp> // `graph_collection_t`
-#include <ustore/ranges.hpp>           // `strided_range`, `strings_tape_iterator_t`
+#include <ustore/ranges.hpp>           // `strided_range`
 #include <ustore/ranges_args.hpp>      // `keys_view_t`, `places_arg_t`
 #include <ustore/status.hpp>           // `status_t`, `expected`
 #include <ustore/types.hpp>            // `arena_t`, `collection_key_t`, `collection_key_field_t`
@@ -28,11 +29,71 @@ namespace unum::ustore {
 
 using snapshots_list_t = std::span<ustore_snapshot_t>;
 
-/** The named collections of a database, identifiers and names in the same order. */
-struct collections_list_t {
-    std::span<ustore_collection_t> ids;
-    strings_tape_iterator_t names;
-};
+using collections_list_t = std::span<ustore_collection_t>;
+
+/**
+ *  @brief Reads the collection @p name was given, through the strings modality that holds every name.
+ *
+ *  Names resolve in two phases, so this is the only place a name reaches the database, and every other
+ *  call addresses its collection by the identifier this returns.
+ */
+inline expected<ustore_collection_t> collection_named(ustore_database_t database, ustore_transaction_t transaction,
+                                                      ustore_arena_t* arena, std::string_view name) noexcept {
+    ustore_error_t error {};
+    ustore_str_view_t const text = name.data();
+    auto const text_length = static_cast<ustore_length_t>(name.size());
+    ustore_collection_t const names = ustore_collection_names_k;
+    ustore_length_t* offsets = nullptr;
+    ustore_length_t* lengths = nullptr;
+    ustore_byte_t* values = nullptr;
+    ustore_strings_read_t read {};
+    read.db = database;
+    read.error = &error;
+    read.transaction = transaction;
+    read.arena = arena;
+    read.tasks_count = 1;
+    read.collections = &names;
+    read.strings = &text;
+    read.strings_lengths = &text_length;
+    read.offsets = &offsets;
+    read.lengths = &lengths;
+    read.values = &values;
+
+    ustore_strings_read(&read);
+    if (error.status) return status_t {error};
+    if (lengths[0] != sizeof(ustore_collection_t)) return status_t {status_code_t::not_found_k, "No such collection"};
+
+    ustore_collection_t found = ustore_collection_main_k;
+    std::memcpy(&found, values + offsets[0], sizeof(found));
+    return found;
+}
+
+/** Records that @p name addresses @p collection, or removes the name when no collection is given. */
+inline status_t name_collection(ustore_database_t database, ustore_arena_t* arena, std::string_view name,
+                                ustore_collection_t const* collection) noexcept {
+    ustore_error_t error {};
+    ustore_str_view_t const text = name.data();
+    auto const text_length = static_cast<ustore_length_t>(name.size());
+    ustore_collection_t const names = ustore_collection_names_k;
+    auto const value = reinterpret_cast<ustore_bytes_cptr_t>(collection);
+    ustore_length_t const value_length = sizeof(ustore_collection_t);
+    ustore_strings_write_t write {};
+    write.db = database;
+    write.error = &error;
+    write.arena = arena;
+    write.tasks_count = 1;
+    write.collections = &names;
+    write.strings = &text;
+    write.strings_lengths = &text_length;
+    write.values = collection ? &value : nullptr;
+    write.values_lengths = collection ? &value_length : nullptr;
+
+    ustore_strings_write(&write);
+    return status_t {error};
+}
+
+/** Whether @p status only says the engine keeps no collections of its own, so no name can be stored. */
+inline bool without_collections(status_t status) noexcept { return status.code == status_code_t::unsupported_k; }
 
 /** A transaction or snapshot context for one thread.
  *
@@ -114,7 +175,6 @@ class context_t {
 
     expected<collections_list_t> collections() noexcept {
         ustore_size_t count = 0;
-        ustore_str_span_t names = nullptr;
         ustore_collection_t* ids = nullptr;
         ustore_error_t error {};
         ustore_collection_list_t collection_list {};
@@ -125,15 +185,10 @@ class context_t {
         collection_list.arena = arena_.member_ptr();
         collection_list.count = &count;
         collection_list.ids = &ids;
-        collection_list.names = &names;
 
         ustore_collection_list(&collection_list);
         if (error.status) return status_t {error};
-
-        collections_list_t result;
-        result.ids = {ids, ids + count};
-        result.names = {count, names};
-        return result;
+        return collections_list_t {ids, ids + count};
     }
 
     expected<snapshots_list_t> snapshots() noexcept {
@@ -156,13 +211,11 @@ class context_t {
     expected<bool> contains(std::string_view name) noexcept {
         if (name.empty()) return true;
 
-        auto maybe_listed = collections();
-        if (!maybe_listed) return maybe_listed.status();
-
-        strings_tape_iterator_t names = maybe_listed->names;
-        for (std::size_t index = 0; index != maybe_listed->ids.size(); ++index, ++names)
-            if (*names == name) return true;
-        return false;
+        auto maybe_found = collection_named(database_, transaction_, arena_.member_ptr(), name);
+        if (maybe_found) return true;
+        if (maybe_found.status() == status_code_t::not_found_k || without_collections(maybe_found.status()))
+            return false;
+        return maybe_found.status();
     }
 
     /**
@@ -174,15 +227,11 @@ class context_t {
         if (name.empty())
             return collection_ {database_, ustore_collection_main_k, transaction_, {}, arena_.member_ptr()};
 
-        auto maybe_listed = collections();
-        if (!maybe_listed) return maybe_listed.status();
-
-        strings_tape_iterator_t names = maybe_listed->names;
-        for (ustore_collection_t const id : maybe_listed->ids) {
-            if (*names == name) return collection_ {database_, id, transaction_, {}, arena_.member_ptr()};
-            ++names;
-        }
-        return status_t {status_code_t::not_found_k, "No such collection"};
+        auto maybe_found = collection_named(database_, transaction_, arena_.member_ptr(), name);
+        if (maybe_found) return collection_ {database_, *maybe_found, transaction_, {}, arena_.member_ptr()};
+        if (without_collections(maybe_found.status()))
+            return status_t {status_code_t::not_found_k, "No such collection"};
+        return maybe_found.status();
     }
 
     /** Clears the transaction for reuse, keeping its memory and starting a new generation. */
@@ -286,7 +335,7 @@ class database_t {
         if (database_) close();
     }
 
-    bool supports_named_collections() noexcept { return get_metadata() & ustore_supports_named_collections_k; }
+    bool supports_collections() noexcept { return get_metadata() & ustore_supports_collections_k; }
     bool supports_transactions() noexcept { return get_metadata() & ustore_supports_transactions_k; }
     bool supports_snapshots() noexcept { return get_metadata() & ustore_supports_snapshots_k; }
 
@@ -336,19 +385,32 @@ class database_t {
     expected<blobs_collection_t> operator[](ustore_str_view_t name) noexcept { return find_or_create(name); }
     expected<bool> contains(std::string_view name) noexcept { return context_t {database_, nullptr}.contains(name); }
 
+    /** Creates a collection and records @p name for it, in the two phases a name always resolves through. */
     template <typename collection_ = blobs_collection_t>
     expected<collection_> create(ustore_str_view_t name, ustore_str_view_t config = "") noexcept {
+        std::string_view const wanted {name ? name : ""};
+        if (wanted.empty())
+            return status_t {status_code_t::invalid_argument_k, "The main collection has no name and always exists"};
+
+        arena_t arena {database_};
+        auto maybe_taken = collection_named(database_, nullptr, arena.member_ptr(), wanted);
+        if (maybe_taken) return status_t {status_code_t::already_exists_k, "Such collection already exists"};
+        if (maybe_taken.status() != status_code_t::not_found_k && !without_collections(maybe_taken.status()))
+            return maybe_taken.status();
+
         ustore_error_t error {};
         ustore_collection_t collection = ustore_collection_main_k;
         ustore_collection_create_t collection_create {};
         collection_create.db = database_;
         collection_create.error = &error;
-        collection_create.name = name;
         collection_create.config = config;
         collection_create.id = &collection;
 
         ustore_collection_create(&collection_create);
         if (error.status) return status_t {error};
+
+        status_t const named = name_collection(database_, arena.member_ptr(), wanted, &collection);
+        if (named.failed()) return named;
         return collection_ {database_, collection, nullptr};
     }
 
@@ -369,10 +431,14 @@ class database_t {
     status_t drop(std::string_view name) noexcept {
         auto maybe_collection = find(name);
         if (!maybe_collection) return maybe_collection.status();
-        return maybe_collection->drop();
+        status_t const dropped = maybe_collection->drop();
+        if (dropped.failed()) return dropped;
+
+        arena_t arena {database_};
+        return name_collection(database_, arena.member_ptr(), name, nullptr);
     }
 
-    /** Drops every snapshot and named collection, then empties the main collection. */
+    /** Drops every snapshot and collection, then empties the names and the main collection. */
     status_t clear() noexcept {
         context_t context {database_, nullptr};
         ustore_error_t error {};
@@ -396,11 +462,18 @@ class database_t {
         collection_drop.db = database_;
         collection_drop.error = &error;
         collection_drop.mode = ustore_drop_keys_vals_handle_k;
-        for (ustore_collection_t const id : maybe_listed->ids) {
+        for (ustore_collection_t const id : *maybe_listed) {
             collection_drop.id = id;
             ustore_collection_drop(&collection_drop);
             if (error.status) return status_t {error};
         }
+
+        // The names go with the collections they addressed, and an engine without them has none to clear
+        collection_drop.id = ustore_collection_names_k;
+        collection_drop.mode = ustore_drop_keys_vals_k;
+        ustore_collection_drop(&collection_drop);
+        if (error.status && error.status != ustore_error_unsupported_k) return status_t {error};
+        error = {};
 
         collection_drop.id = ustore_collection_main_k;
         collection_drop.mode = ustore_drop_keys_vals_k;

@@ -2,10 +2,12 @@ cmake_minimum_required(VERSION 3.16)
 
 file(READ "VERSION" USTORE_VERSION)
 string(STRIP ${USTORE_VERSION} USTORE_VERSION)
+# CMake versions are numeric, so the pre-release suffix of VERSION stays in USTORE_VERSION only.
+string(REGEX MATCH "^[0-9]+\\.[0-9]+\\.[0-9]+" USTORE_VERSION_NUMBER ${USTORE_VERSION})
 project(
     UStore
     LANGUAGES C CXX
-    VERSION ${USTORE_VERSION}
+    VERSION ${USTORE_VERSION_NUMBER}
     HOMEPAGE_URL "https://github.com/unum-cloud/UStore"
     DESCRIPTION "GPU-Accelerated Embedded Transactional Database for High-Throughput NVMe Devices"
 )
@@ -94,7 +96,6 @@ find_package(Threads REQUIRED)
 # Install 3rd Party Packages
 include(FetchContent)
 include_directories(include/)
-include_directories(numkong/include stringzilla/include forkunion/include smashtable/include)
 include_directories(tools)
 include_directories(src)
 include_directories(src/helpers)
@@ -125,6 +126,31 @@ set(FORKUNION_BUILD_TESTS OFF)
 set(FORKUNION_INSTALL OFF)
 add_subdirectory(forkunion EXCLUDE_FROM_ALL)
 
+# SmashTable's containers, header-only
+set(SMASHTABLE_BUILD_TESTS OFF)
+set(SMASHTABLE_BUILD_CUDA OFF)
+set(SMASHTABLE_INSTALL OFF)
+add_subdirectory(smashtable EXCLUDE_FROM_ALL)
+
+# StringZilla's compiled core, so a portable build without instruction-set flags still dispatches to the fastest kernel
+# the running CPU supports. NumKong is unused today; wiring it in later is the same add_subdirectory plus a
+# numkong::header link, once something includes its headers.
+set(STRINGZILLA_BUILD_TEST OFF)
+set(STRINGZILLA_BUILD_BENCHMARK OFF)
+set(STRINGZILLA_BUILD_SHARED OFF)
+set(STRINGZILLA_BUILD_STATIC ON)
+set(STRINGZILLAS_BUILD_SHARED OFF)
+set(STRINGZILLA_BUILD_CUDA OFF)
+set(STRINGZILLA_INSTALL OFF)
+# StringZilla arms sanitizers in Debug by default, which leaves its archive needing a runtime the consumers' link lines
+# do not carry.
+set(STRINGZILLA_USE_SANITIZERS OFF)
+add_subdirectory(stringzilla EXCLUDE_FROM_ALL)
+
+add_library(ustore_stringzilla_dispatch INTERFACE)
+target_link_libraries(ustore_stringzilla_dispatch INTERFACE stringzilla::static)
+target_compile_definitions(ustore_stringzilla_dispatch INTERFACE SZ_DYNAMIC_DISPATCH=1)
+
 if (${USTORE_BUILD_BENCH_CPP})
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/gbench.cmake")
 endif ()
@@ -143,19 +169,28 @@ endif ()
 set(USTORE_ENGINE_NAMES "smashtable")
 add_library(
     ustore_embedded_smashtable STATIC ${USTORE_LIB_C_EXCLUSION} src/smashtable/engine.cpp c/docs.cpp c/graph.cpp
+                                      c/strings.cpp
 )
-target_link_libraries(ustore_embedded_smashtable Threads::Threads yyjson forkunion::static)
+target_link_libraries(
+    ustore_embedded_smashtable Threads::Threads yyjson forkunion::static smashtable::header ustore_stringzilla_dispatch
+)
 target_compile_definitions(ustore_embedded_smashtable INTERFACE USTORE_VERSION="${USTORE_VERSION}")
 
 if (${USTORE_USE_ROCKSDB})
-    add_library(ustore_embedded_rocksdb STATIC ${USTORE_LIB_C_EXCLUSION} src/rocksdb/engine.cpp c/docs.cpp c/graph.cpp)
+    add_library(
+        ustore_embedded_rocksdb STATIC ${USTORE_LIB_C_EXCLUSION} src/rocksdb/engine.cpp c/docs.cpp c/graph.cpp
+                                       c/strings.cpp
+    )
     target_link_libraries(ustore_embedded_rocksdb ${LIB_ROCKSDB} Threads::Threads yyjson)
     target_compile_definitions(ustore_embedded_rocksdb INTERFACE USTORE_VERSION="${USTORE_VERSION}")
     list(APPEND USTORE_ENGINE_NAMES "rocksdb")
 endif ()
 
 if (${USTORE_USE_LEVELDB})
-    add_library(ustore_embedded_leveldb STATIC ${USTORE_LIB_C_EXCLUSION} src/leveldb/engine.cpp c/docs.cpp c/graph.cpp)
+    add_library(
+        ustore_embedded_leveldb STATIC ${USTORE_LIB_C_EXCLUSION} src/leveldb/engine.cpp c/docs.cpp c/graph.cpp
+                                       c/strings.cpp
+    )
     target_link_libraries(ustore_embedded_leveldb ${LIB_LEVELDB} Threads::Threads yyjson)
     if (NOT MSVC)
         set_source_files_properties(src/leveldb/engine.cpp PROPERTIES COMPILE_FLAGS -fno-rtti)
@@ -165,7 +200,9 @@ if (${USTORE_USE_LEVELDB})
 endif ()
 
 foreach (engine_name IN ITEMS ${USTORE_ENGINE_NAMES})
-    target_link_libraries(ustore_embedded_${engine_name} ustore_warnings ${LIB_FMT} forkunion::static)
+    target_link_libraries(
+        ustore_embedded_${engine_name} ustore_warnings ${LIB_FMT} smashtable::header forkunion::static
+    )
 endforeach ()
 
 # A static engine library links only beside the archives it depends on, so they install together, apart from system
@@ -173,8 +210,15 @@ endforeach ()
 if (USTORE_INSTALL)
     include(GNUInstallDirs)
     list(TRANSFORM USTORE_ENGINE_NAMES PREPEND "ustore_embedded_" OUTPUT_VARIABLE USTORE_ENGINE_LIBS)
-    install(TARGETS ${USTORE_ENGINE_LIBS} ${LIB_ROCKSDB} ${LIB_LEVELDB} fmt yyjson forkunion_static
-            ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}/ustore
+    install(
+        TARGETS ${USTORE_ENGINE_LIBS}
+                ${LIB_ROCKSDB}
+                ${LIB_LEVELDB}
+                fmt
+                yyjson
+                forkunion_static
+                stringzilla_static
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}/ustore
     )
     install(DIRECTORY include/ustore DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 endif ()
@@ -182,13 +226,17 @@ endif ()
 if (${USTORE_BUILD_TOOLS_CPP})
     foreach (engine_name IN ITEMS ${USTORE_ENGINE_NAMES})
         add_executable(ustore_cli_${engine_name} tools/cli.cpp tools/dataset.cpp)
-        target_link_libraries(ustore_cli_${engine_name} ${LIB_FMT} ustore_embedded_${engine_name})
+        target_link_libraries(
+            ustore_cli_${engine_name} ${LIB_FMT} ustore_embedded_${engine_name} ustore_stringzilla_dispatch
+        )
     endforeach ()
 endif ()
 
 if (${USTORE_BUILD_TEST_CPP})
     enable_testing()
-    set(USTORE_TEST_NAMES "test_api" "test_compilation" "test_units" "stress_atomicity" "stress_linearizability")
+    set(USTORE_TEST_NAMES "test_api" "test_compilation" "test_units" "test_strings" "stress_atomicity"
+                          "stress_linearizability"
+    )
 
     foreach (engine_name IN ITEMS ${USTORE_ENGINE_NAMES})
         set(client_lib ustore_embedded_${engine_name})
@@ -204,7 +252,7 @@ if (${USTORE_BUILD_TEST_CPP})
         if (${USTORE_BUILD_TOOLS_CPP})
             set(test_exe test_tools_${client_lib})
             add_executable(${test_exe} tests/test_tools.cpp tools/dataset.cpp)
-            target_link_libraries(${test_exe} ${LIB_FMT} ${client_lib})
+            target_link_libraries(${test_exe} ${LIB_FMT} ${client_lib} ustore_stringzilla_dispatch)
             add_dependencies(${test_exe} ustore_cli_${engine_name})
             add_test(NAME ${test_exe} COMMAND ${test_exe} --directory ${CMAKE_BINARY_DIR}/test_data --cli
                                               $<TARGET_FILE:ustore_cli_${engine_name}>
@@ -220,11 +268,11 @@ if (${USTORE_BUILD_BENCH_CPP})
 
         set(bench_name bench_twitter_${client_lib})
         add_executable(${bench_name} bench/twitter.cpp)
-        target_link_libraries(${bench_name} benchmark ${LIB_FMT} ${client_lib})
+        target_link_libraries(${bench_name} benchmark ${LIB_FMT} ${client_lib} ustore_stringzilla_dispatch)
 
         set(bench_name bench_tabular_graph_${client_lib})
         add_executable(${bench_name} bench/tabular_graph.cpp tools/dataset.cpp)
-        target_link_libraries(${bench_name} benchmark ${LIB_FMT} ${client_lib})
+        target_link_libraries(${bench_name} benchmark ${LIB_FMT} ${client_lib} ustore_stringzilla_dispatch)
     endforeach ()
 endif ()
 

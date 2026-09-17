@@ -39,6 +39,7 @@
 #include "helpers/linked_memory.hpp"  // `linked_memory_lock_t`
 
 ustore_collection_t const ustore_collection_main_k = 0;
+ustore_collection_t const ustore_collection_names_k = std::numeric_limits<ustore_collection_t>::max() - 1;
 ustore_length_t const ustore_length_missing_k = std::numeric_limits<ustore_length_t>::max();
 ustore_key_t const ustore_key_unknown_k = std::numeric_limits<ustore_key_t>::max();
 
@@ -103,11 +104,17 @@ using snapshots_t = st::hash_set<ustore_snapshot_t>;
 /** Column family handles, which the database destroys before it closes. */
 using columns_t = st::basic_vector<column_t*>;
 
+/** The name of the column family behind @c ustore_collection_names_k. */
+constexpr char const* names_column_name_k = "ustore.names";
+
 /** The open database, its column families and its snapshots. */
 struct database_t {
 
     /** Handles of every column family, the default one included. */
     columns_t columns;
+
+    /** The column family behind @c ustore_collection_names_k, opened with the database. */
+    column_t* names = nullptr;
 
     /** Identifiers of the live snapshots. */
     snapshots_t snapshots;
@@ -144,9 +151,13 @@ bool export_error(native_status_t const& status, ustore_error_t* error) noexcept
     return true;
 }
 
+/** The column family @p collection addresses, or null when no family carries that identifier. */
 column_t* column_of(database_t& database, ustore_collection_t collection) noexcept {
-    return collection == ustore_collection_main_k ? database.native->DefaultColumnFamily()
-                                                  : reinterpret_cast<column_t*>(collection);
+    if (collection == ustore_collection_main_k) return database.native->DefaultColumnFamily();
+    if (collection == ustore_collection_names_k) return database.names;
+    for (column_t* const column : database.columns)
+        if (column && column->GetID() == collection) return column;
+    return nullptr;
 }
 
 /** Points @p options at the snapshot @p id, leaving them untouched for the zero identifier. */
@@ -468,19 +479,32 @@ void database_init(ustore_database_init_t& arguments) {
     }
     database->native.reset(native);
 
-    if (st::failed(database->columns.reserve(handles.size()))) {
+    if (st::failed(database->columns.reserve(handles.size() + 1))) {
         for (column_t* const handle : handles) database->native->DestroyColumnFamilyHandle(handle);
         *arguments.error = {ustore_error_out_of_memory_k, "Failed to allocate the collection handles"};
         return;
     }
     for (column_t* const handle : handles) {
         [[maybe_unused]] auto const kept = database->columns.emplace_back(handle);
+        if (handle->GetName() == names_column_name_k) database->names = handle;
+    }
+
+    // The reserved names collection is a column family like any other, created the first time a database opens
+    if (!database->names) {
+        ::rocksdb::ColumnFamilyOptions names_options;
+        names_options.comparator = &key_comparator_k;
+        status = database->native->CreateColumnFamily(names_options, names_column_name_k, &database->names);
+        if (!status.ok()) {
+            *arguments.error = {ustore_error_io_k, "Failed to open the names collection"};
+            return;
+        }
+        [[maybe_unused]] auto const kept = database->columns.emplace_back(database->names);
     }
     *arguments.db = database.release();
 }
 
 void get_metadata(ustore_get_metadata_t& arguments) {
-    *arguments.metadata = ustore_metadata_t(ustore_supports_transactions_k | ustore_supports_named_collections_k |
+    *arguments.metadata = ustore_metadata_t(ustore_supports_transactions_k | ustore_supports_collections_k |
                                             ustore_supports_snapshots_k);
 }
 
@@ -878,22 +902,27 @@ void measure(ustore_measure_t& arguments) {
 #pragma region Collections
 
 void collection_create(ustore_collection_create_t& arguments) {
-    std::size_t const name_length = arguments.name ? std::strlen(arguments.name) : 0;
-    if (!name_length) {
-        *arguments.error = {ustore_error_already_exists_k, "Default collection is always present"};
-        return;
-    }
     if (!arguments.db) {
         *arguments.error = {ustore_error_uninitialized_k, "Database is uninitialized"};
         return;
     }
+    if (!arguments.id) {
+        *arguments.error = {ustore_error_invalid_argument_k, "Need an output for the collection"};
+        return;
+    }
 
     database_t& database = *reinterpret_cast<database_t*>(arguments.db);
-    for (column_t* const existing : database.columns)
-        if (existing && existing->GetName() == arguments.name) {
-            *arguments.error = {ustore_error_already_exists_k, "Such collection already exists"};
-            return;
-        }
+
+    // A column family is addressed by a name of its own, so one is minted from the first unused number
+    char minted[32] = "c";
+    for (std::size_t serial = 0;; ++serial) {
+        auto const written = std::to_chars(minted + 1, minted + sizeof(minted) - 1, serial);
+        *written.ptr = '\0';
+        bool taken = false;
+        for (column_t* const existing : database.columns)
+            if (existing && existing->GetName() == minted) taken = true;
+        if (!taken) break;
+    }
 
     // Room for the handle comes first, so a created column family is never left unrecorded
     bool const reserved = !st::failed(database.columns.reserve(database.columns.size() + 1));
@@ -905,11 +934,13 @@ void collection_create(ustore_collection_create_t& arguments) {
     column_t* column = nullptr;
     ::rocksdb::ColumnFamilyOptions column_options;
     column_options.comparator = &key_comparator_k;
-    native_status_t const status = database.native->CreateColumnFamily(column_options, arguments.name, &column);
+    native_status_t const status = database.native->CreateColumnFamily(column_options, minted, &column);
     if (export_error(status, arguments.error)) return;
 
     [[maybe_unused]] auto const recorded = database.columns.emplace_back(column);
-    *arguments.id = reinterpret_cast<ustore_collection_t>(column);
+
+    // RocksDB persists the identifier of a column family, so a name resolved after a restart still addresses it
+    *arguments.id = column->GetID();
 }
 
 void collection_drop(ustore_collection_drop_t& arguments) {
@@ -919,16 +950,16 @@ void collection_drop(ustore_collection_drop_t& arguments) {
     }
 
     bool const invalidate = arguments.mode == ustore_drop_keys_vals_handle_k;
-    if (arguments.id == ustore_collection_main_k && invalidate) {
-        *arguments.error = {ustore_error_invalid_argument_k, "Default collection can't be dropped"};
+    bool const reserved = arguments.id == ustore_collection_main_k || arguments.id == ustore_collection_names_k;
+    if (reserved && invalidate) {
+        *arguments.error = {ustore_error_invalid_argument_k, "This collection can only be cleared"};
         return;
     }
 
     database_t& database = *reinterpret_cast<database_t*>(arguments.db);
-    column_t* column = database.native->DefaultColumnFamily();
+    column_t* column = column_of(database, arguments.id);
     std::size_t position = database.columns.size();
-    if (arguments.id != ustore_collection_main_k) {
-        column = reinterpret_cast<column_t*>(arguments.id);
+    if (!reserved) {
         position = 0;
         while (position != database.columns.size() && database.columns[position] != column) ++position;
         if (position == database.columns.size()) {
@@ -965,8 +996,8 @@ void collection_list(ustore_collection_list_t& arguments) {
         *arguments.error = {ustore_error_uninitialized_k, "Database is uninitialized"};
         return;
     }
-    if (!arguments.count || !arguments.names) {
-        *arguments.error = {ustore_error_invalid_argument_k, "Null names or outputs specified"};
+    if (!arguments.count) {
+        *arguments.error = {ustore_error_invalid_argument_k, "Null outputs specified"};
         return;
     }
 
@@ -974,35 +1005,25 @@ void collection_list(ustore_collection_list_t& arguments) {
     if (arguments.error->status) return;
 
     database_t& database = *reinterpret_cast<database_t*>(arguments.db);
-    std::size_t const collections_count = database.columns.size() - 1;
+
+    // Neither the default column family nor the reserved names collection is a collection the caller made
+    auto const listed = [&](column_t* const column) noexcept {
+        return column != database.names && column->GetName() != ::rocksdb::kDefaultColumnFamilyName;
+    };
+
+    std::size_t collections_count = 0;
+    for (column_t* const column : database.columns) collections_count += listed(column);
     *arguments.count = static_cast<ustore_size_t>(collections_count);
 
-    // Every name is null-terminated
-    std::size_t strings_length = 0;
-    for (column_t* const column : database.columns) strings_length += column->GetName().size() + 1;
-
-    auto names = arena.alloc<char>(strings_length, arguments.error).data();
-    *arguments.names = names;
-    if (arguments.error->status) return;
-
     auto ids = arena.alloc_or_dummy(collections_count, arguments.error, arguments.ids);
-    if (arguments.error->status) return;
-    auto offsets = arena.alloc_or_dummy(collections_count + 1, arguments.error, arguments.offsets);
     if (arguments.error->status) return;
 
     std::size_t index = 0;
     for (column_t* const column : database.columns) {
-        std::string const& name = column->GetName();
-        if (name == ::rocksdb::kDefaultColumnFamilyName) continue;
-
-        std::memcpy(names, name.data(), name.size());
-        names[name.size()] = '\0';
-        ids[index] = reinterpret_cast<ustore_collection_t>(column);
-        offsets[index] = static_cast<ustore_length_t>(names - *arguments.names);
-        names += name.size() + 1;
+        if (!listed(column)) continue;
+        ids[index] = column->GetID();
         ++index;
     }
-    offsets[index] = static_cast<ustore_length_t>(names - *arguments.names);
 }
 
 void database_control(ustore_database_control_t& arguments) {

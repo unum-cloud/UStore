@@ -83,19 +83,18 @@ ustore_database_free(db);
 ```
 
 The `config` is a JSON string, and every freeing function accepts `NULL`.
-`ustore_get_metadata` reports whether the engine supports transactions, named collections and snapshots.
+`ustore_get_metadata` reports whether the engine supports transactions, collections and snapshots.
 
 ### Collections
 
-Every database has a nameless main collection, `ustore_collection_main_k`, which a `NULL` collections array addresses.
-Named collections are created, listed and dropped by name:
+Every database has a main collection, `ustore_collection_main_k`, which a `NULL` collections array addresses.
+A collection is created without a name and addressed afterwards by the identifier the call answers:
 
 ```c
 ustore_collection_t people = 0;
 ustore_collection_create_t create = {
     .db = db,
     .error = &error,
-    .name = "people",
     .id = &people,
 };
 ustore_collection_create(&create);
@@ -110,7 +109,8 @@ ustore_collection_drop(&drop);
 ```
 
 The main collection is never removed, so only `ustore_drop_keys_vals_k` and `ustore_drop_vals_k` apply to it.
-`ustore_collection_list` exports the identifiers of the named collections beside a tape of their null-terminated names.
+`ustore_collection_list` exports the identifiers of the collections and nothing else.
+A name a caller gives a collection lives in the strings modality, under the reserved `ustore_collection_names_k`, so a name resolves in two phases and no other call carries one.
 
 ### Writes
 

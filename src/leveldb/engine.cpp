@@ -33,6 +33,7 @@
 #include "helpers/linked_array.hpp"   // `uninitialized_array`
 
 ustore_collection_t const ustore_collection_main_k = 0;
+ustore_collection_t const ustore_collection_names_k = std::numeric_limits<ustore_collection_t>::max() - 1;
 ustore_length_t const ustore_length_missing_k = std::numeric_limits<ustore_length_t>::max();
 ustore_key_t const ustore_key_unknown_k = std::numeric_limits<ustore_key_t>::max();
 
@@ -132,7 +133,7 @@ bool export_error(native_status_t const& status, ustore_error_t* error) noexcept
 }
 
 /** Refuses tasks addressing any collection but the main one, answering whether it refused. */
-bool refuse_named_collections(strided_iterator<ustore_collection_t const> collections, std::size_t count,
+bool refuse_other_collections(strided_iterator<ustore_collection_t const> collections, std::size_t count,
                               ustore_error_t* error) noexcept {
     if (!collections) return false;
     for (std::size_t task_index = 0; task_index != count; ++task_index) {
@@ -458,7 +459,7 @@ void write(ustore_write_t& arguments) {
 
     validate_write(arguments.transaction, places, contents, arguments.options, arguments.error);
     if (arguments.error->status) return;
-    if (refuse_named_collections(collections, arguments.tasks_count, arguments.error)) return;
+    if (refuse_other_collections(collections, arguments.tasks_count, arguments.error)) return;
     if (!arguments.tasks_count) return;
 
     ::leveldb::WriteOptions options;
@@ -484,7 +485,7 @@ void read(ustore_read_t& arguments) {
 
     validate_read(arguments.transaction, places, arguments.options, arguments.error);
     if (arguments.error->status) return;
-    if (refuse_named_collections(collections, arguments.tasks_count, arguments.error)) return;
+    if (refuse_other_collections(collections, arguments.tasks_count, arguments.error)) return;
 
     ::leveldb::ReadOptions options;
     use_snapshot(database, arguments.snapshot, options, arguments.error);
@@ -530,7 +531,7 @@ void scan(ustore_scan_t& arguments) {
 
     validate_scan(arguments.transaction, scans, arguments.options, arguments.error);
     if (arguments.error->status) return;
-    if (refuse_named_collections(collections, arguments.tasks_count, arguments.error)) return;
+    if (refuse_other_collections(collections, arguments.tasks_count, arguments.error)) return;
 
     auto offsets = arena.alloc_or_dummy(scans.count + 1, arguments.error, arguments.offsets);
     if (arguments.error->status) return;
@@ -581,7 +582,7 @@ void sample(ustore_sample_t& arguments) {
     strided_iterator<ustore_collection_t const> collections {arguments.collections, arguments.collections_stride};
     strided_iterator<ustore_length_t const> limits {arguments.count_limits, arguments.count_limits_stride};
     sample_args_t samples {{}, limits, arguments.tasks_count};
-    if (refuse_named_collections(collections, arguments.tasks_count, arguments.error)) return;
+    if (refuse_other_collections(collections, arguments.tasks_count, arguments.error)) return;
 
     auto offsets = arena.alloc_or_dummy(samples.count + 1, arguments.error, arguments.offsets);
     if (arguments.error->status) return;
@@ -632,7 +633,7 @@ void measure(ustore_measure_t& arguments) {
     strided_iterator<ustore_collection_t const> collections {arguments.collections, arguments.collections_stride};
     strided_iterator<ustore_key_t const> start_keys {arguments.start_keys, arguments.start_keys_stride};
     strided_iterator<ustore_key_t const> end_keys {arguments.end_keys, arguments.end_keys_stride};
-    if (refuse_named_collections(collections, arguments.tasks_count, arguments.error)) return;
+    if (refuse_other_collections(collections, arguments.tasks_count, arguments.error)) return;
 
     // Memory usage describes the whole database, so one property read serves every task
     std::uint64_t memory_bytes = 0;
@@ -699,8 +700,6 @@ void collection_drop(ustore_collection_drop_t& arguments) {
 void collection_list(ustore_collection_list_t& arguments) {
     *arguments.count = 0;
     if (arguments.ids) *arguments.ids = nullptr;
-    if (arguments.offsets) *arguments.offsets = nullptr;
-    if (arguments.names) *arguments.names = nullptr;
 }
 
 void database_control(ustore_database_control_t& arguments) {
