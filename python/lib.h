@@ -759,7 +759,9 @@ PyObject* ustore_py_collection_names(ustore_py_context_t const* context, char co
 extern char const doc_read[];
 extern char const doc_write[];
 extern char const doc_scan[];
+extern char const doc_scan_batch[];
 extern char const doc_sample[];
+extern char const doc_sample_batch[];
 extern char const doc_measure[];
 extern char const doc_get[];
 extern char const doc_set[];
@@ -782,8 +784,12 @@ PyObject* ustore_py_api_write(PyObject* self, PyObject* const* args, Py_ssize_t 
                               PyObject* args_names_tuple);
 PyObject* ustore_py_api_scan(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
                              PyObject* args_names_tuple);
+PyObject* ustore_py_api_scan_batch(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                                   PyObject* args_names_tuple);
 PyObject* ustore_py_api_sample(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
                                PyObject* args_names_tuple);
+PyObject* ustore_py_api_sample_batch(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                                     PyObject* args_names_tuple);
 PyObject* ustore_py_api_measure(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
                                 PyObject* args_names_tuple);
 PyObject* ustore_py_api_get(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,

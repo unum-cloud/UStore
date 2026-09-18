@@ -12,7 +12,7 @@ python -c "import ustore, ustore.lib; print(ustore.lib.__version__, ustore.lib.e
 ```
 
 `pyproject.toml` builds through `scikit-build-core`, which drives the project's own CMake tree, so there is no `setup.py`.
-The wheel compiles the SmashTable engine alone by default.
+The wheel compiles the in-memory engine alone by default.
 RocksDB and LevelDB are enabled through the standard `CMAKE_ARGS` or through scikit-build config settings, never through variables of UStore's own:
 
 ```sh
@@ -43,8 +43,8 @@ pip install . --config-settings=cmake.define.USTORE_USE_ROCKSDB=ON
 | `ustore/py.typed`      | The PEP 561 marker that ships the stubs                                   |
 
 Each modality joins as one C file beside `lib.c`, with its verbs declared in `lib.h` and stubbed in `ustore/lib.pyi`.
-The suites live in `tests/` as `test_*.py` beside the C++ ones, and benchmarks in `bench/`.
-The extension links one engine, SmashTable unless `USTORE_PYTHON_ENGINE` names another one the tree builds.
+The suites live in `test/` as `<topic>.py` beside the C++ ones, and benchmarks in `bench/`.
+The extension links one engine, the in-memory `ram` one unless `USTORE_PYTHON_ENGINE` names another the tree builds.
 
 ## Interface
 
@@ -58,12 +58,15 @@ from ustore.table_view import Table
 with ustore.Database() as database:
     database.write([1, 2], [b"a", b"bb"])
     values = database.read([1, 2])                      # Values, indexed as memoryviews
+    database.scan_batch([1, 100], [16, 32])             # Keys, one ascending run per request
 
     people = database.collection_create("people")
     database.docs_write([10, 11], ['{"name": "Lex", "tweets": 2221}', '{"name": "Joe"}'], collection=people)
     database.docs_gist([10, 11], collection=people)     # ("/name", "/tweets")
     columns = database.docs_gather([10, 11], ["name", "tweets"], ["str", "i64"], collection=people)
     columns[1], columns.validity(1)                     # memoryview of "q", bitmap bytes
+    prices = numpy.array([1.5, 2.5], dtype=numpy.float64)
+    database.docs_write([10, 11], prices, field="price", type="f64", collection=people)
 
     follows = database.collection_create("follows")
     database.graph_upsert_edges(numpy.array([1, 2]), numpy.array([2, 3]), collection=follows)
@@ -73,7 +76,18 @@ with ustore.Database() as database:
     graph = DiGraph(database, "graph", nodes="nodes", edges="edges")
     graph.add_edge(1, 2, weight=3)
     list(graph.edges(data=True))                        # [(1, 2, {"weight": 3})]
-    Table(database, people).astype({"tweets": "int64"}).to_pandas()
+    Table(database, people).astype({"tweets": "int64"}).to_pandas(page=1 << 16)
 ```
 
 A document or a vertex is a value like any other, so documents, graphs and binary values each keep collections of their own.
+
+## Typed Columns, Batches and Options
+
+A fixed-width `type` given a contiguous buffer writes a column of scalars, one per key, so a NumPy column of floats or integers reaches the store without being printed as JSON and parsed back.
+A gather answers the same shapes in reverse: an `f16` column carries the `e` format, which NumPy reads as `float16` without a copy, and a `uuid` column carries sixteen bytes per document.
+
+`scan_batch` and `sample_batch` take many starts and limits per call and answer one run per request, which is what the C ABI takes; `scan` and `sample` remain the single-request forms.
+`Table.to_pandas` takes a `page`, converting that many rows at a time so only one page of gathered columns is ever live.
+
+Of the remaining C ABI options, only `watch` is reachable, as a keyword on every verb a transaction reaches, dropping or taking the conflict record for exactly one call.
+`ustore_option_read_shared_memory_k` and `ustore_option_dont_discard_memory_k` steer the arena's own memory, which no Python result exposes, so neither is exposed here.

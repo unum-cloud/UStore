@@ -17,6 +17,7 @@ include = [
   "/include/**",
   "/c/**",
   "/src/**",
+  "/src_oracles/**",
   "/tools/**",
   "/smashtable/CMakeLists.txt",
   "/smashtable/cmake/**",
@@ -36,8 +37,8 @@ include = [
 name = "ustore"
 path = "rust/lib.rs"
 
-# SmashTable always builds and links; `rocksdb` and `leveldb` build their engines too, linked once `c/lib.cpp` dispatches.
-# UDisk joins as a feature once it builds.
+# The `ram` engine always builds and links; `rocksdb` and `leveldb` build their engines too, linked once
+# `c/lib.cpp` dispatches. `nvme` joins as a feature once `src/nvme` builds.
 [features]
 leveldb = []
 rocksdb = []

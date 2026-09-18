@@ -35,9 +35,9 @@ if (NOT MSVC)
 endif ()
 
 # Every engine library defines the same `ustore_*` symbols, so exactly one links into the extension until `c/lib.cpp`
-# dispatches between them; SmashTable always builds, so it is the default.
+# dispatches between them; the in-memory engine always builds, so it is the default.
 set(USTORE_PYTHON_ENGINE
-    "smashtable"
+    "ram"
     CACHE STRING "The engine the CPython extension links"
 )
 if (NOT USTORE_PYTHON_ENGINE IN_LIST USTORE_ENGINE_NAMES)

@@ -791,6 +791,18 @@ int ustore_py_verb_option_from_keyword(ustore_py_context_t const* context, PyObj
         if (flushing) options->options |= ustore_option_write_flush_k;
         return 1;
     }
+    if (PyUnicode_CompareWithASCIIString(name, "watch") == 0) {
+        int const watching = PyObject_IsTrue(value);
+        if (watching < 0) return -1;
+        // Only a transaction has a conflict set, so outside one the keyword would promise nothing.
+        if (!context->transaction) {
+            ustore_py_raise(ustore_error_invalid_argument_k, "Only a transaction watches what it touches");
+            return -1;
+        }
+        if (watching) options->options &= (ustore_options_t) ~(unsigned)ustore_option_transaction_dont_watch_k;
+        else options->options |= ustore_option_transaction_dont_watch_k;
+        return 1;
+    }
     return 0;
 }
 

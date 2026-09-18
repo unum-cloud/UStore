@@ -9,17 +9,25 @@
 //! outlive it, nor survive the call that would overwrite it.
 //!
 //! ```no_run
-//! use ustore::{Arena, Collection, Configuration, Database, Durability, Entry};
+//! use ustore::{Arena, Collection, Collections, Configuration, Database, Durability, Entry};
 //!
 //! let database = Database::open(Configuration::in_memory())?;
 //! let mut arena = Arena::new();
 //!
 //! let people = database.create_collection(&mut arena, "people")?;
-//! let entries = [Entry::new(1, b"Ada")?, Entry::new(2, b"Grace")?];
+//! let places = database.create_collection(&mut arena, "places")?;
+//! let entries = [Entry::new(1, b"Ada")?, Entry::new(2, b"Grace")?, Entry::removal(3)];
 //! database.head().write(&mut arena, people, &entries, Durability::Buffered)?;
 //!
 //! let values = database.head().read(&mut arena, people, &[1, 2])?;
 //! assert_eq!(values.get(0), Some(b"Ada".as_slice()));
+//!
+//! // A batch carries a collection per task, and a bare one gives every task the same.
+//! let spanned = [people, places];
+//! let across = [Entry::new(1, b"Ada")?, Entry::new(1, b"Kent")?];
+//! database.head().write(&mut arena, spanned.as_slice(), &across, Durability::Buffered)?;
+//! let read = database.head().read(&mut arena, Collections::Each(&spanned), &[1, 1])?;
+//! assert_eq!(read.get(1), Some(b"Kent".as_slice()));
 //! # Ok::<(), ustore::Error>(())
 //! ```
 //!
@@ -48,12 +56,12 @@ mod testing;
 
 pub use blobs::{Entry, Measurement, Values};
 pub use db::{
-    key_unknown, Arena, Collection, Configuration, Database, Durability, Error, Isolation, Key, Metadata, Removed,
-    Result, SequenceNumber, Snapshot, SnapshotId, Status, Transaction, View,
+    key_unknown, Arena, Collection, Collections, Configuration, Conflicts, Database, Durability, Error, Isolation, Key,
+    Metadata, Removed, Result, SequenceNumber, Snapshot, SnapshotId, Status, Transaction, View,
 };
 pub use docs::{
-    Binary, Bitmap, Column, ColumnFormat, Document, FieldAddress, FieldEntry, FieldFormat, Json, Modification, Paths,
-    ReadFormat, Scalar, Strings, Table, Text,
+    Binary, Bitmap, Column, ColumnFormat, Document, DocumentEntry, FieldAddress, FieldEntry, FieldFormat, Half, Json,
+    Modification, Paths, ReadFormat, Scalar, Strings, Table, Text, Uuid, WritableScalar,
 };
 pub use graph::{default_edge_id, degree_missing, Degree, Edge, Neighborhoods, Role, Roles};
 pub use strings::Names;

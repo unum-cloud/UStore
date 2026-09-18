@@ -17,7 +17,9 @@ type DocumentLike = str | Buffer | None
 type FieldType = Literal[
     "json", "str", "bytes", "null", "bool", "f64", "f32", "i64", "i32", "i16", "i8", "u64", "u32", "u16", "u8"
 ]
-type GatherType = Literal["bool", "f64", "f32", "i64", "i32", "i16", "i8", "u64", "u32", "u16", "u8", "str", "bytes"]
+type GatherType = Literal[
+    "bool", "uuid", "f64", "f32", "f16", "i64", "i32", "i16", "i8", "u64", "u32", "u16", "u8", "str", "bytes"
+]
 type Modification = Literal["upsert", "update", "insert", "patch", "merge"]
 type Role = Literal["source", "target", "any"]
 
@@ -174,7 +176,11 @@ class Database:
         flush: bool = False,
     ) -> None: ...
     def scan(self, start: int, count: int, *, collection: CollectionLike = None, snapshot: int = 0) -> Keys: ...
+    def scan_batch(
+        self, starts: KeysLike, counts: Sequence[int], *, collection: CollectionLike = None, snapshot: int = 0
+    ) -> Keys: ...
     def sample(self, count: int, *, collection: CollectionLike = None, snapshot: int = 0) -> Keys: ...
+    def sample_batch(self, counts: Sequence[int], *, collection: CollectionLike = None, snapshot: int = 0) -> Keys: ...
     def measure(
         self, start: int, end: int, *, collection: CollectionLike = None, snapshot: int = 0
     ) -> dict[str, int]: ...
@@ -268,7 +274,7 @@ class Transaction:
     def close(self) -> None:
         """Drops whatever is still staged and releases the handle."""
 
-    def read(self, keys: KeysLike, *, collection: CollectionLike = None) -> Values: ...
+    def read(self, keys: KeysLike, *, collection: CollectionLike = None, watch: bool = True) -> Values: ...
     def write(
         self,
         keys: KeysLike,
@@ -276,14 +282,25 @@ class Transaction:
         *,
         collection: CollectionLike = None,
         flush: bool = False,
+        watch: bool = True,
     ) -> None: ...
-    def scan(self, start: int, count: int, *, collection: CollectionLike = None) -> Keys: ...
-    def sample(self, count: int, *, collection: CollectionLike = None) -> Keys: ...
-    def measure(self, start: int, end: int, *, collection: CollectionLike = None) -> dict[str, int]: ...
-    def get(self, key: int, *, collection: CollectionLike = None) -> bytes | None: ...
-    def set(self, key: int, value: ValueLike, *, collection: CollectionLike = None, flush: bool = False) -> None: ...
-    def pop(self, keys: int | KeysLike, *, collection: CollectionLike = None, flush: bool = False) -> None: ...
-    def contains(self, key: int, *, collection: CollectionLike = None) -> bool: ...
+    def scan(self, start: int, count: int, *, collection: CollectionLike = None, watch: bool = True) -> Keys: ...
+    def scan_batch(
+        self, starts: KeysLike, counts: Sequence[int], *, collection: CollectionLike = None, watch: bool = True
+    ) -> Keys: ...
+    def sample(self, count: int, *, collection: CollectionLike = None, watch: bool = True) -> Keys: ...
+    def sample_batch(self, counts: Sequence[int], *, collection: CollectionLike = None, watch: bool = True) -> Keys: ...
+    def measure(
+        self, start: int, end: int, *, collection: CollectionLike = None, watch: bool = True
+    ) -> dict[str, int]: ...
+    def get(self, key: int, *, collection: CollectionLike = None, watch: bool = True) -> bytes | None: ...
+    def set(
+        self, key: int, value: ValueLike, *, collection: CollectionLike = None, flush: bool = False, watch: bool = True
+    ) -> None: ...
+    def pop(
+        self, keys: int | KeysLike, *, collection: CollectionLike = None, flush: bool = False, watch: bool = True
+    ) -> None: ...
+    def contains(self, key: int, *, collection: CollectionLike = None, watch: bool = True) -> bool: ...
     def docs_write(
         self,
         keys: KeysLike | None,
@@ -295,6 +312,7 @@ class Transaction:
         type: FieldType = "json",
         id_field: str | None = None,
         flush: bool = False,
+        watch: bool = True,
     ) -> None: ...
     def docs_read(
         self,
@@ -303,8 +321,11 @@ class Transaction:
         collection: CollectionLike = None,
         field: str | None = None,
         type: Literal["json", "str"] = "json",
+        watch: bool = True,
     ) -> Values: ...
-    def docs_gist(self, keys: KeysLike, *, collection: CollectionLike = None) -> tuple[str, ...]: ...
+    def docs_gist(
+        self, keys: KeysLike, *, collection: CollectionLike = None, watch: bool = True
+    ) -> tuple[str, ...]: ...
     def docs_gather(
         self,
         keys: KeysLike,
@@ -312,6 +333,7 @@ class Transaction:
         types: GatherType | Sequence[GatherType],
         *,
         collection: CollectionLike = None,
+        watch: bool = True,
     ) -> Columns: ...
     def graph_upsert_edges(
         self,
@@ -321,6 +343,7 @@ class Transaction:
         edges: KeysLike | None = None,
         collection: CollectionLike = None,
         flush: bool = False,
+        watch: bool = True,
     ) -> None: ...
     def graph_remove_edges(
         self,
@@ -330,18 +353,25 @@ class Transaction:
         edges: KeysLike | None = None,
         collection: CollectionLike = None,
         flush: bool = False,
+        watch: bool = True,
     ) -> None: ...
     def graph_find_edges(
-        self, vertices: KeysLike, *, role: Role = "any", collection: CollectionLike = None
+        self, vertices: KeysLike, *, role: Role = "any", collection: CollectionLike = None, watch: bool = True
     ) -> Edges: ...
     def graph_degrees(
-        self, vertices: KeysLike, *, role: Role = "any", collection: CollectionLike = None
+        self, vertices: KeysLike, *, role: Role = "any", collection: CollectionLike = None, watch: bool = True
     ) -> tuple[int | None, ...]: ...
     def graph_upsert_vertices(
-        self, vertices: KeysLike, *, collection: CollectionLike = None, flush: bool = False
+        self, vertices: KeysLike, *, collection: CollectionLike = None, flush: bool = False, watch: bool = True
     ) -> None: ...
     def graph_remove_vertices(
-        self, vertices: KeysLike, *, role: Role = "any", collection: CollectionLike = None, flush: bool = False
+        self,
+        vertices: KeysLike,
+        *,
+        role: Role = "any",
+        collection: CollectionLike = None,
+        flush: bool = False,
+        watch: bool = True,
     ) -> None: ...
 
 # endregion: Handles

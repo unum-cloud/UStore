@@ -66,7 +66,8 @@ class keys_stream_t {
         fetched_offset_ = 0;
 
         auto const count = static_cast<ustore_length_t>(fetched_keys_.size());
-        next_min_key_ = count < read_ahead_ ? ustore_key_unknown_k : fetched_keys_[count - 1] + 1;
+        ustore_key_t const last_key = count ? fetched_keys_[count - 1] : ustore_key_unknown_k;
+        next_min_key_ = count < read_ahead_ || last_key == ustore_key_unknown_k ? ustore_key_unknown_k : last_key + 1;
         return {};
     }
 
@@ -197,7 +198,8 @@ class pairs_stream_t {
 
         values_view_ = joined_blobs_t {count, found_offsets, found_values};
         values_iterator_ = values_view_.begin();
-        next_min_key_ = count < read_ahead_ ? ustore_key_unknown_k : fetched_keys_[count - 1] + 1;
+        ustore_key_t const last_key = count ? fetched_keys_[count - 1] : ustore_key_unknown_k;
+        next_min_key_ = count < read_ahead_ || last_key == ustore_key_unknown_k ? ustore_key_unknown_k : last_key + 1;
         return {};
     }
 

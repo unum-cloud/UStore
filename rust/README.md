@@ -9,8 +9,8 @@ cargo add ustore
 The crate links the engine libraries CMake builds and consumes them through the C ABI in `include/ustore/`.
 `build.rs` compiles no C or C++ of its own: it configures CMake, installs the static libraries into `OUT_DIR` and links them.
 
-SmashTable always builds and links.
-The `rocksdb` and `leveldb` features build their engines beside it, linked once `c/lib.cpp` dispatches between them.
+The in-memory `ram` engine always builds and links.
+The `rocksdb` and `leveldb` features build their engines beside it, linked once `c/lib.cpp` dispatches between them, and `nvme` joins them once `src/nvme` builds.
 
 ```sh
 cargo test
@@ -29,7 +29,7 @@ let database = Database::open(Configuration::in_memory())?;
 let mut arena = Arena::new();
 
 let people = database.create_collection(&mut arena, "people")?;
-let entries = [Entry::new(1, b"Ada")?, Entry::new(2, b"Grace")?];
+let entries = [Entry::new(1, b"Ada")?, Entry::new(2, b"Grace")?, Entry::removal(3)];
 database.head().write(&mut arena, people, &entries, Durability::Buffered)?;
 
 let values = database.head().read(&mut arena, people, &[1, 2])?;
@@ -38,6 +38,37 @@ assert_eq!(values.get(0), Some(b"Ada".as_slice()));
 
 An `Entry` pairs a key with borrowed bytes in the layout the strided ABI reads, so a batch of them crosses the boundary with no staging buffer.
 A read hands back a `Values`, which addresses the tape in the arena rather than copying out of it, and reports a key the database does not hold as `None`.
+
+## One Batch, Many Collections
+
+The ABI carries a collection per task, so a batch spans as many collections as it has entries.
+Every batch verb takes a `Collections`, and a bare `Collection` converts into `Collections::Every`, which is the common case written the short way.
+
+```rust
+use ustore::Collections;
+
+let spanned = [people, places];
+let entries = [Entry::new(1, b"Ada")?, Entry::new(1, b"Kent")?];
+database.head().write(&mut arena, spanned.as_slice(), &entries, Durability::Buffered)?;
+
+let values = database.head().read(&mut arena, Collections::Each(&spanned), &[1, 1])?;
+database.head().write(&mut arena, people, &entries, Durability::Buffered)?; // one for all of them
+```
+
+A `Collections::Each` whose length is not the length of the batch is refused with `Status::InvalidArgument` before the call crosses the boundary.
+
+## Writes And Removals In One Batch
+
+The ABI reads a null value pointer as a removal of its key, so an entry that carries no value removes it, and one batch mixes the two freely.
+Nothing is staged and no bitset of present values is allocated: `Entry::removal` is the same sixteen bytes on the same three strided columns, with a null in the pointer one.
+
+```rust
+let entries = [Entry::new(1, b"rewritten")?, Entry::removal(2), Entry::new(3, b"")?];
+database.head().write(&mut arena, people, &entries, Durability::Buffered)?;
+```
+
+An empty slice still points somewhere, so `Entry::new(3, b"")` writes an empty value rather than removing a key; `Entry::value` answers `None` for a removal and `Some` for an empty value.
+`DocumentEntry::removal` and `FieldEntry::removal` say the same thing for a whole document and for a field, and `View::erase` stays the way to remove a run of bare keys without building entries for them.
 
 ## Arenas Are The Borrow
 
@@ -59,13 +90,19 @@ A call addresses the head of the database, a transaction, or a snapshot, and nev
 `View` is that view, so the combination the C ABI refuses cannot be written.
 
 ```rust
+use ustore::Conflicts;
+
 let mut transaction = database.transaction()?;
-transaction.view().write(&mut arena, people, &entries, Durability::Buffered)?;
+transaction.view(Conflicts::Watched).write(&mut arena, people, &entries, Durability::Buffered)?;
 transaction.commit(Durability::Flushed)?;
 
 let snapshot = database.snapshot()?;
 let pinned = snapshot.view().read(&mut arena, people, &[1])?;
 ```
+
+`Conflicts` says whether the calls of that view watch what they touch.
+It changes what a call does only at `Isolation::Snapshot`, where `Conflicts::Unwatched` lets a transaction commit over a concurrent writer instead of conflicting with it; a strictly serializable transaction puts every read it makes into the one serial order whatever the view says.
+Only a transaction watches anything, so the head of a database and a snapshot carry no such argument.
 
 A transaction conflicts rather than blocks, and reports `Status::WriteConflict`, `ReadConflict` or `PhantomConflict` at its commit.
 It keeps its contents whatever the outcome, so `Transaction::rollback` reopens it on the newest state for another try.
@@ -98,10 +135,13 @@ Documents are JSON text, and the C ABI parses them inside the engine, so the cra
 A field is a top-level key or an RFC 6901 pointer the engine reads up to its null terminator, which is why every field is a `&CStr`: a `c"/user/name"` literal crosses the boundary as it stands.
 
 ```rust
-use ustore::{Column, Document, FieldAddress, FieldEntry, Json, Modification, Text};
+use ustore::{Column, Document, DocumentEntry, FieldAddress, FieldEntry, Json, Modification, Text};
 
-let documents = [Entry::new(1, br#"{"name":"Ada","born":1815}"#)?];
+let documents = [DocumentEntry::<Json>::new(1, r#"{"name":"Ada","born":1815}"#)?];
 database.head().write_documents(&mut arena, people, &documents, Modification::Upsert, Durability::Buffered)?;
+
+let born = [DocumentEntry::<i64>::new(5, &1815)?];
+database.head().write_documents(&mut arena, people, &born, Modification::Upsert, Durability::Buffered)?;
 
 let keyed = [Document::new(r#"{"_id":2,"name":"Grace"}"#)?];
 database.head().write_documents_by_id(&mut arena, people, c"_id", &keyed, Modification::Insert, Durability::Buffered)?;
@@ -115,8 +155,9 @@ let whole = database.head().read_documents(&mut arena, people, &[1, 2])?;
 let names = database.head().read_fields::<Text>(&mut arena, people, &[FieldAddress::new(1, c"name")])?;
 ```
 
-A field write carries one format for the whole batch, named by the type of its entries: a scalar from `f64` down to `u8` or `bool`, `Text` for a JSON string, or `Json` for any JSON value.
-Mixing two formats in one batch does not compile, and an entry built with `FieldEntry::removal` removes its field.
+A write carries one format for the whole batch, named by the type of its entries: a scalar from `f64` down to `u8` or `bool`, `Text` for a JSON string, or `Json` for any JSON value.
+The same formats write a whole document, which is then one number, one boolean or one string rather than an object.
+Mixing two formats in one batch does not compile, and an entry built with `FieldEntry::removal` or `DocumentEntry::removal` removes its field or its document.
 `Modification` chooses between an upsert, an update, an insert, an RFC 6902 patch and an RFC 7386 merge.
 Reads hand back the same `Values` a binary read does, exported as `Json` or as printed `Text`, with a missing document or field reported as `None`.
 
@@ -133,6 +174,7 @@ let name = table.strings(1)?.get(0);
 ```
 
 A `Table` borrows its arena and the columns it was asked for, and hands out scalar columns as slices straight out of the arena.
+Beside the scalars a gather converts into, `Half` is a column of IEEE 754 binary16 bit patterns the caller reinterprets and `Uuid` a column of sixteen bytes parsed from canonical text; neither is a format a write carries, and a value that will not fit either leaves its cell zero and sets the collision bit of its row.
 Every column carries three bitmaps: validity for a value found and converted, conversions for a value whose meaning changed on the way, such as text parsed into a number, and collisions for a value of a type that would not convert.
 Asking for a column in a type other than the one it was gathered in is refused with `Status::InvalidArgument`.
 Paths from one arena address the fields a gather reads through another.
@@ -181,4 +223,10 @@ match database.head().collection(&mut arena, "nowhere") {
 ## What The Crate Covers
 
 Opening and closing, engine metadata and control requests, collections by identifier and by name, binary reads, writes, erases, scans, samples and measurements, documents with whole and field writes, reads, gists and gathers, graphs with edge and vertex upserts, removals and lookups, transactions with staging, commit and rollback, and snapshots with export.
-Batches spanning several collections at once, the half-precision and UUID gather columns, and the shared-memory and unwatched-read options are not bound yet.
+Batches span several collections, mix writes with removals, write whole documents in every format the engine parses, and gather half-precision and UUID columns.
+
+Two options of `ustore_options_t` stay unbound, and deliberately.
+`ustore_option_dont_discard_memory_k` exists so the results of one call survive the next and can be passed back into it, which is exactly the borrow that makes a result safe here: an exported slice is sound because the arena stays mutably borrowed for as long as it lives, and a call made without the flag afterwards would release the pages under it.
+A second `Arena` gives the same thing with the compiler still checking it.
+`ustore_option_read_shared_memory_k` fixes the pages an arena is filled from, and the engine replaces the whole chain, leaking what it held, when a later call asks for the other kind — which a write must, since it refuses the flag outright.
+No single arena can therefore serve both a shared read and a write, and an anonymous shared mapping is reachable only by a child across `fork`, which the crate offers no way to arrange.

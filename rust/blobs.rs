@@ -10,11 +10,11 @@ use std::ptr;
 use crate::db::ffi::{
     ustore_arena_t, ustore_byte_t, ustore_bytes_cptr_t, ustore_collection_t, ustore_database_t, ustore_enum_t,
     ustore_error_t, ustore_key_t, ustore_length_t, ustore_octet_t, ustore_size_t, ustore_snapshot_t,
-    ustore_transaction_t, USTORE_OPTIONS_DEFAULT_K,
+    ustore_transaction_t,
 };
 use crate::db::{
-    check, described_length, exported_slice, first_count, missing_length, Arena, Collection, Durability, Key, Result,
-    View,
+    check, described_length, exported_slice, first_count, missing_length, Arena, Collection, Collections, Durability,
+    Key, Result, View,
 };
 
 // region: Raw Declarations
@@ -168,10 +168,26 @@ impl<'value> Entry<'value> {
         self.key
     }
 
-    /// The bytes this entry stores.
-    pub fn value(&self) -> &'value [u8] {
+    /// Names a key to remove, which a batch mixes freely with the entries that carry values.
+    ///
+    /// The ABI reads a null value pointer as a removal, so no bitset of present values is needed and
+    /// nothing is staged; an empty slice still points somewhere, and writes an empty value.
+    pub fn removal(key: Key) -> Self {
+        Entry {
+            key,
+            value: ptr::null(),
+            length: 0,
+            marker: PhantomData,
+        }
+    }
+
+    /// The bytes this entry stores, or `None` for an entry that removes its key.
+    pub fn value(&self) -> Option<&'value [u8]> {
+        if self.value.is_null() {
+            return None;
+        }
         // SAFETY: the pointer and the length came from one borrowed slice alive for `'value`.
-        unsafe { exported_slice(self.value, self.length as usize) }
+        Some(unsafe { exported_slice(self.value, self.length as usize) })
     }
 }
 
@@ -265,19 +281,23 @@ pub struct Measurement {
 // region: Verbs
 
 impl View<'_> {
-    /// Upserts a batch of values into one collection.
+    /// Upserts a batch of values, removing the keys whose entries carry none.
     ///
-    /// A transaction flushes at its commit, so [`Durability::Flushed`] is refused inside one.
-    pub fn write(
+    /// The batch spans as many collections as it has entries, and a bare [`Collection`] gives every
+    /// entry the same one. A transaction flushes at its commit, so [`Durability::Flushed`] is refused
+    /// inside one.
+    pub fn write<'collections>(
         &self,
         arena: &mut Arena,
-        collection: Collection,
+        collections: impl Into<Collections<'collections>>,
         entries: &[Entry<'_>],
         durability: Durability,
     ) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
+        let collections = collections.into();
+        let (collections, collections_stride) = collections.strided(entries.len())?;
         let stride = size_of::<Entry<'_>>() as ustore_size_t;
         let first = &entries[0];
         let mut error = ustore_error_t::default();
@@ -286,10 +306,10 @@ impl View<'_> {
             error: &mut error,
             transaction: self.transaction(),
             arena: arena.slot(),
-            options: durability.to_raw(),
+            options: self.options() | durability.to_raw(),
             tasks_count: entries.len() as ustore_size_t,
-            collections: &collection.0,
-            collections_stride: 0,
+            collections,
+            collections_stride,
             keys: &first.key,
             keys_stride: stride,
             presences: ptr::null(),
@@ -300,27 +320,35 @@ impl View<'_> {
             values: &first.value,
             values_stride: stride,
         };
-        // SAFETY: the entries outlive the call, and their fields sit `stride` bytes apart, which is
-        // what `#[repr(C)]` on `Entry` promises.
+        // SAFETY: the entries and the collections outlive the call, and the members of every entry sit
+        // `stride` bytes apart, which is what `#[repr(C)]` on `Entry` promises.
         unsafe { ffi::ustore_write(&mut arguments) };
         check(error)
     }
 
-    /// Removes a batch of keys from one collection, whether or not the database holds them.
-    pub fn erase(&self, arena: &mut Arena, collection: Collection, keys: &[Key], durability: Durability) -> Result<()> {
+    /// Removes a batch of keys, whether or not the database holds them.
+    pub fn erase<'collections>(
+        &self,
+        arena: &mut Arena,
+        collections: impl Into<Collections<'collections>>,
+        keys: &[Key],
+        durability: Durability,
+    ) -> Result<()> {
         if keys.is_empty() {
             return Ok(());
         }
+        let collections = collections.into();
+        let (collections, collections_stride) = collections.strided(keys.len())?;
         let mut error = ustore_error_t::default();
         let mut arguments = ffi::ustore_write_t {
             db: self.database(),
             error: &mut error,
             transaction: self.transaction(),
             arena: arena.slot(),
-            options: durability.to_raw(),
+            options: self.options() | durability.to_raw(),
             tasks_count: keys.len() as ustore_size_t,
-            collections: &collection.0,
-            collections_stride: 0,
+            collections,
+            collections_stride,
             keys: keys.as_ptr(),
             keys_stride: size_of::<Key>() as ustore_size_t,
             presences: ptr::null(),
@@ -331,16 +359,17 @@ impl View<'_> {
             values: ptr::null(),
             values_stride: 0,
         };
-        // SAFETY: the keys outlive the call, and a null `values` is how the ABI spells a removal.
+        // SAFETY: the keys and the collections outlive the call, and a null `values` is how the ABI
+        // spells a removal.
         unsafe { ffi::ustore_write(&mut arguments) };
         check(error)
     }
 
-    /// Reads a batch of keys from one collection into the arena.
-    pub fn read<'arena>(
+    /// Reads a batch of keys into the arena, one collection per key or one for all of them.
+    pub fn read<'arena, 'collections>(
         &self,
         arena: &'arena mut Arena,
-        collection: Collection,
+        collections: impl Into<Collections<'collections>>,
         keys: &[Key],
     ) -> Result<Values<'arena>> {
         let mut offsets: *mut ustore_length_t = ptr::null_mut();
@@ -349,6 +378,8 @@ impl View<'_> {
         if keys.is_empty() {
             return Ok(Values::exported(offsets, lengths, tape, 0));
         }
+        let collections = collections.into();
+        let (collections, collections_stride) = collections.strided(keys.len())?;
         let mut error = ustore_error_t::default();
         let mut arguments = ffi::ustore_read_t {
             db: self.database(),
@@ -356,10 +387,10 @@ impl View<'_> {
             transaction: self.transaction(),
             snapshot: self.snapshot(),
             arena: arena.slot(),
-            options: USTORE_OPTIONS_DEFAULT_K,
+            options: self.options(),
             tasks_count: keys.len() as ustore_size_t,
-            collections: &collection.0,
-            collections_stride: 0,
+            collections,
+            collections_stride,
             keys: keys.as_ptr(),
             keys_stride: size_of::<Key>() as ustore_size_t,
             presences: ptr::null_mut(),
@@ -367,7 +398,7 @@ impl View<'_> {
             lengths: &mut lengths,
             values: &mut tape,
         };
-        // SAFETY: the keys and the outputs outlive the call.
+        // SAFETY: the keys, the collections and the outputs outlive the call.
         unsafe { ffi::ustore_read(&mut arguments) };
         check(error)?;
         Ok(Values::exported(offsets, lengths, tape, keys.len()))
@@ -390,7 +421,7 @@ impl View<'_> {
             transaction: self.transaction(),
             snapshot: self.snapshot(),
             arena: arena.slot(),
-            options: USTORE_OPTIONS_DEFAULT_K,
+            options: self.options(),
             tasks_count: 1,
             collections: &collection.0,
             collections_stride: 0,
@@ -426,7 +457,7 @@ impl View<'_> {
             transaction: self.transaction(),
             snapshot: self.snapshot(),
             arena: arena.slot(),
-            options: USTORE_OPTIONS_DEFAULT_K,
+            options: self.options(),
             tasks_count: 1,
             collections: &collection.0,
             collections_stride: 0,
@@ -459,7 +490,7 @@ impl View<'_> {
             transaction: self.transaction(),
             snapshot: self.snapshot(),
             arena: arena.slot(),
-            options: USTORE_OPTIONS_DEFAULT_K,
+            options: self.options(),
             tasks_count: 1,
             collections: &collection.0,
             collections_stride: 0,
@@ -505,7 +536,7 @@ fn first_estimate(column: *const ustore_size_t) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{Configuration, Database, Removed, Status};
+    use crate::db::{Collection, Collections, Configuration, Database, Removed, Status};
 
     /// A database holding `alpha`, `beta` and `gamma` under the keys one, two and three.
     fn populated() -> (Database, Arena) {
@@ -597,8 +628,9 @@ mod tests {
         let value = [1u8, 2, 3];
         let entry = Entry::new(42, &value).unwrap();
         assert_eq!(entry.key(), 42);
-        assert_eq!(entry.value(), &value);
-        assert_eq!(Entry::new(42, b"").unwrap().value(), b"");
+        assert_eq!(entry.value(), Some(value.as_slice()));
+        assert_eq!(Entry::new(42, b"").unwrap().value(), Some(b"".as_slice()));
+        assert_eq!(Entry::removal(42).value(), None);
     }
 
     #[test]
@@ -664,6 +696,83 @@ mod tests {
         assert!(measured.min_entries <= 3 && measured.max_entries >= measured.min_entries);
         assert!(measured.max_value_bytes >= measured.min_value_bytes);
         assert!(measured.max_space_usage >= measured.min_space_usage);
+    }
+
+    #[test]
+    fn one_batch_spans_several_collections() {
+        let database = Database::open(Configuration::in_memory()).unwrap();
+        let mut arena = Arena::new();
+        let people = database.create_collection(&mut arena, "people").unwrap();
+        let places = database.create_collection(&mut arena, "places").unwrap();
+
+        let entries = [Entry::new(1, b"Ada").unwrap(), Entry::new(1, b"Kent").unwrap()];
+        let written = [people, places];
+        database
+            .head()
+            .write(&mut arena, written.as_slice(), &entries, Durability::Buffered)
+            .unwrap();
+
+        let values = database
+            .head()
+            .read(&mut arena, Collections::Each(&written), &[1, 1])
+            .unwrap();
+        assert_eq!(values.get(0), Some(b"Ada".as_slice()));
+        assert_eq!(values.get(1), Some(b"Kent".as_slice()));
+
+        // One collection for the whole batch is the same call with the ergonomic argument.
+        let inside = database.head().read(&mut arena, people, &[1]).unwrap();
+        assert_eq!(inside.get(0), Some(b"Ada".as_slice()));
+
+        database
+            .head()
+            .erase(&mut arena, written.as_slice(), &[1, 1], Durability::Buffered)
+            .unwrap();
+        let erased = database
+            .head()
+            .read(&mut arena, Collections::Each(&written), &[1, 1])
+            .unwrap();
+        assert_eq!((erased.get(0), erased.get(1)), (None, None));
+    }
+
+    #[test]
+    fn a_batch_of_collections_matches_the_batch_of_tasks() {
+        let (database, mut arena) = populated();
+        let one = [Collection::main()];
+        let failure = database
+            .head()
+            .read(&mut arena, Collections::Each(&one), &[1, 2])
+            .unwrap_err();
+        assert_eq!(failure.status, Status::InvalidArgument);
+
+        let entries = [Entry::new(1, b"alpha").unwrap(), Entry::new(2, b"beta").unwrap()];
+        let failure = database
+            .head()
+            .write(&mut arena, Collections::Each(&one), &entries, Durability::Buffered)
+            .unwrap_err();
+        assert_eq!(failure.status, Status::InvalidArgument);
+    }
+
+    #[test]
+    fn one_batch_mixes_values_and_removals() {
+        let (database, mut arena) = populated();
+        let entries = [
+            Entry::new(1, b"rewritten").unwrap(),
+            Entry::removal(2),
+            Entry::new(4, b"").unwrap(),
+        ];
+        database
+            .head()
+            .write(&mut arena, Collection::main(), &entries, Durability::Buffered)
+            .unwrap();
+
+        let values = database
+            .head()
+            .read(&mut arena, Collection::main(), &[1, 2, 3, 4])
+            .unwrap();
+        assert_eq!(values.get(0), Some(b"rewritten".as_slice()));
+        assert_eq!(values.get(1), None, "an entry without a value removes its key");
+        assert_eq!(values.get(2), Some(b"gamma".as_slice()));
+        assert_eq!(values.get(3), Some(b"".as_slice()), "an empty value is not a removal");
     }
 
     #[test]

@@ -11,7 +11,7 @@ use std::ptr;
 use crate::db::ffi::{
     ustore_arena_t, ustore_byte_t, ustore_bytes_cptr_t, ustore_char_t, ustore_collection_t, ustore_database_t,
     ustore_enum_t, ustore_error_t, ustore_length_t, ustore_octet_t, ustore_size_t, ustore_snapshot_t,
-    ustore_str_view_t, ustore_transaction_t, USTORE_OPTIONS_DEFAULT_K,
+    ustore_str_view_t, ustore_transaction_t,
 };
 use crate::db::{check, described_length, fail, first_count, missing_length, Arena, Collection, Result, Status, View};
 
@@ -177,7 +177,7 @@ pub(crate) fn read_name<'arena>(view: View<'_>, arena: &'arena mut Arena, name: 
         transaction: view.transaction(),
         snapshot: view.snapshot(),
         arena: arena.slot(),
-        options: USTORE_OPTIONS_DEFAULT_K,
+        options: view.options(),
         tasks_count: 1,
         collections: &catalog.0,
         collections_stride: 0,
@@ -225,7 +225,7 @@ pub(crate) fn write_name(view: View<'_>, arena: &mut Arena, name: &str, value: O
         error: &mut error,
         transaction: view.transaction(),
         arena: arena.slot(),
-        options: USTORE_OPTIONS_DEFAULT_K,
+        options: view.options(),
         tasks_count: 1,
         collections: &catalog.0,
         collections_stride: 0,
@@ -290,7 +290,7 @@ impl View<'_> {
             transaction: self.transaction(),
             snapshot: self.snapshot(),
             arena: arena.slot(),
-            options: USTORE_OPTIONS_DEFAULT_K,
+            options: self.options(),
             tasks_count: 1,
             collections: &catalog.0,
             collections_stride: 0,
@@ -345,7 +345,7 @@ impl View<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{Configuration, Database, Durability};
+    use crate::db::{Configuration, Conflicts, Database, Durability};
 
     /// A database whose catalog holds three named collections.
     fn cataloged() -> (Database, Arena) {
@@ -437,9 +437,27 @@ mod tests {
 
         // A transaction sees the catalog as the head has it, and its own writes on top.
         let mut transaction = database.transaction().unwrap();
-        assert_eq!(transaction.view().collection(&mut arena, "people").unwrap(), people);
-        write_name(transaction.view(), &mut arena, "pending", Some(&people.0.to_ne_bytes())).unwrap();
-        assert_eq!(transaction.view().collection(&mut arena, "pending").unwrap(), people);
+        assert_eq!(
+            transaction
+                .view(Conflicts::Watched)
+                .collection(&mut arena, "people")
+                .unwrap(),
+            people
+        );
+        write_name(
+            transaction.view(Conflicts::Watched),
+            &mut arena,
+            "pending",
+            Some(&people.0.to_ne_bytes()),
+        )
+        .unwrap();
+        assert_eq!(
+            transaction
+                .view(Conflicts::Watched)
+                .collection(&mut arena, "pending")
+                .unwrap(),
+            people
+        );
         assert_eq!(
             database.head().collection(&mut arena, "pending").unwrap_err().status,
             Status::NotFound

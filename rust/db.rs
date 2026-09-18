@@ -39,6 +39,7 @@ pub(crate) mod ffi {
 
     pub const USTORE_OPTIONS_DEFAULT_K: ustore_enum_t = 0;
     pub const USTORE_OPTION_WRITE_FLUSH_K: ustore_enum_t = 1 << 1;
+    pub const USTORE_OPTION_TRANSACTION_DONT_WATCH_K: ustore_enum_t = 1 << 2;
 
     pub const USTORE_SUPPORTS_TRANSACTIONS_K: ustore_enum_t = 1;
     pub const USTORE_SUPPORTS_COLLECTIONS_K: ustore_enum_t = 2;
@@ -345,6 +346,47 @@ impl Collection {
     }
 }
 
+/// The collections a batch addresses: one for every task, or one per task.
+///
+/// The ABI carries a collection per task, so a batch may span as many collections as it has entries;
+/// [`Collections::Every`] is the common case, and every verb takes a bare [`Collection`] as one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum Collections<'collections> {
+    /// Every task of the batch addresses the same collection.
+    Every(Collection),
+    /// The task at each position addresses the collection at the same position.
+    Each(&'collections [Collection]),
+}
+
+impl From<Collection> for Collections<'_> {
+    fn from(collection: Collection) -> Self {
+        Collections::Every(collection)
+    }
+}
+
+impl<'collections> From<&'collections [Collection]> for Collections<'collections> {
+    fn from(collections: &'collections [Collection]) -> Self {
+        Collections::Each(collections)
+    }
+}
+
+impl Collections<'_> {
+    /// The strided run of collections for `count` tasks, refusing a run of another length.
+    ///
+    /// The pointer addresses either the identifier inside this value or the caller's slice, so the
+    /// call it feeds must run while both are alive.
+    pub(crate) fn strided(&self, count: usize) -> Result<(*const ffi::ustore_collection_t, ffi::ustore_size_t)> {
+        match self {
+            Collections::Every(collection) => Ok((&collection.0, 0)),
+            Collections::Each(collections) if collections.len() == count => Ok((
+                collections.as_ptr().cast(),
+                size_of::<Collection>() as ffi::ustore_size_t,
+            )),
+            Collections::Each(_) => Err(fail(Status::InvalidArgument, "the batch holds a collection per task")),
+        }
+    }
+}
+
 /// An identifier of a point-in-time view of the whole database.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -387,6 +429,30 @@ impl Durability {
         match self {
             Durability::Buffered => ffi::USTORE_OPTIONS_DEFAULT_K,
             Durability::Flushed => ffi::USTORE_OPTION_WRITE_FLUSH_K,
+        }
+    }
+}
+
+/// Whether the calls of a transaction watch what they touch for conflicts.
+///
+/// Only a transaction watches anything, so the head of a database and a snapshot never carry this, and
+/// it changes what a call does only at [`Isolation::Snapshot`]: a strictly serializable transaction puts
+/// every read it makes into the one serial order whatever this says.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+pub enum Conflicts {
+    /// Every read and write the view makes is recorded, so a concurrent writer conflicts at the commit.
+    #[default]
+    Watched,
+    /// Nothing the view touches is watched, so a snapshot-isolated transaction commits over a concurrent
+    /// writer instead of conflicting with it.
+    Unwatched,
+}
+
+impl Conflicts {
+    fn to_raw(self) -> ffi::ustore_enum_t {
+        match self {
+            Conflicts::Watched => ffi::USTORE_OPTIONS_DEFAULT_K,
+            Conflicts::Unwatched => ffi::USTORE_OPTION_TRANSACTION_DONT_WATCH_K,
         }
     }
 }
@@ -647,6 +713,7 @@ impl Database {
             database: self.handle,
             transaction: ptr::null_mut(),
             snapshot: 0,
+            options: ffi::USTORE_OPTIONS_DEFAULT_K,
             marker: PhantomData,
         }
     }
@@ -785,6 +852,7 @@ pub struct View<'view> {
     database: ffi::ustore_database_t,
     transaction: ffi::ustore_transaction_t,
     snapshot: ffi::ustore_snapshot_t,
+    options: ffi::ustore_enum_t,
     marker: PhantomData<&'view Database>,
 }
 
@@ -792,6 +860,11 @@ impl<'view> View<'view> {
     /// The database every call through this view reaches.
     pub(crate) fn database(&self) -> ffi::ustore_database_t {
         self.database
+    }
+
+    /// The options every call through this view carries, which name its conflict detection.
+    pub(crate) fn options(&self) -> ffi::ustore_enum_t {
+        self.options
     }
 
     /// The transaction this view reads and writes through, or null.
@@ -857,12 +930,13 @@ pub struct Transaction<'db> {
 }
 
 impl<'db> Transaction<'db> {
-    /// The view every call inside this transaction addresses.
-    pub fn view(&self) -> View<'_> {
+    /// The view every call inside this transaction addresses, watching what it touches or not.
+    pub fn view(&self, conflicts: Conflicts) -> View<'_> {
         View {
             database: self.database.handle(),
             transaction: self.handle,
             snapshot: 0,
+            options: conflicts.to_raw(),
             marker: PhantomData,
         }
     }
@@ -942,6 +1016,7 @@ impl<'db> Snapshot<'db> {
             database: self.database.handle(),
             transaction: ptr::null_mut(),
             snapshot: self.id.0,
+            options: ffi::USTORE_OPTIONS_DEFAULT_K,
             marker: PhantomData,
         }
     }
@@ -995,7 +1070,7 @@ mod tests {
 
         let mut arena = Arena::new();
         let described = database.control(&mut arena, "info").unwrap();
-        assert!(described.contains("smashtable"), "{described}");
+        assert!(described.contains("ram"), "{described}");
     }
 
     #[test]
@@ -1122,7 +1197,7 @@ mod tests {
         let mut transaction = database.transaction().unwrap();
         let entries = [crate::blobs::Entry::new(1, b"alpha").unwrap()];
         transaction
-            .view()
+            .view(Conflicts::Watched)
             .write(&mut arena, Collection::main(), &entries, Durability::Buffered)
             .unwrap();
 
@@ -1145,14 +1220,14 @@ mod tests {
         let mut transaction = database.transaction().unwrap();
         let abandoned = [crate::blobs::Entry::new(2, b"abandoned").unwrap()];
         transaction
-            .view()
+            .view(Conflicts::Watched)
             .write(&mut arena, Collection::main(), &abandoned, Durability::Buffered)
             .unwrap();
         transaction.rollback().unwrap();
 
         let kept = [crate::blobs::Entry::new(2, b"kept").unwrap()];
         transaction
-            .view()
+            .view(Conflicts::Watched)
             .write(&mut arena, Collection::main(), &kept, Durability::Buffered)
             .unwrap();
         transaction.commit(Durability::Buffered).unwrap();
@@ -1168,7 +1243,7 @@ mod tests {
         let transaction = database.transaction().unwrap();
         let entries = [crate::blobs::Entry::new(3, b"alpha").unwrap()];
         let failure = transaction
-            .view()
+            .view(Conflicts::Watched)
             .write(&mut arena, Collection::main(), &entries, Durability::Flushed)
             .unwrap_err();
         assert_eq!(failure.status, Status::InvalidArgument);
@@ -1184,11 +1259,11 @@ mod tests {
         let mine = [crate::blobs::Entry::new(4, b"mine").unwrap()];
         let yours = [crate::blobs::Entry::new(4, b"yours").unwrap()];
         first
-            .view()
+            .view(Conflicts::Watched)
             .write(&mut arena, Collection::main(), &mine, Durability::Buffered)
             .unwrap();
         second
-            .view()
+            .view(Conflicts::Watched)
             .write(&mut arena, Collection::main(), &yours, Durability::Buffered)
             .unwrap();
         first.commit(Durability::Buffered).unwrap();
@@ -1201,6 +1276,50 @@ mod tests {
             ),
             "{failure:?}"
         );
+    }
+
+    #[test]
+    fn an_unwatched_view_records_nothing_to_conflict_over() {
+        // Only snapshot isolation adds a watch of its own; a strictly serializable read is ordered anyway.
+        let database = Database::open(Configuration::in_memory().with_isolation(Isolation::Snapshot)).unwrap();
+        let mut arena = Arena::new();
+        let seed = [crate::blobs::Entry::new(8, b"seed").unwrap()];
+        database
+            .head()
+            .write(&mut arena, Collection::main(), &seed, Durability::Buffered)
+            .unwrap();
+
+        // A watched read is part of the serial order, so a writer that lands under it conflicts.
+        let mut watched = database.transaction().unwrap();
+        let read = watched
+            .view(Conflicts::Watched)
+            .read(&mut arena, Collection::main(), &[8])
+            .unwrap();
+        assert_eq!(read.get(0), Some(b"seed".as_slice()));
+        let overwritten = [crate::blobs::Entry::new(8, b"overwritten").unwrap()];
+        database
+            .head()
+            .write(&mut arena, Collection::main(), &overwritten, Durability::Buffered)
+            .unwrap();
+        let failure = watched.commit(Durability::Buffered).unwrap_err();
+        assert!(
+            matches!(failure.status, Status::ReadConflict | Status::WriteConflict),
+            "{failure:?}"
+        );
+
+        // The same run through an unwatched view records nothing, so the commit stands.
+        let mut unwatched = database.transaction().unwrap();
+        let read = unwatched
+            .view(Conflicts::Unwatched)
+            .read(&mut arena, Collection::main(), &[8])
+            .unwrap();
+        assert_eq!(read.get(0), Some(b"overwritten".as_slice()));
+        let again = [crate::blobs::Entry::new(8, b"again").unwrap()];
+        database
+            .head()
+            .write(&mut arena, Collection::main(), &again, Durability::Buffered)
+            .unwrap();
+        unwatched.commit(Durability::Buffered).unwrap();
     }
 
     #[test]

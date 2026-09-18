@@ -1,7 +1,7 @@
 # UStore for C and C++
 
 `include/ustore/` is the public interface of UStore, and the only one: every engine and every binding meets here.
-The `*.h` headers declare a C99 binary interface that every engine implements — the in-memory SmashTable reference engine, the RocksDB and LevelDB key-value stores, and UDisk on NVMe as a v1 target — so any language with a C FFI can drive the database.
+The `*.h` headers declare a C99 binary interface that every engine implements — the in-memory SmashTable reference engine, the RocksDB and LevelDB key-value stores, and NVMe on NVMe as a v1 target — so any language with a C FFI can drive the database.
 The `*.hpp` headers beside them wrap the same calls in C++ with RAII handles, batched references and typed ranges, and add no ABI of their own.
 
 | Header     | Declares                                                                                          |
@@ -12,26 +12,27 @@ The `*.hpp` headers beside them wrap the same calls in C++ with RAII handles, ba
 | `docs.h`   | JSON documents: `ustore_docs_write`, `ustore_docs_read`, `ustore_docs_gist`, `ustore_docs_gather` |
 | `graph.h`  | Graph edges and vertices                                                                          |
 
-| Header                 | Declares                                                     |
-| :--------------------- | :----------------------------------------------------------- |
-| `ustore.hpp`           | Every C++ header below                                       |
-| `db.hpp`               | `database_t`, and `context_t` with its `transaction_t` alias |
-| `blobs_collection.hpp` | Binary collections                                           |
-| `blobs_ref.hpp`        | Batched references to binary values                          |
-| `blobs_range.hpp`      | Key ranges                                                   |
-| `docs_collection.hpp`  | Document collections                                         |
-| `docs_ref.hpp`         | Batched references to documents                              |
-| `docs_table.hpp`       | Gathered tables                                              |
-| `graph_collection.hpp` | Graph collections                                            |
-| `graph_stream.hpp`     | Adjacency streams                                            |
-| `status.hpp`           | `status_code_t`, `status_t` and `expected`                   |
-| `types.hpp`            | Value views and arenas                                       |
-| `ranges.hpp`           | Strided ranges                                               |
-| `ranges_args.hpp`      | Argument adapters                                            |
+| Header                   | Declares                                                     |
+| :----------------------- | :----------------------------------------------------------- |
+| `ustore.hpp`             | Every C++ header below                                       |
+| `db.hpp`                 | `database_t`, and `context_t` with its `transaction_t` alias |
+| `blobs_collection.hpp`   | Binary collections                                           |
+| `blobs_ref.hpp`          | Batched references to binary values                          |
+| `blobs_range.hpp`        | Key ranges                                                   |
+| `docs_collection.hpp`    | Document collections                                         |
+| `docs_ref.hpp`           | Batched references to documents                              |
+| `docs_table.hpp`         | Gathered tables                                              |
+| `graph_collection.hpp`   | Graph collections                                            |
+| `graph_stream.hpp`       | Adjacency streams                                            |
+| `strings_collection.hpp` | String-keyed collections and their prefix walks              |
+| `status.hpp`             | `status_code_t`, `status_t` and `expected`                   |
+| `types.hpp`              | Value views and arenas                                       |
+| `ranges.hpp`             | Strided ranges                                               |
+| `ranges_args.hpp`        | Argument adapters                                            |
 
 ## Installation
 
-UStore builds with CMake, and a project links exactly one engine library: `ustore_embedded_smashtable`, `ustore_embedded_rocksdb`, `ustore_embedded_leveldb` or `ustore_embedded_udisk`.
+UStore builds with CMake, and a project links exactly one engine library: `ustore_embedded_smashtable`, `ustore_embedded_rocksdb`, `ustore_embedded_leveldb` or `ustore_embedded_nvme`.
 Each of them implements the whole C interface.
 
 ```cmake

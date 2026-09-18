@@ -106,6 +106,8 @@ struct linked_memory_t {
     /** Starts a chain of @p kind unless one already exists, and reports whether a chain is ready. */
     bool start_if_null(kind_t kind) noexcept {
         if (first && first->kind == kind) return true;
+        // A chain of the other kind is released rather than dropped, which used to leak every block in it.
+        release_all();
         first = alloc_arena(initial_size_k, kind);
         if (!first) return false;
         first->release = release_t::allowed_k;

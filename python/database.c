@@ -735,6 +735,10 @@ static char const doc_Transaction[] =                                           
     "what it reads and writes and refuses to commit when a concurrent writer touched any\n"   //
     "of it, so a caller retries rather than locks.\n"                                         //
     "\n"                                                                                      //
+    "Every verb here takes a `watch` keyword overriding that for one call, so a read a\n"     //
+    "retry must not widen its conflict set with passes `watch=False`; only a transaction\n"   //
+    "has a conflict set, so a database refuses the keyword.\n"                                //
+    "\n"                                                                                      //
     "Used as a context manager, it commits on a clean exit, drops the staged work on an\n"    //
     "exception, and closes either way.";
 
@@ -1003,7 +1007,9 @@ static PyMethodDef Database_methods[] = {
     {"read", (PyCFunction)ustore_py_api_read, ustore_py_method_flags_k, doc_read},
     {"write", (PyCFunction)ustore_py_api_write, ustore_py_method_flags_k, doc_write},
     {"scan", (PyCFunction)ustore_py_api_scan, ustore_py_method_flags_k, doc_scan},
+    {"scan_batch", (PyCFunction)ustore_py_api_scan_batch, ustore_py_method_flags_k, doc_scan_batch},
     {"sample", (PyCFunction)ustore_py_api_sample, ustore_py_method_flags_k, doc_sample},
+    {"sample_batch", (PyCFunction)ustore_py_api_sample_batch, ustore_py_method_flags_k, doc_sample_batch},
     {"measure", (PyCFunction)ustore_py_api_measure, ustore_py_method_flags_k, doc_measure},
     {"get", (PyCFunction)ustore_py_api_get, ustore_py_method_flags_k, doc_get},
     {"set", (PyCFunction)ustore_py_api_set, ustore_py_method_flags_k, doc_set},
@@ -1056,7 +1062,9 @@ static PyMethodDef Transaction_methods[] = {
     {"read", (PyCFunction)ustore_py_api_read, ustore_py_method_flags_k, doc_read},
     {"write", (PyCFunction)ustore_py_api_write, ustore_py_method_flags_k, doc_write},
     {"scan", (PyCFunction)ustore_py_api_scan, ustore_py_method_flags_k, doc_scan},
+    {"scan_batch", (PyCFunction)ustore_py_api_scan_batch, ustore_py_method_flags_k, doc_scan_batch},
     {"sample", (PyCFunction)ustore_py_api_sample, ustore_py_method_flags_k, doc_sample},
+    {"sample_batch", (PyCFunction)ustore_py_api_sample_batch, ustore_py_method_flags_k, doc_sample_batch},
     {"measure", (PyCFunction)ustore_py_api_measure, ustore_py_method_flags_k, doc_measure},
     {"get", (PyCFunction)ustore_py_api_get, ustore_py_method_flags_k, doc_get},
     {"set", (PyCFunction)ustore_py_api_set, ustore_py_method_flags_k, doc_set},

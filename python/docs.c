@@ -13,8 +13,8 @@
 
 #pragma region Field Types
 
-/** Every type a document field travels as, as a caller spells it. */
-static ustore_py_choice_naming_t const field_type_namings[] = {
+/** Every type a written or read value is spelled as, as a caller spells it. */
+static ustore_py_choice_naming_t const value_type_namings[] = {
     {"json", ustore_doc_field_json_k}, {"str", ustore_doc_field_str_k},
     {"bytes", ustore_doc_field_bin_k}, {"null", ustore_doc_field_null_k},
     {"bool", ustore_doc_field_bool_k}, {"f64", ustore_doc_field_f64_k},
@@ -25,6 +25,21 @@ static ustore_py_choice_naming_t const field_type_namings[] = {
     {"u8", ustore_doc_field_u8_k},     {NULL, 0},
 };
 
+/** Every type a gather converts a field into, as a caller spells it. */
+static ustore_py_choice_naming_t const column_type_namings[] = {
+    {"bool", ustore_doc_field_bool_k}, {"uuid", ustore_doc_field_uuid_k},
+    {"f64", ustore_doc_field_f64_k},   {"f32", ustore_doc_field_f32_k},
+    {"f16", ustore_doc_field_f16_k},   {"i64", ustore_doc_field_i64_k},
+    {"i32", ustore_doc_field_i32_k},   {"i16", ustore_doc_field_i16_k},
+    {"i8", ustore_doc_field_i8_k},     {"u64", ustore_doc_field_u64_k},
+    {"u32", ustore_doc_field_u32_k},   {"u16", ustore_doc_field_u16_k},
+    {"u8", ustore_doc_field_u8_k},     {"str", ustore_doc_field_str_k},
+    {"bytes", ustore_doc_field_bin_k}, {NULL, 0},
+};
+
+/** Bytes one UUID takes, as the ABI lays it out. */
+enum { uuid_bytes_k = 16 };
+
 /** Every modification a write applies, as a caller spells it. */
 static ustore_py_choice_naming_t const modification_namings[] = {
     {"upsert", ustore_doc_modify_upsert_k}, {"update", ustore_doc_modify_update_k},
@@ -33,31 +48,61 @@ static ustore_py_choice_naming_t const modification_namings[] = {
 };
 
 /**
- *  @brief Answers the struct-module format a scalar field type exports as.
+ *  @brief Answers the struct-module format one scalar of a field type exports as.
+ *
+ *  A UUID is sixteen bytes rather than a scalar @c struct spells, so it carries no format and
+ *  travels as a two-dimensional run of bytes instead.
+ *
  *  @param[in] type The field type.
- *  @param[out] itemsize Bytes one scalar takes, or zero for a type without a fixed width.
- *  @return The format, or NULL for strings and every type a gather does not fill.
+ *  @return The format, or NULL for UUIDs, strings and every type a gather does not fill.
  */
-static char const* field_type_format(ustore_doc_field_type_t type, Py_ssize_t* itemsize) {
+static char const* field_type_format(ustore_doc_field_type_t type) {
     switch (type) {
-    case ustore_doc_field_bool_k: *itemsize = 1; return "?";
-    case ustore_doc_field_f64_k: *itemsize = 8; return "d";
-    case ustore_doc_field_f32_k: *itemsize = 4; return "f";
-    case ustore_doc_field_i64_k: *itemsize = 8; return "q";
-    case ustore_doc_field_i32_k: *itemsize = 4; return "i";
-    case ustore_doc_field_i16_k: *itemsize = 2; return "h";
-    case ustore_doc_field_i8_k: *itemsize = 1; return "b";
-    case ustore_doc_field_u64_k: *itemsize = 8; return "Q";
-    case ustore_doc_field_u32_k: *itemsize = 4; return "I";
-    case ustore_doc_field_u16_k: *itemsize = 2; return "H";
-    case ustore_doc_field_u8_k: *itemsize = 1; return "B";
-    default: *itemsize = 0; return NULL;
+    case ustore_doc_field_bool_k: return "?";
+    case ustore_doc_field_f64_k: return "d";
+    case ustore_doc_field_f32_k: return "f";
+    case ustore_doc_field_f16_k: return "e";
+    case ustore_doc_field_i64_k: return "q";
+    case ustore_doc_field_i32_k: return "i";
+    case ustore_doc_field_i16_k: return "h";
+    case ustore_doc_field_i8_k: return "b";
+    case ustore_doc_field_u64_k: return "Q";
+    case ustore_doc_field_u32_k: return "I";
+    case ustore_doc_field_u16_k: return "H";
+    case ustore_doc_field_u8_k: return "B";
+    default: return NULL;
     }
 }
 
-/** The spelling of @p type, which every value of the closed set has. */
+/**
+ *  @brief Answers the bytes one value of a fixed-width field type takes.
+ *  @param[in] type The field type.
+ *  @return The width, or zero for JSON, strings and every type without a fixed one.
+ */
+static size_t field_type_width(ustore_doc_field_type_t type) {
+    switch (type) {
+    case ustore_doc_field_bool_k: return 1;
+    case ustore_doc_field_uuid_k: return uuid_bytes_k;
+    case ustore_doc_field_f64_k: return 8;
+    case ustore_doc_field_f32_k: return 4;
+    case ustore_doc_field_f16_k: return 2;
+    case ustore_doc_field_i64_k: return 8;
+    case ustore_doc_field_i32_k: return 4;
+    case ustore_doc_field_i16_k: return 2;
+    case ustore_doc_field_i8_k: return 1;
+    case ustore_doc_field_u64_k: return 8;
+    case ustore_doc_field_u32_k: return 4;
+    case ustore_doc_field_u16_k: return 2;
+    case ustore_doc_field_u8_k: return 1;
+    default: return 0;
+    }
+}
+
+/** The spelling of @p type, which every value of the two closed sets has. */
 static char const* field_type_name(ustore_doc_field_type_t type) {
-    for (ustore_py_choice_naming_t const* naming = field_type_namings; naming->name; ++naming)
+    for (ustore_py_choice_naming_t const* naming = value_type_namings; naming->name; ++naming)
+        if (naming->value == (int)type) return naming->name;
+    for (ustore_py_choice_naming_t const* naming = column_type_namings; naming->name; ++naming)
         if (naming->value == (int)type) return naming->name;
     return "unknown";
 }
@@ -122,6 +167,59 @@ static void documents_release(documents_t* documents) {
 }
 
 /**
+ *  @brief Lays a contiguous buffer of fixed-width scalars out as one borrowed value per task.
+ *
+ *  A buffer holding one scalar stands for every task, and a buffer holding one per task is split in
+ *  place, so a column of floats or integers reaches the ABI without ever being printed as JSON.
+ *
+ *  @param[in] object The column, anything exporting a C-contiguous buffer.
+ *  @param[in] type The field type every scalar carries.
+ *  @param[in] tasks_count Tasks the write addresses.
+ *  @param[out] documents The borrowed runs and the layout they travel with.
+ *  @return 0 on success, -1 with an exception set otherwise.
+ */
+static int scalars_from_object(PyObject* object, ustore_doc_field_type_t type, size_t tasks_count,
+                               documents_t* documents) {
+    memset(documents, 0, sizeof(*documents));
+    size_t const width = field_type_width(type);
+    Py_buffer buffer;
+    if (PyObject_GetBuffer(object, &buffer, PyBUF_C_CONTIGUOUS | PyBUF_FORMAT) != 0)
+        return ustore_py_raise_from_cause(PyExc_TypeError, "A column of '%s' must export a contiguous buffer, not %S",
+                                          field_type_name(type), Py_TYPE(object));
+
+    // A buffer of bytes carries no width of its own, so only a typed one is held to the field's.
+    if (buffer.itemsize != 1 && (size_t)buffer.itemsize != width) {
+        PyErr_Format(PyExc_ValueError, "A column of '%s' holds %zu-byte items, got %zd-byte ones",
+                     field_type_name(type), width, buffer.itemsize);
+        PyBuffer_Release(&buffer);
+        return -1;
+    }
+
+    size_t const values_count = (size_t)buffer.len == width ? 1 : tasks_count;
+    if ((size_t)buffer.len != values_count * width) {
+        PyErr_Format(PyExc_ValueError, "A column of '%s' spans %zd bytes, not the %zu that %zu tasks take",
+                     field_type_name(type), buffer.len, tasks_count * width, tasks_count);
+        PyBuffer_Release(&buffer);
+        return -1;
+    }
+
+    if (ustore_py_contents_reserve(&documents->contents, values_count) != 0) {
+        PyBuffer_Release(&buffer);
+        return -1;
+    }
+    // One buffer backs every task, so the batch borrows once and releases once.
+    documents->contents.buffers[0] = buffer;
+    documents->contents.borrowed = 1;
+    documents->contents.count = values_count;
+    documents->contents.layout = values_count == 1 ? ustore_py_contents_broadcast_k : ustore_py_contents_per_task_k;
+    for (size_t task_index = 0; task_index != values_count; ++task_index) {
+        documents->contents.values[task_index] = (ustore_bytes_cptr_t)buffer.buf + task_index * width;
+        documents->contents.lengths[task_index] = (ustore_length_t)width;
+    }
+    return 0;
+}
+
+/**
  *  @brief Gathers the documents of a write: a sequence, one document for every key, or None.
  *  @param[in] object The documents, each a string, a bytes-like object, or None to remove it.
  *  @param[out] documents The borrowed runs and the layout they travel with.
@@ -171,7 +269,9 @@ char const doc_docs_write[] =                                                   
     "    `id_field` of its document.\n"                                                         //
     "  documents (Sequence[str | bytes-like | None] | str | bytes-like | None): One document\n" //
     "    per key, one document broadcast to every key, or None to remove them all. A None\n"    //
-    "    inside a sequence removes that one document, or the field inside it.\n"                //
+    "    inside a sequence removes that one document, or the field inside it. Under a\n"        //
+    "    fixed-width `type`, a contiguous buffer of one scalar per key is a column, which\n"    //
+    "    reaches the store without being printed as JSON and parsed back.\n"                    //
     "  collection (int | str, optional): The collection, by identifier or by name.\n"           //
     "  field (str, optional): A top-level key or a JSON Pointer such as '/user/name' to\n"      //
     "    write inside every document; None writes whole documents.\n"                           //
@@ -215,7 +315,7 @@ PyObject* ustore_py_api_docs_write(PyObject* self, PyObject* const* args, Py_ssi
         else if (PyUnicode_CompareWithASCIIString(name, "modification") == 0)
             parsed = ustore_py_choice_from_object(value, "modification", modification_namings, &modification);
         else if (PyUnicode_CompareWithASCIIString(name, "type") == 0)
-            parsed = ustore_py_choice_from_object(value, "type", field_type_namings, &type);
+            parsed = ustore_py_choice_from_object(value, "type", value_type_namings, &type);
         else {
             PyErr_Format(PyExc_TypeError, "Got unexpected keyword argument: %S", name);
             return NULL;
@@ -223,11 +323,21 @@ PyObject* ustore_py_api_docs_write(PyObject* self, PyObject* const* args, Py_ssi
         if (parsed != 0) return NULL;
     }
 
-    documents_t documents;
-    if (documents_from_object(args[1], &documents) != 0) return NULL;
-
+    // A fixed-width type given a buffer is a column of scalars, which splits in place per key.
     ustore_py_keys_t keys;
     memset(&keys, 0, sizeof(keys));
+    int const columnar = field_type_width((ustore_doc_field_type_t)type) != 0 && args[0] != Py_None &&
+                         !PyUnicode_Check(args[1]) && PyObject_CheckBuffer(args[1]);
+    if (args[0] != Py_None && ustore_py_keys_from_object(args[0], &keys) != 0) return NULL;
+
+    documents_t documents;
+    int const gathered = columnar ? scalars_from_object(args[1], (ustore_doc_field_type_t)type, keys.count, &documents)
+                                  : documents_from_object(args[1], &documents);
+    if (gathered != 0) {
+        ustore_py_keys_release(&keys);
+        return NULL;
+    }
+
     size_t tasks_count = 0;
     if (args[0] == Py_None) {
         // Every key is read out of its own document, so each task needs a document of its own.
@@ -239,10 +349,6 @@ PyObject* ustore_py_api_docs_write(PyObject* self, PyObject* const* args, Py_ssi
         tasks_count = documents.contents.count;
     }
     else {
-        if (ustore_py_keys_from_object(args[0], &keys) != 0) {
-            documents_release(&documents);
-            return NULL;
-        }
         tasks_count = keys.count;
         if (documents.held && documents.contents.count != keys.count) {
             PyErr_Format(PyExc_ValueError, "Got %zu documents for %zu keys", documents.contents.count, keys.count);
@@ -329,7 +435,7 @@ PyObject* ustore_py_api_docs_read(PyObject* self, PyObject* const* args, Py_ssiz
         if (PyUnicode_CompareWithASCIIString(name, "field") == 0)
             parsed = optional_text_from_object(value, "field", &field);
         else if (PyUnicode_CompareWithASCIIString(name, "type") == 0)
-            parsed = ustore_py_choice_from_object(value, "type", field_type_namings, &type);
+            parsed = ustore_py_choice_from_object(value, "type", value_type_namings, &type);
         else {
             PyErr_Format(PyExc_TypeError, "Got unexpected keyword argument: %S", name);
             return NULL;
@@ -489,8 +595,9 @@ char const doc_docs_gather[] =                                                  
     "  keys (Sequence[int] | buffer): The documents, the rows of every column.\n"             //
     "  fields (Sequence[str]): Top-level keys or JSON Pointers, the columns of the result.\n" //
     "  types (str | Sequence[str]): One type per field, or one for every field: 'bool',\n"    //
-    "    'f64', 'f32', 'i64', 'i32', 'i16', 'i8', 'u64', 'u32', 'u16', 'u8', 'str' or\n"      //
-    "    'bytes'.\n"                                                                          //
+    "    'uuid', 'f64', 'f32', 'f16', 'i64', 'i32', 'i16', 'i8', 'u64', 'u32', 'u16',\n"      //
+    "    'u8', 'str' or 'bytes'. An 'f16' column exports as a half-precision view NumPy\n"    //
+    "    reads as float16, and a 'uuid' column as sixteen bytes per document.\n"              //
     "  collection (int | str, optional): The collection, by identifier or by name.\n"         //
     "  snapshot (int, optional): The snapshot to read; 0 reads the head.\n"                   //
     "Returns:\n"                                                                              //
@@ -546,15 +653,8 @@ PyObject* ustore_py_api_docs_gather(PyObject* self, PyObject* const* args, Py_ss
         field_texts[field_index] = PyUnicode_AsUTF8(field);
         int type = ustore_doc_field_json_k;
         failed = !field_texts[field_index] ||
-                 ustore_py_choice_from_object(type_object, "types", field_type_namings, &type) != 0;
+                 ustore_py_choice_from_object(type_object, "types", column_type_namings, &type) != 0;
         if (failed) break;
-        Py_ssize_t itemsize = 0;
-        if (!field_type_format((ustore_doc_field_type_t)type, &itemsize) && type != ustore_doc_field_str_k &&
-            type != ustore_doc_field_bin_k) {
-            PyErr_Format(PyExc_ValueError, "A gather converts into a scalar, 'str' or 'bytes', not %R", type_object);
-            failed = 1;
-            break;
-        }
         types[field_index] = (ustore_doc_field_type_t)type;
     }
     Py_XDECREF(types_held);
@@ -622,12 +722,15 @@ PyObject* ustore_py_api_docs_gather(PyObject* self, PyObject* const* args, Py_ss
 
 #pragma region Columns
 
-static char const doc_Columns[] =                                                                //
-    "The typed columns one gather exported, read straight out of the arena holding them.\n"      //
-    "\n"                                                                                         //
-    "Indexing a scalar column answers a `memoryview` of its type over the stored scalars, and\n" //
-    "indexing a string column answers a tuple of `str` or `bytes`, with None where the value\n"  //
-    "is not valid. The bitmaps address documents least significant bit first, as Apache\n"       //
+static char const doc_Columns[] =                                                               //
+    "The typed columns one gather exported, read straight out of the arena holding them.\n"     //
+    "\n"                                                                                        //
+    "Indexing a scalar column answers a `memoryview` of its type over the stored scalars, a\n"  //
+    "'uuid' column a two-dimensional view of sixteen bytes per document, and a string column\n" //
+    "a tuple of `str` or `bytes`, with None where the value is not valid. An 'f16' column\n"    //
+    "carries the 'e' format, which NumPy reads as float16 without a copy.\n"                    //
+    "\n"                                                                                        //
+    "The bitmaps address documents least significant bit first, as Apache\n"                    //
     "Arrow does, and every view keeps this object, and therefore the arena, alive.";
 
 static void Columns_dealloc(Columns* self) {
@@ -662,12 +765,16 @@ static PyObject* Columns_item(Columns* self, Py_ssize_t field_index) {
         return NULL;
     }
     ustore_doc_field_type_t const type = self->types[field_index];
-    Py_ssize_t itemsize = 0;
-    char const* const format = field_type_format(type, &itemsize);
+    char const* const format = field_type_format(type);
     Py_ssize_t const rows = (Py_ssize_t)self->docs_count;
     if (format) {
         void* const data = rows ? (void*)self->scalars[field_index] : NULL;
-        return ustore_py_span_view((PyObject*)self, data, format, itemsize, 1, &rows);
+        return ustore_py_span_view((PyObject*)self, data, format, (Py_ssize_t)field_type_width(type), 1, &rows);
+    }
+    if (type == ustore_doc_field_uuid_k) {
+        void* const data = rows ? (void*)self->scalars[field_index] : NULL;
+        Py_ssize_t const shape[2] = {rows, uuid_bytes_k};
+        return ustore_py_span_view((PyObject*)self, data, "B", 1, 2, shape);
     }
 
     PyObject* const strings = PyTuple_New(rows);

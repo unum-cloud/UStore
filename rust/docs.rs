@@ -5,14 +5,14 @@
 //! terminator, which is why every field is a `&CStr`: a `c"/user/name"` literal crosses as it stands.
 //!
 //! ```no_run
-//! use ustore::{Arena, Column, Configuration, Database, Durability, Entry, FieldAddress, FieldEntry};
-//! use ustore::{Modification, Text};
+//! use ustore::{Arena, Column, Configuration, Database, DocumentEntry, Durability, FieldAddress, FieldEntry};
+//! use ustore::{Json, Modification, Text};
 //!
 //! let database = Database::open(Configuration::in_memory())?;
 //! let mut arena = Arena::new();
 //! let people = database.create_collection(&mut arena, "people")?;
 //!
-//! let documents = [Entry::new(1, br#"{"name":"Ada","born":1815}"#)?];
+//! let documents = [DocumentEntry::<Json>::new(1, r#"{"name":"Ada","born":1815}"#)?];
 //! database.head().write_documents(&mut arena, people, &documents, Modification::Upsert, Durability::Buffered)?;
 //! let died = [FieldEntry::<i64>::new(1, c"died", &1852)?];
 //! database.head().write_fields(&mut arena, people, &died, Modification::Upsert, Durability::Buffered)?;
@@ -26,12 +26,31 @@
 //! # Ok::<(), ustore::Error>(())
 //! ```
 //!
-//! One batch writes one format, so a batch mixing two does not compile:
+//! One batch writes one format, so a batch of fields mixing two does not compile:
 //!
 //! ```compile_fail
 //! use ustore::{FieldEntry, Json};
 //!
 //! let fields = [FieldEntry::<i64>::new(1, c"age", &36)?, FieldEntry::<Json>::new(1, c"name", "\"Ada\"")?];
+//! # Ok::<(), ustore::Error>(())
+//! ```
+//!
+//! A batch of whole documents carries one format too, so the same mixture is refused there:
+//!
+//! ```compile_fail
+//! use ustore::{DocumentEntry, Json};
+//!
+//! let documents = [DocumentEntry::<Json>::new(1, "{}")?, DocumentEntry::<i64>::new(2, &1815)?];
+//! # Ok::<(), ustore::Error>(())
+//! ```
+//!
+//! Neither [`Half`] nor [`Uuid`] is a format a write carries, so a document written as one does not
+//! compile either, however it reads back in a gathered column:
+//!
+//! ```compile_fail
+//! use ustore::{DocumentEntry, Half};
+//!
+//! let documents = [DocumentEntry::<Half>::new(1, &Half(0x3e00))?];
 //! # Ok::<(), ustore::Error>(())
 //! ```
 //!
@@ -54,14 +73,14 @@ use std::ffi::{c_char, c_int, CStr};
 use std::marker::PhantomData;
 use std::ptr;
 
-use crate::blobs::{Entry, Values};
+use crate::blobs::Values;
 use crate::db::ffi::{
     ustore_arena_t, ustore_byte_t, ustore_bytes_cptr_t, ustore_char_t, ustore_collection_t, ustore_database_t,
     ustore_enum_t, ustore_error_t, ustore_key_t, ustore_length_t, ustore_octet_t, ustore_size_t, ustore_snapshot_t,
-    ustore_str_view_t, ustore_transaction_t, USTORE_OPTIONS_DEFAULT_K,
+    ustore_str_view_t, ustore_transaction_t,
 };
 use crate::db::{
-    check, described_length, exported_slice, fail, Arena, Collection, Durability, Key, Result, Status, View,
+    check, described_length, exported_slice, fail, Arena, Collections, Durability, Key, Result, Status, View,
 };
 
 // region: Raw Declarations
@@ -188,8 +207,14 @@ mod sealed {
 
 use sealed::Format;
 
-/// A fixed-width value a field write stores and a gather converts a column into.
+/// A fixed-width value a gathered column converts into.
 pub trait Scalar: Format + Copy {}
+
+/// A scalar a write carries into a whole document or into one of its fields.
+///
+/// [`Half`] and [`Uuid`] are gathered but never written: the engine builds a document from the bytes
+/// of a scalar and has no JSON spelling for either.
+pub trait WritableScalar: Scalar {}
 
 /// JSON text: a whole value written into a field, or a field read back as the JSON it holds.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -203,11 +228,30 @@ pub struct Text;
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub struct Binary;
 
+/// A gathered half-precision float, held as the two bytes of its IEEE 754 binary16 encoding.
+///
+/// The crate reinterprets nothing: a value whose magnitude will not fit sets the collision bit of its
+/// row and leaves the cell zero.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+pub struct Half(pub u16);
+
+/// A gathered UUID, sixteen bytes in the order canonical text writes them.
+///
+/// The engine parses the canonical thirty-six character form; anything else sets the collision bit of
+/// its row and leaves the cell zero.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+pub struct Uuid(pub [u8; 16]);
+
 impl Format for f64 {
     const TYPE: c_int = 42;
 }
 impl Format for f32 {
     const TYPE: c_int = 41;
+}
+impl Format for Half {
+    const TYPE: c_int = 40;
 }
 impl Format for i64 {
     const TYPE: c_int = 23;
@@ -236,6 +280,9 @@ impl Format for u8 {
 impl Format for bool {
     const TYPE: c_int = 11;
 }
+impl Format for Uuid {
+    const TYPE: c_int = 12;
+}
 impl Format for Json {
     const TYPE: c_int = 0;
 }
@@ -248,6 +295,7 @@ impl Format for Binary {
 
 impl Scalar for f64 {}
 impl Scalar for f32 {}
+impl Scalar for Half {}
 impl Scalar for i64 {}
 impl Scalar for i32 {}
 impl Scalar for i16 {}
@@ -257,6 +305,19 @@ impl Scalar for u32 {}
 impl Scalar for u16 {}
 impl Scalar for u8 {}
 impl Scalar for bool {}
+impl Scalar for Uuid {}
+
+impl WritableScalar for f64 {}
+impl WritableScalar for f32 {}
+impl WritableScalar for i64 {}
+impl WritableScalar for i32 {}
+impl WritableScalar for i16 {}
+impl WritableScalar for i8 {}
+impl WritableScalar for u64 {}
+impl WritableScalar for u32 {}
+impl WritableScalar for u16 {}
+impl WritableScalar for u8 {}
+impl WritableScalar for bool {}
 
 /// The format of the values one field write carries, which the whole batch shares.
 pub trait FieldFormat: Format {
@@ -267,11 +328,11 @@ pub trait FieldFormat: Format {
     fn bytes(value: &Self::Value) -> &[u8];
 }
 
-impl<Value: Scalar> FieldFormat for Value {
+impl<Value: WritableScalar> FieldFormat for Value {
     type Value = Value;
 
     fn bytes(value: &Value) -> &[u8] {
-        // SAFETY: every `Scalar` is a primitive without padding, so each of its bytes is initialized.
+        // SAFETY: every `WritableScalar` is a primitive without padding, so each of its bytes is initialized.
         unsafe { std::slice::from_raw_parts((value as *const Value).cast::<u8>(), size_of::<Value>()) }
     }
 }
@@ -325,6 +386,50 @@ pub enum Modification {
 // endregion: Formats
 
 // region: Inputs
+
+/// A document and the key it is stored under, laid out so a slice feeds the strided ABI - one array
+/// for the keys, one for the pointers, one for the lengths.
+///
+/// A whole document is written in one format the batch shares: [`Json`] for the text the engine parses,
+/// [`Text`] for a document that is one JSON string, or any [`WritableScalar`] for a document that is
+/// one number or one boolean.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct DocumentEntry<'value, Format: FieldFormat> {
+    key: Key,
+    value: *const u8,
+    length: ustore_length_t,
+    marker: PhantomData<&'value Format::Value>,
+}
+
+impl<'value, Format: FieldFormat> DocumentEntry<'value, Format> {
+    /// Pairs a key with the document to store under it, refusing one past the 32-bit length the ABI
+    /// carries.
+    pub fn new(key: Key, value: &'value Format::Value) -> Result<Self> {
+        let bytes = Format::bytes(value);
+        Ok(DocumentEntry {
+            key,
+            value: bytes.as_ptr(),
+            length: described_length(bytes.len(), "the document is longer than the ABI can describe")?,
+            marker: PhantomData,
+        })
+    }
+
+    /// Names a key whose document a batch removes, which it mixes freely with the entries that carry one.
+    pub fn removal(key: Key) -> Self {
+        DocumentEntry {
+            key,
+            value: ptr::null(),
+            length: 0,
+            marker: PhantomData,
+        }
+    }
+
+    /// The key this entry stores under.
+    pub fn key(&self) -> Key {
+        self.key
+    }
+}
 
 /// A document carrying its own key under an id field, laid out so a slice feeds the strided ABI.
 #[repr(C)]
@@ -662,33 +767,38 @@ impl<'arena> Table<'arena> {
 // region: Verbs
 
 impl View<'_> {
-    /// Writes whole JSON documents under the keys their entries carry.
+    /// Writes whole documents under the keys their entries carry, removing the keys whose entries
+    /// carry none.
     ///
-    /// A transaction flushes at its commit, so [`Durability::Flushed`] is refused inside one.
-    pub fn write_documents(
+    /// The batch writes one format, which is [`Json`] for the text the engine parses and a
+    /// [`WritableScalar`] or [`Text`] for a document that is one scalar. A transaction flushes at its
+    /// commit, so [`Durability::Flushed`] is refused inside one.
+    pub fn write_documents<'collections, Format: FieldFormat>(
         &self,
         arena: &mut Arena,
-        collection: Collection,
-        documents: &[Entry<'_>],
+        collections: impl Into<Collections<'collections>>,
+        documents: &[DocumentEntry<'_, Format>],
         modification: Modification,
         durability: Durability,
     ) -> Result<()> {
         let Some(first) = documents.first() else {
             return Ok(());
         };
-        let stride = size_of::<Entry<'_>>() as ustore_size_t;
+        let collections = collections.into();
+        let (collections, collections_stride) = collections.strided(documents.len())?;
+        let stride = size_of::<DocumentEntry<'_, Format>>() as ustore_size_t;
         let mut error = ustore_error_t::default();
         let mut arguments = ffi::ustore_docs_write_t {
             db: self.database(),
             error: &mut error,
             transaction: self.transaction(),
             arena: arena.slot(),
-            options: durability.to_raw(),
+            options: self.options() | durability.to_raw(),
             tasks_count: documents.len() as ustore_size_t,
-            type_: Json::TYPE,
+            type_: Format::TYPE,
             modification: modification as ustore_enum_t,
-            collections: &collection.0,
-            collections_stride: 0,
+            collections,
+            collections_stride,
             keys: &first.key,
             keys_stride: stride,
             fields: ptr::null(),
@@ -702,17 +812,17 @@ impl View<'_> {
             values_stride: stride,
             id_field: ptr::null(),
         };
-        // SAFETY: the documents outlive the call, and their fields sit `stride` bytes apart, which is what
-        // `#[repr(C)]` on `Entry` promises.
+        // SAFETY: the documents and the collections outlive the call, and the members of every entry sit
+        // `stride` bytes apart, which is what `#[repr(C)]` on `DocumentEntry` promises.
         unsafe { ffi::ustore_docs_write(&mut arguments) };
         check(error)
     }
 
     /// Writes whole JSON documents under the integer key each one holds in `id_field`.
-    pub fn write_documents_by_id(
+    pub fn write_documents_by_id<'collections>(
         &self,
         arena: &mut Arena,
-        collection: Collection,
+        collections: impl Into<Collections<'collections>>,
         id_field: &CStr,
         documents: &[Document<'_>],
         modification: Modification,
@@ -721,6 +831,8 @@ impl View<'_> {
         let Some(first) = documents.first() else {
             return Ok(());
         };
+        let collections = collections.into();
+        let (collections, collections_stride) = collections.strided(documents.len())?;
         let stride = size_of::<Document<'_>>() as ustore_size_t;
         let mut error = ustore_error_t::default();
         let mut arguments = ffi::ustore_docs_write_t {
@@ -728,12 +840,12 @@ impl View<'_> {
             error: &mut error,
             transaction: self.transaction(),
             arena: arena.slot(),
-            options: durability.to_raw(),
+            options: self.options() | durability.to_raw(),
             tasks_count: documents.len() as ustore_size_t,
             type_: Json::TYPE,
             modification: modification as ustore_enum_t,
-            collections: &collection.0,
-            collections_stride: 0,
+            collections,
+            collections_stride,
             keys: ptr::null(),
             keys_stride: 0,
             fields: ptr::null(),
@@ -754,10 +866,10 @@ impl View<'_> {
     }
 
     /// Writes values into fields of existing documents, or removes the fields whose entries carry none.
-    pub fn write_fields<Format: FieldFormat>(
+    pub fn write_fields<'collections, Format: FieldFormat>(
         &self,
         arena: &mut Arena,
-        collection: Collection,
+        collections: impl Into<Collections<'collections>>,
         fields: &[FieldEntry<'_, Format>],
         modification: Modification,
         durability: Durability,
@@ -765,6 +877,8 @@ impl View<'_> {
         let Some(first) = fields.first() else {
             return Ok(());
         };
+        let collections = collections.into();
+        let (collections, collections_stride) = collections.strided(fields.len())?;
         let stride = size_of::<FieldEntry<'_, Format>>() as ustore_size_t;
         let mut error = ustore_error_t::default();
         let mut arguments = ffi::ustore_docs_write_t {
@@ -772,12 +886,12 @@ impl View<'_> {
             error: &mut error,
             transaction: self.transaction(),
             arena: arena.slot(),
-            options: durability.to_raw(),
+            options: self.options() | durability.to_raw(),
             tasks_count: fields.len() as ustore_size_t,
             type_: Format::TYPE,
             modification: modification as ustore_enum_t,
-            collections: &collection.0,
-            collections_stride: 0,
+            collections,
+            collections_stride,
             keys: &first.key,
             keys_stride: stride,
             fields: &first.field,
@@ -798,10 +912,10 @@ impl View<'_> {
     }
 
     /// Reads whole documents as the JSON text they were written in.
-    pub fn read_documents<'arena>(
+    pub fn read_documents<'arena, 'collections>(
         &self,
         arena: &'arena mut Arena,
-        collection: Collection,
+        collections: impl Into<Collections<'collections>>,
         keys: &[Key],
     ) -> Result<Values<'arena>> {
         let tasks = StridedTasks {
@@ -811,14 +925,14 @@ impl View<'_> {
             fields: ptr::null(),
             fields_stride: 0,
         };
-        self.read_tasks(arena, collection, tasks, Json::TYPE)
+        self.read_tasks(arena, collections.into(), tasks, Json::TYPE)
     }
 
     /// Reads fields of documents in `Format`, reporting a missing document or field as absent.
-    pub fn read_fields<'arena, Format: ReadFormat>(
+    pub fn read_fields<'arena, 'collections, Format: ReadFormat>(
         &self,
         arena: &'arena mut Arena,
-        collection: Collection,
+        collections: impl Into<Collections<'collections>>,
         fields: &[FieldAddress<'_>],
     ) -> Result<Values<'arena>> {
         let Some(first) = fields.first() else {
@@ -832,16 +946,18 @@ impl View<'_> {
             fields: &first.field,
             fields_stride: stride,
         };
-        self.read_tasks(arena, collection, tasks, Format::TYPE)
+        self.read_tasks(arena, collections.into(), tasks, Format::TYPE)
     }
 
     /// Lists the unique paths to the leaves of the documents under `keys`.
-    pub fn gist<'arena>(
+    pub fn gist<'arena, 'collections>(
         &self,
         arena: &'arena mut Arena,
-        collection: Collection,
+        collections: impl Into<Collections<'collections>>,
         keys: &[Key],
     ) -> Result<Paths<'arena>> {
+        let collections = collections.into();
+        let (collections, collections_stride) = collections.strided(keys.len())?;
         let mut count: ustore_size_t = 0;
         let mut offsets: *mut ustore_length_t = ptr::null_mut();
         let mut tape: *mut ustore_char_t = ptr::null_mut();
@@ -852,17 +968,17 @@ impl View<'_> {
             transaction: self.transaction(),
             snapshot: self.snapshot(),
             arena: arena.slot(),
-            options: USTORE_OPTIONS_DEFAULT_K,
+            options: self.options(),
             docs_count: keys.len() as ustore_size_t,
-            collections: &collection.0,
-            collections_stride: 0,
+            collections,
+            collections_stride,
             keys: keys.as_ptr(),
             keys_stride: size_of::<Key>() as ustore_size_t,
             fields_count: &mut count,
             offsets: &mut offsets,
             fields: &mut tape,
         };
-        // SAFETY: the keys and every output outlive the call.
+        // SAFETY: the keys, the collections and every output outlive the call.
         unsafe { ffi::ustore_docs_gist(&mut arguments) };
         check(error)?;
         Ok(Paths {
@@ -874,13 +990,15 @@ impl View<'_> {
     }
 
     /// Reads `columns` of the documents under `keys` into typed columns, a row per key.
-    pub fn gather<'arena>(
+    pub fn gather<'arena, 'collections>(
         &self,
         arena: &'arena mut Arena,
-        collection: Collection,
+        collections: impl Into<Collections<'collections>>,
         keys: &[Key],
         columns: &'arena [Column<'arena>],
     ) -> Result<Table<'arena>> {
+        let collections = collections.into();
+        let (collections, collections_stride) = collections.strided(keys.len())?;
         let mut validities: *mut *mut ustore_octet_t = ptr::null_mut();
         let mut conversions: *mut *mut ustore_octet_t = ptr::null_mut();
         let mut collisions: *mut *mut ustore_octet_t = ptr::null_mut();
@@ -903,11 +1021,11 @@ impl View<'_> {
             transaction: self.transaction(),
             snapshot: self.snapshot(),
             arena: arena.slot(),
-            options: USTORE_OPTIONS_DEFAULT_K,
+            options: self.options(),
             docs_count: keys.len() as ustore_size_t,
             fields_count: columns.len() as ustore_size_t,
-            collections: &collection.0,
-            collections_stride: 0,
+            collections,
+            collections_stride,
             keys: keys.as_ptr(),
             keys_stride: size_of::<Key>() as ustore_size_t,
             fields,
@@ -922,8 +1040,8 @@ impl View<'_> {
             columns_lengths: &mut lengths,
             joined_strings: &mut joined,
         };
-        // SAFETY: the keys, the columns with their fields, and every output outlive the call, and the
-        // members of every column sit `stride` bytes apart as `#[repr(C)]` promises.
+        // SAFETY: the keys, the collections, the columns with their fields, and every output outlive the
+        // call, and the members of every column sit `stride` bytes apart as `#[repr(C)]` promises.
         unsafe { ffi::ustore_docs_gather(&mut arguments) };
         check(error)?;
         Ok(Table {
@@ -943,10 +1061,11 @@ impl View<'_> {
     fn read_tasks<'arena>(
         &self,
         arena: &'arena mut Arena,
-        collection: Collection,
+        collections: Collections<'_>,
         tasks: StridedTasks,
         format: c_int,
     ) -> Result<Values<'arena>> {
+        let (collections, collections_stride) = collections.strided(tasks.count)?;
         let mut offsets: *mut ustore_length_t = ptr::null_mut();
         let mut lengths: *mut ustore_length_t = ptr::null_mut();
         let mut tape: *mut ustore_byte_t = ptr::null_mut();
@@ -957,11 +1076,11 @@ impl View<'_> {
             transaction: self.transaction(),
             snapshot: self.snapshot(),
             arena: arena.slot(),
-            options: USTORE_OPTIONS_DEFAULT_K,
+            options: self.options(),
             type_: format,
             tasks_count: tasks.count as ustore_size_t,
-            collections: &collection.0,
-            collections_stride: 0,
+            collections,
+            collections_stride,
             keys: tasks.keys,
             keys_stride: tasks.keys_stride,
             fields: tasks.fields,
@@ -994,15 +1113,16 @@ struct StridedTasks {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{Configuration, Database};
+    use crate::blobs::Entry;
+    use crate::db::{Collection, Collections, Configuration, Conflicts, Database};
 
     /// A database holding Ada under key one and Grace under key two.
     fn populated() -> (Database, Arena) {
         let database = Database::open(Configuration::in_memory()).unwrap();
         let mut arena = Arena::new();
         let documents = [
-            Entry::new(1, br#"{"name":"Ada","born":1815,"languages":["English","French"]}"#).unwrap(),
-            Entry::new(2, br#"{"name":"Grace","born":"1906","navy":{"rank":"Rear Admiral"}}"#).unwrap(),
+            DocumentEntry::<Json>::new(1, r#"{"name":"Ada","born":1815,"languages":["English","French"]}"#).unwrap(),
+            DocumentEntry::<Json>::new(2, r#"{"name":"Grace","born":"1906","navy":{"rank":"Rear Admiral"}}"#).unwrap(),
         ];
         database
             .head()
@@ -1042,7 +1162,7 @@ mod tests {
     fn documents_refuse_text_that_is_not_json() {
         let database = Database::open(Configuration::in_memory()).unwrap();
         let mut arena = Arena::new();
-        let documents = [Entry::new(1, b"{\"name\":").unwrap()];
+        let documents = [DocumentEntry::<Json>::new(1, "{\"name\":").unwrap()];
         let failure = database
             .head()
             .write_documents(
@@ -1059,7 +1179,7 @@ mod tests {
     #[test]
     fn documents_insert_once_and_update_in_place() {
         let (database, mut arena) = populated();
-        let again = [Entry::new(1, br#"{"name":"Someone else"}"#).unwrap()];
+        let again = [DocumentEntry::<Json>::new(1, r#"{"name":"Someone else"}"#).unwrap()];
         let failure = database
             .head()
             .write_documents(
@@ -1072,7 +1192,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(failure.status, Status::AlreadyExists);
 
-        let fresh = [Entry::new(3, br#"{"name":"Katherine"}"#).unwrap()];
+        let fresh = [DocumentEntry::<Json>::new(3, r#"{"name":"Katherine"}"#).unwrap()];
         database
             .head()
             .write_documents(
@@ -1084,7 +1204,7 @@ mod tests {
             )
             .unwrap();
 
-        let merge = [Entry::new(3, br#"{"born":1918}"#).unwrap()];
+        let merge = [DocumentEntry::<Json>::new(3, r#"{"born":1918}"#).unwrap()];
         database
             .head()
             .write_documents(
@@ -1095,7 +1215,7 @@ mod tests {
                 Durability::Buffered,
             )
             .unwrap();
-        let patch = [Entry::new(3, br#"[{"op":"add","path":"/surname","value":"Johnson"}]"#).unwrap()];
+        let patch = [DocumentEntry::<Json>::new(3, r#"[{"op":"add","path":"/surname","value":"Johnson"}]"#).unwrap()];
         database
             .head()
             .write_documents(
@@ -1124,7 +1244,7 @@ mod tests {
     #[test]
     fn a_patch_that_does_not_apply_is_refused() {
         let (database, mut arena) = populated();
-        let patch = [Entry::new(1, br#"[{"op":"remove","path":"/nowhere"}]"#).unwrap()];
+        let patch = [DocumentEntry::<Json>::new(1, r#"[{"op":"remove","path":"/nowhere"}]"#).unwrap()];
         let failure = database
             .head()
             .write_documents(
@@ -1139,7 +1259,7 @@ mod tests {
 
         // An update or a patch replaces what exists, so a missing document refuses both.
         for modification in [Modification::Update, Modification::Patch] {
-            let modifier = [Entry::new(42, br#"[]"#).unwrap()];
+            let modifier = [DocumentEntry::<Json>::new(42, r#"[]"#).unwrap()];
             let failure = database
                 .head()
                 .write_documents(
@@ -1390,7 +1510,7 @@ mod tests {
         let database = Database::open(Configuration::in_memory()).unwrap();
         let mut arena = Arena::new();
         let document = format!("{{\"{}\":1}}", "k".repeat(600));
-        let documents = [Entry::new(1, document.as_bytes()).unwrap()];
+        let documents = [DocumentEntry::<Json>::new(1, &document).unwrap()];
         database
             .head()
             .write_documents(
@@ -1491,10 +1611,193 @@ mod tests {
     }
 
     #[test]
+    fn whole_documents_are_written_as_scalars_and_strings() {
+        let database = Database::open(Configuration::in_memory()).unwrap();
+        let mut arena = Arena::new();
+        let head = database.head();
+        let main = Collection::main();
+        let upsert = Modification::Upsert;
+        let buffered = Durability::Buffered;
+
+        let born = 1815i64;
+        head.write_documents(
+            &mut arena,
+            main,
+            &[DocumentEntry::<i64>::new(1, &born).unwrap()],
+            upsert,
+            buffered,
+        )
+        .unwrap();
+        let height = 1.65f64;
+        head.write_documents(
+            &mut arena,
+            main,
+            &[DocumentEntry::<f64>::new(2, &height).unwrap()],
+            upsert,
+            buffered,
+        )
+        .unwrap();
+        let countess = true;
+        head.write_documents(
+            &mut arena,
+            main,
+            &[DocumentEntry::<bool>::new(3, &countess).unwrap()],
+            upsert,
+            buffered,
+        )
+        .unwrap();
+        head.write_documents(
+            &mut arena,
+            main,
+            &[DocumentEntry::<Text>::new(4, "Countess of Lovelace").unwrap()],
+            upsert,
+            buffered,
+        )
+        .unwrap();
+
+        // A document that is one scalar reads back as the JSON that scalar prints as.
+        let documents = head.read_documents(&mut arena, main, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(text(&documents, 0), Some("1815"));
+        assert_eq!(text(&documents, 1), Some("1.65"));
+        assert_eq!(text(&documents, 2), Some("true"));
+        assert_eq!(text(&documents, 3), Some(r#""Countess of Lovelace""#));
+    }
+
+    #[test]
+    fn one_batch_of_documents_mixes_writes_and_removals() {
+        let (database, mut arena) = populated();
+        let batch = [
+            DocumentEntry::<Json>::new(1, r#"{"name":"Someone else"}"#).unwrap(),
+            DocumentEntry::<Json>::removal(2),
+        ];
+        database
+            .head()
+            .write_documents(
+                &mut arena,
+                Collection::main(),
+                &batch,
+                Modification::Upsert,
+                Durability::Buffered,
+            )
+            .unwrap();
+        let documents = database
+            .head()
+            .read_documents(&mut arena, Collection::main(), &[1, 2])
+            .unwrap();
+        assert_eq!(text(&documents, 0), Some(r#"{"name":"Someone else"}"#));
+        assert_eq!(documents.get(1), None, "an entry without a document removes its key");
+    }
+
+    #[test]
+    fn one_batch_of_documents_spans_several_collections() {
+        let database = Database::open(Configuration::in_memory()).unwrap();
+        let mut arena = Arena::new();
+        let people = database.create_collection(&mut arena, "people").unwrap();
+        let places = database.create_collection(&mut arena, "places").unwrap();
+        let spanned = [people, places];
+
+        let documents = [
+            DocumentEntry::<Json>::new(1, r#"{"name":"Ada"}"#).unwrap(),
+            DocumentEntry::<Json>::new(1, r#"{"name":"Kent"}"#).unwrap(),
+        ];
+        database
+            .head()
+            .write_documents(
+                &mut arena,
+                spanned.as_slice(),
+                &documents,
+                Modification::Upsert,
+                Durability::Buffered,
+            )
+            .unwrap();
+
+        let fields = [FieldAddress::new(1, c"name"), FieldAddress::new(1, c"name")];
+        let names = database
+            .head()
+            .read_fields::<Text>(&mut arena, Collections::Each(&spanned), &fields)
+            .unwrap();
+        assert_eq!((text(&names, 0), text(&names, 1)), (Some("Ada"), Some("Kent")));
+
+        let columns = [Column::new::<Text>(c"name")];
+        let table = database
+            .head()
+            .gather(&mut arena, Collections::Each(&spanned), &[1, 1], &columns)
+            .unwrap();
+        assert_eq!(table.strings(0).unwrap().get(1), Some(b"Kent".as_slice()));
+
+        // A run of collections that is not one per task is refused before the call.
+        let failure = database
+            .head()
+            .gather(&mut arena, Collections::Each(&spanned), &[1], &columns)
+            .unwrap_err();
+        assert_eq!(failure.status, Status::InvalidArgument);
+    }
+
+    #[test]
+    fn gathers_fill_halves_and_uuids() {
+        let database = Database::open(Configuration::in_memory()).unwrap();
+        let mut arena = Arena::new();
+        let documents = [
+            DocumentEntry::<Json>::new(
+                1,
+                r#"{"weight":1.5,"id":"123e4567-e89b-12d3-a456-426614174000","huge":70000.0}"#,
+            )
+            .unwrap(),
+            DocumentEntry::<Json>::new(2, r#"{"weight":0.0,"id":"not a uuid","huge":1.0}"#).unwrap(),
+        ];
+        database
+            .head()
+            .write_documents(
+                &mut arena,
+                Collection::main(),
+                &documents,
+                Modification::Upsert,
+                Durability::Buffered,
+            )
+            .unwrap();
+
+        let columns = [
+            Column::new::<Half>(c"weight"),
+            Column::new::<Uuid>(c"id"),
+            Column::new::<Half>(c"huge"),
+        ];
+        let table = database
+            .head()
+            .gather(&mut arena, Collection::main(), &[1, 2], &columns)
+            .unwrap();
+
+        // A half is two bytes the caller reinterprets; 1.5 is sign zero, exponent fifteen, mantissa one half.
+        let weights = table.scalars::<Half>(0).unwrap();
+        assert_eq!(weights, &[Half(0x3e00), Half(0)]);
+        assert!(table.validities(0).unwrap().get(0) && table.validities(0).unwrap().get(1));
+
+        let identifiers = table.scalars::<Uuid>(1).unwrap();
+        assert_eq!(
+            identifiers[0],
+            Uuid([0x12, 0x3e, 0x45, 0x67, 0xe8, 0x9b, 0x12, 0xd3, 0xa4, 0x56, 0x42, 0x66, 0x14, 0x17, 0x40, 0x00])
+        );
+        assert_eq!(
+            identifiers[1],
+            Uuid::default(),
+            "text that is no UUID leaves its cell zero"
+        );
+        assert!(table.collisions(1).unwrap().get(1));
+
+        // A magnitude past the range of a half collides rather than rounding to infinity.
+        assert!(table.collisions(2).unwrap().get(0));
+        assert_eq!(table.scalars::<Half>(2).unwrap()[0], Half(0));
+        assert_eq!(
+            table.scalars::<f32>(0).unwrap_err().status,
+            Status::InvalidArgument,
+            "a half column is not a float column"
+        );
+    }
+
+    #[test]
     fn empty_batches_reach_no_engine() {
         let (database, mut arena) = populated();
         let head = database.head();
-        head.write_documents(
+        head.write_documents::<Json>(
             &mut arena,
             Collection::main(),
             &[],
@@ -1549,7 +1852,7 @@ mod tests {
         let mut transaction = database.transaction().unwrap();
         let rank = [FieldEntry::<Text>::new(2, c"/navy/rank", "Commodore").unwrap()];
         transaction
-            .view()
+            .view(Conflicts::Watched)
             .write_fields(
                 &mut arena,
                 Collection::main(),
@@ -1559,7 +1862,7 @@ mod tests {
             )
             .unwrap();
         let flushed = transaction
-            .view()
+            .view(Conflicts::Watched)
             .write_fields(
                 &mut arena,
                 Collection::main(),
@@ -1572,7 +1875,7 @@ mod tests {
 
         let address = [FieldAddress::new(2, c"/navy/rank")];
         let inside = transaction
-            .view()
+            .view(Conflicts::Watched)
             .read_fields::<Text>(&mut arena, Collection::main(), &address)
             .unwrap();
         assert_eq!(text(&inside, 0), Some("Commodore"));

@@ -38,6 +38,21 @@ GATHER_TYPES = {
     "bytes": "bytes",
 }
 
+# A column of these dtypes is written as raw scalars, so nothing is printed as JSON and parsed back.
+WRITE_TYPES = {
+    "float64": "f64",
+    "float32": "f32",
+    "int64": "i64",
+    "int32": "i32",
+    "int16": "i16",
+    "int8": "i8",
+    "uint64": "u64",
+    "uint32": "u32",
+    "uint16": "u16",
+    "uint8": "u8",
+    "bool": "bool",
+}
+
 NULLABLE_DTYPES = {
     "float64": "Float64",
     "float32": "Float32",
@@ -64,6 +79,14 @@ def encode_json(value: Any) -> str:
         raise TypeError(f"Cannot spell {type(unknown).__name__} as JSON")
 
     return json.dumps(value, default=fallback)
+
+
+def scalar_column(values: Any) -> tuple[numpy.ndarray, str] | None:
+    """One flat NumPy column of a dtype the store writes as raw scalars, or None for anything else."""
+    if not isinstance(values, numpy.ndarray) or values.ndim != 1:
+        return None
+    kind = WRITE_TYPES.get(values.dtype.name)
+    return (numpy.ascontiguousarray(values), kind) if kind else None
 
 
 def column_of(pointer: str) -> str:
@@ -207,9 +230,8 @@ class Table:
 
     # region Exports
 
-    def to_pandas(self) -> pandas.DataFrame:
-        keys = self.index
-        columns = self.columns
+    def page_frame(self, keys: list[int], columns: list[str]) -> pandas.DataFrame:
+        """The rows `keys` hold, gathered and decoded in one round of calls."""
         data: dict[str, Any] = {}
 
         typed = [column for column in columns if column in self.dtypes]
@@ -231,6 +253,22 @@ class Table:
         frame = pandas.DataFrame({column: data[column] for column in columns}, index=pandas.Index(keys, dtype="int64"))
         return frame if columns else pandas.DataFrame(index=pandas.Index(keys, dtype="int64"))
 
+    def to_pandas(self, *, page: int | None = None) -> pandas.DataFrame:
+        """Every row as a `DataFrame`, converting `page` rows at a time when a page size is given.
+
+        Only one page of gathered columns and decoded documents is live at a time, so a collection
+        larger than memory allows still converts, at the cost of one concatenation at the end.
+        """
+        keys = self.index
+        columns = self.columns
+        if page is None:
+            return self.page_frame(keys, columns)
+        if page < 1:
+            raise ValueError(f"A page holds at least one row, got {page}")
+        if not keys:
+            return self.page_frame(keys, columns)
+        return pandas.concat(self.page_frame(list(rows), columns) for rows in batched(keys, page))
+
     def to_csv(self, path_or_buffer: Any = None, **options: Any) -> str | None:
         return self.to_pandas().to_csv(path_or_buffer, **options)
 
@@ -250,6 +288,13 @@ class Table:
         if isinstance(values, (str, bytes)) or not isinstance(values, Iterable):
             self.view.docs_write(keys, encode_json(values), field=column, collection=self.collection)
             return
+        scalars = scalar_column(values)
+        if scalars is not None:
+            typed, kind = scalars
+            if len(typed) != len(keys):
+                raise ValueError(f"Got {len(typed)} values for {len(keys)} rows")
+            self.view.docs_write(keys, typed, field=column, type=kind, collection=self.collection)
+            return
         encoded = [encode_json(value) for value in values]
         if len(encoded) != len(keys):
             raise ValueError(f"Got {len(encoded)} values for {len(keys)} rows")
@@ -260,11 +305,18 @@ class Table:
         present = set(self.index)
         for column in other.columns:
             series = other[column]
-            cells = [(int(key), value) for key, value in series[series.notna()].items() if int(key) in present]
-            if cells:
-                keys, values = zip(*cells, strict=True)
-                encoded = [encode_json(value) for value in values]
-                self.view.docs_write(keys, encoded, field=column, collection=self.collection)
+            written = series[series.notna()]
+            rows = [int(key) for key in written.index if int(key) in present]
+            if not rows:
+                continue
+            selected = written.loc[rows]
+            scalars = scalar_column(selected.to_numpy())
+            if scalars is not None:
+                typed, kind = scalars
+                self.view.docs_write(rows, typed, field=column, type=kind, collection=self.collection)
+                continue
+            encoded = [encode_json(value) for value in selected]
+            self.view.docs_write(rows, encoded, field=column, collection=self.collection)
 
     def present_rows(self, column: str) -> tuple[list[int], list[memoryview]]:
         """The keys of the rows holding `column`, and the JSON text of the value each holds."""

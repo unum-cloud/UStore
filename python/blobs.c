@@ -426,6 +426,75 @@ PyObject* ustore_py_api_pop(PyObject* self, PyObject* const* args, Py_ssize_t po
 
 #pragma region Scans
 
+/**
+ *  @brief The per-request limits one batch scan or sample carries.
+ *
+ *  A batch small enough lays its limits on the stack, and one allocation backs the rest, matching
+ *  what a batch of keys does beside it.
+ */
+typedef struct limits_t {
+
+    /** The limits, aliasing whichever storage the fields below name. */
+    ustore_length_t* limits;
+
+    /** Requests the batch holds. */
+    size_t count;
+
+    /** The heap block backing @c limits, or NULL when they sit inline. */
+    ustore_length_t* owned;
+
+    /** Storage for a batch that fits without the heap. */
+    ustore_length_t inline_limits[ustore_py_keys_inline_k];
+} limits_t;
+
+/** Releases whatever @c limits_from_object acquired. */
+static void limits_release(limits_t* batch) {
+    if (batch->owned) PyMem_Free(batch->owned);
+    batch->owned = NULL;
+    batch->limits = NULL;
+    batch->count = 0;
+}
+
+/**
+ *  @brief Gathers one limit per request from a sequence of non-negative integers.
+ *  @param[in] object The limits, as a sequence or anything indexing into one.
+ *  @param[out] batch The limits and whatever storage gathering them needed.
+ *  @return 0 on success, -1 with an exception set otherwise.
+ */
+static int limits_from_object(PyObject* object, limits_t* batch) {
+    memset(batch, 0, sizeof(*batch));
+    PyObject* const sequence = PySequence_Fast(object, "Expected a sequence of per-request limits");
+    if (!sequence) return -1;
+    Py_ssize_t const count = PySequence_Fast_GET_SIZE(sequence);
+
+    if (count == 0) { batch->limits = NULL; }
+    else if ((size_t)count <= ustore_py_keys_inline_k) { batch->limits = batch->inline_limits; }
+    else {
+        batch->owned = (ustore_length_t*)PyMem_Malloc((size_t)count * sizeof(ustore_length_t));
+        if (!batch->owned) {
+            Py_DECREF(sequence);
+            PyErr_NoMemory();
+            return -1;
+        }
+        batch->limits = batch->owned;
+    }
+
+    for (Py_ssize_t entry_index = 0; entry_index != count; ++entry_index) {
+        size_t limit = 0;
+        if (ustore_py_size_from_object(PySequence_Fast_GET_ITEM(sequence, entry_index), "count", &limit) != 0 ||
+            limit > UINT32_MAX) {
+            if (!PyErr_Occurred()) PyErr_SetString(PyExc_ValueError, "One request returns at most 4294967295 keys");
+            Py_DECREF(sequence);
+            limits_release(batch);
+            return -1;
+        }
+        batch->limits[entry_index] = (ustore_length_t)limit;
+    }
+    Py_DECREF(sequence);
+    batch->count = (size_t)count;
+    return 0;
+}
+
 char const doc_scan[] =                                                                   //
     "scan(start, count, *, collection=None, snapshot=0) answers a Keys tape.\n"           //
     "\n"                                                                                  //
@@ -494,6 +563,87 @@ PyObject* ustore_py_api_scan(PyObject* self, PyObject* const* args, Py_ssize_t p
     return ustore_py_keys_adopt(arena, found, offsets, counts, 1);
 }
 
+char const doc_scan_batch[] =                                                              //
+    "scan_batch(starts, counts, *, collection=None, snapshot=0) answers a Keys tape.\n"    //
+    "\n"                                                                                   //
+    "Runs many scans in one call, which is what the ABI takes and what an engine can\n"    //
+    "spread across its threads; indexing the answer by request gives the run that\n"       //
+    "request found. Limits differ per request, so a walk that resumes several ranges at\n" //
+    "once asks for exactly what each one still needs.\n"                                   //
+    "\n"                                                                                   //
+    "Args:\n"                                                                              //
+    "  starts (Sequence[int] | buffer): The smallest key every scan may return.\n"         //
+    "  counts (Sequence[int]): Most keys every scan returns, one limit per start.\n"       //
+    "  collection (int | str, optional): The collection, by identifier or by name.\n"      //
+    "  snapshot (int, optional): The snapshot to scan; 0 scans the head.\n"                //
+    "Returns:\n"                                                                           //
+    "  Keys: One run of ascending keys per request, in the order they were asked for.";
+
+PyObject* ustore_py_api_scan_batch(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                                   PyObject* args_names_tuple) {
+    ustore_py_context_t context;
+    if (ustore_py_context_from_object(self, &context) != 0) return NULL;
+    if (ustore_py_args_names_count_checked("scan_batch", positional_args_count, args_names_tuple, 2) < 0) return NULL;
+
+    ustore_py_verb_options_t options;
+    if (ustore_py_verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0)
+        return NULL;
+
+    ustore_py_keys_t starts;
+    if (ustore_py_keys_from_object(args[0], &starts) != 0) return NULL;
+    limits_t limits;
+    if (limits_from_object(args[1], &limits) != 0) {
+        ustore_py_keys_release(&starts);
+        return NULL;
+    }
+    if (limits.count != starts.count) {
+        PyErr_Format(PyExc_ValueError, "Got %zu limits for %zu starts", limits.count, starts.count);
+        limits_release(&limits);
+        ustore_py_keys_release(&starts);
+        return NULL;
+    }
+
+    ustore_length_t* offsets = NULL;
+    ustore_length_t* counts = NULL;
+    ustore_key_t* found = NULL;
+    ustore_error_t error = {0};
+    ustore_arena_t arena = ustore_py_arena_claim(context.database);
+
+    // A batch of no requests answers an empty tape, which the ABI has no address to write into.
+    if (starts.count) {
+        ustore_scan_t scan = {0};
+        scan.db = context.database->handle;
+        scan.error = &error;
+        scan.transaction = context.transaction;
+        scan.snapshot = options.snapshot;
+        scan.arena = &arena;
+        scan.options = options.options;
+        scan.tasks_count = starts.count;
+        scan.collections = &options.collection;
+        scan.start_keys = starts.keys;
+        scan.start_keys_stride = sizeof(ustore_key_t);
+        scan.count_limits = limits.limits;
+        scan.count_limits_stride = sizeof(ustore_length_t);
+        scan.offsets = &offsets;
+        scan.counts = &counts;
+        scan.keys = &found;
+
+        Py_BEGIN_ALLOW_THREADS;
+        ustore_scan(&scan);
+        Py_END_ALLOW_THREADS;
+    }
+
+    size_t const tasks_count = starts.count;
+    limits_release(&limits);
+    ustore_py_keys_release(&starts);
+    if (error.status != ustore_success_k) {
+        ustore_py_arena_return(context.database, arena);
+        ustore_py_raise_on_error(&error);
+        return NULL;
+    }
+    return ustore_py_keys_adopt(arena, found, offsets, counts, tasks_count);
+}
+
 char const doc_sample[] =                                                                 //
     "sample(count, *, collection=None, snapshot=0) answers a Keys tape.\n"                //
     "\n"                                                                                  //
@@ -555,6 +705,70 @@ PyObject* ustore_py_api_sample(PyObject* self, PyObject* const* args, Py_ssize_t
         return NULL;
     }
     return ustore_py_keys_adopt(arena, found, offsets, counts, 1);
+}
+
+char const doc_sample_batch[] =                                                            //
+    "sample_batch(counts, *, collection=None, snapshot=0) answers a Keys tape.\n"          //
+    "\n"                                                                                   //
+    "Draws many independent samples in one call, one per limit, which is how a workload\n" //
+    "builds several disjoint batches without paying for a call each.\n"                    //
+    "\n"                                                                                   //
+    "Args:\n"                                                                              //
+    "  counts (Sequence[int]): Keys every sample draws, one limit per request.\n"          //
+    "  collection (int | str, optional): The collection, by identifier or by name.\n"      //
+    "  snapshot (int, optional): The snapshot to sample; 0 samples the head.\n"            //
+    "Returns:\n"                                                                           //
+    "  Keys: One run of keys per request, in no particular order.";
+
+PyObject* ustore_py_api_sample_batch(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                                     PyObject* args_names_tuple) {
+    ustore_py_context_t context;
+    if (ustore_py_context_from_object(self, &context) != 0) return NULL;
+    if (ustore_py_args_names_count_checked("sample_batch", positional_args_count, args_names_tuple, 1) < 0) return NULL;
+
+    ustore_py_verb_options_t options;
+    if (ustore_py_verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0)
+        return NULL;
+
+    limits_t limits;
+    if (limits_from_object(args[0], &limits) != 0) return NULL;
+
+    ustore_length_t* offsets = NULL;
+    ustore_length_t* counts = NULL;
+    ustore_key_t* found = NULL;
+    ustore_error_t error = {0};
+    ustore_arena_t arena = ustore_py_arena_claim(context.database);
+
+    // A batch of no requests answers an empty tape, which the ABI has no address to write into.
+    if (limits.count) {
+        ustore_sample_t sample = {0};
+        sample.db = context.database->handle;
+        sample.error = &error;
+        sample.transaction = context.transaction;
+        sample.snapshot = options.snapshot;
+        sample.arena = &arena;
+        sample.options = options.options;
+        sample.tasks_count = limits.count;
+        sample.collections = &options.collection;
+        sample.count_limits = limits.limits;
+        sample.count_limits_stride = sizeof(ustore_length_t);
+        sample.offsets = &offsets;
+        sample.counts = &counts;
+        sample.keys = &found;
+
+        Py_BEGIN_ALLOW_THREADS;
+        ustore_sample(&sample);
+        Py_END_ALLOW_THREADS;
+    }
+
+    size_t const tasks_count = limits.count;
+    limits_release(&limits);
+    if (error.status != ustore_success_k) {
+        ustore_py_arena_return(context.database, arena);
+        ustore_py_raise_on_error(&error);
+        return NULL;
+    }
+    return ustore_py_keys_adopt(arena, found, offsets, counts, tasks_count);
 }
 
 char const doc_measure[] =                                                              //

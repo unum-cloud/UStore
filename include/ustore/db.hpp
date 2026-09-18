@@ -15,14 +15,15 @@
 #include <string_view> // `std::string_view`
 #include <utility>     // `std::exchange`, `std::forward`, `std::move`, `std::swap`
 
-#include <ustore/blobs_collection.hpp> // `blobs_collection_t`
-#include <ustore/blobs_ref.hpp>        // `blobs_ref`
-#include <ustore/docs_collection.hpp>  // `docs_collection_t`
-#include <ustore/graph_collection.hpp> // `graph_collection_t`
-#include <ustore/ranges.hpp>           // `strided_range`
-#include <ustore/ranges_args.hpp>      // `keys_view_t`, `places_arg_t`
-#include <ustore/status.hpp>           // `status_t`, `expected`
-#include <ustore/types.hpp>            // `arena_t`, `collection_key_t`, `collection_key_field_t`
+#include <ustore/blobs_collection.hpp>   // `blobs_collection_t`
+#include <ustore/blobs_ref.hpp>          // `blobs_ref`
+#include <ustore/docs_collection.hpp>    // `docs_collection_t`
+#include <ustore/graph_collection.hpp>   // `graph_collection_t`
+#include <ustore/ranges.hpp>             // `strided_range`
+#include <ustore/ranges_args.hpp>        // `keys_view_t`, `places_arg_t`
+#include <ustore/status.hpp>             // `status_t`, `expected`
+#include <ustore/strings_collection.hpp> // `strings_collection_t`
+#include <ustore/types.hpp>              // `arena_t`, `collection_key_t`, `collection_key_field_t`
 #include <ustore/ustore.h>
 
 namespace unum::ustore {
@@ -39,57 +40,23 @@ using collections_list_t = std::span<ustore_collection_t>;
  */
 inline expected<ustore_collection_t> collection_named(ustore_database_t database, ustore_transaction_t transaction,
                                                       ustore_arena_t* arena, std::string_view name) noexcept {
-    ustore_error_t error {};
-    ustore_str_view_t const text = name.data();
-    auto const text_length = static_cast<ustore_length_t>(name.size());
-    ustore_collection_t const names = ustore_collection_names_k;
-    ustore_length_t* offsets = nullptr;
-    ustore_length_t* lengths = nullptr;
-    ustore_byte_t* values = nullptr;
-    ustore_strings_read_t read {};
-    read.db = database;
-    read.error = &error;
-    read.transaction = transaction;
-    read.arena = arena;
-    read.tasks_count = 1;
-    read.collections = &names;
-    read.strings = &text;
-    read.strings_lengths = &text_length;
-    read.offsets = &offsets;
-    read.lengths = &lengths;
-    read.values = &values;
-
-    ustore_strings_read(&read);
-    if (error.status) return status_t {error};
-    if (lengths[0] != sizeof(ustore_collection_t)) return status_t {status_code_t::not_found_k, "No such collection"};
+    strings_collection_t names {database, ustore_collection_names_k, transaction, {}, arena};
+    auto maybe_stored = names.value(name);
+    if (!maybe_stored) return maybe_stored.status();
+    if (maybe_stored->size() != sizeof(ustore_collection_t))
+        return status_t {status_code_t::not_found_k, "No such collection"};
 
     ustore_collection_t found = ustore_collection_main_k;
-    std::memcpy(&found, values + offsets[0], sizeof(found));
+    std::memcpy(&found, maybe_stored->data(), sizeof(found));
     return found;
 }
 
 /** Records that @p name addresses @p collection, or removes the name when no collection is given. */
 inline status_t name_collection(ustore_database_t database, ustore_arena_t* arena, std::string_view name,
                                 ustore_collection_t const* collection) noexcept {
-    ustore_error_t error {};
-    ustore_str_view_t const text = name.data();
-    auto const text_length = static_cast<ustore_length_t>(name.size());
-    ustore_collection_t const names = ustore_collection_names_k;
-    auto const value = reinterpret_cast<ustore_bytes_cptr_t>(collection);
-    ustore_length_t const value_length = sizeof(ustore_collection_t);
-    ustore_strings_write_t write {};
-    write.db = database;
-    write.error = &error;
-    write.arena = arena;
-    write.tasks_count = 1;
-    write.collections = &names;
-    write.strings = &text;
-    write.strings_lengths = &text_length;
-    write.values = collection ? &value : nullptr;
-    write.values_lengths = collection ? &value_length : nullptr;
-
-    ustore_strings_write(&write);
-    return status_t {error};
+    strings_collection_t names {database, ustore_collection_names_k, nullptr, {}, arena};
+    if (!collection) return names.erase(name);
+    return names.assign(name, value_view_t {reinterpret_cast<byte_t const*>(collection), sizeof(*collection)});
 }
 
 /** Whether @p status only says the engine keeps no collections of its own, so no name can be stored. */
