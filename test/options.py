@@ -1,8 +1,9 @@
 """The options a verb takes as keywords, chiefly the watch one call keeps or drops inside a transaction."""
 
 import pytest
-import ustore
 from capabilities import ISOLATIONS, NEEDS_SNAPSHOTS, NEEDS_TRANSACTIONS
+
+import ustore
 
 pytestmark = NEEDS_TRANSACTIONS
 

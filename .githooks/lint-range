@@ -1,0 +1,20 @@
+#!/usr/bin/env sh
+# Runs the pre-commit checks over every change since a base revision, the way a commit would see them.
+#
+#   .githooks/lint-range              every tracked file, as if the tree were one commit
+#   .githooks/lint-range main-dev     only what this branch adds
+set -eu
+
+base=${1:-}
+case "$base" in
+"" | 0000000000000000000000000000000000000000) base=$(git hash-object -t tree /dev/null) ;;
+esac
+
+# The hook reads the index, so it gets a private one and the real index stays as the author left it.
+GIT_INDEX_FILE=$(mktemp)
+export GIT_INDEX_FILE
+trap 'rm -f "$GIT_INDEX_FILE"' EXIT
+
+git read-tree "$base"
+git add -A
+.githooks/pre-commit

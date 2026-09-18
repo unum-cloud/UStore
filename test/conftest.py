@@ -4,7 +4,6 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
-import ustore
 from capabilities import (
     ENGINE,
     NEEDS_TRANSACTIONS,
@@ -13,6 +12,8 @@ from capabilities import (
     SUPPORTS_TRANSACTIONS,
     config,
 )
+
+import ustore
 
 
 def pytest_report_header() -> list[str]:

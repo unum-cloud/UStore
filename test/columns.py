@@ -5,6 +5,7 @@ import struct
 
 import numpy
 import pytest
+
 from ustore.table_view import WRITE_TYPES, Table
 
 # A NumPy dtype, the type name a write spells it as, and the values a column carries.

@@ -9,6 +9,7 @@ import os
 import tempfile
 
 import pytest
+
 import ustore
 
 ENGINE = ustore.engines_compiled()[0]

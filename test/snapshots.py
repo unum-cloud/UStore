@@ -1,8 +1,9 @@
 """Snapshots over the C ABI: capturing a point in time and reading it back through every read verb."""
 
 import pytest
-import ustore
 from capabilities import NEEDS_SNAPSHOTS
+
+import ustore
 
 pytestmark = NEEDS_SNAPSHOTS
 

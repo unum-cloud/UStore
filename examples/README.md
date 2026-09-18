@@ -1,34 +1,39 @@
 # Examples
 
-Six scripts and one notebook over the pre-v1 Python API, each putting one modality of the database to work.
+Six scripts over the v1 Python API, each putting one modality of the database to work.
 
-__None of them run today.__
-Every one imports `ustore.smashtable`, the pybind11 layer being removed, and the CPython core in `python/` exposes only its version and the engines it compiled.
-They are written against the Wave 4 bindings, so until those land these files are read rather than executed.
+They target the CPython extension `ustore.lib` and the pure-Python views beside it, so a script runs as soon as the wheel is installed and whatever it draws with is installed too.
+`consistent_dict.py`, `community.py` and `movie_recommendations.py` need nothing the project does not already test with.
+`dataloader.py` waits on PyTorch, `browser.py` on Streamlit, and `banks_atm_olap.py` on the RAPIDS stack, so those three run only where those are present.
 
 ## The Examples
 
-| Example                    | What It Shows                             | What It Needs                  |
-| :------------------------- | :---------------------------------------- | :----------------------------- |
-| `banks_atm_olap.py`        | Batched rows packed into one blob per key | `cudf`, `cuxfilter`, `pyarrow` |
-| `banks_atm_olap.ipynb`     | The same store and dashboard, inline      | The same, plus Jupyter         |
-| `browser.py`               | Documents, a graph and images in one app  | `streamlit`, `requests`        |
-| `community.py`             | Louvain communities over a graph          | `networkx`, `matplotlib`       |
-| `consistent_dict.py`       | A `dict` timed against a collection       | `numpy`                        |
-| `dataloader.py`            | Collection keys batched into a loader     | `torch`                        |
-| `movie_recommendations.py` | Two graphs edited in one transaction      | `networkx`, `requests`         |
+- __`banks_atm_olap.py`__ — batched rows packed into one blob per key, then aggregated on the GPU. Needs `cudf`, `cuxfilter` and `pyarrow`.
+- __`browser.py`__ — documents, a graph and images browsed side by side in one app. Needs `streamlit` and `requests`.
+- __`community.py`__ — Louvain communities over a graph collection, drawn. Needs `networkx` and `matplotlib`.
+- __`consistent_dict.py`__ — a native `dict` timed against a collection over the same keys. Needs `numpy`.
+- __`dataloader.py`__ — collection keys batched into a PyTorch loader. Needs `torch`.
+- __`movie_recommendations.py`__ — recommendations over two graphs, then both edited in one transaction. Needs `matplotlib` and `requests`.
 
 Each script opens with a docstring naming what it demonstrates, what it needs installed and how to run it.
 
 ## Modalities
 
-`consistent_dict.py` and `dataloader.py` stay on plain binary collections, the first timing a native `dict` against a persistent one across writes, reads, scans and sampling, the second handing a collection straight to a PyTorch `DataLoader` as a map-style dataset.
+`consistent_dict.py` and `dataloader.py` stay on plain binary collections.
+The first times a native `dict` against a persistent one across three write paths, two read paths, a full scan and the engine's sampling, where `write` given one value broadcasts it across a whole key array.
+The second wraps a collection as a map-style dataset for a PyTorch `DataLoader`, with a sampler that draws keys either from `scan_keys` or from the engine's own `sample`.
 
-`community.py` and `movie_recommendations.py` work on graph collections.
-The first mirrors Zachary's karate club into the database and partitions it both with the engine's own Louvain and with NetworkX, so the two answers can be compared.
-The second walks a follow graph and a views graph to rank unseen movies, then edits both graphs in a single transaction when the user dislikes a recommendation.
+`community.py` and `movie_recommendations.py` work on graph collections through the NetworkX-compatible views in `ustore.graph_view`.
+The first mirrors Zachary's karate club into a graph collection, reads the edges back out and partitions both copies with Louvain, so the two answers can be compared.
+The second walks a follow graph and a views graph to rank unseen movies, then edits both graphs in a single transaction when the user dislikes a recommendation, and publishes a movie's document beside its poster blob in another.
 
 `browser.py` renders documents, a graph and images from one database in a Streamlit app, and `banks_atm_olap.py` packs whole batches of ATM withdrawals into fixed-width blobs, one key per batch, then aggregates them on the GPU behind a choropleth map.
+
+## What Has No Equivalent Yet
+
+The engine's own `community_louvain` is gone, so `community.py` partitions with NetworkX over the edges it reads back out of the graph collection.
+`movie_recommendations.py` draws its bipartite figure with Matplotlib alone rather than through NetworkX, which it no longer needs for anything else.
+There is no media modality, so `browser.py` keeps its photographs in an ordinary binary collection.
 
 ## RAPIDS and cuxfilter
 

@@ -6,6 +6,7 @@ import struct
 
 import numpy
 import pytest
+
 import ustore
 
 BATCH_SIZES = [0, 1, 16, 17, 65, 500]

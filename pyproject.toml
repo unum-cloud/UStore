@@ -79,7 +79,7 @@ USTORE_BUILD_TOOLS_CPP = "OFF"
 
 # Groups rather than extras, so none of this reaches the published wheel's metadata.
 [dependency-groups]
-lint = ["ruff"]
+lint = ["ruff", "clang-format==22.*", "cmakelang"]
 test = ["pytest>=8", "numpy", "pandas", "networkx"]
 
 [tool.pytest.ini_options]
@@ -93,6 +93,10 @@ testpaths = ["test"]
 [tool.ruff.lint.per-file-ignores]
 # cmake-format evaluates its profile with `section` already in scope.
 ".cmake-format.py" = ["F821"]
+
+[tool.ruff.lint.isort]
+# The package is ours, so it sorts after the third-party block rather than inside it.
+known-first-party = ["ustore"]
 
 [tool.ruff]
 line-length = 120

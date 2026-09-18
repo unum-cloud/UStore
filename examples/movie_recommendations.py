@@ -1,6 +1,6 @@
 """Recommends movies from a follow graph, then edits two graphs in one atomic transaction.
 
-Four collections model the same little social network, each in the modality that suits it: people
+Five collections model the same little social network, each in the modality that suits it: people
 and movies as documents, posters as raw binary blobs, and two graphs — who follows whom, and who
 watched what.
 The recommendation walks those graphs: take everyone the user follows, count the movies they
@@ -10,20 +10,23 @@ watched it.
 The last two blocks are the point of the example.
 Disliking a recommendation has to add a view edge and remove several follow edges together, or the
 user could end up unfollowing people while the view that justified it was lost; both land in one
-transaction.
+transaction over the same two graph collections.
 Publishing a new movie likewise writes a document and its poster blob as one unit.
 
-Needs `networkx`, `matplotlib`, `requests` and the `ustore` bindings.
+Needs `matplotlib`, `requests` and the `ustore` bindings.
 Run with `python examples/movie_recommendations.py`.
 """
 
 import json
 from collections import Counter
+from collections.abc import Iterable
+from typing import NamedTuple
 
 import matplotlib.pyplot as plt
-import networkx as nx
 import requests
-import ustore.smashtable as ustore
+
+import ustore
+from ustore.graph_view import DiGraph
 
 FOLLOWS_COLLECTION = "people->people"
 VIEWS_COLLECTION = "people->movies"
@@ -36,6 +39,7 @@ FIRST_MOVIE_KEY = 101
 NEW_MOVIE_KEY = 100
 TOP_RECOMMENDATIONS = 10
 REQUEST_TIMEOUT_SECONDS = 30
+USER_AGENT = "ustore-examples/1.0 (https://github.com/unum-cloud/ustore)"
 
 PEOPLE = {
     ALICE: {"name": "Alice", "lastname": "Bobchinsky", "stars": 1200},
@@ -85,94 +89,140 @@ VIEWS = {
 FOLLOWS = [(ALICE, BOB), (DAVID, ALICE), (DAVID, BOB), (DAVID, CHARLIE)]
 
 
-def flatten(nested):
+class Store(NamedTuple):
+    """The open database beside the two graph views and the three collections keyed by movie or person."""
+
+    database: ustore.Database
+    follows: DiGraph
+    views: DiGraph
+    people: int
+    movies: int
+    posters: int
+
+
+def flatten[Item](nested: Iterable[Iterable[Item]]) -> list[Item]:
     """Concatenates an iterable of iterables into one flat list."""
     return [item for inner in nested for item in inner]
 
 
 def download(link: str) -> bytes:
     """Fetches one poster as raw bytes, which is what a blob collection stores."""
-    return requests.get(link, timeout=REQUEST_TIMEOUT_SECONDS).content
+    response = requests.get(link, timeout=REQUEST_TIMEOUT_SECONDS, headers={"User-Agent": USER_AGENT})
+    response.raise_for_status()
+    return response.content
 
 
-def fill(follows, views, posters, people, movies) -> None:
+def open_store(database: ustore.Database) -> Store:
+    """Creates the five collections and wraps the two graphs in NetworkX-compatible views."""
+    return Store(
+        database=database,
+        follows=DiGraph(database, FOLLOWS_COLLECTION),
+        views=DiGraph(database, VIEWS_COLLECTION),
+        people=database.collection_create(PEOPLE_COLLECTION),
+        movies=database.collection_create(MOVIES_COLLECTION),
+        posters=database.collection_create(POSTERS_COLLECTION),
+    )
+
+
+def fill(store: Store) -> None:
     """Populates all five collections, each through the batch call its modality offers."""
-    people.set(tuple(PEOPLE), tuple(json.dumps(person) for person in PEOPLE.values()))
-    movie_keys = range(FIRST_MOVIE_KEY, FIRST_MOVIE_KEY + len(MOVIES))
-    movies.set(movie_keys, tuple(json.dumps(movie) for movie in MOVIES))
-    posters.set(movie_keys, tuple(download(link) for link in POSTER_LINKS))
+    people = [json.dumps(person) for person in PEOPLE.values()]
+    store.database.docs_write(list(PEOPLE), people, collection=store.people)
 
-    for viewer, watched in VIEWS.items():
-        for movie in watched:
-            views.add_edge(viewer, movie)
-    for follower, followee in FOLLOWS:
-        follows.add_edge(follower, followee)
+    movie_keys = list(range(FIRST_MOVIE_KEY, FIRST_MOVIE_KEY + len(MOVIES)))
+    store.database.docs_write(movie_keys, [json.dumps(movie) for movie in MOVIES], collection=store.movies)
+    store.database.write(movie_keys, [download(link) for link in POSTER_LINKS], collection=store.posters)
+
+    viewers = flatten([viewer] * len(watched) for viewer, watched in VIEWS.items())
+    store.views.add_edges_from_arrays(viewers, flatten(VIEWS.values()))
+    store.follows.add_edges_from_arrays([follower for follower, _ in FOLLOWS], [followee for _, followee in FOLLOWS])
 
 
-def recommend(follows, views, user: int) -> tuple[dict[int, list[int]], list[int]]:
+def recommend(store: Store, user: int) -> tuple[dict[int, list[int]], list[int]]:
     """Ranks unseen movies by how many of the user's followees watched them.
 
     Returns each followee's watch list beside the ranked recommendations, since the caller needs
     both to work out who recommended what.
     """
-    followees = list(follows.successors(user))
-    watched_by_followee = {followee: list(views.successors(followee)) for followee in followees}
+    followees = list(store.follows.successors(user))
+    watched_by_followee = {followee: list(store.views.successors(followee)) for followee in followees}
 
     ranking = Counter(flatten(watched_by_followee.values()))
-    for already_seen in views.successors(user):
+    for already_seen in store.views.successors(user):
         ranking.pop(already_seen, None)
 
     recommended = [movie for movie, _ in ranking.most_common(TOP_RECOMMENDATIONS)]
     return watched_by_followee, recommended
 
 
-def draw(watched_by_followee: dict[int, list[int]], recommended: list[int]) -> None:
+def titles(store: Store, movies: list[int]) -> list[str]:
+    """The title of every movie, read as one batch out of the documents collection."""
+    documents = store.database.docs_read(movies, field="title", type="str", collection=store.movies)
+    return ["" if document is None else bytes(document).decode() for document in documents]
+
+
+def draw(store: Store, watched_by_followee: dict[int, list[int]], recommended: list[int]) -> None:
     """Draws the followees on one side and the movies they recommend on the other."""
-    bipartite = nx.Graph()
+    followees = sorted(watched_by_followee)
+    labelled = dict(zip(recommended, titles(store, recommended), strict=True))
+    left = {followee: index for index, followee in enumerate(followees)}
+    right = {movie: index for index, movie in enumerate(recommended)}
+
+    figure, axes = plt.subplots()
     for followee, watched in watched_by_followee.items():
         for movie in watched:
-            if movie in recommended:
-                bipartite.add_edge(followee, movie)
+            if movie in right:
+                axes.plot([0, 1], [left[followee], right[movie]], color="0.7", zorder=1)
+    axes.scatter([0] * len(left), list(left.values()), color="tab:blue", zorder=2)
+    axes.scatter([1] * len(right), list(right.values()), color="tab:orange", zorder=2)
+    for followee, row in left.items():
+        axes.annotate(PEOPLE[followee]["name"], (0, row), horizontalalignment="right")
+    for movie, row in right.items():
+        axes.annotate(labelled[movie], (1, row), horizontalalignment="left")
 
-    followees = [node for node in bipartite if node in watched_by_followee]
-    nx.draw_networkx(bipartite, pos=nx.bipartite_layout(bipartite, followees))
+    axes.set_axis_off()
+    axes.set_xlim(-1, 2)
+    figure.tight_layout()
     plt.show()
 
 
-def dislike(database, user: int, movie: int, recommenders: list[int]) -> None:
+def dislike(store: Store, user: int, movie: int, recommenders: list[int]) -> None:
     """Records the view and drops every follow edge that led to it, as one atomic transaction."""
-    with ustore.Transaction(database) as transaction:
-        transaction[VIEWS_COLLECTION].graph.add_edge(user, movie)
-        transaction[FOLLOWS_COLLECTION].graph.remove_edges_from([user] * len(recommenders), recommenders)
+    with store.database.transaction() as transaction:
+        DiGraph(transaction, store.views.graph_collection).add_edge(user, movie)
+        DiGraph(transaction, store.follows.graph_collection).remove_edges_from_arrays(
+            [user] * len(recommenders), recommenders
+        )
 
 
-def publish(database) -> None:
+def publish(store: Store) -> None:
     """Writes a new movie's document and its poster together, so neither lands without the other."""
-    with ustore.Transaction(database) as transaction:
-        transaction[MOVIES_COLLECTION].docs[NEW_MOVIE_KEY] = NEW_MOVIE
-        transaction[POSTERS_COLLECTION][NEW_MOVIE_KEY] = download(NEW_MOVIE_POSTER_LINK)
+    poster = download(NEW_MOVIE_POSTER_LINK)
+    with store.database.transaction() as transaction:
+        transaction.docs_write([NEW_MOVIE_KEY], json.dumps(NEW_MOVIE), collection=store.movies)
+        transaction.set(NEW_MOVIE_KEY, poster, collection=store.posters)
 
 
 def main() -> None:
     """Fills the collections, recommends movies to David, draws them and then edits both graphs."""
-    database = ustore.DataBase()
-    follows = database[FOLLOWS_COLLECTION].graph
-    views = database[VIEWS_COLLECTION].graph
-    posters = database[POSTERS_COLLECTION]
-    people = database[PEOPLE_COLLECTION].docs
-    movies = database[MOVIES_COLLECTION].docs
-    fill(follows, views, posters, people, movies)
+    with ustore.Database() as database:
+        store = open_store(database)
+        fill(store)
 
-    user = DAVID
-    watched_by_followee, recommended = recommend(follows, views, user)
-    print(f"Recommending {recommended} to {PEOPLE[user]['name']}")
-    draw(watched_by_followee, recommended)
+        user = DAVID
+        watched_by_followee, recommended = recommend(store, user)
+        print(f"Recommending {titles(store, recommended)} to {PEOPLE[user]['name']}")
+        draw(store, watched_by_followee, recommended)
 
-    # The user watches the top pick, dislikes it, and unfollows everyone whose viewing suggested it.
-    disliked = recommended[0]
-    recommenders = [followee for followee, watched in watched_by_followee.items() if disliked in watched]
-    dislike(database, user, disliked, recommenders)
-    publish(database)
+        # The user watches the top pick, dislikes it, and unfollows everyone whose viewing suggested it.
+        disliked = recommended[0]
+        recommenders = [followee for followee, watched in watched_by_followee.items() if disliked in watched]
+        dislike(store, user, disliked, recommenders)
+        print(f"{PEOPLE[user]['name']} now follows {sorted(store.follows.successors(user))}")
+
+        publish(store)
+        published = store.database.get(NEW_MOVIE_KEY, collection=store.posters)
+        print(f"Published {NEW_MOVIE['title']} with a {len(published)} byte poster")
 
 
 if __name__ == "__main__":

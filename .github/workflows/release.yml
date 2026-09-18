@@ -157,7 +157,7 @@ jobs:
       - name: Pull Git submodules
         run: git submodule update --init --recursive
       - name: Build Wheels
-        uses: pypa/cibuildwheel@v4.2.0
+        uses: pypa/cibuildwheel@v4.2.1
         env:
           CIBW_BUILD: cp${{ matrix.python-version }}-*
           CIBW_ARCHS: native

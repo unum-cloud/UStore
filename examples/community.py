@@ -1,9 +1,12 @@
 """Runs Louvain community detection over a graph held in a UStore collection.
 
-Mirrors Zachary's karate club into a graph collection, then partitions it twice: once with the
-engine's own `community_louvain`, and once with NetworkX over the in-memory copy.
-Both counts are printed so a reader can see that a graph living in the database recovers the same
-community structure as the one in memory, and the drawing is colored by the engine's partition.
+Mirrors Zachary's karate club into a graph collection through the NetworkX-compatible view, then
+partitions it twice: once over the edges read back out of the database, and once over the in-memory
+copy.
+Both counts are printed so a reader can see how closely a graph living in the database recovers the
+community structure of the one in memory, and the drawing is colored by the partition of the stored
+graph.
+Louvain is sensitive to the order the edges arrive in, so the two counts need not match exactly.
 
 Needs `networkx`, `matplotlib` and the `ustore` bindings.
 Run with `python examples/community.py`.
@@ -12,44 +15,55 @@ Run with `python examples/community.py`.
 import matplotlib
 import matplotlib.pyplot as plt
 import networkx as nx
-import ustore.smashtable as ustore
 
+import ustore
+from ustore.graph_view import Graph
+
+GRAPH_COLLECTION = "karate"
 RANDOM_SEED = 42
 NODE_SIZE = 40
 EDGE_ALPHA = 0.5
 
 
-def mirror_karate_club(graph) -> nx.Graph:
+def mirror_karate_club(stored: Graph) -> nx.Graph:
     """Copies the karate club edges into the UStore graph collection and returns the in-memory source."""
     karate_club = nx.karate_club_graph()
-    for source, target in karate_club.edges:
-        graph.add_edge(source, target)
+    sources, targets = zip(*karate_club.edges, strict=True)
+    stored.add_edges_from_arrays(sources, targets)
     return karate_club
 
 
-def partition_with_networkx(karate_club: nx.Graph) -> dict[int, int]:
-    """Partitions the in-memory graph, flattening the returned community sets into a node-to-index map."""
-    communities = nx.community.louvain_communities(karate_club, seed=RANDOM_SEED)
+def recover(stored: Graph) -> nx.Graph:
+    """Reads every stored edge back into an in-memory graph, which is what Louvain partitions."""
+    recovered = nx.Graph()
+    recovered.add_nodes_from(stored.nodes)
+    recovered.add_edges_from(stored.edges())
+    return recovered
+
+
+def partition(graph: nx.Graph) -> dict[int, int]:
+    """Partitions a graph, flattening the returned community sets into a node-to-index map."""
+    communities = nx.community.louvain_communities(graph, seed=RANDOM_SEED)
     return {node: index for index, community in enumerate(communities) for node in community}
 
 
-def count_communities(partition: dict[int, int]) -> int:
+def count_communities(partitioned: dict[int, int]) -> int:
     """The number of distinct communities a node-to-index partition describes."""
-    return len(set(partition.values()))
+    return len(set(partitioned.values()))
 
 
-def draw(karate_club: nx.Graph, partition: dict[int, int]) -> None:
+def draw(karate_club: nx.Graph, partitioned: dict[int, int]) -> None:
     """Draws the club with each node colored by its community, seeded so repeated runs look alike."""
     positions = nx.spring_layout(karate_club, seed=RANDOM_SEED)
     nodes = list(karate_club.nodes)
-    colormap = matplotlib.colormaps["viridis"].resampled(count_communities(partition))
+    colormap = matplotlib.colormaps["viridis"].resampled(count_communities(partitioned))
     nx.draw_networkx_nodes(
         karate_club,
         positions,
         nodes,
         node_size=NODE_SIZE,
         cmap=colormap,
-        node_color=[partition[node] for node in nodes],
+        node_color=[partitioned[node] for node in nodes],
     )
     nx.draw_networkx_edges(karate_club, positions, alpha=EDGE_ALPHA)
     plt.show()
@@ -57,18 +71,19 @@ def draw(karate_club: nx.Graph, partition: dict[int, int]) -> None:
 
 def main() -> None:
     """Loads the club into the database, partitions it both ways and draws the result."""
-    database = ustore.DataBase()
-    graph = database.main.graph
-    karate_club = mirror_karate_club(graph)
+    with ustore.Database() as database:
+        stored = Graph(database, GRAPH_COLLECTION)
+        karate_club = mirror_karate_club(stored)
 
-    engine_partition = graph.community_louvain()
-    networkx_partition = partition_with_networkx(karate_club)
-    print(
-        f"Engine found {count_communities(engine_partition)} communities, "
-        f"NetworkX found {count_communities(networkx_partition)}"
-    )
+        stored_partition = partition(recover(stored))
+        memory_partition = partition(karate_club)
+        print(
+            f"The stored graph holds {stored.number_of_nodes()} vertices and "
+            f"{stored.number_of_edges()} edges in {count_communities(stored_partition)} communities, "
+            f"the in-memory one in {count_communities(memory_partition)}"
+        )
 
-    draw(karate_club, engine_partition)
+        draw(karate_club, stored_partition)
 
 
 if __name__ == "__main__":

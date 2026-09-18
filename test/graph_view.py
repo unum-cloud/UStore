@@ -3,8 +3,9 @@
 import networkx
 import numpy
 import pytest
-import ustore
 from capabilities import NEEDS_COLLECTIONS, NEEDS_TRANSACTIONS
+
+import ustore
 from ustore.graph_view import DiGraph, Graph, MultiDiGraph, MultiGraph
 
 GRAPH_KINDS = {

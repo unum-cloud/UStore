@@ -32,10 +32,12 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import requests
-import ustore.smashtable as ustore
 from bokeh.document.document import Document
 from bokeh.server.server import Server
 from cuxfilter import charts
+
+import ustore
+from ustore.keys import scan_keys
 
 MAPBOX_API_KEY = "pk.eyJ1IjoiYXRob3J2ZSIsImEiOiJjazBmcmlhYzAwYXc2M25wMnE3bGttbzczIn0.JCDQliLc-XTU52iKa8L8-Q"
 GEOJSON_LINK = "https://raw.githubusercontent.com/rapidsai/cuxfilter/GTC-2018-mortgage-visualization/javascript/demos/GTC%20demo/public/data/zip3-ms-rhs-lessprops.json"
@@ -73,7 +75,7 @@ def generate_rows(zip_codes: list[int], batch_size: int = 10_000, start_time: in
     """Synthesizes one batch of withdrawals, scattered around the city center at a fixed cadence.
 
     Amounts are lognormal, so a few large withdrawals sit in a long tail of small ones, and every
-    float stays single precision to match what `MEASUREMENT_FORMAT` packs.
+    column carries the width `MEASUREMENT_FORMAT` packs, so a round trip recovers it unchanged.
     """
     generator = np.random.default_rng(start_time)
     return pd.DataFrame(
@@ -96,8 +98,8 @@ def generate_rows(zip_codes: list[int], batch_size: int = 10_000, start_time: in
                 batch_size,
             ).astype(np.single),
             "amounts": (generator.lognormal(3.0, 1.0, batch_size) * 100.0).astype(np.single),
-            "humans": generator.integers(low=1, high=4, size=batch_size),
-            "zips": generator.choice(zip_codes, size=batch_size),
+            "humans": generator.integers(low=1, high=4, size=batch_size, dtype=np.int32),
+            "zips": generator.choice(zip_codes, size=batch_size).astype(np.int32),
         }
     )
 
@@ -186,18 +188,19 @@ def check_round_trip(zip_codes: list[int]) -> None:
         assert original[column].equals(recovered[column]), f"{column} did not survive the round trip"
 
 
-def store_batches(measurements, zip_codes: list[int]) -> None:
+def store_batches(database: ustore.Database, zip_codes: list[int]) -> None:
     """Writes each batch as one blob, keyed by batch index rather than by withdrawal."""
     for batch_index in range(BATCH_COUNT):
         start_time = START_TIME + batch_index * ROWS_PER_BATCH * SECONDS_BETWEEN_EVENTS
         rows = generate_rows(zip_codes, ROWS_PER_BATCH, start_time)
-        measurements[batch_index] = bytes(pack_rows(rows))
+        database.set(batch_index, bytes(pack_rows(rows)))
 
 
-def load_measurements(measurements) -> pd.DataFrame:
-    """Reads every stored blob back and concatenates the batches into one frame."""
-    batches = [parse_rows(measurements[key]) for key in measurements.keys]
-    return pd.concat(batches, ignore_index=True)
+def load_measurements(database: ustore.Database) -> pd.DataFrame:
+    """Reads every stored blob back as one batch and concatenates them into one frame."""
+    keys = list(scan_keys(database))
+    stored = database.read(keys)
+    return pd.concat([parse_rows(bytes(blob)) for blob in stored], ignore_index=True)
 
 
 def make_dashboard(doc: Document, measurements: pd.DataFrame) -> None:
@@ -253,10 +256,9 @@ def main() -> None:
     zip_codes = load_zip_codes()
     check_round_trip(zip_codes)
 
-    database = ustore.DataBase()
-    measurements = database.main
-    store_batches(measurements, zip_codes)
-    recovered = load_measurements(measurements)
+    with ustore.Database() as database:
+        store_batches(database, zip_codes)
+        recovered = load_measurements(database)
 
     smoothed = rolling_mean_amounts(recovered["amounts"])
     print(f"Recovered {len(recovered)} withdrawals, smoothed into {len(smoothed)} windowed means")

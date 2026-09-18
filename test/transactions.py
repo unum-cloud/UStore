@@ -1,8 +1,9 @@
 """Transactions over the C ABI: commits, rollbacks, conflicts and staging, at every isolation the engine offers."""
 
 import pytest
-import ustore
 from capabilities import ENGINE, ISOLATIONS, NEEDS_TRANSACTIONS
+
+import ustore
 
 pytestmark = NEEDS_TRANSACTIONS
 

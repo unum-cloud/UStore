@@ -17,8 +17,9 @@ from typing import Any
 
 import networkx
 import numpy
-import ustore
 from networkx.algorithms.community import louvain_communities
+
+import ustore
 from ustore.graph_view import Graph
 
 

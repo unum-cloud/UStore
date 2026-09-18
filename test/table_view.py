@@ -8,6 +8,7 @@ import pandas
 import pytest
 from capabilities import NEEDS_COLLECTIONS
 from pandas.testing import assert_frame_equal, assert_series_equal
+
 from ustore.table_view import Table
 
 PEOPLE = [

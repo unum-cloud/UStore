@@ -4,8 +4,9 @@ import gc
 
 import numpy
 import pytest
-import ustore
 from capabilities import NEEDS_COLLECTIONS
+
+import ustore
 
 BATCH_SIZES = [1, 16, 65, 1000]
 

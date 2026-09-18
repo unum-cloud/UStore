@@ -4,6 +4,7 @@ import gc
 
 import numpy
 import pytest
+
 import ustore
 
 # Batches below, at and past the 16 values and 64 keys a verb lays out on the stack.

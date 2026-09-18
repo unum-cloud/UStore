@@ -19,13 +19,14 @@ Overview
    :caption: Bindings
 
    python/index
+   rust/index
 
 .. toctree::
    :hidden:
    :caption: Internals
 
    engines
-   udisk
+   nvme
    tests
    benchmarks
    contributing

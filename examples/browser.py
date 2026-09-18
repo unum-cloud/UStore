@@ -10,9 +10,15 @@ Needs `streamlit`, `requests` and the `ustore` bindings.
 Run with `streamlit run examples/browser.py`.
 """
 
+import json
+from typing import NamedTuple
+
 import requests
 import streamlit as st
-import ustore.smashtable as ustore
+
+import ustore
+from ustore.graph_view import DiGraph
+from ustore.keys import KEY_MIN, scan_keys
 
 DOCUMENTS_COLLECTION = "Docs"
 NETWORK_COLLECTION = "Network"
@@ -20,14 +26,21 @@ IMAGES_COLLECTION = "Images"
 
 FIRST_IMAGE_KEY = 50
 REQUEST_TIMEOUT_SECONDS = 30
+USER_AGENT = "ustore-examples/1.0 (https://github.com/unum-cloud/ustore)"
 
+# Wikimedia refuses an anonymous request for a `thumb/` path, so every photograph is scaled through
+# `Special:FilePath`, which serves one and redirects to it.
+IMAGE_WIDTH_PIXELS = 320
+IMAGE_FILES = [
+    "Mount_Ararat_and_the_Yerevan_skyline_in_spring_from_the_Cascade.jpg",
+    "Vartavar_2014_Yerevan_%285%29.jpg",
+    "Cascade_of_Yerevan.JPG",
+    "Yerevan_Tsitsernakaberd_Armenian_Genocide_Museum_Memorial_msu-2018-3009.jpg",
+    "%C3%93pera%2C_Erev%C3%A1n%2C_Armenia%2C_2016-10-03%2C_DD_12.jpg",
+    "Jerewan-Matenadaran-msu-wlm-2509.jpg",
+]
 IMAGE_LINKS = [
-    "https://upload.wikimedia.org/wikipedia/commons/thumb/8/87/Mount_Ararat_and_the_Yerevan_skyline_in_spring_from_the_Cascade.jpg/556px-Mount_Ararat_and_the_Yerevan_skyline_in_spring_from_the_Cascade.jpg",
-    "https://upload.wikimedia.org/wikipedia/commons/thumb/3/31/Vartavar_2014_Yerevan_%285%29.jpg/202px-Vartavar_2014_Yerevan_%285%29.jpg",
-    "https://upload.wikimedia.org/wikipedia/commons/thumb/6/6e/Cascade_of_Yerevan.JPG/168px-Cascade_of_Yerevan.JPG",
-    "https://upload.wikimedia.org/wikipedia/commons/thumb/6/64/Yerevan_Tsitsernakaberd_Armenian_Genocide_Museum_Memorial_msu-2018-3009.jpg/170px-Yerevan_Tsitsernakaberd_Armenian_Genocide_Museum_Memorial_msu-2018-3009.jpg",
-    "https://upload.wikimedia.org/wikipedia/commons/thumb/1/19/%C3%93pera%2C_Erev%C3%A1n%2C_Armenia%2C_2016-10-03%2C_DD_12.jpg/230px-%C3%93pera%2C_Erev%C3%A1n%2C_Armenia%2C_2016-10-03%2C_DD_12.jpg",
-    "https://upload.wikimedia.org/wikipedia/commons/thumb/d/dc/Jerewan-Matenadaran-msu-wlm-2509.jpg/140px-Jerewan-Matenadaran-msu-wlm-2509.jpg",
+    f"https://commons.wikimedia.org/wiki/Special:FilePath/{name}?width={IMAGE_WIDTH_PIXELS}" for name in IMAGE_FILES
 ]
 
 LANDMARKS = {
@@ -39,56 +52,91 @@ LANDMARKS = {
 NEIGHBORHOODS = [(10, 11), (11, 12), (12, 10)]
 
 
-def seed_documents(documents) -> None:
+class Store(NamedTuple):
+    """The open database beside the graph view and the two collections rendered from their raw bytes."""
+
+    database: ustore.Database
+    documents: int
+    network: DiGraph
+    images: int
+
+
+def seeded(database: ustore.Database, collection: int) -> bool:
+    """Whether a collection already holds a pair, so a rerun never seeds it twice."""
+    return len(database.scan(KEY_MIN, 1, collection=collection)[0]) > 0
+
+
+def seed_documents(store: Store) -> None:
     """Writes the landmark records, so the documents view has something structured to render."""
-    if len(documents):
+    if seeded(store.database, store.documents):
         return
-    for key, landmark in LANDMARKS.items():
-        documents[key] = landmark
+    documents = [json.dumps(landmark) for landmark in LANDMARKS.values()]
+    store.database.docs_write(list(LANDMARKS), documents, collection=store.documents)
 
 
-def seed_network(graph) -> None:
+def seed_network(store: Store) -> None:
     """Links the landmarks into a small ring, so the graph view has edges to list."""
-    for source, target in NEIGHBORHOODS:
-        graph.add_edge(source, target)
+    sources = [source for source, _ in NEIGHBORHOODS]
+    targets = [target for _, target in NEIGHBORHOODS]
+    store.network.add_edges_from_arrays(sources, targets)
 
 
-def seed_images(images) -> None:
+def seed_images(store: Store) -> None:
     """Downloads each photograph once and stores the raw bytes under consecutive keys."""
-    if len(images):
+    if seeded(store.database, store.images):
         return
-    for offset, link in enumerate(IMAGE_LINKS):
-        images[FIRST_IMAGE_KEY + offset] = requests.get(link, timeout=REQUEST_TIMEOUT_SECONDS).content
+    keys = [FIRST_IMAGE_KEY + offset for offset in range(len(IMAGE_LINKS))]
+    downloaded = [
+        requests.get(link, timeout=REQUEST_TIMEOUT_SECONDS, headers={"User-Agent": USER_AGENT}).content
+        for link in IMAGE_LINKS
+    ]
+    store.database.write(keys, downloaded, collection=store.images)
 
 
 @st.cache_resource
-def open_database():
+def open_store() -> Store:
     """Opens the database once per session and seeds every collection that is still empty."""
-    database = ustore.DataBase()
-    seed_documents(database[DOCUMENTS_COLLECTION].docs)
-    seed_network(database[NETWORK_COLLECTION].graph)
-    seed_images(database[IMAGES_COLLECTION])
-    return database
+    database = ustore.Database()
+    store = Store(
+        database=database,
+        documents=database.collection_create(DOCUMENTS_COLLECTION),
+        network=DiGraph(database, NETWORK_COLLECTION),
+        images=database.collection_create(IMAGES_COLLECTION),
+    )
+    seed_documents(store)
+    seed_network(store)
+    seed_images(store)
+    return store
 
 
-def render_documents(database) -> None:
+def landmark_names(store: Store, keys: list[int]) -> list[str]:
+    """The name of every landmark, read as one batch out of the documents collection."""
+    found = store.database.docs_read(keys, field="name", type="str", collection=store.documents)
+    return ["" if name is None else bytes(name).decode() for name in found]
+
+
+def render_documents(store: Store) -> None:
     """Renders every stored document as JSON, keyed by the document's own key."""
-    for key, document in database[DOCUMENTS_COLLECTION].docs.items:
+    keys = list(scan_keys(store.database, store.documents))
+    for key, document in zip(keys, store.database.docs_read(keys, collection=store.documents), strict=True):
         st.write(f"Document {key}")
-        st.json(document)
+        st.json(bytes(document).decode())
 
 
-def render_network(database) -> None:
+def render_network(store: Store) -> None:
     """Renders the graph as its edge list, naming each endpoint from the documents collection."""
-    documents = database[DOCUMENTS_COLLECTION].docs
-    for source, target in database[NETWORK_COLLECTION].graph.edges:
-        st.write(f"{documents[source]['name']} → {documents[target]['name']}")
+    edges = list(store.network.edges())
+    sources = landmark_names(store, [source for source, _ in edges])
+    targets = landmark_names(store, [target for _, target in edges])
+    for source, target in zip(sources, targets, strict=True):
+        st.write(f"{source} → {target}")
 
 
-def render_images(database) -> None:
+def render_images(store: Store) -> None:
     """Renders every stored image, decoded by Streamlit from the bytes the collection holds."""
-    for key, image in database[IMAGES_COLLECTION].items:
-        st.image(image, caption=f"Image {key}", width="content")
+    keys = list(scan_keys(store.database, store.images))
+    for key, image in zip(keys, store.database.read(keys, collection=store.images), strict=True):
+        st.image(bytes(image), caption=f"Image {key}", width="content")
 
 
 RENDERERS = {
@@ -99,4 +147,4 @@ RENDERERS = {
 
 selected = st.selectbox("Which collection would you like to view?", tuple(RENDERERS))
 st.write("You selected:", selected)
-RENDERERS[selected](open_database())
+RENDERERS[selected](open_store())

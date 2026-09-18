@@ -23,5 +23,10 @@
   "plugins": [
     "https://plugins.dprint.dev/json-0.23.0.wasm",
     "https://plugins.dprint.dev/g-plane/pretty_yaml-v0.6.0.wasm"
-  ]
+  ],
+  "json": {
+    "associations": [
+      "**/*.{json,jsonc,ipynb}"
+    ]
+  }
 }

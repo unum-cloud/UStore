@@ -42,7 +42,7 @@ PROJECT_NUMBER         =$(VERSION)
 # for a project that appears at the top of each page and should give viewer a
 # quick idea about the purpose of the project. Keep the description short.
 
-PROJECT_BRIEF          = Efficient Multi-Modal Database
+PROJECT_BRIEF          = GPU-Accelerated Embedded Transactional Database for High-Throughput NVMe Devices
 
 # With the PROJECT_LOGO tag one can specify a logo or an icon that is included
 # in the documentation. The maximum height of the logo should not exceed 55
@@ -186,7 +186,7 @@ SHORT_NAMES            = NO
 # description.)
 # The default value is: NO.
 #care
-JAVADOC_AUTOBRIEF      = NO
+JAVADOC_AUTOBRIEF      = YES
 
 # If the JAVADOC_BANNER tag is set to YES then doxygen will interpret a line
 # such as
@@ -815,6 +815,13 @@ WARN_IF_DOC_ERROR      = YES
 # The default value is: NO.
 #care
 WARN_NO_PARAMDOC       = NO
+
+# If WARN_IF_INCOMPLETE_DOC is set to YES, Doxygen warns when a documented entity has some but not
+# all of its parameters documented. The house rule is to document a parameter only where it carries
+# a constraint the signature does not state, so partial coverage is deliberate and the warning is
+# noise that buries the real ones.
+#care
+WARN_IF_INCOMPLETE_DOC = NO
 
 # If the WARN_AS_ERROR tag is set to YES then doxygen will immediately stop when
 # a warning is encountered. If the WARN_AS_ERROR tag is set to FAIL_ON_WARNINGS

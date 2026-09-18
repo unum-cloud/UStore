@@ -578,7 +578,7 @@ check_redundant_nodiscard() {
 check_suffixed_template_names() {
     local suffixed
     suffixed=$(printf '%s\n' "$added" | grep -vE '^\+[[:space:]]*(\*|//|/\*)' |
-        sed -e 's/R"(.*)"/""/g' -e 's/"[^"]*"/""/g' |
+        sed -e 's/R"\([A-Za-z_]*\)(.*)\1"/""/g' -e 's/"[^"]*"/""/g' |
         grep -E '\b(class|struct|union|using)[[:space:]]+[A-Za-z_][A-Za-z0-9_]*_(gt|at)\b|\b[A-Za-z_][A-Za-z0-9_]*_at\b' || true)
     [ -z "$suffixed" ] || fail "$suffixed" \
         "$file names a symbol with a _gt or _at suffix - write \`template <typename store_> class blobs_ref\`:"

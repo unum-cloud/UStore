@@ -49,6 +49,30 @@ jobs:
             include/ustore/ustore.h:^#define USTORE_VERSION_PATCH (\d+)
           dry-run: "true"
 
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Set Up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install Linters
+        run: |
+          python -m pip install --group lint
+          npm install --global dprint
+
+      # The same checks a commit runs locally, over everything this branch adds.
+      - name: Check
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: .githooks/lint-range "$BASE_SHA"
+
   test_cpp:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
@@ -72,8 +96,15 @@ jobs:
               preset: release,
               configure: "-DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl -DCMAKE_EXE_LINKER_FLAGS= -DCMAKE_SHARED_LINKER_FLAGS=",
             }
-          - { name: "Linux x86-64 (ASan, UBSan)", os: ubuntu-24.04, preset: debug, configure: "" }
-          - { name: "Linux x86-64 (TSan)", os: ubuntu-24.04, preset: tsan, configure: "" }
+          # LevelDB 1.23's env_posix.cc names std::memory_order::memory_order_relaxed, which libstdc++ 15 dropped,
+          # so the sanitizer trees build without it.
+          - {
+              name: "Linux x86-64 (ASan, UBSan)",
+              os: ubuntu-24.04,
+              preset: debug,
+              configure: "-DUSTORE_USE_LEVELDB=OFF",
+            }
+          - { name: "Linux x86-64 (TSan)", os: ubuntu-24.04, preset: tsan, configure: "-DUSTORE_USE_LEVELDB=OFF" }
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -143,7 +174,40 @@ jobs:
         shell: bash
         run: |
           python -m pip install --group test
-          python -m pytest tests -x -q
+          python -m pytest test -x -q
+
+  # RocksDB and LevelDB linked into the extension, on the floor Python version only - the OS matrix above already
+  # exercises SmashTable, the default link, on every platform.
+  test_python_engines:
+    name: Python (${{ matrix.engine }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { engine: rocksdb, define: USTORE_USE_ROCKSDB }
+          - { engine: leveldb, define: USTORE_USE_LEVELDB }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Pull Git submodules
+        run: git submodule update --init --recursive
+      - name: Set Up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - name: Build and Install
+        env:
+          CMAKE_ARGS: "-D${{ matrix.define }}=ON -DUSTORE_PYTHON_ENGINE=${{ matrix.engine }}"
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -v .
+      - name: Test
+        run: |
+          python -m pip install --group test
+          python -m pytest test -x -q
 
   test_rust:
     name: Rust on ${{ matrix.os }}
@@ -185,7 +249,7 @@ jobs:
       - name: Pull Git submodules
         run: git submodule update --init --recursive
       - name: Build Wheels
-        uses: pypa/cibuildwheel@v4.2.0
+        uses: pypa/cibuildwheel@v4.2.1
         env:
           CIBW_BUILD: cp${{ matrix.python-version }}-*
           CIBW_ARCHS: native

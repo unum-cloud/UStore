@@ -1,8 +1,9 @@
 """Collections over the C ABI: creating, naming, listing and dropping them."""
 
 import pytest
-import ustore
 from capabilities import ENGINE, NEEDS_COLLECTIONS
+
+import ustore
 
 pytestmark = NEEDS_COLLECTIONS
 
