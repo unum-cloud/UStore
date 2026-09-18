@@ -283,6 +283,7 @@ static ustore_py_choice_naming_t const drop_namings[] = {
     {"collection", ustore_drop_keys_vals_handle_k},
     {"pairs", ustore_drop_keys_vals_k},
     {"values", ustore_drop_vals_k},
+    {NULL, 0},
 };
 
 static char const doc_Database_collection_create[] =                                         //
@@ -548,9 +549,7 @@ static PyObject* Database_collection_drop(PyObject* self, PyObject* const* args,
          ++args_progress, ++names_progress) {
         PyObject* const name = PyTuple_GET_ITEM(args_names_tuple, names_progress);
         if (PyUnicode_CompareWithASCIIString(name, "mode") == 0) {
-            if (ustore_py_choice_from_object(args[args_progress], "mode", drop_namings,
-                                             ustore_py_table_size_(drop_namings), &mode) != 0)
-                return NULL;
+            if (ustore_py_choice_from_object(args[args_progress], "mode", drop_namings, &mode) != 0) return NULL;
         }
         else {
             PyErr_Format(PyExc_TypeError, "Got unexpected keyword argument: %S", name);
@@ -697,8 +696,11 @@ static PyObject* Database_snapshot_export(PyObject* self, PyObject* const* args,
                                           PyObject* args_names_tuple) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
-    if (ustore_py_args_names_count_checked("snapshot_export", positional_args_count, args_names_tuple, 2) != 0) {
-        if (!PyErr_Occurred()) PyErr_SetString(PyExc_TypeError, "snapshot_export() takes no keyword arguments");
+    Py_ssize_t const args_names_count = ustore_py_args_names_count_checked("snapshot_export", positional_args_count,
+                                                                           args_names_tuple, 2);
+    if (args_names_count < 0) return NULL;
+    if (args_names_count != 0) {
+        PyErr_SetString(PyExc_TypeError, "snapshot_export() takes no keyword arguments");
         return NULL;
     }
 
@@ -1007,6 +1009,21 @@ static PyMethodDef Database_methods[] = {
     {"set", (PyCFunction)ustore_py_api_set, ustore_py_method_flags_k, doc_set},
     {"pop", (PyCFunction)ustore_py_api_pop, ustore_py_method_flags_k, doc_pop},
     {"contains", (PyCFunction)ustore_py_api_contains, ustore_py_method_flags_k, doc_contains},
+
+    {"docs_write", (PyCFunction)ustore_py_api_docs_write, ustore_py_method_flags_k, doc_docs_write},
+    {"docs_read", (PyCFunction)ustore_py_api_docs_read, ustore_py_method_flags_k, doc_docs_read},
+    {"docs_gist", (PyCFunction)ustore_py_api_docs_gist, ustore_py_method_flags_k, doc_docs_gist},
+    {"docs_gather", (PyCFunction)ustore_py_api_docs_gather, ustore_py_method_flags_k, doc_docs_gather},
+    {"graph_upsert_edges", (PyCFunction)ustore_py_api_graph_upsert_edges, ustore_py_method_flags_k,
+     doc_graph_upsert_edges},
+    {"graph_remove_edges", (PyCFunction)ustore_py_api_graph_remove_edges, ustore_py_method_flags_k,
+     doc_graph_remove_edges},
+    {"graph_find_edges", (PyCFunction)ustore_py_api_graph_find_edges, ustore_py_method_flags_k, doc_graph_find_edges},
+    {"graph_degrees", (PyCFunction)ustore_py_api_graph_degrees, ustore_py_method_flags_k, doc_graph_degrees},
+    {"graph_upsert_vertices", (PyCFunction)ustore_py_api_graph_upsert_vertices, ustore_py_method_flags_k,
+     doc_graph_upsert_vertices},
+    {"graph_remove_vertices", (PyCFunction)ustore_py_api_graph_remove_vertices, ustore_py_method_flags_k,
+     doc_graph_remove_vertices},
     {NULL, NULL, 0, NULL},
 };
 
@@ -1045,6 +1062,21 @@ static PyMethodDef Transaction_methods[] = {
     {"set", (PyCFunction)ustore_py_api_set, ustore_py_method_flags_k, doc_set},
     {"pop", (PyCFunction)ustore_py_api_pop, ustore_py_method_flags_k, doc_pop},
     {"contains", (PyCFunction)ustore_py_api_contains, ustore_py_method_flags_k, doc_contains},
+
+    {"docs_write", (PyCFunction)ustore_py_api_docs_write, ustore_py_method_flags_k, doc_docs_write},
+    {"docs_read", (PyCFunction)ustore_py_api_docs_read, ustore_py_method_flags_k, doc_docs_read},
+    {"docs_gist", (PyCFunction)ustore_py_api_docs_gist, ustore_py_method_flags_k, doc_docs_gist},
+    {"docs_gather", (PyCFunction)ustore_py_api_docs_gather, ustore_py_method_flags_k, doc_docs_gather},
+    {"graph_upsert_edges", (PyCFunction)ustore_py_api_graph_upsert_edges, ustore_py_method_flags_k,
+     doc_graph_upsert_edges},
+    {"graph_remove_edges", (PyCFunction)ustore_py_api_graph_remove_edges, ustore_py_method_flags_k,
+     doc_graph_remove_edges},
+    {"graph_find_edges", (PyCFunction)ustore_py_api_graph_find_edges, ustore_py_method_flags_k, doc_graph_find_edges},
+    {"graph_degrees", (PyCFunction)ustore_py_api_graph_degrees, ustore_py_method_flags_k, doc_graph_degrees},
+    {"graph_upsert_vertices", (PyCFunction)ustore_py_api_graph_upsert_vertices, ustore_py_method_flags_k,
+     doc_graph_upsert_vertices},
+    {"graph_remove_vertices", (PyCFunction)ustore_py_api_graph_remove_vertices, ustore_py_method_flags_k,
+     doc_graph_remove_vertices},
     {NULL, NULL, 0, NULL},
 };
 

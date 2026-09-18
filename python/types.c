@@ -267,16 +267,13 @@ typedef enum keys_route_t {
 
     /** Not that layout, so each element converts on its own terms. */
     keys_route_sequence_k,
-
-    /** Something went wrong and an exception is set. */
-    keys_route_failed_k,
 } keys_route_t;
 
 /**
- *  @brief Tries the zero-copy route, telling "not a key buffer" apart from a real failure.
+ *  @brief Tries the zero-copy route, falling back to a per-element conversion otherwise.
  *
- *  A blanket clear here would swallow a @c KeyboardInterrupt delivered inside an exporter, so only
- *  the failure this function itself provoked is discarded.
+ *  Only the failure the buffer request itself provoked is cleared, so nothing an exporter raised on
+ *  its own behalf is swallowed.
  */
 static keys_route_t keys_borrow_buffer(PyObject* object, ustore_py_keys_t* batch) {
     if (!PyObject_CheckBuffer(object)) return keys_route_sequence_k;
@@ -290,8 +287,9 @@ static keys_route_t keys_borrow_buffer(PyObject* object, ustore_py_keys_t* batch
         ustore_py_keys_release(batch);
         return keys_route_sequence_k;
     }
-    batch->keys = (ustore_key_t*)buffer->buf;
     batch->count = (size_t)buffer->shape[0];
+    // The ABI spells an empty batch with no keys at all, and refuses an address for no tasks.
+    batch->keys = batch->count ? (ustore_key_t*)buffer->buf : NULL;
     return keys_route_borrowed_k;
 }
 
@@ -300,7 +298,6 @@ int ustore_py_keys_from_object(PyObject* object, ustore_py_keys_t* batch) {
 
     switch (keys_borrow_buffer(object, batch)) {
     case keys_route_borrowed_k: return 0;
-    case keys_route_failed_k: return -1;
     case keys_route_sequence_k: break;
     }
 
@@ -308,7 +305,8 @@ int ustore_py_keys_from_object(PyObject* object, ustore_py_keys_t* batch) {
     if (!sequence) return -1;
     Py_ssize_t const count = PySequence_Fast_GET_SIZE(sequence);
 
-    if ((size_t)count <= ustore_py_keys_inline_k) { batch->keys = batch->inline_keys; }
+    if (count == 0) { batch->keys = NULL; }
+    else if ((size_t)count <= ustore_py_keys_inline_k) { batch->keys = batch->inline_keys; }
     else {
         batch->owned = (ustore_key_t*)PyMem_Malloc((size_t)count * sizeof(ustore_key_t));
         if (!batch->owned) {
@@ -411,6 +409,82 @@ void ustore_py_contents_release(ustore_py_contents_t* batch) {
 
 #pragma endregion Contents
 
+#pragma region Spans
+
+static char const doc_Span[] = "A read-only window into a result's arena, which a memoryview is built over.";
+
+int ustore_py_buffer_fill(Py_buffer* view, PyObject* owner, void* data, char const* format, Py_ssize_t itemsize,
+                          int ndim, Py_ssize_t* shape, Py_ssize_t* strides, int flags) {
+    if ((flags & PyBUF_WRITABLE) == PyBUF_WRITABLE) {
+        view->obj = NULL;
+        PyErr_SetString(PyExc_BufferError, "The arena a result owns is read-only");
+        return -1;
+    }
+    Py_ssize_t items = 1;
+    for (int dimension = 0; dimension != ndim; ++dimension) items *= shape[dimension];
+
+    // An empty run may carry no address at all, and a buffer must still point somewhere.
+    view->buf = data ? data : (void*)owner;
+    view->obj = Py_NewRef(owner);
+    view->len = items * itemsize;
+    view->readonly = 1;
+    view->itemsize = itemsize;
+    view->format = (flags & PyBUF_FORMAT) == PyBUF_FORMAT ? (char*)format : NULL;
+    // A consumer that asks for no shape reads the buffer as one run of bytes.
+    view->ndim = (flags & PyBUF_ND) == PyBUF_ND ? ndim : 1;
+    view->shape = (flags & PyBUF_ND) == PyBUF_ND ? shape : NULL;
+    view->strides = (flags & PyBUF_STRIDES) == PyBUF_STRIDES ? strides : NULL;
+    view->suboffsets = NULL;
+    view->internal = NULL;
+    return 0;
+}
+
+PyObject* ustore_py_span_view(PyObject* owner, void* data, char const* format, Py_ssize_t itemsize, int ndim,
+                              Py_ssize_t const* shape) {
+    Span* const span = PyObject_New(Span, &SpanType);
+    if (!span) return NULL;
+    span->owner = Py_NewRef(owner);
+    span->data = data;
+    span->format = format;
+    span->itemsize = itemsize;
+    span->ndim = ndim;
+    span->shape[0] = shape[0];
+    span->shape[1] = ndim == 2 ? shape[1] : 1;
+    span->strides[0] = ndim == 2 ? itemsize * shape[1] : itemsize;
+    span->strides[1] = itemsize;
+    // The view holds the span through its buffer, and the span holds the owner.
+    PyObject* const view = PyMemoryView_FromObject((PyObject*)span);
+    Py_DECREF(span);
+    return view;
+}
+
+static void Span_dealloc(Span* self) {
+    Py_XDECREF(self->owner);
+    PyObject_Free(self);
+}
+
+static int Span_getbuffer(Span* self, Py_buffer* view, int flags) {
+    return ustore_py_buffer_fill(view, (PyObject*)self, self->data, self->format, self->itemsize, self->ndim,
+                                 self->shape, self->strides, flags);
+}
+
+static PyBufferProcs Span_as_buffer = {
+    .bf_getbuffer = (getbufferproc)Span_getbuffer,
+};
+
+PyTypeObject SpanType = {
+    PyVarObject_HEAD_INIT(NULL, 0) //
+        .tp_name = "ustore.Span",
+    .tp_doc = doc_Span,
+    .tp_basicsize = sizeof(Span),
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_new = NULL,
+    .tp_dealloc = (destructor)Span_dealloc,
+    .tp_as_buffer = &Span_as_buffer,
+};
+
+#pragma endregion Spans
+
 #pragma region Value Tapes
 
 static char const doc_Values[] =                                                             //
@@ -452,14 +526,8 @@ static PyObject* Values_item(Values* self, Py_ssize_t task_index) {
         return NULL;
     }
     if (self->lengths[task_index] == ustore_length_missing_k) Py_RETURN_NONE;
-
-    PyObject* const flat = PyMemoryView_FromObject((PyObject*)self);
-    if (!flat) return NULL;
-    Py_ssize_t const start = (Py_ssize_t)self->offsets[task_index];
-    Py_ssize_t const end = start + (Py_ssize_t)self->lengths[task_index];
-    PyObject* const sliced = PySequence_GetSlice(flat, start, end);
-    Py_DECREF(flat);
-    return sliced;
+    Py_ssize_t const shape = (Py_ssize_t)self->lengths[task_index];
+    return ustore_py_span_view((PyObject*)self, self->tape + self->offsets[task_index], "B", 1, 1, &shape);
 }
 
 static int Values_getbuffer(Values* self, Py_buffer* view, int flags) {
@@ -512,7 +580,7 @@ PyTypeObject ValuesType = {
     .tp_doc = doc_Values,
     .tp_basicsize = sizeof(Values),
     .tp_flags = Py_TPFLAGS_DEFAULT,
-    .tp_new = NULL, //! Exported by a read, never constructed by name.
+    .tp_new = NULL,
     .tp_dealloc = (destructor)Values_dealloc,
     .tp_repr = (reprfunc)Values_repr,
     .tp_as_sequence = &Values_as_sequence,
@@ -558,18 +626,9 @@ static PyObject* Keys_item(Keys* self, Py_ssize_t task_index) {
         PyErr_SetString(PyExc_IndexError, "Task index out of range");
         return NULL;
     }
-    PyObject* const flat = PyMemoryView_FromObject((PyObject*)self);
-    if (!flat) return NULL;
-    Py_ssize_t const key_bytes = (Py_ssize_t)sizeof(ustore_key_t);
-    Py_ssize_t const start = (Py_ssize_t)self->offsets[task_index] * key_bytes;
-    Py_ssize_t const end = start + (Py_ssize_t)self->counts[task_index] * key_bytes;
-    PyObject* const sliced = PySequence_GetSlice(flat, start, end);
-    Py_DECREF(flat);
-    if (!sliced) return NULL;
-    // A cast crosses formats only through the byte one, which is what the tape already exports.
-    PyObject* const shaped = PyObject_CallMethod(sliced, "cast", "s", "q");
-    Py_DECREF(sliced);
-    return shaped;
+    Py_ssize_t const shape = (Py_ssize_t)self->counts[task_index];
+    return ustore_py_span_view((PyObject*)self, self->tape + self->offsets[task_index], "q", sizeof(ustore_key_t), 1,
+                               &shape);
 }
 
 static int Keys_getbuffer(Keys* self, Py_buffer* view, int flags) {
@@ -621,7 +680,7 @@ PyTypeObject KeysType = {
     .tp_doc = doc_Keys,
     .tp_basicsize = sizeof(Keys),
     .tp_flags = Py_TPFLAGS_DEFAULT,
-    .tp_new = NULL, //! Exported by a scan or a sample, never constructed by name.
+    .tp_new = NULL,
     .tp_dealloc = (destructor)Keys_dealloc,
     .tp_repr = (reprfunc)Keys_repr,
     .tp_as_sequence = &Keys_as_sequence,
@@ -645,14 +704,14 @@ int ustore_py_size_from_object(PyObject* object, char const* field, size_t* valu
 }
 
 int ustore_py_choice_from_object(PyObject* object, char const* field, ustore_py_choice_naming_t const* namings,
-                                 size_t count, int* value) {
+                                 int* value) {
     if (!PyUnicode_Check(object)) {
         PyErr_Format(PyExc_TypeError, "The '%s' option must be a string, got %S", field, Py_TYPE(object));
         return -1;
     }
-    for (size_t naming_index = 0; naming_index != count; ++naming_index)
-        if (PyUnicode_CompareWithASCIIString(object, namings[naming_index].name) == 0) {
-            *value = namings[naming_index].value;
+    for (ustore_py_choice_naming_t const* naming = namings; naming->name; ++naming)
+        if (PyUnicode_CompareWithASCIIString(object, naming->name) == 0) {
+            *value = naming->value;
             return 0;
         }
     PyErr_Format(PyExc_ValueError, "Unsupported '%s' option %R", field, object);
@@ -701,3 +760,56 @@ int ustore_py_context_from_object(PyObject* self, ustore_py_context_t* context) 
 }
 
 #pragma endregion Closed Sets
+
+#pragma region Verb Options
+
+void ustore_py_verb_options_init(ustore_py_context_t const* context, ustore_py_verb_options_t* options) {
+    options->collection = ustore_collection_main_k;
+    options->snapshot = 0;
+    options->options = context->options;
+}
+
+int ustore_py_verb_option_from_keyword(ustore_py_context_t const* context, PyObject* name, PyObject* value,
+                                       ustore_py_verb_options_t* options) {
+    if (PyUnicode_CompareWithASCIIString(name, "collection") == 0)
+        return ustore_py_collection_from_object(context, value, &options->collection) == 0 ? 1 : -1;
+    if (PyUnicode_CompareWithASCIIString(name, "snapshot") == 0) {
+        size_t snapshot = 0;
+        if (ustore_py_size_from_object(value, "snapshot", &snapshot) != 0) return -1;
+        // A call addresses exactly one view, so a transaction and a snapshot are never both named.
+        if (snapshot && context->transaction) {
+            ustore_py_raise(ustore_error_invalid_argument_k,
+                            "A transaction already fixes the view, so it takes no snapshot");
+            return -1;
+        }
+        options->snapshot = (ustore_snapshot_t)snapshot;
+        return 1;
+    }
+    if (PyUnicode_CompareWithASCIIString(name, "flush") == 0) {
+        int const flushing = PyObject_IsTrue(value);
+        if (flushing < 0) return -1;
+        if (flushing) options->options |= ustore_option_write_flush_k;
+        return 1;
+    }
+    return 0;
+}
+
+int ustore_py_verb_options_from_keywords(ustore_py_context_t const* context, PyObject* const* args,
+                                         Py_ssize_t positional_args_count, PyObject* args_names_tuple,
+                                         ustore_py_verb_options_t* options) {
+    ustore_py_verb_options_init(context, options);
+    Py_ssize_t const args_names_count = args_names_tuple ? PyTuple_GET_SIZE(args_names_tuple) : 0;
+    for (Py_ssize_t names_progress = 0, args_progress = positional_args_count; names_progress != args_names_count;
+         ++args_progress, ++names_progress) {
+        PyObject* const name = PyTuple_GET_ITEM(args_names_tuple, names_progress);
+        int const consumed = ustore_py_verb_option_from_keyword(context, name, args[args_progress], options);
+        if (consumed < 0) return -1;
+        if (consumed == 0) {
+            PyErr_Format(PyExc_TypeError, "Got unexpected keyword argument: %S", name);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+#pragma endregion Verb Options

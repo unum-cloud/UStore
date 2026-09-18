@@ -13,7 +13,7 @@ use crate::db::ffi::{
     ustore_enum_t, ustore_error_t, ustore_length_t, ustore_octet_t, ustore_size_t, ustore_snapshot_t,
     ustore_str_view_t, ustore_transaction_t, USTORE_OPTIONS_DEFAULT_K,
 };
-use crate::db::{check, fail, missing_length, Arena, Collection, Result, Status, View};
+use crate::db::{check, described_length, fail, first_count, missing_length, Arena, Collection, Result, Status, View};
 
 // region: Raw Declarations
 
@@ -165,12 +165,7 @@ impl<'arena> Names<'arena> {
 /// Reads the value a name holds in the catalog, or `None` when nothing answers to it.
 pub(crate) fn read_name<'arena>(view: View<'_>, arena: &'arena mut Arena, name: &str) -> Result<Option<&'arena [u8]>> {
     let text = name.as_ptr().cast::<c_char>();
-    let text_length = ustore_length_t::try_from(name.len()).map_err(|_| {
-        fail(
-            Status::CapacityExhausted,
-            "the name is longer than the ABI can describe",
-        )
-    })?;
+    let text_length = described_length(name.len(), "the name is longer than the ABI can describe")?;
     let catalog = Collection::names();
     let mut offsets: *mut ustore_length_t = ptr::null_mut();
     let mut lengths: *mut ustore_length_t = ptr::null_mut();
@@ -214,23 +209,13 @@ pub(crate) fn read_name<'arena>(view: View<'_>, arena: &'arena mut Arena, name: 
 /// Binds a name to `value` in the catalog, or unbinds it when no value is given.
 pub(crate) fn write_name(view: View<'_>, arena: &mut Arena, name: &str, value: Option<&[u8]>) -> Result<()> {
     let text = name.as_ptr().cast::<c_char>();
-    let text_length = ustore_length_t::try_from(name.len()).map_err(|_| {
-        fail(
-            Status::CapacityExhausted,
-            "the name is longer than the ABI can describe",
-        )
-    })?;
+    let text_length = described_length(name.len(), "the name is longer than the ABI can describe")?;
     let bytes: ustore_bytes_cptr_t = match value {
         Some(value) => value.as_ptr(),
         None => ptr::null(),
     };
     let bytes_length = match value {
-        Some(value) => ustore_length_t::try_from(value.len()).map_err(|_| {
-            fail(
-                Status::CapacityExhausted,
-                "the value is longer than the ABI can describe",
-            )
-        })?,
+        Some(value) => described_length(value.len(), "the value is longer than the ABI can describe")?,
         None => 0,
     };
     let catalog = Collection::names();
@@ -288,20 +273,10 @@ impl View<'_> {
         limit: u32,
     ) -> Result<Names<'arena>> {
         let prefix_text = prefix.as_ptr().cast::<c_char>();
-        let prefix_length = ustore_length_t::try_from(prefix.len()).map_err(|_| {
-            fail(
-                Status::CapacityExhausted,
-                "the prefix is longer than the ABI can describe",
-            )
-        })?;
+        let prefix_length = described_length(prefix.len(), "the prefix is longer than the ABI can describe")?;
         let start_text = start.map_or(ptr::null(), |text| text.as_ptr().cast::<c_char>());
         let start_length = match start {
-            Some(text) => ustore_length_t::try_from(text.len()).map_err(|_| {
-                fail(
-                    Status::CapacityExhausted,
-                    "the start is longer than the ABI can describe",
-                )
-            })?,
+            Some(text) => described_length(text.len(), "the start is longer than the ABI can describe")?,
             None => 0,
         };
         let catalog = Collection::names();
@@ -344,18 +319,13 @@ impl View<'_> {
         unsafe { ffi::ustore_strings_scan(&mut arguments) };
         check(error)?;
 
-        // SAFETY: a successful walk exports one count, then that many names inside one tape the
-        // offsets close, all of it alive for as long as the arena stays borrowed.
-        let names = unsafe {
-            Names {
-                offsets,
-                tape,
-                count: match counts.is_null() {
-                    true => 0,
-                    false => *counts as usize,
-                },
-                marker: PhantomData,
-            }
+        // A successful walk exports that many names inside one tape the offsets close, all of it
+        // alive for as long as the arena stays borrowed.
+        let names = Names {
+            offsets,
+            tape,
+            count: first_count(counts),
+            marker: PhantomData,
         };
         for index in 0..names.count {
             // SAFETY: `index` is below the count the walk reported, and the tape is still borrowed.

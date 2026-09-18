@@ -41,17 +41,14 @@ ustore_py_naming_t ustore_py_collection_named(ustore_py_context_t const* context
     ustore_strings_read(&read);
     Py_END_ALLOW_THREADS;
 
+    // An engine without collections of its own refuses the reserved collection outright, which is
+    // the same answer as an unknown name to everyone above this call.
     ustore_py_naming_t verdict = ustore_py_naming_missing_k;
-    if (error.status != ustore_success_k) {
-        // An engine without collections of its own refuses the reserved collection outright, which
-        // is the same answer as an unknown name to everyone above this call.
-        if (error.status == ustore_error_unsupported_k) { verdict = ustore_py_naming_missing_k; }
-        else {
-            ustore_py_raise_on_error(&error);
-            verdict = ustore_py_naming_failed_k;
-        }
+    if (error.status != ustore_success_k && error.status != ustore_error_unsupported_k) {
+        ustore_py_raise_on_error(&error);
+        verdict = ustore_py_naming_failed_k;
     }
-    else if (lengths[0] == sizeof(ustore_collection_t)) {
+    else if (error.status == ustore_success_k && lengths[0] == sizeof(ustore_collection_t)) {
         memcpy(collection, values + offsets[0], sizeof(ustore_collection_t));
         verdict = ustore_py_naming_found_k;
     }
@@ -129,14 +126,6 @@ int ustore_py_collection_from_object(ustore_py_context_t const* context, PyObjec
 
 #pragma region Walks
 
-/**
- *  @brief Lists the names recorded in the reserved collection, up to @p limit of them.
- *  @param[in] context The database and view to walk.
- *  @param[in] after The name to resume from, or NULL to start at the first one.
- *  @param[in] after_length The length of @p after in bytes.
- *  @param[in] limit Most names the walk returns.
- *  @return A new tuple of names, or NULL with an exception set.
- */
 PyObject* ustore_py_collection_names(ustore_py_context_t const* context, char const* after, size_t after_length,
                                      size_t limit) {
     ustore_collection_t const names = ustore_collection_names_k;

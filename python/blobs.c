@@ -11,90 +11,6 @@
  */
 #include "lib.h"
 
-#pragma region Shared Arguments
-
-/** The view and options every verb accepts beside its own arguments. */
-typedef struct verb_options_t {
-
-    /** The collection the tasks address. */
-    ustore_collection_t collection;
-
-    /** The snapshot a read follows, or zero for the head. */
-    ustore_snapshot_t snapshot;
-
-    /** Flags the verb adds to the view's own. */
-    ustore_options_t options;
-} verb_options_t;
-
-/**
- *  @brief Reads the keywords shared by every verb, leaving the rest to the caller.
- *  @param[in] context The database and view the verb runs against.
- *  @param[in] name The keyword's name.
- *  @param[in] value The keyword's value.
- *  @param[out] options Where a recognized keyword lands.
- *  @return 1 when the keyword was consumed, 0 when it belongs to the verb, -1 on a failure.
- */
-static int verb_option_from_keyword(ustore_py_context_t const* context, PyObject* name, PyObject* value,
-                                    verb_options_t* options) {
-    if (PyUnicode_CompareWithASCIIString(name, "collection") == 0)
-        return ustore_py_collection_from_object(context, value, &options->collection) == 0 ? 1 : -1;
-    if (PyUnicode_CompareWithASCIIString(name, "snapshot") == 0) {
-        size_t snapshot = 0;
-        if (ustore_py_size_from_object(value, "snapshot", &snapshot) != 0) return -1;
-        // A call addresses exactly one view, so a transaction and a snapshot are never both named.
-        if (snapshot && context->transaction) {
-            ustore_py_raise(ustore_error_invalid_argument_k,
-                            "A transaction already fixes the view, so it takes no snapshot");
-            return -1;
-        }
-        options->snapshot = (ustore_snapshot_t)snapshot;
-        return 1;
-    }
-    if (PyUnicode_CompareWithASCIIString(name, "flush") == 0) {
-        int const flushing = PyObject_IsTrue(value);
-        if (flushing < 0) return -1;
-        if (flushing) options->options |= ustore_option_write_flush_k;
-        return 1;
-    }
-    return 0;
-}
-
-/** Starts the shared options from @p context, so a verb only overrides what a keyword names. */
-static void verb_options_init(ustore_py_context_t const* context, verb_options_t* options) {
-    options->collection = ustore_collection_main_k;
-    options->snapshot = 0;
-    options->options = context->options;
-}
-
-/**
- *  @brief Walks the keywords of a verb that takes none of its own.
- *  @param[in] context The database and view the verb runs against.
- *  @param[in] args The fast-call arguments, positional ones first.
- *  @param[in] positional_args_count Positional arguments the call carried.
- *  @param[in] args_names_tuple The keyword names, or NULL when none followed.
- *  @param[out] options Where every recognized keyword lands.
- *  @return 0 on success, -1 with an exception set otherwise.
- */
-static int verb_options_from_keywords(ustore_py_context_t const* context, PyObject* const* args,
-                                      Py_ssize_t positional_args_count, PyObject* args_names_tuple,
-                                      verb_options_t* options) {
-    verb_options_init(context, options);
-    Py_ssize_t const args_names_count = args_names_tuple ? PyTuple_GET_SIZE(args_names_tuple) : 0;
-    for (Py_ssize_t names_progress = 0, args_progress = positional_args_count; names_progress != args_names_count;
-         ++args_progress, ++names_progress) {
-        PyObject* const name = PyTuple_GET_ITEM(args_names_tuple, names_progress);
-        int const consumed = verb_option_from_keyword(context, name, args[args_progress], options);
-        if (consumed < 0) return -1;
-        if (consumed == 0) {
-            PyErr_Format(PyExc_TypeError, "Got unexpected keyword argument: %S", name);
-            return -1;
-        }
-    }
-    return 0;
-}
-
-#pragma endregion Shared Arguments
-
 #pragma region Reads
 
 char const doc_read[] =                                                                   //
@@ -123,8 +39,9 @@ PyObject* ustore_py_api_read(PyObject* self, PyObject* const* args, Py_ssize_t p
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
     if (ustore_py_args_names_count_checked("read", positional_args_count, args_names_tuple, 1) < 0) return NULL;
 
-    verb_options_t options;
-    if (verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0) return NULL;
+    ustore_py_verb_options_t options;
+    if (ustore_py_verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0)
+        return NULL;
 
     ustore_py_keys_t keys;
     if (ustore_py_keys_from_object(args[0], &keys) != 0) return NULL;
@@ -186,8 +103,9 @@ PyObject* ustore_py_api_get(PyObject* self, PyObject* const* args, Py_ssize_t po
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
     if (ustore_py_args_names_count_checked("get", positional_args_count, args_names_tuple, 1) < 0) return NULL;
 
-    verb_options_t options;
-    if (verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0) return NULL;
+    ustore_py_verb_options_t options;
+    if (ustore_py_verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0)
+        return NULL;
 
     ustore_key_t key = 0;
     if (ustore_py_key_from_object(args[0], &key) != 0) return NULL;
@@ -242,8 +160,9 @@ PyObject* ustore_py_api_contains(PyObject* self, PyObject* const* args, Py_ssize
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
     if (ustore_py_args_names_count_checked("contains", positional_args_count, args_names_tuple, 1) < 0) return NULL;
 
-    verb_options_t options;
-    if (verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0) return NULL;
+    ustore_py_verb_options_t options;
+    if (ustore_py_verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0)
+        return NULL;
 
     ustore_key_t key = 0;
     if (ustore_py_key_from_object(args[0], &key) != 0) return NULL;
@@ -284,12 +203,10 @@ PyObject* ustore_py_api_contains(PyObject* self, PyObject* const* args, Py_ssize
  *  @brief Gathers the values of a batch, broadcasting one value or removing every key.
  *  @param[in] object The values: a sequence, one buffer to broadcast, or None to remove.
  *  @param[in] count Keys the batch carries.
- *  @param[out] batch The borrowed runs the ABI reads.
- *  @param[out] broadcasting Whether one value repeats across every key.
+ *  @param[out] batch The borrowed runs the ABI reads, and the layout they travel with.
  *  @return 0 on success, -1 with an exception set otherwise.
  */
-static int contents_from_object(PyObject* object, size_t count, ustore_py_contents_t* batch, int* broadcasting) {
-    *broadcasting = 0;
+static int contents_from_object(PyObject* object, size_t count, ustore_py_contents_t* batch) {
     if (object == Py_None) {
         // A batch with no values at all removes every key, which the ABI spells as a null run.
         memset(batch, 0, sizeof(*batch));
@@ -303,7 +220,7 @@ static int contents_from_object(PyObject* object, size_t count, ustore_py_conten
             ustore_py_contents_release(batch);
             return -1;
         }
-        *broadcasting = 1;
+        batch->layout = ustore_py_contents_broadcast_k;
         return 0;
     }
 
@@ -351,15 +268,15 @@ PyObject* ustore_py_api_write(PyObject* self, PyObject* const* args, Py_ssize_t 
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
     if (ustore_py_args_names_count_checked("write", positional_args_count, args_names_tuple, 2) < 0) return NULL;
 
-    verb_options_t options;
-    if (verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0) return NULL;
+    ustore_py_verb_options_t options;
+    if (ustore_py_verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0)
+        return NULL;
 
     ustore_py_keys_t keys;
     if (ustore_py_keys_from_object(args[0], &keys) != 0) return NULL;
 
     ustore_py_contents_t contents;
-    int broadcasting = 0;
-    if (contents_from_object(args[1], keys.count, &contents, &broadcasting) != 0) {
+    if (contents_from_object(args[1], keys.count, &contents) != 0) {
         ustore_py_keys_release(&keys);
         return NULL;
     }
@@ -380,8 +297,8 @@ PyObject* ustore_py_api_write(PyObject* self, PyObject* const* args, Py_ssize_t 
     write.values = contents.values;
     write.lengths = contents.lengths;
     // A stride of zero repeats the first entry, which is how one value reaches every key.
-    write.values_stride = broadcasting ? 0 : sizeof(ustore_bytes_cptr_t);
-    write.lengths_stride = broadcasting ? 0 : sizeof(ustore_length_t);
+    write.values_stride = contents.layout == ustore_py_contents_broadcast_k ? 0 : sizeof(ustore_bytes_cptr_t);
+    write.lengths_stride = contents.layout == ustore_py_contents_broadcast_k ? 0 : sizeof(ustore_length_t);
 
     Py_BEGIN_ALLOW_THREADS;
     ustore_write(&write);
@@ -411,8 +328,9 @@ PyObject* ustore_py_api_set(PyObject* self, PyObject* const* args, Py_ssize_t po
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
     if (ustore_py_args_names_count_checked("set", positional_args_count, args_names_tuple, 2) < 0) return NULL;
 
-    verb_options_t options;
-    if (verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0) return NULL;
+    ustore_py_verb_options_t options;
+    if (ustore_py_verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0)
+        return NULL;
 
     ustore_key_t key = 0;
     if (ustore_py_key_from_object(args[0], &key) != 0) return NULL;
@@ -465,13 +383,15 @@ PyObject* ustore_py_api_pop(PyObject* self, PyObject* const* args, Py_ssize_t po
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
     if (ustore_py_args_names_count_checked("pop", positional_args_count, args_names_tuple, 1) < 0) return NULL;
 
-    verb_options_t options;
-    if (verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0) return NULL;
+    ustore_py_verb_options_t options;
+    if (ustore_py_verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0)
+        return NULL;
 
     ustore_key_t single = 0;
     ustore_py_keys_t keys;
     memset(&keys, 0, sizeof(keys));
-    if (PyIndex_Check(args[0])) {
+    // An array exports an index too, so only something that is not a sequence reads as one key.
+    if (PyIndex_Check(args[0]) && !PySequence_Check(args[0])) {
         if (ustore_py_key_from_object(args[0], &single) != 0) return NULL;
         keys.keys = &single;
         keys.count = 1;
@@ -527,8 +447,9 @@ PyObject* ustore_py_api_scan(PyObject* self, PyObject* const* args, Py_ssize_t p
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
     if (ustore_py_args_names_count_checked("scan", positional_args_count, args_names_tuple, 2) < 0) return NULL;
 
-    verb_options_t options;
-    if (verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0) return NULL;
+    ustore_py_verb_options_t options;
+    if (ustore_py_verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0)
+        return NULL;
 
     ustore_key_t start = 0;
     size_t limit = 0;
@@ -592,8 +513,9 @@ PyObject* ustore_py_api_sample(PyObject* self, PyObject* const* args, Py_ssize_t
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
     if (ustore_py_args_names_count_checked("sample", positional_args_count, args_names_tuple, 1) < 0) return NULL;
 
-    verb_options_t options;
-    if (verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0) return NULL;
+    ustore_py_verb_options_t options;
+    if (ustore_py_verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0)
+        return NULL;
 
     size_t wanted = 0;
     if (ustore_py_size_from_object(args[0], "count", &wanted) != 0) return NULL;
@@ -656,8 +578,9 @@ PyObject* ustore_py_api_measure(PyObject* self, PyObject* const* args, Py_ssize_
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
     if (ustore_py_args_names_count_checked("measure", positional_args_count, args_names_tuple, 2) < 0) return NULL;
 
-    verb_options_t options;
-    if (verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0) return NULL;
+    ustore_py_verb_options_t options;
+    if (ustore_py_verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0)
+        return NULL;
 
     ustore_key_t start = 0;
     ustore_key_t end = 0;

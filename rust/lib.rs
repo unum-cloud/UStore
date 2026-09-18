@@ -39,6 +39,8 @@
 
 pub mod blobs;
 pub mod db;
+pub mod docs;
+pub mod graph;
 pub mod strings;
 
 #[cfg(test)]
@@ -49,4 +51,9 @@ pub use db::{
     key_unknown, Arena, Collection, Configuration, Database, Durability, Error, Isolation, Key, Metadata, Removed,
     Result, SequenceNumber, Snapshot, SnapshotId, Status, Transaction, View,
 };
+pub use docs::{
+    Binary, Bitmap, Column, ColumnFormat, Document, FieldAddress, FieldEntry, FieldFormat, Json, Modification, Paths,
+    ReadFormat, Scalar, Strings, Table, Text,
+};
+pub use graph::{default_edge_id, degree_missing, Degree, Edge, Neighborhoods, Role, Roles};
 pub use strings::Names;

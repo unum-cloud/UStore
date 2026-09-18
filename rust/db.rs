@@ -356,6 +356,14 @@ pub(crate) fn missing_length() -> ffi::ustore_length_t {
     unsafe { ffi::ustore_length_missing_k }
 }
 
+/// The length the ABI carries for `length` bytes, refusing one past 32 bits or equal to the missing length.
+pub(crate) fn described_length(length: usize, message: &'static str) -> Result<ffi::ustore_length_t> {
+    match ffi::ustore_length_t::try_from(length) {
+        Ok(described) if described != missing_length() => Ok(described),
+        _ => Err(fail(Status::CapacityExhausted, message)),
+    }
+}
+
 /// The key that stands for no key.
 pub fn key_unknown() -> Key {
     // SAFETY: the library defines the constant once and never writes it.
@@ -752,6 +760,15 @@ pub(crate) unsafe fn exported_slice<'arena, Value>(first: *const Value, count: u
     match count == 0 || first.is_null() {
         true => &[],
         false => std::slice::from_raw_parts(first, count),
+    }
+}
+
+/// How much the one task of a call found, or zero when it never reached an engine.
+pub(crate) fn first_count(counts: *const ffi::ustore_length_t) -> usize {
+    match counts.is_null() {
+        true => 0,
+        // SAFETY: a successful call exports one count per task, and there is exactly one task.
+        false => unsafe { *counts as usize },
     }
 }
 

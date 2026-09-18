@@ -11,6 +11,8 @@ python_add_library(
     types.c
     database.c
     blobs.c
+    docs.c
+    graph.c
     strings.c
 )
 
@@ -33,8 +35,14 @@ if (NOT MSVC)
 endif ()
 
 # Every engine library defines the same `ustore_*` symbols, so exactly one links into the extension until `c/lib.cpp`
-# dispatches between them; SmashTable always builds and leads the list.
-list(GET USTORE_ENGINE_NAMES 0 USTORE_PYTHON_ENGINE)
+# dispatches between them; SmashTable always builds, so it is the default.
+set(USTORE_PYTHON_ENGINE
+    "smashtable"
+    CACHE STRING "The engine the CPython extension links"
+)
+if (NOT USTORE_PYTHON_ENGINE IN_LIST USTORE_ENGINE_NAMES)
+    message(FATAL_ERROR "USTORE_PYTHON_ENGINE names '${USTORE_PYTHON_ENGINE}', which this tree does not build")
+endif ()
 target_link_libraries(ustore_python PRIVATE ustore_embedded_${USTORE_PYTHON_ENGINE})
 
 # The engine this extension carries, until `ustore_engine_compiled` answers the same question.

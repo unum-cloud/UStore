@@ -7,14 +7,22 @@ interpreter running the tests. The package floor is 3.12.
 from collections.abc import Sequence
 from os import PathLike
 from types import TracebackType
-from typing import Self
+from typing import Literal, Self
 
 type Buffer = memoryview | bytes | bytearray
 type CollectionLike = int | str | None
 type KeysLike = Sequence[int] | Buffer
 type ValueLike = Buffer | None
+type DocumentLike = str | Buffer | None
+type FieldType = Literal[
+    "json", "str", "bytes", "null", "bool", "f64", "f32", "i64", "i32", "i16", "i8", "u64", "u32", "u16", "u8"
+]
+type GatherType = Literal["bool", "f64", "f32", "i64", "i32", "i16", "i8", "u64", "u32", "u16", "u8", "str", "bytes"]
+type Modification = Literal["upsert", "update", "insert", "patch", "merge"]
+type Role = Literal["source", "target", "any"]
 
 __version__: str
+default_edge_id: int
 
 def engines_compiled() -> tuple[str, ...]:
     """The engines this build carries."""
@@ -70,6 +78,32 @@ class Keys:
 
     def __len__(self) -> int: ...
     def __getitem__(self, task: int) -> memoryview: ...
+    def __buffer__(self, flags: int) -> memoryview: ...
+
+class Columns:
+    """The typed columns one gather exported, read straight out of the arena holding them."""
+
+    types: tuple[str, ...]
+    rows: int
+
+    def __len__(self) -> int: ...
+    def __getitem__(self, field: int) -> memoryview | tuple[str | bytes | None, ...]: ...
+    def validity(self, field: int) -> memoryview:
+        """The bitmap of documents whose value was found and converted."""
+
+    def conversion(self, field: int) -> memoryview:
+        """The bitmap of values whose conversion changed their meaning."""
+
+    def collision(self, field: int) -> memoryview:
+        """The bitmap of values of a type no conversion reaches."""
+
+class Edges:
+    """The edges one batch lookup found, read straight out of the arena holding them."""
+
+    degrees: tuple[int | None, ...]
+
+    def __len__(self) -> int: ...
+    def __getitem__(self, vertex: int) -> memoryview | None: ...
     def __buffer__(self, flags: int) -> memoryview: ...
 
 # endregion: Result Tapes
@@ -148,6 +182,67 @@ class Database:
     def set(self, key: int, value: ValueLike, *, collection: CollectionLike = None, flush: bool = False) -> None: ...
     def pop(self, keys: int | KeysLike, *, collection: CollectionLike = None, flush: bool = False) -> None: ...
     def contains(self, key: int, *, collection: CollectionLike = None, snapshot: int = 0) -> bool: ...
+    def docs_write(
+        self,
+        keys: KeysLike | None,
+        documents: Sequence[DocumentLike] | DocumentLike,
+        *,
+        collection: CollectionLike = None,
+        field: str | None = None,
+        modification: Modification = "upsert",
+        type: FieldType = "json",
+        id_field: str | None = None,
+        flush: bool = False,
+    ) -> None: ...
+    def docs_read(
+        self,
+        keys: KeysLike,
+        *,
+        collection: CollectionLike = None,
+        snapshot: int = 0,
+        field: str | None = None,
+        type: Literal["json", "str"] = "json",
+    ) -> Values: ...
+    def docs_gist(self, keys: KeysLike, *, collection: CollectionLike = None, snapshot: int = 0) -> tuple[str, ...]: ...
+    def docs_gather(
+        self,
+        keys: KeysLike,
+        fields: Sequence[str],
+        types: GatherType | Sequence[GatherType],
+        *,
+        collection: CollectionLike = None,
+        snapshot: int = 0,
+    ) -> Columns: ...
+    def graph_upsert_edges(
+        self,
+        sources: KeysLike,
+        targets: KeysLike,
+        *,
+        edges: KeysLike | None = None,
+        collection: CollectionLike = None,
+        flush: bool = False,
+    ) -> None: ...
+    def graph_remove_edges(
+        self,
+        sources: KeysLike,
+        targets: KeysLike,
+        *,
+        edges: KeysLike | None = None,
+        collection: CollectionLike = None,
+        flush: bool = False,
+    ) -> None: ...
+    def graph_find_edges(
+        self, vertices: KeysLike, *, role: Role = "any", collection: CollectionLike = None, snapshot: int = 0
+    ) -> Edges: ...
+    def graph_degrees(
+        self, vertices: KeysLike, *, role: Role = "any", collection: CollectionLike = None, snapshot: int = 0
+    ) -> tuple[int | None, ...]: ...
+    def graph_upsert_vertices(
+        self, vertices: KeysLike, *, collection: CollectionLike = None, flush: bool = False
+    ) -> None: ...
+    def graph_remove_vertices(
+        self, vertices: KeysLike, *, role: Role = "any", collection: CollectionLike = None, flush: bool = False
+    ) -> None: ...
 
 class Transaction:
     """An optimistic transaction grouping operations across collections and modalities."""
@@ -189,5 +284,64 @@ class Transaction:
     def set(self, key: int, value: ValueLike, *, collection: CollectionLike = None, flush: bool = False) -> None: ...
     def pop(self, keys: int | KeysLike, *, collection: CollectionLike = None, flush: bool = False) -> None: ...
     def contains(self, key: int, *, collection: CollectionLike = None) -> bool: ...
+    def docs_write(
+        self,
+        keys: KeysLike | None,
+        documents: Sequence[DocumentLike] | DocumentLike,
+        *,
+        collection: CollectionLike = None,
+        field: str | None = None,
+        modification: Modification = "upsert",
+        type: FieldType = "json",
+        id_field: str | None = None,
+        flush: bool = False,
+    ) -> None: ...
+    def docs_read(
+        self,
+        keys: KeysLike,
+        *,
+        collection: CollectionLike = None,
+        field: str | None = None,
+        type: Literal["json", "str"] = "json",
+    ) -> Values: ...
+    def docs_gist(self, keys: KeysLike, *, collection: CollectionLike = None) -> tuple[str, ...]: ...
+    def docs_gather(
+        self,
+        keys: KeysLike,
+        fields: Sequence[str],
+        types: GatherType | Sequence[GatherType],
+        *,
+        collection: CollectionLike = None,
+    ) -> Columns: ...
+    def graph_upsert_edges(
+        self,
+        sources: KeysLike,
+        targets: KeysLike,
+        *,
+        edges: KeysLike | None = None,
+        collection: CollectionLike = None,
+        flush: bool = False,
+    ) -> None: ...
+    def graph_remove_edges(
+        self,
+        sources: KeysLike,
+        targets: KeysLike,
+        *,
+        edges: KeysLike | None = None,
+        collection: CollectionLike = None,
+        flush: bool = False,
+    ) -> None: ...
+    def graph_find_edges(
+        self, vertices: KeysLike, *, role: Role = "any", collection: CollectionLike = None
+    ) -> Edges: ...
+    def graph_degrees(
+        self, vertices: KeysLike, *, role: Role = "any", collection: CollectionLike = None
+    ) -> tuple[int | None, ...]: ...
+    def graph_upsert_vertices(
+        self, vertices: KeysLike, *, collection: CollectionLike = None, flush: bool = False
+    ) -> None: ...
+    def graph_remove_vertices(
+        self, vertices: KeysLike, *, role: Role = "any", collection: CollectionLike = None, flush: bool = False
+    ) -> None: ...
 
 # endregion: Handles

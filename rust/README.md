@@ -92,6 +92,81 @@ database.drop_collection(&mut arena, "people")?;
 `Collection::main` is the collection every database holds, which `Database::clear_collection` may empty but nothing may drop.
 Walks paginate rather than hold an iterator over concurrent state: a scan resumes from a key and a name walk from a name.
 
+## Documents
+
+Documents are JSON text, and the C ABI parses them inside the engine, so the crate never parses JSON itself.
+A field is a top-level key or an RFC 6901 pointer the engine reads up to its null terminator, which is why every field is a `&CStr`: a `c"/user/name"` literal crosses the boundary as it stands.
+
+```rust
+use ustore::{Column, Document, FieldAddress, FieldEntry, Json, Modification, Text};
+
+let documents = [Entry::new(1, br#"{"name":"Ada","born":1815}"#)?];
+database.head().write_documents(&mut arena, people, &documents, Modification::Upsert, Durability::Buffered)?;
+
+let keyed = [Document::new(r#"{"_id":2,"name":"Grace"}"#)?];
+database.head().write_documents_by_id(&mut arena, people, c"_id", &keyed, Modification::Insert, Durability::Buffered)?;
+
+let died = [FieldEntry::<i64>::new(1, c"died", &1852)?];
+database.head().write_fields(&mut arena, people, &died, Modification::Upsert, Durability::Buffered)?;
+let family = [FieldEntry::<Json>::new(1, c"/family", r#"{"father":"Byron"}"#)?, FieldEntry::<Json>::removal(1, c"born")];
+database.head().write_fields(&mut arena, people, &family, Modification::Upsert, Durability::Buffered)?;
+
+let whole = database.head().read_documents(&mut arena, people, &[1, 2])?;
+let names = database.head().read_fields::<Text>(&mut arena, people, &[FieldAddress::new(1, c"name")])?;
+```
+
+A field write carries one format for the whole batch, named by the type of its entries: a scalar from `f64` down to `u8` or `bool`, `Text` for a JSON string, or `Json` for any JSON value.
+Mixing two formats in one batch does not compile, and an entry built with `FieldEntry::removal` removes its field.
+`Modification` chooses between an upsert, an update, an insert, an RFC 6902 patch and an RFC 7386 merge.
+Reads hand back the same `Values` a binary read does, exported as `Json` or as printed `Text`, with a missing document or field reported as `None`.
+
+A gist lists the unique paths to the leaves of a batch of documents as `&CStr` pointers, and a gather converts fields into typed columns, a row per key:
+
+```rust
+let paths = database.head().gist(&mut arena, people, &[1, 2])?;
+
+let columns = [Column::new::<u64>(c"born"), Column::new::<Text>(c"name")];
+let table = database.head().gather(&mut other_arena, people, &[1, 2], &columns)?;
+let born: &[u64] = table.scalars::<u64>(0)?;
+let valid = table.validities(0).unwrap().get(1);
+let name = table.strings(1)?.get(0);
+```
+
+A `Table` borrows its arena and the columns it was asked for, and hands out scalar columns as slices straight out of the arena.
+Every column carries three bitmaps: validity for a value found and converted, conversions for a value whose meaning changed on the way, such as text parsed into a number, and collisions for a value of a type that would not convert.
+Asking for a column in a type other than the one it was gathered in is refused with `Status::InvalidArgument`.
+Paths from one arena address the fields a gather reads through another.
+
+## Graphs
+
+A graph collection stores every vertex as its degrees and sorted edges, and an `Edge` is laid out as the source, target and identifier keys the ABI puts on its tapes.
+A slice of edges therefore crosses as three strided columns, and the tape a lookup exports reads back as `&[Edge]` without a copy.
+
+```rust
+use ustore::{Edge, Role, Roles};
+
+let follows = database.create_collection(&mut arena, "follows")?;
+let edges = [Edge::new(1, 2), Edge::new(1, 3), Edge::with_id(2, 3, 7)];
+database.head().upsert_edges(&mut arena, follows, &edges, Durability::Buffered)?;
+database.head().upsert_vertices(&mut arena, follows, &[4], Durability::Buffered)?;
+
+let found = database.head().find_edges(&mut arena, follows, &[1, 3], Roles::Every(Role::Any))?;
+for (vertex, run) in [1, 3].iter().zip(found.iter()) {
+    for edge in run.unwrap_or_default() {
+        println!("{vertex} meets {:?}", edge.neighbor_of(*vertex));
+    }
+}
+
+let degrees = database.head().degrees(&mut arena, follows, &[1, 2], Roles::Each(&[Role::Source, Role::Target]))?;
+database.head().remove_edges(&mut arena, follows, &[Edge::with_id(2, 3, 7)], Durability::Buffered)?;
+database.head().remove_vertices(&mut arena, follows, &[1], Roles::Every(Role::Any), Durability::Buffered)?;
+```
+
+`Neighborhoods` holds the degree of every vertex and the edges of all of them on one tape, and its iterator splits the tape into one run per vertex.
+Within one role the edges of a vertex come sorted by neighbor, and with both roles the outgoing edges precede the incoming ones.
+`degrees` asks for the degrees alone, exporting no edges.
+`Roles::Every` gives the whole batch one role and `Roles::Each` gives every vertex its own, which must match the batch in length.
+
 ## Errors
 
 Every fallible call answers `Result<T, Error>`, where the error carries the `Status` the C ABI reported and the static message beside it, so nothing allocates on the failure path.
@@ -105,5 +180,5 @@ match database.head().collection(&mut arena, "nowhere") {
 
 ## What The Crate Covers
 
-Opening and closing, engine metadata and control requests, collections by identifier and by name, binary reads, writes, erases, scans, samples and measurements, transactions with staging, commit and rollback, and snapshots with export.
-The documents and graph modalities of `docs.h` and `graph.h`, batches spanning several collections at once, and the shared-memory and unwatched-read options are not bound yet.
+Opening and closing, engine metadata and control requests, collections by identifier and by name, binary reads, writes, erases, scans, samples and measurements, documents with whole and field writes, reads, gists and gathers, graphs with edge and vertex upserts, removals and lookups, transactions with staging, commit and rollback, and snapshots with export.
+Batches spanning several collections at once, the half-precision and UUID gather columns, and the shared-memory and unwatched-read options are not bound yet.

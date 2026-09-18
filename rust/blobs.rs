@@ -13,7 +13,8 @@ use crate::db::ffi::{
     ustore_transaction_t, USTORE_OPTIONS_DEFAULT_K,
 };
 use crate::db::{
-    check, exported_slice, fail, missing_length, Arena, Collection, Durability, Key, Result, Status, View,
+    check, described_length, exported_slice, first_count, missing_length, Arena, Collection, Durability, Key, Result,
+    View,
 };
 
 // region: Raw Declarations
@@ -143,9 +144,9 @@ mod ffi {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Entry<'value> {
-    key: Key,
-    value: *const u8,
-    length: ustore_length_t,
+    pub(crate) key: Key,
+    pub(crate) value: *const u8,
+    pub(crate) length: ustore_length_t,
     marker: PhantomData<&'value [u8]>,
 }
 
@@ -153,18 +154,7 @@ impl<'value> Entry<'value> {
     /// Pairs a key with the bytes to store under it, refusing a value past the 32-bit length the ABI
     /// carries.
     pub fn new(key: Key, value: &'value [u8]) -> Result<Self> {
-        let length = ustore_length_t::try_from(value.len()).map_err(|_| {
-            fail(
-                Status::CapacityExhausted,
-                "the value is longer than the ABI can describe",
-            )
-        })?;
-        if length == missing_length() {
-            return Err(fail(
-                Status::CapacityExhausted,
-                "the value is longer than the ABI can describe",
-            ));
-        }
+        let length = described_length(value.len(), "the value is longer than the ABI can describe")?;
         Ok(Entry {
             key,
             value: value.as_ptr(),
@@ -181,18 +171,7 @@ impl<'value> Entry<'value> {
     /// The bytes this entry stores.
     pub fn value(&self) -> &'value [u8] {
         // SAFETY: the pointer and the length came from one borrowed slice alive for `'value`.
-        unsafe { borrowed_bytes(self.value, self.length) }
-    }
-}
-
-/// Borrows `length` bytes the library reported, reading an empty run without dereferencing.
-///
-/// # Safety
-/// `first` addresses `length` initialized bytes that stay alive for `'bytes`.
-unsafe fn borrowed_bytes<'bytes>(first: *const u8, length: ustore_length_t) -> &'bytes [u8] {
-    match length == 0 || first.is_null() {
-        true => &[],
-        false => std::slice::from_raw_parts(first, length as usize),
+        unsafe { exported_slice(self.value, self.length as usize) }
     }
 }
 
@@ -214,6 +193,22 @@ pub struct Values<'arena> {
 }
 
 impl<'arena> Values<'arena> {
+    /// The run a read of `count` values exported, or an empty one when the read never reached an engine.
+    pub(crate) fn exported(
+        offsets: *const ustore_length_t,
+        lengths: *const ustore_length_t,
+        tape: *const ustore_byte_t,
+        count: usize,
+    ) -> Self {
+        Values {
+            offsets,
+            lengths,
+            tape,
+            count: if lengths.is_null() { 0 } else { count },
+            marker: PhantomData,
+        }
+    }
+
     /// How many keys the read covered.
     pub fn len(&self) -> usize {
         self.count
@@ -237,7 +232,7 @@ impl<'arena> Values<'arena> {
                 return None;
             }
             let offset = *self.offsets.add(index) as usize;
-            Some(borrowed_bytes(self.tape.add(offset), length))
+            Some(exported_slice(self.tape.add(offset), length as usize))
         }
     }
 
@@ -352,13 +347,7 @@ impl View<'_> {
         let mut lengths: *mut ustore_length_t = ptr::null_mut();
         let mut tape: *mut ustore_byte_t = ptr::null_mut();
         if keys.is_empty() {
-            return Ok(Values {
-                offsets,
-                lengths,
-                tape,
-                count: 0,
-                marker: PhantomData,
-            });
+            return Ok(Values::exported(offsets, lengths, tape, 0));
         }
         let mut error = ustore_error_t::default();
         let mut arguments = ffi::ustore_read_t {
@@ -381,13 +370,7 @@ impl View<'_> {
         // SAFETY: the keys and the outputs outlive the call.
         unsafe { ffi::ustore_read(&mut arguments) };
         check(error)?;
-        Ok(Values {
-            offsets,
-            lengths,
-            tape,
-            count: keys.len(),
-            marker: PhantomData,
-        })
+        Ok(Values::exported(offsets, lengths, tape, keys.len()))
     }
 
     /// Lists up to `limit` keys of one collection from `start`, which is how a walk paginates.
@@ -424,7 +407,7 @@ impl View<'_> {
         check(error)?;
         // SAFETY: a successful scan exports one count and that many keys into the arena, which stays
         // borrowed for as long as the slice does.
-        Ok(unsafe { exported_slice(keys, found_count(counts)) })
+        Ok(unsafe { exported_slice(keys, first_count(counts)) })
     }
 
     /// Draws up to `limit` keys uniformly at random from one collection.
@@ -458,7 +441,7 @@ impl View<'_> {
         check(error)?;
         // SAFETY: a successful sample exports one count and that many keys into the arena, which
         // stays borrowed for as long as the slice does.
-        Ok(unsafe { exported_slice(keys, found_count(counts)) })
+        Ok(unsafe { exported_slice(keys, first_count(counts)) })
     }
 
     /// Estimates the entries and the space a range of keys takes in one collection.
@@ -494,38 +477,24 @@ impl View<'_> {
         // SAFETY: the inputs and the outputs outlive the call.
         unsafe { ffi::ustore_measure(&mut arguments) };
         check(error)?;
-        // SAFETY: a successful measurement writes one estimate per column into the arena, which is
-        // read here before the call that would overwrite it.
-        unsafe {
-            Ok(Measurement {
-                min_entries: first_estimate(min_entries),
-                max_entries: first_estimate(max_entries),
-                min_value_bytes: first_estimate(min_value_bytes),
-                max_value_bytes: first_estimate(max_value_bytes),
-                min_space_usage: first_estimate(min_space_usages),
-                max_space_usage: first_estimate(max_space_usages),
-            })
-        }
-    }
-}
-
-/// How many keys the one task of a scan or a sample found.
-fn found_count(counts: *const ustore_length_t) -> usize {
-    match counts.is_null() {
-        true => 0,
-        // SAFETY: a successful call exports one count per task, and there is exactly one task.
-        false => unsafe { *counts as usize },
+        // The estimates are read here, before the call that would overwrite the arena holding them.
+        Ok(Measurement {
+            min_entries: first_estimate(min_entries),
+            max_entries: first_estimate(max_entries),
+            min_value_bytes: first_estimate(min_value_bytes),
+            max_value_bytes: first_estimate(max_value_bytes),
+            min_space_usage: first_estimate(min_space_usages),
+            max_space_usage: first_estimate(max_space_usages),
+        })
     }
 }
 
 /// The estimate one measured column reported for its single range.
-///
-/// # Safety
-/// `column` is null, or addresses one estimate the arena still holds.
-unsafe fn first_estimate(column: *const ustore_size_t) -> u64 {
+fn first_estimate(column: *const ustore_size_t) -> u64 {
     match column.is_null() {
         true => 0,
-        false => *column,
+        // SAFETY: a successful measurement writes one estimate per column into the arena.
+        false => unsafe { *column },
     }
 }
 
@@ -536,7 +505,7 @@ unsafe fn first_estimate(column: *const ustore_size_t) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{Configuration, Database, Removed};
+    use crate::db::{Configuration, Database, Removed, Status};
 
     /// A database holding `alpha`, `beta` and `gamma` under the keys one, two and three.
     fn populated() -> (Database, Arena) {
