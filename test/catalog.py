@@ -2,7 +2,7 @@
 
 import pytest
 import ustore
-from ustore_capabilities import ENGINE, NEEDS_COLLECTIONS
+from capabilities import ENGINE, NEEDS_COLLECTIONS
 
 pytestmark = NEEDS_COLLECTIONS
 

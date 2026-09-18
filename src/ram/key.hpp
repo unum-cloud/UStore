@@ -1,5 +1,5 @@
 /**
- *  @file src/smashtable/key.hpp
+ *  @file src/ram/key.hpp
  *  @author Ash Vardanian
  *  @date September 15, 2026
  *  @brief The composite key every pair of the SmashTable engine is stored under, with its order, hash and bounds.
@@ -17,7 +17,7 @@
 #include <ustore/db.h>
 #include <ustore/types.hpp>
 
-namespace unum::ustore::smashtable {
+namespace unum::ustore::ram {
 
 /** The identifier of the nameless main collection. */
 inline constexpr ustore_collection_t main_collection_k = 0;
@@ -100,4 +100,4 @@ struct stored_key_hash_t {
     }
 };
 
-} // namespace unum::ustore::smashtable
+} // namespace unum::ustore::ram

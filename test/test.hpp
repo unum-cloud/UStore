@@ -1,5 +1,5 @@
 /**
- *  @file tests/test.hpp
+ *  @file test/test.hpp
  *  @author Ash Vardanian
  *  @date September 15, 2026
  *  @brief Shared checks for the C++ test suites: failure counting, verdicts, bounded waits, flags and directories.

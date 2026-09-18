@@ -24,7 +24,7 @@
       "name": "C++: Test SmashTable",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/build_debug/build/bin/test_units_ustore_embedded_smashtable",
+      "program": "${workspaceFolder}/build_debug/build/bin/ustore_test_units_ram",
       "args": [
         "--directory",
         "${workspaceFolder}/build_debug/test_data"
@@ -47,7 +47,7 @@
       "name": "C++: Test LevelDB",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/build_debug/build/bin/test_units_ustore_embedded_leveldb",
+      "program": "${workspaceFolder}/build_debug/build/bin/ustore_test_units_leveldb",
       "args": [
         "--directory",
         "${workspaceFolder}/build_debug/test_data"
@@ -65,7 +65,7 @@
       "name": "C++: Test RocksDB",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/build_debug/build/bin/test_units_ustore_embedded_rocksdb",
+      "program": "${workspaceFolder}/build_debug/build/bin/ustore_test_units_rocksdb",
       "args": [
         "--directory",
         "${workspaceFolder}/build_debug/test_data"
@@ -80,10 +80,10 @@
       "miDebuggerPath": "/usr/bin/gdb"
     },
     {
-      "name": "C++: Test UDisk",
+      "name": "C++: Test NVMe",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/build_debug/build/bin/test_units_ustore_embedded_udisk",
+      "program": "${workspaceFolder}/build_debug/build/bin/ustore_test_units_nvme",
       "args": [
         "--directory",
         "${workspaceFolder}/build_debug/test_data"
@@ -93,7 +93,7 @@
       "showDisplayString": true,
       "stopAtEntry": false,
       "externalConsole": false,
-      "preLaunchTask": "Build Debug UDisk Test",
+      "preLaunchTask": "Build Debug NVMe Test",
       "MIMode": "gdb",
       "miDebuggerPath": "/usr/bin/gdb"
     },
@@ -101,7 +101,7 @@
       "name": "C++: Test SmashTable Stateless",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/build_debug/build/bin/test_units_ustore_embedded_smashtable",
+      "program": "${workspaceFolder}/build_debug/build/bin/ustore_test_units_ram",
       "args": [
         "--directory",
         "${workspaceFolder}/build_debug/test_data"
@@ -124,7 +124,7 @@
       "name": "C++: Stress Atomicity SmashTable",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/build_debug/build/bin/stress_atomicity_ustore_embedded_smashtable",
+      "program": "${workspaceFolder}/build_debug/build/bin/ustore_stress_atomicity_ram",
       "args": [
         "--directory",
         "${workspaceFolder}/build_debug/test_data"
@@ -147,7 +147,7 @@
       "name": "C++: Stress Atomicity RocksDB",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/build_debug/build/bin/stress_atomicity_ustore_embedded_rocksdb",
+      "program": "${workspaceFolder}/build_debug/build/bin/ustore_stress_atomicity_rocksdb",
       "args": [
         "--directory",
         "${workspaceFolder}/build_debug/test_data"
@@ -170,7 +170,7 @@
       "name": "C++: Stress Linearizability SmashTable",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/build_debug/build/bin/stress_linearizability_ustore_embedded_smashtable",
+      "program": "${workspaceFolder}/build_debug/build/bin/ustore_stress_linearizability_ram",
       "args": [
         "--directory",
         "${workspaceFolder}/build_debug/test_data"
@@ -193,7 +193,7 @@
       "name": "C++: Stress Linearizability RocksDB",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/build_debug/build/bin/stress_linearizability_ustore_embedded_rocksdb",
+      "program": "${workspaceFolder}/build_debug/build/bin/ustore_stress_linearizability_rocksdb",
       "args": [
         "--directory",
         "${workspaceFolder}/build_debug/test_data"
@@ -216,7 +216,7 @@
       "name": "C++: Benchmark SmashTable",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/build_debug/build/bin/bench_twitter_ustore_embedded_smashtable",
+      "program": "${workspaceFolder}/build_debug/build/bin/ustore_bench_twitter_ram",
       "args": [],
       "cwd": "${workspaceFolder}",
       "environment": [],
@@ -231,7 +231,7 @@
       "name": "C++: Benchmark RocksDB",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/build_debug/build/bin/bench_twitter_ustore_embedded_rocksdb",
+      "program": "${workspaceFolder}/build_debug/build/bin/ustore_bench_twitter_rocksdb",
       "args": [],
       "cwd": "${workspaceFolder}",
       "environment": [],
@@ -243,17 +243,17 @@
       "miDebuggerPath": "/usr/bin/gdb"
     },
     {
-      "name": "C++: Benchmark UDisk",
+      "name": "C++: Benchmark NVMe",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/build_debug/build/bin/bench_twitter_ustore_embedded_udisk",
+      "program": "${workspaceFolder}/build_debug/build/bin/ustore_bench_twitter_nvme",
       "args": [],
       "cwd": "${workspaceFolder}",
       "environment": [],
       "showDisplayString": true,
       "stopAtEntry": false,
       "externalConsole": false,
-      "preLaunchTask": "Build Debug UDisk Benchmark",
+      "preLaunchTask": "Build Debug NVMe Benchmark",
       "MIMode": "gdb",
       "miDebuggerPath": "/usr/bin/gdb"
     },
@@ -280,12 +280,12 @@
       "name": "C++: Test Tools",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/build_debug/build/bin/test_tools_ustore_embedded_smashtable",
+      "program": "${workspaceFolder}/build_debug/build/bin/ustore_test_tools_ram",
       "args": [
         "--directory",
         "${workspaceFolder}/build_debug/test_data",
         "--cli",
-        "${workspaceFolder}/build_debug/build/bin/ustore_cli_smashtable"
+        "${workspaceFolder}/build_debug/build/bin/ustore_cli_ram"
       ],
       "cwd": "${workspaceFolder}",
       "environment": [

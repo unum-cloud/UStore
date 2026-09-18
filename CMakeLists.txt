@@ -36,18 +36,18 @@ option(USTORE_INSTALL "Install CMake targets" OFF)
 
 option(USTORE_USE_ROCKSDB "Use RocksDB for a persistent engine" OFF)
 option(USTORE_USE_LEVELDB "Use LevelDB for a persistent engine" OFF)
-option(USTORE_USE_SPDK "Use SPDK for user-space NVMe access in UDisk" OFF)
+option(USTORE_USE_SPDK "Use SPDK for user-space NVMe access in NVMe" OFF)
 
 option(USTORE_BUILD_TEST_CPP "Compile a native unit test in C++" ${USTORE_IS_MAIN_PROJECT})
 option(USTORE_BUILD_BENCH_CPP "Compile a native benchmark in C++" ${USTORE_IS_MAIN_PROJECT})
 option(USTORE_BUILD_TOOLS_CPP "Compile the CLI and the dataset tools in C++" OFF)
 option(USTORE_BUILD_LIB_C "Compile a native library for the C interface, one per engine" OFF)
 option(USTORE_BUILD_LIB_PYTHON "Compile the CPython extension; `scikit-build-core` switches it on" OFF)
-option(USTORE_BUILD_UDISK "Compile the in-tree UDisk engine" OFF)
-option(USTORE_BUILD_CUDA "Compile UDisk's GPU compaction" OFF)
+option(USTORE_BUILD_NVME "Compile the in-tree NVMe engine" OFF)
+option(USTORE_BUILD_CUDA "Compile NVMe's GPU compaction" OFF)
 
-if (USTORE_BUILD_UDISK)
-    message(FATAL_ERROR "UStore: USTORE_BUILD_UDISK stays off until src/udisk builds")
+if (USTORE_BUILD_NVME)
+    message(FATAL_ERROR "UStore: USTORE_BUILD_NVME stays off until src/nvme builds")
 endif ()
 
 set(CMAKE_CXX_STANDARD 20)
@@ -159,7 +159,7 @@ endif ()
 set(LIB_FMT fmt::fmt)
 
 if (USTORE_BUILD_CUDA)
-    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/udisk_compaction.cmake")
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/nvme_compaction.cmake")
 endif ()
 
 # Without `USTORE_BUILD_LIB_C`, an engine library builds only for the targets that link it
@@ -167,19 +167,18 @@ if (NOT USTORE_BUILD_LIB_C AND NOT USTORE_INSTALL)
     set(USTORE_LIB_C_EXCLUSION EXCLUDE_FROM_ALL)
 endif ()
 
-set(USTORE_ENGINE_NAMES "smashtable")
+set(USTORE_ENGINE_NAMES "ram")
 add_library(
-    ustore_embedded_smashtable STATIC ${USTORE_LIB_C_EXCLUSION} src/smashtable/engine.cpp c/docs.cpp c/graph.cpp
-                                      c/strings.cpp
+    ustore_embedded_ram STATIC ${USTORE_LIB_C_EXCLUSION} src/ram/engine.cpp c/docs.cpp c/graph.cpp c/strings.cpp
 )
 target_link_libraries(
-    ustore_embedded_smashtable Threads::Threads yyjson forkunion::static smashtable::header ustore_stringzilla_dispatch
+    ustore_embedded_ram Threads::Threads yyjson forkunion::static smashtable::header ustore_stringzilla_dispatch
 )
-target_compile_definitions(ustore_embedded_smashtable INTERFACE USTORE_VERSION="${USTORE_VERSION}")
+target_compile_definitions(ustore_embedded_ram INTERFACE USTORE_VERSION="${USTORE_VERSION}")
 
 if (${USTORE_USE_ROCKSDB})
     add_library(
-        ustore_embedded_rocksdb STATIC ${USTORE_LIB_C_EXCLUSION} src/rocksdb/engine.cpp c/docs.cpp c/graph.cpp
+        ustore_embedded_rocksdb STATIC ${USTORE_LIB_C_EXCLUSION} src_oracles/rocksdb/engine.cpp c/docs.cpp c/graph.cpp
                                        c/strings.cpp
     )
     target_link_libraries(ustore_embedded_rocksdb ${LIB_ROCKSDB} Threads::Threads yyjson)
@@ -189,12 +188,12 @@ endif ()
 
 if (${USTORE_USE_LEVELDB})
     add_library(
-        ustore_embedded_leveldb STATIC ${USTORE_LIB_C_EXCLUSION} src/leveldb/engine.cpp c/docs.cpp c/graph.cpp
+        ustore_embedded_leveldb STATIC ${USTORE_LIB_C_EXCLUSION} src_oracles/leveldb/engine.cpp c/docs.cpp c/graph.cpp
                                        c/strings.cpp
     )
     target_link_libraries(ustore_embedded_leveldb ${LIB_LEVELDB} Threads::Threads yyjson)
     if (NOT MSVC)
-        set_source_files_properties(src/leveldb/engine.cpp PROPERTIES COMPILE_FLAGS -fno-rtti)
+        set_source_files_properties(src_oracles/leveldb/engine.cpp PROPERTIES COMPILE_FLAGS -fno-rtti)
     endif ()
     target_compile_definitions(ustore_embedded_leveldb INTERFACE USTORE_VERSION="${USTORE_VERSION}")
     list(APPEND USTORE_ENGINE_NAMES "leveldb")
@@ -241,24 +240,30 @@ endif ()
 
 if (${USTORE_BUILD_TEST_CPP})
     enable_testing()
-    set(USTORE_TEST_NAMES "test_api" "test_compilation" "test_units" "test_strings" "stress_atomicity"
-                          "stress_linearizability"
-    )
+    set(USTORE_TEST_NAMES "api" "compilation" "units" "strings" "strings_collection")
+    set(USTORE_STRESS_NAMES "atomicity" "linearizability")
 
     foreach (engine_name IN ITEMS ${USTORE_ENGINE_NAMES})
         set(client_lib ustore_embedded_${engine_name})
 
         foreach (test_name IN ITEMS ${USTORE_TEST_NAMES})
-            set(test_exe ${test_name}_${client_lib})
-            add_executable(${test_exe} tests/${test_name}.cpp)
+            set(test_exe ustore_test_${test_name}_${engine_name})
+            add_executable(${test_exe} test/${test_name}.cpp)
             target_link_libraries(${test_exe} ${LIB_FMT} ${client_lib})
             add_test(NAME ${test_exe} COMMAND ${test_exe} --directory ${CMAKE_BINARY_DIR}/test_data)
         endforeach ()
 
-        # The tools test drives the CLI of the same engine
+        foreach (stress_name IN ITEMS ${USTORE_STRESS_NAMES})
+            set(test_exe ustore_stress_${stress_name}_${engine_name})
+            add_executable(${test_exe} test/stress_${stress_name}.cpp)
+            target_link_libraries(${test_exe} ${LIB_FMT} ${client_lib})
+            add_test(NAME ${test_exe} COMMAND ${test_exe} --directory ${CMAKE_BINARY_DIR}/test_data)
+        endforeach ()
+
+        # The tools suite drives the CLI of the same engine
         if (${USTORE_BUILD_TOOLS_CPP})
-            set(test_exe test_tools_${client_lib})
-            add_executable(${test_exe} tests/test_tools.cpp tools/dataset.cpp)
+            set(test_exe ustore_test_tools_${engine_name})
+            add_executable(${test_exe} test/tools.cpp tools/dataset.cpp)
             target_link_libraries(${test_exe} ${LIB_FMT} ${client_lib} ustore_stringzilla_dispatch)
             add_dependencies(${test_exe} ustore_cli_${engine_name})
             add_test(NAME ${test_exe} COMMAND ${test_exe} --directory ${CMAKE_BINARY_DIR}/test_data --cli
@@ -273,15 +278,15 @@ if (${USTORE_BUILD_BENCH_CPP})
     foreach (engine_name IN ITEMS ${USTORE_ENGINE_NAMES})
         set(client_lib ustore_embedded_${engine_name})
 
-        set(bench_name bench_twitter_${client_lib})
+        set(bench_name ustore_bench_twitter_${engine_name})
         add_executable(${bench_name} bench/twitter.cpp)
         target_link_libraries(${bench_name} benchmark ${LIB_FMT} ${client_lib} ustore_stringzilla_dispatch)
 
-        set(bench_name bench_tabular_graph_${client_lib})
+        set(bench_name ustore_bench_tabular_graph_${engine_name})
         add_executable(${bench_name} bench/tabular_graph.cpp tools/dataset.cpp)
         target_link_libraries(${bench_name} benchmark ${LIB_FMT} ${client_lib} ustore_stringzilla_dispatch)
 
-        set(bench_name bench_louvain_${client_lib})
+        set(bench_name ustore_bench_louvain_${engine_name})
         add_executable(${bench_name} bench/louvain.cpp)
         target_link_libraries(${bench_name} benchmark ${LIB_FMT} ${client_lib} ustore_stringzilla_dispatch)
     endforeach ()

@@ -1,5 +1,5 @@
 /**
- *  @file tests/test_strings.cpp
+ *  @file test/strings.cpp
  *  @author Ash Vardanian
  *  @date September 16, 2026
  *  @brief Unit tests of the strings modality, which maps variable-length strings onto arbitrary bytes.

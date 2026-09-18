@@ -14,7 +14,7 @@ import ustore
 ENGINE = ustore.engines_compiled()[0]
 
 # Only SmashTable reads an "isolation" key; every other engine opens at the one level it has.
-ISOLATIONS = ["strict_serializable", "snapshot"] if ENGINE == "smashtable" else [None]
+ISOLATIONS = ["strict_serializable", "snapshot"] if ENGINE == "ram" else [None]
 
 
 def config(directory: str | os.PathLike[str], isolation: str | None = None) -> str:

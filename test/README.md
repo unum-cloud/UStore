@@ -1,6 +1,6 @@
 # Tests
 
-UStore's suites carry no framework: every check in `tests/test.hpp` returns its failure count, counts roll up through each case to `main`, and the process exit code is the verdict.
+UStore's suites carry no framework: every check in `test/test.hpp` returns its failure count, counts roll up through each case to `main`, and the process exit code is the verdict.
 A suite prints one `passed`, `FAILED` or `skipped` line per case and a `total` line last.
 
 ```cpp
@@ -22,22 +22,22 @@ int main(int argc, char** argv) {
 
 ## Suites
 
-- __Conformance__ — `test_units.cpp`, `test_api.cpp` and `test_compilation.cpp` check the C ABI and its C++ wrappers, identically on every engine.
-- __Tools__ — `test_tools.cpp` checks dataset imports and exports, and the CLI against a real directory.
-- __Components__ — `tests/udisk/` checks UDisk's parts below the C ABI.
+- __Conformance__ — `units.cpp`, `api.cpp`, `compilation.cpp`, `strings.cpp` and `strings_collection.cpp` check the C ABI and its C++ wrappers, identically on every engine.
+- __Tools__ — `tools.cpp` checks dataset imports and exports, and the CLI against a real directory.
+- __Components__ — `lsm_*.cpp` check the on-disk engine's parts below the C ABI.
 - __Stress__ — `stress_atomicity.cpp` and `stress_linearizability.cpp` check atomicity and linearizability under concurrent transactions.
-- __Python__ — `test_*.py` check the `ustore.lib` extension and its graph and table views, parametrized over batch shapes, views and isolation levels, and gated on what the linked engine supports; NetworkX and pandas serve as oracles for the views.
+- __Python__ — the Python suites check the `ustore.lib` extension and its graph and table views, parametrized over batch shapes, views and isolation levels, and gated on what the linked engine supports; NetworkX and pandas serve as oracles for the views.
 
 ### Conformance
 
-The C ABI scenarios — collections, transactions, snapshots, scans, documents and graphs — are written once and compiled into one executable per suite and engine, named `<suite>_ustore_embedded_<engine>`, such as `test_units_ustore_embedded_rocksdb`.
+The C ABI scenarios — collections, transactions, snapshots, scans, documents and graphs — are written once and compiled into one executable per suite and engine, named `ustore_test_<suite>_<engine>`, such as `ustore_test_units_rocksdb`.
 Every engine answers the same questions, and the translation units build in parallel.
-`test_units.cpp` drives blobs, documents and graphs through the C++ wrappers, `test_api.cpp` checks that the C ABI accepts valid argument combinations and rejects malformed ones, and `test_compilation.cpp` calls every wrapper in each accepted form, so a broken call site fails to build.
+`units.cpp` drives blobs, documents and graphs through the C++ wrappers, `api.cpp` checks that the C ABI accepts valid argument combinations and rejects malformed ones, and `compilation.cpp` calls every wrapper in each accepted form, so a broken call site fails to build.
 Each suite asks the open database through `ustore_get_metadata` whether it supports named collections, transactions and snapshots, and a case needing a missing capability returns without checks.
 
 ### Components
 
-Only `compaction.cu` builds today, with `USTORE_BUILD_CUDA`; the other sources wait for the UDisk engine to build.
+Only `compaction.cu` builds today, with `USTORE_BUILD_CUDA`; the other sources wait for the NVMe engine to build.
 
 - `street.cpp`, `building.cpp` — streets of buildings: construction, lookups, scans, copies and moves.
 - `write_cache.cpp` — adding, removing, merging, copying and moving citizens in the write cache.
@@ -52,7 +52,7 @@ Only `compaction.cu` builds today, with `USTORE_BUILD_CUDA`; the other sources w
 ## Building
 
 The SmashTable engine is always built, and each other engine is switched on by its option.
-`test_tools` builds only when the CLI does, since it drives the CLI of the same engine.
+`tools.cpp` builds only when the CLI does, since it drives the CLI of the same engine.
 
 ```sh
 cmake --preset debug -DUSTORE_BUILD_TEST_CPP=1 -DUSTORE_BUILD_TOOLS_CPP=1 -DUSTORE_USE_ROCKSDB=1 -DUSTORE_USE_LEVELDB=1
@@ -68,19 +68,19 @@ Executables land in `build_debug/build/bin/`.
 
 Every suite takes its inputs as flags and reads no environment variable, and `--help` prints the flags it accepts.
 
-| Flag                 | Suites       | Meaning                                                                 |
-| :------------------- | :----------- | :---------------------------------------------------------------------- |
-| `--directory <path>` | Every suite  | Parent of the unique directory the suite works in, created when missing |
-| `--cli <path>`       | `test_tools` | The CLI executable the CLI round trip drives                            |
+| Flag                 | Suites      | Meaning                                                                 |
+| :------------------- | :---------- | :---------------------------------------------------------------------- |
+| `--directory <path>` | Every suite | Parent of the unique directory the suite works in, created when missing |
+| `--cli <path>`       | `tools.cpp` | The CLI executable the CLI round trip drives                            |
 
 With `--directory`, a suite creates a unique `ustore-XXXXXX` directory under the path, runs every case inside it, and removes it with its contents at exit, so parallel runs never share a database.
 Without it, the engine runs on its default configuration, and the cases that need persistence or files report `skipped`.
-Without `--cli`, `test_tools` reports its CLI case `skipped`.
-CTest passes `--directory` as `test_data` inside the build directory, and `test_tools` additionally gets `--cli` with the CLI built for the same engine.
+Without `--cli`, the tools suite reports its CLI case `skipped`.
+CTest passes `--directory` as `test_data` inside the build directory, and the tools suite additionally gets `--cli` with the CLI built for the same engine.
 
 ```sh
-build_debug/build/bin/test_units_ustore_embedded_rocksdb --directory /dev/shm/ustore
-build_debug/build/bin/test_tools_ustore_embedded_rocksdb --directory /dev/shm/ustore --cli build_debug/build/bin/ustore_cli_rocksdb
+build_debug/build/bin/ustore_test_units_rocksdb --directory /dev/shm/ustore
+build_debug/build/bin/ustore_test_tools_rocksdb --directory /dev/shm/ustore --cli build_debug/build/bin/ustore_cli_rocksdb
 ```
 
 ### Stress
@@ -122,5 +122,5 @@ Build them with the `release` preset and run them under a memory cap:
 cmake --preset release -DUSTORE_BUILD_TEST_CPP=1 -DUSTORE_USE_ROCKSDB=1
 cmake --build --preset release
 systemd-run --user --scope -p MemoryMax=16G -p MemorySwapMax=0 -- \
-    build_release/build/bin/stress_atomicity_ustore_embedded_rocksdb --directory /dev/shm/ustore-stress --duration 1min
+    build_release/build/bin/ustore_stress_atomicity_rocksdb --directory /dev/shm/ustore-stress --duration 1min
 ```

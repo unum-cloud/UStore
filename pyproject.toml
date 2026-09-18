@@ -56,6 +56,7 @@ sdist.include = [
   "/include/**",
   "/c/**",
   "/src/**",
+  "/src_oracles/**",
   "/cmake/**",
   "/tools/**",
   "/python/**",
@@ -86,8 +87,8 @@ minversion = "6.0"
 addopts = ["-ra", "--showlocals", "--strict-markers", "--strict-config"]
 xfail_strict = true
 filterwarnings = ["error"]
-python_files = ["test_*.py"]
-testpaths = ["tests"]
+python_files = ["*.py"]
+testpaths = ["test"]
 
 [tool.ruff.lint.per-file-ignores]
 # cmake-format evaluates its profile with `section` already in scope.

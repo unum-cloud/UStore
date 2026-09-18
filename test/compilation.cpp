@@ -1,5 +1,5 @@
 /**
- *  @file tests/test_compilation.cpp
+ *  @file test/compilation.cpp
  *  @author Ash Vardanian
  *  @date January 9, 2023
  *  @brief Calls the C++ wrappers in each of their accepted forms, so a change that breaks a call site fails to build.

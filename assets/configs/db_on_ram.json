@@ -1,10 +1,10 @@
 {
   "version": "1.0",
-  "directory": "./tmp/ustore_embedded_smashtable/",
+  "directory": "./tmp/ustore_embedded_ram/",
   "data_directories": [],
   "engine": {
     "config_url": "",
-    "config_file_path": "./engine_smashtable.json",
+    "config_file_path": "./engine_ram.json",
     "config": {
       "encryption": false,
       "compression": false,

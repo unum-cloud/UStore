@@ -2,7 +2,7 @@
 
 import pytest
 import ustore
-from ustore_capabilities import ENGINE, ISOLATIONS, NEEDS_TRANSACTIONS
+from capabilities import ENGINE, ISOLATIONS, NEEDS_TRANSACTIONS
 
 pytestmark = NEEDS_TRANSACTIONS
 

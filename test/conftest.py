@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 import ustore
-from ustore_capabilities import (
+from capabilities import (
     ENGINE,
     NEEDS_TRANSACTIONS,
     SUPPORTS_COLLECTIONS,

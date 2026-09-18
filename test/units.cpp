@@ -1,5 +1,5 @@
 /**
- *  @file tests/test_units.cpp
+ *  @file test/units.cpp
  *  @author Ash Vardanian
  *  @date January 9, 2023
  *  @brief Unit tests of the blobs, documents and graph modalities through the C++ wrappers.

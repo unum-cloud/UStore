@@ -1,5 +1,5 @@
 /**
- *  @file src/smashtable/engine.cpp
+ *  @file src/ram/engine.cpp
  *  @author Ash Vardanian
  *  @date January 9, 2023
  *  @brief Embedded in-memory engine on SmashTable, strictly serializable or snapshot-isolated as configured at open.
@@ -51,9 +51,9 @@
 #include "helpers/config_loader.hpp"  // `load_config`, `read_json_member`
 #include "helpers/linked_array.hpp"   // `uninitialized_array`
 #include "helpers/linked_memory.hpp"  // `linked_memory_lock_t`
-#include "smashtable/key.hpp"         // `stored_key_t`
+#include "ram/key.hpp"                // `stored_key_t`
 
-namespace unum::ustore::smashtable {
+namespace unum::ustore::ram {
 
 #pragma region Store
 
@@ -933,10 +933,10 @@ store_status_t stage_drop(transaction_type_& transaction, ustore_collection_t co
 inline constexpr char image_signature_k[8] = {'U', 'S', 'T', 'S', 'M', 'T', 'B', '1'};
 
 /** Name of the image inside the database directory. */
-inline constexpr std::string_view image_name_k = "/smashtable.image";
+inline constexpr std::string_view image_name_k = "/ram.image";
 
 /** Name of the image while it is being written, renamed over the image once whole. */
-inline constexpr std::string_view partial_image_name_k = "/smashtable.image.partial";
+inline constexpr std::string_view partial_image_name_k = "/ram.image.partial";
 
 #if defined(_WIN32)
 
@@ -1142,8 +1142,8 @@ void compact_database(database_state<isolation_>& state, ustore_database_control
 template <isolation_t isolation_>
 void describe_database(database_state<isolation_>&, ustore_database_control_t& arguments) noexcept {
     *arguments.response = isolation_ == isolation_t::strict_serializable_k
-                              ? R"({"engine":"smashtable","isolation":"strict_serializable"})"
-                              : R"({"engine":"smashtable","isolation":"snapshot"})";
+                              ? R"({"engine":"ram","isolation":"strict_serializable"})"
+                              : R"({"engine":"ram","isolation":"snapshot"})";
 }
 
 /** Writes @p text at @p cursor and answers where it ends. */
@@ -1752,10 +1752,10 @@ database_t* make_database(std::string_view directory, ustore_error_t* error) noe
 
 #pragma endregion Dispatch
 
-} // namespace unum::ustore::smashtable
+} // namespace unum::ustore::ram
 
 using namespace unum::ustore;
-using namespace unum::ustore::smashtable;
+using namespace unum::ustore::ram;
 
 ustore_collection_t const ustore_collection_main_k = main_collection_k;
 ustore_collection_t const ustore_collection_names_k = names_collection_k;

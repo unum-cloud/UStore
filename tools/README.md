@@ -1,6 +1,6 @@
 # Tools
 
-The tools run on the embedded C ABI of `include/ustore/db.h` and never see which engine is behind it, so the same commands drive the in-memory SmashTable engine, RocksDB and LevelDB, and UDisk once it builds.
+The tools run on the embedded C ABI of `include/ustore/db.h` and never see which engine is behind it, so the same commands drive the in-memory SmashTable engine, RocksDB and LevelDB, and UStoreNVMe once it builds.
 
 ## Command-Line Interface
 
@@ -68,8 +68,8 @@ ustore_docs_import_t import = {
 ustore_docs_import(&import);
 ```
 
-## UDisk File Importer
+## UStoreNVMe File Importer
 
-`udisk_importer.cu` imports every file with one extension under a directory tree into a collection of a UDisk database, keyed by inode number, from several threads.
+`nvme_importer.cu` imports every file with one extension under a directory tree into a collection of a UStoreNVMe database, keyed by inode number, from several threads.
 It takes its source directory, extension, size limit and data directories as flags, and `--threads` names the threads the run inserts on, as it does in the benchmarks.
 It deletes the database's directory and every data directory before importing.

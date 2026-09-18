@@ -2,24 +2,24 @@
 
 UStore's speed claims rest on one hyper-converged machine, so this suite measures on one: its NVMe drives, its CPU cores and its GPUs, on Hopper and Blackwell boxes alike.
 Comparisons against other databases live in a separate harness.
-This suite answers _which engine configuration_ and _which component_: SmashTable, RocksDB, LevelDB and UDisk behind the same C ABI, and UDisk's databases, LSM trees, graph database and disk router against their own configurations.
+This suite answers _which engine configuration_ and _which component_: SmashTable, RocksDB, LevelDB and NVMe behind the same C ABI, and NVMe's databases, LSM trees, graph database and disk router against their own configurations.
 Every binary prints a machine block and one block per measured phase to standard output and nothing else, so a run is its own transcript.
 
 ## The Suite
 
-| Source                                | What it measures                                                    |
-| :------------------------------------ | :------------------------------------------------------------------ |
-| `twitter.cpp`                         | Building documents and a graph from tweets, then sampling them      |
-| `tabular_graph.cpp`                   | NDJSON or CSV imported as documents and a graph, then exported back |
-| `louvain.cpp`                         | Louvain communities over a graph collection and over memory         |
-| `udisk/single_collection_database.cu` | Inserts, lookups, scans and deletions, per value width              |
-| `udisk/lsm_tree.cu`                   | Inserts, lookups, selections and scans, per value width             |
-| `udisk/graph_store.cpp`               | Vertex and edge writes and reads, with and without a transaction    |
-| `udisk/disk_router.cpp`               | Random 4 KiB `O_DIRECT` reads over cores, disks and queue depths    |
+| Source                               | What it measures                                                    |
+| :----------------------------------- | :------------------------------------------------------------------ |
+| `twitter.cpp`                        | Building documents and a graph from tweets, then sampling them      |
+| `tabular_graph.cpp`                  | NDJSON or CSV imported as documents and a graph, then exported back |
+| `louvain.cpp`                        | Louvain communities over a graph collection and over memory         |
+| `nvme/single_collection_database.cu` | Inserts, lookups, scans and deletions, per value width              |
+| `nvme/lsm_tree.cu`                   | Inserts, lookups, selections and scans, per value width             |
+| `nvme/graph_store.cpp`               | Vertex and edge writes and reads, with and without a transaction    |
+| `nvme/disk_router.cpp`               | Random 4 KiB `O_DIRECT` reads over cores, disks and queue depths    |
 
 The Twitter benchmark samples keys, parsed objects, one field, a four-column table and two-hop traversals.
 `mixed.hpp` holds the transactional batch upserts of documents and graph edges that the Twitter benchmark issues.
-The three engine benchmarks compile once per engine, as `bench_twitter_ustore_embedded_<engine>`, `bench_tabular_graph_ustore_embedded_<engine>` and `bench_louvain_ustore_embedded_<engine>`.
+The three engine benchmarks compile once per engine, as `ustore_bench_twitter_<engine>`, `ustore_bench_tabular_graph_<engine>` and `ustore_bench_louvain_<engine>`.
 
 ### Building
 
@@ -28,14 +28,14 @@ The SmashTable engine is always built, and each other engine is switched on by i
 
 ```sh
 cmake --preset release -DUSTORE_BUILD_BENCH_CPP=1 -DUSTORE_USE_ROCKSDB=1 -DUSTORE_USE_LEVELDB=1
-cmake --build --preset release --target bench_twitter_ustore_embedded_rocksdb bench_tabular_graph_ustore_embedded_rocksdb
+cmake --build --preset release --target ustore_bench_twitter_rocksdb ustore_bench_tabular_graph_rocksdb
 ```
 
 Executables land in `build_release/build/bin/`.
 Imports hold whole batches in memory, so every run goes under a cgroup cap rather than trusting the benchmark to refuse.
 
 ```sh
-systemd-run --user --scope -p MemoryMax=16G -p MemorySwapMax=0 -- build_release/build/bin/bench_twitter_ustore_embedded_rocksdb ...
+systemd-run --user --scope -p MemoryMax=16G -p MemorySwapMax=0 -- build_release/build/bin/ustore_bench_twitter_rocksdb ...
 ```
 
 ### Flags
@@ -47,7 +47,7 @@ Flags starting with `--benchmark_` go to Google Benchmark, which reads them befo
 ### Twitter
 
 ```sh
-build_release/build/bin/bench_twitter_ustore_embedded_rocksdb \
+build_release/build/bin/ustore_bench_twitter_rocksdb \
     --dataset data/twitter --directory /dev/shm/ustore-twitter --threads 16 --max-input-files-total 100
 ```
 
@@ -65,7 +65,7 @@ build_release/build/bin/bench_twitter_ustore_embedded_rocksdb \
 ### Tables and Graphs
 
 ```sh
-build_release/build/bin/bench_tabular_graph_ustore_embedded_rocksdb \
+build_release/build/bin/ustore_bench_tabular_graph_rocksdb \
     --dataset data/<name> --format csv --directory /dev/shm/ustore-tabular \
     --id-field id --source-field source --target-field target --edge-field edge \
     --threads 4 --max-input-files-total 40
@@ -88,7 +88,7 @@ build_release/build/bin/bench_tabular_graph_ustore_embedded_rocksdb \
 Every row becomes one document and one edge between its source and target, labeled by its edge field.
 The imports divide the listed files into one contiguous share per thread, so `--max-input-files-total` never falls below `--threads`, and each export thread writes its own `<stem>-<thread>.<format>` file.
 
-### UDisk Components
+### NVMe Components
 
 `single_collection_database.cu` and `lsm_tree.cu` read their workloads from `single_collection_database.json` and `lsm_tree.json`.
 Each entry names one value width from 1 byte upward, switches on with `enabled`, and sizes the population, the cache, the write buffer and the LSM levels.
@@ -102,9 +102,9 @@ One level optimizer and one aggregator serve both graphs, so the gap between the
 It reports `modularity`, `communities` and `levels` as counters, and the upsert that fills the collection as a benchmark of its own.
 
 ```sh
-build_release/build/bin/bench_louvain_ustore_embedded_rocksdb \
+build_release/build/bin/ustore_bench_louvain_rocksdb \
     --dataset data/snap-email/email-Eu-core.txt --directory /dev/shm/ustore-louvain
-build_release/build/bin/bench_louvain_ustore_embedded_smashtable --vertices 4096 --communities 16
+build_release/build/bin/ustore_bench_louvain_ram --vertices 4096 --communities 16
 ```
 
 | Flag                                          | Meaning                                                | Default    |

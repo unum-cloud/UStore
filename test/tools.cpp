@@ -1,5 +1,5 @@
 /**
- *  @file tests/test_tools.cpp
+ *  @file test/tools.cpp
  *  @author Ash Vardanian
  *  @date April 16, 2023
  *  @brief Tests importing and exporting documents and graph edges through NDJSON and CSV files, and the CLI on top.

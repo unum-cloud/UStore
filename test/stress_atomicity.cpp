@@ -1,5 +1,5 @@
 /**
- *  @file tests/stress_atomicity.cpp
+ *  @file test/stress_atomicity.cpp
  *  @author Ash Vardanian
  *  @date January 9, 2023
  *  @brief Stress test that concurrent batched transactions land whole or not at all.

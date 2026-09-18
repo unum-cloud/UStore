@@ -2,7 +2,7 @@
 
 import pytest
 import ustore
-from ustore_capabilities import NEEDS_SNAPSHOTS
+from capabilities import NEEDS_SNAPSHOTS
 
 pytestmark = NEEDS_SNAPSHOTS
 

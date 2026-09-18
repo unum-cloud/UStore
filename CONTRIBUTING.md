@@ -1,72 +1,218 @@
 # Contribution Guide
 
-Thank you for even opening this page!
-It's always nice to have third-party contributors!
+Thank you for coming here!
+This guide is for everyone who changes UStore, people and coding agents alike, and every rule in it holds for every file in the tree.
 
----
+## Before You Start
 
-To keep the quality of the code high, we have a set of guidelines common to all Unum projects.
+Pull the sibling submodules — NumKong, StringZilla, ForkUnion and SmashTable — before building anything:
 
-- Whats the procedure? [answered](https://github.com/unum-cloud/awesome/blob/main/Workflow.md#organizing-software-development)
-- How to organize branches? [answered](https://github.com/unum-cloud/awesome/blob/main/Workflow.md#branches)
-- How to style commits? [answered](https://github.com/unum-cloud/awesome/blob/main/Workflow.md#commits)
+```sh
+git submodule update --init --recursive
+```
 
-## Implementing a new Language Binding
+The repository carries its own hooks, and configuring CMake arms them; to arm them without a build:
 
-When you start enumerating the dozens of functions across `/include/ustore` header files, you may not immediately want to implement all of them for a new language binding.
-We feel the same way, and here is the order in which we approach implementing new language bindings.
+```sh
+git config core.hooksPath .githooks
+```
 
-1. To open and close DB: `ustore_database_init()`, `ustore_database_free()`.
-2. To access binary values in the main collection: `ustore_write()`, `ustore_read()`.
-3. Supporting multiple named collections: `ustore_collection_list()`, `ustore_collection_create()`, `ustore_collection_drop()`.
-4. Supporting transactions: `ustore_transaction_init()`, `ustore_transaction_stage()`, `ustore_transaction_commit()`, `ustore_transaction_free()`.
-5. Supporting scans: `ustore_scan()`.
+`.githooks/pre-commit` checks the added lines of every staged file against the rules below and runs `clang-format` 22, `ruff`, `dprint` and `cmake-format` when they are installed.
+`.githooks/commit-msg` checks the subject and rejects AI-assistant attribution.
 
-Once you wrap those functions, we consider the binding usable.
-What have we forgotten?
+## Layout and Namespaces
 
-- Machine Learning: `ustore_sample()`.
-- Metadata: `ustore_database_control()`, `ustore_measure()`.
-- [Graphs](https://unum.cloud/ustore/c/#graphs).
-- [Documents](https://unum.cloud/ustore/c/#documents).
-- [Paths](https://unum.cloud/ustore/c/#paths).
-- [Vectors](https://unum.cloud/ustore/c/#vectors).
+| Directory         | Contents                                                          | Namespace                |
+| :---------------- | :---------------------------------------------------------------- | :----------------------- |
+| `include/ustore/` | C ABI headers as `*.h`, C++ wrappers of the same names as `*.hpp` | `unum::ustore`           |
+| `c/`              | `lib.cpp` with the C ABI dispatch, `docs.cpp` and `graph.cpp`     | `unum::ustore`           |
+| `src/<engine>/`   | `engine.cpp` and the engine's own headers                         | `unum::ustore::<engine>` |
+| `src_oracles/`    | `engine.cpp` of the third-party engines kept as oracles           | `unum::ustore::<engine>` |
+| `tools/`          | the CLI, flag parsing, and dataset import and export              | `unum::ustore`           |
+| `test/`, `bench/` | suites mirroring `src/`, one file per component                   | `unum::ustore`           |
+| `verification/`   | Spin models and GenMC checks, run by `check.sh`                   | none                     |
 
-All of those are optional and can be implemented in any order, if at all.
-Bindings for top-tier languages with compatible build-systems can be integrated into the primary repository.
+Namespaces mirror directories and nothing else: a directory adds a namespace component, and no namespace groups symbols by theme.
+A file name never repeats its directory — `src/nvme/lsm_tree.hpp`, never `src/nvme/nvme_lsm_tree.hpp`.
 
-## Implementing a new Engine
+## C++
 
-Implementing a new engine is similar to [implementing a new binding](#implementing-a-new-language-binding).
-Implementations can be of 2 kinds:
+### Naming
 
-- Lite: native implementation of BLOB modality.
-- Complete: native implementation of all modalities.
+- `_t` marks concrete types and the aliases that materialize a template; `_k` marks enumerators and constants.
+- Class templates carry no suffix: `class lsm_tree`, never `class lsm_tree_gt`.
+- Template type parameters end in `_type_` and private members in one underscore, so a parameter never shadows a member: `typename locations_type_` beside `locations_type_ locations_`.
+- Identifiers are whole words: `index`, `count`, `transaction`, `directory` — never `i`, `cnt`, `txn`, `dir`.
+- A type is named `<domain>_<role>`: the domain word says what it holds and the role word what it does, as in `lsm_tree`, `lsm_level`, `lsm_sorted_run`, `sorted_run_index`, `key_slot`, `stored_value`, `write_buffer` and `graph_store`.
+  Only C ABI terms stay one word — `database`, `collection`, `transaction`, `snapshot` — and no name is a metaphor or a legacy project name.
+- A file is named after its main type without `_t` and never repeats its directory; C++ headers are `.hpp`, never `.h` or `.tcc`.
+- Concepts end in `_concept`, like `stored_key_concept`, so a concept never collides with a member of the same name.
+- A `bool` answers a yes-or-no question and never selects behaviour; name the states in an `enum class`, backed by `bool` when width matters.
+- A closed set of configurations gets one enumerator per configuration, never a struct of knobs that can express combinations that do not exist.
+- These rules govern C and C++ alone; Python follows PEP 8, with `UPPER_SNAKE_CASE` module constants, `snake_case` functions and variables and `CapWords` classes, and never a `_t` or `_k` suffix.
 
-All existing Open Source implementations are Lite.
-This means that the Graph modality logic that comes with RocksDB-based builds is identical to the Graph modality logic that comes with LevelDB-based builds.
-So the engine only implements the functions from "db.h" and "blobs.h", and the rest of the logic comes from a generic "modality_graph.cpp", that transforms and redirects calls into BLOB layer.
+### Templates and Macros
 
-With this in mind, if you were to implement an engine based on ETCD, FoundationDB, Redis, DragonFly, LMDB, or WiredTiger, you would start with the following functions:
+Every template head and argument list is spelled out where it is used, and constraints are named C++20 concepts.
+No macro stands in for a template head, an argument list or a code pattern:
 
-1. To open and close DB: `ustore_database_init()`, `ustore_database_free()`.
-2. Retrieving metadata: `ustore_get_metadata()`.
-3. To access binary values in the main collection: `ustore_write()`, `ustore_read()`.
-4. Supporting multiple named collections: `ustore_collection_list()`, `ustore_collection_create()`, `ustore_collection_drop()`.
-5. Supporting transactions: `ustore_transaction_init()`, `ustore_transaction_stage()`, `ustore_transaction_commit()`, `ustore_transaction_free()`.
-6. Supporting scans: `ustore_scan()`.
-7. Machine Learning: `ustore_sample()`. Rarely supported, generally faked via reservoir sampling of bulk scans.
-8. Metadata: `ustore_database_control()`, `ustore_measure()`. Can be simply silenced.
-9. Memory management: `ustore_arena_free()`, `ustore_error_free()`.
+```cpp
+// Rejected
+#define lsm_tree_def_m template <typename stored_key_, value_layout_t value_layout_>
+#define lsm_tree_args_m stored_key_, value_layout_
+lsm_tree_def_m class lsm_tree;
 
-For RocksDB, all of those are `true`.
-For LevelDB, only the latter.
-You should also define the following:
+// Written out, constrained by a concept
+template <typename stored_key_type_, value_layout_t value_layout_>
+    requires stored_key_concept<stored_key_type_>
+class lsm_tree;
+```
 
-- `ustore_collection_t ustore_collection_main_k`. `0`, by default.
-- `ustore_length_t ustore_length_missing_k`. `UINT_MAX`, by default.
-- `ustore_key_t ustore_key_unknown_k`. `LONG_MAX`, by default.
+A macro survives only as an object-like configuration flag or include guard.
+`#if` brackets whole declarations or include blocks, never a fragment of an `if`/`else`.
 
-> If you are implementing a Lite engine on top of a standalone DBMS, you must acknowledge that logic will split between multiple machines.
-> As such, Graph updates generally translate into binary Read-Modify-Write operations.
-> If those are forwarded to a remote location, you will pay double the networking costs for two round trips.
+### Errors and Memory
+
+Nothing throws.
+Fallible calls return a status or `expected`, constructors that can fail become factories returning `expected`, and no code adds `try` or `catch` except one `try` per exported `ustore_*` call in the RocksDB and LevelDB engines, whose libraries throw.
+Errors are checked with an explicit `if` and `return`, never a macro.
+The status is `status_t {status_code_t code; char const* message;}`, mirroring the C ABI's `ustore_error_t`, and `expected<value_type_>` keeps its value in a union alive only on success, so a move-only type needs no empty state.
+
+No owning standard type that can throw appears anywhere, tests included:
+
+| Instead of                     | Use                                                                              |
+| :----------------------------- | :------------------------------------------------------------------------------- |
+| `std::string`                  | StringZilla `sz::basic_string` through `try_assign`, `try_reserve`, `try_resize` |
+| `std::vector`                  | SmashTable `basic_vector` through `make()`                                       |
+| `std::unordered_map`           | SmashTable `basic_hash_table`                                                    |
+| `std::unordered_set`           | SmashTable `basic_hash_table`                                                    |
+| `std::map`, `std::set`         | SmashTable `basic_avl_tree`, or `basic_wb_tree` for rank and select              |
+| An array sized once            | ForkUnion `dynamic_array`, whose `resize()` returns a status                     |
+| `std::thread`, `std::function` | The ForkUnion executor below, and a template callback parameter                  |
+
+Non-owning `std::span` and `std::string_view` are welcome.
+No mutable global state: no namespace-scope mutable variables, no function-local `static`, and never `static thread_local`.
+Per-thread scratch belongs to the executor that owns the threads.
+
+### Threads and Placement
+
+Threads, topology and domain-placed memory come from ForkUnion's C ABI in `forkunion.h`, wrapped once by a C++ executor and allocator; nothing else calls `fu_*` directly.
+The executor owns a `fu_topology_t` and a `fu_pool_t` created through `fu_topology_new`, `fu_pool_new` and `fu_pool_spawn`, returns `expected` from its factory, deletes the pool in its destructor, and forwards C++ callables to the pool through a C callback.
+The allocator places memory with `fu_allocate_on_domain_id` and releases it with `fu_free_on_domain_id`.
+
+### Documentation and Comments
+
+- Every file opens with `@file`, `@author`, `@date` and `@brief`, in that order and contiguous; `@file` names the path from the repository root and `@date` reads like `January 9, 2023`.
+- Docblock text sits two spaces past its asterisk, as in ` *  @brief`, and a continuation indents two more.
+- Declarations are documented with `/** */`, never with a bare `//` line above them, and every `/**` has an empty line above it.
+- A block that is one unstructured paragraph carries no `@brief`: `/** What it is. */`.
+- Every `@param` states its direction: `@param[in]`, `@param[out]` or `@param[inout]`.
+- No Markdown inside docblocks — no headings, bullets or `__bold__`; use `@note`, `@throws`, `@c`, `@p` and plain sentences.
+- A code span inside a docblock is `@c token`, a shape or a range is `@b [minimum,maximum]` with the whitespace inside the brackets squeezed out, and a span too long for either becomes plain prose; backticks stay in `//` line comments and in the trailing comments of `#include` lines.
+- Document all fields of a type or none of them, each with its own line.
+- Comments stay to one line, two at most, state what the code cannot, and never narrate history.
+- Sections are `#pragma region Name` and `#pragma endregion Name`, with letters, digits and spaces in the label, never banners of asterisks, dashes or equals signs.
+
+### Includes and Printing
+
+Includes form six groups separated by blank lines, alphabetical inside each: C library headers such as `<cstdint>` and `<unistd.h>`, C++ standard headers, external libraries such as `<rocksdb/db.h>` and `<yyjson.h>`, sibling projects such as `<smashtable/basic_vector.hpp>`, UStore's public `<ustore/db.h>` headers in angle brackets, then project headers such as `"helpers/linked_memory.hpp"` in quotes.
+Sibling projects are reached through the aliases `fu`, `nk`, `st` and `sz`, declared once in `include/ustore/types.hpp`, never through spelled-out `ashvardanian::` namespaces or local aliases.
+C++ prints through `fmt::println` — no iostreams, no `printf`.
+Discard a result through `[[maybe_unused]] T const result = call();`, never `(void)call();`, and declare return types before the name, never after an arrow.
+
+## Tests and Benchmarks
+
+Tests use `test/test.hpp`, not a framework: every check returns a failure count, and counts roll up to `main`.
+
+```cpp
+std::size_t lsm_tree_insert_then_find() {
+    std::size_t failures = 0;
+    failures += expect(inserted);
+    failures += expect_eq(found_count, 3u);
+    return failures;
+}
+
+int main() {
+    std::size_t total = 0;
+    total += report("lsm_tree.insert_then_find", lsm_tree_insert_then_find());
+    return report("total", total) ? 1 : 0;
+}
+```
+
+`expect_eq` prints both values, so it needs types `fmt` can format; compare anything else through `expect(a == b)`.
+Waits on a peer thread use `spin_until`, and checks inside worker threads add into an atomic counter folded in after the threads finish.
+
+### Flags and Constants
+
+Binaries read no environment variables and no hard-coded directories; every input is a flag parsed by `tools/arguments.hpp`.
+
+```sh
+# Rejected
+USTORE_TEST_PATH=/tmp/db ./twitter -tw 1000 --max_input_files 4 --mlimit 1048576 -n 10
+
+# Accepted
+./ustore_bench_twitter --directory /tmp/db --dataset data/twitter --max-tweets 1000 --max-input-files 4 --memory-limit 1MiB --duration 10s
+```
+
+Flags are long kebab-case words with no short forms or aliases, sizes carry IEC suffixes, durations carry `ms`, `s` or `min`, and lists are comma-separated.
+A namespace-scope `_k` constant names an invariant — a format, an alignment, an ABI limit — while workload sizes, thread counts and paths are option fields with defaults.
+
+## Python Builds
+
+`pyproject.toml` builds with `scikit-build-core`, which configures the top-level CMake tree with `USTORE_BUILD_LIB_PYTHON=ON` and suites, benchmarks and tools off, then installs the `ustore_python` target into the wheel.
+`python/CMakeLists.txt` defines that target as the C11 extension `ustore.lib` from `python/lib.c`, installed into the `python/ustore/` package, and the build tree lives in `build_python/`.
+Python suites sit in `test/` beside the C++ ones as `<topic>.py`, named so no module shadows a library it imports, and `pytest` collects every module there; `USTORE_PYTHON_ENGINE` picks the engine one build links.
+
+```sh
+pip install -e .                                    # SmashTable only
+CMAKE_ARGS="-DUSTORE_USE_ROCKSDB=ON" pip install .  # RocksDB beside it
+pip install --group test . && pytest test
+```
+
+An engine is enabled through `CMAKE_ARGS` or `--config-settings=cmake.define.USTORE_USE_<ENGINE>=ON`; the build reads no environment variable of its own.
+
+## Rust Builds
+
+`Cargo.toml` and `build.rs` at the root build the crate from `rust/lib.rs`, and `build.rs` compiles no C or C++ itself.
+The crate's own usage is described in [`rust/README.md`](rust/README.md).
+It configures CMake with `USTORE_BUILD_LIB_C=ON`, `USTORE_INSTALL=ON` and suites off, installs the static libraries into `OUT_DIR`, and links them with the target's C++ standard library.
+
+- __SmashTable__ always builds and links.
+- __rocksdb and leveldb__ build their engines beside it, linked once `c/lib.cpp` dispatches, since every engine library defines the same `ustore_*` symbols.
+- __NVMe__ joins as a feature once `USTORE_BUILD_NVME` builds.
+
+```sh
+cargo test
+cargo test --features rocksdb,leveldb
+```
+
+`cargo package` skips every subdirectory holding a `Cargo.toml`, so ForkUnion's and StringZilla's manifests are moved aside before packaging.
+
+## Commits
+
+- The subject is `Verb: Summary` with one of `Add`, `Break`, `Build`, `Chore`, `Docs`, `Fix`, `Improve`, `Make`, `Release`, and the summary starts with a capital.
+- `Break` marks a change to what the project offers, such as a dropped modality or binding; `Chore` removes or rearranges without changing it.
+- The body is prose wrapped near 80 columns and explains the change in primary logic, not renames or formatting.
+- One commit per topic, however many files it touches; an intermediate commit may leave the tree unbuildable.
+- No AI-assistant attribution of any kind.
+
+## Implementing a New Engine
+
+An engine implements the calls from `db.h` and `blobs.h`; the documents and graph modalities in `c/` run on top of them for every engine.
+Start with these, in order:
+
+1. Opening and closing: `ustore_database_init()`, `ustore_database_free()`.
+2. Metadata, including the isolation level the engine delivers: `ustore_get_metadata()`.
+3. Binary values in the main collection: `ustore_write()`, `ustore_read()`.
+4. Named collections: `ustore_collection_list()`, `ustore_collection_create()`, `ustore_collection_drop()`.
+5. Transactions: `ustore_transaction_init()`, `ustore_transaction_stage()`, `ustore_transaction_commit()`, `ustore_transaction_free()`.
+6. Scans, resuming from the last returned key: `ustore_scan()`.
+7. Sampling and measurements: `ustore_sample()`, `ustore_database_control()`, `ustore_measure()`.
+8. Memory: `ustore_arena_free()`.
+
+An advertised isolation level is a promise the conformance suite checks against behaviour, so report the level the engine delivers, not the one it aims for.
+
+## Implementing a New Language Binding
+
+Bindings wrap the C ABI and never instantiate C++ templates themselves.
+A binding is usable once it covers opening and closing, binary reads and writes, named collections, transactions and scans; documents and graphs follow in any order.

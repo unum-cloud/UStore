@@ -1,7 +1,7 @@
 # Engines
 
 Every engine implements the C ABI of `include/ustore/*.h` over its own storage, and links with `c/docs.cpp` and `c/graph.cpp` into one `ustore_embedded_<engine>` library, so documents and graphs work on each of them.
-The engines fill three roles: SmashTable is the reference engine in memory, UDisk is the hyper-converged engine on NVMe drives and GPUs, and RocksDB and LevelDB bring third-party key-value stores behind the same calls.
+The engines fill three roles: SmashTable is the reference engine in memory, NVMe is the hyper-converged engine on NVMe drives and GPUs, and RocksDB and LevelDB bring third-party key-value stores behind the same calls.
 Engines aim for the highest isolation SmashTable delivers, each reports the level its transactions actually deliver, and the conformance suite checks every advertised level against behaviour.
 
 | Engine     | Directory         | Role                  | Builds today | Isolation                                    |
@@ -9,7 +9,7 @@ Engines aim for the highest isolation SmashTable delivers, each reports the leve
 | SmashTable | `src/smashtable/` | reference, in memory  | always       | `strict_serializable` or `snapshot`, at open |
 | RocksDB    | `src/rocksdb/`    | third-party key-value | optional     | optimistic, reads see the latest commit      |
 | LevelDB    | `src/leveldb/`    | third-party key-value | optional     | snapshot reads, no transactions              |
-| UDisk      | `src/udisk/`      | hyper-converged       | v1 target    | optimistic, SmashTable's levels in v1        |
+| NVMe       | `src/nvme/`       | hyper-converged       | v1 target    | optimistic, SmashTable's levels in v1        |
 
 ## SmashTable
 
@@ -34,12 +34,12 @@ Transactions begin without a snapshot, so each read sees the latest value commit
 `src/leveldb/` wraps one LevelDB database with snapshots, but without named collections or transactions: `ustore_transaction_init` fails with an error.
 Its isolation ends at reading from a snapshot.
 
-## UDisk
+## NVMe
 
-`src/udisk/` is the hyper-converged engine, and the one UStore's hardware paths serve.
+`src/nvme/` is the hyper-converged engine, and the one UStore's hardware paths serve.
 A `database` holds `collection`s, each an `lsm_tree` of `lsm_level`s whose `lsm_sorted_run` files open with a `sorted_run_index` of `key_slot`s ahead of their `stored_value`s, with optimistic transactions, snapshots and backups.
-Its graph database keeps adjacency in UDisk's own databases, as a fast path beside `c/graph.cpp`.
-CMake refuses `USTORE_BUILD_UDISK` until the sources in this directory build in tree, so everything below is a v1 target:
+Its graph database keeps adjacency in NVMe's own databases, as a fast path beside `c/graph.cpp`.
+CMake refuses `USTORE_BUILD_NVME` until the sources in this directory build in tree, so everything below is a v1 target:
 
 - __Kernel bypass__ — a transport chosen at mount reaches each data directory through io_uring on `O_DIRECT` files, io_uring on NVMe block devices, NVMe passthrough, or SPDK's user-space driver, and falls back to blocking positioned I/O on macOS, Windows and wherever io_uring is refused.
 - __SIMD point lookups__ — sorted run indexes, micro-sets and ring buffers become SmashTable components with compile-time SIMD kits, one artifact carrying all of them and a database choosing one when it opens.
@@ -47,7 +47,7 @@ CMake refuses `USTORE_BUILD_UDISK` until the sources in this directory build in 
 - __GPUDirect Storage__ — sorted runs move between NVMe drives and GPU memory without staging in host memory.
 - __Isolation__ — in-flight transactions reach SmashTable's levels once they run on SmashTable, after an analysis shows no loss of consistency or efficiency.
 
-See [`udisk/README.md`](udisk/README.md) for its layers.
+See [`nvme/README.md`](nvme/README.md) for its layers.
 
 ## Helpers
 
@@ -63,20 +63,20 @@ Beside the engine directories, `src/executor.hpp` is the one owner of threads, t
 
 ## Dependencies
 
-| Dependency        | Used by                    | Role                                                              |
-| :---------------- | :------------------------- | :---------------------------------------------------------------- |
-| SmashTable        | SmashTable engine, UDisk   | Ordered and hash collections, transactions, snapshots, `expected` |
-| StringZilla       | Every engine               | Strings                                                           |
-| ForkUnion         | `executor.hpp`             | Threads, topology and domain-placed memory                        |
-| NumKong           | UDisk's components         | SIMD kernels                                                      |
-| yyjson            | Every engine               | JSON documents and configuration                                  |
-| RocksDB           | RocksDB engine             | Persistent LSM trees with optimistic transactions                 |
-| LevelDB           | LevelDB engine             | Persistent LSM tree with snapshots                                |
-| fmt               | UDisk                      | Formatting logs and file names                                    |
-| Thrust            | UDisk                      | Sorting and merging key slots on the host                         |
-| CUDA and CUB      | UDisk, optional            | GPU compaction                                                    |
-| GPUDirect Storage | UDisk, optional, v1 target | Reads and writes between NVMe drives and GPU memory               |
-| liburing          | UDisk                      | Asynchronous file I/O, until v1's raw io_uring system calls       |
-| SPDK              | UDisk, optional            | User-space NVMe access                                            |
+| Dependency        | Used by                   | Role                                                              |
+| :---------------- | :------------------------ | :---------------------------------------------------------------- |
+| SmashTable        | SmashTable engine, NVMe   | Ordered and hash collections, transactions, snapshots, `expected` |
+| StringZilla       | Every engine              | Strings                                                           |
+| ForkUnion         | `executor.hpp`            | Threads, topology and domain-placed memory                        |
+| NumKong           | NVMe's components         | SIMD kernels                                                      |
+| yyjson            | Every engine              | JSON documents and configuration                                  |
+| RocksDB           | RocksDB engine            | Persistent LSM trees with optimistic transactions                 |
+| LevelDB           | LevelDB engine            | Persistent LSM tree with snapshots                                |
+| fmt               | NVMe                      | Formatting logs and file names                                    |
+| Thrust            | NVMe                      | Sorting and merging key slots on the host                         |
+| CUDA and CUB      | NVMe, optional            | GPU compaction                                                    |
+| GPUDirect Storage | NVMe, optional, v1 target | Reads and writes between NVMe drives and GPU memory               |
+| liburing          | NVMe                      | Asynchronous file I/O, until v1's raw io_uring system calls       |
+| SPDK              | NVMe, optional            | User-space NVMe access                                            |
 
-UDisk's sources also include the `container`, `primitive`, `algo`, `utils` and `io` headers of a library that is not in this tree, and those give way to SmashTable, NumKong, StringZilla and ForkUnion.
+NVMe's sources also include the `container`, `primitive`, `algo`, `utils` and `io` headers of a library that is not in this tree, and those give way to SmashTable, NumKong, StringZilla and ForkUnion.

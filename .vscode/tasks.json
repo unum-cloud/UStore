@@ -37,7 +37,7 @@
     {
       "label": "Build Debug SmashTable Test",
       "detail": "Unit suite on the in-memory engine",
-      "command": "cmake --preset debug && cmake --build --preset debug --target test_units_ustore_embedded_smashtable",
+      "command": "cmake --preset debug && cmake --build --preset debug --target ustore_test_units_ram",
       "args": [],
       "type": "shell",
       "problemMatcher": ["$gcc"]
@@ -45,7 +45,7 @@
     {
       "label": "Build Debug RocksDB Test",
       "detail": "Unit suite on RocksDB",
-      "command": "cmake --preset debug && cmake --build --preset debug --target test_units_ustore_embedded_rocksdb",
+      "command": "cmake --preset debug && cmake --build --preset debug --target ustore_test_units_rocksdb",
       "args": [],
       "type": "shell",
       "problemMatcher": ["$gcc"]
@@ -53,15 +53,15 @@
     {
       "label": "Build Debug LevelDB Test",
       "detail": "Unit suite on LevelDB",
-      "command": "cmake --preset debug && cmake --build --preset debug --target test_units_ustore_embedded_leveldb",
+      "command": "cmake --preset debug && cmake --build --preset debug --target ustore_test_units_leveldb",
       "args": [],
       "type": "shell",
       "problemMatcher": ["$gcc"]
     },
     {
-      "label": "Build Debug UDisk Test",
-      "detail": "Unit suite on UDisk, which configures only once src/udisk compiles",
-      "command": "cmake --preset debug -DUSTORE_BUILD_UDISK=ON && cmake --build --preset debug --target test_units_ustore_embedded_udisk",
+      "label": "Build Debug NVMe Test",
+      "detail": "Unit suite on NVMe, which configures only once src/nvme compiles",
+      "command": "cmake --preset debug -DUSTORE_BUILD_NVME=ON && cmake --build --preset debug --target ustore_test_units_nvme",
       "args": [],
       "type": "shell",
       "problemMatcher": ["$gcc"]
@@ -69,7 +69,7 @@
     {
       "label": "Build Debug Strings Test",
       "detail": "Strings modality suite on the in-memory engine",
-      "command": "cmake --preset debug && cmake --build --preset debug --target test_strings_ustore_embedded_smashtable",
+      "command": "cmake --preset debug && cmake --build --preset debug --target ustore_test_strings_ram",
       "args": [],
       "type": "shell",
       "problemMatcher": ["$gcc"]
@@ -77,7 +77,7 @@
     {
       "label": "Build Debug Test Tools",
       "detail": "CLI suite and the CLI it drives",
-      "command": "cmake --preset debug && cmake --build --preset debug --target test_tools_ustore_embedded_smashtable",
+      "command": "cmake --preset debug && cmake --build --preset debug --target ustore_test_tools_ram",
       "args": [],
       "type": "shell",
       "problemMatcher": ["$gcc"]
@@ -85,7 +85,7 @@
     {
       "label": "Build Stress Atomicity SmashTable",
       "detail": "Atomicity stress suite on the in-memory engine",
-      "command": "cmake --preset debug && cmake --build --preset debug --target stress_atomicity_ustore_embedded_smashtable",
+      "command": "cmake --preset debug && cmake --build --preset debug --target ustore_stress_atomicity_ram",
       "args": [],
       "type": "shell",
       "problemMatcher": ["$gcc"]
@@ -93,7 +93,7 @@
     {
       "label": "Build Stress Atomicity RocksDB",
       "detail": "Atomicity stress suite on RocksDB",
-      "command": "cmake --preset debug && cmake --build --preset debug --target stress_atomicity_ustore_embedded_rocksdb",
+      "command": "cmake --preset debug && cmake --build --preset debug --target ustore_stress_atomicity_rocksdb",
       "args": [],
       "type": "shell",
       "problemMatcher": ["$gcc"]
@@ -101,7 +101,7 @@
     {
       "label": "Build Stress Linearizability SmashTable",
       "detail": "Linearizability stress suite on the in-memory engine",
-      "command": "cmake --preset debug && cmake --build --preset debug --target stress_linearizability_ustore_embedded_smashtable",
+      "command": "cmake --preset debug && cmake --build --preset debug --target ustore_stress_linearizability_ram",
       "args": [],
       "type": "shell",
       "problemMatcher": ["$gcc"]
@@ -109,7 +109,7 @@
     {
       "label": "Build Stress Linearizability RocksDB",
       "detail": "Linearizability stress suite on RocksDB",
-      "command": "cmake --preset debug && cmake --build --preset debug --target stress_linearizability_ustore_embedded_rocksdb",
+      "command": "cmake --preset debug && cmake --build --preset debug --target ustore_stress_linearizability_rocksdb",
       "args": [],
       "type": "shell",
       "problemMatcher": ["$gcc"]
@@ -117,7 +117,7 @@
     {
       "label": "Build Debug SmashTable Benchmark",
       "detail": "Twitter benchmark on the in-memory engine",
-      "command": "cmake --preset profile && cmake --build --preset profile --target bench_twitter_ustore_embedded_smashtable",
+      "command": "cmake --preset profile && cmake --build --preset profile --target ustore_bench_twitter_ram",
       "args": [],
       "type": "shell",
       "problemMatcher": ["$gcc"]
@@ -125,15 +125,15 @@
     {
       "label": "Build Debug RocksDB Benchmark",
       "detail": "Twitter benchmark on RocksDB",
-      "command": "cmake --preset profile && cmake --build --preset profile --target bench_twitter_ustore_embedded_rocksdb",
+      "command": "cmake --preset profile && cmake --build --preset profile --target ustore_bench_twitter_rocksdb",
       "args": [],
       "type": "shell",
       "problemMatcher": ["$gcc"]
     },
     {
-      "label": "Build Debug UDisk Benchmark",
-      "detail": "Twitter benchmark on UDisk, which configures only once src/udisk compiles",
-      "command": "cmake --preset profile -DUSTORE_BUILD_UDISK=ON && cmake --build --preset profile --target bench_twitter_ustore_embedded_udisk",
+      "label": "Build Debug NVMe Benchmark",
+      "detail": "Twitter benchmark on NVMe, which configures only once src/nvme compiles",
+      "command": "cmake --preset profile -DUSTORE_BUILD_NVME=ON && cmake --build --preset profile --target ustore_bench_twitter_nvme",
       "args": [],
       "type": "shell",
       "problemMatcher": ["$gcc"]

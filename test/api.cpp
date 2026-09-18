@@ -1,5 +1,5 @@
 /**
- *  @file tests/test_api.cpp
+ *  @file test/api.cpp
  *  @author Ash Vardanian
  *  @date January 9, 2023
  *  @brief Checks that the C ABI accepts valid argument combinations and rejects malformed ones.

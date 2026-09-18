@@ -1,5 +1,5 @@
 /**
- *  @file tests/stress_linearizability.cpp
+ *  @file test/stress_linearizability.cpp
  *  @author Ash Vardanian
  *  @date January 9, 2023
  *  @brief Stress test that concurrent write transactions replay, in commit order, to the state the database holds.
