@@ -9,17 +9,21 @@
  *  and modifications parse every document with yyjson, allocating from the arena of the request.
  */
 
+#include <cmath>   // `std::abs`, `std::isfinite`, `std::ldexp`
 #include <cstddef> // `std::size_t`, `std::max_align_t`
+#include <cstdint> // `std::uint8_t`, `std::uint16_t`, `std::uint32_t`
 #include <cstring> // `std::memcpy`, `std::memset`, `std::strlen`
 
 #include <algorithm>    // `std::lower_bound`
+#include <bit>          // `std::bit_cast`
 #include <charconv>     // `std::from_chars`
 #include <concepts>     // `std::invocable`
+#include <limits>       // `std::numeric_limits`
 #include <span>         // `std::span`
 #include <string_view>  // `std::string_view`
 #include <system_error> // `std::errc`
 #include <type_traits>  // `std::is_same_v`
-#include <utility>      // `std::exchange`
+#include <utility>      // `std::exchange`, `std::in_range`
 
 #include <fmt/format.h> // `fmt::format_to_n`
 #include <yyjson.h>     // `yyjson_read_opts`, `yyjson_mut_doc`
@@ -40,6 +44,9 @@ constexpr std::size_t printed_number_length_limit_k = 32;
 
 /** Longest path @c ustore_docs_gist exports, including the null terminator. */
 constexpr std::size_t field_path_length_limit_k = 512;
+
+/** Bytes of a UUID. */
+constexpr std::size_t uuid_bytes_k = 16;
 
 using printed_number_buffer_t = char[printed_number_length_limit_k];
 using field_path_buffer_t = char[field_path_length_limit_k];
@@ -126,28 +133,38 @@ static yyjson_val* json_lookup(yyjson_val* json, ustore_str_view_t field) noexce
     return field[0] == '/' ? yyjson_ptr_get(json, field) : yyjson_obj_get(json, field);
 }
 
+/** Characters @p key takes as an RFC 6901 reference token, where a tilde and a slash each take two. */
+static std::size_t escaped_length(std::string_view key) noexcept {
+    std::size_t length = key.size();
+    for (char const character : key) length += character == '~' || character == '/';
+    return length;
+}
+
+/** Appends @p key as an RFC 6901 reference token at @p output, answering where the token ends. */
+static char* escape_into(std::string_view key, char* output) noexcept {
+    for (char const character : key) {
+        if (character != '~' && character != '/') {
+            *output++ = character;
+            continue;
+        }
+        *output++ = '~';
+        *output++ = character == '~' ? '0' : '1';
+    }
+    return output;
+}
+
 /** Spells @p field as a JSON Pointer, escaping a top-level key into the arena. */
 static std::string_view field_pointer(ustore_str_view_t field, linked_memory_lock_t& arena,
                                       ustore_error_t* error) noexcept {
     std::string_view const key {field};
     if (key.starts_with('/')) return key;
 
-    std::size_t escapes = 0;
-    for (char const character : key) escapes += character == '~' || character == '/';
-
-    auto pointer = arena.alloc<char>(key.size() + escapes + 1, error);
+    auto pointer = arena.alloc<char>(escaped_length(key) + 1, error);
     if (error->status) return {};
 
-    std::size_t length = 0;
-    pointer[length++] = '/';
-    for (char const character : key) {
-        if (character == '~' || character == '/') {
-            pointer[length++] = '~';
-            pointer[length++] = character == '~' ? '0' : '1';
-        }
-        else pointer[length++] = character;
-    }
-    return {pointer.data(), length};
+    pointer[0] = '/';
+    char const* const end = escape_into(key, pointer.data() + 1);
+    return {pointer.data(), static_cast<std::size_t>(end - pointer.data())};
 }
 
 /** Parses a JSON document, leaving the result empty for an empty or a missing value. */
@@ -211,18 +228,42 @@ enum class conversion_t {
     collides_k,
 };
 
+/** Whether @p conversion produced a value the column holds. */
+static bool is_valid(conversion_t conversion) noexcept {
+    return conversion == conversion_t::exact_k || conversion == conversion_t::converted_k;
+}
+
 /** Records @p conversion of one cell, setting the validity bit last since the other bitmaps may alias it. */
 static void record_conversion(conversion_t conversion, ustore_octet_t mask, ustore_octet_t& valid,
                               ustore_octet_t& converted, ustore_octet_t& collides) noexcept {
     ustore_octet_t const cleared = static_cast<ustore_octet_t>(~mask);
-    bool const is_valid = conversion == conversion_t::exact_k || conversion == conversion_t::converted_k;
     converted = static_cast<ustore_octet_t>((converted & cleared) |
                                             (conversion == conversion_t::converted_k ? mask : 0));
     collides = static_cast<ustore_octet_t>((collides & cleared) | (conversion == conversion_t::collides_k ? mask : 0));
-    valid = static_cast<ustore_octet_t>((valid & cleared) | (is_valid ? mask : 0));
+    valid = static_cast<ustore_octet_t>((valid & cleared) | (is_valid(conversion) ? mask : 0));
 }
 
-/** Converts @p value into @p scalar. */
+/** Whether @p real, with its fraction dropped, fits the range of @p scalar_, where NaN fits only a float. */
+template <typename scalar_>
+static bool real_fits(double real) noexcept {
+    if constexpr (std::is_same_v<scalar_, bool>) return true;
+    else if constexpr (std::is_floating_point_v<scalar_>)
+        return !std::isfinite(real) || std::abs(real) <= static_cast<double>(std::numeric_limits<scalar_>::max());
+    else if constexpr (std::is_signed_v<scalar_>) {
+        double const bound = std::ldexp(1.0, std::numeric_limits<scalar_>::digits);
+        return real >= -bound && real < bound;
+    }
+    else return real > -1.0 && real < std::ldexp(1.0, std::numeric_limits<scalar_>::digits);
+}
+
+/** Whether @p integer lies inside the range of @p scalar_, which a boolean or a float always covers. */
+template <typename scalar_, typename integer_>
+static bool integer_fits(integer_ integer) noexcept {
+    if constexpr (std::is_same_v<scalar_, bool> || std::is_floating_point_v<scalar_>) return true;
+    else return std::in_range<scalar_>(integer);
+}
+
+/** Converts @p value into @p scalar, where a value outside the range of the scalar collides. */
 template <typename scalar_>
 static conversion_t json_to_scalar(yyjson_val* value, scalar_& scalar) noexcept {
     if (!value) return conversion_t::missing_k;
@@ -242,13 +283,16 @@ static conversion_t json_to_scalar(yyjson_val* value, scalar_& scalar) noexcept 
     case YYJSON_TYPE_NUM:
         switch (yyjson_get_subtype(value)) {
         case YYJSON_SUBTYPE_REAL:
+            if (!real_fits<scalar_>(yyjson_get_real(value))) return conversion_t::collides_k;
             scalar = static_cast<scalar_>(yyjson_get_real(value));
             return std::is_floating_point_v<scalar_> ? conversion_t::exact_k : conversion_t::converted_k;
         case YYJSON_SUBTYPE_SINT:
+            if (!integer_fits<scalar_>(yyjson_get_sint(value))) return conversion_t::collides_k;
             scalar = static_cast<scalar_>(yyjson_get_sint(value));
             return std::is_integral_v<scalar_> && std::is_signed_v<scalar_> ? conversion_t::exact_k
                                                                             : conversion_t::converted_k;
         case YYJSON_SUBTYPE_UINT:
+            if (!integer_fits<scalar_>(yyjson_get_uint(value))) return conversion_t::collides_k;
             scalar = static_cast<scalar_>(yyjson_get_uint(value));
             return std::is_unsigned_v<scalar_> && !std::is_same_v<scalar_, bool> ? conversion_t::exact_k
                                                                                  : conversion_t::converted_k;
@@ -434,6 +478,10 @@ static void modify(json_t& original, yyjson_mut_val* modifier, ustore_str_view_t
         case modification_t::insert_k: modified = yyjson_mut_val_mut_copy(document, modifier); break;
         default: break;
         }
+        if (!modified && modification == modification_t::patch_k) {
+            *error = {ustore_error_invalid_argument_k, "The patch does not apply to the document"};
+            return;
+        }
         if (!modified) {
             *error = {ustore_error_out_of_memory_k, "Failed to modify the document"};
             return;
@@ -537,7 +585,8 @@ static found_documents_t read_documents(ustore_database_t database, ustore_trans
 /**
  *  @brief Calls @p callback on the document of every task, in order.
  *
- *  Fails a field modification of a missing document, and an insertion of a whole document that already exists.
+ *  Fails a field modification of a missing document, an update or a patch of a whole document that is missing,
+ *  and an insertion of a whole document that already exists.
  */
 template <document_callback callback_>
 static void read_each_document(ustore_database_t database, ustore_transaction_t transaction, ustore_snapshot_t snapshot,
@@ -552,6 +601,12 @@ static void read_each_document(ustore_database_t database, ustore_transaction_t 
         value_view_t const document = found[index];
         if (!document && has_fields && modification != modification_t::nothing_k) {
             *error = {ustore_error_not_found_k, "Modified field belongs to a missing document"};
+            return;
+        }
+        bool const replaces_existing = modification == modification_t::update_k ||
+                                       modification == modification_t::patch_k;
+        if (!document && !has_fields && replaces_existing) {
+            *error = {ustore_error_not_found_k, "Updated or patched document is missing"};
             return;
         }
         if (document && !has_fields && modification == modification_t::insert_k) {
@@ -692,13 +747,12 @@ static void gist_paths(yyjson_val* node, field_path_buffer_t& path, uninitialize
         yyjson_val* key = nullptr;
         while ((key = yyjson_obj_iter_next(&iterator)) && !error->status) {
             std::string_view const name {yyjson_get_str(key), yyjson_get_len(key)};
-            if (path_length + 1 + name.size() >= field_path_length_limit_k) {
+            if (path_length + 1 + escaped_length(name) >= field_path_length_limit_k) {
                 *error = {ustore_error_capacity_exhausted_k, "Path is too long"};
                 return;
             }
             path[path_length] = '/';
-            std::memcpy(path + path_length + 1, name.data(), name.size());
-            path[path_length + 1 + name.size()] = '\0';
+            *escape_into(name, path + path_length + 1) = '\0';
             gist_paths(yyjson_obj_iter_get_val(key), path, sorted_paths, exported_paths, error);
         }
         path[path_length] = '\0';
@@ -746,10 +800,10 @@ static void gist_paths(yyjson_val* node, field_path_buffer_t& path, uninitialize
 static std::size_t field_size_bytes(ustore_doc_field_type_t type) noexcept {
     switch (type) {
     case ustore_doc_field_bool_k: return sizeof(bool);
-    case ustore_doc_field_uuid_k: return 16;
+    case ustore_doc_field_uuid_k: return uuid_bytes_k;
     case ustore_doc_field_f64_k: return sizeof(double);
     case ustore_doc_field_f32_k: return sizeof(float);
-    case ustore_doc_field_f16_k: return 2;
+    case ustore_doc_field_f16_k: return sizeof(std::uint16_t);
     case ustore_doc_field_i64_k: return sizeof(std::int64_t);
     case ustore_doc_field_i32_k: return sizeof(std::int32_t);
     case ustore_doc_field_i16_k: return sizeof(std::int16_t);
@@ -770,13 +824,76 @@ static std::size_t column_size_bytes(ustore_doc_field_type_t type, std::size_t d
     return next_multiple<std::size_t>(bytes, alignof(std::max_align_t));
 }
 
-/** Converts @p value into the scalar at @p index of @p column. */
+/** Converts @p value into the scalar at @p index of @p column, zeroing a cell that holds no valid value. */
 template <typename scalar_>
 static conversion_t gather_scalar(yyjson_val* value, ustore_byte_t* column, std::size_t index) noexcept {
     scalar_ scalar {};
     conversion_t const conversion = json_to_scalar(value, scalar);
+    if (!is_valid(conversion)) scalar = {};
     std::memcpy(column + index * sizeof(scalar_), &scalar, sizeof(scalar_));
     return conversion;
+}
+
+/** Smallest magnitude that rounds past the largest finite half-precision float. */
+constexpr float half_overflow_k = 65520.0f;
+
+/** Encodes a finite @p single below @c half_overflow_k as IEEE 754 binary16, rounding to nearest. */
+static std::uint16_t half_of(float single) noexcept {
+    auto const bits = std::bit_cast<std::uint32_t>(single);
+    auto const sign = static_cast<std::uint16_t>((bits >> 16) & 0x8000u);
+    int const exponent = static_cast<int>((bits >> 23) & 0xffu) - 127 + 15;
+    std::uint32_t mantissa = bits & 0x7fffffu;
+
+    if (((bits >> 23) & 0xffu) == 0xffu) return static_cast<std::uint16_t>(sign | 0x7c00u | (mantissa ? 0x200u : 0u));
+    if (exponent >= 1) {
+        auto const half = static_cast<std::uint16_t>(sign | (exponent << 10) | (mantissa >> 13));
+        return static_cast<std::uint16_t>(half + ((mantissa >> 12) & 1u));
+    }
+    if (exponent < -10) return sign;
+
+    // Subnormal halves shift the implicit leading bit into the mantissa
+    mantissa |= 0x800000u;
+    auto const shift = static_cast<unsigned>(14 - exponent);
+    auto const half = static_cast<std::uint16_t>(sign | (mantissa >> shift));
+    return static_cast<std::uint16_t>(half + ((mantissa >> (shift - 1)) & 1u));
+}
+
+/** Converts @p value into the half-precision float at @p index of @p column, where a magnitude past its range
+ *  collides. */
+static conversion_t gather_half(yyjson_val* value, ustore_byte_t* column, std::size_t index) noexcept {
+    float single = 0;
+    conversion_t conversion = json_to_scalar(value, single);
+    if (is_valid(conversion) && std::isfinite(single) && std::abs(single) >= half_overflow_k)
+        conversion = conversion_t::collides_k;
+    std::uint16_t const half = is_valid(conversion) ? half_of(single) : 0;
+    std::memcpy(column + index * sizeof(half), &half, sizeof(half));
+    return conversion;
+}
+
+/** Parses canonical UUID text such as "123e4567-e89b-12d3-a456-426614174000" into the bytes at @p index of @p column,
+ *  in the order they are written. */
+static conversion_t gather_uuid(yyjson_val* value, ustore_byte_t* column, std::size_t index) noexcept {
+    constexpr std::size_t uuid_text_length_k = 36;
+    std::uint8_t parsed[uuid_bytes_k] = {};
+    ustore_byte_t* const cell = column + index * uuid_bytes_k;
+    std::memset(cell, 0, uuid_bytes_k);
+
+    if (!value || yyjson_is_null(value)) return conversion_t::missing_k;
+    if (!yyjson_is_str(value) || yyjson_get_len(value) != uuid_text_length_k) return conversion_t::collides_k;
+
+    char const* const text = yyjson_get_str(value);
+    std::size_t parsed_count = 0;
+    for (std::size_t position = 0; position != uuid_text_length_k; position += 2) {
+        if (position == 8 || position == 13 || position == 18 || position == 23) {
+            if (text[position] != '-') return conversion_t::collides_k;
+            ++position;
+        }
+        auto const [end, failure] = std::from_chars(text + position, text + position + 2, parsed[parsed_count], 16);
+        if (failure != std::errc() || end != text + position + 2) return conversion_t::collides_k;
+        ++parsed_count;
+    }
+    std::memcpy(cell, parsed, uuid_bytes_k);
+    return conversion_t::converted_k;
 }
 
 #pragma endregion Gather
@@ -1037,10 +1154,12 @@ void ustore_docs_gather(ustore_docs_gather_t* request_pointer) {
 
             switch (type) {
             case ustore_doc_field_bool_k: conversion = gather_scalar<bool>(value, scalar_column, document_index); break;
+            case ustore_doc_field_uuid_k: conversion = gather_uuid(value, scalar_column, document_index); break;
             case ustore_doc_field_f64_k:
                 conversion = gather_scalar<double>(value, scalar_column, document_index);
                 break;
             case ustore_doc_field_f32_k: conversion = gather_scalar<float>(value, scalar_column, document_index); break;
+            case ustore_doc_field_f16_k: conversion = gather_half(value, scalar_column, document_index); break;
             case ustore_doc_field_i64_k:
                 conversion = gather_scalar<std::int64_t>(value, scalar_column, document_index);
                 break;

@@ -12,20 +12,23 @@
 #include <cstdint> // `std::uint64_t`
 #include <cstring> // `std::memcpy`, `std::strlen`
 
-#include <charconv> // `std::to_chars`
-#include <limits>   // `std::numeric_limits`
-#include <memory>   // `std::unique_ptr`
-#include <mutex>    // `std::lock_guard`, `std::mutex`, `std::unique_lock`
-#include <new>      // `std::bad_alloc`, `std::nothrow`
-#include <span>     // `std::span`
-#include <string>   // `std::string`, the path and name type RocksDB takes
-#include <vector>   // `std::vector`, the descriptor, handle and file lists RocksDB takes
+#include <array>       // `std::array`
+#include <charconv>    // `std::to_chars`
+#include <limits>      // `std::numeric_limits`
+#include <memory>      // `std::unique_ptr`
+#include <mutex>       // `std::lock_guard`, `std::mutex`, `std::unique_lock`
+#include <new>         // `std::bad_alloc`, `std::nothrow`
+#include <span>        // `std::span`
+#include <string>      // `std::string`, the path and name type RocksDB takes
+#include <string_view> // `std::string_view`
+#include <vector>      // `std::vector`, the descriptor, handle and file lists RocksDB takes
 
 #include <rocksdb/db.h>
 #include <rocksdb/sst_file_writer.h>
 #include <rocksdb/utilities/optimistic_transaction_db.h>
 #include <rocksdb/utilities/options_util.h>
 #include <rocksdb/utilities/transaction.h>
+#include <rocksdb/version.h>
 
 #include <smashtable/basic_hash_table.hpp>
 #include <smashtable/basic_vector.hpp>
@@ -158,6 +161,22 @@ column_t* column_of(database_t& database, ustore_collection_t collection) noexce
     for (column_t* const column : database.columns)
         if (column && column->GetID() == collection) return column;
     return nullptr;
+}
+
+/** Removes every pair of @p column in one synchronous batch, or empties every value for @c ustore_drop_vals_k. */
+native_status_t clear_column(database_t& database, column_t* column, ustore_drop_mode_t mode) {
+    ::rocksdb::WriteBatch batch;
+    std::unique_ptr<::rocksdb::Iterator> iterator {database.native->NewIterator(::rocksdb::ReadOptions(), column)};
+    native_status_t status;
+    for (iterator->SeekToFirst(); status.ok() && iterator->Valid(); iterator->Next())
+        status = mode == ustore_drop_vals_k ? batch.Put(column, iterator->key(), ::rocksdb::Slice())
+                                            : batch.Delete(column, iterator->key());
+    if (status.ok()) status = iterator->status();
+    if (!status.ok()) return status;
+
+    ::rocksdb::WriteOptions write_options;
+    write_options.sync = true;
+    return database.native->Write(write_options, &batch);
 }
 
 /** Points @p options at the snapshot @p id, leaving them untouched for the zero identifier. */
@@ -630,11 +649,16 @@ void snapshot_export(ustore_snapshot_export_t& arguments) {
 }
 
 void snapshot_drop(ustore_snapshot_drop_t& arguments) {
-    if (!arguments.id) return;
-
+    if (!arguments.db) {
+        *arguments.error = {ustore_error_uninitialized_k, "Database is uninitialized"};
+        return;
+    }
     database_t& database = *reinterpret_cast<database_t*>(arguments.db);
     std::lock_guard lock {database.mutex};
-    if (!database.snapshots.erase(arguments.id)) return;
+    if (!database.snapshots.erase(arguments.id)) {
+        *arguments.error = {ustore_error_not_found_k, "The snapshot doesn't exist"};
+        return;
+    }
 
     snapshot_t* const snapshot = reinterpret_cast<snapshot_t*>(arguments.id);
     database.native->ReleaseSnapshot(snapshot->native);
@@ -832,11 +856,11 @@ void sample(ustore_sample_t& arguments) {
             iterated_column = column;
         }
 
-        std::span<ustore_key_t> const sampled_keys {keys_output, task.limit};
-        reservoir_sample_iterator(iterator, sampled_keys, arguments.error);
+        std::size_t const drawn = reservoir_sample_iterator(iterator, std::span {keys_output, task.limit});
+        if (export_error(iterator->status(), arguments.error)) return;
 
-        counts[task_index] = task.limit;
-        keys_output += task.limit;
+        counts[task_index] = static_cast<ustore_length_t>(drawn);
+        keys_output += drawn;
     }
     offsets[samples.count] = keys_output - *arguments.keys;
 }
@@ -977,18 +1001,7 @@ void collection_drop(ustore_collection_drop_t& arguments) {
         return;
     }
 
-    ::rocksdb::WriteOptions write_options;
-    write_options.sync = true;
-    ::rocksdb::WriteBatch batch;
-    std::unique_ptr<::rocksdb::Iterator> iterator {database.native->NewIterator(::rocksdb::ReadOptions(), column)};
-    for (iterator->SeekToFirst(); iterator->Valid(); iterator->Next()) {
-        native_status_t const staged = arguments.mode == ustore_drop_vals_k
-                                           ? batch.Put(column, iterator->key(), ::rocksdb::Slice())
-                                           : batch.Delete(column, iterator->key());
-        if (export_error(staged, arguments.error)) return;
-    }
-    native_status_t const status = database.native->Write(write_options, &batch);
-    export_error(status, arguments.error);
+    export_error(clear_column(database, column, arguments.mode), arguments.error);
 }
 
 void collection_list(ustore_collection_list_t& arguments) {
@@ -1026,9 +1039,145 @@ void collection_list(ustore_collection_list_t& arguments) {
     }
 }
 
+/** Serves "clear", removing every pair while keeping the collections and their names. */
+void clear_pairs(database_t& database, ustore_database_control_t& arguments) {
+    for (column_t* const column : database.columns) {
+        if (column == database.names) continue;
+        if (export_error(clear_column(database, column, ustore_drop_keys_vals_k), arguments.error)) return;
+    }
+}
+
+/** Serves "reset", releasing every snapshot, dropping every collection and clearing the reserved ones. */
+void reset_database(database_t& database, ustore_database_control_t& arguments) {
+    {
+        std::lock_guard lock {database.mutex};
+        [[maybe_unused]] auto const released = database.snapshots.for_each([&](auto const& slot) noexcept {
+            snapshot_t* const snapshot = reinterpret_cast<snapshot_t*>(slot.key());
+            database.native->ReleaseSnapshot(snapshot->native);
+            delete snapshot;
+        });
+        database.snapshots.clear();
+    }
+
+    // Walking from the back lets a dropped handle take the place of one already visited
+    for (std::size_t position = database.columns.size(); position-- != 0;) {
+        column_t* const column = database.columns[position];
+        bool const reserved = column == database.names || column->GetName() == ::rocksdb::kDefaultColumnFamilyName;
+        native_status_t const status = reserved ? clear_column(database, column, ustore_drop_keys_vals_k)
+                                                : database.native->DropColumnFamily(column);
+        if (export_error(status, arguments.error)) return;
+        if (reserved) continue;
+
+        database.native->DestroyColumnFamilyHandle(column);
+        database.columns[position] = database.columns[database.columns.size() - 1];
+        database.columns.pop_back();
+    }
+}
+
+/** Serves "compact", flushing every memtable and compacting every collection. */
+void compact_database(database_t& database, ustore_database_control_t& arguments) {
+    ::rocksdb::FlushOptions const flush_options;
+    ::rocksdb::CompactRangeOptions const compact_options;
+    for (column_t* const column : database.columns) {
+        if (export_error(database.native->Flush(flush_options, column), arguments.error)) return;
+        native_status_t const status = database.native->CompactRange(compact_options, column, nullptr, nullptr);
+        if (export_error(status, arguments.error)) return;
+    }
+}
+
+/** Writes @p text at @p cursor and answers where it ends. */
+inline char* append_text(char* cursor, std::string_view text) noexcept {
+    std::memcpy(cursor, text.data(), text.size());
+    return cursor + text.size();
+}
+
+/** Serves "info", naming the engine and the RocksDB release it links. */
+void describe_database(database_t&, ustore_database_control_t& arguments) {
+    linked_memory_lock_t arena = linked_memory(arguments.arena, ustore_options_default_k, arguments.error);
+    if (arguments.error->status) return;
+
+    std::string const version = ::rocksdb::GetRocksVersionAsString();
+    constexpr std::string_view prefix_k = R"({"engine":"rocksdb","version":")";
+    constexpr std::string_view suffix_k = R"("})";
+    char* const response =
+        arena.alloc<char>(prefix_k.size() + version.size() + suffix_k.size() + 1, arguments.error).data();
+    if (arguments.error->status) return;
+
+    char* const end = append_text(append_text(append_text(response, prefix_k), version), suffix_k);
+    *end = '\0';
+    *arguments.response = response;
+}
+
+/** Serves "usage", summing the estimated keys, memtable bytes and table file bytes of every collection. */
+void report_usage(database_t& database, ustore_database_control_t& arguments) {
+    linked_memory_lock_t arena = linked_memory(arguments.arena, ustore_options_default_k, arguments.error);
+    if (arguments.error->status) return;
+
+    std::uint64_t keys_count = 0;
+    std::uint64_t memory_bytes = 0;
+    std::uint64_t disk_bytes = 0;
+    for (column_t* const column : database.columns) {
+        std::uint64_t property = 0;
+        if (database.native->GetIntProperty(column, ::rocksdb::DB::Properties::kEstimateNumKeys, &property))
+            keys_count += property;
+        if (database.native->GetIntProperty(column, ::rocksdb::DB::Properties::kCurSizeAllMemTables, &property))
+            memory_bytes += property;
+        if (database.native->GetIntProperty(column, ::rocksdb::DB::Properties::kTotalSstFilesSize, &property))
+            disk_bytes += property;
+    }
+
+    constexpr std::size_t response_capacity_k = 128;
+    char* const response = arena.alloc<char>(response_capacity_k, arguments.error).data();
+    if (arguments.error->status) return;
+    char* const response_end = response + response_capacity_k;
+
+    char* cursor = append_text(response, R"({"keys":)");
+    cursor = std::to_chars(cursor, response_end, keys_count).ptr;
+    cursor = append_text(cursor, R"(,"memory_bytes":)");
+    cursor = std::to_chars(cursor, response_end, memory_bytes).ptr;
+    cursor = append_text(cursor, R"(,"disk_bytes":)");
+    cursor = std::to_chars(cursor, response_end, disk_bytes).ptr;
+    cursor = append_text(cursor, "}");
+    *cursor = '\0';
+    *arguments.response = response;
+}
+
+/** One free-form request of @c ustore_database_control. */
+struct control_request_t {
+
+    /** The name a caller sends. */
+    std::string_view name;
+
+    /** Serves the request. */
+    void (*serve)(database_t&, ustore_database_control_t&);
+};
+
+/** Every request @c ustore_database_control serves. */
+inline constexpr std::array<control_request_t, 5> control_requests_k {{
+    {"clear", &clear_pairs},
+    {"reset", &reset_database},
+    {"compact", &compact_database},
+    {"info", &describe_database},
+    {"usage", &report_usage},
+}};
+
 void database_control(ustore_database_control_t& arguments) {
+    if (!arguments.db) {
+        *arguments.error = {ustore_error_uninitialized_k, "Database is uninitialized"};
+        return;
+    }
+    if (!arguments.request || !arguments.response) {
+        *arguments.error = {ustore_error_invalid_argument_k, "Need a request and an output for the response"};
+        return;
+    }
+
     *arguments.response = nullptr;
-    *arguments.error = {ustore_error_unsupported_k, "Controls are not supported by this engine"};
+    database_t& database = *reinterpret_cast<database_t*>(arguments.db);
+    std::string_view const request {arguments.request};
+    for (control_request_t const& known : control_requests_k)
+        if (known.name == request) return known.serve(database, arguments);
+    *arguments.error = {ustore_error_invalid_argument_k,
+                        "Unknown request: expected clear, reset, compact, info or usage"};
 }
 
 #pragma endregion Collections
@@ -1066,7 +1215,7 @@ void transaction_stage(ustore_transaction_stage_t& arguments) {
         *arguments.error = {ustore_error_uninitialized_k, "Transaction is uninitialized"};
         return;
     }
-    // `OptimisticTransaction::Prepare` refuses two-phase commit, and conflicts are checked only inside `Commit`
+    // Optimistic transactions refuse `Prepare` and validate conflicts only on the write thread inside `Commit`
     *arguments.error = {ustore_error_unsupported_k, "Staging is not supported by RocksDB optimistic transactions"};
 }
 

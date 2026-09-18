@@ -19,7 +19,7 @@
 #include <optional>   // `std::optional`
 #include <span>       // `std::span`
 
-#include <ustore/ustore.hpp> // `ustore_read`, `strided_range`, `joined_blobs_t`
+#include <ustore/ustore.hpp> // `ustore_read`, `strided_range`, `embedded_blobs_t`
 
 #include "helpers/algorithm.hpp"     // `offset_in_sorted`
 #include "helpers/linked_memory.hpp" // `linked_memory_lock_t`
@@ -179,6 +179,16 @@ neighborships_view_t neighbors(value_view_t value, ustore_vertex_role_t role = u
     return {};
 }
 
+/** Whether @p value is missing, a bare vertex, or degrees followed by exactly the neighborships they count. */
+bool is_vertex_value(value_view_t value) noexcept {
+    if (value.empty()) return true;
+    if (value.size() < bytes_in_degrees_header_k) return false;
+
+    auto const header = reinterpret_cast<ustore_bytes_cptr_t>(value.begin());
+    std::size_t const neighborships_count = std::size_t {degree_of(header, 0)} + degree_of(header, 1);
+    return value.size() - bytes_in_degrees_header_k == neighborships_count * sizeof(neighborship_t);
+}
+
 /** Counts a neighborship towards the growth of @p entry unless the entry already holds it. */
 void count_inserts_into_entry( //
     updated_entry_t& entry, ustore_vertex_role_t role, ustore_key_t neighbor_id, ustore_key_t edge_id) noexcept {
@@ -255,9 +265,10 @@ void export_edge_tuples( //
     ustore_size_t const roles_stride, ustore_options_t const options, ustore_vertex_degree_t** degrees_per_vertex,
     ustore_key_t** neighborships_per_vertex, linked_memory_lock_t& arena, ustore_error_t* error) noexcept {
 
-    // Degrees may sit inside compressed values, so they come from the values rather than from their lengths
+    // Degrees come from the values, while lengths tell a missing vertex apart from a bare one
     ustore_bytes_ptr_t found_values {};
     ustore_length_t* found_offsets {};
+    ustore_length_t* found_lengths {};
     ustore_read_t read {};
     read.db = database;
     read.error = error;
@@ -271,12 +282,13 @@ void export_edge_tuples( //
     read.keys = vertices;
     read.keys_stride = vertices_stride;
     read.offsets = &found_offsets;
+    read.lengths = &found_lengths;
     read.values = &found_values;
 
     ustore_read(&read);
     if (error->status) return;
 
-    joined_blobs_t const values {vertices_count, found_offsets, found_values};
+    embedded_blobs_t const values {vertices_count, found_offsets, found_lengths, found_values};
     find_edges_t const find_edges {
         {collections, collections_stride},
         {vertices, vertices_stride},
@@ -286,12 +298,14 @@ void export_edge_tuples( //
     constexpr std::size_t ids_per_neighborship_k = ids_per_neighborship(export_kind_);
 
     std::size_t ids_count = 0;
-    if constexpr (ids_per_neighborship_k != 0) {
-        joined_blobs_iterator_t value_iterator = values.begin();
-        for (std::size_t index = 0; index != vertices_count; ++index, ++value_iterator)
-            ids_count += neighbors(*value_iterator, find_edges[index].role).size();
-        ids_count *= ids_per_neighborship_k;
+    for (std::size_t index = 0; index != vertices_count; ++index) {
+        if (!is_vertex_value(values[index])) {
+            *error = {ustore_error_malformed_k, "A vertex holds a value that is not a graph vertex"};
+            return;
+        }
+        ids_count += neighbors(values[index], find_edges[index].role).size();
     }
+    ids_count *= ids_per_neighborship_k;
 
     auto ids = arena.alloc_or_dummy(ids_count, error, neighborships_per_vertex);
     if (error->status) return;
@@ -299,9 +313,8 @@ void export_edge_tuples( //
     if (error->status) return;
 
     std::size_t exported_ids = 0;
-    joined_blobs_iterator_t value_iterator = values.begin();
-    for (std::size_t index = 0; index != vertices_count; ++index, ++value_iterator) {
-        value_view_t const value = *value_iterator;
+    for (std::size_t index = 0; index != vertices_count; ++index) {
+        value_view_t const value = values[index];
         find_edge_t const find_edge = find_edges[index];
 
         if (!value) {
@@ -352,6 +365,7 @@ void pull_and_link_for_updates( //
 
     ustore_bytes_ptr_t found_values = nullptr;
     ustore_length_t* found_offsets = nullptr;
+    ustore_length_t* found_lengths = nullptr;
     auto const unique_count = static_cast<ustore_size_t>(unique_entries.size());
     auto const collections = unique_entries.immutable().members(&updated_entry_t::collection);
     auto const keys = unique_entries.immutable().members(&updated_entry_t::key);
@@ -373,14 +387,19 @@ void pull_and_link_for_updates( //
     read.keys = keys.begin().get();
     read.keys_stride = keys.stride();
     read.offsets = &found_offsets;
+    read.lengths = &found_lengths;
     read.values = &found_values;
 
     ustore_read(&read);
     if (error->status) return;
 
-    joined_blobs_t const found {unique_count, found_offsets, found_values};
+    embedded_blobs_t const found {unique_count, found_offsets, found_lengths, found_values};
     for (std::size_t index = 0; index != unique_count; ++index) {
         value_view_t const value = found[index];
+        if (!is_vertex_value(value)) {
+            *error = {ustore_error_malformed_k, "A vertex holds a value that is not a graph vertex"};
+            return;
+        }
         unique_entries[index].content = ustore_bytes_ptr_t(value.data());
         unique_entries[index].length = value ? static_cast<ustore_length_t>(value.size()) : ustore_length_missing_k;
     }
@@ -453,9 +472,11 @@ void update_neighborhoods( //
         for_each_task(&insert_into_entry);
     }
 
-    // Vertices the update left unchanged move to the back
-    [[maybe_unused]] auto const unchanged = std::ranges::partition(
+    // Vertices the update left unchanged move to the back and are not written
+    auto const unchanged = std::ranges::partition(
         unique_entries, [](ustore_vertex_degree_t delta) { return delta != 0; }, &updated_entry_t::degree_delta);
+    auto const changed_count = static_cast<ustore_size_t>(unchanged.begin() - unique_entries.begin());
+    if (!changed_count) return;
 
     auto const written_collections = unique_strided.immutable().members(&updated_entry_t::collection);
     auto const written_keys = unique_strided.immutable().members(&updated_entry_t::key);
@@ -468,7 +489,7 @@ void update_neighborhoods( //
     write.transaction = transaction;
     write.arena = arena;
     write.options = options;
-    write.tasks_count = unique_count;
+    write.tasks_count = changed_count;
     write.collections = written_collections.begin().get();
     write.collections_stride = written_collections.stride();
     write.keys = written_keys.begin().get();
@@ -559,6 +580,7 @@ void ustore_graph_upsert_vertices(ustore_graph_upsert_vertices_t* request) {
     std::size_t missing_count = 0;
     for (std::size_t index = 0; index != request->tasks_count; ++index)
         if (found_lengths[index] == ustore_length_missing_k) missing_vertices[missing_count++] = vertices[index];
+    if (!missing_count) return;
 
     ustore_length_t const empty_length = 0;
     value_view_t const empty_value {""};

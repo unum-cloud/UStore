@@ -425,11 +425,16 @@ void snapshot_export(ustore_snapshot_export_t& arguments) {
 }
 
 void snapshot_drop(ustore_snapshot_drop_t& arguments) {
-    if (!arguments.id) return;
-
+    if (!arguments.db) {
+        *arguments.error = {ustore_error_uninitialized_k, "Database is uninitialized"};
+        return;
+    }
     database_t& database = *reinterpret_cast<database_t*>(arguments.db);
     std::lock_guard lock {database.mutex};
-    if (!database.snapshots.erase(arguments.id)) return;
+    if (!database.snapshots.erase(arguments.id)) {
+        *arguments.error = {ustore_error_not_found_k, "The snapshot doesn't exist"};
+        return;
+    }
 
     snapshot_t* const snapshot = reinterpret_cast<snapshot_t*>(arguments.id);
     database.native->ReleaseSnapshot(snapshot->native);
@@ -474,6 +479,7 @@ void read(ustore_read_t& arguments) {
         *arguments.error = {ustore_error_uninitialized_k, "Database is uninitialized"};
         return;
     }
+    if (!arguments.tasks_count) return;
 
     linked_memory_lock_t arena = linked_memory(arguments.arena, arguments.options, arguments.error);
     if (arguments.error->status) return;
@@ -603,11 +609,11 @@ void sample(ustore_sample_t& arguments) {
         sample_arg_t task = samples[task_index];
         offsets[task_index] = keys_output - *arguments.keys;
 
-        std::span<ustore_key_t> const sampled_keys {keys_output, task.limit};
-        reservoir_sample_iterator(iterator, sampled_keys, arguments.error);
+        std::size_t const drawn = reservoir_sample_iterator(iterator, std::span {keys_output, task.limit});
+        if (export_error(iterator->status(), arguments.error)) return;
 
-        counts[task_index] = task.limit;
-        keys_output += task.limit;
+        counts[task_index] = static_cast<ustore_length_t>(drawn);
+        keys_output += drawn;
     }
     offsets[samples.count] = keys_output - *arguments.keys;
 }
