@@ -1,250 +1,199 @@
-# Baseline Python implementation of Louvain Community detection algorithm,
-# similar to the one in NetworkX, designed to operate with both in-memory
-# graphs and the ones persisted in UStore.
-import os
+"""Louvain community detection in pure Python, over a graph held in UStore and over the same graph in NetworkX.
+
+The algorithm is the one `networkx.community.louvain_communities` runs, written against the calls both
+graph types share, so the same code times three ways: NetworkX's own implementation, this baseline over
+a `networkx.Graph`, and this baseline over a `ustore.graph_view.Graph` whose every read reaches the store.
+
+Run:
+    python bench/louvain.py --dataset data/snap-email/email-Eu-core.txt
+    python bench/louvain.py --vertices 1000 --communities 10
+"""
+
+import argparse
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from pathlib import Path
+from typing import Any
 
-import networkx as nx
-import ustore.smashtable as ustore
-from networkx.algorithms.community import louvain_communities as networkx_louvain
+import networkx
+import numpy
+import ustore
+from networkx.algorithms.community import louvain_communities
+from ustore.graph_view import Graph
 
 
-def _node_affiliation(graph, partition: Mapping[int, int], node: int) -> tuple[int, int]:
-    """
-    Simultaneously computes the degree (without self-edges) between `node` and
-    members of `node_community` as well as `neighbor_community`.
-    """
-
-    degrees = {}
-    for neighbor in graph[node]:
-        if neighbor != node:
-            degrees[partition[neighbor]] = degrees.get(partition[neighbor], 0) + 1
+def node_affiliation(graph: Any, partition: Mapping[int, int], node: int) -> dict[int, int]:
+    """The number of edges from `node` into every community its neighbours belong to, self-loops aside."""
+    degrees: dict[int, int] = {}
+    for neighbour in graph[node]:
+        if neighbour != node:
+            degrees[partition[neighbour]] = degrees.get(partition[neighbour], 0) + 1
     return degrees
 
 
-def _node_affiliation_weighted(graph, partition: Mapping[int, int], node: int) -> tuple[int, int]:
-    """
-    Simultaneously computes the weighted degree (without self-edges) between `node` and
-    members of `node_community` (without counting self-edge) as well as `neighbor_community`.
-    """
-
-    degrees = {}
-    for neighbor, data in graph[node].items():
-        if neighbor != node:
-            degrees[partition[neighbor]] = degrees.get(partition[neighbor], 0) + data.get("weight", 1)
+def node_affiliation_weighted(graph: Any, partition: Mapping[int, int], node: int) -> dict[int, float]:
+    """The weight of edges from `node` into every community its neighbours belong to, self-loops aside."""
+    degrees: dict[int, float] = {}
+    for neighbour, attributes in graph[node].items():
+        if neighbour != node:
+            degrees[partition[neighbour]] = degrees.get(partition[neighbour], 0) + attributes.get("weight", 1)
     return degrees
 
 
-def _one_level(
-    graph, edges_weight_sum: float, is_weighted: bool
-) -> tuple[Mapping[int, int], Mapping[int, float], Mapping[int, float], bool]:
-    """
-    Compute one level communities of graph.
-    """
+def one_level(
+    graph: Any, edges_weight_sum: float, is_weighted: bool
+) -> tuple[dict[int, int], dict[int, float], dict[int, float], bool]:
+    """Moves every node into the neighbouring community that raises modularity most, until none moves."""
+    degrees: dict[int, float] = dict(graph.degree(weight="weight") if is_weighted else graph.degree)
+    partition = {node: node for node in degrees}
+    # The summed degree of every community's members, and the summed degree between them.
+    community_degrees = dict(degrees)
+    community_inner_degrees = dict.fromkeys(degrees, 0.0)
+    affiliation: Callable[[Any, Mapping[int, int], int], Mapping[int, float]] = (
+        node_affiliation_weighted if is_weighted else node_affiliation
+    )
 
-    partition = {}
-    degrees = {}
-    # For every partition, stores the accumulated number of degrees of all of its members
-    community_degrees = {}
-    # For every partition, stores the accumulated number of degrees between all of its members
-    community_in_degrees = {}
-
-    if is_weighted:
-        for node in graph.nodes:
-            community_in_degrees[node] = 0
-            degrees[node] = graph.degree(weight="weight")[node]
-            partition[node] = node
-    else:
-        for node in graph.nodes:
-            community_in_degrees[node] = 0
-            degrees[node] = graph.degree[node]
-            partition[node] = node
-
-    community_degrees = degrees.copy()
-    affiliation_func = _node_affiliation_weighted if is_weighted else _node_affiliation
-
-    improvement = False
-    modified = 1
-    while modified:
-        modified = 0
-        for node in graph.nodes:
-            node_degree = degrees[node]
+    improved = False
+    moved = 1
+    while moved:
+        moved = 0
+        for node, node_degree in degrees.items():
             node_community = partition[node]
-            best_mod = 0
-            best_com = node_community
-            node_com_tot_degree = community_degrees[node_community]
+            best_gain = 0.0
+            best_community = node_community
+            node_community_degree = community_degrees[node_community]
 
-            degree_in_coms = affiliation_func(graph, partition, node)
-            node_in_node_com_degree = degree_in_coms.get(node_community, 0)
+            degrees_into_communities = affiliation(graph, partition, node)
+            degree_into_own = degrees_into_communities.get(node_community, 0)
 
-            for neighbor in graph[node]:
-                neighbor_community = partition[neighbor]
-                if node_community == neighbor_community:
+            for neighbour in graph[node]:
+                neighbour_community = partition[neighbour]
+                if neighbour_community == node_community:
                     continue
+                gain = (degrees_into_communities[neighbour_community] - degree_into_own) / edges_weight_sum + (
+                    node_degree / (2 * edges_weight_sum**2)
+                ) * (node_community_degree - node_degree - community_degrees[neighbour_community])
+                if gain > best_gain:
+                    best_gain = gain
+                    best_community = neighbour_community
 
-                neighbor_com_tot_degree = community_degrees[neighbor_community]
-                node_in_neighbor_com_degree = degree_in_coms[neighbor_community]
-
-                delta_modularity = (1 / edges_weight_sum) * (node_in_neighbor_com_degree - node_in_node_com_degree) + (
-                    node_degree / (2 * (edges_weight_sum**2))
-                ) * (node_com_tot_degree - node_degree - neighbor_com_tot_degree)
-
-                if delta_modularity > best_mod:
-                    best_mod = delta_modularity
-                    best_com = neighbor_community
-
-            if best_com != node_community:
+            if best_community != node_community:
                 community_degrees[node_community] -= node_degree
-                node_in_best_com_degree = degree_in_coms[best_com]
-                community_degrees[best_com] += node_degree
-                community_in_degrees[node_community] -= node_in_node_com_degree
-                community_in_degrees[best_com] += node_in_best_com_degree
-                partition[node] = best_com
-                modified += 1
-                improvement = True
+                community_degrees[best_community] += node_degree
+                community_inner_degrees[node_community] -= degree_into_own
+                community_inner_degrees[best_community] += degrees_into_communities[best_community]
+                partition[node] = best_community
+                moved += 1
+                improved = True
 
-            # TODO: remove this awkward logic to assume NetworkX Graph here
-            # But still we need to add weights for self-edges in community_in
+            # A self-loop adds to the inner degree of whichever community the node ends up in.
             if is_weighted:
-                edge_weight = graph.get_edge_data(node, node)
-                community_in_degrees[best_com] += edge_weight.get("weight", 1) if edge_weight is not None else 0
+                loop = graph.get_edge_data(node, node)
+                community_inner_degrees[best_community] += loop.get("weight", 1) if loop is not None else 0
             else:
-                community_in_degrees[best_com] += 1 if graph.has_edge(node, node) else 0
+                community_inner_degrees[best_community] += 1 if graph.has_edge(node, node) else 0
 
-    return partition, community_degrees, community_in_degrees, improvement
-
-
-def _gen_graph(graph, partition: Mapping[int, int]):
-    """
-    Create super node graph, where nodes are communities and edges are degrees between communities.
-    """
-
-    G = nx.Graph()
-    G.add_nodes_from(partition.values())
-
-    for node1, node2 in graph.edges:
-        com1 = partition[node1]
-        com2 = partition[node2]
-        w_prec = G.get_edge_data(com1, com2, {"weight": 0}).get("weight", 1)
-        G.add_edge(com1, com2, weight=w_prec + 1)
-
-    return G
+    return partition, community_degrees, community_inner_degrees, improved
 
 
-def _gen_graph_from_weighted(graph, partition: Mapping[int, int]):
-    """
-    Create super node graph from weighted graph, where nodes are communities and edges are degrees between communities.
-    """
-
-    G = nx.Graph()
-    G.add_nodes_from(partition.values())
-
-    for node1, node2, data in graph.edges(data=True):
-        com1 = partition[node1]
-        com2 = partition[node2]
-        edge_weight = data.get("weight", 1)
-        w_prec = G.get_edge_data(com1, com2, {"weight": 0}).get("weight", 1)
-        G.add_edge(com1, com2, weight=w_prec + edge_weight)
-
-    return G
+def aggregate(graph: Any, partition: Mapping[int, int], is_weighted: bool) -> networkx.Graph:
+    """The graph of communities, whose edge weights sum the edges between their members."""
+    aggregated = networkx.Graph()
+    aggregated.add_nodes_from(partition.values())
+    edges = graph.edges(data=True) if is_weighted else ((source, target, {}) for source, target in graph.edges)
+    for source, target, attributes in edges:
+        first, second = partition[source], partition[target]
+        previous = aggregated.get_edge_data(first, second, {"weight": 0}).get("weight", 1)
+        aggregated.add_edge(first, second, weight=previous + attributes.get("weight", 1))
+    return aggregated
 
 
 def modularity(
     partition: Mapping[int, int],
     community_degrees: Mapping[int, float],
-    community_in_degrees: Mapping[int, float],
+    community_inner_degrees: Mapping[int, float],
     degree_sum: float,
 ) -> float:
-    """
-    Compute the modularity of a partition of a graph
-    """
-
-    m = degree_sum / 2
-    norm = 1 / m
-    res = 0.0
-    for com in set(partition.values()):
-        res += norm * (community_in_degrees[com] - community_degrees[com] * community_degrees[com] / (2 * m))
-    return res
+    """The modularity of a partition, from the degrees `one_level` accumulated."""
+    edges_weight = degree_sum / 2
+    return sum(
+        (community_inner_degrees[community] - community_degrees[community] ** 2 / (2 * edges_weight)) / edges_weight
+        for community in set(partition.values())
+    )
 
 
-def best_partition(graph, min_mod_growth: float = 0.0000001) -> Mapping[int, int]:
-    """
-    Compute the partition of the graph nodes which maximises the modularity.
-    """
-
-    partitions = []
-    count_edges = graph.number_of_edges()
-    partition, community_degrees, community_in_degrees, improvement = _one_level(graph, count_edges, False)
-    if not improvement:
+def best_partition(graph: Any, min_modularity_growth: float = 1e-7) -> dict[int, int]:
+    """The partition of the nodes of `graph` into communities that maximises modularity level by level."""
+    edges_count = graph.number_of_edges()
+    partition, community_degrees, community_inner_degrees, improved = one_level(graph, edges_count, False)
+    if not improved:
         return partition
-    mod = modularity(partition, community_degrees, community_in_degrees, 2 * count_edges)
+    current = modularity(partition, community_degrees, community_inner_degrees, 2 * edges_count)
 
-    partitions.insert(0, partition)
-    graph = _gen_graph(graph, partition)
-
-    while improvement:
-        edges_weight_sum = graph.size(weight="weight")
-        partition, community_degrees, community_in_degrees, improvement = _one_level(graph, edges_weight_sum, True)
-        new_mod = modularity(partition, community_degrees, community_in_degrees, 2 * edges_weight_sum)
-
-        if not improvement or new_mod - mod <= min_mod_growth:
+    partitions = [partition]
+    level = aggregate(graph, partition, False)
+    while improved:
+        edges_weight_sum = level.size(weight="weight")
+        partition, community_degrees, community_inner_degrees, improved = one_level(level, edges_weight_sum, True)
+        grown = modularity(partition, community_degrees, community_inner_degrees, 2 * edges_weight_sum)
+        if not improved or grown - current <= min_modularity_growth:
             break
+        current = grown
+        partitions.append(partition)
+        level = aggregate(level, partition, True)
 
-        mod = new_mod
-        partitions.insert(0, partition)
-        graph = _gen_graph_from_weighted(graph, partition)
-
-    partition = partitions[0]
-    for index in range(1, len(partitions)):
-        for node, com in partitions[index].items():
-            partitions[index][node] = partition[com]
-        partition = partitions[index]
-
-    return partition
+    flattened = partitions[0]
+    for coarser in partitions[1:]:
+        flattened = {node: coarser[community] for node, community in flattened.items()}
+    return flattened
 
 
-dataset_dir = "tmp/"
+def load_graph(settings: argparse.Namespace) -> networkx.Graph:
+    """The edge list at `--dataset`, or a planted-partition graph generated from the other flags."""
+    if settings.dataset is not None:
+        return networkx.read_edgelist(settings.dataset, nodetype=int)
+    size = settings.vertices // settings.communities
+    return networkx.planted_partition_graph(
+        settings.communities, size, settings.inner_probability, settings.outer_probability, seed=settings.seed
+    )
 
-datasets = [
-    ("Email", "email-Eu-core.txt", "https://snap.stanford.edu/data/email-Eu-core.txt.gz"),
-    ("Facebook", "facebook_combined.txt", "https://snap.stanford.edu/data/facebook.tar.gz"),
-    (
-        "Amazon",
-        "com-amazon.ungraph.txt",
-        "https://snap.stanford.edu/data/bigdata/communities/com-amazon.ungraph.txt.gz",
-    ),
-    (
-        "Youtube",
-        "com-youtube.ungraph.txt",
-        "https://snap.stanford.edu/data/bigdata/communities/com-youtube.ungraph.txt.gz",
-    ),
-    ("Orkut", "com-orkut.ungraph.txt", "https://snap.stanford.edu/data/bigdata/communities/com-orkut.ungraph.txt.gz"),
-]
+
+def timed(name: str, run: Callable[[], Any]) -> Any:
+    start = time.perf_counter()
+    result = run()
+    print(f"{name}: {time.perf_counter() - start:.3f} s", flush=True)
+    return result
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--dataset", type=Path, help="SNAP edge list; a planted partition is generated without it")
+    parser.add_argument("--directory", type=Path, help="directory the UStore graph persists in; in memory otherwise")
+    parser.add_argument("--vertices", type=int, default=1000, help="vertices of the generated graph")
+    parser.add_argument("--communities", type=int, default=10, help="communities of the generated graph")
+    parser.add_argument("--inner-probability", type=float, default=0.1, help="edge probability inside a community")
+    parser.add_argument("--outer-probability", type=float, default=0.001, help="edge probability between them")
+    parser.add_argument("--seed", type=int, default=42, help="seed of the generated graph and of NetworkX's Louvain")
+    settings = parser.parse_args()
+
+    reference = load_graph(settings)
+    print(f"Graph: {reference.number_of_nodes()} vertices, {reference.number_of_edges()} edges", flush=True)
+
+    communities = timed("NetworkX louvain_communities", lambda: louvain_communities(reference, seed=settings.seed))
+    print(f"  {len(communities)} communities", flush=True)
+    partition = timed("Python baseline over NetworkX", lambda: best_partition(reference))
+    print(f"  {len(set(partition.values()))} communities", flush=True)
+
+    with ustore.Database(settings.directory) as database:
+        edges = numpy.array(reference.edges, dtype=numpy.int64).reshape(-1, 2)
+        isolated = [node for node, degree in reference.degree if degree == 0]
+        timed("UStore import", lambda: database.graph_upsert_edges(edges[:, 0].copy(), edges[:, 1].copy()))
+        if isolated:
+            database.graph_upsert_vertices(isolated)
+        stored = Graph(database)
+        partition = timed("Python baseline over UStore", lambda: best_partition(stored))
+        print(f"  {len(set(partition.values()))} communities", flush=True)
 
 
 if __name__ == "__main__":
-    for name, dataset, _ in datasets:
-        G = nx.read_edgelist(os.path.join(dataset_dir, dataset), nodetype=int)
-
-        t1 = time.perf_counter()
-        networkx_louvain(G)
-        t2 = time.perf_counter()
-        print(f"Elapsed time for {name} dataset with NetworkX: {t2 - t1:.3f}s ")
-
-        graph = ustore.DataBase().main.graph
-        for v1, v2 in G.edges:
-            graph.add_edge(v1, v2)
-        G.clear()
-
-        t1 = time.perf_counter()
-        best_partition(graph)
-        t2 = time.perf_counter()
-
-        print(f"Elapsed time for {name} dataset with UStore Python: {t2 - t1:.3f}s ")
-
-        t1 = time.perf_counter()
-        graph.community_louvain()
-        t2 = time.perf_counter()
-
-        print(f"Elapsed time for {name} dataset with UStore C++: {t2 - t1:.3f}s ")
+    main()

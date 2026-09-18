@@ -1,477 +1,547 @@
 /**
- * @file cli.cpp
- * @brief CLI tool for UStore.
+ *  @file tools/cli.cpp
+ *  @author Ash Vardanian
+ *  @date June 5, 2023
+ *  @brief Command-line tool over collections, snapshots and document datasets, one command per invocation.
  */
 
-#include <iostream>            // `std::cout`, `std::cerr`
-#include <regex>               // `std::regex`, `std::regex_token_iterator`
+#include <cstddef> // `std::size_t`
+#include <cstdio>  // `stderr`
+#include <cstring> // `std::memcpy`, `std::strlen`
 
-#include <fmt/format.h>        // `fmt::format`, `fmt::print`
+#if defined(_WIN32)
+#include <io.h> // `_isatty`, `_fileno`
+#else
+#include <unistd.h> // `isatty`
+#endif
 
-#include <clipp.h>             // `clipp::parse`
-#include <readline/readline.h> // `readline`
-#include <readline/history.h>  // `add_history`
+#include <array>       // `std::array`
+#include <span>        // `std::span`
+#include <string_view> // `std::string_view`
 
-#include "ustore/cpp/db.hpp"   // `database_t`
-#include "dataset.h"           // `import`, `export`
+#include <fmt/color.h>  // `fmt::color`, `fmt::fg`, `fmt::text_style`
+#include <fmt/format.h> // `fmt::println`, `fmt::format_to_n`
 
-using namespace unum::ustore;
-using namespace unum;
+#include <stringzilla/stringzilla.hpp> // `sz::string`
 
-#pragma region - Helpers
-static constexpr char const* red_k = "\033[31m";
-static constexpr char const* green_k = "\033[32m";
-static constexpr char const* yellow_k = "\x1B[33m";
-static constexpr char const* reset_k = "\033[0m";
+#include <ustore/db.h>      // `ustore_database_init`, `ustore_error_t`
+#include <ustore/strings.h> // `ustore_strings_read`, `ustore_strings_scan`
+#include <ustore/types.hpp> // `sz`
 
-inline std::string remove_quotes(std::string str) {
-    if (str[0] == '\"' && str[str.size() - 1] == '\"') {
-        str.erase(0, 1);
-        str.erase(str.size() - 1);
-    }
-    return str;
-}
+#include "arguments.hpp" // `parse_arguments`, `argument_status_t`
+#include "dataset.h"     // `ustore_docs_import`, `ustore_docs_export`
 
-template <typename... args_at>
-inline void print(char const* color, std::string message, args_at&&... args) {
-    if (sizeof...(args) != 0)
-        message = fmt::format(message, std::forward<args_at>(args)...);
-    fmt::print("{}{}{}\n", color, message, reset_k);
-}
-#pragma endregion - Helpers
+namespace unum::ustore {
 
-#pragma region - Collection
-inline void collection_create(database_t& db, std::string const& name) {
-    auto maybe_collection = db.find_or_create(name.c_str());
-    if (maybe_collection)
-        print(green_k, "Collection '{}' created", name);
-    else
-        print(red_k, "Failed to create collection '{}'", name);
-}
-
-inline void collection_drop(database_t& db, std::string const& name) {
-    auto status = db.drop(name);
-    if (status)
-        print(green_k, "Collection '{}' dropped", name);
-    else
-        print(red_k, "Failed to drop collection '{}'", name);
-}
-
-void collection_list(database_t& db) {
-    auto context = context_t {db, nullptr};
-    auto collections = context.collections();
-
-    if (!collections) {
-        print(red_k, "Failed to list collections");
-        return;
-    }
-
-    while (!collections->names.is_end()) {
-        print(yellow_k, "{}", *collections->names);
-        ++collections->names;
-    }
-}
-#pragma endregion - Collection
-
-#pragma region - Snapshot
-inline void snapshot_create(database_t& db) {
-    auto snapshot = db.snapshot();
-    if (snapshot)
-        print(green_k, "Snapshot created");
-    else
-        print(red_k, "Failed to create snapshot");
-}
-
-inline void snapshot_export(database_t& db, std::string const& path) {
-    auto context = context_t {db, nullptr};
-    auto status = context.export_to(path.c_str());
-    if (status)
-        print(green_k, "Snapshot exported");
-    else
-        print(red_k, "Failed to export snapshot");
-}
-
-void snapshot_drop(database_t& db, ustore_snapshot_t const& id) {
-    auto status = db.drop_snapshot(id);
-    if (status)
-        print(green_k, "Snapshot dropped");
-    else
-        print(red_k, "Failed to drop snapshot");
-}
-
-void snapshot_list(database_t& db) {
-    auto context = context_t {db, nullptr};
-    auto snapshots = context.snapshots().throw_or_release();
-
-    for (auto it = snapshots.begin(); it != snapshots.end(); ++it)
-        print(yellow_k, "{}", *it);
-}
-#pragma endregion - Snapshot
-
-#pragma region - Import/Export
-void docs_import(database_t& db,
-                 std::string const& collection_name,
-                 std::string const& input_file,
-                 std::string const& id_field,
-                 std::size_t max_batch_size) {
-    status_t status;
-    arena_t arena(db);
-    ustore_collection_t collection = db.find(collection_name);
-
-    ustore_docs_import_t docs {
-        .db = db,
-        .error = status.member_ptr(),
-        .arena = arena.member_ptr(),
-        .options = ustore_options_default_k,
-        .collection = collection,
-        .paths_pattern = input_file.c_str(),
-        .max_batch_size = max_batch_size,
-        .id_field = id_field.c_str(),
-    };
-    ustore_docs_import(&docs);
-
-    if (status)
-        print(green_k, "Successfully imported");
-    else
-        print(red_k, "Failed to import: {}", status.message());
-}
-
-void docs_export(database_t& db,
-                 std::string const& collection_name,
-                 std::string const& output_ext,
-                 std::size_t max_batch_size) {
-    status_t status;
-    arena_t arena(db);
-    ustore_collection_t collection = db.find(collection_name);
-
-    ustore_docs_export_t docs {
-        .db = db,
-        .error = status.member_ptr(),
-        .arena = arena.member_ptr(),
-        .options = ustore_options_default_k,
-        .collection = collection,
-        .paths_extension = output_ext.c_str(),
-        .max_batch_size = max_batch_size,
-    };
-    ustore_docs_export(&docs);
-
-    if (status)
-        print(green_k, "Successfully exported");
-    else
-        print(red_k, "Failed to export: {}", status.message());
-}
-#pragma endregion - Import / Export
-
-#pragma region - Interface
-
-// List of CLI arguments
-struct cli_args_t {
-    bool help = false;
-    std::string directory;
-
-    std::string action;
-    std::string db_object;
-    std::string col_name;
-    ustore_snapshot_t snap_id;
-
-    std::string id_field;
-    std::string input_file;
-    std::string output_ext;
-    std::string export_path;
-    std::size_t memory_limit;
+/** How a message reads, which decides its color on a terminal. */
+enum class tone_t : std::uint8_t {
+    failure_k,
+    success_k,
+    listing_k,
 };
 
-// CLI arguments parser
-bool parse_cli_args(int argc, char* argv[], cli_args_t& arg) {
-    using namespace clipp;
+#if defined(_WIN32)
 
-    auto collection =
-        (option("collection").set(arg.db_object, std::string("collection")) &
-         ((required("create").set(arg.action, std::string("create")) & required("--name") &
-           value("collection name", arg.col_name)) |
-          (required("drop").set(arg.action, std::string("drop")) & required("--name") &
-           value("collection name", arg.col_name)) |
-          required("list").set(arg.action, std::string("list")) |
-          ((required("import").set(arg.action, std::string("import")) &
-            (required("--input") & value("input", arg.input_file)).doc("Input file path") &
-            (required("--id") & value("id field", arg.id_field)).doc("The field which data will use as key(s)")) |
-           (required("export").set(arg.action, std::string("export")) &
-            (required("--output") & value("output", arg.output_ext)).doc("Output file path"))) &
-              ((required("--mlimit") & value("memory limit", arg.memory_limit))
-                   .doc("Size of available RAM for a specific operation in bytes"),
-               (option("--name") & value("collection name", arg.col_name)))));
+/** Whether @c stdout writes to a terminal. */
+inline bool stdout_is_terminal() noexcept { return ::_isatty(::_fileno(stdout)) != 0; }
+#else
 
-    auto snapshot = (option("snapshot").set(arg.db_object, std::string("snapshot")) &
-                     ((required("create").set(arg.action, std::string("create"))) |
-                      (required("export").set(arg.action, std::string("export")) & value("path", arg.export_path)) |
-                      (required("drop").set(arg.action, std::string("drop")) & value("snapshot id", arg.snap_id)) |
-                      (required("list").set(arg.action, std::string("list")))));
+/** Whether @c stdout writes to a terminal. */
+inline bool stdout_is_terminal() noexcept { return ::isatty(::fileno(stdout)) != 0; }
+#endif
 
-    auto cli = ((required("--directory") & value("directory", arg.directory)).doc("Database directory"),
-                (collection | snapshot),
-                option("-h", "--help").set(arg.help).doc("Print this help information on this tool and exit"));
+/** The style of a message in @p tone, empty when @c stdout is piped so logs stay plain. */
+inline fmt::text_style style_of(tone_t tone) noexcept {
+    if (!stdout_is_terminal()) return {};
+    switch (tone) {
+    case tone_t::failure_k: return fmt::fg(fmt::color::red);
+    case tone_t::success_k: return fmt::fg(fmt::color::green);
+    case tone_t::listing_k: return fmt::fg(fmt::color::gold);
+    }
+    return {};
+}
 
-    if (!parse(argc, argv, cli)) {
-        std::cerr << make_man_page(cli, argv[0]);
-        return false;
+/** The command words, printed between the synopsis and the flags. */
+constexpr std::string_view commands_k = R"(Commands:
+  collection create --collection <name>
+  collection drop --collection <name>
+  collection list
+  collection import --input <file> --id-field <field> --memory-limit <size> [--collection <name>]
+  collection export --output <file> --memory-limit <size> [--collection <name>]
+  snapshot create
+  snapshot export <path>
+  snapshot drop <id>
+  snapshot list
+
+Files end in .ndjson or .csv, and a command without --collection acts on the main collection.)";
+
+/** Names one listing reads per round, which paginates a walk of however many collections exist. */
+constexpr ustore_length_t listing_page_k = 1024;
+
+#pragma region Parsing
+
+/** Every command the tool runs. */
+enum class command_t {
+    none_k,
+    collection_create_k,
+    collection_drop_k,
+    collection_list_k,
+    collection_import_k,
+    collection_export_k,
+    snapshot_create_k,
+    snapshot_export_k,
+    snapshot_drop_k,
+    snapshot_list_k,
+};
+
+/** One invocation: the flags, which view into @c argv and so end in null terminators, and the command they serve. */
+struct command_line_t {
+
+    /** The command to run. */
+    command_t command = command_t::none_k;
+
+    /** Database directory. */
+    std::string_view directory;
+
+    /** Collection name, empty for the main collection. */
+    std::string_view collection;
+
+    /** File a document import reads. */
+    std::string_view input;
+
+    /** File a document export writes. */
+    std::string_view output;
+
+    /** Field holding the keys of imported documents. */
+    std::string_view id_field;
+
+    /** Bytes an import or export buffers per batch. */
+    bytes_t memory_limit;
+
+    /** Path a snapshot export writes. */
+    std::string_view snapshot_path;
+
+    /** Snapshot a drop removes. */
+    ustore_snapshot_t snapshot = 0;
+};
+
+/** Resolves @p positionals into the command of @p line, answering the problem with them, or null when they parse. */
+[[nodiscard]] char const* parse_command(std::span<std::string_view const> positionals, command_line_t& line) noexcept {
+    std::string_view const object = positionals.size() > 0 ? positionals[0] : "";
+    std::string_view const action = positionals.size() > 1 ? positionals[1] : "";
+    std::string_view const argument = positionals.size() > 2 ? positionals[2] : "";
+
+    if (object == "collection") {
+        if (!argument.empty()) return "Too many arguments";
+        if (action == "create" || action == "drop") {
+            if (line.collection.empty()) return "The collection name is missing";
+            line.command = action == "create" ? command_t::collection_create_k : command_t::collection_drop_k;
+            return nullptr;
+        }
+        if (action == "list") {
+            line.command = command_t::collection_list_k;
+            return nullptr;
+        }
+        if (action == "import") {
+            if (line.input.empty() || line.id_field.empty() || line.memory_limit.value == 0)
+                return "An import needs --input, --id-field and --memory-limit";
+            line.command = command_t::collection_import_k;
+            return nullptr;
+        }
+        if (action == "export") {
+            if (line.output.empty() || line.memory_limit.value == 0)
+                return "An export needs --output and --memory-limit";
+            line.command = command_t::collection_export_k;
+            return nullptr;
+        }
+        return "Invalid collection action";
     }
 
-    if (arg.help)
-        std::cout << make_man_page(cli, argv[0]);
+    if (object == "snapshot") {
+        if (action == "export") {
+            if (argument.empty()) return "The snapshot export path is missing";
+            line.snapshot_path = argument;
+            line.command = command_t::snapshot_export_k;
+            return nullptr;
+        }
+        if (action == "drop") {
+            count_t snapshot;
+            if (parse_count(argument, snapshot) != argument_status_t::parsed_k) return "The snapshot id is missing";
+            line.snapshot = snapshot.value;
+            line.command = command_t::snapshot_drop_k;
+            return nullptr;
+        }
+        if (!argument.empty()) return "Too many arguments";
+        if (action == "create") {
+            line.command = command_t::snapshot_create_k;
+            return nullptr;
+        }
+        if (action == "list") {
+            line.command = command_t::snapshot_list_k;
+            return nullptr;
+        }
+        return "Invalid snapshot action";
+    }
+    return object.empty() ? "The command is missing" : "Unknown command";
+}
 
+#pragma endregion Parsing
+
+#pragma region Commands
+
+/** Prints a red failure line with the database error. */
+void print_failure(char const* what, ustore_error_t const& error) noexcept {
+    fmt::println(style_of(tone_t::failure_k), "{}: {}", what, error.message);
+}
+
+/** Resolves @p name to a collection id, the main collection for an empty name. */
+void find_collection(ustore_database_t db, std::string_view name, ustore_collection_t& id,
+                     ustore_error_t* error) noexcept {
+    if (name.empty()) {
+        id = ustore_collection_main_k;
+        return;
+    }
+    ustore_arena_t arena = nullptr;
+    ustore_collection_t const names = ustore_collection_names_k;
+    ustore_str_view_t const text = name.data();
+    auto const text_length = static_cast<ustore_length_t>(name.size());
+    ustore_length_t* offsets = nullptr;
+    ustore_length_t* lengths = nullptr;
+    ustore_byte_t* values = nullptr;
+    ustore_strings_read_t read {};
+    read.db = db;
+    read.error = error;
+    read.arena = &arena;
+    read.tasks_count = 1;
+    read.collections = &names;
+    read.strings = &text;
+    read.strings_lengths = &text_length;
+    read.offsets = &offsets;
+    read.lengths = &lengths;
+    read.values = &values;
+    ustore_strings_read(&read);
+    if (!error->status) {
+        if (lengths[0] != sizeof(ustore_collection_t)) *error = {ustore_error_not_found_k, "No such collection"};
+        else std::memcpy(&id, values + offsets[0], sizeof(id));
+    }
+    ustore_arena_free(arena);
+}
+
+/** Records that @p name addresses @p collection, or removes the name when no collection is given. */
+void name_collection(ustore_database_t db, std::string_view name, ustore_collection_t const* collection,
+                     ustore_error_t* error) noexcept {
+    ustore_arena_t arena = nullptr;
+    ustore_collection_t const names = ustore_collection_names_k;
+    ustore_str_view_t const text = name.data();
+    auto const text_length = static_cast<ustore_length_t>(name.size());
+    auto const value = reinterpret_cast<ustore_bytes_cptr_t>(collection);
+    ustore_length_t const value_length = sizeof(ustore_collection_t);
+    ustore_strings_write_t write {};
+    write.db = db;
+    write.error = error;
+    write.arena = &arena;
+    write.tasks_count = 1;
+    write.collections = &names;
+    write.strings = &text;
+    write.strings_lengths = &text_length;
+    write.values = collection ? &value : nullptr;
+    write.values_lengths = collection ? &value_length : nullptr;
+    ustore_strings_write(&write);
+    ustore_arena_free(arena);
+}
+
+/** Creates a collection and records @p name for it. */
+[[nodiscard]] bool create_collection(ustore_database_t db, std::string_view name) noexcept {
+    ustore_error_t error {};
+    ustore_collection_t id = 0;
+    ustore_collection_create_t create {};
+    create.db = db;
+    create.error = &error;
+    create.config = "";
+    create.id = &id;
+    ustore_collection_create(&create);
+    if (!error.status) name_collection(db, name, &id, &error);
+    if (error.status) {
+        print_failure("Failed to create the collection", error);
+        return false;
+    }
+    fmt::println(style_of(tone_t::success_k), "Collection '{}' created", name);
     return true;
 }
 
-// CLI commands executor
-bool execute(cli_args_t& arg, database_t& db) {
-    if (arg.db_object == "collection") {
-        if (arg.action == "create")
-            collection_create(db, arg.col_name);
-        else if (arg.action == "drop")
-            collection_drop(db, arg.col_name);
-        else if (arg.action == "list")
-            collection_list(db);
-        else if (arg.action == "import")
-            docs_import(db, arg.col_name, arg.input_file, arg.id_field, arg.memory_limit);
-        else if (arg.action == "export")
-            docs_export(db, arg.col_name, arg.output_ext, arg.memory_limit);
-        else
-            print(red_k, "Invalid collection action {}", arg.action);
-        return true;
+/** Drops the collection @p name addresses and forgets the name. */
+[[nodiscard]] bool drop_collection(ustore_database_t db, std::string_view name) noexcept {
+    ustore_error_t error {};
+    ustore_collection_t id = 0;
+    find_collection(db, name, id, &error);
+    if (!error.status) {
+        ustore_collection_drop_t drop {};
+        drop.db = db;
+        drop.error = &error;
+        drop.id = id;
+        drop.mode = ustore_drop_keys_vals_handle_k;
+        ustore_collection_drop(&drop);
     }
-    else if (arg.db_object == "snapshot") {
-        if (arg.action == "create")
-            snapshot_create(db);
-        else if (arg.action == "export")
-            snapshot_export(db, arg.export_path);
-        else if (arg.action == "drop")
-            snapshot_drop(db, arg.snap_id);
-        else if (arg.action == "list")
-            snapshot_list(db);
-        else
-            print(red_k, "Invalid snapshot action {}", arg.action);
-        return true;
+    if (!error.status) name_collection(db, name, nullptr, &error);
+    if (error.status) {
+        print_failure("Failed to drop the collection", error);
+        return false;
     }
+    fmt::println(style_of(tone_t::success_k), "Collection '{}' dropped", name);
+    return true;
+}
 
+/** Prints every collection name, paging the strings modality the names live in. */
+[[nodiscard]] bool list_collections(ustore_database_t db) noexcept {
+    ustore_error_t error {};
+    ustore_arena_t arena = nullptr;
+    ustore_collection_t const names = ustore_collection_names_k;
+    ustore_str_view_t const prefix = "";
+    ustore_length_t const prefix_length = 0;
+    ustore_length_t const page = listing_page_k;
+    sz::string resume;
+    while (true) {
+        ustore_str_view_t const start = resume.c_str();
+        auto const start_length = static_cast<ustore_length_t>(resume.size());
+        ustore_length_t* counts = nullptr;
+        ustore_length_t* offsets = nullptr;
+        ustore_char_t* strings = nullptr;
+        ustore_strings_scan_t scan {};
+        scan.db = db;
+        scan.error = &error;
+        scan.arena = &arena;
+        scan.tasks_count = 1;
+        scan.collections = &names;
+        scan.prefixes = &prefix;
+        scan.prefixes_lengths = &prefix_length;
+        scan.count_limits = &page;
+        scan.counts = &counts;
+        scan.strings_offsets = &offsets;
+        scan.strings = &strings;
+        if (!resume.empty()) {
+            scan.start_strings = &start;
+            scan.start_strings_lengths = &start_length;
+        }
+        ustore_strings_scan(&scan);
+        if (error.status) break;
+
+        std::size_t const found = counts[0];
+        for (std::size_t index = 0; index != found; ++index)
+            fmt::println(style_of(tone_t::listing_k), "{}",
+                         std::string_view {strings + offsets[index], offsets[index + 1] - offsets[index]});
+        if (found != page) break;
+
+        // A zero byte appended to the last name is the smallest name above it, so no name repeats
+        std::string_view const last {strings + offsets[found - 1], offsets[found] - offsets[found - 1]};
+        resume.clear();
+        if (!resume.try_append(last.data(), last.size()) || !resume.try_push_back('\0')) {
+            error = {ustore_error_out_of_memory_k, "Failed to page the listing"};
+            break;
+        }
+    }
+    ustore_arena_free(arena);
+    if (error.status) {
+        print_failure("Failed to list the collections", error);
+        return false;
+    }
+    return true;
+}
+
+/** Imports the documents of the file @p line names into the collection it names. */
+[[nodiscard]] bool import_documents(ustore_database_t db, command_line_t const& line) noexcept {
+    ustore_error_t error {};
+    ustore_collection_t collection = 0;
+    find_collection(db, line.collection, collection, &error);
+    if (!error.status) {
+        ustore_docs_import_t importing {};
+        importing.db = db;
+        importing.error = &error;
+        importing.collection = collection;
+        importing.path = line.input.data();
+        importing.max_batch_size = line.memory_limit.value;
+        importing.id_field = line.id_field.data();
+        ustore_docs_import(&importing);
+    }
+    if (error.status) {
+        print_failure("Failed to import", error);
+        return false;
+    }
+    fmt::println(style_of(tone_t::success_k), "Successfully imported");
+    return true;
+}
+
+/** Exports the collection @p line names into the file it names. */
+[[nodiscard]] bool export_documents(ustore_database_t db, command_line_t const& line) noexcept {
+    ustore_error_t error {};
+    ustore_collection_t collection = 0;
+    find_collection(db, line.collection, collection, &error);
+    if (!error.status) {
+        ustore_docs_export_t exporting {};
+        exporting.db = db;
+        exporting.error = &error;
+        exporting.collection = collection;
+        exporting.path = line.output.data();
+        exporting.max_batch_size = line.memory_limit.value;
+        ustore_docs_export(&exporting);
+    }
+    if (error.status) {
+        print_failure("Failed to export", error);
+        return false;
+    }
+    fmt::println(style_of(tone_t::success_k), "Successfully exported");
+    return true;
+}
+
+/** Takes a snapshot and prints its identifier. */
+[[nodiscard]] bool create_snapshot(ustore_database_t db) noexcept {
+    ustore_error_t error {};
+    ustore_snapshot_t id = 0;
+    ustore_snapshot_create_t create {};
+    create.db = db;
+    create.error = &error;
+    create.id = &id;
+    ustore_snapshot_create(&create);
+    if (error.status) {
+        print_failure("Failed to create a snapshot", error);
+        return false;
+    }
+    fmt::println(style_of(tone_t::success_k), "Snapshot {} created", id);
+    return true;
+}
+
+/** Writes the newest snapshot to @p path. */
+[[nodiscard]] bool export_snapshot(ustore_database_t db, std::string_view path) noexcept {
+    ustore_error_t error {};
+    ustore_snapshot_export_t exporting {};
+    exporting.db = db;
+    exporting.error = &error;
+    exporting.path = path.data();
+    ustore_snapshot_export(&exporting);
+    if (error.status) {
+        print_failure("Failed to export the snapshot", error);
+        return false;
+    }
+    fmt::println(style_of(tone_t::success_k), "Snapshot exported");
+    return true;
+}
+
+/** Removes the snapshot @p id names. */
+[[nodiscard]] bool drop_snapshot(ustore_database_t db, ustore_snapshot_t id) noexcept {
+    ustore_error_t error {};
+    ustore_snapshot_drop_t drop {};
+    drop.db = db;
+    drop.error = &error;
+    drop.id = id;
+    ustore_snapshot_drop(&drop);
+    if (error.status) {
+        print_failure("Failed to drop the snapshot", error);
+        return false;
+    }
+    fmt::println(style_of(tone_t::success_k), "Snapshot dropped");
+    return true;
+}
+
+/** Prints the identifier of every live snapshot. */
+[[nodiscard]] bool list_snapshots(ustore_database_t db) noexcept {
+    ustore_error_t error {};
+    ustore_arena_t arena = nullptr;
+    ustore_size_t count = 0;
+    ustore_snapshot_t* ids = nullptr;
+    ustore_snapshot_list_t list {};
+    list.db = db;
+    list.error = &error;
+    list.arena = &arena;
+    list.count = &count;
+    list.ids = &ids;
+    ustore_snapshot_list(&list);
+    if (error.status) {
+        print_failure("Failed to list the snapshots", error);
+        ustore_arena_free(arena);
+        return false;
+    }
+    for (std::size_t index = 0; index != count; ++index) fmt::println(style_of(tone_t::listing_k), "{}", ids[index]);
+    ustore_arena_free(arena);
+    return true;
+}
+
+/** Runs the command of @p line and answers whether it succeeded. */
+[[nodiscard]] bool execute(ustore_database_t db, command_line_t const& line) noexcept {
+    switch (line.command) {
+    case command_t::none_k: return false;
+    case command_t::collection_create_k: return create_collection(db, line.collection);
+    case command_t::collection_drop_k: return drop_collection(db, line.collection);
+    case command_t::collection_list_k: return list_collections(db);
+    case command_t::collection_import_k: return import_documents(db, line);
+    case command_t::collection_export_k: return export_documents(db, line);
+    case command_t::snapshot_create_k: return create_snapshot(db);
+    case command_t::snapshot_export_k: return export_snapshot(db, line.snapshot_path);
+    case command_t::snapshot_drop_k: return drop_snapshot(db, line.snapshot);
+    case command_t::snapshot_list_k: return list_snapshots(db);
+    }
     return false;
 }
 
-#pragma region - Interactive CLI
-bool parse_collection_args(cli_args_t& cli_arg, std::vector<std::string>& cmd_line) {
-    cli_arg.action = cmd_line[1];
-    if (cli_arg.action == "create") {
-        if (cmd_line.size() != 3) {
-            print(red_k, "Invalid input");
-            return false;
-        }
-        cli_arg.col_name = remove_quotes(cmd_line[2]);
-    }
-    else if (cli_arg.action == "drop") {
-        if (cmd_line.size() != 3) {
-            print(red_k, "Invalid input");
-            return false;
-        }
-        cli_arg.col_name = remove_quotes(cmd_line[2]);
-    }
-    else if (cli_arg.action == "list") {
-        if (cmd_line.size() != 2) {
-            print(red_k, "Invalid input");
-            return false;
-        }
-    }
-    else {
-        print(red_k, "Invalid collection action {}", cli_arg.action);
-        return false;
-    }
+#pragma endregion Commands
 
-    return true;
-}
-
-bool parse_snapshot_args(cli_args_t& cli_arg, std::vector<std::string>& cmd_line) {
-    cli_arg.action = cmd_line[1];
-    if (cli_arg.action == "create") {
-        if (cmd_line.size() != 2) {
-            print(red_k, "Invalid input");
-            return false;
-        }
-    }
-    else if (cli_arg.action == "export") {
-        if (cmd_line.size() != 3) {
-            print(red_k, "Invalid input");
-            return false;
-        }
-    }
-    else if (cli_arg.action == "drop") {
-        if (cmd_line.size() != 3) {
-            print(red_k, "Invalid input");
-            return false;
-        }
-    }
-    else if (cli_arg.action == "list") {
-        if (cmd_line.size() != 2) {
-            print(red_k, "Invalid input");
-            return false;
-        }
-    }
-    else {
-        print(red_k, "Invalid snapshot action {}", cli_arg.action);
-        return false;
-    }
-
-    return true;
-}
-
-bool parse_import_args(cli_args_t& cli_arg, std::vector<std::string>& cmd_line) {
-    if (cmd_line.size() != 9 && cmd_line.size() != 7) {
-        print(red_k, "Invalid input");
-        return false;
-    }
-
-    std::string argument = cmd_line[1];
-    if (argument == "--input")
-        cli_arg.input_file = cmd_line[2];
-    else {
-        print(red_k, "Invalid list argument {}", argument);
-        return false;
-    }
-
-    argument = cmd_line[3];
-    if (argument == "--id")
-        cli_arg.id_field = cmd_line[4];
-    else {
-        print(red_k, "Invalid list argument {}", argument);
-        return false;
-    }
-
-    argument = cmd_line[5];
-    if (argument == "--mlimit")
-        cli_arg.memory_limit = std::stoi(cmd_line[6]);
-    else {
-        print(red_k, "Invalid list argument {}", argument);
-        return false;
-    }
-
-    if (cmd_line.size() == 9) {
-        argument = cmd_line[7];
-        if (argument == "--collection")
-            cli_arg.col_name = cmd_line[8];
-        else {
-            print(red_k, "Invalid list argument {}", argument);
-            return false;
-        }
-    }
-    else {
-        cli_arg.col_name = "";
-    }
-
-    return true;
-}
-
-bool parse_export_args(cli_args_t& cli_arg, std::vector<std::string>& cmd_line) {
-    if (cmd_line.size() != 7 && cmd_line.size() != 5) {
-        print(red_k, "Invalid input");
-        return false;
-    }
-
-    std::string argument = cmd_line[1];
-    if (argument == "--output")
-        cli_arg.output_ext = cmd_line[2];
-    else {
-        print(red_k, "Invalid list argument {}", argument);
-        return false;
-    }
-
-    argument = cmd_line[3];
-    if (argument == "--mlimit")
-        cli_arg.memory_limit = std::stoi(cmd_line[4]);
-    else {
-        print(red_k, "Invalid list argument {}", argument);
-        return false;
-    }
-
-    if (cmd_line.size() == 7) {
-        argument = cmd_line[5];
-        if (argument == "--collection")
-            cli_arg.col_name = cmd_line[6];
-        else {
-            print(red_k, "Invalid list argument {}", argument);
-            return false;
-        }
-    }
-    else
-        cli_arg.col_name = "";
-
-    return true;
-}
-
-// The main loop of interactive CLI tool
-void interactive_cli(database_t& db) {
-    cli_args_t args;
-    std::string input;
-    std::vector<std::string> cmd_line;
-    std::regex const reg_exp(" +(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)");
-    std::regex_token_iterator<std::string::iterator> const end_tokens;
-
-    while (true) {
-        cmd_line.clear();
-        input = readline(">>> ");
-        add_history(input.c_str());
-
-        std::regex_token_iterator<std::string::iterator> it(input.begin(), input.end(), reg_exp, -1);
-        while (it != end_tokens)
-            cmd_line.emplace_back(*it++);
-
-        if (!cmd_line[0].size())
-            cmd_line.erase(cmd_line.begin());
-
-        args.db_object = cmd_line[0];
-        if (args.db_object == "exit")
-            break;
-
-        if (args.db_object == "clear") {
-            system("clear");
-            continue;
-        }
-
-        bool status = false;
-        if (args.db_object == "collection")
-            status = parse_collection_args(args, cmd_line);
-        else if (args.db_object == "snapshot")
-            status = parse_snapshot_args(args, cmd_line);
-        else if (args.db_object == "import")
-            status = parse_import_args(args, cmd_line);
-        else if (args.db_object == "export")
-            status = parse_export_args(args, cmd_line);
-        else
-            print(red_k, "Unknown command {}", args.db_object);
-
-        if (status)
-            execute(args, db);
-    }
-}
-#pragma endregion - Interactive CLI
-
-#pragma endregion - Interface
+} // namespace unum::ustore
 
 int main(int argc, char* argv[]) {
-    cli_args_t arg;
-    bool result = parse_cli_args(argc, argv, arg);
+    using namespace unum::ustore;
 
-    if (!result || arg.help)
-        return !result | !arg.help;
+    command_line_t line;
+    std::array<flag_t, 6> const flags {{
+        {"--directory", "path", "database directory, required", &line.directory},
+        {"--collection", "name", "collection a command acts on, the main one when omitted", &line.collection},
+        {"--input", "file", "file a collection import reads", &line.input},
+        {"--output", "file", "file a collection export writes", &line.output},
+        {"--id-field", "field", "field holding the keys of imported documents", &line.id_field},
+        {"--memory-limit", "size", "bytes an import or export buffers per batch, like 64MiB", &line.memory_limit},
+    }};
+    std::array<std::string_view, 3> positionals {};
+    arguments_t const parsed = parse_arguments(argc, argv, flags, positionals);
 
-    database_t db;
-    std::string const config = fmt::format(R"({{"version": "1.0", "directory": "{}"}})", arg.directory);
-    status_t status = db.open(config.c_str());
+    char synopsis[4096 + commands_k.size()];
+    auto const written = fmt::format_to_n(synopsis, sizeof(synopsis) - 1,
+                                          "{} --directory <path> <command> [flags]\n\n{}", argv[0], commands_k);
+    *written.out = '\0';
 
-    if (!status) {
-        print(red_k, status.message());
+    if (parsed.status == argument_status_t::help_k) {
+        print_usage(synopsis, flags);
+        return 0;
+    }
+    if (parsed.status != argument_status_t::parsed_k) {
+        fmt::println(stderr, "{}: {}", parsed.argument, describe(parsed.status));
+        return 1;
+    }
+    char const* const problem = line.directory.empty()
+                                    ? "The --directory flag is required"
+                                    : parse_command({positionals.data(), parsed.positionals_count}, line);
+    if (problem) {
+        fmt::println(stderr, "{}\n", problem);
+        print_usage(synopsis, flags);
         return 1;
     }
 
-    if (execute(arg, db))
-        return 0;
+    sz::string config;
+    if (!config.try_append(R"({"version": "1.0", "directory": ")") ||
+        !config.try_append(line.directory.data(), line.directory.size()) || !config.try_append(R"("})")) {
+        fmt::println(stderr, "Failed to allocate the configuration");
+        return 1;
+    }
 
-    interactive_cli(db);
-    return 0;
+    ustore_database_t db = nullptr;
+    ustore_error_t error {};
+    ustore_database_init_t init {};
+    init.config = config.c_str();
+    init.db = &db;
+    init.error = &error;
+    ustore_database_init(&init);
+    if (error.status) {
+        print_failure("Failed to open the database", error);
+        return 1;
+    }
+
+    bool const succeeded = execute(db, line);
+    ustore_database_free(db);
+    return succeeded ? 0 : 1;
 }

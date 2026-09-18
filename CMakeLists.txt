@@ -92,6 +92,7 @@ else ()
 endif ()
 
 find_package(Threads REQUIRED)
+include(GNUInstallDirs)
 
 # Install 3rd Party Packages
 include(FetchContent)
@@ -203,12 +204,18 @@ foreach (engine_name IN ITEMS ${USTORE_ENGINE_NAMES})
     target_link_libraries(
         ustore_embedded_${engine_name} ustore_warnings ${LIB_FMT} smashtable::header forkunion::static
     )
+    # The `include_directories` above reach this project's targets only, so a consumer linking an engine inherits the
+    # public headers from the target instead.
+    target_include_directories(
+        ustore_embedded_${engine_name}
+        PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/src/helpers
+    )
 endforeach ()
 
 # A static engine library links only beside the archives it depends on, so they install together, apart from system
 # copies.
 if (USTORE_INSTALL)
-    include(GNUInstallDirs)
     list(TRANSFORM USTORE_ENGINE_NAMES PREPEND "ustore_embedded_" OUTPUT_VARIABLE USTORE_ENGINE_LIBS)
     install(
         TARGETS ${USTORE_ENGINE_LIBS}
@@ -261,7 +268,7 @@ if (${USTORE_BUILD_TEST_CPP})
     endforeach ()
 endif ()
 
-# Generate benchmarks: Bitcoin Core & Twitter
+# Benchmarks, one executable per engine
 if (${USTORE_BUILD_BENCH_CPP})
     foreach (engine_name IN ITEMS ${USTORE_ENGINE_NAMES})
         set(client_lib ustore_embedded_${engine_name})
@@ -272,6 +279,10 @@ if (${USTORE_BUILD_BENCH_CPP})
 
         set(bench_name bench_tabular_graph_${client_lib})
         add_executable(${bench_name} bench/tabular_graph.cpp tools/dataset.cpp)
+        target_link_libraries(${bench_name} benchmark ${LIB_FMT} ${client_lib} ustore_stringzilla_dispatch)
+
+        set(bench_name bench_louvain_${client_lib})
+        add_executable(${bench_name} bench/louvain.cpp)
         target_link_libraries(${bench_name} benchmark ${LIB_FMT} ${client_lib} ustore_stringzilla_dispatch)
     endforeach ()
 endif ()

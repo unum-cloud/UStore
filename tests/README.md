@@ -26,7 +26,7 @@ int main(int argc, char** argv) {
 - __Tools__ — `test_tools.cpp` checks dataset imports and exports, and the CLI against a real directory.
 - __Components__ — `tests/udisk/` checks UDisk's parts below the C ABI.
 - __Stress__ — `stress_atomicity.cpp` and `stress_linearizability.cpp` check atomicity and linearizability under concurrent transactions.
-- __Python__ — `*.py` check the pre-v1 Python API, and skip themselves until the Wave 4 bindings land.
+- __Python__ — `test_*.py` check the `ustore.lib` extension and its graph and table views, parametrized over batch shapes, views and isolation levels, and gated on what the linked engine supports; NetworkX and pandas serve as oracles for the views.
 
 ### Conformance
 

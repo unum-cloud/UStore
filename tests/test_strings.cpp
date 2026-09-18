@@ -77,7 +77,7 @@ struct strings_batch_t {
     drop.id = ustore_collection_main_k;
     drop.mode = ustore_drop_keys_vals_k;
     ustore_collection_drop(&drop);
-    return expect(error.status == ustore_success_k);
+    return expect_no_error(error);
 }
 
 /** Sends @p batch through @c ustore_strings_write and counts a failure when it is refused. */
@@ -99,8 +99,7 @@ struct strings_batch_t {
     write.values_lengths_stride = sizeof(ustore_length_t);
 
     ustore_strings_write(&write);
-    if (error.status) fmt::println(stderr, "  write failed: {}", error.message);
-    return expect(error.status == ustore_success_k);
+    return expect_no_error(error);
 }
 
 /** Writes one string and its value. */
@@ -157,8 +156,7 @@ struct read_results_t {
     read.values = &results.values;
 
     ustore_strings_read(&read);
-    if (error.status) fmt::println(stderr, "  read failed: {}", error.message);
-    return expect(error.status == ustore_success_k);
+    return expect_no_error(error);
 }
 
 /** The strings one scan exported, in the order of their text. */
@@ -199,10 +197,7 @@ struct scan_results_t {
     scan.strings = &results.strings;
 
     ustore_strings_scan(&scan);
-    if (error.status) {
-        fmt::println(stderr, "  scan failed: {}", error.message);
-        return expect(error.status == ustore_success_k);
-    }
+    if (std::size_t const failures = expect_no_error(error)) return failures;
     results.count = counts[0];
     return 0;
 }
@@ -496,8 +491,9 @@ std::size_t strings_scan_pagination(char const* directory) {
     scan.strings = &second_page.strings;
 
     ustore_strings_scan(&scan);
-    failures += expect(error.status == ustore_success_k);
-    if (!error.status) {
+    std::size_t const scanned = expect_no_error(error);
+    failures += scanned;
+    if (scanned == 0) {
         failures += expect_eq(static_cast<std::size_t>(counts[0]), 1u);
         if (counts[0] == 1) failures += expect_eq(second_page[0], std::string_view("page:c"));
     }

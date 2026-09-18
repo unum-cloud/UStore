@@ -86,12 +86,10 @@ minversion = "6.0"
 addopts = ["-ra", "--showlocals", "--strict-markers", "--strict-config"]
 xfail_strict = true
 filterwarnings = ["error"]
-python_files = ["*.py"]
+python_files = ["test_*.py"]
 testpaths = ["tests"]
 
 [tool.ruff.lint.per-file-ignores]
-# Each module skips before importing the pre-v1 bindings it would fail on.
-"tests/*.py" = ["E402"]
 # cmake-format evaluates its profile with `section` already in scope.
 ".cmake-format.py" = ["F821"]
 
