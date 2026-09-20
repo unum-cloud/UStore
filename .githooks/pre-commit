@@ -334,21 +334,22 @@ check_docblock_indent() {
         "$file indents docblock text one space past the asterisk - use two, as in \` *  @brief\`:"
 }
 
-# Includes form groups in a fixed order with a blank line between them: the C library, the C++ standard
-# library, external libraries, sibling projects, UStore's public <ustore/...> headers, then project headers
-# in quotes.
+# Includes form groups in a fixed order with a blank line between them: the C library, the platform's own
+# headers, the C++ standard library, external libraries, sibling projects, UStore's public <ustore/...>
+# headers, then project headers in quotes.
 check_include_groups() {
     local misgrouped
     misgrouped=$(awk '
         BEGIN {
             split("cassert cctype cerrno cfenv cfloat cinttypes climits clocale cmath csetjmp csignal cstdarg " \
-                  "cstddef cstdint cstdio cstdlib cstring ctime cuchar cwchar cwctype " \
-                  "dirent.h dlfcn.h errno.h fcntl.h ftw.h poll.h pthread.h sched.h signal.h stdio.h stdlib.h " \
-                  "string.h time.h unistd.h io.h windows.h", names, " ")
+                  "cstddef cstdint cstdio cstdlib cstring ctime cuchar cwchar cwctype", names, " ")
             for (n in names) clibrary[names[n]] = 1
+            split("dirent.h dlfcn.h errno.h fcntl.h ftw.h poll.h pthread.h sched.h signal.h stdio.h stdlib.h " \
+                  "string.h time.h unistd.h io.h windows.h", names, " ")
+            for (n in names) platform[names[n]] = 1
             split("smashtable stringzilla forkunion numkong", names, " ")
             for (n in names) sibling[names[n]] = 1
-            split("C-library C++-standard external sibling public-ustore project", labels, " ")
+            split("C-library platform C++-standard external sibling public-ustore project", labels, " ")
         }
         NR == FNR { added[$1 + 0]; next }
         {
@@ -360,14 +361,15 @@ check_include_groups() {
                 touched = (FNR in added)
                 if (quoted && root == "ustore") {
                     if (touched) printf "line %d: public header in quotes - write <%s>\n", FNR, header
-                    rank = 5
+                    rank = 6
                 }
-                else if (quoted) rank = 6
-                else if ((header in clibrary) || header ~ /^(sys|linux|arpa|netinet|asm)\//) rank = 1
-                else if (header !~ /[\/.]/) rank = 2
-                else if (root in sibling) rank = 4
-                else if (root == "ustore") rank = 5
-                else rank = 3
+                else if (quoted) rank = 7
+                else if (header in clibrary) rank = 1
+                else if ((header in platform) || header ~ /^(sys|linux|arpa|netinet|asm)\//) rank = 2
+                else if (header !~ /[\/.]/) rank = 3
+                else if (root in sibling) rank = 5
+                else if (root == "ustore") rank = 6
+                else rank = 4
                 if (touched && block && rank != block)
                     printf "line %d: a %s header shares its group with %s ones\n", FNR, labels[rank], labels[block]
                 if (touched && !block && rank < previous)
@@ -377,7 +379,7 @@ check_include_groups() {
             else if ($0 !~ /^[[:space:]]*#/) { if (block) previous = block; block = 0 }
         }' <(printf '%s\n' "$added_lines") <(git show ":$file"))
     [ -z "$misgrouped" ] || fail "$misgrouped" \
-        "$file misgroups its includes - C library, C++ standard, external, siblings, <ustore/...>, then \"project\"," \
+        "$file misgroups its includes - C library, platform, C++ standard, external, siblings, <ustore/...>, then \"project\"," \
         "            each group separated by a blank line:"
 }
 

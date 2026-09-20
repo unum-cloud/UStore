@@ -241,6 +241,25 @@ endif ()
 if (${USTORE_BUILD_TEST_CPP})
     enable_testing()
     set(USTORE_TEST_NAMES "api" "compilation" "units" "strings" "strings_collection")
+
+    # The storage ring stands outside the per-engine loop: it links no engine, only the siblings it is written against.
+    set(USTORE_STORAGE_TEST_NAMES "ring")
+
+    # The io_uring transport is Linux-only and takes no option of its own; the suite skips itself where the kernel
+    # refuses a ring.
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        list(APPEND USTORE_STORAGE_TEST_NAMES "uring")
+    endif ()
+
+    foreach (storage_name IN ITEMS ${USTORE_STORAGE_TEST_NAMES})
+        set(storage_exe ustore_test_nvme_${storage_name})
+        add_executable(${storage_exe} test/nvme_${storage_name}.cpp)
+        target_link_libraries(
+            ${storage_exe} ${LIB_FMT} forkunion::static smashtable::header ustore_stringzilla_dispatch Threads::Threads
+        )
+        add_test(NAME ${storage_exe} COMMAND ${storage_exe} --directory ${CMAKE_BINARY_DIR}/test_data)
+    endforeach ()
+
     set(USTORE_STRESS_NAMES "atomicity" "linearizability")
 
     foreach (engine_name IN ITEMS ${USTORE_ENGINE_NAMES})

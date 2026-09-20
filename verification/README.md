@@ -4,16 +4,18 @@ UStore's engines publish shared state through atomics rather than locks, and its
 Both are checked here rather than argued about in review: Spin checks a Promela model of a protocol, and GenMC checks the C++ against the real header.
 `check.sh` runs every model, compares each verdict with the expected one, and stops at the first mismatch.
 
-- __`durability.pml`__ — the write, flush, record and catalog order, with a crash injected at every step. Written.
+- __`durability.pml`__ — the write, flush, record and catalog order, with a crash injected at every step.
+- __`nvme_ring.pml`__ — an owner's credit against a bounded completion queue and the overflow list behind it.
+- __`nvme_ring_ownership.pml`__ — one issuing thread per ring, and the leases that move between them.
 - __`transaction_commit.pml`__ — staging and committing across collections at both isolation levels.
 - __`snapshot_lifetime.pml`__ — snapshots created, exported and dropped while writers publish.
 - __`engine_ram.cpp`__ — the in-memory engine's commit path under GenMC, against its real header.
 - __`nvme_compaction.pml`__ — LSM compaction against concurrent readers, with a crash at every step.
 
-Only the first exists; the rest name what belongs here as the engines that need them arrive.
+Only the first three exist; the rest name what belongs here as the engines that need them arrive.
 
 The weak-memory models and the GenMC harness live in [`forkunion/verification`](../forkunion/verification/README.md), and a model whose correctness turns on load and store ordering includes them.
-`durability.pml` does not, since its ordering is made by syscalls rather than by memory accesses.
+None of the three written here does, since their ordering is made by syscalls, by the kernel's own queues and by a lease changing hands rather than by memory accesses.
 
 ## Durability
 
@@ -30,6 +32,40 @@ Two knobs break the order on purpose, and `check.sh` expects each of them to fai
 The model describes the design rather than a header it abstracts, since no code in the tree carries this order yet.
 It assumes the catalog rename is atomic, that a write is whole blocks or nothing, and that everything not flushed is gone after the crash.
 None of those three is checked here, and each is a place where an implementation can be wrong while this model still passes.
+
+## Completion-Queue Overflow
+
+An owner submits against bounded credit, and a completion the visible queue has no room for goes onto a kernel-side overflow list rather than being dropped.
+Nothing is lost there, but an overflowed entry stays invisible until the owner enters the kernel again, which is why `reap` tests `IORING_SQ_CQ_OVERFLOW` and enters a second time.
+A cancellation is what makes a full queue reachable, since the cancelling entry posts a completion nobody budgeted credit for and which `reap` discards.
+
+- __`every_request_retires`__ — once the owner and the device have gone quiet, every submitted request has yielded exactly one terminal completion to its owner, and the owner submitted all of them.
+- __`no_completion_is_lost`__ — the kernel never has to drop a completion for want of a seat, and no completion the owner is owed is left in the overflow list once everything has gone quiet.
+
+Two knobs break the design on purpose, and `check.sh` expects each of them to fail.
+`-Dwithout_overflow_check` drains the visible queue and never enters again to flush the overflow list, so the owner quiesces holding credit for a request it will never see retire.
+`-Dwithout_credit_bound` submits past the owner's credit, so more completions are outstanding than the queue and the overflow list together were sized for.
+
+The shape is one owner, two requests, one request of credit, one visible seat and one overflow seat.
+One request of credit and one visible seat is the smallest shape the cancelling entry can fill the queue in, and two requests is the smallest number an owner can exceed its credit with.
+The overflow list is sized at what the credit budget proves is enough, so a completion that fits nowhere means the budget was wrong rather than the kernel stingy.
+
+## Ring Ownership
+
+A ring belongs to exactly one thread: io_uring answers `-EEXIST` to every other, and an SPDK queue pair polled by a second thread corrupts its tracker list and reports nothing at all.
+A lease may still move between threads, but only through an explicit handoff and only while nothing is outstanding, which is why `basic_disk::adopt` refuses a lease with pending or ready work.
+A released lease is reissued with a raised generation, so a token minted under its predecessor cannot deliver into its successor's queue.
+
+- __`one_issuer_at_a_time`__ — a thread never reaps a request another thread submitted.
+- __`handoff_is_quiesced`__ — a lease never changes hands while it still has work outstanding.
+- __`no_stale_delivery`__ — a completion minted under one lease is never delivered to the lease that later occupies the same slot.
+
+`-Dwithout_generation` reissues the slot without raising the generation, so a token minted under the previous lease passes `submit`'s check and delivers into its successor's queue.
+`-Dwithout_quiesced_handoff` lets `adopt` take a lease with work still outstanding, so the thread that receives it reaps a request the thread that gave it up submitted.
+
+The shape is one lease slot, two threads, one request of depth, two submissions, one reissue and one handoff attempt.
+One slot is enough because the hazard is two threads on the same slot, and one reissue is the smallest number that can make a token stale.
+The model keeps a lease epoch the design does not, as the oracle the generation counter is checked against, so a knob that stops raising the generation is caught rather than hidden by its own counter.
 
 ## Running the Checks
 

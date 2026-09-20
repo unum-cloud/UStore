@@ -49,3 +49,17 @@ verify durability.pml pass
 verify durability.pml pass -Dextents=3
 verify durability.pml fail -Dwithout_flush_before_sync
 verify durability.pml fail -Dwithout_catalog_sync
+verify durability.pml fail -Dwithout_catalog_checksum
+
+echo "nvme_ring.pml: an owner's credit against a bounded completion queue and its overflow list"
+verify nvme_ring.pml pass
+verify nvme_ring.pml pass -Drequests=3
+verify nvme_ring.pml pass -Dcredit=2 -Dqueue_seats=2
+verify nvme_ring.pml fail -Dwithout_overflow_check
+verify nvme_ring.pml fail -Dwithout_credit_bound
+
+echo "nvme_ring_ownership.pml: one issuing thread per ring, and the leases that move between them"
+verify nvme_ring_ownership.pml pass
+verify nvme_ring_ownership.pml pass -Dsubmits=3
+verify nvme_ring_ownership.pml fail -Dwithout_generation
+verify nvme_ring_ownership.pml fail -Dwithout_quiesced_handoff
