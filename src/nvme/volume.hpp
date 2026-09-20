@@ -31,13 +31,13 @@
 #include <ustore/status.hpp> // `status_t`, `status_code_t`, `expected`
 #include <ustore/types.hpp>  // `byte_t`
 
-#include "nvme/buffer_pool.hpp"      // `registered_slab_t`, `buffer_lease_t`
+#include "nvme/buffer_pool.hpp"      // `registered_memory_arena_t`, `pooled_buffer_t`
 #include "nvme/catalog.hpp"          // `catalog_t`, `blob_kind_t`, `volume_header_t`
 #include "nvme/extent.hpp"           // `extent_t`, `rounded_up_to`
 #include "nvme/extent_allocator.hpp" // `extent_allocator_t`
-#include "nvme/io_lane.hpp"          // `io_lane_t`
+#include "nvme/io_channel.hpp"       // `io_channel_t`
 #include "nvme/io_pipeline.hpp"      // `basic_read_pipeline`, `basic_write_pipeline`
-#include "nvme/ring.hpp"             // `ring_concept`, `descriptor_t`
+#include "nvme/ring.hpp"             // `ring_concept`, `registered_medium_t`
 
 namespace unum::ustore::nvme {
 
@@ -60,8 +60,8 @@ struct blob_t {
     /** The volume the bytes live on, which a router resolves to a disk exactly once. */
     volume_id_t volume = volume_id_t::unmounted_k;
 
-    /** The target the bytes live in, which is the whole volume or one file of a directory. */
-    target_place_t target;
+    /** The medium the bytes live in, which is the whole volume or one file of a directory. */
+    medium_reference_t medium;
 
     /** The range reserved for this blob, whose length is the rounded-up size the caller asked for. */
     extent_t extent;
@@ -117,7 +117,7 @@ struct volume_format_t {
 #pragma region Extent Volume
 
 /**
- *  @brief Names resolved to extents of one target, with a catalog of two slots inside the volume.
+ *  @brief Names resolved to extents of one medium, with a catalog of two slots inside the volume.
  *
  *  This is the shape a medium without a filesystem takes. @c create reserves a range in memory
  *  alone, the caller writes the bytes through the ring, and @c seal performs the order the model
@@ -138,20 +138,21 @@ class basic_extent_volume {
     basic_extent_volume(basic_extent_volume&&) noexcept = default;
 
     /**
-     *  @brief Mounts @p target of @p disk, formatting it when it holds no volume and @p format allows.
+     *  @brief Mounts @p medium of @p disk, formatting it when it holds no volume and @p format allows.
      *  @param[inout] disk The transport, borrowed and outliving the volume.
-     *  @param[inout] lane A lane to read the head and the slots through, borrowed for this call.
-     *  @param[in] target The registered target the volume occupies.
+     *  @param[inout] channel A channel to read the head and the slots through, borrowed for this call.
+     *  @param[in] medium The registered medium the volume occupies.
      *  @param[in] format The identity and geometry a format writes, and what to do with a bad catalog.
      *  @return The volume, or @c status_code_t::malformed_k for a medium @p format refuses to repair.
      */
-    static expected<basic_extent_volume> mount(disk_type_& disk, io_lane_t& lane, descriptor_t const& target,
+    static expected<basic_extent_volume> mount(disk_type_& disk, io_channel_t& channel,
+                                               registered_medium_t const& medium,
                                                volume_format_t const& format) noexcept {
         basic_extent_volume volume {disk};
-        volume.target_ = target.place();
-        volume.capacity_ = target.capacity() != 0 ? target.capacity() : format.capacity_bytes;
+        volume.medium_ = medium.reference();
+        volume.capacity_ = medium.capacity() != 0 ? medium.capacity() : format.capacity_bytes;
 
-        expected<volume_header_t> const head = volume.read_head_(lane);
+        expected<volume_header_t> const head = volume.read_head_(channel);
         if (!head && format.recovery == volume_recovery_t::refuse_k) return head.status();
         if (head.has_value() && head->magic == volume_magic_k) {
             if (head->format_version != volume_format_version_k)
@@ -159,9 +160,9 @@ class basic_extent_volume {
             if (format.database.is_valid() && head->database != format.database)
                 return status_t {status_code_t::invalid_argument_k, "The volume belongs to another database"};
             volume.header_ = *head;
-            if (status_t const loaded = volume.load_catalog_(lane, format.recovery); loaded.failed()) return loaded;
+            if (status_t const loaded = volume.load_catalog_(channel, format.recovery); loaded.failed()) return loaded;
         }
-        else if (status_t const written = volume.write_head_(lane, format); written.failed()) return written;
+        else if (status_t const written = volume.write_head_(channel, format); written.failed()) return written;
 
         if (status_t const rebuilt = volume.rebuild_free_map_(); rebuilt.failed()) return rebuilt;
         return volume;
@@ -208,22 +209,22 @@ class basic_extent_volume {
 
     /**
      *  @brief Makes the bytes of @p blob durable and then records it, in that order and no other.
-     *  @param[inout] lane The lane the caller wrote the bytes on, which is the only one that can flush them.
-     *  @param[in] blob The reservation @c create handed out, whose bytes the caller has already reaped.
+     *  @param[inout] channel The channel the caller wrote the bytes on, which is the only one that can flush them.
+     *  @param[in] blob The reservation @c create handed out, whose bytes the caller has already completed.
      *  @return Success, or @c status_code_t::not_found_k when no live reservation covers that range.
      */
-    status_t seal(io_lane_t& lane, blob_t const& blob) noexcept {
-        if (blob.target.descriptor != target_.descriptor || blob.target.generation != target_.generation)
+    status_t seal(io_channel_t& channel, blob_t const& blob) noexcept {
+        if (blob.medium.medium_id != medium_.medium_id || blob.medium.generation != medium_.generation)
             return {status_code_t::invalid_argument_k, "That blob was reserved on another volume"};
         std::size_t const position = reservation_at_(blob.extent);
         if (position == reserved_.size()) return {status_code_t::not_found_k, "The volume reserved no such range"};
 
-        if (status_t const flushed = flush_bytes_(lane); flushed.failed()) return flushed;
+        if (status_t const flushed = flush_bytes_(channel); flushed.failed()) return flushed;
         catalog_entry_t const& entry = reserved_[position];
         if (status_t const recorded = catalog_.insert(entry.name(), entry.kind, entry.extent, entry.content_length);
             recorded.failed())
             return recorded;
-        if (status_t const published = publish_catalog_(lane); published.failed()) {
+        if (status_t const published = publish_catalog_(channel); published.failed()) {
             [[maybe_unused]] expected<extent_t> const undone = catalog_.erase(entry.name());
             return published;
         }
@@ -232,7 +233,7 @@ class basic_extent_volume {
     }
 
     /** Forgets @p name durably, and only then returns its range to the free map. */
-    status_t drop(io_lane_t& lane, blob_name_t name) noexcept {
+    status_t drop(io_channel_t& channel, blob_name_t name) noexcept {
         if (std::size_t const position = reservation_named_(name); position != reserved_.size()) {
             extent_t const abandoned = reserved_[position].extent;
             reserved_.erase(position);
@@ -244,7 +245,7 @@ class basic_extent_volume {
         catalog_entry_t const restored = *found;
         expected<extent_t> const forgotten = catalog_.erase(name);
         if (!forgotten) return forgotten.status();
-        if (status_t const published = publish_catalog_(lane); published.failed()) {
+        if (status_t const published = publish_catalog_(channel); published.failed()) {
             [[maybe_unused]] status_t const undone = catalog_.insert(restored.name(), restored.kind, restored.extent,
                                                                      restored.content_length);
             return published;
@@ -278,19 +279,19 @@ class basic_extent_volume {
     /** The transport underneath, which every read and write of a blob's bytes goes to directly. */
     [[nodiscard]] disk_type_& disk() const noexcept { return disk_; }
 
-    /** The target every blob of this volume lives in. */
-    [[nodiscard]] target_place_t target() const noexcept { return target_; }
+    /** The medium every blob of this volume lives in. */
+    [[nodiscard]] medium_reference_t medium() const noexcept { return medium_; }
 
     /** The head of the volume, which names the geometry a repair tool reads the slots by. */
     [[nodiscard]] volume_header_t const& header() const noexcept { return header_; }
 
   private:
 
-    /** The blob a catalog entry describes, which carries the target so a caller needs nothing else. */
+    /** The blob a catalog entry describes, which carries the medium so a caller needs nothing else. */
     [[nodiscard]] blob_t blob_of_(extent_t extent, std::uint64_t length) const noexcept {
         blob_t blob;
         blob.volume = volume_id_t::unmounted_k;
-        blob.target = target_;
+        blob.medium = medium_;
         blob.extent = extent;
         blob.length = length;
         return blob;
@@ -314,25 +315,25 @@ class basic_extent_volume {
     }
 
     /** Reads the head of the volume, which a fresh medium answers with zeroes rather than a failure. */
-    expected<volume_header_t> read_head_(io_lane_t& lane) noexcept {
-        if (lane.requests().block_bytes() < portable_alignment_k)
-            return status_t {status_code_t::capacity_exhausted_k, "A lane's block is shorter than a volume's head"};
+    expected<volume_header_t> read_head_(io_channel_t& channel) noexcept {
+        if (channel.requests().buffer_bytes() < portable_alignment_k)
+            return status_t {status_code_t::capacity_exhausted_k, "A channel's block is shorter than a volume's head"};
 
-        basic_read_pipeline<disk_type_> reader {disk_, lane, target_};
-        if (status_t const offered = reader.offer(extent_t {0, portable_alignment_k}, 0); offered.failed())
+        basic_read_pipeline<disk_type_> reader {disk_, channel, medium_};
+        if (status_t const offered = reader.enqueue_read(extent_t {0, portable_alignment_k}, 0); offered.failed())
             return offered;
-        if (status_t const flushed = reader.flush(); flushed.failed()) return flushed;
+        if (status_t const flushed = reader.submit(); flushed.failed()) return flushed;
 
         volume_header_t header {};
         status_t sink_status;
-        auto sink = [&](harvested_block_t const& reaped) noexcept {
-            if (status_t const whole = require_whole(reaped); whole.failed()) {
+        auto sink = [&](completed_buffer_t const& completed) noexcept {
+            if (status_t const whole = require_completed_in_full(completed); whole.failed()) {
                 sink_status = whole;
                 return;
             }
-            std::memcpy(&header, reaped.bytes.data(), sizeof(header));
+            std::memcpy(&header, completed.bytes.data(), sizeof(header));
         };
-        if (status_t const harvested = reader.harvest_all(sink); harvested.failed()) return harvested;
+        if (status_t const polled = reader.poll_all_completions(sink); polled.failed()) return polled;
         if (sink_status.failed()) return sink_status;
         if (header.magic != 0 && header.magic != volume_magic_k)
             return status_t {status_code_t::malformed_k, "The volume carries another magic"};
@@ -342,7 +343,7 @@ class basic_extent_volume {
     }
 
     /** Writes the head and two empty catalog slots, which is what a format is. */
-    status_t write_head_(io_lane_t& lane, volume_format_t const& format) noexcept {
+    status_t write_head_(io_channel_t& channel, volume_format_t const& format) noexcept {
         volume_header_t header {};
         header.magic = volume_magic_k;
         header.format_version = volume_format_version_k;
@@ -356,35 +357,35 @@ class basic_extent_volume {
         header.allocation_granularity = format.allocation_granularity;
         header.large_allocation_alignment = format.large_allocation_alignment;
         header.catalog_generation = 0;
-        seal_header_checksum(header);
+        set_header_checksum(header);
         if (header.data_offset >= capacity_)
             return {status_code_t::capacity_exhausted_k, "The volume is too small for its own catalog"};
 
         header_ = header;
         catalog_ = catalog_t {};
-        basic_write_pipeline<disk_type_> writer {disk_, lane, target_};
-        expected<buffer_lease_t> block = writer.stage();
+        basic_write_pipeline<disk_type_> writer {disk_, channel, medium_};
+        expected<pooled_buffer_t> block = writer.acquire_buffer();
         if (!block) return block.status();
         if (block->size() < portable_alignment_k)
-            return {status_code_t::capacity_exhausted_k, "A lane's block is shorter than a volume's head"};
+            return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than a volume's head"};
         std::span<byte_t> const bytes = block->bytes();
         std::memset(bytes.data(), 0, static_cast<std::size_t>(portable_alignment_k));
         std::memcpy(bytes.data(), &header, sizeof(header));
-        if (status_t const queued = writer.commit(std::move(*block), extent_t {0, portable_alignment_k});
+        if (status_t const queued = writer.enqueue_write(std::move(*block), extent_t {0, portable_alignment_k});
             queued.failed())
             return queued;
         if (status_t const durable = writer.make_durable(); durable.failed()) return durable;
-        return publish_both_slots_(lane);
+        return publish_both_slots_(channel);
     }
 
     /** Reads both slots and takes the newer one that verifies, which is the whole of recovery. */
-    status_t load_catalog_(io_lane_t& lane, volume_recovery_t recovery) noexcept {
+    status_t load_catalog_(io_channel_t& channel, volume_recovery_t recovery) noexcept {
         catalog_t newest;
         std::uint64_t newest_generation = 0;
         bool found = false;
         for (std::uint32_t slot = 0; slot != 2; ++slot) {
             catalog_t parsed;
-            expected<std::uint64_t> const generation = read_slot_(lane, slot, parsed);
+            expected<std::uint64_t> const generation = read_slot_(channel, slot, parsed);
             if (!generation) continue;
             if (found && *generation <= newest_generation) continue;
             newest = std::move(parsed);
@@ -401,7 +402,7 @@ class basic_extent_volume {
 
         catalog_ = catalog_t {};
         header_.catalog_generation = 0;
-        return publish_both_slots_(lane);
+        return publish_both_slots_(channel);
     }
 
     /**
@@ -410,29 +411,31 @@ class basic_extent_volume {
      *  @note The image is read through a streaming block with one request of its own, since a
      *      pipeline fills the request pool whose blocks are far shorter than a catalog slot.
      */
-    expected<std::uint64_t> read_slot_(io_lane_t& lane, std::uint32_t slot, catalog_t& into) noexcept {
-        expected<buffer_lease_t> block = lane.streams().acquire();
+    expected<std::uint64_t> read_slot_(io_channel_t& channel, std::uint32_t slot, catalog_t& into) noexcept {
+        expected<pooled_buffer_t> block = channel.streams().acquire();
         if (!block) return block.status();
         std::uint64_t const wanted = slot_image_bytes_(block->size());
         if (wanted == 0)
-            return status_t {status_code_t::capacity_exhausted_k, "A lane's streaming block holds no catalog page"};
+            return status_t {status_code_t::capacity_exhausted_k, "A channel's streaming block holds no catalog page"};
 
         std::array<request_t, 1> const batch {
-            read_request(target_, extent_t {slot_offset_(slot), wanted}, block->place(), lane.token(slot))};
-        expected<std::size_t> const taken = disk_.submit(lane.owner(), std::span<request_t const> {batch});
+            read_request(medium_, extent_t {slot_offset_(slot), wanted}, block->reference(), channel.token(slot))};
+        expected<std::size_t> const taken = disk_.submit(channel.queue_pair(), std::span<request_t const> {batch});
         if (!taken) return taken.status();
-        if (*taken != 1) return status_t {status_code_t::io_k, "The ring would not take a catalog read"};
-        expected<std::size_t> const reaped = reap_at_least(disk_, lane.owner(), lane.reaping_room(), 1);
-        if (!reaped) return reaped.status();
-        if (*reaped == 0) return status_t {status_code_t::io_k, "A catalog read never completed"};
+        if (*taken != 1) return status_t {status_code_t::input_output_k, "The ring would not take a catalog read"};
+        expected<std::size_t> const completed = poll_completions_at_least(disk_, channel.queue_pair(),
+                                                                          channel.completion_buffer(), 1);
+        if (!completed) return completed.status();
+        if (*completed == 0) return status_t {status_code_t::input_output_k, "A catalog read never completed"};
 
-        completion_t const& completion = lane.reaping_room().front();
-        if (!completion.whole())
+        completion_t const& completion = channel.completion_buffer().front();
+        if (!completion.completed_in_full())
             return completion.status.failed()
                        ? completion.status
                        : status_t {status_code_t::malformed_k, "The volume is shorter than its catalog slot"};
 
-        std::span<byte_t const> const image {block->bytes().data(), static_cast<std::size_t>(completion.transferred)};
+        std::span<byte_t const> const image {block->bytes().data(),
+                                             static_cast<std::size_t>(completion.transferred_bytes)};
         if (status_t const parsed = into.load(image); parsed.failed()) return parsed;
         catalog_slot_header_t header {};
         std::memcpy(&header, image.data(), sizeof(header));
@@ -440,11 +443,11 @@ class basic_extent_volume {
     }
 
     /** Writes the whole catalog image into the older slot and flushes it, which publishes it. */
-    status_t publish_catalog_(io_lane_t& lane) noexcept {
+    status_t publish_catalog_(io_channel_t& channel) noexcept {
         std::uint64_t const generation = header_.catalog_generation + 1;
         std::uint32_t const slot = static_cast<std::uint32_t>(generation & 1);
 
-        expected<buffer_lease_t> block = lane.streams().acquire();
+        expected<pooled_buffer_t> block = channel.streams().acquire();
         if (!block) return block.status();
         std::uint64_t const room = slot_image_bytes_(block->size());
         std::uint64_t const needed = catalog_.image_bytes();
@@ -456,8 +459,8 @@ class basic_extent_volume {
         expected<std::uint64_t> const filled = catalog_.save(bytes.first(static_cast<std::size_t>(room)), generation);
         if (!filled) return filled.status();
 
-        basic_write_pipeline<disk_type_> writer {disk_, lane, target_};
-        if (status_t const queued = writer.commit(std::move(*block), extent_t {slot_offset_(slot), written});
+        basic_write_pipeline<disk_type_> writer {disk_, channel, medium_};
+        if (status_t const queued = writer.enqueue_write(std::move(*block), extent_t {slot_offset_(slot), written});
             queued.failed())
             return queued;
         if (status_t const durable = writer.make_durable(); durable.failed()) return durable;
@@ -466,14 +469,14 @@ class basic_extent_volume {
     }
 
     /** Publishes into both slots, so no image of an earlier life outlives a format or a repair. */
-    status_t publish_both_slots_(io_lane_t& lane) noexcept {
-        if (status_t const older = publish_catalog_(lane); older.failed()) return older;
-        return publish_catalog_(lane);
+    status_t publish_both_slots_(io_channel_t& channel) noexcept {
+        if (status_t const older = publish_catalog_(channel); older.failed()) return older;
+        return publish_catalog_(channel);
     }
 
-    /** Makes every write the lane has already reaped durable, which is the step before recording. */
-    status_t flush_bytes_(io_lane_t& lane) noexcept {
-        basic_write_pipeline<disk_type_> writer {disk_, lane, target_};
+    /** Makes every write the channel has already completed durable, which is the step before recording. */
+    status_t flush_bytes_(io_channel_t& channel) noexcept {
+        basic_write_pipeline<disk_type_> writer {disk_, channel, medium_};
         return writer.make_durable();
     }
 
@@ -518,8 +521,8 @@ class basic_extent_volume {
     /** The transport, which outlives the volume. */
     disk_type_& disk_;
 
-    /** The target the whole volume occupies. */
-    target_place_t target_;
+    /** The medium the whole volume occupies. */
+    medium_reference_t medium_;
 
     /** Bytes the volume spans, as the transport reported them. */
     std::uint64_t capacity_ = 0;

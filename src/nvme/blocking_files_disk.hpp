@@ -6,8 +6,8 @@
  *
  *  This is the transport every platform has. POSIX issues @c pread and @c pwrite, Windows issues
  *  @c ReadFile and @c WriteFile with an @c OVERLAPPED offset, and neither keeps a file cursor, so the
- *  same descriptor serves every executor thread at once. Depth comes from those threads rather than
- *  from a device queue, which is why the floor is a floor and not a target.
+ *  same registered medium serves every executor thread at once. Depth comes from those threads rather than
+ *  from a device queue, which is why the floor is a floor and not a medium.
  */
 
 #pragma once
@@ -67,15 +67,15 @@ using native_file_t = void*;
 inline native_file_t const invalid_native_file_k = INVALID_HANDLE_VALUE;
 
 /** Opens @p path, or reports why the platform refused. */
-inline expected<native_file_t> open_native_file(char const* path, target_access_t access,
+inline expected<native_file_t> open_native_file(char const* path, medium_access_t access,
                                                 file_buffering_t buffering) noexcept {
-    DWORD const rights = access == target_access_t::read_only_k ? GENERIC_READ : GENERIC_READ | GENERIC_WRITE;
-    DWORD const creation = access == target_access_t::create_read_write_k ? OPEN_ALWAYS : OPEN_EXISTING;
+    DWORD const rights = access == medium_access_t::read_only_k ? GENERIC_READ : GENERIC_READ | GENERIC_WRITE;
+    DWORD const creation = access == medium_access_t::create_read_write_k ? OPEN_ALWAYS : OPEN_EXISTING;
     DWORD flags = FILE_ATTRIBUTE_NORMAL;
     if (buffering == file_buffering_t::unbuffered_k) flags |= FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH;
     native_file_t const file = CreateFileA(path, rights, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, creation, flags,
                                            nullptr);
-    if (file == invalid_native_file_k) return status_t {status_code_t::io_k, "The file would not open"};
+    if (file == invalid_native_file_k) return status_t {status_code_t::input_output_k, "The file would not open"};
     return file;
 }
 
@@ -95,7 +95,7 @@ inline expected<std::uint64_t> read_native_file(native_file_t file, std::uint64_
         DWORD const asking = static_cast<DWORD>(buffer.size() - moved);
         if (!ReadFile(file, buffer.data() + moved, asking, &arrived, &position)) {
             if (GetLastError() == ERROR_HANDLE_EOF) break;
-            return status_t {status_code_t::io_k, "A positioned read failed"};
+            return status_t {status_code_t::input_output_k, "A positioned read failed"};
         }
         if (arrived == 0) break;
         moved += arrived;
@@ -115,7 +115,7 @@ inline expected<std::uint64_t> write_native_file(native_file_t file, std::uint64
         DWORD landed = 0;
         DWORD const asking = static_cast<DWORD>(buffer.size() - moved);
         if (!WriteFile(file, buffer.data() + moved, asking, &landed, &position))
-            return status_t {status_code_t::io_k, "A positioned write failed"};
+            return status_t {status_code_t::input_output_k, "A positioned write failed"};
         if (landed == 0) break;
         moved += landed;
     }
@@ -124,7 +124,7 @@ inline expected<std::uint64_t> write_native_file(native_file_t file, std::uint64
 
 /** Makes every landed write durable. */
 inline status_t flush_native_file(native_file_t file) noexcept {
-    if (!FlushFileBuffers(file)) return {status_code_t::io_k, "The file would not flush"};
+    if (!FlushFileBuffers(file)) return {status_code_t::input_output_k, "The file would not flush"};
     return {};
 }
 
@@ -139,16 +139,16 @@ inline status_t truncate_native_file(native_file_t file, std::uint64_t bytes) no
     LARGE_INTEGER position {};
     position.QuadPart = static_cast<LONGLONG>(bytes);
     if (!SetFilePointerEx(file, position, nullptr, FILE_BEGIN) || !SetEndOfFile(file))
-        return {status_code_t::io_k, "The file would not resize"};
+        return {status_code_t::input_output_k, "The file would not resize"};
     return {};
 }
 
 #else
 
-/** The descriptor one open file is addressed by. */
+/** The registered medium one open file is addressed by. */
 using native_file_t = int;
 
-/** The descriptor value that marks a file that never opened. */
+/** The registered medium value that marks a file that never opened. */
 inline native_file_t const invalid_native_file_k = -1;
 
 /** Translates the platform's failure into the status the ring reports. */
@@ -161,7 +161,7 @@ inline status_t native_file_failure(int reason, char const* message) noexcept {
     case EINVAL:
     case EBADF: return {status_code_t::invalid_argument_k, message};
     case ENOMEM: return {status_code_t::out_of_memory_k, message};
-    case EIO: return {status_code_t::io_k, message};
+    case EIO: return {status_code_t::input_output_k, message};
     default: return {status_code_t::device_k, message};
     }
 }
@@ -218,10 +218,10 @@ inline status_t flush_native_file(native_file_t file) noexcept {
 #endif
 
 /** Opens @p path, or reports why the platform refused. */
-inline expected<native_file_t> open_native_file(char const* path, target_access_t access,
+inline expected<native_file_t> open_native_file(char const* path, medium_access_t access,
                                                 file_buffering_t buffering) noexcept {
-    int flags = access == target_access_t::read_only_k ? O_RDONLY : O_RDWR;
-    if (access == target_access_t::create_read_write_k) flags |= O_CREAT;
+    int flags = access == medium_access_t::read_only_k ? O_RDONLY : O_RDWR;
+    if (access == medium_access_t::create_read_write_k) flags |= O_CREAT;
     if (buffering == file_buffering_t::unbuffered_k) flags |= unbuffered_open_flag();
     native_file_t const file = ::open(path, flags, 0644);
     if (file == invalid_native_file_k) return native_file_failure(errno, "The file would not open");
@@ -287,7 +287,7 @@ inline status_t truncate_native_file(native_file_t file, std::uint64_t bytes) no
  *  @brief One open file, read and written at absolute offsets by any number of threads at once.
  *
  *  Neither @c pread nor an @c OVERLAPPED @c ReadFile moves a shared cursor, so the device needs no
- *  lock of its own and a lease per thread is the only concurrency control. A short result is not an
+ *  lock of its own and a queue pair per thread is the only concurrency control. A short result is not an
  *  error here: a read that meets the end of the file, and a write that meets a full volume, answer
  *  the prefix they moved and let the ring report it as a partial transfer.
  */
@@ -315,7 +315,7 @@ class blocking_files_device_t {
      *  @brief Makes a device that opens its files with @p buffering.
      *  @param[in] buffering Whether the page cache stands in the path, which fixes the alignments.
      *
-     *  @note No file is opened here; a mount registers each one as a target, so a directory of many
+     *  @note No file is opened here; a mount registers each one as a medium, so a directory of many
      *      sorted runs is one device rather than one device per run.
      */
     static expected<blocking_files_device_t> make(file_buffering_t buffering) noexcept {
@@ -329,11 +329,11 @@ class blocking_files_device_t {
      *  @param[in] request The path, the bytes to create it with, and what the caller may do to it.
      *  @return The slot the file took, which every request against it names.
      */
-    expected<std::uint16_t> attach_target(target_request_t const& request) noexcept {
-        if (!request.name) return status_t {status_code_t::invalid_argument_k, "A file target needs a path"};
+    expected<std::uint16_t> open_medium(medium_options_t const& request) noexcept {
+        if (!request.name) return status_t {status_code_t::invalid_argument_k, "A file medium needs a path"};
         expected<native_file_t> const file = open_native_file(request.name, request.access, buffering_);
         if (!file) return file.status();
-        if (request.access == target_access_t::create_read_write_k && request.length != 0)
+        if (request.access == medium_access_t::create_read_write_k && request.length != 0)
             if (status_t const sized = truncate_native_file(*file, request.length); sized.failed()) {
                 close_native_file(*file);
                 return sized;
@@ -347,15 +347,15 @@ class blocking_files_device_t {
             }
         if (files_.push_back(std::move(opened)) != st::status_t::success_k) {
             close_native_file(*file);
-            return status_t {status_code_t::out_of_memory_k, "A device could not track another target"};
+            return status_t {status_code_t::out_of_memory_k, "A device could not track another medium"};
         }
         return static_cast<std::uint16_t>(files_.size() - 1);
     }
 
-    /** Closes the file in @p index, leaving its slot free for the next target. */
-    status_t detach_target(std::uint16_t index) noexcept {
+    /** Closes the file in @p index, leaving its slot free for the next medium. */
+    status_t close_medium(std::uint16_t index) noexcept {
         if (index >= files_.size() || files_[index] == invalid_native_file_k)
-            return {status_code_t::invalid_argument_k, "The target is not this device's"};
+            return {status_code_t::invalid_argument_k, "The medium is not this device's"};
         close_native_file(files_[index]);
         files_[index] = invalid_native_file_k;
         return {};
@@ -364,7 +364,7 @@ class blocking_files_device_t {
     /** Reads @p extent of @p index into @p destination, answering the prefix that arrived. */
     expected<std::uint64_t> read_extent(std::uint16_t index, extent_t extent, std::span<byte_t> destination) noexcept {
         if (index >= files_.size() || files_[index] == invalid_native_file_k)
-            return status_t {status_code_t::invalid_argument_k, "The target is not this device's"};
+            return status_t {status_code_t::invalid_argument_k, "The medium is not this device's"};
         return read_native_file(files_[index], extent.offset,
                                 destination.first(static_cast<std::size_t>(extent.length)));
     }
@@ -373,14 +373,14 @@ class blocking_files_device_t {
     expected<std::uint64_t> write_extent(std::uint16_t index, extent_t extent,
                                          std::span<byte_t const> source) noexcept {
         if (index >= files_.size() || files_[index] == invalid_native_file_k)
-            return status_t {status_code_t::invalid_argument_k, "The target is not this device's"};
+            return status_t {status_code_t::invalid_argument_k, "The medium is not this device's"};
         return write_native_file(files_[index], extent.offset, source.first(static_cast<std::size_t>(extent.length)));
     }
 
     /** Makes every write @p index has already answered durable. */
     status_t flush(std::uint16_t index) noexcept {
         if (index >= files_.size() || files_[index] == invalid_native_file_k)
-            return {status_code_t::invalid_argument_k, "The target is not this device's"};
+            return {status_code_t::invalid_argument_k, "The medium is not this device's"};
         return flush_native_file(files_[index]);
     }
 
@@ -393,7 +393,7 @@ class blocking_files_device_t {
     /** Preallocates the regular file in @p index to @p bytes, which a mount does once; a block device is refused. */
     status_t resize(std::uint16_t index, std::uint64_t bytes) noexcept {
         if (index >= files_.size() || files_[index] == invalid_native_file_k)
-            return {status_code_t::invalid_argument_k, "The target is not this device's"};
+            return {status_code_t::invalid_argument_k, "The medium is not this device's"};
         return truncate_native_file(files_[index], bytes);
     }
 
@@ -405,7 +405,7 @@ class blocking_files_device_t {
         reported.offset_alignment = alignment;
         reported.length_granularity = alignment;
         reported.max_transfer_bytes = max_transfer_bytes_k;
-        reported.reaches_device_memory = false;
+        reported.reaches_gpu_memory = false;
         return reported;
     }
 
@@ -421,14 +421,14 @@ class blocking_files_device_t {
         files_.clear();
     }
 
-    /** One entry per registered target, @c invalid_native_file_k where a slot is free. */
+    /** One entry per registered medium, @c invalid_native_file_k where a slot is free. */
     st::basic_vector<native_file_t> files_;
 
     /** Whether the page cache stands in the path, which fixes the reported alignments. */
     file_buffering_t buffering_ = file_buffering_t::buffered_k;
 };
 
-/** The ring every platform has: positioned reads and writes, performed on the thread that reaps. */
+/** The ring every platform has: positioned reads and writes, performed on the thread that polls. */
 using blocking_files_disk_t = basic_disk<blocking_files_device_t>;
 
 #pragma endregion Device

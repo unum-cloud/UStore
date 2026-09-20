@@ -4,7 +4,7 @@
  *  @date September 19, 2026
  *  @brief One collection with transactions over the ring: what a commit shows, what a conflict keeps.
  *
- *  The verdicts this file exists for are @c commit_lands_all_or_nothing and
+ *  The results this file exists for are @c commit_lands_all_or_nothing and
  *  @c transactions_serialize_under_threads. A reader passing over every key while a commit lands must
  *  see the whole of that commit or none of it, and several threads racing over overlapping keys must
  *  end at a count no lost update could produce.
@@ -27,7 +27,7 @@
 #include "nvme/key_slot.hpp"                   // `key_slot`
 #include "nvme/single_collection_database.hpp" // `basic_single_collection_database`
 
-#include "nvme_fixture.hpp" // `basic_fixture`, `on_transport`, `expectation_t`, `painted`
+#include "nvme_fixture.hpp" // `basic_fixture`, `run_on_transport`, `expectation_t`, `painted`
 
 namespace unum::ustore {
 
@@ -35,9 +35,9 @@ using namespace unum::ustore::nvme;
 
 #pragma region Shape
 
-/** The numbers every case mounts with: lanes for a compaction to hold two, the case one, and every worker thread
+/** The numbers every case mounts with: channels for a compaction to hold two, the case one, and every worker thread
  *  one. */
-constexpr fixture_shape_t scdb_shape_k {.spare_lanes = 8};
+constexpr fixture_config_t scdb_config_k {.shared_io_channels = 8};
 
 /** Threads the concurrency cases drive the database on. */
 constexpr std::size_t worker_threads_k = 4;
@@ -58,26 +58,26 @@ struct scdb_types {
     using variable_database_t = basic_single_collection_database<variable_slot_t, volume_t>;
     using variable_scanner_t = collection_scanner<variable_slot_t, volume_t>;
 
-    /** A fixture, the lanes a database needs, and the volume over them. */
+    /** A fixture, the channels a database needs, and the volume over them. */
     struct stack_t {
 
-        /** The disk, the slab and the lanes. */
+        /** The disk, the arena and the channels. */
         std::unique_ptr<fixture_t> fixture;
 
-        /** The lane the database writes, flushes and commits on. */
+        /** The channel the database writes, flushes and commits on. */
         guard_t writing;
 
-        /** The second lane a compaction writes its new runs on. */
+        /** The second channel a compaction writes its new runs on. */
         guard_t merging;
 
-        /** The lane the calling thread reads on. */
+        /** The channel the calling thread reads on. */
         guard_t reading;
 
         /** The volume every run and blob lands on, pinned so a database may point at it. */
         std::unique_ptr<volume_t> volume;
 
-        /** The lane of the calling thread, which every read of this stack takes. */
-        [[nodiscard]] io_lane_t& lane() noexcept { return reading.lane(); }
+        /** The channel of the calling thread, which every read of this stack takes. */
+        [[nodiscard]] io_channel_t& channel() noexcept { return reading.channel(); }
     };
 };
 
@@ -126,7 +126,7 @@ void write_counter(std::uint64_t counter, std::span<byte_t> into) noexcept {
 
 #pragma region Fixtures
 
-/** Mounts a fixture through @p mount, takes the three lanes a case needs and formats one volume over them. */
+/** Mounts a fixture through @p mount, takes the three channels a case needs and formats one volume over them. */
 template <typename mount_type_>
 expected<std::unique_ptr<typename scdb_types<typename mount_type_::fixture_t>::stack_t>> make_stack(
     mount_type_ const& mount) noexcept {
@@ -141,28 +141,28 @@ expected<std::unique_ptr<typename scdb_types<typename mount_type_::fixture_t>::s
     if (!fixture) return fixture.status();
     stack->fixture = std::move(*fixture);
 
-    expected<guard_t> writing = stack->fixture->lanes.checkout();
+    expected<guard_t> writing = stack->fixture->channels.acquire();
     if (!writing) return writing.status();
     stack->writing = std::move(*writing);
-    expected<guard_t> merging = stack->fixture->lanes.checkout();
+    expected<guard_t> merging = stack->fixture->channels.acquire();
     if (!merging) return merging.status();
     stack->merging = std::move(*merging);
-    expected<guard_t> reading = stack->fixture->lanes.checkout();
+    expected<guard_t> reading = stack->fixture->channels.acquire();
     if (!reading) return reading.status();
     stack->reading = std::move(*reading);
 
-    expected<volume_t> volume = stack->fixture->mount_volume(stack->writing.lane());
+    expected<volume_t> volume = stack->fixture->mount_volume(stack->writing.channel());
     if (!volume) return volume.status();
     stack->volume = std::unique_ptr<volume_t> {new (std::nothrow) volume_t {std::move(*volume)}};
     if (!stack->volume) return status_t {status_code_t::out_of_memory_k, "The volume did not fit"};
     return stack;
 }
 
-/** Opens a database of @p database_type_ over the volume and the lanes of @p stack. */
+/** Opens a database of @p database_type_ over the volume and the channels of @p stack. */
 template <typename database_type_, typename stack_type_>
 expected<typename database_type_::database_unique_ptr_t> open_over(
     stack_type_& stack, single_collection_database_config_t const& config) noexcept {
-    return database_type_::open(*stack.volume, stack.writing.lane(), stack.merging.lane(), config,
+    return database_type_::open(*stack.volume, stack.writing.channel(), stack.merging.channel(), config,
                                 stack.fixture->resources);
 }
 
@@ -191,7 +191,7 @@ template <typename database_type_>
 
 /** Reads every key of @p wanted through one batched select and counts what the model disagrees with. */
 template <typename readable_type_>
-[[nodiscard]] std::size_t check_model(readable_type_ const& source, io_lane_t& lane,
+[[nodiscard]] std::size_t check_model(readable_type_ const& source, io_channel_t& channel,
                                       std::span<expectation_t const> wanted) {
     std::size_t failures = 0;
     std::size_t const count = wanted.size();
@@ -215,7 +215,7 @@ template <typename readable_type_>
             if (bytes[index] != painted(wanted[request].seed, offset + index)) ++mismatches;
     };
     failures += expect(
-        source.select(lane, std::span<stored_key_t const> {keys}, std::span<select_result_t> {results}, sink)
+        source.select(channel, std::span<stored_key_t const> {keys}, std::span<select_result_t> {results}, sink)
             .succeeded());
     failures += expect_eq(mismatches, std::size_t {0});
 
@@ -264,10 +264,10 @@ template <typename key_slot_type_, typename mount_type_>
     }
 
     failures += write_model(**store, std::span<expectation_t const> {model});
-    failures += check_model(**store, (*stack)->lane(), std::span<expectation_t const> {model});
+    failures += check_model(**store, (*stack)->channel(), std::span<expectation_t const> {model});
     failures += expect((*store)->flush().succeeded());
     failures += expect_eq((*store)->staged_count(), std::size_t {0});
-    failures += check_model(**store, (*stack)->lane(), std::span<expectation_t const> {model});
+    failures += check_model(**store, (*stack)->channel(), std::span<expectation_t const> {model});
     return failures;
 }
 
@@ -391,7 +391,7 @@ template <typename key_slot_type_, typename mount_type_>
             failures += write_model(**store, std::span<expectation_t const> {batch});
             failures += expect((*store)->flush().succeeded());
         }
-        failures += check_model(**store, (*stack)->lane(), std::span<expectation_t const> {model});
+        failures += check_model(**store, (*stack)->channel(), std::span<expectation_t const> {model});
 
         depth = (*store)->records().tree().snapshot().size();
         shallowest_runs = (*store)->records().tree().snapshot().level(0).size();
@@ -407,7 +407,7 @@ template <typename key_slot_type_, typename mount_type_>
     failures += expect_eq((*store)->records().tree().snapshot().size(), depth);
     failures += expect_eq((*store)->records().tree().snapshot().level(0).size(), shallowest_runs);
     failures += expect_eq((*store)->population_count(), population);
-    failures += check_model(**store, (*stack)->lane(), std::span<expectation_t const> {model});
+    failures += check_model(**store, (*stack)->channel(), std::span<expectation_t const> {model});
     return failures;
 }
 
@@ -467,7 +467,7 @@ std::size_t crash_between_seal_and_schema(mount_type_ const& mount) {
         failures += expect(wasted != std::uint64_t {0});
 
         // The schema write that would have named those runs never landed.
-        failures += expect((*stack)->volume->drop((*stack)->writing.lane(), schema_blob_name()).succeeded());
+        failures += expect((*stack)->volume->drop((*stack)->writing.channel(), schema_blob_name()).succeeded());
 
         expected<typename variable_database_t::database_unique_ptr_t> store = open_over<variable_database_t>(**stack,
                                                                                                              config);
@@ -487,7 +487,7 @@ std::size_t crash_between_seal_and_schema(mount_type_ const& mount) {
         failures += expect(back.resize(value.size()) == st::status_t::success_k);
         stored_value_size_t size = 0;
         failures += expect(
-            (*store)->select((*stack)->lane(), stored_key_t {1000}, std::span<byte_t> {back}, size).succeeded());
+            (*store)->select((*stack)->channel(), stored_key_t {1000}, std::span<byte_t> {back}, size).succeeded());
         failures += expect_eq(std::size_t {size}, value.size());
         failures += expect_eq(std::memcmp(back.data(), value.data(), value.size()), 0);
     }
@@ -520,9 +520,9 @@ std::size_t crash_between_seal_and_schema(mount_type_ const& mount) {
         failures += expect(named_bytes != std::size_t {0});
         if (named_bytes == 0) return failures;
 
-        // The bytes of the one run the schema names never reached the medium.
+        // The bytes of the one run the schema names never reached the environment.
         failures += expect(
-            (*stack)->volume->drop((*stack)->writing.lane(), blob_name_t {named.data(), named_bytes}).succeeded());
+            (*stack)->volume->drop((*stack)->writing.channel(), blob_name_t {named.data(), named_bytes}).succeeded());
 
         expected<typename variable_database_t::database_unique_ptr_t> const store = open_over<variable_database_t>(
             **stack, config);
@@ -531,7 +531,7 @@ std::size_t crash_between_seal_and_schema(mount_type_ const& mount) {
     return failures;
 }
 
-/** A reopen takes back what the database itself wrote to the volume, and refuses another shape. */
+/** A reopen takes back what the database itself wrote to the volume, and refuses another config. */
 template <typename mount_type_>
 std::size_t reopen_agrees_on_its_schema(mount_type_ const& mount) {
     using types_t = scdb_types<typename mount_type_::fixture_t>;
@@ -576,7 +576,7 @@ std::size_t reopen_agrees_on_its_schema(mount_type_ const& mount) {
         failures += expect_eq((*store)->user_data_size_bytes(), std::uint64_t {owner_bytes.size()});
         st::basic_vector<byte_t> back;
         failures += expect(back.resize(owner_bytes.size()) == st::status_t::success_k);
-        failures += expect((*store)->load_user_data((*stack)->lane(), std::span<byte_t> {back}).succeeded());
+        failures += expect((*store)->load_user_data((*stack)->channel(), std::span<byte_t> {back}).succeeded());
         failures += expect_eq(std::memcmp(back.data(), owner_bytes.data(), owner_bytes.size()), 0);
 
         // The runs above are back in the tree, so every key the close left behind answers again.
@@ -636,7 +636,7 @@ std::size_t commit_lands_all_or_nothing(mount_type_ const& mount) {
 
     std::size_t writer_failures = 0;
     std::thread writer {[&]() noexcept {
-        expected<guard_t> guard = (*stack)->fixture->lanes.checkout();
+        expected<guard_t> guard = (*stack)->fixture->channels.acquire();
         writer_failures += expect(guard.has_value());
         if (!guard) return;
 
@@ -674,7 +674,7 @@ std::size_t commit_lands_all_or_nothing(mount_type_ const& mount) {
     };
     while (passes != 400) {
         failures += expect((*store)
-                               ->select((*stack)->lane(), std::span<stored_key_t const> {keys},
+                               ->select((*stack)->channel(), std::span<stored_key_t const> {keys},
                                         std::span<select_result_t> {results}, sink)
                                .succeeded());
         std::size_t generations = 0;
@@ -730,9 +730,9 @@ std::size_t conflict_keeps_its_changes(mount_type_ const& mount) {
     // Both read the key before either writes it, which is the shape a lost update takes.
     std::array<byte_t, counter_bytes_k> seen {};
     stored_value_size_t size = 0;
-    failures += expect((*first)->select((*stack)->lane(), contested_k, std::span<byte_t> {seen}, size).succeeded());
+    failures += expect((*first)->select((*stack)->channel(), contested_k, std::span<byte_t> {seen}, size).succeeded());
     failures += expect_eq(read_counter(std::span<byte_t const> {seen}), std::uint64_t {100});
-    failures += expect((*second)->select((*stack)->lane(), contested_k, std::span<byte_t> {seen}, size).succeeded());
+    failures += expect((*second)->select((*stack)->channel(), contested_k, std::span<byte_t> {seen}, size).succeeded());
 
     std::array<byte_t, counter_bytes_k> from_first {};
     std::array<byte_t, counter_bytes_k> from_second {};
@@ -752,21 +752,21 @@ std::size_t conflict_keeps_its_changes(mount_type_ const& mount) {
     stored_value_size_t kept = 0;
     failures += expect((*second)->find_uncommitted(contested_k, kept) == select_result_t::success_k);
     failures += expect_eq(static_cast<std::size_t>(kept), counter_bytes_k);
-    failures += expect((*second)->select((*stack)->lane(), contested_k, std::span<byte_t> {seen}, size).succeeded());
+    failures += expect((*second)->select((*stack)->channel(), contested_k, std::span<byte_t> {seen}, size).succeeded());
     failures += expect_eq(read_counter(std::span<byte_t const> {seen}), std::uint64_t {202});
 
     // The database still carries only what the winner wrote.
-    failures += expect((*store)->select((*stack)->lane(), contested_k, std::span<byte_t> {seen}, size).succeeded());
+    failures += expect((*store)->select((*stack)->channel(), contested_k, std::span<byte_t> {seen}, size).succeeded());
     failures += expect_eq(read_counter(std::span<byte_t const> {seen}), std::uint64_t {101});
 
     // Rolling back and doing the work again is what the loser is supposed to do next.
     (*second)->rollback();
     failures += expect((*second)->find_uncommitted(contested_k, kept) == select_result_t::nothing_k);
-    failures += expect((*second)->select((*stack)->lane(), contested_k, std::span<byte_t> {seen}, size).succeeded());
+    failures += expect((*second)->select((*stack)->channel(), contested_k, std::span<byte_t> {seen}, size).succeeded());
     write_counter(read_counter(std::span<byte_t const> {seen}) + 1, std::span<byte_t> {from_second});
     failures += expect((*second)->insert(contested_k, std::span<byte_t const> {from_second}).succeeded());
     failures += expect((*second)->commit().succeeded());
-    failures += expect((*store)->select((*stack)->lane(), contested_k, std::span<byte_t> {seen}, size).succeeded());
+    failures += expect((*store)->select((*stack)->channel(), contested_k, std::span<byte_t> {seen}, size).succeeded());
     failures += expect_eq(read_counter(std::span<byte_t const> {seen}), std::uint64_t {102});
 
     // A transaction that only read the contested key, and wrote elsewhere, is refused just the same.
@@ -775,7 +775,8 @@ std::size_t conflict_keeps_its_changes(mount_type_ const& mount) {
     failures += expect(observing.has_value() && overwriting.has_value());
     if (!observing || !overwriting) return failures;
 
-    failures += expect((*observing)->select((*stack)->lane(), contested_k, std::span<byte_t> {seen}, size).succeeded());
+    failures += expect(
+        (*observing)->select((*stack)->channel(), contested_k, std::span<byte_t> {seen}, size).succeeded());
     failures += expect((*observing)->insert(stored_key_t {99}, std::span<byte_t const> {from_first}).succeeded());
     failures += expect((*overwriting)->insert(contested_k, std::span<byte_t const> {from_second}).succeeded());
     failures += expect((*overwriting)->commit().succeeded());
@@ -827,10 +828,10 @@ std::size_t rollback_and_renew_behave(mount_type_ const& mount) {
     // A transaction that has read something may not renew, whatever it has written since.
     std::array<byte_t, counter_bytes_k> seen {};
     failures += expect(
-        (*changing)->select((*stack)->lane(), stored_key_t {2}, std::span<byte_t> {seen}, size).succeeded());
+        (*changing)->select((*stack)->channel(), stored_key_t {2}, std::span<byte_t> {seen}, size).succeeded());
     failures += expect_status((*changing)->renew(), status_code_t::invalid_argument_k);
 
-    // Nor may a staged transaction, and the staging lease is handed back by the rollback and not by the renew.
+    // Nor may a staged transaction, and the staging queue pair is handed back by the rollback and not by the renew.
     (*changing)->rollback();
     failures += expect((*changing)->insert(stored_key_t {3}, std::span<byte_t const> {value}).succeeded());
     failures += expect((*changing)->stage().succeeded());
@@ -882,7 +883,7 @@ std::size_t transactions_serialize_under_threads(mount_type_ const& mount) {
     std::array<std::thread, worker_threads_k> workers;
     for (std::size_t worker = 0; worker != worker_threads_k; ++worker)
         workers[worker] = std::thread {[&, worker]() noexcept {
-            expected<guard_t> guard = (*stack)->fixture->lanes.checkout();
+            expected<guard_t> guard = (*stack)->fixture->channels.acquire();
             worker_failures[worker] += expect(guard.has_value());
             if (!guard) return;
 
@@ -897,7 +898,7 @@ std::size_t transactions_serialize_under_threads(mount_type_ const& mount) {
                 stored_key_t const key = static_cast<stored_key_t>((round + worker) % keys_k);
                 for (std::size_t attempt = 0; attempt != 256; ++attempt) {
                     stored_value_size_t size = 0;
-                    if ((*changing)->select(guard->lane(), key, std::span<byte_t> {seen}, size).failed()) {
+                    if ((*changing)->select(guard->channel(), key, std::span<byte_t> {seen}, size).failed()) {
                         ++worker_failures[worker];
                         break;
                     }
@@ -929,7 +930,7 @@ std::size_t transactions_serialize_under_threads(mount_type_ const& mount) {
     for (stored_key_t key = 0; key != keys_k; ++key) {
         std::array<byte_t, counter_bytes_k> seen {};
         stored_value_size_t size = 0;
-        failures += expect((*store)->select((*stack)->lane(), key, std::span<byte_t> {seen}, size).succeeded());
+        failures += expect((*store)->select((*stack)->channel(), key, std::span<byte_t> {seen}, size).succeeded());
         counted += read_counter(std::span<byte_t const> {seen});
     }
     failures += expect_eq(counted, std::uint64_t {commits});
@@ -985,7 +986,7 @@ std::size_t snapshot_sees_its_moment(mount_type_ const& mount) {
 
     std::size_t writer_failures = 0;
     std::thread writer {[&]() noexcept {
-        expected<guard_t> guard = (*stack)->fixture->lanes.checkout();
+        expected<guard_t> guard = (*stack)->fixture->channels.acquire();
         writer_failures += expect(guard.has_value());
         if (!guard) return;
         for (stored_key_t key = 0; key != 8; ++key)
@@ -998,7 +999,7 @@ std::size_t snapshot_sees_its_moment(mount_type_ const& mount) {
     failures += expect(into.resize(bytes_k) == st::status_t::success_k);
     for (stored_key_t key = 0; key != 8; ++key) {
         stored_value_size_t size = 0;
-        failures += expect(taken->select((*stack)->lane(), key, std::span<byte_t> {into}, size).succeeded());
+        failures += expect(taken->select((*stack)->channel(), key, std::span<byte_t> {into}, size).succeeded());
         failures += expect_eq(static_cast<std::size_t>(size), bytes_k);
         failures += expect_eq(std::memcmp(into.data(), older.data(), bytes_k), 0);
     }
@@ -1016,7 +1017,7 @@ std::size_t snapshot_sees_its_moment(mount_type_ const& mount) {
     // The database itself moved on, and every key of it now carries the newer bytes.
     for (stored_key_t key = 0; key != 8; ++key) {
         stored_value_size_t size = 0;
-        failures += expect((*store)->select((*stack)->lane(), key, std::span<byte_t> {into}, size).succeeded());
+        failures += expect((*store)->select((*stack)->channel(), key, std::span<byte_t> {into}, size).succeeded());
         failures += expect_eq(std::memcmp(into.data(), newer.data(), bytes_k), 0);
     }
     return failures;
@@ -1099,7 +1100,7 @@ std::size_t scan_visits_every_key_in_order(mount_type_ const& mount) {
     failures += expect(scan.has_value());
     if (!scan) return failures;
 
-    // The walk is bounded so a merge that forgets to advance a cursor is a verdict and not a hang.
+    // The walk is bounded so a merge that forgets to advance a cursor is a result and not a hang.
     constexpr std::size_t visits_limit_k = keys_k + 64;
     std::size_t visited = 0;
     std::size_t out_of_order = 0;
@@ -1120,7 +1121,7 @@ std::size_t scan_visits_every_key_in_order(mount_type_ const& mount) {
     failures += expect_eq(wrong_state, std::size_t {0});
     failures += expect_eq(wrong_size, std::size_t {0});
 
-    failures += check_model(**store, (*stack)->lane(), std::span<expectation_t const> {model});
+    failures += check_model(**store, (*stack)->channel(), std::span<expectation_t const> {model});
     return failures;
 }
 
@@ -1135,29 +1136,29 @@ int main(int argc, char const* argv[]) {
     if (argument_status_t const status = parse_suite_options(argc, argv, options);
         status != argument_status_t::parsed_k)
         return status == argument_status_t::help_k ? 0 : 1;
-    ledger_t ledger = options.ledger();
+    suite_totals_t totals = options.totals();
 
     st::expected<test_directory_t> const directory = test_directory_t::make(options.directory);
     if (!directory) {
         fmt::println(stderr, "  the working directory would not open");
         return 1;
     }
-    medium_t const medium = medium_t::of(options, *directory);
+    test_environment_t const environment = test_environment_t::of(options, *directory);
 
     auto const cases = [&](auto const& mount) {
-        report(ledger, mount.label("every_layout").c_str(), every_layout_round_trips(mount));
-        report(ledger, mount.label("reopen_agrees").c_str(), reopen_agrees_on_its_schema(mount));
-        report(ledger, mount.label("every_layout_survives_reopen").c_str(), every_layout_survives_reopen(mount));
-        report(ledger, mount.label("crash_before_schema").c_str(), crash_between_seal_and_schema(mount));
-        report(ledger, mount.label("commit_all_or_nothing").c_str(), commit_lands_all_or_nothing(mount));
-        report(ledger, mount.label("conflict_keeps_changes").c_str(), conflict_keeps_its_changes(mount));
-        report(ledger, mount.label("rollback_and_renew").c_str(), rollback_and_renew_behave(mount));
-        report(ledger, mount.label("serializes_under_threads").c_str(), transactions_serialize_under_threads(mount));
-        report(ledger, mount.label("snapshot_holds_its_moment").c_str(), snapshot_sees_its_moment(mount));
-        report(ledger, mount.label("scan_in_order").c_str(), scan_visits_every_key_in_order(mount));
+        report(totals, mount.label("every_layout").c_str(), every_layout_round_trips(mount));
+        report(totals, mount.label("reopen_agrees").c_str(), reopen_agrees_on_its_schema(mount));
+        report(totals, mount.label("every_layout_survives_reopen").c_str(), every_layout_survives_reopen(mount));
+        report(totals, mount.label("crash_before_schema").c_str(), crash_between_seal_and_schema(mount));
+        report(totals, mount.label("commit_all_or_nothing").c_str(), commit_lands_all_or_nothing(mount));
+        report(totals, mount.label("conflict_keeps_changes").c_str(), conflict_keeps_its_changes(mount));
+        report(totals, mount.label("rollback_and_renew").c_str(), rollback_and_renew_behave(mount));
+        report(totals, mount.label("serializes_under_threads").c_str(), transactions_serialize_under_threads(mount));
+        report(totals, mount.label("snapshot_holds_its_moment").c_str(), snapshot_sees_its_moment(mount));
+        report(totals, mount.label("scan_in_order").c_str(), scan_visits_every_key_in_order(mount));
     };
     for (transport_t const transport : every_transport_k)
-        on_transport(ledger, transport, medium, scdb_shape_k, 1, "scdb", cases);
+        run_on_transport(totals, transport, environment, scdb_config_k, 1, "scdb", cases);
 
-    return conclude(ledger);
+    return suite_exit_code(totals);
 }

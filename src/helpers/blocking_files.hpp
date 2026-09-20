@@ -66,17 +66,17 @@ class seekable_file_t {
 #if defined(_WIN32)
 
     /** What the platform calls an open file. */
-    using descriptor_t = HANDLE;
+    using registered_medium_t = HANDLE;
 
     /** The value a closed file carries. */
-    inline static descriptor_t const closed_k = INVALID_HANDLE_VALUE;
+    inline static registered_medium_t const closed_k = INVALID_HANDLE_VALUE;
 #else
 
     /** What the platform calls an open file. */
-    using descriptor_t = int;
+    using registered_medium_t = int;
 
     /** The value a closed file carries. */
-    inline static constexpr descriptor_t closed_k = -1;
+    inline static constexpr registered_medium_t closed_k = -1;
 #endif
 
     seekable_file_t() = default;
@@ -110,7 +110,7 @@ class seekable_file_t {
   private:
 
     /** The wrapped descriptor, or @c closed_k after a move or a close. */
-    descriptor_t descriptor_ = closed_k;
+    registered_medium_t descriptor_ = closed_k;
 };
 
 #if defined(_WIN32)
@@ -124,7 +124,7 @@ inline expected<seekable_file_t> seekable_file_t::open(char const* path, file_mo
                                                                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr)
                                                    : ::CreateFileW(wide.get(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
                                                                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (!file) return status_t {status_code_t::io_k, "Failed to open the file"};
+    if (!file) return status_t {status_code_t::input_output_k, "Failed to open the file"};
     return file;
 }
 
@@ -136,7 +136,7 @@ inline status_t seekable_file_t::write(std::size_t offset, std::span<byte_t cons
         DWORD const asked = static_cast<DWORD>(source.size() < 0x7FFFFFFFu ? source.size() : 0x7FFFFFFFu);
         DWORD written = 0;
         if (!::WriteFile(descriptor_, source.data(), asked, &written, &overlapped) || !written)
-            return {status_code_t::io_k, "Failed to write the file"};
+            return {status_code_t::input_output_k, "Failed to write the file"};
         source = source.subspan(written);
         offset += written;
     }
@@ -151,7 +151,7 @@ inline status_t seekable_file_t::read(std::size_t offset, std::span<byte_t> dest
         DWORD const asked = static_cast<DWORD>(destination.size() < 0x7FFFFFFFu ? destination.size() : 0x7FFFFFFFu);
         DWORD received = 0;
         if (!::ReadFile(descriptor_, destination.data(), asked, &received, &overlapped) || !received)
-            return {status_code_t::io_k, "Failed to read the file"};
+            return {status_code_t::input_output_k, "Failed to read the file"};
         destination = destination.subspan(received);
         offset += received;
     }
@@ -160,13 +160,15 @@ inline status_t seekable_file_t::read(std::size_t offset, std::span<byte_t> dest
 
 inline expected<std::size_t> seekable_file_t::length() const noexcept {
     LARGE_INTEGER size;
-    if (!::GetFileSizeEx(descriptor_, &size)) return status_t {status_code_t::io_k, "Failed to measure the file"};
+    if (!::GetFileSizeEx(descriptor_, &size))
+        return status_t {status_code_t::input_output_k, "Failed to measure the file"};
     return static_cast<std::size_t>(size.QuadPart);
 }
 
 inline status_t seekable_file_t::close() noexcept {
     if (descriptor_ == closed_k) return {};
-    if (!::CloseHandle(std::exchange(descriptor_, closed_k))) return {status_code_t::io_k, "Failed to close the file"};
+    if (!::CloseHandle(std::exchange(descriptor_, closed_k)))
+        return {status_code_t::input_output_k, "Failed to close the file"};
     return {};
 }
 
@@ -176,7 +178,7 @@ inline expected<seekable_file_t> seekable_file_t::open(char const* path, file_mo
     int const flags = mode == file_mode_t::read_k ? O_RDONLY : (O_RDWR | O_CREAT | O_TRUNC);
     seekable_file_t file;
     file.descriptor_ = ::open(path, flags | O_CLOEXEC, 0644);
-    if (!file) return status_t {status_code_t::io_k, "Failed to open the file"};
+    if (!file) return status_t {status_code_t::input_output_k, "Failed to open the file"};
     return file;
 }
 
@@ -184,7 +186,7 @@ inline status_t seekable_file_t::write(std::size_t offset, std::span<byte_t cons
     while (!source.empty()) {
         ssize_t const written = ::pwrite(descriptor_, source.data(), source.size(), static_cast<off_t>(offset));
         if (written < 0 && errno == EINTR) continue;
-        if (written <= 0) return {status_code_t::io_k, "Failed to write the file"};
+        if (written <= 0) return {status_code_t::input_output_k, "Failed to write the file"};
         source = source.subspan(static_cast<std::size_t>(written));
         offset += static_cast<std::size_t>(written);
     }
@@ -196,7 +198,7 @@ inline status_t seekable_file_t::read(std::size_t offset, std::span<byte_t> dest
         ssize_t const received = ::pread(descriptor_, destination.data(), destination.size(),
                                          static_cast<off_t>(offset));
         if (received < 0 && errno == EINTR) continue;
-        if (received <= 0) return {status_code_t::io_k, "Failed to read the file"};
+        if (received <= 0) return {status_code_t::input_output_k, "Failed to read the file"};
         destination = destination.subspan(static_cast<std::size_t>(received));
         offset += static_cast<std::size_t>(received);
     }
@@ -205,13 +207,15 @@ inline status_t seekable_file_t::read(std::size_t offset, std::span<byte_t> dest
 
 inline expected<std::size_t> seekable_file_t::length() const noexcept {
     struct stat description;
-    if (::fstat(descriptor_, &description) != 0) return status_t {status_code_t::io_k, "Failed to measure the file"};
+    if (::fstat(descriptor_, &description) != 0)
+        return status_t {status_code_t::input_output_k, "Failed to measure the file"};
     return static_cast<std::size_t>(description.st_size);
 }
 
 inline status_t seekable_file_t::close() noexcept {
     if (descriptor_ == closed_k) return {};
-    if (::close(std::exchange(descriptor_, closed_k)) != 0) return {status_code_t::io_k, "Failed to close the file"};
+    if (::close(std::exchange(descriptor_, closed_k)) != 0)
+        return {status_code_t::input_output_k, "Failed to close the file"};
     return {};
 }
 
@@ -232,7 +236,7 @@ inline expected<bool> directory_exists(char const* path) noexcept {
     if (attributes != INVALID_FILE_ATTRIBUTES) return (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
     DWORD const failure = ::GetLastError();
     if (failure == ERROR_FILE_NOT_FOUND || failure == ERROR_PATH_NOT_FOUND) return false;
-    return status_t {status_code_t::io_k, "Failed to inspect the path"};
+    return status_t {status_code_t::input_output_k, "Failed to inspect the path"};
 }
 
 /** Calls @p callback with the UTF-8 name of every entry of the null-terminated @p directory but "." and "..". */
@@ -250,7 +254,7 @@ status_t for_each_directory_entry(char const* directory, callback_type_&& callba
 
     WIN32_FIND_DATAW entry;
     HANDLE const search = ::FindFirstFileW(pattern.get(), &entry);
-    if (search == INVALID_HANDLE_VALUE) return {status_code_t::io_k, "Failed to list the directory"};
+    if (search == INVALID_HANDLE_VALUE) return {status_code_t::input_output_k, "Failed to list the directory"};
 
     char name[MAX_PATH * 4];
     status_t error;
@@ -264,7 +268,7 @@ status_t for_each_directory_entry(char const* directory, callback_type_&& callba
         if (view != "." && view != "..") callback(view);
     } while (::FindNextFileW(search, &entry));
     if (error.succeeded() && ::GetLastError() != ERROR_NO_MORE_FILES)
-        error = {status_code_t::io_k, "Failed to list the directory"};
+        error = {status_code_t::input_output_k, "Failed to list the directory"};
     ::FindClose(search);
     return error;
 }
@@ -276,7 +280,7 @@ inline expected<bool> directory_exists(char const* path) noexcept {
     struct stat information;
     if (::stat(path, &information) == 0) return S_ISDIR(information.st_mode) != 0;
     if (errno == ENOENT || errno == ENOTDIR) return false;
-    return status_t {status_code_t::io_k, "Failed to inspect the path"};
+    return status_t {status_code_t::input_output_k, "Failed to inspect the path"};
 }
 
 /** Calls @p callback with the name of every entry of the null-terminated @p directory but "." and "..". */
@@ -284,7 +288,7 @@ template <typename callback_type_>
     requires std::invocable<callback_type_&, std::string_view>
 status_t for_each_directory_entry(char const* directory, callback_type_&& callback) noexcept {
     DIR* const listing = ::opendir(directory);
-    if (!listing) return {status_code_t::io_k, "Failed to list the directory"};
+    if (!listing) return {status_code_t::input_output_k, "Failed to list the directory"};
     errno = 0;
     while (dirent const* const entry = ::readdir(listing)) {
         std::string_view const name {entry->d_name};
@@ -293,7 +297,7 @@ status_t for_each_directory_entry(char const* directory, callback_type_&& callba
     }
     bool const listed = errno == 0;
     ::closedir(listing);
-    if (!listed) return {status_code_t::io_k, "Failed to list the directory"};
+    if (!listed) return {status_code_t::input_output_k, "Failed to list the directory"};
     return {};
 }
 

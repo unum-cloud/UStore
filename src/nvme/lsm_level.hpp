@@ -27,7 +27,7 @@
 
 #include <ustore/status.hpp> // `status_t`, `status_code_t`
 
-#include "nvme/io_lane.hpp"        // `io_lane_t`
+#include "nvme/io_channel.hpp"     // `io_channel_t`
 #include "nvme/lsm_sorted_run.hpp" // `lsm_sorted_run`, `find_result_t`, `value_window_t`
 #include "nvme/types.hpp"          // `value_layout_t`, `is_inline`, `limit`
 
@@ -138,7 +138,7 @@ class lsm_level {
     }
 
     /** Takes @p run into the level, at the back for an overlapping level and in key order for a sorted one. */
-    status_t adopt(sorted_run_t&& run) noexcept {
+    status_t bind_queue_pair(sorted_run_t&& run) noexcept {
         if (runs_.reserve(runs_.size() + 1) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A level could not hold another run"};
         std::size_t position = runs_.size();
@@ -188,10 +188,10 @@ class lsm_level {
     }
 
     /** Returns every run's bytes to @p volume and then frees them, which destroys the level's data. */
-    status_t drop(volume_t& volume, io_lane_t& lane) noexcept {
+    status_t drop(volume_t& volume, io_channel_t& channel) noexcept {
         status_t first;
         for (std::size_t index = 0; index != runs_.size(); ++index)
-            if (status_t const dropped = sorted_run_t::drop(volume, lane, runs_[index]->content_id());
+            if (status_t const dropped = sorted_run_t::drop(volume, channel, runs_[index]->content_id());
                 dropped.failed() && first.succeeded())
                 first = dropped;
         discard();

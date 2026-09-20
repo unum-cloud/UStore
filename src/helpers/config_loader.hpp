@@ -64,7 +64,7 @@ inline status_t parse_json(std::string_view text, json_document_t& document) noe
 /** Parses the JSON file at the null-terminated @p path into @p document. */
 inline status_t load_json_file(char const* path, json_document_t& document) noexcept {
     yyjson_doc* const parsed = yyjson_read_file(path, YYJSON_READ_ALLOW_COMMENTS, nullptr, nullptr);
-    if (!parsed) return {status_code_t::io_k, "Config file not found or invalid"};
+    if (!parsed) return {status_code_t::input_output_k, "Config file not found or invalid"};
     document = json_document_t(parsed);
     return {};
 }

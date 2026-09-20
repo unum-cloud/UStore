@@ -27,7 +27,7 @@
 #include <ustore/types.hpp>  // `byte_t`
 
 #include "nvme/collection_snapshot.hpp" // `collection_snapshot`, `select_result_t`
-#include "nvme/io_lane.hpp"             // `io_lane_t`
+#include "nvme/io_channel.hpp"          // `io_channel_t`
 #include "nvme/key_slot.hpp"            // `key_slot`
 #include "nvme/stored_value.hpp"        // `stored_value_size_t`
 #include "nvme/types.hpp"               // `collection_numeric_id_t`, `value_layout_t`, `string_t`
@@ -159,18 +159,18 @@ class database_snapshot {
 
     /**
      *  @brief Copies the value @p id held for @p stored_key into @p into, which needs only the value's bytes.
-     *  @param[inout] lane The lane the read is submitted and reaped on, held by the calling thread.
+     *  @param[inout] channel The channel the read is submitted and completed on, held by the calling thread.
      *  @param[in] id The collection to read from, named by its number or by its name.
      *  @param[in] stored_key The key to read.
      *  @param[out] into Where the value lands, which need not be aligned and need not be registered.
      *  @param[out] size Bytes written, which is zero for every failure.
      */
-    status_t select(io_lane_t& lane, any_collection_id_t const& id, stored_key_t stored_key, std::span<byte_t> into,
-                    stored_value_size_t& size) const noexcept {
+    status_t select(io_channel_t& channel, any_collection_id_t const& id, stored_key_t stored_key,
+                    std::span<byte_t> into, stored_value_size_t& size) const noexcept {
         size = 0;
         held_collection_t const* const found = held_at_(id);
         if (!found) return {status_code_t::not_found_k, "This snapshot holds no collection of that name"};
-        return std::visit([&](auto const& levels) noexcept { return levels.select(lane, stored_key, into, size); },
+        return std::visit([&](auto const& levels) noexcept { return levels.select(channel, stored_key, into, size); },
                           found->levels);
     }
 

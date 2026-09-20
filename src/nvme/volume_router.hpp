@@ -8,7 +8,7 @@
  *  volume is a placement decision and nothing else: it holds the mounted volumes, answers which of
  *  them a blob of a given length should go to, and stamps every handle it hands back with the volume
  *  that owns the bytes. Resolution stays a one-off - a name is turned into a @c blob_t once, and
- *  every block read afterwards carries the target it found, so nothing here sits on the read path.
+ *  every block read afterwards carries the medium it found, so nothing here sits on the read path.
  *
  *  The router keeps no lock and no claim. One volume's catalog and free map are mutated by one
  *  thread at a time exactly as they were before it, and a router that spun on a word would promise a
@@ -28,9 +28,9 @@
 
 #include <ustore/status.hpp> // `status_t`, `status_code_t`, `expected`
 
-#include "nvme/catalog.hpp" // `blob_kind_t`, `blob_name_t`
-#include "nvme/io_lane.hpp" // `io_lane_t`
-#include "nvme/volume.hpp"  // `blob_t`, `volume_id_t`
+#include "nvme/catalog.hpp"    // `blob_kind_t`, `blob_name_t`
+#include "nvme/io_channel.hpp" // `io_channel_t`
+#include "nvme/volume.hpp"     // `blob_t`, `volume_id_t`
 
 namespace unum::ustore::nvme {
 
@@ -38,11 +38,11 @@ namespace unum::ustore::nvme {
 
 /** What a router asks of a volume: the names it resolves, and the free space it reports. */
 template <typename volume_type_>
-concept extent_volume_concept = requires(volume_type_& volume, volume_type_ const& constant, io_lane_t& lane,
+concept extent_volume_concept = requires(volume_type_& volume, volume_type_ const& constant, io_channel_t& channel,
                                          blob_name_t name, blob_kind_t kind, std::uint64_t length) {
     { volume.create(name, kind, length) } -> std::same_as<expected<blob_t>>;
     { constant.find(name) } -> std::same_as<expected<blob_t>>;
-    { volume.drop(lane, name) } -> std::same_as<status_t>;
+    { volume.drop(channel, name) } -> std::same_as<status_t>;
     { constant.names(name) } -> std::same_as<bool>;
     { constant.free_bytes() } -> std::same_as<std::uint64_t>;
     { constant.largest_free_bytes() } -> std::same_as<std::uint64_t>;
@@ -92,7 +92,7 @@ class basic_volume_router {
      *  @brief Takes @p volume in under the next identifier, which every blob placed on it carries.
      *  @param[in] volume The mounted volume, moved in and owned by the router from here on.
      */
-    status_t adopt(volume_type_&& volume) noexcept {
+    status_t bind_queue_pair(volume_type_&& volume) noexcept {
         // Refused rather than grown, since growing would move volumes their trees still point at.
         if (volumes_.size() >= limit_)
             return {status_code_t::capacity_exhausted_k, "The router reserved room for fewer volumes than that"};
@@ -154,9 +154,9 @@ class basic_volume_router {
     }
 
     /** Forgets @p name on the one volume that holds it, which is the only one the drop reaches. */
-    status_t drop(io_lane_t& lane, blob_name_t name) noexcept {
+    status_t drop(io_channel_t& channel, blob_name_t name) noexcept {
         for (std::size_t index = 0; index != volumes_.size(); ++index)
-            if (volumes_[index].names(name)) return volumes_[index].drop(lane, name);
+            if (volumes_[index].names(name)) return volumes_[index].drop(channel, name);
         return {status_code_t::not_found_k, "No volume of this router holds that blob"};
     }
 

@@ -21,7 +21,7 @@
 #include <ustore/types.hpp>  // `byte_t`
 
 #include "nvme/collection_snapshot.hpp" // `collection_snapshot`, `select_result_t`
-#include "nvme/io_lane.hpp"             // `io_lane_t`
+#include "nvme/io_channel.hpp"          // `io_channel_t`
 #include "nvme/read_set.hpp"            // `transaction_stamp_t`, `unwritten_stamp_k`
 #include "nvme/stored_value.hpp"        // `stored_value_size_t`
 
@@ -106,27 +106,27 @@ class single_collection_database_snapshot {
 
     /**
      *  @brief Copies the value of @p stored_key into @p into, which needs only the value's own bytes.
-     *  @param[inout] lane The lane the read is submitted and reaped on, held by the calling thread.
+     *  @param[inout] channel The channel the read is submitted and completed on, held by the calling thread.
      *  @param[in] stored_key The key to read.
      *  @param[out] into Where the value lands, which need not be aligned and need not be registered.
      *  @param[out] size Bytes written, which is zero for every failure.
      */
-    status_t select(io_lane_t& lane, stored_key_t stored_key, std::span<byte_t> into,
+    status_t select(io_channel_t& channel, stored_key_t stored_key, std::span<byte_t> into,
                     stored_value_size_t& size) const noexcept {
-        return levels_.select(lane, stored_key, into, size);
+        return levels_.select(channel, stored_key, into, size);
     }
 
     /**
-     *  @brief Reads the values of @p stored_keys, refilling the lane as completions retire.
-     *  @param[inout] lane The lane the reads are submitted and reaped on, held by the calling thread.
+     *  @brief Reads the values of @p stored_keys, refilling the channel as completions retire.
+     *  @param[inout] channel The channel the reads are submitted and completed on, held by the calling thread.
      *  @param[in] stored_keys The keys to read, in any order and with any number of misses among them.
      *  @param[out] results What every key answered, which separates a miss from an erasure.
      *  @param[in] sink Called as @c sink(request, offset, bytes) for every key that locates a value.
      */
     template <typename sink_type_>
-    status_t select(io_lane_t& lane, std::span<stored_key_t const> stored_keys, std::span<select_result_t> results,
-                    sink_type_&& sink) const noexcept {
-        return levels_.select(lane, stored_keys, results, std::forward<sink_type_>(sink));
+    status_t select(io_channel_t& channel, std::span<stored_key_t const> stored_keys,
+                    std::span<select_result_t> results, sink_type_&& sink) const noexcept {
+        return levels_.select(channel, stored_keys, results, std::forward<sink_type_>(sink));
     }
 
 #pragma endregion Lookups

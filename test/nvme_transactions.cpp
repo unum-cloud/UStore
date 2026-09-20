@@ -4,7 +4,7 @@
  *  @date September 19, 2026
  *  @brief What the optimistic transaction layer promises: the conflicts it catches and the ones it invents.
  *
- *  The verdicts this file exists for are @c serializable_under_threads and @c write_write_one_winner. A
+ *  The results this file exists for are @c serializable_under_threads and @c write_write_one_winner. A
  *  conflict record that misses a write turns two concurrent transactions into a lost update, which no
  *  single-threaded case can show, so the money-moving case drives real threads at overlapping keys and
  *  checks the one quantity a half-applied or lost commit cannot preserve - the total.
@@ -31,7 +31,7 @@
 #include "nvme/database_transaction_registry.hpp" // `database_transaction_registry`
 #include "nvme/read_set.hpp"                      // `commit_record_t`, `transaction_roster_t`
 
-#include "test.hpp" // `conclude`, `expect`, `expect_eq`
+#include "test.hpp" // `suite_exit_code`, `expect`, `expect_eq`
 
 namespace unum::ustore::nvme {
 
@@ -90,7 +90,7 @@ enum class store_behaviour_t {
 /**
  *  @brief The narrowest store a registry can commit into: one collection of words, held in memory.
  *
- *  Balances move through atomic references because a transaction reads them outside the staging lease
+ *  Balances move through atomic references because a transaction reads them outside the staging queue pair
  *  and writes them inside it, which is where the real collection layer keeps its own synchronization.
  */
 class test_store_t {
@@ -187,10 +187,10 @@ class test_store_t {
         return fu::preferred_atomic_ref<std::uint64_t const> {balances_[stored_key]};
     }
 
-    /** One word per account, read outside the staging lease and written inside it. */
+    /** One word per account, read outside the staging queue pair and written inside it. */
     std::uint64_t balances_[accounts_k] {};
 
-    /** The write paths taken and not yet handed back, which the lease keeps at one. */
+    /** The write paths taken and not yet handed back, which the queue pair keeps at one. */
     std::size_t write_path_depth_ = 0;
 
     /** Raised while a write waits for the suite. */
@@ -718,7 +718,7 @@ static std::size_t failed_commit_keeps_changes() {
 }
 
 /** A stage that cannot make room reports the refusal and hands the write path back. */
-static std::size_t refused_flush_releases_the_lease() {
+static std::size_t refused_flush_releases_the_channel() {
     std::size_t failures = 0;
     fixture_t fixture;
     fixture.store.behaviour = store_behaviour_t::always_flushing_k;
@@ -732,7 +732,7 @@ static std::size_t refused_flush_releases_the_lease() {
     failures += expect_eq(fixture.store.flushes, std::size_t {1});
     failures += expect(transaction->get()->commit().succeeded());
 
-    // The lease was handed back, so the next transaction can still take it.
+    // The queue pair was handed back, so the next transaction can still take it.
     auto second = fixture.open(2);
     failures += expect(second.has_value());
     if (second.has_value()) {
@@ -846,8 +846,8 @@ static std::size_t commit_record_is_bounded() {
  *  @brief Threads moving money between overlapping accounts, checked against the one total.
  *
  *  A lost update leaves the total short or long, and a half-applied commit leaves it short by the
- *  half that landed, so the sum is the whole verdict. Every transaction reads two balances outside
- *  the staging lease and writes both inside it, which is the shape a conflict record has to survive.
+ *  half that landed, so the sum is the whole result. Every transaction reads two balances outside
+ *  the staging queue pair and writes both inside it, which is the shape a conflict record has to survive.
  */
 static std::size_t serializable_under_threads() {
     std::size_t failures = 0;
@@ -1009,24 +1009,24 @@ int main(int argc, char const* argv[]) {
     if (argument_status_t const status = parse_suite_options(argc, argv, options);
         status != argument_status_t::parsed_k)
         return status == argument_status_t::help_k ? 0 : 1;
-    ledger_t ledger = options.ledger();
+    suite_totals_t totals = options.totals();
 
-    report(ledger, "stamps.distinct", commit_stamps_are_distinct());
-    report(ledger, "record.orders_writes", record_orders_writes_against_watches());
-    report(ledger, "roster.one_claimant", roster_admits_one_claimant_per_identifier());
-    report(ledger, "conflict.read_write", read_write_conflict_is_caught());
-    report(ledger, "conflict.untouched_commits", untouched_key_commits());
-    report(ledger, "conflict.write_write_one_winner", write_write_one_winner());
-    report(ledger, "conflict.watch_schedules", watch_schedules_behave());
-    report(ledger, "lifecycle.failed_commit_keeps", failed_commit_keeps_changes());
-    report(ledger, "lifecycle.flush_releases_lease", refused_flush_releases_the_lease());
-    report(ledger, "lifecycle.rollback_and_renew", rollback_and_renew_leave_no_trace());
-    report(ledger, "lifecycle.duplicate_id", duplicate_identifier_is_refused());
-    report(ledger, "lifecycle.roster_refuses", roster_refuses_past_its_slots());
-    report(ledger, "lifecycle.record_bounded", commit_record_is_bounded());
-    report(ledger, "threads.serializable", serializable_under_threads());
-    report(ledger, "threads.start_during_apply", start_during_apply_still_conflicts());
-    report(ledger, "threads.roster_churn", roster_survives_churn());
+    report(totals, "stamps.distinct", commit_stamps_are_distinct());
+    report(totals, "record.orders_writes", record_orders_writes_against_watches());
+    report(totals, "roster.one_claimant", roster_admits_one_claimant_per_identifier());
+    report(totals, "conflict.read_write", read_write_conflict_is_caught());
+    report(totals, "conflict.untouched_commits", untouched_key_commits());
+    report(totals, "conflict.write_write_one_winner", write_write_one_winner());
+    report(totals, "conflict.watch_schedules", watch_schedules_behave());
+    report(totals, "lifecycle.failed_commit_keeps", failed_commit_keeps_changes());
+    report(totals, "lifecycle.flush_releases_channel", refused_flush_releases_the_channel());
+    report(totals, "lifecycle.rollback_and_renew", rollback_and_renew_leave_no_trace());
+    report(totals, "lifecycle.duplicate_id", duplicate_identifier_is_refused());
+    report(totals, "lifecycle.roster_refuses", roster_refuses_past_its_slots());
+    report(totals, "lifecycle.record_bounded", commit_record_is_bounded());
+    report(totals, "threads.serializable", serializable_under_threads());
+    report(totals, "threads.start_during_apply", start_during_apply_still_conflicts());
+    report(totals, "threads.roster_churn", roster_survives_churn());
 
-    return conclude(ledger);
+    return suite_exit_code(totals);
 }

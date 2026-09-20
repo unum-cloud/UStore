@@ -128,7 +128,7 @@ struct input_edge_t {
  */
 status_t read_edge_list(char const* path, std::size_t max_edges, st::basic_vector<input_edge_t>& edges) noexcept {
     int const descriptor = open(path, O_RDONLY);
-    if (descriptor == -1) return {status_code_t::io_k, "Failed to open the edge list"};
+    if (descriptor == -1) return {status_code_t::input_output_k, "Failed to open the edge list"};
 
     struct stat metadata {};
     sz::string text;
@@ -140,7 +140,7 @@ status_t read_edge_list(char const* path, std::size_t max_edges, st::basic_vecto
         filled += loaded ? static_cast<std::size_t>(got) : 0;
     }
     [[maybe_unused]] int const closed = close(descriptor);
-    if (!loaded && text.size() != 0) return {status_code_t::io_k, "Failed to read the edge list"};
+    if (!loaded && text.size() != 0) return {status_code_t::input_output_k, "Failed to read the edge list"};
 
     for (sz::string_view line : sz::split(text.view(), "\n")) {
         if (edges.size() == max_edges) break;

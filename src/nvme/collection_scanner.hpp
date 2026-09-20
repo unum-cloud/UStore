@@ -11,7 +11,7 @@
  *
  *  There is no prefetcher here, and adding one would be a mistake rather than an optimization. A scan
  *  that wants bytes hands the next keys to @c collection::select, which already refills the ring as
- *  completions retire; a second pipeline reading ahead on the same lane would reap the first one's
+ *  completions retire; a second pipeline reading ahead on the same channel would poll the first one's
  *  completions and drop them, since a read pipeline silently discards tags it did not mint.
  */
 

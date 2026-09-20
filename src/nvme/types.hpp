@@ -272,7 +272,7 @@ constexpr status_t to_status(st::status_t failure) noexcept {
     case st::status_t::operation_would_block_k: return {status_code_t::internal_k, "A bounded retry gave up"};
     case st::status_t::invalid_argument_k: return {status_code_t::invalid_argument_k, "Invalid argument"};
     case st::status_t::capacity_exhausted_k: return {status_code_t::capacity_exhausted_k, "Capacity exhausted"};
-    case st::status_t::input_output_k: return {status_code_t::io_k, "Input or output failed"};
+    case st::status_t::input_output_k: return {status_code_t::input_output_k, "Input or output failed"};
     case st::status_t::key_already_exists_k: return {status_code_t::already_exists_k, "Key already exists"};
     case st::status_t::key_not_found_k: return {status_code_t::not_found_k, "Key not found"};
     case st::status_t::write_conflict_k: return {status_code_t::write_conflict_k, "Write conflict"};

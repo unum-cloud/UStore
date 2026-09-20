@@ -29,7 +29,7 @@
 #include <ustore/status.hpp> // `status_t`, `status_code_t`
 #include <ustore/types.hpp>  // `byte_t`
 
-#include "nvme/io_lane.hpp"      // `io_lane_t`
+#include "nvme/io_channel.hpp"   // `io_channel_t`
 #include "nvme/lsm_tree.hpp"     // `lsm_tree`, `lsm_tree_position_t`
 #include "nvme/stored_value.hpp" // `stored_value_size_t`
 #include "nvme/types.hpp"        // `value_layout_t`, `is_inline`
@@ -155,13 +155,13 @@ class collection_snapshot {
 
     /**
      *  @brief Copies the value of @p stored_key into @p into, which needs only the value's own bytes.
-     *  @param[inout] lane The lane the read is submitted and reaped on, held by the calling thread.
+     *  @param[inout] channel The channel the read is submitted and completed on, held by the calling thread.
      *  @param[in] stored_key The key to read.
      *  @param[out] into Where the value lands, which need not be aligned and need not be registered.
      *  @param[out] size Bytes written, which is zero for every failure.
-     *  @return @c not_found_k for a miss or an erasure, @c io_k for a run shorter than its index claims.
+     *  @return @c not_found_k for a miss or an erasure, @c input_output_k for a run shorter than its index claims.
      */
-    status_t select(io_lane_t& lane, stored_key_t stored_key, std::span<byte_t> into,
+    status_t select(io_channel_t& channel, stored_key_t stored_key, std::span<byte_t> into,
                     stored_value_size_t& size) const noexcept {
         size = 0;
         stored_value_size_t wanted = 0;
@@ -176,20 +176,20 @@ class collection_snapshot {
         };
         std::array<stored_key_t, 1> const keys {stored_key};
         std::array<find_result_t, 1> answers {find_result_t::nothing_k};
-        if (status_t const read = tree_->read_values(lane, levels_, std::span<stored_key_t const> {keys},
+        if (status_t const read = tree_->read_values(channel, levels_, std::span<stored_key_t const> {keys},
                                                      std::span<find_result_t> {answers}, sink);
             read.failed())
             return read;
 
         // One key has no rest of a batch to keep, so a block short of its last one fails the whole call.
-        if (delivered != wanted) return {status_code_t::io_k, "A run is shorter than its index claims"};
+        if (delivered != wanted) return {status_code_t::input_output_k, "A run is shorter than its index claims"};
         size = wanted;
         return {};
     }
 
     /**
-     *  @brief Reads the values of @p stored_keys, refilling the lane as completions retire.
-     *  @param[inout] lane The lane the reads are submitted and reaped on, held by the calling thread.
+     *  @brief Reads the values of @p stored_keys, refilling the channel as completions retire.
+     *  @param[inout] channel The channel the reads are submitted and completed on, held by the calling thread.
      *  @param[in] stored_keys The keys to read, in any order and with any number of misses among them.
      *  @param[out] results What every key answered, which separates a miss from an erasure.
      *  @param[in] sink Called as @c sink(request, offset, bytes) for every key that locates a value.
@@ -199,8 +199,8 @@ class collection_snapshot {
      *      value before it, and a key whose value is present and empty is reported once with no bytes.
      */
     template <typename sink_type_>
-    status_t select(io_lane_t& lane, std::span<stored_key_t const> stored_keys, std::span<select_result_t> results,
-                    sink_type_&& sink) const noexcept {
+    status_t select(io_channel_t& channel, std::span<stored_key_t const> stored_keys,
+                    std::span<select_result_t> results, sink_type_&& sink) const noexcept {
         if (results.size() != stored_keys.size())
             return {status_code_t::invalid_argument_k, "A batched select answers one result per key"};
 
@@ -220,7 +220,8 @@ class collection_snapshot {
             delivered[request] += bytes.size();
             sink(request, offset, bytes);
         };
-        status_t const read = tree_->read_values(lane, levels_, stored_keys, std::span<find_result_t> {answers}, relay);
+        status_t const read = tree_->read_values(channel, levels_, stored_keys, std::span<find_result_t> {answers},
+                                                 relay);
 
         std::size_t truncated = 0;
         for (std::size_t request = 0; request != stored_keys.size(); ++request) {
@@ -242,7 +243,7 @@ class collection_snapshot {
         }
 
         // A block short of what it asked for fails its own key; a cancelled or refused one fails the batch.
-        if (read.failed() && (truncated == 0 || !(read == status_code_t::io_k))) return read;
+        if (read.failed() && (truncated == 0 || !(read == status_code_t::input_output_k))) return read;
         return {};
     }
 

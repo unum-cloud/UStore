@@ -26,7 +26,7 @@ enum class status_code_t : int {
     invalid_argument_k = ustore_error_invalid_argument_k,
     uninitialized_k = ustore_error_uninitialized_k,
     unsupported_k = ustore_error_unsupported_k,
-    io_k = ustore_error_io_k,
+    input_output_k = ustore_error_io_k,
     malformed_k = ustore_error_malformed_k,
     not_found_k = ustore_error_not_found_k,
     already_exists_k = ustore_error_already_exists_k,

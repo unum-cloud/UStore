@@ -18,7 +18,7 @@
 
 #include <forkunion/atomics.hpp> // `fu::preferred_atomic_ref`
 
-#include "executor.hpp" // `executor_t`, `caller_role_t`, `task_callback`, `thread_callback`
+#include "executor.hpp" // `executor_t`, `caller_exclusivity_t`, `task_callback`, `thread_callback`
 
 #include "nvme/config.hpp"     // `resources_config_t`
 #include "nvme/filesystem.hpp" // `mounted_storage_t`, `create_directories`
@@ -182,7 +182,7 @@ class background_executor_t {
             if (observed == spawned_k) return {};
             observed = dormant_k;
         }
-        st::expected<executor_t> executor = executor_t::make(threads_, caller_role_t::coordinator_k);
+        st::expected<executor_t> executor = executor_t::make(threads_, caller_exclusivity_t::caller_exclusive_k);
         if (!executor) {
             state.store(dormant_k, std::memory_order_release);
             return to_status(executor.status());
@@ -245,7 +245,7 @@ struct resources_t {
     /** Threads and the job gate every flush, compaction and backup passes. */
     background_executor_shared_ptr_t executor;
 
-    /** The transport, the pinned slab, the lanes and the volumes mounted over the data directories. */
+    /** The transport, the pinned arena, the channels and the volumes mounted over the data directories. */
     mounted_storage_t storage;
 
     /** Sets the memory budgets, leaving the services for the caller to attach. */

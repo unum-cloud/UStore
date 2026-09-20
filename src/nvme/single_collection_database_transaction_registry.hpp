@@ -6,7 +6,7 @@
  *
  *  The same machinery its multi-collection twin uses, over one collection instead of many: no locks,
  *  a stamp counter for the order, one @c fetch_max per committed key for the record, and the staging
- *  lease as the layer's single exclusion.
+ *  queue pair as the layer's single exclusion.
  */
 #pragma once
 
@@ -184,7 +184,7 @@ class single_collection_database_transaction_registry {
     /** The order every transaction is placed in, and the last commit to write each key. */
     commit_record_t record_;
 
-    /** The live transactions and the staging lease. */
+    /** The live transactions and the staging queue pair. */
     transaction_roster_t roster_;
 
 #pragma endregion Private Members

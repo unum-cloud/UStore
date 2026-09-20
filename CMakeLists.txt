@@ -261,7 +261,7 @@ if (${USTORE_BUILD_TEST_CPP})
     # The storage ring stands outside the per-engine loop: it links no engine, only the siblings it is written against.
     set(USTORE_STORAGE_TEST_NAMES
         "ring"
-        "lanes"
+        "channels"
         "catalog"
         "volume"
         "sorted_run"

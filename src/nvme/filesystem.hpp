@@ -10,9 +10,9 @@
  *  seccomp profile and under @c io_uring_disabled; what the probe settled on is reported back in
  *  @c mount_report_t rather than inferred by a caller.
  *
- *  Teardown is an order, not a destructor: a lease may not be released with work outstanding, a
- *  pinned range may not be unpinned while a request addresses it, and a target may not be
- *  deregistered while one names it. So the lanes drain first, the slab is unpinned next, the targets
+ *  Teardown is an order, not a destructor: a queue pair may not be released with work outstanding, a
+ *  pinned range may not be unpinned while a request addresses it, and a medium may not be
+ *  deregistered while one names it. So the channels drain first, the arena is unpinned next, the targets
  *  go back after that, and the volumes are dropped last.
  */
 
@@ -38,12 +38,12 @@
 #include <ustore/status.hpp> // `status_t`, `status_code_t`, `expected`
 
 #include "nvme/blocking_files_disk.hpp" // `blocking_files_disk_t`, `file_buffering_t`
-#include "nvme/buffer_pool.hpp"         // `registered_slab_t`, `slab_config_t`
-#include "nvme/config.hpp"              // `resources_config_t`, `io_discipline_t`
+#include "nvme/buffer_pool.hpp"         // `registered_memory_arena_t`, `memory_arena_config_t`
+#include "nvme/config.hpp"              // `resources_config_t`, `io_transport_t`
 #include "nvme/files_disk.hpp"          // `any_files_disk_t`
-#include "nvme/io_lane.hpp"             // `basic_lane_pool`, `lane_config_t`
+#include "nvme/io_channel.hpp"          // `basic_io_channel_pool`, `io_channel_config_t`
 #include "nvme/ram_disk.hpp"            // `ram_disk_t`, `ram_device_t`
-#include "nvme/ring.hpp"                // `descriptor_t`, `target_request_t`, `ring_concept`
+#include "nvme/ring.hpp"                // `registered_medium_t`, `medium_options_t`, `ring_concept`
 #include "nvme/uring_files_disk.hpp"    // `uring_files_disk_t`, `uring_probe_t`
 #include "nvme/volume.hpp"              // `basic_extent_volume`, `volume_format_t`
 #include "nvme/volume_router.hpp"       // `basic_volume_router`
@@ -63,7 +63,7 @@ inline constexpr char volume_file_name_k[] = "volume.ustore";
 /** Creates @p path alone, treating a directory that is already there as success. */
 inline status_t create_directory(char const* path) noexcept {
     if (CreateDirectoryA(path, nullptr) != 0 || GetLastError() == ERROR_ALREADY_EXISTS) return {};
-    return {status_code_t::io_k, "A directory of the database would not be created"};
+    return {status_code_t::input_output_k, "A directory of the database would not be created"};
 }
 
 #else
@@ -71,7 +71,7 @@ inline status_t create_directory(char const* path) noexcept {
 /** Creates @p path alone, treating a directory that is already there as success. */
 inline status_t create_directory(char const* path) noexcept {
     if (::mkdir(path, 0755) == 0 || errno == EEXIST) return {};
-    return {status_code_t::io_k, "A directory of the database would not be created"};
+    return {status_code_t::input_output_k, "A directory of the database would not be created"};
 }
 
 #endif
@@ -130,7 +130,7 @@ inline status_t create_data_directories(resources_config_t const& config) noexce
 struct mount_report_t {
 
     /** The transport the mount actually opened, which is never @c automatic_k. */
-    io_discipline_t discipline = io_discipline_t::blocking_k;
+    io_transport_t transport = io_transport_t::blocking_k;
 
     /** What the kernel answered when the ring was set up and taken down again. */
     uring_probe_t uring = uring_probe_t::refused_k;
@@ -138,17 +138,17 @@ struct mount_report_t {
     /** Volumes the router adopted, which is one per data directory. */
     std::size_t volumes = 0;
 
-    /** Lanes the pool opened, which is the executor's threads plus the spares. */
-    std::size_t lanes = 0;
+    /** Channels the pool opened, which is the executor's threads plus the shared channels. */
+    std::size_t channels = 0;
 
-    /** Bytes the slab pinned, charged to the host budget exactly once. */
-    std::uint64_t slab_bytes = 0;
+    /** Bytes the arena pinned, charged to the host budget exactly once. */
+    std::uint64_t arena_bytes = 0;
 };
 
 /** The transport @p wanted resolves to given @p probe: the ring where the kernel offers it, the floor elsewhere. */
-[[nodiscard]] inline io_discipline_t probed_discipline(io_discipline_t wanted, uring_probe_t probe) noexcept {
-    if (wanted != io_discipline_t::automatic_k && wanted != io_discipline_t::uring_k) return wanted;
-    return probe == uring_probe_t::available_k ? io_discipline_t::uring_k : io_discipline_t::blocking_k;
+[[nodiscard]] inline io_transport_t probed_transport(io_transport_t wanted, uring_probe_t probe) noexcept {
+    if (wanted != io_transport_t::automatic_k && wanted != io_transport_t::io_uring_k) return wanted;
+    return probe == uring_probe_t::available_k ? io_transport_t::io_uring_k : io_transport_t::blocking_k;
 }
 
 #pragma endregion Probe
@@ -156,9 +156,9 @@ struct mount_report_t {
 #pragma region Mount
 
 /**
- *  @brief One transport, the memory it pinned, the lanes it leases and the volumes it opened over it.
+ *  @brief One transport, the memory it pinned, the channels it queue pairs and the volumes it opened over it.
  *
- *  It is deliberately neither copyable nor movable: a lane pool and every volume hold a pointer to
+ *  It is deliberately neither copyable nor movable: a channel pool and every volume hold a pointer to
  *  the disk beside them, so a mount that moved would leave both addressing a transport that is no
  *  longer there. The variant above it emplaces one rather than assigning one for that reason.
  */
@@ -173,8 +173,8 @@ class basic_storage_mount {
     /** The volumes of this mount and the free-space placement that spreads blobs over them. */
     using router_t = basic_volume_router<volume_t>;
 
-    /** Every lease this mount hands out, one per executor thread plus the spares. */
-    using lane_pool_t = basic_lane_pool<disk_type_>;
+    /** Every queue pair this mount hands out, one per executor thread plus the shared channels. */
+    using channel_pool_t = basic_io_channel_pool<disk_type_>;
 
     /** Takes @p disk in, which a mount owns until it is torn down. */
     explicit basic_storage_mount(disk_type_&& disk) noexcept : disk_(std::move(disk)) {}
@@ -187,10 +187,10 @@ class basic_storage_mount {
     ~basic_storage_mount() noexcept { [[maybe_unused]] status_t const released = unmount(); }
 
     /**
-     *  @brief Pins the slab, leases the lanes and opens one volume per data directory of @p config.
-     *  @param[in] config The lane shape, the spare lanes and the data directories, with their capacities.
-     *  @param[inout] constraint The host budget the slab is charged to, once, for the life of the mount.
-     *  @param[in] threads Executor threads, each of which gets a lane of its own.
+     *  @brief Pins the arena, queue pairs the channels and opens one volume per data directory of @p config.
+     *  @param[in] config The channel shape, the shared channels and the data directories, with their capacities.
+     *  @param[inout] constraint The host budget the arena is charged to, once, for the life of the mount.
+     *  @param[in] threads Executor threads, each of which gets a channel of its own.
      *  @param[in] database The database the volumes belong to, which a mount refuses to open under another.
      *  @return Success, or the first refusal, after which @c unmount gives back whatever was taken.
      */
@@ -198,52 +198,53 @@ class basic_storage_mount {
                    uuid_t const& database) noexcept {
         if (config.data_directories.empty())
             return {status_code_t::invalid_argument_k, "A mount needs a data directory to open a volume in"};
-        if (config.spare_lanes == 0)
-            return {status_code_t::invalid_argument_k, "A mount keeps a lane for the threads outside its executor"};
+        if (config.shared_io_channels == 0)
+            return {status_code_t::invalid_argument_k, "A mount keeps a channel for the threads outside its executor"};
 
-        slab_config_t slab;
-        slab.bytes = config.lanes.slab_bytes() * (threads + config.spare_lanes);
-        expected<registered_slab_t> pinned = registered_slab_t::make(disk_, constraint, slab);
+        memory_arena_config_t arena;
+        arena.bytes = config.channels.arena_bytes() * (threads + config.shared_io_channels);
+        expected<registered_memory_arena_t> pinned = registered_memory_arena_t::make(disk_, constraint, arena);
         if (!pinned) return pinned.status();
-        slab_ = std::move(*pinned);
+        arena_ = std::move(*pinned);
 
-        expected<lane_pool_t> leased = lane_pool_t::make(disk_, slab_, threads, config.spare_lanes, config.lanes);
+        expected<channel_pool_t> leased = channel_pool_t::make(disk_, arena_, threads, config.shared_io_channels,
+                                                               config.channels);
         if (!leased) return leased.status();
-        lanes_ = std::move(*leased);
+        channels_ = std::move(*leased);
 
-        if (targets_.resize(config.data_directories.size()) != st::status_t::success_k)
+        if (media_.resize(config.data_directories.size()) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A mount could not track its targets"};
         expected<router_t> built = router_t::make(config.data_directories.size());
         if (!built) return built.status();
         router_ = std::move(*built);
 
-        expected<typename lane_pool_t::guard_t> guard = lanes_.checkout();
+        expected<typename channel_pool_t::guard_t> guard = channels_.acquire();
         if (!guard) return guard.status();
         for (std::size_t index = 0; index != config.data_directories.size(); ++index)
-            if (status_t const opened = open_volume_(config.data_directories[index], index, guard->lane(), database);
+            if (status_t const opened = open_volume_(config.data_directories[index], index, guard->channel(), database);
                 opened.failed())
                 return opened;
         return {};
     }
 
-    /** Drains and releases the lanes, unpins the slab, gives the targets back and drops the volumes. */
+    /** Drains and releases the channels, unpins the arena, gives the targets back and drops the volumes. */
     status_t unmount() noexcept {
         status_t first;
-        if (status_t const drained = lanes_.dismount(); drained.failed() && first.succeeded()) first = drained;
-        lanes_ = lane_pool_t {};
+        if (status_t const drained = channels_.release_all(); drained.failed() && first.succeeded()) first = drained;
+        channels_ = channel_pool_t {};
 
-        if (slab_.registered())
-            if (status_t const unpinned = slab_.dismount(disk_); unpinned.failed() && first.succeeded())
+        if (arena_.registered())
+            if (status_t const unpinned = arena_.unregister(disk_); unpinned.failed() && first.succeeded())
                 first = unpinned;
-        slab_ = registered_slab_t {};
+        arena_ = registered_memory_arena_t {};
 
-        for (std::size_t index = 0; index != targets_.size(); ++index) {
-            if (!targets_[index].held()) continue;
-            if (status_t const detached = disk_.deregister_target(targets_[index]);
+        for (std::size_t index = 0; index != media_.size(); ++index) {
+            if (!media_[index].held()) continue;
+            if (status_t const detached = disk_.unregister_medium(media_[index]);
                 detached.failed() && first.succeeded())
                 first = detached;
         }
-        targets_.clear();
+        media_.clear();
 
         router_ = router_t {};
         return first;
@@ -258,22 +259,22 @@ class basic_storage_mount {
     /** The volumes of this database and the placement that decides which of them a blob lands on. */
     [[nodiscard]] router_t& router() noexcept { return router_; }
 
-    /** The leases every operation borrows one of, by executor thread index or from the spares. */
-    [[nodiscard]] lane_pool_t& lanes() noexcept { return lanes_; }
+    /** The queue pairs every operation borrows one of, by executor thread index or from the shared channels. */
+    [[nodiscard]] channel_pool_t& channels() noexcept { return channels_; }
 
     /** The one pinned range every I/O buffer of this database is carved out of. */
-    [[nodiscard]] registered_slab_t& slab() noexcept { return slab_; }
+    [[nodiscard]] registered_memory_arena_t& arena() noexcept { return arena_; }
 
   private:
 
     /**
-     *  @brief Opens the volume of @p directory as target @p index, and adopts it into the router.
+     *  @brief Opens the volume of @p directory as medium @p index, and adopts it into the router.
      *  @param[in] directory The path the volume file sits in, and the bytes the volume spans.
-     *  @param[in] index The target slot this volume takes, which @c unmount gives back.
-     *  @param[inout] lane The lane the head and the catalog slots are read and written through.
+     *  @param[in] index The medium slot this volume takes, which @c unmount gives back.
+     *  @param[inout] channel The channel the head and the catalog slots are read and written through.
      *  @param[in] database The database the volume belongs to, which a mount refuses to open under another.
      */
-    status_t open_volume_(data_directory_config_t const& directory, std::size_t index, io_lane_t& lane,
+    status_t open_volume_(data_directory_config_t const& directory, std::size_t index, io_channel_t& channel,
                           uuid_t const& database) noexcept {
         if (directory.path.empty()) return {status_code_t::invalid_argument_k, "A data directory needs a path"};
         if (directory.max_size == 0 || directory.max_size == unlimited_resource_k)
@@ -283,33 +284,33 @@ class basic_storage_mount {
         if (status_t const joined = join_path(directory.path.c_str(), volume_file_name_k, path); joined.failed())
             return joined;
 
-        target_request_t request;
+        medium_options_t request;
         request.name = path;
         request.length = directory.max_size;
-        request.access = target_access_t::create_read_write_k;
-        expected<descriptor_t> registered = disk_.register_target(request);
+        request.access = medium_access_t::create_read_write_k;
+        expected<registered_medium_t> registered = disk_.register_medium(request);
         if (!registered) return registered.status();
-        targets_[index] = std::move(*registered);
+        media_[index] = std::move(*registered);
 
         volume_format_t format;
         format.database = database;
         format.capacity_bytes = directory.max_size;
-        expected<volume_t> opened = volume_t::mount(disk_, lane, targets_[index], format);
+        expected<volume_t> opened = volume_t::mount(disk_, channel, media_[index], format);
         if (!opened) return opened.status();
-        return router_.adopt(std::move(*opened));
+        return router_.bind_queue_pair(std::move(*opened));
     }
 
-    /** The transport, owned here and outliving every lane and volume that points at it. */
+    /** The transport, owned here and outliving every channel and volume that points at it. */
     disk_type_ disk_;
 
-    /** The one pinned range, charged to the host budget once and carved into blocks by the lanes. */
-    registered_slab_t slab_;
+    /** The one pinned range, charged to the host budget once and carved into blocks by the channels. */
+    registered_memory_arena_t arena_;
 
-    /** Every lease of this mount, opened here and lent one operation at a time. */
-    lane_pool_t lanes_;
+    /** Every queue pair of this mount, opened here and lent one operation at a time. */
+    channel_pool_t channels_;
 
-    /** One registered target per data directory, given back before the volumes are dropped. */
-    st::basic_vector<descriptor_t> targets_;
+    /** One registered medium per data directory, given back before the volumes are dropped. */
+    st::basic_vector<registered_medium_t> media_;
 
     /** The volumes those targets hold, and the placement that spreads blobs over them. */
     router_t router_;
@@ -338,9 +339,9 @@ class mounted_storage_t {
 
     /**
      *  @brief Probes the transport @p config asks for and mounts the whole storage stack on it.
-     *  @param[in] config The discipline, the lane shape and the data directories, with their capacities.
-     *  @param[inout] constraint The host budget the slab is charged to, once, for the life of the mount.
-     *  @param[in] threads Executor threads, each of which gets a lane of its own.
+     *  @param[in] config The transport, the channel shape and the data directories, with their capacities.
+     *  @param[inout] constraint The host budget the arena is charged to, once, for the life of the mount.
+     *  @param[in] threads Executor threads, each of which gets a channel of its own.
      *  @param[in] database The database the volumes belong to, or an invalid identifier to take any.
      */
     status_t mount(resources_config_t const& config, resource_constraint_t& constraint, std::size_t threads,
@@ -349,32 +350,30 @@ class mounted_storage_t {
 
         report_ = mount_report_t {};
         report_.uring = uring_files_disk_t::probe();
-        report_.discipline = probed_discipline(config.io_discipline, report_.uring);
+        report_.transport = probed_transport(config.io_transport, report_.uring);
 
-        std::uint16_t const owners = bounded_count_(threads + config.spare_lanes,
-                                                    static_cast<std::size_t>(owner_id_t::unowned_k));
+        std::uint16_t const owners = bounded_count_(threads + config.shared_io_channels,
+                                                    static_cast<std::size_t>(queue_pair_id_t::unallocated_k));
         std::uint16_t const targets = bounded_count_(config.data_directories.size(),
-                                                     static_cast<std::size_t>(descriptor_id_t::unregistered_k));
+                                                     static_cast<std::size_t>(registered_medium_id_t::unregistered_k));
         if (owners == 0 || targets == 0)
-            return {status_code_t::capacity_exhausted_k, "A ring names fewer leases or targets than that"};
+            return {status_code_t::capacity_exhausted_k, "A ring names fewer queue pairs or targets than that"};
 
-        switch (report_.discipline) {
-        case io_discipline_t::ram_k: {
+        switch (report_.transport) {
+        case io_transport_t::memory_k: {
             expected<ram_device_t> device = ram_device_t::make(portable_alignment_k);
             if (!device) return device.status();
             expected<ram_disk_t> disk = ram_disk_t::make(std::move(*device), ring_config_(config, owners, targets));
             if (!disk) return disk.status();
             return adopt_<ram_disk_t>(std::move(*disk), config, constraint, threads, database);
         }
-        case io_discipline_t::blocking_k:
-            return mount_blocking_(config, constraint, threads, database, owners, targets);
-        case io_discipline_t::uring_k: return mount_uring_(config, constraint, threads, database, owners, targets);
-        case io_discipline_t::spdk_k:
+        case io_transport_t::blocking_k: return mount_blocking_(config, constraint, threads, database, owners, targets);
+        case io_transport_t::io_uring_k: return mount_uring_(config, constraint, threads, database, owners, targets);
+        case io_transport_t::spdk_k:
             return {status_code_t::unsupported_k, "The SPDK transport is not mounted by this build"};
-        case io_discipline_t::automatic_k:
-            return {status_code_t::internal_k, "The probe left the discipline unresolved"};
+        case io_transport_t::automatic_k: return {status_code_t::internal_k, "The probe left the transport unresolved"};
         }
-        return {status_code_t::invalid_argument_k, "The configuration names no I/O discipline"};
+        return {status_code_t::invalid_argument_k, "The configuration names no I/O transport"};
     }
 
     /** Tears the mounted transport down in order, and leaves the handle naming none. */
@@ -386,13 +385,13 @@ class mounted_storage_t {
         return released;
     }
 
-    /** Whether any transport is open, which every operation needs before it asks for a lane. */
+    /** Whether any transport is open, which every operation needs before it asks for a channel. */
     [[nodiscard]] bool mounted() const noexcept { return !std::holds_alternative<std::monostate>(held_); }
 
     /** What the mount opened, which a caller reports as the effective configuration. */
     [[nodiscard]] mount_report_t const& report() const noexcept { return report_; }
 
-    /** How the mounted transport addresses its slab, which io_uring settles at each ring's first submission. */
+    /** How the mounted transport addresses its arena, which io_uring settles at each ring's first submission. */
     [[nodiscard]] range_pinning_t pinning() const noexcept {
         files_mount_t const* const files = std::get_if<files_mount_t>(&held_);
         return files ? files->disk().pinning() : range_pinning_t::unpinned_k;
@@ -408,18 +407,18 @@ class mounted_storage_t {
 
   private:
 
-    /** The ring shape every transport is made with, which the lanes and the targets fix. */
+    /** The ring shape every transport is made with, which the channels and the targets fix. */
     [[nodiscard]] static disk_config_t ring_config_(resources_config_t const& config, std::uint16_t owners,
                                                     std::uint16_t targets) noexcept {
         disk_config_t ring;
-        ring.owners_limit = owners;
-        ring.depth_limit = config.lanes.depth;
-        ring.registrations_limit = 1;
-        ring.targets_limit = targets;
+        ring.queue_pairs_limit = owners;
+        ring.depth_limit = config.channels.depth;
+        ring.registered_memory_limit = 1;
+        ring.media_limit = targets;
         return ring;
     }
 
-    /** Mounts the blocking floor on unbuffered files, with @p owners leases over @p targets directories. */
+    /** Mounts the blocking floor on unbuffered files, with @p owners queue pairs over @p targets directories. */
     status_t mount_blocking_(resources_config_t const& config, resource_constraint_t& constraint, std::size_t threads,
                              uuid_t const& database, std::uint16_t owners, std::uint16_t targets) noexcept {
         if (status_t const made = create_data_directories(config); made.failed()) return made;
@@ -431,15 +430,16 @@ class mounted_storage_t {
         return adopt_<any_files_disk_t>(any_files_disk_t {std::move(*disk)}, config, constraint, threads, database);
     }
 
-    /** Mounts io_uring on unbuffered files, one ring per lease, with @p owners leases over @p targets directories. */
+    /** Mounts io_uring on unbuffered files, one ring per queue pair, with @p owners queue pairs over @p targets
+     *  directories. */
     status_t mount_uring_(resources_config_t const& config, resource_constraint_t& constraint, std::size_t threads,
                           uuid_t const& database, std::uint16_t owners, std::uint16_t targets) noexcept {
         if (status_t const made = create_data_directories(config); made.failed()) return made;
         uring_disk_config_t ring;
-        ring.owners_limit = owners;
-        ring.depth_limit = config.lanes.depth;
-        ring.registrations_limit = 1;
-        ring.targets_limit = targets;
+        ring.queue_pairs_limit = owners;
+        ring.depth_limit = config.channels.depth;
+        ring.registered_memory_limit = 1;
+        ring.media_limit = targets;
         ring.buffering = file_buffering_t::unbuffered_k;
         expected<uring_files_disk_t> disk = uring_files_disk_t::make(ring);
         if (!disk) return disk.status();
@@ -462,8 +462,8 @@ class mounted_storage_t {
             return started;
         }
         report_.volumes = opened.router().size();
-        report_.lanes = opened.lanes().size();
-        report_.slab_bytes = opened.slab().size();
+        report_.channels = opened.channels().size();
+        report_.arena_bytes = opened.arena().size();
         return {};
     }
 

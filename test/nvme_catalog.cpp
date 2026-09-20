@@ -27,7 +27,7 @@
 #include "nvme/catalog.hpp"          // `catalog_t`, `crc32c`
 #include "nvme/extent_allocator.hpp" // `extent_allocator_t`
 
-#include "test.hpp"
+#include "test.hpp" // `suite_exit_code`, `expect`, `expect_eq`
 
 namespace unum::ustore {
 
@@ -333,7 +333,7 @@ std::size_t catalog_round_trips_every_field() {
         failures += expect(found->kind == kind_of(seed));
         failures += expect(found->extent == extent_of(seed));
         failures += expect_eq(found->content_length, extent_of(seed).length - seed % 17);
-        failures += expect_eq(found->stamp, seed + 1);
+        failures += expect_eq(found->sequence_number, seed + 1);
         failures += expect_eq(found->name().size(), name_bytes_of(seed));
     }
     return failures;
@@ -486,23 +486,23 @@ int main(int argc, char const* argv[]) {
     if (argument_status_t const status = parse_suite_options(argc, argv, options);
         status != argument_status_t::parsed_k)
         return status == argument_status_t::help_k ? 0 : 1;
-    ledger_t ledger = options.ledger();
+    suite_totals_t totals = options.totals();
 
-    report(ledger, "allocator.best_fit", allocator_picks_the_smallest_fitting_range());
-    report(ledger, "allocator.coalesces", allocator_coalesces_with_both_neighbours());
-    report(ledger, "allocator.overlapping_reserve", allocator_refuses_overlapping_reservations());
-    report(ledger, "allocator.past_capacity", allocator_refuses_what_does_not_fit());
-    report(ledger, "allocator.double_release", allocator_refuses_a_double_release());
-    report(ledger, "allocator.large_alignment", allocator_aligns_a_large_allocation());
-    report(ledger, "allocator.mixed_run", allocator_returns_every_byte_of_a_mixed_run());
-    report(ledger, "catalog.round_trip", catalog_round_trips_every_field());
-    report(ledger, "catalog.flipped_byte", catalog_refuses_a_flipped_byte());
-    report(ledger, "catalog.records_past_image", catalog_refuses_records_past_the_image());
-    report(ledger, "catalog.record_past_records", catalog_refuses_a_record_past_the_records());
-    report(ledger, "catalog.small_image", catalog_refuses_a_small_image());
-    report(ledger, "catalog.duplicate_name", catalog_refuses_a_duplicate_name());
-    report(ledger, "catalog.erases_by_name", catalog_erases_by_name());
-    report(ledger, "catalog.visits_one_kind", catalog_visits_one_kind());
+    report(totals, "allocator.best_fit", allocator_picks_the_smallest_fitting_range());
+    report(totals, "allocator.coalesces", allocator_coalesces_with_both_neighbours());
+    report(totals, "allocator.overlapping_reserve", allocator_refuses_overlapping_reservations());
+    report(totals, "allocator.past_capacity", allocator_refuses_what_does_not_fit());
+    report(totals, "allocator.double_release", allocator_refuses_a_double_release());
+    report(totals, "allocator.large_alignment", allocator_aligns_a_large_allocation());
+    report(totals, "allocator.mixed_run", allocator_returns_every_byte_of_a_mixed_run());
+    report(totals, "catalog.round_trip", catalog_round_trips_every_field());
+    report(totals, "catalog.flipped_byte", catalog_refuses_a_flipped_byte());
+    report(totals, "catalog.records_past_image", catalog_refuses_records_past_the_image());
+    report(totals, "catalog.record_past_records", catalog_refuses_a_record_past_the_records());
+    report(totals, "catalog.small_image", catalog_refuses_a_small_image());
+    report(totals, "catalog.duplicate_name", catalog_refuses_a_duplicate_name());
+    report(totals, "catalog.erases_by_name", catalog_erases_by_name());
+    report(totals, "catalog.visits_one_kind", catalog_visits_one_kind());
 
-    return conclude(ledger);
+    return suite_exit_code(totals);
 }

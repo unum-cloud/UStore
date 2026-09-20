@@ -8,9 +8,9 @@
  *  ordered by and remembers the last commit to write each key, entirely in read-modify-writes.
  *  @c read_set remembers what one transaction watched and from which stamp, and belongs to that
  *  transaction alone. @c transaction_roster_t holds the live transactions, and is where the layer's
- *  two claims live: the staging lease, and the word enrolment scans under.
+ *  two claims live: the staging queue pair, and the word enrolment scans under.
  *
- *  No mutex, and nothing on the path that stages or commits waits for anything but the lease.
+ *  No mutex, and nothing on the path that stages or commits waits for anything but the queue pair.
  */
 #pragma once
 
@@ -215,7 +215,7 @@ class read_set {
  *  rather than being excused by a stamp that commit had claimed but not yet honoured.
  *
  *  That single watermark is enough only because the registry above serializes its commits with the
- *  staging lease, so at most one commit ever sits between claiming a stamp and publishing it.
+ *  staging queue pair, so at most one commit ever sits between claiming a stamp and publishing it.
  *
  *  Two keys sharing a slot share a stamp, so a collision reports a conflict neither transaction had
  *  and can never hide one either of them did have. The record errs toward refusing, never toward
@@ -316,7 +316,7 @@ class commit_record_t {
  *  @brief The live transactions of one registry, each holding a slot for as long as it exists.
  *
  *  Most of what moves here excludes nobody. A transaction's start stamp is written by its own thread
- *  and read by any other through one atomic reference, and the staging lease is a single
+ *  and read by any other through one atomic reference, and the staging queue pair is a single
  *  compare-exchange whose winner holds it from @c stage until @c commit or @c rollback, because those
  *  are separate calls from its owner rather than one operation.
  *
@@ -407,29 +407,29 @@ class transaction_roster_t {
     }
 
     /**
-     *  @brief Takes the staging lease for @p id, waiting while another transaction holds it.
+     *  @brief Takes the staging queue pair for @p id, waiting while another transaction holds it.
      *
-     *  The lease is held from @c stage until @c commit or @c rollback, which are separate calls from
+     *  The queue pair is held from @c stage until @c commit or @c rollback, which are separate calls from
      *  the owner, so the room a stage found in the store's write buffers is still there when the
      *  commit fills it. It is also what lets one published watermark speak for every commit.
      */
     void claim_staging(transaction_id_t id) noexcept {
-        fu::preferred_atomic_ref<transaction_id_t> const lease {staged_by_};
+        fu::preferred_atomic_ref<transaction_id_t> const staging {staged_by_};
         transaction_id_t expected_free = invalid_transaction_id_k;
         while (
-            !lease.compare_exchange_strong(expected_free, id, std::memory_order_acquire, std::memory_order_relaxed)) {
+            !staging.compare_exchange_strong(expected_free, id, std::memory_order_acquire, std::memory_order_relaxed)) {
             expected_free = invalid_transaction_id_k;
             std::this_thread::yield();
         }
     }
 
-    /** Hands the staging lease back. */
+    /** Hands the staging queue pair back. */
     void release_staging() noexcept {
         fu::preferred_atomic_ref<transaction_id_t> {staged_by_}.store(invalid_transaction_id_k,
                                                                       std::memory_order_release);
     }
 
-    /** Whether @p id holds the staging lease. */
+    /** Whether @p id holds the staging queue pair. */
     bool staged_by(transaction_id_t id) const noexcept {
         return fu::preferred_atomic_ref<transaction_id_t const> {staged_by_}.load(std::memory_order_acquire) == id;
     }
@@ -493,7 +493,7 @@ class transaction_roster_t {
     /** The slot of every transaction the roster admits, claimed by identifier. */
     st::basic_vector<transaction_slot_t, constrained_allocator<transaction_slot_t>> slots_;
 
-    /** The transaction holding the staging lease, or @c invalid_transaction_id_k while none does. */
+    /** The transaction holding the staging queue pair, or @c invalid_transaction_id_k while none does. */
     transaction_id_t staged_by_ = invalid_transaction_id_k;
 
     /** One while a caller is enrolling or retiring a transaction, zero otherwise. */

@@ -682,7 +682,7 @@ int main(int argc, char** argv) {
 
     twitter_t twitter;
     {
-        auto maybe_executor = executor_t::make(settings.threads.value, caller_role_t::worker_k);
+        auto maybe_executor = executor_t::make(settings.threads.value, caller_exclusivity_t::caller_inclusive_k);
         if (!maybe_executor) {
             fmt::println(stderr, "Failed to spawn {} threads", settings.threads.value);
             return 1;

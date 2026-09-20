@@ -9,9 +9,9 @@
  *  is left here is the I/O: pointing the compactor at each source run's index, then writing the planned
  *  runs out of the plan it answered.
  *
- *  Reads and writes ride separate lanes because a lane is one lease with one completion queue, so a read
- *  pipeline harvesting on the lane a write pipeline submits on would swallow the writes' completions. The
- *  write side is one pipeline whose depth is the streaming blocks the lane was mounted with, and the read
+ *  Reads and writes ride separate channels because a channel is one queue pair with one completion queue, so a read
+ *  pipeline polling on the channel a write pipeline submits on would swallow the writes' completions. The
+ *  write side is one pipeline whose depth is the streaming blocks the channel was mounted with, and the read
  *  side refills the ring as completions retire rather than waiting on a batch.
  */
 
@@ -30,12 +30,12 @@
 #include <ustore/status.hpp> // `status_t`, `status_code_t`, `expected`
 #include <ustore/types.hpp>  // `byte_t`
 
-#include "nvme/buffer_pool.hpp"    // `buffer_lease_t`
+#include "nvme/buffer_pool.hpp"    // `pooled_buffer_t`
 #include "nvme/catalog.hpp"        // `blob_kind_t`
 #include "nvme/compaction.cuh"     // `cpu_compactor_t`, `compaction_output`, `compaction_kind_t`
 #include "nvme/extent.hpp"         // `extent_t`, `rounded_up_to`, `portable_alignment_k`
-#include "nvme/io_lane.hpp"        // `io_lane_t`
-#include "nvme/io_pipeline.hpp"    // `basic_read_pipeline`, `basic_write_pipeline`, `require_whole`
+#include "nvme/io_channel.hpp"     // `io_channel_t`
+#include "nvme/io_pipeline.hpp"    // `basic_read_pipeline`, `basic_write_pipeline`, `require_completed_in_full`
 #include "nvme/lsm_level.hpp"      // `lsm_level`, `lsm_level_order_t`, `lsm_level_depth_t`
 #include "nvme/lsm_sorted_run.hpp" // `lsm_sorted_run`, `sorted_run_header_t`, `sorted_run_layout`
 #include "nvme/storage_limits.hpp" // `storage_limits_t`
@@ -113,30 +113,31 @@ inline status_t compaction_status(st::status_t status) noexcept {
         return {status_code_t::invalid_argument_k, "A compaction refused its bounds"};
     case st::status_t::capacity_exhausted_k:
         return {status_code_t::capacity_exhausted_k, "A compaction ran out of room"};
-    case st::status_t::input_output_k: return {status_code_t::io_k, "A compaction could not move its key slots"};
+    case st::status_t::input_output_k:
+        return {status_code_t::input_output_k, "A compaction could not move its key slots"};
     default: return {status_code_t::device_k, "A compaction failed on the device it ran on"};
     }
 }
 
-/** Drains a lane's lease before the pipelines above it hand their blocks back, which a failure needs too. */
+/** Drains a channel's queue pair before the pipelines above it hand their blocks back, which a failure needs too. */
 template <typename disk_type_>
     requires ring_concept<disk_type_>
-class lane_drain_t {
+class channel_drain_t {
   public:
 
-    lane_drain_t(disk_type_& disk, io_lane_t& lane) noexcept : disk_(disk), lane_(lane) {}
-    lane_drain_t(lane_drain_t const&) = delete;
-    lane_drain_t& operator=(lane_drain_t const&) = delete;
+    channel_drain_t(disk_type_& disk, io_channel_t& channel) noexcept : disk_(disk), channel_(channel) {}
+    channel_drain_t(channel_drain_t const&) = delete;
+    channel_drain_t& operator=(channel_drain_t const&) = delete;
 
-    ~lane_drain_t() noexcept { [[maybe_unused]] status_t const drained = disk_.drain(lane_.owner()); }
+    ~channel_drain_t() noexcept { [[maybe_unused]] status_t const drained = disk_.drain(channel_.queue_pair()); }
 
   private:
 
-    /** The ring the lease belongs to. */
+    /** The ring the queue pair belongs to. */
     disk_type_& disk_;
 
-    /** The lane whose lease is drained. */
-    io_lane_t& lane_;
+    /** The channel whose queue pair is drained. */
+    io_channel_t& channel_;
 };
 
 #pragma endregion Vocabulary
@@ -191,7 +192,7 @@ class lsm_level_merger {
     /** Whether the values sit in the key slots themselves, so a merge moves no value bytes. */
     static constexpr bool holds_values_inline_k = is_inline(value_layout_k);
 
-    /** What one merge is asked to do, beyond the volume and the lanes it is handed. */
+    /** What one merge is asked to do, beyond the volume and the channels it is handed. */
     struct merge_request_t {
 
         /** The level whose runs shadow the lower level's, which is never null and never empty. */
@@ -229,17 +230,17 @@ class lsm_level_merger {
     /**
      *  @brief Merges @p request.upper into @p request.lower and writes the survivors as a new sorted level.
      *  @param[inout] volume The volume the new runs are reserved on, which every source run also lives on.
-     *  @param[inout] reading_lane The lane the source values are gathered on, held by the calling thread.
-     *  @param[inout] writing_lane The lane the new runs are written on, which must not be @p reading_lane.
+     *  @param[inout] reading_channel The channel the source values are gathered on, held by the calling thread.
+     *  @param[inout] writing_channel The channel the new runs are written on, which must not be @p reading_channel.
      *  @param[in] request Which levels merge, what the new runs may grow to, and where the compaction runs.
      *  @return The new level, or the status that stopped the merge with every new run already dropped.
      */
-    static expected<level_t> merge(volume_t& volume, io_lane_t& reading_lane, io_lane_t& writing_lane,
+    static expected<level_t> merge(volume_t& volume, io_channel_t& reading_channel, io_channel_t& writing_channel,
                                    merge_request_t const& request) noexcept {
         if (request.upper == nullptr)
             return status_t {status_code_t::invalid_argument_k, "A merge reads an upper level"};
-        if (&reading_lane == &writing_lane)
-            return status_t {status_code_t::invalid_argument_k, "A merge reads and writes on two lanes"};
+        if (&reading_channel == &writing_channel)
+            return status_t {status_code_t::invalid_argument_k, "A merge reads and writes on two channels"};
 
         st::basic_vector<sorted_run_t const*> sources;
         st::basic_vector<sorted_run_index_view<key_slot_t>> views;
@@ -267,15 +268,15 @@ class lsm_level_merger {
             planned.first_cell = first_cell;
             planned.first_key_slot = first_key_slot;
 
-            expected<sorted_run_t> written = write_run_(volume, reading_lane, writing_lane,
+            expected<sorted_run_t> written = write_run_(volume, reading_channel, writing_channel,
                                                         std::span<sorted_run_t const* const> {sources}, output, planned,
                                                         request.value_max_size, request.cancellation);
             if (!written) {
-                [[maybe_unused]] status_t const abandoned = merged.drop(volume, writing_lane);
+                [[maybe_unused]] status_t const abandoned = merged.drop(volume, writing_channel);
                 return written.status();
             }
-            if (status_t const adopted = merged.adopt(std::move(*written)); adopted.failed()) {
-                [[maybe_unused]] status_t const abandoned = merged.drop(volume, writing_lane);
+            if (status_t const adopted = merged.bind_queue_pair(std::move(*written)); adopted.failed()) {
+                [[maybe_unused]] status_t const abandoned = merged.drop(volume, writing_channel);
                 return adopted;
             }
             first_cell += round_up(planned.key_slots_count, sorted_run_layout_t::branching_k);
@@ -402,13 +403,13 @@ class lsm_level_merger {
 
 #endif
 
-    /** Takes a streaming block from @p writer, harvesting its completions when every block is out. */
-    static expected<buffer_lease_t> stage_or_harvest_(write_pipeline_t& writer) noexcept {
-        expected<buffer_lease_t> block = writer.stage_stream();
+    /** Takes a streaming block from @p writer, polling its completions when every block is out. */
+    static expected<pooled_buffer_t> acquire_buffer_or_poll_(write_pipeline_t& writer) noexcept {
+        expected<pooled_buffer_t> block = writer.acquire_stream_buffer();
         while (!block && block.status() == status_code_t::capacity_exhausted_k && writer.outstanding() != 0) {
-            if (status_t const flushed = writer.flush(); flushed.failed()) return flushed;
-            if (status_t const harvested = writer.harvest_one(); harvested.failed()) return harvested;
-            block = writer.stage_stream();
+            if (status_t const flushed = writer.submit(); flushed.failed()) return flushed;
+            if (status_t const polled = writer.poll_one_completion(); polled.failed()) return polled;
+            block = writer.acquire_stream_buffer();
         }
         return block;
     }
@@ -424,7 +425,8 @@ class lsm_level_merger {
     }
 
     /** Reserves a blob for the run @p planned describes, writes its three sections, and opens it. */
-    static expected<sorted_run_t> write_run_(volume_t& volume, io_lane_t& reading_lane, io_lane_t& writing_lane,
+    static expected<sorted_run_t> write_run_(volume_t& volume, io_channel_t& reading_channel,
+                                             io_channel_t& writing_channel,
                                              std::span<sorted_run_t const* const> sources,
                                              compaction_output_t const& output, planned_run_t const& planned,
                                              stored_value_size_t value_max_size,
@@ -451,45 +453,46 @@ class lsm_level_merger {
         if (!reserved) return reserved.status();
         blob_t const blob = *reserved;
 
-        if (status_t const written = write_sections_(volume, reading_lane, writing_lane, sources, output, planned,
+        if (status_t const written = write_sections_(volume, reading_channel, writing_channel, sources, output, planned,
                                                      header, blob, cancellation);
             written.failed()) {
-            [[maybe_unused]] status_t const abandoned = volume.drop(writing_lane, sorted_run_t::name_of(content_id));
+            [[maybe_unused]] status_t const abandoned = volume.drop(writing_channel, sorted_run_t::name_of(content_id));
             return written;
         }
-        if (status_t const sealed = volume.seal(writing_lane, blob); sealed.failed()) {
-            [[maybe_unused]] status_t const abandoned = volume.drop(writing_lane, sorted_run_t::name_of(content_id));
+        if (status_t const sealed = volume.seal(writing_channel, blob); sealed.failed()) {
+            [[maybe_unused]] status_t const abandoned = volume.drop(writing_channel, sorted_run_t::name_of(content_id));
             return sealed;
         }
-        return sorted_run_t::attach(volume, writing_lane, blob);
+        return sorted_run_t::attach(volume, writing_channel, blob);
     }
 
     /** Writes the header, the cells and the gathered values of one new run, and makes all three durable. */
-    static status_t write_sections_(volume_t& volume, io_lane_t& reading_lane, io_lane_t& writing_lane,
+    static status_t write_sections_(volume_t& volume, io_channel_t& reading_channel, io_channel_t& writing_channel,
                                     std::span<sorted_run_t const* const> sources, compaction_output_t const& output,
                                     planned_run_t const& planned, sorted_run_header_t const& header, blob_t const& blob,
                                     compaction_cancellation_t const* cancellation) noexcept {
-        std::uint64_t const block_bytes = rounded_down_to(writing_lane.streams().block_bytes(), portable_alignment_k);
+        std::uint64_t const block_bytes = rounded_down_to(writing_channel.streams().buffer_bytes(),
+                                                          portable_alignment_k);
         if (block_bytes < sorted_run_layout_t::header_bytes())
-            return {status_code_t::capacity_exhausted_k, "A lane's streaming block is shorter than a run's header"};
+            return {status_code_t::capacity_exhausted_k, "A channel's streaming block is shorter than a run's header"};
 
-        write_pipeline_t writer {volume.disk(), writing_lane, blob.target};
-        lane_drain_t<disk_t> const parked {volume.disk(), writing_lane};
+        write_pipeline_t writer {volume.disk(), writing_channel, blob.medium};
+        channel_drain_t<disk_t> const parked {volume.disk(), writing_channel};
         if (stopped_(cancellation)) return cancelled_status_();
 
         std::uint64_t const head_bytes = sorted_run_layout_t::header_bytes();
-        expected<buffer_lease_t> head = stage_or_harvest_(writer);
+        expected<pooled_buffer_t> head = acquire_buffer_or_poll_(writer);
         if (!head) return head.status();
         std::memset(head->bytes().data(), 0, static_cast<std::size_t>(head_bytes));
         std::memcpy(head->bytes().data(), &header, sizeof(header));
-        if (status_t const queued = writer.commit(std::move(*head), blob.slice(0, head_bytes)); queued.failed())
+        if (status_t const queued = writer.enqueue_write(std::move(*head), blob.slice(0, head_bytes)); queued.failed())
             return queued;
-        if (status_t const flushed = writer.flush(); flushed.failed()) return flushed;
+        if (status_t const flushed = writer.submit(); flushed.failed()) return flushed;
 
         if (status_t const cells = write_cells_(writer, output, planned, header, blob, block_bytes); cells.failed())
             return cells;
-        if (status_t const values = write_values_(volume, reading_lane, writer, sources, output, planned, header, blob,
-                                                  block_bytes, cancellation);
+        if (status_t const values = write_values_(volume, reading_channel, writer, sources, output, planned, header,
+                                                  blob, block_bytes, cancellation);
             values.failed())
             return values;
         return writer.make_durable();
@@ -505,18 +508,18 @@ class lsm_level_merger {
         for (std::uint64_t written = 0; written != section;) {
             std::uint64_t const room = section - written;
             std::uint64_t const chunk = block_bytes < room ? block_bytes : room;
-            expected<buffer_lease_t> block = stage_or_harvest_(writer);
+            expected<pooled_buffer_t> block = acquire_buffer_or_poll_(writer);
             if (!block) return block.status();
             std::span<byte_t> const bytes = block->bytes().first(static_cast<std::size_t>(chunk));
             std::uint64_t const left = filled > written ? filled - written : 0;
             std::uint64_t const carried = left < chunk ? left : chunk;
             if (carried != 0) std::memcpy(bytes.data(), cells + written, static_cast<std::size_t>(carried));
             std::memset(bytes.data() + carried, 0, static_cast<std::size_t>(chunk - carried));
-            if (status_t const queued = writer.commit(std::move(*block),
-                                                      blob.slice(sorted_run_layout_t::index_offset() + written, chunk));
+            if (status_t const queued = writer.enqueue_write(
+                    std::move(*block), blob.slice(sorted_run_layout_t::index_offset() + written, chunk));
                 queued.failed())
                 return queued;
-            if (status_t const flushed = writer.flush(); flushed.failed()) return flushed;
+            if (status_t const flushed = writer.submit(); flushed.failed()) return flushed;
             written += chunk;
         }
         return {};
@@ -528,7 +531,7 @@ class lsm_level_merger {
      *  @note Values are read into a scratch buffer a block deep plus one read block, so a value that
      *      straddles the boundary between two written blocks is still read whole exactly once.
      */
-    static status_t write_values_(volume_t& volume, io_lane_t& reading_lane, write_pipeline_t& writer,
+    static status_t write_values_(volume_t& volume, io_channel_t& reading_channel, write_pipeline_t& writer,
                                   std::span<sorted_run_t const* const> sources, compaction_output_t const& output,
                                   planned_run_t const& planned, sorted_run_header_t const& header, blob_t const& blob,
                                   std::uint64_t block_bytes, compaction_cancellation_t const* cancellation) noexcept {
@@ -537,12 +540,12 @@ class lsm_level_merger {
             std::uint64_t const section = sorted_run_layout_t::values_section_bytes(header.stored_values_bytes);
             if (section == 0) return {};
             std::uint64_t const values_offset = sorted_run_layout_t::values_offset(header.key_slots_count);
-            std::uint64_t const read_block = rounded_down_to(reading_lane.requests().block_bytes(),
+            std::uint64_t const read_block = rounded_down_to(reading_channel.requests().buffer_bytes(),
                                                              portable_alignment_k);
             if (read_block == 0)
-                return {status_code_t::capacity_exhausted_k, "A lane's block is shorter than one page"};
+                return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than one page"};
 
-            std::size_t const depth = reading_lane.owner().depth();
+            std::size_t const depth = reading_channel.queue_pair().depth();
             st::basic_vector<pending_piece_t> pending;
             if (pending.resize(depth) != st::status_t::success_k)
                 return {status_code_t::out_of_memory_k, "A merge could not track its reads in flight"};
@@ -550,18 +553,18 @@ class lsm_level_merger {
             if (scratch.resize(static_cast<std::size_t>(block_bytes + read_block)) != st::status_t::success_k)
                 return {status_code_t::out_of_memory_k, "A merge could not stage the values it gathers"};
 
-            read_pipeline_t reader {volume.disk(), reading_lane, volume.target()};
-            lane_drain_t<disk_t> const parked {volume.disk(), reading_lane};
+            read_pipeline_t reader {volume.disk(), reading_channel, volume.medium()};
+            channel_drain_t<disk_t> const parked {volume.disk(), reading_channel};
 
             status_t first;
-            auto sink = [&](harvested_block_t const& reaped) noexcept {
-                pending_piece_t const& piece = pending[reaped.tag % depth];
-                if (status_t const whole = require_whole(reaped); whole.failed()) {
+            auto sink = [&](completed_buffer_t const& completed) noexcept {
+                pending_piece_t const& piece = pending[completed.tag % depth];
+                if (status_t const whole = require_completed_in_full(completed); whole.failed()) {
                     if (first.succeeded()) first = whole;
                     return;
                 }
                 if (piece.carried == 0) return;
-                std::memcpy(scratch.data() + piece.destination, reaped.bytes.data() + piece.skipped, piece.carried);
+                std::memcpy(scratch.data() + piece.destination, completed.bytes.data() + piece.skipped, piece.carried);
             };
 
             std::uint64_t survivor = planned.first_key_slot;
@@ -572,12 +575,12 @@ class lsm_level_merger {
             std::uint32_t tag = 0;
             while (written != section) {
                 if (stopped_(cancellation)) {
-                    volume.disk().cancel(reading_lane.owner());
+                    volume.disk().cancel(reading_channel.queue_pair());
                     return cancelled_status_();
                 }
 
                 while (staged < block_bytes && survivor != survivors_end) {
-                    while (staged < block_bytes && survivor != survivors_end && reader.has_room()) {
+                    while (staged < block_bytes && survivor != survivors_end && reader.can_enqueue()) {
                         stored_value_migration_t const& migration = output.migrations[survivor];
                         if (migration.size == 0) {
                             ++survivor;
@@ -602,7 +605,7 @@ class lsm_level_merger {
                         piece.skipped = static_cast<std::uint32_t>(from - chunk_offset);
                         piece.carried = static_cast<std::uint32_t>(to > from ? to - from : 0);
                         pending[tag % depth] = piece;
-                        if (reader.offer(extent_t {window.offset + chunk_offset, length}, tag).failed()) break;
+                        if (reader.enqueue_read(extent_t {window.offset + chunk_offset, length}, tag).failed()) break;
                         ++tag;
                         staged += piece.carried;
                         chunk_offset += length;
@@ -611,27 +614,27 @@ class lsm_level_merger {
                             chunk_offset = 0;
                         }
                     }
-                    if (status_t const flushed = reader.flush(); flushed.failed()) return flushed;
-                    expected<std::size_t> const harvested = reader.harvest(sink);
-                    if (!harvested) return harvested.status();
+                    if (status_t const flushed = reader.submit(); flushed.failed()) return flushed;
+                    expected<std::size_t> const polled = reader.poll_completions(sink);
+                    if (!polled) return polled.status();
                     if (first.failed()) return first;
                 }
-                if (status_t const drained = reader.harvest_all(sink); drained.failed()) return drained;
+                if (status_t const drained = reader.poll_all_completions(sink); drained.failed()) return drained;
                 if (first.failed()) return first;
 
                 std::uint64_t const room = section - written;
                 std::uint64_t const chunk = block_bytes < room ? block_bytes : room;
                 std::uint64_t const carried = staged < chunk ? staged : chunk;
-                expected<buffer_lease_t> block = stage_or_harvest_(writer);
+                expected<pooled_buffer_t> block = acquire_buffer_or_poll_(writer);
                 if (!block) return block.status();
                 std::span<byte_t> const bytes = block->bytes().first(static_cast<std::size_t>(chunk));
                 if (carried != 0) std::memcpy(bytes.data(), scratch.data(), static_cast<std::size_t>(carried));
                 std::memset(bytes.data() + carried, 0, static_cast<std::size_t>(chunk - carried));
-                if (status_t const queued = writer.commit(std::move(*block),
-                                                          blob.slice(values_offset + written, chunk));
+                if (status_t const queued = writer.enqueue_write(std::move(*block),
+                                                                 blob.slice(values_offset + written, chunk));
                     queued.failed())
                     return queued;
-                if (status_t const flushed = writer.flush(); flushed.failed()) return flushed;
+                if (status_t const flushed = writer.submit(); flushed.failed()) return flushed;
                 written += chunk;
                 if (staged > carried)
                     std::memmove(scratch.data(), scratch.data() + carried, static_cast<std::size_t>(staged - carried));

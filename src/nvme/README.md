@@ -60,7 +60,7 @@ They belong on the blob surface of `volume.hpp` rather than on the disk router t
 Single-collection database transactions span one collection, database transactions span the collections of a database, and both are optimistic with a two-phase commit:
 
 - `stage` checks the read set for conflicts and flushes the write buffer when the changes would not fit, and a failure keeps the changes so they can be logged.
-- `commit` stages unless already staged, then applies the changes on the write path the stage took, which is the database's own claim and one lane.
+- `commit` stages unless already staged, then applies the changes on the write path the stage took, which is the database's own claim and one channel.
 - `rollback` drops the changes, and `renew` restarts the transaction with its changes kept, which only a transaction without reads may do.
 
 `read_set.hpp` records each watched stored key with the stamp and purpose of its watch, and the transaction registry keeps the keys of every commit made while an older transaction still runs.
@@ -91,13 +91,13 @@ Commits are ordered by the stamps the registry issues, which keeps a transaction
 - `ustore_snapshot_create`, `ustore_snapshot_export` and `ustore_snapshot_drop` answer `unsupported_k`, `ustore_get_metadata` does not claim `ustore_supports_snapshots_k`, and `ustore_snapshot_list` answers zero so a caller that lists before it clears still works.
 - Nothing compacts on its own, so a write carrying `ustore_option_write_flush_k` flushes and then compacts, and `ustore_database_control` serves `clear`, `reset`, `flush`, `compact`, `info` and `usage`.
 
-The engine mounts on files through whichever of the two file transports the probe settles on, `io_uring` where the kernel allows it and the blocking floor elsewhere, and `info` reports which one it got and, under `io_uring`, whether the slab is pinned.
+The engine mounts on files through whichever of the two file transports the probe settles on, `io_uring` where the kernel allows it and the blocking floor elsewhere, and `info` reports which one it got and, under `io_uring`, whether the arena is pinned.
 Only `ram` is refused, since the database the ABI names keeps its volumes in files.
 
 ## Compactions
 
 - Flushing a write buffer writes one L0 sorted run from key slots held in RAM.
-- Compaction is a call rather than a background loop: `compact` takes two lanes, merges the shallowest level that is over its bounds into the level below, and writes new sorted runs.
+- Compaction is a call rather than a background loop: `compact` takes two channels, merges the shallowest level that is over its bounds into the level below, and writes new sorted runs.
 - A sorted level with nothing to merge beneath it descends one level whole, and compacting the bottom level appends a new level below it.
 - A tree keeps two level sets and stores which of them is live, so a publication builds the next one beside the one readers hold and waits only on the readers of the set it retires.
 
@@ -109,16 +109,16 @@ GPU compaction is part of v1 and runs on both Hopper and Blackwell.
 ## Storage I/O
 
 A disk pairs a __volume__, which maps names to bytes, with a __transport__, which moves them.
-`ring.hpp` is the contract every transport meets: an owner takes a lease, registers the memory it will read into and the target it will read from, submits a batch and reaps its own completions.
-Nothing blocks, no ordering is promised between two submitted requests, and durability is written as submit, reap, flush, reap.
+`ring.hpp` is the contract every transport meets: a thread takes a queue pair, registers the memory it will read into and the target it will read from, submits a batch and polls its own completions.
+Nothing blocks, no ordering is promised between two submitted requests, and durability is written as submit, poll, flush, poll.
 The ring is exposed rather than hidden behind a blocking read because a blocking read reaches the depth of one thread, while a namespace wants thousands of commands outstanding.
 
-`io_discipline_t` in the configuration asks for a transport, and a mount probes rather than trusting a version number, since a kernel with io_uring still refuses it under Docker's seccomp profile:
+`io_transport_t` in the configuration asks for a transport, and a mount probes rather than trusting a version number, since a kernel with io_uring still refuses it under Docker's seccomp profile:
 
 - __`blocking_k`__ — `blocking_files_disk_t`, positioned reads and writes on the calling thread. Every platform has it, and it is where a refused probe falls back to.
-- __`uring_k`__ — `uring_files_disk_t`, one `io_uring` per lease through raw `io_uring_setup`, `io_uring_register` and `io_uring_enter`. No liburing, and Linux 6.12 or newer. Every ring is charged the whole slab against `RLIMIT_MEMLOCK`, so a ring the cap refuses addresses the slab by pointer instead of by registered slot, and the mount stays on `io_uring`.
+- __`io_uring_k`__ — `uring_files_disk_t`, one `io_uring` per queue pair through raw `io_uring_setup`, `io_uring_register` and `io_uring_enter`. No liburing, and Linux 6.12 or newer. Every ring is charged the whole arena against `RLIMIT_MEMLOCK`, so a ring the cap refuses addresses the arena by pointer instead of by registered slot, and the mount stays on `io_uring`.
 - __`spdk_k`__ — `spdk_disk_t`, the user-space NVMe driver behind `USTORE_USE_SPDK`. Its probe reads `/proc/meminfo` and the driver binding first, because `rte_eal_init` can otherwise call `exit` on the whole process.
-- __`ram_k`__ — `ram_disk_t`, volumes in memory for tests and benchmarks.
+- __`memory_k`__ — `ram_disk_t`, volumes in memory for tests and benchmarks.
 - __`automatic_k`__ — io_uring where the kernel allows it, the blocking floor where it does not. What the mount settled on is reported back rather than inferred.
 
 Above the transport, `volume.hpp` resolves a name to an extent.
@@ -126,11 +126,11 @@ A volume without a filesystem under it keeps its catalog in two slots of the vol
 `extent_allocator.hpp` rebuilds the free map from the catalog at mount, which is what makes an extent missing from the catalog free after a crash.
 `volume_router.hpp` places a blob on the volume with the most free space that still fits.
 
-Every I/O buffer comes from one registered slab, because a range can be pinned only once — io_uring answers `EBUSY` on re-registration and a growing arena cannot be pinned at all.
-`buffer_pool.hpp` carves that slab into fixed blocks, `io_lane.hpp` gives each lease its own pools and reaping room, and `io_pipeline.hpp` holds the ring at its depth by refilling as completions retire rather than submitting a batch and waiting for all of it.
+Every I/O buffer comes from one registered arena, because a range can be pinned only once — io_uring answers `EBUSY` on re-registration and a growing arena cannot be pinned at all.
+`buffer_pool.hpp` carves that arena into fixed blocks, `io_channel.hpp` gives each queue pair its own pools and polling room, and `io_pipeline.hpp` holds the ring at its depth by refilling as completions retire rather than submitting a batch and waiting for all of it.
 
-Depth comes from leases rather than threads.
-A dispatch blocks until all its threads return and admits one caller at a time, and ForkUnion bans nested parallelism, so a batch fanned out inside a reap would both serialize two owners and fork a pool that is already forked.
+Depth comes from queue pairs rather than threads.
+A dispatch blocks until all its threads return and admits one caller at a time, and ForkUnion bans nested parallelism, so a batch fanned out inside a poll would both serialize two owners and fork a pool that is already forked.
 
 ## Graph Fast Path
 

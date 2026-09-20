@@ -22,7 +22,7 @@
 #include <fmt/format.h>
 #include <yyjson.h>
 
-#include "nvme/io_lane.hpp"        // `lane_config_t`
+#include "nvme/io_channel.hpp"     // `io_channel_config_t`
 #include "nvme/storage_limits.hpp" // `storage_limits_t`
 #include "nvme/stored_value.hpp"   // `stored_value_size_t`
 #include "nvme/types.hpp"          // `string_t`, `uuid_t`, `unlimited_resource_k`
@@ -47,22 +47,22 @@ struct data_directory_config_t {
  *  reported back rather than inferred, since @c automatic_k resolves differently on a kernel without
  *  io_uring, inside a seccomp profile that refuses it, and on a machine that has both.
  */
-enum class io_discipline_t : std::uint8_t {
+enum class io_transport_t : std::uint8_t {
 
     /** io_uring where the kernel offers it, and the blocking floor everywhere else. */
     automatic_k,
 
-    /** Positioned reads and writes on the reaping thread, which every platform has. */
+    /** Positioned reads and writes on the polling thread, which every platform has. */
     blocking_k,
 
-    /** io_uring on unbuffered files, refused without a kernel ring; a slab the memlock cap refuses goes unpinned. */
-    uring_k,
+    /** io_uring on unbuffered files, refused without a kernel ring; an arena the memlock cap refuses goes unpinned. */
+    io_uring_k,
 
     /** SPDK's user-space driver, which no mount opens yet. */
     spdk_k,
 
     /** Host memory, which a suite and a benchmark ask for and a database never does. */
-    ram_k,
+    memory_k,
 };
 
 /**
@@ -76,13 +76,13 @@ struct resources_config_t {
     std::size_t gpu_memory_limit = 0;
     st::basic_vector<int> gpu_devices;
     string_t directory;
-    io_discipline_t io_discipline = io_discipline_t::automatic_k;
-    lane_config_t lanes;
-    std::size_t spare_lanes = 2;
+    io_transport_t io_transport = io_transport_t::automatic_k;
+    io_channel_config_t channels;
+    std::size_t shared_io_channels = 2;
     st::basic_vector<data_directory_config_t> data_directories;
 };
 
-/** Half the logical cores, between one and eight, as every thread pins a lane of 12 MiB by default. */
+/** Half the logical cores, between one and eight, as every thread pins a channel of 12 MiB by default. */
 [[nodiscard]] inline std::size_t derived_background_threads(std::size_t logical_cores_count) noexcept {
     return std::clamp<std::size_t>(logical_cores_count / 2, 1, 8);
 }
@@ -419,14 +419,14 @@ template <std::unsigned_integral value_>
     return true;
 }
 
-/** Reads an I/O discipline from its name. */
-[[nodiscard]] inline bool read_json(yyjson_val* value, io_discipline_t& io_discipline) noexcept {
+/** Reads an I/O transport from its name. */
+[[nodiscard]] inline bool read_json(yyjson_val* value, io_transport_t& io_transport) noexcept {
     std::string_view const name = json_string_view(value);
-    if (name == "automatic") io_discipline = io_discipline_t::automatic_k;
-    else if (name == "blocking") io_discipline = io_discipline_t::blocking_k;
-    else if (name == "uring") io_discipline = io_discipline_t::uring_k;
-    else if (name == "spdk") io_discipline = io_discipline_t::spdk_k;
-    else if (name == "ram") io_discipline = io_discipline_t::ram_k;
+    if (name == "automatic") io_transport = io_transport_t::automatic_k;
+    else if (name == "blocking") io_transport = io_transport_t::blocking_k;
+    else if (name == "io_uring") io_transport = io_transport_t::io_uring_k;
+    else if (name == "spdk") io_transport = io_transport_t::spdk_k;
+    else if (name == "memory") io_transport = io_transport_t::memory_k;
     else return false;
     return true;
 }
@@ -494,12 +494,12 @@ inline status_t read_json_version(yyjson_val* root) noexcept {
            read_json_bytes_if_present(root, "value_max_size", config.value_max_size);
 }
 
-/** Reads the lane keys of a flat configuration document, which size every I/O buffer of a mount. */
-[[nodiscard]] inline bool read_json_members(yyjson_val* root, lane_config_t& config) noexcept {
-    return read_json_bytes_if_present(root, "io_block_bytes", config.request_block_bytes) &&
-           read_json_if_present(root, "io_blocks_per_lane", config.request_blocks_count) &&
-           read_json_bytes_if_present(root, "io_stream_block_bytes", config.stream_block_bytes) &&
-           read_json_if_present(root, "io_streams_per_lane", config.stream_blocks_count) &&
+/** Reads the channel keys of a flat configuration document, which size every I/O buffer of a mount. */
+[[nodiscard]] inline bool read_json_members(yyjson_val* root, io_channel_config_t& config) noexcept {
+    return read_json_bytes_if_present(root, "io_buffer_bytes", config.request_buffer_bytes) &&
+           read_json_if_present(root, "io_buffers_per_channel", config.request_buffers_count) &&
+           read_json_bytes_if_present(root, "io_stream_buffer_bytes", config.stream_buffer_bytes) &&
+           read_json_if_present(root, "io_stream_buffers_per_channel", config.stream_buffers_count) &&
            read_json_if_present(root, "io_depth", config.depth);
 }
 
@@ -517,9 +517,9 @@ inline status_t read_config(yyjson_val* root, resources_config_t& config) {
                       read_json_bytes_if_present(root, "gpu_memory_limit", config.gpu_memory_limit) &&
                       read_json_if_present(root, "gpu_devices", config.gpu_devices) &&
                       read_json_if_present(root, "directory", config.directory) &&
-                      read_json_if_present(root, "io_discipline", config.io_discipline) &&
-                      read_json_members(root, config.lanes) &&
-                      read_json_if_present(root, "io_spare_lanes", config.spare_lanes) &&
+                      read_json_if_present(root, "io_transport", config.io_transport) &&
+                      read_json_members(root, config.channels) &&
+                      read_json_if_present(root, "io_shared_channels", config.shared_io_channels) &&
                       read_json_if_present(root, "data_directories", config.data_directories);
     if (!read) return status_t {status_code_t::invalid_argument_k, "Invalid config"};
     return status_t {};
@@ -893,7 +893,7 @@ status_t save_schema(char const* file_path, schema_ const& schema) noexcept {
     yyjson_mut_doc_free(document);
 
     if (!written) return status_t {status_code_t::out_of_memory_k, "Failed to allocate memory"};
-    if (!saved) return status_t {status_code_t::io_k, "Failed to submit file request"};
+    if (!saved) return status_t {status_code_t::input_output_k, "Failed to submit file request"};
     return status_t {};
 }
 
@@ -929,13 +929,14 @@ template <issue_sink_concept sink_>
     if (!config.gpu_devices.empty() && config.gpu_memory_limit < 4 * 1024 * 1024)
         return report_issue(sink, issue_kind_t::error_k, "GPU memory limit leaves no room for device buffers");
     if (config.directory.empty()) return report_issue(sink, issue_kind_t::error_k, "Metadata directory is not set");
-    if (config.lanes.depth == 0) return report_issue(sink, issue_kind_t::error_k, "I/O depth is not set");
-    if (config.lanes.request_blocks_count == 0 || config.lanes.stream_blocks_count == 0)
-        return report_issue(sink, issue_kind_t::error_k, "A lane needs a request block and a streaming block");
-    if (config.lanes.request_block_bytes == 0 || config.lanes.stream_block_bytes == 0)
-        return report_issue(sink, issue_kind_t::error_k, "I/O blocks leave a lane nothing to transfer through");
-    if (config.spare_lanes == 0)
-        return report_issue(sink, issue_kind_t::error_k, "A mount keeps a lane for the threads outside its executor");
+    if (config.channels.depth == 0) return report_issue(sink, issue_kind_t::error_k, "I/O depth is not set");
+    if (config.channels.request_buffers_count == 0 || config.channels.stream_buffers_count == 0)
+        return report_issue(sink, issue_kind_t::error_k, "A channel needs a request block and a streaming block");
+    if (config.channels.request_buffer_bytes == 0 || config.channels.stream_buffer_bytes == 0)
+        return report_issue(sink, issue_kind_t::error_k, "I/O blocks leave a channel nothing to transfer through");
+    if (config.shared_io_channels == 0)
+        return report_issue(sink, issue_kind_t::error_k,
+                            "A mount keeps a channel for the threads outside its executor");
 
     for (std::size_t index = 0; index < config.data_directories.size(); ++index)
         for (std::size_t later = index + 1; later < config.data_directories.size(); ++later)

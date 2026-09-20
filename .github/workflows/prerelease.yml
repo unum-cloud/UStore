@@ -28,7 +28,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/acquire@v7
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -55,7 +55,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/acquire@v7
         with:
           fetch-depth: 0
       - name: Set Up Python
@@ -107,7 +107,7 @@ jobs:
           - { name: "Linux x86-64 (TSan)", os: ubuntu-24.04, preset: tsan, configure: "-DUSTORE_USE_LEVELDB=OFF" }
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/acquire@v7
       - name: Pull Git submodules
         run: git submodule update --init --recursive
 
@@ -153,7 +153,7 @@ jobs:
         python-version: ["3.12", "3.14t"]
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/acquire@v7
       - name: Pull Git submodules
         run: git submodule update --init --recursive
       - name: Set Up Python
@@ -190,7 +190,7 @@ jobs:
           - { engine: leveldb, define: USTORE_USE_LEVELDB }
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/acquire@v7
       - name: Pull Git submodules
         run: git submodule update --init --recursive
       - name: Set Up Python
@@ -219,7 +219,7 @@ jobs:
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, windows-2025]
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/acquire@v7
       - name: Pull Git submodules
         run: git submodule update --init --recursive
       - name: Set Up Rust
@@ -245,7 +245,7 @@ jobs:
         python-version: ["312", "314t"]
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/acquire@v7
       - name: Pull Git submodules
         run: git submodule update --init --recursive
       - name: Build Wheels

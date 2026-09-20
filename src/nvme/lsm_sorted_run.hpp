@@ -10,7 +10,7 @@
  *  transfer, which is exactly what a truncated run looks like.
  *
  *  The three sections are disjoint, so the write path needs no ordering between them: it stages the
- *  header, the cells and the values into one reservation, reaps them all, flushes once, and only then
+ *  header, the cells and the values into one reservation, polls them all, flushes once, and only then
  *  asks the volume to record the name.
  */
 
@@ -30,13 +30,13 @@
 #include <ustore/status.hpp> // `status_t`, `status_code_t`, `expected`
 #include <ustore/types.hpp>  // `byte_t`
 
-#include "nvme/buffer_pool.hpp"      // `buffer_lease_t`
+#include "nvme/buffer_pool.hpp"      // `pooled_buffer_t`
 #include "nvme/catalog.hpp"          // `blob_name_t`, `blob_kind_t`, `magic_of`
 #include "nvme/extent.hpp"           // `extent_t`, `rounded_up_to`, `portable_alignment_k`
-#include "nvme/io_lane.hpp"          // `io_lane_t`
-#include "nvme/io_pipeline.hpp"      // `basic_read_pipeline`, `basic_write_pipeline`, `require_whole`
+#include "nvme/io_channel.hpp"       // `io_channel_t`
+#include "nvme/io_pipeline.hpp"      // `basic_read_pipeline`, `basic_write_pipeline`, `require_completed_in_full`
 #include "nvme/key_slot.hpp"         // `key_slot`
-#include "nvme/ring.hpp"             // `read_request`, `reap_at_least`
+#include "nvme/ring.hpp"             // `read_request`, `poll_completions_at_least`
 #include "nvme/sorted_run_index.hpp" // `sorted_run_index_layout_t`, `round_up`
 #include "nvme/stored_value.hpp"     // `stored_value_size_t`
 #include "nvme/types.hpp"            // `value_layout_t`, `is_inline`, `btree_branching_k`
@@ -188,7 +188,7 @@ class sorted_run_layout {
  *  @brief One immutable run of key slots and the values they locate, held as one blob of one volume.
  *
  *  The run borrows the volume and the blob, and owns only the cells of its index. Every call that
- *  moves bytes takes the lane the calling thread holds, since a lease belongs to one thread while it
+ *  moves bytes takes the channel the calling thread holds, since a queue pair belongs to one thread while it
  *  is held and a run outlives every thread that ever reads it.
  */
 template <typename key_slot_type_, typename volume_type_>
@@ -273,14 +273,14 @@ class lsm_sorted_run {
     /**
      *  @brief Writes a whole run into a fresh reservation of @p volume and records it under @p content_id.
      *  @param[inout] volume The volume the blob is reserved on, borrowed and outliving the run.
-     *  @param[inout] lane The lane the sections are staged on, held by the calling thread.
+     *  @param[inout] channel The channel the sections are staged on, held by the calling thread.
      *  @param[in] content_id The identifier the run is named by, which must name no blob yet.
      *  @param[in] key_slots The key slots in ascending order of their keys, which the index is laid from.
      *  @param[in] stored_values The values back to back, located from @c values_offset of the layout.
      *  @param[in] value_max_size The largest value the writing collection admits, kept for a reader.
      *  @return The run, opened again from the volume, or the status that stopped the write.
      */
-    static expected<lsm_sorted_run> write(volume_type_& volume, io_lane_t& lane, uuid_t const& content_id,
+    static expected<lsm_sorted_run> write(volume_type_& volume, io_channel_t& channel, uuid_t const& content_id,
                                           std::span<key_slot_t const> key_slots, std::span<byte_t const> stored_values,
                                           stored_value_size_t value_max_size) noexcept {
         if (!content_id.is_valid())
@@ -291,9 +291,9 @@ class lsm_sorted_run {
             if (!(key_slots[index - 1].stored_key < key_slots[index].stored_key))
                 return status_t {status_code_t::invalid_argument_k, "A run takes its key slots in ascending order"};
 
-        std::uint64_t const block_bytes = rounded_down_to(lane.requests().block_bytes(), portable_alignment_k);
+        std::uint64_t const block_bytes = rounded_down_to(channel.requests().buffer_bytes(), portable_alignment_k);
         if (block_bytes < sorted_run_layout_t::header_bytes())
-            return status_t {status_code_t::capacity_exhausted_k, "A lane's block is shorter than a run's header"};
+            return status_t {status_code_t::capacity_exhausted_k, "A channel's block is shorter than a run's header"};
 
         sorted_run_header_t header {};
         header.magic = sorted_run_magic_k;
@@ -312,44 +312,46 @@ class lsm_sorted_run {
         if (!reserved) return reserved.status();
         blob_t const blob = *reserved;
 
-        if (status_t const written = write_sections_(volume, lane, blob, header, key_slots, stored_values, block_bytes);
+        if (status_t const written = write_sections_(volume, channel, blob, header, key_slots, stored_values,
+                                                     block_bytes);
             written.failed()) {
-            [[maybe_unused]] status_t const abandoned = volume.drop(lane, name_of(content_id));
+            [[maybe_unused]] status_t const abandoned = volume.drop(channel, name_of(content_id));
             return written;
         }
-        if (status_t const sealed = volume.seal(lane, blob); sealed.failed()) {
-            [[maybe_unused]] status_t const abandoned = volume.drop(lane, name_of(content_id));
+        if (status_t const sealed = volume.seal(channel, blob); sealed.failed()) {
+            [[maybe_unused]] status_t const abandoned = volume.drop(channel, name_of(content_id));
             return sealed;
         }
-        return attach(volume, lane, blob);
+        return attach(volume, channel, blob);
     }
 
     /** Opens the run @p content_id names on @p volume, or answers @c not_found_k when it names none. */
-    static expected<lsm_sorted_run> open(volume_type_& volume, io_lane_t& lane, uuid_t const& content_id) noexcept {
+    static expected<lsm_sorted_run> open(volume_type_& volume, io_channel_t& channel,
+                                         uuid_t const& content_id) noexcept {
         expected<blob_t> const found = volume.find(name_of(content_id));
         if (!found) return found.status();
-        return attach(volume, lane, *found);
+        return attach(volume, channel, *found);
     }
 
     /**
      *  @brief Reads the header and the whole index of @p blob, which is everything a run keeps in memory.
      *  @param[inout] volume The volume the run reads through afterwards, borrowed and outliving it.
-     *  @param[inout] lane The lane the header and the index are read on, held by the calling thread.
+     *  @param[inout] channel The channel the header and the index are read on, held by the calling thread.
      *  @param[in] blob The reservation the run occupies, as a lookup or a router handed it over.
      *  @return The run, or @c status_code_t::malformed_k for a blob shorter than the run it claims.
      */
-    static expected<lsm_sorted_run> attach(volume_type_& volume, io_lane_t& lane, blob_t const& blob) noexcept {
+    static expected<lsm_sorted_run> attach(volume_type_& volume, io_channel_t& channel, blob_t const& blob) noexcept {
         lsm_sorted_run run;
         run.volume_ = &volume;
         run.blob_ = blob;
-        if (status_t const head = run.read_header_(lane); head.failed()) return head;
-        if (status_t const index = run.read_index_(lane); index.failed()) return index;
+        if (status_t const head = run.read_header_(channel); head.failed()) return head;
+        if (status_t const index = run.read_index_(channel); index.failed()) return index;
         return run;
     }
 
     /** Forgets the run @p content_id names and returns its bytes to @p volume. */
-    static status_t drop(volume_type_& volume, io_lane_t& lane, uuid_t const& content_id) noexcept {
-        return volume.drop(lane, name_of(content_id));
+    static status_t drop(volume_type_& volume, io_channel_t& channel, uuid_t const& content_id) noexcept {
+        return volume.drop(channel, name_of(content_id));
     }
 
 #pragma endregion Setup and Teardown
@@ -444,17 +446,18 @@ class lsm_sorted_run {
 #pragma region Batched Reads
 
     /**
-     *  @brief Reads the values of the key slots at @p positions, refilling the lane as completions retire.
-     *  @param[inout] lane The lane the reads are submitted and reaped on, held by the calling thread.
+     *  @brief Reads the values of the key slots at @p positions, refilling the channel as completions retire.
+     *  @param[inout] channel The channel the reads are submitted and completed on, held by the calling thread.
      *  @param[in] positions Sorted positions of the key slots whose values are wanted.
-     *  @param[in] sink Called as @c sink(request, offset, bytes) while the lane still owns the block.
+     *  @param[in] sink Called as @c sink(request, offset, bytes) while the channel still owns the block.
      *  @return Success, or the first failure any of the blocks reported.
      *
      *  @note A value larger than one block arrives as several calls, each carrying the bytes of the
      *      value before it, and a key slot that locates nothing is reported once with no bytes.
      */
     template <typename sink_type_>
-    status_t read_values(io_lane_t& lane, std::span<std::uint64_t const> positions, sink_type_&& sink) const noexcept {
+    status_t read_values(io_channel_t& channel, std::span<std::uint64_t const> positions,
+                         sink_type_&& sink) const noexcept {
         if constexpr (holds_values_inline_k) {
             for (std::size_t request = 0; request != positions.size(); ++request) {
                 key_slot_t const& slot = key_slot(positions[request]);
@@ -464,31 +467,31 @@ class lsm_sorted_run {
             return {};
         }
         else {
-            std::uint64_t const block_bytes = rounded_down_to(lane.requests().block_bytes(), portable_alignment_k);
+            std::uint64_t const block_bytes = rounded_down_to(channel.requests().buffer_bytes(), portable_alignment_k);
             if (block_bytes == 0)
-                return {status_code_t::capacity_exhausted_k, "A lane's block is shorter than one page"};
+                return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than one page"};
 
-            std::size_t const depth = lane.owner().depth();
+            std::size_t const depth = channel.queue_pair().depth();
             st::basic_vector<pending_read_t> pending;
             if (pending.resize(depth) != st::status_t::success_k)
                 return {status_code_t::out_of_memory_k, "A run could not track its reads in flight"};
 
-            read_pipeline_t reader {volume_->disk(), lane, blob_.target};
+            read_pipeline_t reader {volume_->disk(), channel, blob_.medium};
             status_t first;
-            auto adapter = [&](harvested_block_t const& reaped) noexcept {
-                pending_read_t const& piece = pending[reaped.tag % depth];
-                if (status_t const whole = require_whole(reaped); whole.failed()) {
+            auto adapter = [&](completed_buffer_t const& completed) noexcept {
+                pending_read_t const& piece = pending[completed.tag % depth];
+                if (status_t const whole = require_completed_in_full(completed); whole.failed()) {
                     if (first.succeeded()) first = whole;
                     return;
                 }
-                sink(piece.request, piece.offset, reaped.bytes.subspan(piece.skipped, piece.carried));
+                sink(piece.request, piece.offset, completed.bytes.subspan(piece.skipped, piece.carried));
             };
 
             std::size_t request = 0;
             std::uint64_t chunk = 0;
             std::uint32_t tag = 0;
             while (request != positions.size() || reader.outstanding() != 0) {
-                while (request != positions.size() && reader.has_room()) {
+                while (request != positions.size() && reader.can_enqueue()) {
                     value_window_t const window = value_window(positions[request]);
                     if (window.extent.length == 0) {
                         sink(request, std::uint64_t {0}, std::span<byte_t const> {});
@@ -500,7 +503,7 @@ class lsm_sorted_run {
                     std::uint64_t const room = window.extent.length - at;
                     std::uint64_t const length = block_bytes < room ? block_bytes : room;
                     pending[tag % depth] = piece_of_(window, request, at, length);
-                    if (reader.offer(extent_t {window.extent.offset + at, length}, tag).failed()) break;
+                    if (reader.enqueue_read(extent_t {window.extent.offset + at, length}, tag).failed()) break;
                     ++tag;
                     if (at + length == window.extent.length) {
                         ++request;
@@ -508,9 +511,9 @@ class lsm_sorted_run {
                     }
                     else ++chunk;
                 }
-                if (status_t const flushed = reader.flush(); flushed.failed()) return flushed;
-                expected<std::size_t> const harvested = reader.harvest(adapter);
-                if (!harvested) return harvested.status();
+                if (status_t const flushed = reader.submit(); flushed.failed()) return flushed;
+                expected<std::size_t> const polled = reader.poll_completions(adapter);
+                if (!polled) return polled.status();
             }
             return first;
         }
@@ -577,35 +580,35 @@ class lsm_sorted_run {
     }
 
     /** Stages the header, the cells and the values into @p blob, and makes all three durable at once. */
-    static status_t write_sections_(volume_type_& volume, io_lane_t& lane, blob_t const& blob,
+    static status_t write_sections_(volume_type_& volume, io_channel_t& channel, blob_t const& blob,
                                     sorted_run_header_t const& header, std::span<key_slot_t const> key_slots,
                                     std::span<byte_t const> stored_values, std::uint64_t block_bytes) noexcept {
-        write_pipeline_t writer {volume.disk(), lane, blob.target};
+        write_pipeline_t writer {volume.disk(), channel, blob.medium};
         sorted_run_index_layout_t const layout {header.key_slots_count, header.branching};
 
         std::uint64_t const head_bytes = sorted_run_layout_t::header_bytes();
-        expected<buffer_lease_t> head = writer.stage_or_harvest();
+        expected<pooled_buffer_t> head = writer.acquire_buffer_or_poll();
         if (!head) return head.status();
         std::memset(head->bytes().data(), 0, static_cast<std::size_t>(head_bytes));
         std::memcpy(head->bytes().data(), &header, sizeof(header));
-        if (status_t const queued = writer.commit(std::move(*head), blob.slice(0, head_bytes)); queued.failed())
+        if (status_t const queued = writer.enqueue_write(std::move(*head), blob.slice(0, head_bytes)); queued.failed())
             return queued;
-        if (status_t const flushed = writer.flush(); flushed.failed()) return flushed;
+        if (status_t const flushed = writer.submit(); flushed.failed()) return flushed;
 
         std::uint64_t const index_section = sorted_run_layout_t::index_section_bytes(header.key_slots_count);
         for (std::uint64_t written = 0; written != index_section;) {
             std::uint64_t const room = index_section - written;
             std::uint64_t const chunk = block_bytes < room ? block_bytes : room;
-            expected<buffer_lease_t> block = writer.stage_or_harvest();
+            expected<pooled_buffer_t> block = writer.acquire_buffer_or_poll();
             if (!block) return block.status();
             std::span<byte_t> const bytes = block->bytes().first(static_cast<std::size_t>(chunk));
             std::memset(bytes.data(), 0, bytes.size());
             paint_cells_(key_slots, layout, written, bytes);
-            if (status_t const queued = writer.commit(std::move(*block),
-                                                      blob.slice(sorted_run_layout_t::index_offset() + written, chunk));
+            if (status_t const queued = writer.enqueue_write(
+                    std::move(*block), blob.slice(sorted_run_layout_t::index_offset() + written, chunk));
                 queued.failed())
                 return queued;
-            if (status_t const flushed = writer.flush(); flushed.failed()) return flushed;
+            if (status_t const flushed = writer.submit(); flushed.failed()) return flushed;
             written += chunk;
         }
 
@@ -614,7 +617,7 @@ class lsm_sorted_run {
         for (std::uint64_t written = 0; written != values_section;) {
             std::uint64_t const room = values_section - written;
             std::uint64_t const chunk = block_bytes < room ? block_bytes : room;
-            expected<buffer_lease_t> block = writer.stage_or_harvest();
+            expected<pooled_buffer_t> block = writer.acquire_buffer_or_poll();
             if (!block) return block.status();
             std::span<byte_t> const bytes = block->bytes().first(static_cast<std::size_t>(chunk));
             std::uint64_t const left = stored_values.size() > written ? stored_values.size() - written : 0;
@@ -622,10 +625,11 @@ class lsm_sorted_run {
             if (carried != 0)
                 std::memcpy(bytes.data(), stored_values.data() + written, static_cast<std::size_t>(carried));
             std::memset(bytes.data() + carried, 0, static_cast<std::size_t>(chunk - carried));
-            if (status_t const queued = writer.commit(std::move(*block), blob.slice(values_offset + written, chunk));
+            if (status_t const queued = writer.enqueue_write(std::move(*block),
+                                                             blob.slice(values_offset + written, chunk));
                 queued.failed())
                 return queued;
-            if (status_t const flushed = writer.flush(); flushed.failed()) return flushed;
+            if (status_t const flushed = writer.submit(); flushed.failed()) return flushed;
             written += chunk;
         }
 
@@ -633,27 +637,27 @@ class lsm_sorted_run {
     }
 
     /** Reads the first page of the blob and accepts it only as a run this reader can serve. */
-    status_t read_header_(io_lane_t& lane) noexcept {
+    status_t read_header_(io_channel_t& channel) noexcept {
         std::uint64_t const head_bytes = sorted_run_layout_t::header_bytes();
-        if (lane.requests().block_bytes() < head_bytes)
-            return {status_code_t::capacity_exhausted_k, "A lane's block is shorter than a run's header"};
+        if (channel.requests().buffer_bytes() < head_bytes)
+            return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than a run's header"};
         extent_t const piece = blob_.slice(0, head_bytes);
         if (piece.length != head_bytes) return {status_code_t::malformed_k, "The run is shorter than its header"};
 
-        read_pipeline_t reader {volume_->disk(), lane, blob_.target};
-        if (status_t const offered = reader.offer(piece, 0); offered.failed()) return offered;
-        if (status_t const flushed = reader.flush(); flushed.failed()) return flushed;
+        read_pipeline_t reader {volume_->disk(), channel, blob_.medium};
+        if (status_t const offered = reader.enqueue_read(piece, 0); offered.failed()) return offered;
+        if (status_t const flushed = reader.submit(); flushed.failed()) return flushed;
 
         sorted_run_header_t header {};
         status_t moved;
-        auto sink = [&](harvested_block_t const& reaped) noexcept {
-            if (status_t const whole = require_whole(reaped); whole.failed()) {
+        auto sink = [&](completed_buffer_t const& completed) noexcept {
+            if (status_t const whole = require_completed_in_full(completed); whole.failed()) {
                 moved = whole;
                 return;
             }
-            std::memcpy(&header, reaped.bytes.data(), sizeof(header));
+            std::memcpy(&header, completed.bytes.data(), sizeof(header));
         };
-        if (status_t const harvested = reader.harvest_all(sink); harvested.failed()) return harvested;
+        if (status_t const polled = reader.poll_all_completions(sink); polled.failed()) return polled;
         if (moved.failed()) return {status_code_t::malformed_k, "A run's header did not read whole"};
 
         if (header.magic != sorted_run_magic_k) return {status_code_t::malformed_k, "The blob is no sorted run"};
@@ -671,17 +675,17 @@ class lsm_sorted_run {
     }
 
     /** Reads the whole index into owned memory, which a short transfer makes a truncated run. */
-    status_t read_index_(io_lane_t& lane) noexcept {
+    status_t read_index_(io_channel_t& channel) noexcept {
         std::uint64_t const cells = sorted_run_layout_t::cells_count(header_.key_slots_count);
         if (cells_.resize(static_cast<std::size_t>(cells)) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A run could not hold its index"};
         std::uint64_t const section = sorted_run_layout_t::index_section_bytes(header_.key_slots_count);
         if (section == 0) return {};
 
-        expected<buffer_lease_t> block = lane.streams().acquire();
+        expected<pooled_buffer_t> block = channel.streams().acquire();
         if (!block) return block.status();
         std::uint64_t const room = rounded_down_to(block->size(), portable_alignment_k);
-        if (room == 0) return {status_code_t::capacity_exhausted_k, "A lane's streaming block holds no index page"};
+        if (room == 0) return {status_code_t::capacity_exhausted_k, "A channel's streaming block holds no index page"};
 
         std::uint64_t const wanted = sorted_run_layout_t::index_bytes(header_.key_slots_count);
         byte_t* const into = reinterpret_cast<byte_t*>(cells_.data());
@@ -690,16 +694,18 @@ class lsm_sorted_run {
             extent_t const piece = blob_.slice(sorted_run_layout_t::index_offset() + read, chunk);
             if (piece.length != chunk) return {status_code_t::malformed_k, "The run is shorter than its index"};
 
-            std::array<request_t, 1> const batch {read_request(blob_.target, piece, block->place(), lane.next_token())};
-            expected<std::size_t> const taken = volume_->disk().submit(lane.owner(),
+            std::array<request_t, 1> const batch {
+                read_request(blob_.medium, piece, block->reference(), channel.next_token())};
+            expected<std::size_t> const taken = volume_->disk().submit(channel.queue_pair(),
                                                                        std::span<request_t const> {batch});
             if (!taken) return taken.status();
-            if (*taken != 1) return {status_code_t::io_k, "The ring would not take an index read"};
-            expected<std::size_t> const reaped = reap_at_least(volume_->disk(), lane.owner(), lane.reaping_room(), 1);
-            if (!reaped) return reaped.status();
-            if (*reaped == 0) return {status_code_t::io_k, "An index read never completed"};
-            completion_t const& completion = lane.reaping_room().front();
-            if (!completion.whole())
+            if (*taken != 1) return {status_code_t::input_output_k, "The ring would not take an index read"};
+            expected<std::size_t> const completed = poll_completions_at_least(volume_->disk(), channel.queue_pair(),
+                                                                              channel.completion_buffer(), 1);
+            if (!completed) return completed.status();
+            if (*completed == 0) return {status_code_t::input_output_k, "An index read never completed"};
+            completion_t const& completion = channel.completion_buffer().front();
+            if (!completion.completed_in_full())
                 return completion.status.failed()
                            ? completion.status
                            : status_t {status_code_t::malformed_k, "The run is shorter than its index"};

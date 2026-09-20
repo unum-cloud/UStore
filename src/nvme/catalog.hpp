@@ -154,7 +154,7 @@ struct volume_header_t {
 };
 
 /** Stamps @p header with the checksum a mount will verify it by. */
-inline void seal_header_checksum(volume_header_t& header) noexcept {
+inline void set_header_checksum(volume_header_t& header) noexcept {
     header.checksum = 0;
     header.checksum = crc32c(viewed_bytes(header));
 }
@@ -181,8 +181,8 @@ struct catalog_slot_header_t {
     /** Bytes those records occupy, padding included. */
     std::uint32_t records_bytes = 0;
 
-    /** The stamp the next entry takes, so a remount never reissues one. */
-    std::uint64_t next_stamp = 0;
+    /** The sequence_number the next entry takes, so a remount never reissues one. */
+    std::uint64_t next_sequence_number = 0;
 
     /** CRC-32C of this header with the field zeroed, continued over @c records_bytes of records. */
     std::uint32_t checksum = 0;
@@ -216,7 +216,7 @@ struct catalog_record_t {
     std::uint64_t content_length = 0;
 
     /** When the entry was made, ordering two blobs that claim the same role. */
-    std::uint64_t stamp = 0;
+    std::uint64_t sequence_number = 0;
 };
 
 #pragma pack(pop)
@@ -253,7 +253,7 @@ struct catalog_entry_t {
     std::uint64_t content_length = 0;
 
     /** When the entry was made. */
-    std::uint64_t stamp = 0;
+    std::uint64_t sequence_number = 0;
 
     /** The name, which borrows the entry and dies with it. */
     [[nodiscard]] blob_name_t name() const noexcept { return blob_name_t {name_storage.data(), name_bytes}; }
@@ -322,7 +322,7 @@ class catalog_t {
             entry.kind = static_cast<blob_kind_t>(record.kind);
             entry.extent = extent_t {record.extent_offset, record.extent_length};
             entry.content_length = record.content_length;
-            entry.stamp = record.stamp;
+            entry.sequence_number = record.sequence_number;
             if (parsed.push_back(std::move(entry)) != st::status_t::success_k)
                 return status_t {status_code_t::out_of_memory_k, "The catalog index would not grow"};
             offset += record_bytes;
@@ -331,14 +331,14 @@ class catalog_t {
             return status_t {status_code_t::malformed_k, "The catalog records hold bytes no entry claims"};
 
         entries_ = std::move(parsed);
-        next_stamp_ = header.next_stamp;
+        next_sequence_number_ = header.next_sequence_number;
         return {};
     }
 
     /**
      *  @brief Writes the whole index into @p image as one slot of @p generation.
      *  @param[out] image The slot to write, which is left untouched when it is too small.
-     *  @param[in] generation What to stamp the slot with, which the mount raises on every publish.
+     *  @param[in] generation What to sequence_number the slot with, which the mount raises on every publish.
      *  @return Bytes written, or @c status_code_t::capacity_exhausted_k when the slot is too small.
      */
     expected<std::uint64_t> save(std::span<byte_t> image, std::uint64_t generation) noexcept {
@@ -357,7 +357,7 @@ class catalog_t {
             record.extent_offset = entry.extent.offset;
             record.extent_length = entry.extent.length;
             record.content_length = entry.content_length;
-            record.stamp = entry.stamp;
+            record.sequence_number = entry.sequence_number;
             std::memcpy(image.data() + offset, &record, sizeof(record));
             std::memcpy(image.data() + offset + sizeof(record), entry.name_storage.data(), entry.name_bytes);
             std::memset(image.data() + offset + sizeof(record) + entry.name_bytes, 0,
@@ -370,7 +370,7 @@ class catalog_t {
         header.generation = generation;
         header.entries_count = static_cast<std::uint32_t>(entries_.size());
         header.records_bytes = static_cast<std::uint32_t>(needed - sizeof(catalog_slot_header_t));
-        header.next_stamp = next_stamp_;
+        header.next_sequence_number = next_sequence_number_;
         header.checksum = crc32c(std::span<byte_t const> {image}.subspan(sizeof(header), header.records_bytes),
                                  crc32c(viewed_bytes(header)));
         std::memcpy(image.data(), &header, sizeof(header));
@@ -407,10 +407,10 @@ class catalog_t {
         entry.kind = kind;
         entry.extent = extent;
         entry.content_length = content_length;
-        entry.stamp = next_stamp_;
+        entry.sequence_number = next_sequence_number_;
         if (entries_.push_back(std::move(entry)) != st::status_t::success_k)
             return status_t {status_code_t::out_of_memory_k, "The catalog index would not grow"};
-        ++next_stamp_;
+        ++next_sequence_number_;
         return {};
     }
 
@@ -449,8 +449,8 @@ class catalog_t {
     /** Every entry, in the order the slot holds them. */
     st::basic_vector<catalog_entry_t> entries_;
 
-    /** The stamp the next entry takes, raised by every insert and restored by every load. */
-    std::uint64_t next_stamp_ = 1;
+    /** The sequence_number the next entry takes, raised by every insert and restored by every load. */
+    std::uint64_t next_sequence_number_ = 1;
 };
 
 #pragma endregion Index

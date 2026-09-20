@@ -5,7 +5,7 @@
  *  @brief Named collections sharing one set of transactions, one catalog and one set of volumes.
  *
  *  A database is a catalog and nothing else: it resolves a name to a collection, hands that collection
- *  a lane, and persists the mapping as one named blob of a volume so a reopen finds the same names.
+ *  a channel, and persists the mapping as one named blob of a volume so a reopen finds the same names.
  *  Every byte of data belongs to the collection below it, and every conflict belongs to the registry
  *  beside it; what is left here is placement, naming and the order the two are changed in.
  *
@@ -42,15 +42,15 @@
 #include <ustore/status.hpp> // `status_t`, `status_code_t`, `expected`
 #include <ustore/types.hpp>  // `byte_t`
 
-#include "nvme/buffer_pool.hpp"       // `buffer_lease_t`
+#include "nvme/buffer_pool.hpp"       // `pooled_buffer_t`
 #include "nvme/catalog.hpp"           // `blob_kind_t`, `blob_name_t`
 #include "nvme/collection.hpp"        // `collection`, `select_result_t`
 #include "nvme/config.hpp"            // `collection_config_t`, `database_config_t`
 #include "nvme/database_snapshot.hpp" // `database_snapshot`
 #include "nvme/extent.hpp"            // `rounded_up_to`, `portable_alignment_k`
 #include "nvme/files_disk.hpp"        // `any_files_disk_t`
-#include "nvme/io_lane.hpp"           // `io_lane_t`, `basic_lane_pool`
-#include "nvme/io_pipeline.hpp"       // `basic_read_pipeline`, `basic_write_pipeline`, `require_whole`
+#include "nvme/io_channel.hpp"        // `io_channel_t`, `basic_io_channel_pool`
+#include "nvme/io_pipeline.hpp"       // `basic_read_pipeline`, `basic_write_pipeline`, `require_completed_in_full`
 #include "nvme/key_slot.hpp"          // `key_slot`
 #include "nvme/lsm_tree.hpp"          // `lsm_tree_run_record_t`, `lsm_tree_publication_hook_t`
 #include "nvme/resources.hpp"         // `resources_shared_ptr_t`
@@ -154,7 +154,7 @@ struct collection_record_t {
  *  @tparam stored_key_ The key every collection of this database is addressed by.
  *  @tparam volume_type_ The volume every run of every collection lives on.
  *
- *  The router and the lanes are borrowed and must outlive the database, and so must the budget the
+ *  The router and the channels are borrowed and must outlive the database, and so must the budget the
  *  collections charge their memory to. A database is pinned rather than movable, because its registry
  *  and every live transaction name it.
  */
@@ -176,11 +176,11 @@ class basic_database {
     /** The volumes of this database and the placement that spreads collections over them. */
     using router_t = basic_volume_router<volume_t>;
 
-    /** The leases every call that moves bytes borrows one of. */
-    using lane_pool_t = basic_lane_pool<disk_t>;
+    /** The queue pairs every call that moves bytes borrows one of. */
+    using channel_pool_t = basic_io_channel_pool<disk_t>;
 
-    /** One borrowed lease, drained and given back when it dies. */
-    using lane_guard_t = typename lane_pool_t::guard_t;
+    /** One borrowed queue pair, drained and given back when it dies. */
+    using channel_guard_t = typename channel_pool_t::guard_t;
 
     /** A collection named by its number or by its name, which is how every call addresses one. */
     using any_collection_id_t = std::variant<collection_numeric_id_t, collection_alphanumeric_id_t>;
@@ -245,41 +245,41 @@ class basic_database {
     /**
      *  @brief Opens every collection @p router already names, or starts an empty catalog.
      *  @param[inout] router The volumes every run lands on, borrowed and outliving the database.
-     *  @param[inout] lanes The leases every call borrows one of, borrowed and outliving the database.
+     *  @param[inout] channels The queue pairs every call borrows one of, borrowed and outliving the database.
      *  @param[in] config The write-buffer bounds a transaction takes when its caller names none.
      */
-    status_t mount(router_t& router, lane_pool_t& lanes, database_config_t const& config) noexcept {
+    status_t mount(router_t& router, channel_pool_t& channels, database_config_t const& config) noexcept {
         if (router_ != nullptr) return {status_code_t::already_exists_k, "This database has already mounted"};
         router_ = &router;
-        lanes_ = &lanes;
+        channels_ = &channels;
         config_ = config;
 
-        expected<claimed_lane_t> claimed = claim_lane_();
+        expected<claimed_channel_t> claimed = claim_channel_();
         if (!claimed) return claimed.status();
-        if (status_t const loaded = load_schema_(claimed->lane()); loaded.failed()) return loaded;
+        if (status_t const loaded = load_schema_(claimed->channel()); loaded.failed()) return loaded;
         return publish_catalog_();
     }
 
     /**
      *  @brief Flushes every collection, rewrites the catalog and lets every collection go.
      *
-     *  @note The router and the lanes are still needed here, so this runs before the mount underneath
+     *  @note The router and the channels are still needed here, so this runs before the mount underneath
      *      is torn down; the destructor calls it for a caller that did not.
      */
     status_t unmount() noexcept {
         if (router_ == nullptr) return {};
         status_t first;
         {
-            expected<claimed_lane_t> claimed = claim_lane_();
+            expected<claimed_channel_t> claimed = claim_channel_();
             if (!claimed) first = claimed.status();
             else {
                 for (std::size_t index = 0; index != collections_.size(); ++index)
                     if (status_t const flushed = std::visit(
-                            [&](auto& held) noexcept { return held.flush(claimed->lane()); },
+                            [&](auto& held) noexcept { return held.flush(claimed->channel()); },
                             collections_[index]->held);
                         flushed.failed() && first.succeeded())
                         first = flushed;
-                if (status_t const saved = save_schema_(claimed->lane()); saved.failed() && first.succeeded())
+                if (status_t const saved = save_schema_(claimed->channel()); saved.failed() && first.succeeded())
                     first = saved;
             }
             // The entries outlive the publication that stops naming them, so no reader is left in one.
@@ -287,7 +287,7 @@ class basic_database {
             [[maybe_unused]] status_t const emptied = publish_catalog_();
         }
         router_ = nullptr;
-        lanes_ = nullptr;
+        channels_ = nullptr;
         return first;
     }
 
@@ -382,7 +382,7 @@ class basic_database {
         if (name.empty()) return status_t {status_code_t::invalid_argument_k, "A collection is named by a byte"};
         if (name.size() > collection_name_max_bytes_k)
             return status_t {status_code_t::invalid_argument_k, "A collection name is shorter than that"};
-        expected<claimed_lane_t> claimed = claim_lane_();
+        expected<claimed_channel_t> claimed = claim_channel_();
         if (!claimed) return claimed.status();
         if (entry_named_in_(claimed_catalog_(), name) != nullptr)
             return status_t {status_code_t::already_exists_k, "The database already names that collection"};
@@ -405,7 +405,7 @@ class basic_database {
         collection_numeric_id_t const numeric_id = entry->numeric_id;
         if (collections_.push_back(std::move(entry)) != st::status_t::success_k)
             return status_t {status_code_t::out_of_memory_k, "No room for another collection"};
-        if (status_t const saved = save_schema_(claimed->lane()); saved.failed()) {
+        if (status_t const saved = save_schema_(claimed->channel()); saved.failed()) {
             collections_.erase(collections_.size() - 1);
             return saved;
         }
@@ -418,7 +418,7 @@ class basic_database {
 
     /** Returns every run of @p id to its volume and forgets the name, which destroys the data. */
     status_t drop_collection(any_collection_id_t const& id) noexcept {
-        expected<claimed_lane_t> claimed = claim_lane_();
+        expected<claimed_channel_t> claimed = claim_channel_();
         if (!claimed) return claimed.status();
         std::size_t const position = position_at_(id);
         if (position == collections_.size())
@@ -431,12 +431,12 @@ class basic_database {
             [[maybe_unused]] st::status_t const returned = collections_.push_back(std::move(doomed));
             return publication;
         }
-        if (status_t const saved = save_schema_(claimed->lane()); saved.failed()) {
+        if (status_t const saved = save_schema_(claimed->channel()); saved.failed()) {
             [[maybe_unused]] st::status_t const returned = collections_.push_back(std::move(doomed));
             [[maybe_unused]] status_t const restored = publish_catalog_();
             return saved;
         }
-        return std::visit([&](auto& held) noexcept { return held.destroy(claimed->lane()); }, doomed->held);
+        return std::visit([&](auto& held) noexcept { return held.destroy(claimed->channel()); }, doomed->held);
     }
 
 #pragma endregion Catalog
@@ -508,17 +508,19 @@ class basic_database {
     status_t select(any_collection_id_t const& id, stored_key_t stored_key, std::span<byte_t> into,
                     stored_value_size_t& size) const noexcept {
         size = 0;
-        expected<claimed_lane_t> claimed = claim_lane_();
+        expected<claimed_channel_t> claimed = claim_channel_();
         if (!claimed) return claimed.status();
         collection_entry_t const* const found = entry_at_in_(claimed_catalog_(), id);
         if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
         return std::visit(
-            [&](auto const& collection) noexcept { return collection.select(claimed->lane(), stored_key, into, size); },
+            [&](auto const& collection) noexcept {
+                return collection.select(claimed->channel(), stored_key, into, size);
+            },
             found->held);
     }
 
     /**
-     *  @brief Reads the values of @p stored_keys out of @p id, refilling the lane as completions retire.
+     *  @brief Reads the values of @p stored_keys out of @p id, refilling the channel as completions retire.
      *  @param[in] id The collection to read from, named by its number or by its name.
      *  @param[in] stored_keys The keys to read, in any order and with any number of misses among them.
      *  @param[out] results What every key answered, which separates a miss from an erasure.
@@ -527,13 +529,13 @@ class basic_database {
     template <typename sink_type_>
     status_t select(any_collection_id_t const& id, std::span<stored_key_t const> stored_keys,
                     std::span<select_result_t> results, sink_type_&& sink) const noexcept {
-        expected<claimed_lane_t> claimed = claim_lane_();
+        expected<claimed_channel_t> claimed = claim_channel_();
         if (!claimed) return claimed.status();
         collection_entry_t const* const found = entry_at_in_(claimed_catalog_(), id);
         if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
         return std::visit(
             [&](auto const& collection) noexcept {
-                return collection.select(claimed->lane(), stored_keys, results, sink);
+                return collection.select(claimed->channel(), stored_keys, results, sink);
             },
             found->held);
     }
@@ -544,22 +546,22 @@ class basic_database {
 
     /** Stages @p stored_value under @p stored_key of @p id, flushing first when the buffer is full. */
     status_t insert(any_collection_id_t const& id, stored_key_t stored_key, stored_value_view_t stored_value) noexcept {
-        expected<claimed_lane_t> claimed = claim_lane_();
+        expected<claimed_channel_t> claimed = claim_channel_();
         if (!claimed) return claimed.status();
         collection_entry_t* const found = entry_at_in_(claimed_catalog_(), id);
         if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
         return std::visit(
-            [&](auto& collection) noexcept { return collection.insert(claimed->lane(), stored_key, stored_value); },
+            [&](auto& collection) noexcept { return collection.insert(claimed->channel(), stored_key, stored_value); },
             found->held);
     }
 
     /** Stages a tombstone under @p stored_key of @p id, flushing first when the buffer is full. */
     status_t remove(any_collection_id_t const& id, stored_key_t stored_key) noexcept {
-        expected<claimed_lane_t> claimed = claim_lane_();
+        expected<claimed_channel_t> claimed = claim_channel_();
         if (!claimed) return claimed.status();
         collection_entry_t* const found = entry_at_in_(claimed_catalog_(), id);
         if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
-        return std::visit([&](auto& collection) noexcept { return collection.erase(claimed->lane(), stored_key); },
+        return std::visit([&](auto& collection) noexcept { return collection.erase(claimed->channel(), stored_key); },
                           found->held);
     }
 
@@ -572,24 +574,24 @@ class basic_database {
      */
     status_t insert(any_collection_id_t const& id, std::span<stored_key_t const> stored_keys,
                     std::span<byte_t const> stored_values, std::span<stored_value_size_t const> sizes) noexcept {
-        expected<claimed_lane_t> claimed = claim_lane_();
+        expected<claimed_channel_t> claimed = claim_channel_();
         if (!claimed) return claimed.status();
         collection_entry_t* const found = entry_at_in_(claimed_catalog_(), id);
         if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
         return std::visit(
             [&](auto& collection) noexcept {
-                return collection.insert(claimed->lane(), stored_keys, stored_values, sizes);
+                return collection.insert(claimed->channel(), stored_keys, stored_values, sizes);
             },
             found->held);
     }
 
     /** Stages a tombstone under every key of @p stored_keys in @p id. */
     status_t remove(any_collection_id_t const& id, std::span<stored_key_t const> stored_keys) noexcept {
-        expected<claimed_lane_t> claimed = claim_lane_();
+        expected<claimed_channel_t> claimed = claim_channel_();
         if (!claimed) return claimed.status();
         collection_entry_t* const found = entry_at_in_(claimed_catalog_(), id);
         if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
-        return std::visit([&](auto& collection) noexcept { return collection.erase(claimed->lane(), stored_keys); },
+        return std::visit([&](auto& collection) noexcept { return collection.erase(claimed->channel(), stored_keys); },
                           found->held);
     }
 
@@ -599,27 +601,27 @@ class basic_database {
 
     /** Writes every staged write of every collection as one run of its level zero. */
     status_t flush() noexcept {
-        expected<claimed_lane_t> claimed = claim_lane_();
+        expected<claimed_channel_t> claimed = claim_channel_();
         if (!claimed) return claimed.status();
         status_t first;
         for (std::size_t index = 0; index != collections_.size(); ++index)
-            if (status_t const flushed = std::visit([&](auto& held) noexcept { return held.flush(claimed->lane()); },
+            if (status_t const flushed = std::visit([&](auto& held) noexcept { return held.flush(claimed->channel()); },
                                                     collections_[index]->held);
                 flushed.failed() && first.succeeded())
                 first = flushed;
         // Every run the flushes wrote is sealed by now, so the catalog may name them.
-        if (status_t const saved = save_schema_(claimed->lane()); saved.failed() && first.succeeded()) first = saved;
+        if (status_t const saved = save_schema_(claimed->channel()); saved.failed() && first.succeeded()) first = saved;
         return first;
     }
 
-    /** Merges one overfull level of every collection that has one, which needs two lanes at once. */
+    /** Merges one overfull level of every collection that has one, which needs two channels at once. */
     status_t compact() noexcept {
-        expected<claimed_lane_t> reading = claim_lane_();
+        expected<claimed_channel_t> reading = claim_channel_();
         if (!reading) return reading.status();
-        expected<lane_guard_t> writing = lanes_->checkout();
+        expected<channel_guard_t> writing = channels_->acquire();
         if (!writing) return writing.status();
 
-        schema_write_t recording {this, &reading->lane()};
+        schema_write_t recording {this, &reading->channel()};
         lsm_tree_publication_hook_t published;
         published.notify = &record_schema_;
         published.context = &recording;
@@ -628,8 +630,8 @@ class basic_database {
         for (std::size_t index = 0; index != collections_.size(); ++index) {
             expected<compaction_outcome_t> const merged = std::visit(
                 [&](auto& held) noexcept {
-                    return held.tree().compact(reading->lane(), writing->lane(), compaction_placement_t::automatic_k,
-                                               nullptr, published);
+                    return held.tree().compact(reading->channel(), writing->channel(),
+                                               compaction_placement_t::automatic_k, nullptr, published);
                 },
                 collections_[index]->held);
             if (!merged && first.succeeded()) first = merged.status();
@@ -644,7 +646,7 @@ class basic_database {
      *      taken on the same thread while one is still alive never returns.
      */
     expected<snapshot_t> take_snapshot() noexcept {
-        expected<claimed_lane_t> claimed = claim_lane_();
+        expected<claimed_channel_t> claimed = claim_channel_();
         if (!claimed) return claimed.status();
         snapshot_t taken;
         if (status_t const room = taken.reserve(collections_.size()); room.failed()) return room;
@@ -653,7 +655,7 @@ class basic_database {
             collection_entry_t& entry = *collections_[index];
             status_t const held = std::visit(
                 [&](auto& collection) noexcept -> status_t {
-                    auto levels = collection.take_snapshot(claimed->lane());
+                    auto levels = collection.take_snapshot(claimed->channel());
                     if (!levels) return levels.status();
                     return taken.hold(entry.numeric_id, entry.name.view(),
                                       typename snapshot_t::any_collection_snapshot_t {std::move(*levels)});
@@ -687,21 +689,21 @@ class basic_database {
 #pragma region Write Path
 
     /**
-     *  @brief Takes the database's claim and a lane, which a staged transaction holds until it commits.
+     *  @brief Takes the database's claim and a channel, which a staged transaction holds until it commits.
      *
      *  @note The claim is what makes a commit atomic to a reader: no @c select of any collection runs
      *      between the first write a commit applies and the last.
      */
     void acquire_write_path() noexcept {
         write_claim_ = claim_guard_t {claim_};
-        write_lane_ = lane_guard_t {};
-        expected<lane_guard_t> guard = lanes_->checkout();
-        if (guard) write_lane_ = std::move(*guard);
+        write_channel_ = channel_guard_t {};
+        expected<channel_guard_t> guard = channels_->acquire();
+        if (guard) write_channel_ = std::move(*guard);
     }
 
-    /** Hands the lane and the claim back, which a commit and a rollback both do. */
+    /** Hands the channel and the claim back, which a commit and a rollback both do. */
     void release_write_path() noexcept {
-        write_lane_ = lane_guard_t {};
+        write_channel_ = channel_guard_t {};
         write_claim_ = claim_guard_t {};
     }
 
@@ -728,32 +730,36 @@ class basic_database {
             found->held);
     }
 
-    /** Writes the staged writes of @p numeric_id out, on the lane the write path holds. */
+    /** Writes the staged writes of @p numeric_id out, on the channel the write path holds. */
     status_t flush_collection(collection_numeric_id_t numeric_id) noexcept {
         collection_entry_t* const found = entry_numbered_in_(claimed_catalog_(), numeric_id);
         if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
-        if (!write_lane_.holding()) return {status_code_t::capacity_exhausted_k, "The write path took no lane"};
-        return std::visit([&](auto& collection) noexcept { return collection.flush(write_lane_.lane()); }, found->held);
+        if (!write_channel_.holding()) return {status_code_t::capacity_exhausted_k, "The write path took no channel"};
+        return std::visit([&](auto& collection) noexcept { return collection.flush(write_channel_.channel()); },
+                          found->held);
     }
 
-    /** Stages @p stored_value under @p stored_key of @p numeric_id, on the lane the write path holds. */
+    /** Stages @p stored_value under @p stored_key of @p numeric_id, on the channel the write path holds. */
     status_t insert_in_collection(collection_numeric_id_t numeric_id, stored_key_t stored_key,
                                   stored_value_view_t stored_value) noexcept {
         collection_entry_t* const found = entry_numbered_in_(claimed_catalog_(), numeric_id);
         if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
-        if (!write_lane_.holding()) return {status_code_t::capacity_exhausted_k, "The write path took no lane"};
+        if (!write_channel_.holding()) return {status_code_t::capacity_exhausted_k, "The write path took no channel"};
         return std::visit(
-            [&](auto& collection) noexcept { return collection.insert(write_lane_.lane(), stored_key, stored_value); },
+            [&](auto& collection) noexcept {
+                return collection.insert(write_channel_.channel(), stored_key, stored_value);
+            },
             found->held);
     }
 
-    /** Stages a tombstone under @p stored_key of @p numeric_id, on the lane the write path holds. */
+    /** Stages a tombstone under @p stored_key of @p numeric_id, on the channel the write path holds. */
     status_t remove_from_collection(collection_numeric_id_t numeric_id, stored_key_t stored_key) noexcept {
         collection_entry_t* const found = entry_numbered_in_(claimed_catalog_(), numeric_id);
         if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
-        if (!write_lane_.holding()) return {status_code_t::capacity_exhausted_k, "The write path took no lane"};
-        return std::visit([&](auto& collection) noexcept { return collection.erase(write_lane_.lane(), stored_key); },
-                          found->held);
+        if (!write_channel_.holding()) return {status_code_t::capacity_exhausted_k, "The write path took no channel"};
+        return std::visit(
+            [&](auto& collection) noexcept { return collection.erase(write_channel_.channel(), stored_key); },
+            found->held);
     }
 
 #pragma endregion Write Path
@@ -769,23 +775,23 @@ class basic_database {
 
     /** Replaces the caller's own blob with @p bytes, which the engine never reads. */
     status_t save_user_data(bytes_view_t bytes) noexcept {
-        expected<claimed_lane_t> claimed = claim_lane_();
+        expected<claimed_channel_t> claimed = claim_channel_();
         if (!claimed) return claimed.status();
-        return write_blob_(claimed->lane(), database_user_data_name(), blob_kind_t::user_data_k, bytes);
+        return write_blob_(claimed->channel(), database_user_data_name(), blob_kind_t::user_data_k, bytes);
     }
 
     /** Reads the caller's own blob into @p into, which must hold @c user_data_size_bytes of it. */
     status_t load_user_data(bytes_span_t into) const noexcept {
-        expected<claimed_lane_t> claimed = claim_lane_();
+        expected<claimed_channel_t> claimed = claim_channel_();
         if (!claimed) return claimed.status();
-        return read_blob_(claimed->lane(), database_user_data_name(), into);
+        return read_blob_(claimed->channel(), database_user_data_name(), into);
     }
 
     /** Forgets the caller's own blob and returns its bytes to the volume that held it. */
     status_t clear_user_data() noexcept {
-        expected<claimed_lane_t> claimed = claim_lane_();
+        expected<claimed_channel_t> claimed = claim_channel_();
         if (!claimed) return claimed.status();
-        return router_->drop(claimed->lane(), database_user_data_name());
+        return router_->drop(claimed->channel(), database_user_data_name());
     }
 
 #pragma endregion User Data
@@ -888,26 +894,26 @@ class basic_database {
         std::int32_t* claim_ = nullptr;
     };
 
-    /** The claim and the lane one call of this database runs under, released in that order. */
-    class claimed_lane_t {
+    /** The claim and the channel one call of this database runs under, released in that order. */
+    class claimed_channel_t {
       public:
 
-        claimed_lane_t(claim_guard_t&& claim, lane_guard_t&& lane) noexcept
-            : claim_(std::move(claim)), lane_(std::move(lane)) {}
+        claimed_channel_t(claim_guard_t&& claim, channel_guard_t&& channel) noexcept
+            : claim_(std::move(claim)), channel_(std::move(channel)) {}
 
-        claimed_lane_t(claimed_lane_t&&) noexcept = default;
-        claimed_lane_t& operator=(claimed_lane_t&&) noexcept = default;
+        claimed_channel_t(claimed_channel_t&&) noexcept = default;
+        claimed_channel_t& operator=(claimed_channel_t&&) noexcept = default;
 
-        /** The lane, which only the thread holding this is on. */
-        [[nodiscard]] io_lane_t& lane() const noexcept { return lane_.lane(); }
+        /** The channel, which only the thread holding this is on. */
+        [[nodiscard]] io_channel_t& channel() const noexcept { return channel_.channel(); }
 
       private:
 
-        /** The database's claim, given back after the lane. */
+        /** The database's claim, given back after the channel. */
         claim_guard_t claim_;
 
-        /** The borrowed lease, drained and given back first. */
-        lane_guard_t lane_;
+        /** The borrowed queue pair, drained and given back first. */
+        channel_guard_t channel_;
     };
 
 #pragma endregion Private Types
@@ -982,12 +988,12 @@ class basic_database {
         return entry_named_in_(view, std::get<collection_alphanumeric_id_t>(id).view());
     }
 
-    /** Takes the claim and then a spare lane, which every call that moves bytes runs under. */
-    expected<claimed_lane_t> claim_lane_() const noexcept {
+    /** Takes the claim and then a shared channel, which every call that moves bytes runs under. */
+    expected<claimed_channel_t> claim_channel_() const noexcept {
         claim_guard_t claim {claim_};
-        expected<lane_guard_t> guard = lanes_->checkout();
+        expected<channel_guard_t> guard = channels_->acquire();
         if (!guard) return guard.status();
-        return claimed_lane_t {std::move(claim), std::move(*guard)};
+        return claimed_channel_t {std::move(claim), std::move(*guard)};
     }
 
     /** Where @p id sits in the catalog, or the catalog's size when it names nothing. */
@@ -1041,63 +1047,65 @@ class basic_database {
 
     /**
      *  @brief Replaces the blob @p name with @p bytes, sealing it only once they are durable.
-     *  @param[inout] lane The lane the bytes are staged and flushed on, held by the calling thread.
+     *  @param[inout] channel The channel the bytes are staged and flushed on, held by the calling thread.
      *  @param[in] name The bytes the blob is named by, which no other blob of this database holds.
      *  @param[in] kind What the blob is, which is how a later mount enumerates it.
-     *  @param[in] bytes The whole image, which must fit in one block of @p lane.
+     *  @param[in] bytes The whole image, which must fit in one block of @p channel.
      */
-    status_t write_blob_(io_lane_t& lane, blob_name_t name, blob_kind_t kind, std::span<byte_t const> bytes) noexcept {
+    status_t write_blob_(io_channel_t& channel, blob_name_t name, blob_kind_t kind,
+                         std::span<byte_t const> bytes) noexcept {
         if (bytes.empty()) return {status_code_t::invalid_argument_k, "A named blob carries at least one byte"};
         std::uint64_t const written = rounded_up_to(bytes.size(), portable_alignment_k);
-        if (written > lane.requests().block_bytes())
-            return {status_code_t::capacity_exhausted_k, "That blob is longer than one block of a lane"};
+        if (written > channel.requests().buffer_bytes())
+            return {status_code_t::capacity_exhausted_k, "That blob is longer than one block of a channel"};
 
-        [[maybe_unused]] status_t const forgotten = router_->drop(lane, name);
+        [[maybe_unused]] status_t const forgotten = router_->drop(channel, name);
         expected<blob_t> const reserved = router_->create(name, kind, bytes.size());
         if (!reserved) return reserved.status();
         if (reserved->extent.length < written)
             return {status_code_t::capacity_exhausted_k, "A volume reserved less than one page for that blob"};
 
         volume_t& volume = router_->volume(reserved->volume);
-        basic_write_pipeline<disk_t> writer {volume.disk(), lane, reserved->target};
-        expected<buffer_lease_t> block = writer.stage();
+        basic_write_pipeline<disk_t> writer {volume.disk(), channel, reserved->medium};
+        expected<pooled_buffer_t> block = writer.acquire_buffer();
         if (!block) return block.status();
         std::span<byte_t> const room = block->bytes();
         std::memset(room.data(), 0, static_cast<std::size_t>(written));
         std::memcpy(room.data(), bytes.data(), bytes.size());
-        if (status_t const queued = writer.commit(std::move(*block), reserved->slice(0, written)); queued.failed())
+        if (status_t const queued = writer.enqueue_write(std::move(*block), reserved->slice(0, written));
+            queued.failed())
             return queued;
         if (status_t const durable = writer.make_durable(); durable.failed()) return durable;
-        return volume.seal(lane, *reserved);
+        return volume.seal(channel, *reserved);
     }
 
     /** Reads the whole blob @p name into @p into, which must hold its content length. */
-    status_t read_blob_(io_lane_t& lane, blob_name_t name, std::span<byte_t> into) const noexcept {
+    status_t read_blob_(io_channel_t& channel, blob_name_t name, std::span<byte_t> into) const noexcept {
         expected<blob_t> const found = router_->find(name);
         if (!found) return found.status();
         if (into.size() < found->length) return {status_code_t::invalid_argument_k, "A buffer shorter than the blob"};
         std::uint64_t const read = rounded_up_to(found->length, portable_alignment_k);
-        if (read > lane.requests().block_bytes())
-            return {status_code_t::capacity_exhausted_k, "That blob is longer than one block of a lane"};
+        if (read > channel.requests().buffer_bytes())
+            return {status_code_t::capacity_exhausted_k, "That blob is longer than one block of a channel"};
 
         volume_t& volume = router_->volume(found->volume);
-        basic_read_pipeline<disk_t> reader {volume.disk(), lane, found->target};
-        if (status_t const offered = reader.offer(found->slice(0, read), 0); offered.failed()) return offered;
-        if (status_t const flushed = reader.flush(); flushed.failed()) return flushed;
+        basic_read_pipeline<disk_t> reader {volume.disk(), channel, found->medium};
+        if (status_t const offered = reader.enqueue_read(found->slice(0, read), 0); offered.failed()) return offered;
+        if (status_t const flushed = reader.submit(); flushed.failed()) return flushed;
         status_t carried;
-        auto sink = [&](harvested_block_t const& reaped) noexcept {
-            if (status_t const whole = require_whole(reaped); whole.failed()) {
+        auto sink = [&](completed_buffer_t const& completed) noexcept {
+            if (status_t const whole = require_completed_in_full(completed); whole.failed()) {
                 carried = whole;
                 return;
             }
-            std::memcpy(into.data(), reaped.bytes.data(), static_cast<std::size_t>(found->length));
+            std::memcpy(into.data(), completed.bytes.data(), static_cast<std::size_t>(found->length));
         };
-        if (status_t const harvested = reader.harvest_all(sink); harvested.failed()) return harvested;
+        if (status_t const polled = reader.poll_all_completions(sink); polled.failed()) return polled;
         return carried;
     }
 
     /** Writes the catalog out as the database's schema blob, which every change to it does. */
-    status_t save_schema_(io_lane_t& lane) noexcept {
+    status_t save_schema_(io_channel_t& channel) noexcept {
         st::basic_vector<collection_record_t> records;
         st::basic_vector<lsm_tree_run_record_t> runs;
         if (records.reserve(collections_.size()) != st::status_t::success_k)
@@ -1133,18 +1141,18 @@ class basic_database {
         if (image.resize(fields_storage_requirements(version, records, runs)) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "No room to lay the catalog out"};
         if (status_t const laid = save_fields(bytes_span_t {image}, version, records, runs); laid.failed()) return laid;
-        return write_blob_(lane, database_schema_name(), blob_kind_t::schema_k, std::span<byte_t const> {image});
+        return write_blob_(channel, database_schema_name(), blob_kind_t::schema_k, std::span<byte_t const> {image});
     }
 
     /** Opens every collection the schema blob names, which is what a mount of an older database does. */
-    status_t load_schema_(io_lane_t& lane) noexcept {
+    status_t load_schema_(io_channel_t& channel) noexcept {
         expected<blob_t> const found = router_->find(database_schema_name());
         if (!found) return found == status_code_t::not_found_k ? status_t {} : found.status();
 
         st::basic_vector<byte_t> image;
         if (image.resize(static_cast<std::size_t>(found->length)) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "No room to read the catalog into"};
-        if (status_t const read = read_blob_(lane, database_schema_name(), std::span<byte_t> {image}); read.failed())
+        if (status_t const read = read_blob_(channel, database_schema_name(), std::span<byte_t> {image}); read.failed())
             return read;
 
         std::uint64_t version = 0;
@@ -1162,7 +1170,7 @@ class basic_database {
             if (records[index].run_count > runs.size() - named)
                 return {status_code_t::malformed_k, "The catalog names more runs than it carries"};
             std::size_t const count = static_cast<std::size_t>(records[index].run_count);
-            if (status_t const opened = adopt_(lane, records[index],
+            if (status_t const opened = adopt_(channel, records[index],
                                                std::span<lsm_tree_run_record_t const> {runs.data() + named, count});
                 opened.failed())
                 return opened;
@@ -1173,7 +1181,7 @@ class basic_database {
     }
 
     /** Opens the collection @p record describes over the runs @p runs names, and takes it into the catalog. */
-    status_t adopt_(io_lane_t& lane, collection_record_t const& record,
+    status_t adopt_(io_channel_t& channel, collection_record_t const& record,
                     std::span<lsm_tree_run_record_t const> runs) noexcept {
         if (static_cast<std::size_t>(record.volume) >= router_->size())
             return {status_code_t::malformed_k, "The catalog names a volume this mount did not open"};
@@ -1192,8 +1200,8 @@ class basic_database {
         entry->config = config;
         entry->volume = static_cast<volume_id_t>(record.volume);
         entry->held = std::move(*mounted);
-        if (status_t const restored = std::visit([&](auto& held) noexcept { return held.tree().restore(lane, runs); },
-                                                 entry->held);
+        if (status_t const restored = std::visit(
+                [&](auto& held) noexcept { return held.tree().restore(channel, runs); }, entry->held);
             restored.failed())
             return restored;
         if (collections_.push_back(std::move(entry)) != st::status_t::success_k)
@@ -1201,20 +1209,20 @@ class basic_database {
         return {};
     }
 
-    /** What a compaction's hook is handed, which is the database and the lane it records through. */
+    /** What a compaction's hook is handed, which is the database and the channel it records through. */
     struct schema_write_t {
 
         /** The database whose catalog the hook writes out. */
         basic_database* store = nullptr;
 
-        /** The lane the schema blob is staged and sealed on, held by the compacting thread. */
-        io_lane_t* lane = nullptr;
+        /** The channel the schema blob is staged and sealed on, held by the compacting thread. */
+        io_channel_t* channel = nullptr;
     };
 
     /** Writes the catalog out for a compaction that has published, before it drops what it consumed. */
     static status_t record_schema_(void* context) noexcept {
         schema_write_t const& writing = *static_cast<schema_write_t const*>(context);
-        return writing.store->save_schema_(*writing.lane);
+        return writing.store->save_schema_(*writing.channel);
     }
 
 #pragma endregion Private Methods
@@ -1230,8 +1238,8 @@ class basic_database {
     /** The volumes every run lands on, null until the database is mounted. */
     router_t* router_ = nullptr;
 
-    /** The leases every call that moves bytes takes one of, null until the database is mounted. */
-    lane_pool_t* lanes_ = nullptr;
+    /** The queue pairs every call that moves bytes takes one of, null until the database is mounted. */
+    channel_pool_t* channels_ = nullptr;
 
     /** The write-buffer bounds a transaction takes when its caller names none. */
     database_config_t config_ {};
@@ -1257,8 +1265,8 @@ class basic_database {
     /** The claim a staged transaction holds from its stage until its commit. */
     claim_guard_t write_claim_;
 
-    /** The lane that transaction writes on, which every applied key of its commit uses. */
-    lane_guard_t write_lane_;
+    /** The channel that transaction writes on, which every applied key of its commit uses. */
+    channel_guard_t write_channel_;
 
 #pragma endregion Private Members
 };

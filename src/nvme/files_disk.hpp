@@ -6,8 +6,8 @@
  *
  *  A database materializes over one disk type, and the transport is known only once the mount has
  *  asked the kernel, so the two file transports are erased here, at the disk. The alternative is
- *  fixed for the life of the mount and the branch is paid once per batch on @c submit and @c reap,
- *  each of which wraps a syscall. Every lease, registration and descriptor is the shared vocabulary
+ *  fixed for the life of the mount and the branch is paid once per batch on @c submit and @c poll,
+ *  each of which wraps a syscall. Every queue pair, registered memory and registered medium is the shared vocabulary
  *  of @c ring.hpp, so nothing above the disk sees which transport answered.
  */
 
@@ -24,8 +24,8 @@
 #include <ustore/types.hpp>  // `byte_t`
 
 #include "nvme/blocking_files_disk.hpp" // `blocking_files_disk_t`
-#include "nvme/config.hpp"              // `io_discipline_t`
-#include "nvme/ring.hpp"                // `ring_concept`, `ring_owner_t`, `registration_t`, `descriptor_t`
+#include "nvme/config.hpp"              // `io_transport_t`
+#include "nvme/ring.hpp"                // `ring_concept`, `queue_pair_t`, `registered_memory_t`, `registered_medium_t`
 #include "nvme/uring_files_disk.hpp"    // `uring_files_disk_t`
 
 namespace unum::ustore::nvme {
@@ -55,9 +55,9 @@ class any_files_disk_t {
     any_files_disk_t& operator=(any_files_disk_t&&) noexcept = default;
 
     /** The transport held, which is never @c automatic_k. */
-    [[nodiscard]] io_discipline_t discipline() const noexcept {
-        return std::holds_alternative<uring_files_disk_t>(held_) ? io_discipline_t::uring_k
-                                                                 : io_discipline_t::blocking_k;
+    [[nodiscard]] io_transport_t transport() const noexcept {
+        return std::holds_alternative<uring_files_disk_t>(held_) ? io_transport_t::io_uring_k
+                                                                 : io_transport_t::blocking_k;
     }
 
     /** What the held transport accepts. */
@@ -65,80 +65,80 @@ class any_files_disk_t {
         return std::visit([](auto const& disk) noexcept { return disk.capabilities(); }, held_);
     }
 
-    /** How the held transport addresses the registered slab; the blocking floor pins per request. */
+    /** How the held transport addresses the registered arena; the blocking floor pins per request. */
     [[nodiscard]] range_pinning_t pinning() const noexcept {
         uring_files_disk_t const* const uring = std::get_if<uring_files_disk_t>(&held_);
         return uring ? uring->pinning() : range_pinning_t::unpinned_k;
     }
 
-#pragma region Leases
+#pragma region Queue Pairs
 
-    /** Takes a lease on @p depth requests of the held ring for the calling thread. */
-    expected<ring_owner_t> open(std::uint32_t depth) noexcept {
-        return std::visit([&](auto& disk) noexcept { return disk.open(depth); }, held_);
+    /** Takes a queue pair on @p depth requests of the held ring for the calling thread. */
+    expected<queue_pair_t> acquire_queue_pair(std::uint32_t depth) noexcept {
+        return std::visit([&](auto& disk) noexcept { return disk.acquire_queue_pair(depth); }, held_);
     }
 
-    /** Binds @p owner to the calling thread, which is how a moved lease changes hands. */
-    status_t adopt(ring_owner_t const& owner) noexcept {
-        return std::visit([&](auto& disk) noexcept { return disk.adopt(owner); }, held_);
+    /** Binds @p queue pair to the calling thread, which is how a moved queue pair changes hands. */
+    status_t bind_queue_pair(queue_pair_t const& queue_pair) noexcept {
+        return std::visit([&](auto& disk) noexcept { return disk.bind_queue_pair(queue_pair); }, held_);
     }
 
-    /** Takes @p owner's lease back once it has nothing outstanding, and empties the handle. */
-    status_t release(ring_owner_t& owner) noexcept {
-        return std::visit([&](auto& disk) noexcept { return disk.release(owner); }, held_);
+    /** Takes @p queue pair back once it has nothing outstanding, and empties the handle. */
+    status_t release_queue_pair(queue_pair_t& queue_pair) noexcept {
+        return std::visit([&](auto& disk) noexcept { return disk.release_queue_pair(queue_pair); }, held_);
     }
 
-    /** Requests @p owner has submitted and not yet reaped. */
-    [[nodiscard]] std::size_t in_flight(ring_owner_t const& owner) const noexcept {
-        return std::visit([&](auto const& disk) noexcept { return disk.in_flight(owner); }, held_);
+    /** Requests @p queue pair has submitted and not yet completed. */
+    [[nodiscard]] std::size_t outstanding(queue_pair_t const& queue_pair) const noexcept {
+        return std::visit([&](auto const& disk) noexcept { return disk.outstanding(queue_pair); }, held_);
     }
 
-#pragma endregion Leases
+#pragma endregion Queue Pairs
 
 #pragma region Registrations
 
-    /** Pins @p chunk so requests can address it, refusing @c device_k on both file transports. */
-    expected<registration_t> register_chunk(std::span<byte_t> chunk, memory_space_t space) noexcept {
-        return std::visit([&](auto& disk) noexcept { return disk.register_chunk(chunk, space); }, held_);
+    /** Pins @p memory so requests can address it, refusing @c gpu_k on both file transports. */
+    expected<registered_memory_t> register_memory(std::span<byte_t> memory, memory_space_t space) noexcept {
+        return std::visit([&](auto& disk) noexcept { return disk.register_memory(memory, space); }, held_);
     }
 
-    /** Unpins @p registration, refusing while requests still address it. */
-    status_t deregister_chunk(registration_t& registration) noexcept {
-        return std::visit([&](auto& disk) noexcept { return disk.deregister_chunk(registration); }, held_);
+    /** Unpins @p registered memory, refusing while requests still address it. */
+    status_t unregister_memory(registered_memory_t& registered_memory) noexcept {
+        return std::visit([&](auto& disk) noexcept { return disk.unregister_memory(registered_memory); }, held_);
     }
 
-    /** Opens the file @p request names as a target requests address by slot. */
-    expected<descriptor_t> register_target(target_request_t const& request) noexcept {
-        return std::visit([&](auto& disk) noexcept { return disk.register_target(request); }, held_);
+    /** Opens the file @p request names as a medium requests address by slot. */
+    expected<registered_medium_t> register_medium(medium_options_t const& request) noexcept {
+        return std::visit([&](auto& disk) noexcept { return disk.register_medium(request); }, held_);
     }
 
-    /** Closes @p descriptor's file, refusing while requests still name it. */
-    status_t deregister_target(descriptor_t& descriptor) noexcept {
-        return std::visit([&](auto& disk) noexcept { return disk.deregister_target(descriptor); }, held_);
+    /** Closes @p registered medium's file, refusing while requests still name it. */
+    status_t unregister_medium(registered_medium_t& registered_medium) noexcept {
+        return std::visit([&](auto& disk) noexcept { return disk.unregister_medium(registered_medium); }, held_);
     }
 
 #pragma endregion Registrations
 
 #pragma region Ring
 
-    /** Takes as much of @p requests as @p owner still has credit for, and never waits. */
-    expected<std::size_t> submit(ring_owner_t const& owner, std::span<request_t const> requests) noexcept {
-        return std::visit([&](auto& disk) noexcept { return disk.submit(owner, requests); }, held_);
+    /** Takes as much of @p requests as @p queue pair still has credit for, and never waits. */
+    expected<std::size_t> submit(queue_pair_t const& queue_pair, std::span<request_t const> requests) noexcept {
+        return std::visit([&](auto& disk) noexcept { return disk.submit(queue_pair, requests); }, held_);
     }
 
-    /** Moves @p owner's ready completions into @p into, and never waits. */
-    expected<std::size_t> reap(ring_owner_t const& owner, std::span<completion_t> into) noexcept {
-        return std::visit([&](auto& disk) noexcept { return disk.reap(owner, into); }, held_);
+    /** Moves @p queue pair's ready completions into @p into, and never waits. */
+    expected<std::size_t> poll_completions(queue_pair_t const& queue_pair, std::span<completion_t> into) noexcept {
+        return std::visit([&](auto& disk) noexcept { return disk.poll_completions(queue_pair, into); }, held_);
     }
 
-    /** Stops @p owner's requests that have not started. */
-    void cancel(ring_owner_t const& owner) noexcept {
-        std::visit([&](auto& disk) noexcept { disk.cancel(owner); }, held_);
+    /** Stops @p queue pair's requests that have not started. */
+    void cancel(queue_pair_t const& queue_pair) noexcept {
+        std::visit([&](auto& disk) noexcept { disk.cancel(queue_pair); }, held_);
     }
 
-    /** Reaps and discards everything @p owner has in flight, so the lease can be released or handed over. */
-    status_t drain(ring_owner_t const& owner) noexcept {
-        return std::visit([&](auto& disk) noexcept { return disk.drain(owner); }, held_);
+    /** Reaps and discards everything @p queue pair has in flight, so the queue pair can be released or handed over. */
+    status_t drain(queue_pair_t const& queue_pair) noexcept {
+        return std::visit([&](auto& disk) noexcept { return disk.drain(queue_pair); }, held_);
     }
 
 #pragma endregion Ring

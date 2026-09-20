@@ -61,7 +61,7 @@ using stored_key_t = ustore_key_t;
 /** The store every call runs against, whose volumes live in files. */
 using store_t = database<stored_key_t>;
 
-/** The mount those volumes are opened over, which the store borrows a router and lanes from. */
+/** The mount those volumes are opened over, which the store borrows a router and channels from. */
 using storage_mount_t = mounted_storage_t::files_mount_t;
 
 /** One transaction over the collections of the store. */
@@ -85,8 +85,8 @@ inline constexpr char data_directory_name_k[] = "data";
 /** Bytes the only volume of a database spans when its configuration names no capacity. */
 inline constexpr std::size_t default_volume_bytes_k = 1024ull * 1024ull * 1024ull;
 
-/** Spare lanes a mount keeps, of which a compaction holds two and every other call one. */
-inline constexpr std::size_t engine_spare_lanes_k = 4;
+/** Spare channels a mount keeps, of which a compaction holds two and every other call one. */
+inline constexpr std::size_t engine_shared_io_channels_k = 4;
 
 /** Bytes the largest value of a collection this engine creates takes. */
 inline constexpr stored_value_size_t engine_value_max_size_k = 1024u * 1024u;
@@ -142,7 +142,7 @@ inline bool reported_failure(status_t status, ustore_error_t* error) noexcept {
 /** Everything one open database of the C ABI holds. */
 struct opened_database_t {
 
-    /** The budgets, the executor and the mount the store borrows its router and lanes from. */
+    /** The budgets, the executor and the mount the store borrows its router and channels from. */
     resources_shared_ptr_t resources;
 
     /** The store itself, unmounted before the mount underneath it is torn down. */
@@ -573,7 +573,7 @@ inline status_t read_batched(opened_database_t& database, st::basic_vector<batch
             std::size_t const at = named.requests[request];
             if (lengths[at] == ustore_length_missing_k) return;
             if (offset + bytes.size() > lengths[at]) {
-                overflowed = {status_code_t::io_k, "A value grew between its measurement and its read"};
+                overflowed = {status_code_t::input_output_k, "A value grew between its measurement and its read"};
                 return;
             }
             if (!bytes.empty()) std::memcpy(tape.data() + starts[at] + offset, bytes.data(), bytes.size());
@@ -783,7 +783,7 @@ inline status_t mount_store(opened_database_t& database, database_config_t const
     return database.resources->storage.visit([&](auto& mount) noexcept -> status_t {
         using mount_t = std::remove_reference_t<decltype(mount)>;
         if constexpr (std::is_same_v<mount_t, storage_mount_t>)
-            return database.store->mount(mount.router(), mount.lanes(), transactions);
+            return database.store->mount(mount.router(), mount.channels(), transactions);
         else return {status_code_t::unsupported_k, "The engine mounts its volumes on files alone"};
     });
 }
@@ -791,14 +791,14 @@ inline status_t mount_store(opened_database_t& database, database_config_t const
 /** Opens the database of @p config, with its two reserved collections. */
 inline expected<opened_database_t*> open_database(config_t const& config) noexcept {
     resources_config_t resources;
-    resources.spare_lanes = engine_spare_lanes_k;
+    resources.shared_io_channels = engine_shared_io_channels_k;
     database_config_t transactions = engine_database_defaults();
     user_collection_config_t collections = engine_collection_defaults();
 
     if (status_t const resolved = resolve_resources(config, resources); resolved.failed()) return resolved;
     if (status_t const read = read_engine_options(config, resources, transactions, collections); read.failed())
         return read;
-    if (resources.io_discipline == io_discipline_t::ram_k)
+    if (resources.io_transport == io_transport_t::memory_k)
         return status_t {status_code_t::unsupported_k, "The engine mounts its volumes on files alone"};
     if (status_t const checked = validated(resources, transactions, collections); checked.failed()) return checked;
 
@@ -1306,7 +1306,7 @@ void ustore_database_control(ustore_database_control_t* c_arguments) {
     *arguments.response = nullptr;
     if (request == "info") {
         mounted_storage_t const& storage = database.resources->storage;
-        if (storage.report().discipline != io_discipline_t::uring_k)
+        if (storage.report().transport != io_transport_t::io_uring_k)
             *arguments.response = R"({"engine":"nvme","transport":"blocking"})";
         else
             *arguments.response = storage.pinning() == range_pinning_t::pinned_k

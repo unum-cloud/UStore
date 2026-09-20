@@ -5,12 +5,12 @@
  *  @brief The ring machinery every NVMe disk shares, over a device that moves positioned bytes.
  *
  *  A disk pairs a volume with a transport. The volume part - naming, allocation, the catalog - sits
- *  above; what lives here is the transport part every disk repeats: leases, per-owner credit,
+ *  above; what lives here is the transport part every disk repeats: queue pairs, per-queue pair credit,
  *  registered memory, batching and completion routing. A transport supplies only the moves a device
- *  makes against a target, and @c basic_disk turns them into the ring of @c ring.hpp.
+ *  makes against a medium, and @c basic_disk turns them into the ring of @c ring.hpp.
  *
- *  Depth on the blocking floor comes from leases rather than threads: a submitted batch waits in the
- *  owner's window and the owner's own @c reap performs it, so the owner pays for its own I/O on the
+ *  Depth on the blocking floor comes from queue pairs rather than threads: a submitted batch waits in the
+ *  queue pair's window and the queue pair's own @c poll performs it, so the queue pair pays for its own I/O on the
  *  thread that asked for it. Nothing is parked, nothing is woken, and nothing forks.
  */
 
@@ -34,7 +34,7 @@
 #include <ustore/types.hpp>  // `byte_t`
 
 #include "nvme/extent.hpp" // `extent_t`, `is_address_aligned`
-#include "nvme/ring.hpp"   // `request_t`, `completion_t`, `ring_owner_t`, `registration_t`, `descriptor_t`
+#include "nvme/ring.hpp"   // `request_t`, `completion_t`, `queue_pair_t`, `registered_memory_t`, `registered_medium_t`
 
 namespace unum::ustore::nvme {
 
@@ -48,11 +48,11 @@ namespace unum::ustore::nvme {
  *  already has a queue of its own implements the ring directly instead of satisfying this.
  */
 template <typename device_type_>
-concept block_device_concept = requires(device_type_& device, device_type_ const& constant, target_request_t target,
+concept block_device_concept = requires(device_type_& device, device_type_ const& constant, medium_options_t medium,
                                         std::uint16_t index, extent_t extent, std::span<byte_t> destination,
                                         std::span<byte_t const> source) {
-    { device.attach_target(target) } -> std::same_as<expected<std::uint16_t>>;
-    { device.detach_target(index) } -> std::same_as<status_t>;
+    { device.open_medium(medium) } -> std::same_as<expected<std::uint16_t>>;
+    { device.close_medium(index) } -> std::same_as<status_t>;
     { device.read_extent(index, extent, destination) } -> std::same_as<expected<std::uint64_t>>;
     { device.write_extent(index, extent, source) } -> std::same_as<expected<std::uint64_t>>;
     { device.flush(index) } -> std::same_as<status_t>;
@@ -60,8 +60,8 @@ concept block_device_concept = requires(device_type_& device, device_type_ const
     { constant.capabilities() } -> std::same_as<ring_capabilities_t>;
 };
 
-/** Identifies the thread holding a lease, so a foreign issuer trips an assertion and not a driver. */
-[[nodiscard]] inline std::uint64_t issuing_thread_identity() noexcept {
+/** Identifies the thread holding a queue pair, so a foreign bound thread trips an assertion and not a driver. */
+[[nodiscard]] inline std::uint64_t calling_thread_identity() noexcept {
     return static_cast<std::uint64_t>(std::hash<std::thread::id> {}(std::this_thread::get_id()));
 }
 
@@ -69,20 +69,20 @@ concept block_device_concept = requires(device_type_& device, device_type_ const
 
 #pragma region Configuration
 
-/** What a mount fixes about a disk's ring before any owner leases a share of it. */
+/** What a mount fixes about a disk's ring before any queue pair queue pairs a share of it. */
 struct disk_config_t {
 
     /** Leases the ring hands out at once, bounded on a real controller by its queue-pair count. */
-    std::uint16_t owners_limit = 1;
+    std::uint16_t queue_pairs_limit = 1;
 
-    /** Requests one lease may keep in flight, which is the credit an owner spends and reaps back. */
+    /** Requests one queue pair may keep in flight, which is the credit a queue pair spends and polls back. */
     std::uint32_t depth_limit = 64;
 
-    /** Memory ranges the disk pins at once, which a transport registering one slab keeps at one. */
-    std::uint16_t registrations_limit = 8;
+    /** Memory ranges the disk pins at once, which a transport registering one arena keeps at one. */
+    std::uint16_t registered_memory_limit = 8;
 
     /** Targets the disk registers at once, which a namespace keeps at one and a directory raises. */
-    std::uint16_t targets_limit = 1;
+    std::uint16_t media_limit = 1;
 };
 
 #pragma endregion Configuration
@@ -92,14 +92,14 @@ struct disk_config_t {
 /**
  *  @brief Turns a positioned-I/O device into the submission and completion ring callers drive.
  *
- *  Depth is partitioned rather than pooled: every lease reserves @c depth_limit requests of its own,
- *  so one owner that stops reaping cannot starve another, and a full ring is always the owner's own
- *  doing. Completions are routed by the owner bits of their token and never appear in another
- *  owner's reap.
+ *  Depth is partitioned rather than pooled: every queue pair reserves @c depth_limit requests of its own,
+ *  so one queue pair that stops polling cannot starve another, and a full ring is always the queue pair's own
+ *  doing. Completions are routed by the queue pair bits of their token and never appear in another
+ *  queue pair's poll.
  *
  *  Ordering between two submitted requests is never promised. Two writes may reach the medium in
- *  either order, and a flush covers only what the owner has already reaped, so durability is written
- *  as submit, reap, flush, reap. A bounded sequence that must be ordered says so with
+ *  either order, and a flush covers only what the queue pair has already completed, so durability is written
+ *  as submit, poll, flush, poll. A bounded sequence that must be ordered says so with
  *  @c request_chaining_t::chained_k, which runs the chain in submission order and cuts it with
  *  @c cancelled_k at the first short or failed result.
  */
@@ -116,29 +116,30 @@ class basic_disk {
     /**
      *  @brief Mounts @p device behind a ring shaped by @p config.
      *  @param[in] device The transport, moved in and owned by the disk from here on.
-     *  @param[in] config Leases, per-lease depth, and the pinned ranges and targets the ring holds.
+     *  @param[in] config Leases, per-queue pair depth, and the pinned ranges and media the ring holds.
      */
     static expected<basic_disk> make(device_type_&& device, disk_config_t const& config) noexcept {
-        if (config.owners_limit == 0 || config.depth_limit == 0)
-            return status_t {status_code_t::invalid_argument_k, "A ring needs a lease and a request of depth"};
-        if (config.owners_limit == static_cast<std::uint16_t>(owner_id_t::unowned_k) ||
-            config.registrations_limit == static_cast<std::uint16_t>(registration_id_t::unregistered_k) ||
-            config.targets_limit == static_cast<std::uint16_t>(descriptor_id_t::unregistered_k))
+        if (config.queue_pairs_limit == 0 || config.depth_limit == 0)
+            return status_t {status_code_t::invalid_argument_k, "A ring needs a queue pair and a request of depth"};
+        if (config.queue_pairs_limit == static_cast<std::uint16_t>(queue_pair_id_t::unallocated_k) ||
+            config.registered_memory_limit == static_cast<std::uint16_t>(registered_memory_id_t::unregistered_k) ||
+            config.media_limit == static_cast<std::uint16_t>(registered_medium_id_t::unregistered_k))
             return status_t {status_code_t::invalid_argument_k, "A ring keeps one identifier for an empty handle"};
-        if (config.targets_limit == 0)
-            return status_t {status_code_t::invalid_argument_k, "A ring needs a target to move bytes against"};
+        if (config.media_limit == 0)
+            return status_t {status_code_t::invalid_argument_k, "A ring needs a medium to move bytes against"};
 
-        std::size_t const window = static_cast<std::size_t>(config.owners_limit) * config.depth_limit;
+        std::size_t const window = static_cast<std::size_t>(config.queue_pairs_limit) * config.depth_limit;
         basic_disk disk {std::move(device), config};
-        if (status_t const sized = size_(disk.owners_, config.owners_limit); sized.failed()) return sized;
-        if (status_t const sized = size_(disk.registrations_, config.registrations_limit); sized.failed()) return sized;
-        if (status_t const sized = size_(disk.targets_, config.targets_limit); sized.failed()) return sized;
+        if (status_t const sized = size_(disk.queue_pairs_, config.queue_pairs_limit); sized.failed()) return sized;
+        if (status_t const sized = size_(disk.registered_memories_, config.registered_memory_limit); sized.failed())
+            return sized;
+        if (status_t const sized = size_(disk.media_, config.media_limit); sized.failed()) return sized;
         if (status_t const sized = size_(disk.pending_, window); sized.failed()) return sized;
         if (status_t const sized = size_(disk.ready_, window); sized.failed()) return sized;
         disk.capabilities_ = disk.device_.capabilities();
         disk.capabilities_.depth_limit = config.depth_limit;
-        disk.capabilities_.owners_limit = config.owners_limit;
-        disk.capabilities_.targets_limit = config.targets_limit;
+        disk.capabilities_.queue_pairs_limit = config.queue_pairs_limit;
+        disk.capabilities_.media_limit = config.media_limit;
         return disk;
     }
 
@@ -148,18 +149,18 @@ class basic_disk {
     /** The transport underneath, for a caller that needs what only the transport knows. */
     [[nodiscard]] device_type_ const& device() const noexcept { return device_; }
 
-#pragma region Leases
+#pragma region Queue Pairs
 
     /**
-     *  @brief Takes a lease on @p depth requests of the ring for the calling thread.
-     *  @param[in] depth Requests this owner may keep in flight, at most the mount's limit.
-     *  @return The lease, or @c capacity_exhausted_k when every lease is already out.
+     *  @brief Takes a queue pair on @p depth requests of the ring for the calling thread.
+     *  @param[in] depth Requests this queue pair may keep in flight, at most the mount's limit.
+     *  @return The queue pair, or @c capacity_exhausted_k when every queue pair is already out.
      */
-    expected<ring_owner_t> open(std::uint32_t depth) noexcept {
+    expected<queue_pair_t> acquire_queue_pair(std::uint32_t depth) noexcept {
         if (depth == 0 || depth > depth_limit_)
-            return status_t {status_code_t::invalid_argument_k, "A lease asks for more depth than the ring has"};
-        for (std::size_t index = 0; index != owners_.size(); ++index) {
-            owner_slot_t& slot = owners_[index];
+            return status_t {status_code_t::invalid_argument_k, "A queue pair asks for more depth than the ring has"};
+        for (std::size_t index = 0; index != queue_pairs_.size(); ++index) {
+            queue_pair_slot_t& slot = queue_pairs_[index];
             std::int32_t expected_free = 0;
             if (!claim_(slot.leased)
                      .compare_exchange_strong(expected_free, 1, std::memory_order_acquire, std::memory_order_relaxed))
@@ -169,133 +170,134 @@ class basic_disk {
             slot.pending_count = 0;
             slot.ready_first = 0;
             slot.ready_count = 0;
-            slot.issuer = issuing_thread_identity();
-            return ring_owner_t::leased(static_cast<owner_id_t>(index), slot.generation, depth);
+            slot.bound_thread = calling_thread_identity();
+            return queue_pair_t::leased(static_cast<queue_pair_id_t>(index), slot.generation, depth);
         }
-        return status_t {status_code_t::capacity_exhausted_k, "Every lease of this ring is already held"};
+        return status_t {status_code_t::capacity_exhausted_k, "Every queue pair of this ring is already held"};
     }
 
     /**
-     *  @brief Binds @p owner to the calling thread, which is how a moved lease changes hands.
-     *  @param[in] owner The lease this thread has just taken over, with nothing outstanding on it.
+     *  @brief Binds @p queue pair to the calling thread, which is how a moved queue pair changes hands.
+     *  @param[in] queue pair The queue pair this thread has just taken over, with nothing outstanding on it.
      *
-     *  @note A lease with work in flight cannot be handed over, since the requests were issued from
-     *      a thread that is no longer the one that would reap them.
+     *  @note A queue pair with work in flight cannot be handed over, since the requests were issued from
+     *      a thread that is no longer the one that would poll them.
      */
-    status_t adopt(ring_owner_t const& owner) noexcept {
-        owner_slot_t* const slot = slot_of_(owner);
-        if (!slot) return {status_code_t::invalid_argument_k, "The lease is not this ring's"};
+    status_t bind_queue_pair(queue_pair_t const& queue_pair) noexcept {
+        queue_pair_slot_t* const slot = slot_of_(queue_pair);
+        if (!slot) return {status_code_t::invalid_argument_k, "The queue pair is not this ring's"};
         if (slot->pending_count != 0 || slot->ready_count != 0)
-            return {status_code_t::invalid_argument_k, "Drain the lease before handing it over"};
-        slot->issuer = issuing_thread_identity();
+            return {status_code_t::invalid_argument_k, "Drain the queue pair before handing it over"};
+        slot->bound_thread = calling_thread_identity();
         return {};
     }
 
     /**
-     *  @brief Takes @p owner's lease back once it has nothing outstanding, and empties the handle.
-     *  @param[inout] owner The lease to return, surrendered on success and untouched on failure.
+     *  @brief Takes @p queue pair back once it has nothing outstanding, and empties the handle.
+     *  @param[inout] queue pair The queue pair to return, surrendered on success and untouched on failure.
      */
-    status_t release(ring_owner_t& owner) noexcept {
-        owner_slot_t* const slot = slot_of_(owner);
-        if (!slot) return {status_code_t::invalid_argument_k, "The lease is not this ring's"};
+    status_t release_queue_pair(queue_pair_t& queue_pair) noexcept {
+        queue_pair_slot_t* const slot = slot_of_(queue_pair);
+        if (!slot) return {status_code_t::invalid_argument_k, "The queue pair is not this ring's"};
         if (slot->pending_count != 0 || slot->ready_count != 0)
-            return {status_code_t::invalid_argument_k, "Drain the lease before releasing it"};
+            return {status_code_t::invalid_argument_k, "Drain the queue pair before releasing it"};
         ++slot->generation;
         slot->depth = 0;
-        slot->issuer = 0;
+        slot->bound_thread = 0;
         claim_(slot->leased).store(0, std::memory_order_release);
-        owner.surrender();
+        queue_pair.surrender();
         return {};
     }
 
-    /** Requests @p owner has submitted and not yet reaped, which its credit bounds. */
-    [[nodiscard]] std::size_t in_flight(ring_owner_t const& owner) const noexcept {
-        owner_slot_t const* const slot = slot_of_(owner);
+    /** Requests @p queue pair has submitted and not yet completed, which its credit bounds. */
+    [[nodiscard]] std::size_t outstanding(queue_pair_t const& queue_pair) const noexcept {
+        queue_pair_slot_t const* const slot = slot_of_(queue_pair);
         return slot ? slot->pending_count + slot->ready_count : 0;
     }
 
-#pragma endregion Leases
+#pragma endregion Queue Pairs
 
 #pragma region Registrations
 
     /**
-     *  @brief Pins @p chunk so requests can address it, and says whether this transport reaches it.
-     *  @param[in] chunk Memory the caller owns and keeps alive until it deregisters the range.
-     *  @param[in] space Where that memory lives; a disk without GPUDirect refuses @c device_k here.
+     *  @brief Pins @p memory so requests can address it, and says whether this transport reaches it.
+     *  @param[in] memory Memory the caller owns and keeps alive until it deregisters the range.
+     *  @param[in] space Where that memory lives; a disk without GPUDirect refuses @c gpu_k here.
      */
-    expected<registration_t> register_chunk(std::span<byte_t> chunk, memory_space_t space) noexcept {
-        if (chunk.empty()) return status_t {status_code_t::invalid_argument_k, "An empty range registers nothing"};
-        if (space == memory_space_t::device_k && !device_.capabilities().reaches_device_memory)
+    expected<registered_memory_t> register_memory(std::span<byte_t> memory, memory_space_t space) noexcept {
+        if (memory.empty()) return status_t {status_code_t::invalid_argument_k, "An empty range registers nothing"};
+        if (space == memory_space_t::gpu_k && !device_.capabilities().reaches_gpu_memory)
             return status_t {status_code_t::unsupported_k, "This transport cannot address device memory"};
-        for (std::size_t index = 0; index != registrations_.size(); ++index) {
-            registration_slot_t& slot = registrations_[index];
+        for (std::size_t index = 0; index != registered_memories_.size(); ++index) {
+            registered_memory_slot_t& slot = registered_memories_[index];
             std::int32_t expected_free = 0;
             if (!claim_(slot.registered)
                      .compare_exchange_strong(expected_free, 1, std::memory_order_acquire, std::memory_order_relaxed))
                 continue;
-            slot.base = chunk.data();
-            slot.length = chunk.size();
+            slot.base = memory.data();
+            slot.length = memory.size();
             slot.space = space;
-            return registration_t::registered(static_cast<registration_id_t>(index), slot.generation, chunk, space);
+            return registered_memory_t::registered(static_cast<registered_memory_id_t>(index), slot.generation, memory,
+                                                   space);
         }
-        return status_t {status_code_t::capacity_exhausted_k, "Every registration slot of this ring is taken"};
+        return status_t {status_code_t::capacity_exhausted_k, "Every registered_memory slot of this ring is taken"};
     }
 
     /**
-     *  @brief Unpins @p registration, refusing while it is still a live target of the device.
-     *  @param[inout] registration The range to give back, surrendered on success.
+     *  @brief Unpins @p registered memory, refusing while it is still a live medium of the device.
+     *  @param[inout] registered memory The range to give back, surrendered on success.
      */
-    status_t deregister_chunk(registration_t& registration) noexcept {
-        registration_slot_t* const slot = slot_of_(registration);
-        if (!slot) return {status_code_t::invalid_argument_k, "The registration is not this ring's"};
+    status_t unregister_memory(registered_memory_t& registered_memory) noexcept {
+        registered_memory_slot_t* const slot = slot_of_(registered_memory);
+        if (!slot) return {status_code_t::invalid_argument_k, "The registered_memory is not this ring's"};
         if (in_flight_(*slot).load(std::memory_order_acquire) != 0)
-            return {status_code_t::invalid_argument_k, "The range is still a target of requests in flight"};
+            return {status_code_t::invalid_argument_k, "The range is still a medium of requests in flight"};
         ++slot->generation;
         slot->base = nullptr;
         slot->length = 0;
         claim_(slot->registered).store(0, std::memory_order_release);
-        registration.surrender();
+        registered_memory.surrender();
         return {};
     }
 
     /**
-     *  @brief Registers the target @p request names, so requests can address it by slot.
+     *  @brief Registers the medium @p request names, so requests can address it by slot.
      *  @param[in] request The path, label or namespace to attach, and what the caller may do to it.
-     *  @return The handle, or @c capacity_exhausted_k when every target slot is taken.
+     *  @return The handle, or @c capacity_exhausted_k when every medium slot is taken.
      */
-    expected<descriptor_t> register_target(target_request_t const& request) noexcept {
-        for (std::size_t index = 0; index != targets_.size(); ++index) {
-            target_slot_t& slot = targets_[index];
+    expected<registered_medium_t> register_medium(medium_options_t const& request) noexcept {
+        for (std::size_t index = 0; index != media_.size(); ++index) {
+            registered_medium_slot_t& slot = media_[index];
             std::int32_t expected_free = 0;
             if (!claim_(slot.registered)
                      .compare_exchange_strong(expected_free, 1, std::memory_order_acquire, std::memory_order_relaxed))
                 continue;
-            expected<std::uint16_t> const attached = device_.attach_target(request);
+            expected<std::uint16_t> const attached = device_.open_medium(request);
             if (!attached) {
                 claim_(slot.registered).store(0, std::memory_order_release);
                 return attached.status();
             }
             slot.index = *attached;
-            return descriptor_t::registered(static_cast<descriptor_id_t>(index), slot.generation,
-                                            device_.capacity(slot.index));
+            return registered_medium_t::registered(static_cast<registered_medium_id_t>(index), slot.generation,
+                                                   device_.capacity(slot.index));
         }
-        return status_t {status_code_t::capacity_exhausted_k, "Every target slot of this ring is taken"};
+        return status_t {status_code_t::capacity_exhausted_k, "Every medium slot of this ring is taken"};
     }
 
     /**
-     *  @brief Releases @p descriptor, refusing while requests against it are still in flight.
-     *  @param[inout] descriptor The target to give back, surrendered on success.
+     *  @brief Releases @p registered medium, refusing while requests against it are still in flight.
+     *  @param[inout] registered medium The medium to give back, surrendered on success.
      */
-    status_t deregister_target(descriptor_t& descriptor) noexcept {
-        target_slot_t* const slot = slot_of_(descriptor);
-        if (!slot) return {status_code_t::invalid_argument_k, "The target is not this ring's"};
+    status_t unregister_medium(registered_medium_t& registered_medium) noexcept {
+        registered_medium_slot_t* const slot = slot_of_(registered_medium);
+        if (!slot) return {status_code_t::invalid_argument_k, "The medium is not this ring's"};
         if (in_flight_(*slot).load(std::memory_order_acquire) != 0)
-            return {status_code_t::invalid_argument_k, "The target is still named by requests in flight"};
-        if (status_t const detached = device_.detach_target(slot->index); detached.failed()) return detached;
+            return {status_code_t::invalid_argument_k, "The medium is still named by requests in flight"};
+        if (status_t const detached = device_.close_medium(slot->index); detached.failed()) return detached;
         ++slot->generation;
         slot->index = 0;
         claim_(slot->registered).store(0, std::memory_order_release);
-        descriptor.surrender();
+        registered_medium.surrender();
         return {};
     }
 
@@ -304,27 +306,27 @@ class basic_disk {
 #pragma region Ring
 
     /**
-     *  @brief Takes as much of @p requests as @p owner still has credit for, and never waits.
-     *  @param[in] owner The lease submitting, held by the calling thread.
+     *  @brief Takes as much of @p requests as @p queue pair still has credit for, and never waits.
+     *  @param[in] queue pair The queue pair submitting, held by the calling thread.
      *  @param[in] requests The batch, of which a prefix is taken.
      *  @return How many were taken, which is zero on a full ring and never a reason to block.
      *
-     *  @note Only a token that is not this lease's is refused here, since it would misroute a
-     *      completion. Every other defect - a stale registration, a misaligned extent, an oversized
+     *  @note Only a token that is not this queue pair's is refused here, since it would misroute a
+     *      completion. Every other defect - a stale registered memory, a misaligned extent, an oversized
      *      transfer - is reported on that one request's completion, which is where a real ring
      *      reports it and where a batch of many keeps its other entries.
      */
-    expected<std::size_t> submit(ring_owner_t const& owner, std::span<request_t const> requests) noexcept {
-        owner_slot_t* const slot = slot_of_(owner);
-        if (!slot) return status_t {status_code_t::invalid_argument_k, "The lease is not this ring's"};
-        assert(slot->issuer == issuing_thread_identity() && "Only the thread holding a lease submits on it");
+    expected<std::size_t> submit(queue_pair_t const& queue_pair, std::span<request_t const> requests) noexcept {
+        queue_pair_slot_t* const slot = slot_of_(queue_pair);
+        if (!slot) return status_t {status_code_t::invalid_argument_k, "The queue pair is not this ring's"};
+        assert(slot->bound_thread == calling_thread_identity() && "Only the thread holding a queue pair submits on it");
         for (request_t const& request : requests)
-            if (request.token.owner() != owner.id() || request.token.generation() != owner.generation())
-                return status_t {status_code_t::invalid_argument_k, "A request carries another lease's token"};
+            if (request.token.queue_pair() != queue_pair.id() || request.token.generation() != queue_pair.generation())
+                return status_t {status_code_t::invalid_argument_k, "A request carries another queue pair's token"};
 
         std::size_t const room = slot->depth - (slot->pending_count + slot->ready_count);
         std::size_t const taking = requests.size() < room ? requests.size() : room;
-        std::uint32_t const base = window_of_(owner.id());
+        std::uint32_t const base = window_of_(queue_pair.id());
         for (std::size_t index = 0; index != taking; ++index) {
             request_t const& request = requests[index];
             pending_[base + slot->pending_count + index] = request;
@@ -335,16 +337,16 @@ class basic_disk {
     }
 
     /**
-     *  @brief Performs what @p owner submitted and moves its completions into @p into, never waiting.
-     *  @param[in] owner The lease reaping, held by the calling thread that submitted on it.
+     *  @brief Performs what @p queue pair submitted and moves its completions into @p into, never waiting.
+     *  @param[in] queue pair The queue pair polling, held by the calling thread that submitted on it.
      *  @param[out] into Room for completions, which bounds how many one call moves.
-     *  @return How many completions were moved, which is zero when the owner submitted nothing.
+     *  @return How many completions were moved, which is zero when the queue pair submitted nothing.
      */
-    expected<std::size_t> reap(ring_owner_t const& owner, std::span<completion_t> into) noexcept {
-        owner_slot_t* const slot = slot_of_(owner);
-        if (!slot) return status_t {status_code_t::invalid_argument_k, "The lease is not this ring's"};
-        assert(slot->issuer == issuing_thread_identity() && "Only the thread holding a lease reaps on it");
-        std::uint32_t const base = window_of_(owner.id());
+    expected<std::size_t> poll_completions(queue_pair_t const& queue_pair, std::span<completion_t> into) noexcept {
+        queue_pair_slot_t* const slot = slot_of_(queue_pair);
+        if (!slot) return status_t {status_code_t::invalid_argument_k, "The queue pair is not this ring's"};
+        assert(slot->bound_thread == calling_thread_identity() && "Only the thread holding a queue pair polls on it");
+        std::uint32_t const base = window_of_(queue_pair.id());
         perform_(*slot, base);
 
         std::size_t const moving = into.size() < slot->ready_count ? into.size() : slot->ready_count;
@@ -356,23 +358,23 @@ class basic_disk {
     }
 
     /**
-     *  @brief Stops @p owner's requests that have not started, which the next reap reports cancelled.
-     *  @param[in] owner The lease to stop, whose started requests still run to their own end.
+     *  @brief Stops @p queue pair's requests that have not started, which the next poll reports cancelled.
+     *  @param[in] queue pair The queue pair to stop, whose started requests still run to their own end.
      */
-    void cancel(ring_owner_t const& owner) noexcept {
-        owner_slot_t* const slot = slot_of_(owner);
+    void cancel(queue_pair_t const& queue_pair) noexcept {
+        queue_pair_slot_t* const slot = slot_of_(queue_pair);
         if (!slot) return;
         cancelled_(*slot).store(1, std::memory_order_release);
     }
 
     /**
-     *  @brief Finishes and discards everything @p owner has outstanding, so its buffers may be freed.
-     *  @param[in] owner The lease to empty, which may be cancelled or still running.
+     *  @brief Finishes and discards everything @p queue pair has outstanding, so its buffers may be freed.
+     *  @param[in] queue pair The queue pair to empty, which may be cancelled or still running.
      */
-    status_t drain(ring_owner_t const& owner) noexcept {
-        owner_slot_t* const slot = slot_of_(owner);
-        if (!slot) return {status_code_t::invalid_argument_k, "The lease is not this ring's"};
-        std::uint32_t const base = window_of_(owner.id());
+    status_t drain(queue_pair_t const& queue_pair) noexcept {
+        queue_pair_slot_t* const slot = slot_of_(queue_pair);
+        if (!slot) return {status_code_t::invalid_argument_k, "The queue pair is not this ring's"};
+        std::uint32_t const base = window_of_(queue_pair.id());
         perform_(*slot, base);
         slot->ready_first = 0;
         slot->ready_count = 0;
@@ -383,36 +385,36 @@ class basic_disk {
 
   private:
 
-    /** One lease's share of the ring: its credit, its window and the flag that stops it. */
-    struct owner_slot_t {
+    /** One queue pair's share of the ring: its credit, its window and the flag that stops it. */
+    struct queue_pair_slot_t {
 
-        /** Zero while the slot is free, one while a lease holds it. */
+        /** Zero while the slot is free, one while a queue pair holds it. */
         std::int32_t leased = 0;
 
-        /** Zero while the owner wants its requests, one once it has cancelled them. */
+        /** Zero while the queue pair wants its requests, one once it has cancelled them. */
         std::int32_t cancelled = 0;
 
         /** Raised every time the slot is leased again, so a stale token routes nowhere. */
         std::uint16_t generation = 0;
 
-        /** Requests this lease may keep in flight, fixed when the lease was taken. */
+        /** Requests this queue pair may keep in flight, fixed when the queue pair was taken. */
         std::uint32_t depth = 0;
 
         /** Requests submitted and not yet performed, at the front of the window. */
         std::uint32_t pending_count = 0;
 
-        /** Where this owner's oldest unreaped completion sits inside its window. */
+        /** Where this queue pair's oldest unreaped completion sits inside its window. */
         std::uint32_t ready_first = 0;
 
-        /** Completions performed and not yet reaped. */
+        /** Completions performed and not yet completed. */
         std::uint32_t ready_count = 0;
 
-        /** The thread that took the lease, which every submit and reap is checked against. */
-        std::uint64_t issuer = 0;
+        /** The thread that took the queue pair, which every submit and poll is checked against. */
+        std::uint64_t bound_thread = 0;
     };
 
     /** One pinned memory range, and the count of requests the device may still be writing into it. */
-    struct registration_slot_t {
+    struct registered_memory_slot_t {
 
         /** Zero while the slot is free, one while a range is pinned in it. */
         std::int32_t registered = 0;
@@ -433,19 +435,19 @@ class basic_disk {
         std::uint64_t length = 0;
     };
 
-    /** One registered target, and the count of requests still naming it. */
-    struct target_slot_t {
+    /** One registered medium, and the count of requests still naming it. */
+    struct registered_medium_slot_t {
 
-        /** Zero while the slot is free, one while a target is registered in it. */
+        /** Zero while the slot is free, one while a medium is registered in it. */
         std::int32_t registered = 0;
 
-        /** Requests accepted against this target and not yet performed. */
+        /** Requests accepted against this medium and not yet performed. */
         std::int32_t in_flight = 0;
 
         /** Raised every time the slot is used again, so a stale place resolves to nothing. */
         std::uint16_t generation = 0;
 
-        /** The transport's own handle for the target, which only the device interprets. */
+        /** The transport's own handle for the medium, which only the device interprets. */
         std::uint16_t index = 0;
     };
 
@@ -464,88 +466,90 @@ class basic_disk {
         return fu::preferred_atomic_ref<std::int32_t> {word};
     }
 
-    static fu::preferred_atomic_ref<std::int32_t> cancelled_(owner_slot_t& slot) noexcept {
+    static fu::preferred_atomic_ref<std::int32_t> cancelled_(queue_pair_slot_t& slot) noexcept {
         return fu::preferred_atomic_ref<std::int32_t> {slot.cancelled};
     }
 
-    static fu::preferred_atomic_ref<std::int32_t> in_flight_(registration_slot_t& slot) noexcept {
+    static fu::preferred_atomic_ref<std::int32_t> in_flight_(registered_memory_slot_t& slot) noexcept {
         return fu::preferred_atomic_ref<std::int32_t> {slot.in_flight};
     }
 
-    static fu::preferred_atomic_ref<std::int32_t> in_flight_(target_slot_t& slot) noexcept {
+    static fu::preferred_atomic_ref<std::int32_t> in_flight_(registered_medium_slot_t& slot) noexcept {
         return fu::preferred_atomic_ref<std::int32_t> {slot.in_flight};
     }
 
-    /** Where one lease's requests and completions sit inside the shared windows. */
-    [[nodiscard]] std::uint32_t window_of_(owner_id_t id) const noexcept {
+    /** Where one queue pair's requests and completions sit inside the shared windows. */
+    [[nodiscard]] std::uint32_t window_of_(queue_pair_id_t id) const noexcept {
         return static_cast<std::uint32_t>(id) * depth_limit_;
     }
 
-    [[nodiscard]] owner_slot_t* slot_of_(ring_owner_t const& owner) noexcept {
-        if (!owner.held() || static_cast<std::size_t>(owner.id()) >= owners_.size()) return nullptr;
-        owner_slot_t& slot = owners_[static_cast<std::size_t>(owner.id())];
-        return slot.leased != 0 && slot.generation == owner.generation() ? &slot : nullptr;
+    [[nodiscard]] queue_pair_slot_t* slot_of_(queue_pair_t const& queue_pair) noexcept {
+        if (!queue_pair.held() || static_cast<std::size_t>(queue_pair.id()) >= queue_pairs_.size()) return nullptr;
+        queue_pair_slot_t& slot = queue_pairs_[static_cast<std::size_t>(queue_pair.id())];
+        return slot.leased != 0 && slot.generation == queue_pair.generation() ? &slot : nullptr;
     }
 
-    [[nodiscard]] owner_slot_t const* slot_of_(ring_owner_t const& owner) const noexcept {
-        if (!owner.held() || static_cast<std::size_t>(owner.id()) >= owners_.size()) return nullptr;
-        owner_slot_t const& slot = owners_[static_cast<std::size_t>(owner.id())];
-        return slot.leased != 0 && slot.generation == owner.generation() ? &slot : nullptr;
+    [[nodiscard]] queue_pair_slot_t const* slot_of_(queue_pair_t const& queue_pair) const noexcept {
+        if (!queue_pair.held() || static_cast<std::size_t>(queue_pair.id()) >= queue_pairs_.size()) return nullptr;
+        queue_pair_slot_t const& slot = queue_pairs_[static_cast<std::size_t>(queue_pair.id())];
+        return slot.leased != 0 && slot.generation == queue_pair.generation() ? &slot : nullptr;
     }
 
-    [[nodiscard]] registration_slot_t* slot_of_(registration_t const& registration) noexcept {
-        if (!registration.held() || static_cast<std::size_t>(registration.id()) >= registrations_.size())
+    [[nodiscard]] registered_memory_slot_t* slot_of_(registered_memory_t const& registered_memory) noexcept {
+        if (!registered_memory.held() ||
+            static_cast<std::size_t>(registered_memory.id()) >= registered_memories_.size())
             return nullptr;
-        registration_slot_t& slot = registrations_[static_cast<std::size_t>(registration.id())];
-        return slot.registered != 0 && slot.generation == registration.generation() ? &slot : nullptr;
+        registered_memory_slot_t& slot = registered_memories_[static_cast<std::size_t>(registered_memory.id())];
+        return slot.registered != 0 && slot.generation == registered_memory.generation() ? &slot : nullptr;
     }
 
-    [[nodiscard]] target_slot_t* slot_of_(descriptor_t const& descriptor) noexcept {
-        if (!descriptor.held() || static_cast<std::size_t>(descriptor.id()) >= targets_.size()) return nullptr;
-        target_slot_t& slot = targets_[static_cast<std::size_t>(descriptor.id())];
-        return slot.registered != 0 && slot.generation == descriptor.generation() ? &slot : nullptr;
+    [[nodiscard]] registered_medium_slot_t* slot_of_(registered_medium_t const& registered_medium) noexcept {
+        if (!registered_medium.held() || static_cast<std::size_t>(registered_medium.id()) >= media_.size())
+            return nullptr;
+        registered_medium_slot_t& slot = media_[static_cast<std::size_t>(registered_medium.id())];
+        return slot.registered != 0 && slot.generation == registered_medium.generation() ? &slot : nullptr;
     }
 
-    /** Marks the range and the target of @p request as live, so neither can be taken back under it. */
+    /** Marks the range and the medium of @p request as live, so neither can be taken back under it. */
     void borrow_(request_t const& request) noexcept {
-        if (registration_slot_t* const slot = resolve_(request.buffer); slot)
+        if (registered_memory_slot_t* const slot = resolve_(request.buffer); slot)
             in_flight_(*slot).add(1, std::memory_order_acquire);
-        if (target_slot_t* const slot = resolve_(request.target); slot)
+        if (registered_medium_slot_t* const slot = resolve_(request.medium); slot)
             in_flight_(*slot).add(1, std::memory_order_acquire);
     }
 
     /** Releases both once the device is done with the bytes of @p request. */
     void restore_(request_t const& request) noexcept {
-        if (registration_slot_t* const slot = resolve_(request.buffer); slot)
+        if (registered_memory_slot_t* const slot = resolve_(request.buffer); slot)
             in_flight_(*slot).sub(1, std::memory_order_release);
-        if (target_slot_t* const slot = resolve_(request.target); slot)
+        if (registered_medium_slot_t* const slot = resolve_(request.medium); slot)
             in_flight_(*slot).sub(1, std::memory_order_release);
     }
 
-    [[nodiscard]] registration_slot_t* resolve_(buffer_place_t place) noexcept {
-        if (static_cast<std::size_t>(place.registration) >= registrations_.size()) return nullptr;
-        registration_slot_t& slot = registrations_[static_cast<std::size_t>(place.registration)];
+    [[nodiscard]] registered_memory_slot_t* resolve_(memory_reference_t place) noexcept {
+        if (static_cast<std::size_t>(place.memory_id) >= registered_memories_.size()) return nullptr;
+        registered_memory_slot_t& slot = registered_memories_[static_cast<std::size_t>(place.memory_id)];
         return slot.registered != 0 && slot.generation == place.generation ? &slot : nullptr;
     }
 
-    [[nodiscard]] target_slot_t* resolve_(target_place_t place) noexcept {
-        if (static_cast<std::size_t>(place.descriptor) >= targets_.size()) return nullptr;
-        target_slot_t& slot = targets_[static_cast<std::size_t>(place.descriptor)];
+    [[nodiscard]] registered_medium_slot_t* resolve_(medium_reference_t place) noexcept {
+        if (static_cast<std::size_t>(place.medium_id) >= media_.size()) return nullptr;
+        registered_medium_slot_t& slot = media_[static_cast<std::size_t>(place.medium_id)];
         return slot.registered != 0 && slot.generation == place.generation ? &slot : nullptr;
     }
 
-    /** Where inside the shared completion window the @p index -th fresh completion of a lease goes. */
-    [[nodiscard]] static std::size_t ready_place_(owner_slot_t const& slot, std::uint32_t base,
+    /** Where inside the shared completion window the @p index -th fresh completion of a queue pair goes. */
+    [[nodiscard]] static std::size_t ready_place_(queue_pair_slot_t const& slot, std::uint32_t base,
                                                   std::size_t index) noexcept {
         return base + (slot.ready_first + slot.ready_count + index) % slot.depth;
     }
 
-    /** The completion a request gets when its owner cancelled it, or a chain ahead of it was cut. */
+    /** The completion a request gets when its queue pair cancelled it, or a chain ahead of it was cut. */
     [[nodiscard]] static completion_t cancelled_completion_(request_t const& request) noexcept {
         completion_t completion;
         completion.token = request.token;
         completion.state = completion_state_t::cancelled_k;
-        completion.status = {status_code_t::uninitialized_k, "The owner cancelled this request"};
+        completion.status = {status_code_t::uninitialized_k, "The queue_pair cancelled this request"};
         return completion;
     }
 
@@ -553,21 +557,21 @@ class basic_disk {
     [[nodiscard]] completion_t perform_one_(request_t const& request) noexcept {
         completion_t completion;
         completion.token = request.token;
-        target_slot_t const* const target = resolve_(request.target);
-        if (!target) {
+        registered_medium_slot_t const* const medium = resolve_(request.medium);
+        if (!medium) {
             completion.state = completion_state_t::failed_k;
-            completion.status = {status_code_t::invalid_argument_k, "The request names no registered target"};
+            completion.status = {status_code_t::invalid_argument_k, "The request names no registered medium"};
             return completion;
         }
         if (request.kind == request_kind_t::flush_k) {
-            completion.status = device_.flush(target->index);
+            completion.status = device_.flush(medium->index);
             completion.state = completion.status.failed() ? completion_state_t::failed_k
                                                           : completion_state_t::completed_k;
             return completion;
         }
 
         ring_capabilities_t const& limits = capabilities_;
-        registration_slot_t const* const slot = resolve_(request.buffer);
+        registered_memory_slot_t const* const slot = resolve_(request.buffer);
         if (!slot) {
             completion.state = completion_state_t::failed_k;
             completion.status = {status_code_t::invalid_argument_k, "The request names no registered range"};
@@ -594,29 +598,29 @@ class basic_disk {
 
         std::span<byte_t> const buffer {address, static_cast<std::size_t>(request.extent.length)};
         expected<std::uint64_t> const moved = request.kind == request_kind_t::read_k
-                                                  ? device_.read_extent(target->index, request.extent, buffer)
-                                                  : device_.write_extent(target->index, request.extent, buffer);
+                                                  ? device_.read_extent(medium->index, request.extent, buffer)
+                                                  : device_.write_extent(medium->index, request.extent, buffer);
         if (!moved) {
             completion.state = completion_state_t::failed_k;
             completion.status = moved.status();
             return completion;
         }
-        completion.transferred = *moved;
+        completion.transferred_bytes = *moved;
         completion.state = *moved == request.extent.length ? completion_state_t::completed_k
                                                            : completion_state_t::partial_k;
         return completion;
     }
 
     /**
-     *  @brief Performs everything one lease has submitted, and stages the completions for its reap.
+     *  @brief Performs everything one queue pair has submitted, and stages the completions for its poll.
      *
-     *  Every request runs on the thread that reaps it, in submission order, so a chain gets the
-     *  ordering it was promised and nothing here forks. Depth comes from leases rather than threads:
+     *  Every request runs on the thread that polls it, in submission order, so a chain gets the
+     *  ordering it was promised and nothing here forks. Depth comes from queue pairs rather than threads:
      *  a pool dispatch blocks until all its threads return and admits one caller at a time, so
-     *  fanning a batch out here would serialize two owners against each other, and a batch issued
+     *  fanning a batch out here would serialize two queue pairs against each other, and a batch issued
      *  from inside a background job would fork a pool that is already forked.
      */
-    void perform_(owner_slot_t& slot, std::uint32_t base) noexcept {
+    void perform_(queue_pair_slot_t& slot, std::uint32_t base) noexcept {
         std::uint32_t const count = slot.pending_count;
         if (count == 0) return;
 
@@ -641,22 +645,22 @@ class basic_disk {
     /** What this disk accepts, read from the transport once at mount. */
     ring_capabilities_t capabilities_;
 
-    /** Requests one lease may keep in flight, and the stride of every lease's window. */
+    /** Requests one queue pair may keep in flight, and the stride of every queue pair's window. */
     std::uint32_t depth_limit_ = 0;
 
-    /** One slot per lease the ring hands out. */
-    st::basic_vector<owner_slot_t> owners_;
+    /** One slot per queue pair the ring hands out. */
+    st::basic_vector<queue_pair_slot_t> queue_pairs_;
 
     /** One slot per memory range the ring pins. */
-    st::basic_vector<registration_slot_t> registrations_;
+    st::basic_vector<registered_memory_slot_t> registered_memories_;
 
-    /** One slot per target the ring registers. */
-    st::basic_vector<target_slot_t> targets_;
+    /** One slot per medium the ring registers. */
+    st::basic_vector<registered_medium_slot_t> media_;
 
-    /** Every lease's submitted requests, in windows of @c depth_limit_. */
+    /** Every queue pair's submitted requests, in windows of @c depth_limit_. */
     st::basic_vector<request_t> pending_;
 
-    /** Every lease's performed completions, in windows of @c depth_limit_ read as a circle. */
+    /** Every queue pair's performed completions, in windows of @c depth_limit_ read as a circle. */
     st::basic_vector<completion_t> ready_;
 };
 

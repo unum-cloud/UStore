@@ -30,7 +30,7 @@
 #include <ustore/types.hpp>  // `byte_t`
 
 #include "nvme/collection_snapshot.hpp" // `select_result_t`
-#include "nvme/io_lane.hpp"             // `io_lane_t`
+#include "nvme/io_channel.hpp"          // `io_channel_t`
 #include "nvme/read_set.hpp"            // `transaction_stamp_t`, `watch_schedule_t`, `watch_purpose_t`
 #include "nvme/single_collection_database_transaction_registry.hpp" // `single_collection_database_transaction_registry`
 #include "nvme/stored_value.hpp"                                    // `stored_value_size_t`, `tombstone_offset_k`
@@ -90,7 +90,7 @@ class single_collection_database_transaction {
         state_ = state_t::started_k;
     }
 
-    /** Retires the roster slot, handing back the staging lease when this transaction still holds it. */
+    /** Retires the roster slot, handing back the staging queue pair when this transaction still holds it. */
     ~single_collection_database_transaction() noexcept { manager_.notify_about_deletion_(id_); }
 
 #pragma endregion Construction
@@ -101,7 +101,7 @@ class single_collection_database_transaction {
      *  @brief Checks the watched keys and takes the write path, leaving the commit itself for later.
      *
      *  A failure keeps the changes exactly as they were, so a caller can log what it could not commit,
-     *  and hands the staging lease back, so the transaction is running again rather than staged.
+     *  and hands the staging queue pair back, so the transaction is running again rather than staged.
      */
     status_t stage() noexcept {
         if (state_ != state_t::started_k) return {status_code_t::invalid_argument_k, "That transaction is not running"};
@@ -115,7 +115,7 @@ class single_collection_database_transaction {
     /**
      *  @brief Stages whatever is not staged and lands every change, starting the transaction again.
      *
-     *  The registry hands the staging lease back whatever it answers, so this transaction is running
+     *  The registry hands the staging queue pair back whatever it answers, so this transaction is running
      *  again either way; a failure keeps the changes for logging and a @c rollback drops them.
      */
     status_t commit() noexcept {
@@ -238,13 +238,13 @@ class single_collection_database_transaction {
 
     /**
      *  @brief Copies the value of @p stored_key into @p into, from this transaction or from the database.
-     *  @param[inout] lane The lane a read of the database is submitted and reaped on, held by the caller.
+     *  @param[inout] channel The channel a read of the database is submitted and completed on, held by the caller.
      *  @param[in] stored_key The key to read.
      *  @param[out] into Where the value lands, which need not be aligned and need not be registered.
      *  @param[out] size Bytes written, which is zero for every failure.
      */
     template <watch_schedule_t watch_schedule_ = watch_schedule_t::default_k>
-    status_t select(io_lane_t& lane, stored_key_t stored_key, std::span<byte_t> into,
+    status_t select(io_channel_t& channel, stored_key_t stored_key, std::span<byte_t> into,
                     stored_value_size_t& size) const noexcept {
         if (state_ != state_t::started_k) return {status_code_t::invalid_argument_k, "That transaction is staged"};
         size = 0;
@@ -266,14 +266,14 @@ class single_collection_database_transaction {
         std::span<stored_key_t const> const only {&stored_key, 1};
         transaction_stamp_t const watch_from = watch_stamp_for_<watch_schedule_>();
         if (status_t const prepared = watch_now_or_prepare_<watch_schedule_>(only); prepared.failed()) return prepared;
-        status_t const read = manager_.store_->select(lane, stored_key, into, size);
+        status_t const read = manager_.store_->select(channel, stored_key, into, size);
         watch_later_<watch_schedule_>(only, watch_from, watch_purpose_t::read_k);
         return read;
     }
 
     /**
      *  @brief Reads the values of @p stored_keys, this transaction's own writes ahead of the database.
-     *  @param[inout] lane The lane a read of the database is submitted and reaped on, held by the caller.
+     *  @param[inout] channel The channel a read of the database is submitted and completed on, held by the caller.
      *  @param[in] stored_keys The keys to read, in any order and with any number of misses among them.
      *  @param[out] results What every key answered, which separates a miss from an erasure.
      *  @param[in] sink Called as @c sink(request, offset, bytes) for every key that locates a value.
@@ -282,8 +282,8 @@ class single_collection_database_transaction {
      *      database answers arrives as one call per block, exactly as a read of the database does.
      */
     template <watch_schedule_t watch_schedule_ = watch_schedule_t::default_k, typename sink_type_>
-    status_t select(io_lane_t& lane, std::span<stored_key_t const> stored_keys, std::span<select_result_t> results,
-                    sink_type_&& sink) const noexcept {
+    status_t select(io_channel_t& channel, std::span<stored_key_t const> stored_keys,
+                    std::span<select_result_t> results, sink_type_&& sink) const noexcept {
         if (state_ != state_t::started_k) return {status_code_t::invalid_argument_k, "That transaction is staged"};
         if (results.size() != stored_keys.size())
             return {status_code_t::invalid_argument_k, "A batched select answers one result per key"};
@@ -317,7 +317,7 @@ class single_collection_database_transaction {
         auto relay = [&](std::size_t request, std::uint64_t offset, std::span<byte_t const> bytes) noexcept {
             sink(deferred_requests[request], offset, bytes);
         };
-        status_t const read = manager_.store_->select(lane, watched, std::span<select_result_t> {deferred_results},
+        status_t const read = manager_.store_->select(channel, watched, std::span<select_result_t> {deferred_results},
                                                       relay);
         watch_later_<watch_schedule_>(watched, watch_from, watch_purpose_t::read_k);
         if (read.failed()) return read;
@@ -354,10 +354,10 @@ class single_collection_database_transaction {
         /** Built but not yet started, and left there by nothing a caller can observe. */
         invalid_k,
 
-        /** Running: it reads, it writes, and it holds no lease. */
+        /** Running: it reads, it writes, and it holds no queue pair. */
         started_k,
 
-        /** Staged: it holds the staging lease and the write path until it commits or rolls back. */
+        /** Staged: it holds the staging queue pair and the write path until it commits or rolls back. */
         staged_k,
     };
 

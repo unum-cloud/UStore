@@ -4,7 +4,7 @@
  *  @date September 19, 2026
  *  @brief The database over the collections: what the catalog persists, and what a commit makes visible.
  *
- *  The verdicts this file exists for are @c commit_is_all_or_nothing and @c threads_commit_serializably.
+ *  The results this file exists for are @c commit_is_all_or_nothing and @c threads_commit_serializably.
  *  A transaction spanning two collections must never be seen half applied by a reader running beside
  *  it, and several threads racing over the same keys must leave a state one serial order explains.
  */
@@ -30,7 +30,7 @@
 #include "nvme/resources.hpp"     // `resources_t`
 #include "nvme/volume_router.hpp" // `basic_volume_router`
 
-#include "nvme_fixture.hpp" // `basic_fixture`, `on_transport`, `painted`
+#include "nvme_fixture.hpp" // `basic_fixture`, `run_on_transport`, `painted`
 
 namespace unum::ustore {
 
@@ -38,8 +38,9 @@ using namespace unum::ustore::nvme;
 
 #pragma region Shape
 
-/** The numbers every case mounts with: lanes for a compaction to hold two, and one for every thread a case spawns. */
-constexpr fixture_shape_t database_shape_k {.spare_lanes = 8};
+/** The numbers every case mounts with: channels for a compaction to hold two, and one for every thread a case
+ *  spawns. */
+constexpr fixture_config_t database_config_k {.shared_io_channels = 8};
 
 /** The largest value the variable-width collections under test admit. */
 constexpr stored_value_size_t value_max_size_k = 4096;
@@ -64,7 +65,7 @@ struct database_types {
     /** A fixture, the router over its one volume, and the database mounted over the router. */
     struct stack_t {
 
-        /** The disk, the slab, the lanes and the one volume. */
+        /** The disk, the arena, the channels and the one volume. */
         std::unique_ptr<fixture_t> fixture;
 
         /** The volumes of the database, of which this stack opens one. */
@@ -229,14 +230,14 @@ template <typename volume_type_>
 
 #pragma region Fixtures
 
-/** Mounts a database over the router and the lanes of @p stack, which a reopen does a second time over the same
+/** Mounts a database over the router and the channels of @p stack, which a reopen does a second time over the same
  *  volume. */
 template <typename stack_type_>
 expected<std::unique_ptr<typename stack_type_::database_t>> open_database(stack_type_& stack) noexcept {
     using database_t = typename stack_type_::database_t;
     auto store = std::unique_ptr<database_t> {new (std::nothrow) database_t {stack.fixture->resources}};
     if (!store) return status_t {status_code_t::out_of_memory_k, "The database did not fit"};
-    if (status_t const mounted = store->mount(stack.router, stack.fixture->lanes, test_database_config());
+    if (status_t const mounted = store->mount(stack.router, stack.fixture->channels, test_database_config());
         mounted.failed())
         return mounted;
     return store;
@@ -259,11 +260,11 @@ expected<std::unique_ptr<typename database_types<typename mount_type_::fixture_t
     if (!built) return built.status();
     stack->router = std::move(*built);
 
-    expected<typename types_t::guard_t> guard = stack->fixture->lanes.checkout();
+    expected<typename types_t::guard_t> guard = stack->fixture->channels.acquire();
     if (!guard) return guard.status();
-    expected<typename types_t::volume_t> volume = stack->fixture->mount_volume(guard->lane());
+    expected<typename types_t::volume_t> volume = stack->fixture->mount_volume(guard->channel());
     if (!volume) return volume.status();
-    if (status_t const adopted = stack->router.adopt(std::move(*volume)); adopted.failed()) return adopted;
+    if (status_t const adopted = stack->router.bind_queue_pair(std::move(*volume)); adopted.failed()) return adopted;
 
     expected<std::unique_ptr<typename types_t::database_t>> store = open_database(*stack);
     if (!store) return store.status();
@@ -607,10 +608,10 @@ std::size_t crash_between_seal_and_schema(mount_type_ const& mount) {
 
         // The schema write that would have named those runs never landed.
         {
-            expected<guard_t> guard = (*stack)->fixture->lanes.checkout();
+            expected<guard_t> guard = (*stack)->fixture->channels.acquire();
             failures += expect(guard.has_value());
             if (!guard) return failures;
-            failures += expect(volume.drop(guard->lane(), database_schema_name()).succeeded());
+            failures += expect(volume.drop(guard->channel(), database_schema_name()).succeeded());
         }
 
         expected<std::unique_ptr<database_t>> reopened = open_database(**stack);
@@ -669,12 +670,12 @@ std::size_t crash_between_seal_and_schema(mount_type_ const& mount) {
         failures += expect(named_bytes != std::size_t {0});
         if (named_bytes == 0) return failures;
 
-        // The bytes of one run the schema names never reached the medium.
+        // The bytes of one run the schema names never reached the environment.
         {
-            expected<guard_t> guard = (*stack)->fixture->lanes.checkout();
+            expected<guard_t> guard = (*stack)->fixture->channels.acquire();
             failures += expect(guard.has_value());
             if (!guard) return failures;
-            failures += expect(volume.drop(guard->lane(), blob_name_t {named.data(), named_bytes}).succeeded());
+            failures += expect(volume.drop(guard->channel(), blob_name_t {named.data(), named_bytes}).succeeded());
         }
 
         expected<std::unique_ptr<database_t>> const reopened = open_database(**stack);
@@ -973,7 +974,7 @@ std::size_t snapshot_holds_its_moment(mount_type_ const& mount) {
         store.insert(any_collection_id_t {*left}, stored_key_t {2}, stored_value_view_t {newer}).succeeded());
     failures += expect(store.remove(any_collection_id_t {*right}, stored_key_t {1}).succeeded());
 
-    expected<guard_t> guard = (*stack)->fixture->lanes.checkout();
+    expected<guard_t> guard = (*stack)->fixture->channels.acquire();
     failures += expect(guard.has_value());
     if (!guard) return failures;
 
@@ -981,7 +982,7 @@ std::size_t snapshot_holds_its_moment(mount_type_ const& mount) {
     failures += expect(into.resize(8) == st::status_t::success_k);
     stored_value_size_t size = 0;
     failures += expect(
-        taken->select(guard->lane(), any_collection_id_t {*left}, stored_key_t {1}, std::span<byte_t> {into}, size)
+        taken->select(guard->channel(), any_collection_id_t {*left}, stored_key_t {1}, std::span<byte_t> {into}, size)
             .succeeded());
     failures += expect_eq(counter_of(std::span<byte_t const> {into.data(), size}), std::uint64_t {1});
     failures += expect(taken->find(any_collection_id_t {*left}, stored_key_t {2}, size) == select_result_t::nothing_k);
@@ -1215,31 +1216,31 @@ int main(int argc, char const* argv[]) {
     if (argument_status_t const status = parse_suite_options(argc, argv, options);
         status != argument_status_t::parsed_k)
         return status == argument_status_t::help_k ? 0 : 1;
-    ledger_t ledger = options.ledger();
+    suite_totals_t totals = options.totals();
 
     st::expected<test_directory_t> const directory = test_directory_t::make(options.directory);
     if (!directory) {
         fmt::println(stderr, "  the working directory would not open");
         return 1;
     }
-    medium_t const medium = medium_t::of(options, *directory);
+    test_environment_t const environment = test_environment_t::of(options, *directory);
 
     auto const cases = [&](auto const& mount) {
-        report(ledger, mount.label("named_collections").c_str(), named_collections_round_trip(mount));
-        report(ledger, mount.label("catalog_survives_reopen").c_str(), catalog_survives_reopen(mount));
-        report(ledger, mount.label("dropped_collection_is_gone").c_str(), dropped_collection_is_gone(mount));
-        report(ledger, mount.label("crash_before_schema").c_str(), crash_between_seal_and_schema(mount));
-        report(ledger, mount.label("user_data").c_str(), user_data_round_trips(mount));
-        report(ledger, mount.label("commit_is_all_or_nothing").c_str(), commit_is_all_or_nothing(mount));
-        report(ledger, mount.label("conflict_spares_the_other").c_str(),
+        report(totals, mount.label("named_collections").c_str(), named_collections_round_trip(mount));
+        report(totals, mount.label("catalog_survives_reopen").c_str(), catalog_survives_reopen(mount));
+        report(totals, mount.label("dropped_collection_is_gone").c_str(), dropped_collection_is_gone(mount));
+        report(totals, mount.label("crash_before_schema").c_str(), crash_between_seal_and_schema(mount));
+        report(totals, mount.label("user_data").c_str(), user_data_round_trips(mount));
+        report(totals, mount.label("commit_is_all_or_nothing").c_str(), commit_is_all_or_nothing(mount));
+        report(totals, mount.label("conflict_spares_the_other").c_str(),
                conflict_leaves_the_other_collection_untouched(mount));
-        report(ledger, mount.label("rollback_and_renew").c_str(), rollback_and_renew_behave(mount));
-        report(ledger, mount.label("snapshot_holds_its_moment").c_str(), snapshot_holds_its_moment(mount));
-        report(ledger, mount.label("threads_commit_serializably").c_str(), threads_commit_serializably(mount));
-        report(ledger, mount.label("lookups_outrun_the_write_path").c_str(), lookups_outrun_the_write_path(mount));
+        report(totals, mount.label("rollback_and_renew").c_str(), rollback_and_renew_behave(mount));
+        report(totals, mount.label("snapshot_holds_its_moment").c_str(), snapshot_holds_its_moment(mount));
+        report(totals, mount.label("threads_commit_serializably").c_str(), threads_commit_serializably(mount));
+        report(totals, mount.label("lookups_outrun_the_write_path").c_str(), lookups_outrun_the_write_path(mount));
     };
     for (transport_t const transport : every_transport_k)
-        on_transport(ledger, transport, medium, database_shape_k, 1, "database", cases);
+        run_on_transport(totals, transport, environment, database_config_k, 1, "database", cases);
 
-    return conclude(ledger);
+    return suite_exit_code(totals);
 }

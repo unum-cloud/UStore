@@ -8,17 +8,17 @@
  *  with @c io_uring_register and entered with @c io_uring_enter, which is the whole interface and
  *  needs Linux 6.12 or newer for @c DEFER_TASKRUN, @c SINGLE_ISSUER and @c NO_SQARRAY together.
  *
- *  A ring belongs to one lease rather than to the disk, because @c SINGLE_ISSUER binds a ring to one
+ *  A ring belongs to one queue pair rather than to the disk, because @c SINGLE_ISSUER binds a ring to one
  *  task and answers @c -EEXIST to every other, for @c io_uring_enter and @c io_uring_register alike.
  *  The binding happens at @c io_uring_setup unless the ring is set up disabled, so every ring is
  *  created with @c IORING_SETUP_R_DISABLED at mount - where mapping and the sparse tables can still
- *  fail loudly - and bound to its thread by @c IORING_REGISTER_ENABLE_RINGS when the lease is taken.
+ *  fail loudly - and bound to its thread by @c IORING_REGISTER_ENABLE_RINGS when the queue pair is taken.
  *
- *  Because only the bound thread may register on its own ring, a registered buffer or target is
+ *  Because only the bound thread may register on its own ring, a registered buffer or medium is
  *  recorded on the disk and copied into a ring's tables by that ring's own thread, at the submission
- *  that first needs it. The disk counts registration and target epochs; a ring rewrites its table
+ *  that first needs it. The disk counts registered memory and medium epochs; a ring rewrites its table
  *  when its epoch is behind. Pinning the ranges is an optimisation the locked-memory cap may refuse,
- *  since every ring is charged for the whole slab; a ring refused the pin addresses them by pointer.
+ *  since every ring is charged for the whole arena; a ring refused the pin addresses them by pointer.
  */
 
 #pragma once
@@ -60,14 +60,14 @@
 
 #include "nvme/blocking_files_disk.hpp" // `native_file_t`, `open_native_file`, `native_file_capacity`
 #include "nvme/extent.hpp"              // `extent_t`, `portable_alignment_k`
-#include "nvme/ring.hpp"                // `request_t`, `completion_t`, `ring_owner_t`
+#include "nvme/ring.hpp"                // `request_t`, `completion_t`, `queue_pair_t`
 
 namespace unum::ustore::nvme {
 
 #pragma region Configuration
 
 /**
- *  @brief What a mount fixes about an io_uring disk before any owner leases a share of it.
+ *  @brief What a mount fixes about an io_uring disk before any queue pair queue pairs a share of it.
  *
  *  Depth is the one number worth tuning: sixteen outstanding reads already beat @c pread elevenfold
  *  on one namespace, sixty-four reach sixteenfold, and everything past a hundred and twenty-eight is
@@ -76,16 +76,16 @@ namespace unum::ustore::nvme {
 struct uring_disk_config_t {
 
     /** Leases the disk hands out at once, which is also the number of rings it creates. */
-    std::uint16_t owners_limit = 1;
+    std::uint16_t queue_pairs_limit = 1;
 
-    /** Requests one lease may keep in flight, which is the credit an owner spends and reaps back. */
+    /** Requests one queue pair may keep in flight, which is the credit a queue pair spends and polls back. */
     std::uint32_t depth_limit = 64;
 
     /** Memory ranges the disk pins at once, which every ring keeps a table slot for. */
-    std::uint16_t registrations_limit = 8;
+    std::uint16_t registered_memory_limit = 8;
 
     /** Targets the disk registers at once, which a directory of sorted runs raises above one. */
-    std::uint16_t targets_limit = 1;
+    std::uint16_t media_limit = 1;
 
     /** Whether the page cache stands between the ring and the medium. */
     file_buffering_t buffering = file_buffering_t::unbuffered_k;
@@ -107,7 +107,7 @@ enum class uring_probe_t : std::uint8_t {
 /** Whether the kernel holds the registered ranges pinned, which the locked-memory cap decides at first submission. */
 enum class range_pinning_t : std::uint8_t {
 
-    /** Pinned once at registration, so a request names a table slot and the kernel pins nothing per request. */
+    /** Pinned once at registered memory, so a request names a table slot and the kernel pins nothing per request. */
     pinned_k,
 
     /** The pin exceeded the locked-memory cap, so a request carries its pointer and the kernel pins per request. */
@@ -174,17 +174,17 @@ struct direct_alignment_t {
 #pragma region Disk
 
 /**
- *  @brief The ring Linux offers, over one or more @c O_DIRECT files registered as targets.
+ *  @brief The ring Linux offers, over one or more @c O_DIRECT files registered as media.
  *
  *  This is not a @c basic_disk over a blocking device: the queue is the kernel's, so the disk drives
  *  it directly and only the bookkeeping is its own. @c submit writes submission entries and enters
- *  once, @c reap enters with @c min_complete of zero to run the deferred completion work and copies
+ *  once, @c poll enters with @c min_complete of zero to run the deferred completion work and copies
  *  whatever landed, and neither ever waits.
  *
- *  A defect the ring can see before the kernel does - a stale registration, an extent past its
+ *  A defect the ring can see before the kernel does - a stale registered memory, an extent past its
  *  range, a length past one transfer, an alignment the filesystem refuses - never fails the batch.
  *  It becomes that one request's completion and leaves its neighbours alone, which is what a chain
- *  of submission entries would do anyway. Only a token that is not this lease's fails the whole
+ *  of submission entries would do anyway. Only a token that is not this queue pair's fails the whole
  *  @c submit, since a misrouted completion is unrecoverable.
  */
 class uring_files_disk_t {
@@ -198,21 +198,21 @@ class uring_files_disk_t {
     uring_files_disk_t& operator=(uring_files_disk_t&& other) noexcept {
         if (this == &other) return *this;
         close_all_();
-        owners_ = std::move(other.owners_);
+        queue_pairs_ = std::move(other.queue_pairs_);
         rings_ = std::move(other.rings_);
-        registrations_ = std::move(other.registrations_);
-        targets_ = std::move(other.targets_);
+        registered_memories_ = std::move(other.registered_memories_);
+        media_ = std::move(other.media_);
         flights_ = std::move(other.flights_);
         locals_ = std::move(other.locals_);
         vectors_ = std::move(other.vectors_);
-        descriptors_ = std::move(other.descriptors_);
-        registrations_epoch_ = other.registrations_epoch_;
-        targets_epoch_ = other.targets_epoch_;
+        registered_media_ = std::move(other.registered_media_);
+        registered_memories_epoch_ = other.registered_memories_epoch_;
+        media_epoch_ = other.media_epoch_;
         pin_refused_epoch_ = other.pin_refused_epoch_;
         depth_limit_ = other.depth_limit_;
-        owners_limit_ = other.owners_limit_;
-        registrations_limit_ = other.registrations_limit_;
-        targets_limit_ = other.targets_limit_;
+        queue_pairs_limit_ = other.queue_pairs_limit_;
+        registered_memories_limit_ = other.registered_memories_limit_;
+        media_limit_ = other.media_limit_;
         buffering_ = other.buffering_;
         return *this;
     }
@@ -239,43 +239,44 @@ class uring_files_disk_t {
     }
 
     /**
-     *  @brief Creates one disabled ring per lease and gives each the sparse tables it will fill.
-     *  @param[in] config Leases, per-lease depth, the ranges and targets pinned, and the buffering.
+     *  @brief Creates one disabled ring per queue pair and gives each the sparse tables it will fill.
+     *  @param[in] config Leases, per-queue pair depth, the ranges and media pinned, and the buffering.
      *
-     *  @note No file is opened here; a mount registers each one as a target, so one disk serves a
+     *  @note No file is opened here; a mount registers each one as a medium, so one disk serves a
      *      directory of many sorted runs rather than one disk per run.
      */
     static expected<uring_files_disk_t> make(uring_disk_config_t const& config) noexcept {
-        if (config.owners_limit == 0 || config.depth_limit == 0)
-            return status_t {status_code_t::invalid_argument_k, "A ring needs a lease and a request of depth"};
-        if (config.owners_limit == static_cast<std::uint16_t>(owner_id_t::unowned_k) ||
-            config.registrations_limit == static_cast<std::uint16_t>(registration_id_t::unregistered_k) ||
-            config.targets_limit == static_cast<std::uint16_t>(descriptor_id_t::unregistered_k))
+        if (config.queue_pairs_limit == 0 || config.depth_limit == 0)
+            return status_t {status_code_t::invalid_argument_k, "A ring needs a queue pair and a request of depth"};
+        if (config.queue_pairs_limit == static_cast<std::uint16_t>(queue_pair_id_t::unallocated_k) ||
+            config.registered_memory_limit == static_cast<std::uint16_t>(registered_memory_id_t::unregistered_k) ||
+            config.media_limit == static_cast<std::uint16_t>(registered_medium_id_t::unregistered_k))
             return status_t {status_code_t::invalid_argument_k, "A ring keeps one identifier for an empty handle"};
-        if (config.targets_limit == 0 || config.registrations_limit == 0)
-            return status_t {status_code_t::invalid_argument_k, "A ring needs a target and a range to move between"};
+        if (config.media_limit == 0 || config.registered_memory_limit == 0)
+            return status_t {status_code_t::invalid_argument_k, "A ring needs a medium and a range to move between"};
         if (config.depth_limit > depth_ceiling_k)
             return status_t {status_code_t::invalid_argument_k, "A ring holds fewer requests than that"};
 
-        std::size_t const window = static_cast<std::size_t>(config.owners_limit) * config.depth_limit;
+        std::size_t const window = static_cast<std::size_t>(config.queue_pairs_limit) * config.depth_limit;
         uring_files_disk_t disk;
         disk.depth_limit_ = config.depth_limit;
-        disk.owners_limit_ = config.owners_limit;
-        disk.registrations_limit_ = config.registrations_limit;
-        disk.targets_limit_ = config.targets_limit;
+        disk.queue_pairs_limit_ = config.queue_pairs_limit;
+        disk.registered_memories_limit_ = config.registered_memory_limit;
+        disk.media_limit_ = config.media_limit;
         disk.buffering_ = config.buffering;
-        if (status_t const sized = size_(disk.owners_, config.owners_limit); sized.failed()) return sized;
-        if (status_t const sized = size_(disk.rings_, config.owners_limit); sized.failed()) return sized;
-        if (status_t const sized = size_(disk.registrations_, config.registrations_limit); sized.failed()) return sized;
-        if (status_t const sized = size_(disk.targets_, config.targets_limit); sized.failed()) return sized;
+        if (status_t const sized = size_(disk.queue_pairs_, config.queue_pairs_limit); sized.failed()) return sized;
+        if (status_t const sized = size_(disk.rings_, config.queue_pairs_limit); sized.failed()) return sized;
+        if (status_t const sized = size_(disk.registered_memories_, config.registered_memory_limit); sized.failed())
+            return sized;
+        if (status_t const sized = size_(disk.media_, config.media_limit); sized.failed()) return sized;
         if (status_t const sized = size_(disk.flights_, window); sized.failed()) return sized;
         if (status_t const sized = size_(disk.locals_, window); sized.failed()) return sized;
-        if (status_t const sized = size_(disk.vectors_,
-                                         static_cast<std::size_t>(config.owners_limit) * config.registrations_limit);
+        if (status_t const sized = size_(
+                disk.vectors_, static_cast<std::size_t>(config.queue_pairs_limit) * config.registered_memory_limit);
             sized.failed())
             return sized;
-        if (status_t const sized = size_(disk.descriptors_,
-                                         static_cast<std::size_t>(config.owners_limit) * config.targets_limit);
+        if (status_t const sized = size_(disk.registered_media_,
+                                         static_cast<std::size_t>(config.queue_pairs_limit) * config.media_limit);
             sized.failed())
             return sized;
         for (std::size_t index = 0; index != disk.rings_.size(); ++index)
@@ -283,12 +284,12 @@ class uring_files_disk_t {
         return disk;
     }
 
-    /** What this disk accepts, which the tightest alignment across its registered targets fixes. */
+    /** What this disk accepts, which the tightest alignment across its registered media fixes. */
     [[nodiscard]] ring_capabilities_t capabilities() const noexcept {
         std::uint64_t memory = 0;
         std::uint64_t offset = 0;
-        for (std::size_t index = 0; index != targets_.size(); ++index) {
-            target_slot_t const& slot = targets_[index];
+        for (std::size_t index = 0; index != media_.size(); ++index) {
+            registered_medium_slot_t const& slot = media_[index];
             if (slot.registered == 0) continue;
             memory = slot.memory_alignment > memory ? slot.memory_alignment : memory;
             offset = slot.offset_alignment > offset ? slot.offset_alignment : offset;
@@ -301,30 +302,31 @@ class uring_files_disk_t {
         reported.length_granularity = reported.offset_alignment;
         reported.max_transfer_bytes = max_transfer_bytes_k;
         reported.depth_limit = depth_limit_;
-        reported.owners_limit = owners_limit_;
-        reported.targets_limit = targets_limit_;
-        reported.reaches_device_memory = false;
+        reported.queue_pairs_limit = queue_pairs_limit_;
+        reported.media_limit = media_limit_;
+        reported.reaches_gpu_memory = false;
         return reported;
     }
 
     /** How the rings address the registered ranges, settled by the first ring the cap refused at this epoch. */
     [[nodiscard]] range_pinning_t pinning() const noexcept {
-        return pin_refused_epoch_ == registrations_epoch_ ? range_pinning_t::unpinned_k : range_pinning_t::pinned_k;
+        return pin_refused_epoch_ == registered_memories_epoch_ ? range_pinning_t::unpinned_k
+                                                                : range_pinning_t::pinned_k;
     }
 
-#pragma region Leases
+#pragma region Queue Pairs
 
     /**
-     *  @brief Takes a lease on @p depth requests of one ring, and binds that ring to this thread.
-     *  @param[in] depth Requests this owner may keep in flight, at most the mount's limit.
-     *  @return The lease, or @c capacity_exhausted_k when every ring is already out.
+     *  @brief Takes a queue pair on @p depth requests of one ring, and binds that ring to this thread.
+     *  @param[in] depth Requests this queue pair may keep in flight, at most the mount's limit.
+     *  @return The queue pair, or @c capacity_exhausted_k when every ring is already out.
      */
-    expected<ring_owner_t> open(std::uint32_t depth) noexcept {
+    expected<queue_pair_t> acquire_queue_pair(std::uint32_t depth) noexcept {
         if (depth == 0 || depth > depth_limit_)
-            return status_t {status_code_t::invalid_argument_k, "A lease asks for more depth than the ring has"};
+            return status_t {status_code_t::invalid_argument_k, "A queue pair asks for more depth than the ring has"};
         std::uint64_t const identity = bound_thread_identity_();
-        for (std::size_t index = 0; index != owners_.size(); ++index) {
-            owner_slot_t& slot = owners_[index];
+        for (std::size_t index = 0; index != queue_pairs_.size(); ++index) {
+            queue_pair_slot_t& slot = queue_pairs_[index];
             std::int32_t expected_free = 0;
             if (!claim_(slot.leased)
                      .compare_exchange_strong(expected_free, 1, std::memory_order_acquire, std::memory_order_relaxed))
@@ -337,112 +339,114 @@ class uring_files_disk_t {
             slot.flights_count = 0;
             slot.locals_first = 0;
             slot.locals_count = 0;
-            slot.issuer = identity;
-            return ring_owner_t::leased(static_cast<owner_id_t>(index), slot.generation, depth);
+            slot.bound_thread = identity;
+            return queue_pair_t::leased(static_cast<queue_pair_id_t>(index), slot.generation, depth);
         }
-        return status_t {status_code_t::capacity_exhausted_k, "Every lease of this ring is already held"};
+        return status_t {status_code_t::capacity_exhausted_k, "Every queue pair of this ring is already held"};
     }
 
     /**
-     *  @brief Binds @p owner and its ring to the calling thread, which is how a moved lease changes hands.
-     *  @param[in] owner The lease this thread has just taken over, with nothing outstanding on it.
+     *  @brief Binds @p queue pair and its ring to the calling thread, which is how a moved queue pair changes hands.
+     *  @param[in] queue pair The queue pair this thread has just taken over, with nothing outstanding on it.
      *
-     *  @note A ring cannot change its issuer, so a handover to another thread builds a fresh ring in
-     *      the lease's slot; that is why the lease must be empty before it moves.
+     *  @note A ring cannot change its bound thread, so a handover to another thread builds a fresh ring in
+     *      the queue pair's slot; that is why the queue pair must be empty before it moves.
      */
-    status_t adopt(ring_owner_t const& owner) noexcept {
-        owner_slot_t* const slot = slot_of_(owner);
-        if (!slot) return {status_code_t::invalid_argument_k, "The lease is not this ring's"};
+    status_t bind_queue_pair(queue_pair_t const& queue_pair) noexcept {
+        queue_pair_slot_t* const slot = slot_of_(queue_pair);
+        if (!slot) return {status_code_t::invalid_argument_k, "The queue pair is not this ring's"};
         if (slot->flights_count != 0 || slot->locals_count != 0)
-            return {status_code_t::invalid_argument_k, "Drain the lease before handing it over"};
+            return {status_code_t::invalid_argument_k, "Drain the queue pair before handing it over"};
         std::uint64_t const identity = bound_thread_identity_();
-        if (status_t const bound = bind_ring_(rings_[static_cast<std::size_t>(owner.id())], identity); bound.failed())
+        if (status_t const bound = bind_ring_(rings_[static_cast<std::size_t>(queue_pair.id())], identity);
+            bound.failed())
             return bound;
-        slot->issuer = identity;
+        slot->bound_thread = identity;
         return {};
     }
 
     /**
-     *  @brief Takes @p owner's lease back once it has nothing outstanding, and empties the handle.
-     *  @param[inout] owner The lease to return, surrendered on success and untouched on failure.
+     *  @brief Takes @p queue pair back once it has nothing outstanding, and empties the handle.
+     *  @param[inout] queue pair The queue pair to return, surrendered on success and untouched on failure.
      */
-    status_t release(ring_owner_t& owner) noexcept {
-        owner_slot_t* const slot = slot_of_(owner);
-        if (!slot) return {status_code_t::invalid_argument_k, "The lease is not this ring's"};
+    status_t release_queue_pair(queue_pair_t& queue_pair) noexcept {
+        queue_pair_slot_t* const slot = slot_of_(queue_pair);
+        if (!slot) return {status_code_t::invalid_argument_k, "The queue pair is not this ring's"};
         if (slot->flights_count != 0 || slot->locals_count != 0)
-            return {status_code_t::invalid_argument_k, "Drain the lease before releasing it"};
+            return {status_code_t::invalid_argument_k, "Drain the queue pair before releasing it"};
         ++slot->generation;
         slot->depth = 0;
-        slot->issuer = 0;
+        slot->bound_thread = 0;
         claim_(slot->leased).store(0, std::memory_order_release);
-        owner.surrender();
+        queue_pair.surrender();
         return {};
     }
 
-    /** Requests @p owner has submitted and not yet reaped, which its credit bounds. */
-    [[nodiscard]] std::size_t in_flight(ring_owner_t const& owner) const noexcept {
-        owner_slot_t const* const slot = slot_of_(owner);
+    /** Requests @p queue pair has submitted and not yet completed, which its credit bounds. */
+    [[nodiscard]] std::size_t outstanding(queue_pair_t const& queue_pair) const noexcept {
+        queue_pair_slot_t const* const slot = slot_of_(queue_pair);
         return slot ? slot->flights_count + slot->locals_count : 0;
     }
 
-#pragma endregion Leases
+#pragma endregion Queue Pairs
 
 #pragma region Registrations
 
     /**
-     *  @brief Records @p chunk so requests can address it by slot, and raises the registration epoch.
-     *  @param[in] chunk Memory the caller owns and keeps alive until it deregisters the range.
+     *  @brief Records @p memory so requests can address it by slot, and raises the registered memory epoch.
+     *  @param[in] memory Memory the caller owns and keeps alive until it deregisters the range.
      *  @param[in] space Where that memory lives; this transport reaches host memory alone.
      *
      *  @note The kernel learns of the range on each ring's own thread, at the next submission there,
-     *      since @c io_uring_register answers @c -EEXIST to anyone but the ring's issuer.
+     *      since @c io_uring_register answers @c -EEXIST to anyone but the ring's bound_thread.
      */
-    expected<registration_t> register_chunk(std::span<byte_t> chunk, memory_space_t space) noexcept {
-        if (chunk.empty()) return status_t {status_code_t::invalid_argument_k, "An empty range registers nothing"};
-        if (space == memory_space_t::device_k)
+    expected<registered_memory_t> register_memory(std::span<byte_t> memory, memory_space_t space) noexcept {
+        if (memory.empty()) return status_t {status_code_t::invalid_argument_k, "An empty range registers nothing"};
+        if (space == memory_space_t::gpu_k)
             return status_t {status_code_t::unsupported_k, "This transport cannot address device memory"};
-        for (std::size_t index = 0; index != registrations_.size(); ++index) {
-            registration_slot_t& slot = registrations_[index];
+        for (std::size_t index = 0; index != registered_memories_.size(); ++index) {
+            registered_memory_slot_t& slot = registered_memories_[index];
             std::int32_t expected_free = 0;
             if (!claim_(slot.registered)
                      .compare_exchange_strong(expected_free, 1, std::memory_order_acquire, std::memory_order_relaxed))
                 continue;
-            slot.base = chunk.data();
-            slot.length = chunk.size();
+            slot.base = memory.data();
+            slot.length = memory.size();
             slot.space = space;
-            epoch_(registrations_epoch_).add(1, std::memory_order_release);
-            return registration_t::registered(static_cast<registration_id_t>(index), slot.generation, chunk, space);
+            epoch_(registered_memories_epoch_).add(1, std::memory_order_release);
+            return registered_memory_t::registered(static_cast<registered_memory_id_t>(index), slot.generation, memory,
+                                                   space);
         }
-        return status_t {status_code_t::capacity_exhausted_k, "Every registration slot of this ring is taken"};
+        return status_t {status_code_t::capacity_exhausted_k, "Every registered_memory slot of this ring is taken"};
     }
 
     /**
-     *  @brief Gives @p registration back, refusing while the kernel may still be writing into it.
-     *  @param[inout] registration The range to give back, surrendered on success.
+     *  @brief Gives @p registered memory back, refusing while the kernel may still be writing into it.
+     *  @param[inout] registered memory The range to give back, surrendered on success.
      */
-    status_t deregister_chunk(registration_t& registration) noexcept {
-        registration_slot_t* const slot = slot_of_(registration);
-        if (!slot) return {status_code_t::invalid_argument_k, "The registration is not this ring's"};
+    status_t unregister_memory(registered_memory_t& registered_memory) noexcept {
+        registered_memory_slot_t* const slot = slot_of_(registered_memory);
+        if (!slot) return {status_code_t::invalid_argument_k, "The registered_memory is not this ring's"};
         if (in_flight_(*slot).load(std::memory_order_acquire) != 0)
-            return {status_code_t::invalid_argument_k, "The range is still a target of requests in flight"};
+            return {status_code_t::invalid_argument_k, "The range is still a medium of requests in flight"};
         ++slot->generation;
         slot->base = nullptr;
         slot->length = 0;
         claim_(slot->registered).store(0, std::memory_order_release);
-        epoch_(registrations_epoch_).add(1, std::memory_order_release);
-        registration.surrender();
+        epoch_(registered_memories_epoch_).add(1, std::memory_order_release);
+        registered_memory.surrender();
         return {};
     }
 
     /**
      *  @brief Opens the file @p request names and records it, reading the alignments it demands.
      *  @param[in] request The path, the bytes to create it with, and what the caller may do to it.
-     *  @return The handle, or @c capacity_exhausted_k when every target slot is taken.
+     *  @return The handle, or @c capacity_exhausted_k when every medium slot is taken.
      */
-    expected<descriptor_t> register_target(target_request_t const& request) noexcept {
-        if (!request.name) return status_t {status_code_t::invalid_argument_k, "A file target needs a path"};
-        for (std::size_t index = 0; index != targets_.size(); ++index) {
-            target_slot_t& slot = targets_[index];
+    expected<registered_medium_t> register_medium(medium_options_t const& request) noexcept {
+        if (!request.name) return status_t {status_code_t::invalid_argument_k, "A file medium needs a path"};
+        for (std::size_t index = 0; index != media_.size(); ++index) {
+            registered_medium_slot_t& slot = media_[index];
             std::int32_t expected_free = 0;
             if (!claim_(slot.registered)
                      .compare_exchange_strong(expected_free, 1, std::memory_order_acquire, std::memory_order_relaxed))
@@ -452,7 +456,7 @@ class uring_files_disk_t {
                 claim_(slot.registered).store(0, std::memory_order_release);
                 return file.status();
             }
-            if (request.access == target_access_t::create_read_write_k && request.length != 0)
+            if (request.access == medium_access_t::create_read_write_k && request.length != 0)
                 if (status_t const sized = truncate_native_file(*file, request.length); sized.failed()) {
                     close_native_file(*file);
                     claim_(slot.registered).store(0, std::memory_order_release);
@@ -465,28 +469,29 @@ class uring_files_disk_t {
             slot.capacity = native_file_capacity(*file);
             slot.memory_alignment = alignment.memory;
             slot.offset_alignment = alignment.offset;
-            epoch_(targets_epoch_).add(1, std::memory_order_release);
-            return descriptor_t::registered(static_cast<descriptor_id_t>(index), slot.generation, slot.capacity);
+            epoch_(media_epoch_).add(1, std::memory_order_release);
+            return registered_medium_t::registered(static_cast<registered_medium_id_t>(index), slot.generation,
+                                                   slot.capacity);
         }
-        return status_t {status_code_t::capacity_exhausted_k, "Every target slot of this ring is taken"};
+        return status_t {status_code_t::capacity_exhausted_k, "Every medium slot of this ring is taken"};
     }
 
     /**
-     *  @brief Closes @p descriptor, refusing while requests against it are still in flight.
-     *  @param[inout] descriptor The target to give back, surrendered on success.
+     *  @brief Closes @p registered medium, refusing while requests against it are still in flight.
+     *  @param[inout] registered medium The medium to give back, surrendered on success.
      */
-    status_t deregister_target(descriptor_t& descriptor) noexcept {
-        target_slot_t* const slot = slot_of_(descriptor);
-        if (!slot) return {status_code_t::invalid_argument_k, "The target is not this ring's"};
+    status_t unregister_medium(registered_medium_t& registered_medium) noexcept {
+        registered_medium_slot_t* const slot = slot_of_(registered_medium);
+        if (!slot) return {status_code_t::invalid_argument_k, "The medium is not this ring's"};
         if (in_flight_(*slot).load(std::memory_order_acquire) != 0)
-            return {status_code_t::invalid_argument_k, "The target is still named by requests in flight"};
+            return {status_code_t::invalid_argument_k, "The medium is still named by requests in flight"};
         close_native_file(slot->file);
         ++slot->generation;
         slot->file = invalid_native_file_k;
         slot->capacity = 0;
         claim_(slot->registered).store(0, std::memory_order_release);
-        epoch_(targets_epoch_).add(1, std::memory_order_release);
-        descriptor.surrender();
+        epoch_(media_epoch_).add(1, std::memory_order_release);
+        registered_medium.surrender();
         return {};
     }
 
@@ -495,24 +500,24 @@ class uring_files_disk_t {
 #pragma region Ring
 
     /**
-     *  @brief Takes as much of @p requests as @p owner still has credit for, and never waits.
-     *  @param[in] owner The lease submitting, held by the calling thread.
+     *  @brief Takes as much of @p requests as @p queue pair still has credit for, and never waits.
+     *  @param[in] queue pair The queue pair submitting, held by the calling thread.
      *  @param[in] requests The batch, of which a prefix is taken.
      *  @return How many were taken, which is zero on a full ring and never a reason to block.
      */
-    expected<std::size_t> submit(ring_owner_t const& owner, std::span<request_t const> requests) noexcept {
-        owner_slot_t* const slot = slot_of_(owner);
-        if (!slot) return status_t {status_code_t::invalid_argument_k, "The lease is not this ring's"};
-        assert(slot->issuer == bound_thread_identity_() && "Only the thread holding a lease submits on it");
+    expected<std::size_t> submit(queue_pair_t const& queue_pair, std::span<request_t const> requests) noexcept {
+        queue_pair_slot_t* const slot = slot_of_(queue_pair);
+        if (!slot) return status_t {status_code_t::invalid_argument_k, "The queue pair is not this ring's"};
+        assert(slot->bound_thread == bound_thread_identity_() && "Only the thread holding a queue pair submits on it");
         for (request_t const& request : requests)
-            if (request.token.owner() != owner.id() || request.token.generation() != owner.generation())
-                return status_t {status_code_t::invalid_argument_k, "A request carries another lease's token"};
+            if (request.token.queue_pair() != queue_pair.id() || request.token.generation() != queue_pair.generation())
+                return status_t {status_code_t::invalid_argument_k, "A request carries another queue pair's token"};
 
-        std::size_t const seat = static_cast<std::size_t>(owner.id());
+        std::size_t const seat = static_cast<std::size_t>(queue_pair.id());
         ring_t& ring = rings_[seat];
         if (status_t const carried = carry_tables_(ring, seat); carried.failed()) return carried;
 
-        std::uint32_t const base = window_of_(owner.id());
+        std::uint32_t const base = window_of_(queue_pair.id());
         std::size_t const credit = slot->depth - (slot->flights_count + slot->locals_count);
         unsigned const consumed = std::atomic_ref<unsigned> {*ring.submission_head}.load(std::memory_order_acquire);
         unsigned const published = *ring.submission_tail;
@@ -570,42 +575,42 @@ class uring_files_disk_t {
 
     /**
      *  @brief Runs this ring's deferred completion work and copies what landed into @p into.
-     *  @param[in] owner The lease reaping, held by the calling thread that submitted on it.
+     *  @param[in] queue pair The queue pair polling, held by the calling thread that submitted on it.
      *  @param[out] into Room for completions, which bounds how many one call moves.
      *  @return How many completions were moved, which is zero when nothing has landed.
      *
      *  @note The entry carries @c min_complete of zero, so the call performs the work a deferred ring
      *      only performs on its owning thread and returns without waiting for anything.
      */
-    expected<std::size_t> reap(ring_owner_t const& owner, std::span<completion_t> into) noexcept {
-        owner_slot_t* const slot = slot_of_(owner);
-        if (!slot) return status_t {status_code_t::invalid_argument_k, "The lease is not this ring's"};
-        assert(slot->issuer == bound_thread_identity_() && "Only the thread holding a lease reaps on it");
-        std::uint32_t const base = window_of_(owner.id());
-        ring_t& ring = rings_[static_cast<std::size_t>(owner.id())];
+    expected<std::size_t> poll_completions(queue_pair_t const& queue_pair, std::span<completion_t> into) noexcept {
+        queue_pair_slot_t* const slot = slot_of_(queue_pair);
+        if (!slot) return status_t {status_code_t::invalid_argument_k, "The queue pair is not this ring's"};
+        assert(slot->bound_thread == bound_thread_identity_() && "Only the thread holding a queue pair polls on it");
+        std::uint32_t const base = window_of_(queue_pair.id());
+        ring_t& ring = rings_[static_cast<std::size_t>(queue_pair.id())];
 
         std::size_t moved = 0;
         if (slot->flights_count != 0) enter_for_completions_(ring);
-        moved += harvest_(*slot, base, ring, into);
+        moved += poll_completions_(*slot, base, ring, into);
         if (overflowed_(ring) && moved != into.size()) {
             enter_for_completions_(ring);
-            moved += harvest_(*slot, base, ring, into.subspan(moved));
+            moved += poll_completions_(*slot, base, ring, into.subspan(moved));
         }
         moved += drain_locals_(*slot, base, into.subspan(moved));
         return moved;
     }
 
     /**
-     *  @brief Asks the kernel to stop everything @p owner has in flight, which reap reports cancelled.
-     *  @param[in] owner The lease to stop, whose started requests still run to their own end.
+     *  @brief Asks the kernel to stop everything @p queue pair has in flight, which poll reports cancelled.
+     *  @param[in] queue pair The queue pair to stop, whose started requests still run to their own end.
      *
-     *  @note The cancelling entry posts a completion of its own, which reap recognises and drops, so
-     *      the owner still sees exactly one completion per request it submitted.
+     *  @note The cancelling entry posts a completion of its own, which poll recognises and drops, so
+     *      the queue pair still sees exactly one completion per request it submitted.
      */
-    void cancel(ring_owner_t const& owner) noexcept {
-        owner_slot_t* const slot = slot_of_(owner);
+    void cancel(queue_pair_t const& queue_pair) noexcept {
+        queue_pair_slot_t* const slot = slot_of_(queue_pair);
         if (!slot || slot->flights_count == 0) return;
-        ring_t& ring = rings_[static_cast<std::size_t>(owner.id())];
+        ring_t& ring = rings_[static_cast<std::size_t>(queue_pair.id())];
         unsigned const consumed = std::atomic_ref<unsigned> {*ring.submission_head}.load(std::memory_order_acquire);
         unsigned const published = *ring.submission_tail;
         if (published - consumed >= ring.submission_entries_count) return;
@@ -620,22 +625,22 @@ class uring_files_disk_t {
     }
 
     /**
-     *  @brief Finishes and discards everything @p owner has outstanding, so its buffers may be freed.
-     *  @param[in] owner The lease to empty, which may be cancelled or still running.
+     *  @brief Finishes and discards everything @p queue pair has outstanding, so its buffers may be freed.
+     *  @param[in] queue pair The queue pair to empty, which may be cancelled or still running.
      */
-    status_t drain(ring_owner_t const& owner) noexcept {
-        owner_slot_t const* const slot = slot_of_(owner);
-        if (!slot) return {status_code_t::invalid_argument_k, "The lease is not this ring's"};
+    status_t drain(queue_pair_t const& queue_pair) noexcept {
+        queue_pair_slot_t const* const slot = slot_of_(queue_pair);
+        if (!slot) return {status_code_t::invalid_argument_k, "The queue pair is not this ring's"};
         std::array<completion_t, drain_batch_k> discarded {};
         for (std::size_t spins = 0; spins != drain_spin_limit_k; ++spins) {
             if (slot->flights_count == 0 && slot->locals_count == 0) return {};
-            expected<std::size_t> const moved = reap(owner, std::span<completion_t> {discarded});
+            expected<std::size_t> const moved = poll_completions(queue_pair, std::span<completion_t> {discarded});
             if (!moved) return moved.status();
             if (*moved != 0) continue;
-            if (spins == drain_patience_k) cancel(owner);
+            if (spins == drain_patience_k) cancel(queue_pair);
             std::this_thread::yield();
         }
-        return {status_code_t::io_k, "The lease would not drain"};
+        return {status_code_t::input_output_k, "The queue pair would not drain"};
     }
 
 #pragma endregion Ring
@@ -645,7 +650,7 @@ class uring_files_disk_t {
     /** One io_uring instance, entered and registered on by exactly one thread for its whole life. */
     struct ring_t {
 
-        /** The ring's descriptor, @c -1 before it is created and after it is taken down. */
+        /** The ring's registered medium, @c -1 before it is created and after it is taken down. */
         int file = -1;
 
         /** The shared submission and completion rings, mapped as one region. */
@@ -688,45 +693,45 @@ class uring_files_disk_t {
         io_uring_cqe* completion_entries = nullptr;
 
         /** The thread this ring is bound to, zero while it is still disabled. */
-        std::uint64_t issuer = 0;
+        std::uint64_t bound_thread = 0;
 
-        /** The registration epoch this ring's buffer table was last written from. */
-        std::int32_t carried_registrations = 0;
+        /** The registered memory epoch this ring's buffer table was last written from. */
+        std::int32_t carried_registered_memories = 0;
 
-        /** The target epoch this ring's file table was last written from. */
-        std::int32_t carried_targets = 0;
+        /** The medium epoch this ring's file table was last written from. */
+        std::int32_t carried_media = 0;
 
         /** How this ring addresses the registered ranges, settled when its buffer table was last written. */
         range_pinning_t pinning = range_pinning_t::pinned_k;
     };
 
-    /** One lease's share of the disk: its ring, its credit and the two queues it reaps from. */
-    struct owner_slot_t {
+    /** One queue pair's share of the disk: its ring, its credit and the two queues it polls from. */
+    struct queue_pair_slot_t {
 
-        /** Zero while the slot is free, one while a lease holds it. */
+        /** Zero while the slot is free, one while a queue pair holds it. */
         std::int32_t leased = 0;
 
         /** Raised every time the slot is leased again, so a stale token routes nowhere. */
         std::uint16_t generation = 0;
 
-        /** Requests this lease may keep in flight, fixed when the lease was taken. */
+        /** Requests this queue pair may keep in flight, fixed when the queue pair was taken. */
         std::uint32_t depth = 0;
 
-        /** Requests the kernel holds for this lease and has not yet answered for. */
+        /** Requests the kernel holds for this queue pair and has not yet answered for. */
         std::uint32_t flights_count = 0;
 
-        /** Where this owner's oldest unreaped local completion sits inside its window. */
+        /** Where this queue pair's oldest unreaped local completion sits inside its window. */
         std::uint32_t locals_first = 0;
 
         /** Completions the disk answered itself, which no submission entry ever carried. */
         std::uint32_t locals_count = 0;
 
-        /** The thread that took the lease, which every submit and reap is checked against. */
-        std::uint64_t issuer = 0;
+        /** The thread that took the queue pair, which every submit and poll is checked against. */
+        std::uint64_t bound_thread = 0;
     };
 
     /** One pinned memory range, and the count of requests the kernel may still be writing into it. */
-    struct registration_slot_t {
+    struct registered_memory_slot_t {
 
         /** Zero while the slot is free, one while a range is recorded in it. */
         std::int32_t registered = 0;
@@ -747,13 +752,13 @@ class uring_files_disk_t {
         std::uint64_t length = 0;
     };
 
-    /** One open target, its alignments, and the count of requests still naming it. */
-    struct target_slot_t {
+    /** One open medium, its alignments, and the count of requests still naming it. */
+    struct registered_medium_slot_t {
 
         /** Zero while the slot is free, one while a file is open in it. */
         std::int32_t registered = 0;
 
-        /** Requests accepted against this target and not yet answered for. */
+        /** Requests accepted against this medium and not yet answered for. */
         std::int32_t in_flight = 0;
 
         /** Raised every time the slot is used again, so a stale place resolves to nothing. */
@@ -762,7 +767,7 @@ class uring_files_disk_t {
         /** The open file, which every ring installs at this slot's own table index. */
         native_file_t file = invalid_native_file_k;
 
-        /** Bytes the target held at registration: a regular file grows past it, a block device falls short. */
+        /** Bytes the medium held at registered_memory: a regular file grows past it, a block device falls short. */
         std::uint64_t capacity = 0;
 
         /** Alignment this filesystem demands of the first byte of a buffer. */
@@ -781,11 +786,11 @@ class uring_files_disk_t {
         /** Bytes the extent asked for, which separates a whole transfer from a partial one. */
         std::uint64_t length = 0;
 
-        /** The range the request borrowed, given back when its completion is reaped. */
-        buffer_place_t buffer;
+        /** The range the request borrowed, given back when its completion is completed. */
+        memory_reference_t buffer;
 
-        /** The target the request borrowed, given back when its completion is reaped. */
-        target_place_t target;
+        /** The medium the request borrowed, given back when its completion is completed. */
+        medium_reference_t medium;
     };
 
     /** Entries the availability probe asks for, which is the smallest ring the kernel rounds up to. */
@@ -800,13 +805,13 @@ class uring_files_disk_t {
     /** The largest extent one submission entry carries, kept well inside the kernel's own limit. */
     static constexpr std::uint64_t max_transfer_bytes_k = 1024ull * 1024ull * 1024ull;
 
-    /** The completion a cancelling entry posts for itself, which no lease can ever mint. */
+    /** The completion a cancelling entry posts for itself, which no queue pair can ever mint. */
     static constexpr std::uint64_t cancel_marker_k = ~std::uint64_t {0};
 
     /** Completions one drain discards at a time. */
     static constexpr std::size_t drain_batch_k = 32;
 
-    /** Fruitless reaps a drain tolerates before it asks the kernel to stop what is left. */
+    /** Fruitless polls a drain tolerates before it asks the kernel to stop what is left. */
     static constexpr std::size_t drain_patience_k = 1024;
 
     /** Reaps a drain performs before it calls the ring broken. */
@@ -837,11 +842,11 @@ class uring_files_disk_t {
         return fu::preferred_atomic_ref<std::int32_t> {word};
     }
 
-    static fu::preferred_atomic_ref<std::int32_t> in_flight_(registration_slot_t& slot) noexcept {
+    static fu::preferred_atomic_ref<std::int32_t> in_flight_(registered_memory_slot_t& slot) noexcept {
         return fu::preferred_atomic_ref<std::int32_t> {slot.in_flight};
     }
 
-    static fu::preferred_atomic_ref<std::int32_t> in_flight_(target_slot_t& slot) noexcept {
+    static fu::preferred_atomic_ref<std::int32_t> in_flight_(registered_medium_slot_t& slot) noexcept {
         return fu::preferred_atomic_ref<std::int32_t> {slot.in_flight};
     }
 
@@ -893,20 +898,20 @@ class uring_files_disk_t {
 
         io_uring_rsrc_register table {};
         table.flags = IORING_RSRC_REGISTER_SPARSE;
-        table.nr = registrations_limit_;
+        table.nr = registered_memories_limit_;
         if (::syscall(__NR_io_uring_register, ring.file, IORING_REGISTER_BUFFERS2, &table, sizeof(table)) < 0) {
             status_t const refused = native_file_failure(errno, "The ring would not take a buffer table");
             teardown_ring_(ring);
             return refused;
         }
-        table.nr = targets_limit_;
+        table.nr = media_limit_;
         if (::syscall(__NR_io_uring_register, ring.file, IORING_REGISTER_FILES2, &table, sizeof(table)) < 0) {
             status_t const refused = native_file_failure(errno, "The ring would not take a file table");
             teardown_ring_(ring);
             return refused;
         }
-        ring.carried_registrations = 0;
-        ring.carried_targets = 0;
+        ring.carried_registered_memories = 0;
+        ring.carried_media = 0;
         return {};
     }
 
@@ -917,7 +922,7 @@ class uring_files_disk_t {
      *  them to the kernel's exit work, which releases them later, and the next pin falls back until then.
      */
     static void teardown_ring_(ring_t& ring) noexcept {
-        if (ring.file >= 0 && ring.issuer == bound_thread_identity_()) {
+        if (ring.file >= 0 && ring.bound_thread == bound_thread_identity_()) {
             [[maybe_unused]] long const unpinned = ::syscall(__NR_io_uring_register, ring.file,
                                                              IORING_UNREGISTER_BUFFERS, nullptr, 0);
         }
@@ -930,45 +935,45 @@ class uring_files_disk_t {
     /**
      *  @brief Makes @p identity the one thread that may enter and register on @p ring.
      *
-     *  A ring set up disabled binds to whoever enables it, so the first lease costs one register
+     *  A ring set up disabled binds to whoever enables it, so the first queue pair costs one register
      *  call. A ring already bound elsewhere cannot change hands, so a handover builds a fresh one,
-     *  which is only legal because a lease moves with nothing outstanding on it. A ring whose last
+     *  which is only legal because a queue pair moves with nothing outstanding on it. A ring whose last
      *  build failed is built again here rather than left dead in its slot.
      */
     status_t bind_ring_(ring_t& ring, std::uint64_t identity) noexcept {
-        if (ring.issuer == identity) return {};
-        if (ring.issuer != 0) teardown_ring_(ring);
+        if (ring.bound_thread == identity) return {};
+        if (ring.bound_thread != 0) teardown_ring_(ring);
         if (ring.file < 0)
             if (status_t const created = create_ring_(ring); created.failed()) return created;
         if (::syscall(__NR_io_uring_register, ring.file, IORING_REGISTER_ENABLE_RINGS, nullptr, 0) < 0)
             return native_file_failure(errno, "The ring would not bind to this thread");
-        ring.issuer = identity;
+        ring.bound_thread = identity;
         return {};
     }
 
-    /** Writes the disk's registered ranges and targets into @p ring's tables when it is behind. */
+    /** Writes the disk's registered ranges and media into @p ring's tables when it is behind. */
     status_t carry_tables_(ring_t& ring, std::size_t seat) noexcept {
-        std::int32_t const registrations = epoch_(registrations_epoch_).load(std::memory_order_acquire);
-        if (ring.carried_registrations != registrations) {
-            expected<range_pinning_t> const pinned = pin_ranges_(ring, seat, registrations);
+        std::int32_t const registered_memories = epoch_(registered_memories_epoch_).load(std::memory_order_acquire);
+        if (ring.carried_registered_memories != registered_memories) {
+            expected<range_pinning_t> const pinned = pin_ranges_(ring, seat, registered_memories);
             if (!pinned) return pinned.status();
             ring.pinning = *pinned;
-            ring.carried_registrations = registrations;
+            ring.carried_registered_memories = registered_memories;
         }
 
-        std::int32_t const targets = epoch_(targets_epoch_).load(std::memory_order_acquire);
-        if (ring.carried_targets != targets) {
-            int* const files = &descriptors_[seat * targets_limit_];
-            for (std::size_t index = 0; index != targets_limit_; ++index) {
-                target_slot_t& slot = targets_[index];
+        std::int32_t const media = epoch_(media_epoch_).load(std::memory_order_acquire);
+        if (ring.carried_media != media) {
+            int* const files = &registered_media_[seat * media_limit_];
+            for (std::size_t index = 0; index != media_limit_; ++index) {
+                registered_medium_slot_t& slot = media_[index];
                 bool const live = claim_(slot.registered).load(std::memory_order_acquire) != 0;
                 files[index] = live ? slot.file : -1;
             }
             io_uring_rsrc_update update {};
             update.data = reinterpret_cast<std::uint64_t>(files);
-            if (::syscall(__NR_io_uring_register, ring.file, IORING_REGISTER_FILES_UPDATE, &update, targets_limit_) < 0)
-                return native_file_failure(errno, "The ring would not take its registered targets");
-            ring.carried_targets = targets;
+            if (::syscall(__NR_io_uring_register, ring.file, IORING_REGISTER_FILES_UPDATE, &update, media_limit_) < 0)
+                return native_file_failure(errno, "The ring would not take its registered media");
+            ring.carried_media = media;
         }
         return {};
     }
@@ -978,27 +983,27 @@ class uring_files_disk_t {
      *
      *  The kernel charges every ring for every range, so the cap is met after a few rings; the first
      *  refusal at an epoch is remembered and later rings skip the attempt, which would pin and unpin
-     *  the whole slab only to be refused again.
+     *  the whole arena only to be refused again.
      */
-    expected<range_pinning_t> pin_ranges_(ring_t& ring, std::size_t seat, std::int32_t registrations) noexcept {
-        if (epoch_(pin_refused_epoch_).load(std::memory_order_acquire) == registrations)
+    expected<range_pinning_t> pin_ranges_(ring_t& ring, std::size_t seat, std::int32_t registered_memories) noexcept {
+        if (epoch_(pin_refused_epoch_).load(std::memory_order_acquire) == registered_memories)
             return range_pinning_t::unpinned_k;
-        ::iovec* const vectors = &vectors_[seat * registrations_limit_];
-        for (std::size_t index = 0; index != registrations_limit_; ++index) {
-            registration_slot_t& slot = registrations_[index];
+        ::iovec* const vectors = &vectors_[seat * registered_memories_limit_];
+        for (std::size_t index = 0; index != registered_memories_limit_; ++index) {
+            registered_memory_slot_t& slot = registered_memories_[index];
             bool const live = claim_(slot.registered).load(std::memory_order_acquire) != 0;
             vectors[index].iov_base = live ? slot.base : nullptr;
             vectors[index].iov_len = live ? static_cast<std::size_t>(slot.length) : 0;
         }
         io_uring_rsrc_update2 update {};
-        update.nr = registrations_limit_;
+        update.nr = registered_memories_limit_;
         update.data = reinterpret_cast<std::uint64_t>(vectors);
         long const took = ::syscall(__NR_io_uring_register, ring.file, IORING_REGISTER_BUFFERS_UPDATE, &update,
                                     sizeof(update));
-        if (took == static_cast<long>(registrations_limit_)) return range_pinning_t::pinned_k;
+        if (took == static_cast<long>(registered_memories_limit_)) return range_pinning_t::pinned_k;
         if (took < 0 && errno != ENOMEM)
             return native_file_failure(errno, "The ring would not take its registered ranges");
-        epoch_(pin_refused_epoch_).store(registrations, std::memory_order_release);
+        epoch_(pin_refused_epoch_).store(registered_memories, std::memory_order_release);
         return range_pinning_t::unpinned_k;
     }
 
@@ -1014,89 +1019,91 @@ class uring_files_disk_t {
         return (flags & IORING_SQ_CQ_OVERFLOW) != 0;
     }
 
-    /** Closes every ring and every open target, which both the destructor and a move assignment need. */
+    /** Closes every ring and every open medium, which both the destructor and a move assignment need. */
     void close_all_() noexcept {
         for (std::size_t index = 0; index != rings_.size(); ++index) teardown_ring_(rings_[index]);
-        for (std::size_t index = 0; index != targets_.size(); ++index)
-            if (targets_[index].file != invalid_native_file_k) close_native_file(targets_[index].file);
+        for (std::size_t index = 0; index != media_.size(); ++index)
+            if (media_[index].file != invalid_native_file_k) close_native_file(media_[index].file);
         rings_.clear();
-        targets_.clear();
+        media_.clear();
     }
 
 #pragma endregion Rings
 
 #pragma region Bookkeeping
 
-    /** Where one lease's outstanding requests and local completions sit inside the shared windows. */
-    [[nodiscard]] std::uint32_t window_of_(owner_id_t id) const noexcept {
+    /** Where one queue pair's outstanding requests and local completions sit inside the shared windows. */
+    [[nodiscard]] std::uint32_t window_of_(queue_pair_id_t id) const noexcept {
         return static_cast<std::uint32_t>(id) * depth_limit_;
     }
 
-    [[nodiscard]] owner_slot_t* slot_of_(ring_owner_t const& owner) noexcept {
-        if (!owner.held() || static_cast<std::size_t>(owner.id()) >= owners_.size()) return nullptr;
-        owner_slot_t& slot = owners_[static_cast<std::size_t>(owner.id())];
-        return slot.leased != 0 && slot.generation == owner.generation() ? &slot : nullptr;
+    [[nodiscard]] queue_pair_slot_t* slot_of_(queue_pair_t const& queue_pair) noexcept {
+        if (!queue_pair.held() || static_cast<std::size_t>(queue_pair.id()) >= queue_pairs_.size()) return nullptr;
+        queue_pair_slot_t& slot = queue_pairs_[static_cast<std::size_t>(queue_pair.id())];
+        return slot.leased != 0 && slot.generation == queue_pair.generation() ? &slot : nullptr;
     }
 
-    [[nodiscard]] owner_slot_t const* slot_of_(ring_owner_t const& owner) const noexcept {
-        if (!owner.held() || static_cast<std::size_t>(owner.id()) >= owners_.size()) return nullptr;
-        owner_slot_t const& slot = owners_[static_cast<std::size_t>(owner.id())];
-        return slot.leased != 0 && slot.generation == owner.generation() ? &slot : nullptr;
+    [[nodiscard]] queue_pair_slot_t const* slot_of_(queue_pair_t const& queue_pair) const noexcept {
+        if (!queue_pair.held() || static_cast<std::size_t>(queue_pair.id()) >= queue_pairs_.size()) return nullptr;
+        queue_pair_slot_t const& slot = queue_pairs_[static_cast<std::size_t>(queue_pair.id())];
+        return slot.leased != 0 && slot.generation == queue_pair.generation() ? &slot : nullptr;
     }
 
-    [[nodiscard]] registration_slot_t* slot_of_(registration_t const& registration) noexcept {
-        if (!registration.held() || static_cast<std::size_t>(registration.id()) >= registrations_.size())
+    [[nodiscard]] registered_memory_slot_t* slot_of_(registered_memory_t const& registered_memory) noexcept {
+        if (!registered_memory.held() ||
+            static_cast<std::size_t>(registered_memory.id()) >= registered_memories_.size())
             return nullptr;
-        registration_slot_t& slot = registrations_[static_cast<std::size_t>(registration.id())];
-        return slot.registered != 0 && slot.generation == registration.generation() ? &slot : nullptr;
+        registered_memory_slot_t& slot = registered_memories_[static_cast<std::size_t>(registered_memory.id())];
+        return slot.registered != 0 && slot.generation == registered_memory.generation() ? &slot : nullptr;
     }
 
-    [[nodiscard]] target_slot_t* slot_of_(descriptor_t const& descriptor) noexcept {
-        if (!descriptor.held() || static_cast<std::size_t>(descriptor.id()) >= targets_.size()) return nullptr;
-        target_slot_t& slot = targets_[static_cast<std::size_t>(descriptor.id())];
-        return slot.registered != 0 && slot.generation == descriptor.generation() ? &slot : nullptr;
+    [[nodiscard]] registered_medium_slot_t* slot_of_(registered_medium_t const& registered_medium) noexcept {
+        if (!registered_medium.held() || static_cast<std::size_t>(registered_medium.id()) >= media_.size())
+            return nullptr;
+        registered_medium_slot_t& slot = media_[static_cast<std::size_t>(registered_medium.id())];
+        return slot.registered != 0 && slot.generation == registered_medium.generation() ? &slot : nullptr;
     }
 
-    [[nodiscard]] registration_slot_t* resolve_(buffer_place_t place) noexcept {
-        if (static_cast<std::size_t>(place.registration) >= registrations_.size()) return nullptr;
-        registration_slot_t& slot = registrations_[static_cast<std::size_t>(place.registration)];
+    [[nodiscard]] registered_memory_slot_t* resolve_(memory_reference_t place) noexcept {
+        if (static_cast<std::size_t>(place.memory_id) >= registered_memories_.size()) return nullptr;
+        registered_memory_slot_t& slot = registered_memories_[static_cast<std::size_t>(place.memory_id)];
         return slot.registered != 0 && slot.generation == place.generation ? &slot : nullptr;
     }
 
-    [[nodiscard]] target_slot_t* resolve_(target_place_t place) noexcept {
-        if (static_cast<std::size_t>(place.descriptor) >= targets_.size()) return nullptr;
-        target_slot_t& slot = targets_[static_cast<std::size_t>(place.descriptor)];
+    [[nodiscard]] registered_medium_slot_t* resolve_(medium_reference_t place) noexcept {
+        if (static_cast<std::size_t>(place.medium_id) >= media_.size()) return nullptr;
+        registered_medium_slot_t& slot = media_[static_cast<std::size_t>(place.medium_id)];
         return slot.registered != 0 && slot.generation == place.generation ? &slot : nullptr;
     }
 
-    /** Marks the range and the target of @p request as live, so neither can be taken back under it. */
+    /** Marks the range and the medium of @p request as live, so neither can be taken back under it. */
     void borrow_(request_t const& request) noexcept {
-        if (registration_slot_t* const slot = resolve_(request.buffer); slot)
+        if (registered_memory_slot_t* const slot = resolve_(request.buffer); slot)
             in_flight_(*slot).add(1, std::memory_order_acquire);
-        if (target_slot_t* const slot = resolve_(request.target); slot)
+        if (registered_medium_slot_t* const slot = resolve_(request.medium); slot)
             in_flight_(*slot).add(1, std::memory_order_acquire);
     }
 
     /** Releases both once the kernel is done with the bytes of the request @p flight remembers. */
     void restore_(flight_t const& flight) noexcept {
-        if (registration_slot_t* const slot = resolve_(flight.buffer); slot)
+        if (registered_memory_slot_t* const slot = resolve_(flight.buffer); slot)
             in_flight_(*slot).sub(1, std::memory_order_release);
-        if (target_slot_t* const slot = resolve_(flight.target); slot)
+        if (registered_medium_slot_t* const slot = resolve_(flight.medium); slot)
             in_flight_(*slot).sub(1, std::memory_order_release);
     }
 
     /** Remembers what @p request will need when only its token and result come back. */
-    void track_(owner_slot_t& slot, std::uint32_t base, request_t const& request) noexcept {
+    void track_(queue_pair_slot_t& slot, std::uint32_t base, request_t const& request) noexcept {
         flight_t& flight = flights_[base + slot.flights_count];
         flight.token = request.token;
         flight.length = request.kind == request_kind_t::flush_k ? 0 : request.extent.length;
         flight.buffer = request.buffer;
-        flight.target = request.target;
+        flight.medium = request.medium;
         ++slot.flights_count;
     }
 
     /** Takes @p token out of @p slot's outstanding set, moving the last entry into the gap. */
-    expected<flight_t> retire_(owner_slot_t& slot, std::uint32_t base, request_token_t token) noexcept {
+    expected<flight_t> retire_(queue_pair_slot_t& slot, std::uint32_t base, request_token_t token) noexcept {
         for (std::uint32_t index = 0; index != slot.flights_count; ++index) {
             flight_t& flight = flights_[base + index];
             if (!(flight.token == token)) continue;
@@ -1108,14 +1115,14 @@ class uring_files_disk_t {
         return status_t {status_code_t::not_found_k, "A completion carries a token nothing is outstanding for"};
     }
 
-    /** Places @p completion at the back of @p slot's own queue, which reap drains after the kernel's. */
-    void push_local_(owner_slot_t& slot, std::uint32_t base, completion_t const& completion) noexcept {
+    /** Places @p completion at the back of @p slot's own queue, which poll drains after the kernel's. */
+    void push_local_(queue_pair_slot_t& slot, std::uint32_t base, completion_t const& completion) noexcept {
         locals_[base + (slot.locals_first + slot.locals_count) % slot.depth] = completion;
         ++slot.locals_count;
     }
 
     /** Moves what the disk answered itself into @p into, oldest first. */
-    std::size_t drain_locals_(owner_slot_t& slot, std::uint32_t base, std::span<completion_t> into) noexcept {
+    std::size_t drain_locals_(queue_pair_slot_t& slot, std::uint32_t base, std::span<completion_t> into) noexcept {
         std::size_t const moving = into.size() < slot.locals_count ? into.size() : slot.locals_count;
         for (std::size_t index = 0; index != moving; ++index)
             into[index] = locals_[base + (slot.locals_first + index) % slot.depth];
@@ -1133,7 +1140,7 @@ class uring_files_disk_t {
         completion_t completion;
         completion.token = token;
         completion.state = completion_state_t::cancelled_k;
-        completion.status = {status_code_t::uninitialized_k, "The owner cancelled this request"};
+        completion.status = {status_code_t::uninitialized_k, "The queue_pair cancelled this request"};
         return completion;
     }
 
@@ -1153,42 +1160,42 @@ class uring_files_disk_t {
 
     /** Whatever would corrupt a submission entry rather than merely fail on the device. */
     status_t inspect_(request_t const& request) noexcept {
-        target_slot_t const* const target = resolve_(request.target);
-        if (!target) return {status_code_t::invalid_argument_k, "The request names no registered target"};
+        registered_medium_slot_t const* const medium = resolve_(request.medium);
+        if (!medium) return {status_code_t::invalid_argument_k, "The request names no registered medium"};
         if (request.kind == request_kind_t::flush_k) return {};
-        registration_slot_t const* const chunk = resolve_(request.buffer);
-        if (!chunk) return {status_code_t::invalid_argument_k, "The request names no registered range"};
-        if (request.buffer.offset > chunk->length || request.extent.length > chunk->length - request.buffer.offset)
+        registered_memory_slot_t const* const memory = resolve_(request.buffer);
+        if (!memory) return {status_code_t::invalid_argument_k, "The request names no registered range"};
+        if (request.buffer.offset > memory->length || request.extent.length > memory->length - request.buffer.offset)
             return {status_code_t::invalid_argument_k, "The request runs past its registered range"};
         if (request.extent.length > max_transfer_bytes_k)
             return {status_code_t::invalid_argument_k, "The request is larger than one transfer"};
-        byte_t const* const address = chunk->base + request.buffer.offset;
-        if (!is_address_aligned(address, target->memory_alignment) ||
-            !request.extent.aligned_to(target->offset_alignment))
+        byte_t const* const address = memory->base + request.buffer.offset;
+        if (!is_address_aligned(address, medium->memory_alignment) ||
+            !request.extent.aligned_to(medium->offset_alignment))
             return {status_code_t::invalid_argument_k, "The request does not meet the disk's alignment"};
         return {};
     }
 
-    /** Writes @p request into @p entry, addressing the target by table index and the buffer as @p pinning allows. */
+    /** Writes @p request into @p entry, addressing the medium by table index and the buffer as @p pinning allows. */
     void build_(io_uring_sqe& entry, request_t const& request, range_pinning_t pinning) noexcept {
         std::memset(&entry, 0, sizeof(entry));
         entry.flags = IOSQE_FIXED_FILE;
         if (request.chaining == request_chaining_t::chained_k) entry.flags |= IOSQE_IO_LINK;
-        entry.fd = static_cast<std::int32_t>(request.target.descriptor);
+        entry.fd = static_cast<std::int32_t>(request.medium.medium_id);
         entry.user_data = request.token.bits;
         if (request.kind == request_kind_t::flush_k) {
             entry.opcode = IORING_OP_FSYNC;
             entry.fsync_flags = IORING_FSYNC_DATASYNC;
             return;
         }
-        registration_slot_t const* const chunk = resolve_(request.buffer);
+        registered_memory_slot_t const* const memory = resolve_(request.buffer);
         entry.off = request.extent.offset;
-        entry.addr = reinterpret_cast<std::uint64_t>(chunk->base + request.buffer.offset);
+        entry.addr = reinterpret_cast<std::uint64_t>(memory->base + request.buffer.offset);
         entry.len = static_cast<std::uint32_t>(request.extent.length);
         switch (pinning) {
         case range_pinning_t::pinned_k:
             entry.opcode = request.kind == request_kind_t::read_k ? IORING_OP_READ_FIXED : IORING_OP_WRITE_FIXED;
-            entry.buf_index = static_cast<std::uint16_t>(request.buffer.registration);
+            entry.buf_index = static_cast<std::uint16_t>(request.buffer.memory_id);
             return;
         case range_pinning_t::unpinned_k:
             entry.opcode = request.kind == request_kind_t::read_k ? IORING_OP_READ : IORING_OP_WRITE;
@@ -1204,9 +1211,10 @@ class uring_files_disk_t {
     }
 
     /** Takes @p count entries the kernel would not accept back out of the queue and fails them. */
-    void refuse_tail_(owner_slot_t& slot, std::uint32_t base, ring_t& ring, unsigned tail, std::size_t count) noexcept {
+    void refuse_tail_(queue_pair_slot_t& slot, std::uint32_t base, ring_t& ring, unsigned tail,
+                      std::size_t count) noexcept {
         std::atomic_ref<unsigned> {*ring.submission_tail}.store(tail, std::memory_order_release);
-        status_t const refused {status_code_t::io_k, "The kernel would not accept this request"};
+        status_t const refused {status_code_t::input_output_k, "The kernel would not accept this request"};
         for (std::size_t index = 0; index != count; ++index) {
             flight_t const& flight = flights_[base + slot.flights_count - 1];
             completion_t const completion = failed_completion_(flight.token, refused);
@@ -1216,19 +1224,19 @@ class uring_files_disk_t {
         }
     }
 
-    /** Turns one completion entry into the completion its owner reads, by what the kernel returned. */
+    /** Turns one completion entry into the completion its queue pair reads, by what the kernel returned. */
     [[nodiscard]] static completion_t translate_(flight_t const& flight, int reason) noexcept {
         completion_t completion;
         completion.token = flight.token;
         if (reason >= 0) {
-            completion.transferred = static_cast<std::uint64_t>(reason);
-            completion.state = completion.transferred == flight.length ? completion_state_t::completed_k
-                                                                       : completion_state_t::partial_k;
+            completion.transferred_bytes = static_cast<std::uint64_t>(reason);
+            completion.state = completion.transferred_bytes == flight.length ? completion_state_t::completed_k
+                                                                             : completion_state_t::partial_k;
             return completion;
         }
         if (reason == -ECANCELED) {
             completion.state = completion_state_t::cancelled_k;
-            completion.status = {status_code_t::uninitialized_k, "The owner cancelled this request"};
+            completion.status = {status_code_t::uninitialized_k, "The queue_pair cancelled this request"};
             return completion;
         }
         completion.state = completion_state_t::failed_k;
@@ -1237,7 +1245,8 @@ class uring_files_disk_t {
     }
 
     /** Copies what the completion queue holds into @p into, dropping the entries nobody asked for. */
-    std::size_t harvest_(owner_slot_t& slot, std::uint32_t base, ring_t& ring, std::span<completion_t> into) noexcept {
+    std::size_t poll_completions_(queue_pair_slot_t& slot, std::uint32_t base, ring_t& ring,
+                                  std::span<completion_t> into) noexcept {
         unsigned const taken = *ring.completion_head;
         unsigned head = taken;
         unsigned const posted = std::atomic_ref<unsigned> {*ring.completion_tail}.load(std::memory_order_acquire);
@@ -1257,52 +1266,52 @@ class uring_files_disk_t {
 
 #pragma endregion Requests
 
-    /** One slot per lease the disk hands out. */
-    st::basic_vector<owner_slot_t> owners_;
+    /** One slot per queue pair the disk hands out. */
+    st::basic_vector<queue_pair_slot_t> queue_pairs_;
 
-    /** One ring per lease, since a deferred single-issuer ring belongs to exactly one thread. */
+    /** One ring per queue pair, since a deferred single-bound thread ring belongs to exactly one thread. */
     st::basic_vector<ring_t> rings_;
 
     /** One slot per memory range the disk records. */
-    st::basic_vector<registration_slot_t> registrations_;
+    st::basic_vector<registered_memory_slot_t> registered_memories_;
 
-    /** One slot per target the disk opens. */
-    st::basic_vector<target_slot_t> targets_;
+    /** One slot per medium the disk opens. */
+    st::basic_vector<registered_medium_slot_t> media_;
 
-    /** Every lease's outstanding requests, in windows of @c depth_limit_. */
+    /** Every queue pair's outstanding requests, in windows of @c depth_limit_. */
     st::basic_vector<flight_t> flights_;
 
-    /** Every lease's own completions, in windows of @c depth_limit_ read as a circle. */
+    /** Every queue pair's own completions, in windows of @c depth_limit_ read as a circle. */
     st::basic_vector<completion_t> locals_;
 
     /** One buffer table per ring, written by that ring's own thread. */
     st::basic_vector<::iovec> vectors_;
 
     /** One file table per ring, written by that ring's own thread. */
-    st::basic_vector<int> descriptors_;
+    st::basic_vector<int> registered_media_;
 
     /** Raised whenever a range is recorded or given back, so a ring knows its table is behind. */
-    std::int32_t registrations_epoch_ = 1;
+    std::int32_t registered_memories_epoch_ = 1;
 
-    /** Raised whenever a target is opened or closed, so a ring knows its table is behind. */
-    std::int32_t targets_epoch_ = 1;
+    /** Raised whenever a medium is opened or closed, so a ring knows its table is behind. */
+    std::int32_t media_epoch_ = 1;
 
-    /** The registration epoch at which the locked-memory cap refused a pin, or zero while none was refused. */
+    /** The registered memory epoch at which the locked-memory cap refused a pin, or zero while none was refused. */
     std::int32_t pin_refused_epoch_ = 0;
 
-    /** Requests one lease may keep in flight, and the stride of every lease's window. */
+    /** Requests one queue pair may keep in flight, and the stride of every queue pair's window. */
     std::uint32_t depth_limit_ = 0;
 
     /** Leases the disk hands out at once, which is also the number of rings it holds. */
-    std::uint16_t owners_limit_ = 0;
+    std::uint16_t queue_pairs_limit_ = 0;
 
     /** Memory ranges the disk records at once, and the width of every ring's buffer table. */
-    std::uint16_t registrations_limit_ = 0;
+    std::uint16_t registered_memories_limit_ = 0;
 
     /** Targets the disk opens at once, and the width of every ring's file table. */
-    std::uint16_t targets_limit_ = 0;
+    std::uint16_t media_limit_ = 0;
 
-    /** Whether the page cache stands in the path, which fixes what a target with no alignment reports. */
+    /** Whether the page cache stands in the path, which fixes what a medium with no alignment reports. */
     file_buffering_t buffering_ = file_buffering_t::unbuffered_k;
 };
 
@@ -1335,59 +1344,61 @@ class uring_files_disk_t {
     /** Answers that nothing is pinned, since nothing was ever registered. */
     [[nodiscard]] range_pinning_t pinning() const noexcept { return range_pinning_t::unpinned_k; }
 
-    /** Refuses the lease, since there is no ring to lease a share of. */
-    expected<ring_owner_t> open(std::uint32_t) noexcept {
+    /** Refuses the queue pair, since there is no ring to queue pair a share of. */
+    expected<queue_pair_t> acquire_queue_pair(std::uint32_t) noexcept {
         return status_t {status_code_t::unsupported_k, "This platform has no io_uring"};
     }
 
-    /** Refuses the handover, since no lease was ever handed out. */
-    status_t adopt(ring_owner_t const&) noexcept {
+    /** Refuses the handover, since no queue pair was ever handed out. */
+    status_t bind_queue_pair(queue_pair_t const&) noexcept {
         return {status_code_t::unsupported_k, "This platform has no io_uring"};
     }
 
-    /** Refuses the return, since no lease was ever handed out. */
-    status_t release(ring_owner_t&) noexcept { return {status_code_t::unsupported_k, "This platform has no io_uring"}; }
+    /** Refuses the return, since no queue pair was ever handed out. */
+    status_t release_queue_pair(queue_pair_t&) noexcept {
+        return {status_code_t::unsupported_k, "This platform has no io_uring"};
+    }
 
     /** Refuses the range, since no ring would ever address it. */
-    expected<registration_t> register_chunk(std::span<byte_t>, memory_space_t) noexcept {
+    expected<registered_memory_t> register_memory(std::span<byte_t>, memory_space_t) noexcept {
         return status_t {status_code_t::unsupported_k, "This platform has no io_uring"};
     }
 
     /** Refuses the range, since none was ever recorded. */
-    status_t deregister_chunk(registration_t&) noexcept {
+    status_t unregister_memory(registered_memory_t&) noexcept {
         return {status_code_t::unsupported_k, "This platform has no io_uring"};
     }
 
-    /** Refuses the target, since no ring would ever address it. */
-    expected<descriptor_t> register_target(target_request_t const&) noexcept {
+    /** Refuses the medium, since no ring would ever address it. */
+    expected<registered_medium_t> register_medium(medium_options_t const&) noexcept {
         return status_t {status_code_t::unsupported_k, "This platform has no io_uring"};
     }
 
-    /** Refuses the target, since none was ever opened. */
-    status_t deregister_target(descriptor_t&) noexcept {
+    /** Refuses the medium, since none was ever opened. */
+    status_t unregister_medium(registered_medium_t&) noexcept {
         return {status_code_t::unsupported_k, "This platform has no io_uring"};
     }
 
     /** Takes nothing, since there is no queue to take it into. */
-    expected<std::size_t> submit(ring_owner_t const&, std::span<request_t const>) noexcept {
+    expected<std::size_t> submit(queue_pair_t const&, std::span<request_t const>) noexcept {
         return status_t {status_code_t::unsupported_k, "This platform has no io_uring"};
     }
 
     /** Answers nothing, since nothing was ever submitted. */
-    expected<std::size_t> reap(ring_owner_t const&, std::span<completion_t>) noexcept {
+    expected<std::size_t> poll_completions(queue_pair_t const&, std::span<completion_t>) noexcept {
         return status_t {status_code_t::unsupported_k, "This platform has no io_uring"};
     }
 
     /** Stops nothing, since nothing was ever submitted. */
-    void cancel(ring_owner_t const&) noexcept {}
+    void cancel(queue_pair_t const&) noexcept {}
 
-    /** Refuses the drain, since no lease was ever handed out. */
-    status_t drain(ring_owner_t const&) noexcept {
+    /** Refuses the drain, since no queue pair was ever handed out. */
+    status_t drain(queue_pair_t const&) noexcept {
         return {status_code_t::unsupported_k, "This platform has no io_uring"};
     }
 
     /** Answers that nothing is outstanding, which is always true here. */
-    [[nodiscard]] std::size_t in_flight(ring_owner_t const&) const noexcept { return 0; }
+    [[nodiscard]] std::size_t outstanding(queue_pair_t const&) const noexcept { return 0; }
 };
 
 #pragma endregion Absent

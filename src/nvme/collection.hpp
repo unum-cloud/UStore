@@ -7,10 +7,10 @@
  *  Three places can answer a key, and they are consulted newest first: the write buffer holds what has
  *  not been flushed, the value cache holds what a point read already paid for, and the tree holds the
  *  rest. Only the third moves bytes, and it moves them through one snapshot of the level set, so a
- *  batched select reaches the lease's depth rather than the size of whatever batch it was handed.
+ *  batched select reaches the queue pair's depth rather than the size of whatever batch it was handed.
  *
  *  Nothing here allocates an I/O buffer. A caller's span is never registered memory, so the bytes are
- *  copied out of the lane's own blocks either way, and that one copy is the whole of the read path.
+ *  copied out of the channel's own blocks either way, and that one copy is the whole of the read path.
  */
 
 #pragma once
@@ -32,7 +32,7 @@
 #include "nvme/collection_snapshot.hpp"   // `collection_snapshot`, `select_result_t`
 #include "nvme/config.hpp"                // `collection_config_t`
 #include "nvme/constrained_allocator.hpp" // `resource_constraint_t`, `constrained_allocator`
-#include "nvme/io_lane.hpp"               // `io_lane_t`
+#include "nvme/io_channel.hpp"            // `io_channel_t`
 #include "nvme/lsm_sorted_run.hpp"        // `sorted_run_layout`
 #include "nvme/lsm_tree.hpp"              // `lsm_tree`, `compaction_outcome_t`
 #include "nvme/stored_value.hpp"          // `stored_value_size_t`, `empty_stored_value_offset_k`
@@ -46,7 +46,7 @@ namespace unum::ustore::nvme {
 /**
  *  @brief A write buffer and a value cache in front of an LSM tree of sorted runs.
  *
- *  The volume, the budget and every lane are borrowed and must outlive the collection. A lane belongs
+ *  The volume, the budget and every channel are borrowed and must outlive the collection. A channel belongs
  *  to the thread holding it for as long as it holds it, so every call that can move bytes takes one
  *  rather than reaching for a shared handle.
  */
@@ -147,8 +147,8 @@ class collection {
     }
 
     /** Returns every run to the volume and forgets every staged write, which destroys the data. */
-    status_t destroy(io_lane_t& lane) noexcept {
-        status_t const dropped = tree_.destroy(lane);
+    status_t destroy(io_channel_t& channel) noexcept {
+        status_t const dropped = tree_.destroy(channel);
         forget_staged_();
         cache_.clear();
         return dropped;
@@ -206,13 +206,13 @@ class collection {
 
     /**
      *  @brief Copies the value of @p stored_key into @p into, which needs only the value's own bytes.
-     *  @param[inout] lane The lane the read is submitted and reaped on, held by the calling thread.
+     *  @param[inout] channel The channel the read is submitted and completed on, held by the calling thread.
      *  @param[in] stored_key The key to read.
      *  @param[out] into Where the value lands, which need not be aligned and need not be registered.
      *  @param[out] size Bytes written, which is zero for every failure.
-     *  @return @c not_found_k for a miss or an erasure, @c io_k for a run shorter than its index claims.
+     *  @return @c not_found_k for a miss or an erasure, @c input_output_k for a run shorter than its index claims.
      */
-    status_t select(io_lane_t& lane, stored_key_t stored_key, std::span<byte_t> into,
+    status_t select(io_channel_t& channel, stored_key_t stored_key, std::span<byte_t> into,
                     stored_value_size_t& size) const noexcept {
         size = 0;
         staged_place_t staged;
@@ -241,15 +241,15 @@ class collection {
             if (cached) return {};
         }
 
-        if (status_t const read = snapshot_t::of(tree_).select(lane, stored_key, into, size); read.failed())
+        if (status_t const read = snapshot_t::of(tree_).select(channel, stored_key, into, size); read.failed())
             return read;
         if constexpr (!holds_values_inline_k) cache_.add(stored_key, std::span<byte_t const> {into.data(), size});
         return {};
     }
 
     /**
-     *  @brief Reads the values of @p stored_keys, refilling the lane as completions retire.
-     *  @param[inout] lane The lane the reads are submitted and reaped on, held by the calling thread.
+     *  @brief Reads the values of @p stored_keys, refilling the channel as completions retire.
+     *  @param[inout] channel The channel the reads are submitted and completed on, held by the calling thread.
      *  @param[in] stored_keys The keys to read, in any order and with any number of misses among them.
      *  @param[out] results What every key answered, which separates a miss from an erasure.
      *  @param[in] sink Called as @c sink(request, offset, bytes) for every key that locates a value.
@@ -261,8 +261,8 @@ class collection {
      *      whole value in a buffer this path exists to do without.
      */
     template <typename sink_type_>
-    status_t select(io_lane_t& lane, std::span<stored_key_t const> stored_keys, std::span<select_result_t> results,
-                    sink_type_&& sink) const noexcept {
+    status_t select(io_channel_t& channel, std::span<stored_key_t const> stored_keys,
+                    std::span<select_result_t> results, sink_type_&& sink) const noexcept {
         if (results.size() != stored_keys.size())
             return {status_code_t::invalid_argument_k, "A batched select answers one result per key"};
 
@@ -305,7 +305,7 @@ class collection {
         auto relay = [&](std::size_t request, std::uint64_t offset, std::span<byte_t const> bytes) noexcept {
             sink(deferred_requests[request], offset, bytes);
         };
-        if (status_t const read = snapshot_t::of(tree_).select(lane, std::span<stored_key_t const> {deferred_keys},
+        if (status_t const read = snapshot_t::of(tree_).select(channel, std::span<stored_key_t const> {deferred_keys},
                                                                std::span<select_result_t> {deferred_results}, relay);
             read.failed())
             return read;
@@ -319,28 +319,28 @@ class collection {
 #pragma region Writes
 
     /** Stages @p stored_value under @p stored_key, flushing first when the write buffer is full. */
-    status_t insert(io_lane_t& lane, stored_key_t stored_key, std::span<byte_t const> stored_value) noexcept {
+    status_t insert(io_channel_t& channel, stored_key_t stored_key, std::span<byte_t const> stored_value) noexcept {
         if (!admits_(stored_value.size()))
             return {status_code_t::malformed_k, "This collection admits no value of that size"};
-        if (status_t const room = make_room_(lane, 1, stored_value.size()); room.failed()) return room;
+        if (status_t const room = make_room_(channel, 1, stored_value.size()); room.failed()) return room;
         return stage_(stored_key, stored_value, staged_state_t::stored_k);
     }
 
     /** Stages a tombstone under @p stored_key, flushing first when the write buffer is full. */
-    status_t erase(io_lane_t& lane, stored_key_t stored_key) noexcept {
-        if (status_t const room = make_room_(lane, 1, 0); room.failed()) return room;
+    status_t erase(io_channel_t& channel, stored_key_t stored_key) noexcept {
+        if (status_t const room = make_room_(channel, 1, 0); room.failed()) return room;
         return stage_(stored_key, std::span<byte_t const> {}, staged_state_t::erased_k);
     }
 
     /**
      *  @brief Stages one value per key, flushing first when the write buffer cannot hold them all.
-     *  @param[inout] lane The lane a flush writes on, held by the calling thread.
+     *  @param[inout] channel The channel a flush writes on, held by the calling thread.
      *  @param[in] stored_keys The keys to write, in any order and with repeats taking the last value.
      *  @param[in] stored_values The values back to back, in the order their keys name them.
      *  @param[in] sizes Bytes of every value, one per key, which must add up to @p stored_values.
      */
-    status_t insert(io_lane_t& lane, std::span<stored_key_t const> stored_keys, std::span<byte_t const> stored_values,
-                    std::span<stored_value_size_t const> sizes) noexcept {
+    status_t insert(io_channel_t& channel, std::span<stored_key_t const> stored_keys,
+                    std::span<byte_t const> stored_values, std::span<stored_value_size_t const> sizes) noexcept {
         if (sizes.size() != stored_keys.size())
             return {status_code_t::invalid_argument_k, "A batched insert names the size of every value"};
         std::uint64_t total = 0;
@@ -351,7 +351,7 @@ class collection {
         }
         if (total != stored_values.size())
             return {status_code_t::invalid_argument_k, "The named sizes do not add up to the values"};
-        if (status_t const room = make_room_(lane, stored_keys.size(), total); room.failed()) return room;
+        if (status_t const room = make_room_(channel, stored_keys.size(), total); room.failed()) return room;
 
         std::uint64_t offset = 0;
         for (std::size_t index = 0; index != stored_keys.size(); ++index) {
@@ -364,8 +364,8 @@ class collection {
     }
 
     /** Stages a tombstone under every key of @p stored_keys, flushing first when they do not fit. */
-    status_t erase(io_lane_t& lane, std::span<stored_key_t const> stored_keys) noexcept {
-        if (status_t const room = make_room_(lane, stored_keys.size(), 0); room.failed()) return room;
+    status_t erase(io_channel_t& channel, std::span<stored_key_t const> stored_keys) noexcept {
+        if (status_t const room = make_room_(channel, stored_keys.size(), 0); room.failed()) return room;
         for (std::size_t index = 0; index != stored_keys.size(); ++index)
             if (status_t const staged = stage_(stored_keys[index], std::span<byte_t const> {},
                                                staged_state_t::erased_k);
@@ -379,12 +379,12 @@ class collection {
 #pragma region Maintenance
 
     /** Writes every staged write as one run of level zero, leaving the write buffer empty. */
-    status_t flush(io_lane_t& lane) noexcept {
+    status_t flush(io_channel_t& channel) noexcept {
         if (staged_.empty()) return {};
         drained_slots_t key_slots {constrained_allocator<key_slot_t> {*constraint_}};
         drained_values_t stored_values {constrained_allocator<byte_t> {*constraint_}};
         if (status_t const drained = drain_(key_slots, stored_values); drained.failed()) return drained;
-        if (status_t const published = tree_.flush(lane, std::span<key_slot_t const> {key_slots},
+        if (status_t const published = tree_.flush(channel, std::span<key_slot_t const> {key_slots},
                                                    std::span<byte_t const> {stored_values}, value_max_size_);
             published.failed())
             return published;
@@ -400,16 +400,16 @@ class collection {
 
     /**
      *  @brief Merges the shallowest level that is over its bounds into the level below it.
-     *  @param[inout] reading_lane The lane the merge gathers source values on, held by the calling thread.
-     *  @param[inout] writing_lane The lane the merge writes its new runs on, which is not @p reading_lane.
+     *  @param[inout] reading_channel The channel the merge gathers source values on, held by the calling thread.
+     *  @param[inout] writing_channel The channel the merge writes its new runs on, which is not @p reading_channel.
      */
-    expected<compaction_outcome_t> compact(io_lane_t& reading_lane, io_lane_t& writing_lane) noexcept {
-        return tree_.compact(reading_lane, writing_lane, compaction_placement_t::automatic_k, nullptr);
+    expected<compaction_outcome_t> compact(io_channel_t& reading_channel, io_channel_t& writing_channel) noexcept {
+        return tree_.compact(reading_channel, writing_channel, compaction_placement_t::automatic_k, nullptr);
     }
 
     /** Flushes the write buffer, then holds the level set the flush published. */
-    expected<snapshot_t> take_snapshot(io_lane_t& lane) noexcept {
-        if (status_t const flushed = flush(lane); flushed.failed()) return flushed;
+    expected<snapshot_t> take_snapshot(io_channel_t& channel) noexcept {
+        if (status_t const flushed = flush(channel); flushed.failed()) return flushed;
         return snapshot_t::of(tree_);
     }
 
@@ -523,9 +523,9 @@ class collection {
     }
 
     /** Flushes when @p count writes of @p bytes do not fit, and refuses when they never would. */
-    status_t make_room_(io_lane_t& lane, std::size_t count, std::uint64_t bytes) noexcept {
+    status_t make_room_(io_channel_t& channel, std::size_t count, std::uint64_t bytes) noexcept {
         if (can_stage_(count, bytes)) return {};
-        if (status_t const flushed = flush(lane); flushed.failed()) return flushed;
+        if (status_t const flushed = flush(channel); flushed.failed()) return flushed;
         if (can_stage_(count, bytes)) return {};
         return {status_code_t::capacity_exhausted_k, "That batch is larger than the whole write buffer"};
     }

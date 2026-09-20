@@ -6,7 +6,7 @@
  *
  *  Nothing here takes a lock. A start reads the stamp counter, a commit claims one with a @c fetch_add
  *  and publishes what it wrote with one @c fetch_max per key, and a roster slot is claimed by writing
- *  its identifier with one compare-exchange. The single exclusion is the staging lease, which a staged
+ *  its identifier with one compare-exchange. The single exclusion is the staging queue pair, which a staged
  *  transaction holds from @c stage until @c commit because those are two separate calls from its owner.
  */
 #pragma once
@@ -202,7 +202,7 @@ class database_transaction_registry {
     /** The order every transaction is placed in, and the last commit to write each key. */
     commit_record_t record_;
 
-    /** The live transactions and the staging lease. */
+    /** The live transactions and the staging queue pair. */
     transaction_roster_t roster_;
 
 #pragma endregion Private Members

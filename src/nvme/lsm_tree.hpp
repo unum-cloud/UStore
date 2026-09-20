@@ -11,7 +11,7 @@
  *  last reader has left it, which is the whole of the reclamation.
  *
  *  A batched read refills the ring as completions retire rather than submitting a batch and waiting on
- *  it, so the depth a read reaches is the lease's and not the batch's.
+ *  it, so the depth a read reaches is the queue pair's and not the batch's.
  */
 
 #pragma once
@@ -32,8 +32,8 @@
 
 #include "nvme/config.hpp"           // `lsm_tree_config_t`
 #include "nvme/extent.hpp"           // `extent_t`, `rounded_down_to`, `portable_alignment_k`
-#include "nvme/io_lane.hpp"          // `io_lane_t`
-#include "nvme/io_pipeline.hpp"      // `basic_read_pipeline`, `require_whole`
+#include "nvme/io_channel.hpp"       // `io_channel_t`
+#include "nvme/io_pipeline.hpp"      // `basic_read_pipeline`, `require_completed_in_full`
 #include "nvme/lsm_level.hpp"        // `lsm_level`, `lsm_level_order_t`, `lsm_level_depth_t`
 #include "nvme/lsm_level_merger.hpp" // `lsm_level_merger`, `compaction_cancellation_t`
 #include "nvme/storage_limits.hpp"   // `storage_limits_t`
@@ -224,11 +224,11 @@ class lsm_tree {
     }
 
     /** Returns every run of every level to the volume, which destroys the tree's data. */
-    status_t destroy(io_lane_t& lane) noexcept {
+    status_t destroy(io_channel_t& channel) noexcept {
         status_t first;
         level_set_t& live = sets_[live_slot_()];
         for (std::size_t number = 0; number != live.size(); ++number)
-            if (status_t const dropped = live[number].drop(*volume_, lane); dropped.failed() && first.succeeded())
+            if (status_t const dropped = live[number].drop(*volume_, channel); dropped.failed() && first.succeeded())
                 first = dropped;
         return first;
     }
@@ -276,8 +276,8 @@ class lsm_tree {
 #pragma region Batched Reads
 
     /**
-     *  @brief Looks @p stored_keys up in @p taken and reads their values, refilling the lane as reads retire.
-     *  @param[inout] lane The lane the reads are submitted and reaped on, held by the calling thread.
+     *  @brief Looks @p stored_keys up in @p taken and reads their values, refilling the channel as reads retire.
+     *  @param[inout] channel The channel the reads are submitted and completed on, held by the calling thread.
      *  @param[in] taken The level set every lookup runs against.
      *  @param[in] stored_keys The keys to read, in any order and with any number of misses among them.
      *  @param[out] results What every key was, which separates a miss from an erased value.
@@ -288,7 +288,7 @@ class lsm_tree {
      *      before it, and a key whose value is present and empty is reported once with no bytes.
      */
     template <typename sink_type_>
-    status_t read_values(io_lane_t& lane, snapshot_t const& taken, std::span<stored_key_t const> stored_keys,
+    status_t read_values(io_channel_t& channel, snapshot_t const& taken, std::span<stored_key_t const> stored_keys,
                          std::span<find_result_t> results, sink_type_&& sink) const noexcept {
         if (results.size() != stored_keys.size())
             return {status_code_t::invalid_argument_k, "A batched read answers one result per key"};
@@ -304,24 +304,24 @@ class lsm_tree {
             return {};
         }
         else {
-            std::uint64_t const block_bytes = rounded_down_to(lane.requests().block_bytes(), portable_alignment_k);
+            std::uint64_t const block_bytes = rounded_down_to(channel.requests().buffer_bytes(), portable_alignment_k);
             if (block_bytes == 0)
-                return {status_code_t::capacity_exhausted_k, "A lane's block is shorter than one page"};
+                return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than one page"};
 
-            std::size_t const depth = lane.owner().depth();
+            std::size_t const depth = channel.queue_pair().depth();
             st::basic_vector<pending_read_t> pending;
             if (pending.resize(depth) != st::status_t::success_k)
                 return {status_code_t::out_of_memory_k, "A tree could not track its reads in flight"};
 
-            read_pipeline_t reader {volume_->disk(), lane, volume_->target()};
+            read_pipeline_t reader {volume_->disk(), channel, volume_->medium()};
             status_t first;
-            auto adapter = [&](harvested_block_t const& reaped) noexcept {
-                pending_read_t const& piece = pending[reaped.tag % depth];
-                if (status_t const whole = require_whole(reaped); whole.failed()) {
+            auto adapter = [&](completed_buffer_t const& completed) noexcept {
+                pending_read_t const& piece = pending[completed.tag % depth];
+                if (status_t const whole = require_completed_in_full(completed); whole.failed()) {
                     if (first.succeeded()) first = whole;
                     return;
                 }
-                sink(piece.request, piece.offset, reaped.bytes.subspan(piece.skipped, piece.carried));
+                sink(piece.request, piece.offset, completed.bytes.subspan(piece.skipped, piece.carried));
             };
 
             std::size_t request = 0;
@@ -329,7 +329,7 @@ class lsm_tree {
             std::uint32_t tag = 0;
             value_window_t window;
             while (request != stored_keys.size() || reader.outstanding() != 0) {
-                while (request != stored_keys.size() && reader.has_room()) {
+                while (request != stored_keys.size() && reader.can_enqueue()) {
                     if (chunk == 0) {
                         lsm_tree_position_t position;
                         find_result_t const found = find(taken, stored_keys[request], position);
@@ -348,7 +348,7 @@ class lsm_tree {
                     std::uint64_t const room = window.extent.length - at;
                     std::uint64_t const length = block_bytes < room ? block_bytes : room;
                     pending[tag % depth] = piece_of_(window, request, at, length);
-                    if (reader.offer(extent_t {window.extent.offset + at, length}, tag).failed()) break;
+                    if (reader.enqueue_read(extent_t {window.extent.offset + at, length}, tag).failed()) break;
                     ++tag;
                     if (at + length == window.extent.length) {
                         ++request;
@@ -356,9 +356,9 @@ class lsm_tree {
                     }
                     else ++chunk;
                 }
-                if (status_t const flushed = reader.flush(); flushed.failed()) return flushed;
-                expected<std::size_t> const harvested = reader.harvest(adapter);
-                if (!harvested) return harvested.status();
+                if (status_t const flushed = reader.submit(); flushed.failed()) return flushed;
+                expected<std::size_t> const polled = reader.poll_completions(adapter);
+                if (!polled) return polled.status();
             }
             return first;
         }
@@ -370,15 +370,15 @@ class lsm_tree {
 
     /**
      *  @brief Writes @p key_slots and @p stored_values as one run and publishes it onto level zero.
-     *  @param[inout] lane The lane the run is written on, held by the calling thread.
+     *  @param[inout] channel The channel the run is written on, held by the calling thread.
      *  @param[in] key_slots The key slots in ascending order of their keys, as a write buffer drained them.
      *  @param[in] stored_values The values back to back, located from the run's own values offset.
      *  @param[in] value_max_size The largest value the collection admits, kept in the run's header.
      */
-    status_t flush(io_lane_t& lane, std::span<key_slot_t const> key_slots, std::span<byte_t const> stored_values,
+    status_t flush(io_channel_t& channel, std::span<key_slot_t const> key_slots, std::span<byte_t const> stored_values,
                    stored_value_size_t value_max_size) noexcept {
-        expected<sorted_run_t> written = sorted_run_t::write(*volume_, lane, uuid_generator(), key_slots, stored_values,
-                                                             value_max_size);
+        expected<sorted_run_t> written = sorted_run_t::write(*volume_, channel, uuid_generator(), key_slots,
+                                                             stored_values, value_max_size);
         if (!written) return written.status();
         uuid_t const content_id = written->content_id();
 
@@ -386,12 +386,12 @@ class lsm_tree {
         std::size_t const staged = 1 - live;
         std::size_t const nothing_consumed = sets_[live].size();
         if (status_t const carried = carry_all_(live, staged, nothing_consumed, nothing_consumed); carried.failed()) {
-            [[maybe_unused]] status_t const abandoned = sorted_run_t::drop(*volume_, lane, content_id);
+            [[maybe_unused]] status_t const abandoned = sorted_run_t::drop(*volume_, channel, content_id);
             return carried;
         }
-        if (status_t const adopted = sets_[staged][0].adopt(std::move(*written)); adopted.failed()) {
+        if (status_t const adopted = sets_[staged][0].bind_queue_pair(std::move(*written)); adopted.failed()) {
             retire_(staged);
-            [[maybe_unused]] status_t const abandoned = sorted_run_t::drop(*volume_, lane, content_id);
+            [[maybe_unused]] status_t const abandoned = sorted_run_t::drop(*volume_, channel, content_id);
             return adopted;
         }
         publish_(staged);
@@ -401,14 +401,14 @@ class lsm_tree {
 
     /**
      *  @brief Opens the runs @p runs names and publishes them as the level set of this tree.
-     *  @param[inout] lane The lane every run's header and index is read on, held by the calling thread.
+     *  @param[inout] channel The channel every run's header and index is read on, held by the calling thread.
      *  @param[in] runs The runs in the order their levels hold them, which is oldest first on level zero.
      *  @return Success, or the status that stopped it with the empty level set still live.
      *
      *  @note Only a tree still holding the one empty level @c mount built takes these, so a reopen
      *      adopts what the medium carries and no call ever merges two level sets into one.
      */
-    status_t restore(io_lane_t& lane, std::span<lsm_tree_run_record_t const> runs) noexcept {
+    status_t restore(io_channel_t& channel, std::span<lsm_tree_run_record_t const> runs) noexcept {
         std::size_t const live = live_slot_();
         if (sets_[live].size() != 1 || !sets_[live][0].empty())
             return {status_code_t::invalid_argument_k, "A tree takes its stored runs only while it holds none"};
@@ -430,12 +430,13 @@ class lsm_tree {
         }
 
         for (std::size_t index = 0; index != runs.size(); ++index) {
-            expected<sorted_run_t> opened = sorted_run_t::open(*volume_, lane, runs[index].content_id);
+            expected<sorted_run_t> opened = sorted_run_t::open(*volume_, channel, runs[index].content_id);
             if (!opened) {
                 discard_(staged);
                 return opened.status();
             }
-            if (status_t const adopted = into[runs[index].level_number].adopt(std::move(*opened)); adopted.failed()) {
+            if (status_t const adopted = into[runs[index].level_number].bind_queue_pair(std::move(*opened));
+                adopted.failed()) {
                 discard_(staged);
                 return adopted;
             }
@@ -454,20 +455,20 @@ class lsm_tree {
 
     /**
      *  @brief Merges the shallowest level that is over its bounds into the level below it and publishes it.
-     *  @param[inout] reading_lane The lane the merge gathers source values on, held by the calling thread.
-     *  @param[inout] writing_lane The lane the merge writes its new runs on, which is not @p reading_lane.
+     *  @param[inout] reading_channel The channel the merge gathers source values on, held by the calling thread.
+     *  @param[inout] writing_channel The channel the merge writes its new runs on, which is not @p reading_channel.
      *  @param[in] placement Where the compaction runs, which a collection leaves automatic.
      *  @param[in] cancellation The word the merge reads between blocks, or null for a merge nobody stops.
      *  @param[in] published What to call once the merged set is live and before a consumed run is dropped.
      *  @return What the pass did, or the status that stopped it with the live level set untouched.
      */
     expected<compaction_outcome_t> compact(
-        io_lane_t& reading_lane, io_lane_t& writing_lane, compaction_placement_t placement,
+        io_channel_t& reading_channel, io_channel_t& writing_channel, compaction_placement_t placement,
         compaction_cancellation_t const* cancellation,
         lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {}) noexcept {
         if (!claim_compaction_()) return compaction_outcome_t::nothing_to_compact_k;
 
-        expected<compaction_outcome_t> const outcome = compact_once_(reading_lane, writing_lane, placement,
+        expected<compaction_outcome_t> const outcome = compact_once_(reading_channel, writing_channel, placement,
                                                                      cancellation, published);
         fu::preferred_atomic_ref<std::int32_t> {compacting_}.store(0, std::memory_order_release);
         return outcome;
@@ -601,7 +602,7 @@ class lsm_tree {
     }
 
     /** Runs one merge and publishes it, which the claim around it keeps to one thread at a time. */
-    expected<compaction_outcome_t> compact_once_(io_lane_t& reading_lane, io_lane_t& writing_lane,
+    expected<compaction_outcome_t> compact_once_(io_channel_t& reading_channel, io_channel_t& writing_channel,
                                                  compaction_placement_t placement,
                                                  compaction_cancellation_t const* cancellation,
                                                  lsm_tree_publication_hook_t const& published) noexcept {
@@ -629,18 +630,18 @@ class lsm_tree {
         request.cancellation = cancellation;
         if (!grows && lower + 1 != source.size()) request.depth = lsm_level_depth_t::intermediate_k;
 
-        expected<level_t> merged = merger_t::merge(*volume_, reading_lane, writing_lane, request);
+        expected<level_t> merged = merger_t::merge(*volume_, reading_channel, writing_channel, request);
         if (!merged) return merged.status();
 
         std::size_t const staged = 1 - live;
         if (status_t const carried = carry_all_(live, staged, upper, last_consumed); carried.failed()) {
-            [[maybe_unused]] status_t const abandoned = merged->drop(*volume_, writing_lane);
+            [[maybe_unused]] status_t const abandoned = merged->drop(*volume_, writing_channel);
             return carried;
         }
         if (grows) {
             if (sets_[staged].push_back(level_t::of(static_cast<std::uint32_t>(lower), lsm_level_order_t::sorted_k)) !=
                 st::status_t::success_k) {
-                [[maybe_unused]] status_t const abandoned = merged->drop(*volume_, writing_lane);
+                [[maybe_unused]] status_t const abandoned = merged->drop(*volume_, writing_channel);
                 retire_(staged);
                 return status_t {status_code_t::out_of_memory_k, "A tree could not hold another level"};
             }
@@ -656,7 +657,7 @@ class lsm_tree {
             }
         status_t first;
         for (std::size_t index = 0; index != consumed.size(); ++index) {
-            if (status_t const dropped = sorted_run_t::drop(*volume_, writing_lane, consumed[index]->content_id());
+            if (status_t const dropped = sorted_run_t::drop(*volume_, writing_channel, consumed[index]->content_id());
                 dropped.failed() && first.succeeded())
                 first = dropped;
             delete consumed[index];

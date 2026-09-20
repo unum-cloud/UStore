@@ -8,10 +8,10 @@
  *  registry that orders the commits landing in it, and two blobs on the volume - the schema a reopen
  *  checks itself against, and whatever bytes the owner keeps beside the data. A graph is two of these.
  *
- *  The volume and the lanes are borrowed rather than reached for. Reads take the caller's lane, so any
- *  number of threads read at once; writes take the two lanes the database was opened with, because the
- *  registry commits through calls that carry no lane. A lease belongs to one thread at a time, so the
- *  writer that wins the write path adopts both lanes before it writes through them.
+ *  The volume and the channels are borrowed rather than reached for. Reads take the caller's channel, so any
+ *  number of threads read at once; writes take the two channels the database was opened with, because the
+ *  registry commits through calls that carry no channel. A queue pair belongs to one thread at a time, so the
+ *  writer that wins the write path adopts both channels before it writes through them.
  *
  *  That write path is the one claim here, and it is not lock-free. The collection under it is a
  *  single-writer structure - a staged write mutates a hash map, an arena and a value cache that
@@ -39,14 +39,14 @@
 #include <ustore/status.hpp> // `status_t`, `status_code_t`, `expected`
 #include <ustore/types.hpp>  // `byte_t`
 
-#include "nvme/buffer_pool.hpp"                            // `buffer_lease_t`
+#include "nvme/buffer_pool.hpp"                            // `pooled_buffer_t`
 #include "nvme/catalog.hpp"                                // `blob_kind_t`, `blob_name_t`
 #include "nvme/collection.hpp"                             // `collection`
 #include "nvme/collection_scanner.hpp"                     // `collection_scanner`
 #include "nvme/collection_snapshot.hpp"                    // `select_result_t`
 #include "nvme/config.hpp"                                 // `single_collection_database_config_t`
 #include "nvme/extent.hpp"                                 // `extent_t`, `rounded_up_to`, `portable_alignment_k`
-#include "nvme/io_lane.hpp"                                // `io_lane_t`
+#include "nvme/io_channel.hpp"                             // `io_channel_t`
 #include "nvme/io_pipeline.hpp"                            // `basic_read_pipeline`, `basic_write_pipeline`
 #include "nvme/lsm_tree.hpp"                               // `lsm_tree_run_record_t`, `lsm_tree_publication_hook_t`
 #include "nvme/read_set.hpp"                               // `transaction_stamp_t`
@@ -165,7 +165,7 @@ class basic_single_collection_database {
     /** Writes whatever is still staged onto the volume and names every run, so the data outlives this. */
     ~basic_single_collection_database() noexcept {
         write_path_guard_t const held {*this};
-        [[maybe_unused]] status_t const flushed = collection_.flush(writing_lane_);
+        [[maybe_unused]] status_t const flushed = collection_.flush(writing_channel_);
         // A destroyed database dropped its schema, and a close must not write one back over an empty volume.
         if (!volume_.names(schema_blob_name_())) return;
         [[maybe_unused]] status_t const saved = save_schema_();
@@ -174,24 +174,27 @@ class basic_single_collection_database {
     /**
      *  @brief Opens a database over @p volume, creating its schema blob when the volume holds none.
      *  @param[inout] volume The volume every run and blob lands on, borrowed and outliving the database.
-     *  @param[inout] writing_lane The lane every write, flush and commit runs on, borrowed for the database's life.
-     *  @param[inout] merging_lane The second lane a compaction writes its new runs on, which is not @p writing_lane.
+     *  @param[inout] writing_channel The channel every write, flush and commit runs on, borrowed for the database's
+     *      life.
+     *  @param[inout] merging_channel The second channel a compaction writes its new runs on, which is not @p
+     *      writing_channel.
      *  @param[in] config The collection's bounds and the transaction defaults.
      *  @param[in] resources The budget the conflict record, the roster and every transaction's writes are charged to.
      *  @return The database, or @c malformed_k for a volume whose schema names another value layout.
      */
-    static expected<database_unique_ptr_t> open(volume_t& volume, io_lane_t& writing_lane, io_lane_t& merging_lane,
+    static expected<database_unique_ptr_t> open(volume_t& volume, io_channel_t& writing_channel,
+                                                io_channel_t& merging_channel,
                                                 single_collection_database_config_t const& config,
                                                 resources_shared_ptr_t resources) noexcept {
         if (!resources) return status_t {status_code_t::invalid_argument_k, "A database is charged to some budget"};
-        if (&writing_lane == &merging_lane)
-            return status_t {status_code_t::invalid_argument_k, "A compaction reads and writes on two lanes"};
+        if (&writing_channel == &merging_channel)
+            return status_t {status_code_t::invalid_argument_k, "A compaction reads and writes on two channels"};
 
         expected<collection_t> mounted = collection_t::mount(volume, config.collection, resources->memory_constraint);
         if (!mounted) return mounted.status();
 
         database_unique_ptr_t opened {new (std::nothrow) basic_single_collection_database {
-            volume, writing_lane, merging_lane, config, std::move(resources), std::move(*mounted)}};
+            volume, writing_channel, merging_channel, config, std::move(resources), std::move(*mounted)}};
         if (!opened) return status_t {status_code_t::out_of_memory_k, "The database did not fit"};
         if (status_t const agreed = opened->agree_on_schema_(); agreed.failed()) return agreed;
         return opened;
@@ -204,7 +207,7 @@ class basic_single_collection_database {
         status_t first = drop_blob_(schema_blob_name_());
         if (status_t const dropped = drop_blob_(user_data_blob_name_()); dropped.failed() && first.succeeded())
             first = dropped;
-        if (status_t const emptied = collection_.destroy(writing_lane_); emptied.failed() && first.succeeded())
+        if (status_t const emptied = collection_.destroy(writing_channel_); emptied.failed() && first.succeeded())
             first = emptied;
         return first;
     }
@@ -260,51 +263,51 @@ class basic_single_collection_database {
 
     /**
      *  @brief Copies the value of @p stored_key into @p into, which needs only the value's own bytes.
-     *  @param[inout] lane The lane the read is submitted and reaped on, held by the calling thread.
+     *  @param[inout] channel The channel the read is submitted and completed on, held by the calling thread.
      *  @param[in] stored_key The key to read.
      *  @param[out] into Where the value lands, which need not be aligned and need not be registered.
      *  @param[out] size Bytes written, which is zero for every failure.
      */
-    status_t select(io_lane_t& lane, stored_key_t stored_key, std::span<byte_t> into,
+    status_t select(io_channel_t& channel, stored_key_t stored_key, std::span<byte_t> into,
                     stored_value_size_t& size) const noexcept {
         read_path_guard_t const held {*this};
-        return collection_.select(lane, stored_key, into, size);
+        return collection_.select(channel, stored_key, into, size);
     }
 
     /**
-     *  @brief Reads the values of @p stored_keys, refilling the lane as completions retire.
-     *  @param[inout] lane The lane the reads are submitted and reaped on, held by the calling thread.
+     *  @brief Reads the values of @p stored_keys, refilling the channel as completions retire.
+     *  @param[inout] channel The channel the reads are submitted and completed on, held by the calling thread.
      *  @param[in] stored_keys The keys to read, in any order and with any number of misses among them.
      *  @param[out] results What every key answered, which separates a miss from an erasure.
      *  @param[in] sink Called as @c sink(request, offset, bytes) for every key that locates a value.
      */
     template <typename sink_type_>
-    status_t select(io_lane_t& lane, std::span<stored_key_t const> stored_keys, std::span<select_result_t> results,
-                    sink_type_&& sink) const noexcept {
+    status_t select(io_channel_t& channel, std::span<stored_key_t const> stored_keys,
+                    std::span<select_result_t> results, sink_type_&& sink) const noexcept {
         read_path_guard_t const held {*this};
-        return collection_.select(lane, stored_keys, results, std::forward<sink_type_>(sink));
+        return collection_.select(channel, stored_keys, results, std::forward<sink_type_>(sink));
     }
 
 #pragma endregion Lookups
 
 #pragma region Writes
 
-    /** Stages @p stored_value under @p stored_key on the writing lane, flushing when the buffer is full. */
+    /** Stages @p stored_value under @p stored_key on the writing channel, flushing when the buffer is full. */
     status_t insert(stored_key_t stored_key, std::span<byte_t const> stored_value) noexcept {
         write_path_guard_t const held {*this};
         if (held.adopted().failed()) return held.adopted();
-        return collection_.insert(writing_lane_, stored_key, stored_value);
+        return collection_.insert(writing_channel_, stored_key, stored_value);
     }
 
-    /** Stages a tombstone under @p stored_key on the writing lane. */
+    /** Stages a tombstone under @p stored_key on the writing channel. */
     status_t erase(stored_key_t stored_key) noexcept {
         write_path_guard_t const held {*this};
         if (held.adopted().failed()) return held.adopted();
-        return collection_.erase(writing_lane_, stored_key);
+        return collection_.erase(writing_channel_, stored_key);
     }
 
     /**
-     *  @brief Stages one value per key on the writing lane, flushing when they do not all fit.
+     *  @brief Stages one value per key on the writing channel, flushing when they do not all fit.
      *  @param[in] stored_keys The keys to write, in any order and with repeats taking the last value.
      *  @param[in] stored_values The values back to back, in the order their keys name them.
      *  @param[in] sizes Bytes of every value, one per key, which must add up to @p stored_values.
@@ -313,14 +316,14 @@ class basic_single_collection_database {
                     std::span<stored_value_size_t const> sizes) noexcept {
         write_path_guard_t const held {*this};
         if (held.adopted().failed()) return held.adopted();
-        return collection_.insert(writing_lane_, stored_keys, stored_values, sizes);
+        return collection_.insert(writing_channel_, stored_keys, stored_values, sizes);
     }
 
-    /** Stages a tombstone under every key of @p stored_keys on the writing lane. */
+    /** Stages a tombstone under every key of @p stored_keys on the writing channel. */
     status_t erase(std::span<stored_key_t const> stored_keys) noexcept {
         write_path_guard_t const held {*this};
         if (held.adopted().failed()) return held.adopted();
-        return collection_.erase(writing_lane_, stored_keys);
+        return collection_.erase(writing_channel_, stored_keys);
     }
 
 #pragma endregion Writes
@@ -331,7 +334,7 @@ class basic_single_collection_database {
     status_t flush() noexcept {
         write_path_guard_t const held {*this};
         if (held.adopted().failed()) return held.adopted();
-        if (status_t const flushed = collection_.flush(writing_lane_); flushed.failed()) return flushed;
+        if (status_t const flushed = collection_.flush(writing_channel_); flushed.failed()) return flushed;
         // The run the flush wrote is sealed by now, so the schema may name it.
         return save_schema_();
     }
@@ -339,22 +342,22 @@ class basic_single_collection_database {
     /** Whether any level is over the bytes its number admits, answered without excluding a writer. */
     [[nodiscard]] bool needs_compaction() const noexcept { return collection_.needs_compaction(); }
 
-    /** Merges the shallowest level that is over its bounds, reading on one lane and writing on the other. */
+    /** Merges the shallowest level that is over its bounds, reading on one channel and writing on the other. */
     expected<compaction_outcome_t> compact() noexcept {
         write_path_guard_t const held {*this};
         if (held.adopted().failed()) return held.adopted();
         lsm_tree_publication_hook_t published;
         published.notify = &record_schema_;
         published.context = this;
-        return collection_.tree().compact(writing_lane_, merging_lane_, compaction_placement_t::automatic_k, nullptr,
-                                          published);
+        return collection_.tree().compact(writing_channel_, merging_channel_, compaction_placement_t::automatic_k,
+                                          nullptr, published);
     }
 
     /** Flushes, then holds the level set the flush published together with the stamp it holds it at. */
     expected<snapshot_t> take_snapshot() noexcept {
         write_path_guard_t const held {*this};
         if (held.adopted().failed()) return held.adopted();
-        expected<typename collection_t::snapshot_t> levels = collection_.take_snapshot(writing_lane_);
+        expected<typename collection_t::snapshot_t> levels = collection_.take_snapshot(writing_channel_);
         if (!levels) return levels.status();
         return snapshot_t::of(std::move(*levels), registry_.current_stamp_());
     }
@@ -404,11 +407,11 @@ class basic_single_collection_database {
     }
 
     /** Copies the owner's blob into @p into, which must be at least as long as the blob. */
-    status_t load_user_data(io_lane_t& lane, std::span<byte_t> into) const noexcept {
+    status_t load_user_data(io_channel_t& channel, std::span<byte_t> into) const noexcept {
         expected<blob_t> const found = volume_.find(user_data_blob_name_());
         if (!found) return found.status();
         if (into.size() < found->length) return {status_code_t::invalid_argument_k, "A buffer shorter than the blob"};
-        return read_blob_(lane, *found, into.first(static_cast<std::size_t>(found->length)));
+        return read_blob_(channel, *found, into.first(static_cast<std::size_t>(found->length)));
     }
 
     /** Forgets the owner's blob, which a volume holding none reports as @c not_found_k. */
@@ -446,7 +449,7 @@ class basic_single_collection_database {
     /** Writes every staged write as one run, called by the registry under the write path it took. */
     status_t flush_collection() {
         if (write_path_adoption_.failed()) return write_path_adoption_;
-        return collection_.flush(writing_lane_);
+        return collection_.flush(writing_channel_);
     }
 
     /** Stages every change of @p changes, called by the registry under the write path it took. */
@@ -456,8 +459,8 @@ class basic_single_collection_database {
         [[maybe_unused]] st::status_t const walked = changes.stored_values.for_each([&](auto const& entry) noexcept {
             auto const& place = entry.value();
             status_t const written = place.offset == tombstone_offset_k
-                                         ? collection_.erase(writing_lane_, entry.key())
-                                         : collection_.insert(writing_lane_, entry.key(),
+                                         ? collection_.erase(writing_channel_, entry.key())
+                                         : collection_.insert(writing_channel_, entry.key(),
                                                               changed_bytes_(changes, place));
             if (written.failed() && first.succeeded()) first = written;
             return st::walk_control_t::resume_k;
@@ -499,7 +502,7 @@ class basic_single_collection_database {
         write_path_guard_t& operator=(write_path_guard_t const&) = delete;
         ~write_path_guard_t() noexcept { owner_->release_write_path_(); }
 
-        /** Whether this thread took the lanes over, which every write through them needs. */
+        /** Whether this thread took the channels over, which every write through them needs. */
         status_t adopted() const noexcept { return owner_->write_path_adoption_; }
 
       private:
@@ -513,10 +516,10 @@ class basic_single_collection_database {
 #pragma region Private Construction
 
     /** Takes what @c open assembled, and points the registry at the database it will commit into. */
-    basic_single_collection_database(volume_t& volume, io_lane_t& writing_lane, io_lane_t& merging_lane,
+    basic_single_collection_database(volume_t& volume, io_channel_t& writing_channel, io_channel_t& merging_channel,
                                      single_collection_database_config_t const& config,
                                      resources_shared_ptr_t resources, collection_t&& mounted) noexcept
-        : volume_(volume), writing_lane_(writing_lane), merging_lane_(merging_lane), config_(config),
+        : volume_(volume), writing_channel_(writing_channel), merging_channel_(merging_channel), config_(config),
           collection_(std::move(mounted)), registry_(*this, std::move(resources)) {}
 
 #pragma endregion Private Construction
@@ -544,7 +547,7 @@ class basic_single_collection_database {
     /**
      *  @brief Takes the collection for one writer, waiting while any reader or writer holds it.
      *
-     *  A lease belongs to the thread that announced itself on it, so the winner adopts both lanes
+     *  A queue pair belongs to the thread that announced itself on it, so the winner adopts both channels
      *  before it writes through them; the claim is what makes that handoff a handoff and not a share.
      */
     void acquire_write_path_() noexcept {
@@ -555,8 +558,9 @@ class basic_single_collection_database {
             expected_idle = 0;
             std::this_thread::yield();
         }
-        write_path_adoption_ = volume_.disk().adopt(writing_lane_.owner());
-        if (write_path_adoption_.succeeded()) write_path_adoption_ = volume_.disk().adopt(merging_lane_.owner());
+        write_path_adoption_ = volume_.disk().bind_queue_pair(writing_channel_.queue_pair());
+        if (write_path_adoption_.succeeded())
+            write_path_adoption_ = volume_.disk().bind_queue_pair(merging_channel_.queue_pair());
     }
 
     /** Hands the collection back to the readers and the next writer. */
@@ -609,7 +613,7 @@ class basic_single_collection_database {
         st::basic_vector<byte_t> image;
         if (image.resize(static_cast<std::size_t>(found->length)) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "No room to read the schema into"};
-        if (status_t const read = read_blob_(writing_lane_, *found, std::span<byte_t> {image}); read.failed())
+        if (status_t const read = read_blob_(writing_channel_, *found, std::span<byte_t> {image}); read.failed())
             return read;
 
         single_collection_database_schema_record_t carried;
@@ -628,7 +632,7 @@ class basic_single_collection_database {
             return {status_code_t::out_of_memory_k, "No room for the runs the schema names"};
         if (!runs.empty())
             std::memcpy(runs.data(), image.data() + sizeof(carried), runs.size() * sizeof(lsm_tree_run_record_t));
-        return collection_.tree().restore(writing_lane_, std::span<lsm_tree_run_record_t const> {runs});
+        return collection_.tree().restore(writing_channel_, std::span<lsm_tree_run_record_t const> {runs});
     }
 
     /** Names every run the tree holds in the schema blob, which every publication of a run does. */
@@ -657,21 +661,21 @@ class basic_single_collection_database {
     }
 
     /** Forgets @p name, which a volume holding no such blob reports as @c not_found_k. */
-    status_t drop_blob_(blob_name_t name) noexcept { return volume_.drop(writing_lane_, name); }
+    status_t drop_blob_(blob_name_t name) noexcept { return volume_.drop(writing_channel_, name); }
 
-    /** Writes @p bytes as the blob @p name of @p kind on the writing lane, replacing any blob of that name. */
+    /** Writes @p bytes as the blob @p name of @p kind on the writing channel, replacing any blob of that name. */
     status_t write_blob_(blob_name_t name, blob_kind_t kind, std::span<byte_t const> bytes) noexcept {
         if (volume_.names(name))
-            if (status_t const dropped = volume_.drop(writing_lane_, name); dropped.failed()) return dropped;
+            if (status_t const dropped = volume_.drop(writing_channel_, name); dropped.failed()) return dropped;
 
         expected<blob_t> const reserved = volume_.create(name, kind, bytes.size());
         if (!reserved) return reserved.status();
         if (status_t const written = fill_blob_(*reserved, bytes); written.failed()) {
-            [[maybe_unused]] status_t const abandoned = volume_.drop(writing_lane_, name);
+            [[maybe_unused]] status_t const abandoned = volume_.drop(writing_channel_, name);
             return written;
         }
-        if (status_t const sealed = volume_.seal(writing_lane_, *reserved); sealed.failed()) {
-            [[maybe_unused]] status_t const abandoned = volume_.drop(writing_lane_, name);
+        if (status_t const sealed = volume_.seal(writing_channel_, *reserved); sealed.failed()) {
+            [[maybe_unused]] status_t const abandoned = volume_.drop(writing_channel_, name);
             return sealed;
         }
         return {};
@@ -679,20 +683,21 @@ class basic_single_collection_database {
 
     /** Moves @p bytes into the range @p blob reserved, one block at a time and padded to a page. */
     status_t fill_blob_(blob_t const& blob, std::span<byte_t const> bytes) noexcept {
-        basic_write_pipeline<disk_t> writer {volume_.disk(), writing_lane_, volume_.target()};
+        basic_write_pipeline<disk_t> writer {volume_.disk(), writing_channel_, volume_.medium()};
         std::uint64_t at = 0;
         while (at != bytes.size()) {
-            expected<buffer_lease_t> block = writer.stage_or_harvest();
+            expected<pooled_buffer_t> block = writer.acquire_buffer_or_poll();
             if (!block) return block.status();
             std::uint64_t const room = rounded_down_to(block->size(), portable_alignment_k);
-            if (room == 0) return {status_code_t::capacity_exhausted_k, "A lane's block is shorter than one page"};
+            if (room == 0) return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than one page"};
 
             std::uint64_t const carried = room < bytes.size() - at ? room : bytes.size() - at;
             std::uint64_t const padded = rounded_up_to(carried, portable_alignment_k);
             std::span<byte_t> const room_bytes = block->bytes();
             std::memcpy(room_bytes.data(), bytes.data() + at, static_cast<std::size_t>(carried));
             std::memset(room_bytes.data() + carried, 0, static_cast<std::size_t>(padded - carried));
-            if (status_t const queued = writer.commit(std::move(*block), blob.slice(at, padded)); queued.failed())
+            if (status_t const queued = writer.enqueue_write(std::move(*block), blob.slice(at, padded));
+                queued.failed())
                 return queued;
             at += carried;
         }
@@ -700,38 +705,38 @@ class basic_single_collection_database {
     }
 
     /** Copies the first @c into.size() bytes of @p blob into @p into, one block at a time. */
-    status_t read_blob_(io_lane_t& lane, blob_t const& blob, std::span<byte_t> into) const noexcept {
-        std::uint64_t const chunk = rounded_down_to(lane.requests().block_bytes(), portable_alignment_k);
-        if (chunk == 0) return {status_code_t::capacity_exhausted_k, "A lane's block is shorter than one page"};
+    status_t read_blob_(io_channel_t& channel, blob_t const& blob, std::span<byte_t> into) const noexcept {
+        std::uint64_t const chunk = rounded_down_to(channel.requests().buffer_bytes(), portable_alignment_k);
+        if (chunk == 0) return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than one page"};
         std::uint64_t const wanted = rounded_up_to(into.size(), portable_alignment_k);
 
         status_t first;
-        auto sink = [&](harvested_block_t const& reaped) noexcept {
-            if (status_t const whole = require_whole(reaped); whole.failed()) {
+        auto sink = [&](completed_buffer_t const& completed) noexcept {
+            if (status_t const whole = require_completed_in_full(completed); whole.failed()) {
                 if (first.succeeded()) first = whole;
                 return;
             }
-            std::uint64_t const at = static_cast<std::uint64_t>(reaped.tag) * chunk;
+            std::uint64_t const at = static_cast<std::uint64_t>(completed.tag) * chunk;
             if (at >= into.size()) return;
             std::uint64_t const room = into.size() - at;
-            std::uint64_t const carried = reaped.bytes.size() < room ? reaped.bytes.size() : room;
-            std::memcpy(into.data() + at, reaped.bytes.data(), static_cast<std::size_t>(carried));
+            std::uint64_t const carried = completed.bytes.size() < room ? completed.bytes.size() : room;
+            std::memcpy(into.data() + at, completed.bytes.data(), static_cast<std::size_t>(carried));
         };
 
-        basic_read_pipeline<disk_t> reader {volume_.disk(), lane, volume_.target()};
+        basic_read_pipeline<disk_t> reader {volume_.disk(), channel, volume_.medium()};
         std::uint64_t at = 0;
         std::uint32_t tag = 0;
         while (at != wanted) {
-            while (at != wanted && reader.has_room()) {
+            while (at != wanted && reader.can_enqueue()) {
                 std::uint64_t const length = chunk < wanted - at ? chunk : wanted - at;
-                if (status_t const offered = reader.offer(blob.slice(at, length), tag); offered.failed())
+                if (status_t const offered = reader.enqueue_read(blob.slice(at, length), tag); offered.failed())
                     return offered;
                 at += length;
                 ++tag;
             }
-            // The offers sit staged until the lane submits them, and a harvest waits only on what it did.
-            if (status_t const flushed = reader.flush(); flushed.failed()) return flushed;
-            if (status_t const harvested = reader.harvest_all(sink); harvested.failed()) return harvested;
+            // The offers sit staged until the channel submits them, and a poll_completions waits only on what it did.
+            if (status_t const flushed = reader.submit(); flushed.failed()) return flushed;
+            if (status_t const polled = reader.poll_all_completions(sink); polled.failed()) return polled;
         }
         return first;
     }
@@ -743,11 +748,11 @@ class basic_single_collection_database {
     /** The volume every run and every blob lives on, borrowed and outliving the database. */
     volume_t& volume_;
 
-    /** The lane every write, flush and commit runs on, borrowed and outliving the database. */
-    io_lane_t& writing_lane_;
+    /** The channel every write, flush and commit runs on, borrowed and outliving the database. */
+    io_channel_t& writing_channel_;
 
-    /** The second lane a compaction writes its new runs on, borrowed and outliving the database. */
-    io_lane_t& merging_lane_;
+    /** The second channel a compaction writes its new runs on, borrowed and outliving the database. */
+    io_channel_t& merging_channel_;
 
     /** The bounds this database was opened with. */
     single_collection_database_config_t config_ {};
@@ -761,7 +766,7 @@ class basic_single_collection_database {
     /** Readers inside the collection, or minus one while a writer holds it. */
     std::int32_t mutable write_path_claim_ = 0;
 
-    /** Whether the writer holding the path took both lanes over, written only under the claim. */
+    /** Whether the writer holding the path took both channels over, written only under the claim. */
     status_t write_path_adoption_;
 
 #pragma endregion Private Members

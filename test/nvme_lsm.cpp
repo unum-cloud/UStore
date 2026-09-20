@@ -4,10 +4,10 @@
  *  @date September 19, 2026
  *  @brief The LSM level and the tree over the ring: what a flush publishes, what a merge keeps, and how deep it reads.
  *
- *  The verdicts this file exists for are @c cancelled_leaves_nothing and @c holds_its_depth. A cancelled
- *  compaction must leave the level set it was replacing live, every block of both lanes back in its pool
+ *  The results this file exists for are @c cancelled_leaves_nothing and @c holds_its_depth. A cancelled
+ *  compaction must leave the level set it was replacing live, every block of both channels back in its pool
  *  and not one byte of the volume reserved, since a merge that leaks either is worse than one that never
- *  ran. A batched read must sit at the lease's depth through the middle of a run rather than at the size
+ *  ran. A batched read must sit at the queue pair's depth through the middle of a run rather than at the size
  *  of whatever batch a caller handed it.
  */
 
@@ -30,7 +30,7 @@
 #include "nvme/lsm_level_merger.hpp" // `lsm_level_merger`, `choose_compactor`, `compaction_cancellation_t`
 #include "nvme/lsm_tree.hpp"         // `lsm_tree`, `compaction_outcome_t`
 
-#include "nvme_fixture.hpp" // `basic_fixture`, `on_transport`, `expectation_t`, `painted`
+#include "nvme_fixture.hpp" // `basic_fixture`, `run_on_transport`, `expectation_t`, `painted`
 
 #pragma region Allocation Watch
 
@@ -115,8 +115,8 @@ using namespace unum::ustore::nvme;
 
 #pragma region Shape
 
-/** The numbers every case mounts with, which are the defaults: lanes enough for a compaction to hold two at once. */
-constexpr fixture_shape_t lsm_shape_k {};
+/** The numbers every case mounts with, which are the defaults: channels enough for a compaction to hold two at once. */
+constexpr fixture_config_t lsm_config_k {};
 
 /** The bytes level zero admits before a compaction is due, kept small so a few flushes reach it. */
 constexpr std::uint64_t level_zero_bytes_k = 256ull * 1024ull;
@@ -202,12 +202,12 @@ struct batch_t {
 
 /** Flushes @p wanted onto level zero of @p tree as one run. */
 template <typename tree_type_>
-[[nodiscard]] std::size_t flush_batch(tree_type_& tree, io_lane_t& lane, std::span<expectation_t const> wanted) {
+[[nodiscard]] std::size_t flush_batch(tree_type_& tree, io_channel_t& channel, std::span<expectation_t const> wanted) {
     std::size_t failures = 0;
     batch_t batch;
     failures += build_batch(wanted, batch);
     if (failures != 0) return failures;
-    failures += expect(tree.flush(lane, std::span<variable_slot_t const> {batch.key_slots},
+    failures += expect(tree.flush(channel, std::span<variable_slot_t const> {batch.key_slots},
                                   std::span<byte_t const> {batch.values}, value_max_size_k)
                            .succeeded());
     return failures;
@@ -215,7 +215,8 @@ template <typename tree_type_>
 
 /** Reads every key of @p wanted out of @p tree and counts what it does not answer as the model says. */
 template <typename tree_type_>
-[[nodiscard]] std::size_t check_model(tree_type_ const& tree, io_lane_t& lane, std::span<expectation_t const> wanted) {
+[[nodiscard]] std::size_t check_model(tree_type_ const& tree, io_channel_t& channel,
+                                      std::span<expectation_t const> wanted) {
     std::size_t failures = 0;
     std::size_t const count = wanted.size();
     st::basic_vector<stored_key_t> keys;
@@ -240,7 +241,7 @@ template <typename tree_type_>
 
     typename tree_type_::snapshot_t const taken = tree.snapshot();
     failures += expect(
-        tree.read_values(lane, taken, std::span<stored_key_t const> {keys}, std::span<find_result_t> {results}, sink)
+        tree.read_values(channel, taken, std::span<stored_key_t const> {keys}, std::span<find_result_t> {results}, sink)
             .succeeded());
     failures += expect_eq(mismatches, std::size_t {0});
     for (std::size_t index = 0; index != count; ++index) {
@@ -258,7 +259,7 @@ template <typename tree_type_>
 
 /** Reads every value of every run of @p level back to back, which is what two compactors must agree on. */
 template <typename level_type_>
-[[nodiscard]] std::size_t collect_level_values(level_type_ const& level, io_lane_t& lane,
+[[nodiscard]] std::size_t collect_level_values(level_type_ const& level, io_channel_t& channel,
                                                st::basic_vector<byte_t>& into) {
     std::size_t failures = 0;
     for (std::size_t run = 0; run != level.size(); ++run) {
@@ -284,26 +285,26 @@ template <typename level_type_>
         auto sink = [&](std::size_t request, std::uint64_t offset, std::span<byte_t const> bytes) noexcept {
             std::memcpy(into.data() + starts[request] + offset, bytes.data(), bytes.size());
         };
-        failures += expect(source.read_values(lane, std::span<std::uint64_t const> {positions}, sink).succeeded());
+        failures += expect(source.read_values(channel, std::span<std::uint64_t const> {positions}, sink).succeeded());
     }
     return failures;
 }
 
 /** Writes @p wanted as one run of @p volume and takes it into @p level, which is how a case builds a level. */
 template <typename level_type_, typename volume_type_>
-[[nodiscard]] std::size_t adopt_batch(level_type_& level, volume_type_& volume, io_lane_t& lane,
+[[nodiscard]] std::size_t adopt_batch(level_type_& level, volume_type_& volume, io_channel_t& channel,
                                       std::span<expectation_t const> wanted) {
     using sorted_run_t = lsm_sorted_run<variable_slot_t, volume_type_>;
     std::size_t failures = 0;
     batch_t batch;
     failures += build_batch(wanted, batch);
     if (failures != 0) return failures;
-    expected<sorted_run_t> written = sorted_run_t::write(volume, lane, uuid_generator(),
+    expected<sorted_run_t> written = sorted_run_t::write(volume, channel, uuid_generator(),
                                                          std::span<variable_slot_t const> {batch.key_slots},
                                                          std::span<byte_t const> {batch.values}, value_max_size_k);
     failures += expect(written.has_value());
     if (!written) return failures;
-    failures += expect(level.adopt(std::move(*written)).succeeded());
+    failures += expect(level.bind_queue_pair(std::move(*written)).succeeded());
     return failures;
 }
 
@@ -325,10 +326,10 @@ std::size_t flush_lands_on_level_zero(mount_type_ const& mount) {
     failures += expect_status(fixture, status_code_t::success_k);
     if (!fixture) return failures;
 
-    expected<guard_t> guard = (*fixture)->lanes.checkout();
+    expected<guard_t> guard = (*fixture)->channels.acquire();
     failures += expect(guard.has_value());
     if (!guard) return failures;
-    expected<volume_t> volume = (*fixture)->mount_volume(guard->lane());
+    expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
     failures += expect(volume.has_value());
     if (!volume) return failures;
     expected<tree_t> tree = tree_t::mount(*volume, test_tree_config());
@@ -347,7 +348,7 @@ std::size_t flush_lands_on_level_zero(mount_type_ const& mount) {
         model[index] = entry;
     }
 
-    failures += flush_batch(*tree, guard->lane(), std::span<expectation_t const> {model});
+    failures += flush_batch(*tree, guard->channel(), std::span<expectation_t const> {model});
     if (failures != 0) return failures;
 
     {
@@ -357,7 +358,7 @@ std::size_t flush_lands_on_level_zero(mount_type_ const& mount) {
         failures += expect(taken.level(0).order() == lsm_level_order_t::overlapping_k);
         failures += expect_eq(taken.population_count(), static_cast<std::uint64_t>(count_k));
     }
-    failures += check_model(*tree, guard->lane(), std::span<expectation_t const> {model});
+    failures += check_model(*tree, guard->channel(), std::span<expectation_t const> {model});
 
     // Every even key is a miss, since the model only ever wrote odd ones.
     st::basic_vector<expectation_t> absent;
@@ -369,7 +370,7 @@ std::size_t flush_lands_on_level_zero(mount_type_ const& mount) {
         entry.state = select_result_t::nothing_k;
         absent[index] = entry;
     }
-    failures += check_model(*tree, guard->lane(), std::span<expectation_t const> {absent});
+    failures += check_model(*tree, guard->channel(), std::span<expectation_t const> {absent});
     return failures;
 }
 
@@ -388,10 +389,10 @@ std::size_t overlapping_runs_take_the_youngest(mount_type_ const& mount) {
     failures += expect_status(fixture, status_code_t::success_k);
     if (!fixture) return failures;
 
-    expected<guard_t> guard = (*fixture)->lanes.checkout();
+    expected<guard_t> guard = (*fixture)->channels.acquire();
     failures += expect(guard.has_value());
     if (!guard) return failures;
-    expected<volume_t> volume = (*fixture)->mount_volume(guard->lane());
+    expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
     failures += expect(volume.has_value());
     if (!volume) return failures;
     expected<tree_t> tree = tree_t::mount(*volume, test_tree_config());
@@ -421,7 +422,7 @@ std::size_t overlapping_runs_take_the_youngest(mount_type_ const& mount) {
             failures += expect(batch.push_back(expectation_t {entry}) == st::status_t::success_k);
             model[index] = entry;
         }
-        failures += flush_batch(*tree, guard->lane(), std::span<expectation_t const> {batch});
+        failures += flush_batch(*tree, guard->channel(), std::span<expectation_t const> {batch});
         if (failures != 0) return failures;
     }
 
@@ -429,7 +430,7 @@ std::size_t overlapping_runs_take_the_youngest(mount_type_ const& mount) {
         typename tree_t::snapshot_t const taken = tree->snapshot();
         failures += expect_eq(taken.level(0).size(), flushes_k);
     }
-    failures += check_model(*tree, guard->lane(), std::span<expectation_t const> {model});
+    failures += check_model(*tree, guard->channel(), std::span<expectation_t const> {model});
 
     // A merged walk of level zero reports every key once, in ascending order, at its youngest run.
     typename tree_t::snapshot_t const taken = tree->snapshot();
@@ -470,12 +471,12 @@ std::size_t compaction_drops_tombstones_at_the_bottom(mount_type_ const& mount) 
     failures += expect_status(fixture, status_code_t::success_k);
     if (!fixture) return failures;
 
-    expected<guard_t> guard = (*fixture)->lanes.checkout();
-    expected<guard_t> reading = (*fixture)->lanes.checkout();
-    expected<guard_t> writing = (*fixture)->lanes.checkout();
+    expected<guard_t> guard = (*fixture)->channels.acquire();
+    expected<guard_t> reading = (*fixture)->channels.acquire();
+    expected<guard_t> writing = (*fixture)->channels.acquire();
     failures += expect(guard.has_value() && reading.has_value() && writing.has_value());
     if (!guard || !reading || !writing) return failures;
-    expected<volume_t> volume = (*fixture)->mount_volume(guard->lane());
+    expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
     failures += expect(volume.has_value());
     if (!volume) return failures;
     expected<tree_t> tree = tree_t::mount(*volume, test_tree_config());
@@ -505,12 +506,12 @@ std::size_t compaction_drops_tombstones_at_the_bottom(mount_type_ const& mount) 
             failures += expect(batch.push_back(expectation_t {entry}) == st::status_t::success_k);
             model[index] = entry;
         }
-        failures += flush_batch(*tree, guard->lane(), std::span<expectation_t const> {batch});
+        failures += flush_batch(*tree, guard->channel(), std::span<expectation_t const> {batch});
         if (failures != 0) return failures;
     }
 
     failures += expect(tree->needs_compaction());
-    expected<compaction_outcome_t> const outcome = tree->compact(reading->lane(), writing->lane(),
+    expected<compaction_outcome_t> const outcome = tree->compact(reading->channel(), writing->channel(),
                                                                  compaction_placement_t::host_k, nullptr);
     failures += expect(outcome.has_value());
     if (!outcome) return failures;
@@ -531,7 +532,7 @@ std::size_t compaction_drops_tombstones_at_the_bottom(mount_type_ const& mount) 
             if (model[index].state != select_result_t::nothing_k) ++live_keys;
         failures += expect_eq(taken.level(1).population_count(), static_cast<std::uint64_t>(live_keys));
     }
-    failures += check_model(*tree, guard->lane(), std::span<expectation_t const> {model});
+    failures += check_model(*tree, guard->channel(), std::span<expectation_t const> {model});
     return failures;
 }
 
@@ -550,12 +551,12 @@ std::size_t intermediate_merge_keeps_tombstones(mount_type_ const& mount) {
     failures += expect_status(fixture, status_code_t::success_k);
     if (!fixture) return failures;
 
-    expected<guard_t> guard = (*fixture)->lanes.checkout();
-    expected<guard_t> reading = (*fixture)->lanes.checkout();
-    expected<guard_t> writing = (*fixture)->lanes.checkout();
+    expected<guard_t> guard = (*fixture)->channels.acquire();
+    expected<guard_t> reading = (*fixture)->channels.acquire();
+    expected<guard_t> writing = (*fixture)->channels.acquire();
     failures += expect(guard.has_value() && reading.has_value() && writing.has_value());
     if (!guard || !reading || !writing) return failures;
-    expected<volume_t> volume = (*fixture)->mount_volume(guard->lane());
+    expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
     failures += expect(volume.has_value());
     if (!volume) return failures;
 
@@ -581,8 +582,8 @@ std::size_t intermediate_merge_keeps_tombstones(mount_type_ const& mount) {
 
     // One level of two overlapping runs, merged twice with nothing changed but the depth.
     level_t upper = level_t::of(0, lsm_level_order_t::overlapping_k);
-    failures += adopt_batch(upper, *volume, guard->lane(), std::span<expectation_t const> {older});
-    failures += adopt_batch(upper, *volume, guard->lane(), std::span<expectation_t const> {newer});
+    failures += adopt_batch(upper, *volume, guard->channel(), std::span<expectation_t const> {older});
+    failures += adopt_batch(upper, *volume, guard->channel(), std::span<expectation_t const> {newer});
     if (failures != 0) return failures;
 
     typename merger_t::merge_request_t request;
@@ -593,13 +594,13 @@ std::size_t intermediate_merge_keeps_tombstones(mount_type_ const& mount) {
     request.placement = compaction_placement_t::host_k;
 
     request.depth = lsm_level_depth_t::intermediate_k;
-    expected<level_t> kept = merger_t::merge(*volume, reading->lane(), writing->lane(), request);
+    expected<level_t> kept = merger_t::merge(*volume, reading->channel(), writing->channel(), request);
     failures += expect_status(kept, status_code_t::success_k);
     if (!kept) return failures;
     failures += expect_eq(kept->population_count(), static_cast<std::uint64_t>(keys_k));
 
     request.depth = lsm_level_depth_t::bottom_k;
-    expected<level_t> dropped = merger_t::merge(*volume, reading->lane(), writing->lane(), request);
+    expected<level_t> dropped = merger_t::merge(*volume, reading->channel(), writing->channel(), request);
     failures += expect(dropped.has_value());
     if (!dropped) return failures;
     failures += expect_eq(dropped->population_count(), static_cast<std::uint64_t>(keys_k - erased_keys));
@@ -616,9 +617,9 @@ std::size_t intermediate_merge_keeps_tombstones(mount_type_ const& mount) {
         failures += expect(dropped->find(static_cast<stored_key_t>(index), position) == find_result_t::success_k);
     }
 
-    failures += expect(kept->drop(*volume, writing->lane()).succeeded());
-    failures += expect(dropped->drop(*volume, writing->lane()).succeeded());
-    failures += expect(upper.drop(*volume, writing->lane()).succeeded());
+    failures += expect(kept->drop(*volume, writing->channel()).succeeded());
+    failures += expect(dropped->drop(*volume, writing->channel()).succeeded());
+    failures += expect(upper.drop(*volume, writing->channel()).succeeded());
     return failures;
 }
 
@@ -637,12 +638,12 @@ std::size_t cancelled_compaction_leaves_nothing(mount_type_ const& mount) {
     failures += expect_status(fixture, status_code_t::success_k);
     if (!fixture) return failures;
 
-    expected<guard_t> guard = (*fixture)->lanes.checkout();
-    expected<guard_t> reading = (*fixture)->lanes.checkout();
-    expected<guard_t> writing = (*fixture)->lanes.checkout();
+    expected<guard_t> guard = (*fixture)->channels.acquire();
+    expected<guard_t> reading = (*fixture)->channels.acquire();
+    expected<guard_t> writing = (*fixture)->channels.acquire();
     failures += expect(guard.has_value() && reading.has_value() && writing.has_value());
     if (!guard || !reading || !writing) return failures;
-    expected<volume_t> volume = (*fixture)->mount_volume(guard->lane());
+    expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
     failures += expect(volume.has_value());
     if (!volume) return failures;
     expected<tree_t> tree = tree_t::mount(*volume, test_tree_config());
@@ -664,7 +665,7 @@ std::size_t cancelled_compaction_leaves_nothing(mount_type_ const& mount) {
         st::basic_vector<expectation_t> batch;
         for (std::size_t index = flush; index < keys_k; index += flushes_k)
             failures += expect(batch.push_back(expectation_t {model[index]}) == st::status_t::success_k);
-        failures += flush_batch(*tree, guard->lane(), std::span<expectation_t const> {batch});
+        failures += flush_batch(*tree, guard->channel(), std::span<expectation_t const> {batch});
         if (failures != 0) return failures;
     }
     failures += expect(tree->needs_compaction());
@@ -672,8 +673,8 @@ std::size_t cancelled_compaction_leaves_nothing(mount_type_ const& mount) {
     std::uint64_t const free_before = volume->free_bytes();
     std::size_t const reserved_before = volume->reservations();
     std::size_t const blobs_before = volume->size();
-    std::uint32_t const requests_before = reading->lane().requests().available();
-    std::uint32_t const streams_before = writing->lane().streams().available();
+    std::uint32_t const requests_before = reading->channel().requests().available_buffers();
+    std::uint32_t const streams_before = writing->channel().streams().available_buffers();
     std::uint64_t population_before = 0;
     std::size_t runs_before = 0;
     {
@@ -684,20 +685,20 @@ std::size_t cancelled_compaction_leaves_nothing(mount_type_ const& mount) {
 
     compaction_cancellation_t cancellation;
     cancellation.raise();
-    expected<compaction_outcome_t> const outcome = tree->compact(reading->lane(), writing->lane(),
+    expected<compaction_outcome_t> const outcome = tree->compact(reading->channel(), writing->channel(),
                                                                  compaction_placement_t::host_k, &cancellation);
     failures += expect(!outcome.has_value());
     failures += expect_status(outcome, status_code_t::uninitialized_k);
 
-    // Nothing the merge took is still out: no lease, no block and no reservation.
-    failures += expect_eq(reading->lane().requests().available(), requests_before);
-    failures += expect_eq(writing->lane().streams().available(), streams_before);
-    failures += expect_eq(writing->lane().requests().available(), lsm_shape_k.request_blocks);
+    // Nothing the merge took is still out: no queue pair, no block and no reservation.
+    failures += expect_eq(reading->channel().requests().available_buffers(), requests_before);
+    failures += expect_eq(writing->channel().streams().available_buffers(), streams_before);
+    failures += expect_eq(writing->channel().requests().available_buffers(), lsm_config_k.request_buffers);
     failures += expect_eq(volume->free_bytes(), free_before);
     failures += expect_eq(volume->reservations(), reserved_before);
     failures += expect_eq(volume->size(), blobs_before);
-    failures += expect_eq((*fixture)->disk.in_flight(reading->lane().owner()), std::size_t {0});
-    failures += expect_eq((*fixture)->disk.in_flight(writing->lane().owner()), std::size_t {0});
+    failures += expect_eq((*fixture)->disk.outstanding(reading->channel().queue_pair()), std::size_t {0});
+    failures += expect_eq((*fixture)->disk.outstanding(writing->channel().queue_pair()), std::size_t {0});
 
     {
         typename tree_t::snapshot_t const taken = tree->snapshot();
@@ -705,14 +706,14 @@ std::size_t cancelled_compaction_leaves_nothing(mount_type_ const& mount) {
         failures += expect_eq(taken.level(0).size(), runs_before);
         failures += expect_eq(taken.population_count(), population_before);
     }
-    failures += check_model(*tree, guard->lane(), std::span<expectation_t const> {model});
+    failures += check_model(*tree, guard->channel(), std::span<expectation_t const> {model});
 
     // The same tree still compacts once nobody is cancelling it.
-    expected<compaction_outcome_t> const again = tree->compact(reading->lane(), writing->lane(),
+    expected<compaction_outcome_t> const again = tree->compact(reading->channel(), writing->channel(),
                                                                compaction_placement_t::host_k, nullptr);
     failures += expect(again.has_value());
     if (again) failures += expect(*again == compaction_outcome_t::published_k);
-    failures += check_model(*tree, guard->lane(), std::span<expectation_t const> {model});
+    failures += check_model(*tree, guard->channel(), std::span<expectation_t const> {model});
     return failures;
 }
 
@@ -731,12 +732,12 @@ std::size_t raced_cancellation_is_all_or_nothing(mount_type_ const& mount) {
     failures += expect_status(fixture, status_code_t::success_k);
     if (!fixture) return failures;
 
-    expected<guard_t> guard = (*fixture)->lanes.checkout();
-    expected<guard_t> reading = (*fixture)->lanes.checkout();
-    expected<guard_t> writing = (*fixture)->lanes.checkout();
+    expected<guard_t> guard = (*fixture)->channels.acquire();
+    expected<guard_t> reading = (*fixture)->channels.acquire();
+    expected<guard_t> writing = (*fixture)->channels.acquire();
     failures += expect(guard.has_value() && reading.has_value() && writing.has_value());
     if (!guard || !reading || !writing) return failures;
-    expected<volume_t> volume = (*fixture)->mount_volume(guard->lane());
+    expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
     failures += expect(volume.has_value());
     if (!volume) return failures;
     expected<tree_t> tree = tree_t::mount(*volume, test_tree_config());
@@ -758,7 +759,7 @@ std::size_t raced_cancellation_is_all_or_nothing(mount_type_ const& mount) {
         st::basic_vector<expectation_t> batch;
         for (std::size_t index = flush; index < keys_k; index += flushes_k)
             failures += expect(batch.push_back(expectation_t {model[index]}) == st::status_t::success_k);
-        failures += flush_batch(*tree, guard->lane(), std::span<expectation_t const> {batch});
+        failures += flush_batch(*tree, guard->channel(), std::span<expectation_t const> {batch});
         if (failures != 0) return failures;
     }
 
@@ -775,14 +776,14 @@ std::size_t raced_cancellation_is_all_or_nothing(mount_type_ const& mount) {
         for (std::size_t spins = 0; spins != 64; ++spins) std::this_thread::yield();
         cancellation.raise();
     }};
-    expected<compaction_outcome_t> const outcome = tree->compact(reading->lane(), writing->lane(),
+    expected<compaction_outcome_t> const outcome = tree->compact(reading->channel(), writing->channel(),
                                                                  compaction_placement_t::host_k, &cancellation);
     raiser.join();
 
-    failures += expect_eq(writing->lane().streams().available(), lsm_shape_k.stream_blocks);
-    failures += expect_eq(reading->lane().requests().available(), lsm_shape_k.request_blocks);
+    failures += expect_eq(writing->channel().streams().available_buffers(), lsm_config_k.stream_buffers);
+    failures += expect_eq(reading->channel().requests().available_buffers(), lsm_config_k.request_buffers);
     failures += expect_eq(volume->reservations(), std::size_t {0});
-    failures += expect_eq((*fixture)->disk.in_flight(writing->lane().owner()), std::size_t {0});
+    failures += expect_eq((*fixture)->disk.outstanding(writing->channel().queue_pair()), std::size_t {0});
 
     typename tree_t::snapshot_t const taken = tree->snapshot();
     failures += expect_eq(taken.population_count(), population_before);
@@ -797,7 +798,7 @@ std::size_t raced_cancellation_is_all_or_nothing(mount_type_ const& mount) {
         failures += expect_eq(taken.size(), std::size_t {2});
         failures += expect(taken.level(0).empty());
     }
-    failures += check_model(*tree, guard->lane(), std::span<expectation_t const> {model});
+    failures += check_model(*tree, guard->channel(), std::span<expectation_t const> {model});
     return failures;
 }
 
@@ -828,7 +829,7 @@ std::size_t compactor_choice_follows_the_threshold() {
 
 /** A merge on the host and the same merge on a device answer the same runs, key slot for key slot. */
 template <typename mount_type_>
-verdict_t both_compactors_agree(mount_type_ const& mount) {
+case_result_t both_compactors_agree(mount_type_ const& mount) {
     using types_t = lsm_types<typename mount_type_::fixture_t>;
     using fixture_t = typename types_t::fixture_t;
     using guard_t = typename types_t::guard_t;
@@ -842,12 +843,12 @@ verdict_t both_compactors_agree(mount_type_ const& mount) {
     failures += expect_status(fixture, status_code_t::success_k);
     if (!fixture) return failures;
 
-    expected<guard_t> guard = (*fixture)->lanes.checkout();
-    expected<guard_t> reading = (*fixture)->lanes.checkout();
-    expected<guard_t> writing = (*fixture)->lanes.checkout();
+    expected<guard_t> guard = (*fixture)->channels.acquire();
+    expected<guard_t> reading = (*fixture)->channels.acquire();
+    expected<guard_t> writing = (*fixture)->channels.acquire();
     failures += expect(guard.has_value() && reading.has_value() && writing.has_value());
     if (!guard || !reading || !writing) return failures;
-    expected<volume_t> volume = (*fixture)->mount_volume(guard->lane());
+    expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
     failures += expect(volume.has_value());
     if (!volume) return failures;
 
@@ -868,8 +869,8 @@ verdict_t both_compactors_agree(mount_type_ const& mount) {
     if (failures != 0) return failures;
 
     level_t upper = level_t::of(0, lsm_level_order_t::overlapping_k);
-    failures += adopt_batch(upper, *volume, guard->lane(), std::span<expectation_t const> {older});
-    failures += adopt_batch(upper, *volume, guard->lane(), std::span<expectation_t const> {newer});
+    failures += adopt_batch(upper, *volume, guard->channel(), std::span<expectation_t const> {older});
+    failures += adopt_batch(upper, *volume, guard->channel(), std::span<expectation_t const> {newer});
     if (failures != 0) return failures;
 
     typename merger_t::merge_request_t request;
@@ -879,19 +880,19 @@ verdict_t both_compactors_agree(mount_type_ const& mount) {
     request.value_max_size = value_max_size_k;
 
     request.placement = compaction_placement_t::host_k;
-    expected<level_t> host = merger_t::merge(*volume, reading->lane(), writing->lane(), request);
+    expected<level_t> host = merger_t::merge(*volume, reading->channel(), writing->channel(), request);
     failures += expect(host.has_value());
     if (!host) return failures;
 
     request.placement = compaction_placement_t::device_k;
-    expected<level_t> device = merger_t::merge(*volume, reading->lane(), writing->lane(), request);
+    expected<level_t> device = merger_t::merge(*volume, reading->channel(), writing->channel(), request);
     if (!device) {
         bool const no_compactor = device.status() == status_code_t::unsupported_k ||
                                   device.status() == status_code_t::device_k;
         if (!no_compactor) failures += expect_status(device, status_code_t::unsupported_k);
-        failures += expect(host->drop(*volume, writing->lane()).succeeded());
-        failures += expect(upper.drop(*volume, writing->lane()).succeeded());
-        return no_compactor ? verdict_t::skipped("no device compactor", failures) : verdict_t {failures};
+        failures += expect(host->drop(*volume, writing->channel()).succeeded());
+        failures += expect(upper.drop(*volume, writing->channel()).succeeded());
+        return no_compactor ? case_result_t::skipped("no device compactor", failures) : case_result_t {failures};
     }
 
     failures += expect_eq(device->size(), host->size());
@@ -915,14 +916,14 @@ verdict_t both_compactors_agree(mount_type_ const& mount) {
     // Identical cells are not identical runs until the bytes they locate come back the same too.
     st::basic_vector<byte_t> host_values;
     st::basic_vector<byte_t> device_values;
-    failures += collect_level_values(*host, guard->lane(), host_values);
-    failures += collect_level_values(*device, guard->lane(), device_values);
+    failures += collect_level_values(*host, guard->channel(), host_values);
+    failures += collect_level_values(*device, guard->channel(), device_values);
     failures += expect_eq(device_values.size(), host_values.size());
     if (device_values.size() == host_values.size())
         failures += expect_eq(std::memcmp(host_values.data(), device_values.data(), host_values.size()), 0);
-    failures += expect(host->drop(*volume, writing->lane()).succeeded());
-    failures += expect(device->drop(*volume, writing->lane()).succeeded());
-    failures += expect(upper.drop(*volume, writing->lane()).succeeded());
+    failures += expect(host->drop(*volume, writing->channel()).succeeded());
+    failures += expect(device->drop(*volume, writing->channel()).succeeded());
+    failures += expect(upper.drop(*volume, writing->channel()).succeeded());
     return failures;
 }
 
@@ -951,12 +952,12 @@ std::size_t merge_charges_no_index_copy(mount_type_ const& mount) {
     failures += expect_status(fixture, status_code_t::success_k);
     if (!fixture) return failures;
 
-    expected<guard_t> guard = (*fixture)->lanes.checkout();
-    expected<guard_t> reading = (*fixture)->lanes.checkout();
-    expected<guard_t> writing = (*fixture)->lanes.checkout();
+    expected<guard_t> guard = (*fixture)->channels.acquire();
+    expected<guard_t> reading = (*fixture)->channels.acquire();
+    expected<guard_t> writing = (*fixture)->channels.acquire();
     failures += expect(guard.has_value() && reading.has_value() && writing.has_value());
     if (!guard || !reading || !writing) return failures;
-    expected<volume_t> volume = (*fixture)->mount_volume(guard->lane());
+    expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
     failures += expect(volume.has_value());
     if (!volume) return failures;
 
@@ -982,8 +983,8 @@ std::size_t merge_charges_no_index_copy(mount_type_ const& mount) {
     if (failures != 0) return failures;
 
     level_t upper = level_t::of(0, lsm_level_order_t::overlapping_k);
-    failures += adopt_batch(upper, *volume, guard->lane(), std::span<expectation_t const> {older});
-    failures += adopt_batch(upper, *volume, guard->lane(), std::span<expectation_t const> {newer});
+    failures += adopt_batch(upper, *volume, guard->channel(), std::span<expectation_t const> {older});
+    failures += adopt_batch(upper, *volume, guard->channel(), std::span<expectation_t const> {newer});
     if (failures != 0) return failures;
 
     // The sizes a copy of one source index, or of both back to back, would be requested at.
@@ -1003,7 +1004,7 @@ std::size_t merge_charges_no_index_copy(mount_type_ const& mount) {
     request.depth = lsm_level_depth_t::intermediate_k;
     request.value_max_size = value_max_size_k;
     request.placement = compaction_placement_t::host_k;
-    expected<level_t> merged = merger_t::merge(*volume, reading->lane(), writing->lane(), request);
+    expected<level_t> merged = merger_t::merge(*volume, reading->channel(), writing->channel(), request);
     allocation_watch_t const seen = watch;
     watch = allocation_watch_t {};
     failures += expect_status(merged, status_code_t::success_k);
@@ -1011,8 +1012,8 @@ std::size_t merge_charges_no_index_copy(mount_type_ const& mount) {
 
     failures += expect_eq(merged->population_count(), std::uint64_t {older_keys_k + newer_keys_k / 2});
     for (std::size_t index = 0; index != seen.count; ++index) failures += expect_eq(seen.hits[index], std::size_t {0});
-    failures += expect(merged->drop(*volume, writing->lane()).succeeded());
-    failures += expect(upper.drop(*volume, writing->lane()).succeeded());
+    failures += expect(merged->drop(*volume, writing->channel()).succeeded());
+    failures += expect(upper.drop(*volume, writing->channel()).succeeded());
     return failures;
 }
 
@@ -1021,7 +1022,7 @@ std::size_t merge_charges_no_index_copy(mount_type_ const& mount) {
 #pragma region Depth Cases
 
 /**
- *  @brief A batched read of many keys across several runs sits at the lease's depth through the middle.
+ *  @brief A batched read of many keys across several runs sits at the queue pair's depth through the middle.
  *
  *  The keys are spread over four level-zero runs, so what is held to the depth is a read that crosses
  *  runs rather than one run's own values read back to back.
@@ -1040,10 +1041,10 @@ std::size_t batched_read_holds_its_depth(mount_type_ const& mount) {
     failures += expect_status(fixture, status_code_t::success_k);
     if (!fixture) return failures;
 
-    expected<guard_t> guard = (*fixture)->lanes.checkout();
+    expected<guard_t> guard = (*fixture)->channels.acquire();
     failures += expect(guard.has_value());
     if (!guard) return failures;
-    expected<volume_t> volume = (*fixture)->mount_volume(guard->lane());
+    expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
     failures += expect(volume.has_value());
     if (!volume) return failures;
     expected<tree_t> tree = tree_t::mount(*volume, test_tree_config());
@@ -1065,7 +1066,7 @@ std::size_t batched_read_holds_its_depth(mount_type_ const& mount) {
         st::basic_vector<expectation_t> batch;
         for (std::size_t index = flush; index < keys_k; index += flushes_k)
             failures += expect(batch.push_back(expectation_t {model[index]}) == st::status_t::success_k);
-        failures += flush_batch(*tree, guard->lane(), std::span<expectation_t const> {batch});
+        failures += flush_batch(*tree, guard->channel(), std::span<expectation_t const> {batch});
         if (failures != 0) return failures;
     }
 
@@ -1076,12 +1077,12 @@ std::size_t batched_read_holds_its_depth(mount_type_ const& mount) {
     if (failures != 0) return failures;
     for (std::size_t index = 0; index != keys_k; ++index) keys[index] = model[index].stored_key;
 
-    // The blocks a batched read holds are counted in the pool, since the ring performs a lane's
-    // requests inside the reap that hands them to the sink.
-    std::uint32_t idlest = lsm_shape_k.request_blocks;
+    // The blocks a batched read holds are counted in the pool, since the ring performs a channel's
+    // requests inside the poll that hands them to the sink.
+    std::uint32_t idlest = lsm_config_k.request_buffers;
     std::size_t mismatches = 0;
     auto counting = [&](std::size_t request, std::uint64_t offset, std::span<byte_t const> bytes) noexcept {
-        std::uint32_t const free_blocks = guard->lane().requests().available();
+        std::uint32_t const free_blocks = guard->channel().requests().available_buffers();
         if (free_blocks < idlest) idlest = free_blocks;
         for (std::size_t index = 0; index != bytes.size(); ++index)
             if (bytes[index] != painted(model[request].seed, offset + index)) ++mismatches;
@@ -1089,11 +1090,11 @@ std::size_t batched_read_holds_its_depth(mount_type_ const& mount) {
 
     typename tree_t::snapshot_t const taken = tree->snapshot();
     failures += expect_eq(taken.level(0).size(), flushes_k);
-    failures += expect(tree->read_values(guard->lane(), taken, std::span<stored_key_t const> {keys},
+    failures += expect(tree->read_values(guard->channel(), taken, std::span<stored_key_t const> {keys},
                                          std::span<find_result_t> {results}, counting)
                            .succeeded());
     failures += expect_eq(mismatches, std::size_t {0});
-    failures += expect_eq(lsm_shape_k.request_blocks - idlest, lsm_shape_k.lease_depth);
+    failures += expect_eq(lsm_config_k.request_buffers - idlest, lsm_config_k.queue_depth);
     for (std::size_t index = 0; index != keys_k; ++index)
         failures += expect(results[index] == find_result_t::success_k);
     return failures;
@@ -1110,31 +1111,31 @@ int main(int argc, char const* argv[]) {
     if (argument_status_t const status = parse_suite_options(argc, argv, options);
         status != argument_status_t::parsed_k)
         return status == argument_status_t::help_k ? 0 : 1;
-    ledger_t ledger = options.ledger();
+    suite_totals_t totals = options.totals();
 
     st::expected<test_directory_t> const directory = test_directory_t::make(options.directory);
     if (!directory) {
         fmt::println(stderr, "  the working directory would not open");
         return 1;
     }
-    medium_t const medium = medium_t::of(options, *directory);
+    test_environment_t const environment = test_environment_t::of(options, *directory);
 
-    report(ledger, "lsm.compactor_choice", compactor_choice_follows_the_threshold());
+    report(totals, "lsm.compactor_choice", compactor_choice_follows_the_threshold());
     auto const cases = [&](auto const& mount) {
-        report(ledger, mount.label("flush_lands_on_level_zero").c_str(), flush_lands_on_level_zero(mount));
-        report(ledger, mount.label("overlapping_takes_youngest").c_str(), overlapping_runs_take_the_youngest(mount));
-        report(ledger, mount.label("drops_tombstones_at_bottom").c_str(),
+        report(totals, mount.label("flush_lands_on_level_zero").c_str(), flush_lands_on_level_zero(mount));
+        report(totals, mount.label("overlapping_takes_youngest").c_str(), overlapping_runs_take_the_youngest(mount));
+        report(totals, mount.label("drops_tombstones_at_bottom").c_str(),
                compaction_drops_tombstones_at_the_bottom(mount));
-        report(ledger, mount.label("intermediate_keeps_tombstones").c_str(),
+        report(totals, mount.label("intermediate_keeps_tombstones").c_str(),
                intermediate_merge_keeps_tombstones(mount));
-        report(ledger, mount.label("cancelled_leaves_nothing").c_str(), cancelled_compaction_leaves_nothing(mount));
-        report(ledger, mount.label("raced_cancellation").c_str(), raced_cancellation_is_all_or_nothing(mount));
-        report(ledger, mount.label("compactors_agree").c_str(), both_compactors_agree(mount));
-        report(ledger, mount.label("merge_charges_no_index_copy").c_str(), merge_charges_no_index_copy(mount));
-        report(ledger, mount.label("holds_its_depth").c_str(), batched_read_holds_its_depth(mount));
+        report(totals, mount.label("cancelled_leaves_nothing").c_str(), cancelled_compaction_leaves_nothing(mount));
+        report(totals, mount.label("raced_cancellation").c_str(), raced_cancellation_is_all_or_nothing(mount));
+        report(totals, mount.label("compactors_agree").c_str(), both_compactors_agree(mount));
+        report(totals, mount.label("merge_charges_no_index_copy").c_str(), merge_charges_no_index_copy(mount));
+        report(totals, mount.label("holds_its_depth").c_str(), batched_read_holds_its_depth(mount));
     };
     for (transport_t const transport : every_transport_k)
-        on_transport(ledger, transport, medium, lsm_shape_k, 1, "lsm", cases);
+        run_on_transport(totals, transport, environment, lsm_config_k, 1, "lsm", cases);
 
-    return conclude(ledger);
+    return suite_exit_code(totals);
 }

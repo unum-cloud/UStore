@@ -100,13 +100,13 @@ template <typename callback_>
 concept task_callback = std::is_nothrow_invocable_v<callback_&, std::size_t, std::size_t>;
 
 /** What the thread that spawns a pool does on every dispatch it makes afterwards. */
-enum class caller_role_t : std::uint8_t {
+enum class caller_exclusivity_t : std::uint8_t {
 
     /** Counts as one of the threads, runs its share of every dispatch, and is pinned like the rest. */
-    worker_k,
+    caller_inclusive_k,
 
     /** Only dispatches and waits, keeping its own affinity and adding nothing to the thread count. */
-    coordinator_k,
+    caller_exclusive_k,
 };
 
 /**
@@ -143,16 +143,17 @@ class executor_t {
      *  @param[in] threads Thread count, at least one; see @c logical_cores_count for the machine's.
      *  @param[in] role Whether the caller is one of the @p threads or only coordinates them.
      */
-    [[nodiscard]] static st::expected<executor_t> make(std::size_t threads, caller_role_t role) noexcept {
+    [[nodiscard]] static st::expected<executor_t> make(std::size_t threads, caller_exclusivity_t exclusivity) noexcept {
         executor_t executor;
         if (fu_status_t const status = fu_topology_new(&executor.topology_); status != fu_success_k)
             return status_from_(status);
         if (fu_status_t const status = fu_pool_new(pool_name_k, fu_capabilities_all_k, &executor.pool_);
             status != fu_success_k)
             return status_from_(status);
-        fu_caller_exclusivity_t const exclusivity = role == caller_role_t::worker_k ? fu_caller_inclusive_k
-                                                                                    : fu_caller_exclusive_k;
-        if (fu_status_t const status = fu_pool_spawn(executor.topology_, executor.pool_, threads, exclusivity);
+        fu_caller_exclusivity_t const spawn_exclusivity = exclusivity == caller_exclusivity_t::caller_inclusive_k
+                                                              ? fu_caller_inclusive_k
+                                                              : fu_caller_exclusive_k;
+        if (fu_status_t const status = fu_pool_spawn(executor.topology_, executor.pool_, threads, spawn_exclusivity);
             status != fu_success_k)
             return status_from_(status);
         return executor;
