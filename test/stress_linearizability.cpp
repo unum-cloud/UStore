@@ -26,8 +26,8 @@
 
 #include <ustore/ustore.hpp>
 
-#include "executor.hpp"
-#include "test.hpp"
+#include "executor.hpp" // `caller_exclusivity_t`, `executor_t`
+#include "test.hpp"     // `suite_exit_code`, `expect`, `expect_eq`
 
 using namespace unum::ustore;
 using namespace unum;
@@ -357,30 +357,28 @@ std::size_t linear_writes_mixes(linearizability_run_t& run, executor_t& executor
 }
 
 /** Runs and reports every transaction count on one pool of @p threads threads, each on a freshly opened database. */
-std::size_t linear_writes_on_threads(linearizability_run_t& run, linearizability_options_t const& options,
-                                     std::size_t threads, std::chrono::nanoseconds slice) {
-    auto maybe_executor = executor_t::make(threads);
-    std::size_t total = expect(maybe_executor);
-    if (!maybe_executor) return total;
+void linear_writes_on_threads(suite_totals_t& totals, linearizability_run_t& run,
+                              linearizability_options_t const& options, std::size_t threads,
+                              std::chrono::nanoseconds slice) {
+    auto maybe_executor = executor_t::make(threads, caller_exclusivity_t::caller_inclusive_k);
     for (std::size_t const transactions : options.transactions.view()) {
         char name[64];
         auto const written = fmt::format_to_n(name, sizeof(name) - 1, "linear_writes.threads_{}.between_{}", threads,
                                               transactions);
         *written.out = '\0';
-        std::size_t failures = reopen_run(run);
+        std::size_t failures = expect(maybe_executor);
+        if (!failures) failures += reopen_run(run);
         if (!failures) failures += linear_writes_mixes(run, *maybe_executor, options, threads, transactions, slice);
-        total += report(name, failures);
+        report(totals, name, failures);
     }
-    return total;
 }
 
 #pragma endregion Configurations
 
 int main(int argc, char** argv) {
-    std::string_view parent;
+    suite_options_t suite;
     linearizability_options_t options;
-    std::array<flag_t, 6> const flags {{
-        directory_flag(parent),
+    std::array<flag_t, 5> const flags {{
         {"--duration", "duration", "bound of the whole run, like 10s", &options.duration},
         {"--checkpoints", "count", "most replayed rounds per configuration", &options.checkpoints},
         {"--threads", "counts", "writing thread counts, like 2,4,8", &options.threads},
@@ -388,33 +386,34 @@ int main(int argc, char** argv) {
          &options.transactions},
         {"--writes-per-key", "count", "mean writes one key receives per round", &options.writes_per_key},
     }};
-    if (argument_status_t const status = parse_test_arguments(argc, argv, flags); status != argument_status_t::parsed_k)
+    if (argument_status_t const status = parse_suite_options(argc, argv, suite, flags);
+        status != argument_status_t::parsed_k)
         return status == argument_status_t::help_k ? 0 : 1;
+    suite_totals_t totals = suite.totals();
 
-    auto const maybe_directory = test_directory_t::make(parent);
+    auto const maybe_directory = test_directory_t::make(suite.directory);
     if (!maybe_directory) {
-        fmt::println(stderr, "Cannot create a unique directory under {}", parent);
+        fmt::println(stderr, "Cannot create a unique directory under {}", suite.directory);
         return 1;
     }
-    test_config_t const config {maybe_directory->path()};
+    test_config_t const config {maybe_directory->path(), suite.engine_config};
     linearizability_run_t run {config.c_str()};
     if (run.database.open(run.config).failed()) {
         fmt::println(stderr, "Cannot open the database");
         return 1;
     }
     if (!run.database.supports_transactions()) {
-        report("linear_writes", "the engine does not support transactions");
-        return 0;
+        report(totals, "linear_writes", case_result_t::skipped("the engine does not support transactions"));
+        return suite_exit_code(totals);
     }
     if (std::size_t const failures = prepare_run(run, options); failures) {
-        report("setup", failures);
-        return 1;
+        report(totals, "setup", failures);
+        return suite_exit_code(totals);
     }
 
     std::size_t const configurations_count = options.threads.size * options.transactions.size * mixes_k.size();
     std::chrono::nanoseconds const slice = options.duration / configurations_count;
-    std::size_t total = 0;
     for (std::size_t const threads : options.threads.view())
-        total += linear_writes_on_threads(run, options, threads, slice);
-    return report("total", total) ? 1 : 0;
+        linear_writes_on_threads(totals, run, options, threads, slice);
+    return suite_exit_code(totals);
 }

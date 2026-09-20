@@ -6,7 +6,7 @@
  *
  *  Every case runs against the main collection, which every engine holds, so the same suite covers the
  *  engines that refuse collections of their own. Walks run with a read-ahead smaller than the collection
- *  too, so the paging a stream does is exercised beside its single-page shape.
+ *  too, so the paging a stream does is exercised beside its single-page config.
  */
 
 #include <cstddef> // `std::size_t`
@@ -20,7 +20,7 @@
 
 #include <ustore/ustore.hpp>
 
-#include "test.hpp"
+#include "test.hpp" // `suite_exit_code`, `expect`, `expect_eq`
 
 using namespace unum::ustore;
 using namespace unum;
@@ -45,8 +45,7 @@ struct fixture_t {
     fixture_t(fixture_t const&) = delete;
     fixture_t& operator=(fixture_t const&) = delete;
 
-    explicit fixture_t(char const* directory) noexcept {
-        test_config_t const config {directory};
+    explicit fixture_t(test_config_t const& config) noexcept {
         if (status_t const opened = database.open(config.c_str()); opened.failed()) {
             fmt::println(stderr, "  failed to open the database: {}", opened.message);
             return;
@@ -93,9 +92,9 @@ struct fixture_t {
 }
 
 /** Short strings order exactly as their text, whatever byte values they carry. */
-std::size_t strings_collection_short_ordering(char const* directory) {
+std::size_t strings_collection_short_ordering(test_config_t const& config) {
     std::size_t failures = 0;
-    fixture_t fixture {directory};
+    fixture_t fixture {config};
     if (!fixture.ready()) return failures + 1;
 
     // Written out of order, including a byte above the signed range, which the key encoding must not reorder
@@ -109,9 +108,9 @@ std::size_t strings_collection_short_ordering(char const* directory) {
 }
 
 /** A walk of a prefix returns the members of the prefix, in order, and nothing else. */
-std::size_t strings_collection_prefix_walk(char const* directory) {
+std::size_t strings_collection_prefix_walk(test_config_t const& config) {
     std::size_t failures = 0;
-    fixture_t fixture {directory};
+    fixture_t fixture {config};
     if (!fixture.ready()) return failures + 1;
 
     std::array<value_view_t, 4> const texts {"user:2", "team:1", "user:10", "user:1"};
@@ -139,9 +138,9 @@ std::size_t strings_collection_prefix_walk(char const* directory) {
 }
 
 /** Strings sharing a long leading run share one bucket, and each keeps its own value. */
-std::size_t strings_collection_shared_prefix(char const* directory) {
+std::size_t strings_collection_shared_prefix(test_config_t const& config) {
     std::size_t failures = 0;
-    fixture_t fixture {directory};
+    fixture_t fixture {config};
     if (!fixture.ready()) return failures + 1;
 
     // Fifteen leading bytes in common, so the strings share a key at every key width the engine compiles with
@@ -162,9 +161,9 @@ std::size_t strings_collection_shared_prefix(char const* directory) {
 }
 
 /** The empty string and a string holding a zero byte are ordinary keys. */
-std::size_t strings_collection_empty_and_embedded_zero(char const* directory) {
+std::size_t strings_collection_empty_and_embedded_zero(test_config_t const& config) {
     std::size_t failures = 0;
-    fixture_t fixture {directory};
+    fixture_t fixture {config};
     if (!fixture.ready()) return failures + 1;
 
     constexpr std::string_view with_zero_k {"a\0b", 3};
@@ -189,9 +188,9 @@ std::size_t strings_collection_empty_and_embedded_zero(char const* directory) {
 }
 
 /** Writing a string again replaces its value, and erasing it removes the string. */
-std::size_t strings_collection_update_and_remove(char const* directory) {
+std::size_t strings_collection_update_and_remove(test_config_t const& config) {
     std::size_t failures = 0;
-    fixture_t fixture {directory};
+    fixture_t fixture {config};
     if (!fixture.ready()) return failures + 1;
 
     failures += expect(fixture.strings.assign("key", "first").succeeded());
@@ -221,9 +220,9 @@ std::size_t strings_collection_update_and_remove(char const* directory) {
 }
 
 /** A bucket grows past one entry and shrinks back, and disappears once its last string goes. */
-std::size_t strings_collection_bucket_growth(char const* directory) {
+std::size_t strings_collection_bucket_growth(test_config_t const& config) {
     std::size_t failures = 0;
-    fixture_t fixture {directory};
+    fixture_t fixture {config};
     if (!fixture.ready()) return failures + 1;
 
     constexpr std::string_view shared_k = "shared-prefix!!";
@@ -256,9 +255,9 @@ std::size_t strings_collection_bucket_growth(char const* directory) {
 }
 
 /** A page stops at its limit and repeats the string the next page resumes from. */
-std::size_t strings_collection_paged_walk(char const* directory) {
+std::size_t strings_collection_paged_walk(test_config_t const& config) {
     std::size_t failures = 0;
-    fixture_t fixture {directory};
+    fixture_t fixture {config};
     if (!fixture.ready()) return failures + 1;
 
     std::array<value_view_t, 3> const texts {"page:a", "page:b", "page:c"};
@@ -290,9 +289,9 @@ std::size_t strings_collection_paged_walk(char const* directory) {
 }
 
 /** A handle inside a transaction writes through it, and only a commit publishes the strings. */
-std::size_t strings_collection_in_transaction(char const* directory) {
+std::size_t strings_collection_in_transaction(test_config_t const& config) {
     std::size_t failures = 0;
-    fixture_t fixture {directory};
+    fixture_t fixture {config};
     if (!fixture.ready()) return failures + 1;
     if (!fixture.database.supports_transactions()) return failures;
 
@@ -310,30 +309,30 @@ std::size_t strings_collection_in_transaction(char const* directory) {
 } // namespace
 
 int main(int argc, char** argv) {
-    std::string_view parent;
-    std::array<flag_t, 1> const flags {{directory_flag(parent)}};
-    if (argument_status_t const status = parse_test_arguments(argc, argv, flags); status != argument_status_t::parsed_k)
+    suite_options_t options;
+    if (argument_status_t const status = parse_suite_options(argc, argv, options);
+        status != argument_status_t::parsed_k)
         return status == argument_status_t::help_k ? 0 : 1;
+    suite_totals_t totals = options.totals();
 
-    auto const maybe_test_directory = test_directory_t::make(parent);
+    auto const maybe_test_directory = test_directory_t::make(options.directory);
     if (!maybe_test_directory) {
-        fmt::println(stderr, "Cannot create a unique directory under {}", parent);
+        fmt::println(stderr, "Cannot create a unique directory under {}", options.directory);
         return 1;
     }
     char const* const directory = maybe_test_directory->path();
     if (directory) fmt::println("Will work in directory: {}", directory);
     else fmt::println("Will work with default configuration");
+    test_config_t const config {directory, options.engine_config};
 
-    std::size_t total = 0;
-    total += report("strings_collection.short_ordering", strings_collection_short_ordering(directory));
-    total += report("strings_collection.prefix_walk", strings_collection_prefix_walk(directory));
-    total += report("strings_collection.shared_prefix", strings_collection_shared_prefix(directory));
-    total += report("strings_collection.empty_and_embedded_zero",
-                    strings_collection_empty_and_embedded_zero(directory));
-    total += report("strings_collection.update_and_remove", strings_collection_update_and_remove(directory));
-    total += report("strings_collection.bucket_growth", strings_collection_bucket_growth(directory));
-    total += report("strings_collection.paged_walk", strings_collection_paged_walk(directory));
-    total += report("strings_collection.in_transaction", strings_collection_in_transaction(directory));
+    report(totals, "strings_collection.short_ordering", strings_collection_short_ordering(config));
+    report(totals, "strings_collection.prefix_walk", strings_collection_prefix_walk(config));
+    report(totals, "strings_collection.shared_prefix", strings_collection_shared_prefix(config));
+    report(totals, "strings_collection.empty_and_embedded_zero", strings_collection_empty_and_embedded_zero(config));
+    report(totals, "strings_collection.update_and_remove", strings_collection_update_and_remove(config));
+    report(totals, "strings_collection.bucket_growth", strings_collection_bucket_growth(config));
+    report(totals, "strings_collection.paged_walk", strings_collection_paged_walk(config));
+    report(totals, "strings_collection.in_transaction", strings_collection_in_transaction(config));
 
-    return report("total", total) ? 1 : 0;
+    return suite_exit_code(totals);
 }

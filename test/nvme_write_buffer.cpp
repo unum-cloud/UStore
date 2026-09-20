@@ -9,8 +9,8 @@
 #include <array>
 #include <limits>
 
-#include "test.hpp"
-#include "nvme/write_buffer.hpp"
+#include "test.hpp"              // `suite_exit_code`, `expect`, `expect_eq`
+#include "nvme/write_buffer.hpp" // `write_buffer`, `write_buffer_status_t`
 
 using namespace unum::ustore;
 using namespace unum::ustore::nvme;
@@ -61,7 +61,7 @@ std::size_t ensure_all_resources_are_freed() {
     std::size_t failures = 0;
     // All taken resources must be returned
     failures += expect(resources->memory_constraint.used() == 0);
-#if use_cuda_m
+#if USTORE_USE_CUDA
     failures += expect(resources->gpu_memory_constraint.used() == 0);
 #endif
     return failures;
@@ -206,11 +206,11 @@ std::size_t test_overload(options_t const& options) {
         status_t current_status = cache.mark_as_removed(stored_keys[index]);
         if (current_status != status) {
             failures += expect(status);
-            failures += expect(current_status == status_t {status_code_t::capacity_exhausted_k, "Cache is full"});
+            failures += expect_status(current_status, status_code_t::capacity_exhausted_k);
             status = status_t {status_code_t::capacity_exhausted_k, "Cache is full"};
         }
     }
-    failures += expect(status == status_t {status_code_t::capacity_exhausted_k, "Cache is full"});
+    failures += expect_status(status, status_code_t::capacity_exhausted_k);
 
     cache.unsafe_clear();
     failures += ensure_cache_is_empty(cache);
@@ -419,9 +419,11 @@ int main(int argc, char** argv) {
         {"--empty-value-step", "count", "every this many stored values is empty", &options.empty_value_step},
         {"--value-max-size", "size", "largest stored value the cache admits, like 10KiB", &options.value_max_size},
     }};
-    argument_status_t const parsed = parse_test_arguments(argc, argv, flags);
-    if (parsed == argument_status_t::help_k) return 0;
-    if (parsed != argument_status_t::parsed_k) return 1;
+    suite_options_t suite;
+    if (argument_status_t const status = parse_suite_options(argc, argv, suite, flags);
+        status != argument_status_t::parsed_k)
+        return status == argument_status_t::help_k ? 0 : 1;
+    suite_totals_t totals = suite.totals();
     if (options.empty_value_step.value == 0) {
         fmt::println(stderr, "--empty-value-step: must be positive");
         return 1;
@@ -432,23 +434,22 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-#if use_cuda_m
+#if USTORE_USE_CUDA
     resources = std::make_shared<resources_t>(40'000'000, 0);
 #else
     resources = std::make_shared<resources_t>(40'000'000);
 #endif
     prepare_initial_data(options);
 
-    std::size_t total = 0;
-    total += report("cache_initial_state", cache_initial_state(options));
-    total += report("cache_insertions", cache_insertions(options));
-    total += report("cache_removals", cache_removals(options));
-    total += report("cache_mixed_insertions_and_removals", cache_mixed_insertions_and_removals(options));
-    total += report("cache_test_overload", cache_test_overload(options));
-    total += report("cache_test_batch", cache_test_batch(options));
-    total += report("cache_test_batch_overload", cache_test_batch_overload(options));
-    total += report("cache_copy", cache_copy(options));
-    total += report("cache_move", cache_move(options));
+    report(totals, "cache_initial_state", cache_initial_state(options));
+    report(totals, "cache_insertions", cache_insertions(options));
+    report(totals, "cache_removals", cache_removals(options));
+    report(totals, "cache_mixed_insertions_and_removals", cache_mixed_insertions_and_removals(options));
+    report(totals, "cache_test_overload", cache_test_overload(options));
+    report(totals, "cache_test_batch", cache_test_batch(options));
+    report(totals, "cache_test_batch_overload", cache_test_batch_overload(options));
+    report(totals, "cache_copy", cache_copy(options));
+    report(totals, "cache_move", cache_move(options));
 
-    return report("total", total) ? 1 : 0;
+    return suite_exit_code(totals);
 }

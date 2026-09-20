@@ -15,17 +15,17 @@
 
 #include <ustore/ustore.hpp>
 
-#include "test.hpp"
+#include "test.hpp" // `suite_exit_code`, `expect`, `suite_totals_t`
 
 using namespace unum::ustore;
 using namespace unum;
 
 /** Calls every C++ wrapper in each accepted form against one database. */
-std::size_t wrappers_compile(char const* directory) {
+std::size_t wrappers_compile(test_config_t const& config) {
     std::size_t failures = 0;
-    test_config_t const config {directory};
     database_t database;
     failures += expect(database.open(config.c_str()).succeeded());
+    if (failures != 0) return failures;
 
     [[maybe_unused]] auto const main_by_value = database.main();
     blobs_collection_t main_collection = database.main();
@@ -96,18 +96,19 @@ std::size_t wrappers_compile(char const* directory) {
 }
 
 int main(int argc, char** argv) {
-    std::string_view parent;
-    std::array<flag_t, 1> const flags {{directory_flag(parent)}};
-    if (argument_status_t const status = parse_test_arguments(argc, argv, flags); status != argument_status_t::parsed_k)
+    suite_options_t options;
+    if (argument_status_t const status = parse_suite_options(argc, argv, options);
+        status != argument_status_t::parsed_k)
         return status == argument_status_t::help_k ? 0 : 1;
+    suite_totals_t totals = options.totals();
 
-    auto const maybe_directory = test_directory_t::make(parent);
+    auto const maybe_directory = test_directory_t::make(options.directory);
     if (!maybe_directory) {
-        fmt::println(stderr, "Cannot create a unique directory under {}", parent);
+        fmt::println(stderr, "Cannot create a unique directory under {}", options.directory);
         return 1;
     }
+    test_config_t const config {maybe_directory->path(), options.engine_config};
 
-    std::size_t total = 0;
-    total += report("wrappers.compile", wrappers_compile(maybe_directory->path()));
-    return report("total", total) ? 1 : 0;
+    report(totals, "wrappers.compile", wrappers_compile(config));
+    return suite_exit_code(totals);
 }

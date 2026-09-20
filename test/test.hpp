@@ -2,32 +2,37 @@
  *  @file test/test.hpp
  *  @author Ash Vardanian
  *  @date September 15, 2026
- *  @brief Shared checks for the C++ test suites: failure counting, verdicts, bounded waits, flags and directories.
+ *  @brief Shared checks for the C++ test suites: failure counting, results, the totals, bounded waits, flags and
+ *      directories.
  *
- *  Every check returns its own failure count, and counts roll up through each test function to
- *  @c main without global mutable state. Four verbs cover every case: @c expect for a condition,
- *  @c expect_eq and @c expect_near when diagnosis needs the values, and @c report for the verdict.
+ *  Every check returns its own failure count, a case returns a @c case_result_t, and @c report rolls results into
+ *  the @c suite_totals_t the suite's @c main owns, so counts reach @c suite_exit_code without global mutable state.
  */
 #pragma once
 
-#include <cerrno>     // `errno`, `EEXIST`
-#include <cmath>      // `std::fabs`, `std::fmax`
-#include <cstddef>    // `std::size_t`
-#include <cstdio>     // `stderr`, `std::remove`
-#include <cstdlib>    // `mkdtemp`
-#include <cstring>    // `std::memcpy`, `std::strlen`
+#include <cerrno>  // `errno`, `EEXIST`
+#include <cmath>   // `std::fabs`, `std::fmax`
+#include <cstddef> // `std::size_t`
+#include <cstdint> // `std::uint8_t`, `std::uint64_t`
+#include <cstdio>  // `stderr`, `std::remove`
+#include <cstdlib> // `mkdtemp`
+#include <cstring> // `std::memcpy`, `std::strlen`
+
 #include <ftw.h>      // `nftw`
 #include <sys/stat.h> // `mkdir`
 
+#include <array>       // `std::array`
+#include <random>      // `std::random_device`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
-#include <thread>      // `std::this_thread::yield`
+#include <thread>      // `std::this_thread::yield`, `std::thread::hardware_concurrency`
 
 #include <fmt/format.h>
 
 #include <smashtable/shared.hpp>
 
 #include <ustore/db.h>
+#include <ustore/status.hpp> // `status_t`, `status_code_t`, `expected`
 #include <ustore/types.hpp>
 
 #include "arguments.hpp"
@@ -62,15 +67,116 @@ inline std::size_t expect_near_(double actual, double wanted, char const* expres
     return 1;
 }
 
-/** Prints one verdict line and answers the count it was given, so a caller accumulates through it. */
-inline std::size_t report(char const* name, std::size_t failures) {
-    fmt::println("{}  {:<32} : {} failures", failures ? "FAILED" : "passed", name, failures);
-    return failures;
+/** The enumerator's own spelling of @p code, so a message names what the code says. */
+[[nodiscard]] constexpr char const* describe(status_code_t code) noexcept {
+    switch (code) {
+    case status_code_t::success_k: return "success_k";
+    case status_code_t::out_of_memory_k: return "out_of_memory_k";
+    case status_code_t::invalid_argument_k: return "invalid_argument_k";
+    case status_code_t::uninitialized_k: return "uninitialized_k";
+    case status_code_t::unsupported_k: return "unsupported_k";
+    case status_code_t::input_output_k: return "input_output_k";
+    case status_code_t::malformed_k: return "malformed_k";
+    case status_code_t::not_found_k: return "not_found_k";
+    case status_code_t::already_exists_k: return "already_exists_k";
+    case status_code_t::write_conflict_k: return "write_conflict_k";
+    case status_code_t::read_conflict_k: return "read_conflict_k";
+    case status_code_t::phantom_conflict_k: return "phantom_conflict_k";
+    case status_code_t::capacity_exhausted_k: return "capacity_exhausted_k";
+    case status_code_t::device_k: return "device_k";
+    case status_code_t::internal_k: return "internal_k";
+    }
+    return "unknown";
 }
 
-/** Prints a skipped case with its reason; a skip counts no failures. */
-inline std::size_t report(char const* name, char const* skip_reason) {
-    fmt::println("skipped  {:<32} : {}", name, skip_reason);
+/** Counts one failure when @p actual carries a code other than @p wanted, printing both with the message. */
+#define expect_status(actual, wanted) expect_status_((actual), (wanted), __FILE__, __LINE__)
+inline std::size_t expect_status_(status_t actual, status_code_t wanted, char const* file, int line) {
+    if (actual.code == wanted) return 0;
+    fmt::println(stderr, "  check failed at {}:{}: expected {}, got {}{}{}", file, line, describe(wanted),
+                 describe(actual.code), actual.message ? ": " : "", actual.message ? actual.message : "");
+    return 1;
+}
+
+/** The same check on the status an @c expected carries, so a refusal is checked without unpacking it. */
+template <typename value_type_>
+inline std::size_t expect_status_(expected<value_type_> const& actual, status_code_t wanted, char const* file,
+                                  int line) {
+    return expect_status_(actual.status(), wanted, file, line);
+}
+
+/** What one case answers: its failures, and the reason it could not run when it skipped. */
+struct case_result_t {
+
+    /** Checks that failed, which a case skipping past its gate still carries from before it. */
+    std::size_t failures = 0;
+
+    /** Why the case did not run, or null when it ran. */
+    char const* skip_reason = nullptr;
+
+    /** A result of @p counted failures, so a case answering its count reads as one. */
+    constexpr case_result_t(std::size_t counted) noexcept : failures(counted) {}
+
+    /** A result that did not run for @p reason, carrying the @p counted failures from before its gate. */
+    [[nodiscard]] static constexpr case_result_t skipped(char const* reason, std::size_t counted = 0) noexcept {
+        case_result_t result {counted};
+        result.skip_reason = reason;
+        return result;
+    }
+};
+
+/** Whether a skipped case is a tolerated absence of hardware or option, or a refused gap in coverage. */
+enum class skip_policy_t : std::uint8_t {
+    tolerated_k,
+    refused_k,
+};
+
+/** The counts one suite's @c main owns and every @c report rolls into, so nothing global accumulates. */
+struct suite_totals_t {
+
+    /** Cases that ran without a failure. */
+    std::size_t passed = 0;
+
+    /** Cases that did not run. */
+    std::size_t skipped = 0;
+
+    /** Cases with at least one failure. */
+    std::size_t failed = 0;
+
+    /** Failed checks across every case. */
+    std::size_t failures = 0;
+
+    /** The seed every random draw of the suite descends from. */
+    std::uint64_t seed = 0;
+
+    /** What a skip does to the exit code. */
+    skip_policy_t policy = skip_policy_t::tolerated_k;
+};
+
+/** Prints one result line, rolls it into @p totals, and answers its failures so a helper still accumulates. */
+inline std::size_t report(suite_totals_t& totals, char const* name, case_result_t result) {
+    totals.failures += result.failures;
+    if (result.failures != 0) {
+        ++totals.failed;
+        fmt::println("FAILED  {:<32} : {} failures", name, result.failures);
+    }
+    else if (result.skip_reason) {
+        ++totals.skipped;
+        fmt::println("skipped  {:<32} : {}", name, result.skip_reason);
+    }
+    else {
+        ++totals.passed;
+        fmt::println("passed  {:<32} : 0 failures", name);
+    }
+    return result.failures;
+}
+
+/** Prints the totals and answers the exit code: 1 on any failure, 3 on a skip the policy refuses, 0 otherwise. */
+[[nodiscard]] inline int suite_exit_code(suite_totals_t const& totals) {
+    fmt::println("total {} passed, {} skipped, {} failed, seed {}", totals.passed, totals.skipped, totals.failed,
+                 totals.seed);
+    if (totals.failures != 0) return 1;
+    if (totals.skipped != 0 && totals.policy == skip_policy_t::refused_k) return 3;
     return 0;
 }
 
@@ -92,6 +198,34 @@ inline std::size_t report(char const* name, char const* skip_reason) {
     return 0;
 }
 
+/**
+ *  @brief Bisects a memory budget between zero and @p ceiling, running @p body at every rung.
+ *
+ *  A rung may refuse only with @c out_of_memory_k, and the caller checks that nothing stays charged afterwards.
+ *  Answers the failures counted across the rungs.
+ */
+template <typename body_type_>
+[[nodiscard]] std::size_t under_bisected_budget(std::size_t ceiling, body_type_&& body) {
+    std::size_t failures = 0;
+    std::size_t refused = 0;
+    std::size_t admitted = ceiling;
+    while (refused < admitted) {
+        std::size_t const budget = refused + (admitted - refused) / 2;
+        status_t const status = body(budget);
+        if (status.succeeded()) {
+            admitted = budget;
+            continue;
+        }
+        if (status.code != status_code_t::out_of_memory_k) {
+            fmt::println(stderr, "  a budget of {} bytes failed with {}{}{}", budget, describe(status.code),
+                         status.message ? ": " : "", status.message ? status.message : "");
+            ++failures;
+        }
+        refused = budget + 1;
+    }
+    return failures;
+}
+
 /** Spin ceiling for waits on flags a peer sets within bounded work; expiry proves a broken rendezvous. */
 constexpr std::size_t spin_limit_k = std::size_t {1} << 28;
 
@@ -110,18 +244,123 @@ template <typename condition_type_>
 /** The reason a case that needs a filesystem reports when the suite ran without @c --directory. */
 constexpr char const* needs_directory_k = "needs --directory";
 
-/** The @c --directory flag every suite accepts, writing the parent it names into @p parent. */
-[[nodiscard]] inline flag_t directory_flag(std::string_view& parent) noexcept {
-    return {"--directory", "path", "parent of the unique directory the suite works in", &parent};
+/** A splitmix64 generator, seeded once per suite and forked once per thread, so every draw replays from one seed. */
+class test_random_t {
+  public:
+    explicit constexpr test_random_t(std::uint64_t seed) noexcept : state_(seed) {}
+
+    /** The next 64 random bits. */
+    constexpr std::uint64_t next() noexcept {
+        std::uint64_t mixed = (state_ += 0x9E3779B97F4A7C15ull);
+        mixed = (mixed ^ (mixed >> 30)) * 0xBF58476D1CE4E5B9ull;
+        mixed = (mixed ^ (mixed >> 27)) * 0x94D049BB133111EBull;
+        return mixed ^ (mixed >> 31);
+    }
+
+    /** A random value below @p bound. */
+    constexpr std::uint64_t below(std::uint64_t bound) noexcept { return next() % bound; }
+
+    /** The generator of the thread at @p index, which draws a stream distinct from every sibling's. */
+    [[nodiscard]] constexpr test_random_t fork(std::size_t index) const noexcept {
+        test_random_t branch {state_ + (index + 1) * 0xD1B54A32D192ED03ull};
+        return test_random_t {branch.next()};
+    }
+
+  private:
+
+    /** The advancing state. */
+    std::uint64_t state_;
+};
+
+/** The threads the machine offers, at least one. */
+[[nodiscard]] inline std::size_t hardware_threads() noexcept {
+    unsigned const offered = std::thread::hardware_concurrency();
+    return offered != 0 ? offered : 1;
 }
 
-/** Parses @p flags from @p argv, printing the usage on @c --help and the offending argument on failure. */
-[[nodiscard]] inline argument_status_t parse_test_arguments(int argc, char const* const* argv,
-                                                            std::span<flag_t const> flags) {
-    arguments_t const parsed = parse_arguments(argc, argv, flags, {});
-    if (parsed.status == argument_status_t::help_k) print_usage(argv[0], flags);
+/** A non-zero seed from the machine, for a run that asked for none. */
+[[nodiscard]] inline std::uint64_t draw_seed() {
+    std::random_device device;
+    std::uint64_t const drawn = (static_cast<std::uint64_t>(device()) << 32) | device();
+    return drawn != 0 ? drawn : 1;
+}
+
+/** The flags every suite accepts, parsed from @c argv beside the suite's own. */
+struct suite_options_t {
+
+    /** Parent of the unique directory the suite works in, empty to run without persistence. */
+    std::string_view directory;
+
+    /** The block device the storage cases open, empty to skip the cases that need one. */
+    std::string_view device;
+
+    /** The PCIe address of the NVMe device SPDK binds, empty to skip the cases that need one. */
+    std::string_view spdk_address;
+
+    /** The transports a ring suite mounts, every one when empty. */
+    texts_t transports;
+
+    /** Fields spliced into the engine's own configuration, like @c "io_transport":"uring", empty for its defaults. */
+    std::string_view engine_config;
+
+    /** The seed every random draw descends from, drawn from the machine when left zero. */
+    count_t seed;
+
+    /** Threads the concurrent cases fan out over. */
+    count_t threads {hardware_threads(), 1};
+
+    /** Whether a skipped case fails the suite. */
+    switch_t no_skips = switch_t::absent_k;
+
+    /** A totals seeded and policed by these options. */
+    [[nodiscard]] suite_totals_t totals() const noexcept {
+        suite_totals_t counts;
+        counts.seed = seed.value;
+        counts.policy = no_skips == switch_t::present_k ? skip_policy_t::refused_k : skip_policy_t::tolerated_k;
+        return counts;
+    }
+
+    /** A generator seeded by these options. */
+    [[nodiscard]] test_random_t random() const noexcept { return test_random_t {seed.value}; }
+};
+
+/** Most flags one suite adds to the shared ones. */
+constexpr std::size_t suite_flags_capacity_k = 16;
+
+/**
+ *  @brief Parses the shared flags and @p suite_flags from @p argv into @p options, drawing a seed when none was given.
+ *
+ *  Prints the usage on @c --help and the offending argument on failure. A suite flag named like a shared one
+ *  shadows it, so a suite may give @c --threads its own meaning.
+ */
+[[nodiscard]] inline argument_status_t parse_suite_options(int argc, char const* const* argv, suite_options_t& options,
+                                                           std::span<flag_t const> suite_flags = {}) {
+    if (suite_flags.size() > suite_flags_capacity_k) {
+        fmt::println(stderr, "a suite may add at most {} flags", suite_flags_capacity_k);
+        return argument_status_t::too_many_items_k;
+    }
+    std::array<flag_t, suite_flags_capacity_k + 8> flags;
+    std::size_t count = 0;
+    flags[count++] = {"--directory", "path", "parent of the unique directory the suite works in", &options.directory};
+    flags[count++] = {"--device", "path", "block device the storage cases open", &options.device};
+    flags[count++] = {"--spdk-address", "address", "PCIe address of the NVMe device SPDK binds", &options.spdk_address};
+    flags[count++] = {"--transports", "names", "transports a ring suite mounts, like ram,files,uring",
+                      &options.transports};
+    flags[count++] = {"--engine-config", "json",
+                      "fields of the engine's own configuration, like \"io_transport\":\"uring\"",
+                      &options.engine_config};
+    flags[count++] = {"--seed", "count", "seed of every random draw, drawn from the machine when absent",
+                      &options.seed};
+    flags[count++] = {"--threads", "count", "threads the concurrent cases fan out over", &options.threads};
+    flags[count++] = {"--no-skips", "", "fail the suite when a case skips", &options.no_skips};
+    for (flag_t const& flag : suite_flags) flags[count++] = flag;
+
+    std::span<flag_t const> const every_flag {flags.data(), count};
+    arguments_t const parsed = parse_arguments(argc, argv, every_flag, {});
+    if (parsed.status == argument_status_t::help_k) print_usage(argv[0], every_flag);
     else if (parsed.status != argument_status_t::parsed_k)
         fmt::println(stderr, "{}: {}", parsed.argument, describe(parsed.status));
+    if (options.seed.value == 0) options.seed.value = draw_seed();
     return parsed.status;
 }
 
@@ -149,21 +388,46 @@ struct test_path_t {
 };
 
 /** An engine configuration held inline, empty when the engine should use its defaults. */
-struct test_config_t {
+class test_config_t {
+  public:
 
-    /** The null-terminated JSON configuration, empty for the defaults. */
-    char json[path_capacity_k + 64] {};
-
-    /** Configures the engine to work in @p directory, or leaves the defaults for a null one. */
-    explicit test_config_t(char const* directory) noexcept {
-        if (!directory) return;
-        auto const written = fmt::format_to_n(json, sizeof(json) - 1, R"({{"version": "1.0", "directory": "{}"}})",
-                                              directory);
+    /** Configures the engine to work in @p directory, with @p engine_config spliced into the engine's own object. */
+    explicit test_config_t(char const* directory, std::string_view engine_config = {}) noexcept
+        : directory_(directory), engine_config_(engine_config) {
+        if (!directory && engine_config.empty()) return;
+        auto const written =
+            engine_config.empty()
+                ? fmt::format_to_n(json_, sizeof(json_) - 1, R"({{"version": "1.0", "directory": "{}"}})", directory)
+            : !directory
+                ? fmt::format_to_n(json_, sizeof(json_) - 1,
+                                   R"({{"version": "1.0", "engine": {{"config": {{"version": "1.0", {}}}}}}})",
+                                   engine_config)
+                : fmt::format_to_n(
+                      json_, sizeof(json_) - 1,
+                      R"({{"version": "1.0", "directory": "{}", "engine": {{"config": {{"version": "1.0", {}}}}}}})",
+                      directory, engine_config);
         *written.out = '\0';
     }
 
-    /** The configuration as a C string. */
-    char const* c_str() const noexcept { return json; }
+    /** The configuration as a C string, empty for the defaults. */
+    [[nodiscard]] char const* c_str() const noexcept { return json_; }
+
+    /** The directory the engine works in, or null without @c --directory. */
+    [[nodiscard]] char const* directory() const noexcept { return directory_; }
+
+    /** The fields spliced into the engine's own configuration, which a second database of a case repeats. */
+    [[nodiscard]] std::string_view engine_config() const noexcept { return engine_config_; }
+
+  private:
+
+    /** The null-terminated JSON configuration, empty for the defaults. */
+    char json_[path_capacity_k + 256] {};
+
+    /** The directory the engine works in, or null. */
+    char const* directory_ = nullptr;
+
+    /** The fields spliced into the engine's own configuration. */
+    std::string_view engine_config_;
 };
 
 /** Removes one entry of a depth-first walk. */

@@ -1,30 +1,36 @@
 # Tests
 
-UStore's suites carry no framework: every check in `test/test.hpp` returns its failure count, counts roll up through each case to `main`, and the process exit code is the verdict.
+UStore's suites carry no framework: every check in `test/test.hpp` returns its failure count, counts roll up through each case to `main`, and the process exit code is the result.
 A suite prints one `passed`, `FAILED` or `skipped` line per case and a `total` line last.
 
 ```cpp
-std::size_t database_scan(char const* directory) {
+case_result_t database_scan(char const* directory) {
     std::size_t failures = 0;
     failures += expect(database.open(config.c_str()));
-    failures += expect_eq(keys_found, 3u);
+    failures += expect_status(database.remove(missing), status_code_t::not_found_k);
+    if (!database.supports_snapshots()) return case_result_t::skipped("the engine keeps no snapshots", failures);
     return failures;
 }
 
 int main(int argc, char** argv) {
-    std::size_t total = 0;
-    total += report("database.scan", database_scan(directory));
-    return report("total", total) ? 1 : 0;
+    suite_options_t options;
+    if (argument_status_t const status = parse_suite_options(argc, argv, options); status != argument_status_t::parsed_k)
+        return status == argument_status_t::help_k ? 0 : 1;
+    suite_totals_t totals = options.totals();
+    report(totals, "database.scan", database_scan(options.directory));
+    return suite_exit_code(totals);
 }
 ```
 
-`expect` checks a condition, `expect_eq` and `expect_near` print both values when they differ, and `report` prints the verdict and passes the count through.
+`expect` checks a condition, `expect_eq` and `expect_near` print both values when they differ, and `expect_status` prints the expected and the actual status with its message.
+`report` prints the result and rolls it into the totals, and `suite_exit_code` prints `total N passed, M skipped, K failed, seed S` and answers the exit code: 1 on a failure, 3 on a skip under `--no-skips`.
+A skip names the reason a case did not run, so a suite passing on nothing is visible in its summary.
 
 ## Suites
 
 - __Conformance__ — `units.cpp`, `api.cpp`, `compilation.cpp`, `strings.cpp` and `strings_collection.cpp` check the C ABI and its C++ wrappers, identically on every engine.
 - __Tools__ — `tools.cpp` checks dataset imports and exports, and the CLI against a real directory.
-- __Components__ — `lsm_*.cpp` check the on-disk engine's parts below the C ABI.
+- __Components__ — `nvme_*.cpp` and `nvme_*.cu` check the NVMe engine's parts below the C ABI, each on every transport the machine offers.
 - __Stress__ — `stress_atomicity.cpp` and `stress_linearizability.cpp` check atomicity and linearizability under concurrent transactions.
 - __Python__ — the Python suites check the `ustore.lib` extension and its graph and table views, parametrized over batch shapes, views and isolation levels, and gated on what the linked engine supports; NetworkX and pandas serve as oracles for the views.
 
@@ -37,17 +43,21 @@ Each suite asks the open database through `ustore_get_metadata` whether it suppo
 
 ### Components
 
-Only `compaction.cu` builds today, with `USTORE_BUILD_CUDA`; the other sources wait for the NVMe engine to build.
+The engine suites share `nvme_fixture.hpp`: one shape per suite, one mount per transport, and a driver that runs every case on memory, on files through the blocking floor and through io_uring, and on a block device.
+A transport the machine does not offer skips with its reason, and a transport the flags claim that then fails to mount fails the suite.
+Every result line reads `<suite>.<transport>.<case>`.
 
-- `street.cpp`, `building.cpp` — streets of buildings: construction, lookups, scans, copies and moves.
-- `write_cache.cpp` — adding, removing, merging, copying and moving citizens in the write cache.
-- `city.cu`, `country.cu` — citizens in cities and countries, with exports, imports and compaction.
-- `compaction.cu` — host and GPU compaction against a reference merge and against each other.
-- `region.cu`, `planet.cu` — point and batch access, scans, snapshots, backups and transfers.
-- `region_transaction.cu`, `planet_transaction.cu` — transactions over one region and across the countries of a planet.
-- `region_stress.cu`, `region_transaction_stress.cu` — concurrent reads, writes and transactions on a region, replayed in commit order.
-- `disk_ram.cpp`, `filesystem.cpp` — the RAM-backed disk and files written through the disk router.
-- `graph_gdb*.cpp`, `graph_ukv_graph.cpp` — the persistent graph database and the graph C ABI above it.
+- `nvme_ring.cpp`, `nvme_uring.cpp`, `nvme_spdk.cpp` — the ring contract of `nvme_ring_cases.hpp` on the RAM and blocking transports, on io_uring with what only a kernel queue can get wrong, and on SPDK.
+- `nvme_channels.cpp` — the registered arena, the blocks channels queue pair out of it, and the pipelines that keep a ring at depth.
+- `nvme_volume.cpp` — the catalog of two slots, the crashes it survives, and the router above it.
+- `nvme_catalog.cpp` — the catalog records and the schema blobs a database persists.
+- `nvme_sorted_run.cpp` — one sorted run: round trips of every layout, truncation, lookups and read depth.
+- `nvme_lsm.cpp` — the LSM level and the tree: what a flush publishes, what a merge keeps, and what a cancelled compaction leaves.
+- `nvme_collection.cpp` — one collection over a tree: the write buffer, the value cache, snapshots and scans.
+- `nvme_single_collection_database.cpp`, `nvme_single_collection_database_transaction.cu`, `nvme_single_collection_database_stress.cu`, `nvme_single_collection_database_transaction_stress.cu` — a database of one collection, its transactions, and both under concurrent load.
+- `nvme_database.cpp`, `nvme_database_transaction.cu`, `nvme_transactions.cpp` — named collections over a router, and the transactions across them.
+- `nvme_graph.cpp` — a graph over two databases: what a walk sees and what a commit shows.
+- `nvme_compaction.cu` — host and GPU compaction against a reference merge and against each other.
 
 ## Building
 
@@ -68,14 +78,21 @@ Executables land in `build_debug/build/bin/`.
 
 Every suite takes its inputs as flags and reads no environment variable, and `--help` prints the flags it accepts.
 
-| Flag                 | Suites      | Meaning                                                                 |
-| :------------------- | :---------- | :---------------------------------------------------------------------- |
-| `--directory <path>` | Every suite | Parent of the unique directory the suite works in, created when missing |
-| `--cli <path>`       | `tools.cpp` | The CLI executable the CLI round trip drives                            |
+| Flag                       | Suites        | Meaning                                                                 |
+| :------------------------- | :------------ | :---------------------------------------------------------------------- |
+| `--directory <path>`       | Every suite   | Parent of the unique directory the suite works in, created when missing |
+| `--device <path>`          | Engine suites | Block device the `device` transport opens, skipped when absent          |
+| `--spdk-address <address>` | Engine suites | PCIe address of the NVMe device SPDK binds, skipped when absent         |
+| `--transports <names>`     | Engine suites | Transports to mount, like `ram,files,uring`, every one when absent      |
+| `--threads <count>`        | Every suite   | Threads the concurrent cases fan out over, every core when absent       |
+| `--cli <path>`             | `tools.cpp`   | The CLI executable the CLI round trip drives                            |
+| `--seed <number>`          | Every suite   | The seed every random draw descends from, drawn and printed when absent |
+| `--no-skips`               | Every suite   | Exit with code 3 when any case skipped, for a rig that must be present  |
 
 With `--directory`, a suite creates a unique `ustore-XXXXXX` directory under the path, runs every case inside it, and removes it with its contents at exit, so parallel runs never share a database.
 Without it, the engine runs on its default configuration, and the cases that need persistence or files report `skipped`.
 Without `--cli`, the tools suite reports its CLI case `skipped`.
+Without `--device`, the engine suites skip the `device` transport, and `scripts/rigs/nvmet_loop.sh up` hands out a RAM-backed NVMe namespace to pass to it.
 CTest passes `--directory` as `test_data` inside the build directory, and the tools suite additionally gets `--cli` with the CLI built for the same engine.
 
 ```sh

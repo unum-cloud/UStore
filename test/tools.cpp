@@ -5,11 +5,12 @@
  *  @brief Tests importing and exporting documents and graph edges through NDJSON and CSV files, and the CLI on top.
  */
 
-#include <cstddef>    // `std::size_t`
-#include <cstdint>    // `std::int64_t`
-#include <cstdio>     // `stderr`
-#include <cstdlib>    // `std::free`
-#include <cstring>    // `std::strcmp`
+#include <cstddef> // `std::size_t`
+#include <cstdint> // `std::int64_t`
+#include <cstdio>  // `stderr`
+#include <cstdlib> // `std::free`
+#include <cstring> // `std::strcmp`
+
 #include <fcntl.h>    // `open`
 #include <sys/stat.h> // `fstat`
 #include <sys/wait.h> // `waitpid`
@@ -34,7 +35,7 @@
 #include <ustore/strings.h>
 
 #include "dataset.h"
-#include "test.hpp"
+#include "test.hpp" // `suite_exit_code`, `create_directories`, `expect`
 
 namespace unum::ustore {
 
@@ -225,9 +226,8 @@ class test_database_t {
         if (database_) ustore_database_free(database_);
     }
 
-    /** Opens the database in @p directory and answers whether it opened. */
-    [[nodiscard]] bool open(char const* directory) noexcept {
-        test_config_t const config {directory};
+    /** Opens the database @p config describes and answers whether it opened. */
+    [[nodiscard]] bool open(test_config_t const& config) noexcept {
         ustore_error_t error {};
         ustore_database_init_t opening {};
         opening.config = config.c_str();
@@ -477,9 +477,10 @@ struct edge_row_t {
 #pragma region Round Trips
 
 /** Imports edges from @p input, exports them to @p output, and checks the export holds exactly the fixture edges. */
-[[nodiscard]] std::size_t graph_round_trip(char const* directory, char const* input, char const* output) noexcept {
+[[nodiscard]] std::size_t graph_round_trip(test_config_t const& config, char const* input,
+                                           char const* output) noexcept {
     test_database_t database;
-    if (!database.open(directory)) return 1;
+    if (!database.open(config)) return 1;
     database.clear();
 
     std::size_t failures = 0;
@@ -515,10 +516,10 @@ struct edge_row_t {
 }
 
 /** Imports documents from @p input, exports them to @p output, and checks the rows or fields @p selection keeps. */
-[[nodiscard]] std::size_t documents_round_trip(char const* directory, char const* input, char const* output,
+[[nodiscard]] std::size_t documents_round_trip(test_config_t const& config, char const* input, char const* output,
                                                field_selection_t selection) noexcept {
     test_database_t database;
-    if (!database.open(directory)) return 1;
+    if (!database.open(config)) return 1;
     database.clear();
 
     std::span<ustore_str_view_t const> const fields = is_csv(input)
@@ -564,9 +565,9 @@ struct edge_row_t {
 #pragma region Invalid Tasks
 
 /** Graph import rejects a task without a path, source, target or database, and accepts one without edges. */
-[[nodiscard]] std::size_t graph_import_rejects_invalid_tasks(char const* directory, char const* input) noexcept {
+[[nodiscard]] std::size_t graph_import_rejects_invalid_tasks(test_config_t const& config, char const* input) noexcept {
     test_database_t database;
-    if (!database.open(directory)) return 1;
+    if (!database.open(config)) return 1;
     database.clear();
 
     std::size_t failures = 0;
@@ -611,9 +612,9 @@ struct edge_row_t {
 }
 
 /** Graph export rejects a task without a path, source, target or database, or with a pointer field. */
-[[nodiscard]] std::size_t graph_export_rejects_invalid_tasks(char const* directory, char const* output) noexcept {
+[[nodiscard]] std::size_t graph_export_rejects_invalid_tasks(test_config_t const& config, char const* output) noexcept {
     test_database_t database;
-    if (!database.open(directory)) return 1;
+    if (!database.open(config)) return 1;
     database.clear();
 
     std::size_t failures = 0;
@@ -663,9 +664,9 @@ struct edge_row_t {
 }
 
 /** Document import rejects a task without a path, fields, stride, database or an identifier among the fields. */
-[[nodiscard]] std::size_t docs_import_rejects_invalid_tasks(char const* directory, char const* input) noexcept {
+[[nodiscard]] std::size_t docs_import_rejects_invalid_tasks(test_config_t const& config, char const* input) noexcept {
     test_database_t database;
-    if (!database.open(directory)) return 1;
+    if (!database.open(config)) return 1;
     database.clear();
 
     std::size_t failures = 0;
@@ -716,9 +717,9 @@ struct edge_row_t {
 }
 
 /** Document export rejects a task without a path, fields, stride or database, or with an unknown format. */
-[[nodiscard]] std::size_t docs_export_rejects_invalid_tasks(char const* directory, char const* output) noexcept {
+[[nodiscard]] std::size_t docs_export_rejects_invalid_tasks(test_config_t const& config, char const* output) noexcept {
     test_database_t database;
-    if (!database.open(directory)) return 1;
+    if (!database.open(config)) return 1;
     database.clear();
 
     std::size_t failures = 0;
@@ -753,7 +754,7 @@ struct edge_row_t {
     ustore_docs_export(&without_stride);
     failures += expect_error(error);
 
-    test_path_t const unknown_format_output {directory, exported_parquet_k};
+    test_path_t const unknown_format_output {config.directory(), exported_parquet_k};
     ustore_docs_export_t with_unknown_format = valid;
     with_unknown_format.path = unknown_format_output.c_str();
     ustore_docs_export(&with_unknown_format);
@@ -787,7 +788,8 @@ template <typename... arguments_type_>
 }
 
 /** Creates, imports into, exports and drops a named collection, then imports and exports the main one. */
-[[nodiscard]] std::size_t cli_round_trip(fixture_paths_t const& paths, char const* cli) noexcept {
+[[nodiscard]] std::size_t cli_round_trip(fixture_paths_t const& paths, test_config_t const& config,
+                                         char const* cli) noexcept {
     std::size_t failures = 0;
     char const* const directory = paths.directory;
     char const* const collection = "collection1";
@@ -796,7 +798,7 @@ template <typename... arguments_type_>
     bool supports_collections = false;
     {
         test_database_t database;
-        failures += expect(database.open(directory));
+        failures += expect(database.open(config));
         supports_collections = database.supports_collections();
     }
 
@@ -805,7 +807,7 @@ template <typename... arguments_type_>
             run_command(cli, "--directory", directory, "collection", "create", "--collection", collection), 0);
         {
             test_database_t database;
-            failures += expect(database.open(directory) && lists_collection(database.get(), collection));
+            failures += expect(database.open(config) && lists_collection(database.get(), collection));
         }
 
         failures += expect_eq(run_command(cli, "--directory", directory, "collection", "import", "--input", input,
@@ -821,7 +823,7 @@ template <typename... arguments_type_>
             run_command(cli, "--directory", directory, "collection", "drop", "--collection", collection), 0);
         {
             test_database_t database;
-            failures += expect(database.open(directory) && !lists_collection(database.get(), collection));
+            failures += expect(database.open(config) && !lists_collection(database.get(), collection));
         }
     }
 
@@ -838,10 +840,14 @@ template <typename... arguments_type_>
 
 #pragma endregion CLI
 
-/** Runs every case against the fixtures written under @p directory, and the CLI at @p cli unless it is empty. */
-[[nodiscard]] std::size_t run_cases(char const* directory, std::string_view cli) noexcept {
-    fixture_paths_t const paths {directory};
-    if (!write_fixtures(paths)) return report("tools.fixtures", 1);
+/** Runs every case against the fixtures written under the directory of @p config, and the CLI at @p cli unless it is
+ *  empty. */
+void run_cases(suite_totals_t& totals, test_config_t const& config, std::string_view cli) noexcept {
+    fixture_paths_t const paths {config.directory()};
+    if (!write_fixtures(paths)) {
+        report(totals, "tools.fixtures", 1);
+        return;
+    }
 
     char const* const documents_ndjson = paths.documents_ndjson.c_str();
     char const* const documents_csv = paths.documents_csv.c_str();
@@ -850,62 +856,64 @@ template <typename... arguments_type_>
     char const* const exported_ndjson = paths.exported_ndjson.c_str();
     char const* const exported_csv = paths.exported_csv.c_str();
 
-    std::size_t total = 0;
-    total += report("graph.ndjson_to_ndjson", graph_round_trip(directory, edges_ndjson, exported_ndjson));
-    total += report("graph.ndjson_to_csv", graph_round_trip(directory, edges_ndjson, exported_csv));
-    total += report("graph.csv_to_ndjson", graph_round_trip(directory, edges_csv, exported_ndjson));
-    total += report("graph.csv_to_csv", graph_round_trip(directory, edges_csv, exported_csv));
+    report(totals, "graph.ndjson_to_ndjson", graph_round_trip(config, edges_ndjson, exported_ndjson));
+    report(totals, "graph.ndjson_to_csv", graph_round_trip(config, edges_ndjson, exported_csv));
+    report(totals, "graph.csv_to_ndjson", graph_round_trip(config, edges_csv, exported_ndjson));
+    report(totals, "graph.csv_to_csv", graph_round_trip(config, edges_csv, exported_csv));
 
     field_selection_t const whole = field_selection_t::whole_k;
     field_selection_t const selected = field_selection_t::selected_k;
-    total += report("docs.whole.ndjson_to_ndjson",
-                    documents_round_trip(directory, documents_ndjson, exported_ndjson, whole));
-    total += report("docs.whole.ndjson_to_csv", documents_round_trip(directory, documents_ndjson, exported_csv, whole));
-    total += report("docs.whole.csv_to_ndjson", documents_round_trip(directory, documents_csv, exported_ndjson, whole));
-    total += report("docs.whole.csv_to_csv", documents_round_trip(directory, documents_csv, exported_csv, whole));
-    total += report("docs.selected.ndjson_to_ndjson",
-                    documents_round_trip(directory, documents_ndjson, exported_ndjson, selected));
-    total += report("docs.selected.ndjson_to_csv",
-                    documents_round_trip(directory, documents_ndjson, exported_csv, selected));
-    total += report("docs.selected.csv_to_ndjson",
-                    documents_round_trip(directory, documents_csv, exported_ndjson, selected));
-    total += report("docs.selected.csv_to_csv", documents_round_trip(directory, documents_csv, exported_csv, selected));
+    report(totals, "docs.whole.ndjson_to_ndjson",
+           documents_round_trip(config, documents_ndjson, exported_ndjson, whole));
+    report(totals, "docs.whole.ndjson_to_csv", documents_round_trip(config, documents_ndjson, exported_csv, whole));
+    report(totals, "docs.whole.csv_to_ndjson", documents_round_trip(config, documents_csv, exported_ndjson, whole));
+    report(totals, "docs.whole.csv_to_csv", documents_round_trip(config, documents_csv, exported_csv, whole));
+    report(totals, "docs.selected.ndjson_to_ndjson",
+           documents_round_trip(config, documents_ndjson, exported_ndjson, selected));
+    report(totals, "docs.selected.ndjson_to_csv",
+           documents_round_trip(config, documents_ndjson, exported_csv, selected));
+    report(totals, "docs.selected.csv_to_ndjson",
+           documents_round_trip(config, documents_csv, exported_ndjson, selected));
+    report(totals, "docs.selected.csv_to_csv", documents_round_trip(config, documents_csv, exported_csv, selected));
 
-    total += report("invalid.graph_import.ndjson", graph_import_rejects_invalid_tasks(directory, edges_ndjson));
-    total += report("invalid.graph_import.csv", graph_import_rejects_invalid_tasks(directory, edges_csv));
-    total += report("invalid.graph_export.ndjson", graph_export_rejects_invalid_tasks(directory, exported_ndjson));
-    total += report("invalid.graph_export.csv", graph_export_rejects_invalid_tasks(directory, exported_csv));
-    total += report("invalid.docs_import.ndjson", docs_import_rejects_invalid_tasks(directory, documents_ndjson));
-    total += report("invalid.docs_import.csv", docs_import_rejects_invalid_tasks(directory, documents_csv));
-    total += report("invalid.docs_export.ndjson", docs_export_rejects_invalid_tasks(directory, exported_ndjson));
-    total += report("invalid.docs_export.csv", docs_export_rejects_invalid_tasks(directory, exported_csv));
+    report(totals, "invalid.graph_import.ndjson", graph_import_rejects_invalid_tasks(config, edges_ndjson));
+    report(totals, "invalid.graph_import.csv", graph_import_rejects_invalid_tasks(config, edges_csv));
+    report(totals, "invalid.graph_export.ndjson", graph_export_rejects_invalid_tasks(config, exported_ndjson));
+    report(totals, "invalid.graph_export.csv", graph_export_rejects_invalid_tasks(config, exported_csv));
+    report(totals, "invalid.docs_import.ndjson", docs_import_rejects_invalid_tasks(config, documents_ndjson));
+    report(totals, "invalid.docs_import.csv", docs_import_rejects_invalid_tasks(config, documents_csv));
+    report(totals, "invalid.docs_export.ndjson", docs_export_rejects_invalid_tasks(config, exported_ndjson));
+    report(totals, "invalid.docs_export.csv", docs_export_rejects_invalid_tasks(config, exported_csv));
 
     // The CLI path views into `argv`, so it ends in a null terminator
-    total += cli.empty() ? report("tools.cli", "needs --cli") : report("tools.cli", cli_round_trip(paths, cli.data()));
-    return total;
+    report(totals, "tools.cli",
+           cli.empty() ? case_result_t::skipped("needs --cli")
+                       : case_result_t {cli_round_trip(paths, config, cli.data())});
 }
 
 } // namespace unum::ustore
 
 int main(int argc, char** argv) {
     using namespace unum::ustore;
-    std::string_view parent;
+    suite_options_t options;
     std::string_view cli;
-    std::array<flag_t, 2> const flags {{
-        directory_flag(parent),
+    std::array<flag_t, 1> const flags {{
         {"--cli", "path", "the CLI executable its case runs, skipped without it", &cli},
     }};
-    if (argument_status_t const status = parse_test_arguments(argc, argv, flags); status != argument_status_t::parsed_k)
+    if (argument_status_t const status = parse_suite_options(argc, argv, options, flags);
+        status != argument_status_t::parsed_k)
         return status == argument_status_t::help_k ? 0 : 1;
+    suite_totals_t totals = options.totals();
 
-    auto const maybe_directory = test_directory_t::make(parent);
+    auto const maybe_directory = test_directory_t::make(options.directory);
     if (!maybe_directory) {
-        fmt::println(stderr, "Cannot create a unique directory under {}", parent);
+        fmt::println(stderr, "Cannot create a unique directory under {}", options.directory);
         return 1;
     }
     char const* const directory = maybe_directory->path();
+    test_config_t const config {directory, options.engine_config};
 
-    std::size_t total = 0;
-    total += directory ? run_cases(directory, cli) : report("tools", needs_directory_k);
-    return report("total", total) ? 1 : 0;
+    if (directory) run_cases(totals, config, cli);
+    else report(totals, "tools", case_result_t::skipped(needs_directory_k));
+    return suite_exit_code(totals);
 }

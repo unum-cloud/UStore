@@ -21,7 +21,7 @@
 
 #include <ustore/ustore.h>
 
-#include "test.hpp"
+#include "test.hpp" // `suite_exit_code`, `expect`, `expect_eq`
 
 using namespace unum::ustore;
 using namespace unum;
@@ -226,8 +226,7 @@ struct fixture_t {
     fixture_t(fixture_t const&) = delete;
     fixture_t& operator=(fixture_t const&) = delete;
 
-    explicit fixture_t(char const* directory) noexcept {
-        test_config_t const config {directory};
+    explicit fixture_t(test_config_t const& config) noexcept {
         ustore_error_t error {};
         ustore_database_init_t init {};
         init.config = config.c_str();
@@ -244,9 +243,9 @@ struct fixture_t {
 };
 
 /** Short strings order exactly as their text, whatever byte values they carry. */
-std::size_t strings_short_ordering(char const* directory) {
+std::size_t strings_short_ordering(test_config_t const& config) {
     std::size_t failures = 0;
-    fixture_t fixture {directory};
+    fixture_t fixture {config};
     if (!fixture.database) return failures + 1;
     failures += clear_database(fixture.database);
 
@@ -262,9 +261,9 @@ std::size_t strings_short_ordering(char const* directory) {
 }
 
 /** A prefix scan returns the members of the prefix, in order, and nothing else. */
-std::size_t strings_prefix_scan(char const* directory) {
+std::size_t strings_prefix_scan(test_config_t const& config) {
     std::size_t failures = 0;
-    fixture_t fixture {directory};
+    fixture_t fixture {config};
     if (!fixture.database) return failures + 1;
     failures += clear_database(fixture.database);
 
@@ -287,9 +286,9 @@ std::size_t strings_prefix_scan(char const* directory) {
 }
 
 /** Strings sharing a long leading run share one bucket, and each keeps its own value. */
-std::size_t strings_shared_prefix(char const* directory) {
+std::size_t strings_shared_prefix(test_config_t const& config) {
     std::size_t failures = 0;
-    fixture_t fixture {directory};
+    fixture_t fixture {config};
     if (!fixture.database) return failures + 1;
     failures += clear_database(fixture.database);
 
@@ -316,9 +315,9 @@ std::size_t strings_shared_prefix(char const* directory) {
 }
 
 /** The empty string and a string holding a zero byte are ordinary keys. */
-std::size_t strings_empty_and_embedded_zero(char const* directory) {
+std::size_t strings_empty_and_embedded_zero(test_config_t const& config) {
     std::size_t failures = 0;
-    fixture_t fixture {directory};
+    fixture_t fixture {config};
     if (!fixture.database) return failures + 1;
     failures += clear_database(fixture.database);
 
@@ -347,9 +346,9 @@ std::size_t strings_empty_and_embedded_zero(char const* directory) {
 }
 
 /** Writing a string again replaces its value, and a task without one removes it. */
-std::size_t strings_update_and_remove(char const* directory) {
+std::size_t strings_update_and_remove(test_config_t const& config) {
     std::size_t failures = 0;
-    fixture_t fixture {directory};
+    fixture_t fixture {config};
     if (!fixture.database) return failures + 1;
     failures += clear_database(fixture.database);
 
@@ -381,9 +380,9 @@ std::size_t strings_update_and_remove(char const* directory) {
 }
 
 /** A bucket grows past one entry and shrinks back, and disappears once its last string goes. */
-std::size_t strings_bucket_growth(char const* directory) {
+std::size_t strings_bucket_growth(test_config_t const& config) {
     std::size_t failures = 0;
-    fixture_t fixture {directory};
+    fixture_t fixture {config};
     if (!fixture.database) return failures + 1;
     failures += clear_database(fixture.database);
 
@@ -421,9 +420,9 @@ std::size_t strings_bucket_growth(char const* directory) {
 }
 
 /** A batch touching one bucket many times keeps only the last write of every string. */
-std::size_t strings_batched_bucket(char const* directory) {
+std::size_t strings_batched_bucket(test_config_t const& config) {
     std::size_t failures = 0;
-    fixture_t fixture {directory};
+    fixture_t fixture {config};
     if (!fixture.database) return failures + 1;
     failures += clear_database(fixture.database);
 
@@ -448,9 +447,9 @@ std::size_t strings_batched_bucket(char const* directory) {
 }
 
 /** A scan stops at its limit and resumes from the string it is given. */
-std::size_t strings_scan_pagination(char const* directory) {
+std::size_t strings_scan_pagination(test_config_t const& config) {
     std::size_t failures = 0;
-    fixture_t fixture {directory};
+    fixture_t fixture {config};
     if (!fixture.database) return failures + 1;
     failures += clear_database(fixture.database);
 
@@ -503,29 +502,30 @@ std::size_t strings_scan_pagination(char const* directory) {
 } // namespace
 
 int main(int argc, char** argv) {
-    std::string_view parent;
-    std::array<flag_t, 1> const flags {{directory_flag(parent)}};
-    if (argument_status_t const status = parse_test_arguments(argc, argv, flags); status != argument_status_t::parsed_k)
+    suite_options_t options;
+    if (argument_status_t const status = parse_suite_options(argc, argv, options);
+        status != argument_status_t::parsed_k)
         return status == argument_status_t::help_k ? 0 : 1;
+    suite_totals_t totals = options.totals();
 
-    auto const maybe_test_directory = test_directory_t::make(parent);
+    auto const maybe_test_directory = test_directory_t::make(options.directory);
     if (!maybe_test_directory) {
-        fmt::println(stderr, "Cannot create a unique directory under {}", parent);
+        fmt::println(stderr, "Cannot create a unique directory under {}", options.directory);
         return 1;
     }
     char const* const directory = maybe_test_directory->path();
     if (directory) fmt::println("Will work in directory: {}", directory);
     else fmt::println("Will work with default configuration");
+    test_config_t const config {directory, options.engine_config};
 
-    std::size_t total = 0;
-    total += report("strings.short_ordering", strings_short_ordering(directory));
-    total += report("strings.prefix_scan", strings_prefix_scan(directory));
-    total += report("strings.shared_prefix", strings_shared_prefix(directory));
-    total += report("strings.empty_and_embedded_zero", strings_empty_and_embedded_zero(directory));
-    total += report("strings.update_and_remove", strings_update_and_remove(directory));
-    total += report("strings.bucket_growth", strings_bucket_growth(directory));
-    total += report("strings.batched_bucket", strings_batched_bucket(directory));
-    total += report("strings.scan_pagination", strings_scan_pagination(directory));
+    report(totals, "strings.short_ordering", strings_short_ordering(config));
+    report(totals, "strings.prefix_scan", strings_prefix_scan(config));
+    report(totals, "strings.shared_prefix", strings_shared_prefix(config));
+    report(totals, "strings.empty_and_embedded_zero", strings_empty_and_embedded_zero(config));
+    report(totals, "strings.update_and_remove", strings_update_and_remove(config));
+    report(totals, "strings.bucket_growth", strings_bucket_growth(config));
+    report(totals, "strings.batched_bucket", strings_batched_bucket(config));
+    report(totals, "strings.scan_pagination", strings_scan_pagination(config));
 
-    return report("total", total) ? 1 : 0;
+    return suite_exit_code(totals);
 }

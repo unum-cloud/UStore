@@ -25,8 +25,8 @@
 
 #include <ustore/ustore.hpp>
 
-#include "executor.hpp"
-#include "test.hpp"
+#include "executor.hpp" // `caller_exclusivity_t`, `executor_t`
+#include "test.hpp"     // `suite_exit_code`, `expect`, `suite_totals_t`
 
 using namespace unum::ustore;
 using namespace unum;
@@ -233,7 +233,7 @@ std::size_t insert_atomic_isolated(atomicity_run_t& run, executor_t& executor, b
 /** Runs every batch size on one pool of @p threads threads. */
 std::size_t inserts_on_threads(atomicity_run_t& run, atomicity_options_t const& options, std::size_t threads,
                                round_deletes_t deletes, std::chrono::nanoseconds slice) {
-    auto maybe_executor = executor_t::make(threads);
+    auto maybe_executor = executor_t::make(threads, caller_exclusivity_t::caller_inclusive_k);
     std::size_t failures = expect(maybe_executor);
     if (!maybe_executor) return failures;
     for (std::size_t const batch_size : options.batch_sizes.view()) {
@@ -258,10 +258,9 @@ std::size_t database_inserts(atomicity_run_t& run, atomicity_options_t const& op
 #pragma endregion Configurations
 
 int main(int argc, char** argv) {
-    std::string_view parent;
+    suite_options_t suite;
     atomicity_options_t options;
-    std::array<flag_t, 7> const flags {{
-        directory_flag(parent),
+    std::array<flag_t, 6> const flags {{
         {"--duration", "duration", "bound of the whole run, like 10s", &options.duration},
         {"--checkpoints", "count", "most write-and-verify rounds per configuration", &options.checkpoints},
         {"--threads", "counts", "competing thread counts, like 4,8,13,16", &options.threads},
@@ -269,15 +268,17 @@ int main(int argc, char** argv) {
         {"--keys", "count", "keys one round writes", &options.keys},
         {"--deletes-periodicity", "count", "one batch in this many is erased", &options.deletes_periodicity},
     }};
-    if (argument_status_t const status = parse_test_arguments(argc, argv, flags); status != argument_status_t::parsed_k)
+    if (argument_status_t const status = parse_suite_options(argc, argv, suite, flags);
+        status != argument_status_t::parsed_k)
         return status == argument_status_t::help_k ? 0 : 1;
+    suite_totals_t totals = suite.totals();
 
-    auto const maybe_directory = test_directory_t::make(parent);
+    auto const maybe_directory = test_directory_t::make(suite.directory);
     if (!maybe_directory) {
-        fmt::println(stderr, "Cannot create a unique directory under {}", parent);
+        fmt::println(stderr, "Cannot create a unique directory under {}", suite.directory);
         return 1;
     }
-    test_config_t const config {maybe_directory->path()};
+    test_config_t const config {maybe_directory->path(), suite.engine_config};
     database_t database;
     if (database.open(config.c_str()).failed()) {
         fmt::println(stderr, "Cannot open the database");
@@ -286,12 +287,11 @@ int main(int argc, char** argv) {
 
     atomicity_run_t run {database, database.main()};
     if (std::size_t const failures = prepare_run(run, options); failures) {
-        report("setup", failures);
-        return 1;
+        report(totals, "setup", failures);
+        return suite_exit_code(totals);
     }
 
-    std::size_t total = 0;
-    total += report("database.inserts", database_inserts(run, options, round_deletes_t::without_deletes_k));
-    total += report("database.inserts_and_deletes", database_inserts(run, options, round_deletes_t::with_deletes_k));
-    return report("total", total) ? 1 : 0;
+    report(totals, "database.inserts", database_inserts(run, options, round_deletes_t::without_deletes_k));
+    report(totals, "database.inserts_and_deletes", database_inserts(run, options, round_deletes_t::with_deletes_k));
+    return suite_exit_code(totals);
 }
