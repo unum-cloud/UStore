@@ -243,7 +243,7 @@ if (${USTORE_BUILD_TEST_CPP})
     set(USTORE_TEST_NAMES "api" "compilation" "units" "strings" "strings_collection")
 
     # The storage ring stands outside the per-engine loop: it links no engine, only the siblings it is written against.
-    set(USTORE_STORAGE_TEST_NAMES "ring")
+    set(USTORE_STORAGE_TEST_NAMES "ring" "lanes" "catalog" "volume")
 
     # The io_uring transport is Linux-only and takes no option of its own; the suite skips itself where the kernel
     # refuses a ring.

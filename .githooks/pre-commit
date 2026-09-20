@@ -334,6 +334,19 @@ check_docblock_indent() {
         "$file indents docblock text one space past the asterisk - use two, as in \` *  @brief\`:"
 }
 
+# A line continuing a block tag hangs four columns past the ` *  ` prefix, so a note reads as one paragraph.
+check_tag_continuation() {
+    local aligned
+    aligned=$(awk '
+        NR == FNR { added[$1 + 0]; next }
+        /^[[:space:]]*\*  @(brief|param|tparam|return|returns|retval|note|warning|sa|see|pre|post|throws|deprecated)(\[[a-z,]+\])? / { open = 1; next }
+        /^[[:space:]]*\*  @/ || /^[[:space:]]*\*\/?[[:space:]]*$/ || !/^[[:space:]]*\*/ { open = 0; next }
+        open && (FNR in added) && !/^[[:space:]]*\*      [^[:space:]]/ { printf "line %d: %s\n", FNR, $0 }
+        ' <(printf '%s\n' "$added_lines") <(git show ":$file"))
+    [ -z "$aligned" ] || fail "$aligned" \
+        "$file continues a tag at the wrong column - a continuation line hangs four spaces past the prefix, \` *      like this\`:"
+}
+
 # Includes form groups in a fixed order with a blank line between them: the C library, the platform's own
 # headers, the C++ standard library, external libraries, sibling projects, UStore's public <ustore/...>
 # headers, then project headers in quotes.
@@ -893,6 +906,7 @@ for file in "${staged[@]}"; do
         check_brief_length
         check_file_header
         check_docblock_indent
+        check_tag_continuation
         check_ansi_escapes
         check_include_groups
         check_docblock_brackets
