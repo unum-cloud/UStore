@@ -44,17 +44,25 @@ class job_cancellation_t {
     job_cancellation_t& operator=(job_cancellation_t const&) = delete;
 
     /** Stops the jobs this owner submitted, and refuses the ones it has not submitted yet. */
-    void cancel() noexcept { flag_reference_().store(1, std::memory_order_release); }
+    void cancel() noexcept {
+        flag_reference_().store(static_cast<std::int32_t>(cancellation_state_t::cancelled_k),
+                                std::memory_order_release);
+    }
 
     /** Admits this owner's jobs again, for a component reopened in place. */
-    void resume() noexcept { flag_reference_().store(0, std::memory_order_release); }
+    void resume() noexcept {
+        flag_reference_().store(static_cast<std::int32_t>(cancellation_state_t::wanted_k), std::memory_order_release);
+    }
 
     /** Whether the owner has stopped its jobs, which every part of a running one polls. */
-    bool cancelled() const noexcept { return flag_reference_().load(std::memory_order_acquire) != 0; }
+    bool cancelled() const noexcept {
+        return flag_reference_().load(std::memory_order_acquire) !=
+               static_cast<std::int32_t>(cancellation_state_t::wanted_k);
+    }
 
   private:
 
-    /** Zero while the owner wants its jobs, one once it has cancelled them. */
+    /** A @c cancellation_state_t, moved by @c cancel and @c resume. */
     std::int32_t flag_ = 0;
 
     fu::preferred_atomic_ref<std::int32_t> flag_reference_() noexcept {

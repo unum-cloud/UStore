@@ -10,20 +10,15 @@
 #include <cstdint> // `std::int32_t`
 
 #include <atomic>  // `std::memory_order`
-#include <thread>  // `std::this_thread::yield`
 #include <utility> // `std::exchange`
 
-#include <forkunion/atomics.hpp> // `fu::preferred_atomic_ref`
+#include <forkunion/atomics.hpp>      // `fu::preferred_atomic_ref`
+#include <forkunion/capabilities.hpp> // `fu::preferred_yield_t`
 
 #include <ustore/status.hpp> // `status_t`, `status_code_t`
 #include <ustore/types.hpp>  // the `fu` alias
 
 namespace unum::ustore::nvme {
-
-/** Hands the core back to the scheduler, which is what a wait with no work of its own does. */
-struct thread_yield_t {
-    void operator()() const noexcept { std::this_thread::yield(); }
-};
 
 /**
  *  @brief The parts still owed by one fanned-out job, and the first failure any of them reported.
@@ -75,9 +70,10 @@ class countdown_t {
      *      work where there is any; the default hands the core back to the scheduler.
      *  @return Whether every part succeeded.
      */
-    template <typename background_task_type_ = thread_yield_t>
-    bool wait(background_task_type_&& task = {}) noexcept {
-        while (!has_finished()) task();
+    bool wait() noexcept {
+        for (std::int32_t remaining = remaining_reference_().load(std::memory_order_acquire); remaining > 0;
+             remaining = remaining_reference_().load(std::memory_order_acquire))
+            fu::preferred_yield_t {}(remaining_, remaining, std::size_t {0});
         return !has_failed();
     }
 

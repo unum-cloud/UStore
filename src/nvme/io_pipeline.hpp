@@ -38,7 +38,7 @@ namespace unum::ustore::nvme {
 struct completed_buffer_t {
 
     /** The tag the caller minted when it offered the transfer, naming its own bookkeeping. */
-    std::uint32_t tag = 0;
+    request_tag_t tag = 0;
 
     /** The bytes the device touched, which is a prefix of the block on a partial transfer. */
     std::span<byte_t const> bytes;
@@ -99,7 +99,7 @@ class basic_read_pipeline {
     }
 
     /** Queues a read of @p extent under @p tag, or answers @c capacity_exhausted_k when out of room. */
-    status_t enqueue_read(extent_t extent, std::uint32_t tag) noexcept {
+    status_t enqueue_read(extent_t extent, request_tag_t tag) noexcept {
         if (!can_enqueue()) return {status_code_t::capacity_exhausted_k, "This channel has no block or credit left"};
         expected<pooled_buffer_t> block = channel_.requests().acquire();
         if (!block) return block.status();
@@ -201,7 +201,7 @@ class basic_read_pipeline {
         pooled_buffer_t block;
 
         /** The caller's tag, which the sink matches its own bookkeeping on. */
-        std::uint32_t tag = 0;
+        request_tag_t tag = 0;
 
         /** Bytes the request asked for, against which a partial transfer is measured. */
         std::uint64_t requested_bytes = 0;
@@ -211,8 +211,8 @@ class basic_read_pipeline {
     };
 
     /** The entry a completion belongs to, found by the ring tag it was minted with. */
-    [[nodiscard]] entry_t* entry_of_(std::uint32_t slot) noexcept {
-        std::uint32_t const base = next_slot_ - static_cast<std::uint32_t>(entries_.size());
+    [[nodiscard]] entry_t* entry_of_(request_tag_t slot) noexcept {
+        request_tag_t const base = next_slot_ - static_cast<request_tag_t>(entries_.size());
         std::uint32_t const index = slot - base;
         if (index >= entries_.size()) return nullptr;
         entry_t& entry = entries_[index];
@@ -253,7 +253,7 @@ class basic_read_pipeline {
     std::size_t outstanding_ = 0;
 
     /** The ring tag the next offer takes, which rises for the life of the pipeline. */
-    std::uint32_t next_slot_ = 0;
+    request_tag_t next_slot_ = 0;
 };
 
 #pragma endregion Reading
@@ -411,8 +411,8 @@ class basic_write_pipeline {
     }
 
     /** The entry a completion belongs to, found by the ring tag it was minted with. */
-    [[nodiscard]] entry_t* entry_of_(std::uint32_t slot) noexcept {
-        std::uint32_t const base = next_slot_ - static_cast<std::uint32_t>(entries_.size());
+    [[nodiscard]] entry_t* entry_of_(request_tag_t slot) noexcept {
+        request_tag_t const base = next_slot_ - static_cast<request_tag_t>(entries_.size());
         std::uint32_t const index = slot - base;
         if (index >= entries_.size()) return nullptr;
         entry_t& entry = entries_[index];
@@ -453,7 +453,7 @@ class basic_write_pipeline {
     std::size_t outstanding_ = 0;
 
     /** The ring tag the next write takes, which rises for the life of the pipeline. */
-    std::uint32_t next_slot_ = 0;
+    request_tag_t next_slot_ = 0;
 };
 
 #pragma endregion Writing

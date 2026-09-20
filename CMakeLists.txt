@@ -114,6 +114,11 @@ if (${USTORE_USE_ROCKSDB})
     set(LIB_ROCKSDB rocksdb)
 endif ()
 
+# The user-space NVMe transport, an `ustore_spdk` interface target over the archives of an SPDK build
+if (${USTORE_USE_SPDK})
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/spdk.cmake")
+endif ()
+
 # Modalities:
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/fmt.cmake")
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/yyjson.cmake")
@@ -270,6 +275,7 @@ if (${USTORE_BUILD_TEST_CPP})
         "transactions"
         "database"
         "single_collection_database"
+        "spdk"
     )
 
     # The io_uring transport is Linux-only and takes no option of its own; the suite skips itself where the kernel
@@ -278,6 +284,8 @@ if (${USTORE_BUILD_TEST_CPP})
         list(APPEND USTORE_STORAGE_TEST_NAMES "uring")
     endif ()
 
+    # The SPDK suite starts and stops its own target through the rig script, so the script's path is compiled in and
+    # `--spdk-root` names the build the script runs; without the option the suite prints its skip line instead.
     foreach (storage_name IN ITEMS ${USTORE_STORAGE_TEST_NAMES})
         set(storage_exe ustore_test_nvme_${storage_name})
         add_executable(${storage_exe} test/nvme_${storage_name}.cpp)
@@ -290,6 +298,15 @@ if (${USTORE_BUILD_TEST_CPP})
         if (storage_name STREQUAL "lsm" AND TARGET ustore_nvme_compaction)
             target_link_libraries(${storage_exe} ustore_nvme_compaction)
             list(APPEND storage_arguments --no-skips --transports ram,files,uring)
+        endif ()
+        if (storage_name STREQUAL "spdk")
+            target_compile_definitions(
+                ${storage_exe} PRIVATE USTORE_SPDK_RIG="${CMAKE_CURRENT_SOURCE_DIR}/scripts/rigs/spdk_target.sh"
+            )
+            if (${USTORE_USE_SPDK})
+                target_link_libraries(${storage_exe} ustore_spdk)
+                list(APPEND storage_arguments --spdk-root ${USTORE_SPDK_ROOT})
+            endif ()
         endif ()
         add_test(NAME ${storage_exe} COMMAND ${storage_exe} ${storage_arguments})
     endforeach ()

@@ -21,10 +21,10 @@
 
 #include <array>   // `std::array`
 #include <span>    // `std::span`
-#include <thread>  // `std::this_thread::yield`
 #include <utility> // `std::exchange`, `std::move`
 
 #include <forkunion/atomics.hpp>       // `fu::preferred_atomic_ref`
+#include <forkunion/capabilities.hpp>  // `fu::preferred_yield_t`
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
 #include <ustore/status.hpp> // `status_t`, `status_code_t`, `expected`
@@ -326,7 +326,7 @@ class lsm_tree {
 
             std::size_t request = 0;
             std::uint64_t chunk = 0;
-            std::uint32_t tag = 0;
+            request_tag_t tag = 0;
             value_window_t window;
             while (request != stored_keys.size() || reader.outstanding() != 0) {
                 while (request != stored_keys.size() && reader.can_enqueue()) {
@@ -470,7 +470,8 @@ class lsm_tree {
 
         expected<compaction_outcome_t> const outcome = compact_once_(reading_channel, writing_channel, placement,
                                                                      cancellation, published);
-        fu::preferred_atomic_ref<std::int32_t> {compacting_}.store(0, std::memory_order_release);
+        fu::preferred_atomic_ref<std::int32_t> {compacting_}.store(
+            static_cast<std::int32_t>(compaction_state_t::idle_k), std::memory_order_release);
         return outcome;
     }
 
@@ -522,15 +523,16 @@ class lsm_tree {
     }
 
     /** The word counting the readers of set @p slot. */
-    [[nodiscard]] fu::preferred_atomic_ref<std::int32_t> readers_reference_(std::size_t slot) const noexcept {
-        return fu::preferred_atomic_ref<std::int32_t> {readers_[slot]};
+    [[nodiscard]] fu::preferred_atomic_ref<readers_count_t> readers_reference_(std::size_t slot) const noexcept {
+        return fu::preferred_atomic_ref<readers_count_t> {readers_[slot]};
     }
 
     /** Takes the right to publish, which only one thread holds at a time. */
     [[nodiscard]] bool claim_compaction_() noexcept {
-        std::int32_t idle = 0;
+        std::int32_t idle = static_cast<std::int32_t>(compaction_state_t::idle_k);
         return fu::preferred_atomic_ref<std::int32_t> {compacting_}.compare_exchange_strong(
-            idle, 1, std::memory_order_acquire, std::memory_order_relaxed);
+            idle, static_cast<std::int32_t>(compaction_state_t::compacting_k), std::memory_order_acquire,
+            std::memory_order_relaxed);
     }
 
     /** Makes set @p staged live and frees the one it replaced once its last reader has left. */
@@ -538,7 +540,9 @@ class lsm_tree {
         std::size_t const retired = 1 - staged;
         fu::preferred_atomic_ref<std::int32_t> {live_}.store(static_cast<std::int32_t>(staged),
                                                              std::memory_order_release);
-        while (readers_reference_(retired).load(std::memory_order_acquire) != 0) std::this_thread::yield();
+        for (readers_count_t readers = readers_reference_(retired).load(std::memory_order_acquire); readers != 0;
+             readers = readers_reference_(retired).load(std::memory_order_acquire))
+            fu::preferred_yield_t {}(readers_[retired], readers, std::size_t {0});
     }
 
     /** Empties set @p slot without freeing a run, since every run it named is named by the live set too. */
@@ -699,9 +703,9 @@ class lsm_tree {
     std::int32_t mutable live_ = 0;
 
     /** Readers counted into each set, which a publication waits on before it frees the retired one. */
-    std::array<std::int32_t, 2> mutable readers_ {0, 0};
+    std::array<readers_count_t, 2> mutable readers_ {0, 0};
 
-    /** Zero while no thread is compacting, and one while one is. */
+    /** A @c compaction_state_t, moved by @c claim_compaction_ alone. */
     std::int32_t compacting_ = 0;
 
 #pragma endregion Private Members

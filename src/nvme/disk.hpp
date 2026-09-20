@@ -61,7 +61,7 @@ concept block_device_concept = requires(device_type_& device, device_type_ const
 };
 
 /** Identifies the thread holding a queue pair, so a foreign bound thread trips an assertion and not a driver. */
-[[nodiscard]] inline std::uint64_t calling_thread_identity() noexcept {
+[[nodiscard]] inline thread_identity_t calling_thread_identity() noexcept {
     return static_cast<std::uint64_t>(std::hash<std::thread::id> {}(std::this_thread::get_id()));
 }
 
@@ -76,7 +76,7 @@ struct disk_config_t {
     std::uint16_t queue_pairs_limit = 1;
 
     /** Requests one queue pair may keep in flight, which is the credit a queue pair spends and polls back. */
-    std::uint32_t depth_limit = 64;
+    queue_depth_t depth_limit = 64;
 
     /** Memory ranges the disk pins at once, which a transport registering one arena keeps at one. */
     std::uint16_t registered_memory_limit = 8;
@@ -156,7 +156,7 @@ class basic_disk {
      *  @param[in] depth Requests this queue pair may keep in flight, at most the mount's limit.
      *  @return The queue pair, or @c capacity_exhausted_k when every queue pair is already out.
      */
-    expected<queue_pair_t> acquire_queue_pair(std::uint32_t depth) noexcept {
+    expected<queue_pair_t> acquire_queue_pair(queue_depth_t depth) noexcept {
         if (depth == 0 || depth > depth_limit_)
             return status_t {status_code_t::invalid_argument_k, "A queue pair asks for more depth than the ring has"};
         for (std::size_t index = 0; index != queue_pairs_.size(); ++index) {
@@ -395,10 +395,10 @@ class basic_disk {
         std::int32_t cancelled = 0;
 
         /** Raised every time the slot is leased again, so a stale token routes nowhere. */
-        std::uint16_t generation = 0;
+        queue_pair_generation_t generation = 0;
 
         /** Requests this queue pair may keep in flight, fixed when the queue pair was taken. */
-        std::uint32_t depth = 0;
+        queue_depth_t depth = 0;
 
         /** Requests submitted and not yet performed, at the front of the window. */
         std::uint32_t pending_count = 0;
@@ -410,7 +410,7 @@ class basic_disk {
         std::uint32_t ready_count = 0;
 
         /** The thread that took the queue pair, which every submit and poll is checked against. */
-        std::uint64_t bound_thread = 0;
+        thread_identity_t bound_thread = 0;
     };
 
     /** One pinned memory range, and the count of requests the device may still be writing into it. */
@@ -423,7 +423,7 @@ class basic_disk {
         std::int32_t in_flight = 0;
 
         /** Raised every time the slot is used again, so a stale place resolves to nothing. */
-        std::uint16_t generation = 0;
+        queue_pair_generation_t generation = 0;
 
         /** Where the pinned memory lives. */
         memory_space_t space = memory_space_t::host_k;
@@ -445,7 +445,7 @@ class basic_disk {
         std::int32_t in_flight = 0;
 
         /** Raised every time the slot is used again, so a stale place resolves to nothing. */
-        std::uint16_t generation = 0;
+        queue_pair_generation_t generation = 0;
 
         /** The transport's own handle for the medium, which only the device interprets. */
         std::uint16_t index = 0;
@@ -646,7 +646,7 @@ class basic_disk {
     ring_capabilities_t capabilities_;
 
     /** Requests one queue pair may keep in flight, and the stride of every queue pair's window. */
-    std::uint32_t depth_limit_ = 0;
+    queue_depth_t depth_limit_ = 0;
 
     /** One slot per queue pair the ring hands out. */
     st::basic_vector<queue_pair_slot_t> queue_pairs_;

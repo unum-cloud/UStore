@@ -489,7 +489,7 @@ class lsm_sorted_run {
 
             std::size_t request = 0;
             std::uint64_t chunk = 0;
-            std::uint32_t tag = 0;
+            request_tag_t tag = 0;
             while (request != positions.size() || reader.outstanding() != 0) {
                 while (request != positions.size() && reader.can_enqueue()) {
                     value_window_t const window = value_window(positions[request]);

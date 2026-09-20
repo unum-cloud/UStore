@@ -31,12 +31,12 @@
 #include <memory>      // `std::unique_ptr`
 #include <new>         // `std::nothrow`
 #include <span>        // `std::span`
-#include <thread>      // `std::this_thread::yield`
 #include <type_traits> // `std::remove_reference_t`
 #include <utility>     // `std::exchange`, `std::move`
 #include <variant>     // `std::variant`, `std::visit`, `std::get_if`
 
 #include <forkunion/atomics.hpp>       // `fu::preferred_atomic_ref`
+#include <forkunion/capabilities.hpp>  // `fu::preferred_yield_t`
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
 #include <ustore/status.hpp> // `status_t`, `status_code_t`, `expected`
@@ -861,13 +861,13 @@ class basic_database {
         claim_guard_t& operator=(claim_guard_t const&) = delete;
 
         /** Takes @p claim, waiting while another caller holds it. */
-        explicit claim_guard_t(std::int32_t& claim) noexcept : claim_(&claim) {
-            fu::preferred_atomic_ref<std::int32_t> const word {claim};
-            std::int32_t expected_free = 0;
+        explicit claim_guard_t(claim_word_t& claim) noexcept : claim_(&claim) {
+            fu::preferred_atomic_ref<claim_word_t> const word {claim};
+            claim_word_t expected_free = 0;
             while (
                 !word.compare_exchange_strong(expected_free, 1, std::memory_order_acquire, std::memory_order_relaxed)) {
+                fu::preferred_yield_t {}(claim, expected_free, std::size_t {0});
                 expected_free = 0;
-                std::this_thread::yield();
             }
         }
 
@@ -886,12 +886,12 @@ class basic_database {
 
         /** Hands the claim back, which both the destructor and a move assignment need. */
         void release_() noexcept {
-            if (claim_) fu::preferred_atomic_ref<std::int32_t> {*claim_}.store(0, std::memory_order_release);
+            if (claim_) fu::preferred_atomic_ref<claim_word_t> {*claim_}.store(0, std::memory_order_release);
             claim_ = nullptr;
         }
 
         /** The word this guard holds, null once moved from. */
-        std::int32_t* claim_ = nullptr;
+        claim_word_t* claim_ = nullptr;
     };
 
     /** The claim and the channel one call of this database runs under, released in that order. */
@@ -927,8 +927,9 @@ class basic_database {
     }
 
     /** The word counting the readers of published catalog @p slot. */
-    [[nodiscard]] fu::preferred_atomic_ref<std::int32_t> catalog_readers_reference_(std::size_t slot) const noexcept {
-        return fu::preferred_atomic_ref<std::int32_t> {catalog_readers_[slot]};
+    [[nodiscard]] fu::preferred_atomic_ref<readers_count_t> catalog_readers_reference_(
+        std::size_t slot) const noexcept {
+        return fu::preferred_atomic_ref<readers_count_t> {catalog_readers_[slot]};
     }
 
     /**
@@ -961,7 +962,9 @@ class basic_database {
         version.store(version.load(std::memory_order_relaxed) + 1, std::memory_order_release);
         fu::preferred_atomic_ref<std::int32_t> {live_catalog_}.store(static_cast<std::int32_t>(staged),
                                                                      std::memory_order_release);
-        while (catalog_readers_reference_(retired).load(std::memory_order_acquire) != 0) std::this_thread::yield();
+        for (readers_count_t readers = catalog_readers_reference_(retired).load(std::memory_order_acquire);
+             readers != 0; readers = catalog_readers_reference_(retired).load(std::memory_order_acquire))
+            fu::preferred_yield_t {}(catalog_readers_[retired], readers, std::size_t {0});
         return {};
     }
 
@@ -1257,10 +1260,10 @@ class basic_database {
     std::uint64_t mutable catalog_version_ = 0;
 
     /** Readers counted into each published catalog, which a publication waits on before it retires one. */
-    std::array<std::int32_t, 2> mutable catalog_readers_ {0, 0};
+    std::array<readers_count_t, 2> mutable catalog_readers_ {0, 0};
 
     /** Zero while nobody is inside a collection, one while a caller is. */
-    std::int32_t mutable claim_ = 0;
+    claim_word_t mutable claim_ = 0;
 
     /** The claim a staged transaction holds from its stage until its commit. */
     claim_guard_t write_claim_;

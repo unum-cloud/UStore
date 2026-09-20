@@ -298,6 +298,31 @@ struct storage_info_t {
 
 #pragma endregion Measurements
 
+#pragma region Atomic Words
+
+/** A word one thread claims by compare-exchange: readers count upward from zero, the writer holds @c writer_claim_k. */
+using claim_word_t = std::int32_t;
+
+/** What a claim word holds while one writer has it, so no reader can add to it. */
+constexpr claim_word_t writer_claim_k = -1;
+
+/** Readers still inside a retired slot, which a publisher waits on before freeing it. */
+using readers_count_t = std::int32_t;
+
+/** Whether the owner of a background job or a merge still wants it, moved by compare-exchange on a word. */
+enum class cancellation_state_t : std::int32_t {
+    wanted_k = 0,
+    cancelled_k = 1,
+};
+
+/** Whether a thread holds the right to compact a tree, moved by compare-exchange on a word. */
+enum class compaction_state_t : std::int32_t {
+    idle_k = 0,
+    compacting_k = 1,
+};
+
+#pragma endregion Atomic Words
+
 #pragma region Rounding
 
 /** @p number rounded down to the previous multiple of @p multiple, which is a power of two. */

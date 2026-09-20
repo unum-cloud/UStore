@@ -74,7 +74,7 @@ class any_files_disk_t {
 #pragma region Queue Pairs
 
     /** Takes a queue pair on @p depth requests of the held ring for the calling thread. */
-    expected<queue_pair_t> acquire_queue_pair(std::uint32_t depth) noexcept {
+    expected<queue_pair_t> acquire_queue_pair(queue_depth_t depth) noexcept {
         return std::visit([&](auto& disk) noexcept { return disk.acquire_queue_pair(depth); }, held_);
     }
 

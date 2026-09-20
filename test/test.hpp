@@ -25,10 +25,11 @@
 #include <random>      // `std::random_device`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
-#include <thread>      // `std::this_thread::yield`, `std::thread::hardware_concurrency`
+#include <thread>      // `std::thread::hardware_concurrency`
 
 #include <fmt/format.h>
 
+#include <forkunion/capabilities.hpp> // `fu::preferred_yield_t`
 #include <smashtable/shared.hpp>
 
 #include <ustore/db.h>
@@ -234,7 +235,7 @@ template <typename condition_type_>
 [[nodiscard]] inline bool spin_until(condition_type_&& condition) noexcept {
     for (std::size_t spins = 0; spins != spin_limit_k; ++spins) {
         if (condition()) return true;
-        std::this_thread::yield();
+        fu::preferred_yield_t {}(spins, spins, std::size_t {0});
     }
     return false;
 }

@@ -19,6 +19,7 @@
 #include <thread>  // `std::thread`
 #include <utility> // `std::move`
 
+#include <forkunion/capabilities.hpp>  // `fu::preferred_yield_t`
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
 #include "nvme/buffer_pool.hpp" // `buffer_pool_t`, `pooled_buffer_t`
@@ -259,7 +260,9 @@ std::size_t spare_channel_stays_with_its_thread(mount_type_ const& mount) {
     std::array<std::size_t, 2> thread_failures {};
     auto alternate = [&](std::size_t self) noexcept {
         for (std::size_t round = 0; round != rounds_k; ++round) {
-            while (turn.load(std::memory_order_acquire) % 2 != self) std::this_thread::yield();
+            for (std::size_t seen = turn.load(std::memory_order_acquire); seen % 2 != self;
+                 seen = turn.load(std::memory_order_acquire))
+                fu::preferred_yield_t {}(turn, seen, self);
             {
                 expected<guard_t> guard = (*fixture)->channels.acquire();
                 thread_failures[self] += expect(guard.has_value());

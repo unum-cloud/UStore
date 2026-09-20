@@ -29,11 +29,11 @@
 #include <memory>      // `std::unique_ptr`
 #include <new>         // `std::nothrow`
 #include <span>        // `std::span`
-#include <thread>      // `std::this_thread::yield`
 #include <type_traits> // `std::remove_reference_t`
 #include <utility>     // `std::forward`, `std::move`
 
 #include <forkunion/atomics.hpp>       // `fu::preferred_atomic_ref`
+#include <forkunion/capabilities.hpp>  // `fu::preferred_yield_t`
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
 #include <ustore/status.hpp> // `status_t`, `status_code_t`, `expected`
@@ -530,18 +530,18 @@ class basic_single_collection_database {
     void acquire_read_path_() const noexcept {
         fu::preferred_atomic_ref<std::int32_t> const claim {write_path_claim_};
         for (;;) {
-            std::int32_t readers = claim.load(std::memory_order_relaxed);
+            claim_word_t readers = claim.load(std::memory_order_relaxed);
             if (readers >= 0 && claim.compare_exchange_strong(readers, readers + 1, std::memory_order_acquire,
                                                               std::memory_order_relaxed))
                 return;
-            std::this_thread::yield();
+            fu::preferred_yield_t {}(write_path_claim_, readers, std::size_t {0});
         }
     }
 
     /** Counts one reader back out of the collection. */
     void release_read_path_() const noexcept {
         [[maybe_unused]] std::int32_t const before =
-            fu::preferred_atomic_ref<std::int32_t> {write_path_claim_}.fetch_sub(1, std::memory_order_release);
+            fu::preferred_atomic_ref<claim_word_t> {write_path_claim_}.fetch_sub(1, std::memory_order_release);
     }
 
     /**
@@ -552,11 +552,11 @@ class basic_single_collection_database {
      */
     void acquire_write_path_() noexcept {
         fu::preferred_atomic_ref<std::int32_t> const claim {write_path_claim_};
-        std::int32_t expected_idle = 0;
-        while (
-            !claim.compare_exchange_strong(expected_idle, -1, std::memory_order_acquire, std::memory_order_relaxed)) {
+        claim_word_t expected_idle = 0;
+        while (!claim.compare_exchange_strong(expected_idle, writer_claim_k, std::memory_order_acquire,
+                                              std::memory_order_relaxed)) {
+            fu::preferred_yield_t {}(write_path_claim_, expected_idle, std::size_t {0});
             expected_idle = 0;
-            std::this_thread::yield();
         }
         write_path_adoption_ = volume_.disk().bind_queue_pair(writing_channel_.queue_pair());
         if (write_path_adoption_.succeeded())
@@ -565,7 +565,7 @@ class basic_single_collection_database {
 
     /** Hands the collection back to the readers and the next writer. */
     void release_write_path_() noexcept {
-        fu::preferred_atomic_ref<std::int32_t> {write_path_claim_}.store(0, std::memory_order_release);
+        fu::preferred_atomic_ref<claim_word_t> {write_path_claim_}.store(0, std::memory_order_release);
     }
 
 #pragma endregion Write Path
@@ -725,7 +725,7 @@ class basic_single_collection_database {
 
         basic_read_pipeline<disk_t> reader {volume_.disk(), channel, volume_.medium()};
         std::uint64_t at = 0;
-        std::uint32_t tag = 0;
+        request_tag_t tag = 0;
         while (at != wanted) {
             while (at != wanted && reader.can_enqueue()) {
                 std::uint64_t const length = chunk < wanted - at ? chunk : wanted - at;
@@ -764,7 +764,7 @@ class basic_single_collection_database {
     registry_t registry_;
 
     /** Readers inside the collection, or minus one while a writer holds it. */
-    std::int32_t mutable write_path_claim_ = 0;
+    claim_word_t mutable write_path_claim_ = 0;
 
     /** Whether the writer holding the path took both channels over, written only under the claim. */
     status_t write_path_adoption_;

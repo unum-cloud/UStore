@@ -21,9 +21,9 @@
 #include <atomic>    // `std::memory_order`
 #include <limits>    // `std::numeric_limits`
 #include <new>       // placement `new`
-#include <thread>    // `std::this_thread::yield`
 
 #include <forkunion/atomics.hpp>           // `fu::preferred_atomic_ref`
+#include <forkunion/capabilities.hpp>      // `fu::preferred_yield_t`
 #include <smashtable/basic_hash_table.hpp> // `st::hash_map`, `st::assume_reserved_t`
 #include <smashtable/basic_vector.hpp>     // `st::basic_vector`
 
@@ -418,8 +418,8 @@ class transaction_roster_t {
         transaction_id_t expected_free = invalid_transaction_id_k;
         while (
             !staging.compare_exchange_strong(expected_free, id, std::memory_order_acquire, std::memory_order_relaxed)) {
+            fu::preferred_yield_t {}(staged_by_, expected_free, std::size_t {0});
             expected_free = invalid_transaction_id_k;
-            std::this_thread::yield();
         }
     }
 
@@ -448,11 +448,11 @@ class transaction_roster_t {
 
     /** Takes the roster claim, waiting while another caller enrols or retires. */
     void take_roster_claim_() noexcept {
-        fu::preferred_atomic_ref<std::int32_t> const claim {roster_claim_};
-        std::int32_t expected_free = 0;
+        fu::preferred_atomic_ref<claim_word_t> const claim {roster_claim_};
+        claim_word_t expected_free = 0;
         while (!claim.compare_exchange_strong(expected_free, 1, std::memory_order_acquire, std::memory_order_relaxed)) {
+            fu::preferred_yield_t {}(roster_claim_, expected_free, std::size_t {0});
             expected_free = 0;
-            std::this_thread::yield();
         }
     }
 
@@ -497,7 +497,7 @@ class transaction_roster_t {
     transaction_id_t staged_by_ = invalid_transaction_id_k;
 
     /** One while a caller is enrolling or retiring a transaction, zero otherwise. */
-    std::int32_t roster_claim_ = 0;
+    claim_word_t roster_claim_ = 0;
 };
 
 #pragma endregion Roster

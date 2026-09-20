@@ -24,6 +24,7 @@
 #include <utility>     // `std::move`
 #include <variant>     // `std::visit`
 
+#include <forkunion/capabilities.hpp>  // `fu::preferred_yield_t`
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
 #include "nvme/database.hpp"      // `basic_database`
@@ -1183,7 +1184,7 @@ std::size_t lookups_outrun_the_write_path(mount_type_ const& mount) {
     while (std::chrono::steady_clock::now() - started < patience_k) {
         progressed = answered.load(std::memory_order_relaxed);
         if (progressed >= readers_k * rounds_k) break;
-        std::this_thread::yield();
+        fu::preferred_yield_t {}(answered, progressed, std::size_t {0});
     }
     store.release_write_path();
     failures += expect(progressed >= readers_k * rounds_k);

@@ -26,8 +26,9 @@
 
 #include <concepts> // `std::same_as`
 #include <span>     // `std::span`
-#include <thread>   // `std::this_thread::yield`
 #include <utility>  // `std::exchange`
+
+#include <forkunion/capabilities.hpp> // `fu::preferred_yield_t`
 
 #include <ustore/status.hpp> // `status_t`, `status_code_t`, `expected`
 #include <ustore/types.hpp>  // `byte_t`
@@ -37,6 +38,21 @@
 namespace unum::ustore::nvme {
 
 #pragma region Vocabulary
+
+/** A table's version, raised on every change so a ring knows its copy is behind. */
+using epoch_t = std::int32_t;
+
+/** The hash of a thread's identity, which binds a queue pair to the thread that submits on it. */
+using thread_identity_t = std::uint64_t;
+
+/** Which reissue of a queue pair slot a token belongs to, the 16 bits of the token beside the tag. */
+using queue_pair_generation_t = std::uint16_t;
+
+/** The 32 bits of a token its queue pair's holder chooses, usually a slot index. */
+using request_tag_t = std::uint32_t;
+
+/** Requests one queue pair may keep outstanding. */
+using queue_depth_t = std::uint32_t;
 
 /** What a submitted request asks the device to do. */
 enum class request_kind_t : std::uint8_t {
@@ -172,8 +188,8 @@ struct request_token_t {
     std::uint64_t bits = 0;
 
     /** Packs a queue pair, its queue pair generation and the queue pair's own tag into one token. */
-    [[nodiscard]] static constexpr request_token_t make(queue_pair_id_t queue_pair, std::uint16_t generation,
-                                                        std::uint32_t tag) noexcept {
+    [[nodiscard]] static constexpr request_token_t make(queue_pair_id_t queue_pair, queue_pair_generation_t generation,
+                                                        request_tag_t tag) noexcept {
         return request_token_t {(static_cast<std::uint64_t>(queue_pair) << 48) |
                                 (static_cast<std::uint64_t>(generation) << 32) | tag};
     }
@@ -184,10 +200,12 @@ struct request_token_t {
     }
 
     /** The queue pair generation, which separates a queue pair from its predecessor in the same slot. */
-    [[nodiscard]] constexpr std::uint16_t generation() const noexcept { return static_cast<std::uint16_t>(bits >> 32); }
+    [[nodiscard]] constexpr queue_pair_generation_t generation() const noexcept {
+        return static_cast<queue_pair_generation_t>(bits >> 32);
+    }
 
     /** The queue pair's own tag, which the ring never interprets. */
-    [[nodiscard]] constexpr std::uint32_t tag() const noexcept { return static_cast<std::uint32_t>(bits); }
+    [[nodiscard]] constexpr request_tag_t tag() const noexcept { return static_cast<request_tag_t>(bits); }
 
     friend constexpr bool operator==(request_token_t first, request_token_t second) noexcept {
         return first.bits == second.bits;
@@ -212,7 +230,7 @@ struct memory_reference_t {
     registered_memory_id_t memory_id = registered_memory_id_t::unregistered_k;
 
     /** The queue pair generation of that range, so a stale place resolves to nothing. */
-    std::uint16_t generation = 0;
+    queue_pair_generation_t generation = 0;
 
     /** Bytes from the start of the range to the first byte this request touches. */
     std::uint64_t offset = 0;
@@ -232,7 +250,7 @@ struct medium_reference_t {
     registered_medium_id_t medium_id = registered_medium_id_t::unregistered_k;
 
     /** The queue pair generation of that medium, so a stale place resolves to nothing. */
-    std::uint16_t generation = 0;
+    queue_pair_generation_t generation = 0;
 };
 
 /**
@@ -353,8 +371,8 @@ class queue_pair_t {
     ~queue_pair_t() noexcept { assert(!held() && "Release a queue pair before destroying it"); }
 
     /** Builds the handle a disk hands back from its @c open; callers never call this. */
-    [[nodiscard]] static queue_pair_t leased(queue_pair_id_t id, std::uint16_t generation,
-                                             std::uint32_t depth) noexcept {
+    [[nodiscard]] static queue_pair_t leased(queue_pair_id_t id, queue_pair_generation_t generation,
+                                             queue_depth_t depth) noexcept {
         queue_pair_t queue_pair;
         queue_pair.id_ = id;
         queue_pair.generation_ = generation;
@@ -376,13 +394,13 @@ class queue_pair_t {
     [[nodiscard]] queue_pair_id_t id() const noexcept { return id_; }
 
     /** The generation that separates this queue pair from the slot's previous one. */
-    [[nodiscard]] std::uint16_t generation() const noexcept { return generation_; }
+    [[nodiscard]] queue_pair_generation_t generation() const noexcept { return generation_; }
 
     /** Requests this queue pair may keep in flight at once, reserved when the queue pair was taken. */
-    [[nodiscard]] std::uint32_t depth() const noexcept { return depth_; }
+    [[nodiscard]] queue_depth_t depth() const noexcept { return depth_; }
 
     /** Mints a token of this queue pair carrying the queue pair's own @p tag. */
-    [[nodiscard]] request_token_t token(std::uint32_t tag) const noexcept {
+    [[nodiscard]] request_token_t token(request_tag_t tag) const noexcept {
         return request_token_t::make(id_, generation_, tag);
     }
 
@@ -392,10 +410,10 @@ class queue_pair_t {
     queue_pair_id_t id_ = queue_pair_id_t::unallocated_k;
 
     /** The generation of this queue pair, raised every time the slot is leased again. */
-    std::uint16_t generation_ = 0;
+    queue_pair_generation_t generation_ = 0;
 
     /** Requests this queue pair may keep in flight at once. */
-    std::uint32_t depth_ = 0;
+    queue_depth_t depth_ = 0;
 };
 
 /**
@@ -430,7 +448,7 @@ class registered_memory_t {
     ~registered_memory_t() noexcept { assert(!held() && "Deregister a range before destroying its handle"); }
 
     /** Builds the handle a disk hands back from its @c register_memory; callers never call this. */
-    [[nodiscard]] static registered_memory_t registered(registered_memory_id_t id, std::uint16_t generation,
+    [[nodiscard]] static registered_memory_t registered(registered_memory_id_t id, queue_pair_generation_t generation,
                                                         std::span<byte_t> memory, memory_space_t space) noexcept {
         registered_memory_t registered_memory;
         registered_memory.id_ = id;
@@ -454,7 +472,7 @@ class registered_memory_t {
     [[nodiscard]] registered_memory_id_t id() const noexcept { return id_; }
 
     /** The generation that separates this range from the slot's previous one. */
-    [[nodiscard]] std::uint16_t generation() const noexcept { return generation_; }
+    [[nodiscard]] queue_pair_generation_t generation() const noexcept { return generation_; }
 
     /** The memory the range covers, which the queue pair allocated and still owns. */
     [[nodiscard]] std::span<byte_t> bytes() const noexcept { return memory_; }
@@ -473,7 +491,7 @@ class registered_memory_t {
     registered_memory_id_t id_ = registered_memory_id_t::unregistered_k;
 
     /** The generation of this registered memory, raised every time the slot is used again. */
-    std::uint16_t generation_ = 0;
+    queue_pair_generation_t generation_ = 0;
 
     /** The memory the range covers, owned by the caller throughout. */
     std::span<byte_t> memory_;
@@ -512,7 +530,7 @@ class registered_medium_t {
     ~registered_medium_t() noexcept { assert(!held() && "Deregister a medium before destroying its handle"); }
 
     /** Builds the handle a disk hands back from its @c register_medium; callers never call this. */
-    [[nodiscard]] static registered_medium_t registered(registered_medium_id_t id, std::uint16_t generation,
+    [[nodiscard]] static registered_medium_t registered(registered_medium_id_t id, queue_pair_generation_t generation,
                                                         std::uint64_t capacity) noexcept {
         registered_medium_t registered_medium;
         registered_medium.id_ = id;
@@ -535,7 +553,7 @@ class registered_medium_t {
     [[nodiscard]] registered_medium_id_t id() const noexcept { return id_; }
 
     /** The generation that separates this medium from the slot's previous one. */
-    [[nodiscard]] std::uint16_t generation() const noexcept { return generation_; }
+    [[nodiscard]] queue_pair_generation_t generation() const noexcept { return generation_; }
 
     /** Bytes the medium spans, which an extent past it reads short or fails. */
     [[nodiscard]] std::uint64_t capacity() const noexcept { return capacity_; }
@@ -549,7 +567,7 @@ class registered_medium_t {
     registered_medium_id_t id_ = registered_medium_id_t::unregistered_k;
 
     /** The generation of this registered memory, raised every time the slot is used again. */
-    std::uint16_t generation_ = 0;
+    queue_pair_generation_t generation_ = 0;
 
     /** Bytes the medium spans, as the transport reported them at registered_memory. */
     std::uint64_t capacity_ = 0;
@@ -583,7 +601,7 @@ struct ring_capabilities_t {
     std::uint64_t max_transfer_bytes = 0;
 
     /** Requests one queue pair may keep in flight at once. */
-    std::uint32_t depth_limit = 0;
+    queue_depth_t depth_limit = 0;
 
     /** Leases the ring can hand out at once, which a controller's queue-pair count bounds. */
     std::uint16_t queue_pairs_limit = 0;
@@ -650,7 +668,7 @@ expected<std::size_t> poll_completions_at_least(disk_type_& disk, queue_pair_t c
     for (std::size_t spins = 0; completed < wanted && spins != spins_limit; ++spins) {
         expected<std::size_t> const moved = disk.poll_completions(queue_pair, into.subspan(completed));
         if (!moved) return moved.status();
-        if (*moved == 0) std::this_thread::yield();
+        if (*moved == 0) fu::preferred_yield_t {}(spins, spins, std::size_t {0});
         completed += *moved;
     }
     return completed;

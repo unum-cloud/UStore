@@ -51,7 +51,7 @@ struct io_channel_config_t {
     std::uint32_t stream_buffers_count = 4;
 
     /** Requests one queue pair keeps in flight, which is also the room one poll needs. */
-    std::uint32_t depth = 64;
+    queue_depth_t depth = 64;
 
     /** Bytes one channel's share of the arena takes, derived from the four numbers above. */
     [[nodiscard]] constexpr std::uint64_t arena_bytes() const noexcept {
@@ -101,7 +101,7 @@ class io_channel_t {
     [[nodiscard]] request_token_t next_token() noexcept { return queue_pair_.token(next_tag_++); }
 
     /** A token of this channel carrying the caller's own @p tag. */
-    [[nodiscard]] request_token_t token(std::uint32_t tag) const noexcept { return queue_pair_.token(tag); }
+    [[nodiscard]] request_token_t token(request_tag_t tag) const noexcept { return queue_pair_.token(tag); }
 
   private:
 
@@ -122,10 +122,10 @@ class io_channel_t {
     st::basic_vector<completion_t> completions_;
 
     /** The tag the next request of this channel carries, wrapping harmlessly past the depth. */
-    std::uint32_t next_tag_ = 0;
+    request_tag_t next_tag_ = 0;
 
     /** The thread that last adopted this channel, a hint the shared acquire ranks by and never trusts. */
-    std::uint64_t bound_thread_ = 0;
+    thread_identity_t bound_thread_ = 0;
 };
 
 /**
@@ -336,7 +336,7 @@ class basic_io_channel_pool {
      *  claim, so a stale read costs one rebind and never a wrong queue_pair.
      */
     expected<guard_t> acquire() noexcept {
-        std::uint64_t const bound_thread = calling_thread_identity();
+        thread_identity_t const bound_thread = calling_thread_identity();
         if (expected<guard_t> claimed = claim_shared_(io_channel_preference_t::bound_to_this_thread_k, bound_thread);
             !exhausted_(claimed))
             return claimed;
@@ -357,7 +357,7 @@ class basic_io_channel_pool {
     }
 
     /** The first free shared @p preference admits for @p bound thread, or @c capacity_exhausted_k when none does. */
-    expected<guard_t> claim_shared_(io_channel_preference_t preference, std::uint64_t bound_thread) noexcept {
+    expected<guard_t> claim_shared_(io_channel_preference_t preference, thread_identity_t bound_thread) noexcept {
         for (std::size_t index = 0; index != shared_claims_.size(); ++index) {
             io_channel_t& channel = channels_[executor_channels_ + index];
             fu::preferred_atomic_ref<std::uint64_t> bound {channel.bound_thread_};

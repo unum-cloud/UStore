@@ -82,16 +82,20 @@ class compaction_cancellation_t {
     compaction_cancellation_t& operator=(compaction_cancellation_t const&) = delete;
 
     /** Raises the word, which the merge reads at its next block boundary. */
-    void raise() noexcept { fu::preferred_atomic_ref<std::int32_t> {raised_}.store(1, std::memory_order_release); }
+    void raise() noexcept {
+        fu::preferred_atomic_ref<std::int32_t> {raised_}.store(
+            static_cast<std::int32_t>(cancellation_state_t::cancelled_k), std::memory_order_release);
+    }
 
     /** Whether a caller has raised the word. */
     [[nodiscard]] bool cancelled() const noexcept {
-        return fu::preferred_atomic_ref<std::int32_t const> {raised_}.load(std::memory_order_acquire) != 0;
+        return fu::preferred_atomic_ref<std::int32_t const> {raised_}.load(std::memory_order_acquire) !=
+               static_cast<std::int32_t>(cancellation_state_t::wanted_k);
     }
 
   private:
 
-    /** Zero while the merge may go on, and one once a caller has raised it. */
+    /** A @c cancellation_state_t, moved by @c raise alone. */
     std::int32_t raised_ = 0;
 };
 
@@ -572,7 +576,7 @@ class lsm_level_merger {
             std::uint64_t chunk_offset = 0;
             std::uint64_t staged = 0;
             std::uint64_t written = 0;
-            std::uint32_t tag = 0;
+            request_tag_t tag = 0;
             while (written != section) {
                 if (stopped_(cancellation)) {
                     volume.disk().cancel(reading_channel.queue_pair());

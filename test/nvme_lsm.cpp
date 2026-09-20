@@ -23,6 +23,7 @@
 #include <thread>  // `std::thread`
 #include <utility> // `std::move`
 
+#include <forkunion/capabilities.hpp>  // `fu::preferred_yield_t`
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
 #include "nvme/key_slot.hpp"         // `key_slot`
@@ -773,7 +774,7 @@ std::size_t raced_cancellation_is_all_or_nothing(mount_type_ const& mount) {
 
     compaction_cancellation_t cancellation;
     std::thread raiser {[&cancellation]() noexcept {
-        for (std::size_t spins = 0; spins != 64; ++spins) std::this_thread::yield();
+        for (std::size_t spins = 0; spins != 64; ++spins) fu::preferred_yield_t {}(spins, spins, std::size_t {0});
         cancellation.raise();
     }};
     expected<compaction_outcome_t> const outcome = tree->compact(reading->channel(), writing->channel(),

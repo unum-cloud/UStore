@@ -49,10 +49,10 @@
 #include <array>   // `std::array`
 #include <atomic>  // `std::atomic_ref`
 #include <span>    // `std::span`
-#include <thread>  // `std::this_thread::yield`
 #include <utility> // `std::move`
 
 #include <forkunion/atomics.hpp>       // `fu::preferred_atomic_ref`
+#include <forkunion/capabilities.hpp>  // `fu::preferred_yield_t`
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
 #include <ustore/status.hpp> // `status_t`, `status_code_t`, `expected`
@@ -79,7 +79,7 @@ struct uring_disk_config_t {
     std::uint16_t queue_pairs_limit = 1;
 
     /** Requests one queue pair may keep in flight, which is the credit a queue pair spends and polls back. */
-    std::uint32_t depth_limit = 64;
+    queue_depth_t depth_limit = 64;
 
     /** Memory ranges the disk pins at once, which every ring keeps a table slot for. */
     std::uint16_t registered_memory_limit = 8;
@@ -321,10 +321,10 @@ class uring_files_disk_t {
      *  @param[in] depth Requests this queue pair may keep in flight, at most the mount's limit.
      *  @return The queue pair, or @c capacity_exhausted_k when every ring is already out.
      */
-    expected<queue_pair_t> acquire_queue_pair(std::uint32_t depth) noexcept {
+    expected<queue_pair_t> acquire_queue_pair(queue_depth_t depth) noexcept {
         if (depth == 0 || depth > depth_limit_)
             return status_t {status_code_t::invalid_argument_k, "A queue pair asks for more depth than the ring has"};
-        std::uint64_t const identity = bound_thread_identity_();
+        thread_identity_t const identity = bound_thread_identity_();
         for (std::size_t index = 0; index != queue_pairs_.size(); ++index) {
             queue_pair_slot_t& slot = queue_pairs_[index];
             std::int32_t expected_free = 0;
@@ -357,7 +357,7 @@ class uring_files_disk_t {
         if (!slot) return {status_code_t::invalid_argument_k, "The queue pair is not this ring's"};
         if (slot->flights_count != 0 || slot->locals_count != 0)
             return {status_code_t::invalid_argument_k, "Drain the queue pair before handing it over"};
-        std::uint64_t const identity = bound_thread_identity_();
+        thread_identity_t const identity = bound_thread_identity_();
         if (status_t const bound = bind_ring_(rings_[static_cast<std::size_t>(queue_pair.id())], identity);
             bound.failed())
             return bound;
@@ -638,7 +638,7 @@ class uring_files_disk_t {
             if (!moved) return moved.status();
             if (*moved != 0) continue;
             if (spins == drain_patience_k) cancel(queue_pair);
-            std::this_thread::yield();
+            fu::preferred_yield_t {}(spins, spins, std::size_t {0});
         }
         return {status_code_t::input_output_k, "The queue pair would not drain"};
     }
@@ -693,7 +693,7 @@ class uring_files_disk_t {
         io_uring_cqe* completion_entries = nullptr;
 
         /** The thread this ring is bound to, zero while it is still disabled. */
-        std::uint64_t bound_thread = 0;
+        thread_identity_t bound_thread = 0;
 
         /** The registered memory epoch this ring's buffer table was last written from. */
         std::int32_t carried_registered_memories = 0;
@@ -712,10 +712,10 @@ class uring_files_disk_t {
         std::int32_t leased = 0;
 
         /** Raised every time the slot is leased again, so a stale token routes nowhere. */
-        std::uint16_t generation = 0;
+        queue_pair_generation_t generation = 0;
 
         /** Requests this queue pair may keep in flight, fixed when the queue pair was taken. */
-        std::uint32_t depth = 0;
+        queue_depth_t depth = 0;
 
         /** Requests the kernel holds for this queue pair and has not yet answered for. */
         std::uint32_t flights_count = 0;
@@ -727,7 +727,7 @@ class uring_files_disk_t {
         std::uint32_t locals_count = 0;
 
         /** The thread that took the queue pair, which every submit and poll is checked against. */
-        std::uint64_t bound_thread = 0;
+        thread_identity_t bound_thread = 0;
     };
 
     /** One pinned memory range, and the count of requests the kernel may still be writing into it. */
@@ -740,7 +740,7 @@ class uring_files_disk_t {
         std::int32_t in_flight = 0;
 
         /** Raised every time the slot is used again, so a stale place resolves to nothing. */
-        std::uint16_t generation = 0;
+        queue_pair_generation_t generation = 0;
 
         /** Where the pinned memory lives, which is host memory for every range this disk takes. */
         memory_space_t space = memory_space_t::host_k;
@@ -762,7 +762,7 @@ class uring_files_disk_t {
         std::int32_t in_flight = 0;
 
         /** Raised every time the slot is used again, so a stale place resolves to nothing. */
-        std::uint16_t generation = 0;
+        queue_pair_generation_t generation = 0;
 
         /** The open file, which every ring installs at this slot's own table index. */
         native_file_t file = invalid_native_file_k;
@@ -800,7 +800,7 @@ class uring_files_disk_t {
     static constexpr unsigned completion_slack_k = 4;
 
     /** Completion seats the kernel allows at most, which bounds the depth a mount may ask for. */
-    static constexpr std::uint32_t depth_ceiling_k = 16384;
+    static constexpr queue_depth_t depth_ceiling_k = 16384;
 
     /** The largest extent one submission entry carries, kept well inside the kernel's own limit. */
     static constexpr std::uint64_t max_transfer_bytes_k = 1024ull * 1024ull * 1024ull;
@@ -830,16 +830,16 @@ class uring_files_disk_t {
     }
 
     /** The kernel's name for the calling thread, since a ring binds to a task and a @c pthread_t is reused. */
-    [[nodiscard]] static std::uint64_t bound_thread_identity_() noexcept {
+    [[nodiscard]] static thread_identity_t bound_thread_identity_() noexcept {
         return static_cast<std::uint64_t>(::gettid());
     }
 
     static fu::preferred_atomic_ref<std::int32_t> claim_(std::int32_t& word) noexcept {
-        return fu::preferred_atomic_ref<std::int32_t> {word};
+        return fu::preferred_atomic_ref<epoch_t> {word};
     }
 
-    static fu::preferred_atomic_ref<std::int32_t> epoch_(std::int32_t& word) noexcept {
-        return fu::preferred_atomic_ref<std::int32_t> {word};
+    static fu::preferred_atomic_ref<epoch_t> epoch_(epoch_t& word) noexcept {
+        return fu::preferred_atomic_ref<epoch_t> {word};
     }
 
     static fu::preferred_atomic_ref<std::int32_t> in_flight_(registered_memory_slot_t& slot) noexcept {
@@ -940,7 +940,7 @@ class uring_files_disk_t {
      *  which is only legal because a queue pair moves with nothing outstanding on it. A ring whose last
      *  build failed is built again here rather than left dead in its slot.
      */
-    status_t bind_ring_(ring_t& ring, std::uint64_t identity) noexcept {
+    status_t bind_ring_(ring_t& ring, thread_identity_t identity) noexcept {
         if (ring.bound_thread == identity) return {};
         if (ring.bound_thread != 0) teardown_ring_(ring);
         if (ring.file < 0)
@@ -953,7 +953,7 @@ class uring_files_disk_t {
 
     /** Writes the disk's registered ranges and media into @p ring's tables when it is behind. */
     status_t carry_tables_(ring_t& ring, std::size_t seat) noexcept {
-        std::int32_t const registered_memories = epoch_(registered_memories_epoch_).load(std::memory_order_acquire);
+        epoch_t const registered_memories = epoch_(registered_memories_epoch_).load(std::memory_order_acquire);
         if (ring.carried_registered_memories != registered_memories) {
             expected<range_pinning_t> const pinned = pin_ranges_(ring, seat, registered_memories);
             if (!pinned) return pinned.status();
@@ -1291,16 +1291,16 @@ class uring_files_disk_t {
     st::basic_vector<int> registered_media_;
 
     /** Raised whenever a range is recorded or given back, so a ring knows its table is behind. */
-    std::int32_t registered_memories_epoch_ = 1;
+    epoch_t registered_memories_epoch_ = 1;
 
     /** Raised whenever a medium is opened or closed, so a ring knows its table is behind. */
-    std::int32_t media_epoch_ = 1;
+    epoch_t media_epoch_ = 1;
 
     /** The registered memory epoch at which the locked-memory cap refused a pin, or zero while none was refused. */
-    std::int32_t pin_refused_epoch_ = 0;
+    epoch_t pin_refused_epoch_ = 0;
 
     /** Requests one queue pair may keep in flight, and the stride of every queue pair's window. */
-    std::uint32_t depth_limit_ = 0;
+    queue_depth_t depth_limit_ = 0;
 
     /** Leases the disk hands out at once, which is also the number of rings it holds. */
     std::uint16_t queue_pairs_limit_ = 0;
