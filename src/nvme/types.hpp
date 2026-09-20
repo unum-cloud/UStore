@@ -198,9 +198,6 @@ inline constexpr std::string_view user_data_file_name_k = "user.data";
 
 #pragma region Modes
 
-/** Marks a call several threads make at once, so the callee publishes through atomics. */
-struct concurrent_t {};
-
 /** Whether a database holds one collection with transactions of its own, or many sharing them. */
 enum class database_kind_t : std::uint8_t {
     unknown_k = 0x00,

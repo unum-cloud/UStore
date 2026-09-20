@@ -7,8 +7,8 @@
 
 #pragma once
 
-#include "nvme/read_set.hpp"
-#include "nvme/write_buffer.hpp"
+#include "nvme/read_set.hpp"     // `noexcept`, `read_set`
+#include "nvme/write_buffer.hpp" // `write_buffer`
 
 namespace unum::ustore::nvme {
 

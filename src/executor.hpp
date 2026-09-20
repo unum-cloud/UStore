@@ -10,6 +10,7 @@
 #pragma once
 
 #include <cstddef> // `std::size_t`
+#include <cstdint> // `std::uint8_t`
 #include <cstdlib> // `std::aligned_alloc`, `std::free`
 
 #include <limits>      // `std::numeric_limits`
@@ -98,11 +99,21 @@ concept thread_callback = std::is_nothrow_invocable_v<callback_&, std::size_t, s
 template <typename callback_>
 concept task_callback = std::is_nothrow_invocable_v<callback_&, std::size_t, std::size_t>;
 
+/** What the thread that spawns a pool does on every dispatch it makes afterwards. */
+enum class caller_role_t : std::uint8_t {
+
+    /** Counts as one of the threads, runs its share of every dispatch, and is pinned like the rest. */
+    worker_k,
+
+    /** Only dispatches and waits, keeping its own affinity and adding nothing to the thread count. */
+    coordinator_k,
+};
+
 /**
  *  @brief A ForkUnion pool spawned over the machine topology it owns.
  *
- *  The calling thread counts as one of the threads and runs its share of every dispatch.
- *  Every dispatch blocks until all threads return, and admits one caller at a time.
+ *  A worker caller counts as one of the threads and runs its share of every dispatch, while a
+ *  coordinator only waits. Every dispatch blocks until all threads return, and admits one caller at a time.
  */
 class executor_t {
   public:
@@ -128,18 +139,20 @@ class executor_t {
     }
 
     /**
-     *  @brief Harvests the topology and spawns @p threads threads, the caller included.
+     *  @brief Harvests the topology and spawns @p threads threads, the caller among them for a worker.
      *  @param[in] threads Thread count, at least one; see @c logical_cores_count for the machine's.
+     *  @param[in] role Whether the caller is one of the @p threads or only coordinates them.
      */
-    [[nodiscard]] static st::expected<executor_t> make(std::size_t threads) noexcept {
+    [[nodiscard]] static st::expected<executor_t> make(std::size_t threads, caller_role_t role) noexcept {
         executor_t executor;
         if (fu_status_t const status = fu_topology_new(&executor.topology_); status != fu_success_k)
             return status_from_(status);
         if (fu_status_t const status = fu_pool_new(pool_name_k, fu_capabilities_all_k, &executor.pool_);
             status != fu_success_k)
             return status_from_(status);
-        if (fu_status_t const status = fu_pool_spawn(executor.topology_, executor.pool_, threads,
-                                                     fu_caller_inclusive_k);
+        fu_caller_exclusivity_t const exclusivity = role == caller_role_t::worker_k ? fu_caller_inclusive_k
+                                                                                    : fu_caller_exclusive_k;
+        if (fu_status_t const status = fu_pool_spawn(executor.topology_, executor.pool_, threads, exclusivity);
             status != fu_success_k)
             return status_from_(status);
         return executor;
@@ -156,7 +169,7 @@ class executor_t {
         return cores;
     }
 
-    /** The number of threads every dispatch runs on, the caller included. */
+    /** The number of threads every dispatch runs on, the caller included when it is a worker. */
     [[nodiscard]] std::size_t threads_count() const noexcept {
         std::size_t threads = 0;
         return fu_pool_threads_count(pool_, &threads) == fu_success_k ? threads : 0;

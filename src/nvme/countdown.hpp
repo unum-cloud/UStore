@@ -126,19 +126,18 @@ class notifier_t {
 
     notifier_t() = delete;
     notifier_t(notifier_t const&) = default;
-    notifier_t& operator=(notifier_t const&) = default;
 
     /** A handle onto @p countdown, which must outlive every part holding one. */
-    notifier_t(countdown_t& countdown) noexcept : countdown_(&countdown) {}
+    notifier_t(countdown_t& countdown) noexcept : countdown_(countdown) {}
 
     /** The counter this handle reports through. */
-    countdown_t& countdown() const noexcept { return *countdown_; }
+    countdown_t& countdown() const noexcept { return countdown_; }
 
     /** Reports one part done. */
-    void did_one() const noexcept { countdown_->remaining_reference_().sub(1, std::memory_order_release); }
+    void did_one() const noexcept { countdown_.remaining_reference_().sub(1, std::memory_order_release); }
 
     /** Reports every remaining part done, for a fan-out that finished early. */
-    void did_all() const noexcept { countdown_->remaining_reference_().store(0, std::memory_order_release); }
+    void did_all() const noexcept { countdown_.remaining_reference_().store(0, std::memory_order_release); }
 
     /**
      *  @brief Reports @p status, which the counter keeps if it is the first failure.
@@ -148,27 +147,27 @@ class notifier_t {
      */
     void fail(status_t status) const noexcept {
         if (status.succeeded()) return;
-        countdown_->message_ = status.message;
+        countdown_.message_ = status.message;
         int expected = 0;
-        if (!countdown_->code_reference_().compare_exchange_strong(
-                expected, static_cast<int>(status.code), std::memory_order_release, std::memory_order_relaxed))
+        if (!countdown_.code_reference_().compare_exchange_strong(expected, static_cast<int>(status.code),
+                                                                  std::memory_order_release, std::memory_order_relaxed))
             return;
-        countdown_->remaining_reference_().store(0, std::memory_order_release);
+        countdown_.remaining_reference_().store(0, std::memory_order_release);
     }
 
     /** Whether any part reported a failure. */
-    bool has_failed() const noexcept { return countdown_->has_failed(); }
+    bool has_failed() const noexcept { return countdown_.has_failed(); }
 
     /** Whether every part has reported, or one of them has failed. */
-    bool has_finished() const noexcept { return countdown_->has_finished(); }
+    bool has_finished() const noexcept { return countdown_.has_finished(); }
 
     /** Whether the parts still owed have fallen to @p threshold or below. */
-    bool test(std::int32_t threshold) const noexcept { return countdown_->test(threshold); }
+    bool test(std::int32_t threshold) const noexcept { return countdown_.test(threshold); }
 
   private:
 
     /** The counter this handle reports through, owned by whoever waits on it. */
-    countdown_t* countdown_ = nullptr;
+    countdown_t& countdown_;
 };
 
 } // namespace unum::ustore::nvme

@@ -10,6 +10,7 @@
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint8_t`, `std::uint32_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`
+
 #if defined(_WIN32)
 #include <stdlib.h> // `rand_s`
 #else

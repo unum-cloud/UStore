@@ -46,10 +46,6 @@ option(USTORE_BUILD_LIB_PYTHON "Compile the CPython extension; `scikit-build-cor
 option(USTORE_BUILD_NVME "Compile the in-tree NVMe engine" OFF)
 option(USTORE_BUILD_CUDA "Compile NVMe's GPU compaction" OFF)
 
-if (USTORE_BUILD_NVME)
-    message(FATAL_ERROR "UStore: USTORE_BUILD_NVME stays off until src/nvme builds")
-endif ()
-
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -158,7 +154,9 @@ endif ()
 
 set(LIB_FMT fmt::fmt)
 
-if (USTORE_BUILD_CUDA)
+# The host half of the compaction suite checks the comparator, the survival rule, the sorted-run split and the placement
+# without a device, so a plain test build registers it too.
+if (USTORE_BUILD_CUDA OR USTORE_BUILD_TEST_CPP)
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/nvme_compaction.cmake")
 endif ()
 
@@ -175,6 +173,23 @@ target_link_libraries(
     ustore_embedded_ram Threads::Threads yyjson forkunion::static smashtable::header ustore_stringzilla_dispatch
 )
 target_compile_definitions(ustore_embedded_ram INTERFACE USTORE_VERSION="${USTORE_VERSION}")
+
+# The NVMe engine mounts its volumes on files, so it builds everywhere the siblings do; the io_uring transport beside it
+# compiles on every platform and only opens a ring on Linux.
+if (${USTORE_BUILD_NVME})
+    add_library(
+        ustore_embedded_nvme STATIC ${USTORE_LIB_C_EXCLUSION} src/nvme/engine.cpp c/docs.cpp c/graph.cpp c/strings.cpp
+    )
+    target_link_libraries(
+        ustore_embedded_nvme Threads::Threads yyjson forkunion::static smashtable::header ustore_stringzilla_dispatch
+    )
+    if (TARGET ustore_nvme_compaction)
+        target_link_libraries(ustore_embedded_nvme ustore_nvme_compaction)
+        set(USTORE_COMPACTION_LIB ustore_nvme_compaction)
+    endif ()
+    target_compile_definitions(ustore_embedded_nvme INTERFACE USTORE_VERSION="${USTORE_VERSION}")
+    list(APPEND USTORE_ENGINE_NAMES "nvme")
+endif ()
 
 if (${USTORE_USE_ROCKSDB})
     add_library(
@@ -218,6 +233,7 @@ if (USTORE_INSTALL)
     list(TRANSFORM USTORE_ENGINE_NAMES PREPEND "ustore_embedded_" OUTPUT_VARIABLE USTORE_ENGINE_LIBS)
     install(
         TARGETS ${USTORE_ENGINE_LIBS}
+                ${USTORE_COMPACTION_LIB}
                 ${LIB_ROCKSDB}
                 ${LIB_LEVELDB}
                 fmt
@@ -243,7 +259,18 @@ if (${USTORE_BUILD_TEST_CPP})
     set(USTORE_TEST_NAMES "api" "compilation" "units" "strings" "strings_collection")
 
     # The storage ring stands outside the per-engine loop: it links no engine, only the siblings it is written against.
-    set(USTORE_STORAGE_TEST_NAMES "ring" "lanes" "catalog" "volume" "sorted_run" "lsm" "collection")
+    set(USTORE_STORAGE_TEST_NAMES
+        "ring"
+        "lanes"
+        "catalog"
+        "volume"
+        "sorted_run"
+        "lsm"
+        "collection"
+        "transactions"
+        "database"
+        "single_collection_database"
+    )
 
     # The io_uring transport is Linux-only and takes no option of its own; the suite skips itself where the kernel
     # refuses a ring.
