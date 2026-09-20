@@ -323,12 +323,16 @@ check_docblock_indent() {
     misindented=$(awk '
         NR == FNR { added[$1 + 0]; next }
         {
-            if (inside && $0 ~ /\*\//) { inside = 0; next }
+            if (inside && $0 ~ /\*\//) {
+                if ((FNR in added) && $0 ~ /^[[:space:]]*\* [^[:space:]]/) printf "line %d: one space past the asterisk\n", FNR
+                inside = 0
+                next
+            }
             if (inside && (FNR in added)) {
                 if ($0 ~ /^[[:space:]]*\*[^[:space:]\/]/) printf "line %d: text glued to the asterisk\n", FNR
                 else if ($0 ~ /^[[:space:]]*\* [^[:space:]]/) printf "line %d: one space past the asterisk\n", FNR
             }
-            if ($0 ~ /^[[:space:]]*\/\*\*[[:space:]]*$/) inside = 1
+            if ($0 ~ /^[[:space:]]*\/\*\*/ && $0 !~ /\*\//) inside = 1
         }' <(printf '%s\n' "$added_lines") <(git show ":$file"))
     [ -z "$misindented" ] || fail "$misindented" \
         "$file indents docblock text one space past the asterisk - use two, as in \` *  @brief\`:"

@@ -8,15 +8,13 @@
 
 #include <cstdint> // `std::uint64_t`
 
-#include "cuda.hpp" // `host_device_m`, so CUDA kernels call these functions too
-
 namespace unum::ustore::nvme {
 
 /** Levels a sorted run index layout describes, far beyond any sorted run index a sorted run file holds. */
 inline constexpr std::uint64_t sorted_run_index_levels_capacity_k = 32;
 
 /** The least multiple of @p multiple at or above @p value. */
-host_device_m constexpr std::uint64_t round_up(std::uint64_t value, std::uint64_t multiple) noexcept {
+constexpr std::uint64_t round_up(std::uint64_t value, std::uint64_t multiple) noexcept {
     return (value + multiple - 1) / multiple * multiple;
 }
 
@@ -38,7 +36,7 @@ struct sorted_run_index_layout_t {
     /** Rows of cells, enough for every key slot. */
     std::uint64_t rows_count = 0;
 
-    /** Levels of rows, the root counting as one. */
+    /** Levels of rows, the root counting as one, and zero for a layout of no key slots. */
     std::uint64_t height = 0;
 
     /** Cells in the deepest level. */
@@ -51,7 +49,7 @@ struct sorted_run_index_layout_t {
     std::uint64_t cells_above[sorted_run_index_levels_capacity_k] = {};
 
     /** At @c index above zero the cells of level @c index minus one in a complete sorted run index, the root being
-     * level zero. */
+     *  level zero. */
     std::uint64_t level_cells[sorted_run_index_levels_capacity_k] = {};
 
     /** Sorted positions between neighbouring cells of a level in a complete sorted run index. */
@@ -60,7 +58,7 @@ struct sorted_run_index_layout_t {
     constexpr sorted_run_index_layout_t() noexcept = default;
 
     /** Lays out @p key_slots key slots in rows of @p cells_per_row, which must be two or more. */
-    host_device_m constexpr sorted_run_index_layout_t(std::uint64_t key_slots, std::uint64_t cells_per_row) noexcept
+    constexpr sorted_run_index_layout_t(std::uint64_t key_slots, std::uint64_t cells_per_row) noexcept
         : key_slots_count(key_slots), branching(cells_per_row),
           rows_count((key_slots + cells_per_row - 1) / cells_per_row) {
         if (key_slots == 0) return;
@@ -87,17 +85,21 @@ struct sorted_run_index_layout_t {
     }
 
     /** Cells in the sorted run index, padding included. */
-    host_device_m constexpr std::uint64_t cells_count() const noexcept { return rows_count * branching; }
+    constexpr std::uint64_t cells_count() const noexcept { return rows_count * branching; }
 
     /** Level of the row holding @p cell, the root being level zero. */
-    host_device_m constexpr std::uint64_t level_of(std::uint64_t cell) const noexcept {
+    constexpr std::uint64_t level_of(std::uint64_t cell) const noexcept {
         for (std::uint64_t index = 1; index < height; ++index)
             if (cells_above[index] <= cell) return height - index;
         return 0;
     }
 
-    /** Sorted position of @p cell, at or past @c key_slots_count for padding. */
-    host_device_m constexpr std::uint64_t cell_to_sorted(std::uint64_t cell) const noexcept {
+    /** Whether the layout describes any key slot, which decides whether its two mappings mean anything. */
+    constexpr bool holds_key_slots() const noexcept { return height != 0; }
+
+    /** Sorted position of @p cell, at or past @c key_slots_count for padding and for an empty layout. */
+    constexpr std::uint64_t cell_to_sorted(std::uint64_t cell) const noexcept {
+        if (!holds_key_slots()) return key_slots_count;
         std::uint64_t const level = level_of(cell);
         std::uint64_t const offset_in_level = cell - cells_above[height - level];
         std::uint64_t const slots = offset_in_level + offset_in_level / branching + 1;
@@ -108,8 +110,9 @@ struct sorted_run_index_layout_t {
         return slots * level_stride[level] - 1 - missing_leaf_cells;
     }
 
-    /** Cell holding sorted position @p sorted, which may be a padding position below @c cells_count. */
-    host_device_m constexpr std::uint64_t sorted_to_cell(std::uint64_t sorted) const noexcept {
+    /** Cell holding sorted position @p sorted, which is @c cells_count for an empty layout that holds none. */
+    constexpr std::uint64_t sorted_to_cell(std::uint64_t sorted) const noexcept {
+        if (!holds_key_slots()) return cells_count();
         std::uint64_t const leaf_row = sorted / (branching + 1);
         std::uint64_t leaf_cells_before = leaf_rows_count * branching;
         if (leaf_row < leaf_rows_count) {
@@ -134,7 +137,7 @@ struct sorted_run_index_layout_t {
     }
 
   private:
-    host_device_m static constexpr std::uint64_t power_(std::uint64_t base, std::uint64_t exponent) noexcept {
+    static constexpr std::uint64_t power_(std::uint64_t base, std::uint64_t exponent) noexcept {
         std::uint64_t result = 1;
         for (std::uint64_t step = 0; step != exponent; ++step) result *= base;
         return result;

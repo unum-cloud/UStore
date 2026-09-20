@@ -243,7 +243,7 @@ if (${USTORE_BUILD_TEST_CPP})
     set(USTORE_TEST_NAMES "api" "compilation" "units" "strings" "strings_collection")
 
     # The storage ring stands outside the per-engine loop: it links no engine, only the siblings it is written against.
-    set(USTORE_STORAGE_TEST_NAMES "ring" "lanes" "catalog" "volume")
+    set(USTORE_STORAGE_TEST_NAMES "ring" "lanes" "catalog" "volume" "sorted_run" "lsm" "collection")
 
     # The io_uring transport is Linux-only and takes no option of its own; the suite skips itself where the kernel
     # refuses a ring.
@@ -257,7 +257,14 @@ if (${USTORE_BUILD_TEST_CPP})
         target_link_libraries(
             ${storage_exe} ${LIB_FMT} forkunion::static smashtable::header ustore_stringzilla_dispatch Threads::Threads
         )
-        add_test(NAME ${storage_exe} COMMAND ${storage_exe} --directory ${CMAKE_BINARY_DIR}/test_data)
+        set(storage_arguments --directory ${CMAKE_BINARY_DIR}/test_data)
+        # The LSM suite merges on the device where the build carries one, so on the transports that need no hardware
+        # option its device case may no longer skip
+        if (storage_name STREQUAL "lsm" AND TARGET ustore_nvme_compaction)
+            target_link_libraries(${storage_exe} ustore_nvme_compaction)
+            list(APPEND storage_arguments --no-skips --transports ram,files,uring)
+        endif ()
+        add_test(NAME ${storage_exe} COMMAND ${storage_exe} ${storage_arguments})
     endforeach ()
 
     set(USTORE_STRESS_NAMES "atomicity" "linearizability")

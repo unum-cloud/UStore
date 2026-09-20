@@ -12,8 +12,6 @@
 #include <limits>      // `std::numeric_limits`
 #include <type_traits> // `std::is_arithmetic_v`, `std::is_trivially_copyable_v`
 
-#include "cuda.hpp" // `host_device_m`, so CUDA kernels call these functions too
-
 namespace unum::ustore::nvme {
 
 /**
@@ -49,14 +47,12 @@ struct uuid_stored_key_t {
     }
 
     /** Whether both keys hold the same 16 bytes. */
-    host_device_m friend constexpr bool operator==(uuid_stored_key_t const& first,
-                                                   uuid_stored_key_t const& second) noexcept {
+    friend constexpr bool operator==(uuid_stored_key_t const& first, uuid_stored_key_t const& second) noexcept {
         return (first.high == second.high) & (first.low == second.low);
     }
 
     /** Whether @p first orders before @p second, as @c memcmp orders their bytes. */
-    host_device_m friend constexpr bool operator<(uuid_stored_key_t const& first,
-                                                  uuid_stored_key_t const& second) noexcept {
+    friend constexpr bool operator<(uuid_stored_key_t const& first, uuid_stored_key_t const& second) noexcept {
         return (first.high < second.high) | ((first.high == second.high) & (first.low < second.low));
     }
 };
@@ -71,10 +67,10 @@ template <typename value_type_>
 struct limit<value_type_> {
 
     /** The least value. */
-    host_device_m static constexpr value_type_ min() noexcept { return min_k; }
+    static constexpr value_type_ min() noexcept { return min_k; }
 
     /** The greatest value. */
-    host_device_m static constexpr value_type_ max() noexcept { return max_k; }
+    static constexpr value_type_ max() noexcept { return max_k; }
 
   private:
     static constexpr value_type_ min_k = std::numeric_limits<value_type_>::lowest();
@@ -86,10 +82,10 @@ template <>
 struct limit<uuid_stored_key_t> {
 
     /** The key of 16 zero bytes. */
-    host_device_m static constexpr uuid_stored_key_t min() noexcept { return {0, 0}; }
+    static constexpr uuid_stored_key_t min() noexcept { return {0, 0}; }
 
     /** The key of 16 bytes with every bit set. */
-    host_device_m static constexpr uuid_stored_key_t max() noexcept { return {~std::uint64_t {0}, ~std::uint64_t {0}}; }
+    static constexpr uuid_stored_key_t max() noexcept { return {~std::uint64_t {0}, ~std::uint64_t {0}}; }
 };
 
 /** A key a key slot carries: trivially copyable, ordered by @c < and @c ==, with bounds from @c limit. */

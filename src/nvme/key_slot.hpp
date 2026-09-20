@@ -8,10 +8,9 @@
 
 #include <cstdint>
 
-#include "cuda.hpp" // `host_device_m`, since CUDA compaction compares key slots on the device
 #include "nvme/stored_value.hpp"
-#include "nvme/stored_key.hpp"
-#include "nvme/types.hpp"
+#include "nvme/stored_key.hpp" // `limit`
+#include "nvme/types.hpp"      // `noexcept`, `rounddown_to_multiple`, `roundup_to_multiple`
 
 namespace unum::ustore::nvme {
 
@@ -24,18 +23,18 @@ struct key_slot {
     stored_value_size_t size = 0;
     byte_t data[static_cast<std::uint16_t>(value_layout_k)] = {byte_t(0)};
 
-    host_device_m bool is_tombstone() const noexcept { return size == 0; }
-    host_device_m void make_tombstone() noexcept { size = 0; }
-    host_device_m bool is_stored_value_empty() const noexcept { return size == 0; }
+    constexpr bool is_tombstone() const noexcept { return size == 0; }
+    constexpr void make_tombstone() noexcept { size = 0; }
+    constexpr bool is_stored_value_empty() const noexcept { return size == 0; }
 
     stored_value_size_t aligned_buffer_size() const noexcept { return size; }
     stored_value_offset_t aligned_offset_in_file() const noexcept { return 0; }
     stored_value_size_t buffer_padding() const noexcept { return 0; }
 
-    host_device_m bool operator==(key_slot const& other) const noexcept { return stored_key == other.stored_key; }
-    host_device_m bool operator==(stored_key_t other) const noexcept { return stored_key == other; }
-    host_device_m bool operator<(key_slot const& other) const noexcept { return stored_key < other.stored_key; }
-    host_device_m bool operator<(stored_key_t other) const noexcept { return stored_key < other; }
+    constexpr bool operator==(key_slot const& other) const noexcept { return stored_key == other.stored_key; }
+    constexpr bool operator==(stored_key_t other) const noexcept { return stored_key == other; }
+    constexpr bool operator<(key_slot const& other) const noexcept { return stored_key < other.stored_key; }
+    constexpr bool operator<(stored_key_t other) const noexcept { return stored_key < other; }
 };
 
 template <typename stored_key_>
@@ -47,9 +46,9 @@ struct key_slot<stored_key_, value_layout_t::fixed_width_k> {
     stored_value_size_t size = 0;
     stored_value_offset_t location = 0;
 
-    host_device_m bool is_tombstone() const noexcept { return size == 0; }
-    host_device_m void make_tombstone() noexcept { size = 0; }
-    host_device_m bool is_stored_value_empty() const noexcept { return size == 0; }
+    constexpr bool is_tombstone() const noexcept { return size == 0; }
+    constexpr void make_tombstone() noexcept { size = 0; }
+    constexpr bool is_stored_value_empty() const noexcept { return size == 0; }
 
     stored_value_size_t aligned_buffer_size() const noexcept {
         auto padded_size = stored_value_offset_t(size != 0) * (buffer_padding() + size);
@@ -60,10 +59,10 @@ struct key_slot<stored_key_, value_layout_t::fixed_width_k> {
     }
     stored_value_size_t buffer_padding() const noexcept { return location - aligned_offset_in_file(); }
 
-    host_device_m bool operator==(key_slot const& other) const noexcept { return stored_key == other.stored_key; }
-    host_device_m bool operator==(stored_key_t other) const noexcept { return stored_key == other; }
-    host_device_m bool operator<(key_slot const& other) const noexcept { return stored_key < other.stored_key; }
-    host_device_m bool operator<(stored_key_t other) const noexcept { return stored_key < other; }
+    constexpr bool operator==(key_slot const& other) const noexcept { return stored_key == other.stored_key; }
+    constexpr bool operator==(stored_key_t other) const noexcept { return stored_key == other; }
+    constexpr bool operator<(key_slot const& other) const noexcept { return stored_key < other.stored_key; }
+    constexpr bool operator<(stored_key_t other) const noexcept { return stored_key < other; }
 };
 
 template <typename stored_key_>
@@ -75,12 +74,12 @@ struct key_slot<stored_key_, value_layout_t::variable_width_k> {
     stored_value_size_t size = 0;
     stored_value_offset_t location = 0;
 
-    host_device_m bool is_tombstone() const noexcept { return location == tombstone_offset_k; }
-    host_device_m void make_tombstone() noexcept {
+    constexpr bool is_tombstone() const noexcept { return location == tombstone_offset_k; }
+    constexpr void make_tombstone() noexcept {
         size = 0;
         location = tombstone_offset_k;
     }
-    host_device_m bool is_stored_value_empty() const noexcept {
+    constexpr bool is_stored_value_empty() const noexcept {
         return (location == tombstone_offset_k) | (location == empty_stored_value_offset_k);
     }
 
@@ -93,10 +92,10 @@ struct key_slot<stored_key_, value_layout_t::variable_width_k> {
     }
     stored_value_size_t buffer_padding() const noexcept { return location - aligned_offset_in_file(); }
 
-    host_device_m bool operator==(key_slot const& other) const noexcept { return stored_key == other.stored_key; }
-    host_device_m bool operator==(stored_key_t other) const noexcept { return stored_key == other; }
-    host_device_m bool operator<(key_slot const& other) const noexcept { return stored_key < other.stored_key; }
-    host_device_m bool operator<(stored_key_t other) const noexcept { return stored_key < other; }
+    constexpr bool operator==(key_slot const& other) const noexcept { return stored_key == other.stored_key; }
+    constexpr bool operator==(stored_key_t other) const noexcept { return stored_key == other; }
+    constexpr bool operator<(key_slot const& other) const noexcept { return stored_key < other.stored_key; }
+    constexpr bool operator<(stored_key_t other) const noexcept { return stored_key < other; }
 };
 
 } // namespace unum::ustore::nvme

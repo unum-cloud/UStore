@@ -11,6 +11,11 @@ if (USTORE_BUILD_TEST_CPP)
     add_test(NAME ustore_test_nvme_compaction_host COMMAND ustore_test_nvme_compaction_host)
 endif ()
 
+# The GPU half is opt-in, so a plain test build takes the host suite and leaves the toolkit alone
+if (NOT USTORE_BUILD_CUDA)
+    return()
+endif ()
+
 include(CheckLanguage)
 
 # A toolkit installed outside the PATH, which is where the distribution packages put it
@@ -52,9 +57,19 @@ find_package(CUDAToolkit REQUIRED)
 include("${CMAKE_CURRENT_LIST_DIR}/cccl.cmake")
 
 add_library(ustore_nvme_compaction STATIC "${CMAKE_CURRENT_SOURCE_DIR}/src/nvme/compaction.cu")
-target_link_libraries(ustore_nvme_compaction PUBLIC CCCL::CUB CUDA::cudart smashtable::header forkunion::header)
+target_link_libraries(
+    ustore_nvme_compaction
+    PUBLIC CCCL::CUB CUDA::cudart smashtable::header forkunion::header
+    PRIVATE ustore_stringzilla_dispatch
+)
 set_target_properties(ustore_nvme_compaction PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
 target_compile_options(ustore_nvme_compaction PUBLIC $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>)
+# A constexpr function is callable from a kernel, so the shared headers carry no host-device qualifier
+target_compile_options(ustore_nvme_compaction PUBLIC $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+# StringZilla's serial kernels, reached through the engine's key slots, carry GCC pragmas nvcc's front end does not know
+target_compile_options(ustore_nvme_compaction PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--diag-suppress=1675>)
+# Every target linking the library merges on the device, and every other one takes the host branch of the merger
+target_compile_definitions(ustore_nvme_compaction PUBLIC USTORE_USE_CUDA=1)
 
 add_executable(ustore_test_nvme_compaction "${USTORE_COMPACTION_TEST_SOURCE}")
 target_include_directories(ustore_test_nvme_compaction PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/test")

@@ -10,10 +10,7 @@
 #include <cstddef> // `std::byte`, `std::size_t`
 
 #include <algorithm> // `std::min`, `std::max`
-#include <atomic>    // `std::memory_order_relaxed`
 #include <new>       // placement `new`
-
-#include <forkunion/atomics.hpp> // `fu::preferred_atomic_ref`
 
 #include <smashtable/basic_hash_table.hpp> // `st::hash_map`, `st::assume_reserved_t`
 #include <smashtable/basic_vector.hpp>     // `st::basic_vector`
@@ -39,7 +36,7 @@ class write_buffer {
 #pragma region Types
 
     /** Offset into @c stored_values_buffer, 64-bit even though files stay under 4GB, since concurrent
-     * writers may push @c next_stored_value_offset_ past the 32-bit range before the capacity check. */
+     *  writers may push @c next_stored_value_offset_ past the 32-bit range before the capacity check. */
     using stored_value_offset_in_buffer_t = std::size_t;
 
     struct stored_value_place_t {
@@ -88,13 +85,10 @@ class write_buffer {
     inline void select(stored_value_location_ const& location, stored_value_span_t stored_value,
                        notifier_t notifier) const noexcept;
 
-    template <typename... tags_>
-    inline status_t add(stored_key_t stored_key, stored_value_view_t stored_value, tags_... tags) noexcept;
-    template <typename serializable_stored_value_, typename... tags_>
-    inline status_t add(stored_key_t stored_key, serializable_stored_value_ const& stored_value,
-                        tags_... tags) noexcept;
-    template <typename... tags_>
-    inline status_t mark_as_removed(stored_key_t stored_key, tags_... tags) noexcept;
+    inline status_t add(stored_key_t stored_key, stored_value_view_t stored_value) noexcept;
+    template <typename serializable_stored_value_>
+    inline status_t add(stored_key_t stored_key, serializable_stored_value_ const& stored_value) noexcept;
+    inline status_t mark_as_removed(stored_key_t stored_key) noexcept;
 #pragma endregion Interface Methods
 
 #pragma region Batch Methods
@@ -112,9 +106,7 @@ class write_buffer {
     inline status_t check_stored_values(write_buffer const& other) const noexcept;
     inline status_t check_stored_value(stored_key_t stored_key, stored_value_size_t stored_value_size) const noexcept;
 
-    template <typename... tags_>
-    inline bool can_fit(std::size_t stored_values_count, std::size_t stored_values_sum_size,
-                        tags_... tags) const noexcept;
+    inline bool can_fit(std::size_t stored_values_count, std::size_t stored_values_sum_size) const noexcept;
 #pragma endregion Validators
 
 #pragma region Unsafe Methods
@@ -222,7 +214,7 @@ inline write_buffer_status_t write_buffer<stored_key_>::status(stored_key_t stor
             };
             result = results[entry.value().offset == tombstone_offset_k];
         },
-        st::assume_reserved_t {}, concurrent_t {});
+        st::assume_reserved_t {});
 
     return result;
 }
@@ -238,7 +230,7 @@ inline status_t write_buffer<stored_key_>::stored_value_size(stored_key_t stored
             if (entry.value().offset != tombstone_offset_k) size = entry.value().size;
             status = status_t {};
         },
-        st::assume_reserved_t {}, concurrent_t {});
+        st::assume_reserved_t {});
 
     return status;
 }
@@ -271,7 +263,7 @@ inline status_t write_buffer<stored_key_>::select(stored_key_t stored_key, store
             size = span.size();
             status = status_t {};
         },
-        st::assume_reserved_t {}, concurrent_t {});
+        st::assume_reserved_t {});
 
     return status;
 }
@@ -297,7 +289,7 @@ inline write_buffer_status_t write_buffer<stored_key_>::find(stored_key_t stored
                                                           write_buffer_status_t::removed_k};
             result = results[stored_value_place.offset == tombstone_offset_k];
         },
-        st::assume_reserved_t {}, concurrent_t {});
+        st::assume_reserved_t {});
 
     return result;
 }
@@ -332,83 +324,60 @@ inline void write_buffer<stored_key_>::select(stored_value_location_ const& loca
 }
 
 template <typename stored_key_>
-template <typename... tags_>
-inline status_t write_buffer<stored_key_>::add(stored_key_t stored_key, stored_value_view_t stored_value,
-                                               tags_... tags) noexcept {
+inline status_t write_buffer<stored_key_>::add(stored_key_t stored_key, stored_value_view_t stored_value) noexcept {
 
     auto status = check_stored_value(stored_key, stored_value.size());
     if (status.failed()) return status;
 
-    if (!can_fit(1, stored_value.size(), tags...)) [[unlikely]]
+    if (!can_fit(1, stored_value.size())) [[unlikely]]
         return status_t {status_code_t::capacity_exhausted_k, "Cache is full"};
 
     stored_value_offset_in_buffer_t stored_value_offset = 0;
     if (!stored_value.empty()) {
-        if constexpr (st::contains_type<concurrent_t, tags_...>()) {
-            auto count_gap = concurrency_limit_ > 1 ? concurrency_limit_ : 0;
-            stored_value_offset = fu::preferred_atomic_ref<stored_value_offset_in_buffer_t>(next_stored_value_offset_)
-                                      .fetch_add(stored_value.size(), std::memory_order_relaxed);
-            if ((stored_value_offset + stored_value.size() > capacity_bytes_) |
-                (stored_values.size() >= elements_max_count_ - count_gap)) [[unlikely]]
-                return status_t {status_code_t::capacity_exhausted_k, "Cache is full"};
-        }
-        else {
-            stored_value_offset = next_stored_value_offset_;
-            next_stored_value_offset_ += stored_value.size();
-        }
+        stored_value_offset = next_stored_value_offset_;
+        next_stored_value_offset_ += stored_value.size();
         std::memcpy(stored_values_buffer.data() + stored_value_offset, stored_value.data(), stored_value.size());
     }
     else stored_value_offset = empty_stored_value_offset_k;
     stored_values.emplace(stored_key,
                           stored_value_place_t {stored_value_offset, stored_value_size_t(stored_value.size())},
-                          st::assume_reserved_t {}, tags...);
+                          st::assume_reserved_t {});
 
     return status_t {};
 }
 
 template <typename stored_key_>
-template <typename serializable_stored_value_, typename... tags_>
-inline status_t write_buffer<stored_key_>::add(stored_key_t stored_key, serializable_stored_value_ const& stored_value,
-                                               tags_... tags) noexcept {
+template <typename serializable_stored_value_>
+inline status_t write_buffer<stored_key_>::add(stored_key_t stored_key,
+                                               serializable_stored_value_ const& stored_value) noexcept {
 
     stored_value_size_t serialized_size = nvme::storage_requirements(stored_value);
     auto status = check_stored_value(stored_key, serialized_size);
     if (status.failed()) return status;
 
-    if (!can_fit(1, serialized_size, tags...)) [[unlikely]]
+    if (!can_fit(1, serialized_size)) [[unlikely]]
         return status_t {status_code_t::capacity_exhausted_k, "Cache is full"};
 
     stored_value_offset_in_buffer_t stored_value_offset = 0;
-    if constexpr (st::contains_type<concurrent_t, tags_...>()) {
-        auto count_gap = concurrency_limit_ > 1 ? concurrency_limit_ : 0;
-        stored_value_offset = fu::preferred_atomic_ref<stored_value_offset_in_buffer_t>(next_stored_value_offset_)
-                                  .fetch_add(serialized_size, std::memory_order_relaxed);
-        if ((stored_value_offset + serialized_size > capacity_bytes_) |
-            (stored_values.size() >= elements_max_count_ - count_gap)) [[unlikely]]
-            return status_t {status_code_t::capacity_exhausted_k, "Cache is full"};
-    }
-    else {
-        stored_value_offset = next_stored_value_offset_;
-        next_stored_value_offset_ += serialized_size;
-    }
+    stored_value_offset = next_stored_value_offset_;
+    next_stored_value_offset_ += serialized_size;
 
     status = nvme::save(stored_value,
                         bytes_span_t {stored_values_buffer.data() + stored_value_offset, serialized_size});
     if (status.failed()) return status;
     stored_values.emplace(stored_key, stored_value_place_t {stored_value_offset, serialized_size},
-                          st::assume_reserved_t {}, tags...);
+                          st::assume_reserved_t {});
 
     return status_t {};
 }
 
 template <typename stored_key_>
-template <typename... tags_>
-inline status_t write_buffer<stored_key_>::mark_as_removed(stored_key_t stored_key, tags_... tags) noexcept {
+inline status_t write_buffer<stored_key_>::mark_as_removed(stored_key_t stored_key) noexcept {
 
-    if (!can_fit(1, 0, tags...)) [[unlikely]]
+    if (!can_fit(1, 0)) [[unlikely]]
         return status_t {status_code_t::capacity_exhausted_k, "Cache is full"};
 
-    stored_values.emplace(stored_key, stored_value_place_t {tombstone_offset_k, 0}, st::assume_reserved_t {}, tags...);
+    stored_values.emplace(stored_key, stored_value_place_t {tombstone_offset_k, 0}, st::assume_reserved_t {});
     return status_t {};
 }
 
@@ -494,25 +463,13 @@ inline status_t write_buffer<stored_key_>::check_stored_value(stored_key_t store
 }
 
 template <typename stored_key_>
-template <typename... tags_>
-inline bool write_buffer<stored_key_>::can_fit(std::size_t stored_values_count, std::size_t stored_values_sum_size,
-                                               tags_...) const noexcept {
-    auto count_gap = concurrency_limit_ > 1 ? concurrency_limit_ : 0;
-    if constexpr (st::contains_type<concurrent_t, tags_...>()) {
-        auto used_memory = fu::preferred_atomic_ref<stored_value_offset_in_buffer_t const>(next_stored_value_offset_)
-                               .load(std::memory_order_relaxed);
-        bool has_element_place = stored_values.size() + stored_values_count <= elements_max_count_ - count_gap;
-        bool has_enough_space = (used_memory + stored_values_sum_size <= capacity_bytes_) &
-                                (used_memory + stored_values_sum_size <= empty_stored_value_offset_k);
-        return has_element_place & has_enough_space;
-    }
-    else {
-        auto used_memory = next_stored_value_offset_;
-        bool has_element_place = stored_values.size() + stored_values_count <= elements_max_count_;
-        bool has_enough_space = (used_memory + stored_values_sum_size <= capacity_bytes_) &
-                                (used_memory + stored_values_sum_size <= empty_stored_value_offset_k);
-        return has_element_place & has_enough_space;
-    }
+inline bool write_buffer<stored_key_>::can_fit(std::size_t stored_values_count,
+                                               std::size_t stored_values_sum_size) const noexcept {
+    auto used_memory = next_stored_value_offset_;
+    bool has_element_place = stored_values.size() + stored_values_count <= elements_max_count_;
+    bool has_enough_space = (used_memory + stored_values_sum_size <= capacity_bytes_) &
+                            (used_memory + stored_values_sum_size <= empty_stored_value_offset_k);
+    return has_element_place & has_enough_space;
 }
 
 template <typename stored_key_>

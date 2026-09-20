@@ -5,8 +5,8 @@
  *  @brief CUDA devices from the host: specifications, memory, NUMA placement, streams, events and buffers.
  *
  *  Host code over the CUDA runtime API with no kernels, so it compiles under a host compiler whenever the
- *  toolkit's headers are on the include path. Without them only @c host_device_m remains, which kernels and
- *  host code share. Nothing here throws or keeps global state: devices enumerate into a table the caller owns.
+ *  toolkit's headers are on the include path, and to nothing without them. Nothing here throws or keeps
+ *  global state: devices enumerate into a table the caller owns.
  */
 
 #pragma once
@@ -27,13 +27,6 @@
 #include <smashtable/shared.hpp>
 
 #include "executor.hpp"
-#endif
-
-/** Makes a function callable from CUDA kernels as well as from the host, and expands to nothing for a host compiler. */
-#if defined(__CUDACC__)
-#define host_device_m __host__ __device__
-#else
-#define host_device_m
 #endif
 
 #if __has_include(<cuda_runtime.h>)
@@ -516,7 +509,7 @@ class cuda_pinned_allocator {
 };
 
 /** Memory on one device for buffers kernels read, as an allocator that answers null on failure and never touches the
- * bytes. */
+ *  bytes. */
 template <typename value_type_>
 class cuda_device_allocator {
   public:

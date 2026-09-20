@@ -7,7 +7,8 @@
  *  A compaction reads the sorted run indexes of an upper LSM level and of the lower sorted runs it overlaps, keeps the
  *  newest key slot of every stored key, drops tombstones when it writes the bottom LSM level, and lays the survivors
  *  into sorted runs that fit their bounds, planning where every stored value moves. Both compactors share the rules
- *  below, so a host compiler sees the whole contract and a CUDA compiler adds the device path.
+ *  below. A build with @c USTORE_USE_CUDA declares the device compactor for every compiler, its kernels compile under
+ *  nvcc alone, and @c compaction.cu instantiates its compaction for the engine's key slots, so a host TU calls it.
  */
 #pragma once
 
@@ -21,7 +22,7 @@
 #include <type_traits> // `std::is_trivially_copyable_v`
 #include <utility>     // `std::move`, `std::swap`
 
-#if defined(__CUDACC__)
+#if USTORE_USE_CUDA && defined(__CUDACC__)
 #include <cub/device/device_for.cuh>
 #include <cub/device/device_merge.cuh>
 #include <cub/device/device_merge_sort.cuh>
@@ -35,16 +36,16 @@
 
 #include <ustore/types.hpp>
 
-#include "cuda.hpp" // `host_device_m`, so CUDA kernels call these functions too
-#include "nvme/stored_key.hpp"
-#include "nvme/sorted_run_index.hpp"
+#include "cuda.hpp"                  // `cuda_stream_t`
+#include "nvme/stored_key.hpp"       // `limit`, `stored_key_concept`
+#include "nvme/sorted_run_index.hpp" // `sorted_run_index_layout_t`
 
 namespace unum::ustore::nvme {
 
 #pragma region Vocabulary
 
 /** A key slot shape compaction merges: trivially copyable, keyed by a stored key, sized, and able to say whether it is
- * a tombstone. */
+ *  a tombstone. */
 template <typename key_slot_type_>
 concept compactable_key_slot_concept = std::is_trivially_copyable_v<key_slot_type_> &&
                                        stored_key_concept<typename key_slot_type_::stored_key_t> &&
@@ -181,13 +182,13 @@ struct located_key_slot {
 struct survivor_first_t {
 
     /** Sorted runs of the upper LSM level: a newer upper sorted run shadows older ones, and any upper sorted run every
-     * lower one. */
+     *  lower one. */
     std::uint32_t upper_sorted_runs_count = 0;
 
     /** Whether @p first orders before @p second. */
     template <typename key_slot_type_>
-    host_device_m constexpr bool operator()(located_key_slot<key_slot_type_> const& first,
-                                            located_key_slot<key_slot_type_> const& second) const noexcept {
+    constexpr bool operator()(located_key_slot<key_slot_type_> const& first,
+                              located_key_slot<key_slot_type_> const& second) const noexcept {
         if (first.key_slot.stored_key < second.key_slot.stored_key) return true;
         if (second.key_slot.stored_key < first.key_slot.stored_key) return false;
         bool const both_upper = (first.sorted_run < upper_sorted_runs_count) &
@@ -198,9 +199,8 @@ struct survivor_first_t {
 
 /** Whether @p current survives a merge: it leads its stored key, and is not tombstoned where tombstones drop. */
 template <typename key_slot_type_>
-host_device_m constexpr bool survives(located_key_slot<key_slot_type_> const* previous,
-                                      located_key_slot<key_slot_type_> const& current,
-                                      compaction_kind_t kind) noexcept {
+constexpr bool survives(located_key_slot<key_slot_type_> const* previous,
+                        located_key_slot<key_slot_type_> const& current, compaction_kind_t kind) noexcept {
     if (previous != nullptr && previous->key_slot.stored_key == current.key_slot.stored_key) return false;
     bool const drops_tombstones = (kind == compaction_kind_t::overlapping_into_bottom_k) |
                                   (kind == compaction_kind_t::sorted_into_bottom_k);
@@ -208,9 +208,9 @@ host_device_m constexpr bool survives(located_key_slot<key_slot_type_> const* pr
 }
 
 /** Bytes of the stored value @p key_slot locates in a stored values section, zero for empty, tombstoned and inline
- * stored values. */
+ *  stored values. */
 template <typename key_slot_type_>
-host_device_m constexpr std::uint64_t stored_value_bytes(key_slot_type_ const& key_slot) noexcept {
+constexpr std::uint64_t stored_value_bytes(key_slot_type_ const& key_slot) noexcept {
     if constexpr (locates_stored_values_concept<key_slot_type_>)
         return key_slot.is_stored_value_empty() ? 0 : key_slot.size;
     else return 0;
@@ -218,8 +218,8 @@ host_device_m constexpr std::uint64_t stored_value_bytes(key_slot_type_ const& k
 
 /** Offset of the stored values section in a sorted run of @p key_slots_count key slots. */
 template <typename key_slot_type_>
-host_device_m constexpr std::uint64_t stored_values_offset(sorted_run_bounds_t const& bounds,
-                                                           std::uint64_t key_slots_count) noexcept {
+constexpr std::uint64_t stored_values_offset(sorted_run_bounds_t const& bounds,
+                                             std::uint64_t key_slots_count) noexcept {
     std::uint64_t const cells_bytes = round_up(key_slots_count, bounds.branching) * sizeof(key_slot_type_);
     return bounds.header_bytes + round_up(cells_bytes, bounds.alignment_bytes);
 }
@@ -242,7 +242,7 @@ constexpr bool admits_sorted_runs(sorted_run_bounds_t const& bounds) noexcept {
 
 /** The key slot padding cells hold: the greatest stored key, with everything else as a key slot starts. */
 template <typename key_slot_type_>
-host_device_m constexpr key_slot_type_ padding_key_slot() noexcept {
+constexpr key_slot_type_ padding_key_slot() noexcept {
     key_slot_type_ padding {};
     padding.stored_key = limit<typename key_slot_type_::stored_key_t>::max();
     return padding;
@@ -250,9 +250,8 @@ host_device_m constexpr key_slot_type_ padding_key_slot() noexcept {
 
 /** Copies @p cell of a sorted run into its sorted position among @p records, skipping padding. */
 template <typename key_slot_type_>
-host_device_m constexpr void extract_cell(key_slot_type_ const* cells, sorted_run_index_layout_t const& layout,
-                                          std::uint64_t cell, std::uint32_t sorted_run,
-                                          located_key_slot<key_slot_type_>* records) noexcept {
+constexpr void extract_cell(key_slot_type_ const* cells, sorted_run_index_layout_t const& layout, std::uint64_t cell,
+                            std::uint32_t sorted_run, located_key_slot<key_slot_type_>* records) noexcept {
     std::uint64_t const sorted = layout.cell_to_sorted(cell);
     if (sorted < layout.key_slots_count) records[sorted] = located_key_slot<key_slot_type_> {cells[cell], sorted_run};
 }
@@ -269,10 +268,9 @@ host_device_m constexpr void extract_cell(key_slot_type_ const* cells, sorted_ru
  *  @param[out] migration The survivor's migration, written only for key slots that locate stored values.
  */
 template <typename key_slot_type_>
-host_device_m constexpr void place_key_slot(located_key_slot<key_slot_type_> const& source,
-                                            sorted_run_index_layout_t const& layout, std::uint64_t position,
-                                            std::uint64_t section_offset, std::uint64_t preceding_bytes,
-                                            key_slot_type_* cells, stored_value_migration_t* migration) noexcept {
+constexpr void place_key_slot(located_key_slot<key_slot_type_> const& source, sorted_run_index_layout_t const& layout,
+                              std::uint64_t position, std::uint64_t section_offset, std::uint64_t preceding_bytes,
+                              key_slot_type_* cells, stored_value_migration_t* migration) noexcept {
     key_slot_type_ key_slot = source.key_slot;
     if constexpr (locates_stored_values_concept<key_slot_type_>) {
         migration->size = static_cast<std::uint32_t>(stored_value_bytes(key_slot));
@@ -290,7 +288,7 @@ host_device_m constexpr void place_key_slot(located_key_slot<key_slot_type_> con
  *  A sorted run takes the most key slots that fit its capacity and file limit, and always at least one.
  *
  *  @param[in] read_prefix Called as @c read_prefix(index, bytes) to write the stored value bytes of the first @c index
- *  survivors.
+ *      survivors.
  *  @param[out] sorted runs The planned sorted runs, replacing what it held.
  */
 template <typename key_slot_type_, typename prefix_reader_type_, typename sorted_runs_type_>
@@ -494,9 +492,42 @@ struct cpu_compactor_t {
 
 #pragma endregion Host
 
+#if USTORE_USE_CUDA
+
+#pragma region Device
+
+/** Compacts LSM levels on one CUDA device, queueing every transfer and kernel on a stream of its own. */
+class gpu_compactor_t {
+  public:
+
+    /** Binds a compactor to device @p ordinal with a new stream, failing when no such device exists. */
+    static st::expected<gpu_compactor_t> make(int ordinal) noexcept;
+
+    /** Does what @c cpu_compactor_t::compact does with identical output, and reports CUDA failures as statuses. */
+    template <typename key_slot_type_, typename allocator_type_>
+        requires compactable_key_slot_concept<key_slot_type_>
+    st::status_t compact(compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_type_> const> upper,
+                         std::span<sorted_run_index_view<key_slot_type_> const> lower,
+                         sorted_run_bounds_t const& bounds,
+                         compaction_output<key_slot_type_, allocator_type_>& output) noexcept;
+
+    /** The ordinal of the device the compactor runs on. */
+    int device() const noexcept { return stream_.device(); }
+
+  private:
+    explicit gpu_compactor_t(cuda_stream_t&& stream) noexcept : stream_(std::move(stream)) {}
+
+    /** The stream every transfer and kernel of the compactor queues on. */
+    cuda_stream_t stream_;
+};
+
+#pragma endregion Device
+
+#endif
+
 } // namespace unum::ustore::nvme
 
-#if defined(__CUDACC__)
+#if USTORE_USE_CUDA && defined(__CUDACC__)
 
 namespace unum::ustore::nvme {
 
@@ -520,7 +551,7 @@ struct extract_kernel {
     /** Index of the sorted run. */
     std::uint32_t sorted_run;
 
-    host_device_m void operator()(std::int64_t cell) const noexcept {
+    constexpr void operator()(std::int64_t cell) const noexcept {
         extract_cell(cells, layout, static_cast<std::uint64_t>(cell), sorted_run, records);
     }
 };
@@ -538,7 +569,7 @@ struct survivor_kernel {
     /** The kind of compaction, which decides whether tombstones drop. */
     compaction_kind_t kind;
 
-    host_device_m void operator()(std::int64_t index) const noexcept {
+    constexpr void operator()(std::int64_t index) const noexcept {
         located_key_slot<key_slot_type_> const* const previous = index != 0 ? merged + index - 1 : nullptr;
         flags[index] = survives(previous, merged[index], kind) ? 1 : 0;
     }
@@ -554,7 +585,7 @@ struct stored_value_bytes_kernel {
     /** Prefix sums, one slot longer than the survivors. */
     std::uint64_t* prefix;
 
-    host_device_m void operator()(std::int64_t index) const noexcept {
+    constexpr void operator()(std::int64_t index) const noexcept {
         prefix[index + 1] = stored_value_bytes(survivors[index].key_slot);
     }
 };
@@ -569,7 +600,7 @@ struct padding_kernel {
     /** The key slot padding cells hold. */
     key_slot_type_ padding;
 
-    host_device_m void operator()(std::int64_t cell) const noexcept { cells[cell] = padding; }
+    constexpr void operator()(std::int64_t cell) const noexcept { cells[cell] = padding; }
 };
 
 /** Where one new sorted run starts among the survivors and the cells, and where its stored values section begins. */
@@ -610,7 +641,7 @@ struct place_kernel {
     /** One migration per survivor, or null for stored values held inline. */
     stored_value_migration_t* migrations;
 
-    host_device_m void operator()(std::int64_t signed_index) const noexcept {
+    constexpr void operator()(std::int64_t signed_index) const noexcept {
         std::uint64_t const index = static_cast<std::uint64_t>(signed_index);
         std::uint64_t low = 0;
         std::uint64_t high = placements_count;
@@ -624,35 +655,6 @@ struct place_kernel {
         place_key_slot(survivors[index], placement.layout, index - placement.first_key_slot, placement.section_offset,
                        preceding, cells + placement.first_cell, migrations != nullptr ? migrations + index : nullptr);
     }
-};
-
-#pragma endregion Kernels
-
-#pragma region Device
-
-/** Compacts LSM levels on one CUDA device, queueing every transfer and kernel on a stream of its own. */
-class gpu_compactor_t {
-  public:
-
-    /** Binds a compactor to device @p ordinal with a new stream, failing when no such device exists. */
-    static st::expected<gpu_compactor_t> make(int ordinal) noexcept;
-
-    /** Does what @c cpu_compactor_t::compact does with identical output, and reports CUDA failures as statuses. */
-    template <typename key_slot_type_, typename allocator_type_>
-        requires compactable_key_slot_concept<key_slot_type_>
-    st::status_t compact(compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_type_> const> upper,
-                         std::span<sorted_run_index_view<key_slot_type_> const> lower,
-                         sorted_run_bounds_t const& bounds,
-                         compaction_output<key_slot_type_, allocator_type_>& output) noexcept;
-
-    /** The ordinal of the device the compactor runs on. */
-    int device() const noexcept { return stream_.device(); }
-
-  private:
-    explicit gpu_compactor_t(cuda_stream_t&& stream) noexcept : stream_(std::move(stream)) {}
-
-    /** The stream every transfer and kernel of the compactor queues on. */
-    cuda_stream_t stream_;
 };
 
 template <typename key_slot_type_, typename allocator_type_>
@@ -872,7 +874,7 @@ st::status_t gpu_compactor_t::compact(compaction_kind_t kind,
     return stream_.synchronize();
 }
 
-#pragma endregion Device
+#pragma endregion Kernels
 
 } // namespace unum::ustore::nvme
 
