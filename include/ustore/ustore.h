@@ -30,4 +30,5 @@
 #include <ustore/db.h>
 #include <ustore/docs.h>
 #include <ustore/graph.h>
+#include <ustore/pages.h>
 #include <ustore/strings.h>
