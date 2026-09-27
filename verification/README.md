@@ -2,20 +2,21 @@
 
 UStore's engines publish shared state through atomics rather than locks, and its storage layer publishes bytes through syscalls whose order is the only thing standing between a crash and a corrupt database.
 Both are checked here rather than argued about in review: Spin checks a Promela model of a protocol, and GenMC checks the C++ against the real header.
-`check.sh` runs every model, compares each result with the expected one, and stops at the first mismatch.
+`check.sh` runs every model and client through ForkUnion's runner, compares each result with the expected one, and exits with the count of mismatches.
 
 - __`durability.pml`__ — the write, flush, record and catalog order, with a crash injected at every step.
 - __`nvme_ring.pml`__ — an owner's credit against a bounded completion queue and the overflow list behind it.
 - __`nvme_ring_ownership.pml`__ — one issuing thread per ring, and the queue pairs that move between them.
+- __`reader_gates.cpp`__ — the two-slot reader gate of `lsm_tree` and the catalog under GenMC, which finds the freed slot once its fences are dropped.
 - __`transaction_commit.pml`__ — staging and committing across collections at both isolation levels.
 - __`snapshot_lifetime.pml`__ — snapshots created, exported and dropped while writers publish.
 - __`engine_ram.cpp`__ — the in-memory engine's commit path under GenMC, against its real header.
 - __`nvme_compaction.pml`__ — LSM compaction against concurrent readers, with a crash at every step.
 
-Only the first three exist; the rest name what belongs here as the engines that need them arrive.
+The first four exist; the rest name what belongs here as the engines that need them arrive.
 
 The weak-memory models and the GenMC harness live in [`forkunion/verification`](../forkunion/verification/README.md), and a model whose correctness turns on load and store ordering includes them.
-None of the three written here does, since their ordering is made by syscalls, by the kernel's own queues and by a queue pair changing hands rather than by memory accesses.
+None of the three Promela models written here does, since their ordering is made by syscalls, by the kernel's own queues and by a queue pair changing hands rather than by memory accesses.
 
 ## Durability
 

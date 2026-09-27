@@ -143,16 +143,40 @@ jobs:
         run: ctest --preset ${{ matrix.preset }}
 
   verify_models:
-    name: Check Promela Models
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    name: Check Promela Models and GenMC Clients
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-      - name: Install Spin
-        run: sudo apt-get update && sudo apt-get install -y spin
-      - name: Check the Models
+      - name: Pull Git submodules
+        run: git submodule update --init --recursive
+      - name: Install Spin, Clang and the GenMC Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y spin cmake clang-20 llvm-20-dev libffi-dev zlib1g-dev libedit-dev
+      - name: Checkout GenMC
+        uses: actions/checkout@v7
+        with:
+          repository: MPI-SWS/genmc
+          ref: fe124db203f6d1a626057d72f07e25409075d809
+          path: genmc
+      - name: Restore the GenMC Build
+        id: genmc
+        uses: actions/cache@v6
+        with:
+          path: genmc/build
+          key: genmc-fe124db-clang-20
+      - name: Build GenMC
+        if: steps.genmc.outputs.cache-hit != 'true'
+        run: |
+          cmake -S genmc -B genmc/build -D CMAKE_BUILD_TYPE=Release -D CMAKE_C_COMPILER=clang-20 -D CMAKE_CXX_COMPILER=clang++-20 -D LLVM_DIR=/usr/lib/llvm-20/lib/cmake/llvm
+          cmake --build genmc/build --parallel
+      - name: Check the Models and the Clients
         run: verification/check.sh
+        env:
+          GENMC: ${{ github.workspace }}/genmc/build/bin/genmc
+          GENMC_CLANG: clang++-20
 
   test_python:
     name: Python ${{ matrix.python-version }} on ${{ matrix.os }}

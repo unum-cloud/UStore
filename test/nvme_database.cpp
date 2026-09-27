@@ -1009,6 +1009,51 @@ std::size_t snapshot_holds_its_moment(mount_type_ const& mount) {
 }
 
 /**
+ *  @brief Dropping a collection waits for a snapshot still holding its levels, rather than freeing its runs under it.
+ *
+ *  The drop runs on a second thread while the snapshot lives, so it must still be waiting when the snapshot goes.
+ */
+template <typename mount_type_>
+std::size_t drop_waits_for_the_snapshot(mount_type_ const& mount) {
+    using types_t = database_types<typename mount_type_::fixture_t>;
+    using database_t = typename types_t::database_t;
+    using stack_t = typename types_t::stack_t;
+    std::size_t failures = 0;
+    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
+    failures += expect_status(stack, status_code_t::success_k);
+    if (!stack) return failures;
+    database_t& store = *(*stack)->store;
+
+    expected<collection_numeric_id_t> const doomed = store.create_collection("doomed", test_config(8, 0));
+    failures += expect(doomed.has_value());
+    if (failures != 0) return failures;
+    std::array<byte_t, 8> const value = counted(1);
+    failures += expect(
+        store.insert(any_collection_id_t {*doomed}, stored_key_t {1}, stored_value_view_t {value}).succeeded());
+
+    std::atomic<bool> dropped {false};
+    std::atomic<bool> succeeded {false};
+    std::thread dropper;
+    {
+        expected<typename database_t::snapshot_t> const taken = store.take_snapshot();
+        failures += expect(taken.has_value());
+        if (!taken) return failures;
+        dropper = std::thread {[&]() noexcept {
+            succeeded.store(store.drop_collection(any_collection_id_t {*doomed}).succeeded(),
+                            std::memory_order_relaxed);
+            dropped.store(true, std::memory_order_release);
+        }};
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        failures += expect(!dropped.load(std::memory_order_acquire));
+    }
+    dropper.join();
+    failures += expect(dropped.load(std::memory_order_acquire));
+    failures += expect(succeeded.load(std::memory_order_relaxed));
+    failures += expect(!store.contains_collection(*doomed));
+    return failures;
+}
+
+/**
  *  @brief Several threads committing over the same two collections leave a state one serial order explains.
  *
  *  Every attempt reads both counters, writes both back one higher and commits; a conflict is retried.
@@ -1238,6 +1283,7 @@ int main(int argc, char const* argv[]) {
         report(totals, mount, "conflict_spares_the_other", conflict_leaves_the_other_collection_untouched);
         report(totals, mount, "rollback_and_renew", rollback_and_renew_behave);
         report(totals, mount, "snapshot_holds_its_moment", snapshot_holds_its_moment);
+        report(totals, mount, "drop_waits_for_the_snapshot", drop_waits_for_the_snapshot);
         report(totals, mount, "threads_commit_serializably", threads_commit_serializably);
         report(totals, mount, "lookups_outrun_the_write_path", lookups_outrun_the_write_path);
     };

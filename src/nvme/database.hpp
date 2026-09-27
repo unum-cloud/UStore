@@ -28,6 +28,7 @@
 #include <cstring> // `std::memcpy`, `std::memset`
 
 #include <array>       // `std::array`
+#include <atomic>      // `std::atomic_thread_fence`
 #include <memory>      // `std::unique_ptr`
 #include <new>         // `std::nothrow`
 #include <span>        // `std::span`
@@ -821,6 +822,8 @@ class basic_database {
             for (;;) {
                 slot_ = database.live_catalog_slot_();
                 database.catalog_readers_reference_(slot_).fetch_add(1, std::memory_order_acquire);
+                // Pairs with the publisher's fence, so the count and the live slot are never both read stale.
+                std::atomic_thread_fence(std::memory_order_seq_cst);
                 if (database.live_catalog_slot_() == slot_) return;
                 database.catalog_readers_reference_(slot_).fetch_sub(1, std::memory_order_release);
             }
@@ -962,6 +965,8 @@ class basic_database {
         version.store(version.load(std::memory_order_relaxed) + 1, std::memory_order_release);
         fu::preferred_atomic_ref<std::int32_t> {live_catalog_}.store(static_cast<std::int32_t>(staged),
                                                                      std::memory_order_release);
+        // Pairs with the reader's fence, so the retired slot's count is read only after the new slot is visible.
+        std::atomic_thread_fence(std::memory_order_seq_cst);
         for (readers_count_t readers = catalog_readers_reference_(retired).load(std::memory_order_acquire);
              readers != 0; readers = catalog_readers_reference_(retired).load(std::memory_order_acquire))
             fu::preferred_yield_t {}(catalog_readers_[retired], readers, std::size_t {0});

@@ -20,6 +20,7 @@
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`
 
 #include <array>   // `std::array`
+#include <atomic>  // `std::atomic_thread_fence`
 #include <span>    // `std::span`
 #include <utility> // `std::exchange`, `std::move`
 
@@ -223,8 +224,13 @@ class lsm_tree {
         return tree;
     }
 
-    /** Returns every run of every level to the volume, which destroys the tree's data. */
+    /** Returns every run of every level to the volume, which destroys the tree's data, once no snapshot still holds
+     *  either set. */
     status_t destroy(io_channel_t& channel) noexcept {
+        for (std::size_t slot = 0; slot != readers_.size(); ++slot)
+            for (readers_count_t readers = readers_reference_(slot).load(std::memory_order_acquire); readers != 0;
+                 readers = readers_reference_(slot).load(std::memory_order_acquire))
+                fu::preferred_yield_t {}(readers_[slot], readers, std::size_t {0});
         status_t first;
         level_set_t& live = sets_[live_slot_()];
         for (std::size_t number = 0; number != live.size(); ++number)
@@ -242,6 +248,8 @@ class lsm_tree {
         for (;;) {
             std::size_t const slot = live_slot_();
             readers_reference_(slot).fetch_add(1, std::memory_order_acquire);
+            // Pairs with the publisher's fence, so the count and the live slot are never both read stale.
+            std::atomic_thread_fence(std::memory_order_seq_cst);
             if (live_slot_() == slot) {
                 snapshot_t taken;
                 taken.tree_ = this;
@@ -540,6 +548,8 @@ class lsm_tree {
         std::size_t const retired = 1 - staged;
         fu::preferred_atomic_ref<std::int32_t> {live_}.store(static_cast<std::int32_t>(staged),
                                                              std::memory_order_release);
+        // Pairs with the reader's fence, so the retired slot's count is read only after the new slot is visible.
+        std::atomic_thread_fence(std::memory_order_seq_cst);
         for (readers_count_t readers = readers_reference_(retired).load(std::memory_order_acquire); readers != 0;
              readers = readers_reference_(retired).load(std::memory_order_acquire))
             fu::preferred_yield_t {}(readers_[retired], readers, std::size_t {0});
