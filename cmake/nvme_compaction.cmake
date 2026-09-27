@@ -6,7 +6,10 @@ set(USTORE_COMPACTION_HOST_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/test/nvme_compact
 configure_file("${USTORE_COMPACTION_TEST_SOURCE}" "${USTORE_COMPACTION_HOST_SOURCE}" COPYONLY)
 add_executable(ustore_test_nvme_compaction_host "${USTORE_COMPACTION_HOST_SOURCE}")
 target_include_directories(ustore_test_nvme_compaction_host PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/test")
-target_link_libraries(ustore_test_nvme_compaction_host ${LIB_FMT} ustore_warnings smashtable::header forkunion::header)
+target_compile_features(ustore_test_nvme_compaction_host PRIVATE cxx_std_20)
+target_link_libraries(
+    ustore_test_nvme_compaction_host PRIVATE smashtable::header forkunion::header fmt::fmt ustore_warnings
+)
 if (USTORE_BUILD_TEST)
     add_test(NAME ustore_test_nvme_compaction_host COMMAND ustore_test_nvme_compaction_host)
 endif ()
@@ -43,7 +46,7 @@ add_library(ustore_nvme_compaction STATIC "${CMAKE_CURRENT_SOURCE_DIR}/src/nvme/
 target_link_libraries(
     ustore_nvme_compaction
     PUBLIC CCCL::CUB CUDA::cudart smashtable::header forkunion::header
-    PRIVATE ustore_stringzilla_dispatch
+    PRIVATE stringzilla::static
 )
 set_target_properties(ustore_nvme_compaction PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
 target_compile_options(ustore_nvme_compaction PUBLIC $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>)
@@ -56,7 +59,7 @@ target_compile_definitions(ustore_nvme_compaction PUBLIC USTORE_WITH_CUDA=1)
 
 add_executable(ustore_test_nvme_compaction "${USTORE_COMPACTION_TEST_SOURCE}")
 target_include_directories(ustore_test_nvme_compaction PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/test")
-target_link_libraries(ustore_test_nvme_compaction ${LIB_FMT} ustore_nvme_compaction)
+target_link_libraries(ustore_test_nvme_compaction PRIVATE ustore_nvme_compaction fmt::fmt)
 set_target_properties(ustore_test_nvme_compaction PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
 if (USTORE_BUILD_TEST)
     add_test(NAME ustore_test_nvme_compaction COMMAND ustore_test_nvme_compaction)

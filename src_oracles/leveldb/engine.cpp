@@ -972,6 +972,16 @@ void ustore_arena_free(ustore_arena_t arena) { clear_linked_memory(arena); }
 
 void ustore_transaction_free(ustore_transaction_t) {}
 
-void ustore_database_free(ustore_database_t database) { delete reinterpret_cast<database_t*>(database); }
+void ustore_database_free(ustore_database_t database_handle) {
+    if (!database_handle) return;
+    database_t* const database = reinterpret_cast<database_t*>(database_handle);
+    // Snapshots a caller never dropped belong to the database, so they go with it
+    [[maybe_unused]] auto const released = database->snapshots.for_each([&](auto const& slot) noexcept {
+        snapshot_t* const snapshot = reinterpret_cast<snapshot_t*>(slot.key());
+        database->native->ReleaseSnapshot(snapshot->native);
+        delete snapshot;
+    });
+    delete database;
+}
 
 #pragma endregion Memory

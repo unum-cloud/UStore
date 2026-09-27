@@ -618,8 +618,10 @@ std::size_t trivial_insert( //
     static_assert(std::is_trivially_copyable_v<element_>);
     auto const inserted_length = static_cast<std::size_t>(inserted_end - inserted_begin);
     auto const following_length = old_length - offset;
-    std::memmove(begin + offset + inserted_length, begin + offset, following_length * sizeof(element_));
-    std::memcpy(begin + offset, inserted_begin, inserted_length * sizeof(element_));
+    // An empty range may hold null pointers, which `memmove` and `memcpy` must never receive, even for zero bytes
+    if (following_length)
+        std::memmove(begin + offset + inserted_length, begin + offset, following_length * sizeof(element_));
+    if (inserted_length) std::memcpy(begin + offset, inserted_begin, inserted_length * sizeof(element_));
     return old_length + inserted_length;
 }
 

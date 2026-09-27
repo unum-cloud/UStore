@@ -27,6 +27,9 @@ git config core.hooksPath .githooks
 `.githooks/pre-commit` checks the added lines of every staged file against the rules below and runs `clang-format` 22, `ruff`, `dprint` and `cmake-format` when they are installed.
 `.githooks/commit-msg` checks the subject and rejects AI-assistant attribution.
 
+The `release` and `relwithdebinfo` presets build with whatever toolchain the environment provides, MSVC, AppleClang, GCC or Clang.
+`debug`, `check`, `dev`, `trace`, `tsan`, `profile` and `cuda` take Clang and lld, whose sanitizer, tracing and line-table flags they use.
+
 ## Layout and Namespaces
 
 | Directory         | Contents                                                           | Namespace                |

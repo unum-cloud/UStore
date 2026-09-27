@@ -13,6 +13,10 @@
 #include <cstdint> // `std::uint8_t`
 #include <cstdlib> // `std::aligned_alloc`, `std::free`
 
+#if defined(_WIN32)
+#include <malloc.h> // `_aligned_malloc`, `_aligned_free`
+#endif
+
 #include <limits>      // `std::numeric_limits`
 #include <type_traits> // `std::is_nothrow_invocable_v`, `std::remove_reference_t`, `std::true_type`
 #include <utility>     // `std::exchange`, `std::swap`
@@ -49,7 +53,11 @@ class domain_allocator {
         if (count == 0 || count > max_count_k) return nullptr;
         std::size_t const bytes = aligned_bytes_(count);
         if (memory_domain_ == no_memory_domain_k)
+#if defined(_WIN32)
+            return static_cast<value_type_*>(::_aligned_malloc(bytes, alignment_k));
+#else
             return static_cast<value_type_*>(std::aligned_alloc(alignment_k, bytes));
+#endif
         void* memory = nullptr;
         if (fu_allocate_on_domain_id(memory_domain_, bytes, &memory) != fu_success_k) return nullptr;
         return static_cast<value_type_*>(memory);
@@ -57,7 +65,11 @@ class domain_allocator {
 
     /** Releases @p pointer, which must come from @c allocate with the same @p count. */
     void deallocate(value_type_* pointer, std::size_t count) noexcept {
+#if defined(_WIN32)
+        if (memory_domain_ == no_memory_domain_k) return ::_aligned_free(pointer);
+#else
         if (memory_domain_ == no_memory_domain_k) return std::free(pointer);
+#endif
         fu_free_on_domain_id(memory_domain_, pointer, aligned_bytes_(count));
     }
 

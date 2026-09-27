@@ -465,7 +465,7 @@ void update_neighborhoods( //
             std::span<byte_t> const buffer = arena.alloc<byte_t>(
                 bytes_present + bytes_for_relations + bytes_for_degrees, error);
             if (error->status) return;
-            std::memcpy(buffer.data(), entry.content, bytes_present);
+            if (bytes_present) std::memcpy(buffer.data(), entry.content, bytes_present);
             entry.content = reinterpret_cast<ustore_bytes_ptr_t>(buffer.data());
             entry.length = static_cast<ustore_length_t>(bytes_present);
         }

@@ -32,7 +32,7 @@ The `*.hpp` headers beside them wrap the same calls in C++ with RAII handles, ba
 
 ## Installation
 
-UStore builds with CMake, and a project links exactly one engine library: `ustore_embedded_smashtable`, `ustore_embedded_rocksdb`, `ustore_embedded_leveldb` or `ustore_embedded_nvme`.
+UStore builds with CMake, and a project links exactly one engine library: `ustore_embedded_ram`, `ustore_embedded_rocksdb`, `ustore_embedded_leveldb` or `ustore_embedded_nvme`.
 Each of them implements the whole C interface.
 
 ```cmake
@@ -42,7 +42,6 @@ FetchContent_Declare(
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(ustore)
-include_directories(${ustore_SOURCE_DIR}/include)
 target_link_libraries(your_target PRIVATE ustore_embedded_rocksdb)
 ```
 

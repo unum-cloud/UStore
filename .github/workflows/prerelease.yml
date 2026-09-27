@@ -24,7 +24,7 @@ concurrency:
 jobs:
   versioning:
     name: Update Version
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
       - name: Checkout
@@ -51,7 +51,7 @@ jobs:
 
   lint:
     name: Lint
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -80,31 +80,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The base preset's clang and lld are installed on Linux only: macOS links with ld64, Windows builds with MSVC.
+        # The release preset builds with each platform's own toolchain, while the sanitizer presets assume Clang and lld.
         include:
-          - { name: "Linux x86-64", os: ubuntu-24.04, preset: release, configure: "" }
-          - { name: "Linux AArch64", os: ubuntu-24.04-arm, preset: release, configure: "" }
-          - {
-              name: "macOS arm64",
-              os: macos-15,
-              preset: release,
-              configure: "-DCMAKE_EXE_LINKER_FLAGS= -DCMAKE_SHARED_LINKER_FLAGS=",
-            }
-          - {
-              name: "Windows x86-64",
-              os: windows-2025,
-              preset: release,
-              configure: "-DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl -DCMAKE_EXE_LINKER_FLAGS= -DCMAKE_SHARED_LINKER_FLAGS=",
-            }
-          # LevelDB 1.23's env_posix.cc names std::memory_order::memory_order_relaxed, which libstdc++ 15 dropped,
-          # so the sanitizer trees build without it.
-          - {
-              name: "Linux x86-64 with ASan and UBSan",
-              os: ubuntu-24.04,
-              preset: debug,
-              configure: "-DUSTORE_WITH_LEVELDB=OFF",
-            }
-          - { name: "Linux x86-64 with TSan", os: ubuntu-24.04, preset: tsan, configure: "-DUSTORE_WITH_LEVELDB=OFF" }
+          - { name: "Linux x86-64", os: ubuntu-26.04, preset: release }
+          - { name: "Linux AArch64", os: ubuntu-26.04-arm, preset: release }
+          - { name: "macOS arm64", os: macos-26, preset: release }
+          - { name: "Windows x86-64", os: windows-2025, preset: release }
+          - { name: "Windows ARM64", os: windows-11-arm, preset: release }
+          - { name: "Linux x86-64 with ASan and UBSan", os: ubuntu-26.04, preset: debug }
+          - { name: "Linux x86-64 with TSan", os: ubuntu-26.04, preset: tsan }
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -123,6 +107,8 @@ jobs:
       - name: Set Up MSVC
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
 
       # Sanitizer runtimes crash under the runner kernel's 32-bit mmap randomization.
       - name: Lower ASLR Entropy
@@ -135,8 +121,12 @@ jobs:
           path: build_${{ matrix.preset }}/_deps
           key: deps-${{ runner.os }}-${{ runner.arch }}-${{ matrix.preset }}-${{ hashFiles('cmake/*.cmake') }}
 
+      # Ninja takes the first compiler on the path, which on Windows runners can be MinGW's
       - name: Configure
-        run: cmake --preset ${{ matrix.preset }} ${{ matrix.configure }}
+        env:
+          CC: ${{ runner.os == 'Windows' && 'cl' || '' }}
+          CXX: ${{ runner.os == 'Windows' && 'cl' || '' }}
+        run: cmake --preset ${{ matrix.preset }}
       - name: Build
         run: cmake --build --preset ${{ matrix.preset }}
       - name: Test
@@ -185,7 +175,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, windows-2025]
+        os: [ubuntu-26.04, ubuntu-26.04-arm, macos-26, windows-2025, windows-11-arm]
         python-version: ["3.12", "3.14t"]
     steps:
       - name: Checkout
@@ -216,7 +206,7 @@ jobs:
   # exercises SmashTable, the default link, on every platform.
   test_python_engines:
     name: Python on ${{ matrix.engine }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -252,7 +242,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, windows-2025]
+        os: [ubuntu-26.04, ubuntu-26.04-arm, macos-26, windows-2025, windows-11-arm]
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -263,7 +253,7 @@ jobs:
         with:
           components: clippy
       - name: Lint Rust
-        if: matrix.os == 'ubuntu-24.04'
+        if: matrix.os == 'ubuntu-26.04'
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Test Rust
         run: cargo test --all-features
@@ -277,7 +267,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15]
+        os: [ubuntu-26.04, macos-26]
         python-version: ["312", "314t"]
     steps:
       - name: Checkout

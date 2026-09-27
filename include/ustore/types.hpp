@@ -370,7 +370,7 @@ inline ustore_vertex_role_t invert(ustore_vertex_role_t role) noexcept {
     case ustore_vertex_role_any_k: return ustore_vertex_role_unknown_k;
     case ustore_vertex_role_unknown_k: return ustore_vertex_role_any_k;
     }
-    __builtin_unreachable();
+    return ustore_vertex_role_unknown_k;
 }
 
 constexpr std::size_t bits_in_byte_k = 8;

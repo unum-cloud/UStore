@@ -7,10 +7,15 @@
 
 #pragma once
 
-#include <cstddef>    // `std::size_t`
-#include <cstdint>    // `std::uintptr_t`
-#include <cstring>    // `std::memcpy`
+#include <cstddef> // `std::size_t`
+#include <cstdint> // `std::uintptr_t`
+#include <cstring> // `std::memcpy`
+
+#if defined(_WIN32)
+#include <windows.h> // `VirtualAlloc`, `VirtualFree`
+#else
 #include <sys/mman.h> // `mmap`, `munmap`
+#endif
 
 #include <algorithm>   // `std::max`
 #include <new>         // placement `new`
@@ -83,8 +88,13 @@ struct linked_memory_t {
             if (fu_allocate_on_domain_id(domain_id_k, length, &begin) != fu_success_k) return nullptr;
             break;
         case kind_t::shared_k:
+#if defined(_WIN32)
+            // Windows has no `fork` for shared anonymous pages to survive, so plain committed pages serve
+            begin = ::VirtualAlloc(nullptr, length, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
             begin = ::mmap(nullptr, length, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_SHARED, -1, 0);
             if (begin == MAP_FAILED) return nullptr;
+#endif
             break;
         }
         if (!begin) return nullptr;
@@ -99,7 +109,11 @@ struct linked_memory_t {
     static void release_arena(arena_header_t* arena) noexcept {
         switch (arena->kind) {
         case kind_t::private_k: fu_free_on_domain_id(domain_id_k, arena, arena->capacity); break;
+#if defined(_WIN32)
+        case kind_t::shared_k: ::VirtualFree(arena, 0, MEM_RELEASE); break;
+#else
         case kind_t::shared_k: ::munmap(arena, arena->capacity); break;
+#endif
         }
     }
 

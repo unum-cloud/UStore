@@ -24,9 +24,14 @@ if (NOT leveldb_POPULATED)
         OFF
         CACHE BOOL "Build with snappy compression library"
     )
-    set(RTTI
+    # Probed libraries would make the archive depend on whatever the build machine has installed.
+    set(HAVE_CRC32C
         OFF
-        CACHE BOOL "Build with RTTI"
+        CACHE BOOL "Build with the crc32c library"
+    )
+    set(HAVE_TCMALLOC
+        OFF
+        CACHE BOOL "Build with tcmalloc"
     )
 
     # Should not be set globally, but just for this target!
@@ -34,6 +39,7 @@ if (NOT leveldb_POPULATED)
     add_subdirectory(${leveldb_SOURCE_DIR} ${leveldb_BINARY_DIR} EXCLUDE_FROM_ALL)
     # LevelDB's own sources keep -Werror -Wthread-safety, which it would otherwise impose on every consumer.
     set_property(TARGET leveldb PROPERTY INTERFACE_COMPILE_OPTIONS "")
+    add_library(leveldb::leveldb ALIAS leveldb)
 endif ()
 
 include_directories(${leveldb_SOURCE_DIR}/include)

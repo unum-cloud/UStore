@@ -15,7 +15,7 @@ permissions:
 jobs:
   versioning:
     name: Update Version
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -45,7 +45,7 @@ jobs:
   rebase:
     name: Rebase Dev Branch
     needs: versioning
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - name: Checkout the latest code
         uses: actions/checkout@v7
@@ -75,16 +75,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The base preset's clang and lld are installed on Linux only: macOS links with ld64, Windows builds with MSVC.
+        # The release preset builds with each platform's own toolchain.
         include:
-          - { platform: linux_x86_64, os: ubuntu-24.04, configure: "" }
-          - { platform: linux_aarch64, os: ubuntu-24.04-arm, configure: "" }
-          - { platform: macos_arm64, os: macos-15, configure: "-DCMAKE_EXE_LINKER_FLAGS= -DCMAKE_SHARED_LINKER_FLAGS=" }
-          - {
-              platform: windows_x86_64,
-              os: windows-2025,
-              configure: "-DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl -DCMAKE_EXE_LINKER_FLAGS= -DCMAKE_SHARED_LINKER_FLAGS=",
-            }
+          - { platform: linux_x86_64, os: ubuntu-26.04 }
+          - { platform: linux_aarch64, os: ubuntu-26.04-arm }
+          - { platform: macos_arm64, os: macos-26 }
+          - { platform: windows_x86_64, os: windows-2025 }
+          - { platform: windows_arm64, os: windows-11-arm }
     defaults:
       run:
         shell: bash
@@ -108,6 +105,8 @@ jobs:
       - name: Set Up MSVC
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
 
       - name: Restore Fetched Dependencies
         uses: actions/cache@v6
@@ -115,9 +114,13 @@ jobs:
           path: build_release/_deps
           key: deps-${{ runner.os }}-${{ runner.arch }}-release-${{ hashFiles('cmake/*.cmake') }}
 
+      # Ninja takes the first compiler on the path, which on Windows runners can be MinGW's
       - name: Build
+        env:
+          CC: ${{ runner.os == 'Windows' && 'cl' || '' }}
+          CXX: ${{ runner.os == 'Windows' && 'cl' || '' }}
         run: |
-          cmake --preset release ${{ matrix.configure }} \
+          cmake --preset release \
             -DUSTORE_INSTALL=ON \
             -DUSTORE_BUILD_TEST=OFF \
             -DUSTORE_BUILD_BENCH=OFF \
@@ -148,7 +151,7 @@ jobs:
       matrix:
         # One entry per interpreter variant: a `cp314-*` glob stops before the `t`.
         python-version: ["312", "313", "314", "314t"]
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, windows-2025]
+        os: [ubuntu-26.04, ubuntu-26.04-arm, macos-26, windows-2025, windows-11-arm]
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -182,7 +185,7 @@ jobs:
   build_sdist:
     name: Source Distribution
     needs: versioning
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -200,13 +203,13 @@ jobs:
           python -m pip install --upgrade build
           python -m build --sdist
 
-      # The extension builds from the C ABI headers and the sibling submodules, so a sdist without them installs nowhere.
-      - name: Assert the Headers Travel
+      # The extension configures from the siblings' CMake trees and instruction-set probes, so the sdist must configure
+      # on its own, not merely carry the headers.
+      - name: Configure the Unpacked Source Distribution
         run: |
-          listing=$(tar tzf dist/*.tar.gz)
-          for pattern in "include/ustore/db\.h" "smashtable/include/" "stringzilla/include/" "numkong/include/" "forkunion/include/"; do
-            printf '%s\n' "$listing" | grep -q "$pattern" || { echo "::error::the sdist lacks $pattern"; exit 1; }
-          done
+          mkdir sdist_check && tar xzf dist/*.tar.gz -C sdist_check --strip-components=1
+          cmake -S sdist_check -B sdist_check/build \
+            -DUSTORE_BUILD_LIB_PYTHON=ON -DUSTORE_BUILD_TEST=OFF -DUSTORE_BUILD_BENCH=OFF -DUSTORE_BUILD_TOOLS=OFF
 
       - name: Upload Source Distribution
         uses: actions/upload-artifact@v7
@@ -217,7 +220,7 @@ jobs:
   publish_python:
     name: Publish Python
     needs: [build_wheels, build_sdist]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     environment:
       name: pypi
       url: https://pypi.org/p/ustore
@@ -240,7 +243,7 @@ jobs:
   publish_rust:
     name: Publish Rust
     needs: versioning
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     env:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:

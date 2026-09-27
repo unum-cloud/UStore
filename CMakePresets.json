@@ -9,23 +9,31 @@
     {
       "name": "base",
       "hidden": true,
-      "description": "Ninja, LLVM, a build tree named after the preset, and a compilation database for the language server. `lld` links several times faster than `bfd`. Export CMAKE_CXX_COMPILER_LAUNCHER=ccache to cache objects; point CC/CXX elsewhere for GCC or MSVC. No preset adds instruction-set flags, so every tree runs on any CPU of its architecture.",
+      "description": "Ninja, a build tree named after the preset, and a compilation database for the language server, on whatever toolchain the environment provides: MSVC, AppleClang, GCC or Clang. Export CMAKE_CXX_COMPILER_LAUNCHER=ccache to cache objects. No preset adds instruction-set flags, so every tree runs on any CPU of its architecture.",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build_${presetName}",
       "cacheVariables": {
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "CMAKE_C_COMPILER": "clang",
-        "CMAKE_CXX_COMPILER": "clang++",
-        "CMAKE_EXE_LINKER_FLAGS": "-fuse-ld=lld",
-        "CMAKE_SHARED_LINKER_FLAGS": "-fuse-ld=lld",
         "CMAKE_OPTIMIZE_DEPENDENCIES": "ON",
         "USTORE_WITH_ROCKSDB": "ON",
         "USTORE_WITH_LEVELDB": "ON"
       }
     },
     {
-      "name": "debug",
+      "name": "llvm",
+      "hidden": true,
       "inherits": "base",
+      "description": "Clang and lld, which the sanitizer, tracing and line-table flags of the development presets assume. `lld` links several times faster than `bfd` and `ld64`.",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_EXE_LINKER_FLAGS": "-fuse-ld=lld",
+        "CMAKE_SHARED_LINKER_FLAGS": "-fuse-ld=lld"
+      }
+    },
+    {
+      "name": "debug",
+      "inherits": "llvm",
       "displayName": "Debug - suites under AddressSanitizer",
       "description": "Unoptimized suites and the CLI on every engine, with AddressSanitizer and UndefinedBehaviorSanitizer.",
       "cacheVariables": {
@@ -40,7 +48,7 @@
     },
     {
       "name": "check",
-      "inherits": "base",
+      "inherits": "llvm",
       "displayName": "Check - fastest compile cycle",
       "description": "Does it still compile, nothing more: -O0 without debug information over every UStore target.",
       "cacheVariables": {
@@ -82,7 +90,7 @@
     },
     {
       "name": "profile",
-      "inherits": "base",
+      "inherits": "llvm",
       "displayName": "Profile - benchmarks under perf",
       "description": "The profiling tree behind bench/README.md: full optimization, plus the symbols `perf` needs to attribute samples.",
       "cacheVariables": {
@@ -97,7 +105,7 @@
     },
     {
       "name": "tsan",
-      "inherits": "base",
+      "inherits": "llvm",
       "displayName": "TSan - concurrency suites under ThreadSanitizer",
       "description": "-fsanitize=thread over RelWithDebInfo, in a tree of its own because Debug arms AddressSanitizer, which cannot share a process with it. -O1 keeps the instrumented stress suites tolerable.",
       "cacheVariables": {
@@ -112,7 +120,7 @@
     },
     {
       "name": "dev",
-      "inherits": "base",
+      "inherits": "llvm",
       "displayName": "Dev - everything",
       "description": "The iteration tree that `.clangd` reads: every CPU target, optimized enough to run, with line tables instead of full DWARF.",
       "cacheVariables": {

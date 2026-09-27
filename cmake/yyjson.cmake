@@ -7,4 +7,5 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(yyjson)
 set_property(TARGET yyjson PROPERTY POSITION_INDEPENDENT_CODE ON)
+add_library(yyjson::yyjson ALIAS yyjson)
 include_directories(${yyjson_SOURCE_DIR}/src)

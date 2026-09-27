@@ -50,7 +50,7 @@ if (NOT rocksdb_POPULATED)
         CACHE INTERNAL ""
     )
 
-    set(BUILD_SHARED
+    set(ROCKSDB_BUILD_SHARED
         OFF
         CACHE INTERNAL ""
     )
@@ -62,12 +62,12 @@ if (NOT rocksdb_POPULATED)
         OFF
         CACHE INTERNAL ""
     )
-    set(CMAKE_ENABLE_SHARED
-        OFF
-        CACHE INTERNAL ""
-    )
     FetchContent_Populate(rocksdb)
     add_subdirectory(${rocksdb_SOURCE_DIR} ${rocksdb_BINARY_DIR} EXCLUDE_FROM_ALL)
+    add_library(rocksdb::rocksdb ALIAS rocksdb)
+    # RocksDB loads fixed-width integers from unaligned addresses on purpose, and exempts those loads from the
+    # undefined-behavior sanitizer only when told a sanitized build is running
+    target_compile_definitions(rocksdb PRIVATE ROCKSDB_UBSAN_RUN)
 endif ()
 
 include_directories(${rocksdb_SOURCE_DIR}/include)

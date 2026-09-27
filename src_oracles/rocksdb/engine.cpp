@@ -12,16 +12,18 @@
 #include <cstdint> // `std::uint64_t`
 #include <cstring> // `std::memcpy`, `std::strlen`
 
-#include <array>       // `std::array`
-#include <charconv>    // `std::to_chars`
-#include <limits>      // `std::numeric_limits`
-#include <memory>      // `std::unique_ptr`
-#include <mutex>       // `std::lock_guard`, `std::mutex`, `std::unique_lock`
-#include <new>         // `std::bad_alloc`, `std::nothrow`
-#include <span>        // `std::span`
-#include <string>      // `std::string`, the path and name type RocksDB takes
-#include <string_view> // `std::string_view`
-#include <vector>      // `std::vector`, the descriptor, handle and file lists RocksDB takes
+#include <array>        // `std::array`
+#include <charconv>     // `std::to_chars`
+#include <filesystem>   // `std::filesystem::remove`
+#include <limits>       // `std::numeric_limits`
+#include <memory>       // `std::unique_ptr`
+#include <mutex>        // `std::lock_guard`, `std::mutex`, `std::unique_lock`
+#include <new>          // `std::bad_alloc`, `std::nothrow`
+#include <span>         // `std::span`
+#include <string>       // `std::string`, the path and name type RocksDB takes
+#include <string_view>  // `std::string_view`
+#include <system_error> // `std::error_code`
+#include <vector>       // `std::vector`, the descriptor, handle and file lists RocksDB takes
 
 #include <rocksdb/db.h>
 #include <rocksdb/sst_file_writer.h>
@@ -393,8 +395,33 @@ native_status_t export_column(::rocksdb::Iterator& iterator, ::rocksdb::Options 
         ingest_options.move_files = true;
         status = target.IngestExternalFile(column, {file_path}, ingest_options);
     }
-    if (!status.ok()) { [[maybe_unused]] native_status_t const removed = options.env->DeleteFile(file_path); }
     return status;
+}
+
+/** Points @p file_path at the SST file an export at @p path writes for the collection at @p column_index, named apart
+ *  from the numbered files RocksDB owns in the same directory. */
+void column_file_path(std::string& file_path, std::string const& path, std::size_t column_index) {
+    char digits[std::numeric_limits<std::size_t>::digits10 + 1];
+    char const* const digits_end = std::to_chars(digits, digits + sizeof(digits), column_index).ptr;
+    file_path.assign(path)
+        .append("/column-")
+        .append(digits, static_cast<std::size_t>(digits_end - digits))
+        .append(".sst");
+}
+
+/** Removes what a failed export of @p columns_count collections left at @p path, answering whether nothing remains:
+ *  first the SST files, which RocksDB does not recognize as its own, then the database around them. */
+bool remove_partial_export(std::string const& path, ::rocksdb::Options const& options, std::size_t columns_count) {
+    bool removed = true;
+    std::string file_path;
+    for (std::size_t column_index = 0; column_index != columns_count; ++column_index) {
+        column_file_path(file_path, path, column_index);
+        // A file that was never written, or was already moved in by an ingestion, is no error
+        std::error_code error;
+        std::filesystem::remove(file_path, error);
+        removed = removed && !error;
+    }
+    return ::rocksdb::DestroyDB(path, options).ok() && removed;
 }
 
 #pragma endregion Snapshots
@@ -621,7 +648,6 @@ void snapshot_export(ustore_snapshot_export_t& arguments) {
     ::rocksdb::ColumnFamilyOptions column_options;
     column_options.comparator = &key_comparator_k;
     std::string file_path;
-    char digits[std::numeric_limits<std::size_t>::digits10 + 1];
 
     for (std::size_t column_index = 0; status.ok() && column_index != database.columns.size(); ++column_index) {
         column_t* const column = database.columns[column_index];
@@ -630,12 +656,7 @@ void snapshot_export(ustore_snapshot_export_t& arguments) {
             status = exported->CreateColumnFamily(column_options, column->GetName(), &target);
         if (!status.ok()) break;
 
-        // File names stay apart from the numbered ones RocksDB owns in the same directory
-        char const* const digits_end = std::to_chars(digits, digits + sizeof(digits), column_index).ptr;
-        file_path.assign(path)
-            .append("/column-")
-            .append(digits, static_cast<std::size_t>(digits_end - digits))
-            .append(".sst");
+        column_file_path(file_path, path, column_index);
 
         std::unique_ptr<::rocksdb::Iterator> iterator {database.native->NewIterator(snapshot_options, column)};
         status = iterator ? export_column(*iterator, options, file_path, *exported, target)
@@ -644,8 +665,10 @@ void snapshot_export(ustore_snapshot_export_t& arguments) {
     }
 
     exported.reset();
-    if (!status.ok()) { [[maybe_unused]] native_status_t const destroyed = ::rocksdb::DestroyDB(path, options); }
-    export_error(status, arguments.error);
+    if (!export_error(status, arguments.error)) return;
+    // A failed export removes what it wrote, and says so when it cannot, since the path then refuses every retry
+    if (!remove_partial_export(path, options, database.columns.size()))
+        arguments.error->message = "Failed to export the snapshot, and to remove the files it left behind";
 }
 
 void snapshot_drop(ustore_snapshot_drop_t& arguments) {
@@ -1473,6 +1496,12 @@ void ustore_transaction_free(ustore_transaction_t transaction) { delete reinterp
 void ustore_database_free(ustore_database_t database_handle) {
     if (!database_handle) return;
     database_t* const database = reinterpret_cast<database_t*>(database_handle);
+    // Snapshots a caller never dropped belong to the database, so they go with it
+    [[maybe_unused]] auto const released = database->snapshots.for_each([&](auto const& slot) noexcept {
+        snapshot_t* const snapshot = reinterpret_cast<snapshot_t*>(slot.key());
+        database->native->ReleaseSnapshot(snapshot->native);
+        delete snapshot;
+    });
     for (column_t* const column : database->columns) database->native->DestroyColumnFamilyHandle(column);
     database->native.reset();
     delete database;

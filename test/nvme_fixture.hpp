@@ -17,7 +17,9 @@
 #include <cstdio>  // `std::remove`
 #include <cstring> // `std::memset`
 
+#if defined(__linux__)
 #include <sys/vfs.h> // `statfs`
+#endif
 
 #include <array>       // `std::array`
 #include <memory>      // `std::unique_ptr`, `std::make_shared`
@@ -199,10 +201,14 @@ struct test_environment_t {
 constexpr std::uint64_t memory_filesystem_magic_k = 0x01021994ull;
 
 /** Whether @p directory lives in memory, where @c O_DIRECT is accepted and alignment is ignored. */
-[[nodiscard]] inline bool on_memory_filesystem(char const* directory) noexcept {
+[[nodiscard]] inline bool on_memory_filesystem([[maybe_unused]] char const* directory) noexcept {
+#if defined(__linux__)
     struct statfs description {};
     if (::statfs(directory, &description) != 0) return false;
     return static_cast<std::uint64_t>(description.f_type) == memory_filesystem_magic_k;
+#else
+    return false;
+#endif
 }
 
 /** Why this machine offers no io_uring, or null when it does. */

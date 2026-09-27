@@ -19,7 +19,7 @@ const KNOWN_OPTIONS: &[(&str, Option<&str>)] = &[
     ("USTORE_BUILD_BENCH", None),
     ("USTORE_BUILD_TOOLS", None),
     ("USTORE_BUILD_LIB_PYTHON", None),
-    ("USTORE_BUILD_UDISK", None),
+    ("USTORE_BUILD_NVME", None),
     ("USTORE_BUILD_CUDA", None),
 ];
 
@@ -45,9 +45,12 @@ const SOURCES: &[&str] = &[
     "stringzilla/CMakeLists.txt",
     "stringzilla/cmake",
     "stringzilla/c/stringzilla",
+    "stringzilla/probes",
     "stringzilla/include",
     "forkunion/CMakeLists.txt",
+    "forkunion/cmake",
     "forkunion/c",
+    "forkunion/probes",
     "forkunion/include",
 ];
 

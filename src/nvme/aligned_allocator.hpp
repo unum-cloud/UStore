@@ -10,6 +10,10 @@
 #include <cstddef> // `std::size_t`
 #include <cstdlib> // `std::aligned_alloc`, `std::free`
 
+#if defined(_WIN32)
+#include <malloc.h> // `_aligned_malloc`, `_aligned_free`
+#endif
+
 #include <limits>      // `std::numeric_limits`
 #include <type_traits> // `std::true_type`
 
@@ -44,11 +48,21 @@ class aligned_allocator {
     /** Allocates room for @p count values on an aligned boundary, or answers @c nullptr. */
     [[nodiscard]] value_type_* allocate(std::size_t count) noexcept {
         if (count == 0 || count > max_count_k) return nullptr;
+#if defined(_WIN32)
+        return static_cast<value_type_*>(::_aligned_malloc(aligned_bytes(count), alignment_k));
+#else
         return static_cast<value_type_*>(std::aligned_alloc(alignment_k, aligned_bytes(count)));
+#endif
     }
 
     /** Releases @p pointer, which must come from @c allocate. */
-    void deallocate(value_type_* pointer, std::size_t) noexcept { std::free(pointer); }
+    void deallocate(value_type_* pointer, std::size_t) noexcept {
+#if defined(_WIN32)
+        ::_aligned_free(pointer);
+#else
+        std::free(pointer);
+#endif
+    }
 
     /** The bytes @p count values occupy once rounded up to the alignment. */
     static constexpr std::size_t aligned_bytes(std::size_t count) noexcept {

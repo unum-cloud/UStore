@@ -11,9 +11,6 @@
 #include <cstddef> // `std::size_t`
 
 #if defined(_WIN32)
-#if !defined(NOMINMAX)
-#define NOMINMAX
-#endif
 #include <windows.h> // `CreateFileW`, `ReadFile`, `WriteFile`, `FindFirstFileW`
 #else
 #include <dirent.h>   // `opendir`, `readdir`, `closedir`

@@ -48,7 +48,7 @@ cmake.build-type = "Release"
 cmake.version = ">=3.25"
 install.components = ["ustore_python"]
 minimum-version = "build-system.requires"
-sdist.exclude = ["/v1.md", "/numkong/**", "/stringzilla/**", "/smashtable/**", "/forkunion/**"]
+sdist.exclude = ["/build*/**", "/target/**", "/v1.md", "/numkong/**", "/stringzilla/**", "/smashtable/**", "/forkunion/**"]
 sdist.include = [
   "/CMakeLists.txt",
   "/CMakePresets.json",
@@ -61,12 +61,21 @@ sdist.include = [
   "/tools/**",
   "/python/**",
   "/numkong/include/**",
+  "/stringzilla/CMakeLists.txt",
+  "/stringzilla/VERSION",
+  "/stringzilla/cmake/**",
+  "/stringzilla/c/**",
+  "/stringzilla/probes/**",
   "/stringzilla/include/**",
+  "/smashtable/CMakeLists.txt",
+  "/smashtable/VERSION",
+  "/smashtable/cmake/**",
   "/smashtable/include/**",
   "/forkunion/CMakeLists.txt",
   "/forkunion/VERSION",
   "/forkunion/cmake/**",
   "/forkunion/c/**",
+  "/forkunion/probes/**",
   "/forkunion/include/**",
 ]
 wheel.packages = ["python/ustore"]
@@ -119,4 +128,4 @@ repair-wheel-command = "auditwheel repair -w {dest_dir} {wheel}"
 archs = ["arm64"]
 
 [tool.cibuildwheel.windows]
-archs = ["AMD64"]
+archs = ["AMD64", "ARM64"]

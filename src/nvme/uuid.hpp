@@ -12,9 +12,10 @@
 #include <cstring> // `std::memcpy`
 
 #if defined(_WIN32)
-#include <stdlib.h> // `rand_s`
+#include <windows.h> // `NTSTATUS`, which <bcrypt.h> needs
+#include <bcrypt.h>  // `BCryptGenRandom`
 #else
-#include <unistd.h> // `getentropy`
+#include <sys/random.h> // `getentropy`
 #endif
 
 #include <compare> // `std::strong_ordering`
@@ -154,16 +155,10 @@ static_assert(sizeof(uuid_t) == uuid_t::size_bytes_k, "An identifier is its sixt
 /** Fills @p destination with bytes from the operating system, answering whether it could. */
 inline bool fill_with_entropy(std::span<std::uint8_t> destination) noexcept {
 #if defined(_WIN32)
-    for (std::size_t offset = 0; offset < destination.size(); offset += sizeof(unsigned int)) {
-        unsigned int word = 0;
-        if (rand_s(&word) != 0) return false;
-        std::size_t const bytes = destination.size() - offset < sizeof(word) ? destination.size() - offset
-                                                                             : sizeof(word);
-        std::memcpy(destination.data() + offset, &word, bytes);
-    }
-    return true;
+    return ::BCryptGenRandom(nullptr, destination.data(), static_cast<ULONG>(destination.size()),
+                             BCRYPT_USE_SYSTEM_PREFERRED_RNG) >= 0;
 #else
-    return getentropy(destination.data(), destination.size()) == 0;
+    return ::getentropy(destination.data(), destination.size()) == 0;
 #endif
 }
 

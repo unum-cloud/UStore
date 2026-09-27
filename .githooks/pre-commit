@@ -374,7 +374,7 @@ check_include_groups() {
                   "cstddef cstdint cstdio cstdlib cstring ctime cuchar cwchar cwctype", names, " ")
             for (n in names) clibrary[names[n]] = 1
             split("dirent.h dlfcn.h errno.h fcntl.h ftw.h poll.h pthread.h sched.h signal.h stdio.h stdlib.h " \
-                  "string.h time.h unistd.h io.h windows.h", names, " ")
+                  "string.h time.h unistd.h io.h windows.h bcrypt.h malloc.h", names, " ")
             for (n in names) platform[names[n]] = 1
             split("smashtable stringzilla forkunion numkong", names, " ")
             for (n in names) sibling[names[n]] = 1

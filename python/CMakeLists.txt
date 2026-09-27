@@ -23,6 +23,7 @@ set_target_properties(
     PROPERTIES OUTPUT_NAME "lib"
                C_STANDARD 11
                C_STANDARD_REQUIRED ON
+               C_EXTENSIONS OFF
                LINKER_LANGUAGE CXX
 )
 
@@ -43,7 +44,7 @@ set(USTORE_PYTHON_ENGINE
 if (NOT USTORE_PYTHON_ENGINE IN_LIST USTORE_ENGINE_NAMES)
     message(FATAL_ERROR "USTORE_PYTHON_ENGINE names '${USTORE_PYTHON_ENGINE}', which this tree does not build")
 endif ()
-target_link_libraries(ustore_python PRIVATE ustore_embedded_${USTORE_PYTHON_ENGINE})
+target_link_libraries(ustore_python PRIVATE ustore_embedded_${USTORE_PYTHON_ENGINE} ustore_warnings)
 
 # The engine this extension carries, until `ustore_engine_compiled` answers the same question.
 target_compile_definitions(

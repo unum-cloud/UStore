@@ -50,7 +50,9 @@ std::size_t wrappers_compile(test_config_t const& config) {
     [[maybe_unused]] auto const by_array = main_collection[std::array<ustore_key_t, 3> {65, 66, 67}];
     std::array<ustore_key_t, 4> const four_keys {65, 66, 67, 68};
     [[maybe_unused]] auto const by_range = main_collection[strided(four_keys)];
-    for ([[maybe_unused]] value_view_t const element : *main_collection[{100, 101}].value()) {}
+    // A range-for keeps a temporary alive only from C++23, so the answer is named before iterating
+    auto const listed = main_collection[{100, 101}].value();
+    for ([[maybe_unused]] value_view_t const element : *listed) {}
 
     // Named collections
     if (database.supports_collections()) {

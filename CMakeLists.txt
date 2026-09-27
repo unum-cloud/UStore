@@ -52,9 +52,11 @@ set(USTORE_CUDA_ARCHITECTURES
     CACHE STRING "GPU architectures NVMe's compaction compiles for"
 )
 
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# C++20 is a floor each UStore target declares through `cxx_std_20`, so fetched dependencies build at the standard they
+# pick for themselves.
 set(CMAKE_CXX_EXTENSIONS OFF)
+# No target uses C++20 modules, and Homebrew's clang-scan-deps cannot find the macOS SDK on its own.
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 
 set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/")
 set(CMAKE_CACHEFILE_DIR "${CMAKE_SOURCE_DIR}/build")
@@ -81,6 +83,11 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_C_VISIBILITY_PRESET hidden)
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
+
+# Windows headers define `min`, `max` and, through the RPC headers, `small` as macros unless told not to
+if (WIN32)
+    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+endif ()
 
 # Warnings apply to UStore's own targets only, so fetched dependencies build with their own flags.
 add_library(ustore_warnings INTERFACE)
@@ -118,12 +125,10 @@ endif ()
 # Engines:
 if (${USTORE_WITH_LEVELDB})
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/leveldb.cmake")
-    set(LIB_LEVELDB leveldb)
 endif ()
 
 if (${USTORE_WITH_ROCKSDB})
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/rocksdb.cmake")
-    set(LIB_ROCKSDB rocksdb)
 endif ()
 
 # The user-space NVMe transport, an `ustore_spdk` interface target over the archives of an SPDK build
@@ -160,15 +165,9 @@ set(STRINGZILLA_INSTALL OFF)
 set(STRINGZILLA_USE_SANITIZERS OFF)
 add_subdirectory(stringzilla EXCLUDE_FROM_ALL)
 
-add_library(ustore_stringzilla_dispatch INTERFACE)
-target_link_libraries(ustore_stringzilla_dispatch INTERFACE stringzilla::static)
-target_compile_definitions(ustore_stringzilla_dispatch INTERFACE STRINGZILLA_RUNTIME_DISPATCH=1)
-
 if (${USTORE_BUILD_BENCH})
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/gbench.cmake")
 endif ()
-
-set(LIB_FMT fmt::fmt)
 
 # The host half of the compaction suite checks the comparator, the survival rule, the sorted-run split and the placement
 # without a device, so a plain test build registers it too.
@@ -185,10 +184,6 @@ set(USTORE_ENGINE_NAMES "ram")
 add_library(
     ustore_embedded_ram STATIC ${USTORE_LIB_C_EXCLUSION} src/ram/engine.cpp c/docs.cpp c/graph.cpp c/strings.cpp
 )
-target_link_libraries(
-    ustore_embedded_ram Threads::Threads yyjson forkunion::static smashtable::header ustore_stringzilla_dispatch
-)
-target_compile_definitions(ustore_embedded_ram INTERFACE USTORE_VERSION="${USTORE_VERSION}")
 
 # The NVMe engine mounts its volumes on files, so it builds everywhere the siblings do; the io_uring transport beside it
 # compiles on every platform and only opens a ring on Linux.
@@ -196,14 +191,12 @@ if (${USTORE_BUILD_NVME})
     add_library(
         ustore_embedded_nvme STATIC ${USTORE_LIB_C_EXCLUSION} src/nvme/engine.cpp c/docs.cpp c/graph.cpp c/strings.cpp
     )
-    target_link_libraries(
-        ustore_embedded_nvme Threads::Threads yyjson forkunion::static smashtable::header ustore_stringzilla_dispatch
-    )
+    # Identifiers draw their entropy from `BCryptGenRandom` on Windows
+    target_link_libraries(ustore_embedded_nvme PRIVATE $<$<PLATFORM_ID:Windows>:bcrypt>)
     if (TARGET ustore_nvme_compaction)
-        target_link_libraries(ustore_embedded_nvme ustore_nvme_compaction)
+        target_link_libraries(ustore_embedded_nvme PUBLIC ustore_nvme_compaction)
         set(USTORE_COMPACTION_LIB ustore_nvme_compaction)
     endif ()
-    target_compile_definitions(ustore_embedded_nvme INTERFACE USTORE_VERSION="${USTORE_VERSION}")
     list(APPEND USTORE_ENGINE_NAMES "nvme")
 endif ()
 
@@ -212,8 +205,7 @@ if (${USTORE_WITH_ROCKSDB})
         ustore_embedded_rocksdb STATIC ${USTORE_LIB_C_EXCLUSION} src_oracles/rocksdb/engine.cpp c/docs.cpp c/graph.cpp
                                        c/strings.cpp
     )
-    target_link_libraries(ustore_embedded_rocksdb ${LIB_ROCKSDB} Threads::Threads yyjson)
-    target_compile_definitions(ustore_embedded_rocksdb INTERFACE USTORE_VERSION="${USTORE_VERSION}")
+    target_link_libraries(ustore_embedded_rocksdb PRIVATE rocksdb::rocksdb)
     list(APPEND USTORE_ENGINE_NAMES "rocksdb")
 endif ()
 
@@ -222,17 +214,22 @@ if (${USTORE_WITH_LEVELDB})
         ustore_embedded_leveldb STATIC ${USTORE_LIB_C_EXCLUSION} src_oracles/leveldb/engine.cpp c/docs.cpp c/graph.cpp
                                        c/strings.cpp
     )
-    target_link_libraries(ustore_embedded_leveldb ${LIB_LEVELDB} Threads::Threads yyjson)
+    target_link_libraries(ustore_embedded_leveldb PRIVATE leveldb::leveldb)
     if (NOT MSVC)
         set_source_files_properties(src_oracles/leveldb/engine.cpp PROPERTIES COMPILE_FLAGS -fno-rtti)
     endif ()
-    target_compile_definitions(ustore_embedded_leveldb INTERFACE USTORE_VERSION="${USTORE_VERSION}")
     list(APPEND USTORE_ENGINE_NAMES "leveldb")
 endif ()
 
+# Every engine carries the siblings to whoever links it, since the suites and tools reach them through the engine, while
+# formatting and warnings stay inside.
 foreach (engine_name IN ITEMS ${USTORE_ENGINE_NAMES})
+    target_compile_features(ustore_embedded_${engine_name} PUBLIC cxx_std_20)
+    target_compile_definitions(ustore_embedded_${engine_name} INTERFACE USTORE_VERSION="${USTORE_VERSION}")
     target_link_libraries(
-        ustore_embedded_${engine_name} ustore_warnings ${LIB_FMT} smashtable::header forkunion::static
+        ustore_embedded_${engine_name}
+        PUBLIC forkunion::static smashtable::header stringzilla::static yyjson::yyjson Threads::Threads
+        PRIVATE fmt::fmt ustore_warnings
     )
     # The `include_directories` above reach this project's targets only, so a consumer linking an engine inherits the
     # public headers from the target instead.
@@ -246,27 +243,30 @@ endforeach ()
 # A static engine library links only beside the archives it depends on, so they install together, apart from system
 # copies.
 if (USTORE_INSTALL)
-    list(TRANSFORM USTORE_ENGINE_NAMES PREPEND "ustore_embedded_" OUTPUT_VARIABLE USTORE_ENGINE_LIBS)
-    install(
-        TARGETS ${USTORE_ENGINE_LIBS}
-                ${USTORE_COMPACTION_LIB}
-                ${LIB_ROCKSDB}
-                ${LIB_LEVELDB}
-                fmt
-                yyjson
-                forkunion_static
-                stringzilla_static
-        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}/ustore
+    list(TRANSFORM USTORE_ENGINE_NAMES PREPEND "ustore_embedded_" OUTPUT_VARIABLE USTORE_INSTALLED_ARCHIVES)
+    list(
+        APPEND
+        USTORE_INSTALLED_ARCHIVES
+        ${USTORE_COMPACTION_LIB}
+        fmt
+        yyjson
+        forkunion_static
+        stringzilla_static
     )
+    if (${USTORE_WITH_ROCKSDB})
+        list(APPEND USTORE_INSTALLED_ARCHIVES rocksdb)
+    endif ()
+    if (${USTORE_WITH_LEVELDB})
+        list(APPEND USTORE_INSTALLED_ARCHIVES leveldb)
+    endif ()
+    install(TARGETS ${USTORE_INSTALLED_ARCHIVES} ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}/ustore)
     install(DIRECTORY include/ustore DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 endif ()
 
 if (${USTORE_BUILD_TOOLS})
     foreach (engine_name IN ITEMS ${USTORE_ENGINE_NAMES})
         add_executable(ustore_cli_${engine_name} tools/cli.cpp tools/dataset.cpp)
-        target_link_libraries(
-            ustore_cli_${engine_name} ${LIB_FMT} ustore_embedded_${engine_name} ustore_stringzilla_dispatch
-        )
+        target_link_libraries(ustore_cli_${engine_name} PRIVATE ustore_embedded_${engine_name} fmt::fmt ustore_warnings)
     endforeach ()
 endif ()
 
@@ -286,13 +286,12 @@ if (${USTORE_BUILD_TEST})
         "transactions"
         "database"
         "single_collection_database"
-        "linux_spdk"
     )
 
-    # The io_uring and Linux AIO transports are Linux-only and take no option of their own; each suite skips itself
-    # where the kernel refuses its transport.
+    # The io_uring, Linux AIO and SPDK transports are Linux-only and take no option of their own; each suite skips
+    # itself where the kernel or the build refuses its transport.
     if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
-        list(APPEND USTORE_STORAGE_TEST_NAMES "linux_uring" "linux_aio")
+        list(APPEND USTORE_STORAGE_TEST_NAMES "linux_uring" "linux_aio" "linux_spdk")
     endif ()
 
     # The SPDK suite starts and stops its own target through the rig script, so the script's path is compiled in and
@@ -300,14 +299,22 @@ if (${USTORE_BUILD_TEST})
     foreach (storage_name IN ITEMS ${USTORE_STORAGE_TEST_NAMES})
         set(storage_exe ustore_test_nvme_${storage_name})
         add_executable(${storage_exe} test/nvme_${storage_name}.cpp)
+        target_compile_features(${storage_exe} PRIVATE cxx_std_20)
         target_link_libraries(
-            ${storage_exe} ${LIB_FMT} forkunion::static smashtable::header ustore_stringzilla_dispatch Threads::Threads
+            ${storage_exe}
+            PRIVATE forkunion::static
+                    smashtable::header
+                    stringzilla::static
+                    fmt::fmt
+                    Threads::Threads
+                    $<$<PLATFORM_ID:Windows>:bcrypt>
+                    ustore_warnings
         )
         set(storage_arguments --directory ${CMAKE_BINARY_DIR}/test_data)
         # The LSM suite merges on the device where the build carries one, so on the transports that need no hardware
         # option its device case may no longer skip
         if (storage_name STREQUAL "lsm" AND TARGET ustore_nvme_compaction)
-            target_link_libraries(${storage_exe} ustore_nvme_compaction)
+            target_link_libraries(${storage_exe} PRIVATE ustore_nvme_compaction)
             list(APPEND storage_arguments --no-skips --transports memory,blocking,linux-uring)
         endif ()
         if (storage_name STREQUAL "linux_spdk")
@@ -315,7 +322,7 @@ if (${USTORE_BUILD_TEST})
                 ${storage_exe} PRIVATE USTORE_SPDK_RIG="${CMAKE_CURRENT_SOURCE_DIR}/scripts/rigs/spdk_target.sh"
             )
             if (${USTORE_WITH_SPDK})
-                target_link_libraries(${storage_exe} ustore_spdk)
+                target_link_libraries(${storage_exe} PRIVATE ustore_spdk)
                 list(APPEND storage_arguments --spdk-root ${USTORE_SPDK_ROOT})
             endif ()
         endif ()
@@ -330,14 +337,14 @@ if (${USTORE_BUILD_TEST})
         foreach (test_name IN ITEMS ${USTORE_TEST_NAMES})
             set(test_exe ustore_test_${test_name}_${engine_name})
             add_executable(${test_exe} test/${test_name}.cpp)
-            target_link_libraries(${test_exe} ${LIB_FMT} ${client_lib})
+            target_link_libraries(${test_exe} PRIVATE ${client_lib} fmt::fmt ustore_warnings)
             add_test(NAME ${test_exe} COMMAND ${test_exe} --directory ${CMAKE_BINARY_DIR}/test_data)
         endforeach ()
 
         foreach (stress_name IN ITEMS ${USTORE_STRESS_NAMES})
             set(test_exe ustore_stress_${stress_name}_${engine_name})
             add_executable(${test_exe} test/stress_${stress_name}.cpp)
-            target_link_libraries(${test_exe} ${LIB_FMT} ${client_lib})
+            target_link_libraries(${test_exe} PRIVATE ${client_lib} fmt::fmt ustore_warnings)
             add_test(NAME ${test_exe} COMMAND ${test_exe} --directory ${CMAKE_BINARY_DIR}/test_data)
         endforeach ()
 
@@ -345,7 +352,7 @@ if (${USTORE_BUILD_TEST})
         if (${USTORE_BUILD_TOOLS})
             set(test_exe ustore_test_tools_${engine_name})
             add_executable(${test_exe} test/tools.cpp tools/dataset.cpp)
-            target_link_libraries(${test_exe} ${LIB_FMT} ${client_lib} ustore_stringzilla_dispatch)
+            target_link_libraries(${test_exe} PRIVATE ${client_lib} fmt::fmt ustore_warnings)
             add_dependencies(${test_exe} ustore_cli_${engine_name})
             add_test(NAME ${test_exe} COMMAND ${test_exe} --directory ${CMAKE_BINARY_DIR}/test_data --cli
                                               $<TARGET_FILE:ustore_cli_${engine_name}>
@@ -361,15 +368,15 @@ if (${USTORE_BUILD_BENCH})
 
         set(bench_name ustore_bench_twitter_${engine_name})
         add_executable(${bench_name} bench/twitter.cpp)
-        target_link_libraries(${bench_name} benchmark ${LIB_FMT} ${client_lib} ustore_stringzilla_dispatch)
+        target_link_libraries(${bench_name} PRIVATE ${client_lib} benchmark::benchmark fmt::fmt ustore_warnings)
 
         set(bench_name ustore_bench_tabular_graph_${engine_name})
         add_executable(${bench_name} bench/tabular_graph.cpp tools/dataset.cpp)
-        target_link_libraries(${bench_name} benchmark ${LIB_FMT} ${client_lib} ustore_stringzilla_dispatch)
+        target_link_libraries(${bench_name} PRIVATE ${client_lib} benchmark::benchmark fmt::fmt ustore_warnings)
 
         set(bench_name ustore_bench_louvain_${engine_name})
         add_executable(${bench_name} bench/louvain.cpp)
-        target_link_libraries(${bench_name} benchmark ${LIB_FMT} ${client_lib} ustore_stringzilla_dispatch)
+        target_link_libraries(${bench_name} PRIVATE ${client_lib} benchmark::benchmark fmt::fmt ustore_warnings)
     endforeach ()
 endif ()
 
