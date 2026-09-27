@@ -41,6 +41,7 @@
 #include <ustore/db.h>
 #include <ustore/ranges_args.hpp> // `places_arg_t`, `contents_arg_t`, `scans_arg_t`, `validate_read`
 
+#include "engine.hpp"                // `engine_t`, `handle_t`, `handle_cast`
 #include "helpers/config_loader.hpp" // `config_t`, `load_config`
 #include "helpers/linked_array.hpp"  // `uninitialized_array`
 #include "helpers/linked_memory.hpp" // `linked_memory`, `clear_linked_memory`
@@ -139,8 +140,11 @@ inline bool reported_failure(status_t status, ustore_error_t* error) noexcept {
 
 #pragma region Handles
 
+/** The calls this engine serves, which stamp every handle it hands out. */
+extern engine_t const engine_k;
+
 /** Everything one open database of the C ABI holds. */
-struct opened_database_t {
+struct opened_database_t : handle_t {
 
     /** The budgets, the executor and the mount the store borrows its router and channels from. */
     resources_shared_ptr_t resources;
@@ -159,7 +163,7 @@ struct opened_database_t {
 };
 
 /** A transaction handle of the C ABI. */
-struct opened_transaction_t {
+struct opened_transaction_t : handle_t {
 
     /** The database the transaction belongs to, which outlives it. */
     opened_database_t* database = nullptr;
@@ -170,12 +174,12 @@ struct opened_transaction_t {
 
 /** The database behind @p handle. */
 [[nodiscard]] inline opened_database_t& database_of(ustore_database_t handle) noexcept {
-    return *static_cast<opened_database_t*>(handle);
+    return *handle_cast<opened_database_t>(handle);
 }
 
 /** The transaction behind @p handle, or null when the call names none. */
 [[nodiscard]] inline opened_transaction_t* transaction_of(ustore_transaction_t handle) noexcept {
-    return static_cast<opened_transaction_t*>(handle);
+    return handle_cast<opened_transaction_t>(handle);
 }
 
 /** The number @p collection resolves to in @p database, reserved identifiers included. */
@@ -804,6 +808,7 @@ inline expected<opened_database_t*> open_database(config_t const& config) noexce
 
     std::unique_ptr<opened_database_t> opened {new (std::nothrow) opened_database_t {}};
     if (!opened) return status_t {status_code_t::out_of_memory_k, "No room for the database"};
+    opened->engine = &engine_k;
     opened->collection_defaults = collections;
 
     auto [budget, open_resources_status] = open_resources(resources, uuid_t {});
@@ -833,20 +838,9 @@ inline void close_database(opened_database_t& database) noexcept {
 
 #pragma endregion Lifetime
 
-} // namespace unum::ustore::nvme
-
-using namespace unum::ustore;
-using namespace unum::ustore::nvme;
-
-ustore_collection_t const ustore_collection_main_k = 0;
-ustore_collection_t const ustore_collection_names_k = std::numeric_limits<ustore_collection_t>::max() - 1;
-ustore_length_t const ustore_length_missing_k = std::numeric_limits<ustore_length_t>::max();
-ustore_key_t const ustore_key_unknown_k = std::numeric_limits<ustore_key_t>::max();
-
 #pragma region C ABI
 
-void ustore_database_init(ustore_database_init_t* c_arguments) {
-    ustore_database_init_t& arguments = *c_arguments;
+void database_init(ustore_database_init_t& arguments) {
     if (!arguments.db) {
         *arguments.error = {ustore_error_invalid_argument_k, "Need an output for the database"};
         return;
@@ -866,11 +860,10 @@ void ustore_database_init(ustore_database_init_t* c_arguments) {
         *arguments.error = open_database_status;
         return;
     }
-    *arguments.db = opened;
+    *arguments.db = static_cast<handle_t*>(opened);
 }
 
-void ustore_get_metadata(ustore_get_metadata_t* c_arguments) {
-    ustore_get_metadata_t& arguments = *c_arguments;
+void get_metadata(ustore_get_metadata_t& arguments) {
     if (!arguments.db || !arguments.metadata) {
         *arguments.error = {ustore_error_invalid_argument_k, "Need a database and an output for the metadata"};
         return;
@@ -878,8 +871,7 @@ void ustore_get_metadata(ustore_get_metadata_t* c_arguments) {
     *arguments.metadata = ustore_metadata_t(ustore_supports_transactions_k | ustore_supports_collections_k);
 }
 
-void ustore_read(ustore_read_t* c_arguments) {
-    ustore_read_t& arguments = *c_arguments;
+void read(ustore_read_t& arguments) {
     if (!arguments.tasks_count) return;
     if (!arguments.db) {
         *arguments.error = {ustore_error_uninitialized_k, "The database is uninitialized"};
@@ -942,8 +934,7 @@ void ustore_read(ustore_read_t* c_arguments) {
     reported_failure(read_batched(database, groups, bases, widths, tape), arguments.error);
 }
 
-void ustore_write(ustore_write_t* c_arguments) {
-    ustore_write_t& arguments = *c_arguments;
+void write(ustore_write_t& arguments) {
     if (!arguments.db) {
         *arguments.error = {ustore_error_uninitialized_k, "The database is uninitialized"};
         return;
@@ -970,8 +961,7 @@ void ustore_write(ustore_write_t* c_arguments) {
     reported_failure(database.store->compact(), arguments.error);
 }
 
-void ustore_scan(ustore_scan_t* c_arguments) {
-    ustore_scan_t& arguments = *c_arguments;
+void scan(ustore_scan_t& arguments) {
     if (!arguments.db) {
         *arguments.error = {ustore_error_uninitialized_k, "The database is uninitialized"};
         return;
@@ -1013,8 +1003,7 @@ void ustore_scan(ustore_scan_t* c_arguments) {
     tape.finish(arguments.keys);
 }
 
-void ustore_sample(ustore_sample_t* c_arguments) {
-    ustore_sample_t& arguments = *c_arguments;
+void sample(ustore_sample_t& arguments) {
     if (!arguments.tasks_count) return;
     if (!arguments.db) {
         *arguments.error = {ustore_error_uninitialized_k, "The database is uninitialized"};
@@ -1062,8 +1051,7 @@ void ustore_sample(ustore_sample_t* c_arguments) {
     tape.finish(arguments.keys);
 }
 
-void ustore_measure(ustore_measure_t* c_arguments) {
-    ustore_measure_t& arguments = *c_arguments;
+void measure(ustore_measure_t& arguments) {
     if (!arguments.tasks_count) return;
     if (!arguments.db) {
         *arguments.error = {ustore_error_uninitialized_k, "The database is uninitialized"};
@@ -1129,8 +1117,7 @@ void ustore_measure(ustore_measure_t* c_arguments) {
     }
 }
 
-void ustore_collection_list(ustore_collection_list_t* c_arguments) {
-    ustore_collection_list_t& arguments = *c_arguments;
+void collection_list(ustore_collection_list_t& arguments) {
     if (!arguments.db) {
         *arguments.error = {ustore_error_uninitialized_k, "The database is uninitialized"};
         return;
@@ -1158,8 +1145,7 @@ void ustore_collection_list(ustore_collection_list_t* c_arguments) {
     *arguments.count = static_cast<ustore_size_t>(named);
 }
 
-void ustore_collection_create(ustore_collection_create_t* c_arguments) {
-    ustore_collection_create_t& arguments = *c_arguments;
+void collection_create(ustore_collection_create_t& arguments) {
     if (!arguments.db) {
         *arguments.error = {ustore_error_uninitialized_k, "The database is uninitialized"};
         return;
@@ -1188,8 +1174,7 @@ void ustore_collection_create(ustore_collection_create_t* c_arguments) {
     *arguments.id = static_cast<ustore_collection_t>(created);
 }
 
-void ustore_collection_drop(ustore_collection_drop_t* c_arguments) {
-    ustore_collection_drop_t& arguments = *c_arguments;
+void collection_drop(ustore_collection_drop_t& arguments) {
     if (!arguments.db) {
         *arguments.error = {ustore_error_uninitialized_k, "The database is uninitialized"};
         return;
@@ -1213,8 +1198,7 @@ void ustore_collection_drop(ustore_collection_drop_t* c_arguments) {
     reported_failure(empty_collection(database, numeric_id, arguments.mode), arguments.error);
 }
 
-void ustore_snapshot_list(ustore_snapshot_list_t* c_arguments) {
-    ustore_snapshot_list_t& arguments = *c_arguments;
+void snapshot_list(ustore_snapshot_list_t& arguments) {
     if (!arguments.db) {
         *arguments.error = {ustore_error_uninitialized_k, "The database is uninitialized"};
         return;
@@ -1227,20 +1211,19 @@ void ustore_snapshot_list(ustore_snapshot_list_t* c_arguments) {
     if (arguments.ids) *arguments.ids = nullptr;
 }
 
-void ustore_snapshot_create(ustore_snapshot_create_t* c_arguments) {
-    *c_arguments->error = {ustore_error_unsupported_k, "This engine keeps no snapshots"};
+void snapshot_create(ustore_snapshot_create_t& arguments) {
+    *arguments.error = {ustore_error_unsupported_k, "This engine keeps no snapshots"};
 }
 
-void ustore_snapshot_export(ustore_snapshot_export_t* c_arguments) {
-    *c_arguments->error = {ustore_error_unsupported_k, "This engine keeps no snapshots"};
+void snapshot_export(ustore_snapshot_export_t& arguments) {
+    *arguments.error = {ustore_error_unsupported_k, "This engine keeps no snapshots"};
 }
 
-void ustore_snapshot_drop(ustore_snapshot_drop_t* c_arguments) {
-    *c_arguments->error = {ustore_error_unsupported_k, "This engine keeps no snapshots"};
+void snapshot_drop(ustore_snapshot_drop_t& arguments) {
+    *arguments.error = {ustore_error_unsupported_k, "This engine keeps no snapshots"};
 }
 
-void ustore_transaction_init(ustore_transaction_init_t* c_arguments) {
-    ustore_transaction_init_t& arguments = *c_arguments;
+void transaction_init(ustore_transaction_init_t& arguments) {
     if (!arguments.db) {
         *arguments.error = {ustore_error_uninitialized_k, "The database is uninitialized"};
         return;
@@ -1259,16 +1242,15 @@ void ustore_transaction_init(ustore_transaction_init_t* c_arguments) {
     auto [started, create_transaction_status] = database.store->create_transaction(id);
     if (reported_failure(create_transaction_status, arguments.error)) return;
 
-    auto* const opened = new (std::nothrow) opened_transaction_t {&database, std::move(started)};
+    auto* const opened = new (std::nothrow) opened_transaction_t {{&engine_k}, &database, std::move(started)};
     if (!opened) {
         *arguments.error = {ustore_error_out_of_memory_k, "Failed to allocate the transaction"};
         return;
     }
-    *arguments.transaction = opened;
+    *arguments.transaction = static_cast<handle_t*>(opened);
 }
 
-void ustore_transaction_stage(ustore_transaction_stage_t* c_arguments) {
-    ustore_transaction_stage_t& arguments = *c_arguments;
+void transaction_stage(ustore_transaction_stage_t& arguments) {
     if (!arguments.transaction) {
         *arguments.error = {ustore_error_uninitialized_k, "Transaction is uninitialized"};
         return;
@@ -1278,8 +1260,7 @@ void ustore_transaction_stage(ustore_transaction_stage_t* c_arguments) {
     if (arguments.sequence_number) *arguments.sequence_number = transaction.held->last_stage_stamp();
 }
 
-void ustore_transaction_commit(ustore_transaction_commit_t* c_arguments) {
-    ustore_transaction_commit_t& arguments = *c_arguments;
+void transaction_commit(ustore_transaction_commit_t& arguments) {
     validate_transaction_commit(arguments.transaction, arguments.options, arguments.error);
     if (arguments.error->status) return;
 
@@ -1290,8 +1271,7 @@ void ustore_transaction_commit(ustore_transaction_commit_t* c_arguments) {
     reported_failure(transaction.database->store->flush(), arguments.error);
 }
 
-void ustore_database_control(ustore_database_control_t* c_arguments) {
-    ustore_database_control_t& arguments = *c_arguments;
+void database_control(ustore_database_control_t& arguments) {
     if (!arguments.db) {
         *arguments.error = {ustore_error_uninitialized_k, "The database is uninitialized"};
         return;
@@ -1354,17 +1334,40 @@ void ustore_database_control(ustore_database_control_t* c_arguments) {
                         "Unknown request: expected clear, reset, flush, compact, info or usage"};
 }
 
-void ustore_arena_free(ustore_arena_t c_arena) { clear_linked_memory(c_arena); }
+void transaction_free(ustore_transaction_t c_transaction) noexcept { delete transaction_of(c_transaction); }
 
-void ustore_transaction_free(ustore_transaction_t c_transaction) {
-    if (!c_transaction) return;
-    delete transaction_of(c_transaction);
-}
-
-void ustore_database_free(ustore_database_t c_database) {
-    if (!c_database) return;
+void database_free(ustore_database_t c_database) noexcept {
     std::unique_ptr<opened_database_t> const freed {&database_of(c_database)};
     close_database(*freed);
 }
 
 #pragma endregion C ABI
+
+engine_t const engine_k {
+    .get_metadata = &get_metadata,
+    .database_control = &database_control,
+    .snapshot_list = &snapshot_list,
+    .snapshot_create = &snapshot_create,
+    .snapshot_export = &snapshot_export,
+    .snapshot_drop = &snapshot_drop,
+    .read = &read,
+    .write = &write,
+    .scan = &scan,
+    .sample = &sample,
+    .measure = &measure,
+    .collection_create = &collection_create,
+    .collection_drop = &collection_drop,
+    .collection_list = &collection_list,
+    .transaction_init = &transaction_init,
+    .transaction_stage = &transaction_stage,
+    .transaction_commit = &transaction_commit,
+    .transaction_free = &transaction_free,
+    .database_free = &database_free,
+};
+
+} // namespace unum::ustore::nvme
+
+using namespace unum::ustore;
+using namespace unum::ustore::nvme;
+
+void ustore_database_init_nvme(ustore_database_init_t* arguments) { database_init(*arguments); }

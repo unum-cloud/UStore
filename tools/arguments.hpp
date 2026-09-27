@@ -38,6 +38,8 @@
 #include <fmt/format.h>
 #include <fmt/ranges.h> // `fmt::join`
 
+#include <ustore/db.h> // `ustore_database_init_t` and the init call of every engine
+
 namespace unum::ustore {
 
 /** Outcome of parsing one value or a whole argument list. */
@@ -366,5 +368,24 @@ inline void print_usage(std::string_view synopsis, std::span<flag_t const> flags
 }
 
 #pragma endregion Arguments
+
+/** An engine's init call of the C ABI. */
+using database_init_t = void (*)(ustore_database_init_t*);
+
+/** The init call of the engine @p name names, or null for one this build lacks; the one place binaries tell the engines
+ *  apart. */
+[[nodiscard]] inline database_init_t database_init_of(std::string_view name) noexcept {
+    if (name == "ram") return ustore_database_init_ram;
+#if USTORE_WITH_ROCKSDB
+    if (name == "rocksdb") return ustore_database_init_rocksdb;
+#endif
+#if USTORE_WITH_LEVELDB
+    if (name == "leveldb") return ustore_database_init_leveldb;
+#endif
+#if USTORE_WITH_NVME
+    if (name == "nvme") return ustore_database_init_nvme;
+#endif
+    return nullptr;
+}
 
 } // namespace unum::ustore

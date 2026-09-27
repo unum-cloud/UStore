@@ -349,6 +349,9 @@ struct suite_options_t {
     /** The transports a ring suite mounts, every one when empty. */
     texts_t transports;
 
+    /** The engine an engine suite opens: @c ram, @c rocksdb, @c leveldb or @c nvme. */
+    std::string_view engine = "ram";
+
     /** Fields spliced into the engine's own configuration, like @c "io_transport":"linux-uring", or none. */
     std::string_view engine_config;
 
@@ -404,13 +407,15 @@ constexpr std::size_t suite_flags_capacity_k = 16;
         fmt::println(stderr, "a suite may add at most {} flags", suite_flags_capacity_k);
         return argument_status_t::too_many_items_k;
     }
-    std::array<flag_t, suite_flags_capacity_k + 9> flags;
+    std::array<flag_t, suite_flags_capacity_k + 10> flags;
     std::size_t count = 0;
     flags[count++] = {"--directory", "path", "parent of the unique directory the suite works in", &options.directory};
     flags[count++] = {"--device", "path", "block device the storage cases open", &options.device};
     flags[count++] = {"--spdk-address", "address", "PCIe address of the NVMe device SPDK binds", &options.spdk_address};
     flags[count++] = {"--transports", "names", "transports a ring suite mounts, like memory,blocking,linux-uring",
                       &options.transports};
+    flags[count++] = {"--engine", "name", "engine an engine suite opens: ram, rocksdb, leveldb or nvme",
+                      &options.engine};
     flags[count++] = {"--engine-config", "json",
                       "fields of the engine's own configuration, like \"io_transport\":\"uring\"",
                       &options.engine_config};
@@ -459,9 +464,9 @@ struct test_path_t {
 class test_config_t {
   public:
 
-    /** Configures the engine to work in @p directory, with @p engine_config spliced into the engine's own object. */
-    explicit test_config_t(char const* directory, std::string_view engine_config = {}) noexcept
-        : directory_(directory), engine_config_(engine_config) {
+    /** Configures @p engine to work in @p directory, with @p engine_config spliced into the engine's own object. */
+    explicit test_config_t(std::string_view engine, char const* directory, std::string_view engine_config = {}) noexcept
+        : engine_(engine), directory_(directory), engine_config_(engine_config) {
         if (!directory && engine_config.empty()) return;
         auto const written =
             engine_config.empty()
@@ -480,6 +485,9 @@ class test_config_t {
     /** The configuration as a C string, empty for the defaults. */
     [[nodiscard]] char const* c_str() const noexcept { return json_; }
 
+    /** The engine the configuration opens, which a second database of a case repeats. */
+    [[nodiscard]] std::string_view engine() const noexcept { return engine_; }
+
     /** The directory the engine works in, or null without @c --directory. */
     [[nodiscard]] char const* directory() const noexcept { return directory_; }
 
@@ -491,12 +499,37 @@ class test_config_t {
     /** The null-terminated JSON configuration, empty for the defaults. */
     char json_[path_capacity_k + 256] {};
 
+    /** The engine the configuration opens. */
+    std::string_view engine_;
+
     /** The directory the engine works in, or null. */
     char const* directory_ = nullptr;
 
     /** The fields spliced into the engine's own configuration. */
     std::string_view engine_config_;
 };
+
+/** Opens the engine @p config names into @p database through the C ABI. */
+inline status_t open_raw(test_config_t const& config, ustore_database_t& database) noexcept {
+    database_init_t const init_database = database_init_of(config.engine());
+    if (!init_database) return {status_code_t::invalid_argument_k, "This build carries no engine of that name"};
+    ustore_error_t error {};
+    ustore_database_init_t init {};
+    init.config = config.c_str();
+    init.db = &database;
+    init.error = &error;
+    init_database(&init);
+    return status_t {error};
+}
+
+/** Opens the engine @p config names into the C++ @p database, which adopts the handle. */
+template <typename database_type_>
+status_t open_database(database_type_& database, test_config_t const& config) noexcept {
+    ustore_database_t raw = nullptr;
+    status_t const opened = open_raw(config, raw);
+    if (opened.succeeded()) database = database_type_ {raw};
+    return opened;
+}
 
 /** Creates @p directory with its missing parents, answering whether it exists. */
 [[nodiscard]] inline bool create_directories(char const* directory) noexcept {

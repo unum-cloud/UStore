@@ -47,6 +47,7 @@
 #include <ustore/db.h>
 #include <ustore/ranges_args.hpp> // `places_arg_t`, `contents_arg_t`, `scans_arg_t`, `validate_read`
 
+#include "engine.hpp"                 // `engine_t`, `handle_t`, `handle_cast`
 #include "helpers/blocking_files.hpp" // `directory_exists`
 #include "helpers/config_loader.hpp"  // `load_config`, `read_json_member`
 #include "helpers/linked_array.hpp"   // `uninitialized_array`
@@ -399,8 +400,11 @@ struct database_state {
     sz::string_t directory;
 };
 
+/** The calls this engine serves, which stamp every handle it hands out. */
+extern engine_t const engine_k;
+
 /** A database handle of the C ABI, holding one isolation chosen at open. */
-struct database_t {
+struct database_t : handle_t {
 
     /** The database at the isolation its configuration named. */
     std::variant<database_state<isolation_t::strict_serializable_k>, database_state<isolation_t::snapshot_k>> state;
@@ -410,7 +414,7 @@ struct database_t {
 };
 
 /** Leads every transaction handle, so a call tells a transaction of another isolation apart before using it. */
-struct transaction_header_t {
+struct transaction_header_t : handle_t {
 
     /** The isolation of the database that opened the transaction. */
     isolation_t isolation;
@@ -427,13 +431,13 @@ struct transaction_handle : transaction_header_t {
     staging_t staging {staging_t::pending_k};
 
     explicit transaction_handle(store_transaction<isolation_>&& opened) noexcept
-        : transaction_header_t {isolation_}, transaction(std::move(opened)) {}
+        : transaction_header_t {{&engine_k}, isolation_}, transaction(std::move(opened)) {}
 };
 
 /** The transaction behind @p transaction, or null after reporting one of another isolation. */
 template <isolation_t isolation_>
 transaction_handle<isolation_>* transaction_of(ustore_transaction_t transaction, ustore_error_t* error) noexcept {
-    auto* const header = static_cast<transaction_header_t*>(transaction);
+    auto* const header = handle_cast<transaction_header_t>(transaction);
     if (header->isolation == isolation_) return static_cast<transaction_handle<isolation_>*>(header);
     *error = {ustore_error_invalid_argument_k, "The transaction belongs to a database of another isolation"};
     return nullptr;
@@ -1618,7 +1622,7 @@ void open_transaction(database_state<isolation_>& state, ustore_transaction_init
         *arguments.error = {ustore_error_out_of_memory_k, "Failed to allocate the transaction"};
         return;
     }
-    *arguments.transaction = static_cast<transaction_header_t*>(handle);
+    *arguments.transaction = static_cast<handle_t*>(handle);
 }
 
 /** Resets @p transaction onto a fresh snapshot for reuse. */
@@ -1680,11 +1684,7 @@ void serve(database_state<isolation_>& state, ustore_transaction_commit_t& argum
 /** Visits the isolation of the database @p arguments names once, and serves the call at it. */
 template <typename arguments_type_>
 void serve_database(arguments_type_& arguments) noexcept {
-    if (!arguments.db) {
-        *arguments.error = {ustore_error_uninitialized_k, "The database is uninitialized"};
-        return;
-    }
-    database_t& database = *static_cast<database_t*>(arguments.db);
+    database_t& database = *handle_cast<database_t>(arguments.db);
     std::visit([&](auto& state) noexcept { serve(state, arguments); }, database.state);
 }
 
@@ -1746,9 +1746,53 @@ database_t* make_database(std::string_view directory, ustore_error_t* error) noe
         *error = {ustore_error_out_of_memory_k, "Failed to allocate the database"};
         return nullptr;
     }
+    database->engine = &engine_k;
     open_database(*std::get_if<database_state<isolation_>>(&database->state), directory, error);
     return error->status ? nullptr : database.release();
 }
+
+void get_metadata(ustore_get_metadata_t& arguments) noexcept {
+    if (!arguments.metadata) {
+        *arguments.error = {ustore_error_invalid_argument_k, "Need an output for the metadata"};
+        return;
+    }
+    *arguments.metadata = ustore_metadata_t(ustore_supports_transactions_k | ustore_supports_collections_k |
+                                            ustore_supports_snapshots_k);
+}
+
+void transaction_free(ustore_transaction_t transaction) noexcept {
+    auto* const header = handle_cast<transaction_header_t>(transaction);
+    if (header->isolation == isolation_t::snapshot_k)
+        return delete static_cast<transaction_handle<isolation_t::snapshot_k>*>(header);
+    delete static_cast<transaction_handle<isolation_t::strict_serializable_k>*>(header);
+}
+
+void database_free(ustore_database_t database) noexcept {
+    std::unique_ptr<database_t> freed {handle_cast<database_t>(database)};
+    std::visit([](auto& state) noexcept { close_database(state); }, freed->state);
+}
+
+engine_t const engine_k {
+    .get_metadata = &get_metadata,
+    .database_control = &serve_database<ustore_database_control_t>,
+    .snapshot_list = &serve_database<ustore_snapshot_list_t>,
+    .snapshot_create = &serve_database<ustore_snapshot_create_t>,
+    .snapshot_export = &serve_database<ustore_snapshot_export_t>,
+    .snapshot_drop = &serve_database<ustore_snapshot_drop_t>,
+    .read = &serve_database<ustore_read_t>,
+    .write = &serve_database<ustore_write_t>,
+    .scan = &serve_database<ustore_scan_t>,
+    .sample = &serve_database<ustore_sample_t>,
+    .measure = &serve_database<ustore_measure_t>,
+    .collection_create = &serve_database<ustore_collection_create_t>,
+    .collection_drop = &serve_database<ustore_collection_drop_t>,
+    .collection_list = &serve_database<ustore_collection_list_t>,
+    .transaction_init = &serve_database<ustore_transaction_init_t>,
+    .transaction_stage = &serve_database<ustore_transaction_stage_t>,
+    .transaction_commit = &serve_database<ustore_transaction_commit_t>,
+    .transaction_free = &transaction_free,
+    .database_free = &database_free,
+};
 
 #pragma endregion Dispatch
 
@@ -1757,14 +1801,9 @@ database_t* make_database(std::string_view directory, ustore_error_t* error) noe
 using namespace unum::ustore;
 using namespace unum::ustore::ram;
 
-ustore_collection_t const ustore_collection_main_k = main_collection_k;
-ustore_collection_t const ustore_collection_names_k = names_collection_k;
-ustore_length_t const ustore_length_missing_k = std::numeric_limits<ustore_length_t>::max();
-ustore_key_t const ustore_key_unknown_k = stored_key_t::unknown_key_k;
-
 #pragma region C ABI
 
-void ustore_database_init(ustore_database_init_t* arguments) {
+void ustore_database_init_ram(ustore_database_init_t* arguments) {
     if (!arguments->db) {
         *arguments->error = {ustore_error_invalid_argument_k, "Need an output for the database"};
         return;
@@ -1773,51 +1812,11 @@ void ustore_database_init(ustore_database_init_t* arguments) {
     isolation_t isolation = isolation_t::strict_serializable_k;
     load_configuration(arguments->config, config, isolation, arguments->error);
     if (arguments->error->status) return;
-    *arguments->db = isolation == isolation_t::snapshot_k
-                         ? make_database<isolation_t::snapshot_k>(config.directory, arguments->error)
-                         : make_database<isolation_t::strict_serializable_k>(config.directory, arguments->error);
-}
-
-void ustore_get_metadata(ustore_get_metadata_t* arguments) {
-    if (!arguments->db || !arguments->metadata) {
-        *arguments->error = {ustore_error_invalid_argument_k, "Need a database and an output for the metadata"};
-        return;
-    }
-    *arguments->metadata = ustore_metadata_t(ustore_supports_transactions_k | ustore_supports_collections_k |
-                                             ustore_supports_snapshots_k);
-}
-
-void ustore_database_control(ustore_database_control_t* arguments) { serve_database(*arguments); }
-void ustore_snapshot_list(ustore_snapshot_list_t* arguments) { serve_database(*arguments); }
-void ustore_snapshot_create(ustore_snapshot_create_t* arguments) { serve_database(*arguments); }
-void ustore_snapshot_export(ustore_snapshot_export_t* arguments) { serve_database(*arguments); }
-void ustore_snapshot_drop(ustore_snapshot_drop_t* arguments) { serve_database(*arguments); }
-void ustore_read(ustore_read_t* arguments) { serve_database(*arguments); }
-void ustore_write(ustore_write_t* arguments) { serve_database(*arguments); }
-void ustore_scan(ustore_scan_t* arguments) { serve_database(*arguments); }
-void ustore_sample(ustore_sample_t* arguments) { serve_database(*arguments); }
-void ustore_measure(ustore_measure_t* arguments) { serve_database(*arguments); }
-void ustore_collection_list(ustore_collection_list_t* arguments) { serve_database(*arguments); }
-void ustore_collection_create(ustore_collection_create_t* arguments) { serve_database(*arguments); }
-void ustore_collection_drop(ustore_collection_drop_t* arguments) { serve_database(*arguments); }
-void ustore_transaction_init(ustore_transaction_init_t* arguments) { serve_database(*arguments); }
-void ustore_transaction_stage(ustore_transaction_stage_t* arguments) { serve_database(*arguments); }
-void ustore_transaction_commit(ustore_transaction_commit_t* arguments) { serve_database(*arguments); }
-
-void ustore_arena_free(ustore_arena_t arena) { clear_linked_memory(arena); }
-
-void ustore_transaction_free(ustore_transaction_t transaction) {
-    if (!transaction) return;
-    auto* const header = static_cast<transaction_header_t*>(transaction);
-    if (header->isolation == isolation_t::snapshot_k)
-        return delete static_cast<transaction_handle<isolation_t::snapshot_k>*>(header);
-    delete static_cast<transaction_handle<isolation_t::strict_serializable_k>*>(header);
-}
-
-void ustore_database_free(ustore_database_t database) {
-    if (!database) return;
-    std::unique_ptr<database_t> freed {static_cast<database_t*>(database)};
-    std::visit([](auto& state) noexcept { close_database(state); }, freed->state);
+    database_t* const database = isolation == isolation_t::snapshot_k
+                                     ? make_database<isolation_t::snapshot_k>(config.directory, arguments->error)
+                                     : make_database<isolation_t::strict_serializable_k>(config.directory,
+                                                                                         arguments->error);
+    *arguments->db = static_cast<handle_t*>(database);
 }
 
 #pragma endregion C ABI

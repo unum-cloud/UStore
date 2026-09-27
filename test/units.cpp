@@ -225,7 +225,7 @@ std::size_t check_binary_collection(blobs_collection_t& collection) {
 std::size_t database_open_clear_close(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
 
@@ -238,7 +238,7 @@ std::size_t database_open_clear_close(test_config_t const& config) {
 std::size_t database_clear_collection_by_clearing_database(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
 
@@ -259,7 +259,7 @@ std::size_t database_clear_collection_by_clearing_database(test_config_t const& 
 std::size_t database_overwrite_with_step(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
 
@@ -286,7 +286,7 @@ std::size_t database_overwrite_with_step(test_config_t const& config) {
 std::size_t database_persistency(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
 
@@ -310,7 +310,7 @@ std::size_t database_persistency(test_config_t const& config) {
     }
     database.close();
     {
-        failures += expect(database.open(config.c_str()).succeeded());
+        failures += expect(open_database(database, config).succeeded());
         if (failures != 0) return failures;
 
         blobs_collection_t main_collection = database.main();
@@ -337,7 +337,7 @@ std::size_t database_persistency(test_config_t const& config) {
 std::size_t database_named_collections(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
 
@@ -374,7 +374,7 @@ std::size_t database_named_collections(test_config_t const& config) {
 case_result_t database_named_collections_list(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     if (!database.supports_collections())
         return case_result_t::skipped("the engine keeps no named collections", failures);
@@ -415,7 +415,7 @@ case_result_t database_named_collections_list(test_config_t const& config) {
 std::size_t database_clear_values(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
 
@@ -438,7 +438,7 @@ std::size_t database_clear_values(test_config_t const& config) {
 std::size_t database_presences(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
     blobs_collection_t main_collection = database.main();
@@ -479,7 +479,7 @@ std::size_t database_presences(test_config_t const& config) {
 std::size_t database_scan(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
     blobs_collection_t collection = database.main();
@@ -506,7 +506,7 @@ std::size_t database_scan(test_config_t const& config) {
 std::size_t database_batch_scan(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
     blobs_collection_t collection = database.main();
@@ -541,7 +541,7 @@ std::size_t database_batch_scan(test_config_t const& config) {
 case_result_t database_transaction_read_committed(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     if (!database.supports_transactions()) return case_result_t::skipped("the engine keeps no transactions", failures);
     failures += expect(database.clear().succeeded());
@@ -567,7 +567,7 @@ case_result_t database_transaction_read_committed(test_config_t const& config) {
 case_result_t database_transaction_snapshot_isolation(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     if (!database.supports_snapshots()) return case_result_t::skipped("the engine keeps no snapshots", failures);
     failures += expect(database.clear().succeeded());
@@ -611,7 +611,7 @@ case_result_t database_transaction_snapshot_isolation(test_config_t const& confi
 case_result_t database_snapshots_list(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     if (!database.supports_snapshots()) return case_result_t::skipped("the engine keeps no snapshots", failures);
     failures += expect(database.clear().succeeded());
@@ -642,7 +642,7 @@ case_result_t database_snapshots_list(test_config_t const& config) {
 case_result_t database_transaction_with_snapshot(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     if (!database.supports_snapshots()) return case_result_t::skipped("the engine keeps no snapshots", failures);
     if (!database.supports_transactions()) return case_result_t::skipped("the engine keeps no transactions", failures);
@@ -683,7 +683,7 @@ case_result_t database_transaction_with_snapshot(test_config_t const& config) {
 case_result_t database_set_wrong_snapshot(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     if (!database.supports_snapshots()) return case_result_t::skipped("the engine keeps no snapshots", failures);
     failures += expect(database.clear().succeeded());
@@ -723,9 +723,9 @@ case_result_t database_export_snapshot(test_config_t const& config) {
     failures += expect(recreate_directory(first_export_directory.c_str()));
     failures += expect(recreate_directory(second_export_directory.c_str()));
 
-    test_config_t const original_config {original_directory.c_str(), config.engine_config()};
+    test_config_t const original_config {config.engine(), original_directory.c_str(), config.engine_config()};
     database_t database;
-    failures += expect(database.open(original_config.c_str()).succeeded());
+    failures += expect(open_database(database, original_config).succeeded());
     if (failures != 0) return failures;
     if (!database.supports_snapshots()) return case_result_t::skipped("the engine keeps no snapshots", failures);
     failures += expect(database.clear().succeeded());
@@ -742,9 +742,9 @@ case_result_t database_export_snapshot(test_config_t const& config) {
     failures += expect(first_snapshot.export_to(first_export_directory.c_str()).succeeded());
     failures += check_equalities(collection_reference, triplet);
 
-    test_config_t const first_config {first_export_directory.c_str(), config.engine_config()};
+    test_config_t const first_config {config.engine(), first_export_directory.c_str(), config.engine_config()};
     database_t first_export;
-    failures += expect(first_export.open(first_config.c_str()).succeeded());
+    failures += expect(open_database(first_export, first_config).succeeded());
     if (failures != 0) return failures;
     auto first_collection = first_export.main();
     auto first_reference = first_collection[triplet.keys];
@@ -756,9 +756,9 @@ case_result_t database_export_snapshot(test_config_t const& config) {
     failures += expect(second_snapshot.export_to(second_export_directory.c_str()).succeeded());
     failures += check_equalities(collection_reference, same_values_triplet);
 
-    test_config_t const second_config {second_export_directory.c_str(), config.engine_config()};
+    test_config_t const second_config {config.engine(), second_export_directory.c_str(), config.engine_config()};
     database_t second_export;
-    failures += expect(second_export.open(second_config.c_str()).succeeded());
+    failures += expect(open_database(second_export, second_config).succeeded());
     if (failures != 0) return failures;
     auto second_collection = second_export.main();
     auto second_reference = second_collection[same_values_triplet.keys];
@@ -777,7 +777,7 @@ case_result_t database_export_snapshot(test_config_t const& config) {
 case_result_t database_snapshot_with_threads(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     if (!database.supports_snapshots()) return case_result_t::skipped("the engine keeps no snapshots", failures);
     failures += expect(database.clear().succeeded());
@@ -839,7 +839,7 @@ case_result_t database_snapshot_with_threads(test_config_t const& config) {
 case_result_t database_transaction_erase_missing(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     if (!database.supports_transactions()) return case_result_t::skipped("the engine keeps no transactions", failures);
     failures += expect(database.clear().succeeded());
@@ -862,7 +862,7 @@ case_result_t database_transaction_erase_missing(test_config_t const& config) {
 case_result_t database_transaction_write_conflicting(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     if (!database.supports_transactions()) return case_result_t::skipped("the engine keeps no transactions", failures);
     failures += expect(database.clear().succeeded());
@@ -881,7 +881,7 @@ case_result_t database_transaction_write_conflicting(test_config_t const& config
 case_result_t database_transaction_sequenced_commit(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     if (!database.supports_transactions()) return case_result_t::skipped("the engine keeps no transactions", failures);
     failures += expect(database.clear().succeeded());
@@ -959,7 +959,7 @@ struct documents_tape_t {
 std::size_t database_docs_flat(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
 
@@ -980,7 +980,7 @@ std::size_t database_docs_flat(test_config_t const& config) {
 std::size_t database_docs_nested_batch(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
     docs_collection_t collection = database.main<docs_collection_t>();
@@ -1034,7 +1034,7 @@ std::size_t database_docs_nested_batch(test_config_t const& config) {
 std::size_t database_docs_modify(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
     docs_collection_t collection = database.main<docs_collection_t>();
@@ -1195,7 +1195,7 @@ std::size_t check_modification_cases(docs_collection_t& collection, document_mod
 std::size_t database_docs_merge_and_patch(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
     docs_collection_t collection = database.main<docs_collection_t>();
@@ -1209,7 +1209,7 @@ std::size_t database_docs_merge_and_patch(test_config_t const& config) {
 std::size_t database_docs_table(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
 
@@ -1398,7 +1398,7 @@ edges_view_t edges_of(st::basic_vector<edge_t> const& edges) noexcept {
 std::size_t database_graph_upsert_vertices(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
 
@@ -1417,7 +1417,7 @@ std::size_t database_graph_upsert_vertices(test_config_t const& config) {
 std::size_t database_graph_upsert_edge(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
 
@@ -1518,7 +1518,7 @@ std::size_t check_triangle(graph_collection_t& graph, std::array<edge_t, 3>& tri
 std::size_t database_graph_triangle(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
 
@@ -1543,7 +1543,7 @@ std::size_t database_graph_triangle(test_config_t const& config) {
 std::size_t database_graph_triangle_batch(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
 
@@ -1559,7 +1559,7 @@ std::size_t database_graph_triangle_batch(test_config_t const& config) {
 case_result_t database_graph_transaction_watch(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     if (!database.supports_transactions()) return case_result_t::skipped("the engine keeps no transactions", failures);
     failures += expect(database.clear().succeeded());
@@ -1584,7 +1584,7 @@ case_result_t database_graph_transaction_watch(test_config_t const& config) {
 std::size_t database_graph_random_fill(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
 
@@ -1604,7 +1604,7 @@ std::size_t database_graph_random_fill(test_config_t const& config) {
 case_result_t database_graph_conflicting_transactions(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     if (!database.supports_transactions()) return case_result_t::skipped("the engine keeps no transactions", failures);
     failures += expect(database.clear().succeeded());
@@ -1628,7 +1628,7 @@ case_result_t database_graph_conflicting_transactions(test_config_t const& confi
 std::size_t database_graph_layering_shapes(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
 
@@ -1678,7 +1678,7 @@ std::size_t database_graph_layering_shapes(test_config_t const& config) {
 std::size_t database_graph_remove_vertices(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
 
@@ -1710,7 +1710,7 @@ std::size_t database_graph_remove_vertices(test_config_t const& config) {
 std::size_t database_graph_remove_edges_keep_vertices(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
 
@@ -1731,7 +1731,7 @@ std::size_t database_graph_remove_edges_keep_vertices(test_config_t const& confi
 std::size_t database_graph_get_vertex_edges(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
 
@@ -1763,7 +1763,7 @@ std::size_t database_graph_get_vertex_edges(test_config_t const& config) {
 std::size_t database_graph_degrees(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
 
@@ -1784,7 +1784,7 @@ std::size_t database_graph_degrees(test_config_t const& config) {
 std::size_t database_graph_neighbors(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
 
@@ -1826,7 +1826,7 @@ int main(int argc, char** argv) {
     char const* const directory = maybe_test_directory->path();
     if (directory) fmt::println("Will work in directory: {}", directory);
     else fmt::println("Will work with default configuration");
-    test_config_t const config {directory, options.engine_config};
+    test_config_t const config {options.engine, directory, options.engine_config};
 
     report(totals, "database.open_clear_close", database_open_clear_close, config);
     report(totals, "database.clear_by_clearing_db", database_clear_collection_by_clearing_database, config);

@@ -217,7 +217,7 @@ extern ustore_key_t const ustore_key_unknown_k;
 
 #pragma region Database
 
-/** The arguments of @c ustore_database_init. */
+/** The arguments of every engine's init call. */
 typedef struct ustore_database_init_t {
 
     /** Configuration of the engine as a JSON string. */
@@ -232,10 +232,19 @@ typedef struct ustore_database_init_t {
 } ustore_database_init_t;
 
 /**
- *  @brief Opens an embedded database, persistent or in memory.
+ *  @brief Opens the in-memory engine, which persists as one image when the configuration names a directory.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_database_init(ustore_database_init_t* arguments);
+void ustore_database_init_ram(ustore_database_init_t* arguments);
+
+/** Opens the RocksDB engine, in a library built with `USTORE_WITH_ROCKSDB`. */
+void ustore_database_init_rocksdb(ustore_database_init_t* arguments);
+
+/** Opens the LevelDB engine, in a library built with `USTORE_WITH_LEVELDB`. */
+void ustore_database_init_leveldb(ustore_database_init_t* arguments);
+
+/** Opens the NVMe engine, in a library built with `USTORE_BUILD_NVME`. */
+void ustore_database_init_nvme(ustore_database_init_t* arguments);
 
 /** The arguments of @c ustore_get_metadata. */
 typedef struct ustore_get_metadata_t {

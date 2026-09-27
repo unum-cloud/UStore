@@ -27,15 +27,11 @@
 #include <ustore/db.h>
 #include <ustore/ranges_args.hpp> // `places_arg_t`
 
+#include "engine.hpp"                 // `engine_t`, `handle_t`, `handle_cast`
 #include "helpers/blocking_files.hpp" // `directory_exists`
 #include "helpers/config_loader.hpp"  // `load_config`
 #include "helpers/full_scan.hpp"      // `reservoir_sample_iterator`
 #include "helpers/linked_array.hpp"   // `uninitialized_array`
-
-ustore_collection_t const ustore_collection_main_k = 0;
-ustore_collection_t const ustore_collection_names_k = std::numeric_limits<ustore_collection_t>::max() - 1;
-ustore_length_t const ustore_length_missing_k = std::numeric_limits<ustore_length_t>::max();
-ustore_key_t const ustore_key_unknown_k = std::numeric_limits<ustore_key_t>::max();
 
 namespace unum::ustore::leveldb {
 
@@ -87,8 +83,11 @@ struct snapshot_t {
 /** Identifiers of the live snapshots. */
 using snapshots_t = st::hash_set<ustore_snapshot_t>;
 
+/** The calls this engine serves, which stamp every handle it hands out. */
+extern engine_t const engine_k;
+
 /** The open database, its options and its snapshots. */
-struct database_t {
+struct database_t : handle_t {
 
     /** Options the database opened with, reused to create exports. */
     ::leveldb::Options options;
@@ -317,7 +316,8 @@ void database_init(ustore_database_init_t& arguments) {
         return;
     }
     database->native.reset(native);
-    *arguments.db = database.release();
+    database->engine = &engine_k;
+    *arguments.db = static_cast<handle_t*>(database.release());
 }
 
 void get_metadata(ustore_get_metadata_t& arguments) { *arguments.metadata = ustore_supports_snapshots_k; }
@@ -339,7 +339,7 @@ void snapshot_list(ustore_snapshot_list_t& arguments) {
     linked_memory_lock_t arena = linked_memory(arguments.arena, arguments.options, arguments.error);
     if (arguments.error->status) return;
 
-    database_t& database = *reinterpret_cast<database_t*>(arguments.db);
+    database_t& database = *handle_cast<database_t>(arguments.db);
     std::lock_guard lock {database.mutex};
     std::size_t const snapshots_count = database.snapshots.size();
     *arguments.count = static_cast<ustore_size_t>(snapshots_count);
@@ -358,7 +358,7 @@ void snapshot_create(ustore_snapshot_create_t& arguments) {
         return;
     }
 
-    database_t& database = *reinterpret_cast<database_t*>(arguments.db);
+    database_t& database = *handle_cast<database_t>(arguments.db);
     std::lock_guard lock {database.mutex};
     if (database.snapshots.find(*arguments.id) != database.snapshots.end()) {
         *arguments.error = {ustore_error_already_exists_k, "Such snapshot already exists"};
@@ -391,7 +391,7 @@ void snapshot_export(ustore_snapshot_export_t& arguments) {
         *arguments.error = {ustore_error_uninitialized_k, "Database is uninitialized"};
         return;
     }
-    database_t& database = *reinterpret_cast<database_t*>(arguments.db);
+    database_t& database = *handle_cast<database_t>(arguments.db);
 
     ::leveldb::ReadOptions scan_options;
     scan_options.fill_cache = false;
@@ -429,7 +429,7 @@ void snapshot_drop(ustore_snapshot_drop_t& arguments) {
         *arguments.error = {ustore_error_uninitialized_k, "Database is uninitialized"};
         return;
     }
-    database_t& database = *reinterpret_cast<database_t*>(arguments.db);
+    database_t& database = *handle_cast<database_t>(arguments.db);
     std::lock_guard lock {database.mutex};
     if (!database.snapshots.erase(arguments.id)) {
         *arguments.error = {ustore_error_not_found_k, "The snapshot doesn't exist"};
@@ -451,7 +451,7 @@ void write(ustore_write_t& arguments) {
         return;
     }
 
-    database_t& database = *reinterpret_cast<database_t*>(arguments.db);
+    database_t& database = *handle_cast<database_t>(arguments.db);
     strided_iterator<ustore_collection_t const> collections {arguments.collections, arguments.collections_stride};
     strided_iterator<ustore_key_t const> keys {arguments.keys, arguments.keys_stride};
     strided_iterator<ustore_bytes_cptr_t const> values {arguments.values, arguments.values_stride};
@@ -484,7 +484,7 @@ void read(ustore_read_t& arguments) {
     linked_memory_lock_t arena = linked_memory(arguments.arena, arguments.options, arguments.error);
     if (arguments.error->status) return;
 
-    database_t& database = *reinterpret_cast<database_t*>(arguments.db);
+    database_t& database = *handle_cast<database_t>(arguments.db);
     strided_iterator<ustore_collection_t const> collections {arguments.collections, arguments.collections_stride};
     strided_iterator<ustore_key_t const> keys {arguments.keys, arguments.keys_stride};
     places_arg_t places {{}, keys, {}, arguments.tasks_count};
@@ -529,7 +529,7 @@ void scan(ustore_scan_t& arguments) {
     linked_memory_lock_t arena = linked_memory(arguments.arena, arguments.options, arguments.error);
     if (arguments.error->status) return;
 
-    database_t& database = *reinterpret_cast<database_t*>(arguments.db);
+    database_t& database = *handle_cast<database_t>(arguments.db);
     strided_iterator<ustore_collection_t const> collections {arguments.collections, arguments.collections_stride};
     strided_iterator<ustore_key_t const> start_keys {arguments.start_keys, arguments.start_keys_stride};
     strided_iterator<ustore_length_t const> limits {arguments.count_limits, arguments.count_limits_stride};
@@ -584,7 +584,7 @@ void sample(ustore_sample_t& arguments) {
     linked_memory_lock_t arena = linked_memory(arguments.arena, arguments.options, arguments.error);
     if (arguments.error->status) return;
 
-    database_t& database = *reinterpret_cast<database_t*>(arguments.db);
+    database_t& database = *handle_cast<database_t>(arguments.db);
     strided_iterator<ustore_collection_t const> collections {arguments.collections, arguments.collections_stride};
     strided_iterator<ustore_length_t const> limits {arguments.count_limits, arguments.count_limits_stride};
     sample_args_t samples {{}, limits, arguments.tasks_count};
@@ -635,7 +635,7 @@ void measure(ustore_measure_t& arguments) {
     auto max_space_usages = arena.alloc_or_dummy(arguments.tasks_count, arguments.error, arguments.max_space_usages);
     if (arguments.error->status) return;
 
-    database_t& database = *reinterpret_cast<database_t*>(arguments.db);
+    database_t& database = *handle_cast<database_t>(arguments.db);
     strided_iterator<ustore_collection_t const> collections {arguments.collections, arguments.collections_stride};
     strided_iterator<ustore_key_t const> start_keys {arguments.start_keys, arguments.start_keys_stride};
     strided_iterator<ustore_key_t const> end_keys {arguments.end_keys, arguments.end_keys_stride};
@@ -684,7 +684,7 @@ void collection_drop(ustore_collection_drop_t& arguments) {
         return;
     }
 
-    database_t& database = *reinterpret_cast<database_t*>(arguments.db);
+    database_t& database = *handle_cast<database_t>(arguments.db);
 
     ::leveldb::WriteBatch batch;
     iterator_pointer_t iterator {database.native->NewIterator(::leveldb::ReadOptions())};
@@ -740,241 +740,12 @@ void transaction_commit(ustore_transaction_commit_t& arguments) {
 
 #pragma endregion Transactions
 
-} // namespace unum::ustore::leveldb
-
-using namespace unum::ustore;
-using namespace unum::ustore::leveldb;
-
-#pragma region Exception Boundaries
-
-void ustore_database_init(ustore_database_init_t* arguments) {
-    try {
-        database_init(*arguments);
-    }
-    catch (std::bad_alloc const&) {
-        *arguments->error = {ustore_error_out_of_memory_k, "Out of memory"};
-    }
-    catch (...) {
-        *arguments->error = {ustore_error_internal_k, "Unexpected engine failure"};
-    }
-}
-
-void ustore_get_metadata(ustore_get_metadata_t* arguments) {
-    try {
-        get_metadata(*arguments);
-    }
-    catch (std::bad_alloc const&) {
-        *arguments->error = {ustore_error_out_of_memory_k, "Out of memory"};
-    }
-    catch (...) {
-        *arguments->error = {ustore_error_internal_k, "Unexpected engine failure"};
-    }
-}
-
-void ustore_snapshot_list(ustore_snapshot_list_t* arguments) {
-    try {
-        snapshot_list(*arguments);
-    }
-    catch (std::bad_alloc const&) {
-        *arguments->error = {ustore_error_out_of_memory_k, "Out of memory"};
-    }
-    catch (...) {
-        *arguments->error = {ustore_error_internal_k, "Unexpected engine failure"};
-    }
-}
-
-void ustore_snapshot_create(ustore_snapshot_create_t* arguments) {
-    try {
-        snapshot_create(*arguments);
-    }
-    catch (std::bad_alloc const&) {
-        *arguments->error = {ustore_error_out_of_memory_k, "Out of memory"};
-    }
-    catch (...) {
-        *arguments->error = {ustore_error_internal_k, "Unexpected engine failure"};
-    }
-}
-
-void ustore_snapshot_export(ustore_snapshot_export_t* arguments) {
-    try {
-        snapshot_export(*arguments);
-    }
-    catch (std::bad_alloc const&) {
-        *arguments->error = {ustore_error_out_of_memory_k, "Out of memory"};
-    }
-    catch (...) {
-        *arguments->error = {ustore_error_internal_k, "Unexpected engine failure"};
-    }
-}
-
-void ustore_snapshot_drop(ustore_snapshot_drop_t* arguments) {
-    if (!arguments) return;
-    try {
-        snapshot_drop(*arguments);
-    }
-    catch (std::bad_alloc const&) {
-        *arguments->error = {ustore_error_out_of_memory_k, "Out of memory"};
-    }
-    catch (...) {
-        *arguments->error = {ustore_error_internal_k, "Unexpected engine failure"};
-    }
-}
-
-void ustore_write(ustore_write_t* arguments) {
-    try {
-        write(*arguments);
-    }
-    catch (std::bad_alloc const&) {
-        *arguments->error = {ustore_error_out_of_memory_k, "Out of memory"};
-    }
-    catch (...) {
-        *arguments->error = {ustore_error_internal_k, "Unexpected engine failure"};
-    }
-}
-
-void ustore_read(ustore_read_t* arguments) {
-    try {
-        read(*arguments);
-    }
-    catch (std::bad_alloc const&) {
-        *arguments->error = {ustore_error_out_of_memory_k, "Out of memory"};
-    }
-    catch (...) {
-        *arguments->error = {ustore_error_internal_k, "Unexpected engine failure"};
-    }
-}
-
-void ustore_scan(ustore_scan_t* arguments) {
-    try {
-        scan(*arguments);
-    }
-    catch (std::bad_alloc const&) {
-        *arguments->error = {ustore_error_out_of_memory_k, "Out of memory"};
-    }
-    catch (...) {
-        *arguments->error = {ustore_error_internal_k, "Unexpected engine failure"};
-    }
-}
-
-void ustore_sample(ustore_sample_t* arguments) {
-    try {
-        sample(*arguments);
-    }
-    catch (std::bad_alloc const&) {
-        *arguments->error = {ustore_error_out_of_memory_k, "Out of memory"};
-    }
-    catch (...) {
-        *arguments->error = {ustore_error_internal_k, "Unexpected engine failure"};
-    }
-}
-
-void ustore_measure(ustore_measure_t* arguments) {
-    try {
-        measure(*arguments);
-    }
-    catch (std::bad_alloc const&) {
-        *arguments->error = {ustore_error_out_of_memory_k, "Out of memory"};
-    }
-    catch (...) {
-        *arguments->error = {ustore_error_internal_k, "Unexpected engine failure"};
-    }
-}
-
-void ustore_collection_create(ustore_collection_create_t* arguments) {
-    try {
-        collection_create(*arguments);
-    }
-    catch (std::bad_alloc const&) {
-        *arguments->error = {ustore_error_out_of_memory_k, "Out of memory"};
-    }
-    catch (...) {
-        *arguments->error = {ustore_error_internal_k, "Unexpected engine failure"};
-    }
-}
-
-void ustore_collection_drop(ustore_collection_drop_t* arguments) {
-    try {
-        collection_drop(*arguments);
-    }
-    catch (std::bad_alloc const&) {
-        *arguments->error = {ustore_error_out_of_memory_k, "Out of memory"};
-    }
-    catch (...) {
-        *arguments->error = {ustore_error_internal_k, "Unexpected engine failure"};
-    }
-}
-
-void ustore_collection_list(ustore_collection_list_t* arguments) {
-    try {
-        collection_list(*arguments);
-    }
-    catch (std::bad_alloc const&) {
-        *arguments->error = {ustore_error_out_of_memory_k, "Out of memory"};
-    }
-    catch (...) {
-        *arguments->error = {ustore_error_internal_k, "Unexpected engine failure"};
-    }
-}
-
-void ustore_database_control(ustore_database_control_t* arguments) {
-    try {
-        database_control(*arguments);
-    }
-    catch (std::bad_alloc const&) {
-        *arguments->error = {ustore_error_out_of_memory_k, "Out of memory"};
-    }
-    catch (...) {
-        *arguments->error = {ustore_error_internal_k, "Unexpected engine failure"};
-    }
-}
-
-void ustore_transaction_init(ustore_transaction_init_t* arguments) {
-    try {
-        transaction_init(*arguments);
-    }
-    catch (std::bad_alloc const&) {
-        *arguments->error = {ustore_error_out_of_memory_k, "Out of memory"};
-    }
-    catch (...) {
-        *arguments->error = {ustore_error_internal_k, "Unexpected engine failure"};
-    }
-}
-
-void ustore_transaction_stage(ustore_transaction_stage_t* arguments) {
-    try {
-        transaction_stage(*arguments);
-    }
-    catch (std::bad_alloc const&) {
-        *arguments->error = {ustore_error_out_of_memory_k, "Out of memory"};
-    }
-    catch (...) {
-        *arguments->error = {ustore_error_internal_k, "Unexpected engine failure"};
-    }
-}
-
-void ustore_transaction_commit(ustore_transaction_commit_t* arguments) {
-    try {
-        transaction_commit(*arguments);
-    }
-    catch (std::bad_alloc const&) {
-        *arguments->error = {ustore_error_out_of_memory_k, "Out of memory"};
-    }
-    catch (...) {
-        *arguments->error = {ustore_error_internal_k, "Unexpected engine failure"};
-    }
-}
-
-#pragma endregion Exception Boundaries
-
 #pragma region Memory
 
-void ustore_arena_free(ustore_arena_t arena) { clear_linked_memory(arena); }
+void transaction_free(ustore_transaction_t) noexcept {}
 
-void ustore_transaction_free(ustore_transaction_t) {}
-
-void ustore_database_free(ustore_database_t database_handle) {
-    if (!database_handle) return;
-    database_t* const database = reinterpret_cast<database_t*>(database_handle);
+void database_free(ustore_database_t handle) noexcept {
+    database_t* const database = handle_cast<database_t>(handle);
     // Snapshots a caller never dropped belong to the database, so they go with it
     [[maybe_unused]] auto const released = database->snapshots.for_each([&](auto const& slot) noexcept {
         snapshot_t* const snapshot = reinterpret_cast<snapshot_t*>(slot.key());
@@ -985,3 +756,42 @@ void ustore_database_free(ustore_database_t database_handle) {
 }
 
 #pragma endregion Memory
+
+engine_t const engine_k {
+    .get_metadata = &get_metadata,
+    .database_control = &database_control,
+    .snapshot_list = &snapshot_list,
+    .snapshot_create = &snapshot_create,
+    .snapshot_export = &snapshot_export,
+    .snapshot_drop = &snapshot_drop,
+    .read = &read,
+    .write = &write,
+    .scan = &scan,
+    .sample = &sample,
+    .measure = &measure,
+    .collection_create = &collection_create,
+    .collection_drop = &collection_drop,
+    .collection_list = &collection_list,
+    .transaction_init = &transaction_init,
+    .transaction_stage = &transaction_stage,
+    .transaction_commit = &transaction_commit,
+    .transaction_free = &transaction_free,
+    .database_free = &database_free,
+};
+
+} // namespace unum::ustore::leveldb
+
+using namespace unum::ustore;
+using namespace unum::ustore::leveldb;
+
+void ustore_database_init_leveldb(ustore_database_init_t* arguments) {
+    try {
+        database_init(*arguments);
+    }
+    catch (std::bad_alloc const&) {
+        *arguments->error = {ustore_error_out_of_memory_k, "Out of memory"};
+    }
+    catch (...) {
+        *arguments->error = {ustore_error_internal_k, "Unexpected engine failure"};
+    }
+}

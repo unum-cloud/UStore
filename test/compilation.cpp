@@ -26,7 +26,7 @@ using namespace unum;
 std::size_t wrappers_compile(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
 
     [[maybe_unused]] auto const main_by_value = database.main();
@@ -111,7 +111,7 @@ int main(int argc, char** argv) {
         fmt::println(stderr, "Cannot create a unique directory under {}", options.directory);
         return 1;
     }
-    test_config_t const config {maybe_directory->path(), options.engine_config};
+    test_config_t const config {options.engine, maybe_directory->path(), options.engine_config};
 
     report(totals, "wrappers.compile", wrappers_compile, config);
     return suite_exit_code(totals);

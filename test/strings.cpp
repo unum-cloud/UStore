@@ -229,13 +229,8 @@ struct fixture_t {
     fixture_t& operator=(fixture_t const&) = delete;
 
     explicit fixture_t(test_config_t const& config) noexcept {
-        ustore_error_t error {};
-        ustore_database_init_t init {};
-        init.config = config.c_str();
-        init.db = &database;
-        init.error = &error;
-        ustore_database_init(&init);
-        if (error.status) fmt::println(stderr, "  failed to open the database: {}", error.message);
+        status_t const opened = open_raw(config, database);
+        if (opened.failed()) fmt::println(stderr, "  failed to open the database: {}", opened.message);
     }
 
     ~fixture_t() noexcept {
@@ -518,7 +513,7 @@ int main(int argc, char** argv) {
     char const* const directory = maybe_test_directory->path();
     if (directory) fmt::println("Will work in directory: {}", directory);
     else fmt::println("Will work with default configuration");
-    test_config_t const config {directory, options.engine_config};
+    test_config_t const config {options.engine, directory, options.engine_config};
 
     report(totals, "strings.short_ordering", strings_short_ordering, config);
     report(totals, "strings.prefix_scan", strings_prefix_scan, config);

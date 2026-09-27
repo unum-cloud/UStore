@@ -275,9 +275,9 @@ int main(int argc, char** argv) {
         fmt::println(stderr, "Cannot create a unique directory under {}", suite.directory);
         return 1;
     }
-    test_config_t const config {maybe_directory->path(), suite.engine_config};
+    test_config_t const config {suite.engine, maybe_directory->path(), suite.engine_config};
     database_t database;
-    if (database.open(config.c_str()).failed()) {
+    if (open_database(database, config).failed()) {
         fmt::println(stderr, "Cannot open the database");
         return 1;
     }

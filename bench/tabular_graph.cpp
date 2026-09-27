@@ -67,6 +67,9 @@ struct settings_t {
     /** Directory the exports are written to, and the database lives in without @c config. */
     std::string_view directory;
 
+    /** The engine to open: @c ram, @c rocksdb, @c leveldb or @c nvme. */
+    std::string_view engine = "ram";
+
     /** Field holding the document keys. */
     std::string_view id_field;
 
@@ -415,10 +418,11 @@ int main(int argc, char** argv) {
     using namespace unum::ustore::bench;
 
     settings_t settings;
-    std::array<flag_t, 11> const flags {{
+    std::array<flag_t, 12> const flags {{
         {"--dataset", "path", "directory of input files, required", &settings.dataset},
         {"--format", "name", "format of the input files and the exports", &settings.format},
         {"--config", "path", "JSON file configuring the database", &settings.config},
+        {"--engine", "name", "engine to open: ram, rocksdb, leveldb or nvme", &settings.engine},
         {"--directory", "path", "directory of the exports and of the database without --config, required",
          &settings.directory},
         {"--id-field", "field", "field holding each document's key, required", &settings.id_field},
@@ -468,12 +472,17 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    database_init_t const init_database = database_init_of(settings.engine);
+    if (!init_database) {
+        fmt::println(stderr, "This build carries no engine named {}", settings.engine);
+        return 1;
+    }
     ustore_error_t error {};
     ustore_database_init_t init {};
     init.config = config.c_str();
     init.db = &tabular.db;
     init.error = &error;
-    ustore_database_init(&init);
+    init_database(&init);
     if (error.status) {
         fmt::println(stderr, "Failed to open the database: {}", error.message);
         return 1;

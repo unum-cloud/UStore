@@ -56,6 +56,9 @@ struct settings_t {
     /** Directory the database lives in. */
     std::string_view directory;
 
+    /** The engine to open: @c ram, @c rocksdb, @c leveldb or @c nvme. */
+    std::string_view engine = "ram";
+
     /** Threads every benchmark and the indexing run on. */
     count_t threads {.value = 1, .minimum = 1};
 
@@ -592,9 +595,10 @@ int main(int argc, char** argv) {
 
     settings_t settings;
     if (auto const cores = executor_t::logical_cores_count(); cores && *cores > 1) settings.threads.value = *cores / 2;
-    std::array<flag_t, 8> const flags {{
+    std::array<flag_t, 9> const flags {{
         {"--dataset", "path", "directory of .ndjson tweet files; tweets are generated without it", &settings.dataset},
         {"--directory", "path", "database directory, required", &settings.directory},
+        {"--engine", "name", "engine to open: ram, rocksdb, leveldb or nvme", &settings.engine},
         {"--threads", "count", "threads every benchmark runs on", &settings.threads},
         {"--max-tweets", "count", "tweets to generate without a dataset", &settings.max_tweets},
         {"--max-input-files-total", "count", "input files mapped from the dataset", &settings.max_input_files_total},
@@ -647,12 +651,17 @@ int main(int argc, char** argv) {
     fmt::println("- indexed {} docs", pass_through_size(twitter.documents));
     fmt::println("- indexed {} relations", pass_through_size(twitter.edges));
 
+    database_init_t const init_database = database_init_of(settings.engine);
+    if (!init_database) {
+        fmt::println(stderr, "This build carries no engine named {}", settings.engine);
+        return 1;
+    }
     ustore_error_t error {};
     ustore_database_init_t init {};
     init.config = config;
     init.db = &twitter.db;
     init.error = &error;
-    ustore_database_init(&init);
+    init_database(&init);
     if (error.status) {
         fmt::println(stderr, "Failed to open the database: {}", error.message);
         return 1;

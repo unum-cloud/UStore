@@ -48,7 +48,7 @@ struct fixture_t {
     fixture_t& operator=(fixture_t const&) = delete;
 
     explicit fixture_t(test_config_t const& config) noexcept {
-        if (status_t const opened = database.open(config.c_str()); opened.failed()) {
+        if (status_t const opened = open_database(database, config); opened.failed()) {
             fmt::println(stderr, "  failed to open the database: {}", opened.message);
             return;
         }
@@ -325,7 +325,7 @@ int main(int argc, char** argv) {
     char const* const directory = maybe_test_directory->path();
     if (directory) fmt::println("Will work in directory: {}", directory);
     else fmt::println("Will work with default configuration");
-    test_config_t const config {directory, options.engine_config};
+    test_config_t const config {options.engine, directory, options.engine_config};
 
     report(totals, "strings_collection.short_ordering", strings_collection_short_ordering, config);
     report(totals, "strings_collection.prefix_walk", strings_collection_prefix_walk, config);

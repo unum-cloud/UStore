@@ -28,7 +28,7 @@ using namespace unum;
 std::size_t database_validation(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
-    failures += expect(database.open(config.c_str()).succeeded());
+    failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
     blobs_collection_t collection = database.main();
     auto maybe_named_collection = database.find_or_create("col");
@@ -385,7 +385,7 @@ int main(int argc, char** argv) {
         fmt::println(stderr, "Cannot create a unique directory under {}", options.directory);
         return 1;
     }
-    test_config_t const config {maybe_directory->path(), options.engine_config};
+    test_config_t const config {options.engine, maybe_directory->path(), options.engine_config};
 
     report(totals, "database.validation", database_validation, config);
     return suite_exit_code(totals);

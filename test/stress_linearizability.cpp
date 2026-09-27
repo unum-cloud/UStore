@@ -152,7 +152,7 @@ struct writer_slot_t {
 struct linearizability_run_t {
 
     /** Configuration every opening of the database reads. */
-    char const* config = nullptr;
+    test_config_t const* config = nullptr;
 
     /** Database reopened for every thread and transaction count, which bounds the tombstones clears leave behind. */
     database_t database;
@@ -204,7 +204,7 @@ struct linearizability_run_t {
 [[nodiscard]] std::size_t reopen_run(linearizability_run_t& run) {
     for (writer_slot_t& slot : run.slots) slot.transaction = transaction_t {};
     if (run.database) run.database.close();
-    std::size_t failures = expect(run.database.open(run.config).succeeded());
+    std::size_t failures = expect(open_database(run.database, *run.config).succeeded());
     if (failures) return failures;
     run.collection = run.database.main();
     for (std::size_t thread = 0; thread != run.slots.size() && !failures; ++thread)
@@ -394,9 +394,9 @@ int main(int argc, char** argv) {
         fmt::println(stderr, "Cannot create a unique directory under {}", suite.directory);
         return 1;
     }
-    test_config_t const config {maybe_directory->path(), suite.engine_config};
-    linearizability_run_t run {config.c_str()};
-    if (run.database.open(run.config).failed()) {
+    test_config_t const config {suite.engine, maybe_directory->path(), suite.engine_config};
+    linearizability_run_t run {&config};
+    if (open_database(run.database, *run.config).failed()) {
         fmt::println(stderr, "Cannot open the database");
         return 1;
     }

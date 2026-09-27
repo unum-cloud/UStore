@@ -213,14 +213,9 @@ class test_database_t {
 
     /** Opens the database @p config describes and answers whether it opened. */
     [[nodiscard]] bool open(test_config_t const& config) noexcept {
-        ustore_error_t error {};
-        ustore_database_init_t opening {};
-        opening.config = config.c_str();
-        opening.db = &database_;
-        opening.error = &error;
-        ustore_database_init(&opening);
-        if (!error.status) return true;
-        fmt::println(stderr, "  failed to open the database: {}", error.message);
+        status_t const opened = open_raw(config, database_);
+        if (opened.succeeded()) return true;
+        fmt::println(stderr, "  failed to open the database: {}", opened.message);
         return false;
     }
 
@@ -770,6 +765,8 @@ template <typename... arguments_type_>
                                          char const* cli) noexcept {
     std::size_t failures = 0;
     char const* const directory = paths.directory;
+    // The engine's name is a literal or a word of `argv`, so it ends in a null either way
+    char const* const engine = config.engine().data();
     char const* const collection = "collection1";
     char const* const input = paths.documents_ndjson.c_str();
     char const* const output = paths.exported_ndjson.c_str();
@@ -781,35 +778,38 @@ template <typename... arguments_type_>
     }
 
     if (supports_collections) {
-        failures += expect_eq(
-            run_command(cli, "--directory", directory, "collection", "create", "--collection", collection), 0);
+        failures += expect_eq(run_command(cli, "--engine", engine, "--directory", directory, "collection", "create",
+                                          "--collection", collection),
+                              0);
         {
             test_database_t database;
             failures += expect(database.open(config) && lists_collection(database.get(), collection));
         }
 
-        failures += expect_eq(run_command(cli, "--directory", directory, "collection", "import", "--input", input,
-                                          "--id-field", "id", "--memory-limit", "1MiB", "--collection", collection),
-                              0);
-        failures += expect_eq(run_command(cli, "--directory", directory, "collection", "export", "--output", output,
-                                          "--memory-limit", "1MiB", "--collection", collection),
+        failures += expect_eq(
+            run_command(cli, "--engine", engine, "--directory", directory, "collection", "import", "--input", input,
+                        "--id-field", "id", "--memory-limit", "1MiB", "--collection", collection),
+            0);
+        failures += expect_eq(run_command(cli, "--engine", engine, "--directory", directory, "collection", "export",
+                                          "--output", output, "--memory-limit", "1MiB", "--collection", collection),
                               0);
         failures += check_documents(output, input, field_selection_t::whole_k);
         [[maybe_unused]] int const removed_named = std::remove(output);
 
-        failures += expect_eq(
-            run_command(cli, "--directory", directory, "collection", "drop", "--collection", collection), 0);
+        failures += expect_eq(run_command(cli, "--engine", engine, "--directory", directory, "collection", "drop",
+                                          "--collection", collection),
+                              0);
         {
             test_database_t database;
             failures += expect(database.open(config) && !lists_collection(database.get(), collection));
         }
     }
 
-    failures += expect_eq(run_command(cli, "--directory", directory, "collection", "import", "--input", input,
-                                      "--id-field", "id", "--memory-limit", "1MiB"),
+    failures += expect_eq(run_command(cli, "--engine", engine, "--directory", directory, "collection", "import",
+                                      "--input", input, "--id-field", "id", "--memory-limit", "1MiB"),
                           0);
-    failures += expect_eq(run_command(cli, "--directory", directory, "collection", "export", "--output", output,
-                                      "--memory-limit", "1MiB"),
+    failures += expect_eq(run_command(cli, "--engine", engine, "--directory", directory, "collection", "export",
+                                      "--output", output, "--memory-limit", "1MiB"),
                           0);
     failures += check_documents(output, input, field_selection_t::whole_k);
     [[maybe_unused]] int const removed_main = std::remove(output);
@@ -889,7 +889,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     char const* const directory = maybe_directory->path();
-    test_config_t const config {directory, options.engine_config};
+    test_config_t const config {options.engine, directory, options.engine_config};
 
     if (directory) run_cases(totals, config, cli);
     else report(totals, "tools", case_result_t::skipped(needs_directory_k));

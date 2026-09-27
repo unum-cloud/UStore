@@ -180,79 +180,63 @@ if (NOT USTORE_BUILD_LIB_C AND NOT USTORE_INSTALL)
     set(USTORE_LIB_C_EXCLUSION EXCLUDE_FROM_ALL)
 endif ()
 
+# One library holds the C ABI and every engine the build enables, each opened through its own `ustore_database_init_*`;
+# every engine is its own object of the archive, so a program links only those it opens.
 set(USTORE_ENGINE_NAMES "ram")
-add_library(
-    ustore_embedded_ram STATIC ${USTORE_LIB_C_EXCLUSION} src/ram/engine.cpp c/docs.cpp c/graph.cpp c/strings.cpp
-)
+add_library(ustore STATIC ${USTORE_LIB_C_EXCLUSION} c/lib.cpp c/docs.cpp c/graph.cpp c/strings.cpp src/ram/engine.cpp)
+add_library(ustore::ustore ALIAS ustore)
 
 # The NVMe engine mounts its volumes on files, so it builds everywhere the siblings do; the io_uring transport beside it
 # compiles on every platform and only opens a ring on Linux.
 if (${USTORE_BUILD_NVME})
-    add_library(
-        ustore_embedded_nvme STATIC ${USTORE_LIB_C_EXCLUSION} src/nvme/engine.cpp c/docs.cpp c/graph.cpp c/strings.cpp
-    )
+    target_sources(ustore PRIVATE src/nvme/engine.cpp)
+    target_compile_definitions(ustore PUBLIC USTORE_WITH_NVME=1)
     # Identifiers draw their entropy from `BCryptGenRandom` on Windows
-    target_link_libraries(ustore_embedded_nvme PRIVATE $<$<PLATFORM_ID:Windows>:bcrypt>)
+    target_link_libraries(ustore PRIVATE $<$<PLATFORM_ID:Windows>:bcrypt>)
     if (TARGET ustore_nvme_compaction)
-        target_link_libraries(ustore_embedded_nvme PUBLIC ustore_nvme_compaction)
+        target_link_libraries(ustore PUBLIC ustore_nvme_compaction)
         set(USTORE_COMPACTION_LIB ustore_nvme_compaction)
     endif ()
     list(APPEND USTORE_ENGINE_NAMES "nvme")
 endif ()
 
 if (${USTORE_WITH_ROCKSDB})
-    add_library(
-        ustore_embedded_rocksdb STATIC ${USTORE_LIB_C_EXCLUSION} src_oracles/rocksdb/engine.cpp c/docs.cpp c/graph.cpp
-                                       c/strings.cpp
-    )
-    target_link_libraries(ustore_embedded_rocksdb PRIVATE rocksdb::rocksdb)
+    target_sources(ustore PRIVATE src_oracles/rocksdb/engine.cpp)
+    target_compile_definitions(ustore PUBLIC USTORE_WITH_ROCKSDB=1)
+    target_link_libraries(ustore PRIVATE rocksdb::rocksdb)
     list(APPEND USTORE_ENGINE_NAMES "rocksdb")
 endif ()
 
 if (${USTORE_WITH_LEVELDB})
-    add_library(
-        ustore_embedded_leveldb STATIC ${USTORE_LIB_C_EXCLUSION} src_oracles/leveldb/engine.cpp c/docs.cpp c/graph.cpp
-                                       c/strings.cpp
-    )
-    target_link_libraries(ustore_embedded_leveldb PRIVATE leveldb::leveldb)
+    target_sources(ustore PRIVATE src_oracles/leveldb/engine.cpp)
+    target_compile_definitions(ustore PUBLIC USTORE_WITH_LEVELDB=1)
+    target_link_libraries(ustore PRIVATE leveldb::leveldb)
     if (NOT MSVC)
         set_source_files_properties(src_oracles/leveldb/engine.cpp PROPERTIES COMPILE_FLAGS -fno-rtti)
     endif ()
     list(APPEND USTORE_ENGINE_NAMES "leveldb")
 endif ()
 
-# Every engine carries the siblings to whoever links it, since the suites and tools reach them through the engine, while
+# The library carries the siblings to whoever links it, since the suites and tools reach them through it, while
 # formatting and warnings stay inside.
-foreach (engine_name IN ITEMS ${USTORE_ENGINE_NAMES})
-    target_compile_features(ustore_embedded_${engine_name} PUBLIC cxx_std_20)
-    target_compile_definitions(ustore_embedded_${engine_name} INTERFACE USTORE_VERSION="${USTORE_VERSION}")
-    target_link_libraries(
-        ustore_embedded_${engine_name}
-        PUBLIC forkunion::static smashtable::header stringzilla::static yyjson::yyjson Threads::Threads
-        PRIVATE fmt::fmt ustore_warnings
-    )
-    # The `include_directories` above reach this project's targets only, so a consumer linking an engine inherits the
-    # public headers from the target instead.
-    target_include_directories(
-        ustore_embedded_${engine_name}
-        PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/src/helpers
-    )
-endforeach ()
+target_compile_features(ustore PUBLIC cxx_std_20)
+target_compile_definitions(ustore INTERFACE USTORE_VERSION="${USTORE_VERSION}")
+target_link_libraries(
+    ustore
+    PUBLIC forkunion::static smashtable::header stringzilla::static yyjson::yyjson Threads::Threads
+    PRIVATE fmt::fmt ustore_warnings
+)
+# The `include_directories` above reach this project's targets only, so a consumer linking the library inherits the
+# public headers from the target instead.
+target_include_directories(
+    ustore
+    PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/src/helpers
+)
 
-# A static engine library links only beside the archives it depends on, so they install together, apart from system
-# copies.
+# A static library links only beside the archives it depends on, so they install together, apart from system copies.
 if (USTORE_INSTALL)
-    list(TRANSFORM USTORE_ENGINE_NAMES PREPEND "ustore_embedded_" OUTPUT_VARIABLE USTORE_INSTALLED_ARCHIVES)
-    list(
-        APPEND
-        USTORE_INSTALLED_ARCHIVES
-        ${USTORE_COMPACTION_LIB}
-        fmt
-        yyjson
-        forkunion_static
-        stringzilla_static
-    )
+    set(USTORE_INSTALLED_ARCHIVES ustore ${USTORE_COMPACTION_LIB} fmt yyjson forkunion_static stringzilla_static)
     if (${USTORE_WITH_ROCKSDB})
         list(APPEND USTORE_INSTALLED_ARCHIVES rocksdb)
     endif ()
@@ -267,10 +251,8 @@ if (USTORE_INSTALL)
 endif ()
 
 if (${USTORE_BUILD_TOOLS})
-    foreach (engine_name IN ITEMS ${USTORE_ENGINE_NAMES})
-        add_executable(ustore_cli_${engine_name} tools/cli.cpp tools/dataset.cpp)
-        target_link_libraries(ustore_cli_${engine_name} PRIVATE ustore_embedded_${engine_name} fmt::fmt ustore_warnings)
-    endforeach ()
+    add_executable(ustore_cli tools/cli.cpp tools/dataset.cpp)
+    target_link_libraries(ustore_cli PRIVATE ustore fmt::fmt ustore_warnings)
 endif ()
 
 if (${USTORE_BUILD_TEST})
@@ -334,53 +316,52 @@ if (${USTORE_BUILD_TEST})
 
     set(USTORE_STRESS_NAMES "atomicity" "linearizability")
 
-    foreach (engine_name IN ITEMS ${USTORE_ENGINE_NAMES})
-        set(client_lib ustore_embedded_${engine_name})
-
-        foreach (test_name IN ITEMS ${USTORE_TEST_NAMES})
-            set(test_exe ustore_test_${test_name}_${engine_name})
-            add_executable(${test_exe} test/${test_name}.cpp)
-            target_link_libraries(${test_exe} PRIVATE ${client_lib} fmt::fmt ustore_warnings)
-            add_test(NAME ${test_exe} COMMAND ${test_exe} --directory ${CMAKE_BINARY_DIR}/test_data)
-        endforeach ()
-
-        foreach (stress_name IN ITEMS ${USTORE_STRESS_NAMES})
-            set(test_exe ustore_stress_${stress_name}_${engine_name})
-            add_executable(${test_exe} test/stress_${stress_name}.cpp)
-            target_link_libraries(${test_exe} PRIVATE ${client_lib} fmt::fmt ustore_warnings)
-            add_test(NAME ${test_exe} COMMAND ${test_exe} --directory ${CMAKE_BINARY_DIR}/test_data)
-        endforeach ()
-
-        # The tools suite drives the CLI of the same engine
-        if (${USTORE_BUILD_TOOLS})
-            set(test_exe ustore_test_tools_${engine_name})
-            add_executable(${test_exe} test/tools.cpp tools/dataset.cpp)
-            target_link_libraries(${test_exe} PRIVATE ${client_lib} fmt::fmt ustore_warnings)
-            add_dependencies(${test_exe} ustore_cli_${engine_name})
-            add_test(NAME ${test_exe} COMMAND ${test_exe} --directory ${CMAKE_BINARY_DIR}/test_data --cli
-                                              $<TARGET_FILE:ustore_cli_${engine_name}>
+    # Every suite builds once and runs once per engine, picking it with `--engine`
+    foreach (test_name IN ITEMS ${USTORE_TEST_NAMES})
+        add_executable(ustore_test_${test_name} test/${test_name}.cpp)
+        target_link_libraries(ustore_test_${test_name} PRIVATE ustore fmt::fmt ustore_warnings)
+        foreach (engine_name IN ITEMS ${USTORE_ENGINE_NAMES})
+            add_test(NAME ustore_test_${test_name}_${engine_name}
+                     COMMAND ustore_test_${test_name} --engine ${engine_name} --directory ${CMAKE_BINARY_DIR}/test_data
             )
-        endif ()
+        endforeach ()
     endforeach ()
+
+    foreach (stress_name IN ITEMS ${USTORE_STRESS_NAMES})
+        add_executable(ustore_stress_${stress_name} test/stress_${stress_name}.cpp)
+        target_link_libraries(ustore_stress_${stress_name} PRIVATE ustore fmt::fmt ustore_warnings)
+        foreach (engine_name IN ITEMS ${USTORE_ENGINE_NAMES})
+            add_test(NAME ustore_stress_${stress_name}_${engine_name}
+                     COMMAND ustore_stress_${stress_name} --engine ${engine_name} --directory
+                             ${CMAKE_BINARY_DIR}/test_data
+            )
+        endforeach ()
+    endforeach ()
+
+    # The tools suite drives the CLI on the same engine
+    if (${USTORE_BUILD_TOOLS})
+        add_executable(ustore_test_tools test/tools.cpp tools/dataset.cpp)
+        target_link_libraries(ustore_test_tools PRIVATE ustore fmt::fmt ustore_warnings)
+        add_dependencies(ustore_test_tools ustore_cli)
+        foreach (engine_name IN ITEMS ${USTORE_ENGINE_NAMES})
+            add_test(NAME ustore_test_tools_${engine_name}
+                     COMMAND ustore_test_tools --engine ${engine_name} --directory ${CMAKE_BINARY_DIR}/test_data --cli
+                             $<TARGET_FILE:ustore_cli>
+            )
+        endforeach ()
+    endif ()
 endif ()
 
-# Benchmarks, one executable per engine
+# Benchmarks, each picking its engine with `--engine`
 if (${USTORE_BUILD_BENCH})
-    foreach (engine_name IN ITEMS ${USTORE_ENGINE_NAMES})
-        set(client_lib ustore_embedded_${engine_name})
+    add_executable(ustore_bench_twitter bench/twitter.cpp)
+    target_link_libraries(ustore_bench_twitter PRIVATE ustore benchmark::benchmark fmt::fmt ustore_warnings)
 
-        set(bench_name ustore_bench_twitter_${engine_name})
-        add_executable(${bench_name} bench/twitter.cpp)
-        target_link_libraries(${bench_name} PRIVATE ${client_lib} benchmark::benchmark fmt::fmt ustore_warnings)
+    add_executable(ustore_bench_tabular_graph bench/tabular_graph.cpp tools/dataset.cpp)
+    target_link_libraries(ustore_bench_tabular_graph PRIVATE ustore benchmark::benchmark fmt::fmt ustore_warnings)
 
-        set(bench_name ustore_bench_tabular_graph_${engine_name})
-        add_executable(${bench_name} bench/tabular_graph.cpp tools/dataset.cpp)
-        target_link_libraries(${bench_name} PRIVATE ${client_lib} benchmark::benchmark fmt::fmt ustore_warnings)
-
-        set(bench_name ustore_bench_louvain_${engine_name})
-        add_executable(${bench_name} bench/louvain.cpp)
-        target_link_libraries(${bench_name} PRIVATE ${client_lib} benchmark::benchmark fmt::fmt ustore_warnings)
-    endforeach ()
+    add_executable(ustore_bench_louvain bench/louvain.cpp)
+    target_link_libraries(ustore_bench_louvain PRIVATE ustore benchmark::benchmark fmt::fmt ustore_warnings)
 endif ()
 
 if (${USTORE_BUILD_LIB_PYTHON})

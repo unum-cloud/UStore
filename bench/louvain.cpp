@@ -50,6 +50,9 @@ struct settings_t {
     /** Directory the database lives in; the engine keeps the graph in memory without it. */
     std::string_view directory;
 
+    /** The engine to open: @c ram, @c rocksdb, @c leveldb or @c nvme. */
+    std::string_view engine = "ram";
+
     /** Vertices of the generated graph, trimmed down to a whole number of communities. */
     count_t vertices {.value = 4096, .minimum = 2};
 
@@ -635,8 +638,9 @@ int main(int argc, char** argv) {
     using namespace unum::ustore::bench;
 
     settings_t settings;
-    std::array<flag_t, 11> const flags {{
+    std::array<flag_t, 12> const flags {{
         {"--dataset", "path", "SNAP edge list; a planted partition is generated without it", &settings.dataset},
+        {"--engine", "name", "engine to open: ram, rocksdb, leveldb or nvme", &settings.engine},
         {"--directory", "path", "database directory; the graph stays in memory without it", &settings.directory},
         {"--vertices", "count", "vertices of the generated graph", &settings.vertices},
         {"--communities", "count", "communities planted in the generated graph", &settings.communities},
@@ -707,12 +711,23 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    database_t database;
-    status_t const opened = database.open(config.c_str());
-    if (opened.failed()) {
-        fmt::println(stderr, "Failed to open the database: {}", opened.message ? opened.message : "unknown");
+    database_init_t const init_database = database_init_of(settings.engine);
+    if (!init_database) {
+        fmt::println(stderr, "This build carries no engine named {}", settings.engine);
         return 1;
     }
+    ustore_database_t raw = nullptr;
+    ustore_error_t error {};
+    ustore_database_init_t init {};
+    init.config = config.c_str();
+    init.db = &raw;
+    init.error = &error;
+    init_database(&init);
+    if (error.status) {
+        fmt::println(stderr, "Failed to open the database: {}", error.message ? error.message : "unknown");
+        return 1;
+    }
+    database_t database {raw};
     if (status_t const cleared = database.clear(); cleared.failed()) {
         fmt::println(stderr, "Failed to clear the database: {}", cleared.message ? cleared.message : "unknown");
         return 1;
