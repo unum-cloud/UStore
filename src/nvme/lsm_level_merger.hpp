@@ -272,14 +272,14 @@ class lsm_level_merger {
             planned.first_cell = first_cell;
             planned.first_key_slot = first_key_slot;
 
-            expected<sorted_run_t> written = write_run_(volume, reading_channel, writing_channel,
-                                                        std::span<sorted_run_t const* const> {sources}, output, planned,
-                                                        request.value_max_size, request.cancellation);
-            if (!written) {
+            auto [written, write_run_status] = write_run_(volume, reading_channel, writing_channel,
+                                                          std::span<sorted_run_t const* const> {sources}, output,
+                                                          planned, request.value_max_size, request.cancellation);
+            if (write_run_status.failed()) {
                 [[maybe_unused]] status_t const abandoned = merged.drop(volume, writing_channel);
-                return written.status();
+                return write_run_status;
             }
-            if (status_t const adopted = merged.bind_queue_pair(std::move(*written)); adopted.failed()) {
+            if (status_t const adopted = merged.bind_queue_pair(std::move(written)); adopted.failed()) {
                 [[maybe_unused]] status_t const abandoned = merged.drop(volume, writing_channel);
                 return adopted;
             }
@@ -410,7 +410,7 @@ class lsm_level_merger {
     /** Takes a streaming block from @p writer, polling its completions when every block is out. */
     static expected<pooled_buffer_t> acquire_buffer_or_poll_(write_pipeline_t& writer) noexcept {
         expected<pooled_buffer_t> block = writer.acquire_stream_buffer();
-        while (!block && block.status() == status_code_t::capacity_exhausted_k && writer.outstanding() != 0) {
+        while (block == status_code_t::capacity_exhausted_k && writer.outstanding() != 0) {
             if (status_t const flushed = writer.submit(); flushed.failed()) return flushed;
             if (status_t const polled = writer.poll_one_completion(); polled.failed()) return polled;
             block = writer.acquire_stream_buffer();
@@ -452,10 +452,10 @@ class lsm_level_merger {
 
         std::uint64_t const reserved_bytes = sorted_run_layout_t::blob_bytes(header.key_slots_count,
                                                                              header.stored_values_bytes);
-        expected<blob_t> reserved = volume.create(sorted_run_t::name_of(content_id), blob_kind_t::sorted_run_k,
-                                                  reserved_bytes);
-        if (!reserved) return reserved.status();
-        blob_t const blob = *reserved;
+        auto [reserved, create_status] = volume.create(sorted_run_t::name_of(content_id), blob_kind_t::sorted_run_k,
+                                                       reserved_bytes);
+        if (create_status.failed()) return create_status;
+        blob_t const blob = reserved;
 
         if (status_t const written = write_sections_(volume, reading_channel, writing_channel, sources, output, planned,
                                                      header, blob, cancellation);
@@ -485,11 +485,11 @@ class lsm_level_merger {
         if (stopped_(cancellation)) return cancelled_status_();
 
         std::uint64_t const head_bytes = sorted_run_layout_t::header_bytes();
-        expected<pooled_buffer_t> head = acquire_buffer_or_poll_(writer);
-        if (!head) return head.status();
-        std::memset(head->bytes().data(), 0, static_cast<std::size_t>(head_bytes));
-        std::memcpy(head->bytes().data(), &header, sizeof(header));
-        if (status_t const queued = writer.enqueue_write(std::move(*head), blob.slice(0, head_bytes)); queued.failed())
+        auto [head, acquire_buffer_or_poll_status] = acquire_buffer_or_poll_(writer);
+        if (acquire_buffer_or_poll_status.failed()) return acquire_buffer_or_poll_status;
+        std::memset(head.bytes().data(), 0, static_cast<std::size_t>(head_bytes));
+        std::memcpy(head.bytes().data(), &header, sizeof(header));
+        if (status_t const queued = writer.enqueue_write(std::move(head), blob.slice(0, head_bytes)); queued.failed())
             return queued;
         if (status_t const flushed = writer.submit(); flushed.failed()) return flushed;
 
@@ -512,15 +512,15 @@ class lsm_level_merger {
         for (std::uint64_t written = 0; written != section;) {
             std::uint64_t const room = section - written;
             std::uint64_t const chunk = block_bytes < room ? block_bytes : room;
-            expected<pooled_buffer_t> block = acquire_buffer_or_poll_(writer);
-            if (!block) return block.status();
-            std::span<byte_t> const bytes = block->bytes().first(static_cast<std::size_t>(chunk));
+            auto [block, acquire_buffer_or_poll_status] = acquire_buffer_or_poll_(writer);
+            if (acquire_buffer_or_poll_status.failed()) return acquire_buffer_or_poll_status;
+            std::span<byte_t> const bytes = block.bytes().first(static_cast<std::size_t>(chunk));
             std::uint64_t const left = filled > written ? filled - written : 0;
             std::uint64_t const carried = left < chunk ? left : chunk;
             if (carried != 0) std::memcpy(bytes.data(), cells + written, static_cast<std::size_t>(carried));
             std::memset(bytes.data() + carried, 0, static_cast<std::size_t>(chunk - carried));
             if (status_t const queued = writer.enqueue_write(
-                    std::move(*block), blob.slice(sorted_run_layout_t::index_offset() + written, chunk));
+                    std::move(block), blob.slice(sorted_run_layout_t::index_offset() + written, chunk));
                 queued.failed())
                 return queued;
             if (status_t const flushed = writer.submit(); flushed.failed()) return flushed;
@@ -619,8 +619,8 @@ class lsm_level_merger {
                         }
                     }
                     if (status_t const flushed = reader.submit(); flushed.failed()) return flushed;
-                    expected<std::size_t> const polled = reader.poll_completions(sink);
-                    if (!polled) return polled.status();
+                    auto [polled, poll_completions_status] = reader.poll_completions(sink);
+                    if (poll_completions_status.failed()) return poll_completions_status;
                     if (first.failed()) return first;
                 }
                 if (status_t const drained = reader.poll_all_completions(sink); drained.failed()) return drained;
@@ -629,12 +629,12 @@ class lsm_level_merger {
                 std::uint64_t const room = section - written;
                 std::uint64_t const chunk = block_bytes < room ? block_bytes : room;
                 std::uint64_t const carried = staged < chunk ? staged : chunk;
-                expected<pooled_buffer_t> block = acquire_buffer_or_poll_(writer);
-                if (!block) return block.status();
-                std::span<byte_t> const bytes = block->bytes().first(static_cast<std::size_t>(chunk));
+                auto [block, acquire_buffer_or_poll_status] = acquire_buffer_or_poll_(writer);
+                if (acquire_buffer_or_poll_status.failed()) return acquire_buffer_or_poll_status;
+                std::span<byte_t> const bytes = block.bytes().first(static_cast<std::size_t>(chunk));
                 if (carried != 0) std::memcpy(bytes.data(), scratch.data(), static_cast<std::size_t>(carried));
                 std::memset(bytes.data() + carried, 0, static_cast<std::size_t>(chunk - carried));
-                if (status_t const queued = writer.enqueue_write(std::move(*block),
+                if (status_t const queued = writer.enqueue_write(std::move(block),
                                                                  blob.slice(values_offset + written, chunk));
                     queued.failed())
                     return queued;

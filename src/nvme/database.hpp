@@ -388,11 +388,11 @@ class basic_database {
         if (entry_named_in_(claimed_catalog_(), name) != nullptr)
             return status_t {status_code_t::already_exists_k, "The database already names that collection"};
 
-        expected<volume_id_t> const placed = router_->optimal_volume(1);
-        if (!placed) return placed.status();
+        auto [placed, optimal_volume_status] = router_->optimal_volume(1);
+        if (optimal_volume_status.failed()) return optimal_volume_status;
         value_layout_t const layout = resolve_value_layout(config.lsm_tree.lsm_level_0.sorted_run.value_size);
-        expected<any_collection_t> mounted = mount_collection_(router_->volume(*placed), config, layout);
-        if (!mounted) return mounted.status();
+        auto [mounted, mount_collection_status] = mount_collection_(router_->volume(placed), config, layout);
+        if (mount_collection_status.failed()) return mount_collection_status;
 
         entry_pointer_t entry {new (std::nothrow) collection_entry_t {}};
         if (!entry) return status_t {status_code_t::out_of_memory_k, "No room for another collection"};
@@ -400,8 +400,8 @@ class basic_database {
         if (!entry->name.try_assign(name))
             return status_t {status_code_t::out_of_memory_k, "No room for a collection's name"};
         entry->config = config;
-        entry->volume = *placed;
-        entry->held = std::move(*mounted);
+        entry->volume = placed;
+        entry->held = std::move(mounted);
 
         collection_numeric_id_t const numeric_id = entry->numeric_id;
         if (collections_.push_back(std::move(entry)) != st::status_t::success_k)
@@ -619,8 +619,8 @@ class basic_database {
     status_t compact() noexcept {
         expected<claimed_channel_t> reading = claim_channel_();
         if (!reading) return reading.status();
-        expected<channel_guard_t> writing = channels_->acquire();
-        if (!writing) return writing.status();
+        auto [writing, acquire_status] = channels_->acquire();
+        if (acquire_status.failed()) return acquire_status;
 
         schema_write_t recording {this, &reading->channel()};
         lsm_tree_publication_hook_t published;
@@ -629,13 +629,13 @@ class basic_database {
 
         status_t first;
         for (std::size_t index = 0; index != collections_.size(); ++index) {
-            expected<compaction_outcome_t> const merged = std::visit(
+            auto [merged, compact_status] = std::visit(
                 [&](auto& held) noexcept {
-                    return held.tree().compact(reading->channel(), writing->channel(),
+                    return held.tree().compact(reading->channel(), writing.channel(),
                                                compaction_placement_t::automatic_k, nullptr, published);
                 },
                 collections_[index]->held);
-            if (!merged && first.succeeded()) first = merged.status();
+            if (compact_status.failed() && first.succeeded()) first = compact_status;
         }
         return first;
     }
@@ -656,10 +656,10 @@ class basic_database {
             collection_entry_t& entry = *collections_[index];
             status_t const held = std::visit(
                 [&](auto& collection) noexcept -> status_t {
-                    auto levels = collection.take_snapshot(claimed->channel());
-                    if (!levels) return levels.status();
+                    auto [levels, take_snapshot_status] = collection.take_snapshot(claimed->channel());
+                    if (take_snapshot_status.failed()) return take_snapshot_status;
                     return taken.hold(entry.numeric_id, entry.name.view(),
-                                      typename snapshot_t::any_collection_snapshot_t {std::move(*levels)});
+                                      typename snapshot_t::any_collection_snapshot_t {std::move(levels)});
                 },
                 entry.held);
             if (held.failed()) return held;
@@ -999,9 +999,9 @@ class basic_database {
     /** Takes the claim and then a shared channel, which every call that moves bytes runs under. */
     expected<claimed_channel_t> claim_channel_() const noexcept {
         claim_guard_t claim {claim_};
-        expected<channel_guard_t> guard = channels_->acquire();
-        if (!guard) return guard.status();
-        return claimed_channel_t {std::move(claim), std::move(*guard)};
+        auto [guard, acquire_status] = channels_->acquire();
+        if (acquire_status.failed()) return acquire_status;
+        return claimed_channel_t {std::move(claim), std::move(guard)};
     }
 
     /** Where @p id sits in the catalog, or the catalog's size when it names nothing. */
@@ -1030,10 +1030,10 @@ class basic_database {
     /** Mounts a collection of @p value_layout_ over @p volume, as one alternative of the variant. */
     template <value_layout_t value_layout_>
     expected<any_collection_t> mounted_as_(volume_t& volume, collection_config_t const& config) const noexcept {
-        expected<collection_of<value_layout_>> mounted = collection_of<value_layout_>::mount(
-            volume, config, resources_->memory_constraint);
-        if (!mounted) return mounted.status();
-        return any_collection_t {std::move(*mounted)};
+        auto [mounted, mount_status] = collection_of<value_layout_>::mount(volume, config,
+                                                                           resources_->memory_constraint);
+        if (mount_status.failed()) return mount_status;
+        return any_collection_t {std::move(mounted)};
     }
 
     /** Mounts a collection of the runtime @p value_layout over @p volume. */
@@ -1068,37 +1068,36 @@ class basic_database {
             return {status_code_t::capacity_exhausted_k, "That blob is longer than one block of a channel"};
 
         [[maybe_unused]] status_t const forgotten = router_->drop(channel, name);
-        expected<blob_t> const reserved = router_->create(name, kind, bytes.size());
-        if (!reserved) return reserved.status();
-        if (reserved->extent.length < written)
+        auto [reserved, create_status] = router_->create(name, kind, bytes.size());
+        if (create_status.failed()) return create_status;
+        if (reserved.extent.length < written)
             return {status_code_t::capacity_exhausted_k, "A volume reserved less than one page for that blob"};
 
-        volume_t& volume = router_->volume(reserved->volume);
-        basic_write_pipeline<disk_t> writer {volume.disk(), channel, reserved->medium};
-        expected<pooled_buffer_t> block = writer.acquire_buffer();
-        if (!block) return block.status();
-        std::span<byte_t> const room = block->bytes();
+        volume_t& volume = router_->volume(reserved.volume);
+        basic_write_pipeline<disk_t> writer {volume.disk(), channel, reserved.medium};
+        auto [block, acquire_buffer_status] = writer.acquire_buffer();
+        if (acquire_buffer_status.failed()) return acquire_buffer_status;
+        std::span<byte_t> const room = block.bytes();
         std::memset(room.data(), 0, static_cast<std::size_t>(written));
         std::memcpy(room.data(), bytes.data(), bytes.size());
-        if (status_t const queued = writer.enqueue_write(std::move(*block), reserved->slice(0, written));
-            queued.failed())
+        if (status_t const queued = writer.enqueue_write(std::move(block), reserved.slice(0, written)); queued.failed())
             return queued;
         if (status_t const durable = writer.make_durable(); durable.failed()) return durable;
-        return volume.seal(channel, *reserved);
+        return volume.seal(channel, reserved);
     }
 
     /** Reads the whole blob @p name into @p into, which must hold its content length. */
     status_t read_blob_(io_channel_t& channel, blob_name_t name, std::span<byte_t> into) const noexcept {
-        expected<blob_t> const found = router_->find(name);
-        if (!found) return found.status();
-        if (into.size() < found->length) return {status_code_t::invalid_argument_k, "A buffer shorter than the blob"};
-        std::uint64_t const read = rounded_up_to(found->length, portable_alignment_k);
+        auto [found, find_status] = router_->find(name);
+        if (find_status.failed()) return find_status;
+        if (into.size() < found.length) return {status_code_t::invalid_argument_k, "A buffer shorter than the blob"};
+        std::uint64_t const read = rounded_up_to(found.length, portable_alignment_k);
         if (read > channel.requests().buffer_bytes())
             return {status_code_t::capacity_exhausted_k, "That blob is longer than one block of a channel"};
 
-        volume_t& volume = router_->volume(found->volume);
-        basic_read_pipeline<disk_t> reader {volume.disk(), channel, found->medium};
-        if (status_t const offered = reader.enqueue_read(found->slice(0, read), 0); offered.failed()) return offered;
+        volume_t& volume = router_->volume(found.volume);
+        basic_read_pipeline<disk_t> reader {volume.disk(), channel, found.medium};
+        if (status_t const offered = reader.enqueue_read(found.slice(0, read), 0); offered.failed()) return offered;
         if (status_t const flushed = reader.submit(); flushed.failed()) return flushed;
         status_t carried;
         auto sink = [&](completed_buffer_t const& completed) noexcept {
@@ -1106,7 +1105,7 @@ class basic_database {
                 carried = whole;
                 return;
             }
-            std::memcpy(into.data(), completed.bytes.data(), static_cast<std::size_t>(found->length));
+            std::memcpy(into.data(), completed.bytes.data(), static_cast<std::size_t>(found.length));
         };
         if (status_t const polled = reader.poll_all_completions(sink); polled.failed()) return polled;
         return carried;
@@ -1154,11 +1153,11 @@ class basic_database {
 
     /** Opens every collection the schema blob names, which is what a mount of an older database does. */
     status_t load_schema_(io_channel_t& channel) noexcept {
-        expected<blob_t> const found = router_->find(database_schema_name());
-        if (!found) return found == status_code_t::not_found_k ? status_t {} : found.status();
+        auto [found, find_status] = router_->find(database_schema_name());
+        if (find_status.failed()) return find_status == status_code_t::not_found_k ? status_t {} : find_status;
 
         st::basic_vector<byte_t> image;
-        if (image.resize(static_cast<std::size_t>(found->length)) != st::status_t::success_k)
+        if (image.resize(static_cast<std::size_t>(found.length)) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "No room to read the catalog into"};
         if (status_t const read = read_blob_(channel, database_schema_name(), std::span<byte_t> {image}); read.failed())
             return read;
@@ -1196,9 +1195,9 @@ class basic_database {
 
         collection_config_t const config = record.config();
         value_layout_t const layout = resolve_value_layout(config.lsm_tree.lsm_level_0.sorted_run.value_size);
-        expected<any_collection_t> mounted = mount_collection_(router_->volume(static_cast<volume_id_t>(record.volume)),
-                                                               config, layout);
-        if (!mounted) return mounted.status();
+        auto [mounted, mount_collection_status] = mount_collection_(
+            router_->volume(static_cast<volume_id_t>(record.volume)), config, layout);
+        if (mount_collection_status.failed()) return mount_collection_status;
 
         entry_pointer_t entry {new (std::nothrow) collection_entry_t {}};
         if (!entry) return {status_code_t::out_of_memory_k, "No room for another collection"};
@@ -1207,7 +1206,7 @@ class basic_database {
             return {status_code_t::out_of_memory_k, "No room for a collection's name"};
         entry->config = config;
         entry->volume = static_cast<volume_id_t>(record.volume);
-        entry->held = std::move(*mounted);
+        entry->held = std::move(mounted);
         if (status_t const restored = std::visit(
                 [&](auto& held) noexcept { return held.tree().restore(channel, runs); }, entry->held);
             restored.failed())

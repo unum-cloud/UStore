@@ -436,14 +436,14 @@ constexpr std::size_t fixture_volumes_capacity_k = 16;
 template <typename disk_type_>
 expected<disk_type_> open_disk(fixture_config_t const& config, std::size_t media) noexcept {
     if constexpr (std::is_same_v<disk_type_, memory_disk_t>) {
-        expected<memory_device_t> device = memory_device_t::make(config.page_bytes);
-        if (!device) return device.status();
-        return memory_disk_t::make(std::move(*device), config.disk(media));
+        auto [device, make_memory_device_status] = memory_device_t::make(config.page_bytes);
+        if (make_memory_device_status.failed()) return make_memory_device_status;
+        return memory_disk_t::make(std::move(device), config.disk(media));
     }
     else if constexpr (std::is_same_v<disk_type_, blocking_files_disk_t>) {
-        expected<blocking_files_device_t> device = blocking_files_device_t::make(file_buffering_t::buffered_k);
-        if (!device) return device.status();
-        return blocking_files_disk_t::make(std::move(*device), config.disk(media));
+        auto [device, make_device_status] = blocking_files_device_t::make(file_buffering_t::buffered_k);
+        if (make_device_status.failed()) return make_device_status;
+        return blocking_files_disk_t::make(std::move(device), config.disk(media));
     }
     else if constexpr (std::is_same_v<disk_type_, linux_aio_files_disk_t>)
         return linux_aio_files_disk_t::make(config.linux_aio(media));
@@ -458,12 +458,12 @@ template <typename disk_type_>
 status_t blank_head(disk_type_& disk, io_channel_t& channel, medium_reference_t medium,
                     std::uint64_t page_bytes) noexcept {
     basic_write_pipeline<disk_type_> writer {disk, channel, medium};
-    expected<pooled_buffer_t> block = writer.acquire_buffer();
-    if (!block) return block.status();
-    if (block->size() < page_bytes)
+    auto [block, acquire_buffer_status] = writer.acquire_buffer();
+    if (acquire_buffer_status.failed()) return acquire_buffer_status;
+    if (block.size() < page_bytes)
         return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than a volume's head"};
-    std::memset(block->bytes().data(), 0, static_cast<std::size_t>(page_bytes));
-    if (status_t const queued = writer.enqueue_write(std::move(*block), extent_t {0, page_bytes}); queued.failed())
+    std::memset(block.bytes().data(), 0, static_cast<std::size_t>(page_bytes));
+    if (status_t const queued = writer.enqueue_write(std::move(block), extent_t {0, page_bytes}); queued.failed())
         return queued;
     return writer.make_durable();
 }
@@ -530,27 +530,27 @@ struct basic_mount {
         io_channel_config_t const channels = reshaped.channels();
         memory_arena_config_t arena;
         arena.bytes = channels.arena_bytes() * (reshaped.executor_threads + reshaped.shared_io_channels);
-        expected<registered_memory_arena_t> pinned = registered_memory_arena_t::make(
+        auto [pinned, make_arena_status] = registered_memory_arena_t::make(
             fixture->disk, fixture->resources->memory_constraint, arena);
-        if (!pinned) return pinned.status();
-        fixture->arena = std::move(*pinned);
+        if (make_arena_status.failed()) return make_arena_status;
+        fixture->arena = std::move(pinned);
 
-        expected<typename fixture_t::channel_pool_t> pool = fixture_t::channel_pool_t::make(
+        auto [pool, make_status] = fixture_t::channel_pool_t::make(
             fixture->disk, fixture->arena, reshaped.executor_threads, reshaped.shared_io_channels, channels);
-        if (!pool) return pool.status();
-        fixture->channels = std::move(*pool);
+        if (make_status.failed()) return make_status;
+        fixture->channels = std::move(pool);
 
         for (std::size_t index = 0; index != capacities.size(); ++index) {
-            expected<registered_medium_t> registered = register_volume_(fixture->disk, index, capacities[index]);
-            if (!registered) return registered.status();
-            if (fixture->media.push_back(std::move(*registered)) != st::status_t::success_k)
+            auto [registered, register_volume_status] = register_volume_(fixture->disk, index, capacities[index]);
+            if (register_volume_status.failed()) return register_volume_status;
+            if (fixture->media.push_back(std::move(registered)) != st::status_t::success_k)
                 return status_t {status_code_t::out_of_memory_k, "The fixture could not track another medium"};
         }
 
         if (transport == transport_t::device_k) {
-            expected<typename fixture_t::guard_t> guard = fixture->channels.acquire();
-            if (!guard) return guard.status();
-            if (status_t const blanked = blank_head(fixture->disk, guard->channel(), fixture->media[0].reference(),
+            auto [guard, acquire_status] = fixture->channels.acquire();
+            if (acquire_status.failed()) return acquire_status;
+            if (status_t const blanked = blank_head(fixture->disk, guard.channel(), fixture->media[0].reference(),
                                                     reshaped.page_bytes);
                 blanked.failed())
                 return blanked;

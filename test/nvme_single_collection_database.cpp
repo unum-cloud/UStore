@@ -138,19 +138,19 @@ expected<std::unique_ptr<typename scdb_types<typename mount_type_::fixture_t>::s
     auto stack = std::unique_ptr<stack_t> {new (std::nothrow) stack_t {}};
     if (!stack) return status_t {status_code_t::out_of_memory_k, "The stack did not fit"};
 
-    expected<std::unique_ptr<typename types_t::fixture_t>> fixture = mount();
-    if (!fixture) return fixture.status();
-    stack->fixture = std::move(*fixture);
+    auto [fixture, mount_status] = mount();
+    if (mount_status.failed()) return mount_status;
+    stack->fixture = std::move(fixture);
 
-    expected<guard_t> writing = stack->fixture->channels.acquire();
-    if (!writing) return writing.status();
-    stack->writing = std::move(*writing);
-    expected<guard_t> merging = stack->fixture->channels.acquire();
-    if (!merging) return merging.status();
-    stack->merging = std::move(*merging);
-    expected<guard_t> reading = stack->fixture->channels.acquire();
-    if (!reading) return reading.status();
-    stack->reading = std::move(*reading);
+    auto [writing, acquire_writing_status] = stack->fixture->channels.acquire();
+    if (acquire_writing_status.failed()) return acquire_writing_status;
+    stack->writing = std::move(writing);
+    auto [merging, acquire_merging_status] = stack->fixture->channels.acquire();
+    if (acquire_merging_status.failed()) return acquire_merging_status;
+    stack->merging = std::move(merging);
+    auto [reading, acquire_reading_status] = stack->fixture->channels.acquire();
+    if (acquire_reading_status.failed()) return acquire_reading_status;
+    stack->reading = std::move(reading);
 
     expected<volume_t> volume = stack->fixture->mount_volume(stack->writing.channel());
     if (!volume) return volume.status();

@@ -249,31 +249,31 @@ inline expected<pci_address_t> pci_address_parsed(std::string_view spelled) noex
     std::uint64_t domain = 0;
     if (colons == 2) {
         std::size_t const separator = rest.find(':');
-        expected<std::uint64_t> const parsed = hexadecimal_field(rest.substr(0, separator), 4);
-        if (!parsed) return parsed.status();
-        domain = *parsed;
+        auto [parsed, parse_domain_status] = hexadecimal_field(rest.substr(0, separator), 4);
+        if (parse_domain_status.failed()) return parse_domain_status;
+        domain = parsed;
         rest.remove_prefix(separator + 1);
     }
 
     std::size_t const separator = rest.find(':');
-    expected<std::uint64_t> const bus = hexadecimal_field(rest.substr(0, separator), 2);
-    if (!bus) return bus.status();
+    auto [bus, parse_bus_status] = hexadecimal_field(rest.substr(0, separator), 2);
+    if (parse_bus_status.failed()) return parse_bus_status;
     rest.remove_prefix(separator + 1);
 
     std::size_t const dot = rest.find('.');
     if (dot == std::string_view::npos)
         return status_t {status_code_t::invalid_argument_k, "A PCIe address separates its function with a dot"};
-    expected<std::uint64_t> const device = hexadecimal_field(rest.substr(0, dot), 2);
-    if (!device) return device.status();
-    expected<std::uint64_t> const function = hexadecimal_field(rest.substr(dot + 1), 1);
-    if (!function) return function.status();
-    if (*device > 0x1F || *function > 7)
+    auto [device, parse_device_status] = hexadecimal_field(rest.substr(0, dot), 2);
+    if (parse_device_status.failed()) return parse_device_status;
+    auto [function, parse_function_status] = hexadecimal_field(rest.substr(dot + 1), 1);
+    if (parse_function_status.failed()) return parse_function_status;
+    if (device > 0x1F || function > 7)
         return status_t {status_code_t::invalid_argument_k, "A PCIe device is below 32 and a function below 8"};
 
     pci_address_t address;
-    [[maybe_unused]] int const written = std::snprintf(
-        address.text, sizeof(address.text), "%04x:%02x:%02x.%01x", static_cast<unsigned>(domain),
-        static_cast<unsigned>(*bus), static_cast<unsigned>(*device), static_cast<unsigned>(*function));
+    [[maybe_unused]] int const written = std::snprintf(address.text, sizeof(address.text), "%04x:%02x:%02x.%01x",
+                                                       static_cast<unsigned>(domain), static_cast<unsigned>(bus),
+                                                       static_cast<unsigned>(device), static_cast<unsigned>(function));
     return address;
 }
 
@@ -930,15 +930,15 @@ class linux_spdk_disk_t {
                 continue;
             }
             if (chaining == chaining_state_t::held_k) {
-                expected<std::uint32_t> const entry = hold_(*slot, base, request);
-                if (!entry) {
-                    push_local_(*slot, base, failed_completion_(request.token, entry.status()));
+                auto [entry, hold_status] = hold_(*slot, base, request);
+                if (hold_status.failed()) {
+                    push_local_(*slot, base, failed_completion_(request.token, hold_status));
                     chaining = chains_next_(request) ? chaining_state_t::cut_k : chaining_state_t::open_k;
                     continue;
                 }
-                if (chain_staged == no_entry_k) flights_[base + chain_flight].successor = *entry;
-                else staged_[base + chain_staged].next = *entry;
-                chain_staged = *entry;
+                if (chain_staged == no_entry_k) flights_[base + chain_flight].successor = entry;
+                else staged_[base + chain_staged].next = entry;
+                chain_staged = entry;
                 chaining = chains_next_(request) ? chaining_state_t::held_k : chaining_state_t::open_k;
                 continue;
             }
@@ -948,14 +948,14 @@ class linux_spdk_disk_t {
                 chaining = chains_next_(request) ? chaining_state_t::cut_k : chaining_state_t::open_k;
                 continue;
             }
-            expected<std::uint32_t> const started = start_(*slot, base, request);
-            if (!started) {
-                if (started.status() == status_code_t::capacity_exhausted_k) break;
-                push_local_(*slot, base, failed_completion_(request.token, started.status()));
+            auto [started, start_status] = start_(*slot, base, request);
+            if (start_status.failed()) {
+                if (start_status == status_code_t::capacity_exhausted_k) break;
+                push_local_(*slot, base, failed_completion_(request.token, start_status));
                 chaining = chains_next_(request) ? chaining_state_t::cut_k : chaining_state_t::open_k;
                 continue;
             }
-            chain_flight = *started;
+            chain_flight = started;
             chain_staged = no_entry_k;
             chaining = chains_next_(request) ? chaining_state_t::held_k : chaining_state_t::open_k;
         }
@@ -1017,9 +1017,9 @@ class linux_spdk_disk_t {
         std::array<completion_t, drain_batch_k> discarded {};
         for (std::size_t spins = 0; spins != drain_spin_limit_k; ++spins) {
             if (outstanding_(*slot) == 0) return {};
-            expected<std::size_t> const moved = poll_completions(queue_pair, std::span<completion_t> {discarded});
-            if (!moved) return moved.status();
-            if (*moved != 0) continue;
+            auto [moved, poll_completions_status] = poll_completions(queue_pair, std::span<completion_t> {discarded});
+            if (poll_completions_status.failed()) return poll_completions_status;
+            if (moved != 0) continue;
             if (spins == drain_patience_k) cancel(queue_pair);
             fu::preferred_yield_t {}(spins, spins, std::size_t {0});
         }
@@ -1615,13 +1615,13 @@ class linux_spdk_disk_t {
             cut_chain_(slot, base, next);
             return;
         }
-        expected<std::uint32_t> const started = start_(slot, base, request);
-        if (!started) {
-            push_local_(slot, base, failed_completion_(request.token, started.status()));
+        auto [started, start_status] = start_(slot, base, request);
+        if (start_status.failed()) {
+            push_local_(slot, base, failed_completion_(request.token, start_status));
             cut_chain_(slot, base, next);
             return;
         }
-        flights_[base + *started].successor = next;
+        flights_[base + started].successor = next;
     }
 
     /** Copies every finished command of @p slot into @p into, resuming or cutting the chains they head. */

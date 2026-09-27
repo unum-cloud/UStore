@@ -264,15 +264,15 @@ class snapshot_directory {
 
     /** Pins the newest stamp of @p store in a slot and answers its identifier. */
     st::expected<ustore_snapshot_t> open(ordered_store<isolation_> const& store) noexcept {
-        st::expected<std::uint64_t> const claimed = claim_slot_();
-        if (!claimed) return claimed.status();
-        slot_t& slot = *slot_at_(*claimed);
+        auto [claimed, claim_slot_status] = claim_slot_();
+        if (st::failed(claim_slot_status)) return claim_slot_status;
+        slot_t& slot = *slot_at_(claimed);
         new (&slot.reader) reader_t(store.reader());
         std::uint64_t const serial =
             fu::standard_atomic_ref<std::uint64_t>(creations_).fetch_add(1, st::memory_order_release_k) %
                 (std::numeric_limits<std::uint64_t>::max() >> slot_index_bits_k) +
             1;
-        std::uint64_t const identifier = (serial << slot_index_bits_k) | *claimed;
+        std::uint64_t const identifier = (serial << slot_index_bits_k) | claimed;
         release_word(slot.identifier, identifier);
         return identifier;
     }
@@ -807,9 +807,9 @@ store_status_t list_catalog(view_type_ const& view, catalog_listing_t& listing, 
 /** Stages @p content under @p key into @p transaction. */
 template <typename transaction_type_>
 store_status_t stage_upsert(transaction_type_& transaction, stored_key_t const& key, value_view_t content) noexcept {
-    auto copied = copy_blob(content);
-    if (!copied) return copied.status();
-    return transaction.upsert(pair_t {key, std::move(*copied)});
+    auto [copied, copy_blob_status] = copy_blob(content);
+    if (st::failed(copy_blob_status)) return copy_blob_status;
+    return transaction.upsert(pair_t {key, std::move(copied)});
 }
 
 /** Stages erasing @p key, watching its absence when @p watch asks and the key is already gone. */
@@ -1133,8 +1133,8 @@ void reset_database(database_state<isolation_>& state, ustore_database_control_t
 /** Serves "compact", reclaiming unreachable versions and rewriting the image. */
 template <isolation_t isolation_>
 void compact_database(database_state<isolation_>& state, ustore_database_control_t& arguments) noexcept {
-    auto const vacuumed = state.store.vacuum();
-    if (reported_failure(vacuumed.status(), arguments.error)) return;
+    auto [vacuumed, vacuum_status] = state.store.vacuum();
+    if (reported_failure(vacuum_status, arguments.error)) return;
     persist(state, arguments.error);
 }
 
@@ -1296,9 +1296,9 @@ void serve(database_state<isolation_>& state, ustore_snapshot_create_t& argument
         *arguments.error = {ustore_error_invalid_argument_k, "Need an output for the snapshot"};
         return;
     }
-    auto const opened = state.snapshots.open(state.store);
-    if (reported_failure(opened.status(), arguments.error)) return;
-    *arguments.id = *opened;
+    auto [opened, open_status] = state.snapshots.open(state.store);
+    if (reported_failure(open_status, arguments.error)) return;
+    *arguments.id = opened;
 }
 
 /** Implements @c ustore_snapshot_export as an image in the export directory. */

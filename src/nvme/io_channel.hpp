@@ -278,9 +278,9 @@ class basic_io_channel_pool {
 
         for (std::size_t index = 0; index != wanted; ++index) {
             io_channel_t& channel = pool.channels_[index];
-            expected<queue_pair_t> leased = disk.acquire_queue_pair(config.depth);
-            if (!leased) return leased.status();
-            channel.queue_pair_ = std::move(*leased);
+            auto [leased, acquire_queue_pair_status] = disk.acquire_queue_pair(config.depth);
+            if (acquire_queue_pair_status.failed()) return acquire_queue_pair_status;
+            channel.queue_pair_ = std::move(leased);
             if (channel.completions_.resize(config.depth) != st::status_t::success_k)
                 return status_t {status_code_t::out_of_memory_k, "A channel could not size its polling room"};
 
@@ -288,17 +288,17 @@ class basic_io_channel_pool {
             buffer_pool_config_t requests;
             requests.buffer_bytes = config.request_buffer_bytes;
             requests.buffers_count = config.request_buffers_count;
-            expected<buffer_pool_t> request_pool = buffer_pool_t::make(arena, base, requests);
-            if (!request_pool) return request_pool.status();
-            channel.requests_ = std::move(*request_pool);
+            auto [request_pool, make_request_pool_status] = buffer_pool_t::make(arena, base, requests);
+            if (make_request_pool_status.failed()) return make_request_pool_status;
+            channel.requests_ = std::move(request_pool);
 
             buffer_pool_config_t streams;
             streams.buffer_bytes = config.stream_buffer_bytes;
             streams.buffers_count = config.stream_buffers_count;
             std::uint64_t const stream_base = base + config.request_buffer_bytes * config.request_buffers_count;
-            expected<buffer_pool_t> stream_pool = buffer_pool_t::make(arena, stream_base, streams);
-            if (!stream_pool) return stream_pool.status();
-            channel.streams_ = std::move(*stream_pool);
+            auto [stream_pool, make_stream_pool_status] = buffer_pool_t::make(arena, stream_base, streams);
+            if (make_stream_pool_status.failed()) return make_stream_pool_status;
+            channel.streams_ = std::move(stream_pool);
         }
         return pool;
     }
@@ -353,7 +353,7 @@ class basic_io_channel_pool {
 
     /** Whether @p claimed says that no shared met the pass, as opposed to a shared refusing adoption. */
     [[nodiscard]] static bool exhausted_(expected<guard_t> const& claimed) noexcept {
-        return !claimed && claimed.status() == status_code_t::capacity_exhausted_k;
+        return claimed == status_code_t::capacity_exhausted_k;
     }
 
     /** The first free shared @p preference admits for @p bound thread, or @c capacity_exhausted_k when none does. */

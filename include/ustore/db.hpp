@@ -41,13 +41,13 @@ using collections_list_t = std::span<ustore_collection_t>;
 inline expected<ustore_collection_t> collection_named(ustore_database_t database, ustore_transaction_t transaction,
                                                       ustore_arena_t* arena, std::string_view name) noexcept {
     strings_collection_t names {database, ustore_collection_names_k, transaction, {}, arena};
-    auto maybe_stored = names.value(name);
-    if (!maybe_stored) return maybe_stored.status();
-    if (maybe_stored->size() != sizeof(ustore_collection_t))
+    auto [stored, read_status] = names.value(name);
+    if (read_status.failed()) return read_status;
+    if (stored.size() != sizeof(ustore_collection_t))
         return status_t {status_code_t::not_found_k, "No such collection"};
 
     ustore_collection_t found = ustore_collection_main_k;
-    std::memcpy(&found, maybe_stored->data(), sizeof(found));
+    std::memcpy(&found, stored.data(), sizeof(found));
     return found;
 }
 
@@ -178,11 +178,10 @@ class context_t {
     expected<bool> contains(std::string_view name) noexcept {
         if (name.empty()) return true;
 
-        auto maybe_found = collection_named(database_, transaction_, arena_.member_ptr(), name);
-        if (maybe_found) return true;
-        if (maybe_found.status() == status_code_t::not_found_k || without_collections(maybe_found.status()))
-            return false;
-        return maybe_found.status();
+        auto [found, lookup_status] = collection_named(database_, transaction_, arena_.member_ptr(), name);
+        if (lookup_status.succeeded()) return true;
+        if (lookup_status == status_code_t::not_found_k || without_collections(lookup_status)) return false;
+        return lookup_status;
     }
 
     /**
@@ -194,11 +193,10 @@ class context_t {
         if (name.empty())
             return collection_ {database_, ustore_collection_main_k, transaction_, {}, arena_.member_ptr()};
 
-        auto maybe_found = collection_named(database_, transaction_, arena_.member_ptr(), name);
-        if (maybe_found) return collection_ {database_, *maybe_found, transaction_, {}, arena_.member_ptr()};
-        if (without_collections(maybe_found.status()))
-            return status_t {status_code_t::not_found_k, "No such collection"};
-        return maybe_found.status();
+        auto [found, lookup_status] = collection_named(database_, transaction_, arena_.member_ptr(), name);
+        if (lookup_status.succeeded()) return collection_ {database_, found, transaction_, {}, arena_.member_ptr()};
+        if (without_collections(lookup_status)) return status_t {status_code_t::not_found_k, "No such collection"};
+        return lookup_status;
     }
 
     /** Clears the transaction for reuse, keeping its memory and starting a new generation. */
@@ -360,10 +358,10 @@ class database_t {
             return status_t {status_code_t::invalid_argument_k, "The main collection has no name and always exists"};
 
         arena_t arena {database_};
-        auto maybe_taken = collection_named(database_, nullptr, arena.member_ptr(), wanted);
-        if (maybe_taken) return status_t {status_code_t::already_exists_k, "Such collection already exists"};
-        if (maybe_taken.status() != status_code_t::not_found_k && !without_collections(maybe_taken.status()))
-            return maybe_taken.status();
+        auto [taken, lookup_status] = collection_named(database_, nullptr, arena.member_ptr(), wanted);
+        if (lookup_status.succeeded())
+            return status_t {status_code_t::already_exists_k, "Such collection already exists"};
+        if (lookup_status != status_code_t::not_found_k && !without_collections(lookup_status)) return lookup_status;
 
         ustore_error_t error {};
         ustore_collection_t collection = ustore_collection_main_k;
@@ -383,9 +381,9 @@ class database_t {
 
     template <typename collection_ = blobs_collection_t>
     expected<collection_> find(std::string_view name = {}) noexcept {
-        auto maybe_found = context_t {database_, nullptr}.find(name);
-        if (!maybe_found) return maybe_found.status();
-        return collection_ {database_, *maybe_found, nullptr};
+        auto [found, find_status] = context_t {database_, nullptr}.find(name);
+        if (find_status.failed()) return find_status;
+        return collection_ {database_, found, nullptr};
     }
 
     template <typename collection_ = blobs_collection_t>
@@ -396,9 +394,9 @@ class database_t {
     }
 
     status_t drop(std::string_view name) noexcept {
-        auto maybe_collection = find(name);
-        if (!maybe_collection) return maybe_collection.status();
-        status_t const dropped = maybe_collection->drop();
+        auto [found, find_status] = find(name);
+        if (find_status.failed()) return find_status;
+        status_t const dropped = found.drop();
         if (dropped.failed()) return dropped;
 
         arena_t arena {database_};
@@ -410,26 +408,26 @@ class database_t {
         context_t context {database_, nullptr};
         ustore_error_t error {};
 
-        auto maybe_snapshots = context.snapshots();
-        if (!maybe_snapshots) return maybe_snapshots.status();
+        auto [snapshot_ids, list_snapshots_status] = context.snapshots();
+        if (list_snapshots_status.failed()) return list_snapshots_status;
 
         ustore_snapshot_drop_t snapshot_drop {};
         snapshot_drop.db = database_;
         snapshot_drop.error = &error;
-        for (ustore_snapshot_t const id : *maybe_snapshots) {
+        for (ustore_snapshot_t const id : snapshot_ids) {
             snapshot_drop.id = id;
             ustore_snapshot_drop(&snapshot_drop);
             if (error.status) return status_t {error};
         }
 
-        auto maybe_listed = context.collections();
-        if (!maybe_listed) return maybe_listed.status();
+        auto [collection_ids, list_collections_status] = context.collections();
+        if (list_collections_status.failed()) return list_collections_status;
 
         ustore_collection_drop_t collection_drop {};
         collection_drop.db = database_;
         collection_drop.error = &error;
         collection_drop.mode = ustore_drop_keys_vals_handle_k;
-        for (ustore_collection_t const id : *maybe_listed) {
+        for (ustore_collection_t const id : collection_ids) {
             collection_drop.id = id;
             ustore_collection_drop(&collection_drop);
             if (error.status) return status_t {error};

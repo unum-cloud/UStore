@@ -96,9 +96,9 @@ class blobs_collection_t {
     }
 
     expected<size_range_t> size_range() const noexcept {
-        auto maybe = members().size_estimates();
-        if (!maybe) return maybe.status();
-        return maybe->cardinality;
+        auto [estimates, size_estimates_status] = members().size_estimates();
+        if (size_estimates_status.failed()) return size_estimates_status;
+        return estimates.cardinality;
     }
 
     /** Counts the keys by streaming through all of them. */

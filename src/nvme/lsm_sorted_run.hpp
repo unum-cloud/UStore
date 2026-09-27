@@ -308,9 +308,9 @@ class lsm_sorted_run {
 
         std::uint64_t const reserved_bytes = sorted_run_layout_t::blob_bytes(header.key_slots_count,
                                                                              header.stored_values_bytes);
-        expected<blob_t> reserved = volume.create(name_of(content_id), blob_kind_t::sorted_run_k, reserved_bytes);
-        if (!reserved) return reserved.status();
-        blob_t const blob = *reserved;
+        auto [reserved, create_status] = volume.create(name_of(content_id), blob_kind_t::sorted_run_k, reserved_bytes);
+        if (create_status.failed()) return create_status;
+        blob_t const blob = reserved;
 
         if (status_t const written = write_sections_(volume, channel, blob, header, key_slots, stored_values,
                                                      block_bytes);
@@ -328,9 +328,9 @@ class lsm_sorted_run {
     /** Opens the run @p content_id names on @p volume, or answers @c not_found_k when it names none. */
     static expected<lsm_sorted_run> open(volume_type_& volume, io_channel_t& channel,
                                          uuid_t const& content_id) noexcept {
-        expected<blob_t> const found = volume.find(name_of(content_id));
-        if (!found) return found.status();
-        return attach(volume, channel, *found);
+        auto [found, find_status] = volume.find(name_of(content_id));
+        if (find_status.failed()) return find_status;
+        return attach(volume, channel, found);
     }
 
     /**
@@ -512,8 +512,8 @@ class lsm_sorted_run {
                     else ++chunk;
                 }
                 if (status_t const flushed = reader.submit(); flushed.failed()) return flushed;
-                expected<std::size_t> const polled = reader.poll_completions(adapter);
-                if (!polled) return polled.status();
+                auto [polled, poll_completions_status] = reader.poll_completions(adapter);
+                if (poll_completions_status.failed()) return poll_completions_status;
             }
             return first;
         }
@@ -587,11 +587,11 @@ class lsm_sorted_run {
         sorted_run_index_layout_t const layout {header.key_slots_count, header.branching};
 
         std::uint64_t const head_bytes = sorted_run_layout_t::header_bytes();
-        expected<pooled_buffer_t> head = writer.acquire_buffer_or_poll();
-        if (!head) return head.status();
-        std::memset(head->bytes().data(), 0, static_cast<std::size_t>(head_bytes));
-        std::memcpy(head->bytes().data(), &header, sizeof(header));
-        if (status_t const queued = writer.enqueue_write(std::move(*head), blob.slice(0, head_bytes)); queued.failed())
+        auto [head, acquire_buffer_or_poll_status] = writer.acquire_buffer_or_poll();
+        if (acquire_buffer_or_poll_status.failed()) return acquire_buffer_or_poll_status;
+        std::memset(head.bytes().data(), 0, static_cast<std::size_t>(head_bytes));
+        std::memcpy(head.bytes().data(), &header, sizeof(header));
+        if (status_t const queued = writer.enqueue_write(std::move(head), blob.slice(0, head_bytes)); queued.failed())
             return queued;
         if (status_t const flushed = writer.submit(); flushed.failed()) return flushed;
 
@@ -599,13 +599,13 @@ class lsm_sorted_run {
         for (std::uint64_t written = 0; written != index_section;) {
             std::uint64_t const room = index_section - written;
             std::uint64_t const chunk = block_bytes < room ? block_bytes : room;
-            expected<pooled_buffer_t> block = writer.acquire_buffer_or_poll();
-            if (!block) return block.status();
-            std::span<byte_t> const bytes = block->bytes().first(static_cast<std::size_t>(chunk));
+            auto [block, acquire_buffer_or_poll_status] = writer.acquire_buffer_or_poll();
+            if (acquire_buffer_or_poll_status.failed()) return acquire_buffer_or_poll_status;
+            std::span<byte_t> const bytes = block.bytes().first(static_cast<std::size_t>(chunk));
             std::memset(bytes.data(), 0, bytes.size());
             paint_cells_(key_slots, layout, written, bytes);
             if (status_t const queued = writer.enqueue_write(
-                    std::move(*block), blob.slice(sorted_run_layout_t::index_offset() + written, chunk));
+                    std::move(block), blob.slice(sorted_run_layout_t::index_offset() + written, chunk));
                 queued.failed())
                 return queued;
             if (status_t const flushed = writer.submit(); flushed.failed()) return flushed;
@@ -617,15 +617,15 @@ class lsm_sorted_run {
         for (std::uint64_t written = 0; written != values_section;) {
             std::uint64_t const room = values_section - written;
             std::uint64_t const chunk = block_bytes < room ? block_bytes : room;
-            expected<pooled_buffer_t> block = writer.acquire_buffer_or_poll();
-            if (!block) return block.status();
-            std::span<byte_t> const bytes = block->bytes().first(static_cast<std::size_t>(chunk));
+            auto [block, acquire_buffer_or_poll_status] = writer.acquire_buffer_or_poll();
+            if (acquire_buffer_or_poll_status.failed()) return acquire_buffer_or_poll_status;
+            std::span<byte_t> const bytes = block.bytes().first(static_cast<std::size_t>(chunk));
             std::uint64_t const left = stored_values.size() > written ? stored_values.size() - written : 0;
             std::uint64_t const carried = left < chunk ? left : chunk;
             if (carried != 0)
                 std::memcpy(bytes.data(), stored_values.data() + written, static_cast<std::size_t>(carried));
             std::memset(bytes.data() + carried, 0, static_cast<std::size_t>(chunk - carried));
-            if (status_t const queued = writer.enqueue_write(std::move(*block),
+            if (status_t const queued = writer.enqueue_write(std::move(block),
                                                              blob.slice(values_offset + written, chunk));
                 queued.failed())
                 return queued;
@@ -682,9 +682,9 @@ class lsm_sorted_run {
         std::uint64_t const section = sorted_run_layout_t::index_section_bytes(header_.key_slots_count);
         if (section == 0) return {};
 
-        expected<pooled_buffer_t> block = channel.streams().acquire();
-        if (!block) return block.status();
-        std::uint64_t const room = rounded_down_to(block->size(), portable_alignment_k);
+        auto [block, acquire_status] = channel.streams().acquire();
+        if (acquire_status.failed()) return acquire_status;
+        std::uint64_t const room = rounded_down_to(block.size(), portable_alignment_k);
         if (room == 0) return {status_code_t::capacity_exhausted_k, "A channel's streaming block holds no index page"};
 
         std::uint64_t const wanted = sorted_run_layout_t::index_bytes(header_.key_slots_count);
@@ -695,15 +695,15 @@ class lsm_sorted_run {
             if (piece.length != chunk) return {status_code_t::malformed_k, "The run is shorter than its index"};
 
             std::array<request_t, 1> const batch {
-                read_request(blob_.medium, piece, block->reference(), channel.next_token())};
-            expected<std::size_t> const taken = volume_->disk().submit(channel.queue_pair(),
-                                                                       std::span<request_t const> {batch});
-            if (!taken) return taken.status();
-            if (*taken != 1) return {status_code_t::input_output_k, "The ring would not take an index read"};
-            expected<std::size_t> const completed = poll_completions_at_least(volume_->disk(), channel.queue_pair(),
-                                                                              channel.completion_buffer(), 1);
-            if (!completed) return completed.status();
-            if (*completed == 0) return {status_code_t::input_output_k, "An index read never completed"};
+                read_request(blob_.medium, piece, block.reference(), channel.next_token())};
+            auto [taken, submit_status] = volume_->disk().submit(channel.queue_pair(),
+                                                                 std::span<request_t const> {batch});
+            if (submit_status.failed()) return submit_status;
+            if (taken != 1) return {status_code_t::input_output_k, "The ring would not take an index read"};
+            auto [completed, poll_completions_status] = poll_completions_at_least(volume_->disk(), channel.queue_pair(),
+                                                                                  channel.completion_buffer(), 1);
+            if (poll_completions_status.failed()) return poll_completions_status;
+            if (completed == 0) return {status_code_t::input_output_k, "An index read never completed"};
             completion_t const& completion = channel.completion_buffer().front();
             if (!completion.completed_in_full())
                 return completion.status.failed()
@@ -712,7 +712,7 @@ class lsm_sorted_run {
 
             if (read < wanted) {
                 std::uint64_t const usable = wanted - read < chunk ? wanted - read : chunk;
-                std::memcpy(into + read, block->bytes().data(), static_cast<std::size_t>(usable));
+                std::memcpy(into + read, block.bytes().data(), static_cast<std::size_t>(usable));
             }
             read += chunk;
         }

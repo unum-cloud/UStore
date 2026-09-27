@@ -134,11 +134,11 @@ class basic_volume_router {
             if (volumes_[index].names(name))
                 return status_t {status_code_t::already_exists_k, "A volume of this router names that blob"};
 
-        expected<volume_id_t> const placed = optimal_volume(length);
-        if (!placed) return placed.status();
-        expected<blob_t> created = volumes_[static_cast<std::size_t>(*placed)].create(name, kind, length);
-        if (!created) return created.status();
-        created->volume = *placed;
+        auto [placed, optimal_volume_status] = optimal_volume(length);
+        if (optimal_volume_status.failed()) return optimal_volume_status;
+        auto [created, create_status] = volumes_[static_cast<std::size_t>(placed)].create(name, kind, length);
+        if (create_status.failed()) return create_status;
+        created.volume = placed;
         return created;
     }
 

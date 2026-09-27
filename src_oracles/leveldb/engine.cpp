@@ -266,12 +266,12 @@ void database_init(ustore_database_init_t& arguments) {
         return;
     }
 
-    expected<bool> const root_exists = directory_exists(config.directory.data());
-    if (!root_exists) {
-        *arguments.error = root_exists.status();
+    auto [root_exists, directory_exists_status] = directory_exists(config.directory.data());
+    if (directory_exists_status.failed()) {
+        *arguments.error = directory_exists_status;
         return;
     }
-    if (!*root_exists) {
+    if (!root_exists) {
         *arguments.error = {ustore_error_not_found_k, "Root isn't a directory"};
         return;
     }

@@ -152,14 +152,14 @@ class basic_extent_volume {
         volume.medium_ = medium.reference();
         volume.capacity_ = medium.capacity() != 0 ? medium.capacity() : format.capacity_bytes;
 
-        expected<volume_header_t> const head = volume.read_head_(channel);
-        if (!head && format.recovery == volume_recovery_t::refuse_k) return head.status();
-        if (head.has_value() && head->magic == volume_magic_k) {
-            if (head->format_version != volume_format_version_k)
+        auto [head, read_head_status] = volume.read_head_(channel);
+        if (read_head_status.failed() && format.recovery == volume_recovery_t::refuse_k) return read_head_status;
+        if (read_head_status.succeeded() && head.magic == volume_magic_k) {
+            if (head.format_version != volume_format_version_k)
                 return status_t {status_code_t::unsupported_k, "The volume follows another format version"};
-            if (format.database.is_valid() && head->database != format.database)
+            if (format.database.is_valid() && head.database != format.database)
                 return status_t {status_code_t::invalid_argument_k, "The volume belongs to another database"};
-            volume.header_ = *head;
+            volume.header_ = head;
             if (status_t const loaded = volume.load_catalog_(channel, format.recovery); loaded.failed()) return loaded;
         }
         else if (status_t const written = volume.write_head_(channel, format); written.failed()) return written;
@@ -180,19 +180,19 @@ class basic_extent_volume {
             return status_t {status_code_t::invalid_argument_k, "A blob name is one byte to the format's limit"};
         if (names(name)) return status_t {status_code_t::already_exists_k, "The volume names that blob"};
 
-        expected<extent_t> reserved = allocator_.allocate(length);
-        if (!reserved) return reserved.status();
+        auto [reserved, allocate_status] = allocator_.allocate(length);
+        if (allocate_status.failed()) return allocate_status;
         catalog_entry_t entry;
         std::memcpy(entry.name_storage.data(), name.data(), name.size());
         entry.name_bytes = static_cast<std::uint16_t>(name.size());
         entry.kind = kind;
-        entry.extent = *reserved;
+        entry.extent = reserved;
         entry.content_length = length;
         if (reserved_.push_back(std::move(entry)) != st::status_t::success_k) {
-            [[maybe_unused]] status_t const returned = allocator_.release(*reserved);
+            [[maybe_unused]] status_t const returned = allocator_.release(reserved);
             return status_t {status_code_t::out_of_memory_k, "The volume could not track another reservation"};
         }
-        return blob_of_(*reserved, length);
+        return blob_of_(reserved, length);
     }
 
     /** Whether this volume already answers to @p name, by a sealed blob or by a live reservation. */
@@ -243,14 +243,14 @@ class basic_extent_volume {
         catalog_entry_t const* const found = catalog_.find(name);
         if (!found) return {status_code_t::not_found_k, "The volume holds no blob of that name"};
         catalog_entry_t const restored = *found;
-        expected<extent_t> const forgotten = catalog_.erase(name);
-        if (!forgotten) return forgotten.status();
+        auto [forgotten, erase_status] = catalog_.erase(name);
+        if (erase_status.failed()) return erase_status;
         if (status_t const published = publish_catalog_(channel); published.failed()) {
             [[maybe_unused]] status_t const undone = catalog_.insert(restored.name(), restored.kind, restored.extent,
                                                                      restored.content_length);
             return published;
         }
-        return allocator_.release(*forgotten);
+        return allocator_.release(forgotten);
     }
 
     /** Calls @p visitor with the name and the blob of every catalog entry of @p kind. */
@@ -364,14 +364,14 @@ class basic_extent_volume {
         header_ = header;
         catalog_ = catalog_t {};
         basic_write_pipeline<disk_type_> writer {disk_, channel, medium_};
-        expected<pooled_buffer_t> block = writer.acquire_buffer();
-        if (!block) return block.status();
-        if (block->size() < portable_alignment_k)
+        auto [block, acquire_buffer_status] = writer.acquire_buffer();
+        if (acquire_buffer_status.failed()) return acquire_buffer_status;
+        if (block.size() < portable_alignment_k)
             return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than a volume's head"};
-        std::span<byte_t> const bytes = block->bytes();
+        std::span<byte_t> const bytes = block.bytes();
         std::memset(bytes.data(), 0, static_cast<std::size_t>(portable_alignment_k));
         std::memcpy(bytes.data(), &header, sizeof(header));
-        if (status_t const queued = writer.enqueue_write(std::move(*block), extent_t {0, portable_alignment_k});
+        if (status_t const queued = writer.enqueue_write(std::move(block), extent_t {0, portable_alignment_k});
             queued.failed())
             return queued;
         if (status_t const durable = writer.make_durable(); durable.failed()) return durable;
@@ -412,21 +412,21 @@ class basic_extent_volume {
      *      pipeline fills the request pool whose blocks are far shorter than a catalog slot.
      */
     expected<std::uint64_t> read_slot_(io_channel_t& channel, std::uint32_t slot, catalog_t& into) noexcept {
-        expected<pooled_buffer_t> block = channel.streams().acquire();
-        if (!block) return block.status();
-        std::uint64_t const wanted = slot_image_bytes_(block->size());
+        auto [block, acquire_status] = channel.streams().acquire();
+        if (acquire_status.failed()) return acquire_status;
+        std::uint64_t const wanted = slot_image_bytes_(block.size());
         if (wanted == 0)
             return status_t {status_code_t::capacity_exhausted_k, "A channel's streaming block holds no catalog page"};
 
         std::array<request_t, 1> const batch {
-            read_request(medium_, extent_t {slot_offset_(slot), wanted}, block->reference(), channel.token(slot))};
-        expected<std::size_t> const taken = disk_.submit(channel.queue_pair(), std::span<request_t const> {batch});
-        if (!taken) return taken.status();
-        if (*taken != 1) return status_t {status_code_t::input_output_k, "The ring would not take a catalog read"};
-        expected<std::size_t> const completed = poll_completions_at_least(disk_, channel.queue_pair(),
-                                                                          channel.completion_buffer(), 1);
-        if (!completed) return completed.status();
-        if (*completed == 0) return status_t {status_code_t::input_output_k, "A catalog read never completed"};
+            read_request(medium_, extent_t {slot_offset_(slot), wanted}, block.reference(), channel.token(slot))};
+        auto [taken, submit_status] = disk_.submit(channel.queue_pair(), std::span<request_t const> {batch});
+        if (submit_status.failed()) return submit_status;
+        if (taken != 1) return status_t {status_code_t::input_output_k, "The ring would not take a catalog read"};
+        auto [completed, poll_completions_status] = poll_completions_at_least(disk_, channel.queue_pair(),
+                                                                              channel.completion_buffer(), 1);
+        if (poll_completions_status.failed()) return poll_completions_status;
+        if (completed == 0) return status_t {status_code_t::input_output_k, "A catalog read never completed"};
 
         completion_t const& completion = channel.completion_buffer().front();
         if (!completion.completed_in_full())
@@ -434,7 +434,7 @@ class basic_extent_volume {
                        ? completion.status
                        : status_t {status_code_t::malformed_k, "The volume is shorter than its catalog slot"};
 
-        std::span<byte_t const> const image {block->bytes().data(),
+        std::span<byte_t const> const image {block.bytes().data(),
                                              static_cast<std::size_t>(completion.transferred_bytes)};
         if (status_t const parsed = into.load(image); parsed.failed()) return parsed;
         catalog_slot_header_t header {};
@@ -447,20 +447,20 @@ class basic_extent_volume {
         std::uint64_t const generation = header_.catalog_generation + 1;
         std::uint32_t const slot = static_cast<std::uint32_t>(generation & 1);
 
-        expected<pooled_buffer_t> block = channel.streams().acquire();
-        if (!block) return block.status();
-        std::uint64_t const room = slot_image_bytes_(block->size());
+        auto [block, acquire_status] = channel.streams().acquire();
+        if (acquire_status.failed()) return acquire_status;
+        std::uint64_t const room = slot_image_bytes_(block.size());
         std::uint64_t const needed = catalog_.image_bytes();
         if (needed > room) return {status_code_t::capacity_exhausted_k, "The catalog outgrew the slot that holds it"};
 
         std::uint64_t const written = rounded_up_to(needed, portable_alignment_k);
-        std::span<byte_t> const bytes = block->bytes();
+        std::span<byte_t> const bytes = block.bytes();
         std::memset(bytes.data(), 0, static_cast<std::size_t>(written));
-        expected<std::uint64_t> const filled = catalog_.save(bytes.first(static_cast<std::size_t>(room)), generation);
-        if (!filled) return filled.status();
+        auto [filled, save_status] = catalog_.save(bytes.first(static_cast<std::size_t>(room)), generation);
+        if (save_status.failed()) return save_status;
 
         basic_write_pipeline<disk_type_> writer {disk_, channel, medium_};
-        if (status_t const queued = writer.enqueue_write(std::move(*block), extent_t {slot_offset_(slot), written});
+        if (status_t const queued = writer.enqueue_write(std::move(block), extent_t {slot_offset_(slot), written});
             queued.failed())
             return queued;
         if (status_t const durable = writer.make_durable(); durable.failed()) return durable;
@@ -489,10 +489,10 @@ class basic_extent_volume {
             return {status_code_t::malformed_k, "The volume names no power-of-two granularity"};
 
         extent_t const region {header_.data_offset, rounded_down_to(capacity_ - header_.data_offset, granularity)};
-        expected<extent_allocator_t> allocator = extent_allocator_t::make(region, granularity,
-                                                                          header_.large_allocation_alignment);
-        if (!allocator) return allocator.status();
-        allocator_ = std::move(*allocator);
+        auto [allocator, make_extent_allocator_status] = extent_allocator_t::make(region, granularity,
+                                                                                  header_.large_allocation_alignment);
+        if (make_extent_allocator_status.failed()) return make_extent_allocator_status;
+        allocator_ = std::move(allocator);
 
         status_t first;
         for (blob_kind_t const kind :

@@ -190,11 +190,12 @@ class basic_single_collection_database {
         if (&writing_channel == &merging_channel)
             return status_t {status_code_t::invalid_argument_k, "A compaction reads and writes on two channels"};
 
-        expected<collection_t> mounted = collection_t::mount(volume, config.collection, resources->memory_constraint);
-        if (!mounted) return mounted.status();
+        auto [mounted, mount_collection_status] = collection_t::mount(volume, config.collection,
+                                                                      resources->memory_constraint);
+        if (mount_collection_status.failed()) return mount_collection_status;
 
         database_unique_ptr_t opened {new (std::nothrow) basic_single_collection_database {
-            volume, writing_channel, merging_channel, config, std::move(resources), std::move(*mounted)}};
+            volume, writing_channel, merging_channel, config, std::move(resources), std::move(mounted)}};
         if (!opened) return status_t {status_code_t::out_of_memory_k, "The database did not fit"};
         if (status_t const agreed = opened->agree_on_schema_(); agreed.failed()) return agreed;
         return opened;
@@ -357,9 +358,9 @@ class basic_single_collection_database {
     expected<snapshot_t> take_snapshot() noexcept {
         write_path_guard_t const held {*this};
         if (held.adopted().failed()) return held.adopted();
-        expected<typename collection_t::snapshot_t> levels = collection_.take_snapshot(writing_channel_);
-        if (!levels) return levels.status();
-        return snapshot_t::of(std::move(*levels), registry_.current_stamp_());
+        auto [levels, take_snapshot_status] = collection_.take_snapshot(writing_channel_);
+        if (take_snapshot_status.failed()) return take_snapshot_status;
+        return snapshot_t::of(std::move(levels), registry_.current_stamp_());
     }
 
 #pragma endregion Maintenance
@@ -408,10 +409,10 @@ class basic_single_collection_database {
 
     /** Copies the owner's blob into @p into, which must be at least as long as the blob. */
     status_t load_user_data(io_channel_t& channel, std::span<byte_t> into) const noexcept {
-        expected<blob_t> const found = volume_.find(user_data_blob_name_());
-        if (!found) return found.status();
-        if (into.size() < found->length) return {status_code_t::invalid_argument_k, "A buffer shorter than the blob"};
-        return read_blob_(channel, *found, into.first(static_cast<std::size_t>(found->length)));
+        auto [found, find_status] = volume_.find(user_data_blob_name_());
+        if (find_status.failed()) return find_status;
+        if (into.size() < found.length) return {status_code_t::invalid_argument_k, "A buffer shorter than the blob"};
+        return read_blob_(channel, found, into.first(static_cast<std::size_t>(found.length)));
     }
 
     /** Forgets the owner's blob, which a volume holding none reports as @c not_found_k. */
@@ -668,13 +669,13 @@ class basic_single_collection_database {
         if (volume_.names(name))
             if (status_t const dropped = volume_.drop(writing_channel_, name); dropped.failed()) return dropped;
 
-        expected<blob_t> const reserved = volume_.create(name, kind, bytes.size());
-        if (!reserved) return reserved.status();
-        if (status_t const written = fill_blob_(*reserved, bytes); written.failed()) {
+        auto [reserved, create_status] = volume_.create(name, kind, bytes.size());
+        if (create_status.failed()) return create_status;
+        if (status_t const written = fill_blob_(reserved, bytes); written.failed()) {
             [[maybe_unused]] status_t const abandoned = volume_.drop(writing_channel_, name);
             return written;
         }
-        if (status_t const sealed = volume_.seal(writing_channel_, *reserved); sealed.failed()) {
+        if (status_t const sealed = volume_.seal(writing_channel_, reserved); sealed.failed()) {
             [[maybe_unused]] status_t const abandoned = volume_.drop(writing_channel_, name);
             return sealed;
         }
@@ -686,18 +687,17 @@ class basic_single_collection_database {
         basic_write_pipeline<disk_t> writer {volume_.disk(), writing_channel_, volume_.medium()};
         std::uint64_t at = 0;
         while (at != bytes.size()) {
-            expected<pooled_buffer_t> block = writer.acquire_buffer_or_poll();
-            if (!block) return block.status();
-            std::uint64_t const room = rounded_down_to(block->size(), portable_alignment_k);
+            auto [block, acquire_buffer_or_poll_status] = writer.acquire_buffer_or_poll();
+            if (acquire_buffer_or_poll_status.failed()) return acquire_buffer_or_poll_status;
+            std::uint64_t const room = rounded_down_to(block.size(), portable_alignment_k);
             if (room == 0) return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than one page"};
 
             std::uint64_t const carried = room < bytes.size() - at ? room : bytes.size() - at;
             std::uint64_t const padded = rounded_up_to(carried, portable_alignment_k);
-            std::span<byte_t> const room_bytes = block->bytes();
+            std::span<byte_t> const room_bytes = block.bytes();
             std::memcpy(room_bytes.data(), bytes.data() + at, static_cast<std::size_t>(carried));
             std::memset(room_bytes.data() + carried, 0, static_cast<std::size_t>(padded - carried));
-            if (status_t const queued = writer.enqueue_write(std::move(*block), blob.slice(at, padded));
-                queued.failed())
+            if (status_t const queued = writer.enqueue_write(std::move(block), blob.slice(at, padded)); queued.failed())
                 return queued;
             at += carried;
         }

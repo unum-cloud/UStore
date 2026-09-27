@@ -243,18 +243,18 @@ class cuda_devices_t {
     /** Enumerates every device, which yields an empty table on a machine without one. */
     static st::expected<cuda_devices_t> make() noexcept {
         using st::status_t;
-        st::expected<std::size_t> const count = cuda_count_devices();
-        if (!count) return count.status();
+        auto [count, cuda_count_devices_status] = cuda_count_devices();
+        if (st::failed(cuda_count_devices_status)) return cuda_count_devices_status;
         cuda_devices_t table;
-        status_t const status = table.devices_.resize(*count);
+        status_t const status = table.devices_.resize(count);
         if (status != status_t::success_k) return status;
-        for (std::size_t index = 0; index != *count; ++index) {
+        for (std::size_t index = 0; index != count; ++index) {
             int const ordinal = static_cast<int>(index);
-            st::expected<cuda_device_specs_t> const specs = cuda_device_specs_t::query(ordinal);
-            if (!specs) return specs.status();
-            st::expected<cuda_memory_usage_t> const memory = cuda_memory_usage_t::query(ordinal);
-            if (!memory) return memory.status();
-            table.devices_[index] = cuda_device_t {*specs, *memory, cuda_numa_node(*specs)};
+            auto [specs, query_cuda_device_specs_status] = cuda_device_specs_t::query(ordinal);
+            if (st::failed(query_cuda_device_specs_status)) return query_cuda_device_specs_status;
+            auto [memory, query_cuda_memory_usage_status] = cuda_memory_usage_t::query(ordinal);
+            if (st::failed(query_cuda_memory_usage_status)) return query_cuda_memory_usage_status;
+            table.devices_[index] = cuda_device_t {specs, memory, cuda_numa_node(specs)};
         }
         return table;
     }

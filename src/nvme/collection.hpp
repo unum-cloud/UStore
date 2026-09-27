@@ -140,9 +140,9 @@ class collection {
         mounted.cache_ = value_cache_t::of(holds_values_inline_k ? 0 : config.cache_limit, mounted.value_max_size_,
                                            constraint);
 
-        expected<tree_t> tree = tree_t::mount(volume, config.lsm_tree);
-        if (!tree) return tree.status();
-        mounted.tree_ = std::move(*tree);
+        auto [tree, mount_tree_status] = tree_t::mount(volume, config.lsm_tree);
+        if (mount_tree_status.failed()) return mount_tree_status;
+        mounted.tree_ = std::move(tree);
         return mounted;
     }
 

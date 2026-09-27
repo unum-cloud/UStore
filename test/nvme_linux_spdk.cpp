@@ -440,14 +440,13 @@ void spdk_suite(suite_totals_t& totals, suite_options_t const& options, spdk_sui
     failures += expect_status(empty.acquire_queue_pair(std::uint32_t {8}), status_code_t::unsupported_k);
     failures += expect_status(empty.bind_queue_pair(queue_pair), status_code_t::unsupported_k);
     failures += expect_status(empty.release_queue_pair(queue_pair), status_code_t::unsupported_k);
-    failures += expect(empty.register_memory(std::span<byte_t> {buffer}, memory_space_t::host_k).status() ==
+    failures += expect(empty.register_memory(std::span<byte_t> {buffer}, memory_space_t::host_k) ==
                        status_code_t::unsupported_k);
     failures += expect_status(empty.unregister_memory(registered_memory), status_code_t::unsupported_k);
     failures += expect_status(empty.register_medium(medium_options_t {}), status_code_t::unsupported_k);
     failures += expect_status(empty.unregister_medium(descriptor), status_code_t::unsupported_k);
-    failures += expect(empty.submit(queue_pair, std::span<request_t const> {requests}).status() ==
-                       status_code_t::unsupported_k);
-    failures += expect(empty.poll_completions(queue_pair, std::span<completion_t> {completions}).status() ==
+    failures += expect(empty.submit(queue_pair, std::span<request_t const> {requests}) == status_code_t::unsupported_k);
+    failures += expect(empty.poll_completions(queue_pair, std::span<completion_t> {completions}) ==
                        status_code_t::unsupported_k);
     failures += expect_status(empty.drain(queue_pair), status_code_t::unsupported_k);
     failures += expect_eq(empty.outstanding(queue_pair), std::size_t {0});

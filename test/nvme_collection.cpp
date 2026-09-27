@@ -106,13 +106,13 @@ expected<std::unique_ptr<typename collection_types<typename mount_type_::fixture
     auto stack = std::unique_ptr<stack_t> {new (std::nothrow) stack_t {}};
     if (!stack) return status_t {status_code_t::out_of_memory_k, "The stack did not fit"};
 
-    expected<std::unique_ptr<typename types_t::fixture_t>> fixture = mount();
-    if (!fixture) return fixture.status();
-    stack->fixture = std::move(*fixture);
+    auto [fixture, mount_status] = mount();
+    if (mount_status.failed()) return mount_status;
+    stack->fixture = std::move(fixture);
 
-    expected<typename types_t::guard_t> guard = stack->fixture->channels.acquire();
-    if (!guard) return guard.status();
-    stack->guard = std::move(*guard);
+    auto [guard, acquire_status] = stack->fixture->channels.acquire();
+    if (acquire_status.failed()) return acquire_status;
+    stack->guard = std::move(guard);
 
     expected<volume_t> volume = stack->fixture->mount_volume(stack->guard.channel());
     if (!volume) return volume.status();

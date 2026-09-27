@@ -300,9 +300,9 @@ class strings_collection_t {
 
     /** Reads the value of one string, which reads as a missing view when the collection lacks it. */
     expected<value_view_t> value(value_view_t text, watch_t watch = watch_t::watch_k) noexcept {
-        auto maybe_read = values({&text, 1}, watch);
-        if (!maybe_read) return maybe_read.status();
-        return (*maybe_read)[0];
+        auto [read, read_status] = values({&text, 1}, watch);
+        if (read_status.failed()) return read_status;
+        return read[0];
     }
 
     /** Reads the values of a batch of strings, each addressed by its own offset and length. */
@@ -337,9 +337,9 @@ class strings_collection_t {
     }
 
     expected<bool> present(value_view_t text, watch_t watch = watch_t::watch_k) noexcept {
-        auto maybe_read = value(text, watch);
-        if (!maybe_read) return maybe_read.status();
-        return static_cast<bool>(*maybe_read);
+        auto [found, read_status] = value(text, watch);
+        if (read_status.failed()) return read_status;
+        return static_cast<bool>(found);
     }
 
     /**
@@ -393,19 +393,19 @@ class strings_collection_t {
     /** Walks every string of @p prefix, which outlives the range, in the order of their text. */
     expected<prefix_range_t> prefixed(value_view_t prefix = value_view_t::make_empty(),
                                       std::size_t read_ahead = strings_stream_t::default_read_ahead_k) const noexcept {
-        auto maybe_begin = prefix_begin(prefix, read_ahead);
-        if (!maybe_begin) return maybe_begin.status();
+        auto [begin, prefix_begin_status] = prefix_begin(prefix, read_ahead);
+        if (prefix_begin_status.failed()) return prefix_begin_status;
         strings_stream_t end {database_, collection_, transaction_, snapshot_, prefix, read_ahead};
-        return prefix_range_t {std::move(*maybe_begin), std::move(end)};
+        return prefix_range_t {std::move(begin), std::move(end)};
     }
 
     /** Counts the strings of @p prefix by streaming through all of them. */
     expected<std::size_t> size(value_view_t prefix = value_view_t::make_empty()) const noexcept {
-        auto maybe_begin = prefix_begin(prefix);
-        if (!maybe_begin) return maybe_begin.status();
+        auto [begin, prefix_begin_status] = prefix_begin(prefix);
+        if (prefix_begin_status.failed()) return prefix_begin_status;
 
         std::size_t count = 0;
-        for (strings_stream_t& stream = *maybe_begin; !stream.is_end(); ++stream) ++count;
+        for (strings_stream_t& stream = begin; !stream.is_end(); ++stream) ++count;
         return count;
     }
 

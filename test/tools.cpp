@@ -395,8 +395,7 @@ struct edge_row_t {
     sz::string_t expected_value;
     if (selection == field_selection_t::whole_k) {
         failures += expect(canonical(exported_root, exported_value) && canonical(expected_root, expected_value));
-        failures += expect(std::string_view(exported_value.data(), exported_value.size()) ==
-                           std::string_view(expected_value.data(), expected_value.size()));
+        failures += expect(exported_value == expected_value);
         return failures;
     }
 
@@ -407,8 +406,7 @@ struct edge_row_t {
         failures += expect(canonical(lookup(exported_root, field), exported_value) &&
                            canonical(lookup(expected_root, field), expected_value));
         failures += expect(exported_value.size() != 0);
-        failures += expect(std::string_view(exported_value.data(), exported_value.size()) ==
-                           std::string_view(expected_value.data(), expected_value.size()));
+        failures += expect(exported_value == expected_value);
     }
     failures += expect(yyjson_obj_get(exported_root, is_csv(input) ? "retweeted" : "favorited") == nullptr);
     return failures;

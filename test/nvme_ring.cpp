@@ -38,18 +38,19 @@ void memory_transport(suite_totals_t& totals) {
     config.registered_memory_limit = 4;
     config.media_limit = 4;
 
-    expected<memory_device_t> device = memory_device_t::make();
-    expected<memory_disk_t> disk = device ? memory_disk_t::make(std::move(*device), config)
-                                          : expected<memory_disk_t> {device.status()};
+    auto [device, make_device_status] = memory_device_t::make();
+    expected<memory_disk_t> disk = make_device_status.failed() ? make_device_status
+                                                               : memory_disk_t::make(std::move(device), config);
     if (report(totals, "memory.mount", expect(disk.has_value())) != 0) return;
     on_medium(totals, "memory.volume", *disk, volume_request("memory"),
               [&](medium_reference_t medium) { ring_cases(totals, "memory", *disk, medium); });
     report(totals, "memory.medium_in_flight", ring_holds_a_medium_in_flight<memory_disk_t>, *disk,
            volume_request("memory_borrowed"));
 
-    expected<memory_device_t> strict_device = memory_device_t::make(portable_alignment_k);
-    expected<memory_disk_t> strict_disk = strict_device ? memory_disk_t::make(std::move(*strict_device), config)
-                                                        : expected<memory_disk_t> {strict_device.status()};
+    auto [strict_device, make_strict_device_status] = memory_device_t::make(portable_alignment_k);
+    expected<memory_disk_t> strict_disk = make_strict_device_status.failed()
+                                              ? make_strict_device_status
+                                              : memory_disk_t::make(std::move(strict_device), config);
     if (report(totals, "memory_strict.mount", expect(strict_disk.has_value())) != 0) return;
     on_medium(totals, "memory_strict.volume", *strict_disk, volume_request("memory_strict"),
               [&](medium_reference_t medium) {
@@ -66,9 +67,10 @@ void blocking_files_transport(suite_totals_t& totals, char const* directory) {
     config.registered_memory_limit = 4;
     config.media_limit = 4;
 
-    expected<blocking_files_device_t> device = blocking_files_device_t::make(file_buffering_t::buffered_k);
-    expected<blocking_files_disk_t> disk = device ? blocking_files_disk_t::make(std::move(*device), config)
-                                                  : expected<blocking_files_disk_t> {device.status()};
+    auto [device, make_device_status] = blocking_files_device_t::make(file_buffering_t::buffered_k);
+    expected<blocking_files_disk_t> disk = make_device_status.failed()
+                                               ? make_device_status
+                                               : blocking_files_disk_t::make(std::move(device), config);
     if (report(totals, "blocking.mount", expect(disk.has_value())) != 0) return;
     test_path_t const path {directory, "volume.bin"};
     on_medium(totals, "blocking.volume", *disk, volume_request(path.c_str()),
@@ -80,10 +82,10 @@ void blocking_files_transport(suite_totals_t& totals, char const* directory) {
     report(totals, "blocking.keeps_what_it_flushed", ring_keeps_what_it_flushed<blocking_files_disk_t>, *disk,
            volume_request(durable_path.c_str()));
 
-    expected<blocking_files_device_t> strict_device = blocking_files_device_t::make(file_buffering_t::unbuffered_k);
-    expected<blocking_files_disk_t> strict_disk = strict_device
-                                                      ? blocking_files_disk_t::make(std::move(*strict_device), config)
-                                                      : expected<blocking_files_disk_t> {strict_device.status()};
+    auto [strict_device, make_strict_device_status] = blocking_files_device_t::make(file_buffering_t::unbuffered_k);
+    expected<blocking_files_disk_t> strict_disk = make_strict_device_status.failed()
+                                                      ? make_strict_device_status
+                                                      : blocking_files_disk_t::make(std::move(strict_device), config);
     if (report(totals, "blocking_unbuffered.mount", expect(strict_disk.has_value())) != 0) return;
     test_path_t const strict_path {directory, "volume_unbuffered.bin"};
     on_medium(totals, "blocking_unbuffered.volume", *strict_disk, volume_request(strict_path.c_str()),

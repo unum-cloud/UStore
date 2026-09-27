@@ -254,23 +254,23 @@ expected<std::unique_ptr<typename database_types<typename mount_type_::fixture_t
     auto stack = std::unique_ptr<stack_t> {new (std::nothrow) stack_t {}};
     if (!stack) return status_t {status_code_t::out_of_memory_k, "The stack did not fit"};
 
-    expected<std::unique_ptr<typename types_t::fixture_t>> fixture = mount();
-    if (!fixture) return fixture.status();
-    stack->fixture = std::move(*fixture);
+    auto [fixture, mount_status] = mount();
+    if (mount_status.failed()) return mount_status;
+    stack->fixture = std::move(fixture);
 
-    expected<typename types_t::router_t> built = types_t::router_t::make();
-    if (!built) return built.status();
-    stack->router = std::move(*built);
+    auto [built, make_status] = types_t::router_t::make();
+    if (make_status.failed()) return make_status;
+    stack->router = std::move(built);
 
-    expected<typename types_t::guard_t> guard = stack->fixture->channels.acquire();
-    if (!guard) return guard.status();
-    expected<typename types_t::volume_t> volume = stack->fixture->mount_volume(guard->channel());
+    auto [guard, acquire_status] = stack->fixture->channels.acquire();
+    if (acquire_status.failed()) return acquire_status;
+    expected<typename types_t::volume_t> volume = stack->fixture->mount_volume(guard.channel());
     if (!volume) return volume.status();
     if (status_t const adopted = stack->router.bind_queue_pair(std::move(*volume)); adopted.failed()) return adopted;
 
-    expected<std::unique_ptr<typename types_t::database_t>> store = open_database(*stack);
-    if (!store) return store.status();
-    stack->store = std::move(*store);
+    auto [store, open_database_status] = open_database(*stack);
+    if (open_database_status.failed()) return open_database_status;
+    stack->store = std::move(store);
     return stack;
 }
 

@@ -172,9 +172,9 @@ class graph_collection_t {
         ustore_key_t vertex, ustore_vertex_role_t role = ustore_vertex_role_any_k,
         watch_t watch = watch_t::watch_k) noexcept {
 
-        auto maybe_degrees = degrees({{&vertex}, 1}, {{&role}, 1}, watch);
-        if (!maybe_degrees) return maybe_degrees.status();
-        return ustore_vertex_degree_t {(*maybe_degrees)[0]};
+        auto [found, degrees_status] = degrees({{&vertex}, 1}, {{&role}, 1}, watch);
+        if (degrees_status.failed()) return degrees_status;
+        return ustore_vertex_degree_t {found[0]};
     }
 
     expected<std::span<ustore_vertex_degree_t>> degrees( //
@@ -343,25 +343,24 @@ class graph_collection_t {
     }
 
     expected<strided_range<ustore_key_t>> successors(ustore_key_t vertex) noexcept {
-        auto maybe = edges_containing(vertex, ustore_vertex_source_k);
-        if (!maybe) return maybe.status();
-        return strided_range<ustore_key_t> {maybe->target_ids};
+        auto [edges, edges_containing_status] = edges_containing(vertex, ustore_vertex_source_k);
+        if (edges_containing_status.failed()) return edges_containing_status;
+        return strided_range<ustore_key_t> {edges.target_ids};
     }
 
     expected<strided_range<ustore_key_t>> predecessors(ustore_key_t vertex) noexcept {
-        auto maybe = edges_containing(vertex, ustore_vertex_target_k);
-        if (!maybe) return maybe.status();
-        return strided_range<ustore_key_t> {maybe->source_ids};
+        auto [edges, edges_containing_status] = edges_containing(vertex, ustore_vertex_target_k);
+        if (edges_containing_status.failed()) return edges_containing_status;
+        return strided_range<ustore_key_t> {edges.source_ids};
     }
 
     /** Lists the distinct neighbors of @p vertex, reordering the fetched edges in place. */
     expected<strided_range<ustore_key_t>> neighbors(ustore_key_t vertex,
                                                     ustore_vertex_role_t role = ustore_vertex_role_any_k) noexcept {
-        auto maybe = edges_containing(vertex, role);
-        if (!maybe) return maybe.status();
+        auto [edges, edges_containing_status] = edges_containing(vertex, role);
+        if (edges_containing_status.failed()) return edges_containing_status;
 
         // Incoming and outgoing edges hold the neighbor in different columns, so every edge is flipped to target it
-        edges_span_t edges = *maybe;
         for (std::size_t index = 0; index != edges.size(); ++index) {
             ustore_key_t& source = edges.source_ids[index];
             ustore_key_t& target = edges.target_ids[index];

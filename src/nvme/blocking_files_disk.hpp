@@ -331,22 +331,22 @@ class blocking_files_device_t {
      */
     expected<std::uint16_t> open_medium(medium_options_t const& request) noexcept {
         if (!request.name) return status_t {status_code_t::invalid_argument_k, "A file medium needs a path"};
-        expected<native_file_t> const file = open_native_file(request.name, request.access, buffering_);
-        if (!file) return file.status();
+        auto [file, open_native_file_status] = open_native_file(request.name, request.access, buffering_);
+        if (open_native_file_status.failed()) return open_native_file_status;
         if (request.access == medium_access_t::create_read_write_k && request.length != 0)
-            if (status_t const sized = truncate_native_file(*file, request.length); sized.failed()) {
-                close_native_file(*file);
+            if (status_t const sized = truncate_native_file(file, request.length); sized.failed()) {
+                close_native_file(file);
                 return sized;
             }
 
-        native_file_t opened = *file;
+        native_file_t opened = file;
         for (std::size_t index = 0; index != files_.size(); ++index)
             if (files_[index] == invalid_native_file_k) {
                 files_[index] = opened;
                 return static_cast<std::uint16_t>(index);
             }
         if (files_.push_back(std::move(opened)) != st::status_t::success_k) {
-            close_native_file(*file);
+            close_native_file(file);
             return status_t {status_code_t::out_of_memory_k, "A device could not track another medium"};
         }
         return static_cast<std::uint16_t>(files_.size() - 1);

@@ -616,6 +616,21 @@ check_redundant_nodiscard() {
         "            marked [[nodiscard]] themselves, so drop the annotation:"
 }
 
+# A two-way structured binding is an `expected` taken apart, so its halves read `[thing, status]`:
+# the status half is `status` or `<verb>_status`, never a participle, and the payload half never
+# carries the suffix. A `std::pair` binds under the same rule; `[first, second]` says nothing either.
+# The standard conversions answer an end and an `std::errc`, not a status, so `[end, error]` stays.
+check_expected_bindings() {
+    local participle suffixed
+    participle=$(printf '%s\n' "$added" | grep -vE '^\+[[:space:]]*(//|/\*|\*( |/|$))' |
+        grep -E 'auto( const)?&? \[[a-z_]+, [a-z_]+\] =' | grep -vE '\b(from_chars|to_chars|format_to_n)\(' |
+        grep -vE 'auto( const)?&? \[[a-z_]+, (status|[a-z]+(_[a-z]+)*_status)\] =' || true)
+    suffixed=$(printf '%s\n' "$added" | grep -vE '^\+[[:space:]]*(//|/\*|\*( |/|$))' |
+        grep -E 'auto( const)?&? \[[a-z_]+_status, ' || true)
+    [ -z "$participle$suffixed" ] || fail "$participle$suffixed" \
+        "$file binds an expected as [payload, participle] - the status half is \`status\` or \`<verb>_status\`:"
+}
+
 # A class template takes a bare name - `class blobs_ref`, never `class blobs_ref_gt` - and `_at` belongs to no
 # identifier at all: template parameters end in a single underscore, and `_t` marks only a materialized type.
 check_suffixed_template_names() {
@@ -726,13 +741,15 @@ check_memcpy() {
         "$file reinterprets one object through memcpy - write \`auto bits = std::bit_cast<u64_t>(value);\`:"
 }
 
-# A range rebuilt from its own parts - `{x.data(), x.size()}` - means a conversion or an
-# accessor is missing: `std::vector` converts to `std::span`, NumKong spans convert to views,
-# and containers can grow `begin()`/`end()`. Pass the range itself.
+# A range rebuilt from its own parts - `{x.data(), x.size()}`, `{file->view().data(), file->view().size()}`
+# or `std::span<T const>(x.data(), x.size())` - means a conversion or an accessor is missing: `std::vector`
+# converts to `std::span`, `std::string_view` to StringZilla's views, and containers can grow
+# `begin()`/`end()`. Pass the range itself.
 check_range_reconstruction() {
     local rebuilt
+    # The range may be reached through calls and arrows, and rebuilt in braces or in a view's parentheses
     rebuilt=$(printf '%s\n' "$added" |
-        grep -E '\{ *([A-Za-z_][A-Za-z0-9_.]*)\.data\(\), *\1\.size\(\) *\}' || true)
+        grep -E '(\{|(span|string_view|_view_t|_span_t)(<.*>)?( const)?( [a-z_]+)? *\() *([A-Za-z_][A-Za-z0-9_.()>-]*)(\.|->)data\(\), *\6(\.|->)size\(\) *[})]' || true)
     [ -z "$rebuilt" ] || fail "$rebuilt" \
         "$file rebuilds a range from its own .data()/.size() - pass the range itself," \
         "            or add the missing accessor or conversion:"
@@ -1026,6 +1043,7 @@ for file in "${staged[@]}"; do
         check_template_parameter_underscores
         check_function_like_macros
         check_redundant_nodiscard
+        check_expected_bindings
         check_printf
         check_partial_prints
         check_stl_streams

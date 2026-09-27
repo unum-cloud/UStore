@@ -111,16 +111,16 @@ class docs_collection_t {
     }
 
     expected<size_range_t> size_range() const noexcept {
-        auto maybe = members().size_estimates();
-        if (!maybe) return maybe.status();
-        return maybe->cardinality;
+        auto [estimates, size_estimates_status] = members().size_estimates();
+        if (size_estimates_status.failed()) return size_estimates_status;
+        return estimates.cardinality;
     }
 
     /** Estimates the number of documents as the middle of @c size_range. */
     expected<std::size_t> size() const noexcept {
-        auto maybe = size_range();
-        if (!maybe) return maybe.status();
-        return (maybe->min + maybe->max) / 2;
+        auto [range, size_range_status] = size_range();
+        if (size_range_status.failed()) return size_range_status;
+        return (range.min + range.max) / 2;
     }
 
     /** Empties every document, keeping the keys. */

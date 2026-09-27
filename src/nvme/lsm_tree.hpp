@@ -365,8 +365,8 @@ class lsm_tree {
                     else ++chunk;
                 }
                 if (status_t const flushed = reader.submit(); flushed.failed()) return flushed;
-                expected<std::size_t> const polled = reader.poll_completions(adapter);
-                if (!polled) return polled.status();
+                auto [polled, poll_completions_status] = reader.poll_completions(adapter);
+                if (poll_completions_status.failed()) return poll_completions_status;
             }
             return first;
         }
@@ -385,10 +385,10 @@ class lsm_tree {
      */
     status_t flush(io_channel_t& channel, std::span<key_slot_t const> key_slots, std::span<byte_t const> stored_values,
                    stored_value_size_t value_max_size) noexcept {
-        expected<sorted_run_t> written = sorted_run_t::write(*volume_, channel, uuid_generator(), key_slots,
-                                                             stored_values, value_max_size);
-        if (!written) return written.status();
-        uuid_t const content_id = written->content_id();
+        auto [written, write_sorted_run_status] = sorted_run_t::write(*volume_, channel, uuid_generator(), key_slots,
+                                                                      stored_values, value_max_size);
+        if (write_sorted_run_status.failed()) return write_sorted_run_status;
+        uuid_t const content_id = written.content_id();
 
         std::size_t const live = live_slot_();
         std::size_t const staged = 1 - live;
@@ -397,7 +397,7 @@ class lsm_tree {
             [[maybe_unused]] status_t const abandoned = sorted_run_t::drop(*volume_, channel, content_id);
             return carried;
         }
-        if (status_t const adopted = sets_[staged][0].bind_queue_pair(std::move(*written)); adopted.failed()) {
+        if (status_t const adopted = sets_[staged][0].bind_queue_pair(std::move(written)); adopted.failed()) {
             retire_(staged);
             [[maybe_unused]] status_t const abandoned = sorted_run_t::drop(*volume_, channel, content_id);
             return adopted;
@@ -438,12 +438,12 @@ class lsm_tree {
         }
 
         for (std::size_t index = 0; index != runs.size(); ++index) {
-            expected<sorted_run_t> opened = sorted_run_t::open(*volume_, channel, runs[index].content_id);
-            if (!opened) {
+            auto [opened, open_sorted_run_status] = sorted_run_t::open(*volume_, channel, runs[index].content_id);
+            if (open_sorted_run_status.failed()) {
                 discard_(staged);
-                return opened.status();
+                return open_sorted_run_status;
             }
-            if (status_t const adopted = into[runs[index].level_number].bind_queue_pair(std::move(*opened));
+            if (status_t const adopted = into[runs[index].level_number].bind_queue_pair(std::move(opened));
                 adopted.failed()) {
                 discard_(staged);
                 return adopted;
@@ -644,23 +644,23 @@ class lsm_tree {
         request.cancellation = cancellation;
         if (!grows && lower + 1 != source.size()) request.depth = lsm_level_depth_t::intermediate_k;
 
-        expected<level_t> merged = merger_t::merge(*volume_, reading_channel, writing_channel, request);
-        if (!merged) return merged.status();
+        auto [merged, merge_status] = merger_t::merge(*volume_, reading_channel, writing_channel, request);
+        if (merge_status.failed()) return merge_status;
 
         std::size_t const staged = 1 - live;
         if (status_t const carried = carry_all_(live, staged, upper, last_consumed); carried.failed()) {
-            [[maybe_unused]] status_t const abandoned = merged->drop(*volume_, writing_channel);
+            [[maybe_unused]] status_t const abandoned = merged.drop(*volume_, writing_channel);
             return carried;
         }
         if (grows) {
             if (sets_[staged].push_back(level_t::of(static_cast<std::uint32_t>(lower), lsm_level_order_t::sorted_k)) !=
                 st::status_t::success_k) {
-                [[maybe_unused]] status_t const abandoned = merged->drop(*volume_, writing_channel);
+                [[maybe_unused]] status_t const abandoned = merged.drop(*volume_, writing_channel);
                 retire_(staged);
                 return status_t {status_code_t::out_of_memory_k, "A tree could not hold another level"};
             }
         }
-        sets_[staged][lower] = std::move(*merged);
+        sets_[staged][lower] = std::move(merged);
 
         publish_(staged);
         retire_(live);

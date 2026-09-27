@@ -64,10 +64,10 @@ using namespace unum::ustore::nvme;
 /** Registers @p request on @p disk and answers the capacity the registered medium carries, giving the medium back. */
 template <typename disk_type_>
 expected<std::uint64_t> registered_capacity(disk_type_& disk, medium_options_t const& request) {
-    expected<registered_medium_t> registered = disk.register_medium(request);
-    if (!registered) return registered.status();
-    std::uint64_t const capacity = registered->capacity();
-    if (status_t const released = disk.unregister_medium(*registered); released.failed()) return released;
+    auto [registered, register_medium_status] = disk.register_medium(request);
+    if (register_medium_status.failed()) return register_medium_status;
+    std::uint64_t const capacity = registered.capacity();
+    if (status_t const released = disk.unregister_medium(registered); released.failed()) return released;
     return capacity;
 }
 

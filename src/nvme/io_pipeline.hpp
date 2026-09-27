@@ -101,10 +101,10 @@ class basic_read_pipeline {
     /** Queues a read of @p extent under @p tag, or answers @c capacity_exhausted_k when out of room. */
     status_t enqueue_read(extent_t extent, request_tag_t tag) noexcept {
         if (!can_enqueue()) return {status_code_t::capacity_exhausted_k, "This channel has no block or credit left"};
-        expected<pooled_buffer_t> block = channel_.requests().acquire();
-        if (!block) return block.status();
+        auto [block, acquire_status] = channel_.requests().acquire();
+        if (acquire_status.failed()) return acquire_status;
         entry_t entry;
-        entry.block = std::move(*block);
+        entry.block = std::move(block);
         entry.tag = tag;
         entry.requested_bytes = extent.length;
         request_t const request = read_request(medium_, extent, entry.block.reference(), channel_.token(next_slot_));
@@ -121,12 +121,11 @@ class basic_read_pipeline {
     /** Submits what is staged, keeping whatever the ring would not take for the next call. */
     status_t submit() noexcept {
         while (!staged_.empty()) {
-            expected<std::size_t> const taken = disk_.submit(channel_.queue_pair(),
-                                                             std::span<request_t const> {staged_});
-            if (!taken) return taken.status();
-            if (*taken == 0) return {};
-            outstanding_ += *taken;
-            drop_front_(staged_, *taken);
+            auto [taken, submit_status] = disk_.submit(channel_.queue_pair(), std::span<request_t const> {staged_});
+            if (submit_status.failed()) return submit_status;
+            if (taken == 0) return {};
+            outstanding_ += taken;
+            drop_front_(staged_, taken);
         }
         return {};
     }
@@ -142,10 +141,10 @@ class basic_read_pipeline {
     template <typename sink_type_>
     expected<std::size_t> poll_completions(sink_type_&& sink) noexcept {
         if (outstanding_ == 0) return std::size_t {0};
-        expected<std::size_t> const completed = disk_.poll_completions(channel_.queue_pair(),
-                                                                       channel_.completion_buffer());
-        if (!completed) return completed.status();
-        std::span<completion_t const> const landed = channel_.completion_buffer().first(*completed);
+        auto [completed, poll_completions_status] = disk_.poll_completions(channel_.queue_pair(),
+                                                                           channel_.completion_buffer());
+        if (poll_completions_status.failed()) return poll_completions_status;
+        std::span<completion_t const> const landed = channel_.completion_buffer().first(completed);
         for (completion_t const& completion : landed) {
             if (!completion.retires()) continue;
             entry_t* const entry = entry_of_(completion.token.tag());
@@ -172,8 +171,8 @@ class basic_read_pipeline {
         if (outstanding_ == 0) return {status_code_t::invalid_argument_k, "This channel has nothing in flight"};
         std::size_t const before = outstanding_;
         for (std::size_t spins = 0; outstanding_ == before && spins != poll_spin_limit_k; ++spins) {
-            expected<std::size_t> const seen = poll_completions(sink);
-            if (!seen) return seen.status();
+            auto [seen, poll_completions_status] = poll_completions(sink);
+            if (poll_completions_status.failed()) return poll_completions_status;
         }
         return outstanding_ == before
                    ? status_t {status_code_t::input_output_k, "A channel's completions never arrived"}
@@ -287,7 +286,7 @@ class basic_write_pipeline {
     /** Takes a block, polling completions first when every block of the channel is out. */
     expected<pooled_buffer_t> acquire_buffer_or_poll() noexcept {
         expected<pooled_buffer_t> block = acquire_buffer();
-        while (!block && block.status() == status_code_t::capacity_exhausted_k && outstanding_ != 0) {
+        while (block == status_code_t::capacity_exhausted_k && outstanding_ != 0) {
             if (status_t const polled = poll_one_completion(); polled.failed()) return polled;
             block = acquire_buffer();
         }
@@ -317,12 +316,11 @@ class basic_write_pipeline {
     /** Submits what is staged, keeping whatever the ring would not take for the next call. */
     status_t submit() noexcept {
         while (!staged_.empty()) {
-            expected<std::size_t> const taken = disk_.submit(channel_.queue_pair(),
-                                                             std::span<request_t const> {staged_});
-            if (!taken) return taken.status();
-            if (*taken == 0) return {};
-            outstanding_ += *taken;
-            drop_front_(staged_, *taken);
+            auto [taken, submit_status] = disk_.submit(channel_.queue_pair(), std::span<request_t const> {staged_});
+            if (submit_status.failed()) return submit_status;
+            if (taken == 0) return {};
+            outstanding_ += taken;
+            drop_front_(staged_, taken);
         }
         return {};
     }
@@ -333,11 +331,11 @@ class basic_write_pipeline {
     /** Harvests landed completions, recycling their blocks and failing on anything short of whole. */
     status_t poll_completions() noexcept {
         if (outstanding_ == 0) return {};
-        expected<std::size_t> const completed = disk_.poll_completions(channel_.queue_pair(),
-                                                                       channel_.completion_buffer());
-        if (!completed) return completed.status();
+        auto [completed, poll_completions_status] = disk_.poll_completions(channel_.queue_pair(),
+                                                                           channel_.completion_buffer());
+        if (poll_completions_status.failed()) return poll_completions_status;
         status_t first;
-        std::span<completion_t const> const landed = channel_.completion_buffer().first(*completed);
+        std::span<completion_t const> const landed = channel_.completion_buffer().first(completed);
         for (completion_t const& completion : landed) {
             if (!completion.retires()) continue;
             entry_t* const entry = entry_of_(completion.token.tag());
@@ -376,13 +374,13 @@ class basic_write_pipeline {
         }
 
         std::array<request_t, 1> barrier {flush_request(medium_, channel_.token(next_slot_++))};
-        expected<std::size_t> const taken = disk_.submit(channel_.queue_pair(), std::span<request_t const> {barrier});
-        if (!taken) return taken.status();
-        if (*taken != 1) return {status_code_t::input_output_k, "The ring would not take a flush"};
-        expected<std::size_t> const completed = poll_completions_at_least(disk_, channel_.queue_pair(),
-                                                                          channel_.completion_buffer(), 1);
-        if (!completed) return completed.status();
-        if (*completed == 0) return {status_code_t::input_output_k, "A flush never completed"};
+        auto [taken, submit_status] = disk_.submit(channel_.queue_pair(), std::span<request_t const> {barrier});
+        if (submit_status.failed()) return submit_status;
+        if (taken != 1) return {status_code_t::input_output_k, "The ring would not take a flush"};
+        auto [completed, poll_completions_status] = poll_completions_at_least(disk_, channel_.queue_pair(),
+                                                                              channel_.completion_buffer(), 1);
+        if (poll_completions_status.failed()) return poll_completions_status;
+        if (completed == 0) return {status_code_t::input_output_k, "A flush never completed"};
         completion_t const& completion = channel_.completion_buffer().front();
         return completion.completed_in_full() ? status_t {} : completion.status;
     }

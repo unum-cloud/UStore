@@ -216,25 +216,25 @@ class basic_storage_mount {
 
         memory_arena_config_t arena;
         arena.bytes = config.channels.arena_bytes() * (threads + config.shared_io_channels);
-        expected<registered_memory_arena_t> pinned = registered_memory_arena_t::make(disk_, constraint, arena);
-        if (!pinned) return pinned.status();
-        arena_ = std::move(*pinned);
+        auto [pinned, make_arena_status] = registered_memory_arena_t::make(disk_, constraint, arena);
+        if (make_arena_status.failed()) return make_arena_status;
+        arena_ = std::move(pinned);
 
-        expected<channel_pool_t> leased = channel_pool_t::make(disk_, arena_, threads, config.shared_io_channels,
-                                                               config.channels);
-        if (!leased) return leased.status();
-        channels_ = std::move(*leased);
+        auto [leased, make_channel_pool_status] = channel_pool_t::make(disk_, arena_, threads,
+                                                                       config.shared_io_channels, config.channels);
+        if (make_channel_pool_status.failed()) return make_channel_pool_status;
+        channels_ = std::move(leased);
 
         if (media_.resize(config.data_directories.size()) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A mount could not track its targets"};
-        expected<router_t> built = router_t::make(config.data_directories.size());
-        if (!built) return built.status();
-        router_ = std::move(*built);
+        auto [built, make_router_status] = router_t::make(config.data_directories.size());
+        if (make_router_status.failed()) return make_router_status;
+        router_ = std::move(built);
 
-        expected<typename channel_pool_t::guard_t> guard = channels_.acquire();
-        if (!guard) return guard.status();
+        auto [guard, acquire_status] = channels_.acquire();
+        if (acquire_status.failed()) return acquire_status;
         for (std::size_t index = 0; index != config.data_directories.size(); ++index)
-            if (status_t const opened = open_volume_(config.data_directories[index], index, guard->channel(), database);
+            if (status_t const opened = open_volume_(config.data_directories[index], index, guard.channel(), database);
                 opened.failed())
                 return opened;
         return {};
@@ -301,9 +301,9 @@ class basic_storage_mount {
         request.name = path;
         request.length = directory.max_size;
         request.access = medium_access_t::create_read_write_k;
-        expected<registered_medium_t> registered = disk_.register_medium(request);
-        if (!registered) return registered.status();
-        media_[index] = std::move(*registered);
+        auto [registered, register_medium_status] = disk_.register_medium(request);
+        if (register_medium_status.failed()) return register_medium_status;
+        media_[index] = std::move(registered);
 
         volume_format_t format;
         format.database = database;
@@ -375,9 +375,9 @@ class mounted_storage_t {
 
         switch (report_.transport) {
         case io_transport_t::memory_k: {
-            expected<memory_device_t> device = memory_device_t::make(portable_alignment_k);
-            if (!device) return device.status();
-            expected<memory_disk_t> disk = memory_disk_t::make(std::move(*device),
+            auto [device, make_memory_device_status] = memory_device_t::make(portable_alignment_k);
+            if (make_memory_device_status.failed()) return make_memory_device_status;
+            expected<memory_disk_t> disk = memory_disk_t::make(std::move(device),
                                                                ring_config_(config, owners, targets));
             if (!disk) return disk.status();
             return adopt_<memory_disk_t>(std::move(*disk), config, constraint, threads, database);
@@ -440,9 +440,9 @@ class mounted_storage_t {
     status_t mount_blocking_(resources_config_t const& config, resource_constraint_t& constraint, std::size_t threads,
                              uuid_t const& database, std::uint16_t owners, std::uint16_t targets) noexcept {
         if (status_t const made = create_data_directories(config); made.failed()) return made;
-        expected<blocking_files_device_t> device = blocking_files_device_t::make(file_buffering_t::unbuffered_k);
-        if (!device) return device.status();
-        expected<blocking_files_disk_t> disk = blocking_files_disk_t::make(std::move(*device),
+        auto [device, make_device_status] = blocking_files_device_t::make(file_buffering_t::unbuffered_k);
+        if (make_device_status.failed()) return make_device_status;
+        expected<blocking_files_disk_t> disk = blocking_files_disk_t::make(std::move(device),
                                                                            ring_config_(config, owners, targets));
         if (!disk) return disk.status();
         return adopt_<any_files_disk_t>(any_files_disk_t {std::move(*disk)}, config, constraint, threads, database);
@@ -460,9 +460,9 @@ class mounted_storage_t {
         ring.registered_memory_limit = 1;
         ring.media_limit = targets;
         ring.buffering = file_buffering_t::unbuffered_k;
-        expected<linux_uring_files_disk_t> disk = linux_uring_files_disk_t::make(ring);
-        if (!disk) return disk.status();
-        return adopt_<any_files_disk_t>(any_files_disk_t {std::move(*disk)}, config, constraint, threads, database);
+        auto [disk, make_disk_status] = linux_uring_files_disk_t::make(ring);
+        if (make_disk_status.failed()) return make_disk_status;
+        return adopt_<any_files_disk_t>(any_files_disk_t {std::move(disk)}, config, constraint, threads, database);
     }
 
     /** Mounts Linux AIO on unbuffered files, one context per queue pair, with @p owners queue pairs over @p targets
@@ -476,9 +476,9 @@ class mounted_storage_t {
         contexts.registered_memory_limit = 1;
         contexts.media_limit = targets;
         contexts.buffering = file_buffering_t::unbuffered_k;
-        expected<linux_aio_files_disk_t> disk = linux_aio_files_disk_t::make(contexts);
-        if (!disk) return disk.status();
-        return adopt_<any_files_disk_t>(any_files_disk_t {std::move(*disk)}, config, constraint, threads, database);
+        auto [disk, make_disk_status] = linux_aio_files_disk_t::make(contexts);
+        if (make_disk_status.failed()) return make_disk_status;
+        return adopt_<any_files_disk_t>(any_files_disk_t {std::move(disk)}, config, constraint, threads, database);
     }
 
     /** @p wanted as the 16-bit count a ring names things by, or zero when @p reserved leaves no room. */

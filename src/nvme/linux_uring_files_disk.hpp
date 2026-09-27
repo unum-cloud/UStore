@@ -444,22 +444,22 @@ class linux_uring_files_disk_t {
             if (!claim_(slot.registered)
                      .compare_exchange_strong(expected_free, 1, std::memory_order_acquire, std::memory_order_relaxed))
                 continue;
-            expected<native_file_t> const file = open_native_file(request.name, request.access, buffering_);
-            if (!file) {
+            auto [file, open_native_file_status] = open_native_file(request.name, request.access, buffering_);
+            if (open_native_file_status.failed()) {
                 claim_(slot.registered).store(0, std::memory_order_release);
-                return file.status();
+                return open_native_file_status;
             }
             if (request.access == medium_access_t::create_read_write_k && request.length != 0)
-                if (status_t const sized = truncate_native_file(*file, request.length); sized.failed()) {
-                    close_native_file(*file);
+                if (status_t const sized = truncate_native_file(file, request.length); sized.failed()) {
+                    close_native_file(file);
                     claim_(slot.registered).store(0, std::memory_order_release);
                     return sized;
                 }
             direct_alignment_t const alignment = buffering_ == file_buffering_t::unbuffered_k
-                                                     ? direct_alignment_of(*file)
+                                                     ? direct_alignment_of(file)
                                                      : direct_alignment_t {1, 1};
-            slot.file = *file;
-            slot.capacity = native_file_capacity(*file);
+            slot.file = file;
+            slot.capacity = native_file_capacity(file);
             slot.memory_alignment = alignment.memory;
             slot.offset_alignment = alignment.offset;
             epoch_(media_epoch_).add(1, std::memory_order_release);
@@ -627,9 +627,9 @@ class linux_uring_files_disk_t {
         std::array<completion_t, drain_batch_k> discarded {};
         for (std::size_t spins = 0; spins != drain_spin_limit_k; ++spins) {
             if (slot->flights_count == 0 && slot->locals_count == 0) return {};
-            expected<std::size_t> const moved = poll_completions(queue_pair, std::span<completion_t> {discarded});
-            if (!moved) return moved.status();
-            if (*moved != 0) continue;
+            auto [moved, poll_completions_status] = poll_completions(queue_pair, std::span<completion_t> {discarded});
+            if (poll_completions_status.failed()) return poll_completions_status;
+            if (moved != 0) continue;
             if (spins == drain_patience_k) cancel(queue_pair);
             fu::preferred_yield_t {}(spins, spins, std::size_t {0});
         }
@@ -948,9 +948,9 @@ class linux_uring_files_disk_t {
     status_t carry_tables_(ring_t& ring, std::size_t seat) noexcept {
         epoch_t const registered_memories = epoch_(registered_memories_epoch_).load(std::memory_order_acquire);
         if (ring.carried_registered_memories != registered_memories) {
-            expected<range_pinning_t> const pinned = pin_ranges_(ring, seat, registered_memories);
-            if (!pinned) return pinned.status();
-            ring.pinning = *pinned;
+            auto [pinned, pin_ranges_status] = pin_ranges_(ring, seat, registered_memories);
+            if (pin_ranges_status.failed()) return pin_ranges_status;
+            ring.pinning = pinned;
             ring.carried_registered_memories = registered_memories;
         }
 

@@ -272,12 +272,12 @@ class basic_disk {
             if (!claim_(slot.registered)
                      .compare_exchange_strong(expected_free, 1, std::memory_order_acquire, std::memory_order_relaxed))
                 continue;
-            expected<std::uint16_t> const attached = device_.open_medium(request);
-            if (!attached) {
+            auto [attached, open_medium_status] = device_.open_medium(request);
+            if (open_medium_status.failed()) {
                 claim_(slot.registered).store(0, std::memory_order_release);
-                return attached.status();
+                return open_medium_status;
             }
-            slot.index = *attached;
+            slot.index = attached;
             return registered_medium_t::registered(static_cast<registered_medium_id_t>(index), slot.generation,
                                                    device_.capacity(slot.index));
         }
@@ -597,17 +597,17 @@ class basic_disk {
         }
 
         std::span<byte_t> const buffer {address, static_cast<std::size_t>(request.extent.length)};
-        expected<std::uint64_t> const moved = request.kind == request_kind_t::read_k
-                                                  ? device_.read_extent(medium->index, request.extent, buffer)
-                                                  : device_.write_extent(medium->index, request.extent, buffer);
-        if (!moved) {
+        auto [moved, move_status] = request.kind == request_kind_t::read_k
+                                        ? device_.read_extent(medium->index, request.extent, buffer)
+                                        : device_.write_extent(medium->index, request.extent, buffer);
+        if (move_status.failed()) {
             completion.state = completion_state_t::failed_k;
-            completion.status = moved.status();
+            completion.status = move_status;
             return completion;
         }
-        completion.transferred_bytes = *moved;
-        completion.state = *moved == request.extent.length ? completion_state_t::completed_k
-                                                           : completion_state_t::partial_k;
+        completion.transferred_bytes = moved;
+        completion.state = moved == request.extent.length ? completion_state_t::completed_k
+                                                          : completion_state_t::partial_k;
         return completion;
     }
 

@@ -300,9 +300,9 @@ inline expected<resources_shared_ptr_t> open_resources(resources_config_t const&
 
     std::size_t threads = config.threads;
     if (threads == 0) {
-        st::expected<std::size_t> const cores = executor_t::logical_cores_count();
-        if (!cores) return to_status(cores.status());
-        threads = derived_background_threads(*cores);
+        auto [cores, logical_cores_count_status] = executor_t::logical_cores_count();
+        if (st::failed(logical_cores_count_status)) return to_status(logical_cores_count_status);
+        threads = derived_background_threads(cores);
     }
     expected<background_executor_t> executor = background_executor_t::make(
         threads, background_jobs_limit(config.data_directories.size()));

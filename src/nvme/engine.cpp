@@ -639,15 +639,15 @@ inline status_t commit_batch(opened_database_t& database, places_arg_t const& pl
 
     transaction_id_t id = invalid_transaction_id_k;
     do { id = uuid_to_u64(uuid_generator()); } while (database.store->has_transaction(id));
-    expected<typename store_t::transaction_unique_ptr_t> opened = database.store->create_transaction(id, shape);
-    if (!opened) return opened.status();
+    auto [opened, create_transaction_status] = database.store->create_transaction(id, shape);
+    if (create_transaction_status.failed()) return create_transaction_status;
 
     for (std::size_t index = 0; index != places.size(); ++index)
-        if (status_t const staged = stage_one(database, **opened, watch_schedule_t::never_k, places[index],
+        if (status_t const staged = stage_one(database, *opened, watch_schedule_t::never_k, places[index],
                                               contents[index]);
             staged.failed())
             return staged;
-    return (*opened)->commit();
+    return opened->commit();
 }
 
 #pragma endregion Writes
@@ -676,9 +676,9 @@ inline status_t empty_collection(opened_database_t& database, collection_numeric
 
     st::basic_vector<stored_key_t> keys;
     {
-        expected<store_snapshot_t> taken = database.store->take_snapshot();
-        if (!taken) return taken.status();
-        if (status_t const walked = collect_keys(*taken, numeric_id, limit<stored_key_t>::min(), keys); walked.failed())
+        auto [taken, take_snapshot_status] = database.store->take_snapshot();
+        if (take_snapshot_status.failed()) return take_snapshot_status;
+        if (status_t const walked = collect_keys(taken, numeric_id, limit<stored_key_t>::min(), keys); walked.failed())
             return walked;
     }
     if (keys.empty()) return {};
@@ -806,21 +806,21 @@ inline expected<opened_database_t*> open_database(config_t const& config) noexce
     if (!opened) return status_t {status_code_t::out_of_memory_k, "No room for the database"};
     opened->collection_defaults = collections;
 
-    expected<resources_shared_ptr_t> budget = open_resources(resources, uuid_t {});
-    if (!budget) return budget.status();
-    opened->resources = std::move(*budget);
+    auto [budget, open_resources_status] = open_resources(resources, uuid_t {});
+    if (open_resources_status.failed()) return open_resources_status;
+    opened->resources = std::move(budget);
 
     opened->store = std::unique_ptr<store_t> {new (std::nothrow) store_t {opened->resources}};
     if (!opened->store) return status_t {status_code_t::out_of_memory_k, "No room for the store"};
     if (status_t const mounted = mount_store(*opened, transactions); mounted.failed()) return mounted;
 
     collection_config_t const shape = create_collection_config(collections);
-    expected<collection_numeric_id_t> const main = reserve_collection(*opened->store, main_collection_name_k, shape);
-    if (!main) return main.status();
-    expected<collection_numeric_id_t> const names = reserve_collection(*opened->store, names_collection_name_k, shape);
-    if (!names) return names.status();
-    opened->main = *main;
-    opened->names = *names;
+    auto [main, reserve_main_status] = reserve_collection(*opened->store, main_collection_name_k, shape);
+    if (reserve_main_status.failed()) return reserve_main_status;
+    auto [names, reserve_names_status] = reserve_collection(*opened->store, names_collection_name_k, shape);
+    if (reserve_names_status.failed()) return reserve_names_status;
+    opened->main = main;
+    opened->names = names;
     return opened.release();
 }
 
@@ -861,12 +861,12 @@ void ustore_database_init(ustore_database_init_t* c_arguments) {
         return;
     }
 
-    expected<opened_database_t*> opened = open_database(config);
-    if (!opened) {
-        *arguments.error = opened.status();
+    auto [opened, open_database_status] = open_database(config);
+    if (open_database_status.failed()) {
+        *arguments.error = open_database_status;
         return;
     }
-    *arguments.db = *opened;
+    *arguments.db = opened;
 }
 
 void ustore_get_metadata(ustore_get_metadata_t* c_arguments) {
@@ -995,13 +995,13 @@ void ustore_scan(ustore_scan_t* c_arguments) {
     tape.reserve(expected_keys(scans));
     if (arguments.error->status) return;
 
-    expected<store_snapshot_t> taken = database.store->take_snapshot();
-    if (reported_failure(taken.status(), arguments.error)) return;
+    auto [taken, take_snapshot_status] = database.store->take_snapshot();
+    if (reported_failure(take_snapshot_status, arguments.error)) return;
     for (std::size_t task = 0; task != scans.size(); ++task) {
         scan_t const scan = scans[task];
         std::size_t const first = tape.size();
         status_t const walked = walk_collection(
-            *taken, numbered(database, scan.collection), scan.min_key,
+            taken, numbered(database, scan.collection), scan.min_key,
             [&](stored_key_t key, select_result_t state, stored_value_size_t) noexcept -> walk_control_t {
                 if (state != select_result_t::success_k) return walk_control_t::resume_k;
                 if (tape.push(key) == walk_control_t::halt_k) return walk_control_t::halt_k;
@@ -1036,8 +1036,8 @@ void ustore_sample(ustore_sample_t* c_arguments) {
     key_tape_t tape {arena, samples.size(), arguments.offsets, arguments.counts, arguments.error};
     if (arguments.error->status) return;
 
-    expected<store_snapshot_t> taken = database.store->take_snapshot();
-    if (reported_failure(taken.status(), arguments.error)) return;
+    auto [taken, take_snapshot_status] = database.store->take_snapshot();
+    if (reported_failure(take_snapshot_status, arguments.error)) return;
     auto const now = static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
     sample_generator_t generator {now ^ reinterpret_cast<std::uintptr_t>(&tape)};
 
@@ -1046,7 +1046,7 @@ void ustore_sample(ustore_sample_t* c_arguments) {
         std::size_t const first = tape.size();
         std::size_t seen = 0;
         status_t const walked = walk_collection(
-            *taken, numbered(database, sample.collection), limit<stored_key_t>::min(),
+            taken, numbered(database, sample.collection), limit<stored_key_t>::min(),
             [&](stored_key_t key, select_result_t state, stored_value_size_t) noexcept -> walk_control_t {
                 if (state != select_result_t::success_k) return walk_control_t::resume_k;
                 std::size_t const slot = seen < sample.limit ? seen : generator() % (seen + 1);
@@ -1100,8 +1100,8 @@ void ustore_measure(ustore_measure_t* c_arguments) {
     strided_iterator<ustore_key_t const> const start_keys {arguments.start_keys, arguments.start_keys_stride};
     strided_iterator<ustore_key_t const> const end_keys {arguments.end_keys, arguments.end_keys_stride};
 
-    expected<store_snapshot_t> taken = database.store->take_snapshot();
-    if (reported_failure(taken.status(), arguments.error)) return;
+    auto [taken, take_snapshot_status] = database.store->take_snapshot();
+    if (reported_failure(take_snapshot_status, arguments.error)) return;
     for (std::size_t task = 0; task != count; ++task) {
         auto const index = static_cast<std::ptrdiff_t>(task);
         ustore_collection_t const collection = collections ? collections[index] : ustore_collection_main_k;
@@ -1110,7 +1110,7 @@ void ustore_measure(ustore_measure_t* c_arguments) {
         std::size_t cardinality = 0;
         std::size_t value_bytes = 0;
         status_t const walked = walk_collection(
-            *taken, numbered(database, collection), lower,
+            taken, numbered(database, collection), lower,
             [&](stored_key_t key, select_result_t state, stored_value_size_t size) noexcept -> walk_control_t {
                 if (last < key) return walk_control_t::halt_k;
                 if (state != select_result_t::success_k) return walk_control_t::resume_k;
@@ -1182,10 +1182,10 @@ void ustore_collection_create(ustore_collection_create_t* c_arguments) {
         if (!database.store->has_collection(any_collection_id_t {collection_alphanumeric_id_t {name}})) break;
     }
 
-    expected<collection_numeric_id_t> const created = database.store->create_collection(
-        string_view_t {name}, create_collection_config(shape));
-    if (reported_failure(created.status(), arguments.error)) return;
-    *arguments.id = static_cast<ustore_collection_t>(*created);
+    auto [created, create_collection_status] = database.store->create_collection(string_view_t {name},
+                                                                                 create_collection_config(shape));
+    if (reported_failure(create_collection_status, arguments.error)) return;
+    *arguments.id = static_cast<ustore_collection_t>(created);
 }
 
 void ustore_collection_drop(ustore_collection_drop_t* c_arguments) {
@@ -1256,10 +1256,10 @@ void ustore_transaction_init(ustore_transaction_init_t* c_arguments) {
 
     transaction_id_t id = invalid_transaction_id_k;
     do { id = uuid_to_u64(uuid_generator()); } while (database.store->has_transaction(id));
-    expected<typename store_t::transaction_unique_ptr_t> started = database.store->create_transaction(id);
-    if (reported_failure(started.status(), arguments.error)) return;
+    auto [started, create_transaction_status] = database.store->create_transaction(id);
+    if (reported_failure(create_transaction_status, arguments.error)) return;
 
-    auto* const opened = new (std::nothrow) opened_transaction_t {&database, std::move(*started)};
+    auto* const opened = new (std::nothrow) opened_transaction_t {&database, std::move(started)};
     if (!opened) {
         *arguments.error = {ustore_error_out_of_memory_k, "Failed to allocate the transaction"};
         return;

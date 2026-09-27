@@ -337,9 +337,8 @@ class stored_graph_t {
     /** Hands @p visit every distinct neighbor of @p vertex_index, each carrying unit weight. */
     template <typename visitor_type_>
     status_t for_each_neighbor(std::size_t vertex_index, visitor_type_&& visit) noexcept {
-        auto maybe_neighbors = collection_->neighbors(keys_[vertex_index]);
-        if (!maybe_neighbors) return maybe_neighbors.status();
-        strided_range<ustore_key_t> const neighbors = *maybe_neighbors;
+        auto [neighbors, neighbors_status] = collection_->neighbors(keys_[vertex_index]);
+        if (neighbors_status.failed()) return neighbors_status;
         for (std::size_t index = 0; index != neighbors.size(); ++index) {
             ustore_key_t const* const found = std::lower_bound(keys_.begin(), keys_.end(), neighbors[index]);
             if (found == keys_.end() || *found != neighbors[index]) continue;
@@ -538,38 +537,35 @@ template <typename graph_type_>
 expected<run_result_t> run_louvain(graph_type_& graph, settings_t const& settings) noexcept {
     double const min_growth = static_cast<double>(settings.min_modularity_growth_per_billion.value) / 1e9;
 
-    auto maybe_level = optimize_level(graph);
-    if (!maybe_level) return maybe_level.status();
-    level_t level = *std::move(maybe_level);
-    auto maybe_score = score_level(graph, level);
-    if (!maybe_score) return maybe_score.status();
+    auto [level, optimize_level_status] = optimize_level(graph);
+    if (optimize_level_status.failed()) return optimize_level_status;
+    auto [score, score_level_status] = score_level(graph, level);
+    if (score_level_status.failed()) return score_level_status;
 
     run_result_t result;
-    result.modularity = maybe_score->modularity;
-    result.communities_count = maybe_score->communities_count;
+    result.modularity = score.modularity;
+    result.communities_count = score.communities_count;
     result.levels_count = 1;
     if (level.progress == level_progress_t::settled_k) return result;
 
-    auto maybe_coarse = aggregate_level(graph, level);
-    if (!maybe_coarse) return maybe_coarse.status();
-    adjacency_graph_t coarse = *std::move(maybe_coarse);
+    auto [coarse, aggregate_level_status] = aggregate_level(graph, level);
+    if (aggregate_level_status.failed()) return aggregate_level_status;
 
     while (result.levels_count != settings.max_levels.value) {
-        auto maybe_coarse_level = optimize_level(coarse);
-        if (!maybe_coarse_level) return maybe_coarse_level.status();
-        level_t const coarse_level = *std::move(maybe_coarse_level);
-        auto maybe_coarse_score = score_level(coarse, coarse_level);
-        if (!maybe_coarse_score) return maybe_coarse_score.status();
+        auto [coarse_level, optimize_coarse_status] = optimize_level(coarse);
+        if (optimize_coarse_status.failed()) return optimize_coarse_status;
+        auto [coarse_score, score_coarse_status] = score_level(coarse, coarse_level);
+        if (score_coarse_status.failed()) return score_coarse_status;
         if (coarse_level.progress == level_progress_t::settled_k ||
-            maybe_coarse_score->modularity - result.modularity <= min_growth)
+            coarse_score.modularity - result.modularity <= min_growth)
             break;
 
-        result.modularity = maybe_coarse_score->modularity;
-        result.communities_count = maybe_coarse_score->communities_count;
+        result.modularity = coarse_score.modularity;
+        result.communities_count = coarse_score.communities_count;
         ++result.levels_count;
-        auto maybe_coarser = aggregate_level(coarse, coarse_level);
-        if (!maybe_coarser) return maybe_coarser.status();
-        coarse = *std::move(maybe_coarser);
+        auto [coarser, aggregate_coarse_status] = aggregate_level(coarse, coarse_level);
+        if (aggregate_coarse_status.failed()) return aggregate_coarse_status;
+        coarse = std::move(coarser);
     }
     return result;
 }
@@ -603,13 +599,13 @@ template <typename graph_type_>
 void bench_louvain(bm::State& state, graph_type_& graph, settings_t const& settings, run_result_t& result) {
     std::size_t vertices = 0;
     for ([[maybe_unused]] auto iteration : state) {
-        auto maybe_result = run_louvain(graph, settings);
-        if (!maybe_result) {
-            state.SkipWithError(maybe_result.status().message ? maybe_result.status().message
-                                                              : "Failed to detect communities");
+        auto [run, run_louvain_status] = run_louvain(graph, settings);
+        if (run_louvain_status.failed()) {
+            state.SkipWithError(run_louvain_status.message ? run_louvain_status.message
+                                                           : "Failed to detect communities");
             return;
         }
-        result = *maybe_result;
+        result = run;
         vertices += graph.vertices_count();
     }
     state.counters["vertices/s"] = bm::Counter(static_cast<double>(vertices), bm::Counter::kIsRate);
@@ -621,13 +617,12 @@ void bench_louvain(bm::State& state, graph_type_& graph, settings_t const& setti
 /** Runs Louvain over the graph collection, whose vertex scan and neighborhood reads it also times. */
 void bench_louvain_over_ustore(bm::State& state, graph_collection_t& graph, settings_t const& settings,
                                run_result_t& result) {
-    auto maybe_graph = stored_graph_t::make(graph);
-    if (!maybe_graph) {
-        state.SkipWithError(maybe_graph.status().message ? maybe_graph.status().message
-                                                         : "Failed to scan the graph collection");
+    auto [stored, make_stored_graph_status] = stored_graph_t::make(graph);
+    if (make_stored_graph_status.failed()) {
+        state.SkipWithError(make_stored_graph_status.message ? make_stored_graph_status.message
+                                                             : "Failed to scan the graph collection");
         return;
     }
-    stored_graph_t stored = *std::move(maybe_graph);
     bench_louvain(state, stored, settings, result);
 }
 

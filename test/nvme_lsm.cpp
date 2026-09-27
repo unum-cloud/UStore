@@ -904,8 +904,7 @@ case_result_t both_compactors_agree(mount_type_ const& mount) {
     request.placement = compaction_placement_t::device_k;
     expected<level_t> device = merger_t::merge(*volume, reading->channel(), writing->channel(), request);
     if (!device) {
-        bool const no_compactor = device.status() == status_code_t::unsupported_k ||
-                                  device.status() == status_code_t::device_k;
+        bool const no_compactor = device == status_code_t::unsupported_k || device == status_code_t::device_k;
         if (!no_compactor) failures += expect_status(device, status_code_t::unsupported_k);
         failures += expect(host->drop(*volume, writing->channel()).succeeded());
         failures += expect(upper.drop(*volume, writing->channel()).succeeded());

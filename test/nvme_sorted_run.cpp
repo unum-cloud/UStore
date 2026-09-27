@@ -371,11 +371,11 @@ status_t paint_stub_header(disk_type_& disk, io_channel_t& channel, medium_refer
     header.content_id = uuid_generator();
 
     basic_write_pipeline<disk_type_> writer {disk, channel, medium};
-    expected<pooled_buffer_t> block = writer.acquire_buffer();
-    if (!block) return block.status();
-    std::memset(block->bytes().data(), 0, static_cast<std::size_t>(run_config_k.page_bytes));
-    std::memcpy(block->bytes().data(), &header, sizeof(header));
-    if (status_t const queued = writer.enqueue_write(std::move(*block), extent_t {0, run_config_k.page_bytes});
+    auto [block, acquire_buffer_status] = writer.acquire_buffer();
+    if (acquire_buffer_status.failed()) return acquire_buffer_status;
+    std::memset(block.bytes().data(), 0, static_cast<std::size_t>(run_config_k.page_bytes));
+    std::memcpy(block.bytes().data(), &header, sizeof(header));
+    if (status_t const queued = writer.enqueue_write(std::move(block), extent_t {0, run_config_k.page_bytes});
         queued.failed())
         return queued;
     if (status_t const flushed = writer.submit(); flushed.failed()) return flushed;

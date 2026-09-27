@@ -848,7 +848,7 @@ void ustore_docs_export(ustore_docs_export_t* task_pointer) {
                 json_document_t const parsed {yyjson_read(document.data(), document.size(), 0)};
                 projected.clear();
                 project(yyjson_doc_get_root(parsed.handle), fields, projected, task.error);
-                document = sz::string_view_t(projected.data(), projected.size());
+                document = projected.view();
             }
             if (format == dataset_format_t::ndjson_k) {
                 output.append("{\"_id\":", task.error);

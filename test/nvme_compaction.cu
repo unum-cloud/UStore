@@ -299,7 +299,7 @@ struct test_lsm_level {
 template <typename key_slot_type_>
 std::span<sorted_run_index_view<key_slot_type_> const> views_of(
     test_lsm_level<key_slot_type_> const& lsm_level) noexcept {
-    return std::span<sorted_run_index_view<key_slot_type_> const>(lsm_level.views.data(), lsm_level.views.size());
+    return lsm_level.views;
 }
 
 /** Assigns sorted positions to a sorted run index's cells the way the B-tree builder fills sorted runs, answering the
@@ -1047,7 +1047,7 @@ std::size_t run_scenario(suite_totals_t& totals, char const* shape, std::size_t 
     failures += expect(status == st::status_t::success_k);
     if (failures != 0) return report(totals, host_name, failures);
 
-    std::span<stored_key_t const> const keys(universe.data(), universe.size());
+    std::span<stored_key_t const> const keys {universe};
     bool const overlapping = (scenario.kind == compaction_kind_t::overlapping_into_intermediate_k) |
                              (scenario.kind == compaction_kind_t::overlapping_into_bottom_k);
     test_lsm_level<key_slot_type_> upper;
@@ -1249,7 +1249,7 @@ std::size_t run_handmade_case(suite_totals_t& totals, char const* shape, std::si
     failures += expect_eq(unordered, std::size_t {0});
     if (failures != 0) return report(totals, host_name, failures);
 
-    std::span<stored_key_t const> const keys(lettered.data(), lettered.size());
+    std::span<stored_key_t const> const keys {lettered};
     test_lsm_level<key_slot_type_> upper;
     test_lsm_level<key_slot_type_> lower;
     status = spell_lsm_level(keys, handmade.upper, random, upper);

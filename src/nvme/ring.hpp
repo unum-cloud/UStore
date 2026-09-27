@@ -666,10 +666,10 @@ expected<std::size_t> poll_completions_at_least(disk_type_& disk, queue_pair_t c
         return status_t {status_code_t::invalid_argument_k, "A bounded wait needs room for what it wants"};
     std::size_t completed = 0;
     for (std::size_t spins = 0; completed < wanted && spins != spins_limit; ++spins) {
-        expected<std::size_t> const moved = disk.poll_completions(queue_pair, into.subspan(completed));
-        if (!moved) return moved.status();
-        if (*moved == 0) fu::preferred_yield_t {}(spins, spins, std::size_t {0});
-        completed += *moved;
+        auto [moved, poll_completions_status] = disk.poll_completions(queue_pair, into.subspan(completed));
+        if (poll_completions_status.failed()) return poll_completions_status;
+        if (moved == 0) fu::preferred_yield_t {}(spins, spins, std::size_t {0});
+        completed += moved;
     }
     return completed;
 }

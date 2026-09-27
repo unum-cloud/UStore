@@ -74,16 +74,15 @@ status_t write_blob(disk_type_& disk, io_channel_t& channel, blob_t const& blob,
     basic_write_pipeline<disk_type_> writer {disk, channel, blob.medium};
     std::uint64_t written = 0;
     while (written != blob.extent.length) {
-        expected<pooled_buffer_t> block = writer.acquire_buffer_or_poll();
-        if (!block) return block.status();
+        auto [block, acquire_buffer_or_poll_status] = writer.acquire_buffer_or_poll();
+        if (acquire_buffer_or_poll_status.failed()) return acquire_buffer_or_poll_status;
         std::uint64_t const room = blob.extent.length - written;
-        std::uint64_t const chunk = block->size() < room ? block->size() : room;
-        std::span<byte_t> const bytes = block->bytes();
+        std::uint64_t const chunk = block.size() < room ? block.size() : room;
+        std::span<byte_t> const bytes = block.bytes();
         for (std::uint64_t index = 0; index != chunk; ++index)
             bytes[static_cast<std::size_t>(index)] = written + index < blob.length ? painted(seed, written + index)
                                                                                    : byte_t {};
-        if (status_t const queued = writer.enqueue_write(std::move(*block), blob.slice(written, chunk));
-            queued.failed())
+        if (status_t const queued = writer.enqueue_write(std::move(block), blob.slice(written, chunk)); queued.failed())
             return queued;
         if (status_t const flushed = writer.submit(); flushed.failed()) return flushed;
         written += chunk;
@@ -124,8 +123,8 @@ expected<std::size_t> mismatched_bytes(disk_type_& disk, io_channel_t& channel, 
             ++offered;
         }
         if (status_t const flushed = reader.submit(); flushed.failed()) return flushed;
-        expected<std::size_t> const polled = reader.poll_completions(sink);
-        if (!polled) return polled.status();
+        auto [polled, poll_completions_status] = reader.poll_completions(sink);
+        if (poll_completions_status.failed()) return poll_completions_status;
     }
     if (seen != chunks) return status_t {status_code_t::input_output_k, "A blob read lost a block"};
     return mismatches;
@@ -156,11 +155,10 @@ template <typename disk_type_>
 status_t store_page(disk_type_& disk, io_channel_t& channel, medium_reference_t medium, std::uint64_t offset,
                     std::span<byte_t const> from) noexcept {
     basic_write_pipeline<disk_type_> writer {disk, channel, medium};
-    expected<pooled_buffer_t> block = writer.acquire_buffer();
-    if (!block) return block.status();
-    std::memcpy(block->bytes().data(), from.data(), from.size());
-    if (status_t const queued = writer.enqueue_write(std::move(*block), extent_t {offset, from.size()});
-        queued.failed())
+    auto [block, acquire_buffer_status] = writer.acquire_buffer();
+    if (acquire_buffer_status.failed()) return acquire_buffer_status;
+    std::memcpy(block.bytes().data(), from.data(), from.size());
+    if (status_t const queued = writer.enqueue_write(std::move(block), extent_t {offset, from.size()}); queued.failed())
         return queued;
     return writer.make_durable();
 }
@@ -225,10 +223,10 @@ expected<bool> slot_is_erased(disk_type_& disk, io_channel_t& channel, medium_re
 template <typename disk_type_>
 expected<blob_t> publish_blob(disk_type_& disk, io_channel_t& channel, basic_extent_volume<disk_type_>& volume,
                               blob_name_t name, blob_kind_t kind, std::uint64_t length, std::uint64_t seed) noexcept {
-    expected<blob_t> blob = volume.create(name, kind, length);
-    if (!blob) return blob.status();
-    if (status_t const written = write_blob(disk, channel, *blob, seed); written.failed()) return written;
-    if (status_t const sealed = volume.seal(channel, *blob); sealed.failed()) return sealed;
+    auto [blob, create_status] = volume.create(name, kind, length);
+    if (create_status.failed()) return create_status;
+    if (status_t const written = write_blob(disk, channel, blob, seed); written.failed()) return written;
+    if (status_t const sealed = volume.seal(channel, blob); sealed.failed()) return sealed;
     return blob;
 }
 
@@ -657,7 +655,7 @@ std::size_t volume_refuses_a_duplicate(fixture_type_& fixture) {
     failures += expect_status(volume->drop(guard->channel(), absent.name()), status_code_t::not_found_k);
 
     // An empty name and one past the format's limit are arguments, never names.
-    failures += expect(volume->create(blob_name_t {}, blob_kind_t::sorted_run_k, 8192).status() ==
+    failures += expect(volume->create(blob_name_t {}, blob_kind_t::sorted_run_k, 8192) ==
                        status_code_t::invalid_argument_k);
     return failures;
 }
@@ -876,8 +874,7 @@ std::size_t router_places_by_free_space(fixture_type_& fixture) {
     failures += expect_status(router->find(wide.name()), status_code_t::not_found_k);
 
     // Nothing fits when every volume is asked for more than the largest of them holds.
-    failures += expect(router->optimal_volume(64ull * 1024ull * 1024ull).status() ==
-                       status_code_t::capacity_exhausted_k);
+    failures += expect(router->optimal_volume(64ull * 1024ull * 1024ull) == status_code_t::capacity_exhausted_k);
 
     std::array<std::size_t, volumes_k> placed {};
     std::array<blob_label_t, volumes_k> last {blob_label_t {0}, blob_label_t {0}, blob_label_t {0}};

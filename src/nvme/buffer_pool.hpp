@@ -98,10 +98,10 @@ class registered_memory_arena_t {
         if (arena.storage_.resize(bytes) != st::status_t::success_k)
             return status_t {status_code_t::out_of_memory_k, "An arena of that size does not fit"};
 
-        expected<registered_memory_t> pinned = disk.register_memory(std::span<byte_t> {arena.storage_},
-                                                                    memory_space_t::host_k);
-        if (!pinned) return pinned.status();
-        arena.registered_memory_ = std::move(*pinned);
+        auto [pinned, register_memory_status] = disk.register_memory(std::span<byte_t> {arena.storage_},
+                                                                     memory_space_t::host_k);
+        if (register_memory_status.failed()) return register_memory_status;
+        arena.registered_memory_ = std::move(pinned);
         return arena;
     }
 
