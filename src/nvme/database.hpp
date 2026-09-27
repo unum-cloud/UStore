@@ -1259,11 +1259,12 @@ class basic_database {
     /** How many catalogs have been published, which is what lets a caller memoize a lookup. */
     std::uint64_t mutable catalog_version_ = 0;
 
-    /** Readers counted into each published catalog, which a publication waits on before it retires one. */
-    std::array<readers_count_t, 2> mutable catalog_readers_ {0, 0};
+    /** Readers counted into each published catalog, which a publication waits on before it retires one; on a line of
+     *  their own, so counting in never evicts the live word every reader checks. */
+    alignas(fu::default_alignment_k) std::array<readers_count_t, 2> mutable catalog_readers_ {0, 0};
 
-    /** Zero while nobody is inside a collection, one while a caller is. */
-    claim_word_t mutable claim_ = 0;
+    /** Zero while nobody is inside a collection, one while a caller is, off the readers' line. */
+    alignas(fu::default_alignment_k) claim_word_t mutable claim_ = 0;
 
     /** The claim a staged transaction holds from its stage until its commit. */
     claim_guard_t write_claim_;

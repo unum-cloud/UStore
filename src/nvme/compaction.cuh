@@ -7,11 +7,12 @@
  *  A compaction reads the sorted run indexes of an upper LSM level and of the lower sorted runs it overlaps, keeps the
  *  newest key slot of every stored key, drops tombstones when it writes the bottom LSM level, and lays the survivors
  *  into sorted runs that fit their bounds, planning where every stored value moves. Both compactors share the rules
- *  below. A build with @c USTORE_USE_CUDA declares the device compactor for every compiler, its kernels compile under
+ *  below. A build with @c USTORE_WITH_CUDA declares the device compactor for every compiler, its kernels compile under
  *  nvcc alone, and @c compaction.cu instantiates its compaction for the engine's key slots, so a host TU calls it.
  */
 #pragma once
 
+#include <cassert> // `assert`
 #include <cstddef> // `std::byte`, `std::size_t`
 #include <cstdint> // `std::int64_t`, `std::uint32_t`, `std::uint64_t`
 
@@ -22,7 +23,7 @@
 #include <type_traits> // `std::is_trivially_copyable_v`
 #include <utility>     // `std::move`, `std::swap`
 
-#if USTORE_USE_CUDA && defined(__CUDACC__)
+#if defined(__CUDACC__)
 #include <cub/device/device_for.cuh>
 #include <cub/device/device_merge.cuh>
 #include <cub/device/device_merge_sort.cuh>
@@ -201,6 +202,8 @@ struct survivor_first_t {
 template <typename key_slot_type_>
 constexpr bool survives(located_key_slot<key_slot_type_> const* previous,
                         located_key_slot<key_slot_type_> const& current, compaction_kind_t kind) noexcept {
+    assert((previous == nullptr || !(current.key_slot.stored_key < previous->key_slot.stored_key)) &&
+           "survivors are flagged over a merge sorted by stored key");
     if (previous != nullptr && previous->key_slot.stored_key == current.key_slot.stored_key) return false;
     bool const drops_tombstones = (kind == compaction_kind_t::overlapping_into_bottom_k) |
                                   (kind == compaction_kind_t::sorted_into_bottom_k);
@@ -492,7 +495,7 @@ struct cpu_compactor_t {
 
 #pragma endregion Host
 
-#if USTORE_USE_CUDA
+#if USTORE_WITH_CUDA
 
 #pragma region Device
 
@@ -527,7 +530,7 @@ class gpu_compactor_t {
 
 } // namespace unum::ustore::nvme
 
-#if USTORE_USE_CUDA && defined(__CUDACC__)
+#if defined(__CUDACC__)
 
 namespace unum::ustore::nvme {
 

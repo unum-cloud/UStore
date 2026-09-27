@@ -8,6 +8,7 @@
  *  engines that refuse collections of their own. Strings carry explicit lengths throughout, so a zero
  *  byte inside one is stored and read back like any other.
  */
+#undef NDEBUG // ! A test's oracle must stay live in every build
 
 #include <cstddef> // `std::size_t`
 #include <cstdio>  // `stderr`
@@ -24,6 +25,7 @@
 #include "test.hpp" // `suite_exit_code`, `expect`, `expect_eq`
 
 using namespace unum::ustore;
+using namespace unum::ustore::test;
 using namespace unum;
 
 namespace {
@@ -518,14 +520,14 @@ int main(int argc, char** argv) {
     else fmt::println("Will work with default configuration");
     test_config_t const config {directory, options.engine_config};
 
-    report(totals, "strings.short_ordering", strings_short_ordering(config));
-    report(totals, "strings.prefix_scan", strings_prefix_scan(config));
-    report(totals, "strings.shared_prefix", strings_shared_prefix(config));
-    report(totals, "strings.empty_and_embedded_zero", strings_empty_and_embedded_zero(config));
-    report(totals, "strings.update_and_remove", strings_update_and_remove(config));
-    report(totals, "strings.bucket_growth", strings_bucket_growth(config));
-    report(totals, "strings.batched_bucket", strings_batched_bucket(config));
-    report(totals, "strings.scan_pagination", strings_scan_pagination(config));
+    report(totals, "strings.short_ordering", strings_short_ordering, config);
+    report(totals, "strings.prefix_scan", strings_prefix_scan, config);
+    report(totals, "strings.shared_prefix", strings_shared_prefix, config);
+    report(totals, "strings.empty_and_embedded_zero", strings_empty_and_embedded_zero, config);
+    report(totals, "strings.update_and_remove", strings_update_and_remove, config);
+    report(totals, "strings.bucket_growth", strings_bucket_growth, config);
+    report(totals, "strings.batched_bucket", strings_batched_bucket, config);
+    report(totals, "strings.scan_pagination", strings_scan_pagination, config);
 
     return suite_exit_code(totals);
 }

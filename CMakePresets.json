@@ -19,8 +19,8 @@
         "CMAKE_EXE_LINKER_FLAGS": "-fuse-ld=lld",
         "CMAKE_SHARED_LINKER_FLAGS": "-fuse-ld=lld",
         "CMAKE_OPTIMIZE_DEPENDENCIES": "ON",
-        "USTORE_USE_ROCKSDB": "ON",
-        "USTORE_USE_LEVELDB": "ON"
+        "USTORE_WITH_ROCKSDB": "ON",
+        "USTORE_WITH_LEVELDB": "ON"
       }
     },
     {
@@ -32,9 +32,9 @@
         "CMAKE_BUILD_TYPE": "Debug",
         "CMAKE_C_FLAGS_DEBUG": "-O0 -g -fsanitize=address,undefined -fsanitize-address-use-after-scope -fno-omit-frame-pointer",
         "CMAKE_CXX_FLAGS_DEBUG": "-O0 -g -fsanitize=address,undefined -fsanitize-address-use-after-scope -fno-omit-frame-pointer",
-        "USTORE_BUILD_TEST_CPP": "ON",
-        "USTORE_BUILD_BENCH_CPP": "OFF",
-        "USTORE_BUILD_TOOLS_CPP": "ON",
+        "USTORE_BUILD_TEST": "ON",
+        "USTORE_BUILD_BENCH": "OFF",
+        "USTORE_BUILD_TOOLS": "ON",
         "USTORE_BUILD_LIB_C": "ON"
       }
     },
@@ -47,9 +47,10 @@
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "CMAKE_C_FLAGS_RELWITHDEBINFO": "-O0 -g0 -DNDEBUG",
         "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O0 -g0 -DNDEBUG",
-        "USTORE_BUILD_TEST_CPP": "ON",
-        "USTORE_BUILD_BENCH_CPP": "ON",
-        "USTORE_BUILD_TOOLS_CPP": "ON",
+        "CMAKE_CUDA_FLAGS_RELWITHDEBINFO": "-O0 -Xptxas -O0 -DNDEBUG",
+        "USTORE_BUILD_TEST": "ON",
+        "USTORE_BUILD_BENCH": "ON",
+        "USTORE_BUILD_TOOLS": "ON",
         "USTORE_BUILD_LIB_C": "ON"
       }
     },
@@ -60,9 +61,9 @@
       "description": "Optimized, with full DWARF for stepping through the suites.",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
-        "USTORE_BUILD_TEST_CPP": "ON",
-        "USTORE_BUILD_BENCH_CPP": "OFF",
-        "USTORE_BUILD_TOOLS_CPP": "ON",
+        "USTORE_BUILD_TEST": "ON",
+        "USTORE_BUILD_BENCH": "OFF",
+        "USTORE_BUILD_TOOLS": "ON",
         "USTORE_BUILD_LIB_C": "ON"
       }
     },
@@ -73,9 +74,9 @@
       "description": "Libraries, suites, benchmarks and the CLI on every engine.",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "USTORE_BUILD_TEST_CPP": "ON",
-        "USTORE_BUILD_BENCH_CPP": "ON",
-        "USTORE_BUILD_TOOLS_CPP": "ON",
+        "USTORE_BUILD_TEST": "ON",
+        "USTORE_BUILD_BENCH": "ON",
+        "USTORE_BUILD_TOOLS": "ON",
         "USTORE_BUILD_LIB_C": "ON"
       }
     },
@@ -88,9 +89,9 @@
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "CMAKE_C_FLAGS_RELWITHDEBINFO": "-O3 -g -DNDEBUG",
         "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O3 -g -DNDEBUG",
-        "USTORE_BUILD_TEST_CPP": "OFF",
-        "USTORE_BUILD_BENCH_CPP": "ON",
-        "USTORE_BUILD_TOOLS_CPP": "OFF",
+        "USTORE_BUILD_TEST": "OFF",
+        "USTORE_BUILD_BENCH": "ON",
+        "USTORE_BUILD_TOOLS": "OFF",
         "USTORE_BUILD_LIB_C": "ON"
       }
     },
@@ -103,9 +104,9 @@
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "CMAKE_C_FLAGS_RELWITHDEBINFO": "-O1 -g -DNDEBUG -fsanitize=thread -fno-omit-frame-pointer",
         "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O1 -g -DNDEBUG -fsanitize=thread -fno-omit-frame-pointer",
-        "USTORE_BUILD_TEST_CPP": "ON",
-        "USTORE_BUILD_BENCH_CPP": "OFF",
-        "USTORE_BUILD_TOOLS_CPP": "OFF",
+        "USTORE_BUILD_TEST": "ON",
+        "USTORE_BUILD_BENCH": "OFF",
+        "USTORE_BUILD_TOOLS": "OFF",
         "USTORE_BUILD_LIB_C": "OFF"
       }
     },
@@ -118,10 +119,22 @@
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "CMAKE_C_FLAGS_RELWITHDEBINFO": "-O2 -gline-tables-only -DNDEBUG",
         "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O2 -gline-tables-only -DNDEBUG",
-        "USTORE_BUILD_TEST_CPP": "ON",
-        "USTORE_BUILD_BENCH_CPP": "ON",
-        "USTORE_BUILD_TOOLS_CPP": "ON",
+        "USTORE_BUILD_TEST": "ON",
+        "USTORE_BUILD_BENCH": "ON",
+        "USTORE_BUILD_TOOLS": "ON",
         "USTORE_BUILD_LIB_C": "ON"
+      }
+    },
+    {
+      "name": "cuda",
+      "inherits": "dev",
+      "displayName": "CUDA - the NVMe engine with GPU compaction",
+      "description": "The dev tree plus the NVMe engine and its CUDA compaction, compiled for the GPUs of this machine alone.",
+      "cacheVariables": {
+        "CMAKE_CUDA_FLAGS_RELWITHDEBINFO": "-O2 -lineinfo -DNDEBUG",
+        "USTORE_BUILD_NVME": "ON",
+        "USTORE_BUILD_CUDA": "ON",
+        "USTORE_CUDA_ARCHITECTURES": "native"
       }
     },
     {
@@ -171,6 +184,11 @@
       "jobs": 0
     },
     {
+      "name": "cuda",
+      "configurePreset": "cuda",
+      "jobs": 0
+    },
+    {
       "name": "trace",
       "configurePreset": "trace",
       "jobs": 0
@@ -184,7 +202,8 @@
         "outputOnFailure": true
       },
       "execution": {
-        "stopOnFailure": true
+        "noTestsAction": "error",
+        "timeout": 900
       }
     },
     {
@@ -218,6 +237,11 @@
       "name": "dev",
       "inherits": "base",
       "configurePreset": "dev"
+    },
+    {
+      "name": "cuda",
+      "inherits": "base",
+      "configurePreset": "cuda"
     }
   ],
   "workflowPresets": [

@@ -9,6 +9,7 @@
  *  is the failure a mapped index could never report. The rest holds the layout to a byte-for-byte
  *  round trip at both ends of the value sizes it admits.
  */
+#undef NDEBUG // ! A test's oracle must stay live in every build
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint64_t`
@@ -27,7 +28,7 @@
 
 #include "nvme_fixture.hpp" // `basic_fixture`, `run_on_transport`, `painted`
 
-namespace unum::ustore {
+namespace unum::ustore::test {
 
 using namespace unum::ustore::nvme;
 
@@ -830,10 +831,11 @@ std::size_t batched_read_holds_its_depth(mount_type_ const& mount) {
 
 #pragma endregion Depth Cases
 
-} // namespace unum::ustore
+} // namespace unum::ustore::test
 
 int main(int argc, char const* argv[]) {
     using namespace unum::ustore;
+    using namespace unum::ustore::test;
 
     suite_options_t options;
     if (argument_status_t const status = parse_suite_options(argc, argv, options);
@@ -849,16 +851,16 @@ int main(int argc, char const* argv[]) {
     test_environment_t const environment = test_environment_t::of(options, *directory);
 
     auto const cases = [&](auto const& mount) {
-        report(totals, mount.label("reads_back_every_value").c_str(), run_reads_back_every_value(mount));
-        report(totals, mount.label("fixed_width_reads_back").c_str(), fixed_width_run_reads_back(mount));
-        report(totals, mount.label("inline_needs_no_reads").c_str(), inline_run_needs_no_reads(mount));
-        report(totals, mount.label("truncated_index").c_str(), truncated_index_is_malformed(mount));
-        report(totals, mount.label("missing_is_not_found").c_str(), missing_run_is_not_found(mount));
-        report(totals, mount.label("point_lookup").c_str(), point_lookup_finds_and_misses(mount));
-        report(totals, mount.label("smallest_sizes").c_str(), runs_at_the_smallest_sizes(mount));
-        report(totals, mount.label("value_size_extremes").c_str(), values_at_the_size_extremes(mount));
-        report(totals, mount.label("tombstones").c_str(), tombstones_read_back_as_tombstones(mount));
-        report(totals, mount.label("holds_its_depth").c_str(), batched_read_holds_its_depth(mount));
+        report(totals, mount, "reads_back_every_value", run_reads_back_every_value);
+        report(totals, mount, "fixed_width_reads_back", fixed_width_run_reads_back);
+        report(totals, mount, "inline_needs_no_reads", inline_run_needs_no_reads);
+        report(totals, mount, "truncated_index", truncated_index_is_malformed);
+        report(totals, mount, "missing_is_not_found", missing_run_is_not_found);
+        report(totals, mount, "point_lookup", point_lookup_finds_and_misses);
+        report(totals, mount, "smallest_sizes", runs_at_the_smallest_sizes);
+        report(totals, mount, "value_size_extremes", values_at_the_size_extremes);
+        report(totals, mount, "tombstones", tombstones_read_back_as_tombstones);
+        report(totals, mount, "holds_its_depth", batched_read_holds_its_depth);
     };
     for (transport_t const transport : every_transport_k)
         run_on_transport(totals, transport, environment, run_config_k, 1, "run", cases);

@@ -8,6 +8,7 @@
  *  queue pair's depth through the middle of a long run, since a batch that is submitted whole and waited
  *  on reaches the depth of that batch and no further, which is the defect the pipelines replace.
  */
+#undef NDEBUG // ! A test's oracle must stay live in every build
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint64_t`
@@ -27,7 +28,7 @@
 
 #include "nvme_fixture.hpp" // `basic_fixture`, `run_on_transport`
 
-namespace unum::ustore {
+namespace unum::ustore::test {
 
 using namespace unum::ustore::nvme;
 
@@ -476,10 +477,11 @@ std::size_t pipeline_reports_a_partial_read(mount_type_ const& mount) {
 
 #pragma endregion Pipeline Cases
 
-} // namespace unum::ustore
+} // namespace unum::ustore::test
 
 int main(int argc, char const* argv[]) {
     using namespace unum::ustore;
+    using namespace unum::ustore::test;
 
     suite_options_t options;
     if (argument_status_t const status = parse_suite_options(argc, argv, options);
@@ -495,16 +497,16 @@ int main(int argc, char const* argv[]) {
     test_environment_t const environment = test_environment_t::of(options, *directory);
 
     auto const cases = [&](auto const& mount) {
-        report(totals, mount.label("arena_charges_once").c_str(), arena_charges_its_budget_once(mount));
-        report(totals, mount.label("pool_exhausts_and_recycles").c_str(), pool_exhausts_and_recycles(mount));
-        report(totals, mount.label("pool_recycles_exactly_once").c_str(), pool_recycles_exactly_once(mount));
-        report(totals, mount.label("separate_threads").c_str(), channels_separate_executor_threads(mount));
-        report(totals, mount.label("refuse_beyond_spares").c_str(), channels_refuse_beyond_their_spares(mount));
-        report(totals, mount.label("spare_stays_with_thread").c_str(), spare_channel_stays_with_its_thread(mount));
-        report(totals, mount.label("pipeline_reads_back").c_str(), pipeline_reads_back_what_it_wrote(mount));
-        report(totals, mount.label("pipeline_holds_its_depth").c_str(), pipeline_holds_its_depth(mount));
-        report(totals, mount.label("pipeline_refuses_short_write").c_str(), pipeline_refuses_a_short_write(mount));
-        report(totals, mount.label("pipeline_partial_read").c_str(), pipeline_reports_a_partial_read(mount));
+        report(totals, mount, "arena_charges_once", arena_charges_its_budget_once);
+        report(totals, mount, "pool_exhausts_and_recycles", pool_exhausts_and_recycles);
+        report(totals, mount, "pool_recycles_exactly_once", pool_recycles_exactly_once);
+        report(totals, mount, "separate_threads", channels_separate_executor_threads);
+        report(totals, mount, "refuse_beyond_spares", channels_refuse_beyond_their_spares);
+        report(totals, mount, "spare_stays_with_thread", spare_channel_stays_with_its_thread);
+        report(totals, mount, "pipeline_reads_back", pipeline_reads_back_what_it_wrote);
+        report(totals, mount, "pipeline_holds_its_depth", pipeline_holds_its_depth);
+        report(totals, mount, "pipeline_refuses_short_write", pipeline_refuses_a_short_write);
+        report(totals, mount, "pipeline_partial_read", pipeline_reports_a_partial_read);
     };
     for (transport_t const transport : every_transport_k)
         run_on_transport(totals, transport, environment, channels_config_k, 1, "channels", cases);

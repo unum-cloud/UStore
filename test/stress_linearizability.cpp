@@ -4,6 +4,7 @@
  *  @date January 9, 2023
  *  @brief Stress test that concurrent write transactions replay, in commit order, to the state the database holds.
  */
+#undef NDEBUG // ! A test's oracle must stay live in every build
 
 #include <cstddef>      // `std::size_t`
 #include <cstdint>      // `std::uint8_t`, `std::uint32_t`
@@ -30,6 +31,7 @@
 #include "test.hpp"     // `suite_exit_code`, `expect`, `expect_eq`
 
 using namespace unum::ustore;
+using namespace unum::ustore::test;
 using namespace unum;
 
 /** Workload of the suite, each field set by the flag of the same name. */
@@ -366,6 +368,7 @@ void linear_writes_on_threads(suite_totals_t& totals, linearizability_run_t& run
         auto const written = fmt::format_to_n(name, sizeof(name) - 1, "linear_writes.threads_{}.between_{}", threads,
                                               transactions);
         *written.out = '\0';
+        if (!totals.selects(name)) continue;
         std::size_t failures = expect(maybe_executor);
         if (!failures) failures += reopen_run(run);
         if (!failures) failures += linear_writes_mixes(run, *maybe_executor, options, threads, transactions, slice);

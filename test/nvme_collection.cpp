@@ -9,6 +9,7 @@
  *  batch a caller handed it, and a snapshot must keep answering the level set it was taken from while
  *  another thread publishes over it.
  */
+#undef NDEBUG // ! A test's oracle must stay live in every build
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint64_t`
@@ -29,7 +30,7 @@
 
 #include "nvme_fixture.hpp" // `basic_fixture`, `run_on_transport`, `expectation_t`, `painted`
 
-namespace unum::ustore {
+namespace unum::ustore::test {
 
 using namespace unum::ustore::nvme;
 
@@ -953,10 +954,11 @@ std::size_t scan_visits_every_key_in_order(mount_type_ const& mount) {
 
 #pragma endregion Scan Cases
 
-} // namespace unum::ustore
+} // namespace unum::ustore::test
 
 int main(int argc, char const* argv[]) {
     using namespace unum::ustore;
+    using namespace unum::ustore::test;
 
     suite_options_t options;
     if (argument_status_t const status = parse_suite_options(argc, argv, options);
@@ -971,18 +973,18 @@ int main(int argc, char const* argv[]) {
     }
     test_environment_t const environment = test_environment_t::of(options, *directory);
 
-    report(totals, "collection.value_cache", value_cache_holds_what_it_took());
+    report(totals, "collection.value_cache", value_cache_holds_what_it_took);
     auto const cases = [&](auto const& mount) {
-        report(totals, mount.label("mixed_widths_round_trip").c_str(), mixed_widths_round_trip(mount));
-        report(totals, mount.label("every_layout").c_str(), every_layout_round_trips(mount));
-        report(totals, mount.label("misses_and_tombstones").c_str(), misses_and_tombstones(mount));
-        report(totals, mount.label("buffer_before_tree").c_str(), write_buffer_answers_before_the_tree(mount));
-        report(totals, mount.label("full_buffer_flushes").c_str(), full_write_buffer_flushes_itself(mount));
-        report(totals, mount.label("unaligned_exact_span").c_str(), unaligned_exact_span_is_taken(mount));
-        report(totals, mount.label("widest_and_empty").c_str(), widest_and_empty_values(mount));
-        report(totals, mount.label("holds_its_depth").c_str(), batched_select_holds_its_depth(mount));
-        report(totals, mount.label("snapshot_holds_its_moment").c_str(), snapshot_holds_its_moment(mount));
-        report(totals, mount.label("scan_in_order").c_str(), scan_visits_every_key_in_order(mount));
+        report(totals, mount, "mixed_widths_round_trip", mixed_widths_round_trip);
+        report(totals, mount, "every_layout", every_layout_round_trips);
+        report(totals, mount, "misses_and_tombstones", misses_and_tombstones);
+        report(totals, mount, "buffer_before_tree", write_buffer_answers_before_the_tree);
+        report(totals, mount, "full_buffer_flushes", full_write_buffer_flushes_itself);
+        report(totals, mount, "unaligned_exact_span", unaligned_exact_span_is_taken);
+        report(totals, mount, "widest_and_empty", widest_and_empty_values);
+        report(totals, mount, "holds_its_depth", batched_select_holds_its_depth);
+        report(totals, mount, "snapshot_holds_its_moment", snapshot_holds_its_moment);
+        report(totals, mount, "scan_in_order", scan_visits_every_key_in_order);
     };
     for (transport_t const transport : every_transport_k)
         run_on_transport(totals, transport, environment, collection_config_k, 1, "collection", cases);

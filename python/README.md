@@ -16,8 +16,8 @@ The wheel compiles the in-memory engine alone by default.
 RocksDB and LevelDB are enabled through the standard `CMAKE_ARGS` or through scikit-build config settings, never through variables of UStore's own:
 
 ```sh
-CMAKE_ARGS="-DUSTORE_USE_ROCKSDB=ON -DUSTORE_USE_LEVELDB=ON" pip install .
-pip install . --config-settings=cmake.define.USTORE_USE_ROCKSDB=ON
+CMAKE_ARGS="-DUSTORE_WITH_ROCKSDB=ON -DUSTORE_WITH_LEVELDB=ON" pip install .
+pip install . --config-settings=cmake.define.USTORE_WITH_ROCKSDB=ON
 ```
 
 `cibuildwheel` builds wheels for CPython 3.12, 3.13 and 3.14, and for the free-threaded 3.14t, where importing `ustore` keeps the GIL disabled.

@@ -4,6 +4,7 @@
  *  @date July 10, 2023
  *  @brief Tests adding, removing, merging, copying and moving stored values in the write buffer.
  */
+#undef NDEBUG // ! A test's oracle must stay live in every build
 
 #include <algorithm>
 #include <array>
@@ -13,6 +14,7 @@
 #include "nvme/write_buffer.hpp" // `write_buffer`, `write_buffer_status_t`
 
 using namespace unum::ustore;
+using namespace unum::ustore::test;
 using namespace unum::ustore::nvme;
 using namespace unum;
 
@@ -61,7 +63,7 @@ std::size_t ensure_all_resources_are_freed() {
     std::size_t failures = 0;
     // All taken resources must be returned
     failures += expect(resources->memory_constraint.used() == 0);
-#if USTORE_USE_CUDA
+#if USTORE_WITH_CUDA
     failures += expect(resources->gpu_memory_constraint.used() == 0);
 #endif
     return failures;
@@ -434,22 +436,22 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-#if USTORE_USE_CUDA
+#if USTORE_WITH_CUDA
     resources = std::make_shared<resources_t>(40'000'000, 0);
 #else
     resources = std::make_shared<resources_t>(40'000'000);
 #endif
     prepare_initial_data(options);
 
-    report(totals, "cache_initial_state", cache_initial_state(options));
-    report(totals, "cache_insertions", cache_insertions(options));
-    report(totals, "cache_removals", cache_removals(options));
-    report(totals, "cache_mixed_insertions_and_removals", cache_mixed_insertions_and_removals(options));
-    report(totals, "cache_test_overload", cache_test_overload(options));
-    report(totals, "cache_test_batch", cache_test_batch(options));
-    report(totals, "cache_test_batch_overload", cache_test_batch_overload(options));
-    report(totals, "cache_copy", cache_copy(options));
-    report(totals, "cache_move", cache_move(options));
+    report(totals, "cache_initial_state", cache_initial_state, options);
+    report(totals, "cache_insertions", cache_insertions, options);
+    report(totals, "cache_removals", cache_removals, options);
+    report(totals, "cache_mixed_insertions_and_removals", cache_mixed_insertions_and_removals, options);
+    report(totals, "cache_test_overload", cache_test_overload, options);
+    report(totals, "cache_test_batch", cache_test_batch, options);
+    report(totals, "cache_test_batch_overload", cache_test_batch_overload, options);
+    report(totals, "cache_copy", cache_copy, options);
+    report(totals, "cache_move", cache_move, options);
 
     return suite_exit_code(totals);
 }

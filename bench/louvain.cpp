@@ -37,7 +37,7 @@
 
 #include "arguments.hpp"
 
-namespace unum::ustore {
+namespace unum::ustore::bench {
 
 namespace bm = benchmark;
 
@@ -131,7 +131,7 @@ status_t read_edge_list(char const* path, std::size_t max_edges, st::basic_vecto
     if (descriptor == -1) return {status_code_t::input_output_k, "Failed to open the edge list"};
 
     struct stat metadata {};
-    sz::string text;
+    sz::string_t text;
     bool loaded = fstat(descriptor, &metadata) == 0 && text.try_resize(static_cast<std::size_t>(metadata.st_size));
     std::size_t filled = 0;
     while (loaded && filled != text.size()) {
@@ -142,7 +142,7 @@ status_t read_edge_list(char const* path, std::size_t max_edges, st::basic_vecto
     [[maybe_unused]] int const closed = close(descriptor);
     if (!loaded && text.size() != 0) return {status_code_t::input_output_k, "Failed to read the edge list"};
 
-    for (sz::string_view line : sz::split(text.view(), "\n")) {
+    for (sz::string_view_t line : sz::split(text.view(), "\n")) {
         if (edges.size() == max_edges) break;
         std::string_view trimmed = line;
         while (!trimmed.empty() && (trimmed.back() == '\r' || trimmed.back() == ' ')) trimmed.remove_suffix(1);
@@ -647,10 +647,11 @@ void bench_louvain_over_ustore(bm::State& state, graph_collection_t& graph, sett
 
 #pragma endregion Benchmarks
 
-} // namespace unum::ustore
+} // namespace unum::ustore::bench
 
 int main(int argc, char** argv) {
     using namespace unum::ustore;
+    using namespace unum::ustore::bench;
 
     settings_t settings;
     std::array<flag_t, 11> const flags {{
@@ -717,7 +718,7 @@ int main(int argc, char** argv) {
     adjacency_graph_t memory_graph = *std::move(maybe_memory_graph);
     fmt::println("Graph: {} vertices, {} edges", memory_graph.vertices_count(), edges.size());
 
-    sz::string config;
+    sz::string_t config;
     if (!settings.directory.empty() &&
         (!config.try_append(R"({"version": "1.0", "directory": ")") ||
          !config.try_append(settings.directory.data(), settings.directory.size()) || !config.try_append(R"("})"))) {

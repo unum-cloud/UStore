@@ -4,6 +4,7 @@
  *  @date January 9, 2023
  *  @brief Unit tests of the blobs, documents and graph modalities through the C++ wrappers.
  */
+#undef NDEBUG // ! A test's oracle must stay live in every build
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::int32_t`, `std::uint32_t`, `std::uint64_t`
@@ -28,6 +29,7 @@
 #include "test.hpp"     // `suite_exit_code`, `expect`, `expect_eq`
 
 using namespace unum::ustore;
+using namespace unum::ustore::test;
 using namespace unum;
 
 #pragma region JSON
@@ -1826,48 +1828,48 @@ int main(int argc, char** argv) {
     else fmt::println("Will work with default configuration");
     test_config_t const config {directory, options.engine_config};
 
-    report(totals, "database.open_clear_close", database_open_clear_close(config));
-    report(totals, "database.clear_by_clearing_db", database_clear_collection_by_clearing_database(config));
-    report(totals, "database.overwrite_with_step", database_overwrite_with_step(config));
-    report(totals, "database.persistency",
-           directory ? case_result_t {database_persistency(config)} : case_result_t::skipped(needs_directory_k));
-    report(totals, "database.named_collections", database_named_collections(config));
-    report(totals, "database.named_collections_list", database_named_collections_list(config));
-    report(totals, "database.clear_values", database_clear_values(config));
-    report(totals, "database.presences", database_presences(config));
-    report(totals, "database.scan", database_scan(config));
-    report(totals, "database.batch_scan", database_batch_scan(config));
-    report(totals, "database.transaction_read_committed", database_transaction_read_committed(config));
-    report(totals, "database.snapshot_isolation", database_transaction_snapshot_isolation(config));
-    report(totals, "database.snapshots_list", database_snapshots_list(config));
-    report(totals, "database.transaction_with_snapshot", database_transaction_with_snapshot(config));
-    report(totals, "database.set_wrong_snapshot", database_set_wrong_snapshot(config));
-    report(totals, "database.export_snapshot",
-           directory ? database_export_snapshot(config) : case_result_t::skipped(needs_directory_k));
-    report(totals, "database.snapshot_with_threads", database_snapshot_with_threads(config));
-    report(totals, "database.erase_missing", database_transaction_erase_missing(config));
-    report(totals, "database.write_conflicting", database_transaction_write_conflicting(config));
-    report(totals, "database.sequenced_commit", database_transaction_sequenced_commit(config));
+    report(totals, "database.open_clear_close", database_open_clear_close, config);
+    report(totals, "database.clear_by_clearing_db", database_clear_collection_by_clearing_database, config);
+    report(totals, "database.overwrite_with_step", database_overwrite_with_step, config);
+    if (directory) report(totals, "database.persistency", database_persistency, config);
+    else report(totals, "database.persistency", case_result_t::skipped(needs_directory_k));
+    report(totals, "database.named_collections", database_named_collections, config);
+    report(totals, "database.named_collections_list", database_named_collections_list, config);
+    report(totals, "database.clear_values", database_clear_values, config);
+    report(totals, "database.presences", database_presences, config);
+    report(totals, "database.scan", database_scan, config);
+    report(totals, "database.batch_scan", database_batch_scan, config);
+    report(totals, "database.transaction_read_committed", database_transaction_read_committed, config);
+    report(totals, "database.snapshot_isolation", database_transaction_snapshot_isolation, config);
+    report(totals, "database.snapshots_list", database_snapshots_list, config);
+    report(totals, "database.transaction_with_snapshot", database_transaction_with_snapshot, config);
+    report(totals, "database.set_wrong_snapshot", database_set_wrong_snapshot, config);
+    if (directory) report(totals, "database.export_snapshot", database_export_snapshot, config);
+    else report(totals, "database.export_snapshot", case_result_t::skipped(needs_directory_k));
+    report(totals, "database.snapshot_with_threads", database_snapshot_with_threads, config);
+    report(totals, "database.erase_missing", database_transaction_erase_missing, config);
+    report(totals, "database.write_conflicting", database_transaction_write_conflicting, config);
+    report(totals, "database.sequenced_commit", database_transaction_sequenced_commit, config);
 
-    report(totals, "database.docs_flat", database_docs_flat(config));
-    report(totals, "database.docs_nested_batch", database_docs_nested_batch(config));
-    report(totals, "database.docs_modify", database_docs_modify(config));
-    report(totals, "database.docs_merge_and_patch", database_docs_merge_and_patch(config));
-    report(totals, "database.docs_table", database_docs_table(config));
+    report(totals, "database.docs_flat", database_docs_flat, config);
+    report(totals, "database.docs_nested_batch", database_docs_nested_batch, config);
+    report(totals, "database.docs_modify", database_docs_modify, config);
+    report(totals, "database.docs_merge_and_patch", database_docs_merge_and_patch, config);
+    report(totals, "database.docs_table", database_docs_table, config);
 
-    report(totals, "database.graph_upsert_vertices", database_graph_upsert_vertices(config));
-    report(totals, "database.graph_upsert_edge", database_graph_upsert_edge(config));
-    report(totals, "database.graph_triangle", database_graph_triangle(config));
-    report(totals, "database.graph_triangle_batch", database_graph_triangle_batch(config));
-    report(totals, "database.graph_transaction_watch", database_graph_transaction_watch(config));
-    report(totals, "database.graph_random_fill", database_graph_random_fill(config));
-    report(totals, "database.graph_conflicts", database_graph_conflicting_transactions(config));
-    report(totals, "database.graph_layering_shapes", database_graph_layering_shapes(config));
-    report(totals, "database.graph_remove_vertices", database_graph_remove_vertices(config));
-    report(totals, "database.graph_remove_edges", database_graph_remove_edges_keep_vertices(config));
-    report(totals, "database.graph_get_vertex_edges", database_graph_get_vertex_edges(config));
-    report(totals, "database.graph_degrees", database_graph_degrees(config));
-    report(totals, "database.graph_neighbors", database_graph_neighbors(config));
+    report(totals, "database.graph_upsert_vertices", database_graph_upsert_vertices, config);
+    report(totals, "database.graph_upsert_edge", database_graph_upsert_edge, config);
+    report(totals, "database.graph_triangle", database_graph_triangle, config);
+    report(totals, "database.graph_triangle_batch", database_graph_triangle_batch, config);
+    report(totals, "database.graph_transaction_watch", database_graph_transaction_watch, config);
+    report(totals, "database.graph_random_fill", database_graph_random_fill, config);
+    report(totals, "database.graph_conflicts", database_graph_conflicting_transactions, config);
+    report(totals, "database.graph_layering_shapes", database_graph_layering_shapes, config);
+    report(totals, "database.graph_remove_vertices", database_graph_remove_vertices, config);
+    report(totals, "database.graph_remove_edges", database_graph_remove_edges_keep_vertices, config);
+    report(totals, "database.graph_get_vertex_edges", database_graph_get_vertex_edges, config);
+    report(totals, "database.graph_degrees", database_graph_degrees, config);
+    report(totals, "database.graph_neighbors", database_graph_neighbors, config);
 
     return suite_exit_code(totals);
 }

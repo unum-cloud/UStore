@@ -8,6 +8,7 @@
  *  as skipped. LSM levels are generated from a seed, with overlapping and sorted sorted runs, tombstones, and keys
  *  crowded at the edges a comparator gets wrong.
  */
+#undef NDEBUG // ! A test's oracle must stay live in every build
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint8_t`, `std::uint32_t`, `std::uint64_t`
@@ -32,6 +33,7 @@
 #include "nvme/compaction.cuh" // `admits_sorted_runs`, `compacted_sorted_run_t`, `compaction_kind_t`
 
 using namespace unum::ustore;
+using namespace unum::ustore::test;
 using namespace unum::ustore::nvme;
 using st::basic_vector;
 
@@ -1012,6 +1014,7 @@ std::size_t report_compaction(suite_totals_t& totals, char const* host_name, cha
                               compaction_kind_t kind, sorted_run_bounds_t const& bounds,
                               test_lsm_level<key_slot_type_> const& upper,
                               test_lsm_level<key_slot_type_> const& lower) {
+    if (!totals.selects(host_name) && !totals.selects(gpu_name)) return 0;
     std::size_t failures = 0;
     basic_vector<located_key_slot<key_slot_type_>> survivors;
     st::status_t status = reference_survivors(kind, upper, lower, survivors);
@@ -1023,7 +1026,7 @@ std::size_t report_compaction(suite_totals_t& totals, char const* host_name, cha
     failures += expect(status == st::status_t::success_k);
     if (status == st::status_t::success_k) failures += check_compaction(kind, bounds, survivors, host);
     std::size_t const host_failures = report(totals, host_name, failures);
-    return host_failures + report(totals, gpu_name, gpu_case(kind, bounds, upper, lower, host));
+    return host_failures + report(totals, gpu_name, gpu_case<key_slot_type_>, kind, bounds, upper, lower, host);
 }
 
 /** Generates the LSM levels of @p scenario for one key slot shape, then checks the host compaction and the GPU one. */
@@ -1273,12 +1276,12 @@ int main(int argc, char** argv) {
     options.random = suite.random();
     suite_totals_t totals = suite.totals();
 
-    report(totals, "compaction.uuid_orders_like_memcmp", uuid_orders_like_memcmp(options));
-    report(totals, "compaction.sorted_run_index_layout_matches_builder", sorted_run_index_layout_matches_builder());
-    report(totals, "compaction.survivor_first_orders_the_survivor_first", survivor_first_orders_the_survivor_first());
-    report(totals, "compaction.survives_follows_the_kind", survives_follows_the_kind());
-    report(totals, "compaction.plan_sorted_runs_cuts_at_the_bounds", plan_sorted_runs_cuts_at_the_bounds());
-    report(totals, "cuda.devices_round_trip", cuda_devices_round_trip());
+    report(totals, "compaction.uuid_orders_like_memcmp", uuid_orders_like_memcmp, options);
+    report(totals, "compaction.sorted_run_index_layout_matches_builder", sorted_run_index_layout_matches_builder);
+    report(totals, "compaction.survivor_first_orders_the_survivor_first", survivor_first_orders_the_survivor_first);
+    report(totals, "compaction.survives_follows_the_kind", survives_follows_the_kind);
+    report(totals, "compaction.plan_sorted_runs_cuts_at_the_bounds", plan_sorted_runs_cuts_at_the_bounds);
+    report(totals, "cuda.devices_round_trip", cuda_devices_round_trip);
     for (std::size_t index = 0; index != handmade_cases_k.size(); ++index) {
         handmade_case_t const& handmade = handmade_cases_k[index];
         run_handmade_case<inline_key_slot<std::uint64_t>>(totals, "inline_u64", index, handmade, options);

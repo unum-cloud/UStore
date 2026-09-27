@@ -8,6 +8,7 @@
  *  A transaction spanning two collections must never be seen half applied by a reader running beside
  *  it, and several threads racing over the same keys must leave a state one serial order explains.
  */
+#undef NDEBUG // ! A test's oracle must stay live in every build
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint64_t`
@@ -33,7 +34,7 @@
 
 #include "nvme_fixture.hpp" // `basic_fixture`, `run_on_transport`, `painted`
 
-namespace unum::ustore {
+namespace unum::ustore::test {
 
 using namespace unum::ustore::nvme;
 
@@ -1208,10 +1209,11 @@ std::size_t lookups_outrun_the_write_path(mount_type_ const& mount) {
 
 #pragma endregion Transaction Cases
 
-} // namespace unum::ustore
+} // namespace unum::ustore::test
 
 int main(int argc, char const* argv[]) {
     using namespace unum::ustore;
+    using namespace unum::ustore::test;
 
     suite_options_t options;
     if (argument_status_t const status = parse_suite_options(argc, argv, options);
@@ -1227,18 +1229,17 @@ int main(int argc, char const* argv[]) {
     test_environment_t const environment = test_environment_t::of(options, *directory);
 
     auto const cases = [&](auto const& mount) {
-        report(totals, mount.label("named_collections").c_str(), named_collections_round_trip(mount));
-        report(totals, mount.label("catalog_survives_reopen").c_str(), catalog_survives_reopen(mount));
-        report(totals, mount.label("dropped_collection_is_gone").c_str(), dropped_collection_is_gone(mount));
-        report(totals, mount.label("crash_before_schema").c_str(), crash_between_seal_and_schema(mount));
-        report(totals, mount.label("user_data").c_str(), user_data_round_trips(mount));
-        report(totals, mount.label("commit_is_all_or_nothing").c_str(), commit_is_all_or_nothing(mount));
-        report(totals, mount.label("conflict_spares_the_other").c_str(),
-               conflict_leaves_the_other_collection_untouched(mount));
-        report(totals, mount.label("rollback_and_renew").c_str(), rollback_and_renew_behave(mount));
-        report(totals, mount.label("snapshot_holds_its_moment").c_str(), snapshot_holds_its_moment(mount));
-        report(totals, mount.label("threads_commit_serializably").c_str(), threads_commit_serializably(mount));
-        report(totals, mount.label("lookups_outrun_the_write_path").c_str(), lookups_outrun_the_write_path(mount));
+        report(totals, mount, "named_collections", named_collections_round_trip);
+        report(totals, mount, "catalog_survives_reopen", catalog_survives_reopen);
+        report(totals, mount, "dropped_collection_is_gone", dropped_collection_is_gone);
+        report(totals, mount, "crash_before_schema", crash_between_seal_and_schema);
+        report(totals, mount, "user_data", user_data_round_trips);
+        report(totals, mount, "commit_is_all_or_nothing", commit_is_all_or_nothing);
+        report(totals, mount, "conflict_spares_the_other", conflict_leaves_the_other_collection_untouched);
+        report(totals, mount, "rollback_and_renew", rollback_and_renew_behave);
+        report(totals, mount, "snapshot_holds_its_moment", snapshot_holds_its_moment);
+        report(totals, mount, "threads_commit_serializably", threads_commit_serializably);
+        report(totals, mount, "lookups_outrun_the_write_path", lookups_outrun_the_write_path);
     };
     for (transport_t const transport : every_transport_k)
         run_on_transport(totals, transport, environment, database_config_k, 1, "database", cases);

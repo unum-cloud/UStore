@@ -208,6 +208,18 @@ check_doxygen_glued() {
         "            never \`(@c foo)\`; a highlighter only sees a command that follows whitespace:"
 }
 
+# Doxygen text aligned into columns by hand - `@brief  Text`, `@param[in] a     Text` - drifts out of
+# line with the first edit to a neighbor, so one space follows a command and one the name it documents.
+check_doxygen_columns_unaligned() {
+    local aligned
+    aligned=$(printf '%s\n' "$added" | grep -E '^\+[[:space:]]*(/\*\*|\*([[:space:]]|$)|//)' | grep -E \
+        '@(file|author|date|brief|param|tparam|returns?|retval|note|warning|details|pre|post|sa|see|ref|c|p|b)(\[[a-z,]+\])?  +[^[:space:]]|@(t?param(\[[a-z,]+\])?|retval) +[A-Za-z_][A-Za-z0-9_.]*  +[^[:space:]]' ||
+        true)
+    [ -z "$aligned" ] || fail "$aligned" \
+        "$file aligns Doxygen text into columns by hand - write \`@param[in] count Rows to read\`," \
+        "            one space after the command and one after the name it documents:"
+}
+
 # An `@section` line reads as a heading only when air surrounds it: the comment lines directly
 # above and below must be empty (`*` alone). Spacing is context, not a line, so this reads the
 # whole staged file and reports only the headings the commit itself added.
@@ -460,6 +472,18 @@ check_docblock_brackets() {
     [ -z "$shape" ] || fail "$shape" \
         "$file mismatches a docblock's brackets to its content - prose opens on the /** and closes" \
         "            on its last line, a tagged block takes dedicated /** and */ lines:"
+}
+
+# A header's @date is when the file was created, not when it was last touched: git records every edit
+# since, and the header keeps the one fact git cannot show without archaeology.
+check_header_date() {
+    local rewritten
+    rewritten=$(git diff --cached --unified=0 -- "$file" | awk '
+        /^-[^-].*@date/ { value = $0; sub(/^.*@date[[:space:]]+/, "", value); removed[value] = $0 }
+        /^\+[^+].*@date/ { value = $0; sub(/^.*@date[[:space:]]+/, "", value); added[value] = 1 }
+        END { for (value in removed) if (!(value in added)) print removed[value] }' || true)
+    [ -z "$rewritten" ] || fail "$rewritten" \
+        "$file rewrites the @date in its header - that is the creation date, and git holds the edits:"
 }
 
 # Member documentation is Doxygen: a bare `//` line directly above a declaration (a member or a type)
@@ -799,24 +823,96 @@ check_annotate_release_before_unlock() {
 
 # endregion Concurrency and Atomics
 
+# region Tests and Verification
+
+# A test's oracle is the `expect` family from test/test.hpp, never `assert`, which compiles out wherever
+# NDEBUG is defined and, where it is not, aborts the whole run instead of counting one failure.
+check_test_oracle_never_compiled_out() {
+    local asserts
+    asserts=$(printf '%s\n' "$added" | grep -vE '^\+[[:space:]]*(\*|//|/\*)' |
+        grep -E '(^|[^A-Za-z0-9_])assert[[:space:]]*\(' || true)
+    [ -z "$asserts" ] || fail "$asserts" \
+        "$file asserts in a test - write \`failures += expect_eq(count, 3);\` from test/test.hpp," \
+        "            which counts the failure and never compiles out:"
+}
+
+# A test translation unit undefines NDEBUG before its first include, so the asserts inside the code under
+# test stay live in the Release builds too. Order is context, so this reads the whole staged file.
+check_test_undefines_ndebug() {
+    local opening
+    opening=$(git show ":$file" | awk -v wanted="#undef NDEBUG // ! A test's oracle must stay live in every build" '
+        in_comment { if ($0 ~ /\*\//) in_comment = 0; next }
+        /^[[:space:]]*\/\*/ { if ($0 !~ /\*\//) in_comment = 1; next }
+        /^[[:space:]]*(\/\/|$)/ { next }
+        { if ($0 != wanted) printf "line %d: %s\n", NR, $0; exit }')
+    [ -z "$opening" ] || fail "$opening" \
+        "$file does not open with \`#undef NDEBUG // ! A test's oracle must stay live in every build\` -" \
+        "            put it on the line below the file docblock, before the first #include:"
+}
+
+# A verification model, client or note cites a symbol and its file, never `<file>.<ext>:<line>`, since a
+# line number drifts with every edit above it.
+check_verification_cites_symbols() {
+    local pinned
+    pinned=$(printf '%s\n' "$added" | grep -E '[A-Za-z0-9_]\.[A-Za-z]+:[0-9]' || true)
+    [ -z "$pinned" ] || fail "$pinned" \
+        "$file pins a citation to a line number, which drifts with every edit above it - cite the symbol" \
+        "            and its file instead, as \`poll\` in \`uring_files_disk.hpp\`:"
+}
+
+# endregion Tests and Verification
+
 # region Build CI and Packaging
 
 # CI workflows - every job and every step carries a `name:`. An unnamed step renders as its raw
 # command in the Actions UI, and job names are what branch protection's required checks reference,
-# so an anonymous one can't be pinned. Names are structure, not lines, so unlike the checks above
-# this validates the whole staged file - the workflows are small and already conform.
+# so an anonymous one can't be pinned. A name reads as a plain phrase, never `Name (qualifier)`, and a
+# matrix job's name spells every list-valued axis, since GitHub appends `(values)` to one naming none.
+# Names are structure, not lines, so unlike the checks above this validates the whole staged file.
 check_workflow_names() {
-    local nameless
-    nameless=$(
+    local misnamed
+    misnamed=$(
         git show ":$file" | awk '
+            # A name is plain when no parenthesis is left once its ${{ }} expressions are dropped.
+            function check_plain(line,    name) {
+                name = line; sub(/^[^:]*:[[:space:]]*/, "", name)
+                line = name; gsub(/\$\{\{([^}]|\}[^}])*\}\}/, "", line)
+                if (line ~ /[()]/) printf "line %d: `%s` is parenthesized\n", NR, name
+            }
+            # A matrix job names every list-valued axis, and at least one matrix value when it has none.
+            function settle(    axis, count, i) {
+                if (job == "" || !job_named || !matrix) return
+                count = split(axes, axis, " ")
+                for (i = 1; i <= count; ++i)
+                    if (job_name !~ ("matrix\\." axis[i] "([^A-Za-z0-9_-]|$)"))
+                        printf "line %d: job `%s` leaves the matrix axis `%s` out of its name\n", job_line, job, axis[i]
+                if (!count && job_name !~ /matrix\./) printf "line %d: job `%s` names no matrix value\n", job_line, job
+            }
+            /^name:/ { check_plain($0) }
             # Jobs: two-space keys under the top-level `jobs:` section, named by a four-space `name:`.
             /^jobs:[[:space:]]*$/ { in_jobs = 1; next }
             in_jobs && /^[^ #]/ { in_jobs = 0 }
             in_jobs && /^  [A-Za-z_][A-Za-z0-9_-]*:[[:space:]]*$/ {
                 if (job != "" && !job_named) printf "line %d: job `%s` has no name\n", job_line, job
+                settle()
                 job = substr($1, 1, length($1) - 1); job_line = NR; job_named = 0
+                job_name = ""; in_strategy = 0; matrix = 0; axes = ""
             }
-            in_jobs && /^    name:/ { job_named = 1 }
+            in_jobs && /^    name:/ { job_named = 1; job_name = $0; check_plain($0) }
+            # Matrix axes: keys two deeper than `strategy.matrix:` holding a `[a, b]` or `- a` list, never
+            # the keys that appear only inside its `include` and `exclude` entries.
+            matrix_at && !/^[[:space:]]*(#|$)/ {
+                indent = match($0, /[^ ]/) - 1
+                if (indent <= matrix_at) matrix_at = 0
+                else if (indent == matrix_at + 2 && match($0, /^ *[A-Za-z_][A-Za-z0-9_-]*:/)) {
+                    key = substr($0, indent + 1, RLENGTH - indent - 1); value = substr($0, RLENGTH + 1); listed = ""
+                    if (key == "include" || key == "exclude") next
+                    if (value ~ /^[[:space:]]*\[/) axes = axes " " key
+                    else if (value ~ /^[[:space:]]*(#.*)?$/) listed = key
+                } else if (listed != "" && $0 ~ /^[[:space:]]*- /) { axes = axes " " listed; listed = "" }
+            }
+            in_jobs && /^    [^ #]/ { in_strategy = ($0 ~ /^    strategy:/) }
+            in_strategy && /^      matrix:/ { matrix = 1; matrix_at = 6; listed = "" }
             # Steps: list items two deeper than their `steps:`, named inline or by a key two deeper.
             /^[[:space:]]*steps:[[:space:]]*$/ { steps_at = index($0, "steps:") - 1; item_at = steps_at + 2; pending = 0; next }
             steps_at {
@@ -826,17 +922,19 @@ check_workflow_names() {
                 if (indent == item_at && substr($0, item_at + 1, 2) == "- ") {
                     if (pending) printf "line %d: unnamed step\n", pending
                     pending = ($0 ~ /^[[:space:]]*- name:/) ? 0 : NR
-                } else if (pending && indent == item_at + 2 && $0 ~ /^[[:space:]]*name:/) pending = 0
+                    if (!pending) check_plain($0)
+                } else if (indent == item_at + 2 && $0 ~ /^[[:space:]]*name:/) { pending = 0; check_plain($0) }
             }
             END {
                 if (job != "" && !job_named) printf "line %d: job `%s` has no name\n", job_line, job
+                settle()
                 if (pending) printf "line %d: unnamed step\n", pending
             }
         '
     )
-    [ -z "$nameless" ] || fail "$nameless" \
-        "$file has a CI job or step without a name - write \`- name: Build the wheels\`;" \
-        "            the Actions UI and branch protection both reference it by name:"
+    [ -z "$misnamed" ] || fail "$misnamed" \
+        "$file misnames a CI workflow, job or step - each carries a \`name:\` the Actions UI and branch protection" \
+        "            reference, a plain phrase like \`Test \${{ matrix.os }} on QEMU\` that spells every list-valued matrix axis:"
 }
 
 # `sys.version` is a display string whose shape is not contractual; every question about the
@@ -904,11 +1002,13 @@ for file in "${staged[@]}"; do
         check_param_directions
         check_markdown_doxygen
         check_doxygen_glued
+        check_doxygen_columns_unaligned
         check_section_spacing
         check_docblock_spacing
         check_lone_brief
         check_brief_length
         check_file_header
+        check_header_date
         check_docblock_indent
         check_tag_continuation
         check_ansi_escapes
@@ -944,6 +1044,16 @@ for file in "${staged[@]}"; do
     # The shipped library: public headers under include/ and the ABI sources under src/.
     include/*.h | include/*.hpp | include/*.cuh | src/*.cpp | src/*.cuh)
         check_boolean_parameters
+        ;;&
+    # Test sources, whose oracle stays live in every build.
+    test/*.cpp | test/*.hpp | test/*.cu)
+        check_test_oracle_never_compiled_out
+        ;;&
+    test/*.cpp | test/*.cu)
+        check_test_undefines_ndebug
+        ;;&
+    verification/*)
+        check_verification_cites_symbols
         ;;&
     *.md)
         check_ascii_arrows_prose

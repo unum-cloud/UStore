@@ -10,6 +10,7 @@
  *  tears the medium at an exact offset between two mounts through the same pipelines the volume
  *  writes with, so it runs on every transport the driver mounts.
  */
+#undef NDEBUG // ! A test's oracle must stay live in every build
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint64_t`
@@ -27,7 +28,7 @@
 
 #include "nvme_fixture.hpp" // `basic_fixture`, `run_on_transport`, `painted`
 
-namespace unum::ustore {
+namespace unum::ustore::test {
 
 using namespace unum::ustore::nvme;
 
@@ -961,10 +962,11 @@ case_result_t on_three_volumes(mount_type_ const& mount) {
 
 #pragma endregion Drivers
 
-} // namespace unum::ustore
+} // namespace unum::ustore::test
 
 int main(int argc, char const* argv[]) {
     using namespace unum::ustore;
+    using namespace unum::ustore::test;
     using namespace unum::ustore::nvme;
 
     suite_options_t options;
@@ -981,7 +983,9 @@ int main(int argc, char const* argv[]) {
 
     auto const cases = [&](auto const& mount) {
         auto const on_one = [&](char const* name, auto&& body) {
-            report(totals, mount.label(name).c_str(), on_one_volume(mount, body));
+            case_label_t const label = mount.label(name);
+            if (totals.selects(label.c_str()))
+                report(totals, label.c_str(), on_one_volume(mount, body) + mount.take_leaks());
         };
         on_one("round_trip", [](auto& fixture) { return volume_round_trips(fixture); });
         on_one("crash_before_seal", [](auto& fixture) { return volume_forgets_an_unsealed_blob(fixture); });
@@ -994,7 +998,7 @@ int main(int argc, char const* argv[]) {
         on_one("walks_one_kind", [](auto& fixture) { return volume_walks_one_kind(fixture); });
         on_one("overgrown_catalog", [](auto& fixture) { return volume_refuses_an_overgrown_catalog(fixture); });
         on_one("mount_spares_blocks", [](auto& fixture) { return volume_mount_spares_held_blocks(fixture); });
-        report(totals, mount.label("router_places_by_free_space").c_str(), on_three_volumes(mount));
+        report(totals, mount, "router_places_by_free_space", on_three_volumes);
     };
     for (transport_t const transport : every_transport_k)
         run_on_transport(totals, transport, environment, volume_config_k, 1, "volume", cases);

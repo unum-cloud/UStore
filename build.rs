@@ -12,12 +12,12 @@ use std::path::PathBuf;
 /// Every CMake option this crate sets, paired with the Cargo feature naming it - `None` stays off, since no
 /// feature turns it on.
 const KNOWN_OPTIONS: &[(&str, Option<&str>)] = &[
-    ("USTORE_USE_ROCKSDB", Some("rocksdb")),
-    ("USTORE_USE_LEVELDB", Some("leveldb")),
-    ("USTORE_USE_SPDK", None),
-    ("USTORE_BUILD_TEST_CPP", None),
-    ("USTORE_BUILD_BENCH_CPP", None),
-    ("USTORE_BUILD_TOOLS_CPP", None),
+    ("USTORE_WITH_ROCKSDB", Some("rocksdb")),
+    ("USTORE_WITH_LEVELDB", Some("leveldb")),
+    ("USTORE_WITH_SPDK", None),
+    ("USTORE_BUILD_TEST", None),
+    ("USTORE_BUILD_BENCH", None),
+    ("USTORE_BUILD_TOOLS", None),
     ("USTORE_BUILD_LIB_PYTHON", None),
     ("USTORE_BUILD_UDISK", None),
     ("USTORE_BUILD_CUDA", None),

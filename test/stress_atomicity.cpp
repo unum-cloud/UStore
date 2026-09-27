@@ -4,6 +4,7 @@
  *  @date January 9, 2023
  *  @brief Stress test that concurrent batched transactions land whole or not at all.
  */
+#undef NDEBUG // ! A test's oracle must stay live in every build
 
 #include <cstddef>      // `std::size_t`
 #include <cstdint>      // `std::uint32_t`, `std::uint64_t`
@@ -29,6 +30,7 @@
 #include "test.hpp"     // `suite_exit_code`, `expect`, `suite_totals_t`
 
 using namespace unum::ustore;
+using namespace unum::ustore::test;
 using namespace unum;
 
 /** Workload of the suite, each field set by the flag of the same name. */
@@ -291,7 +293,7 @@ int main(int argc, char** argv) {
         return suite_exit_code(totals);
     }
 
-    report(totals, "database.inserts", database_inserts(run, options, round_deletes_t::without_deletes_k));
-    report(totals, "database.inserts_and_deletes", database_inserts(run, options, round_deletes_t::with_deletes_k));
+    report(totals, "database.inserts", database_inserts, run, options, round_deletes_t::without_deletes_k);
+    report(totals, "database.inserts_and_deletes", database_inserts, run, options, round_deletes_t::with_deletes_k);
     return suite_exit_code(totals);
 }

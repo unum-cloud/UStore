@@ -27,7 +27,7 @@ Every number comes from the `release` preset, which builds into `build_release`.
 The SmashTable engine is always built, and each other engine is switched on by its option.
 
 ```sh
-cmake --preset release -DUSTORE_BUILD_BENCH_CPP=1 -DUSTORE_USE_ROCKSDB=1 -DUSTORE_USE_LEVELDB=1
+cmake --preset release -DUSTORE_BUILD_BENCH=1 -DUSTORE_WITH_ROCKSDB=1 -DUSTORE_WITH_LEVELDB=1
 cmake --build --preset release --target ustore_bench_twitter_rocksdb ustore_bench_tabular_graph_rocksdb
 ```
 

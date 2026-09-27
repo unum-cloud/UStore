@@ -13,6 +13,7 @@
  *  The suite needs @c --directory and refuses tmpfs, which accepts @c O_DIRECT and ignores alignment
  *  outright, hiding exactly the mistakes this transport can make.
  */
+#undef NDEBUG // ! A test's oracle must stay live in every build
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint64_t`
@@ -40,7 +41,7 @@
 
 #include "nvme_ring_cases.hpp" // `ring_cases`, every transport-independent result
 
-namespace unum::ustore {
+namespace unum::ustore::test {
 
 using namespace unum::ustore::nvme;
 
@@ -369,25 +370,26 @@ void uring_transport(suite_totals_t& totals, char const* directory) {
     test_path_t const path {directory, "volume.bin"};
     on_medium(totals, "uring.volume", *disk, volume_request(path.c_str()), [&](medium_reference_t medium) {
         ring_cases(totals, "uring", *disk, medium);
-        report(totals, "uring.fails_one_request", uring_fails_one_request_of_a_batch(*disk, medium));
-        report(totals, "uring.cuts_a_chain_short", uring_cuts_a_chain_on_a_short_read(*disk, medium));
-        report(totals, "uring.cancel_completions", uring_counts_completions_after_a_cancel(*disk, medium));
-        report(totals, "uring.narrow_poll_window", uring_polls_through_a_narrow_window(*disk, medium));
-        report(totals, "uring.overflowed_queue", uring_polls_an_overflowed_queue(*disk, medium));
-        report(totals, "uring.alignment_matches_statx", uring_reports_the_alignment_statx_reports(*disk, path.c_str()));
+        report(totals, "uring.fails_one_request", uring_fails_one_request_of_a_batch, *disk, medium);
+        report(totals, "uring.cuts_a_chain_short", uring_cuts_a_chain_on_a_short_read, *disk, medium);
+        report(totals, "uring.cancel_completions", uring_counts_completions_after_a_cancel, *disk, medium);
+        report(totals, "uring.narrow_poll_window", uring_polls_through_a_narrow_window, *disk, medium);
+        report(totals, "uring.overflowed_queue", uring_polls_an_overflowed_queue, *disk, medium);
+        report(totals, "uring.alignment_matches_statx", uring_reports_the_alignment_statx_reports, *disk, path.c_str());
     });
 
     test_path_t const borrowed_path {directory, "volume_borrowed.bin"};
-    report(totals, "uring.medium_in_flight",
-           ring_holds_a_medium_in_flight(*disk, volume_request(borrowed_path.c_str())));
+    report(totals, "uring.medium_in_flight", ring_holds_a_medium_in_flight<uring_files_disk_t>, *disk,
+           volume_request(borrowed_path.c_str()));
 }
 
 #pragma endregion Driver
 
-} // namespace unum::ustore
+} // namespace unum::ustore::test
 
 int main(int argc, char const* argv[]) {
     using namespace unum::ustore;
+    using namespace unum::ustore::test;
     using namespace unum::ustore::nvme;
 
     suite_options_t options;
@@ -409,6 +411,6 @@ int main(int argc, char const* argv[]) {
 
     if (char const* const reason = transport_refusal(transport_t::device_k, environment))
         report(totals, "uring.device_capacity", case_result_t::skipped(reason));
-    else report(totals, "uring.device_capacity", device_reports_its_capacity(environment.device));
+    else report(totals, "uring.device_capacity", device_reports_its_capacity, environment.device);
     return suite_exit_code(totals);
 }

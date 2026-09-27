@@ -4,6 +4,7 @@
  *  @date April 16, 2023
  *  @brief Tests importing and exporting documents and graph edges through NDJSON and CSV files, and the CLI on top.
  */
+#undef NDEBUG // ! A test's oracle must stay live in every build
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::int64_t`
@@ -37,7 +38,7 @@
 #include "dataset.h"
 #include "test.hpp" // `suite_exit_code`, `create_directories`, `expect`
 
-namespace unum::ustore {
+namespace unum::ustore::test {
 
 constexpr std::int64_t rows_count_k = 1000;
 constexpr ustore_size_t max_batch_size_k = 64 * 1024;
@@ -111,19 +112,19 @@ struct fixture_paths_t {
 };
 
 /** Appends @p piece to @p text, answering whether it fit. */
-[[nodiscard]] bool append(sz::string& text, std::string_view piece) noexcept {
+[[nodiscard]] bool append(sz::string_t& text, std::string_view piece) noexcept {
     return text.try_append(piece.data(), piece.size());
 }
 
 /** Appends the decimal digits of @p number to @p text, answering whether they fit. */
-[[nodiscard]] bool append(sz::string& text, std::int64_t number) noexcept {
+[[nodiscard]] bool append(sz::string_t& text, std::int64_t number) noexcept {
     char digits[24];
     std::to_chars_result const printed = std::to_chars(digits, digits + sizeof(digits), number);
     return text.try_append(digits, static_cast<std::size_t>(printed.ptr - digits));
 }
 
 /** Appends the NDJSON fixture document with key @p id, without a line break. */
-[[nodiscard]] bool append_ndjson_document(sz::string& text, std::int64_t id) noexcept {
+[[nodiscard]] bool append_ndjson_document(sz::string_t& text, std::int64_t id) noexcept {
     std::int64_t const user = id % 97;
     return append(text, R"({"id":)") && append(text, id) && append(text, R"(,"id_str":")") && append(text, id) &&
            append(text, R"(","user":{"id":)") && append(text, user) && append(text, R"(,"followers_count":)") &&
@@ -135,7 +136,7 @@ struct fixture_paths_t {
 }
 
 /** Appends the CSV fixture row with key @p id, line break included. */
-[[nodiscard]] bool append_csv_row(sz::string& text, std::int64_t id) noexcept {
+[[nodiscard]] bool append_csv_row(sz::string_t& text, std::int64_t id) noexcept {
     std::string_view const geo = id % 3 == 0 ? R"("Point, ""exact""")" : id % 3 == 1 ? "Point" : "";
     return append(text, id) && append(text, ",id-") && append(text, id) && append(text, ",") && append(text, id % 97) &&
            append(text, ",") && append(text, id * 3) && append(text, ",") && append(text, geo) &&
@@ -143,7 +144,7 @@ struct fixture_paths_t {
 }
 
 /** Appends the JSON document an import makes of the CSV fixture row with key @p id. */
-[[nodiscard]] bool append_csv_document(sz::string& text, std::int64_t id) noexcept {
+[[nodiscard]] bool append_csv_document(sz::string_t& text, std::int64_t id) noexcept {
     std::string_view const geo = id % 3 == 0 ? R"("Point, \"exact\"")" : id % 3 == 1 ? R"("Point")" : "null";
     return append(text, R"({"id":)") && append(text, id) && append(text, R"(,"id_str":"id-)") && append(text, id) &&
            append(text, R"(","user_id":)") && append(text, id % 97) && append(text, R"(,"user_followers_count":)") &&
@@ -152,7 +153,7 @@ struct fixture_paths_t {
 }
 
 /** Writes @p content to the file at @p path, answering whether every byte landed. */
-[[nodiscard]] bool write_file(char const* path, sz::string const& content) noexcept {
+[[nodiscard]] bool write_file(char const* path, sz::string_t const& content) noexcept {
     int const descriptor = open(path, O_CREAT | O_WRONLY | O_TRUNC, S_IRUSR | S_IWUSR);
     if (descriptor == -1) return false;
     char const* cursor = content.data();
@@ -167,7 +168,7 @@ struct fixture_paths_t {
 }
 
 /** Reads the whole file at @p path into @p content, answering whether it loaded. */
-[[nodiscard]] bool read_file(char const* path, sz::string& content) noexcept {
+[[nodiscard]] bool read_file(char const* path, sz::string_t& content) noexcept {
     int const descriptor = open(path, O_RDONLY);
     if (descriptor == -1) return false;
     struct stat metadata {};
@@ -184,10 +185,10 @@ struct fixture_paths_t {
 
 /** Writes the document and edge fixtures, in NDJSON and CSV, where @p paths names them. */
 [[nodiscard]] bool write_fixtures(fixture_paths_t const& paths) noexcept {
-    sz::string documents_ndjson;
-    sz::string documents_csv;
-    sz::string edges_ndjson;
-    sz::string edges_csv;
+    sz::string_t documents_ndjson;
+    sz::string_t documents_csv;
+    sz::string_t edges_ndjson;
+    sz::string_t edges_csv;
     bool written = append(documents_csv, "id,id_str,user_id,user_followers_count,geo_type,favorited,retweeted\n") &&
                    append(edges_csv, "id,user_id,user_followers_count\n");
     for (std::int64_t id = 1; written && id <= rows_count_k; ++id) {
@@ -286,7 +287,7 @@ struct json_document_t {
 }
 
 /** Serializes @p value minified into @p output, so equal values of equal key order compare equal as text. */
-[[nodiscard]] bool canonical(yyjson_val* value, sz::string& output) noexcept {
+[[nodiscard]] bool canonical(yyjson_val* value, sz::string_t& output) noexcept {
     output.clear();
     if (!value) return true;
     yyjson_mut_doc* const builder = yyjson_mut_doc_new(nullptr);
@@ -346,12 +347,12 @@ struct edge_row_t {
 /** Checks that the edges exported to @p path are exactly the fixture edges. */
 [[nodiscard]] std::size_t check_edges(char const* path) noexcept {
     std::size_t failures = 0;
-    sz::string content;
+    sz::string_t content;
     st::basic_vector<edge_row_t> edges;
     if (!read_file(path, content)) return expect(!"the exported edges are readable");
 
     std::size_t line_index = 0;
-    for (sz::string_view line : sz::split(content.view(), "\n")) {
+    for (sz::string_view_t line : sz::split(content.view(), "\n")) {
         if (line.size() == 0 || (is_csv(path) && line_index++ == 0)) continue;
         edge_row_t edge {};
         bool parsed = false;
@@ -395,7 +396,7 @@ struct edge_row_t {
 [[nodiscard]] std::size_t check_document(ustore_key_t key, std::string_view text, char const* input,
                                          field_selection_t selection) noexcept {
     std::size_t failures = expect(key >= 1 && key <= rows_count_k);
-    sz::string expected_text;
+    sz::string_t expected_text;
     bool const generated = is_csv(input) ? append_csv_document(expected_text, key)
                                          : append_ndjson_document(expected_text, key);
     if (!generated) return failures + 1;
@@ -406,8 +407,8 @@ struct edge_row_t {
     yyjson_val* const expected_root = yyjson_doc_get_root(expected.handle);
     failures += expect(yyjson_is_obj(exported_root));
 
-    sz::string exported_value;
-    sz::string expected_value;
+    sz::string_t exported_value;
+    sz::string_t expected_value;
     if (selection == field_selection_t::whole_k) {
         failures += expect(canonical(exported_root, exported_value) && canonical(expected_root, expected_value));
         failures += expect(std::string_view(exported_value.data(), exported_value.size()) ==
@@ -432,12 +433,12 @@ struct edge_row_t {
 /** Checks that the documents exported to @p output match the fixture rows of @p input, one per key. */
 [[nodiscard]] std::size_t check_documents(char const* output, char const* input, field_selection_t selection) noexcept {
     std::size_t failures = 0;
-    sz::string content;
+    sz::string_t content;
     if (!read_file(output, content)) return expect(!"the exported documents are readable");
 
     std::size_t rows = 0;
-    sz::string unescaped;
-    for (sz::string_view line : sz::split(content.view(), "\n")) {
+    sz::string_t unescaped;
+    for (sz::string_view_t line : sz::split(content.view(), "\n")) {
         if (line.size() == 0) continue;
         std::string_view const row = line;
         if (is_csv(output)) {
@@ -450,8 +451,8 @@ struct edge_row_t {
             if (!quoted) continue;
             unescaped.clear();
             std::string_view separator;
-            sz::string_view const inner {row.data() + comma + 2, row.size() - comma - 3};
-            for (sz::string_view segment : sz::split(inner, "\"\"")) {
+            sz::string_view_t const inner {row.data() + comma + 2, row.size() - comma - 3};
+            for (sz::string_view_t segment : sz::split(inner, "\"\"")) {
                 failures += expect(append(unescaped, separator) && unescaped.try_append(segment));
                 separator = "\"";
             }
@@ -461,7 +462,7 @@ struct edge_row_t {
             json_document_t const document {yyjson_read(row.data(), row.size(), 0)};
             yyjson_val* const root = yyjson_doc_get_root(document.handle);
             yyjson_val* const key = yyjson_obj_get(root, "_id");
-            sz::string text;
+            sz::string_t text;
             failures += expect(yyjson_is_int(key) && canonical(yyjson_obj_get(root, "doc"), text));
             if (!yyjson_is_int(key)) continue;
             failures += check_document(yyjson_get_sint(key), text, input, selection);
@@ -856,45 +857,45 @@ void run_cases(suite_totals_t& totals, test_config_t const& config, std::string_
     char const* const exported_ndjson = paths.exported_ndjson.c_str();
     char const* const exported_csv = paths.exported_csv.c_str();
 
-    report(totals, "graph.ndjson_to_ndjson", graph_round_trip(config, edges_ndjson, exported_ndjson));
-    report(totals, "graph.ndjson_to_csv", graph_round_trip(config, edges_ndjson, exported_csv));
-    report(totals, "graph.csv_to_ndjson", graph_round_trip(config, edges_csv, exported_ndjson));
-    report(totals, "graph.csv_to_csv", graph_round_trip(config, edges_csv, exported_csv));
+    report(totals, "graph.ndjson_to_ndjson", graph_round_trip, config, edges_ndjson, exported_ndjson);
+    report(totals, "graph.ndjson_to_csv", graph_round_trip, config, edges_ndjson, exported_csv);
+    report(totals, "graph.csv_to_ndjson", graph_round_trip, config, edges_csv, exported_ndjson);
+    report(totals, "graph.csv_to_csv", graph_round_trip, config, edges_csv, exported_csv);
 
     field_selection_t const whole = field_selection_t::whole_k;
     field_selection_t const selected = field_selection_t::selected_k;
-    report(totals, "docs.whole.ndjson_to_ndjson",
-           documents_round_trip(config, documents_ndjson, exported_ndjson, whole));
-    report(totals, "docs.whole.ndjson_to_csv", documents_round_trip(config, documents_ndjson, exported_csv, whole));
-    report(totals, "docs.whole.csv_to_ndjson", documents_round_trip(config, documents_csv, exported_ndjson, whole));
-    report(totals, "docs.whole.csv_to_csv", documents_round_trip(config, documents_csv, exported_csv, whole));
-    report(totals, "docs.selected.ndjson_to_ndjson",
-           documents_round_trip(config, documents_ndjson, exported_ndjson, selected));
-    report(totals, "docs.selected.ndjson_to_csv",
-           documents_round_trip(config, documents_ndjson, exported_csv, selected));
-    report(totals, "docs.selected.csv_to_ndjson",
-           documents_round_trip(config, documents_csv, exported_ndjson, selected));
-    report(totals, "docs.selected.csv_to_csv", documents_round_trip(config, documents_csv, exported_csv, selected));
+    report(totals, "docs.whole.ndjson_to_ndjson", documents_round_trip, config, documents_ndjson, exported_ndjson,
+           whole);
+    report(totals, "docs.whole.ndjson_to_csv", documents_round_trip, config, documents_ndjson, exported_csv, whole);
+    report(totals, "docs.whole.csv_to_ndjson", documents_round_trip, config, documents_csv, exported_ndjson, whole);
+    report(totals, "docs.whole.csv_to_csv", documents_round_trip, config, documents_csv, exported_csv, whole);
+    report(totals, "docs.selected.ndjson_to_ndjson", documents_round_trip, config, documents_ndjson, exported_ndjson,
+           selected);
+    report(totals, "docs.selected.ndjson_to_csv", documents_round_trip, config, documents_ndjson, exported_csv,
+           selected);
+    report(totals, "docs.selected.csv_to_ndjson", documents_round_trip, config, documents_csv, exported_ndjson,
+           selected);
+    report(totals, "docs.selected.csv_to_csv", documents_round_trip, config, documents_csv, exported_csv, selected);
 
-    report(totals, "invalid.graph_import.ndjson", graph_import_rejects_invalid_tasks(config, edges_ndjson));
-    report(totals, "invalid.graph_import.csv", graph_import_rejects_invalid_tasks(config, edges_csv));
-    report(totals, "invalid.graph_export.ndjson", graph_export_rejects_invalid_tasks(config, exported_ndjson));
-    report(totals, "invalid.graph_export.csv", graph_export_rejects_invalid_tasks(config, exported_csv));
-    report(totals, "invalid.docs_import.ndjson", docs_import_rejects_invalid_tasks(config, documents_ndjson));
-    report(totals, "invalid.docs_import.csv", docs_import_rejects_invalid_tasks(config, documents_csv));
-    report(totals, "invalid.docs_export.ndjson", docs_export_rejects_invalid_tasks(config, exported_ndjson));
-    report(totals, "invalid.docs_export.csv", docs_export_rejects_invalid_tasks(config, exported_csv));
+    report(totals, "invalid.graph_import.ndjson", graph_import_rejects_invalid_tasks, config, edges_ndjson);
+    report(totals, "invalid.graph_import.csv", graph_import_rejects_invalid_tasks, config, edges_csv);
+    report(totals, "invalid.graph_export.ndjson", graph_export_rejects_invalid_tasks, config, exported_ndjson);
+    report(totals, "invalid.graph_export.csv", graph_export_rejects_invalid_tasks, config, exported_csv);
+    report(totals, "invalid.docs_import.ndjson", docs_import_rejects_invalid_tasks, config, documents_ndjson);
+    report(totals, "invalid.docs_import.csv", docs_import_rejects_invalid_tasks, config, documents_csv);
+    report(totals, "invalid.docs_export.ndjson", docs_export_rejects_invalid_tasks, config, exported_ndjson);
+    report(totals, "invalid.docs_export.csv", docs_export_rejects_invalid_tasks, config, exported_csv);
 
     // The CLI path views into `argv`, so it ends in a null terminator
-    report(totals, "tools.cli",
-           cli.empty() ? case_result_t::skipped("needs --cli")
-                       : case_result_t {cli_round_trip(paths, config, cli.data())});
+    if (cli.empty()) report(totals, "tools.cli", case_result_t::skipped("needs --cli"));
+    else report(totals, "tools.cli", cli_round_trip, paths, config, cli.data());
 }
 
-} // namespace unum::ustore
+} // namespace unum::ustore::test
 
 int main(int argc, char** argv) {
     using namespace unum::ustore;
+    using namespace unum::ustore::test;
     suite_options_t options;
     std::string_view cli;
     std::array<flag_t, 1> const flags {{

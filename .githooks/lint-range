@@ -7,14 +7,18 @@ set -eu
 
 base=${1:-}
 case "$base" in
-"" | 0000000000000000000000000000000000000000) base=$(git hash-object -t tree /dev/null) ;;
+"" | 0000000000000000000000000000000000000000) base=$(git commit-tree "$(git hash-object -t tree /dev/null)" -m empty) ;;
 esac
 
-# The hook reads the index, so it gets a private one and the real index stays as the author left it.
-GIT_INDEX_FILE=$(mktemp)
-export GIT_INDEX_FILE
-trap 'rm -f "$GIT_INDEX_FILE"' EXIT
-
-git read-tree "$base"
-git add -A
+# The hook diffs the index against HEAD, so it runs in a scratch worktree whose HEAD is the base and whose index and
+# files hold this tree, leaving the author's own index and files as they are.
+index=$(mktemp)
+scratch=$(mktemp -d)
+trap 'git worktree remove --force "$scratch" > /dev/null 2>&1; rm -rf "$index" "$scratch"' EXIT
+cp "$(git rev-parse --git-path index)" "$index"
+GIT_INDEX_FILE=$index git add -A
+snapshot=$(git commit-tree "$(GIT_INDEX_FILE=$index git write-tree)" -m snapshot)
+git worktree add --quiet --detach "$scratch" "$base"
+cd "$scratch"
+git checkout --quiet "$snapshot" -- .
 .githooks/pre-commit

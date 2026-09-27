@@ -5,8 +5,9 @@
  *  @brief Shared checks for the C++ test suites: failure counting, results, the totals, bounded waits, flags and
  *      directories.
  *
- *  Every check returns its own failure count, a case returns a @c case_result_t, and @c report rolls results into
- *  the @c suite_totals_t the suite's @c main owns, so counts reach @c suite_exit_code without global mutable state.
+ *  Every check returns its own failure count, a case returns a @c case_result_t, and @c report runs each case the
+ *  @c --filter selects and rolls its result into the @c suite_totals_t the suite's @c main owns, so counts reach
+ *  @c suite_exit_code without global mutable state.
  */
 #pragma once
 
@@ -22,10 +23,13 @@
 #include <sys/stat.h> // `mkdir`
 
 #include <array>       // `std::array`
+#include <optional>    // `std::optional`
 #include <random>      // `std::random_device`
+#include <regex>       // `std::regex`, `std::regex_search`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 #include <thread>      // `std::thread::hardware_concurrency`
+#include <type_traits> // `std::type_identity_t`
 
 #include <fmt/format.h>
 
@@ -38,7 +42,7 @@
 
 #include "arguments.hpp"
 
-namespace unum::ustore {
+namespace unum::ustore::test {
 
 /** Counts one failure when the condition is false, printing it with its location. */
 #define expect(...) expect_((bool)(__VA_ARGS__), #__VA_ARGS__, __FILE__, __LINE__)
@@ -152,14 +156,37 @@ struct suite_totals_t {
 
     /** What a skip does to the exit code. */
     skip_policy_t policy = skip_policy_t::tolerated_k;
+
+    /** The @c --filter pattern a case label must match to run, empty to run every case. */
+    std::string_view filter;
+
+    /** The filter compiled once as an ECMAScript regex, or nothing when it does not compile. */
+    std::optional<std::regex> pattern;
+
+    /** The binary's @c argv[0], which turns a rerun line into a command. */
+    char const* program = "";
+
+    /** Whether the case labelled @p name runs: the filter searched as a regex, or found as a plain substring. */
+    [[nodiscard]] bool selects(std::string_view name) const noexcept {
+        if (filter.empty()) return true;
+        if (pattern) return std::regex_search(name.begin(), name.end(), *pattern);
+        return name.find(filter) != std::string_view::npos;
+    }
 };
 
-/** Prints one result line, rolls it into @p totals, and answers its failures so a helper still accumulates. */
+/**
+ *  @brief Prints the result line of the case @p name and rolls it into @p totals unless the @c --filter leaves it out,
+ *      answering its failures so a helper still accumulates.
+ *
+ *  A failure also prints the command that reruns only this case under the same seed.
+ */
 inline std::size_t report(suite_totals_t& totals, char const* name, case_result_t result) {
+    if (!totals.selects(name)) return 0;
     totals.failures += result.failures;
     if (result.failures != 0) {
         ++totals.failed;
         fmt::println("FAILED  {:<32} : {} failures", name, result.failures);
+        fmt::println(stderr, "  rerun: {} --seed {} --filter '^{}$'", totals.program, totals.seed, name);
     }
     else if (result.skip_reason) {
         ++totals.skipped;
@@ -172,11 +199,33 @@ inline std::size_t report(suite_totals_t& totals, char const* name, case_result_
     return result.failures;
 }
 
-/** Prints the totals and answers the exit code: 1 on any failure, 3 on a skip the policy refuses, 0 otherwise. */
+/**
+ *  @brief Runs @p case_function on @p arguments only when the @c --filter selects @p name, then reports it as above.
+ *
+ *  Takes a function pointer rather than any callable, as SmashTable's harness does, so a case whose signature drifts
+ *  fails to compile here instead of hiding behind a lambda at every call site.
+ */
+template <typename result_type_, typename... parameters_types_>
+std::size_t report(suite_totals_t& totals, char const* name, result_type_ (*case_function)(parameters_types_...),
+                   std::type_identity_t<parameters_types_>... arguments) {
+    if (!totals.selects(name)) return 0;
+    return report(totals, name, case_result_t(case_function(arguments...)));
+}
+
+/**
+ *  @brief Prints the totals and answers the exit code: 1 on any failure or on a @c --filter that matched no case,
+ *      3 on a skip the policy refuses, 0 otherwise.
+ *
+ *  A filter that selected nothing fails, since a mistyped one would otherwise read like a green suite.
+ */
 [[nodiscard]] inline int suite_exit_code(suite_totals_t const& totals) {
     fmt::println("total {} passed, {} skipped, {} failed, seed {}", totals.passed, totals.skipped, totals.failed,
                  totals.seed);
     if (totals.failures != 0) return 1;
+    if (!totals.filter.empty() && totals.passed + totals.skipped + totals.failed == 0) {
+        fmt::println(stderr, "--filter '{}' matched no case, so nothing ran", totals.filter);
+        return 1;
+    }
     if (totals.skipped != 0 && totals.policy == skip_policy_t::refused_k) return 3;
     return 0;
 }
@@ -313,11 +362,27 @@ struct suite_options_t {
     /** Whether a skipped case fails the suite. */
     switch_t no_skips = switch_t::absent_k;
 
-    /** A totals seeded and policed by these options. */
+    /** A regex over case labels, like @c ^lsm\.files or @c uring|ram, selecting which cases run. */
+    std::string_view filter;
+
+    /** The binary's @c argv[0], which every rerun line starts with. */
+    char const* program = "";
+
+    /** A totals seeded, filtered and policed by these options. */
     [[nodiscard]] suite_totals_t totals() const noexcept {
         suite_totals_t counts;
         counts.seed = seed.value;
         counts.policy = no_skips == switch_t::present_k ? skip_policy_t::refused_k : skip_policy_t::tolerated_k;
+        counts.filter = filter;
+        if (!filter.empty()) {
+            try {
+                counts.pattern.emplace(filter.begin(), filter.end());
+            }
+            catch (std::regex_error const&) {
+                // Left empty, so `selects` finds the filter as a plain substring instead, as SmashTable does.
+            }
+        }
+        counts.program = program;
         return counts;
     }
 
@@ -340,7 +405,7 @@ constexpr std::size_t suite_flags_capacity_k = 16;
         fmt::println(stderr, "a suite may add at most {} flags", suite_flags_capacity_k);
         return argument_status_t::too_many_items_k;
     }
-    std::array<flag_t, suite_flags_capacity_k + 8> flags;
+    std::array<flag_t, suite_flags_capacity_k + 9> flags;
     std::size_t count = 0;
     flags[count++] = {"--directory", "path", "parent of the unique directory the suite works in", &options.directory};
     flags[count++] = {"--device", "path", "block device the storage cases open", &options.device};
@@ -354,6 +419,8 @@ constexpr std::size_t suite_flags_capacity_k = 16;
                       &options.seed};
     flags[count++] = {"--threads", "count", "threads the concurrent cases fan out over", &options.threads};
     flags[count++] = {"--no-skips", "", "fail the suite when a case skips", &options.no_skips};
+    flags[count++] = {"--filter", "regex", "runs only the cases whose label it matches, like '^lsm\\.files'",
+                      &options.filter};
     for (flag_t const& flag : suite_flags) flags[count++] = flag;
 
     std::span<flag_t const> const every_flag {flags.data(), count};
@@ -362,6 +429,7 @@ constexpr std::size_t suite_flags_capacity_k = 16;
     else if (parsed.status != argument_status_t::parsed_k)
         fmt::println(stderr, "{}: {}", parsed.argument, describe(parsed.status));
     if (options.seed.value == 0) options.seed.value = draw_seed();
+    options.program = argc != 0 ? argv[0] : "";
     return parsed.status;
 }
 
@@ -511,4 +579,4 @@ class test_directory_t {
 
 #pragma endregion Directories
 
-} // namespace unum::ustore
+} // namespace unum::ustore::test

@@ -22,7 +22,7 @@
 #include <fmt/color.h>  // `fmt::color`, `fmt::fg`, `fmt::text_style`
 #include <fmt/format.h> // `fmt::println`, `fmt::format_to_n`
 
-#include <stringzilla/stringzilla.hpp> // `sz::string`
+#include <stringzilla/stringzilla.hpp> // `sz::string_t`
 
 #include <ustore/db.h>      // `ustore_database_init`, `ustore_error_t`
 #include <ustore/strings.h> // `ustore_strings_read`, `ustore_strings_scan`
@@ -299,7 +299,7 @@ void name_collection(ustore_database_t db, std::string_view name, ustore_collect
     ustore_str_view_t const prefix = "";
     ustore_length_t const prefix_length = 0;
     ustore_length_t const page = listing_page_k;
-    sz::string resume;
+    sz::string_t resume;
     while (true) {
         ustore_str_view_t const start = resume.c_str();
         auto const start_length = static_cast<ustore_length_t>(resume.size());
@@ -522,7 +522,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    sz::string config;
+    sz::string_t config;
     if (!config.try_append(R"({"version": "1.0", "directory": ")") ||
         !config.try_append(line.directory.data(), line.directory.size()) || !config.try_append(R"("})")) {
         fmt::println(stderr, "Failed to allocate the configuration");

@@ -8,6 +8,7 @@
  *  engines that refuse collections of their own. Walks run with a read-ahead smaller than the collection
  *  too, so the paging a stream does is exercised beside its single-page config.
  */
+#undef NDEBUG // ! A test's oracle must stay live in every build
 
 #include <cstddef> // `std::size_t`
 #include <cstdio>  // `stderr`
@@ -23,6 +24,7 @@
 #include "test.hpp" // `suite_exit_code`, `expect`, `expect_eq`
 
 using namespace unum::ustore;
+using namespace unum::ustore::test;
 using namespace unum;
 
 namespace {
@@ -325,14 +327,14 @@ int main(int argc, char** argv) {
     else fmt::println("Will work with default configuration");
     test_config_t const config {directory, options.engine_config};
 
-    report(totals, "strings_collection.short_ordering", strings_collection_short_ordering(config));
-    report(totals, "strings_collection.prefix_walk", strings_collection_prefix_walk(config));
-    report(totals, "strings_collection.shared_prefix", strings_collection_shared_prefix(config));
-    report(totals, "strings_collection.empty_and_embedded_zero", strings_collection_empty_and_embedded_zero(config));
-    report(totals, "strings_collection.update_and_remove", strings_collection_update_and_remove(config));
-    report(totals, "strings_collection.bucket_growth", strings_collection_bucket_growth(config));
-    report(totals, "strings_collection.paged_walk", strings_collection_paged_walk(config));
-    report(totals, "strings_collection.in_transaction", strings_collection_in_transaction(config));
+    report(totals, "strings_collection.short_ordering", strings_collection_short_ordering, config);
+    report(totals, "strings_collection.prefix_walk", strings_collection_prefix_walk, config);
+    report(totals, "strings_collection.shared_prefix", strings_collection_shared_prefix, config);
+    report(totals, "strings_collection.empty_and_embedded_zero", strings_collection_empty_and_embedded_zero, config);
+    report(totals, "strings_collection.update_and_remove", strings_collection_update_and_remove, config);
+    report(totals, "strings_collection.bucket_growth", strings_collection_bucket_growth, config);
+    report(totals, "strings_collection.paged_walk", strings_collection_paged_walk, config);
+    report(totals, "strings_collection.in_transaction", strings_collection_in_transaction, config);
 
     return suite_exit_code(totals);
 }

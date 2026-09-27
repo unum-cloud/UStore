@@ -117,7 +117,7 @@ The ring is exposed rather than hidden behind a blocking read because a blocking
 
 - __`blocking_k`__ — `blocking_files_disk_t`, positioned reads and writes on the calling thread. Every platform has it, and it is where a refused probe falls back to.
 - __`io_uring_k`__ — `uring_files_disk_t`, one `io_uring` per queue pair through raw `io_uring_setup`, `io_uring_register` and `io_uring_enter`. No liburing, and Linux 6.12 or newer. Every ring is charged the whole arena against `RLIMIT_MEMLOCK`, so a ring the cap refuses addresses the arena by pointer instead of by registered slot, and the mount stays on `io_uring`.
-- __`spdk_k`__ — `spdk_disk_t`, the user-space NVMe driver behind `USTORE_USE_SPDK`. Its probe reads `/proc/meminfo` and the driver binding first, because `rte_eal_init` can otherwise call `exit` on the whole process.
+- __`spdk_k`__ — `spdk_disk_t`, the user-space NVMe driver behind `USTORE_WITH_SPDK`. Its probe reads `/proc/meminfo` and the driver binding first, because `rte_eal_init` can otherwise call `exit` on the whole process.
 - __`memory_k`__ — `ram_disk_t`, volumes in memory for tests and benchmarks.
 - __`automatic_k`__ — io_uring where the kernel allows it, the blocking floor where it does not. What the mount settled on is reported back rather than inferred.
 

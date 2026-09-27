@@ -23,20 +23,13 @@
 
 #pragma once
 
-/** Whether this translation unit can reach the ring at all, which only Linux offers. */
-#if defined(__linux__) && __has_include(<linux/io_uring.h>)
-#define USTORE_NVME_HAS_URING 1
-#else
-#define USTORE_NVME_HAS_URING 0
-#endif
-
 #include <cassert> // `assert`
 #include <cerrno>  // `errno`
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint64_t`
 #include <cstring> // `std::memset`
 
-#if USTORE_NVME_HAS_URING
+#if defined(__linux__)
 #include <fcntl.h>          // `AT_EMPTY_PATH`
 #include <linux/io_uring.h> // `io_uring_sqe`, `io_uring_cqe`, `IORING_SETUP_DEFER_TASKRUN`
 #include <linux/stat.h>     // `struct statx`, `STATX_DIOALIGN`
@@ -116,7 +109,7 @@ enum class range_pinning_t : std::uint8_t {
 
 #pragma endregion Configuration
 
-#if USTORE_NVME_HAS_URING
+#if defined(__linux__)
 
 #pragma region Kernel
 

@@ -4,6 +4,7 @@
  *  @date January 9, 2023
  *  @brief Checks that the C ABI accepts valid argument combinations and rejects malformed ones.
  */
+#undef NDEBUG // ! A test's oracle must stay live in every build
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint64_t`
@@ -20,6 +21,7 @@
 #include "test.hpp" // `suite_exit_code`, `expect`, `expect_error`
 
 using namespace unum::ustore;
+using namespace unum::ustore::test;
 using namespace unum;
 
 /** Writes, reads, transactions and scans accept valid tasks and reject malformed ones, per engine capability. */
@@ -385,6 +387,6 @@ int main(int argc, char** argv) {
     }
     test_config_t const config {maybe_directory->path(), options.engine_config};
 
-    report(totals, "database.validation", database_validation(config));
+    report(totals, "database.validation", database_validation, config);
     return suite_exit_code(totals);
 }

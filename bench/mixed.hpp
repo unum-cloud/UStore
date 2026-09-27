@@ -25,7 +25,7 @@
 #include <ustore/graph.h>
 #include <ustore/types.hpp>
 
-namespace unum::ustore {
+namespace unum::ustore::bench {
 
 namespace bm = benchmark;
 
@@ -268,4 +268,4 @@ void edges_upsert(bm::State& state, ustore_database_t db, ustore_collection_t co
     state.counters["bytes/s"] = bm::Counter(committed_bytes, bm::Counter::kIsRate);
 }
 
-} // namespace unum::ustore
+} // namespace unum::ustore::bench

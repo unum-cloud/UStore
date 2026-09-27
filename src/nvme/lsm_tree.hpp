@@ -702,11 +702,12 @@ class lsm_tree {
     /** Which of the two sets is live, stored with release and read with acquire. */
     std::int32_t mutable live_ = 0;
 
-    /** Readers counted into each set, which a publication waits on before it frees the retired one. */
-    std::array<readers_count_t, 2> mutable readers_ {0, 0};
+    /** Readers counted into each set, which a publication waits on before it frees the retired one; on a line of their
+     *  own, so counting in never evicts the live word every reader checks. */
+    alignas(fu::default_alignment_k) std::array<readers_count_t, 2> mutable readers_ {0, 0};
 
-    /** A @c compaction_state_t, moved by @c claim_compaction_ alone. */
-    std::int32_t compacting_ = 0;
+    /** A @c compaction_state_t, moved by @c claim_compaction_ alone, off the readers' line. */
+    alignas(fu::default_alignment_k) std::int32_t compacting_ = 0;
 
 #pragma endregion Private Members
 };

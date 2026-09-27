@@ -211,10 +211,10 @@ class basic_io_channel_guard {
 #pragma region Pool
 
 /**
- *  @brief Which free shared channels one pass of a acquire may claim, from the cheapest to adopt to any.
+ *  @brief Which free shared channels one pass of an acquire may claim, from the cheapest to adopt to any.
  *
  *  Adopting a channel on a thread other than the one that last held it costs an io_uring transport a
- *  ring rebuild, so a acquire tries the tiers in order: a shared this thread bound stays with it, a
+ *  ring rebuild, so an acquire tries the tiers in order: a shared this thread bound stays with it, a
  *  shared nobody bound is taken before another thread's is stolen, and any free one ends the search.
  */
 enum class io_channel_preference_t : std::uint8_t {

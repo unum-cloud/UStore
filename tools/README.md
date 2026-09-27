@@ -4,11 +4,11 @@ The tools run on the embedded C ABI of `include/ustore/db.h` and never see which
 
 ## Command-Line Interface
 
-`cli.cpp` builds into one executable per engine, `ustore_cli_<engine>`, when CMake is configured with `-DUSTORE_BUILD_TOOLS_CPP=1`.
+`cli.cpp` builds into one executable per engine, `ustore_cli_<engine>`, when CMake is configured with `-DUSTORE_BUILD_TOOLS=1`.
 It opens the database in the `--directory` it is given, runs one command and exits, with status 1 when the flags do not parse or the command fails.
 
 ```sh
-cmake --preset release -DUSTORE_BUILD_TOOLS_CPP=1 -DUSTORE_USE_ROCKSDB=1
+cmake --preset release -DUSTORE_BUILD_TOOLS=1 -DUSTORE_WITH_ROCKSDB=1
 cmake --build --preset release --target ustore_cli_rocksdb
 build_release/build/bin/ustore_cli_rocksdb --directory /dev/shm/ustore \
     collection import --input data/twitter/tweets.ndjson --id-field id --memory-limit 1GiB --collection tweets

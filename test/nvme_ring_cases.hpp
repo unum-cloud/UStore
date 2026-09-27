@@ -27,7 +27,7 @@
 
 #include "nvme_fixture.hpp" // `case_label_t`, `same_bytes`
 
-namespace unum::ustore {
+namespace unum::ustore::test {
 
 using namespace unum::ustore::nvme;
 
@@ -951,23 +951,26 @@ template <typename disk_type_>
 void ring_cases(suite_totals_t& totals, char const* transport, disk_type_& disk, medium_reference_t medium,
                 ring_edge_t edge = ring_edge_t::clipped_k) {
     auto const label = [&](char const* name) noexcept { return case_label_t {"ring", transport, name}; };
-    report(totals, label("reads_back").c_str(), ring_reads_back_what_it_wrote(disk, medium));
-    report(totals, label("depth_beyond_credit").c_str(), ring_reaches_depth_beyond_its_credit(disk, medium));
-    report(totals, label("refuses_when_full").c_str(), ring_refuses_when_full(disk, medium));
-    report(totals, label("partial_transfer").c_str(), ring_reports_a_partial_transfer(disk, medium, edge));
-    report(totals, label("refuses_torn_read").c_str(), ring_refuses_a_torn_read(disk, medium));
-    report(totals, label("cancelled_queue_pair").c_str(), ring_drains_a_cancelled_queue_pair(disk, medium));
-    report(totals, label("separates_queue_pairs").c_str(), ring_separates_two_queue_pairs(disk, medium));
-    report(totals, label("foreign_token").c_str(), ring_refuses_a_foreign_token(disk, medium));
-    report(totals, label("registered_memory_in_flight").c_str(),
-           ring_holds_a_registered_memory_in_flight(disk, medium));
-    report(totals, label("cuts_a_chain").c_str(), ring_cuts_a_chain(disk, medium));
-    report(totals, label("flushes_what_it_reaped").c_str(), ring_flushes_what_it_reaped(disk, medium));
-    report(totals, label("impossible_queue pair").c_str(), ring_refuses_an_impossible_queue_pair(disk, medium));
-    report(totals, label("exhausts_its_slots").c_str(), ring_exhausts_its_slots(disk, medium));
-    report(totals, label("undrained_release").c_str(), ring_refuses_an_undrained_release(disk, medium));
-    report(totals, label("oversized_wait").c_str(), ring_refuses_an_oversized_wait(disk, medium));
-    report(totals, label("moves_a_queue pair").c_str(), ring_moves_a_queue_pair_between_threads(disk, medium));
+    report(totals, label("reads_back").c_str(), ring_reads_back_what_it_wrote<disk_type_>, disk, medium);
+    report(totals, label("depth_beyond_credit").c_str(), ring_reaches_depth_beyond_its_credit<disk_type_>, disk,
+           medium);
+    report(totals, label("refuses_when_full").c_str(), ring_refuses_when_full<disk_type_>, disk, medium);
+    report(totals, label("partial_transfer").c_str(), ring_reports_a_partial_transfer<disk_type_>, disk, medium, edge);
+    report(totals, label("refuses_torn_read").c_str(), ring_refuses_a_torn_read<disk_type_>, disk, medium);
+    report(totals, label("cancelled_queue_pair").c_str(), ring_drains_a_cancelled_queue_pair<disk_type_>, disk, medium);
+    report(totals, label("separates_queue_pairs").c_str(), ring_separates_two_queue_pairs<disk_type_>, disk, medium);
+    report(totals, label("foreign_token").c_str(), ring_refuses_a_foreign_token<disk_type_>, disk, medium);
+    report(totals, label("registered_memory_in_flight").c_str(), ring_holds_a_registered_memory_in_flight<disk_type_>,
+           disk, medium);
+    report(totals, label("cuts_a_chain").c_str(), ring_cuts_a_chain<disk_type_>, disk, medium);
+    report(totals, label("flushes_what_it_reaped").c_str(), ring_flushes_what_it_reaped<disk_type_>, disk, medium);
+    report(totals, label("impossible_queue pair").c_str(), ring_refuses_an_impossible_queue_pair<disk_type_>, disk,
+           medium);
+    report(totals, label("exhausts_its_slots").c_str(), ring_exhausts_its_slots<disk_type_>, disk, medium);
+    report(totals, label("undrained_release").c_str(), ring_refuses_an_undrained_release<disk_type_>, disk, medium);
+    report(totals, label("oversized_wait").c_str(), ring_refuses_an_oversized_wait<disk_type_>, disk, medium);
+    report(totals, label("moves_a_queue pair").c_str(), ring_moves_a_queue_pair_between_threads<disk_type_>, disk,
+           medium);
 }
 
 /**
@@ -1002,4 +1005,4 @@ void on_medium(suite_totals_t& totals, char const* name, disk_type_& disk, mediu
     return request;
 }
 
-} // namespace unum::ustore
+} // namespace unum::ustore::test

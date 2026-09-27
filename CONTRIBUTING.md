@@ -5,10 +5,17 @@ This guide is for everyone who changes UStore, people and coding agents alike, a
 
 ## Before You Start
 
-Pull the sibling submodules — NumKong, StringZilla, ForkUnion and SmashTable — before building anything:
+Pull the sibling submodules — NumKong, StringZilla, ForkUnion and SmashTable — before building anything, and put each on the branch `.gitmodules` names, so it tracks that branch's upstream instead of sitting on a detached commit:
 
 ```sh
 git submodule update --init --recursive
+git submodule foreach --quiet 'git switch --quiet "$(git config -f "$toplevel/.gitmodules" "submodule.$name.branch")"'
+```
+
+Later, bring every sibling to the tip of its branch before bumping the pointers this repository records:
+
+```sh
+git submodule foreach --quiet 'git pull --ff-only --quiet'
 ```
 
 The repository carries its own hooks, and configuring CMake arms them; to arm them without a build:
@@ -22,15 +29,16 @@ git config core.hooksPath .githooks
 
 ## Layout and Namespaces
 
-| Directory         | Contents                                                          | Namespace                |
-| :---------------- | :---------------------------------------------------------------- | :----------------------- |
-| `include/ustore/` | C ABI headers as `*.h`, C++ wrappers of the same names as `*.hpp` | `unum::ustore`           |
-| `c/`              | `lib.cpp` with the C ABI dispatch, `docs.cpp` and `graph.cpp`     | `unum::ustore`           |
-| `src/<engine>/`   | `engine.cpp` and the engine's own headers                         | `unum::ustore::<engine>` |
-| `src_oracles/`    | `engine.cpp` of the third-party engines kept as oracles           | `unum::ustore::<engine>` |
-| `tools/`          | the CLI, flag parsing, and dataset import and export              | `unum::ustore`           |
-| `test/`, `bench/` | suites mirroring `src/`, one file per component                   | `unum::ustore`           |
-| `verification/`   | Spin models and GenMC checks, run by `check.sh`                   | none                     |
+| Directory         | Contents                                                           | Namespace                |
+| :---------------- | :----------------------------------------------------------------- | :----------------------- |
+| `include/ustore/` | C ABI headers as `*.h`, C++ wrappers of the same names as `*.hpp`  | `unum::ustore`           |
+| `c/`              | `lib.cpp` with the C ABI dispatch, `docs.cpp` and `graph.cpp`      | `unum::ustore`           |
+| `src/<engine>/`   | `engine.cpp` and the engine's own headers                          | `unum::ustore::<engine>` |
+| `src_oracles/`    | `engine.cpp` of the third-party engines kept as oracles            | `unum::ustore::<engine>` |
+| `tools/`          | the CLI, flag parsing, and dataset import and export               | `unum::ustore`           |
+| `test/`           | suites mirroring `src/`, one file per component, and their harness | `unum::ustore::test`     |
+| `bench/`          | benchmarks mirroring `src/`, with a harness of their own           | `unum::ustore::bench`    |
+| `verification/`   | Spin models and GenMC checks, run by `check.sh`                    | none                     |
 
 Namespaces mirror directories and nothing else: a directory adds a namespace component, and no namespace groups symbols by theme.
 A file name never repeats its directory — `src/nvme/lsm_tree.hpp`, never `src/nvme/nvme_lsm_tree.hpp`.
@@ -165,7 +173,7 @@ Python suites sit in `test/` beside the C++ ones as `<topic>.py`, named so no mo
 
 ```sh
 pip install -e .                                    # SmashTable only
-CMAKE_ARGS="-DUSTORE_USE_ROCKSDB=ON" pip install .  # RocksDB beside it
+CMAKE_ARGS="-DUSTORE_WITH_ROCKSDB=ON" pip install .  # RocksDB beside it
 pip install --group test . && pytest test
 ```
 

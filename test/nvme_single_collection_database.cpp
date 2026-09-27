@@ -9,6 +9,7 @@
  *  see the whole of that commit or none of it, and several threads racing over overlapping keys must
  *  end at a count no lost update could produce.
  */
+#undef NDEBUG // ! A test's oracle must stay live in every build
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint64_t`
@@ -29,7 +30,7 @@
 
 #include "nvme_fixture.hpp" // `basic_fixture`, `run_on_transport`, `expectation_t`, `painted`
 
-namespace unum::ustore {
+namespace unum::ustore::test {
 
 using namespace unum::ustore::nvme;
 
@@ -1127,10 +1128,11 @@ std::size_t scan_visits_every_key_in_order(mount_type_ const& mount) {
 
 #pragma endregion Scan Cases
 
-} // namespace unum::ustore
+} // namespace unum::ustore::test
 
 int main(int argc, char const* argv[]) {
     using namespace unum::ustore;
+    using namespace unum::ustore::test;
 
     suite_options_t options;
     if (argument_status_t const status = parse_suite_options(argc, argv, options);
@@ -1146,16 +1148,16 @@ int main(int argc, char const* argv[]) {
     test_environment_t const environment = test_environment_t::of(options, *directory);
 
     auto const cases = [&](auto const& mount) {
-        report(totals, mount.label("every_layout").c_str(), every_layout_round_trips(mount));
-        report(totals, mount.label("reopen_agrees").c_str(), reopen_agrees_on_its_schema(mount));
-        report(totals, mount.label("every_layout_survives_reopen").c_str(), every_layout_survives_reopen(mount));
-        report(totals, mount.label("crash_before_schema").c_str(), crash_between_seal_and_schema(mount));
-        report(totals, mount.label("commit_all_or_nothing").c_str(), commit_lands_all_or_nothing(mount));
-        report(totals, mount.label("conflict_keeps_changes").c_str(), conflict_keeps_its_changes(mount));
-        report(totals, mount.label("rollback_and_renew").c_str(), rollback_and_renew_behave(mount));
-        report(totals, mount.label("serializes_under_threads").c_str(), transactions_serialize_under_threads(mount));
-        report(totals, mount.label("snapshot_holds_its_moment").c_str(), snapshot_sees_its_moment(mount));
-        report(totals, mount.label("scan_in_order").c_str(), scan_visits_every_key_in_order(mount));
+        report(totals, mount, "every_layout", every_layout_round_trips);
+        report(totals, mount, "reopen_agrees", reopen_agrees_on_its_schema);
+        report(totals, mount, "every_layout_survives_reopen", every_layout_survives_reopen);
+        report(totals, mount, "crash_before_schema", crash_between_seal_and_schema);
+        report(totals, mount, "commit_all_or_nothing", commit_lands_all_or_nothing);
+        report(totals, mount, "conflict_keeps_changes", conflict_keeps_its_changes);
+        report(totals, mount, "rollback_and_renew", rollback_and_renew_behave);
+        report(totals, mount, "serializes_under_threads", transactions_serialize_under_threads);
+        report(totals, mount, "snapshot_holds_its_moment", snapshot_sees_its_moment);
+        report(totals, mount, "scan_in_order", scan_visits_every_key_in_order);
     };
     for (transport_t const transport : every_transport_k)
         run_on_transport(totals, transport, environment, scdb_config_k, 1, "scdb", cases);

@@ -12,6 +12,7 @@
  *  Nothing here touches a disk. The registry reaches its store through a handful of calls, so the store
  *  is a table of words in memory and every case runs at memory speed under both sanitizers.
  */
+#undef NDEBUG // ! A test's oracle must stay live in every build
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint64_t`
@@ -34,6 +35,8 @@
 #include "test.hpp" // `suite_exit_code`, `expect`, `expect_eq`
 
 namespace unum::ustore::nvme {
+
+using namespace unum::ustore::test;
 
 #pragma region Shape
 
@@ -1003,6 +1006,7 @@ static std::size_t roster_survives_churn() {
 
 int main(int argc, char const* argv[]) {
     using namespace unum::ustore;
+    using namespace unum::ustore::test;
     using namespace unum::ustore::nvme;
 
     suite_options_t options;
@@ -1011,22 +1015,22 @@ int main(int argc, char const* argv[]) {
         return status == argument_status_t::help_k ? 0 : 1;
     suite_totals_t totals = options.totals();
 
-    report(totals, "stamps.distinct", commit_stamps_are_distinct());
-    report(totals, "record.orders_writes", record_orders_writes_against_watches());
-    report(totals, "roster.one_claimant", roster_admits_one_claimant_per_identifier());
-    report(totals, "conflict.read_write", read_write_conflict_is_caught());
-    report(totals, "conflict.untouched_commits", untouched_key_commits());
-    report(totals, "conflict.write_write_one_winner", write_write_one_winner());
-    report(totals, "conflict.watch_schedules", watch_schedules_behave());
-    report(totals, "lifecycle.failed_commit_keeps", failed_commit_keeps_changes());
-    report(totals, "lifecycle.flush_releases_channel", refused_flush_releases_the_channel());
-    report(totals, "lifecycle.rollback_and_renew", rollback_and_renew_leave_no_trace());
-    report(totals, "lifecycle.duplicate_id", duplicate_identifier_is_refused());
-    report(totals, "lifecycle.roster_refuses", roster_refuses_past_its_slots());
-    report(totals, "lifecycle.record_bounded", commit_record_is_bounded());
-    report(totals, "threads.serializable", serializable_under_threads());
-    report(totals, "threads.start_during_apply", start_during_apply_still_conflicts());
-    report(totals, "threads.roster_churn", roster_survives_churn());
+    report(totals, "stamps.distinct", commit_stamps_are_distinct);
+    report(totals, "record.orders_writes", record_orders_writes_against_watches);
+    report(totals, "roster.one_claimant", roster_admits_one_claimant_per_identifier);
+    report(totals, "conflict.read_write", read_write_conflict_is_caught);
+    report(totals, "conflict.untouched_commits", untouched_key_commits);
+    report(totals, "conflict.write_write_one_winner", write_write_one_winner);
+    report(totals, "conflict.watch_schedules", watch_schedules_behave);
+    report(totals, "lifecycle.failed_commit_keeps", failed_commit_keeps_changes);
+    report(totals, "lifecycle.flush_releases_channel", refused_flush_releases_the_channel);
+    report(totals, "lifecycle.rollback_and_renew", rollback_and_renew_leave_no_trace);
+    report(totals, "lifecycle.duplicate_id", duplicate_identifier_is_refused);
+    report(totals, "lifecycle.roster_refuses", roster_refuses_past_its_slots);
+    report(totals, "lifecycle.record_bounded", commit_record_is_bounded);
+    report(totals, "threads.serializable", serializable_under_threads);
+    report(totals, "threads.start_during_apply", start_during_apply_still_conflicts);
+    report(totals, "threads.roster_churn", roster_survives_churn);
 
     return suite_exit_code(totals);
 }

@@ -65,7 +65,7 @@ The SmashTable engine is always built, and each other engine is switched on by i
 `tools.cpp` builds only when the CLI does, since it drives the CLI of the same engine.
 
 ```sh
-cmake --preset debug -DUSTORE_BUILD_TEST_CPP=1 -DUSTORE_BUILD_TOOLS_CPP=1 -DUSTORE_USE_ROCKSDB=1 -DUSTORE_USE_LEVELDB=1
+cmake --preset debug -DUSTORE_BUILD_TEST=1 -DUSTORE_BUILD_TOOLS=1 -DUSTORE_WITH_ROCKSDB=1 -DUSTORE_WITH_LEVELDB=1
 cmake --build --preset debug
 ```
 
@@ -88,11 +88,13 @@ Every suite takes its inputs as flags and reads no environment variable, and `--
 | `--cli <path>`             | `tools.cpp`   | The CLI executable the CLI round trip drives                            |
 | `--seed <number>`          | Every suite   | The seed every random draw descends from, drawn and printed when absent |
 | `--no-skips`               | Every suite   | Exit with code 3 when any case skipped, for a rig that must be present  |
+| `--filter <regex>`         | Every suite   | Run only the cases whose label it matches, like `^lsm\.ram\.flush`      |
 
 With `--directory`, a suite creates a unique `ustore-XXXXXX` directory under the path, runs every case inside it, and removes it with its contents at exit, so parallel runs never share a database.
 Without it, the engine runs on its default configuration, and the cases that need persistence or files report `skipped`.
 Without `--cli`, the tools suite reports its CLI case `skipped`.
 Without `--device`, the engine suites skip the `device` transport, and `scripts/rigs/nvmet_loop.sh up` hands out a RAM-backed NVMe namespace to pass to it.
+A failing case prints the command that reruns it alone, with its `--seed` and a `--filter` anchored on its label, and a filter that matches no case fails the suite rather than passing an empty one.
 CTest passes `--directory` as `test_data` inside the build directory, and the tools suite additionally gets `--cli` with the CLI built for the same engine.
 
 ```sh
@@ -136,7 +138,7 @@ Linearizability also takes:
 Build them with the `release` preset and run them under a memory cap:
 
 ```sh
-cmake --preset release -DUSTORE_BUILD_TEST_CPP=1 -DUSTORE_USE_ROCKSDB=1
+cmake --preset release -DUSTORE_BUILD_TEST=1 -DUSTORE_WITH_ROCKSDB=1
 cmake --build --preset release
 systemd-run --user --scope -p MemoryMax=16G -p MemorySwapMax=0 -- \
     build_release/build/bin/ustore_stress_atomicity_rocksdb --directory /dev/shm/ustore-stress --duration 1min

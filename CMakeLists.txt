@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.25)
 
 file(READ "VERSION" USTORE_VERSION)
 string(STRIP ${USTORE_VERSION} USTORE_VERSION)
@@ -34,17 +34,23 @@ endif ()
 # Options
 option(USTORE_INSTALL "Install CMake targets" OFF)
 
-option(USTORE_USE_ROCKSDB "Use RocksDB for a persistent engine" OFF)
-option(USTORE_USE_LEVELDB "Use LevelDB for a persistent engine" OFF)
-option(USTORE_USE_SPDK "Use SPDK for user-space NVMe access in NVMe" OFF)
+option(USTORE_WITH_ROCKSDB "Use RocksDB for a persistent engine" OFF)
+option(USTORE_WITH_LEVELDB "Use LevelDB for a persistent engine" OFF)
+option(USTORE_WITH_SPDK "Use SPDK for user-space NVMe access in NVMe" OFF)
 
-option(USTORE_BUILD_TEST_CPP "Compile a native unit test in C++" ${USTORE_IS_MAIN_PROJECT})
-option(USTORE_BUILD_BENCH_CPP "Compile a native benchmark in C++" ${USTORE_IS_MAIN_PROJECT})
-option(USTORE_BUILD_TOOLS_CPP "Compile the CLI and the dataset tools in C++" OFF)
+option(USTORE_BUILD_TEST "Compile the C++ suites in test/" ${USTORE_IS_MAIN_PROJECT})
+option(USTORE_BUILD_BENCH "Compile the C++ benchmarks in bench/" ${USTORE_IS_MAIN_PROJECT})
+option(USTORE_BUILD_TOOLS "Compile the CLI and the dataset tools in tools/" OFF)
 option(USTORE_BUILD_LIB_C "Compile a native library for the C interface, one per engine" OFF)
 option(USTORE_BUILD_LIB_PYTHON "Compile the CPython extension; `scikit-build-core` switches it on" OFF)
 option(USTORE_BUILD_NVME "Compile the in-tree NVMe engine" OFF)
 option(USTORE_BUILD_CUDA "Compile NVMe's GPU compaction" OFF)
+option(USTORE_WERROR "Treat compiler warnings as errors" OFF)
+# CUB is all the compaction kernels call, so one plain code per generation covers Ampere through Blackwell.
+set(USTORE_CUDA_ARCHITECTURES
+    "80;90;100;120"
+    CACHE STRING "GPU architectures NVMe's compaction compiles for"
+)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -80,11 +86,17 @@ set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 add_library(ustore_warnings INTERFACE)
 if (MSVC)
     target_compile_options(ustore_warnings INTERFACE /W4 /permissive- /Zc:__cplusplus)
+    if (USTORE_WERROR)
+        target_compile_options(ustore_warnings INTERFACE /WX)
+    endif ()
 else ()
     # The C ABI takes named arguments as partially designated structs, leaving the rest zeroed.
     target_compile_options(
         ustore_warnings INTERFACE -Wall -Wextra -Wpedantic -Wno-unknown-pragmas -Wno-missing-field-initializers
     )
+    if (USTORE_WERROR)
+        target_compile_options(ustore_warnings INTERFACE -Werror)
+    endif ()
 endif ()
 
 find_package(Threads REQUIRED)
@@ -104,18 +116,18 @@ else ()
 endif ()
 
 # Engines:
-if (${USTORE_USE_LEVELDB})
+if (${USTORE_WITH_LEVELDB})
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/leveldb.cmake")
     set(LIB_LEVELDB leveldb)
 endif ()
 
-if (${USTORE_USE_ROCKSDB})
+if (${USTORE_WITH_ROCKSDB})
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/rocksdb.cmake")
     set(LIB_ROCKSDB rocksdb)
 endif ()
 
 # The user-space NVMe transport, an `ustore_spdk` interface target over the archives of an SPDK build
-if (${USTORE_USE_SPDK})
+if (${USTORE_WITH_SPDK})
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/spdk.cmake")
 endif ()
 
@@ -124,12 +136,12 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/fmt.cmake")
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/yyjson.cmake")
 
 # ForkUnion's C ABI, linked statically into every engine and suite
-set(FORKUNION_BUILD_TESTS OFF)
+set(FORKUNION_BUILD_TEST OFF)
 set(FORKUNION_INSTALL OFF)
 add_subdirectory(forkunion EXCLUDE_FROM_ALL)
 
 # SmashTable's containers, header-only
-set(SMASHTABLE_BUILD_TESTS OFF)
+set(SMASHTABLE_BUILD_TEST OFF)
 set(SMASHTABLE_BUILD_CUDA OFF)
 set(SMASHTABLE_INSTALL OFF)
 add_subdirectory(smashtable EXCLUDE_FROM_ALL)
@@ -138,10 +150,9 @@ add_subdirectory(smashtable EXCLUDE_FROM_ALL)
 # the running CPU supports. NumKong is unused today; wiring it in later is the same add_subdirectory plus a
 # numkong::header link, once something includes its headers.
 set(STRINGZILLA_BUILD_TEST OFF)
-set(STRINGZILLA_BUILD_BENCHMARK OFF)
+set(STRINGZILLA_BUILD_BENCH OFF)
 set(STRINGZILLA_BUILD_SHARED OFF)
 set(STRINGZILLA_BUILD_STATIC ON)
-set(STRINGZILLAS_BUILD_SHARED OFF)
 set(STRINGZILLA_BUILD_CUDA OFF)
 set(STRINGZILLA_INSTALL OFF)
 # StringZilla arms sanitizers in Debug by default, which leaves its archive needing a runtime the consumers' link lines
@@ -151,9 +162,9 @@ add_subdirectory(stringzilla EXCLUDE_FROM_ALL)
 
 add_library(ustore_stringzilla_dispatch INTERFACE)
 target_link_libraries(ustore_stringzilla_dispatch INTERFACE stringzilla::static)
-target_compile_definitions(ustore_stringzilla_dispatch INTERFACE SZ_DYNAMIC_DISPATCH=1)
+target_compile_definitions(ustore_stringzilla_dispatch INTERFACE STRINGZILLA_RUNTIME_DISPATCH=1)
 
-if (${USTORE_BUILD_BENCH_CPP})
+if (${USTORE_BUILD_BENCH})
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/gbench.cmake")
 endif ()
 
@@ -161,7 +172,7 @@ set(LIB_FMT fmt::fmt)
 
 # The host half of the compaction suite checks the comparator, the survival rule, the sorted-run split and the placement
 # without a device, so a plain test build registers it too.
-if (USTORE_BUILD_CUDA OR USTORE_BUILD_TEST_CPP)
+if (USTORE_BUILD_CUDA OR USTORE_BUILD_TEST)
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/nvme_compaction.cmake")
 endif ()
 
@@ -196,7 +207,7 @@ if (${USTORE_BUILD_NVME})
     list(APPEND USTORE_ENGINE_NAMES "nvme")
 endif ()
 
-if (${USTORE_USE_ROCKSDB})
+if (${USTORE_WITH_ROCKSDB})
     add_library(
         ustore_embedded_rocksdb STATIC ${USTORE_LIB_C_EXCLUSION} src_oracles/rocksdb/engine.cpp c/docs.cpp c/graph.cpp
                                        c/strings.cpp
@@ -206,7 +217,7 @@ if (${USTORE_USE_ROCKSDB})
     list(APPEND USTORE_ENGINE_NAMES "rocksdb")
 endif ()
 
-if (${USTORE_USE_LEVELDB})
+if (${USTORE_WITH_LEVELDB})
     add_library(
         ustore_embedded_leveldb STATIC ${USTORE_LIB_C_EXCLUSION} src_oracles/leveldb/engine.cpp c/docs.cpp c/graph.cpp
                                        c/strings.cpp
@@ -250,7 +261,7 @@ if (USTORE_INSTALL)
     install(DIRECTORY include/ustore DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 endif ()
 
-if (${USTORE_BUILD_TOOLS_CPP})
+if (${USTORE_BUILD_TOOLS})
     foreach (engine_name IN ITEMS ${USTORE_ENGINE_NAMES})
         add_executable(ustore_cli_${engine_name} tools/cli.cpp tools/dataset.cpp)
         target_link_libraries(
@@ -259,7 +270,7 @@ if (${USTORE_BUILD_TOOLS_CPP})
     endforeach ()
 endif ()
 
-if (${USTORE_BUILD_TEST_CPP})
+if (${USTORE_BUILD_TEST})
     enable_testing()
     set(USTORE_TEST_NAMES "api" "compilation" "units" "strings" "strings_collection")
 
@@ -303,7 +314,7 @@ if (${USTORE_BUILD_TEST_CPP})
             target_compile_definitions(
                 ${storage_exe} PRIVATE USTORE_SPDK_RIG="${CMAKE_CURRENT_SOURCE_DIR}/scripts/rigs/spdk_target.sh"
             )
-            if (${USTORE_USE_SPDK})
+            if (${USTORE_WITH_SPDK})
                 target_link_libraries(${storage_exe} ustore_spdk)
                 list(APPEND storage_arguments --spdk-root ${USTORE_SPDK_ROOT})
             endif ()
@@ -331,7 +342,7 @@ if (${USTORE_BUILD_TEST_CPP})
         endforeach ()
 
         # The tools suite drives the CLI of the same engine
-        if (${USTORE_BUILD_TOOLS_CPP})
+        if (${USTORE_BUILD_TOOLS})
             set(test_exe ustore_test_tools_${engine_name})
             add_executable(${test_exe} test/tools.cpp tools/dataset.cpp)
             target_link_libraries(${test_exe} ${LIB_FMT} ${client_lib} ustore_stringzilla_dispatch)
@@ -344,7 +355,7 @@ if (${USTORE_BUILD_TEST_CPP})
 endif ()
 
 # Benchmarks, one executable per engine
-if (${USTORE_BUILD_BENCH_CPP})
+if (${USTORE_BUILD_BENCH})
     foreach (engine_name IN ITEMS ${USTORE_ENGINE_NAMES})
         set(client_lib ustore_embedded_${engine_name})
 

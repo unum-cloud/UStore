@@ -396,7 +396,7 @@ struct database_state {
     snapshot_directory<isolation_> snapshots;
 
     /** Directory the image persists in, empty for a volatile database. */
-    sz::string directory;
+    sz::string_t directory;
 };
 
 /** A database handle of the C ABI, holding one isolation chosen at open. */
@@ -977,8 +977,8 @@ class stream_t {
 };
 
 /** Joins @p directory and @p name into @p path, answering whether it fit in memory. */
-inline bool join_path(sz::string& path, char const* directory, std::string_view name) noexcept {
-    return path.try_assign(sz::string_view {directory}) && path.try_append(name.data(), name.size());
+inline bool join_path(sz::string_t& path, char const* directory, std::string_view name) noexcept {
+    return path.try_assign(sz::string_view_t {directory}) && path.try_append(name.data(), name.size());
 }
 
 /** Writes one pair as its key, its length and its bytes, answering whether all of it reached @p file. */
@@ -992,8 +992,8 @@ inline bool write_pair(std::FILE* file, pair_t const& pair) noexcept {
 /** Writes every pair @p view reads into the image of @p directory: a signature, the key width, then each pair. */
 template <typename view_type_>
 void write_image(view_type_ const& view, char const* directory, ustore_error_t* error) noexcept {
-    sz::string partial_path;
-    sz::string final_path;
+    sz::string_t partial_path;
+    sz::string_t final_path;
     if (!join_path(partial_path, directory, partial_image_name_k) || !join_path(final_path, directory, image_name_k)) {
         *error = {ustore_error_out_of_memory_k, "Failed to build the image path"};
         return;
@@ -1062,7 +1062,7 @@ inline bool recognize_image(std::FILE* file) noexcept {
 /** Loads the image of the directory of @p state into its store, leaving it empty when there is none. */
 template <isolation_t isolation_>
 void read_image(database_state<isolation_>& state, ustore_error_t* error) noexcept {
-    sz::string path;
+    sz::string_t path;
     if (!join_path(path, state.directory.c_str(), image_name_k)) {
         *error = {ustore_error_out_of_memory_k, "Failed to build the image path"};
         return;
@@ -1094,7 +1094,7 @@ void persist(database_state<isolation_>& state, ustore_error_t* error) noexcept 
 template <isolation_t isolation_>
 void open_database(database_state<isolation_>& state, std::string_view directory, ustore_error_t* error) noexcept {
     if (directory.empty()) return;
-    if (!state.directory.try_assign(sz::string_view {directory})) {
+    if (!state.directory.try_assign(sz::string_view_t {directory})) {
         *error = {ustore_error_out_of_memory_k, "Failed to copy the directory"};
         return;
     }

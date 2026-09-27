@@ -4,6 +4,7 @@
  *  @date January 9, 2023
  *  @brief Calls the C++ wrappers in each of their accepted forms, so a change that breaks a call site fails to build.
  */
+#undef NDEBUG // ! A test's oracle must stay live in every build
 
 #include <cstddef> // `std::size_t`
 #include <cstdio>  // `stderr`
@@ -18,6 +19,7 @@
 #include "test.hpp" // `suite_exit_code`, `expect`, `suite_totals_t`
 
 using namespace unum::ustore;
+using namespace unum::ustore::test;
 using namespace unum;
 
 /** Calls every C++ wrapper in each accepted form against one database. */
@@ -109,6 +111,6 @@ int main(int argc, char** argv) {
     }
     test_config_t const config {maybe_directory->path(), options.engine_config};
 
-    report(totals, "wrappers.compile", wrappers_compile(config));
+    report(totals, "wrappers.compile", wrappers_compile, config);
     return suite_exit_code(totals);
 }

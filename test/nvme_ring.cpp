@@ -9,6 +9,7 @@
  *  and want a real filesystem: tmpfs accepts @c O_DIRECT and ignores alignment outright, so a volume
  *  in a scratch directory hides exactly the mistakes the alignment case looks for.
  */
+#undef NDEBUG // ! A test's oracle must stay live in every build
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint64_t`
@@ -27,7 +28,7 @@
 
 #include "nvme_ring_cases.hpp" // `ring_cases`, `ring_fails_a_misaligned_request`
 
-namespace unum::ustore {
+namespace unum::ustore::test {
 
 /** Mounts the RAM transport and runs the suite on it, with and without demanded alignment. */
 void ram_transport(suite_totals_t& totals) {
@@ -43,14 +44,15 @@ void ram_transport(suite_totals_t& totals) {
     if (report(totals, "ram.mount", expect(disk.has_value())) != 0) return;
     on_medium(totals, "ram.volume", *disk, volume_request("ram"),
               [&](medium_reference_t medium) { ring_cases(totals, "ram", *disk, medium); });
-    report(totals, "ram.medium_in_flight", ring_holds_a_medium_in_flight(*disk, volume_request("ram_borrowed")));
+    report(totals, "ram.medium_in_flight", ring_holds_a_medium_in_flight<ram_disk_t>, *disk,
+           volume_request("ram_borrowed"));
 
     expected<ram_device_t> strict_device = ram_device_t::make(portable_alignment_k);
     expected<ram_disk_t> strict_disk = strict_device ? ram_disk_t::make(std::move(*strict_device), config)
                                                      : expected<ram_disk_t> {strict_device.status()};
     if (report(totals, "ram_strict.mount", expect(strict_disk.has_value())) != 0) return;
     on_medium(totals, "ram_strict.volume", *strict_disk, volume_request("ram_strict"), [&](medium_reference_t medium) {
-        report(totals, "ram.misaligned_request", ring_fails_a_misaligned_request(*strict_disk, medium));
+        report(totals, "ram.misaligned_request", ring_fails_a_misaligned_request<ram_disk_t>, *strict_disk, medium);
     });
 }
 
@@ -70,11 +72,11 @@ void blocking_files_transport(suite_totals_t& totals, char const* directory) {
     on_medium(totals, "files.volume", *disk, volume_request(path.c_str()),
               [&](medium_reference_t medium) { ring_cases(totals, "files", *disk, medium); });
     test_path_t const borrowed_path {directory, "volume_borrowed.bin"};
-    report(totals, "files.medium_in_flight",
-           ring_holds_a_medium_in_flight(*disk, volume_request(borrowed_path.c_str())));
+    report(totals, "files.medium_in_flight", ring_holds_a_medium_in_flight<blocking_files_disk_t>, *disk,
+           volume_request(borrowed_path.c_str()));
     test_path_t const durable_path {directory, "volume_durable.bin"};
-    report(totals, "files.keeps_what_it_flushed",
-           ring_keeps_what_it_flushed(*disk, volume_request(durable_path.c_str())));
+    report(totals, "files.keeps_what_it_flushed", ring_keeps_what_it_flushed<blocking_files_disk_t>, *disk,
+           volume_request(durable_path.c_str()));
 
     expected<blocking_files_device_t> strict_device = blocking_files_device_t::make(file_buffering_t::unbuffered_k);
     expected<blocking_files_disk_t> strict_disk = strict_device
@@ -84,16 +86,18 @@ void blocking_files_transport(suite_totals_t& totals, char const* directory) {
     test_path_t const strict_path {directory, "volume_unbuffered.bin"};
     on_medium(totals, "files_unbuffered.volume", *strict_disk, volume_request(strict_path.c_str()),
               [&](medium_reference_t medium) {
-                  report(totals, "files.misaligned_request", ring_fails_a_misaligned_request(*strict_disk, medium));
+                  report(totals, "files.misaligned_request", ring_fails_a_misaligned_request<blocking_files_disk_t>,
+                         *strict_disk, medium);
               });
 }
 
 #pragma endregion Drivers
 
-} // namespace unum::ustore
+} // namespace unum::ustore::test
 
 int main(int argc, char const* argv[]) {
     using namespace unum::ustore;
+    using namespace unum::ustore::test;
 
     suite_options_t options;
     if (argument_status_t const status = parse_suite_options(argc, argv, options);

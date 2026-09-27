@@ -7,7 +7,7 @@ configure_file("${USTORE_COMPACTION_TEST_SOURCE}" "${USTORE_COMPACTION_HOST_SOUR
 add_executable(ustore_test_nvme_compaction_host "${USTORE_COMPACTION_HOST_SOURCE}")
 target_include_directories(ustore_test_nvme_compaction_host PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/test")
 target_link_libraries(ustore_test_nvme_compaction_host ${LIB_FMT} ustore_warnings smashtable::header forkunion::header)
-if (USTORE_BUILD_TEST_CPP)
+if (USTORE_BUILD_TEST)
     add_test(NAME ustore_test_nvme_compaction_host COMMAND ustore_test_nvme_compaction_host)
 endif ()
 
@@ -33,25 +33,8 @@ if (NOT CMAKE_CUDA_COMPILER)
     return()
 endif ()
 
-# Hopper, Blackwell data center and Blackwell workstation GPUs, plus the GPUs of the building machine
-if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 90 100 120)
-    find_program(USTORE_NVIDIA_SMI nvidia-smi HINTS /usr/lib/wsl/lib)
-    if (USTORE_NVIDIA_SMI)
-        execute_process(
-            COMMAND "${USTORE_NVIDIA_SMI}" --query-gpu=compute_cap --format=csv,noheader
-            OUTPUT_VARIABLE ustore_compute_capabilities
-            RESULT_VARIABLE ustore_nvidia_smi_status
-            OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET
-        )
-        if (ustore_nvidia_smi_status EQUAL 0)
-            string(REPLACE "." "" ustore_compute_capabilities "${ustore_compute_capabilities}")
-            string(REPLACE "\n" ";" ustore_compute_capabilities "${ustore_compute_capabilities}")
-            list(APPEND CMAKE_CUDA_ARCHITECTURES ${ustore_compute_capabilities})
-            list(REMOVE_DUPLICATES CMAKE_CUDA_ARCHITECTURES)
-        endif ()
-    endif ()
-endif ()
+# The same codes on every machine, rather than whatever GPU the building one carries
+set(CMAKE_CUDA_ARCHITECTURES ${USTORE_CUDA_ARCHITECTURES})
 enable_language(CUDA)
 find_package(CUDAToolkit REQUIRED)
 include("${CMAKE_CURRENT_LIST_DIR}/cccl.cmake")
@@ -69,12 +52,12 @@ target_compile_options(ustore_nvme_compaction PUBLIC $<$<COMPILE_LANGUAGE:CUDA>:
 # StringZilla's serial kernels, reached through the engine's key slots, carry GCC pragmas nvcc's front end does not know
 target_compile_options(ustore_nvme_compaction PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--diag-suppress=1675>)
 # Every target linking the library merges on the device, and every other one takes the host branch of the merger
-target_compile_definitions(ustore_nvme_compaction PUBLIC USTORE_USE_CUDA=1)
+target_compile_definitions(ustore_nvme_compaction PUBLIC USTORE_WITH_CUDA=1)
 
 add_executable(ustore_test_nvme_compaction "${USTORE_COMPACTION_TEST_SOURCE}")
 target_include_directories(ustore_test_nvme_compaction PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/test")
 target_link_libraries(ustore_test_nvme_compaction ${LIB_FMT} ustore_nvme_compaction)
 set_target_properties(ustore_test_nvme_compaction PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
-if (USTORE_BUILD_TEST_CPP)
+if (USTORE_BUILD_TEST)
     add_test(NAME ustore_test_nvme_compaction COMMAND ustore_test_nvme_compaction)
 endif ()

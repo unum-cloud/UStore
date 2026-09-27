@@ -23,7 +23,7 @@
 #include <yyjson.h> // `yyjson_read`, `yyjson_mut_doc`
 
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
-#include <stringzilla/stringzilla.hpp> // `sz::string`, `sz::string_view`
+#include <stringzilla/stringzilla.hpp> // `sz::string_t`, `sz::string_view_t`
 
 #include <ustore/blobs.h>   // `ustore_scan_t`, `ustore_read_t`
 #include <ustore/docs.h>    // `ustore_docs_write_t`, `ustore_docs_read_t`
@@ -76,7 +76,7 @@ class mapped_file_t {
     }
 
     /** The mapped bytes, empty before a successful @c map or for an empty file. */
-    [[nodiscard]] sz::string_view view() const noexcept { return {data_, size_}; }
+    [[nodiscard]] sz::string_view_t view() const noexcept { return {data_, size_}; }
 
   private:
 
@@ -104,7 +104,7 @@ class mapped_file_t {
 class output_file_t {
     int descriptor_ = -1;
     std::size_t threshold_ = 0;
-    sz::string buffer_;
+    sz::string_t buffer_;
 
   public:
     output_file_t() noexcept = default;
@@ -180,7 +180,7 @@ class task_arena_t {
 };
 
 /** Drops a trailing carriage return, so CRLF files read as LF files. */
-[[nodiscard]] std::string_view without_carriage_return(sz::string_view line) noexcept {
+[[nodiscard]] std::string_view without_carriage_return(sz::string_view_t line) noexcept {
     std::string_view view = line;
     if (!view.empty() && view.back() == '\r') view.remove_suffix(1);
     return view;
@@ -274,7 +274,7 @@ void place(yyjson_mut_doc* builder, yyjson_mut_val* root, ustore_str_view_t fiel
 }
 
 /** Serializes the root of @p builder into @p output. */
-void append_json(yyjson_mut_doc* builder, sz::string& output, ustore_error_t* error) noexcept {
+void append_json(yyjson_mut_doc* builder, sz::string_t& output, ustore_error_t* error) noexcept {
     std::size_t length = 0;
     json_text_t const text {yyjson_mut_write(builder, 0, &length)};
     if (!text.handle) {
@@ -286,7 +286,7 @@ void append_json(yyjson_mut_doc* builder, sz::string& output, ustore_error_t* er
 
 /** Serializes the @p fields of @p document into @p output, nesting JSON pointers into objects and skipping missing
  * fields. */
-void project(yyjson_val* document, field_list_t fields, sz::string& output, ustore_error_t* error) noexcept {
+void project(yyjson_val* document, field_list_t fields, sz::string_t& output, ustore_error_t* error) noexcept {
     json_builder_t const builder {yyjson_mut_doc_new(nullptr)};
     yyjson_mut_val* const root = builder.handle ? yyjson_mut_obj(builder.handle) : nullptr;
     if (!root) {
@@ -314,9 +314,9 @@ enum class csv_boundary_t {
 
 /** Walks CSV records field by field, unquoting quoted fields into a scratch string. */
 class csv_reader_t {
-    sz::string_view text_;
+    sz::string_view_t text_;
     std::size_t position_ = 0;
-    sz::string unquoted_;
+    sz::string_t unquoted_;
 
     /** Steps over the comma or the line break after a field and answers which one it was. */
     [[nodiscard]] csv_boundary_t consume_delimiter() noexcept {
@@ -333,7 +333,7 @@ class csv_reader_t {
     }
 
   public:
-    explicit csv_reader_t(sz::string_view text) noexcept : text_(text) {}
+    explicit csv_reader_t(sz::string_view_t text) noexcept : text_(text) {}
 
     /** Skips empty lines and answers whether any record remains. */
     [[nodiscard]] bool has_record() noexcept {
@@ -362,7 +362,7 @@ class csv_reader_t {
             field = unquoted_;
             return consume_delimiter();
         }
-        std::size_t end = text_.find_first_of(sz::string_view {",\r\n"}, position_);
+        std::size_t end = text_.find_first_of(sz::string_view_t {",\r\n"}, position_);
         if (end > size) end = size;
         field = {data + position_, end - position_};
         position_ = end;
@@ -384,8 +384,8 @@ struct csv_column_t {
 };
 
 /** Reads the header record into @p names and @p columns, keeping the columns @p fields names, or all without fields. */
-void read_header(csv_reader_t& reader, field_list_t fields, sz::string& names, st::basic_vector<csv_column_t>& columns,
-                 ustore_error_t* error) noexcept {
+void read_header(csv_reader_t& reader, field_list_t fields, sz::string_t& names,
+                 st::basic_vector<csv_column_t>& columns, ustore_error_t* error) noexcept {
     if (!reader.has_record()) {
         *error = {ustore_error_malformed_k, "The CSV file has no header"};
         return;
@@ -434,7 +434,7 @@ void read_header(csv_reader_t& reader, field_list_t fields, sz::string& names, s
 }
 
 /** Answers the index of the column named @p field, ignoring a leading slash, or the column count when absent. */
-[[nodiscard]] std::size_t column_index(sz::string const& names, st::basic_vector<csv_column_t> const& columns,
+[[nodiscard]] std::size_t column_index(sz::string_t const& names, st::basic_vector<csv_column_t> const& columns,
                                        ustore_str_view_t field) noexcept {
     std::string_view name {field};
     if (name.starts_with('/')) name.remove_prefix(1);
@@ -445,10 +445,10 @@ void read_header(csv_reader_t& reader, field_list_t fields, sz::string& names, s
 }
 
 /** Writes @p text as one quoted CSV field, doubling the quotes inside. */
-void append_quoted(output_file_t& output, sz::string_view text, ustore_error_t* error) noexcept {
+void append_quoted(output_file_t& output, sz::string_view_t text, ustore_error_t* error) noexcept {
     output.append("\"", error);
     std::string_view separator;
-    for (sz::string_view segment : sz::split(text, "\"")) {
+    for (sz::string_view_t segment : sz::split(text, "\"")) {
         output.append(separator, error);
         output.append(segment, error);
         separator = "\"\"";
@@ -511,13 +511,13 @@ struct staged_document_t {
 
 /** Documents staged for one batched upsert. */
 class document_batch_t {
-    sz::string text_;
+    sz::string_t text_;
     st::basic_vector<staged_document_t> documents_;
 
   public:
 
     /** The buffer every document is appended to. */
-    [[nodiscard]] sz::string& text() noexcept { return text_; }
+    [[nodiscard]] sz::string_t& text() noexcept { return text_; }
 
     /** Bytes the staged documents and the text appended after them occupy. */
     [[nodiscard]] std::size_t bytes() const noexcept { return text_.size(); }
@@ -558,10 +558,10 @@ class document_batch_t {
 };
 
 /** Imports one document per NDJSON line, whole or projected onto @c task.fields. */
-void import_ndjson_documents(ustore_docs_import_t const& task, sz::string_view text, ustore_arena_t* arena) noexcept {
+void import_ndjson_documents(ustore_docs_import_t const& task, sz::string_view_t text, ustore_arena_t* arena) noexcept {
     field_list_t const fields {task.fields, task.fields_stride, task.fields_count};
     document_batch_t batch;
-    for (sz::string_view line : sz::split(text, "\n")) {
+    for (sz::string_view_t line : sz::split(text, "\n")) {
         std::string_view const row = without_carriage_return(line);
         if (row.empty()) continue;
 
@@ -589,10 +589,10 @@ void import_ndjson_documents(ustore_docs_import_t const& task, sz::string_view t
 }
 
 /** Imports one document per CSV record, keeping the columns the header marked kept. */
-void import_csv_documents(ustore_docs_import_t const& task, sz::string_view text, ustore_arena_t* arena) noexcept {
+void import_csv_documents(ustore_docs_import_t const& task, sz::string_view_t text, ustore_arena_t* arena) noexcept {
     field_list_t const fields {task.fields, task.fields_stride, task.fields_count};
     csv_reader_t reader {text};
-    sz::string names;
+    sz::string_t names;
     st::basic_vector<csv_column_t> columns;
     read_header(reader, fields, names, columns, task.error);
     if (task.error->status) return;
@@ -726,9 +726,9 @@ void stage_edge(ustore_graph_import_t const& task, ustore_arena_t* arena, st::ba
 }
 
 /** Imports one edge per NDJSON line, reading its vertices and edge from integer fields. */
-void import_ndjson_edges(ustore_graph_import_t const& task, sz::string_view text, ustore_arena_t* arena) noexcept {
+void import_ndjson_edges(ustore_graph_import_t const& task, sz::string_view_t text, ustore_arena_t* arena) noexcept {
     st::basic_vector<edge_row_t> edges;
-    for (sz::string_view line : sz::split(text, "\n")) {
+    for (sz::string_view_t line : sz::split(text, "\n")) {
         std::string_view const row = without_carriage_return(line);
         if (row.empty()) continue;
 
@@ -749,9 +749,9 @@ void import_ndjson_edges(ustore_graph_import_t const& task, sz::string_view text
 }
 
 /** Imports one edge per CSV record, reading its vertices and edge from the columns the header names. */
-void import_csv_edges(ustore_graph_import_t const& task, sz::string_view text, ustore_arena_t* arena) noexcept {
+void import_csv_edges(ustore_graph_import_t const& task, sz::string_view_t text, ustore_arena_t* arena) noexcept {
     csv_reader_t reader {text};
-    sz::string names;
+    sz::string_t names;
     st::basic_vector<csv_column_t> columns;
     read_header(reader, field_list_t {}, names, columns, task.error);
     if (task.error->status) return;
@@ -874,7 +874,7 @@ void ustore_docs_export(ustore_docs_export_t* task_pointer) {
     if (format == dataset_format_t::csv_k) output.append("_id,doc\n", task.error);
 
     task_arena_t const arena {task.arena};
-    sz::string projected;
+    sz::string_t projected;
     auto const export_batch = [&](std::span<ustore_key_t const> keys) noexcept {
         ustore_length_t* offsets = nullptr;
         ustore_length_t* lengths = nullptr;
@@ -897,14 +897,14 @@ void ustore_docs_export(ustore_docs_export_t* task_pointer) {
 
         for (std::size_t index = 0; index != keys.size() && !task.error->status; ++index) {
             if (lengths[index] == ustore_length_missing_k) continue;
-            sz::string_view document {reinterpret_cast<char const*>(values) + offsets[index], lengths[index]};
+            sz::string_view_t document {reinterpret_cast<char const*>(values) + offsets[index], lengths[index]};
             while (document.size() != 0 && document[document.size() - 1] == '\n')
-                document = sz::string_view(document.data(), document.size() - 1);
+                document = sz::string_view_t(document.data(), document.size() - 1);
             if (fields.count != 0) {
                 json_document_t const parsed {yyjson_read(document.data(), document.size(), 0)};
                 projected.clear();
                 project(yyjson_doc_get_root(parsed.handle), fields, projected, task.error);
-                document = sz::string_view(projected.data(), projected.size());
+                document = sz::string_view_t(projected.data(), projected.size());
             }
             if (format == dataset_format_t::ndjson_k) {
                 output.append("{\"_id\":", task.error);

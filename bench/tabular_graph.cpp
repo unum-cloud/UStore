@@ -36,7 +36,7 @@
 
 namespace bm = benchmark;
 
-namespace unum::ustore {
+namespace unum::ustore::bench {
 
 /** The format of the input files, which the exports also take, in the order of @c format_names_k. */
 enum class file_format_t : std::size_t {
@@ -111,7 +111,7 @@ struct tabular_t {
     ustore_database_t db = nullptr;
 
     /** Null-terminated paths of the input files, one after another. */
-    sz::string paths;
+    sz::string_t paths;
 
     /** The listed input files, whose shares the import threads take. */
     st::basic_vector<source_file_t> files;
@@ -121,7 +121,7 @@ struct tabular_t {
 };
 
 /** Reads the whole file at @p path into @p content, answering whether it succeeded. */
-[[nodiscard]] bool read_file(char const* path, sz::string& content) noexcept {
+[[nodiscard]] bool read_file(char const* path, sz::string_t& content) noexcept {
     int const descriptor = open(path, O_RDONLY);
     if (descriptor == -1) return false;
     struct stat metadata {};
@@ -137,7 +137,7 @@ struct tabular_t {
 }
 
 /** Remembers the path and size of @p name under @p directory, answering whether both fit. */
-[[nodiscard]] bool remember_file(tabular_t& tabular, sz::string const& directory, char const* name) noexcept {
+[[nodiscard]] bool remember_file(tabular_t& tabular, sz::string_t const& directory, char const* name) noexcept {
     std::size_t const offset = tabular.paths.size();
     if (!tabular.paths.try_append(directory) || !tabular.paths.try_append(name) || !tabular.paths.try_push_back('\0'))
         return false;
@@ -151,7 +151,7 @@ struct tabular_t {
 [[nodiscard]] bool list_files(settings_t const& settings, tabular_t& tabular) noexcept {
     std::string_view const extension = format_name(selected_format(settings));
     fmt::println("Will search for .{} files...", extension);
-    sz::string directory;
+    sz::string_t directory;
     if (!directory.try_append(settings.dataset.data(), settings.dataset.size()) || !directory.try_push_back('/'))
         return false;
 
@@ -247,7 +247,7 @@ void clear_main(ustore_database_t db) noexcept {
 }
 
 /** Composes the path of the export named @p stem that the thread at @p thread_index writes, in the input format. */
-[[nodiscard]] bool export_path(sz::string& path, settings_t const& settings, std::string_view stem,
+[[nodiscard]] bool export_path(sz::string_t& path, settings_t const& settings, std::string_view stem,
                                std::size_t thread_index) noexcept {
     std::string_view const extension = format_name(selected_format(settings));
     char infix[24];
@@ -328,7 +328,7 @@ void bench_graph_import(bm::State& state, tabular_t const& tabular, settings_t c
 }
 
 void bench_docs_export(bm::State& state, tabular_t const& tabular, settings_t const& settings) {
-    sz::string output;
+    sz::string_t output;
     if (!export_path(output, settings, "tabular_graph_docs", static_cast<std::size_t>(state.thread_index()))) {
         state.SkipWithError("Failed to allocate the output path");
         return;
@@ -359,10 +359,10 @@ void bench_docs_export(bm::State& state, tabular_t const& tabular, settings_t co
 }
 
 void bench_graph_export(bm::State& state, tabular_t const& tabular, settings_t const& settings) {
-    sz::string output;
-    sz::string source;
-    sz::string target;
-    sz::string edge;
+    sz::string_t output;
+    sz::string_t source;
+    sz::string_t target;
+    sz::string_t edge;
     if (!export_path(output, settings, "tabular_graph_edges", static_cast<std::size_t>(state.thread_index())) ||
         !source.try_append(settings.source_field.data(), settings.source_field.size()) ||
         !target.try_append(settings.target_field.data(), settings.target_field.size()) ||
@@ -371,7 +371,7 @@ void bench_graph_export(bm::State& state, tabular_t const& tabular, settings_t c
         return;
     }
     // Exported column names cannot hold the slashes of JSON pointers.
-    for (sz::string* name : {&source, &target, &edge})
+    for (sz::string_t* name : {&source, &target, &edge})
         for (std::size_t index = 0; index != name->size(); ++index)
             if ((*name)[index] == '/') (*name)[index] = '_';
 
@@ -403,15 +403,16 @@ void bench_graph_export(bm::State& state, tabular_t const& tabular, settings_t c
 }
 
 /** Composes a benchmark name from @p prefix and the name of @p format. */
-[[nodiscard]] bool benchmark_name(sz::string& name, char const* prefix, file_format_t format) noexcept {
+[[nodiscard]] bool benchmark_name(sz::string_t& name, char const* prefix, file_format_t format) noexcept {
     std::string_view const suffix = format_name(format);
     return name.try_append(prefix) && name.try_append(suffix.data(), suffix.size());
 }
 
-} // namespace unum::ustore
+} // namespace unum::ustore::bench
 
 int main(int argc, char** argv) {
     using namespace unum::ustore;
+    using namespace unum::ustore::bench;
 
     settings_t settings;
     std::array<flag_t, 11> const flags {{
@@ -456,7 +457,7 @@ int main(int argc, char** argv) {
     tabular_t tabular;
     if (!list_files(settings, tabular)) return 1;
 
-    sz::string config;
+    sz::string_t config;
     bool const configured = settings.config.empty()
                                 ? config.try_append(R"({"version": "1.0", "directory": ")") &&
                                       config.try_append(settings.directory.data(), settings.directory.size()) &&
@@ -478,10 +479,10 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    sz::string docs_import_name;
-    sz::string docs_export_name;
-    sz::string graph_import_name;
-    sz::string graph_export_name;
+    sz::string_t docs_import_name;
+    sz::string_t docs_export_name;
+    sz::string_t graph_import_name;
+    sz::string_t graph_export_name;
     if (!benchmark_name(docs_import_name, "docs_import_", selected_format(settings)) ||
         !benchmark_name(docs_export_name, "docs_export_", selected_format(settings)) ||
         !benchmark_name(graph_import_name, "graph_import_", selected_format(settings)) ||

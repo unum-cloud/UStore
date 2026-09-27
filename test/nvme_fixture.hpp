@@ -25,7 +25,7 @@
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 #include <type_traits> // `std::is_same_v`
-#include <utility>     // `std::move`
+#include <utility>     // `std::exchange`, `std::move`
 
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
@@ -41,7 +41,7 @@
 
 #include "test.hpp" // `describe`, `expect_status`, `suite_totals_t`
 
-namespace unum::ustore {
+namespace unum::ustore::test {
 
 using namespace unum::ustore::nvme;
 
@@ -351,6 +351,12 @@ struct basic_fixture {
     /** The generator every random draw of a case descends from. */
     test_random_t random;
 
+    /** Bytes the budgets held once the mount finished, which a case hands back before its fixture dies. */
+    std::size_t mounted_bytes = 0;
+
+    /** Where a fixture dying with bytes still charged counts the leak, or null to count nowhere. */
+    std::size_t* leaks = nullptr;
+
     basic_fixture(disk_type_&& mounted, fixture_config_t const& mounted_shape, transport_t mounted_on,
                   std::uint64_t seed) noexcept
         : resources(std::make_shared<resources_t>(mounted_shape.memory_limit)), disk(std::move(mounted)),
@@ -360,6 +366,13 @@ struct basic_fixture {
     basic_fixture& operator=(basic_fixture const&) = delete;
 
     ~basic_fixture() noexcept {
+        // Only the last owner can tell a leak from a budget a case still holds on purpose.
+        if (leaks && resources.use_count() == 1)
+            if (std::size_t const held = resources->memory_constraint.used(); held != mounted_bytes) {
+                fmt::println(stderr, "  check failed: the budgets hold {} bytes past the mount's {}", held,
+                             mounted_bytes);
+                ++*leaks;
+            }
         [[maybe_unused]] status_t const parked = channels.release_all();
         [[maybe_unused]] status_t const unpinned = arena.unregister(disk);
         for (std::size_t index = 0; index != media.size(); ++index)
@@ -447,6 +460,9 @@ struct basic_mount {
     /** Volumes a fixture holds unless a case asks for its own capacities. */
     std::size_t volumes = 1;
 
+    /** Where every fixture of this mount counts a leak, which the mount's @c report charges to the case. */
+    std::size_t* leaks = nullptr;
+
     /** A fixture of @c volumes volumes of the suite's config. */
     expected<fixture_unique_ptr_t> operator()() const noexcept { return (*this)(config); }
 
@@ -503,6 +519,8 @@ struct basic_mount {
                 blanked.failed())
                 return blanked;
         }
+        fixture->mounted_bytes = fixture->resources->memory_constraint.used();
+        fixture->leaks = leaks;
         return fixture;
     }
 
@@ -515,6 +533,9 @@ struct basic_mount {
     [[nodiscard]] case_label_t label(char const* name) const noexcept {
         return case_label_t {suite, name_of(transport), name};
     }
+
+    /** Failures the fixtures of this mount counted as leaks since the last call, which it hands over and forgets. */
+    [[nodiscard]] std::size_t take_leaks() const noexcept { return leaks ? std::exchange(*leaks, std::size_t {0}) : 0; }
 
   private:
 
@@ -548,15 +569,44 @@ struct basic_mount {
 
 #pragma region Driver
 
+/** Runs @p case_function on @p mount as @c report does, failing it when a fixture it mounted died with bytes still
+ *  charged to its budgets. */
+template <typename disk_type_, typename result_type_>
+std::size_t report_on_mount(suite_totals_t& totals, basic_mount<disk_type_> const& mount, char const* name,
+                            result_type_ (*case_function)(basic_mount<disk_type_> const&)) {
+    case_label_t const label = mount.label(name);
+    if (!totals.selects(label.c_str())) return 0;
+    case_result_t result(case_function(mount));
+    result.failures += mount.take_leaks();
+    return report(totals, label.c_str(), result);
+}
+
+/** A case of @p mount counting its failures, named without its template arguments. */
+template <typename disk_type_>
+std::size_t report(suite_totals_t& totals, basic_mount<disk_type_> const& mount, char const* name,
+                   std::size_t (*case_function)(basic_mount<disk_type_> const&)) {
+    return report_on_mount(totals, mount, name, case_function);
+}
+
+/** A case of @p mount that may skip, named without its template arguments. */
+template <typename disk_type_>
+std::size_t report(suite_totals_t& totals, basic_mount<disk_type_> const& mount, char const* name,
+                   case_result_t (*case_function)(basic_mount<disk_type_> const&)) {
+    return report_on_mount(totals, mount, name, case_function);
+}
+
+/** Mounts one fixture and lets it go, which is the first case of every transport. */
+template <typename disk_type_>
+std::size_t mounts_a_fixture(basic_mount<disk_type_> const& mount) {
+    expected<typename basic_mount<disk_type_>::fixture_unique_ptr_t> const probe = mount();
+    return expect_status(probe, status_code_t::success_k);
+}
+
 /** Mounts one probe fixture, reports it as the transport's @c mount case, and hands @p cases the mount when it held. */
 template <typename disk_type_, typename cases_type_>
 std::size_t run_on_mount(suite_totals_t& totals, basic_mount<disk_type_> const& mount, cases_type_&& cases) {
-    std::size_t failures = 0;
-    {
-        expected<typename basic_mount<disk_type_>::fixture_unique_ptr_t> const probe = mount();
-        failures += expect_status(probe, status_code_t::success_k);
-    }
-    if (report(totals, mount.label("mount").c_str(), failures) != 0) return failures;
+    std::size_t const failures = report(totals, mount, "mount", mounts_a_fixture);
+    if (failures != 0) return failures;
     cases(mount);
     return 0;
 }
@@ -583,16 +633,18 @@ std::size_t run_on_transport(suite_totals_t& totals, transport_t transport, test
     if (transport == transport_t::device_k && volumes > 1)
         return report(totals, label.c_str(), case_result_t::skipped(one_volume_per_device_k));
 
+    std::size_t leaks = 0;
     switch (transport) {
     case transport_t::memory_k:
-        return run_on_mount(totals, basic_mount<ram_disk_t> {environment, config, transport, suite, volumes}, cases);
-    case transport_t::files_k:
-        return run_on_mount(totals, basic_mount<blocking_files_disk_t> {environment, config, transport, suite, volumes},
+        return run_on_mount(totals, basic_mount<ram_disk_t> {environment, config, transport, suite, volumes, &leaks},
                             cases);
+    case transport_t::files_k:
+        return run_on_mount(
+            totals, basic_mount<blocking_files_disk_t> {environment, config, transport, suite, volumes, &leaks}, cases);
     case transport_t::io_uring_k:
     case transport_t::device_k:
-        return run_on_mount(totals, basic_mount<uring_files_disk_t> {environment, config, transport, suite, volumes},
-                            cases);
+        return run_on_mount(
+            totals, basic_mount<uring_files_disk_t> {environment, config, transport, suite, volumes, &leaks}, cases);
     case transport_t::spdk_k:
         // The driver mounts no SPDK disk: the transport skips even when `--spdk-address` names one.
         return report(totals, label.c_str(), case_result_t::skipped("the driver mounts no SPDK disk"));
@@ -643,4 +695,4 @@ inline void paint_into(expectation_t const& entry, std::span<byte_t> into) noexc
 
 #pragma endregion Byte Painters
 
-} // namespace unum::ustore
+} // namespace unum::ustore::test

@@ -15,6 +15,7 @@
  *  and stops it after. A namespace never answers a partial transfer, so the shared cases run with the
  *  read past the namespace refused whole rather than clipped.
  */
+#undef NDEBUG // ! A test's oracle must stay live in every build
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint64_t`
@@ -41,7 +42,7 @@
 #define USTORE_SPDK_RIG "scripts/rigs/spdk_target.sh"
 #endif
 
-namespace unum::ustore {
+namespace unum::ustore::test {
 
 using namespace unum::ustore::nvme;
 
@@ -330,7 +331,7 @@ class spdk_rig_t {
 
 #pragma endregion Rig
 
-#if USTORE_NVME_HAS_SPDK
+#if USTORE_WITH_SPDK
 
 #pragma region Cases
 
@@ -373,8 +374,8 @@ void spdk_transport(suite_totals_t& totals, char const* address, std::string_vie
     expected<spdk_disk_t> disk = spdk_disk_t::open(*environment, address, config);
     if (report(totals, "spdk.mount", expect_status(disk, status_code_t::success_k)) != 0) return;
 
-    report(totals, "spdk.identify", spdk_identifies_the_controller(*disk, serial));
-    report(totals, "spdk.namespace", spdk_reports_the_namespace(*disk));
+    report(totals, "spdk.identify", spdk_identifies_the_controller, *disk, serial);
+    report(totals, "spdk.namespace", spdk_reports_the_namespace, *disk);
 
     std::size_t volume_failures = 0;
     expected<registered_medium_t> registered = disk->register_medium(volume_request("namespace"));
@@ -388,8 +389,10 @@ void spdk_transport(suite_totals_t& totals, char const* address, std::string_vie
     }
     report(totals, "spdk.volume", volume_failures);
 
-    report(totals, "spdk.target_in_flight", ring_holds_a_target_in_flight(*disk, volume_request("namespace")));
-    report(totals, "spdk.keeps_what_it_flushed", ring_keeps_what_it_flushed(*disk, volume_request("namespace")));
+    report(totals, "spdk.target_in_flight", ring_holds_a_target_in_flight<spdk_disk_t>, *disk,
+           volume_request("namespace"));
+    report(totals, "spdk.keeps_what_it_flushed", ring_keeps_what_it_flushed<spdk_disk_t>, *disk,
+           volume_request("namespace"));
 }
 
 /** Runs the transport where the flags name a target, starting one through the rig when asked to. */
@@ -460,18 +463,19 @@ void spdk_suite(suite_totals_t& totals, suite_options_t const& options, spdk_sui
 
 /** Checks the refusals, and reports that the transport itself needs a build that carries the driver. */
 void spdk_suite(suite_totals_t& totals, suite_options_t const&, spdk_suite_flags_t const&) {
-    report(totals, "spdk.refuses_without_the_option", spdk_refuses_without_the_option());
-    report(totals, "spdk", case_result_t::skipped("needs a build with USTORE_USE_SPDK"));
+    report(totals, "spdk.refuses_without_the_option", spdk_refuses_without_the_option);
+    report(totals, "spdk", case_result_t::skipped("needs a build with USTORE_WITH_SPDK"));
 }
 
 #pragma endregion Refusals
 
 #endif
 
-} // namespace unum::ustore
+} // namespace unum::ustore::test
 
 int main(int argc, char const* argv[]) {
     using namespace unum::ustore;
+    using namespace unum::ustore::test;
     using namespace unum::ustore::nvme;
 
     suite_options_t options;
@@ -486,12 +490,12 @@ int main(int argc, char const* argv[]) {
         return status == argument_status_t::help_k ? 0 : 1;
     suite_totals_t totals = options.totals();
 
-    report(totals, "spdk.absent_address", spdk_refuses_an_absent_address());
-    report(totals, "spdk.hugepage_pool", spdk_parses_the_hugepage_pool());
-    report(totals, "spdk.bound_driver", spdk_names_the_bound_driver());
-    report(totals, "spdk.normalises_address", spdk_normalises_an_address());
-    report(totals, "spdk.fabric_address", spdk_passes_a_fabric_address());
-    report(totals, "spdk.probes_this_machine", spdk_probes_this_machine());
+    report(totals, "spdk.absent_address", spdk_refuses_an_absent_address);
+    report(totals, "spdk.hugepage_pool", spdk_parses_the_hugepage_pool);
+    report(totals, "spdk.bound_driver", spdk_names_the_bound_driver);
+    report(totals, "spdk.normalises_address", spdk_normalises_an_address);
+    report(totals, "spdk.fabric_address", spdk_passes_a_fabric_address);
+    report(totals, "spdk.probes_this_machine", spdk_probes_this_machine);
     spdk_suite(totals, options, flags);
     return suite_exit_code(totals);
 }

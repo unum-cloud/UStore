@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/acquire@v7
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -48,7 +48,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout the latest code
-        uses: actions/acquire@v7
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           # The push below inherits this credential; the default token holds no role to bypass branch protection.
@@ -58,7 +58,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git fetch origin main
-          git acquire main-dev
+          git checkout main-dev
           git rebase origin/main
       - name: Push Changes
         uses: CasperWA/push-protected@v2
@@ -90,19 +90,19 @@ jobs:
         shell: bash
     steps:
       - name: Check out refreshed version
-        uses: actions/acquire@v7
+        uses: actions/checkout@v7
         with:
           ref: main
       - name: Pull Git submodules
         run: git submodule update --init --recursive
 
-      - name: Install Toolchain (Linux)
+      - name: Install Toolchain on Linux
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y clang lld ninja-build
-      - name: Install Toolchain (macOS)
+      - name: Install Toolchain on macOS
         if: runner.os == 'macOS'
         run: brew install ninja
-      - name: Install Toolchain (Windows)
+      - name: Install Toolchain on Windows
         if: runner.os == 'Windows'
         run: choco install ninja -y
       - name: Set Up MSVC
@@ -119,9 +119,9 @@ jobs:
         run: |
           cmake --preset release ${{ matrix.configure }} \
             -DUSTORE_INSTALL=ON \
-            -DUSTORE_BUILD_TEST_CPP=OFF \
-            -DUSTORE_BUILD_BENCH_CPP=OFF \
-            -DUSTORE_BUILD_TOOLS_CPP=OFF
+            -DUSTORE_BUILD_TEST=OFF \
+            -DUSTORE_BUILD_BENCH=OFF \
+            -DUSTORE_BUILD_TOOLS=OFF
           cmake --build --preset release
 
       - name: Archive Headers and Static Libraries
@@ -151,7 +151,7 @@ jobs:
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, windows-2025]
     steps:
       - name: Checkout
-        uses: actions/acquire@v7
+        uses: actions/checkout@v7
         with:
           ref: main
       - name: Pull Git submodules
@@ -186,7 +186,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/acquire@v7
+        uses: actions/checkout@v7
         with:
           ref: main
       - name: Pull Git submodules
@@ -246,7 +246,7 @@ jobs:
     steps:
       - name: Check out refreshed version
         if: env.CARGO_REGISTRY_TOKEN != ''
-        uses: actions/acquire@v7
+        uses: actions/checkout@v7
         with:
           ref: main
       - name: Pull Git submodules

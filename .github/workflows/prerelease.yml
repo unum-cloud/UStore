@@ -28,7 +28,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout
-        uses: actions/acquire@v7
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -55,7 +55,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/acquire@v7
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Set Up Python
@@ -99,25 +99,25 @@ jobs:
           # LevelDB 1.23's env_posix.cc names std::memory_order::memory_order_relaxed, which libstdc++ 15 dropped,
           # so the sanitizer trees build without it.
           - {
-              name: "Linux x86-64 (ASan, UBSan)",
+              name: "Linux x86-64 with ASan and UBSan",
               os: ubuntu-24.04,
               preset: debug,
-              configure: "-DUSTORE_USE_LEVELDB=OFF",
+              configure: "-DUSTORE_WITH_LEVELDB=OFF",
             }
-          - { name: "Linux x86-64 (TSan)", os: ubuntu-24.04, preset: tsan, configure: "-DUSTORE_USE_LEVELDB=OFF" }
+          - { name: "Linux x86-64 with TSan", os: ubuntu-24.04, preset: tsan, configure: "-DUSTORE_WITH_LEVELDB=OFF" }
     steps:
       - name: Checkout
-        uses: actions/acquire@v7
+        uses: actions/checkout@v7
       - name: Pull Git submodules
         run: git submodule update --init --recursive
 
-      - name: Install Toolchain (Linux)
+      - name: Install Toolchain on Linux
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y clang lld ninja-build
-      - name: Install Toolchain (macOS)
+      - name: Install Toolchain on macOS
         if: runner.os == 'macOS'
         run: brew install ninja
-      - name: Install Toolchain (Windows)
+      - name: Install Toolchain on Windows
         if: runner.os == 'Windows'
         run: choco install ninja -y
       - name: Set Up MSVC
@@ -142,6 +142,18 @@ jobs:
       - name: Test
         run: ctest --preset ${{ matrix.preset }}
 
+  verify_models:
+    name: Check Promela Models
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Install Spin
+        run: sudo apt-get update && sudo apt-get install -y spin
+      - name: Check the Models
+        run: verification/check.sh
+
   test_python:
     name: Python ${{ matrix.python-version }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
@@ -153,7 +165,7 @@ jobs:
         python-version: ["3.12", "3.14t"]
     steps:
       - name: Checkout
-        uses: actions/acquire@v7
+        uses: actions/checkout@v7
       - name: Pull Git submodules
         run: git submodule update --init --recursive
       - name: Set Up Python
@@ -179,18 +191,18 @@ jobs:
   # RocksDB and LevelDB linked into the extension, on the floor Python version only - the OS matrix above already
   # exercises SmashTable, the default link, on every platform.
   test_python_engines:
-    name: Python (${{ matrix.engine }})
+    name: Python on ${{ matrix.engine }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { engine: rocksdb, define: USTORE_USE_ROCKSDB }
-          - { engine: leveldb, define: USTORE_USE_LEVELDB }
+          - { engine: rocksdb, define: USTORE_WITH_ROCKSDB }
+          - { engine: leveldb, define: USTORE_WITH_LEVELDB }
     steps:
       - name: Checkout
-        uses: actions/acquire@v7
+        uses: actions/checkout@v7
       - name: Pull Git submodules
         run: git submodule update --init --recursive
       - name: Set Up Python
@@ -219,7 +231,7 @@ jobs:
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, windows-2025]
     steps:
       - name: Checkout
-        uses: actions/acquire@v7
+        uses: actions/checkout@v7
       - name: Pull Git submodules
         run: git submodule update --init --recursive
       - name: Set Up Rust
@@ -245,7 +257,7 @@ jobs:
         python-version: ["312", "314t"]
     steps:
       - name: Checkout
-        uses: actions/acquire@v7
+        uses: actions/checkout@v7
       - name: Pull Git submodules
         run: git submodule update --init --recursive
       - name: Build Wheels

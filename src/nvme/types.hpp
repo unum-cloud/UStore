@@ -23,7 +23,7 @@
 
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 #include <smashtable/shared.hpp>       // `st::status_t`, `st::default_allocator`
-#include <stringzilla/stringzilla.hpp> // `sz::string`
+#include <stringzilla/stringzilla.hpp> // `sz::string_t`
 
 #include <ustore/db.h>       // `ustore_status_t`, `ustore_error_t`
 #include <ustore/status.hpp> // `status_t`, `status_code_t`, `expected`
@@ -53,10 +53,10 @@ inline constexpr std::size_t disk_write_attempts_on_failure_k = 4;
 #pragma region Vocabulary
 
 /** Text the engine owns, grown through the fallible members that never throw. */
-using string_t = sz::string;
+using string_t = sz::string_t;
 
 /** A view of text the engine does not own. */
-using string_view_t = sz::string_view;
+using string_view_t = sz::string_view_t;
 
 /** Bytes a caller may write into. */
 using bytes_span_t = std::span<std::byte>;

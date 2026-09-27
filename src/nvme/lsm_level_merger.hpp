@@ -371,7 +371,7 @@ class lsm_level_merger {
         return {};
     }
 
-#if USTORE_USE_CUDA
+#if USTORE_WITH_CUDA
 
     /** Compacts on the first device when @p placement asks for one, and on the calling thread otherwise. */
     static status_t run_compaction_(compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_t> const> upper,

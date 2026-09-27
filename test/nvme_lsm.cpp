@@ -10,6 +10,7 @@
  *  ran. A batched read must sit at the queue pair's depth through the middle of a run rather than at the size
  *  of whatever batch a caller handed it.
  */
+#undef NDEBUG // ! A test's oracle must stay live in every build
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint64_t`
@@ -110,7 +111,7 @@ void operator delete[](void* pointer, std::align_val_t, std::nothrow_t const&) n
 
 #pragma endregion Allocation Watch
 
-namespace unum::ustore {
+namespace unum::ustore::test {
 
 using namespace unum::ustore::nvme;
 
@@ -1103,10 +1104,11 @@ std::size_t batched_read_holds_its_depth(mount_type_ const& mount) {
 
 #pragma endregion Depth Cases
 
-} // namespace unum::ustore
+} // namespace unum::ustore::test
 
 int main(int argc, char const* argv[]) {
     using namespace unum::ustore;
+    using namespace unum::ustore::test;
 
     suite_options_t options;
     if (argument_status_t const status = parse_suite_options(argc, argv, options);
@@ -1121,19 +1123,17 @@ int main(int argc, char const* argv[]) {
     }
     test_environment_t const environment = test_environment_t::of(options, *directory);
 
-    report(totals, "lsm.compactor_choice", compactor_choice_follows_the_threshold());
+    report(totals, "lsm.compactor_choice", compactor_choice_follows_the_threshold);
     auto const cases = [&](auto const& mount) {
-        report(totals, mount.label("flush_lands_on_level_zero").c_str(), flush_lands_on_level_zero(mount));
-        report(totals, mount.label("overlapping_takes_youngest").c_str(), overlapping_runs_take_the_youngest(mount));
-        report(totals, mount.label("drops_tombstones_at_bottom").c_str(),
-               compaction_drops_tombstones_at_the_bottom(mount));
-        report(totals, mount.label("intermediate_keeps_tombstones").c_str(),
-               intermediate_merge_keeps_tombstones(mount));
-        report(totals, mount.label("cancelled_leaves_nothing").c_str(), cancelled_compaction_leaves_nothing(mount));
-        report(totals, mount.label("raced_cancellation").c_str(), raced_cancellation_is_all_or_nothing(mount));
-        report(totals, mount.label("compactors_agree").c_str(), both_compactors_agree(mount));
-        report(totals, mount.label("merge_charges_no_index_copy").c_str(), merge_charges_no_index_copy(mount));
-        report(totals, mount.label("holds_its_depth").c_str(), batched_read_holds_its_depth(mount));
+        report(totals, mount, "flush_lands_on_level_zero", flush_lands_on_level_zero);
+        report(totals, mount, "overlapping_takes_youngest", overlapping_runs_take_the_youngest);
+        report(totals, mount, "drops_tombstones_at_bottom", compaction_drops_tombstones_at_the_bottom);
+        report(totals, mount, "intermediate_keeps_tombstones", intermediate_merge_keeps_tombstones);
+        report(totals, mount, "cancelled_leaves_nothing", cancelled_compaction_leaves_nothing);
+        report(totals, mount, "raced_cancellation", raced_cancellation_is_all_or_nothing);
+        report(totals, mount, "compactors_agree", both_compactors_agree);
+        report(totals, mount, "merge_charges_no_index_copy", merge_charges_no_index_copy);
+        report(totals, mount, "holds_its_depth", batched_read_holds_its_depth);
     };
     for (transport_t const transport : every_transport_k)
         run_on_transport(totals, transport, environment, lsm_config_k, 1, "lsm", cases);

@@ -26,27 +26,13 @@
 
 #pragma once
 
-/** Whether this translation unit can reach the driver, which the option and its headers both gate. */
-#if defined(USTORE_USE_SPDK) && __has_include(<spdk/nvme.h>)
-#define USTORE_NVME_HAS_SPDK 1
-#else
-#define USTORE_NVME_HAS_SPDK 0
-#endif
-
-/** Whether this translation unit can read the files the probe decides on, which only Linux offers. */
-#if defined(__linux__)
-#define USTORE_NVME_HAS_SYSFS 1
-#else
-#define USTORE_NVME_HAS_SYSFS 0
-#endif
-
 #include <cassert> // `assert`
 #include <cerrno>  // `errno`, `EINTR`, `ENOMEM`
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint64_t`
 #include <cstdio>  // `std::snprintf`
 
-#if USTORE_NVME_HAS_SYSFS
+#if defined(__linux__)
 #include <fcntl.h>  // `O_RDONLY`, `O_CLOEXEC`
 #include <unistd.h> // `read`, `readlink`, `access`, `close`
 #endif
@@ -58,7 +44,7 @@
 #include <string_view> // `std::string_view`
 #include <utility>     // `std::exchange`
 
-#if USTORE_NVME_HAS_SPDK
+#if USTORE_WITH_SPDK
 #include <spdk/env.h>      // `spdk_env_init`, `spdk_mem_register`, `spdk_vtophys`
 #include <spdk/env_dpdk.h> // `spdk_env_dpdk_external_init`
 #include <spdk/nvme.h>     // `spdk_nvme_connect`, `spdk_nvme_ns_cmd_read`, `spdk_nvme_qpair`
@@ -295,7 +281,7 @@ inline expected<pci_address_t> pci_address_parsed(std::string_view spelled) noex
 
 #pragma region Files
 
-#if USTORE_NVME_HAS_SYSFS
+#if defined(__linux__)
 
 /** Reads what fits of @p path into @p into, answering an empty text when the file will not open. */
 [[nodiscard]] inline std::string_view read_system_text(char const* path, std::span<char> into) noexcept {
@@ -494,7 +480,7 @@ class spdk_environment_t {
     holders_t* holders_ = nullptr;
 };
 
-#if USTORE_NVME_HAS_SYSFS
+#if defined(__linux__)
 
 /** Bytes of @c /proc/meminfo the probe reads, which is more than the file has ever held. */
 inline constexpr std::size_t meminfo_bytes_k = 8192;
@@ -539,7 +525,7 @@ inline spdk_probe_t spdk_environment_t::probe(char const* address) noexcept {
 
 #endif
 
-#if USTORE_NVME_HAS_SPDK
+#if USTORE_WITH_SPDK
 
 inline expected<spdk_environment_t> spdk_environment_t::acquire(spdk_environment_config_t const& config) noexcept {
     bool const plain = config.memory == spdk_memory_t::plain_pages_k;
@@ -581,7 +567,7 @@ inline void spdk_environment_t::finalize_() noexcept {}
 
 #pragma endregion Environment
 
-#if USTORE_NVME_HAS_SPDK
+#if USTORE_WITH_SPDK
 
 #pragma region Disk
 
