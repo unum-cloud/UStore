@@ -29,6 +29,7 @@ git config core.hooksPath .githooks
 
 The `release` and `relwithdebinfo` presets build with whatever toolchain the environment provides, MSVC, AppleClang, GCC or Clang.
 `debug`, `check`, `dev`, `trace`, `tsan`, `profile` and `cuda` take Clang and lld, whose sanitizer, tracing and line-table flags they use.
+`cuda` also hands Clang to `nvcc` as its host compiler, so the CUDA units mangle their templates like the C++ ones that link them.
 
 ## Layout and Namespaces
 

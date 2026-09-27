@@ -141,6 +141,7 @@
       "cacheVariables": {
         "CMAKE_CUDA_FLAGS_RELWITHDEBINFO": "-O2 -lineinfo -DNDEBUG",
         "USTORE_BUILD_NVME": "ON",
+        "CMAKE_CUDA_HOST_COMPILER": "clang++",
         "USTORE_BUILD_CUDA": "ON",
         "USTORE_CUDA_ARCHITECTURES": "native"
       }
