@@ -315,6 +315,8 @@ class catalog_t {
                 return status_t {status_code_t::malformed_k, "A catalog record runs past the records"};
             if (record.kind > static_cast<std::uint8_t>(blob_kind_t::user_data_k))
                 return status_t {status_code_t::malformed_k, "A catalog record names no kind"};
+            if (record.content_length > record.extent_length)
+                return status_t {status_code_t::malformed_k, "A catalog record holds more content than its extent"};
 
             catalog_entry_t entry;
             std::memcpy(entry.name_storage.data(), records.data() + offset + sizeof(record), name_bytes);

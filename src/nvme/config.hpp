@@ -436,13 +436,13 @@ template <typename element_, template <typename> typename allocator_>
 [[nodiscard]] bool read_json(yyjson_val* array, st::basic_vector<element_, allocator_<element_>>& elements) {
     if (!yyjson_is_arr(array)) return false;
     elements.clear();
-    elements.reserve(yyjson_arr_size(array));
+    if (elements.reserve(yyjson_arr_size(array)) != st::status_t::success_k) return false;
     yyjson_arr_iter iterator;
     yyjson_arr_iter_init(array, &iterator);
     while (yyjson_val* const item = yyjson_arr_iter_next(&iterator)) {
         element_ element;
         if (!read_json(item, element)) return false;
-        elements.push_back(std::move(element));
+        if (elements.push_back(std::move(element)) != st::status_t::success_k) return false;
     }
     return true;
 }

@@ -10,6 +10,8 @@
 
 #include <algorithm> // `std::max`
 
+#include "nvme/stored_value.hpp" // `empty_stored_value_offset_k`
+
 namespace unum::ustore::nvme {
 
 /** Size and capacity limits enforced when validating configurations. */
@@ -32,10 +34,13 @@ struct storage_limits_t {
     static constexpr std::size_t first_level_compaction_threshold_k = 768;
     static constexpr std::size_t level_min_enlarge_factor_k = 2;
     static constexpr std::size_t level_max_enlarge_factor_k = 64;
-    static constexpr std::size_t sorted_run_file_max_size_k = 4 * 1024 * 1024 * 1024ull;
+    static constexpr std::size_t sorted_run_file_max_size_k = 4 * 1024 * 1024 * 1024ull - 4096;
     static constexpr std::size_t gpu_compaction_threshold_k = 900'000;
     static constexpr std::size_t value_max_size_k = std::max(fixed_value_max_size_k, variable_value_max_size_k);
     static constexpr std::size_t user_data_max_size_k = 4 * 1024 * 1024;
 };
+
+static_assert(storage_limits_t::sorted_run_file_max_size_k <= empty_stored_value_offset_k,
+              "A stored value's location never reaches the offsets that mean empty and erased");
 
 } // namespace unum::ustore::nvme

@@ -374,7 +374,8 @@ std::size_t catalog_refuses_records_past_the_image() {
     return failures;
 }
 
-/** One record claiming more bytes than the slot holds is refused, checksum or no checksum. */
+/** One record claiming more bytes than the slot holds, or more content than its extent, is refused, checksum or no
+ *  checksum. */
 std::size_t catalog_refuses_a_record_past_the_records() {
     std::size_t failures = 0;
     catalog_t catalog;
@@ -388,6 +389,7 @@ std::size_t catalog_refuses_a_record_past_the_records() {
     std::memcpy(&header, image.data(), sizeof(header));
     catalog_record_t record {};
     std::memcpy(&record, image.data() + sizeof(header), sizeof(record));
+    catalog_record_t const original = record;
     record.record_bytes = static_cast<std::uint16_t>(header.records_bytes + record_alignment_k);
     std::memcpy(image.data() + sizeof(header), &record, sizeof(record));
     reseal(whole(image));
@@ -396,6 +398,12 @@ std::size_t catalog_refuses_a_record_past_the_records() {
     failures += expect_status(reloaded.load(viewed(image)), status_code_t::malformed_k);
 
     record.record_bytes = static_cast<std::uint16_t>(sizeof(record) + record.name_bytes - 1);
+    std::memcpy(image.data() + sizeof(header), &record, sizeof(record));
+    reseal(whole(image));
+    failures += expect_status(reloaded.load(viewed(image)), status_code_t::malformed_k);
+
+    record = original;
+    record.content_length = record.extent_length + 1;
     std::memcpy(image.data() + sizeof(header), &record, sizeof(record));
     reseal(whole(image));
     failures += expect_status(reloaded.load(viewed(image)), status_code_t::malformed_k);
