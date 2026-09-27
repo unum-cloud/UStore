@@ -2,7 +2,7 @@
  *  @file src/helpers/blocking_files.hpp
  *  @author Ash Vardanian
  *  @date January 11, 2023
- *  @brief Positional file reads and writes, and directory queries, that block the calling thread.
+ *  @brief Positional file reads and writes, whole-file mappings, and directory queries, that block the calling thread.
  */
 
 #pragma once
@@ -11,10 +11,11 @@
 #include <cstddef> // `std::size_t`
 
 #if defined(_WIN32)
-#include <windows.h> // `CreateFileW`, `ReadFile`, `WriteFile`, `FindFirstFileW`
+#include <windows.h> // `CreateFileW`, `ReadFile`, `WriteFile`, `MapViewOfFile`, `FindFirstFileW`
 #else
 #include <dirent.h>   // `opendir`, `readdir`, `closedir`
 #include <fcntl.h>    // `open`
+#include <sys/mman.h> // `mmap`, `madvise`, `munmap`
 #include <sys/stat.h> // `stat`, `fstat`, `S_ISDIR`
 #include <unistd.h>   // `pread`, `pwrite`, `close`
 #endif
@@ -105,6 +106,7 @@ class seekable_file_t {
     status_t close() noexcept;
 
   private:
+    friend class mapped_file_t;
 
     /** The wrapped descriptor, or @c closed_k after a move or a close. */
     registered_medium_t descriptor_ = closed_k;
@@ -219,6 +221,86 @@ inline status_t seekable_file_t::close() noexcept {
 #endif
 
 #pragma endregion Files
+
+#pragma region Mappings
+
+/** A read-only mapping of a whole file, unmapped on destruction, for parsers that scan large inputs in place. */
+class mapped_file_t {
+  public:
+    mapped_file_t() = default;
+    mapped_file_t(mapped_file_t&& other) noexcept
+        : data_(std::exchange(other.data_, nullptr)), size_(std::exchange(other.size_, 0)) {}
+    mapped_file_t& operator=(mapped_file_t&& other) noexcept {
+        std::swap(data_, other.data_);
+        std::swap(size_, other.size_);
+        return *this;
+    }
+    mapped_file_t(mapped_file_t const&) = delete;
+    mapped_file_t& operator=(mapped_file_t const&) = delete;
+    ~mapped_file_t() noexcept;
+
+    /** Maps the null-terminated @p path whole, where an empty file maps to an empty view. */
+    static expected<mapped_file_t> map(char const* path) noexcept;
+
+    /** The mapped bytes. */
+    std::string_view view() const noexcept { return {data_, size_}; }
+
+  private:
+
+    /** The first mapped byte, or null for an empty file and after a move. */
+    char const* data_ = nullptr;
+    std::size_t size_ = 0;
+};
+
+#if defined(_WIN32)
+
+inline mapped_file_t::~mapped_file_t() noexcept {
+    if (data_) { [[maybe_unused]] BOOL const unmapped = ::UnmapViewOfFile(data_); }
+}
+
+inline expected<mapped_file_t> mapped_file_t::map(char const* path) noexcept {
+    auto [file, open_status] = seekable_file_t::open(path, file_mode_t::read_k);
+    if (open_status.failed()) return open_status;
+    auto [length, measure_status] = file.length();
+    if (measure_status.failed()) return measure_status;
+    mapped_file_t mapped;
+    if (length == 0) return mapped;
+    // A view keeps its mapping alive, and the mapping its file, so both handles close on return
+    HANDLE const mapping = ::CreateFileMappingW(file.descriptor_, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    if (!mapping) return status_t {status_code_t::input_output_k, "Failed to map the file"};
+    void const* const begin = ::MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+    [[maybe_unused]] BOOL const closed = ::CloseHandle(mapping);
+    if (!begin) return status_t {status_code_t::input_output_k, "Failed to map the file"};
+    mapped.data_ = static_cast<char const*>(begin);
+    mapped.size_ = length;
+    return mapped;
+}
+
+#else
+
+inline mapped_file_t::~mapped_file_t() noexcept {
+    if (data_) { [[maybe_unused]] int const unmapped = ::munmap(const_cast<char*>(data_), size_); }
+}
+
+inline expected<mapped_file_t> mapped_file_t::map(char const* path) noexcept {
+    auto [file, open_status] = seekable_file_t::open(path, file_mode_t::read_k);
+    if (open_status.failed()) return open_status;
+    auto [length, measure_status] = file.length();
+    if (measure_status.failed()) return measure_status;
+    mapped_file_t mapped;
+    if (length == 0) return mapped;
+    // A mapping outlives the descriptor it came from, which closes on return
+    void* const begin = ::mmap(nullptr, length, PROT_READ, MAP_PRIVATE, file.descriptor_, 0);
+    if (begin == MAP_FAILED) return status_t {status_code_t::input_output_k, "Failed to map the file"};
+    [[maybe_unused]] int const advised = ::madvise(begin, length, MADV_SEQUENTIAL);
+    mapped.data_ = static_cast<char const*>(begin);
+    mapped.size_ = length;
+    return mapped;
+}
+
+#endif
+
+#pragma endregion Mappings
 
 #pragma region Directories
 

@@ -11,11 +11,8 @@
  *  community-detection benchmarks time the levels alone, plus the vertex scan the store needs.
  */
 
-#include <cstddef>    // `std::size_t`
-#include <cstdio>     // `stderr`
-#include <fcntl.h>    // `open`
-#include <sys/stat.h> // `fstat`
-#include <unistd.h>   // `close`, `read`
+#include <cstddef> // `std::size_t`
+#include <cstdio>  // `stderr`
 
 #include <algorithm>   // `std::sort`, `std::unique`, `std::remove_if`, `std::lower_bound`
 #include <array>       // `std::array`
@@ -36,6 +33,7 @@
 #include <ustore/ustore.hpp>
 
 #include "arguments.hpp"
+#include "helpers/blocking_files.hpp" // `mapped_file_t`
 
 namespace unum::ustore::bench {
 
@@ -127,22 +125,10 @@ struct input_edge_t {
  *  @param[out] edges Receives one entry per kept pair.
  */
 status_t read_edge_list(char const* path, std::size_t max_edges, st::basic_vector<input_edge_t>& edges) noexcept {
-    int const descriptor = open(path, O_RDONLY);
-    if (descriptor == -1) return {status_code_t::input_output_k, "Failed to open the edge list"};
+    auto [file, map_status] = mapped_file_t::map(path);
+    if (map_status.failed()) return map_status;
 
-    struct stat metadata {};
-    sz::string_t text;
-    bool loaded = fstat(descriptor, &metadata) == 0 && text.try_resize(static_cast<std::size_t>(metadata.st_size));
-    std::size_t filled = 0;
-    while (loaded && filled != text.size()) {
-        ssize_t const got = read(descriptor, text.data() + filled, text.size() - filled);
-        loaded = got > 0;
-        filled += loaded ? static_cast<std::size_t>(got) : 0;
-    }
-    [[maybe_unused]] int const closed = close(descriptor);
-    if (!loaded && text.size() != 0) return {status_code_t::input_output_k, "Failed to read the edge list"};
-
-    for (sz::string_view_t line : sz::split(text.view(), "\n")) {
+    for (sz::string_view_t line : sz::split(file.view(), "\n")) {
         if (edges.size() == max_edges) break;
         std::string_view trimmed = line;
         while (!trimmed.empty() && (trimmed.back() == '\r' || trimmed.back() == ' ')) trimmed.remove_suffix(1);

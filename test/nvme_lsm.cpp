@@ -13,8 +13,8 @@
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
 #include <cstddef> // `std::size_t`
-#include <cstdint> // `std::uint64_t`
-#include <cstdlib> // `std::malloc`, `std::aligned_alloc`, `std::free`
+#include <cstdint> // `std::uint64_t`, `std::uintptr_t`
+#include <cstdlib> // `std::malloc`, `std::free`
 #include <cstring> // `std::memcmp`
 
 #include <array>   // `std::array`
@@ -55,13 +55,28 @@ struct allocation_watch_t {
 /** The one watch the replaced allocation functions write to, since a global @c operator @c new has no other context. */
 allocation_watch_t allocation_watch_g;
 
-/** Counts @p bytes against the watched sizes, which every replaced allocation function passes through. */
+/**
+ *  @brief Counts @p bytes against the watched sizes, which every replaced allocation function passes through.
+ *
+ *  The block is aligned by hand inside a larger `std::malloc` one, whose address sits just before it, since not every
+ *  standard library offers `std::aligned_alloc`.
+ */
 void* watched_allocate(std::size_t bytes, std::size_t alignment) noexcept {
     for (std::size_t index = 0; index != allocation_watch_g.count; ++index)
         if (allocation_watch_g.sizes[index] == bytes) ++allocation_watch_g.hits[index];
-    return alignment > __STDCPP_DEFAULT_NEW_ALIGNMENT__
-               ? std::aligned_alloc(alignment, (bytes + alignment - 1) / alignment * alignment)
-               : std::malloc(bytes);
+    void* const block = std::malloc(bytes + alignment + sizeof(void*));
+    if (!block) return nullptr;
+    std::uintptr_t const start = reinterpret_cast<std::uintptr_t>(block) + sizeof(void*);
+    void** const aligned = reinterpret_cast<void**>((start + alignment - 1) / alignment * alignment);
+    aligned[-1] = block;
+    return aligned;
+}
+
+/** Releases what @c watched_allocate answered. */
+void watched_free(void* pointer) noexcept {
+    if (!pointer) return;
+    void* const* const header = static_cast<void* const*>(pointer) - 1;
+    std::free(*header);
 }
 
 void* operator new(std::size_t bytes) {
@@ -96,18 +111,18 @@ void* operator new(std::size_t bytes, std::align_val_t alignment, std::nothrow_t
 void* operator new[](std::size_t bytes, std::align_val_t alignment, std::nothrow_t const&) noexcept {
     return watched_allocate(bytes, static_cast<std::size_t>(alignment));
 }
-void operator delete(void* pointer) noexcept { std::free(pointer); }
-void operator delete[](void* pointer) noexcept { std::free(pointer); }
-void operator delete(void* pointer, std::size_t) noexcept { std::free(pointer); }
-void operator delete[](void* pointer, std::size_t) noexcept { std::free(pointer); }
-void operator delete(void* pointer, std::align_val_t) noexcept { std::free(pointer); }
-void operator delete[](void* pointer, std::align_val_t) noexcept { std::free(pointer); }
-void operator delete(void* pointer, std::size_t, std::align_val_t) noexcept { std::free(pointer); }
-void operator delete[](void* pointer, std::size_t, std::align_val_t) noexcept { std::free(pointer); }
-void operator delete(void* pointer, std::nothrow_t const&) noexcept { std::free(pointer); }
-void operator delete[](void* pointer, std::nothrow_t const&) noexcept { std::free(pointer); }
-void operator delete(void* pointer, std::align_val_t, std::nothrow_t const&) noexcept { std::free(pointer); }
-void operator delete[](void* pointer, std::align_val_t, std::nothrow_t const&) noexcept { std::free(pointer); }
+void operator delete(void* pointer) noexcept { watched_free(pointer); }
+void operator delete[](void* pointer) noexcept { watched_free(pointer); }
+void operator delete(void* pointer, std::size_t) noexcept { watched_free(pointer); }
+void operator delete[](void* pointer, std::size_t) noexcept { watched_free(pointer); }
+void operator delete(void* pointer, std::align_val_t) noexcept { watched_free(pointer); }
+void operator delete[](void* pointer, std::align_val_t) noexcept { watched_free(pointer); }
+void operator delete(void* pointer, std::size_t, std::align_val_t) noexcept { watched_free(pointer); }
+void operator delete[](void* pointer, std::size_t, std::align_val_t) noexcept { watched_free(pointer); }
+void operator delete(void* pointer, std::nothrow_t const&) noexcept { watched_free(pointer); }
+void operator delete[](void* pointer, std::nothrow_t const&) noexcept { watched_free(pointer); }
+void operator delete(void* pointer, std::align_val_t, std::nothrow_t const&) noexcept { watched_free(pointer); }
+void operator delete[](void* pointer, std::align_val_t, std::nothrow_t const&) noexcept { watched_free(pointer); }
 
 #pragma endregion Allocation Watch
 

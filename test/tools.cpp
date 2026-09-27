@@ -8,14 +8,9 @@
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::int64_t`
-#include <cstdio>  // `stderr`
-#include <cstdlib> // `std::free`
+#include <cstdio>  // `stderr`, `std::fopen`, `std::fread`, `std::fwrite`, `std::remove`
+#include <cstdlib> // `std::free`, `std::system`
 #include <cstring> // `std::strcmp`
-
-#include <fcntl.h>    // `open`
-#include <sys/stat.h> // `fstat`
-#include <sys/wait.h> // `waitpid`
-#include <unistd.h>   // `close`, `execl`, `fork`, `read`, `unlink`, `write`
 
 #include <algorithm>    // `std::sort`
 #include <array>        // `std::array`
@@ -154,32 +149,21 @@ struct fixture_paths_t {
 
 /** Writes @p content to the file at @p path, answering whether every byte landed. */
 [[nodiscard]] bool write_file(char const* path, sz::string_t const& content) noexcept {
-    int const descriptor = open(path, O_CREAT | O_WRONLY | O_TRUNC, S_IRUSR | S_IWUSR);
-    if (descriptor == -1) return false;
-    char const* cursor = content.data();
-    std::size_t remaining = content.size();
-    while (remaining != 0) {
-        ssize_t const written = write(descriptor, cursor, remaining);
-        if (written <= 0) break;
-        cursor += written;
-        remaining -= static_cast<std::size_t>(written);
-    }
-    return close(descriptor) == 0 && remaining == 0;
+    std::FILE* const file = std::fopen(path, "wb");
+    if (!file) return false;
+    bool const written = std::fwrite(content.data(), 1, content.size(), file) == content.size();
+    return std::fclose(file) == 0 && written;
 }
 
 /** Reads the whole file at @p path into @p content, answering whether it loaded. */
 [[nodiscard]] bool read_file(char const* path, sz::string_t& content) noexcept {
-    int const descriptor = open(path, O_RDONLY);
-    if (descriptor == -1) return false;
-    struct stat metadata {};
-    bool loaded = fstat(descriptor, &metadata) == 0 && content.try_resize(static_cast<std::size_t>(metadata.st_size));
-    std::size_t filled = 0;
-    while (loaded && filled != content.size()) {
-        ssize_t const got = read(descriptor, content.data() + filled, content.size() - filled);
-        loaded = got > 0;
-        filled += loaded ? static_cast<std::size_t>(got) : 0;
-    }
-    [[maybe_unused]] int const closed = close(descriptor);
+    std::FILE* const file = std::fopen(path, "rb");
+    if (!file) return false;
+    bool loaded = std::fseek(file, 0, SEEK_END) == 0;
+    long const size = loaded ? std::ftell(file) : -1;
+    loaded = size >= 0 && std::fseek(file, 0, SEEK_SET) == 0 && content.try_resize(static_cast<std::size_t>(size));
+    loaded = loaded && std::fread(content.data(), 1, content.size(), file) == content.size();
+    [[maybe_unused]] int const closed = std::fclose(file);
     return loaded;
 }
 
@@ -511,7 +495,7 @@ struct edge_row_t {
     failures += expect_no_error(error);
 
     failures += check_edges(output);
-    [[maybe_unused]] int const removed = unlink(output);
+    [[maybe_unused]] int const removed = std::remove(output);
     database.clear();
     return failures;
 }
@@ -556,7 +540,7 @@ struct edge_row_t {
     failures += expect_no_error(error);
 
     failures += check_documents(output, input, selection);
-    [[maybe_unused]] int const removed = unlink(output);
+    [[maybe_unused]] int const removed = std::remove(output);
     database.clear();
     return failures;
 }
@@ -660,7 +644,7 @@ struct edge_row_t {
     ustore_graph_export(&without_database);
     failures += expect_error(error);
 
-    [[maybe_unused]] int const removed = unlink(output);
+    [[maybe_unused]] int const removed = std::remove(output);
     return failures;
 }
 
@@ -773,19 +757,14 @@ struct edge_row_t {
 
 #pragma region CLI
 
-/** Runs @p command with @p arguments in a child process and answers its exit code, or -1 when it did not exit. */
+/** Runs @p command with @p arguments through the system's shell and answers zero exactly when it exited with zero. */
 template <typename... arguments_type_>
     requires(std::same_as<arguments_type_, char const*> && ...)
 [[nodiscard]] int run_command(char const* command, arguments_type_... arguments) noexcept {
-    pid_t const child = fork();
-    if (child == -1) return -1;
-    if (child == 0) {
-        execl(command, command, arguments..., static_cast<char*>(nullptr));
-        _exit(127);
-    }
-    int status = 0;
-    if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) return -1;
-    return WEXITSTATUS(status);
+    // A word with a space would split under both `sh` and `cmd.exe`, and the fixture paths carry none
+    sz::string_t line;
+    bool const built = append(line, command) && ((append(line, " ") && append(line, arguments)) && ...);
+    return built ? std::system(line.c_str()) : -1;
 }
 
 /** Creates, imports into, exports and drops a named collection, then imports and exports the main one. */
@@ -818,7 +797,7 @@ template <typename... arguments_type_>
                                           "--memory-limit", "1MiB", "--collection", collection),
                               0);
         failures += check_documents(output, input, field_selection_t::whole_k);
-        [[maybe_unused]] int const removed_named = unlink(output);
+        [[maybe_unused]] int const removed_named = std::remove(output);
 
         failures += expect_eq(
             run_command(cli, "--directory", directory, "collection", "drop", "--collection", collection), 0);
@@ -835,7 +814,7 @@ template <typename... arguments_type_>
                                       "--memory-limit", "1MiB"),
                           0);
     failures += check_documents(output, input, field_selection_t::whole_k);
-    [[maybe_unused]] int const removed_main = unlink(output);
+    [[maybe_unused]] int const removed_main = std::remove(output);
     return failures;
 }
 

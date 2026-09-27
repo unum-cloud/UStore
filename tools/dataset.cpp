@@ -5,14 +5,11 @@
  *  @brief Imports and exports documents and graph edges as NDJSON on yyjson and CSV on StringZilla.
  */
 
-#include <cstddef>    // `std::size_t`
-#include <cstdint>    // `std::int64_t`
-#include <cstdlib>    // `std::free`
-#include <cstring>    // `std::strcmp`
-#include <fcntl.h>    // `open`
-#include <sys/mman.h> // `mmap`, `madvise`, `munmap`
-#include <sys/stat.h> // `fstat`
-#include <unistd.h>   // `close`, `write`
+#include <cstddef> // `std::size_t`
+#include <cstdint> // `std::int64_t`
+#include <cstdio>  // `std::fopen`, `std::fwrite`, `std::fclose`
+#include <cstdlib> // `std::free`
+#include <cstring> // `std::strcmp`
 
 #include <charconv>     // `std::from_chars`, `std::to_chars`
 #include <limits>       // `std::numeric_limits`
@@ -30,7 +27,8 @@
 #include <ustore/graph.h>   // `ustore_graph_upsert_edges_t`
 #include <ustore/types.hpp> // `sz`, `st`
 
-#include "dataset.h" // `ustore_docs_import_t`, `ustore_graph_export_t`
+#include "dataset.h"                  // `ustore_docs_import_t`, `ustore_graph_export_t`
+#include "helpers/blocking_files.hpp" // `mapped_file_t`
 
 namespace unum::ustore {
 
@@ -51,58 +49,9 @@ enum class dataset_format_t {
     return dataset_format_t::unknown_k;
 }
 
-/** A read-only memory map of a whole file, unmapped on destruction. */
-class mapped_file_t {
-    char const* data_ = nullptr;
-    std::size_t size_ = 0;
-
-  public:
-    mapped_file_t() noexcept = default;
-    mapped_file_t(mapped_file_t const&) = delete;
-    mapped_file_t& operator=(mapped_file_t const&) = delete;
-    ~mapped_file_t() noexcept {
-        if (size_ != 0) { [[maybe_unused]] int const unmapped = munmap(const_cast<char*>(data_), size_); }
-    }
-
-    /** Maps @p path, reporting a failure into @p error; an empty file maps to an empty view. */
-    void map(ustore_str_view_t path, ustore_error_t* error) noexcept {
-        int const descriptor = open(path, O_RDONLY);
-        if (descriptor == -1) {
-            *error = {ustore_error_io_k, "Failed to open the input file"};
-            return;
-        }
-        map_descriptor(descriptor, error);
-        [[maybe_unused]] int const closed = close(descriptor);
-    }
-
-    /** The mapped bytes, empty before a successful @c map or for an empty file. */
-    [[nodiscard]] sz::string_view_t view() const noexcept { return {data_, size_}; }
-
-  private:
-
-    /** Maps the whole of the already open @p descriptor, reporting a failure into @p error. */
-    void map_descriptor(int descriptor, ustore_error_t* error) noexcept {
-        struct stat metadata {};
-        if (fstat(descriptor, &metadata) != 0) {
-            *error = {ustore_error_io_k, "Failed to read the size of the input file"};
-            return;
-        }
-        if (metadata.st_size == 0) return;
-        std::size_t const size = static_cast<std::size_t>(metadata.st_size);
-        void* const begin = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, descriptor, 0);
-        if (begin == MAP_FAILED) {
-            *error = {ustore_error_io_k, "Failed to map the input file"};
-            return;
-        }
-        [[maybe_unused]] int const advised = madvise(begin, size, MADV_SEQUENTIAL);
-        data_ = static_cast<char const*>(begin);
-        size_ = size;
-    }
-};
-
 /** A file written through a buffer that is flushed whenever it reaches a byte threshold. */
 class output_file_t {
-    int descriptor_ = -1;
+    std::FILE* file_ = nullptr;
     std::size_t threshold_ = 0;
     sz::string_t buffer_;
 
@@ -111,14 +60,14 @@ class output_file_t {
     output_file_t(output_file_t const&) = delete;
     output_file_t& operator=(output_file_t const&) = delete;
     ~output_file_t() noexcept {
-        if (descriptor_ != -1) { [[maybe_unused]] int const closed = close(descriptor_); }
+        if (file_) { [[maybe_unused]] int const closed = std::fclose(file_); }
     }
 
     /** Creates or truncates @p path, reporting a failure into @p error. */
     void create(ustore_str_view_t path, std::size_t threshold, ustore_error_t* error) noexcept {
-        descriptor_ = open(path, O_CREAT | O_WRONLY | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+        file_ = std::fopen(path, "wb");
         threshold_ = threshold;
-        if (descriptor_ == -1) *error = {ustore_error_io_k, "Failed to create the output file"};
+        if (!file_) *error = {ustore_error_io_k, "Failed to create the output file"};
     }
 
     /** Buffers @p text, writing the buffer out once it reaches the threshold; does nothing after an error. */
@@ -140,16 +89,9 @@ class output_file_t {
 
     /** Writes the whole buffer out and empties it, reporting a short or failed write into @p error. */
     void flush(ustore_error_t* error) noexcept {
-        char const* cursor = buffer_.data();
-        std::size_t remaining = buffer_.size();
-        while (remaining != 0) {
-            ssize_t const written = write(descriptor_, cursor, remaining);
-            if (written <= 0) {
-                *error = {ustore_error_io_k, "Failed to write the output file"};
-                return;
-            }
-            cursor += written;
-            remaining -= static_cast<std::size_t>(written);
+        if (std::fwrite(buffer_.data(), 1, buffer_.size(), file_) != buffer_.size()) {
+            *error = {ustore_error_io_k, "Failed to write the output file"};
+            return;
         }
         buffer_.clear();
     }
@@ -157,8 +99,8 @@ class output_file_t {
     /** Flushes the buffer and closes the file, reporting either failure into @p error. */
     void finish(ustore_error_t* error) noexcept {
         if (!error->status) flush(error);
-        int const closed = close(descriptor_);
-        descriptor_ = -1;
+        int const closed = std::fclose(file_);
+        file_ = nullptr;
         if (closed != 0 && !error->status) *error = {ustore_error_io_k, "Failed to close the output file"};
     }
 };
@@ -835,9 +777,11 @@ void ustore_docs_import(ustore_docs_import_t* task_pointer) {
         return;
     }
 
-    mapped_file_t file;
-    file.map(task.path, task.error);
-    if (task.error->status) return;
+    auto [file, map_status] = mapped_file_t::map(task.path);
+    if (map_status.failed()) {
+        *task.error = map_status;
+        return;
+    }
     task_arena_t const arena {task.arena};
     if (format == dataset_format_t::ndjson_k) import_ndjson_documents(task, file.view(), arena.get());
     else import_csv_documents(task, file.view(), arena.get());
@@ -951,9 +895,11 @@ void ustore_graph_import(ustore_graph_import_t* task_pointer) {
         return;
     }
 
-    mapped_file_t file;
-    file.map(task.path, task.error);
-    if (task.error->status) return;
+    auto [file, map_status] = mapped_file_t::map(task.path);
+    if (map_status.failed()) {
+        *task.error = map_status;
+        return;
+    }
     task_arena_t const arena {task.arena};
     if (format == dataset_format_t::ndjson_k) import_ndjson_edges(task, file.view(), arena.get());
     else import_csv_edges(task, file.view(), arena.get());

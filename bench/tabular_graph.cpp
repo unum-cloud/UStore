@@ -8,18 +8,18 @@
  *  labeled by the edge column.
  */
 
-#include <cstddef>    // `std::size_t`
-#include <cstdio>     // `stderr`
-#include <dirent.h>   // `opendir`, `readdir`, `closedir`
-#include <fcntl.h>    // `open`
-#include <sys/stat.h> // `fstat`, `stat`
-#include <unistd.h>   // `close`, `read`, `unlink`
+#include <cstddef> // `std::size_t`
+#include <cstdint> // `std::uintmax_t`
+#include <cstdio>  // `stderr`, `std::fopen`, `std::fread`, `std::fclose`
 
 #include <array>            // `std::array`
 #include <chrono>           // `std::chrono::steady_clock`
 #include <initializer_list> // `std::initializer_list`
+#include <filesystem>       // `std::filesystem::directory_iterator`, `std::filesystem::file_size`
 #include <limits>           // `std::numeric_limits`
+#include <string>           // `std::string`, what `std::filesystem::path::string` answers
 #include <string_view>      // `std::string_view`
+#include <system_error>     // `std::error_code`
 
 #include <benchmark/benchmark.h>
 #include <fmt/format.h>
@@ -122,17 +122,13 @@ struct tabular_t {
 
 /** Reads the whole file at @p path into @p content, answering whether it succeeded. */
 [[nodiscard]] bool read_file(char const* path, sz::string_t& content) noexcept {
-    int const descriptor = open(path, O_RDONLY);
-    if (descriptor == -1) return false;
-    struct stat metadata {};
-    bool loaded = fstat(descriptor, &metadata) == 0 && content.try_resize(static_cast<std::size_t>(metadata.st_size));
-    std::size_t filled = 0;
-    while (loaded && filled != content.size()) {
-        ssize_t const got = read(descriptor, content.data() + filled, content.size() - filled);
-        loaded = got > 0;
-        filled += loaded ? static_cast<std::size_t>(got) : 0;
-    }
-    [[maybe_unused]] int const closed = close(descriptor);
+    std::FILE* const file = std::fopen(path, "rb");
+    if (!file) return false;
+    bool loaded = std::fseek(file, 0, SEEK_END) == 0;
+    long const size = loaded ? std::ftell(file) : -1;
+    loaded = size >= 0 && std::fseek(file, 0, SEEK_SET) == 0 && content.try_resize(static_cast<std::size_t>(size));
+    loaded = loaded && std::fread(content.data(), 1, content.size(), file) == content.size();
+    [[maybe_unused]] int const closed = std::fclose(file);
     return loaded;
 }
 
@@ -141,9 +137,10 @@ struct tabular_t {
     std::size_t const offset = tabular.paths.size();
     if (!tabular.paths.try_append(directory) || !tabular.paths.try_append(name) || !tabular.paths.try_push_back('\0'))
         return false;
-    struct stat metadata {};
-    if (stat(tabular.paths.data() + offset, &metadata) != 0) return true;
-    source_file_t const file {offset, static_cast<std::size_t>(metadata.st_size)};
+    std::error_code error;
+    std::uintmax_t const size = std::filesystem::file_size(tabular.paths.data() + offset, error);
+    if (error) return true;
+    source_file_t const file {offset, static_cast<std::size_t>(size)};
     return st::succeeded(tabular.files.push_back(source_file_t {file}));
 }
 
@@ -155,21 +152,23 @@ struct tabular_t {
     if (!directory.try_append(settings.dataset.data(), settings.dataset.size()) || !directory.try_push_back('/'))
         return false;
 
-    DIR* const listing = opendir(directory.c_str());
-    if (!listing) {
+    std::error_code error;
+    std::filesystem::directory_iterator listing {std::filesystem::path {settings.dataset}, error};
+    if (error) {
         fmt::println(stderr, "Failed to open {}", directory.c_str());
         return false;
     }
     std::size_t const wanted = settings.max_input_files_total.value;
     bool listed = true;
-    for (dirent* entry = readdir(listing); entry && listed && tabular.files.size() != wanted;
-         entry = readdir(listing)) {
-        std::string_view const name {entry->d_name};
-        if (!name.ends_with(extension) || !name.substr(0, name.size() - extension.size()).ends_with('.')) continue;
-        listed = remember_file(tabular, directory, entry->d_name);
+    for (; !error && listed && tabular.files.size() != wanted && listing != std::filesystem::directory_iterator {};
+         listing.increment(error)) {
+        std::string const name = listing->path().filename().string();
+        if (!std::string_view {name}.ends_with(extension) ||
+            !std::string_view {name}.substr(0, name.size() - extension.size()).ends_with('.'))
+            continue;
+        listed = remember_file(tabular, directory, name.c_str());
     }
-    [[maybe_unused]] int const closed = closedir(listing);
-    if (!listed) {
+    if (!listed || error) {
         fmt::println(stderr, "Failed to list the files in {}", directory.c_str());
         return false;
     }
@@ -240,10 +239,11 @@ void clear_main(ustore_database_t db) noexcept {
 
 /** Answers the size of the exported file at @p path and removes it, or zero when it is missing. */
 [[nodiscard]] std::size_t take_exported(char const* path) noexcept {
-    struct stat metadata {};
-    if (stat(path, &metadata) != 0) return 0;
-    [[maybe_unused]] int const removed = unlink(path);
-    return static_cast<std::size_t>(metadata.st_size);
+    std::error_code error;
+    std::uintmax_t const size = std::filesystem::file_size(path, error);
+    if (error) return 0;
+    if (!std::filesystem::remove(path, error)) fmt::println(stderr, "Failed to remove {}: {}", path, error.message());
+    return static_cast<std::size_t>(size);
 }
 
 /** Composes the path of the export named @p stem that the thread at @p thread_index writes, in the input format. */

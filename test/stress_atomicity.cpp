@@ -6,10 +6,9 @@
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
-#include <cstddef>      // `std::size_t`
-#include <cstdint>      // `std::uint32_t`, `std::uint64_t`
-#include <cstdio>       // `stderr`
-#include <sys/random.h> // `getentropy`
+#include <cstddef> // `std::size_t`
+#include <cstdint> // `std::uint32_t`, `std::uint64_t`
+#include <cstdio>  // `stderr`
 
 #include <algorithm>   // `std::ranges::max`
 #include <array>       // `std::array`
@@ -142,11 +141,7 @@ struct batches_t {
     std::size_t failures = expect(st::succeeded(run.keys.resize(options.keys.value)));
     failures += expect(st::succeeded(run.slots.resize(std::ranges::max(options.threads.view()))));
     std::iota(run.keys.begin(), run.keys.end(), ustore_key_t {0});
-    for (writer_slot_t& slot : run.slots) {
-        std::uint32_t seed = 0;
-        failures += expect(getentropy(&seed, sizeof(seed)) == 0);
-        slot.random_generator.seed(seed);
-    }
+    for (writer_slot_t& slot : run.slots) slot.random_generator.seed(static_cast<std::uint32_t>(draw_seed()));
     if (failures || !run.database.supports_transactions()) return failures;
     for (std::size_t thread = 0; thread != run.slots.size() && !failures; ++thread)
         failures += begin_transaction(run.database, run.slots[thread].transaction);

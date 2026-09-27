@@ -6,11 +6,10 @@
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
-#include <cstddef>      // `std::size_t`
-#include <cstdint>      // `std::uint8_t`, `std::uint32_t`
-#include <cstdio>       // `stderr`
-#include <cstring>      // `std::memcpy`
-#include <sys/random.h> // `getentropy`
+#include <cstddef> // `std::size_t`
+#include <cstdint> // `std::uint8_t`, `std::uint32_t`
+#include <cstdio>  // `stderr`
+#include <cstring> // `std::memcpy`
 
 #include <algorithm>   // `std::fill`, `std::max`, `std::ranges::max`
 #include <array>       // `std::array`
@@ -197,11 +196,7 @@ struct linearizability_run_t {
     failures += expect(st::succeeded(run.operations.resize(operations_count)));
     failures += expect(st::succeeded(run.latest.resize(keys_count)));
     failures += expect(st::succeeded(run.present_keys.resize(keys_count)));
-    for (writer_slot_t& slot : run.slots) {
-        std::uint32_t seed = 0;
-        failures += expect(getentropy(&seed, sizeof(seed)) == 0);
-        slot.random_generator.seed(seed);
-    }
+    for (writer_slot_t& slot : run.slots) slot.random_generator.seed(static_cast<std::uint32_t>(draw_seed()));
     return failures;
 }
 

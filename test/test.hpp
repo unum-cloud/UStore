@@ -11,25 +11,24 @@
  */
 #pragma once
 
-#include <cerrno>  // `errno`, `EEXIST`
 #include <cmath>   // `std::fabs`, `std::fmax`
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint8_t`, `std::uint64_t`
-#include <cstdio>  // `stderr`, `std::remove`
-#include <cstdlib> // `mkdtemp`
+#include <cstdio>  // `stderr`
 #include <cstring> // `std::memcpy`, `std::strlen`
 
-#include <ftw.h>      // `nftw`
-#include <sys/stat.h> // `mkdir`
-
-#include <array>       // `std::array`
-#include <optional>    // `std::optional`
-#include <random>      // `std::random_device`
-#include <regex>       // `std::regex`, `std::regex_search`
-#include <span>        // `std::span`
-#include <string_view> // `std::string_view`
-#include <thread>      // `std::thread::hardware_concurrency`
-#include <type_traits> // `std::type_identity_t`
+#include <array>        // `std::array`
+#include <chrono>       // `std::chrono::steady_clock`
+#include <filesystem>   // `std::filesystem::create_directories`, `std::filesystem::remove_all`
+#include <optional>     // `std::optional`
+#include <random>       // `std::random_device`
+#include <regex>        // `std::regex`, `std::regex_search`
+#include <span>         // `std::span`
+#include <string>       // `std::string`, what `std::filesystem::path::generic_string` answers
+#include <string_view>  // `std::string_view`
+#include <system_error> // `std::error_code`
+#include <thread>       // `std::thread::hardware_concurrency`
+#include <type_traits>  // `std::type_identity_t`
 
 #include <fmt/format.h>
 
@@ -499,29 +498,18 @@ class test_config_t {
     std::string_view engine_config_;
 };
 
-/** Removes one entry of a depth-first walk. */
-inline int remove_entry(char const* entry, struct stat const*, int, struct FTW*) noexcept { return std::remove(entry); }
-
 /** Creates @p directory with its missing parents, answering whether it exists. */
 [[nodiscard]] inline bool create_directories(char const* directory) noexcept {
-    std::size_t const length = std::strlen(directory);
-    if (length >= path_capacity_k) return false;
-    char prefix[path_capacity_k];
-    std::memcpy(prefix, directory, length + 1);
-    for (std::size_t index = 1; index <= length; ++index) {
-        char const separator = prefix[index];
-        if (separator != '/' && separator != '\0') continue;
-        prefix[index] = '\0';
-        if (mkdir(prefix, 0755) != 0 && errno != EEXIST) return false;
-        prefix[index] = separator;
-    }
-    return true;
+    std::error_code error;
+    std::filesystem::create_directories(directory, error);
+    return !error;
 }
 
 /** Removes @p directory with its contents and creates it again with its parents, answering whether it exists. */
 [[nodiscard]] inline bool recreate_directory(char const* directory) noexcept {
-    [[maybe_unused]] int const removed = nftw(directory, remove_entry, 16, FTW_DEPTH | FTW_PHYS);
-    return create_directories(directory);
+    std::error_code error;
+    std::filesystem::remove_all(directory, error);
+    return !error && create_directories(directory);
 }
 
 /**
@@ -541,9 +529,10 @@ class test_directory_t {
     test_directory_t& operator=(test_directory_t const&) = delete;
 
     ~test_directory_t() noexcept {
-        if (path_[0] != '\0') {
-            [[maybe_unused]] int const removed = nftw(path_, remove_entry, 16, FTW_DEPTH | FTW_PHYS);
-        }
+        if (path_[0] == '\0') return;
+        std::error_code error;
+        std::filesystem::remove_all(path_, error);
+        if (error) fmt::println(stderr, "Failed to remove {}: {}", path_, error.message());
     }
 
     /** Creates @p parent with its parents and a unique directory inside it, or names none for an empty @p parent. */
@@ -552,19 +541,28 @@ class test_directory_t {
         test_directory_t directory;
         if (parent.empty()) return directory;
 
-        constexpr std::string_view unique_suffix_k = "/ustore-XXXXXX";
-        if (parent.size() + unique_suffix_k.size() >= path_capacity_k) return status_t::invalid_argument_k;
-        std::memcpy(directory.path_, parent.data(), parent.size());
-        std::memcpy(directory.path_ + parent.size(), unique_suffix_k.data(), unique_suffix_k.size() + 1);
-        directory.path_[parent.size()] = '\0';
-        bool const created = create_directories(directory.path_);
-        directory.path_[parent.size()] = '/';
-        if (!created || !mkdtemp(directory.path_)) {
-            status_t const status = static_cast<status_t>(errno);
-            directory.path_[0] = '\0';
-            return status;
+        std::error_code error;
+        std::filesystem::path const parent_path {parent};
+        std::filesystem::create_directories(parent_path, error);
+        if (error) return status_t::input_output_k;
+
+        // A name another suite already took answers false rather than an error, so the next tick is tried
+        auto const tick = static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+        for (std::uint64_t attempt = 0; attempt != 64; ++attempt) {
+            char name[32];
+            *fmt::format_to_n(name, sizeof(name) - 1, "ustore-{:016x}", tick + attempt).out = '\0';
+            std::filesystem::path const candidate = parent_path / name;
+            if (!std::filesystem::create_directory(candidate, error)) {
+                if (error) return status_t::input_output_k;
+                continue;
+            }
+            // Forward slashes serve every platform and need no escaping inside the JSON configuration
+            std::string const text = candidate.generic_string();
+            if (text.size() >= path_capacity_k) return status_t::invalid_argument_k;
+            std::memcpy(directory.path_, text.c_str(), text.size() + 1);
+            return directory;
         }
-        return directory;
+        return status_t::key_already_exists_k;
     }
 
     /** The unique directory, or null without @c --directory. */

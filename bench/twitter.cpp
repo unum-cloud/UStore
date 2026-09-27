@@ -5,25 +5,23 @@
  *  @brief Benchmarks document and graph workloads over real or generated tweets parsed with yyjson.
  */
 
-#include <cstddef>    // `std::size_t`
-#include <cstdint>    // `std::int64_t`, `std::uint64_t`
-#include <cstdio>     // `stderr`
-#include <dirent.h>   // `opendir`, `readdir`, `closedir`
-#include <fcntl.h>    // `open`
-#include <sys/mman.h> // `mmap`, `madvise`, `munmap`
-#include <sys/stat.h> // `fstat`
-#include <unistd.h>   // `close`
+#include <cstddef> // `std::size_t`
+#include <cstdint> // `std::int64_t`, `std::uint64_t`
+#include <cstdio>  // `stderr`
 
-#include <algorithm>   // `std::min`, `std::sort`, `std::unique`
-#include <array>       // `std::array`
-#include <atomic>      // `std::atomic`
-#include <charconv>    // `std::to_chars`
-#include <chrono>      // `std::chrono::nanoseconds`
-#include <functional>  // `std::plus`
-#include <numeric>     // `std::transform_reduce`
-#include <random>      // `std::mt19937_64`
-#include <string_view> // `std::string_view`
-#include <utility>     // `std::exchange`, `std::move`, `std::swap`
+#include <algorithm>    // `std::min`, `std::sort`, `std::unique`
+#include <array>        // `std::array`
+#include <atomic>       // `std::atomic`
+#include <charconv>     // `std::to_chars`
+#include <chrono>       // `std::chrono::nanoseconds`
+#include <filesystem>   // `std::filesystem::directory_iterator`
+#include <functional>   // `std::plus`
+#include <numeric>      // `std::transform_reduce`
+#include <random>       // `std::mt19937_64`
+#include <string>       // `std::string`, what `std::filesystem::path::string` answers
+#include <string_view>  // `std::string_view`
+#include <system_error> // `std::error_code`
+#include <utility>      // `std::move`
 
 #include <benchmark/benchmark.h>
 #include <fmt/format.h>
@@ -39,6 +37,7 @@
 
 #include "arguments.hpp"
 #include "executor.hpp"
+#include "helpers/blocking_files.hpp"
 #include "mixed.hpp"
 
 namespace unum::ustore::bench {
@@ -79,53 +78,6 @@ struct settings_t {
 #pragma endregion Settings
 
 #pragma region Dataset
-
-/** A read-only memory map of a whole file, unmapped on destruction. */
-class mapped_file_t {
-    char const* data_ = nullptr;
-    std::size_t size_ = 0;
-
-  public:
-    mapped_file_t() noexcept = default;
-    mapped_file_t(mapped_file_t&& other) noexcept
-        : data_(std::exchange(other.data_, nullptr)), size_(std::exchange(other.size_, 0)) {}
-    mapped_file_t& operator=(mapped_file_t&& other) noexcept {
-        std::swap(data_, other.data_);
-        std::swap(size_, other.size_);
-        return *this;
-    }
-    ~mapped_file_t() noexcept {
-        if (size_ != 0) { [[maybe_unused]] int const unmapped = munmap(const_cast<char*>(data_), size_); }
-    }
-
-    /** Maps @p path and answers whether it succeeded. */
-    [[nodiscard]] bool map(char const* path) noexcept {
-        int const descriptor = open(path, O_RDONLY);
-        if (descriptor == -1) return false;
-        bool const mapped = map_descriptor(descriptor);
-        [[maybe_unused]] int const closed = close(descriptor);
-        return mapped;
-    }
-
-    /** The mapped bytes, empty before a successful @c map or for an empty file. */
-    [[nodiscard]] std::string_view view() const noexcept { return {data_, size_}; }
-
-  private:
-
-    /** Maps the whole of the already open @p descriptor and answers whether it succeeded. */
-    [[nodiscard]] bool map_descriptor(int descriptor) noexcept {
-        struct stat metadata {};
-        if (fstat(descriptor, &metadata) != 0) return false;
-        if (metadata.st_size == 0) return true;
-        std::size_t const size = static_cast<std::size_t>(metadata.st_size);
-        void* const begin = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, descriptor, 0);
-        if (begin == MAP_FAILED) return false;
-        [[maybe_unused]] int const advised = madvise(begin, size, MADV_SEQUENTIAL);
-        data_ = static_cast<char const*>(begin);
-        size_ = size;
-        return true;
-    }
-};
 
 /** Owns a parsed yyjson document. */
 struct json_document_t {
@@ -293,31 +245,28 @@ constexpr std::string_view
 /** Maps up to @c max_input_files_total NDJSON files from the dataset directory and indexes them on @p executor. */
 [[nodiscard]] bool load_dataset(settings_t const& settings, executor_t& executor, twitter_t& twitter) noexcept {
     fmt::println("Will search for .ndjson files...");
-    sz::string_t directory;
-    if (!directory.try_append(settings.dataset.data(), settings.dataset.size()) || !directory.try_push_back('/'))
-        return false;
-
-    DIR* const listing = opendir(directory.c_str());
-    if (!listing) {
-        fmt::println(stderr, "Failed to open {}", directory.c_str());
+    std::error_code error;
+    std::filesystem::directory_iterator listing {std::filesystem::path {settings.dataset}, error};
+    if (error) {
+        fmt::println(stderr, "Failed to open {}", settings.dataset);
         return false;
     }
     std::size_t found = 0;
-    sz::string_t path;
-    for (dirent* entry = readdir(listing); entry; entry = readdir(listing)) {
-        if (!std::string_view {entry->d_name}.ends_with(".ndjson")) continue;
+    for (; !error && listing != std::filesystem::directory_iterator {}; listing.increment(error)) {
+        if (listing->path().extension() != ".ndjson") continue;
         ++found;
         if (twitter.files.size() == settings.max_input_files_total.value) continue;
-        path.clear();
-        mapped_file_t file;
-        if (!path.try_append(directory) || !path.try_append(entry->d_name) || !file.map(path.c_str()) ||
-            st::failed(twitter.files.push_back(std::move(file)))) {
-            [[maybe_unused]] int const closed = closedir(listing);
-            fmt::println(stderr, "Failed to map {}", path.c_str());
+        std::string const path = listing->path().string();
+        auto [file, map_status] = mapped_file_t::map(path.c_str());
+        if (map_status.failed() || st::failed(twitter.files.push_back(std::move(file)))) {
+            fmt::println(stderr, "Failed to map {}", path);
             return false;
         }
     }
-    [[maybe_unused]] int const closed = closedir(listing);
+    if (error) {
+        fmt::println(stderr, "Failed to list {}", settings.dataset);
+        return false;
+    }
     fmt::println("- found {} files", found);
     fmt::println("- kept only {} files", twitter.files.size());
 
