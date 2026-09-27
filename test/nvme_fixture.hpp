@@ -5,7 +5,7 @@
  *  @brief One mounted ring for every engine suite: its config, the transports, the driver and the byte painters.
  *
  *  A suite names its config once, writes every case against the mount it is handed, and lets @c run_on_transport
- *  run the same cases on memory, on files through the blocking floor and through io_uring, and on a block
+ *  run the same cases on memory, on files through the blocking floor, io_uring and Linux AIO, and on a block
  *  device. A transport the machine does not offer skips with its reason; a transport the flags claim and the
  *  mount then refuses fails.
  */
@@ -29,14 +29,16 @@
 
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
-#include "nvme/blocking_files_disk.hpp" // `blocking_files_disk_t`, `file_buffering_t`
+#include "nvme/blocking_files_disk.hpp"    // `blocking_files_disk_t`, `file_buffering_t`
+#include "nvme/linux_aio_files_disk.hpp"   // `linux_aio_files_disk_t`, `linux_aio_probe_t`
+#include "nvme/linux_uring_files_disk.hpp" // `linux_uring_files_disk_t`, `linux_uring_probe_t`
+#include "nvme/memory_disk.hpp"            // `memory_disk_t`
+
 #include "nvme/buffer_pool.hpp"         // `registered_memory_arena_t`, `memory_arena_config_t`
 #include "nvme/collection_snapshot.hpp" // `select_result_t`
 #include "nvme/io_channel.hpp"          // `basic_io_channel_pool`, `io_channel_config_t`
 #include "nvme/io_pipeline.hpp"         // `basic_write_pipeline`
-#include "nvme/ram_disk.hpp"            // `ram_disk_t`
 #include "nvme/resources.hpp"           // `resources_t`, `resources_shared_ptr_t`
-#include "nvme/uring_files_disk.hpp"    // `uring_files_disk_t`, `uring_probe_t`
 #include "nvme/volume.hpp"              // `basic_extent_volume`, `volume_format_t`
 
 #include "test.hpp" // `describe`, `expect_status`, `suite_totals_t`
@@ -54,30 +56,35 @@ enum class transport_t : std::uint8_t {
     memory_k,
 
     /** Files under @c --directory, through positioned reads and writes on the polling thread. */
-    files_k,
+    blocking_k,
 
     /** Unbuffered files under @c --directory, through io_uring. */
-    io_uring_k,
+    linux_uring_k,
+
+    /** Unbuffered files under @c --directory, through Linux AIO. */
+    linux_aio_k,
 
     /** The block device @c --device names, through io_uring. */
     device_k,
 
     /** The namespace @c --spdk-address binds, which the driver does not mount. */
-    spdk_k,
+    linux_spdk_k,
 };
 
 /** Every transport, in the order a suite runs them. */
-constexpr std::array<transport_t, 5> every_transport_k {
-    transport_t::memory_k, transport_t::files_k, transport_t::io_uring_k, transport_t::device_k, transport_t::spdk_k};
+constexpr std::array<transport_t, 6> every_transport_k {transport_t::memory_k,      transport_t::blocking_k,
+                                                        transport_t::linux_uring_k, transport_t::linux_aio_k,
+                                                        transport_t::device_k,      transport_t::linux_spdk_k};
 
 /** The name @c --transports selects @p transport by, which is also the middle of every result line. */
 [[nodiscard]] constexpr char const* name_of(transport_t transport) noexcept {
     switch (transport) {
-    case transport_t::memory_k: return "ram";
-    case transport_t::files_k: return "files";
-    case transport_t::io_uring_k: return "uring";
+    case transport_t::memory_k: return "memory";
+    case transport_t::blocking_k: return "blocking";
+    case transport_t::linux_uring_k: return "linux-uring";
+    case transport_t::linux_aio_k: return "linux-aio";
     case transport_t::device_k: return "device";
-    case transport_t::spdk_k: return "spdk";
+    case transport_t::linux_spdk_k: return "linux-spdk";
     }
     return "unknown";
 }
@@ -112,10 +119,11 @@ enum class completion_timing_t : std::uint8_t {
 [[nodiscard]] constexpr completion_timing_t completion_timing_of(transport_t transport) noexcept {
     switch (transport) {
     case transport_t::memory_k:
-    case transport_t::files_k: return completion_timing_t::synchronous_k;
-    case transport_t::io_uring_k:
+    case transport_t::blocking_k: return completion_timing_t::synchronous_k;
+    case transport_t::linux_uring_k:
+    case transport_t::linux_aio_k:
     case transport_t::device_k:
-    case transport_t::spdk_k: return completion_timing_t::asynchronous_k;
+    case transport_t::linux_spdk_k: return completion_timing_t::asynchronous_k;
     }
     return completion_timing_t::synchronous_k;
 }
@@ -129,11 +137,12 @@ enum class capacity_behavior_t : std::uint8_t {
 /** The edge of @p transport, which a regular file grows past and every other medium refuses. */
 [[nodiscard]] constexpr capacity_behavior_t capacity_behavior_of(transport_t transport) noexcept {
     switch (transport) {
-    case transport_t::files_k:
-    case transport_t::io_uring_k: return capacity_behavior_t::growing_k;
+    case transport_t::blocking_k:
+    case transport_t::linux_uring_k:
+    case transport_t::linux_aio_k: return capacity_behavior_t::growing_k;
     case transport_t::memory_k:
     case transport_t::device_k:
-    case transport_t::spdk_k: return capacity_behavior_t::fixed_k;
+    case transport_t::linux_spdk_k: return capacity_behavior_t::fixed_k;
     }
     return capacity_behavior_t::fixed_k;
 }
@@ -198,12 +207,18 @@ constexpr std::uint64_t memory_filesystem_magic_k = 0x01021994ull;
 
 /** Why this machine offers no io_uring, or null when it does. */
 [[nodiscard]] inline char const* uring_refusal() noexcept {
-    switch (uring_files_disk_t::probe()) {
-    case uring_probe_t::too_old_k: return "needs io_uring of Linux 6.12 or newer";
-    case uring_probe_t::refused_k: return "io_uring is refused on this machine";
-    case uring_probe_t::available_k: return nullptr;
+    switch (linux_uring_files_disk_t::probe()) {
+    case linux_uring_probe_t::too_old_k: return "needs io_uring of Linux 6.12 or newer";
+    case linux_uring_probe_t::refused_k: return "io_uring is refused on this machine";
+    case linux_uring_probe_t::available_k: return nullptr;
     }
     return nullptr;
+}
+
+/** Why this machine offers no Linux AIO, or null when it does. */
+[[nodiscard]] inline char const* aio_refusal() noexcept {
+    return linux_aio_files_disk_t::probe() == linux_aio_probe_t::available_k ? nullptr
+                                                                             : "Linux AIO is refused on this machine";
 }
 
 /** Why @p transport cannot be mounted on @p environment, or null when it can; a path the flags claim is never a
@@ -212,14 +227,16 @@ constexpr std::uint64_t memory_filesystem_magic_k = 0x01021994ull;
                                                    test_environment_t const& environment) noexcept {
     switch (transport) {
     case transport_t::memory_k: return nullptr;
-    case transport_t::files_k: return environment.directory ? nullptr : needs_directory_k;
-    case transport_t::io_uring_k:
-        if (char const* const reason = uring_refusal()) return reason;
+    case transport_t::blocking_k: return environment.directory ? nullptr : needs_directory_k;
+    case transport_t::linux_uring_k:
+    case transport_t::linux_aio_k:
+        if (char const* const reason = transport == transport_t::linux_uring_k ? uring_refusal() : aio_refusal())
+            return reason;
         if (!environment.directory) return needs_directory_k;
         if (on_memory_filesystem(environment.directory)) return "needs a filesystem that enforces O_DIRECT, not tmpfs";
         return nullptr;
     case transport_t::device_k: return environment.device.empty() ? needs_device_k : uring_refusal();
-    case transport_t::spdk_k: return environment.spdk_address.empty() ? needs_spdk_address_k : nullptr;
+    case transport_t::linux_spdk_k: return environment.spdk_address.empty() ? needs_spdk_address_k : nullptr;
     }
     return nullptr;
 }
@@ -302,8 +319,19 @@ struct fixture_config_t {
     }
 
     /** The same ring config for io_uring, which always runs unbuffered. */
-    [[nodiscard]] constexpr uring_disk_config_t uring(std::size_t media) const noexcept {
-        uring_disk_config_t config;
+    [[nodiscard]] constexpr linux_uring_disk_config_t linux_uring(std::size_t media) const noexcept {
+        linux_uring_disk_config_t config;
+        config.queue_pairs_limit = static_cast<std::uint16_t>(executor_threads + shared_io_channels);
+        config.depth_limit = queue_depth;
+        config.registered_memory_limit = registered_memory_limit;
+        config.media_limit = static_cast<std::uint16_t>(media);
+        config.buffering = file_buffering_t::unbuffered_k;
+        return config;
+    }
+
+    /** The same ring config for Linux AIO, which always runs unbuffered too. */
+    [[nodiscard]] constexpr linux_aio_disk_config_t linux_aio(std::size_t media) const noexcept {
+        linux_aio_disk_config_t config;
         config.queue_pairs_limit = static_cast<std::uint16_t>(executor_threads + shared_io_channels);
         config.depth_limit = queue_depth;
         config.registered_memory_limit = registered_memory_limit;
@@ -401,19 +429,21 @@ constexpr std::size_t fixture_volumes_capacity_k = 16;
 /** Opens the ring of @p disk_type_ shaped by @p config for @p media volumes. */
 template <typename disk_type_>
 expected<disk_type_> open_disk(fixture_config_t const& config, std::size_t media) noexcept {
-    if constexpr (std::is_same_v<disk_type_, ram_disk_t>) {
-        expected<ram_device_t> device = ram_device_t::make(config.page_bytes);
+    if constexpr (std::is_same_v<disk_type_, memory_disk_t>) {
+        expected<memory_device_t> device = memory_device_t::make(config.page_bytes);
         if (!device) return device.status();
-        return ram_disk_t::make(std::move(*device), config.disk(media));
+        return memory_disk_t::make(std::move(*device), config.disk(media));
     }
     else if constexpr (std::is_same_v<disk_type_, blocking_files_disk_t>) {
         expected<blocking_files_device_t> device = blocking_files_device_t::make(file_buffering_t::buffered_k);
         if (!device) return device.status();
         return blocking_files_disk_t::make(std::move(*device), config.disk(media));
     }
+    else if constexpr (std::is_same_v<disk_type_, linux_aio_files_disk_t>)
+        return linux_aio_files_disk_t::make(config.linux_aio(media));
     else {
-        static_assert(std::is_same_v<disk_type_, uring_files_disk_t>, "The driver mounts no other ring");
-        return uring_files_disk_t::make(config.uring(media));
+        static_assert(std::is_same_v<disk_type_, linux_uring_files_disk_t>, "The driver mounts no other ring");
+        return linux_uring_files_disk_t::make(config.linux_uring(media));
     }
 }
 
@@ -636,16 +666,21 @@ std::size_t run_on_transport(suite_totals_t& totals, transport_t transport, test
     std::size_t leaks = 0;
     switch (transport) {
     case transport_t::memory_k:
-        return run_on_mount(totals, basic_mount<ram_disk_t> {environment, config, transport, suite, volumes, &leaks},
+        return run_on_mount(totals, basic_mount<memory_disk_t> {environment, config, transport, suite, volumes, &leaks},
                             cases);
-    case transport_t::files_k:
+    case transport_t::blocking_k:
         return run_on_mount(
             totals, basic_mount<blocking_files_disk_t> {environment, config, transport, suite, volumes, &leaks}, cases);
-    case transport_t::io_uring_k:
+    case transport_t::linux_uring_k:
     case transport_t::device_k:
         return run_on_mount(
-            totals, basic_mount<uring_files_disk_t> {environment, config, transport, suite, volumes, &leaks}, cases);
-    case transport_t::spdk_k:
+            totals, basic_mount<linux_uring_files_disk_t> {environment, config, transport, suite, volumes, &leaks},
+            cases);
+    case transport_t::linux_aio_k:
+        return run_on_mount(
+            totals, basic_mount<linux_aio_files_disk_t> {environment, config, transport, suite, volumes, &leaks},
+            cases);
+    case transport_t::linux_spdk_k:
         // The driver mounts no SPDK disk: the transport skips even when `--spdk-address` names one.
         return report(totals, label.c_str(), case_result_t::skipped("the driver mounts no SPDK disk"));
     }

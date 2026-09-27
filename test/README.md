@@ -47,7 +47,7 @@ The engine suites share `nvme_fixture.hpp`: one shape per suite, one mount per t
 A transport the machine does not offer skips with its reason, and a transport the flags claim that then fails to mount fails the suite.
 Every result line reads `<suite>.<transport>.<case>`.
 
-- `nvme_ring.cpp`, `nvme_uring.cpp`, `nvme_spdk.cpp` — the ring contract of `nvme_ring_cases.hpp` on the RAM and blocking transports, on io_uring with what only a kernel queue can get wrong, and on SPDK.
+- `nvme_ring.cpp`, `nvme_linux_uring.cpp`, `nvme_linux_spdk.cpp` — the ring contract of `nvme_ring_cases.hpp` on the RAM and blocking transports, on io_uring with what only a kernel queue can get wrong, and on SPDK.
 - `nvme_channels.cpp` — the registered arena, the blocks channels queue pair out of it, and the pipelines that keep a ring at depth.
 - `nvme_volume.cpp` — the catalog of two slots, the crashes it survives, and the router above it.
 - `nvme_catalog.cpp` — the catalog records and the schema blobs a database persists.
@@ -83,7 +83,7 @@ Every suite takes its inputs as flags and reads no environment variable, and `--
 | `--directory <path>`       | Every suite   | Parent of the unique directory the suite works in, created when missing |
 | `--device <path>`          | Engine suites | Block device the `device` transport opens, skipped when absent          |
 | `--spdk-address <address>` | Engine suites | PCIe address of the NVMe device SPDK binds, skipped when absent         |
-| `--transports <names>`     | Engine suites | Transports to mount, like `ram,files,uring`, every one when absent      |
+| `--transports <names>`     | Engine suites | Transports to mount, like `memory,linux-uring`, all when absent         |
 | `--threads <count>`        | Every suite   | Threads the concurrent cases fan out over, every core when absent       |
 | `--cli <path>`             | `tools.cpp`   | The CLI executable the CLI round trip drives                            |
 | `--seed <number>`          | Every suite   | The seed every random draw descends from, drawn and printed when absent |

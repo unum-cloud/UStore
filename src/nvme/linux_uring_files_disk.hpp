@@ -1,5 +1,5 @@
 /**
- *  @file src/nvme/uring_files_disk.hpp
+ *  @file src/nvme/linux_uring_files_disk.hpp
  *  @author Ash Vardanian
  *  @date September 19, 2026
  *  @brief The ring Linux offers: @c O_DIRECT files driven through raw @c io_uring syscalls.
@@ -66,7 +66,7 @@ namespace unum::ustore::nvme {
  *  on one namespace, sixty-four reach sixteenfold, and everything past a hundred and twenty-eight is
  *  flat, so the default sits where the curve does.
  */
-struct uring_disk_config_t {
+struct linux_uring_disk_config_t {
 
     /** Leases the disk hands out at once, which is also the number of rings it creates. */
     std::uint16_t queue_pairs_limit = 1;
@@ -85,7 +85,7 @@ struct uring_disk_config_t {
 };
 
 /** Whether this machine offers the ring, which a mount asks once before it chooses a transport. */
-enum class uring_probe_t : std::uint8_t {
+enum class linux_uring_probe_t : std::uint8_t {
 
     /** The kernel set a ring up with every flag this transport needs. */
     available_k,
@@ -180,15 +180,15 @@ struct direct_alignment_t {
  *  of submission entries would do anyway. Only a token that is not this queue pair's fails the whole
  *  @c submit, since a misrouted completion is unrecoverable.
  */
-class uring_files_disk_t {
+class linux_uring_files_disk_t {
   public:
 
-    uring_files_disk_t() noexcept = default;
-    uring_files_disk_t(uring_files_disk_t const&) = delete;
-    uring_files_disk_t& operator=(uring_files_disk_t const&) = delete;
-    uring_files_disk_t(uring_files_disk_t&&) noexcept = default;
+    linux_uring_files_disk_t() noexcept = default;
+    linux_uring_files_disk_t(linux_uring_files_disk_t const&) = delete;
+    linux_uring_files_disk_t& operator=(linux_uring_files_disk_t const&) = delete;
+    linux_uring_files_disk_t(linux_uring_files_disk_t&&) noexcept = default;
 
-    uring_files_disk_t& operator=(uring_files_disk_t&& other) noexcept {
+    linux_uring_files_disk_t& operator=(linux_uring_files_disk_t&& other) noexcept {
         if (this == &other) return *this;
         close_all_();
         queue_pairs_ = std::move(other.queue_pairs_);
@@ -210,24 +210,24 @@ class uring_files_disk_t {
         return *this;
     }
 
-    ~uring_files_disk_t() noexcept { close_all_(); }
+    ~linux_uring_files_disk_t() noexcept { close_all_(); }
 
     /**
      *  @brief Sets one tiny ring up and takes it down again, which is the only honest availability test.
      *  @return Whether the kernel offers the flags this transport needs, or why it does not.
      */
-    [[nodiscard]] static uring_probe_t probe() noexcept {
+    [[nodiscard]] static linux_uring_probe_t probe() noexcept {
         io_uring_params parameters {};
         parameters.flags = ring_setup_flags_k;
         long const opened = ::syscall(__NR_io_uring_setup, probe_entries_k, &parameters);
         if (opened >= 0) {
             ::close(static_cast<int>(opened));
-            return uring_probe_t::available_k;
+            return linux_uring_probe_t::available_k;
         }
         switch (errno) {
         case ENOSYS:
-        case EINVAL: return uring_probe_t::too_old_k;
-        default: return uring_probe_t::refused_k;
+        case EINVAL: return linux_uring_probe_t::too_old_k;
+        default: return linux_uring_probe_t::refused_k;
         }
     }
 
@@ -238,7 +238,7 @@ class uring_files_disk_t {
      *  @note No file is opened here; a mount registers each one as a medium, so one disk serves a
      *      directory of many sorted runs rather than one disk per run.
      */
-    static expected<uring_files_disk_t> make(uring_disk_config_t const& config) noexcept {
+    static expected<linux_uring_files_disk_t> make(linux_uring_disk_config_t const& config) noexcept {
         if (config.queue_pairs_limit == 0 || config.depth_limit == 0)
             return status_t {status_code_t::invalid_argument_k, "A ring needs a queue pair and a request of depth"};
         if (config.queue_pairs_limit == static_cast<std::uint16_t>(queue_pair_id_t::unallocated_k) ||
@@ -251,7 +251,7 @@ class uring_files_disk_t {
             return status_t {status_code_t::invalid_argument_k, "A ring holds fewer requests than that"};
 
         std::size_t const window = static_cast<std::size_t>(config.queue_pairs_limit) * config.depth_limit;
-        uring_files_disk_t disk;
+        linux_uring_files_disk_t disk;
         disk.depth_limit_ = config.depth_limit;
         disk.queue_pairs_limit_ = config.queue_pairs_limit;
         disk.registered_memories_limit_ = config.registered_memory_limit;
@@ -1320,14 +1320,14 @@ class uring_files_disk_t {
  *  The type exists so a caller compiles against it unconditionally and chooses at mount, where a
  *  refused @c make sends it to the blocking floor rather than to a build-time branch.
  */
-class uring_files_disk_t {
+class linux_uring_files_disk_t {
   public:
 
     /** Answers that this platform has no ring to offer. */
-    [[nodiscard]] static uring_probe_t probe() noexcept { return uring_probe_t::refused_k; }
+    [[nodiscard]] static linux_uring_probe_t probe() noexcept { return linux_uring_probe_t::refused_k; }
 
     /** Refuses the mount, since this platform has no ring to mount on. */
-    static expected<uring_files_disk_t> make(uring_disk_config_t const&) noexcept {
+    static expected<linux_uring_files_disk_t> make(linux_uring_disk_config_t const&) noexcept {
         return status_t {status_code_t::unsupported_k, "This platform has no io_uring"};
     }
 
@@ -1398,6 +1398,6 @@ class uring_files_disk_t {
 
 #endif
 
-static_assert(ring_concept<uring_files_disk_t>, "The io_uring transport is a ring like every other");
+static_assert(ring_concept<linux_uring_files_disk_t>, "The io_uring transport is a ring like every other");
 
 } // namespace unum::ustore::nvme

@@ -1,6 +1,6 @@
 /**
  *  The completion queue an owner reaps from and the kernel-side list that catches what the queue has
- *  no room for, as the ring of `src/nvme/ring.hpp` fixes it and `src/nvme/uring_files_disk.hpp`
+ *  no room for, as the ring of `src/nvme/ring.hpp` fixes it and `src/nvme/linux_uring_files_disk.hpp`
  *  implements it: an owner submits against bounded credit, every submitted request yields one
  *  terminal completion, and a completion the visible queue cannot hold goes onto an overflow list
  *  rather than being dropped. Nothing is lost there, since `IORING_SETUP_CQ_NODROP` promises it, but

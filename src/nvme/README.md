@@ -1,6 +1,6 @@
 # UStoreNVMe
 
-UStoreNVMe is UStore's NVMe-focused LSM engine, with `io_uring`, SPDK and blocking transports, GPU compaction and GPUDirect Storage, and SIMD row kits.
+UStoreNVMe is UStore's NVMe-focused LSM engine, with `io_uring`, Linux AIO, SPDK and blocking transports, GPU compaction and GPUDirect Storage, and SIMD row kits.
 Every collection is a log-structured merge tree of immutable sorted runs, each opening with a memory-mapped B-tree of its keys.
 Keys are fixed-width stored keys, `ustore_key_t` at the C ABI, and values are opaque bytes whose width a collection fixes at compile time.
 The C ABI in `engine.cpp` backs each UStore database with one `database` and each named collection with one `collection`.
@@ -91,7 +91,7 @@ Commits are ordered by the stamps the registry issues, which keeps a transaction
 - `ustore_snapshot_create`, `ustore_snapshot_export` and `ustore_snapshot_drop` answer `unsupported_k`, `ustore_get_metadata` does not claim `ustore_supports_snapshots_k`, and `ustore_snapshot_list` answers zero so a caller that lists before it clears still works.
 - Nothing compacts on its own, so a write carrying `ustore_option_write_flush_k` flushes and then compacts, and `ustore_database_control` serves `clear`, `reset`, `flush`, `compact`, `info` and `usage`.
 
-The engine mounts on files through whichever of the two file transports the probe settles on, `io_uring` where the kernel allows it and the blocking floor elsewhere, and `info` reports which one it got and, under `io_uring`, whether the arena is pinned.
+The engine mounts on files through whichever of the three file transports the probe settles on, `io_uring` where the kernel allows it, Linux AIO where it refuses a ring, and the blocking floor elsewhere, and `info` reports which one it got, as `uring`, `aio` or `blocking`, and under `io_uring` whether the arena is pinned.
 Only `ram` is refused, since the database the ABI names keeps its volumes in files.
 
 ## Compactions
@@ -115,11 +115,12 @@ The ring is exposed rather than hidden behind a blocking read because a blocking
 
 `io_transport_t` in the configuration asks for a transport, and a mount probes rather than trusting a version number, since a kernel with io_uring still refuses it under Docker's seccomp profile:
 
-- __`blocking_k`__ — `blocking_files_disk_t`, positioned reads and writes on the calling thread. Every platform has it, and it is where a refused probe falls back to.
-- __`io_uring_k`__ — `uring_files_disk_t`, one `io_uring` per queue pair through raw `io_uring_setup`, `io_uring_register` and `io_uring_enter`. No liburing, and Linux 6.12 or newer. Every ring is charged the whole arena against `RLIMIT_MEMLOCK`, so a ring the cap refuses addresses the arena by pointer instead of by registered slot, and the mount stays on `io_uring`.
-- __`spdk_k`__ — `spdk_disk_t`, the user-space NVMe driver behind `USTORE_WITH_SPDK`. Its probe reads `/proc/meminfo` and the driver binding first, because `rte_eal_init` can otherwise call `exit` on the whole process.
-- __`memory_k`__ — `ram_disk_t`, volumes in memory for tests and benchmarks.
-- __`automatic_k`__ — io_uring where the kernel allows it, the blocking floor where it does not. What the mount settled on is reported back rather than inferred.
+- __`blocking_k`__ — `blocking_files_disk_t`, positioned reads and writes on the calling thread. Every platform has it, and it is where two refused probes fall back to.
+- __`linux_uring_k`__ — `linux_uring_files_disk_t`, one `io_uring` per queue pair through raw `io_uring_setup`, `io_uring_register` and `io_uring_enter`. No liburing, and Linux 6.12 or newer. Every ring is charged the whole arena against `RLIMIT_MEMLOCK`, so a ring the cap refuses addresses the arena by pointer instead of by registered slot, and the mount stays on `io_uring`.
+- __`linux_aio_k`__ — `linux_aio_files_disk_t`, one AIO context per queue pair through raw `io_setup`, `io_submit`, `io_getevents` and `io_destroy`, with no libaio. Docker's default seccomp profile, gVisor and kernels below 6.12 keep it where they refuse io_uring. It registers nothing, so the kernel pins each request's pages, and it links nothing, so a chained request waits in its seat until the poll that sees its predecessor transfer in full submits it. A flush is `IOCB_CMD_FDSYNC`, or `fdatasync` where a kernel older than 4.18 refuses that. One thread at depth 256 reads about 500 K random 4 KiB blocks a second on a 6.8 kernel, where `pread` reads 14 K.
+- __`linux_spdk_k`__ — `linux_spdk_disk_t`, the user-space NVMe driver behind `USTORE_WITH_SPDK`. Its probe reads `/proc/meminfo` and the driver binding first, because `rte_eal_init` can otherwise call `exit` on the whole process.
+- __`memory_k`__ — `memory_disk_t`, volumes in memory for tests and benchmarks.
+- __`automatic_k`__ — io_uring where the kernel allows it, Linux AIO where it refuses a ring, the blocking floor where it offers neither. What the mount settled on is reported back rather than inferred.
 
 Above the transport, `volume.hpp` resolves a name to an extent.
 A volume without a filesystem under it keeps its catalog in two slots of the volume itself: an image is written whole into the older slot, flushed, and from that instant it is the newer one, while a torn image fails the checksum its header carries and a mount reads the other slot.

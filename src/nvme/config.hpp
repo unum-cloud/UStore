@@ -49,17 +49,20 @@ struct data_directory_config_t {
  */
 enum class io_transport_t : std::uint8_t {
 
-    /** io_uring where the kernel offers it, and the blocking floor everywhere else. */
+    /** io_uring where the kernel offers it, Linux AIO where it offers only that, and the blocking floor elsewhere. */
     automatic_k,
 
     /** Positioned reads and writes on the polling thread, which every platform has. */
     blocking_k,
 
     /** io_uring on unbuffered files, refused without a kernel ring; an arena the memlock cap refuses goes unpinned. */
-    io_uring_k,
+    linux_uring_k,
+
+    /** Linux AIO on unbuffered files, which Docker's seccomp profile and kernels below 6.12 keep without a ring. */
+    linux_aio_k,
 
     /** SPDK's user-space driver, which no mount opens yet. */
-    spdk_k,
+    linux_spdk_k,
 
     /** Host memory, which a suite and a benchmark ask for and a database never does. */
     memory_k,
@@ -424,8 +427,9 @@ template <std::unsigned_integral value_>
     std::string_view const name = json_string_view(value);
     if (name == "automatic") io_transport = io_transport_t::automatic_k;
     else if (name == "blocking") io_transport = io_transport_t::blocking_k;
-    else if (name == "io_uring") io_transport = io_transport_t::io_uring_k;
-    else if (name == "spdk") io_transport = io_transport_t::spdk_k;
+    else if (name == "linux-uring") io_transport = io_transport_t::linux_uring_k;
+    else if (name == "linux-aio") io_transport = io_transport_t::linux_aio_k;
+    else if (name == "linux-spdk") io_transport = io_transport_t::linux_spdk_k;
     else if (name == "memory") io_transport = io_transport_t::memory_k;
     else return false;
     return true;

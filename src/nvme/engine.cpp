@@ -1306,12 +1306,14 @@ void ustore_database_control(ustore_database_control_t* c_arguments) {
     *arguments.response = nullptr;
     if (request == "info") {
         mounted_storage_t const& storage = database.resources->storage;
-        if (storage.report().transport != io_transport_t::io_uring_k)
+        if (storage.report().transport == io_transport_t::linux_aio_k)
+            *arguments.response = R"({"engine":"nvme","transport":"linux-aio"})";
+        else if (storage.report().transport != io_transport_t::linux_uring_k)
             *arguments.response = R"({"engine":"nvme","transport":"blocking"})";
         else
             *arguments.response = storage.pinning() == range_pinning_t::pinned_k
-                                      ? R"({"engine":"nvme","transport":"uring","buffers":"pinned"})"
-                                      : R"({"engine":"nvme","transport":"uring","buffers":"unpinned"})";
+                                      ? R"({"engine":"nvme","transport":"linux-uring","buffers":"pinned"})"
+                                      : R"({"engine":"nvme","transport":"linux-uring","buffers":"unpinned"})";
         return;
     }
     if (request == "flush") {

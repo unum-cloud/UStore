@@ -1,5 +1,5 @@
 /**
- *  @file src/nvme/ram_disk.hpp
+ *  @file src/nvme/memory_disk.hpp
  *  @author Ash Vardanian
  *  @date September 18, 2026
  *  @brief A volume in memory behind the same ring, so a suite exercises the contract without a device.
@@ -36,14 +36,14 @@ namespace unum::ustore::nvme {
  *  mount parameter rather than a property of memory, so a suite can hold a transport to the numbers
  *  an @c O_DIRECT file or an NVMe namespace would report without owning either.
  */
-class ram_device_t {
+class memory_device_t {
   public:
 
-    ram_device_t() noexcept = default;
-    ram_device_t(ram_device_t const&) = delete;
-    ram_device_t& operator=(ram_device_t const&) = delete;
-    ram_device_t(ram_device_t&&) noexcept = default;
-    ram_device_t& operator=(ram_device_t&&) noexcept = default;
+    memory_device_t() noexcept = default;
+    memory_device_t(memory_device_t const&) = delete;
+    memory_device_t& operator=(memory_device_t const&) = delete;
+    memory_device_t(memory_device_t&&) noexcept = default;
+    memory_device_t& operator=(memory_device_t&&) noexcept = default;
 
     /**
      *  @brief Makes a device whose volumes demand @p alignment of every request.
@@ -52,10 +52,10 @@ class ram_device_t {
      *  @note No volume is allocated here; a mount registers each one as a medium, so one device
      *      serves a directory of many volumes exactly as a file device does.
      */
-    static expected<ram_device_t> make(std::uint64_t alignment = 1) noexcept {
+    static expected<memory_device_t> make(std::uint64_t alignment = 1) noexcept {
         if (!is_power_of_two(alignment))
             return status_t {status_code_t::invalid_argument_k, "An alignment is a power of two"};
-        ram_device_t device;
+        memory_device_t device;
         device.alignment_ = alignment;
         return device;
     }
@@ -151,7 +151,7 @@ class ram_device_t {
 };
 
 /** The ring a suite drives without a device, satisfying the same contract as every disk. */
-using ram_disk_t = basic_disk<ram_device_t>;
+using memory_disk_t = basic_disk<memory_device_t>;
 
 #pragma endregion Device
 

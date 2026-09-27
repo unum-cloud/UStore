@@ -857,7 +857,7 @@ check_verification_cites_symbols() {
     pinned=$(printf '%s\n' "$added" | grep -E '[A-Za-z0-9_]\.[A-Za-z]+:[0-9]' || true)
     [ -z "$pinned" ] || fail "$pinned" \
         "$file pins a citation to a line number, which drifts with every edit above it - cite the symbol" \
-        "            and its file instead, as \`poll\` in \`uring_files_disk.hpp\`:"
+        "            and its file instead, as \`poll\` in \`linux_uring_files_disk.hpp\`:"
 }
 
 # endregion Tests and Verification

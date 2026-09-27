@@ -1,5 +1,5 @@
 /**
- *  @file test/nvme_spdk.cpp
+ *  @file test/nvme_linux_spdk.cpp
  *  @author Ash Vardanian
  *  @date September 19, 2026
  *  @brief The SPDK transport: its probe on any machine, and the ring contract over an NVMe/TCP target.
@@ -32,8 +32,8 @@
 #include <ustore/status.hpp> // `status_t`, `expected`
 #include <ustore/types.hpp>  // `byte_t`
 
-#include "nvme/ring.hpp"      // `ring_concept`, `queue_pair_t`
-#include "nvme/spdk_disk.hpp" // `spdk_disk_t`, `spdk_environment_t`, `spdk_probe_t`
+#include "nvme/linux_spdk_disk.hpp" // `linux_spdk_disk_t`, `spdk_environment_t`, `linux_spdk_probe_t`
+#include "nvme/ring.hpp"            // `ring_concept`, `queue_pair_t`
 
 #include "nvme_ring_cases.hpp" // `ring_cases`, `ring_edge_t`, every transport-independent result
 
@@ -48,7 +48,7 @@ using namespace unum::ustore::nvme;
 
 #pragma region Fixtures
 
-static_assert(ring_concept<spdk_disk_t>, "The SPDK transport is a ring in every configuration");
+static_assert(ring_concept<linux_spdk_disk_t>, "The SPDK transport is a ring in every configuration");
 
 /** A PCIe address no machine answers at, since function seven of device 31 on bus 255 is empty. */
 constexpr char const* absent_address_k = "0000:ff:1f.7";
@@ -93,12 +93,12 @@ MemFree:         98765432 kB
 )";
 
 /** What a probe result is called, so a machine's own answer reads as a word rather than a number. */
-[[nodiscard]] char const* describe(spdk_probe_t result) noexcept {
+[[nodiscard]] char const* describe(linux_spdk_probe_t result) noexcept {
     switch (result) {
-    case spdk_probe_t::available_k: return "available_k";
-    case spdk_probe_t::without_hugepages_k: return "without_hugepages_k";
-    case spdk_probe_t::without_permission_k: return "without_permission_k";
-    case spdk_probe_t::not_found_k: return "not_found_k";
+    case linux_spdk_probe_t::available_k: return "available_k";
+    case linux_spdk_probe_t::without_hugepages_k: return "without_hugepages_k";
+    case linux_spdk_probe_t::without_permission_k: return "without_permission_k";
+    case linux_spdk_probe_t::not_found_k: return "not_found_k";
     }
     return "unknown";
 }
@@ -133,12 +133,12 @@ MemFree:         98765432 kB
 /** A bogus address answers @c not_found_k, without a crash and without a wait. */
 [[nodiscard]] std::size_t spdk_refuses_an_absent_address() {
     std::size_t failures = 0;
-    failures += expect(spdk_environment_t::probe(absent_address_k) == spdk_probe_t::not_found_k);
-    failures += expect(spdk_environment_t::probe(nullptr) == spdk_probe_t::not_found_k);
-    failures += expect(spdk_environment_t::probe("") == spdk_probe_t::not_found_k);
-    failures += expect(spdk_environment_t::probe("not an address") == spdk_probe_t::not_found_k);
-    failures += expect(spdk_environment_t::probe("0000:ff:1f.7:0") == spdk_probe_t::not_found_k);
-    failures += expect(spdk_environment_t::probe("/dev/nvme0n1") == spdk_probe_t::not_found_k);
+    failures += expect(spdk_environment_t::probe(absent_address_k) == linux_spdk_probe_t::not_found_k);
+    failures += expect(spdk_environment_t::probe(nullptr) == linux_spdk_probe_t::not_found_k);
+    failures += expect(spdk_environment_t::probe("") == linux_spdk_probe_t::not_found_k);
+    failures += expect(spdk_environment_t::probe("not an address") == linux_spdk_probe_t::not_found_k);
+    failures += expect(spdk_environment_t::probe("0000:ff:1f.7:0") == linux_spdk_probe_t::not_found_k);
+    failures += expect(spdk_environment_t::probe("/dev/nvme0n1") == linux_spdk_probe_t::not_found_k);
     return failures;
 }
 
@@ -219,8 +219,8 @@ MemFree:         98765432 kB
     failures += expect(transport_field("trtype:TCP traddr:10.0.0.1 trsvcid:4420", "traddr:") == "10.0.0.1");
     failures += expect(transport_field("trtype:TCP traddr:10.0.0.1 trsvcid:4420", "trsvcid:") == "4420");
     failures += expect(transport_field("trtype:TCP", "traddr:").empty());
-    failures += expect(spdk_environment_t::probe(fabric_address_k) == spdk_probe_t::available_k);
-    failures += expect(spdk_environment_t::probe("trtype:PCIe traddr:0000:ff:1f.7") == spdk_probe_t::not_found_k);
+    failures += expect(spdk_environment_t::probe(fabric_address_k) == linux_spdk_probe_t::available_k);
+    failures += expect(spdk_environment_t::probe("trtype:PCIe traddr:0000:ff:1f.7") == linux_spdk_probe_t::not_found_k);
     return failures;
 }
 
@@ -234,14 +234,14 @@ MemFree:         98765432 kB
     std::string_view const first = first_pci_address(address);
     if (first.empty()) {
         fmt::println("  this machine lists no PCIe device, so every address probes not_found_k");
-        return failures + expect(spdk_environment_t::probe(absent_address_k) == spdk_probe_t::not_found_k);
+        return failures + expect(spdk_environment_t::probe(absent_address_k) == linux_spdk_probe_t::not_found_k);
     }
 
-    spdk_probe_t const result = spdk_environment_t::probe(address.data());
+    linux_spdk_probe_t const result = spdk_environment_t::probe(address.data());
     fmt::println("  probe({}) answers {}, with {} of {} hugepages free", first, describe(result), hugepages.free_pages,
                  hugepages.total_pages);
-    if (hugepages.free_pages == 0) failures += expect(result == spdk_probe_t::without_hugepages_k);
-    else failures += expect(result != spdk_probe_t::not_found_k);
+    if (hugepages.free_pages == 0) failures += expect(result == linux_spdk_probe_t::without_hugepages_k);
+    else failures += expect(result != linux_spdk_probe_t::not_found_k);
     return failures;
 }
 
@@ -336,7 +336,7 @@ class spdk_rig_t {
 #pragma region Cases
 
 /** The controller identifies as the serial the rig set; a foreign target's serial is only printed. */
-[[nodiscard]] std::size_t spdk_identifies_the_controller(spdk_disk_t& disk, std::string_view wanted) {
+[[nodiscard]] std::size_t spdk_identifies_the_controller(linux_spdk_disk_t& disk, std::string_view wanted) {
     std::size_t failures = 0;
     spdk_controller_identity_t const identity = disk.identity();
     fmt::println("  serial {}, model {}", identity.serial, identity.model);
@@ -346,7 +346,7 @@ class spdk_rig_t {
 }
 
 /** What the disk reports is the namespace's sector, the queue pair shape the mount asked for, and one target. */
-[[nodiscard]] std::size_t spdk_reports_the_namespace(spdk_disk_t& disk) {
+[[nodiscard]] std::size_t spdk_reports_the_namespace(linux_spdk_disk_t& disk) {
     std::size_t failures = 0;
     ring_capabilities_t const limits = disk.capabilities();
     fmt::println("  sector {} bytes, transfer up to {} bytes, {} queue pairs of {}", limits.offset_alignment,
@@ -365,17 +365,17 @@ class spdk_rig_t {
 /** Connects to @p address, checks what the controller says it is, and runs the ring contract over it. */
 void spdk_transport(suite_totals_t& totals, char const* address, std::string_view serial) {
     expected<spdk_environment_t> environment = spdk_environment_t::acquire(spdk_environment_config_t {});
-    if (report(totals, "spdk.environment", expect_status(environment, status_code_t::success_k)) != 0) return;
+    if (report(totals, "linux-spdk.environment", expect_status(environment, status_code_t::success_k)) != 0) return;
 
-    spdk_disk_config_t config;
+    linux_spdk_disk_config_t config;
     config.queue_pairs_limit = spdk_queue_pairs_k;
     config.depth_limit = queue_pair_depth_k;
     config.registered_memory_limit = 4;
-    expected<spdk_disk_t> disk = spdk_disk_t::open(*environment, address, config);
-    if (report(totals, "spdk.mount", expect_status(disk, status_code_t::success_k)) != 0) return;
+    expected<linux_spdk_disk_t> disk = linux_spdk_disk_t::open(*environment, address, config);
+    if (report(totals, "linux-spdk.mount", expect_status(disk, status_code_t::success_k)) != 0) return;
 
-    report(totals, "spdk.identify", spdk_identifies_the_controller, *disk, serial);
-    report(totals, "spdk.namespace", spdk_reports_the_namespace, *disk);
+    report(totals, "linux-spdk.identify", spdk_identifies_the_controller, *disk, serial);
+    report(totals, "linux-spdk.namespace", spdk_reports_the_namespace, *disk);
 
     std::size_t volume_failures = 0;
     expected<registered_medium_t> registered = disk->register_medium(volume_request("namespace"));
@@ -384,14 +384,14 @@ void spdk_transport(suite_totals_t& totals, char const* address, std::string_vie
         registered_medium_t descriptor = std::move(*registered);
         volume_failures += expect_eq(descriptor.capacity(), volume_bytes_k);
         if (descriptor.capacity() == volume_bytes_k)
-            ring_cases(totals, "spdk", *disk, descriptor.reference(), ring_edge_t::refused_k);
+            ring_cases(totals, "linux-spdk", *disk, descriptor.reference(), ring_edge_t::refused_k);
         volume_failures += expect(disk->unregister_medium(descriptor).succeeded());
     }
-    report(totals, "spdk.volume", volume_failures);
+    report(totals, "linux-spdk.volume", volume_failures);
 
-    report(totals, "spdk.target_in_flight", ring_holds_a_target_in_flight<spdk_disk_t>, *disk,
+    report(totals, "linux-spdk.target_in_flight", ring_holds_a_target_in_flight<linux_spdk_disk_t>, *disk,
            volume_request("namespace"));
-    report(totals, "spdk.keeps_what_it_flushed", ring_keeps_what_it_flushed<spdk_disk_t>, *disk,
+    report(totals, "linux-spdk.keeps_what_it_flushed", ring_keeps_what_it_flushed<linux_spdk_disk_t>, *disk,
            volume_request("namespace"));
 }
 
@@ -402,11 +402,11 @@ void spdk_suite(suite_totals_t& totals, suite_options_t const& options, spdk_sui
         return;
     }
     if (flags.root.empty()) {
-        report(totals, "spdk", case_result_t::skipped("needs --spdk-address or --spdk-root"));
+        report(totals, "linux-spdk", case_result_t::skipped("needs --spdk-address or --spdk-root"));
         return;
     }
     spdk_rig_t rig;
-    if (report(totals, "spdk.rig", expect(rig.up(flags.root))) != 0) return;
+    if (report(totals, "linux-spdk.rig", expect(rig.up(flags.root))) != 0) return;
     fmt::println("  target at {}", rig.address());
     spdk_transport(totals, rig.address(), flags.serial.empty() ? std::string_view {rig.serial()} : flags.serial);
     rig.down();
@@ -423,14 +423,14 @@ void spdk_suite(suite_totals_t& totals, suite_options_t const& options, spdk_sui
     std::size_t failures = 0;
     failures += expect_status(spdk_environment_t::acquire(spdk_environment_config_t {}), status_code_t::unsupported_k);
 
-    spdk_disk_config_t config;
+    linux_spdk_disk_config_t config;
     config.queue_pairs_limit = 4;
     config.depth_limit = 8;
     config.registered_memory_limit = 4;
-    expected<spdk_disk_t> disk = spdk_disk_t::open(spdk_environment_t {}, absent_address_k, config);
+    expected<linux_spdk_disk_t> disk = linux_spdk_disk_t::open(spdk_environment_t {}, absent_address_k, config);
     failures += expect_status(disk, status_code_t::unsupported_k);
 
-    spdk_disk_t empty;
+    linux_spdk_disk_t empty;
     queue_pair_t queue_pair;
     registered_memory_t registered_memory;
     registered_medium_t descriptor;
@@ -463,8 +463,8 @@ void spdk_suite(suite_totals_t& totals, suite_options_t const& options, spdk_sui
 
 /** Checks the refusals, and reports that the transport itself needs a build that carries the driver. */
 void spdk_suite(suite_totals_t& totals, suite_options_t const&, spdk_suite_flags_t const&) {
-    report(totals, "spdk.refuses_without_the_option", spdk_refuses_without_the_option);
-    report(totals, "spdk", case_result_t::skipped("needs a build with USTORE_WITH_SPDK"));
+    report(totals, "linux-spdk.refuses_without_the_option", spdk_refuses_without_the_option);
+    report(totals, "linux-spdk", case_result_t::skipped("needs a build with USTORE_WITH_SPDK"));
 }
 
 #pragma endregion Refusals
@@ -490,12 +490,12 @@ int main(int argc, char const* argv[]) {
         return status == argument_status_t::help_k ? 0 : 1;
     suite_totals_t totals = options.totals();
 
-    report(totals, "spdk.absent_address", spdk_refuses_an_absent_address);
-    report(totals, "spdk.hugepage_pool", spdk_parses_the_hugepage_pool);
-    report(totals, "spdk.bound_driver", spdk_names_the_bound_driver);
-    report(totals, "spdk.normalises_address", spdk_normalises_an_address);
-    report(totals, "spdk.fabric_address", spdk_passes_a_fabric_address);
-    report(totals, "spdk.probes_this_machine", spdk_probes_this_machine);
+    report(totals, "linux-spdk.absent_address", spdk_refuses_an_absent_address);
+    report(totals, "linux-spdk.hugepage_pool", spdk_parses_the_hugepage_pool);
+    report(totals, "linux-spdk.bound_driver", spdk_names_the_bound_driver);
+    report(totals, "linux-spdk.normalises_address", spdk_normalises_an_address);
+    report(totals, "linux-spdk.fabric_address", spdk_passes_a_fabric_address);
+    report(totals, "linux-spdk.probes_this_machine", spdk_probes_this_machine);
     spdk_suite(totals, options, flags);
     return suite_exit_code(totals);
 }

@@ -5,7 +5,7 @@
  *  @brief The one ring a database on files mounts, holding whichever file transport the probe chose.
  *
  *  A database materializes over one disk type, and the transport is known only once the mount has
- *  asked the kernel, so the two file transports are erased here, at the disk. The alternative is
+ *  asked the kernel, so the three file transports are erased here, at the disk. The alternative is
  *  fixed for the life of the mount and the branch is paid once per batch on @c submit and @c poll,
  *  each of which wraps a syscall. Every queue pair, registered memory and registered medium is the shared vocabulary
  *  of @c ring.hpp, so nothing above the disk sees which transport answered.
@@ -23,20 +23,22 @@
 #include <ustore/status.hpp> // `status_t`, `expected`
 #include <ustore/types.hpp>  // `byte_t`
 
-#include "nvme/blocking_files_disk.hpp" // `blocking_files_disk_t`
-#include "nvme/config.hpp"              // `io_transport_t`
-#include "nvme/ring.hpp"                // `ring_concept`, `queue_pair_t`, `registered_memory_t`, `registered_medium_t`
-#include "nvme/uring_files_disk.hpp"    // `uring_files_disk_t`
+#include "nvme/blocking_files_disk.hpp"    // `blocking_files_disk_t`
+#include "nvme/linux_aio_files_disk.hpp"   // `linux_aio_files_disk_t`
+#include "nvme/linux_uring_files_disk.hpp" // `linux_uring_files_disk_t`
+
+#include "nvme/config.hpp" // `io_transport_t`
+#include "nvme/ring.hpp"   // `ring_concept`, `queue_pair_t`, `registered_memory_t`, `registered_medium_t`
 
 namespace unum::ustore::nvme {
 
 #pragma region Disk
 
 /**
- *  @brief The ring of a database on files: the blocking floor or io_uring, whichever the mount probed.
+ *  @brief The ring of a database on files: the blocking floor, AIO or io_uring, as the mount probed.
  *
- *  The uring alternative exists on every platform, as a stub that refuses where the kernel has no
- *  ring, so the type is portable and only the mount's probe decides which alternative is built.
+ *  The io_uring and AIO alternatives exist on every platform, as stubs that refuse off Linux, so
+ *  the type is portable and only the mount's probe decides which alternative is built.
  */
 class any_files_disk_t {
   public:
@@ -46,8 +48,12 @@ class any_files_disk_t {
         : held_(std::in_place_type<blocking_files_disk_t>, std::move(disk)) {}
 
     /** Takes the io_uring transport in, which a mount builds where the probe found a ring. */
-    explicit any_files_disk_t(uring_files_disk_t&& disk) noexcept
-        : held_(std::in_place_type<uring_files_disk_t>, std::move(disk)) {}
+    explicit any_files_disk_t(linux_uring_files_disk_t&& disk) noexcept
+        : held_(std::in_place_type<linux_uring_files_disk_t>, std::move(disk)) {}
+
+    /** Takes the Linux AIO transport in, which a mount builds where the probe refused a ring and found AIO. */
+    explicit any_files_disk_t(linux_aio_files_disk_t&& disk) noexcept
+        : held_(std::in_place_type<linux_aio_files_disk_t>, std::move(disk)) {}
 
     any_files_disk_t(any_files_disk_t const&) = delete;
     any_files_disk_t& operator=(any_files_disk_t const&) = delete;
@@ -56,8 +62,9 @@ class any_files_disk_t {
 
     /** The transport held, which is never @c automatic_k. */
     [[nodiscard]] io_transport_t transport() const noexcept {
-        return std::holds_alternative<uring_files_disk_t>(held_) ? io_transport_t::io_uring_k
-                                                                 : io_transport_t::blocking_k;
+        if (std::holds_alternative<linux_uring_files_disk_t>(held_)) return io_transport_t::linux_uring_k;
+        if (std::holds_alternative<linux_aio_files_disk_t>(held_)) return io_transport_t::linux_aio_k;
+        return io_transport_t::blocking_k;
     }
 
     /** What the held transport accepts. */
@@ -65,10 +72,10 @@ class any_files_disk_t {
         return std::visit([](auto const& disk) noexcept { return disk.capabilities(); }, held_);
     }
 
-    /** How the held transport addresses the registered arena; the blocking floor pins per request. */
+    /** How the held transport addresses the registered arena; the blocking floor and AIO pin per request. */
     [[nodiscard]] range_pinning_t pinning() const noexcept {
-        uring_files_disk_t const* const uring = std::get_if<uring_files_disk_t>(&held_);
-        return uring ? uring->pinning() : range_pinning_t::unpinned_k;
+        linux_uring_files_disk_t const* const linux_uring = std::get_if<linux_uring_files_disk_t>(&held_);
+        return linux_uring ? linux_uring->pinning() : range_pinning_t::unpinned_k;
     }
 
 #pragma region Queue Pairs
@@ -146,7 +153,7 @@ class any_files_disk_t {
   private:
 
     /** The transport the probe chose, fixed for the life of the mount. */
-    std::variant<blocking_files_disk_t, uring_files_disk_t> held_;
+    std::variant<blocking_files_disk_t, linux_uring_files_disk_t, linux_aio_files_disk_t> held_;
 };
 
 static_assert(ring_concept<any_files_disk_t>);

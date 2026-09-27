@@ -1,5 +1,5 @@
 /**
- *  @file test/nvme_uring.cpp
+ *  @file test/nvme_linux_uring.cpp
  *  @author Ash Vardanian
  *  @date September 19, 2026
  *  @brief The ring contract on Linux, and the four things only a real io_uring transport can get wrong.
@@ -36,8 +36,8 @@
 #include <ustore/status.hpp> // `status_t`, `expected`
 #include <ustore/types.hpp>  // `byte_t`
 
-#include "nvme/blocking_files_disk.hpp" // `native_file_t`, `close_native_file`, `blocking_files_disk_t`
-#include "nvme/uring_files_disk.hpp"    // `uring_files_disk_t`, `uring_probe_t`
+#include "nvme/blocking_files_disk.hpp"    // `native_file_t`, `close_native_file`, `blocking_files_disk_t`
+#include "nvme/linux_uring_files_disk.hpp" // `linux_uring_files_disk_t`, `linux_uring_probe_t`
 
 #include "nvme_ring_cases.hpp" // `ring_cases`, every transport-independent result
 
@@ -80,7 +80,7 @@ expected<std::uint64_t> registered_capacity(disk_type_& disk, medium_options_t c
  *  @param[in] body Called with the queue pair, the registered memory and the buffer it covers.
  */
 template <typename body_type_>
-std::size_t on_queue_pair(uring_files_disk_t& disk, std::size_t bytes, body_type_&& body) {
+std::size_t on_queue_pair(linux_uring_files_disk_t& disk, std::size_t bytes, body_type_&& body) {
     std::size_t failures = 0;
     test_buffer_t buffer = make_buffer(bytes);
     failures += expect_eq(buffer.size(), bytes);
@@ -110,7 +110,7 @@ std::size_t on_queue_pair(uring_files_disk_t& disk, std::size_t bytes, body_type
 #pragma region Cases
 
 /** A request the disk can refuse before the kernel sees it fails alone, and its neighbours still run. */
-std::size_t uring_fails_one_request_of_a_batch(uring_files_disk_t& disk, medium_reference_t medium) {
+std::size_t uring_fails_one_request_of_a_batch(linux_uring_files_disk_t& disk, medium_reference_t medium) {
     return on_queue_pair(
         disk, 2 * block_bytes_k,
         [&](queue_pair_t& queue_pair, registered_memory_t& registered_memory, std::span<byte_t>) {
@@ -145,7 +145,7 @@ std::size_t uring_fails_one_request_of_a_batch(uring_files_disk_t& disk, medium_
 }
 
 /** A chain whose first read is short reports the rest cancelled, which is what cutting a link means. */
-std::size_t uring_cuts_a_chain_on_a_short_read(uring_files_disk_t& disk, medium_reference_t medium) {
+std::size_t uring_cuts_a_chain_on_a_short_read(linux_uring_files_disk_t& disk, medium_reference_t medium) {
     constexpr std::uint64_t reachable_k = 1024;
     return on_queue_pair(
         disk, 3 * block_bytes_k,
@@ -176,7 +176,7 @@ std::size_t uring_cuts_a_chain_on_a_short_read(uring_files_disk_t& disk, medium_
 }
 
 /** A cancellation mid-flight delivers one completion per submitted request, and never one extra. */
-std::size_t uring_counts_completions_after_a_cancel(uring_files_disk_t& disk, medium_reference_t medium) {
+std::size_t uring_counts_completions_after_a_cancel(linux_uring_files_disk_t& disk, medium_reference_t medium) {
     return on_queue_pair(
         disk, queue_pair_depth_k * block_bytes_k,
         [&](queue_pair_t& queue_pair, registered_memory_t& registered_memory, std::span<byte_t>) {
@@ -218,7 +218,7 @@ std::size_t uring_counts_completions_after_a_cancel(uring_files_disk_t& disk, me
  *  often than the queue has seats puts the kernel over the edge, and from there every completion
  *  sits in the kernel's overflow list until a poll enters again to flush it.
  */
-std::size_t uring_polls_an_overflowed_queue(uring_files_disk_t& disk, medium_reference_t medium) {
+std::size_t uring_polls_an_overflowed_queue(linux_uring_files_disk_t& disk, medium_reference_t medium) {
     constexpr std::size_t cancels_k = 64;
     return on_queue_pair(
         disk, queue_pair_depth_k * block_bytes_k,
@@ -255,7 +255,7 @@ std::size_t uring_polls_an_overflowed_queue(uring_files_disk_t& disk, medium_ref
 }
 
 /** A full ring drained one completion at a time still answers for every request it took. */
-std::size_t uring_polls_through_a_narrow_window(uring_files_disk_t& disk, medium_reference_t medium) {
+std::size_t uring_polls_through_a_narrow_window(linux_uring_files_disk_t& disk, medium_reference_t medium) {
     return on_queue_pair(
         disk, queue_pair_depth_k * block_bytes_k,
         [&](queue_pair_t& queue_pair, registered_memory_t& registered_memory, std::span<byte_t>) {
@@ -284,7 +284,7 @@ std::size_t uring_polls_through_a_narrow_window(uring_files_disk_t& disk, medium
 }
 
 /** What the disk reports is what @c statx says the filesystem under the volume demands. */
-std::size_t uring_reports_the_alignment_statx_reports(uring_files_disk_t& disk, char const* path) {
+std::size_t uring_reports_the_alignment_statx_reports(linux_uring_files_disk_t& disk, char const* path) {
     std::size_t failures = 0;
     ring_capabilities_t const limits = disk.capabilities();
 
@@ -332,8 +332,8 @@ std::size_t device_reports_its_capacity(std::string_view device) {
     failures += expect(blocking_capacity.has_value());
     if (blocking_capacity) failures += expect_eq(*blocking_capacity, exported);
 
-    uring_disk_config_t uring_config;
-    expected<uring_files_disk_t> uring = uring_files_disk_t::make(uring_config);
+    linux_uring_disk_config_t uring_config;
+    expected<linux_uring_files_disk_t> uring = linux_uring_files_disk_t::make(uring_config);
     failures += expect(uring.has_value());
     if (!uring) return failures;
     expected<std::uint64_t> const uring_capacity = registered_capacity(*uring, request);
@@ -357,29 +357,30 @@ std::size_t device_reports_its_capacity(std::string_view device) {
 
 /** Mounts the io_uring transport on a preallocated volume and runs the suite on it. */
 void uring_transport(suite_totals_t& totals, char const* directory) {
-    uring_disk_config_t config;
+    linux_uring_disk_config_t config;
     config.queue_pairs_limit = 4;
     config.depth_limit = queue_pair_depth_k;
     config.registered_memory_limit = 4;
     config.media_limit = 4;
     config.buffering = file_buffering_t::unbuffered_k;
 
-    expected<uring_files_disk_t> disk = uring_files_disk_t::make(config);
-    if (report(totals, "uring.mount", expect_status(disk, status_code_t::success_k)) != 0) return;
+    expected<linux_uring_files_disk_t> disk = linux_uring_files_disk_t::make(config);
+    if (report(totals, "linux-uring.mount", expect_status(disk, status_code_t::success_k)) != 0) return;
 
     test_path_t const path {directory, "volume.bin"};
-    on_medium(totals, "uring.volume", *disk, volume_request(path.c_str()), [&](medium_reference_t medium) {
-        ring_cases(totals, "uring", *disk, medium);
-        report(totals, "uring.fails_one_request", uring_fails_one_request_of_a_batch, *disk, medium);
-        report(totals, "uring.cuts_a_chain_short", uring_cuts_a_chain_on_a_short_read, *disk, medium);
-        report(totals, "uring.cancel_completions", uring_counts_completions_after_a_cancel, *disk, medium);
-        report(totals, "uring.narrow_poll_window", uring_polls_through_a_narrow_window, *disk, medium);
-        report(totals, "uring.overflowed_queue", uring_polls_an_overflowed_queue, *disk, medium);
-        report(totals, "uring.alignment_matches_statx", uring_reports_the_alignment_statx_reports, *disk, path.c_str());
+    on_medium(totals, "linux-uring.volume", *disk, volume_request(path.c_str()), [&](medium_reference_t medium) {
+        ring_cases(totals, "linux-uring", *disk, medium);
+        report(totals, "linux-uring.fails_one_request", uring_fails_one_request_of_a_batch, *disk, medium);
+        report(totals, "linux-uring.cuts_a_chain_short", uring_cuts_a_chain_on_a_short_read, *disk, medium);
+        report(totals, "linux-uring.cancel_completions", uring_counts_completions_after_a_cancel, *disk, medium);
+        report(totals, "linux-uring.narrow_poll_window", uring_polls_through_a_narrow_window, *disk, medium);
+        report(totals, "linux-uring.overflowed_queue", uring_polls_an_overflowed_queue, *disk, medium);
+        report(totals, "linux-uring.alignment_matches_statx", uring_reports_the_alignment_statx_reports, *disk,
+               path.c_str());
     });
 
     test_path_t const borrowed_path {directory, "volume_borrowed.bin"};
-    report(totals, "uring.medium_in_flight", ring_holds_a_medium_in_flight<uring_files_disk_t>, *disk,
+    report(totals, "linux-uring.medium_in_flight", ring_holds_a_medium_in_flight<linux_uring_files_disk_t>, *disk,
            volume_request(borrowed_path.c_str()));
 }
 
@@ -405,12 +406,12 @@ int main(int argc, char const* argv[]) {
     }
     test_environment_t const environment = test_environment_t::of(options, *directory);
 
-    if (char const* const reason = transport_refusal(transport_t::io_uring_k, environment))
-        report(totals, "uring", case_result_t::skipped(reason));
+    if (char const* const reason = transport_refusal(transport_t::linux_uring_k, environment))
+        report(totals, "linux-uring", case_result_t::skipped(reason));
     else uring_transport(totals, environment.directory);
 
     if (char const* const reason = transport_refusal(transport_t::device_k, environment))
-        report(totals, "uring.device_capacity", case_result_t::skipped(reason));
-    else report(totals, "uring.device_capacity", device_reports_its_capacity, environment.device);
+        report(totals, "linux-uring.device_capacity", case_result_t::skipped(reason));
+    else report(totals, "linux-uring.device_capacity", device_reports_its_capacity, environment.device);
     return suite_exit_code(totals);
 }

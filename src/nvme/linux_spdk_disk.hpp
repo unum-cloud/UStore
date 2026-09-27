@@ -1,5 +1,5 @@
 /**
- *  @file src/nvme/spdk_disk.hpp
+ *  @file src/nvme/linux_spdk_disk.hpp
  *  @author Ash Vardanian
  *  @date September 19, 2026
  *  @brief The ring SPDK offers: a user-space NVMe driver over one namespace, one queue pair per queue pair.
@@ -66,7 +66,7 @@ namespace unum::ustore::nvme {
 #pragma region Probe
 
 /** Whether this machine would let a user-space driver claim a device, or why it would not. */
-enum class spdk_probe_t : std::uint8_t {
+enum class linux_spdk_probe_t : std::uint8_t {
 
     /** The device is there, hugepages are free, and the binding lets a user-space driver claim it. */
     available_k,
@@ -368,7 +368,7 @@ struct spdk_controller_identity_t {
  *  controller actually offers, which on a consumer drive is far fewer than a large executor has
  *  threads, so a caller reads @c capabilities to learn how many queue pairs it really got.
  */
-struct spdk_disk_config_t {
+struct linux_spdk_disk_config_t {
 
     /** Queue pairs the mount asks the controller for, which is the queue pairs it hands out. */
     std::uint16_t queue_pairs_limit = 1;
@@ -434,7 +434,7 @@ class spdk_environment_t {
      *      hugepage behind it, so it answers @c available_k at once and leaves the refusal to the
      *      connect, which is the only thing that can see the network.
      */
-    [[nodiscard]] static spdk_probe_t probe(char const* address) noexcept;
+    [[nodiscard]] static linux_spdk_probe_t probe(char const* address) noexcept;
 
     /**
      *  @brief Initialises the environment, which only a probe that answered @c available_k permits.
@@ -488,39 +488,39 @@ inline constexpr std::size_t meminfo_bytes_k = 8192;
 /** Bytes of a sysfs driver link the probe reads, which is more than such a path has ever spanned. */
 inline constexpr std::size_t link_bytes_k = 512;
 
-inline spdk_probe_t spdk_environment_t::probe(char const* address) noexcept {
-    if (!address) return spdk_probe_t::not_found_k;
-    if (spdk_transport_named(address) == spdk_transport_t::fabric_k) return spdk_probe_t::available_k;
+inline linux_spdk_probe_t spdk_environment_t::probe(char const* address) noexcept {
+    if (!address) return linux_spdk_probe_t::not_found_k;
+    if (spdk_transport_named(address) == spdk_transport_t::fabric_k) return linux_spdk_probe_t::available_k;
     std::string_view const named = transport_field(address, "traddr:");
     expected<pci_address_t> const parsed = pci_address_parsed(named.empty() ? std::string_view {address} : named);
-    if (!parsed) return spdk_probe_t::not_found_k;
+    if (!parsed) return linux_spdk_probe_t::not_found_k;
 
     char device_path[64] = {};
     std::snprintf(device_path, sizeof(device_path), "/sys/bus/pci/devices/%s", parsed->text);
-    if (!system_path_exists(device_path)) return spdk_probe_t::not_found_k;
+    if (!system_path_exists(device_path)) return linux_spdk_probe_t::not_found_k;
 
     std::array<char, meminfo_bytes_k> meminfo {};
     hugepage_inventory_t const hugepages = hugepages_in_meminfo(read_system_text("/proc/meminfo", meminfo));
-    if (hugepages.page_bytes == 0 || hugepages.free_pages == 0) return spdk_probe_t::without_hugepages_k;
-    if (!system_path_exists("/sys/kernel/mm/hugepages")) return spdk_probe_t::without_hugepages_k;
+    if (hugepages.page_bytes == 0 || hugepages.free_pages == 0) return linux_spdk_probe_t::without_hugepages_k;
+    if (!system_path_exists("/sys/kernel/mm/hugepages")) return linux_spdk_probe_t::without_hugepages_k;
 
     char driver_path[80] = {};
     std::snprintf(driver_path, sizeof(driver_path), "/sys/bus/pci/devices/%s/driver", parsed->text);
     std::array<char, link_bytes_k> link {};
     pci_driver_t const driver = pci_driver_named(read_system_link(driver_path, link));
     if (driver != pci_driver_t::vfio_pci_k && driver != pci_driver_t::uio_generic_k)
-        return spdk_probe_t::without_permission_k;
+        return linux_spdk_probe_t::without_permission_k;
     if (driver == pci_driver_t::vfio_pci_k && !system_path_is_usable("/dev/vfio/vfio"))
-        return spdk_probe_t::without_permission_k;
-    return spdk_probe_t::available_k;
+        return linux_spdk_probe_t::without_permission_k;
+    return linux_spdk_probe_t::available_k;
 }
 
 #else
 
-inline spdk_probe_t spdk_environment_t::probe(char const* address) noexcept {
-    if (!address) return spdk_probe_t::not_found_k;
-    return spdk_transport_named(address) == spdk_transport_t::fabric_k ? spdk_probe_t::available_k
-                                                                       : spdk_probe_t::not_found_k;
+inline linux_spdk_probe_t spdk_environment_t::probe(char const* address) noexcept {
+    if (!address) return linux_spdk_probe_t::not_found_k;
+    return spdk_transport_named(address) == spdk_transport_t::fabric_k ? linux_spdk_probe_t::available_k
+                                                                       : linux_spdk_probe_t::not_found_k;
 }
 
 #endif
@@ -589,14 +589,14 @@ inline void spdk_environment_t::finalize_() noexcept {}
  *  lands. What a registered memory must prove depends on the transport: a controller reached by DMA
  *  needs every page in the driver's map, while one reached over a socket takes any host memory.
  */
-class spdk_disk_t {
+class linux_spdk_disk_t {
   public:
 
-    spdk_disk_t() noexcept = default;
-    spdk_disk_t(spdk_disk_t const&) = delete;
-    spdk_disk_t& operator=(spdk_disk_t const&) = delete;
+    linux_spdk_disk_t() noexcept = default;
+    linux_spdk_disk_t(linux_spdk_disk_t const&) = delete;
+    linux_spdk_disk_t& operator=(linux_spdk_disk_t const&) = delete;
 
-    spdk_disk_t(spdk_disk_t&& other) noexcept
+    linux_spdk_disk_t(linux_spdk_disk_t&& other) noexcept
         : environment_(std::move(other.environment_)), queue_pairs_(std::move(other.queue_pairs_)),
           registered_memories_(std::move(other.registered_memories_)), media_(std::move(other.media_)),
           flights_(std::move(other.flights_)), staged_(std::move(other.staged_)), locals_(std::move(other.locals_)),
@@ -608,7 +608,7 @@ class spdk_disk_t {
           queue_pairs_limit_(std::exchange(other.queue_pairs_limit_, 0)),
           registered_memories_limit_(std::exchange(other.registered_memories_limit_, 0)), reach_(other.reach_) {}
 
-    spdk_disk_t& operator=(spdk_disk_t&& other) noexcept {
+    linux_spdk_disk_t& operator=(linux_spdk_disk_t&& other) noexcept {
         if (this == &other) return *this;
         close_all_();
         environment_ = std::move(other.environment_);
@@ -630,7 +630,7 @@ class spdk_disk_t {
         return *this;
     }
 
-    ~spdk_disk_t() noexcept { close_all_(); }
+    ~linux_spdk_disk_t() noexcept { close_all_(); }
 
     /**
      *  @brief Connects @p address, takes its first active namespace, and sizes the disk's bookkeeping.
@@ -639,8 +639,8 @@ class spdk_disk_t {
      *  @param[in] config The queue pairs wanted, the per-queue pair depth and the ranges registered at once.
      *  @return The mounted disk, or why the controller would not answer.
      */
-    static expected<spdk_disk_t> open(spdk_environment_t environment, char const* address,
-                                      spdk_disk_config_t const& config) noexcept {
+    static expected<linux_spdk_disk_t> open(spdk_environment_t environment, char const* address,
+                                            linux_spdk_disk_config_t const& config) noexcept {
         if (status_t const sane = inspect_config_(config); sane.failed()) return sane;
         if (!address) return status_t {status_code_t::invalid_argument_k, "A controller needs an address"};
         if (!environment.initialised())
@@ -674,7 +674,7 @@ class spdk_disk_t {
         std::uint16_t const queue_pairs = static_cast<std::uint16_t>(
             config.queue_pairs_limit < queues ? config.queue_pairs_limit : queues);
 
-        spdk_disk_t disk;
+        linux_spdk_disk_t disk;
         disk.environment_ = std::move(environment);
         disk.controller_ = controller;
         disk.namespace_ = chosen;
@@ -1003,7 +1003,7 @@ class spdk_disk_t {
             flight_t& flight = flights_[base + index];
             if (flight.state != flight_state_t::outstanding_k) continue;
             [[maybe_unused]] int const asked = spdk_nvme_ctrlr_cmd_abort_ext(controller_, slot->queue, &flight,
-                                                                             &spdk_disk_t::aborted_, nullptr);
+                                                                             &linux_spdk_disk_t::aborted_, nullptr);
         }
     }
 
@@ -1253,7 +1253,7 @@ class spdk_disk_t {
     }
 
     /** Whatever a mount must refuse before it touches the controller at all. */
-    static status_t inspect_config_(spdk_disk_config_t const& config) noexcept {
+    static status_t inspect_config_(linux_spdk_disk_config_t const& config) noexcept {
         if (config.queue_pairs_limit == 0 || config.depth_limit == 0)
             return {status_code_t::invalid_argument_k, "A ring needs a queue pair and a request of depth"};
         if (config.queue_pairs_limit == static_cast<std::uint16_t>(queue_pair_id_t::unallocated_k) ||
@@ -1561,7 +1561,7 @@ class spdk_disk_t {
 
         int issued = 0;
         if (request.kind == request_kind_t::flush_k) {
-            issued = spdk_nvme_ns_cmd_flush(namespace_, slot.queue, &spdk_disk_t::completed_, &flight);
+            issued = spdk_nvme_ns_cmd_flush(namespace_, slot.queue, &linux_spdk_disk_t::completed_, &flight);
         }
         else {
             registered_memory_slot_t const* const chunk = resolve_(request.buffer);
@@ -1570,9 +1570,9 @@ class spdk_disk_t {
             std::uint32_t const sectors = static_cast<std::uint32_t>(request.extent.length / sector_bytes_);
             issued = request.kind == request_kind_t::read_k
                          ? spdk_nvme_ns_cmd_read(namespace_, slot.queue, payload, first, sectors,
-                                                 &spdk_disk_t::completed_, &flight, 0)
+                                                 &linux_spdk_disk_t::completed_, &flight, 0)
                          : spdk_nvme_ns_cmd_write(namespace_, slot.queue, payload, first, sectors,
-                                                  &spdk_disk_t::completed_, &flight, 0);
+                                                  &linux_spdk_disk_t::completed_, &flight, 0);
         }
         if (issued == 0) return index;
         restore_(flight);
@@ -1731,11 +1731,11 @@ class spdk_disk_t {
  *  refused @c open sends it to another transport rather than to a build-time branch. The probe is
  *  not here, because it belongs to the environment and must answer honestly in every build.
  */
-class spdk_disk_t {
+class linux_spdk_disk_t {
   public:
 
     /** Refuses the mount, since this build carries no driver to mount with. */
-    static expected<spdk_disk_t> open(spdk_environment_t, char const*, spdk_disk_config_t const&) noexcept {
+    static expected<linux_spdk_disk_t> open(spdk_environment_t, char const*, linux_spdk_disk_config_t const&) noexcept {
         return status_t {status_code_t::unsupported_k, "This build carries no SPDK"};
     }
 
@@ -1806,6 +1806,6 @@ class spdk_disk_t {
 
 #endif
 
-static_assert(ring_concept<spdk_disk_t>, "The SPDK transport is a ring like every other");
+static_assert(ring_concept<linux_spdk_disk_t>, "The SPDK transport is a ring like every other");
 
 } // namespace unum::ustore::nvme

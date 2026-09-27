@@ -350,7 +350,7 @@ struct suite_options_t {
     /** The transports a ring suite mounts, every one when empty. */
     texts_t transports;
 
-    /** Fields spliced into the engine's own configuration, like @c "io_transport":"uring", empty for its defaults. */
+    /** Fields spliced into the engine's own configuration, like @c "io_transport":"linux-uring", or none. */
     std::string_view engine_config;
 
     /** The seed every random draw descends from, drawn from the machine when left zero. */
@@ -410,7 +410,7 @@ constexpr std::size_t suite_flags_capacity_k = 16;
     flags[count++] = {"--directory", "path", "parent of the unique directory the suite works in", &options.directory};
     flags[count++] = {"--device", "path", "block device the storage cases open", &options.device};
     flags[count++] = {"--spdk-address", "address", "PCIe address of the NVMe device SPDK binds", &options.spdk_address};
-    flags[count++] = {"--transports", "names", "transports a ring suite mounts, like ram,files,uring",
+    flags[count++] = {"--transports", "names", "transports a ring suite mounts, like memory,blocking,linux-uring",
                       &options.transports};
     flags[count++] = {"--engine-config", "json",
                       "fields of the engine's own configuration, like \"io_transport\":\"uring\"",

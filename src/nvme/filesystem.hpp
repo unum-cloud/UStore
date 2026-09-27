@@ -5,10 +5,10 @@
  *  @brief The mount of one database's storage: the transport it probes, the memory it pins, the volumes it opens.
  *
  *  A database owns exactly one of these, and everything it reads or writes hangs off it. The
- *  transport is chosen once, here, by setting a ring up and taking it down again rather than by
- *  reading a version number, because a kernel that has io_uring still refuses it under Docker's
- *  seccomp profile and under @c io_uring_disabled; what the probe settled on is reported back in
- *  @c mount_report_t rather than inferred by a caller.
+ *  transport is chosen once, here, by setting a ring and an AIO context up and taking each down
+ *  again rather than by reading a version number, because a kernel that has io_uring still refuses
+ *  it under Docker's seccomp profile and under @c io_uring_disabled, and keeps AIO in both; what the
+ *  probes settled on is reported back in @c mount_report_t rather than inferred by a caller.
  *
  *  Teardown is an order, not a destructor: a queue pair may not be released with work outstanding, a
  *  pinned range may not be unpinned while a request addresses it, and a medium may not be
@@ -37,16 +37,18 @@
 
 #include <ustore/status.hpp> // `status_t`, `status_code_t`, `expected`
 
-#include "nvme/blocking_files_disk.hpp" // `blocking_files_disk_t`, `file_buffering_t`
-#include "nvme/buffer_pool.hpp"         // `registered_memory_arena_t`, `memory_arena_config_t`
-#include "nvme/config.hpp"              // `resources_config_t`, `io_transport_t`
-#include "nvme/files_disk.hpp"          // `any_files_disk_t`
-#include "nvme/io_channel.hpp"          // `basic_io_channel_pool`, `io_channel_config_t`
-#include "nvme/ram_disk.hpp"            // `ram_disk_t`, `ram_device_t`
-#include "nvme/ring.hpp"                // `registered_medium_t`, `medium_options_t`, `ring_concept`
-#include "nvme/uring_files_disk.hpp"    // `uring_files_disk_t`, `uring_probe_t`
-#include "nvme/volume.hpp"              // `basic_extent_volume`, `volume_format_t`
-#include "nvme/volume_router.hpp"       // `basic_volume_router`
+#include "nvme/blocking_files_disk.hpp"    // `blocking_files_disk_t`, `file_buffering_t`
+#include "nvme/files_disk.hpp"             // `any_files_disk_t`
+#include "nvme/linux_aio_files_disk.hpp"   // `linux_aio_files_disk_t`, `linux_aio_probe_t`
+#include "nvme/linux_uring_files_disk.hpp" // `linux_uring_files_disk_t`, `linux_uring_probe_t`
+#include "nvme/memory_disk.hpp"            // `memory_disk_t`, `memory_device_t`
+
+#include "nvme/buffer_pool.hpp"   // `registered_memory_arena_t`, `memory_arena_config_t`
+#include "nvme/config.hpp"        // `resources_config_t`, `io_transport_t`
+#include "nvme/io_channel.hpp"    // `basic_io_channel_pool`, `io_channel_config_t`
+#include "nvme/ring.hpp"          // `registered_medium_t`, `medium_options_t`, `ring_concept`
+#include "nvme/volume.hpp"        // `basic_extent_volume`, `volume_format_t`
+#include "nvme/volume_router.hpp" // `basic_volume_router`
 
 namespace unum::ustore::nvme {
 
@@ -112,7 +114,7 @@ inline status_t join_path(char const* directory, char const* name, std::span<cha
     return {};
 }
 
-/** Creates every data directory of @p config, which the two file transports open a volume in. */
+/** Creates every data directory of @p config, which every file transport opens a volume in. */
 inline status_t create_data_directories(resources_config_t const& config) noexcept {
     for (std::size_t index = 0; index != config.data_directories.size(); ++index) {
         data_directory_config_t const& directory = config.data_directories[index];
@@ -133,7 +135,10 @@ struct mount_report_t {
     io_transport_t transport = io_transport_t::blocking_k;
 
     /** What the kernel answered when the ring was set up and taken down again. */
-    uring_probe_t uring = uring_probe_t::refused_k;
+    linux_uring_probe_t linux_uring = linux_uring_probe_t::refused_k;
+
+    /** What the kernel answered when an AIO context was set up and taken down again. */
+    linux_aio_probe_t linux_aio = linux_aio_probe_t::refused_k;
 
     /** Volumes the router adopted, which is one per data directory. */
     std::size_t volumes = 0;
@@ -145,10 +150,18 @@ struct mount_report_t {
     std::uint64_t arena_bytes = 0;
 };
 
-/** The transport @p wanted resolves to given @p probe: the ring where the kernel offers it, the floor elsewhere. */
-[[nodiscard]] inline io_transport_t probed_transport(io_transport_t wanted, uring_probe_t probe) noexcept {
-    if (wanted != io_transport_t::automatic_k && wanted != io_transport_t::io_uring_k) return wanted;
-    return probe == uring_probe_t::available_k ? io_transport_t::io_uring_k : io_transport_t::blocking_k;
+/**
+ *  @brief The transport @p wanted resolves to, given what the two probes answered.
+ *
+ *  The order is io_uring, then Linux AIO, then the blocking floor. A transport named outright starts
+ *  at its own place in that order and only falls further down it, so asking for AIO never mounts a ring.
+ */
+[[nodiscard]] inline io_transport_t probed_transport(io_transport_t wanted, linux_uring_probe_t linux_uring,
+                                                     linux_aio_probe_t linux_aio) noexcept {
+    bool const takes_linux_uring = wanted == io_transport_t::automatic_k || wanted == io_transport_t::linux_uring_k;
+    if (takes_linux_uring && linux_uring == linux_uring_probe_t::available_k) return io_transport_t::linux_uring_k;
+    if (!takes_linux_uring && wanted != io_transport_t::linux_aio_k) return wanted;
+    return linux_aio == linux_aio_probe_t::available_k ? io_transport_t::linux_aio_k : io_transport_t::blocking_k;
 }
 
 #pragma endregion Probe
@@ -321,16 +334,16 @@ class basic_storage_mount {
  *
  *  The probe runs once and the alternative it picked is emplaced in place, so the dispatch a caller
  *  pays is one @c visit per operation rather than one virtual call per request. A mount on files
- *  holds whichever of the two file transports the probe settled on, so a database materializes over
+ *  holds whichever of the three file transports the probe settled on, so a database materializes over
  *  one disk type; SPDK is named by the configuration and refused here until its disk is ported.
  */
 class mounted_storage_t {
   public:
 
     /** The mount a suite and a benchmark ask for, whose volumes never reach a medium. */
-    using ram_mount_t = basic_storage_mount<ram_disk_t>;
+    using memory_mount_t = basic_storage_mount<memory_disk_t>;
 
-    /** The mount a database gets, on unbuffered files through the ring or the blocking floor. */
+    /** The mount a database gets, on unbuffered files through io_uring, Linux AIO or the blocking floor. */
     using files_mount_t = basic_storage_mount<any_files_disk_t>;
 
     mounted_storage_t() noexcept = default;
@@ -349,8 +362,9 @@ class mounted_storage_t {
         if (mounted()) return {status_code_t::already_exists_k, "This database has already mounted its storage"};
 
         report_ = mount_report_t {};
-        report_.uring = uring_files_disk_t::probe();
-        report_.transport = probed_transport(config.io_transport, report_.uring);
+        report_.linux_uring = linux_uring_files_disk_t::probe();
+        report_.linux_aio = linux_aio_files_disk_t::probe();
+        report_.transport = probed_transport(config.io_transport, report_.linux_uring, report_.linux_aio);
 
         std::uint16_t const owners = bounded_count_(threads + config.shared_io_channels,
                                                     static_cast<std::size_t>(queue_pair_id_t::unallocated_k));
@@ -361,15 +375,19 @@ class mounted_storage_t {
 
         switch (report_.transport) {
         case io_transport_t::memory_k: {
-            expected<ram_device_t> device = ram_device_t::make(portable_alignment_k);
+            expected<memory_device_t> device = memory_device_t::make(portable_alignment_k);
             if (!device) return device.status();
-            expected<ram_disk_t> disk = ram_disk_t::make(std::move(*device), ring_config_(config, owners, targets));
+            expected<memory_disk_t> disk = memory_disk_t::make(std::move(*device),
+                                                               ring_config_(config, owners, targets));
             if (!disk) return disk.status();
-            return adopt_<ram_disk_t>(std::move(*disk), config, constraint, threads, database);
+            return adopt_<memory_disk_t>(std::move(*disk), config, constraint, threads, database);
         }
         case io_transport_t::blocking_k: return mount_blocking_(config, constraint, threads, database, owners, targets);
-        case io_transport_t::io_uring_k: return mount_uring_(config, constraint, threads, database, owners, targets);
-        case io_transport_t::spdk_k:
+        case io_transport_t::linux_uring_k:
+            return mount_linux_uring_(config, constraint, threads, database, owners, targets);
+        case io_transport_t::linux_aio_k:
+            return mount_linux_aio_(config, constraint, threads, database, owners, targets);
+        case io_transport_t::linux_spdk_k:
             return {status_code_t::unsupported_k, "The SPDK transport is not mounted by this build"};
         case io_transport_t::automatic_k: return {status_code_t::internal_k, "The probe left the transport unresolved"};
         }
@@ -400,7 +418,7 @@ class mounted_storage_t {
     /** Calls @p visitor with the mount that is open, or reports that none is. */
     template <typename visitor_type_>
     status_t visit(visitor_type_&& visitor) noexcept {
-        if (ram_mount_t* const ram = std::get_if<ram_mount_t>(&held_)) return visitor(*ram);
+        if (memory_mount_t* const ram = std::get_if<memory_mount_t>(&held_)) return visitor(*ram);
         if (files_mount_t* const files = std::get_if<files_mount_t>(&held_)) return visitor(*files);
         return {status_code_t::uninitialized_k, "This database has mounted no storage"};
     }
@@ -432,16 +450,33 @@ class mounted_storage_t {
 
     /** Mounts io_uring on unbuffered files, one ring per queue pair, with @p owners queue pairs over @p targets
      *  directories. */
-    status_t mount_uring_(resources_config_t const& config, resource_constraint_t& constraint, std::size_t threads,
-                          uuid_t const& database, std::uint16_t owners, std::uint16_t targets) noexcept {
+    status_t mount_linux_uring_(resources_config_t const& config, resource_constraint_t& constraint,
+                                std::size_t threads, uuid_t const& database, std::uint16_t owners,
+                                std::uint16_t targets) noexcept {
         if (status_t const made = create_data_directories(config); made.failed()) return made;
-        uring_disk_config_t ring;
+        linux_uring_disk_config_t ring;
         ring.queue_pairs_limit = owners;
         ring.depth_limit = config.channels.depth;
         ring.registered_memory_limit = 1;
         ring.media_limit = targets;
         ring.buffering = file_buffering_t::unbuffered_k;
-        expected<uring_files_disk_t> disk = uring_files_disk_t::make(ring);
+        expected<linux_uring_files_disk_t> disk = linux_uring_files_disk_t::make(ring);
+        if (!disk) return disk.status();
+        return adopt_<any_files_disk_t>(any_files_disk_t {std::move(*disk)}, config, constraint, threads, database);
+    }
+
+    /** Mounts Linux AIO on unbuffered files, one context per queue pair, with @p owners queue pairs over @p targets
+     *  directories. */
+    status_t mount_linux_aio_(resources_config_t const& config, resource_constraint_t& constraint, std::size_t threads,
+                              uuid_t const& database, std::uint16_t owners, std::uint16_t targets) noexcept {
+        if (status_t const made = create_data_directories(config); made.failed()) return made;
+        linux_aio_disk_config_t contexts;
+        contexts.queue_pairs_limit = owners;
+        contexts.depth_limit = config.channels.depth;
+        contexts.registered_memory_limit = 1;
+        contexts.media_limit = targets;
+        contexts.buffering = file_buffering_t::unbuffered_k;
+        expected<linux_aio_files_disk_t> disk = linux_aio_files_disk_t::make(contexts);
         if (!disk) return disk.status();
         return adopt_<any_files_disk_t>(any_files_disk_t {std::move(*disk)}, config, constraint, threads, database);
     }
@@ -468,7 +503,7 @@ class mounted_storage_t {
     }
 
     /** The one mount this database opened, or @c std::monostate while it has opened none. */
-    std::variant<std::monostate, ram_mount_t, files_mount_t> held_;
+    std::variant<std::monostate, memory_mount_t, files_mount_t> held_;
 
     /** What the probe settled on and what the mount took, reported as the effective configuration. */
     mount_report_t report_;

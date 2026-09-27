@@ -286,13 +286,13 @@ if (${USTORE_BUILD_TEST})
         "transactions"
         "database"
         "single_collection_database"
-        "spdk"
+        "linux_spdk"
     )
 
-    # The io_uring transport is Linux-only and takes no option of its own; the suite skips itself where the kernel
-    # refuses a ring.
+    # The io_uring and Linux AIO transports are Linux-only and take no option of their own; each suite skips itself
+    # where the kernel refuses its transport.
     if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
-        list(APPEND USTORE_STORAGE_TEST_NAMES "uring")
+        list(APPEND USTORE_STORAGE_TEST_NAMES "linux_uring" "linux_aio")
     endif ()
 
     # The SPDK suite starts and stops its own target through the rig script, so the script's path is compiled in and
@@ -308,9 +308,9 @@ if (${USTORE_BUILD_TEST})
         # option its device case may no longer skip
         if (storage_name STREQUAL "lsm" AND TARGET ustore_nvme_compaction)
             target_link_libraries(${storage_exe} ustore_nvme_compaction)
-            list(APPEND storage_arguments --no-skips --transports ram,files,uring)
+            list(APPEND storage_arguments --no-skips --transports memory,blocking,linux-uring)
         endif ()
-        if (storage_name STREQUAL "spdk")
+        if (storage_name STREQUAL "linux_spdk")
             target_compile_definitions(
                 ${storage_exe} PRIVATE USTORE_SPDK_RIG="${CMAKE_CURRENT_SOURCE_DIR}/scripts/rigs/spdk_target.sh"
             )
