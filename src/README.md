@@ -76,7 +76,7 @@ Beside the engine directories, `src/executor.hpp` is the one owner of threads, t
 | Thrust            | NVMe                      | Sorting and merging key slots on the host                         |
 | CUDA and CUB      | NVMe, optional            | GPU compaction                                                    |
 | GPUDirect Storage | NVMe, optional, v1 target | Reads and writes between NVMe drives and GPU memory               |
-| liburing          | NVMe                      | Asynchronous file I/O, until v1's raw io_uring system calls       |
+| liburing          | RocksDB engine, on Linux  | Batched SST reads through io_uring, falling back to `pread`       |
 | SPDK              | NVMe, optional            | User-space NVMe access                                            |
 
 NVMe's sources also include the `container`, `primitive`, `algo`, `utils` and `io` headers of a library that is not in this tree, and those give way to SmashTable, NumKong, StringZilla and ForkUnion.

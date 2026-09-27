@@ -11,11 +11,20 @@ FetchContent_Declare(
 FetchContent_GetProperties(rocksdb)
 
 if (NOT rocksdb_POPULATED)
-    # Fetch the content using previously declared details
-    set(WITH_LIBURING
-        OFF
-        CACHE INTERNAL ""
-    )
+    # RocksDB keeps both paths in one build: io_uring where a ring can be created, `pread` where the kernel or a seccomp
+    # profile refuses one.
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        include("${CMAKE_CURRENT_LIST_DIR}/liburing.cmake")
+        set(WITH_LIBURING
+            ON
+            CACHE INTERNAL ""
+        )
+    else ()
+        set(WITH_LIBURING
+            OFF
+            CACHE INTERNAL ""
+        )
+    endif ()
     set(FAIL_ON_WARNINGS
         OFF
         CACHE INTERNAL ""
@@ -68,6 +77,14 @@ if (NOT rocksdb_POPULATED)
     # RocksDB loads fixed-width integers from unaligned addresses on purpose, and exempts those loads from the
     # undefined-behavior sanitizer only when told a sanitized build is running
     target_compile_definitions(rocksdb PRIVATE ROCKSDB_UBSAN_RUN)
+    # RocksDB installs its static archive through an export set, which must also carry the archives it links
+    if (TARGET uring)
+        install(
+            TARGETS uring
+            EXPORT RocksDBTargets
+            ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        )
+    endif ()
 endif ()
 
 include_directories(${rocksdb_SOURCE_DIR}/include)

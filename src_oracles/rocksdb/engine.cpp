@@ -1266,6 +1266,13 @@ void transaction_commit(ustore_transaction_commit_t& arguments) {
 using namespace unum::ustore;
 using namespace unum::ustore::rocksdb;
 
+#if defined(__linux__)
+
+/** Lets RocksDB's POSIX file system open io_uring rings, which it leaves off unless this weak symbol is defined. A
+ *  thread whose ring the kernel or a seccomp profile refuses reads through `pread` instead. */
+extern "C" bool RocksDbIOUringEnable() { return true; }
+#endif
+
 #pragma region Exception Boundaries
 
 void ustore_database_init(ustore_database_init_t* arguments) {
