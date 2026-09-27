@@ -1,7 +1,7 @@
 """Transactions over the C ABI: commits, rollbacks, conflicts and staging, at every isolation the engine offers."""
 
 import pytest
-from capabilities import ENGINE, ISOLATIONS, NEEDS_TRANSACTIONS
+from capabilities import ISOLATIONS, NEEDS_TRANSACTIONS
 
 import ustore
 
@@ -85,9 +85,6 @@ def test_an_exception_leaves_the_work_unpublished(database):
     assert not database.contains(1)
 
 
-@pytest.mark.xfail(
-    ENGINE == "rocksdb", raises=ustore.UnsupportedError, reason="RocksDB's optimistic transactions do not stage"
-)
 def test_stage_answers_a_sequence_number(database):
     staged = database.transaction()
     try:

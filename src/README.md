@@ -7,7 +7,7 @@ Engines aim for the highest isolation SmashTable delivers, each reports the leve
 | Engine     | Directory         | Role                  | Builds today | Isolation                                    |
 | :--------- | :---------------- | :-------------------- | :----------- | :------------------------------------------- |
 | SmashTable | `src/smashtable/` | reference, in memory  | always       | `strict_serializable` or `snapshot`, at open |
-| RocksDB    | `src/rocksdb/`    | third-party key-value | optional     | optimistic, reads see the latest commit      |
+| RocksDB    | `src/rocksdb/`    | third-party key-value | optional     | start snapshot, validated when staging       |
 | LevelDB    | `src/leveldb/`    | third-party key-value | optional     | snapshot reads, no transactions              |
 | NVMe       | `src/nvme/`       | hyper-converged       | v1 target    | optimistic, SmashTable's levels in v1        |
 
@@ -25,9 +25,12 @@ A database opened with a directory persists as one binary image, rewritten whole
 
 ## RocksDB
 
-`src/rocksdb/` keeps each named collection as a column family of a RocksDB `OptimisticTransactionDB`, with fixed-width keys under a custom comparator.
-A transaction reads through `GetForUpdate` unless the call passes `ustore_option_transaction_dont_watch_k`, and RocksDB validates the keys it tracked at commit.
-Transactions begin without a snapshot, so each read sees the latest value committed when it runs.
+`src/rocksdb/` keeps each named collection as a column family of a RocksDB `TransactionDB`, with fixed-width keys under a custom comparator.
+Every write reaches RocksDB's log, which stays in memory until a flushed write or commit, a full buffer or a clean close writes it out, so a crash keeps a consistent prefix of the commits across every collection.
+A transaction reads the snapshot it began from through its own buffered writes, and records the keys it watches unless a call passes `ustore_option_transaction_dont_watch_k`.
+Nothing is locked until it stages, when RocksDB's pessimistic transaction locks and validates every watched read and buffered write and prepares them into the log, so conflicts surface at stage or commit as on SmashTable.
+Scans are not validated, and a prepared transaction a crash leaves behind is rolled back when the database opens.
+This is one design for durability and two-phase commits rather than the settled one, and a log kept above the engine, as a data-lake coordinator would own, remains open.
 
 ## LevelDB
 
@@ -70,7 +73,7 @@ Beside the engine directories, `src/executor.hpp` is the one owner of threads, t
 | ForkUnion         | `executor.hpp`            | Threads, topology and domain-placed memory                        |
 | NumKong           | NVMe's components         | SIMD kernels                                                      |
 | yyjson            | Every engine              | JSON documents and configuration                                  |
-| RocksDB           | RocksDB engine            | Persistent LSM trees with optimistic transactions                 |
+| RocksDB           | RocksDB engine            | Persistent LSM trees with two-phase transactions                  |
 | LevelDB           | LevelDB engine            | Persistent LSM tree with snapshots                                |
 | fmt               | NVMe                      | Formatting logs and file names                                    |
 | Thrust            | NVMe                      | Sorting and merging key slots on the host                         |
