@@ -840,7 +840,7 @@ inline void close_database(opened_database_t& database) noexcept {
 
 #pragma region C ABI
 
-void database_init(ustore_database_init_t& arguments) {
+void database_init(ustore_database_init_t& arguments) noexcept {
     if (!arguments.db) {
         *arguments.error = {ustore_error_invalid_argument_k, "Need an output for the database"};
         return;
@@ -863,7 +863,7 @@ void database_init(ustore_database_init_t& arguments) {
     *arguments.db = static_cast<handle_t*>(opened);
 }
 
-void get_metadata(ustore_get_metadata_t& arguments) {
+void get_metadata(ustore_get_metadata_t& arguments) noexcept {
     if (!arguments.db || !arguments.metadata) {
         *arguments.error = {ustore_error_invalid_argument_k, "Need a database and an output for the metadata"};
         return;
@@ -871,7 +871,7 @@ void get_metadata(ustore_get_metadata_t& arguments) {
     *arguments.metadata = ustore_metadata_t(ustore_supports_transactions_k | ustore_supports_collections_k);
 }
 
-void read(ustore_read_t& arguments) {
+void read(ustore_read_t& arguments) noexcept {
     if (!arguments.tasks_count) return;
     if (!arguments.db) {
         *arguments.error = {ustore_error_uninitialized_k, "The database is uninitialized"};
@@ -934,7 +934,7 @@ void read(ustore_read_t& arguments) {
     reported_failure(read_batched(database, groups, bases, widths, tape), arguments.error);
 }
 
-void write(ustore_write_t& arguments) {
+void write(ustore_write_t& arguments) noexcept {
     if (!arguments.db) {
         *arguments.error = {ustore_error_uninitialized_k, "The database is uninitialized"};
         return;
@@ -961,7 +961,7 @@ void write(ustore_write_t& arguments) {
     reported_failure(database.store->compact(), arguments.error);
 }
 
-void scan(ustore_scan_t& arguments) {
+void scan(ustore_scan_t& arguments) noexcept {
     if (!arguments.db) {
         *arguments.error = {ustore_error_uninitialized_k, "The database is uninitialized"};
         return;
@@ -1003,7 +1003,7 @@ void scan(ustore_scan_t& arguments) {
     tape.finish(arguments.keys);
 }
 
-void sample(ustore_sample_t& arguments) {
+void sample(ustore_sample_t& arguments) noexcept {
     if (!arguments.tasks_count) return;
     if (!arguments.db) {
         *arguments.error = {ustore_error_uninitialized_k, "The database is uninitialized"};
@@ -1051,7 +1051,7 @@ void sample(ustore_sample_t& arguments) {
     tape.finish(arguments.keys);
 }
 
-void measure(ustore_measure_t& arguments) {
+void measure(ustore_measure_t& arguments) noexcept {
     if (!arguments.tasks_count) return;
     if (!arguments.db) {
         *arguments.error = {ustore_error_uninitialized_k, "The database is uninitialized"};
@@ -1117,7 +1117,7 @@ void measure(ustore_measure_t& arguments) {
     }
 }
 
-void collection_list(ustore_collection_list_t& arguments) {
+void collection_list(ustore_collection_list_t& arguments) noexcept {
     if (!arguments.db) {
         *arguments.error = {ustore_error_uninitialized_k, "The database is uninitialized"};
         return;
@@ -1145,7 +1145,7 @@ void collection_list(ustore_collection_list_t& arguments) {
     *arguments.count = static_cast<ustore_size_t>(named);
 }
 
-void collection_create(ustore_collection_create_t& arguments) {
+void collection_create(ustore_collection_create_t& arguments) noexcept {
     if (!arguments.db) {
         *arguments.error = {ustore_error_uninitialized_k, "The database is uninitialized"};
         return;
@@ -1174,7 +1174,7 @@ void collection_create(ustore_collection_create_t& arguments) {
     *arguments.id = static_cast<ustore_collection_t>(created);
 }
 
-void collection_drop(ustore_collection_drop_t& arguments) {
+void collection_drop(ustore_collection_drop_t& arguments) noexcept {
     if (!arguments.db) {
         *arguments.error = {ustore_error_uninitialized_k, "The database is uninitialized"};
         return;
@@ -1198,7 +1198,7 @@ void collection_drop(ustore_collection_drop_t& arguments) {
     reported_failure(empty_collection(database, numeric_id, arguments.mode), arguments.error);
 }
 
-void snapshot_list(ustore_snapshot_list_t& arguments) {
+void snapshot_list(ustore_snapshot_list_t& arguments) noexcept {
     if (!arguments.db) {
         *arguments.error = {ustore_error_uninitialized_k, "The database is uninitialized"};
         return;
@@ -1211,19 +1211,19 @@ void snapshot_list(ustore_snapshot_list_t& arguments) {
     if (arguments.ids) *arguments.ids = nullptr;
 }
 
-void snapshot_create(ustore_snapshot_create_t& arguments) {
+void snapshot_create(ustore_snapshot_create_t& arguments) noexcept {
     *arguments.error = {ustore_error_unsupported_k, "This engine keeps no snapshots"};
 }
 
-void snapshot_export(ustore_snapshot_export_t& arguments) {
+void snapshot_export(ustore_snapshot_export_t& arguments) noexcept {
     *arguments.error = {ustore_error_unsupported_k, "This engine keeps no snapshots"};
 }
 
-void snapshot_drop(ustore_snapshot_drop_t& arguments) {
+void snapshot_drop(ustore_snapshot_drop_t& arguments) noexcept {
     *arguments.error = {ustore_error_unsupported_k, "This engine keeps no snapshots"};
 }
 
-void transaction_init(ustore_transaction_init_t& arguments) {
+void transaction_init(ustore_transaction_init_t& arguments) noexcept {
     if (!arguments.db) {
         *arguments.error = {ustore_error_uninitialized_k, "The database is uninitialized"};
         return;
@@ -1250,7 +1250,7 @@ void transaction_init(ustore_transaction_init_t& arguments) {
     *arguments.transaction = static_cast<handle_t*>(opened);
 }
 
-void transaction_stage(ustore_transaction_stage_t& arguments) {
+void transaction_stage(ustore_transaction_stage_t& arguments) noexcept {
     if (!arguments.transaction) {
         *arguments.error = {ustore_error_uninitialized_k, "Transaction is uninitialized"};
         return;
@@ -1260,7 +1260,7 @@ void transaction_stage(ustore_transaction_stage_t& arguments) {
     if (arguments.sequence_number) *arguments.sequence_number = transaction.held->last_stage_stamp();
 }
 
-void transaction_commit(ustore_transaction_commit_t& arguments) {
+void transaction_commit(ustore_transaction_commit_t& arguments) noexcept {
     validate_transaction_commit(arguments.transaction, arguments.options, arguments.error);
     if (arguments.error->status) return;
 
@@ -1271,7 +1271,7 @@ void transaction_commit(ustore_transaction_commit_t& arguments) {
     reported_failure(transaction.database->store->flush(), arguments.error);
 }
 
-void database_control(ustore_database_control_t& arguments) {
+void database_control(ustore_database_control_t& arguments) noexcept {
     if (!arguments.db) {
         *arguments.error = {ustore_error_uninitialized_k, "The database is uninitialized"};
         return;

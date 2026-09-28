@@ -827,6 +827,16 @@ check_iterator_laundering() {
         "$file launders an iterator through &* - write \`values.data() + offset\`, or address the element:"
 }
 
+# The in-house engines never throw, so their calls fill the `noexcept` table of `src/engine.hpp` as they are; only the
+# oracles, whose libraries throw, wrap theirs in `guarded`. A `throw` or a `noexcept(false)` here would break that.
+check_in_house_never_throws() {
+    local throwing
+    throwing=$(printf '%s\n' "$added" | grep -vE '^\+[[:space:]]*(//|/\*|\*( |/|$))' |
+        grep -E '\bthrow\b|noexcept[[:space:]]*\([[:space:]]*false[[:space:]]*\)' || true)
+    [ -z "$throwing" ] || fail "$throwing" \
+        "$file throws in an in-house engine - answer a status_t, since every call of the engine table is noexcept:"
+}
+
 # The CPython bindings parse arguments and build results by hand: `PyArg_Parse*` and `Py_BuildValue` interpret a
 # format string at runtime, so a wrong specifier is a crash rather than a compile error.
 check_cpython_format_shortcuts() {
@@ -1125,6 +1135,10 @@ for file in "${staged[@]}"; do
         ;;&
     verification/*)
         check_verification_cites_symbols
+        ;;&
+    # The in-house engines, whose calls fill the noexcept engine table without a guard.
+    src/ram/* | src/nvme/*)
+        check_in_house_never_throws
         ;;&
     # The CPython bindings, which build every argument and result by hand.
     python/*.c)

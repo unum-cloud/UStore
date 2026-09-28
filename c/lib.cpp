@@ -5,11 +5,11 @@
  *  @brief The C ABI, routing every call to the engine behind its database or transaction handle.
  *
  *  Each engine defines only its own `ustore_database_init_*`, which stamps every handle it hands out with its
- *  @c engine_t, so one library holds every engine it was built with and a program links only those it opens.
+ *  @c engine_t, so one library holds every engine it was built with and a program links only those it opens. Every
+ *  call of the table is `noexcept`, so nothing here catches.
  */
 
 #include <limits> // `std::numeric_limits`
-#include <new>    // `std::bad_alloc`
 
 #include "engine.hpp"                // `engine_t`, `handle_t`
 #include "helpers/linked_memory.hpp" // `clear_linked_memory`
@@ -30,9 +30,9 @@ void* carried(ustore_transaction_t transaction) noexcept { return transaction; }
 /** The transaction a call reuses, or null for one it opens afresh. */
 void* carried(ustore_transaction_t const* transaction) noexcept { return transaction ? *transaction : nullptr; }
 
-/** Serves @p arguments on the engine of their database, turning whatever the engine throws into a status. */
+/** Serves @p arguments on the engine of their database. */
 template <typename arguments_type_>
-void route(arguments_type_* arguments, void (*engine_t::*call)(arguments_type_&)) noexcept {
+void route(arguments_type_* arguments, void (*engine_t::*call)(arguments_type_&) noexcept) noexcept {
     if (!arguments->db) {
         *arguments->error = {ustore_error_uninitialized_k, "The database is uninitialized"};
         return;
@@ -45,15 +45,7 @@ void route(arguments_type_* arguments, void (*engine_t::*call)(arguments_type_&)
             return;
         }
     }
-    try {
-        (engine.*call)(*arguments);
-    }
-    catch (std::bad_alloc const&) {
-        *arguments->error = {ustore_error_out_of_memory_k, "Out of memory"};
-    }
-    catch (...) {
-        *arguments->error = {ustore_error_internal_k, "Unexpected engine failure"};
-    }
+    (engine.*call)(*arguments);
 }
 
 } // namespace unum::ustore
