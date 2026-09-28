@@ -118,23 +118,17 @@ struct time_point_hasher_t {
 
 #pragma region Identifiers
 
-/** The identifier of one unit of data a backup or a transfer moves. */
-using data_unit_id_t = uuid_t;
-
-/** The identifier of one collection, unique across every database. */
-using collection_uuid_t = uuid_t;
-
-/** The identifier of one collection as its schema and its files number it. */
-using collection_numeric_id_t = std::uint64_t;
+/** The ID of one collection: the UUID the C ABI addresses it by, unique across every database. */
+using collection_id_t = ustore_collection_id_t;
 
 /** The name of one collection. */
 using collection_alphanumeric_id_t = string_t;
 
-/** The identifier of one single-collection database. */
-using single_collection_database_uuid_t = uuid_t;
+/** The ID of one single-collection database, which its schema records. */
+using single_collection_database_id_t = uuid_t;
 
-/** The identifier of one database. */
-using database_uuid_t = uuid_t;
+/** The ID of one database, which its schema records. */
+using database_id_t = uuid_t;
 
 /** The identifier of one snapshot inside its database. */
 using snapshot_id_t = std::uint64_t;
@@ -145,19 +139,24 @@ using transaction_id_t = std::uint64_t;
 /** The identifier of one backup inside its database. */
 using backup_id_t = std::uint64_t;
 
-/** The name and the numeric identifier of one collection. */
+/** The name and the ID of one collection. */
 struct collection_ids_t {
 
     /** The name users address the collection by. */
     collection_alphanumeric_id_t name;
 
-    /** The number its schema and its files carry. */
-    collection_numeric_id_t numeric_id;
+    /** The UUID its schema, every commit and the C ABI carry. */
+    collection_id_t id;
 };
 
-/** The numeric identifier of no collection. */
-inline constexpr collection_numeric_id_t collection_invalid_numeric_id_k =
-    std::numeric_limits<collection_numeric_id_t>::max();
+/** Hashes a collection ID as the C ABI does, for the tables a transaction groups its writes in by collection. */
+struct collection_id_hash_t {
+    std::size_t operator()(collection_id_t const& id) const noexcept { return std::hash<collection_id_t> {}(id); }
+};
+
+/** The ID of no collection, every bit set, which no minted UUID spells. */
+inline constexpr collection_id_t collection_invalid_id_k {
+    {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}}};
 
 /** The identifier of no snapshot. */
 inline constexpr snapshot_id_t invalid_snapshot_id_k = 0;

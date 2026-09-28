@@ -56,7 +56,7 @@
 #include "nvme/lsm_tree.hpp"          // `lsm_tree_run_record_t`, `lsm_tree_publication_hook_t`
 #include "nvme/resources.hpp"         // `resources_shared_ptr_t`
 #include "nvme/stored_value.hpp"      // `stored_value_size_t`, `stored_value_view_t`
-#include "nvme/types.hpp"             // `collection_numeric_id_t`, `value_layout_t`, `resolve_value_layout`
+#include "nvme/types.hpp"             // `collection_id_t`, `value_layout_t`, `resolve_value_layout`
 #include "nvme/volume.hpp"            // `basic_extent_volume`, `blob_t`, `volume_id_t`
 #include "nvme/volume_router.hpp"     // `basic_volume_router`
 
@@ -93,8 +93,8 @@ inline constexpr std::size_t collection_name_max_bytes_k = 64;
  */
 struct collection_record_t {
 
-    /** The number the catalog and every commit address the collection by. */
-    collection_numeric_id_t numeric_id = collection_invalid_numeric_id_k;
+    /** The UUID the catalog, every commit and the C ABI address the collection by. */
+    collection_id_t id = collection_invalid_id_k;
 
     /** Bytes level zero admits before a compaction is due. */
     std::uint64_t first_level_max_bytes = 0;
@@ -183,8 +183,8 @@ class basic_database {
     /** One borrowed queue pair, drained and given back when it dies. */
     using channel_guard_t = typename channel_pool_t::guard_t;
 
-    /** A collection named by its number or by its name, which is how every call addresses one. */
-    using any_collection_id_t = std::variant<collection_numeric_id_t, collection_alphanumeric_id_t>;
+    /** A collection named by its ID or by its name, which is how every call addresses one. */
+    using any_collection_id_t = std::variant<collection_id_t, collection_alphanumeric_id_t>;
 
     /** The transactions of this database, the order they commit in and the conflicts that stop them. */
     using registry_t = database_transaction_registry<stored_key_t, basic_database>;
@@ -212,8 +212,8 @@ class basic_database {
     /** One entry of the catalog: what a collection is called, how it is shaped, and the collection itself. */
     struct collection_entry_t {
 
-        /** The number the catalog and every commit address this collection by. */
-        collection_numeric_id_t numeric_id = collection_invalid_numeric_id_k;
+        /** The UUID the catalog, every commit and the C ABI address this collection by. */
+        collection_id_t id = collection_invalid_id_k;
 
         /** The name a caller reaches this collection by. */
         string_t name;
@@ -308,42 +308,42 @@ class basic_database {
         return entry_at_in_(published.view(), id) != nullptr;
     }
 
-    /** The number @p id resolves to, or @c collection_invalid_numeric_id_k when it names nothing. */
-    [[nodiscard]] collection_numeric_id_t collection_numeric_id(any_collection_id_t const& id) const noexcept {
+    /** The ID @p id resolves to, or @c collection_invalid_id_k when it names nothing. */
+    [[nodiscard]] collection_id_t collection_id(any_collection_id_t const& id) const noexcept {
         catalog_guard_t const published {*this};
         collection_entry_t const* const found = entry_at_in_(published.view(), id);
-        return found ? found->numeric_id : collection_invalid_numeric_id_k;
+        return found ? found->id : collection_invalid_id_k;
     }
 
-    /** The name @p numeric_id answers to, which is empty when it names nothing. */
-    [[nodiscard]] string_t collection_name(collection_numeric_id_t numeric_id) const noexcept {
+    /** The name @p collection_id answers to, which is empty when it names nothing. */
+    [[nodiscard]] string_t collection_name(collection_id_t collection_id) const noexcept {
         catalog_guard_t const published {*this};
-        collection_entry_t const* const found = entry_numbered_in_(published.view(), numeric_id);
+        collection_entry_t const* const found = entry_with_id_in_(published.view(), collection_id);
         string_t name;
         if (found) { [[maybe_unused]] bool const copied = name.try_assign(found->name.view()); }
         return name;
     }
 
-    /** The bounds @p numeric_id was created with, which a transaction checks every write against. */
-    status_t collection_config(collection_numeric_id_t numeric_id, collection_config_t& config) const noexcept {
+    /** The bounds @p collection_id was created with, which a transaction checks every write against. */
+    status_t collection_config(collection_id_t collection_id, collection_config_t& config) const noexcept {
         catalog_guard_t const published {*this};
-        collection_entry_t const* const found = entry_numbered_in_(published.view(), numeric_id);
+        collection_entry_t const* const found = entry_with_id_in_(published.view(), collection_id);
         if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
         config = found->config;
         return {};
     }
 
     /**
-     *  @brief The number @p id answers to and the bounds it was created with, read in one lookup.
-     *  @param[in] id The collection to resolve, named by its number or by its name.
-     *  @param[out] numeric_id The number it answers to, invalid when the database names none.
+     *  @brief The ID @p id answers to and the bounds it was created with, read in one lookup.
+     *  @param[in] id The collection to resolve, named by its ID or by its name.
+     *  @param[out] collection_id The ID it answers to, invalid when the database names none.
      *  @param[out] config The bounds it was created with, untouched when the database names none.
      */
-    status_t resolve_collection(any_collection_id_t const& id, collection_numeric_id_t& numeric_id,
+    status_t resolve_collection(any_collection_id_t const& id, collection_id_t& collection_id,
                                 collection_config_t& config) const noexcept {
         catalog_guard_t const published {*this};
         collection_entry_t const* const found = entry_at_in_(published.view(), id);
-        numeric_id = found ? found->numeric_id : collection_invalid_numeric_id_k;
+        collection_id = found ? found->id : collection_invalid_id_k;
         if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
         config = found->config;
         return {};
@@ -363,29 +363,32 @@ class basic_database {
         for (std::size_t index = 0; index != view.size(); ++index) {
             collection_ids_t named;
             if (!named.name.try_assign(view[index]->name.view())) break;
-            named.numeric_id = view[index]->numeric_id;
+            named.id = view[index]->id;
             if (listed.push_back(std::move(named)) != st::status_t::success_k) break;
         }
         return listed;
     }
 
     /**
-     *  @brief Creates the collection @p name, shaped by @p config, and records it in the catalog.
+     *  @brief Catalogs a new collection @p name under @p collection_id, shaped by @p config.
+     *  @param[in] collection_id The UUID the caller minted, which addresses the collection for as long as it lives.
      *  @param[in] name The name callers reach the collection by, which no other collection may hold.
      *  @param[in] config The write-buffer bounds, the cache bound and the shape of the tree below.
-     *  @return The number the collection is addressed by, which outlives its name.
      *
      *  @note The value layout follows from @c config's value size, so a width of eight bytes is stored
      *      inside the key slots and a width of none is a collection of values that differ.
      */
-    expected<collection_numeric_id_t> create_collection(string_view_t name,
-                                                        collection_config_t const& config) noexcept {
+    status_t create_collection(collection_id_t collection_id, string_view_t name,
+                               collection_config_t const& config) noexcept {
         if (name.empty()) return status_t {status_code_t::invalid_argument_k, "A collection is named by a byte"};
         if (name.size() > collection_name_max_bytes_k)
             return status_t {status_code_t::invalid_argument_k, "A collection name is shorter than that"};
+        if (collection_id == collection_invalid_id_k)
+            return status_t {status_code_t::invalid_argument_k, "That ID names no collection"};
         expected<claimed_channel_t> claimed = claim_channel_();
         if (!claimed) return claimed.status();
-        if (entry_named_in_(claimed_catalog_(), name) != nullptr)
+        if (entry_named_in_(claimed_catalog_(), name) != nullptr ||
+            entry_with_id_in_(claimed_catalog_(), collection_id) != nullptr)
             return status_t {status_code_t::already_exists_k, "The database already names that collection"};
 
         auto [placed, optimal_volume_status] = router_->optimal_volume(1);
@@ -396,14 +399,13 @@ class basic_database {
 
         entry_pointer_t entry {new (std::nothrow) collection_entry_t {}};
         if (!entry) return status_t {status_code_t::out_of_memory_k, "No room for another collection"};
-        entry->numeric_id = unused_numeric_id_();
+        entry->id = collection_id;
         if (!entry->name.try_assign(name))
             return status_t {status_code_t::out_of_memory_k, "No room for a collection's name"};
         entry->config = config;
         entry->volume = placed;
         entry->held = std::move(mounted);
 
-        collection_numeric_id_t const numeric_id = entry->numeric_id;
         if (collections_.push_back(std::move(entry)) != st::status_t::success_k)
             return status_t {status_code_t::out_of_memory_k, "No room for another collection"};
         if (status_t const saved = save_schema_(claimed->channel()); saved.failed()) {
@@ -414,7 +416,7 @@ class basic_database {
             collections_.erase(collections_.size() - 1);
             return publication;
         }
-        return numeric_id;
+        return {};
     }
 
     /** Returns every run of @p id to its volume and forgets the name, which destroys the data. */
@@ -501,7 +503,7 @@ class basic_database {
 
     /**
      *  @brief Copies the value @p id holds for @p stored_key into @p into, which needs only its bytes.
-     *  @param[in] id The collection to read from, named by its number or by its name.
+     *  @param[in] id The collection to read from, named by its ID or by its name.
      *  @param[in] stored_key The key to read.
      *  @param[out] into Where the value lands, which need not be aligned and need not be registered.
      *  @param[out] size Bytes written, which is zero for every failure.
@@ -522,7 +524,7 @@ class basic_database {
 
     /**
      *  @brief Reads the values of @p stored_keys out of @p id, refilling the channel as completions retire.
-     *  @param[in] id The collection to read from, named by its number or by its name.
+     *  @param[in] id The collection to read from, named by its ID or by its name.
      *  @param[in] stored_keys The keys to read, in any order and with any number of misses among them.
      *  @param[out] results What every key answered, which separates a miss from an erasure.
      *  @param[in] sink Called as @c sink(request, offset, bytes) for every key that locates a value.
@@ -568,7 +570,7 @@ class basic_database {
 
     /**
      *  @brief Stages one value per key into @p id, flushing first when they do not all fit.
-     *  @param[in] id The collection to write to, named by its number or by its name.
+     *  @param[in] id The collection to write to, named by its ID or by its name.
      *  @param[in] stored_keys The keys to write, in any order and with repeats taking the last value.
      *  @param[in] stored_values The values back to back, in the order their keys name them.
      *  @param[in] sizes Bytes of every value, one per key, which must add up to @p stored_values.
@@ -658,7 +660,7 @@ class basic_database {
                 [&](auto& collection) noexcept -> status_t {
                     auto [levels, take_snapshot_status] = collection.take_snapshot(claimed->channel());
                     if (take_snapshot_status.failed()) return take_snapshot_status;
-                    return taken.hold(entry.numeric_id, entry.name.view(),
+                    return taken.hold(entry.id, entry.name.view(),
                                       typename snapshot_t::any_collection_snapshot_t {std::move(levels)});
                 },
                 entry.held);
@@ -708,20 +710,20 @@ class basic_database {
         write_claim_ = claim_guard_t {};
     }
 
-    /** Whether @p numeric_id still names a collection, which a commit checks before it writes one. */
-    [[nodiscard]] bool contains_collection(collection_numeric_id_t numeric_id) const noexcept {
-        return entry_numbered_in_(claimed_catalog_(), numeric_id) != nullptr;
+    /** Whether @p collection_id still names a collection, which a commit checks before it writes one. */
+    [[nodiscard]] bool contains_collection(collection_id_t collection_id) const noexcept {
+        return entry_with_id_in_(claimed_catalog_(), collection_id) != nullptr;
     }
 
     /**
-     *  @brief Whether @p count writes of @p bytes fit in the write buffer of @p numeric_id as it stands.
+     *  @brief Whether @p count writes of @p bytes fit in the write buffer of @p collection_id as it stands.
      *
      *  @note A refusal only asks the caller to flush first; a collection whose buffer fills anyway
      *      flushes itself rather than losing the write.
      */
-    [[nodiscard]] bool collection_fits(collection_numeric_id_t numeric_id, std::size_t count,
+    [[nodiscard]] bool collection_fits(collection_id_t collection_id, std::size_t count,
                                        std::size_t bytes) const noexcept {
-        collection_entry_t const* const found = entry_numbered_in_(claimed_catalog_(), numeric_id);
+        collection_entry_t const* const found = entry_with_id_in_(claimed_catalog_(), collection_id);
         if (!found) return false;
         return std::visit(
             [&](auto const& collection) noexcept {
@@ -731,19 +733,19 @@ class basic_database {
             found->held);
     }
 
-    /** Writes the staged writes of @p numeric_id out, on the channel the write path holds. */
-    status_t flush_collection(collection_numeric_id_t numeric_id) noexcept {
-        collection_entry_t* const found = entry_numbered_in_(claimed_catalog_(), numeric_id);
+    /** Writes the staged writes of @p collection_id out, on the channel the write path holds. */
+    status_t flush_collection(collection_id_t collection_id) noexcept {
+        collection_entry_t* const found = entry_with_id_in_(claimed_catalog_(), collection_id);
         if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
         if (!write_channel_.holding()) return {status_code_t::capacity_exhausted_k, "The write path took no channel"};
         return std::visit([&](auto& collection) noexcept { return collection.flush(write_channel_.channel()); },
                           found->held);
     }
 
-    /** Stages @p stored_value under @p stored_key of @p numeric_id, on the channel the write path holds. */
-    status_t insert_in_collection(collection_numeric_id_t numeric_id, stored_key_t stored_key,
+    /** Stages @p stored_value under @p stored_key of @p collection_id, on the channel the write path holds. */
+    status_t insert_in_collection(collection_id_t collection_id, stored_key_t stored_key,
                                   stored_value_view_t stored_value) noexcept {
-        collection_entry_t* const found = entry_numbered_in_(claimed_catalog_(), numeric_id);
+        collection_entry_t* const found = entry_with_id_in_(claimed_catalog_(), collection_id);
         if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
         if (!write_channel_.holding()) return {status_code_t::capacity_exhausted_k, "The write path took no channel"};
         return std::visit(
@@ -753,9 +755,9 @@ class basic_database {
             found->held);
     }
 
-    /** Stages a tombstone under @p stored_key of @p numeric_id, on the channel the write path holds. */
-    status_t remove_from_collection(collection_numeric_id_t numeric_id, stored_key_t stored_key) noexcept {
-        collection_entry_t* const found = entry_numbered_in_(claimed_catalog_(), numeric_id);
+    /** Stages a tombstone under @p stored_key of @p collection_id, on the channel the write path holds. */
+    status_t remove_from_collection(collection_id_t collection_id, stored_key_t stored_key) noexcept {
+        collection_entry_t* const found = entry_with_id_in_(claimed_catalog_(), collection_id);
         if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
         if (!write_channel_.holding()) return {status_code_t::capacity_exhausted_k, "The write path took no channel"};
         return std::visit(
@@ -810,7 +812,7 @@ class basic_database {
     /**
      *  @brief Holds one published catalog against republication for the life of the guard.
      *
-     *  A lookup that reads nothing but a name, a number or a shape needs no claim: every entry is
+     *  A lookup that reads nothing but a name, an ID or a shape needs no claim: every entry is
      *  pinned on the heap, so a create and a drop replace only the array naming them, and the
      *  publication that replaces it waits until the view it retired has no reader left inside.
      */
@@ -973,11 +975,11 @@ class basic_database {
         return {};
     }
 
-    /** The entry @p numeric_id names in @p view, or null when the view names none. */
-    [[nodiscard]] static collection_entry_t* entry_numbered_in_(catalog_view_t const& view,
-                                                                collection_numeric_id_t numeric_id) noexcept {
+    /** The entry @p collection_id names in @p view, or null when the view names none. */
+    [[nodiscard]] static collection_entry_t* entry_with_id_in_(catalog_view_t const& view,
+                                                               collection_id_t collection_id) noexcept {
         for (std::size_t index = 0; index != view.size(); ++index)
-            if (view[index]->numeric_id == numeric_id) return view[index];
+            if (view[index]->id == collection_id) return view[index];
         return nullptr;
     }
 
@@ -991,8 +993,8 @@ class basic_database {
     /** The entry @p id names in @p view, or null when the view names none. */
     [[nodiscard]] static collection_entry_t* entry_at_in_(catalog_view_t const& view,
                                                           any_collection_id_t const& id) noexcept {
-        if (collection_numeric_id_t const* const numbered = std::get_if<collection_numeric_id_t>(&id))
-            return entry_numbered_in_(view, *numbered);
+        if (collection_id_t const* const identified = std::get_if<collection_id_t>(&id))
+            return entry_with_id_in_(view, *identified);
         return entry_named_in_(view, std::get<collection_alphanumeric_id_t>(id).view());
     }
 
@@ -1006,25 +1008,15 @@ class basic_database {
 
     /** Where @p id sits in the catalog, or the catalog's size when it names nothing. */
     [[nodiscard]] std::size_t position_at_(any_collection_id_t const& id) const noexcept {
-        if (collection_numeric_id_t const* const numbered = std::get_if<collection_numeric_id_t>(&id)) {
+        if (collection_id_t const* const identified = std::get_if<collection_id_t>(&id)) {
             for (std::size_t index = 0; index != collections_.size(); ++index)
-                if (collections_[index]->numeric_id == *numbered) return index;
+                if (collections_[index]->id == *identified) return index;
             return collections_.size();
         }
         collection_alphanumeric_id_t const& named = std::get<collection_alphanumeric_id_t>(id);
         for (std::size_t index = 0; index != collections_.size(); ++index)
             if (collections_[index]->name == named) return index;
         return collections_.size();
-    }
-
-    /** A number no live collection holds, which is one past the largest the catalog names. */
-    [[nodiscard]] collection_numeric_id_t unused_numeric_id_() const noexcept {
-        collection_numeric_id_t largest = 0;
-        for (std::size_t index = 0; index != collections_.size(); ++index) {
-            collection_numeric_id_t const held = collections_[index]->numeric_id;
-            if (held != collection_invalid_numeric_id_k && held > largest) largest = held;
-        }
-        return largest + 1;
     }
 
     /** Mounts a collection of @p value_layout_ over @p volume, as one alternative of the variant. */
@@ -1120,7 +1112,7 @@ class basic_database {
         for (std::size_t index = 0; index != collections_.size(); ++index) {
             collection_entry_t const& entry = *collections_[index];
             collection_record_t record;
-            record.numeric_id = entry.numeric_id;
+            record.id = entry.id;
             std::size_t const named_before = runs.size();
             if (status_t const named = std::visit(
                     [&](auto const& held) noexcept { return record_lsm_tree_runs(held.tree(), runs); }, entry.held);
@@ -1201,7 +1193,7 @@ class basic_database {
 
         entry_pointer_t entry {new (std::nothrow) collection_entry_t {}};
         if (!entry) return {status_code_t::out_of_memory_k, "No room for another collection"};
-        entry->numeric_id = record.numeric_id;
+        entry->id = record.id;
         if (!entry->name.try_assign(record.name()))
             return {status_code_t::out_of_memory_k, "No room for a collection's name"};
         entry->config = config;

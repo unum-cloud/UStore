@@ -38,9 +38,9 @@ class database_transaction;
  *  shape alone still satisfies this.
  */
 template <typename store_type_, typename stored_key_type_>
-concept transaction_store_concept = requires(store_type_& store, store_type_ const& constant,
-                                             collection_numeric_id_t group_id, stored_key_type_ stored_key,
-                                             stored_value_view_t stored_value, std::size_t count) {
+concept transaction_store_concept = requires(store_type_& store, store_type_ const& constant, collection_id_t group_id,
+                                             stored_key_type_ stored_key, stored_value_view_t stored_value,
+                                             std::size_t count) {
     { store.acquire_write_path() } -> std::same_as<void>;
     { store.release_write_path() } -> std::same_as<void>;
     { constant.contains_collection(group_id) } -> std::same_as<bool>;
@@ -126,7 +126,7 @@ class database_transaction_registry {
     /** The lowest stamp any later commit can claim, which scopes a watch taken now. */
     inline transaction_stamp_t current_stamp_() const noexcept { return record_.watch_stamp(); }
 
-    inline status_t watch_now_(transaction_stamp_t start_stamp, collection_numeric_id_t group_id,
+    inline status_t watch_now_(transaction_stamp_t start_stamp, collection_id_t group_id,
                                std::span<stored_key_t const> stored_keys) const noexcept;
 
 #pragma endregion Transactions
@@ -153,11 +153,9 @@ class database_transaction_registry {
     }
 
     inline bool has_collection_(auto const& id) const noexcept { return store_->has_collection(id); }
-    inline collection_numeric_id_t collection_numeric_id_(auto const& id) const noexcept {
-        return store_->collection_numeric_id(id);
-    }
+    inline collection_id_t collection_id_(auto const& id) const noexcept { return store_->collection_id(id); }
     inline auto list_collections_() const noexcept { return store_->list_collections(); }
-    inline status_t collection_config_(collection_numeric_id_t group_id, collection_config_t& config) const noexcept {
+    inline status_t collection_config_(collection_id_t group_id, collection_config_t& config) const noexcept {
         return store_->collection_config(group_id, config);
     }
 
@@ -318,7 +316,7 @@ inline void database_transaction_registry<stored_key_, store_type_>::notify_abou
 
 template <typename stored_key_, typename store_type_>
 inline status_t database_transaction_registry<stored_key_, store_type_>::watch_now_(
-    transaction_stamp_t start_stamp, collection_numeric_id_t group_id,
+    transaction_stamp_t start_stamp, collection_id_t group_id,
     std::span<stored_key_t const> stored_keys) const noexcept {
 
     for (stored_key_t const& stored_key : stored_keys)
@@ -338,7 +336,7 @@ inline bool database_transaction_registry<stored_key_, store_type_>::conflicting
     bool conflict = false;
     [[maybe_unused]] st::status_t const walked = data.read_set.groups.for_each(
         [&](auto const& group) noexcept -> st::walk_control_t {
-            collection_numeric_id_t const group_id = group.key();
+            collection_id_t const group_id = group.key();
             [[maybe_unused]] st::status_t const watched = group.value().stored_keys.for_each(
                 [&](auto const& watch) noexcept -> st::walk_control_t {
                     conflict = record_.conflicts(watched_key_fingerprint(group_id, watch.key()),
@@ -355,7 +353,7 @@ inline void database_transaction_registry<stored_key_, store_type_>::record_comm
     write_buffer_t const& changes, transaction_stamp_t commit_stamp) noexcept {
 
     [[maybe_unused]] st::status_t const walked = changes.groups_by_id.for_each([&](auto const& group) noexcept {
-        collection_numeric_id_t const group_id = group.key();
+        collection_id_t const group_id = group.key();
         [[maybe_unused]] st::status_t const written = group.value().stored_values.for_each(
             [&](auto const& entry) noexcept {
                 record_.record(watched_key_fingerprint(group_id, entry.key()), commit_stamp);
@@ -387,7 +385,7 @@ inline status_t database_transaction_registry<stored_key_, store_type_>::apply_(
     status_t status = status_t {};
     [[maybe_unused]] st::status_t const walked = changes.groups_by_id.for_each(
         [&](auto const& group) noexcept -> st::walk_control_t {
-            collection_numeric_id_t const group_id = group.key();
+            collection_id_t const group_id = group.key();
             [[maybe_unused]] st::status_t const applied = group.value().stored_values.for_each(
                 [&](auto const& entry) noexcept -> st::walk_control_t {
                     auto const& place = entry.value();

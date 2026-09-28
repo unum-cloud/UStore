@@ -12,6 +12,10 @@
 #include <limits>      // `std::numeric_limits`
 #include <type_traits> // `std::is_arithmetic_v`, `std::is_trivially_copyable_v`
 
+#include <smashtable/shared.hpp> // `st::hash`
+
+#include <ustore/types.hpp> // the `st` alias
+
 namespace unum::ustore::nvme {
 
 /**
@@ -86,6 +90,17 @@ struct limit<uuid_stored_key_t> {
 
     /** The key of 16 bytes with every bit set. */
     static constexpr uuid_stored_key_t max() noexcept { return {~std::uint64_t {0}, ~std::uint64_t {0}}; }
+};
+
+/** Hashes a key a key slot carries: a 16-byte key by folding its two words, any other through SmashTable's own. */
+struct stored_key_hash_t {
+    template <typename stored_key_type_>
+    std::size_t operator()(stored_key_type_ const& key) const noexcept {
+        return st::hash<stored_key_type_> {}(key);
+    }
+    std::size_t operator()(uuid_stored_key_t const& key) const noexcept {
+        return st::hash<std::uint64_t> {}(key.high ^ (key.low * 0x9E3779B97F4A7C15ull));
+    }
 };
 
 /** A key a key slot carries: trivially copyable, ordered by @c < and @c ==, with bounds from @c limit. */

@@ -134,7 +134,7 @@ class collection {
         if (mounted.staged_count_limit_ == 0)
             return status_t {status_code_t::invalid_argument_k, "A collection stages at least one write"};
 
-        mounted.staged_ = staged_t {st::hash<stored_key_t> {}, st::equal_to_t {},
+        mounted.staged_ = staged_t {stored_key_hash_t {}, st::equal_to_t {},
                                     constrained_allocator<std::byte> {constraint}};
         mounted.arena_ = arena_t {constrained_allocator<byte_t> {constraint}};
         mounted.cache_ = value_cache_t::of(holds_values_inline_k ? 0 : config.cache_limit, mounted.value_max_size_,
@@ -464,8 +464,8 @@ class collection {
     };
 
     /** The staged writes, addressed by their key, of which the last write of a key wins. */
-    using staged_t = st::hash_map<stored_key_t, staged_place_t, st::hash<stored_key_t>, st::equal_to_t,
-                                  constrained_allocator<std::byte>>;
+    using staged_t =
+        st::hash_map<stored_key_t, staged_place_t, stored_key_hash_t, st::equal_to_t, constrained_allocator<std::byte>>;
 
     /** The bytes every staged value was copied into, appended to and never rewritten. */
     using arena_t = st::basic_vector<byte_t, constrained_allocator<byte_t>>;

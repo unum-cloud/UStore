@@ -45,8 +45,8 @@ class write_buffer {
     };
 
     using stored_key_t = stored_key_;
-    using stored_values_hash_map_t = st::hash_map<stored_key_t, stored_value_place_t, st::hash<stored_key_t>,
-                                                  st::equal_to_t, constrained_allocator<std::byte>>;
+    using stored_values_hash_map_t = st::hash_map<stored_key_t, stored_value_place_t, stored_key_hash_t, st::equal_to_t,
+                                                  constrained_allocator<std::byte>>;
 
 #pragma endregion Types
 

@@ -55,9 +55,8 @@ namespace unum::ustore::nvme {
 
 #pragma region Store
 
-/** The key every collection of this engine stores, a 64-bit integer onto which the keys of the C ABI whose first eight
- *  bytes are zero map, until NVMe stores sixteen-byte keys itself. */
-using stored_key_t = std::int64_t;
+/** The key every collection of this engine stores: the 16 bytes of the C ABI's key, ordered like `memcmp`. */
+using stored_key_t = uuid_stored_key_t;
 
 /** The store every call runs against, whose volumes live in files. */
 using store_t = database<stored_key_t>;
@@ -154,12 +153,6 @@ struct opened_database_t : handle_t {
 
     /** The shape every collection this database creates takes. */
     user_collection_config_t collection_defaults;
-
-    /** The number the collection @c ustore_collection_main_k addresses answers to. */
-    collection_numeric_id_t main = collection_invalid_numeric_id_k;
-
-    /** The number the collection of the strings modality answers to. */
-    collection_numeric_id_t names = collection_invalid_numeric_id_k;
 };
 
 /** A transaction handle of the C ABI. */
@@ -204,52 +197,21 @@ void with_names(arguments_type_& arguments) noexcept {
 
 #pragma endregion Strings and Names
 
-/** The number @p collection resolves to in @p database, reserved identifiers included, or the invalid number for an
- *  identifier this engine never hands out. */
-[[nodiscard]] inline collection_numeric_id_t numbered(opened_database_t const& database,
-                                                      ustore_collection_id_t collection) noexcept {
-    if (collection == ustore_collection_main_k) return database.main;
-    if (collection == names_collection_k) return database.names;
-    auto [numeric_id, numeric_status] = uuid_to_integer(collection.uuid);
-    if (numeric_status.failed() || !std::in_range<collection_numeric_id_t>(numeric_id))
-        return collection_invalid_numeric_id_k;
-    return static_cast<collection_numeric_id_t>(numeric_id);
+/** The stored key holding the 16 bytes of @p key. */
+[[nodiscard]] inline stored_key_t stored_from_key(ustore_key_t const& key) noexcept {
+    return stored_key_t::from_bytes(key.uuid.bytes);
 }
 
-/** The identifier the C ABI names the collection @p numeric_id by, which spells the number until NVMe mints UUIDv7s. */
-[[nodiscard]] inline ustore_collection_id_t collection_id_of(collection_numeric_id_t numeric_id) noexcept {
-    return {uuid_from_integer(static_cast<std::uint64_t>(numeric_id))};
+/** The key of the C ABI whose 16 bytes @p stored holds. */
+[[nodiscard]] inline ustore_key_t key_from_stored(stored_key_t const& stored) noexcept {
+    ustore_key_t key;
+    stored.to_bytes(key.uuid.bytes);
+    return key;
 }
 
-/** The bit whose flip turns the unsigned lower half of a key into a signed stored key of the same order. */
-constexpr std::uint64_t sign_bit_k = std::uint64_t {1} << 63;
-
-/** Whether @p key maps onto a stored key, which only a key with its first eight bytes zero does. */
-[[nodiscard]] inline bool storable(ustore_key_t const& key) noexcept { return uuid_to_integer(key.uuid).has_value(); }
-
-/** The stored key of @p key, which the call has checked is @c storable. */
-[[nodiscard]] inline stored_key_t stored_of(ustore_key_t const& key) noexcept {
-    return static_cast<stored_key_t>(*uuid_to_integer(key.uuid) ^ sign_bit_k);
-}
-
-/** The key of the C ABI that @p stored maps back onto. */
-[[nodiscard]] inline ustore_key_t key_of_stored(stored_key_t stored) noexcept {
-    return key_from_integer(static_cast<std::uint64_t>(stored) ^ sign_bit_k);
-}
-
-/** Refuses a batch naming a key NVMe can't store yet, answering whether it refused. */
-[[nodiscard]] inline bool refuse_wide_keys(places_arg_t const& places, ustore_error_t* error) noexcept {
-    for (std::size_t index = 0; index != places.size(); ++index)
-        if (!storable(places[index].key)) {
-            *error = {ustore_error_unsupported_k, "NVMe keys fit 64 bits for now"};
-            return true;
-        }
-    return false;
-}
-
-/** Whether @p numeric_id names one of the two collections the engine reserves for itself. */
-[[nodiscard]] inline bool reserved(opened_database_t const& database, collection_numeric_id_t numeric_id) noexcept {
-    return numeric_id == database.main || numeric_id == database.names;
+/** Whether @p collection is one of the two collections the engine reserves for itself. */
+[[nodiscard]] inline bool reserved(collection_id_t const& collection) noexcept {
+    return collection == ustore_collection_main_k || collection == names_collection_k;
 }
 
 /** The watches a call of @p options takes, which a caller turns off per call. */
@@ -262,35 +224,33 @@ constexpr std::uint64_t sign_bit_k = std::uint64_t {1} << 63;
 #pragma region Transaction Dispatch
 
 /**
- *  @brief Reads @p stored_key of @p numeric_id through @p handler, watching it as @p schedule asks.
+ *  @brief Reads @p stored_key of @p collection through @p handler, watching it as @p schedule asks.
  *
  *  The transaction's own buffer is asked first and only falls through when it carries no value, since
  *  the store's own fall-through would answer a key the transaction erased with the committed one.
  */
-inline status_t read_through(store_transaction_t const& handler, watch_schedule_t schedule,
-                             collection_numeric_id_t numeric_id, stored_key_t stored_key, std::span<byte_t> into,
-                             stored_value_size_t& size) noexcept {
-    any_collection_id_t const id {numeric_id};
+inline status_t read_through(store_transaction_t const& handler, watch_schedule_t schedule, collection_id_t collection,
+                             stored_key_t stored_key, std::span<byte_t> into, stored_value_size_t& size) noexcept {
+    any_collection_id_t const id {collection};
     if (handler.contains_uncommitted(id, stored_key)) return handler.select_uncommitted(id, stored_key, into, size);
     if (schedule == watch_schedule_t::never_k)
         return handler.select_committed<watch_schedule_t::never_k>(id, stored_key, into, size);
     return handler.select_committed<watch_schedule_t::on_commit_k>(id, stored_key, into, size);
 }
 
-/** Stages @p stored_value under @p stored_key of @p numeric_id, watching it as @p schedule asks. */
-inline status_t write_through(store_transaction_t& handler, watch_schedule_t schedule,
-                              collection_numeric_id_t numeric_id, stored_key_t stored_key,
-                              stored_value_view_t stored_value) noexcept {
-    any_collection_id_t const id {numeric_id};
+/** Stages @p stored_value under @p stored_key of @p collection, watching it as @p schedule asks. */
+inline status_t write_through(store_transaction_t& handler, watch_schedule_t schedule, collection_id_t collection,
+                              stored_key_t stored_key, stored_value_view_t stored_value) noexcept {
+    any_collection_id_t const id {collection};
     if (schedule == watch_schedule_t::never_k)
         return handler.insert<watch_schedule_t::never_k>(id, stored_key, stored_value);
     return handler.insert<watch_schedule_t::on_commit_k>(id, stored_key, stored_value);
 }
 
-/** Stages a removal of @p stored_key of @p numeric_id, watching it as @p schedule asks. */
-inline status_t erase_through(store_transaction_t& handler, watch_schedule_t schedule,
-                              collection_numeric_id_t numeric_id, stored_key_t stored_key) noexcept {
-    any_collection_id_t const id {numeric_id};
+/** Stages a removal of @p stored_key of @p collection, watching it as @p schedule asks. */
+inline status_t erase_through(store_transaction_t& handler, watch_schedule_t schedule, collection_id_t collection,
+                              stored_key_t stored_key) noexcept {
+    any_collection_id_t const id {collection};
     if (schedule == watch_schedule_t::never_k) return handler.remove<watch_schedule_t::never_k>(id, stored_key);
     return handler.remove<watch_schedule_t::on_commit_k>(id, stored_key);
 }
@@ -401,24 +361,24 @@ status_t walk_from(collection_snapshot_type_ const& held, stored_key_t from, vis
     }
 }
 
-/** Walks the collection @p numeric_id names inside @p taken, which walks nothing when it holds none. */
+/** Walks the collection @p collection names inside @p taken, which walks nothing when it holds none. */
 template <typename visitor_type_>
-status_t walk_collection(store_snapshot_t const& taken, collection_numeric_id_t numeric_id, stored_key_t from,
+status_t walk_collection(store_snapshot_t const& taken, collection_id_t collection, stored_key_t from,
                          visitor_type_&& visitor) noexcept {
     for (std::size_t index = 0; index != taken.size(); ++index) {
-        if (taken.at(index).numeric_id != numeric_id) continue;
+        if (taken.at(index).id != collection) continue;
         return std::visit([&](auto const& held) noexcept { return walk_from(held, from, visitor); },
                           taken.at(index).levels);
     }
     return {};
 }
 
-/** Appends every key of @p numeric_id from @p from up to @p into, which a mutation then works through. */
-inline status_t collect_keys(store_snapshot_t const& taken, collection_numeric_id_t numeric_id, stored_key_t from,
+/** Appends every key of @p collection from @p from up to @p into, which a mutation then works through. */
+inline status_t collect_keys(store_snapshot_t const& taken, collection_id_t collection, stored_key_t from,
                              st::basic_vector<stored_key_t>& into) noexcept {
     status_t room;
     status_t const walked = walk_collection(
-        taken, numeric_id, from,
+        taken, collection, from,
         [&](stored_key_t key, select_result_t state, stored_value_size_t) noexcept -> walk_control_t {
             if (state != select_result_t::success_k) return walk_control_t::resume_k;
             if (into.push_back(stored_key_t {key}) == st::status_t::success_k) return walk_control_t::resume_k;
@@ -548,8 +508,8 @@ struct sample_generator_t {
 /** One collection of a batch and the requests of the batch that name it. */
 struct batch_group_t {
 
-    /** The number the store addresses the collection by. */
-    collection_numeric_id_t numeric_id = collection_invalid_numeric_id_k;
+    /** The collection every key of the group belongs to. */
+    collection_id_t collection = collection_invalid_id_k;
 
     /** The keys of this collection, in the order the batch names them. */
     st::basic_vector<stored_key_t> keys;
@@ -564,21 +524,20 @@ struct batch_group_t {
  *  A read of several collections is several reads of the store, and the store takes its keys
  *  contiguous, so the batch is laid out per collection rather than walked per place.
  */
-inline status_t group_places(opened_database_t const& database, places_arg_t const& places,
-                             st::basic_vector<batch_group_t>& groups) noexcept {
+inline status_t group_places(places_arg_t const& places, st::basic_vector<batch_group_t>& groups) noexcept {
     for (std::size_t index = 0; index != places.size(); ++index) {
         place_t const place = places[index];
-        collection_numeric_id_t const numeric_id = numbered(database, place.collection);
+        collection_id_t const collection = place.collection;
         std::size_t found = groups.size();
         for (std::size_t group = 0; group != groups.size(); ++group)
-            if (groups[group].numeric_id == numeric_id) found = group;
+            if (groups[group].collection == collection) found = group;
         if (found == groups.size()) {
             batch_group_t fresh;
-            fresh.numeric_id = numeric_id;
+            fresh.collection = collection;
             if (groups.push_back(std::move(fresh)) != st::status_t::success_k)
                 return {status_code_t::out_of_memory_k, "A batch could not hold another collection"};
         }
-        if (groups[found].keys.push_back(stored_of(place.key)) != st::status_t::success_k ||
+        if (groups[found].keys.push_back(stored_from_key(place.key)) != st::status_t::success_k ||
             groups[found].requests.push_back(std::size_t {index}) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A batch could not hold another key"};
     }
@@ -596,9 +555,9 @@ inline status_t group_places(opened_database_t const& database, places_arg_t con
  *  call reports as a value of no bytes, so the buffer is asked whether it carries a value first.
  */
 [[nodiscard]] inline ustore_length_t measured_in_transaction(store_transaction_t const& handler,
-                                                             collection_numeric_id_t numeric_id,
+                                                             collection_id_t collection,
                                                              stored_key_t stored_key) noexcept {
-    any_collection_id_t const id {numeric_id};
+    any_collection_id_t const id {collection};
     stored_value_size_t size = 0;
     if (handler.stored_value_size_uncommitted(id, stored_key, size).succeeded())
         return handler.contains_uncommitted(id, stored_key) ? static_cast<ustore_length_t>(size)
@@ -611,11 +570,10 @@ inline status_t group_places(opened_database_t const& database, places_arg_t con
 /** Bytes the value of @p stored_key takes, or @c ustore_length_missing_k for a miss and an erasure. */
 [[nodiscard]] inline ustore_length_t measured_length(opened_database_t const& database,
                                                      opened_transaction_t const* transaction,
-                                                     collection_numeric_id_t numeric_id,
-                                                     stored_key_t stored_key) noexcept {
-    if (transaction) return measured_in_transaction(*transaction->held, numeric_id, stored_key);
+                                                     collection_id_t collection, stored_key_t stored_key) noexcept {
+    if (transaction) return measured_in_transaction(*transaction->held, collection, stored_key);
     stored_value_size_t size = 0;
-    status_t const answered = database.store->stored_value_size(any_collection_id_t {numeric_id}, stored_key, size);
+    status_t const answered = database.store->stored_value_size(any_collection_id_t {collection}, stored_key, size);
     return answered.succeeded() ? static_cast<ustore_length_t>(size) : ustore_length_missing_k;
 }
 
@@ -639,7 +597,7 @@ inline status_t read_batched(opened_database_t& database, st::basic_vector<batch
             }
             if (!bytes.empty()) std::memcpy(tape.data() + starts[at] + offset, bytes.data(), bytes.size());
         };
-        status_t const read = database.store->select(any_collection_id_t {named.numeric_id},
+        status_t const read = database.store->select(any_collection_id_t {named.collection},
                                                      std::span<stored_key_t const> {named.keys},
                                                      std::span<select_result_t> {answers}, sink);
         if (read.failed()) return read;
@@ -649,17 +607,16 @@ inline status_t read_batched(opened_database_t& database, st::basic_vector<batch
 }
 
 /** Reads every place of @p places through @p transaction into @p tape, one key at a time. */
-inline status_t read_through_transaction(opened_database_t const& database, opened_transaction_t const& transaction,
-                                         watch_schedule_t schedule, places_arg_t const& places,
-                                         std::span<ustore_length_t const> starts,
+inline status_t read_through_transaction(opened_transaction_t const& transaction, watch_schedule_t schedule,
+                                         places_arg_t const& places, std::span<ustore_length_t const> starts,
                                          std::span<ustore_length_t const> lengths, std::span<byte_t> tape) noexcept {
     for (std::size_t index = 0; index != places.size(); ++index) {
         if (lengths[index] == ustore_length_missing_k) continue;
         place_t const place = places[index];
         stored_value_size_t size = 0;
         std::span<byte_t> const into = tape.subspan(starts[index], lengths[index]);
-        if (status_t const read = read_through(*transaction.held, schedule, numbered(database, place.collection),
-                                               stored_of(place.key), into, size);
+        if (status_t const read = read_through(*transaction.held, schedule, place.collection,
+                                               stored_from_key(place.key), into, size);
             read.failed())
             return read;
     }
@@ -676,11 +633,11 @@ inline status_t read_through_transaction(opened_database_t const& database, open
 }
 
 /** Stages one place into @p handler, which a missing value erases. */
-inline status_t stage_one(opened_database_t const& database, store_transaction_t& handler, watch_schedule_t schedule,
-                          place_t place, value_view_t content) noexcept {
-    collection_numeric_id_t const numeric_id = numbered(database, place.collection);
-    if (content) return write_through(handler, schedule, numeric_id, stored_of(place.key), bytes_of(content));
-    return erase_through(handler, schedule, numeric_id, stored_of(place.key));
+inline status_t stage_one(store_transaction_t& handler, watch_schedule_t schedule, place_t place,
+                          value_view_t content) noexcept {
+    collection_id_t const collection = place.collection;
+    if (content) return write_through(handler, schedule, collection, stored_from_key(place.key), bytes_of(content));
+    return erase_through(handler, schedule, collection, stored_from_key(place.key));
 }
 
 /**
@@ -704,8 +661,7 @@ inline status_t commit_batch(opened_database_t& database, places_arg_t const& pl
     if (create_transaction_status.failed()) return create_transaction_status;
 
     for (std::size_t index = 0; index != places.size(); ++index)
-        if (status_t const staged = stage_one(database, *opened, watch_schedule_t::never_k, places[index],
-                                              contents[index]);
+        if (status_t const staged = stage_one(*opened, watch_schedule_t::never_k, places[index], contents[index]);
             staged.failed())
             return staged;
     return opened->commit();
@@ -715,31 +671,29 @@ inline status_t commit_batch(opened_database_t& database, places_arg_t const& pl
 
 #pragma region Catalog
 
-/** Creates the collection @p name, or answers the number it already had. */
-inline expected<collection_numeric_id_t> reserve_collection(store_t& store, std::string_view name,
-                                                            collection_config_t const& config) noexcept {
-    any_collection_id_t const id {collection_alphanumeric_id_t {string_view_t {name}}};
-    collection_numeric_id_t const known = store.collection_numeric_id(id);
-    if (known != collection_invalid_numeric_id_k) return known;
-    return store.create_collection(string_view_t {name}, config);
+/** Creates the collection @p collection named @p name, unless the store holds it already. */
+inline status_t reserve_collection(store_t& store, collection_id_t const& collection, std::string_view name,
+                                   collection_config_t const& config) noexcept {
+    if (store.has_collection(any_collection_id_t {collection})) return {};
+    return store.create_collection(collection, string_view_t {name}, config);
 }
 
 /**
- *  @brief Removes every key of @p numeric_id, or empties every value when @p mode asks for that.
+ *  @brief Removes every key of @p collection, or empties every value when @p mode asks for that.
  *
  *  The keys are collected under a snapshot that is let go before the first write, since a publication
  *  waits on every hold, and they are written back in windows the collection's write buffer admits.
  */
-inline status_t empty_collection(opened_database_t& database, collection_numeric_id_t numeric_id,
+inline status_t empty_collection(opened_database_t& database, collection_id_t collection,
                                  ustore_drop_mode_t mode) noexcept {
     collection_config_t shape;
-    if (status_t const known = database.store->collection_config(numeric_id, shape); known.failed()) return known;
+    if (status_t const known = database.store->collection_config(collection, shape); known.failed()) return known;
 
     st::basic_vector<stored_key_t> keys;
     {
         auto [taken, take_snapshot_status] = database.store->take_snapshot();
         if (take_snapshot_status.failed()) return take_snapshot_status;
-        if (status_t const walked = collect_keys(taken, numeric_id, limit<stored_key_t>::min(), keys); walked.failed())
+        if (status_t const walked = collect_keys(taken, collection, limit<stored_key_t>::min(), keys); walked.failed())
             return walked;
     }
     if (keys.empty()) return {};
@@ -751,7 +705,7 @@ inline status_t empty_collection(opened_database_t& database, collection_numeric
 
     // A window is half the buffer, so one flush always leaves room for the whole of the next one.
     std::size_t const window = std::max<std::size_t>(shape.write_buffer_max_elements / 2, 1);
-    any_collection_id_t const id {numeric_id};
+    any_collection_id_t const id {collection};
     for (std::size_t first = 0; first != keys.size(); first += std::min(window, keys.size() - first)) {
         std::size_t const count = std::min(window, keys.size() - first);
         std::span<stored_key_t const> const named {keys.data() + first, count};
@@ -772,8 +726,8 @@ inline status_t drop_named_collections(opened_database_t& database) noexcept {
     st::basic_vector<collection_ids_t> const listed = database.store->list_collections();
     status_t first;
     for (std::size_t index = 0; index != listed.size(); ++index) {
-        if (reserved(database, listed[index].numeric_id)) continue;
-        if (status_t const dropped = database.store->drop_collection(any_collection_id_t {listed[index].numeric_id});
+        if (reserved(listed[index].id)) continue;
+        if (status_t const dropped = database.store->drop_collection(any_collection_id_t {listed[index].id});
             dropped.failed() && first.succeeded())
             first = dropped;
     }
@@ -919,12 +873,12 @@ inline expected<opened_database_t*> open_database(ustore_database_init_nvme_t co
     if (status_t const mounted = mount_store(*opened, transactions); mounted.failed()) return mounted;
 
     collection_config_t const shape = create_collection_config(collections);
-    auto [main, reserve_main_status] = reserve_collection(*opened->store, main_collection_name_k, shape);
-    if (reserve_main_status.failed()) return reserve_main_status;
-    auto [names, reserve_names_status] = reserve_collection(*opened->store, names_collection_name_k, shape);
-    if (reserve_names_status.failed()) return reserve_names_status;
-    opened->main = main;
-    opened->names = names;
+    status_t const reserved_main = reserve_collection(*opened->store, ustore_collection_main_k, main_collection_name_k,
+                                                      shape);
+    if (reserved_main.failed()) return reserved_main;
+    status_t const reserved_names = reserve_collection(*opened->store, names_collection_k, names_collection_name_k,
+                                                       shape);
+    if (reserved_names.failed()) return reserved_names;
     return opened.release();
 }
 
@@ -968,7 +922,7 @@ void read(ustore_read_t& arguments) noexcept {
     }
     places_arg_t const places = places_of(arguments);
     validate_read(arguments.transaction, places, arguments.options, arguments.error);
-    if (arguments.error->status || refuse_wide_keys(places, arguments.error)) return;
+    if (arguments.error->status) return;
     if (arguments.snapshot) {
         *arguments.error = {ustore_error_unsupported_k, "This engine keeps no snapshots"};
         return;
@@ -994,8 +948,7 @@ void read(ustore_read_t& arguments) noexcept {
     std::size_t used = 0;
     for (std::size_t index = 0; index != places.size(); ++index) {
         place_t const place = places[index];
-        measured[index] = measured_length(database, transaction, numbered(database, place.collection),
-                                          stored_of(place.key));
+        measured[index] = measured_length(database, transaction, place.collection, stored_from_key(place.key));
         starts[index] = static_cast<ustore_length_t>(used);
         presences[index] = measured[index] != ustore_length_missing_k;
         offsets[index] = static_cast<ustore_length_t>(used);
@@ -1013,14 +966,14 @@ void read(ustore_read_t& arguments) noexcept {
     std::span<ustore_length_t const> const widths {measured};
     std::span<ustore_length_t const> const bases {starts};
     if (transaction) {
-        status_t const read = read_through_transaction(database, *transaction, schedule_of(arguments.options), places,
-                                                       bases, widths, tape);
+        status_t const read = read_through_transaction(*transaction, schedule_of(arguments.options), places, bases,
+                                                       widths, tape);
         reported_failure(read, arguments.error);
         return;
     }
 
     st::basic_vector<batch_group_t> groups;
-    if (reported_failure(group_places(database, places, groups), arguments.error)) return;
+    if (reported_failure(group_places(places, groups), arguments.error)) return;
     reported_failure(read_batched(database, groups, bases, widths, tape), arguments.error);
 }
 
@@ -1032,13 +985,13 @@ void write(ustore_write_t& arguments) noexcept {
     places_arg_t const places = places_of(arguments);
     contents_arg_t const contents = contents_of(arguments);
     validate_write(arguments.transaction, places, contents, arguments.options, arguments.error);
-    if (arguments.error->status || refuse_wide_keys(places, arguments.error)) return;
+    if (arguments.error->status) return;
 
     opened_database_t& database = database_of(arguments.db);
     if (opened_transaction_t* const transaction = transaction_of(arguments.transaction)) {
         watch_schedule_t const schedule = schedule_of(arguments.options);
         for (std::size_t index = 0; index != places.size(); ++index)
-            if (reported_failure(stage_one(database, *transaction->held, schedule, places[index], contents[index]),
+            if (reported_failure(stage_one(*transaction->held, schedule, places[index], contents[index]),
                                  arguments.error))
                 return;
         return;
@@ -1081,16 +1034,11 @@ void scan(ustore_scan_t& arguments) noexcept {
         scan_t const scan = scans[task];
         std::size_t const first = tape.size();
 
-        // A key past the storable ones sorts after every stored key, so a scan from it finds nothing
-        if (!storable(scan.min_key)) {
-            tape.close_task(task, first);
-            continue;
-        }
         status_t const walked = walk_collection(
-            taken, numbered(database, scan.collection), stored_of(scan.min_key),
+            taken, scan.collection, stored_from_key(scan.min_key),
             [&](stored_key_t key, select_result_t state, stored_value_size_t) noexcept -> walk_control_t {
                 if (state != select_result_t::success_k) return walk_control_t::resume_k;
-                if (tape.push(key_of_stored(key)) == walk_control_t::halt_k) return walk_control_t::halt_k;
+                if (tape.push(key_from_stored(key)) == walk_control_t::halt_k) return walk_control_t::halt_k;
                 return tape.size() - first == scan.limit ? walk_control_t::halt_k : walk_control_t::resume_k;
             });
         if (reported_failure(walked, arguments.error) || arguments.error->status) return;
@@ -1131,14 +1079,14 @@ void sample(ustore_sample_t& arguments) noexcept {
         std::size_t const first = tape.size();
         std::size_t seen = 0;
         status_t const walked = walk_collection(
-            taken, numbered(database, sample.collection), limit<stored_key_t>::min(),
+            taken, sample.collection, limit<stored_key_t>::min(),
             [&](stored_key_t key, select_result_t state, stored_value_size_t) noexcept -> walk_control_t {
                 if (state != select_result_t::success_k) return walk_control_t::resume_k;
                 std::size_t const slot = seen < sample.limit ? seen : generator() % (seen + 1);
                 ++seen;
                 if (slot >= sample.limit) return walk_control_t::resume_k;
-                if (slot == tape.size() - first) return tape.push(key_of_stored(key));
-                tape[first + slot] = key_of_stored(key);
+                if (slot == tape.size() - first) return tape.push(key_from_stored(key));
+                tape[first + slot] = key_from_stored(key);
                 return walk_control_t::resume_k;
             });
         if (reported_failure(walked, arguments.error) || arguments.error->status) return;
@@ -1191,25 +1139,19 @@ void measure(ustore_measure_t& arguments) noexcept {
         auto const index = static_cast<std::ptrdiff_t>(task);
         ustore_collection_id_t const collection = collections ? collections[index] : ustore_collection_main_k;
 
-        // A bound past the storable keys sorts after every stored key: a window starting there holds nothing, and one
-        // ending there runs to the last stored key
-        bool const beyond = start_keys && !storable(start_keys[index]);
-        stored_key_t const lower = start_keys && !beyond ? stored_of(start_keys[index]) : limit<stored_key_t>::min();
-        stored_key_t const last = end_keys && storable(end_keys[index]) ? stored_of(end_keys[index])
-                                                                        : limit<stored_key_t>::max();
+        stored_key_t const lower = start_keys ? stored_from_key(start_keys[index]) : limit<stored_key_t>::min();
+        stored_key_t const last = end_keys ? stored_from_key(end_keys[index]) : limit<stored_key_t>::max();
         std::size_t cardinality = 0;
         std::size_t value_bytes = 0;
-        status_t const walked = beyond ? status_t {}
-                                       : walk_collection(taken, numbered(database, collection), lower,
-                                                         [&](stored_key_t key, select_result_t state,
-                                                             stored_value_size_t size) noexcept -> walk_control_t {
-                                                             if (last < key) return walk_control_t::halt_k;
-                                                             if (state != select_result_t::success_k)
-                                                                 return walk_control_t::resume_k;
-                                                             ++cardinality;
-                                                             value_bytes += size;
-                                                             return walk_control_t::resume_k;
-                                                         });
+        status_t const walked = walk_collection(
+            taken, collection, lower,
+            [&](stored_key_t key, select_result_t state, stored_value_size_t size) noexcept -> walk_control_t {
+                if (last < key) return walk_control_t::halt_k;
+                if (state != select_result_t::success_k) return walk_control_t::resume_k;
+                ++cardinality;
+                value_bytes += size;
+                return walk_control_t::resume_k;
+            });
         if (reported_failure(walked, arguments.error)) return;
 
         min_cardinalities[task] = cardinality;
@@ -1238,15 +1180,14 @@ void collection_list(ustore_collection_list_t& arguments) noexcept {
     st::basic_vector<collection_ids_t> const listed = database.store->list_collections();
     std::size_t named = 0;
     for (std::size_t index = 0; index != listed.size(); ++index)
-        if (!reserved(database, listed[index].numeric_id)) ++named;
+        if (!reserved(listed[index].id)) ++named;
 
     range_or_dummy<std::span<ustore_collection_id_t>> collections = arena.alloc_or_dummy(named, arguments.error,
                                                                                          arguments.collections);
     if (arguments.error->status) return;
     std::size_t written = 0;
     for (std::size_t index = 0; index != listed.size(); ++index)
-        if (!reserved(database, listed[index].numeric_id))
-            collections[written++] = collection_id_of(listed[index].numeric_id);
+        if (!reserved(listed[index].id)) collections[written++] = listed[index].id;
     *arguments.count = static_cast<ustore_size_t>(named);
 }
 
@@ -1263,18 +1204,18 @@ void collection_create(ustore_collection_create_t& arguments) noexcept {
     opened_database_t& database = database_of(arguments.db);
     user_collection_config_t const& shape = database.collection_defaults;
 
-    // A collection is addressed by its number, so this name never leaves the engine and only has to be free.
-    char name[collection_name_max_bytes_k];
-    for (std::size_t suffix = database.store->size();; ++suffix) {
-        auto const written = fmt::format_to_n(name, sizeof(name) - 1, "collection_{}", suffix);
-        *written.out = '\0';
-        if (!database.store->has_collection(any_collection_id_t {collection_alphanumeric_id_t {name}})) break;
+    ustore_collection_id_t created {};
+    if (!mint_collection_id(created)) {
+        *arguments.error = {ustore_error_internal_k, "The system gave no entropy for a collection identifier"};
+        return;
     }
-
-    auto [created, create_collection_status] = database.store->create_collection(string_view_t {name},
-                                                                                 create_collection_config(shape));
-    if (reported_failure(create_collection_status, arguments.error)) return;
-    *arguments.collection = collection_id_of(created);
+    // A collection is addressed by its UUID, so its name inside NVMe never leaves the engine and is the UUID's text
+    char name[uuid_text_length_k];
+    uuid_to_text(created.uuid, name);
+    status_t const created_status = database.store->create_collection(created, string_view_t {name, sizeof(name)},
+                                                                      create_collection_config(shape));
+    if (reported_failure(created_status, arguments.error)) return;
+    *arguments.collection = created;
 }
 
 void collection_drop(ustore_collection_drop_t& arguments) noexcept {
@@ -1289,16 +1230,16 @@ void collection_drop(ustore_collection_drop_t& arguments) noexcept {
     }
 
     opened_database_t& database = database_of(arguments.db);
-    collection_numeric_id_t const numeric_id = numbered(database, arguments.collection);
+    collection_id_t const collection = arguments.collection;
     if (arguments.mode == ustore_drop_keys_vals_handle_k) {
-        if (reserved(database, numeric_id)) {
+        if (reserved(collection)) {
             *arguments.error = {ustore_error_invalid_argument_k, "This collection can only be cleared"};
             return;
         }
-        reported_failure(database.store->drop_collection(any_collection_id_t {numeric_id}), arguments.error);
+        reported_failure(database.store->drop_collection(any_collection_id_t {collection}), arguments.error);
         return;
     }
-    reported_failure(empty_collection(database, numeric_id, arguments.mode), arguments.error);
+    reported_failure(empty_collection(database, collection, arguments.mode), arguments.error);
 }
 
 void snapshot_init(ustore_snapshot_init_t& arguments) noexcept {
@@ -1395,16 +1336,18 @@ void database_control(ustore_database_control_t& arguments) noexcept {
         return;
     }
     if (request == "clear") {
-        if (reported_failure(empty_collection(database, database.main, ustore_drop_keys_vals_k), arguments.error))
+        if (reported_failure(empty_collection(database, ustore_collection_main_k, ustore_drop_keys_vals_k),
+                             arguments.error))
             return;
-        reported_failure(empty_collection(database, database.names, ustore_drop_keys_vals_k), arguments.error);
+        reported_failure(empty_collection(database, names_collection_k, ustore_drop_keys_vals_k), arguments.error);
         return;
     }
     if (request == "reset") {
         if (reported_failure(drop_named_collections(database), arguments.error)) return;
-        if (reported_failure(empty_collection(database, database.main, ustore_drop_keys_vals_k), arguments.error))
+        if (reported_failure(empty_collection(database, ustore_collection_main_k, ustore_drop_keys_vals_k),
+                             arguments.error))
             return;
-        reported_failure(empty_collection(database, database.names, ustore_drop_keys_vals_k), arguments.error);
+        reported_failure(empty_collection(database, names_collection_k, ustore_drop_keys_vals_k), arguments.error);
         return;
     }
     if (request == "usage") {

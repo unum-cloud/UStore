@@ -30,7 +30,7 @@
 #include "nvme/io_channel.hpp"          // `io_channel_t`
 #include "nvme/key_slot.hpp"            // `key_slot`
 #include "nvme/stored_value.hpp"        // `stored_value_size_t`
-#include "nvme/types.hpp"               // `collection_numeric_id_t`, `value_layout_t`, `string_t`
+#include "nvme/types.hpp"               // `collection_id_t`, `value_layout_t`, `string_t`
 
 namespace unum::ustore::nvme {
 
@@ -53,8 +53,8 @@ class database_snapshot {
     /** The volume every run of every held collection lives on. */
     using volume_t = volume_type_;
 
-    /** A collection named by its number or by its name, which is how every call addresses one. */
-    using any_collection_id_t = std::variant<collection_numeric_id_t, collection_alphanumeric_id_t>;
+    /** A collection named by its ID or by its name, which is how every call addresses one. */
+    using any_collection_id_t = std::variant<collection_id_t, collection_alphanumeric_id_t>;
 
     /** One held level set of a collection whose values follow @p value_layout_. */
     template <value_layout_t value_layout_>
@@ -73,8 +73,8 @@ class database_snapshot {
     /** One collection of the snapshot: the names it answers to, and the level set it holds. */
     struct held_collection_t {
 
-        /** The number the database addresses the collection by. */
-        collection_numeric_id_t numeric_id = collection_invalid_numeric_id_k;
+        /** The UUID the database addresses the collection by. */
+        collection_id_t id = collection_invalid_id_k;
 
         /** The name the database addresses the collection by. */
         string_t name;
@@ -101,14 +101,14 @@ class database_snapshot {
     }
 
     /**
-     *  @brief Takes @p levels in under @p numeric_id and @p name, in room @c reserve took.
-     *  @param[in] numeric_id The number the database addresses the collection by.
+     *  @brief Takes @p levels in under @p collection_id and @p name, in room @c reserve took.
+     *  @param[in] collection_id The UUID the database addresses the collection by.
      *  @param[in] name The name the database addresses the collection by.
      *  @param[in] levels The level set already held, moved in and released when the snapshot dies.
      */
-    status_t hold(collection_numeric_id_t numeric_id, string_view_t name, any_collection_snapshot_t&& levels) noexcept {
+    status_t hold(collection_id_t collection_id, string_view_t name, any_collection_snapshot_t&& levels) noexcept {
         held_collection_t taken;
-        taken.numeric_id = numeric_id;
+        taken.id = collection_id;
         if (!taken.name.try_assign(name))
             return {status_code_t::out_of_memory_k, "A snapshot could not hold a collection's name"};
         taken.levels = std::move(levels);
@@ -145,7 +145,7 @@ class database_snapshot {
 
     /**
      *  @brief Whether the held levels of @p id carry @p stored_key, and how many bytes its value takes.
-     *  @param[in] id The collection to look in, named by its number or by its name.
+     *  @param[in] id The collection to look in, named by its ID or by its name.
      *  @param[in] stored_key The key to look for.
      *  @param[out] size Bytes the value takes, which is zero for anything but @c success_k.
      */
@@ -160,7 +160,7 @@ class database_snapshot {
     /**
      *  @brief Copies the value @p id held for @p stored_key into @p into, which needs only the value's bytes.
      *  @param[inout] channel The channel the read is submitted and completed on, held by the calling thread.
-     *  @param[in] id The collection to read from, named by its number or by its name.
+     *  @param[in] id The collection to read from, named by its ID or by its name.
      *  @param[in] stored_key The key to read.
      *  @param[out] into Where the value lands, which need not be aligned and need not be registered.
      *  @param[out] size Bytes written, which is zero for every failure.
@@ -182,9 +182,9 @@ class database_snapshot {
 
     /** The collection @p id names, or null when the snapshot holds none. */
     [[nodiscard]] held_collection_t const* held_at_(any_collection_id_t const& id) const noexcept {
-        if (collection_numeric_id_t const* const numbered = std::get_if<collection_numeric_id_t>(&id)) {
+        if (collection_id_t const* const identified = std::get_if<collection_id_t>(&id)) {
             for (std::size_t index = 0; index != held_.size(); ++index)
-                if (held_[index].numeric_id == *numbered) return &held_[index];
+                if (held_[index].id == *identified) return &held_[index];
             return nullptr;
         }
         collection_alphanumeric_id_t const& named = std::get<collection_alphanumeric_id_t>(id);

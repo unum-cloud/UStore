@@ -27,8 +27,9 @@
 #include <smashtable/basic_hash_table.hpp> // `st::hash_map`, `st::assume_reserved_t`
 #include <smashtable/basic_vector.hpp>     // `st::basic_vector`
 
-#include "nvme/resources.hpp" // `resources_shared_ptr_t`
-#include "nvme/types.hpp"     // `transaction_id_t`, `constrained_allocator`
+#include "nvme/resources.hpp"  // `resources_shared_ptr_t`
+#include "nvme/stored_key.hpp" // `stored_key_hash_t`
+#include "nvme/types.hpp"      // `transaction_id_t`, `constrained_allocator`
 
 namespace unum::ustore::nvme {
 
@@ -59,9 +60,9 @@ inline constexpr transaction_stamp_t invalid_transaction_stamp_k = std::numeric_
  *  record has no keys to compare against and a clustered hash would turn neighbours into conflicts.
  */
 template <typename stored_key_>
-inline std::uint64_t watched_key_fingerprint(collection_numeric_id_t group_id, stored_key_ const& stored_key) noexcept {
-    std::uint64_t mixed = static_cast<std::uint64_t>(st::hash<stored_key_> {}(stored_key)) ^
-                          (static_cast<std::uint64_t>(group_id) * 0x9e3779b97f4a7c15ull);
+inline std::uint64_t watched_key_fingerprint(collection_id_t group_id, stored_key_ const& stored_key) noexcept {
+    std::uint64_t mixed = static_cast<std::uint64_t>(stored_key_hash_t {}(stored_key)) ^
+                          (static_cast<std::uint64_t>(collection_id_hash_t {}(group_id)) * 0x9e3779b97f4a7c15ull);
     mixed ^= mixed >> 33;
     mixed *= 0xff51afd7ed558ccdull;
     mixed ^= mixed >> 33;
@@ -71,7 +72,7 @@ inline std::uint64_t watched_key_fingerprint(collection_numeric_id_t group_id, s
 }
 
 /** The collection identifier a registry serving one collection records its keys under. */
-inline constexpr collection_numeric_id_t sole_collection_id_k = 0;
+inline constexpr collection_id_t sole_collection_id_k {};
 
 #pragma endregion Ordering
 
@@ -144,7 +145,7 @@ class read_set {
     };
 
     using stored_keys_t =
-        st::hash_map<stored_key_t, watch_t, st::hash<stored_key_t>, st::equal_to_t, constrained_allocator<std::byte>>;
+        st::hash_map<stored_key_t, watch_t, stored_key_hash_t, st::equal_to_t, constrained_allocator<std::byte>>;
 
     /** A set charging @p resources for the keys it holds. */
     explicit read_set(resources_shared_ptr_t const& resources) noexcept

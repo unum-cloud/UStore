@@ -31,7 +31,7 @@
 #include "nvme/database_transaction_state.hpp"    // `database_transaction_state`
 #include "nvme/read_set.hpp"                      // `transaction_stamp_t`, `watch_schedule_t`, `watch_purpose_t`
 #include "nvme/stored_value.hpp"                  // `stored_value_size_t`, `stored_value_view_t`
-#include "nvme/types.hpp"                         // `collection_numeric_id_t`, `transaction_id_t`
+#include "nvme/types.hpp"                         // `collection_id_t`, `transaction_id_t`
 
 namespace unum::ustore::nvme {
 
@@ -67,7 +67,7 @@ class database_transaction {
     /** The uncommitted writes alone, grouped by the collection they belong to. */
     using write_buffer_t = typename state_t::write_buffer_t;
 
-    /** A collection named by its number or by its name, which is how every call addresses one. */
+    /** A collection named by its ID or by its name, which is how every call addresses one. */
     using any_collection_id_t = typename store_t::any_collection_id_t;
 
 #pragma endregion Types
@@ -155,20 +155,20 @@ class database_transaction {
 
     /**
      *  @brief Watches @p stored_keys of @p id for conflicts, without reading or writing any of them.
-     *  @param[in] id The collection the keys belong to, named by its number or by its name.
+     *  @param[in] id The collection the keys belong to, named by its ID or by its name.
      *  @param[in] stored_keys The keys to watch, which are dropped by a commit and by a rollback.
      */
     template <watch_schedule_t watch_schedule_ = watch_schedule_t::default_k>
     status_t watch_more(any_collection_id_t const& id, std::span<stored_key_t const> stored_keys) noexcept {
         if (phase_ != phase_t::started_k) return {status_code_t::invalid_argument_k, "That transaction is staged"};
-        collection_numeric_id_t const numeric_id = resolve_(id).numeric_id;
-        if (numeric_id == collection_invalid_numeric_id_k)
+        collection_id_t const collection_id = resolve_(id).id;
+        if (collection_id == collection_invalid_id_k)
             return {status_code_t::not_found_k, "The store names no such collection"};
 
-        if (status_t const prepared = watch_now_or_prepare_for_later_<watch_schedule_>(numeric_id, stored_keys);
+        if (status_t const prepared = watch_now_or_prepare_for_later_<watch_schedule_>(collection_id, stored_keys);
             prepared.failed())
             return prepared;
-        watch_later_<watch_schedule_>(numeric_id, stored_keys, watch_stamp_for_<watch_schedule_>(),
+        watch_later_<watch_schedule_>(collection_id, stored_keys, watch_stamp_for_<watch_schedule_>(),
                                       watch_purpose_t::track_k);
         return {};
     }
@@ -183,10 +183,10 @@ class database_transaction {
         return manager_.has_collection_(id);
     }
 
-    /** The number @p id resolves to, or @c collection_invalid_numeric_id_k when it names nothing. */
-    [[nodiscard]] collection_numeric_id_t collection_numeric_id(any_collection_id_t const& id) const noexcept {
-        if (!idle_()) return collection_invalid_numeric_id_k;
-        return resolve_(id).numeric_id;
+    /** The ID @p id resolves to, or @c collection_invalid_id_k when it names nothing. */
+    [[nodiscard]] collection_id_t collection_id(any_collection_id_t const& id) const noexcept {
+        if (!idle_()) return collection_invalid_id_k;
+        return resolve_(id).id;
     }
 
     /** The name and the number of every collection of the store. */
@@ -215,20 +215,20 @@ class database_transaction {
     status_t insert(any_collection_id_t const& id, stored_key_t stored_key, stored_value_view_t stored_value) noexcept {
         if (phase_ != phase_t::started_k) return {status_code_t::invalid_argument_k, "That transaction is staged"};
         resolved_collection_t const named = resolve_(id);
-        collection_numeric_id_t const numeric_id = named.numeric_id;
-        if (numeric_id == collection_invalid_numeric_id_k)
+        collection_id_t const collection_id = named.id;
+        if (collection_id == collection_invalid_id_k)
             return {status_code_t::not_found_k, "The store names no such collection"};
 
         std::array<stored_key_t, 1> const alone {stored_key};
         std::span<stored_key_t const> const watched {alone};
-        if (status_t const prepared = watch_now_or_prepare_for_later_<watch_schedule_>(numeric_id, watched);
+        if (status_t const prepared = watch_now_or_prepare_for_later_<watch_schedule_>(collection_id, watched);
             prepared.failed())
             return prepared;
 
         transaction_stamp_t const from = watch_stamp_for_<watch_schedule_>();
-        status_t const written = data_.changes.add(numeric_id, group_config_of_(named.config), stored_key,
+        status_t const written = data_.changes.add(collection_id, group_config_of_(named.config), stored_key,
                                                    stored_value);
-        if (written.succeeded()) watch_later_<watch_schedule_>(numeric_id, watched, from, watch_purpose_t::write_k);
+        if (written.succeeded()) watch_later_<watch_schedule_>(collection_id, watched, from, watch_purpose_t::write_k);
         return written;
     }
 
@@ -237,19 +237,20 @@ class database_transaction {
     status_t remove(any_collection_id_t const& id, stored_key_t stored_key) noexcept {
         if (phase_ != phase_t::started_k) return {status_code_t::invalid_argument_k, "That transaction is staged"};
         resolved_collection_t const named = resolve_(id);
-        collection_numeric_id_t const numeric_id = named.numeric_id;
-        if (numeric_id == collection_invalid_numeric_id_k)
+        collection_id_t const collection_id = named.id;
+        if (collection_id == collection_invalid_id_k)
             return {status_code_t::not_found_k, "The store names no such collection"};
 
         std::array<stored_key_t, 1> const alone {stored_key};
         std::span<stored_key_t const> const watched {alone};
-        if (status_t const prepared = watch_now_or_prepare_for_later_<watch_schedule_>(numeric_id, watched);
+        if (status_t const prepared = watch_now_or_prepare_for_later_<watch_schedule_>(collection_id, watched);
             prepared.failed())
             return prepared;
 
         transaction_stamp_t const from = watch_stamp_for_<watch_schedule_>();
-        status_t const written = data_.changes.mark_as_removed(numeric_id, group_config_of_(named.config), stored_key);
-        if (written.succeeded()) watch_later_<watch_schedule_>(numeric_id, watched, from, watch_purpose_t::write_k);
+        status_t const written = data_.changes.mark_as_removed(collection_id, group_config_of_(named.config),
+                                                               stored_key);
+        if (written.succeeded()) watch_later_<watch_schedule_>(collection_id, watched, from, watch_purpose_t::write_k);
         return written;
     }
 
@@ -282,29 +283,29 @@ class database_transaction {
     /** Whether this transaction's own buffer carries @p stored_key of @p id. */
     [[nodiscard]] bool contains_uncommitted(any_collection_id_t const& id, stored_key_t stored_key) const noexcept {
         if (!idle_()) return false;
-        collection_numeric_id_t const numeric_id = resolve_(id).numeric_id;
-        if (numeric_id == collection_invalid_numeric_id_k) return false;
-        return data_.changes.status(numeric_id, stored_key) == write_buffer_status_t::found_k;
+        collection_id_t const collection_id = resolve_(id).id;
+        if (collection_id == collection_invalid_id_k) return false;
+        return data_.changes.status(collection_id, stored_key) == write_buffer_status_t::found_k;
     }
 
     /** Bytes the value this transaction wrote for @p stored_key takes. */
     status_t stored_value_size_uncommitted(any_collection_id_t const& id, stored_key_t stored_key,
                                            stored_value_size_t& size) const noexcept {
         if (!idle_()) return {status_code_t::invalid_argument_k, "That transaction is staged"};
-        collection_numeric_id_t const numeric_id = resolve_(id).numeric_id;
-        if (numeric_id == collection_invalid_numeric_id_k)
+        collection_id_t const collection_id = resolve_(id).id;
+        if (collection_id == collection_invalid_id_k)
             return {status_code_t::not_found_k, "The store names no such collection"};
-        return data_.changes.stored_value_size(numeric_id, stored_key, size);
+        return data_.changes.stored_value_size(collection_id, stored_key, size);
     }
 
     /** Copies the value this transaction wrote for @p stored_key into @p into. */
     status_t select_uncommitted(any_collection_id_t const& id, stored_key_t stored_key, stored_value_span_t into,
                                 stored_value_size_t& size) const noexcept {
         if (!idle_()) return {status_code_t::invalid_argument_k, "That transaction is staged"};
-        collection_numeric_id_t const numeric_id = resolve_(id).numeric_id;
-        if (numeric_id == collection_invalid_numeric_id_k)
+        collection_id_t const collection_id = resolve_(id).id;
+        if (collection_id == collection_invalid_id_k)
             return {status_code_t::not_found_k, "The store names no such collection"};
-        return data_.changes.select(numeric_id, stored_key, into, size);
+        return data_.changes.select(collection_id, stored_key, into, size);
     }
 
     /** Whether the store carries @p stored_key of @p id, ignoring what this transaction wrote. */
@@ -322,7 +323,7 @@ class database_transaction {
 
     /**
      *  @brief Reads @p stored_key of @p id out of the store and watches it for conflicts.
-     *  @param[in] id The collection to read from, named by its number or by its name.
+     *  @param[in] id The collection to read from, named by its ID or by its name.
      *  @param[in] stored_key The key to read.
      *  @param[out] into Where the value lands, which need not be aligned and need not be registered.
      *  @param[out] size Bytes written, which is zero for every failure.
@@ -333,19 +334,19 @@ class database_transaction {
     status_t select_committed(any_collection_id_t const& id, stored_key_t stored_key, stored_value_span_t into,
                               stored_value_size_t& size) const noexcept {
         if (phase_ != phase_t::started_k) return {status_code_t::invalid_argument_k, "That transaction is staged"};
-        collection_numeric_id_t const numeric_id = resolve_(id).numeric_id;
-        if (numeric_id == collection_invalid_numeric_id_k)
+        collection_id_t const collection_id = resolve_(id).id;
+        if (collection_id == collection_invalid_id_k)
             return {status_code_t::not_found_k, "The store names no such collection"};
 
         transaction_stamp_t const from = watch_stamp_for_<watch_schedule_>();
-        if (status_t const read = manager_.select_(numeric_id, stored_key, into, size); read.failed()) return read;
+        if (status_t const read = manager_.select_(collection_id, stored_key, into, size); read.failed()) return read;
 
         std::array<stored_key_t, 1> const alone {stored_key};
         std::span<stored_key_t const> const watched {alone};
-        if (status_t const prepared = watch_now_or_prepare_for_later_<watch_schedule_>(numeric_id, watched);
+        if (status_t const prepared = watch_now_or_prepare_for_later_<watch_schedule_>(collection_id, watched);
             prepared.failed())
             return prepared;
-        watch_later_<watch_schedule_>(numeric_id, watched, from, watch_purpose_t::read_k);
+        watch_later_<watch_schedule_>(collection_id, watched, from, watch_purpose_t::read_k);
         return {};
     }
 
@@ -387,8 +388,8 @@ class database_transaction {
     /** What one lookup of a collection answered, which the next lookup of the same one reuses. */
     struct resolved_collection_t {
 
-        /** The number the collection answers to, invalid when the store names no such collection. */
-        collection_numeric_id_t numeric_id = collection_invalid_numeric_id_k;
+        /** The ID the collection answers to, invalid when the store names no such collection. */
+        collection_id_t id = collection_invalid_id_k;
 
         /** The value widths that collection admits, which every write of it is checked against. */
         group_config_t config {};
@@ -409,23 +410,23 @@ class database_transaction {
 
     /**
      *  @brief What @p id resolves to, taken from the last answer while the catalog has not moved.
-     *  @param[in] id The collection to resolve, named by its number or by its name.
-     *  @return Its number and its widths, the number invalid when the store names no such collection.
+     *  @param[in] id The collection to resolve, named by its ID or by its name.
+     *  @return Its ID and its widths, the ID invalid when the store names no such collection.
      *
      *  @note One catalog lookup answers both, and a run of calls over one collection takes one lookup
      *      rather than one per key; a create or a drop moves the version and the next call reads again.
      */
     [[nodiscard]] resolved_collection_t resolve_(any_collection_id_t const& id) const noexcept {
         std::uint64_t const version = store_().catalog_version();
-        collection_numeric_id_t const* const numbered = std::get_if<collection_numeric_id_t>(&id);
-        if (numbered != nullptr && resolved_.numeric_id != collection_invalid_numeric_id_k &&
-            *numbered == resolved_.numeric_id && version == resolved_.catalog_version)
+        collection_id_t const* const identified = std::get_if<collection_id_t>(&id);
+        if (identified != nullptr && resolved_.id != collection_invalid_id_k && *identified == resolved_.id &&
+            version == resolved_.catalog_version)
             return resolved_;
 
-        collection_numeric_id_t numeric_id = collection_invalid_numeric_id_k;
+        collection_id_t collection_id = collection_invalid_id_k;
         collection_config_t shape;
-        if (store_().resolve_collection(id, numeric_id, shape).failed()) return resolved_collection_t {};
-        resolved_.numeric_id = numeric_id;
+        if (store_().resolve_collection(id, collection_id, shape).failed()) return resolved_collection_t {};
+        resolved_.id = collection_id;
         resolved_.config = group_config_t {shape.lsm_tree.lsm_level_0.sorted_run.value_size,
                                            shape.lsm_tree.lsm_level_0.sorted_run.value_max_size};
         resolved_.catalog_version = version;
@@ -434,7 +435,7 @@ class database_transaction {
 
     /** Answers the write buffer with @p widths, which the caller resolved in the same lookup. */
     [[nodiscard]] static auto group_config_of_(group_config_t widths) noexcept {
-        return [widths](collection_numeric_id_t, group_config_t& config) noexcept {
+        return [widths](collection_id_t, group_config_t& config) noexcept {
             config = widths;
             return status_t {};
         };
@@ -451,24 +452,24 @@ class database_transaction {
 
     /** Checks @p stored_keys right away, or makes the room a later watch of them needs. */
     template <watch_schedule_t watch_schedule_>
-    status_t watch_now_or_prepare_for_later_(collection_numeric_id_t numeric_id,
+    status_t watch_now_or_prepare_for_later_(collection_id_t collection_id,
                                              std::span<stored_key_t const> stored_keys) const noexcept {
         if constexpr (watch_schedule_ == watch_schedule_t::now_k)
-            return manager_.watch_now_(start_stamp_, numeric_id, stored_keys);
+            return manager_.watch_now_(start_stamp_, collection_id, stored_keys);
         else if constexpr (watch_schedule_ == watch_schedule_t::on_commit_k ||
                            watch_schedule_ == watch_schedule_t::on_commit_since_operation_k)
-            return data_.read_set.reserve_more(numeric_id, stored_keys.size());
+            return data_.read_set.reserve_more(collection_id, stored_keys.size());
         else return {};
     }
 
     /** Records every key of @p stored_keys as watched from @p from, in room the step above took. */
     template <watch_schedule_t watch_schedule_>
-    void watch_later_(collection_numeric_id_t numeric_id, std::span<stored_key_t const> stored_keys,
+    void watch_later_(collection_id_t collection_id, std::span<stored_key_t const> stored_keys,
                       transaction_stamp_t from, watch_purpose_t purpose) const noexcept {
         if constexpr (watch_schedule_ == watch_schedule_t::on_commit_k ||
                       watch_schedule_ == watch_schedule_t::on_commit_since_operation_k)
             for (stored_key_t const& stored_key : stored_keys)
-                data_.read_set.add(numeric_id, stored_key, from, purpose, st::assume_reserved_t {});
+                data_.read_set.add(collection_id, stored_key, from, purpose, st::assume_reserved_t {});
     }
 
 #pragma endregion Private Methods

@@ -52,7 +52,7 @@ constexpr std::uint64_t shallow_level_bytes_k = 64ull * 1024ull;
 
 /** The keys every case of this suite drives, and the two ways a collection is named. */
 using stored_key_t = std::uint64_t;
-using any_collection_id_t = std::variant<collection_numeric_id_t, collection_alphanumeric_id_t>;
+using any_collection_id_t = std::variant<collection_id_t, collection_alphanumeric_id_t>;
 
 /** The router, the database and its transactions every case drives over the volume of @p fixture_type_. */
 template <typename fixture_type_>
@@ -100,6 +100,16 @@ struct database_types {
     return config;
 }
 
+/** Creates the collection @p name in @p store under an ID minted for it, answering the ID or why it was refused. */
+template <typename store_type_>
+expected<collection_id_t> create_named(store_type_& store, string_view_t name,
+                                       collection_config_t const& config) noexcept {
+    collection_id_t collection_id;
+    std::memcpy(collection_id.uuid.bytes, uuid_generator().bytes, sizeof(collection_id.uuid.bytes));
+    if (status_t const created = store.create_collection(collection_id, name, config); created.failed()) return created;
+    return collection_id;
+}
+
 /** The transaction shape every case creates, which holds a whole case's writes. */
 [[nodiscard]] database_config_t test_database_config() noexcept {
     database_config_t config;
@@ -129,13 +139,13 @@ struct database_types {
 struct painted_collections_t {
 
     /** The inline collection, whose value is one counter. */
-    collection_numeric_id_t numbers = collection_invalid_numeric_id_k;
+    collection_id_t numbers = collection_invalid_id_k;
 
     /** The variable-width collection, whose values differ in length from key to key. */
-    collection_numeric_id_t blobs = collection_invalid_numeric_id_k;
+    collection_id_t blobs = collection_invalid_id_k;
 
     /** The fixed-width collection, whose values are always the same length. */
-    collection_numeric_id_t fixed = collection_invalid_numeric_id_k;
+    collection_id_t fixed = collection_invalid_id_k;
 };
 
 /** Writes @p key into all three collections of @p store, painted from @p round. */
@@ -290,19 +300,19 @@ std::size_t named_collections_round_trip(mount_type_ const& mount) {
     if (!stack) return failures;
     database_t& store = *(*stack)->store;
 
-    expected<collection_numeric_id_t> const numbers = store.create_collection("numbers", test_config(8, 0));
-    expected<collection_numeric_id_t> const blobs = store.create_collection("blobs", test_config(0, value_max_size_k));
-    expected<collection_numeric_id_t> const fixed = store.create_collection("fixed", test_config(512, 0));
+    expected<collection_id_t> const numbers = create_named(store, "numbers", test_config(8, 0));
+    expected<collection_id_t> const blobs = create_named(store, "blobs", test_config(0, value_max_size_k));
+    expected<collection_id_t> const fixed = create_named(store, "fixed", test_config(512, 0));
     failures += expect(numbers.has_value());
     failures += expect(blobs.has_value());
     failures += expect(fixed.has_value());
     if (failures != 0) return failures;
 
     // A name is taken once, and a collection nobody created is named by nothing.
-    failures += expect_status(store.create_collection("numbers", test_config(8, 0)), status_code_t::already_exists_k);
+    failures += expect_status(create_named(store, "numbers", test_config(8, 0)), status_code_t::already_exists_k);
     failures += expect(store.has_collection(any_collection_id_t {string_t {"blobs"}}));
     failures += expect(!store.has_collection(any_collection_id_t {string_t {"missing"}}));
-    failures += expect_eq(store.collection_numeric_id(any_collection_id_t {string_t {"numbers"}}), *numbers);
+    failures += expect_eq(store.collection_id(any_collection_id_t {string_t {"numbers"}}), *numbers);
     failures += expect_eq(store.list_collections().size(), std::size_t {3});
     failures += expect_eq(store.size(), std::size_t {3});
 
@@ -408,9 +418,9 @@ std::size_t catalog_survives_reopen(mount_type_ const& mount) {
     blobs_config.lsm_tree.lsm_level_0.max_bytes = shallow_level_bytes_k;
     fixed_config.lsm_tree.lsm_level_0.max_bytes = shallow_level_bytes_k;
 
-    expected<collection_numeric_id_t> const numbers = (*stack)->store->create_collection("numbers", numbers_config);
-    expected<collection_numeric_id_t> const blobs = (*stack)->store->create_collection("blobs", blobs_config);
-    expected<collection_numeric_id_t> const fixed = (*stack)->store->create_collection("fixed", fixed_config);
+    expected<collection_id_t> const numbers = create_named(*(*stack)->store, "numbers", numbers_config);
+    expected<collection_id_t> const blobs = create_named(*(*stack)->store, "blobs", blobs_config);
+    expected<collection_id_t> const fixed = create_named(*(*stack)->store, "fixed", fixed_config);
     failures += expect(numbers.has_value());
     failures += expect(blobs.has_value());
     failures += expect(fixed.has_value());
@@ -459,8 +469,8 @@ std::size_t catalog_survives_reopen(mount_type_ const& mount) {
     database_t& store = **reopened;
 
     failures += expect_eq(store.size(), std::size_t {3});
-    failures += expect_eq(store.collection_numeric_id(any_collection_id_t {string_t {"numbers"}}), *numbers);
-    failures += expect_eq(store.collection_numeric_id(any_collection_id_t {string_t {"blobs"}}), *blobs);
+    failures += expect_eq(store.collection_id(any_collection_id_t {string_t {"numbers"}}), *numbers);
+    failures += expect_eq(store.collection_id(any_collection_id_t {string_t {"blobs"}}), *blobs);
     failures += expect(store.collection_name(*blobs) == string_t {"blobs"});
 
     collection_config_t restored;
@@ -501,9 +511,8 @@ std::size_t dropped_collection_is_gone(mount_type_ const& mount) {
     if (!stack) return failures;
     volume_t& volume = (*stack)->router.volume(volume_id_t {0});
 
-    expected<collection_numeric_id_t> const kept = (*stack)->store->create_collection("kept", test_config(8, 0));
-    expected<collection_numeric_id_t> const doomed = (*stack)->store->create_collection(
-        "doomed", test_config(0, value_max_size_k));
+    expected<collection_id_t> const kept = create_named(*(*stack)->store, "kept", test_config(8, 0));
+    expected<collection_id_t> const doomed = create_named(*(*stack)->store, "doomed", test_config(0, value_max_size_k));
     failures += expect(kept.has_value());
     failures += expect(doomed.has_value());
     if (failures != 0) return failures;
@@ -548,8 +557,7 @@ std::size_t dropped_collection_is_gone(mount_type_ const& mount) {
     failures += expect((*again)->has_collection(any_collection_id_t {string_t {"kept"}}));
 
     // The bytes the dropped runs held are handed out again rather than lost to the catalog.
-    expected<collection_numeric_id_t> const fresh = (*again)->create_collection("fresh",
-                                                                                test_config(0, value_max_size_k));
+    expected<collection_id_t> const fresh = create_named(**again, "fresh", test_config(0, value_max_size_k));
     failures += expect(fresh.has_value());
     if (!fresh) return failures;
     for (std::size_t index = 0; index != 400; ++index) {
@@ -585,7 +593,7 @@ std::size_t crash_between_seal_and_schema(mount_type_ const& mount) {
         if (!stack) return failures;
         volume_t& volume = (*stack)->router.volume(volume_id_t {0});
 
-        expected<collection_numeric_id_t> const lost = (*stack)->store->create_collection("lost", test_config(8, 0));
+        expected<collection_id_t> const lost = create_named(*(*stack)->store, "lost", test_config(8, 0));
         failures += expect(lost.has_value());
         if (!lost) return failures;
         for (std::uint64_t key = 0; key != 200; ++key) {
@@ -625,7 +633,7 @@ std::size_t crash_between_seal_and_schema(mount_type_ const& mount) {
         failures += expect_eq(run_bytes_of(volume), wasted);
 
         // The volume is still a volume: a fresh collection writes, flushes and answers over it.
-        expected<collection_numeric_id_t> const fresh = (*reopened)->create_collection("fresh", test_config(8, 0));
+        expected<collection_id_t> const fresh = create_named(**reopened, "fresh", test_config(8, 0));
         failures += expect(fresh.has_value());
         if (!fresh) return failures;
         std::array<byte_t, 8> const counter = counted(77);
@@ -647,7 +655,7 @@ std::size_t crash_between_seal_and_schema(mount_type_ const& mount) {
         if (!stack) return failures;
         volume_t& volume = (*stack)->router.volume(volume_id_t {0});
 
-        expected<collection_numeric_id_t> const torn = (*stack)->store->create_collection("torn", test_config(8, 0));
+        expected<collection_id_t> const torn = create_named(*(*stack)->store, "torn", test_config(8, 0));
         failures += expect(torn.has_value());
         if (!torn) return failures;
         for (std::uint64_t key = 0; key != 200; ++key) {
@@ -749,8 +757,8 @@ std::size_t commit_is_all_or_nothing(mount_type_ const& mount) {
     collection_config_t narrow = test_config(8, 0);
     narrow.write_buffer_max_elements = 6;
     narrow.write_buffer_max_bytes = 8ull * 1024ull;
-    expected<collection_numeric_id_t> const first = store.create_collection("first", narrow);
-    expected<collection_numeric_id_t> const second = store.create_collection("second", narrow);
+    expected<collection_id_t> const first = create_named(store, "first", narrow);
+    expected<collection_id_t> const second = create_named(store, "second", narrow);
     failures += expect(first.has_value());
     failures += expect(second.has_value());
     if (failures != 0) return failures;
@@ -827,8 +835,8 @@ std::size_t conflict_leaves_the_other_collection_untouched(mount_type_ const& mo
     if (!stack) return failures;
     database_t& store = *(*stack)->store;
 
-    expected<collection_numeric_id_t> const contested = store.create_collection("contested", test_config(8, 0));
-    expected<collection_numeric_id_t> const quiet = store.create_collection("quiet", test_config(8, 0));
+    expected<collection_id_t> const contested = create_named(store, "contested", test_config(8, 0));
+    expected<collection_id_t> const quiet = create_named(store, "quiet", test_config(8, 0));
     failures += expect(contested.has_value());
     failures += expect(quiet.has_value());
     if (failures != 0) return failures;
@@ -886,7 +894,7 @@ std::size_t rollback_and_renew_behave(mount_type_ const& mount) {
     if (!stack) return failures;
     database_t& store = *(*stack)->store;
 
-    expected<collection_numeric_id_t> const only = store.create_collection("only", test_config(8, 0));
+    expected<collection_id_t> const only = create_named(store, "only", test_config(8, 0));
     failures += expect(only.has_value());
     if (!only) return failures;
 
@@ -950,8 +958,8 @@ std::size_t snapshot_holds_its_moment(mount_type_ const& mount) {
     if (!stack) return failures;
     database_t& store = *(*stack)->store;
 
-    expected<collection_numeric_id_t> const left = store.create_collection("left", test_config(8, 0));
-    expected<collection_numeric_id_t> const right = store.create_collection("right", test_config(0, value_max_size_k));
+    expected<collection_id_t> const left = create_named(store, "left", test_config(8, 0));
+    expected<collection_id_t> const right = create_named(store, "right", test_config(0, value_max_size_k));
     failures += expect(left.has_value());
     failures += expect(right.has_value());
     if (failures != 0) return failures;
@@ -1024,7 +1032,7 @@ std::size_t drop_waits_for_the_snapshot(mount_type_ const& mount) {
     if (!stack) return failures;
     database_t& store = *(*stack)->store;
 
-    expected<collection_numeric_id_t> const doomed = store.create_collection("doomed", test_config(8, 0));
+    expected<collection_id_t> const doomed = create_named(store, "doomed", test_config(8, 0));
     failures += expect(doomed.has_value());
     if (failures != 0) return failures;
     std::array<byte_t, 8> const value = counted(1);
@@ -1073,8 +1081,8 @@ std::size_t threads_commit_serializably(mount_type_ const& mount) {
     if (!stack) return failures;
     database_t& store = *(*stack)->store;
 
-    expected<collection_numeric_id_t> const left = store.create_collection("left", test_config(8, 0));
-    expected<collection_numeric_id_t> const right = store.create_collection("right", test_config(8, 0));
+    expected<collection_id_t> const left = create_named(store, "left", test_config(8, 0));
+    expected<collection_id_t> const right = create_named(store, "right", test_config(8, 0));
     failures += expect(left.has_value());
     failures += expect(right.has_value());
     if (failures != 0) return failures;
@@ -1201,7 +1209,7 @@ std::size_t lookups_outrun_the_write_path(mount_type_ const& mount) {
     if (!stack) return failures;
     database_t& store = *(*stack)->store;
 
-    expected<collection_numeric_id_t> const left = store.create_collection("left", test_config(8, 0));
+    expected<collection_id_t> const left = create_named(store, "left", test_config(8, 0));
     failures += expect(left.has_value());
     if (!left) return failures;
 
@@ -1217,7 +1225,7 @@ std::size_t lookups_outrun_the_write_path(mount_type_ const& mount) {
     for (std::size_t reader = 0; reader != readers_k; ++reader)
         readers[reader] = std::thread {[&]() noexcept {
             while (phase.load(std::memory_order_relaxed) == reader_phase_t::racing_k) {
-                if (store.collection_numeric_id(by_name) != *left) mismatched.fetch_add(1, std::memory_order_relaxed);
+                if (store.collection_id(by_name) != *left) mismatched.fetch_add(1, std::memory_order_relaxed);
                 collection_config_t shape;
                 if (store.collection_config(*left, shape).failed()) mismatched.fetch_add(1, std::memory_order_relaxed);
                 [[maybe_unused]] bool const seen = store.has_collection(churned);
@@ -1237,7 +1245,7 @@ std::size_t lookups_outrun_the_write_path(mount_type_ const& mount) {
 
     // Every create and every drop republishes the catalog with the readers already inside one.
     for (std::size_t round = 0; round != churns_k; ++round) {
-        expected<collection_numeric_id_t> const created = store.create_collection("churn", test_config(8, 0));
+        expected<collection_id_t> const created = create_named(store, "churn", test_config(8, 0));
         failures += expect(created.has_value());
         if (!created) break;
         failures += expect(store.drop_collection(any_collection_id_t {*created}).succeeded());
@@ -1247,7 +1255,7 @@ std::size_t lookups_outrun_the_write_path(mount_type_ const& mount) {
     for (std::size_t reader = 0; reader != readers_k; ++reader) readers[reader].join();
 
     failures += expect_eq(mismatched.load(std::memory_order_relaxed), std::size_t {0});
-    failures += expect(store.collection_numeric_id(by_name) == *left);
+    failures += expect(store.collection_id(by_name) == *left);
     failures += expect(!store.has_collection(churned));
     return failures;
 }

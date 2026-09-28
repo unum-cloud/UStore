@@ -82,7 +82,7 @@ class value_cache {
                                         resource_constraint_t& constraint) noexcept {
         value_cache cache;
         cache.constraint_ = &constraint;
-        cache.cached_ = cached_t {st::hash<stored_key_t> {}, st::equal_to_t {},
+        cache.cached_ = cached_t {stored_key_hash_t {}, st::equal_to_t {},
                                   constrained_allocator<std::byte> {constraint}};
         if (capacity_bytes == 0 || value_size == 0) return cache;
 
@@ -163,7 +163,7 @@ class value_cache {
 #pragma region Private Types
 
     /** The cached values, addressed by their stored key. */
-    using cached_t = st::hash_map<stored_key_t, constrained_buffer_t, st::hash<stored_key_t>, st::equal_to_t,
+    using cached_t = st::hash_map<stored_key_t, constrained_buffer_t, stored_key_hash_t, st::equal_to_t,
                                   constrained_allocator<std::byte>>;
 
     /** The cached keys in the order they arrived. */

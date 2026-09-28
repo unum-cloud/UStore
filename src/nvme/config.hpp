@@ -213,7 +213,7 @@ struct collection_schema_t {
 /** The files a snapshot of one collection shares with its source. */
 struct collection_snapshot_schema_t {
     lsm_tree_schema_t lsm_tree;
-    collection_uuid_t source_id;
+    collection_id_t source_id;
 };
 
 /** The files and snapshots of one single-collection database. */
@@ -229,7 +229,7 @@ struct single_collection_database_schema_t {
     };
     using snapshots_t = st::basic_vector<snapshot_t>;
 
-    single_collection_database_uuid_t id;
+    single_collection_database_id_t id;
     collection_schema_t collection;
     snapshots_t snapshots;
 };
@@ -244,7 +244,7 @@ struct database_schema_t {
         collection_config_t config;
         collection_schema_t schema;
         string_t name;
-        collection_uuid_t id;
+        collection_id_t id;
         value_layout_t type = value_layout_t::unknown_k;
     };
 
@@ -269,7 +269,7 @@ struct database_schema_t {
     using collections_t = st::basic_vector<collection_t>;
     using snapshots_t = st::basic_vector<snapshot_t>;
 
-    database_uuid_t id;
+    database_id_t id;
     collections_t collections;
     snapshots_t snapshots;
 };
@@ -359,6 +359,13 @@ template <std::unsigned_integral value_>
     if (!uuid_t::parses(printed)) return false;
     id = uuid_t::parse(printed);
     return true;
+}
+
+/** Reads a collection ID from its canonical text. */
+[[nodiscard]] inline bool read_json(yyjson_val* value, collection_id_t& id) noexcept {
+    auto [uuid, uuid_status] = uuid_from_text(json_string_view(value));
+    id.uuid = uuid;
+    return uuid_status.succeeded();
 }
 
 /** Reads a time point from its count of clock ticks since the epoch. */
@@ -559,6 +566,12 @@ template <std::unsigned_integral value_>
     char text[uuid_t::printed_length_k] = {};
     id.print(text);
     return yyjson_mut_strncpy(document, text, uuid_t::printed_length_k);
+}
+
+[[nodiscard]] inline yyjson_mut_val* write_json(yyjson_mut_doc* document, collection_id_t const& id) noexcept {
+    char text[uuid_text_length_k];
+    uuid_to_text(id.uuid, text);
+    return yyjson_mut_strncpy(document, text, uuid_text_length_k);
 }
 
 [[nodiscard]] inline yyjson_mut_val* write_json(yyjson_mut_doc* document, time_point_t time) noexcept {

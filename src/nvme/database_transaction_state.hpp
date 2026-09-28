@@ -34,7 +34,7 @@ class grouped_write_buffer {
 #pragma region Types
 
     using stored_key_t = stored_key_;
-    using group_id_t = collection_numeric_id_t;
+    using group_id_t = collection_id_t;
     using stored_value_offset_in_buffer_t = std::size_t;
 
     /** The value widths one collection admits, of which exactly one is ever set. */
@@ -73,7 +73,7 @@ class grouped_write_buffer {
 
     /** One collection's share of the buffer. */
     struct group_t {
-        using stored_values_t = st::hash_map<stored_key_t, stored_value_place_t, st::hash<stored_key_t>, st::equal_to_t,
+        using stored_values_t = st::hash_map<stored_key_t, stored_value_place_t, stored_key_hash_t, st::equal_to_t,
                                              constrained_allocator<std::byte>>;
 
         /** The value widths the collection admits, which every write is checked against. */
@@ -87,7 +87,7 @@ class grouped_write_buffer {
     };
 
     using groups_t =
-        st::hash_map<group_id_t, group_t, st::hash<group_id_t>, st::equal_to_t, constrained_allocator<std::byte>>;
+        st::hash_map<group_id_t, group_t, collection_id_hash_t, st::equal_to_t, constrained_allocator<std::byte>>;
 
 #pragma endregion Types
 
@@ -587,10 +587,10 @@ template <typename stored_key_>
 class grouped_read_set {
   public:
     using stored_key_t = stored_key_;
-    using group_id_t = collection_numeric_id_t;
+    using group_id_t = collection_id_t;
     using read_set_t = read_set<stored_key_t>;
     using groups_t =
-        st::hash_map<group_id_t, read_set_t, st::hash<group_id_t>, st::equal_to_t, constrained_allocator<std::byte>>;
+        st::hash_map<group_id_t, read_set_t, collection_id_hash_t, st::equal_to_t, constrained_allocator<std::byte>>;
 
     /** A set charging @p resources for the keys of every collection it watches. */
     explicit grouped_read_set(resources_shared_ptr_t resources) noexcept

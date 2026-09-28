@@ -85,12 +85,8 @@ def test_keys_span_the_lower_64_bits(view, boundary: int):
 
 
 @pytest.mark.parametrize("boundary", [2**64, 2**128 - 2, UUID("0190b8f2-6c4e-7a31-9d4f-2b6c8e1a5f37")])
-def test_keys_span_128_bits(view, engine: str, boundary: int | UUID):
-    """Every key but the one reserved for unknown keys addresses a value, while NVMe still stops at 64 bits."""
-    if engine == "nvme":
-        with pytest.raises(ustore.UnsupportedError):
-            view.set(boundary, b"edge")
-        return
+def test_keys_span_128_bits(view, boundary: int | UUID):
+    """Every key but the one reserved for unknown keys addresses a value."""
     view.set(boundary, b"edge")
     assert view.get(boundary) == b"edge"
 

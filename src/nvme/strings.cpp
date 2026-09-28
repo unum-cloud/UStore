@@ -31,9 +31,9 @@
 
 namespace unum::ustore::nvme {
 
-/** The collection the names of collections live in as strings, above every identifier NVMe hands out. */
+/** The collection the names of collections live in as strings, which no minted UUIDv7 spells, as its byte 6 is 0x7X. */
 extern ustore_collection_id_t const names_collection_k = {
-    uuid_from_integer(std::numeric_limits<std::uint64_t>::max() - 1)};
+    {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE}}};
 
 void collection_find(ustore_collection_find_t& request) noexcept;
 
@@ -41,11 +41,8 @@ namespace {
 
 #pragma region Key Encoding
 
-/** The word a string's key spells in its last eight bytes, which keeps every such key within the keys NVMe stores. */
-using key_word_t = std::uint64_t;
-
-/** Bytes of the word that hold the leading characters of a string, leaving the last one for its length. */
-constexpr std::size_t prefix_bytes_k = sizeof(key_word_t) - 1;
+/** Bytes of a key that hold the leading characters of a string, leaving the last one for its length. */
+constexpr std::size_t prefix_bytes_k = sizeof(ustore_key_t) - 1;
 
 /** The length a key carries for a string too long to fit @c prefix_bytes_k, which shares a bucket. */
 constexpr unsigned char bucketed_length_k = static_cast<unsigned char>(prefix_bytes_k + 1);
@@ -56,19 +53,18 @@ constexpr unsigned char padded_byte(std::string_view text, std::size_t index) no
 }
 
 /** The key of a string whose leading bytes are @p text and whose length byte is @p length_byte. */
-constexpr ustore_key_t key_of_bytes(std::string_view text, unsigned char length_byte) noexcept {
-    key_word_t word = 0;
-    for (std::size_t index = 0; index != prefix_bytes_k; ++index)
-        word = static_cast<key_word_t>((word << 8) | padded_byte(text, index));
-    word = static_cast<key_word_t>((word << 8) | length_byte);
-    return key_from_integer(word);
+constexpr ustore_key_t key_from_bytes(std::string_view text, unsigned char length_byte) noexcept {
+    ustore_key_t key {};
+    for (std::size_t index = 0; index != prefix_bytes_k; ++index) key.uuid.bytes[index] = padded_byte(text, index);
+    key.uuid.bytes[prefix_bytes_k] = length_byte;
+    return key;
 }
 
 /** The key @p text is stored under, which orders exactly as the text of every string that fits a key. */
 constexpr ustore_key_t key_from_string(std::string_view text) noexcept {
     unsigned char const length_byte = text.size() <= prefix_bytes_k ? static_cast<unsigned char>(text.size())
                                                                     : bucketed_length_k;
-    return key_of_bytes(text, length_byte);
+    return key_from_bytes(text, length_byte);
 }
 
 /** Whether a string of @p length shares its key with every other string of the same leading bytes. */
@@ -92,14 +88,12 @@ constexpr key_window_t window_of(std::string_view prefix) noexcept {
     }
 
     // Every length byte a stored string takes stays below the padding of the upper bound, so it closes the window
-    key_word_t highest = 0;
-    for (std::size_t index = 0; index != prefix_bytes_k; ++index) {
-        unsigned char const character = index < prefix.size() ? static_cast<unsigned char>(prefix[index])
-                                                              : static_cast<unsigned char>(0xFF);
-        highest = static_cast<key_word_t>((highest << 8) | character);
-    }
-    highest = static_cast<key_word_t>((highest << 8) | 0xFF);
-    return {key_from_string(prefix), key_from_integer(highest)};
+    ustore_key_t highest {};
+    for (std::size_t index = 0; index != prefix_bytes_k; ++index)
+        highest.uuid.bytes[index] = index < prefix.size() ? static_cast<unsigned char>(prefix[index])
+                                                          : static_cast<unsigned char>(0xFF);
+    highest.uuid.bytes[prefix_bytes_k] = 0xFF;
+    return {key_from_string(prefix), highest};
 }
 
 #pragma endregion Key Encoding

@@ -40,7 +40,7 @@ template <typename key_slot_type_>
 using views_of = std::span<sorted_run_index_view<key_slot_type_> const>;
 
 /** The key the engine stores, the 64-bit integer the keys of the C ABI map onto until NVMe stores sixteen bytes. */
-using stored_key_t = std::int64_t;
+using stored_key_t = uuid_stored_key_t;
 
 /** The key slots of the engine's collections, one per value layout a collection is created with. */
 using inline_1_byte_slot_t = key_slot<stored_key_t, value_layout_t::inline_1_byte_k>;

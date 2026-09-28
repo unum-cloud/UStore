@@ -44,7 +44,7 @@ using namespace unum::ustore::test;
 using stored_key_t = std::uint64_t;
 
 /** The sole collection the multi-collection registry is driven over here. */
-constexpr collection_numeric_id_t collection_k = 7;
+constexpr collection_id_t collection_k {uuid_from_integer(7)};
 
 /** Bytes one value of this suite occupies, which is one word. */
 constexpr std::size_t value_bytes_k = sizeof(std::uint64_t);
@@ -111,23 +111,22 @@ class test_store_t {
     void release_write_path() noexcept { --write_path_depth_; }
 
     /** Whether the collection @p group_id names still exists. */
-    bool contains_collection(collection_numeric_id_t group_id) const noexcept { return group_id == collection_k; }
+    bool contains_collection(collection_id_t group_id) const noexcept { return group_id == collection_k; }
 
     /** Whether @p count values of @p bytes still fit in the collection's own write buffer. */
-    bool collection_fits(collection_numeric_id_t, std::size_t, std::size_t) const noexcept {
+    bool collection_fits(collection_id_t, std::size_t, std::size_t) const noexcept {
         return behaviour != store_behaviour_t::always_flushing_k && behaviour != store_behaviour_t::refusing_flushes_k;
     }
 
     /** Empties the collection's write buffer onto its runs. */
-    status_t flush_collection(collection_numeric_id_t) noexcept {
+    status_t flush_collection(collection_id_t) noexcept {
         ++flushes;
         if (behaviour == store_behaviour_t::refusing_flushes_k) return {status_code_t::device_k, "Refusing to flush"};
         return {};
     }
 
     /** Writes @p stored_value under @p stored_key. */
-    status_t insert_in_collection(collection_numeric_id_t, stored_key_t stored_key,
-                                  stored_value_view_t stored_value) noexcept {
+    status_t insert_in_collection(collection_id_t, stored_key_t stored_key, stored_value_view_t stored_value) noexcept {
         if (behaviour == store_behaviour_t::refusing_applies_k) return {status_code_t::device_k, "Refusing to write"};
         if (stored_key >= accounts_k) return {status_code_t::invalid_argument_k, "Key out of range"};
         if (behaviour == store_behaviour_t::pausing_in_apply_k) wait_for_the_suite_();
@@ -138,7 +137,7 @@ class test_store_t {
     }
 
     /** Drops whatever @p stored_key held. */
-    status_t remove_from_collection(collection_numeric_id_t, stored_key_t stored_key) noexcept {
+    status_t remove_from_collection(collection_id_t, stored_key_t stored_key) noexcept {
         if (behaviour == store_behaviour_t::refusing_applies_k) return {status_code_t::device_k, "Refusing to write"};
         if (stored_key >= accounts_k) return {status_code_t::invalid_argument_k, "Key out of range"};
         balance_(stored_key).store(0, std::memory_order_release);
@@ -332,7 +331,7 @@ class database_transaction<stored_key_t, test_store_t> {
   private:
 
     /** The widths the sole collection admits, which every write is checked against. */
-    static status_t group_config_(collection_numeric_id_t, write_buffer_t::group_config_t& config) noexcept {
+    static status_t group_config_(collection_id_t, write_buffer_t::group_config_t& config) noexcept {
         config = {value_bytes_k, 0};
         return {};
     }
