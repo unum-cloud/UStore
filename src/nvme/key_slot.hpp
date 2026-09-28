@@ -10,7 +10,7 @@
 
 #include "nvme/stored_value.hpp"
 #include "nvme/stored_key.hpp" // `limit`
-#include "nvme/types.hpp"      // `noexcept`, `rounddown_to_multiple`, `roundup_to_multiple`
+#include "nvme/types.hpp"      // `round_down_to_multiple`, `round_up_to_multiple`
 
 namespace unum::ustore::nvme {
 
@@ -52,10 +52,10 @@ struct key_slot<stored_key_, value_layout_t::fixed_width_k> {
 
     stored_value_size_t aligned_buffer_size() const noexcept {
         auto padded_size = stored_value_offset_t(size != 0) * (buffer_padding() + size);
-        return roundup_to_multiple<stored_value_size_t, buffer_alignment_k>(padded_size);
+        return round_up_to_multiple<stored_value_size_t>(padded_size, buffer_alignment_k);
     }
     stored_value_offset_t aligned_offset_in_file() const noexcept {
-        return rounddown_to_multiple<stored_value_offset_t, buffer_alignment_k>(location);
+        return round_down_to_multiple<stored_value_offset_t>(location, buffer_alignment_k);
     }
     stored_value_size_t buffer_padding() const noexcept { return location - aligned_offset_in_file(); }
 
@@ -85,10 +85,10 @@ struct key_slot<stored_key_, value_layout_t::variable_width_k> {
 
     stored_value_size_t aligned_buffer_size() const noexcept {
         auto padded_size = stored_value_offset_t(!is_stored_value_empty()) * (buffer_padding() + size);
-        return roundup_to_multiple<stored_value_size_t, buffer_alignment_k>(padded_size);
+        return round_up_to_multiple<stored_value_size_t>(padded_size, buffer_alignment_k);
     }
     stored_value_offset_t aligned_offset_in_file() const noexcept {
-        return rounddown_to_multiple<stored_value_offset_t, buffer_alignment_k>(location);
+        return round_down_to_multiple<stored_value_offset_t>(location, buffer_alignment_k);
     }
     stored_value_size_t buffer_padding() const noexcept { return location - aligned_offset_in_file(); }
 

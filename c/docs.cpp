@@ -821,7 +821,7 @@ static std::size_t field_size_bytes(ustore_doc_field_type_t type) noexcept {
 /** Bytes one column of @p type takes for @p docs_count documents, with the closing offset, aligned for any scalar. */
 static std::size_t column_size_bytes(ustore_doc_field_type_t type, std::size_t docs_count) noexcept {
     std::size_t const bytes = field_size_bytes(type) * docs_count + sizeof(ustore_length_t);
-    return next_multiple<std::size_t>(bytes, alignof(std::max_align_t));
+    return round_up_to_multiple<std::size_t>(bytes, alignof(std::max_align_t));
 }
 
 /** Converts @p value into the scalar at @p index of @p column, zeroing a cell that holds no valid value. */
@@ -1095,8 +1095,8 @@ void ustore_docs_gather(ustore_docs_gather_t* request_pointer) {
                                       (request.columns_collisions != nullptr);
     std::size_t const address_row_bytes = sizeof(void*) * fields_count;
     std::size_t const addresses_bytes = address_row_bytes * 6;
-    std::size_t const bitmaps_bytes = next_multiple<std::size_t>(bitmap_bytes * bitmaps_count * fields_count,
-                                                                 alignof(std::max_align_t));
+    std::size_t const bitmaps_bytes = round_up_to_multiple<std::size_t>(bitmap_bytes * bitmaps_count * fields_count,
+                                                                        alignof(std::max_align_t));
     std::size_t const columns_bytes = transform_reduce_n(
         types, fields_count, std::size_t {0},
         [docs_count](ustore_doc_field_type_t type) { return column_size_bytes(type, docs_count); });

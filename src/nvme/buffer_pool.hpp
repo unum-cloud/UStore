@@ -28,7 +28,7 @@
 
 #include "nvme/aligned_allocator.hpp"     // `aligned_allocator`
 #include "nvme/constrained_allocator.hpp" // `resource_constraint_t`
-#include "nvme/extent.hpp"                // `portable_alignment_k`, `rounded_up_to`
+#include "nvme/extent.hpp"                // `portable_alignment_k`
 #include "nvme/ring.hpp"                  // `registered_memory_t`, `ring_concept`, `memory_space_t`
 
 namespace unum::ustore::nvme {
@@ -90,7 +90,7 @@ class registered_memory_arena_t {
         if (config.placement == memory_space_t::gpu_k)
             return status_t {status_code_t::unsupported_k, "Device memory has no arena yet"};
 
-        std::size_t const bytes = static_cast<std::size_t>(rounded_up_to(config.bytes, portable_alignment_k));
+        std::size_t const bytes = static_cast<std::size_t>(round_up_to_multiple(config.bytes, portable_alignment_k));
         registered_memory_arena_t arena;
         if (!constraint.acquire(bytes)) return status_t {status_code_t::out_of_memory_k, "The budget refused an arena"};
         arena.constraint_ = &constraint;
@@ -340,11 +340,6 @@ inline void pooled_buffer_t::release() noexcept {
     pool_->recycle_(index_);
     pool_ = nullptr;
     bytes_ = std::span<byte_t> {};
-}
-
-/** Blocks a transfer of @p length bytes needs from a pool of @p buffer_bytes blocks. */
-[[nodiscard]] constexpr std::uint64_t buffers_for(std::uint64_t length, std::uint64_t buffer_bytes) noexcept {
-    return buffer_bytes == 0 ? 0 : (length + buffer_bytes - 1) / buffer_bytes;
 }
 
 #pragma endregion Pool

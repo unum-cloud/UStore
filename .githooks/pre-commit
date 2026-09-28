@@ -530,6 +530,15 @@ check_bare_member_docs() {
         "            /** @brief ... */ blocks; \`//\` is for implementation notes inside bodies:"
 }
 
+# A member documented after it - `parsed_k, ///< Every argument matched.` - is the one declaration whose doc does not
+# hover above it, and its column drifts with every rename; the doc goes on the line above as a `/** ... */` one-liner.
+check_trailing_member_docs() {
+    local trailing
+    trailing=$(printf '%s\n' "$added" | grep -E '(///<|//!<|/\*\*<|/\*!<)' || true)
+    [ -z "$trailing" ] || fail "$trailing" \
+        "$file documents a member after it with ///< - put a /** ... */ one-liner on the line above:"
+}
+
 # endregion Doxygen Blocks
 
 # region Naming and Vocabulary
@@ -684,6 +693,36 @@ check_private_member_underscores() {
         "$file declares a private or protected data member without a trailing underscore - write \`size_\`:"
 }
 
+# A class template never takes the `_t` suffix: `_t` marks a concrete type or the alias a template materializes, so
+# `template <...> class channel_drain_t` reads as a type the reader could name without arguments. Name the template
+# bare - `channel_drain<disk_type_>` - and keep `_t` for the aliases it produces.
+check_template_type_suffixes() {
+    local suffixed
+    suffixed=$(printf '%s\n' "$added" | awk '
+        /^\+[[:space:]]*template[[:space:]]*</ {
+            if ($0 ~ /(struct|class)[[:space:]]+[A-Za-z0-9_]+_t([^A-Za-z0-9_]|$)/) print
+            pending = 1
+            next
+        }
+        pending && /^\+[[:space:]]*requires/ { next }
+        pending && /^\+[[:space:]]*(struct|class)[[:space:]]+[A-Za-z0-9_]+_t([^A-Za-z0-9_]|$)/ { print }
+        { pending = 0 }' || true)
+    [ -z "$suffixed" ] || fail "$suffixed" \
+        "$file names a class template with the _t suffix - name the template bare, as in" \
+        "            \`template <typename disk_type_> class channel_drain\`, and keep _t for its aliases:"
+}
+
+# Hand-rolled rounding - `(value + divisor - 1) / divisor` or `value & ~(alignment - 1)` - re-derives what the shared
+# vocabulary names once: `divide_round_up`, `round_up_to_multiple` and `round_down_to_multiple` in `ustore/types.hpp`.
+check_hand_ceils() {
+    local ceils
+    ceils=$(printf '%s\n' "$added" | grep -vE 'divide_round_up|round_up_to_multiple|round_down_to_multiple' |
+        grep -E '\([^()]+\+[^()]+-[[:space:]]*1[[:space:]]*\)[[:space:]]*/|&[[:space:]]*~[[:space:]]*\([^()]+-[[:space:]]*1[[:space:]]*\)' || true)
+    [ -z "$ceils" ] || fail "$ceils" \
+        "$file hand-rolls rounding - write divide_round_up, round_up_to_multiple or round_down_to_multiple" \
+        "            from ustore/types.hpp:"
+}
+
 # endregion Naming and Vocabulary
 
 # region C++ Surface and Containers
@@ -786,6 +825,17 @@ check_iterator_laundering() {
     laundered=$(printf '%s\n' "$added" | grep -E '&\*[A-Za-z_]' || true)
     [ -z "$laundered" ] || fail "$laundered" \
         "$file launders an iterator through &* - write \`values.data() + offset\`, or address the element:"
+}
+
+# The CPython bindings parse arguments and build results by hand: `PyArg_Parse*` and `Py_BuildValue` interpret a
+# format string at runtime, so a wrong specifier is a crash rather than a compile error.
+check_cpython_format_shortcuts() {
+    local shortcuts
+    shortcuts=$(printf '%s\n' "$added" | grep -vE '^\+[[:space:]]*(//|/\*|\*( |/|$))' |
+        grep -E '\b(Py_BuildValue|PyArg_Parse[A-Za-z]*|PyArg_UnpackTuple)[[:space:]]*\(' || true)
+    [ -z "$shortcuts" ] || fail "$shortcuts" \
+        "$file calls a format-string shortcut of the C API - walk the arguments by hand and build results with" \
+        "            PyDict_New and PyLong_FromUnsignedLongLong:"
 }
 
 # endregion C++ Surface and Containers
@@ -1032,6 +1082,7 @@ for file in "${staged[@]}"; do
         check_include_groups
         check_docblock_brackets
         check_bare_member_docs
+        check_trailing_member_docs
         check_trailing_returns
         check_iterator_laundering
         ;;&
@@ -1039,6 +1090,8 @@ for file in "${staged[@]}"; do
     *.hpp | *.cpp | *.cc | *.cxx | *.cu | *.cuh)
         check_qualified_namespace
         check_suffixed_template_names
+        check_template_type_suffixes
+        check_hand_ceils
         check_private_member_underscores
         check_template_parameter_underscores
         check_function_like_macros
@@ -1072,6 +1125,10 @@ for file in "${staged[@]}"; do
         ;;&
     verification/*)
         check_verification_cites_symbols
+        ;;&
+    # The CPython bindings, which build every argument and result by hand.
+    python/*.c)
+        check_cpython_format_shortcuts
         ;;&
     *.md)
         check_ascii_arrows_prose

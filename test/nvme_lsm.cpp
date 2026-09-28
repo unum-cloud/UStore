@@ -13,12 +13,12 @@
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
 #include <cstddef> // `std::size_t`
-#include <cstdint> // `std::uint64_t`, `std::uintptr_t`
+#include <cstdint> // `std::uint64_t`
 #include <cstdlib> // `std::malloc`, `std::free`
 #include <cstring> // `std::memcmp`
 
 #include <array>   // `std::array`
-#include <memory>  // `std::unique_ptr`
+#include <memory>  // `std::align`, `std::unique_ptr`
 #include <new>     // `std::bad_alloc`, `std::align_val_t`, `std::nothrow_t`
 #include <span>    // `std::span`
 #include <thread>  // `std::thread`
@@ -66,9 +66,11 @@ void* watched_allocate(std::size_t bytes, std::size_t alignment) noexcept {
         if (allocation_watch_g.sizes[index] == bytes) ++allocation_watch_g.hits[index];
     void* const block = std::malloc(bytes + alignment + sizeof(void*));
     if (!block) return nullptr;
-    std::uintptr_t const start = reinterpret_cast<std::uintptr_t>(block) + sizeof(void*);
-    void** const aligned = reinterpret_cast<void**>((start + alignment - 1) / alignment * alignment);
-    aligned[-1] = block;
+    void* aligned = static_cast<void**>(block) + 1;
+    std::size_t space = bytes + alignment;
+    std::align(alignment, bytes, aligned, space);
+    void** const header = static_cast<void**>(aligned) - 1;
+    *header = block;
     return aligned;
 }
 

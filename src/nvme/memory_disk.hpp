@@ -11,6 +11,7 @@
 #include <cstdint> // `std::uint64_t`
 #include <cstring> // `std::memcpy`
 
+#include <bit>     // `std::has_single_bit`
 #include <span>    // `std::span`
 #include <utility> // `std::move`
 
@@ -53,7 +54,7 @@ class memory_device_t {
      *      serves a directory of many volumes exactly as a file device does.
      */
     static expected<memory_device_t> make(std::uint64_t alignment = 1) noexcept {
-        if (!is_power_of_two(alignment))
+        if (!std::has_single_bit(alignment))
             return status_t {status_code_t::invalid_argument_k, "An alignment is a power of two"};
         memory_device_t device;
         device.alignment_ = alignment;

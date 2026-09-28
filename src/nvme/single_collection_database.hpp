@@ -45,7 +45,7 @@
 #include "nvme/collection_scanner.hpp"                     // `collection_scanner`
 #include "nvme/collection_snapshot.hpp"                    // `select_result_t`
 #include "nvme/config.hpp"                                 // `single_collection_database_config_t`
-#include "nvme/extent.hpp"                                 // `extent_t`, `rounded_up_to`, `portable_alignment_k`
+#include "nvme/extent.hpp"                                 // `extent_t`, `portable_alignment_k`
 #include "nvme/io_channel.hpp"                             // `io_channel_t`
 #include "nvme/io_pipeline.hpp"                            // `basic_read_pipeline`, `basic_write_pipeline`
 #include "nvme/lsm_tree.hpp"                               // `lsm_tree_run_record_t`, `lsm_tree_publication_hook_t`
@@ -689,11 +689,11 @@ class basic_single_collection_database {
         while (at != bytes.size()) {
             auto [block, acquire_buffer_or_poll_status] = writer.acquire_buffer_or_poll();
             if (acquire_buffer_or_poll_status.failed()) return acquire_buffer_or_poll_status;
-            std::uint64_t const room = rounded_down_to(block.size(), portable_alignment_k);
+            std::uint64_t const room = round_down_to_multiple(block.size(), portable_alignment_k);
             if (room == 0) return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than one page"};
 
             std::uint64_t const carried = room < bytes.size() - at ? room : bytes.size() - at;
-            std::uint64_t const padded = rounded_up_to(carried, portable_alignment_k);
+            std::uint64_t const padded = round_up_to_multiple(carried, portable_alignment_k);
             std::span<byte_t> const room_bytes = block.bytes();
             std::memcpy(room_bytes.data(), bytes.data() + at, static_cast<std::size_t>(carried));
             std::memset(room_bytes.data() + carried, 0, static_cast<std::size_t>(padded - carried));
@@ -706,9 +706,9 @@ class basic_single_collection_database {
 
     /** Copies the first @c into.size() bytes of @p blob into @p into, one block at a time. */
     status_t read_blob_(io_channel_t& channel, blob_t const& blob, std::span<byte_t> into) const noexcept {
-        std::uint64_t const chunk = rounded_down_to(channel.requests().buffer_bytes(), portable_alignment_k);
+        std::uint64_t const chunk = round_down_to_multiple(channel.requests().buffer_bytes(), portable_alignment_k);
         if (chunk == 0) return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than one page"};
-        std::uint64_t const wanted = rounded_up_to(into.size(), portable_alignment_k);
+        std::uint64_t const wanted = round_up_to_multiple(into.size(), portable_alignment_k);
 
         status_t first;
         auto sink = [&](completed_buffer_t const& completed) noexcept {

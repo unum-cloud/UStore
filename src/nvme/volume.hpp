@@ -23,6 +23,7 @@
 #include <cstring> // `std::memcpy`, `std::memset`
 
 #include <array>   // `std::array`
+#include <bit>     // `std::has_single_bit`
 #include <span>    // `std::span`
 #include <utility> // `std::move`
 
@@ -33,7 +34,7 @@
 
 #include "nvme/buffer_pool.hpp"      // `registered_memory_arena_t`, `pooled_buffer_t`
 #include "nvme/catalog.hpp"          // `catalog_t`, `blob_kind_t`, `volume_header_t`
-#include "nvme/extent.hpp"           // `extent_t`, `rounded_up_to`
+#include "nvme/extent.hpp"           // `extent_t`
 #include "nvme/extent_allocator.hpp" // `extent_allocator_t`
 #include "nvme/io_channel.hpp"       // `io_channel_t`
 #include "nvme/io_pipeline.hpp"      // `basic_read_pipeline`, `basic_write_pipeline`
@@ -351,9 +352,9 @@ class basic_extent_volume {
         header.database = format.database;
         header.capacity_bytes = capacity_;
         header.catalog_slot_offset = portable_alignment_k;
-        header.catalog_slot_bytes = rounded_up_to(format.catalog_slot_bytes, portable_alignment_k);
-        header.data_offset = rounded_up_to(header.catalog_slot_offset + 2 * header.catalog_slot_bytes,
-                                           format.large_allocation_alignment);
+        header.catalog_slot_bytes = round_up_to_multiple(format.catalog_slot_bytes, portable_alignment_k);
+        header.data_offset = round_up_to_multiple(header.catalog_slot_offset + 2 * header.catalog_slot_bytes,
+                                                  format.large_allocation_alignment);
         header.allocation_granularity = format.allocation_granularity;
         header.large_allocation_alignment = format.large_allocation_alignment;
         header.catalog_generation = 0;
@@ -453,7 +454,7 @@ class basic_extent_volume {
         std::uint64_t const needed = catalog_.image_bytes();
         if (needed > room) return {status_code_t::capacity_exhausted_k, "The catalog outgrew the slot that holds it"};
 
-        std::uint64_t const written = rounded_up_to(needed, portable_alignment_k);
+        std::uint64_t const written = round_up_to_multiple(needed, portable_alignment_k);
         std::span<byte_t> const bytes = block.bytes();
         std::memset(bytes.data(), 0, static_cast<std::size_t>(written));
         auto [filled, save_status] = catalog_.save(bytes.first(static_cast<std::size_t>(room)), generation);
@@ -485,10 +486,11 @@ class basic_extent_volume {
         if (header_.data_offset > capacity_)
             return {status_code_t::malformed_k, "The volume is shorter than its own catalog"};
         std::uint64_t const granularity = header_.allocation_granularity;
-        if (!is_power_of_two(granularity))
+        if (!std::has_single_bit(granularity))
             return {status_code_t::malformed_k, "The volume names no power-of-two granularity"};
 
-        extent_t const region {header_.data_offset, rounded_down_to(capacity_ - header_.data_offset, granularity)};
+        extent_t const region {header_.data_offset,
+                               round_down_to_multiple(capacity_ - header_.data_offset, granularity)};
         auto [allocator, make_extent_allocator_status] = extent_allocator_t::make(region, granularity,
                                                                                   header_.large_allocation_alignment);
         if (make_extent_allocator_status.failed()) return make_extent_allocator_status;
@@ -508,7 +510,7 @@ class basic_extent_volume {
     [[nodiscard]] std::uint64_t slot_image_bytes_(std::uint64_t block_bytes) const noexcept {
         std::uint64_t const bounded = header_.catalog_slot_bytes < block_bytes ? header_.catalog_slot_bytes
                                                                                : block_bytes;
-        return rounded_down_to(bounded, portable_alignment_k);
+        return round_down_to_multiple(bounded, portable_alignment_k);
     }
 
     /** Where slot @p slot begins, which alternates so a torn image never overwrites the live one. */

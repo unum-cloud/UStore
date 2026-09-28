@@ -25,6 +25,7 @@
 #include <dirent.h> // `opendir`, `readdir`
 
 #include <array>       // `std::array`
+#include <bit>         // `std::has_single_bit`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 #include <utility>     // `std::move`
@@ -351,7 +352,7 @@ class spdk_rig_t {
     ring_capabilities_t const limits = disk.capabilities();
     fmt::println("  sector {} bytes, transfer up to {} bytes, {} queue pairs of {}", limits.offset_alignment,
                  limits.max_transfer_bytes, limits.queue_pairs_limit, limits.depth_limit);
-    failures += expect(is_power_of_two(limits.offset_alignment) && limits.offset_alignment <= block_bytes_k);
+    failures += expect(std::has_single_bit(limits.offset_alignment) && limits.offset_alignment <= block_bytes_k);
     failures += expect_eq(limits.length_granularity, limits.offset_alignment);
     failures += expect_eq(limits.memory_alignment, std::uint64_t {portable_alignment_k});
     failures += expect(limits.max_transfer_bytes >= block_bytes_k);

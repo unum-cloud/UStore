@@ -835,11 +835,16 @@ PyObject* ustore_py_api_measure(PyObject* self, PyObject* const* args, Py_ssize_
     PyObject* bounds = NULL;
     if (error.status != ustore_success_k) { ustore_py_raise_on_error(&error); }
     else {
-        bounds = Py_BuildValue(
-            "{s:K,s:K,s:K,s:K,s:K,s:K}", "min_cardinality", (unsigned long long)min_cardinalities[0], "max_cardinality",
-            (unsigned long long)max_cardinalities[0], "min_value_bytes", (unsigned long long)min_value_bytes[0],
-            "max_value_bytes", (unsigned long long)max_value_bytes[0], "min_space_usage",
-            (unsigned long long)min_space_usages[0], "max_space_usage", (unsigned long long)max_space_usages[0]);
+        char const* const names[6] = {"min_cardinality", "max_cardinality", "min_value_bytes",
+                                      "max_value_bytes", "min_space_usage", "max_space_usage"};
+        ustore_size_t const values[6] = {min_cardinalities[0], max_cardinalities[0], min_value_bytes[0],
+                                         max_value_bytes[0],   min_space_usages[0],  max_space_usages[0]};
+        bounds = PyDict_New();
+        for (size_t index = 0; bounds && index != 6; ++index) {
+            PyObject* const value = PyLong_FromUnsignedLongLong(values[index]);
+            if (!value || PyDict_SetItemString(bounds, names[index], value) != 0) Py_CLEAR(bounds);
+            Py_XDECREF(value);
+        }
     }
     ustore_py_arena_return(context.database, arena);
     return bounds;

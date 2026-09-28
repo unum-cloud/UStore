@@ -32,7 +32,7 @@
 #include <ustore/types.hpp>  // `byte_t`
 
 #include "nvme/config.hpp"           // `lsm_tree_config_t`
-#include "nvme/extent.hpp"           // `extent_t`, `rounded_down_to`, `portable_alignment_k`
+#include "nvme/extent.hpp"           // `extent_t`, `portable_alignment_k`
 #include "nvme/io_channel.hpp"       // `io_channel_t`
 #include "nvme/io_pipeline.hpp"      // `basic_read_pipeline`, `require_completed_in_full`
 #include "nvme/lsm_level.hpp"        // `lsm_level`, `lsm_level_order_t`, `lsm_level_depth_t`
@@ -312,7 +312,8 @@ class lsm_tree {
             return {};
         }
         else {
-            std::uint64_t const block_bytes = rounded_down_to(channel.requests().buffer_bytes(), portable_alignment_k);
+            std::uint64_t const block_bytes = round_down_to_multiple(channel.requests().buffer_bytes(),
+                                                                     portable_alignment_k);
             if (block_bytes == 0)
                 return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than one page"};
 

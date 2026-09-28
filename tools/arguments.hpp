@@ -44,17 +44,39 @@ namespace unum::ustore {
 
 /** Outcome of parsing one value or a whole argument list. */
 enum class argument_status_t {
-    parsed_k,           ///< Every argument matched its flag.
-    help_k,             ///< `--help` was given, so the caller prints the usage and exits.
-    unknown_flag_k,     ///< An argument starting with `--` names no flag.
-    missing_value_k,    ///< A flag taking a value ended the argument list.
-    unexpected_value_k, ///< A switch was given a value through `=`.
-    invalid_number_k,   ///< The digits do not form a non-negative integer.
-    invalid_unit_k,     ///< The suffix names no unit of the flag's kind.
-    invalid_choice_k,   ///< The value names none of the flag's choices.
-    out_of_range_k,     ///< The value overflows its destination or falls outside its bounds.
-    too_many_items_k,   ///< A list or the positional arguments exceed their capacity.
-    too_few_items_k,    ///< A list holds fewer items than it requires.
+
+    /** Every argument matched its flag. */
+    parsed_k,
+
+    /** `--help` was given, so the caller prints the usage and exits. */
+    help_k,
+
+    /** An argument starting with `--` names no flag. */
+    unknown_flag_k,
+
+    /** A flag taking a value ended the argument list. */
+    missing_value_k,
+
+    /** A switch was given a value through `=`. */
+    unexpected_value_k,
+
+    /** The digits do not form a non-negative integer. */
+    invalid_number_k,
+
+    /** The suffix names no unit of the flag's kind. */
+    invalid_unit_k,
+
+    /** The value names none of the flag's choices. */
+    invalid_choice_k,
+
+    /** The value overflows its destination or falls outside its bounds. */
+    out_of_range_k,
+
+    /** A list or the positional arguments exceed their capacity. */
+    too_many_items_k,
+
+    /** A list holds fewer items than it requires. */
+    too_few_items_k,
 };
 
 /** A size in bytes, written @c 64MiB or @c 1GiB; a bare number is bytes. */

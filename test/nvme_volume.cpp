@@ -96,7 +96,7 @@ expected<std::size_t> mismatched_bytes(disk_type_& disk, io_channel_t& channel, 
                                        std::uint64_t seed) noexcept {
     basic_read_pipeline<disk_type_> reader {disk, channel, blob.medium};
     std::uint64_t const chunk_bytes = channel.requests().buffer_bytes();
-    std::uint64_t const chunks = buffers_for(blob.extent.length, chunk_bytes);
+    std::uint64_t const chunks = chunk_bytes == 0 ? 0 : divide_round_up(blob.extent.length, chunk_bytes);
     std::uint64_t offered = 0;
     std::size_t seen = 0;
     std::size_t mismatches = 0;
@@ -255,7 +255,7 @@ std::size_t volume_round_trips(fixture_type_& fixture) {
     failures += expect(blob.has_value());
     if (!blob) return failures;
     failures += expect_eq(blob->length, length_k);
-    failures += expect_eq(blob->extent.length, rounded_up_to(length_k, volume_config_k.page_bytes));
+    failures += expect_eq(blob->extent.length, round_up_to_multiple(length_k, volume_config_k.page_bytes));
 
     expected<blob_t> const found = volume->find(label.name());
     failures += expect(found.has_value());

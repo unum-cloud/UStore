@@ -25,7 +25,7 @@
 #include <ustore/status.hpp> // `status_t`, `status_code_t`, `expected`
 #include <ustore/types.hpp>  // `byte_t`
 
-#include "nvme/extent.hpp" // `extent_t`, `rounded_up_to`
+#include "nvme/extent.hpp" // `extent_t`
 #include "nvme/uuid.hpp"   // `uuid_t`
 
 namespace unum::ustore::nvme {
@@ -227,7 +227,7 @@ static_assert(sizeof(catalog_record_t) == 40, "A catalog record is what the form
 
 /** Bytes one record occupies for a name of @p name_bytes, its padding to the next record included. */
 [[nodiscard]] constexpr std::uint32_t record_bytes_of(std::uint32_t name_bytes) noexcept {
-    return static_cast<std::uint32_t>(rounded_up_to(sizeof(catalog_record_t) + name_bytes, record_alignment_k));
+    return static_cast<std::uint32_t>(round_up_to_multiple(sizeof(catalog_record_t) + name_bytes, record_alignment_k));
 }
 
 #pragma endregion Layouts

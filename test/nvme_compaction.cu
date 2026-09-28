@@ -356,7 +356,7 @@ st::status_t add_sorted_sorted_runs(std::span<typename key_slot_type_::stored_ke
     if (status != st::status_t::success_k) return status;
     std::uint64_t const total = lsm_level.sorted.size();
     if (total == 0) return st::status_t::success_k;
-    std::uint64_t const chunk = (total + sorted_runs - 1) / sorted_runs;
+    std::uint64_t const chunk = divide_round_up(total, sorted_runs);
     for (std::uint64_t offset = 0; offset < total; offset += chunk) {
         status = lsm_level.counts.push_back(std::uint64_t {chunk < total - offset ? chunk : total - offset});
         if (status != st::status_t::success_k) return status;
@@ -369,7 +369,7 @@ template <typename key_slot_type_>
 st::status_t lay_out(test_lsm_level<key_slot_type_>& lsm_level, std::uint64_t branching) noexcept {
     std::uint64_t cells_count = 0;
     for (std::size_t index = 0; index != lsm_level.counts.size(); ++index)
-        cells_count += round_up(lsm_level.counts[index], branching);
+        cells_count += round_up_to_multiple(lsm_level.counts[index], branching);
     st::status_t status = lsm_level.cells.resize(cells_count);
     if (status != st::status_t::success_k) return status;
     status = lsm_level.views.resize(lsm_level.counts.size());
@@ -381,7 +381,7 @@ st::status_t lay_out(test_lsm_level<key_slot_type_>& lsm_level, std::uint64_t br
     std::uint64_t first_cell = 0;
     for (std::size_t sorted_run = 0; sorted_run != lsm_level.counts.size(); ++sorted_run) {
         std::uint64_t const count = lsm_level.counts[sorted_run];
-        std::uint64_t const rows = (count + branching - 1) / branching;
+        std::uint64_t const rows = divide_round_up(count, branching);
         status = positions.resize(rows * branching);
         if (status != st::status_t::success_k) return status;
         [[maybe_unused]] std::uint64_t const assigned = assign_sorted_positions(positions.data(), rows, branching, 0,
@@ -457,7 +457,7 @@ std::size_t check_compaction(compaction_kind_t kind, sorted_run_bounds_t const& 
     std::uint64_t cells_count = 0;
     for (std::size_t index = 0; index != output.sorted_runs.size(); ++index) {
         key_slots_count += output.sorted_runs[index].key_slots_count;
-        cells_count += round_up(output.sorted_runs[index].key_slots_count, bounds.branching);
+        cells_count += round_up_to_multiple(output.sorted_runs[index].key_slots_count, bounds.branching);
     }
     failures += expect_eq(key_slots_count, std::uint64_t {wanted_survivors.size()});
     failures += expect_eq(output.cells.size(), std::size_t {cells_count});
@@ -485,7 +485,7 @@ std::size_t check_compaction(compaction_kind_t kind, sorted_run_bounds_t const& 
     for (std::size_t index = 0; index != output.sorted_runs.size(); ++index) {
         compacted_sorted_run_t const& sorted_run = output.sorted_runs[index];
         std::uint64_t const count = sorted_run.key_slots_count;
-        std::uint64_t const rows = (count + bounds.branching - 1) / bounds.branching;
+        std::uint64_t const rows = divide_round_up(count, bounds.branching);
         std::uint64_t const cells = rows * bounds.branching;
         empty_sorted_runs += count == 0;
         oversized_sorted_runs += count > bounds.key_slots_capacity;
@@ -869,7 +869,7 @@ std::size_t sorted_run_index_layout_matches_builder() {
     basic_vector<std::uint64_t> positions;
     auto const check = [&](std::uint64_t count, std::uint64_t branching) {
         sorted_run_index_layout_t const layout(count, branching);
-        std::uint64_t const rows = (count + branching - 1) / branching;
+        std::uint64_t const rows = divide_round_up(count, branching);
         if (layout.cells_count() != rows * branching || positions.resize(rows * branching) != st::status_t::success_k) {
             ++mismatches;
             return;

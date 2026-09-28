@@ -25,22 +25,6 @@ namespace unum::ustore::nvme {
  */
 inline constexpr std::uint64_t portable_alignment_k = 4096;
 
-/** Whether @p value is a power of two, which every alignment a disk reports must be. */
-constexpr bool is_power_of_two(std::uint64_t value) noexcept { return value != 0 && (value & (value - 1)) == 0; }
-
-/** Rounds @p value down to a multiple of @p alignment, which must be a power of two. */
-constexpr std::uint64_t rounded_down_to(std::uint64_t value, std::uint64_t alignment) noexcept {
-    return value & ~(alignment - 1);
-}
-
-/** Rounds @p value up to a multiple of @p alignment, saturating instead of wrapping. */
-constexpr std::uint64_t rounded_up_to(std::uint64_t value, std::uint64_t alignment) noexcept {
-    std::uint64_t const remainder = value & (alignment - 1);
-    if (remainder == 0) return value;
-    std::uint64_t const padding = alignment - remainder;
-    return value > UINT64_MAX - padding ? rounded_down_to(UINT64_MAX, alignment) : value + padding;
-}
-
 /** Whether @p address is a multiple of @p alignment, for the memory a registration hands the driver. */
 inline bool is_address_aligned(void const* address, std::uint64_t alignment) noexcept {
     return (reinterpret_cast<std::uintptr_t>(address) & (alignment - 1)) == 0;

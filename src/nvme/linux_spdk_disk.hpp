@@ -39,6 +39,7 @@
 
 #include <array>       // `std::array`
 #include <atomic>      // `std::memory_order`
+#include <bit>         // `std::has_single_bit`
 #include <new>         // `std::nothrow`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
@@ -685,7 +686,7 @@ class linux_spdk_disk_t {
         disk.queue_pairs_limit_ = queue_pairs;
         disk.registered_memories_limit_ = config.registered_memory_limit;
         disk.reach_ = transport.trtype == SPDK_NVME_TRANSPORT_TCP ? reach_t::copied_k : reach_t::translated_k;
-        if (disk.sector_bytes_ == 0 || !is_power_of_two(disk.sector_bytes_))
+        if (disk.sector_bytes_ == 0 || !std::has_single_bit(disk.sector_bytes_))
             return status_t {status_code_t::unsupported_k, "The namespace reports no power-of-two sector"};
 
         std::size_t const window = static_cast<std::size_t>(queue_pairs) * config.depth_limit;

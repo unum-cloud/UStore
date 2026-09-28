@@ -32,7 +32,7 @@
 
 #include "nvme/buffer_pool.hpp"      // `pooled_buffer_t`
 #include "nvme/catalog.hpp"          // `blob_name_t`, `blob_kind_t`, `magic_of`
-#include "nvme/extent.hpp"           // `extent_t`, `rounded_up_to`, `portable_alignment_k`
+#include "nvme/extent.hpp"           // `extent_t`, `portable_alignment_k`
 #include "nvme/io_channel.hpp"       // `io_channel_t`
 #include "nvme/io_pipeline.hpp"      // `basic_read_pipeline`, `basic_write_pipeline`, `require_completed_in_full`
 #include "nvme/key_slot.hpp"         // `key_slot`
@@ -142,12 +142,12 @@ class sorted_run_layout {
 
     /** Bytes the header occupies, padded out to what an unbuffered read accepts. */
     [[nodiscard]] static constexpr std::uint64_t header_bytes() noexcept {
-        return rounded_up_to(sizeof(sorted_run_header_t), portable_alignment_k);
+        return round_up_to_multiple(sizeof(sorted_run_header_t), portable_alignment_k);
     }
 
     /** Cells the index of @p key_slots_count key slots holds, padding included. */
     [[nodiscard]] static constexpr std::uint64_t cells_count(std::uint64_t key_slots_count) noexcept {
-        return round_up(key_slots_count, branching_k);
+        return round_up_to_multiple(key_slots_count, branching_k);
     }
 
     /** Bytes those cells occupy, before the section's alignment padding. */
@@ -157,7 +157,7 @@ class sorted_run_layout {
 
     /** Bytes the index section occupies, which one read of it covers whole. */
     [[nodiscard]] static constexpr std::uint64_t index_section_bytes(std::uint64_t key_slots_count) noexcept {
-        return rounded_up_to(index_bytes(key_slots_count), portable_alignment_k);
+        return round_up_to_multiple(index_bytes(key_slots_count), portable_alignment_k);
     }
 
     /** First byte of the index inside the blob. */
@@ -170,7 +170,7 @@ class sorted_run_layout {
 
     /** Bytes the stored values section occupies, which is none for values held inline. */
     [[nodiscard]] static constexpr std::uint64_t values_section_bytes(std::uint64_t stored_values_bytes) noexcept {
-        return holds_values_inline_k ? 0 : rounded_up_to(stored_values_bytes, portable_alignment_k);
+        return holds_values_inline_k ? 0 : round_up_to_multiple(stored_values_bytes, portable_alignment_k);
     }
 
     /** Bytes the whole run occupies, which is the length its blob is reserved with. */
@@ -291,7 +291,8 @@ class lsm_sorted_run {
             if (!(key_slots[index - 1].stored_key < key_slots[index].stored_key))
                 return status_t {status_code_t::invalid_argument_k, "A run takes its key slots in ascending order"};
 
-        std::uint64_t const block_bytes = rounded_down_to(channel.requests().buffer_bytes(), portable_alignment_k);
+        std::uint64_t const block_bytes = round_down_to_multiple(channel.requests().buffer_bytes(),
+                                                                 portable_alignment_k);
         if (block_bytes < sorted_run_layout_t::header_bytes())
             return status_t {status_code_t::capacity_exhausted_k, "A channel's block is shorter than a run's header"};
 
@@ -467,7 +468,8 @@ class lsm_sorted_run {
             return {};
         }
         else {
-            std::uint64_t const block_bytes = rounded_down_to(channel.requests().buffer_bytes(), portable_alignment_k);
+            std::uint64_t const block_bytes = round_down_to_multiple(channel.requests().buffer_bytes(),
+                                                                     portable_alignment_k);
             if (block_bytes == 0)
                 return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than one page"};
 
@@ -684,7 +686,7 @@ class lsm_sorted_run {
 
         auto [block, acquire_status] = channel.streams().acquire();
         if (acquire_status.failed()) return acquire_status;
-        std::uint64_t const room = rounded_down_to(block.size(), portable_alignment_k);
+        std::uint64_t const room = round_down_to_multiple(block.size(), portable_alignment_k);
         if (room == 0) return {status_code_t::capacity_exhausted_k, "A channel's streaming block holds no index page"};
 
         std::uint64_t const wanted = sorted_run_layout_t::index_bytes(header_.key_slots_count);

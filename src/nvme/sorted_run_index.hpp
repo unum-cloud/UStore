@@ -8,15 +8,12 @@
 
 #include <cstdint> // `std::uint64_t`
 
+#include <ustore/types.hpp> // `divide_round_up`
+
 namespace unum::ustore::nvme {
 
 /** Levels a sorted run index layout describes, far beyond any sorted run index a sorted run file holds. */
 inline constexpr std::uint64_t sorted_run_index_levels_capacity_k = 32;
-
-/** The least multiple of @p multiple at or above @p value. */
-constexpr std::uint64_t round_up(std::uint64_t value, std::uint64_t multiple) noexcept {
-    return (value + multiple - 1) / multiple * multiple;
-}
 
 /**
  *  @brief Maps between a sorted run index's cells and the sorted order of the key slots they hold.
@@ -59,8 +56,7 @@ struct sorted_run_index_layout_t {
 
     /** Lays out @p key_slots key slots in rows of @p cells_per_row, which must be two or more. */
     constexpr sorted_run_index_layout_t(std::uint64_t key_slots, std::uint64_t cells_per_row) noexcept
-        : key_slots_count(key_slots), branching(cells_per_row),
-          rows_count((key_slots + cells_per_row - 1) / cells_per_row) {
+        : key_slots_count(key_slots), branching(cells_per_row), rows_count(divide_round_up(key_slots, cells_per_row)) {
         if (key_slots == 0) return;
         std::uint64_t levels = 1;
         for (std::uint64_t reach = branching + 1; reach <= key_slots && levels + 1 < sorted_run_index_levels_capacity_k;

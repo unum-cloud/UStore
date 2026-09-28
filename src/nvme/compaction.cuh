@@ -223,8 +223,8 @@ constexpr std::uint64_t stored_value_bytes(key_slot_type_ const& key_slot) noexc
 template <typename key_slot_type_>
 constexpr std::uint64_t stored_values_offset(sorted_run_bounds_t const& bounds,
                                              std::uint64_t key_slots_count) noexcept {
-    std::uint64_t const cells_bytes = round_up(key_slots_count, bounds.branching) * sizeof(key_slot_type_);
-    return bounds.header_bytes + round_up(cells_bytes, bounds.alignment_bytes);
+    std::uint64_t const cells_bytes = round_up_to_multiple(key_slots_count, bounds.branching) * sizeof(key_slot_type_);
+    return bounds.header_bytes + round_up_to_multiple(cells_bytes, bounds.alignment_bytes);
 }
 
 /** Bytes of a sorted run file of @p key_slots_count key slots locating @p stored_values_bytes bytes of stored
@@ -234,7 +234,7 @@ constexpr std::uint64_t sorted_run_file_bytes(sorted_run_bounds_t const& bounds,
                                               std::uint64_t stored_values_bytes) noexcept {
     std::uint64_t const key_slots_end = stored_values_offset<key_slot_type_>(bounds, key_slots_count);
     if constexpr (locates_stored_values_concept<key_slot_type_>)
-        return key_slots_end + round_up(stored_values_bytes, bounds.alignment_bytes);
+        return key_slots_end + round_up_to_multiple(stored_values_bytes, bounds.alignment_bytes);
     else return key_slots_end;
 }
 
@@ -462,7 +462,7 @@ struct cpu_compactor_t {
 
         std::uint64_t cells_count = 0;
         for (std::size_t index = 0; index != output.sorted_runs.size(); ++index)
-            cells_count += round_up(output.sorted_runs[index].key_slots_count, bounds.branching);
+            cells_count += round_up_to_multiple(output.sorted_runs[index].key_slots_count, bounds.branching);
         status = output.cells.resize(cells_count);
         if (status != status_t::success_k) return status;
         key_slot_type_ const padding = padding_key_slot<key_slot_type_>();
@@ -687,7 +687,7 @@ st::status_t gpu_compactor_t::compact(compaction_kind_t kind,
         sorted_run_index_view<key_slot_type_> const& view = sorted_run < upper.size()
                                                                 ? upper[sorted_run]
                                                                 : lower[sorted_run - upper.size()];
-        std::uint64_t const cells = round_up(view.key_slots_count, bounds.branching);
+        std::uint64_t const cells = round_up_to_multiple(view.key_slots_count, bounds.branching);
         largest_cells = cells > largest_cells ? cells : largest_cells;
         merged_count += view.key_slots_count;
         if (sorted_run < upper.size()) upper_key_slots += view.key_slots_count;
@@ -833,7 +833,7 @@ st::status_t gpu_compactor_t::compact(compaction_kind_t kind,
                                                     stored_values_offset<key_slot_type_>(bounds, count),
                                                     sorted_run_index_layout_t(count, bounds.branching)};
         first += count;
-        cells_count += round_up(count, bounds.branching);
+        cells_count += round_up_to_multiple(count, bounds.branching);
     }
 
     std::uint64_t const migrations_count = locates_stored_values_concept<key_slot_type_> ? survivors : 0;

@@ -48,7 +48,7 @@
 #include "nvme/collection.hpp"        // `collection`, `select_result_t`
 #include "nvme/config.hpp"            // `collection_config_t`, `database_config_t`
 #include "nvme/database_snapshot.hpp" // `database_snapshot`
-#include "nvme/extent.hpp"            // `rounded_up_to`, `portable_alignment_k`
+#include "nvme/extent.hpp"            // `portable_alignment_k`
 #include "nvme/files_disk.hpp"        // `any_files_disk_t`
 #include "nvme/io_channel.hpp"        // `io_channel_t`, `basic_io_channel_pool`
 #include "nvme/io_pipeline.hpp"       // `basic_read_pipeline`, `basic_write_pipeline`, `require_completed_in_full`
@@ -1063,7 +1063,7 @@ class basic_database {
     status_t write_blob_(io_channel_t& channel, blob_name_t name, blob_kind_t kind,
                          std::span<byte_t const> bytes) noexcept {
         if (bytes.empty()) return {status_code_t::invalid_argument_k, "A named blob carries at least one byte"};
-        std::uint64_t const written = rounded_up_to(bytes.size(), portable_alignment_k);
+        std::uint64_t const written = round_up_to_multiple(bytes.size(), portable_alignment_k);
         if (written > channel.requests().buffer_bytes())
             return {status_code_t::capacity_exhausted_k, "That blob is longer than one block of a channel"};
 
@@ -1091,7 +1091,7 @@ class basic_database {
         auto [found, find_status] = router_->find(name);
         if (find_status.failed()) return find_status;
         if (into.size() < found.length) return {status_code_t::invalid_argument_k, "A buffer shorter than the blob"};
-        std::uint64_t const read = rounded_up_to(found.length, portable_alignment_k);
+        std::uint64_t const read = round_up_to_multiple(found.length, portable_alignment_k);
         if (read > channel.requests().buffer_bytes())
             return {status_code_t::capacity_exhausted_k, "That blob is longer than one block of a channel"};
 

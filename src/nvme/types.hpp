@@ -323,34 +323,6 @@ enum class compaction_state_t : std::int32_t {
 
 #pragma endregion Atomic Words
 
-#pragma region Rounding
-
-/** @p number rounded down to the previous multiple of @p multiple, which is a power of two. */
-template <typename unsigned_type_>
-constexpr unsigned_type_ rounddown_to_multiple(unsigned_type_ number, unsigned_type_ multiple) noexcept {
-    return static_cast<unsigned_type_>(number / multiple * multiple);
-}
-
-/** @p number rounded up to the next multiple of @p multiple, which is a power of two. */
-template <typename unsigned_type_>
-constexpr unsigned_type_ roundup_to_multiple(unsigned_type_ number, unsigned_type_ multiple) noexcept {
-    return static_cast<unsigned_type_>((number + multiple - 1) / multiple * multiple);
-}
-
-/** @p number rounded down to the previous multiple of @p multiple_, known at compile time. */
-template <typename unsigned_type_, unsigned_type_ multiple_>
-constexpr unsigned_type_ rounddown_to_multiple(unsigned_type_ number) noexcept {
-    return rounddown_to_multiple<unsigned_type_>(number, multiple_);
-}
-
-/** @p number rounded up to the next multiple of @p multiple_, known at compile time. */
-template <typename unsigned_type_, unsigned_type_ multiple_>
-constexpr unsigned_type_ roundup_to_multiple(unsigned_type_ number) noexcept {
-    return roundup_to_multiple<unsigned_type_>(number, multiple_);
-}
-
-#pragma endregion Rounding
-
 #pragma region Value Layouts
 
 /** Whether @p value_layout stores values of that width inside the key slot itself. */

@@ -14,11 +14,12 @@
 #include <algorithm>   // `std::ranges::equal`
 #include <bit>         // `std::bit_floor`
 #include <compare>     // `std::strong_ordering`
-#include <concepts>    // `std::same_as`, `std::integral`
+#include <concepts>    // `std::same_as`, `std::integral`, `std::unsigned_integral`
 #include <functional>  // `std::hash`
+#include <limits>      // `std::numeric_limits`
 #include <ranges>      // `std::ranges::contiguous_range`
 #include <string_view> // `std::string_view`
-#include <type_traits> // `std::remove_cvref_t`, `std::is_same_v`
+#include <type_traits> // `std::remove_cvref_t`, `std::is_same_v`, `std::type_identity_t`
 #include <utility>     // `std::exchange`, `std::swap`
 
 #include <ustore/ustore.h>
@@ -378,14 +379,24 @@ constexpr std::size_t bits_in_byte_k = 8;
 /** The power of two just above the highest set bit of @p value. */
 inline std::size_t next_power_of_two(std::size_t value) noexcept { return std::bit_floor(value) << 1; }
 
-template <std::integral integer_ = std::size_t>
-integer_ divide_round_up(integer_ value, integer_ divisor) noexcept {
-    return (value + (divisor - 1)) / divisor;
+/** @p value divided by @p divisor and rounded up, without the overflow `value + divisor - 1` risks near the limit. */
+template <std::unsigned_integral integer_>
+constexpr integer_ divide_round_up(integer_ value, std::type_identity_t<integer_> divisor) noexcept {
+    return static_cast<integer_>(value / divisor + (value % divisor != 0));
 }
 
-template <std::integral integer_ = std::size_t>
-integer_ next_multiple(integer_ value, integer_ divisor) noexcept {
-    return divide_round_up(value, divisor) * divisor;
+/** The greatest multiple of @p multiple at or below @p value. */
+template <std::unsigned_integral integer_>
+constexpr integer_ round_down_to_multiple(integer_ value, std::type_identity_t<integer_> multiple) noexcept {
+    return static_cast<integer_>(value - value % multiple);
+}
+
+/** The least multiple of @p multiple at or above @p value, saturating at the greatest multiple @p integer_ holds. */
+template <std::unsigned_integral integer_>
+constexpr integer_ round_up_to_multiple(integer_ value, std::type_identity_t<integer_> multiple) noexcept {
+    integer_ const below = round_down_to_multiple(value, multiple);
+    if (below == value || below > std::numeric_limits<integer_>::max() - multiple) return below;
+    return static_cast<integer_>(below + multiple);
 }
 
 /** The document field type that stores @p element_. */

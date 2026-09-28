@@ -33,7 +33,7 @@
 #include "nvme/buffer_pool.hpp"    // `pooled_buffer_t`
 #include "nvme/catalog.hpp"        // `blob_kind_t`
 #include "nvme/compaction.cuh"     // `cpu_compactor_t`, `compaction_output`, `compaction_kind_t`
-#include "nvme/extent.hpp"         // `extent_t`, `rounded_up_to`, `portable_alignment_k`
+#include "nvme/extent.hpp"         // `extent_t`, `portable_alignment_k`
 #include "nvme/io_channel.hpp"     // `io_channel_t`
 #include "nvme/io_pipeline.hpp"    // `basic_read_pipeline`, `basic_write_pipeline`, `require_completed_in_full`
 #include "nvme/lsm_level.hpp"      // `lsm_level`, `lsm_level_order_t`, `lsm_level_depth_t`
@@ -126,14 +126,14 @@ inline status_t compaction_status(st::status_t status) noexcept {
 /** Drains a channel's queue pair before the pipelines above it hand their blocks back, which a failure needs too. */
 template <typename disk_type_>
     requires ring_concept<disk_type_>
-class channel_drain_t {
+class channel_drain {
   public:
 
-    channel_drain_t(disk_type_& disk, io_channel_t& channel) noexcept : disk_(disk), channel_(channel) {}
-    channel_drain_t(channel_drain_t const&) = delete;
-    channel_drain_t& operator=(channel_drain_t const&) = delete;
+    channel_drain(disk_type_& disk, io_channel_t& channel) noexcept : disk_(disk), channel_(channel) {}
+    channel_drain(channel_drain const&) = delete;
+    channel_drain& operator=(channel_drain const&) = delete;
 
-    ~channel_drain_t() noexcept { [[maybe_unused]] status_t const drained = disk_.drain(channel_.queue_pair()); }
+    ~channel_drain() noexcept { [[maybe_unused]] status_t const drained = disk_.drain(channel_.queue_pair()); }
 
   private:
 
@@ -283,7 +283,7 @@ class lsm_level_merger {
                 [[maybe_unused]] status_t const abandoned = merged.drop(volume, writing_channel);
                 return adopted;
             }
-            first_cell += round_up(planned.key_slots_count, sorted_run_layout_t::branching_k);
+            first_cell += round_up_to_multiple(planned.key_slots_count, sorted_run_layout_t::branching_k);
             first_key_slot += planned.key_slots_count;
         }
         return merged;
@@ -475,13 +475,13 @@ class lsm_level_merger {
                                     std::span<sorted_run_t const* const> sources, compaction_output_t const& output,
                                     planned_run_t const& planned, sorted_run_header_t const& header, blob_t const& blob,
                                     compaction_cancellation_t const* cancellation) noexcept {
-        std::uint64_t const block_bytes = rounded_down_to(writing_channel.streams().buffer_bytes(),
-                                                          portable_alignment_k);
+        std::uint64_t const block_bytes = round_down_to_multiple(writing_channel.streams().buffer_bytes(),
+                                                                 portable_alignment_k);
         if (block_bytes < sorted_run_layout_t::header_bytes())
             return {status_code_t::capacity_exhausted_k, "A channel's streaming block is shorter than a run's header"};
 
         write_pipeline_t writer {volume.disk(), writing_channel, blob.medium};
-        channel_drain_t<disk_t> const parked {volume.disk(), writing_channel};
+        channel_drain<disk_t> const parked {volume.disk(), writing_channel};
         if (stopped_(cancellation)) return cancelled_status_();
 
         std::uint64_t const head_bytes = sorted_run_layout_t::header_bytes();
@@ -544,8 +544,8 @@ class lsm_level_merger {
             std::uint64_t const section = sorted_run_layout_t::values_section_bytes(header.stored_values_bytes);
             if (section == 0) return {};
             std::uint64_t const values_offset = sorted_run_layout_t::values_offset(header.key_slots_count);
-            std::uint64_t const read_block = rounded_down_to(reading_channel.requests().buffer_bytes(),
-                                                             portable_alignment_k);
+            std::uint64_t const read_block = round_down_to_multiple(reading_channel.requests().buffer_bytes(),
+                                                                    portable_alignment_k);
             if (read_block == 0)
                 return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than one page"};
 
@@ -558,7 +558,7 @@ class lsm_level_merger {
                 return {status_code_t::out_of_memory_k, "A merge could not stage the values it gathers"};
 
             read_pipeline_t reader {volume.disk(), reading_channel, volume.medium()};
-            channel_drain_t<disk_t> const parked {volume.disk(), reading_channel};
+            channel_drain<disk_t> const parked {volume.disk(), reading_channel};
 
             status_t first;
             auto sink = [&](completed_buffer_t const& completed) noexcept {
@@ -591,9 +591,11 @@ class lsm_level_merger {
                             chunk_offset = 0;
                             continue;
                         }
-                        std::uint64_t const aligned = rounded_down_to(migration.old_location, portable_alignment_k);
+                        std::uint64_t const aligned = round_down_to_multiple(migration.old_location,
+                                                                             portable_alignment_k);
                         std::uint64_t const skipped = migration.old_location - aligned;
-                        std::uint64_t const covered = rounded_up_to(skipped + migration.size, portable_alignment_k);
+                        std::uint64_t const covered = round_up_to_multiple(skipped + migration.size,
+                                                                           portable_alignment_k);
                         extent_t const window = sources[migration.old_sorted_run]->blob().slice(aligned, covered);
                         if (window.length != covered)
                             return {status_code_t::malformed_k, "A source run is shorter than the value it locates"};

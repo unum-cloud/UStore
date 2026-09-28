@@ -139,12 +139,12 @@ struct stored_value_location<value_layout_t::fixed_width_k> : public stored_valu
     /** Bytes a buffer needs for the value, rounded out to what unbuffered I/O accepts. */
     stored_value_size_t aligned_buffer_size() const noexcept {
         stored_value_size_t const padded_size = stored_value_size_t(size_bytes != 0) * (buffer_padding() + size_bytes);
-        return roundup_to_multiple<stored_value_size_t, buffer_alignment_k>(padded_size);
+        return round_up_to_multiple<stored_value_size_t>(padded_size, buffer_alignment_k);
     }
 
     /** Where an unbuffered read of the value starts inside the file. */
     stored_value_size_t aligned_offset_in_file() const noexcept {
-        return rounddown_to_multiple<stored_value_offset_t, buffer_alignment_k>(offset);
+        return round_down_to_multiple<stored_value_offset_t>(offset, buffer_alignment_k);
     }
 
     /** Bytes between the start of the aligned read and the value itself. */
@@ -172,12 +172,12 @@ struct stored_value_location<value_layout_t::variable_width_k>
     stored_value_size_t aligned_buffer_size() const noexcept {
         bool const is_nonempty = bool(*this) && offset != empty_stored_value_offset_k;
         stored_value_size_t const padded_size = stored_value_size_t(is_nonempty) * (buffer_padding() + size_bytes);
-        return roundup_to_multiple<stored_value_size_t, buffer_alignment_k>(padded_size);
+        return round_up_to_multiple<stored_value_size_t>(padded_size, buffer_alignment_k);
     }
 
     /** Where an unbuffered read of the value starts inside the file. */
     stored_value_size_t aligned_offset_in_file() const noexcept {
-        return rounddown_to_multiple<stored_value_offset_t, buffer_alignment_k>(offset);
+        return round_down_to_multiple<stored_value_offset_t>(offset, buffer_alignment_k);
     }
 
     /** Bytes between the start of the aligned read and the value itself. */

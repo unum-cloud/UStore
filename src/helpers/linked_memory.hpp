@@ -26,7 +26,7 @@
 #include <forkunion.h>
 
 #include <ustore/ranges.hpp> // `bits_span_t`
-#include <ustore/types.hpp>  // `next_multiple`, `divide_round_up`
+#include <ustore/types.hpp>  // `round_up_to_multiple`, `divide_round_up`
 
 namespace unum::ustore {
 
@@ -70,7 +70,7 @@ struct linked_memory_t {
         void* alloc_internally(std::size_t length, std::size_t alignment) noexcept {
             auto const arena_start = reinterpret_cast<std::uintptr_t>(this);
             std::uintptr_t const arena_end = arena_start + capacity;
-            std::uintptr_t const potential_start = next_multiple<std::uintptr_t>(arena_start + used, alignment);
+            std::uintptr_t const potential_start = round_up_to_multiple<std::uintptr_t>(arena_start + used, alignment);
             std::uintptr_t const potential_end = potential_start + length;
             if (potential_end > arena_end) return nullptr;
             used = potential_end - arena_start;

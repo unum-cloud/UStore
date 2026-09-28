@@ -16,11 +16,13 @@
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint64_t`
 
+#include <bit> // `std::has_single_bit`
+
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
 #include <ustore/status.hpp> // `status_t`, `status_code_t`, `expected`
 
-#include "nvme/extent.hpp" // `extent_t`, `is_power_of_two`, `rounded_up_to`
+#include "nvme/extent.hpp" // `extent_t`
 
 namespace unum::ustore::nvme {
 
@@ -63,7 +65,7 @@ class extent_allocator_t {
      */
     static expected<extent_allocator_t> make(extent_t region, std::uint64_t granularity,
                                              std::uint64_t large_alignment) noexcept {
-        if (!is_power_of_two(granularity) || !is_power_of_two(large_alignment))
+        if (!std::has_single_bit(granularity) || !std::has_single_bit(large_alignment))
             return status_t {status_code_t::invalid_argument_k, "An allocation granularity is a power of two"};
         if (large_alignment < granularity)
             return status_t {status_code_t::invalid_argument_k, "A large allocation is aligned no more finely"};
@@ -102,7 +104,7 @@ class extent_allocator_t {
      */
     expected<extent_t> allocate(std::uint64_t length) noexcept {
         if (length == 0) return status_t {status_code_t::invalid_argument_k, "An allocation of no bytes names nothing"};
-        std::uint64_t const rounded = rounded_up_to(length, granularity_);
+        std::uint64_t const rounded = round_up_to_multiple(length, granularity_);
         if (rounded < length)
             return status_t {status_code_t::capacity_exhausted_k, "The rounded length does not fit an address"};
         std::uint64_t const alignment = rounded >= large_allocation_bytes_k ? large_alignment_ : granularity_;
@@ -113,7 +115,7 @@ class extent_allocator_t {
         std::uint64_t chosen_offset = 0;
         for (std::size_t index = 0; index != free_ranges_.size(); ++index) {
             extent_t const range = free_ranges_[index];
-            std::uint64_t const start = rounded_up_to(range.offset, alignment);
+            std::uint64_t const start = round_up_to_multiple(range.offset, alignment);
             if (start < range.offset || start > range.end()) continue;
             std::uint64_t const reachable = range.end() - start;
             if (reachable < rounded) continue;
