@@ -58,28 +58,31 @@ from ustore.table_view import Table
 with ustore.Database.open_ram() as database:
     database.write([1, 2], [b"a", b"bb"])
     values = database.read([1, 2])                      # Values, indexed as memoryviews
-    database.scan_batch([1, 100], [16, 32])             # Keys, one ascending run per request
+    database.scan_batch([1, 100], [16, 32])             # Keys, one ascending run of UUIDs per request
 
     people = database.collection_create("people")
     database.docs_write([10, 11], ['{"name": "Lex", "tweets": 2221}', '{"name": "Joe"}'], collection=people)
     database.docs_gist([10, 11], collection=people)     # ("/name", "/tweets")
     columns = database.docs_gather([10, 11], ["name", "tweets"], ["str", "i64"], collection=people)
     columns[1], columns.validity(1)                     # memoryview of "q", bitmap bytes
-    prices = numpy.array([1.5, 2.5], dtype=numpy.float64)
+    prices = np.array([1.5, 2.5], dtype=np.float64)
     database.docs_write([10, 11], prices, field="price", type="f64", collection=people)
 
     follows = database.collection_create("follows")
-    database.graph_upsert_edges(numpy.array([1, 2]), numpy.array([2, 3]), collection=follows)
+    database.graph_upsert_edges(np.array([1, 2]), np.array([2, 3]), collection=follows)
     edges = database.graph_find_edges([1, 2, 3], role="any", collection=follows)
-    numpy.asarray(edges)                                # (edges, 3) of source, target, edge
+    np.asarray(edges)                                # (edges, 3, 16) bytes of source, target, edge
 
     graph = DiGraph(database, "graph", nodes="nodes", edges="edges")
     graph.add_edge(1, 2, weight=3)
-    list(graph.edges(data=True))                        # [(1, 2, {"weight": 3})]
+    list(graph.edges(data=True))                        # [(UUID(int=1), UUID(int=2), {"weight": 3})]
     Table(database, people).astype({"tweets": "int64"}).to_pandas(page=1 << 16)
 ```
 
 A document or a vertex is a value like any other, so documents, graphs and binary values each keep collections of their own.
+
+A key is a `uuid.UUID`, its text, sixteen raw bytes, or a non-negative integer read as `uuid.UUID(int=n)`, so the integers above order as integers do.
+Keys, vertices and collection IDs come back as `uuid.UUID`, and a key batch passes without a copy as a contiguous array of 16-byte records, such as NumPy's `V16` or an (n, 16) `uint8` array, which is also how `np.asarray` reads a `Keys` or `Edges` tape.
 
 ## Typed Columns, Batches and Options
 

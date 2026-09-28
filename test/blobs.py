@@ -1,9 +1,11 @@
 """Binary values over the C ABI: single and batch access, scans, samples and measurements."""
 
 import gc
+from uuid import UUID
 
-import numpy
+import numpy as np
 import pytest
+from capabilities import key, keys
 
 import ustore
 
@@ -28,12 +30,21 @@ VALUE_SHAPES = {
     "paged": bytes(range(256)) * 4096,
 }
 
+
+def records(integers: list[int]) -> np.ndarray:
+    """Integer keys as the 16-byte records a batch borrows without converting them."""
+    return np.frombuffer(b"".join(uuid.bytes for uuid in keys(integers)), dtype="V16")
+
+
 KEY_CONTAINERS = {
     "list": list,
     "tuple": tuple,
-    "int64": lambda keys: numpy.array(keys, dtype=numpy.int64),
-    "uint64": lambda keys: numpy.array(keys, dtype=numpy.uint64),
-    "int32": lambda keys: numpy.array(keys, dtype=numpy.int32),
+    "uuids": keys,
+    "records": records,
+    "rows": lambda integers: records(integers).view(np.uint8).reshape(-1, 16),
+    "int64": lambda integers: np.array(integers, dtype=np.int64),
+    "uint64": lambda integers: np.array(integers, dtype=np.uint64),
+    "int32": lambda integers: np.array(integers, dtype=np.int32),
 }
 
 
@@ -66,17 +77,39 @@ def test_set_none_removes(view):
     assert not view.contains(9)
 
 
-@pytest.mark.parametrize("key", [0, -1, 2**63 - 2, -(2**63)])
-def test_keys_span_the_signed_range(view, key: int):
-    """Every signed 64-bit key but the one reserved for unknown keys addresses a value."""
-    view.set(key, b"edge")
-    assert view.get(key) == b"edge"
+@pytest.mark.parametrize("boundary", [0, 2**63, 2**64 - 2])
+def test_keys_span_the_lower_64_bits(view, boundary: int):
+    """Every engine addresses the integer keys that fit 64 bits."""
+    view.set(boundary, b"edge")
+    assert view.get(boundary) == b"edge"
 
 
-@pytest.mark.parametrize("key", [2**63, -(2**63) - 1])
-def test_rejects_a_key_past_64_bits(view, key: int):
+@pytest.mark.parametrize("boundary", [2**64, 2**128 - 2, UUID("0190b8f2-6c4e-7a31-9d4f-2b6c8e1a5f37")])
+def test_keys_span_128_bits(view, engine: str, boundary: int | UUID):
+    """Every key but the one reserved for unknown keys addresses a value, while NVMe still stops at 64 bits."""
+    if engine == "nvme":
+        with pytest.raises(ustore.UnsupportedError):
+            view.set(boundary, b"edge")
+        return
+    view.set(boundary, b"edge")
+    assert view.get(boundary) == b"edge"
+
+
+@pytest.mark.parametrize("boundary", [2**128, -1])
+def test_rejects_an_integer_outside_128_bits(view, boundary: int):
     with pytest.raises(OverflowError):
-        view.get(key)
+        view.get(boundary)
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [5, np.uint64(5), key(5), str(key(5)), key(5).bytes],
+    ids=["integer", "numpy", "uuid", "text", "bytes"],
+)
+def test_every_spelling_of_a_key_addresses_one_value(view, spelling):
+    view.set(spelling, b"v")
+    assert view.get(5) == b"v"
+    assert view.scan(0, 2)[0] == (key(5),)
 
 
 # endregion Single Access
@@ -87,7 +120,7 @@ def test_rejects_a_key_past_64_bits(view, key: int):
 @pytest.mark.parametrize("count", BATCH_SIZES)
 @pytest.mark.parametrize("container", KEY_CONTAINERS)
 def test_batch_round_trip(view, count: int, container: str):
-    """A batch reads back in the order it was asked for, borrowed as 64-bit keys or converted one by one."""
+    """A batch reads back in the order it was asked for, borrowed as 16-byte keys or converted from integers."""
     keys = KEY_CONTAINERS[container](list(range(count)))
     values = [str(key).encode() * (key % 3 + 1) for key in range(count)]
     view.write(keys, values)
@@ -129,9 +162,7 @@ def test_batch_removes_one_key_of_many(view, removed: int):
     assert not view.contains(30 + removed)
 
 
-@pytest.mark.parametrize(
-    "keys", [[40], [40, 41], numpy.array([40, 41], dtype=numpy.int64)], ids=["one", "two", "numpy"]
-)
+@pytest.mark.parametrize("keys", [[40], [40, 41], np.array([40, 41], dtype=np.int64)], ids=["one", "two", "numpy"])
 def test_batch_pop(view, keys):
     view.write([40, 41], [b"a", b"b"])
     view.pop(keys)
@@ -189,11 +220,13 @@ def test_whole_tape_exports_a_buffer(view):
     assert bytes(memoryview(view.read([1, 2]))) == b"abcd"
 
 
-def test_keys_export_as_signed_integers(view):
+def test_keys_export_as_16_byte_records(view):
     view.write([5, 6], b"v")
-    page = view.scan(0, 2)[0]
-    assert page.format == "q"
-    assert numpy.asarray(page).tolist() == [5, 6]
+    found = view.scan(0, 2)
+    assert found[0] == (key(5), key(6))
+    exported = memoryview(found)
+    assert (exported.format, exported.shape) == ("B", (2, 16))
+    assert exported.tobytes() == key(5).bytes + key(6).bytes
 
 
 @pytest.mark.parametrize("index", [1, -2, 5])
@@ -215,19 +248,19 @@ def test_rejects_an_index_past_the_batch(view, index: int):
 def test_scan(view, start: int, count: int, expected: list[int]):
     view.write([10, 20, 30, 40, 50, 60], b"v")
     page = view.scan(start, count)
-    assert list(page[0]) == expected
+    assert list(page[0]) == keys(expected)
     assert page.counts == (len(expected),)
 
 
 @pytest.mark.parametrize("page_size", [1, 2, 3, 7, 8])
 def test_scan_paginates_from_the_last_key(view, page_size: int):
     view.write(list(range(1, 8)), b"v")
-    walked: list[int] = []
+    walked: list[UUID] = []
     start = 0
     while page := list(view.scan(start, page_size)[0]):
         walked.extend(page)
-        start = page[-1] + 1
-    assert walked == list(range(1, 8))
+        start = page[-1].int + 1
+    assert walked == keys(range(1, 8))
 
 
 @pytest.mark.parametrize("count", [0, 1, 3, 9, 20])
@@ -235,7 +268,7 @@ def test_sample(view, count: int):
     view.write(list(range(1, 10)), b"v")
     drawn = list(view.sample(count)[0])
     assert len(drawn) == len(set(drawn)) == min(count, 9)
-    assert set(drawn) <= set(range(1, 10))
+    assert set(drawn) <= set(keys(range(1, 10)))
 
 
 def test_measure(view):
@@ -263,12 +296,26 @@ def test_measure(view):
         (lambda view: view.get(1, colection=None), TypeError),
         (lambda view: view.set(1, 42), TypeError),
         (lambda view: view.set(1, "text"), TypeError),
-        (lambda view: view.get("one"), TypeError),
+        (lambda view: view.get("one"), ValueError),
+        (lambda view: view.get(b"short"), ValueError),
+        (lambda view: view.get(1.0), TypeError),
         (lambda view: view.read(1), TypeError),
+        (lambda view: view.read(str(key(1))), TypeError),
         (lambda view: view.scan(0, -1), ValueError),
         (lambda view: view.get(), TypeError),
     ],
-    ids=["keyword", "integer-value", "string-value", "string-key", "bare-key-read", "negative-count", "no-key"],
+    ids=[
+        "keyword",
+        "integer-value",
+        "string-value",
+        "malformed-text-key",
+        "short-bytes-key",
+        "float-key",
+        "bare-key-read",
+        "text-key-read",
+        "negative-count",
+        "no-key",
+    ],
 )
 def test_rejects_malformed_arguments(view, call, failure: type):
     with pytest.raises(failure):

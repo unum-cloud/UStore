@@ -76,7 +76,7 @@ struct fixture_t {
     ustore_database_t database = nullptr;
 
     /** The strings collection every call of a case addresses. */
-    ustore_collection_t collection = ustore_collection_main_k;
+    ustore_collection_id_t collection = ustore_collection_main_k;
 
     /** Reusable memory for the results. */
     ustore_arena_t arena = nullptr;
@@ -94,7 +94,7 @@ struct fixture_t {
         create.db = database;
         create.error = &error;
         create.modality = ustore_modality_strings_k;
-        create.id = &collection;
+        create.collection = &collection;
         ustore_collection_create(&create);
         if (error.status) fmt::println(stderr, "  failed to create a strings collection: {}", error.message);
     }

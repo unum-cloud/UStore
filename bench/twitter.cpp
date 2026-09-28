@@ -96,10 +96,10 @@ struct twitter_t {
     ustore_database_t db = nullptr;
 
     /** Collection of tweet and author documents. */
-    ustore_collection_t docs = ustore_collection_main_k;
+    ustore_collection_id_t docs = ustore_collection_main_k;
 
     /** Collection of the graph between tweets and authors. */
-    ustore_collection_t graph = ustore_collection_main_k;
+    ustore_collection_id_t graph = ustore_collection_main_k;
 
     /** Memory-mapped NDJSON files the tweets come from. */
     st::basic_vector<mapped_file_t> files;
@@ -119,9 +119,9 @@ struct twitter_t {
                                st::basic_vector<graph_edge_t>& edges) noexcept {
     yyjson_val* const id = yyjson_obj_get(tweet, "id");
     yyjson_val* const user_id = yyjson_obj_get(yyjson_obj_get(tweet, "user"), "id");
-    if (!yyjson_is_int(id) || !yyjson_is_int(user_id)) return true;
-    ustore_key_t const tweet_key = yyjson_get_sint(id);
-    ustore_key_t const user_key = yyjson_get_sint(user_id);
+    if (!yyjson_is_uint(id) || !yyjson_is_uint(user_id)) return true;
+    ustore_key_t const tweet_key = key_from_integer(yyjson_get_uint(id));
+    ustore_key_t const user_key = key_from_integer(yyjson_get_uint(user_id));
 
     if (st::failed(documents.push_back(keyed_document_t {tweet_key, body})) ||
         st::failed(documents.push_back(keyed_document_t {user_key, body})) ||
@@ -131,10 +131,11 @@ struct twitter_t {
     yyjson_val* const retweet = yyjson_obj_get(tweet, "retweeted_status");
     yyjson_val* const retweet_id = yyjson_obj_get(retweet, "id");
     yyjson_val* const retweet_user_id = yyjson_obj_get(yyjson_obj_get(retweet, "user"), "id");
-    if (yyjson_is_int(retweet_id) && yyjson_is_int(retweet_user_id)) {
-        ustore_key_t const retweet_key = yyjson_get_sint(retweet_id);
+    if (yyjson_is_uint(retweet_id) && yyjson_is_uint(retweet_user_id)) {
+        ustore_key_t const retweet_key = key_from_integer(yyjson_get_uint(retweet_id));
         if (st::failed(edges.push_back(graph_edge_t {tweet_key, retweet_key, ustore_default_edge_id_k})) ||
-            st::failed(edges.push_back(graph_edge_t {user_key, yyjson_get_sint(retweet_user_id), retweet_key})))
+            st::failed(edges.push_back(
+                graph_edge_t {user_key, key_from_integer(yyjson_get_uint(retweet_user_id)), retweet_key})))
             return false;
     }
 
@@ -143,8 +144,9 @@ struct twitter_t {
     if (!yyjson_arr_iter_init(mentions, &iterator)) return true;
     for (yyjson_val* mention = yyjson_arr_iter_next(&iterator); mention; mention = yyjson_arr_iter_next(&iterator)) {
         yyjson_val* const mentioned_id = yyjson_obj_get(mention, "id");
-        if (!yyjson_is_int(mentioned_id)) return true;
-        if (st::failed(edges.push_back(graph_edge_t {user_key, yyjson_get_sint(mentioned_id), tweet_key})))
+        if (!yyjson_is_uint(mentioned_id)) return true;
+        if (st::failed(
+                edges.push_back(graph_edge_t {user_key, key_from_integer(yyjson_get_uint(mentioned_id)), tweet_key})))
             return false;
     }
     return true;
@@ -556,13 +558,15 @@ void graph_traverse_two_hops(bm::State& state, twitter_t const& twitter) {
 
 #pragma region Database
 
-/** Creates a collection into @p id, reporting a failure against @p name on the standard error. */
-[[nodiscard]] bool create_collection(ustore_database_t db, char const* name, ustore_collection_t& id) noexcept {
+/** Creates a collection holding @p modality into @p id, reporting a failure against @p name on the standard error. */
+[[nodiscard]] bool create_collection(ustore_database_t db, char const* name, ustore_modality_t modality,
+                                     ustore_collection_id_t& id) noexcept {
     ustore_error_t error {};
     ustore_collection_create_t create {};
     create.db = db;
     create.error = &error;
-    create.id = &id;
+    create.modality = modality;
+    create.collection = &id;
     ustore_collection_create(&create);
     if (!error.status) return true;
     fmt::println(stderr, "Failed to create {}: {}", name, error.message);
@@ -570,12 +574,12 @@ void graph_traverse_two_hops(bm::State& state, twitter_t const& twitter) {
 }
 
 /** Drops @p id as @p mode asks, reporting a failure on the standard error. */
-void drop_collection(ustore_database_t db, ustore_collection_t id, ustore_drop_mode_t mode) noexcept {
+void drop_collection(ustore_database_t db, ustore_collection_id_t id, ustore_drop_mode_t mode) noexcept {
     ustore_error_t error {};
     ustore_collection_drop_t drop {};
     drop.db = db;
     drop.error = &error;
-    drop.id = id;
+    drop.collection = id;
     drop.mode = mode;
     ustore_collection_drop(&drop);
     if (error.status) fmt::println(stderr, "Failed to clear a collection: {}", error.message);
@@ -662,8 +666,9 @@ int main(int argc, char** argv) {
 
     bool const supports_collections = (capabilities & ustore_supports_collections_k) != 0;
     bool const supports_transactions = (capabilities & ustore_supports_transactions_k) != 0;
-    if (supports_collections && (!create_collection(twitter.db, "twitter.docs", twitter.docs) ||
-                                 !create_collection(twitter.db, "twitter.graph", twitter.graph))) {
+    if (supports_collections &&
+        (!create_collection(twitter.db, "twitter.docs", ustore_modality_docs_k, twitter.docs) ||
+         !create_collection(twitter.db, "twitter.graph", ustore_modality_graph_k, twitter.graph))) {
         ustore_database_free(twitter.db);
         return 1;
     }

@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import networkx
-import numpy
+import numpy as np
 from networkx.algorithms.community import louvain_communities
 
 import ustore
@@ -187,12 +187,16 @@ def main() -> None:
     print(f"  {len(set(partition.values()))} communities", flush=True)
 
     with getattr(ustore.Database, f"open_{settings.engine}")(settings.directory) as database:
-        edges = numpy.array(reference.edges, dtype=numpy.int64).reshape(-1, 2)
+        edges = np.array(reference.edges, dtype=np.int64).reshape(-1, 2)
         isolated = [node for node, degree in reference.degree if degree == 0]
-        timed("UStore import", lambda: database.graph_upsert_edges(edges[:, 0].copy(), edges[:, 1].copy()))
+        stored = Graph(database, "graph")
+        graph = stored.graph_collection
+        timed(
+            "UStore import",
+            lambda: database.graph_upsert_edges(edges[:, 0].copy(), edges[:, 1].copy(), collection=graph),
+        )
         if isolated:
-            database.graph_upsert_vertices(isolated)
-        stored = Graph(database)
+            database.graph_upsert_vertices(isolated, collection=graph)
         partition = timed("Python baseline over UStore", lambda: best_partition(stored))
         print(f"  {len(set(partition.values()))} communities", flush=True)
 

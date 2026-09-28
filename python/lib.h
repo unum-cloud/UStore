@@ -29,10 +29,17 @@
  *
  *  @section python_buffers Buffer Protocol and Batches
  *
- *  Keys and values arrive through PEP 3118 where the layout allows it, so a NumPy array of keys
- *  reaches the ABI without a copy and NumPy is never a build-time dependency. A batch small enough
- *  lays its strided arrays out on the stack, so the hot path allocates nothing beyond the objects
- *  CPython itself demands.
+ *  Keys and values arrive through PEP 3118 where the layout allows it, so a NumPy array of 16-byte
+ *  keys reaches the ABI without a copy and NumPy is never a build-time dependency. A batch small
+ *  enough lays its strided arrays out on the stack, so the hot path allocates nothing beyond the
+ *  objects CPython itself demands.
+ *
+ *  @section python_identifiers Keys and Collection IDs
+ *
+ *  A key and a collection ID are 16-byte UUIDs, which Python meets as `uuid.UUID`. A key is read
+ *  from a `uuid.UUID`, 16 raw bytes, canonical UUID text, or a non-negative integer below 2**128,
+ *  which spells as its 128-bit big-endian bytes the way `uuid.UUID(int=n)` does, so integer keys
+ *  order as the integers. Every key and collection ID a verb answers is a `uuid.UUID`.
  */
 #ifndef UNUM_USTORE_PYTHON_LIB_H
 #define UNUM_USTORE_PYTHON_LIB_H
@@ -90,8 +97,18 @@ enum {
 
 #pragma region Shared Types
 
+/** The `uuid.UUID` class every key and collection ID is answered as, imported once at module init. */
+extern PyObject* UUIDType;
+
+/**
+ *  @brief Imports `uuid.UUID` into @c UUIDType, which every conversion between keys and objects needs.
+ *  @return 0 on success, or -1 with an exception set.
+ */
+int ustore_py_uuid_import(void);
+
 extern PyTypeObject DatabaseType;
 extern PyTypeObject TransactionType;
+extern PyTypeObject SnapshotType;
 extern PyTypeObject ValuesType;
 extern PyTypeObject KeysType;
 extern PyTypeObject ColumnsType;
@@ -155,6 +172,9 @@ typedef struct Database {
 
     /** Transactions still holding this database, which must reach zero before it closes. */
     Py_ssize_t transactions;
+
+    /** Snapshots still pinning this database, which must reach zero before it closes. */
+    Py_ssize_t snapshots;
 } Database;
 
 /** An optimistic transaction grouping operations across collections and modalities. */
@@ -173,6 +193,19 @@ typedef struct Transaction {
     ustore_options_t options;
 } Transaction;
 
+/** A point-in-time view of the whole database, which a read names through its `snapshot` keyword. */
+typedef struct Snapshot {
+
+    /** The object header every instance carries. */
+    PyObject ob_base;
+
+    /** The pinned view, or NULL once it has been closed. */
+    ustore_snapshot_t handle;
+
+    /** The database this snapshot reads, kept alive for its whole life. */
+    PyObject* database;
+} Snapshot;
+
 /**
  *  @brief The database, the view and the arena one verb runs against.
  *
@@ -188,7 +221,7 @@ typedef struct ustore_py_context_t {
     /** The transaction the verb joins, or NULL for the head. */
     ustore_transaction_t transaction;
 
-    /** The snapshot the verb reads, or zero for the head. */
+    /** The snapshot the verb reads, or NULL for the head. */
     ustore_snapshot_t snapshot;
 
     /** Options the view adds to the verb's own, such as the watch of a transaction. */
@@ -198,9 +231,9 @@ typedef struct ustore_py_context_t {
 /**
  *  @brief A batch of keys, and whatever storage gathering them needed.
  *
- *  A caller passing a contiguous buffer of 64-bit keys hands us the array outright and @c owned
- *  stays NULL; a caller passing a sequence of integers gets the inline run, or one allocation when
- *  the batch outgrows it.
+ *  A caller passing a contiguous buffer of 16-byte keys hands us the array outright and @c owned
+ *  stays NULL; a caller passing a buffer of 64-bit integers or a sequence of keys gets them
+ *  converted into the inline run, or into one allocation when the batch outgrows it.
  */
 typedef struct ustore_py_keys_t {
 
@@ -326,6 +359,12 @@ typedef struct Keys {
 
     /** Tasks the scan or sample carried. */
     size_t count;
+
+    /** The shape the whole tape exports: keys, then the sixteen bytes of each. */
+    Py_ssize_t shape[2];
+
+    /** The strides matching @c shape. */
+    Py_ssize_t strides[2];
 } Keys;
 
 /**
@@ -377,8 +416,8 @@ typedef struct Columns {
 /**
  *  @brief The edges one batch of vertices connects to, read back off the arena that holds them.
  *
- *  Every edge is three keys - source, target and edge identifier - laid end to end vertex after
- *  vertex, so the whole tape exports as an array of shape (edges, 3). The object owns the arena on
+ *  Every edge is three keys - source, target and edge ID - laid end to end vertex after vertex,
+ *  so the whole tape exports as an array of shape (edges, 3, 16) bytes. The object owns the arena on
  *  the same terms a tape of values does.
  */
 typedef struct Edges {
@@ -401,11 +440,11 @@ typedef struct Edges {
     /** Vertices the lookup carried. */
     size_t count;
 
-    /** The shape the whole tape exports: edges, then the three keys of each. */
-    Py_ssize_t shape[2];
+    /** The shape the whole tape exports: edges, the three keys of each, and the sixteen bytes of a key. */
+    Py_ssize_t shape[3];
 
     /** The strides matching @c shape. */
-    Py_ssize_t strides[2];
+    Py_ssize_t strides[3];
 } Edges;
 
 /**
@@ -506,9 +545,9 @@ void ustore_py_arena_return(Database* database, ustore_arena_t arena);
 typedef struct ustore_py_verb_options_t {
 
     /** The collection the tasks address. */
-    ustore_collection_t collection;
+    ustore_collection_id_t collection;
 
-    /** The snapshot a read follows, or zero for the head. */
+    /** The snapshot a read follows, or NULL for the head. */
     ustore_snapshot_t snapshot;
 
     /** Flags the verb adds to the view's own. */
@@ -555,16 +594,39 @@ int ustore_py_verb_options_from_keywords(ustore_py_context_t const* context, PyO
 int ustore_py_context_from_object(PyObject* self, ustore_py_context_t* context);
 
 /**
- *  @brief Reads one key from an object CPython can index.
- *  @param[in] object The key, as an integer or anything that becomes one.
+ *  @brief Reads one UUID from a `uuid.UUID`, 16 raw bytes, canonical UUID text or a non-negative integer.
+ *  @param[in] object The identifier in any of those spellings.
+ *  @param[out] uuid The sixteen bytes it spells, an integer big-endian as `uuid.UUID(int=n)` spells it.
+ *  @return 0 on success, -1 with an exception set otherwise.
+ */
+int ustore_py_uuid_from_object(PyObject* object, ustore_uuid_t* uuid);
+
+/**
+ *  @brief Builds the `uuid.UUID` whose bytes are @p uuid.
+ *  @param[in] uuid The sixteen bytes, in the order they are stored.
+ *  @return A new reference, or NULL with an exception set.
+ */
+PyObject* ustore_py_uuid_to_object(ustore_uuid_t const* uuid);
+
+/**
+ *  @brief Reads one key from any spelling @c ustore_py_uuid_from_object accepts.
+ *  @param[in] object The key.
  *  @param[out] key The key the ABI addresses.
  *  @return 0 on success, -1 with an exception set otherwise.
  */
 int ustore_py_key_from_object(PyObject* object, ustore_key_t* key);
 
 /**
- *  @brief Gathers a batch of keys from a buffer of 64-bit integers or a sequence.
- *  @param[in] object The keys, as a contiguous buffer or a sequence of integers.
+ *  @brief Whether @p object spells one key rather than a batch of them.
+ *
+ *  A `uuid.UUID`, a string and a run of raw bytes are one key although the latter two are
+ *  sequences, while an integer is one key unless it is also a sequence, as an array is.
+ */
+int ustore_py_is_one_key(PyObject* object);
+
+/**
+ *  @brief Gathers a batch of keys from a buffer of 16-byte keys, a buffer of 64-bit integers, or a sequence.
+ *  @param[in] object The keys, as a contiguous buffer of either layout or a sequence of keys.
  *  @param[out] batch The keys and whatever storage gathering them needed.
  *  @return 0 on success, -1 with an exception set otherwise.
  */
@@ -718,17 +780,17 @@ typedef enum ustore_py_naming_t {
  *  @return Whether the name was found, missing, or could not be looked up.
  */
 ustore_py_naming_t ustore_py_collection_named(ustore_py_context_t const* context, char const* name, size_t length,
-                                              ustore_collection_t* collection);
+                                              ustore_collection_id_t* collection);
 
 /**
- *  @brief Reads the collection an argument names, accepting an identifier, a name, or @c None.
+ *  @brief Reads the collection an argument names, accepting an ID, a name, or @c None.
  *  @param[in] context The database and view to resolve a name against.
- *  @param[in] object The collection, as an integer identifier, a string name, or @c None for the main one.
+ *  @param[in] object The collection, as a `uuid.UUID` ID, a string name, or @c None for the main one.
  *  @param[out] collection The identifier the argument addresses.
  *  @return 0 on success, -1 with an exception set otherwise.
  */
 int ustore_py_collection_from_object(ustore_py_context_t const* context, PyObject* object,
-                                     ustore_collection_t* collection);
+                                     ustore_collection_id_t* collection);
 
 /**
  *  @brief Lists the names of collections in the order of their text, up to @p limit of them.

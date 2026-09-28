@@ -15,6 +15,7 @@
 
 #include <ustore/blobs.h>   // `ustore_read_t`, `ustore_write_t`, `ustore_scan_t`, `ustore_sample_t`, `ustore_measure_t`
 #include <ustore/db.h>      // `ustore_database_t`, `ustore_transaction_t` and the calls on them
+#include <ustore/graph.h>   // `ustore_graph_find_edges_t`, `ustore_graph_upsert_edges_t` and the other graph calls
 #include <ustore/strings.h> // `ustore_strings_read_t`, `ustore_strings_write_t`, `ustore_strings_scan_t`
 
 namespace unum::ustore {
@@ -28,10 +29,8 @@ namespace unum::ustore {
 struct engine_t {
     void (*database_capabilities)(ustore_database_capabilities_t&) noexcept;
     void (*database_control)(ustore_database_control_t&) noexcept;
-    void (*snapshot_list)(ustore_snapshot_list_t&) noexcept;
-    void (*snapshot_create)(ustore_snapshot_create_t&) noexcept;
+    void (*snapshot_init)(ustore_snapshot_init_t&) noexcept;
     void (*snapshot_export)(ustore_snapshot_export_t&) noexcept;
-    void (*snapshot_drop)(ustore_snapshot_drop_t&) noexcept;
     void (*read)(ustore_read_t&) noexcept;
     void (*write)(ustore_write_t&) noexcept;
     void (*scan)(ustore_scan_t&) noexcept;
@@ -44,14 +43,20 @@ struct engine_t {
     void (*strings_write)(ustore_strings_write_t&) noexcept;
     void (*strings_read)(ustore_strings_read_t&) noexcept;
     void (*strings_scan)(ustore_strings_scan_t&) noexcept;
+    void (*graph_find_edges)(ustore_graph_find_edges_t&) noexcept;
+    void (*graph_upsert_edges)(ustore_graph_upsert_edges_t&) noexcept;
+    void (*graph_remove_edges)(ustore_graph_remove_edges_t&) noexcept;
+    void (*graph_upsert_vertices)(ustore_graph_upsert_vertices_t&) noexcept;
+    void (*graph_remove_vertices)(ustore_graph_remove_vertices_t&) noexcept;
     void (*transaction_init)(ustore_transaction_init_t&) noexcept;
     void (*transaction_stage)(ustore_transaction_stage_t&) noexcept;
     void (*transaction_commit)(ustore_transaction_commit_t&) noexcept;
     void (*transaction_free)(ustore_transaction_t) noexcept;
+    void (*snapshot_free)(ustore_snapshot_t) noexcept;
     void (*database_free)(ustore_database_t) noexcept;
 };
 
-/** Leads every database and transaction handle an engine hands out, naming the engine that serves it. */
+/** Leads every database, transaction and snapshot handle an engine hands out, naming the engine that serves it. */
 struct handle_t {
     engine_t const* engine = nullptr;
 };
@@ -60,6 +65,23 @@ struct handle_t {
 template <typename handle_type_>
 handle_type_* handle_cast(void* handle) noexcept {
     return static_cast<handle_type_*>(static_cast<handle_t*>(handle));
+}
+
+/** The graph calls of an engine keeping every vertex as one value of its degrees and sorted neighborships, which
+ *  `c/graph.cpp` serves through the engine's own reads and writes. */
+void graph_find_edges_in_vertex_values(ustore_graph_find_edges_t&) noexcept;
+void graph_upsert_edges_in_vertex_values(ustore_graph_upsert_edges_t&) noexcept;
+void graph_remove_edges_in_vertex_values(ustore_graph_remove_edges_t&) noexcept;
+void graph_upsert_vertices_in_vertex_values(ustore_graph_upsert_vertices_t&) noexcept;
+void graph_remove_vertices_in_vertex_values(ustore_graph_remove_vertices_t&) noexcept;
+
+/** Mints a UUIDv7 for a new collection into @p id, answering false when the system gives no entropy. */
+bool mint_collection_id(ustore_collection_id_t& id) noexcept;
+
+/** The C ABI's opaque spelling of @p handle, which @c handle_cast turns back into the engine's own handle. */
+template <typename c_handle_type_>
+c_handle_type_ c_handle(handle_t* handle) noexcept {
+    return reinterpret_cast<c_handle_type_>(handle);
 }
 
 /** Serves @p call_ of an oracle, whose library may throw, turning whatever it throws into a status. */
@@ -78,20 +100,20 @@ void guarded(arguments_type_& arguments) noexcept {
 
 /** How a call keys the collections it addresses. */
 enum class keying_t : std::uint8_t {
-    integers_k,
+    uuids_k,
     strings_k,
 };
 
 /** How a collection holding @p modality is keyed. */
 constexpr keying_t keying_of(ustore_modality_t modality) noexcept {
-    return modality == ustore_modality_strings_k ? keying_t::strings_k : keying_t::integers_k;
+    return modality == ustore_modality_strings_k ? keying_t::strings_k : keying_t::uuids_k;
 }
 
-/** The record a collection's name maps onto: the collection's identifier in bytes @b [0,8), its modality in byte 8. */
+/** The record a collection's name maps onto: the collection ID in bytes @b [0,16), its modality in byte 16. */
 struct name_record_t {
-    char bytes[sizeof(ustore_collection_t) + 1] {};
+    char bytes[sizeof(ustore_collection_id_t) + 1] {};
 
-    name_record_t(ustore_collection_t id, ustore_modality_t modality) noexcept {
+    name_record_t(ustore_collection_id_t id, ustore_modality_t modality) noexcept {
         std::memcpy(bytes, &id, sizeof(id));
         bytes[sizeof(id)] = static_cast<char>(modality);
     }
@@ -101,7 +123,7 @@ struct name_record_t {
 
 /** Reads the identifier and the modality the bytes of @p record hold, answering false for bytes of any other length. */
 template <typename bytes_type_>
-bool read_name_record(bytes_type_ const& record, ustore_collection_t& id, ustore_modality_t& modality) noexcept {
+bool read_name_record(bytes_type_ const& record, ustore_collection_id_t& id, ustore_modality_t& modality) noexcept {
     if (record.size() != sizeof(name_record_t::bytes)) return false;
     std::memcpy(&id, record.data(), sizeof(id));
     modality = static_cast<ustore_modality_t>(record[sizeof(id)]);

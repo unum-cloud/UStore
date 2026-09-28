@@ -1,6 +1,7 @@
 """Paged conversion of a document collection into Pandas, against the frame one unpaged call builds."""
 
 import pytest
+from capabilities import keys
 from pandas.testing import assert_frame_equal
 
 from ustore.table_view import Table
@@ -32,14 +33,14 @@ def test_paged_gathers_typed_columns(people, page: int):
 
 def test_paged_keeps_the_index_in_order(people):
     """Pages follow the ascending walk of keys, so the concatenated index is the unpaged one."""
-    assert people.to_pandas(page=3).index.tolist() == list(range(ROWS))
+    assert people.to_pandas(page=3).index.tolist() == keys(range(ROWS))
 
 
 def test_paged_narrowed_view(people):
     """A view narrowed to some rows pages only those, never the whole collection."""
     narrowed = people.derive(index=[2, 4, 6, 8])
     assert_frame_equal(narrowed.to_pandas(page=3), narrowed.to_pandas())
-    assert narrowed.to_pandas(page=3).index.tolist() == [2, 4, 6, 8]
+    assert narrowed.to_pandas(page=3).index.tolist() == keys([2, 4, 6, 8])
 
 
 def test_paged_empty_view(view):

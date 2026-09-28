@@ -53,7 +53,7 @@ std::size_t database_validation(test_config_t const& config) {
     transaction_t transaction = maybe_transaction.has_value() ? *std::move(maybe_transaction) : transaction_t {};
 
     constexpr ustore_length_t count = 3;
-    std::array<ustore_key_t, count> keys {34, 35, 36};
+    std::array<ustore_key_t, count> keys {key_from_integer(34), key_from_integer(35), key_from_integer(36)};
     std::array<std::uint64_t, count> numbers {34, 35, 36};
     ustore_length_t number_length = sizeof(std::uint64_t);
     std::array<ustore_length_t, count> number_offsets {0, number_length, number_length * 2};
@@ -97,14 +97,15 @@ std::size_t database_validation(test_config_t const& config) {
     }
 
     if (!database.supports_collections()) {
-        std::array<ustore_collection_t, count> collections {1, 2, 3};
+        std::array<ustore_collection_id_t, count> collections {
+            {{uuid_from_integer(1)}, {uuid_from_integer(2)}, {uuid_from_integer(3)}}};
         ustore_write_t write_unnamed {
             .db = database,
             .error = &error,
             .arena = collection.member_arena(),
             .tasks_count = count,
             .collections = collections.data(),
-            .collections_stride = sizeof(ustore_collection_t),
+            .collections_stride = sizeof(ustore_collection_id_t),
             .keys = keys.data(),
             .keys_stride = sizeof(ustore_key_t),
             .offsets = offsets.get(),
@@ -117,14 +118,15 @@ std::size_t database_validation(test_config_t const& config) {
         ustore_write(&write_unnamed);
         failures += expect_error(error);
 
-        std::array<ustore_collection_t, count> collections_only_main {0, 0, 0};
+        std::array<ustore_collection_id_t, count> collections_only_main {
+            ustore_collection_main_k, ustore_collection_main_k, ustore_collection_main_k};
         ustore_write_t write_main {
             .db = database,
             .error = &error,
             .arena = collection.member_arena(),
             .tasks_count = count,
             .collections = collections_only_main.data(),
-            .collections_stride = sizeof(ustore_collection_t),
+            .collections_stride = sizeof(ustore_collection_id_t),
             .keys = keys.data(),
             .keys_stride = sizeof(ustore_key_t),
             .offsets = offsets.get(),

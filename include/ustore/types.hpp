@@ -18,10 +18,12 @@
 #include <functional>  // `std::hash`
 #include <limits>      // `std::numeric_limits`
 #include <ranges>      // `std::ranges::contiguous_range`
+#include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 #include <type_traits> // `std::remove_cvref_t`, `std::is_same_v`, `std::type_identity_t`
 #include <utility>     // `std::exchange`, `std::swap`
 
+#include <ustore/status.hpp> // `expected`, `status_t`
 #include <ustore/ustore.h>
 
 namespace ashvardanian::forkunion {}
@@ -34,7 +36,150 @@ namespace nk = ashvardanian::numkong;
 namespace st = ashvardanian::smashtable;
 namespace sz = ashvardanian::stringzilla;
 
+#pragma region Identifiers
+
+// The C structs live in the global namespace, so their comparisons live there too, where lookup finds them
+
+/** Orders identifiers as their bytes, which is how every engine stores and walks them. */
+constexpr std::strong_ordering operator<=>(ustore_uuid_t const& first, ustore_uuid_t const& second) noexcept {
+    return std::lexicographical_compare_three_way(first.bytes, first.bytes + 16, second.bytes, second.bytes + 16);
+}
+constexpr bool operator==(ustore_uuid_t const& first, ustore_uuid_t const& second) noexcept {
+    return (first <=> second) == 0;
+}
+constexpr std::strong_ordering operator<=>(ustore_key_t const& first, ustore_key_t const& second) noexcept {
+    return first.uuid <=> second.uuid;
+}
+constexpr bool operator==(ustore_key_t const& first, ustore_key_t const& second) noexcept {
+    return first.uuid == second.uuid;
+}
+constexpr std::strong_ordering operator<=>(ustore_collection_id_t const& first,
+                                           ustore_collection_id_t const& second) noexcept {
+    return first.uuid <=> second.uuid;
+}
+constexpr bool operator==(ustore_collection_id_t const& first, ustore_collection_id_t const& second) noexcept {
+    return first.uuid == second.uuid;
+}
+
+template <>
+struct std::hash<ustore_uuid_t> {
+    std::size_t operator()(ustore_uuid_t const& uuid) const noexcept {
+        std::uint64_t halves[2];
+        std::memcpy(halves, uuid.bytes, sizeof(halves));
+        return std::hash<std::uint64_t> {}(halves[0] ^ (halves[1] * 0x9E3779B97F4A7C15ull));
+    }
+};
+
+template <>
+struct std::hash<ustore_key_t> {
+    std::size_t operator()(ustore_key_t const& key) const noexcept { return std::hash<ustore_uuid_t> {}(key.uuid); }
+};
+
+template <>
+struct std::hash<ustore_collection_id_t> {
+    std::size_t operator()(ustore_collection_id_t const& id) const noexcept {
+        return std::hash<ustore_uuid_t> {}(id.uuid);
+    }
+};
+
+#pragma endregion Identifiers
+
 namespace unum::ustore {
+
+#pragma region Identifier Arithmetic
+
+/** The UUID spelling @p integer big-endian in its last eight bytes, so UUIDs made from integers order as the
+ *  integers, exactly as Python's `uuid.UUID(int=integer)` does. */
+constexpr ustore_uuid_t uuid_from_integer(std::uint64_t integer) noexcept {
+    ustore_uuid_t uuid {};
+    for (unsigned index = 0; index != 8; ++index)
+        uuid.bytes[15 - index] = static_cast<std::uint8_t>(integer >> (8 * index));
+    return uuid;
+}
+
+/** The integer @p uuid spells, which only a UUID with its first eight bytes zero has. */
+inline expected<std::uint64_t> uuid_to_integer(ustore_uuid_t const& uuid) noexcept {
+    std::uint64_t integer = 0;
+    for (unsigned index = 0; index != 8; ++index)
+        if (uuid.bytes[index] != 0) return status_t {status_code_t::invalid_argument_k, "The UUID exceeds 64 bits"};
+    for (unsigned index = 8; index != 16; ++index) integer = (integer << 8) | uuid.bytes[index];
+    return integer;
+}
+
+/** The key spelling @p integer, as @c uuid_from_integer does. */
+constexpr ustore_key_t key_from_integer(std::uint64_t integer) noexcept { return {uuid_from_integer(integer)}; }
+
+/** The first key in their order, the nil UUID, where a walk of a whole collection starts. */
+inline constexpr ustore_key_t smallest_key_k {};
+
+/** The last key in their order, every bit set, which @c ustore_key_unknown_k spells too. */
+inline constexpr ustore_key_t largest_key_k {
+    {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}}};
+
+/** The key right after @p key in their order, where a scan resuming past @p key starts; the last key has none and
+ *  wraps to the first. */
+constexpr ustore_key_t key_after(ustore_key_t key) noexcept {
+    for (unsigned index = 16; index != 0; --index)
+        if (++key.uuid.bytes[index - 1] != 0) break;
+    return key;
+}
+
+#pragma endregion Identifier Arithmetic
+
+#pragma region Identifier Text
+
+/** Characters the canonical `8-4-4-4-12` text of a UUID takes, dashes included. */
+inline constexpr std::size_t uuid_text_length_k = 36;
+
+/** Writes the canonical lowercase `8-4-4-4-12` text of @p uuid into @p text, without a terminator. */
+constexpr void uuid_to_text(ustore_uuid_t const& uuid, std::span<char, uuid_text_length_k> text) noexcept {
+    constexpr char digits_k[] = "0123456789abcdef";
+    std::size_t position = 0;
+    for (unsigned index = 0; index != 16; ++index) {
+        if (index == 4 || index == 6 || index == 8 || index == 10) text[position++] = '-';
+        text[position++] = digits_k[uuid.bytes[index] >> 4];
+        text[position++] = digits_k[uuid.bytes[index] & 0x0F];
+    }
+}
+
+/** Reads @p text as canonical UUID text in either case, or as a non-negative decimal integer, which spells as
+ *  @c uuid_from_integer does. */
+inline expected<ustore_uuid_t> uuid_from_text(std::string_view text) noexcept {
+    status_t const malformed {status_code_t::invalid_argument_k, "Neither UUID text nor a non-negative integer"};
+    ustore_uuid_t uuid {};
+    if (text.size() == uuid_text_length_k) {
+        std::size_t position = 0;
+        for (unsigned index = 0; index != 16; ++index) {
+            if (index == 4 || index == 6 || index == 8 || index == 10) {
+                if (text[position] != '-') return malformed;
+                ++position;
+            }
+            unsigned byte = 0;
+            for (unsigned half = 0; half != 2; ++half, ++position) {
+                char const digit = text[position];
+                unsigned const value = digit >= '0' && digit <= '9'   ? unsigned(digit - '0')
+                                       : digit >= 'a' && digit <= 'f' ? unsigned(digit - 'a' + 10)
+                                       : digit >= 'A' && digit <= 'F' ? unsigned(digit - 'A' + 10)
+                                                                      : 16u;
+                if (value == 16) return malformed;
+                byte = byte * 16 + value;
+            }
+            uuid.bytes[index] = static_cast<std::uint8_t>(byte);
+        }
+        return uuid;
+    }
+    if (text.empty() || text.size() > 20) return malformed;
+    std::uint64_t integer = 0;
+    for (char const digit : text) {
+        if (digit < '0' || digit > '9') return malformed;
+        std::uint64_t const scaled = integer * 10 + unsigned(digit - '0');
+        if (scaled / 10 != integer) return malformed;
+        integer = scaled;
+    }
+    return uuid_from_integer(integer);
+}
+
+#pragma endregion Identifier Text
 
 using f64_t = double;
 using f32_t = float;
@@ -78,17 +223,17 @@ constexpr ustore_options_t to_options(flush_t flush) noexcept {
 struct collection_key_t {
 
     /** Collection owning the key. */
-    ustore_collection_t collection {ustore_collection_main_k};
+    ustore_collection_id_t collection {ustore_collection_main_k};
 
     /** Key inside the collection. */
-    ustore_key_t key {0};
+    ustore_key_t key {};
 
     collection_key_t() = default;
     explicit collection_key_t(ustore_key_t key) noexcept : key(key) {}
-    collection_key_t(ustore_collection_t collection, ustore_key_t key) noexcept : collection(collection), key(key) {}
+    collection_key_t(ustore_collection_id_t collection, ustore_key_t key) noexcept : collection(collection), key(key) {}
 
     /** The same key addressed inside @p other_collection. */
-    collection_key_t in(ustore_collection_t other_collection) const noexcept { return {other_collection, key}; }
+    collection_key_t in(ustore_collection_id_t other_collection) const noexcept { return {other_collection, key}; }
 
     friend bool operator==(collection_key_t const&, collection_key_t const&) = default;
     friend std::strong_ordering operator<=>(collection_key_t const&, collection_key_t const&) = default;
@@ -98,7 +243,7 @@ struct collection_key_t {
 struct collection_key_field_t {
 
     /** Collection owning the key. */
-    ustore_collection_t collection {0};
+    ustore_collection_id_t collection {};
 
     /** Key inside the collection. */
     ustore_key_t key {ustore_key_unknown_k};
@@ -107,7 +252,8 @@ struct collection_key_field_t {
     ustore_str_view_t field {nullptr};
 
     collection_key_field_t() = default;
-    collection_key_field_t(ustore_collection_t collection, ustore_key_t key, ustore_str_view_t field = nullptr) noexcept
+    collection_key_field_t(ustore_collection_id_t collection, ustore_key_t key,
+                           ustore_str_view_t field = nullptr) noexcept
         : collection(collection), key(key), field(field) {}
     collection_key_field_t(ustore_key_t key) noexcept
         : collection(ustore_collection_main_k), key(key), field(nullptr) {}
@@ -125,8 +271,7 @@ concept has_field_concept = requires(location_ const& location) { location.field
 
 /** A single key, bare or with its collection, that widens into a @c collection_key_field_t. */
 template <typename location_>
-concept key_location_concept = std::same_as<std::remove_cvref_t<location_>, int> ||
-                               std::same_as<std::remove_cvref_t<location_>, ustore_key_t> ||
+concept key_location_concept = std::same_as<std::remove_cvref_t<location_>, ustore_key_t> ||
                                std::same_as<std::remove_cvref_t<location_>, collection_key_t>;
 
 #pragma endregion Locations
@@ -152,10 +297,10 @@ struct edge_t {
 struct neighborship_t {
 
     /** Vertex on the other end of the edge. */
-    ustore_key_t neighbor_id {0};
+    ustore_key_t neighbor_id {};
 
     /** Identifier of the edge. */
-    ustore_key_t edge_id {0};
+    ustore_key_t edge_id {};
 
     friend bool operator==(neighborship_t const&, neighborship_t const&) = default;
     friend std::strong_ordering operator<=>(neighborship_t const&, neighborship_t const&) = default;

@@ -13,24 +13,24 @@
 
 #pragma region Reads
 
-char const doc_read[] =                                                                   //
-    "read(keys, *, collection=None, snapshot=0) answers a Values tape.\n"                 //
-    "\n"                                                                                  //
-    "Reads a batch of binary values in one call, which no sequence of single reads\n"     //
-    "matches for throughput. Nothing is copied: the tape sits in an arena the result\n"   //
-    "owns, and indexing it answers a memoryview over the stored bytes, or None for an\n"  //
-    "absent key.\n"                                                                       //
-    "\n"                                                                                  //
-    "Args:\n"                                                                             //
-    "  keys (Sequence[int] | buffer): The keys to read, as a sequence or a contiguous\n"  //
-    "    buffer of signed 64-bit integers, which is read in place.\n"                     //
-    "  collection (int | str, optional): The collection, by identifier or by name;\n"     //
-    "    None addresses the main one.\n"                                                  //
-    "  snapshot (int, optional): The snapshot to read; 0 reads the head. A transaction\n" //
-    "    already fixes the view and therefore refuses this.\n"                            //
-    "Returns:\n"                                                                          //
-    "  Values: One entry per key, in the order they were asked for.\n"                    //
-    "Raises:\n"                                                                           //
+char const doc_read[] =                                                                    //
+    "read(keys, *, collection=None, snapshot=None) answers a Values tape.\n"               //
+    "\n"                                                                                   //
+    "Reads a batch of binary values in one call, which no sequence of single reads\n"      //
+    "matches for throughput. Nothing is copied: the tape sits in an arena the result\n"    //
+    "owns, and indexing it answers a memoryview over the stored bytes, or None for an\n"   //
+    "absent key.\n"                                                                        //
+    "\n"                                                                                   //
+    "Args:\n"                                                                              //
+    "  keys (Sequence[KeyLike] | buffer): The keys to read, as a sequence, a contiguous\n" //
+    "    buffer of 16-byte keys, which is read in place, or one of 64-bit integers.\n"     //
+    "  collection (UUID | str, optional): The collection, by identifier or by name;\n"     //
+    "    None addresses the main one.\n"                                                   //
+    "  snapshot (Snapshot, optional): The snapshot to read; None reads the head. A\n"      //
+    "    transaction already fixes the view and therefore refuses this.\n"                 //
+    "Returns:\n"                                                                           //
+    "  Values: One entry per key, in the order they were asked for.\n"                     //
+    "Raises:\n"                                                                            //
     "  Error: Whatever the engine reported.";
 
 PyObject* ustore_py_api_read(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
@@ -84,16 +84,16 @@ PyObject* ustore_py_api_read(PyObject* self, PyObject* const* args, Py_ssize_t p
 }
 
 char const doc_get[] =                                                                     //
-    "get(key, *, collection=None, snapshot=0) answers bytes or None.\n"                    //
+    "get(key, *, collection=None, snapshot=None) answers bytes or None.\n"                 //
     "\n"                                                                                   //
     "Reads one value and copies it into a bytes object, so nothing of the arena\n"         //
     "outlives the call. Reach for `read` when several keys are wanted, or when the copy\n" //
     "is not.\n"                                                                            //
     "\n"                                                                                   //
     "Args:\n"                                                                              //
-    "  key (int): The key to read.\n"                                                      //
-    "  collection (int | str, optional): The collection, by identifier or by name.\n"      //
-    "  snapshot (int, optional): The snapshot to read; 0 reads the head.\n"                //
+    "  key (KeyLike): The key to read.\n"                                                  //
+    "  collection (UUID | str, optional): The collection, by identifier or by name.\n"     //
+    "  snapshot (Snapshot, optional): The snapshot to read; None reads the head.\n"        //
     "Returns:\n"                                                                           //
     "  bytes | None: The stored bytes, or None when the key is absent.";
 
@@ -107,7 +107,7 @@ PyObject* ustore_py_api_get(PyObject* self, PyObject* const* args, Py_ssize_t po
     if (ustore_py_verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0)
         return NULL;
 
-    ustore_key_t key = 0;
+    ustore_key_t key = {0};
     if (ustore_py_key_from_object(args[0], &key) != 0) return NULL;
 
     ustore_length_t* offsets = NULL;
@@ -142,16 +142,16 @@ PyObject* ustore_py_api_get(PyObject* self, PyObject* const* args, Py_ssize_t po
     return found;
 }
 
-char const doc_contains[] =                                                               //
-    "contains(key, *, collection=None, snapshot=0) answers whether the key is present.\n" //
-    "\n"                                                                                  //
-    "Reads the presence alone, so no value crosses the boundary and no tape is built.\n"  //
-    "\n"                                                                                  //
-    "Args:\n"                                                                             //
-    "  key (int): The key to look for.\n"                                                 //
-    "  collection (int | str, optional): The collection, by identifier or by name.\n"     //
-    "  snapshot (int, optional): The snapshot to read; 0 reads the head.\n"               //
-    "Returns:\n"                                                                          //
+char const doc_contains[] =                                                                  //
+    "contains(key, *, collection=None, snapshot=None) answers whether the key is present.\n" //
+    "\n"                                                                                     //
+    "Reads the presence alone, so no value crosses the boundary and no tape is built.\n"     //
+    "\n"                                                                                     //
+    "Args:\n"                                                                                //
+    "  key (KeyLike): The key to look for.\n"                                                //
+    "  collection (UUID | str, optional): The collection, by identifier or by name.\n"       //
+    "  snapshot (Snapshot, optional): The snapshot to read; None reads the head.\n"          //
+    "Returns:\n"                                                                             //
     "  bool: Whether the key carries a value.";
 
 PyObject* ustore_py_api_contains(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
@@ -164,7 +164,7 @@ PyObject* ustore_py_api_contains(PyObject* self, PyObject* const* args, Py_ssize
     if (ustore_py_verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0)
         return NULL;
 
-    ustore_key_t key = 0;
+    ustore_key_t key = {0};
     if (ustore_py_key_from_object(args[0], &key) != 0) return NULL;
 
     ustore_octet_t* presences = NULL;
@@ -253,11 +253,11 @@ char const doc_write[] =                                                        
     "engine untouched.\n"                                                                    //
     "\n"                                                                                     //
     "Args:\n"                                                                                //
-    "  keys (Sequence[int] | buffer): The keys to write.\n"                                  //
+    "  keys (Sequence[KeyLike] | buffer): The keys to write.\n"                              //
     "  values (Sequence[bytes-like | None] | bytes-like | None): One value per key, or a\n"  //
     "    single bytes-like object broadcast to every key, or None to remove them all. A\n"   //
     "    None inside a sequence removes that one key.\n"                                     //
-    "  collection (int | str, optional): The collection, by identifier or by name.\n"        //
+    "  collection (UUID | str, optional): The collection, by identifier or by name.\n"       //
     "  flush (bool, optional): Whether to reach the drive before returning.\n"               //
     "Raises:\n"                                                                              //
     "  Error: Whatever the engine reported.";
@@ -311,15 +311,15 @@ PyObject* ustore_py_api_write(PyObject* self, PyObject* const* args, Py_ssize_t 
     Py_RETURN_NONE;
 }
 
-char const doc_set[] =                                                                //
-    "set(key, value, *, collection=None, flush=False) answers None.\n"                //
-    "\n"                                                                              //
-    "Upserts one binary value, or removes the key when the value is None.\n"          //
-    "\n"                                                                              //
-    "Args:\n"                                                                         //
-    "  key (int): The key to write.\n"                                                //
-    "  value (bytes-like | None): The bytes to store, borrowed rather than copied.\n" //
-    "  collection (int | str, optional): The collection, by identifier or by name.\n" //
+char const doc_set[] =                                                                 //
+    "set(key, value, *, collection=None, flush=False) answers None.\n"                 //
+    "\n"                                                                               //
+    "Upserts one binary value, or removes the key when the value is None.\n"           //
+    "\n"                                                                               //
+    "Args:\n"                                                                          //
+    "  key (KeyLike): The key to write.\n"                                             //
+    "  value (bytes-like | None): The bytes to store, borrowed rather than copied.\n"  //
+    "  collection (UUID | str, optional): The collection, by identifier or by name.\n" //
     "  flush (bool, optional): Whether to reach the drive before returning.";
 
 PyObject* ustore_py_api_set(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
@@ -332,7 +332,7 @@ PyObject* ustore_py_api_set(PyObject* self, PyObject* const* args, Py_ssize_t po
     if (ustore_py_verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0)
         return NULL;
 
-    ustore_key_t key = 0;
+    ustore_key_t key = {0};
     if (ustore_py_key_from_object(args[0], &key) != 0) return NULL;
 
     ustore_py_contents_t contents;
@@ -367,14 +367,14 @@ PyObject* ustore_py_api_set(PyObject* self, PyObject* const* args, Py_ssize_t po
     Py_RETURN_NONE;
 }
 
-char const doc_pop[] =                                                                //
-    "pop(keys, *, collection=None, flush=False) answers None.\n"                      //
-    "\n"                                                                              //
-    "Removes a batch of keys, or one key given on its own.\n"                         //
-    "\n"                                                                              //
-    "Args:\n"                                                                         //
-    "  keys (int | Sequence[int] | buffer): The keys to remove.\n"                    //
-    "  collection (int | str, optional): The collection, by identifier or by name.\n" //
+char const doc_pop[] =                                                                 //
+    "pop(keys, *, collection=None, flush=False) answers None.\n"                       //
+    "\n"                                                                               //
+    "Removes a batch of keys, or one key given on its own.\n"                          //
+    "\n"                                                                               //
+    "Args:\n"                                                                          //
+    "  keys (KeyLike | Sequence[KeyLike] | buffer): The keys to remove.\n"             //
+    "  collection (UUID | str, optional): The collection, by identifier or by name.\n" //
     "  flush (bool, optional): Whether to reach the drive before returning.";
 
 PyObject* ustore_py_api_pop(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
@@ -387,11 +387,10 @@ PyObject* ustore_py_api_pop(PyObject* self, PyObject* const* args, Py_ssize_t po
     if (ustore_py_verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0)
         return NULL;
 
-    ustore_key_t single = 0;
+    ustore_key_t single = {0};
     ustore_py_keys_t keys;
     memset(&keys, 0, sizeof(keys));
-    // An array exports an index too, so only something that is not a sequence reads as one key.
-    if (PyIndex_Check(args[0]) && !PySequence_Check(args[0])) {
+    if (ustore_py_is_one_key(args[0])) {
         if (ustore_py_key_from_object(args[0], &single) != 0) return NULL;
         keys.keys = &single;
         keys.count = 1;
@@ -481,9 +480,7 @@ static int limits_from_object(PyObject* object, limits_t* batch) {
 
     for (Py_ssize_t entry_index = 0; entry_index != count; ++entry_index) {
         size_t limit = 0;
-        if (ustore_py_size_from_object(PySequence_Fast_GET_ITEM(sequence, entry_index), "count", &limit) != 0 ||
-            limit > UINT32_MAX) {
-            if (!PyErr_Occurred()) PyErr_SetString(PyExc_ValueError, "One request returns at most 4294967295 keys");
+        if (ustore_py_size_from_object(PySequence_Fast_GET_ITEM(sequence, entry_index), "count", &limit) != 0) {
             Py_DECREF(sequence);
             limits_release(batch);
             return -1;
@@ -496,17 +493,17 @@ static int limits_from_object(PyObject* object, limits_t* batch) {
 }
 
 char const doc_scan[] =                                                                   //
-    "scan(start, count, *, collection=None, snapshot=0) answers a Keys tape.\n"           //
+    "scan(start, count, *, collection=None, snapshot=None) answers a Keys tape.\n"        //
     "\n"                                                                                  //
     "Lists up to `count` keys from `start` upwards. Values are not exported, so a read\n" //
     "follows the scan; a walk longer than one page resumes from the last key it saw,\n"   //
     "since holding an iterator over concurrent state costs more than paginating.\n"       //
     "\n"                                                                                  //
     "Args:\n"                                                                             //
-    "  start (int): The smallest key the scan may return.\n"                              //
+    "  start (KeyLike): The smallest key the scan may return.\n"                          //
     "  count (int): Most keys the scan returns.\n"                                        //
-    "  collection (int | str, optional): The collection, by identifier or by name.\n"     //
-    "  snapshot (int, optional): The snapshot to scan; 0 scans the head.\n"               //
+    "  collection (UUID | str, optional): The collection, by identifier or by name.\n"    //
+    "  snapshot (Snapshot, optional): The snapshot to scan; None scans the head.\n"       //
     "Returns:\n"                                                                          //
     "  Keys: One run of keys, in ascending order.";
 
@@ -520,14 +517,10 @@ PyObject* ustore_py_api_scan(PyObject* self, PyObject* const* args, Py_ssize_t p
     if (ustore_py_verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0)
         return NULL;
 
-    ustore_key_t start = 0;
+    ustore_key_t start = {0};
     size_t limit = 0;
     if (ustore_py_key_from_object(args[0], &start) != 0) return NULL;
     if (ustore_py_size_from_object(args[1], "count", &limit) != 0) return NULL;
-    if (limit > UINT32_MAX) {
-        PyErr_SetString(PyExc_ValueError, "A scan returns at most 4294967295 keys in one page");
-        return NULL;
-    }
 
     ustore_length_t const count_limit = (ustore_length_t)limit;
     ustore_length_t* offsets = NULL;
@@ -564,7 +557,7 @@ PyObject* ustore_py_api_scan(PyObject* self, PyObject* const* args, Py_ssize_t p
 }
 
 char const doc_scan_batch[] =                                                              //
-    "scan_batch(starts, counts, *, collection=None, snapshot=0) answers a Keys tape.\n"    //
+    "scan_batch(starts, counts, *, collection=None, snapshot=None) answers a Keys tape.\n" //
     "\n"                                                                                   //
     "Runs many scans in one call, which is what the ABI takes and what an engine can\n"    //
     "spread across its threads; indexing the answer by request gives the run that\n"       //
@@ -572,10 +565,10 @@ char const doc_scan_batch[] =                                                   
     "once asks for exactly what each one still needs.\n"                                   //
     "\n"                                                                                   //
     "Args:\n"                                                                              //
-    "  starts (Sequence[int] | buffer): The smallest key every scan may return.\n"         //
+    "  starts (Sequence[KeyLike] | buffer): The smallest key every scan may return.\n"     //
     "  counts (Sequence[int]): Most keys every scan returns, one limit per start.\n"       //
-    "  collection (int | str, optional): The collection, by identifier or by name.\n"      //
-    "  snapshot (int, optional): The snapshot to scan; 0 scans the head.\n"                //
+    "  collection (UUID | str, optional): The collection, by identifier or by name.\n"     //
+    "  snapshot (Snapshot, optional): The snapshot to scan; None scans the head.\n"        //
     "Returns:\n"                                                                           //
     "  Keys: One run of ascending keys per request, in the order they were asked for.";
 
@@ -645,15 +638,15 @@ PyObject* ustore_py_api_scan_batch(PyObject* self, PyObject* const* args, Py_ssi
 }
 
 char const doc_sample[] =                                                                 //
-    "sample(count, *, collection=None, snapshot=0) answers a Keys tape.\n"                //
+    "sample(count, *, collection=None, snapshot=None) answers a Keys tape.\n"             //
     "\n"                                                                                  //
     "Draws keys uniformly at random from one collection, which is how a workload picks\n" //
     "entries it has no list of.\n"                                                        //
     "\n"                                                                                  //
     "Args:\n"                                                                             //
     "  count (int): Keys to draw.\n"                                                      //
-    "  collection (int | str, optional): The collection, by identifier or by name.\n"     //
-    "  snapshot (int, optional): The snapshot to sample; 0 samples the head.\n"           //
+    "  collection (UUID | str, optional): The collection, by identifier or by name.\n"    //
+    "  snapshot (Snapshot, optional): The snapshot to sample; None samples the head.\n"   //
     "Returns:\n"                                                                          //
     "  Keys: One run of keys, in no particular order.";
 
@@ -669,10 +662,6 @@ PyObject* ustore_py_api_sample(PyObject* self, PyObject* const* args, Py_ssize_t
 
     size_t wanted = 0;
     if (ustore_py_size_from_object(args[0], "count", &wanted) != 0) return NULL;
-    if (wanted > UINT32_MAX) {
-        PyErr_SetString(PyExc_ValueError, "A sample draws at most 4294967295 keys in one call");
-        return NULL;
-    }
 
     ustore_length_t const count_limit = (ustore_length_t)wanted;
     ustore_length_t* offsets = NULL;
@@ -708,15 +697,15 @@ PyObject* ustore_py_api_sample(PyObject* self, PyObject* const* args, Py_ssize_t
 }
 
 char const doc_sample_batch[] =                                                            //
-    "sample_batch(counts, *, collection=None, snapshot=0) answers a Keys tape.\n"          //
+    "sample_batch(counts, *, collection=None, snapshot=None) answers a Keys tape.\n"       //
     "\n"                                                                                   //
     "Draws many independent samples in one call, one per limit, which is how a workload\n" //
     "builds several disjoint batches without paying for a call each.\n"                    //
     "\n"                                                                                   //
     "Args:\n"                                                                              //
     "  counts (Sequence[int]): Keys every sample draws, one limit per request.\n"          //
-    "  collection (int | str, optional): The collection, by identifier or by name.\n"      //
-    "  snapshot (int, optional): The snapshot to sample; 0 samples the head.\n"            //
+    "  collection (UUID | str, optional): The collection, by identifier or by name.\n"     //
+    "  snapshot (Snapshot, optional): The snapshot to sample; None samples the head.\n"    //
     "Returns:\n"                                                                           //
     "  Keys: One run of keys per request, in no particular order.";
 
@@ -771,19 +760,20 @@ PyObject* ustore_py_api_sample_batch(PyObject* self, PyObject* const* args, Py_s
     return ustore_py_keys_adopt(arena, found, offsets, counts, tasks_count);
 }
 
-char const doc_measure[] =                                                              //
-    "measure(start, end, *, collection=None, snapshot=0) answers a dict of bounds.\n"   //
-    "\n"                                                                                //
-    "Estimates what a key range holds without walking it, so the answers are bounds\n"  //
-    "rather than counts.\n"                                                             //
-    "\n"                                                                                //
-    "Args:\n"                                                                           //
-    "  start (int): First key of the range.\n"                                          //
-    "  end (int): Last key of the range.\n"                                             //
-    "  collection (int | str, optional): The collection, by identifier or by name.\n"   //
-    "  snapshot (int, optional): The snapshot to measure; 0 measures the head.\n"       //
-    "Returns:\n"                                                                        //
-    "  dict[str, int]: The lower and upper bounds on the entries, the bytes of their\n" //
+char const doc_measure[] =                                                               //
+    "measure(start, end, *, collection=None, snapshot=None) answers a dict of bounds.\n" //
+    "\n"                                                                                 //
+    "Estimates what a key range holds without walking it, so the answers are bounds\n"   //
+    "rather than counts.\n"                                                              //
+    "\n"                                                                                 //
+    "Args:\n"                                                                            //
+    "  start (KeyLike): First key of the range.\n"                                       //
+    "  end (KeyLike): Last key of the range.\n"                                          //
+    "  collection (UUID | str, optional): The collection, by identifier or by name.\n"   //
+    "  snapshot (Snapshot, optional): The snapshot to measure; None measures the\n"      //
+    "    head.\n"                                                                        //
+    "Returns:\n"                                                                         //
+    "  dict[str, int]: The lower and upper bounds on the entries, the bytes of their\n"  //
     "  values, and the space they take on disk.";
 
 PyObject* ustore_py_api_measure(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
@@ -796,8 +786,8 @@ PyObject* ustore_py_api_measure(PyObject* self, PyObject* const* args, Py_ssize_
     if (ustore_py_verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0)
         return NULL;
 
-    ustore_key_t start = 0;
-    ustore_key_t end = 0;
+    ustore_key_t start = {0};
+    ustore_key_t end = {0};
     if (ustore_py_key_from_object(args[0], &start) != 0) return NULL;
     if (ustore_py_key_from_object(args[1], &end) != 0) return NULL;
 

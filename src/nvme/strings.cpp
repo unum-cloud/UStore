@@ -11,7 +11,7 @@
  */
 
 #include <cstddef> // `std::size_t`
-#include <cstdint> // `std::uint32_t`, `std::uint64_t`
+#include <cstdint> // `std::uint64_t`
 #include <cstring> // `std::memcpy`, `std::strlen`
 
 #include <algorithm>   // `std::sort`, `std::ranges::sort`, `std::ranges::lower_bound`, `std::min`
@@ -19,7 +19,6 @@
 #include <limits>      // `std::numeric_limits`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
-#include <type_traits> // `std::make_unsigned_t`
 
 #include <ustore/ranges_args.hpp> // `contents_arg_t`
 #include <ustore/strings.h>       // `ustore_strings_write_t`, `ustore_strings_read_t`
@@ -33,7 +32,8 @@
 namespace unum::ustore::nvme {
 
 /** The collection the names of collections live in as strings, above every identifier NVMe hands out. */
-extern ustore_collection_t const names_collection_k = std::numeric_limits<ustore_collection_t>::max() - 1;
+extern ustore_collection_id_t const names_collection_k = {
+    uuid_from_integer(std::numeric_limits<std::uint64_t>::max() - 1)};
 
 void collection_find(ustore_collection_find_t& request) noexcept;
 
@@ -41,17 +41,14 @@ namespace {
 
 #pragma region Key Encoding
 
-/** The unsigned twin of a key, in which the encoded bytes are assembled before they take their sign. */
-using unsigned_key_t = std::make_unsigned_t<ustore_key_t>;
+/** The word a string's key spells in its last eight bytes, which keeps every such key within the keys NVMe stores. */
+using key_word_t = std::uint64_t;
 
-/** Bytes of a key that hold the leading characters of a string, leaving the last one for its length. */
-constexpr std::size_t prefix_bytes_k = sizeof(ustore_key_t) - 1;
+/** Bytes of the word that hold the leading characters of a string, leaving the last one for its length. */
+constexpr std::size_t prefix_bytes_k = sizeof(key_word_t) - 1;
 
 /** The length a key carries for a string too long to fit @c prefix_bytes_k, which shares a bucket. */
 constexpr unsigned char bucketed_length_k = static_cast<unsigned char>(prefix_bytes_k + 1);
-
-/** The bit whose flip makes an unsigned byte order match the signed order of the keys the engines compare. */
-constexpr unsigned_key_t sign_bit_k = unsigned_key_t {1} << (sizeof(ustore_key_t) * 8 - 1);
 
 /** The byte at @p index of @p text, or the padding a shorter string takes. */
 constexpr unsigned char padded_byte(std::string_view text, std::size_t index) noexcept {
@@ -60,15 +57,15 @@ constexpr unsigned char padded_byte(std::string_view text, std::size_t index) no
 
 /** The key of a string whose leading bytes are @p text and whose length byte is @p length_byte. */
 constexpr ustore_key_t key_of_bytes(std::string_view text, unsigned char length_byte) noexcept {
-    unsigned_key_t word = 0;
+    key_word_t word = 0;
     for (std::size_t index = 0; index != prefix_bytes_k; ++index)
-        word = static_cast<unsigned_key_t>((word << 8) | padded_byte(text, index));
-    word = static_cast<unsigned_key_t>((word << 8) | length_byte);
-    return static_cast<ustore_key_t>(word ^ sign_bit_k);
+        word = static_cast<key_word_t>((word << 8) | padded_byte(text, index));
+    word = static_cast<key_word_t>((word << 8) | length_byte);
+    return key_from_integer(word);
 }
 
 /** The key @p text is stored under, which orders exactly as the text of every string that fits a key. */
-constexpr ustore_key_t key_of(std::string_view text) noexcept {
+constexpr ustore_key_t key_from_string(std::string_view text) noexcept {
     unsigned char const length_byte = text.size() <= prefix_bytes_k ? static_cast<unsigned char>(text.size())
                                                                     : bucketed_length_k;
     return key_of_bytes(text, length_byte);
@@ -90,37 +87,40 @@ struct key_window_t {
 /** The keys a walk of @p prefix covers, which is one bucket for a prefix longer than a key holds. */
 constexpr key_window_t window_of(std::string_view prefix) noexcept {
     if (shares_a_bucket(prefix.size())) {
-        ustore_key_t const bucket = key_of(prefix);
+        ustore_key_t const bucket = key_from_string(prefix);
         return {bucket, bucket};
     }
 
     // Every length byte a stored string takes stays below the padding of the upper bound, so it closes the window
-    unsigned_key_t highest = 0;
+    key_word_t highest = 0;
     for (std::size_t index = 0; index != prefix_bytes_k; ++index) {
         unsigned char const character = index < prefix.size() ? static_cast<unsigned char>(prefix[index])
                                                               : static_cast<unsigned char>(0xFF);
-        highest = static_cast<unsigned_key_t>((highest << 8) | character);
+        highest = static_cast<key_word_t>((highest << 8) | character);
     }
-    highest = static_cast<unsigned_key_t>((highest << 8) | 0xFF);
-    return {key_of(prefix), static_cast<ustore_key_t>(highest ^ sign_bit_k)};
+    highest = static_cast<key_word_t>((highest << 8) | 0xFF);
+    return {key_from_string(prefix), key_from_integer(highest)};
 }
 
 #pragma endregion Key Encoding
 
 #pragma region Bucket Layout
 
+/** The word every count and offset of a bucket takes, wide enough for a bucket past 4 GiB. */
+using bucket_word_t = std::uint64_t;
+
 /** Bytes of the entry count that leads every bucket. */
-constexpr std::size_t bucket_header_bytes_k = sizeof(std::uint32_t);
+constexpr std::size_t bucket_header_bytes_k = sizeof(bucket_word_t);
 
 /** Reads the little-endian length sitting @p offset bytes into @p bytes. */
-inline std::uint32_t read_length(ustore_bytes_cptr_t bytes, std::size_t offset) noexcept {
-    std::uint32_t length = 0;
+inline bucket_word_t read_length(ustore_bytes_cptr_t bytes, std::size_t offset) noexcept {
+    bucket_word_t length = 0;
     std::memcpy(&length, bytes + offset, sizeof(length));
     return length;
 }
 
 /** Writes @p length as a little-endian length @p offset bytes into @p bytes. */
-inline void write_length(ustore_byte_t* bytes, std::size_t offset, std::uint32_t length) noexcept {
+inline void write_length(ustore_byte_t* bytes, std::size_t offset, bucket_word_t length) noexcept {
     std::memcpy(bytes + offset, &length, sizeof(length));
 }
 
@@ -144,7 +144,7 @@ struct bucket_entry_t {
 class bucket_view_t {
 
     ustore_bytes_cptr_t bytes_ {nullptr};
-    std::uint32_t count_ {0};
+    bucket_word_t count_ {0};
 
   public:
     bucket_view_t() = default;
@@ -152,8 +152,9 @@ class bucket_view_t {
     explicit bucket_view_t(value_view_t value) noexcept {
         if (value.size() < bucket_header_bytes_k) return;
         auto const bytes = reinterpret_cast<ustore_bytes_cptr_t>(value.data());
-        std::uint32_t const count = read_length(bytes, 0);
-        if (value.size() < bucket_header_bytes_k + 2 * sizeof(std::uint32_t) * (std::size_t {count} + 1)) return;
+        bucket_word_t const count = read_length(bytes, 0);
+        if (value.size() < bucket_header_bytes_k + 2 * sizeof(bucket_word_t) * (static_cast<std::size_t>(count) + 1))
+            return;
         bytes_ = bytes;
         count_ = count;
     }
@@ -164,16 +165,16 @@ class bucket_view_t {
 
     /** The string of the entry at @p index. */
     std::string_view text_of(std::size_t index) const noexcept {
-        std::size_t const begin = read_length(bytes_, strings_offsets_begin_() + index * sizeof(std::uint32_t));
-        std::size_t const end = read_length(bytes_, strings_offsets_begin_() + (index + 1) * sizeof(std::uint32_t));
+        std::size_t const begin = read_length(bytes_, strings_offsets_begin_() + index * sizeof(bucket_word_t));
+        std::size_t const end = read_length(bytes_, strings_offsets_begin_() + (index + 1) * sizeof(bucket_word_t));
         auto const characters = reinterpret_cast<char const*>(bytes_ + strings_begin_());
         return {characters + begin, end - begin};
     }
 
     /** The value of the entry at @p index. */
     value_view_t value_of(std::size_t index) const noexcept {
-        std::size_t const begin = read_length(bytes_, values_offsets_begin_() + index * sizeof(std::uint32_t));
-        std::size_t const end = read_length(bytes_, values_offsets_begin_() + (index + 1) * sizeof(std::uint32_t));
+        std::size_t const begin = read_length(bytes_, values_offsets_begin_() + index * sizeof(bucket_word_t));
+        std::size_t const end = read_length(bytes_, values_offsets_begin_() + (index + 1) * sizeof(bucket_word_t));
         return {bytes_ + values_begin_() + begin, static_cast<ustore_length_t>(end - begin)};
     }
 
@@ -206,23 +207,23 @@ class bucket_view_t {
 
     /** Where the offsets of the values start. */
     std::size_t values_offsets_begin_() const noexcept {
-        return bucket_header_bytes_k + sizeof(std::uint32_t) * (std::size_t {count_} + 1);
+        return bucket_header_bytes_k + sizeof(bucket_word_t) * (static_cast<std::size_t>(count_) + 1);
     }
 
     /** Where the strings themselves start. */
     std::size_t strings_begin_() const noexcept {
-        return bucket_header_bytes_k + 2 * sizeof(std::uint32_t) * (std::size_t {count_} + 1);
+        return bucket_header_bytes_k + 2 * sizeof(bucket_word_t) * (static_cast<std::size_t>(count_) + 1);
     }
 
     /** Where the values themselves start. */
     std::size_t values_begin_() const noexcept {
-        return strings_begin_() + read_length(bytes_, strings_offsets_begin_() + count_ * sizeof(std::uint32_t));
+        return strings_begin_() + read_length(bytes_, strings_offsets_begin_() + count_ * sizeof(bucket_word_t));
     }
 };
 
 /** The bytes a bucket of @p entries takes once written. */
 inline std::size_t bucket_bytes(std::span<bucket_entry_t const> entries) noexcept {
-    std::size_t bytes = bucket_header_bytes_k + 2 * sizeof(std::uint32_t) * (entries.size() + 1);
+    std::size_t bytes = bucket_header_bytes_k + 2 * sizeof(bucket_word_t) * (entries.size() + 1);
     for (bucket_entry_t const& entry : entries) bytes += entry.text.size() + entry.value.size();
     return bytes;
 }
@@ -230,25 +231,25 @@ inline std::size_t bucket_bytes(std::span<bucket_entry_t const> entries) noexcep
 /** Writes @p entries, already sorted by their strings, into @p bytes, which has room for them. */
 inline void write_bucket(ustore_byte_t* bytes, std::span<bucket_entry_t const> entries) noexcept {
     std::size_t const count = entries.size();
-    write_length(bytes, 0, static_cast<std::uint32_t>(count));
+    write_length(bytes, 0, static_cast<bucket_word_t>(count));
 
     std::size_t const strings_offsets_begin = bucket_header_bytes_k;
-    std::size_t const values_offsets_begin = bucket_header_bytes_k + sizeof(std::uint32_t) * (count + 1);
-    std::size_t const strings_begin = bucket_header_bytes_k + 2 * sizeof(std::uint32_t) * (count + 1);
+    std::size_t const values_offsets_begin = bucket_header_bytes_k + sizeof(bucket_word_t) * (count + 1);
+    std::size_t const strings_begin = bucket_header_bytes_k + 2 * sizeof(bucket_word_t) * (count + 1);
 
     std::size_t strings_bytes = 0;
     std::size_t values_bytes = 0;
     for (std::size_t index = 0; index != count; ++index) {
-        write_length(bytes, strings_offsets_begin + index * sizeof(std::uint32_t),
-                     static_cast<std::uint32_t>(strings_bytes));
-        write_length(bytes, values_offsets_begin + index * sizeof(std::uint32_t),
-                     static_cast<std::uint32_t>(values_bytes));
+        write_length(bytes, strings_offsets_begin + index * sizeof(bucket_word_t),
+                     static_cast<bucket_word_t>(strings_bytes));
+        write_length(bytes, values_offsets_begin + index * sizeof(bucket_word_t),
+                     static_cast<bucket_word_t>(values_bytes));
         strings_bytes += entries[index].text.size();
         values_bytes += entries[index].value.size();
     }
-    write_length(bytes, strings_offsets_begin + count * sizeof(std::uint32_t),
-                 static_cast<std::uint32_t>(strings_bytes));
-    write_length(bytes, values_offsets_begin + count * sizeof(std::uint32_t), static_cast<std::uint32_t>(values_bytes));
+    write_length(bytes, strings_offsets_begin + count * sizeof(bucket_word_t),
+                 static_cast<bucket_word_t>(strings_bytes));
+    write_length(bytes, values_offsets_begin + count * sizeof(bucket_word_t), static_cast<bucket_word_t>(values_bytes));
 
     std::size_t const values_begin = strings_begin + strings_bytes;
     std::size_t written_strings = 0;
@@ -281,10 +282,10 @@ struct touched_bucket_t : public collection_key_t {
 struct write_task_t {
 
     /** Collection owning the string. */
-    ustore_collection_t collection {ustore_collection_main_k};
+    ustore_collection_id_t collection {ustore_collection_main_k};
 
     /** Key the string is stored under. */
-    ustore_key_t key {0};
+    ustore_key_t key {};
 
     /** The string itself. */
     std::string_view text;
@@ -378,8 +379,8 @@ constexpr std::size_t name_record_attempts_k = 16;
 
 /** Reads the record of @p name at the head, answering whether a collection carries the name at all. */
 bool look_up_name(ustore_database_t database, ustore_transaction_t transaction, std::string_view name,
-                  linked_memory_lock_t& arena, ustore_error_t* error, ustore_collection_t& id) noexcept {
-    ustore_collection_t const names = names_collection_k;
+                  linked_memory_lock_t& arena, ustore_error_t* error, ustore_collection_id_t& id) noexcept {
+    ustore_collection_id_t const names = names_collection_k;
     char const* const text = name.data();
     ustore_length_t const length = static_cast<ustore_length_t>(name.size());
     ustore_length_t* lengths = nullptr;
@@ -409,7 +410,7 @@ bool look_up_name(ustore_database_t database, ustore_transaction_t transaction, 
 void write_name_record(ustore_database_t database, ustore_transaction_t transaction, std::string_view name,
                        name_record_t const* record, ustore_options_t options, linked_memory_lock_t& arena,
                        ustore_error_t* error) noexcept {
-    ustore_collection_t const names = names_collection_k;
+    ustore_collection_id_t const names = names_collection_k;
     char const* const text = name.data();
     ustore_length_t const length = static_cast<ustore_length_t>(name.size());
     ustore_bytes_cptr_t const value = record ? reinterpret_cast<ustore_bytes_cptr_t>(record->bytes) : nullptr;
@@ -439,7 +440,7 @@ void write_name_record(ustore_database_t database, ustore_transaction_t transact
 bool record_name(ustore_database_t database, std::string_view name, name_record_t const& record,
                  linked_memory_lock_t& arena, ustore_error_t* error) noexcept {
     ustore_transaction_t transaction = nullptr;
-    ustore_collection_t taken = ustore_collection_main_k;
+    ustore_collection_id_t taken = ustore_collection_main_k;
     bool recorded = false;
     for (std::size_t attempt = 0; !recorded && attempt != name_record_attempts_k; ++attempt) {
         *error = {};
@@ -476,7 +477,7 @@ struct names_t {
     std::size_t count = 0;
     ustore_length_t* offsets = nullptr;
     ustore_char_t* tape = nullptr;
-    ustore_collection_t* ids = nullptr;
+    ustore_collection_id_t* collections = nullptr;
     ustore_modality_t* modalities = nullptr;
 
     /** The name at @p index. */
@@ -489,7 +490,7 @@ struct names_t {
 names_t scan_names(ustore_database_t database, ustore_snapshot_t snapshot, linked_memory_lock_t& arena,
                    ustore_error_t* error) noexcept {
     names_t names;
-    ustore_collection_t const collection = names_collection_k;
+    ustore_collection_id_t const collection = names_collection_k;
     char const* const prefix = "";
     ustore_length_t const prefix_length = 0;
     ustore_length_t const limit = std::numeric_limits<ustore_length_t>::max();
@@ -533,7 +534,7 @@ names_t scan_names(ustore_database_t database, ustore_snapshot_t snapshot, linke
     find.names_stride = sizeof(ustore_str_view_t);
     find.names_lengths = lengths.data();
     find.names_lengths_stride = sizeof(ustore_length_t);
-    find.ids = &names.ids;
+    find.collections = &names.collections;
     find.modalities = &names.modalities;
     collection_find(find);
     return names;
@@ -541,7 +542,7 @@ names_t scan_names(ustore_database_t database, ustore_snapshot_t snapshot, linke
 
 /** A name's position in a @c names_t, beside the collection it addresses, so names sort by collection. */
 struct named_position_t {
-    ustore_collection_t id = ustore_collection_main_k;
+    ustore_collection_id_t id = ustore_collection_main_k;
     std::size_t position = 0;
 
     friend constexpr std::strong_ordering operator<=>(named_position_t const&,
@@ -565,7 +566,7 @@ void strings_write(ustore_strings_write_t& request) noexcept {
     if (request.error->status) return;
 
     std::size_t const tasks_count = request.tasks_count;
-    strided_iterator<ustore_collection_t const> const collections {request.collections, request.collections_stride};
+    strided_iterator<ustore_collection_id_t const> const collections {request.collections, request.collections_stride};
     strings_arg_t const texts {
         {request.strings, request.strings_stride},
         {request.strings_lengths, request.strings_lengths_stride},
@@ -585,7 +586,7 @@ void strings_write(ustore_strings_write_t& request) noexcept {
         std::string_view const text = texts[index];
         tasks[index].collection = collections ? collections[static_cast<std::ptrdiff_t>(index)]
                                               : ustore_collection_main_k;
-        tasks[index].key = key_of(text);
+        tasks[index].key = key_from_string(text);
         tasks[index].text = text;
         tasks[index].value = values[index];
         tasks[index].task_index = static_cast<ustore_length_t>(index);
@@ -683,7 +684,7 @@ void strings_read(ustore_strings_read_t& request) noexcept {
     if (request.error->status) return;
 
     std::size_t const tasks_count = request.tasks_count;
-    strided_iterator<ustore_collection_t const> const collections {request.collections, request.collections_stride};
+    strided_iterator<ustore_collection_id_t const> const collections {request.collections, request.collections_stride};
     strings_arg_t const texts {
         {request.strings, request.strings_stride},
         {request.strings_lengths, request.strings_lengths_stride},
@@ -695,7 +696,7 @@ void strings_read(ustore_strings_read_t& request) noexcept {
         touched[index] = touched_bucket_t {};
         touched[index].collection = collections ? collections[static_cast<std::ptrdiff_t>(index)]
                                                 : ustore_collection_main_k;
-        touched[index].key = key_of(texts[index]);
+        touched[index].key = key_from_string(texts[index]);
     }
     std::size_t const touched_count = sort_and_deduplicate(touched.begin(), touched.end());
     touched = touched.first(touched_count);
@@ -711,9 +712,10 @@ void strings_read(ustore_strings_read_t& request) noexcept {
 
     for (std::size_t index = 0; index != tasks_count; ++index) {
         std::string_view const text = texts[index];
-        ustore_collection_t const collection = collections ? collections[static_cast<std::ptrdiff_t>(index)]
-                                                           : ustore_collection_main_k;
-        std::size_t const bucket_index = offset_in_sorted(touched, collection_key_t {collection, key_of(text)});
+        ustore_collection_id_t const collection = collections ? collections[static_cast<std::ptrdiff_t>(index)]
+                                                              : ustore_collection_main_k;
+        std::size_t const bucket_index = offset_in_sorted(touched,
+                                                          collection_key_t {collection, key_from_string(text)});
         bucket_view_t const bucket {stored[bucket_index]};
         std::size_t const position = bucket.find(text);
         exported.push_back(position == bucket.size() ? value_view_t {} : bucket.value_of(position), request.error);
@@ -741,7 +743,7 @@ void strings_scan(ustore_strings_scan_t& request) noexcept {
     if (request.error->status) return;
 
     std::size_t const tasks_count = request.tasks_count;
-    strided_iterator<ustore_collection_t const> const collections {request.collections, request.collections_stride};
+    strided_iterator<ustore_collection_id_t const> const collections {request.collections, request.collections_stride};
     strided_iterator<ustore_length_t const> const count_limits {request.count_limits, request.count_limits_stride};
     strings_arg_t const prefixes {
         {request.prefixes, request.prefixes_stride},
@@ -762,7 +764,7 @@ void strings_scan(ustore_strings_scan_t& request) noexcept {
 
     for (std::size_t index = 0; index != tasks_count; ++index) {
         auto const signed_index = static_cast<std::ptrdiff_t>(index);
-        ustore_collection_t collection = collections ? collections[signed_index] : ustore_collection_main_k;
+        ustore_collection_id_t collection = collections ? collections[signed_index] : ustore_collection_main_k;
         std::string_view const prefix = prefixes[index];
         std::string_view const start = request.start_strings ? start_strings[index] : std::string_view {};
         std::size_t const limit = count_limits[signed_index];
@@ -772,7 +774,7 @@ void strings_scan(ustore_strings_scan_t& request) noexcept {
         std::size_t found = 0;
         ustore_key_t next_key = window.first;
         if (request.start_strings && !start.empty()) {
-            ustore_key_t const resumed = key_of(start);
+            ustore_key_t const resumed = key_from_string(start);
             if (resumed > next_key) next_key = resumed;
         }
 
@@ -834,9 +836,8 @@ void strings_scan(ustore_strings_scan_t& request) noexcept {
             }
 
             ustore_key_t const last_key = scanned_keys[wanted - 1];
-            if (found == limit || last_key == std::numeric_limits<ustore_key_t>::max()) break;
-            next_key = last_key + 1;
-            if (next_key > window.last) break;
+            if (found == limit || last_key >= window.last) break;
+            next_key = key_after(last_key);
         }
 
         counts[index] = static_cast<ustore_length_t>(found);
@@ -849,7 +850,7 @@ void strings_scan(ustore_strings_scan_t& request) noexcept {
 
 void collection_find(ustore_collection_find_t& request) noexcept {
     if (!request.tasks_count) return;
-    if (!request.names || !request.ids) {
+    if (!request.names || !request.collections) {
         *request.error = {ustore_error_invalid_argument_k, "Need the names and an output for the identifiers"};
         return;
     }
@@ -857,7 +858,7 @@ void collection_find(ustore_collection_find_t& request) noexcept {
     linked_memory_lock_t arena = linked_memory(request.arena, request.options, request.error);
     if (request.error->status) return;
 
-    ustore_collection_t const names = names_collection_k;
+    ustore_collection_id_t const names = names_collection_k;
     ustore_length_t* offsets = nullptr;
     ustore_length_t* lengths = nullptr;
     ustore_byte_t* values = nullptr;
@@ -879,13 +880,13 @@ void collection_find(ustore_collection_find_t& request) noexcept {
     if (request.error->status) return;
 
     std::size_t const count = request.tasks_count;
-    std::span<ustore_collection_t> const ids = arena.alloc<ustore_collection_t>(count, request.error);
+    std::span<ustore_collection_id_t> const ids = arena.alloc<ustore_collection_id_t>(count, request.error);
     auto modalities = arena.alloc_or_dummy(count, request.error, request.modalities);
     auto presences = arena.alloc_or_dummy(count, request.error, request.presences);
     if (request.error->status) return;
     for (std::size_t index = 0; index != count; ++index) {
         bool const present = lengths[index] != ustore_length_missing_k;
-        ustore_collection_t id = ustore_collection_main_k;
+        ustore_collection_id_t id = ustore_collection_main_k;
         ustore_modality_t modality = ustore_modality_any_k;
         std::string_view const record {reinterpret_cast<char const*>(values) + offsets[index],
                                        present ? lengths[index] : 0};
@@ -897,7 +898,7 @@ void collection_find(ustore_collection_find_t& request) noexcept {
         modalities[index] = modality;
         presences[index] = present;
     }
-    *request.ids = ids.data();
+    *request.collections = ids.data();
 }
 
 void with_names(ustore_collection_create_t& request, void (*create)(ustore_collection_create_t&) noexcept) noexcept {
@@ -907,7 +908,7 @@ void with_names(ustore_collection_create_t& request, void (*create)(ustore_colle
         *request.error = {ustore_error_invalid_argument_k, "A name is never empty, as the main collection has none"};
         return;
     }
-    if (!request.id) {
+    if (!request.collection) {
         *request.error = {ustore_error_invalid_argument_k, "Need an output for the collection"};
         return;
     }
@@ -916,7 +917,7 @@ void with_names(ustore_collection_create_t& request, void (*create)(ustore_colle
     linked_memory_lock_t arena = linked_memory(scratch.member_ptr(), ustore_options_default_k, request.error);
     if (request.error->status) return;
 
-    ustore_collection_t id = ustore_collection_main_k;
+    ustore_collection_id_t id = ustore_collection_main_k;
     if (look_up_name(request.db, nullptr, name, arena, request.error, id)) {
         *request.error = {ustore_error_already_exists_k, "A collection already carries the name"};
         return;
@@ -926,7 +927,7 @@ void with_names(ustore_collection_create_t& request, void (*create)(ustore_colle
     ustore_collection_create_t anonymous = request;
     anonymous.name = nullptr;
     anonymous.name_length = 0;
-    anonymous.id = &id;
+    anonymous.collection = &id;
     create(anonymous);
     if (request.error->status) return;
 
@@ -946,7 +947,7 @@ void with_names(ustore_collection_create_t& request, void (*create)(ustore_colle
         recorded = request.error->status == ustore_success_k;
     }
     if (recorded) {
-        *request.id = id;
+        *request.collection = id;
         return;
     }
 
@@ -955,13 +956,14 @@ void with_names(ustore_collection_create_t& request, void (*create)(ustore_colle
     ustore_collection_drop_t drop {};
     drop.db = request.db;
     drop.error = &dropped;
-    drop.id = id;
+    drop.collection = id;
     drop.mode = ustore_drop_keys_vals_handle_k;
     ustore_collection_drop(&drop);
 }
 
 void with_names(ustore_collection_drop_t& request, void (*drop)(ustore_collection_drop_t&) noexcept) noexcept {
-    if (request.mode != ustore_drop_keys_vals_handle_k || request.id == ustore_collection_main_k) return drop(request);
+    if (request.mode != ustore_drop_keys_vals_handle_k || request.collection == ustore_collection_main_k)
+        return drop(request);
 
     // The names go first and flushed, so a crash leaves a collection without a name, never a name without a collection
     arena_t scratch {request.db};
@@ -975,14 +977,14 @@ void with_names(ustore_collection_drop_t& request, void (*drop)(ustore_collectio
     if (request.error->status) return;
     std::size_t unnamed_count = 0;
     for (std::size_t index = 0; index != names.count; ++index) {
-        if (names.ids[index] != request.id) continue;
+        if (names.collections[index] != request.collection) continue;
         std::string_view const name = names[index];
         unnamed[unnamed_count] = name.data();
         lengths[unnamed_count] = static_cast<ustore_length_t>(name.size());
         ++unnamed_count;
     }
     if (unnamed_count != 0) {
-        ustore_collection_t const collection = names_collection_k;
+        ustore_collection_id_t const collection = names_collection_k;
         ustore_strings_write_t write {};
         write.db = request.db;
         write.error = request.error;
@@ -1005,15 +1007,15 @@ void with_names(ustore_collection_list_t& request, void (*list)(ustore_collectio
         *request.error = {ustore_error_invalid_argument_k, "Need an output for the count"};
         return;
     }
-    ustore_collection_t* ids = nullptr;
+    ustore_collection_id_t* ids = nullptr;
     ustore_collection_list_t listing = request;
-    listing.ids = &ids;
+    listing.collections = &ids;
     listing.modalities = nullptr;
     listing.names_offsets = nullptr;
     listing.names = nullptr;
     list(listing);
     if (request.error->status) return;
-    if (request.ids) *request.ids = ids;
+    if (request.collections) *request.collections = ids;
     if (!request.modalities && !request.names_offsets && !request.names) return;
 
     // The identifiers stay in the arena, as everything below is allocated beside them
@@ -1026,7 +1028,7 @@ void with_names(ustore_collection_list_t& request, void (*list)(ustore_collectio
     // Every name ordered by the collection it addresses, so each listed collection finds its own by bisection
     std::span<named_position_t> const named = arena.alloc<named_position_t>(names.count, request.error);
     if (request.error->status) return;
-    for (std::size_t index = 0; index != names.count; ++index) named[index] = {names.ids[index], index};
+    for (std::size_t index = 0; index != names.count; ++index) named[index] = {names.collections[index], index};
     std::ranges::sort(named);
 
     std::size_t const count = *request.count;

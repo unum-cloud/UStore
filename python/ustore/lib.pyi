@@ -8,10 +8,12 @@ from collections.abc import Sequence
 from os import PathLike
 from types import TracebackType
 from typing import Literal, Self
+from uuid import UUID
 
 type Buffer = memoryview | bytes | bytearray
-type CollectionLike = int | str | None
-type KeysLike = Sequence[int] | Buffer
+type CollectionLike = UUID | str | None
+type KeyLike = UUID | int | str | bytes
+type KeysLike = Sequence[KeyLike] | Buffer
 type ValueLike = Buffer | None
 type DocumentLike = str | Buffer | None
 type FieldType = Literal[
@@ -29,7 +31,7 @@ type Transport = Literal["automatic", "blocking", "linux-uring", "linux-aio", "l
 type Modality = Literal["any", "blobs", "docs", "graph", "strings", "pages"]
 
 __version__: str
-default_edge_id: int
+default_edge_id: UUID
 
 def engines_compiled() -> tuple[str, ...]:
     """The engines this build carries: some of "ram", "rocksdb", "leveldb" and "nvme", in that order."""
@@ -84,7 +86,7 @@ class Keys:
     counts: tuple[int, ...]
 
     def __len__(self) -> int: ...
-    def __getitem__(self, task: int) -> memoryview: ...
+    def __getitem__(self, task: int) -> tuple[UUID, ...]: ...
     def __buffer__(self, flags: int) -> memoryview: ...
 
 class Columns:
@@ -110,7 +112,7 @@ class Edges:
     degrees: tuple[int | None, ...]
 
     def __len__(self) -> int: ...
-    def __getitem__(self, vertex: int) -> memoryview | None: ...
+    def __getitem__(self, vertex: int) -> tuple[tuple[UUID, UUID, UUID], ...] | None: ...
     def __buffer__(self, flags: int) -> memoryview: ...
 
 # endregion: Result Tapes
@@ -178,40 +180,33 @@ class Database:
     def control(self, request: str) -> str:
         """Sends a free-form request to the engine, such as 'clear', 'compact' or 'usage'."""
 
-    def collection_create(self, name: str, *, modality: Modality = "any") -> int:
+    def collection_create(self, name: str, *, modality: Modality = "any") -> UUID:
         """Creates an empty collection and records the name for it."""
 
-    def collection_find(self, name: str) -> int:
-        """The identifier the name addresses."""
+    def collection_find(self, name: str) -> UUID:
+        """The collection ID the name addresses."""
 
     def collection_contains(self, name: str) -> bool:
         """Whether a collection carries the name."""
 
-    def collection_list(self) -> tuple[int, ...]:
-        """The identifiers of every collection but the main one."""
+    def collection_list(self) -> tuple[UUID, ...]:
+        """The IDs of every collection but the main one."""
 
     def collection_names(self, *, after: str | None = None, limit: int = 1024) -> tuple[str, ...]:
         """One page of the names recorded for collections, in the order of their text."""
 
-    def collection_drop(self, collection: int | str, *, mode: str = "collection") -> None:
+    def collection_drop(self, collection: UUID | str, *, mode: str = "collection") -> None:
         """Removes a collection, or empties its pairs or its values."""
 
-    def snapshot_create(self) -> int:
-        """Captures a point-in-time view of the whole database."""
-
-    def snapshot_list(self) -> tuple[int, ...]:
-        """The identifiers of every snapshot."""
-
-    def snapshot_drop(self, snapshot: int) -> None:
-        """Releases a snapshot."""
-
-    def snapshot_export(self, snapshot: int, directory: str | bytes | PathLike[str]) -> None:
-        """Writes a snapshot out as a new database."""
+    def snapshot(self) -> Snapshot:
+        """Pins a point-in-time view of the whole database, which reads follow by naming it."""
 
     def transaction(self, *, watch: bool = True) -> Transaction:
         """Begins a transaction over this database."""
 
-    def read(self, keys: KeysLike, *, collection: CollectionLike = None, snapshot: int = 0) -> Values: ...
+    def read(
+        self, keys: KeysLike, *, collection: CollectionLike = None, snapshot: Snapshot | None = None
+    ) -> Values: ...
     def write(
         self,
         keys: KeysLike,
@@ -220,19 +215,34 @@ class Database:
         collection: CollectionLike = None,
         flush: bool = False,
     ) -> None: ...
-    def scan(self, start: int, count: int, *, collection: CollectionLike = None, snapshot: int = 0) -> Keys: ...
-    def scan_batch(
-        self, starts: KeysLike, counts: Sequence[int], *, collection: CollectionLike = None, snapshot: int = 0
+    def scan(
+        self, start: KeyLike, count: int, *, collection: CollectionLike = None, snapshot: Snapshot | None = None
     ) -> Keys: ...
-    def sample(self, count: int, *, collection: CollectionLike = None, snapshot: int = 0) -> Keys: ...
-    def sample_batch(self, counts: Sequence[int], *, collection: CollectionLike = None, snapshot: int = 0) -> Keys: ...
+    def scan_batch(
+        self,
+        starts: KeysLike,
+        counts: Sequence[int],
+        *,
+        collection: CollectionLike = None,
+        snapshot: Snapshot | None = None,
+    ) -> Keys: ...
+    def sample(self, count: int, *, collection: CollectionLike = None, snapshot: Snapshot | None = None) -> Keys: ...
+    def sample_batch(
+        self, counts: Sequence[int], *, collection: CollectionLike = None, snapshot: Snapshot | None = None
+    ) -> Keys: ...
     def measure(
-        self, start: int, end: int, *, collection: CollectionLike = None, snapshot: int = 0
+        self, start: KeyLike, end: KeyLike, *, collection: CollectionLike = None, snapshot: Snapshot | None = None
     ) -> dict[str, int]: ...
-    def get(self, key: int, *, collection: CollectionLike = None, snapshot: int = 0) -> bytes | None: ...
-    def set(self, key: int, value: ValueLike, *, collection: CollectionLike = None, flush: bool = False) -> None: ...
-    def pop(self, keys: int | KeysLike, *, collection: CollectionLike = None, flush: bool = False) -> None: ...
-    def contains(self, key: int, *, collection: CollectionLike = None, snapshot: int = 0) -> bool: ...
+    def get(
+        self, key: KeyLike, *, collection: CollectionLike = None, snapshot: Snapshot | None = None
+    ) -> bytes | None: ...
+    def set(
+        self, key: KeyLike, value: ValueLike, *, collection: CollectionLike = None, flush: bool = False
+    ) -> None: ...
+    def pop(self, keys: KeyLike | KeysLike, *, collection: CollectionLike = None, flush: bool = False) -> None: ...
+    def contains(
+        self, key: KeyLike, *, collection: CollectionLike = None, snapshot: Snapshot | None = None
+    ) -> bool: ...
     def docs_write(
         self,
         keys: KeysLike | None,
@@ -250,11 +260,13 @@ class Database:
         keys: KeysLike,
         *,
         collection: CollectionLike = None,
-        snapshot: int = 0,
+        snapshot: Snapshot | None = None,
         field: str | None = None,
         type: Literal["json", "str"] = "json",
     ) -> Values: ...
-    def docs_gist(self, keys: KeysLike, *, collection: CollectionLike = None, snapshot: int = 0) -> tuple[str, ...]: ...
+    def docs_gist(
+        self, keys: KeysLike, *, collection: CollectionLike = None, snapshot: Snapshot | None = None
+    ) -> tuple[str, ...]: ...
     def docs_gather(
         self,
         keys: KeysLike,
@@ -262,7 +274,7 @@ class Database:
         types: GatherType | Sequence[GatherType],
         *,
         collection: CollectionLike = None,
-        snapshot: int = 0,
+        snapshot: Snapshot | None = None,
     ) -> Columns: ...
     def graph_upsert_edges(
         self,
@@ -283,10 +295,20 @@ class Database:
         flush: bool = False,
     ) -> None: ...
     def graph_find_edges(
-        self, vertices: KeysLike, *, role: Role = "any", collection: CollectionLike = None, snapshot: int = 0
+        self,
+        vertices: KeysLike,
+        *,
+        role: Role = "any",
+        collection: CollectionLike = None,
+        snapshot: Snapshot | None = None,
     ) -> Edges: ...
     def graph_degrees(
-        self, vertices: KeysLike, *, role: Role = "any", collection: CollectionLike = None, snapshot: int = 0
+        self,
+        vertices: KeysLike,
+        *,
+        role: Role = "any",
+        collection: CollectionLike = None,
+        snapshot: Snapshot | None = None,
     ) -> tuple[int | None, ...]: ...
     def graph_upsert_vertices(
         self, vertices: KeysLike, *, collection: CollectionLike = None, flush: bool = False
@@ -294,6 +316,24 @@ class Database:
     def graph_remove_vertices(
         self, vertices: KeysLike, *, role: Role = "any", collection: CollectionLike = None, flush: bool = False
     ) -> None: ...
+
+class Snapshot:
+    """A point-in-time view of the whole database, which reads follow by naming it."""
+
+    database: Database
+
+    def __enter__(self) -> Self: ...
+    def __exit__(
+        self,
+        kind: type[BaseException] | None = None,
+        value: BaseException | None = None,
+        traceback: TracebackType | None = None,
+    ) -> None: ...
+    def export(self, directory: str | bytes | PathLike[str]) -> None:
+        """Writes the snapshot out as a new database, which another process may then open."""
+
+    def close(self) -> None:
+        """Releases the snapshot, unpinning the versions only it kept."""
 
 class Transaction:
     """An optimistic transaction grouping operations across collections and modalities."""
@@ -311,7 +351,7 @@ class Transaction:
         """Applies every staged change, or none of them."""
 
     def stage(self) -> int:
-        """Runs the first phase of a two-phase commit."""
+        """Runs the first phase of a two-phase commit, answering the stamp it took."""
 
     def rollback(self) -> None:
         """Drops every staged change and starts a new generation on the same handle."""
@@ -329,23 +369,29 @@ class Transaction:
         flush: bool = False,
         watch: bool = True,
     ) -> None: ...
-    def scan(self, start: int, count: int, *, collection: CollectionLike = None, watch: bool = True) -> Keys: ...
+    def scan(self, start: KeyLike, count: int, *, collection: CollectionLike = None, watch: bool = True) -> Keys: ...
     def scan_batch(
         self, starts: KeysLike, counts: Sequence[int], *, collection: CollectionLike = None, watch: bool = True
     ) -> Keys: ...
     def sample(self, count: int, *, collection: CollectionLike = None, watch: bool = True) -> Keys: ...
     def sample_batch(self, counts: Sequence[int], *, collection: CollectionLike = None, watch: bool = True) -> Keys: ...
     def measure(
-        self, start: int, end: int, *, collection: CollectionLike = None, watch: bool = True
+        self, start: KeyLike, end: KeyLike, *, collection: CollectionLike = None, watch: bool = True
     ) -> dict[str, int]: ...
-    def get(self, key: int, *, collection: CollectionLike = None, watch: bool = True) -> bytes | None: ...
+    def get(self, key: KeyLike, *, collection: CollectionLike = None, watch: bool = True) -> bytes | None: ...
     def set(
-        self, key: int, value: ValueLike, *, collection: CollectionLike = None, flush: bool = False, watch: bool = True
+        self,
+        key: KeyLike,
+        value: ValueLike,
+        *,
+        collection: CollectionLike = None,
+        flush: bool = False,
+        watch: bool = True,
     ) -> None: ...
     def pop(
-        self, keys: int | KeysLike, *, collection: CollectionLike = None, flush: bool = False, watch: bool = True
+        self, keys: KeyLike | KeysLike, *, collection: CollectionLike = None, flush: bool = False, watch: bool = True
     ) -> None: ...
-    def contains(self, key: int, *, collection: CollectionLike = None, watch: bool = True) -> bool: ...
+    def contains(self, key: KeyLike, *, collection: CollectionLike = None, watch: bool = True) -> bool: ...
     def docs_write(
         self,
         keys: KeysLike | None,

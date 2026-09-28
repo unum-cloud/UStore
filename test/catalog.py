@@ -1,14 +1,16 @@
 """Collections over the C ABI: creating, naming, listing and dropping them."""
 
+from uuid import UUID
+
 import pytest
-from capabilities import NEEDS_COLLECTIONS
+from capabilities import NEEDS_COLLECTIONS, keys
 
 import ustore
 
 pytestmark = NEEDS_COLLECTIONS
 
 
-def address(database: ustore.Database, name: str, addressing: str) -> int | str:
+def address(database: ustore.Database, name: str, addressing: str) -> UUID | str:
     """The collection named `name`, spelled by name or by the identifier the name resolves to."""
     return name if addressing == "name" else database.collection_find(name)
 
@@ -16,9 +18,11 @@ def address(database: ustore.Database, name: str, addressing: str) -> int | str:
 ADDRESSINGS = ["name", "identifier"]
 
 
-def test_create_answers_an_identifier(database):
+def test_create_answers_a_uuid(database, engine: str):
+    """A collection ID is a UUIDv7, but on NVMe, which still spells the number it keeps."""
     identifier = database.collection_create("people")
-    assert isinstance(identifier, int)
+    assert isinstance(identifier, UUID)
+    assert identifier.version == 7 or engine == "nvme"
     assert database.collection_find("people") == identifier
 
 
@@ -30,10 +34,10 @@ def test_verbs_address_a_collection_either_way(database, addressing: str):
     database.write([2, 3], b"batch", collection=collection)
     assert database.get(1, collection="people") == b"named"
     assert [bytes(value) for value in database.read([2, 3], collection=collection)] == [b"batch"] * 2
-    assert list(database.scan(0, 3, collection=collection)[0]) == [1, 2, 3]
+    assert list(database.scan(0, 3, collection=collection)[0]) == keys([1, 2, 3])
 
 
-@pytest.mark.parametrize("key", [0, 1, -1])
+@pytest.mark.parametrize("key", [0, 1, 2**64 - 2])
 def test_collections_hold_their_keys_apart(database, key: int):
     first = database.collection_create("first")
     second = database.collection_create("second")
@@ -45,8 +49,8 @@ def test_collections_hold_their_keys_apart(database, key: int):
     assert not database.contains(key)
 
 
-@pytest.mark.parametrize("main", [None, "", 0])
-def test_the_main_collection_is_the_default(database, main: int | str | None):
+@pytest.mark.parametrize("main", [None, "", UUID(int=0)])
+def test_the_main_collection_is_the_default(database, main: UUID | str | None):
     database.set(1, b"main")
     assert database.get(1, collection=main) == b"main"
 
@@ -118,7 +122,7 @@ def test_emptying_keeps_the_collection(database, mode: str):
 
 def test_the_main_collection_can_be_cleared(database):
     database.set(1, b"main")
-    database.collection_drop(0, mode="pairs")
+    database.collection_drop(UUID(int=0), mode="pairs")
     assert not database.contains(1)
 
 
@@ -132,8 +136,18 @@ def test_the_main_collection_can_be_cleared(database):
         (lambda database: database.collection_drop("people", mode="everything"), ValueError),
         (lambda database: database.collection_create(42), TypeError),
         (lambda database: database.get(1, collection=1.5), TypeError),
+        (lambda database: database.get(1, collection=7), TypeError),
     ],
-    ids=["taken-name", "unknown-name", "unknown-name-in-a-verb", "empty-name", "drop-mode", "integer-name", "float"],
+    ids=[
+        "taken-name",
+        "unknown-name",
+        "unknown-name-in-a-verb",
+        "empty-name",
+        "drop-mode",
+        "integer-name",
+        "float",
+        "integer-collection",
+    ],
 )
 def test_refusals(database, call, failure: type):
     database.collection_create("people")

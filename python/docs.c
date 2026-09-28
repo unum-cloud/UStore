@@ -150,10 +150,6 @@ static int document_borrow(PyObject* object, ustore_py_contents_t* batch) {
     Py_ssize_t length = 0;
     char const* const text = PyUnicode_AsUTF8AndSize(object, &length);
     if (!text) return -1;
-    if (length > (Py_ssize_t)UINT32_MAX) {
-        PyErr_Format(PyExc_ValueError, "A document spans %zd bytes, past the 4 GiB a length can carry", length);
-        return -1;
-    }
     batch->values[batch->count] = (ustore_bytes_cptr_t)text;
     batch->lengths[batch->count] = (ustore_length_t)length;
     ++batch->count;
@@ -257,33 +253,33 @@ static int documents_from_object(PyObject* object, documents_t* documents) {
     return 0;
 }
 
-char const doc_docs_write[] =                                                                   //
-    "docs_write(keys, documents, *, collection=None, field=None, modification='upsert',\n"      //
-    "           type='json', id_field=None, flush=False) answers None.\n"                       //
-    "\n"                                                                                        //
-    "Writes a batch of JSON documents, or one field inside each of them. Every document is\n"   //
-    "borrowed for the length of the call rather than copied.\n"                                 //
-    "\n"                                                                                        //
-    "Args:\n"                                                                                   //
-    "  keys (Sequence[int] | buffer | None): The keys to write; None reads every key from\n"    //
-    "    `id_field` of its document.\n"                                                         //
-    "  documents (Sequence[str | bytes-like | None] | str | bytes-like | None): One document\n" //
-    "    per key, one document broadcast to every key, or None to remove them all. A None\n"    //
-    "    inside a sequence removes that one document, or the field inside it. Under a\n"        //
-    "    fixed-width `type`, a contiguous buffer of one scalar per key is a column, which\n"    //
-    "    reaches the store without being printed as JSON and parsed back.\n"                    //
-    "  collection (int | str, optional): The collection, by identifier or by name.\n"           //
-    "  field (str, optional): A top-level key or a JSON Pointer such as '/user/name' to\n"      //
-    "    write inside every document; None writes whole documents.\n"                           //
-    "  modification (str, optional): 'upsert', 'update', 'insert', an RFC 6902 'patch' or\n"    //
-    "    an RFC 7386 'merge'.\n"                                                                //
-    "  type (str, optional): How every document is spelled: 'json', 'str' for a plain\n"        //
-    "    string, 'null', or the raw bytes of 'bool', 'f64', 'f32', 'i64' through 'u8'.\n"       //
-    "  id_field (str, optional): The field holding every key when `keys` is None.\n"            //
-    "  flush (bool, optional): Whether to reach the drive before returning.\n"                  //
-    "Raises:\n"                                                                                 //
-    "  MalformedError: A document does not parse, or its `id_field` holds no integer.\n"        //
-    "  MissingError: A field is written inside a document that does not exist.\n"               //
+char const doc_docs_write[] =                                                                    //
+    "docs_write(keys, documents, *, collection=None, field=None, modification='upsert',\n"       //
+    "           type='json', id_field=None, flush=False) answers None.\n"                        //
+    "\n"                                                                                         //
+    "Writes a batch of JSON documents, or one field inside each of them. Every document is\n"    //
+    "borrowed for the length of the call rather than copied.\n"                                  //
+    "\n"                                                                                         //
+    "Args:\n"                                                                                    //
+    "  keys (Sequence[KeyLike] | buffer | None): The keys to write; None reads every key from\n" //
+    "    `id_field` of its document.\n"                                                          //
+    "  documents (Sequence[str | bytes-like | None] | str | bytes-like | None): One document\n"  //
+    "    per key, one document broadcast to every key, or None to remove them all. A None\n"     //
+    "    inside a sequence removes that one document, or the field inside it. Under a\n"         //
+    "    fixed-width `type`, a contiguous buffer of one scalar per key is a column, which\n"     //
+    "    reaches the store without being printed as JSON and parsed back.\n"                     //
+    "  collection (UUID | str, optional): The collection, by identifier or by name.\n"           //
+    "  field (str, optional): A top-level key or a JSON Pointer such as '/user/name' to\n"       //
+    "    write inside every document; None writes whole documents.\n"                            //
+    "  modification (str, optional): 'upsert', 'update', 'insert', an RFC 6902 'patch' or\n"     //
+    "    an RFC 7386 'merge'.\n"                                                                 //
+    "  type (str, optional): How every document is spelled: 'json', 'str' for a plain\n"         //
+    "    string, 'null', or the raw bytes of 'bool', 'f64', 'f32', 'i64' through 'u8'.\n"        //
+    "  id_field (str, optional): The field holding every key when `keys` is None.\n"             //
+    "  flush (bool, optional): Whether to reach the drive before returning.\n"                   //
+    "Raises:\n"                                                                                  //
+    "  MalformedError: A document does not parse, or its `id_field` holds no integer.\n"         //
+    "  MissingError: A field is written inside a document that does not exist.\n"                //
     "  ExistsError: An insert names a document that already exists.";
 
 PyObject* ustore_py_api_docs_write(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
@@ -403,9 +399,9 @@ char const doc_docs_read[] =                                                    
     "documents read as JSON pass straight through from the engine, so nothing is parsed.\n"    //
     "\n"                                                                                       //
     "Args:\n"                                                                                  //
-    "  keys (Sequence[int] | buffer): The keys to read.\n"                                     //
-    "  collection (int | str, optional): The collection, by identifier or by name.\n"          //
-    "  snapshot (int, optional): The snapshot to read; 0 reads the head.\n"                    //
+    "  keys (Sequence[KeyLike] | buffer): The keys to read.\n"                                 //
+    "  collection (UUID | str, optional): The collection, by identifier or by name.\n"         //
+    "  snapshot (Snapshot, optional): The snapshot to read; None reads the head.\n"            //
     "  field (str, optional): A top-level key or a JSON Pointer to read inside every\n"        //
     "    document; None reads whole documents.\n"                                              //
     "  type (str, optional): 'json' for JSON text, or 'str' to print scalars as text.\n"       //
@@ -484,15 +480,15 @@ PyObject* ustore_py_api_docs_read(PyObject* self, PyObject* const* args, Py_ssiz
 }
 
 char const doc_docs_gist[] =                                                                  //
-    "docs_gist(keys, *, collection=None, snapshot=0) answers a tuple of JSON Pointers.\n"     //
+    "docs_gist(keys, *, collection=None, snapshot=None) answers a tuple of JSON Pointers.\n"  //
     "\n"                                                                                      //
     "Lists every distinct path to a leaf across the requested documents, in the order they\n" //
     "were first met, which is how a table learns the columns its documents hold.\n"           //
     "\n"                                                                                      //
     "Args:\n"                                                                                 //
-    "  keys (Sequence[int] | buffer): The documents to inspect.\n"                            //
-    "  collection (int | str, optional): The collection, by identifier or by name.\n"         //
-    "  snapshot (int, optional): The snapshot to read; 0 reads the head.\n"                   //
+    "  keys (Sequence[KeyLike] | buffer): The documents to inspect.\n"                        //
+    "  collection (UUID | str, optional): The collection, by identifier or by name.\n"        //
+    "  snapshot (Snapshot, optional): The snapshot to read; None reads the head.\n"           //
     "Returns:\n"                                                                              //
     "  tuple[str, ...]: One JSON Pointer per leaf, such as '/user/name'.";
 
@@ -586,20 +582,20 @@ static PyObject* columns_adopt(ustore_arena_t arena, ustore_doc_field_type_t* ty
 }
 
 char const doc_docs_gather[] =                                                                //
-    "docs_gather(keys, fields, types, *, collection=None, snapshot=0) answers Columns.\n"     //
+    "docs_gather(keys, fields, types, *, collection=None, snapshot=None) answers Columns.\n"  //
     "\n"                                                                                      //
     "Reads every field of every document into typed columns, converting each value on a\n"    //
     "best-effort basis and recording what was found, converted, or could not be.\n"           //
     "\n"                                                                                      //
     "Args:\n"                                                                                 //
-    "  keys (Sequence[int] | buffer): The documents, the rows of every column.\n"             //
+    "  keys (Sequence[KeyLike] | buffer): The documents, the rows of every column.\n"         //
     "  fields (Sequence[str]): Top-level keys or JSON Pointers, the columns of the result.\n" //
     "  types (str | Sequence[str]): One type per field, or one for every field: 'bool',\n"    //
     "    'uuid', 'f64', 'f32', 'f16', 'i64', 'i32', 'i16', 'i8', 'u64', 'u32', 'u16',\n"      //
     "    'u8', 'str' or 'bytes'. An 'f16' column exports as a half-precision view NumPy\n"    //
     "    reads as float16, and a 'uuid' column as sixteen bytes per document.\n"              //
-    "  collection (int | str, optional): The collection, by identifier or by name.\n"         //
-    "  snapshot (int, optional): The snapshot to read; 0 reads the head.\n"                   //
+    "  collection (UUID | str, optional): The collection, by identifier or by name.\n"        //
+    "  snapshot (Snapshot, optional): The snapshot to read; None reads the head.\n"           //
     "Returns:\n"                                                                              //
     "  Columns: One column per field, each holding one entry per document.";
 

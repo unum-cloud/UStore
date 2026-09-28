@@ -4,8 +4,9 @@ import gc
 import json
 import struct
 
-import numpy
+import numpy as np
 import pytest
+from capabilities import key
 
 import ustore
 
@@ -73,7 +74,7 @@ def test_one_document_broadcasts_to_every_key(view, count: int):
     assert decoded(view.docs_read(list(range(count)))) == [{"same": True}] * count
 
 
-@pytest.mark.parametrize("keys", [[1, 2, 3], numpy.array([1, 2, 3], dtype=numpy.int64)], ids=["list", "numpy"])
+@pytest.mark.parametrize("keys", [[1, 2, 3], np.array([1, 2, 3], dtype=np.int64)], ids=["list", "numpy"])
 def test_none_removes_documents(view, keys):
     view.docs_write(keys, "{}")
     view.docs_write(keys, None)
@@ -88,13 +89,19 @@ def test_none_inside_a_batch_removes_one_document(view, removed: int):
 
 
 @pytest.mark.parametrize(
-    ("id_field", "spell"), [("_id", lambda key: {"_id": key}), ("/meta/id", lambda key: {"meta": {"id": key}})]
+    ("id_field", "spell"),
+    [
+        ("_id", lambda integer: {"_id": integer}),
+        ("/meta/id", lambda integer: {"meta": {"id": integer}}),
+        ("_id", lambda integer: {"_id": str(key(integer))}),
+    ],
+    ids=["integer", "nested-integer", "uuid-text"],
 )
 @pytest.mark.parametrize("count", [1, 17])
 def test_keys_are_read_out_of_an_id_field(view, id_field: str, spell, count: int):
-    documents = [{**spell(key * 10), "value": key} for key in range(count)]
+    documents = [{**spell(integer * 10), "value": integer} for integer in range(count)]
     view.docs_write(None, [json.dumps(document) for document in documents], id_field=id_field)
-    assert decoded(view.docs_read([key * 10 for key in range(count)])) == documents
+    assert decoded(view.docs_read([integer * 10 for integer in range(count)])) == documents
 
 
 def test_documents_read_back_as_zero_copy_views(view):
@@ -264,7 +271,7 @@ def test_gist_lists_every_leaf_once(view, documents: list[dict], expected: tuple
     keys = list(range(len(documents)))
     if documents:
         view.docs_write(keys, [json.dumps(document) for document in documents])
-    assert view.docs_gist([*keys, -1]) == expected
+    assert view.docs_gist([*keys, len(keys)]) == expected
 
 
 # endregion Gists
@@ -328,13 +335,13 @@ def test_gather_strings(view, type_name: str, value, text: str | None):
 def test_gather_columns_line_up_with_keys(view, count: int):
     keys = list(range(count))
     view.docs_write(keys, [json.dumps({"n": key, "name": f"row-{key}", "half": key / 2}) for key in keys])
-    columns = view.docs_gather([*keys, -1], ["n", "name", "half"], ["i64", "str", "f64"])
+    columns = view.docs_gather([*keys, count], ["n", "name", "half"], ["i64", "str", "f64"])
     assert len(columns) == 3
     assert columns.rows == count + 1
     assert columns.types == ("i64", "str", "f64")
     assert columns[0].tolist()[:count] == keys
     assert columns[1] == (*(f"row-{key}" for key in keys), None)
-    assert numpy.asarray(columns[2])[:count].tolist() == [key / 2 for key in keys]
+    assert np.asarray(columns[2])[:count].tolist() == [key / 2 for key in keys]
     assert not bit(columns.validity(0), count)
 
 

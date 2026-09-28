@@ -29,7 +29,7 @@ typedef struct ustore_docs_import_t {
     ustore_options_t options;
 
     /** Collection receiving the documents. */
-    ustore_collection_t collection;
+    ustore_collection_id_t collection;
 
     /** The file to import, whose @c .ndjson or @c .csv extension selects the format. */
     ustore_str_view_t path;
@@ -68,7 +68,7 @@ typedef struct ustore_docs_export_t {
     ustore_options_t options;
 
     /** Collection to export. */
-    ustore_collection_t collection;
+    ustore_collection_id_t collection;
 
     /** The file to create, whose @c .ndjson or @c .csv extension selects the format. */
     ustore_str_view_t path;
@@ -104,7 +104,7 @@ typedef struct ustore_graph_import_t {
     ustore_options_t options;
 
     /** Collection receiving the edges. */
-    ustore_collection_t collection;
+    ustore_collection_id_t collection;
 
     /** The file to import, whose @c .ndjson or @c .csv extension selects the format. */
     ustore_str_view_t path;
@@ -140,7 +140,7 @@ typedef struct ustore_graph_export_t {
     ustore_options_t options;
 
     /** Collection to export. */
-    ustore_collection_t collection;
+    ustore_collection_id_t collection;
 
     /** The file to create, whose @c .ndjson or @c .csv extension selects the format. */
     ustore_str_view_t path;

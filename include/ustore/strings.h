@@ -52,7 +52,7 @@ typedef struct ustore_strings_write_t {
     ustore_size_t tasks_count;
 
     /** Strings collections owning the strings. */
-    ustore_collection_t const* collections;
+    ustore_collection_id_t const* collections;
 
     /** Bytes between consecutive collections, where zero repeats the first one. */
     ustore_size_t collections_stride;
@@ -115,7 +115,7 @@ typedef struct ustore_strings_read_t {
     /** Transaction that watches the read buckets. */
     ustore_transaction_t transaction;
 
-    /** Snapshot whose view is read. */
+    /** Optional snapshot whose view is read, never set beside a transaction. */
     ustore_snapshot_t snapshot;
 
     /** Reusable memory for the results. */
@@ -128,7 +128,7 @@ typedef struct ustore_strings_read_t {
     ustore_size_t tasks_count;
 
     /** Strings collections owning the strings. */
-    ustore_collection_t const* collections;
+    ustore_collection_id_t const* collections;
 
     /** Bytes between consecutive collections, where zero repeats the first one. */
     ustore_size_t collections_stride;
@@ -188,7 +188,7 @@ typedef struct ustore_strings_scan_t {
     /** Transaction that watches the scanned buckets. */
     ustore_transaction_t transaction;
 
-    /** Snapshot whose view is scanned. */
+    /** Optional snapshot whose view is scanned, never set beside a transaction. */
     ustore_snapshot_t snapshot;
 
     /** Reusable memory for the results. */
@@ -201,7 +201,7 @@ typedef struct ustore_strings_scan_t {
     ustore_size_t tasks_count;
 
     /** Strings collections to scan. */
-    ustore_collection_t const* collections;
+    ustore_collection_id_t const* collections;
 
     /** Bytes between consecutive collections, where zero repeats the first one. */
     ustore_size_t collections_stride;

@@ -209,6 +209,7 @@ static PyObject* database_opened(PyTypeObject* type, ustore_database_t handle, u
     instance->arenas.idle = NULL;
     instance->capabilities = capabilities;
     instance->transactions = 0;
+    instance->snapshots = 0;
     return (PyObject*)instance;
 }
 
@@ -458,20 +459,25 @@ static void Database_dealloc(Database* self) {
     Py_TYPE(self)->tp_free((PyObject*)self);
 }
 
-static char const doc_Database_close[] =                                                  //
-    "close() answers None.\n"                                                             //
-    "\n"                                                                                  //
-    "Closes the database, while the data persists on disk. Every transaction it opened\n" //
-    "must be closed first, since a transaction stages into the handle this releases.\n"   //
-    "\n"                                                                                  //
-    "Raises:\n"                                                                           //
-    "  ArgumentError: A transaction of this database is still open.";
+static char const doc_Database_close[] =                                                        //
+    "close() answers None.\n"                                                                   //
+    "\n"                                                                                        //
+    "Closes the database, while the data persists on disk. Every transaction and snapshot it\n" //
+    "opened must be closed first, since both read through the handle this releases.\n"          //
+    "\n"                                                                                        //
+    "Raises:\n"                                                                                 //
+    "  ArgumentError: A transaction or a snapshot of this database is still open.";
 
 static PyObject* Database_close(PyObject* self, PyObject* Py_UNUSED(ignored)) {
     Database* const database = (Database*)self;
     if (database->transactions != 0) {
         ustore_py_raise(ustore_error_invalid_argument_k, "%zd transactions of this database are still open",
                         database->transactions);
+        return NULL;
+    }
+    if (database->snapshots != 0) {
+        ustore_py_raise(ustore_error_invalid_argument_k, "%zd snapshots of this database are still open",
+                        database->snapshots);
         return NULL;
     }
     database_close(database);
@@ -588,7 +594,7 @@ static char const doc_Database_collection_create[] =                            
     "  modality (str): What the collection holds: 'any', 'blobs', 'docs', 'graph',\n"        //
     "    'strings' or 'pages'.\n"                                                            //
     "Returns:\n"                                                                             //
-    "  int: The identifier addressing the new collection.\n"                                 //
+    "  UUID: The identifier addressing the new collection.\n"                                //
     "Raises:\n"                                                                              //
     "  ExistsError: A collection already carries the name.\n"                                //
     "  UnsupportedError: The engine holds only the main collection.";
@@ -628,7 +634,7 @@ static PyObject* Database_collection_create(PyObject* self, PyObject* const* arg
         return NULL;
     }
 
-    ustore_collection_t created = ustore_collection_main_k;
+    ustore_collection_id_t created = ustore_collection_main_k;
     ustore_error_t error = {0};
     ustore_collection_create_t create = {0};
     create.db = context.database->handle;
@@ -636,13 +642,13 @@ static PyObject* Database_collection_create(PyObject* self, PyObject* const* arg
     create.name = name;
     create.name_length = (ustore_length_t)name_length;
     create.modality = (ustore_modality_t)modality;
-    create.id = &created;
+    create.collection = &created;
 
     Py_BEGIN_ALLOW_THREADS;
     ustore_collection_create(&create);
     Py_END_ALLOW_THREADS;
     if (ustore_py_raise_on_error(&error) != 0) return NULL;
-    return PyLong_FromUnsignedLongLong(created);
+    return ustore_py_uuid_to_object(&created.uuid);
 }
 
 static char const doc_Database_collection_find[] =                               //
@@ -651,16 +657,16 @@ static char const doc_Database_collection_find[] =                              
     "Args:\n"                                                                    //
     "  name (str): The name to resolve; the empty one is the main collection.\n" //
     "Returns:\n"                                                                 //
-    "  int: The identifier addressing the collection.\n"                         //
+    "  UUID: The identifier addressing the collection.\n"                        //
     "Raises:\n"                                                                  //
     "  MissingError: No collection carries the name.";
 
 static PyObject* Database_collection_find(PyObject* self, PyObject* name_object) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
-    ustore_collection_t found = ustore_collection_main_k;
+    ustore_collection_id_t found = ustore_collection_main_k;
     if (ustore_py_collection_from_object(&context, name_object, &found) != 0) return NULL;
-    return PyLong_FromUnsignedLongLong(found);
+    return ustore_py_uuid_to_object(&found.uuid);
 }
 
 static char const doc_Database_collection_contains[] =                            //
@@ -683,7 +689,7 @@ static PyObject* Database_collection_contains(PyObject* self, PyObject* name_obj
     if (!name) return NULL;
     if (length == 0) Py_RETURN_TRUE;
 
-    ustore_collection_t found = ustore_collection_main_k;
+    ustore_collection_id_t found = ustore_collection_main_k;
     switch (ustore_py_collection_named(&context, name, (size_t)length, &found)) {
     case ustore_py_naming_found_k: Py_RETURN_TRUE;
     case ustore_py_naming_missing_k: Py_RETURN_FALSE;
@@ -698,14 +704,14 @@ static char const doc_Database_collection_list[] =                              
     "The main collection is never listed, and collection_names answers the names.\n" //
     "\n"                                                                             //
     "Returns:\n"                                                                     //
-    "  tuple[int, ...]: One identifier per collection.";
+    "  tuple[UUID, ...]: One identifier per collection.";
 
 static PyObject* Database_collection_list(PyObject* self, PyObject* Py_UNUSED(ignored)) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
 
     ustore_size_t count = 0;
-    ustore_collection_t* identifiers = NULL;
+    ustore_collection_id_t* identifiers = NULL;
     ustore_error_t error = {0};
     ustore_arena_t arena = ustore_py_arena_claim(context.database);
 
@@ -717,7 +723,7 @@ static PyObject* Database_collection_list(PyObject* self, PyObject* Py_UNUSED(ig
     list.arena = &arena;
     list.options = context.options;
     list.count = &count;
-    list.ids = &identifiers;
+    list.collections = &identifiers;
 
     Py_BEGIN_ALLOW_THREADS;
     ustore_collection_list(&list);
@@ -727,7 +733,7 @@ static PyObject* Database_collection_list(PyObject* self, PyObject* Py_UNUSED(ig
     if (error.status != ustore_success_k) { ustore_py_raise_on_error(&error); }
     else if ((listed = PyTuple_New((Py_ssize_t)count)) != NULL) {
         for (ustore_size_t entry_index = 0; entry_index != count; ++entry_index) {
-            PyObject* const identifier = PyLong_FromUnsignedLongLong(identifiers[entry_index]);
+            PyObject* const identifier = ustore_py_uuid_to_object(&identifiers[entry_index].uuid);
             if (!identifier) {
                 Py_CLEAR(listed);
                 break;
@@ -777,10 +783,6 @@ static PyObject* Database_collection_names(PyObject* self, PyObject* const* args
             return NULL;
         }
     }
-    if (limit > UINT32_MAX) {
-        PyErr_SetString(PyExc_ValueError, "A page carries at most 4294967295 names");
-        return NULL;
-    }
 
     char const* after = NULL;
     Py_ssize_t after_length = 0;
@@ -802,7 +804,7 @@ static char const doc_Database_collection_drop[] =                              
     "name can be given to another collection afterwards.\n"                                 //
     "\n"                                                                                    //
     "Args:\n"                                                                               //
-    "  collection (int | str): The collection, by identifier or by name.\n"                 //
+    "  collection (UUID | str): The collection, by identifier or by name.\n"                //
     "  mode (str, optional): 'collection' removes the handle and everything in it,\n"       //
     "    'pairs' removes every key and value, and 'values' removes every value. The main\n" //
     "    collection accepts the latter two alone.\n"                                        //
@@ -832,13 +834,13 @@ static PyObject* Database_collection_drop(PyObject* self, PyObject* const* args,
     }
 
     // A name resolves first, and the collection it addresses takes the name with it when it goes
-    ustore_collection_t collection = ustore_collection_main_k;
+    ustore_collection_id_t collection = ustore_collection_main_k;
     if (ustore_py_collection_from_object(&context, args[0], &collection) != 0) return NULL;
     ustore_error_t error = {0};
     ustore_collection_drop_t drop = {0};
     drop.db = context.database->handle;
     drop.error = &error;
-    drop.id = collection;
+    drop.collection = collection;
     drop.mode = (ustore_drop_mode_t)mode;
 
     Py_BEGIN_ALLOW_THREADS;
@@ -852,134 +854,110 @@ static PyObject* Database_collection_drop(PyObject* self, PyObject* const* args,
 
 #pragma region Snapshots
 
-static char const doc_Database_snapshot_create[] =                                          //
-    "snapshot_create() answers the identifier of a new snapshot.\n"                         //
-    "\n"                                                                                    //
-    "Captures a point-in-time view of the whole database, which reads may then follow by\n" //
-    "naming its identifier.\n"                                                              //
-    "\n"                                                                                    //
-    "Returns:\n"                                                                            //
-    "  int: The identifier addressing the snapshot.";
+static char const doc_Snapshot[] =                                                           //
+    "A point-in-time view of the whole database, which reads follow by naming it.\n"         //
+    "\n"                                                                                     //
+    "Built through `Database.snapshot()`, never by name. Every read verb of the database\n"  //
+    "takes it through the `snapshot` keyword, and it pins the versions those reads need\n"   //
+    "until it closes. It lives no longer than the process, and a database waits for every\n" //
+    "snapshot it opened before it closes.\n"                                                 //
+    "\n"                                                                                     //
+    "Used as a context manager, it closes on exit.";
 
-static PyObject* Database_snapshot_create(PyObject* self, PyObject* Py_UNUSED(ignored)) {
-    ustore_py_context_t context;
-    if (ustore_py_context_from_object(self, &context) != 0) return NULL;
-
-    ustore_snapshot_t identifier = 0;
-    ustore_error_t error = {0};
-    ustore_snapshot_create_t create = {0};
-    create.db = context.database->handle;
-    create.error = &error;
-    create.id = &identifier;
-
-    Py_BEGIN_ALLOW_THREADS;
-    ustore_snapshot_create(&create);
-    Py_END_ALLOW_THREADS;
-    if (ustore_py_raise_on_error(&error) != 0) return NULL;
-    return PyLong_FromUnsignedLongLong(identifier);
+static PyObject* Snapshot_tp_new(PyTypeObject* Py_UNUSED(type), PyObject* Py_UNUSED(args),
+                                 PyObject* Py_UNUSED(keywords)) {
+    PyErr_SetString(PyExc_TypeError, "A snapshot is built through Database.snapshot()");
+    return NULL;
 }
 
-static char const doc_Database_snapshot_list[] =                   //
-    "snapshot_list() answers the identifiers of every snapshot.\n" //
-    "\n"                                                           //
-    "Returns:\n"                                                   //
-    "  tuple[int, ...]: One identifier per snapshot.";
-
-static PyObject* Database_snapshot_list(PyObject* self, PyObject* Py_UNUSED(ignored)) {
-    ustore_py_context_t context;
-    if (ustore_py_context_from_object(self, &context) != 0) return NULL;
-
-    ustore_size_t count = 0;
-    ustore_snapshot_t* identifiers = NULL;
-    ustore_error_t error = {0};
-    ustore_arena_t arena = ustore_py_arena_claim(context.database);
-
-    ustore_snapshot_list_t list = {0};
-    list.db = context.database->handle;
-    list.error = &error;
-    list.arena = &arena;
-    list.options = context.options;
-    list.count = &count;
-    list.ids = &identifiers;
+/** Releases the snapshot's handle and lets go of the database that was holding it open. */
+static void snapshot_close(Snapshot* snapshot) {
+    if (!snapshot->handle) return;
+    ustore_snapshot_t const handle = snapshot->handle;
+    snapshot->handle = NULL;
 
     Py_BEGIN_ALLOW_THREADS;
-    ustore_snapshot_list(&list);
+    ustore_snapshot_free(handle);
     Py_END_ALLOW_THREADS;
-
-    PyObject* listed = NULL;
-    if (error.status != ustore_success_k) { ustore_py_raise_on_error(&error); }
-    else if ((listed = PyTuple_New((Py_ssize_t)count)) != NULL) {
-        for (ustore_size_t entry_index = 0; entry_index != count; ++entry_index) {
-            PyObject* const identifier = PyLong_FromUnsignedLongLong(identifiers[entry_index]);
-            if (!identifier) {
-                Py_CLEAR(listed);
-                break;
-            }
-            PyTuple_SET_ITEM(listed, (Py_ssize_t)entry_index, identifier);
-        }
-    }
-    ustore_py_arena_return(context.database, arena);
-    return listed;
+    --((Database*)snapshot->database)->snapshots;
 }
 
-static char const doc_Database_snapshot_drop[] =                        //
-    "snapshot_drop(snapshot) answers None.\n"                           //
-    "\n"                                                                //
-    "Releases a snapshot, after which reads can no longer follow it.\n" //
-    "\n"                                                                //
-    "Args:\n"                                                           //
-    "  snapshot (int): The identifier of an existing snapshot.";
-
-static PyObject* Database_snapshot_drop(PyObject* self, PyObject* snapshot_object) {
-    ustore_py_context_t context;
-    if (ustore_py_context_from_object(self, &context) != 0) return NULL;
-    size_t identifier = 0;
-    if (ustore_py_size_from_object(snapshot_object, "snapshot", &identifier) != 0) return NULL;
-
-    ustore_error_t error = {0};
-    ustore_snapshot_drop_t drop = {0};
-    drop.db = context.database->handle;
-    drop.error = &error;
-    drop.id = (ustore_snapshot_t)identifier;
-
-    Py_BEGIN_ALLOW_THREADS;
-    ustore_snapshot_drop(&drop);
-    Py_END_ALLOW_THREADS;
-    if (ustore_py_raise_on_error(&error) != 0) return NULL;
-    Py_RETURN_NONE;
+static void Snapshot_dealloc(Snapshot* self) {
+    snapshot_close(self);
+    Py_XDECREF(self->database);
+    Py_TYPE(self)->tp_free((PyObject*)self);
 }
 
-static char const doc_Database_snapshot_export[] =                                    //
-    "snapshot_export(snapshot, directory) answers None.\n"                            //
-    "\n"                                                                              //
-    "Writes a snapshot out as a new database, which another process may then open.\n" //
-    "\n"                                                                              //
-    "Args:\n"                                                                         //
-    "  snapshot (int): The identifier of an existing snapshot.\n"                     //
-    "  directory (str | bytes | PathLike): Where the exported database lands.";
+static char const doc_Database_snapshot[] =                                                //
+    "snapshot() answers a new Snapshot.\n"                                                 //
+    "\n"                                                                                   //
+    "Pins a point-in-time view of the whole database, which reads then follow by naming\n" //
+    "it through their `snapshot` keyword.\n"                                               //
+    "\n"                                                                                   //
+    "Returns:\n"                                                                           //
+    "  Snapshot: A view of this database as it stands now.\n"                              //
+    "Raises:\n"                                                                            //
+    "  UnsupportedError: The engine keeps no snapshots.";
 
-static PyObject* Database_snapshot_export(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                                          PyObject* args_names_tuple) {
-    ustore_py_context_t context;
-    if (ustore_py_context_from_object(self, &context) != 0) return NULL;
-    Py_ssize_t const args_names_count = ustore_py_args_names_count_checked("snapshot_export", positional_args_count,
-                                                                           args_names_tuple, 2);
-    if (args_names_count < 0) return NULL;
-    if (args_names_count != 0) {
-        PyErr_SetString(PyExc_TypeError, "snapshot_export() takes no keyword arguments");
+static PyObject* Database_snapshot(PyObject* self, PyObject* Py_UNUSED(ignored)) {
+    Database* const database = (Database*)self;
+    if (!database->handle) {
+        PyErr_SetString(PyExc_ValueError, "The database is closed");
         return NULL;
     }
 
-    size_t identifier = 0;
-    if (ustore_py_size_from_object(args[0], "snapshot", &identifier) != 0) return NULL;
+    ustore_snapshot_t handle = NULL;
+    ustore_error_t error = {0};
+    ustore_snapshot_init_t init = {0};
+    init.db = database->handle;
+    init.error = &error;
+    init.snapshot = &handle;
+
+    Py_BEGIN_ALLOW_THREADS;
+    ustore_snapshot_init(&init);
+    Py_END_ALLOW_THREADS;
+    if (ustore_py_raise_on_error(&error) != 0) return NULL;
+
+    Snapshot* const instance = (Snapshot*)SnapshotType.tp_alloc(&SnapshotType, 0);
+    if (!instance) {
+        ustore_snapshot_free(handle);
+        return NULL;
+    }
+    instance->handle = handle;
+    instance->database = Py_NewRef(self);
+    ++database->snapshots;
+    return (PyObject*)instance;
+}
+
+static char const doc_Snapshot_export[] =                                               //
+    "export(directory) answers None.\n"                                                 //
+    "\n"                                                                                //
+    "Writes the snapshot out as a new database, which another process may then open.\n" //
+    "\n"                                                                                //
+    "Args:\n"                                                                           //
+    "  directory (str | bytes | PathLike): Where the exported database lands.\n"        //
+    "Raises:\n"                                                                         //
+    "  UnsupportedError: The engine exports no snapshots.";
+
+static PyObject* Snapshot_export(PyObject* self, PyObject* directory) {
+    Snapshot* const snapshot = (Snapshot*)self;
+    if (!snapshot->handle) {
+        PyErr_SetString(PyExc_ValueError, "The snapshot is closed");
+        return NULL;
+    }
+    Database* const database = (Database*)snapshot->database;
+    if (!database->handle) {
+        PyErr_SetString(PyExc_ValueError, "The database is closed");
+        return NULL;
+    }
     PyObject* encoded = NULL;
-    if (!PyUnicode_FSConverter(args[1], &encoded)) return NULL;
+    if (!PyUnicode_FSConverter(directory, &encoded)) return NULL;
 
     ustore_error_t error = {0};
     ustore_snapshot_export_t exported = {0};
-    exported.db = context.database->handle;
+    exported.db = database->handle;
     exported.error = &error;
-    exported.id = (ustore_snapshot_t)identifier;
+    exported.snapshot = snapshot->handle;
     exported.path = PyBytes_AS_STRING(encoded);
 
     Py_BEGIN_ALLOW_THREADS;
@@ -989,6 +967,34 @@ static PyObject* Database_snapshot_export(PyObject* self, PyObject* const* args,
     if (ustore_py_raise_on_error(&error) != 0) return NULL;
     Py_RETURN_NONE;
 }
+
+static char const doc_Snapshot_close[] =                                                  //
+    "close() answers None.\n"                                                             //
+    "\n"                                                                                  //
+    "Releases the snapshot, unpinning the versions only it kept, and lets its database\n" //
+    "close. Closing twice is safe.";
+
+static PyObject* Snapshot_close(PyObject* self, PyObject* Py_UNUSED(ignored)) {
+    snapshot_close((Snapshot*)self);
+    Py_RETURN_NONE;
+}
+
+static PyObject* Snapshot_enter(PyObject* self, PyObject* Py_UNUSED(ignored)) { return Py_NewRef(self); }
+
+static PyObject* Snapshot_exit(PyObject* self, PyObject* const* Py_UNUSED(args),
+                               Py_ssize_t Py_UNUSED(positional_args_count), PyObject* Py_UNUSED(args_names_tuple)) {
+    snapshot_close((Snapshot*)self);
+    Py_RETURN_NONE;
+}
+
+static PyObject* Snapshot_repr(Snapshot* self) {
+    if (!self->handle) return PyUnicode_FromString("Snapshot(<closed>)");
+    return PyUnicode_FromFormat("Snapshot(at=%p)", (void*)self->handle);
+}
+
+static char const doc_Snapshot_database[] = "The database this snapshot reads.";
+
+static PyObject* Snapshot_get_database(Snapshot* self, void* Py_UNUSED(closure)) { return Py_NewRef(self->database); }
 
 #pragma endregion Snapshots
 
@@ -1145,7 +1151,7 @@ static PyObject* Transaction_commit(PyObject* self, PyObject* const* args, Py_ss
 }
 
 static char const doc_Transaction_stage[] =                                            //
-    "stage() answers the sequence number the stage took.\n"                            //
+    "stage() answers the stamp the stage took.\n"                                      //
     "\n"                                                                               //
     "Runs the first phase of a two-phase commit, after which a commit publishes the\n" //
     "work.\n"                                                                          //
@@ -1157,19 +1163,19 @@ static PyObject* Transaction_stage(PyObject* self, PyObject* Py_UNUSED(ignored))
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
 
-    ustore_sequence_number_t sequence_number = 0;
+    ustore_stamp_t stamp = 0;
     ustore_error_t error = {0};
     ustore_transaction_stage_t stage = {0};
     stage.db = context.database->handle;
     stage.error = &error;
     stage.transaction = context.transaction;
-    stage.sequence_number = &sequence_number;
+    stage.stamp = &stamp;
 
     Py_BEGIN_ALLOW_THREADS;
     ustore_transaction_stage(&stage);
     Py_END_ALLOW_THREADS;
     if (ustore_py_raise_on_error(&error) != 0) return NULL;
-    return PyLong_FromUnsignedLongLong(sequence_number);
+    return PyLong_FromUnsignedLongLong(stamp);
 }
 
 static char const doc_Transaction_rollback[] =                                           //
@@ -1270,10 +1276,7 @@ static PyMethodDef Database_methods[] = {
      doc_Database_collection_names},
     {"collection_drop", (PyCFunction)Database_collection_drop, ustore_py_method_flags_k, doc_Database_collection_drop},
 
-    {"snapshot_create", (PyCFunction)Database_snapshot_create, METH_NOARGS, doc_Database_snapshot_create},
-    {"snapshot_list", (PyCFunction)Database_snapshot_list, METH_NOARGS, doc_Database_snapshot_list},
-    {"snapshot_drop", (PyCFunction)Database_snapshot_drop, METH_O, doc_Database_snapshot_drop},
-    {"snapshot_export", (PyCFunction)Database_snapshot_export, ustore_py_method_flags_k, doc_Database_snapshot_export},
+    {"snapshot", (PyCFunction)Database_snapshot, METH_NOARGS, doc_Database_snapshot},
     {"transaction", (PyCFunction)Database_transaction, ustore_py_method_flags_k, doc_Database_transaction},
 
     {"read", (PyCFunction)ustore_py_api_read, ustore_py_method_flags_k, doc_read},
@@ -1371,6 +1374,32 @@ PyTypeObject TransactionType = {
     .tp_repr = (reprfunc)Transaction_repr,
     .tp_methods = Transaction_methods,
     .tp_getset = Transaction_getset,
+};
+
+static PyGetSetDef Snapshot_getset[] = {
+    {"database", (getter)Snapshot_get_database, NULL, doc_Snapshot_database, NULL},
+    {NULL, NULL, NULL, NULL, NULL},
+};
+
+static PyMethodDef Snapshot_methods[] = {
+    {"export", (PyCFunction)Snapshot_export, METH_O, doc_Snapshot_export},
+    {"close", (PyCFunction)Snapshot_close, METH_NOARGS, doc_Snapshot_close},
+    {"__enter__", (PyCFunction)Snapshot_enter, METH_NOARGS, NULL},
+    {"__exit__", (PyCFunction)Snapshot_exit, ustore_py_method_flags_k, NULL},
+    {NULL, NULL, 0, NULL},
+};
+
+PyTypeObject SnapshotType = {
+    PyVarObject_HEAD_INIT(NULL, 0) //
+        .tp_name = "ustore.Snapshot",
+    .tp_doc = doc_Snapshot,
+    .tp_basicsize = sizeof(Snapshot),
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_new = Snapshot_tp_new,
+    .tp_dealloc = (destructor)Snapshot_dealloc,
+    .tp_repr = (reprfunc)Snapshot_repr,
+    .tp_methods = Snapshot_methods,
+    .tp_getset = Snapshot_getset,
 };
 
 #pragma endregion Tables

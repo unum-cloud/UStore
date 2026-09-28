@@ -93,14 +93,14 @@ using payload_t = std::size_t;
 /** One write a thread staged, stamped with the outcome of the transaction holding it. */
 struct operation_t {
 
-    /** Key the write targets. */
-    ustore_key_t key = 0;
+    /** Integer of the key the write targets, which also indexes the replay; the key is its @c key_of. */
+    std::uint64_t key = 0;
 
     /** Value an insert writes. */
     payload_t value = 0;
 
-    /** Sequence number the transaction committed at, or the maximum when it failed. */
-    ustore_sequence_number_t sequence = std::numeric_limits<ustore_sequence_number_t>::max();
+    /** Stamp the transaction committed under, or the maximum when it failed. */
+    ustore_stamp_t stamp = std::numeric_limits<ustore_stamp_t>::max();
 
     /** Whether the write inserts or removes. */
     operation_code_t code = operation_code_t::insert_k;
@@ -126,8 +126,8 @@ struct workload_t {
     /** Transactions every thread commits per round. */
     std::size_t transactions = 1;
 
-    /** Largest key a write targets, the smallest being one. */
-    ustore_key_t max_key = 1;
+    /** Integer of the largest key a write targets, the smallest being one. */
+    std::uint64_t max_key = 1;
 
     /** Writes one thread logs per round. */
     std::size_t operations_per_thread() const noexcept { return transactions * mix.parts(); }
@@ -218,44 +218,44 @@ struct linearizability_run_t {
 
 /** Stages and commits one transaction of random writes, stamping each logged write with the commit's outcome. */
 std::size_t write_transaction(writer_slot_t& slot, std::span<operation_t> batch, operations_mix_t mix,
-                              std::uniform_int_distribution<ustore_key_t>& key_distribution) {
+                              std::uniform_int_distribution<std::uint64_t>& key_distribution) {
     std::size_t failures = expect(slot.transaction.reset().succeeded());
     for (operation_t& operation : batch) {
         operation.code = slot.random_generator() % mix.parts() < mix.inserts ? operation_code_t::insert_k
                                                                              : operation_code_t::remove_k;
         operation.key = key_distribution(slot.random_generator);
         operation.value = slot.random_generator();
-        failures += operation.code == operation_code_t::insert_k
-                        ? expect(slot.transaction[operation.key].assign(operation.value_view()).succeeded())
-                        : expect(slot.transaction[operation.key].erase().succeeded());
+        failures +=
+            operation.code == operation_code_t::insert_k
+                ? expect(slot.transaction[key_from_integer(operation.key)].assign(operation.value_view()).succeeded())
+                : expect(slot.transaction[key_from_integer(operation.key)].erase().succeeded());
     }
 
-    auto maybe_sequence = slot.transaction.sequenced_commit();
-    bool const committed = maybe_sequence.has_value();
-    ustore_sequence_number_t const sequence = committed ? *maybe_sequence
-                                                        : std::numeric_limits<ustore_sequence_number_t>::max();
+    auto maybe_stamp = slot.transaction.stamped_commit();
+    bool const committed = maybe_stamp.has_value();
+    ustore_stamp_t const stamp = committed ? *maybe_stamp : std::numeric_limits<ustore_stamp_t>::max();
     for (operation_t& operation : batch) {
         operation.committed = committed;
-        operation.sequence = sequence;
+        operation.stamp = stamp;
     }
     return failures;
 }
 
 /** Commits every transaction of one thread's round, logging its writes into @p log. */
 void write_round(writer_slot_t& slot, std::span<operation_t> log, workload_t const& workload) {
-    std::uniform_int_distribution<ustore_key_t> key_distribution(1, workload.max_key);
+    std::uniform_int_distribution<std::uint64_t> key_distribution(1, workload.max_key);
     std::size_t const parts = workload.mix.parts();
     for (std::size_t iteration = 0; iteration != workload.transactions; ++iteration)
         slot.failures += write_transaction(slot, log.subspan(iteration * parts, parts), workload.mix, key_distribution);
 }
 
-/** Keeps, per key, the committed write with the highest sequence, and the later-logged one among equal sequences. */
+/** Keeps, per key, the committed write with the highest stamp, and the later-logged one among equal stamps. */
 void replay_round(std::span<operation_t const> operations, std::span<operation_t const*> latest) {
     std::fill(latest.begin(), latest.end(), nullptr);
     for (operation_t const& operation : operations) {
         if (!operation.committed) continue;
         operation_t const*& winner = latest[operation.key];
-        if (!winner || winner->sequence <= operation.sequence) winner = &operation;
+        if (!winner || winner->stamp <= operation.stamp) winner = &operation;
     }
 }
 
@@ -280,7 +280,7 @@ std::size_t expect_payload(value_view_t retrieved, operation_t const& operation)
 std::size_t verify_round(linearizability_run_t& run, std::span<operation_t const*> latest) {
     std::size_t present_count = 0;
     for (operation_t const* const winner : latest)
-        if (leaves_inserted(winner)) run.present_keys[present_count++] = winner->key;
+        if (leaves_inserted(winner)) run.present_keys[present_count++] = key_from_integer(winner->key);
 
     ustore_key_t const* const keys = run.present_keys.data();
     auto maybe_retrieved = run.collection[strided(keys, keys + present_count)].value();
@@ -320,7 +320,7 @@ std::size_t run_round(linearizability_run_t& run, executor_t& executor, workload
  *  @brief Checks that the state after each round of concurrent random writes matches their replay in commit order.
  *
  *  Every round ends at a checkpoint where all threads stop, the main thread replays the committed writes in
- *  sequence order, compares the replay against the database, and clears it for the next round.
+ *  stamp order, compares the replay against the database, and clears it for the next round.
  *
  *  @param[inout] run Database, logs and thread slots the run allocated once.
  *  @param[inout] executor Pool of exactly the workload's thread count.
@@ -346,7 +346,7 @@ std::size_t linear_writes_mixes(linearizability_run_t& run, executor_t& executor
     std::size_t failures = 0;
     for (operations_mix_t const mix : mixes_k) {
         std::size_t const writes = mix.parts() * transactions * threads;
-        ustore_key_t const max_key = std::max<ustore_key_t>(writes / options.writes_per_key.value, 1);
+        std::uint64_t const max_key = std::max<std::uint64_t>(writes / options.writes_per_key.value, 1);
         workload_t const workload {mix, threads, transactions, max_key};
         failures += linear_writes(run, executor, workload, options.checkpoints.value, slice);
     }

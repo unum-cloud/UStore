@@ -17,8 +17,9 @@ from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from itertools import batched
 from pathlib import Path
+from uuid import UUID
 
-import numpy
+import numpy as np
 import pyarrow
 import pyarrow.csv
 import pyarrow.json
@@ -65,8 +66,8 @@ def column_name(field: str) -> str:
     return field.removeprefix("/").replace("/", ".")
 
 
-def integer_column(table: pyarrow.Table, field: str) -> numpy.ndarray:
-    return table.column(column_name(field)).to_numpy().astype(numpy.int64, copy=False)
+def integer_column(table: pyarrow.Table, field: str) -> np.ndarray:
+    return table.column(column_name(field)).to_numpy().astype(np.int64, copy=False)
 
 
 def report(name: str, processed_bytes: int, duration: float) -> None:
@@ -127,7 +128,7 @@ def bench_docs_export(database: ustore.Database, settings: argparse.Namespace) -
 # region Graphs
 
 
-def bench_graph_import(database: ustore.Database, files: list[Path], settings: argparse.Namespace) -> None:
+def bench_graph_import(database: ustore.Database, graph: UUID, files: list[Path], settings: argparse.Namespace) -> None:
     def import_file(path: Path) -> int:
         table = read_table(path, settings.format)
         sources = integer_column(table, settings.source_field)
@@ -135,27 +136,29 @@ def bench_graph_import(database: ustore.Database, files: list[Path], settings: a
         edges = integer_column(table, settings.edge_field)
         for begin in range(0, len(sources), settings.batch_rows):
             end = begin + settings.batch_rows
-            database.graph_upsert_edges(sources[begin:end], targets[begin:end], edges=edges[begin:end])
+            database.graph_upsert_edges(
+                sources[begin:end], targets[begin:end], edges=edges[begin:end], collection=graph
+            )
         return 0
 
     start = time.perf_counter()
     run_threads(files, settings, import_file)
     duration = time.perf_counter() - start
     # Every stored vertex is counted as three keys, as the C++ benchmark counts it.
-    imported = sum(1 for _ in scan_keys(database)) * 3 * 8
+    imported = sum(1 for _ in scan_keys(database, graph)) * 3 * 8
     report(f"graph_import_{settings.format}", imported, duration)
 
 
-def bench_graph_export(database: ustore.Database, settings: argparse.Namespace) -> None:
+def bench_graph_export(database: ustore.Database, graph: UUID, settings: argparse.Namespace) -> None:
     output = settings.directory / f"tabular_graph_edges.{settings.format}"
     # Exported column names cannot hold the slashes of JSON Pointers.
     names = [field.replace("/", "_") for field in (settings.source_field, settings.target_field, settings.edge_field)]
     start = time.perf_counter()
     tapes = [
-        numpy.asarray(database.graph_find_edges(page, role="source"))
-        for page in batched(scan_keys(database), PAGE_KEYS)
+        np.asarray(database.graph_find_edges(page, role="source", collection=graph))
+        for page in batched(scan_keys(database, graph), PAGE_KEYS)
     ]
-    triples = numpy.concatenate(tapes) if tapes else numpy.empty((0, 3), dtype=numpy.int64)
+    triples = np.concatenate(tapes) if tapes else np.empty((0, 3), dtype=np.int64)
     table = pyarrow.Table.from_arrays([pyarrow.array(triples[:, column]) for column in range(3)], names=names)
     if settings.format == "ndjson":
         with output.open("w") as file:
@@ -166,7 +169,7 @@ def bench_graph_export(database: ustore.Database, settings: argparse.Namespace) 
     exported = output.stat().st_size
     output.unlink()
     report(f"graph_export_{settings.format}", exported, duration)
-    clear_main(database)
+    database.collection_drop(graph)
 
 
 # endregion Graphs
@@ -183,8 +186,9 @@ def main() -> None:
     with getattr(ustore.Database, f"open_{settings.engine}")(settings.directory) as database:
         bench_docs_import(database, files, settings)
         bench_docs_export(database, settings)
-        bench_graph_import(database, files, settings)
-        bench_graph_export(database, settings)
+        graph = database.collection_create("graph", modality="graph")
+        bench_graph_import(database, graph, files, settings)
+        bench_graph_export(database, graph, settings)
 
 
 if __name__ == "__main__":

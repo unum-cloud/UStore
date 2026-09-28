@@ -41,6 +41,33 @@
 
 #include "arguments.hpp"
 
+/** Prints a UUID as the integer it spells when its upper half is zero, else as canonical text. */
+template <>
+struct fmt::formatter<ustore_uuid_t> : fmt::formatter<std::string_view> {
+    auto format(ustore_uuid_t const& uuid, fmt::format_context& context) const {
+        using namespace unum::ustore;
+        if (auto [integer, integer_status] = uuid_to_integer(uuid); integer_status.succeeded())
+            return fmt::format_to(context.out(), "{}", integer);
+        char text[uuid_text_length_k];
+        uuid_to_text(uuid, text);
+        return fmt::formatter<std::string_view>::format(std::string_view(text, sizeof(text)), context);
+    }
+};
+
+template <>
+struct fmt::formatter<ustore_key_t> : fmt::formatter<ustore_uuid_t> {
+    auto format(ustore_key_t const& key, fmt::format_context& context) const {
+        return fmt::formatter<ustore_uuid_t>::format(key.uuid, context);
+    }
+};
+
+template <>
+struct fmt::formatter<ustore_collection_id_t> : fmt::formatter<ustore_uuid_t> {
+    auto format(ustore_collection_id_t const& collection, fmt::format_context& context) const {
+        return fmt::formatter<ustore_uuid_t>::format(collection.uuid, context);
+    }
+};
+
 namespace unum::ustore::test {
 
 /** Counts one failure when the condition is false, printing it with its location. */

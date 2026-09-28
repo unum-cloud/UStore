@@ -106,7 +106,7 @@ struct batch_document_t {
 
 /** Upserts documents in transactional batches of @c state.range(0), each thread from its own share of @p documents. */
 template <typename nested_documents_type_>
-void docs_upsert(bm::State& state, ustore_database_t db, ustore_collection_t collection,
+void docs_upsert(bm::State& state, ustore_database_t db, ustore_collection_id_t collection,
                  nested_documents_type_ const& documents) {
     pass_through_iterator<nested_documents_type_> staged_document {documents};
     std::advance(staged_document, state.thread_index() * (pass_through_size(documents) / state.threads()));
@@ -191,7 +191,7 @@ void docs_upsert(bm::State& state, ustore_database_t db, ustore_collection_t col
 
 /** Upserts edges in transactional batches of @c state.range(0), each thread from its own share of @p edges. */
 template <typename nested_edges_type_>
-void edges_upsert(bm::State& state, ustore_database_t db, ustore_collection_t collection,
+void edges_upsert(bm::State& state, ustore_database_t db, ustore_collection_id_t collection,
                   nested_edges_type_ const& edges) {
     pass_through_iterator<nested_edges_type_> staged_edge {edges};
     std::advance(staged_edge, state.thread_index() * (pass_through_size(edges) / state.threads()));

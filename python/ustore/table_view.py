@@ -1,10 +1,10 @@
 """A Pandas table view over a collection of JSON documents in `ustore.lib`.
 
-Rows are documents addressed by their keys, and columns are fields: top-level keys, or JSON Pointers
-such as `/user/name` for nested values. A column given a dtype is gathered into typed memory and
-handed to Pandas without a copy where every value is valid, while a column without one is decoded
-from JSON. Verbs that change columns - assignment, `update`, `drop`, `rename` and `merge_from` -
-write through to the store instead of answering a changed copy.
+Rows are documents addressed by their keys, which a frame indexes as `uuid.UUID`, and columns are
+fields: top-level keys, or JSON Pointers such as `/user/name` for nested values. A column given a
+dtype is gathered into typed memory and handed to Pandas without a copy where every value is valid,
+while a column without one is decoded from JSON. Verbs that change columns - assignment, `update`,
+`drop`, `rename` and `merge_from` - write through to the store instead of answering a changed copy.
 """
 
 from __future__ import annotations
@@ -13,11 +13,12 @@ import json
 from collections.abc import Iterable, Mapping, Sequence
 from itertools import batched
 from typing import Any
+from uuid import UUID
 
-import numpy
+import numpy as np
 import pandas
 
-from ustore.keys import PAGE_KEYS, scan_keys
+from ustore.keys import PAGE_KEYS, KeyLike, as_key, scan_keys
 from ustore.lib import Columns, Database, Transaction
 
 type View = Database | Transaction
@@ -74,19 +75,19 @@ def encode_json(value: Any) -> str:
     def fallback(unknown: Any) -> Any:
         if isinstance(unknown, bytes):
             return unknown.decode()
-        if isinstance(unknown, numpy.generic):
+        if isinstance(unknown, np.generic):
             return unknown.item()
         raise TypeError(f"Cannot spell {type(unknown).__name__} as JSON")
 
     return json.dumps(value, default=fallback)
 
 
-def scalar_column(values: Any) -> tuple[numpy.ndarray, str] | None:
+def scalar_column(values: Any) -> tuple[np.ndarray, str] | None:
     """One flat NumPy column of a dtype the store writes as raw scalars, or None for anything else."""
-    if not isinstance(values, numpy.ndarray) or values.ndim != 1:
+    if not isinstance(values, np.ndarray) or values.ndim != 1:
         return None
     kind = WRITE_TYPES.get(values.dtype.name)
-    return (numpy.ascontiguousarray(values), kind) if kind else None
+    return (np.ascontiguousarray(values), kind) if kind else None
 
 
 def column_of(pointer: str) -> str:
@@ -113,14 +114,14 @@ def value_at(document: Any, column: str) -> Any:
 def column_values(gathered: Columns, position: int, dtype: str) -> Any:
     """One gathered column as a NumPy or Pandas array, masking the values that were not found or converted."""
     rows = gathered.rows
-    valid = numpy.unpackbits(
-        numpy.frombuffer(gathered.validity(position), dtype=numpy.uint8), count=rows, bitorder="little"
+    valid = np.unpackbits(
+        np.frombuffer(gathered.validity(position), dtype=np.uint8), count=rows, bitorder="little"
     ).astype(bool)
     if dtype == "str":
         return pandas.array(gathered[position], dtype="str")
     if dtype == "bytes":
-        return numpy.array(gathered[position], dtype=object)
-    values = numpy.asarray(gathered[position])
+        return np.array(gathered[position], dtype=object)
+    values = np.asarray(gathered[position])
     if valid.all():
         return values
     masked = pandas.array(values, dtype=NULLABLE_DTYPES[dtype])
@@ -134,16 +135,16 @@ class Table:
     def __init__(
         self,
         view: View,
-        collection: int | str | None = None,
+        collection: UUID | str | None = None,
         *,
-        index: Iterable[int] | None = None,
+        index: Iterable[KeyLike] | None = None,
         columns: Iterable[str] | None = None,
         dtypes: Mapping[str, str] | None = None,
     ) -> None:
         """Opens a view of `collection`, over every document and field unless `index` or `columns` narrow it."""
         self.view = view
         self.collection = collection
-        self.selected_index = None if index is None else [int(key) for key in index]
+        self.selected_index = None if index is None else [as_key(key) for key in index]
         self.selected_columns = None if columns is None else list(columns)
         self.dtypes = dict(dtypes or {})
         unknown = set(self.dtypes.values()) - set(GATHER_TYPES)
@@ -153,7 +154,7 @@ class Table:
     def derive(
         self,
         *,
-        index: Iterable[int] | None = None,
+        index: Iterable[KeyLike] | None = None,
         columns: Iterable[str] | None = None,
         dtypes: Mapping[str, str] | None = None,
     ) -> Table:
@@ -169,7 +170,7 @@ class Table:
     # region Shape
 
     @property
-    def index(self) -> list[int]:
+    def index(self) -> list[UUID]:
         """The keys of the rows, in ascending order unless the view was narrowed to others."""
         if self.selected_index is not None:
             return list(self.selected_index)
@@ -223,14 +224,13 @@ class Table:
 
     def sample(self, count: int) -> Table:
         """A view of up to `count` documents drawn at random by the store."""
-        drawn = self.view.sample(count, collection=self.collection)[0]
-        return self.derive(index=drawn.tolist())
+        return self.derive(index=self.view.sample(count, collection=self.collection)[0])
 
     # endregion Selection
 
     # region Exports
 
-    def page_frame(self, keys: list[int], columns: list[str]) -> pandas.DataFrame:
+    def page_frame(self, keys: list[UUID], columns: list[str]) -> pandas.DataFrame:
         """The rows `keys` hold, gathered and decoded in one round of calls."""
         data: dict[str, Any] = {}
 
@@ -250,8 +250,8 @@ class Table:
             for column in untyped:
                 data[column] = [value_at(document, column) for document in documents]
 
-        frame = pandas.DataFrame({column: data[column] for column in columns}, index=pandas.Index(keys, dtype="int64"))
-        return frame if columns else pandas.DataFrame(index=pandas.Index(keys, dtype="int64"))
+        frame = pandas.DataFrame({column: data[column] for column in columns}, index=pandas.Index(keys, dtype=object))
+        return frame if columns else pandas.DataFrame(index=pandas.Index(keys, dtype=object))
 
     def to_pandas(self, *, page: int | None = None) -> pandas.DataFrame:
         """Every row as a `DataFrame`, converting `page` rows at a time when a page size is given.
@@ -306,10 +306,12 @@ class Table:
         for column in other.columns:
             series = other[column]
             written = series[series.notna()]
-            rows = [int(key) for key in written.index if int(key) in present]
-            if not rows:
+            # The frame may label its rows with any spelling of a key, which selects them here as is.
+            labels = [label for label in written.index if as_key(label) in present]
+            if not labels:
                 continue
-            selected = written.loc[rows]
+            rows = [as_key(label) for label in labels]
+            selected = written.loc[labels]
             scalars = scalar_column(selected.to_numpy())
             if scalars is not None:
                 typed, kind = scalars
@@ -318,7 +320,7 @@ class Table:
             encoded = [encode_json(value) for value in selected]
             self.view.docs_write(rows, encoded, field=column, collection=self.collection)
 
-    def present_rows(self, column: str) -> tuple[list[int], list[memoryview]]:
+    def present_rows(self, column: str) -> tuple[list[UUID], list[memoryview]]:
         """The keys of the rows holding `column`, and the JSON text of the value each holds."""
         keys = self.index
         found = self.view.docs_read(keys, field=column, collection=self.collection)
@@ -361,11 +363,11 @@ class Table:
         view: View,
         records: Sequence[Mapping[str, Any]],
         *,
-        collection: int | str | None = None,
-        index: Iterable[int] | None = None,
+        collection: UUID | str | None = None,
+        index: Iterable[KeyLike] | None = None,
     ) -> Table:
         """Writes one document per record, keyed by `index` or by position, and views the collection."""
-        keys = list(range(len(records))) if index is None else [int(key) for key in index]
+        keys = list(range(len(records))) if index is None else list(index)
         view.docs_write(keys, [encode_json(dict(record)) for record in records], collection=collection)
         return cls(view, collection)
 
@@ -375,8 +377,8 @@ class Table:
         view: View,
         data: Mapping[str, Sequence[Any]],
         *,
-        collection: int | str | None = None,
-        index: Iterable[int] | None = None,
+        collection: UUID | str | None = None,
+        index: Iterable[KeyLike] | None = None,
     ) -> Table:
         """Writes one document per row of equally long columns, keyed by `index` or by position."""
         rows = {len(values) for values in data.values()}

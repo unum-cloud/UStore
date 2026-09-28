@@ -238,8 +238,30 @@ class test_database_t {
         ustore_collection_drop_t drop {};
         drop.db = database_;
         drop.error = &error;
-        drop.id = ustore_collection_main_k;
+        drop.collection = ustore_collection_main_k;
         drop.mode = ustore_drop_keys_vals_k;
+        ustore_collection_drop(&drop);
+    }
+
+    /** Creates an anonymous graph collection, answering its ID, or the main one after reporting why it could not. */
+    [[nodiscard]] ustore_collection_id_t create_graph(ustore_error_t& error) noexcept {
+        ustore_collection_id_t graph = ustore_collection_main_k;
+        ustore_collection_create_t create {};
+        create.db = database_;
+        create.error = &error;
+        create.modality = ustore_modality_graph_k;
+        create.collection = &graph;
+        ustore_collection_create(&create);
+        return graph;
+    }
+
+    /** Drops @p collection together with its handle. */
+    void drop(ustore_collection_id_t collection, ustore_error_t& error) noexcept {
+        ustore_collection_drop_t drop {};
+        drop.db = database_;
+        drop.error = &error;
+        drop.collection = collection;
+        drop.mode = ustore_drop_keys_vals_handle_k;
         ustore_collection_drop(&drop);
     }
 
@@ -283,8 +305,8 @@ struct json_document_t {
     return serialized;
 }
 
-/** Parses all of @p text as a decimal key into @p key, answering whether it parsed. */
-[[nodiscard]] bool parse_key(std::string_view text, ustore_key_t& key) noexcept {
+/** Parses all of @p text as the decimal integer an exported key spells into @p key, answering whether it parsed. */
+[[nodiscard]] bool parse_key(std::string_view text, std::uint64_t& key) noexcept {
     std::from_chars_result const parsed = std::from_chars(text.data(), text.data() + text.size(), key);
     return !text.empty() && parsed.ec == std::errc {} && parsed.ptr == text.data() + text.size();
 }
@@ -294,7 +316,7 @@ struct json_document_t {
     ustore_arena_t arena = nullptr;
     ustore_error_t error {};
     ustore_octet_t* presences = nullptr;
-    ustore_collection_t* ids = nullptr;
+    ustore_collection_id_t* ids = nullptr;
     ustore_collection_find_t find {};
     find.db = database;
     find.error = &error;
@@ -302,7 +324,7 @@ struct json_document_t {
     find.tasks_count = 1;
     find.names = &name;
     find.presences = &presences;
-    find.ids = &ids;
+    find.collections = &ids;
     ustore_collection_find(&find);
     bool const found = !error.status && (presences[0] & 1);
     ustore_arena_free(arena);
@@ -313,11 +335,11 @@ struct json_document_t {
 
 #pragma region Checks
 
-/** One exported edge, compared after sorting. */
+/** One exported edge, compared after sorting, with the integers its keys spell, as the fixture's keys all do. */
 struct edge_row_t {
-    ustore_key_t source;
-    ustore_key_t target;
-    ustore_key_t edge;
+    std::uint64_t source;
+    std::uint64_t target;
+    std::uint64_t edge;
 };
 
 /** Checks that the edges exported to @p path are exactly the fixture edges. */
@@ -346,8 +368,8 @@ struct edge_row_t {
             yyjson_val* const source = yyjson_obj_get(root, source_field_k);
             yyjson_val* const target = yyjson_obj_get(root, target_field_k);
             yyjson_val* const label = yyjson_obj_get(root, edge_field_k);
-            parsed = yyjson_is_int(source) && yyjson_is_int(target) && yyjson_is_int(label);
-            edge = {yyjson_get_sint(source), yyjson_get_sint(target), yyjson_get_sint(label)};
+            parsed = yyjson_is_uint(source) && yyjson_is_uint(target) && yyjson_is_uint(label);
+            edge = {yyjson_get_uint(source), yyjson_get_uint(target), yyjson_get_uint(label)};
         }
         failures += expect(parsed);
         if (!parsed || st::failed(edges.push_back(edge_row_t {edge}))) return failures + 1;
@@ -357,7 +379,7 @@ struct edge_row_t {
               [](edge_row_t const& left, edge_row_t const& right) noexcept { return left.source < right.source; });
     failures += expect_eq(edges.size(), static_cast<std::size_t>(rows_count_k));
     for (std::size_t index = 0; index != edges.size(); ++index) {
-        ustore_key_t const id = static_cast<ustore_key_t>(index) + 1;
+        std::uint64_t const id = index + 1;
         edge_row_t const& edge = edges[index];
         if (edge.source == id && edge.target == id % 97 && edge.edge == id * 3) continue;
         failures += expect_eq(edge.source, id);
@@ -369,12 +391,13 @@ struct edge_row_t {
 }
 
 /** Checks one exported document against the fixture row of its key. */
-[[nodiscard]] std::size_t check_document(ustore_key_t key, std::string_view text, char const* input,
+[[nodiscard]] std::size_t check_document(std::uint64_t key, std::string_view text, char const* input,
                                          field_selection_t selection) noexcept {
     std::size_t failures = expect(key >= 1 && key <= rows_count_k);
     sz::string_t expected_text;
-    bool const generated = is_csv(input) ? append_csv_document(expected_text, key)
-                                         : append_ndjson_document(expected_text, key);
+    auto const id = static_cast<std::int64_t>(key);
+    bool const generated = is_csv(input) ? append_csv_document(expected_text, id)
+                                         : append_ndjson_document(expected_text, id);
     if (!generated) return failures + 1;
 
     json_document_t const exported {yyjson_read(text.data(), text.size(), 0)};
@@ -418,7 +441,7 @@ struct edge_row_t {
         if (is_csv(output)) {
             if (row == "_id,doc") continue;
             std::size_t const comma = row.find(',');
-            ustore_key_t key = 0;
+            std::uint64_t key = 0;
             bool const quoted = comma != std::string_view::npos && row.size() >= comma + 3 && row[comma + 1] == '"' &&
                                 row.back() == '"';
             failures += expect(quoted && parse_key(row.substr(0, comma), key));
@@ -437,9 +460,9 @@ struct edge_row_t {
             yyjson_val* const root = yyjson_doc_get_root(document.handle);
             yyjson_val* const key = yyjson_obj_get(root, "_id");
             sz::string_t text;
-            failures += expect(yyjson_is_int(key) && canonical(yyjson_obj_get(root, "doc"), text));
-            if (!yyjson_is_int(key)) continue;
-            failures += check_document(yyjson_get_sint(key), text, input, selection);
+            failures += expect(yyjson_is_uint(key) && canonical(yyjson_obj_get(root, "doc"), text));
+            if (!yyjson_is_uint(key)) continue;
+            failures += check_document(yyjson_get_uint(key), text, input, selection);
         }
         ++rows;
     }
@@ -460,10 +483,13 @@ struct edge_row_t {
 
     std::size_t failures = 0;
     ustore_error_t error {};
+    ustore_collection_id_t const graph = database.create_graph(error);
+    failures += expect_no_error(error);
+
     ustore_graph_import_t importing {};
     importing.db = database.get();
     importing.error = &error;
-    importing.collection = ustore_collection_main_k;
+    importing.collection = graph;
     importing.path = input;
     importing.max_batch_size = max_batch_size_k;
     importing.source_id_field = source_field_k;
@@ -475,7 +501,7 @@ struct edge_row_t {
     ustore_graph_export_t exporting {};
     exporting.db = database.get();
     exporting.error = &error;
-    exporting.collection = ustore_collection_main_k;
+    exporting.collection = graph;
     exporting.path = output;
     exporting.max_batch_size = max_batch_size_k;
     exporting.source_id_field = source_field_k;
@@ -486,7 +512,8 @@ struct edge_row_t {
 
     failures += check_edges(output);
     [[maybe_unused]] int const removed = std::remove(output);
-    database.clear();
+    database.drop(graph, error);
+    failures += expect_no_error(error);
     return failures;
 }
 
@@ -547,10 +574,12 @@ struct edge_row_t {
 
     std::size_t failures = 0;
     ustore_error_t error {};
+    ustore_collection_id_t const graph = database.create_graph(error);
+    failures += expect_no_error(error);
     ustore_graph_import_t valid {};
     valid.db = database.get();
     valid.error = &error;
-    valid.collection = ustore_collection_main_k;
+    valid.collection = graph;
     valid.path = input;
     valid.max_batch_size = max_batch_size_k;
     valid.source_id_field = source_field_k;
@@ -582,7 +611,8 @@ struct edge_row_t {
     ustore_graph_import(&without_database);
     failures += expect_error(error);
 
-    database.clear();
+    database.drop(graph, error);
+    failures += expect_no_error(error);
     return failures;
 }
 

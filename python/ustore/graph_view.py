@@ -3,7 +3,8 @@
 A graph collection holds every vertex and its edges, while two optional document collections hold
 the attributes of vertices, keyed by vertex, and of edges, keyed by edge identifier. Every read goes
 to the store, so a view holds nothing that could go stale, and every verb works the same over a
-`Database` and over a `Transaction`.
+`Database` and over a `Transaction`. Vertices and edges are named by `uuid.UUID`, as every key is,
+and any spelling of a key the binding accepts names them on the way in.
 
 A multigraph gives every edge an identifier of its own, which is the key NetworkX reports; a simple
 graph does too once it keeps edge attributes, and otherwise stores every edge under
@@ -16,31 +17,34 @@ import json
 from collections.abc import Buffer, Iterable, Iterator, Mapping, Sequence
 from itertools import batched
 from typing import Any, ClassVar
+from uuid import UUID
 
-from ustore.keys import PAGE_KEYS, scan_keys
+from ustore.keys import PAGE_KEYS, KeyLike, as_key, is_one_key, scan_keys
 from ustore.lib import Database, Edges, Transaction, default_edge_id
 
 type View = Database | Transaction
-type CollectionLike = int | str | None
+type CollectionLike = UUID | str | None
 type Attributes = dict[str, Any]
-type Triple = tuple[int, int, int]
-type KeysLike = Sequence[int] | Buffer
+type Triple = tuple[UUID, UUID, UUID]
+type KeysLike = Sequence[KeyLike] | Buffer
 
 
-def resolve_collection(view: View, collection: int | str | None) -> int | None:
-    """Answers the identifier a collection argument addresses, creating a named one that is missing."""
+def resolve_collection(view: View, collection: CollectionLike, modality: str) -> UUID:
+    """Answers the ID a collection argument addresses, creating a named one that is missing to hold `modality`."""
+    if collection is None:
+        return UUID(int=0)
     if not isinstance(collection, str):
         return collection
     database = view if isinstance(view, Database) else view.database
     if database.collection_contains(collection):
         return database.collection_find(collection)
-    return database.collection_create(collection)
+    return database.collection_create(collection, modality=modality)
 
 
 def triples_of(edges: Edges, index: int) -> list[Triple]:
     """The (source, target, edge) triples one vertex of a lookup found."""
     found = edges[index]
-    return [] if found is None else [(source, target, edge) for source, target, edge in found.tolist()]
+    return [] if found is None else list(found)
 
 
 class NodeView:
@@ -49,26 +53,26 @@ class NodeView:
     def __init__(self, graph: Graph) -> None:
         self.graph = graph
 
-    def __iter__(self) -> Iterator[int]:
+    def __iter__(self) -> Iterator[UUID]:
         return iter(self.graph)
 
     def __len__(self) -> int:
         return len(self.graph)
 
-    def __contains__(self, node: int) -> bool:
+    def __contains__(self, node: KeyLike) -> bool:
         return self.graph.has_node(node)
 
-    def __getitem__(self, node: int) -> Attributes:
+    def __getitem__(self, node: KeyLike) -> Attributes:
         if not self.graph.has_node(node):
             raise KeyError(node)
         return self.graph.read_attributes(self.graph.nodes_collection, [node])[0]
 
-    def __call__(self, data: bool | str = False, default: Any = None) -> Iterator[int] | Iterator[tuple[int, Any]]:
+    def __call__(self, data: bool | str = False, default: Any = None) -> Iterator[UUID] | Iterator[tuple[UUID, Any]]:
         if data is False:
             return iter(self.graph)
         return self._with_data(data, default)
 
-    def _with_data(self, data: bool | str, default: Any) -> Iterator[tuple[int, Any]]:
+    def _with_data(self, data: bool | str, default: Any) -> Iterator[tuple[UUID, Any]]:
         for page in batched(self.graph, PAGE_KEYS):
             attributes = self.graph.read_attributes(self.graph.nodes_collection, page)
             for node, found in zip(page, attributes, strict=True):
@@ -81,19 +85,19 @@ class EdgeView:
     def __init__(self, graph: Graph) -> None:
         self.graph = graph
 
-    def __iter__(self) -> Iterator[tuple[int, ...]]:
+    def __iter__(self) -> Iterator[tuple[UUID, ...]]:
         """Every edge as its two ends, followed by its key in a multigraph."""
         return self(keys=self.graph.MULTIGRAPH)
 
     def __len__(self) -> int:
         return self.graph.number_of_edges()
 
-    def __contains__(self, edge: tuple[int, int]) -> bool:
+    def __contains__(self, edge: tuple[KeyLike, KeyLike]) -> bool:
         return self.graph.has_edge(*edge)
 
     def __call__(
         self,
-        nbunch: int | Iterable[int] | None = None,
+        nbunch: KeyLike | Iterable[KeyLike] | None = None,
         data: bool | str = False,
         keys: bool = False,
         default: Any = None,
@@ -120,30 +124,30 @@ class EdgeView:
 class DegreeView:
     """Degrees of vertices in one role: indexable by vertex, iterable as pairs, callable with weights."""
 
-    def __init__(self, graph: Graph, role: str, weight: str | None = None, nodes: list[int] | None = None) -> None:
+    def __init__(self, graph: Graph, role: str, weight: str | None = None, nodes: list[KeyLike] | None = None) -> None:
         self.graph = graph
         self.role = role
         self.weight = weight
         self.nodes = nodes
 
-    def __getitem__(self, node: int) -> int | float:
+    def __getitem__(self, node: KeyLike) -> int | float:
         if not self.graph.has_node(node):
             raise KeyError(node)
         return next(self._degrees([node]))[1]
 
-    def __iter__(self) -> Iterator[tuple[int, int | float]]:
+    def __iter__(self) -> Iterator[tuple[KeyLike, int | float]]:
         pages = batched(self.graph if self.nodes is None else self.nodes, PAGE_KEYS)
         for page in pages:
             yield from self._degrees(list(page))
 
     def __call__(
-        self, nbunch: int | Iterable[int] | None = None, weight: str | None = None
+        self, nbunch: KeyLike | Iterable[KeyLike] | None = None, weight: str | None = None
     ) -> int | float | DegreeView:
-        if not isinstance(nbunch, Iterable | None):
+        if nbunch is not None and is_one_key(nbunch):
             return DegreeView(self.graph, self.role, weight)[nbunch]
         return DegreeView(self.graph, self.role, weight, None if nbunch is None else list(nbunch))
 
-    def _degrees(self, nodes: list[int]) -> Iterator[tuple[int, int | float]]:
+    def _degrees(self, nodes: list[KeyLike]) -> Iterator[tuple[KeyLike, int | float]]:
         if self.weight is None:
             counts = self.graph.view.graph_degrees(nodes, role=self.role, collection=self.graph.graph_collection)
             yield from ((node, count or 0) for node, count in zip(nodes, counts, strict=True))
@@ -164,24 +168,21 @@ class Graph:
     def __init__(
         self,
         view: View,
-        graph: CollectionLike = None,
+        graph: UUID | str,
         *,
-        nodes: int | str | None = None,
-        edges: int | str | None = None,
+        nodes: UUID | str | None = None,
+        edges: UUID | str | None = None,
     ) -> None:
-        """Opens a graph in `graph`, with vertex attributes in `nodes` and edge attributes in `edges`.
+        """Opens a graph in the graph collection `graph`, with vertex attributes in `nodes` and edge attributes in `edges`.
 
-        Named collections that do not exist yet are created, which only a `Database` can do.
+        Named collections that do not exist yet are created, at the head of the database, graph and documents.
         """
         self.view = view
-        self.graph_collection = resolve_collection(view, graph)
-        self.nodes_collection = None if nodes is None else resolve_collection(view, nodes)
-        self.edges_collection = None if edges is None else resolve_collection(view, edges)
-        # A vertex value is not a document, so attributes never share the graph's own collection.
-        attributes = {
-            collection or 0 for collection in (self.nodes_collection, self.edges_collection) if collection is not None
-        }
-        if (self.graph_collection or 0) in attributes:
+        self.graph_collection = resolve_collection(view, graph, "graph")
+        self.nodes_collection = None if nodes is None else resolve_collection(view, nodes, "docs")
+        self.edges_collection = None if edges is None else resolve_collection(view, edges, "docs")
+        # A graph collection holds vertices rather than documents, so attributes live in collections of their own.
+        if self.graph_collection in (self.nodes_collection, self.edges_collection):
             raise ValueError("Attributes live in a collection apart from the graph")
         self.next_edge_id: int | None = None
 
@@ -193,14 +194,14 @@ class Graph:
 
     # region Attributes
 
-    def read_attributes(self, collection: int | None, keys: Sequence[int]) -> list[Attributes]:
+    def read_attributes(self, collection: UUID | None, keys: Sequence[KeyLike]) -> list[Attributes]:
         """The attribute document of every key, an empty one where there is none."""
         if collection is None or len(keys) == 0:
             return [{} for _ in keys]
         documents = self.view.docs_read(keys, collection=collection)
         return [{} if document is None else json.loads(bytes(document)) for document in documents]
 
-    def merge_attributes(self, collection: int | None, keys: KeysLike, documents: Sequence[Attributes]) -> None:
+    def merge_attributes(self, collection: UUID | None, keys: KeysLike, documents: Sequence[Attributes]) -> None:
         """Merges one attribute document into every key, or one per key, as RFC 7386 does."""
         if collection is None:
             raise ValueError("Attributes need a collection of their own, given when the graph is opened")
@@ -211,22 +212,22 @@ class Graph:
 
     # region Vertices
 
-    def __iter__(self) -> Iterator[int]:
+    def __iter__(self) -> Iterator[UUID]:
         return scan_keys(self.view, self.graph_collection)
 
     def __len__(self) -> int:
         return sum(1 for _ in self)
 
-    def __contains__(self, node: int) -> bool:
+    def __contains__(self, node: KeyLike) -> bool:
         return self.has_node(node)
 
-    def __getitem__(self, node: int) -> dict[int, Any]:
+    def __getitem__(self, node: KeyLike) -> dict[UUID, Any]:
         """The neighbours of a vertex with the attributes of the edges reaching them, keyed by edge in a multigraph."""
         if not self.has_node(node):
             raise KeyError(node)
         triples = list(self.edge_triples(node))
         attributes = self.read_attributes(self.edges_collection, [edge for _, _, edge in triples])
-        adjacency: dict[int, Any] = {}
+        adjacency: dict[UUID, Any] = {}
         for (_, neighbour, edge), found in zip(triples, attributes, strict=True):
             if self.MULTIGRAPH:
                 adjacency.setdefault(neighbour, {})[edge] = found
@@ -241,13 +242,13 @@ class Graph:
     def number_of_nodes(self) -> int:
         return len(self)
 
-    def has_node(self, node: int) -> bool:
+    def has_node(self, node: KeyLike) -> bool:
         return self.view.contains(node, collection=self.graph_collection)
 
-    def add_node(self, node: int, **attributes: Any) -> None:
+    def add_node(self, node: KeyLike, **attributes: Any) -> None:
         self.add_nodes_from([node], **attributes)
 
-    def add_nodes_from(self, nodes: KeysLike | Iterable[int], **attributes: Any) -> None:
+    def add_nodes_from(self, nodes: KeysLike | Iterable[KeyLike], **attributes: Any) -> None:
         """Inserts vertices, merging `attributes` into every one of them."""
         keys = nodes if isinstance(nodes, (Buffer, Sequence)) else list(nodes)
         # Only absent vertices are upserted, since a batch whose every vertex exists is refused by the C ABI.
@@ -258,12 +259,12 @@ class Graph:
         if attributes:
             self.merge_attributes(self.nodes_collection, keys, [attributes])
 
-    def remove_node(self, node: int) -> None:
+    def remove_node(self, node: KeyLike) -> None:
         if not self.has_node(node):
             raise KeyError(node)
         self.remove_nodes_from([node])
 
-    def remove_nodes_from(self, nodes: Iterable[int]) -> None:
+    def remove_nodes_from(self, nodes: Iterable[KeyLike]) -> None:
         """Removes vertices with every edge they take part in and the attributes of both."""
         keys = list(nodes)
         if self.edges_collection is not None:
@@ -283,15 +284,16 @@ class Graph:
         """The role a vertex plays in the edges it reaches its neighbours by."""
         return "source" if self.DIRECTED else "any"
 
-    def canonical_pair(self, source: int, target: int) -> tuple[int, int]:
+    def canonical_pair(self, source: KeyLike, target: KeyLike) -> tuple[UUID, UUID]:
         """The pair both orientations of an undirected edge share."""
+        source, target = as_key(source), as_key(target)
         return (source, target) if self.DIRECTED else (min(source, target), max(source, target))
 
-    def stored_between(self, sources: Sequence[int]) -> dict[tuple[int, int], list[Triple]]:
+    def stored_between(self, sources: Sequence[KeyLike]) -> dict[tuple[UUID, UUID], list[Triple]]:
         """Every stored edge leaving `sources`, grouped by canonical pair, in stored order."""
-        unique = list(dict.fromkeys(sources))
+        unique = list(dict.fromkeys(map(as_key, sources)))
         found = self.view.graph_find_edges(unique, role=self.outgoing_role, collection=self.graph_collection)
-        grouped: dict[tuple[int, int], list[Triple]] = {}
+        grouped: dict[tuple[UUID, UUID], list[Triple]] = {}
         for index in range(len(unique)):
             for triple in triples_of(found, index):
                 entries = grouped.setdefault(self.canonical_pair(triple[0], triple[1]), [])
@@ -300,48 +302,48 @@ class Graph:
                     entries.append(triple)
         return grouped
 
-    def allocate_edge_ids(self, count: int) -> list[int]:
-        """Hands out identifiers past every one the graph already holds."""
+    def allocate_edge_ids(self, count: int) -> list[UUID]:
+        """Hands out identifiers past every one the graph already holds, counting as integers do."""
         if self.next_edge_id is None:
-            held = (edge for _, _, edge in self.edge_triples(None) if edge != default_edge_id)
+            held = (edge.int for _, _, edge in self.edge_triples(None) if edge != default_edge_id)
             self.next_edge_id = max(held, default=-1) + 1
         first = self.next_edge_id
         self.next_edge_id += count
-        return list(range(first, first + count))
+        return [UUID(int=edge) for edge in range(first, first + count)]
 
     def add_edges_from_arrays(
         self,
-        sources: Sequence[int],
-        targets: Sequence[int],
-        keys: Sequence[int | None] | None = None,
+        sources: Sequence[KeyLike],
+        targets: Sequence[KeyLike],
+        keys: Sequence[KeyLike | None] | None = None,
         *,
         columns: Mapping[str, Sequence[Any]] | None = None,
         **attributes: Any,
-    ) -> list[int]:
+    ) -> list[UUID]:
         """Inserts a batch of edges, merging `attributes` into all of them and `columns` edge by edge.
 
         Returns:
             The identifier of every edge, in the order the edges were given.
         """
-        sources = [int(source) for source in sources]
-        targets = [int(target) for target in targets]
+        sources = [as_key(source) for source in sources]
+        targets = [as_key(target) for target in targets]
         if len(sources) != len(targets):
             raise ValueError(f"Got {len(sources)} sources and {len(targets)} targets")
-        wanted = [None] * len(sources) if keys is None else [None if key is None else int(key) for key in keys]
+        wanted = [None] * len(sources) if keys is None else [None if key is None else as_key(key) for key in keys]
         if not self.MULTIGRAPH and any(key is not None for key in wanted):
             raise TypeError("Only a multigraph takes edge keys")
 
-        identifiers: list[int] = []
+        identifiers: list[UUID] = []
         upserted: list[Triple] = []
         if self.MULTIGRAPH:
             fresh = iter(self.allocate_edge_ids(sum(key is None for key in wanted)))
             identifiers = [next(fresh) if key is None else key for key in wanted]
             # A key the caller chose is never handed out again.
-            self.next_edge_id = max([self.next_edge_id or 0, *(key + 1 for key in wanted if key is not None)])
+            self.next_edge_id = max([self.next_edge_id or 0, *(key.int + 1 for key in wanted if key is not None)])
             upserted = list(zip(sources, targets, identifiers, strict=True))
         else:
             stored = self.stored_between(sources)
-            pending: dict[tuple[int, int], int] = {}
+            pending: dict[tuple[UUID, UUID], UUID] = {}
             for source, target in zip(sources, targets, strict=True):
                 pair = self.canonical_pair(source, target)
                 if pair in stored:
@@ -367,7 +369,7 @@ class Graph:
             self.merge_attributes(self.edges_collection, identifiers, documents if columns else documents[:1])
         return identifiers
 
-    def add_edge(self, source: int, target: int, **attributes: Any) -> None:
+    def add_edge(self, source: KeyLike, target: KeyLike, **attributes: Any) -> None:
         self.add_edges_from_arrays([source], [target], **attributes)
 
     def add_edges_from(self, ebunch: Iterable[tuple[Any, ...]], **attributes: Any) -> None:
@@ -379,16 +381,16 @@ class Graph:
             self.add_edges_from_arrays([source], [target], None if key is None else [key], **{**attributes, **own})
 
     def remove_edges_from_arrays(
-        self, sources: Sequence[int], targets: Sequence[int], keys: Sequence[int | None] | None = None
+        self, sources: Sequence[KeyLike], targets: Sequence[KeyLike], keys: Sequence[KeyLike | None] | None = None
     ) -> int:
         """Removes a batch of edges, the newest one of a pair where a multigraph names no key.
 
         Returns:
             The number of edges removed; pairs holding no edge are skipped.
         """
-        sources = [int(source) for source in sources]
-        targets = [int(target) for target in targets]
-        wanted = [None] * len(sources) if keys is None else [None if key is None else int(key) for key in keys]
+        sources = [as_key(source) for source in sources]
+        targets = [as_key(target) for target in targets]
+        wanted = [None] * len(sources) if keys is None else [None if key is None else as_key(key) for key in keys]
         stored = self.stored_between(sources)
         removed: list[Triple] = []
         for source, target, key in zip(sources, targets, wanted, strict=True):
@@ -410,16 +412,16 @@ class Graph:
                 self.view.pop(removed_edges, collection=self.edges_collection)
         return len(removed)
 
-    def remove_edge(self, source: int, target: int) -> None:
+    def remove_edge(self, source: KeyLike, target: KeyLike) -> None:
         if self.remove_edges_from_arrays([source], [target]) == 0:
             raise KeyError((source, target))
 
-    def remove_edges_from(self, ebunch: Iterable[tuple[int, ...]]) -> None:
+    def remove_edges_from(self, ebunch: Iterable[tuple[KeyLike, ...]]) -> None:
         for edge in ebunch:
             key = edge[2] if self.MULTIGRAPH and len(edge) > 2 else None
             self.remove_edges_from_arrays([edge[0]], [edge[1]], None if key is None else [key])
 
-    def edge_triples(self, nbunch: int | Iterable[int] | None) -> Iterator[Triple]:
+    def edge_triples(self, nbunch: KeyLike | Iterable[KeyLike] | None) -> Iterator[Triple]:
         """Every edge once, as stored for the whole graph and oriented away from `nbunch` otherwise."""
         if nbunch is None:
             for page in batched(self, PAGE_KEYS):
@@ -427,7 +429,7 @@ class Graph:
                 for index in range(len(page)):
                     yield from triples_of(found, index)
             return
-        nodes = list(nbunch) if isinstance(nbunch, Iterable) else [nbunch]
+        nodes = [as_key(nbunch)] if is_one_key(nbunch) else [as_key(node) for node in nbunch]
         found = self.view.graph_find_edges(nodes, role=self.outgoing_role, collection=self.graph_collection)
         seen: set[Triple] = set()
         for index, node in enumerate(nodes):
@@ -442,11 +444,11 @@ class Graph:
     def edges(self) -> EdgeView:
         return EdgeView(self)
 
-    def has_edge(self, source: int, target: int, key: int | None = None) -> bool:
+    def has_edge(self, source: KeyLike, target: KeyLike, key: KeyLike | None = None) -> bool:
         between = self.stored_between([source]).get(self.canonical_pair(source, target), [])
-        return any(key is None or edge == key for _, _, edge in between)
+        return any(key is None or edge == as_key(key) for _, _, edge in between)
 
-    def number_of_edges(self, source: int | None = None, target: int | None = None) -> int:
+    def number_of_edges(self, source: KeyLike | None = None, target: KeyLike | None = None) -> int:
         if source is None or target is None:
             return sum(degree for _, degree in DegreeView(self, "source"))
         return len(self.stored_between([source]).get(self.canonical_pair(source, target), []))
@@ -456,11 +458,11 @@ class Graph:
             return self.number_of_edges()
         return sum(attributes.get(weight, 1) for _, _, attributes in self.edges(data=True))
 
-    def neighbors(self, node: int) -> Iterator[int]:
+    def neighbors(self, node: KeyLike) -> Iterator[UUID]:
         """The distinct vertices an edge leads to from `node`, in ascending order."""
         return iter(sorted({target for _, target, _ in self.edge_triples(node)}))
 
-    def get_edge_data(self, source: int, target: int, default: Any = None) -> Any:
+    def get_edge_data(self, source: KeyLike, target: KeyLike, default: Any = None) -> Any:
         between = self.stored_between([source]).get(self.canonical_pair(source, target), [])
         if not between:
             return default
@@ -497,7 +499,7 @@ class Graph:
 
     # region Attribute Maps
 
-    def get_node_attributes(self, name: str) -> dict[int, Any]:
+    def get_node_attributes(self, name: str) -> dict[UUID, Any]:
         return {node: found[name] for node, found in self.nodes(data=True) if name in found}
 
     def set_node_attributes(self, values: Any, name: str | None = None) -> None:
@@ -512,21 +514,21 @@ class Graph:
             for page in batched(self, PAGE_KEYS):
                 self.merge_attributes(self.nodes_collection, page, [{name: values}])
 
-    def edge_label(self, source: int, target: int, edge: int) -> tuple[int, ...]:
+    def edge_label(self, source: UUID, target: UUID, edge: UUID) -> tuple[UUID, ...]:
         """How NetworkX names an edge: with its key in a multigraph, by its ends otherwise."""
         return (source, target, edge) if self.MULTIGRAPH else (source, target)
 
-    def edge_identifier(self, label: tuple[int, ...]) -> int:
+    def edge_identifier(self, label: tuple[KeyLike, ...]) -> UUID:
         """The identifier an edge label addresses."""
         if self.MULTIGRAPH:
-            return label[2]
+            return as_key(label[2])
         between = self.stored_between([label[0]]).get(self.canonical_pair(label[0], label[1]), [])
         if not between:
             raise KeyError(label)
         return between[0][2]
 
-    def get_edge_attributes(self, name: str) -> dict[tuple[int, ...], Any]:
-        labelled: dict[tuple[int, ...], Any] = {}
+    def get_edge_attributes(self, name: str) -> dict[tuple[UUID, ...], Any]:
+        labelled: dict[tuple[UUID, ...], Any] = {}
         for page in batched(self.edge_triples(None), PAGE_KEYS):
             attributes = self.read_attributes(self.edges_collection, [edge for _, _, edge in page])
             for (source, target, edge), found in zip(page, attributes, strict=True):
@@ -557,10 +559,10 @@ class DiGraph(Graph):
 
     DIRECTED = True
 
-    def successors(self, node: int) -> Iterator[int]:
+    def successors(self, node: KeyLike) -> Iterator[UUID]:
         return self.neighbors(node)
 
-    def predecessors(self, node: int) -> Iterator[int]:
+    def predecessors(self, node: KeyLike) -> Iterator[UUID]:
         found = self.view.graph_find_edges([node], role="target", collection=self.graph_collection)
         return iter(sorted({source for source, _, _ in triples_of(found, 0)}))
 
@@ -578,18 +580,18 @@ class MultiGraph(Graph):
 
     MULTIGRAPH = True
 
-    def add_edge(self, source: int, target: int, key: int | None = None, **attributes: Any) -> int:
+    def add_edge(self, source: KeyLike, target: KeyLike, key: KeyLike | None = None, **attributes: Any) -> UUID:
         """Inserts one edge, or merges `attributes` into the one `key` names, and answers its key."""
         return self.add_edges_from_arrays([source], [target], [key], **attributes)[0]
 
-    def remove_edge(self, source: int, target: int, key: int | None = None) -> None:
+    def remove_edge(self, source: KeyLike, target: KeyLike, key: KeyLike | None = None) -> None:
         """Removes the edge `key` names, or the newest edge between the pair."""
         if self.remove_edges_from_arrays([source], [target], [key]) == 0:
             raise KeyError((source, target, key))
 
-    def get_edge_data(self, source: int, target: int, key: int | None = None, default: Any = None) -> Any:
+    def get_edge_data(self, source: KeyLike, target: KeyLike, key: KeyLike | None = None, default: Any = None) -> Any:
         between = self.stored_between([source]).get(self.canonical_pair(source, target), [])
-        identifiers = [edge for _, _, edge in between if key is None or edge == key]
+        identifiers = [edge for _, _, edge in between if key is None or edge == as_key(key)]
         if not identifiers:
             return default
         attributes = self.read_attributes(self.edges_collection, identifiers)

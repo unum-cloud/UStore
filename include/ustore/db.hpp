@@ -28,9 +28,7 @@
 
 namespace unum::ustore {
 
-using snapshots_list_t = std::span<ustore_snapshot_t>;
-
-using collections_list_t = std::span<ustore_collection_t>;
+using collections_list_t = std::span<ustore_collection_id_t>;
 
 /**
  *  @brief Reads the collection @p name was given, at the head of the database or at @p snapshot.
@@ -39,12 +37,12 @@ using collections_list_t = std::span<ustore_collection_t>;
  *  call addresses its collection by the identifier this returns. An engine without collections of its
  *  own carries no names, so it answers as for a name no collection carries.
  */
-inline expected<ustore_collection_t> collection_named(ustore_database_t database, ustore_snapshot_t snapshot,
-                                                      ustore_arena_t* arena, std::string_view name) noexcept {
+inline expected<ustore_collection_id_t> collection_named(ustore_database_t database, ustore_snapshot_t snapshot,
+                                                         ustore_arena_t* arena, std::string_view name) noexcept {
     char const* const text = name.data();
     ustore_length_t const length = static_cast<ustore_length_t>(name.size());
     ustore_octet_t* presences = nullptr;
-    ustore_collection_t* ids = nullptr;
+    ustore_collection_id_t* collections = nullptr;
     ustore_error_t error {};
     ustore_collection_find_t find {};
     find.db = database;
@@ -55,12 +53,12 @@ inline expected<ustore_collection_t> collection_named(ustore_database_t database
     find.names = &text;
     find.names_lengths = &length;
     find.presences = &presences;
-    find.ids = &ids;
+    find.collections = &collections;
     ustore_collection_find(&find);
     if (error.status == ustore_error_unsupported_k || (!error.status && !(presences[0] & 1)))
         return status_t {status_code_t::not_found_k, "No such collection"};
     if (error.status) return status_t {error};
-    return ids[0];
+    return collections[0];
 }
 
 /** A transaction or snapshot context for one thread.
@@ -102,8 +100,6 @@ class context_t {
     ustore_snapshot_t snap() const noexcept { return snapshot_; }
     operator ustore_transaction_t() const noexcept { return transaction_; }
 
-    void set_snapshot(ustore_snapshot_t snapshot) noexcept { snapshot_ = snapshot; }
-
     blobs_ref<places_arg_t> operator[](strided_range<collection_key_t const> collections_and_keys) noexcept {
         places_arg_t arg;
         arg.collections_begin = collections_and_keys.members(&collection_key_t::collection).begin();
@@ -143,7 +139,7 @@ class context_t {
 
     expected<collections_list_t> collections() noexcept {
         ustore_size_t count = 0;
-        ustore_collection_t* ids = nullptr;
+        ustore_collection_id_t* ids = nullptr;
         ustore_error_t error {};
         ustore_collection_list_t collection_list {};
         collection_list.db = database_;
@@ -152,27 +148,11 @@ class context_t {
         collection_list.snapshot = snapshot_;
         collection_list.arena = arena_.member_ptr();
         collection_list.count = &count;
-        collection_list.ids = &ids;
+        collection_list.collections = &ids;
 
         ustore_collection_list(&collection_list);
         if (error.status) return status_t {error};
         return collections_list_t {ids, ids + count};
-    }
-
-    expected<snapshots_list_t> snapshots() noexcept {
-        ustore_size_t count = 0;
-        ustore_snapshot_t* ids = nullptr;
-        ustore_error_t error {};
-        ustore_snapshot_list_t snapshots_list {};
-        snapshots_list.db = database_;
-        snapshots_list.error = &error;
-        snapshots_list.arena = arena_.member_ptr();
-        snapshots_list.count = &count;
-        snapshots_list.ids = &ids;
-
-        ustore_snapshot_list(&snapshots_list);
-        if (error.status) return status_t {error};
-        return snapshots_list_t {ids, ids + count};
     }
 
     /** Whether a collection named @p name exists, where the empty name is the main collection. */
@@ -227,22 +207,36 @@ class context_t {
     }
 
     /**
-     *  Commits like @c commit and returns the sequence number the commit received.
+     *  Commits like @c commit and returns the stamp the commit published under.
      *  @param[in] flush Whether the call returns only after the data reaches the disk.
      */
-    expected<ustore_sequence_number_t> sequenced_commit(flush_t flush = flush_t::dont_flush_k) noexcept {
+    expected<ustore_stamp_t> stamped_commit(flush_t flush = flush_t::dont_flush_k) noexcept {
         ustore_error_t error {};
-        ustore_sequence_number_t sequence_number = std::numeric_limits<ustore_sequence_number_t>::max();
+        ustore_stamp_t stamp = std::numeric_limits<ustore_stamp_t>::max();
         ustore_transaction_commit_t transaction_commit {};
         transaction_commit.db = database_;
         transaction_commit.error = &error;
         transaction_commit.transaction = transaction_;
         transaction_commit.options = to_options(flush);
-        transaction_commit.sequence_number = &sequence_number;
+        transaction_commit.stamp = &stamp;
         ustore_transaction_commit(&transaction_commit);
         if (error.status) return status_t {error};
-        return sequence_number;
+        return stamp;
     }
+};
+
+using transaction_t = context_t;
+
+/** A point-in-time view of the whole database, which reads through it see until its destructor frees it. It never
+ *  copies, and goes before its database closes. */
+class snapshot_t : public context_t {
+  public:
+    snapshot_t() noexcept = default;
+    snapshot_t(ustore_database_t database, ustore_snapshot_t snapshot) noexcept
+        : context_t(database, nullptr, snapshot) {}
+    snapshot_t(snapshot_t&&) noexcept = default;
+    snapshot_t& operator=(snapshot_t&&) noexcept = default;
+    ~snapshot_t() noexcept { ustore_snapshot_free(snapshot_); }
 
     /** Exports the snapshot as a new database at @p path. */
     status_t export_to(ustore_str_view_t path) noexcept {
@@ -250,14 +244,12 @@ class context_t {
         ustore_snapshot_export_t snapshot_export {};
         snapshot_export.db = database_;
         snapshot_export.error = &error;
-        snapshot_export.id = snapshot_;
+        snapshot_export.snapshot = snapshot_;
         snapshot_export.path = path;
         ustore_snapshot_export(&snapshot_export);
         return status_t {error};
     }
 };
-
-using transaction_t = context_t;
 
 /** A database as a transactional map from collection names to collections of binary values.
  *  It is thread-safe except for @c open and @c close, never copies, and outlives its collections. */
@@ -344,28 +336,18 @@ class database_t {
         return context_t {database_, raw};
     }
 
-    expected<context_t> snapshot() noexcept {
+    /** Pins a point-in-time view of the database, which the returned snapshot frees when it goes. */
+    expected<snapshot_t> snapshot() noexcept {
         ustore_error_t error {};
-        ustore_snapshot_t raw = {};
-        ustore_snapshot_create_t snapshot_create {
+        ustore_snapshot_t raw = nullptr;
+        ustore_snapshot_init_t snapshot_init {
             .db = database_,
             .error = &error,
-            .id = &raw,
+            .snapshot = &raw,
         };
-        ustore_snapshot_create(&snapshot_create);
+        ustore_snapshot_init(&snapshot_init);
         if (error.status) return status_t {error};
-        return context_t {database_, nullptr, raw};
-    }
-
-    status_t drop_snapshot(ustore_snapshot_t id) noexcept {
-        ustore_error_t error {};
-        ustore_snapshot_drop_t snapshot_drop {
-            .db = database_,
-            .error = &error,
-            .id = id,
-        };
-        ustore_snapshot_drop(&snapshot_drop);
-        return status_t {error};
+        return snapshot_t {database_, raw};
     }
 
     template <typename collection_ = blobs_collection_t>
@@ -381,14 +363,14 @@ class database_t {
     template <typename collection_ = blobs_collection_t>
     expected<collection_> create(std::string_view name, ustore_modality_t modality = ustore_modality_any_k) noexcept {
         ustore_error_t error {};
-        ustore_collection_t collection = ustore_collection_main_k;
+        ustore_collection_id_t collection = ustore_collection_main_k;
         ustore_collection_create_t create {};
         create.db = database_;
         create.error = &error;
         create.name = name.data();
         create.name_length = static_cast<ustore_length_t>(name.size());
         create.modality = modality;
-        create.id = &collection;
+        create.collection = &collection;
         ustore_collection_create(&create);
         if (error.status) return status_t {error};
         return collection_ {database_, collection, nullptr};
@@ -418,28 +400,17 @@ class database_t {
         ustore_collection_drop_t drop {};
         drop.db = database_;
         drop.error = &error;
-        drop.id = collection;
+        drop.collection = collection;
         drop.mode = ustore_drop_keys_vals_handle_k;
         ustore_collection_drop(&drop);
         return status_t {error};
     }
 
-    /** Drops every snapshot and every collection, whose names go with them, then empties the main collection. */
+    /** Drops every collection, whose names go with them, then empties the main collection. Snapshots belong to
+     *  their holders and stay. */
     status_t clear() noexcept {
         context_t context {database_, nullptr};
         ustore_error_t error {};
-
-        auto [snapshot_ids, list_snapshots_status] = context.snapshots();
-        if (list_snapshots_status.failed()) return list_snapshots_status;
-
-        ustore_snapshot_drop_t snapshot_drop {};
-        snapshot_drop.db = database_;
-        snapshot_drop.error = &error;
-        for (ustore_snapshot_t const id : snapshot_ids) {
-            snapshot_drop.id = id;
-            ustore_snapshot_drop(&snapshot_drop);
-            if (error.status) return status_t {error};
-        }
 
         auto [collection_ids, list_collections_status] = context.collections();
         if (list_collections_status.failed()) return list_collections_status;
@@ -448,13 +419,13 @@ class database_t {
         collection_drop.db = database_;
         collection_drop.error = &error;
         collection_drop.mode = ustore_drop_keys_vals_handle_k;
-        for (ustore_collection_t const id : collection_ids) {
-            collection_drop.id = id;
+        for (ustore_collection_id_t const collection : collection_ids) {
+            collection_drop.collection = collection;
             ustore_collection_drop(&collection_drop);
             if (error.status) return status_t {error};
         }
 
-        collection_drop.id = ustore_collection_main_k;
+        collection_drop.collection = ustore_collection_main_k;
         collection_drop.mode = ustore_drop_keys_vals_k;
         ustore_collection_drop(&collection_drop);
         return status_t {error};

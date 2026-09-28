@@ -92,8 +92,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     if feature_enabled("leveldb") {
         println!("cargo:rustc-link-lib=static=leveldb");
     }
-    // The NVMe engine draws the entropy of its identifiers from `BCryptGenRandom` on Windows.
-    if feature_enabled("nvme") && target_os == "windows" {
+    // Collection identifiers draw their entropy from `BCryptGenRandom` on Windows.
+    if target_os == "windows" {
         println!("cargo:rustc-link-lib=dylib=bcrypt");
     }
     println!("cargo:rustc-link-lib=static={fmt}");

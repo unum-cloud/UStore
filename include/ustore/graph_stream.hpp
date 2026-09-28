@@ -10,7 +10,6 @@
 #include <cstddef> // `std::size_t`, `std::ptrdiff_t`
 
 #include <iterator> // `std::forward_iterator_tag`
-#include <limits>   // `std::numeric_limits`
 
 #include <ustore/blobs_range.hpp> // `keys_stream_t`
 #include <ustore/graph.h>
@@ -25,7 +24,7 @@ namespace unum::ustore {
 class graph_stream_t {
 
     ustore_database_t database_ {nullptr};
-    ustore_collection_t collection_ {ustore_collection_main_k};
+    ustore_collection_id_t collection_ {ustore_collection_main_k};
     ustore_transaction_t transaction_ {nullptr};
     ustore_snapshot_t snapshot_ {};
     ustore_vertex_role_t role_ = ustore_vertex_role_any_k;
@@ -78,7 +77,7 @@ class graph_stream_t {
 
     static constexpr std::size_t default_read_ahead_k = 256;
 
-    graph_stream_t(ustore_database_t database, ustore_collection_t collection = ustore_collection_main_k,
+    graph_stream_t(ustore_database_t database, ustore_collection_id_t collection = ustore_collection_main_k,
                    ustore_transaction_t transaction = nullptr, ustore_snapshot_t snapshot = 0,
                    std::size_t read_ahead_vertices = keys_stream_t::default_read_ahead_k,
                    ustore_vertex_role_t role = ustore_vertex_role_any_k) noexcept
@@ -111,7 +110,7 @@ class graph_stream_t {
 
     edge_t edge() const noexcept { return fetched_edges_[fetched_offset_]; }
     edge_t operator*() const noexcept { return edge(); }
-    status_t seek_to_first() noexcept { return seek(std::numeric_limits<ustore_key_t>::min()); }
+    status_t seek_to_first() noexcept { return seek(smallest_key_k); }
     status_t seek_to_next_batch() noexcept {
         if (status_t const sought = vertex_stream_.seek_to_next_batch(); sought.failed()) return sought;
         return prefetch_gather();

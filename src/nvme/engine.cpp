@@ -55,8 +55,9 @@ namespace unum::ustore::nvme {
 
 #pragma region Store
 
-/** The key every collection of this engine is addressed by, which is the key of the C ABI. */
-using stored_key_t = ustore_key_t;
+/** The key every collection of this engine stores, a 64-bit integer onto which the keys of the C ABI whose first eight
+ *  bytes are zero map, until NVMe stores sixteen-byte keys itself. */
+using stored_key_t = std::int64_t;
 
 /** The store every call runs against, whose volumes live in files. */
 using store_t = database<stored_key_t>;
@@ -184,7 +185,7 @@ struct opened_transaction_t : handle_t {
 #pragma region Strings and Names
 
 /** The collection @c nvme/strings.cpp keeps the names of collections in, above every identifier handed out. */
-extern ustore_collection_t const names_collection_k;
+extern ustore_collection_id_t const names_collection_k;
 
 // Laid over NVMe's keyed calls in `nvme/strings.cpp`, until NVMe keys strings and names itself
 void strings_write(ustore_strings_write_t& arguments) noexcept;
@@ -203,12 +204,47 @@ void with_names(arguments_type_& arguments) noexcept {
 
 #pragma endregion Strings and Names
 
-/** The number @p collection resolves to in @p database, reserved identifiers included. */
+/** The number @p collection resolves to in @p database, reserved identifiers included, or the invalid number for an
+ *  identifier this engine never hands out. */
 [[nodiscard]] inline collection_numeric_id_t numbered(opened_database_t const& database,
-                                                      ustore_collection_t collection) noexcept {
+                                                      ustore_collection_id_t collection) noexcept {
     if (collection == ustore_collection_main_k) return database.main;
     if (collection == names_collection_k) return database.names;
-    return static_cast<collection_numeric_id_t>(collection);
+    auto [numeric_id, numeric_status] = uuid_to_integer(collection.uuid);
+    if (numeric_status.failed() || !std::in_range<collection_numeric_id_t>(numeric_id))
+        return collection_invalid_numeric_id_k;
+    return static_cast<collection_numeric_id_t>(numeric_id);
+}
+
+/** The identifier the C ABI names the collection @p numeric_id by, which spells the number until NVMe mints UUIDv7s. */
+[[nodiscard]] inline ustore_collection_id_t collection_id_of(collection_numeric_id_t numeric_id) noexcept {
+    return {uuid_from_integer(static_cast<std::uint64_t>(numeric_id))};
+}
+
+/** The bit whose flip turns the unsigned lower half of a key into a signed stored key of the same order. */
+constexpr std::uint64_t sign_bit_k = std::uint64_t {1} << 63;
+
+/** Whether @p key maps onto a stored key, which only a key with its first eight bytes zero does. */
+[[nodiscard]] inline bool storable(ustore_key_t const& key) noexcept { return uuid_to_integer(key.uuid).has_value(); }
+
+/** The stored key of @p key, which the call has checked is @c storable. */
+[[nodiscard]] inline stored_key_t stored_of(ustore_key_t const& key) noexcept {
+    return static_cast<stored_key_t>(*uuid_to_integer(key.uuid) ^ sign_bit_k);
+}
+
+/** The key of the C ABI that @p stored maps back onto. */
+[[nodiscard]] inline ustore_key_t key_of_stored(stored_key_t stored) noexcept {
+    return key_from_integer(static_cast<std::uint64_t>(stored) ^ sign_bit_k);
+}
+
+/** Refuses a batch naming a key NVMe can't store yet, answering whether it refused. */
+[[nodiscard]] inline bool refuse_wide_keys(places_arg_t const& places, ustore_error_t* error) noexcept {
+    for (std::size_t index = 0; index != places.size(); ++index)
+        if (!storable(places[index].key)) {
+            *error = {ustore_error_unsupported_k, "NVMe keys fit 64 bits for now"};
+            return true;
+        }
+    return false;
 }
 
 /** Whether @p numeric_id names one of the two collections the engine reserves for itself. */
@@ -542,7 +578,7 @@ inline status_t group_places(opened_database_t const& database, places_arg_t con
             if (groups.push_back(std::move(fresh)) != st::status_t::success_k)
                 return {status_code_t::out_of_memory_k, "A batch could not hold another collection"};
         }
-        if (groups[found].keys.push_back(stored_key_t {place.key}) != st::status_t::success_k ||
+        if (groups[found].keys.push_back(stored_of(place.key)) != st::status_t::success_k ||
             groups[found].requests.push_back(std::size_t {index}) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A batch could not hold another key"};
     }
@@ -623,7 +659,7 @@ inline status_t read_through_transaction(opened_database_t const& database, open
         stored_value_size_t size = 0;
         std::span<byte_t> const into = tape.subspan(starts[index], lengths[index]);
         if (status_t const read = read_through(*transaction.held, schedule, numbered(database, place.collection),
-                                               place.key, into, size);
+                                               stored_of(place.key), into, size);
             read.failed())
             return read;
     }
@@ -643,8 +679,8 @@ inline status_t read_through_transaction(opened_database_t const& database, open
 inline status_t stage_one(opened_database_t const& database, store_transaction_t& handler, watch_schedule_t schedule,
                           place_t place, value_view_t content) noexcept {
     collection_numeric_id_t const numeric_id = numbered(database, place.collection);
-    if (content) return write_through(handler, schedule, numeric_id, place.key, bytes_of(content));
-    return erase_through(handler, schedule, numeric_id, place.key);
+    if (content) return write_through(handler, schedule, numeric_id, stored_of(place.key), bytes_of(content));
+    return erase_through(handler, schedule, numeric_id, stored_of(place.key));
 }
 
 /**
@@ -913,7 +949,7 @@ void database_init(ustore_database_init_nvme_t& arguments) noexcept {
         *arguments.error = open_database_status;
         return;
     }
-    *arguments.db = static_cast<handle_t*>(opened);
+    *arguments.db = c_handle<ustore_database_t>(opened);
 }
 
 void database_capabilities(ustore_database_capabilities_t& arguments) noexcept {
@@ -932,7 +968,7 @@ void read(ustore_read_t& arguments) noexcept {
     }
     places_arg_t const places = places_of(arguments);
     validate_read(arguments.transaction, places, arguments.options, arguments.error);
-    if (arguments.error->status) return;
+    if (arguments.error->status || refuse_wide_keys(places, arguments.error)) return;
     if (arguments.snapshot) {
         *arguments.error = {ustore_error_unsupported_k, "This engine keeps no snapshots"};
         return;
@@ -958,7 +994,8 @@ void read(ustore_read_t& arguments) noexcept {
     std::size_t used = 0;
     for (std::size_t index = 0; index != places.size(); ++index) {
         place_t const place = places[index];
-        measured[index] = measured_length(database, transaction, numbered(database, place.collection), place.key);
+        measured[index] = measured_length(database, transaction, numbered(database, place.collection),
+                                          stored_of(place.key));
         starts[index] = static_cast<ustore_length_t>(used);
         presences[index] = measured[index] != ustore_length_missing_k;
         offsets[index] = static_cast<ustore_length_t>(used);
@@ -995,7 +1032,7 @@ void write(ustore_write_t& arguments) noexcept {
     places_arg_t const places = places_of(arguments);
     contents_arg_t const contents = contents_of(arguments);
     validate_write(arguments.transaction, places, contents, arguments.options, arguments.error);
-    if (arguments.error->status) return;
+    if (arguments.error->status || refuse_wide_keys(places, arguments.error)) return;
 
     opened_database_t& database = database_of(arguments.db);
     if (opened_transaction_t* const transaction = transaction_of(arguments.transaction)) {
@@ -1043,11 +1080,17 @@ void scan(ustore_scan_t& arguments) noexcept {
     for (std::size_t task = 0; task != scans.size(); ++task) {
         scan_t const scan = scans[task];
         std::size_t const first = tape.size();
+
+        // A key past the storable ones sorts after every stored key, so a scan from it finds nothing
+        if (!storable(scan.min_key)) {
+            tape.close_task(task, first);
+            continue;
+        }
         status_t const walked = walk_collection(
-            taken, numbered(database, scan.collection), scan.min_key,
+            taken, numbered(database, scan.collection), stored_of(scan.min_key),
             [&](stored_key_t key, select_result_t state, stored_value_size_t) noexcept -> walk_control_t {
                 if (state != select_result_t::success_k) return walk_control_t::resume_k;
-                if (tape.push(key) == walk_control_t::halt_k) return walk_control_t::halt_k;
+                if (tape.push(key_of_stored(key)) == walk_control_t::halt_k) return walk_control_t::halt_k;
                 return tape.size() - first == scan.limit ? walk_control_t::halt_k : walk_control_t::resume_k;
             });
         if (reported_failure(walked, arguments.error) || arguments.error->status) return;
@@ -1094,8 +1137,8 @@ void sample(ustore_sample_t& arguments) noexcept {
                 std::size_t const slot = seen < sample.limit ? seen : generator() % (seen + 1);
                 ++seen;
                 if (slot >= sample.limit) return walk_control_t::resume_k;
-                if (slot == tape.size() - first) return tape.push(key);
-                tape[first + slot] = key;
+                if (slot == tape.size() - first) return tape.push(key_of_stored(key));
+                tape[first + slot] = key_of_stored(key);
                 return walk_control_t::resume_k;
             });
         if (reported_failure(walked, arguments.error) || arguments.error->status) return;
@@ -1137,7 +1180,8 @@ void measure(ustore_measure_t& arguments) noexcept {
                                                                                      arguments.max_space_usages);
     if (arguments.error->status) return;
 
-    strided_iterator<ustore_collection_t const> const collections {arguments.collections, arguments.collections_stride};
+    strided_iterator<ustore_collection_id_t const> const collections {arguments.collections,
+                                                                      arguments.collections_stride};
     strided_iterator<ustore_key_t const> const start_keys {arguments.start_keys, arguments.start_keys_stride};
     strided_iterator<ustore_key_t const> const end_keys {arguments.end_keys, arguments.end_keys_stride};
 
@@ -1145,20 +1189,27 @@ void measure(ustore_measure_t& arguments) noexcept {
     if (reported_failure(take_snapshot_status, arguments.error)) return;
     for (std::size_t task = 0; task != count; ++task) {
         auto const index = static_cast<std::ptrdiff_t>(task);
-        ustore_collection_t const collection = collections ? collections[index] : ustore_collection_main_k;
-        stored_key_t const lower = start_keys ? start_keys[index] : limit<stored_key_t>::min();
-        stored_key_t const last = end_keys ? end_keys[index] : limit<stored_key_t>::max();
+        ustore_collection_id_t const collection = collections ? collections[index] : ustore_collection_main_k;
+
+        // A bound past the storable keys sorts after every stored key: a window starting there holds nothing, and one
+        // ending there runs to the last stored key
+        bool const beyond = start_keys && !storable(start_keys[index]);
+        stored_key_t const lower = start_keys && !beyond ? stored_of(start_keys[index]) : limit<stored_key_t>::min();
+        stored_key_t const last = end_keys && storable(end_keys[index]) ? stored_of(end_keys[index])
+                                                                        : limit<stored_key_t>::max();
         std::size_t cardinality = 0;
         std::size_t value_bytes = 0;
-        status_t const walked = walk_collection(
-            taken, numbered(database, collection), lower,
-            [&](stored_key_t key, select_result_t state, stored_value_size_t size) noexcept -> walk_control_t {
-                if (last < key) return walk_control_t::halt_k;
-                if (state != select_result_t::success_k) return walk_control_t::resume_k;
-                ++cardinality;
-                value_bytes += size;
-                return walk_control_t::resume_k;
-            });
+        status_t const walked = beyond ? status_t {}
+                                       : walk_collection(taken, numbered(database, collection), lower,
+                                                         [&](stored_key_t key, select_result_t state,
+                                                             stored_value_size_t size) noexcept -> walk_control_t {
+                                                             if (last < key) return walk_control_t::halt_k;
+                                                             if (state != select_result_t::success_k)
+                                                                 return walk_control_t::resume_k;
+                                                             ++cardinality;
+                                                             value_bytes += size;
+                                                             return walk_control_t::resume_k;
+                                                         });
         if (reported_failure(walked, arguments.error)) return;
 
         min_cardinalities[task] = cardinality;
@@ -1189,12 +1240,13 @@ void collection_list(ustore_collection_list_t& arguments) noexcept {
     for (std::size_t index = 0; index != listed.size(); ++index)
         if (!reserved(database, listed[index].numeric_id)) ++named;
 
-    range_or_dummy<std::span<ustore_collection_t>> ids = arena.alloc_or_dummy(named, arguments.error, arguments.ids);
+    range_or_dummy<std::span<ustore_collection_id_t>> collections = arena.alloc_or_dummy(named, arguments.error,
+                                                                                         arguments.collections);
     if (arguments.error->status) return;
     std::size_t written = 0;
     for (std::size_t index = 0; index != listed.size(); ++index)
         if (!reserved(database, listed[index].numeric_id))
-            ids[written++] = static_cast<ustore_collection_t>(listed[index].numeric_id);
+            collections[written++] = collection_id_of(listed[index].numeric_id);
     *arguments.count = static_cast<ustore_size_t>(named);
 }
 
@@ -1203,7 +1255,7 @@ void collection_create(ustore_collection_create_t& arguments) noexcept {
         *arguments.error = {ustore_error_uninitialized_k, "The database is uninitialized"};
         return;
     }
-    if (!arguments.id) {
+    if (!arguments.collection) {
         *arguments.error = {ustore_error_invalid_argument_k, "Need an output for the collection"};
         return;
     }
@@ -1222,7 +1274,7 @@ void collection_create(ustore_collection_create_t& arguments) noexcept {
     auto [created, create_collection_status] = database.store->create_collection(string_view_t {name},
                                                                                  create_collection_config(shape));
     if (reported_failure(create_collection_status, arguments.error)) return;
-    *arguments.id = static_cast<ustore_collection_t>(created);
+    *arguments.collection = collection_id_of(created);
 }
 
 void collection_drop(ustore_collection_drop_t& arguments) noexcept {
@@ -1237,7 +1289,7 @@ void collection_drop(ustore_collection_drop_t& arguments) noexcept {
     }
 
     opened_database_t& database = database_of(arguments.db);
-    collection_numeric_id_t const numeric_id = numbered(database, arguments.id);
+    collection_numeric_id_t const numeric_id = numbered(database, arguments.collection);
     if (arguments.mode == ustore_drop_keys_vals_handle_k) {
         if (reserved(database, numeric_id)) {
             *arguments.error = {ustore_error_invalid_argument_k, "This collection can only be cleared"};
@@ -1249,20 +1301,7 @@ void collection_drop(ustore_collection_drop_t& arguments) noexcept {
     reported_failure(empty_collection(database, numeric_id, arguments.mode), arguments.error);
 }
 
-void snapshot_list(ustore_snapshot_list_t& arguments) noexcept {
-    if (!arguments.db) {
-        *arguments.error = {ustore_error_uninitialized_k, "The database is uninitialized"};
-        return;
-    }
-    if (!arguments.count) {
-        *arguments.error = {ustore_error_invalid_argument_k, "Need an output for the count"};
-        return;
-    }
-    *arguments.count = 0;
-    if (arguments.ids) *arguments.ids = nullptr;
-}
-
-void snapshot_create(ustore_snapshot_create_t& arguments) noexcept {
+void snapshot_init(ustore_snapshot_init_t& arguments) noexcept {
     *arguments.error = {ustore_error_unsupported_k, "This engine keeps no snapshots"};
 }
 
@@ -1270,9 +1309,8 @@ void snapshot_export(ustore_snapshot_export_t& arguments) noexcept {
     *arguments.error = {ustore_error_unsupported_k, "This engine keeps no snapshots"};
 }
 
-void snapshot_drop(ustore_snapshot_drop_t& arguments) noexcept {
-    *arguments.error = {ustore_error_unsupported_k, "This engine keeps no snapshots"};
-}
+/** Frees nothing, as the engine never hands a snapshot out. */
+void snapshot_free(ustore_snapshot_t) noexcept {}
 
 void transaction_init(ustore_transaction_init_t& arguments) noexcept {
     if (!arguments.db) {
@@ -1298,7 +1336,7 @@ void transaction_init(ustore_transaction_init_t& arguments) noexcept {
         *arguments.error = {ustore_error_out_of_memory_k, "Failed to allocate the transaction"};
         return;
     }
-    *arguments.transaction = static_cast<handle_t*>(opened);
+    *arguments.transaction = c_handle<ustore_transaction_t>(opened);
 }
 
 void transaction_stage(ustore_transaction_stage_t& arguments) noexcept {
@@ -1308,7 +1346,7 @@ void transaction_stage(ustore_transaction_stage_t& arguments) noexcept {
     }
     opened_transaction_t& transaction = *transaction_of(arguments.transaction);
     if (reported_failure(transaction.held->stage(), arguments.error)) return;
-    if (arguments.sequence_number) *arguments.sequence_number = transaction.held->last_stage_stamp();
+    if (arguments.stamp) *arguments.stamp = transaction.held->last_stage_stamp();
 }
 
 void transaction_commit(ustore_transaction_commit_t& arguments) noexcept {
@@ -1317,7 +1355,7 @@ void transaction_commit(ustore_transaction_commit_t& arguments) noexcept {
 
     opened_transaction_t& transaction = *transaction_of(arguments.transaction);
     if (reported_failure(transaction.held->commit(), arguments.error)) return;
-    if (arguments.sequence_number) *arguments.sequence_number = transaction.held->last_commit_stamp();
+    if (arguments.stamp) *arguments.stamp = transaction.held->last_commit_stamp();
     if (!(arguments.options & ustore_option_write_flush_k)) return;
     reported_failure(transaction.database->store->flush(), arguments.error);
 }
@@ -1397,10 +1435,8 @@ void database_free(ustore_database_t c_database) noexcept {
 engine_t const engine_k {
     .database_capabilities = &database_capabilities,
     .database_control = &database_control,
-    .snapshot_list = &snapshot_list,
-    .snapshot_create = &snapshot_create,
+    .snapshot_init = &snapshot_init,
     .snapshot_export = &snapshot_export,
-    .snapshot_drop = &snapshot_drop,
     .read = &read,
     .write = &write,
     .scan = &scan,
@@ -1413,10 +1449,16 @@ engine_t const engine_k {
     .strings_write = &strings_write,
     .strings_read = &strings_read,
     .strings_scan = &strings_scan,
+    .graph_find_edges = &graph_find_edges_in_vertex_values,
+    .graph_upsert_edges = &graph_upsert_edges_in_vertex_values,
+    .graph_remove_edges = &graph_remove_edges_in_vertex_values,
+    .graph_upsert_vertices = &graph_upsert_vertices_in_vertex_values,
+    .graph_remove_vertices = &graph_remove_vertices_in_vertex_values,
     .transaction_init = &transaction_init,
     .transaction_stage = &transaction_stage,
     .transaction_commit = &transaction_commit,
     .transaction_free = &transaction_free,
+    .snapshot_free = &snapshot_free,
     .database_free = &database_free,
 };
 

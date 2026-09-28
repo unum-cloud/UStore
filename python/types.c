@@ -232,50 +232,198 @@ void ustore_py_arena_return(Database* database, ustore_arena_t arena) {
 
 #pragma region Keys
 
-int ustore_py_key_from_object(PyObject* object, ustore_key_t* key) {
-    // `PyIndex_Check` rather than `PyLong_Check`, so a NumPy scalar - which is not a Python
-    // integer but knows how to become one - is read the same way a literal is.
-    if (!PyIndex_Check(object)) {
-        PyErr_Format(PyExc_TypeError, "Cannot read a key from %S", Py_TYPE(object));
-        return -1;
+PyObject* UUIDType = NULL;
+
+/** Writes @p high then @p low big-endian into @p uuid, which is how an integer spells as a UUID. */
+static void uuid_from_halves(unsigned long long high, unsigned long long low, ustore_uuid_t* uuid) {
+    for (int byte_index = 7; byte_index >= 0; --byte_index, high >>= 8, low >>= 8) {
+        uuid->bytes[byte_index] = (uint8_t)(high & 0xFF);
+        uuid->bytes[byte_index + 8] = (uint8_t)(low & 0xFF);
     }
+}
+
+/** Reads a non-negative integer below 2**128 into @p uuid, as `uuid.UUID(int=n)` spells it. */
+static int uuid_from_integer(PyObject* object, ustore_uuid_t* uuid) {
     PyObject* const integer = PyNumber_Index(object);
     if (!integer) return -1;
-    long long const value = PyLong_AsLongLong(integer);
+    unsigned long long low = PyLong_AsUnsignedLongLong(integer);
+    unsigned long long high = 0;
+    if (low == (unsigned long long)-1 && PyErr_Occurred()) {
+        if (!PyErr_ExceptionMatches(PyExc_OverflowError)) {
+            Py_DECREF(integer);
+            return -1;
+        }
+        // Past 64 bits or negative, and a negative integer keeps a negative upper half, which refuses too
+        PyErr_Clear();
+        PyObject* const shift = PyLong_FromLong(64);
+        PyObject* const upper = shift ? PyNumber_Rshift(integer, shift) : NULL;
+        Py_XDECREF(shift);
+        high = upper ? PyLong_AsUnsignedLongLong(upper) : (unsigned long long)-1;
+        Py_XDECREF(upper);
+        if (high == (unsigned long long)-1 && PyErr_Occurred()) {
+            Py_DECREF(integer);
+            return ustore_py_raise_from_cause(PyExc_OverflowError, "A key must be an integer in [0, 2**128)");
+        }
+        low = PyLong_AsUnsignedLongLongMask(integer);
+    }
     Py_DECREF(integer);
-    if (value == -1 && PyErr_Occurred())
-        return ustore_py_raise_from_cause(PyExc_OverflowError, "A key must fit a signed 64-bit integer");
-    *key = (ustore_key_t)value;
+    if (low == (unsigned long long)-1 && PyErr_Occurred()) return -1;
+    uuid_from_halves(high, low, uuid);
     return 0;
 }
 
-/** Whether a buffer of @p format and @p itemsize holds keys this binding can read in place. */
-static int format_holds_keys(char const* format, Py_ssize_t itemsize) {
-    if (itemsize != (Py_ssize_t)sizeof(ustore_key_t)) return 0;
-    if (!format) return 0;
-    // Unsigned spellings are read as the signed keys they alias, which is what a caller holding a
-    // `uint64` array of identifiers means by them.
+/** Copies the sixteen bytes a `uuid.UUID` holds, which its `bytes` attribute spells big-endian. */
+static int uuid_from_uuid(PyObject* object, ustore_uuid_t* uuid) {
+    PyObject* const bytes = PyObject_GetAttrString(object, "bytes");
+    if (!bytes) return -1;
+    int const sized = PyBytes_Check(bytes) && PyBytes_GET_SIZE(bytes) == (Py_ssize_t)sizeof(uuid->bytes);
+    if (sized) memcpy(uuid->bytes, PyBytes_AS_STRING(bytes), sizeof(uuid->bytes));
+    Py_DECREF(bytes);
+    if (!sized) PyErr_SetString(PyExc_TypeError, "A UUID must hold sixteen bytes");
+    return sized ? 0 : -1;
+}
+
+int ustore_py_uuid_from_object(PyObject* object, ustore_uuid_t* uuid) {
+    if (PyObject_TypeCheck(object, (PyTypeObject*)UUIDType)) return uuid_from_uuid(object, uuid);
+    if (PyUnicode_Check(object)) {
+        // `uuid.UUID` parses every spelling Python itself accepts, so the text is handed to it
+        PyObject* const parsed = PyObject_CallOneArg(UUIDType, object);
+        if (!parsed) return ustore_py_raise_from_cause(PyExc_ValueError, "Cannot read a UUID from %R", object);
+        int const read = uuid_from_uuid(parsed, uuid);
+        Py_DECREF(parsed);
+        return read;
+    }
+    // `PyIndex_Check` rather than `PyLong_Check`, so a NumPy scalar - which is not a Python
+    // integer but knows how to become one - is read the same way a literal is, while an array,
+    // which exports an index too, is a sequence and falls through to the bytes it holds.
+    if (PyIndex_Check(object) && !PySequence_Check(object)) return uuid_from_integer(object, uuid);
+    if (PyObject_CheckBuffer(object)) {
+        Py_buffer buffer;
+        if (PyObject_GetBuffer(object, &buffer, PyBUF_SIMPLE) != 0) return -1;
+        int const sized = buffer.len == (Py_ssize_t)sizeof(uuid->bytes);
+        if (sized) memcpy(uuid->bytes, buffer.buf, sizeof(uuid->bytes));
+        PyBuffer_Release(&buffer);
+        if (sized) return 0;
+        PyErr_Format(PyExc_ValueError, "A UUID spelled as bytes takes sixteen of them, not %zd", buffer.len);
+        return -1;
+    }
+    PyErr_Format(PyExc_TypeError, "Cannot read a UUID from %S", Py_TYPE(object));
+    return -1;
+}
+
+/** The keyword `uuid.UUID` reads raw bytes through, built once beside @c UUIDType. */
+static PyObject* uuid_bytes_keyword = NULL;
+
+int ustore_py_uuid_import(void) {
+    if (UUIDType) return 0;
+    PyObject* const uuid_module = PyImport_ImportModule("uuid");
+    if (!uuid_module) return -1;
+    UUIDType = PyObject_GetAttrString(uuid_module, "UUID");
+    Py_DECREF(uuid_module);
+    if (!UUIDType) return -1;
+    PyObject* const keyword = PyUnicode_InternFromString("bytes");
+    uuid_bytes_keyword = keyword ? PyTuple_Pack(1, keyword) : NULL;
+    Py_XDECREF(keyword);
+    if (uuid_bytes_keyword) return 0;
+    Py_CLEAR(UUIDType);
+    return -1;
+}
+
+PyObject* ustore_py_uuid_to_object(ustore_uuid_t const* uuid) {
+    PyObject* const bytes = PyBytes_FromStringAndSize((char const*)uuid->bytes, (Py_ssize_t)sizeof(uuid->bytes));
+    if (!bytes) return NULL;
+    // The slot before the arguments is scratch the callee may borrow, as the offset flag permits.
+    PyObject* arguments[2] = {NULL, bytes};
+    PyObject* const object = PyObject_Vectorcall(UUIDType, arguments + 1, PY_VECTORCALL_ARGUMENTS_OFFSET,
+                                                 uuid_bytes_keyword);
+    Py_DECREF(bytes);
+    return object;
+}
+
+int ustore_py_key_from_object(PyObject* object, ustore_key_t* key) {
+    return ustore_py_uuid_from_object(object, &key->uuid);
+}
+
+int ustore_py_is_one_key(PyObject* object) {
+    if (PyObject_TypeCheck(object, (PyTypeObject*)UUIDType)) return 1;
+    if (PyUnicode_Check(object) || PyBytes_Check(object) || PyByteArray_Check(object)) return 1;
+    // An array exports an index too, so only something that is not a sequence reads as one key.
+    return PyIndex_Check(object) && !PySequence_Check(object);
+}
+
+/** Whether a buffer lays out 16-byte keys, one per item or one per row of sixteen bytes. */
+static int buffer_holds_keys(Py_buffer const* buffer) {
+    if (buffer->ndim == 1) return buffer->itemsize == (Py_ssize_t)sizeof(ustore_key_t);
+    return buffer->ndim == 2 && buffer->itemsize == 1 && buffer->shape[1] == (Py_ssize_t)sizeof(ustore_key_t);
+}
+
+/** Whether a buffer lays out 64-bit integers, which convert into keys one by one. */
+static int buffer_holds_integers(Py_buffer const* buffer) {
+    if (buffer->ndim != 1 || buffer->itemsize != 8 || !buffer->format) return 0;
+    char const* const format = buffer->format[0] == '@' || buffer->format[0] == '=' ? buffer->format + 1
+                                                                                    : buffer->format;
     static char const readable[] = "qQlLnN";
     return format[0] != '\0' && format[1] == '\0' && strchr(readable, format[0]) != NULL;
 }
 
-/** Whether a batch of keys travels as a borrowed buffer or converts element by element. */
+/** Points @p batch at storage for @p count keys: the inline run, or one allocation past it. */
+static int keys_reserve(ustore_py_keys_t* batch, size_t count) {
+    if (count == 0) batch->keys = NULL;
+    else if (count <= ustore_py_keys_inline_k) batch->keys = batch->inline_keys;
+    else {
+        batch->owned = (ustore_key_t*)PyMem_Malloc(count * sizeof(ustore_key_t));
+        if (!batch->owned) {
+            PyErr_NoMemory();
+            return -1;
+        }
+        batch->keys = batch->owned;
+    }
+    batch->count = count;
+    return 0;
+}
+
+/** Converts a buffer of 64-bit integers into keys, refusing a negative signed one. */
+static int keys_from_integers(Py_buffer const* buffer, ustore_py_keys_t* batch) {
+    char const kind = buffer->format[0] == '@' || buffer->format[0] == '=' ? buffer->format[1] : buffer->format[0];
+    int const is_signed = kind == 'q' || kind == 'l' || kind == 'n';
+    size_t const count = (size_t)buffer->shape[0];
+    if (keys_reserve(batch, count) != 0) return -1;
+    char const* const items = (char const*)buffer->buf;
+    for (size_t index = 0; index != count; ++index) {
+        uint64_t value = 0;
+        memcpy(&value, items + index * 8, sizeof(value));
+        if (is_signed && (int64_t)value < 0) {
+            PyErr_SetString(PyExc_OverflowError, "A key must be an integer in [0, 2**128)");
+            return -1;
+        }
+        uuid_from_halves(0, value, &batch->keys[index].uuid);
+    }
+    return 0;
+}
+
+/** Whether a batch of keys travels as a borrowed buffer, converts from one, or reads element by element. */
 typedef enum keys_route_t {
 
-    /** A contiguous run of 64-bit keys the batch borrows outright. */
+    /** A contiguous run of 16-byte keys the batch borrows outright. */
     keys_route_borrowed_k,
 
-    /** Not that layout, so each element converts on its own terms. */
+    /** A contiguous run of 64-bit integers, converted into keys and released. */
+    keys_route_converted_k,
+
+    /** Not a buffer of either layout, so each element converts on its own terms. */
     keys_route_sequence_k,
+
+    /** The conversion failed, with an exception set. */
+    keys_route_failed_k,
 } keys_route_t;
 
 /**
- *  @brief Tries the zero-copy route, falling back to a per-element conversion otherwise.
+ *  @brief Tries the buffer routes, falling back to a per-element conversion otherwise.
  *
  *  Only the failure the buffer request itself provoked is cleared, so nothing an exporter raised on
  *  its own behalf is swallowed.
  */
-static keys_route_t keys_borrow_buffer(PyObject* object, ustore_py_keys_t* batch) {
+static keys_route_t keys_from_buffer(PyObject* object, ustore_py_keys_t* batch) {
     if (!PyObject_CheckBuffer(object)) return keys_route_sequence_k;
     if (PyObject_GetBuffer(object, &batch->buffer, PyBUF_C_CONTIGUOUS | PyBUF_FORMAT) != 0) {
         PyErr_Clear();
@@ -283,40 +431,45 @@ static keys_route_t keys_borrow_buffer(PyObject* object, ustore_py_keys_t* batch
     }
     batch->borrowed = 1;
     Py_buffer const* const buffer = &batch->buffer;
-    if (buffer->ndim != 1 || !format_holds_keys(buffer->format, buffer->itemsize)) {
-        ustore_py_keys_release(batch);
-        return keys_route_sequence_k;
+    if (buffer_holds_keys(buffer)) {
+        batch->count = (size_t)buffer->shape[0];
+        // The ABI spells an empty batch with no keys at all, and refuses an address for no tasks.
+        batch->keys = batch->count ? (ustore_key_t*)buffer->buf : NULL;
+        return keys_route_borrowed_k;
     }
-    batch->count = (size_t)buffer->shape[0];
-    // The ABI spells an empty batch with no keys at all, and refuses an address for no tasks.
-    batch->keys = batch->count ? (ustore_key_t*)buffer->buf : NULL;
-    return keys_route_borrowed_k;
+    if (buffer_holds_integers(buffer)) {
+        int const converted = keys_from_integers(buffer, batch);
+        PyBuffer_Release(&batch->buffer);
+        batch->borrowed = 0;
+        return converted == 0 ? keys_route_converted_k : keys_route_failed_k;
+    }
+    PyBuffer_Release(&batch->buffer);
+    batch->borrowed = 0;
+    return keys_route_sequence_k;
 }
 
 int ustore_py_keys_from_object(PyObject* object, ustore_py_keys_t* batch) {
     memset(batch, 0, sizeof(*batch));
+    // Text and bytes are sequences too, and iterating one would answer a key per character
+    if (ustore_py_is_one_key(object)) {
+        PyErr_Format(PyExc_TypeError, "A batch of keys takes a sequence or a buffer, not one %S", Py_TYPE(object));
+        return -1;
+    }
 
-    switch (keys_borrow_buffer(object, batch)) {
-    case keys_route_borrowed_k: return 0;
+    switch (keys_from_buffer(object, batch)) {
+    case keys_route_borrowed_k:
+    case keys_route_converted_k: return 0;
+    case keys_route_failed_k: ustore_py_keys_release(batch); return -1;
     case keys_route_sequence_k: break;
     }
 
-    PyObject* const sequence = PySequence_Fast(object, "Expected a sequence of keys or a buffer of 64-bit integers");
+    PyObject* const sequence = PySequence_Fast(object, "Expected a sequence of keys or a buffer of keys");
     if (!sequence) return -1;
     Py_ssize_t const count = PySequence_Fast_GET_SIZE(sequence);
-
-    if (count == 0) { batch->keys = NULL; }
-    else if ((size_t)count <= ustore_py_keys_inline_k) { batch->keys = batch->inline_keys; }
-    else {
-        batch->owned = (ustore_key_t*)PyMem_Malloc((size_t)count * sizeof(ustore_key_t));
-        if (!batch->owned) {
-            Py_DECREF(sequence);
-            PyErr_NoMemory();
-            return -1;
-        }
-        batch->keys = batch->owned;
+    if (keys_reserve(batch, (size_t)count) != 0) {
+        Py_DECREF(sequence);
+        return -1;
     }
-
     for (Py_ssize_t entry_index = 0; entry_index != count; ++entry_index)
         if (ustore_py_key_from_object(PySequence_Fast_GET_ITEM(sequence, entry_index), &batch->keys[entry_index]) !=
             0) {
@@ -325,7 +478,6 @@ int ustore_py_keys_from_object(PyObject* object, ustore_py_keys_t* batch) {
             return -1;
         }
     Py_DECREF(sequence);
-    batch->count = (size_t)count;
     return 0;
 }
 
@@ -386,11 +538,6 @@ int ustore_py_contents_borrow(PyObject* object, ustore_py_contents_t* batch) {
     if (PyObject_GetBuffer(object, buffer, PyBUF_SIMPLE) != 0)
         return ustore_py_raise_from_cause(PyExc_TypeError, "A value must be bytes-like or None, not %S",
                                           Py_TYPE(object));
-    if (buffer->len > (Py_ssize_t)UINT32_MAX) {
-        PyBuffer_Release(buffer);
-        PyErr_Format(PyExc_ValueError, "A value spans %zd bytes, past the 4 GiB a length can carry", buffer->len);
-        return -1;
-    }
     ++batch->borrowed;
     batch->values[task] = (ustore_bytes_cptr_t)buffer->buf;
     batch->lengths[task] = (ustore_length_t)buffer->len;
@@ -550,7 +697,7 @@ static PyObject* Values_get_lengths(Values* self, void* Py_UNUSED(closure)) {
     for (size_t task_index = 0; task_index != self->count; ++task_index) {
         ustore_length_t const length = self->lengths[task_index];
         PyObject* const entry = length == ustore_length_missing_k ? Py_NewRef(Py_None)
-                                                                  : PyLong_FromUnsignedLong(length);
+                                                                  : PyLong_FromUnsignedLongLong(length);
         if (!entry) {
             Py_DECREF(lengths);
             return NULL;
@@ -592,12 +739,13 @@ PyTypeObject ValuesType = {
 
 #pragma region Key Tapes
 
-static char const doc_Keys[] =                                                                 //
-    "The keys one batch scan or sample found, read straight out of the arena holding them.\n"  //
-    "\n"                                                                                       //
-    "Indexing answers a `memoryview` of signed 64-bit keys for one task; nothing is copied,\n" //
-    "and the view keeps this object, and therefore the arena, alive for as long as it is\n"    //
-    "held. `list(keys[index])` is where a copy happens, and nowhere before it.";
+static char const doc_Keys[] =                                                                //
+    "The keys one batch scan or sample found, read straight out of the arena holding them.\n" //
+    "\n"                                                                                      //
+    "Indexing answers a tuple of `uuid.UUID` keys for one task, which is where a copy\n"      //
+    "happens. The whole tape exports through the buffer protocol as an array of shape\n"      //
+    "(keys, 16) bytes, so `numpy.asarray(keys)` reads the arena without copying, and keeps\n" //
+    "this object, and therefore the arena, alive for as long as it is held.";
 
 PyObject* ustore_py_keys_adopt(ustore_arena_t arena, ustore_key_t* tape, ustore_length_t* offsets,
                                ustore_length_t* counts, size_t count) {
@@ -611,6 +759,10 @@ PyObject* ustore_py_keys_adopt(ustore_arena_t arena, ustore_key_t* tape, ustore_
     instance->offsets = offsets;
     instance->counts = counts;
     instance->count = count;
+    instance->shape[0] = count ? (Py_ssize_t)offsets[count] : 0;
+    instance->shape[1] = (Py_ssize_t)sizeof(ustore_key_t);
+    instance->strides[0] = (Py_ssize_t)sizeof(ustore_key_t);
+    instance->strides[1] = 1;
     return (PyObject*)instance;
 }
 
@@ -626,16 +778,23 @@ static PyObject* Keys_item(Keys* self, Py_ssize_t task_index) {
         PyErr_SetString(PyExc_IndexError, "Task index out of range");
         return NULL;
     }
-    Py_ssize_t const shape = (Py_ssize_t)self->counts[task_index];
-    return ustore_py_span_view((PyObject*)self, self->tape + self->offsets[task_index], "q", sizeof(ustore_key_t), 1,
-                               &shape);
+    ustore_key_t const* const run = self->tape + self->offsets[task_index];
+    Py_ssize_t const found = (Py_ssize_t)self->counts[task_index];
+    PyObject* const keys = PyTuple_New(found);
+    if (!keys) return NULL;
+    for (Py_ssize_t key_index = 0; key_index != found; ++key_index) {
+        PyObject* const key = ustore_py_uuid_to_object(&run[key_index].uuid);
+        if (!key) {
+            Py_DECREF(keys);
+            return NULL;
+        }
+        PyTuple_SET_ITEM(keys, key_index, key);
+    }
+    return keys;
 }
 
 static int Keys_getbuffer(Keys* self, Py_buffer* view, int flags) {
-    Py_ssize_t const spanned = self->count ? (Py_ssize_t)self->offsets[self->count] * (Py_ssize_t)sizeof(ustore_key_t)
-                                           : 0;
-    void* const data = self->tape ? (void*)self->tape : (void*)self;
-    return PyBuffer_FillInfo(view, (PyObject*)self, data, spanned, 1, flags);
+    return ustore_py_buffer_fill(view, (PyObject*)self, self->tape, "B", 1, 2, self->shape, self->strides, flags);
 }
 
 static PyObject* Keys_repr(Keys* self) {
@@ -650,7 +809,7 @@ static PyObject* Keys_get_counts(Keys* self, void* Py_UNUSED(closure)) {
     PyObject* const counts = PyTuple_New((Py_ssize_t)self->count);
     if (!counts) return NULL;
     for (size_t task_index = 0; task_index != self->count; ++task_index) {
-        PyObject* const entry = PyLong_FromUnsignedLong(self->counts[task_index]);
+        PyObject* const entry = PyLong_FromUnsignedLongLong(self->counts[task_index]);
         if (!entry) {
             Py_DECREF(counts);
             return NULL;
@@ -694,7 +853,14 @@ PyTypeObject KeysType = {
 
 int ustore_py_size_from_object(PyObject* object, char const* field, size_t* value) {
     Py_ssize_t const signed_value = PyNumber_AsSsize_t(object, PyExc_OverflowError);
-    if (signed_value == -1 && PyErr_Occurred()) return -1;
+    if (signed_value == -1 && PyErr_Occurred()) {
+        // A count past the index range is a bad value like a negative one, not an arithmetic failure
+        if (PyErr_ExceptionMatches(PyExc_OverflowError)) {
+            PyErr_Clear();
+            PyErr_Format(PyExc_ValueError, "The '%s' option does not fit an index", field);
+        }
+        return -1;
+    }
     if (signed_value < 0) {
         PyErr_Format(PyExc_ValueError, "The '%s' option must not be negative", field);
         return -1;
@@ -765,7 +931,7 @@ int ustore_py_context_from_object(PyObject* self, ustore_py_context_t* context) 
 
 void ustore_py_verb_options_init(ustore_py_context_t const* context, ustore_py_verb_options_t* options) {
     options->collection = ustore_collection_main_k;
-    options->snapshot = 0;
+    options->snapshot = NULL;
     options->options = context->options;
 }
 
@@ -774,15 +940,30 @@ int ustore_py_verb_option_from_keyword(ustore_py_context_t const* context, PyObj
     if (PyUnicode_CompareWithASCIIString(name, "collection") == 0)
         return ustore_py_collection_from_object(context, value, &options->collection) == 0 ? 1 : -1;
     if (PyUnicode_CompareWithASCIIString(name, "snapshot") == 0) {
-        size_t snapshot = 0;
-        if (ustore_py_size_from_object(value, "snapshot", &snapshot) != 0) return -1;
+        if (value == Py_None) {
+            options->snapshot = NULL;
+            return 1;
+        }
         // A call addresses exactly one view, so a transaction and a snapshot are never both named.
-        if (snapshot && context->transaction) {
+        if (context->transaction) {
             ustore_py_raise(ustore_error_invalid_argument_k,
                             "A transaction already fixes the view, so it takes no snapshot");
             return -1;
         }
-        options->snapshot = (ustore_snapshot_t)snapshot;
+        if (!PyObject_TypeCheck(value, &SnapshotType)) {
+            PyErr_Format(PyExc_TypeError, "The 'snapshot' option must be a Snapshot or None, got %S", Py_TYPE(value));
+            return -1;
+        }
+        Snapshot* const snapshot = (Snapshot*)value;
+        if (!snapshot->handle) {
+            PyErr_SetString(PyExc_ValueError, "The snapshot is closed");
+            return -1;
+        }
+        if (snapshot->database != (PyObject*)context->database) {
+            ustore_py_raise(ustore_error_invalid_argument_k, "The snapshot belongs to another database");
+            return -1;
+        }
+        options->snapshot = snapshot->handle;
         return 1;
     }
     if (PyUnicode_CompareWithASCIIString(name, "flush") == 0) {

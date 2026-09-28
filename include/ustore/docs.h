@@ -71,7 +71,8 @@ typedef enum ustore_doc_modification_t {
 /**
  *  @brief The arguments of @c ustore_docs_write, which writes whole documents or fields inside them.
  *
- *  Without @c keys, the key of every document is read from its @c id_field, which must hold an integer.
+ *  Without @c keys, the key of every document is read from its @c id_field, which must hold a non-negative
+ *  integer, spelled as the key of that integer, or a UUID in canonical text.
  */
 typedef struct ustore_docs_write_t {
 
@@ -100,7 +101,7 @@ typedef struct ustore_docs_write_t {
     ustore_doc_modification_t modification;
 
     /** Collections of the documents, where @c NULL stands for the main collection. */
-    ustore_collection_t const* collections;
+    ustore_collection_id_t const* collections;
 
     /** Bytes between consecutive collections, where zero repeats the first one. */
     ustore_size_t collections_stride;
@@ -166,7 +167,7 @@ typedef struct ustore_docs_read_t {
     /** Transaction that watches the read documents, or @c NULL. */
     ustore_transaction_t transaction;
 
-    /** Snapshot whose view is read. */
+    /** Optional snapshot whose view is read, never set beside a transaction. */
     ustore_snapshot_t snapshot;
 
     /** Reusable memory for the results. */
@@ -182,7 +183,7 @@ typedef struct ustore_docs_read_t {
     ustore_size_t tasks_count;
 
     /** Collections of the documents, where @c NULL stands for the main collection. */
-    ustore_collection_t const* collections;
+    ustore_collection_id_t const* collections;
 
     /** Bytes between consecutive collections, where zero repeats the first one. */
     ustore_size_t collections_stride;
@@ -232,7 +233,7 @@ typedef struct ustore_docs_gist_t {
     /** Transaction that watches the read documents, or @c NULL. */
     ustore_transaction_t transaction;
 
-    /** Snapshot whose view is read. */
+    /** Optional snapshot whose view is read, never set beside a transaction. */
     ustore_snapshot_t snapshot;
 
     /** Reusable memory for the results. */
@@ -245,7 +246,7 @@ typedef struct ustore_docs_gist_t {
     ustore_size_t docs_count;
 
     /** Collections of the documents, where @c NULL stands for the main collection. */
-    ustore_collection_t const* collections;
+    ustore_collection_id_t const* collections;
 
     /** Bytes between consecutive collections, where zero repeats the first one. */
     ustore_size_t collections_stride;
@@ -295,7 +296,7 @@ typedef struct ustore_docs_gather_t {
     /** Transaction that watches the read documents, or @c NULL. */
     ustore_transaction_t transaction;
 
-    /** Snapshot whose view is read. */
+    /** Optional snapshot whose view is read, never set beside a transaction. */
     ustore_snapshot_t snapshot;
 
     /** Reusable memory for the results. */
@@ -311,7 +312,7 @@ typedef struct ustore_docs_gather_t {
     ustore_size_t fields_count;
 
     /** Collections of the documents, where @c NULL stands for the main collection. */
-    ustore_collection_t const* collections;
+    ustore_collection_id_t const* collections;
 
     /** Bytes between consecutive collections, where zero repeats the first one. */
     ustore_size_t collections_stride;

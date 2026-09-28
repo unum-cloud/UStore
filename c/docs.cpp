@@ -716,18 +716,41 @@ static void read_modify_write(ustore_database_t database, ustore_transaction_t t
     ustore_write(&write);
 }
 
-/** Reads the integer key of every document from its @p id_field into @p keys. */
+/** Reads @p text as a UUID in its canonical 8-4-4-4-12 hexadecimal form into @p uuid, answering whether it is one. */
+static bool parse_uuid(std::string_view text, ustore_uuid_t& uuid) noexcept {
+    if (text.size() != 36) return false;
+    std::size_t byte_index = 0;
+    for (std::size_t index = 0; index != text.size();) {
+        if (index == 8 || index == 13 || index == 18 || index == 23) {
+            if (text[index++] != '-') return false;
+            continue;
+        }
+        char const* const pair = text.data() + index;
+        auto const [end, parse_error] = std::from_chars(pair, pair + 2, uuid.bytes[byte_index++], 16);
+        if (parse_error != std::errc {} || end != pair + 2) return false;
+        index += 2;
+    }
+    return true;
+}
+
+/** Reads the key of every document from its @p id_field into @p keys: a non-negative integer, spelled as the key of
+ *  that integer, or a UUID in canonical text. */
 static void extract_keys(contents_arg_t const& contents, ustore_str_view_t id_field, linked_memory_lock_t& arena,
                          std::span<ustore_key_t> keys, ustore_error_t* error) noexcept {
     for (std::size_t index = 0; index != contents.size(); ++index) {
         json_t const document = json_parse(contents[index], arena, error);
         if (error->status) return;
         yyjson_val* const identifier = json_lookup(yyjson_doc_get_root(document.handle), id_field);
-        if (!yyjson_is_int(identifier)) {
-            *error = {ustore_error_malformed_k, "The id field does not hold an integer key"};
+        if (yyjson_is_uint(identifier)) {
+            keys[index] = key_from_integer(yyjson_get_uint(identifier));
+            continue;
+        }
+        bool const is_uuid = yyjson_is_str(identifier) &&
+                             parse_uuid({yyjson_get_str(identifier), yyjson_get_len(identifier)}, keys[index].uuid);
+        if (!is_uuid) {
+            *error = {ustore_error_malformed_k, "The id field holds neither a non-negative integer nor a UUID"};
             return;
         }
-        keys[index] = yyjson_get_sint(identifier);
     }
 }
 
@@ -916,7 +939,7 @@ void ustore_docs_write(ustore_docs_write_t* request_pointer) {
     if (request.error->status) return;
 
     strided_iterator<ustore_str_view_t const> fields {request.fields, request.fields_stride};
-    strided_iterator<ustore_collection_t const> collections {request.collections, request.collections_stride};
+    strided_iterator<ustore_collection_id_t const> collections {request.collections, request.collections_stride};
     bits_view_t presences {request.presences};
     strided_iterator<ustore_length_t const> offsets {request.offsets, request.offsets_stride};
     strided_iterator<ustore_length_t const> lengths {request.lengths, request.lengths_stride};
@@ -1007,7 +1030,7 @@ void ustore_docs_read(ustore_docs_read_t* request_pointer) {
         return;
     }
 
-    strided_iterator<ustore_collection_t const> collections {request.collections, request.collections_stride};
+    strided_iterator<ustore_collection_id_t const> collections {request.collections, request.collections_stride};
     strided_iterator<ustore_key_t const> keys {request.keys, request.keys_stride};
     places_arg_t const places {collections, keys, fields, request.tasks_count};
 
@@ -1048,7 +1071,7 @@ void ustore_docs_gist(ustore_docs_gist_t* request_pointer) {
     linked_memory_lock_t arena = linked_memory(request.arena, request.options, request.error);
     if (request.error->status) return;
 
-    strided_iterator<ustore_collection_t const> collections {request.collections, request.collections_stride};
+    strided_iterator<ustore_collection_id_t const> collections {request.collections, request.collections_stride};
     strided_iterator<ustore_key_t const> keys {request.keys, request.keys_stride};
     places_arg_t const places {collections, keys, {}, request.docs_count};
     found_documents_t const found = read_documents(request.db, request.transaction, request.snapshot, places,
@@ -1078,7 +1101,7 @@ void ustore_docs_gather(ustore_docs_gather_t* request_pointer) {
     linked_memory_lock_t arena = linked_memory(request.arena, request.options, request.error);
     if (request.error->status) return;
 
-    strided_iterator<ustore_collection_t const> collections {request.collections, request.collections_stride};
+    strided_iterator<ustore_collection_id_t const> collections {request.collections, request.collections_stride};
     strided_iterator<ustore_key_t const> keys {request.keys, request.keys_stride};
     strided_iterator<ustore_str_view_t const> fields {request.fields, request.fields_stride};
     strided_iterator<ustore_doc_field_type_t const> types {request.types, request.types_stride};

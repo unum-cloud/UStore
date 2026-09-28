@@ -67,7 +67,7 @@ def test_an_unwatched_read_leaves_the_rest_watching(database, isolation):
         lambda view: view.docs_read([1], watch=False),
         lambda view: view.docs_gist([1], watch=False),
         lambda view: view.docs_gather([1], ["v"], "i64", watch=False),
-        lambda view: view.graph_degrees([9], watch=False),
+        lambda view: view.graph_degrees([9], watch=False, collection="graph"),
         lambda view: view.write([1], [b"x"], watch=False),
         lambda view: view.docs_write([2], '{"v": 2}', watch=False),
     ],
@@ -91,6 +91,7 @@ def test_an_unwatched_read_leaves_the_rest_watching(database, isolation):
 def test_every_verb_takes_the_watch(database, call):
     """The watch is a shared keyword, so every verb a transaction reaches accepts it."""
     database.docs_write([1], '{"v": 1}')
+    database.collection_create("graph", modality="graph")
     with database.transaction() as staged:
         call(staged)
 
@@ -116,10 +117,8 @@ def test_watch_reads_a_truth_value(database):
 @NEEDS_SNAPSHOTS
 def test_snapshot_refused_inside_a_transaction(database):
     """A call addresses one view, so a transaction and a snapshot are never both named."""
-    identifier = database.snapshot_create()
-    with database.transaction() as staged, pytest.raises(ustore.ArgumentError):
-        staged.read([1], snapshot=identifier)
-    database.snapshot_drop(identifier)
+    with database.snapshot() as snapshot, database.transaction() as staged, pytest.raises(ustore.ArgumentError):
+        staged.read([1], snapshot=snapshot)
 
 
 @pytest.mark.parametrize(

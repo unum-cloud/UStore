@@ -14,17 +14,14 @@ build_release/build/bin/ustore_cli --engine rocksdb --directory /dev/shm/ustore 
     collection import --input data/twitter/tweets.ndjson --id-field id --memory-limit 1GiB --collection tweets
 ```
 
-| Command                  | Action                                                                           |
-| :----------------------- | :------------------------------------------------------------------------------- |
-| `collection create`      | Creates the collection named by `--collection`                                   |
-| `collection drop`        | Drops the collection named by `--collection`                                     |
-| `collection list`        | Prints the name of every collection                                              |
-| `collection import`      | Imports `--input` as documents keyed by `--id-field`, `--memory-limit` per batch |
-| `collection export`      | Exports documents into `--output`, `--memory-limit` per batch                    |
-| `snapshot create`        | Takes a snapshot                                                                 |
-| `snapshot list`          | Prints the existing snapshots                                                    |
-| `snapshot export <path>` | Writes a snapshot to a path                                                      |
-| `snapshot drop <id>`     | Drops a snapshot                                                                 |
+| Command                  | Action                                                                              |
+| :----------------------- | :---------------------------------------------------------------------------------- |
+| `collection create`      | Creates the collection named by `--collection`                                      |
+| `collection drop`        | Drops the collection named by `--collection`                                        |
+| `collection list`        | Prints the ID as canonical UUID text, the name and the modality of every collection |
+| `collection import`      | Imports `--input` as documents keyed by `--id-field`, `--memory-limit` per batch    |
+| `collection export`      | Exports documents into `--output`, `--memory-limit` per batch                       |
+| `snapshot export <path>` | Takes a snapshot of the head and writes it to a path                                |
 
 | Flag                    | Meaning                                                                |
 | :---------------------- | :--------------------------------------------------------------------- |
@@ -32,7 +29,7 @@ build_release/build/bin/ustore_cli --engine rocksdb --directory /dev/shm/ustore 
 | `--collection <name>`   | Collection a command acts on; the main collection when omitted         |
 | `--input <file>`        | File a collection import reads                                         |
 | `--output <file>`       | File a collection export writes                                        |
-| `--id-field <field>`    | Field holding the keys of imported documents                           |
+| `--id-field <field>`    | Field holding the keys of imported documents, integers or UUID text    |
 | `--memory-limit <size>` | Bytes an import or export buffers per batch, such as `64MiB` or `1GiB` |
 
 The file extension, `.ndjson` or `.csv`, selects the format, and `--help` prints the commands and the flags.
@@ -50,6 +47,7 @@ The file extension, `.ndjson` or `.csv`, selects the format, and `--help` prints
 
 The `.ndjson` or `.csv` extension of `path` selects the format: NDJSON is parsed and written with yyjson, and CSV with StringZilla.
 Fields are plain names or JSON pointers, and `max_batch_size` bounds the bytes buffered before each batched write.
+A key in a file is a non-negative integer, read as the key of that integer, or a UUID in canonical text, and an export writes every key back the same way: as its integer when its first eight bytes are zero, and as quoted UUID text otherwise.
 
 ```c
 ustore_error_t error = {0};

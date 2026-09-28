@@ -110,12 +110,12 @@ struct input_edge_t {
     std::size_t target_begin = source_end;
     while (target_begin != line.size() && (line[target_begin] == ' ' || line[target_begin] == '\t')) ++target_begin;
 
-    ustore_key_t source = 0;
-    ustore_key_t target = 0;
+    std::uint64_t source = 0;
+    std::uint64_t target = 0;
     auto const parsed_source = std::from_chars(line.data(), line.data() + source_end, source);
     auto const parsed_target = std::from_chars(line.data() + target_begin, line.data() + line.size(), target);
     if (parsed_source.ec != std::errc {} || parsed_target.ec != std::errc {}) return false;
-    edge = make_input_edge(source, target);
+    edge = make_input_edge(key_from_integer(source), key_from_integer(target));
     return true;
 }
 
@@ -154,14 +154,14 @@ status_t generate_edge_list(settings_t const& settings, st::basic_vector<input_e
     std::mt19937_64 generator {settings.seed.value};
     for (std::size_t vertex = 0; vertex != planted; ++vertex) {
         std::size_t const community_begin = (vertex / community_size) * community_size;
-        auto const source = static_cast<ustore_key_t>(vertex);
+        ustore_key_t const source = key_from_integer(vertex);
         for (std::size_t drawn = 0; drawn != settings.inner_degree.value; ++drawn) {
-            auto const target = static_cast<ustore_key_t>(community_begin + generator() % community_size);
+            ustore_key_t const target = key_from_integer(community_begin + generator() % community_size);
             [[maybe_unused]] st::status_t const pushed = edges.push_back(st::assume_reserved,
                                                                          make_input_edge(source, target));
         }
         for (std::size_t drawn = 0; drawn != settings.outer_degree.value; ++drawn) {
-            auto const target = static_cast<ustore_key_t>(generator() % planted);
+            ustore_key_t const target = key_from_integer(generator() % planted);
             [[maybe_unused]] st::status_t const pushed = edges.push_back(st::assume_reserved,
                                                                          make_input_edge(source, target));
         }
@@ -503,10 +503,10 @@ expected<adjacency_graph_t> aggregate_level(graph_type_& graph, level_t const& l
     std::size_t const count = graph.vertices_count();
     st::basic_vector<weighted_entry_t> entries;
     for (std::size_t vertex = 0; vertex != count; ++vertex) {
-        auto const source = static_cast<ustore_key_t>(level.communities[vertex]);
+        ustore_key_t const source = key_from_integer(level.communities[vertex]);
         st::status_t pushed = st::status_t::success_k;
         status_t const walked = graph.for_each_neighbor(vertex, [&](std::size_t neighbor, double weight) noexcept {
-            auto const target = static_cast<ustore_key_t>(level.communities[neighbor]);
+            ustore_key_t const target = key_from_integer(level.communities[neighbor]);
             if (st::succeeded(pushed)) pushed = entries.push_back(weighted_entry_t {source, target, weight});
         });
         if (walked.failed()) return walked;
@@ -718,7 +718,11 @@ int main(int argc, char** argv) {
         fmt::println(stderr, "Failed to clear the database: {}", cleared.message ? cleared.message : "unknown");
         return 1;
     }
-    graph_collection_t graph = database.main<graph_collection_t>();
+    auto [graph, graph_status] = database.create<graph_collection_t>("graph", ustore_modality_graph_k);
+    if (graph_status.failed()) {
+        fmt::println(stderr, "Failed to create the graph: {}", graph_status.message ? graph_status.message : "unknown");
+        return 1;
+    }
 
     run_result_t memory_result;
     run_result_t stored_result;

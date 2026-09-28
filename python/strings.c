@@ -16,10 +16,10 @@
 #pragma region Lookups
 
 ustore_py_naming_t ustore_py_collection_named(ustore_py_context_t const* context, char const* name, size_t length,
-                                              ustore_collection_t* collection) {
+                                              ustore_collection_id_t* collection) {
     ustore_length_t const name_length = (ustore_length_t)length;
     ustore_octet_t* presences = NULL;
-    ustore_collection_t* ids = NULL;
+    ustore_collection_id_t* ids = NULL;
     ustore_error_t error = {0};
     ustore_arena_t arena = ustore_py_arena_claim(context->database);
 
@@ -33,7 +33,7 @@ ustore_py_naming_t ustore_py_collection_named(ustore_py_context_t const* context
     find.names = &name;
     find.names_lengths = &name_length;
     find.presences = &presences;
-    find.ids = &ids;
+    find.collections = &ids;
 
     Py_BEGIN_ALLOW_THREADS;
     ustore_collection_find(&find);
@@ -54,7 +54,7 @@ ustore_py_naming_t ustore_py_collection_named(ustore_py_context_t const* context
 }
 
 int ustore_py_collection_from_object(ustore_py_context_t const* context, PyObject* object,
-                                     ustore_collection_t* collection) {
+                                     ustore_collection_id_t* collection) {
     if (!object || object == Py_None) {
         *collection = ustore_collection_main_k;
         return 0;
@@ -74,18 +74,12 @@ int ustore_py_collection_from_object(ustore_py_context_t const* context, PyObjec
             return ustore_py_raise(ustore_error_not_found_k, "No collection is named %R", object);
         }
     }
-    if (!PyIndex_Check(object)) {
-        PyErr_Format(PyExc_TypeError, "A collection is an identifier, a name, or None, not %S", Py_TYPE(object));
+    // Only a `uuid.UUID` spells an ID here, since text already means a name
+    if (!PyObject_TypeCheck(object, (PyTypeObject*)UUIDType)) {
+        PyErr_Format(PyExc_TypeError, "A collection is a UUID, a name, or None, not %S", Py_TYPE(object));
         return -1;
     }
-    PyObject* const integer = PyNumber_Index(object);
-    if (!integer) return -1;
-    unsigned long long const identifier = PyLong_AsUnsignedLongLong(integer);
-    Py_DECREF(integer);
-    if (identifier == (unsigned long long)-1 && PyErr_Occurred())
-        return ustore_py_raise_from_cause(PyExc_OverflowError, "A collection identifier must fit 64 unsigned bits");
-    *collection = (ustore_collection_t)identifier;
-    return 0;
+    return ustore_py_uuid_from_object(object, &collection->uuid);
 }
 
 #pragma endregion Lookups

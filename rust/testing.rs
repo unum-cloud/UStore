@@ -2,6 +2,18 @@
 
 use std::fs;
 
+use crate::db::Key;
+
+/// The key that spells `integer`, which the suites number their keys with.
+pub fn key(integer: u64) -> Key {
+    Key::from(integer)
+}
+
+/// The keys that spell `integers`, in order.
+pub fn keys<const COUNT: usize>(integers: [u64; COUNT]) -> [Key; COUNT] {
+    integers.map(Key::from)
+}
+
 /// A directory under the build tree, created on the way in and removed on the way out.
 pub struct TemporaryDirectory {
     path: String,

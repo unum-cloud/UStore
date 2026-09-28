@@ -21,7 +21,8 @@
 #include <fmt/color.h>  // `fmt::color`, `fmt::fg`, `fmt::text_style`
 #include <fmt/format.h> // `fmt::println`, `fmt::format_to_n`
 
-#include <ustore/db.h> // `ustore_database_init_t`, `ustore_error_t`
+#include <ustore/db.h>      // `ustore_database_init_t`, `ustore_error_t`
+#include <ustore/types.hpp> // `uuid_to_text`, `uuid_text_length_k`
 
 #include "arguments.hpp" // `parse_arguments`, `argument_status_t`
 #include "dataset.h"     // `ustore_docs_import`, `ustore_docs_export`
@@ -63,10 +64,7 @@ constexpr std::string_view commands_k = R"(Commands:
   collection list
   collection import --input <file> --id-field <field> --memory-limit <size> [--collection <name>]
   collection export --output <file> --memory-limit <size> [--collection <name>]
-  snapshot create
   snapshot export <path>
-  snapshot drop <id>
-  snapshot list
 
 Files end in .ndjson or .csv, and a command without --collection acts on the main collection.)";
 
@@ -83,10 +81,7 @@ enum class command_t {
     collection_list_k,
     collection_import_k,
     collection_export_k,
-    snapshot_create_k,
     snapshot_export_k,
-    snapshot_drop_k,
-    snapshot_list_k,
 };
 
 /** One invocation: the flags, which view into @c argv and so end in null terminators, and the command they serve. */
@@ -118,9 +113,6 @@ struct command_line_t {
 
     /** Path a snapshot export writes. */
     std::string_view snapshot_path;
-
-    /** Snapshot a drop removes. */
-    ustore_snapshot_t snapshot = 0;
 };
 
 /** Resolves @p positionals into the command of @p line, answering the problem with them, or null when they parse. */
@@ -155,30 +147,13 @@ struct command_line_t {
         return "Invalid collection action";
     }
 
+    // A snapshot lives no longer than the process that took it, so exporting one is the only use a command has
     if (object == "snapshot") {
-        if (action == "export") {
-            if (argument.empty()) return "The snapshot export path is missing";
-            line.snapshot_path = argument;
-            line.command = command_t::snapshot_export_k;
-            return nullptr;
-        }
-        if (action == "drop") {
-            count_t snapshot;
-            if (parse_count(argument, snapshot) != argument_status_t::parsed_k) return "The snapshot id is missing";
-            line.snapshot = snapshot.value;
-            line.command = command_t::snapshot_drop_k;
-            return nullptr;
-        }
-        if (!argument.empty()) return "Too many arguments";
-        if (action == "create") {
-            line.command = command_t::snapshot_create_k;
-            return nullptr;
-        }
-        if (action == "list") {
-            line.command = command_t::snapshot_list_k;
-            return nullptr;
-        }
-        return "Invalid snapshot action";
+        if (action != "export") return "Invalid snapshot action";
+        if (argument.empty()) return "The snapshot export path is missing";
+        line.snapshot_path = argument;
+        line.command = command_t::snapshot_export_k;
+        return nullptr;
     }
     return object.empty() ? "The command is missing" : "Unknown command";
 }
@@ -192,8 +167,8 @@ void print_failure(char const* what, ustore_error_t const& error) noexcept {
     fmt::println(style_of(tone_t::failure_k), "{}: {}", what, error.message);
 }
 
-/** Resolves @p name to a collection id, the main collection for an empty name. */
-void find_collection(ustore_database_t db, std::string_view name, ustore_collection_t& id,
+/** Resolves @p name to a collection ID, the main collection for an empty name. */
+void find_collection(ustore_database_t db, std::string_view name, ustore_collection_id_t& id,
                      ustore_error_t* error) noexcept {
     if (name.empty()) {
         id = ustore_collection_main_k;
@@ -203,7 +178,7 @@ void find_collection(ustore_database_t db, std::string_view name, ustore_collect
     ustore_str_view_t const text = name.data();
     auto const text_length = static_cast<ustore_length_t>(name.size());
     ustore_octet_t* presences = nullptr;
-    ustore_collection_t* ids = nullptr;
+    ustore_collection_id_t* collections = nullptr;
     ustore_collection_find_t find {};
     find.db = db;
     find.error = error;
@@ -212,11 +187,11 @@ void find_collection(ustore_database_t db, std::string_view name, ustore_collect
     find.names = &text;
     find.names_lengths = &text_length;
     find.presences = &presences;
-    find.ids = &ids;
+    find.collections = &collections;
     ustore_collection_find(&find);
     if (!error->status) {
         if (!(presences[0] & 1)) *error = {ustore_error_not_found_k, "No such collection"};
-        else id = ids[0];
+        else id = collections[0];
     }
     ustore_arena_free(arena);
 }
@@ -224,13 +199,13 @@ void find_collection(ustore_database_t db, std::string_view name, ustore_collect
 /** Creates a collection under @p name. */
 [[nodiscard]] bool create_collection(ustore_database_t db, std::string_view name) noexcept {
     ustore_error_t error {};
-    ustore_collection_t id = 0;
+    ustore_collection_id_t id {};
     ustore_collection_create_t create {};
     create.db = db;
     create.error = &error;
     create.name = name.data();
     create.name_length = static_cast<ustore_length_t>(name.size());
-    create.id = &id;
+    create.collection = &id;
     ustore_collection_create(&create);
     if (error.status) {
         print_failure("Failed to create the collection", error);
@@ -248,7 +223,7 @@ void find_collection(ustore_database_t db, std::string_view name, ustore_collect
     drop.error = &error;
     drop.mode = ustore_drop_keys_vals_handle_k;
     if (name.empty()) error = {ustore_error_invalid_argument_k, "The main collection is never dropped"};
-    else find_collection(db, name, drop.id, &error);
+    else find_collection(db, name, drop.collection, &error);
     if (!error.status) ustore_collection_drop(&drop);
     if (error.status) {
         print_failure("Failed to drop the collection", error);
@@ -263,7 +238,7 @@ void find_collection(ustore_database_t db, std::string_view name, ustore_collect
     ustore_error_t error {};
     ustore_arena_t arena = nullptr;
     ustore_size_t count = 0;
-    ustore_collection_t* ids = nullptr;
+    ustore_collection_id_t* ids = nullptr;
     ustore_modality_t* modalities = nullptr;
     ustore_length_t* names_offsets = nullptr;
     ustore_char_t* names = nullptr;
@@ -272,7 +247,7 @@ void find_collection(ustore_database_t db, std::string_view name, ustore_collect
     list.error = &error;
     list.arena = &arena;
     list.count = &count;
-    list.ids = &ids;
+    list.collections = &ids;
     list.modalities = &modalities;
     list.names_offsets = &names_offsets;
     list.names = &names;
@@ -280,7 +255,9 @@ void find_collection(ustore_database_t db, std::string_view name, ustore_collect
     for (std::size_t index = 0; !error.status && index != count; ++index) {
         std::string_view const name {names + names_offsets[index], names_offsets[index + 1] - names_offsets[index]};
         std::size_t const modality = static_cast<std::size_t>(modalities[index]);
-        fmt::println(style_of(tone_t::listing_k), "{}\t{}\t{}", ids[index], name,
+        char id_text[uuid_text_length_k];
+        uuid_to_text(ids[index].uuid, id_text);
+        fmt::println(style_of(tone_t::listing_k), "{}\t{}\t{}", std::string_view {id_text, uuid_text_length_k}, name,
                      modality < modality_names_k.size() ? modality_names_k[modality] : "unknown");
     }
     ustore_arena_free(arena);
@@ -294,7 +271,7 @@ void find_collection(ustore_database_t db, std::string_view name, ustore_collect
 /** Imports the documents of the file @p line names into the collection it names. */
 [[nodiscard]] bool import_documents(ustore_database_t db, command_line_t const& line) noexcept {
     ustore_error_t error {};
-    ustore_collection_t collection = 0;
+    ustore_collection_id_t collection {};
     find_collection(db, line.collection, collection, &error);
     if (!error.status) {
         ustore_docs_import_t importing {};
@@ -317,7 +294,7 @@ void find_collection(ustore_database_t db, std::string_view name, ustore_collect
 /** Exports the collection @p line names into the file it names. */
 [[nodiscard]] bool export_documents(ustore_database_t db, command_line_t const& line) noexcept {
     ustore_error_t error {};
-    ustore_collection_t collection = 0;
+    ustore_collection_id_t collection {};
     find_collection(db, line.collection, collection, &error);
     if (!error.status) {
         ustore_docs_export_t exporting {};
@@ -336,75 +313,29 @@ void find_collection(ustore_database_t db, std::string_view name, ustore_collect
     return true;
 }
 
-/** Takes a snapshot and prints its identifier. */
-[[nodiscard]] bool create_snapshot(ustore_database_t db) noexcept {
-    ustore_error_t error {};
-    ustore_snapshot_t id = 0;
-    ustore_snapshot_create_t create {};
-    create.db = db;
-    create.error = &error;
-    create.id = &id;
-    ustore_snapshot_create(&create);
-    if (error.status) {
-        print_failure("Failed to create a snapshot", error);
-        return false;
-    }
-    fmt::println(style_of(tone_t::success_k), "Snapshot {} created", id);
-    return true;
-}
-
-/** Writes the newest snapshot to @p path. */
+/** Takes a snapshot of the head and writes it to @p path. */
 [[nodiscard]] bool export_snapshot(ustore_database_t db, std::string_view path) noexcept {
     ustore_error_t error {};
-    ustore_snapshot_export_t exporting {};
-    exporting.db = db;
-    exporting.error = &error;
-    exporting.path = path.data();
-    ustore_snapshot_export(&exporting);
+    ustore_snapshot_t snapshot = nullptr;
+    ustore_snapshot_init_t init {};
+    init.db = db;
+    init.error = &error;
+    init.snapshot = &snapshot;
+    ustore_snapshot_init(&init);
+    if (!error.status) {
+        ustore_snapshot_export_t exporting {};
+        exporting.db = db;
+        exporting.error = &error;
+        exporting.snapshot = snapshot;
+        exporting.path = path.data();
+        ustore_snapshot_export(&exporting);
+    }
+    ustore_snapshot_free(snapshot);
     if (error.status) {
         print_failure("Failed to export the snapshot", error);
         return false;
     }
     fmt::println(style_of(tone_t::success_k), "Snapshot exported");
-    return true;
-}
-
-/** Removes the snapshot @p id names. */
-[[nodiscard]] bool drop_snapshot(ustore_database_t db, ustore_snapshot_t id) noexcept {
-    ustore_error_t error {};
-    ustore_snapshot_drop_t drop {};
-    drop.db = db;
-    drop.error = &error;
-    drop.id = id;
-    ustore_snapshot_drop(&drop);
-    if (error.status) {
-        print_failure("Failed to drop the snapshot", error);
-        return false;
-    }
-    fmt::println(style_of(tone_t::success_k), "Snapshot dropped");
-    return true;
-}
-
-/** Prints the identifier of every live snapshot. */
-[[nodiscard]] bool list_snapshots(ustore_database_t db) noexcept {
-    ustore_error_t error {};
-    ustore_arena_t arena = nullptr;
-    ustore_size_t count = 0;
-    ustore_snapshot_t* ids = nullptr;
-    ustore_snapshot_list_t list {};
-    list.db = db;
-    list.error = &error;
-    list.arena = &arena;
-    list.count = &count;
-    list.ids = &ids;
-    ustore_snapshot_list(&list);
-    if (error.status) {
-        print_failure("Failed to list the snapshots", error);
-        ustore_arena_free(arena);
-        return false;
-    }
-    for (std::size_t index = 0; index != count; ++index) fmt::println(style_of(tone_t::listing_k), "{}", ids[index]);
-    ustore_arena_free(arena);
     return true;
 }
 
@@ -417,10 +348,7 @@ void find_collection(ustore_database_t db, std::string_view name, ustore_collect
     case command_t::collection_list_k: return list_collections(db);
     case command_t::collection_import_k: return import_documents(db, line);
     case command_t::collection_export_k: return export_documents(db, line);
-    case command_t::snapshot_create_k: return create_snapshot(db);
     case command_t::snapshot_export_k: return export_snapshot(db, line.snapshot_path);
-    case command_t::snapshot_drop_k: return drop_snapshot(db, line.snapshot);
-    case command_t::snapshot_list_k: return list_snapshots(db);
     }
     return false;
 }

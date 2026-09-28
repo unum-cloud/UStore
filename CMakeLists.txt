@@ -185,14 +185,14 @@ endif ()
 set(USTORE_ENGINE_NAMES "ram")
 add_library(ustore STATIC ${USTORE_LIB_C_EXCLUSION} c/lib.cpp c/docs.cpp c/graph.cpp src/ram/engine.cpp)
 add_library(ustore::ustore ALIAS ustore)
+# Collection identifiers draw their entropy from `BCryptGenRandom` on Windows
+target_link_libraries(ustore PRIVATE $<$<PLATFORM_ID:Windows>:bcrypt>)
 
 # The NVMe engine mounts its volumes on files, so it builds everywhere the siblings do; the io_uring transport beside it
 # compiles on every platform and only opens a ring on Linux.
 if (${USTORE_BUILD_NVME})
     target_sources(ustore PRIVATE src/nvme/engine.cpp src/nvme/strings.cpp)
     target_compile_definitions(ustore PUBLIC USTORE_WITH_NVME=1)
-    # Identifiers draw their entropy from `BCryptGenRandom` on Windows
-    target_link_libraries(ustore PRIVATE $<$<PLATFORM_ID:Windows>:bcrypt>)
     if (TARGET ustore_nvme_compaction)
         target_link_libraries(ustore PUBLIC ustore_nvme_compaction)
         set(USTORE_COMPACTION_LIB ustore_nvme_compaction)

@@ -26,20 +26,37 @@ extern "C" {
  *  database holds @c ustore_collection_main_k, which can be cleared but never dropped, next to the
  *  collections of binary values, documents or graphs it creates.
  */
-typedef void* ustore_database_t;
+typedef struct ustore_database_handle_t* ustore_database_t;
 
-/** An identifier of a point-in-time view of the whole database. */
-typedef uint64_t ustore_snapshot_t;
+/** An opaque handle to a point-in-time view of the whole database, which a read names instead of a
+ *  transaction. Short-lived: it pins the versions its reads need until @c ustore_snapshot_free, and is
+ *  freed before its database closes. */
+typedef struct ustore_snapshot_handle_t* ustore_snapshot_t;
 
 /** An opaque handle to an optimistic transaction that groups operations across collections and
  *  modalities. Not thread-safe, and freed with @c ustore_transaction_free before its database closes. */
-typedef void* ustore_transaction_t;
+typedef struct ustore_transaction_handle_t* ustore_transaction_t;
 
-/** An identifier of a collection, unique within its database but not stable across restarts. */
-typedef uint64_t ustore_collection_t;
+/**
+ *  @brief Sixteen bytes naming one thing everywhere, ordered as their bytes and compared with @c memcmp.
+ *
+ *  An integer spells as its 128-bit big-endian bytes, as Python's `uuid.UUID(int=...)` does, so identifiers made from
+ *  integers order as the integers.
+ */
+typedef struct ustore_uuid_t {
+    uint8_t bytes[16];
+} ustore_uuid_t;
+
+/** The identifier of a collection: a UUIDv7 the catalog mints once and never reuses, so it stays the same across
+ *  restarts and never names two collections. */
+typedef struct ustore_collection_id_t {
+    ustore_uuid_t uuid;
+} ustore_collection_id_t;
 
 /** The identifier of a value within one collection. */
-typedef int64_t ustore_key_t;
+typedef struct ustore_key_t {
+    ustore_uuid_t uuid;
+} ustore_key_t;
 
 /** The elementary piece of a binary value. */
 typedef uint8_t ustore_byte_t;
@@ -50,8 +67,8 @@ typedef float ustore_float_t;
 /** The elementary piece of a string, such as a collection name. */
 typedef char ustore_char_t;
 
-/** The length of a value in bytes. */
-typedef uint32_t ustore_length_t;
+/** The length of a value in bytes, or an offset into a tape of values, wide enough for a tape past 4 GiB. */
+typedef uint64_t ustore_length_t;
 
 /** A pointer-sized unsigned integer. */
 typedef uint64_t ustore_size_t;
@@ -59,8 +76,8 @@ typedef uint64_t ustore_size_t;
 /** The smallest bitset, holding eight bits. */
 typedef uint8_t ustore_octet_t;
 
-/** A monotonically increasing identifier of the order in which transactions applied. */
-typedef uint64_t ustore_sequence_number_t;
+/** The position of a commit in the order commits apply in, which grows with every commit. */
+typedef uint64_t ustore_stamp_t;
 
 /** What went wrong, in one vocabulary shared by every engine and binding. */
 typedef enum ustore_status_t {
@@ -130,9 +147,9 @@ typedef char const* ustore_str_view_t;
 /** A mutable string the caller owns and the database never frees. */
 typedef char* ustore_str_span_t;
 
-/** Temporary memory for results, which the database allocates and grows and the caller frees with
- *  @c ustore_arena_free. */
-typedef void* ustore_arena_t;
+/** An opaque handle to temporary memory for results, which the database allocates and grows and the
+ *  caller frees with @c ustore_arena_free. */
+typedef struct ustore_arena_handle_t* ustore_arena_t;
 
 /** A pointer to mutable bytes. */
 typedef uint8_t* ustore_bytes_ptr_t;
@@ -198,14 +215,14 @@ typedef enum {
 
 } ustore_capabilities_t;
 
-/** The collection every database holds, which @c ustore_drop_keys_vals_k and
+/** The collection every database holds, named by the nil UUID, which @c ustore_drop_keys_vals_k and
  *  @c ustore_drop_vals_k may only clear. */
-extern ustore_collection_t const ustore_collection_main_k;
+extern ustore_collection_id_t const ustore_collection_main_k;
 
 /** The length reported for a missing value. */
 extern ustore_length_t const ustore_length_missing_k;
 
-/** The key that stands for no key. */
+/** The key that stands for no key, every bit of it set. */
 extern ustore_key_t const ustore_key_unknown_k;
 
 #pragma endregion Handles and Constants
@@ -462,8 +479,8 @@ void ustore_database_control(ustore_database_control_t* arguments);
 
 #pragma region Snapshots
 
-/** The arguments of @c ustore_snapshot_list. */
-typedef struct ustore_snapshot_list_t {
+/** The arguments of @c ustore_snapshot_init. */
+typedef struct ustore_snapshot_init_t {
 
     /** An open database. */
     ustore_database_t db;
@@ -471,45 +488,16 @@ typedef struct ustore_snapshot_list_t {
     /** Output for the error message. */
     ustore_error_t* error;
 
-    /** Reusable memory for the results. */
-    ustore_arena_t* arena;
+    /** Output for the new snapshot, which the caller frees with @c ustore_snapshot_free. */
+    ustore_snapshot_t* snapshot;
 
-    /** Accepts @c ustore_option_dont_discard_memory_k. */
-    ustore_options_t options;
-
-    /** Output for the number of snapshots. */
-    ustore_size_t* count;
-
-    /** Output for the identifiers of the snapshots. */
-    ustore_snapshot_t** ids;
-
-} ustore_snapshot_list_t;
+} ustore_snapshot_init_t;
 
 /**
- *  @brief Lists every snapshot of the database.
+ *  @brief Pins a point-in-time view of the database until @c ustore_snapshot_free releases it.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_snapshot_list(ustore_snapshot_list_t* arguments);
-
-/** The arguments of @c ustore_snapshot_create. */
-typedef struct ustore_snapshot_create_t {
-
-    /** An open database. */
-    ustore_database_t db;
-
-    /** Output for the error message. */
-    ustore_error_t* error;
-
-    /** Output for the identifier of the new snapshot. */
-    ustore_snapshot_t* id;
-
-} ustore_snapshot_create_t;
-
-/**
- *  @brief Captures a point-in-time view of the database.
- *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
- */
-void ustore_snapshot_create(ustore_snapshot_create_t* arguments);
+void ustore_snapshot_init(ustore_snapshot_init_t* arguments);
 
 /** The arguments of @c ustore_snapshot_export. */
 typedef struct ustore_snapshot_export_t {
@@ -520,8 +508,8 @@ typedef struct ustore_snapshot_export_t {
     /** Output for the error message. */
     ustore_error_t* error;
 
-    /** Identifier of the snapshot. */
-    ustore_snapshot_t id;
+    /** The snapshot to export. */
+    ustore_snapshot_t snapshot;
 
     /** Directory that receives the exported database. */
     ustore_str_view_t path;
@@ -533,26 +521,6 @@ typedef struct ustore_snapshot_export_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
 void ustore_snapshot_export(ustore_snapshot_export_t* arguments);
-
-/** The arguments of @c ustore_snapshot_drop. */
-typedef struct ustore_snapshot_drop_t {
-
-    /** An open database. */
-    ustore_database_t db;
-
-    /** Output for the error message. */
-    ustore_error_t* error;
-
-    /** Identifier of an existing snapshot. */
-    ustore_snapshot_t id;
-
-} ustore_snapshot_drop_t;
-
-/**
- *  @brief Releases a snapshot.
- *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
- */
-void ustore_snapshot_drop(ustore_snapshot_drop_t* arguments);
 
 #pragma endregion Snapshots
 
@@ -598,7 +566,7 @@ typedef struct ustore_collection_list_t {
     /** Transaction whose view is listed. */
     ustore_transaction_t transaction;
 
-    /** Snapshot whose view is listed. */
+    /** Optional snapshot whose view is listed, never set beside a transaction. */
     ustore_snapshot_t snapshot;
 
     /** Reusable memory for the results. */
@@ -611,7 +579,7 @@ typedef struct ustore_collection_list_t {
     ustore_size_t* count;
 
     /** Optional output for the identifiers of the collections. */
-    ustore_collection_t** ids;
+    ustore_collection_id_t** collections;
 
     /** Optional output for what every collection holds. */
     ustore_modality_t** modalities;
@@ -659,7 +627,7 @@ typedef struct ustore_collection_create_t {
     ustore_modality_t modality;
 
     /** Output for the identifier of the collection. */
-    ustore_collection_t* id;
+    ustore_collection_id_t* collection;
 
 } ustore_collection_create_t;
 
@@ -684,7 +652,7 @@ typedef struct ustore_collection_find_t {
     /** Output for the error message. */
     ustore_error_t* error;
 
-    /** Snapshot whose names are read, or zero for the head. */
+    /** Optional snapshot whose names are read, where @c NULL reads the head. */
     ustore_snapshot_t snapshot;
 
     /** Reusable memory for the results. */
@@ -713,7 +681,7 @@ typedef struct ustore_collection_find_t {
     ustore_octet_t** presences;
 
     /** Output for the identifiers of the collections the names address. */
-    ustore_collection_t** ids;
+    ustore_collection_id_t** collections;
 
     /** Optional output for what the collections hold. */
     ustore_modality_t** modalities;
@@ -737,7 +705,7 @@ typedef struct ustore_collection_drop_t {
     ustore_error_t* error;
 
     /** Identifier of an existing collection. */
-    ustore_collection_t id;
+    ustore_collection_id_t collection;
 
     /** Whether values, pairs or the whole collection go. */
     ustore_drop_mode_t mode;
@@ -793,8 +761,8 @@ typedef struct ustore_transaction_stage_t {
     /** Options of the stage. */
     ustore_options_t options;
 
-    /** Optional output for the sequence number of the stage. */
-    ustore_sequence_number_t* sequence_number;
+    /** Optional output for the stamp the stage took. */
+    ustore_stamp_t* stamp;
 
 } ustore_transaction_stage_t;
 
@@ -820,8 +788,8 @@ typedef struct ustore_transaction_commit_t {
     /** Accepts @c ustore_option_write_flush_k. */
     ustore_options_t options;
 
-    /** Optional output for the sequence number of the commit. */
-    ustore_sequence_number_t* sequence_number;
+    /** Optional output for the stamp the commit published under. */
+    ustore_stamp_t* stamp;
 
 } ustore_transaction_commit_t;
 
@@ -846,6 +814,12 @@ void ustore_arena_free(ustore_arena_t arena);
  *  @param[inout] transaction The transaction to be freed; @c NULL is safe.
  */
 void ustore_transaction_free(ustore_transaction_t transaction);
+
+/**
+ *  @brief Releases a snapshot, unpinning the versions only it kept, and frees its memory.
+ *  @param[inout] snapshot The snapshot to be freed; @c NULL is safe.
+ */
+void ustore_snapshot_free(ustore_snapshot_t snapshot);
 
 /**
  *  @brief Closes the database and frees its memory, while the data persists on disk.

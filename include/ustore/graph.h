@@ -23,7 +23,7 @@ extern "C" {
 
 #pragma region Constants
 
-/** The edge identifier of an edge that was given none. */
+/** The edge identifier of an edge that was given none, every bit of it set like @c ustore_key_unknown_k. */
 extern ustore_key_t const ustore_default_edge_id_k;
 
 /** The role a vertex plays in an edge, where undirected graphs use @c ustore_vertex_role_any_k.
@@ -73,7 +73,7 @@ typedef struct ustore_graph_find_edges_t {
     /** Transaction that watches the read vertices. */
     ustore_transaction_t transaction;
 
-    /** Snapshot whose view is read. */
+    /** Optional snapshot whose view is read, never set beside a transaction. */
     ustore_snapshot_t snapshot;
 
     /** Reusable memory for the results. */
@@ -86,7 +86,7 @@ typedef struct ustore_graph_find_edges_t {
     ustore_size_t tasks_count;
 
     /** Graph collections, where @c NULL stands for the main collection. */
-    ustore_collection_t const* collections;
+    ustore_collection_id_t const* collections;
 
     /** Bytes between consecutive collections, where zero repeats the first one. */
     ustore_size_t collections_stride;
@@ -139,7 +139,7 @@ typedef struct ustore_graph_upsert_edges_t {
     ustore_size_t tasks_count;
 
     /** Graph collections, where @c NULL stands for the main collection. */
-    ustore_collection_t const* collections;
+    ustore_collection_id_t const* collections;
 
     /** Bytes between consecutive collections, where zero repeats the first one. */
     ustore_size_t collections_stride;
@@ -192,7 +192,7 @@ typedef struct ustore_graph_remove_edges_t {
     ustore_size_t tasks_count;
 
     /** Graph collections, where @c NULL stands for the main collection. */
-    ustore_collection_t const* collections;
+    ustore_collection_id_t const* collections;
 
     /** Bytes between consecutive collections, where zero repeats the first one. */
     ustore_size_t collections_stride;
@@ -249,7 +249,7 @@ typedef struct ustore_graph_upsert_vertices_t {
     ustore_size_t tasks_count;
 
     /** Graph collections, where @c NULL stands for the main collection. */
-    ustore_collection_t const* collections;
+    ustore_collection_id_t const* collections;
 
     /** Bytes between consecutive collections, where zero repeats the first one. */
     ustore_size_t collections_stride;
@@ -290,7 +290,7 @@ typedef struct ustore_graph_remove_vertices_t {
     ustore_size_t tasks_count;
 
     /** Graph collections, where @c NULL stands for the main collection. */
-    ustore_collection_t const* collections;
+    ustore_collection_id_t const* collections;
 
     /** Bytes between consecutive collections, where zero repeats the first one. */
     ustore_size_t collections_stride;

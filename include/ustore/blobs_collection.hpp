@@ -9,9 +9,8 @@
 
 #include <cstddef> // `std::size_t`
 
-#include <concepts>         // `std::integral`
+#include <concepts>         // `std::same_as`
 #include <initializer_list> // `std::initializer_list`
-#include <limits>           // `std::numeric_limits`
 #include <type_traits>      // `std::remove_cvref_t`
 #include <utility>          // `std::exchange`, `std::forward`, `std::swap`
 
@@ -33,14 +32,14 @@ namespace unum::ustore {
  *  its database. */
 class blobs_collection_t {
     ustore_database_t database_ {nullptr};
-    ustore_collection_t collection_ {ustore_collection_main_k};
+    ustore_collection_id_t collection_ {ustore_collection_main_k};
     ustore_transaction_t transaction_ {nullptr};
     ustore_snapshot_t snapshot_ {};
     any_arena_t arena_ {nullptr};
 
   public:
     blobs_collection_t() noexcept : arena_(nullptr) {}
-    blobs_collection_t(ustore_database_t database, ustore_collection_t collection = ustore_collection_main_k,
+    blobs_collection_t(ustore_database_t database, ustore_collection_id_t collection = ustore_collection_main_k,
                        ustore_transaction_t transaction = nullptr, ustore_snapshot_t snapshot = {},
                        ustore_arena_t* arena = nullptr) noexcept
         : database_(database), collection_(collection), transaction_(transaction), snapshot_(snapshot),
@@ -73,25 +72,22 @@ class blobs_collection_t {
         return *this;
     }
 
-    operator ustore_collection_t() const noexcept { return collection_; }
-    ustore_collection_t* member_ptr() noexcept { return &collection_; }
+    operator ustore_collection_id_t() const noexcept { return collection_; }
+    ustore_collection_id_t* member_ptr() noexcept { return &collection_; }
     ustore_arena_t* member_arena() noexcept { return arena_.member_ptr(); }
     ustore_database_t db() const noexcept { return database_; }
     ustore_transaction_t txn() const noexcept { return transaction_; }
     ustore_snapshot_t snap() const noexcept { return snapshot_; }
 
-    blobs_range_t members(ustore_key_t min_key = std::numeric_limits<ustore_key_t>::min(),
-                          ustore_key_t max_key = std::numeric_limits<ustore_key_t>::max()) const noexcept {
+    blobs_range_t members(ustore_key_t min_key = smallest_key_k, ustore_key_t max_key = largest_key_k) const noexcept {
         return {database_, transaction_, snapshot_, collection_, min_key, max_key};
     }
 
-    keys_range_t keys(ustore_key_t min_key = std::numeric_limits<ustore_key_t>::min(),
-                      ustore_key_t max_key = std::numeric_limits<ustore_key_t>::max()) const noexcept {
+    keys_range_t keys(ustore_key_t min_key = smallest_key_k, ustore_key_t max_key = largest_key_k) const noexcept {
         return {members(min_key, max_key)};
     }
 
-    pairs_range_t items(ustore_key_t min_key = std::numeric_limits<ustore_key_t>::min(),
-                        ustore_key_t max_key = std::numeric_limits<ustore_key_t>::max()) const noexcept {
+    pairs_range_t items(ustore_key_t min_key = smallest_key_k, ustore_key_t max_key = largest_key_k) const noexcept {
         return {members(min_key, max_key)};
     }
 
@@ -132,7 +128,7 @@ class blobs_collection_t {
         if constexpr (!batch_concept<keys_arg_>) {
             collection_key_field_t arg;
             arg.collection = collection_;
-            if constexpr (std::integral<plain_t>) arg.key = keys;
+            if constexpr (std::same_as<plain_t, ustore_key_t>) arg.key = keys;
             else arg.key = keys.key;
             if constexpr (has_field_concept<plain_t>) arg.field = keys.field;
             return blobs_ref<collection_key_field_t> {database_, transaction_, snapshot_, std::move(arg), arena_};
@@ -150,7 +146,7 @@ class blobs_collection_t {
         ustore_collection_drop_t collection_drop {};
         collection_drop.db = database_;
         collection_drop.error = &error;
-        collection_drop.id = collection_;
+        collection_drop.collection = collection_;
         collection_drop.mode = mode;
         ustore_collection_drop(&collection_drop);
         return status_t {error};

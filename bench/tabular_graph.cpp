@@ -110,6 +110,9 @@ struct tabular_t {
     /** Open database. */
     ustore_database_t db = nullptr;
 
+    /** The graph collection the graph benchmarks import into and export from. */
+    ustore_collection_id_t graph = ustore_collection_main_k;
+
     /** Null-terminated paths of the input files, one after another. */
     sz::string_t paths;
 
@@ -188,12 +191,11 @@ struct files_share_t {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 }
 
-/** Answers the number of keys in the main collection. */
-[[nodiscard]] std::size_t count_keys(ustore_database_t db) noexcept {
+/** Answers the number of keys in @p collection. */
+[[nodiscard]] std::size_t count_keys(ustore_database_t db, ustore_collection_id_t collection) noexcept {
     ustore_arena_t arena = nullptr;
     ustore_error_t error {};
-    ustore_collection_t const collection = ustore_collection_main_k;
-    ustore_key_t const start = std::numeric_limits<ustore_key_t>::min();
+    ustore_key_t const start = smallest_key_k;
     ustore_length_t const limit = std::numeric_limits<ustore_length_t>::max();
     ustore_length_t* counts = nullptr;
     ustore_key_t* keys = nullptr;
@@ -213,16 +215,16 @@ struct files_share_t {
     return count;
 }
 
-/** Drops the keys and values of the main collection, reporting a failure on the standard error. */
-void clear_main(ustore_database_t db) noexcept {
+/** Drops the keys and values of @p collection, reporting a failure on the standard error. */
+void clear_collection(ustore_database_t db, ustore_collection_id_t collection) noexcept {
     ustore_error_t error {};
     ustore_collection_drop_t drop {};
     drop.db = db;
     drop.error = &error;
-    drop.id = ustore_collection_main_k;
+    drop.collection = collection;
     drop.mode = ustore_drop_keys_vals_k;
     ustore_collection_drop(&drop);
-    if (error.status) fmt::println(stderr, "Failed to clear the main collection: {}", error.message);
+    if (error.status) fmt::println(stderr, "Failed to clear a collection: {}", error.message);
 }
 
 /** Answers the size of the exported file at @p path and removes it, or zero when it is missing. */
@@ -296,7 +298,7 @@ void bench_graph_import(bm::State& state, tabular_t const& tabular, settings_t c
         importing.db = tabular.db;
         importing.error = &error;
         importing.arena = &arena;
-        importing.collection = ustore_collection_main_k;
+        importing.collection = tabular.graph;
         importing.path = tabular.path(file);
         importing.max_batch_size = settings.memory_limit.value;
         importing.source_id_field = settings.source_field.data();
@@ -309,7 +311,7 @@ void bench_graph_import(bm::State& state, tabular_t const& tabular, settings_t c
     double const duration = seconds_since(start);
     ustore_arena_free(arena);
 
-    std::size_t const imported = count_keys(tabular.db) * 3 * sizeof(ustore_key_t);
+    std::size_t const imported = count_keys(tabular.db, tabular.graph) * 3 * sizeof(ustore_key_t);
     state.counters["bytes/s"] = bm::Counter(imported / duration);
     state.counters["duration"] = bm::Counter(duration, bm::Counter::kAvgThreads);
     state.counters["imported"] = bm::Counter(imported);
@@ -372,7 +374,7 @@ void bench_graph_export(bm::State& state, tabular_t const& tabular, settings_t c
         exporting.db = tabular.db;
         exporting.error = &error;
         exporting.arena = &arena;
-        exporting.collection = ustore_collection_main_k;
+        exporting.collection = tabular.graph;
         exporting.path = output.c_str();
         exporting.max_batch_size = settings.memory_limit.value;
         exporting.source_id_field = source.c_str();
@@ -453,6 +455,17 @@ int main(int argc, char** argv) {
         fmt::println(stderr, "Failed to open the database: {}", error.message);
         return 1;
     }
+    ustore_collection_create_t create {};
+    create.db = tabular.db;
+    create.error = &error;
+    create.modality = ustore_modality_graph_k;
+    create.collection = &tabular.graph;
+    ustore_collection_create(&create);
+    if (error.status) {
+        fmt::println(stderr, "Failed to create the graph collection: {}", error.message);
+        ustore_database_free(tabular.db);
+        return 1;
+    }
 
     sz::string_t docs_import_name;
     sz::string_t docs_export_name;
@@ -468,7 +481,10 @@ int main(int argc, char** argv) {
 
     std::size_t const threads = settings.threads.value;
     std::size_t const files_per_thread = settings.max_input_files_total.value / threads;
-    auto const clear = [&tabular](bm::State const&) { clear_main(tabular.db); };
+    auto const clear_documents = [&tabular](bm::State const&) {
+        clear_collection(tabular.db, ustore_collection_main_k);
+    };
+    auto const clear_graph = [&tabular](bm::State const&) { clear_collection(tabular.db, tabular.graph); };
     bm::RegisterBenchmark(docs_import_name.c_str(),
                           [&](bm::State& state) { bench_docs_import(state, tabular, settings); })
         ->Threads(threads)
@@ -477,7 +493,7 @@ int main(int argc, char** argv) {
                           [&](bm::State& state) { bench_docs_export(state, tabular, settings); })
         ->Threads(threads)
         ->Iterations(1)
-        ->Teardown(clear);
+        ->Teardown(clear_documents);
     bm::RegisterBenchmark(graph_import_name.c_str(),
                           [&](bm::State& state) { bench_graph_import(state, tabular, settings); })
         ->Threads(threads)
@@ -486,7 +502,7 @@ int main(int argc, char** argv) {
                           [&](bm::State& state) { bench_graph_export(state, tabular, settings); })
         ->Threads(threads)
         ->Iterations(1)
-        ->Teardown(clear);
+        ->Teardown(clear_graph);
 
     bm::RunSpecifiedBenchmarks();
     bm::Shutdown();

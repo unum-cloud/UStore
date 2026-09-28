@@ -131,19 +131,19 @@ static int edge_batches_from_args(ustore_py_context_t const* context, char const
 
 #pragma region Edges
 
-char const doc_graph_upsert_edges[] =                                                         //
-    "graph_upsert_edges(sources, targets, *, edges=None, collection=None, flush=False)\n"     //
-    "answers None.\n"                                                                         //
-    "\n"                                                                                      //
-    "Inserts a batch of edges, creating the vertices they connect. An edge already present\n" //
-    "is kept, so upserting the same batch twice changes nothing.\n"                           //
-    "\n"                                                                                      //
-    "Args:\n"                                                                                 //
-    "  sources (Sequence[int] | buffer): The vertex every edge leaves.\n"                     //
-    "  targets (Sequence[int] | buffer): The vertex every edge enters.\n"                     //
-    "  edges (Sequence[int] | buffer, optional): The identifier of every edge, which tells\n" //
-    "    apart several edges between one pair; None gives every edge `default_edge_id`.\n"    //
-    "  collection (int | str, optional): The graph collection, by identifier or by name.\n"   //
+char const doc_graph_upsert_edges[] =                                                             //
+    "graph_upsert_edges(sources, targets, *, edges=None, collection=None, flush=False)\n"         //
+    "answers None.\n"                                                                             //
+    "\n"                                                                                          //
+    "Inserts a batch of edges, creating the vertices they connect. An edge already present\n"     //
+    "is kept, so upserting the same batch twice changes nothing.\n"                               //
+    "\n"                                                                                          //
+    "Args:\n"                                                                                     //
+    "  sources (Sequence[KeyLike] | buffer): The vertex every edge leaves.\n"                     //
+    "  targets (Sequence[KeyLike] | buffer): The vertex every edge enters.\n"                     //
+    "  edges (Sequence[KeyLike] | buffer, optional): The identifier of every edge, which tells\n" //
+    "    apart several edges between one pair; None gives every edge `default_edge_id`.\n"        //
+    "  collection (UUID | str, optional): The graph collection, by identifier or by name.\n"      //
     "  flush (bool, optional): Whether to reach the drive before returning.";
 
 PyObject* ustore_py_api_graph_upsert_edges(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
@@ -183,18 +183,18 @@ PyObject* ustore_py_api_graph_upsert_edges(PyObject* self, PyObject* const* args
     Py_RETURN_NONE;
 }
 
-char const doc_graph_remove_edges[] =                                                          //
-    "graph_remove_edges(sources, targets, *, edges=None, collection=None, flush=False)\n"      //
-    "answers None.\n"                                                                          //
-    "\n"                                                                                       //
-    "Removes a batch of edges and keeps the vertices they connected, even once isolated.\n"    //
-    "\n"                                                                                       //
-    "Args:\n"                                                                                  //
-    "  sources (Sequence[int] | buffer): The vertex every edge leaves.\n"                      //
-    "  targets (Sequence[int] | buffer): The vertex every edge enters.\n"                      //
-    "  edges (Sequence[int] | buffer, optional): The identifier of every edge; None removes\n" //
-    "    the edges that were given `default_edge_id`.\n"                                       //
-    "  collection (int | str, optional): The graph collection, by identifier or by name.\n"    //
+char const doc_graph_remove_edges[] =                                                              //
+    "graph_remove_edges(sources, targets, *, edges=None, collection=None, flush=False)\n"          //
+    "answers None.\n"                                                                              //
+    "\n"                                                                                           //
+    "Removes a batch of edges and keeps the vertices they connected, even once isolated.\n"        //
+    "\n"                                                                                           //
+    "Args:\n"                                                                                      //
+    "  sources (Sequence[KeyLike] | buffer): The vertex every edge leaves.\n"                      //
+    "  targets (Sequence[KeyLike] | buffer): The vertex every edge enters.\n"                      //
+    "  edges (Sequence[KeyLike] | buffer, optional): The identifier of every edge; None removes\n" //
+    "    the edges that were given `default_edge_id`.\n"                                           //
+    "  collection (UUID | str, optional): The graph collection, by identifier or by name.\n"       //
     "  flush (bool, optional): Whether to reach the drive before returning.";
 
 PyObject* ustore_py_api_graph_remove_edges(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
@@ -264,24 +264,26 @@ static PyObject* edges_adopt(ustore_arena_t arena, ustore_key_t* tape, ustore_ve
     instance->count = count;
     instance->shape[0] = (Py_ssize_t)offsets[count];
     instance->shape[1] = 3;
+    instance->shape[2] = (Py_ssize_t)sizeof(ustore_key_t);
     instance->strides[0] = 3 * (Py_ssize_t)sizeof(ustore_key_t);
     instance->strides[1] = (Py_ssize_t)sizeof(ustore_key_t);
+    instance->strides[2] = 1;
     return (PyObject*)instance;
 }
 
-char const doc_graph_find_edges[] =                                                             //
-    "graph_find_edges(vertices, *, role='any', collection=None, snapshot=0) answers Edges.\n"   //
-    "\n"                                                                                        //
-    "Finds every edge a batch of vertices takes part in. The edges of one vertex come sorted\n" //
-    "by neighbour; with both roles the outgoing ones precede the incoming ones.\n"              //
-    "\n"                                                                                        //
-    "Args:\n"                                                                                   //
-    "  vertices (Sequence[int] | buffer): The vertices whose edges are found.\n"                //
-    "  role (str, optional): 'source' for the edges a vertex leaves by, 'target' for those\n"   //
-    "    it is entered by, or 'any' for both, which is how an undirected graph asks.\n"         //
-    "  collection (int | str, optional): The graph collection, by identifier or by name.\n"     //
-    "  snapshot (int, optional): The snapshot to read; 0 reads the head.\n"                     //
-    "Returns:\n"                                                                                //
+char const doc_graph_find_edges[] =                                                              //
+    "graph_find_edges(vertices, *, role='any', collection=None, snapshot=None) answers Edges.\n" //
+    "\n"                                                                                         //
+    "Finds every edge a batch of vertices takes part in. The edges of one vertex come sorted\n"  //
+    "by neighbour; with both roles the outgoing ones precede the incoming ones.\n"               //
+    "\n"                                                                                         //
+    "Args:\n"                                                                                    //
+    "  vertices (Sequence[KeyLike] | buffer): The vertices whose edges are found.\n"             //
+    "  role (str, optional): 'source' for the edges a vertex leaves by, 'target' for those\n"    //
+    "    it is entered by, or 'any' for both, which is how an undirected graph asks.\n"          //
+    "  collection (UUID | str, optional): The graph collection, by identifier or by name.\n"     //
+    "  snapshot (Snapshot, optional): The snapshot to read; None reads the head.\n"              //
+    "Returns:\n"                                                                                 //
     "  Edges: One run of (source, target, edge) triples per vertex, None where it is absent.";
 
 PyObject* ustore_py_api_graph_find_edges(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
@@ -331,17 +333,17 @@ PyObject* ustore_py_api_graph_find_edges(PyObject* self, PyObject* const* args, 
     return edges_adopt(arena, tape, degrees, vertices_count);
 }
 
-char const doc_graph_degrees[] =                                                             //
-    "graph_degrees(vertices, *, role='any', collection=None, snapshot=0) answers a tuple.\n" //
-    "\n"                                                                                     //
-    "Counts the edges of a batch of vertices without exporting them.\n"                      //
-    "\n"                                                                                     //
-    "Args:\n"                                                                                //
-    "  vertices (Sequence[int] | buffer): The vertices whose edges are counted.\n"           //
-    "  role (str, optional): 'source', 'target' or 'any', as `graph_find_edges` takes it.\n" //
-    "  collection (int | str, optional): The graph collection, by identifier or by name.\n"  //
-    "  snapshot (int, optional): The snapshot to read; 0 reads the head.\n"                  //
-    "Returns:\n"                                                                             //
+char const doc_graph_degrees[] =                                                                //
+    "graph_degrees(vertices, *, role='any', collection=None, snapshot=None) answers a tuple.\n" //
+    "\n"                                                                                        //
+    "Counts the edges of a batch of vertices without exporting them.\n"                         //
+    "\n"                                                                                        //
+    "Args:\n"                                                                                   //
+    "  vertices (Sequence[KeyLike] | buffer): The vertices whose edges are counted.\n"          //
+    "  role (str, optional): 'source', 'target' or 'any', as `graph_find_edges` takes it.\n"    //
+    "  collection (UUID | str, optional): The graph collection, by identifier or by name.\n"    //
+    "  snapshot (Snapshot, optional): The snapshot to read; None reads the head.\n"             //
+    "Returns:\n"                                                                                //
     "  tuple[int | None, ...]: The degree of every vertex, None where it is absent.";
 
 PyObject* ustore_py_api_graph_degrees(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
@@ -403,14 +405,14 @@ PyObject* ustore_py_api_graph_degrees(PyObject* self, PyObject* const* args, Py_
 
 #pragma region Vertices
 
-char const doc_graph_upsert_vertices[] =                                                 //
-    "graph_upsert_vertices(vertices, *, collection=None, flush=False) answers None.\n"   //
-    "\n"                                                                                 //
-    "Inserts a batch of vertices without edges, keeping those already present.\n"        //
-    "\n"                                                                                 //
-    "Args:\n"                                                                            //
-    "  vertices (Sequence[int] | buffer): The vertices to insert.\n"                     //
-    "  collection (int | str, optional): The graph collection, by identifier or name.\n" //
+char const doc_graph_upsert_vertices[] =                                                  //
+    "graph_upsert_vertices(vertices, *, collection=None, flush=False) answers None.\n"    //
+    "\n"                                                                                  //
+    "Inserts a batch of vertices without edges, keeping those already present.\n"         //
+    "\n"                                                                                  //
+    "Args:\n"                                                                             //
+    "  vertices (Sequence[KeyLike] | buffer): The vertices to insert.\n"                  //
+    "  collection (UUID | str, optional): The graph collection, by identifier or name.\n" //
     "  flush (bool, optional): Whether to reach the drive before returning.";
 
 PyObject* ustore_py_api_graph_upsert_vertices(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
@@ -456,10 +458,10 @@ char const doc_graph_remove_vertices[] =                                        
     "Removes a batch of vertices together with every edge they take part in.\n"                    //
     "\n"                                                                                           //
     "Args:\n"                                                                                      //
-    "  vertices (Sequence[int] | buffer): The vertices to remove.\n"                               //
+    "  vertices (Sequence[KeyLike] | buffer): The vertices to remove.\n"                           //
     "  role (str, optional): The role every vertex plays, which only a joining graph between\n"    //
     "    two collections needs; 'any' otherwise.\n"                                                //
-    "  collection (int | str, optional): The graph collection, by identifier or by name.\n"        //
+    "  collection (UUID | str, optional): The graph collection, by identifier or by name.\n"       //
     "  flush (bool, optional): Whether to reach the drive before returning.";
 
 PyObject* ustore_py_api_graph_remove_vertices(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
@@ -504,13 +506,13 @@ PyObject* ustore_py_api_graph_remove_vertices(PyObject* self, PyObject* const* a
 
 #pragma region Edge Tapes
 
-static char const doc_Edges[] =                                                                  //
-    "The edges one batch lookup found, read straight out of the arena holding them.\n"           //
-    "\n"                                                                                         //
-    "Indexing answers a `memoryview` of shape (degree, 3) holding the (source, target, edge)\n"  //
-    "triples of one vertex, or None where the vertex is absent; the whole tape exports as one\n" //
-    "array of shape (edges, 3). Nothing is copied, and every view keeps this object, and\n"      //
-    "therefore the arena, alive.";
+static char const doc_Edges[] =                                                              //
+    "The edges one batch lookup found, read straight out of the arena holding them.\n"       //
+    "\n"                                                                                     //
+    "Indexing answers a tuple of (source, target, edge) triples of `uuid.UUID` for one\n"    //
+    "vertex, or None where the vertex is absent, which is where a copy happens. The whole\n" //
+    "tape exports through the buffer protocol as an array of shape (edges, 3, 16) bytes,\n"  //
+    "copying nothing and keeping this object, and therefore the arena, alive while held.";
 
 static void Edges_dealloc(Edges* self) {
     ustore_arena_free(self->arena);
@@ -527,14 +529,29 @@ static PyObject* Edges_item(Edges* self, Py_ssize_t vertex_index) {
     }
     if (self->degrees[vertex_index] == ustore_vertex_degree_missing_k) Py_RETURN_NONE;
     size_t const offset = self->offsets[vertex_index];
-    Py_ssize_t const shape[2] = {(Py_ssize_t)(self->offsets[vertex_index + 1] - offset), 3};
-    void* const data = self->tape ? (void*)(self->tape + offset * 3) : NULL;
-    return ustore_py_span_view((PyObject*)self, data, "q", sizeof(ustore_key_t), 2, shape);
+    Py_ssize_t const found = (Py_ssize_t)(self->offsets[vertex_index + 1] - offset);
+    PyObject* const edges = PyTuple_New(found);
+    if (!edges) return NULL;
+    for (Py_ssize_t edge_index = 0; edge_index != found; ++edge_index) {
+        ustore_key_t const* const members = self->tape + (offset + (size_t)edge_index) * 3;
+        PyObject* const source = ustore_py_uuid_to_object(&members[0].uuid);
+        PyObject* const target = source ? ustore_py_uuid_to_object(&members[1].uuid) : NULL;
+        PyObject* const edge = target ? ustore_py_uuid_to_object(&members[2].uuid) : NULL;
+        PyObject* const triple = edge ? PyTuple_Pack(3, source, target, edge) : NULL;
+        Py_XDECREF(source);
+        Py_XDECREF(target);
+        Py_XDECREF(edge);
+        if (!triple) {
+            Py_DECREF(edges);
+            return NULL;
+        }
+        PyTuple_SET_ITEM(edges, edge_index, triple);
+    }
+    return edges;
 }
 
 static int Edges_getbuffer(Edges* self, Py_buffer* view, int flags) {
-    return ustore_py_buffer_fill(view, (PyObject*)self, self->tape, "q", sizeof(ustore_key_t), 2, self->shape,
-                                 self->strides, flags);
+    return ustore_py_buffer_fill(view, (PyObject*)self, self->tape, "B", 1, 3, self->shape, self->strides, flags);
 }
 
 static PyObject* Edges_repr(Edges* self) {

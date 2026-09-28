@@ -1,7 +1,7 @@
 """Transactions over the C ABI: commits, rollbacks, conflicts and staging, at every isolation the engine offers."""
 
 import pytest
-from capabilities import NEEDS_TRANSACTIONS
+from capabilities import NEEDS_TRANSACTIONS, keys
 
 import ustore
 
@@ -80,7 +80,7 @@ def test_an_exception_leaves_the_work_unpublished(database):
     assert not database.contains(1)
 
 
-def test_stage_answers_a_sequence_number(database):
+def test_stage_answers_a_stamp(database):
     staged = database.transaction()
     try:
         staged.set(1, b"pending")
@@ -95,7 +95,7 @@ def test_batch_verbs_reach_through_a_transaction(database):
     with database.transaction() as staged:
         staged.write([1, 2, 3], [b"a", b"bb", b"ccc"])
         assert [bytes(value) for value in staged.read([1, 2, 3])] == [b"a", b"bb", b"ccc"]
-        assert list(staged.scan(0, 3)[0]) == [1, 2, 3]
+        assert list(staged.scan(0, 3)[0]) == keys([1, 2, 3])
 
 
 # endregion Publishing

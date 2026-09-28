@@ -1,7 +1,8 @@
 """Batch scans and samples: many starts and limits in one call, against the single form beside them."""
 
-import numpy
+import numpy as np
 import pytest
+from capabilities import keys
 
 KEYS = list(range(1, 33))
 
@@ -14,8 +15,8 @@ def populated(view):
 
 
 def runs(found) -> list[list[int]]:
-    """Every request's run of keys, as lists."""
-    return [list(found[request]) for request in range(len(found))]
+    """Every request's run of keys, as lists of the integers they spell."""
+    return [[key.int for key in found[request]] for request in range(len(found))]
 
 
 # region Batch Scans
@@ -26,7 +27,7 @@ def test_scan_batch_matches_the_single_form(populated):
     starts = [1, 9, 25]
     counts = [4, 4, 4]
     batched = runs(populated.scan_batch(starts, counts))
-    alone = [list(populated.scan(start, count)[0]) for start, count in zip(starts, counts, strict=True)]
+    alone = [runs(populated.scan(start, count))[0] for start, count in zip(starts, counts, strict=True)]
     assert batched == alone
 
 
@@ -39,7 +40,7 @@ def test_scan_batch_honours_differing_limits(populated):
 
 def test_scan_batch_takes_a_buffer_of_starts(populated):
     """Starts arrive through the buffer protocol, as every other batch of keys does."""
-    found = populated.scan_batch(numpy.array([2, 10], dtype=numpy.int64), [2, 2])
+    found = populated.scan_batch(np.array([2, 10], dtype=np.int64), [2, 2])
     assert runs(found) == [[2, 3], [10, 11]]
 
 
@@ -63,11 +64,10 @@ def test_scan_batch_repeats_a_start(populated):
 
 
 def test_scan_batch_holds_its_arena(populated):
-    """A run outlives the call after it, since the view keeps the arena alive."""
-    found = populated.scan_batch([1, 9], [2, 2])
-    first = found[0]
+    """An exported tape outlives the call after it, since the view keeps the arena alive."""
+    exported = memoryview(populated.scan_batch([1, 9], [2, 2]))
     populated.scan(1, 100)
-    assert list(first) == [1, 2]
+    assert exported.tobytes() == b"".join(key.bytes for key in keys([1, 2, 9, 10]))
 
 
 @pytest.mark.parametrize(
@@ -75,7 +75,7 @@ def test_scan_batch_holds_its_arena(populated):
     [
         (lambda view: view.scan_batch([1, 2], [1]), ValueError),
         (lambda view: view.scan_batch([1], [1, 2]), ValueError),
-        (lambda view: view.scan_batch([1], [2**33]), ValueError),
+        (lambda view: view.scan_batch([1], [2**64]), ValueError),
         (lambda view: view.scan_batch([1], [-1]), ValueError),
         (lambda view: view.scan_batch([1], 4), TypeError),
         (lambda view: view.scan_batch([1], ["four"]), TypeError),
@@ -101,7 +101,7 @@ def test_sample_batch_draws_one_run_per_limit(populated):
     for request, limit in enumerate([1, 4, 7]):
         drawn = list(found[request])
         assert len(drawn) <= limit
-        assert set(drawn) <= set(KEYS)
+        assert set(drawn) <= set(keys(KEYS))
 
 
 def test_sample_batch_of_no_requests(populated):
@@ -121,7 +121,7 @@ def test_sample_batch_of_an_empty_collection(view):
     [
         (lambda view: view.sample_batch(4), TypeError),
         (lambda view: view.sample_batch([-2]), ValueError),
-        (lambda view: view.sample_batch([2**33]), ValueError),
+        (lambda view: view.sample_batch([2**64]), ValueError),
     ],
     ids=["bare-limit", "negative-limit", "huge-limit"],
 )

@@ -170,11 +170,11 @@ struct field_type_t {
 
 /** The first column of a table, naming the document of every row. */
 struct table_index_view_t {
-    strided_iterator<ustore_collection_t const> collections_begin;
+    strided_iterator<ustore_collection_id_t const> collections_begin;
     strided_iterator<ustore_key_t const> keys_begin;
     std::size_t count {0};
 
-    strided_range<ustore_collection_t const> collections() const noexcept { return {collections_begin, count}; }
+    strided_range<ustore_collection_id_t const> collections() const noexcept { return {collections_begin, count}; }
     strided_range<ustore_key_t const> keys() const noexcept { return {keys_begin, count}; }
 };
 
@@ -242,7 +242,7 @@ class docs_table {
     ustore_size_t docs_count_;
     ustore_size_t fields_count_;
 
-    strided_iterator<ustore_collection_t const> collections_;
+    strided_iterator<ustore_collection_id_t const> collections_;
     strided_iterator<ustore_key_t const> keys_;
     strided_iterator<ustore_str_view_t const> fields_;
     strided_iterator<ustore_doc_field_type_t const> types_;
@@ -257,12 +257,13 @@ class docs_table {
 
   public:
     docs_table( //
-        ustore_size_t docs_count, ustore_size_t fields_count, strided_iterator<ustore_collection_t const> collections,
-        strided_iterator<ustore_key_t const> keys, strided_iterator<ustore_str_view_t const> fields,
-        strided_iterator<ustore_doc_field_type_t const> types, ustore_octet_t** columns_validities = nullptr,
-        ustore_octet_t** columns_conversions = nullptr, ustore_octet_t** columns_collisions = nullptr,
-        ustore_byte_t** columns_scalars = nullptr, ustore_length_t** columns_offsets = nullptr,
-        ustore_length_t** columns_lengths = nullptr, ustore_byte_t* tape = nullptr) noexcept
+        ustore_size_t docs_count, ustore_size_t fields_count,
+        strided_iterator<ustore_collection_id_t const> collections, strided_iterator<ustore_key_t const> keys,
+        strided_iterator<ustore_str_view_t const> fields, strided_iterator<ustore_doc_field_type_t const> types,
+        ustore_octet_t** columns_validities = nullptr, ustore_octet_t** columns_conversions = nullptr,
+        ustore_octet_t** columns_collisions = nullptr, ustore_byte_t** columns_scalars = nullptr,
+        ustore_length_t** columns_offsets = nullptr, ustore_length_t** columns_lengths = nullptr,
+        ustore_byte_t* tape = nullptr) noexcept
         : docs_count_(docs_count), fields_count_(fields_count), collections_(collections), keys_(keys), fields_(fields),
           types_(types), columns_validities_(columns_validities), columns_conversions_(columns_conversions),
           columns_collisions_(columns_collisions), columns_scalars_(columns_scalars), columns_offsets_(columns_offsets),

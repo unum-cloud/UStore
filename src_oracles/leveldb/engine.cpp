@@ -4,10 +4,34 @@
  *  @date January 9, 2023
  *  @brief Embedded persistent key-value store on LevelDB, with collections as key ranges and without transactions.
  *
- *  LevelDB keeps one sorted keyspace, so every stored key leads with a tag naming its range, and the pairs of each
- *  collection follow the tag as one contiguous run. The pairs of collections keyed by integers and by strings, the
- *  names of collections, the catalog of collections and its counter each take a tag of their own, so no key a caller
- *  passes reaches another range.
+ *  LevelDB keeps one keyspace in bytewise order, so every stored key leads with the UUID of its collection and the
+ *  pairs of each collection lie in one contiguous run. The collection's modality shapes the rest of the key, and the
+ *  catalog and the names are two more collections under reserved UUIDs:
+ *
+ *  @code{.c}
+ *  struct pairs {              // blobs, docs, graph and any collections, the main one under the nil UUID
+ *      uint8_t collection[16]; // offset 0
+ *      uint8_t key[16];        // offset 16, 32 bytes in all
+ *  };
+ *  struct strings {            // strings collections
+ *      uint8_t collection[16]; // offset 0
+ *      char string[];          // offset 16
+ *  };
+ *  struct catalog {            // every collection but the main one, valued by a `struct catalog_entry`
+ *      uint8_t collection[16]; // offset 0, all bytes 0xFF
+ *      uint8_t listed[16];     // offset 16
+ *  };
+ *  struct catalog_entry {
+ *      uint8_t modality;       // offset 0
+ *      char name[];            // offset 1, empty for an anonymous collection
+ *  };
+ *  struct names {              // valued by a `name_record_t`
+ *      uint8_t collection[16]; // offset 0, all bytes 0xFF but the last, 0xFE
+ *      char name[];            // offset 16
+ *  };
+ *  @endcode
+ *
+ *  A block stores the bytes a key shares with its predecessor once, so the leading UUID costs little on disk.
  */
 
 #include <cstddef> // `offsetof`
@@ -15,7 +39,6 @@
 #include <cstring> // `std::memcpy`
 
 #include <charconv>     // `std::from_chars`
-#include <compare>      // `std::strong_ordering`
 #include <limits>       // `std::numeric_limits`
 #include <memory>       // `std::unique_ptr`
 #include <mutex>        // `std::lock_guard`, `std::mutex`
@@ -26,14 +49,12 @@
 #include <system_error> // `std::errc`
 
 #include <fmt/format.h> // `fmt::format_to_n`
-#include <leveldb/comparator.h>
 #include <leveldb/db.h>
 #include <leveldb/write_batch.h>
 
-#include <smashtable/basic_hash_table.hpp>
-
 #include <ustore/db.h>
 #include <ustore/ranges_args.hpp> // `places_arg_t`, `strings_arg_t`
+#include <ustore/status.hpp>      // `expected`, `status_t`
 
 #include "engine.hpp"                 // `engine_t`, `handle_t`, `handle_cast`
 #include "helpers/blocking_files.hpp" // `directory_exists`
@@ -53,196 +74,121 @@ using native_status_t = ::leveldb::Status;
 /** An owned LevelDB iterator. */
 using iterator_pointer_t = std::unique_ptr<::leveldb::Iterator>;
 
-/**
- *  @brief The range of the keyspace a stored key lies in, which its leading byte names and which orders the ranges.
- *
- *  @code{.c}
- *  struct integers { uint8_t tag; uint64_t collection; int64_t key; };  // 17 bytes, the value of the pair
- *  struct strings  { uint8_t tag; uint64_t collection; char string[]; }; // 9 bytes and up, the value of the pair
- *  struct names    { uint8_t tag; char name[]; };                       // valued by a `name_record_t`
- *  struct catalog  { uint8_t tag; uint64_t collection; };               // valued by its modality byte and its name
- *  struct counter  { uint8_t tag; };                                    // valued by the next collection's identifier
- *  @endcode
- */
-enum class tag_t : std::uint8_t {
-    integers_k,
-    strings_k,
-    names_k,
-    catalog_k,
-    counter_k,
+/** The collection holding the catalog, all bytes `0xFF`, which no minted UUIDv7 reaches, as its byte 6 is `0x7X`. */
+constexpr ustore_collection_id_t catalog_collection_k {
+    {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}}};
+
+/** The collection holding the names of collections, all bytes `0xFF` but the last `0xFE`, which no minted UUIDv7
+ *  reaches either. */
+constexpr ustore_collection_id_t names_collection_k {
+    {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE}}};
+
+/** Bytes every stored key leads with, the UUID of its collection. */
+constexpr std::size_t collection_bytes_k = sizeof(ustore_collection_id_t);
+
+/** A stored key of a `struct pairs` or a `struct catalog`, which a slice may view for as long as it lives. */
+struct uuid_key_t {
+    char bytes[collection_bytes_k + sizeof(ustore_uuid_t)];
+
+    [[nodiscard]] ::leveldb::Slice slice() const noexcept { return {bytes, sizeof(bytes)}; }
 };
 
-/** Bytes a stored key spends on its tag and its collection, ahead of the key or string within the collection. */
-constexpr std::size_t head_bytes_k = 1 + sizeof(ustore_collection_t);
-
-/** A stored key of @p bytes_ bytes, which a slice may view for as long as it lives. */
-template <std::size_t bytes_>
-struct fixed_key {
-    char bytes[bytes_] {};
-
-    [[nodiscard]] ::leveldb::Slice slice() const noexcept { return {bytes, bytes_}; }
-};
-
-/** A stored key of a pair of an integer-keyed collection. */
-using integer_key_t = fixed_key<head_bytes_k + sizeof(ustore_key_t)>;
-
-/** A stored key of a tag and a collection alone. */
-using head_key_t = fixed_key<head_bytes_k>;
-
-/** A stored key of a tag alone. */
-using tag_key_t = fixed_key<1>;
-
-/** The tag and the collection alone, which a seek to the first stored key of @p collection in @p tag takes. */
-inline head_key_t head_key(tag_t tag, ustore_collection_t collection) noexcept {
-    head_key_t stored;
-    stored.bytes[0] = static_cast<char>(tag);
-    std::memcpy(stored.bytes + 1, &collection, sizeof(collection));
+/** The stored key of @p uuid in @p collection: a key of a collection keyed by UUIDs, or a collection the catalog
+ *  lists. */
+inline uuid_key_t uuid_key(ustore_collection_id_t const& collection, ustore_uuid_t const& uuid) noexcept {
+    uuid_key_t stored;
+    std::memcpy(stored.bytes, collection.uuid.bytes, collection_bytes_k);
+    std::memcpy(stored.bytes + collection_bytes_k, uuid.bytes, sizeof(uuid.bytes));
     return stored;
 }
 
-/** The stored key of @p key in @p collection, which is keyed by integers. */
-inline integer_key_t integer_key(ustore_collection_t collection, ustore_key_t key) noexcept {
-    integer_key_t stored;
-    stored.bytes[0] = static_cast<char>(tag_t::integers_k);
-    std::memcpy(stored.bytes + 1, &collection, sizeof(collection));
-    std::memcpy(stored.bytes + head_bytes_k, &key, sizeof(key));
-    return stored;
-}
-
-/** Writes into @p stored the stored key of @p text in @p collection, which is keyed by strings. */
-inline ::leveldb::Slice string_key(ustore_collection_t collection, std::string_view text, std::string& stored) {
-    head_key_t const head = head_key(tag_t::strings_k, collection);
-    stored.assign(head.bytes, head_bytes_k);
+/** Writes into @p stored the stored key of @p text in @p collection: a string of a strings collection, or a name. */
+inline ::leveldb::Slice string_key(ustore_collection_id_t const& collection, std::string_view text,
+                                   std::string& stored) {
+    stored.assign(reinterpret_cast<char const*>(collection.uuid.bytes), collection_bytes_k);
     stored.append(text);
     return stored;
 }
 
-/** Writes into @p stored the stored key of the collection name @p name. */
-inline ::leveldb::Slice name_key(std::string_view name, std::string& stored) {
-    stored.assign(1, static_cast<char>(tag_t::names_k));
-    stored.append(name);
-    return stored;
+/** The 16 bytes every stored key of @p collection leads with, where a walk of it starts, viewing @p collection
+ *  itself. */
+inline ::leveldb::Slice prefix_of(ustore_collection_id_t const& collection) noexcept {
+    return {reinterpret_cast<char const*>(collection.uuid.bytes), collection_bytes_k};
 }
 
-/** The stored key of the counter every created collection takes its identifier from. */
-constexpr tag_key_t counter_key_k {{static_cast<char>(tag_t::counter_k)}};
+/** Refuses a temporary collection, which would leave the prefix viewing freed bytes. */
+::leveldb::Slice prefix_of(ustore_collection_id_t const&&) = delete;
 
-inline tag_t tag_of(::leveldb::Slice const& stored) noexcept { return static_cast<tag_t>(stored[0]); }
-
-/** The collection @p stored belongs to, whose bytes LevelDB leaves unaligned. */
-inline ustore_collection_t collection_of(::leveldb::Slice const& stored) noexcept {
-    ustore_collection_t collection;
-    std::memcpy(&collection, stored.data() + 1, sizeof(collection));
-    return collection;
+/** The 16 bytes @p stored holds past its collection's UUID: the key of a pair, or the collection a catalog entry
+ *  lists. */
+inline ustore_uuid_t tail_uuid_of(::leveldb::Slice const& stored) noexcept {
+    ustore_uuid_t uuid;
+    std::memcpy(uuid.bytes, stored.data() + collection_bytes_k, sizeof(uuid.bytes));
+    return uuid;
 }
 
-/** The integer key @p stored holds within its collection. */
-inline ustore_key_t key_of(::leveldb::Slice const& stored) noexcept {
-    ustore_key_t key;
-    std::memcpy(&key, stored.data() + head_bytes_k, sizeof(key));
-    return key;
+/** What follows the collection's UUID in @p stored: the key or string of a pair. */
+inline ::leveldb::Slice tail_of(::leveldb::Slice const& stored) noexcept {
+    return {stored.data() + collection_bytes_k, stored.size() - collection_bytes_k};
 }
 
-/** What follows the head of @p stored, from @p head bytes in: the string of a strings key or the text of a name. */
-inline ::leveldb::Slice tail_of(::leveldb::Slice const& stored, std::size_t head = head_bytes_k) noexcept {
-    return {stored.data() + head, stored.size() - head};
-}
+/** What the catalog records of a collection: `struct catalog_entry`. */
+struct catalog_entry_t {
+    ustore_modality_t modality = ustore_modality_any_k;
 
-/** Whether @p stored lies in the run of @p collection within the range of @p tag. */
-inline bool in_run(::leveldb::Slice const& stored, tag_t tag, ustore_collection_t collection) noexcept {
-    return tag_of(stored) == tag && collection_of(stored) == collection;
-}
-
-/** The range holding the pairs of a collection keyed as @p keying. */
-constexpr tag_t pairs_tag(keying_t keying) noexcept {
-    return keying == keying_t::strings_k ? tag_t::strings_k : tag_t::integers_k;
-}
-
-/** Orders stored keys by tag, then by collection, then integer keys as integers and everything else as bytes. */
-struct key_comparator_t final : public ::leveldb::Comparator {
-
-    int Compare(::leveldb::Slice const& left, ::leveldb::Slice const& right) const override {
-        tag_t const left_tag = tag_of(left);
-        tag_t const right_tag = tag_of(right);
-        if (left_tag != right_tag) return left_tag < right_tag ? -1 : 1;
-        if (left_tag == tag_t::names_k || left_tag == tag_t::counter_k) return left.compare(right);
-
-        ustore_collection_t const left_collection = collection_of(left);
-        ustore_collection_t const right_collection = collection_of(right);
-        if (left_collection != right_collection) return left_collection < right_collection ? -1 : 1;
-
-        // A bare head is shorter than every integer key of its collection, so it seeks ahead of all of them
-        if (left_tag != tag_t::integers_k || left.size() != right.size()) return tail_of(left).compare(tail_of(right));
-        ustore_key_t const left_key = key_of(left);
-        ustore_key_t const right_key = key_of(right);
-        return left_key < right_key ? -1 : left_key > right_key ? 1 : 0;
-    }
-
-    char const* Name() const override { return "ustore.tagged_key"; }
-
-    void FindShortestSeparator(std::string*, ::leveldb::Slice const&) const override {}
-
-    /** Leaves @p key as it is, since LevelDB keeps a successor only when it is physically shorter. */
-    void FindShortSuccessor(std::string*) const override {}
+    /** The name the collection carries, empty for none, viewing the bytes the entry was read from. */
+    std::string_view name;
 };
 
-key_comparator_t const key_comparator_k {};
+/** Reads the catalog entry @p held, whose name views the same bytes, refusing bytes too short to be one. */
+inline expected<catalog_entry_t> read_catalog_entry(::leveldb::Slice const& held) noexcept {
+    if (held.empty()) return status_t {status_code_t::malformed_k, "The catalog entry of a collection is malformed"};
+    return catalog_entry_t {static_cast<ustore_modality_t>(held[0]), {held.data() + 1, held.size() - 1}};
+}
 
-/** Walks the keys of one integer-keyed collection over @p base, handing the reservoir sampler the key of each. */
+/** Walks the keys of one collection keyed by UUIDs over @p base, handing the reservoir sampler the key of each. */
 class collection_walk_t {
     ::leveldb::Iterator& base_;
-    ustore_collection_t collection_;
+    ::leveldb::Slice prefix_;
 
   public:
-    collection_walk_t(::leveldb::Iterator& base, ustore_collection_t collection) noexcept
-        : base_(base), collection_(collection) {}
+    collection_walk_t(::leveldb::Iterator& base, ::leveldb::Slice prefix) noexcept : base_(base), prefix_(prefix) {}
 
     collection_walk_t* operator->() noexcept { return this; }
 
-    void SeekToFirst() {
-        head_key_t const first = head_key(tag_t::integers_k, collection_);
-        base_.Seek(first.slice());
-    }
+    void SeekToFirst() { base_.Seek(prefix_); }
 
     void Next() { base_.Next(); }
 
-    [[nodiscard]] bool Valid() const noexcept {
-        return base_.Valid() && in_run(base_.key(), tag_t::integers_k, collection_);
-    }
+    [[nodiscard]] bool Valid() const noexcept { return base_.Valid() && base_.key().starts_with(prefix_); }
 
     [[nodiscard]] ::leveldb::Slice key() const noexcept { return tail_of(base_.key()); }
 };
 
-/** A snapshot handle, whose address is its identifier. */
-struct snapshot_t {
-
-    /** The LevelDB snapshot. */
-    ::leveldb::Snapshot const* native = nullptr;
-};
-
-/** Identifiers of the live snapshots. */
-using snapshots_t = st::hash_set<ustore_snapshot_t>;
-
 /** The calls this engine serves, which stamp every handle it hands out. */
 extern engine_t const engine_k;
 
-/** The open database, its options and its snapshots. */
+/** The open database and its options. */
 struct database_t : handle_t {
 
     /** Options the database opened with, reused to create exports. */
     ::leveldb::Options options;
 
-    /** Identifiers of the live snapshots. */
-    snapshots_t snapshots;
-
     /** The open database. */
     std::unique_ptr<native_t> native;
 
-    /** Guards the snapshots. */
-    std::mutex mutex;
-
     /** Serializes changes to the catalog and the names, so a name is checked and taken in one step. */
     std::mutex catalog_mutex;
+};
+
+/** A snapshot handle, pinning one LevelDB snapshot of its database until freed. */
+struct snapshot_t : handle_t {
+
+    /** The database the snapshot was taken of, which releases it. */
+    database_t* database = nullptr;
+
+    /** The LevelDB snapshot. */
+    ::leveldb::Snapshot const* native = nullptr;
 };
 
 inline ::leveldb::Slice to_slice(value_view_t value) noexcept {
@@ -253,73 +199,57 @@ inline value_view_t to_value(::leveldb::Slice const& slice) noexcept {
     return {reinterpret_cast<ustore_bytes_cptr_t>(slice.data()), static_cast<ustore_length_t>(slice.size())};
 }
 
+/** The status LevelDB's @p status stands for, success included. */
+status_t status_of(native_status_t const& status) noexcept {
+    if (status.ok()) return {};
+    if (status.IsCorruption()) return {status_code_t::malformed_k, "LevelDB found corrupted data"};
+    if (status.IsIOError()) return {status_code_t::input_output_k, "LevelDB failed an I/O operation"};
+    if (status.IsInvalidArgument()) return {status_code_t::invalid_argument_k, "LevelDB rejected an argument"};
+    if (status.IsNotFound()) return {status_code_t::not_found_k, "LevelDB found no such entry"};
+    if (status.IsNotSupportedError()) return {status_code_t::unsupported_k, "LevelDB does not support the operation"};
+    return {status_code_t::internal_k, "LevelDB failed"};
+}
+
 /** Exports a failed status into @p error, answering whether it failed. */
 bool export_error(native_status_t const& status, ustore_error_t* error) noexcept {
     if (status.ok()) return false;
-
-    if (status.IsCorruption()) *error = {ustore_error_malformed_k, "LevelDB found corrupted data"};
-    else if (status.IsIOError()) *error = {ustore_error_io_k, "LevelDB failed an I/O operation"};
-    else if (status.IsInvalidArgument()) *error = {ustore_error_invalid_argument_k, "LevelDB rejected an argument"};
-    else if (status.IsNotFound()) *error = {ustore_error_not_found_k, "LevelDB found no such entry"};
-    else if (status.IsNotSupportedError())
-        *error = {ustore_error_unsupported_k, "LevelDB does not support the operation"};
-    else *error = {ustore_error_internal_k, "LevelDB failed"};
+    *error = status_of(status);
     return true;
 }
 
-/** Reads what @p collection holds, answering false after reporting a collection the catalog does not list. */
-bool modality_of(database_t& database, ustore_collection_t collection, ustore_modality_t& modality,
-                 ustore_error_t* error) {
-    modality = ustore_modality_any_k;
-    if (collection == ustore_collection_main_k) return true;
+/** What the catalog records of @p collection, whose name views @p held, refusing a collection the catalog does not
+ *  list, the reserved ones included. */
+expected<catalog_entry_t> look_up(database_t& database, ustore_collection_id_t const& collection, std::string& held) {
+    if (collection == ustore_collection_main_k) return catalog_entry_t {};
 
+    uuid_key_t const key = uuid_key(catalog_collection_k, collection.uuid);
+    native_status_t const status = database.native->Get(::leveldb::ReadOptions(), key.slice(), &held);
+    if (status.IsNotFound()) return status_t {status_code_t::not_found_k, "No such collection"};
+    if (!status.ok()) return status_of(status);
+    return read_catalog_entry(held);
+}
+
+/** Refuses a batch addressing a collection the catalog does not list or one keyed otherwise than @p keying, looking
+ *  each run of tasks on one collection up once. */
+status_t resolve_collections(database_t& database, strided_iterator<ustore_collection_id_t const> collections,
+                             std::size_t count, keying_t keying) {
     std::string held;
-    head_key_t const entry = head_key(tag_t::catalog_k, collection);
-    native_status_t const status = database.native->Get(::leveldb::ReadOptions(), entry.slice(), &held);
-    if (status.IsNotFound()) {
-        *error = {ustore_error_not_found_k, "No such collection"};
-        return false;
-    }
-    if (export_error(status, error)) return false;
-    if (held.empty()) {
-        *error = {ustore_error_malformed_k, "The catalog entry of a collection is malformed"};
-        return false;
-    }
-    modality = static_cast<ustore_modality_t>(held[0]);
-    return true;
-}
-
-/** Refuses @p collection unless the catalog lists it keyed as @p keying, answering whether it refused. */
-bool refuse_collection(database_t& database, ustore_collection_t collection, keying_t keying, ustore_error_t* error) {
-    ustore_modality_t modality = ustore_modality_any_k;
-    if (!modality_of(database, collection, modality, error)) return true;
-    if (keying_of(modality) == keying) return false;
-    *error = {ustore_error_invalid_argument_k,
-              keying == keying_t::strings_k ? "The collection holds no strings" : "The collection holds strings"};
-    return true;
-}
-
-/** Refuses a batch addressing a collection the catalog does not list keyed as @p keying, checking each run of tasks
- *  on one collection once. */
-bool refuse_collections(database_t& database, strided_iterator<ustore_collection_t const> collections,
-                        std::size_t count, keying_t keying, ustore_error_t* error) {
-    if (!collections) return count && refuse_collection(database, ustore_collection_main_k, keying, error);
     for (std::size_t task_index = 0; task_index != count; ++task_index) {
-        bool const repeated = task_index != 0 && collections[task_index] == collections[task_index - 1];
-        if (!repeated && refuse_collection(database, collections[task_index], keying, error)) return true;
+        bool const repeated = task_index != 0 && collections && collections[task_index] == collections[task_index - 1];
+        if (repeated) continue;
+        ustore_collection_id_t const collection = collections ? collections[task_index] : ustore_collection_main_k;
+        auto [entry, look_up_status] = look_up(database, collection, held);
+        if (look_up_status.failed()) return look_up_status;
+        if (keying_of(entry.modality) != keying)
+            return {status_code_t::invalid_argument_k,
+                    keying == keying_t::strings_k ? "The collection holds no strings" : "The collection holds strings"};
     }
-    return false;
+    return {};
 }
 
-/** Points @p options at the snapshot @p id, leaving them untouched for the zero identifier. */
-void use_snapshot(database_t& database, ustore_snapshot_t id, ::leveldb::ReadOptions& options, ustore_error_t* error) {
-    if (!id) return;
-    std::lock_guard lock {database.mutex};
-    if (database.snapshots.find(id) == database.snapshots.end()) {
-        *error = {ustore_error_not_found_k, "The snapshot doesn't exist"};
-        return;
-    }
-    options.snapshot = reinterpret_cast<snapshot_t*>(id)->native;
+/** Points @p options at @p snapshot, leaving them at the head for a call naming none. */
+void use_snapshot(ustore_snapshot_t snapshot, ::leveldb::ReadOptions& options) noexcept {
+    if (snapshot) options.snapshot = handle_cast<snapshot_t>(snapshot)->native;
 }
 
 #pragma endregion Database
@@ -334,7 +264,7 @@ void write_one(database_t& database, places_arg_t const& places, contents_arg_t 
 
     auto place = places[0];
     auto content = contents[0];
-    integer_key_t const key = integer_key(place.collection, place.key);
+    uuid_key_t const key = uuid_key(place.collection, place.key.uuid);
     native_status_t const status = !content ? database.native->Delete(options, key.slice())
                                             : database.native->Put(options, key.slice(), to_slice(content));
     export_error(status, error);
@@ -347,7 +277,7 @@ void write_many(database_t& database, places_arg_t const& places, contents_arg_t
     for (std::size_t task_index = 0; task_index != places.size(); ++task_index) {
         auto place = places[task_index];
         auto content = contents[task_index];
-        integer_key_t const key = integer_key(place.collection, place.key);
+        uuid_key_t const key = uuid_key(place.collection, place.key.uuid);
         if (!content) batch.Delete(key.slice());
         else batch.Put(key.slice(), to_slice(content));
     }
@@ -364,7 +294,8 @@ void get_each(database_t& database, places_arg_t const& places, ::leveldb::ReadO
     // `Get` writes only into a string, so one buffer serves the whole batch
     std::string value;
     for (std::size_t task_index = 0; task_index != places.size(); ++task_index) {
-        integer_key_t const key = integer_key(places[task_index].collection, places[task_index].key);
+        auto place = places[task_index];
+        uuid_key_t const key = uuid_key(place.collection, place.key.uuid);
         native_status_t const status = database.native->Get(options, key.slice(), &value);
         if (status.IsNotFound()) {
             enumerator(task_index, value_view_t {});
@@ -382,7 +313,8 @@ void seek_each(database_t& database, places_arg_t const& places, ::leveldb::Read
 
     iterator_pointer_t iterator {database.native->NewIterator(options)};
     for (std::size_t task_index = 0; task_index != places.size(); ++task_index) {
-        integer_key_t const key = integer_key(places[task_index].collection, places[task_index].key);
+        auto place = places[task_index];
+        uuid_key_t const key = uuid_key(place.collection, place.key.uuid);
         iterator->Seek(key.slice());
         if (iterator->Valid() && iterator->key().compare(key.slice()) == 0) {
             enumerator(task_index, to_value(iterator->value()));
@@ -422,7 +354,6 @@ void database_init(ustore_database_init_leveldb_t& arguments) {
         *arguments.error = {ustore_error_out_of_memory_k, "Failed to allocate the database"};
         return;
     }
-    database->options.comparator = &key_comparator_k;
     database->options.compression = ::leveldb::kNoCompression;
     database->options.create_if_missing = true;
 
@@ -434,7 +365,7 @@ void database_init(ustore_database_init_leveldb_t& arguments) {
     }
     database->native.reset(native);
     database->engine = &engine_k;
-    *arguments.db = static_cast<handle_t*>(database.release());
+    *arguments.db = c_handle<ustore_database_t>(database.release());
 }
 
 void database_capabilities(ustore_database_capabilities_t& arguments) {
@@ -445,45 +376,17 @@ void database_capabilities(ustore_database_capabilities_t& arguments) {
 
 #pragma region Snapshots
 
-void snapshot_list(ustore_snapshot_list_t& arguments) {
+void snapshot_init(ustore_snapshot_init_t& arguments) {
     if (!arguments.db) {
         *arguments.error = {ustore_error_uninitialized_k, "Database is uninitialized"};
         return;
     }
-    if (!arguments.count || !arguments.ids) {
-        *arguments.error = {ustore_error_invalid_argument_k, "Null outputs specified"};
-        return;
-    }
-
-    linked_memory_lock_t arena = linked_memory(arguments.arena, arguments.options, arguments.error);
-    if (arguments.error->status) return;
-
-    database_t& database = *handle_cast<database_t>(arguments.db);
-    std::lock_guard lock {database.mutex};
-    std::size_t const snapshots_count = database.snapshots.size();
-    *arguments.count = static_cast<ustore_size_t>(snapshots_count);
-
-    auto ids = arena.alloc_or_dummy(snapshots_count, arguments.error, arguments.ids);
-    if (arguments.error->status) return;
-
-    std::size_t index = 0;
-    [[maybe_unused]] auto const walked = database.snapshots.for_each(
-        [&](auto const& slot) noexcept { ids[index++] = slot.key(); });
-}
-
-void snapshot_create(ustore_snapshot_create_t& arguments) {
-    if (!arguments.db) {
-        *arguments.error = {ustore_error_uninitialized_k, "Database is uninitialized"};
+    if (!arguments.snapshot) {
+        *arguments.error = {ustore_error_invalid_argument_k, "Need an output for the snapshot"};
         return;
     }
 
     database_t& database = *handle_cast<database_t>(arguments.db);
-    std::lock_guard lock {database.mutex};
-    if (database.snapshots.find(*arguments.id) != database.snapshots.end()) {
-        *arguments.error = {ustore_error_already_exists_k, "Such snapshot already exists"};
-        return;
-    }
-
     std::unique_ptr<snapshot_t> snapshot {new (std::nothrow) snapshot_t};
     if (!snapshot) {
         *arguments.error = {ustore_error_out_of_memory_k, "Failed to allocate the snapshot handle"};
@@ -494,15 +397,9 @@ void snapshot_create(ustore_snapshot_create_t& arguments) {
         *arguments.error = {ustore_error_internal_k, "Failed to take a snapshot"};
         return;
     }
-
-    auto const id = reinterpret_cast<ustore_snapshot_t>(snapshot.get());
-    if (st::failed(database.snapshots.upsert(id))) {
-        database.native->ReleaseSnapshot(snapshot->native);
-        *arguments.error = {ustore_error_out_of_memory_k, "Failed to register the snapshot"};
-        return;
-    }
-    [[maybe_unused]] snapshot_t* const registered = snapshot.release();
-    *arguments.id = id;
+    snapshot->engine = &engine_k;
+    snapshot->database = &database;
+    *arguments.snapshot = c_handle<ustore_snapshot_t>(snapshot.release());
 }
 
 void snapshot_export(ustore_snapshot_export_t& arguments) {
@@ -512,10 +409,13 @@ void snapshot_export(ustore_snapshot_export_t& arguments) {
     }
     database_t& database = *handle_cast<database_t>(arguments.db);
 
+    if (!arguments.snapshot) {
+        *arguments.error = {ustore_error_invalid_argument_k, "Need a snapshot to export"};
+        return;
+    }
     ::leveldb::ReadOptions scan_options;
     scan_options.fill_cache = false;
-    use_snapshot(database, arguments.id, scan_options, arguments.error);
-    if (arguments.error->status) return;
+    use_snapshot(arguments.snapshot, scan_options);
 
     native_t* exported_native = nullptr;
     native_status_t status = native_t::Open(database.options, arguments.path, &exported_native);
@@ -543,23 +443,6 @@ void snapshot_export(ustore_snapshot_export_t& arguments) {
     export_error(status, arguments.error);
 }
 
-void snapshot_drop(ustore_snapshot_drop_t& arguments) {
-    if (!arguments.db) {
-        *arguments.error = {ustore_error_uninitialized_k, "Database is uninitialized"};
-        return;
-    }
-    database_t& database = *handle_cast<database_t>(arguments.db);
-    std::lock_guard lock {database.mutex};
-    if (!database.snapshots.erase(arguments.id)) {
-        *arguments.error = {ustore_error_not_found_k, "The snapshot doesn't exist"};
-        return;
-    }
-
-    snapshot_t* const snapshot = reinterpret_cast<snapshot_t*>(arguments.id);
-    database.native->ReleaseSnapshot(snapshot->native);
-    delete snapshot;
-}
-
 #pragma endregion Snapshots
 
 #pragma region Reads and Writes
@@ -571,7 +454,7 @@ void write(ustore_write_t& arguments) {
     }
 
     database_t& database = *handle_cast<database_t>(arguments.db);
-    strided_iterator<ustore_collection_t const> collections {arguments.collections, arguments.collections_stride};
+    strided_iterator<ustore_collection_id_t const> collections {arguments.collections, arguments.collections_stride};
     strided_iterator<ustore_key_t const> keys {arguments.keys, arguments.keys_stride};
     strided_iterator<ustore_bytes_cptr_t const> values {arguments.values, arguments.values_stride};
     strided_iterator<ustore_length_t const> offsets {arguments.offsets, arguments.offsets_stride};
@@ -584,7 +467,8 @@ void write(ustore_write_t& arguments) {
     validate_write(arguments.transaction, places, contents, arguments.options, arguments.error);
     if (arguments.error->status) return;
     if (!arguments.tasks_count) return;
-    if (refuse_collections(database, collections, arguments.tasks_count, keying_t::integers_k, arguments.error)) return;
+    *arguments.error = resolve_collections(database, collections, arguments.tasks_count, keying_t::uuids_k);
+    if (arguments.error->status) return;
 
     ::leveldb::WriteOptions options;
     options.sync = arguments.options & ustore_option_write_flush_k;
@@ -604,17 +488,17 @@ void read(ustore_read_t& arguments) {
     if (arguments.error->status) return;
 
     database_t& database = *handle_cast<database_t>(arguments.db);
-    strided_iterator<ustore_collection_t const> collections {arguments.collections, arguments.collections_stride};
+    strided_iterator<ustore_collection_id_t const> collections {arguments.collections, arguments.collections_stride};
     strided_iterator<ustore_key_t const> keys {arguments.keys, arguments.keys_stride};
     places_arg_t places {collections, keys, {}, arguments.tasks_count};
 
     validate_read(arguments.transaction, places, arguments.options, arguments.error);
     if (arguments.error->status) return;
-    if (refuse_collections(database, collections, arguments.tasks_count, keying_t::integers_k, arguments.error)) return;
+    *arguments.error = resolve_collections(database, collections, arguments.tasks_count, keying_t::uuids_k);
+    if (arguments.error->status) return;
 
     ::leveldb::ReadOptions options;
-    use_snapshot(database, arguments.snapshot, options, arguments.error);
-    if (arguments.error->status) return;
+    use_snapshot(arguments.snapshot, options);
 
     auto offsets = arena.alloc_or_dummy(places.count + 1, arguments.error, arguments.offsets);
     if (arguments.error->status) return;
@@ -649,14 +533,15 @@ void scan(ustore_scan_t& arguments) {
     if (arguments.error->status) return;
 
     database_t& database = *handle_cast<database_t>(arguments.db);
-    strided_iterator<ustore_collection_t const> collections {arguments.collections, arguments.collections_stride};
+    strided_iterator<ustore_collection_id_t const> collections {arguments.collections, arguments.collections_stride};
     strided_iterator<ustore_key_t const> start_keys {arguments.start_keys, arguments.start_keys_stride};
     strided_iterator<ustore_length_t const> limits {arguments.count_limits, arguments.count_limits_stride};
     scans_arg_t scans {collections, start_keys, limits, arguments.tasks_count};
 
     validate_scan(arguments.transaction, scans, arguments.options, arguments.error);
     if (arguments.error->status) return;
-    if (refuse_collections(database, collections, arguments.tasks_count, keying_t::integers_k, arguments.error)) return;
+    *arguments.error = resolve_collections(database, collections, arguments.tasks_count, keying_t::uuids_k);
+    if (arguments.error->status) return;
 
     auto offsets = arena.alloc_or_dummy(scans.count + 1, arguments.error, arguments.offsets);
     if (arguments.error->status) return;
@@ -669,20 +554,19 @@ void scan(ustore_scan_t& arguments) {
 
     ::leveldb::ReadOptions options;
     options.fill_cache = false;
-    use_snapshot(database, arguments.snapshot, options, arguments.error);
-    if (arguments.error->status) return;
+    use_snapshot(arguments.snapshot, options);
 
     iterator_pointer_t iterator {database.native->NewIterator(options)};
     for (ustore_size_t task_index = 0; task_index != arguments.tasks_count; ++task_index) {
         scan_t task = scans[task_index];
-        integer_key_t const start = integer_key(task.collection, task.min_key);
+        uuid_key_t const start = uuid_key(task.collection, task.min_key.uuid);
+        ::leveldb::Slice const prefix = prefix_of(task.collection);
         iterator->Seek(start.slice());
         offsets[task_index] = keys_output - *arguments.keys;
 
         ustore_size_t matched_count = 0;
-        while (iterator->Valid() && in_run(iterator->key(), tag_t::integers_k, task.collection) &&
-               matched_count != task.limit) {
-            *keys_output = key_of(iterator->key());
+        while (iterator->Valid() && iterator->key().starts_with(prefix) && matched_count != task.limit) {
+            *keys_output = ustore_key_t {tail_uuid_of(iterator->key())};
             ++keys_output;
             ++matched_count;
             iterator->Next();
@@ -706,10 +590,11 @@ void sample(ustore_sample_t& arguments) {
     if (arguments.error->status) return;
 
     database_t& database = *handle_cast<database_t>(arguments.db);
-    strided_iterator<ustore_collection_t const> collections {arguments.collections, arguments.collections_stride};
+    strided_iterator<ustore_collection_id_t const> collections {arguments.collections, arguments.collections_stride};
     strided_iterator<ustore_length_t const> limits {arguments.count_limits, arguments.count_limits_stride};
     sample_args_t samples {collections, limits, arguments.tasks_count};
-    if (refuse_collections(database, collections, arguments.tasks_count, keying_t::integers_k, arguments.error)) return;
+    *arguments.error = resolve_collections(database, collections, arguments.tasks_count, keying_t::uuids_k);
+    if (arguments.error->status) return;
 
     auto offsets = arena.alloc_or_dummy(samples.count + 1, arguments.error, arguments.offsets);
     if (arguments.error->status) return;
@@ -722,15 +607,15 @@ void sample(ustore_sample_t& arguments) {
 
     ::leveldb::ReadOptions options;
     options.fill_cache = false;
-    use_snapshot(database, arguments.snapshot, options, arguments.error);
-    if (arguments.error->status) return;
+    use_snapshot(arguments.snapshot, options);
 
     iterator_pointer_t iterator {database.native->NewIterator(options)};
     for (std::size_t task_index = 0; task_index != samples.count; ++task_index) {
         sample_arg_t task = samples[task_index];
         offsets[task_index] = keys_output - *arguments.keys;
 
-        collection_walk_t walk {*iterator, task.collection};
+        ::leveldb::Slice const prefix = prefix_of(task.collection);
+        collection_walk_t walk {*iterator, prefix};
         std::size_t const drawn = reservoir_sample_iterator(walk, std::span {keys_output, task.limit});
         if (export_error(iterator->status(), arguments.error)) return;
 
@@ -758,10 +643,11 @@ void measure(ustore_measure_t& arguments) {
     if (arguments.error->status) return;
 
     database_t& database = *handle_cast<database_t>(arguments.db);
-    strided_iterator<ustore_collection_t const> collections {arguments.collections, arguments.collections_stride};
+    strided_iterator<ustore_collection_id_t const> collections {arguments.collections, arguments.collections_stride};
     strided_iterator<ustore_key_t const> start_keys {arguments.start_keys, arguments.start_keys_stride};
     strided_iterator<ustore_key_t const> end_keys {arguments.end_keys, arguments.end_keys_stride};
-    if (refuse_collections(database, collections, arguments.tasks_count, keying_t::integers_k, arguments.error)) return;
+    *arguments.error = resolve_collections(database, collections, arguments.tasks_count, keying_t::uuids_k);
+    if (arguments.error->status) return;
 
     // Memory usage describes the whole database, so one property read serves every task
     std::uint64_t memory_bytes = 0;
@@ -780,9 +666,9 @@ void measure(ustore_measure_t& arguments) {
         min_value_bytes[task_index] = static_cast<ustore_size_t>(0);
         max_value_bytes[task_index] = static_cast<ustore_size_t>(0);
 
-        ustore_collection_t const collection = collections ? collections[task_index] : ustore_collection_main_k;
-        integer_key_t const min_key = integer_key(collection, start_keys[task_index]);
-        integer_key_t const max_key = integer_key(collection, end_keys[task_index]);
+        ustore_collection_id_t const collection = collections ? collections[task_index] : ustore_collection_main_k;
+        uuid_key_t const min_key = uuid_key(collection, start_keys[task_index].uuid);
+        uuid_key_t const max_key = uuid_key(collection, end_keys[task_index].uuid);
         ::leveldb::Range const range(min_key.slice(), max_key.slice());
         std::uint64_t approximate_size = 0;
         database.native->GetApproximateSizes(&range, 1, &approximate_size);
@@ -795,20 +681,18 @@ void measure(ustore_measure_t& arguments) {
 
 #pragma region Collections
 
-/** Clears the run of @p collection, keyed as @p keying, as @p mode asks, in batches the size of a memtable, the last
- *  one synced. */
-native_status_t clear_collection(database_t& database, ustore_collection_t collection, keying_t keying,
+/** Clears the run of @p collection as @p mode asks, in batches the size of a memtable, the last one synced. */
+native_status_t clear_collection(database_t& database, ustore_collection_id_t const& collection,
                                  ustore_drop_mode_t mode) {
     ::leveldb::WriteOptions buffered;
     ::leveldb::WriteOptions synced;
     synced.sync = true;
     ::leveldb::WriteBatch batch;
     native_status_t status;
-    tag_t const tag = pairs_tag(keying);
-    head_key_t const first = head_key(tag, collection);
+    ::leveldb::Slice const prefix = prefix_of(collection);
     iterator_pointer_t iterator {database.native->NewIterator(::leveldb::ReadOptions())};
-    for (iterator->Seek(first.slice()); status.ok() && iterator->Valid(); iterator->Next()) {
-        if (!in_run(iterator->key(), tag, collection)) break;
+    for (iterator->Seek(prefix); status.ok() && iterator->Valid(); iterator->Next()) {
+        if (!iterator->key().starts_with(prefix)) break;
         if (mode == ustore_drop_vals_k) batch.Put(iterator->key(), ::leveldb::Slice());
         else batch.Delete(iterator->key());
         if (batch.ApproximateSize() < database.options.write_buffer_size) continue;
@@ -820,51 +704,24 @@ native_status_t clear_collection(database_t& database, ustore_collection_t colle
     return status;
 }
 
-/** Adds a collection holding @p modality under @p name to @p batch, answering its identifier, or the main one after
- *  reporting why. The catalog entry's value is `struct { uint8_t modality; char name[]; }`, the name empty for none.
- *  The caller holds @c catalog_mutex until the batch is written. */
-ustore_collection_t add_collection(database_t& database, ustore_modality_t modality, std::string_view name,
-                                   ::leveldb::WriteBatch& batch, ustore_error_t* error) {
-    if (modality > ustore_modality_pages_k) {
-        *error = {ustore_error_invalid_argument_k, "Unknown modality"};
-        return ustore_collection_main_k;
-    }
-
-    std::string stored;
-    native_status_t const read = database.native->Get(::leveldb::ReadOptions(), counter_key_k.slice(), &stored);
-    if (!read.IsNotFound() && export_error(read, error)) return ustore_collection_main_k;
-    ustore_collection_t id = 1;
-    if (read.ok() && stored.size() != sizeof(id)) {
-        *error = {ustore_error_malformed_k, "The collection counter is malformed"};
-        return ustore_collection_main_k;
-    }
-    if (read.ok()) std::memcpy(&id, stored.data(), sizeof(id));
-
-    ustore_collection_t const next = id + 1;
-    std::string held(1, static_cast<char>(modality));
-    held.append(name);
-    head_key_t const entry = head_key(tag_t::catalog_k, id);
-    batch.Put(entry.slice(), held);
-    batch.Put(counter_key_k.slice(), ::leveldb::Slice(reinterpret_cast<char const*>(&next), sizeof(next)));
-    return id;
-}
-
-/** Drops @p collection, keyed as @p keying, forgetting first and durably its catalog entry and the name the entry
- *  records, answering whether it did. The caller holds @c catalog_mutex. */
-bool drop_collection(database_t& database, ustore_collection_t collection, keying_t keying, ustore_error_t* error) {
-    head_key_t const entry = head_key(tag_t::catalog_k, collection);
+/** Drops @p collection, forgetting first and durably its catalog entry and the name the entry records. The caller
+ *  holds @c catalog_mutex. */
+status_t drop_collection(database_t& database, ustore_collection_id_t const& collection) {
     std::string held;
-    if (export_error(database.native->Get(::leveldb::ReadOptions(), entry.slice(), &held), error)) return false;
+    auto [entry, look_up_status] = look_up(database, collection, held);
+    if (look_up_status.failed()) return look_up_status;
 
     // A crash between the two leaves an unlisted run behind, never a listed or named collection that is gone
     ::leveldb::WriteBatch forgotten;
-    forgotten.Delete(entry.slice());
-    std::string key;
-    if (held.size() > 1) forgotten.Delete(name_key(std::string_view {held}.substr(1), key));
+    uuid_key_t const listed = uuid_key(catalog_collection_k, collection.uuid);
+    forgotten.Delete(listed.slice());
+    std::string name;
+    if (!entry.name.empty()) forgotten.Delete(string_key(names_collection_k, entry.name, name));
     ::leveldb::WriteOptions synced;
     synced.sync = true;
-    if (export_error(database.native->Write(synced, &forgotten), error)) return false;
-    return !export_error(clear_collection(database, collection, keying, ustore_drop_keys_vals_k), error);
+    status_t const forget_status = status_of(database.native->Write(synced, &forgotten));
+    if (forget_status.failed()) return forget_status;
+    return status_of(clear_collection(database, collection, ustore_drop_keys_vals_k));
 }
 
 void collection_create(ustore_collection_create_t& arguments) {
@@ -872,8 +729,12 @@ void collection_create(ustore_collection_create_t& arguments) {
         *arguments.error = {ustore_error_uninitialized_k, "Database is uninitialized"};
         return;
     }
-    if (!arguments.id) {
+    if (!arguments.collection) {
         *arguments.error = {ustore_error_invalid_argument_k, "Need an output for the collection"};
+        return;
+    }
+    if (arguments.modality > ustore_modality_pages_k) {
+        *arguments.error = {ustore_error_invalid_argument_k, "Unknown modality"};
         return;
     }
     std::string_view const name = string_of(arguments.name, arguments.name_length);
@@ -882,28 +743,37 @@ void collection_create(ustore_collection_create_t& arguments) {
         return;
     }
 
-    // The entry, the counter and the name reach the log in one batch, so a crash keeps all three or none
+    // The entry and the name reach the log in one batch, so a crash keeps both or neither
     database_t& database = *handle_cast<database_t>(arguments.db);
     std::lock_guard lock {database.catalog_mutex};
-    std::string key;
+    std::string name_key;
     if (!name.empty()) {
         std::string record;
-        native_status_t const looked_up = database.native->Get(::leveldb::ReadOptions(), name_key(name, key), &record);
+        native_status_t const looked_up = database.native->Get(::leveldb::ReadOptions(),
+                                                               string_key(names_collection_k, name, name_key), &record);
         if (looked_up.ok()) {
             *arguments.error = {ustore_error_already_exists_k, "A collection already carries the name"};
             return;
         }
         if (!looked_up.IsNotFound() && export_error(looked_up, arguments.error)) return;
     }
+    ustore_collection_id_t id {};
+    if (!mint_collection_id(id)) {
+        *arguments.error = {ustore_error_internal_k, "The system gave no entropy for a collection identifier"};
+        return;
+    }
+
+    uuid_key_t const listed = uuid_key(catalog_collection_k, id.uuid);
+    std::string entry(1, static_cast<char>(arguments.modality));
+    entry.append(name);
+    name_record_t const record {id, arguments.modality};
     ::leveldb::WriteBatch batch;
-    ustore_collection_t const id = add_collection(database, arguments.modality, name, batch, arguments.error);
-    if (id == ustore_collection_main_k) return;
-    name_record_t const named {id, arguments.modality};
-    if (!name.empty()) batch.Put(key, ::leveldb::Slice(named.bytes, sizeof(named.bytes)));
+    batch.Put(listed.slice(), entry);
+    if (!name.empty()) batch.Put(name_key, ::leveldb::Slice(record.bytes, sizeof(record.bytes)));
     ::leveldb::WriteOptions synced;
     synced.sync = true;
     if (export_error(database.native->Write(synced, &batch), arguments.error)) return;
-    *arguments.id = id;
+    *arguments.collection = id;
 }
 
 void collection_drop(ustore_collection_drop_t& arguments) {
@@ -916,20 +786,21 @@ void collection_drop(ustore_collection_drop_t& arguments) {
         *arguments.error = {ustore_error_invalid_argument_k, "Unknown drop mode"};
         return;
     }
-    if (arguments.id == ustore_collection_main_k && arguments.mode == ustore_drop_keys_vals_handle_k) {
+    if (arguments.collection == ustore_collection_main_k && arguments.mode == ustore_drop_keys_vals_handle_k) {
         *arguments.error = {ustore_error_invalid_argument_k, "The main collection can only be cleared"};
         return;
     }
 
     database_t& database = *handle_cast<database_t>(arguments.db);
-    ustore_modality_t modality = ustore_modality_any_k;
-    if (!modality_of(database, arguments.id, modality, arguments.error)) return;
-    if (arguments.mode != ustore_drop_keys_vals_handle_k) {
-        export_error(clear_collection(database, arguments.id, keying_of(modality), arguments.mode), arguments.error);
+    if (arguments.mode == ustore_drop_keys_vals_handle_k) {
+        std::lock_guard lock {database.catalog_mutex};
+        *arguments.error = drop_collection(database, arguments.collection);
         return;
     }
-    std::lock_guard lock {database.catalog_mutex};
-    drop_collection(database, arguments.id, keying_of(modality), arguments.error);
+    std::string held;
+    *arguments.error = look_up(database, arguments.collection, held).status();
+    if (arguments.error->status) return;
+    export_error(clear_collection(database, arguments.collection, arguments.mode), arguments.error);
 }
 
 void collection_list(ustore_collection_list_t& arguments) {
@@ -948,30 +819,29 @@ void collection_list(ustore_collection_list_t& arguments) {
     database_t& database = *handle_cast<database_t>(arguments.db);
     ::leveldb::ReadOptions options;
     options.fill_cache = false;
-    use_snapshot(database, arguments.snapshot, options, arguments.error);
-    if (arguments.error->status) return;
+    use_snapshot(arguments.snapshot, options);
 
-    // The main collection is never listed, so its entry is where the catalog starts
-    head_key_t const first = head_key(tag_t::catalog_k, ustore_collection_main_k);
+    // The catalog lists every collection but the main one, keyed by its ID
+    ::leveldb::Slice const catalog = prefix_of(catalog_collection_k);
     iterator_pointer_t iterator {database.native->NewIterator(options)};
-    uninitialized_array<ustore_collection_t> ids {arena};
+    uninitialized_array<ustore_collection_id_t> ids {arena};
     uninitialized_array<ustore_modality_t> modalities {arena};
     growing_tape_t names {arena};
-    for (iterator->Seek(first.slice()); iterator->Valid() && tag_of(iterator->key()) == tag_t::catalog_k;
-         iterator->Next()) {
-        ::leveldb::Slice const held = iterator->value();
-        if (held.empty()) {
+    for (iterator->Seek(catalog); iterator->Valid() && iterator->key().starts_with(catalog); iterator->Next()) {
+        ::leveldb::Slice const listed = iterator->key();
+        auto [entry, read_status] = read_catalog_entry(iterator->value());
+        if (read_status.failed() || listed.size() != sizeof(uuid_key_t)) {
             *arguments.error = {ustore_error_malformed_k, "The catalog entry of a collection is malformed"};
             return;
         }
-        ids.push_back(collection_of(iterator->key()), arguments.error);
-        modalities.push_back(static_cast<ustore_modality_t>(held[0]), arguments.error);
-        names.push_back(held.size() == 1 ? value_view_t {} : to_value(tail_of(held, 1)), arguments.error);
+        ids.push_back(ustore_collection_id_t {tail_uuid_of(listed)}, arguments.error);
+        modalities.push_back(entry.modality, arguments.error);
+        names.push_back(entry.name.empty() ? value_view_t {} : value_view_t {entry.name}, arguments.error);
         if (arguments.error->status) return;
     }
     if (export_error(iterator->status(), arguments.error)) return;
     *arguments.count = static_cast<ustore_size_t>(ids.size());
-    if (arguments.ids) *arguments.ids = ids.data();
+    if (arguments.collections) *arguments.collections = ids.data();
     if (arguments.modalities) *arguments.modalities = modalities.data();
     if (arguments.names_offsets) *arguments.names_offsets = names.offsets().begin().get();
     if (arguments.names) *arguments.names = reinterpret_cast<ustore_char_t*>(names.contents().begin().get());
@@ -983,7 +853,7 @@ void collection_find(ustore_collection_find_t& arguments) {
         return;
     }
     if (!arguments.tasks_count) return;
-    if (!arguments.names || !arguments.ids) {
+    if (!arguments.names || !arguments.collections) {
         *arguments.error = {ustore_error_invalid_argument_k, "Need the names and an output for the identifiers"};
         return;
     }
@@ -992,13 +862,12 @@ void collection_find(ustore_collection_find_t& arguments) {
     if (arguments.error->status) return;
     database_t& database = *handle_cast<database_t>(arguments.db);
     ::leveldb::ReadOptions options;
-    use_snapshot(database, arguments.snapshot, options, arguments.error);
-    if (arguments.error->status) return;
+    use_snapshot(arguments.snapshot, options);
 
     std::size_t const count = arguments.tasks_count;
     strings_arg_t const names {{arguments.names, arguments.names_stride},
                                {arguments.names_lengths, arguments.names_lengths_stride}};
-    std::span<ustore_collection_t> const ids = arena.alloc<ustore_collection_t>(count, arguments.error);
+    std::span<ustore_collection_id_t> const ids = arena.alloc<ustore_collection_id_t>(count, arguments.error);
     auto modalities = arena.alloc_or_dummy(count, arguments.error, arguments.modalities);
     auto presences = arena.alloc_or_dummy(count, arguments.error, arguments.presences);
     if (arguments.error->status) return;
@@ -1006,8 +875,9 @@ void collection_find(ustore_collection_find_t& arguments) {
     std::string key;
     std::string record;
     for (std::size_t index = 0; index != count; ++index) {
-        native_status_t const status = database.native->Get(options, name_key(names[index], key), &record);
-        ustore_collection_t id = ustore_collection_main_k;
+        native_status_t const status = database.native->Get(options, string_key(names_collection_k, names[index], key),
+                                                            &record);
+        ustore_collection_id_t id = ustore_collection_main_k;
         ustore_modality_t modality = ustore_modality_any_k;
         bool const present = status.ok();
         if (!present && !status.IsNotFound() && export_error(status, arguments.error)) return;
@@ -1019,7 +889,7 @@ void collection_find(ustore_collection_find_t& arguments) {
         modalities[index] = modality;
         presences[index] = present;
     }
-    *arguments.ids = ids.data();
+    *arguments.collections = ids.data();
 }
 
 void database_control(ustore_database_control_t& arguments) {
@@ -1066,7 +936,8 @@ void strings_write(ustore_strings_write_t& arguments) {
     }
 
     database_t& database = *handle_cast<database_t>(arguments.db);
-    strided_iterator<ustore_collection_t const> const collections {arguments.collections, arguments.collections_stride};
+    strided_iterator<ustore_collection_id_t const> const collections {arguments.collections,
+                                                                      arguments.collections_stride};
     strings_arg_t const texts {{arguments.strings, arguments.strings_stride},
                                {arguments.strings_lengths, arguments.strings_lengths_stride}};
     contents_arg_t const contents {bits_view_t {arguments.values_presences},
@@ -1074,12 +945,13 @@ void strings_write(ustore_strings_write_t& arguments) {
                                    {arguments.values_lengths, arguments.values_lengths_stride},
                                    {arguments.values, arguments.values_stride},
                                    arguments.tasks_count};
-    if (refuse_collections(database, collections, arguments.tasks_count, keying_t::strings_k, arguments.error)) return;
+    *arguments.error = resolve_collections(database, collections, arguments.tasks_count, keying_t::strings_k);
+    if (arguments.error->status) return;
 
     ::leveldb::WriteBatch batch;
     std::string key;
     for (std::size_t index = 0; index != arguments.tasks_count; ++index) {
-        ustore_collection_t const collection = collections ? collections[index] : ustore_collection_main_k;
+        ustore_collection_id_t const collection = collections ? collections[index] : ustore_collection_main_k;
         value_view_t const content = contents[index];
         string_key(collection, texts[index], key);
         if (!content) batch.Delete(key);
@@ -1105,13 +977,14 @@ void strings_read(ustore_strings_read_t& arguments) {
     if (arguments.error->status) return;
     database_t& database = *handle_cast<database_t>(arguments.db);
     ::leveldb::ReadOptions options;
-    use_snapshot(database, arguments.snapshot, options, arguments.error);
-    if (arguments.error->status) return;
+    use_snapshot(arguments.snapshot, options);
 
-    strided_iterator<ustore_collection_t const> const collections {arguments.collections, arguments.collections_stride};
+    strided_iterator<ustore_collection_id_t const> const collections {arguments.collections,
+                                                                      arguments.collections_stride};
     strings_arg_t const texts {{arguments.strings, arguments.strings_stride},
                                {arguments.strings_lengths, arguments.strings_lengths_stride}};
-    if (refuse_collections(database, collections, arguments.tasks_count, keying_t::strings_k, arguments.error)) return;
+    *arguments.error = resolve_collections(database, collections, arguments.tasks_count, keying_t::strings_k);
+    if (arguments.error->status) return;
 
     growing_tape_t exported {arena};
     exported.reserve(arguments.tasks_count, arguments.error);
@@ -1119,7 +992,7 @@ void strings_read(ustore_strings_read_t& arguments) {
     std::string key;
     std::string value;
     for (std::size_t index = 0; index != arguments.tasks_count; ++index) {
-        ustore_collection_t const collection = collections ? collections[index] : ustore_collection_main_k;
+        ustore_collection_id_t const collection = collections ? collections[index] : ustore_collection_main_k;
         native_status_t const status = database.native->Get(options, string_key(collection, texts[index], key), &value);
         if (!status.IsNotFound() && export_error(status, arguments.error)) return;
         exported.push_back(status.ok() ? to_value(value) : value_view_t {}, arguments.error);
@@ -1148,37 +1021,40 @@ void strings_scan(ustore_strings_scan_t& arguments) {
     database_t& database = *handle_cast<database_t>(arguments.db);
     ::leveldb::ReadOptions options;
     options.fill_cache = false;
-    use_snapshot(database, arguments.snapshot, options, arguments.error);
-    if (arguments.error->status) return;
+    use_snapshot(arguments.snapshot, options);
 
     std::size_t const count = arguments.tasks_count;
-    strided_iterator<ustore_collection_t const> const collections {arguments.collections, arguments.collections_stride};
+    strided_iterator<ustore_collection_id_t const> const collections {arguments.collections,
+                                                                      arguments.collections_stride};
     strings_arg_t const prefixes {{arguments.prefixes, arguments.prefixes_stride},
                                   {arguments.prefixes_lengths, arguments.prefixes_lengths_stride}};
     strings_arg_t const starts {{arguments.start_strings, arguments.start_strings_stride},
                                 {arguments.start_strings_lengths, arguments.start_strings_lengths_stride}};
     strided_iterator<ustore_length_t const> const limits {arguments.count_limits, arguments.count_limits_stride};
-    if (refuse_collections(database, collections, count, keying_t::strings_k, arguments.error)) return;
+    *arguments.error = resolve_collections(database, collections, count, keying_t::strings_k);
+    if (arguments.error->status) return;
 
     auto offsets = arena.alloc_or_dummy(count + 1, arguments.error, arguments.offsets);
     auto counts = arena.alloc_or_dummy(count, arguments.error, arguments.counts);
     if (arguments.error->status) return;
     growing_tape_t found {arena};
     std::string first;
+    std::string bound;
     iterator_pointer_t iterator {database.native->NewIterator(options)};
     for (std::size_t task = 0; task != count; ++task) {
-        ustore_collection_t const collection = collections ? collections[task] : ustore_collection_main_k;
+        ustore_collection_id_t const collection = collections ? collections[task] : ustore_collection_main_k;
         std::string_view const prefix = arguments.prefixes ? prefixes[task] : std::string_view {};
         std::string_view const start = arguments.start_strings ? starts[task] : std::string_view {};
         std::size_t const found_before = found.lengths().size();
         offsets[task] = static_cast<ustore_length_t>(found_before);
 
-        ::leveldb::Slice const wanted = to_slice(prefix);
+        // The stored key of every string starting with the prefix starts with the stored key of the prefix
+        ::leveldb::Slice const wanted = string_key(collection, prefix, bound);
         for (iterator->Seek(string_key(collection, start > prefix ? start : prefix, first));
-             iterator->Valid() && found.lengths().size() - found_before != limits[task]; iterator->Next()) {
-            if (!in_run(iterator->key(), tag_t::strings_k, collection)) break;
+             iterator->Valid() && iterator->key().starts_with(wanted) &&
+             found.lengths().size() - found_before != limits[task];
+             iterator->Next()) {
             ::leveldb::Slice const text = tail_of(iterator->key());
-            if (!text.starts_with(wanted)) break;
             found.push_back(to_value(text), arguments.error);
             if (arguments.error->status) return;
         }
@@ -1212,15 +1088,12 @@ void transaction_commit(ustore_transaction_commit_t& arguments) {
 
 void transaction_free(ustore_transaction_t) noexcept {}
 
-void database_free(ustore_database_t handle) noexcept {
-    database_t* const database = handle_cast<database_t>(handle);
-    // Snapshots a caller never dropped belong to the database, so they go with it
-    [[maybe_unused]] auto const released = database->snapshots.for_each([&](auto const& slot) noexcept {
-        snapshot_t* const snapshot = reinterpret_cast<snapshot_t*>(slot.key());
-        database->native->ReleaseSnapshot(snapshot->native);
-        delete snapshot;
-    });
-    delete database;
+void database_free(ustore_database_t database) noexcept { delete handle_cast<database_t>(database); }
+
+void snapshot_free(ustore_snapshot_t handle) noexcept {
+    snapshot_t* const snapshot = handle_cast<snapshot_t>(handle);
+    snapshot->database->native->ReleaseSnapshot(snapshot->native);
+    delete snapshot;
 }
 
 #pragma endregion Memory
@@ -1228,10 +1101,8 @@ void database_free(ustore_database_t handle) noexcept {
 engine_t const engine_k {
     .database_capabilities = &guarded<ustore_database_capabilities_t, &database_capabilities>,
     .database_control = &guarded<ustore_database_control_t, &database_control>,
-    .snapshot_list = &guarded<ustore_snapshot_list_t, &snapshot_list>,
-    .snapshot_create = &guarded<ustore_snapshot_create_t, &snapshot_create>,
+    .snapshot_init = &guarded<ustore_snapshot_init_t, &snapshot_init>,
     .snapshot_export = &guarded<ustore_snapshot_export_t, &snapshot_export>,
-    .snapshot_drop = &guarded<ustore_snapshot_drop_t, &snapshot_drop>,
     .read = &guarded<ustore_read_t, &read>,
     .write = &guarded<ustore_write_t, &write>,
     .scan = &guarded<ustore_scan_t, &scan>,
@@ -1244,10 +1115,16 @@ engine_t const engine_k {
     .strings_write = &guarded<ustore_strings_write_t, &strings_write>,
     .strings_read = &guarded<ustore_strings_read_t, &strings_read>,
     .strings_scan = &guarded<ustore_strings_scan_t, &strings_scan>,
+    .graph_find_edges = &graph_find_edges_in_vertex_values,
+    .graph_upsert_edges = &graph_upsert_edges_in_vertex_values,
+    .graph_remove_edges = &graph_remove_edges_in_vertex_values,
+    .graph_upsert_vertices = &graph_upsert_vertices_in_vertex_values,
+    .graph_remove_vertices = &graph_remove_vertices_in_vertex_values,
     .transaction_init = &guarded<ustore_transaction_init_t, &transaction_init>,
     .transaction_stage = &guarded<ustore_transaction_stage_t, &transaction_stage>,
     .transaction_commit = &guarded<ustore_transaction_commit_t, &transaction_commit>,
     .transaction_free = &transaction_free,
+    .snapshot_free = &snapshot_free,
     .database_free = &database_free,
 };
 

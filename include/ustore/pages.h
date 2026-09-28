@@ -114,7 +114,7 @@ typedef struct ustore_pages_write_t {
     ustore_page_modification_t modification;
 
     /** Collections of the pages, where @c NULL stands for the main collection. */
-    ustore_collection_t const* collections;
+    ustore_collection_id_t const* collections;
 
     /** Bytes between consecutive collections, where zero repeats the first one. */
     ustore_size_t collections_stride;
@@ -203,7 +203,7 @@ typedef struct ustore_pages_read_t {
     /** Transaction that watches the read pages, or @c NULL. */
     ustore_transaction_t transaction;
 
-    /** Snapshot whose view is rendered. */
+    /** Optional snapshot whose view is rendered, never set beside a transaction. */
     ustore_snapshot_t snapshot;
 
     /** Reusable memory for the results. */
@@ -219,7 +219,7 @@ typedef struct ustore_pages_read_t {
     ustore_size_t tasks_count;
 
     /** Collections of the pages, where @c NULL stands for the main collection. */
-    ustore_collection_t const* collections;
+    ustore_collection_id_t const* collections;
 
     /** Bytes between consecutive collections, where zero repeats the first one. */
     ustore_size_t collections_stride;
@@ -274,7 +274,7 @@ typedef struct ustore_pages_history_t {
     /** Transaction that watches the read pages, or @c NULL. */
     ustore_transaction_t transaction;
 
-    /** Snapshot whose view bounds the history. */
+    /** Optional snapshot whose view bounds the history, never set beside a transaction. */
     ustore_snapshot_t snapshot;
 
     /** Reusable memory for the results. */
@@ -290,7 +290,7 @@ typedef struct ustore_pages_history_t {
     ustore_size_t tasks_count;
 
     /** Collections of the pages, where @c NULL stands for the main collection. */
-    ustore_collection_t const* collections;
+    ustore_collection_id_t const* collections;
 
     /** Bytes between consecutive collections, where zero repeats the first one. */
     ustore_size_t collections_stride;
@@ -302,13 +302,13 @@ typedef struct ustore_pages_history_t {
     ustore_size_t keys_stride;
 
     /** First commit stamp included, where zero starts at the page's creation. */
-    ustore_sequence_number_t const* since;
+    ustore_stamp_t const* since;
 
     /** Bytes between consecutive stamps, where zero repeats the first one. */
     ustore_size_t since_stride;
 
     /** Last commit stamp included, where zero ends at the moment read. */
-    ustore_sequence_number_t const* until;
+    ustore_stamp_t const* until;
 
     /** Bytes between consecutive stamps, where zero repeats the first one. */
     ustore_size_t until_stride;
@@ -317,7 +317,7 @@ typedef struct ustore_pages_history_t {
     ustore_length_t** counts;
 
     /** Optional output for the commit stamp of every edit. */
-    ustore_sequence_number_t** stamps;
+    ustore_stamp_t** stamps;
 
     /** Optional output for the modification of every edit. */
     ustore_page_modification_t** modifications;

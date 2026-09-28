@@ -15,7 +15,6 @@
 #include <algorithm>   // `std::min`, `std::sort`
 #include <array>       // `std::array`
 #include <atomic>      // `std::atomic`, `std::atomic_flag`
-#include <numeric>     // `std::iota`
 #include <string_view> // `std::string_view`
 
 #include <fmt/format.h>
@@ -130,7 +129,7 @@ std::size_t round_trip(blobs_ref<locations_type_>& reference, contents_arg_t val
 struct triplet_t {
     static constexpr std::size_t value_size_k = sizeof(char);
 
-    std::array<ustore_key_t, 3> keys {'a', 'b', 'c'};
+    std::array<ustore_key_t, 3> keys {key_from_integer('a'), key_from_integer('b'), key_from_integer('c')};
     std::array<char, 3> values {'A', 'B', 'C'};
     std::array<ustore_length_t, 3> lengths {1, 1, 1};
     std::array<ustore_length_t, 4> offsets {0, 1, 2, 3};
@@ -265,18 +264,24 @@ std::size_t database_overwrite_with_step(test_config_t const& config) {
 
     blobs_collection_t collection = database.main();
 
-    for (ustore_key_t key = 1000; key != 1100; ++key) failures += expect(collection[key].assign("some").succeeded());
-    for (ustore_key_t key = 1000; key != 1100; ++key) failures += expect(*collection[key].value() == "some");
+    for (std::uint64_t key = 1000; key != 1100; ++key)
+        failures += expect(collection[key_from_integer(key)].assign("some").succeeded());
+    for (std::uint64_t key = 1000; key != 1100; ++key)
+        failures += expect(*collection[key_from_integer(key)].value() == "some");
     failures += expect(collection.keys().size() == 100u);
     failures += expect(collection.items().size() == 100u);
 
-    for (ustore_key_t key = 900; key != 800; --key) failures += expect(collection[key].assign("other").succeeded());
-    for (ustore_key_t key = 900; key != 800; --key) failures += expect(*collection[key].value() == "other");
+    for (std::uint64_t key = 900; key != 800; --key)
+        failures += expect(collection[key_from_integer(key)].assign("other").succeeded());
+    for (std::uint64_t key = 900; key != 800; --key)
+        failures += expect(*collection[key_from_integer(key)].value() == "other");
     failures += expect(collection.keys().size() == 200u);
     failures += expect(collection.items().size() == 200u);
 
-    for (ustore_key_t key = 800; key != 1100; key += 2) failures += expect(collection[key].assign("third").succeeded());
-    for (ustore_key_t key = 800; key != 1100; key += 2) failures += expect(*collection[key].value() == "third");
+    for (std::uint64_t key = 800; key != 1100; key += 2)
+        failures += expect(collection[key_from_integer(key)].assign("third").succeeded());
+    for (std::uint64_t key = 800; key != 1100; key += 2)
+        failures += expect(*collection[key_from_integer(key)].value() == "third");
     failures += expect(collection.keys().size() == 250u);
     failures += expect(collection.items().size() == 250u);
     return failures;
@@ -400,7 +405,7 @@ case_result_t database_named_collections_race(test_config_t const& config) {
     auto [found, find_status] = database.find("contested");
     failures += expect(list_status.succeeded() && find_status.succeeded());
     failures += expect_eq(collections.size(), 1u);
-    failures += expect(collections.size() == 1 && ustore_collection_t(found) == collections[0]);
+    failures += expect(collections.size() == 1 && ustore_collection_id_t(found) == collections[0]);
     failures += expect(database.drop("contested").succeeded());
     return failures;
 }
@@ -421,18 +426,18 @@ case_result_t database_named_collections_list(test_config_t const& config) {
     for (std::size_t index = 0; index != names.size(); ++index)
         failures += expect(database.create(names[index], modalities[index]));
     ustore_error_t error {};
-    ustore_collection_t unnamed = ustore_collection_main_k;
+    ustore_collection_id_t unnamed = ustore_collection_main_k;
     ustore_collection_create_t create {};
     create.db = database;
     create.error = &error;
     create.modality = ustore_modality_strings_k;
-    create.id = &unnamed;
+    create.collection = &unnamed;
     ustore_collection_create(&create);
     failures += expect_no_error(error);
 
     arena_t arena {database};
     ustore_size_t count = 0;
-    ustore_collection_t* ids = nullptr;
+    ustore_collection_id_t* ids = nullptr;
     ustore_modality_t* listed_modalities = nullptr;
     ustore_length_t* names_offsets = nullptr;
     ustore_char_t* listed_names = nullptr;
@@ -441,7 +446,7 @@ case_result_t database_named_collections_list(test_config_t const& config) {
     list.error = &error;
     list.arena = arena.member_ptr();
     list.count = &count;
-    list.ids = &ids;
+    list.collections = &ids;
     list.modalities = &listed_modalities;
     list.names_offsets = &names_offsets;
     list.names = &listed_names;
@@ -463,7 +468,7 @@ case_result_t database_named_collections_list(test_config_t const& config) {
         if (named == names.end()) continue;
         failures += expect(listed_modalities[index] == modalities[named - names.begin()]);
         auto maybe_found = database.find(name);
-        failures += expect(maybe_found && ustore_collection_t(*maybe_found) == ids[index]);
+        failures += expect(maybe_found && ustore_collection_id_t(*maybe_found) == ids[index]);
     }
 
     failures += expect(database.drop("col1").succeeded());
@@ -483,11 +488,11 @@ case_result_t database_collections_resolve(test_config_t const& config) {
     failures += expect(database.clear().succeeded());
 
     // Nothing reaches an identifier the engine never handed out, whatever it may keep there itself
-    constexpr ustore_collection_t last_k = std::numeric_limits<ustore_collection_t>::max();
-    for (ustore_collection_t const unknown : {ustore_collection_t {4242}, last_k - 1, last_k}) {
+    for (ustore_collection_id_t const unknown :
+         {ustore_collection_id_t {uuid_from_integer(4242)}, ustore_collection_id_t {largest_key_k.uuid}}) {
         blobs_collection_t keyed {database, unknown};
-        failures += expect(keyed[1].value() == status_code_t::not_found_k);
-        failures += expect(keyed[1].assign("intruder") == status_code_t::not_found_k);
+        failures += expect(keyed[key_from_integer(1)].value() == status_code_t::not_found_k);
+        failures += expect(keyed[key_from_integer(1)].assign("intruder") == status_code_t::not_found_k);
         failures += expect(keyed.clear() == status_code_t::not_found_k);
         strings_collection_t stringed {database, unknown};
         failures += expect(stringed.assign("intruder", "value") == status_code_t::not_found_k);
@@ -498,9 +503,9 @@ case_result_t database_collections_resolve(test_config_t const& config) {
     auto maybe_numbers = database.create("numbers", ustore_modality_blobs_k);
     failures += expect(maybe_words && maybe_numbers);
     if (!maybe_words || !maybe_numbers) return failures;
-    ustore_collection_t const words = *maybe_words;
+    ustore_collection_id_t const words = *maybe_words;
     blobs_collection_t keyed_words {database, words};
-    failures += expect(keyed_words[1].assign("number") == status_code_t::invalid_argument_k);
+    failures += expect(keyed_words[key_from_integer(1)].assign("number") == status_code_t::invalid_argument_k);
     strings_collection_t stringed_numbers {database, *maybe_numbers};
     failures += expect(stringed_numbers.assign("word", "value") == status_code_t::invalid_argument_k);
     strings_collection_t stringed_main {database, ustore_collection_main_k};
@@ -516,7 +521,7 @@ case_result_t database_collections_resolve(test_config_t const& config) {
     ustore_collection_drop_t drop {};
     drop.db = database;
     drop.error = &error;
-    drop.id = words;
+    drop.collection = words;
     drop.mode = ustore_drop_keys_vals_handle_k;
     ustore_collection_drop(&drop);
     failures += expect_no_error(error);
@@ -559,11 +564,10 @@ std::size_t database_presences(test_config_t const& config) {
 
     constexpr std::size_t keys_count = 1000;
     for (std::size_t index = 0; index != keys_count; ++index)
-        if (index % 10)
-            failures += expect(main_collection[static_cast<ustore_key_t>(index)].assign("value").succeeded());
+        if (index % 10) failures += expect(main_collection[key_from_integer(index)].assign("value").succeeded());
 
     std::array<ustore_key_t, keys_count> keys;
-    std::iota(keys.begin(), keys.end(), 0);
+    for (std::size_t index = 0; index != keys_count; ++index) keys[index] = key_from_integer(index);
     ustore_octet_t* found_presences = nullptr;
     arena_t arena(database);
     ustore_error_t error {};
@@ -600,19 +604,19 @@ std::size_t database_scan(test_config_t const& config) {
 
     constexpr std::size_t keys_count = 1000;
     std::array<ustore_key_t, keys_count> keys;
-    std::iota(keys.begin(), keys.end(), 0);
+    for (std::size_t index = 0; index != keys_count; ++index) keys[index] = key_from_integer(index);
     auto reference = collection[keys];
     value_view_t const value("value");
     failures += expect(reference.assign(value).succeeded());
     keys_stream_t stream(database, collection, 256);
 
     failures += expect(stream.seek_to_first().succeeded());
-    ustore_key_t key = 0;
+    std::size_t count = 0;
     while (!stream.is_end()) {
-        failures += expect_eq(stream.key(), key++);
+        failures += expect_eq(stream.key(), key_from_integer(count++));
         ++stream;
     }
-    failures += expect_eq(key, static_cast<ustore_key_t>(keys_count));
+    failures += expect_eq(count, keys_count);
     return failures;
 }
 
@@ -626,7 +630,7 @@ std::size_t database_batch_scan(test_config_t const& config) {
     blobs_collection_t collection = database.main();
 
     std::array<ustore_key_t, 512> keys;
-    std::iota(keys.begin(), keys.end(), 0);
+    for (std::size_t index = 0; index != keys.size(); ++index) keys[index] = key_from_integer(index);
     auto reference = collection[keys];
     value_view_t const value("value");
     failures += expect(reference.assign(value).succeeded());
@@ -636,13 +640,14 @@ std::size_t database_batch_scan(test_config_t const& config) {
     auto batch = stream.keys_batch();
     failures += expect_eq(batch.size(), 256u);
     failures += expect(!stream.is_end());
-    for (ustore_key_t key = 0; key != 256; ++key) failures += expect_eq(batch[key], key);
+    for (std::size_t index = 0; index != 256; ++index) failures += expect_eq(batch[index], key_from_integer(index));
 
     failures += expect(stream.seek_to_next_batch().succeeded());
     batch = stream.keys_batch();
     failures += expect_eq(batch.size(), 256u);
     failures += expect(!stream.is_end());
-    for (ustore_key_t key = 0; key != 256; ++key) failures += expect_eq(batch[key], key + 256);
+    for (std::size_t index = 0; index != 256; ++index)
+        failures += expect_eq(batch[index], key_from_integer(index + 256));
 
     failures += expect(stream.seek_to_next_batch().succeeded());
     batch = stream.keys_batch();
@@ -721,38 +726,7 @@ case_result_t database_transaction_snapshot_isolation(test_config_t const& confi
     return failures;
 }
 
-/** Every new snapshot joins the listed ones, and clearing the database drops them all. */
-case_result_t database_snapshots_list(test_config_t const& config) {
-    std::size_t failures = 0;
-    database_t database;
-    failures += expect(open_database(database, config).succeeded());
-    if (failures != 0) return failures;
-    if (!database.supports_snapshots()) return case_result_t::skipped("the engine keeps no snapshots", failures);
-    failures += expect(database.clear().succeeded());
-
-    auto first_snapshot = *database.snapshot();
-    auto snapshots = first_snapshot.snapshots();
-    failures += expect_eq((*snapshots).size(), 1u);
-
-    auto second_snapshot = *database.snapshot();
-    snapshots = second_snapshot.snapshots();
-    failures += expect_eq((*snapshots).size(), 2u);
-
-    auto third_snapshot = *database.snapshot();
-    snapshots = third_snapshot.snapshots();
-    failures += expect_eq((*snapshots).size(), 3u);
-
-    first_snapshot = *database.snapshot();
-    snapshots = first_snapshot.snapshots();
-    failures += expect_eq((*snapshots).size(), 4u);
-
-    failures += expect(database.clear().succeeded());
-    snapshots = first_snapshot.snapshots();
-    failures += expect_eq((*snapshots).size(), 0u);
-    return failures;
-}
-
-/** A transaction reads the head, or the state of whichever snapshot it is set to. */
+/** A transaction reads the head while a snapshot reads its own view, and a call naming both is refused. */
 case_result_t database_transaction_with_snapshot(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
@@ -781,49 +755,25 @@ case_result_t database_transaction_with_snapshot(test_config_t const& config) {
     transaction_t transaction = *database.transact();
     auto head_reference = transaction[triplet.keys];
     failures += check_equalities(head_reference, same_values_triplet);
-
-    transaction.set_snapshot(snapshot.snap());
-    auto older_reference = transaction[triplet.keys];
+    auto older_reference = snapshot[triplet.keys];
     failures += check_equalities(older_reference, triplet);
 
     snapshot = *database.snapshot();
-    transaction.set_snapshot(snapshot.snap());
-    auto newer_reference = transaction[triplet.keys];
+    auto newer_reference = snapshot[triplet.keys];
     failures += check_equalities(newer_reference, same_values_triplet);
-    return failures;
-}
 
-/** Reads through an unknown snapshot fail, and reads through a valid one succeed again. */
-case_result_t database_set_wrong_snapshot(test_config_t const& config) {
-    std::size_t failures = 0;
-    database_t database;
-    failures += expect(open_database(database, config).succeeded());
-    if (failures != 0) return failures;
-    if (!database.supports_snapshots()) return case_result_t::skipped("the engine keeps no snapshots", failures);
-    failures += expect(database.clear().succeeded());
-
-    triplet_t triplet;
-    blobs_collection_t collection = database.main();
-    auto collection_reference = collection[triplet.keys];
-
-    failures += check_length(collection_reference, ustore_length_missing_k);
-    failures += round_trip(collection_reference, triplet);
-
-    auto snapshot = *database.snapshot();
-    auto snapshot_reference = snapshot[triplet.keys];
-    failures += check_equalities(snapshot_reference, triplet);
-
-    auto snapshots = snapshot.snapshots();
-    failures += expect_eq((*snapshots).size(), 1u);
-
-    ustore_snapshot_t const valid_snapshot = snapshot.snap();
-    snapshot.set_snapshot(1u);
-    auto wrong_reference = snapshot[triplet.keys];
-    failures += expect(!wrong_reference.value());
-
-    snapshot.set_snapshot(valid_snapshot);
-    auto right_reference = snapshot[triplet.keys];
-    failures += expect(right_reference.value());
+    // A call reads exactly one view, so naming a transaction beside a snapshot is refused before any engine runs
+    ustore_error_t error {};
+    ustore_key_t const key = triplet.keys[0];
+    ustore_read_t read {};
+    read.db = database;
+    read.error = &error;
+    read.transaction = transaction;
+    read.snapshot = snapshot.snap();
+    read.tasks_count = 1;
+    read.keys = &key;
+    ustore_read(&read);
+    failures += expect(error.status == ustore_error_invalid_argument_k);
     return failures;
 }
 
@@ -887,7 +837,7 @@ case_result_t database_export_snapshot(test_config_t const& config) {
     return failures;
 }
 
-/** One thread reads through a snapshot while another resets it to the head. */
+/** One thread reads through a snapshot while another replaces it with a newer one. */
 case_result_t database_snapshot_with_threads(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
@@ -933,7 +883,7 @@ case_result_t database_snapshot_with_threads(test_config_t const& config) {
             }
         }
         else if (acquire()) {
-            snapshot.set_snapshot(0);
+            snapshot = *database.snapshot();
             is_reset = true;
             snapshot_lock.clear(std::memory_order_release);
         }
@@ -961,13 +911,13 @@ case_result_t database_transaction_erase_missing(test_config_t const& config) {
     transaction_t first_transaction = *database.transact();
     transaction_t second_transaction = *database.transact();
 
-    failures += expect(second_transaction.main().at(-7297309151944849401).erase().succeeded());
-    failures += expect(first_transaction.main().at(-8640850744835793378).erase().succeeded());
+    failures += expect(second_transaction.main().at(key_from_integer(7297309151944849401)).erase().succeeded());
+    failures += expect(first_transaction.main().at(key_from_integer(8640850744835793378)).erase().succeeded());
     failures += expect(first_transaction.commit().succeeded());
     failures += expect(second_transaction.commit().succeeded());
 
-    failures += expect(database.main().at(-8640850744835793378).value() == value_view_t {});
-    failures += expect(database.main().at(-7297309151944849401).value() == value_view_t {});
+    failures += expect(database.main().at(key_from_integer(8640850744835793378)).value() == value_view_t {});
+    failures += expect(database.main().at(key_from_integer(7297309151944849401)).value() == value_view_t {});
     failures += expect(database.main().keys().size() == 0u);
     return failures;
 }
@@ -984,15 +934,15 @@ case_result_t database_transaction_write_conflicting(test_config_t const& config
     transaction_t first_transaction = *database.transact();
     transaction_t second_transaction = *database.transact();
 
-    failures += expect(second_transaction.main().at(6).assign("a").succeeded());
-    failures += expect(first_transaction.main().at(6).assign("b").succeeded());
+    failures += expect(second_transaction.main().at(key_from_integer(6)).assign("a").succeeded());
+    failures += expect(first_transaction.main().at(key_from_integer(6)).assign("b").succeeded());
     failures += expect(first_transaction.commit().succeeded());
     failures += expect(second_transaction.commit().failed());
     return failures;
 }
 
-/** A sequenced commit answers a positive sequence number. */
-case_result_t database_transaction_sequenced_commit(test_config_t const& config) {
+/** A stamped commit answers a positive stamp. */
+case_result_t database_transaction_stamped_commit(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
     failures += expect(open_database(database, config).succeeded());
@@ -1007,9 +957,9 @@ case_result_t database_transaction_sequenced_commit(test_config_t const& config)
     auto transaction_reference = transaction[triplet.keys];
 
     failures += expect(transaction_reference.assign(triplet.contents_offsets()).succeeded());
-    auto maybe_sequence_number = transaction.sequenced_commit();
-    failures += expect(maybe_sequence_number);
-    failures += expect(*maybe_sequence_number > 0);
+    auto maybe_stamp = transaction.stamped_commit();
+    failures += expect(maybe_stamp);
+    failures += expect(*maybe_stamp > 0);
     failures += expect(transaction.reset().succeeded());
     return failures;
 }
@@ -1078,14 +1028,17 @@ std::size_t database_docs_flat(test_config_t const& config) {
     failures += expect(database.clear().succeeded());
 
     docs_collection_t collection = database.main<docs_collection_t>();
-    failures += expect(collection[1].assign(flat_documents_k[0]).succeeded());
-    failures += expect(collection[2].assign(flat_documents_k[1]).succeeded());
-    failures += expect(collection[3].assign(flat_documents_k[2]).succeeded());
-    failures += expect(json_equal(as_text(*collection[1].value()), flat_documents_k[0]));
-    failures += expect(json_equal(as_text(*collection[collection_key_field_t {2, "person"}].value()), R"("Bob")"));
-    failures += expect(json_equal(as_text(*collection[collection_key_field_t {3, "age"}].value()), "26"));
+    failures += expect(collection[key_from_integer(1)].assign(flat_documents_k[0]).succeeded());
+    failures += expect(collection[key_from_integer(2)].assign(flat_documents_k[1]).succeeded());
+    failures += expect(collection[key_from_integer(3)].assign(flat_documents_k[2]).succeeded());
+    failures += expect(json_equal(as_text(*collection[key_from_integer(1)].value()), flat_documents_k[0]));
+    failures += expect(
+        json_equal(as_text(*collection[collection_key_field_t {key_from_integer(2), "person"}].value()), R"("Bob")"));
+    failures += expect(
+        json_equal(as_text(*collection[collection_key_field_t {key_from_integer(3), "age"}].value()), "26"));
 
-    auto maybe_person = collection[collection_key_field_t {1, "person"}].value(ustore_doc_field_str_k);
+    auto maybe_person = collection[collection_key_field_t {key_from_integer(1), "person"}].value(
+        ustore_doc_field_str_k);
     failures += expect_eq(std::string_view(maybe_person->c_str(), maybe_person->size()), std::string_view("Alice"));
     return failures;
 }
@@ -1103,37 +1056,37 @@ std::size_t database_docs_nested_batch(test_config_t const& config) {
     contents_arg_t const values = tape.contents();
     tape.assign(nested_documents_k);
 
-    std::array<ustore_key_t, 3> keys {1, 2, 3};
+    std::array<ustore_key_t, 3> keys {key_from_integer(1), key_from_integer(2), key_from_integer(3)};
     auto reference = collection[keys];
     failures += expect(reference.assign(values).succeeded());
 
-    failures += expect(json_equal(as_text(*collection[1].value()), nested_documents_k[0]));
-    failures += expect(json_equal(as_text(*collection[2].value()), nested_documents_k[1]));
-    failures += expect(json_equal(as_text(*collection[3].value()), nested_documents_k[2]));
+    failures += expect(json_equal(as_text(*collection[key_from_integer(1)].value()), nested_documents_k[0]));
+    failures += expect(json_equal(as_text(*collection[key_from_integer(2)].value()), nested_documents_k[1]));
+    failures += expect(json_equal(as_text(*collection[key_from_integer(3)].value()), nested_documents_k[2]));
 
-    failures += expect(
-        json_equal(as_text(*collection[collection_key_field_t {1, "person"}].value()), R"({"name":"Alice","age":24})"));
-    failures += expect(
-        json_equal(as_text(*collection[collection_key_field_t {2, "person"}].value()), R"([{"name":"Bob","age":25}])"));
-    failures += expect(
-        json_equal(as_text(*collection[collection_key_field_t {2, "/person/0/name"}].value()), R"("Bob")"));
+    failures += expect(json_equal(as_text(*collection[collection_key_field_t {key_from_integer(1), "person"}].value()),
+                                  R"({"name":"Alice","age":24})"));
+    failures += expect(json_equal(as_text(*collection[collection_key_field_t {key_from_integer(2), "person"}].value()),
+                                  R"([{"name":"Bob","age":25}])"));
+    failures += expect(json_equal(
+        as_text(*collection[collection_key_field_t {key_from_integer(2), "/person/0/name"}].value()), R"("Bob")"));
 
     failures += check_equalities(reference, values);
 
-    std::array<ustore_key_t, 3> unsorted_keys {1, 3, 2};
+    std::array<ustore_key_t, 3> unsorted_keys {key_from_integer(1), key_from_integer(3), key_from_integer(2)};
     auto unsorted_reference = collection[unsorted_keys];
     tape.assign({nested_documents_k[0], nested_documents_k[2], nested_documents_k[1]});
     failures += check_equalities(unsorted_reference, values);
 
-    std::array<ustore_key_t, 3> duplicate_keys {1, 2, 1};
+    std::array<ustore_key_t, 3> duplicate_keys {key_from_integer(1), key_from_integer(2), key_from_integer(1)};
     auto duplicate_reference = collection[duplicate_keys];
     tape.assign({nested_documents_k[0], nested_documents_k[1], nested_documents_k[0]});
     failures += check_equalities(duplicate_reference, values);
 
     std::array<collection_key_field_t, 3> keys_with_fields {
-        collection_key_field_t {1, "person"},
-        collection_key_field_t {2, "/person/0/name"},
-        collection_key_field_t {3, "age"},
+        collection_key_field_t {key_from_integer(1), "person"},
+        collection_key_field_t {key_from_integer(2), "/person/0/name"},
+        collection_key_field_t {key_from_integer(3), "age"},
     };
     auto fields_reference = collection[keys_with_fields];
     tape.assign({R"({"age":24,"name":"Alice"})", R"("Bob")", "26"});
@@ -1152,33 +1105,38 @@ std::size_t database_docs_modify(test_config_t const& config) {
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
     docs_collection_t collection = database.main<docs_collection_t>();
-    failures += expect(collection[1].assign(nested_documents_k[0].data()).succeeded());
-    failures += expect(json_equal(as_text(*collection[1].value()), nested_documents_k[0]));
+    failures += expect(collection[key_from_integer(1)].assign(nested_documents_k[0].data()).succeeded());
+    failures += expect(json_equal(as_text(*collection[key_from_integer(1)].value()), nested_documents_k[0]));
 
     char const* modifier = R"({"person":{"name":"Charles","age":28}})";
-    failures += expect(collection[1].update(modifier).succeeded());
-    failures += expect(json_equal(as_text(*collection[1].value()), modifier));
+    failures += expect(collection[key_from_integer(1)].update(modifier).succeeded());
+    failures += expect(json_equal(as_text(*collection[key_from_integer(1)].value()), modifier));
+
+    failures += expect(collection[collection_key_field_t {key_from_integer(1), "/person"}]
+                           .update(R"({"name":"Alice","age":24})")
+                           .succeeded());
+    failures += expect(json_equal(as_text(*collection[key_from_integer(1)].value()), nested_documents_k[0]));
+
+    failures += expect(collection[key_from_integer(1)].insert(nested_documents_k[1].data()).failed());
+    failures += expect(collection[key_from_integer(2)].insert(nested_documents_k[1].data()).succeeded());
+    failures += expect(json_equal(as_text(*collection[key_from_integer(2)].value()), nested_documents_k[1]));
 
     failures += expect(
-        collection[collection_key_field_t {1, "/person"}].update(R"({"name":"Alice","age":24})").succeeded());
-    failures += expect(json_equal(as_text(*collection[1].value()), nested_documents_k[0]));
+        collection[collection_key_field_t {key_from_integer(2), "/person/0/surname"}].insert(R"("Doe")").succeeded());
+    failures += expect(json_equal(as_text(*collection[key_from_integer(2)].value()),
+                                  R"({"person":[{"name":"Bob","age":25,"surname":"Doe"}]})"));
 
-    failures += expect(collection[1].insert(nested_documents_k[1].data()).failed());
-    failures += expect(collection[2].insert(nested_documents_k[1].data()).succeeded());
-    failures += expect(json_equal(as_text(*collection[2].value()), nested_documents_k[1]));
+    failures += expect(collection[key_from_integer(1)].upsert(nested_documents_k[2].data()).succeeded());
+    failures += expect(json_equal(as_text(*collection[key_from_integer(1)].value()), nested_documents_k[2]));
 
-    failures += expect(collection[collection_key_field_t {2, "/person/0/surname"}].insert(R"("Doe")").succeeded());
     failures += expect(
-        json_equal(as_text(*collection[2].value()), R"({"person":[{"name":"Bob","age":25,"surname":"Doe"}]})"));
+        collection[collection_key_field_t {key_from_integer(1), "/person"}].upsert(R"("Charles")").succeeded());
+    failures += expect(
+        json_equal(as_text(*collection[key_from_integer(1)].value()), R"({"person":"Charles","age":26})"));
 
-    failures += expect(collection[1].upsert(nested_documents_k[2].data()).succeeded());
-    failures += expect(json_equal(as_text(*collection[1].value()), nested_documents_k[2]));
-
-    failures += expect(collection[collection_key_field_t {1, "/person"}].upsert(R"("Charles")").succeeded());
-    failures += expect(json_equal(as_text(*collection[1].value()), R"({"person":"Charles","age":26})"));
-
-    failures += expect(collection[collection_key_field_t {1, "/weight"}].upsert("70").succeeded());
-    failures += expect(json_equal(as_text(*collection[1].value()), R"({"person":"Charles","age":26,"weight":70})"));
+    failures += expect(collection[collection_key_field_t {key_from_integer(1), "/weight"}].upsert("70").succeeded());
+    failures += expect(
+        json_equal(as_text(*collection[key_from_integer(1)].value()), R"({"person":"Charles","age":26,"weight":70})"));
     return failures;
 }
 
@@ -1290,10 +1248,12 @@ std::size_t check_modification_cases(docs_collection_t& collection, document_mod
         written_json_t const expected {yyjson_obj_get(entry, "expected")};
         if (!document.text || !modifier.text || !expected.text) continue;
 
-        failures += expect(collection[1].assign(static_cast<char const*>(document.text)).succeeded());
-        failures += patching ? expect(collection[1].patch(static_cast<char const*>(modifier.text)).succeeded())
-                             : expect(collection[1].merge(static_cast<char const*>(modifier.text)).succeeded());
-        auto maybe_value = collection[1].value();
+        failures += expect(collection[key_from_integer(1)].assign(static_cast<char const*>(document.text)).succeeded());
+        failures +=
+            patching
+                ? expect(collection[key_from_integer(1)].patch(static_cast<char const*>(modifier.text)).succeeded())
+                : expect(collection[key_from_integer(1)].merge(static_cast<char const*>(modifier.text)).succeeded());
+        auto maybe_value = collection[key_from_integer(1)].value();
         failures += expect(maybe_value);
         std::size_t const mismatches = expect(json_equal(as_text(*maybe_value), expected.text));
         if (mismatches)
@@ -1331,15 +1291,15 @@ std::size_t database_docs_table(test_config_t const& config) {
     char const* const alice = R"({"person":"Alice","age":27,"height":1})";
     char const* const bob = R"({"person":"Bob","age":"27","weight":2})";
     char const* const carl = R"({"person":"Carl","age":24})";
-    failures += expect(collection[1].assign(alice).succeeded());
-    failures += expect(collection[2].assign(bob).succeeded());
-    failures += expect(collection[3].assign(carl).succeeded());
-    failures += expect(json_equal(as_text(*collection[1].value()), alice));
-    failures += expect(json_equal(as_text(*collection[2].value()), bob));
+    failures += expect(collection[key_from_integer(1)].assign(alice).succeeded());
+    failures += expect(collection[key_from_integer(2)].assign(bob).succeeded());
+    failures += expect(collection[key_from_integer(3)].assign(carl).succeeded());
+    failures += expect(json_equal(as_text(*collection[key_from_integer(1)].value()), alice));
+    failures += expect(json_equal(as_text(*collection[key_from_integer(2)].value()), bob));
 
     // Column names
     {
-        auto maybe_fields = collection[1].gist();
+        auto maybe_fields = collection[key_from_integer(1)].gist();
         auto fields = *maybe_fields;
         bool has_person = false;
         bool has_height = false;
@@ -1361,7 +1321,7 @@ std::size_t database_docs_table(test_config_t const& config) {
     // Single cell
     {
         auto header = make_table_header().with<std::uint32_t>("age");
-        auto maybe_table = collection[1].gather(header);
+        auto maybe_table = collection[key_from_integer(1)].gather(header);
         auto table = *maybe_table;
         auto ages = table.column<0>();
 
@@ -1376,7 +1336,7 @@ std::size_t database_docs_table(test_config_t const& config) {
                           .with<std::int32_t>("age")
                           .with<std::string_view>("age");
 
-        auto maybe_table = collection[1].gather(header);
+        auto maybe_table = collection[key_from_integer(1)].gather(header);
         auto table = *maybe_table;
         auto unsigned_ages = table.column<0>();
         auto signed_ages = table.column<1>();
@@ -1393,7 +1353,9 @@ std::size_t database_docs_table(test_config_t const& config) {
     // Single column
     {
         auto header = make_table_header().with<std::int32_t>("age");
-        auto maybe_table = collection[{1, 2, 3, 123456}].gather(header);
+        auto maybe_table =
+            collection[{key_from_integer(1), key_from_integer(2), key_from_integer(3), key_from_integer(123456)}]
+                .gather(header);
         auto table = *maybe_table;
         auto ages = table.column<0>();
 
@@ -1406,7 +1368,9 @@ std::size_t database_docs_table(test_config_t const& config) {
     // Single strings column
     {
         auto header = make_table_header().with<std::string_view>("age");
-        auto maybe_table = collection[{1, 2, 3, 123456}].gather(header);
+        auto maybe_table =
+            collection[{key_from_integer(1), key_from_integer(2), key_from_integer(3), key_from_integer(123456)}]
+                .gather(header);
         auto table = *maybe_table;
         auto age_texts = table.column<0>();
 
@@ -1426,7 +1390,9 @@ std::size_t database_docs_table(test_config_t const& config) {
                           .with<std::int32_t>("height")
                           .with<std::uint64_t>("weight");
 
-        auto maybe_table = collection[{1, 2, 3, 123456, 654321}].gather(header);
+        auto maybe_table = collection[{key_from_integer(1), key_from_integer(2), key_from_integer(3),
+                                       key_from_integer(123456), key_from_integer(654321)}]
+                               .gather(header);
         auto table = *maybe_table;
         auto ages = table.column<0>();
         auto age_texts = table.column<1>();
@@ -1458,7 +1424,9 @@ std::size_t database_docs_table(test_config_t const& config) {
         }};
         table_header_view_t const header = make_table_header(columns);
 
-        auto maybe_table = collection[{1, 2, 3, 123456, 654321}].gather(header);
+        auto maybe_table = collection[{key_from_integer(1), key_from_integer(2), key_from_integer(3),
+                                       key_from_integer(123456), key_from_integer(654321)}]
+                               .gather(header);
         auto table = *maybe_table;
         auto ages = table.column(0).as<std::int32_t>();
         auto age_texts = table.column(1).as<value_view_t>();
@@ -1490,14 +1458,19 @@ constexpr std::size_t graph_vertices_count_k = 1000;
 /** Stride between the vertices each vertex connects to, which leaves every degree at nine. */
 constexpr std::size_t graph_connect_stride_k = 100;
 
+/** The edge from @p source to @p target named @p id, each spelled as the key of that integer. */
+constexpr edge_t edge_of(std::uint64_t source, std::uint64_t target, std::uint64_t id) noexcept {
+    return {key_from_integer(source), key_from_integer(target), key_from_integer(id)};
+}
+
 /** Connects every vertex to each @c graph_connect_stride_k-th vertex after it, and answers whether every edge fit. */
 [[nodiscard]] bool fill_edges(st::basic_vector<edge_t>& edges) noexcept {
-    ustore_key_t edge_id = 0;
+    std::uint64_t edge_id = 0;
     for (std::size_t vertex_id = 0; vertex_id != graph_vertices_count_k; ++vertex_id)
         for (std::size_t connect_with = vertex_id + graph_connect_stride_k; connect_with < graph_vertices_count_k;
              connect_with += graph_connect_stride_k) {
             ++edge_id;
-            edge_t edge {static_cast<ustore_key_t>(vertex_id), static_cast<ustore_key_t>(connect_with), edge_id};
+            edge_t edge = edge_of(vertex_id, connect_with, edge_id);
             if (st::failed(edges.push_back(std::move(edge)))) return false;
         }
     return true;
@@ -1516,14 +1489,16 @@ std::size_t database_graph_upsert_vertices(test_config_t const& config) {
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
 
-    graph_collection_t graph = database.main<graph_collection_t>();
-    std::array<ustore_key_t, 4> const vertices {1, 4, 5, 2};
+    auto [graph, graph_status] = database.create<graph_collection_t>("graph", ustore_modality_graph_k);
+    failures += expect(graph_status.succeeded());
+    std::array<ustore_key_t, 4> const vertices {key_from_integer(1), key_from_integer(4), key_from_integer(5),
+                                                key_from_integer(2)};
     failures += expect(graph.upsert_vertices(strided(vertices)).succeeded());
 
-    failures += expect(*graph.contains(1));
-    failures += expect(*graph.contains(2));
-    failures += expect(*graph.contains(4));
-    failures += expect(*graph.contains(5));
+    failures += expect(*graph.contains(key_from_integer(1)));
+    failures += expect(*graph.contains(key_from_integer(2)));
+    failures += expect(*graph.contains(key_from_integer(4)));
+    failures += expect(*graph.contains(key_from_integer(5)));
     return failures;
 }
 
@@ -1535,49 +1510,53 @@ std::size_t database_graph_upsert_edge(test_config_t const& config) {
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
 
-    graph_collection_t graph = database.main<graph_collection_t>();
-    edge_t const edge {1, 2, 9};
+    auto [graph, graph_status] = database.create<graph_collection_t>("graph", ustore_modality_graph_k);
+    failures += expect(graph_status.succeeded());
+    edge_t const edge = edge_of(1, 2, 9);
     failures += expect(graph.upsert_edge(edge).succeeded());
-    failures += expect(*graph.contains(1));
-    failures += expect(*graph.contains(2));
-    failures += expect(!*graph.contains(3));
+    failures += expect(*graph.contains(key_from_integer(1)));
+    failures += expect(*graph.contains(key_from_integer(2)));
+    failures += expect(!*graph.contains(key_from_integer(3)));
 
-    auto maybe_neighbors = graph.neighbors(1);
+    auto maybe_neighbors = graph.neighbors(key_from_integer(1));
     failures += expect(maybe_neighbors);
     auto const& neighbors = *maybe_neighbors;
     failures += expect_eq(neighbors.size(), 1u);
-    failures += expect_eq(neighbors[0], 2);
+    failures += expect_eq(neighbors[0], key_from_integer(2));
     return failures;
 }
 
 /** Checks a triangle of three vertices and three directed edges, before and after removing its parts. */
 std::size_t check_triangle(graph_collection_t& graph, std::array<edge_t, 3>& triangle) {
     std::size_t failures = 0;
-    failures += expect(*graph.contains(1));
-    failures += expect(*graph.contains(2));
-    failures += expect(!*graph.contains(9));
-    failures += expect(!*graph.contains(10));
-    failures += expect(!*graph.contains(1000));
+    failures += expect(*graph.contains(key_from_integer(1)));
+    failures += expect(*graph.contains(key_from_integer(2)));
+    failures += expect(!*graph.contains(key_from_integer(9)));
+    failures += expect(!*graph.contains(key_from_integer(10)));
+    failures += expect(!*graph.contains(key_from_integer(1000)));
 
-    failures += expect_eq(*graph.degree(1), 2u);
-    failures += expect_eq(*graph.degree(2), 2u);
-    failures += expect_eq(*graph.degree(3), 2u);
-    failures += expect_eq(*graph.degree(1, ustore_vertex_source_k), 1u);
-    failures += expect_eq(*graph.degree(2, ustore_vertex_source_k), 1u);
-    failures += expect_eq(*graph.degree(3, ustore_vertex_source_k), 1u);
+    failures += expect_eq(*graph.degree(key_from_integer(1)), 2u);
+    failures += expect_eq(*graph.degree(key_from_integer(2)), 2u);
+    failures += expect_eq(*graph.degree(key_from_integer(3)), 2u);
+    failures += expect_eq(*graph.degree(key_from_integer(1), ustore_vertex_source_k), 1u);
+    failures += expect_eq(*graph.degree(key_from_integer(2), ustore_vertex_source_k), 1u);
+    failures += expect_eq(*graph.degree(key_from_integer(3), ustore_vertex_source_k), 1u);
 
-    failures += expect(graph.edges_containing(1));
-    failures += expect_eq(graph.edges_containing(1)->size(), 2u);
-    failures += expect_eq(graph.edges_containing(1, ustore_vertex_source_k)->size(), 1u);
-    failures += expect_eq(graph.edges_containing(1, ustore_vertex_target_k)->size(), 1u);
+    failures += expect(graph.edges_containing(key_from_integer(1)));
+    failures += expect_eq(graph.edges_containing(key_from_integer(1))->size(), 2u);
+    failures += expect_eq(graph.edges_containing(key_from_integer(1), ustore_vertex_source_k)->size(), 1u);
+    failures += expect_eq(graph.edges_containing(key_from_integer(1), ustore_vertex_target_k)->size(), 1u);
 
-    failures += expect_eq(graph.edges_containing(3, ustore_vertex_target_k)->size(), 1u);
-    failures += expect_eq(graph.edges_containing(2, ustore_vertex_source_k)->size(), 1u);
-    failures += expect_eq((*graph.edges_containing(3, ustore_vertex_target_k))[0].source_id, 2);
-    failures += expect_eq((*graph.edges_containing(3, ustore_vertex_target_k))[0].target_id, 3);
-    failures += expect_eq((*graph.edges_containing(3, ustore_vertex_target_k))[0].id, 10);
-    failures += expect_eq(graph.edges_between(3, 1)->size(), 1u);
-    failures += expect_eq(graph.edges_between(1, 3)->size(), 0u);
+    failures += expect_eq(graph.edges_containing(key_from_integer(3), ustore_vertex_target_k)->size(), 1u);
+    failures += expect_eq(graph.edges_containing(key_from_integer(2), ustore_vertex_source_k)->size(), 1u);
+    failures += expect_eq((*graph.edges_containing(key_from_integer(3), ustore_vertex_target_k))[0].source_id,
+                          key_from_integer(2));
+    failures += expect_eq((*graph.edges_containing(key_from_integer(3), ustore_vertex_target_k))[0].target_id,
+                          key_from_integer(3));
+    failures += expect_eq((*graph.edges_containing(key_from_integer(3), ustore_vertex_target_k))[0].id,
+                          key_from_integer(10));
+    failures += expect_eq(graph.edges_between(key_from_integer(3), key_from_integer(1))->size(), 1u);
+    failures += expect_eq(graph.edges_between(key_from_integer(1), key_from_integer(3))->size(), 0u);
 
     failures += expect(graph.edges());
     {
@@ -1600,9 +1579,9 @@ std::size_t check_triangle(graph_collection_t& graph, std::array<edge_t, 3>& tri
                                {{&triangle[0].id}, 1},
                            })
                            .succeeded());
-    failures += expect(*graph.contains(1));
-    failures += expect(*graph.contains(2));
-    failures += expect_eq(graph.edges_between(1, 2)->size(), 0u);
+    failures += expect(*graph.contains(key_from_integer(1)));
+    failures += expect(*graph.contains(key_from_integer(2)));
+    failures += expect_eq(graph.edges_between(key_from_integer(1), key_from_integer(2))->size(), 0u);
 
     failures += expect(graph
                            .upsert_edges(edges_view_t {
@@ -1611,20 +1590,20 @@ std::size_t check_triangle(graph_collection_t& graph, std::array<edge_t, 3>& tri
                                {{&triangle[0].id}, 1},
                            })
                            .succeeded());
-    failures += expect_eq(graph.edges_between(1, 2)->size(), 1u);
+    failures += expect_eq(graph.edges_between(key_from_integer(1), key_from_integer(2))->size(), 1u);
 
-    ustore_key_t const vertex_to_remove = 2;
+    ustore_key_t const vertex_to_remove = key_from_integer(2);
     failures += expect(graph.remove_vertex(vertex_to_remove).succeeded());
     failures += expect(!*graph.contains(vertex_to_remove));
     failures += expect_eq(graph.edges_containing(vertex_to_remove)->size(), 0u);
-    failures += expect_eq(graph.edges_between(1, vertex_to_remove)->size(), 0u);
-    failures += expect_eq(graph.edges_between(vertex_to_remove, 1)->size(), 0u);
+    failures += expect_eq(graph.edges_between(key_from_integer(1), vertex_to_remove)->size(), 0u);
+    failures += expect_eq(graph.edges_between(vertex_to_remove, key_from_integer(1))->size(), 0u);
 
     failures += expect(graph.upsert_edges(edges(triangle)).succeeded());
     failures += expect(*graph.contains(vertex_to_remove));
     failures += expect_eq(graph.edges_containing(vertex_to_remove)->size(), 2u);
-    failures += expect_eq(graph.edges_between(1, vertex_to_remove)->size(), 1u);
-    failures += expect_eq(graph.edges_between(vertex_to_remove, 1)->size(), 0u);
+    failures += expect_eq(graph.edges_between(key_from_integer(1), vertex_to_remove)->size(), 1u);
+    failures += expect_eq(graph.edges_between(vertex_to_remove, key_from_integer(1))->size(), 0u);
     return failures;
 }
 
@@ -1636,18 +1615,19 @@ std::size_t database_graph_triangle(test_config_t const& config) {
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
 
-    graph_collection_t graph = database.main<graph_collection_t>();
-    std::array<edge_t, 3> triangle {{{1, 2, 9}, {2, 3, 10}, {3, 1, 11}}};
+    auto [graph, graph_status] = database.create<graph_collection_t>("graph", ustore_modality_graph_k);
+    failures += expect(graph_status.succeeded());
+    std::array<edge_t, 3> triangle {edge_of(1, 2, 9), edge_of(2, 3, 10), edge_of(3, 1, 11)};
     failures += expect(graph.upsert_edge(triangle[0]).succeeded());
     failures += expect(graph.upsert_edge(triangle[1]).succeeded());
     failures += expect(graph.upsert_edge(triangle[2]).succeeded());
 
-    auto maybe_neighbors = graph.neighbors(1);
+    auto maybe_neighbors = graph.neighbors(key_from_integer(1));
     failures += expect(maybe_neighbors);
     auto const& neighbors = *maybe_neighbors;
     failures += expect_eq(neighbors.size(), 2u);
-    failures += expect_eq(neighbors[0], 2);
-    failures += expect_eq(neighbors[1], 3);
+    failures += expect_eq(neighbors[0], key_from_integer(2));
+    failures += expect_eq(neighbors[1], key_from_integer(3));
 
     failures += check_triangle(graph, triangle);
     return failures;
@@ -1661,8 +1641,9 @@ std::size_t database_graph_triangle_batch(test_config_t const& config) {
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
 
-    graph_collection_t graph = database.main<graph_collection_t>();
-    std::array<edge_t, 3> triangle {{{1, 2, 9}, {2, 3, 10}, {3, 1, 11}}};
+    auto [graph, graph_status] = database.create<graph_collection_t>("graph", ustore_modality_graph_k);
+    failures += expect(graph_status.succeeded());
+    std::array<edge_t, 3> triangle {edge_of(1, 2, 9), edge_of(2, 3, 10), edge_of(3, 1, 11)};
     failures += expect(graph.upsert_edges(edges(triangle)).succeeded());
 
     failures += check_triangle(graph, triangle);
@@ -1678,15 +1659,17 @@ case_result_t database_graph_transaction_watch(test_config_t const& config) {
     if (!database.supports_transactions()) return case_result_t::skipped("the engine keeps no transactions", failures);
     failures += expect(database.clear().succeeded());
 
-    graph_collection_t graph = database.main<graph_collection_t>();
-    edge_t const edge_ab {'A', 'B', 19};
-    edge_t const edge_bc {'B', 'C', 31};
+    auto [graph, graph_status] = database.create<graph_collection_t>("graph", ustore_modality_graph_k);
+    failures += expect(graph_status.succeeded());
+    edge_t const edge_ab = edge_of('A', 'B', 19);
+    edge_t const edge_bc = edge_of('B', 'C', 31);
     failures += expect(graph.upsert_edge(edge_ab).succeeded());
     failures += expect(graph.upsert_edge(edge_bc).succeeded());
 
     transaction_t transaction = *database.transact();
-    graph_collection_t transaction_graph = transaction.main<graph_collection_t>();
-    failures += expect(transaction_graph.degree('B') == 2);
+    auto [transaction_graph, transaction_graph_status] = transaction.find<graph_collection_t>("graph");
+    failures += expect(transaction_graph_status.succeeded());
+    failures += expect(transaction_graph.degree(key_from_integer('B')) == 2);
     failures += expect(transaction_graph.remove_edge(edge_bc).succeeded());
     failures += expect(graph.remove_edge(edge_ab).succeeded());
 
@@ -1702,12 +1685,14 @@ std::size_t database_graph_random_fill(test_config_t const& config) {
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
 
-    graph_collection_t graph = database.main<graph_collection_t>();
+    auto [graph, graph_status] = database.create<graph_collection_t>("graph", ustore_modality_graph_k);
+    failures += expect(graph_status.succeeded());
     st::basic_vector<edge_t> generated;
     failures += expect(fill_edges(generated));
     failures += expect(graph.upsert_edges(edges_of(generated)).succeeded());
 
-    for (ustore_key_t vertex_id = 0; vertex_id != graph_vertices_count_k; ++vertex_id) {
+    for (std::size_t index = 0; index != graph_vertices_count_k; ++index) {
+        ustore_key_t const vertex_id = key_from_integer(index);
         failures += expect(graph.contains(vertex_id));
         failures += expect_eq(*graph.degree(vertex_id), 9u);
     }
@@ -1723,13 +1708,15 @@ case_result_t database_graph_conflicting_transactions(test_config_t const& confi
     if (!database.supports_transactions()) return case_result_t::skipped("the engine keeps no transactions", failures);
     failures += expect(database.clear().succeeded());
 
+    failures += expect(database.create<graph_collection_t>("graph", ustore_modality_graph_k).has_value());
     transaction_t first_transaction = *database.transact();
-    graph_collection_t first_graph = first_transaction.main<graph_collection_t>();
+    auto [first_graph, first_graph_status] = first_transaction.find<graph_collection_t>("graph");
     transaction_t second_transaction = *database.transact();
-    graph_collection_t second_graph = second_transaction.main<graph_collection_t>();
+    auto [second_graph, second_graph_status] = second_transaction.find<graph_collection_t>("graph");
+    failures += expect(first_graph_status.succeeded() && second_graph_status.succeeded());
 
-    edge_t const first_edge {4, 5, 15};
-    edge_t const second_edge {5, 6, 16};
+    edge_t const first_edge = edge_of(4, 5, 15);
+    edge_t const second_edge = edge_of(5, 6, 16);
 
     failures += expect(first_graph.upsert_edge(first_edge).succeeded());
     failures += expect(second_graph.upsert_edge(second_edge).succeeded());
@@ -1746,9 +1733,11 @@ std::size_t database_graph_layering_shapes(test_config_t const& config) {
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
 
-    graph_collection_t graph = database.main<graph_collection_t>();
+    auto [graph, graph_status] = database.create<graph_collection_t>("graph", ustore_modality_graph_k);
+    failures += expect(graph_status.succeeded());
 
-    std::array<ustore_key_t, 5> const vertices {1, 2, 3, 4, 5};
+    std::array<ustore_key_t, 5> const vertices {key_from_integer(1), key_from_integer(2), key_from_integer(3),
+                                                key_from_integer(4), key_from_integer(5)};
     auto check_vertices = [&](ustore_vertex_degree_t degree) {
         std::size_t vertex_failures = 0;
         for (ustore_key_t const vertex_id : vertices) {
@@ -1760,9 +1749,12 @@ std::size_t database_graph_layering_shapes(test_config_t const& config) {
 
     failures += check_vertices(ustore_vertex_degree_missing_k);
 
-    std::array<edge_t, 5> star {{{1, 3, 1}, {1, 4, 2}, {2, 4, 3}, {2, 5, 4}, {3, 5, 5}}};
-    std::array<edge_t, 5> pentagon {{{1, 2, 6}, {2, 3, 7}, {3, 4, 8}, {4, 5, 9}, {5, 1, 10}}};
-    std::array<edge_t, 5> self_loops {{{1, 1, 11}, {2, 2, 12}, {3, 3, 13}, {4, 4, 14}, {5, 5, 15}}};
+    std::array<edge_t, 5> star {edge_of(1, 3, 1), edge_of(1, 4, 2), edge_of(2, 4, 3), edge_of(2, 5, 4),
+                                edge_of(3, 5, 5)};
+    std::array<edge_t, 5> pentagon {edge_of(1, 2, 6), edge_of(2, 3, 7), edge_of(3, 4, 8), edge_of(4, 5, 9),
+                                    edge_of(5, 1, 10)};
+    std::array<edge_t, 5> self_loops {edge_of(1, 1, 11), edge_of(2, 2, 12), edge_of(3, 3, 13), edge_of(4, 4, 14),
+                                      edge_of(5, 5, 15)};
 
     failures += expect(graph.upsert_edges(edges(star)).succeeded());
     failures += check_vertices(2);
@@ -1783,7 +1775,7 @@ std::size_t database_graph_layering_shapes(test_config_t const& config) {
     failures += check_vertices(2);
     failures += expect(graph.remove_edges(edges(self_loops)).succeeded());
     failures += check_vertices(0);
-    failures += expect(database.clear().succeeded());
+    failures += expect(graph.clear().succeeded());
     failures += check_vertices(ustore_vertex_degree_missing_k);
     return failures;
 }
@@ -1796,12 +1788,14 @@ std::size_t database_graph_remove_vertices(test_config_t const& config) {
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
 
-    graph_collection_t graph = database.main<graph_collection_t>();
+    auto [graph, graph_status] = database.create<graph_collection_t>("graph", ustore_modality_graph_k);
+    failures += expect(graph_status.succeeded());
     st::basic_vector<edge_t> generated;
     failures += expect(fill_edges(generated));
     failures += expect(graph.upsert_edges(edges_of(generated)).succeeded());
 
-    for (ustore_key_t vertex_id = 0; vertex_id != graph_vertices_count_k; ++vertex_id) {
+    for (std::size_t index = 0; index != graph_vertices_count_k; ++index) {
+        ustore_key_t const vertex_id = key_from_integer(index);
         failures += expect(graph.contains(vertex_id));
         failures += expect(*graph.contains(vertex_id));
         failures += expect(graph.remove_vertex(vertex_id).succeeded());
@@ -1811,9 +1805,10 @@ std::size_t database_graph_remove_vertices(test_config_t const& config) {
 
     failures += expect(graph.upsert_edges(edges_of(generated)).succeeded());
     std::array<ustore_key_t, graph_vertices_count_k> vertices;
-    std::iota(vertices.begin(), vertices.end(), 0);
+    for (std::size_t index = 0; index != vertices.size(); ++index) vertices[index] = key_from_integer(index);
     failures += expect(graph.remove_vertices(strided(vertices).immutable()).succeeded());
-    for (ustore_key_t vertex_id = 0; vertex_id != graph_vertices_count_k; ++vertex_id) {
+    for (std::size_t index = 0; index != graph_vertices_count_k; ++index) {
+        ustore_key_t const vertex_id = key_from_integer(index);
         failures += expect(graph.contains(vertex_id));
         failures += expect(!*graph.contains(vertex_id));
     }
@@ -1828,13 +1823,15 @@ std::size_t database_graph_remove_edges_keep_vertices(test_config_t const& confi
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
 
-    graph_collection_t graph = database.main<graph_collection_t>();
+    auto [graph, graph_status] = database.create<graph_collection_t>("graph", ustore_modality_graph_k);
+    failures += expect(graph_status.succeeded());
     st::basic_vector<edge_t> generated;
     failures += expect(fill_edges(generated));
     failures += expect(graph.upsert_edges(edges_of(generated)).succeeded());
     failures += expect(graph.remove_edges(edges_of(generated)).succeeded());
 
-    for (ustore_key_t vertex_id = 0; vertex_id != graph_vertices_count_k; ++vertex_id) {
+    for (std::size_t index = 0; index != graph_vertices_count_k; ++index) {
+        ustore_key_t const vertex_id = key_from_integer(index);
         failures += expect(graph.contains(vertex_id));
         failures += expect(*graph.contains(vertex_id));
     }
@@ -1849,13 +1846,15 @@ std::size_t database_graph_get_vertex_edges(test_config_t const& config) {
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
 
-    graph_collection_t graph = database.main<graph_collection_t>();
+    auto [graph, graph_status] = database.create<graph_collection_t>("graph", ustore_modality_graph_k);
+    failures += expect(graph_status.succeeded());
     st::basic_vector<edge_t> generated;
     failures += expect(fill_edges(generated));
     failures += expect(graph.upsert_edges(edges_of(generated)).succeeded());
 
     st::basic_vector<edge_t> received;
-    for (ustore_key_t vertex_id = 0; vertex_id != graph_vertices_count_k; ++vertex_id) {
+    for (std::size_t index = 0; index != graph_vertices_count_k; ++index) {
+        ustore_key_t const vertex_id = key_from_integer(index);
         auto vertex_edges = *graph.edges_containing(vertex_id);
         failures += expect_eq(vertex_edges.size(), 9u);
         for (std::size_t index = 0; index != vertex_edges.size(); ++index) {
@@ -1865,7 +1864,8 @@ std::size_t database_graph_get_vertex_edges(test_config_t const& config) {
     }
     failures += expect(graph.remove_edges(edges_of(received)).succeeded());
 
-    for (ustore_key_t vertex_id = 0; vertex_id != graph_vertices_count_k; ++vertex_id) {
+    for (std::size_t index = 0; index != graph_vertices_count_k; ++index) {
+        ustore_key_t const vertex_id = key_from_integer(index);
         failures += expect(graph.contains(vertex_id));
         failures += expect(*graph.contains(vertex_id));
         failures += expect_eq(graph.edges_containing(vertex_id)->size(), 0u);
@@ -1881,9 +1881,10 @@ std::size_t database_graph_degrees(test_config_t const& config) {
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
 
-    graph_collection_t graph = database.main<graph_collection_t>();
+    auto [graph, graph_status] = database.create<graph_collection_t>("graph", ustore_modality_graph_k);
+    failures += expect(graph_status.succeeded());
     std::array<ustore_key_t, graph_vertices_count_k> vertices;
-    std::iota(vertices.begin(), vertices.end(), 0);
+    for (std::size_t index = 0; index != vertices.size(); ++index) vertices[index] = key_from_integer(index);
 
     st::basic_vector<edge_t> generated;
     failures += expect(fill_edges(generated));
@@ -1902,24 +1903,25 @@ std::size_t database_graph_neighbors(test_config_t const& config) {
     if (failures != 0) return failures;
     failures += expect(database.clear().succeeded());
 
-    graph_collection_t graph = database.main<graph_collection_t>();
-    failures += expect(graph.upsert_edge(edge_t {1, 1, 17}).succeeded());
-    failures += expect(graph.upsert_edge(edge_t {1, 2, 15}).succeeded());
-    failures += expect(graph.upsert_edge(edge_t {2, 3, 16}).succeeded());
+    auto [graph, graph_status] = database.create<graph_collection_t>("graph", ustore_modality_graph_k);
+    failures += expect(graph_status.succeeded());
+    failures += expect(graph.upsert_edge(edge_of(1, 1, 17)).succeeded());
+    failures += expect(graph.upsert_edge(edge_of(1, 2, 15)).succeeded());
+    failures += expect(graph.upsert_edge(edge_of(2, 3, 16)).succeeded());
 
-    auto maybe_first_neighbors = graph.neighbors(1);
+    auto maybe_first_neighbors = graph.neighbors(key_from_integer(1));
     failures += expect(maybe_first_neighbors);
     auto const& first_neighbors = *maybe_first_neighbors;
     failures += expect_eq(first_neighbors.size(), 2u);
-    failures += expect_eq(first_neighbors[0], 1);
-    failures += expect_eq(first_neighbors[1], 2);
+    failures += expect_eq(first_neighbors[0], key_from_integer(1));
+    failures += expect_eq(first_neighbors[1], key_from_integer(2));
 
-    auto maybe_second_neighbors = graph.neighbors(2);
+    auto maybe_second_neighbors = graph.neighbors(key_from_integer(2));
     failures += expect(maybe_second_neighbors);
     auto const& second_neighbors = *maybe_second_neighbors;
     failures += expect_eq(second_neighbors.size(), 2u);
-    failures += expect_eq(second_neighbors[0], 1);
-    failures += expect_eq(second_neighbors[1], 3);
+    failures += expect_eq(second_neighbors[0], key_from_integer(1));
+    failures += expect_eq(second_neighbors[1], key_from_integer(3));
     return failures;
 }
 
@@ -1957,15 +1959,13 @@ int main(int argc, char** argv) {
     report(totals, "database.batch_scan", database_batch_scan, config);
     report(totals, "database.transaction_read_committed", database_transaction_read_committed, config);
     report(totals, "database.snapshot_isolation", database_transaction_snapshot_isolation, config);
-    report(totals, "database.snapshots_list", database_snapshots_list, config);
     report(totals, "database.transaction_with_snapshot", database_transaction_with_snapshot, config);
-    report(totals, "database.set_wrong_snapshot", database_set_wrong_snapshot, config);
     if (directory) report(totals, "database.export_snapshot", database_export_snapshot, config);
     else report(totals, "database.export_snapshot", case_result_t::skipped(needs_directory_k));
     report(totals, "database.snapshot_with_threads", database_snapshot_with_threads, config);
     report(totals, "database.erase_missing", database_transaction_erase_missing, config);
     report(totals, "database.write_conflicting", database_transaction_write_conflicting, config);
-    report(totals, "database.sequenced_commit", database_transaction_sequenced_commit, config);
+    report(totals, "database.stamped_commit", database_transaction_stamped_commit, config);
 
     report(totals, "database.docs_flat", database_docs_flat, config);
     report(totals, "database.docs_nested_batch", database_docs_nested_batch, config);

@@ -14,7 +14,8 @@ Engines aim for the highest isolation SmashTable delivers, each reports the leve
 ## SmashTable
 
 `src/smashtable/` is the reference in-memory engine, and the one every other engine is checked against.
-Collections keyed by integers, their catalog and its counter share one stamp-based SmashTable `partitioned_store` ordered by collection and key, and collections keyed by strings share a second one with the names of collections, ordered by collection and string.
+Collections keyed by UUIDs, their catalog and its counter share one stamp-based SmashTable `partitioned_store` ordered by collection and key, and collections keyed by strings share a second one with the names of collections, ordered by collection and string.
+The catalog maps the UUID of every collection onto the number its pairs are filed under, so a stored key spends eight bytes on its collection rather than sixteen.
 Collections appear at runtime while a `transaction_group` spans stores fixed at compile time, so each store spans every collection of its keying, and both are built into one commit order, so a transaction reaching both publishes under one stamp and a snapshot reads both at it.
 One library serves both isolation levels: the `"isolation"` key picks one at open, each exported call visits the chosen instantiation once, and the `info` request of `ustore_database_control` reports it.
 
@@ -26,7 +27,7 @@ A database opened with a directory persists as one binary image, rewritten whole
 
 ## RocksDB
 
-`src/rocksdb/` keeps each collection as a column family of a RocksDB `TransactionDB`: integer keys under a custom comparator, strings under the bytewise one, and the names of collections in a family of their own that no identifier reaches.
+`src/rocksdb/` keeps each collection as a column family of a RocksDB `TransactionDB`, named `<modality>.<UUID>` so an open recovers both: UUID keys and strings alike under the bytewise comparator, the main collection in the default family, and the names of collections in a family of their own that no identifier reaches.
 Every write reaches RocksDB's log, which stays in memory until a flushed write or commit, a full buffer or a clean close writes it out, so a crash keeps a consistent prefix of the commits across every collection.
 A transaction reads the snapshot its first read or write took, through its own buffered writes, and records the keys it watches unless a call passes `ustore_option_transaction_dont_watch_k`.
 Nothing is locked until it stages, when RocksDB's pessimistic transaction locks and validates every watched read and buffered write and prepares them into the log, so conflicts surface at stage or commit as on SmashTable.
@@ -36,14 +37,14 @@ This is one design for durability and two-phase commits rather than the settled 
 ## LevelDB
 
 `src_oracles/leveldb/` wraps one LevelDB database with snapshots and collections, but without transactions: `ustore_transaction_init` fails with an error.
-LevelDB keeps one sorted keyspace, so every stored key leads with a tag naming its range, and the engine's comparator orders keys by tag, then by collection, then integer keys as integers and everything else as bytes, keeping each collection one contiguous run:
+LevelDB keeps one sorted keyspace, so every stored key leads with a tag naming its range, and the engine's comparator orders keys by tag, then by the number the catalog gave the collection, then as bytes, keeping each collection one contiguous run:
 
 ```c
-struct integers { uint8_t tag; uint64_t collection; int64_t key; };  // 17 bytes, the value of the pair
-struct strings  { uint8_t tag; uint64_t collection; char string[]; }; // 9 bytes and up, the value of the pair
-struct names    { uint8_t tag; char name[]; };                       // valued by the collection and its modality
-struct catalog  { uint8_t tag; uint64_t collection; };               // valued by the collection's modality byte
-struct counter  { uint8_t tag; };                                    // valued by the next collection's identifier
+struct uuids   { uint8_t tag; uint64_t number; uint8_t key[16]; };  // 25 bytes, the value of the pair
+struct strings { uint8_t tag; uint64_t number; char string[]; };    // 9 bytes and up, the value of the pair
+struct names   { uint8_t tag; char name[]; };                       // valued by the collection and its modality
+struct catalog { uint8_t tag; uint8_t collection[16]; };            // valued by its number, modality and name
+struct counter { uint8_t tag; };                                    // valued by the next collection's number
 ```
 
 No key a caller passes reaches another tag, so the catalog, the counter and the names stay out of every collection.
@@ -57,6 +58,7 @@ Its isolation ends at reading from a snapshot.
 A `database` holds `collection`s, each an `lsm_tree` of `lsm_level`s whose `lsm_sorted_run` files open with a `sorted_run_index` of `key_slot`s ahead of their `stored_value`s, with optimistic transactions, snapshots and backups.
 Its graph database keeps adjacency in NVMe's own databases, as a fast path beside `c/graph.cpp`.
 Its strings and the names of its collections live in `src/nvme/strings.cpp`, as sorted buckets under integer keys in collections no identifier a caller holds reaches, until the engine keys strings itself.
+It keeps 64-bit keys inside for now, so it takes only keys below 2^64, refusing the rest with `ustore_error_unsupported_k`, and names a collection by the UUID spelling its catalog number rather than a UUIDv7.
 CMake refuses `USTORE_BUILD_NVME` until the sources in this directory build in tree, so everything below is a v1 target:
 
 - __Kernel bypass__ — a transport chosen at mount reaches each data directory through io_uring on `O_DIRECT` files, io_uring on NVMe block devices, NVMe passthrough, or SPDK's user-space driver, and falls back to blocking positioned I/O on macOS, Windows and wherever io_uring is refused.

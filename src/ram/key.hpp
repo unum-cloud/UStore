@@ -2,15 +2,15 @@
  *  @file src/ram/key.hpp
  *  @author Ash Vardanian
  *  @date September 15, 2026
- *  @brief The composite keys the pairs of the SmashTable engine are stored under, with their orders, hashes and bounds.
+ *  @brief The keys the stores of the RAM engine file their entries under, with their orders and hashes.
  */
 
 #pragma once
 
 #include <cstddef> // `std::size_t`
-#include <cstdint> // `std::uint64_t`
+#include <cstdint> // `std::uint8_t`, `std::uint64_t`
+#include <cstring> // `std::memcmp`, `std::memcpy`
 
-#include <limits>      // `std::numeric_limits`
 #include <string_view> // `std::string_view`
 #include <utility>     // `std::move`
 
@@ -23,104 +23,34 @@
 
 namespace unum::ustore::ram {
 
-/** The identifier of the nameless main collection. */
-inline constexpr ustore_collection_t main_collection_k = 0;
-
-/** The collection of the strings store holding the record of every collection name, kept above every
- *  identifier the counter hands out and never listed in the catalog, so no call reaches it. */
-inline constexpr ustore_collection_t names_collection_k = std::numeric_limits<ustore_collection_t>::max() - 1;
-
-/** The reserved collection holding one entry per collection and the counter that numbers them. */
-inline constexpr ustore_collection_t catalog_collection_k = std::numeric_limits<ustore_collection_t>::max();
-
-/** The catalog key of the counter, which sits above every entry and below @c stored_key_t::highest. */
-inline constexpr ustore_key_t collection_counter_key_k = std::numeric_limits<ustore_key_t>::max() - 1;
-
-/** A key inside a collection, and the only type that knows how keys order, hash and bound a collection. */
-struct stored_key_t {
-
-    /** Collection owning the key. */
-    ustore_collection_t collection {main_collection_k};
-
-    /** Key inside the collection. */
-    ustore_key_t key {0};
-
-    /** The key that stands for no key. */
-    static constexpr ustore_key_t unknown_key_k = std::numeric_limits<ustore_key_t>::max();
-
-    /** The first key @p collection can hold. */
-    static constexpr stored_key_t lowest_in(ustore_collection_t collection) noexcept {
-        return {collection, std::numeric_limits<ustore_key_t>::min()};
-    }
-
-    /** The last key @p collection can hold. */
-    static constexpr stored_key_t highest_in(ustore_collection_t collection) noexcept {
-        return {collection, std::numeric_limits<ustore_key_t>::max()};
-    }
-
-    /** The first key after every key of @p collection, which a walk of it stops before. */
-    static constexpr stored_key_t past(ustore_collection_t collection) noexcept { return lowest_in(collection + 1); }
-
-    /** The first key the store can hold. */
-    static constexpr stored_key_t lowest() noexcept { return lowest_in(main_collection_k); }
-
-    /** The last key the store can hold, which nothing is ever stored under. */
-    static constexpr stored_key_t highest() noexcept { return highest_in(catalog_collection_k); }
-
-    /** The catalog entry naming @p collection. */
-    static constexpr stored_key_t catalog_entry(ustore_collection_t collection) noexcept {
-        return {catalog_collection_k, static_cast<ustore_key_t>(collection)};
-    }
-
-    /** The catalog counter, which every created collection advances and so every concurrent creation conflicts on. */
-    static constexpr stored_key_t collection_counter() noexcept {
-        return {catalog_collection_k, collection_counter_key_k};
-    }
-
-    /** Whether this key belongs to the catalog, which writes through the C ABI may not touch. */
-    constexpr bool is_catalog_entry() const noexcept { return collection == catalog_collection_k; }
-
-    /** The collection a catalog entry names. */
-    constexpr ustore_collection_t cataloged() const noexcept { return static_cast<ustore_collection_t>(key); }
-};
-
-/** The identifier past the last one a collection may take, so no catalog entry reaches the counter. */
-inline constexpr ustore_collection_t collections_limit_k = static_cast<ustore_collection_t>(collection_counter_key_k);
-
-/** Orders keys by collection first, so every collection is one contiguous window of the store. */
-struct stored_key_order_t {
-    constexpr bool operator()(stored_key_t const& first, stored_key_t const& second) const noexcept {
-        if (first.collection != second.collection) return first.collection < second.collection;
-        return first.key < second.key;
+/** Orders keys and collection IDs by their bytes, as every engine does. */
+struct uuid_order_t {
+    template <typename uuid_type_>
+    constexpr bool operator()(uuid_type_ const& first, uuid_type_ const& second) const noexcept {
+        return first < second;
     }
 };
 
-/** Hashes a key as its two machine words, spreading every collection over all partitions for writer concurrency. */
-struct stored_key_hash_t {
-    constexpr std::size_t operator()(stored_key_t const& stored) const noexcept {
+/** Hashes a UUID as its two machine words, spreading the keys of a collection over every partition. */
+struct uuid_hash_t {
+    std::size_t operator()(ustore_uuid_t const& uuid) const noexcept {
         st::hash<std::uint64_t> const mixer;
-        std::uint64_t const collection_hash = mixer(stored.collection);
-        return mixer(static_cast<std::uint64_t>(stored.key) ^ (collection_hash * 0x9E3779B97F4A7C15ull));
+        std::uint64_t halves[2];
+        std::memcpy(halves, uuid.bytes, sizeof(halves));
+        return mixer(halves[0] ^ (halves[1] * 0x9E3779B97F4A7C15ull));
     }
+    std::size_t operator()(ustore_key_t const& key) const noexcept { return (*this)(key.uuid); }
+    std::size_t operator()(ustore_collection_id_t const& id) const noexcept { return (*this)(id.uuid); }
 };
 
-/** A value, or the bytes of a string key, owned so it outlives the call that wrote it. */
+/** A value, or the bytes of a string, owned so it outlives the call that wrote it. */
 using blob_t = st::basic_vector<ustore_byte_t>;
 
-/** A string inside a collection keyed by strings, owning its bytes. */
+/** A string of a strings collection, or the name of a collection, owning its bytes. */
 struct string_key_t {
-
-    /** Collection owning the string. */
-    ustore_collection_t collection {main_collection_k};
 
     /** Bytes of the string. */
     blob_t text;
-
-    /** The first key @p collection can hold, the empty string, which owns no bytes. */
-    static string_key_t lowest_in(ustore_collection_t collection) noexcept { return {collection, {}}; }
-
-    /** The first key after every key of @p collection, which a walk of it stops before. */
-    static string_key_t past(ustore_collection_t collection) noexcept { return lowest_in(collection + 1); }
 
     /** The bytes of the string. */
     std::string_view view() const noexcept { return {reinterpret_cast<char const*>(text.data()), text.size()}; }
@@ -130,24 +60,88 @@ struct string_key_t {
     st::expected<string_key_t> copy() const noexcept {
         st::expected<blob_t> copied = text.copy();
         if (!copied) return copied.status();
-        return string_key_t {collection, std::move(*copied)};
+        return string_key_t {std::move(*copied)};
     }
 };
 
-/** Orders string keys by collection, then by their bytes, so every collection is one contiguous window. */
+/** Orders strings by their bytes, unsigned. */
 struct string_key_order_t {
     bool operator()(string_key_t const& first, string_key_t const& second) const noexcept {
-        if (first.collection != second.collection) return first.collection < second.collection;
         return sz::string_view_t {first.view()} < sz::string_view_t {second.view()};
     }
 };
 
-/** Hashes a string key through StringZilla, seeded by its collection, spreading every collection over all
- *  partitions. */
+/** Hashes a string through StringZilla, spreading the strings of a collection over every partition. */
 struct string_key_hash_t {
     std::size_t operator()(string_key_t const& stored) const noexcept {
-        return sz::string_view_t {stored.view()}.hash(stored.collection);
+        return sz::string_view_t {stored.view()}.hash();
     }
+};
+
+/** Which entry of a vertex's run a half-edge is: the vertex itself, or an edge seen from one of its ends. */
+enum class half_edge_direction_t : std::uint8_t {
+
+    /** The vertex itself, with a nil neighbor and edge, present for as long as the vertex is. */
+    vertex_k = 0,
+
+    /** An edge leaving the vertex, filed under its target as the neighbor. */
+    outgoing_k = 1,
+
+    /** An edge entering the vertex, filed under its source as the neighbor. */
+    incoming_k = 2,
+
+    /** After every entry of the vertex, which a walk of the vertex stops before and nothing is filed under. */
+    past_k = 3,
+};
+
+/**
+ *  @brief One entry of a graph collection: a vertex, or an edge filed under one of its ends.
+ *
+ *  Every edge is filed twice, outgoing under its source and incoming under its target, so the entries of one
+ *  vertex are one contiguous run of the set: the vertex, its outgoing edges by target, then its incoming edges
+ *  by source. Adding an edge writes two entries instead of rewriting either vertex, so transactions adding
+ *  different edges to one vertex never conflict over it.
+ *
+ *  @code{.c}
+ *  struct half_edge {
+ *      uint8_t vertex[16];   // offset 0
+ *      uint8_t direction;    // offset 16: 0 for the vertex itself, 1 outgoing, 2 incoming
+ *      uint8_t neighbor[16]; // offset 17, nil for the vertex itself
+ *      uint8_t edge[16];     // offset 33, nil for the vertex itself
+ *  };                        // 49 bytes, ordered bytewise
+ *  @endcode
+ */
+struct half_edge_t {
+    ustore_key_t vertex {};
+    half_edge_direction_t direction {half_edge_direction_t::vertex_k};
+    ustore_key_t neighbor {};
+    ustore_key_t edge {};
+
+    /** The entry recording that @p vertex exists. */
+    static constexpr half_edge_t vertex_entry(ustore_key_t const& vertex) noexcept {
+        return {vertex, half_edge_direction_t::vertex_k, {}, {}};
+    }
+
+    /** The first entry of @p vertex in @p direction, where a walk of that direction starts. */
+    static constexpr half_edge_t first_of(ustore_key_t const& vertex, half_edge_direction_t direction) noexcept {
+        return {vertex, direction, {}, {}};
+    }
+
+    friend constexpr bool operator==(half_edge_t const&, half_edge_t const&) noexcept = default;
+};
+
+static_assert(sizeof(half_edge_t) == 49, "a half-edge packs its three UUIDs around the direction byte");
+
+/** Orders half-edges by their bytes, which groups every vertex's run and sorts it by direction, neighbor and edge. */
+struct half_edge_order_t {
+    bool operator()(half_edge_t const& first, half_edge_t const& second) const noexcept {
+        return std::memcmp(&first, &second, sizeof(half_edge_t)) < 0;
+    }
+};
+
+/** Hashes a half-edge by its vertex alone, so the run of one vertex stays in one partition. */
+struct half_edge_hash_t {
+    std::size_t operator()(half_edge_t const& entry) const noexcept { return uuid_hash_t {}(entry.vertex.uuid); }
 };
 
 } // namespace unum::ustore::ram

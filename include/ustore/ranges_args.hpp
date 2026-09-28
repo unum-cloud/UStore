@@ -13,7 +13,6 @@
 #include <algorithm>   // `std::min`
 #include <concepts>    // `std::same_as`
 #include <iterator>    // `std::data`, `std::size`
-#include <limits>      // `std::numeric_limits`
 #include <ranges>      // `std::ranges::contiguous_range`
 #include <string_view> // `std::string_view`
 #include <type_traits> // `std::conditional_t`, `std::remove_reference_t`
@@ -31,7 +30,7 @@ using fields_view_t = strided_range<ustore_str_view_t const>;
 
 /** One task of a batched read or write. */
 struct place_t {
-    ustore_collection_t collection;
+    ustore_collection_id_t collection;
     ustore_key_t const& key;
     ustore_str_view_t field;
 
@@ -42,7 +41,7 @@ struct place_t {
 /** The locations of a batched read or write, as the C ABI receives them. */
 struct places_arg_t {
     using value_type = place_t;
-    strided_iterator<ustore_collection_t const> collections_begin;
+    strided_iterator<ustore_collection_id_t const> collections_begin;
     strided_iterator<ustore_key_t const> keys_begin;
     strided_iterator<ustore_str_view_t const> fields_begin;
     ustore_size_t count {0};
@@ -50,7 +49,8 @@ struct places_arg_t {
     std::size_t size() const noexcept { return count; }
     place_t operator[](std::size_t index) const noexcept {
         auto const signed_index = static_cast<std::ptrdiff_t>(index);
-        ustore_collection_t collection = collections_begin ? collections_begin[signed_index] : ustore_collection_main_k;
+        ustore_collection_id_t collection = collections_begin ? collections_begin[signed_index]
+                                                              : ustore_collection_main_k;
         ustore_key_t const& key = keys_begin[signed_index];
         ustore_str_view_t field = fields_begin ? fields_begin[signed_index] : nullptr;
         return {collection, key, field};
@@ -58,7 +58,7 @@ struct places_arg_t {
 
     /** Whether every task addresses the same collection. */
     bool same_collection() const noexcept {
-        return strided_range<ustore_collection_t const>(collections_begin, count).same_elements();
+        return strided_range<ustore_collection_id_t const>(collections_begin, count).same_elements();
     }
 };
 
@@ -131,14 +131,14 @@ struct contents_arg_t {
 
 /** One task of a batched scan. */
 struct scan_t {
-    ustore_collection_t collection;
+    ustore_collection_id_t collection;
     ustore_key_t min_key;
     ustore_length_t limit;
 };
 
 /** The arguments of @c ustore_scan gathered into a structure of arrays for validation. */
 struct scans_arg_t {
-    strided_iterator<ustore_collection_t const> collections;
+    strided_iterator<ustore_collection_id_t const> collections;
     strided_iterator<ustore_key_t const> start_keys;
     strided_iterator<ustore_length_t const> limits;
     ustore_size_t count = 0;
@@ -146,47 +146,47 @@ struct scans_arg_t {
     std::size_t size() const noexcept { return count; }
     scan_t operator[](std::size_t index) const noexcept {
         auto const signed_index = static_cast<std::ptrdiff_t>(index);
-        ustore_collection_t collection = collections ? collections[signed_index] : ustore_collection_main_k;
-        ustore_key_t min_key = start_keys ? start_keys[signed_index] : std::numeric_limits<ustore_key_t>::min();
+        ustore_collection_id_t collection = collections ? collections[signed_index] : ustore_collection_main_k;
+        ustore_key_t min_key = start_keys ? start_keys[signed_index] : smallest_key_k;
         ustore_length_t limit = limits[signed_index];
         return {collection, min_key, limit};
     }
 
     /** Whether every task scans the same collection. */
     bool same_collection() const noexcept {
-        return strided_range<ustore_collection_t const>(collections, count).same_elements();
+        return strided_range<ustore_collection_id_t const>(collections, count).same_elements();
     }
 };
 
 /** One task of a batched sample. */
 struct sample_arg_t {
-    ustore_collection_t collection;
+    ustore_collection_id_t collection;
     ustore_length_t limit;
 };
 
 /** The arguments of @c ustore_sample gathered into a structure of arrays for validation. */
 struct sample_args_t {
-    strided_iterator<ustore_collection_t const> collections;
+    strided_iterator<ustore_collection_id_t const> collections;
     strided_iterator<ustore_length_t const> limits;
     ustore_size_t count = 0;
 
     std::size_t size() const noexcept { return count; }
     sample_arg_t operator[](std::size_t index) const noexcept {
         auto const signed_index = static_cast<std::ptrdiff_t>(index);
-        ustore_collection_t collection = collections ? collections[signed_index] : ustore_collection_main_k;
+        ustore_collection_id_t collection = collections ? collections[signed_index] : ustore_collection_main_k;
         ustore_length_t limit = limits[signed_index];
         return {collection, limit};
     }
 
     /** Whether every task samples the same collection. */
     bool same_collection() const noexcept {
-        return strided_range<ustore_collection_t const>(collections, count).same_elements();
+        return strided_range<ustore_collection_id_t const>(collections, count).same_elements();
     }
 };
 
 /** One task of a batched edge lookup. */
 struct find_edge_t {
-    ustore_collection_t collection;
+    ustore_collection_id_t collection;
     ustore_key_t const& vertex_id;
     ustore_vertex_role_t role;
 };
@@ -194,7 +194,7 @@ struct find_edge_t {
 /** The vertices of a batched edge lookup, as the C ABI receives them. */
 struct find_edges_t {
     using value_type = find_edge_t;
-    strided_iterator<ustore_collection_t const> collections_begin;
+    strided_iterator<ustore_collection_id_t const> collections_begin;
     strided_iterator<ustore_key_t const> vertex_id_begin;
     strided_iterator<ustore_vertex_role_t const> roles_begin;
     ustore_size_t count = 0;
@@ -202,7 +202,8 @@ struct find_edges_t {
     std::size_t size() const noexcept { return count; }
     find_edge_t operator[](std::size_t index) const noexcept {
         auto const signed_index = static_cast<std::ptrdiff_t>(index);
-        ustore_collection_t collection = collections_begin ? collections_begin[signed_index] : ustore_collection_main_k;
+        ustore_collection_id_t collection = collections_begin ? collections_begin[signed_index]
+                                                              : ustore_collection_main_k;
         ustore_key_t const& vertex_id = vertex_id_begin[signed_index];
         ustore_vertex_role_t role = roles_begin ? roles_begin[signed_index] : ustore_vertex_role_any_k;
         return {collection, vertex_id, role};
@@ -210,7 +211,7 @@ struct find_edges_t {
 
     /** Whether every task looks inside the same collection. */
     bool same_collection() const noexcept {
-        return strided_range<ustore_collection_t const>(collections_begin, count).same_elements();
+        return strided_range<ustore_collection_id_t const>(collections_begin, count).same_elements();
     }
 };
 
@@ -330,7 +331,7 @@ struct locations_in_collection {
     location_store<locations_> without;
 
     /** Collection every location lives in. */
-    ustore_collection_t collection;
+    ustore_collection_id_t collection;
 };
 
 /** Resolves a location or a batch of locations into the strided keys, collections and fields of the C ABI. */
@@ -351,7 +352,7 @@ struct places_arg_extractor {
         else return elements(locations).members(&element_t::key);
     }
 
-    strided_iterator<ustore_collection_t const> collections(location_t const& locations) noexcept {
+    strided_iterator<ustore_collection_id_t const> collections(location_t const& locations) noexcept {
         if constexpr (has_collection_concept<element_t>) return elements(locations).members(&element_t::collection);
         else return {};
     }
@@ -378,7 +379,7 @@ struct places_arg_extractor<places_arg_t> {
 
     ustore_size_t count(places_arg_t const& places) noexcept { return places.count; }
     strided_iterator<ustore_key_t const> keys(places_arg_t const& places) noexcept { return places.keys_begin; }
-    strided_iterator<ustore_collection_t const> collections(places_arg_t const& places) noexcept {
+    strided_iterator<ustore_collection_id_t const> collections(places_arg_t const& places) noexcept {
         return places.collections_begin;
     }
     strided_iterator<ustore_str_view_t const> fields(places_arg_t const& places) noexcept {
@@ -398,7 +399,7 @@ struct places_arg_extractor<locations_in_collection<locations_>> {
     strided_iterator<ustore_key_t const> keys(location_t const& locations) noexcept {
         return base_t {}.keys(locations.without.ref());
     }
-    strided_iterator<ustore_collection_t const> collections(location_t const& locations) noexcept {
+    strided_iterator<ustore_collection_id_t const> collections(location_t const& locations) noexcept {
         return {&locations.collection};
     }
     strided_iterator<ustore_str_view_t const> fields(location_t const& locations) noexcept {
@@ -504,7 +505,7 @@ struct contents_arg_extractor<views_> {
 #pragma region Validation
 
 /** Whether the tasks address a named collection rather than the main one. */
-inline bool same_collections_are_named(strided_iterator<ustore_collection_t const> collections_begin) noexcept {
+inline bool same_collections_are_named(strided_iterator<ustore_collection_id_t const> collections_begin) noexcept {
     return collections_begin && collections_begin[0] != ustore_collection_main_k;
 }
 
@@ -576,11 +577,11 @@ inline void validate_scan([[maybe_unused]] ustore_transaction_t const transactio
     if (!scans.limits) *error = {ustore_error_unsupported_k, "Full scans are not supported, paginate with limits"};
 }
 
-inline void validate_transaction_begin(ustore_transaction_t const transaction, ustore_options_t const options,
+inline void validate_transaction_begin(ustore_transaction_t const* transaction, ustore_options_t const options,
                                        ustore_error_t* error) noexcept {
 
     if (!transaction) {
-        *error = {ustore_error_uninitialized_k, "Transaction is uninitialized"};
+        *error = {ustore_error_invalid_argument_k, "Need an output for the transaction"};
         return;
     }
     if (!enum_is_subset(options, ustore_option_transaction_dont_watch_k))

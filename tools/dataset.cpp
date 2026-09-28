@@ -80,11 +80,19 @@ class output_file_t {
         if (buffer_.size() >= threshold_) flush(error);
     }
 
-    /** Buffers @p value as decimal digits. */
-    void append_integer(ustore_key_t value, ustore_error_t* error) noexcept {
-        char digits[24];
-        std::to_chars_result const printed = std::to_chars(digits, digits + sizeof(digits), value);
-        append({digits, static_cast<std::size_t>(printed.ptr - digits)}, error);
+    /** Buffers @p key as the decimal digits of the integer it spells, or as quoted UUID text when it spells none. */
+    void append_key(ustore_key_t key, ustore_error_t* error) noexcept {
+        if (auto [integer, integer_status] = uuid_to_integer(key.uuid); integer_status.succeeded()) {
+            char digits[24];
+            std::to_chars_result const printed = std::to_chars(digits, digits + sizeof(digits), integer);
+            append({digits, static_cast<std::size_t>(printed.ptr - digits)}, error);
+            return;
+        }
+        char quoted[uuid_text_length_k + 2];
+        quoted[0] = '"';
+        uuid_to_text(key.uuid, std::span(quoted).subspan<1, uuid_text_length_k>());
+        quoted[uuid_text_length_k + 1] = '"';
+        append({quoted, sizeof(quoted)}, error);
     }
 
     /** Writes the whole buffer out and empties it, reporting a short or failed write into @p error. */
@@ -178,12 +186,17 @@ struct field_list_t {
     return field[0] == '/' ? yyjson_ptr_get(object, field) : yyjson_obj_get(object, field);
 }
 
-/** Reads the integer @p field of @p object into @p key, answering whether the field held an integer. */
+/** Reads the key @p field of @p object holds, a non-negative integer or UUID text, answering whether it held one. */
 [[nodiscard]] bool read_key(yyjson_val* object, ustore_str_view_t field, ustore_key_t& key) noexcept {
     yyjson_val* const value = lookup(object, field);
-    if (!yyjson_is_int(value)) return false;
-    key = static_cast<ustore_key_t>(yyjson_get_sint(value));
-    return true;
+    if (yyjson_is_uint(value)) {
+        key = key_from_integer(yyjson_get_uint(value));
+        return true;
+    }
+    if (!yyjson_is_str(value)) return false;
+    auto [uuid, uuid_status] = uuid_from_text({yyjson_get_str(value), yyjson_get_len(value)});
+    key.uuid = uuid;
+    return uuid_status.succeeded();
 }
 
 /** Finds or adds the object member @p key of @p parent, answering null when a non-object already holds the key. */
@@ -368,11 +381,11 @@ void read_header(csv_reader_t& reader, field_list_t fields, sz::string_t& names,
     return yyjson_mut_strncpy(builder, field.data(), field.size());
 }
 
-/** Parses an integer CSV field into @p key, answering whether the whole field was an integer. */
+/** Parses a CSV field holding a non-negative integer or UUID text into @p key, answering whether it held one. */
 [[nodiscard]] bool csv_key(std::string_view field, ustore_key_t& key) noexcept {
-    char const* const end = field.data() + field.size();
-    std::from_chars_result const parsed = std::from_chars(field.data(), end, key);
-    return !field.empty() && parsed.ec == std::errc {} && parsed.ptr == end;
+    auto [uuid, uuid_status] = uuid_from_text(field);
+    key.uuid = uuid;
+    return uuid_status.succeeded();
 }
 
 /** Answers the index of the column named @p field, ignoring a leading slash, or the column count when absent. */
@@ -588,7 +601,7 @@ void import_csv_documents(ustore_docs_import_t const& task, sz::string_view_t te
 template <typename task_type_, typename consumer_type_>
 void scan_keys(task_type_ const& task, ustore_length_t batch_size, consumer_type_&& consume) noexcept {
     task_arena_t const scan_arena {nullptr};
-    ustore_key_t start = std::numeric_limits<ustore_key_t>::min();
+    ustore_key_t start = smallest_key_k;
     while (true) {
         ustore_length_t* counts = nullptr;
         ustore_key_t* keys = nullptr;
@@ -609,8 +622,8 @@ void scan_keys(task_type_ const& task, ustore_length_t batch_size, consumer_type
         ustore_length_t const count = counts[0];
         ustore_key_t const last = keys[count - 1];
         consume(std::span<ustore_key_t const>(keys, count));
-        if (task.error->status || count < batch_size || last == std::numeric_limits<ustore_key_t>::max()) return;
-        start = last + 1;
+        if (task.error->status || count < batch_size || last == largest_key_k) return;
+        start = key_after(last);
     }
 }
 
@@ -676,12 +689,12 @@ void import_ndjson_edges(ustore_graph_import_t const& task, sz::string_view_t te
 
         json_document_t const document {yyjson_read(row.data(), row.size(), 0)};
         yyjson_val* const root = yyjson_doc_get_root(document.handle);
-        edge_row_t edge {0, 0, ustore_default_edge_id_k};
+        edge_row_t edge {{}, {}, ustore_default_edge_id_k};
         if (!yyjson_is_obj(root) || !read_key(root, task.source_id_field, edge.source) ||
             !read_key(root, task.target_id_field, edge.target) ||
             (task.edge_id_field && !read_key(root, task.edge_id_field, edge.edge))) {
             *task.error = {ustore_error_malformed_k,
-                           "The input file holds a line without integer vertex or edge fields"};
+                           "The input file holds a line without integer or UUID vertex or edge fields"};
             return;
         }
         stage_edge(task, arena, edges, edge);
@@ -709,7 +722,7 @@ void import_csv_edges(ustore_graph_import_t const& task, sz::string_view_t text,
 
     st::basic_vector<edge_row_t> edges;
     while (reader.has_record()) {
-        edge_row_t edge {0, 0, ustore_default_edge_id_k};
+        edge_row_t edge {{}, {}, ustore_default_edge_id_k};
         std::size_t parsed = 0;
         csv_boundary_t boundary = csv_boundary_t::next_field_k;
         for (std::size_t index = 0; boundary == csv_boundary_t::next_field_k; ++index) {
@@ -852,13 +865,13 @@ void ustore_docs_export(ustore_docs_export_t* task_pointer) {
             }
             if (format == dataset_format_t::ndjson_k) {
                 output.append("{\"_id\":", task.error);
-                output.append_integer(keys[index], task.error);
+                output.append_key(keys[index], task.error);
                 output.append(",\"doc\":", task.error);
                 output.append(document, task.error);
                 output.append("}\n", task.error);
             }
             else {
-                output.append_integer(keys[index], task.error);
+                output.append_key(keys[index], task.error);
                 output.append(",", task.error);
                 append_quoted(output, document, task.error);
                 output.append("\n", task.error);
@@ -981,26 +994,26 @@ void ustore_graph_export(ustore_graph_export_t* task_pointer) {
                 output.append("{\"", task.error);
                 output.append(task.source_id_field, task.error);
                 output.append("\":", task.error);
-                output.append_integer(ids[0], task.error);
+                output.append_key(ids[0], task.error);
                 output.append(",\"", task.error);
                 output.append(task.target_id_field, task.error);
                 output.append("\":", task.error);
-                output.append_integer(ids[1], task.error);
+                output.append_key(ids[1], task.error);
                 if (task.edge_id_field) {
                     output.append(",\"", task.error);
                     output.append(task.edge_id_field, task.error);
                     output.append("\":", task.error);
-                    output.append_integer(ids[2], task.error);
+                    output.append_key(ids[2], task.error);
                 }
                 output.append("}\n", task.error);
             }
             else {
-                output.append_integer(ids[0], task.error);
+                output.append_key(ids[0], task.error);
                 output.append(",", task.error);
-                output.append_integer(ids[1], task.error);
+                output.append_key(ids[1], task.error);
                 if (task.edge_id_field) {
                     output.append(",", task.error);
-                    output.append_integer(ids[2], task.error);
+                    output.append_key(ids[2], task.error);
                 }
                 output.append("\n", task.error);
             }

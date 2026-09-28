@@ -10,7 +10,6 @@
 #include <cstddef> // `std::size_t`, `std::ptrdiff_t`
 
 #include <iterator> // `std::forward_iterator_tag`
-#include <limits>   // `std::numeric_limits`
 #include <span>     // `std::span`
 #include <utility>  // `std::pair`, `std::move`
 
@@ -26,13 +25,13 @@ namespace unum::ustore {
 class keys_stream_t {
 
     ustore_database_t database_ {nullptr};
-    ustore_collection_t collection_ {ustore_collection_main_k};
+    ustore_collection_id_t collection_ {ustore_collection_main_k};
     ustore_transaction_t transaction_ {nullptr};
 
     arena_t arena_ {nullptr};
     ustore_length_t read_ahead_ {0};
 
-    ustore_key_t next_min_key_ {std::numeric_limits<ustore_key_t>::min()};
+    ustore_key_t next_min_key_ {smallest_key_k};
     std::span<ustore_key_t> fetched_keys_ {};
     std::size_t fetched_offset_ {0};
 
@@ -67,7 +66,8 @@ class keys_stream_t {
 
         auto const count = static_cast<ustore_length_t>(fetched_keys_.size());
         ustore_key_t const last_key = count ? fetched_keys_[count - 1] : ustore_key_unknown_k;
-        next_min_key_ = count < read_ahead_ || last_key == ustore_key_unknown_k ? ustore_key_unknown_k : last_key + 1;
+        next_min_key_ = count < read_ahead_ || last_key == ustore_key_unknown_k ? ustore_key_unknown_k
+                                                                                : key_after(last_key);
         return {};
     }
 
@@ -78,7 +78,7 @@ class keys_stream_t {
 
     static constexpr std::size_t default_read_ahead_k = 256;
 
-    keys_stream_t(ustore_database_t database, ustore_collection_t collection = ustore_collection_main_k,
+    keys_stream_t(ustore_database_t database, ustore_collection_id_t collection = ustore_collection_main_k,
                   std::size_t read_ahead = keys_stream_t::default_read_ahead_k,
                   ustore_transaction_t transaction = nullptr) noexcept
         : database_(database), collection_(collection), transaction_(transaction), arena_(database),
@@ -113,7 +113,7 @@ class keys_stream_t {
 
     ustore_key_t key() const noexcept { return fetched_keys_[fetched_offset_]; }
     ustore_key_t operator*() const noexcept { return key(); }
-    status_t seek_to_first() noexcept { return seek(std::numeric_limits<ustore_key_t>::min()); }
+    status_t seek_to_first() noexcept { return seek(smallest_key_k); }
     status_t seek_to_next_batch() noexcept { return seek(next_min_key_); }
 
     /** Exposes the whole fetched page, passed keys included, for use with @c seek_to_next_batch. */
@@ -137,13 +137,13 @@ class keys_stream_t {
 class pairs_stream_t {
 
     ustore_database_t database_ {nullptr};
-    ustore_collection_t collection_ {ustore_collection_main_k};
+    ustore_collection_id_t collection_ {ustore_collection_main_k};
     ustore_transaction_t transaction_ {nullptr};
 
     arena_t arena_ {nullptr};
     ustore_length_t read_ahead_ {0};
 
-    ustore_key_t next_min_key_ {std::numeric_limits<ustore_key_t>::min()};
+    ustore_key_t next_min_key_ {smallest_key_k};
     std::span<ustore_key_t> fetched_keys_ {};
     joined_blobs_t values_view_ {};
     joined_blobs_iterator_t values_iterator_ {};
@@ -199,7 +199,8 @@ class pairs_stream_t {
         values_view_ = joined_blobs_t {count, found_offsets, found_values};
         values_iterator_ = values_view_.begin();
         ustore_key_t const last_key = count ? fetched_keys_[count - 1] : ustore_key_unknown_k;
-        next_min_key_ = count < read_ahead_ || last_key == ustore_key_unknown_k ? ustore_key_unknown_k : last_key + 1;
+        next_min_key_ = count < read_ahead_ || last_key == ustore_key_unknown_k ? ustore_key_unknown_k
+                                                                                : key_after(last_key);
         return {};
     }
 
@@ -210,7 +211,7 @@ class pairs_stream_t {
 
     static constexpr std::size_t default_read_ahead_k = 256;
 
-    pairs_stream_t(ustore_database_t database, ustore_collection_t collection = ustore_collection_main_k,
+    pairs_stream_t(ustore_database_t database, ustore_collection_id_t collection = ustore_collection_main_k,
                    std::size_t read_ahead = pairs_stream_t::default_read_ahead_k,
                    ustore_transaction_t transaction = nullptr) noexcept
         : database_(database), collection_(collection), transaction_(transaction), arena_(database),
@@ -250,7 +251,7 @@ class pairs_stream_t {
     value_type item() const noexcept { return {fetched_keys_[fetched_offset_], *values_iterator_}; }
     value_type operator*() const noexcept { return item(); }
 
-    status_t seek_to_first() noexcept { return seek(std::numeric_limits<ustore_key_t>::min()); }
+    status_t seek_to_first() noexcept { return seek(smallest_key_k); }
     status_t seek_to_next_batch() noexcept { return seek(next_min_key_); }
 
     /** Exposes the whole fetched page, passed keys included, for use with @c seek_to_next_batch. */
@@ -289,7 +290,7 @@ class blobs_range_t {
     ustore_database_t database_;
     ustore_transaction_t transaction_;
     ustore_snapshot_t snapshot_;
-    ustore_collection_t collection_;
+    ustore_collection_id_t collection_;
     ustore_key_t min_key_;
     ustore_key_t max_key_;
 
@@ -302,23 +303,22 @@ class blobs_range_t {
 
   public:
     blobs_range_t(ustore_database_t database, ustore_transaction_t transaction = nullptr,
-                  ustore_snapshot_t snapshot = 0, ustore_collection_t collection = ustore_collection_main_k,
-                  ustore_key_t min_key = std::numeric_limits<ustore_key_t>::min(),
-                  ustore_key_t max_key = std::numeric_limits<ustore_key_t>::max()) noexcept
+                  ustore_snapshot_t snapshot = 0, ustore_collection_id_t collection = ustore_collection_main_k,
+                  ustore_key_t min_key = smallest_key_k, ustore_key_t max_key = largest_key_k) noexcept
         : database_(database), transaction_(transaction), snapshot_(snapshot), collection_(collection),
           min_key_(min_key), max_key_(max_key) {}
 
     ustore_database_t db() const noexcept { return database_; }
     ustore_transaction_t txn() const noexcept { return transaction_; }
     ustore_snapshot_t snap() const noexcept { return snapshot_; }
-    ustore_collection_t collection() const noexcept { return collection_; }
+    ustore_collection_id_t collection() const noexcept { return collection_; }
 
     expected<keys_stream_t> keys_begin(std::size_t read_ahead = keys_stream_t::default_read_ahead_k) noexcept {
         return make_stream<keys_stream_t>(min_key_, read_ahead);
     }
 
     expected<keys_stream_t> keys_end() noexcept {
-        return make_stream<keys_stream_t>(max_key_, max_key_ == std::numeric_limits<ustore_key_t>::max() ? 0u : 1u);
+        return make_stream<keys_stream_t>(max_key_, max_key_ == largest_key_k ? 0u : 1u);
     }
 
     expected<pairs_stream_t> pairs_begin(std::size_t read_ahead = pairs_stream_t::default_read_ahead_k) noexcept {
@@ -326,7 +326,7 @@ class blobs_range_t {
     }
 
     expected<pairs_stream_t> pairs_end() noexcept {
-        return make_stream<pairs_stream_t>(max_key_, max_key_ == std::numeric_limits<ustore_key_t>::max() ? 0u : 1u);
+        return make_stream<pairs_stream_t>(max_key_, max_key_ == largest_key_k ? 0u : 1u);
     }
 
     expected<size_estimates_t> size_estimates() noexcept {
@@ -400,7 +400,7 @@ struct keys_range_t {
         ustore_key_t* found_keys = nullptr;
         ustore_error_t error {};
         auto const count_limit = static_cast<ustore_length_t>(count);
-        ustore_collection_t const collection = members.collection();
+        ustore_collection_id_t const collection = members.collection();
 
         ustore_sample_t sample {};
         sample.db = members.db();

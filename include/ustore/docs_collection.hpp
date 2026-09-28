@@ -9,9 +9,8 @@
 
 #include <cstddef> // `std::size_t`
 
-#include <concepts>         // `std::integral`
+#include <concepts>         // `std::same_as`
 #include <initializer_list> // `std::initializer_list`
-#include <limits>           // `std::numeric_limits`
 #include <type_traits>      // `std::remove_cvref_t`
 #include <utility>          // `std::exchange`, `std::forward`, `std::swap`
 
@@ -36,7 +35,7 @@ namespace unum::ustore {
  */
 class docs_collection_t {
     ustore_database_t db_ {nullptr};
-    ustore_collection_t collection_ {ustore_collection_main_k};
+    ustore_collection_id_t collection_ {ustore_collection_main_k};
     ustore_transaction_t transaction_ {nullptr};
     ustore_snapshot_t snapshot_ {};
     any_arena_t arena_ {nullptr};
@@ -47,7 +46,7 @@ class docs_collection_t {
         ustore_collection_drop_t collection_drop {};
         collection_drop.db = db_;
         collection_drop.error = &error;
-        collection_drop.id = collection_;
+        collection_drop.collection = collection_;
         collection_drop.mode = mode;
         ustore_collection_drop(&collection_drop);
         return status_t {error};
@@ -56,7 +55,7 @@ class docs_collection_t {
   public:
     docs_collection_t() noexcept = default;
 
-    docs_collection_t(ustore_database_t db, ustore_collection_t collection = ustore_collection_main_k,
+    docs_collection_t(ustore_database_t db, ustore_collection_id_t collection = ustore_collection_main_k,
                       ustore_transaction_t transaction = nullptr, ustore_snapshot_t snapshot = {},
                       ustore_arena_t* arena = nullptr, ustore_doc_field_type_t type = ustore_doc_field_json_k) noexcept
         : db_(db), collection_(collection), transaction_(transaction), snapshot_(snapshot), arena_(db_, arena),
@@ -91,22 +90,20 @@ class docs_collection_t {
         return *this;
     }
 
-    operator ustore_collection_t() const noexcept { return collection_; }
-    ustore_collection_t* member_ptr() noexcept { return &collection_; }
+    operator ustore_collection_id_t() const noexcept { return collection_; }
+    ustore_collection_id_t* member_ptr() noexcept { return &collection_; }
     ustore_arena_t* member_arena() noexcept { return arena_.member_ptr(); }
     ustore_database_t db() const noexcept { return db_; }
     ustore_transaction_t transaction() const noexcept { return transaction_; }
     ustore_snapshot_t snapshot() const noexcept { return snapshot_; }
 
     blobs_range_t members( //
-        ustore_key_t min_key = std::numeric_limits<ustore_key_t>::min(),
-        ustore_key_t max_key = std::numeric_limits<ustore_key_t>::max()) const noexcept {
+        ustore_key_t min_key = smallest_key_k, ustore_key_t max_key = largest_key_k) const noexcept {
         return {db_, transaction_, snapshot_, collection_, min_key, max_key};
     }
 
     keys_range_t keys( //
-        ustore_key_t min_key = std::numeric_limits<ustore_key_t>::min(),
-        ustore_key_t max_key = std::numeric_limits<ustore_key_t>::max()) const noexcept {
+        ustore_key_t min_key = smallest_key_k, ustore_key_t max_key = largest_key_k) const noexcept {
         return {members(min_key, max_key)};
     }
 
@@ -162,7 +159,7 @@ class docs_collection_t {
             using plain_t = std::remove_cvref_t<keys_argument_>;
             collection_key_field_t location;
             location.collection = collection_;
-            if constexpr (std::integral<plain_t>) location.key = keys;
+            if constexpr (std::same_as<plain_t, ustore_key_t>) location.key = keys;
             else location.key = keys.key;
 
             if constexpr (has_field_concept<plain_t>) location.field = keys.field;

@@ -16,20 +16,40 @@ use std::ptr;
 pub(crate) mod ffi {
     #![allow(non_camel_case_types)]
 
-    use std::ffi::{c_char, c_int, c_void};
+    use std::ffi::{c_char, c_int};
 
-    pub type ustore_database_t = *mut c_void;
-    pub type ustore_transaction_t = *mut c_void;
-    pub type ustore_arena_t = *mut c_void;
-    pub type ustore_snapshot_t = u64;
-    pub type ustore_collection_t = u64;
-    pub type ustore_key_t = i64;
+    /// The opaque structs the C ABI hands out pointers to, which Rust never reads through.
+    #[repr(C)]
+    pub struct ustore_database_handle_t {
+        _private: [u8; 0],
+    }
+    #[repr(C)]
+    pub struct ustore_transaction_handle_t {
+        _private: [u8; 0],
+    }
+    #[repr(C)]
+    pub struct ustore_snapshot_handle_t {
+        _private: [u8; 0],
+    }
+    #[repr(C)]
+    pub struct ustore_arena_handle_t {
+        _private: [u8; 0],
+    }
+
+    pub type ustore_database_t = *mut ustore_database_handle_t;
+    pub type ustore_transaction_t = *mut ustore_transaction_handle_t;
+    pub type ustore_snapshot_t = *mut ustore_snapshot_handle_t;
+    pub type ustore_arena_t = *mut ustore_arena_handle_t;
+
+    // The public identifiers are `#[repr(C)]` twins of the structs the header declares, so the ABI names them directly
+    pub type ustore_collection_id_t = super::CollectionID;
+    pub type ustore_key_t = super::Key;
     pub type ustore_byte_t = u8;
     pub type ustore_char_t = c_char;
-    pub type ustore_length_t = u32;
+    pub type ustore_length_t = u64;
     pub type ustore_size_t = u64;
     pub type ustore_octet_t = u8;
-    pub type ustore_sequence_number_t = u64;
+    pub type ustore_stamp_t = u64;
     pub type ustore_str_view_t = *const c_char;
     pub type ustore_bytes_cptr_t = *const u8;
 
@@ -48,6 +68,11 @@ pub(crate) mod ffi {
     pub const USTORE_TRANSPORT_LINUX_SPDK_K: ustore_enum_t = 4;
 
     pub const USTORE_MODALITY_ANY_K: ustore_enum_t = 0;
+    pub const USTORE_MODALITY_BLOBS_K: ustore_enum_t = 1;
+    pub const USTORE_MODALITY_DOCS_K: ustore_enum_t = 2;
+    pub const USTORE_MODALITY_GRAPH_K: ustore_enum_t = 3;
+    pub const USTORE_MODALITY_STRINGS_K: ustore_enum_t = 4;
+    pub const USTORE_MODALITY_PAGES_K: ustore_enum_t = 5;
 
     pub const USTORE_OPTIONS_DEFAULT_K: ustore_enum_t = 0;
     pub const USTORE_OPTION_WRITE_FLUSH_K: ustore_enum_t = 1 << 1;
@@ -152,35 +177,18 @@ pub(crate) mod ffi {
     }
 
     #[repr(C)]
-    pub struct ustore_snapshot_list_t {
+    pub struct ustore_snapshot_init_t {
         pub db: ustore_database_t,
         pub error: *mut ustore_error_t,
-        pub arena: *mut ustore_arena_t,
-        pub options: ustore_enum_t,
-        pub count: *mut ustore_size_t,
-        pub ids: *mut *mut ustore_snapshot_t,
-    }
-
-    #[repr(C)]
-    pub struct ustore_snapshot_create_t {
-        pub db: ustore_database_t,
-        pub error: *mut ustore_error_t,
-        pub id: *mut ustore_snapshot_t,
+        pub snapshot: *mut ustore_snapshot_t,
     }
 
     #[repr(C)]
     pub struct ustore_snapshot_export_t {
         pub db: ustore_database_t,
         pub error: *mut ustore_error_t,
-        pub id: ustore_snapshot_t,
+        pub snapshot: ustore_snapshot_t,
         pub path: ustore_str_view_t,
-    }
-
-    #[repr(C)]
-    pub struct ustore_snapshot_drop_t {
-        pub db: ustore_database_t,
-        pub error: *mut ustore_error_t,
-        pub id: ustore_snapshot_t,
     }
 
     #[repr(C)]
@@ -192,7 +200,7 @@ pub(crate) mod ffi {
         pub arena: *mut ustore_arena_t,
         pub options: ustore_enum_t,
         pub count: *mut ustore_size_t,
-        pub ids: *mut *mut ustore_collection_t,
+        pub collections: *mut *mut ustore_collection_id_t,
         pub modalities: *mut *mut ustore_enum_t,
         pub names_offsets: *mut *mut ustore_length_t,
         pub names: *mut *mut ustore_char_t,
@@ -205,7 +213,7 @@ pub(crate) mod ffi {
         pub name: ustore_str_view_t,
         pub name_length: ustore_length_t,
         pub modality: ustore_enum_t,
-        pub id: *mut ustore_collection_t,
+        pub collection: *mut ustore_collection_id_t,
     }
 
     #[repr(C)]
@@ -221,7 +229,7 @@ pub(crate) mod ffi {
         pub names_lengths: *const ustore_length_t,
         pub names_lengths_stride: ustore_size_t,
         pub presences: *mut *mut ustore_octet_t,
-        pub ids: *mut *mut ustore_collection_t,
+        pub collections: *mut *mut ustore_collection_id_t,
         pub modalities: *mut *mut ustore_enum_t,
     }
 
@@ -229,7 +237,7 @@ pub(crate) mod ffi {
     pub struct ustore_collection_drop_t {
         pub db: ustore_database_t,
         pub error: *mut ustore_error_t,
-        pub id: ustore_collection_t,
+        pub collection: ustore_collection_id_t,
         pub mode: ustore_enum_t,
     }
 
@@ -247,7 +255,7 @@ pub(crate) mod ffi {
         pub error: *mut ustore_error_t,
         pub transaction: ustore_transaction_t,
         pub options: ustore_enum_t,
-        pub sequence_number: *mut ustore_sequence_number_t,
+        pub stamp: *mut ustore_stamp_t,
     }
 
     #[repr(C)]
@@ -256,11 +264,11 @@ pub(crate) mod ffi {
         pub error: *mut ustore_error_t,
         pub transaction: ustore_transaction_t,
         pub options: ustore_enum_t,
-        pub sequence_number: *mut ustore_sequence_number_t,
+        pub stamp: *mut ustore_stamp_t,
     }
 
     extern "C" {
-        pub static ustore_collection_main_k: ustore_collection_t;
+        pub static ustore_collection_main_k: ustore_collection_id_t;
         pub static ustore_length_missing_k: ustore_length_t;
         pub static ustore_key_unknown_k: ustore_key_t;
 
@@ -272,10 +280,8 @@ pub(crate) mod ffi {
         pub fn ustore_database_capabilities(arguments: *mut ustore_database_capabilities_t);
         pub fn ustore_database_control(arguments: *mut ustore_database_control_t);
 
-        pub fn ustore_snapshot_list(arguments: *mut ustore_snapshot_list_t);
-        pub fn ustore_snapshot_create(arguments: *mut ustore_snapshot_create_t);
+        pub fn ustore_snapshot_init(arguments: *mut ustore_snapshot_init_t);
         pub fn ustore_snapshot_export(arguments: *mut ustore_snapshot_export_t);
-        pub fn ustore_snapshot_drop(arguments: *mut ustore_snapshot_drop_t);
 
         pub fn ustore_collection_list(arguments: *mut ustore_collection_list_t);
         pub fn ustore_collection_create(arguments: *mut ustore_collection_create_t);
@@ -288,6 +294,7 @@ pub(crate) mod ffi {
 
         pub fn ustore_arena_free(arena: ustore_arena_t);
         pub fn ustore_transaction_free(transaction: ustore_transaction_t);
+        pub fn ustore_snapshot_free(snapshot: ustore_snapshot_t);
         pub fn ustore_database_free(database: ustore_database_t);
     }
 }
@@ -413,45 +420,173 @@ unsafe fn static_string(raw: *const c_char) -> &'static str {
 
 // region: Handles and Constants
 
+/// Sixteen bytes naming one thing everywhere, ordered and hashed as their bytes, and printed in the canonical
+/// thirty-six character form.
+///
+/// An integer spells as its 128-bit big-endian bytes, as Python's `uuid.UUID(int=...)` does, so identifiers made from
+/// integers order as the integers.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct UUID(pub [u8; 16]);
+
+impl From<[u8; 16]> for UUID {
+    fn from(bytes: [u8; 16]) -> Self {
+        UUID(bytes)
+    }
+}
+
+impl From<u128> for UUID {
+    fn from(integer: u128) -> Self {
+        UUID(integer.to_be_bytes())
+    }
+}
+
+impl From<u64> for UUID {
+    fn from(integer: u64) -> Self {
+        UUID::from(u128::from(integer))
+    }
+}
+
+impl fmt::Display for UUID {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, byte) in self.0.iter().enumerate() {
+            if matches!(index, 4 | 6 | 8 | 10) {
+                formatter.write_str("-")?;
+            }
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for UUID {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
 /// The identifier of a value within one collection.
-pub type Key = ffi::ustore_key_t;
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct Key(pub UUID);
 
-/// The order in which transactions applied, as a commit or a stage reports it.
-pub type SequenceNumber = ffi::ustore_sequence_number_t;
+impl Key {
+    /// The key right after this one in their order, where a scan resuming past it starts; the last key wraps to the
+    /// first.
+    pub fn next(self) -> Key {
+        Key(UUID::from(u128::from_be_bytes(self.0 .0).wrapping_add(1)))
+    }
+}
 
-/// An identifier of a collection, unique within its database but not stable across restarts.
-#[repr(transparent)]
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct Collection(pub ffi::ustore_collection_t);
+impl From<UUID> for Key {
+    fn from(uuid: UUID) -> Self {
+        Key(uuid)
+    }
+}
 
-impl Collection {
-    /// The collection every database holds, which may be cleared but never dropped.
+impl From<[u8; 16]> for Key {
+    fn from(bytes: [u8; 16]) -> Self {
+        Key(UUID::from(bytes))
+    }
+}
+
+impl From<u128> for Key {
+    fn from(integer: u128) -> Self {
+        Key(UUID::from(integer))
+    }
+}
+
+impl From<u64> for Key {
+    fn from(integer: u64) -> Self {
+        Key(UUID::from(integer))
+    }
+}
+
+impl fmt::Display for Key {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, formatter)
+    }
+}
+
+impl fmt::Debug for Key {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, formatter)
+    }
+}
+
+/// The position of a commit in the order commits apply in, as a commit or a stage reports it.
+pub type Stamp = ffi::ustore_stamp_t;
+
+/// The identifier of a collection: a UUIDv7 the catalog mints once and never reuses, so it stays the same across
+/// restarts and never names two collections.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct CollectionID(pub UUID);
+
+impl CollectionID {
+    /// The collection every database holds, named by the nil UUID, which may be cleared but never dropped.
     pub fn main() -> Self {
         // SAFETY: the library defines the constant once and never writes it.
-        Collection(unsafe { ffi::ustore_collection_main_k })
+        unsafe { ffi::ustore_collection_main_k }
+    }
+}
+
+impl From<UUID> for CollectionID {
+    fn from(uuid: UUID) -> Self {
+        CollectionID(uuid)
+    }
+}
+
+impl From<[u8; 16]> for CollectionID {
+    fn from(bytes: [u8; 16]) -> Self {
+        CollectionID(UUID::from(bytes))
+    }
+}
+
+impl From<u128> for CollectionID {
+    fn from(integer: u128) -> Self {
+        CollectionID(UUID::from(integer))
+    }
+}
+
+impl From<u64> for CollectionID {
+    fn from(integer: u64) -> Self {
+        CollectionID(UUID::from(integer))
+    }
+}
+
+impl fmt::Display for CollectionID {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, formatter)
+    }
+}
+
+impl fmt::Debug for CollectionID {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, formatter)
     }
 }
 
 /// The collections a batch addresses: one for every task, or one per task.
 ///
 /// The ABI carries a collection per task, so a batch may span as many collections as it has entries;
-/// [`Collections::Every`] is the common case, and every verb takes a bare [`Collection`] as one.
+/// [`Collections::Every`] is the common case, and every verb takes a bare [`CollectionID`] as one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Collections<'collections> {
     /// Every task of the batch addresses the same collection.
-    Every(Collection),
+    Every(CollectionID),
     /// The task at each position addresses the collection at the same position.
-    Each(&'collections [Collection]),
+    Each(&'collections [CollectionID]),
 }
 
-impl From<Collection> for Collections<'_> {
-    fn from(collection: Collection) -> Self {
+impl From<CollectionID> for Collections<'_> {
+    fn from(collection: CollectionID) -> Self {
         Collections::Every(collection)
     }
 }
 
-impl<'collections> From<&'collections [Collection]> for Collections<'collections> {
-    fn from(collections: &'collections [Collection]) -> Self {
+impl<'collections> From<&'collections [CollectionID]> for Collections<'collections> {
+    fn from(collections: &'collections [CollectionID]) -> Self {
         Collections::Each(collections)
     }
 }
@@ -461,22 +596,16 @@ impl Collections<'_> {
     ///
     /// The pointer addresses either the identifier inside this value or the caller's slice, so the
     /// call it feeds must run while both are alive.
-    pub(crate) fn strided(&self, count: usize) -> Result<(*const ffi::ustore_collection_t, ffi::ustore_size_t)> {
+    pub(crate) fn strided(&self, count: usize) -> Result<(*const ffi::ustore_collection_id_t, ffi::ustore_size_t)> {
         match self {
-            Collections::Every(collection) => Ok((&collection.0, 0)),
-            Collections::Each(collections) if collections.len() == count => Ok((
-                collections.as_ptr().cast(),
-                size_of::<Collection>() as ffi::ustore_size_t,
-            )),
+            Collections::Every(collection) => Ok((collection, 0)),
+            Collections::Each(collections) if collections.len() == count => {
+                Ok((collections.as_ptr(), size_of::<CollectionID>() as ffi::ustore_size_t))
+            }
             Collections::Each(_) => Err(fail(Status::InvalidArgument, "the batch holds a collection per task")),
         }
     }
 }
-
-/// An identifier of a point-in-time view of the whole database.
-#[repr(transparent)]
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct SnapshotId(pub ffi::ustore_snapshot_t);
 
 /// The length the ABI reports for a missing value.
 pub(crate) fn missing_length() -> ffi::ustore_length_t {
@@ -484,7 +613,7 @@ pub(crate) fn missing_length() -> ffi::ustore_length_t {
     unsafe { ffi::ustore_length_missing_k }
 }
 
-/// The length the ABI carries for `length` bytes, refusing one past 32 bits or equal to the missing length.
+/// The length the ABI carries for `length` bytes, refusing one equal to the missing length.
 pub(crate) fn described_length(length: usize, message: &'static str) -> Result<ffi::ustore_length_t> {
     match ffi::ustore_length_t::try_from(length) {
         Ok(described) if described != missing_length() => Ok(described),
@@ -492,7 +621,7 @@ pub(crate) fn described_length(length: usize, message: &'static str) -> Result<f
     }
 }
 
-/// The key that stands for no key.
+/// The key that stands for no key, every bit of it set.
 pub fn key_unknown() -> Key {
     // SAFETY: the library defines the constant once and never writes it.
     unsafe { ffi::ustore_key_unknown_k }
@@ -608,6 +737,24 @@ unsafe impl Send for Arena {}
 // endregion: Arenas
 
 // region: Options
+
+/// What a collection holds, which an engine records beside its name and refuses the verbs of another modality by.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+pub enum Modality {
+    /// Anything the blob and document verbs write, which the main collection holds.
+    #[default]
+    Any,
+    /// Binary values.
+    Blobs,
+    /// JSON documents.
+    Docs,
+    /// Vertices and their edges, which only the graph verbs reach.
+    Graph,
+    /// Values keyed by strings.
+    Strings,
+    /// Ordered documents.
+    Pages,
+}
 
 /// The isolation the in-memory engine delivers to the transactions of a database.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
@@ -979,7 +1126,7 @@ impl Database {
         View {
             database: self.handle,
             transaction: ptr::null_mut(),
-            snapshot: 0,
+            snapshot: ptr::null_mut(),
             options: ffi::USTORE_OPTIONS_DEFAULT_K,
             marker: PhantomData,
         }
@@ -992,48 +1139,27 @@ impl Database {
         Ok(Transaction { database: self, handle })
     }
 
-    /// Captures a point-in-time view of the database, released when it is dropped.
+    /// Pins a point-in-time view of the database, which it releases when dropped.
     pub fn snapshot(&self) -> Result<Snapshot<'_>> {
-        let mut id: ffi::ustore_snapshot_t = 0;
+        let mut handle: ffi::ustore_snapshot_t = ptr::null_mut();
         let mut error = ffi::ustore_error_t::default();
-        let mut arguments = ffi::ustore_snapshot_create_t {
+        let mut arguments = ffi::ustore_snapshot_init_t {
             db: self.handle,
             error: &mut error,
-            id: &mut id,
+            snapshot: &mut handle,
         };
         // SAFETY: every pointer in `arguments` outlives the call.
-        unsafe { ffi::ustore_snapshot_create(&mut arguments) };
+        unsafe { ffi::ustore_snapshot_init(&mut arguments) };
         check(error)?;
-        Ok(Snapshot {
-            database: self,
-            id: SnapshotId(id),
-        })
+        match handle.is_null() {
+            true => Err(fail(Status::Internal, "the library returned no snapshot and no error")),
+            false => Ok(Snapshot { database: self, handle }),
+        }
     }
 
-    /// Every snapshot the database holds, exported into the arena.
-    pub fn snapshots<'arena>(&self, arena: &'arena mut Arena) -> Result<&'arena [SnapshotId]> {
-        let mut count: ffi::ustore_size_t = 0;
-        let mut ids: *mut ffi::ustore_snapshot_t = ptr::null_mut();
-        let mut error = ffi::ustore_error_t::default();
-        let mut arguments = ffi::ustore_snapshot_list_t {
-            db: self.handle,
-            error: &mut error,
-            arena: arena.slot(),
-            options: ffi::USTORE_OPTIONS_DEFAULT_K,
-            count: &mut count,
-            ids: &mut ids,
-        };
-        // SAFETY: every pointer in `arguments` outlives the call.
-        unsafe { ffi::ustore_snapshot_list(&mut arguments) };
-        check(error)?;
-        // SAFETY: a successful listing writes `count` identifiers into the arena, which stays
-        // borrowed for as long as the slice does; `SnapshotId` is a transparent wrapper of one.
-        Ok(unsafe { exported_slice(ids.cast::<SnapshotId>(), count as usize) })
-    }
-
-    /// Creates an empty collection and binds `name` to it, refusing a name already in use.
-    pub fn create_collection(&self, name: &str) -> Result<Collection> {
-        crate::strings::create_named(self.handle, name)
+    /// Creates an empty collection holding `modality` and binds `name` to it, refusing a name already in use.
+    pub fn create_collection(&self, name: &str, modality: Modality) -> Result<CollectionID> {
+        crate::strings::create_named(self.handle, name, modality)
     }
 
     /// Drops the collection `name` addresses, together with its contents and its name.
@@ -1043,12 +1169,12 @@ impl Database {
     }
 
     /// Removes the contents of a collection, or the collection itself together with its name.
-    pub fn clear_collection(&self, collection: Collection, removed: Removed) -> Result<()> {
+    pub fn clear_collection(&self, collection: CollectionID, removed: Removed) -> Result<()> {
         let mut error = ffi::ustore_error_t::default();
         let mut arguments = ffi::ustore_collection_drop_t {
             db: self.handle,
             error: &mut error,
-            id: collection.0,
+            collection,
             mode: removed as ffi::ustore_enum_t,
         };
         // SAFETY: every pointer in `arguments` outlives the call.
@@ -1123,15 +1249,15 @@ impl<'view> View<'view> {
         self.transaction
     }
 
-    /// The snapshot this view reads at, or zero.
+    /// The snapshot this view reads at, or null.
     pub(crate) fn snapshot(&self) -> ffi::ustore_snapshot_t {
         self.snapshot
     }
 
     /// Every collection this view holds, the main one excluded, exported into the arena.
-    pub fn collections<'arena>(&self, arena: &'arena mut Arena) -> Result<&'arena [Collection]> {
+    pub fn collections<'arena>(&self, arena: &'arena mut Arena) -> Result<&'arena [CollectionID]> {
         let mut count: ffi::ustore_size_t = 0;
-        let mut ids: *mut ffi::ustore_collection_t = ptr::null_mut();
+        let mut ids: *mut CollectionID = ptr::null_mut();
         let mut error = ffi::ustore_error_t::default();
         let mut arguments = ffi::ustore_collection_list_t {
             db: self.database,
@@ -1141,7 +1267,7 @@ impl<'view> View<'view> {
             arena: arena.slot(),
             options: ffi::USTORE_OPTIONS_DEFAULT_K,
             count: &mut count,
-            ids: &mut ids,
+            collections: &mut ids,
             modalities: ptr::null_mut(),
             names_offsets: ptr::null_mut(),
             names: ptr::null_mut(),
@@ -1150,8 +1276,8 @@ impl<'view> View<'view> {
         unsafe { ffi::ustore_collection_list(&mut arguments) };
         check(error)?;
         // SAFETY: a successful listing writes `count` identifiers into the arena, which stays
-        // borrowed for as long as the slice does; `Collection` is a transparent wrapper of one.
-        Ok(unsafe { exported_slice(ids.cast::<Collection>(), count as usize) })
+        // borrowed for as long as the slice does.
+        Ok(unsafe { exported_slice(ids, count as usize) })
     }
 }
 
@@ -1189,48 +1315,47 @@ impl<'db> Transaction<'db> {
         View {
             database: self.database.handle(),
             transaction: self.handle,
-            snapshot: 0,
+            snapshot: ptr::null_mut(),
             options: conflicts.to_raw(),
             marker: PhantomData,
         }
     }
 
-    /// Stages the writes as the first phase of a two-phase commit, reporting the sequence number
-    /// the stage took.
-    pub fn stage(&mut self) -> Result<SequenceNumber> {
-        let mut sequence_number: SequenceNumber = 0;
+    /// Stages the writes as the first phase of a two-phase commit, reporting the stamp the stage took.
+    pub fn stage(&mut self) -> Result<Stamp> {
+        let mut stamp: Stamp = 0;
         let mut error = ffi::ustore_error_t::default();
         let mut arguments = ffi::ustore_transaction_stage_t {
             db: self.database.handle(),
             error: &mut error,
             transaction: self.handle,
             options: ffi::USTORE_OPTIONS_DEFAULT_K,
-            sequence_number: &mut sequence_number,
+            stamp: &mut stamp,
         };
         // SAFETY: every pointer in `arguments` outlives the call.
         unsafe { ffi::ustore_transaction_stage(&mut arguments) };
         check(error)?;
-        Ok(sequence_number)
+        Ok(stamp)
     }
 
-    /// Commits the writes, reporting the sequence number they applied at.
+    /// Commits the writes, reporting the stamp they were published under.
     ///
     /// A conflict is reported rather than retried, and the transaction keeps its contents either
     /// way, so a caller may replay them after [`Transaction::rollback`].
-    pub fn commit(&mut self, durability: Durability) -> Result<SequenceNumber> {
-        let mut sequence_number: SequenceNumber = 0;
+    pub fn commit(&mut self, durability: Durability) -> Result<Stamp> {
+        let mut stamp: Stamp = 0;
         let mut error = ffi::ustore_error_t::default();
         let mut arguments = ffi::ustore_transaction_commit_t {
             db: self.database.handle(),
             error: &mut error,
             transaction: self.handle,
             options: durability.to_raw(),
-            sequence_number: &mut sequence_number,
+            stamp: &mut stamp,
         };
         // SAFETY: every pointer in `arguments` outlives the call.
         unsafe { ffi::ustore_transaction_commit(&mut arguments) };
         check(error)?;
-        Ok(sequence_number)
+        Ok(stamp)
     }
 
     /// Discards the writes and reopens the transaction on the newest state, ready for another try.
@@ -1251,25 +1376,24 @@ impl Drop for Transaction<'_> {
 
 // region: Snapshots
 
-/// A point-in-time view of the whole database, released when it is dropped.
+/// A point-in-time view of the whole database, which pins the versions its reads need until it is
+/// dropped.
+///
+/// Every view at a snapshot borrows it, so the snapshot outlives them, and the snapshot borrows its
+/// database, which it is freed before.
 #[derive(Debug)]
 pub struct Snapshot<'db> {
     database: &'db Database,
-    id: SnapshotId,
+    handle: ffi::ustore_snapshot_t,
 }
 
 impl<'db> Snapshot<'db> {
-    /// The identifier `Database::snapshots` reports this snapshot under.
-    pub fn id(&self) -> SnapshotId {
-        self.id
-    }
-
     /// The view every call at this snapshot addresses, which no write may go through.
     pub fn view(&self) -> View<'_> {
         View {
             database: self.database.handle(),
             transaction: ptr::null_mut(),
-            snapshot: self.id.0,
+            snapshot: self.handle,
             options: ffi::USTORE_OPTIONS_DEFAULT_K,
             marker: PhantomData,
         }
@@ -1282,7 +1406,7 @@ impl<'db> Snapshot<'db> {
         let mut arguments = ffi::ustore_snapshot_export_t {
             db: self.database.handle(),
             error: &mut error,
-            id: self.id.0,
+            snapshot: self.handle,
             path: path.as_ptr(),
         };
         // SAFETY: every pointer in `arguments` outlives the call, the path included.
@@ -1293,15 +1417,9 @@ impl<'db> Snapshot<'db> {
 
 impl Drop for Snapshot<'_> {
     fn drop(&mut self) {
-        let mut error = ffi::ustore_error_t::default();
-        let mut arguments = ffi::ustore_snapshot_drop_t {
-            db: self.database.handle(),
-            error: &mut error,
-            id: self.id.0,
-        };
-        // SAFETY: every pointer in `arguments` outlives the call; the only failure a drop can meet
-        // is a snapshot the engine already released, which leaves nothing to do.
-        unsafe { ffi::ustore_snapshot_drop(&mut arguments) };
+        // SAFETY: the handle came from a successful init, is freed once, and outlives no view - every
+        // view borrows this snapshot.
+        unsafe { ffi::ustore_snapshot_free(self.handle) };
     }
 }
 
@@ -1313,6 +1431,7 @@ impl Drop for Snapshot<'_> {
 mod tests {
     use super::*;
     use crate::testing::temporary_directory;
+    use crate::testing::{key, keys};
 
     #[test]
     fn databases_open_in_memory_and_report_their_engine() {
@@ -1334,15 +1453,18 @@ mod tests {
         let mut arena = Arena::new();
 
         let database = Database::open_ram(&options).unwrap();
-        let entries = [crate::blobs::Entry::new(7, b"alpha").unwrap()];
+        let entries = [crate::blobs::Entry::new(key(7), b"alpha").unwrap()];
         database
             .head()
-            .write(&mut arena, Collection::main(), &entries, Durability::Flushed)
+            .write(&mut arena, CollectionID::main(), &entries, Durability::Flushed)
             .unwrap();
         drop(database);
 
         let reopened = Database::open_ram(&options).unwrap();
-        let values = reopened.head().read(&mut arena, Collection::main(), &[7]).unwrap();
+        let values = reopened
+            .head()
+            .read(&mut arena, CollectionID::main(), &keys([7]))
+            .unwrap();
         assert_eq!(values.get(0), Some(b"alpha".as_slice()));
     }
 
@@ -1395,12 +1517,15 @@ mod tests {
                 continue;
             }
             let database = database.unwrap();
-            let entries = [crate::blobs::Entry::new(7, b"alpha").unwrap()];
+            let entries = [crate::blobs::Entry::new(key(7), b"alpha").unwrap()];
             database
                 .head()
-                .write(&mut arena, Collection::main(), &entries, Durability::Flushed)
+                .write(&mut arena, CollectionID::main(), &entries, Durability::Flushed)
                 .unwrap();
-            let values = database.head().read(&mut arena, Collection::main(), &[7]).unwrap();
+            let values = database
+                .head()
+                .read(&mut arena, CollectionID::main(), &keys([7]))
+                .unwrap();
             assert_eq!(values.get(0), Some(b"alpha".as_slice()));
         }
     }
@@ -1419,8 +1544,8 @@ mod tests {
         let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
 
-        let people = database.create_collection("people").unwrap();
-        let places = database.create_collection("places").unwrap();
+        let people = database.create_collection("people", Modality::Any).unwrap();
+        let places = database.create_collection("places", Modality::Any).unwrap();
         assert_ne!(people, places);
         assert_eq!(database.head().collection(&mut arena, "people").unwrap(), people);
 
@@ -1430,7 +1555,7 @@ mod tests {
 
         // A name is bound once, and a name nobody bound addresses nothing.
         assert_eq!(
-            database.create_collection("people").unwrap_err().status,
+            database.create_collection("people", Modality::Any).unwrap_err().status,
             Status::AlreadyExists
         );
         assert_eq!(
@@ -1450,19 +1575,24 @@ mod tests {
     fn the_main_collection_clears_but_never_drops() {
         let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
-        let entries = [crate::blobs::Entry::new(1, b"alpha").unwrap()];
+        let entries = [crate::blobs::Entry::new(key(1), b"alpha").unwrap()];
         database
             .head()
-            .write(&mut arena, Collection::main(), &entries, Durability::Buffered)
+            .write(&mut arena, CollectionID::main(), &entries, Durability::Buffered)
             .unwrap();
 
         let failure = database
-            .clear_collection(Collection::main(), Removed::CollectionAndEntries)
+            .clear_collection(CollectionID::main(), Removed::CollectionAndEntries)
             .unwrap_err();
         assert_eq!(failure.status, Status::InvalidArgument);
 
-        database.clear_collection(Collection::main(), Removed::Entries).unwrap();
-        let values = database.head().read(&mut arena, Collection::main(), &[1]).unwrap();
+        database
+            .clear_collection(CollectionID::main(), Removed::Entries)
+            .unwrap();
+        let values = database
+            .head()
+            .read(&mut arena, CollectionID::main(), &keys([1]))
+            .unwrap();
         assert_eq!(values.get(0), None);
     }
 
@@ -1471,21 +1601,27 @@ mod tests {
         let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
         let mut transaction = database.transaction().unwrap();
-        let entries = [crate::blobs::Entry::new(1, b"alpha").unwrap()];
+        let entries = [crate::blobs::Entry::new(key(1), b"alpha").unwrap()];
         transaction
             .view(Conflicts::Watched)
-            .write(&mut arena, Collection::main(), &entries, Durability::Buffered)
+            .write(&mut arena, CollectionID::main(), &entries, Durability::Buffered)
             .unwrap();
 
         // Nothing is visible at the head until the commit lands.
-        let before = database.head().read(&mut arena, Collection::main(), &[1]).unwrap();
+        let before = database
+            .head()
+            .read(&mut arena, CollectionID::main(), &keys([1]))
+            .unwrap();
         assert_eq!(before.get(0), None);
 
         let staged = transaction.stage().unwrap();
         let committed = transaction.commit(Durability::Buffered).unwrap();
         assert!(committed >= staged);
 
-        let after = database.head().read(&mut arena, Collection::main(), &[1]).unwrap();
+        let after = database
+            .head()
+            .read(&mut arena, CollectionID::main(), &keys([1]))
+            .unwrap();
         assert_eq!(after.get(0), Some(b"alpha".as_slice()));
     }
 
@@ -1494,21 +1630,24 @@ mod tests {
         let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
         let mut transaction = database.transaction().unwrap();
-        let abandoned = [crate::blobs::Entry::new(2, b"abandoned").unwrap()];
+        let abandoned = [crate::blobs::Entry::new(key(2), b"abandoned").unwrap()];
         transaction
             .view(Conflicts::Watched)
-            .write(&mut arena, Collection::main(), &abandoned, Durability::Buffered)
+            .write(&mut arena, CollectionID::main(), &abandoned, Durability::Buffered)
             .unwrap();
         transaction.rollback().unwrap();
 
-        let kept = [crate::blobs::Entry::new(2, b"kept").unwrap()];
+        let kept = [crate::blobs::Entry::new(key(2), b"kept").unwrap()];
         transaction
             .view(Conflicts::Watched)
-            .write(&mut arena, Collection::main(), &kept, Durability::Buffered)
+            .write(&mut arena, CollectionID::main(), &kept, Durability::Buffered)
             .unwrap();
         transaction.commit(Durability::Buffered).unwrap();
 
-        let values = database.head().read(&mut arena, Collection::main(), &[2]).unwrap();
+        let values = database
+            .head()
+            .read(&mut arena, CollectionID::main(), &keys([2]))
+            .unwrap();
         assert_eq!(values.get(0), Some(b"kept".as_slice()));
     }
 
@@ -1517,10 +1656,10 @@ mod tests {
         let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
         let transaction = database.transaction().unwrap();
-        let entries = [crate::blobs::Entry::new(3, b"alpha").unwrap()];
+        let entries = [crate::blobs::Entry::new(key(3), b"alpha").unwrap()];
         let failure = transaction
             .view(Conflicts::Watched)
-            .write(&mut arena, Collection::main(), &entries, Durability::Flushed)
+            .write(&mut arena, CollectionID::main(), &entries, Durability::Flushed)
             .unwrap_err();
         assert_eq!(failure.status, Status::InvalidArgument);
     }
@@ -1532,15 +1671,15 @@ mod tests {
         let mut first = database.transaction().unwrap();
         let mut second = database.transaction().unwrap();
 
-        let mine = [crate::blobs::Entry::new(4, b"mine").unwrap()];
-        let yours = [crate::blobs::Entry::new(4, b"yours").unwrap()];
+        let mine = [crate::blobs::Entry::new(key(4), b"mine").unwrap()];
+        let yours = [crate::blobs::Entry::new(key(4), b"yours").unwrap()];
         first
             .view(Conflicts::Watched)
-            .write(&mut arena, Collection::main(), &mine, Durability::Buffered)
+            .write(&mut arena, CollectionID::main(), &mine, Durability::Buffered)
             .unwrap();
         second
             .view(Conflicts::Watched)
-            .write(&mut arena, Collection::main(), &yours, Durability::Buffered)
+            .write(&mut arena, CollectionID::main(), &yours, Durability::Buffered)
             .unwrap();
         first.commit(Durability::Buffered).unwrap();
 
@@ -1563,23 +1702,23 @@ mod tests {
         })
         .unwrap();
         let mut arena = Arena::new();
-        let seed = [crate::blobs::Entry::new(8, b"seed").unwrap()];
+        let seed = [crate::blobs::Entry::new(key(8), b"seed").unwrap()];
         database
             .head()
-            .write(&mut arena, Collection::main(), &seed, Durability::Buffered)
+            .write(&mut arena, CollectionID::main(), &seed, Durability::Buffered)
             .unwrap();
 
         // A watched read is part of the serial order, so a writer that lands under it conflicts.
         let mut watched = database.transaction().unwrap();
         let read = watched
             .view(Conflicts::Watched)
-            .read(&mut arena, Collection::main(), &[8])
+            .read(&mut arena, CollectionID::main(), &keys([8]))
             .unwrap();
         assert_eq!(read.get(0), Some(b"seed".as_slice()));
-        let overwritten = [crate::blobs::Entry::new(8, b"overwritten").unwrap()];
+        let overwritten = [crate::blobs::Entry::new(key(8), b"overwritten").unwrap()];
         database
             .head()
-            .write(&mut arena, Collection::main(), &overwritten, Durability::Buffered)
+            .write(&mut arena, CollectionID::main(), &overwritten, Durability::Buffered)
             .unwrap();
         let failure = watched.commit(Durability::Buffered).unwrap_err();
         assert!(
@@ -1591,13 +1730,13 @@ mod tests {
         let mut unwatched = database.transaction().unwrap();
         let read = unwatched
             .view(Conflicts::Unwatched)
-            .read(&mut arena, Collection::main(), &[8])
+            .read(&mut arena, CollectionID::main(), &keys([8]))
             .unwrap();
         assert_eq!(read.get(0), Some(b"overwritten".as_slice()));
-        let again = [crate::blobs::Entry::new(8, b"again").unwrap()];
+        let again = [crate::blobs::Entry::new(key(8), b"again").unwrap()];
         database
             .head()
-            .write(&mut arena, Collection::main(), &again, Durability::Buffered)
+            .write(&mut arena, CollectionID::main(), &again, Durability::Buffered)
             .unwrap();
         unwatched.commit(Durability::Buffered).unwrap();
     }
@@ -1606,40 +1745,39 @@ mod tests {
     fn snapshots_hold_the_state_they_were_taken_at() {
         let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
-        let before = [crate::blobs::Entry::new(5, b"before").unwrap()];
+        let before = [crate::blobs::Entry::new(key(5), b"before").unwrap()];
         database
             .head()
-            .write(&mut arena, Collection::main(), &before, Durability::Buffered)
+            .write(&mut arena, CollectionID::main(), &before, Durability::Buffered)
             .unwrap();
 
         let snapshot = database.snapshot().unwrap();
-        let after = [crate::blobs::Entry::new(5, b"after").unwrap()];
+        let after = [crate::blobs::Entry::new(key(5), b"after").unwrap()];
         database
             .head()
-            .write(&mut arena, Collection::main(), &after, Durability::Buffered)
+            .write(&mut arena, CollectionID::main(), &after, Durability::Buffered)
             .unwrap();
 
-        let pinned = snapshot.view().read(&mut arena, Collection::main(), &[5]).unwrap();
+        let pinned = snapshot
+            .view()
+            .read(&mut arena, CollectionID::main(), &keys([5]))
+            .unwrap();
         assert_eq!(pinned.get(0), Some(b"before".as_slice()));
-        let latest = database.head().read(&mut arena, Collection::main(), &[5]).unwrap();
+        let latest = database
+            .head()
+            .read(&mut arena, CollectionID::main(), &keys([5]))
+            .unwrap();
         assert_eq!(latest.get(0), Some(b"after".as_slice()));
-
-        let listed = database.snapshots(&mut arena).unwrap();
-        assert!(listed.contains(&snapshot.id()));
-
-        let identifier = snapshot.id();
-        drop(snapshot);
-        assert!(!database.snapshots(&mut arena).unwrap().contains(&identifier));
     }
 
     #[test]
     fn snapshots_export_a_database_of_their_own() {
         let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
-        let entries = [crate::blobs::Entry::new(6, b"exported").unwrap()];
+        let entries = [crate::blobs::Entry::new(key(6), b"exported").unwrap()];
         database
             .head()
-            .write(&mut arena, Collection::main(), &entries, Durability::Buffered)
+            .write(&mut arena, CollectionID::main(), &entries, Durability::Buffered)
             .unwrap();
 
         let directory = temporary_directory("snapshot_exports");
@@ -1651,7 +1789,10 @@ mod tests {
         );
 
         let exported = Database::open_ram(&RAMOptions::at(directory.path())).unwrap();
-        let values = exported.head().read(&mut arena, Collection::main(), &[6]).unwrap();
+        let values = exported
+            .head()
+            .read(&mut arena, CollectionID::main(), &keys([6]))
+            .unwrap();
         assert_eq!(values.get(0), Some(b"exported".as_slice()));
     }
 
@@ -1676,9 +1817,9 @@ mod tests {
 
     #[test]
     fn constants_come_from_the_linked_engine() {
-        assert_eq!(Collection::main().0, 0);
-        assert_eq!(missing_length(), u32::MAX);
-        assert_ne!(key_unknown(), 0);
+        assert_eq!(CollectionID::main(), CollectionID::default());
+        assert_eq!(missing_length(), u64::MAX);
+        assert_eq!(key_unknown(), Key::from(u128::MAX));
     }
 }
 

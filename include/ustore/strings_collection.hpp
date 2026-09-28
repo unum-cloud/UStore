@@ -46,7 +46,7 @@ enum class walk_stage_t : unsigned char {
 class strings_stream_t {
 
     ustore_database_t database_ {nullptr};
-    ustore_collection_t collection_ {ustore_collection_main_k};
+    ustore_collection_id_t collection_ {ustore_collection_main_k};
     ustore_transaction_t transaction_ {nullptr};
     ustore_snapshot_t snapshot_ {};
     value_view_t prefix_ {value_view_t::make_empty()};
@@ -116,7 +116,7 @@ class strings_stream_t {
     static constexpr std::size_t default_read_ahead_k = 256;
 
     strings_stream_t() noexcept = default;
-    strings_stream_t(ustore_database_t database, ustore_collection_t collection = ustore_collection_main_k,
+    strings_stream_t(ustore_database_t database, ustore_collection_id_t collection = ustore_collection_main_k,
                      ustore_transaction_t transaction = nullptr, ustore_snapshot_t snapshot = {},
                      value_view_t prefix = value_view_t::make_empty(),
                      std::size_t read_ahead = default_read_ahead_k) noexcept
@@ -189,7 +189,7 @@ class strings_stream_t {
 class strings_collection_t {
 
     ustore_database_t database_ {nullptr};
-    ustore_collection_t collection_ {ustore_collection_main_k};
+    ustore_collection_id_t collection_ {ustore_collection_main_k};
     ustore_transaction_t transaction_ {nullptr};
     ustore_snapshot_t snapshot_ {};
     any_arena_t arena_ {nullptr};
@@ -227,7 +227,7 @@ class strings_collection_t {
         ustore_collection_drop_t collection_drop {};
         collection_drop.db = database_;
         collection_drop.error = &error;
-        collection_drop.id = collection_;
+        collection_drop.collection = collection_;
         collection_drop.mode = mode;
         ustore_collection_drop(&collection_drop);
         return status_t {error};
@@ -237,7 +237,7 @@ class strings_collection_t {
     using prefix_range_t = range<strings_stream_t>;
 
     strings_collection_t() noexcept : arena_(nullptr) {}
-    strings_collection_t(ustore_database_t database, ustore_collection_t collection,
+    strings_collection_t(ustore_database_t database, ustore_collection_id_t collection,
                          ustore_transaction_t transaction = nullptr, ustore_snapshot_t snapshot = {},
                          ustore_arena_t* arena = nullptr) noexcept
         : database_(database), collection_(collection), transaction_(transaction), snapshot_(snapshot),
@@ -270,8 +270,8 @@ class strings_collection_t {
         return *this;
     }
 
-    operator ustore_collection_t() const noexcept { return collection_; }
-    ustore_collection_t* member_ptr() noexcept { return &collection_; }
+    operator ustore_collection_id_t() const noexcept { return collection_; }
+    ustore_collection_id_t* member_ptr() noexcept { return &collection_; }
     ustore_arena_t* member_arena() noexcept { return arena_.member_ptr(); }
     ustore_database_t db() const noexcept { return database_; }
     ustore_transaction_t txn() const noexcept { return transaction_; }

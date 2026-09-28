@@ -7,14 +7,13 @@
  */
 
 #include <cstddef> // `std::size_t`
-#include <cstdint> // `std::uint64_t`
+#include <cstdint> // `std::int64_t`, `std::uint64_t`
 
 #include <span>    // `std::span`
 #include <utility> // `std::move`
 
 #include <smashtable/shared.hpp>
 
-#include <ustore/db.h>      // `ustore_key_t`
 #include <ustore/types.hpp> // `value_layout_t`
 
 #include "cuda.hpp"            // `cuda_count_devices`, `cuda_stream_t`
@@ -40,15 +39,18 @@ st::expected<gpu_compactor_t> gpu_compactor_t::make(int ordinal) noexcept {
 template <typename key_slot_type_>
 using views_of = std::span<sorted_run_index_view<key_slot_type_> const>;
 
+/** The key the engine stores, the 64-bit integer the keys of the C ABI map onto until NVMe stores sixteen bytes. */
+using stored_key_t = std::int64_t;
+
 /** The key slots of the engine's collections, one per value layout a collection is created with. */
-using inline_1_byte_slot_t = key_slot<ustore_key_t, value_layout_t::inline_1_byte_k>;
-using inline_4_bytes_slot_t = key_slot<ustore_key_t, value_layout_t::inline_4_bytes_k>;
-using inline_8_bytes_slot_t = key_slot<ustore_key_t, value_layout_t::inline_8_bytes_k>;
-using inline_16_bytes_slot_t = key_slot<ustore_key_t, value_layout_t::inline_16_bytes_k>;
-using inline_32_bytes_slot_t = key_slot<ustore_key_t, value_layout_t::inline_32_bytes_k>;
-using inline_64_bytes_slot_t = key_slot<ustore_key_t, value_layout_t::inline_64_bytes_k>;
-using fixed_width_slot_t = key_slot<ustore_key_t, value_layout_t::fixed_width_k>;
-using variable_width_slot_t = key_slot<ustore_key_t, value_layout_t::variable_width_k>;
+using inline_1_byte_slot_t = key_slot<stored_key_t, value_layout_t::inline_1_byte_k>;
+using inline_4_bytes_slot_t = key_slot<stored_key_t, value_layout_t::inline_4_bytes_k>;
+using inline_8_bytes_slot_t = key_slot<stored_key_t, value_layout_t::inline_8_bytes_k>;
+using inline_16_bytes_slot_t = key_slot<stored_key_t, value_layout_t::inline_16_bytes_k>;
+using inline_32_bytes_slot_t = key_slot<stored_key_t, value_layout_t::inline_32_bytes_k>;
+using inline_64_bytes_slot_t = key_slot<stored_key_t, value_layout_t::inline_64_bytes_k>;
+using fixed_width_slot_t = key_slot<stored_key_t, value_layout_t::fixed_width_k>;
+using variable_width_slot_t = key_slot<stored_key_t, value_layout_t::variable_width_k>;
 
 /** The key slot the storage suites model their runs with. */
 using suite_variable_width_slot_t = key_slot<std::uint64_t, value_layout_t::variable_width_k>;

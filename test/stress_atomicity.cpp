@@ -13,7 +13,6 @@
 #include <algorithm>   // `std::ranges::max`
 #include <array>       // `std::array`
 #include <chrono>      // `std::chrono::steady_clock`
-#include <numeric>     // `std::iota`
 #include <random>      // `std::mt19937`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
@@ -140,7 +139,7 @@ struct batches_t {
 [[nodiscard]] std::size_t prepare_run(atomicity_run_t& run, atomicity_options_t const& options) {
     std::size_t failures = expect(st::succeeded(run.keys.resize(options.keys.value)));
     failures += expect(st::succeeded(run.slots.resize(std::ranges::max(options.threads.view()))));
-    std::iota(run.keys.begin(), run.keys.end(), ustore_key_t {0});
+    for (std::size_t index = 0; index != run.keys.size(); ++index) run.keys[index] = key_from_integer(index);
     for (writer_slot_t& slot : run.slots) slot.random_generator.seed(static_cast<std::uint32_t>(draw_seed()));
     if (failures || !run.database.supports_transactions()) return failures;
     for (std::size_t thread = 0; thread != run.slots.size() && !failures; ++thread)

@@ -3,24 +3,24 @@
 import json
 import struct
 
-import numpy
+import numpy as np
 import pytest
 
 from ustore.table_view import WRITE_TYPES, Table
 
 # A NumPy dtype, the type name a write spells it as, and the values a column carries.
 COLUMN_DTYPES = {
-    "f64": (numpy.float64, [1.5, -2.25, 3.75]),
-    "f32": (numpy.float32, [1.5, -2.25, 3.75]),
-    "i64": (numpy.int64, [-(2**40), 0, 2**40]),
-    "i32": (numpy.int32, [-5, 0, 7]),
-    "i16": (numpy.int16, [-5, 0, 7]),
-    "i8": (numpy.int8, [-5, 0, 7]),
-    "u64": (numpy.uint64, [0, 1, 2**40]),
-    "u32": (numpy.uint32, [0, 1, 2**31]),
-    "u16": (numpy.uint16, [0, 1, 65535]),
-    "u8": (numpy.uint8, [0, 1, 255]),
-    "bool": (numpy.bool_, [True, False, True]),
+    "f64": (np.float64, [1.5, -2.25, 3.75]),
+    "f32": (np.float32, [1.5, -2.25, 3.75]),
+    "i64": (np.int64, [-(2**40), 0, 2**40]),
+    "i32": (np.int32, [-5, 0, 7]),
+    "i16": (np.int16, [-5, 0, 7]),
+    "i8": (np.int8, [-5, 0, 7]),
+    "u64": (np.uint64, [0, 1, 2**40]),
+    "u32": (np.uint32, [0, 1, 2**31]),
+    "u16": (np.uint16, [0, 1, 65535]),
+    "u8": (np.uint8, [0, 1, 255]),
+    "bool": (np.bool_, [True, False, True]),
 }
 
 # The UUID the gather parses, and the sixteen bytes it decodes into.
@@ -47,7 +47,7 @@ def test_column_write_round_trip(view, type_name: str):
     dtype, values = COLUMN_DTYPES[type_name]
     keys = [3, 4, 5]
     view.docs_write(keys, ["{}"] * len(keys))
-    view.docs_write(keys, numpy.array(values, dtype=dtype), field="v", type=type_name)
+    view.docs_write(keys, np.array(values, dtype=dtype), field="v", type=type_name)
     assert decoded(view.docs_read(keys)) == [{"v": value} for value in values]
 
 
@@ -63,7 +63,7 @@ def test_column_write_broadcasts_one_scalar(view):
     """One scalar the width of the field stands for every key, as one document does."""
     keys = [1, 2, 3]
     view.docs_write(keys, ["{}"] * len(keys))
-    view.docs_write(keys, numpy.array([2.5], dtype=numpy.float64), field="v", type="f64")
+    view.docs_write(keys, np.array([2.5], dtype=np.float64), field="v", type="f64")
     assert decoded(view.docs_read(keys)) == [{"v": 2.5}] * 3
 
 
@@ -71,17 +71,17 @@ def test_column_write_refuses_a_strided_view(view):
     """A column is borrowed rather than copied, so a slice with gaps in it is refused outright."""
     keys = [1, 2, 3]
     view.docs_write(keys, ["{}"] * len(keys))
-    strided = numpy.arange(6, dtype=numpy.int64)[::2]
+    strided = np.arange(6, dtype=np.int64)[::2]
     with pytest.raises(TypeError):
         view.docs_write(keys, strided, field="v", type="i64")
-    view.docs_write(keys, numpy.ascontiguousarray(strided), field="v", type="i64")
+    view.docs_write(keys, np.ascontiguousarray(strided), field="v", type="i64")
     assert decoded(view.docs_read(keys)) == [{"v": 0}, {"v": 2}, {"v": 4}]
 
 
 def test_column_write_replaces_whole_documents(view):
     """Without a field the scalars replace the documents themselves, one per key."""
     keys = [1, 2]
-    view.docs_write(keys, numpy.array([4.5, 5.5], dtype=numpy.float64), type="f64")
+    view.docs_write(keys, np.array([4.5, 5.5], dtype=np.float64), type="f64")
     assert decoded(view.docs_read(keys)) == [4.5, 5.5]
 
 
@@ -89,16 +89,16 @@ def test_column_write_replaces_whole_documents(view):
     ("call", "failure"),
     [
         (
-            lambda view: view.docs_write([1, 2, 3], numpy.zeros(2, dtype=numpy.float64), field="v", type="f64"),
+            lambda view: view.docs_write([1, 2, 3], np.zeros(2, dtype=np.float64), field="v", type="f64"),
             ValueError,
         ),
         (
-            lambda view: view.docs_write([1, 2, 3], numpy.zeros(3, dtype=numpy.float32), field="v", type="f64"),
+            lambda view: view.docs_write([1, 2, 3], np.zeros(3, dtype=np.float32), field="v", type="f64"),
             ValueError,
         ),
         (lambda view: view.docs_write([1, 2], b"\x00" * 3, field="v", type="i32"), ValueError),
-        (lambda view: view.docs_write([1], numpy.zeros(1, dtype=numpy.float64), field="v", type="f16"), ValueError),
-        (lambda view: view.docs_write([1], numpy.zeros(1, dtype=numpy.float64), field="v", type="uuid"), ValueError),
+        (lambda view: view.docs_write([1], np.zeros(1, dtype=np.float64), field="v", type="f16"), ValueError),
+        (lambda view: view.docs_write([1], np.zeros(1, dtype=np.float64), field="v", type="uuid"), ValueError),
     ],
     ids=["short-column", "narrow-items", "ragged-bytes", "unwritable-f16", "unwritable-uuid"],
 )
@@ -121,8 +121,8 @@ def test_gather_half_precision(view):
     column = columns[0]
     assert column.format == "e"
     assert column.itemsize == 2
-    assert numpy.asarray(column).dtype == numpy.float16
-    assert numpy.asarray(column).tolist() == [1.5, -0.25]
+    assert np.asarray(column).dtype == np.float16
+    assert np.asarray(column).tolist() == [1.5, -0.25]
     assert bit(columns.validity(0), 0) and bit(columns.validity(0), 1)
 
 
@@ -139,7 +139,7 @@ def test_gather_half_precision_overflows(view):
     columns = view.docs_gather([0, 1], ["v"], "f16")
     assert bit(columns.collision(0), 0)
     assert not bit(columns.collision(0), 1)
-    assert numpy.asarray(columns[0])[1] == numpy.float16(1.0)
+    assert np.asarray(columns[0])[1] == np.float16(1.0)
 
 
 def test_gather_half_precision_converts(view):
@@ -148,7 +148,7 @@ def test_gather_half_precision_converts(view):
     columns = view.docs_gather([0, 1], ["v"], "f16")
     assert bit(columns.conversion(0), 0)
     assert not bit(columns.conversion(0), 1)
-    assert numpy.asarray(columns[0]).tolist() == [3.0, numpy.float16(0.1)]
+    assert np.asarray(columns[0]).tolist() == [3.0, np.float16(0.1)]
 
 
 # endregion Half Precision Gathers
@@ -163,7 +163,7 @@ def test_gather_uuid(view):
     column = columns[0]
     assert column.shape == (1, 16)
     assert column.tolist() == [list(UUID_BYTES)]
-    assert numpy.asarray(column)[0].tobytes() == UUID_BYTES
+    assert np.asarray(column)[0].tobytes() == UUID_BYTES
     assert bit(columns.validity(0), 0)
 
 
@@ -187,7 +187,7 @@ def test_gather_uuid_beside_a_scalar(view):
     columns = view.docs_gather([0], ["id", "n"], ["uuid", "i64"])
     assert columns.types == ("uuid", "i64")
     assert bytes(columns[0]) == UUID_BYTES
-    assert numpy.asarray(columns[1]).tolist() == [7]
+    assert np.asarray(columns[1]).tolist() == [7]
 
 
 def test_gather_holds_its_arena(view):
@@ -221,19 +221,19 @@ def test_gather_of_no_documents(view):
 def test_table_column_assignment_is_typed(view):
     """Assigning a NumPy column writes raw scalars, so the stored values keep their dtype exactly."""
     table = Table.from_records(view, [{"n": row} for row in range(4)])
-    table["score"] = numpy.array([0.1, 0.25, 0.5, 0.75], dtype=numpy.float64)
+    table["score"] = np.array([0.1, 0.25, 0.5, 0.75], dtype=np.float64)
     assert decoded(view.docs_read(table.index)) == [
         {"n": row, "score": score} for row, score in enumerate([0.1, 0.25, 0.5, 0.75])
     ]
 
 
-@pytest.mark.parametrize("dtype", [numpy.int64, numpy.int32, numpy.uint16, numpy.float32, numpy.bool_])
+@pytest.mark.parametrize("dtype", [np.int64, np.int32, np.uint16, np.float32, np.bool_])
 def test_table_column_assignment_dtypes(view, dtype):
     """Every dtype a column writes as raw scalars round-trips through the table view."""
     table = Table.from_records(view, [{"n": row} for row in range(3)])
-    table["v"] = numpy.array([1, 0, 1], dtype=dtype)
-    gathered = view.docs_gather(table.index, ["v"], WRITE_TYPES[numpy.dtype(dtype).name])
-    assert numpy.asarray(gathered[0]).tolist() == numpy.array([1, 0, 1], dtype=dtype).tolist()
+    table["v"] = np.array([1, 0, 1], dtype=dtype)
+    gathered = view.docs_gather(table.index, ["v"], WRITE_TYPES[np.dtype(dtype).name])
+    assert np.asarray(gathered[0]).tolist() == np.array([1, 0, 1], dtype=dtype).tolist()
 
 
 def test_table_column_of_objects_still_writes_json(view):
@@ -247,7 +247,7 @@ def test_table_column_of_the_wrong_length(view):
     """A column shorter than the rows it would fill is refused before anything is written."""
     table = Table.from_records(view, [{"n": row} for row in range(3)])
     with pytest.raises(ValueError):
-        table["v"] = numpy.zeros(2, dtype=numpy.float64)
+        table["v"] = np.zeros(2, dtype=np.float64)
 
 
 # endregion Table Columns

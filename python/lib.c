@@ -13,11 +13,15 @@ static char const doc_module[] =                                                
     "GPU-Accelerated Embedded Transactional Database for High-Throughput NVMe Devices.\n"     //
     "\n"                                                                                      //
     "One handle per view of the data: a `Database` addresses the head, a `Transaction`\n"     //
-    "groups changes across collections, and a snapshot fixes a point in time. Every verb\n"   //
+    "groups changes across collections, and a `Snapshot` fixes a point in time. Every verb\n" //
     "is a batch, and a single operation is a batch of one.\n"                                 //
     "\n"                                                                                      //
     "Results land in an arena the returned tape owns, so a `memoryview` over one reads the\n" //
-    "engine's own bytes and copies nothing; the arena lives exactly as long as the tape.";
+    "engine's own bytes and copies nothing; the arena lives exactly as long as the tape.\n"   //
+    "\n"                                                                                      //
+    "A key, `KeyLike` in the docs of every verb, is a `uuid.UUID`, its text, sixteen raw\n"   //
+    "bytes, or an integer in [0, 2**128) read as `uuid.UUID(int=n)`, so integer keys order\n" //
+    "as integers do. Keys and collection IDs always come back as `uuid.UUID`.";
 
 /**
  *  @brief Every type the module readies, and the name it is reachable under.
@@ -32,9 +36,10 @@ static struct {
     /** The type to ready. */
     PyTypeObject* type;
 } const module_types[] = {
-    {"Database", &DatabaseType}, {"Transaction", &TransactionType}, {"Values", &ValuesType},
-    {"Keys", &KeysType},         {"Columns", &ColumnsType},         {"Edges", &EdgesType},
-    {NULL, &SpanType},
+    {"Database", &DatabaseType}, {"Transaction", &TransactionType},
+    {"Snapshot", &SnapshotType}, {"Values", &ValuesType},
+    {"Keys", &KeysType},         {"Columns", &ColumnsType},
+    {"Edges", &EdgesType},       {NULL, &SpanType},
 };
 
 static char const doc_engines_compiled[] =                         //
@@ -87,6 +92,8 @@ PyMODINIT_FUNC PyInit_lib(void) {
     for (size_t type_index = 0; type_index != types_count; ++type_index)
         if (PyType_Ready(module_types[type_index].type) < 0) return NULL;
 
+    if (ustore_py_uuid_import() != 0) return NULL;
+
     PyObject* const module = PyModule_Create(&module_definition);
     if (!module) return NULL;
 
@@ -99,7 +106,7 @@ PyMODINIT_FUNC PyInit_lib(void) {
 
     if (ustore_py_register_errors(module) < 0) goto failed;
     if (PyModule_AddStringConstant(module, "__version__", USTORE_VERSION) < 0) goto failed;
-    PyObject* const default_edge_id = PyLong_FromLongLong(ustore_default_edge_id_k);
+    PyObject* const default_edge_id = ustore_py_uuid_to_object(&ustore_default_edge_id_k.uuid);
     int const edge_id_added = default_edge_id ? PyModule_AddObjectRef(module, "default_edge_id", default_edge_id) : -1;
     Py_XDECREF(default_edge_id);
     if (edge_id_added < 0) goto failed;

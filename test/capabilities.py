@@ -1,11 +1,14 @@
 """What each engine the extension carries supports, probed once so every suite gates on it at collection.
 
 The extension carries every engine its build enabled, so each case runs once per engine, and a case
-marked as needing a capability skips on the engines that lack it.
+marked as needing a capability skips on the engines that lack it. Suites write integer keys and
+expect them back as the `uuid.UUID` every key is answered as, which `key` and `keys` spell.
 """
 
 import os
 import tempfile
+from collections.abc import Iterable
+from uuid import UUID
 
 import pytest
 
@@ -35,6 +38,17 @@ def probe(engine: str) -> dict[str, bool]:
 
 
 SUPPORTS = {engine: probe(engine) for engine in ENGINES}
+
+
+def key(integer: int) -> UUID:
+    """The `uuid.UUID` an integer key comes back as."""
+    return UUID(int=integer)
+
+
+def keys(integers: Iterable[int]) -> list[UUID]:
+    """The `uuid.UUID` every integer key comes back as, in order."""
+    return [UUID(int=integer) for integer in integers]
+
 
 NEEDS_TRANSACTIONS = pytest.mark.needs("transactions")
 NEEDS_COLLECTIONS = pytest.mark.needs("collections")

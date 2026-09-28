@@ -29,7 +29,7 @@ namespace unum::ustore {
  *  handle to the same collection, inside or outside a transaction. */
 class graph_collection_t {
     ustore_database_t database_ = nullptr;
-    ustore_collection_t collection_ = ustore_collection_main_k;
+    ustore_collection_id_t collection_ = ustore_collection_main_k;
     ustore_transaction_t transaction_ = nullptr;
     ustore_snapshot_t snapshot_ = {};
     any_arena_t arena_;
@@ -39,7 +39,7 @@ class graph_collection_t {
         ustore_collection_drop_t collection_drop {};
         collection_drop.db = database_;
         collection_drop.error = &error;
-        collection_drop.id = collection_;
+        collection_drop.collection = collection_;
         collection_drop.mode = mode;
         ustore_collection_drop(&collection_drop);
         return status_t {error};
@@ -49,7 +49,7 @@ class graph_collection_t {
     using adjacency_range_t = range<graph_stream_t>;
 
     graph_collection_t() noexcept : arena_(nullptr) {}
-    graph_collection_t(ustore_database_t database, ustore_collection_t collection = ustore_collection_main_k,
+    graph_collection_t(ustore_database_t database, ustore_collection_id_t collection = ustore_collection_main_k,
                        ustore_transaction_t transaction = nullptr, ustore_snapshot_t snapshot = {},
                        ustore_arena_t* arena = nullptr) noexcept
         : database_(database), collection_(collection), transaction_(transaction), snapshot_(snapshot),
@@ -60,7 +60,7 @@ class graph_collection_t {
     graph_collection_t(graph_collection_t const&) = delete;
     graph_collection_t& operator=(graph_collection_t const&) = delete;
 
-    ustore_collection_t* member_ptr() noexcept { return &collection_; }
+    ustore_collection_id_t* member_ptr() noexcept { return &collection_; }
 
     status_t upsert_vertices(strided_range<ustore_key_t const> vertices) noexcept {
         ustore_error_t error {};
