@@ -370,6 +370,41 @@ std::size_t database_named_collections(test_config_t const& config) {
     return failures;
 }
 
+/** Threads racing to create one name leave exactly one collection behind, which the name addresses. */
+case_result_t database_named_collections_race(test_config_t const& config) {
+    std::size_t failures = 0;
+    database_t database;
+    failures += expect(open_database(database, config).succeeded());
+    if (failures != 0) return failures;
+    if (!database.supports_collections() || !database.supports_transactions())
+        return case_result_t::skipped("the engine records names without transactions", failures);
+    failures += expect(database.clear().succeeded());
+
+    constexpr std::size_t threads_count = 8;
+    std::atomic<std::size_t> created {0};
+    std::atomic<std::size_t> refused {0};
+    auto task = [&](std::size_t) noexcept {
+        auto [collection, create_status] = database.create("contested");
+        if (create_status.succeeded()) created.fetch_add(1, std::memory_order_relaxed);
+        else if (create_status == status_code_t::already_exists_k) refused.fetch_add(1, std::memory_order_relaxed);
+    };
+    auto maybe_executor = executor_t::make(threads_count, caller_exclusivity_t::caller_inclusive_k);
+    failures += expect(maybe_executor);
+    if (!maybe_executor) return failures;
+    failures += expect(st::succeeded(maybe_executor->for_threads(task)));
+
+    failures += expect_eq(created.load(), 1u);
+    failures += expect_eq(refused.load(), threads_count - 1);
+    context_t context {database, nullptr};
+    auto [collections, list_status] = context.collections();
+    auto [found, find_status] = database.find("contested");
+    failures += expect(list_status.succeeded() && find_status.succeeded());
+    failures += expect_eq(collections.size(), 1u);
+    failures += expect(collections.size() == 1 && ustore_collection_t(found) == collections[0]);
+    failures += expect(database.drop("contested").succeeded());
+    return failures;
+}
+
 /** Lists the names of present collections. */
 case_result_t database_named_collections_list(test_config_t const& config) {
     std::size_t failures = 0;
@@ -1834,6 +1869,7 @@ int main(int argc, char** argv) {
     if (directory) report(totals, "database.persistency", database_persistency, config);
     else report(totals, "database.persistency", case_result_t::skipped(needs_directory_k));
     report(totals, "database.named_collections", database_named_collections, config);
+    report(totals, "database.named_collections_race", database_named_collections_race, config);
     report(totals, "database.named_collections_list", database_named_collections_list, config);
     report(totals, "database.clear_values", database_clear_values, config);
     report(totals, "database.presences", database_presences, config);

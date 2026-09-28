@@ -1,71 +1,26 @@
 //! Collections keyed by variable-length strings - the Rust twin of `include/ustore/strings.h`.
 //!
 //! Names resolve in two phases: a string maps onto a value once through this modality, and every
-//! other call addresses the collection by the identifier that value holds. The reserved catalog of
-//! names is where this crate keeps the binding, so a name never reaches an engine.
+//! other call addresses the collection by the identifier that value holds. The library keeps every
+//! binding in its reserved catalog of names, so a name never reaches an engine.
 
 use std::ffi::c_char;
 use std::marker::PhantomData;
 use std::ptr;
 
 use crate::db::ffi::{
-    ustore_arena_t, ustore_byte_t, ustore_bytes_cptr_t, ustore_char_t, ustore_collection_t, ustore_database_t,
-    ustore_enum_t, ustore_error_t, ustore_length_t, ustore_octet_t, ustore_size_t, ustore_snapshot_t,
-    ustore_str_view_t, ustore_transaction_t,
+    ustore_arena_t, ustore_char_t, ustore_collection_t, ustore_database_t, ustore_enum_t, ustore_error_t,
+    ustore_length_t, ustore_octet_t, ustore_size_t, ustore_snapshot_t, ustore_str_view_t, ustore_transaction_t,
 };
-use crate::db::{check, described_length, fail, first_count, missing_length, Arena, Collection, Result, Status, View};
+use crate::db::{check, described_length, fail, first_count, Arena, Collection, Result, Status, View};
 
 // region: Raw Declarations
 
-/// One-to-one mirror of `include/ustore/strings.h`.
+/// The calls of `include/ustore/strings.h` this crate makes, mirrored field for field.
 mod ffi {
     #![allow(non_camel_case_types)]
 
     use super::*;
-
-    #[repr(C)]
-    pub struct ustore_strings_write_t {
-        pub db: ustore_database_t,
-        pub error: *mut ustore_error_t,
-        pub transaction: ustore_transaction_t,
-        pub arena: *mut ustore_arena_t,
-        pub options: ustore_enum_t,
-        pub tasks_count: ustore_size_t,
-        pub collections: *const ustore_collection_t,
-        pub collections_stride: ustore_size_t,
-        pub strings: *const ustore_str_view_t,
-        pub strings_stride: ustore_size_t,
-        pub strings_lengths: *const ustore_length_t,
-        pub strings_lengths_stride: ustore_size_t,
-        pub values_presences: *const ustore_octet_t,
-        pub values_offsets: *const ustore_length_t,
-        pub values_offsets_stride: ustore_size_t,
-        pub values_lengths: *const ustore_length_t,
-        pub values_lengths_stride: ustore_size_t,
-        pub values: *const ustore_bytes_cptr_t,
-        pub values_stride: ustore_size_t,
-    }
-
-    #[repr(C)]
-    pub struct ustore_strings_read_t {
-        pub db: ustore_database_t,
-        pub error: *mut ustore_error_t,
-        pub transaction: ustore_transaction_t,
-        pub snapshot: ustore_snapshot_t,
-        pub arena: *mut ustore_arena_t,
-        pub options: ustore_enum_t,
-        pub tasks_count: ustore_size_t,
-        pub collections: *const ustore_collection_t,
-        pub collections_stride: ustore_size_t,
-        pub strings: *const ustore_str_view_t,
-        pub strings_stride: ustore_size_t,
-        pub strings_lengths: *const ustore_length_t,
-        pub strings_lengths_stride: ustore_size_t,
-        pub presences: *mut *mut ustore_octet_t,
-        pub offsets: *mut *mut ustore_length_t,
-        pub lengths: *mut *mut ustore_length_t,
-        pub values: *mut *mut ustore_byte_t,
-    }
 
     #[repr(C)]
     pub struct ustore_strings_scan_t {
@@ -94,10 +49,48 @@ mod ffi {
         pub strings: *mut *mut ustore_char_t,
     }
 
+    #[repr(C)]
+    pub struct ustore_named_collections_find_t {
+        pub db: ustore_database_t,
+        pub error: *mut ustore_error_t,
+        pub snapshot: ustore_snapshot_t,
+        pub arena: *mut ustore_arena_t,
+        pub options: ustore_enum_t,
+        pub tasks_count: ustore_size_t,
+        pub names: *const ustore_str_view_t,
+        pub names_stride: ustore_size_t,
+        pub names_lengths: *const ustore_length_t,
+        pub names_lengths_stride: ustore_size_t,
+        pub presences: *mut *mut ustore_octet_t,
+        pub ids: *mut *mut ustore_collection_t,
+        pub modalities: *mut *mut ustore_enum_t,
+    }
+
+    #[repr(C)]
+    pub struct ustore_named_collections_create_t {
+        pub db: ustore_database_t,
+        pub error: *mut ustore_error_t,
+        pub arena: *mut ustore_arena_t,
+        pub name: ustore_str_view_t,
+        pub name_length: ustore_length_t,
+        pub modality: ustore_enum_t,
+        pub id: *mut ustore_collection_t,
+    }
+
+    #[repr(C)]
+    pub struct ustore_named_collections_drop_t {
+        pub db: ustore_database_t,
+        pub error: *mut ustore_error_t,
+        pub arena: *mut ustore_arena_t,
+        pub name: ustore_str_view_t,
+        pub name_length: ustore_length_t,
+    }
+
     extern "C" {
-        pub fn ustore_strings_write(arguments: *mut ustore_strings_write_t);
-        pub fn ustore_strings_read(arguments: *mut ustore_strings_read_t);
         pub fn ustore_strings_scan(arguments: *mut ustore_strings_scan_t);
+        pub fn ustore_named_collections_find(arguments: *mut ustore_named_collections_find_t);
+        pub fn ustore_named_collections_create(arguments: *mut ustore_named_collections_create_t);
+        pub fn ustore_named_collections_drop(arguments: *mut ustore_named_collections_drop_t);
     }
 }
 
@@ -162,106 +155,79 @@ impl<'arena> Names<'arena> {
 
 // region: Names
 
-/// Reads the value a name holds in the catalog, or `None` when nothing answers to it.
-pub(crate) fn read_name<'arena>(view: View<'_>, arena: &'arena mut Arena, name: &str) -> Result<Option<&'arena [u8]>> {
+/// Creates a collection under `name`, which no other collection may carry, answering its identifier.
+pub(crate) fn create_named(database: ustore_database_t, arena: &mut Arena, name: &str) -> Result<Collection> {
     let text = name.as_ptr().cast::<c_char>();
     let text_length = described_length(name.len(), "the name is longer than the ABI can describe")?;
-    let catalog = Collection::names();
-    let mut offsets: *mut ustore_length_t = ptr::null_mut();
-    let mut lengths: *mut ustore_length_t = ptr::null_mut();
-    let mut values: *mut ustore_byte_t = ptr::null_mut();
+    let mut id: ustore_collection_t = 0;
     let mut error = ustore_error_t::default();
-    let mut arguments = ffi::ustore_strings_read_t {
-        db: view.database(),
+    let mut arguments = ffi::ustore_named_collections_create_t {
+        db: database,
         error: &mut error,
-        transaction: view.transaction(),
-        snapshot: view.snapshot(),
         arena: arena.slot(),
-        options: view.options(),
-        tasks_count: 1,
-        collections: &catalog.0,
-        collections_stride: 0,
-        strings: &text,
-        strings_stride: 0,
-        strings_lengths: &text_length,
-        strings_lengths_stride: 0,
-        presences: ptr::null_mut(),
-        offsets: &mut offsets,
-        lengths: &mut lengths,
-        values: &mut values,
+        name: text,
+        name_length: text_length,
+        modality: crate::db::ffi::USTORE_MODALITY_ANY_K,
+        id: &mut id,
     };
-    // SAFETY: the name outlives the call, whose lengths spare it a null terminator, and every
-    // output pointer outlives it too.
-    unsafe { ffi::ustore_strings_read(&mut arguments) };
+    // SAFETY: the name outlives the call, whose length spares it a null terminator, and so does the output.
+    unsafe { ffi::ustore_named_collections_create(&mut arguments) };
     check(error)?;
-    // SAFETY: a successful read exports one length and one offset into the arena, which stays
-    // borrowed for as long as the returned bytes do.
-    unsafe {
-        let length = *lengths;
-        if length == missing_length() {
-            return Ok(None);
-        }
-        let offset = *offsets as usize;
-        Ok(Some(std::slice::from_raw_parts(values.add(offset), length as usize)))
-    }
+    Ok(Collection(id))
 }
 
-/// Binds a name to `value` in the catalog, or unbinds it when no value is given.
-pub(crate) fn write_name(view: View<'_>, arena: &mut Arena, name: &str, value: Option<&[u8]>) -> Result<()> {
+/// Drops the collection `name` addresses, together with the name.
+pub(crate) fn drop_named(database: ustore_database_t, arena: &mut Arena, name: &str) -> Result<()> {
     let text = name.as_ptr().cast::<c_char>();
     let text_length = described_length(name.len(), "the name is longer than the ABI can describe")?;
-    let bytes: ustore_bytes_cptr_t = match value {
-        Some(value) => value.as_ptr(),
-        None => ptr::null(),
-    };
-    let bytes_length = match value {
-        Some(value) => described_length(value.len(), "the value is longer than the ABI can describe")?,
-        None => 0,
-    };
-    let catalog = Collection::names();
     let mut error = ustore_error_t::default();
-    let mut arguments = ffi::ustore_strings_write_t {
-        db: view.database(),
+    let mut arguments = ffi::ustore_named_collections_drop_t {
+        db: database,
         error: &mut error,
-        transaction: view.transaction(),
         arena: arena.slot(),
-        options: view.options(),
-        tasks_count: 1,
-        collections: &catalog.0,
-        collections_stride: 0,
-        strings: &text,
-        strings_stride: 0,
-        strings_lengths: &text_length,
-        strings_lengths_stride: 0,
-        values_presences: ptr::null(),
-        values_offsets: ptr::null(),
-        values_offsets_stride: 0,
-        values_lengths: match value {
-            Some(_) => &bytes_length as *const ustore_length_t,
-            None => ptr::null(),
-        },
-        values_lengths_stride: 0,
-        values: match value {
-            Some(_) => &bytes as *const ustore_bytes_cptr_t,
-            None => ptr::null(),
-        },
-        values_stride: 0,
+        name: text,
+        name_length: text_length,
     };
-    // SAFETY: the name and the value outlive the call, and a null `values` is how the ABI spells
-    // the removal of a name.
-    unsafe { ffi::ustore_strings_write(&mut arguments) };
+    // SAFETY: the name outlives the call, whose length spares it a null terminator.
+    unsafe { ffi::ustore_named_collections_drop(&mut arguments) };
     check(error)
 }
 
 impl View<'_> {
     /// The collection `name` addresses, which [`crate::Database::create_collection`] bound.
+    ///
+    /// Names resolve at the view's snapshot or at the head, never inside a transaction, so a lookup
+    /// never joins the conflicts of the work that follows it.
     pub fn collection(&self, arena: &mut Arena, name: &str) -> Result<Collection> {
-        let stored =
-            read_name(*self, arena, name)?.ok_or(fail(Status::NotFound, "no collection answers to that name"))?;
-        let identifier: [u8; size_of::<ustore_collection_t>()] = stored
-            .try_into()
-            .map_err(|_| fail(Status::Malformed, "the name holds something other than a collection"))?;
-        Ok(Collection(ustore_collection_t::from_ne_bytes(identifier)))
+        let text = name.as_ptr().cast::<c_char>();
+        let text_length = described_length(name.len(), "the name is longer than the ABI can describe")?;
+        let mut presences: *mut ustore_octet_t = ptr::null_mut();
+        let mut ids: *mut ustore_collection_t = ptr::null_mut();
+        let mut error = ustore_error_t::default();
+        let mut arguments = ffi::ustore_named_collections_find_t {
+            db: self.database(),
+            error: &mut error,
+            snapshot: self.snapshot(),
+            arena: arena.slot(),
+            options: 0,
+            tasks_count: 1,
+            names: &text,
+            names_stride: 0,
+            names_lengths: &text_length,
+            names_lengths_stride: 0,
+            presences: &mut presences,
+            ids: &mut ids,
+            modalities: ptr::null_mut(),
+        };
+        // SAFETY: the name outlives the call, whose length spares it a null terminator, and every
+        // output pointer outlives it too.
+        unsafe { ffi::ustore_named_collections_find(&mut arguments) };
+        check(error)?;
+        // SAFETY: a successful lookup exports one presence bit and one identifier into the arena.
+        match unsafe { *presences & 1 } {
+            0 => Err(fail(Status::NotFound, "no collection answers to that name")),
+            _ => Ok(Collection(unsafe { *ids })),
+        }
     }
 
     /// Lists up to `limit` collection names under `prefix`, resuming from `start` where one is given.
@@ -397,31 +363,6 @@ mod tests {
     }
 
     #[test]
-    fn a_name_bound_to_something_else_is_refused() {
-        let database = Database::open_ram(&RAMOptions::default()).unwrap();
-        let mut arena = Arena::new();
-        write_name(database.head(), &mut arena, "people", Some(b"not an identifier")).unwrap();
-        let failure = database.head().collection(&mut arena, "people").unwrap_err();
-        assert_eq!(failure.status, Status::Malformed);
-    }
-
-    #[test]
-    fn names_read_back_what_was_written_under_them() {
-        let database = Database::open_ram(&RAMOptions::default()).unwrap();
-        let mut arena = Arena::new();
-        assert_eq!(read_name(database.head(), &mut arena, "absent").unwrap(), None);
-
-        write_name(database.head(), &mut arena, "present", Some(b"value")).unwrap();
-        assert_eq!(
-            read_name(database.head(), &mut arena, "present").unwrap(),
-            Some(b"value".as_slice())
-        );
-
-        write_name(database.head(), &mut arena, "present", None).unwrap();
-        assert_eq!(read_name(database.head(), &mut arena, "present").unwrap(), None);
-    }
-
-    #[test]
     fn the_catalog_follows_the_view_it_is_read_through() {
         let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
@@ -435,35 +376,33 @@ mod tests {
             Status::NotFound
         );
 
-        // A transaction sees the catalog as the head has it, and its own writes on top.
+        // A transaction resolves names at the head, so a name created after it began is found.
         let mut transaction = database.transaction().unwrap();
+        let planets = database.create_collection(&mut arena, "planets").unwrap();
         assert_eq!(
             transaction
                 .view(Conflicts::Watched)
-                .collection(&mut arena, "people")
+                .collection(&mut arena, "planets")
                 .unwrap(),
-            people
-        );
-        write_name(
-            transaction.view(Conflicts::Watched),
-            &mut arena,
-            "pending",
-            Some(&people.0.to_ne_bytes()),
-        )
-        .unwrap();
-        assert_eq!(
-            transaction
-                .view(Conflicts::Watched)
-                .collection(&mut arena, "pending")
-                .unwrap(),
-            people
-        );
-        assert_eq!(
-            database.head().collection(&mut arena, "pending").unwrap_err().status,
-            Status::NotFound
+            planets
         );
         transaction.commit(Durability::Buffered).unwrap();
-        assert_eq!(database.head().collection(&mut arena, "pending").unwrap(), people);
+    }
+
+    #[test]
+    fn a_taken_name_is_refused_and_a_dropped_one_is_free() {
+        let database = Database::open_ram(&RAMOptions::default()).unwrap();
+        let mut arena = Arena::new();
+        let first = database.create_collection(&mut arena, "people").unwrap();
+        let taken = database.create_collection(&mut arena, "people").unwrap_err();
+        assert_eq!(taken.status, Status::AlreadyExists);
+        database.drop_collection(&mut arena, "people").unwrap();
+        assert_eq!(
+            database.head().collection(&mut arena, "people").unwrap_err().status,
+            Status::NotFound
+        );
+        let second = database.create_collection(&mut arena, "people").unwrap();
+        assert_ne!(first, second);
     }
 }
 

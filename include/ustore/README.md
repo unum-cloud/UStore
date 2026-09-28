@@ -111,7 +111,24 @@ ustore_collection_drop(&drop);
 
 The main collection is never removed, so only `ustore_drop_keys_vals_k` and `ustore_drop_vals_k` apply to it.
 `ustore_collection_list` exports the identifiers of the collections and nothing else.
-A name a caller gives a collection lives in the strings modality, under the reserved `ustore_collection_names_k`, so a name resolves in two phases and no other call carries one.
+
+A name a caller gives a collection lives in the strings modality, under the reserved `ustore_collection_names_k`, beside the `ustore_modality_t` the collection holds, so a name resolves in two phases and no other call carries one.
+`ustore_named_collections_create` creates a collection and records its name in one step, refusing a name another collection carries even under a concurrent creator, and `ustore_named_collections_drop` forgets the name before it drops the collection:
+
+```c
+ustore_collection_t movies = 0;
+ustore_named_collections_create_t create = {
+    .db = db,
+    .error = &error,
+    .arena = &arena,
+    .name = "movies",
+    .modality = ustore_modality_docs_k,
+    .id = &movies,
+};
+ustore_named_collections_create(&create);
+```
+
+`ustore_named_collections_find` resolves a batch of names at the head or at a snapshot, answering each identifier, its modality and whether the name was found.
 
 ### Writes
 

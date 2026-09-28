@@ -565,8 +565,19 @@ static ustore_py_choice_naming_t const drop_namings[] = {
     {NULL, 0},
 };
 
+/** What a collection holds, as a caller spells it. */
+static ustore_py_choice_naming_t const modality_namings[] = {
+    {"any", ustore_modality_any_k},
+    {"blobs", ustore_modality_blobs_k},
+    {"docs", ustore_modality_docs_k},
+    {"graph", ustore_modality_graph_k},
+    {"strings", ustore_modality_strings_k},
+    {"pages", ustore_modality_pages_k},
+    {NULL, 0},
+};
+
 static char const doc_Database_collection_create[] =                                         //
-    "collection_create(name, *, config=None) answers the new collection's identifier.\n"     //
+    "collection_create(name, *, modality='any') answers the new collection's identifier.\n"  //
     "\n"                                                                                     //
     "Creates an empty collection and records the name for it, in the two phases a name\n"    //
     "always resolves through. Every other verb addresses the collection by the identifier\n" //
@@ -574,7 +585,8 @@ static char const doc_Database_collection_create[] =                            
     "\n"                                                                                     //
     "Args:\n"                                                                                //
     "  name (str): The name to record, which must not already be taken.\n"                   //
-    "  config (str, optional): The engine's JSON configuration for this collection.\n"       //
+    "  modality (str): What the collection holds: 'any', 'blobs', 'docs', 'graph',\n"        //
+    "    'strings' or 'pages'.\n"                                                            //
     "Returns:\n"                                                                             //
     "  int: The identifier addressing the new collection.\n"                                 //
     "Raises:\n"                                                                              //
@@ -590,11 +602,14 @@ static PyObject* Database_collection_create(PyObject* self, PyObject* const* arg
                                                                            args_names_tuple, 1);
     if (args_names_count < 0) return NULL;
 
-    PyObject* config_object = Py_None;
+    int modality = ustore_modality_any_k;
     for (Py_ssize_t names_progress = 0, args_progress = positional_args_count; names_progress != args_names_count;
          ++args_progress, ++names_progress) {
         PyObject* const name = PyTuple_GET_ITEM(args_names_tuple, names_progress);
-        if (PyUnicode_CompareWithASCIIString(name, "config") == 0) { config_object = args[args_progress]; }
+        if (PyUnicode_CompareWithASCIIString(name, "modality") == 0) {
+            if (ustore_py_choice_from_object(args[args_progress], "modality", modality_namings, &modality) != 0)
+                return NULL;
+        }
         else {
             PyErr_Format(PyExc_TypeError, "Got unexpected keyword argument: %S", name);
             return NULL;
@@ -613,39 +628,23 @@ static PyObject* Database_collection_create(PyObject* self, PyObject* const* arg
         return NULL;
     }
 
-    ustore_collection_t taken = ustore_collection_main_k;
-    switch (ustore_py_collection_named(&context, name, (size_t)name_length, &taken)) {
-    case ustore_py_naming_failed_k: return NULL;
-    case ustore_py_naming_found_k:
-        ustore_py_raise(ustore_error_already_exists_k, "A collection is already named %R", args[0]);
-        return NULL;
-    case ustore_py_naming_missing_k: break;
-    }
-
-    ustore_str_view_t config = NULL;
-    if (config_object != Py_None) {
-        if (!PyUnicode_Check(config_object)) {
-            PyErr_Format(PyExc_TypeError, "The 'config' option must be a string, got %S", Py_TYPE(config_object));
-            return NULL;
-        }
-        config = PyUnicode_AsUTF8(config_object);
-        if (!config) return NULL;
-    }
-
     ustore_collection_t created = ustore_collection_main_k;
     ustore_error_t error = {0};
-    ustore_collection_create_t create = {0};
+    ustore_arena_t arena = ustore_py_arena_claim(context.database);
+    ustore_named_collections_create_t create = {0};
     create.db = context.database->handle;
     create.error = &error;
-    create.config = config;
+    create.arena = &arena;
+    create.name = name;
+    create.name_length = (ustore_length_t)name_length;
+    create.modality = (ustore_modality_t)modality;
     create.id = &created;
 
     Py_BEGIN_ALLOW_THREADS;
-    ustore_collection_create(&create);
+    ustore_named_collections_create(&create);
     Py_END_ALLOW_THREADS;
+    ustore_py_arena_return(context.database, arena);
     if (ustore_py_raise_on_error(&error) != 0) return NULL;
-
-    if (ustore_py_collection_name(&context, name, (size_t)name_length, &created) != 0) return NULL;
     return PyLong_FromUnsignedLongLong(created);
 }
 
@@ -836,10 +835,31 @@ static PyObject* Database_collection_drop(PyObject* self, PyObject* const* args,
         }
     }
 
+    ustore_error_t error = {0};
+
+    // A named collection that goes takes its name with it, so no name is left addressing nothing.
+    Py_ssize_t length = 0;
+    char const* const name = PyUnicode_Check(args[0]) ? PyUnicode_AsUTF8AndSize(args[0], &length) : NULL;
+    if (PyUnicode_Check(args[0]) && !name) return NULL;
+    if (mode == ustore_drop_keys_vals_handle_k && length != 0) {
+        ustore_arena_t arena = ustore_py_arena_claim(context.database);
+        ustore_named_collections_drop_t drop = {0};
+        drop.db = context.database->handle;
+        drop.error = &error;
+        drop.arena = &arena;
+        drop.name = name;
+        drop.name_length = (ustore_length_t)length;
+
+        Py_BEGIN_ALLOW_THREADS;
+        ustore_named_collections_drop(&drop);
+        Py_END_ALLOW_THREADS;
+        ustore_py_arena_return(context.database, arena);
+        if (ustore_py_raise_on_error(&error) != 0) return NULL;
+        Py_RETURN_NONE;
+    }
+
     ustore_collection_t collection = ustore_collection_main_k;
     if (ustore_py_collection_from_object(&context, args[0], &collection) != 0) return NULL;
-
-    ustore_error_t error = {0};
     ustore_collection_drop_t drop = {0};
     drop.db = context.database->handle;
     drop.error = &error;
@@ -850,14 +870,6 @@ static PyObject* Database_collection_drop(PyObject* self, PyObject* const* args,
     ustore_collection_drop(&drop);
     Py_END_ALLOW_THREADS;
     if (ustore_py_raise_on_error(&error) != 0) return NULL;
-
-    // A handle that is gone leaves its name addressing nothing, so the name goes with it.
-    if (mode == ustore_drop_keys_vals_handle_k && PyUnicode_Check(args[0])) {
-        Py_ssize_t length = 0;
-        char const* const name = PyUnicode_AsUTF8AndSize(args[0], &length);
-        if (!name) return NULL;
-        if (length != 0 && ustore_py_collection_name(&context, name, (size_t)length, NULL) != 0) return NULL;
-    }
     Py_RETURN_NONE;
 }
 

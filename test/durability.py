@@ -66,6 +66,13 @@ def test_a_crash_keeps_whole_transactions(engine: str, tmp_path: Path):
         assert left == right
 
 
+@NEEDS_COLLECTIONS
+def test_a_crash_keeps_the_names_of_collections(engine: str, tmp_path: Path):
+    crash_after(engine, tmp_path, 'database.collection_create("kept", modality="docs")')
+    with open_engine(engine, tmp_path) as database:
+        assert database.collection_contains("kept")
+
+
 @NEEDS_TRANSACTIONS
 def test_a_crash_drops_a_staged_transaction(engine: str, tmp_path: Path):
     crash_after(

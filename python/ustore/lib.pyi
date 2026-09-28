@@ -26,6 +26,7 @@ type PathLikeOrStr = str | bytes | PathLike[str]
 type DataDirectory = PathLikeOrStr | tuple[PathLikeOrStr, int]
 type Isolation = Literal["strict-serializable", "snapshot"]
 type Transport = Literal["automatic", "blocking", "linux-uring", "linux-aio", "linux-spdk"]
+type Modality = Literal["any", "blobs", "docs", "graph", "strings", "pages"]
 
 __version__: str
 default_edge_id: int
@@ -177,7 +178,7 @@ class Database:
     def control(self, request: str) -> str:
         """Sends a free-form request to the engine, such as 'clear', 'compact' or 'usage'."""
 
-    def collection_create(self, name: str, *, config: str | None = None) -> int:
+    def collection_create(self, name: str, *, modality: Modality = "any") -> int:
         """Creates an empty collection and records the name for it."""
 
     def collection_find(self, name: str) -> int:

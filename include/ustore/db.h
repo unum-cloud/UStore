@@ -563,6 +563,29 @@ void ustore_snapshot_drop(ustore_snapshot_drop_t* arguments);
 
 #pragma region Collections
 
+/** What a collection holds, recorded beside its name so a view of another kind is refused. */
+typedef enum ustore_modality_t {
+
+    /** Anything, which the main collection and every collection created without a modality hold. */
+    ustore_modality_any_k = 0,
+
+    /** Binary values of @c blobs.h. */
+    ustore_modality_blobs_k = 1,
+
+    /** JSON documents of @c docs.h. */
+    ustore_modality_docs_k = 2,
+
+    /** Vertices and their edges of @c graph.h. */
+    ustore_modality_graph_k = 3,
+
+    /** Values keyed by strings of @c strings.h. */
+    ustore_modality_strings_k = 4,
+
+    /** Ordered documents of @c pages.h. */
+    ustore_modality_pages_k = 5,
+
+} ustore_modality_t;
+
 /**
  *  @brief The arguments of @c ustore_collection_list, which exports the identifiers of the collections.
  *
@@ -613,8 +636,8 @@ typedef struct ustore_collection_create_t {
     /** Output for the error message. */
     ustore_error_t* error;
 
-    /** Optional configuration as a JSON string. */
-    ustore_str_view_t config;
+    /** What the collection holds, which an engine may lay its storage out for. */
+    ustore_modality_t modality;
 
     /** Output for the identifier of the collection. */
     ustore_collection_t* id;

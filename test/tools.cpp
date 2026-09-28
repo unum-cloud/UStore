@@ -289,25 +289,22 @@ struct json_document_t {
     return !text.empty() && parsed.ec == std::errc {} && parsed.ptr == text.data() + text.size();
 }
 
-/** Whether @p database holds a collection named @p name, which the strings modality resolves. */
+/** Whether @p database holds a collection named @p name. */
 [[nodiscard]] bool lists_collection(ustore_database_t database, char const* name) noexcept {
     ustore_arena_t arena = nullptr;
     ustore_error_t error {};
-    ustore_collection_t const names = ustore_collection_names_k;
-    ustore_str_view_t const text = name;
-    auto const text_length = static_cast<ustore_length_t>(std::strlen(name));
-    ustore_length_t* lengths = nullptr;
-    ustore_strings_read_t read {};
-    read.db = database;
-    read.error = &error;
-    read.arena = &arena;
-    read.tasks_count = 1;
-    read.collections = &names;
-    read.strings = &text;
-    read.strings_lengths = &text_length;
-    read.lengths = &lengths;
-    ustore_strings_read(&read);
-    bool const found = !error.status && lengths[0] == sizeof(ustore_collection_t);
+    ustore_octet_t* presences = nullptr;
+    ustore_collection_t* ids = nullptr;
+    ustore_named_collections_find_t find {};
+    find.db = database;
+    find.error = &error;
+    find.arena = &arena;
+    find.tasks_count = 1;
+    find.names = &name;
+    find.presences = &presences;
+    find.ids = &ids;
+    ustore_named_collections_find(&find);
+    bool const found = !error.status && (presences[0] & 1);
     ustore_arena_free(arena);
     return found;
 }

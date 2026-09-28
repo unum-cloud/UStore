@@ -386,6 +386,128 @@ void push_buckets( //
 
 #pragma endregion Shared Reads
 
+#pragma region Named Collections
+
+/** Bytes of the record a name maps onto: the collection's identifier in bytes @b [0,8), its modality in byte 8. */
+constexpr std::size_t name_record_bytes_k = sizeof(ustore_collection_t) + 1;
+
+/** Times a create retries recording its name, as a transaction conflicts over any other name sharing its bucket. */
+constexpr std::size_t name_record_attempts_k = 16;
+
+/** The record a name maps onto, laid out as @c ustore_collection_names_k stores it. */
+struct name_record_t {
+    ustore_byte_t bytes[name_record_bytes_k] {};
+
+    name_record_t(ustore_collection_t id, ustore_modality_t modality) noexcept {
+        std::memcpy(bytes, &id, sizeof(id));
+        bytes[sizeof(id)] = static_cast<ustore_byte_t>(modality);
+    }
+};
+
+/** Reads the record of @p name at the head, answering whether a collection carries the name at all. */
+bool read_name_record(ustore_database_t database, ustore_transaction_t transaction, std::string_view name,
+                      linked_memory_lock_t& arena, ustore_error_t* error, ustore_collection_t& id) noexcept {
+    ustore_collection_t const names = ustore_collection_names_k;
+    char const* const text = name.data();
+    ustore_length_t const length = static_cast<ustore_length_t>(name.size());
+    ustore_length_t* lengths = nullptr;
+    ustore_byte_t* values = nullptr;
+
+    ustore_strings_read_t read {};
+    read.db = database;
+    read.error = error;
+    read.transaction = transaction;
+    read.arena = arena;
+    read.tasks_count = 1;
+    read.collections = &names;
+    read.strings = &text;
+    read.strings_lengths = &length;
+    read.lengths = &lengths;
+    read.values = &values;
+    ustore_strings_read(&read);
+    if (error->status || lengths[0] == ustore_length_missing_k) return false;
+    if (lengths[0] != name_record_bytes_k) {
+        *error = {ustore_error_malformed_k, "The name holds no collection record"};
+        return false;
+    }
+    std::memcpy(&id, values, sizeof(id));
+    return true;
+}
+
+/** Writes @p record under @p name, or removes the name when @p record is null. */
+void write_name_record(ustore_database_t database, ustore_transaction_t transaction, std::string_view name,
+                       name_record_t const* record, ustore_options_t options, linked_memory_lock_t& arena,
+                       ustore_error_t* error) noexcept {
+    ustore_collection_t const names = ustore_collection_names_k;
+    char const* const text = name.data();
+    ustore_length_t const length = static_cast<ustore_length_t>(name.size());
+    ustore_bytes_cptr_t const value = record ? record->bytes : nullptr;
+    ustore_length_t const value_length = name_record_bytes_k;
+
+    ustore_strings_write_t write {};
+    write.db = database;
+    write.error = error;
+    write.transaction = transaction;
+    write.arena = arena;
+    write.options = options;
+    write.tasks_count = 1;
+    write.collections = &names;
+    write.strings = &text;
+    write.strings_lengths = &length;
+    write.values = record ? &value : nullptr;
+    write.values_lengths = record ? &value_length : nullptr;
+    ustore_strings_write(&write);
+}
+
+/**
+ *  @brief Records @p record under @p name unless another writer took the name first, answering whether it did.
+ *
+ *  The name is read watched and written in one transaction, so a concurrent creator of the same name makes one of
+ *  the two commits conflict. A conflict over another name of the same bucket is retried.
+ */
+bool record_name(ustore_database_t database, std::string_view name, name_record_t const& record,
+                 linked_memory_lock_t& arena, ustore_error_t* error) noexcept {
+    ustore_transaction_t transaction = nullptr;
+    ustore_collection_t taken = ustore_collection_main_k;
+    bool recorded = false;
+    for (std::size_t attempt = 0; !recorded && attempt != name_record_attempts_k; ++attempt) {
+        *error = {};
+        ustore_transaction_init_t init {};
+        init.db = database;
+        init.error = error;
+        init.transaction = &transaction;
+        ustore_transaction_init(&init);
+        if (error->status) break;
+
+        if (read_name_record(database, transaction, name, arena, error, taken)) {
+            *error = {ustore_error_already_exists_k, "Another collection took the name first"};
+            break;
+        }
+        if (error->status) break;
+        write_name_record(database, transaction, name, &record, ustore_options_default_k, arena, error);
+        if (error->status) break;
+
+        ustore_transaction_commit_t commit {};
+        commit.db = database;
+        commit.error = error;
+        commit.transaction = transaction;
+        commit.options = ustore_option_write_flush_k;
+        ustore_transaction_commit(&commit);
+        recorded = !error->status;
+        if (error->status != ustore_error_read_conflict_k && error->status != ustore_error_write_conflict_k) break;
+    }
+    ustore_transaction_free(transaction);
+    return recorded;
+}
+
+/** The name @p text of @p length, whose length a null terminator gives when zero. */
+std::string_view name_of(ustore_str_view_t text, ustore_length_t length) noexcept {
+    if (!text) return {};
+    return {text, length ? length : std::strlen(text)};
+}
+
+#pragma endregion Named Collections
+
 } // namespace unum::ustore
 
 using namespace unum::ustore;
@@ -444,10 +566,11 @@ void ustore_strings_write(ustore_strings_write_t* request) {
     }
     touched = touched.first(touched_count);
 
-    // A transaction watches every bucket it rewrites, whatever the caller asked of its reads
-    ustore_options_t const read_options =
-        request->transaction ? ustore_options_t(request->options & ~ustore_option_transaction_dont_watch_k)
-                             : request->options;
+    // A transaction watches every bucket it rewrites, whatever the caller asked of its reads, and a flush is for the
+    // write that follows, which a read refuses
+    ustore_options_t const read_options = ustore_options_t(
+        request->options & ~ustore_option_write_flush_k &
+        ~(request->transaction ? ustore_option_transaction_dont_watch_k : ustore_options_default_k));
 
     joined_blobs_t stored;
     pull_buckets(request->db, request->transaction, {}, touched, read_options, arena, request->error, stored);
@@ -680,4 +803,141 @@ void ustore_strings_scan(ustore_strings_scan_t* request) {
     offsets[tasks_count] = static_cast<ustore_length_t>(exported_count);
     if (request->strings_offsets) *request->strings_offsets = exported.offsets().begin().get();
     if (request->strings) *request->strings = reinterpret_cast<ustore_char_t*>(exported.contents().begin().get());
+}
+
+void ustore_named_collections_find(ustore_named_collections_find_t* request) {
+    if (!request->tasks_count) return;
+    if (!request->names || !request->ids) {
+        *request->error = {ustore_error_invalid_argument_k, "Need the names and an output for the identifiers"};
+        return;
+    }
+
+    linked_memory_lock_t arena = linked_memory(request->arena, request->options, request->error);
+    if (request->error->status) return;
+
+    ustore_collection_t const names = ustore_collection_names_k;
+    ustore_length_t* offsets = nullptr;
+    ustore_length_t* lengths = nullptr;
+    ustore_byte_t* values = nullptr;
+    ustore_strings_read_t read {};
+    read.db = request->db;
+    read.error = request->error;
+    read.snapshot = request->snapshot;
+    read.arena = arena;
+    read.tasks_count = request->tasks_count;
+    read.collections = &names;
+    read.strings = request->names;
+    read.strings_stride = request->names_stride;
+    read.strings_lengths = request->names_lengths;
+    read.strings_lengths_stride = request->names_lengths_stride;
+    read.offsets = &offsets;
+    read.lengths = &lengths;
+    read.values = &values;
+    ustore_strings_read(&read);
+    if (request->error->status) return;
+
+    std::size_t const count = request->tasks_count;
+    std::span<ustore_collection_t> const ids = arena.alloc<ustore_collection_t>(count, request->error);
+    auto modalities = arena.alloc_or_dummy(count, request->error, request->modalities);
+    auto presences = arena.alloc_or_dummy(count, request->error, request->presences);
+    if (request->error->status) return;
+    for (std::size_t index = 0; index != count; ++index) {
+        bool const present = lengths[index] != ustore_length_missing_k;
+        if (present && lengths[index] != name_record_bytes_k) {
+            *request->error = {ustore_error_malformed_k, "A name holds no collection record"};
+            return;
+        }
+        ids[index] = ustore_collection_main_k;
+        modalities[index] = ustore_modality_any_k;
+        presences[index] = present;
+        if (!present) continue;
+        std::memcpy(&ids[index], values + offsets[index], sizeof(ustore_collection_t));
+        modalities[index] = static_cast<ustore_modality_t>(values[offsets[index] + sizeof(ustore_collection_t)]);
+    }
+    *request->ids = ids.data();
+}
+
+void ustore_named_collections_create(ustore_named_collections_create_t* request) {
+    std::string_view const name = name_of(request->name, request->name_length);
+    if (name.empty()) {
+        *request->error = {ustore_error_invalid_argument_k, "The main collection has no name and always exists"};
+        return;
+    }
+    if (!request->id) {
+        *request->error = {ustore_error_invalid_argument_k, "Need an output for the collection"};
+        return;
+    }
+
+    linked_memory_lock_t arena = linked_memory(request->arena, ustore_options_default_k, request->error);
+    if (request->error->status) return;
+
+    ustore_collection_t id = ustore_collection_main_k;
+    if (read_name_record(request->db, nullptr, name, arena, request->error, id)) {
+        *request->error = {ustore_error_already_exists_k, "A collection already carries the name"};
+        return;
+    }
+    if (request->error->status) return;
+
+    ustore_collection_create_t create {};
+    create.db = request->db;
+    create.error = request->error;
+    create.modality = request->modality;
+    create.id = &id;
+    ustore_collection_create(&create);
+    if (request->error->status) return;
+
+    ustore_capabilities_t capabilities {};
+    ustore_database_capabilities_t query {};
+    query.db = request->db;
+    query.error = request->error;
+    query.capabilities = &capabilities;
+    ustore_database_capabilities(&query);
+
+    name_record_t const record {id, request->modality};
+    bool recorded = false;
+    if (request->error->status == ustore_success_k && (capabilities & ustore_supports_transactions_k))
+        recorded = record_name(request->db, name, record, arena, request->error);
+    else if (request->error->status == ustore_success_k) {
+        write_name_record(request->db, nullptr, name, &record, ustore_option_write_flush_k, arena, request->error);
+        recorded = request->error->status == ustore_success_k;
+    }
+    if (recorded) {
+        *request->id = id;
+        return;
+    }
+
+    // The collection no name addresses would be unreachable, so it goes, while the error that stopped the name stays
+    ustore_error_t dropped {};
+    ustore_collection_drop_t drop {};
+    drop.db = request->db;
+    drop.error = &dropped;
+    drop.id = id;
+    drop.mode = ustore_drop_keys_vals_handle_k;
+    ustore_collection_drop(&drop);
+}
+
+void ustore_named_collections_drop(ustore_named_collections_drop_t* request) {
+    std::string_view const name = name_of(request->name, request->name_length);
+    if (name.empty()) {
+        *request->error = {ustore_error_invalid_argument_k, "The main collection has no name and is never dropped"};
+        return;
+    }
+
+    linked_memory_lock_t arena = linked_memory(request->arena, ustore_options_default_k, request->error);
+    if (request->error->status) return;
+
+    ustore_collection_t id = ustore_collection_main_k;
+    if (!read_name_record(request->db, nullptr, name, arena, request->error, id)) {
+        if (!request->error->status) *request->error = {ustore_error_not_found_k, "No collection carries the name"};
+        return;
+    }
+    write_name_record(request->db, nullptr, name, nullptr, ustore_option_write_flush_k, arena, request->error);
+    if (request->error->status) return;
+
+    ustore_collection_drop_t drop {};
+    drop.db = request->db;
+    drop.error = request->error;
+    drop.id = id;
+    drop.mode = ustore_drop_keys_vals_handle_k;
+    ustore_collection_drop(&drop);
 }

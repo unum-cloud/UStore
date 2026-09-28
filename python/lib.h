@@ -721,17 +721,6 @@ ustore_py_naming_t ustore_py_collection_named(ustore_py_context_t const* context
                                               ustore_collection_t* collection);
 
 /**
- *  @brief Records that @p name addresses @p collection, or removes the name when none is given.
- *  @param[in] context The database and view to write through.
- *  @param[in] name The name's bytes, which need no null terminator.
- *  @param[in] length The name's length in bytes.
- *  @param[in] collection The identifier to record, or NULL to forget the name.
- *  @return 0 on success, -1 with an exception set otherwise.
- */
-int ustore_py_collection_name(ustore_py_context_t const* context, char const* name, size_t length,
-                              ustore_collection_t const* collection);
-
-/**
  *  @brief Reads the collection an argument names, accepting an identifier, a name, or @c None.
  *  @param[in] context The database and view to resolve a name against.
  *  @param[in] object The collection, as an integer identifier, a string name, or @c None for the main one.

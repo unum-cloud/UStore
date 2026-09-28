@@ -14,31 +14,26 @@
 
 ustore_py_naming_t ustore_py_collection_named(ustore_py_context_t const* context, char const* name, size_t length,
                                               ustore_collection_t* collection) {
-    ustore_collection_t const names = ustore_collection_names_k;
     ustore_length_t const name_length = (ustore_length_t)length;
-    ustore_length_t* offsets = NULL;
-    ustore_length_t* lengths = NULL;
-    ustore_byte_t* values = NULL;
+    ustore_octet_t* presences = NULL;
+    ustore_collection_t* ids = NULL;
     ustore_error_t error = {0};
     ustore_arena_t arena = ustore_py_arena_claim(context->database);
 
-    ustore_strings_read_t read = {0};
-    read.db = context->database->handle;
-    read.error = &error;
-    read.transaction = context->transaction;
-    read.snapshot = context->snapshot;
-    read.arena = &arena;
-    read.options = context->options;
-    read.tasks_count = 1;
-    read.collections = &names;
-    read.strings = &name;
-    read.strings_lengths = &name_length;
-    read.offsets = &offsets;
-    read.lengths = &lengths;
-    read.values = &values;
+    // Names resolve at the head or at the context's snapshot, so a transaction never watches the lookup.
+    ustore_named_collections_find_t find = {0};
+    find.db = context->database->handle;
+    find.error = &error;
+    find.snapshot = context->snapshot;
+    find.arena = &arena;
+    find.tasks_count = 1;
+    find.names = &name;
+    find.names_lengths = &name_length;
+    find.presences = &presences;
+    find.ids = &ids;
 
     Py_BEGIN_ALLOW_THREADS;
-    ustore_strings_read(&read);
+    ustore_named_collections_find(&find);
     Py_END_ALLOW_THREADS;
 
     // An engine without collections of its own refuses the reserved collection outright, which is
@@ -48,43 +43,13 @@ ustore_py_naming_t ustore_py_collection_named(ustore_py_context_t const* context
         ustore_py_raise_on_error(&error);
         verdict = ustore_py_naming_failed_k;
     }
-    else if (error.status == ustore_success_k && lengths[0] == sizeof(ustore_collection_t)) {
-        memcpy(collection, values + offsets[0], sizeof(ustore_collection_t));
+    else if (error.status == ustore_success_k && (presences[0] & 1)) {
+        *collection = ids[0];
         verdict = ustore_py_naming_found_k;
     }
 
     ustore_py_arena_return(context->database, arena);
     return verdict;
-}
-
-int ustore_py_collection_name(ustore_py_context_t const* context, char const* name, size_t length,
-                              ustore_collection_t const* collection) {
-    ustore_collection_t const names = ustore_collection_names_k;
-    ustore_length_t const name_length = (ustore_length_t)length;
-    ustore_bytes_cptr_t const value = (ustore_bytes_cptr_t)collection;
-    ustore_length_t const value_length = sizeof(ustore_collection_t);
-    ustore_error_t error = {0};
-    ustore_arena_t arena = ustore_py_arena_claim(context->database);
-
-    ustore_strings_write_t write = {0};
-    write.db = context->database->handle;
-    write.error = &error;
-    write.transaction = context->transaction;
-    write.arena = &arena;
-    write.options = context->options;
-    write.tasks_count = 1;
-    write.collections = &names;
-    write.strings = &name;
-    write.strings_lengths = &name_length;
-    write.values = collection ? &value : NULL;
-    write.values_lengths = collection ? &value_length : NULL;
-
-    Py_BEGIN_ALLOW_THREADS;
-    ustore_strings_write(&write);
-    Py_END_ALLOW_THREADS;
-
-    ustore_py_arena_return(context->database, arena);
-    return ustore_py_raise_on_error(&error);
 }
 
 int ustore_py_collection_from_object(ustore_py_context_t const* context, PyObject* object,

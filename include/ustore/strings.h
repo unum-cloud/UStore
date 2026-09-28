@@ -6,7 +6,8 @@
  *
  *  Names resolve in two phases: a caller maps a string onto a value once through this modality, then
  *  addresses collections and entries by the identifier that value holds, so no other call carries a name.
- *  A value is arbitrary bytes, so a collection identifier is simply sixteen of them.
+ *  The names of collections live in @c ustore_collection_names_k, each mapped onto its collection's
+ *  identifier and one byte of its @c ustore_modality_t, and the named-collection calls below keep them.
  *
  *  A string maps onto a key of its leading @c sizeof(ustore_key_t) minus one bytes, zero-padded, followed
  *  by its length, so a string that fits those bytes orders exactly as its text. A longer string takes the
@@ -257,6 +258,137 @@ typedef struct ustore_strings_scan_t {
 void ustore_strings_scan(ustore_strings_scan_t* arguments);
 
 #pragma endregion Scans
+
+#pragma region Named Collections
+
+/**
+ *  @brief The arguments of @c ustore_named_collections_find, which reads the collections a batch of names address.
+ *
+ *  Names are read at the head of the database or at a snapshot, never inside a transaction, so resolving a name
+ *  never joins the conflicts of the work that follows it. A name no collection carries answers
+ *  @c ustore_collection_main_k, @c ustore_modality_any_k and an unset presence bit.
+ */
+typedef struct ustore_named_collections_find_t {
+
+    /** An open database. */
+    ustore_database_t db;
+
+    /** Output for the error message. */
+    ustore_error_t* error;
+
+    /** Snapshot whose names are read, or zero for the head. */
+    ustore_snapshot_t snapshot;
+
+    /** Reusable memory for the results. */
+    ustore_arena_t* arena;
+
+    /** Accepts @c ustore_option_dont_discard_memory_k. */
+    ustore_options_t options;
+
+    /** Number of tasks, one per name. */
+    ustore_size_t tasks_count;
+
+    /** Names to resolve, @c NULL only when there are no tasks. */
+    ustore_str_view_t const* names;
+
+    /** Bytes between consecutive name pointers, where zero repeats the first one. */
+    ustore_size_t names_stride;
+
+    /** Optional lengths of the names, inferred from null terminators when absent. */
+    ustore_length_t const* names_lengths;
+
+    /** Bytes between consecutive name lengths, where zero repeats the first one. */
+    ustore_size_t names_lengths_stride;
+
+    /** Optional output for a bitset of at least @c tasks_count bits marking the names a collection carries,
+     *  addressed as Apache Arrow does. */
+    ustore_octet_t** presences;
+
+    /** Output for the identifiers of the collections the names address. */
+    ustore_collection_t** ids;
+
+    /** Optional output for what the collections hold. */
+    ustore_modality_t** modalities;
+
+} ustore_named_collections_find_t;
+
+/**
+ *  @brief Reads the collections a batch of names address.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ */
+void ustore_named_collections_find(ustore_named_collections_find_t* arguments);
+
+/**
+ *  @brief The arguments of @c ustore_named_collections_create, which creates one collection under a new name.
+ *
+ *  Runs at the head of the database. The name is recorded in a transaction of its own and flushed with it, so it
+ *  survives a crash beside the collection it addresses, and a name another writer takes first fails the call with
+ *  @c ustore_error_already_exists_k, dropping the collection again. An engine without transactions records the
+ *  name with a flushed write instead, which leaves two concurrent creators of one name to the last of them.
+ */
+typedef struct ustore_named_collections_create_t {
+
+    /** An open database. */
+    ustore_database_t db;
+
+    /** Output for the error message. */
+    ustore_error_t* error;
+
+    /** Reusable memory for intermediate results. */
+    ustore_arena_t* arena;
+
+    /** The name, which must not be empty, as the main collection has none. */
+    ustore_str_view_t name;
+
+    /** Optional length of the name, inferred from a null terminator when zero. */
+    ustore_length_t name_length;
+
+    /** What the collection holds. */
+    ustore_modality_t modality;
+
+    /** Output for the identifier of the created collection. */
+    ustore_collection_t* id;
+
+} ustore_named_collections_create_t;
+
+/**
+ *  @brief Creates a collection and records its name.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ */
+void ustore_named_collections_create(ustore_named_collections_create_t* arguments);
+
+/**
+ *  @brief The arguments of @c ustore_named_collections_drop, which drops one collection together with its name.
+ *
+ *  Runs at the head of the database. The name goes first, flushed, so a crash never leaves it addressing a
+ *  collection that is gone, only a collection without a name.
+ */
+typedef struct ustore_named_collections_drop_t {
+
+    /** An open database. */
+    ustore_database_t db;
+
+    /** Output for the error message. */
+    ustore_error_t* error;
+
+    /** Reusable memory for intermediate results. */
+    ustore_arena_t* arena;
+
+    /** The name of the collection to drop. */
+    ustore_str_view_t name;
+
+    /** Optional length of the name, inferred from a null terminator when zero. */
+    ustore_length_t name_length;
+
+} ustore_named_collections_drop_t;
+
+/**
+ *  @brief Drops a collection and forgets its name.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ */
+void ustore_named_collections_drop(ustore_named_collections_drop_t* arguments);
+
+#pragma endregion Named Collections
 
 #ifdef __cplusplus
 }

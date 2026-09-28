@@ -34,7 +34,8 @@ pub(crate) mod ffi {
     pub type ustore_bytes_cptr_t = *const u8;
 
     /// The `ustore_status_t`, `ustore_options_t`, `ustore_drop_mode_t`, `ustore_capabilities_t`,
-    /// `ustore_isolation_t` and `ustore_transport_t` enumerations, each of which lowers to the platform `int`.
+    /// `ustore_isolation_t`, `ustore_transport_t` and `ustore_modality_t` enumerations, each of which lowers to the
+    /// platform `int`.
     pub type ustore_enum_t = c_int;
 
     pub const USTORE_ISOLATION_STRICT_SERIALIZABLE_K: ustore_enum_t = 0;
@@ -45,6 +46,8 @@ pub(crate) mod ffi {
     pub const USTORE_TRANSPORT_LINUX_URING_K: ustore_enum_t = 2;
     pub const USTORE_TRANSPORT_LINUX_AIO_K: ustore_enum_t = 3;
     pub const USTORE_TRANSPORT_LINUX_SPDK_K: ustore_enum_t = 4;
+
+    pub const USTORE_MODALITY_ANY_K: ustore_enum_t = 0;
 
     pub const USTORE_OPTIONS_DEFAULT_K: ustore_enum_t = 0;
     pub const USTORE_OPTION_WRITE_FLUSH_K: ustore_enum_t = 1 << 1;
@@ -193,14 +196,6 @@ pub(crate) mod ffi {
     }
 
     #[repr(C)]
-    pub struct ustore_collection_create_t {
-        pub db: ustore_database_t,
-        pub error: *mut ustore_error_t,
-        pub config: ustore_str_view_t,
-        pub id: *mut ustore_collection_t,
-    }
-
-    #[repr(C)]
     pub struct ustore_collection_drop_t {
         pub db: ustore_database_t,
         pub error: *mut ustore_error_t,
@@ -254,7 +249,6 @@ pub(crate) mod ffi {
         pub fn ustore_snapshot_drop(arguments: *mut ustore_snapshot_drop_t);
 
         pub fn ustore_collection_list(arguments: *mut ustore_collection_list_t);
-        pub fn ustore_collection_create(arguments: *mut ustore_collection_create_t);
         pub fn ustore_collection_drop(arguments: *mut ustore_collection_drop_t);
 
         pub fn ustore_transaction_init(arguments: *mut ustore_transaction_init_t);
@@ -1014,29 +1008,12 @@ impl Database {
 
     /// Creates an empty collection and binds `name` to it, refusing a name already in use.
     pub fn create_collection(&self, arena: &mut Arena, name: &str) -> Result<Collection> {
-        if crate::strings::read_name(self.head(), arena, name)?.is_some() {
-            return Err(fail(Status::AlreadyExists, "a collection already answers to that name"));
-        }
-        let mut id: ffi::ustore_collection_t = 0;
-        let mut error = ffi::ustore_error_t::default();
-        let mut arguments = ffi::ustore_collection_create_t {
-            db: self.handle,
-            error: &mut error,
-            config: ptr::null(),
-            id: &mut id,
-        };
-        // SAFETY: every pointer in `arguments` outlives the call.
-        unsafe { ffi::ustore_collection_create(&mut arguments) };
-        check(error)?;
-        crate::strings::write_name(self.head(), arena, name, Some(&id.to_ne_bytes()))?;
-        Ok(Collection(id))
+        crate::strings::create_named(self.handle, arena, name)
     }
 
     /// Drops the collection `name` addresses, together with its contents and its name.
     pub fn drop_collection(&self, arena: &mut Arena, name: &str) -> Result<()> {
-        let collection = self.head().collection(arena, name)?;
-        self.clear_collection(collection, Removed::CollectionAndEntries)?;
-        crate::strings::write_name(self.head(), arena, name, None)
+        crate::strings::drop_named(self.handle, arena, name)
     }
 
     /// Removes the contents of a collection, or the collection itself, keeping every name bound.

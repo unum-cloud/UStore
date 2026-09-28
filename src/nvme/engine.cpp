@@ -1187,9 +1187,7 @@ void collection_create(ustore_collection_create_t& arguments) noexcept {
     }
 
     opened_database_t& database = database_of(arguments.db);
-    user_collection_config_t shape = database.collection_defaults;
-    if (arguments.config && arguments.config[0] != '\0')
-        if (reported_failure(parse_config(std::string_view {arguments.config}, shape), arguments.error)) return;
+    user_collection_config_t const& shape = database.collection_defaults;
 
     // A collection is addressed by its number, so this name never leaves the engine and only has to be free.
     char name[collection_name_max_bytes_k];

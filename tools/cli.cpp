@@ -7,7 +7,6 @@
 
 #include <cstddef> // `std::size_t`
 #include <cstdio>  // `stderr`
-#include <cstring> // `std::memcpy`, `std::strlen`
 
 #if defined(_WIN32)
 #include <io.h> // `_isatty`, `_fileno`
@@ -205,65 +204,41 @@ void find_collection(ustore_database_t db, std::string_view name, ustore_collect
         return;
     }
     ustore_arena_t arena = nullptr;
-    ustore_collection_t const names = ustore_collection_names_k;
     ustore_str_view_t const text = name.data();
     auto const text_length = static_cast<ustore_length_t>(name.size());
-    ustore_length_t* offsets = nullptr;
-    ustore_length_t* lengths = nullptr;
-    ustore_byte_t* values = nullptr;
-    ustore_strings_read_t read {};
-    read.db = db;
-    read.error = error;
-    read.arena = &arena;
-    read.tasks_count = 1;
-    read.collections = &names;
-    read.strings = &text;
-    read.strings_lengths = &text_length;
-    read.offsets = &offsets;
-    read.lengths = &lengths;
-    read.values = &values;
-    ustore_strings_read(&read);
+    ustore_octet_t* presences = nullptr;
+    ustore_collection_t* ids = nullptr;
+    ustore_named_collections_find_t find {};
+    find.db = db;
+    find.error = error;
+    find.arena = &arena;
+    find.tasks_count = 1;
+    find.names = &text;
+    find.names_lengths = &text_length;
+    find.presences = &presences;
+    find.ids = &ids;
+    ustore_named_collections_find(&find);
     if (!error->status) {
-        if (lengths[0] != sizeof(ustore_collection_t)) *error = {ustore_error_not_found_k, "No such collection"};
-        else std::memcpy(&id, values + offsets[0], sizeof(id));
+        if (!(presences[0] & 1)) *error = {ustore_error_not_found_k, "No such collection"};
+        else id = ids[0];
     }
-    ustore_arena_free(arena);
-}
-
-/** Records that @p name addresses @p collection, or removes the name when no collection is given. */
-void name_collection(ustore_database_t db, std::string_view name, ustore_collection_t const* collection,
-                     ustore_error_t* error) noexcept {
-    ustore_arena_t arena = nullptr;
-    ustore_collection_t const names = ustore_collection_names_k;
-    ustore_str_view_t const text = name.data();
-    auto const text_length = static_cast<ustore_length_t>(name.size());
-    auto const value = reinterpret_cast<ustore_bytes_cptr_t>(collection);
-    ustore_length_t const value_length = sizeof(ustore_collection_t);
-    ustore_strings_write_t write {};
-    write.db = db;
-    write.error = error;
-    write.arena = &arena;
-    write.tasks_count = 1;
-    write.collections = &names;
-    write.strings = &text;
-    write.strings_lengths = &text_length;
-    write.values = collection ? &value : nullptr;
-    write.values_lengths = collection ? &value_length : nullptr;
-    ustore_strings_write(&write);
     ustore_arena_free(arena);
 }
 
 /** Creates a collection and records @p name for it. */
 [[nodiscard]] bool create_collection(ustore_database_t db, std::string_view name) noexcept {
     ustore_error_t error {};
+    ustore_arena_t arena = nullptr;
     ustore_collection_t id = 0;
-    ustore_collection_create_t create {};
+    ustore_named_collections_create_t create {};
     create.db = db;
     create.error = &error;
-    create.config = "";
+    create.arena = &arena;
+    create.name = name.data();
+    create.name_length = static_cast<ustore_length_t>(name.size());
     create.id = &id;
-    ustore_collection_create(&create);
-    if (!error.status) name_collection(db, name, &id, &error);
+    ustore_named_collections_create(&create);
+    ustore_arena_free(arena);
     if (error.status) {
         print_failure("Failed to create the collection", error);
         return false;
@@ -275,17 +250,15 @@ void name_collection(ustore_database_t db, std::string_view name, ustore_collect
 /** Drops the collection @p name addresses and forgets the name. */
 [[nodiscard]] bool drop_collection(ustore_database_t db, std::string_view name) noexcept {
     ustore_error_t error {};
-    ustore_collection_t id = 0;
-    find_collection(db, name, id, &error);
-    if (!error.status) {
-        ustore_collection_drop_t drop {};
-        drop.db = db;
-        drop.error = &error;
-        drop.id = id;
-        drop.mode = ustore_drop_keys_vals_handle_k;
-        ustore_collection_drop(&drop);
-    }
-    if (!error.status) name_collection(db, name, nullptr, &error);
+    ustore_arena_t arena = nullptr;
+    ustore_named_collections_drop_t drop {};
+    drop.db = db;
+    drop.error = &error;
+    drop.arena = &arena;
+    drop.name = name.data();
+    drop.name_length = static_cast<ustore_length_t>(name.size());
+    ustore_named_collections_drop(&drop);
+    ustore_arena_free(arena);
     if (error.status) {
         print_failure("Failed to drop the collection", error);
         return false;

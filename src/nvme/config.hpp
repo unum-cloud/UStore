@@ -2,22 +2,19 @@
  *  @file src/nvme/config.hpp
  *  @author Ash Vardanian
  *  @date July 10, 2023
- *  @brief Configurations and on-disk schemas of UStoreNVMe, read, validated and written as JSON through yyjson.
+ *  @brief Configurations of UStoreNVMe and their validation, and its on-disk schemas, kept as JSON through yyjson.
  */
 #pragma once
 
-#include <cmath>   // `std::isfinite`
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint8_t`, `std::int64_t`
 #include <cstring> // `std::memcmp`
 
-#include <algorithm>    // `std::clamp`, `std::max`, `std::min`
-#include <charconv>     // `std::from_chars`
-#include <concepts>     // `std::invocable`, `std::same_as`, `std::unsigned_integral`
-#include <limits>       // `std::numeric_limits`
-#include <string_view>  // `std::string_view`
-#include <system_error> // `std::errc`
-#include <utility>      // `std::forward`, `std::move`
+#include <algorithm>   // `std::clamp`, `std::max`, `std::min`
+#include <concepts>    // `std::invocable`, `std::same_as`, `std::unsigned_integral`
+#include <limits>      // `std::numeric_limits`
+#include <string_view> // `std::string_view`
+#include <utility>     // `std::forward`, `std::move`
 
 #include <fmt/format.h>
 #include <yyjson.h>
@@ -69,7 +66,7 @@ enum class io_transport_t : std::uint8_t {
 };
 
 /**
- *  @brief Budgets and directories every collection of one database shares, named as in the JSON document.
+ *  @brief Budgets and directories every collection of one database shares, as the NVMe init call names them.
  *
  *  Zero @c threads leaves the count to @c derived_background_threads when the database opens.
  */
@@ -90,7 +87,7 @@ struct resources_config_t {
     return std::clamp<std::size_t>(logical_cores_count / 2, 1, 8);
 }
 
-/** Limits of one collection, named as in the JSON document. */
+/** Limits of one collection, which the @c collection_* fields of the NVMe init call set. */
 struct user_collection_config_t {
     std::size_t concurrency_limit = 32;
     std::size_t cache_limit = 100 * 1024 * 1024ull;
@@ -129,7 +126,7 @@ struct collection_config_t {
     std::size_t write_buffer_max_elements = 0;
 };
 
-/** Write buffer limits of one transaction, named @c transaction_max_* in the JSON document. */
+/** Write buffer limits of one transaction, which the @c transaction_max_* fields of the NVMe init call set. */
 struct transaction_config_t {
     std::size_t write_buffer_max_bytes = 0;
     std::size_t write_buffer_max_elements = 0;
@@ -146,8 +143,7 @@ struct database_config_t {
     transaction_config_t default_transaction {100 * 1024 * 1024ull, 100'000};
 };
 
-/** Limits of one single-collection database, read from the same flat JSON document as its collection and
- *  transactions. */
+/** Limits of one single-collection database: its collection and its transactions. */
 struct user_single_collection_database_config_t {
     user_collection_config_t collection;
     transaction_config_t default_transaction {100 * 1024 * 1024ull, 100'000};
@@ -340,49 +336,11 @@ inline std::string_view json_string_view(yyjson_val* value) noexcept {
     return yyjson_is_str(value) ? std::string_view {yyjson_get_str(value), yyjson_get_len(value)} : std::string_view {};
 }
 
-/** Parses a byte volume such as "512", "4KB" or "1.5 GB"; a fraction needs a unit of kilobytes or more. */
-[[nodiscard]] inline bool parse_bytes(std::string_view text, std::size_t& bytes) noexcept {
-    if (text.empty()) {
-        bytes = 0;
-        return true;
-    }
-    if (text.front() < '0' || text.front() > '9') return false;
-
-    double number = 0.0;
-    auto const [number_end, error] = std::from_chars(text.data(), text.data() + text.size(), number);
-    if (error != std::errc {} || !std::isfinite(number)) return false;
-    std::string_view const digits = text.substr(0, number_end - text.data());
-    bool const is_fraction = digits.find('.') != std::string_view::npos;
-
-    std::string_view unit = text.substr(digits.size());
-    while (!unit.empty() && unit.front() == ' ') unit.remove_prefix(1);
-    double multiplier = 1.0;
-    if (unit == "KB") multiplier = 1024.0;
-    else if (unit == "MB") multiplier = 1024.0 * 1024.0;
-    else if (unit == "GB") multiplier = 1024.0 * 1024.0 * 1024.0;
-    else if (unit == "TB") multiplier = 1024.0 * 1024.0 * 1024.0 * 1024.0;
-    else if ((!unit.empty() && unit != "B") || is_fraction) return false;
-
-    double const scaled = number * multiplier;
-    if (scaled >= static_cast<double>(std::numeric_limits<std::size_t>::max())) return false;
-    bytes = static_cast<std::size_t>(scaled);
-    return true;
-}
-
 /** Reads an unsigned number that fits @p value_. */
 template <std::unsigned_integral value_>
 [[nodiscard]] bool read_json(yyjson_val* value, value_& number) noexcept {
     if (!yyjson_is_uint(value) || yyjson_get_uint(value) > std::numeric_limits<value_>::max()) return false;
     number = static_cast<value_>(yyjson_get_uint(value));
-    return true;
-}
-
-/** Reads a GPU device index, which is either non-negative or -1. */
-[[nodiscard]] inline bool read_json(yyjson_val* value, int& device) noexcept {
-    if (yyjson_is_uint(value) && yyjson_get_uint(value) <= std::uint64_t(std::numeric_limits<int>::max()))
-        device = static_cast<int>(yyjson_get_uint(value));
-    else if (yyjson_is_sint(value) && yyjson_get_sint(value) == -1) device = -1;
-    else return false;
     return true;
 }
 
@@ -422,19 +380,6 @@ template <std::unsigned_integral value_>
     return true;
 }
 
-/** Reads an I/O transport from its name. */
-[[nodiscard]] inline bool read_json(yyjson_val* value, io_transport_t& io_transport) noexcept {
-    std::string_view const name = json_string_view(value);
-    if (name == "automatic") io_transport = io_transport_t::automatic_k;
-    else if (name == "blocking") io_transport = io_transport_t::blocking_k;
-    else if (name == "linux-uring") io_transport = io_transport_t::linux_uring_k;
-    else if (name == "linux-aio") io_transport = io_transport_t::linux_aio_k;
-    else if (name == "linux-spdk") io_transport = io_transport_t::linux_spdk_k;
-    else if (name == "memory") io_transport = io_transport_t::memory_k;
-    else return false;
-    return true;
-}
-
 /** Reads an array, replacing the elements of @p elements. */
 template <typename element_, template <typename> typename allocator_>
 [[nodiscard]] bool read_json(yyjson_val* array, st::basic_vector<element_, allocator_<element_>>& elements) noexcept {
@@ -451,32 +396,6 @@ template <typename element_, template <typename> typename allocator_>
     return true;
 }
 
-/** Reads the member @p key of @p object into @p value, keeping @p value when the member is absent. */
-template <typename value_>
-[[nodiscard]] bool read_json_if_present(yyjson_val* object, char const* key, value_& value) noexcept {
-    yyjson_val* const member = yyjson_obj_get(object, key);
-    return !member || read_json(member, value);
-}
-
-/** Reads a byte volume given as a number or as text such as "1.5 GB", keeping @p value when absent. */
-template <std::unsigned_integral value_>
-[[nodiscard]] bool read_json_bytes_if_present(yyjson_val* object, char const* key, value_& value) noexcept {
-    yyjson_val* const member = yyjson_obj_get(object, key);
-    if (!member) return true;
-    std::size_t bytes = 0;
-    if (yyjson_is_uint(member)) bytes = static_cast<std::size_t>(yyjson_get_uint(member));
-    else if (!yyjson_is_str(member) || !parse_bytes(json_string_view(member), bytes)) return false;
-    if (bytes > std::numeric_limits<value_>::max()) return false;
-    value = static_cast<value_>(bytes);
-    return true;
-}
-
-/** Reads a data directory, whose path is required and whose byte volume is optional. */
-[[nodiscard]] inline bool read_json(yyjson_val* object, data_directory_config_t& directory) noexcept {
-    return read_json(yyjson_obj_get(object, "path"), directory.path) && !directory.path.empty() &&
-           read_json_bytes_if_present(object, "max_size", directory.max_size);
-}
-
 /** Checks the @c version member of a document against @c format_version_k. */
 inline status_t read_json_version(yyjson_val* root) noexcept {
     yyjson_val* const version = yyjson_obj_get(root, "version");
@@ -484,103 +403,6 @@ inline status_t read_json_version(yyjson_val* root) noexcept {
     if (json_string_view(version) != format_version_k)
         return status_t {status_code_t::unsupported_k, "Version not supported"};
     return status_t {};
-}
-
-/** Reads the collection keys of a flat configuration document. */
-[[nodiscard]] inline bool read_json_members(yyjson_val* root, user_collection_config_t& config) noexcept {
-    return read_json_if_present(root, "concurrency_limit", config.concurrency_limit) &&
-           read_json_bytes_if_present(root, "cache_limit", config.cache_limit) &&
-           read_json_if_present(root, "write_buffer_max_elements", config.write_buffer_max_elements) &&
-           read_json_bytes_if_present(root, "write_buffer_max_bytes", config.write_buffer_max_bytes) &&
-           read_json_bytes_if_present(root, "first_level_max_bytes", config.first_level_max_bytes) &&
-           read_json_if_present(root, "level_enlarge_factor", config.level_enlarge_factor) &&
-           read_json_bytes_if_present(root, "value_size", config.value_size) &&
-           read_json_bytes_if_present(root, "value_max_size", config.value_max_size);
-}
-
-/** Reads the channel keys of a flat configuration document, which size every I/O buffer of a mount. */
-[[nodiscard]] inline bool read_json_members(yyjson_val* root, io_channel_config_t& config) noexcept {
-    return read_json_bytes_if_present(root, "io_buffer_bytes", config.request_buffer_bytes) &&
-           read_json_if_present(root, "io_buffers_per_channel", config.request_buffers_count) &&
-           read_json_bytes_if_present(root, "io_stream_buffer_bytes", config.stream_buffer_bytes) &&
-           read_json_if_present(root, "io_stream_buffers_per_channel", config.stream_buffers_count) &&
-           read_json_if_present(root, "io_depth", config.depth);
-}
-
-/** Reads the transaction keys of a flat configuration document. */
-[[nodiscard]] inline bool read_json_members(yyjson_val* root, transaction_config_t& config) noexcept {
-    return read_json_if_present(root, "transaction_max_elements", config.write_buffer_max_elements) &&
-           read_json_bytes_if_present(root, "transaction_max_bytes", config.write_buffer_max_bytes);
-}
-
-/** Reads resources from a parsed document, keeping the current value of every absent key. */
-inline status_t read_config(yyjson_val* root, resources_config_t& config) noexcept {
-    if (status_t const status = read_json_version(root); status.failed()) return status;
-    bool const read = read_json_bytes_if_present(root, "memory_limit", config.memory_limit) &&
-                      read_json_if_present(root, "threads", config.threads) &&
-                      read_json_bytes_if_present(root, "gpu_memory_limit", config.gpu_memory_limit) &&
-                      read_json_if_present(root, "gpu_devices", config.gpu_devices) &&
-                      read_json_if_present(root, "directory", config.directory) &&
-                      read_json_if_present(root, "io_transport", config.io_transport) &&
-                      read_json_members(root, config.channels) &&
-                      read_json_if_present(root, "io_shared_channels", config.shared_io_channels) &&
-                      read_json_if_present(root, "data_directories", config.data_directories);
-    if (!read) return status_t {status_code_t::invalid_argument_k, "Invalid config"};
-    return status_t {};
-}
-
-/** Reads collection limits from a parsed document, keeping the current value of every absent key. */
-inline status_t read_config(yyjson_val* root, user_collection_config_t& config) noexcept {
-    if (status_t const status = read_json_version(root); status.failed()) return status;
-    if (!read_json_members(root, config)) return status_t {status_code_t::invalid_argument_k, "Invalid config"};
-    return status_t {};
-}
-
-/** Reads single-collection database limits from a parsed document, keeping the current value of every absent key. */
-inline status_t read_config(yyjson_val* root, user_single_collection_database_config_t& config) noexcept {
-    if (status_t const status = read_json_version(root); status.failed()) return status;
-    if (!read_json_members(root, config.collection) || !read_json_members(root, config.default_transaction))
-        return status_t {status_code_t::invalid_argument_k, "Invalid config"};
-    return status_t {};
-}
-
-/** Reads database limits from a parsed document, keeping the current value of every absent key. */
-inline status_t read_config(yyjson_val* root, database_config_t& config) noexcept {
-    if (status_t const status = read_json_version(root); status.failed()) return status;
-    if (!read_json_members(root, config.default_transaction))
-        return status_t {status_code_t::invalid_argument_k, "Invalid config"};
-    return status_t {};
-}
-
-/** A configuration read from a flat JSON document. */
-template <typename config_>
-concept json_config_concept = std::same_as<config_, resources_config_t> ||
-                              std::same_as<config_, user_collection_config_t> ||
-                              std::same_as<config_, user_single_collection_database_config_t> ||
-                              std::same_as<config_, database_config_t>;
-
-/** Parses @p text, which may carry comments, keeping the current value of every absent key. */
-template <json_config_concept config_>
-status_t parse_config(std::string_view text, config_& config) noexcept {
-    yyjson_doc* const document = yyjson_read_opts(const_cast<char*>(text.data()), text.size(),
-                                                  YYJSON_READ_ALLOW_COMMENTS, nullptr, nullptr);
-    if (!document) return status_t {status_code_t::invalid_argument_k, "Invalid config"};
-    status_t const status = read_config(yyjson_doc_get_root(document), config);
-    yyjson_doc_free(document);
-    return status;
-}
-
-/** Reads the document at @p file_path, which may carry comments, keeping the current value of every absent key. */
-template <json_config_concept config_>
-status_t load_config(char const* file_path, config_& config) noexcept {
-    yyjson_read_err error;
-    yyjson_doc* const document = yyjson_read_file(file_path, YYJSON_READ_ALLOW_COMMENTS, nullptr, &error);
-    if (!document && error.code == YYJSON_READ_ERROR_FILE_OPEN)
-        return status_t {status_code_t::not_found_k, "File not exists"};
-    if (!document) return status_t {status_code_t::invalid_argument_k, "Invalid config"};
-    status_t const status = read_config(yyjson_doc_get_root(document), config);
-    yyjson_doc_free(document);
-    return status;
 }
 
 [[nodiscard]] inline bool read_json(yyjson_val* object, sorted_run_config_t& config) noexcept {

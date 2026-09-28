@@ -562,7 +562,6 @@ void graph_traverse_two_hops(bm::State& state, twitter_t const& twitter) {
     ustore_collection_create_t create {};
     create.db = db;
     create.error = &error;
-    create.config = "";
     create.id = &id;
     ustore_collection_create(&create);
     if (!error.status) return true;
