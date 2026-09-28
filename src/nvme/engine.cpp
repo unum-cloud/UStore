@@ -30,7 +30,7 @@
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 #include <type_traits> // `std::remove_reference_t`
-#include <utility>     // `std::move`
+#include <utility>     // `std::in_range`, `std::move`
 #include <variant>     // `std::visit`
 
 #include <fmt/format.h> // `fmt::format_to_n`
@@ -42,7 +42,6 @@
 #include <ustore/ranges_args.hpp> // `places_arg_t`, `contents_arg_t`, `scans_arg_t`, `validate_read`
 
 #include "engine.hpp"                // `engine_t`, `handle_t`, `handle_cast`
-#include "helpers/config_loader.hpp" // `config_t`, `load_config`
 #include "helpers/linked_array.hpp"  // `uninitialized_array`
 #include "helpers/linked_memory.hpp" // `linked_memory`, `clear_linked_memory`
 
@@ -727,20 +726,25 @@ inline status_t drop_named_collections(opened_database_t& database) noexcept {
 
 #pragma region Lifetime
 
-/** The resources @p config names, with a data directory and a capacity where it named none. */
-inline status_t resolve_resources(config_t const& config, resources_config_t& resources) noexcept {
-    if (config.directory.empty()) return {status_code_t::invalid_argument_k, "A database needs a directory"};
-    if (!resources.directory.try_assign(string_view_t {config.directory}))
+/** The resources @p arguments name, with a data directory and a capacity where they named none. */
+inline status_t resolve_resources(ustore_database_init_nvme_t const& arguments,
+                                  resources_config_t& resources) noexcept {
+    if (!arguments.directory || arguments.directory[0] == '\0')
+        return {status_code_t::invalid_argument_k, "A database needs a directory"};
+    if (!resources.directory.try_assign(string_view_t {arguments.directory}))
         return {status_code_t::out_of_memory_k, "No room for the directory of the database"};
+    if (arguments.data_directories_count && !arguments.data_directories)
+        return {status_code_t::invalid_argument_k, "Counted data directories are null"};
 
     resources.data_directories.clear();
-    for (std::size_t index = 0; index != config.data_directories.size(); ++index) {
+    for (ustore_data_directory_t const& given :
+         std::span {arguments.data_directories, static_cast<std::size_t>(arguments.data_directories_count)}) {
+        if (!given.path || given.path[0] == '\0')
+            return {status_code_t::invalid_argument_k, "A data directory needs a path"};
         data_directory_config_t directory;
-        std::string_view const path = config.data_directories[index].path;
-        if (!directory.path.try_assign(string_view_t {path}))
+        if (!directory.path.try_assign(string_view_t {given.path}))
             return {status_code_t::out_of_memory_k, "No room for a data directory of the database"};
-        directory.max_size = config.data_directories[index].max_size;
-        if (directory.max_size == ustore::disk_config_t::unlimited_space_k) directory.max_size = default_volume_bytes_k;
+        directory.max_size = given.max_bytes ? given.max_bytes : default_volume_bytes_k;
         if (resources.data_directories.push_back(std::move(directory)) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "No room for another data directory"};
     }
@@ -758,19 +762,58 @@ inline status_t resolve_resources(config_t const& config, resources_config_t& re
     return {};
 }
 
-/** Reads the engine's own options, from the file the configuration names and then from its nested object. */
-inline status_t read_engine_options(config_t const& config, resources_config_t& resources,
+/** Replaces @p value with @p requested unless it is zero, answering whether @p requested fits @p value. */
+template <typename value_type_>
+[[nodiscard]] bool take_unless_zero(value_type_& value, ustore_size_t requested) noexcept {
+    if (requested == 0) return true;
+    if (!std::in_range<value_type_>(requested)) return false;
+    value = static_cast<value_type_>(requested);
+    return true;
+}
+
+/** Reads the engine's own options from @p arguments, keeping the engine's default for every zero among them. */
+inline status_t read_engine_options(ustore_database_init_nvme_t const& arguments, resources_config_t& resources,
                                     database_config_t& transactions, user_collection_config_t& collections) noexcept {
-    if (!config.engine.config_file_path.empty()) {
-        char const* const path = config.engine.config_file_path.data();
-        if (status_t const read = load_config(path, resources); read.failed()) return read;
-        if (status_t const read = load_config(path, transactions); read.failed()) return read;
-        if (status_t const read = load_config(path, collections); read.failed()) return read;
+    switch (arguments.transport) {
+    case ustore_transport_automatic_k: resources.io_transport = io_transport_t::automatic_k; break;
+    case ustore_transport_blocking_k: resources.io_transport = io_transport_t::blocking_k; break;
+    case ustore_transport_linux_uring_k: resources.io_transport = io_transport_t::linux_uring_k; break;
+    case ustore_transport_linux_aio_k: resources.io_transport = io_transport_t::linux_aio_k; break;
+    case ustore_transport_linux_spdk_k: resources.io_transport = io_transport_t::linux_spdk_k; break;
+    default: return {status_code_t::invalid_argument_k, "Unknown transport"};
     }
-    if (!config.engine.config) return {};
-    if (status_t const read = read_config(config.engine.config, resources); read.failed()) return read;
-    if (status_t const read = read_config(config.engine.config, transactions); read.failed()) return read;
-    return read_config(config.engine.config, collections);
+
+    if (arguments.gpu_devices_count && !arguments.gpu_devices)
+        return {status_code_t::invalid_argument_k, "Counted GPU devices are null"};
+    for (int const device : std::span {arguments.gpu_devices, static_cast<std::size_t>(arguments.gpu_devices_count)})
+        if (resources.gpu_devices.emplace_back(device) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "No room for another GPU device"};
+
+    // A fixed value size leaves the largest one unset unless it was asked for, as exactly one of the two may be set
+    if (arguments.collection_value_size) collections.value_max_size = 0;
+    bool const fits =
+        take_unless_zero(resources.memory_limit, arguments.memory_limit) &&
+        take_unless_zero(resources.threads, arguments.threads) &&
+        take_unless_zero(resources.gpu_memory_limit, arguments.gpu_memory_limit) &&
+        take_unless_zero(resources.shared_io_channels, arguments.shared_io_channels) &&
+        take_unless_zero(resources.channels.depth, arguments.queue_depth) &&
+        take_unless_zero(resources.channels.request_buffer_bytes, arguments.request_buffer_bytes) &&
+        take_unless_zero(resources.channels.request_buffers_count, arguments.request_buffers_count) &&
+        take_unless_zero(resources.channels.stream_buffer_bytes, arguments.stream_buffer_bytes) &&
+        take_unless_zero(resources.channels.stream_buffers_count, arguments.stream_buffers_count) &&
+        take_unless_zero(transactions.default_transaction.write_buffer_max_bytes, arguments.transaction_max_bytes) &&
+        take_unless_zero(transactions.default_transaction.write_buffer_max_elements,
+                         arguments.transaction_max_elements) &&
+        take_unless_zero(collections.concurrency_limit, arguments.collection_concurrency_limit) &&
+        take_unless_zero(collections.cache_limit, arguments.collection_cache_limit) &&
+        take_unless_zero(collections.write_buffer_max_bytes, arguments.collection_write_buffer_max_bytes) &&
+        take_unless_zero(collections.write_buffer_max_elements, arguments.collection_write_buffer_max_elements) &&
+        take_unless_zero(collections.first_level_max_bytes, arguments.collection_first_level_max_bytes) &&
+        take_unless_zero(collections.level_enlarge_factor, arguments.collection_level_enlarge_factor) &&
+        take_unless_zero(collections.value_size, arguments.collection_value_size) &&
+        take_unless_zero(collections.value_max_size, arguments.collection_value_max_size);
+    if (!fits) return {status_code_t::invalid_argument_k, "An option of the engine exceeds its range"};
+    return {};
 }
 
 /** Checks @p resources and @p collections, whose issue messages live only inside this call. */
@@ -792,18 +835,16 @@ inline status_t mount_store(opened_database_t& database, database_config_t const
     });
 }
 
-/** Opens the database of @p config, with its two reserved collections. */
-inline expected<opened_database_t*> open_database(config_t const& config) noexcept {
+/** Opens the database @p arguments describe, with its two reserved collections. */
+inline expected<opened_database_t*> open_database(ustore_database_init_nvme_t const& arguments) noexcept {
     resources_config_t resources;
     resources.shared_io_channels = engine_shared_io_channels_k;
     database_config_t transactions = engine_database_defaults();
     user_collection_config_t collections = engine_collection_defaults();
 
-    if (status_t const resolved = resolve_resources(config, resources); resolved.failed()) return resolved;
-    if (status_t const read = read_engine_options(config, resources, transactions, collections); read.failed())
+    if (status_t const resolved = resolve_resources(arguments, resources); resolved.failed()) return resolved;
+    if (status_t const read = read_engine_options(arguments, resources, transactions, collections); read.failed())
         return read;
-    if (resources.io_transport == io_transport_t::memory_k)
-        return status_t {status_code_t::unsupported_k, "The engine mounts its volumes on files alone"};
     if (status_t const checked = validated(resources, transactions, collections); checked.failed()) return checked;
 
     std::unique_ptr<opened_database_t> opened {new (std::nothrow) opened_database_t {}};
@@ -840,22 +881,12 @@ inline void close_database(opened_database_t& database) noexcept {
 
 #pragma region C ABI
 
-void database_init(ustore_database_init_t& arguments) noexcept {
+void database_init(ustore_database_init_nvme_t& arguments) noexcept {
     if (!arguments.db) {
         *arguments.error = {ustore_error_invalid_argument_k, "Need an output for the database"};
         return;
     }
-    config_t config;
-    if (arguments.config && arguments.config[0] != '\0') {
-        status_t const loaded = load_config(arguments.config, config);
-        if (reported_failure(loaded, arguments.error)) return;
-    }
-    if (!config.engine.config_url.empty()) {
-        *arguments.error = {ustore_error_unsupported_k, "URL configs aren't supported"};
-        return;
-    }
-
-    auto [opened, open_database_status] = open_database(config);
+    auto [opened, open_database_status] = open_database(arguments);
     if (open_database_status.failed()) {
         *arguments.error = open_database_status;
         return;
@@ -1370,4 +1401,4 @@ engine_t const engine_k {
 using namespace unum::ustore;
 using namespace unum::ustore::nvme;
 
-void ustore_database_init_nvme(ustore_database_init_t* arguments) { database_init(*arguments); }
+void ustore_database_init_nvme(ustore_database_init_nvme_t* arguments) { database_init(*arguments); }

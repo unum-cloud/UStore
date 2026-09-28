@@ -25,7 +25,7 @@
 #include <limits>       // `std::numeric_limits`
 #include <memory>       // `std::unique_ptr`
 #include <mutex>        // `std::lock_guard`, `std::mutex`, `std::unique_lock`
-#include <new>          // `std::bad_alloc`, `std::nothrow`
+#include <new>          // `std::nothrow`
 #include <span>         // `std::span`
 #include <string>       // `std::string`, `std::to_string`, the path and name type RocksDB takes
 #include <string_view>  // `std::string_view`
@@ -48,7 +48,6 @@
 
 #include "engine.hpp"                 // `engine_t`, `handle_t`, `handle_cast`
 #include "helpers/blocking_files.hpp" // `directory_exists`
-#include "helpers/config_loader.hpp"  // `load_config`
 #include "helpers/full_scan.hpp"      // `reservoir_sample_iterator`
 #include "helpers/linked_memory.hpp"  // `linked_memory_lock_t`
 
@@ -525,19 +524,21 @@ bool remove_partial_export(std::string const& path, ::rocksdb::Options const& op
 
 #pragma region Lifetime
 
-void database_init(ustore_database_init_t& arguments) {
-    if (!arguments.config) {
-        *arguments.error = {ustore_error_invalid_argument_k, "Null config specified"};
+void database_init(ustore_database_init_rocksdb_t& arguments) {
+    if (!arguments.db) {
+        *arguments.error = {ustore_error_invalid_argument_k, "Need an output for the database"};
+        return;
+    }
+    if (!arguments.directory) {
+        *arguments.error = {ustore_error_invalid_argument_k, "A database needs a directory"};
+        return;
+    }
+    if (arguments.data_directories_count && !arguments.data_directories) {
+        *arguments.error = {ustore_error_invalid_argument_k, "Counted data directories are null"};
         return;
     }
 
-    config_t config;
-    if (status_t const loaded = load_config(arguments.config, config); loaded.failed()) {
-        *arguments.error = loaded;
-        return;
-    }
-
-    auto [root_exists, directory_exists_status] = directory_exists(config.directory.data());
+    auto [root_exists, directory_exists_status] = directory_exists(arguments.directory);
     if (directory_exists_status.failed()) {
         *arguments.error = directory_exists_status;
         return;
@@ -546,57 +547,21 @@ void database_init(ustore_database_init_t& arguments) {
         *arguments.error = {ustore_error_not_found_k, "Root isn't a directory"};
         return;
     }
-    if (!config.engine.config_url.empty()) {
-        *arguments.error = {ustore_error_unsupported_k, "URL configs are not supported"};
-        return;
-    }
 
     // Recovery depends on the options file: https://github.com/facebook/rocksdb/wiki/RocksDB-Options-File
     ::rocksdb::Options options;
     options.compression = ::rocksdb::kNoCompression;
-    ::rocksdb::ColumnFamilyOptions column_options;
     std::vector<::rocksdb::ColumnFamilyDescriptor> column_descriptors;
-    ::rocksdb::ConfigOptions config_options;
-    native_status_t status;
-
-    if (!config.engine.config_file_path.empty()) {
-        status = ::rocksdb::LoadOptionsFromFile(config_options, std::string(config.engine.config_file_path), &options,
-                                                &column_descriptors);
-        if (!status.ok()) {
-            *arguments.error = {ustore_error_malformed_k, "Failed to parse the RocksDB options file"};
-            return;
-        }
-    }
-
-    yyjson_val* const database_json = yyjson_obj_get(config.engine.config, "DBOptions");
-    yyjson_val* const column_json = yyjson_obj_get(config.engine.config, "CFOptions");
-    bool const valid = //
-        read_json_member(database_json, "create_if_missing", options.create_if_missing) &&
-        read_json_member(database_json, "writable_file_max_buffer_size", options.writable_file_max_buffer_size) &&
-        read_json_member(database_json, "max_open_files", options.max_open_files) &&
-        read_json_member(database_json, "max_file_opening_threads", options.max_file_opening_threads) &&
-        read_json_member(column_json, "max_write_buffer_number", column_options.max_write_buffer_number) &&
-        read_json_member(column_json, "write_buffer_size", column_options.write_buffer_size) &&
-        read_json_member(column_json, "target_file_size_base", column_options.target_file_size_base) &&
-        read_json_member(column_json, "max_compaction_bytes", column_options.max_compaction_bytes) &&
-        read_json_member(column_json, "level_compaction_dynamic_level_bytes",
-                         column_options.level_compaction_dynamic_level_bytes) &&
-        read_json_member(column_json, "level0_stop_writes_trigger", column_options.level0_stop_writes_trigger) &&
-        read_json_member(column_json, "target_file_size_multiplier", column_options.target_file_size_multiplier) &&
-        read_json_member(column_json, "max_bytes_for_level_multiplier", column_options.max_bytes_for_level_multiplier);
-    if (!valid) {
-        *arguments.error = {ustore_error_malformed_k, "Unsupported type in RocksDB configuration key"};
-        return;
-    }
-
-    std::string const root(config.directory);
-    status = ::rocksdb::LoadLatestOptions(config_options, root, &options, &column_descriptors);
+    std::string const root(arguments.directory);
+    native_status_t status = ::rocksdb::LoadLatestOptions(::rocksdb::ConfigOptions(), root, &options,
+                                                          &column_descriptors);
     if (!status.ok() && !status.IsNotFound()) {
         *arguments.error = {ustore_error_io_k, "Failed to recover the RocksDB state"};
         return;
     }
 
-    if (column_descriptors.empty()) column_descriptors.push_back({::rocksdb::kDefaultColumnFamilyName, column_options});
+    if (column_descriptors.empty())
+        column_descriptors.push_back({::rocksdb::kDefaultColumnFamilyName, ::rocksdb::ColumnFamilyOptions()});
     for (auto& descriptor : column_descriptors) descriptor.options.comparator = &key_comparator_k;
 
     // An export persists `error_if_exists`, which would refuse every reopening of it
@@ -606,8 +571,15 @@ void database_init(ustore_database_init_t& arguments) {
     // Every write reaches the log, which stays in memory until a flushed write, a full buffer or a clean close; set
     // after the options files, so a database created before keeps no other setting
     options.manual_wal_flush = true;
-    for (disk_config_t const& disk : config.data_directories)
-        options.db_paths.push_back({std::string(disk.path), disk.max_size});
+    for (ustore_data_directory_t const& directory :
+         std::span {arguments.data_directories, static_cast<std::size_t>(arguments.data_directories_count)}) {
+        if (!directory.path) {
+            *arguments.error = {ustore_error_invalid_argument_k, "A data directory needs a path"};
+            return;
+        }
+        options.db_paths.push_back(
+            {std::string(directory.path), directory.max_bytes ? directory.max_bytes : UINT64_MAX});
+    }
 
     // Room for every handle comes first, so the database owns each one the moment it opens and closes it on any exit
     std::unique_ptr<database_t> database {new (std::nothrow) database_t};
@@ -1526,14 +1498,6 @@ using namespace unum::ustore::rocksdb;
 extern "C" bool RocksDbIOUringEnable() { return true; }
 #endif
 
-void ustore_database_init_rocksdb(ustore_database_init_t* arguments) {
-    try {
-        database_init(*arguments);
-    }
-    catch (std::bad_alloc const&) {
-        *arguments->error = {ustore_error_out_of_memory_k, "Out of memory"};
-    }
-    catch (...) {
-        *arguments->error = {ustore_error_internal_k, "Unexpected engine failure"};
-    }
+void ustore_database_init_rocksdb(ustore_database_init_rocksdb_t* arguments) {
+    guarded<ustore_database_init_rocksdb_t, &database_init>(*arguments);
 }

@@ -5,8 +5,9 @@
  *  @brief The C ABI, routing every call to the engine behind its database or transaction handle.
  *
  *  Each engine defines only its own `ustore_database_init_*`, which stamps every handle it hands out with its
- *  @c engine_t, so one library holds every engine it was built with and a program links only those it opens. Every
- *  call of the table is `noexcept`, so nothing here catches.
+ *  @c engine_t, so one library holds every engine it was built with and a program links only those it opens. The init
+ *  of an engine the build lacks is defined here and refuses, so every program links against every build. Every call
+ *  of the table is `noexcept`, so nothing here catches.
  */
 
 #include <limits> // `std::numeric_limits`
@@ -81,3 +82,21 @@ void ustore_database_free(ustore_database_t database) {
 }
 
 void ustore_arena_free(ustore_arena_t arena) { clear_linked_memory(arena); }
+
+#if !USTORE_WITH_ROCKSDB
+void ustore_database_init_rocksdb(ustore_database_init_rocksdb_t* arguments) {
+    *arguments->error = {ustore_error_unsupported_k, "This build carries no RocksDB engine"};
+}
+#endif
+
+#if !USTORE_WITH_LEVELDB
+void ustore_database_init_leveldb(ustore_database_init_leveldb_t* arguments) {
+    *arguments->error = {ustore_error_unsupported_k, "This build carries no LevelDB engine"};
+}
+#endif
+
+#if !USTORE_WITH_NVME
+void ustore_database_init_nvme(ustore_database_init_nvme_t* arguments) {
+    *arguments->error = {ustore_error_unsupported_k, "This build carries no NVMe engine"};
+}
+#endif

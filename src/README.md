@@ -56,7 +56,6 @@ See [`nvme/README.md`](nvme/README.md) for its layers.
 
 `src/helpers/` holds what several engines share:
 
-- `config_loader.hpp` — the JSON database configuration on yyjson, until a schema-backed loader of intent keys replaces it.
 - `linked_memory.hpp` and `linked_array.hpp` — the arena behind each C ABI call, and the non-throwing arrays grown inside it.
 - `algorithm.hpp` and `full_scan.hpp` — STL algorithms over strided iterators, and a callback-driven full scan of a blob collection.
 - `blocking_files.hpp` — positional file reads and writes, and directory queries, that block the calling thread and report a `status_t`.

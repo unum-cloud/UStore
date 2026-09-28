@@ -50,8 +50,8 @@ struct settings_t {
     /** Directory the database lives in; the engine keeps the graph in memory without it. */
     std::string_view directory;
 
-    /** The engine to open: @c ram, @c rocksdb, @c leveldb or @c nvme. */
-    std::string_view engine = "ram";
+    /** The engine to open and the options of its init call. */
+    engine_options_t engine;
 
     /** Vertices of the generated graph, trimmed down to a whole number of communities. */
     count_t vertices {.value = 4096, .minimum = 2};
@@ -638,9 +638,11 @@ int main(int argc, char** argv) {
     using namespace unum::ustore::bench;
 
     settings_t settings;
-    std::array<flag_t, 12> const flags {{
+    std::array<flag_t, 14> const flags {{
         {"--dataset", "path", "SNAP edge list; a planted partition is generated without it", &settings.dataset},
-        {"--engine", "name", "engine to open: ram, rocksdb, leveldb or nvme", &settings.engine},
+        {"--engine", "name", "engine to open: ram, rocksdb, leveldb or nvme", &settings.engine.name},
+        {"--isolation", "name", "isolation of the transactions of ram", &settings.engine.isolation},
+        {"--engine-transport", "name", "transport of nvme", &settings.engine.transport},
         {"--directory", "path", "database directory; the graph stays in memory without it", &settings.directory},
         {"--vertices", "count", "vertices of the generated graph", &settings.vertices},
         {"--communities", "count", "communities planted in the generated graph", &settings.communities},
@@ -703,26 +705,10 @@ int main(int argc, char** argv) {
     adjacency_graph_t memory_graph = *std::move(maybe_memory_graph);
     fmt::println("Graph: {} vertices, {} edges", memory_graph.vertices_count(), edges.size());
 
-    sz::string_t config;
-    if (!settings.directory.empty() &&
-        (!config.try_append(R"({"version": "1.0", "directory": ")") ||
-         !config.try_append(settings.directory.data(), settings.directory.size()) || !config.try_append(R"("})"))) {
-        fmt::println(stderr, "Failed to prepare the database configuration");
-        return 1;
-    }
-
-    database_init_t const init_database = database_init_of(settings.engine);
-    if (!init_database) {
-        fmt::println(stderr, "This build carries no engine named {}", settings.engine);
-        return 1;
-    }
     ustore_database_t raw = nullptr;
     ustore_error_t error {};
-    ustore_database_init_t init {};
-    init.config = config.c_str();
-    init.db = &raw;
-    init.error = &error;
-    init_database(&init);
+    settings.engine.directory = settings.directory.data();
+    open_engine(settings.engine, &raw, &error);
     if (error.status) {
         fmt::println(stderr, "Failed to open the database: {}", error.message ? error.message : "unknown");
         return 1;

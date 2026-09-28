@@ -889,7 +889,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     char const* const directory = maybe_directory->path();
-    test_config_t const config {options.engine, directory, options.engine_config};
+    test_config_t const config {options.engine, directory};
 
     if (directory) run_cases(totals, config, cli);
     else report(totals, "tools", case_result_t::skipped(needs_directory_k));

@@ -394,7 +394,7 @@ int main(int argc, char** argv) {
         fmt::println(stderr, "Cannot create a unique directory under {}", suite.directory);
         return 1;
     }
-    test_config_t const config {suite.engine, maybe_directory->path(), suite.engine_config};
+    test_config_t const config {suite.engine, maybe_directory->path()};
     linearizability_run_t run {&config};
     if (open_database(run.database, *run.config).failed()) {
         fmt::println(stderr, "Cannot open the database");

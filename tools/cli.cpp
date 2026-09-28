@@ -103,8 +103,8 @@ struct command_line_t {
     /** Database directory. */
     std::string_view directory;
 
-    /** The engine to open: @c ram, @c rocksdb, @c leveldb or @c nvme. */
-    std::string_view engine = "ram";
+    /** The engine to open and the options of its init call. */
+    engine_options_t engine;
 
     /** Collection name, empty for the main collection. */
     std::string_view collection;
@@ -492,9 +492,11 @@ int main(int argc, char* argv[]) {
     using namespace unum::ustore;
 
     command_line_t line;
-    std::array<flag_t, 7> const flags {{
+    std::array<flag_t, 9> const flags {{
         {"--directory", "path", "database directory, required", &line.directory},
-        {"--engine", "name", "engine to open: ram, rocksdb, leveldb or nvme", &line.engine},
+        {"--engine", "name", "engine to open: ram, rocksdb, leveldb or nvme", &line.engine.name},
+        {"--isolation", "name", "isolation of the transactions of ram", &line.engine.isolation},
+        {"--engine-transport", "name", "transport of nvme", &line.engine.transport},
         {"--collection", "name", "collection a command acts on, the main one when omitted", &line.collection},
         {"--input", "file", "file a collection import reads", &line.input},
         {"--output", "file", "file a collection export writes", &line.output},
@@ -526,25 +528,10 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    sz::string_t config;
-    if (!config.try_append(R"({"version": "1.0", "directory": ")") ||
-        !config.try_append(line.directory.data(), line.directory.size()) || !config.try_append(R"("})")) {
-        fmt::println(stderr, "Failed to allocate the configuration");
-        return 1;
-    }
-
-    database_init_t const init_database = database_init_of(line.engine);
-    if (!init_database) {
-        fmt::println(stderr, "This build carries no engine named {}", line.engine);
-        return 1;
-    }
     ustore_database_t db = nullptr;
     ustore_error_t error {};
-    ustore_database_init_t init {};
-    init.config = config.c_str();
-    init.db = &db;
-    init.error = &error;
-    init_database(&init);
+    line.engine.directory = line.directory.data();
+    open_engine(line.engine, &db, &error);
     if (error.status) {
         print_failure("Failed to open the database", error);
         return 1;

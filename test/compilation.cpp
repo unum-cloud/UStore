@@ -111,7 +111,7 @@ int main(int argc, char** argv) {
         fmt::println(stderr, "Cannot create a unique directory under {}", options.directory);
         return 1;
     }
-    test_config_t const config {options.engine, maybe_directory->path(), options.engine_config};
+    test_config_t const config {options.engine, maybe_directory->path()};
 
     report(totals, "wrappers.compile", wrappers_compile, config);
     return suite_exit_code(totals);

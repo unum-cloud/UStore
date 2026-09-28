@@ -349,11 +349,8 @@ struct suite_options_t {
     /** The transports a ring suite mounts, every one when empty. */
     texts_t transports;
 
-    /** The engine an engine suite opens: @c ram, @c rocksdb, @c leveldb or @c nvme. */
-    std::string_view engine = "ram";
-
-    /** Fields spliced into the engine's own configuration, like @c "io_transport":"linux-uring", or none. */
-    std::string_view engine_config;
+    /** The engine an engine suite opens and the options of its init call. */
+    engine_options_t engine;
 
     /** The seed every random draw descends from, drawn from the machine when left zero. */
     count_t seed;
@@ -407,7 +404,7 @@ constexpr std::size_t suite_flags_capacity_k = 16;
         fmt::println(stderr, "a suite may add at most {} flags", suite_flags_capacity_k);
         return argument_status_t::too_many_items_k;
     }
-    std::array<flag_t, suite_flags_capacity_k + 10> flags;
+    std::array<flag_t, suite_flags_capacity_k + 11> flags;
     std::size_t count = 0;
     flags[count++] = {"--directory", "path", "parent of the unique directory the suite works in", &options.directory};
     flags[count++] = {"--device", "path", "block device the storage cases open", &options.device};
@@ -415,10 +412,9 @@ constexpr std::size_t suite_flags_capacity_k = 16;
     flags[count++] = {"--transports", "names", "transports a ring suite mounts, like memory,blocking,linux-uring",
                       &options.transports};
     flags[count++] = {"--engine", "name", "engine an engine suite opens: ram, rocksdb, leveldb or nvme",
-                      &options.engine};
-    flags[count++] = {"--engine-config", "json",
-                      "fields of the engine's own configuration, like \"io_transport\":\"uring\"",
-                      &options.engine_config};
+                      &options.engine.name};
+    flags[count++] = {"--isolation", "name", "isolation of the transactions of ram", &options.engine.isolation};
+    flags[count++] = {"--engine-transport", "name", "transport of nvme", &options.engine.transport};
     flags[count++] = {"--seed", "count", "seed of every random draw, drawn from the machine when absent",
                       &options.seed};
     flags[count++] = {"--threads", "count", "threads the concurrent cases fan out over", &options.threads};
@@ -460,65 +456,32 @@ struct test_path_t {
     char const* c_str() const noexcept { return text; }
 };
 
-/** An engine configuration held inline, empty when the engine should use its defaults. */
+/** The engine a case opens, with the directory it works in. */
 class test_config_t {
   public:
 
-    /** Configures @p engine to work in @p directory, with @p engine_config spliced into the engine's own object. */
-    explicit test_config_t(std::string_view engine, char const* directory, std::string_view engine_config = {}) noexcept
-        : engine_(engine), directory_(directory), engine_config_(engine_config) {
-        if (!directory && engine_config.empty()) return;
-        auto const written =
-            engine_config.empty()
-                ? fmt::format_to_n(json_, sizeof(json_) - 1, R"({{"version": "1.0", "directory": "{}"}})", directory)
-            : !directory
-                ? fmt::format_to_n(json_, sizeof(json_) - 1,
-                                   R"({{"version": "1.0", "engine": {{"config": {{"version": "1.0", {}}}}}}})",
-                                   engine_config)
-                : fmt::format_to_n(
-                      json_, sizeof(json_) - 1,
-                      R"({{"version": "1.0", "directory": "{}", "engine": {{"config": {{"version": "1.0", {}}}}}}})",
-                      directory, engine_config);
-        *written.out = '\0';
+    /** Opens the engine @p options name in @p directory, or in memory when @p directory is null. */
+    explicit test_config_t(engine_options_t options, char const* directory) noexcept : options_(options) {
+        options_.directory = directory;
     }
 
-    /** The configuration as a C string, empty for the defaults. */
-    [[nodiscard]] char const* c_str() const noexcept { return json_; }
-
-    /** The engine the configuration opens, which a second database of a case repeats. */
-    [[nodiscard]] std::string_view engine() const noexcept { return engine_; }
-
-    /** The directory the engine works in, or null without @c --directory. */
-    [[nodiscard]] char const* directory() const noexcept { return directory_; }
-
-    /** The fields spliced into the engine's own configuration, which a second database of a case repeats. */
-    [[nodiscard]] std::string_view engine_config() const noexcept { return engine_config_; }
-
-  private:
-
-    /** The null-terminated JSON configuration, empty for the defaults. */
-    char json_[path_capacity_k + 256] {};
+    /** The engine and the options of its init call, which a second database of a case repeats. */
+    [[nodiscard]] engine_options_t const& options() const noexcept { return options_; }
 
     /** The engine the configuration opens. */
-    std::string_view engine_;
+    [[nodiscard]] std::string_view engine() const noexcept { return options_.name; }
 
-    /** The directory the engine works in, or null. */
-    char const* directory_ = nullptr;
+    /** The directory the engine works in, or null without @c --directory. */
+    [[nodiscard]] char const* directory() const noexcept { return options_.directory; }
 
-    /** The fields spliced into the engine's own configuration. */
-    std::string_view engine_config_;
+  private:
+    engine_options_t options_;
 };
 
 /** Opens the engine @p config names into @p database through the C ABI. */
 inline status_t open_raw(test_config_t const& config, ustore_database_t& database) noexcept {
-    database_init_t const init_database = database_init_of(config.engine());
-    if (!init_database) return {status_code_t::invalid_argument_k, "This build carries no engine of that name"};
     ustore_error_t error {};
-    ustore_database_init_t init {};
-    init.config = config.c_str();
-    init.db = &database;
-    init.error = &error;
-    init_database(&init);
+    open_engine(config.options(), &database, &error);
     return status_t {error};
 }
 

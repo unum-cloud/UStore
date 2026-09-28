@@ -8,16 +8,14 @@
 #include <cstdint> // `std::uint64_t`
 #include <cstring> // `std::memcpy`
 
-#include <charconv>    // `std::from_chars`
-#include <limits>      // `std::numeric_limits`
-#include <memory>      // `std::unique_ptr`
-#include <mutex>       // `std::lock_guard`, `std::mutex`
-#include <new>         // `std::bad_alloc`, `std::nothrow`
-#include <span>        // `std::span`
-#include <string>      // `std::string`, the path, property and value type LevelDB takes
-#include <string_view> // `std::string_view`
+#include <charconv> // `std::from_chars`
+#include <limits>   // `std::numeric_limits`
+#include <memory>   // `std::unique_ptr`
+#include <mutex>    // `std::lock_guard`, `std::mutex`
+#include <new>      // `std::nothrow`
+#include <span>     // `std::span`
+#include <string>   // `std::string`, the path, property and value type LevelDB takes
 
-#include <leveldb/cache.h> // `NewLRUCache`
 #include <leveldb/comparator.h>
 #include <leveldb/db.h>
 #include <leveldb/write_batch.h>
@@ -29,7 +27,6 @@
 
 #include "engine.hpp"                 // `engine_t`, `handle_t`, `handle_cast`
 #include "helpers/blocking_files.hpp" // `directory_exists`
-#include "helpers/config_loader.hpp"  // `load_config`
 #include "helpers/full_scan.hpp"      // `reservoir_sample_iterator`
 #include "helpers/linked_array.hpp"   // `uninitialized_array`
 
@@ -92,9 +89,6 @@ struct database_t : handle_t {
     /** Options the database opened with, reused to create exports. */
     ::leveldb::Options options;
 
-    /** Block cache the options point to, or null for the default one. */
-    std::unique_ptr<::leveldb::Cache> cache;
-
     /** Identifiers of the live snapshots. */
     snapshots_t snapshots;
 
@@ -141,31 +135,6 @@ bool refuse_other_collections(strided_iterator<ustore_collection_t const> collec
         return true;
     }
     return false;
-}
-
-/** Applies the options of one JSON object, answering whether every present member has the right type. */
-bool read_options(yyjson_val* json, database_t& database) {
-    ::leveldb::Options& options = database.options;
-    std::size_t cache_size = 0;
-    std::string_view compression;
-    bool const valid = //
-        read_json_member(json, "write_buffer_size", options.write_buffer_size) &&
-        read_json_member(json, "max_file_size", options.max_file_size) &&
-        read_json_member(json, "max_open_files", options.max_open_files) &&
-        read_json_member(json, "cache_size", cache_size) &&
-        read_json_member(json, "create_if_missing", options.create_if_missing) &&
-        read_json_member(json, "error_if_exists", options.error_if_exists) &&
-        read_json_member(json, "paranoid_checks", options.paranoid_checks) &&
-        read_json_member(json, "compression", compression);
-    if (!valid) return false;
-
-    if (yyjson_obj_get(json, "cache_size")) {
-        database.cache.reset(::leveldb::NewLRUCache(cache_size));
-        options.block_cache = database.cache.get();
-    }
-    if (compression == "kSnappyCompression" || compression == "snappy")
-        options.compression = ::leveldb::kSnappyCompression;
-    return true;
 }
 
 /** Points @p options at the snapshot @p id, leaving them untouched for the zero identifier. */
@@ -253,33 +222,23 @@ void seek_each(database_t& database, places_arg_t const& places, ::leveldb::Read
 
 #pragma region Lifetime
 
-void database_init(ustore_database_init_t& arguments) {
-    if (!arguments.config) {
-        *arguments.error = {ustore_error_invalid_argument_k, "Null config specified"};
+void database_init(ustore_database_init_leveldb_t& arguments) {
+    if (!arguments.db) {
+        *arguments.error = {ustore_error_invalid_argument_k, "Need an output for the database"};
+        return;
+    }
+    if (!arguments.directory) {
+        *arguments.error = {ustore_error_invalid_argument_k, "A database needs a directory"};
         return;
     }
 
-    config_t config;
-    if (status_t const loaded = load_config(arguments.config, config); loaded.failed()) {
-        *arguments.error = loaded;
-        return;
-    }
-
-    auto [root_exists, directory_exists_status] = directory_exists(config.directory.data());
+    auto [root_exists, directory_exists_status] = directory_exists(arguments.directory);
     if (directory_exists_status.failed()) {
         *arguments.error = directory_exists_status;
         return;
     }
     if (!root_exists) {
         *arguments.error = {ustore_error_not_found_k, "Root isn't a directory"};
-        return;
-    }
-    if (config.data_directories.size() != 0) {
-        *arguments.error = {ustore_error_unsupported_k, "Multiple data directories are not supported"};
-        return;
-    }
-    if (!config.engine.config_url.empty()) {
-        *arguments.error = {ustore_error_unsupported_k, "URL configs are not supported"};
         return;
     }
 
@@ -292,25 +251,8 @@ void database_init(ustore_database_init_t& arguments) {
     database->options.compression = ::leveldb::kNoCompression;
     database->options.create_if_missing = true;
 
-    if (!config.engine.config_file_path.empty()) {
-        json_document_t file_config;
-        if (status_t const file_loaded = load_json_file(config.engine.config_file_path.data(), file_config);
-            file_loaded.failed()) {
-            *arguments.error = file_loaded;
-            return;
-        }
-        if (!read_options(file_config.root(), *database)) {
-            *arguments.error = {ustore_error_malformed_k, "Unsupported type in LevelDB configuration key"};
-            return;
-        }
-    }
-    if (!read_options(config.engine.config, *database)) {
-        *arguments.error = {ustore_error_malformed_k, "Unsupported type in LevelDB configuration key"};
-        return;
-    }
-
     native_t* native = nullptr;
-    native_status_t const status = native_t::Open(database->options, std::string(config.directory), &native);
+    native_status_t const status = native_t::Open(database->options, std::string(arguments.directory), &native);
     if (!status.ok()) {
         *arguments.error = {ustore_error_io_k, "Failed to open LevelDB"};
         return;
@@ -784,14 +726,6 @@ engine_t const engine_k {
 using namespace unum::ustore;
 using namespace unum::ustore::leveldb;
 
-void ustore_database_init_leveldb(ustore_database_init_t* arguments) {
-    try {
-        database_init(*arguments);
-    }
-    catch (std::bad_alloc const&) {
-        *arguments->error = {ustore_error_out_of_memory_k, "Out of memory"};
-    }
-    catch (...) {
-        *arguments->error = {ustore_error_internal_k, "Unexpected engine failure"};
-    }
+void ustore_database_init_leveldb(ustore_database_init_leveldb_t* arguments) {
+    guarded<ustore_database_init_leveldb_t, &database_init>(*arguments);
 }

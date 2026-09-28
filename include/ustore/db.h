@@ -217,11 +217,50 @@ extern ustore_key_t const ustore_key_unknown_k;
 
 #pragma region Database
 
-/** The arguments of every engine's init call. */
-typedef struct ustore_database_init_t {
+/** How the transactions of the in-memory engine see each other's writes. */
+typedef enum ustore_isolation_t {
 
-    /** Configuration of the engine as a JSON string. */
-    ustore_str_view_t config;
+    /** Every transaction appears to run alone at one moment between its start and its commit. */
+    ustore_isolation_strict_serializable_k = 0,
+
+    /** Every transaction reads the state its start saw and conflicts only over what it writes. */
+    ustore_isolation_snapshot_k = 1,
+
+} ustore_isolation_t;
+
+/** How the NVMe engine moves bytes between its files and memory. */
+typedef enum ustore_transport_t {
+
+    /** io_uring where the kernel offers it, Linux AIO where it offers only that, and blocking calls elsewhere. */
+    ustore_transport_automatic_k = 0,
+
+    /** Positioned reads and writes that block the polling thread, which every platform has. */
+    ustore_transport_blocking_k = 1,
+
+    /** io_uring on unbuffered files, refused where the kernel creates no ring. */
+    ustore_transport_linux_uring_k = 2,
+
+    /** Linux AIO on unbuffered files. */
+    ustore_transport_linux_aio_k = 3,
+
+    /** SPDK's user-space driver on NVMe devices the process owns. */
+    ustore_transport_linux_spdk_k = 4,
+
+} ustore_transport_t;
+
+/** A directory the data files may occupy, with the bytes they may take there. */
+typedef struct ustore_data_directory_t {
+
+    /** The directory, which must exist. */
+    ustore_str_view_t path;
+
+    /** Bytes the files may take there: zero is unlimited on RocksDB and the default volume size on NVMe. */
+    ustore_size_t max_bytes;
+
+} ustore_data_directory_t;
+
+/** The arguments of @c ustore_database_init_ram. */
+typedef struct ustore_database_init_ram_t {
 
     /** Output for the opened database, unless @c error is set. */
     ustore_database_t* db;
@@ -229,22 +268,148 @@ typedef struct ustore_database_init_t {
     /** Output for the error message. */
     ustore_error_t* error;
 
-} ustore_database_init_t;
+    /** Directory the database persists in as one image, or null to keep it in memory alone. */
+    ustore_str_view_t directory;
+
+    /** How transactions see each other. */
+    ustore_isolation_t isolation;
+
+} ustore_database_init_ram_t;
 
 /**
- *  @brief Opens the in-memory engine, which persists as one image when the configuration names a directory.
+ *  @brief Opens the in-memory engine, which persists as one image when it names a directory.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_database_init_ram(ustore_database_init_t* arguments);
+void ustore_database_init_ram(ustore_database_init_ram_t* arguments);
 
-/** Opens the RocksDB engine, in a library built with `USTORE_WITH_ROCKSDB`. */
-void ustore_database_init_rocksdb(ustore_database_init_t* arguments);
+/** The arguments of @c ustore_database_init_rocksdb. */
+typedef struct ustore_database_init_rocksdb_t {
 
-/** Opens the LevelDB engine, in a library built with `USTORE_WITH_LEVELDB`. */
-void ustore_database_init_leveldb(ustore_database_init_t* arguments);
+    /** Output for the opened database, unless @c error is set. */
+    ustore_database_t* db;
 
-/** Opens the NVMe engine, in a library built with `USTORE_BUILD_NVME`. */
-void ustore_database_init_nvme(ustore_database_init_t* arguments);
+    /** Output for the error message. */
+    ustore_error_t* error;
+
+    /** Directory of the database, which must exist. */
+    ustore_str_view_t directory;
+
+    /** Directories the table files fill in order, or null to keep them in @c directory. */
+    ustore_data_directory_t const* data_directories;
+
+    /** Entries of @c data_directories. */
+    ustore_size_t data_directories_count;
+
+} ustore_database_init_rocksdb_t;
+
+/** Opens the RocksDB engine, or reports @c ustore_error_unsupported_k in a library built without it. */
+void ustore_database_init_rocksdb(ustore_database_init_rocksdb_t* arguments);
+
+/** The arguments of @c ustore_database_init_leveldb. */
+typedef struct ustore_database_init_leveldb_t {
+
+    /** Output for the opened database, unless @c error is set. */
+    ustore_database_t* db;
+
+    /** Output for the error message. */
+    ustore_error_t* error;
+
+    /** Directory of the database, which must exist. */
+    ustore_str_view_t directory;
+
+} ustore_database_init_leveldb_t;
+
+/** Opens the LevelDB engine, or reports @c ustore_error_unsupported_k in a library built without it. */
+void ustore_database_init_leveldb(ustore_database_init_leveldb_t* arguments);
+
+/** The arguments of @c ustore_database_init_nvme, where every zero size or count keeps the engine's default. */
+typedef struct ustore_database_init_nvme_t {
+
+    /** Output for the opened database, unless @c error is set. */
+    ustore_database_t* db;
+
+    /** Output for the error message. */
+    ustore_error_t* error;
+
+    /** Directory of the database's own files, which must exist. */
+    ustore_str_view_t directory;
+
+    /** Directories the volumes fill, or null for one inside @c directory. */
+    ustore_data_directory_t const* data_directories;
+
+    /** Entries of @c data_directories. */
+    ustore_size_t data_directories_count;
+
+    /** How bytes move between the files and memory. */
+    ustore_transport_t transport;
+
+    /** Bytes of host memory the engine may pin and cache. */
+    ustore_size_t memory_limit;
+
+    /** Background threads, derived from the cores by default. */
+    ustore_size_t threads;
+
+    /** CUDA devices compaction may run on, or null for none. */
+    int const* gpu_devices;
+
+    /** Entries of @c gpu_devices. */
+    ustore_size_t gpu_devices_count;
+
+    /** Bytes of device memory compaction may take on each of @c gpu_devices. */
+    ustore_size_t gpu_memory_limit;
+
+    /** I/O channels the threads share beyond their own. */
+    ustore_size_t shared_io_channels;
+
+    /** Submissions a channel keeps in flight. */
+    ustore_size_t queue_depth;
+
+    /** Bytes of each request buffer of a channel. */
+    ustore_size_t request_buffer_bytes;
+
+    /** Request buffers of each channel. */
+    ustore_size_t request_buffers_count;
+
+    /** Bytes of each streaming buffer of a channel. */
+    ustore_size_t stream_buffer_bytes;
+
+    /** Streaming buffers of each channel. */
+    ustore_size_t stream_buffers_count;
+
+    /** Bytes a transaction may buffer before it must commit. */
+    ustore_size_t transaction_max_bytes;
+
+    /** Writes a transaction may buffer before it must commit. */
+    ustore_size_t transaction_max_elements;
+
+    /** Operations that may run on one collection at once. */
+    ustore_size_t collection_concurrency_limit;
+
+    /** Bytes of values each collection may cache. */
+    ustore_size_t collection_cache_limit;
+
+    /** Bytes each collection buffers before it flushes a sorted run. */
+    ustore_size_t collection_write_buffer_max_bytes;
+
+    /** Writes each collection buffers before it flushes a sorted run. */
+    ustore_size_t collection_write_buffer_max_elements;
+
+    /** Bytes the first level of each collection holds before it compacts into the next. */
+    ustore_size_t collection_first_level_max_bytes;
+
+    /** How many times larger each level of a collection is than the one above it. */
+    ustore_size_t collection_level_enlarge_factor;
+
+    /** Bytes of every value of a collection whose values share one size, or zero for varying sizes. */
+    ustore_size_t collection_value_size;
+
+    /** Bytes of the largest value of a collection whose values vary in size. */
+    ustore_size_t collection_value_max_size;
+
+} ustore_database_init_nvme_t;
+
+/** Opens the NVMe engine, or reports @c ustore_error_unsupported_k in a library built without it. */
+void ustore_database_init_nvme(ustore_database_init_nvme_t* arguments);
 
 /** The arguments of @c ustore_get_metadata. */
 typedef struct ustore_get_metadata_t {

@@ -38,7 +38,7 @@
 #include <fmt/format.h>
 #include <fmt/ranges.h> // `fmt::join`
 
-#include <ustore/db.h> // `ustore_database_init_t` and the init call of every engine
+#include <ustore/db.h> // the init call of every engine and its arguments
 
 namespace unum::ustore {
 
@@ -391,23 +391,58 @@ inline void print_usage(std::string_view synopsis, std::span<flag_t const> flags
 
 #pragma endregion Arguments
 
-/** An engine's init call of the C ABI. */
-using database_init_t = void (*)(ustore_database_init_t*);
+#pragma region Engines
 
-/** The init call of the engine @p name names, or null for one this build lacks; the one place binaries tell the engines
- *  apart. */
-[[nodiscard]] inline database_init_t database_init_of(std::string_view name) noexcept {
-    if (name == "ram") return ustore_database_init_ram;
-#if USTORE_WITH_ROCKSDB
-    if (name == "rocksdb") return ustore_database_init_rocksdb;
-#endif
-#if USTORE_WITH_LEVELDB
-    if (name == "leveldb") return ustore_database_init_leveldb;
-#endif
-#if USTORE_WITH_NVME
-    if (name == "nvme") return ustore_database_init_nvme;
-#endif
-    return nullptr;
+/** The names @c --isolation accepts, in the order of @c ustore_isolation_t. */
+inline constexpr std::array<std::string_view, 2> isolation_names_k {"strict-serializable", "snapshot"};
+
+/** The names @c --engine-transport accepts, in the order of @c ustore_transport_t. */
+inline constexpr std::array<std::string_view, 5> transport_names_k {"automatic", "blocking", "linux-uring", "linux-aio",
+                                                                    "linux-spdk"};
+
+/** The engine a binary opens and the options its flags give the engine's init call. */
+struct engine_options_t {
+
+    /** The engine's name: @c ram, @c rocksdb, @c leveldb or @c nvme. */
+    std::string_view name = "ram";
+
+    /** The null-terminated database directory, or null for an in-memory database. */
+    char const* directory = nullptr;
+
+    /** How the transactions of @c ram see each other. */
+    choice_t isolation {isolation_names_k};
+
+    /** How @c nvme moves bytes between its files and memory. */
+    choice_t transport {transport_names_k};
+};
+
+/** Opens the engine @p options name into @p database; the one place binaries tell the engines apart. */
+inline void open_engine(engine_options_t const& options, ustore_database_t* database, ustore_error_t* error) noexcept {
+    if (options.name == "ram") {
+        ustore_database_init_ram_t init {.db = database,
+                                         .error = error,
+                                         .directory = options.directory,
+                                         .isolation = static_cast<ustore_isolation_t>(options.isolation.selected)};
+        return ustore_database_init_ram(&init);
+    }
+    if (options.name == "rocksdb") {
+        ustore_database_init_rocksdb_t init {.db = database, .error = error, .directory = options.directory};
+        return ustore_database_init_rocksdb(&init);
+    }
+    if (options.name == "leveldb") {
+        ustore_database_init_leveldb_t init {.db = database, .error = error, .directory = options.directory};
+        return ustore_database_init_leveldb(&init);
+    }
+    if (options.name == "nvme") {
+        ustore_database_init_nvme_t init {.db = database,
+                                          .error = error,
+                                          .directory = options.directory,
+                                          .transport = static_cast<ustore_transport_t>(options.transport.selected)};
+        return ustore_database_init_nvme(&init);
+    }
+    *error = {ustore_error_invalid_argument_k, "No engine has that name"};
 }
+
+#pragma endregion Engines
 
 } // namespace unum::ustore

@@ -275,15 +275,14 @@ class database_t {
         return metadata;
     }
 
-    /** Opens the engine behind @p init with the JSON @p config. */
-    static expected<database_t> open_(void (*init)(ustore_database_init_t*), ustore_str_view_t config) noexcept {
+    /** Opens the engine behind @p init with @p options, whose outputs this call fills in. */
+    template <typename options_type_>
+    static expected<database_t> open_(void (*init)(options_type_*), options_type_ options) noexcept {
         database_t database;
         ustore_error_t error {};
-        ustore_database_init_t database_init {};
-        database_init.config = config;
-        database_init.db = &database.database_;
-        database_init.error = &error;
-        init(&database_init);
+        options.db = &database.database_;
+        options.error = &error;
+        init(&options);
         if (error.status) return status_t {error};
         return database;
     }
@@ -299,34 +298,25 @@ class database_t {
     }
     operator ustore_database_t() const noexcept { return database_; }
 
-    /** Opens the in-memory engine, which persists as one image when @p config names a directory. */
-    static expected<database_t> ram(ustore_str_view_t config = nullptr) noexcept {
-        return open_(ustore_database_init_ram, config);
+    /** Opens the in-memory engine, which persists as one image when @p options name a directory. */
+    static expected<database_t> ram(ustore_database_init_ram_t options = {}) noexcept {
+        return open_(ustore_database_init_ram, options);
     }
 
-#if USTORE_WITH_ROCKSDB
-
-    /** Opens the RocksDB engine in the directory @p config names. */
-    static expected<database_t> rocksdb(ustore_str_view_t config = nullptr) noexcept {
-        return open_(ustore_database_init_rocksdb, config);
+    /** Opens the RocksDB engine in the directory @p options name. */
+    static expected<database_t> rocksdb(ustore_database_init_rocksdb_t options) noexcept {
+        return open_(ustore_database_init_rocksdb, options);
     }
-#endif
 
-#if USTORE_WITH_LEVELDB
-
-    /** Opens the LevelDB engine in the directory @p config names. */
-    static expected<database_t> leveldb(ustore_str_view_t config = nullptr) noexcept {
-        return open_(ustore_database_init_leveldb, config);
+    /** Opens the LevelDB engine in the directory @p options name. */
+    static expected<database_t> leveldb(ustore_database_init_leveldb_t options) noexcept {
+        return open_(ustore_database_init_leveldb, options);
     }
-#endif
 
-#if USTORE_WITH_NVME
-
-    /** Opens the NVMe engine over the directories @p config names. */
-    static expected<database_t> nvme(ustore_str_view_t config = nullptr) noexcept {
-        return open_(ustore_database_init_nvme, config);
+    /** Opens the NVMe engine over the directories @p options name. */
+    static expected<database_t> nvme(ustore_database_init_nvme_t options) noexcept {
+        return open_(ustore_database_init_nvme, options);
     }
-#endif
 
     void close() noexcept {
         ustore_database_free(database_);

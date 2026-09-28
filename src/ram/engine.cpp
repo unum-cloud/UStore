@@ -49,7 +49,6 @@
 
 #include "engine.hpp"                 // `engine_t`, `handle_t`, `handle_cast`
 #include "helpers/blocking_files.hpp" // `directory_exists`
-#include "helpers/config_loader.hpp"  // `load_config`, `read_json_member`
 #include "helpers/linked_array.hpp"   // `uninitialized_array`
 #include "helpers/linked_memory.hpp"  // `linked_memory_lock_t`
 #include "ram/key.hpp"                // `stored_key_t`
@@ -1688,55 +1687,6 @@ void serve_database(arguments_type_& arguments) noexcept {
     std::visit([&](auto& state) noexcept { serve(state, arguments); }, database.state);
 }
 
-/** One isolation a configuration may name. */
-struct isolation_name_t {
-
-    /** The name in the configuration, empty for the default. */
-    std::string_view name;
-
-    /** The isolation it names. */
-    isolation_t isolation;
-};
-
-/** Every isolation a configuration may name. */
-inline constexpr std::array<isolation_name_t, 3> isolation_names_k {{
-    {"", isolation_t::strict_serializable_k},
-    {"strict_serializable", isolation_t::strict_serializable_k},
-    {"snapshot", isolation_t::snapshot_k},
-}};
-
-/** Reads the isolation @p name names into @p isolation, answering whether it names one. */
-inline bool parse_isolation(std::string_view name, isolation_t& isolation) noexcept {
-    for (isolation_name_t const& known : isolation_names_k) {
-        if (known.name != name) continue;
-        isolation = known.isolation;
-        return true;
-    }
-    return false;
-}
-
-/** Loads the configuration @p text into @p config and @p isolation, refusing what the engine does not support. */
-inline void load_configuration(char const* text, config_t& config, isolation_t& isolation,
-                               ustore_error_t* error) noexcept {
-    if (!text || text[0] == '\0') return;
-    auto const loaded = load_config(text, config);
-    if (loaded.failed()) {
-        *error = loaded;
-        return;
-    }
-    std::string_view requested;
-    if (!read_json_member(config.document.root(), "isolation", requested))
-        *error = {ustore_error_malformed_k, "The isolation must be a string"};
-    else if (!parse_isolation(requested, isolation))
-        *error = {ustore_error_invalid_argument_k, "Unknown isolation: expected strict_serializable or snapshot"};
-    else if (!config.directory.empty() && !names_directory(config.directory.data()))
-        *error = {ustore_error_not_found_k, "The directory doesn't exist"};
-    else if (config.data_directories.size() != 0)
-        *error = {ustore_error_unsupported_k, "Multiple data directories aren't supported"};
-    else if (!config.engine.config_url.empty() || config.engine.config)
-        *error = {ustore_error_unsupported_k, "Engine options aren't supported"};
-}
-
 /** Allocates a database at @p isolation_ and loads the image of @p directory, or answers null. */
 template <isolation_t isolation_>
 database_t* make_database(std::string_view directory, ustore_error_t* error) noexcept {
@@ -1803,19 +1753,26 @@ using namespace unum::ustore::ram;
 
 #pragma region C ABI
 
-void ustore_database_init_ram(ustore_database_init_t* arguments) {
+void ustore_database_init_ram(ustore_database_init_ram_t* arguments) {
     if (!arguments->db) {
         *arguments->error = {ustore_error_invalid_argument_k, "Need an output for the database"};
         return;
     }
-    config_t config;
-    isolation_t isolation = isolation_t::strict_serializable_k;
-    load_configuration(arguments->config, config, isolation, arguments->error);
-    if (arguments->error->status) return;
-    database_t* const database = isolation == isolation_t::snapshot_k
-                                     ? make_database<isolation_t::snapshot_k>(config.directory, arguments->error)
-                                     : make_database<isolation_t::strict_serializable_k>(config.directory,
-                                                                                         arguments->error);
+    std::string_view const directory = arguments->directory ? arguments->directory : "";
+    if (!directory.empty() && !names_directory(arguments->directory)) {
+        *arguments->error = {ustore_error_not_found_k, "The directory doesn't exist"};
+        return;
+    }
+    database_t* database = nullptr;
+    switch (arguments->isolation) {
+    case ustore_isolation_strict_serializable_k:
+        database = make_database<isolation_t::strict_serializable_k>(directory, arguments->error);
+        break;
+    case ustore_isolation_snapshot_k:
+        database = make_database<isolation_t::snapshot_k>(directory, arguments->error);
+        break;
+    default: *arguments->error = {ustore_error_invalid_argument_k, "Unknown isolation"}; return;
+    }
     *arguments->db = static_cast<handle_t*>(database);
 }
 

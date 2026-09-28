@@ -10,7 +10,7 @@
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uintmax_t`
-#include <cstdio>  // `stderr`, `std::fopen`, `std::fread`, `std::fclose`
+#include <cstdio>  // `stderr`
 
 #include <array>            // `std::array`
 #include <chrono>           // `std::chrono::steady_clock`
@@ -61,14 +61,11 @@ struct settings_t {
     /** Format of the input files and the exports. */
     choice_t format {format_names_k};
 
-    /** File holding the database configuration as JSON; without it the database lives in @c directory. */
-    std::string_view config;
-
-    /** Directory the exports are written to, and the database lives in without @c config. */
+    /** Directory the exports are written to and the database lives in. */
     std::string_view directory;
 
-    /** The engine to open: @c ram, @c rocksdb, @c leveldb or @c nvme. */
-    std::string_view engine = "ram";
+    /** The engine to open and the options of its init call. */
+    engine_options_t engine;
 
     /** Field holding the document keys. */
     std::string_view id_field;
@@ -122,18 +119,6 @@ struct tabular_t {
     /** The null-terminated path of the input file at @p index. */
     [[nodiscard]] char const* path(std::size_t index) const noexcept { return paths.data() + files[index].path_offset; }
 };
-
-/** Reads the whole file at @p path into @p content, answering whether it succeeded. */
-[[nodiscard]] bool read_file(char const* path, sz::string_t& content) noexcept {
-    std::FILE* const file = std::fopen(path, "rb");
-    if (!file) return false;
-    bool loaded = std::fseek(file, 0, SEEK_END) == 0;
-    long const size = loaded ? std::ftell(file) : -1;
-    loaded = size >= 0 && std::fseek(file, 0, SEEK_SET) == 0 && content.try_resize(static_cast<std::size_t>(size));
-    loaded = loaded && std::fread(content.data(), 1, content.size(), file) == content.size();
-    [[maybe_unused]] int const closed = std::fclose(file);
-    return loaded;
-}
 
 /** Remembers the path and size of @p name under @p directory, answering whether both fit. */
 [[nodiscard]] bool remember_file(tabular_t& tabular, sz::string_t const& directory, char const* name) noexcept {
@@ -418,13 +403,13 @@ int main(int argc, char** argv) {
     using namespace unum::ustore::bench;
 
     settings_t settings;
-    std::array<flag_t, 12> const flags {{
+    std::array<flag_t, 13> const flags {{
         {"--dataset", "path", "directory of input files, required", &settings.dataset},
         {"--format", "name", "format of the input files and the exports", &settings.format},
-        {"--config", "path", "JSON file configuring the database", &settings.config},
-        {"--engine", "name", "engine to open: ram, rocksdb, leveldb or nvme", &settings.engine},
-        {"--directory", "path", "directory of the exports and of the database without --config, required",
-         &settings.directory},
+        {"--engine", "name", "engine to open: ram, rocksdb, leveldb or nvme", &settings.engine.name},
+        {"--isolation", "name", "isolation of the transactions of ram", &settings.engine.isolation},
+        {"--engine-transport", "name", "transport of nvme", &settings.engine.transport},
+        {"--directory", "path", "directory of the exports and of the database, required", &settings.directory},
         {"--id-field", "field", "field holding each document's key, required", &settings.id_field},
         {"--source-field", "field", "integer field holding the source vertex, required", &settings.source_field},
         {"--target-field", "field", "integer field holding the target vertex, required", &settings.target_field},
@@ -461,28 +446,9 @@ int main(int argc, char** argv) {
     tabular_t tabular;
     if (!list_files(settings, tabular)) return 1;
 
-    sz::string_t config;
-    bool const configured = settings.config.empty()
-                                ? config.try_append(R"({"version": "1.0", "directory": ")") &&
-                                      config.try_append(settings.directory.data(), settings.directory.size()) &&
-                                      config.try_append(R"("})")
-                                : read_file(settings.config.data(), config);
-    if (!configured) {
-        fmt::println(stderr, "Failed to prepare the database configuration");
-        return 1;
-    }
-
-    database_init_t const init_database = database_init_of(settings.engine);
-    if (!init_database) {
-        fmt::println(stderr, "This build carries no engine named {}", settings.engine);
-        return 1;
-    }
     ustore_error_t error {};
-    ustore_database_init_t init {};
-    init.config = config.c_str();
-    init.db = &tabular.db;
-    init.error = &error;
-    init_database(&init);
+    settings.engine.directory = settings.directory.data();
+    open_engine(settings.engine, &tabular.db, &error);
     if (error.status) {
         fmt::println(stderr, "Failed to open the database: {}", error.message);
         return 1;

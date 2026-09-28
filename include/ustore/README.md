@@ -69,12 +69,12 @@ ustore_arena_t arena = NULL;
 ```c
 #include <ustore/ustore.h>
 
-ustore_database_init_t init = {
-    .config = "{}",
+ustore_database_init_rocksdb_t init = {
     .db = &db,
     .error = &error,
+    .directory = "/var/lib/ustore",
 };
-ustore_database_init(&init);
+ustore_database_init_rocksdb(&init);
 if (error.status != ustore_success_k)
     fprintf(stderr, "%s\n", error.message);
 
@@ -82,7 +82,8 @@ ustore_arena_free(arena);
 ustore_database_free(db);
 ```
 
-The `config` is a JSON string, and every freeing function accepts `NULL`.
+Each engine opens through its own call, `ustore_database_init_ram`, `_rocksdb`, `_leveldb` or `_nvme`, whose arguments hold what that engine can be asked, and a zero field keeps the engine's default.
+Every freeing function accepts `NULL`.
 `ustore_get_metadata` reports whether the engine supports transactions, collections and snapshots.
 
 ### Collections

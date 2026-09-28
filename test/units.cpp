@@ -723,7 +723,7 @@ case_result_t database_export_snapshot(test_config_t const& config) {
     failures += expect(recreate_directory(first_export_directory.c_str()));
     failures += expect(recreate_directory(second_export_directory.c_str()));
 
-    test_config_t const original_config {config.engine(), original_directory.c_str(), config.engine_config()};
+    test_config_t const original_config {config.options(), original_directory.c_str()};
     database_t database;
     failures += expect(open_database(database, original_config).succeeded());
     if (failures != 0) return failures;
@@ -742,7 +742,7 @@ case_result_t database_export_snapshot(test_config_t const& config) {
     failures += expect(first_snapshot.export_to(first_export_directory.c_str()).succeeded());
     failures += check_equalities(collection_reference, triplet);
 
-    test_config_t const first_config {config.engine(), first_export_directory.c_str(), config.engine_config()};
+    test_config_t const first_config {config.options(), first_export_directory.c_str()};
     database_t first_export;
     failures += expect(open_database(first_export, first_config).succeeded());
     if (failures != 0) return failures;
@@ -756,7 +756,7 @@ case_result_t database_export_snapshot(test_config_t const& config) {
     failures += expect(second_snapshot.export_to(second_export_directory.c_str()).succeeded());
     failures += check_equalities(collection_reference, same_values_triplet);
 
-    test_config_t const second_config {config.engine(), second_export_directory.c_str(), config.engine_config()};
+    test_config_t const second_config {config.options(), second_export_directory.c_str()};
     database_t second_export;
     failures += expect(open_database(second_export, second_config).succeeded());
     if (failures != 0) return failures;
@@ -1826,7 +1826,7 @@ int main(int argc, char** argv) {
     char const* const directory = maybe_test_directory->path();
     if (directory) fmt::println("Will work in directory: {}", directory);
     else fmt::println("Will work with default configuration");
-    test_config_t const config {options.engine, directory, options.engine_config};
+    test_config_t const config {options.engine, directory};
 
     report(totals, "database.open_clear_close", database_open_clear_close, config);
     report(totals, "database.clear_by_clearing_db", database_clear_collection_by_clearing_database, config);

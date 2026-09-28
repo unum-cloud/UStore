@@ -24,6 +24,22 @@ using namespace unum::ustore;
 using namespace unum::ustore::test;
 using namespace unum;
 
+/** Every engine refuses an init without an output, and all but the in-memory one refuse to open without a directory. */
+std::size_t database_init_refusals(test_config_t const& config) {
+    std::size_t failures = 0;
+    ustore_error_t error {};
+    open_engine(config.options(), nullptr, &error);
+    failures += expect_error(error);
+
+    engine_options_t without_directory = config.options();
+    without_directory.directory = nullptr;
+    ustore_database_t database = nullptr;
+    open_engine(without_directory, &database, &error);
+    failures += config.engine() == "ram" ? expect_no_error(error) : expect_error(error);
+    ustore_database_free(database);
+    return failures;
+}
+
 /** Writes, reads, transactions and scans accept valid tasks and reject malformed ones, per engine capability. */
 std::size_t database_validation(test_config_t const& config) {
     std::size_t failures = 0;
@@ -385,8 +401,9 @@ int main(int argc, char** argv) {
         fmt::println(stderr, "Cannot create a unique directory under {}", options.directory);
         return 1;
     }
-    test_config_t const config {options.engine, maybe_directory->path(), options.engine_config};
+    test_config_t const config {options.engine, maybe_directory->path()};
 
+    report(totals, "database.init_refusals", database_init_refusals, config);
     report(totals, "database.validation", database_validation, config);
     return suite_exit_code(totals);
 }
