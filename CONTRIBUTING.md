@@ -215,7 +215,7 @@ Start with these, in order:
 1. Opening and closing: `ustore_database_init()`, `ustore_database_free()`.
 2. Metadata, including the isolation level the engine delivers: `ustore_database_capabilities()`.
 3. Binary values in the main collection: `ustore_write()`, `ustore_read()`.
-4. Named collections: `ustore_collection_list()`, `ustore_collection_create()`, `ustore_collection_drop()`.
+4. Collections and their names: `ustore_collection_create()`, `ustore_collection_find()`, `ustore_collection_list()`, `ustore_collection_drop()`.
 5. Transactions: `ustore_transaction_init()`, `ustore_transaction_stage()`, `ustore_transaction_commit()`, `ustore_transaction_free()`.
 6. Scans, resuming from the last returned key: `ustore_scan()`.
 7. Sampling and measurements: `ustore_sample()`, `ustore_database_control()`, `ustore_measure()`.

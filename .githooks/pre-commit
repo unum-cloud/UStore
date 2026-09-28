@@ -640,13 +640,20 @@ check_expected_bindings() {
         "$file binds an expected as [payload, participle] - the status half is \`status\` or \`<verb>_status\`:"
 }
 
-# A class template takes a bare name - `class blobs_ref`, never `class blobs_ref_gt` - and `_at` belongs to no
-# identifier at all: template parameters end in a single underscore, and `_t` marks only a materialized type.
+# A class template takes a bare name - `class blobs_ref`, never `class blobs_ref_gt` - and nothing UStore declares ends
+# in `_at`: template parameters end in a single underscore, and `_t` marks only a materialized type. A declaration
+# follows a type, so a call into a sibling that spells its members so, like SmashTable's `reader_at`, passes.
 check_suffixed_template_names() {
     local suffixed
     suffixed=$(printf '%s\n' "$added" | grep -vE '^\+[[:space:]]*(\*|//|/\*)' |
         sed -e 's/R"\([A-Za-z_]*\)(.*)\1"/""/g' -e 's/"[^"]*"/""/g' |
-        grep -E '\b(class|struct|union|using)[[:space:]]+[A-Za-z_][A-Za-z0-9_]*_(gt|at)\b|\b[A-Za-z_][A-Za-z0-9_]*_at\b' || true)
+        awk '{
+            probe = $0
+            gsub(/(^|[^A-Za-z0-9_])(return|co_return|throw|case|else|new|delete)[[:space:]]+/, " (", probe)
+            if (probe ~ /(^|[^A-Za-z0-9_])(class|struct|union|using)[[:space:]]+[A-Za-z_][A-Za-z0-9_]*_(gt|at)([^A-Za-z0-9_]|$)/ ||
+                probe ~ /[A-Za-z0-9_>*&][[:space:]]+[A-Za-z_][A-Za-z0-9_]*_at([^A-Za-z0-9_]|$)/)
+                print
+        }' || true)
     [ -z "$suffixed" ] || fail "$suffixed" \
         "$file names a symbol with a _gt or _at suffix - write \`template <typename store_> class blobs_ref\`:"
 }

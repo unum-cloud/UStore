@@ -295,7 +295,7 @@ struct json_document_t {
     ustore_error_t error {};
     ustore_octet_t* presences = nullptr;
     ustore_collection_t* ids = nullptr;
-    ustore_named_collections_find_t find {};
+    ustore_collection_find_t find {};
     find.db = database;
     find.error = &error;
     find.arena = &arena;
@@ -303,7 +303,7 @@ struct json_document_t {
     find.names = &name;
     find.presences = &presences;
     find.ids = &ids;
-    ustore_named_collections_find(&find);
+    ustore_collection_find(&find);
     bool const found = !error.status && (presences[0] & 1);
     ustore_arena_free(arena);
     return found;

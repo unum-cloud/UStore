@@ -10,7 +10,7 @@
 //!
 //! let database = Database::open_ram(&RAMOptions::default())?;
 //! let mut arena = Arena::new();
-//! let follows = database.create_collection(&mut arena, "follows")?;
+//! let follows = database.create_collection("follows")?;
 //!
 //! let edges = [Edge::new(1, 2), Edge::new(1, 3), Edge::new(2, 3)];
 //! database.head().upsert_edges(&mut arena, follows, &edges, Durability::Buffered)?;
@@ -499,7 +499,7 @@ mod tests {
     fn populated() -> (Database, Arena, Collection) {
         let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
-        let graph = database.create_collection(&mut arena, "graph").unwrap();
+        let graph = database.create_collection("graph").unwrap();
         let edges = [Edge::new(1, 2), Edge::new(1, 3), Edge::new(2, 3)];
         database
             .head()
@@ -747,8 +747,8 @@ mod tests {
     fn one_batch_spans_several_graph_collections() {
         let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
-        let follows = database.create_collection(&mut arena, "follows").unwrap();
-        let blocks = database.create_collection(&mut arena, "blocks").unwrap();
+        let follows = database.create_collection("follows").unwrap();
+        let blocks = database.create_collection("blocks").unwrap();
         let spanned = [follows, blocks];
 
         let edges = [Edge::new(1, 2), Edge::new(1, 3)];

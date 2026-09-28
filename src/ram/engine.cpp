@@ -4,11 +4,14 @@
  *  @date January 9, 2023
  *  @brief Embedded in-memory engine on SmashTable, strictly serializable or snapshot-isolated as configured at open.
  *
- *  Collections, their catalog and the counter numbering them share one partitioned multi-version store ordered by
- *  collection and key. Every exported call visits the isolation once, resolves the one view it reads - the head, a
- *  snapshot or a transaction - and runs a template specialised for both. Snapshots are pinned readers in a lock-free
- *  slot directory and the catalog changes through store transactions, so the engine adds no lock of its own.
- *  A database with a directory persists as one binary image, rewritten whole on a flush and on close.
+ *  Collections keyed by integers, their catalog and the counter numbering them share one partitioned multi-version
+ *  store ordered by collection and key. Collections keyed by strings and the names of collections share a second one
+ *  ordered by collection and string. Both are built into one commit order, so a transaction spanning them publishes
+ *  under one stamp and a snapshot reads both at it. Every exported call visits the isolation once, resolves the one
+ *  view it reads - the head, a snapshot or a transaction - and runs a template specialised for both. Snapshots are
+ *  pinned readers in a lock-free slot directory and the catalog changes through store transactions, so the engine
+ *  adds no lock of its own. A database with a directory persists as one binary image, rewritten whole on a flush and
+ *  on close.
  */
 
 #include <cstddef> // `std::size_t`
@@ -26,16 +29,17 @@
 #include <algorithm>   // `std::max`, `std::min`
 #include <array>       // `std::array`
 #include <bit>         // `std::bit_width`
-#include <charconv>    // `std::to_chars`
 #include <chrono>      // `std::chrono::steady_clock`
 #include <limits>      // `std::numeric_limits`
 #include <memory>      // `std::destroy_n`, `std::unique_ptr`
 #include <new>         // `std::nothrow`, placement `new`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
-#include <utility>     // `std::exchange`, `std::move`
+#include <type_traits> // `std::remove_cvref_t`
+#include <utility>     // `std::exchange`, `std::forward`, `std::move`
 #include <variant>     // `std::in_place_type`, `std::variant`, `std::visit`
 
+#include <fmt/format.h> // `fmt::format_to_n`
 #include <forkunion/atomics.hpp>
 #include <smashtable/basic_avl_tree.hpp>
 #include <smashtable/basic_vector.hpp>
@@ -45,13 +49,14 @@
 
 #include <ustore/blobs.h>
 #include <ustore/db.h>
-#include <ustore/ranges_args.hpp> // `places_arg_t`, `contents_arg_t`, `scans_arg_t`, `validate_read`
+#include <ustore/ranges_args.hpp> // `places_arg_t`, `contents_arg_t`, `scans_arg_t`, `strings_arg_t`, `validate_read`
+#include <ustore/strings.h>
 
 #include "engine.hpp"                 // `engine_t`, `handle_t`, `handle_cast`
 #include "helpers/blocking_files.hpp" // `directory_exists`
-#include "helpers/linked_array.hpp"   // `uninitialized_array`
+#include "helpers/linked_array.hpp"   // `growing_tape_t`, `uninitialized_array`
 #include "helpers/linked_memory.hpp"  // `linked_memory_lock_t`
-#include "ram/key.hpp"                // `stored_key_t`
+#include "ram/key.hpp"                // `stored_key_t`, `string_key_t`
 
 namespace unum::ustore::ram {
 
@@ -69,9 +74,6 @@ using walk_control_t = st::walk_control_t;
 /** Whether a transaction's writes sit in the store, invisible. */
 using staging_t = st::staging_t;
 
-/** The bytes of one value, owned by the store. */
-using blob_t = st::basic_vector<ustore_byte_t>;
-
 /** A value filed under its key. */
 using pair_t = st::mapping<stored_key_t, blob_t>;
 
@@ -82,6 +84,19 @@ using tree_t = st::basic_avl_tree<pair_t, stored_key_order_t, st::default_alloca
 template <isolation_t isolation_>
 using ordered_store = st::partitioned_store<st::snapshot_store<tree_t, isolation_>, stored_key_hash_t>;
 
+/** A string of a collection keyed by strings with its value, or a collection name with its record. */
+using string_pair_t = st::mapping<string_key_t, blob_t>;
+
+/** The ordered core every partition of the strings store keeps its versions in. */
+using string_tree_t = st::basic_avl_tree<string_pair_t, string_key_order_t, st::default_allocator<string_pair_t>>;
+
+/** Every string pair and every collection name of a database at @p isolation_, in the order of its other pairs. */
+template <isolation_t isolation_>
+using strings_store = st::partitioned_store<st::snapshot_store<string_tree_t, isolation_>, string_key_hash_t>;
+
+/** The order both stores of a database commit in, so one stamp spans a commit reaching both. */
+using order_t = ordered_store<isolation_t::snapshot_k>::order_t;
+
 /** A view of every partition pinned at one stamp, recording nothing. */
 template <isolation_t isolation_>
 using pinned_reader = typename ordered_store<isolation_>::reader_t;
@@ -90,10 +105,19 @@ using pinned_reader = typename ordered_store<isolation_>::reader_t;
 template <isolation_t isolation_>
 using store_transaction = typename ordered_store<isolation_>::transaction_t;
 
+/** A transaction over both stores of a database, which publishes both under one stamp. */
+template <isolation_t isolation_>
+using stores_transaction = st::transaction_group<ordered_store<isolation_>, strings_store<isolation_>>;
+
 static_assert(ordered_store<isolation_t::strict_serializable_k>::isolation_k == isolation_t::strict_serializable_k,
               "the partitions must keep the strict serializability of their stores");
 static_assert(ordered_store<isolation_t::snapshot_k>::isolation_k == isolation_t::snapshot_k,
               "the partitions must keep the snapshot isolation of their stores");
+static_assert(strings_store<isolation_t::strict_serializable_k>::isolation_k == isolation_t::strict_serializable_k,
+              "the strings must keep the isolation of the pairs they commit with");
+static_assert(stores_transaction<isolation_t::snapshot_k>::shares_one_order_k &&
+                  stores_transaction<isolation_t::strict_serializable_k>::shares_one_order_k,
+              "a transaction over both stores must publish them under one stamp");
 
 /** How many times an engine-internal commit is attempted before its conflicts reach the caller. */
 inline constexpr std::size_t commit_attempts_k = 16;
@@ -148,6 +172,13 @@ inline st::expected<blob_t> copy_blob(value_view_t value) noexcept {
 /** Views the bytes of a stored blob. */
 inline value_view_t view_of(blob_t const& blob) noexcept {
     return value_view_t {blob.data(), static_cast<ustore_length_t>(blob.size())};
+}
+
+/** The key of @p text in @p collection, owning a copy of its bytes. */
+inline st::expected<string_key_t> string_key_of(ustore_collection_t collection, std::string_view text) noexcept {
+    auto [copied, copy_blob_status] = copy_blob(value_view_t {text});
+    if (st::failed(copy_blob_status)) return copy_blob_status;
+    return string_key_t {collection, std::move(copied)};
 }
 
 #pragma endregion Store
@@ -389,8 +420,14 @@ class snapshot_directory {
 template <isolation_t isolation_>
 struct database_state {
 
-    /** Every pair, every catalog entry and the collection counter. */
-    ordered_store<isolation_> store;
+    /** The order both stores commit in. */
+    order_t order;
+
+    /** Every pair of the collections keyed by integers, every catalog entry and the collection counter. */
+    ordered_store<isolation_> store {order};
+
+    /** Every pair of the collections keyed by strings and the record of every collection name. */
+    strings_store<isolation_> strings {order};
 
     /** Every open snapshot. */
     snapshot_directory<isolation_> snapshots;
@@ -423,14 +460,20 @@ struct transaction_header_t : handle_t {
 template <isolation_t isolation_>
 struct transaction_handle : transaction_header_t {
 
-    /** The transaction over every partition. */
-    store_transaction<isolation_> transaction;
+    /** The transaction over both stores. */
+    stores_transaction<isolation_> transaction;
 
     /** Whether the writes of the transaction are staged. */
     staging_t staging {staging_t::pending_k};
 
-    explicit transaction_handle(store_transaction<isolation_>&& opened) noexcept
+    explicit transaction_handle(stores_transaction<isolation_>&& opened) noexcept
         : transaction_header_t {{&engine_k}, isolation_}, transaction(std::move(opened)) {}
+
+    /** The part of the transaction over the store keyed as @p keying_. */
+    template <keying_t keying_>
+    auto& part() noexcept {
+        return transaction.template participant<keying_ == keying_t::strings_k ? 1 : 0>();
+    }
 };
 
 /** The transaction behind @p transaction, or null after reporting one of another isolation. */
@@ -446,96 +489,116 @@ transaction_handle<isolation_>* transaction_of(ustore_transaction_t transaction,
 
 #pragma region Views
 
-/** Reads what the newest published commit shows, recording nothing. */
-template <isolation_t isolation_>
+/** Reads what the newest published commit of @p store_type_ shows, recording nothing. */
+template <typename store_type_>
 struct head_view {
 
-    /** The store being read. */
-    ordered_store<isolation_> const& store;
+    /** Whether @c watch records anything. */
+    static constexpr bool watches_k = false;
 
-    template <typename found_type_, typename missing_type_>
-    store_status_t find(stored_key_t const& key, found_type_&& found, missing_type_&& missing) const noexcept {
+    /** The store being read. */
+    store_type_ const& store;
+
+    template <typename key_type_, typename found_type_, typename missing_type_>
+    store_status_t find(key_type_ const& key, found_type_&& found, missing_type_&& missing) const noexcept {
         return store.find(key, found, missing);
     }
 
-    template <typename callback_type_>
-    store_status_t range(stored_key_t const& lower, stored_key_t const& upper,
-                         callback_type_&& callback) const noexcept {
+    template <typename key_type_, typename callback_type_>
+    store_status_t range(key_type_ const& lower, key_type_ const& upper, callback_type_&& callback) const noexcept {
         return store.range(lower, upper, callback);
     }
 
     store_status_t prepare(std::size_t) const noexcept { return store_status_t::success_k; }
 
-    store_status_t watch(stored_key_t const&) const noexcept { return store_status_t::success_k; }
+    template <typename key_type_>
+    store_status_t watch(key_type_ const&) const noexcept {
+        return store_status_t::success_k;
+    }
 };
 
 /** Reads at the stamp a snapshot pinned, recording nothing. */
-template <isolation_t isolation_>
+template <typename reader_type_>
 struct snapshot_view {
 
-    /** The reader of the snapshot. */
-    pinned_reader<isolation_> const& reader;
+    /** Whether @c watch records anything. */
+    static constexpr bool watches_k = false;
 
-    template <typename found_type_, typename missing_type_>
-    store_status_t find(stored_key_t const& key, found_type_&& found, missing_type_&& missing) const noexcept {
+    /** The reader of the snapshot. */
+    reader_type_ const& reader;
+
+    template <typename key_type_, typename found_type_, typename missing_type_>
+    store_status_t find(key_type_ const& key, found_type_&& found, missing_type_&& missing) const noexcept {
         return reader.find(key, found, missing);
     }
 
-    template <typename callback_type_>
-    store_status_t range(stored_key_t const& lower, stored_key_t const& upper,
-                         callback_type_&& callback) const noexcept {
+    template <typename key_type_, typename callback_type_>
+    store_status_t range(key_type_ const& lower, key_type_ const& upper, callback_type_&& callback) const noexcept {
         return reader.range(lower, upper, callback);
     }
 
     store_status_t prepare(std::size_t) const noexcept { return store_status_t::success_k; }
 
-    store_status_t watch(stored_key_t const&) const noexcept { return store_status_t::success_k; }
+    template <typename key_type_>
+    store_status_t watch(key_type_ const&) const noexcept {
+        return store_status_t::success_k;
+    }
 };
 
 /** Reads at the snapshot of a transaction, which records what it read from @c serializable_k up. */
-template <isolation_t isolation_>
+template <typename transaction_type_>
 struct transaction_view {
 
-    /** The transaction being read through. */
-    store_transaction<isolation_>& transaction;
+    /** Whether @c watch records anything. */
+    static constexpr bool watches_k = false;
 
-    template <typename found_type_, typename missing_type_>
-    store_status_t find(stored_key_t const& key, found_type_&& found, missing_type_&& missing) const noexcept {
+    /** The transaction being read through. */
+    transaction_type_& transaction;
+
+    template <typename key_type_, typename found_type_, typename missing_type_>
+    store_status_t find(key_type_ const& key, found_type_&& found, missing_type_&& missing) const noexcept {
         return transaction.find(key, found, missing);
     }
 
-    template <typename callback_type_>
-    store_status_t range(stored_key_t const& lower, stored_key_t const& upper,
-                         callback_type_&& callback) const noexcept {
+    template <typename key_type_, typename callback_type_>
+    store_status_t range(key_type_ const& lower, key_type_ const& upper, callback_type_&& callback) const noexcept {
         return transaction.range(lower, upper, callback);
     }
 
     store_status_t prepare(std::size_t count) const noexcept { return transaction.reserve(count); }
 
-    store_status_t watch(stored_key_t const&) const noexcept { return store_status_t::success_k; }
+    template <typename key_type_>
+    store_status_t watch(key_type_ const&) const noexcept {
+        return store_status_t::success_k;
+    }
 };
 
 /** Reads through a snapshot-isolated transaction, watching every key it hands out. */
-template <isolation_t isolation_>
+template <typename transaction_type_>
 struct watching_view {
 
-    /** The transaction being read through. */
-    store_transaction<isolation_>& transaction;
+    /** Whether @c watch records anything. */
+    static constexpr bool watches_k = true;
 
-    template <typename found_type_, typename missing_type_>
-    store_status_t find(stored_key_t const& key, found_type_&& found, missing_type_&& missing) const noexcept {
+    /** The transaction being read through. */
+    transaction_type_& transaction;
+
+    template <typename key_type_, typename found_type_, typename missing_type_>
+    store_status_t find(key_type_ const& key, found_type_&& found, missing_type_&& missing) const noexcept {
         return transaction.find_and_watch(key, found, missing);
     }
 
-    template <typename callback_type_>
-    store_status_t range(stored_key_t const& lower, stored_key_t const& upper,
-                         callback_type_&& callback) const noexcept {
+    template <typename key_type_, typename callback_type_>
+    store_status_t range(key_type_ const& lower, key_type_ const& upper, callback_type_&& callback) const noexcept {
         return transaction.range(lower, upper, callback);
     }
 
     store_status_t prepare(std::size_t count) const noexcept { return transaction.reserve(count); }
 
-    store_status_t watch(stored_key_t const& key) const noexcept { return transaction.watch(key); }
+    template <typename key_type_>
+    store_status_t watch(key_type_ const& key) const noexcept {
+        return transaction.watch(key);
+    }
 };
 
 /** The view a read, scan, sample, measure or listing names. */
@@ -551,8 +614,15 @@ struct view_request_t {
     ustore_options_t options;
 };
 
-/** Hands @p action the view @p request names, or reports why none exists. */
-template <isolation_t isolation_, typename action_type_>
+/** The store of @p state keyed as @p keying_. */
+template <keying_t keying_, isolation_t isolation_>
+auto& store_of(database_state<isolation_>& state) noexcept {
+    if constexpr (keying_ == keying_t::strings_k) return state.strings;
+    else return state.store;
+}
+
+/** Hands @p action the view of the store keyed as @p keying_ that @p request names, or reports why none exists. */
+template <keying_t keying_ = keying_t::integers_k, isolation_t isolation_, typename action_type_>
 void with_view(database_state<isolation_>& state, view_request_t const& request, ustore_error_t* error,
                action_type_&& action) noexcept {
     if (request.snapshot) {
@@ -561,16 +631,21 @@ void with_view(database_state<isolation_>& state, view_request_t const& request,
             *error = {ustore_error_not_found_k, "The snapshot doesn't exist"};
             return;
         }
-        return action(snapshot_view<isolation_> {*reader});
+        if constexpr (keying_ == keying_t::strings_k) {
+            // The directory's reader holds the claim, so the strings read at its stamp without one of their own
+            auto const strings = state.strings.reader_at(reader->snapshot());
+            return action(snapshot_view {strings});
+        }
+        else return action(snapshot_view {*reader});
     }
-    if (!request.transaction) return action(head_view<isolation_> {state.store});
+    if (!request.transaction) return action(head_view {store_of<keying_>(state)});
 
     transaction_handle<isolation_>* const handle = transaction_of<isolation_>(request.transaction, error);
     if (!handle) return;
     bool const watches = isolation_ == isolation_t::snapshot_k &&
                          !(request.options & ustore_option_transaction_dont_watch_k);
-    if (watches) return action(watching_view<isolation_> {handle->transaction});
-    action(transaction_view<isolation_> {handle->transaction});
+    if (watches) return action(watching_view {handle->template part<keying_>()});
+    action(transaction_view {handle->template part<keying_>()});
 }
 
 #pragma endregion Views
@@ -601,7 +676,8 @@ class value_tape {
     }
 
   public:
-    value_tape(linked_memory_lock_t& arena, ustore_read_t& arguments) noexcept
+    template <typename arguments_type_>
+    value_tape(linked_memory_lock_t& arena, arguments_type_& arguments) noexcept
         : arena_(arena), error_(arguments.error),
           presences_(arena.alloc_or_dummy(arguments.tasks_count, arguments.error, arguments.presences)),
           offsets_(arena.alloc_or_dummy(arguments.tasks_count + 1, arguments.error, arguments.offsets)),
@@ -783,16 +859,35 @@ store_status_t measure_window(view_type_ const& view, stored_key_t const& lower,
     });
 }
 
-/** The collections a listing exports. */
+/** What the collection a catalog entry lists holds, which the entry's value leads with. */
+inline ustore_modality_t modality_of_entry(blob_t const& entry) noexcept {
+    return entry.size() == 0 ? ustore_modality_any_k : static_cast<ustore_modality_t>(entry[0]);
+}
+
+/** The name the collection a catalog entry lists carries, which follows its modality and is empty for none. */
+inline value_view_t name_of_entry(blob_t const& entry) noexcept {
+    if (entry.size() <= 1) return {};
+    return value_view_t {entry.data() + 1, static_cast<ustore_length_t>(entry.size() - 1)};
+}
+
+/** The collections a listing exports, with what each holds and the name it carries. */
 struct catalog_listing_t {
 
     /** The identifier of every collection. */
     uninitialized_array<ustore_collection_t> identifiers;
+
+    /** What every collection holds. */
+    uninitialized_array<ustore_modality_t> modalities;
+
+    /** The name of every collection, empty for one without. */
+    growing_tape_t names;
 };
 
 /** Appends the catalog entry @p pair to @p listing, halting the walk when the arena refuses. */
 inline walk_control_t list_entry(catalog_listing_t& listing, pair_t const& pair, ustore_error_t* error) noexcept {
     listing.identifiers.push_back(pair.key.cataloged(), error);
+    listing.modalities.push_back(modality_of_entry(pair.mapped), error);
+    listing.names.push_back(name_of_entry(pair.mapped), error);
     return error->status ? walk_control_t::halt_k : walk_control_t::resume_k;
 }
 
@@ -803,21 +898,73 @@ store_status_t list_catalog(view_type_ const& view, catalog_listing_t& listing, 
                       [&](pair_t const& pair) noexcept { return list_entry(listing, pair, error); });
 }
 
+/** Reads the value of every string of @p texts through @p view into @p tape. */
+template <typename view_type_>
+store_status_t read_strings(view_type_ const& view, strided_iterator<ustore_collection_t const> collections,
+                            strings_arg_t const& texts, std::size_t count, value_tape& tape,
+                            ustore_error_t* error) noexcept {
+    store_status_t const reserved = view.prepare(count);
+    if (st::failed(reserved)) return reserved;
+    auto const found = [&](string_pair_t const& pair) noexcept { tape.append(pair.mapped); };
+    auto const missing = [&]() noexcept { tape.append_missing(); };
+    for (std::size_t index = 0; index != count && !error->status; ++index) {
+        ustore_collection_t const collection = collections ? collections[index] : main_collection_k;
+        auto [key, key_status] = string_key_of(collection, texts[index]);
+        if (st::failed(key_status)) return key_status;
+        store_status_t const looked_up = view.find(key, found, missing);
+        if (st::failed(looked_up)) return looked_up;
+    }
+    return store_status_t::success_k;
+}
+
+/** Appends up to @p limit strings of @p collection starting with @p prefix, from @p start on, to @p found. */
+template <typename view_type_>
+store_status_t scan_strings(view_type_ const& view, ustore_collection_t collection, std::string_view prefix,
+                            std::string_view start, std::size_t limit, growing_tape_t& found,
+                            ustore_error_t* error) noexcept {
+    if (limit == 0) return store_status_t::success_k;
+    auto [first, first_status] = string_key_of(collection, start > prefix ? start : prefix);
+    if (st::failed(first_status)) return first_status;
+    std::size_t const found_before = found.lengths().size();
+    store_status_t const walked = view.range(
+        first, string_key_t::past(collection), [&](string_pair_t const& pair) noexcept -> walk_control_t {
+            std::string_view const text = pair.key.view();
+            if (!text.starts_with(prefix)) return walk_control_t::halt_k;
+            found.push_back(value_view_t {text}, error);
+            if (error->status) return walk_control_t::halt_k;
+            return found.lengths().size() - found_before == limit ? walk_control_t::halt_k : walk_control_t::resume_k;
+        });
+    if (st::failed(walked) || !view_type_::watches_k) return walked;
+
+    // A walk holds its partitions, so the strings it handed out are watched once it let go of them
+    auto const offsets = found.offsets();
+    auto const lengths = found.lengths();
+    char const* const tape = reinterpret_cast<char const*>(found.contents().begin().get());
+    for (std::size_t index = found_before; index != lengths.size() && !error->status; ++index) {
+        std::string_view const text {tape + offsets[index], lengths[index]};
+        auto [key, key_status] = string_key_of(collection, text);
+        store_status_t const watched = st::failed(key_status) ? key_status : view.watch(key);
+        if (st::failed(watched)) return watched;
+    }
+    return store_status_t::success_k;
+}
+
 #pragma endregion Reads
 
 #pragma region Writes
 
-/** Stages @p content under @p key into @p transaction. */
-template <typename transaction_type_>
-store_status_t stage_upsert(transaction_type_& transaction, stored_key_t const& key, value_view_t content) noexcept {
+/** Stages @p content under @p key into @p transaction, which may be a store publishing it at once. */
+template <typename transaction_type_, typename key_type_>
+store_status_t stage_upsert(transaction_type_& transaction, key_type_&& key, value_view_t content) noexcept {
     auto [copied, copy_blob_status] = copy_blob(content);
     if (st::failed(copy_blob_status)) return copy_blob_status;
-    return transaction.upsert(pair_t {key, std::move(copied)});
+    using staged_pair_t = st::mapping<std::remove_cvref_t<key_type_>, blob_t>;
+    return transaction.upsert(staged_pair_t {std::forward<key_type_>(key), std::move(copied)});
 }
 
 /** Stages erasing @p key, watching its absence when @p watch asks and the key is already gone. */
-template <typename transaction_type_>
-store_status_t stage_erase(transaction_type_& transaction, stored_key_t const& key, watch_t watch) noexcept {
+template <typename transaction_type_, typename key_type_>
+store_status_t stage_erase(transaction_type_& transaction, key_type_ const& key, watch_t watch) noexcept {
     store_status_t const erased = transaction.erase(key);
     if (erased != store_status_t::key_not_found_k) return erased;
     if (watch == watch_t::dont_watch_k) return store_status_t::success_k;
@@ -839,28 +986,49 @@ store_status_t stage_writes(transaction_type_& transaction, places_arg_t const& 
     return store_status_t::success_k;
 }
 
-/** Publishes one write under a stamp of its own, with no transaction to open. */
-template <isolation_t isolation_>
-store_status_t write_directly(ordered_store<isolation_>& store, stored_key_t const& key,
-                              value_view_t content) noexcept {
-    if (content) return stage_upsert(store, key, content);
+/** Stages a batch of strings into @p transaction, where a missing value erases its string. */
+template <typename transaction_type_>
+store_status_t stage_strings(transaction_type_& transaction, strided_iterator<ustore_collection_t const> collections,
+                             strings_arg_t const& texts, contents_arg_t const& contents, watch_t watch) noexcept {
+    for (std::size_t index = 0; index != contents.size(); ++index) {
+        ustore_collection_t const collection = collections ? collections[index] : main_collection_k;
+        auto [key, key_status] = string_key_of(collection, texts[index]);
+        if (st::failed(key_status)) return key_status;
+        value_view_t const content = contents[index];
+        store_status_t const staged = content ? stage_upsert(transaction, std::move(key), content)
+                                              : stage_erase(transaction, key, watch);
+        if (st::failed(staged)) return staged;
+    }
+    return store_status_t::success_k;
+}
+
+/** Publishes one write into @p store under a stamp of its own, with no transaction to open. */
+template <typename store_type_, typename key_type_>
+store_status_t write_directly(store_type_& store, key_type_&& key, value_view_t content) noexcept {
+    if (content) return stage_upsert(store, std::forward<key_type_>(key), content);
     store_status_t const erased = store.erase(key);
     return erased == store_status_t::key_not_found_k ? store_status_t::success_k : erased;
 }
 
 /** Commits @p stage_changes in a transaction of its own, retrying conflicts up to @c commit_attempts_k times. */
-template <isolation_t isolation_, typename stage_changes_type_>
-store_status_t commit_atomically(ordered_store<isolation_>& store, stage_changes_type_&& stage_changes) noexcept {
+template <typename store_type_, typename stage_changes_type_>
+store_status_t commit_atomically(store_type_& store, stage_changes_type_&& stage_changes) noexcept {
     auto opened = store.transaction();
     if (!opened) return opened.status();
     return st::commit_with_retries(*opened, commit_attempts_k, stage_changes);
 }
 
-/** Whether any place of @p places addresses the catalog, which only the engine writes. */
-inline bool touches_catalog(places_arg_t const& places) noexcept {
-    for (std::size_t index = 0; index != places.size(); ++index)
-        if (places[index].collection == catalog_collection_k) return true;
-    return false;
+/** Commits @p stage_changes over both stores of @p state under one stamp, retrying conflicts up to
+ *  @c commit_attempts_k times. */
+template <isolation_t isolation_, typename stage_changes_type_>
+store_status_t commit_together(database_state<isolation_>& state, stage_changes_type_&& stage_changes) noexcept {
+    for (std::size_t attempt = 0; attempt != commit_attempts_k; ++attempt) {
+        auto opened = st::make_transaction_group(state.store, state.strings);
+        if (!opened) return opened.status();
+        store_status_t const committed = opened->commit_with(stage_changes);
+        if (!st::conflicted(committed)) return committed;
+    }
+    return store_status_t::operation_would_block_k;
 }
 
 #pragma endregion Writes
@@ -887,45 +1055,121 @@ store_status_t read_counter(transaction_type_& transaction, ustore_collection_t&
         st::no_op_t {});
 }
 
-/** Stages a new collection and the advanced counter, answering its identifier through @p created. */
+/**
+ *  @brief Stages a new collection holding @p modality under @p name and the advanced counter, answering its
+ *      identifier through @p created.
+ *
+ *  The catalog entry's value is `struct { uint8_t modality; char name[]; }`, the name empty for a collection without
+ *  one, so a listing and a drop reach the name without walking the names.
+ */
 template <isolation_t isolation_>
-store_status_t stage_collection(store_transaction<isolation_>& transaction, ustore_collection_t& created) noexcept {
+store_status_t stage_collection(store_transaction<isolation_>& transaction, ustore_modality_t modality,
+                                std::string_view name, ustore_collection_t& created) noexcept {
     store_status_t const counted = read_counter(transaction, created);
     if (st::failed(counted)) return counted;
     if (created >= collections_limit_k) return store_status_t::capacity_exhausted_k;
     store_status_t const advanced = stage_counter(transaction, created + 1);
     if (st::failed(advanced)) return advanced;
-    return stage_upsert(transaction, stored_key_t::catalog_entry(created), value_view_t::make_empty());
+    blob_t entry;
+    if (st::failed(entry.resize(1 + name.size()))) return store_status_t::out_of_memory_heap_k;
+    entry[0] = static_cast<ustore_byte_t>(modality);
+    if (!name.empty()) std::memcpy(entry.data() + 1, name.data(), name.size());
+    return transaction.upsert(pair_t {stored_key_t::catalog_entry(created), std::move(entry)});
 }
 
-/** Answers @c key_not_found_k unless @p collection is the main one or listed in the catalog. */
-template <typename transaction_type_>
-store_status_t require_listed(transaction_type_& transaction, ustore_collection_t collection) noexcept {
-    if (collection == main_collection_k || collection == names_collection_k) return store_status_t::success_k;
+/** Reads what @p collection holds through @p reader, answering @c key_not_found_k for a collection the catalog does
+ *  not list. */
+template <typename reader_type_>
+store_status_t read_modality(reader_type_& reader, ustore_collection_t collection,
+                             ustore_modality_t& modality) noexcept {
+    modality = ustore_modality_any_k;
+    if (collection == main_collection_k) return store_status_t::success_k;
     store_status_t listing = store_status_t::key_not_found_k;
-    store_status_t const looked_up = transaction.find(
-        stored_key_t::catalog_entry(collection), [&](pair_t const&) noexcept { listing = store_status_t::success_k; },
+    store_status_t const looked_up = reader.find(
+        stored_key_t::catalog_entry(collection),
+        [&](pair_t const& entry) noexcept {
+            listing = store_status_t::success_k;
+            modality = modality_of_entry(entry.mapped);
+        },
         st::no_op_t {});
     return st::failed(looked_up) ? looked_up : listing;
 }
 
-/** Empties @p value in place, keeping its key. */
-inline void empty_value(stored_key_t const&, blob_t& value) noexcept {
-    [[maybe_unused]] store_status_t const emptied = value.resize(0);
+/** Refuses @p collection unless the catalog lists it keyed as @p keying, answering whether it refused. */
+template <isolation_t isolation_>
+bool refuse_collection(database_state<isolation_>& state, ustore_collection_t collection, keying_t keying,
+                       ustore_error_t* error) noexcept {
+    ustore_modality_t modality = ustore_modality_any_k;
+    store_status_t const listed = read_modality(state.store, collection, modality);
+    if (listed == store_status_t::key_not_found_k) {
+        *error = {ustore_error_not_found_k, "No such collection"};
+        return true;
+    }
+    if (reported_failure(listed, error)) return true;
+    if (keying_of(modality) == keying) return false;
+    *error = {ustore_error_invalid_argument_k,
+              keying == keying_t::strings_k ? "The collection holds no strings" : "The collection holds strings"};
+    return true;
 }
 
-/** Stages what dropping @p collection in @p mode removes. */
-template <typename transaction_type_>
-store_status_t stage_drop(transaction_type_& transaction, ustore_collection_t collection,
+/** Refuses a batch addressing a collection the catalog does not list keyed as @p keying, checking each run of tasks
+ *  on one collection once. */
+template <isolation_t isolation_>
+bool refuse_collections(database_state<isolation_>& state, strided_iterator<ustore_collection_t const> collections,
+                        std::size_t count, keying_t keying, ustore_error_t* error) noexcept {
+    if (!collections) return count && refuse_collection(state, main_collection_k, keying, error);
+    for (std::size_t task = 0; task != count; ++task) {
+        bool const repeated = task != 0 && collections[task] == collections[task - 1];
+        if (!repeated && refuse_collection(state, collections[task], keying, error)) return true;
+    }
+    return false;
+}
+
+/** Empties a value in place, keeping its key. */
+struct empty_value_t {
+    template <typename key_type_>
+    void operator()(key_type_ const&, blob_t& value) const noexcept {
+        [[maybe_unused]] store_status_t const emptied = value.resize(0);
+    }
+};
+
+/** Stages clearing [ @p lower, @p upper ) as @p mode asks: emptying every value, or erasing every key. */
+template <typename transaction_type_, typename key_type_>
+store_status_t stage_clear(transaction_type_& transaction, key_type_ const& lower, key_type_ const& upper,
+                           ustore_drop_mode_t mode) noexcept {
+    if (mode == ustore_drop_vals_k) return transaction.update_range(lower, upper, empty_value_t {});
+    return transaction.erase_range(lower, upper, st::no_op_t {});
+}
+
+/** Stages what dropping @p collection in @p mode removes from both stores: its pairs, and with the handle its catalog
+ *  entry and the name the entry records. */
+template <typename pairs_type_, typename strings_type_>
+store_status_t stage_drop(pairs_type_& pairs, strings_type_& strings, ustore_collection_t collection,
                           ustore_drop_mode_t mode) noexcept {
-    store_status_t const listed = require_listed(transaction, collection);
-    if (st::failed(listed)) return listed;
-    stored_key_t const lower = stored_key_t::lowest_in(collection);
-    stored_key_t const upper = stored_key_t::past(collection);
-    if (mode == ustore_drop_vals_k) return transaction.update_range(lower, upper, empty_value);
-    store_status_t const erased = transaction.erase_range(lower, upper, st::no_op_t {});
-    if (st::failed(erased) || mode == ustore_drop_keys_vals_k) return erased;
-    return transaction.erase(stored_key_t::catalog_entry(collection));
+    ustore_modality_t modality = ustore_modality_any_k;
+    string_key_t name = string_key_t::lowest_in(names_collection_k);
+    store_status_t listing = collection == main_collection_k ? store_status_t::success_k
+                                                             : store_status_t::key_not_found_k;
+    store_status_t const looked_up = pairs.find(
+        stored_key_t::catalog_entry(collection),
+        [&](pair_t const& entry) noexcept {
+            modality = modality_of_entry(entry.mapped);
+            auto [text, copy_blob_status] = copy_blob(name_of_entry(entry.mapped));
+            listing = copy_blob_status;
+            name.text = std::move(text);
+        },
+        st::no_op_t {});
+    if (st::failed(looked_up)) return looked_up;
+    if (st::failed(listing)) return listing;
+
+    store_status_t const cleared =
+        keying_of(modality) == keying_t::strings_k
+            ? stage_clear(strings, string_key_t::lowest_in(collection), string_key_t::past(collection), mode)
+            : stage_clear(pairs, stored_key_t::lowest_in(collection), stored_key_t::past(collection), mode);
+    if (st::failed(cleared) || mode != ustore_drop_keys_vals_handle_k) return cleared;
+    store_status_t const unlisted = pairs.erase(stored_key_t::catalog_entry(collection));
+    if (st::failed(unlisted) || name.text.size() == 0) return unlisted;
+    return strings.erase(name);
 }
 
 #pragma endregion Catalog
@@ -984,17 +1228,34 @@ inline bool join_path(sz::string_t& path, char const* directory, std::string_vie
     return path.try_assign(sz::string_view_t {directory}) && path.try_append(name.data(), name.size());
 }
 
-/** Writes one pair as its key, its length and its bytes, answering whether all of it reached @p file. */
-inline bool write_pair(std::FILE* file, pair_t const& pair) noexcept {
-    auto const length = static_cast<ustore_length_t>(pair.mapped.size());
-    return std::fwrite(&pair.key, sizeof(stored_key_t), 1, file) == 1 &&
-           std::fwrite(&length, sizeof(length), 1, file) == 1 &&
-           (length == 0 || std::fwrite(pair.mapped.data(), 1, length, file) == length);
+/** Writes @p blob as its length and its bytes, answering whether all of it reached @p file. */
+inline bool write_blob(std::FILE* file, blob_t const& blob) noexcept {
+    auto const length = static_cast<ustore_length_t>(blob.size());
+    return std::fwrite(&length, sizeof(length), 1, file) == 1 &&
+           (length == 0 || std::fwrite(blob.data(), 1, length, file) == length);
 }
 
-/** Writes every pair @p view reads into the image of @p directory: a signature, the key width, then each pair. */
-template <typename view_type_>
-void write_image(view_type_ const& view, char const* directory, ustore_error_t* error) noexcept {
+/** Writes one pair as its key and its value, answering whether all of it reached @p file. */
+inline bool write_pair(std::FILE* file, pair_t const& pair) noexcept {
+    return std::fwrite(&pair.key, sizeof(stored_key_t), 1, file) == 1 && write_blob(file, pair.mapped);
+}
+
+/** Writes one string pair as its collection, its string and its value, answering whether all of it reached
+ *  @p file. */
+inline bool write_string_pair(std::FILE* file, string_pair_t const& pair) noexcept {
+    return std::fwrite(&pair.key.collection, sizeof(ustore_collection_t), 1, file) == 1 &&
+           write_blob(file, pair.key.text) && write_blob(file, pair.mapped);
+}
+
+/**
+ *  @brief Writes the image of @p directory from @p pairs and @p strings, which read at one stamp.
+ *
+ *  A signature and the key width lead, then every pair, then @c stored_key_t::highest, which no pair is stored
+ *  under, and then every string pair up to the end of the file.
+ */
+template <typename pairs_view_type_, typename strings_view_type_>
+void write_image(pairs_view_type_ const& pairs, strings_view_type_ const& strings, char const* directory,
+                 ustore_error_t* error) noexcept {
     sz::string_t partial_path;
     sz::string_t final_path;
     if (!join_path(partial_path, directory, partial_image_name_k) || !join_path(final_path, directory, image_name_k)) {
@@ -1010,12 +1271,21 @@ void write_image(view_type_ const& view, char const* directory, ustore_error_t* 
     std::uint32_t const key_bytes = sizeof(stored_key_t);
     bool written = std::fwrite(image_signature_k, sizeof(image_signature_k), 1, stream.get()) == 1 &&
                    std::fwrite(&key_bytes, sizeof(key_bytes), 1, stream.get()) == 1;
-    store_status_t const walked = view.range(stored_key_t::lowest(), stored_key_t::highest(),
-                                             [&](pair_t const& pair) noexcept -> walk_control_t {
-                                                 written = written && write_pair(stream.get(), pair);
-                                                 return written ? walk_control_t::resume_k : walk_control_t::halt_k;
-                                             });
+    store_status_t const walked = pairs.range(stored_key_t::lowest(), stored_key_t::highest(),
+                                              [&](pair_t const& pair) noexcept -> walk_control_t {
+                                                  written = written && write_pair(stream.get(), pair);
+                                                  return written ? walk_control_t::resume_k : walk_control_t::halt_k;
+                                              });
     if (reported_failure(walked, error)) return;
+    stored_key_t const sentinel = stored_key_t::highest();
+    written = written && std::fwrite(&sentinel, sizeof(stored_key_t), 1, stream.get()) == 1;
+    store_status_t const walked_strings = strings.range(
+        string_key_t::lowest_in(main_collection_k), string_key_t::lowest_in(catalog_collection_k),
+        [&](string_pair_t const& pair) noexcept -> walk_control_t {
+            written = written && write_string_pair(stream.get(), pair);
+            return written ? walk_control_t::resume_k : walk_control_t::halt_k;
+        });
+    if (reported_failure(walked_strings, error)) return;
 
     bool const synced = written && std::fflush(stream.get()) == 0 && sync_file(stream.get());
     bool const closed = stream.close();
@@ -1039,17 +1309,36 @@ inline constexpr std::array<ustore_error_t, 5> image_step_errors_k {{
     {ustore_error_internal_k, "The store refused a pair of the image"},
 }};
 
-/** Loads the next pair of @p file into @p store. */
+/** Reads a length and that many bytes of @p file into @p blob. */
+inline image_step_t load_blob(std::FILE* file, blob_t& blob) noexcept {
+    ustore_length_t length = 0;
+    if (std::fread(&length, sizeof(length), 1, file) != 1) return image_step_t::truncated_k;
+    if (st::failed(blob.resize(length))) return image_step_t::out_of_memory_k;
+    if (length != 0 && std::fread(blob.data(), 1, length, file) != length) return image_step_t::truncated_k;
+    return image_step_t::loaded_k;
+}
+
+/** Loads the next pair of @p file into @p store, finishing at the sentinel that closes the pairs. */
 template <isolation_t isolation_>
 image_step_t load_pair(std::FILE* file, ordered_store<isolation_>& store) noexcept {
     stored_key_t key;
     if (std::fread(&key, sizeof(stored_key_t), 1, file) != 1) return image_step_t::finished_k;
-    ustore_length_t length = 0;
-    if (std::fread(&length, sizeof(length), 1, file) != 1) return image_step_t::truncated_k;
+    if (!stored_key_order_t {}(key, stored_key_t::highest())) return image_step_t::finished_k;
     blob_t blob;
-    if (st::failed(blob.resize(length))) return image_step_t::out_of_memory_k;
-    if (length != 0 && std::fread(blob.data(), 1, length, file) != length) return image_step_t::truncated_k;
+    if (image_step_t const loaded = load_blob(file, blob); loaded != image_step_t::loaded_k) return loaded;
     if (st::failed(store.upsert(pair_t {key, std::move(blob)}))) return image_step_t::refused_k;
+    return image_step_t::loaded_k;
+}
+
+/** Loads the next string pair of @p file into @p store. */
+template <isolation_t isolation_>
+image_step_t load_string_pair(std::FILE* file, strings_store<isolation_>& store) noexcept {
+    string_key_t key;
+    if (std::fread(&key.collection, sizeof(ustore_collection_t), 1, file) != 1) return image_step_t::finished_k;
+    if (image_step_t const loaded = load_blob(file, key.text); loaded != image_step_t::loaded_k) return loaded;
+    blob_t blob;
+    if (image_step_t const loaded = load_blob(file, blob); loaded != image_step_t::loaded_k) return loaded;
+    if (st::failed(store.upsert(string_pair_t {std::move(key), std::move(blob)}))) return image_step_t::refused_k;
     return image_step_t::loaded_k;
 }
 
@@ -1062,7 +1351,7 @@ inline bool recognize_image(std::FILE* file) noexcept {
            std::fread(&key_bytes, sizeof(key_bytes), 1, file) == 1 && key_bytes == sizeof(stored_key_t);
 }
 
-/** Loads the image of the directory of @p state into its store, leaving it empty when there is none. */
+/** Loads the image of the directory of @p state into its stores, leaving them empty when there is none. */
 template <isolation_t isolation_>
 void read_image(database_state<isolation_>& state, ustore_error_t* error) noexcept {
     sz::string_t path;
@@ -1078,6 +1367,9 @@ void read_image(database_state<isolation_>& state, ustore_error_t* error) noexce
     }
     image_step_t step = image_step_t::loaded_k;
     while (step == image_step_t::loaded_k) step = load_pair(stream.get(), state.store);
+    if (step == image_step_t::finished_k) do
+            step = load_string_pair(stream.get(), state.strings);
+        while (step == image_step_t::loaded_k);
     *error = image_step_errors_k[static_cast<std::size_t>(step)];
 }
 
@@ -1086,7 +1378,8 @@ template <isolation_t isolation_>
 void persist(database_state<isolation_>& state, ustore_error_t* error) noexcept {
     if (state.directory.empty()) return;
     pinned_reader<isolation_> const reader = state.store.reader();
-    write_image(snapshot_view<isolation_> {reader}, state.directory.c_str(), error);
+    auto const strings = state.strings.reader_at(reader.snapshot());
+    write_image(snapshot_view {reader}, snapshot_view {strings}, state.directory.c_str(), error);
 }
 
 #pragma endregion Image
@@ -1112,32 +1405,36 @@ void close_database(database_state<isolation_>& state) noexcept {
     persist(state, &error);
 }
 
-/** Serves "clear", removing every pair and keeping the catalog. */
+/** Serves "clear", removing every pair and keeping the catalog and the names. */
 template <isolation_t isolation_>
 void clear_pairs(database_state<isolation_>& state, ustore_database_control_t& arguments) noexcept {
-    store_status_t const cleared = commit_atomically(
-        state.store, [](store_transaction<isolation_>& transaction) noexcept {
-            return transaction.erase_up_to(stored_key_t::lowest_in(catalog_collection_k), st::no_op_t {});
-        });
+    store_status_t const cleared = commit_together(state, [](auto& pairs, auto& strings) noexcept {
+        store_status_t const erased = pairs.erase_up_to(stored_key_t::lowest_in(catalog_collection_k), st::no_op_t {});
+        if (st::failed(erased)) return erased;
+        return strings.erase_up_to(string_key_t::lowest_in(names_collection_k), st::no_op_t {});
+    });
     reported_failure(cleared, arguments.error);
 }
 
-/** Serves "reset", removing every snapshot, pair and collection. */
+/** Serves "reset", removing every snapshot, pair, collection and name. */
 template <isolation_t isolation_>
 void reset_database(database_state<isolation_>& state, ustore_database_control_t& arguments) noexcept {
     state.snapshots.close_every();
-    store_status_t const reset = commit_atomically(
-        state.store, [](store_transaction<isolation_>& transaction) noexcept {
-            return transaction.erase_from(stored_key_t::lowest(), st::no_op_t {});
-        });
+    store_status_t const reset = commit_together(state, [](auto& pairs, auto& strings) noexcept {
+        store_status_t const erased = pairs.erase_from(stored_key_t::lowest(), st::no_op_t {});
+        if (st::failed(erased)) return erased;
+        return strings.erase_from(string_key_t::lowest_in(main_collection_k), st::no_op_t {});
+    });
     reported_failure(reset, arguments.error);
 }
 
-/** Serves "compact", reclaiming unreachable versions and rewriting the image. */
+/** Serves "compact", reclaiming unreachable versions of both stores and rewriting the image. */
 template <isolation_t isolation_>
 void compact_database(database_state<isolation_>& state, ustore_database_control_t& arguments) noexcept {
     auto [vacuumed, vacuum_status] = state.store.vacuum();
     if (reported_failure(vacuum_status, arguments.error)) return;
+    auto [vacuumed_strings, vacuum_strings_status] = state.strings.vacuum();
+    if (reported_failure(vacuum_strings_status, arguments.error)) return;
     persist(state, arguments.error);
 }
 
@@ -1149,12 +1446,6 @@ void describe_database(database_state<isolation_>&, ustore_database_control_t& a
                               : R"({"engine":"ram","isolation":"snapshot"})";
 }
 
-/** Writes @p text at @p cursor and answers where it ends. */
-inline char* append_text(char* cursor, std::string_view text) noexcept {
-    std::memcpy(cursor, text.data(), text.size());
-    return cursor + text.size();
-}
-
 /** Serves "usage", counting keys and versions into the arena. */
 template <isolation_t isolation_>
 void report_usage(database_state<isolation_>& state, ustore_database_control_t& arguments) noexcept {
@@ -1163,14 +1454,10 @@ void report_usage(database_state<isolation_>& state, ustore_database_control_t& 
     constexpr std::size_t response_capacity_k = 96;
     char* const response = arena.alloc<char>(response_capacity_k, arguments.error).data();
     if (arguments.error->status) return;
-    char* const response_end = response + response_capacity_k;
-
-    char* cursor = append_text(response, R"({"keys":)");
-    cursor = std::to_chars(cursor, response_end, state.store.size()).ptr;
-    cursor = append_text(cursor, R"(,"versions":)");
-    cursor = std::to_chars(cursor, response_end, state.store.versions_count()).ptr;
-    cursor = append_text(cursor, "}");
-    *cursor = '\0';
+    auto const written = fmt::format_to_n(response, response_capacity_k - 1, R"({{"keys":{},"versions":{}}})",
+                                          state.store.size() + state.strings.size(),
+                                          state.store.versions_count() + state.strings.versions_count());
+    *written.out = '\0';
     *arguments.response = response;
 }
 
@@ -1316,7 +1603,8 @@ void serve(database_state<isolation_>& state, ustore_snapshot_export_t& argument
         *arguments.error = {ustore_error_not_found_k, "The snapshot doesn't exist"};
         return;
     }
-    write_image(snapshot_view<isolation_> {*reader}, arguments.path, arguments.error);
+    auto const strings = state.strings.reader_at(reader->snapshot());
+    write_image(snapshot_view {*reader}, snapshot_view {strings}, arguments.path, arguments.error);
 }
 
 /** Implements @c ustore_snapshot_drop. */
@@ -1337,6 +1625,8 @@ void serve(database_state<isolation_>& state, ustore_read_t& arguments) noexcept
     places_arg_t const places = places_of(arguments);
     validate_read(arguments.transaction, places, arguments.options, arguments.error);
     if (arguments.error->status) return;
+    strided_iterator<ustore_collection_t const> const collections {arguments.collections, arguments.collections_stride};
+    if (refuse_collections(state, collections, places.size(), keying_t::integers_k, arguments.error)) return;
     linked_memory_lock_t arena = linked_memory(arguments.arena, arguments.options, arguments.error);
     if (arguments.error->status) return;
     value_tape tape {arena, arguments};
@@ -1360,7 +1650,8 @@ void stage_into_transaction(ustore_write_t& arguments, places_arg_t const& place
                                   !(arguments.options & ustore_option_transaction_dont_watch_k)
                               ? watch_t::watch_k
                               : watch_t::dont_watch_k;
-    reported_failure(stage_writes(handle->transaction, places, contents, watch), arguments.error);
+    reported_failure(stage_writes(handle->template part<keying_t::integers_k>(), places, contents, watch),
+                     arguments.error);
 }
 
 /** Implements @c ustore_write, committing a batch outside a transaction atomically. */
@@ -1370,10 +1661,8 @@ void serve(database_state<isolation_>& state, ustore_write_t& arguments) noexcep
     contents_arg_t const contents = contents_of(arguments);
     validate_write(arguments.transaction, places, contents, arguments.options, arguments.error);
     if (arguments.error->status || !arguments.tasks_count) return;
-    if (touches_catalog(places)) {
-        *arguments.error = {ustore_error_invalid_argument_k, "The catalog collection is reserved"};
-        return;
-    }
+    strided_iterator<ustore_collection_t const> const collections {arguments.collections, arguments.collections_stride};
+    if (refuse_collections(state, collections, places.size(), keying_t::integers_k, arguments.error)) return;
     if (arguments.transaction) return stage_into_transaction<isolation_>(arguments, places, contents);
 
     store_status_t const written =
@@ -1402,6 +1691,8 @@ void serve(database_state<isolation_>& state, ustore_scan_t& arguments) noexcept
     scans_arg_t const scans = scans_of(arguments);
     validate_scan(arguments.transaction, scans, arguments.options, arguments.error);
     if (arguments.error->status || !arguments.tasks_count) return;
+    strided_iterator<ustore_collection_t const> const collections {arguments.collections, arguments.collections_stride};
+    if (refuse_collections(state, collections, scans.size(), keying_t::integers_k, arguments.error)) return;
     if (!arguments.keys) {
         *arguments.error = {ustore_error_invalid_argument_k, "Need an output for the keys"};
         return;
@@ -1440,6 +1731,8 @@ void serve(database_state<isolation_>& state, ustore_sample_t& arguments) noexce
         return;
     }
     sample_args_t const samples = samples_of(arguments);
+    strided_iterator<ustore_collection_t const> const collections {arguments.collections, arguments.collections_stride};
+    if (refuse_collections(state, collections, samples.size(), keying_t::integers_k, arguments.error)) return;
     linked_memory_lock_t arena = linked_memory(arguments.arena, arguments.options, arguments.error);
     if (arguments.error->status) return;
     key_tape tape {arena, samples.size(), arguments.offsets, arguments.counts, arguments.error};
@@ -1517,6 +1810,8 @@ void measure_every(view_type_ const& view, ustore_measure_t& arguments, measure_
 template <isolation_t isolation_>
 void serve(database_state<isolation_>& state, ustore_measure_t& arguments) noexcept {
     if (!arguments.tasks_count) return;
+    strided_iterator<ustore_collection_t const> const collections {arguments.collections, arguments.collections_stride};
+    if (refuse_collections(state, collections, arguments.tasks_count, keying_t::integers_k, arguments.error)) return;
     linked_memory_lock_t arena = linked_memory(arguments.arena, arguments.options, arguments.error);
     if (arguments.error->status) return;
     std::size_t const count = arguments.tasks_count;
@@ -1537,7 +1832,7 @@ void serve(database_state<isolation_>& state, ustore_measure_t& arguments) noexc
 
 #pragma region Collection Calls
 
-/** Implements @c ustore_collection_list as a walk of the catalog. */
+/** Implements @c ustore_collection_list as a walk of the catalog, whose entries carry the modalities and the names. */
 template <isolation_t isolation_>
 void serve(database_state<isolation_>& state, ustore_collection_list_t& arguments) noexcept {
     if (!arguments.count) {
@@ -1546,7 +1841,7 @@ void serve(database_state<isolation_>& state, ustore_collection_list_t& argument
     }
     linked_memory_lock_t arena = linked_memory(arguments.arena, arguments.options, arguments.error);
     if (arguments.error->status) return;
-    catalog_listing_t listing {{arena}};
+    catalog_listing_t listing {{arena}, {arena}, {arena}};
     with_view(state, view_of(arguments), arguments.error, [&](auto const& view) noexcept {
         reported_failure(list_catalog(view, listing, arguments.error), arguments.error);
     });
@@ -1554,6 +1849,9 @@ void serve(database_state<isolation_>& state, ustore_collection_list_t& argument
 
     *arguments.count = static_cast<ustore_size_t>(listing.identifiers.size());
     if (arguments.ids) *arguments.ids = listing.identifiers.begin();
+    if (arguments.modalities) *arguments.modalities = listing.modalities.begin();
+    if (arguments.names_offsets) *arguments.names_offsets = listing.names.offsets().begin().get();
+    if (arguments.names) *arguments.names = reinterpret_cast<ustore_char_t*>(listing.names.contents().begin().get());
 }
 
 /** The error of a catalog change refused with @p status. */
@@ -1567,54 +1865,259 @@ constexpr ustore_error_t describe_catalog(store_status_t status) noexcept {
     return translate(status);
 }
 
-/** Implements @c ustore_collection_create as one commit of the entry and the advanced counter. */
+/** Stages a collection named @p name, unless another collection carries the name, and records the name. */
+template <isolation_t isolation_, typename strings_type_>
+store_status_t stage_named_collection(store_transaction<isolation_>& pairs, strings_type_& strings,
+                                      ustore_modality_t modality, std::string_view name,
+                                      ustore_collection_t& created) noexcept {
+    auto [key, key_status] = string_key_of(names_collection_k, name);
+    if (st::failed(key_status)) return key_status;
+    bool taken = false;
+    store_status_t const looked_up = strings.find(
+        key, [&](string_pair_t const&) noexcept { taken = true; }, st::no_op_t {});
+    if (st::failed(looked_up)) return looked_up;
+    if (taken) return store_status_t::key_already_exists_k;
+    store_status_t const staged = stage_collection<isolation_>(pairs, modality, name, created);
+    if (st::failed(staged)) return staged;
+    name_record_t const record {created, modality};
+    return stage_upsert(strings, std::move(key), value_view_t {record.view()});
+}
+
+/** Implements @c ustore_collection_create as one commit of the entry, the advanced counter and the name, a named
+ *  collection persisted at once as a flushed write would be. */
 template <isolation_t isolation_>
 void serve(database_state<isolation_>& state, ustore_collection_create_t& arguments) noexcept {
     if (!arguments.id) {
         *arguments.error = {ustore_error_invalid_argument_k, "Need an output for the collection"};
         return;
     }
+    if (arguments.modality > ustore_modality_pages_k) {
+        *arguments.error = {ustore_error_invalid_argument_k, "Unknown modality"};
+        return;
+    }
+    std::string_view const name = string_of(arguments.name, arguments.name_length);
+    if (arguments.name && name.empty()) {
+        *arguments.error = {ustore_error_invalid_argument_k, "A name is never empty, as the main collection has none"};
+        return;
+    }
+
+    // Every creation advances the counter, so two creating the same name conflict and the retry finds it taken
     ustore_collection_t created = main_collection_k;
-    store_status_t const committed = commit_atomically(state.store,
-                                                       [&](store_transaction<isolation_>& transaction) noexcept {
-                                                           return stage_collection<isolation_>(transaction, created);
-                                                       });
+    store_status_t const committed =
+        name.empty()
+            ? commit_atomically(state.store,
+                                [&](store_transaction<isolation_>& pairs) noexcept {
+                                    return stage_collection<isolation_>(pairs, arguments.modality, name, created);
+                                })
+            : commit_together(state, [&](store_transaction<isolation_>& pairs, auto& strings) noexcept {
+                  return stage_named_collection<isolation_>(pairs, strings, arguments.modality, name, created);
+              });
+    if (committed == store_status_t::key_already_exists_k) {
+        *arguments.error = {ustore_error_already_exists_k, "A collection already carries the name"};
+        return;
+    }
     *arguments.error = describe_catalog(committed);
-    if (!arguments.error->status) *arguments.id = created;
+    if (arguments.error->status) return;
+    *arguments.id = created;
+    if (!name.empty()) persist(state, arguments.error);
 }
 
-/** Implements @c ustore_collection_drop as one commit over the collection's window and its catalog entry. */
+/** Implements @c ustore_collection_drop as one commit over the collection's window, its catalog entry and its
+ *  names. */
 template <isolation_t isolation_>
 void serve(database_state<isolation_>& state, ustore_collection_drop_t& arguments) noexcept {
     ustore_collection_t const collection = arguments.id;
     ustore_drop_mode_t const mode = arguments.mode;
-    if (collection == catalog_collection_k) {
-        *arguments.error = {ustore_error_invalid_argument_k, "The catalog collection is reserved"};
-        return;
-    }
-    if ((collection == main_collection_k || collection == names_collection_k) &&
-        mode == ustore_drop_keys_vals_handle_k) {
-        *arguments.error = {ustore_error_invalid_argument_k, "This collection can only be cleared"};
+    if (collection == main_collection_k && mode == ustore_drop_keys_vals_handle_k) {
+        *arguments.error = {ustore_error_invalid_argument_k, "The main collection can only be cleared"};
         return;
     }
     if (mode != ustore_drop_keys_vals_handle_k && mode != ustore_drop_keys_vals_k && mode != ustore_drop_vals_k) {
         *arguments.error = {ustore_error_invalid_argument_k, "Unknown drop mode"};
         return;
     }
-    store_status_t const committed = commit_atomically(
-        state.store,
-        [&](store_transaction<isolation_>& transaction) noexcept { return stage_drop(transaction, collection, mode); });
+    store_status_t const committed = commit_together(
+        state, [&](auto& pairs, auto& strings) noexcept { return stage_drop(pairs, strings, collection, mode); });
     *arguments.error = describe_catalog(committed);
+    if (!arguments.error->status && mode == ustore_drop_keys_vals_handle_k) persist(state, arguments.error);
+}
+
+/** Implements @c ustore_collection_find, reading the names at the head or at a snapshot. */
+template <isolation_t isolation_>
+void serve(database_state<isolation_>& state, ustore_collection_find_t& arguments) noexcept {
+    if (!arguments.tasks_count) return;
+    if (!arguments.names || !arguments.ids) {
+        *arguments.error = {ustore_error_invalid_argument_k, "Need the names and an output for the identifiers"};
+        return;
+    }
+    linked_memory_lock_t arena = linked_memory(arguments.arena, arguments.options, arguments.error);
+    if (arguments.error->status) return;
+    std::size_t const count = arguments.tasks_count;
+    strings_arg_t const names {{arguments.names, arguments.names_stride},
+                               {arguments.names_lengths, arguments.names_lengths_stride}};
+    std::span<ustore_collection_t> const ids = arena.alloc<ustore_collection_t>(count, arguments.error);
+    auto modalities = arena.alloc_or_dummy(count, arguments.error, arguments.modalities);
+    auto presences = arena.alloc_or_dummy(count, arguments.error, arguments.presences);
+    if (arguments.error->status) return;
+
+    view_request_t const request {nullptr, arguments.snapshot, arguments.options};
+    with_view<keying_t::strings_k>(state, request, arguments.error, [&](auto const& view) noexcept {
+        for (std::size_t index = 0; index != count; ++index) {
+            auto [key, key_status] = string_key_of(names_collection_k, names[index]);
+            if (reported_failure(key_status, arguments.error)) return;
+            ustore_collection_t id = main_collection_k;
+            ustore_modality_t modality = ustore_modality_any_k;
+            bool present = false;
+            bool malformed = false;
+            store_status_t const looked_up = view.find(
+                key,
+                [&](string_pair_t const& named) noexcept {
+                    present = true;
+                    malformed = !read_name_record(named.mapped, id, modality);
+                },
+                st::no_op_t {});
+            if (reported_failure(looked_up, arguments.error)) return;
+            if (malformed) {
+                *arguments.error = {ustore_error_malformed_k, "A name holds no collection record"};
+                return;
+            }
+            ids[index] = id;
+            modalities[index] = modality;
+            presences[index] = present;
+        }
+    });
+    if (!arguments.error->status) *arguments.ids = ids.data();
 }
 
 #pragma endregion Collection Calls
+
+#pragma region Strings Calls
+
+/** Implements @c ustore_strings_write, committing a batch outside a transaction atomically. */
+template <isolation_t isolation_>
+void serve(database_state<isolation_>& state, ustore_strings_write_t& arguments) noexcept {
+    if (!arguments.tasks_count) return;
+    if (!arguments.strings) {
+        *arguments.error = {ustore_error_invalid_argument_k, "No strings were provided"};
+        return;
+    }
+    if (arguments.transaction && (arguments.options & ustore_option_write_flush_k)) {
+        *arguments.error = {ustore_error_invalid_argument_k, "A transaction flushes at commit, not at a write"};
+        return;
+    }
+    strided_iterator<ustore_collection_t const> const collections {arguments.collections, arguments.collections_stride};
+    strings_arg_t const texts {{arguments.strings, arguments.strings_stride},
+                               {arguments.strings_lengths, arguments.strings_lengths_stride}};
+    contents_arg_t const contents {bits_view_t {arguments.values_presences},
+                                   {arguments.values_offsets, arguments.values_offsets_stride},
+                                   {arguments.values_lengths, arguments.values_lengths_stride},
+                                   {arguments.values, arguments.values_stride},
+                                   arguments.tasks_count};
+    if (refuse_collections(state, collections, arguments.tasks_count, keying_t::strings_k, arguments.error)) return;
+
+    if (arguments.transaction) {
+        transaction_handle<isolation_>* const handle = transaction_of<isolation_>(arguments.transaction,
+                                                                                  arguments.error);
+        if (!handle) return;
+        watch_t const watch = isolation_ == isolation_t::snapshot_k &&
+                                      !(arguments.options & ustore_option_transaction_dont_watch_k)
+                                  ? watch_t::watch_k
+                                  : watch_t::dont_watch_k;
+        reported_failure(
+            stage_strings(handle->template part<keying_t::strings_k>(), collections, texts, contents, watch),
+            arguments.error);
+        return;
+    }
+
+    store_status_t written = store_status_t::success_k;
+    if (arguments.tasks_count == 1) {
+        auto [key, key_status] = string_key_of(collections ? collections[0] : main_collection_k, texts[0]);
+        written = st::failed(key_status) ? key_status : write_directly(state.strings, std::move(key), contents[0]);
+    }
+    else
+        written = commit_atomically(state.strings, [&](auto& transaction) noexcept {
+            return stage_strings(transaction, collections, texts, contents, watch_t::dont_watch_k);
+        });
+    if (reported_failure(written, arguments.error)) return;
+    if (arguments.options & ustore_option_write_flush_k) persist(state, arguments.error);
+}
+
+/** Implements @c ustore_strings_read, copying every value into the caller's arena once. */
+template <isolation_t isolation_>
+void serve(database_state<isolation_>& state, ustore_strings_read_t& arguments) noexcept {
+    if (!arguments.tasks_count) return;
+    if (!arguments.strings) {
+        *arguments.error = {ustore_error_invalid_argument_k, "No strings were provided"};
+        return;
+    }
+    strided_iterator<ustore_collection_t const> const collections {arguments.collections, arguments.collections_stride};
+    strings_arg_t const texts {{arguments.strings, arguments.strings_stride},
+                               {arguments.strings_lengths, arguments.strings_lengths_stride}};
+    if (refuse_collections(state, collections, arguments.tasks_count, keying_t::strings_k, arguments.error)) return;
+    linked_memory_lock_t arena = linked_memory(arguments.arena, arguments.options, arguments.error);
+    if (arguments.error->status) return;
+    value_tape tape {arena, arguments};
+    if (arguments.error->status) return;
+
+    with_view<keying_t::strings_k>(state, view_of(arguments), arguments.error, [&](auto const& view) noexcept {
+        store_status_t const read = read_strings(view, collections, texts, arguments.tasks_count, tape,
+                                                 arguments.error);
+        reported_failure(read, arguments.error);
+    });
+    if (arguments.error->status) return;
+    tape.finish();
+}
+
+/** Implements @c ustore_strings_scan as ordered walks of each collection's strings. */
+template <isolation_t isolation_>
+void serve(database_state<isolation_>& state, ustore_strings_scan_t& arguments) noexcept {
+    if (!arguments.tasks_count) return;
+    if (!arguments.count_limits || !arguments.strings) {
+        *arguments.error = {ustore_error_invalid_argument_k, "Need the limits and an output for the strings"};
+        return;
+    }
+    std::size_t const count = arguments.tasks_count;
+    strided_iterator<ustore_collection_t const> const collections {arguments.collections, arguments.collections_stride};
+    strings_arg_t const prefixes {{arguments.prefixes, arguments.prefixes_stride},
+                                  {arguments.prefixes_lengths, arguments.prefixes_lengths_stride}};
+    strings_arg_t const starts {{arguments.start_strings, arguments.start_strings_stride},
+                                {arguments.start_strings_lengths, arguments.start_strings_lengths_stride}};
+    strided_iterator<ustore_length_t const> const limits {arguments.count_limits, arguments.count_limits_stride};
+    if (refuse_collections(state, collections, count, keying_t::strings_k, arguments.error)) return;
+    linked_memory_lock_t arena = linked_memory(arguments.arena, arguments.options, arguments.error);
+    if (arguments.error->status) return;
+    auto offsets = arena.alloc_or_dummy(count + 1, arguments.error, arguments.offsets);
+    auto counts = arena.alloc_or_dummy(count, arguments.error, arguments.counts);
+    if (arguments.error->status) return;
+
+    growing_tape_t found {arena};
+    with_view<keying_t::strings_k>(state, view_of(arguments), arguments.error, [&](auto const& view) noexcept {
+        for (std::size_t task = 0; task != count; ++task) {
+            ustore_collection_t const collection = collections ? collections[task] : main_collection_k;
+            std::string_view const prefix = arguments.prefixes ? prefixes[task] : std::string_view {};
+            std::string_view const start = arguments.start_strings ? starts[task] : std::string_view {};
+            std::size_t const found_before = found.lengths().size();
+            offsets[task] = static_cast<ustore_length_t>(found_before);
+            store_status_t const walked = scan_strings(view, collection, prefix, start, limits[task], found,
+                                                       arguments.error);
+            if (reported_failure(walked, arguments.error) || arguments.error->status) return;
+            counts[task] = static_cast<ustore_length_t>(found.lengths().size() - found_before);
+        }
+    });
+    if (arguments.error->status) return;
+    offsets[count] = static_cast<ustore_length_t>(found.lengths().size());
+    if (arguments.strings_offsets) *arguments.strings_offsets = found.offsets().begin().get();
+    *arguments.strings = reinterpret_cast<ustore_char_t*>(found.contents().begin().get());
+}
+
+#pragma endregion Strings Calls
 
 #pragma region Transaction Calls
 
 /** Opens a transaction handle for @p arguments. */
 template <isolation_t isolation_>
 void open_transaction(database_state<isolation_>& state, ustore_transaction_init_t& arguments) noexcept {
-    auto opened = state.store.transaction();
+    auto opened = st::make_transaction_group(state.store, state.strings);
     if (reported_failure(opened.status(), arguments.error)) return;
     auto* const handle = new (std::nothrow) transaction_handle<isolation_>(std::move(*opened));
     if (!handle) {
@@ -1660,7 +2163,8 @@ void serve(database_state<isolation_>&, ustore_transaction_stage_t& arguments) n
     }
     transaction_handle<isolation_>* const handle = transaction_of<isolation_>(arguments.transaction, arguments.error);
     if (!handle || !staged(*handle, arguments.error)) return;
-    if (arguments.sequence_number) *arguments.sequence_number = handle->transaction.generation();
+    if (arguments.sequence_number)
+        *arguments.sequence_number = handle->template part<keying_t::integers_k>().generation();
 }
 
 /** Implements @c ustore_transaction_commit, staging first when the caller did not. */
@@ -1737,6 +2241,10 @@ engine_t const engine_k {
     .collection_create = &serve_database<ustore_collection_create_t>,
     .collection_drop = &serve_database<ustore_collection_drop_t>,
     .collection_list = &serve_database<ustore_collection_list_t>,
+    .collection_find = &serve_database<ustore_collection_find_t>,
+    .strings_write = &serve_database<ustore_strings_write_t>,
+    .strings_read = &serve_database<ustore_strings_read_t>,
+    .strings_scan = &serve_database<ustore_strings_scan_t>,
     .transaction_init = &serve_database<ustore_transaction_init_t>,
     .transaction_stage = &serve_database<ustore_transaction_stage_t>,
     .transaction_commit = &serve_database<ustore_transaction_commit_t>,

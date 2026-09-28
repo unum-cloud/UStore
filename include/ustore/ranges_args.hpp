@@ -8,12 +8,14 @@
 #pragma once
 
 #include <cstddef> // `std::size_t`, `std::nullptr_t`
+#include <cstring> // `std::strlen`
 
 #include <algorithm>   // `std::min`
 #include <concepts>    // `std::same_as`
 #include <iterator>    // `std::data`, `std::size`
 #include <limits>      // `std::numeric_limits`
 #include <ranges>      // `std::ranges::contiguous_range`
+#include <string_view> // `std::string_view`
 #include <type_traits> // `std::conditional_t`, `std::remove_reference_t`
 #include <utility>     // `std::move`
 
@@ -57,6 +59,31 @@ struct places_arg_t {
     /** Whether every task addresses the same collection. */
     bool same_collection() const noexcept {
         return strided_range<ustore_collection_t const>(collections_begin, count).same_elements();
+    }
+};
+
+/** The string @p text of @p length, whose length a null terminator gives when zero. */
+inline std::string_view string_of(ustore_str_view_t text, ustore_length_t length) noexcept {
+    if (!text) return {};
+    return {text, length ? length : std::strlen(text)};
+}
+
+/** The strings of one batch, as the C ABI receives them. */
+struct strings_arg_t {
+
+    /** Pointers to the strings. */
+    strided_iterator<ustore_str_view_t const> texts;
+
+    /** Optional lengths of the strings, where a null iterator means they are null-terminated. */
+    strided_iterator<ustore_length_t const> lengths;
+
+    /** The string of task @p index. */
+    std::string_view operator[](std::size_t index) const noexcept {
+        auto const signed_index = static_cast<std::ptrdiff_t>(index);
+        ustore_str_view_t const text = texts[signed_index];
+        if (!text) return {};
+        std::size_t const length = lengths ? lengths[signed_index] : std::strlen(text);
+        return {text, length};
     }
 };
 

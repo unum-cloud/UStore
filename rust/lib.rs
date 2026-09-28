@@ -14,8 +14,8 @@
 //! let database = Database::open_ram(&RAMOptions::default())?;
 //! let mut arena = Arena::new();
 //!
-//! let people = database.create_collection(&mut arena, "people")?;
-//! let places = database.create_collection(&mut arena, "places")?;
+//! let people = database.create_collection("people")?;
+//! let places = database.create_collection("places")?;
 //! let entries = [Entry::new(1, b"Ada")?, Entry::new(2, b"Grace")?, Entry::removal(3)];
 //! database.head().write(&mut arena, people, &entries, Durability::Buffered)?;
 //!

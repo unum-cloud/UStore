@@ -4,9 +4,8 @@
  *  @date September 16, 2026
  *  @brief Unit tests of the strings modality, which maps variable-length strings onto arbitrary bytes.
  *
- *  Every case runs against the main collection, which every engine holds, so the same suite covers the
- *  engines that refuse collections of their own. Strings carry explicit lengths throughout, so a zero
- *  byte inside one is stored and read back like any other.
+ *  Every case runs against a fresh collection of the strings modality. Strings carry explicit lengths
+ *  throughout, so a zero byte inside one is stored and read back like any other.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
@@ -70,26 +69,53 @@ struct strings_batch_t {
     }
 };
 
-/** Removes every key and value of the main collection. */
-[[nodiscard]] std::size_t clear_database(ustore_database_t database) noexcept {
-    ustore_error_t error {};
-    ustore_collection_drop_t drop {};
-    drop.db = database;
-    drop.error = &error;
-    drop.id = ustore_collection_main_k;
-    drop.mode = ustore_drop_keys_vals_k;
-    ustore_collection_drop(&drop);
-    return expect_no_error(error);
-}
+/** An open database, a fresh strings collection in it, and the arena its calls export through. */
+struct fixture_t {
+
+    /** The open database. */
+    ustore_database_t database = nullptr;
+
+    /** The strings collection every call of a case addresses. */
+    ustore_collection_t collection = ustore_collection_main_k;
+
+    /** Reusable memory for the results. */
+    ustore_arena_t arena = nullptr;
+
+    fixture_t(fixture_t const&) = delete;
+    fixture_t& operator=(fixture_t const&) = delete;
+
+    explicit fixture_t(test_config_t const& config) noexcept {
+        if (status_t const opened = open_raw(config, database); opened.failed()) {
+            fmt::println(stderr, "  failed to open the database: {}", opened.message);
+            return;
+        }
+        ustore_error_t error {};
+        ustore_collection_create_t create {};
+        create.db = database;
+        create.error = &error;
+        create.modality = ustore_modality_strings_k;
+        create.id = &collection;
+        ustore_collection_create(&create);
+        if (error.status) fmt::println(stderr, "  failed to create a strings collection: {}", error.message);
+    }
+
+    ~fixture_t() noexcept {
+        ustore_arena_free(arena);
+        ustore_database_free(database);
+    }
+
+    /** Whether the database opened with its strings collection. */
+    [[nodiscard]] bool ready() const noexcept { return database && collection != ustore_collection_main_k; }
+};
 
 /** Sends @p batch through @c ustore_strings_write and counts a failure when it is refused. */
-[[nodiscard]] std::size_t write_batch(ustore_database_t database, ustore_arena_t* arena,
-                                      strings_batch_t const& batch) noexcept {
+[[nodiscard]] std::size_t write_batch(fixture_t& fixture, strings_batch_t const& batch) noexcept {
     ustore_error_t error {};
     ustore_strings_write_t write {};
-    write.db = database;
+    write.db = fixture.database;
     write.error = &error;
-    write.arena = arena;
+    write.arena = &fixture.arena;
+    write.collections = &fixture.collection;
     write.tasks_count = batch.count;
     write.strings = batch.texts.data();
     write.strings_stride = sizeof(ustore_str_view_t);
@@ -105,18 +131,17 @@ struct strings_batch_t {
 }
 
 /** Writes one string and its value. */
-[[nodiscard]] std::size_t write_one(ustore_database_t database, ustore_arena_t* arena, std::string_view text,
-                                    std::string_view value) noexcept {
+[[nodiscard]] std::size_t write_one(fixture_t& fixture, std::string_view text, std::string_view value) noexcept {
     strings_batch_t batch;
     batch.assign(text, value);
-    return write_batch(database, arena, batch);
+    return write_batch(fixture, batch);
 }
 
 /** Removes one string. */
-[[nodiscard]] std::size_t erase_one(ustore_database_t database, ustore_arena_t* arena, std::string_view text) noexcept {
+[[nodiscard]] std::size_t erase_one(fixture_t& fixture, std::string_view text) noexcept {
     strings_batch_t batch;
     batch.erase(text);
-    return write_batch(database, arena, batch);
+    return write_batch(fixture, batch);
 }
 
 /** The values one read exported, addressed by task. */
@@ -141,13 +166,14 @@ struct read_results_t {
 };
 
 /** Reads the values of @p batch, counting a failure when the read is refused. */
-[[nodiscard]] std::size_t read_batch(ustore_database_t database, ustore_arena_t* arena, strings_batch_t const& batch,
+[[nodiscard]] std::size_t read_batch(fixture_t& fixture, strings_batch_t const& batch,
                                      read_results_t& results) noexcept {
     ustore_error_t error {};
     ustore_strings_read_t read {};
-    read.db = database;
+    read.db = fixture.database;
     read.error = &error;
-    read.arena = arena;
+    read.arena = &fixture.arena;
+    read.collections = &fixture.collection;
     read.tasks_count = batch.count;
     read.strings = batch.texts.data();
     read.strings_stride = sizeof(ustore_str_view_t);
@@ -180,16 +206,17 @@ struct scan_results_t {
 };
 
 /** Walks @p prefix, counting a failure when the scan is refused. */
-[[nodiscard]] std::size_t scan_prefix(ustore_database_t database, ustore_arena_t* arena, std::string_view prefix,
-                                      ustore_length_t limit, scan_results_t& results) noexcept {
+[[nodiscard]] std::size_t scan_prefix(fixture_t& fixture, std::string_view prefix, ustore_length_t limit,
+                                      scan_results_t& results) noexcept {
     ustore_error_t error {};
     ustore_str_view_t const prefix_pointer = prefix.data();
     auto const prefix_length = static_cast<ustore_length_t>(prefix.size());
     ustore_length_t* counts = nullptr;
     ustore_strings_scan_t scan {};
-    scan.db = database;
+    scan.db = fixture.database;
     scan.error = &error;
-    scan.arena = arena;
+    scan.arena = &fixture.arena;
+    scan.collections = &fixture.collection;
     scan.tasks_count = 1;
     scan.prefixes = &prefix_pointer;
     scan.prefixes_lengths = &prefix_length;
@@ -205,55 +232,31 @@ struct scan_results_t {
 }
 
 /** Whether a scan of @p prefix returns exactly @p wanted, in that order. */
-[[nodiscard]] std::size_t expect_scan(ustore_database_t database, ustore_arena_t* arena, std::string_view prefix,
+[[nodiscard]] std::size_t expect_scan(fixture_t& fixture, std::string_view prefix,
                                       std::span<std::string_view const> wanted) noexcept {
     std::size_t failures = 0;
     scan_results_t results;
-    failures += scan_prefix(database, arena, prefix, static_cast<ustore_length_t>(batch_capacity_k), results);
+    failures += scan_prefix(fixture, prefix, static_cast<ustore_length_t>(batch_capacity_k), results);
     failures += expect_eq(static_cast<std::size_t>(results.count), wanted.size());
     if (results.count != wanted.size()) return failures;
     for (std::size_t index = 0; index != wanted.size(); ++index) failures += expect_eq(results[index], wanted[index]);
     return failures;
 }
 
-/** An open database and the arena its calls export through. */
-struct fixture_t {
-
-    /** The open database. */
-    ustore_database_t database = nullptr;
-
-    /** Reusable memory for the results. */
-    ustore_arena_t arena = nullptr;
-
-    fixture_t(fixture_t const&) = delete;
-    fixture_t& operator=(fixture_t const&) = delete;
-
-    explicit fixture_t(test_config_t const& config) noexcept {
-        status_t const opened = open_raw(config, database);
-        if (opened.failed()) fmt::println(stderr, "  failed to open the database: {}", opened.message);
-    }
-
-    ~fixture_t() noexcept {
-        ustore_arena_free(arena);
-        ustore_database_free(database);
-    }
-};
-
 /** Short strings order exactly as their text, whatever byte values they carry. */
 std::size_t strings_short_ordering(test_config_t const& config) {
     std::size_t failures = 0;
     fixture_t fixture {config};
-    if (!fixture.database) return failures + 1;
-    failures += clear_database(fixture.database);
+    if (!fixture.ready()) return failures + 1;
 
     // Written out of order, including a byte above the signed range, which the key encoding must not reorder
     std::array<std::string_view, 6> const written {"b", "a", "ab", "aa", "\x80", ""};
     strings_batch_t batch;
     for (std::string_view const text : written) batch.assign(text, "value");
-    failures += write_batch(fixture.database, &fixture.arena, batch);
+    failures += write_batch(fixture, batch);
 
     std::array<std::string_view, 6> const ordered {"", "a", "aa", "ab", "b", "\x80"};
-    failures += expect_scan(fixture.database, &fixture.arena, "", ordered);
+    failures += expect_scan(fixture, "", ordered);
     return failures;
 }
 
@@ -261,24 +264,23 @@ std::size_t strings_short_ordering(test_config_t const& config) {
 std::size_t strings_prefix_scan(test_config_t const& config) {
     std::size_t failures = 0;
     fixture_t fixture {config};
-    if (!fixture.database) return failures + 1;
-    failures += clear_database(fixture.database);
+    if (!fixture.ready()) return failures + 1;
 
     strings_batch_t batch;
     batch.assign("user:2", "second");
     batch.assign("team:1", "team");
     batch.assign("user:10", "tenth");
     batch.assign("user:1", "first");
-    failures += write_batch(fixture.database, &fixture.arena, batch);
+    failures += write_batch(fixture, batch);
 
     std::array<std::string_view, 3> const users {"user:1", "user:10", "user:2"};
-    failures += expect_scan(fixture.database, &fixture.arena, "user:", users);
+    failures += expect_scan(fixture, "user:", users);
 
     std::array<std::string_view, 1> const teams {"team:1"};
-    failures += expect_scan(fixture.database, &fixture.arena, "team:", teams);
+    failures += expect_scan(fixture, "team:", teams);
 
     std::array<std::string_view, 0> const absent {};
-    failures += expect_scan(fixture.database, &fixture.arena, "missing", absent);
+    failures += expect_scan(fixture, "missing", absent);
     return failures;
 }
 
@@ -286,8 +288,7 @@ std::size_t strings_prefix_scan(test_config_t const& config) {
 std::size_t strings_shared_prefix(test_config_t const& config) {
     std::size_t failures = 0;
     fixture_t fixture {config};
-    if (!fixture.database) return failures + 1;
-    failures += clear_database(fixture.database);
+    if (!fixture.ready()) return failures + 1;
 
     // Fifteen leading bytes in common, so the strings share a key at every key width the engine compiles with
     constexpr std::string_view shared_k = "shared-prefix!!";
@@ -297,17 +298,17 @@ std::size_t strings_shared_prefix(test_config_t const& config) {
     batch.assign(written[0], "first");
     batch.assign(written[1], "third");
     batch.assign(written[2], "second");
-    failures += write_batch(fixture.database, &fixture.arena, batch);
+    failures += write_batch(fixture, batch);
 
     read_results_t results;
-    failures += read_batch(fixture.database, &fixture.arena, batch, results);
+    failures += read_batch(fixture, batch, results);
     failures += expect(results.present(0) && results.value_of(0) == std::string_view("first"));
     failures += expect(results.present(1) && results.value_of(1) == std::string_view("third"));
     failures += expect(results.present(2) && results.value_of(2) == std::string_view("second"));
 
     std::array<std::string_view, 3> const ordered {"shared-prefix!!alpha", "shared-prefix!!beta",
                                                    "shared-prefix!!gamma"};
-    failures += expect_scan(fixture.database, &fixture.arena, shared_k, ordered);
+    failures += expect_scan(fixture, shared_k, ordered);
     return failures;
 }
 
@@ -315,8 +316,7 @@ std::size_t strings_shared_prefix(test_config_t const& config) {
 std::size_t strings_empty_and_embedded_zero(test_config_t const& config) {
     std::size_t failures = 0;
     fixture_t fixture {config};
-    if (!fixture.database) return failures + 1;
-    failures += clear_database(fixture.database);
+    if (!fixture.ready()) return failures + 1;
 
     constexpr std::string_view with_zero_k {"a\0b", 3};
     constexpr std::string_view trailing_zero_k {"a\0", 2};
@@ -327,10 +327,10 @@ std::size_t strings_empty_and_embedded_zero(test_config_t const& config) {
     batch.assign(with_zero_k, binary_value_k);
     batch.assign(trailing_zero_k, "trailing");
     batch.assign("a", "plain");
-    failures += write_batch(fixture.database, &fixture.arena, batch);
+    failures += write_batch(fixture, batch);
 
     read_results_t results;
-    failures += read_batch(fixture.database, &fixture.arena, batch, results);
+    failures += read_batch(fixture, batch, results);
     failures += expect(results.present(0) && results.value_of(0) == std::string_view("empty string"));
     failures += expect(results.present(1) && results.value_of(1) == binary_value_k);
     failures += expect(results.present(2) && results.value_of(2) == std::string_view("trailing"));
@@ -338,7 +338,7 @@ std::size_t strings_empty_and_embedded_zero(test_config_t const& config) {
 
     // The length inside the key tells the three strings apart, though their bytes share a run
     std::array<std::string_view, 3> const ordered {"a", trailing_zero_k, with_zero_k};
-    failures += expect_scan(fixture.database, &fixture.arena, "a", ordered);
+    failures += expect_scan(fixture, "a", ordered);
     return failures;
 }
 
@@ -346,33 +346,32 @@ std::size_t strings_empty_and_embedded_zero(test_config_t const& config) {
 std::size_t strings_update_and_remove(test_config_t const& config) {
     std::size_t failures = 0;
     fixture_t fixture {config};
-    if (!fixture.database) return failures + 1;
-    failures += clear_database(fixture.database);
+    if (!fixture.ready()) return failures + 1;
 
-    failures += write_one(fixture.database, &fixture.arena, "key", "first");
+    failures += write_one(fixture, "key", "first");
     strings_batch_t probe;
     probe.assign("key", "");
 
     read_results_t results;
-    failures += read_batch(fixture.database, &fixture.arena, probe, results);
+    failures += read_batch(fixture, probe, results);
     failures += expect(results.present(0) && results.value_of(0) == std::string_view("first"));
 
-    failures += write_one(fixture.database, &fixture.arena, "key", "second");
-    failures += read_batch(fixture.database, &fixture.arena, probe, results);
+    failures += write_one(fixture, "key", "second");
+    failures += read_batch(fixture, probe, results);
     failures += expect(results.present(0) && results.value_of(0) == std::string_view("second"));
 
     // An empty value is stored and read back as present, unlike a removed one
-    failures += write_one(fixture.database, &fixture.arena, "key", "");
-    failures += read_batch(fixture.database, &fixture.arena, probe, results);
+    failures += write_one(fixture, "key", "");
+    failures += read_batch(fixture, probe, results);
     failures += expect(results.present(0));
     failures += expect_eq(results.value_of(0).size(), 0u);
 
-    failures += erase_one(fixture.database, &fixture.arena, "key");
-    failures += read_batch(fixture.database, &fixture.arena, probe, results);
+    failures += erase_one(fixture, "key");
+    failures += read_batch(fixture, probe, results);
     failures += expect(!results.present(0));
 
     std::array<std::string_view, 0> const empty {};
-    failures += expect_scan(fixture.database, &fixture.arena, "", empty);
+    failures += expect_scan(fixture, "", empty);
     return failures;
 }
 
@@ -380,38 +379,37 @@ std::size_t strings_update_and_remove(test_config_t const& config) {
 std::size_t strings_bucket_growth(test_config_t const& config) {
     std::size_t failures = 0;
     fixture_t fixture {config};
-    if (!fixture.database) return failures + 1;
-    failures += clear_database(fixture.database);
+    if (!fixture.ready()) return failures + 1;
 
     constexpr std::string_view shared_k = "shared-prefix!!";
     constexpr std::string_view first_k = "shared-prefix!!one";
     constexpr std::string_view second_k = "shared-prefix!!two";
     constexpr std::string_view third_k = "shared-prefix!!three";
 
-    failures += write_one(fixture.database, &fixture.arena, first_k, "1");
+    failures += write_one(fixture, first_k, "1");
     std::array<std::string_view, 1> const alone {first_k};
-    failures += expect_scan(fixture.database, &fixture.arena, shared_k, alone);
+    failures += expect_scan(fixture, shared_k, alone);
 
-    failures += write_one(fixture.database, &fixture.arena, second_k, "2");
-    failures += write_one(fixture.database, &fixture.arena, third_k, "3");
+    failures += write_one(fixture, second_k, "2");
+    failures += write_one(fixture, third_k, "3");
     std::array<std::string_view, 3> const grown {first_k, third_k, second_k};
-    failures += expect_scan(fixture.database, &fixture.arena, shared_k, grown);
+    failures += expect_scan(fixture, shared_k, grown);
 
-    failures += erase_one(fixture.database, &fixture.arena, third_k);
-    failures += erase_one(fixture.database, &fixture.arena, second_k);
-    failures += expect_scan(fixture.database, &fixture.arena, shared_k, alone);
+    failures += erase_one(fixture, third_k);
+    failures += erase_one(fixture, second_k);
+    failures += expect_scan(fixture, shared_k, alone);
 
     // The surviving entry still reads back, so shrinking rewrote the bucket rather than truncating it
     strings_batch_t probe;
     probe.assign(first_k, "");
     read_results_t results;
-    failures += read_batch(fixture.database, &fixture.arena, probe, results);
+    failures += read_batch(fixture, probe, results);
     failures += expect(results.present(0) && results.value_of(0) == std::string_view("1"));
 
-    failures += erase_one(fixture.database, &fixture.arena, first_k);
+    failures += erase_one(fixture, first_k);
     std::array<std::string_view, 0> const gone {};
-    failures += expect_scan(fixture.database, &fixture.arena, shared_k, gone);
-    failures += read_batch(fixture.database, &fixture.arena, probe, results);
+    failures += expect_scan(fixture, shared_k, gone);
+    failures += read_batch(fixture, probe, results);
     failures += expect(!results.present(0));
     return failures;
 }
@@ -420,26 +418,25 @@ std::size_t strings_bucket_growth(test_config_t const& config) {
 std::size_t strings_batched_bucket(test_config_t const& config) {
     std::size_t failures = 0;
     fixture_t fixture {config};
-    if (!fixture.database) return failures + 1;
-    failures += clear_database(fixture.database);
+    if (!fixture.ready()) return failures + 1;
 
     constexpr std::string_view shared_k = "shared-prefix!!";
     strings_batch_t batch;
     batch.assign("shared-prefix!!a", "stale");
     batch.assign("shared-prefix!!b", "kept");
     batch.assign("shared-prefix!!a", "fresh");
-    failures += write_batch(fixture.database, &fixture.arena, batch);
+    failures += write_batch(fixture, batch);
 
     strings_batch_t probe;
     probe.assign("shared-prefix!!a", "");
     probe.assign("shared-prefix!!b", "");
     read_results_t results;
-    failures += read_batch(fixture.database, &fixture.arena, probe, results);
+    failures += read_batch(fixture, probe, results);
     failures += expect(results.present(0) && results.value_of(0) == std::string_view("fresh"));
     failures += expect(results.present(1) && results.value_of(1) == std::string_view("kept"));
 
     std::array<std::string_view, 2> const ordered {"shared-prefix!!a", "shared-prefix!!b"};
-    failures += expect_scan(fixture.database, &fixture.arena, shared_k, ordered);
+    failures += expect_scan(fixture, shared_k, ordered);
     return failures;
 }
 
@@ -447,17 +444,16 @@ std::size_t strings_batched_bucket(test_config_t const& config) {
 std::size_t strings_scan_pagination(test_config_t const& config) {
     std::size_t failures = 0;
     fixture_t fixture {config};
-    if (!fixture.database) return failures + 1;
-    failures += clear_database(fixture.database);
+    if (!fixture.ready()) return failures + 1;
 
     strings_batch_t batch;
     batch.assign("page:a", "1");
     batch.assign("page:b", "2");
     batch.assign("page:c", "3");
-    failures += write_batch(fixture.database, &fixture.arena, batch);
+    failures += write_batch(fixture, batch);
 
     scan_results_t first_page;
-    failures += scan_prefix(fixture.database, &fixture.arena, "page:", 2, first_page);
+    failures += scan_prefix(fixture, "page:", 2, first_page);
     failures += expect_eq(static_cast<std::size_t>(first_page.count), 2u);
     if (first_page.count == 2) {
         failures += expect_eq(first_page[0], std::string_view("page:a"));
@@ -476,6 +472,7 @@ std::size_t strings_scan_pagination(test_config_t const& config) {
     scan.db = fixture.database;
     scan.error = &error;
     scan.arena = &fixture.arena;
+    scan.collections = &fixture.collection;
     scan.tasks_count = 1;
     scan.prefixes = &prefix_pointer;
     scan.prefixes_lengths = &prefix_length;

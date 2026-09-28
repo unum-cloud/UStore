@@ -16,7 +16,6 @@
 #include "helpers/linked_memory.hpp" // `clear_linked_memory`
 
 ustore_collection_t const ustore_collection_main_k = 0;
-ustore_collection_t const ustore_collection_names_k = std::numeric_limits<ustore_collection_t>::max() - 1;
 ustore_length_t const ustore_length_missing_k = std::numeric_limits<ustore_length_t>::max();
 ustore_key_t const ustore_key_unknown_k = std::numeric_limits<ustore_key_t>::max();
 
@@ -69,6 +68,10 @@ void ustore_measure(ustore_measure_t* arguments) { route(arguments, &engine_t::m
 void ustore_collection_create(ustore_collection_create_t* arguments) { route(arguments, &engine_t::collection_create); }
 void ustore_collection_drop(ustore_collection_drop_t* arguments) { route(arguments, &engine_t::collection_drop); }
 void ustore_collection_list(ustore_collection_list_t* arguments) { route(arguments, &engine_t::collection_list); }
+void ustore_collection_find(ustore_collection_find_t* arguments) { route(arguments, &engine_t::collection_find); }
+void ustore_strings_write(ustore_strings_write_t* arguments) { route(arguments, &engine_t::strings_write); }
+void ustore_strings_read(ustore_strings_read_t* arguments) { route(arguments, &engine_t::strings_read); }
+void ustore_strings_scan(ustore_strings_scan_t* arguments) { route(arguments, &engine_t::strings_scan); }
 void ustore_transaction_init(ustore_transaction_init_t* arguments) { route(arguments, &engine_t::transaction_init); }
 void ustore_transaction_stage(ustore_transaction_stage_t* arguments) { route(arguments, &engine_t::transaction_stage); }
 void ustore_transaction_commit(ustore_transaction_commit_t* arguments) {

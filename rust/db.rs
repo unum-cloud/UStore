@@ -193,6 +193,36 @@ pub(crate) mod ffi {
         pub options: ustore_enum_t,
         pub count: *mut ustore_size_t,
         pub ids: *mut *mut ustore_collection_t,
+        pub modalities: *mut *mut ustore_enum_t,
+        pub names_offsets: *mut *mut ustore_length_t,
+        pub names: *mut *mut ustore_char_t,
+    }
+
+    #[repr(C)]
+    pub struct ustore_collection_create_t {
+        pub db: ustore_database_t,
+        pub error: *mut ustore_error_t,
+        pub name: ustore_str_view_t,
+        pub name_length: ustore_length_t,
+        pub modality: ustore_enum_t,
+        pub id: *mut ustore_collection_t,
+    }
+
+    #[repr(C)]
+    pub struct ustore_collection_find_t {
+        pub db: ustore_database_t,
+        pub error: *mut ustore_error_t,
+        pub snapshot: ustore_snapshot_t,
+        pub arena: *mut ustore_arena_t,
+        pub options: ustore_enum_t,
+        pub tasks_count: ustore_size_t,
+        pub names: *const ustore_str_view_t,
+        pub names_stride: ustore_size_t,
+        pub names_lengths: *const ustore_length_t,
+        pub names_lengths_stride: ustore_size_t,
+        pub presences: *mut *mut ustore_octet_t,
+        pub ids: *mut *mut ustore_collection_t,
+        pub modalities: *mut *mut ustore_enum_t,
     }
 
     #[repr(C)]
@@ -231,7 +261,6 @@ pub(crate) mod ffi {
 
     extern "C" {
         pub static ustore_collection_main_k: ustore_collection_t;
-        pub static ustore_collection_names_k: ustore_collection_t;
         pub static ustore_length_missing_k: ustore_length_t;
         pub static ustore_key_unknown_k: ustore_key_t;
 
@@ -249,6 +278,8 @@ pub(crate) mod ffi {
         pub fn ustore_snapshot_drop(arguments: *mut ustore_snapshot_drop_t);
 
         pub fn ustore_collection_list(arguments: *mut ustore_collection_list_t);
+        pub fn ustore_collection_create(arguments: *mut ustore_collection_create_t);
+        pub fn ustore_collection_find(arguments: *mut ustore_collection_find_t);
         pub fn ustore_collection_drop(arguments: *mut ustore_collection_drop_t);
 
         pub fn ustore_transaction_init(arguments: *mut ustore_transaction_init_t);
@@ -398,12 +429,6 @@ impl Collection {
     pub fn main() -> Self {
         // SAFETY: the library defines the constant once and never writes it.
         Collection(unsafe { ffi::ustore_collection_main_k })
-    }
-
-    /// The reserved collection the strings modality maps names onto identifiers in.
-    pub(crate) fn names() -> Self {
-        // SAFETY: the library defines the constant once and never writes it.
-        Collection(unsafe { ffi::ustore_collection_names_k })
     }
 }
 
@@ -1007,16 +1032,17 @@ impl Database {
     }
 
     /// Creates an empty collection and binds `name` to it, refusing a name already in use.
-    pub fn create_collection(&self, arena: &mut Arena, name: &str) -> Result<Collection> {
-        crate::strings::create_named(self.handle, arena, name)
+    pub fn create_collection(&self, name: &str) -> Result<Collection> {
+        crate::strings::create_named(self.handle, name)
     }
 
     /// Drops the collection `name` addresses, together with its contents and its name.
     pub fn drop_collection(&self, arena: &mut Arena, name: &str) -> Result<()> {
-        crate::strings::drop_named(self.handle, arena, name)
+        let collection = self.head().collection(arena, name)?;
+        self.clear_collection(collection, Removed::CollectionAndEntries)
     }
 
-    /// Removes the contents of a collection, or the collection itself, keeping every name bound.
+    /// Removes the contents of a collection, or the collection itself together with its name.
     pub fn clear_collection(&self, collection: Collection, removed: Removed) -> Result<()> {
         let mut error = ffi::ustore_error_t::default();
         let mut arguments = ffi::ustore_collection_drop_t {
@@ -1116,6 +1142,9 @@ impl<'view> View<'view> {
             options: ffi::USTORE_OPTIONS_DEFAULT_K,
             count: &mut count,
             ids: &mut ids,
+            modalities: ptr::null_mut(),
+            names_offsets: ptr::null_mut(),
+            names: ptr::null_mut(),
         };
         // SAFETY: every pointer in `arguments` outlives the call.
         unsafe { ffi::ustore_collection_list(&mut arguments) };
@@ -1390,8 +1419,8 @@ mod tests {
         let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
 
-        let people = database.create_collection(&mut arena, "people").unwrap();
-        let places = database.create_collection(&mut arena, "places").unwrap();
+        let people = database.create_collection("people").unwrap();
+        let places = database.create_collection("places").unwrap();
         assert_ne!(people, places);
         assert_eq!(database.head().collection(&mut arena, "people").unwrap(), people);
 
@@ -1401,7 +1430,7 @@ mod tests {
 
         // A name is bound once, and a name nobody bound addresses nothing.
         assert_eq!(
-            database.create_collection(&mut arena, "people").unwrap_err().status,
+            database.create_collection("people").unwrap_err().status,
             Status::AlreadyExists
         );
         assert_eq!(
@@ -1648,7 +1677,6 @@ mod tests {
     #[test]
     fn constants_come_from_the_linked_engine() {
         assert_eq!(Collection::main().0, 0);
-        assert_ne!(Collection::names().0, Collection::main().0);
         assert_eq!(missing_length(), u32::MAX);
         assert_ne!(key_unknown(), 0);
     }

@@ -46,7 +46,7 @@ inline expected<ustore_collection_t> collection_named(ustore_database_t database
     ustore_octet_t* presences = nullptr;
     ustore_collection_t* ids = nullptr;
     ustore_error_t error {};
-    ustore_named_collections_find_t find {};
+    ustore_collection_find_t find {};
     find.db = database;
     find.error = &error;
     find.snapshot = snapshot;
@@ -56,7 +56,7 @@ inline expected<ustore_collection_t> collection_named(ustore_database_t database
     find.names_lengths = &length;
     find.presences = &presences;
     find.ids = &ids;
-    ustore_named_collections_find(&find);
+    ustore_collection_find(&find);
     if (error.status == ustore_error_unsupported_k || (!error.status && !(presences[0] & 1)))
         return status_t {status_code_t::not_found_k, "No such collection"};
     if (error.status) return status_t {error};
@@ -377,21 +377,19 @@ class database_t {
     expected<blobs_collection_t> operator[](std::string_view name) noexcept { return find_or_create(name); }
     expected<bool> contains(std::string_view name) noexcept { return context_t {database_, nullptr}.contains(name); }
 
-    /** Creates a collection of @p modality and records @p name for it, which no other collection may carry. */
+    /** Creates a collection of @p modality under @p name, which no other collection may carry. */
     template <typename collection_ = blobs_collection_t>
     expected<collection_> create(std::string_view name, ustore_modality_t modality = ustore_modality_any_k) noexcept {
-        arena_t arena {database_};
         ustore_error_t error {};
         ustore_collection_t collection = ustore_collection_main_k;
-        ustore_named_collections_create_t create {};
+        ustore_collection_create_t create {};
         create.db = database_;
         create.error = &error;
-        create.arena = arena.member_ptr();
         create.name = name.data();
         create.name_length = static_cast<ustore_length_t>(name.size());
         create.modality = modality;
         create.id = &collection;
-        ustore_named_collections_create(&create);
+        ustore_collection_create(&create);
         if (error.status) return status_t {error};
         return collection_ {database_, collection, nullptr};
     }
@@ -410,21 +408,23 @@ class database_t {
         return create<collection_>(name);
     }
 
-    /** Drops the collection @p name addresses, together with the name. */
+    /** Drops the collection @p name addresses, which takes the name with it. */
     status_t drop(std::string_view name) noexcept {
         arena_t arena {database_};
+        auto [collection, find_status] = collection_named(database_, {}, arena.member_ptr(), name);
+        if (find_status.failed()) return find_status;
+
         ustore_error_t error {};
-        ustore_named_collections_drop_t drop {};
+        ustore_collection_drop_t drop {};
         drop.db = database_;
         drop.error = &error;
-        drop.arena = arena.member_ptr();
-        drop.name = name.data();
-        drop.name_length = static_cast<ustore_length_t>(name.size());
-        ustore_named_collections_drop(&drop);
+        drop.id = collection;
+        drop.mode = ustore_drop_keys_vals_handle_k;
+        ustore_collection_drop(&drop);
         return status_t {error};
     }
 
-    /** Drops every snapshot and collection, then empties the names and the main collection. */
+    /** Drops every snapshot and every collection, whose names go with them, then empties the main collection. */
     status_t clear() noexcept {
         context_t context {database_, nullptr};
         ustore_error_t error {};
@@ -453,13 +453,6 @@ class database_t {
             ustore_collection_drop(&collection_drop);
             if (error.status) return status_t {error};
         }
-
-        // The names go with the collections they addressed, and an engine without them has none to clear
-        collection_drop.id = ustore_collection_names_k;
-        collection_drop.mode = ustore_drop_keys_vals_k;
-        ustore_collection_drop(&collection_drop);
-        if (error.status && error.status != ustore_error_unsupported_k) return status_t {error};
-        error = {};
 
         collection_drop.id = ustore_collection_main_k;
         collection_drop.mode = ustore_drop_keys_vals_k;

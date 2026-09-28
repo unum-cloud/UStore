@@ -28,7 +28,7 @@ use ustore::{Arena, Collection, RAMOptions, Database, Durability, Entry};
 let database = Database::open_ram(&RAMOptions::default())?;
 let mut arena = Arena::new();
 
-let people = database.create_collection(&mut arena, "people")?;
+let people = database.create_collection("people")?;
 let entries = [Entry::new(1, b"Ada")?, Entry::new(2, b"Grace")?, Entry::removal(3)];
 database.head().write(&mut arena, people, &entries, Durability::Buffered)?;
 
@@ -111,11 +111,11 @@ A snapshot pins the state it was taken at until it is dropped, and `Snapshot::ex
 
 ## Collections And Names
 
-Collections are created, listed and dropped by identifier, and a name is a binding in the strings modality rather than anything an engine knows.
-Both halves live behind one call each.
+Collections are created under a name, resolved by it once and addressed by identifier from then on, and dropping one forgets its name.
+Each engine keeps the names apart from every collection, so no identifier reaches them.
 
 ```rust
-let people = database.create_collection(&mut arena, "people")?;
+let people = database.create_collection("people")?;
 let same = database.head().collection(&mut arena, "people")?;
 let every = database.head().collections(&mut arena)?;
 
@@ -187,7 +187,7 @@ A slice of edges therefore crosses as three strided columns, and the tape a look
 ```rust
 use ustore::{Edge, Role, Roles};
 
-let follows = database.create_collection(&mut arena, "follows")?;
+let follows = database.create_collection("follows")?;
 let edges = [Edge::new(1, 2), Edge::new(1, 3), Edge::with_id(2, 3, 7)];
 database.head().upsert_edges(&mut arena, follows, &edges, Durability::Buffered)?;
 database.head().upsert_vertices(&mut arena, follows, &[4], Durability::Buffered)?;

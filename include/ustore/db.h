@@ -202,11 +202,6 @@ typedef enum {
  *  @c ustore_drop_vals_k may only clear. */
 extern ustore_collection_t const ustore_collection_main_k;
 
-/** The collection reserved for the strings modality that maps names onto identifiers, which
- *  @c ustore_collection_create never hands out and @c ustore_collection_list never reports. An engine
- *  without collections of its own refuses it, as it refuses every collection but the main one. */
-extern ustore_collection_t const ustore_collection_names_k;
-
 /** The length reported for a missing value. */
 extern ustore_length_t const ustore_length_missing_k;
 
@@ -587,10 +582,10 @@ typedef enum ustore_modality_t {
 } ustore_modality_t;
 
 /**
- *  @brief The arguments of @c ustore_collection_list, which exports the identifiers of the collections.
+ *  @brief The arguments of @c ustore_collection_list, which exports every collection with its name and modality.
  *
- *  The main collection is never listed. Listing is the only collection operation that runs on a snapshot.
- *  A name a caller gives a collection lives in the strings modality, never in the catalog of an engine.
+ *  The main collection is never listed, and the order of the others is the engine's. Listing is the only collection
+ *  operation beside @c ustore_collection_find that runs on a snapshot.
  */
 typedef struct ustore_collection_list_t {
 
@@ -615,8 +610,18 @@ typedef struct ustore_collection_list_t {
     /** Output for the number of collections. */
     ustore_size_t* count;
 
-    /** Output for the identifiers of the collections. */
+    /** Optional output for the identifiers of the collections. */
     ustore_collection_t** ids;
+
+    /** Optional output for what every collection holds. */
+    ustore_modality_t** modalities;
+
+    /** Optional output for @c count plus one offsets into @c names, where a collection without a name has an empty
+     *  one. */
+    ustore_length_t** names_offsets;
+
+    /** Optional output for the tape of names, in the order of the identifiers. */
+    ustore_char_t** names;
 
 } ustore_collection_list_t;
 
@@ -626,8 +631,16 @@ typedef struct ustore_collection_list_t {
  */
 void ustore_collection_list(ustore_collection_list_t* arguments);
 
-/** The arguments of @c ustore_collection_create, which always creates an empty collection and answers
- *  the identifier addressing it. */
+/**
+ *  @brief The arguments of @c ustore_collection_create, which always creates an empty collection and answers the
+ *      identifier addressing it.
+ *
+ *  Runs at the head of the database. A name is recorded with the collection in one step and survives a crash beside
+ *  it, and a name another collection carries, even one a concurrent creator took first, fails the call with
+ *  @c ustore_error_already_exists_k and creates nothing. Each engine keeps the names apart from every collection,
+ *  so no identifier reaches them, and a name resolves in two phases: once through @c ustore_collection_find, and
+ *  from then on by identifier, as no other call carries one.
+ */
 typedef struct ustore_collection_create_t {
 
     /** An open database. */
@@ -636,7 +649,13 @@ typedef struct ustore_collection_create_t {
     /** Output for the error message. */
     ustore_error_t* error;
 
-    /** What the collection holds, which an engine may lay its storage out for. */
+    /** Optional name no other collection carries, where @c NULL creates a collection without one. */
+    ustore_str_view_t name;
+
+    /** Length of the name, inferred from a null terminator when zero. */
+    ustore_length_t name_length;
+
+    /** What the collection holds, which fixes how it is keyed and so which calls reach it. */
     ustore_modality_t modality;
 
     /** Output for the identifier of the collection. */
@@ -645,12 +664,70 @@ typedef struct ustore_collection_create_t {
 } ustore_collection_create_t;
 
 /**
- *  @brief Creates an empty collection.
+ *  @brief Creates an empty collection, named or not.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
 void ustore_collection_create(ustore_collection_create_t* arguments);
 
-/** The arguments of @c ustore_collection_drop, where the main collection can only be cleared. */
+/**
+ *  @brief The arguments of @c ustore_collection_find, which reads the collections a batch of names address.
+ *
+ *  Names are read at the head of the database or at a snapshot, never inside a transaction, so resolving a name
+ *  never joins the conflicts of the work that follows it. A name no collection carries answers
+ *  @c ustore_collection_main_k, @c ustore_modality_any_k and an unset presence bit.
+ */
+typedef struct ustore_collection_find_t {
+
+    /** An open database. */
+    ustore_database_t db;
+
+    /** Output for the error message. */
+    ustore_error_t* error;
+
+    /** Snapshot whose names are read, or zero for the head. */
+    ustore_snapshot_t snapshot;
+
+    /** Reusable memory for the results. */
+    ustore_arena_t* arena;
+
+    /** Accepts @c ustore_option_dont_discard_memory_k. */
+    ustore_options_t options;
+
+    /** Number of tasks, one per name. */
+    ustore_size_t tasks_count;
+
+    /** Names to resolve, @c NULL only when there are no tasks. */
+    ustore_str_view_t const* names;
+
+    /** Bytes between consecutive name pointers, where zero repeats the first one. */
+    ustore_size_t names_stride;
+
+    /** Optional lengths of the names, inferred from null terminators when absent. */
+    ustore_length_t const* names_lengths;
+
+    /** Bytes between consecutive name lengths, where zero repeats the first one. */
+    ustore_size_t names_lengths_stride;
+
+    /** Optional output for a bitset of at least @c tasks_count bits marking the names a collection carries,
+     *  addressed as Apache Arrow does. */
+    ustore_octet_t** presences;
+
+    /** Output for the identifiers of the collections the names address. */
+    ustore_collection_t** ids;
+
+    /** Optional output for what the collections hold. */
+    ustore_modality_t** modalities;
+
+} ustore_collection_find_t;
+
+/**
+ *  @brief Reads the collections a batch of names address.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ */
+void ustore_collection_find(ustore_collection_find_t* arguments);
+
+/** The arguments of @c ustore_collection_drop, where the main collection can only be cleared, and dropping a
+ *  collection whole forgets its name before the collection goes. */
 typedef struct ustore_collection_drop_t {
 
     /** An open database. */

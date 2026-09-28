@@ -1,8 +1,8 @@
 /**
- *  @file c/strings.cpp
+ *  @file src/nvme/strings.cpp
  *  @author Ash Vardanian
  *  @date September 16, 2026
- *  @brief The strings modality over any engine, mapping variable-length strings onto arbitrary bytes.
+ *  @brief The strings modality and the names of collections laid over NVMe's keyed calls, until NVMe keys them itself.
  *
  *  A string becomes a key of its leading bytes and its length, and the value under that key is a bucket:
  *  a sorted run of entries, each a string and its value, binary-searched by text. A string short enough to
@@ -14,7 +14,7 @@
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`, `std::strlen`
 
-#include <algorithm>   // `std::ranges::sort`, `std::min`
+#include <algorithm>   // `std::sort`, `std::ranges::sort`, `std::ranges::lower_bound`, `std::min`
 #include <compare>     // `std::strong_ordering`
 #include <limits>      // `std::numeric_limits`
 #include <span>        // `std::span`
@@ -25,11 +25,19 @@
 #include <ustore/strings.h>       // `ustore_strings_write_t`, `ustore_strings_read_t`
 #include <ustore/ustore.hpp>      // `ustore_read`, `strided_iterator`, `joined_blobs_t`
 
+#include "engine.hpp"                // `name_record_t`, `read_name_record`
 #include "helpers/algorithm.hpp"     // `offset_in_sorted`
 #include "helpers/linked_array.hpp"  // `growing_tape_t`, `uninitialized_array`
 #include "helpers/linked_memory.hpp" // `linked_memory_lock_t`
 
-namespace unum::ustore {
+namespace unum::ustore::nvme {
+
+/** The collection the names of collections live in as strings, above every identifier NVMe hands out. */
+extern ustore_collection_t const names_collection_k = std::numeric_limits<ustore_collection_t>::max() - 1;
+
+void collection_find(ustore_collection_find_t& request) noexcept;
+
+namespace {
 
 #pragma region Key Encoding
 
@@ -259,25 +267,6 @@ inline void write_bucket(ustore_byte_t* bytes, std::span<bucket_entry_t const> e
 
 #pragma region Argument Views
 
-/** The strings of one batch, as the C ABI receives them. */
-struct strings_arg_t {
-
-    /** Pointers to the strings. */
-    strided_iterator<ustore_str_view_t const> texts;
-
-    /** Optional lengths of the strings, where a null iterator means they are null-terminated. */
-    strided_iterator<ustore_length_t const> lengths;
-
-    /** The string of task @p index. */
-    std::string_view operator[](std::size_t index) const noexcept {
-        auto const signed_index = static_cast<std::ptrdiff_t>(index);
-        ustore_str_view_t const text = texts[signed_index];
-        if (!text) return {};
-        std::size_t const length = lengths ? lengths[signed_index] : std::strlen(text);
-        return {text, length};
-    }
-};
-
 /** One bucket a batch reads or rewrites, addressed by its collection and key. */
 struct touched_bucket_t : public collection_key_t {
 
@@ -311,10 +300,6 @@ struct write_task_t {
         if (auto const keys = first.key <=> second.key; keys != 0) return keys;
         if (auto const texts = first.text <=> second.text; texts != 0) return texts;
         return first.task_index <=> second.task_index;
-    }
-
-    friend bool operator==(write_task_t const& first, write_task_t const& second) noexcept {
-        return (first <=> second) == 0;
     }
 };
 
@@ -388,26 +373,13 @@ void push_buckets( //
 
 #pragma region Named Collections
 
-/** Bytes of the record a name maps onto: the collection's identifier in bytes @b [0,8), its modality in byte 8. */
-constexpr std::size_t name_record_bytes_k = sizeof(ustore_collection_t) + 1;
-
 /** Times a create retries recording its name, as a transaction conflicts over any other name sharing its bucket. */
 constexpr std::size_t name_record_attempts_k = 16;
 
-/** The record a name maps onto, laid out as @c ustore_collection_names_k stores it. */
-struct name_record_t {
-    ustore_byte_t bytes[name_record_bytes_k] {};
-
-    name_record_t(ustore_collection_t id, ustore_modality_t modality) noexcept {
-        std::memcpy(bytes, &id, sizeof(id));
-        bytes[sizeof(id)] = static_cast<ustore_byte_t>(modality);
-    }
-};
-
 /** Reads the record of @p name at the head, answering whether a collection carries the name at all. */
-bool read_name_record(ustore_database_t database, ustore_transaction_t transaction, std::string_view name,
-                      linked_memory_lock_t& arena, ustore_error_t* error, ustore_collection_t& id) noexcept {
-    ustore_collection_t const names = ustore_collection_names_k;
+bool look_up_name(ustore_database_t database, ustore_transaction_t transaction, std::string_view name,
+                  linked_memory_lock_t& arena, ustore_error_t* error, ustore_collection_t& id) noexcept {
+    ustore_collection_t const names = names_collection_k;
     char const* const text = name.data();
     ustore_length_t const length = static_cast<ustore_length_t>(name.size());
     ustore_length_t* lengths = nullptr;
@@ -426,23 +398,22 @@ bool read_name_record(ustore_database_t database, ustore_transaction_t transacti
     read.values = &values;
     ustore_strings_read(&read);
     if (error->status || lengths[0] == ustore_length_missing_k) return false;
-    if (lengths[0] != name_record_bytes_k) {
-        *error = {ustore_error_malformed_k, "The name holds no collection record"};
-        return false;
-    }
-    std::memcpy(&id, values, sizeof(id));
-    return true;
+    ustore_modality_t modality = ustore_modality_any_k;
+    if (read_name_record(std::string_view {reinterpret_cast<char const*>(values), lengths[0]}, id, modality))
+        return true;
+    *error = {ustore_error_malformed_k, "The name holds no collection record"};
+    return false;
 }
 
 /** Writes @p record under @p name, or removes the name when @p record is null. */
 void write_name_record(ustore_database_t database, ustore_transaction_t transaction, std::string_view name,
                        name_record_t const* record, ustore_options_t options, linked_memory_lock_t& arena,
                        ustore_error_t* error) noexcept {
-    ustore_collection_t const names = ustore_collection_names_k;
+    ustore_collection_t const names = names_collection_k;
     char const* const text = name.data();
     ustore_length_t const length = static_cast<ustore_length_t>(name.size());
-    ustore_bytes_cptr_t const value = record ? record->bytes : nullptr;
-    ustore_length_t const value_length = name_record_bytes_k;
+    ustore_bytes_cptr_t const value = record ? reinterpret_cast<ustore_bytes_cptr_t>(record->bytes) : nullptr;
+    ustore_length_t const value_length = sizeof(name_record_t::bytes);
 
     ustore_strings_write_t write {};
     write.db = database;
@@ -479,7 +450,7 @@ bool record_name(ustore_database_t database, std::string_view name, name_record_
         ustore_transaction_init(&init);
         if (error->status) break;
 
-        if (read_name_record(database, transaction, name, arena, error, taken)) {
+        if (look_up_name(database, transaction, name, arena, error, taken)) {
             *error = {ustore_error_already_exists_k, "Another collection took the name first"};
             break;
         }
@@ -500,45 +471,116 @@ bool record_name(ustore_database_t database, std::string_view name, name_record_
     return recorded;
 }
 
-/** The name @p text of @p length, whose length a null terminator gives when zero. */
-std::string_view name_of(ustore_str_view_t text, ustore_length_t length) noexcept {
-    if (!text) return {};
-    return {text, length ? length : std::strlen(text)};
+/** Every name of a database with the collection it addresses and what that holds, exported into one arena. */
+struct names_t {
+    std::size_t count = 0;
+    ustore_length_t* offsets = nullptr;
+    ustore_char_t* tape = nullptr;
+    ustore_collection_t* ids = nullptr;
+    ustore_modality_t* modalities = nullptr;
+
+    /** The name at @p index. */
+    [[nodiscard]] std::string_view operator[](std::size_t index) const noexcept {
+        return {tape + offsets[index], offsets[index + 1] - offsets[index]};
+    }
+};
+
+/** Reads every name of @p database at @p snapshot, or at the head, keeping whatever @p arena held before. */
+names_t scan_names(ustore_database_t database, ustore_snapshot_t snapshot, linked_memory_lock_t& arena,
+                   ustore_error_t* error) noexcept {
+    names_t names;
+    ustore_collection_t const collection = names_collection_k;
+    char const* const prefix = "";
+    ustore_length_t const prefix_length = 0;
+    ustore_length_t const limit = std::numeric_limits<ustore_length_t>::max();
+    ustore_length_t* counts = nullptr;
+    ustore_strings_scan_t scan {};
+    scan.db = database;
+    scan.error = error;
+    scan.snapshot = snapshot;
+    scan.arena = arena;
+    scan.options = ustore_option_dont_discard_memory_k;
+    scan.tasks_count = 1;
+    scan.collections = &collection;
+    scan.prefixes = &prefix;
+    scan.prefixes_lengths = &prefix_length;
+    scan.count_limits = &limit;
+    scan.counts = &counts;
+    scan.strings_offsets = &names.offsets;
+    scan.strings = &names.tape;
+    ustore_strings_scan(&scan);
+    if (error->status) return names;
+    names.count = counts[0];
+    if (names.count == 0) return names;
+
+    // The records sit beside the names, so one batched lookup of the names just listed answers them
+    std::span<ustore_str_view_t> const listed = arena.alloc<ustore_str_view_t>(names.count, error);
+    std::span<ustore_length_t> const lengths = arena.alloc<ustore_length_t>(names.count, error);
+    if (error->status) return names;
+    for (std::size_t index = 0; index != names.count; ++index) {
+        std::string_view const name = names[index];
+        listed[index] = name.data();
+        lengths[index] = static_cast<ustore_length_t>(name.size());
+    }
+    ustore_collection_find_t find {};
+    find.db = database;
+    find.error = error;
+    find.snapshot = snapshot;
+    find.arena = arena;
+    find.options = ustore_option_dont_discard_memory_k;
+    find.tasks_count = names.count;
+    find.names = listed.data();
+    find.names_stride = sizeof(ustore_str_view_t);
+    find.names_lengths = lengths.data();
+    find.names_lengths_stride = sizeof(ustore_length_t);
+    find.ids = &names.ids;
+    find.modalities = &names.modalities;
+    collection_find(find);
+    return names;
 }
+
+/** A name's position in a @c names_t, beside the collection it addresses, so names sort by collection. */
+struct named_position_t {
+    ustore_collection_t id = ustore_collection_main_k;
+    std::size_t position = 0;
+
+    friend constexpr std::strong_ordering operator<=>(named_position_t const&,
+                                                      named_position_t const&) noexcept = default;
+};
 
 #pragma endregion Named Collections
 
-} // namespace unum::ustore
+} // namespace
 
-using namespace unum::ustore;
+#pragma region Strings and Names
 
-void ustore_strings_write(ustore_strings_write_t* request) {
-    if (!request->tasks_count) return;
-    if (!request->strings) {
-        *request->error = {ustore_error_invalid_argument_k, "No strings were provided"};
+void strings_write(ustore_strings_write_t& request) noexcept {
+    if (!request.tasks_count) return;
+    if (!request.strings) {
+        *request.error = {ustore_error_invalid_argument_k, "No strings were provided"};
         return;
     }
 
-    linked_memory_lock_t arena = linked_memory(request->arena, request->options, request->error);
-    if (request->error->status) return;
+    linked_memory_lock_t arena = linked_memory(request.arena, request.options, request.error);
+    if (request.error->status) return;
 
-    std::size_t const tasks_count = request->tasks_count;
-    strided_iterator<ustore_collection_t const> const collections {request->collections, request->collections_stride};
+    std::size_t const tasks_count = request.tasks_count;
+    strided_iterator<ustore_collection_t const> const collections {request.collections, request.collections_stride};
     strings_arg_t const texts {
-        {request->strings, request->strings_stride},
-        {request->strings_lengths, request->strings_lengths_stride},
+        {request.strings, request.strings_stride},
+        {request.strings_lengths, request.strings_lengths_stride},
     };
     contents_arg_t const values {
-        {request->values_presences},
-        {request->values_offsets, request->values_offsets_stride},
-        {request->values_lengths, request->values_lengths_stride},
-        {request->values, request->values_stride},
+        {request.values_presences},
+        {request.values_offsets, request.values_offsets_stride},
+        {request.values_lengths, request.values_lengths_stride},
+        {request.values, request.values_stride},
         static_cast<ustore_size_t>(tasks_count),
     };
 
     // Tasks sorted by bucket and by string, so the tasks of one bucket merge in one pass
-    std::span<write_task_t> const tasks = arena.alloc<write_task_t>(tasks_count, request->error);
-    if (request->error->status) return;
+    std::span<write_task_t> const tasks = arena.alloc<write_task_t>(tasks_count, request.error);
+    if (request.error->status) return;
     for (std::size_t index = 0; index != tasks_count; ++index) {
         std::string_view const text = texts[index];
         tasks[index].collection = collections ? collections[static_cast<std::ptrdiff_t>(index)]
@@ -548,11 +590,11 @@ void ustore_strings_write(ustore_strings_write_t* request) {
         tasks[index].value = values[index];
         tasks[index].task_index = static_cast<ustore_length_t>(index);
     }
-    std::ranges::sort(tasks);
+    std::sort(tasks.begin(), tasks.end());
 
     // Every bucket the batch touches, one per run of tasks that share a collection and a key
-    std::span<touched_bucket_t> touched = arena.alloc<touched_bucket_t>(tasks_count, request->error);
-    if (request->error->status) return;
+    std::span<touched_bucket_t> touched = arena.alloc<touched_bucket_t>(tasks_count, request.error);
+    if (request.error->status) return;
     std::size_t touched_count = 0;
     for (std::size_t index = 0; index != tasks_count; ++index) {
         write_task_t const& task = tasks[index];
@@ -569,12 +611,12 @@ void ustore_strings_write(ustore_strings_write_t* request) {
     // A transaction watches every bucket it rewrites, whatever the caller asked of its reads, and a flush is for the
     // write that follows, which a read refuses
     ustore_options_t const read_options = ustore_options_t(
-        request->options & ~ustore_option_write_flush_k &
-        ~(request->transaction ? ustore_option_transaction_dont_watch_k : ustore_options_default_k));
+        request.options & ~ustore_option_write_flush_k &
+        ~(request.transaction ? ustore_option_transaction_dont_watch_k : ustore_options_default_k));
 
     joined_blobs_t stored;
-    pull_buckets(request->db, request->transaction, {}, touched, read_options, arena, request->error, stored);
-    if (request->error->status) return;
+    pull_buckets(request.db, request.transaction, {}, touched, read_options, arena, request.error, stored);
+    if (request.error->status) return;
 
     std::size_t task_begin = 0;
     for (std::size_t bucket_index = 0; bucket_index != touched_count; ++bucket_index) {
@@ -586,8 +628,8 @@ void ustore_strings_write(ustore_strings_write_t* request) {
 
         bucket_view_t const existing {stored[bucket_index]};
         std::size_t const room = existing.size() + (task_end - task_begin);
-        std::span<bucket_entry_t> const merged = arena.alloc<bucket_entry_t>(room, request->error);
-        if (request->error->status) return;
+        std::span<bucket_entry_t> const merged = arena.alloc<bucket_entry_t>(room, request.error);
+        if (request.error->status) return;
 
         // Two sorted runs meet, where a task replaces or removes the entry of the same string
         std::size_t merged_count = 0;
@@ -618,8 +660,8 @@ void ustore_strings_write(ustore_strings_write_t* request) {
             bucket.length = ustore_length_missing_k;
         }
         else {
-            std::span<byte_t> const written = arena.alloc<byte_t>(bucket_bytes(entries), request->error);
-            if (request->error->status) return;
+            std::span<byte_t> const written = arena.alloc<byte_t>(bucket_bytes(entries), request.error);
+            if (request.error->status) return;
             write_bucket(reinterpret_cast<ustore_byte_t*>(written.data()), entries);
             bucket.content = reinterpret_cast<ustore_bytes_cptr_t>(written.data());
             bucket.length = static_cast<ustore_length_t>(written.size());
@@ -627,28 +669,28 @@ void ustore_strings_write(ustore_strings_write_t* request) {
         task_begin = task_end;
     }
 
-    push_buckets(request->db, request->transaction, touched, request->options, arena, request->error);
+    push_buckets(request.db, request.transaction, touched, request.options, arena, request.error);
 }
 
-void ustore_strings_read(ustore_strings_read_t* request) {
-    if (!request->tasks_count) return;
-    if (!request->strings) {
-        *request->error = {ustore_error_invalid_argument_k, "No strings were provided"};
+void strings_read(ustore_strings_read_t& request) noexcept {
+    if (!request.tasks_count) return;
+    if (!request.strings) {
+        *request.error = {ustore_error_invalid_argument_k, "No strings were provided"};
         return;
     }
 
-    linked_memory_lock_t arena = linked_memory(request->arena, request->options, request->error);
-    if (request->error->status) return;
+    linked_memory_lock_t arena = linked_memory(request.arena, request.options, request.error);
+    if (request.error->status) return;
 
-    std::size_t const tasks_count = request->tasks_count;
-    strided_iterator<ustore_collection_t const> const collections {request->collections, request->collections_stride};
+    std::size_t const tasks_count = request.tasks_count;
+    strided_iterator<ustore_collection_t const> const collections {request.collections, request.collections_stride};
     strings_arg_t const texts {
-        {request->strings, request->strings_stride},
-        {request->strings_lengths, request->strings_lengths_stride},
+        {request.strings, request.strings_stride},
+        {request.strings_lengths, request.strings_lengths_stride},
     };
 
-    std::span<touched_bucket_t> touched = arena.alloc<touched_bucket_t>(tasks_count, request->error);
-    if (request->error->status) return;
+    std::span<touched_bucket_t> touched = arena.alloc<touched_bucket_t>(tasks_count, request.error);
+    if (request.error->status) return;
     for (std::size_t index = 0; index != tasks_count; ++index) {
         touched[index] = touched_bucket_t {};
         touched[index].collection = collections ? collections[static_cast<std::ptrdiff_t>(index)]
@@ -659,13 +701,13 @@ void ustore_strings_read(ustore_strings_read_t* request) {
     touched = touched.first(touched_count);
 
     joined_blobs_t stored;
-    pull_buckets(request->db, request->transaction, request->snapshot, touched, request->options, arena, request->error,
+    pull_buckets(request.db, request.transaction, request.snapshot, touched, request.options, arena, request.error,
                  stored);
-    if (request->error->status) return;
+    if (request.error->status) return;
 
     growing_tape_t exported {arena};
-    exported.reserve(tasks_count, request->error);
-    if (request->error->status) return;
+    exported.reserve(tasks_count, request.error);
+    if (request.error->status) return;
 
     for (std::size_t index = 0; index != tasks_count; ++index) {
         std::string_view const text = texts[index];
@@ -674,46 +716,46 @@ void ustore_strings_read(ustore_strings_read_t* request) {
         std::size_t const bucket_index = offset_in_sorted(touched, collection_key_t {collection, key_of(text)});
         bucket_view_t const bucket {stored[bucket_index]};
         std::size_t const position = bucket.find(text);
-        exported.push_back(position == bucket.size() ? value_view_t {} : bucket.value_of(position), request->error);
-        if (request->error->status) return;
+        exported.push_back(position == bucket.size() ? value_view_t {} : bucket.value_of(position), request.error);
+        if (request.error->status) return;
     }
 
-    if (request->presences) *request->presences = exported.presences().get();
-    if (request->offsets) *request->offsets = exported.offsets().begin().get();
-    if (request->lengths) *request->lengths = exported.lengths().begin().get();
-    if (request->values) *request->values = reinterpret_cast<ustore_byte_t*>(exported.contents().begin().get());
+    if (request.presences) *request.presences = exported.presences().get();
+    if (request.offsets) *request.offsets = exported.offsets().begin().get();
+    if (request.lengths) *request.lengths = exported.lengths().begin().get();
+    if (request.values) *request.values = reinterpret_cast<ustore_byte_t*>(exported.contents().begin().get());
 }
 
-void ustore_strings_scan(ustore_strings_scan_t* request) {
-    if (!request->tasks_count) return;
-    if (!request->prefixes) {
-        *request->error = {ustore_error_invalid_argument_k, "No prefixes were provided"};
+void strings_scan(ustore_strings_scan_t& request) noexcept {
+    if (!request.tasks_count) return;
+    if (!request.prefixes) {
+        *request.error = {ustore_error_invalid_argument_k, "No prefixes were provided"};
         return;
     }
-    if (!request->count_limits) {
-        *request->error = {ustore_error_unsupported_k, "Full scans are not supported, paginate with limits"};
+    if (!request.count_limits) {
+        *request.error = {ustore_error_unsupported_k, "Full scans are not supported, paginate with limits"};
         return;
     }
 
-    linked_memory_lock_t arena = linked_memory(request->arena, request->options, request->error);
-    if (request->error->status) return;
+    linked_memory_lock_t arena = linked_memory(request.arena, request.options, request.error);
+    if (request.error->status) return;
 
-    std::size_t const tasks_count = request->tasks_count;
-    strided_iterator<ustore_collection_t const> const collections {request->collections, request->collections_stride};
-    strided_iterator<ustore_length_t const> const count_limits {request->count_limits, request->count_limits_stride};
+    std::size_t const tasks_count = request.tasks_count;
+    strided_iterator<ustore_collection_t const> const collections {request.collections, request.collections_stride};
+    strided_iterator<ustore_length_t const> const count_limits {request.count_limits, request.count_limits_stride};
     strings_arg_t const prefixes {
-        {request->prefixes, request->prefixes_stride},
-        {request->prefixes_lengths, request->prefixes_lengths_stride},
+        {request.prefixes, request.prefixes_stride},
+        {request.prefixes_lengths, request.prefixes_lengths_stride},
     };
     strings_arg_t const start_strings {
-        {request->start_strings, request->start_strings_stride},
-        {request->start_strings_lengths, request->start_strings_lengths_stride},
+        {request.start_strings, request.start_strings_stride},
+        {request.start_strings_lengths, request.start_strings_lengths_stride},
     };
 
-    auto offsets = arena.alloc_or_dummy(tasks_count + 1, request->error, request->offsets);
-    if (request->error->status) return;
-    auto counts = arena.alloc_or_dummy(tasks_count, request->error, request->counts);
-    if (request->error->status) return;
+    auto offsets = arena.alloc_or_dummy(tasks_count + 1, request.error, request.offsets);
+    if (request.error->status) return;
+    auto counts = arena.alloc_or_dummy(tasks_count, request.error, request.counts);
+    if (request.error->status) return;
 
     growing_tape_t exported {arena};
     std::size_t exported_count = 0;
@@ -722,14 +764,14 @@ void ustore_strings_scan(ustore_strings_scan_t* request) {
         auto const signed_index = static_cast<std::ptrdiff_t>(index);
         ustore_collection_t collection = collections ? collections[signed_index] : ustore_collection_main_k;
         std::string_view const prefix = prefixes[index];
-        std::string_view const start = request->start_strings ? start_strings[index] : std::string_view {};
+        std::string_view const start = request.start_strings ? start_strings[index] : std::string_view {};
         std::size_t const limit = count_limits[signed_index];
         key_window_t const window = window_of(prefix);
 
         offsets[index] = static_cast<ustore_length_t>(exported_count);
         std::size_t found = 0;
         ustore_key_t next_key = window.first;
-        if (request->start_strings && !start.empty()) {
+        if (request.start_strings && !start.empty()) {
             ustore_key_t const resumed = key_of(start);
             if (resumed > next_key) next_key = resumed;
         }
@@ -740,12 +782,12 @@ void ustore_strings_scan(ustore_strings_scan_t* request) {
             ustore_length_t* scanned_counts = nullptr;
             ustore_key_t* scanned_keys = nullptr;
             ustore_scan_t scan {};
-            scan.db = request->db;
-            scan.error = request->error;
-            scan.transaction = request->transaction;
-            scan.snapshot = request->snapshot;
+            scan.db = request.db;
+            scan.error = request.error;
+            scan.transaction = request.transaction;
+            scan.snapshot = request.snapshot;
             scan.arena = arena;
-            scan.options = request->options;
+            scan.options = request.options;
             scan.tasks_count = 1;
             scan.collections = &collection;
             scan.start_keys = &next_key;
@@ -754,7 +796,7 @@ void ustore_strings_scan(ustore_strings_scan_t* request) {
             scan.keys = &scanned_keys;
 
             ustore_scan(&scan);
-            if (request->error->status) return;
+            if (request.error->status) return;
 
             std::size_t const scanned = scanned_counts[0];
             if (scanned == 0) break;
@@ -765,8 +807,8 @@ void ustore_strings_scan(ustore_strings_scan_t* request) {
             exhausted = wanted != scanned || scanned != wanted_keys;
             if (wanted == 0) break;
 
-            std::span<touched_bucket_t> const touched = arena.alloc<touched_bucket_t>(wanted, request->error);
-            if (request->error->status) return;
+            std::span<touched_bucket_t> const touched = arena.alloc<touched_bucket_t>(wanted, request.error);
+            if (request.error->status) return;
             for (std::size_t scanned_index = 0; scanned_index != wanted; ++scanned_index) {
                 touched[scanned_index] = touched_bucket_t {};
                 touched[scanned_index].collection = collection;
@@ -774,18 +816,18 @@ void ustore_strings_scan(ustore_strings_scan_t* request) {
             }
 
             joined_blobs_t stored;
-            pull_buckets(request->db, request->transaction, request->snapshot, touched, request->options, arena,
-                         request->error, stored);
-            if (request->error->status) return;
+            pull_buckets(request.db, request.transaction, request.snapshot, touched, request.options, arena,
+                         request.error, stored);
+            if (request.error->status) return;
 
             for (std::size_t scanned_index = 0; scanned_index != wanted && found != limit; ++scanned_index) {
                 bucket_view_t const bucket {stored[scanned_index]};
                 for (std::size_t entry = 0; entry != bucket.size() && found != limit; ++entry) {
                     std::string_view const text = bucket.text_of(entry);
                     if (!text.starts_with(prefix)) continue;
-                    if (request->start_strings && text < start) continue;
-                    exported.push_back(value_view_t {text}, request->error);
-                    if (request->error->status) return;
+                    if (request.start_strings && text < start) continue;
+                    exported.push_back(value_view_t {text}, request.error);
+                    if (request.error->status) return;
                     ++found;
                     ++exported_count;
                 }
@@ -801,143 +843,208 @@ void ustore_strings_scan(ustore_strings_scan_t* request) {
     }
 
     offsets[tasks_count] = static_cast<ustore_length_t>(exported_count);
-    if (request->strings_offsets) *request->strings_offsets = exported.offsets().begin().get();
-    if (request->strings) *request->strings = reinterpret_cast<ustore_char_t*>(exported.contents().begin().get());
+    if (request.strings_offsets) *request.strings_offsets = exported.offsets().begin().get();
+    if (request.strings) *request.strings = reinterpret_cast<ustore_char_t*>(exported.contents().begin().get());
 }
 
-void ustore_named_collections_find(ustore_named_collections_find_t* request) {
-    if (!request->tasks_count) return;
-    if (!request->names || !request->ids) {
-        *request->error = {ustore_error_invalid_argument_k, "Need the names and an output for the identifiers"};
+void collection_find(ustore_collection_find_t& request) noexcept {
+    if (!request.tasks_count) return;
+    if (!request.names || !request.ids) {
+        *request.error = {ustore_error_invalid_argument_k, "Need the names and an output for the identifiers"};
         return;
     }
 
-    linked_memory_lock_t arena = linked_memory(request->arena, request->options, request->error);
-    if (request->error->status) return;
+    linked_memory_lock_t arena = linked_memory(request.arena, request.options, request.error);
+    if (request.error->status) return;
 
-    ustore_collection_t const names = ustore_collection_names_k;
+    ustore_collection_t const names = names_collection_k;
     ustore_length_t* offsets = nullptr;
     ustore_length_t* lengths = nullptr;
     ustore_byte_t* values = nullptr;
     ustore_strings_read_t read {};
-    read.db = request->db;
-    read.error = request->error;
-    read.snapshot = request->snapshot;
+    read.db = request.db;
+    read.error = request.error;
+    read.snapshot = request.snapshot;
     read.arena = arena;
-    read.tasks_count = request->tasks_count;
+    read.tasks_count = request.tasks_count;
     read.collections = &names;
-    read.strings = request->names;
-    read.strings_stride = request->names_stride;
-    read.strings_lengths = request->names_lengths;
-    read.strings_lengths_stride = request->names_lengths_stride;
+    read.strings = request.names;
+    read.strings_stride = request.names_stride;
+    read.strings_lengths = request.names_lengths;
+    read.strings_lengths_stride = request.names_lengths_stride;
     read.offsets = &offsets;
     read.lengths = &lengths;
     read.values = &values;
     ustore_strings_read(&read);
-    if (request->error->status) return;
+    if (request.error->status) return;
 
-    std::size_t const count = request->tasks_count;
-    std::span<ustore_collection_t> const ids = arena.alloc<ustore_collection_t>(count, request->error);
-    auto modalities = arena.alloc_or_dummy(count, request->error, request->modalities);
-    auto presences = arena.alloc_or_dummy(count, request->error, request->presences);
-    if (request->error->status) return;
+    std::size_t const count = request.tasks_count;
+    std::span<ustore_collection_t> const ids = arena.alloc<ustore_collection_t>(count, request.error);
+    auto modalities = arena.alloc_or_dummy(count, request.error, request.modalities);
+    auto presences = arena.alloc_or_dummy(count, request.error, request.presences);
+    if (request.error->status) return;
     for (std::size_t index = 0; index != count; ++index) {
         bool const present = lengths[index] != ustore_length_missing_k;
-        if (present && lengths[index] != name_record_bytes_k) {
-            *request->error = {ustore_error_malformed_k, "A name holds no collection record"};
+        ustore_collection_t id = ustore_collection_main_k;
+        ustore_modality_t modality = ustore_modality_any_k;
+        std::string_view const record {reinterpret_cast<char const*>(values) + offsets[index],
+                                       present ? lengths[index] : 0};
+        if (present && !read_name_record(record, id, modality)) {
+            *request.error = {ustore_error_malformed_k, "A name holds no collection record"};
             return;
         }
-        ids[index] = ustore_collection_main_k;
-        modalities[index] = ustore_modality_any_k;
+        ids[index] = id;
+        modalities[index] = modality;
         presences[index] = present;
-        if (!present) continue;
-        std::memcpy(&ids[index], values + offsets[index], sizeof(ustore_collection_t));
-        modalities[index] = static_cast<ustore_modality_t>(values[offsets[index] + sizeof(ustore_collection_t)]);
     }
-    *request->ids = ids.data();
+    *request.ids = ids.data();
 }
 
-void ustore_named_collections_create(ustore_named_collections_create_t* request) {
-    std::string_view const name = name_of(request->name, request->name_length);
+void with_names(ustore_collection_create_t& request, void (*create)(ustore_collection_create_t&) noexcept) noexcept {
+    if (!request.name) return create(request);
+    std::string_view const name = string_of(request.name, request.name_length);
     if (name.empty()) {
-        *request->error = {ustore_error_invalid_argument_k, "The main collection has no name and always exists"};
+        *request.error = {ustore_error_invalid_argument_k, "A name is never empty, as the main collection has none"};
         return;
     }
-    if (!request->id) {
-        *request->error = {ustore_error_invalid_argument_k, "Need an output for the collection"};
+    if (!request.id) {
+        *request.error = {ustore_error_invalid_argument_k, "Need an output for the collection"};
         return;
     }
 
-    linked_memory_lock_t arena = linked_memory(request->arena, ustore_options_default_k, request->error);
-    if (request->error->status) return;
+    arena_t scratch {request.db};
+    linked_memory_lock_t arena = linked_memory(scratch.member_ptr(), ustore_options_default_k, request.error);
+    if (request.error->status) return;
 
     ustore_collection_t id = ustore_collection_main_k;
-    if (read_name_record(request->db, nullptr, name, arena, request->error, id)) {
-        *request->error = {ustore_error_already_exists_k, "A collection already carries the name"};
+    if (look_up_name(request.db, nullptr, name, arena, request.error, id)) {
+        *request.error = {ustore_error_already_exists_k, "A collection already carries the name"};
         return;
     }
-    if (request->error->status) return;
+    if (request.error->status) return;
 
-    ustore_collection_create_t create {};
-    create.db = request->db;
-    create.error = request->error;
-    create.modality = request->modality;
-    create.id = &id;
-    ustore_collection_create(&create);
-    if (request->error->status) return;
+    ustore_collection_create_t anonymous = request;
+    anonymous.name = nullptr;
+    anonymous.name_length = 0;
+    anonymous.id = &id;
+    create(anonymous);
+    if (request.error->status) return;
 
     ustore_capabilities_t capabilities {};
     ustore_database_capabilities_t query {};
-    query.db = request->db;
-    query.error = request->error;
+    query.db = request.db;
+    query.error = request.error;
     query.capabilities = &capabilities;
     ustore_database_capabilities(&query);
 
-    name_record_t const record {id, request->modality};
+    name_record_t const record {id, request.modality};
     bool recorded = false;
-    if (request->error->status == ustore_success_k && (capabilities & ustore_supports_transactions_k))
-        recorded = record_name(request->db, name, record, arena, request->error);
-    else if (request->error->status == ustore_success_k) {
-        write_name_record(request->db, nullptr, name, &record, ustore_option_write_flush_k, arena, request->error);
-        recorded = request->error->status == ustore_success_k;
+    if (request.error->status == ustore_success_k && (capabilities & ustore_supports_transactions_k))
+        recorded = record_name(request.db, name, record, arena, request.error);
+    else if (request.error->status == ustore_success_k) {
+        write_name_record(request.db, nullptr, name, &record, ustore_option_write_flush_k, arena, request.error);
+        recorded = request.error->status == ustore_success_k;
     }
     if (recorded) {
-        *request->id = id;
+        *request.id = id;
         return;
     }
 
     // The collection no name addresses would be unreachable, so it goes, while the error that stopped the name stays
     ustore_error_t dropped {};
     ustore_collection_drop_t drop {};
-    drop.db = request->db;
+    drop.db = request.db;
     drop.error = &dropped;
     drop.id = id;
     drop.mode = ustore_drop_keys_vals_handle_k;
     ustore_collection_drop(&drop);
 }
 
-void ustore_named_collections_drop(ustore_named_collections_drop_t* request) {
-    std::string_view const name = name_of(request->name, request->name_length);
-    if (name.empty()) {
-        *request->error = {ustore_error_invalid_argument_k, "The main collection has no name and is never dropped"};
-        return;
+void with_names(ustore_collection_drop_t& request, void (*drop)(ustore_collection_drop_t&) noexcept) noexcept {
+    if (request.mode != ustore_drop_keys_vals_handle_k || request.id == ustore_collection_main_k) return drop(request);
+
+    // The names go first and flushed, so a crash leaves a collection without a name, never a name without a collection
+    arena_t scratch {request.db};
+    linked_memory_lock_t arena = linked_memory(scratch.member_ptr(), ustore_options_default_k, request.error);
+    if (request.error->status) return;
+    names_t const names = scan_names(request.db, {}, arena, request.error);
+    if (request.error->status) return;
+
+    std::span<ustore_str_view_t> const unnamed = arena.alloc<ustore_str_view_t>(names.count, request.error);
+    std::span<ustore_length_t> const lengths = arena.alloc<ustore_length_t>(names.count, request.error);
+    if (request.error->status) return;
+    std::size_t unnamed_count = 0;
+    for (std::size_t index = 0; index != names.count; ++index) {
+        if (names.ids[index] != request.id) continue;
+        std::string_view const name = names[index];
+        unnamed[unnamed_count] = name.data();
+        lengths[unnamed_count] = static_cast<ustore_length_t>(name.size());
+        ++unnamed_count;
     }
-
-    linked_memory_lock_t arena = linked_memory(request->arena, ustore_options_default_k, request->error);
-    if (request->error->status) return;
-
-    ustore_collection_t id = ustore_collection_main_k;
-    if (!read_name_record(request->db, nullptr, name, arena, request->error, id)) {
-        if (!request->error->status) *request->error = {ustore_error_not_found_k, "No collection carries the name"};
-        return;
+    if (unnamed_count != 0) {
+        ustore_collection_t const collection = names_collection_k;
+        ustore_strings_write_t write {};
+        write.db = request.db;
+        write.error = request.error;
+        write.arena = arena;
+        write.options = ustore_option_write_flush_k;
+        write.tasks_count = unnamed_count;
+        write.collections = &collection;
+        write.strings = unnamed.data();
+        write.strings_stride = sizeof(ustore_str_view_t);
+        write.strings_lengths = lengths.data();
+        write.strings_lengths_stride = sizeof(ustore_length_t);
+        ustore_strings_write(&write);
+        if (request.error->status) return;
     }
-    write_name_record(request->db, nullptr, name, nullptr, ustore_option_write_flush_k, arena, request->error);
-    if (request->error->status) return;
-
-    ustore_collection_drop_t drop {};
-    drop.db = request->db;
-    drop.error = request->error;
-    drop.id = id;
-    drop.mode = ustore_drop_keys_vals_handle_k;
-    ustore_collection_drop(&drop);
+    drop(request);
 }
+
+void with_names(ustore_collection_list_t& request, void (*list)(ustore_collection_list_t&) noexcept) noexcept {
+    if (!request.count) {
+        *request.error = {ustore_error_invalid_argument_k, "Need an output for the count"};
+        return;
+    }
+    ustore_collection_t* ids = nullptr;
+    ustore_collection_list_t listing = request;
+    listing.ids = &ids;
+    listing.modalities = nullptr;
+    listing.names_offsets = nullptr;
+    listing.names = nullptr;
+    list(listing);
+    if (request.error->status) return;
+    if (request.ids) *request.ids = ids;
+    if (!request.modalities && !request.names_offsets && !request.names) return;
+
+    // The identifiers stay in the arena, as everything below is allocated beside them
+    ustore_options_t const kept = ustore_options_t(request.options | ustore_option_dont_discard_memory_k);
+    linked_memory_lock_t arena = linked_memory(request.arena, kept, request.error);
+    if (request.error->status) return;
+    names_t const names = scan_names(request.db, request.snapshot, arena, request.error);
+    if (request.error->status) return;
+
+    // Every name ordered by the collection it addresses, so each listed collection finds its own by bisection
+    std::span<named_position_t> const named = arena.alloc<named_position_t>(names.count, request.error);
+    if (request.error->status) return;
+    for (std::size_t index = 0; index != names.count; ++index) named[index] = {names.ids[index], index};
+    std::ranges::sort(named);
+
+    std::size_t const count = *request.count;
+    auto modalities = arena.alloc_or_dummy(count, request.error, request.modalities);
+    growing_tape_t exported {arena};
+    exported.reserve(count, request.error);
+    if (request.error->status) return;
+    for (std::size_t index = 0; index != count; ++index) {
+        auto const found = std::ranges::lower_bound(named, ids[index], {}, &named_position_t::id);
+        bool const present = found != named.end() && found->id == ids[index];
+        modalities[index] = present ? names.modalities[found->position] : ustore_modality_any_k;
+        exported.push_back(present ? value_view_t {names[found->position]} : value_view_t {}, request.error);
+        if (request.error->status) return;
+    }
+    if (request.names_offsets) *request.names_offsets = exported.offsets().begin().get();
+    if (request.names) *request.names = reinterpret_cast<ustore_char_t*>(exported.contents().begin().get());
+}
+
+#pragma endregion Strings and Names
+
+} // namespace unum::ustore::nvme

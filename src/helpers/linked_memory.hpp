@@ -138,8 +138,7 @@ struct linked_memory_t {
                                          static_cast<void*>(reinterpret_cast<char*>(current) + current->used);
             bool const can_fit = current->capacity - current->used >= additional_size;
             if (!is_continuation || !can_fit) continue;
-            [[maybe_unused]] void* const extension = current->alloc_internally(additional_size, alignment);
-            return true;
+            return current->alloc_internally(additional_size, alignment) != nullptr;
         }
         return false;
     }

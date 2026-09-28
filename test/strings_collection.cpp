@@ -4,9 +4,8 @@
  *  @date September 17, 2026
  *  @brief Unit tests of @c strings_collection_t, the C++ handle over the strings modality.
  *
- *  Every case runs against the main collection, which every engine holds, so the same suite covers the
- *  engines that refuse collections of their own. Walks run with a read-ahead smaller than the collection
- *  too, so the paging a stream does is exercised beside its single-page config.
+ *  Every case runs against a fresh collection of the strings modality. Walks run with a read-ahead smaller
+ *  than the collection too, so the paging a stream does is exercised beside its single-page config.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
@@ -16,6 +15,7 @@
 #include <array>       // `std::array`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
+#include <utility>     // `std::move`
 
 #include <fmt/format.h>
 
@@ -41,8 +41,11 @@ struct fixture_t {
     /** The open database. */
     database_t database;
 
-    /** A handle to the strings of the main collection. */
+    /** A handle to the strings collection every case works in. */
     strings_collection_t strings;
+
+    /** The name of that collection. */
+    static constexpr std::string_view name_k = "strings";
 
     fixture_t(fixture_t const&) = delete;
     fixture_t& operator=(fixture_t const&) = delete;
@@ -52,11 +55,20 @@ struct fixture_t {
             fmt::println(stderr, "  failed to open the database: {}", opened.message);
             return;
         }
-        strings = database.main<strings_collection_t>();
+        if (status_t const cleared = database.clear(); cleared.failed()) {
+            fmt::println(stderr, "  failed to clear the database: {}", cleared.message);
+            return;
+        }
+        auto maybe_strings = database.create<strings_collection_t>(name_k, ustore_modality_strings_k);
+        if (!maybe_strings) {
+            fmt::println(stderr, "  failed to create a strings collection: {}", maybe_strings.status().message);
+            return;
+        }
+        strings = std::move(*maybe_strings);
     }
 
-    /** Whether the database opened and its strings start empty. */
-    [[nodiscard]] bool ready() noexcept { return database && strings.clear().succeeded(); }
+    /** Whether the database opened with its strings collection. */
+    [[nodiscard]] bool ready() const noexcept { return database && strings != ustore_collection_main_k; }
 };
 
 /** Counts one failure when the value of @p text is not @p wanted. */
@@ -300,8 +312,9 @@ std::size_t strings_collection_in_transaction(test_config_t const& config) {
     auto maybe_transaction = fixture.database.transact();
     if (!maybe_transaction) return failures + expect(maybe_transaction.has_value());
 
-    strings_collection_t inside = maybe_transaction->main<strings_collection_t>();
-    failures += expect(inside.assign("pending", "value").succeeded());
+    auto maybe_inside = maybe_transaction->find<strings_collection_t>(fixture_t::name_k);
+    if (!maybe_inside) return failures + expect(maybe_inside.has_value());
+    failures += expect(maybe_inside->assign("pending", "value").succeeded());
     failures += expect_missing(fixture.strings, "pending");
     failures += expect(maybe_transaction->commit().succeeded());
     failures += expect_value(fixture.strings, "pending", "value");

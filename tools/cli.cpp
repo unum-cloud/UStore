@@ -21,11 +21,7 @@
 #include <fmt/color.h>  // `fmt::color`, `fmt::fg`, `fmt::text_style`
 #include <fmt/format.h> // `fmt::println`, `fmt::format_to_n`
 
-#include <stringzilla/stringzilla.hpp> // `sz::string_t`
-
-#include <ustore/db.h>      // `ustore_database_init_t`, `ustore_error_t`
-#include <ustore/strings.h> // `ustore_strings_read`, `ustore_strings_scan`
-#include <ustore/types.hpp> // `sz`
+#include <ustore/db.h> // `ustore_database_init_t`, `ustore_error_t`
 
 #include "arguments.hpp" // `parse_arguments`, `argument_status_t`
 #include "dataset.h"     // `ustore_docs_import`, `ustore_docs_export`
@@ -74,8 +70,8 @@ constexpr std::string_view commands_k = R"(Commands:
 
 Files end in .ndjson or .csv, and a command without --collection acts on the main collection.)";
 
-/** Names one listing reads per round, which paginates a walk of however many collections exist. */
-constexpr ustore_length_t listing_page_k = 1024;
+/** The spelling of every modality in the order of @c ustore_modality_t, as a listing prints it. */
+constexpr std::array<std::string_view, 6> modality_names_k {"any", "blobs", "docs", "graph", "strings", "pages"};
 
 #pragma region Parsing
 
@@ -208,7 +204,7 @@ void find_collection(ustore_database_t db, std::string_view name, ustore_collect
     auto const text_length = static_cast<ustore_length_t>(name.size());
     ustore_octet_t* presences = nullptr;
     ustore_collection_t* ids = nullptr;
-    ustore_named_collections_find_t find {};
+    ustore_collection_find_t find {};
     find.db = db;
     find.error = error;
     find.arena = &arena;
@@ -217,7 +213,7 @@ void find_collection(ustore_database_t db, std::string_view name, ustore_collect
     find.names_lengths = &text_length;
     find.presences = &presences;
     find.ids = &ids;
-    ustore_named_collections_find(&find);
+    ustore_collection_find(&find);
     if (!error->status) {
         if (!(presences[0] & 1)) *error = {ustore_error_not_found_k, "No such collection"};
         else id = ids[0];
@@ -225,20 +221,17 @@ void find_collection(ustore_database_t db, std::string_view name, ustore_collect
     ustore_arena_free(arena);
 }
 
-/** Creates a collection and records @p name for it. */
+/** Creates a collection under @p name. */
 [[nodiscard]] bool create_collection(ustore_database_t db, std::string_view name) noexcept {
     ustore_error_t error {};
-    ustore_arena_t arena = nullptr;
     ustore_collection_t id = 0;
-    ustore_named_collections_create_t create {};
+    ustore_collection_create_t create {};
     create.db = db;
     create.error = &error;
-    create.arena = &arena;
     create.name = name.data();
     create.name_length = static_cast<ustore_length_t>(name.size());
     create.id = &id;
-    ustore_named_collections_create(&create);
-    ustore_arena_free(arena);
+    ustore_collection_create(&create);
     if (error.status) {
         print_failure("Failed to create the collection", error);
         return false;
@@ -247,18 +240,16 @@ void find_collection(ustore_database_t db, std::string_view name, ustore_collect
     return true;
 }
 
-/** Drops the collection @p name addresses and forgets the name. */
+/** Drops the collection @p name addresses, which takes the name with it. */
 [[nodiscard]] bool drop_collection(ustore_database_t db, std::string_view name) noexcept {
     ustore_error_t error {};
-    ustore_arena_t arena = nullptr;
-    ustore_named_collections_drop_t drop {};
+    ustore_collection_drop_t drop {};
     drop.db = db;
     drop.error = &error;
-    drop.arena = &arena;
-    drop.name = name.data();
-    drop.name_length = static_cast<ustore_length_t>(name.size());
-    ustore_named_collections_drop(&drop);
-    ustore_arena_free(arena);
+    drop.mode = ustore_drop_keys_vals_handle_k;
+    if (name.empty()) error = {ustore_error_invalid_argument_k, "The main collection is never dropped"};
+    else find_collection(db, name, drop.id, &error);
+    if (!error.status) ustore_collection_drop(&drop);
     if (error.status) {
         print_failure("Failed to drop the collection", error);
         return false;
@@ -267,53 +258,30 @@ void find_collection(ustore_database_t db, std::string_view name, ustore_collect
     return true;
 }
 
-/** Prints every collection name, paging the strings modality the names live in. */
+/** Prints every collection with its identifier, its name and what it holds. */
 [[nodiscard]] bool list_collections(ustore_database_t db) noexcept {
     ustore_error_t error {};
     ustore_arena_t arena = nullptr;
-    ustore_collection_t const names = ustore_collection_names_k;
-    ustore_str_view_t const prefix = "";
-    ustore_length_t const prefix_length = 0;
-    ustore_length_t const page = listing_page_k;
-    sz::string_t resume;
-    while (true) {
-        ustore_str_view_t const start = resume.c_str();
-        auto const start_length = static_cast<ustore_length_t>(resume.size());
-        ustore_length_t* counts = nullptr;
-        ustore_length_t* offsets = nullptr;
-        ustore_char_t* strings = nullptr;
-        ustore_strings_scan_t scan {};
-        scan.db = db;
-        scan.error = &error;
-        scan.arena = &arena;
-        scan.tasks_count = 1;
-        scan.collections = &names;
-        scan.prefixes = &prefix;
-        scan.prefixes_lengths = &prefix_length;
-        scan.count_limits = &page;
-        scan.counts = &counts;
-        scan.strings_offsets = &offsets;
-        scan.strings = &strings;
-        if (!resume.empty()) {
-            scan.start_strings = &start;
-            scan.start_strings_lengths = &start_length;
-        }
-        ustore_strings_scan(&scan);
-        if (error.status) break;
-
-        std::size_t const found = counts[0];
-        for (std::size_t index = 0; index != found; ++index)
-            fmt::println(style_of(tone_t::listing_k), "{}",
-                         std::string_view {strings + offsets[index], offsets[index + 1] - offsets[index]});
-        if (found != page) break;
-
-        // A zero byte appended to the last name is the smallest name above it, so no name repeats
-        std::string_view const last {strings + offsets[found - 1], offsets[found] - offsets[found - 1]};
-        resume.clear();
-        if (!resume.try_append(last.data(), last.size()) || !resume.try_push_back('\0')) {
-            error = {ustore_error_out_of_memory_k, "Failed to page the listing"};
-            break;
-        }
+    ustore_size_t count = 0;
+    ustore_collection_t* ids = nullptr;
+    ustore_modality_t* modalities = nullptr;
+    ustore_length_t* names_offsets = nullptr;
+    ustore_char_t* names = nullptr;
+    ustore_collection_list_t list {};
+    list.db = db;
+    list.error = &error;
+    list.arena = &arena;
+    list.count = &count;
+    list.ids = &ids;
+    list.modalities = &modalities;
+    list.names_offsets = &names_offsets;
+    list.names = &names;
+    ustore_collection_list(&list);
+    for (std::size_t index = 0; !error.status && index != count; ++index) {
+        std::string_view const name {names + names_offsets[index], names_offsets[index + 1] - names_offsets[index]};
+        std::size_t const modality = static_cast<std::size_t>(modalities[index]);
+        fmt::println(style_of(tone_t::listing_k), "{}\t{}\t{}", ids[index], name,
+                     modality < modality_names_k.size() ? modality_names_k[modality] : "unknown");
     }
     ustore_arena_free(arena);
     if (error.status) {

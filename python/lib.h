@@ -710,7 +710,7 @@ typedef enum ustore_py_naming_t {
 } ustore_py_naming_t;
 
 /**
- *  @brief Reads the collection a name was given, through the strings modality that holds every name.
+ *  @brief Reads the collection a name was given, at the head or at the snapshot of @p context.
  *  @param[in] context The database and view to resolve against.
  *  @param[in] name The name's bytes, which need no null terminator.
  *  @param[in] length The name's length in bytes.
@@ -731,9 +731,9 @@ int ustore_py_collection_from_object(ustore_py_context_t const* context, PyObjec
                                      ustore_collection_t* collection);
 
 /**
- *  @brief Lists the names recorded in the reserved collection, up to @p limit of them.
- *  @param[in] context The database and view to walk.
- *  @param[in] after The name to resume from, or NULL to start at the first one.
+ *  @brief Lists the names of collections in the order of their text, up to @p limit of them.
+ *  @param[in] context The database and view to list.
+ *  @param[in] after The smallest name listed, or NULL to start at the first one.
  *  @param[in] after_length The length of @p after in bytes.
  *  @param[in] limit Most names the walk returns.
  *  @return A new tuple of names, or NULL with an exception set.

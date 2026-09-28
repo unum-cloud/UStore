@@ -637,7 +637,7 @@ mod tests {
     fn writes_land_in_the_collection_they_name() {
         let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
-        let named = database.create_collection(&mut arena, "people").unwrap();
+        let named = database.create_collection("people").unwrap();
         let entries = [Entry::new(1, b"in the named one").unwrap()];
         database
             .head()
@@ -702,8 +702,8 @@ mod tests {
     fn one_batch_spans_several_collections() {
         let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
-        let people = database.create_collection(&mut arena, "people").unwrap();
-        let places = database.create_collection(&mut arena, "places").unwrap();
+        let people = database.create_collection("people").unwrap();
+        let places = database.create_collection("places").unwrap();
 
         let entries = [Entry::new(1, b"Ada").unwrap(), Entry::new(1, b"Kent").unwrap()];
         let written = [people, places];
@@ -776,13 +776,12 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_collection_reads_as_empty_and_drops_as_missing() {
+    fn an_unknown_collection_is_refused() {
         let (database, mut arena) = populated();
-        // A read addresses a window of keys, so an identifier nobody created simply holds nothing.
-        let values = database.head().read(&mut arena, Collection(4242), &[1]).unwrap();
-        assert_eq!(values.get(0), None);
+        // Every call resolves its collections first, so an identifier nobody created reaches nothing.
+        let failure = database.head().read(&mut arena, Collection(4242), &[1]).unwrap_err();
+        assert_eq!(failure.status, Status::NotFound);
 
-        // Dropping one changes the catalog, which refuses an identifier it never handed out.
         let failure = database
             .clear_collection(Collection(4242), Removed::CollectionAndEntries)
             .unwrap_err();

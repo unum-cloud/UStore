@@ -237,7 +237,7 @@ class strings_collection_t {
     using prefix_range_t = range<strings_stream_t>;
 
     strings_collection_t() noexcept : arena_(nullptr) {}
-    strings_collection_t(ustore_database_t database, ustore_collection_t collection = ustore_collection_main_k,
+    strings_collection_t(ustore_database_t database, ustore_collection_t collection,
                          ustore_transaction_t transaction = nullptr, ustore_snapshot_t snapshot = {},
                          ustore_arena_t* arena = nullptr) noexcept
         : database_(database), collection_(collection), transaction_(transaction), snapshot_(snapshot),

@@ -183,13 +183,13 @@ endif ()
 # One library holds the C ABI and every engine the build enables, each opened through its own `ustore_database_init_*`;
 # every engine is its own object of the archive, so a program links only those it opens.
 set(USTORE_ENGINE_NAMES "ram")
-add_library(ustore STATIC ${USTORE_LIB_C_EXCLUSION} c/lib.cpp c/docs.cpp c/graph.cpp c/strings.cpp src/ram/engine.cpp)
+add_library(ustore STATIC ${USTORE_LIB_C_EXCLUSION} c/lib.cpp c/docs.cpp c/graph.cpp src/ram/engine.cpp)
 add_library(ustore::ustore ALIAS ustore)
 
 # The NVMe engine mounts its volumes on files, so it builds everywhere the siblings do; the io_uring transport beside it
 # compiles on every platform and only opens a ring on Linux.
 if (${USTORE_BUILD_NVME})
-    target_sources(ustore PRIVATE src/nvme/engine.cpp)
+    target_sources(ustore PRIVATE src/nvme/engine.cpp src/nvme/strings.cpp)
     target_compile_definitions(ustore PUBLIC USTORE_WITH_NVME=1)
     # Identifiers draw their entropy from `BCryptGenRandom` on Windows
     target_link_libraries(ustore PRIVATE $<$<PLATFORM_ID:Windows>:bcrypt>)

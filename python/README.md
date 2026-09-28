@@ -33,7 +33,7 @@ pip install . --config-settings=cmake.define.USTORE_WITH_ROCKSDB=ON
 | `blobs.c`              | Binary values                                                             |
 | `docs.c`               | JSON documents and typed column gathers                                   |
 | `graph.c`              | Graph edges and vertices                                                  |
-| `strings.c`            | Collection names, resolved through the strings modality                   |
+| `strings.c`            | Collection names, resolved onto identifiers and listed in text order      |
 | `CMakeLists.txt`       | The `ustore_python` target, installed into the `ustore` package           |
 | `ustore/__init__.py`   | The package, re-exporting `ustore.lib`                                    |
 | `ustore/lib.pyi`       | Type stubs for the extension                                              |

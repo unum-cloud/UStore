@@ -89,46 +89,32 @@ Every freeing function accepts `NULL`.
 ### Collections
 
 Every database has a main collection, `ustore_collection_main_k`, which a `NULL` collections array addresses.
-A collection is created without a name and addressed afterwards by the identifier the call answers:
+A collection is created with an optional name and the `ustore_modality_t` it holds, and addressed afterwards by the identifier the call answers:
 
 ```c
-ustore_collection_t people = 0;
+ustore_collection_t movies = 0;
 ustore_collection_create_t create = {
     .db = db,
     .error = &error,
-    .id = &people,
+    .name = "movies",
+    .modality = ustore_modality_docs_k,
+    .id = &movies,
 };
 ustore_collection_create(&create);
 
 ustore_collection_drop_t drop = {
     .db = db,
     .error = &error,
-    .id = people,
+    .id = movies,
     .mode = ustore_drop_keys_vals_handle_k,
 };
 ustore_collection_drop(&drop);
 ```
 
-The main collection is never removed, so only `ustore_drop_keys_vals_k` and `ustore_drop_vals_k` apply to it.
-`ustore_collection_list` exports the identifiers of the collections and nothing else.
-
-A name a caller gives a collection lives in the strings modality, under the reserved `ustore_collection_names_k`, beside the `ustore_modality_t` the collection holds, so a name resolves in two phases and no other call carries one.
-`ustore_named_collections_create` creates a collection and records its name in one step, refusing a name another collection carries even under a concurrent creator, and `ustore_named_collections_drop` forgets the name before it drops the collection:
-
-```c
-ustore_collection_t movies = 0;
-ustore_named_collections_create_t create = {
-    .db = db,
-    .error = &error,
-    .arena = &arena,
-    .name = "movies",
-    .modality = ustore_modality_docs_k,
-    .id = &movies,
-};
-ustore_named_collections_create(&create);
-```
-
-`ustore_named_collections_find` resolves a batch of names at the head or at a snapshot, answering each identifier, its modality and whether the name was found.
+Each engine records names apart from every collection, so no identifier reaches them, and a name resolves in two phases: once through `ustore_collection_find`, which answers the identifier and the modality of every name of a batch at the head or at a snapshot, and by identifier from then on, as no other call carries one.
+A create records the name in the same step as the collection, refusing a name another collection carries even under a concurrent creator.
+The main collection is never removed, so only `ustore_drop_keys_vals_k` and `ustore_drop_vals_k` apply to it, and dropping any other collection whole forgets its name before the collection goes.
+`ustore_collection_list` exports the identifier of every other collection and, where asked, its modality and its name, which is empty for a collection created without one.
 
 ### Writes
 

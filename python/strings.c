@@ -2,12 +2,15 @@
  *  @file python/strings.c
  *  @author Ash Vardanian
  *  @date September 16, 2026
- *  @brief Collection names, resolved onto identifiers through the strings modality.
+ *  @brief Collection names, resolved onto identifiers and listed in the order of their text.
  *
  *  Names resolve in two phases: a name maps onto a collection identifier once here, and every
- *  other verb addresses that collection by the identifier, so no other call carries a name. The
- *  mapping lives in the collection the ABI reserves for it, which no create ever hands out.
+ *  other verb addresses that collection by the identifier, so no other call carries a name. Each
+ *  engine keeps the names apart from every collection, so no identifier reaches them.
  */
+#include <stdlib.h> // `qsort`
+#include <string.h> // `memcmp`
+
 #include "lib.h"
 
 #pragma region Lookups
@@ -21,7 +24,7 @@ ustore_py_naming_t ustore_py_collection_named(ustore_py_context_t const* context
     ustore_arena_t arena = ustore_py_arena_claim(context->database);
 
     // Names resolve at the head or at the context's snapshot, so a transaction never watches the lookup.
-    ustore_named_collections_find_t find = {0};
+    ustore_collection_find_t find = {0};
     find.db = context->database->handle;
     find.error = &error;
     find.snapshot = context->snapshot;
@@ -33,17 +36,15 @@ ustore_py_naming_t ustore_py_collection_named(ustore_py_context_t const* context
     find.ids = &ids;
 
     Py_BEGIN_ALLOW_THREADS;
-    ustore_named_collections_find(&find);
+    ustore_collection_find(&find);
     Py_END_ALLOW_THREADS;
 
-    // An engine without collections of its own refuses the reserved collection outright, which is
-    // the same answer as an unknown name to everyone above this call.
     ustore_py_naming_t verdict = ustore_py_naming_missing_k;
-    if (error.status != ustore_success_k && error.status != ustore_error_unsupported_k) {
+    if (error.status != ustore_success_k) {
         ustore_py_raise_on_error(&error);
         verdict = ustore_py_naming_failed_k;
     }
-    else if (error.status == ustore_success_k && (presences[0] & 1)) {
+    else if (presences[0] & 1) {
         *collection = ids[0];
         verdict = ustore_py_naming_found_k;
     }
@@ -91,66 +92,87 @@ int ustore_py_collection_from_object(ustore_py_context_t const* context, PyObjec
 
 #pragma region Walks
 
+/** One recorded name, viewed inside the arena the listing exported it into. */
+typedef struct ustore_py_name_view_t {
+    char const* text;
+    size_t length;
+} ustore_py_name_view_t;
+
+/** Orders two names by their bytes, where of two names sharing a leading run the shorter goes first. */
+static int ustore_py_name_view_order(void const* first_pointer, void const* second_pointer) {
+    ustore_py_name_view_t const* const first = (ustore_py_name_view_t const*)first_pointer;
+    ustore_py_name_view_t const* const second = (ustore_py_name_view_t const*)second_pointer;
+    size_t const shared = first->length < second->length ? first->length : second->length;
+    int const ordered = shared ? memcmp(first->text, second->text, shared) : 0;
+    if (ordered != 0) return ordered;
+    return (first->length > second->length) - (first->length < second->length);
+}
+
 PyObject* ustore_py_collection_names(ustore_py_context_t const* context, char const* after, size_t after_length,
                                      size_t limit) {
-    ustore_collection_t const names = ustore_collection_names_k;
-    char const* const prefix = "";
-    ustore_length_t const prefix_length = 0;
-    ustore_length_t const resume_length = (ustore_length_t)after_length;
-    ustore_length_t const count_limit = (ustore_length_t)limit;
-    ustore_length_t* counts = NULL;
-    ustore_length_t* strings_offsets = NULL;
-    ustore_char_t* strings = NULL;
+    ustore_size_t count = 0;
+    ustore_length_t* names_offsets = NULL;
+    ustore_char_t* names = NULL;
     ustore_error_t error = {0};
     ustore_arena_t arena = ustore_py_arena_claim(context->database);
 
-    ustore_strings_scan_t scan = {0};
-    scan.db = context->database->handle;
-    scan.error = &error;
-    scan.transaction = context->transaction;
-    scan.snapshot = context->snapshot;
-    scan.arena = &arena;
-    scan.options = context->options;
-    scan.tasks_count = 1;
-    scan.collections = &names;
-    scan.prefixes = &prefix;
-    scan.prefixes_lengths = &prefix_length;
-    scan.start_strings = after ? &after : NULL;
-    scan.start_strings_lengths = after ? &resume_length : NULL;
-    scan.count_limits = &count_limit;
-    scan.counts = &counts;
-    scan.strings_offsets = &strings_offsets;
-    scan.strings = &strings;
+    // Names are listed at the head or at the context's snapshot, as they resolve
+    ustore_collection_list_t list = {0};
+    list.db = context->database->handle;
+    list.error = &error;
+    list.snapshot = context->snapshot;
+    list.arena = &arena;
+    list.options = context->options;
+    list.count = &count;
+    list.names_offsets = &names_offsets;
+    list.names = &names;
 
     Py_BEGIN_ALLOW_THREADS;
-    ustore_strings_scan(&scan);
+    ustore_collection_list(&list);
     Py_END_ALLOW_THREADS;
 
     if (error.status != ustore_success_k) {
         ustore_py_arena_return(context->database, arena);
-        // An engine without collections holds no names, which is an empty listing rather than a fault.
-        if (error.status == ustore_error_unsupported_k) return PyTuple_New(0);
         ustore_py_raise_on_error(&error);
         return NULL;
     }
 
+    // An engine lists in an order of its own, so the named collections are gathered and sorted here
+    ustore_py_name_view_t* const views = PyMem_New(ustore_py_name_view_t, count ? count : 1);
+    if (!views) {
+        ustore_py_arena_return(context->database, arena);
+        return PyErr_NoMemory();
+    }
+    size_t named = 0;
+    for (size_t collection_index = 0; collection_index != count; ++collection_index) {
+        ustore_length_t const begins = names_offsets[collection_index];
+        ustore_length_t const ends = names_offsets[collection_index + 1];
+        if (begins == ends) continue;
+        views[named].text = names + begins;
+        views[named].length = ends - begins;
+        ++named;
+    }
+    qsort(views, named, sizeof(ustore_py_name_view_t), &ustore_py_name_view_order);
+
+    ustore_py_name_view_t const start = {after ? after : "", after ? after_length : 0};
+    size_t first = 0;
+    while (first != named && ustore_py_name_view_order(&views[first], &start) < 0) ++first;
+    size_t const found = named - first < limit ? named - first : limit;
+
     // The names are copied out here rather than borrowed: every one is a `str`, which owns its own
     // bytes whatever the arena does, so the arena goes back to the database immediately.
-    size_t const found = counts[0];
-    PyObject* const listed = PyTuple_New((Py_ssize_t)found);
-    if (listed)
-        for (size_t name_index = 0; name_index != found; ++name_index) {
-            ustore_length_t const begins = strings_offsets[name_index];
-            ustore_length_t const ends = strings_offsets[name_index + 1];
-            PyObject* const name = PyUnicode_DecodeUTF8(strings + begins, (Py_ssize_t)(ends - begins), "strict");
-            if (!name) {
-                Py_DECREF(listed);
-                ustore_py_arena_return(context->database, arena);
-                return NULL;
-            }
-            PyTuple_SET_ITEM(listed, (Py_ssize_t)name_index, name);
+    PyObject* listed = PyTuple_New((Py_ssize_t)found);
+    for (size_t name_index = 0; listed && name_index != found; ++name_index) {
+        ustore_py_name_view_t const view = views[first + name_index];
+        PyObject* const name = PyUnicode_DecodeUTF8(view.text, (Py_ssize_t)view.length, "strict");
+        if (!name) {
+            Py_CLEAR(listed);
+            break;
         }
+        PyTuple_SET_ITEM(listed, (Py_ssize_t)name_index, name);
+    }
 
+    PyMem_Free(views);
     ustore_py_arena_return(context->database, arena);
     return listed;
 }

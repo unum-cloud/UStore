@@ -181,11 +181,33 @@ struct opened_transaction_t : handle_t {
     return handle_cast<opened_transaction_t>(handle);
 }
 
+#pragma region Strings and Names
+
+/** The collection @c nvme/strings.cpp keeps the names of collections in, above every identifier handed out. */
+extern ustore_collection_t const names_collection_k;
+
+// Laid over NVMe's keyed calls in `nvme/strings.cpp`, until NVMe keys strings and names itself
+void strings_write(ustore_strings_write_t& arguments) noexcept;
+void strings_read(ustore_strings_read_t& arguments) noexcept;
+void strings_scan(ustore_strings_scan_t& arguments) noexcept;
+void collection_find(ustore_collection_find_t& arguments) noexcept;
+void with_names(ustore_collection_create_t& arguments, void (*create)(ustore_collection_create_t&) noexcept) noexcept;
+void with_names(ustore_collection_drop_t& arguments, void (*drop)(ustore_collection_drop_t&) noexcept) noexcept;
+void with_names(ustore_collection_list_t& arguments, void (*list)(ustore_collection_list_t&) noexcept) noexcept;
+
+/** The table entry serving @p native_, NVMe's own call that knows no names, with the names of collections. */
+template <typename arguments_type_, void (*native_)(arguments_type_&) noexcept>
+void with_names(arguments_type_& arguments) noexcept {
+    with_names(arguments, native_);
+}
+
+#pragma endregion Strings and Names
+
 /** The number @p collection resolves to in @p database, reserved identifiers included. */
 [[nodiscard]] inline collection_numeric_id_t numbered(opened_database_t const& database,
                                                       ustore_collection_t collection) noexcept {
     if (collection == ustore_collection_main_k) return database.main;
-    if (collection == ustore_collection_names_k) return database.names;
+    if (collection == names_collection_k) return database.names;
     return static_cast<collection_numeric_id_t>(collection);
 }
 
@@ -304,7 +326,7 @@ status_t walk_from(collection_snapshot_type_ const& held, stored_key_t from, vis
             cursor.run_index = static_cast<std::uint32_t>(index);
             cursor.population = level.run(index).population_count();
             cursor.position = lower_bound_position(level.run(index), from);
-            [[maybe_unused]] st::status_t const placed = cursors.push_back(std::move(cursor));
+            [[maybe_unused]] st::status_t const placed = cursors.push_back(st::assume_reserved, std::move(cursor));
         }
     }
 
@@ -1384,9 +1406,13 @@ engine_t const engine_k {
     .scan = &scan,
     .sample = &sample,
     .measure = &measure,
-    .collection_create = &collection_create,
-    .collection_drop = &collection_drop,
-    .collection_list = &collection_list,
+    .collection_create = &with_names<ustore_collection_create_t, &collection_create>,
+    .collection_drop = &with_names<ustore_collection_drop_t, &collection_drop>,
+    .collection_list = &with_names<ustore_collection_list_t, &collection_list>,
+    .collection_find = &collection_find,
+    .strings_write = &strings_write,
+    .strings_read = &strings_read,
+    .strings_scan = &strings_scan,
     .transaction_init = &transaction_init,
     .transaction_stage = &transaction_stage,
     .transaction_commit = &transaction_commit,

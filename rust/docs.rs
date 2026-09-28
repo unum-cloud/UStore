@@ -10,7 +10,7 @@
 //!
 //! let database = Database::open_ram(&RAMOptions::default())?;
 //! let mut arena = Arena::new();
-//! let people = database.create_collection(&mut arena, "people")?;
+//! let people = database.create_collection("people")?;
 //!
 //! let documents = [DocumentEntry::<Json>::new(1, r#"{"name":"Ada","born":1815}"#)?];
 //! database.head().write_documents(&mut arena, people, &documents, Modification::Upsert, Durability::Buffered)?;
@@ -1692,8 +1692,8 @@ mod tests {
     fn one_batch_of_documents_spans_several_collections() {
         let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
-        let people = database.create_collection(&mut arena, "people").unwrap();
-        let places = database.create_collection(&mut arena, "places").unwrap();
+        let people = database.create_collection("people").unwrap();
+        let places = database.create_collection("places").unwrap();
         let spanned = [people, places];
 
         let documents = [

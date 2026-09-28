@@ -630,20 +630,17 @@ static PyObject* Database_collection_create(PyObject* self, PyObject* const* arg
 
     ustore_collection_t created = ustore_collection_main_k;
     ustore_error_t error = {0};
-    ustore_arena_t arena = ustore_py_arena_claim(context.database);
-    ustore_named_collections_create_t create = {0};
+    ustore_collection_create_t create = {0};
     create.db = context.database->handle;
     create.error = &error;
-    create.arena = &arena;
     create.name = name;
     create.name_length = (ustore_length_t)name_length;
     create.modality = (ustore_modality_t)modality;
     create.id = &created;
 
     Py_BEGIN_ALLOW_THREADS;
-    ustore_named_collections_create(&create);
+    ustore_collection_create(&create);
     Py_END_ALLOW_THREADS;
-    ustore_py_arena_return(context.database, arena);
     if (ustore_py_raise_on_error(&error) != 0) return NULL;
     return PyLong_FromUnsignedLongLong(created);
 }
@@ -695,13 +692,12 @@ static PyObject* Database_collection_contains(PyObject* self, PyObject* name_obj
     Py_RETURN_FALSE;
 }
 
-static char const doc_Database_collection_list[] =                                           //
-    "collection_list() answers the identifiers of every collection.\n"                       //
-    "\n"                                                                                     //
-    "The main collection is never listed, and a name lives in the strings modality rather\n" //
-    "than in the catalog of an engine, so this answers identifiers alone.\n"                 //
-    "\n"                                                                                     //
-    "Returns:\n"                                                                             //
+static char const doc_Database_collection_list[] =                                   //
+    "collection_list() answers the identifiers of every collection.\n"               //
+    "\n"                                                                             //
+    "The main collection is never listed, and collection_names answers the names.\n" //
+    "\n"                                                                             //
+    "Returns:\n"                                                                     //
     "  tuple[int, ...]: One identifier per collection.";
 
 static PyObject* Database_collection_list(PyObject* self, PyObject* Py_UNUSED(ignored)) {
@@ -799,18 +795,18 @@ static PyObject* Database_collection_names(PyObject* self, PyObject* const* args
     return ustore_py_collection_names(&context, after, (size_t)after_length, limit);
 }
 
-static char const doc_Database_collection_drop[] =                                           //
-    "collection_drop(collection, *, mode='collection') answers None.\n"                      //
-    "\n"                                                                                     //
-    "Removes a collection, or empties it. Dropping one addressed by name forgets the name\n" //
-    "with it, so the name can be given to another collection afterwards.\n"                  //
-    "\n"                                                                                     //
-    "Args:\n"                                                                                //
-    "  collection (int | str): The collection, by identifier or by name.\n"                  //
-    "  mode (str, optional): 'collection' removes the handle and everything in it,\n"        //
-    "    'pairs' removes every key and value, and 'values' removes every value. The main\n"  //
-    "    collection accepts the latter two alone.\n"                                         //
-    "Raises:\n"                                                                              //
+static char const doc_Database_collection_drop[] =                                          //
+    "collection_drop(collection, *, mode='collection') answers None.\n"                     //
+    "\n"                                                                                    //
+    "Removes a collection, or empties it. Removing it forgets its name with it, so the\n"   //
+    "name can be given to another collection afterwards.\n"                                 //
+    "\n"                                                                                    //
+    "Args:\n"                                                                               //
+    "  collection (int | str): The collection, by identifier or by name.\n"                 //
+    "  mode (str, optional): 'collection' removes the handle and everything in it,\n"       //
+    "    'pairs' removes every key and value, and 'values' removes every value. The main\n" //
+    "    collection accepts the latter two alone.\n"                                        //
+    "Raises:\n"                                                                             //
     "  MissingError: No collection carries the name.";
 
 static PyObject* Database_collection_drop(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
@@ -835,31 +831,10 @@ static PyObject* Database_collection_drop(PyObject* self, PyObject* const* args,
         }
     }
 
-    ustore_error_t error = {0};
-
-    // A named collection that goes takes its name with it, so no name is left addressing nothing.
-    Py_ssize_t length = 0;
-    char const* const name = PyUnicode_Check(args[0]) ? PyUnicode_AsUTF8AndSize(args[0], &length) : NULL;
-    if (PyUnicode_Check(args[0]) && !name) return NULL;
-    if (mode == ustore_drop_keys_vals_handle_k && length != 0) {
-        ustore_arena_t arena = ustore_py_arena_claim(context.database);
-        ustore_named_collections_drop_t drop = {0};
-        drop.db = context.database->handle;
-        drop.error = &error;
-        drop.arena = &arena;
-        drop.name = name;
-        drop.name_length = (ustore_length_t)length;
-
-        Py_BEGIN_ALLOW_THREADS;
-        ustore_named_collections_drop(&drop);
-        Py_END_ALLOW_THREADS;
-        ustore_py_arena_return(context.database, arena);
-        if (ustore_py_raise_on_error(&error) != 0) return NULL;
-        Py_RETURN_NONE;
-    }
-
+    // A name resolves first, and the collection it addresses takes the name with it when it goes
     ustore_collection_t collection = ustore_collection_main_k;
     if (ustore_py_collection_from_object(&context, args[0], &collection) != 0) return NULL;
+    ustore_error_t error = {0};
     ustore_collection_drop_t drop = {0};
     drop.db = context.database->handle;
     drop.error = &error;

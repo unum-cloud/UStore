@@ -376,8 +376,8 @@ case_result_t database_named_collections_race(test_config_t const& config) {
     database_t database;
     failures += expect(open_database(database, config).succeeded());
     if (failures != 0) return failures;
-    if (!database.supports_collections() || !database.supports_transactions())
-        return case_result_t::skipped("the engine records names without transactions", failures);
+    if (!database.supports_collections())
+        return case_result_t::skipped("the engine keeps no named collections", failures);
     failures += expect(database.clear().succeeded());
 
     constexpr std::size_t threads_count = 8;
@@ -405,7 +405,7 @@ case_result_t database_named_collections_race(test_config_t const& config) {
     return failures;
 }
 
-/** Lists the names of present collections. */
+/** Lists every collection with its name and modality beside its identifier, an unnamed one with an empty name. */
 case_result_t database_named_collections_list(test_config_t const& config) {
     std::size_t failures = 0;
     database_t database;
@@ -415,34 +415,113 @@ case_result_t database_named_collections_list(test_config_t const& config) {
         return case_result_t::skipped("the engine keeps no named collections", failures);
     failures += expect(database.clear().succeeded());
 
-    blobs_collection_t first_collection = *database.create("col1");
-    blobs_collection_t second_collection = *database.create("col2");
-    blobs_collection_t third_collection = *database.create("col3");
-    blobs_collection_t fourth_collection = *database.create("col4");
+    std::array<std::string_view, 3> const names {"col1", "col2", "col3"};
+    std::array<ustore_modality_t, 3> const modalities {ustore_modality_blobs_k, ustore_modality_docs_k,
+                                                       ustore_modality_graph_k};
+    for (std::size_t index = 0; index != names.size(); ++index)
+        failures += expect(database.create(names[index], modalities[index]));
+    ustore_error_t error {};
+    ustore_collection_t unnamed = ustore_collection_main_k;
+    ustore_collection_create_t create {};
+    create.db = database;
+    create.error = &error;
+    create.modality = ustore_modality_strings_k;
+    create.id = &unnamed;
+    ustore_collection_create(&create);
+    failures += expect_no_error(error);
 
-    failures += expect(*database.contains("col1"));
-    failures += expect(*database.contains("col2"));
+    arena_t arena {database};
+    ustore_size_t count = 0;
+    ustore_collection_t* ids = nullptr;
+    ustore_modality_t* listed_modalities = nullptr;
+    ustore_length_t* names_offsets = nullptr;
+    ustore_char_t* listed_names = nullptr;
+    ustore_collection_list_t list {};
+    list.db = database;
+    list.error = &error;
+    list.arena = arena.member_ptr();
+    list.count = &count;
+    list.ids = &ids;
+    list.modalities = &listed_modalities;
+    list.names_offsets = &names_offsets;
+    list.names = &listed_names;
+    ustore_collection_list(&list);
+    failures += expect_no_error(error);
+    failures += expect_eq(count, 4u);
+    if (count != 4) return failures;
 
-    auto maybe_transaction = database.transact();
-    failures += expect(maybe_transaction);
-    auto maybe_collections = maybe_transaction->collections();
-    failures += expect(maybe_collections);
-    failures += expect_eq(maybe_collections->size(), 4u);
-
-    // The catalog carries identifiers alone, so every name resolves through the strings modality
-    std::array<std::string_view, 4> const names {"col1", "col2", "col3", "col4"};
-    for (std::string_view const name : names) {
+    // Every listed name resolves back to the identifier beside it, and the unnamed collection lists an empty name
+    for (std::size_t index = 0; index != count; ++index) {
+        std::string_view const name {listed_names + names_offsets[index],
+                                     names_offsets[index + 1] - names_offsets[index]};
+        if (name.empty()) {
+            failures += expect(ids[index] == unnamed && listed_modalities[index] == ustore_modality_strings_k);
+            continue;
+        }
+        auto const named = std::ranges::find(names, name);
+        failures += expect(named != names.end());
+        if (named == names.end()) continue;
+        failures += expect(listed_modalities[index] == modalities[named - names.begin()]);
         auto maybe_found = database.find(name);
-        failures += expect(maybe_found);
-        if (!maybe_found) continue;
-        ustore_collection_t const found = *maybe_found;
-        failures += expect(std::ranges::find(*maybe_collections, found) != maybe_collections->end());
+        failures += expect(maybe_found && ustore_collection_t(*maybe_found) == ids[index]);
     }
 
     failures += expect(database.drop("col1").succeeded());
     failures += expect(!*database.contains("col1"));
     failures += expect(database.drop("").failed());
     failures += expect(database.main().clear().succeeded());
+    return failures;
+}
+
+/** Every call resolves its collections, refusing identifiers nobody created and collections keyed the other way. */
+case_result_t database_collections_resolve(test_config_t const& config) {
+    std::size_t failures = 0;
+    database_t database;
+    failures += expect(open_database(database, config).succeeded());
+    if (failures != 0) return failures;
+    if (!database.supports_collections()) return case_result_t::skipped("the engine keeps no collections", failures);
+    failures += expect(database.clear().succeeded());
+
+    // Nothing reaches an identifier the engine never handed out, whatever it may keep there itself
+    constexpr ustore_collection_t last_k = std::numeric_limits<ustore_collection_t>::max();
+    for (ustore_collection_t const unknown : {ustore_collection_t {4242}, last_k - 1, last_k}) {
+        blobs_collection_t keyed {database, unknown};
+        failures += expect(keyed[1].value() == status_code_t::not_found_k);
+        failures += expect(keyed[1].assign("intruder") == status_code_t::not_found_k);
+        failures += expect(keyed.clear() == status_code_t::not_found_k);
+        strings_collection_t stringed {database, unknown};
+        failures += expect(stringed.assign("intruder", "value") == status_code_t::not_found_k);
+    }
+
+    // A modality fixes how a collection is keyed, and calls keyed the other way are refused
+    auto maybe_words = database.create<strings_collection_t>("words", ustore_modality_strings_k);
+    auto maybe_numbers = database.create("numbers", ustore_modality_blobs_k);
+    failures += expect(maybe_words && maybe_numbers);
+    if (!maybe_words || !maybe_numbers) return failures;
+    ustore_collection_t const words = *maybe_words;
+    blobs_collection_t keyed_words {database, words};
+    failures += expect(keyed_words[1].assign("number") == status_code_t::invalid_argument_k);
+    strings_collection_t stringed_numbers {database, *maybe_numbers};
+    failures += expect(stringed_numbers.assign("word", "value") == status_code_t::invalid_argument_k);
+    strings_collection_t stringed_main {database, ustore_collection_main_k};
+    failures += expect(stringed_main.assign("word", "value") == status_code_t::invalid_argument_k);
+    failures += expect(maybe_words->assign("word", "value").succeeded());
+
+    // A name is never a collection, and dropping a collection by identifier takes its name too
+    context_t head {database, nullptr};
+    auto [listed, list_status] = head.collections();
+    failures += expect(list_status.succeeded());
+    failures += expect_eq(listed.size(), 2u);
+    ustore_error_t error {};
+    ustore_collection_drop_t drop {};
+    drop.db = database;
+    drop.error = &error;
+    drop.id = words;
+    drop.mode = ustore_drop_keys_vals_handle_k;
+    ustore_collection_drop(&drop);
+    failures += expect_no_error(error);
+    failures += expect(!*database.contains("words"));
+    failures += expect(database.drop("numbers").succeeded());
     return failures;
 }
 
@@ -1871,6 +1950,7 @@ int main(int argc, char** argv) {
     report(totals, "database.named_collections", database_named_collections, config);
     report(totals, "database.named_collections_race", database_named_collections_race, config);
     report(totals, "database.named_collections_list", database_named_collections_list, config);
+    report(totals, "database.collections_resolve", database_collections_resolve, config);
     report(totals, "database.clear_values", database_clear_values, config);
     report(totals, "database.presences", database_presences, config);
     report(totals, "database.scan", database_scan, config);
