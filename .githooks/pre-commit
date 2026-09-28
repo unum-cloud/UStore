@@ -837,6 +837,41 @@ check_in_house_never_throws() {
         "$file throws in an in-house engine - answer a status_t, since every call of the engine table is noexcept:"
 }
 
+# Every in-house function promises not to throw, as the engine table's calls do. Signatures are joined across lines, and
+# control statements, lambdas, types and the `ustore_*` C exports, which a C header declares, are skipped.
+check_in_house_noexcept() {
+    local missing
+    missing=$(git show ":$file" | awk -v lines=" $(printf '%s ' $added_lines)" '
+        function reset() { head = ""; first = 0; touched = 0 }
+        {
+            line = $0
+            sub(/[[:space:]]*\/\/.*$/, "", line)
+            if (line ~ /^[[:space:]]*(\/\*|\*|#|$)/ || line ~ /^[[:space:]]*((public|private|protected|default)[[:space:]]*:|case )/) {
+                reset()
+                next
+            }
+            if (!first) first = NR
+            if (index(lines, " " NR " ")) touched = 1
+            opened = line
+            if (opened ~ /\) ?(const )?\{.*\}[[:space:]]*;?[[:space:]]*$/) sub(/\{.*$/, "{", opened)
+            head = head " " opened
+            if (opened !~ /\{[[:space:]]*$/) {
+                if (line ~ /[;}][[:space:]]*$/) reset()
+                next
+            }
+            text = head
+            gsub(/[[:space:]]+/, " ", text)
+            sub(/^ /, "", text)
+            defines = text ~ /\)( const)?( ->[^{]*)? \{$/ || text ~ /\) : [^{]*\{$/
+            control = text ~ /^(if|else|for|while|switch|catch|do|return|\})/ || text ~ /(^| )(if|for|while|switch) \(/
+            skipped = text ~ /\[[^]]*\] ?\(|= ?\[|(^| )(struct|class|union|enum|namespace|extern|concept|requires) |(^| )ustore_[a-z_]+\(/
+            if (touched && defines && !control && !skipped && text !~ /noexcept/) print first ": " text
+            reset()
+        }' || true)
+    [ -z "$missing" ] || fail "$missing" \
+        "$file defines a function without noexcept in an in-house engine, which never throws:"
+}
+
 # The CPython bindings parse arguments and build results by hand: `PyArg_Parse*` and `Py_BuildValue` interpret a
 # format string at runtime, so a wrong specifier is a crash rather than a compile error.
 check_cpython_format_shortcuts() {
@@ -1139,6 +1174,7 @@ for file in "${staged[@]}"; do
     # The in-house engines, whose calls fill the noexcept engine table without a guard.
     src/ram/* | src/nvme/*)
         check_in_house_never_throws
+        check_in_house_noexcept
         ;;&
     # The CPython bindings, which build every argument and result by hand.
     python/*.c)

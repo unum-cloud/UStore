@@ -265,7 +265,8 @@ using resources_shared_ptr_t = std::shared_ptr<resources_t>;
 
 /** Constructs @p object_ in memory charged to the host budget, or returns an empty pointer once it runs out. */
 template <typename object_, typename... arguments_>
-std::shared_ptr<object_> make_constrained_shared(resources_shared_ptr_t const& resources, arguments_&&... arguments) {
+std::shared_ptr<object_> make_constrained_shared(resources_shared_ptr_t const& resources,
+                                                 arguments_&&... arguments) noexcept {
     constrained_allocator<byte_t> allocator {resources->memory_constraint};
     auto* const pointer = reinterpret_cast<object_*>(allocator.allocate(sizeof(object_)));
     if (!pointer) return {};
@@ -288,7 +289,8 @@ inline std::size_t background_jobs_limit(std::size_t data_directories_count) noe
  *  @param[in] database The database the volumes belong to, or an invalid identifier to take any.
  *  @return The resources, whose destructor tears the mount down in the order it was built in.
  */
-inline expected<resources_shared_ptr_t> open_resources(resources_config_t const& config, uuid_t const& database) {
+inline expected<resources_shared_ptr_t> open_resources(resources_config_t const& config,
+                                                       uuid_t const& database) noexcept {
     if (config.directory.empty()) return status_t {status_code_t::invalid_argument_k, "A database needs a directory"};
     if (status_t const made = create_directories(config.directory.c_str()); made.failed()) return made;
 

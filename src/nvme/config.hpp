@@ -154,7 +154,7 @@ struct user_single_collection_database_config_t {
 };
 
 /** Expands the limits of one collection into the configuration of its LSM tree. */
-inline collection_config_t create_collection_config(user_collection_config_t const& user_config) {
+inline collection_config_t create_collection_config(user_collection_config_t const& user_config) noexcept {
     collection_config_t config;
     config.concurrency_limit = user_config.concurrency_limit;
     config.cache_limit = user_config.cache_limit;
@@ -169,7 +169,7 @@ inline collection_config_t create_collection_config(user_collection_config_t con
 
 /** Expands the limits of one single-collection database into its configuration. */
 inline single_collection_database_config_t create_single_collection_database_config(
-    user_single_collection_database_config_t const& user_config) {
+    user_single_collection_database_config_t const& user_config) noexcept {
     return {create_collection_config(user_config.collection), user_config.default_transaction};
 }
 
@@ -387,7 +387,7 @@ template <std::unsigned_integral value_>
 }
 
 /** Reads a string. */
-[[nodiscard]] inline bool read_json(yyjson_val* value, string_t& text) {
+[[nodiscard]] inline bool read_json(yyjson_val* value, string_t& text) noexcept {
     if (!yyjson_is_str(value)) return false;
     text = yyjson_get_str(value);
     return true;
@@ -437,7 +437,7 @@ template <std::unsigned_integral value_>
 
 /** Reads an array, replacing the elements of @p elements. */
 template <typename element_, template <typename> typename allocator_>
-[[nodiscard]] bool read_json(yyjson_val* array, st::basic_vector<element_, allocator_<element_>>& elements) {
+[[nodiscard]] bool read_json(yyjson_val* array, st::basic_vector<element_, allocator_<element_>>& elements) noexcept {
     if (!yyjson_is_arr(array)) return false;
     elements.clear();
     if (elements.reserve(yyjson_arr_size(array)) != st::status_t::success_k) return false;
@@ -453,7 +453,7 @@ template <typename element_, template <typename> typename allocator_>
 
 /** Reads the member @p key of @p object into @p value, keeping @p value when the member is absent. */
 template <typename value_>
-[[nodiscard]] bool read_json_if_present(yyjson_val* object, char const* key, value_& value) {
+[[nodiscard]] bool read_json_if_present(yyjson_val* object, char const* key, value_& value) noexcept {
     yyjson_val* const member = yyjson_obj_get(object, key);
     return !member || read_json(member, value);
 }
@@ -472,7 +472,7 @@ template <std::unsigned_integral value_>
 }
 
 /** Reads a data directory, whose path is required and whose byte volume is optional. */
-[[nodiscard]] inline bool read_json(yyjson_val* object, data_directory_config_t& directory) {
+[[nodiscard]] inline bool read_json(yyjson_val* object, data_directory_config_t& directory) noexcept {
     return read_json(yyjson_obj_get(object, "path"), directory.path) && !directory.path.empty() &&
            read_json_bytes_if_present(object, "max_size", directory.max_size);
 }
@@ -487,7 +487,7 @@ inline status_t read_json_version(yyjson_val* root) noexcept {
 }
 
 /** Reads the collection keys of a flat configuration document. */
-[[nodiscard]] inline bool read_json_members(yyjson_val* root, user_collection_config_t& config) {
+[[nodiscard]] inline bool read_json_members(yyjson_val* root, user_collection_config_t& config) noexcept {
     return read_json_if_present(root, "concurrency_limit", config.concurrency_limit) &&
            read_json_bytes_if_present(root, "cache_limit", config.cache_limit) &&
            read_json_if_present(root, "write_buffer_max_elements", config.write_buffer_max_elements) &&
@@ -514,7 +514,7 @@ inline status_t read_json_version(yyjson_val* root) noexcept {
 }
 
 /** Reads resources from a parsed document, keeping the current value of every absent key. */
-inline status_t read_config(yyjson_val* root, resources_config_t& config) {
+inline status_t read_config(yyjson_val* root, resources_config_t& config) noexcept {
     if (status_t const status = read_json_version(root); status.failed()) return status;
     bool const read = read_json_bytes_if_present(root, "memory_limit", config.memory_limit) &&
                       read_json_if_present(root, "threads", config.threads) &&
@@ -530,14 +530,14 @@ inline status_t read_config(yyjson_val* root, resources_config_t& config) {
 }
 
 /** Reads collection limits from a parsed document, keeping the current value of every absent key. */
-inline status_t read_config(yyjson_val* root, user_collection_config_t& config) {
+inline status_t read_config(yyjson_val* root, user_collection_config_t& config) noexcept {
     if (status_t const status = read_json_version(root); status.failed()) return status;
     if (!read_json_members(root, config)) return status_t {status_code_t::invalid_argument_k, "Invalid config"};
     return status_t {};
 }
 
 /** Reads single-collection database limits from a parsed document, keeping the current value of every absent key. */
-inline status_t read_config(yyjson_val* root, user_single_collection_database_config_t& config) {
+inline status_t read_config(yyjson_val* root, user_single_collection_database_config_t& config) noexcept {
     if (status_t const status = read_json_version(root); status.failed()) return status;
     if (!read_json_members(root, config.collection) || !read_json_members(root, config.default_transaction))
         return status_t {status_code_t::invalid_argument_k, "Invalid config"};
@@ -561,7 +561,7 @@ concept json_config_concept = std::same_as<config_, resources_config_t> ||
 
 /** Parses @p text, which may carry comments, keeping the current value of every absent key. */
 template <json_config_concept config_>
-status_t parse_config(std::string_view text, config_& config) {
+status_t parse_config(std::string_view text, config_& config) noexcept {
     yyjson_doc* const document = yyjson_read_opts(const_cast<char*>(text.data()), text.size(),
                                                   YYJSON_READ_ALLOW_COMMENTS, nullptr, nullptr);
     if (!document) return status_t {status_code_t::invalid_argument_k, "Invalid config"};
@@ -572,7 +572,7 @@ status_t parse_config(std::string_view text, config_& config) {
 
 /** Reads the document at @p file_path, which may carry comments, keeping the current value of every absent key. */
 template <json_config_concept config_>
-status_t load_config(char const* file_path, config_& config) {
+status_t load_config(char const* file_path, config_& config) noexcept {
     yyjson_read_err error;
     yyjson_doc* const document = yyjson_read_file(file_path, YYJSON_READ_ALLOW_COMMENTS, nullptr, &error);
     if (!document && error.code == YYJSON_READ_ERROR_FILE_OPEN)
@@ -583,22 +583,22 @@ status_t load_config(char const* file_path, config_& config) {
     return status;
 }
 
-[[nodiscard]] inline bool read_json(yyjson_val* object, sorted_run_config_t& config) {
+[[nodiscard]] inline bool read_json(yyjson_val* object, sorted_run_config_t& config) noexcept {
     return read_json(yyjson_obj_get(object, "value_size"), config.value_size) &&
            read_json(yyjson_obj_get(object, "value_max_size"), config.value_max_size);
 }
 
-[[nodiscard]] inline bool read_json(yyjson_val* object, lsm_level_config_t& config) {
+[[nodiscard]] inline bool read_json(yyjson_val* object, lsm_level_config_t& config) noexcept {
     return read_json(yyjson_obj_get(object, "sorted_run"), config.sorted_run) &&
            read_json(yyjson_obj_get(object, "max_bytes"), config.max_bytes);
 }
 
-[[nodiscard]] inline bool read_json(yyjson_val* object, lsm_tree_config_t& config) {
+[[nodiscard]] inline bool read_json(yyjson_val* object, lsm_tree_config_t& config) noexcept {
     return read_json(yyjson_obj_get(object, "lsm_level_0"), config.lsm_level_0) &&
            read_json(yyjson_obj_get(object, "level_enlarge_factor"), config.level_enlarge_factor);
 }
 
-[[nodiscard]] inline bool read_json(yyjson_val* object, collection_config_t& config) {
+[[nodiscard]] inline bool read_json(yyjson_val* object, collection_config_t& config) noexcept {
     return read_json(yyjson_obj_get(object, "lsm_tree"), config.lsm_tree) &&
            read_json(yyjson_obj_get(object, "concurrency_limit"), config.concurrency_limit) &&
            read_json(yyjson_obj_get(object, "cache_limit"), config.cache_limit) &&
@@ -606,40 +606,41 @@ status_t load_config(char const* file_path, config_& config) {
            read_json(yyjson_obj_get(object, "write_buffer_max_elements"), config.write_buffer_max_elements);
 }
 
-[[nodiscard]] inline bool read_json(yyjson_val* object, sorted_run_schema_t& schema) {
+[[nodiscard]] inline bool read_json(yyjson_val* object, sorted_run_schema_t& schema) noexcept {
     return read_json(yyjson_obj_get(object, "file_name"), schema.file_name);
 }
 
-[[nodiscard]] inline bool read_json(yyjson_val* object, lsm_level_schema_t& schema) {
+[[nodiscard]] inline bool read_json(yyjson_val* object, lsm_level_schema_t& schema) noexcept {
     return read_json(yyjson_obj_get(object, "sorted_runs"), schema.sorted_runs);
 }
 
-[[nodiscard]] inline bool read_json(yyjson_val* object, lsm_tree_schema_t& schema) {
+[[nodiscard]] inline bool read_json(yyjson_val* object, lsm_tree_schema_t& schema) noexcept {
     return read_json(yyjson_obj_get(object, "lsm_levels"), schema.lsm_levels);
 }
 
-[[nodiscard]] inline bool read_json(yyjson_val* object, collection_schema_t& schema) {
+[[nodiscard]] inline bool read_json(yyjson_val* object, collection_schema_t& schema) noexcept {
     return read_json(yyjson_obj_get(object, "lsm_tree"), schema.lsm_tree);
 }
 
-[[nodiscard]] inline bool read_json(yyjson_val* object, collection_snapshot_schema_t& schema) {
+[[nodiscard]] inline bool read_json(yyjson_val* object, collection_snapshot_schema_t& schema) noexcept {
     return read_json(yyjson_obj_get(object, "lsm_tree"), schema.lsm_tree) &&
            read_json(yyjson_obj_get(object, "source_id"), schema.source_id);
 }
 
-[[nodiscard]] inline bool read_json(yyjson_val* object, single_collection_database_schema_t::snapshot_t& snapshot) {
+[[nodiscard]] inline bool read_json(yyjson_val* object,
+                                    single_collection_database_schema_t::snapshot_t& snapshot) noexcept {
     return read_json(yyjson_obj_get(object, "collection"), snapshot.collection) &&
            read_json(yyjson_obj_get(object, "id"), snapshot.id) &&
            read_json(yyjson_obj_get(object, "time_stamp"), snapshot.time_stamp);
 }
 
-[[nodiscard]] inline bool read_json(yyjson_val* object, single_collection_database_schema_t& schema) {
+[[nodiscard]] inline bool read_json(yyjson_val* object, single_collection_database_schema_t& schema) noexcept {
     return read_json(yyjson_obj_get(object, "id"), schema.id) &&
            read_json(yyjson_obj_get(object, "collection"), schema.collection) &&
            read_json(yyjson_obj_get(object, "snapshots"), schema.snapshots);
 }
 
-[[nodiscard]] inline bool read_json(yyjson_val* object, database_schema_t::collection_t& collection) {
+[[nodiscard]] inline bool read_json(yyjson_val* object, database_schema_t::collection_t& collection) noexcept {
     return read_json(yyjson_obj_get(object, "config"), collection.config) &&
            read_json(yyjson_obj_get(object, "schema"), collection.schema) &&
            read_json(yyjson_obj_get(object, "name"), collection.name) &&
@@ -647,7 +648,8 @@ status_t load_config(char const* file_path, config_& config) {
            read_json(yyjson_obj_get(object, "type"), collection.type);
 }
 
-[[nodiscard]] inline bool read_json(yyjson_val* object, database_schema_t::snapshot_t::collection_t& collection) {
+[[nodiscard]] inline bool read_json(yyjson_val* object,
+                                    database_schema_t::snapshot_t::collection_t& collection) noexcept {
     return read_json(yyjson_obj_get(object, "source_config"), collection.source_config) &&
            read_json(yyjson_obj_get(object, "source_name"), collection.source_name) &&
            read_json(yyjson_obj_get(object, "source_type"), collection.source_type) &&
@@ -655,13 +657,13 @@ status_t load_config(char const* file_path, config_& config) {
            read_json(yyjson_obj_get(object, "collection"), collection.collection);
 }
 
-[[nodiscard]] inline bool read_json(yyjson_val* object, database_schema_t::snapshot_t& snapshot) {
+[[nodiscard]] inline bool read_json(yyjson_val* object, database_schema_t::snapshot_t& snapshot) noexcept {
     return read_json(yyjson_obj_get(object, "id"), snapshot.id) &&
            read_json(yyjson_obj_get(object, "time_stamp"), snapshot.time_stamp) &&
            read_json(yyjson_obj_get(object, "collections"), snapshot.collections);
 }
 
-[[nodiscard]] inline bool read_json(yyjson_val* object, database_schema_t& schema) {
+[[nodiscard]] inline bool read_json(yyjson_val* object, database_schema_t& schema) noexcept {
     return read_json(yyjson_obj_get(object, "id"), schema.id) &&
            read_json(yyjson_obj_get(object, "collections"), schema.collections) &&
            read_json(yyjson_obj_get(object, "snapshots"), schema.snapshots);
@@ -694,7 +696,7 @@ inline status_t load_schema_header(char const* file_path, schema_header_t& heade
 
 /** Reads the schema document at @p file_path, rejecting one of another kind. */
 template <database_schema_concept schema_>
-status_t load_schema(char const* file_path, schema_& schema) {
+status_t load_schema(char const* file_path, schema_& schema) noexcept {
     yyjson_read_err error;
     yyjson_doc* const document = yyjson_read_file(file_path, YYJSON_READ_NOFLAG, nullptr, &error);
     if (!document && error.code == YYJSON_READ_ERROR_FILE_OPEN)
@@ -917,7 +919,8 @@ concept issue_sink_concept = std::invocable<sink_&, issue_kind_t, std::string_vi
 
 /** Formats an issue on the stack and hands it to @p sink, answering whether it was only a warning. */
 template <issue_sink_concept sink_, typename... arguments_>
-bool report_issue(sink_& sink, issue_kind_t kind, fmt::format_string<arguments_...> format, arguments_&&... arguments) {
+bool report_issue(sink_& sink, issue_kind_t kind, fmt::format_string<arguments_...> format,
+                  arguments_&&... arguments) noexcept {
     char message[256];
     auto const formatted = fmt::format_to_n(message, sizeof(message), format, std::forward<arguments_>(arguments)...);
     sink(kind, std::string_view(message, formatted.out - message));
@@ -926,7 +929,7 @@ bool report_issue(sink_& sink, issue_kind_t kind, fmt::format_string<arguments_.
 
 /** Checks resources on their own, answering whether no error was reported. */
 template <issue_sink_concept sink_>
-[[nodiscard]] bool validate(resources_config_t const& config, sink_&& sink) {
+[[nodiscard]] bool validate(resources_config_t const& config, sink_&& sink) noexcept {
     if (config.memory_limit == 0) return report_issue(sink, issue_kind_t::error_k, "Memory limit is not set");
     if (config.gpu_devices.empty() && config.gpu_memory_limit > 0)
         return report_issue(sink, issue_kind_t::error_k, "GPU memory limit is set but no GPU device is selected");
@@ -952,7 +955,7 @@ template <issue_sink_concept sink_>
 
 /** Checks resources, then an explicit thread count against @c executor_t::logical_cores_count. */
 template <issue_sink_concept sink_>
-[[nodiscard]] bool validate(resources_config_t const& config, std::size_t logical_cores_count, sink_&& sink) {
+[[nodiscard]] bool validate(resources_config_t const& config, std::size_t logical_cores_count, sink_&& sink) noexcept {
     if (!validate(config, sink)) return false;
     if (config.threads > logical_cores_count)
         return report_issue(sink, issue_kind_t::error_k, "{} threads exceed the {} logical cores", config.threads,
@@ -964,7 +967,7 @@ template <issue_sink_concept sink_>
 
 /** Checks the write buffer of one transaction against the storage limits. */
 template <issue_sink_concept sink_>
-[[nodiscard]] bool validate(transaction_config_t const& config, sink_&& sink) {
+[[nodiscard]] bool validate(transaction_config_t const& config, sink_&& sink) noexcept {
     if (config.write_buffer_max_elements < storage_limits_t::transaction_write_buffer_elements_min_count_k ||
         config.write_buffer_max_elements > storage_limits_t::transaction_write_buffer_elements_max_count_k)
         return report_issue(sink, issue_kind_t::error_k, "Transaction elements must be within [{}, {}]",
@@ -980,7 +983,8 @@ template <issue_sink_concept sink_>
 
 /** Checks the limits of one collection holding values of @p value_layout against the storage limits. */
 template <issue_sink_concept sink_>
-[[nodiscard]] bool validate(user_collection_config_t const& config, value_layout_t value_layout, sink_&& sink) {
+[[nodiscard]] bool validate(user_collection_config_t const& config, value_layout_t value_layout,
+                            sink_&& sink) noexcept {
     if ((config.value_size == 0) == (config.value_max_size == 0))
         return report_issue(sink, issue_kind_t::error_k, "Exactly one of value_size and value_max_size must be set");
 
@@ -1044,7 +1048,8 @@ template <issue_sink_concept sink_>
 
 /** Checks resources and the limits of a database within them. */
 template <issue_sink_concept sink_>
-[[nodiscard]] bool validate(resources_config_t const& resources, database_config_t const& config, sink_&& sink) {
+[[nodiscard]] bool validate(resources_config_t const& resources, database_config_t const& config,
+                            sink_&& sink) noexcept {
     if (!validate(resources, sink) || !validate(config.default_transaction, sink)) return false;
     if (resources.memory_limit < config.default_transaction.write_buffer_max_bytes)
         return report_issue(sink, issue_kind_t::error_k, "Memory limit cannot hold one transaction");
@@ -1054,7 +1059,7 @@ template <issue_sink_concept sink_>
 /** Checks resources and the limits of a single-collection database within them. */
 template <issue_sink_concept sink_>
 [[nodiscard]] bool validate(resources_config_t const& resources, user_single_collection_database_config_t const& config,
-                            sink_&& sink) {
+                            sink_&& sink) noexcept {
     if (!validate(resources, sink) || !validate(config.default_transaction, sink)) return false;
     if (config.default_transaction.write_buffer_max_elements > config.collection.write_buffer_max_elements ||
         config.default_transaction.write_buffer_max_bytes > config.collection.write_buffer_max_bytes)
@@ -1069,7 +1074,8 @@ template <issue_sink_concept sink_>
 
 /** Checks resources and the limits of a collection within them. */
 template <issue_sink_concept sink_>
-[[nodiscard]] bool validate(resources_config_t const& resources, user_collection_config_t const& config, sink_&& sink) {
+[[nodiscard]] bool validate(resources_config_t const& resources, user_collection_config_t const& config,
+                            sink_&& sink) noexcept {
     if (!validate(resources, sink) || !validate(config, resolve_value_layout(config.value_size), sink)) return false;
     if (resources.memory_limit < config.write_buffer_max_bytes)
         return report_issue(sink, issue_kind_t::error_k, "Memory limit cannot hold a write buffer");

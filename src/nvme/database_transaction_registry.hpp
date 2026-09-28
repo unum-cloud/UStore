@@ -142,13 +142,13 @@ class database_transaction_registry {
 
 #pragma region Store Accessor Methods
 
-    inline void lock_shared_() const { store_->lock_shared(); }
-    inline void unlock_shared_() const { store_->unlock_shared(); }
+    inline void lock_shared_() const noexcept { store_->lock_shared(); }
+    inline void unlock_shared_() const noexcept { store_->unlock_shared(); }
 
-    inline auto begin_(auto const& id) const { return store_->begin(id); }
-    inline auto end_(auto const& id) const { return store_->end(id); }
-    inline auto find_(auto const& id, stored_key_t stored_key) const { return store_->find(id, stored_key); }
-    inline auto find_or_next_(auto const& id, stored_key_t stored_key) const {
+    inline auto begin_(auto const& id) const noexcept { return store_->begin(id); }
+    inline auto end_(auto const& id) const noexcept { return store_->end(id); }
+    inline auto find_(auto const& id, stored_key_t stored_key) const noexcept { return store_->find(id, stored_key); }
+    inline auto find_or_next_(auto const& id, stored_key_t stored_key) const noexcept {
         return store_->find_or_next(id, stored_key);
     }
 
@@ -172,7 +172,7 @@ class database_transaction_registry {
         return store_->buffer_size_for_any_stored_value(id);
     }
     template <typename allocator_>
-    inline auto create_stored_value_locations_(auto const& id, std::size_t count) const {
+    inline auto create_stored_value_locations_(auto const& id, std::size_t count) const noexcept {
         return store_->template create_stored_value_locations<allocator_>(id, count);
     }
 
