@@ -22,12 +22,16 @@ type GatherType = Literal[
 ]
 type Modification = Literal["upsert", "update", "insert", "patch", "merge"]
 type Role = Literal["source", "target", "any"]
+type PathLikeOrStr = str | bytes | PathLike[str]
+type DataDirectory = PathLikeOrStr | tuple[PathLikeOrStr, int]
+type Isolation = Literal["strict-serializable", "snapshot"]
+type Transport = Literal["automatic", "blocking", "linux-uring", "linux-aio", "linux-spdk"]
 
 __version__: str
 default_edge_id: int
 
 def engines_compiled() -> tuple[str, ...]:
-    """The engines this build carries."""
+    """The engines this build carries: some of "ram", "rocksdb", "leveldb" and "nvme", in that order."""
 
 # region: Failures
 
@@ -113,13 +117,53 @@ class Edges:
 # region: Handles
 
 class Database:
-    """An embedded database, persistent when it names a directory and in memory otherwise."""
+    """An embedded database, opened through one class method per engine."""
 
     supports_transactions: bool
     supports_collections: bool
     supports_snapshots: bool
 
-    def __init__(self, directory: str | bytes | PathLike[str] | None = None, *, config: str | None = None) -> None: ...
+    @classmethod
+    def open_ram(cls, directory: PathLikeOrStr | None = None, *, isolation: Isolation = "strict-serializable") -> Self:
+        """An in-memory database, persisted as one image when it names a directory."""
+
+    @classmethod
+    def open_rocksdb(cls, directory: PathLikeOrStr, *, data_directories: Sequence[DataDirectory] = ()) -> Self:
+        """A database on RocksDB, whose table files may spread over data directories."""
+
+    @classmethod
+    def open_leveldb(cls, directory: PathLikeOrStr) -> Self:
+        """A database on LevelDB."""
+
+    @classmethod
+    def open_nvme(
+        cls,
+        directory: PathLikeOrStr,
+        *,
+        data_directories: Sequence[DataDirectory] = (),
+        transport: Transport = "automatic",
+        gpu_devices: Sequence[int] = (),
+        memory_limit: int = 0,
+        threads: int = 0,
+        gpu_memory_limit: int = 0,
+        shared_io_channels: int = 0,
+        queue_depth: int = 0,
+        request_buffer_bytes: int = 0,
+        request_buffers_count: int = 0,
+        stream_buffer_bytes: int = 0,
+        stream_buffers_count: int = 0,
+        transaction_max_bytes: int = 0,
+        transaction_max_elements: int = 0,
+        collection_concurrency_limit: int = 0,
+        collection_cache_limit: int = 0,
+        collection_write_buffer_max_bytes: int = 0,
+        collection_write_buffer_max_elements: int = 0,
+        collection_first_level_max_bytes: int = 0,
+        collection_level_enlarge_factor: int = 0,
+        collection_value_size: int = 0,
+        collection_value_max_size: int = 0,
+    ) -> Self:
+        """A database on the NVMe engine, where every zero size keeps the engine's default."""
     def __enter__(self) -> Self: ...
     def __exit__(
         self,

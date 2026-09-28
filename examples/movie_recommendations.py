@@ -205,7 +205,7 @@ def publish(store: Store) -> None:
 
 def main() -> None:
     """Fills the collections, recommends movies to David, draws them and then edits both graphs."""
-    with ustore.Database() as database:
+    with ustore.Database.open_ram() as database:
         store = open_store(database)
         fill(store)
 

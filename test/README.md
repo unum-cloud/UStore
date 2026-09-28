@@ -95,11 +95,11 @@ Without it, the engine runs on its default configuration, and the cases that nee
 Without `--cli`, the tools suite reports its CLI case `skipped`.
 Without `--device`, the engine suites skip the `device` transport, and `scripts/rigs/nvmet_loop.sh up` hands out a RAM-backed NVMe namespace to pass to it.
 A failing case prints the command that reruns it alone, with its `--seed` and a `--filter` anchored on its label, and a filter that matches no case fails the suite rather than passing an empty one.
-CTest passes `--directory` as `test_data` inside the build directory, and the tools suite additionally gets `--cli` with the CLI built for the same engine.
+CTest passes `--directory` as `test_data` inside the build directory, the engine suites get `--engine`, and the tools suite additionally gets `--cli` with the CLI it drives on that engine.
 
 ```sh
-build_debug/build/bin/ustore_test_units_rocksdb --directory /dev/shm/ustore
-build_debug/build/bin/ustore_test_tools_rocksdb --directory /dev/shm/ustore --cli build_debug/build/bin/ustore_cli_rocksdb
+build_debug/build/bin/ustore_test_units --engine rocksdb --directory /dev/shm/ustore
+build_debug/build/bin/ustore_test_tools --engine rocksdb --directory /dev/shm/ustore --cli build_debug/build/bin/ustore_cli
 ```
 
 ### Stress
@@ -141,5 +141,5 @@ Build them with the `release` preset and run them under a memory cap:
 cmake --preset release -DUSTORE_BUILD_TEST=1 -DUSTORE_WITH_ROCKSDB=1
 cmake --build --preset release
 systemd-run --user --scope -p MemoryMax=16G -p MemorySwapMax=0 -- \
-    build_release/build/bin/ustore_stress_atomicity_rocksdb --directory /dev/shm/ustore-stress --duration 1min
+    build_release/build/bin/ustore_stress_atomicity --engine rocksdb --directory /dev/shm/ustore-stress --duration 1min
 ```

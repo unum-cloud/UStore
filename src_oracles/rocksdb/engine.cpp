@@ -624,9 +624,9 @@ void database_init(ustore_database_init_rocksdb_t& arguments) {
     *arguments.db = static_cast<handle_t*>(database.release());
 }
 
-void get_metadata(ustore_get_metadata_t& arguments) {
-    *arguments.metadata = ustore_metadata_t(ustore_supports_transactions_k | ustore_supports_collections_k |
-                                            ustore_supports_snapshots_k);
+void database_capabilities(ustore_database_capabilities_t& arguments) {
+    *arguments.capabilities = ustore_capabilities_t(ustore_supports_transactions_k | ustore_supports_collections_k |
+                                                    ustore_supports_snapshots_k);
 }
 
 #pragma endregion Lifetime
@@ -1465,7 +1465,7 @@ void database_free(ustore_database_t database) noexcept { delete handle_cast<dat
 #pragma endregion Memory
 
 engine_t const engine_k {
-    .get_metadata = &guarded<ustore_get_metadata_t, &get_metadata>,
+    .database_capabilities = &guarded<ustore_database_capabilities_t, &database_capabilities>,
     .database_control = &guarded<ustore_database_control_t, &database_control>,
     .snapshot_list = &guarded<ustore_snapshot_list_t, &snapshot_list>,
     .snapshot_create = &guarded<ustore_snapshot_create_t, &snapshot_create>,

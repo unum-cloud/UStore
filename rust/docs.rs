@@ -5,10 +5,10 @@
 //! terminator, which is why every field is a `&CStr`: a `c"/user/name"` literal crosses as it stands.
 //!
 //! ```no_run
-//! use ustore::{Arena, Column, Configuration, Database, DocumentEntry, Durability, FieldAddress, FieldEntry};
+//! use ustore::{Arena, Column, RAMOptions, Database, DocumentEntry, Durability, FieldAddress, FieldEntry};
 //! use ustore::{Json, Modification, Text};
 //!
-//! let database = Database::open(Configuration::in_memory())?;
+//! let database = Database::open_ram(&RAMOptions::default())?;
 //! let mut arena = Arena::new();
 //! let people = database.create_collection(&mut arena, "people")?;
 //!
@@ -58,9 +58,9 @@
 //! does not compile while it lives:
 //!
 //! ```compile_fail
-//! use ustore::{Arena, Collection, Column, Configuration, Database, Text};
+//! use ustore::{Arena, Collection, Column, RAMOptions, Database, Text};
 //!
-//! let database = Database::open(Configuration::in_memory())?;
+//! let database = Database::open_ram(&RAMOptions::default())?;
 //! let mut arena = Arena::new();
 //! let columns = [Column::new::<Text>(c"name")];
 //! let table = database.head().gather(&mut arena, Collection::main(), &[1], &columns)?;
@@ -1114,11 +1114,11 @@ struct StridedTasks {
 mod tests {
     use super::*;
     use crate::blobs::Entry;
-    use crate::db::{Collection, Collections, Configuration, Conflicts, Database};
+    use crate::db::{Collection, Collections, Conflicts, Database, RAMOptions};
 
     /// A database holding Ada under key one and Grace under key two.
     fn populated() -> (Database, Arena) {
-        let database = Database::open(Configuration::in_memory()).unwrap();
+        let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
         let documents = [
             DocumentEntry::<Json>::new(1, r#"{"name":"Ada","born":1815,"languages":["English","French"]}"#).unwrap(),
@@ -1160,7 +1160,7 @@ mod tests {
 
     #[test]
     fn documents_refuse_text_that_is_not_json() {
-        let database = Database::open(Configuration::in_memory()).unwrap();
+        let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
         let documents = [DocumentEntry::<Json>::new(1, "{\"name\":").unwrap()];
         let failure = database
@@ -1276,7 +1276,7 @@ mod tests {
 
     #[test]
     fn documents_carry_their_keys_under_an_id_field() {
-        let database = Database::open(Configuration::in_memory()).unwrap();
+        let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
         let documents = [
             Document::new(r#"{"_id":7,"name":"Ada"}"#).unwrap(),
@@ -1474,7 +1474,7 @@ mod tests {
 
     #[test]
     fn fields_of_a_value_that_is_not_json_are_refused() {
-        let database = Database::open(Configuration::in_memory()).unwrap();
+        let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
         let blob = [Entry::new(1, b"not a document").unwrap()];
         database
@@ -1507,7 +1507,7 @@ mod tests {
 
     #[test]
     fn gists_refuse_a_path_past_the_length_they_export() {
-        let database = Database::open(Configuration::in_memory()).unwrap();
+        let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
         let document = format!("{{\"{}\":1}}", "k".repeat(600));
         let documents = [DocumentEntry::<Json>::new(1, &document).unwrap()];
@@ -1612,7 +1612,7 @@ mod tests {
 
     #[test]
     fn whole_documents_are_written_as_scalars_and_strings() {
-        let database = Database::open(Configuration::in_memory()).unwrap();
+        let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
         let head = database.head();
         let main = Collection::main();
@@ -1690,7 +1690,7 @@ mod tests {
 
     #[test]
     fn one_batch_of_documents_spans_several_collections() {
-        let database = Database::open(Configuration::in_memory()).unwrap();
+        let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
         let people = database.create_collection(&mut arena, "people").unwrap();
         let places = database.create_collection(&mut arena, "places").unwrap();
@@ -1735,7 +1735,7 @@ mod tests {
 
     #[test]
     fn gathers_fill_halves_and_uuids() {
-        let database = Database::open(Configuration::in_memory()).unwrap();
+        let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
         let documents = [
             DocumentEntry::<Json>::new(

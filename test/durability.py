@@ -9,27 +9,30 @@ import sys
 import textwrap
 from pathlib import Path
 
-from capabilities import NEEDS_COLLECTIONS, NEEDS_TRANSACTIONS, config
-
-import ustore
+from capabilities import NEEDS_COLLECTIONS, NEEDS_TRANSACTIONS, open_engine
 
 
-def crash_after(directory: Path, body: str) -> None:
-    """Runs `body` against a database opened in `directory`, then exits the process without closing it."""
-    opening = "import os, sys, ustore\ndatabase = ustore.Database(config=sys.argv[1])\n"
+def crash_after(engine: str, directory: Path, body: str) -> None:
+    """Runs `body` against `engine` opened in `directory`, then exits the process without closing it."""
+    opening = textwrap.dedent(f"""
+        import os, sys, ustore
+        database = ustore.Database.open_{engine}(sys.argv[1])
+    """)
     script = opening + textwrap.dedent(body) + "\nos._exit(0)\n"
-    subprocess.run([sys.executable, "-c", script, config(directory)], check=True)
+    # A child that never exits fails its case instead of stalling the suite.
+    subprocess.run([sys.executable, "-c", script, str(directory)], check=True, timeout=120)
 
 
-def test_a_flushed_write_survives_a_crash(tmp_path: Path):
-    crash_after(tmp_path, 'database.set(1, b"kept", flush=True)')
-    with ustore.Database(config=config(tmp_path)) as database:
+def test_a_flushed_write_survives_a_crash(engine: str, tmp_path: Path):
+    crash_after(engine, tmp_path, 'database.set(1, b"kept", flush=True)')
+    with open_engine(engine, tmp_path) as database:
         assert database.get(1) == b"kept"
 
 
 @NEEDS_TRANSACTIONS
-def test_a_flushed_commit_survives_a_crash(tmp_path: Path):
+def test_a_flushed_commit_survives_a_crash(engine: str, tmp_path: Path):
     crash_after(
+        engine,
         tmp_path,
         """
         transaction = database.transaction()
@@ -37,14 +40,15 @@ def test_a_flushed_commit_survives_a_crash(tmp_path: Path):
         transaction.commit(flush=True)
         """,
     )
-    with ustore.Database(config=config(tmp_path)) as database:
+    with open_engine(engine, tmp_path) as database:
         assert database.get(1) == b"kept"
 
 
 @NEEDS_TRANSACTIONS
 @NEEDS_COLLECTIONS
-def test_a_crash_keeps_whole_transactions(tmp_path: Path):
+def test_a_crash_keeps_whole_transactions(engine: str, tmp_path: Path):
     crash_after(
+        engine,
         tmp_path,
         """
         left = database.collection_create("left")
@@ -56,15 +60,16 @@ def test_a_crash_keeps_whole_transactions(tmp_path: Path):
                 transaction.set(key, b"x" * 4096, collection=right)
         """,
     )
-    with ustore.Database(config=config(tmp_path)) as database:
+    with open_engine(engine, tmp_path) as database:
         left = [length is not None for length in database.read(list(range(64)), collection="left").lengths]
         right = [length is not None for length in database.read(list(range(64)), collection="right").lengths]
         assert left == right
 
 
 @NEEDS_TRANSACTIONS
-def test_a_crash_drops_a_staged_transaction(tmp_path: Path):
+def test_a_crash_drops_a_staged_transaction(engine: str, tmp_path: Path):
     crash_after(
+        engine,
         tmp_path,
         """
         transaction = database.transaction()
@@ -73,7 +78,7 @@ def test_a_crash_drops_a_staged_transaction(tmp_path: Path):
         database.set(2, b"after", flush=True)
         """,
     )
-    with ustore.Database(config=config(tmp_path)) as database:
+    with open_engine(engine, tmp_path) as database:
         assert database.get(1) is None
         assert database.get(2) == b"after"
         with database.transaction() as transaction:

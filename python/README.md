@@ -44,7 +44,7 @@ pip install . --config-settings=cmake.define.USTORE_WITH_ROCKSDB=ON
 
 Each modality joins as one C file beside `lib.c`, with its verbs declared in `lib.h` and stubbed in `ustore/lib.pyi`.
 The suites live in `test/` as `<topic>.py` beside the C++ ones, and benchmarks in `bench/`.
-The extension links one engine, the in-memory `ram` one unless `USTORE_PYTHON_ENGINE` names another the tree builds.
+The extension carries every engine the build enables, each opened through its own class method: `Database.open_ram()`, `open_rocksdb()`, `open_leveldb()` or `open_nvme()`, and `engines_compiled()` names them.
 
 ## Interface
 
@@ -55,7 +55,7 @@ import numpy, ustore
 from ustore.graph_view import DiGraph
 from ustore.table_view import Table
 
-with ustore.Database() as database:
+with ustore.Database.open_ram() as database:
     database.write([1, 2], [b"a", b"bb"])
     values = database.read([1, 2])                      # Values, indexed as memoryviews
     database.scan_batch([1, 100], [16, 32])             # Keys, one ascending run per request

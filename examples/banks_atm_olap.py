@@ -256,7 +256,7 @@ def main() -> None:
     zip_codes = load_zip_codes()
     check_round_trip(zip_codes)
 
-    with ustore.Database() as database:
+    with ustore.Database.open_ram() as database:
         store_batches(database, zip_codes)
         recovered = load_measurements(database)
 

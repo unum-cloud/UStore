@@ -1,7 +1,7 @@
 """Collections over the C ABI: creating, naming, listing and dropping them."""
 
 import pytest
-from capabilities import ENGINE, NEEDS_COLLECTIONS
+from capabilities import NEEDS_COLLECTIONS
 
 import ustore
 
@@ -146,7 +146,7 @@ def test_engine_reports_its_capabilities(database):
     assert database.supports_collections
 
 
-def test_control_describes_the_build(database):
+def test_control_describes_the_build(database, engine: str):
     described = database.control("info")
     assert isinstance(described, str)
-    assert ENGINE in described or "engine" in described
+    assert engine in described or "engine" in described

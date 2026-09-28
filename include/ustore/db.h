@@ -196,7 +196,7 @@ typedef enum {
     /** The engine supports snapshots. */
     ustore_supports_snapshots_k = 4,
 
-} ustore_metadata_t;
+} ustore_capabilities_t;
 
 /** The collection every database holds, which @c ustore_drop_keys_vals_k and
  *  @c ustore_drop_vals_k may only clear. */
@@ -411,8 +411,8 @@ typedef struct ustore_database_init_nvme_t {
 /** Opens the NVMe engine, or reports @c ustore_error_unsupported_k in a library built without it. */
 void ustore_database_init_nvme(ustore_database_init_nvme_t* arguments);
 
-/** The arguments of @c ustore_get_metadata. */
-typedef struct ustore_get_metadata_t {
+/** The arguments of @c ustore_database_capabilities. */
+typedef struct ustore_database_capabilities_t {
 
     /** An open database. */
     ustore_database_t db;
@@ -421,15 +421,15 @@ typedef struct ustore_get_metadata_t {
     ustore_error_t* error;
 
     /** Output for the capabilities of the engine. */
-    ustore_metadata_t* metadata;
+    ustore_capabilities_t* capabilities;
 
-} ustore_get_metadata_t;
+} ustore_database_capabilities_t;
 
 /**
  *  @brief Reports the capabilities of the engine.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_get_metadata(ustore_get_metadata_t* arguments);
+void ustore_database_capabilities(ustore_database_capabilities_t* arguments);
 
 /**
  *  @brief The arguments of @c ustore_database_control, a free-form tunnel to the engine.

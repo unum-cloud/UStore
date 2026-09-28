@@ -133,7 +133,7 @@ def sample_collection(database: ustore.Database) -> None:
 def main() -> None:
     """Runs every phase against both stores and prints the timings side by side."""
     keys = generate_keys()
-    with ustore.Database() as database:
+    with ustore.Database.open_ram() as database:
         native_seconds, native_dict = timed(fill_native_dict, keys)
         single_seconds, _ = timed(fill_one_by_one, database, keys)
         batch_seconds, _ = timed(fill_in_batches, database, keys)

@@ -10,154 +10,433 @@
  */
 #include "lib.h"
 
-#pragma region Configuration
+#pragma region Opening
 
-/**
- *  @brief Builds the JSON configuration that points an engine at @p directory.
- *  @param[in] directory The path, as a string, bytes, or anything os.PathLike.
- *  @return A new @c bytes whose buffer is the configuration, or NULL with an exception set.
- */
-static PyObject* config_from_directory(PyObject* directory) {
-    PyObject* encoded = NULL;
-    if (!PyUnicode_FSConverter(directory, &encoded)) return NULL;
-    char const* const path = PyBytes_AS_STRING(encoded);
-    Py_ssize_t const length = PyBytes_GET_SIZE(encoded);
+/** The spellings @c isolation= accepts, closed by a nameless row. */
+static ustore_py_choice_naming_t const isolation_namings[] = {
+    {"strict-serializable", ustore_isolation_strict_serializable_k},
+    {"snapshot", ustore_isolation_snapshot_k},
+    {NULL, 0},
+};
 
-    static char const opening[] = "{\"version\": \"1.0\", \"directory\": \"";
-    static char const closing[] = "\"}";
-    // Two characters of a path would close the JSON string early, and each of them grows to two.
-    char* const text = (char*)PyMem_Malloc(sizeof(opening) + sizeof(closing) + (size_t)length * 2);
-    if (!text) {
-        Py_DECREF(encoded);
-        PyErr_NoMemory();
-        return NULL;
-    }
+/** The spellings @c transport= accepts, closed by a nameless row. */
+static ustore_py_choice_naming_t const transport_namings[] = {
+    {"automatic", ustore_transport_automatic_k},     {"blocking", ustore_transport_blocking_k},
+    {"linux-uring", ustore_transport_linux_uring_k}, {"linux-aio", ustore_transport_linux_aio_k},
+    {"linux-spdk", ustore_transport_linux_spdk_k},   {NULL, 0},
+};
 
-    char* cursor = text;
-    memcpy(cursor, opening, sizeof(opening) - 1);
-    cursor += sizeof(opening) - 1;
-    for (Py_ssize_t position = 0; position != length; ++position) {
-        char const character = path[position];
-        if (character == '"' || character == '\\') *cursor++ = '\\';
-        *cursor++ = character;
-    }
-    memcpy(cursor, closing, sizeof(closing));
-    Py_DECREF(encoded);
+/** A size keyword of @c Database.open_nvme and the field of the init call it fills. */
+typedef struct nvme_size_keyword_t {
 
-    PyObject* const built = PyBytes_FromString(text);
-    PyMem_Free(text);
-    return built;
+    /** The keyword, spelled as the field, or NULL closing the table. */
+    char const* name;
+
+    /** Where the field sits in @c ustore_database_init_nvme_t. */
+    size_t offset;
+} nvme_size_keyword_t;
+
+/** Every size keyword of @c Database.open_nvme, closed by a nameless row. */
+static nvme_size_keyword_t const nvme_size_keywords[] = {
+    {"memory_limit", offsetof(ustore_database_init_nvme_t, memory_limit)},
+    {"threads", offsetof(ustore_database_init_nvme_t, threads)},
+    {"gpu_memory_limit", offsetof(ustore_database_init_nvme_t, gpu_memory_limit)},
+    {"shared_io_channels", offsetof(ustore_database_init_nvme_t, shared_io_channels)},
+    {"queue_depth", offsetof(ustore_database_init_nvme_t, queue_depth)},
+    {"request_buffer_bytes", offsetof(ustore_database_init_nvme_t, request_buffer_bytes)},
+    {"request_buffers_count", offsetof(ustore_database_init_nvme_t, request_buffers_count)},
+    {"stream_buffer_bytes", offsetof(ustore_database_init_nvme_t, stream_buffer_bytes)},
+    {"stream_buffers_count", offsetof(ustore_database_init_nvme_t, stream_buffers_count)},
+    {"transaction_max_bytes", offsetof(ustore_database_init_nvme_t, transaction_max_bytes)},
+    {"transaction_max_elements", offsetof(ustore_database_init_nvme_t, transaction_max_elements)},
+    {"collection_concurrency_limit", offsetof(ustore_database_init_nvme_t, collection_concurrency_limit)},
+    {"collection_cache_limit", offsetof(ustore_database_init_nvme_t, collection_cache_limit)},
+    {"collection_write_buffer_max_bytes", offsetof(ustore_database_init_nvme_t, collection_write_buffer_max_bytes)},
+    {"collection_write_buffer_max_elements",
+     offsetof(ustore_database_init_nvme_t, collection_write_buffer_max_elements)},
+    {"collection_first_level_max_bytes", offsetof(ustore_database_init_nvme_t, collection_first_level_max_bytes)},
+    {"collection_level_enlarge_factor", offsetof(ustore_database_init_nvme_t, collection_level_enlarge_factor)},
+    {"collection_value_size", offsetof(ustore_database_init_nvme_t, collection_value_size)},
+    {"collection_value_max_size", offsetof(ustore_database_init_nvme_t, collection_value_max_size)},
+    {NULL, 0},
+};
+
+/** What an init call borrows from the arguments of a constructor, kept alive until the call returns. */
+typedef struct opening_t {
+
+    /** The encoded directory, or NULL for none. */
+    PyObject* directory;
+
+    /** The encoded paths @c data_directories point into, or NULL for none. */
+    PyObject* paths;
+
+    /** The data directories, or NULL for none. */
+    ustore_data_directory_t* data_directories;
+
+    /** Entries of @c data_directories. */
+    size_t data_directories_count;
+
+    /** The CUDA devices, or NULL for none. */
+    int* gpu_devices;
+
+    /** Entries of @c gpu_devices. */
+    size_t gpu_devices_count;
+} opening_t;
+
+/** Releases whatever @p opening holds. */
+static void opening_release(opening_t* opening) {
+    Py_XDECREF(opening->directory);
+    Py_XDECREF(opening->paths);
+    PyMem_Free(opening->data_directories);
+    PyMem_Free(opening->gpu_devices);
 }
 
-#pragma endregion Configuration
+/** Encodes @p object, a str, bytes or PathLike, as the directory, leaving None as no directory. */
+static int opening_directory(opening_t* opening, PyObject* object) {
+    if (opening->directory) {
+        PyErr_SetString(PyExc_TypeError, "The directory was given twice");
+        return -1;
+    }
+    if (object == Py_None) return 0;
+    return PyUnicode_FSConverter(object, &opening->directory) ? 0 : -1;
+}
 
-#pragma region Databases
-
-static char const doc_Database[] =                                                            //
-    "Database(directory=None, *, config=None)\n"                                              //
-    "\n"                                                                                      //
-    "An embedded database, persistent when it names a directory and in memory otherwise.\n"   //
-    "\n"                                                                                      //
-    "The directory belongs to the database, so no two processes may open the same one at\n"   //
-    "once. Every database holds a main collection, which can be cleared but never dropped,\n" //
-    "beside the collections it creates.\n"                                                    //
-    "\n"                                                                                      //
-    "Args:\n"                                                                                 //
-    "  directory (str | bytes | PathLike, optional): Where the database persists; None\n"     //
-    "    keeps it in memory. Turned into the engine's own JSON configuration.\n"              //
-    "  config (str, optional): The engine's JSON configuration, given whole. Names the\n"     //
-    "    directory itself, so it cannot be combined with the argument above.";
-
-static PyObject* Database_tp_new(PyTypeObject* type, PyObject* args, PyObject* keywords) {
-    PyObject* directory_object = Py_None;
-    PyObject* config_object = Py_None;
-
-    Py_ssize_t const positional_args_count = PyTuple_GET_SIZE(args);
+/**
+ *  @brief Reads the positional arguments of a constructor, which name the directory at most.
+ *  @param[in] verb The constructor's name, as a failure should read it.
+ *  @return The keyword count, or -1 with an exception set.
+ */
+static Py_ssize_t opening_positional(opening_t* opening, char const* verb, PyObject* const* args,
+                                     Py_ssize_t positional_args_count, PyObject* args_names_tuple) {
     if (positional_args_count > 1) {
-        PyErr_SetString(PyExc_TypeError, "Database() takes at most one positional argument");
-        return NULL;
+        PyErr_Format(PyExc_TypeError, "Database.%s() takes at most one positional argument", verb);
+        return -1;
     }
-    if (positional_args_count == 1) directory_object = PyTuple_GET_ITEM(args, 0);
-    if (keywords) {
-        PyObject* key = NULL;
-        PyObject* value = NULL;
-        Py_ssize_t position = 0;
-        while (PyDict_Next(keywords, &position, &key, &value)) {
-            if (PyUnicode_CompareWithASCIIString(key, "directory") == 0) {
-                if (positional_args_count == 1) {
-                    PyErr_SetString(PyExc_TypeError, "Database() got 'directory' twice");
-                    return NULL;
-                }
-                directory_object = value;
-            }
-            else if (PyUnicode_CompareWithASCIIString(key, "config") == 0) { config_object = value; }
-            else {
-                PyErr_Format(PyExc_TypeError, "Got unexpected keyword argument: %S", key);
-                return NULL;
-            }
-        }
-    }
-    if (directory_object != Py_None && config_object != Py_None) {
-        PyErr_SetString(PyExc_TypeError, "A configuration already names the directory, so only one of them is taken");
-        return NULL;
-    }
+    if (positional_args_count == 1 && opening_directory(opening, args[0]) != 0) return -1;
+    return args_names_tuple ? PyTuple_GET_SIZE(args_names_tuple) : 0;
+}
 
-    // The configuration outlives the call through this reference alone, since the ABI borrows it.
-    PyObject* configuration = NULL;
-    if (directory_object != Py_None) {
-        configuration = config_from_directory(directory_object);
-        if (!configuration) return NULL;
+/** Reads @p object, a sequence of paths or of @b (path,max_bytes) pairs, as the data directories. */
+static int opening_data_directories(opening_t* opening, PyObject* object) {
+    PyObject* const items = PySequence_Fast(object, "The 'data_directories' option must be a sequence");
+    if (!items) return -1;
+    Py_ssize_t const count = PySequence_Fast_GET_SIZE(items);
+    Py_XDECREF(opening->paths);
+    PyMem_Free(opening->data_directories);
+    opening->paths = PyList_New(count);
+    opening->data_directories = PyMem_Calloc((size_t)count + 1, sizeof(ustore_data_directory_t));
+    opening->data_directories_count = (size_t)count;
+    if (!opening->paths || !opening->data_directories) {
+        Py_DECREF(items);
+        if (!PyErr_Occurred()) PyErr_NoMemory();
+        return -1;
     }
-    else if (config_object != Py_None) {
-        if (!PyUnicode_Check(config_object)) {
-            PyErr_Format(PyExc_TypeError, "The 'config' option must be a string, got %S", Py_TYPE(config_object));
-            return NULL;
+    for (Py_ssize_t index = 0; index != count; ++index) {
+        PyObject* path = PySequence_Fast_GET_ITEM(items, index);
+        size_t max_bytes = 0;
+        if (PyTuple_Check(path)) {
+            if (PyTuple_GET_SIZE(path) != 2) {
+                Py_DECREF(items);
+                PyErr_SetString(PyExc_TypeError, "A data directory is a path or a (path, max_bytes) pair");
+                return -1;
+            }
+            if (ustore_py_size_from_object(PyTuple_GET_ITEM(path, 1), "data_directories", &max_bytes) != 0) {
+                Py_DECREF(items);
+                return -1;
+            }
+            path = PyTuple_GET_ITEM(path, 0);
         }
-        configuration = PyUnicode_AsUTF8String(config_object);
-        if (!configuration) return NULL;
+        PyObject* encoded = NULL;
+        if (!PyUnicode_FSConverter(path, &encoded)) {
+            Py_DECREF(items);
+            return -1;
+        }
+        PyList_SET_ITEM(opening->paths, index, encoded);
+        opening->data_directories[index].path = PyBytes_AS_STRING(encoded);
+        opening->data_directories[index].max_bytes = (ustore_size_t)max_bytes;
     }
+    Py_DECREF(items);
+    return 0;
+}
 
-    Database* const instance = (Database*)type->tp_alloc(type, 0);
+/** Reads @p object, a sequence of CUDA device ordinals, as the GPU devices. */
+static int opening_gpu_devices(opening_t* opening, PyObject* object) {
+    PyObject* const items = PySequence_Fast(object, "The 'gpu_devices' option must be a sequence");
+    if (!items) return -1;
+    Py_ssize_t const count = PySequence_Fast_GET_SIZE(items);
+    PyMem_Free(opening->gpu_devices);
+    opening->gpu_devices = PyMem_Calloc((size_t)count + 1, sizeof(int));
+    opening->gpu_devices_count = (size_t)count;
+    if (!opening->gpu_devices) {
+        Py_DECREF(items);
+        PyErr_NoMemory();
+        return -1;
+    }
+    for (Py_ssize_t index = 0; index != count; ++index) {
+        long const device = PyLong_AsLong(PySequence_Fast_GET_ITEM(items, index));
+        if (device == -1 && PyErr_Occurred()) {
+            Py_DECREF(items);
+            return -1;
+        }
+        if (device < 0 || device > INT_MAX) {
+            Py_DECREF(items);
+            PyErr_Format(PyExc_ValueError, "A CUDA device ordinal must be within [0, %d], got %ld", INT_MAX, device);
+            return -1;
+        }
+        opening->gpu_devices[index] = (int)device;
+    }
+    Py_DECREF(items);
+    return 0;
+}
+
+/** Wraps @p handle, which an init call opened unless @p error is set, in a new database of @p type. */
+static PyObject* database_opened(PyTypeObject* type, ustore_database_t handle, ustore_error_t* error) {
+    if (ustore_py_raise_on_error(error) != 0) return NULL;
+
+    ustore_capabilities_t capabilities = 0;
+    ustore_database_capabilities_t request = {0};
+    request.db = handle;
+    request.error = error;
+    request.capabilities = &capabilities;
+    ustore_database_capabilities(&request);
+    Database* const instance = error->status ? NULL : (Database*)type->tp_alloc(type, 0);
     if (!instance) {
-        Py_XDECREF(configuration);
-        return NULL;
-    }
-    instance->handle = NULL;
-    instance->arenas.idle = NULL;
-    instance->metadata = 0;
-    instance->transactions = 0;
-
-    ustore_str_view_t const config = configuration ? PyBytes_AS_STRING(configuration) : NULL;
-    ustore_database_t handle = NULL;
-    ustore_error_t error = {0};
-    ustore_database_init_t open = {0};
-    open.config = config;
-    open.db = &handle;
-    open.error = &error;
-
-    Py_BEGIN_ALLOW_THREADS;
-    ustore_database_init(&open);
-    Py_END_ALLOW_THREADS;
-    Py_XDECREF(configuration);
-
-    if (ustore_py_raise_on_error(&error) != 0) {
-        Py_DECREF(instance);
+        ustore_database_free(handle);
+        if (!PyErr_Occurred()) ustore_py_raise_on_error(error);
         return NULL;
     }
     instance->handle = handle;
-
-    ustore_metadata_t metadata = 0;
-    ustore_get_metadata_t capabilities = {0};
-    capabilities.db = handle;
-    capabilities.error = &error;
-    capabilities.metadata = &metadata;
-    ustore_get_metadata(&capabilities);
-    if (ustore_py_raise_on_error(&error) != 0) {
-        Py_DECREF(instance);
-        return NULL;
-    }
-    instance->metadata = metadata;
+    instance->arenas.idle = NULL;
+    instance->capabilities = capabilities;
+    instance->transactions = 0;
     return (PyObject*)instance;
+}
+
+#pragma endregion Opening
+
+#pragma region Databases
+
+static char const doc_Database[] =                                                             //
+    "An embedded database, opened through one class method per engine.\n"                      //
+    "\n"                                                                                       //
+    "Database.open_ram(), open_rocksdb(), open_leveldb() and open_nvme() each take what\n"     //
+    "their engine can be asked; engines_compiled() names the ones this build carries, and\n"   //
+    "the others refuse to open. The directory belongs to the database, so no two\n"            //
+    "processes may open the same one at once. Every database holds a main collection, which\n" //
+    "can be cleared but never dropped, beside the collections it creates.";
+
+static PyObject* Database_tp_new(PyTypeObject* Py_UNUSED(type), PyObject* Py_UNUSED(args),
+                                 PyObject* Py_UNUSED(keywords)) {
+    PyErr_SetString(PyExc_TypeError,
+                    "Database() names no engine: use open_ram, open_rocksdb, open_leveldb or open_nvme");
+    return NULL;
+}
+
+static char const doc_Database_open_ram[] =                                                //
+    "open_ram(directory=None, *, isolation='strict-serializable') answers a database in\n" //
+    "memory.\n"                                                                            //
+    "\n"                                                                                   //
+    "Args:\n"                                                                              //
+    "  directory (str | bytes | PathLike, optional): Where the database persists as one\n" //
+    "    image, rewritten whole on a flush and on close; None keeps it in memory alone.\n" //
+    "  isolation (str): How transactions see each other: 'strict-serializable' or\n"       //
+    "    'snapshot'.\n"                                                                    //
+    "Returns:\n"                                                                           //
+    "  Database: The opened database.";
+
+static PyObject* Database_open_ram(PyObject* type, PyObject* const* args, Py_ssize_t positional_args_count,
+                                   PyObject* args_names_tuple) {
+    opening_t opening = {0};
+    int isolation = ustore_isolation_strict_serializable_k;
+    Py_ssize_t const args_names_count = opening_positional(&opening, "open_ram", args, positional_args_count,
+                                                           args_names_tuple);
+    if (args_names_count < 0) goto failed;
+    for (Py_ssize_t names_progress = 0; names_progress != args_names_count; ++names_progress) {
+        PyObject* const name = PyTuple_GET_ITEM(args_names_tuple, names_progress);
+        PyObject* const value = args[positional_args_count + names_progress];
+        int read = -1;
+        if (PyUnicode_CompareWithASCIIString(name, "directory") == 0) read = opening_directory(&opening, value);
+        else if (PyUnicode_CompareWithASCIIString(name, "isolation") == 0)
+            read = ustore_py_choice_from_object(value, "isolation", isolation_namings, &isolation);
+        else PyErr_Format(PyExc_TypeError, "Got unexpected keyword argument: %S", name);
+        if (read != 0) goto failed;
+    }
+
+    ustore_database_t handle = NULL;
+    ustore_error_t error = {0};
+    ustore_database_init_ram_t init = {0};
+    init.db = &handle;
+    init.error = &error;
+    init.directory = opening.directory ? PyBytes_AS_STRING(opening.directory) : NULL;
+    init.isolation = (ustore_isolation_t)isolation;
+    Py_BEGIN_ALLOW_THREADS;
+    ustore_database_init_ram(&init);
+    Py_END_ALLOW_THREADS;
+    opening_release(&opening);
+    return database_opened((PyTypeObject*)type, handle, &error);
+
+failed:
+    opening_release(&opening);
+    return NULL;
+}
+
+static char const doc_Database_open_rocksdb[] =                                           //
+    "open_rocksdb(directory, *, data_directories=()) answers a database on RocksDB.\n"    //
+    "\n"                                                                                  //
+    "Args:\n"                                                                             //
+    "  directory (str | bytes | PathLike): The database's directory, which must exist.\n" //
+    "  data_directories (Sequence): Directories the table files fill in order, each a\n"  //
+    "    path or a (path, max_bytes) pair, where zero bytes means no limit.\n"            //
+    "Returns:\n"                                                                          //
+    "  Database: The opened database.\n"                                                  //
+    "Raises:\n"                                                                           //
+    "  UnsupportedError: This build carries no RocksDB engine.";
+
+static PyObject* Database_open_rocksdb(PyObject* type, PyObject* const* args, Py_ssize_t positional_args_count,
+                                       PyObject* args_names_tuple) {
+    opening_t opening = {0};
+    Py_ssize_t const args_names_count = opening_positional(&opening, "open_rocksdb", args, positional_args_count,
+                                                           args_names_tuple);
+    if (args_names_count < 0) goto failed;
+    for (Py_ssize_t names_progress = 0; names_progress != args_names_count; ++names_progress) {
+        PyObject* const name = PyTuple_GET_ITEM(args_names_tuple, names_progress);
+        PyObject* const value = args[positional_args_count + names_progress];
+        int read = -1;
+        if (PyUnicode_CompareWithASCIIString(name, "directory") == 0) read = opening_directory(&opening, value);
+        else if (PyUnicode_CompareWithASCIIString(name, "data_directories") == 0)
+            read = opening_data_directories(&opening, value);
+        else PyErr_Format(PyExc_TypeError, "Got unexpected keyword argument: %S", name);
+        if (read != 0) goto failed;
+    }
+
+    ustore_database_t handle = NULL;
+    ustore_error_t error = {0};
+    ustore_database_init_rocksdb_t init = {0};
+    init.db = &handle;
+    init.error = &error;
+    init.directory = opening.directory ? PyBytes_AS_STRING(opening.directory) : NULL;
+    init.data_directories = opening.data_directories;
+    init.data_directories_count = (ustore_size_t)opening.data_directories_count;
+    Py_BEGIN_ALLOW_THREADS;
+    ustore_database_init_rocksdb(&init);
+    Py_END_ALLOW_THREADS;
+    opening_release(&opening);
+    return database_opened((PyTypeObject*)type, handle, &error);
+
+failed:
+    opening_release(&opening);
+    return NULL;
+}
+
+static char const doc_Database_open_leveldb[] =                                           //
+    "open_leveldb(directory) answers a database on LevelDB.\n"                            //
+    "\n"                                                                                  //
+    "Args:\n"                                                                             //
+    "  directory (str | bytes | PathLike): The database's directory, which must exist.\n" //
+    "Returns:\n"                                                                          //
+    "  Database: The opened database.\n"                                                  //
+    "Raises:\n"                                                                           //
+    "  UnsupportedError: This build carries no LevelDB engine.";
+
+static PyObject* Database_open_leveldb(PyObject* type, PyObject* const* args, Py_ssize_t positional_args_count,
+                                       PyObject* args_names_tuple) {
+    opening_t opening = {0};
+    Py_ssize_t const args_names_count = opening_positional(&opening, "open_leveldb", args, positional_args_count,
+                                                           args_names_tuple);
+    if (args_names_count < 0) goto failed;
+    for (Py_ssize_t names_progress = 0; names_progress != args_names_count; ++names_progress) {
+        PyObject* const name = PyTuple_GET_ITEM(args_names_tuple, names_progress);
+        PyObject* const value = args[positional_args_count + names_progress];
+        int read = -1;
+        if (PyUnicode_CompareWithASCIIString(name, "directory") == 0) read = opening_directory(&opening, value);
+        else PyErr_Format(PyExc_TypeError, "Got unexpected keyword argument: %S", name);
+        if (read != 0) goto failed;
+    }
+
+    ustore_database_t handle = NULL;
+    ustore_error_t error = {0};
+    ustore_database_init_leveldb_t init = {0};
+    init.db = &handle;
+    init.error = &error;
+    init.directory = opening.directory ? PyBytes_AS_STRING(opening.directory) : NULL;
+    Py_BEGIN_ALLOW_THREADS;
+    ustore_database_init_leveldb(&init);
+    Py_END_ALLOW_THREADS;
+    opening_release(&opening);
+    return database_opened((PyTypeObject*)type, handle, &error);
+
+failed:
+    opening_release(&opening);
+    return NULL;
+}
+
+static char const doc_Database_open_nvme[] =                                                   //
+    "open_nvme(directory, *, transport='automatic', **sizes) answers a database on NVMe.\n"    //
+    "\n"                                                                                       //
+    "Every size keyword names a field of ustore_database_init_nvme_t, like memory_limit,\n"    //
+    "threads, queue_depth or collection_cache_limit, where zero keeps the engine's default.\n" //
+    "\n"                                                                                       //
+    "Args:\n"                                                                                  //
+    "  directory (str | bytes | PathLike): The directory of the database's own files.\n"       //
+    "  data_directories (Sequence): Directories the volumes fill, each a path or a\n"          //
+    "    (path, max_bytes) pair; none keeps one volume inside the directory.\n"                //
+    "  transport (str): How bytes move: 'automatic', 'blocking', 'linux-uring',\n"             //
+    "    'linux-aio' or 'linux-spdk'.\n"                                                       //
+    "  gpu_devices (Sequence[int]): CUDA devices compaction may run on.\n"                     //
+    "Returns:\n"                                                                               //
+    "  Database: The opened database.\n"                                                       //
+    "Raises:\n"                                                                                //
+    "  UnsupportedError: This build carries no NVMe engine.";
+
+static PyObject* Database_open_nvme(PyObject* type, PyObject* const* args, Py_ssize_t positional_args_count,
+                                    PyObject* args_names_tuple) {
+    opening_t opening = {0};
+    ustore_database_init_nvme_t init = {0};
+    int transport = ustore_transport_automatic_k;
+    Py_ssize_t const args_names_count = opening_positional(&opening, "open_nvme", args, positional_args_count,
+                                                           args_names_tuple);
+    if (args_names_count < 0) goto failed;
+    for (Py_ssize_t names_progress = 0; names_progress != args_names_count; ++names_progress) {
+        PyObject* const name = PyTuple_GET_ITEM(args_names_tuple, names_progress);
+        PyObject* const value = args[positional_args_count + names_progress];
+        nvme_size_keyword_t const* keyword = nvme_size_keywords;
+        while (keyword->name && PyUnicode_CompareWithASCIIString(name, keyword->name) != 0) ++keyword;
+        size_t size = 0;
+        int read = -1;
+        if (keyword->name) {
+            read = ustore_py_size_from_object(value, keyword->name, &size);
+            *(ustore_size_t*)((char*)&init + keyword->offset) = (ustore_size_t)size;
+        }
+        else if (PyUnicode_CompareWithASCIIString(name, "directory") == 0) read = opening_directory(&opening, value);
+        else if (PyUnicode_CompareWithASCIIString(name, "data_directories") == 0)
+            read = opening_data_directories(&opening, value);
+        else if (PyUnicode_CompareWithASCIIString(name, "gpu_devices") == 0)
+            read = opening_gpu_devices(&opening, value);
+        else if (PyUnicode_CompareWithASCIIString(name, "transport") == 0)
+            read = ustore_py_choice_from_object(value, "transport", transport_namings, &transport);
+        else PyErr_Format(PyExc_TypeError, "Got unexpected keyword argument: %S", name);
+        if (read != 0) goto failed;
+    }
+
+    ustore_database_t handle = NULL;
+    ustore_error_t error = {0};
+    init.db = &handle;
+    init.error = &error;
+    init.directory = opening.directory ? PyBytes_AS_STRING(opening.directory) : NULL;
+    init.data_directories = opening.data_directories;
+    init.data_directories_count = (ustore_size_t)opening.data_directories_count;
+    init.transport = (ustore_transport_t)transport;
+    init.gpu_devices = opening.gpu_devices;
+    init.gpu_devices_count = (ustore_size_t)opening.gpu_devices_count;
+    Py_BEGIN_ALLOW_THREADS;
+    ustore_database_init_nvme(&init);
+    Py_END_ALLOW_THREADS;
+    opening_release(&opening);
+    return database_opened((PyTypeObject*)type, handle, &error);
+
+failed:
+    opening_release(&opening);
+    return NULL;
 }
 
 /** Closes @p database and releases the arena it was lending. */
@@ -214,19 +493,19 @@ static PyObject* Database_repr(Database* self) {
 static char const doc_Database_supports_transactions[] = "Whether the engine groups operations into transactions.";
 
 static PyObject* Database_get_supports_transactions(Database* self, void* Py_UNUSED(closure)) {
-    return PyBool_FromLong((self->metadata & ustore_supports_transactions_k) != 0);
+    return PyBool_FromLong((self->capabilities & ustore_supports_transactions_k) != 0);
 }
 
 static char const doc_Database_supports_collections[] = "Whether the engine holds collections beyond the main one.";
 
 static PyObject* Database_get_supports_collections(Database* self, void* Py_UNUSED(closure)) {
-    return PyBool_FromLong((self->metadata & ustore_supports_collections_k) != 0);
+    return PyBool_FromLong((self->capabilities & ustore_supports_collections_k) != 0);
 }
 
 static char const doc_Database_supports_snapshots[] = "Whether the engine captures point-in-time views.";
 
 static PyObject* Database_get_supports_snapshots(Database* self, void* Py_UNUSED(closure)) {
-    return PyBool_FromLong((self->metadata & ustore_supports_snapshots_k) != 0);
+    return PyBool_FromLong((self->capabilities & ustore_supports_snapshots_k) != 0);
 }
 
 static char const doc_Database_control[] =                                                   //
@@ -984,6 +1263,12 @@ static PyGetSetDef Database_getset[] = {
 };
 
 static PyMethodDef Database_methods[] = {
+    {"open_ram", (PyCFunction)Database_open_ram, ustore_py_method_flags_k | METH_CLASS, doc_Database_open_ram},
+    {"open_rocksdb", (PyCFunction)Database_open_rocksdb, ustore_py_method_flags_k | METH_CLASS,
+     doc_Database_open_rocksdb},
+    {"open_leveldb", (PyCFunction)Database_open_leveldb, ustore_py_method_flags_k | METH_CLASS,
+     doc_Database_open_leveldb},
+    {"open_nvme", (PyCFunction)Database_open_nvme, ustore_py_method_flags_k | METH_CLASS, doc_Database_open_nvme},
     {"close", (PyCFunction)Database_close, METH_NOARGS, doc_Database_close},
     {"__enter__", (PyCFunction)Database_enter, METH_NOARGS, NULL},
     {"__exit__", (PyCFunction)Database_exit, ustore_py_method_flags_k, NULL},

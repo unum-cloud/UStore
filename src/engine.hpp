@@ -21,7 +21,7 @@ namespace unum::ustore {
  *  @c guarded.
  */
 struct engine_t {
-    void (*get_metadata)(ustore_get_metadata_t&) noexcept;
+    void (*database_capabilities)(ustore_database_capabilities_t&) noexcept;
     void (*database_control)(ustore_database_control_t&) noexcept;
     void (*snapshot_list)(ustore_snapshot_list_t&) noexcept;
     void (*snapshot_create)(ustore_snapshot_create_t&) noexcept;

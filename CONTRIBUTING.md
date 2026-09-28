@@ -173,15 +173,15 @@ A namespace-scope `_k` constant names an invariant — a format, an alignment, a
 
 `pyproject.toml` builds with `scikit-build-core`, which configures the top-level CMake tree with `USTORE_BUILD_LIB_PYTHON=ON` and suites, benchmarks and tools off, then installs the `ustore_python` target into the wheel.
 `python/CMakeLists.txt` defines that target as the C11 extension `ustore.lib` from `python/lib.c`, installed into the `python/ustore/` package, and the build tree lives in `build_python/`.
-Python suites sit in `test/` beside the C++ ones as `<topic>.py`, named so no module shadows a library it imports, and `pytest` collects every module there; `USTORE_PYTHON_ENGINE` picks the engine one build links.
+Python suites sit in `test/` beside the C++ ones as `<topic>.py`, named so no module shadows a library it imports, and `pytest` collects every module there, running each case once per engine in `ustore.engines_compiled()`.
 
 ```sh
-pip install -e .                                    # SmashTable only
-CMAKE_ARGS="-DUSTORE_WITH_ROCKSDB=ON" pip install .  # RocksDB beside it
+pip install -e .                                     # every engine
+CMAKE_ARGS="-DUSTORE_WITH_ROCKSDB=OFF" pip install .  # all but RocksDB
 pip install --group test . && pytest test
 ```
 
-An engine is enabled through `CMAKE_ARGS` or `--config-settings=cmake.define.USTORE_USE_<ENGINE>=ON`; the build reads no environment variable of its own.
+An engine is left out through `CMAKE_ARGS` or `--config-settings=cmake.define.USTORE_WITH_<ENGINE>=OFF`, and `USTORE_BUILD_NVME=OFF` for NVMe; the build reads no environment variable of its own.
 
 ## Rust Builds
 
@@ -189,13 +189,12 @@ An engine is enabled through `CMAKE_ARGS` or `--config-settings=cmake.define.UST
 The crate's own usage is described in [`rust/README.md`](rust/README.md).
 It configures CMake with `USTORE_BUILD_LIB_C=ON`, `USTORE_INSTALL=ON` and suites off, installs the static libraries into `OUT_DIR`, and links them with the target's C++ standard library.
 
-- __SmashTable__ always builds and links.
-- __rocksdb and leveldb__ build their engines beside it, linked once `c/lib.cpp` dispatches, since every engine library defines the same `ustore_*` symbols.
-- __NVMe__ joins as a feature once `USTORE_BUILD_NVME` builds.
+- __RAM__ always builds, in the one `ustore` library the crate links.
+- __rocksdb, leveldb and nvme__ are default features, each adding its engine to that library; without one, its `Database::open_*` fails with `Status::Unsupported`.
 
 ```sh
-cargo test
-cargo test --features rocksdb,leveldb
+cargo test                                        # every engine
+cargo test --no-default-features --features nvme  # RAM and NVMe alone
 ```
 
 `cargo package` skips every subdirectory holding a `Cargo.toml`, so ForkUnion's and StringZilla's manifests are moved aside before packaging.
@@ -214,7 +213,7 @@ An engine implements the calls from `db.h` and `blobs.h`; the documents and grap
 Start with these, in order:
 
 1. Opening and closing: `ustore_database_init()`, `ustore_database_free()`.
-2. Metadata, including the isolation level the engine delivers: `ustore_get_metadata()`.
+2. Metadata, including the isolation level the engine delivers: `ustore_database_capabilities()`.
 3. Binary values in the main collection: `ustore_write()`, `ustore_read()`.
 4. Named collections: `ustore_collection_list()`, `ustore_collection_create()`, `ustore_collection_drop()`.
 5. Transactions: `ustore_transaction_init()`, `ustore_transaction_stage()`, `ustore_transaction_commit()`, `ustore_transaction_free()`.

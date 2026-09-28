@@ -649,20 +649,20 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    ustore_metadata_t metadata {};
-    ustore_get_metadata_t get_metadata {};
-    get_metadata.db = twitter.db;
-    get_metadata.error = &error;
-    get_metadata.metadata = &metadata;
-    ustore_get_metadata(&get_metadata);
+    ustore_capabilities_t capabilities {};
+    ustore_database_capabilities_t request {};
+    request.db = twitter.db;
+    request.error = &error;
+    request.capabilities = &capabilities;
+    ustore_database_capabilities(&request);
     if (error.status) {
-        fmt::println(stderr, "Failed to read the database metadata: {}", error.message);
+        fmt::println(stderr, "Failed to read the database capabilities: {}", error.message);
         ustore_database_free(twitter.db);
         return 1;
     }
 
-    bool const supports_collections = (metadata & ustore_supports_collections_k) != 0;
-    bool const supports_transactions = (metadata & ustore_supports_transactions_k) != 0;
+    bool const supports_collections = (capabilities & ustore_supports_collections_k) != 0;
+    bool const supports_transactions = (capabilities & ustore_supports_transactions_k) != 0;
     if (supports_collections && (!create_collection(twitter.db, "twitter.docs", twitter.docs) ||
                                  !create_collection(twitter.db, "twitter.graph", twitter.graph))) {
         ustore_database_free(twitter.db);

@@ -37,7 +37,7 @@
     {
       "label": "Build Debug SmashTable Test",
       "detail": "Unit suite on the in-memory engine",
-      "command": "cmake --preset debug && cmake --build --preset debug --target ustore_test_units_ram",
+      "command": "cmake --preset debug && cmake --build --preset debug --target ustore_test_units",
       "args": [],
       "type": "shell",
       "problemMatcher": ["$gcc"]
@@ -45,7 +45,7 @@
     {
       "label": "Build Debug RocksDB Test",
       "detail": "Unit suite on RocksDB",
-      "command": "cmake --preset debug && cmake --build --preset debug --target ustore_test_units_rocksdb",
+      "command": "cmake --preset debug && cmake --build --preset debug --target ustore_test_units",
       "args": [],
       "type": "shell",
       "problemMatcher": ["$gcc"]
@@ -53,7 +53,7 @@
     {
       "label": "Build Debug LevelDB Test",
       "detail": "Unit suite on LevelDB",
-      "command": "cmake --preset debug && cmake --build --preset debug --target ustore_test_units_leveldb",
+      "command": "cmake --preset debug && cmake --build --preset debug --target ustore_test_units",
       "args": [],
       "type": "shell",
       "problemMatcher": ["$gcc"]
@@ -61,7 +61,7 @@
     {
       "label": "Build Debug NVMe Test",
       "detail": "Unit suite on NVMe, which configures only once src/nvme compiles",
-      "command": "cmake --preset debug -DUSTORE_BUILD_NVME=ON && cmake --build --preset debug --target ustore_test_units_nvme",
+      "command": "cmake --preset debug -DUSTORE_BUILD_NVME=ON && cmake --build --preset debug --target ustore_test_units",
       "args": [],
       "type": "shell",
       "problemMatcher": ["$gcc"]
@@ -69,7 +69,7 @@
     {
       "label": "Build Debug Strings Test",
       "detail": "Strings modality suite on the in-memory engine",
-      "command": "cmake --preset debug && cmake --build --preset debug --target ustore_test_strings_ram",
+      "command": "cmake --preset debug && cmake --build --preset debug --target ustore_test_strings",
       "args": [],
       "type": "shell",
       "problemMatcher": ["$gcc"]
@@ -77,7 +77,7 @@
     {
       "label": "Build Debug Test Tools",
       "detail": "CLI suite and the CLI it drives",
-      "command": "cmake --preset debug && cmake --build --preset debug --target ustore_test_tools_ram",
+      "command": "cmake --preset debug && cmake --build --preset debug --target ustore_test_tools",
       "args": [],
       "type": "shell",
       "problemMatcher": ["$gcc"]
@@ -85,7 +85,7 @@
     {
       "label": "Build Stress Atomicity SmashTable",
       "detail": "Atomicity stress suite on the in-memory engine",
-      "command": "cmake --preset debug && cmake --build --preset debug --target ustore_stress_atomicity_ram",
+      "command": "cmake --preset debug && cmake --build --preset debug --target ustore_stress_atomicity",
       "args": [],
       "type": "shell",
       "problemMatcher": ["$gcc"]
@@ -93,7 +93,7 @@
     {
       "label": "Build Stress Atomicity RocksDB",
       "detail": "Atomicity stress suite on RocksDB",
-      "command": "cmake --preset debug && cmake --build --preset debug --target ustore_stress_atomicity_rocksdb",
+      "command": "cmake --preset debug && cmake --build --preset debug --target ustore_stress_atomicity",
       "args": [],
       "type": "shell",
       "problemMatcher": ["$gcc"]
@@ -101,7 +101,7 @@
     {
       "label": "Build Stress Linearizability SmashTable",
       "detail": "Linearizability stress suite on the in-memory engine",
-      "command": "cmake --preset debug && cmake --build --preset debug --target ustore_stress_linearizability_ram",
+      "command": "cmake --preset debug && cmake --build --preset debug --target ustore_stress_linearizability",
       "args": [],
       "type": "shell",
       "problemMatcher": ["$gcc"]
@@ -109,7 +109,7 @@
     {
       "label": "Build Stress Linearizability RocksDB",
       "detail": "Linearizability stress suite on RocksDB",
-      "command": "cmake --preset debug && cmake --build --preset debug --target ustore_stress_linearizability_rocksdb",
+      "command": "cmake --preset debug && cmake --build --preset debug --target ustore_stress_linearizability",
       "args": [],
       "type": "shell",
       "problemMatcher": ["$gcc"]
@@ -117,7 +117,7 @@
     {
       "label": "Build Debug SmashTable Benchmark",
       "detail": "Twitter benchmark on the in-memory engine",
-      "command": "cmake --preset profile && cmake --build --preset profile --target ustore_bench_twitter_ram",
+      "command": "cmake --preset profile && cmake --build --preset profile --target ustore_bench_twitter",
       "args": [],
       "type": "shell",
       "problemMatcher": ["$gcc"]
@@ -125,7 +125,7 @@
     {
       "label": "Build Debug RocksDB Benchmark",
       "detail": "Twitter benchmark on RocksDB",
-      "command": "cmake --preset profile && cmake --build --preset profile --target ustore_bench_twitter_rocksdb",
+      "command": "cmake --preset profile && cmake --build --preset profile --target ustore_bench_twitter",
       "args": [],
       "type": "shell",
       "problemMatcher": ["$gcc"]
@@ -133,7 +133,7 @@
     {
       "label": "Build Debug NVMe Benchmark",
       "detail": "Twitter benchmark on NVMe, which configures only once src/nvme compiles",
-      "command": "cmake --preset profile -DUSTORE_BUILD_NVME=ON && cmake --build --preset profile --target ustore_bench_twitter_nvme",
+      "command": "cmake --preset profile -DUSTORE_BUILD_NVME=ON && cmake --build --preset profile --target ustore_bench_twitter",
       "args": [],
       "type": "shell",
       "problemMatcher": ["$gcc"]

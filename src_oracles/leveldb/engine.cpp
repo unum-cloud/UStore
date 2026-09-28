@@ -262,7 +262,9 @@ void database_init(ustore_database_init_leveldb_t& arguments) {
     *arguments.db = static_cast<handle_t*>(database.release());
 }
 
-void get_metadata(ustore_get_metadata_t& arguments) { *arguments.metadata = ustore_supports_snapshots_k; }
+void database_capabilities(ustore_database_capabilities_t& arguments) {
+    *arguments.capabilities = ustore_supports_snapshots_k;
+}
 
 #pragma endregion Lifetime
 
@@ -700,7 +702,7 @@ void database_free(ustore_database_t handle) noexcept {
 #pragma endregion Memory
 
 engine_t const engine_k {
-    .get_metadata = &guarded<ustore_get_metadata_t, &get_metadata>,
+    .database_capabilities = &guarded<ustore_database_capabilities_t, &database_capabilities>,
     .database_control = &guarded<ustore_database_control_t, &database_control>,
     .snapshot_list = &guarded<ustore_snapshot_list_t, &snapshot_list>,
     .snapshot_create = &guarded<ustore_snapshot_create_t, &snapshot_create>,

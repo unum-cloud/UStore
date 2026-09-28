@@ -102,7 +102,7 @@ def show_batches(dataset: CollectionDataset, order: Order) -> None:
 
 def main() -> None:
     """Fills a collection and drains it through the loader twice, in key order and at random."""
-    with ustore.Database() as database:
+    with ustore.Database.open_ram() as database:
         collection = database.collection_create(COLLECTION)
         fill(database, collection)
         dataset = CollectionDataset(database, collection)

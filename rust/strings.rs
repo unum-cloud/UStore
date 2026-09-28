@@ -345,11 +345,11 @@ impl View<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{Configuration, Conflicts, Database, Durability};
+    use crate::db::{Conflicts, Database, Durability, RAMOptions};
 
     /// A database whose catalog holds three named collections.
     fn cataloged() -> (Database, Arena) {
-        let database = Database::open(Configuration::in_memory()).unwrap();
+        let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
         for name in ["people", "places", "planets"] {
             database.create_collection(&mut arena, name).unwrap();
@@ -398,7 +398,7 @@ mod tests {
 
     #[test]
     fn a_name_bound_to_something_else_is_refused() {
-        let database = Database::open(Configuration::in_memory()).unwrap();
+        let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
         write_name(database.head(), &mut arena, "people", Some(b"not an identifier")).unwrap();
         let failure = database.head().collection(&mut arena, "people").unwrap_err();
@@ -407,7 +407,7 @@ mod tests {
 
     #[test]
     fn names_read_back_what_was_written_under_them() {
-        let database = Database::open(Configuration::in_memory()).unwrap();
+        let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
         assert_eq!(read_name(database.head(), &mut arena, "absent").unwrap(), None);
 
@@ -423,7 +423,7 @@ mod tests {
 
     #[test]
     fn the_catalog_follows_the_view_it_is_read_through() {
-        let database = Database::open(Configuration::in_memory()).unwrap();
+        let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
         let snapshot = database.snapshot().unwrap();
         let people = database.create_collection(&mut arena, "people").unwrap();

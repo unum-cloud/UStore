@@ -28,14 +28,14 @@ The SmashTable engine is always built, and each other engine is switched on by i
 
 ```sh
 cmake --preset release -DUSTORE_BUILD_BENCH=1 -DUSTORE_WITH_ROCKSDB=1 -DUSTORE_WITH_LEVELDB=1
-cmake --build --preset release --target ustore_bench_twitter_rocksdb ustore_bench_tabular_graph_rocksdb
+cmake --build --preset release --target ustore_bench_twitter ustore_bench_tabular_graph
 ```
 
-Executables land in `build_release/build/bin/`.
+Executables land in `build_release/build/bin/`, and each opens the engine its `--engine` names.
 Imports hold whole batches in memory, so every run goes under a cgroup cap rather than trusting the benchmark to refuse.
 
 ```sh
-systemd-run --user --scope -p MemoryMax=16G -p MemorySwapMax=0 -- build_release/build/bin/ustore_bench_twitter_rocksdb ...
+systemd-run --user --scope -p MemoryMax=16G -p MemorySwapMax=0 -- build_release/build/bin/ustore_bench_twitter --engine rocksdb ...
 ```
 
 ### Flags
@@ -47,7 +47,7 @@ Flags starting with `--benchmark_` go to Google Benchmark, which reads them befo
 ### Twitter
 
 ```sh
-build_release/build/bin/ustore_bench_twitter_rocksdb \
+build_release/build/bin/ustore_bench_twitter --engine rocksdb \
     --dataset data/twitter --directory /dev/shm/ustore-twitter --threads 16 --max-input-files-total 100
 ```
 
@@ -65,7 +65,7 @@ build_release/build/bin/ustore_bench_twitter_rocksdb \
 ### Tables and Graphs
 
 ```sh
-build_release/build/bin/ustore_bench_tabular_graph_rocksdb \
+build_release/build/bin/ustore_bench_tabular_graph --engine rocksdb \
     --dataset data/<name> --format csv --directory /dev/shm/ustore-tabular \
     --id-field id --source-field source --target-field target --edge-field edge \
     --threads 4 --max-input-files-total 40
@@ -102,9 +102,9 @@ One level optimizer and one aggregator serve both graphs, so the gap between the
 It reports `modularity`, `communities` and `levels` as counters, and the upsert that fills the collection as a benchmark of its own.
 
 ```sh
-build_release/build/bin/ustore_bench_louvain_rocksdb \
+build_release/build/bin/ustore_bench_louvain --engine rocksdb \
     --dataset data/snap-email/email-Eu-core.txt --directory /dev/shm/ustore-louvain
-build_release/build/bin/ustore_bench_louvain_ram --vertices 4096 --communities 16
+build_release/build/bin/ustore_bench_louvain --engine ram --vertices 4096 --communities 16
 ```
 
 | Flag                                          | Meaning                                                | Default    |

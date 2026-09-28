@@ -222,13 +222,13 @@ class test_database_t {
     /** Answers whether the engine reports named collections. */
     [[nodiscard]] bool supports_collections() noexcept {
         ustore_error_t error {};
-        ustore_metadata_t metadata {};
-        ustore_get_metadata_t request {};
+        ustore_capabilities_t capabilities {};
+        ustore_database_capabilities_t request {};
         request.db = database_;
         request.error = &error;
-        request.metadata = &metadata;
-        ustore_get_metadata(&request);
-        bool const supported = !error.status && (metadata & ustore_supports_collections_k);
+        request.capabilities = &capabilities;
+        ustore_database_capabilities(&request);
+        bool const supported = !error.status && (capabilities & ustore_supports_collections_k);
         return supported;
     }
 

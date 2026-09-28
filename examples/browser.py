@@ -96,7 +96,7 @@ def seed_images(store: Store) -> None:
 @st.cache_resource
 def open_store() -> Store:
     """Opens the database once per session and seeds every collection that is still empty."""
-    database = ustore.Database()
+    database = ustore.Database.open_ram()
     store = Store(
         database=database,
         documents=database.collection_create(DOCUMENTS_COLLECTION),

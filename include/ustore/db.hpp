@@ -264,15 +264,15 @@ using transaction_t = context_t;
 class database_t {
     ustore_database_t database_ = nullptr;
 
-    ustore_metadata_t get_metadata() noexcept {
+    ustore_capabilities_t capabilities_() noexcept {
         ustore_error_t error {};
-        ustore_metadata_t metadata {};
-        ustore_get_metadata_t request {};
+        ustore_capabilities_t capabilities {};
+        ustore_database_capabilities_t request {};
         request.db = database_;
-        request.metadata = &metadata;
+        request.capabilities = &capabilities;
         request.error = &error;
-        ustore_get_metadata(&request);
-        return metadata;
+        ustore_database_capabilities(&request);
+        return capabilities;
     }
 
     /** Opens the engine behind @p init with @p options, whose outputs this call fills in. */
@@ -299,22 +299,22 @@ class database_t {
     operator ustore_database_t() const noexcept { return database_; }
 
     /** Opens the in-memory engine, which persists as one image when @p options name a directory. */
-    static expected<database_t> ram(ustore_database_init_ram_t options = {}) noexcept {
+    static expected<database_t> open_ram(ustore_database_init_ram_t options = {}) noexcept {
         return open_(ustore_database_init_ram, options);
     }
 
     /** Opens the RocksDB engine in the directory @p options name. */
-    static expected<database_t> rocksdb(ustore_database_init_rocksdb_t options) noexcept {
+    static expected<database_t> open_rocksdb(ustore_database_init_rocksdb_t options) noexcept {
         return open_(ustore_database_init_rocksdb, options);
     }
 
     /** Opens the LevelDB engine in the directory @p options name. */
-    static expected<database_t> leveldb(ustore_database_init_leveldb_t options) noexcept {
+    static expected<database_t> open_leveldb(ustore_database_init_leveldb_t options) noexcept {
         return open_(ustore_database_init_leveldb, options);
     }
 
     /** Opens the NVMe engine over the directories @p options name. */
-    static expected<database_t> nvme(ustore_database_init_nvme_t options) noexcept {
+    static expected<database_t> open_nvme(ustore_database_init_nvme_t options) noexcept {
         return open_(ustore_database_init_nvme, options);
     }
 
@@ -327,9 +327,9 @@ class database_t {
         if (database_) close();
     }
 
-    bool supports_collections() noexcept { return get_metadata() & ustore_supports_collections_k; }
-    bool supports_transactions() noexcept { return get_metadata() & ustore_supports_transactions_k; }
-    bool supports_snapshots() noexcept { return get_metadata() & ustore_supports_snapshots_k; }
+    bool supports_collections() noexcept { return capabilities_() & ustore_supports_collections_k; }
+    bool supports_transactions() noexcept { return capabilities_() & ustore_supports_transactions_k; }
+    bool supports_snapshots() noexcept { return capabilities_() & ustore_supports_snapshots_k; }
 
     expected<context_t> transact() noexcept {
         ustore_error_t error {};

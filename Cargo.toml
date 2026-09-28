@@ -41,10 +41,12 @@ include = [
 name = "ustore"
 path = "rust/lib.rs"
 
-# The `ram` engine always builds and links; `rocksdb` and `leveldb` build their engines too, linked once
-# `c/lib.cpp` dispatches. `nvme` joins as a feature once `src/nvme` builds.
+# The `ram` engine always builds; each feature adds its engine to the one library, and without it the engine's
+# `Database::open_*` fails with `Status::Unsupported`.
 [features]
+default = ["rocksdb", "leveldb", "nvme"]
 leveldb = []
+nvme = []
 rocksdb = []
 
 [build-dependencies]

@@ -9,9 +9,9 @@
 //! outlive it, nor survive the call that would overwrite it.
 //!
 //! ```no_run
-//! use ustore::{Arena, Collection, Collections, Configuration, Database, Durability, Entry};
+//! use ustore::{Arena, Collection, Collections, RAMOptions, Database, Durability, Entry};
 //!
-//! let database = Database::open(Configuration::in_memory())?;
+//! let database = Database::open_ram(&RAMOptions::default())?;
 //! let mut arena = Arena::new();
 //!
 //! let people = database.create_collection(&mut arena, "people")?;
@@ -35,9 +35,9 @@
 //! first one exported. That is the borrow the verbs take, and it does not compile:
 //!
 //! ```compile_fail
-//! use ustore::{Arena, Collection, Configuration, Database};
+//! use ustore::{Arena, Collection, RAMOptions, Database};
 //!
-//! let database = Database::open(Configuration::in_memory())?;
+//! let database = Database::open_ram(&RAMOptions::default())?;
 //! let mut arena = Arena::new();
 //! let values = database.head().read(&mut arena, Collection::main(), &[1])?;
 //! let overwritten = database.head().read(&mut arena, Collection::main(), &[2])?;
@@ -56,8 +56,9 @@ mod testing;
 
 pub use blobs::{Entry, Measurement, Values};
 pub use db::{
-    key_unknown, Arena, Collection, Collections, Configuration, Conflicts, Database, Durability, Error, Isolation, Key,
-    Metadata, Removed, Result, SequenceNumber, Snapshot, SnapshotId, Status, Transaction, View,
+    key_unknown, Arena, Capabilities, Collection, Collections, Conflicts, DataDirectory, Database, Durability, Error,
+    Isolation, Key, LevelDBOptions, NVMEOptions, RAMOptions, Removed, Result, RocksDBOptions, SequenceNumber, Snapshot,
+    SnapshotId, Status, Transaction, Transport, View,
 };
 pub use docs::{
     Binary, Bitmap, Column, ColumnFormat, Document, DocumentEntry, FieldAddress, FieldEntry, FieldFormat, Half, Json,

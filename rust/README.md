@@ -9,12 +9,12 @@ cargo add ustore
 The crate links the engine libraries CMake builds and consumes them through the C ABI in `include/ustore/`.
 `build.rs` compiles no C or C++ of its own: it configures CMake, installs the static libraries into `OUT_DIR` and links them.
 
-The in-memory `ram` engine always builds and links.
-The `rocksdb` and `leveldb` features build their engines beside it, linked once `c/lib.cpp` dispatches between them, and `nvme` joins them once `src/nvme` builds.
+The in-memory `ram` engine always builds, and the default `rocksdb`, `leveldb` and `nvme` features add theirs to the one library.
+Without a feature, its engine's `Database::open_*` fails with `Status::Unsupported`.
 
 ```sh
-cargo test
-cargo test --features rocksdb,leveldb
+cargo test                                        # every engine
+cargo test --no-default-features --features nvme  # RAM and NVMe alone
 ```
 
 ## Quickstart
@@ -23,9 +23,9 @@ A `Database` owns its directory, and an `Arena` is the scratch the engine export
 Every batch verb takes the arena mutably and hands back a result that borrows it, so a value read out of an arena can neither outlive it nor survive the call that would overwrite it.
 
 ```rust
-use ustore::{Arena, Collection, Configuration, Database, Durability, Entry};
+use ustore::{Arena, Collection, RAMOptions, Database, Durability, Entry};
 
-let database = Database::open(Configuration::in_memory())?;
+let database = Database::open_ram(&RAMOptions::default())?;
 let mut arena = Arena::new();
 
 let people = database.create_collection(&mut arena, "people")?;
@@ -222,7 +222,7 @@ match database.head().collection(&mut arena, "nowhere") {
 
 ## What The Crate Covers
 
-Opening and closing, engine metadata and control requests, collections by identifier and by name, binary reads, writes, erases, scans, samples and measurements, documents with whole and field writes, reads, gists and gathers, graphs with edge and vertex upserts, removals and lookups, transactions with staging, commit and rollback, and snapshots with export.
+Opening and closing, engine capabilities and control requests, collections by identifier and by name, binary reads, writes, erases, scans, samples and measurements, documents with whole and field writes, reads, gists and gathers, graphs with edge and vertex upserts, removals and lookups, transactions with staging, commit and rollback, and snapshots with export.
 Batches span several collections, mix writes with removals, write whole documents in every format the engine parses, and gather half-precision and UUID columns.
 
 Two options of `ustore_options_t` stay unbound, and deliberately.

@@ -1,6 +1,6 @@
 # Engines
 
-Every engine implements the C ABI of `include/ustore/*.h` over its own storage, and links with `c/docs.cpp` and `c/graph.cpp` into one `ustore_embedded_<engine>` library, so documents and graphs work on each of them.
+Every engine implements the C ABI of `include/ustore/*.h` over its own storage, and joins `c/lib.cpp`, `c/docs.cpp` and `c/graph.cpp` in the one `ustore` library, so documents and graphs work on each of them.
 The engines fill three roles: SmashTable is the reference engine in memory, NVMe is the hyper-converged engine on NVMe drives and GPUs, and RocksDB and LevelDB bring third-party key-value stores behind the same calls.
 Engines aim for the highest isolation SmashTable delivers, each reports the level its transactions actually deliver, and the conformance suite checks every advertised level against behaviour.
 

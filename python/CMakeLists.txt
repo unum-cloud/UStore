@@ -35,21 +35,8 @@ if (NOT MSVC)
     target_compile_options(ustore_python PRIVATE -Wno-cast-function-type)
 endif ()
 
-# Every engine library defines the same `ustore_*` symbols, so exactly one links into the extension until `c/lib.cpp`
-# dispatches between them; the in-memory engine always builds, so it is the default.
-set(USTORE_PYTHON_ENGINE
-    "ram"
-    CACHE STRING "The engine the CPython extension links"
-)
-if (NOT USTORE_PYTHON_ENGINE IN_LIST USTORE_ENGINE_NAMES)
-    message(FATAL_ERROR "USTORE_PYTHON_ENGINE names '${USTORE_PYTHON_ENGINE}', which this tree does not build")
-endif ()
-target_link_libraries(ustore_python PRIVATE ustore_embedded_${USTORE_PYTHON_ENGINE} ustore_warnings)
-
-# The engine this extension carries, until `ustore_engine_compiled` answers the same question.
-target_compile_definitions(
-    ustore_python PRIVATE USTORE_VERSION="${USTORE_VERSION}" USTORE_ENGINES="${USTORE_PYTHON_ENGINE}"
-)
+# The one library carries every engine the build enables, with the `USTORE_WITH_*` switches `engines_compiled` reads.
+target_link_libraries(ustore_python PRIVATE ustore ustore_warnings)
 
 # Named, or every dependency's own install rules land in the wheel beside the extension.
 install(TARGETS ustore_python LIBRARY DESTINATION ustore COMPONENT ustore_python)

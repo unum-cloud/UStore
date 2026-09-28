@@ -71,7 +71,7 @@ def draw(karate_club: nx.Graph, partitioned: dict[int, int]) -> None:
 
 def main() -> None:
     """Loads the club into the database, partitions it both ways and draws the result."""
-    with ustore.Database() as database:
+    with ustore.Database.open_ram() as database:
         stored = Graph(database, GRAPH_COLLECTION)
         karate_club = mirror_karate_club(stored)
 

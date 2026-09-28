@@ -536,11 +536,11 @@ fn first_estimate(column: *const ustore_size_t) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{Collection, Collections, Configuration, Database, Removed, Status};
+    use crate::db::{Collection, Collections, Database, RAMOptions, Removed, Status};
 
     /// A database holding `alpha`, `beta` and `gamma` under the keys one, two and three.
     fn populated() -> (Database, Arena) {
-        let database = Database::open(Configuration::in_memory()).unwrap();
+        let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
         let entries = [
             Entry::new(1, b"alpha").unwrap(),
@@ -578,7 +578,7 @@ mod tests {
 
     #[test]
     fn reads_report_a_missing_key_apart_from_an_empty_value() {
-        let database = Database::open(Configuration::in_memory()).unwrap();
+        let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
         let entries = [Entry::new(1, b"").unwrap()];
         database
@@ -635,7 +635,7 @@ mod tests {
 
     #[test]
     fn writes_land_in_the_collection_they_name() {
-        let database = Database::open(Configuration::in_memory()).unwrap();
+        let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
         let named = database.create_collection(&mut arena, "people").unwrap();
         let entries = [Entry::new(1, b"in the named one").unwrap()];
@@ -700,7 +700,7 @@ mod tests {
 
     #[test]
     fn one_batch_spans_several_collections() {
-        let database = Database::open(Configuration::in_memory()).unwrap();
+        let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
         let people = database.create_collection(&mut arena, "people").unwrap();
         let places = database.create_collection(&mut arena, "places").unwrap();

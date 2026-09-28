@@ -894,12 +894,12 @@ void database_init(ustore_database_init_nvme_t& arguments) noexcept {
     *arguments.db = static_cast<handle_t*>(opened);
 }
 
-void get_metadata(ustore_get_metadata_t& arguments) noexcept {
-    if (!arguments.db || !arguments.metadata) {
-        *arguments.error = {ustore_error_invalid_argument_k, "Need a database and an output for the metadata"};
+void database_capabilities(ustore_database_capabilities_t& arguments) noexcept {
+    if (!arguments.db || !arguments.capabilities) {
+        *arguments.error = {ustore_error_invalid_argument_k, "Need a database and an output for the capabilities"};
         return;
     }
-    *arguments.metadata = ustore_metadata_t(ustore_supports_transactions_k | ustore_supports_collections_k);
+    *arguments.capabilities = ustore_capabilities_t(ustore_supports_transactions_k | ustore_supports_collections_k);
 }
 
 void read(ustore_read_t& arguments) noexcept {
@@ -1375,7 +1375,7 @@ void database_free(ustore_database_t c_database) noexcept {
 #pragma endregion C ABI
 
 engine_t const engine_k {
-    .get_metadata = &get_metadata,
+    .database_capabilities = &database_capabilities,
     .database_control = &database_control,
     .snapshot_list = &snapshot_list,
     .snapshot_create = &snapshot_create,

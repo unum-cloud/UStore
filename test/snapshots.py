@@ -1,7 +1,7 @@
 """Snapshots over the C ABI: capturing a point in time and reading it back through every read verb."""
 
 import pytest
-from capabilities import NEEDS_SNAPSHOTS
+from capabilities import NEEDS_SNAPSHOTS, open_engine
 
 import ustore
 
@@ -65,7 +65,7 @@ def test_batch_verbs_follow_a_snapshot(database):
     database.snapshot_drop(identifier)
 
 
-def test_export_writes_a_database_that_opens(database, tmp_path):
+def test_export_writes_a_database_that_opens(database, engine: str, tmp_path):
     database.set(1, b"exported")
     identifier = database.snapshot_create()
     directory = tmp_path / "exported"
@@ -78,7 +78,7 @@ def test_export_writes_a_database_that_opens(database, tmp_path):
     finally:
         database.snapshot_drop(identifier)
 
-    with ustore.Database(directory) as reopened:
+    with open_engine(engine, directory) as reopened:
         assert reopened.get(1) == b"exported"
 
 

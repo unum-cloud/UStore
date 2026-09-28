@@ -33,9 +33,18 @@ pub(crate) mod ffi {
     pub type ustore_str_view_t = *const c_char;
     pub type ustore_bytes_cptr_t = *const u8;
 
-    /// The `ustore_status_t`, `ustore_options_t`, `ustore_drop_mode_t` and `ustore_metadata_t`
-    /// enumerations, each of which lowers to the platform `int`.
+    /// The `ustore_status_t`, `ustore_options_t`, `ustore_drop_mode_t`, `ustore_capabilities_t`,
+    /// `ustore_isolation_t` and `ustore_transport_t` enumerations, each of which lowers to the platform `int`.
     pub type ustore_enum_t = c_int;
+
+    pub const USTORE_ISOLATION_STRICT_SERIALIZABLE_K: ustore_enum_t = 0;
+    pub const USTORE_ISOLATION_SNAPSHOT_K: ustore_enum_t = 1;
+
+    pub const USTORE_TRANSPORT_AUTOMATIC_K: ustore_enum_t = 0;
+    pub const USTORE_TRANSPORT_BLOCKING_K: ustore_enum_t = 1;
+    pub const USTORE_TRANSPORT_LINUX_URING_K: ustore_enum_t = 2;
+    pub const USTORE_TRANSPORT_LINUX_AIO_K: ustore_enum_t = 3;
+    pub const USTORE_TRANSPORT_LINUX_SPDK_K: ustore_enum_t = 4;
 
     pub const USTORE_OPTIONS_DEFAULT_K: ustore_enum_t = 0;
     pub const USTORE_OPTION_WRITE_FLUSH_K: ustore_enum_t = 1 << 1;
@@ -63,17 +72,71 @@ pub(crate) mod ffi {
     }
 
     #[repr(C)]
-    pub struct ustore_database_init_t {
-        pub config: ustore_str_view_t,
-        pub db: *mut ustore_database_t,
-        pub error: *mut ustore_error_t,
+    pub struct ustore_data_directory_t {
+        pub path: ustore_str_view_t,
+        pub max_bytes: ustore_size_t,
     }
 
     #[repr(C)]
-    pub struct ustore_get_metadata_t {
+    pub struct ustore_database_init_ram_t {
+        pub db: *mut ustore_database_t,
+        pub error: *mut ustore_error_t,
+        pub directory: ustore_str_view_t,
+        pub isolation: ustore_enum_t,
+    }
+
+    #[repr(C)]
+    pub struct ustore_database_init_rocksdb_t {
+        pub db: *mut ustore_database_t,
+        pub error: *mut ustore_error_t,
+        pub directory: ustore_str_view_t,
+        pub data_directories: *const ustore_data_directory_t,
+        pub data_directories_count: ustore_size_t,
+    }
+
+    #[repr(C)]
+    pub struct ustore_database_init_leveldb_t {
+        pub db: *mut ustore_database_t,
+        pub error: *mut ustore_error_t,
+        pub directory: ustore_str_view_t,
+    }
+
+    #[repr(C)]
+    pub struct ustore_database_init_nvme_t {
+        pub db: *mut ustore_database_t,
+        pub error: *mut ustore_error_t,
+        pub directory: ustore_str_view_t,
+        pub data_directories: *const ustore_data_directory_t,
+        pub data_directories_count: ustore_size_t,
+        pub transport: ustore_enum_t,
+        pub memory_limit: ustore_size_t,
+        pub threads: ustore_size_t,
+        pub gpu_devices: *const c_int,
+        pub gpu_devices_count: ustore_size_t,
+        pub gpu_memory_limit: ustore_size_t,
+        pub shared_io_channels: ustore_size_t,
+        pub queue_depth: ustore_size_t,
+        pub request_buffer_bytes: ustore_size_t,
+        pub request_buffers_count: ustore_size_t,
+        pub stream_buffer_bytes: ustore_size_t,
+        pub stream_buffers_count: ustore_size_t,
+        pub transaction_max_bytes: ustore_size_t,
+        pub transaction_max_elements: ustore_size_t,
+        pub collection_concurrency_limit: ustore_size_t,
+        pub collection_cache_limit: ustore_size_t,
+        pub collection_write_buffer_max_bytes: ustore_size_t,
+        pub collection_write_buffer_max_elements: ustore_size_t,
+        pub collection_first_level_max_bytes: ustore_size_t,
+        pub collection_level_enlarge_factor: ustore_size_t,
+        pub collection_value_size: ustore_size_t,
+        pub collection_value_max_size: ustore_size_t,
+    }
+
+    #[repr(C)]
+    pub struct ustore_database_capabilities_t {
         pub db: ustore_database_t,
         pub error: *mut ustore_error_t,
-        pub metadata: *mut ustore_enum_t,
+        pub capabilities: *mut ustore_enum_t,
     }
 
     #[repr(C)]
@@ -177,8 +240,12 @@ pub(crate) mod ffi {
         pub static ustore_length_missing_k: ustore_length_t;
         pub static ustore_key_unknown_k: ustore_key_t;
 
-        pub fn ustore_database_init(arguments: *mut ustore_database_init_t);
-        pub fn ustore_get_metadata(arguments: *mut ustore_get_metadata_t);
+        pub fn ustore_database_init_ram(arguments: *mut ustore_database_init_ram_t);
+        pub fn ustore_database_init_rocksdb(arguments: *mut ustore_database_init_rocksdb_t);
+        pub fn ustore_database_init_leveldb(arguments: *mut ustore_database_init_leveldb_t);
+        pub fn ustore_database_init_nvme(arguments: *mut ustore_database_init_nvme_t);
+
+        pub fn ustore_database_capabilities(arguments: *mut ustore_database_capabilities_t);
         pub fn ustore_database_control(arguments: *mut ustore_database_control_t);
 
         pub fn ustore_snapshot_list(arguments: *mut ustore_snapshot_list_t);
@@ -521,9 +588,9 @@ unsafe impl Send for Arena {}
 
 // endregion: Arenas
 
-// region: Configuration
+// region: Options
 
-/// The isolation an engine delivers to the transactions of a database.
+/// The isolation the in-memory engine delivers to the transactions of a database.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
 pub enum Isolation {
     /// Reads and writes both take part in one serial order.
@@ -533,84 +600,177 @@ pub enum Isolation {
     Snapshot,
 }
 
-impl Isolation {
-    fn name(self) -> &'static str {
-        match self {
-            Isolation::StrictSerializable => "strict_serializable",
-            Isolation::Snapshot => "snapshot",
-        }
-    }
+/// How the NVMe engine moves bytes between its files and memory.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+pub enum Transport {
+    /// io_uring where the kernel offers it, Linux AIO where it offers only that, and blocking calls elsewhere.
+    #[default]
+    Automatic,
+    /// Positioned reads and writes that block the polling thread, which every platform has.
+    Blocking,
+    /// io_uring on unbuffered files, refused where the kernel creates no ring.
+    LinuxUring,
+    /// Linux AIO on unbuffered files.
+    LinuxAio,
+    /// SPDK's user-space driver on NVMe devices the process owns.
+    LinuxSpdk,
 }
 
-/// What a database opens as: where it keeps its data, and what its transactions promise.
+/// A directory the data files may occupy, with the bytes they may take there.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
-#[non_exhaustive]
-pub struct Configuration<'text> {
-    /// The directory holding the data, which must exist; an empty one keeps the database in memory.
-    pub directory: &'text str,
-    /// The isolation the transactions of this database run at.
+pub struct DataDirectory<'path> {
+    /// The directory, which must exist.
+    pub path: &'path str,
+    /// Bytes the files may take there: zero is unlimited on RocksDB and the default volume size on NVMe.
+    pub max_bytes: u64,
+}
+
+/// What [`Database::open_ram`] opens: in memory alone, or persisted as one image in a directory.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+pub struct RAMOptions<'path> {
+    /// The directory the image persists in, which must exist, or `None` to keep the database in memory.
+    pub directory: Option<&'path str>,
+    /// How transactions see each other.
     pub isolation: Isolation,
 }
 
-impl<'text> Configuration<'text> {
-    /// A database that lives in memory and persists nothing.
-    pub fn in_memory() -> Self {
-        Configuration {
-            directory: "",
-            isolation: Isolation::StrictSerializable,
+impl<'path> RAMOptions<'path> {
+    /// A database persisted as one image in an existing directory.
+    pub fn at(directory: &'path str) -> Self {
+        RAMOptions {
+            directory: Some(directory),
+            ..RAMOptions::default()
         }
-    }
-
-    /// A database whose data lives in an existing directory.
-    pub fn at(directory: &'text str) -> Self {
-        Configuration {
-            directory,
-            isolation: Isolation::StrictSerializable,
-        }
-    }
-
-    /// The same configuration at another isolation.
-    pub fn with_isolation(self, isolation: Isolation) -> Self {
-        Configuration { isolation, ..self }
-    }
-
-    /// The JSON the C ABI takes, which is the one allocation opening a database forces.
-    fn to_json(self) -> Result<CString> {
-        let mut text = String::from("{\"isolation\":\"");
-        text.push_str(self.isolation.name());
-        text.push('"');
-        if !self.directory.is_empty() {
-            text.push_str(",\"directory\":\"");
-            for character in self.directory.chars() {
-                match character {
-                    '"' | '\\' => {
-                        text.push('\\');
-                        text.push(character);
-                    }
-                    control if control.is_control() => {
-                        return Err(fail(Status::Malformed, "the directory holds a control character"))
-                    }
-                    plain => text.push(plain),
-                }
-            }
-            text.push('"');
-        }
-        text.push('}');
-        CString::new(text).map_err(|_| fail(Status::Malformed, "the directory holds a null character"))
     }
 }
 
-// endregion: Configuration
+/// What [`Database::open_rocksdb`] opens.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+pub struct RocksDBOptions<'path> {
+    /// The database's directory, which must exist.
+    pub directory: &'path str,
+    /// Directories the table files fill in order, or none to keep them in `directory`.
+    pub data_directories: &'path [DataDirectory<'path>],
+}
+
+impl<'path> RocksDBOptions<'path> {
+    /// A database in an existing directory.
+    pub fn at(directory: &'path str) -> Self {
+        RocksDBOptions {
+            directory,
+            ..RocksDBOptions::default()
+        }
+    }
+}
+
+/// What [`Database::open_leveldb`] opens.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+pub struct LevelDBOptions<'path> {
+    /// The database's directory, which must exist.
+    pub directory: &'path str,
+}
+
+impl<'path> LevelDBOptions<'path> {
+    /// A database in an existing directory.
+    pub fn at(directory: &'path str) -> Self {
+        LevelDBOptions { directory }
+    }
+}
+
+/// What [`Database::open_nvme`] opens, where every zero size or count keeps the engine's default.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+pub struct NVMEOptions<'path> {
+    /// The directory of the database's own files.
+    pub directory: &'path str,
+    /// Directories the volumes fill, or none for one volume inside `directory`.
+    pub data_directories: &'path [DataDirectory<'path>],
+    /// How bytes move between the files and memory.
+    pub transport: Transport,
+    /// Bytes of host memory the engine may pin and cache.
+    pub memory_limit: u64,
+    /// Background threads, derived from the cores by default.
+    pub threads: u64,
+    /// CUDA devices compaction may run on.
+    pub gpu_devices: &'path [i32],
+    /// Bytes of device memory compaction may take on each of `gpu_devices`.
+    pub gpu_memory_limit: u64,
+    /// I/O channels the threads share beyond their own.
+    pub shared_io_channels: u64,
+    /// Submissions a channel keeps in flight.
+    pub queue_depth: u64,
+    /// Bytes of each request buffer of a channel.
+    pub request_buffer_bytes: u64,
+    /// Request buffers of each channel.
+    pub request_buffers_count: u64,
+    /// Bytes of each streaming buffer of a channel.
+    pub stream_buffer_bytes: u64,
+    /// Streaming buffers of each channel.
+    pub stream_buffers_count: u64,
+    /// Bytes a transaction may buffer before it must commit.
+    pub transaction_max_bytes: u64,
+    /// Writes a transaction may buffer before it must commit.
+    pub transaction_max_elements: u64,
+    /// Operations that may run on one collection at once.
+    pub collection_concurrency_limit: u64,
+    /// Bytes of values each collection may cache.
+    pub collection_cache_limit: u64,
+    /// Bytes each collection buffers before it flushes a sorted run.
+    pub collection_write_buffer_max_bytes: u64,
+    /// Writes each collection buffers before it flushes a sorted run.
+    pub collection_write_buffer_max_elements: u64,
+    /// Bytes the first level of each collection holds before it compacts into the next.
+    pub collection_first_level_max_bytes: u64,
+    /// How many times larger each level of a collection is than the one above it.
+    pub collection_level_enlarge_factor: u64,
+    /// Bytes of every value of a collection whose values share one size, or zero for varying sizes.
+    pub collection_value_size: u64,
+    /// Bytes of the largest value of a collection whose values vary in size.
+    pub collection_value_max_size: u64,
+}
+
+impl<'path> NVMEOptions<'path> {
+    /// A database in a directory, with every default.
+    pub fn at(directory: &'path str) -> Self {
+        NVMEOptions {
+            directory,
+            ..NVMEOptions::default()
+        }
+    }
+}
+
+/// The null-terminated copy of `path` the C ABI borrows.
+fn c_path(path: &str) -> Result<CString> {
+    CString::new(path).map_err(|_| fail(Status::Malformed, "a path holds a null character"))
+}
+
+/// The C view of `directories`, pointing into the null-terminated paths returned beside it.
+fn c_data_directories(directories: &[DataDirectory<'_>]) -> Result<(Vec<CString>, Vec<ffi::ustore_data_directory_t>)> {
+    let paths = directories
+        .iter()
+        .map(|directory| c_path(directory.path))
+        .collect::<Result<Vec<_>>>()?;
+    let entries = paths
+        .iter()
+        .zip(directories)
+        .map(|(path, directory)| ffi::ustore_data_directory_t {
+            path: path.as_ptr(),
+            max_bytes: directory.max_bytes,
+        })
+        .collect();
+    Ok((paths, entries))
+}
+
+// endregion: Options
 
 // region: Databases
 
-/// What an engine supports, as `ustore_get_metadata` reports it.
+/// What an engine supports, as `ustore_database_capabilities` reports it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub struct Metadata {
+pub struct Capabilities {
     bits: ffi::ustore_enum_t,
 }
 
-impl Metadata {
+impl Capabilities {
     /// Whether the engine supports transactions.
     pub fn supports_transactions(self) -> bool {
         self.bits & ffi::USTORE_SUPPORTS_TRANSACTIONS_K != 0
@@ -642,18 +802,106 @@ unsafe impl Send for Database {}
 unsafe impl Sync for Database {}
 
 impl Database {
-    /// Opens an embedded database, in memory or in the directory the configuration names.
-    pub fn open(configuration: Configuration<'_>) -> Result<Self> {
-        let config = configuration.to_json()?;
+    /// Opens the in-memory engine, which persists as one image when the options name a directory.
+    pub fn open_ram(options: &RAMOptions<'_>) -> Result<Self> {
+        let directory = options.directory.map(c_path).transpose()?;
         let mut handle: ffi::ustore_database_t = ptr::null_mut();
         let mut error = ffi::ustore_error_t::default();
-        let mut arguments = ffi::ustore_database_init_t {
-            config: config.as_ptr(),
+        let mut arguments = ffi::ustore_database_init_ram_t {
             db: &mut handle,
             error: &mut error,
+            directory: directory.as_ref().map_or(ptr::null(), |path| path.as_ptr()),
+            isolation: match options.isolation {
+                Isolation::StrictSerializable => ffi::USTORE_ISOLATION_STRICT_SERIALIZABLE_K,
+                Isolation::Snapshot => ffi::USTORE_ISOLATION_SNAPSHOT_K,
+            },
         };
-        // SAFETY: every pointer in `arguments` outlives the call, and the config stays alive with it.
-        unsafe { ffi::ustore_database_init(&mut arguments) };
+        // SAFETY: every pointer in `arguments` outlives the call, the directory included.
+        unsafe { ffi::ustore_database_init_ram(&mut arguments) };
+        Database::opened(handle, error)
+    }
+
+    /// Opens the RocksDB engine, or fails with [`Status::Unsupported`] in a build without it.
+    pub fn open_rocksdb(options: &RocksDBOptions<'_>) -> Result<Self> {
+        let directory = c_path(options.directory)?;
+        let (_paths, data_directories) = c_data_directories(options.data_directories)?;
+        let mut handle: ffi::ustore_database_t = ptr::null_mut();
+        let mut error = ffi::ustore_error_t::default();
+        let mut arguments = ffi::ustore_database_init_rocksdb_t {
+            db: &mut handle,
+            error: &mut error,
+            directory: directory.as_ptr(),
+            data_directories: data_directories.as_ptr(),
+            data_directories_count: data_directories.len() as ffi::ustore_size_t,
+        };
+        // SAFETY: every pointer in `arguments` outlives the call, the paths included.
+        unsafe { ffi::ustore_database_init_rocksdb(&mut arguments) };
+        Database::opened(handle, error)
+    }
+
+    /// Opens the LevelDB engine, or fails with [`Status::Unsupported`] in a build without it.
+    pub fn open_leveldb(options: &LevelDBOptions<'_>) -> Result<Self> {
+        let directory = c_path(options.directory)?;
+        let mut handle: ffi::ustore_database_t = ptr::null_mut();
+        let mut error = ffi::ustore_error_t::default();
+        let mut arguments = ffi::ustore_database_init_leveldb_t {
+            db: &mut handle,
+            error: &mut error,
+            directory: directory.as_ptr(),
+        };
+        // SAFETY: every pointer in `arguments` outlives the call, the directory included.
+        unsafe { ffi::ustore_database_init_leveldb(&mut arguments) };
+        Database::opened(handle, error)
+    }
+
+    /// Opens the NVMe engine, or fails with [`Status::Unsupported`] in a build without it.
+    pub fn open_nvme(options: &NVMEOptions<'_>) -> Result<Self> {
+        let directory = c_path(options.directory)?;
+        let (_paths, data_directories) = c_data_directories(options.data_directories)?;
+        let mut handle: ffi::ustore_database_t = ptr::null_mut();
+        let mut error = ffi::ustore_error_t::default();
+        let mut arguments = ffi::ustore_database_init_nvme_t {
+            db: &mut handle,
+            error: &mut error,
+            directory: directory.as_ptr(),
+            data_directories: data_directories.as_ptr(),
+            data_directories_count: data_directories.len() as ffi::ustore_size_t,
+            transport: match options.transport {
+                Transport::Automatic => ffi::USTORE_TRANSPORT_AUTOMATIC_K,
+                Transport::Blocking => ffi::USTORE_TRANSPORT_BLOCKING_K,
+                Transport::LinuxUring => ffi::USTORE_TRANSPORT_LINUX_URING_K,
+                Transport::LinuxAio => ffi::USTORE_TRANSPORT_LINUX_AIO_K,
+                Transport::LinuxSpdk => ffi::USTORE_TRANSPORT_LINUX_SPDK_K,
+            },
+            memory_limit: options.memory_limit,
+            threads: options.threads,
+            gpu_devices: options.gpu_devices.as_ptr(),
+            gpu_devices_count: options.gpu_devices.len() as ffi::ustore_size_t,
+            gpu_memory_limit: options.gpu_memory_limit,
+            shared_io_channels: options.shared_io_channels,
+            queue_depth: options.queue_depth,
+            request_buffer_bytes: options.request_buffer_bytes,
+            request_buffers_count: options.request_buffers_count,
+            stream_buffer_bytes: options.stream_buffer_bytes,
+            stream_buffers_count: options.stream_buffers_count,
+            transaction_max_bytes: options.transaction_max_bytes,
+            transaction_max_elements: options.transaction_max_elements,
+            collection_concurrency_limit: options.collection_concurrency_limit,
+            collection_cache_limit: options.collection_cache_limit,
+            collection_write_buffer_max_bytes: options.collection_write_buffer_max_bytes,
+            collection_write_buffer_max_elements: options.collection_write_buffer_max_elements,
+            collection_first_level_max_bytes: options.collection_first_level_max_bytes,
+            collection_level_enlarge_factor: options.collection_level_enlarge_factor,
+            collection_value_size: options.collection_value_size,
+            collection_value_max_size: options.collection_value_max_size,
+        };
+        // SAFETY: every pointer in `arguments` outlives the call, the paths and devices included.
+        unsafe { ffi::ustore_database_init_nvme(&mut arguments) };
+        Database::opened(handle, error)
+    }
+
+    /// The database an init call opened, or the error it reported.
+    fn opened(handle: ffi::ustore_database_t, error: ffi::ustore_error_t) -> Result<Self> {
         check(error)?;
         match handle.is_null() {
             true => Err(fail(Status::Internal, "the library returned no database and no error")),
@@ -662,18 +910,18 @@ impl Database {
     }
 
     /// What the engine behind this database supports.
-    pub fn metadata(&self) -> Result<Metadata> {
+    pub fn capabilities(&self) -> Result<Capabilities> {
         let mut bits: ffi::ustore_enum_t = 0;
         let mut error = ffi::ustore_error_t::default();
-        let mut arguments = ffi::ustore_get_metadata_t {
+        let mut arguments = ffi::ustore_database_capabilities_t {
             db: self.handle,
             error: &mut error,
-            metadata: &mut bits,
+            capabilities: &mut bits,
         };
         // SAFETY: every pointer in `arguments` outlives the call.
-        unsafe { ffi::ustore_get_metadata(&mut arguments) };
+        unsafe { ffi::ustore_database_capabilities(&mut arguments) };
         check(error)?;
-        Ok(Metadata { bits })
+        Ok(Capabilities { bits })
     }
 
     /// Sends a free-form request to the engine - "clear", "reset", "compact", "info" or "usage" -
@@ -1062,11 +1310,11 @@ mod tests {
 
     #[test]
     fn databases_open_in_memory_and_report_their_engine() {
-        let database = Database::open(Configuration::in_memory()).unwrap();
-        let metadata = database.metadata().unwrap();
-        assert!(metadata.supports_transactions());
-        assert!(metadata.supports_collections());
-        assert!(metadata.supports_snapshots());
+        let database = Database::open_ram(&RAMOptions::default()).unwrap();
+        let capabilities = database.capabilities().unwrap();
+        assert!(capabilities.supports_transactions());
+        assert!(capabilities.supports_collections());
+        assert!(capabilities.supports_snapshots());
 
         let mut arena = Arena::new();
         let described = database.control(&mut arena, "info").unwrap();
@@ -1076,10 +1324,10 @@ mod tests {
     #[test]
     fn databases_open_at_a_directory_and_keep_what_they_held() {
         let directory = temporary_directory("database_reopens");
-        let configuration = Configuration::at(directory.path());
+        let options = RAMOptions::at(directory.path());
         let mut arena = Arena::new();
 
-        let database = Database::open(configuration).unwrap();
+        let database = Database::open_ram(&options).unwrap();
         let entries = [crate::blobs::Entry::new(7, b"alpha").unwrap()];
         database
             .head()
@@ -1087,51 +1335,73 @@ mod tests {
             .unwrap();
         drop(database);
 
-        let reopened = Database::open(configuration).unwrap();
+        let reopened = Database::open_ram(&options).unwrap();
         let values = reopened.head().read(&mut arena, Collection::main(), &[7]).unwrap();
         assert_eq!(values.get(0), Some(b"alpha".as_slice()));
     }
 
     #[test]
     fn databases_refuse_a_directory_that_is_not_there() {
-        let failure = Database::open(Configuration::at("/nonexistent/ustore/directory")).unwrap_err();
+        let failure = Database::open_ram(&RAMOptions::at("/nonexistent/ustore/directory")).unwrap_err();
         assert_eq!(failure.status, Status::NotFound);
-    }
-
-    #[test]
-    fn configurations_escape_what_they_carry() {
-        let quoted = Configuration::at("/tmp/say \"hello\"\\now").to_json().unwrap();
-        assert_eq!(
-            quoted.to_str().unwrap(),
-            "{\"isolation\":\"strict_serializable\",\"directory\":\"/tmp/say \\\"hello\\\"\\\\now\"}"
-        );
-        assert_eq!(
-            Configuration::in_memory()
-                .with_isolation(Isolation::Snapshot)
-                .to_json()
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            "{\"isolation\":\"snapshot\"}"
-        );
-        // A path the JSON cannot carry is refused rather than smuggled through.
-        assert_eq!(
-            Configuration::at("/tmp/a\nb").to_json().unwrap_err().status,
-            Status::Malformed
-        );
+        let failure = Database::open_ram(&RAMOptions::at("/tmp/a\0b")).unwrap_err();
+        assert_eq!(failure.status, Status::Malformed);
     }
 
     #[test]
     fn databases_open_at_either_isolation() {
         for isolation in [Isolation::StrictSerializable, Isolation::Snapshot] {
-            let database = Database::open(Configuration::in_memory().with_isolation(isolation)).unwrap();
-            assert!(database.metadata().unwrap().supports_transactions());
+            let options = RAMOptions {
+                isolation,
+                ..RAMOptions::default()
+            };
+            assert!(Database::open_ram(&options)
+                .unwrap()
+                .capabilities()
+                .unwrap()
+                .supports_transactions());
+        }
+    }
+
+    #[test]
+    fn databases_open_on_every_engine_or_report_it_missing() {
+        let rocksdb = temporary_directory("database_rocksdb");
+        let leveldb = temporary_directory("database_leveldb");
+        let nvme = temporary_directory("database_nvme");
+        let opened = [
+            (
+                Database::open_rocksdb(&RocksDBOptions::at(rocksdb.path())),
+                cfg!(feature = "rocksdb"),
+            ),
+            (
+                Database::open_leveldb(&LevelDBOptions::at(leveldb.path())),
+                cfg!(feature = "leveldb"),
+            ),
+            (
+                Database::open_nvme(&NVMEOptions::at(nvme.path())),
+                cfg!(feature = "nvme"),
+            ),
+        ];
+        let mut arena = Arena::new();
+        for (database, compiled) in opened {
+            if !compiled {
+                assert_eq!(database.unwrap_err().status, Status::Unsupported);
+                continue;
+            }
+            let database = database.unwrap();
+            let entries = [crate::blobs::Entry::new(7, b"alpha").unwrap()];
+            database
+                .head()
+                .write(&mut arena, Collection::main(), &entries, Durability::Flushed)
+                .unwrap();
+            let values = database.head().read(&mut arena, Collection::main(), &[7]).unwrap();
+            assert_eq!(values.get(0), Some(b"alpha".as_slice()));
         }
     }
 
     #[test]
     fn engines_refuse_a_request_they_do_not_know() {
-        let database = Database::open(Configuration::in_memory()).unwrap();
+        let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
         let failure = database.control(&mut arena, "levitate").unwrap_err();
         assert_eq!(failure.status, Status::InvalidArgument);
@@ -1140,7 +1410,7 @@ mod tests {
 
     #[test]
     fn collections_are_created_listed_and_dropped_by_name() {
-        let database = Database::open(Configuration::in_memory()).unwrap();
+        let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
 
         let people = database.create_collection(&mut arena, "people").unwrap();
@@ -1172,7 +1442,7 @@ mod tests {
 
     #[test]
     fn the_main_collection_clears_but_never_drops() {
-        let database = Database::open(Configuration::in_memory()).unwrap();
+        let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
         let entries = [crate::blobs::Entry::new(1, b"alpha").unwrap()];
         database
@@ -1192,7 +1462,7 @@ mod tests {
 
     #[test]
     fn transactions_commit_what_they_wrote() {
-        let database = Database::open(Configuration::in_memory()).unwrap();
+        let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
         let mut transaction = database.transaction().unwrap();
         let entries = [crate::blobs::Entry::new(1, b"alpha").unwrap()];
@@ -1215,7 +1485,7 @@ mod tests {
 
     #[test]
     fn transactions_roll_back_and_run_again() {
-        let database = Database::open(Configuration::in_memory()).unwrap();
+        let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
         let mut transaction = database.transaction().unwrap();
         let abandoned = [crate::blobs::Entry::new(2, b"abandoned").unwrap()];
@@ -1238,7 +1508,7 @@ mod tests {
 
     #[test]
     fn transactions_refuse_a_flush_of_their_own() {
-        let database = Database::open(Configuration::in_memory()).unwrap();
+        let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
         let transaction = database.transaction().unwrap();
         let entries = [crate::blobs::Entry::new(3, b"alpha").unwrap()];
@@ -1251,7 +1521,7 @@ mod tests {
 
     #[test]
     fn transactions_conflict_rather_than_block() {
-        let database = Database::open(Configuration::in_memory()).unwrap();
+        let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
         let mut first = database.transaction().unwrap();
         let mut second = database.transaction().unwrap();
@@ -1281,7 +1551,11 @@ mod tests {
     #[test]
     fn an_unwatched_view_records_nothing_to_conflict_over() {
         // Only snapshot isolation adds a watch of its own; a strictly serializable read is ordered anyway.
-        let database = Database::open(Configuration::in_memory().with_isolation(Isolation::Snapshot)).unwrap();
+        let database = Database::open_ram(&RAMOptions {
+            isolation: Isolation::Snapshot,
+            ..RAMOptions::default()
+        })
+        .unwrap();
         let mut arena = Arena::new();
         let seed = [crate::blobs::Entry::new(8, b"seed").unwrap()];
         database
@@ -1324,7 +1598,7 @@ mod tests {
 
     #[test]
     fn snapshots_hold_the_state_they_were_taken_at() {
-        let database = Database::open(Configuration::in_memory()).unwrap();
+        let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
         let before = [crate::blobs::Entry::new(5, b"before").unwrap()];
         database
@@ -1354,7 +1628,7 @@ mod tests {
 
     #[test]
     fn snapshots_export_a_database_of_their_own() {
-        let database = Database::open(Configuration::in_memory()).unwrap();
+        let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
         let entries = [crate::blobs::Entry::new(6, b"exported").unwrap()];
         database
@@ -1370,7 +1644,7 @@ mod tests {
             Status::NotFound
         );
 
-        let exported = Database::open(Configuration::at(directory.path())).unwrap();
+        let exported = Database::open_ram(&RAMOptions::at(directory.path())).unwrap();
         let values = exported.head().read(&mut arena, Collection::main(), &[6]).unwrap();
         assert_eq!(values.get(0), Some(b"exported".as_slice()));
     }

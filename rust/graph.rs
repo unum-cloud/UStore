@@ -6,9 +6,9 @@
 //! edges without a copy.
 //!
 //! ```no_run
-//! use ustore::{Arena, Configuration, Database, Durability, Edge, Role, Roles};
+//! use ustore::{Arena, RAMOptions, Database, Durability, Edge, Role, Roles};
 //!
-//! let database = Database::open(Configuration::in_memory())?;
+//! let database = Database::open_ram(&RAMOptions::default())?;
 //! let mut arena = Arena::new();
 //! let follows = database.create_collection(&mut arena, "follows")?;
 //!
@@ -25,9 +25,9 @@
 //! they are still read:
 //!
 //! ```compile_fail
-//! use ustore::{Arena, Collection, Configuration, Database, Durability, Edge, Role, Roles};
+//! use ustore::{Arena, Collection, RAMOptions, Database, Durability, Edge, Role, Roles};
 //!
-//! let database = Database::open(Configuration::in_memory())?;
+//! let database = Database::open_ram(&RAMOptions::default())?;
 //! let mut arena = Arena::new();
 //! let found = database.head().find_edges(&mut arena, Collection::main(), &[1], Roles::Every(Role::Any))?;
 //! database.head().remove_edges(&mut arena, Collection::main(), found.edges(), Durability::Buffered)?;
@@ -493,11 +493,11 @@ impl View<'_> {
 mod tests {
     use super::*;
     use crate::blobs::Entry;
-    use crate::db::{Collection, Collections, Configuration, Conflicts, Database};
+    use crate::db::{Collection, Collections, Conflicts, Database, RAMOptions};
 
     /// A directed graph of one to two, one to three and two to three, in a collection of its own.
     fn populated() -> (Database, Arena, Collection) {
-        let database = Database::open(Configuration::in_memory()).unwrap();
+        let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
         let graph = database.create_collection(&mut arena, "graph").unwrap();
         let edges = [Edge::new(1, 2), Edge::new(1, 3), Edge::new(2, 3)];
@@ -584,7 +584,7 @@ mod tests {
 
     #[test]
     fn identifiers_tell_parallel_edges_apart() {
-        let database = Database::open(Configuration::in_memory()).unwrap();
+        let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
         let graph = Collection::main();
         let edges = [
@@ -714,7 +714,7 @@ mod tests {
 
     #[test]
     fn a_vertex_that_is_not_a_graph_value_is_refused() {
-        let database = Database::open(Configuration::in_memory()).unwrap();
+        let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
         let blobs = [
             Entry::new(1, b"abc").unwrap(),
@@ -745,7 +745,7 @@ mod tests {
 
     #[test]
     fn one_batch_spans_several_graph_collections() {
-        let database = Database::open(Configuration::in_memory()).unwrap();
+        let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
         let follows = database.create_collection(&mut arena, "follows").unwrap();
         let blocks = database.create_collection(&mut arena, "blocks").unwrap();

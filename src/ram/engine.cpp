@@ -1701,13 +1701,13 @@ database_t* make_database(std::string_view directory, ustore_error_t* error) noe
     return error->status ? nullptr : database.release();
 }
 
-void get_metadata(ustore_get_metadata_t& arguments) noexcept {
-    if (!arguments.metadata) {
-        *arguments.error = {ustore_error_invalid_argument_k, "Need an output for the metadata"};
+void database_capabilities(ustore_database_capabilities_t& arguments) noexcept {
+    if (!arguments.capabilities) {
+        *arguments.error = {ustore_error_invalid_argument_k, "Need an output for the capabilities"};
         return;
     }
-    *arguments.metadata = ustore_metadata_t(ustore_supports_transactions_k | ustore_supports_collections_k |
-                                            ustore_supports_snapshots_k);
+    *arguments.capabilities = ustore_capabilities_t(ustore_supports_transactions_k | ustore_supports_collections_k |
+                                                    ustore_supports_snapshots_k);
 }
 
 void transaction_free(ustore_transaction_t transaction) noexcept {
@@ -1723,7 +1723,7 @@ void database_free(ustore_database_t database) noexcept {
 }
 
 engine_t const engine_k {
-    .get_metadata = &get_metadata,
+    .database_capabilities = &database_capabilities,
     .database_control = &serve_database<ustore_database_control_t>,
     .snapshot_list = &serve_database<ustore_snapshot_list_t>,
     .snapshot_create = &serve_database<ustore_snapshot_create_t>,

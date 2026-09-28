@@ -37,20 +37,38 @@ static struct {
     {NULL, &SpanType},
 };
 
-static char const doc_engines_compiled[] =                                               //
-    "engines_compiled() answers the engines this build carries as a tuple of strings.\n" //
-    "\n"                                                                                 //
-    "Every engine library defines the same symbols, so one of them links into the\n"     //
-    "extension and the tuple names it.";
+static char const doc_engines_compiled[] =                         //
+    "engines_compiled() answers the engines this build carries.\n" //
+    "\n"                                                           //
+    "Returns:\n"                                                   //
+    "  tuple[str, ...]: Some of 'ram', 'rocksdb', 'leveldb' and 'nvme', in that order.";
+
+/** The engines this build carries, in the order @c engines_compiled answers them. */
+static char const* const engines_compiled[] = {
+    "ram",
+#if USTORE_WITH_ROCKSDB
+    "rocksdb",
+#endif
+#if USTORE_WITH_LEVELDB
+    "leveldb",
+#endif
+#if USTORE_WITH_NVME
+    "nvme",
+#endif
+};
 
 static PyObject* api_engines_compiled(PyObject* Py_UNUSED(module), PyObject* Py_UNUSED(arguments)) {
-    PyObject* const joined = PyUnicode_FromString(USTORE_ENGINES);
-    PyObject* const separator = PyUnicode_FromString(",");
-    PyObject* const names = joined && separator ? PyUnicode_Split(joined, separator, -1) : NULL;
-    PyObject* const engines = names ? PyList_AsTuple(names) : NULL;
-    Py_XDECREF(names);
-    Py_XDECREF(separator);
-    Py_XDECREF(joined);
+    size_t const engines_count = ustore_py_table_size_(engines_compiled);
+    PyObject* const engines = PyTuple_New((Py_ssize_t)engines_count);
+    if (!engines) return NULL;
+    for (size_t index = 0; index != engines_count; ++index) {
+        PyObject* const name = PyUnicode_FromString(engines_compiled[index]);
+        if (!name) {
+            Py_DECREF(engines);
+            return NULL;
+        }
+        PyTuple_SET_ITEM(engines, (Py_ssize_t)index, name);
+    }
     return engines;
 }
 

@@ -1,28 +1,23 @@
 """The options a verb takes as keywords, chiefly the watch one call keeps or drops inside a transaction."""
 
 import pytest
-from capabilities import ISOLATIONS, NEEDS_SNAPSHOTS, NEEDS_TRANSACTIONS
+from capabilities import NEEDS_SNAPSHOTS, NEEDS_TRANSACTIONS
 
 import ustore
 
 pytestmark = NEEDS_TRANSACTIONS
 
 
-@pytest.fixture(params=ISOLATIONS, ids=lambda isolation: isolation or "default")
-def isolation(request: pytest.FixtureRequest) -> str | None:
-    return request.param
-
-
 @pytest.fixture
 def database(open_database, isolation: str | None) -> ustore.Database:
-    """A database at one of the isolation levels the engine can be opened at."""
+    """A database at one of the isolation levels the engine can be opened at, or the one it has."""
     return open_database(isolation)
 
 
 def read_conflicts(isolation: str | None, watch: bool) -> bool:
     """Whether a transaction's read fails its commit once a concurrent writer touches the key."""
     # Strict serializability records every read; weaker levels record only what a call watches.
-    return watch or isolation == "strict_serializable"
+    return watch or isolation == "strict-serializable"
 
 
 # region Watching

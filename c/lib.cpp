@@ -53,7 +53,9 @@ void route(arguments_type_* arguments, void (*engine_t::*call)(arguments_type_&)
 
 using namespace unum::ustore;
 
-void ustore_get_metadata(ustore_get_metadata_t* arguments) { route(arguments, &engine_t::get_metadata); }
+void ustore_database_capabilities(ustore_database_capabilities_t* arguments) {
+    route(arguments, &engine_t::database_capabilities);
+}
 void ustore_database_control(ustore_database_control_t* arguments) { route(arguments, &engine_t::database_control); }
 void ustore_snapshot_list(ustore_snapshot_list_t* arguments) { route(arguments, &engine_t::snapshot_list); }
 void ustore_snapshot_create(ustore_snapshot_create_t* arguments) { route(arguments, &engine_t::snapshot_create); }

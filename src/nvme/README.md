@@ -82,7 +82,7 @@ Commits are ordered by the stamps the registry issues, which keeps a transaction
 ## The C ABI
 
 `engine.cpp` implements `include/ustore/db.h` and `include/ustore/blobs.h` over one `database`, and `c/docs.cpp`, `c/graph.cpp` and `c/strings.cpp` layer the other modalities on top of it, exactly as they do for every other engine.
-`USTORE_BUILD_NVME` registers the engine as `ustore_embedded_nvme` and adds `nvme` to the per-engine test and benchmark loops.
+`USTORE_BUILD_NVME` adds the engine to the `ustore` library and `nvme` to the engines every suite runs with `--engine`.
 
 - A configuration names a directory, which becomes the metadata directory; a data directory it does not name defaults to `data` beneath it, and a capacity it does not name defaults to one gibibyte, since a volume file is preallocated.
 - `ustore_collection_main_k` is zero and `ustore_collection_names_k` is one below the largest identifier; both resolve to reserved collections the first mount creates, neither can be dropped rather than cleared, and every other identifier is the number the catalog gave the collection.

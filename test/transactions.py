@@ -1,7 +1,7 @@
 """Transactions over the C ABI: commits, rollbacks, conflicts and staging, at every isolation the engine offers."""
 
 import pytest
-from capabilities import ISOLATIONS, NEEDS_TRANSACTIONS
+from capabilities import NEEDS_TRANSACTIONS
 
 import ustore
 
@@ -10,21 +10,16 @@ pytestmark = NEEDS_TRANSACTIONS
 BATCH_SIZES = [1, 17, 100]
 
 
-@pytest.fixture(params=ISOLATIONS, ids=lambda isolation: isolation or "default")
-def isolation(request: pytest.FixtureRequest) -> str | None:
-    return request.param
-
-
 @pytest.fixture
 def database(open_database, isolation: str | None) -> ustore.Database:
-    """A database at one of the isolation levels the engine can be opened at."""
+    """A database at one of the isolation levels the engine can be opened at, or the one it has."""
     return open_database(isolation)
 
 
 def read_conflicts(isolation: str | None, watch: bool) -> bool:
     """Whether a transaction's read fails its commit once a concurrent writer touches the key."""
     # Strict serializability records every read; weaker levels record only what a transaction watches.
-    return watch or isolation == "strict_serializable"
+    return watch or isolation == "strict-serializable"
 
 
 # region Publishing

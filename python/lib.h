@@ -151,7 +151,7 @@ typedef struct Database {
     ustore_py_arena_pool_t arenas;
 
     /** What the engine supports, read once at open. */
-    ustore_metadata_t metadata;
+    ustore_capabilities_t capabilities;
 
     /** Transactions still holding this database, which must reach zero before it closes. */
     Py_ssize_t transactions;

@@ -169,6 +169,7 @@ def timed(name: str, run: Callable[[], Any]) -> Any:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--dataset", type=Path, help="SNAP edge list; a planted partition is generated without it")
+    parser.add_argument("--engine", choices=ustore.engines_compiled(), default="ram", help="engine to open")
     parser.add_argument("--directory", type=Path, help="directory the UStore graph persists in; in memory otherwise")
     parser.add_argument("--vertices", type=int, default=1000, help="vertices of the generated graph")
     parser.add_argument("--communities", type=int, default=10, help="communities of the generated graph")
@@ -185,7 +186,7 @@ def main() -> None:
     partition = timed("Python baseline over NetworkX", lambda: best_partition(reference))
     print(f"  {len(set(partition.values()))} communities", flush=True)
 
-    with ustore.Database(settings.directory) as database:
+    with getattr(ustore.Database, f"open_{settings.engine}")(settings.directory) as database:
         edges = numpy.array(reference.edges, dtype=numpy.int64).reshape(-1, 2)
         isolated = [node for node, degree in reference.degree if degree == 0]
         timed("UStore import", lambda: database.graph_upsert_edges(edges[:, 0].copy(), edges[:, 1].copy()))

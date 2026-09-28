@@ -12,7 +12,6 @@ Run:
 
 import argparse
 import json
-import os
 import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -34,8 +33,8 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--dataset", type=Path, required=True, help="directory of input files")
     parser.add_argument("--format", choices=["ndjson", "csv"], default="ndjson", help="format of inputs and exports")
-    parser.add_argument("--config", type=Path, help="JSON file configuring the database")
-    parser.add_argument("--directory", type=Path, required=True, help="exports, and the database without --config")
+    parser.add_argument("--engine", choices=ustore.engines_compiled(), default="ram", help="engine to open")
+    parser.add_argument("--directory", type=Path, required=True, help="directory of the exports and the database")
     parser.add_argument("--id-field", required=True, help="field holding each document's key")
     parser.add_argument("--source-field", required=True, help="integer field holding the source vertex")
     parser.add_argument("--target-field", required=True, help="integer field holding the target vertex")
@@ -181,8 +180,7 @@ def main() -> None:
     print(f"Found {len(files)} .{settings.format} files", flush=True)
     settings.directory.mkdir(parents=True, exist_ok=True)
 
-    config = settings.config.read_text() if settings.config else None
-    with ustore.Database(None if config else os.fspath(settings.directory), config=config) as database:
+    with getattr(ustore.Database, f"open_{settings.engine}")(settings.directory) as database:
         bench_docs_import(database, files, settings)
         bench_docs_export(database, settings)
         bench_graph_import(database, files, settings)

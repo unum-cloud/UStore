@@ -32,8 +32,8 @@ The `*.hpp` headers beside them wrap the same calls in C++ with RAII handles, ba
 
 ## Installation
 
-UStore builds with CMake, and a project links exactly one engine library: `ustore_embedded_ram`, `ustore_embedded_rocksdb`, `ustore_embedded_leveldb` or `ustore_embedded_nvme`.
-Each of them implements the whole C interface.
+UStore builds with CMake into one library, `ustore`, holding the in-memory engine and every engine the build enables through `USTORE_WITH_ROCKSDB`, `USTORE_WITH_LEVELDB` and `USTORE_BUILD_NVME`.
+Each engine is its own object of the archive, so a program links only the engines it opens.
 
 ```cmake
 FetchContent_Declare(
@@ -42,7 +42,7 @@ FetchContent_Declare(
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(ustore)
-target_link_libraries(your_target PRIVATE ustore_embedded_rocksdb)
+target_link_libraries(your_target PRIVATE ustore::ustore)
 ```
 
 ## C Interface
@@ -84,7 +84,7 @@ ustore_database_free(db);
 
 Each engine opens through its own call, `ustore_database_init_ram`, `_rocksdb`, `_leveldb` or `_nvme`, whose arguments hold what that engine can be asked, and a zero field keeps the engine's default.
 Every freeing function accepts `NULL`.
-`ustore_get_metadata` reports whether the engine supports transactions, collections and snapshots.
+`ustore_database_capabilities` reports whether the engine supports transactions, collections and snapshots.
 
 ### Collections
 

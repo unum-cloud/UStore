@@ -24,8 +24,10 @@
       "name": "C++: Test SmashTable",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/build_debug/build/bin/ustore_test_units_ram",
+      "program": "${workspaceFolder}/build_debug/build/bin/ustore_test_units",
       "args": [
+        "--engine",
+        "ram",
         "--directory",
         "${workspaceFolder}/build_debug/test_data"
       ],
@@ -47,8 +49,10 @@
       "name": "C++: Test LevelDB",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/build_debug/build/bin/ustore_test_units_leveldb",
+      "program": "${workspaceFolder}/build_debug/build/bin/ustore_test_units",
       "args": [
+        "--engine",
+        "leveldb",
         "--directory",
         "${workspaceFolder}/build_debug/test_data"
       ],
@@ -65,8 +69,10 @@
       "name": "C++: Test RocksDB",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/build_debug/build/bin/ustore_test_units_rocksdb",
+      "program": "${workspaceFolder}/build_debug/build/bin/ustore_test_units",
       "args": [
+        "--engine",
+        "rocksdb",
         "--directory",
         "${workspaceFolder}/build_debug/test_data"
       ],
@@ -83,8 +89,10 @@
       "name": "C++: Test NVMe",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/build_debug/build/bin/ustore_test_units_nvme",
+      "program": "${workspaceFolder}/build_debug/build/bin/ustore_test_units",
       "args": [
+        "--engine",
+        "nvme",
         "--directory",
         "${workspaceFolder}/build_debug/test_data"
       ],
@@ -101,8 +109,10 @@
       "name": "C++: Test SmashTable Stateless",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/build_debug/build/bin/ustore_test_units_ram",
+      "program": "${workspaceFolder}/build_debug/build/bin/ustore_test_units",
       "args": [
+        "--engine",
+        "ram",
         "--directory",
         "${workspaceFolder}/build_debug/test_data"
       ],
@@ -124,8 +134,10 @@
       "name": "C++: Stress Atomicity SmashTable",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/build_debug/build/bin/ustore_stress_atomicity_ram",
+      "program": "${workspaceFolder}/build_debug/build/bin/ustore_stress_atomicity",
       "args": [
+        "--engine",
+        "ram",
         "--directory",
         "${workspaceFolder}/build_debug/test_data"
       ],
@@ -147,8 +159,10 @@
       "name": "C++: Stress Atomicity RocksDB",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/build_debug/build/bin/ustore_stress_atomicity_rocksdb",
+      "program": "${workspaceFolder}/build_debug/build/bin/ustore_stress_atomicity",
       "args": [
+        "--engine",
+        "rocksdb",
         "--directory",
         "${workspaceFolder}/build_debug/test_data"
       ],
@@ -170,8 +184,10 @@
       "name": "C++: Stress Linearizability SmashTable",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/build_debug/build/bin/ustore_stress_linearizability_ram",
+      "program": "${workspaceFolder}/build_debug/build/bin/ustore_stress_linearizability",
       "args": [
+        "--engine",
+        "ram",
         "--directory",
         "${workspaceFolder}/build_debug/test_data"
       ],
@@ -193,8 +209,10 @@
       "name": "C++: Stress Linearizability RocksDB",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/build_debug/build/bin/ustore_stress_linearizability_rocksdb",
+      "program": "${workspaceFolder}/build_debug/build/bin/ustore_stress_linearizability",
       "args": [
+        "--engine",
+        "rocksdb",
         "--directory",
         "${workspaceFolder}/build_debug/test_data"
       ],
@@ -216,8 +234,8 @@
       "name": "C++: Benchmark SmashTable",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/build_debug/build/bin/ustore_bench_twitter_ram",
-      "args": [],
+      "program": "${workspaceFolder}/build_debug/build/bin/ustore_bench_twitter",
+      "args": ["--engine", "ram"],
       "cwd": "${workspaceFolder}",
       "environment": [],
       "showDisplayString": true,
@@ -231,8 +249,8 @@
       "name": "C++: Benchmark RocksDB",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/build_debug/build/bin/ustore_bench_twitter_rocksdb",
-      "args": [],
+      "program": "${workspaceFolder}/build_debug/build/bin/ustore_bench_twitter",
+      "args": ["--engine", "rocksdb"],
       "cwd": "${workspaceFolder}",
       "environment": [],
       "showDisplayString": true,
@@ -246,8 +264,8 @@
       "name": "C++: Benchmark NVMe",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/build_debug/build/bin/ustore_bench_twitter_nvme",
-      "args": [],
+      "program": "${workspaceFolder}/build_debug/build/bin/ustore_bench_twitter",
+      "args": ["--engine", "nvme"],
       "cwd": "${workspaceFolder}",
       "environment": [],
       "showDisplayString": true,
@@ -280,12 +298,14 @@
       "name": "C++: Test Tools",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/build_debug/build/bin/ustore_test_tools_ram",
+      "program": "${workspaceFolder}/build_debug/build/bin/ustore_test_tools",
       "args": [
+        "--engine",
+        "ram",
         "--directory",
         "${workspaceFolder}/build_debug/test_data",
         "--cli",
-        "${workspaceFolder}/build_debug/build/bin/ustore_cli_ram"
+        "${workspaceFolder}/build_debug/build/bin/ustore_cli"
       ],
       "cwd": "${workspaceFolder}",
       "environment": [
