@@ -24,7 +24,7 @@
 
 #include <smashtable/basic_vector.hpp>
 
-#include <ustore/ustore.hpp>
+#include "ustore/ustore.hpp"
 
 #include "executor.hpp" // `caller_exclusivity_t`, `executor_t`
 #include "test.hpp"     // `suite_exit_code`, `expect`, `expect_eq`
@@ -37,7 +37,7 @@ using namespace unum;
 struct linearizability_options_t {
 
     /** Wall-clock bound of the whole run, shared evenly by every configuration. */
-    std::chrono::nanoseconds duration = std::chrono::seconds {10};
+    std::chrono::nanoseconds time_limit = std::chrono::seconds {10};
 
     /** Most rounds, each ending at a replayed checkpoint, one configuration runs. */
     count_t checkpoints {.value = 1'000, .minimum = 1};
@@ -185,7 +185,8 @@ struct linearizability_run_t {
 }
 
 /** Sizes the buffers of @p run for its largest configuration and seeds one generator per thread. */
-[[nodiscard]] std::size_t prepare_run(linearizability_run_t& run, linearizability_options_t const& options) {
+[[nodiscard]] std::size_t prepare_run(linearizability_run_t& run, linearizability_options_t const& options,
+                                      test_random_t random) {
     std::size_t parts = 0;
     for (operations_mix_t const mix : mixes_k) parts = std::max(parts, mix.parts());
     std::size_t const threads_count = std::ranges::max(options.threads.view());
@@ -196,7 +197,8 @@ struct linearizability_run_t {
     failures += expect(st::succeeded(run.operations.resize(operations_count)));
     failures += expect(st::succeeded(run.latest.resize(keys_count)));
     failures += expect(st::succeeded(run.present_keys.resize(keys_count)));
-    for (writer_slot_t& slot : run.slots) slot.random_generator.seed(static_cast<std::uint32_t>(draw_seed()));
+    for (std::size_t index = 0; index != run.slots.size(); ++index)
+        run.slots[index].random_generator.seed(static_cast<std::uint32_t>(random.fork(index).next()));
     return failures;
 }
 
@@ -377,7 +379,7 @@ int main(int argc, char** argv) {
     suite_options_t suite;
     linearizability_options_t options;
     std::array<flag_t, 5> const flags {{
-        {"--duration", "duration", "bound of the whole run, like 10s", &options.duration},
+        {"--time-limit", "duration", "bound of the whole run, like 10s", &options.time_limit},
         {"--checkpoints", "count", "most replayed rounds per configuration", &options.checkpoints},
         {"--threads", "counts", "writing thread counts, like 2,4,8", &options.threads},
         {"--transactions", "counts", "transactions per thread between checkpoints, like 1,10,100",
@@ -404,13 +406,13 @@ int main(int argc, char** argv) {
         report(totals, "linear_writes", case_result_t::skipped("the engine does not support transactions"));
         return suite_exit_code(totals);
     }
-    if (std::size_t const failures = prepare_run(run, options); failures) {
+    if (std::size_t const failures = prepare_run(run, options, suite.random()); failures) {
         report(totals, "setup", failures);
         return suite_exit_code(totals);
     }
 
     std::size_t const configurations_count = options.threads.size * options.transactions.size * mixes_k.size();
-    std::chrono::nanoseconds const slice = options.duration / configurations_count;
+    std::chrono::nanoseconds const slice = options.time_limit / configurations_count;
     for (std::size_t const threads : options.threads.view())
         linear_writes_on_threads(totals, run, options, threads, slice);
     return suite_exit_code(totals);

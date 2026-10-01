@@ -20,9 +20,6 @@
 #include <array>        // `std::array`
 #include <chrono>       // `std::chrono::steady_clock`
 #include <filesystem>   // `std::filesystem::create_directories`, `std::filesystem::remove_all`
-#include <optional>     // `std::optional`
-#include <random>       // `std::random_device`
-#include <regex>        // `std::regex`, `std::regex_search`
 #include <span>         // `std::span`
 #include <string>       // `std::string`, what `std::filesystem::path::generic_string` answers
 #include <string_view>  // `std::string_view`
@@ -35,9 +32,9 @@
 #include <forkunion/capabilities.hpp> // `fu::preferred_yield_t`
 #include <smashtable/shared.hpp>
 
-#include <ustore/db.h>
-#include <ustore/status.hpp> // `status_t`, `status_code_t`, `expected`
-#include <ustore/types.hpp>
+#include "ustore/db.h"
+#include "ustore/status.hpp" // `status_t`, `status_code_t`, `expected`
+#include "ustore/types.hpp"
 
 #include "arguments.hpp"
 
@@ -69,6 +66,8 @@ struct fmt::formatter<ustore_collection_id_t> : fmt::formatter<ustore_uuid_t> {
 };
 
 namespace unum::ustore::test {
+
+using namespace tools;
 
 /** Counts one failure when the condition is false, printing it with its location. */
 #define expect(...) expect_((bool)(__VA_ARGS__), #__VA_ARGS__, __FILE__, __LINE__)
@@ -183,21 +182,14 @@ struct suite_totals_t {
     /** What a skip does to the exit code. */
     skip_policy_t policy = skip_policy_t::tolerated_k;
 
-    /** The @c --filter pattern a case label must match to run, empty to run every case. */
-    std::string_view filter;
-
-    /** The filter compiled once as an ECMAScript regex, or nothing when it does not compile. */
-    std::optional<std::regex> pattern;
+    /** The @c --filter a case label must match to run, empty to run every case. */
+    filter_t filter;
 
     /** The binary's @c argv[0], which turns a rerun line into a command. */
     char const* program = "";
 
     /** Whether the case labelled @p name runs: the filter searched as a regex, or found as a plain substring. */
-    [[nodiscard]] bool selects(std::string_view name) const noexcept {
-        if (filter.empty()) return true;
-        if (pattern) return std::regex_search(name.begin(), name.end(), *pattern);
-        return name.find(filter) != std::string_view::npos;
-    }
+    [[nodiscard]] bool selects(std::string_view name) const noexcept { return filter.selects(name); }
 };
 
 /**
@@ -248,8 +240,8 @@ std::size_t report(suite_totals_t& totals, char const* name, result_type_ (*case
     fmt::println("total {} passed, {} skipped, {} failed, seed {}", totals.passed, totals.skipped, totals.failed,
                  totals.seed);
     if (totals.failures != 0) return 1;
-    if (!totals.filter.empty() && totals.passed + totals.skipped + totals.failed == 0) {
-        fmt::println(stderr, "--filter '{}' matched no case, so nothing ran", totals.filter);
+    if (!totals.filter.text.empty() && totals.passed + totals.skipped + totals.failed == 0) {
+        fmt::println(stderr, "--filter '{}' matched no case, so nothing ran", totals.filter.text);
         return 1;
     }
     if (totals.skipped != 0 && totals.policy == skip_policy_t::refused_k) return 3;
@@ -354,13 +346,6 @@ class test_random_t {
     return offered != 0 ? offered : 1;
 }
 
-/** A non-zero seed from the machine, for a run that asked for none. */
-[[nodiscard]] inline std::uint64_t draw_seed() {
-    std::random_device device;
-    std::uint64_t const drawn = (static_cast<std::uint64_t>(device()) << 32) | device();
-    return drawn != 0 ? drawn : 1;
-}
-
 /** The flags every suite accepts, parsed from @c argv beside the suite's own. */
 struct suite_options_t {
 
@@ -379,8 +364,8 @@ struct suite_options_t {
     /** The engine an engine suite opens and the options of its init call. */
     engine_options_t engine;
 
-    /** The seed every random draw descends from, drawn from the machine when left zero. */
-    count_t seed;
+    /** The seed every random draw descends from. */
+    seed_t seed;
 
     /** Threads the concurrent cases fan out over. */
     count_t threads {hardware_threads(), 1};
@@ -389,7 +374,7 @@ struct suite_options_t {
     switch_t no_skips = switch_t::absent_k;
 
     /** A regex over case labels, like @c ^lsm\.files or @c uring|ram, selecting which cases run. */
-    std::string_view filter;
+    filter_t filter;
 
     /** The binary's @c argv[0], which every rerun line starts with. */
     char const* program = "";
@@ -400,14 +385,6 @@ struct suite_options_t {
         counts.seed = seed.value;
         counts.policy = no_skips == switch_t::present_k ? skip_policy_t::refused_k : skip_policy_t::tolerated_k;
         counts.filter = filter;
-        if (!filter.empty()) {
-            try {
-                counts.pattern.emplace(filter.begin(), filter.end());
-            }
-            catch (std::regex_error const&) {
-                // Left empty, so `selects` finds the filter as a plain substring instead, as SmashTable does.
-            }
-        }
         counts.program = program;
         return counts;
     }
@@ -420,9 +397,10 @@ struct suite_options_t {
 constexpr std::size_t suite_flags_capacity_k = 16;
 
 /**
- *  @brief Parses the shared flags and @p suite_flags from @p argv into @p options, drawing a seed when none was given.
+ *  @brief Parses the shared flags and @p suite_flags from @p argv into @p options, drawing a seed on @c --seed
+ *      @c random, and echoes every flag.
  *
- *  Prints the usage on @c --help and the offending argument on failure. A suite flag named like a shared one
+ *  Prints the usage on @c --help and one failure line on failure. A suite flag named like a shared one
  *  shadows it, so a suite may give @c --threads its own meaning.
  */
 [[nodiscard]] inline argument_status_t parse_suite_options(int argc, char const* const* argv, suite_options_t& options,
@@ -442,7 +420,7 @@ constexpr std::size_t suite_flags_capacity_k = 16;
                       &options.engine.name};
     flags[count++] = {"--isolation", "name", "isolation of the transactions of ram", &options.engine.isolation};
     flags[count++] = {"--engine-transport", "name", "transport of nvme", &options.engine.transport};
-    flags[count++] = {"--seed", "count", "seed of every random draw, drawn from the machine when absent",
+    flags[count++] = {"--seed", "number", "seed of every random draw, 42 by default, or random to draw one",
                       &options.seed};
     flags[count++] = {"--threads", "count", "threads the concurrent cases fan out over", &options.threads};
     flags[count++] = {"--no-skips", "", "fail the suite when a case skips", &options.no_skips};
@@ -453,9 +431,8 @@ constexpr std::size_t suite_flags_capacity_k = 16;
     std::span<flag_t const> const every_flag {flags.data(), count};
     arguments_t const parsed = parse_arguments(argc, argv, every_flag, {});
     if (parsed.status == argument_status_t::help_k) print_usage(argv[0], every_flag);
-    else if (parsed.status != argument_status_t::parsed_k)
-        fmt::println(stderr, "{}: {}", parsed.argument, describe(parsed.status));
-    if (options.seed.value == 0) options.seed.value = draw_seed();
+    else if (parsed.status != argument_status_t::parsed_k) print_error(parsed);
+    else print_flags(every_flag);
     options.program = argc != 0 ? argv[0] : "";
     return parsed.status;
 }

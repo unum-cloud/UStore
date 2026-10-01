@@ -22,7 +22,7 @@
 
 #include <smashtable/basic_vector.hpp>
 
-#include <ustore/ustore.hpp>
+#include "ustore/ustore.hpp"
 
 #include "executor.hpp" // `caller_exclusivity_t`, `executor_t`
 #include "test.hpp"     // `suite_exit_code`, `expect`, `suite_totals_t`
@@ -35,7 +35,7 @@ using namespace unum;
 struct atomicity_options_t {
 
     /** Wall-clock bound of the whole run, shared evenly by every configuration. */
-    std::chrono::nanoseconds duration = std::chrono::seconds {10};
+    std::chrono::nanoseconds time_limit = std::chrono::seconds {10};
 
     /** Most write-and-verify rounds one configuration runs. */
     count_t checkpoints {.value = 1'000, .minimum = 1};
@@ -136,11 +136,12 @@ struct batches_t {
 }
 
 /** Fills the keys of @p run, seeds one generator per thread, and begins their transactions when the engine has them. */
-[[nodiscard]] std::size_t prepare_run(atomicity_run_t& run, atomicity_options_t const& options) {
+[[nodiscard]] std::size_t prepare_run(atomicity_run_t& run, atomicity_options_t const& options, test_random_t random) {
     std::size_t failures = expect(st::succeeded(run.keys.resize(options.keys.value)));
     failures += expect(st::succeeded(run.slots.resize(std::ranges::max(options.threads.view()))));
     for (std::size_t index = 0; index != run.keys.size(); ++index) run.keys[index] = key_from_integer(index);
-    for (writer_slot_t& slot : run.slots) slot.random_generator.seed(static_cast<std::uint32_t>(draw_seed()));
+    for (std::size_t index = 0; index != run.slots.size(); ++index)
+        run.slots[index].random_generator.seed(static_cast<std::uint32_t>(random.fork(index).next()));
     if (failures || !run.database.supports_transactions()) return failures;
     for (std::size_t thread = 0; thread != run.slots.size() && !failures; ++thread)
         failures += begin_transaction(run.database, run.slots[thread].transaction);
@@ -244,7 +245,7 @@ std::size_t inserts_on_threads(atomicity_run_t& run, atomicity_options_t const& 
 std::size_t database_inserts(atomicity_run_t& run, atomicity_options_t const& options, round_deletes_t deletes) {
     if (!run.database.supports_transactions()) return 0;
     std::size_t const configurations_count = 2 * options.threads.size * options.batch_sizes.size;
-    std::chrono::nanoseconds const slice = options.duration / configurations_count;
+    std::chrono::nanoseconds const slice = options.time_limit / configurations_count;
     std::size_t failures = 0;
     for (std::size_t const threads : options.threads.view())
         failures += inserts_on_threads(run, options, threads, deletes, slice);
@@ -257,7 +258,7 @@ int main(int argc, char** argv) {
     suite_options_t suite;
     atomicity_options_t options;
     std::array<flag_t, 6> const flags {{
-        {"--duration", "duration", "bound of the whole run, like 10s", &options.duration},
+        {"--time-limit", "duration", "bound of the whole run, like 10s", &options.time_limit},
         {"--checkpoints", "count", "most write-and-verify rounds per configuration", &options.checkpoints},
         {"--threads", "counts", "competing thread counts, like 4,8,13,16", &options.threads},
         {"--batch-sizes", "counts", "keys per transaction, like 10,100,150", &options.batch_sizes},
@@ -282,7 +283,7 @@ int main(int argc, char** argv) {
     }
 
     atomicity_run_t run {database, database.main()};
-    if (std::size_t const failures = prepare_run(run, options); failures) {
+    if (std::size_t const failures = prepare_run(run, options, suite.random()); failures) {
         report(totals, "setup", failures);
         return suite_exit_code(totals);
     }

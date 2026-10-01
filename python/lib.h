@@ -53,7 +53,7 @@
 #include <stddef.h> // `size_t`
 #include <stdint.h> // `int64_t`
 
-#include <ustore/ustore.h>
+#include "ustore/ustore.h"
 
 #ifdef __cplusplus
 extern "C" {

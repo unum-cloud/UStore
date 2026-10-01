@@ -15,7 +15,7 @@
 #include <forkunion/atomics.hpp> // `fu::preferred_atomic_ref`
 #include <smashtable/shared.hpp> // `st::default_allocator`
 
-#include <ustore/types.hpp> // the `fu` and `st` aliases
+#include "ustore/types.hpp" // the `fu` and `st` aliases
 
 namespace unum::ustore::nvme {
 

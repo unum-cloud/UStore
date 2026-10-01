@@ -20,8 +20,8 @@
 
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
-#include <ustore/status.hpp> // `status_t`, `expected`
-#include <ustore/types.hpp>  // `byte_t`
+#include "ustore/status.hpp" // `status_t`, `expected`
+#include "ustore/types.hpp"  // `byte_t`
 
 #include "nvme/blocking_files_disk.hpp" // `blocking_files_disk_t`
 #include "nvme/memory_disk.hpp"         // `memory_disk_t`

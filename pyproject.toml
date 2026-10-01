@@ -48,7 +48,15 @@ cmake.build-type = "Release"
 cmake.version = ">=3.25"
 install.components = ["ustore_python"]
 minimum-version = "build-system.requires"
-sdist.exclude = ["/build*/**", "/target/**", "/v1.md", "/numkong/**", "/stringzilla/**", "/smashtable/**", "/forkunion/**"]
+sdist.exclude = [
+  "/build*/**",
+  "/target/**",
+  "/v1.md",
+  "/numkong/**",
+  "/stringzilla/**",
+  "/smashtable/**",
+  "/forkunion/**",
+]
 sdist.include = [
   "/CMakeLists.txt",
   "/CMakePresets.json",
@@ -92,23 +100,45 @@ USTORE_WITH_ROCKSDB = "ON"
 # Groups rather than extras, so none of this reaches the published wheel's metadata.
 [dependency-groups]
 lint = ["ruff", "clang-format==22.*", "cmakelang"]
-test = ["pytest>=8", "numpy", "pandas", "networkx"]
+# PyArrow publishes no Windows on Arm wheels, so the Parquet case skips there.
+test = [
+  "pytest>=8",
+  "numpy",
+  "pandas",
+  "networkx",
+  "pyarrow; platform_machine != 'ARM64'",
+]
 
 [tool.pytest.ini_options]
-minversion = "6.0"
-addopts = ["-ra", "--showlocals", "--strict-markers", "--strict-config"]
-xfail_strict = true
+# `-p no:randomly` keeps `<PROJECT>_SEED` in charge wherever pytest-randomly happens to be installed.
+addopts = [
+  "-ra",
+  "--showlocals",
+  "--strict-markers",
+  "--strict-config",
+  "-p",
+  "no:randomly",
+]
 filterwarnings = ["error"]
+minversion = "8.0"
 python_files = ["*.py"]
 testpaths = ["test"]
+xfail_strict = true
+
+[tool.ruff.lint]
+extend-select = ["I", "TID"]
 
 [tool.ruff.lint.per-file-ignores]
 # cmake-format evaluates its profile with `section` already in scope.
 ".cmake-format.py" = ["F821"]
 
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
 [tool.ruff.lint.isort]
 # The package is ours, so it sorts after the third-party block rather than inside it.
 known-first-party = ["ustore"]
+combine-as-imports = true
 
 [tool.ruff]
 line-length = 120
@@ -118,6 +148,8 @@ target-version = "py312"
 build = ["cp312-*", "cp313-*", "cp314-*", "cp314t-*"]
 build-verbosity = 0
 skip = ["*musllinux*"]
+test-command = "python -X faulthandler -m pytest -x {project}/test"
+test-groups = ["test"]
 
 # Every architecture's baseline instruction set, since the CMake tree adds no `-march` of its own.
 [tool.cibuildwheel.linux]

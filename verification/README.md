@@ -76,7 +76,7 @@ verification/check.sh
 
 It needs `spin` and a C compiler, and it exits 127 with a `skip` line when Spin is absent, so a machine without it reports the gap rather than reporting success.
 Each result prints the state count and the depth Spin reached.
-Every search runs under an 8 GiB cgroup cap where `systemd-run` is reachable; a model that hits the cap is a model to shrink, never a cap to raise.
+Every search runs under an 8 GB cgroup cap where `systemd-run` is reachable; a model that hits the cap is a model to shrink, never a cap to raise.
 
 ## When a Check Fails
 

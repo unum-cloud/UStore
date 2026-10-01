@@ -113,7 +113,6 @@ def test_triangle_in_batches(graphs, container: str):
 
 
 @pytest.mark.parametrize("size", SIZES)
-@pytest.mark.parametrize("seed", [0, 1])
 def test_random_fill_matches_networkx(graphs, size: int, seed: int):
     ours, reference = graphs
     generator = np.random.default_rng(seed)

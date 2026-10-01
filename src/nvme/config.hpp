@@ -82,7 +82,7 @@ struct resources_config_t {
     st::basic_vector<data_directory_config_t> data_directories;
 };
 
-/** Half the logical cores, between one and eight, as every thread pins a channel of 12 MiB by default. */
+/** Half the logical cores, between one and eight, as every thread pins a channel of 12 MB by default. */
 [[nodiscard]] inline std::size_t derived_background_threads(std::size_t logical_cores_count) noexcept {
     return std::clamp<std::size_t>(logical_cores_count / 2, 1, 8);
 }

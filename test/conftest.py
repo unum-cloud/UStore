@@ -1,9 +1,11 @@
 """Fixtures every Python suite shares: databases in a fresh directory, and the views verbs run through."""
 
+import random
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
+from base import SETTINGS
 from capabilities import ENGINES, ISOLATIONS, SUPPORTS, open_engine
 
 import ustore
@@ -15,11 +17,33 @@ def pytest_configure(config: pytest.Config) -> None:
 
 def pytest_report_header() -> list[str]:
     """The build this run exercises, printed where pytest prints its own header."""
-    header = [f"ustore: {ustore.__version__} from {ustore.lib.__file__}"]
+    header = [f"- UStore: {ustore.__version__} from {ustore.lib.__file__}"]
     for engine in ENGINES:
         supported = ", ".join(name for name, present in SUPPORTS[engine].items() if present)
-        header.append(f"{engine}: {supported or 'no transactions, collections or snapshots'}")
+        header.append(f"- Engine {engine}: {supported or 'no transactions, collections or snapshots'}")
+    header.append(f"- Seed: {SETTINGS.seed}")
+    header.append(f"- Filter: {SETTINGS.filter or 'none'}")
     return header
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Keeps only the tests whose node id `USTORE_FILTER` selects, on top of any `-k`."""
+    deselected = [item for item in items if not SETTINGS.selects(item.nodeid)]
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+        items[:] = [item for item in items if SETTINGS.selects(item.nodeid)]
+
+
+@pytest.fixture
+def seed() -> int:
+    """The seed of this run, 42 unless `USTORE_SEED` names another or is `random`."""
+    return SETTINGS.seed
+
+
+@pytest.fixture
+def rng(seed: int) -> random.Random:
+    """An RNG private to this test, so a neighbour's draws cannot shift this one's."""
+    return random.Random(seed)
 
 
 def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:

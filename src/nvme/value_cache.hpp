@@ -23,7 +23,7 @@
 #include <smashtable/basic_hash_table.hpp> // `st::hash_map`, `st::assume_reserved_t`
 #include <smashtable/basic_ring.hpp>       // `st::basic_ring`, `st::ring_eviction_t`
 
-#include <ustore/types.hpp> // `byte_t`
+#include "ustore/types.hpp" // `byte_t`
 
 #include "nvme/constrained_allocator.hpp" // `resource_constraint_t`, `constrained_allocator`
 #include "nvme/stored_value.hpp"          // `stored_value_size_t`

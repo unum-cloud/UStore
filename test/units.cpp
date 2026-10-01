@@ -22,7 +22,7 @@
 
 #include <smashtable/basic_vector.hpp>
 
-#include <ustore/ustore.hpp>
+#include "ustore/ustore.hpp"
 
 #include "executor.hpp" // `caller_exclusivity_t`, `executor_t`
 #include "test.hpp"     // `suite_exit_code`, `expect`, `expect_eq`

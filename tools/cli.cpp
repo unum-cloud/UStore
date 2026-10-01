@@ -21,13 +21,13 @@
 #include <fmt/color.h>  // `fmt::color`, `fmt::fg`, `fmt::text_style`
 #include <fmt/format.h> // `fmt::println`, `fmt::format_to_n`
 
-#include <ustore/db.h>      // `ustore_database_init_t`, `ustore_error_t`
-#include <ustore/types.hpp> // `uuid_to_text`, `uuid_text_length_k`
+#include "ustore/db.h"      // `ustore_database_init_t`, `ustore_error_t`
+#include "ustore/types.hpp" // `uuid_to_text`, `uuid_text_length_k`
 
-#include "arguments.hpp" // `parse_arguments`, `argument_status_t`
+#include "arguments.hpp" // `parse_arguments`, `print_error`
 #include "dataset.h"     // `ustore_docs_import`, `ustore_docs_export`
 
-namespace unum::ustore {
+namespace unum::ustore::tools {
 
 /** How a message reads, which decides its color on a terminal. */
 enum class tone_t : std::uint8_t {
@@ -355,10 +355,11 @@ void find_collection(ustore_database_t db, std::string_view name, ustore_collect
 
 #pragma endregion Commands
 
-} // namespace unum::ustore
+} // namespace unum::ustore::tools
 
 int main(int argc, char* argv[]) {
     using namespace unum::ustore;
+    using namespace unum::ustore::tools;
 
     command_line_t line;
     std::array<flag_t, 9> const flags {{
@@ -370,7 +371,7 @@ int main(int argc, char* argv[]) {
         {"--input", "file", "file a collection import reads", &line.input},
         {"--output", "file", "file a collection export writes", &line.output},
         {"--id-field", "field", "field holding the keys of imported documents", &line.id_field},
-        {"--memory-limit", "size", "bytes an import or export buffers per batch, like 64MiB", &line.memory_limit},
+        {"--memory-limit", "size", "bytes an import or export buffers per batch, like 64MB", &line.memory_limit},
     }};
     std::array<std::string_view, 3> positionals {};
     arguments_t const parsed = parse_arguments(argc, argv, flags, positionals);
@@ -385,7 +386,7 @@ int main(int argc, char* argv[]) {
         return 0;
     }
     if (parsed.status != argument_status_t::parsed_k) {
-        fmt::println(stderr, "{}: {}", parsed.argument, describe(parsed.status));
+        print_error(parsed);
         return 1;
     }
     char const* const problem = line.directory.empty()

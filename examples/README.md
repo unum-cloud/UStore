@@ -8,12 +8,18 @@ They target the CPython extension `ustore.lib` and the pure-Python views beside 
 
 ## The Examples
 
-- __`banks_atm_olap.py`__ — batched rows packed into one blob per key, then aggregated on the GPU. Needs `cudf`, `cuxfilter` and `pyarrow`.
-- __`browser.py`__ — documents, a graph and images browsed side by side in one app. Needs `streamlit` and `requests`.
-- __`community.py`__ — Louvain communities over a graph collection, drawn. Needs `networkx` and `matplotlib`.
-- __`consistent_dict.py`__ — a native `dict` timed against a collection over the same keys. Needs `numpy`.
-- __`dataloader.py`__ — collection keys batched into a PyTorch loader. Needs `torch`.
-- __`movie_recommendations.py`__ — recommendations over two graphs, then both edited in one transaction. Needs `matplotlib` and `requests`.
+- __`banks_atm_olap.py`__ — batched rows packed into one blob per key, then aggregated on the GPU.
+  Needs `cudf`, `cuxfilter` and `pyarrow`.
+- __`browser.py`__ — documents, a graph and images browsed side by side in one app.
+  Needs `streamlit` and `requests`.
+- __`community.py`__ — Louvain communities over a graph collection, drawn.
+  Needs `networkx` and `matplotlib`.
+- __`consistent_dict.py`__ — a native `dict` timed against a collection over the same keys.
+  Needs `numpy`.
+- __`dataloader.py`__ — collection keys batched into a PyTorch loader.
+  Needs `torch`.
+- __`movie_recommendations.py`__ — recommendations over two graphs, then both edited in one transaction.
+  Needs `matplotlib` and `requests`.
 
 Each script opens with a docstring naming what it demonstrates, what it needs installed and how to run it.
 

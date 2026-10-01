@@ -58,7 +58,7 @@ Its isolation ends at reading from a snapshot.
 A `database` holds `collection`s, each an `lsm_tree` of `lsm_level`s whose `lsm_sorted_run` files open with a `sorted_run_index` of `key_slot`s ahead of their `stored_value`s, with optimistic transactions, snapshots and backups.
 Its graph database keeps adjacency in NVMe's own databases, as a fast path beside `c/graph.cpp`.
 Its strings and the names of its collections live in `src/nvme/strings.cpp`, as sorted buckets under integer keys in collections no identifier a caller holds reaches, until the engine keys strings itself.
-It keeps 64-bit keys inside for now, so it takes only keys below 2^64, refusing the rest with `ustore_error_unsupported_k`, and names a collection by the UUID spelling its catalog number rather than a UUIDv7.
+It keeps 64-bit keys inside for now, so it takes only keys below 2⁶⁴, refusing the rest with `ustore_error_unsupported_k`, and names a collection by the UUID spelling its catalog number rather than a UUIDv7.
 CMake refuses `USTORE_BUILD_NVME` until the sources in this directory build in tree, so everything below is a v1 target:
 
 - __Kernel bypass__ — a transport chosen at mount reaches each data directory through io_uring on `O_DIRECT` files, io_uring on NVMe block devices, NVMe passthrough, or SPDK's user-space driver, and falls back to blocking positioned I/O on macOS, Windows and wherever io_uring is refused.

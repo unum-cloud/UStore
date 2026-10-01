@@ -26,7 +26,7 @@
 #include <smashtable/basic_vector.hpp>
 #include <smashtable/shared.hpp>
 
-#include <ustore/types.hpp>
+#include "ustore/types.hpp"
 
 #include "cuda.hpp"            // `cuda_count_devices`, `cuda_pinned_allocator`
 #include "test.hpp"            // `suite_exit_code`, `expect`, `expect_eq`
@@ -911,7 +911,7 @@ case_result_t cuda_devices_round_trip() {
     for (std::size_t index = 0; index != devices->size(); ++index) {
         cuda_device_t const& device = (*devices)[index];
         fmt::println(
-            "  device {}: {}, compute capability {}.{} ({}), {} multiprocessors, {} of {} MiB free, NUMA node {}",
+            "  device {}: {}, compute capability {}.{} ({}), {} multiprocessors, {} of {} MB free, NUMA node {}",
             device.specs.ordinal, device.specs.name, device.specs.compute_major, device.specs.compute_minor,
             generation_name(static_cast<std::uint8_t>(device.specs.generation())), device.specs.multiprocessor_count,
             device.memory.free_bytes >> 20, device.memory.total_bytes >> 20, device.numa_node);

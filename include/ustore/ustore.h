@@ -26,9 +26,9 @@
 /** The patch version of UStore, which changes for fixes that keep the C ABI. */
 #define USTORE_VERSION_PATCH 0
 
-#include <ustore/blobs.h>
-#include <ustore/db.h>
-#include <ustore/docs.h>
-#include <ustore/graph.h>
-#include <ustore/pages.h>
-#include <ustore/strings.h>
+#include "ustore/blobs.h"
+#include "ustore/db.h"
+#include "ustore/docs.h"
+#include "ustore/graph.h"
+#include "ustore/pages.h"
+#include "ustore/strings.h"

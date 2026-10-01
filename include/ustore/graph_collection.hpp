@@ -13,14 +13,14 @@
 #include <span>      // `std::span`
 #include <utility>   // `std::forward`, `std::move`, `std::swap`
 
-#include <ustore/blobs_range.hpp> // `keys_range_t`
-#include <ustore/blobs_ref.hpp>   // `blobs_ref`
-#include <ustore/graph.h>
-#include <ustore/graph_stream.hpp> // `graph_stream_t`
-#include <ustore/ranges.hpp>       // `range`, `strided`, `sort_and_deduplicate`, `transform_reduce_n`
-#include <ustore/ranges_args.hpp>  // `edges_span_t`, `edges_view_t`, `places_arg_t`
-#include <ustore/status.hpp>       // `status_t`, `expected`
-#include <ustore/types.hpp>        // `any_arena_t`, `collection_key_field_t`, `edge_t`
+#include "ustore/blobs_range.hpp" // `keys_range_t`
+#include "ustore/blobs_ref.hpp"   // `blobs_ref`
+#include "ustore/graph.h"
+#include "ustore/graph_stream.hpp" // `graph_stream_t`
+#include "ustore/ranges.hpp"       // `range`, `strided`, `sort_and_deduplicate`, `transform_reduce_n`
+#include "ustore/ranges_args.hpp"  // `edges_span_t`, `edges_view_t`, `places_arg_t`
+#include "ustore/status.hpp"       // `status_t`, `expected`
+#include "ustore/types.hpp"        // `any_arena_t`, `collection_key_field_t`, `edge_t`
 
 namespace unum::ustore {
 

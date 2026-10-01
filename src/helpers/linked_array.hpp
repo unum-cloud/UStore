@@ -14,8 +14,8 @@
 #include <type_traits> // `std::is_nothrow_constructible_v`
 #include <utility>     // `std::exchange`, `std::move`, `std::swap`
 
-#include <ustore/ranges.hpp> // `strided_range`, `trivial_insert`, `trivial_erase`
-#include <ustore/types.hpp>  // `value_view_t`, `next_power_of_two`
+#include "ustore/ranges.hpp" // `strided_range`, `trivial_insert`, `trivial_erase`
+#include "ustore/types.hpp"  // `value_view_t`, `next_power_of_two`
 
 #include "helpers/linked_memory.hpp" // `linked_memory_lock_t`
 

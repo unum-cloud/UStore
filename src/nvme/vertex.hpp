@@ -15,7 +15,7 @@
 
 #include <smashtable/basic_flat_set.hpp> // `st::basic_flat_set`
 
-#include <ustore/types.hpp> // the `st` alias
+#include "ustore/types.hpp" // the `st` alias
 
 #include "nvme/stored_key.hpp" // `limit`
 

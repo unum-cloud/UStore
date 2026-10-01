@@ -13,10 +13,10 @@
 #include <new>         // `std::bad_alloc`
 #include <string_view> // `std::string_view`
 
-#include <ustore/blobs.h>   // `ustore_read_t`, `ustore_write_t`, `ustore_scan_t`, `ustore_sample_t`, `ustore_measure_t`
-#include <ustore/db.h>      // `ustore_database_t`, `ustore_transaction_t` and the calls on them
-#include <ustore/graph.h>   // `ustore_graph_find_edges_t`, `ustore_graph_upsert_edges_t` and the other graph calls
-#include <ustore/strings.h> // `ustore_strings_read_t`, `ustore_strings_write_t`, `ustore_strings_scan_t`
+#include "ustore/blobs.h"   // `ustore_read_t`, `ustore_write_t`, `ustore_scan_t`, `ustore_sample_t`, `ustore_measure_t`
+#include "ustore/db.h"      // `ustore_database_t`, `ustore_transaction_t` and the calls on them
+#include "ustore/graph.h"   // `ustore_graph_find_edges_t`, `ustore_graph_upsert_edges_t` and the other graph calls
+#include "ustore/strings.h" // `ustore_strings_read_t`, `ustore_strings_write_t`, `ustore_strings_scan_t`
 
 namespace unum::ustore {
 

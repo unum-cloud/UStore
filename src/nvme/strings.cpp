@@ -20,9 +20,9 @@
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 
-#include <ustore/ranges_args.hpp> // `contents_arg_t`
-#include <ustore/strings.h>       // `ustore_strings_write_t`, `ustore_strings_read_t`
-#include <ustore/ustore.hpp>      // `ustore_read`, `strided_iterator`, `joined_blobs_t`
+#include "ustore/ranges_args.hpp" // `contents_arg_t`
+#include "ustore/strings.h"       // `ustore_strings_write_t`, `ustore_strings_read_t`
+#include "ustore/ustore.hpp"      // `ustore_read`, `strided_iterator`, `joined_blobs_t`
 
 #include "engine.hpp"                // `name_record_t`, `read_name_record`
 #include "helpers/algorithm.hpp"     // `offset_in_sorted`
@@ -100,7 +100,7 @@ constexpr key_window_t window_of(std::string_view prefix) noexcept {
 
 #pragma region Bucket Layout
 
-/** The word every count and offset of a bucket takes, wide enough for a bucket past 4 GiB. */
+/** The word every count and offset of a bucket takes, wide enough for a bucket past 4 GB. */
 using bucket_word_t = std::uint64_t;
 
 /** Bytes of the entry count that leads every bucket. */

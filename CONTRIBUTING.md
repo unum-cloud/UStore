@@ -127,7 +127,7 @@ The allocator places memory with `fu_allocate_on_domain_id` and releases it with
 
 ### Includes and Printing
 
-Includes form six groups separated by blank lines, alphabetical inside each: C library headers such as `<cstdint>` and `<unistd.h>`, C++ standard headers, external libraries such as `<rocksdb/db.h>` and `<yyjson.h>`, sibling projects such as `<smashtable/basic_vector.hpp>`, UStore's public `<ustore/db.h>` headers in angle brackets, then project headers such as `"helpers/linked_memory.hpp"` in quotes.
+Includes form groups separated by blank lines, alphabetical inside each: C library headers such as `<cstdint>`, platform headers such as `<unistd.h>`, C++ standard headers, external libraries such as `<rocksdb/db.h>` and `<yyjson.h>`, sibling projects such as `<smashtable/basic_vector.hpp>`, then UStore's own headers in quotes, such as `"ustore/db.h"` and `"helpers/linked_memory.hpp"`.
 Sibling projects are reached through the aliases `fu`, `nk`, `st` and `sz`, declared once in `include/ustore/types.hpp`, never through spelled-out `ashvardanian::` namespaces or local aliases.
 C++ prints through `fmt::println` — no iostreams, no `printf`.
 Discard a result through `[[maybe_unused]] T const result = call();`, never `(void)call();`, and declare return types before the name, never after an arrow.
@@ -163,10 +163,10 @@ Binaries read no environment variables and no hard-coded directories; every inpu
 USTORE_TEST_PATH=/tmp/db ./twitter -tw 1000 --max_input_files 4 --mlimit 1048576 -n 10
 
 # Accepted
-./ustore_bench_twitter --directory /tmp/db --dataset data/twitter --max-tweets 1000 --max-input-files 4 --memory-limit 1MiB --duration 10s
+./ustore_bench_twitter --directory /tmp/db --dataset data/twitter --max-tweets 1000 --max-input-files-total 4 --time-limit 10s
 ```
 
-Flags are long kebab-case words with no short forms or aliases, sizes carry IEC suffixes, durations carry `ms`, `s` or `min`, and lists are comma-separated.
+Flags are long kebab-case words with no short forms or aliases, sizes carry IEC suffixes, durations carry `ms` or `s`, and lists are comma-separated.
 A namespace-scope `_k` constant names an invariant — a format, an alignment, an ABI limit — while workload sizes, thread counts and paths are option fields with defaults.
 
 ## Python Builds
@@ -178,8 +178,11 @@ Python suites sit in `test/` beside the C++ ones as `<topic>.py`, named so no mo
 ```sh
 pip install -e .                                     # every engine
 CMAKE_ARGS="-DUSTORE_WITH_ROCKSDB=OFF" pip install .  # all but RocksDB
-pip install --group test . && pytest test
+pip install --group test . && python -X faulthandler -m pytest -x
 ```
+
+`USTORE_SEED` pins the seed the suites draw from, `42` by default or `random` for a fresh one, and `USTORE_FILTER` keeps the cases whose node id matches it, as a regex or else as a substring.
+pytest prints both in its header as `- Seed:` and `- Filter:`, so a failing run reruns with the same values.
 
 An engine is left out through `CMAKE_ARGS` or `--config-settings=cmake.define.USTORE_WITH_<ENGINE>=OFF`, and `USTORE_BUILD_NVME=OFF` for NVMe; the build reads no environment variable of its own.
 

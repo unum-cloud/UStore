@@ -25,7 +25,7 @@
 
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
-#include <ustore/status.hpp> // `status_t`, `status_code_t`
+#include "ustore/status.hpp" // `status_t`, `status_code_t`
 
 #include "nvme/io_channel.hpp"     // `io_channel_t`
 #include "nvme/lsm_sorted_run.hpp" // `lsm_sorted_run`, `find_result_t`, `value_window_t`

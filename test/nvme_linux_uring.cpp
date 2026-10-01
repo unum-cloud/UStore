@@ -33,8 +33,8 @@
 
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
-#include <ustore/status.hpp> // `status_t`, `expected`
-#include <ustore/types.hpp>  // `byte_t`
+#include "ustore/status.hpp" // `status_t`, `expected`
+#include "ustore/types.hpp"  // `byte_t`
 
 #include "nvme/blocking_files_disk.hpp"    // `native_file_t`, `close_native_file`, `blocking_files_disk_t`
 #include "nvme/linux_uring_files_disk.hpp" // `linux_uring_files_disk_t`, `linux_uring_probe_t`

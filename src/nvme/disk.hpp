@@ -30,8 +30,8 @@
 #include <forkunion/atomics.hpp>       // `fu::preferred_atomic_ref`
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
-#include <ustore/status.hpp> // `status_t`, `status_code_t`, `expected`
-#include <ustore/types.hpp>  // `byte_t`
+#include "ustore/status.hpp" // `status_t`, `status_code_t`, `expected`
+#include "ustore/types.hpp"  // `byte_t`
 
 #include "nvme/extent.hpp" // `extent_t`, `is_address_aligned`
 #include "nvme/ring.hpp"   // `request_t`, `completion_t`, `queue_pair_t`, `registered_memory_t`, `registered_medium_t`

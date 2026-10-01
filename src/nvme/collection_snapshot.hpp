@@ -26,8 +26,8 @@
 
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
-#include <ustore/status.hpp> // `status_t`, `status_code_t`
-#include <ustore/types.hpp>  // `byte_t`
+#include "ustore/status.hpp" // `status_t`, `status_code_t`
+#include "ustore/types.hpp"  // `byte_t`
 
 #include "nvme/io_channel.hpp"   // `io_channel_t`
 #include "nvme/lsm_tree.hpp"     // `lsm_tree`, `lsm_tree_position_t`

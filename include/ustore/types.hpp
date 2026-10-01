@@ -23,18 +23,12 @@
 #include <type_traits> // `std::remove_cvref_t`, `std::is_same_v`, `std::type_identity_t`
 #include <utility>     // `std::exchange`, `std::swap`
 
-#include <ustore/status.hpp> // `expected`, `status_t`
-#include <ustore/ustore.h>
+#include "ustore/status.hpp" // `expected`, `status_t`
+#include "ustore/ustore.h"
 
 namespace ashvardanian::forkunion {}
-namespace ashvardanian::numkong {}
 namespace ashvardanian::smashtable {}
 namespace ashvardanian::stringzilla {}
-
-namespace fu = ashvardanian::forkunion;
-namespace nk = ashvardanian::numkong;
-namespace st = ashvardanian::smashtable;
-namespace sz = ashvardanian::stringzilla;
 
 #pragma region Identifiers
 
@@ -85,6 +79,10 @@ struct std::hash<ustore_collection_id_t> {
 #pragma endregion Identifiers
 
 namespace unum::ustore {
+
+namespace fu = ashvardanian::forkunion;
+namespace st = ashvardanian::smashtable;
+namespace sz = ashvardanian::stringzilla;
 
 #pragma region Identifier Arithmetic
 

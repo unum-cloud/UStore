@@ -2,11 +2,12 @@
  *  @file tools/arguments.hpp
  *  @author Ash Vardanian
  *  @date September 15, 2026
- *  @brief Command-line flags for every UStore binary: one table parses the arguments and prints the usage.
+ *  @brief Command-line flags for every UStore binary: one table parses the arguments, echoes them and prints the usage.
  *
- *  Flags are long kebab-case words whose value follows as the next argument or after @c =. Sizes carry IEC
- *  suffixes, durations carry @c ms, @c s, @c min or @c h, counts are plain integers, and lists are comma-separated.
+ *  Flags are long kebab-case words whose value follows as the next argument or after @c =. Sizes carry binary
+ *  suffixes of any case, durations carry @c ms or @c s, counts are positive integers, and lists are comma-separated.
  *  A text value views the tail of its @c argv entry, so it is null-terminated; list items are not.
+ *  A value that does not parse prints @c --flag="value" @c does @c not @c parse, @c expected @c <grammar>.
  *
  *  @code
  *  bytes_t memory_limit {64 << 20};
@@ -15,7 +16,7 @@
  *  choice_t format {formats};
  *  std::array<flag_t, 3> const flags {{
  *      {"--directory", "path", "database directory", &directory},
- *      {"--memory-limit", "size", "arena budget, like 64MiB", &memory_limit},
+ *      {"--memory-limit", "size", "arena budget, like 64MB", &memory_limit},
  *      {"--format", "name", "export format", &format},
  *  }};
  *  arguments_t const parsed = parse_arguments(argc, argv, flags, {});
@@ -23,14 +24,21 @@
  */
 #pragma once
 
+#include <cctype>  // `std::tolower`, `std::toupper`
 #include <cstddef> // `std::size_t`
-#include <cstdint> // `std::uint64_t`
+#include <cstdint> // `std::uint32_t`, `std::uint64_t`
+#include <cstdio>  // `stderr`
 
+#include <algorithm>    // `std::any_of`, `std::equal`
 #include <array>        // `std::array`
 #include <charconv>     // `std::from_chars`
 #include <chrono>       // `std::chrono::nanoseconds`
 #include <limits>       // `std::numeric_limits`
+#include <optional>     // `std::optional`
+#include <random>       // `std::random_device`
+#include <regex>        // `std::regex`, `std::regex_search`
 #include <span>         // `std::span`
+#include <string>       // `std::string`, `std::to_string`
 #include <string_view>  // `std::string_view`
 #include <system_error> // `std::errc`
 #include <variant>      // `std::variant`
@@ -38,9 +46,9 @@
 #include <fmt/format.h>
 #include <fmt/ranges.h> // `fmt::join`
 
-#include <ustore/db.h> // the init call of every engine and its arguments
+#include "ustore/db.h" // the init call of every engine and its arguments
 
-namespace unum::ustore {
+namespace unum::ustore::tools {
 
 /** Outcome of parsing one value or a whole argument list. */
 enum class argument_status_t {
@@ -79,15 +87,15 @@ enum class argument_status_t {
     too_few_items_k,
 };
 
-/** A size in bytes, written @c 64MiB or @c 1GiB; a bare number is bytes. */
+/** A positive size in bytes, written @c 64MB or @c 1gb; a bare number is bytes. */
 struct bytes_t {
     std::size_t value = 0;
 };
 
-/** A plain non-negative integer, accepted only within @b [minimum,maximum]. */
+/** A plain integer, accepted only within @b [minimum,maximum]. */
 struct count_t {
     std::size_t value = 0;
-    std::size_t minimum = 0;
+    std::size_t minimum = 1;
     std::size_t maximum = std::numeric_limits<std::size_t>::max();
 };
 
@@ -97,7 +105,7 @@ struct counts_t {
     static constexpr std::size_t capacity_k = 16;
     std::array<std::size_t, capacity_k> values {};
     std::size_t size = 0;
-    std::size_t minimum = 0;
+    std::size_t minimum = 1;
     std::size_t maximum = std::numeric_limits<std::size_t>::max();
     std::size_t minimum_size = 1;
     std::size_t maximum_size = capacity_k;
@@ -120,26 +128,48 @@ struct choice_t {
     std::size_t selected = 0;
 };
 
+/** A 32-bit seed, or @c random to draw one from the machine. */
+struct seed_t {
+    std::uint32_t value = 42;
+};
+
+/** A regex over names, found as a plain substring when it does not compile; empty selects everything. */
+struct filter_t {
+    std::string_view text;
+    std::optional<std::regex> pattern;
+
+    [[nodiscard]] bool selects(std::string_view name) const noexcept {
+        if (text.empty()) return true;
+        if (pattern) return std::regex_search(name.begin(), name.end(), *pattern);
+        return name.find(text) != std::string_view::npos;
+    }
+};
+
 /** Whether a flag without a value appeared. */
 enum class switch_t : bool {
     absent_k,
     present_k,
 };
 
-/** One flag: its name with both dashes, the usage placeholder, one help line, and the value it writes. */
+/** One flag: its name with both dashes, the usage placeholder, one help line, the value it writes, and the label
+ *  its echo takes, derived from the name when empty. */
 struct flag_t {
     std::string_view name;
     std::string_view placeholder;
     std::string_view help;
     std::variant<std::string_view*, count_t*, counts_t*, bytes_t*, std::chrono::nanoseconds*, texts_t*, choice_t*,
-                 switch_t*>
+                 switch_t*, seed_t*, filter_t*>
         destination;
+    std::string_view label;
 };
 
-/** Result of @c parse_arguments: the status, the argument it concerns, and how many positionals were collected. */
+/** Result of @c parse_arguments: the status, the argument it concerns, the flag that argument named and the value
+ *  it gave, and how many positionals were collected. */
 struct arguments_t {
     argument_status_t status = argument_status_t::parsed_k;
     std::string_view argument;
+    flag_t const* flag = nullptr;
+    std::string_view value;
     std::size_t positionals_count = 0;
 };
 
@@ -151,19 +181,9 @@ struct unit_t {
     std::uint64_t multiplier = 1;
 };
 
-inline constexpr std::array<unit_t, 5> byte_units_k {{
-    {"", 1},
-    {"KiB", std::uint64_t {1} << 10},
-    {"MiB", std::uint64_t {1} << 20},
-    {"GiB", std::uint64_t {1} << 30},
-    {"TiB", std::uint64_t {1} << 40},
-}};
-
-inline constexpr std::array<unit_t, 4> duration_units_k {{
+inline constexpr std::array<unit_t, 2> duration_units_k {{
     {"ms", 1'000'000},
     {"s", 1'000'000'000},
-    {"min", 60'000'000'000},
-    {"h", 3'600'000'000'000},
 }};
 
 [[nodiscard]] inline argument_status_t parse_integer_(std::string_view digits, std::uint64_t& value) noexcept {
@@ -203,23 +223,38 @@ inline constexpr std::array<unit_t, 4> duration_units_k {{
     return argument_status_t::parsed_k;
 }
 
-/** Parses a size such as @c 64MiB into bytes. */
+/** A positive size in whole bytes or binary units of any case, like "4096", "64KB" or "1GB". */
+inline std::optional<std::size_t> parse_size(std::string_view text) noexcept {
+    std::size_t bytes = 0;
+    auto const [end, error] = std::from_chars(text.data(), text.data() + text.size(), bytes);
+    if (error != std::errc {} || !bytes) return std::nullopt;
+    std::string_view const unit = text.substr(end - text.data());
+    auto const same_letter = [](char given, char lower) noexcept {
+        return std::tolower(static_cast<unsigned char>(given)) == lower;
+    };
+    for (std::string_view const known : std::array<std::string_view, 5> {"", "kb", "mb", "gb", "tb"}) {
+        if (std::equal(unit.begin(), unit.end(), known.begin(), known.end(), same_letter)) return bytes;
+        if (bytes > std::numeric_limits<std::size_t>::max() / 1024) return std::nullopt;
+        bytes *= 1024;
+    }
+    return std::nullopt;
+}
+
+/** Parses a size such as @c 64MB into bytes; zero is rejected. */
 [[nodiscard]] inline argument_status_t parse_bytes(std::string_view text, bytes_t& bytes) noexcept {
-    std::uint64_t value = 0;
-    argument_status_t const status = parse_with_units_(text, byte_units_k, value);
-    if (status != argument_status_t::parsed_k) return status;
-    if (value > std::numeric_limits<std::size_t>::max()) return argument_status_t::out_of_range_k;
-    bytes.value = static_cast<std::size_t>(value);
+    std::optional<std::size_t> const size = parse_size(text);
+    if (!size) return argument_status_t::invalid_unit_k;
+    bytes.value = *size;
     return argument_status_t::parsed_k;
 }
 
-/** Parses a duration such as @c 500ms or @c 10s; a bare number is rejected. */
+/** Parses a duration such as @c 500ms or @c 10s; a bare number, a fraction or zero is rejected. */
 [[nodiscard]] inline argument_status_t parse_duration(std::string_view text,
                                                       std::chrono::nanoseconds& duration) noexcept {
     std::uint64_t value = 0;
     argument_status_t const status = parse_with_units_(text, duration_units_k, value);
     if (status != argument_status_t::parsed_k) return status;
-    if (value > static_cast<std::uint64_t>(std::numeric_limits<std::chrono::nanoseconds::rep>::max()))
+    if (value == 0 || value > static_cast<std::uint64_t>(std::numeric_limits<std::chrono::nanoseconds::rep>::max()))
         return argument_status_t::out_of_range_k;
     duration = std::chrono::nanoseconds {static_cast<std::chrono::nanoseconds::rep>(value)};
     return argument_status_t::parsed_k;
@@ -262,6 +297,31 @@ inline constexpr std::array<unit_t, 4> duration_units_k {{
     }
 }
 
+/** Parses a seed: an unsigned 32-bit integer, or @c random for a fresh draw from @c std::random_device. */
+[[nodiscard]] inline argument_status_t parse_seed(std::string_view text, seed_t& seed) noexcept {
+    if (text == "random") {
+        seed.value = static_cast<std::uint32_t>(std::random_device {}());
+        return argument_status_t::parsed_k;
+    }
+    auto const [end, error] = std::from_chars(text.data(), text.data() + text.size(), seed.value);
+    if (error == std::errc::result_out_of_range) return argument_status_t::out_of_range_k;
+    if (error != std::errc {} || end != text.data() + text.size()) return argument_status_t::invalid_number_k;
+    return argument_status_t::parsed_k;
+}
+
+/** Keeps @p text as the filter, compiled once as an ECMAScript regex when it compiles; any text parses. */
+[[nodiscard]] inline argument_status_t parse_filter(std::string_view text, filter_t& filter) noexcept {
+    filter.text = text;
+    filter.pattern.reset();
+    try {
+        filter.pattern.emplace(text.begin(), text.end());
+    }
+    catch (std::regex_error const&) {
+        // Left empty, so `selects` finds the filter as a plain substring instead.
+    }
+    return argument_status_t::parsed_k;
+}
+
 /** Selects the name in @p choice equal to @p text. */
 [[nodiscard]] inline argument_status_t parse_choice(std::string_view text, choice_t& choice) noexcept {
     for (std::size_t index = 0; index != choice.names.size(); ++index) {
@@ -288,6 +348,8 @@ inline constexpr std::array<unit_t, 4> duration_units_k {{
         return parse_duration(value, **duration);
     if (auto const* texts = std::get_if<texts_t*>(&flag.destination)) return parse_texts(value, **texts);
     if (auto const* choice = std::get_if<choice_t*>(&flag.destination)) return parse_choice(value, **choice);
+    if (auto const* seed = std::get_if<seed_t*>(&flag.destination)) return parse_seed(value, **seed);
+    if (auto const* filter = std::get_if<filter_t*>(&flag.destination)) return parse_filter(value, **filter);
     return argument_status_t::unexpected_value_k;
 }
 
@@ -346,7 +408,11 @@ inline constexpr std::array<unit_t, 4> duration_units_k {{
 
         std::string_view const value = equals != std::string_view::npos ? argument.substr(equals + 1) : argv[++index];
         result.status = assign_(*flag, value);
-        if (result.status != argument_status_t::parsed_k) return result;
+        if (result.status != argument_status_t::parsed_k) {
+            result.flag = flag;
+            result.value = value;
+            return result;
+        }
     }
     result.argument = {};
     return result;
@@ -387,6 +453,84 @@ inline void print_usage(std::string_view synopsis, std::span<flag_t const> flags
                          fmt::join(names, "|"));
     }
     fmt::println("  --help{:{}}print this message", "", column_k - 6);
+}
+
+/** Spells @p duration as a user types it: whole seconds as "10s", anything else as "1500ms". */
+inline std::string spell_duration(std::chrono::milliseconds duration) {
+    auto const count = duration.count();
+    return count % 1000 ? std::to_string(count) + "ms" : std::to_string(count / 1000) + "s";
+}
+
+/** Spells @p bytes as a user types it, in the largest binary unit dividing it, like "256MB". */
+inline std::string spell_size(std::size_t bytes) {
+    constexpr std::array<char const*, 5> units {"", "KB", "MB", "GB", "TB"};
+    std::size_t power = 0;
+    while (power + 1 != units.size() && bytes && bytes % 1024 == 0) bytes /= 1024, ++power;
+    return std::to_string(bytes) + units[power];
+}
+
+/** The grammar the value of @p flag takes, which a failure line ends with. */
+[[nodiscard]] inline std::string expected_(flag_t const& flag) {
+    if (auto const* count = std::get_if<count_t*>(&flag.destination)) {
+        std::size_t const minimum = (*count)->minimum, maximum = (*count)->maximum;
+        if (maximum != std::numeric_limits<std::size_t>::max())
+            return fmt::format("a count from {} to {}", minimum, maximum);
+        return minimum == 1 ? "a positive count" : fmt::format("a count of at least {}", minimum);
+    }
+    if (auto const* counts = std::get_if<counts_t*>(&flag.destination))
+        return (*counts)->minimum_size == (*counts)->maximum_size
+                   ? fmt::format("{} positive counts like 32,64,128", (*counts)->minimum_size)
+                   : "positive counts like 64,128";
+    if (std::holds_alternative<bytes_t*>(flag.destination)) return "a size like 4096, 64KB or 1GB";
+    if (std::holds_alternative<std::chrono::nanoseconds*>(flag.destination)) return "a duration like 200ms or 10s";
+    if (std::holds_alternative<seed_t*>(flag.destination)) return "an unsigned integer or random";
+    if (auto const* choice = std::get_if<choice_t*>(&flag.destination))
+        return fmt::format("one of {}", fmt::join((*choice)->names, ", "));
+    return "names separated by commas";
+}
+
+/** Prints why @p parsed failed as one line, like @c --threads="0" @c does @c not @c parse, @c expected @c a @c positive
+ *  @c count, when a value failed, or as the argument and the reason otherwise. */
+inline void print_error(arguments_t const& parsed) {
+    if (!parsed.flag) return fmt::println(stderr, "{}: {}", parsed.argument, describe(parsed.status));
+    fmt::println(stderr, "{}=\"{}\" does not parse, expected {}", parsed.flag->name, parsed.value,
+                 expected_(*parsed.flag));
+}
+
+/** The value of @p flag, spelled as a user types it, or "none" for empty text. */
+[[nodiscard]] inline std::string spell_value_(flag_t const& flag) {
+    if (auto const* text = std::get_if<std::string_view*>(&flag.destination))
+        return (*text)->empty() ? "none" : std::string(**text);
+    if (auto const* count = std::get_if<count_t*>(&flag.destination)) return std::to_string((*count)->value);
+    if (auto const* counts = std::get_if<counts_t*>(&flag.destination))
+        return fmt::format("{}", fmt::join((*counts)->view(), ","));
+    if (auto const* bytes = std::get_if<bytes_t*>(&flag.destination)) return spell_size((*bytes)->value);
+    if (auto const* duration = std::get_if<std::chrono::nanoseconds*>(&flag.destination))
+        return spell_duration(std::chrono::duration_cast<std::chrono::milliseconds>(**duration));
+    if (auto const* texts = std::get_if<texts_t*>(&flag.destination))
+        return (*texts)->size ? fmt::format("{}", fmt::join((*texts)->view(), ",")) : "none";
+    if (auto const* choice = std::get_if<choice_t*>(&flag.destination))
+        return std::string((*choice)->names[(*choice)->selected]);
+    if (auto const* toggle = std::get_if<switch_t*>(&flag.destination))
+        return **toggle == switch_t::present_k ? "true" : "false";
+    if (auto const* seed = std::get_if<seed_t*>(&flag.destination)) return std::to_string((*seed)->value);
+    filter_t const& filter = **std::get_if<filter_t*>(&flag.destination);
+    return filter.text.empty() ? "none" : std::string(filter.text);
+}
+
+/** Prints every flag as "- Label: value" in the grammar it parses from, labelled like "--time-limit" as "Time limit",
+ *  skipping a flag that a later one of the same name shadows. */
+inline void print_flags(std::span<flag_t const> flags) {
+    for (std::size_t index = 0; index != flags.size(); ++index) {
+        flag_t const& flag = flags[index];
+        auto const shadows = [&](flag_t const& later) noexcept { return later.name == flag.name; };
+        if (std::any_of(flags.begin() + index + 1, flags.end(), shadows)) continue;
+        std::string label {flag.label.empty() ? flag.name.substr(2) : flag.label};
+        for (char& character : label)
+            if (character == '-' && flag.label.empty()) character = ' ';
+        label.front() = static_cast<char>(std::toupper(static_cast<unsigned char>(label.front())));
+        fmt::println("- {}: {}", label, spell_value_(flag));
+    }
 }
 
 #pragma endregion Arguments
@@ -445,4 +589,4 @@ inline void open_engine(engine_options_t const& options, ustore_database_t* data
 
 #pragma endregion Engines
 
-} // namespace unum::ustore
+} // namespace unum::ustore::tools

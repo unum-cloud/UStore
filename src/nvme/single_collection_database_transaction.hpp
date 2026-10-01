@@ -26,8 +26,8 @@
 #include <smashtable/basic_hash_table.hpp> // `st::assume_reserved_t`
 #include <smashtable/basic_vector.hpp>     // `st::basic_vector`
 
-#include <ustore/status.hpp> // `status_t`, `status_code_t`
-#include <ustore/types.hpp>  // `byte_t`
+#include "ustore/status.hpp" // `status_t`, `status_code_t`
+#include "ustore/types.hpp"  // `byte_t`
 
 #include "nvme/collection_snapshot.hpp" // `select_result_t`
 #include "nvme/io_channel.hpp"          // `io_channel_t`

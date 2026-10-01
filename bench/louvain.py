@@ -6,7 +6,7 @@ a `networkx.Graph`, and this baseline over a `ustore.graph_view.Graph` whose eve
 
 Run:
     python bench/louvain.py --dataset data/snap-email/email-Eu-core.txt
-    python bench/louvain.py --vertices 1000 --communities 10
+    python bench/louvain.py --vertices 4096 --communities 16
 """
 
 import argparse
@@ -154,8 +154,12 @@ def load_graph(settings: argparse.Namespace) -> networkx.Graph:
     if settings.dataset is not None:
         return networkx.read_edgelist(settings.dataset, nodetype=int)
     size = settings.vertices // settings.communities
+    outer_size = size * (settings.communities - 1)
+    # Peers draw edges into a vertex too, so `degree` drawn per vertex is a pair probability of `2 * degree / peers`.
+    inner_probability = min(1.0, 2 * settings.inner_degree / (size - 1))
+    outer_probability = min(1.0, 2 * settings.outer_degree / outer_size) if outer_size else 0.0
     return networkx.planted_partition_graph(
-        settings.communities, size, settings.inner_probability, settings.outer_probability, seed=settings.seed
+        settings.communities, size, inner_probability, outer_probability, seed=settings.seed
     )
 
 
@@ -171,10 +175,10 @@ def main() -> None:
     parser.add_argument("--dataset", type=Path, help="SNAP edge list; a planted partition is generated without it")
     parser.add_argument("--engine", choices=ustore.engines_compiled(), default="ram", help="engine to open")
     parser.add_argument("--directory", type=Path, help="directory the UStore graph persists in; in memory otherwise")
-    parser.add_argument("--vertices", type=int, default=1000, help="vertices of the generated graph")
-    parser.add_argument("--communities", type=int, default=10, help="communities of the generated graph")
-    parser.add_argument("--inner-probability", type=float, default=0.1, help="edge probability inside a community")
-    parser.add_argument("--outer-probability", type=float, default=0.001, help="edge probability between them")
+    parser.add_argument("--vertices", type=int, default=4096, help="vertices of the generated graph")
+    parser.add_argument("--communities", type=int, default=16, help="communities planted in the generated graph")
+    parser.add_argument("--inner-degree", type=int, default=8, help="edges each vertex draws inside its community")
+    parser.add_argument("--outer-degree", type=int, default=1, help="edges each vertex draws across communities")
     parser.add_argument("--seed", type=int, default=42, help="seed of the generated graph and of NetworkX's Louvain")
     settings = parser.parse_args()
 

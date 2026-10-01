@@ -22,15 +22,15 @@
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 #include <stringzilla/stringzilla.hpp> // `sz::string_t`, `sz::string_view_t`
 
-#include <ustore/blobs.h>   // `ustore_scan_t`, `ustore_read_t`
-#include <ustore/docs.h>    // `ustore_docs_write_t`, `ustore_docs_read_t`
-#include <ustore/graph.h>   // `ustore_graph_upsert_edges_t`
-#include <ustore/types.hpp> // `sz`, `st`
+#include "ustore/blobs.h"   // `ustore_scan_t`, `ustore_read_t`
+#include "ustore/docs.h"    // `ustore_docs_write_t`, `ustore_docs_read_t`
+#include "ustore/graph.h"   // `ustore_graph_upsert_edges_t`
+#include "ustore/types.hpp" // `sz`, `st`
 
 #include "dataset.h"                  // `ustore_docs_import_t`, `ustore_graph_export_t`
 #include "helpers/blocking_files.hpp" // `mapped_file_t`
 
-namespace unum::ustore {
+namespace unum::ustore::tools {
 
 #pragma region Files
 
@@ -749,12 +749,13 @@ void import_csv_edges(ustore_graph_import_t const& task, sz::string_view_t text,
 
 #pragma endregion Graph
 
-} // namespace unum::ustore
+} // namespace unum::ustore::tools
 
 #pragma region C Interface
 
 void ustore_docs_import(ustore_docs_import_t* task_pointer) {
     using namespace unum::ustore;
+    using namespace unum::ustore::tools;
     ustore_docs_import_t const& task = *task_pointer;
 
     if (!task.db) {
@@ -802,6 +803,7 @@ void ustore_docs_import(ustore_docs_import_t* task_pointer) {
 
 void ustore_docs_export(ustore_docs_export_t* task_pointer) {
     using namespace unum::ustore;
+    using namespace unum::ustore::tools;
     ustore_docs_export_t const& task = *task_pointer;
 
     if (!task.db) {
@@ -884,6 +886,7 @@ void ustore_docs_export(ustore_docs_export_t* task_pointer) {
 
 void ustore_graph_import(ustore_graph_import_t* task_pointer) {
     using namespace unum::ustore;
+    using namespace unum::ustore::tools;
     ustore_graph_import_t const& task = *task_pointer;
 
     if (!task.db) {
@@ -920,6 +923,7 @@ void ustore_graph_import(ustore_graph_import_t* task_pointer) {
 
 void ustore_graph_export(ustore_graph_export_t* task_pointer) {
     using namespace unum::ustore;
+    using namespace unum::ustore::tools;
     ustore_graph_export_t const& task = *task_pointer;
 
     if (!task.db) {

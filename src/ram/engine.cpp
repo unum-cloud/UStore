@@ -47,11 +47,11 @@
 #include <smashtable/snapshot_store.hpp>
 #include <stringzilla/stringzilla.hpp>
 
-#include <ustore/blobs.h>
-#include <ustore/db.h>
-#include <ustore/graph.h>
-#include <ustore/ranges_args.hpp> // `places_arg_t`, `contents_arg_t`, `scans_arg_t`, `strings_arg_t`, `find_edges_t`
-#include <ustore/strings.h>
+#include "ustore/blobs.h"
+#include "ustore/db.h"
+#include "ustore/graph.h"
+#include "ustore/ranges_args.hpp" // `places_arg_t`, `contents_arg_t`, `scans_arg_t`, `strings_arg_t`, `find_edges_t`
+#include "ustore/strings.h"
 
 #include "engine.hpp"                 // `engine_t`, `handle_t`, `handle_cast`
 #include "helpers/blocking_files.hpp" // `directory_exists`

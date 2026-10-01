@@ -27,8 +27,8 @@
 
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
-#include <ustore/status.hpp> // `status_t`, `status_code_t`, `expected`
-#include <ustore/types.hpp>  // `byte_t`
+#include "ustore/status.hpp" // `status_t`, `status_code_t`, `expected`
+#include "ustore/types.hpp"  // `byte_t`
 
 #include "nvme/buffer_pool.hpp"      // `pooled_buffer_t`
 #include "nvme/catalog.hpp"          // `blob_name_t`, `blob_kind_t`, `magic_of`

@@ -419,17 +419,13 @@ int main(int argc, char** argv) {
     std::array<flag_t, 3> const flags {{
         {"--stored-values", "count", "stored values every case writes into the cache", &options.stored_values},
         {"--empty-value-step", "count", "every this many stored values is empty", &options.empty_value_step},
-        {"--value-max-size", "size", "largest stored value the cache admits, like 10KiB", &options.value_max_size},
+        {"--value-max-size", "size", "largest stored value the cache admits, like 10KB", &options.value_max_size},
     }};
     suite_options_t suite;
     if (argument_status_t const status = parse_suite_options(argc, argv, suite, flags);
         status != argument_status_t::parsed_k)
         return status == argument_status_t::help_k ? 0 : 1;
     suite_totals_t totals = suite.totals();
-    if (options.empty_value_step.value == 0) {
-        fmt::println(stderr, "--empty-value-step: must be positive");
-        return 1;
-    }
     if (options.value_max_size.value == 0 ||
         options.value_max_size.value > std::numeric_limits<stored_value_size_t>::max()) {
         fmt::println(stderr, "--value-max-size: must be positive and fit a stored value size");

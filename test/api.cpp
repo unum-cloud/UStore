@@ -16,7 +16,7 @@
 
 #include <fmt/format.h>
 
-#include <ustore/ustore.hpp>
+#include "ustore/ustore.hpp"
 
 #include "test.hpp" // `suite_exit_code`, `expect`, `expect_error`
 

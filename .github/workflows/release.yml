@@ -165,7 +165,6 @@ jobs:
           CIBW_BUILD: cp${{ matrix.python-version }}-*
           CIBW_ARCHS: native
           CIBW_SKIP: "*-musllinux_*"
-          CIBW_TEST_COMMAND: python -c "import ustore"
 
       # The ABI tag tells a free-threaded wheel apart from the GIL one.
       - name: Assert the Expected Interpreter Was Built

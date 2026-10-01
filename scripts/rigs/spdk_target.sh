@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Brings up an SPDK NVMe/TCP target exporting one RAM-backed namespace without hugepages, or tears it down.
-# Usage: USTORE_SPDK_ROOT=<spdk tree> spdk_target.sh up [size_mib] | down | address | serial
-# The namespace is 0.25 MiB of 4096-byte blocks by default, the 64-block volume the shared ring cases assume.
+# Usage: USTORE_SPDK_ROOT=<spdk tree> spdk_target.sh up [size_mb] | down | address | serial
+# The namespace is 0.25 MB of 4096-byte blocks by default, the 64-block volume the shared ring cases assume.
 set -euo pipefail
 
 root=${USTORE_SPDK_ROOT:?set USTORE_SPDK_ROOT to an SPDK tree with a finished build}
@@ -11,7 +11,7 @@ subsystem_nqn=nqn.2026-09.io.ustore:malloc
 serial=USTORE00000000000001
 model=USTORE_Malloc
 port=4420
-size_mib=${2:-0.25}
+size_mb=${2:-0.25}
 target=$root/build/bin/nvmf_tgt
 rpc="$root/scripts/rpc.py -s $socket"
 
@@ -51,7 +51,7 @@ up() {
         sleep 0.1
     done
     $rpc nvmf_create_transport -t TCP -u 16384 -m 8 -c 8192 >&2
-    $rpc bdev_malloc_create -b Malloc0 "$size_mib" 4096 >&2
+    $rpc bdev_malloc_create -b Malloc0 "$size_mb" 4096 >&2
     $rpc nvmf_create_subsystem "$subsystem_nqn" -a -s "$serial" -d "$model" >&2
     $rpc nvmf_subsystem_add_ns "$subsystem_nqn" Malloc0 >&2
     local candidate address=""
@@ -98,5 +98,5 @@ up) up ;;
 down) down ;;
 address) address ;;
 serial) echo "$serial" ;;
-*) echo "usage: $0 up [size_mib] | down | address | serial" >&2; exit 2 ;;
+*) echo "usage: $0 up [size_mb] | down | address | serial" >&2; exit 2 ;;
 esac

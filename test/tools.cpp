@@ -27,8 +27,8 @@
 #include <smashtable/basic_vector.hpp>
 #include <stringzilla/stringzilla.hpp>
 
-#include <ustore/db.h>
-#include <ustore/strings.h>
+#include "ustore/db.h"
+#include "ustore/strings.h"
 
 #include "dataset.h"
 #include "test.hpp" // `suite_exit_code`, `create_directories`, `expect`
@@ -815,10 +815,10 @@ template <typename... arguments_type_>
 
         failures += expect_eq(
             run_command(cli, "--engine", engine, "--directory", directory, "collection", "import", "--input", input,
-                        "--id-field", "id", "--memory-limit", "1MiB", "--collection", collection),
+                        "--id-field", "id", "--memory-limit", "1MB", "--collection", collection),
             0);
         failures += expect_eq(run_command(cli, "--engine", engine, "--directory", directory, "collection", "export",
-                                          "--output", output, "--memory-limit", "1MiB", "--collection", collection),
+                                          "--output", output, "--memory-limit", "1MB", "--collection", collection),
                               0);
         failures += check_documents(output, input, field_selection_t::whole_k);
         [[maybe_unused]] int const removed_named = std::remove(output);
@@ -833,10 +833,10 @@ template <typename... arguments_type_>
     }
 
     failures += expect_eq(run_command(cli, "--engine", engine, "--directory", directory, "collection", "import",
-                                      "--input", input, "--id-field", "id", "--memory-limit", "1MiB"),
+                                      "--input", input, "--id-field", "id", "--memory-limit", "1MB"),
                           0);
     failures += expect_eq(run_command(cli, "--engine", engine, "--directory", directory, "collection", "export",
-                                      "--output", output, "--memory-limit", "1MiB"),
+                                      "--output", output, "--memory-limit", "1MB"),
                           0);
     failures += check_documents(output, input, field_selection_t::whole_k);
     [[maybe_unused]] int const removed_main = std::remove(output);

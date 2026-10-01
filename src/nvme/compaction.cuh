@@ -35,7 +35,7 @@
 #include <smashtable/basic_vector.hpp>
 #include <smashtable/shared.hpp>
 
-#include <ustore/types.hpp>
+#include "ustore/types.hpp"
 
 #include "cuda.hpp"                  // `cuda_stream_t`
 #include "nvme/stored_key.hpp"       // `limit`, `stored_key_concept`

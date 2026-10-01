@@ -14,7 +14,7 @@
 
 #include <smashtable/shared.hpp>
 
-#include <ustore/types.hpp> // `value_layout_t`
+#include "ustore/types.hpp" // `value_layout_t`
 
 #include "cuda.hpp"            // `cuda_count_devices`, `cuda_stream_t`
 #include "nvme/compaction.cuh" // `compaction_kind_t`, `compaction_output`, `gpu_compactor_t`

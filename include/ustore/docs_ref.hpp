@@ -13,12 +13,12 @@
 #include <type_traits> // `std::conditional_t`, `std::decay_t`
 #include <utility>     // `std::forward`, `std::move`
 
-#include <ustore/docs.h>
-#include <ustore/docs_table.hpp>  // `docs_table`, `table_header`, `table_header_view_t`
-#include <ustore/ranges.hpp>      // `embedded_blobs_t`, `bits_span_t`, `joined_strs_t`
-#include <ustore/ranges_args.hpp> // `location_store`, `places_arg_extractor`, `contents_arg_extractor`
-#include <ustore/status.hpp>      // `status_t`, `expected`
-#include <ustore/types.hpp>       // `arena_t`
+#include "ustore/docs.h"
+#include "ustore/docs_table.hpp"  // `docs_table`, `table_header`, `table_header_view_t`
+#include "ustore/ranges.hpp"      // `embedded_blobs_t`, `bits_span_t`, `joined_strs_t`
+#include "ustore/ranges_args.hpp" // `location_store`, `places_arg_extractor`, `contents_arg_extractor`
+#include "ustore/status.hpp"      // `status_t`, `expected`
+#include "ustore/types.hpp"       // `arena_t`
 
 namespace unum::ustore {
 

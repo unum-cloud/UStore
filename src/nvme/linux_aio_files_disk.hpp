@@ -43,8 +43,8 @@
 #include <forkunion/capabilities.hpp>  // `fu::preferred_yield_t`
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
-#include <ustore/status.hpp> // `status_t`, `status_code_t`, `expected`
-#include <ustore/types.hpp>  // `byte_t`
+#include "ustore/status.hpp" // `status_t`, `status_code_t`, `expected`
+#include "ustore/types.hpp"  // `byte_t`
 
 #include "nvme/blocking_files_disk.hpp"    // `native_file_t`, `open_native_file`, `flush_native_file`
 #include "nvme/disk.hpp"                   // `calling_thread_identity`
@@ -61,7 +61,7 @@ namespace unum::ustore::nvme {
  *  @brief What a mount fixes about a Linux AIO disk before any queue pair takes a share of it.
  *
  *  Depth is the number worth tuning, as it is for io_uring: one thread at a depth of 256 reads
- *  4 KiB blocks about thirty times faster than @c pread on the same thread, since the queue rather
+ *  4 KB blocks about thirty times faster than @c pread on the same thread, since the queue rather
  *  than the thread keeps a drive busy.
  */
 struct linux_aio_disk_config_t {

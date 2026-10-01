@@ -23,8 +23,8 @@
 
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
-#include <ustore/status.hpp> // `status_t`, `status_code_t`, `expected`
-#include <ustore/types.hpp>  // `byte_t`
+#include "ustore/status.hpp" // `status_t`, `status_code_t`, `expected`
+#include "ustore/types.hpp"  // `byte_t`
 
 #include "nvme/aligned_allocator.hpp"     // `aligned_allocator`
 #include "nvme/constrained_allocator.hpp" // `resource_constraint_t`

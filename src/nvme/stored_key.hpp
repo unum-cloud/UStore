@@ -14,7 +14,7 @@
 
 #include <smashtable/shared.hpp> // `st::hash`
 
-#include <ustore/types.hpp> // the `st` alias
+#include "ustore/types.hpp" // the `st` alias
 
 namespace unum::ustore::nvme {
 

@@ -25,7 +25,7 @@
 
 #include <smashtable/shared.hpp>
 
-#include <ustore/types.hpp>
+#include "ustore/types.hpp"
 
 namespace unum::ustore {
 

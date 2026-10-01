@@ -36,8 +36,8 @@
 #include <forkunion/capabilities.hpp>  // `fu::preferred_yield_t`
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
-#include <ustore/status.hpp> // `status_t`, `status_code_t`, `expected`
-#include <ustore/types.hpp>  // `byte_t`
+#include "ustore/status.hpp" // `status_t`, `status_code_t`, `expected`
+#include "ustore/types.hpp"  // `byte_t`
 
 #include "nvme/buffer_pool.hpp"                            // `pooled_buffer_t`
 #include "nvme/catalog.hpp"                                // `blob_kind_t`, `blob_name_t`

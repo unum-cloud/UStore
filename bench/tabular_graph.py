@@ -31,7 +31,7 @@ MEBIBYTE = 1 << 20
 
 
 def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0], allow_abbrev=False)
     parser.add_argument("--dataset", type=Path, required=True, help="directory of input files")
     parser.add_argument("--format", choices=["ndjson", "csv"], default="ndjson", help="format of inputs and exports")
     parser.add_argument("--engine", choices=ustore.engines_compiled(), default="ram", help="engine to open")
@@ -41,16 +41,15 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--target-field", required=True, help="integer field holding the target vertex")
     parser.add_argument("--edge-field", required=True, help="field holding the edge key")
     parser.add_argument("--threads", type=int, default=1, help="import threads")
-    parser.add_argument("--max-input-files", type=int, default=10, help="files each import thread takes")
+    parser.add_argument("--max-input-files-total", type=int, default=10, help="input files listed from the dataset")
     parser.add_argument("--batch-rows", type=int, default=1 << 16, help="rows one write carries")
     return parser.parse_args()
 
 
 def list_files(settings: argparse.Namespace) -> list[Path]:
-    """Up to `max_input_files` files per thread with the extension of the requested format."""
-    wanted = settings.max_input_files * settings.threads
+    """Up to `max_input_files_total` files with the extension of the requested format."""
     found = sorted(path for path in settings.dataset.iterdir() if path.suffix == f".{settings.format}")
-    return found[:wanted]
+    return found[: settings.max_input_files_total]
 
 
 def read_table(path: Path, file_format: str) -> pyarrow.Table:
@@ -72,7 +71,7 @@ def integer_column(table: pyarrow.Table, field: str) -> np.ndarray:
 
 def report(name: str, processed_bytes: int, duration: float) -> None:
     rate = processed_bytes / MEBIBYTE / duration if duration else float("inf")
-    print(f"{name}: {rate:.2f} MiB/s, {processed_bytes / MEBIBYTE:.2f} MiB in {duration:.3f} s", flush=True)
+    print(f"{name}: {rate:.2f} MB/s, {processed_bytes / MEBIBYTE:.2f} MB in {duration:.3f} s", flush=True)
 
 
 def run_threads(files: list[Path], settings: argparse.Namespace, import_file: Callable[[Path], int]) -> int:

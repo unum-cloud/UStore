@@ -25,9 +25,9 @@
 #include <smashtable/shared.hpp>       // `st::status_t`, `st::default_allocator`
 #include <stringzilla/stringzilla.hpp> // `sz::string_t`
 
-#include <ustore/db.h>       // `ustore_status_t`, `ustore_error_t`
-#include <ustore/status.hpp> // `status_t`, `status_code_t`, `expected`
-#include <ustore/types.hpp>  // `byte_t`, the `st` and `sz` aliases
+#include "ustore/db.h"       // `ustore_status_t`, `ustore_error_t`
+#include "ustore/status.hpp" // `status_t`, `status_code_t`, `expected`
+#include "ustore/types.hpp"  // `byte_t`, the `st` and `sz` aliases
 
 #include "cuda.hpp" // `cuda_device_allocator`, when the toolkit is on the include path
 

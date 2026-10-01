@@ -36,7 +36,7 @@ A skip names the reason a case did not run, so a suite passing on nothing is vis
 
 ### Conformance
 
-The C ABI scenarios — collections, transactions, snapshots, scans, documents and graphs — are written once and compiled into one executable per suite and engine, named `ustore_test_<suite>_<engine>`, such as `ustore_test_units_rocksdb`.
+The C ABI scenarios — collections, transactions, snapshots, scans, documents and graphs — are written once and compiled into one executable per suite, named `ustore_test_<suite>`, which CTest runs once per engine as `ustore_test_<suite>_<engine>`, such as `ustore_test_units_rocksdb`.
 Every engine answers the same questions, and the translation units build in parallel.
 `units.cpp` drives blobs, documents and graphs through the C++ wrappers, `api.cpp` checks that the C ABI accepts valid argument combinations and rejects malformed ones, and `compilation.cpp` calls every wrapper in each accepted form, so a broken call site fails to build.
 Each suite asks the open database through `ustore_get_metadata` whether it supports named collections, transactions and snapshots, and a case needing a missing capability returns without checks.
@@ -77,18 +77,62 @@ Executables land in `build_debug/build/bin/`.
 ### Flags
 
 Every suite takes its inputs as flags and reads no environment variable, and `--help` prints the flags it accepts.
+A suite echoes every flag as `- Name: value` before its cases, and a value that does not parse prints one `--flag="value" does not parse, expected <grammar>` line and exits with status 1.
+The engine, isolation and transport flags matter only to the engine suites.
 
-| Flag                       | Suites        | Meaning                                                                 |
-| :------------------------- | :------------ | :---------------------------------------------------------------------- |
-| `--directory <path>`       | Every suite   | Parent of the unique directory the suite works in, created when missing |
-| `--device <path>`          | Engine suites | Block device the `device` transport opens, skipped when absent          |
-| `--spdk-address <address>` | Engine suites | PCIe address of the NVMe device SPDK binds, skipped when absent         |
-| `--transports <names>`     | Engine suites | Transports to mount, like `memory,linux-uring`, all when absent         |
-| `--threads <count>`        | Every suite   | Threads the concurrent cases fan out over, every core when absent       |
-| `--cli <path>`             | `tools.cpp`   | The CLI executable the CLI round trip drives                            |
-| `--seed <number>`          | Every suite   | The seed every random draw descends from, drawn and printed when absent |
-| `--no-skips`               | Every suite   | Exit with code 3 when any case skipped, for a rig that must be present  |
-| `--filter <regex>`         | Every suite   | Run only the cases whose label it matches, like `^lsm\.ram\.flush`      |
+| Flag                        | Default               | Meaning                                                        |
+| :-------------------------- | :-------------------- | :------------------------------------------------------------- |
+| `--directory <path>`        | None                  | Parent of the unique directory the suite works in              |
+| `--device <path>`           | None                  | Block device the `device` transport opens, skipped when absent |
+| `--spdk-address <address>`  | None                  | PCIe address of the device SPDK binds, skipped when absent     |
+| `--transports <names>`      | Every transport       | Transports to mount, like `memory,linux-uring`                 |
+| `--engine <name>`           | `ram`                 | Engine to open: `ram`, `rocksdb`, `leveldb` or `nvme`          |
+| `--isolation <name>`        | `strict-serializable` | Isolation of `ram` transactions, or `snapshot`                 |
+| `--engine-transport <name>` | `automatic`           | Transport of `nvme`, like `linux-uring`                        |
+| `--threads <count>`         | Every core            | Threads the concurrent cases fan out over                      |
+| `--seed <number>`           | `42`                  | The seed every random draw descends from, or `random`          |
+| `--no-skips`                | Off                   | Exit with code 3 when any case skipped                         |
+| `--filter <regex>`          | Every case            | Cases to run, by label, like `^lsm\.ram\.flush`                |
+
+`tools.cpp` also takes:
+
+| Flag           | Default | Meaning                                                           |
+| :------------- | :------ | :---------------------------------------------------------------- |
+| `--cli <path>` | None    | The CLI executable the CLI round trip drives, skipped when absent |
+
+`nvme_linux_spdk.cpp` also takes:
+
+| Flag                   | Default   | Meaning                                                        |
+| :--------------------- | :-------- | :------------------------------------------------------------- |
+| `--spdk-root <path>`   | None      | SPDK tree with a finished build, whose target the suite starts |
+| `--spdk-serial <text>` | The rig's | Serial the controller must identify as                         |
+
+`nvme_write_buffer.cpp` also takes:
+
+| Flag                         | Default | Meaning                                            |
+| :--------------------------- | :------ | :------------------------------------------------- |
+| `--stored-values <count>`    | `1000`  | Stored values every case writes into the cache     |
+| `--empty-value-step <count>` | `50`    | Every this many stored values is empty             |
+| `--value-max-size <size>`    | `10000` | Largest stored value the cache admits, like `10KB` |
+
+`nvme_single_collection_database_transaction.cu` and `nvme_database_transaction.cu` also take:
+
+| Flag                                | Default | Meaning                                                            |
+| :---------------------------------- | :------ | :----------------------------------------------------------------- |
+| `--population <count>`              | `10000` | Stored values every case inserts into each collection              |
+| `--empty-stored-value-step <count>` | `500`   | Every this many stored values is empty in the variable-width cases |
+
+`nvme_single_collection_database_transaction_stress.cu` also takes:
+
+| Flag                   | Default | Meaning                          |
+| :--------------------- | :------ | :------------------------------- |
+| `--population <count>` | `10000` | Keys every case writes and reads |
+
+`nvme_compaction.cu` also takes:
+
+| Flag                       | Default  | Meaning                                                       |
+| :------------------------- | :------- | :------------------------------------------------------------ |
+| `--large-universe <count>` | `600000` | Random keys of the large cases, which cross the GPU threshold |
 
 With `--directory`, a suite creates a unique `ustore-XXXXXX` directory under the path, runs every case inside it, and removes it with its contents at exit, so parallel runs never share a database.
 Without it, the engine runs on its default configuration, and the cases that need persistence or files report `skipped`.
@@ -107,31 +151,31 @@ build_debug/build/bin/ustore_test_tools --engine rocksdb --directory /dev/shm/us
 Stress suites are separate executables with a time bound, run on demand and in nightly CI rather than on every push.
 Atomicity batch-inserts intersecting key ranges from several threads in rounds, and checks after each round that every batch landed whole or not at all; on an engine without transactions its cases pass without checks.
 Linearizability replays concurrent write transactions in commit order and compares the result with the state the database holds; an engine without transactions reports it `skipped`.
-`--duration` bounds the whole run and is shared evenly by every configuration, each of which runs at least one round and at most `--checkpoints` rounds.
+`--time-limit` bounds the whole run and is shared evenly by every configuration, each of which runs at least one round and at most `--checkpoints` rounds.
 
 Both suites take these flags:
 
-| Flag                    | Meaning                            | Default |
-| :---------------------- | :--------------------------------- | :------ |
-| `--duration <duration>` | Bound of the whole run             | `10s`   |
-| `--checkpoints <count>` | Most rounds one configuration runs | `1000`  |
+| Flag                      | Default | Meaning                            |
+| :------------------------ | :------ | :--------------------------------- |
+| `--time-limit <duration>` | `10s`   | Bound of the whole run             |
+| `--checkpoints <count>`   | `1000`  | Most rounds one configuration runs |
 
 Atomicity also takes:
 
-| Flag                            | Meaning                                               | Default      |
-| :------------------------------ | :---------------------------------------------------- | :----------- |
-| `--threads <counts>`            | Thread counts, each run against every other list      | `4,8,13,16`  |
-| `--batch-sizes <counts>`        | Consecutive keys one transaction changes              | `10,100,150` |
-| `--keys <count>`                | Keys one round writes, split into batches             | `100000`     |
-| `--deletes-periodicity <count>` | One batch in this many is erased by the deleting case | `3`          |
+| Flag                            | Default      | Meaning                                               |
+| :------------------------------ | :----------- | :---------------------------------------------------- |
+| `--threads <counts>`            | `4,8,13,16`  | Thread counts, each run against every other list      |
+| `--batch-sizes <counts>`        | `10,100,150` | Consecutive keys one transaction changes              |
+| `--keys <count>`                | `100000`     | Keys one round writes, split into batches             |
+| `--deletes-periodicity <count>` | `3`          | One batch in this many is erased by the deleting case |
 
 Linearizability also takes:
 
-| Flag                       | Meaning                                                      | Default              |
-| :------------------------- | :----------------------------------------------------------- | :------------------- |
-| `--threads <counts>`       | Thread counts, each run against every other list             | `2,3,4,5,6,7,8,9,10` |
-| `--transactions <counts>`  | Transactions every thread commits between two checkpoints    | Listed below         |
-| `--writes-per-key <count>` | Mean writes one key receives per round, sizing the key range | `4`                  |
+| Flag                       | Default              | Meaning                                                      |
+| :------------------------- | :------------------- | :----------------------------------------------------------- |
+| `--threads <counts>`       | `2,3,4,5,6,7,8,9,10` | Thread counts, each run against every other list             |
+| `--transactions <counts>`  | Listed below         | Transactions every thread commits between two checkpoints    |
+| `--writes-per-key <count>` | `4`                  | Mean writes one key receives per round, sizing the key range |
 
 `--transactions` defaults to `1,2,3,4,5,6,7,8,9,10,20,50,100`.
 
@@ -141,5 +185,5 @@ Build them with the `release` preset and run them under a memory cap:
 cmake --preset release -DUSTORE_BUILD_TEST=1 -DUSTORE_WITH_ROCKSDB=1
 cmake --build --preset release
 systemd-run --user --scope -p MemoryMax=16G -p MemorySwapMax=0 -- \
-    build_release/build/bin/ustore_stress_atomicity --engine rocksdb --directory /dev/shm/ustore-stress --duration 1min
+    build_release/build/bin/ustore_stress_atomicity --engine rocksdb --directory /dev/shm/ustore-stress --time-limit 60s
 ```

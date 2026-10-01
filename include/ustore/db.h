@@ -67,7 +67,7 @@ typedef float ustore_float_t;
 /** The elementary piece of a string, such as a collection name. */
 typedef char ustore_char_t;
 
-/** The length of a value in bytes, or an offset into a tape of values, wide enough for a tape past 4 GiB. */
+/** The length of a value in bytes, or an offset into a tape of values, wide enough for a tape past 4 GB. */
 typedef uint64_t ustore_length_t;
 
 /** A pointer-sized unsigned integer. */

@@ -19,7 +19,7 @@
 
 #include <fmt/format.h>
 
-#include <ustore/ustore.h>
+#include "ustore/ustore.h"
 
 #include "test.hpp" // `suite_exit_code`, `expect`, `expect_eq`
 

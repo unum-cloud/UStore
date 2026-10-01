@@ -22,8 +22,8 @@
 
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
-#include <ustore/status.hpp> // `status_t`, `expected`
-#include <ustore/types.hpp>  // `byte_t`
+#include "ustore/status.hpp" // `status_t`, `expected`
+#include "ustore/types.hpp"  // `byte_t`
 
 #include "nvme/catalog.hpp"          // `catalog_t`, `crc32c`
 #include "nvme/extent_allocator.hpp" // `extent_allocator_t`

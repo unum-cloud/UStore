@@ -18,8 +18,8 @@
 #include <smashtable/shared.hpp>
 #include <stringzilla/stringzilla.hpp>
 
-#include <ustore/db.h>
-#include <ustore/types.hpp>
+#include "ustore/db.h"
+#include "ustore/types.hpp"
 
 namespace unum::ustore::ram {
 

@@ -35,7 +35,7 @@
 
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
-#include <ustore/status.hpp> // `status_t`, `status_code_t`, `expected`
+#include "ustore/status.hpp" // `status_t`, `status_code_t`, `expected`
 
 #include "nvme/blocking_files_disk.hpp"    // `blocking_files_disk_t`, `file_buffering_t`
 #include "nvme/files_disk.hpp"             // `any_files_disk_t`

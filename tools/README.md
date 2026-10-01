@@ -11,7 +11,7 @@ It opens the database in the `--directory` it is given, runs one command and exi
 cmake --preset release -DUSTORE_BUILD_TOOLS=1 -DUSTORE_WITH_ROCKSDB=1
 cmake --build --preset release --target ustore_cli
 build_release/build/bin/ustore_cli --engine rocksdb --directory /dev/shm/ustore \
-    collection import --input data/twitter/tweets.ndjson --id-field id --memory-limit 1GiB --collection tweets
+    collection import --input data/twitter/tweets.ndjson --id-field id --memory-limit 1GB --collection tweets
 ```
 
 | Command                  | Action                                                                              |
@@ -23,14 +23,14 @@ build_release/build/bin/ustore_cli --engine rocksdb --directory /dev/shm/ustore 
 | `collection export`      | Exports documents into `--output`, `--memory-limit` per batch                       |
 | `snapshot export <path>` | Takes a snapshot of the head and writes it to a path                                |
 
-| Flag                    | Meaning                                                                |
-| :---------------------- | :--------------------------------------------------------------------- |
-| `--directory <path>`    | Database directory; required                                           |
-| `--collection <name>`   | Collection a command acts on; the main collection when omitted         |
-| `--input <file>`        | File a collection import reads                                         |
-| `--output <file>`       | File a collection export writes                                        |
-| `--id-field <field>`    | Field holding the keys of imported documents, integers or UUID text    |
-| `--memory-limit <size>` | Bytes an import or export buffers per batch, such as `64MiB` or `1GiB` |
+| Flag                    | Meaning                                                              |
+| :---------------------- | :------------------------------------------------------------------- |
+| `--directory <path>`    | Database directory; required                                         |
+| `--collection <name>`   | Collection a command acts on; the main collection when omitted       |
+| `--input <file>`        | File a collection import reads                                       |
+| `--output <file>`       | File a collection export writes                                      |
+| `--id-field <field>`    | Field holding the keys of imported documents, integers or UUID text  |
+| `--memory-limit <size>` | Bytes an import or export buffers per batch, such as `64MB` or `1GB` |
 
 The file extension, `.ndjson` or `.csv`, selects the format, and `--help` prints the commands and the flags.
 

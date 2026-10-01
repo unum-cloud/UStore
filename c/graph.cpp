@@ -32,7 +32,7 @@
 #include <optional>   // `std::optional`
 #include <span>       // `std::span`
 
-#include <ustore/ustore.hpp> // `ustore_read`, `strided_range`, `embedded_blobs_t`
+#include "ustore/ustore.hpp" // `ustore_read`, `strided_range`, `embedded_blobs_t`
 
 #include "engine.hpp"                // `graph_find_edges_in_vertex_values`
 #include "helpers/algorithm.hpp"     // `offset_in_sorted`

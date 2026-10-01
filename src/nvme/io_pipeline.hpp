@@ -24,7 +24,7 @@
 
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
-#include <ustore/status.hpp> // `status_t`, `status_code_t`, `expected`
+#include "ustore/status.hpp" // `status_t`, `status_code_t`, `expected`
 
 #include "nvme/buffer_pool.hpp" // `pooled_buffer_t`
 #include "nvme/io_channel.hpp"  // `io_channel_t`

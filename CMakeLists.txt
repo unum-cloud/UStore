@@ -165,10 +165,6 @@ set(STRINGZILLA_INSTALL OFF)
 set(STRINGZILLA_USE_SANITIZERS OFF)
 add_subdirectory(stringzilla EXCLUDE_FROM_ALL)
 
-if (${USTORE_BUILD_BENCH})
-    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/gbench.cmake")
-endif ()
-
 # The host half of the compaction suite checks the comparator, the survival rule, the sorted-run split and the placement
 # without a device, so a plain test build registers it too.
 if (USTORE_BUILD_CUDA OR USTORE_BUILD_TEST)
@@ -355,13 +351,13 @@ endif ()
 # Benchmarks, each picking its engine with `--engine`
 if (${USTORE_BUILD_BENCH})
     add_executable(ustore_bench_twitter bench/twitter.cpp)
-    target_link_libraries(ustore_bench_twitter PRIVATE ustore benchmark::benchmark fmt::fmt ustore_warnings)
+    target_link_libraries(ustore_bench_twitter PRIVATE ustore fmt::fmt ustore_warnings)
 
     add_executable(ustore_bench_tabular_graph bench/tabular_graph.cpp tools/dataset.cpp)
-    target_link_libraries(ustore_bench_tabular_graph PRIVATE ustore benchmark::benchmark fmt::fmt ustore_warnings)
+    target_link_libraries(ustore_bench_tabular_graph PRIVATE ustore fmt::fmt ustore_warnings)
 
     add_executable(ustore_bench_louvain bench/louvain.cpp)
-    target_link_libraries(ustore_bench_louvain PRIVATE ustore benchmark::benchmark fmt::fmt ustore_warnings)
+    target_link_libraries(ustore_bench_louvain PRIVATE ustore fmt::fmt ustore_warnings)
 endif ()
 
 if (${USTORE_BUILD_LIB_PYTHON})

@@ -9,6 +9,23 @@
  *  so the gap between the two timings is the cost of reading each neighborhood through UStore.
  *  The store's adjacency is built by the upsert benchmark and the in-memory one before the run, so both
  *  community-detection benchmarks time the levels alone, plus the vertex scan the store needs.
+ *
+ *  Beside the flags of @c bench/harness.hpp, whose @c --seed also seeds the generated graph, it takes:
+ *
+ *  Flag                                   Default                Meaning
+ *  `--dataset`                            generated              SNAP edge list
+ *  `--directory`                          in memory              Database directory
+ *  `--engine`                             `ram`                  Engine to open
+ *  `--isolation`                          `strict-serializable`  Isolation of the transactions of `ram`
+ *  `--engine-transport`                   `automatic`            Transport of `nvme`
+ *  `--vertices`                           `4096`                 Vertices of the generated graph
+ *  `--communities`                        `16`                   Communities planted in the generated graph
+ *  `--inner-degree`                       `8`                    Edges a vertex draws in its community
+ *  `--outer-degree`                       `1`                    Edges a vertex draws across communities
+ *  `--max-edges`                          every edge             Edges kept from the dataset
+ *  `--batch-size-upsert`                  `1024`                 Edges per upsert batch
+ *  `--min-modularity-growth-per-billion`  `100`                  Billionths of modularity a level must add
+ *  `--max-levels`                         `32`                   Levels either run coarsens through
  */
 
 #include <cstddef> // `std::size_t`
@@ -19,30 +36,26 @@
 #include <charconv>    // `std::from_chars`
 #include <compare>     // `std::strong_ordering`
 #include <limits>      // `std::numeric_limits`
-#include <random>      // `std::mt19937_64`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 #include <utility>     // `std::move`, `std::swap`
 
-#include <benchmark/benchmark.h>
 #include <fmt/format.h>
 
 #include <smashtable/basic_vector.hpp>
 #include <stringzilla/stringzilla.hpp>
 
-#include <ustore/ustore.hpp>
+#include "ustore/ustore.hpp"
 
-#include "arguments.hpp"
+#include "harness.hpp"
 #include "helpers/blocking_files.hpp" // `mapped_file_t`
 
 namespace unum::ustore::bench {
 
-namespace bm = benchmark;
-
 #pragma region Settings
 
 /** Command-line options of the benchmark, each field set by the flag of the same name. */
-struct settings_t {
+struct settings_t : shared_settings_t {
 
     /** File holding one source and target pair per line; a graph is generated without it. */
     std::string_view dataset;
@@ -65,17 +78,14 @@ struct settings_t {
     /** Edges every generated vertex draws to any vertex of the graph. */
     count_t outer_degree {.value = 1, .minimum = 0};
 
-    /** Seed of the generated graph. */
-    count_t seed {42};
-
     /** Edges kept from the dataset, counted before repeats collapse. */
     count_t max_edges {std::numeric_limits<std::size_t>::max()};
 
     /** Edges every upsert batch carries into the graph collection. */
-    count_t upsert_batch_size {.value = 1024, .minimum = 1};
+    count_t batch_size_upsert {.value = 1024, .minimum = 1};
 
     /** Least modularity growth, in billionths, that justifies coarsening once more. */
-    count_t min_modularity_growth_per_billion {100};
+    count_t min_modularity_growth_per_billion {.value = 100, .minimum = 0};
 
     /** Levels either run coarsens through at most. */
     count_t max_levels {.value = 32, .minimum = 1};
@@ -151,17 +161,17 @@ status_t generate_edge_list(settings_t const& settings, st::basic_vector<input_e
     std::size_t const drawn_per_vertex = settings.inner_degree.value + settings.outer_degree.value;
     if (st::failed(edges.reserve(planted * drawn_per_vertex))) return status_code_t::out_of_memory_k;
 
-    std::mt19937_64 generator {settings.seed.value};
+    splitmix64_t random {stream_key(settings.seed.value, "edges", 0)};
     for (std::size_t vertex = 0; vertex != planted; ++vertex) {
         std::size_t const community_begin = (vertex / community_size) * community_size;
         ustore_key_t const source = key_from_integer(vertex);
         for (std::size_t drawn = 0; drawn != settings.inner_degree.value; ++drawn) {
-            ustore_key_t const target = key_from_integer(community_begin + generator() % community_size);
+            ustore_key_t const target = key_from_integer(community_begin + random.below(community_size));
             [[maybe_unused]] st::status_t const pushed = edges.push_back(st::assume_reserved,
                                                                          make_input_edge(source, target));
         }
         for (std::size_t drawn = 0; drawn != settings.outer_degree.value; ++drawn) {
-            ustore_key_t const target = key_from_integer(generator() % planted);
+            ustore_key_t const target = key_from_integer(random.below(planted));
             [[maybe_unused]] st::status_t const pushed = edges.push_back(st::assume_reserved,
                                                                          make_input_edge(source, target));
         }
@@ -577,56 +587,13 @@ expected<run_result_t> run_louvain(graph_type_& graph, settings_t const& setting
 
 #pragma region Benchmarks
 
-/** Upserts @p staged into @p graph in batches of @p batch_size, reporting the edges and bytes it wrote. */
-void bench_graph_upsert(bm::State& state, graph_collection_t& graph, std::span<edge_t const> staged,
-                        std::size_t batch_size) {
-    std::size_t committed = 0;
-    for ([[maybe_unused]] auto iteration : state) {
-        for (std::size_t offset = 0; offset < staged.size(); offset += batch_size) {
-            std::size_t const count = std::min(batch_size, staged.size() - offset);
-            edge_t const* const begin = staged.data() + offset;
-            status_t const upserted = graph.upsert_edges(edges_view_t {begin, begin + count});
-            if (upserted.failed()) {
-                state.SkipWithError(upserted.message ? upserted.message : "Failed to upsert a batch of edges");
-                return;
-            }
-            committed += count;
-        }
-    }
-    state.counters["edges/s"] = bm::Counter(static_cast<double>(committed), bm::Counter::kIsRate);
-    state.counters["bytes/s"] = bm::Counter(static_cast<double>(committed * sizeof(edge_t)), bm::Counter::kIsRate);
-}
-
-/** Runs Louvain over @p graph, reporting its modularity, communities and levels into @p result. */
+/** Runs Louvain over @p graph into @p result, counting its vertices, or skips @p loop on a failure. */
 template <typename graph_type_>
-void bench_louvain(bm::State& state, graph_type_& graph, settings_t const& settings, run_result_t& result) {
-    std::size_t vertices = 0;
-    for ([[maybe_unused]] auto iteration : state) {
-        auto [run, run_louvain_status] = run_louvain(graph, settings);
-        if (run_louvain_status.failed()) {
-            state.SkipWithError(run_louvain_status.message ? run_louvain_status.message
-                                                           : "Failed to detect communities");
-            return;
-        }
-        result = run;
-        vertices += graph.vertices_count();
-    }
-    state.counters["vertices/s"] = bm::Counter(static_cast<double>(vertices), bm::Counter::kIsRate);
-    state.counters["modularity"] = bm::Counter(result.modularity);
-    state.counters["communities"] = bm::Counter(static_cast<double>(result.communities_count));
-    state.counters["levels"] = bm::Counter(static_cast<double>(result.levels_count));
-}
-
-/** Runs Louvain over the graph collection, whose vertex scan and neighborhood reads it also times. */
-void bench_louvain_over_ustore(bm::State& state, graph_collection_t& graph, settings_t const& settings,
-                               run_result_t& result) {
-    auto [stored, make_stored_graph_status] = stored_graph_t::make(graph);
-    if (make_stored_graph_status.failed()) {
-        state.SkipWithError(make_stored_graph_status.message ? make_stored_graph_status.message
-                                                             : "Failed to scan the graph collection");
-        return;
-    }
-    bench_louvain(state, stored, settings, result);
+void louvain_call(loop_t& loop, graph_type_& graph, settings_t const& settings, run_result_t& result) noexcept {
+    auto [run, run_louvain_status] = run_louvain(graph, settings);
+    if (run_louvain_status.failed()) return loop.skip("failed to detect communities");
+    result = run;
+    loop.count(graph.vertices_count());
 }
 
 #pragma endregion Benchmarks
@@ -638,7 +605,7 @@ int main(int argc, char** argv) {
     using namespace unum::ustore::bench;
 
     settings_t settings;
-    std::array<flag_t, 14> const flags {{
+    std::array<flag_t, 13> const flags {{
         {"--dataset", "path", "SNAP edge list; a planted partition is generated without it", &settings.dataset},
         {"--engine", "name", "engine to open: ram, rocksdb, leveldb or nvme", &settings.engine.name},
         {"--isolation", "name", "isolation of the transactions of ram", &settings.engine.isolation},
@@ -648,27 +615,20 @@ int main(int argc, char** argv) {
         {"--communities", "count", "communities planted in the generated graph", &settings.communities},
         {"--inner-degree", "count", "edges each generated vertex draws inside its community", &settings.inner_degree},
         {"--outer-degree", "count", "edges each generated vertex draws across communities", &settings.outer_degree},
-        {"--seed", "count", "seed of the generated graph", &settings.seed},
         {"--max-edges", "count", "edges kept from the dataset", &settings.max_edges},
-        {"--upsert-batch-size", "count", "edges per upsert batch", &settings.upsert_batch_size},
+        {"--batch-size-upsert", "count", "edges per upsert batch", &settings.batch_size_upsert},
         {"--min-modularity-growth-per-billion", "count", "least modularity growth that justifies a level",
          &settings.min_modularity_growth_per_billion},
         {"--max-levels", "count", "levels either run coarsens through", &settings.max_levels},
     }};
 
-    // Google Benchmark exits on `--help` inside its initialization, so these flags print first
-    for (int index = 1; index < argc; ++index)
-        if (std::string_view {argv[index]} == "--help") {
-            print_usage(argv[0], flags);
-            break;
-        }
-    bm::Initialize(&argc, argv);
-    arguments_t const parsed = parse_arguments(argc, argv, flags, {});
-    if (parsed.status == argument_status_t::help_k) return 0;
-    if (parsed.status != argument_status_t::parsed_k) {
-        fmt::println(stderr, "{}: {}", parsed.argument, describe(parsed.status));
+    read_settings(argc, argv, settings, flags);
+    auto maybe_executor = executor_t::make(1, caller_exclusivity_t::caller_inclusive_k);
+    if (!maybe_executor) {
+        fmt::println(stderr, "Failed to pin the calling thread");
         return 1;
     }
+    executor_t& executor = *maybe_executor;
 
     st::basic_vector<input_edge_t> edges;
     status_t const loaded = settings.dataset.empty()
@@ -726,26 +686,41 @@ int main(int argc, char** argv) {
 
     run_result_t memory_result;
     run_result_t stored_result;
-    bm::RegisterBenchmark(
-        "graph_upsert",
-        [&](bm::State& state) { bench_graph_upsert(state, graph, staged, settings.upsert_batch_size.value); })
-        ->Iterations(1)
-        ->UseRealTime();
-    bm::RegisterBenchmark("louvain_in_memory",
-                          [&](bm::State& state) { bench_louvain(state, memory_graph, settings, memory_result); })
-        ->Iterations(1)
-        ->UseRealTime();
-    bm::RegisterBenchmark("louvain_over_ustore",
-                          [&](bm::State& state) { bench_louvain_over_ustore(state, graph, settings, stored_result); })
-        ->Iterations(1)
-        ->UseRealTime();
+    if (settings.selects("graph_upsert") || settings.selects("louvain_over_ustore")) {
+        std::size_t const batch_size = settings.batch_size_upsert.value;
+        std::span<edge_t const> const batches {staged.begin(), staged.end()};
+        row_t const upserted = run_pass(
+            executor, "graph_upsert", divide_round_up(batches.size(), batch_size),
+            [&](loop_t& loop, std::size_t) noexcept {
+                for (std::size_t call : loop) {
+                    std::span<edge_t const> const batch = batches.subspan(
+                        call * batch_size, std::min(batch_size, batches.size() - call * batch_size));
+                    if (graph.upsert_edges(edges_view_t {batch.data(), batch.data() + batch.size()}).failed())
+                        return loop.skip("failed to upsert a batch of edges");
+                    loop.count(batch.size(), batch.size() * sizeof(edge_t));
+                }
+            });
+        if (settings.selects("graph_upsert")) print(upserted);
+        if (upserted.skipped) return 1;
+    }
+    if (settings.selects("louvain_in_memory"))
+        print(run_pass(executor, "louvain_in_memory", 1, [&](loop_t& loop, std::size_t) noexcept {
+            for ([[maybe_unused]] std::size_t call : loop) louvain_call(loop, memory_graph, settings, memory_result);
+        }));
+    if (settings.selects("louvain_over_ustore"))
+        print(run_pass(executor, "louvain_over_ustore", 1, [&](loop_t& loop, std::size_t) noexcept {
+            for ([[maybe_unused]] std::size_t call : loop) {
+                auto [stored, make_stored_graph_status] = stored_graph_t::make(graph);
+                if (make_stored_graph_status.failed()) return loop.skip("failed to scan the graph collection");
+                louvain_call(loop, stored, settings, stored_result);
+            }
+        }));
 
-    bm::RunSpecifiedBenchmarks();
-    bm::Shutdown();
-
-    fmt::println("In memory: modularity {:.6f}, {} communities, {} levels", memory_result.modularity,
-                 memory_result.communities_count, memory_result.levels_count);
-    fmt::println("Over UStore: modularity {:.6f}, {} communities, {} levels", stored_result.modularity,
-                 stored_result.communities_count, stored_result.levels_count);
+    if (memory_result.levels_count)
+        fmt::println("In memory: modularity {:.6f}, {} communities, {} levels", memory_result.modularity,
+                     memory_result.communities_count, memory_result.levels_count);
+    if (stored_result.levels_count)
+        fmt::println("Over UStore: modularity {:.6f}, {} communities, {} levels", stored_result.modularity,
+                     stored_result.communities_count, stored_result.levels_count);
     return 0;
 }

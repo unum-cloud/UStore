@@ -15,7 +15,7 @@
 #include <smashtable/basic_hash_table.hpp> // `st::hash_map`, `st::assume_reserved_t`
 #include <smashtable/basic_vector.hpp>     // `st::basic_vector`
 
-#include <ustore/types.hpp> // the `fu` and `st` aliases
+#include "ustore/types.hpp" // the `fu` and `st` aliases
 
 #include "nvme/resources.hpp"    // `resources_shared_ptr_t`
 #include "nvme/stored_key.hpp"   // `limit`

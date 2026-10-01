@@ -25,7 +25,7 @@
 #include <forkunion/atomics.hpp>       // `fu::preferred_atomic_ref`
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
-#include <ustore/status.hpp> // `status_t`, `status_code_t`, `expected`
+#include "ustore/status.hpp" // `status_t`, `status_code_t`, `expected`
 
 #include "nvme/buffer_pool.hpp" // `buffer_pool_t`, `registered_memory_arena_t`
 #include "nvme/disk.hpp"        // `calling_thread_identity`

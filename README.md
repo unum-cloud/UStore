@@ -318,16 +318,16 @@ As we know, people use different languages for different purposes.
 Some C-level functionality isn't implemented for some languages.
 Either because there was no demand for it, or as we haven't gotten to it yet.
 
-| Name                        | Transact | Collections | Batches | Docs  | Graphs | Copies |
-| :-------------------------- | :------: | :---------: | :-----: | :---: | :----: | :----: |
-| [C99 Standard][ustore-c]    |    ✓     |      ✓      |    ✓    |   ✓   |   ✓    |   0    |
-|                             |          |             |         |       |        |        |
-| [C++ SDK][ustore-cpp]       |    ✓     |      ✓      |    ✓    |   ✓   |   ✓    |   0    |
-| [Python SDK][ustore-python] |    ✓     |      ✓      |    ✓    |   ✓   |   ✓    |  0-1   |
-| [GoLang SDK][ustore-golang] |    ✓     |      ✓      |    ✓    |   ✗   |   ✗    |   1    |
-| [Java SDK][ustore-java]     |    ✓     |      ✓      |    ✗    |   ✗   |   ✗    |   1    |
-|                             |          |             |         |       |        |        |
-| Arrow Flight API            |    ✓     |      ✓      |    ✓    |   ✓   |   ✓    |  0-2   |
+| Name                        | Transact | Collections | Batches | Docs | Graphs | Copies |
+| :-------------------------- | :------: | :---------: | :-----: | :--: | :----: | :----: |
+| [C99 Standard][ustore-c]    | ✓        | ✓           | ✓       | ✓    | ✓      | 0      |
+|                             |          |             |         |      |        |        |
+| [C++ SDK][ustore-cpp]       | ✓        | ✓           | ✓       | ✓    | ✓      | 0      |
+| [Python SDK][ustore-python] | ✓        | ✓           | ✓       | ✓    | ✓      | 0-1    |
+| [GoLang SDK][ustore-golang] | ✓        | ✓           | ✓       | ✗    | ✗      | 1      |
+| [Java SDK][ustore-java]     | ✓        | ✓           | ✗       | ✗    | ✗      | 1      |
+|                             |          |             |         |      |        |        |
+| Arrow Flight API            | ✓        | ✓           | ✓       | ✓    | ✓      | 0-2    |
 
 Some frontends here have entire ecosystems around them!
 [Apache Arrow Flight][flight] API, for instance, has its own drivers for  C, C++, C#, Go, Java, JavaScript, Julia, MATLAB, Python, R, Ruby and Rust.
