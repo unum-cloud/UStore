@@ -39,7 +39,7 @@ FIRST_MOVIE_KEY = 101
 NEW_MOVIE_KEY = 100
 TOP_RECOMMENDATIONS = 10
 REQUEST_TIMEOUT_SECONDS = 30
-USER_AGENT = "ustore-examples/1.0 (https://github.com/unum-cloud/ustore)"
+USER_AGENT = "ustore-examples/1.0 (https://github.com/unum-cloud/UStore)"
 
 PEOPLE = {
     ALICE: {"name": "Alice", "lastname": "Bobchinsky", "stars": 1200},

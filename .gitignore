@@ -71,3 +71,6 @@ target/
 
 # Editor and agent local state
 .claude/
+
+# Editors, assistants, language servers and tool caches
+.mypy_cache/

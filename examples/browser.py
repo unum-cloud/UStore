@@ -26,7 +26,7 @@ IMAGES_COLLECTION = "Images"
 
 FIRST_IMAGE_KEY = 50
 REQUEST_TIMEOUT_SECONDS = 30
-USER_AGENT = "ustore-examples/1.0 (https://github.com/unum-cloud/ustore)"
+USER_AGENT = "ustore-examples/1.0 (https://github.com/unum-cloud/UStore)"
 
 # Wikimedia refuses an anonymous request for a `thumb/` path, so every photograph is scaled through
 # `Special:FilePath`, which serves one and redirects to it.

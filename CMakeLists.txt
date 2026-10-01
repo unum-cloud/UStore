@@ -140,16 +140,31 @@ endif ()
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/fmt.cmake")
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/yyjson.cmake")
 
+# A sibling builds from its nested checkout, or from the directory `FETCHCONTENT_SOURCE_DIR_<NAME>` names when the
+# submodule is not initialized, as in a workspace that keeps the siblings side by side
+function (ustore_sibling NAME)
+    string(TOUPPER ${NAME} UPPER_NAME)
+    if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${NAME}/CMakeLists.txt")
+        add_subdirectory(${NAME} EXCLUDE_FROM_ALL)
+    elseif (DEFINED FETCHCONTENT_SOURCE_DIR_${UPPER_NAME})
+        add_subdirectory(
+            "${FETCHCONTENT_SOURCE_DIR_${UPPER_NAME}}" "${CMAKE_CURRENT_BINARY_DIR}/${NAME}" EXCLUDE_FROM_ALL
+        )
+    else ()
+        message(FATAL_ERROR "ustore: initialize the ${NAME} submodule or set FETCHCONTENT_SOURCE_DIR_${UPPER_NAME}")
+    endif ()
+endfunction ()
+
 # ForkUnion's C ABI, linked statically into every engine and suite
 set(FORKUNION_BUILD_TEST OFF)
 set(FORKUNION_INSTALL OFF)
-add_subdirectory(forkunion EXCLUDE_FROM_ALL)
+ustore_sibling(forkunion)
 
 # SmashTable's containers, header-only
 set(SMASHTABLE_BUILD_TEST OFF)
 set(SMASHTABLE_BUILD_CUDA OFF)
 set(SMASHTABLE_INSTALL OFF)
-add_subdirectory(smashtable EXCLUDE_FROM_ALL)
+ustore_sibling(smashtable)
 
 # StringZilla's compiled core, so a portable build without instruction-set flags still dispatches to the fastest kernel
 # the running CPU supports. NumKong is unused today; wiring it in later is the same add_subdirectory plus a
@@ -163,7 +178,7 @@ set(STRINGZILLA_INSTALL OFF)
 # StringZilla arms sanitizers in Debug by default, which leaves its archive needing a runtime the consumers' link lines
 # do not carry.
 set(STRINGZILLA_USE_SANITIZERS OFF)
-add_subdirectory(stringzilla EXCLUDE_FROM_ALL)
+ustore_sibling(stringzilla)
 
 # The host half of the compaction suite checks the comparator, the survival rule, the sorted-run split and the placement
 # without a device, so a plain test build registers it too.

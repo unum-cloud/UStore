@@ -1,14 +1,15 @@
-#!/usr/bin/env sh
-# Runs the pre-commit checks over every change since a base revision, the way a commit would see them.
+#!/usr/bin/env bash
+#
+# UStore lint-range: run the pre-commit checks over every change since a base revision, the way a commit would see them.
 #
 #   .githooks/lint-range              every tracked file, as if the tree were one commit
 #   .githooks/lint-range main-dev     only what this branch adds
-set -eu
+set -euo pipefail
 
 base=${1:-}
-case "$base" in
-"" | 0000000000000000000000000000000000000000) base=$(git commit-tree "$(git hash-object -t tree /dev/null)" -m empty) ;;
-esac
+if [[ -z $base || $base == 0000000000000000000000000000000000000000 ]]; then
+    base=$(git commit-tree "$(git hash-object -t tree /dev/null)" -m empty)
+fi
 
 # The hook diffs the index against HEAD, so it runs in a scratch worktree whose HEAD is the base and whose index and
 # files hold this tree, leaving the author's own index and files as they are.
