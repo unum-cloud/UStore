@@ -241,6 +241,25 @@ def test_update_skips_missing_cells_and_foreign_rows(people):
     assert people.index == keys([0, 1, 2])
 
 
+def test_updating_selected_rows_merges_into_their_documents(people):
+    people.loc[[key(1)]].update({"tweets": 100})
+    assert people.to_pandas().to_dict(orient="records") == [PEOPLE[0], {**PEOPLE[1], "tweets": 100}, PEOPLE[2]]
+
+
+def test_updating_several_selected_rows_at_once(people):
+    people.loc[[0, 2]].update({"tweets": 0, "verified": True})
+    assert people["tweets"].tolist() == [0, 3935, 0]
+    assert people["verified"].tolist() == [True, None, True]
+
+
+@NEEDS_COLLECTIONS
+def test_updating_a_missing_row_of_a_collection_by_id(database, view):
+    availability = database.collection_create("availability", modality="docs")
+    Table(view, availability).loc[[key(7)]].update({"quantity": 100})
+    assert Table(view, availability).to_pandas().to_dict(orient="records") == [{"quantity": 100}]
+    assert Table(view).empty
+
+
 @pytest.mark.parametrize(
     "dropped", [["name"], ["tweets"], ["name", "lastname"], "name"], ids=["name", "tweets", "two", "bare"]
 )

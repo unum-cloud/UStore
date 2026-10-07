@@ -7,19 +7,23 @@
  *  One extension, one file per header of the C ABI: @c types.c owns the vocabulary every modality
  *  shares, @c database.c owns databases, collections, snapshots and transactions, @c blobs.c owns
  *  the binary verbs, @c docs.c the document verbs, @c graph.c the graph verbs, @c strings.c resolves
- *  names onto identifiers, and @c lib.c owns the module glue alone. A verb is written once and
- *  reached from both method tables, since a database and a transaction differ only in the view
- *  they address.
+ *  names onto identifiers, @c collection.c answers the collections a database is indexed by, and
+ *  @c lib.c owns the module glue alone. A verb is written once and reached from both method tables,
+ *  since a database and a transaction differ only in the view they address, and its core is reached
+ *  from the collection views too, which skip the keywords.
  *
  *  @section python_arena_ownership Arena Ownership
  *
- *  Results land in an arena the caller owns, and a later call on the same arena discards what an
- *  earlier one left there, so an arena is owned by exactly one live object at a time. A database
- *  keeps one idle arena; a verb claims it, runs, and either gives it back before returning or
- *  hands it to the result object it built. A claim that finds the slot empty makes an arena of its
- *  own, so two threads never share one. A result object frees its arena in @c tp_dealloc, and a
- *  @c memoryview over that object holds a reference to it, so no view outlives the bytes it reads
- *  and nothing can write into an arena a result owns.
+ *  Outputs whose size the inputs bound, such as offsets, presences, degrees and the keys of a scan,
+ *  land in the trailing storage of the result object, which is allocated before the call, so they
+ *  live exactly as long as the result. Outputs only a call can size, such as tapes of values, land
+ *  in an arena, and a later call on the same arena discards what an earlier one left there, so an
+ *  arena is owned by exactly one live object at a time. A database keeps one idle arena; a verb
+ *  that needs one claims it, runs, and either gives it back before returning or hands it to the
+ *  result object it built. A claim that finds the slot empty makes an arena of its own, so two
+ *  threads never share one. A result object frees its arena in @c tp_dealloc, and a @c memoryview
+ *  over that object holds a reference to it, so no view outlives the bytes it reads and nothing
+ *  can write into an arena a result owns.
  *
  *  @section python_calling_convention Latency and Arguments Parsing
  *
@@ -52,6 +56,8 @@
 #include <stdarg.h> // `va_list`
 #include <stddef.h> // `size_t`
 #include <stdint.h> // `int64_t`
+
+#include <yyjson.h> // `yyjson_val`, `yyjson_mut_doc`
 
 #include "ustore/ustore.h"
 
@@ -114,6 +120,10 @@ extern PyTypeObject KeysType;
 extern PyTypeObject ColumnsType;
 extern PyTypeObject EdgesType;
 extern PyTypeObject SpanType;
+extern PyTypeObject CollectionType;
+extern PyTypeObject BlobsViewType;
+extern PyTypeObject DocsViewType;
+extern PyTypeObject DocsJSONViewType;
 
 /** The failure every other one specializes, subclassing @c RuntimeError. */
 extern PyObject* ErrorType;
@@ -167,7 +177,7 @@ typedef struct Database {
     /** The arena this database lends to one verb at a time. */
     ustore_py_arena_pool_t arenas;
 
-    /** What the engine supports, read once at open. */
+    /** What the engine supports, described once at open. */
     ustore_capabilities_t capabilities;
 
     /** Transactions still holding this database, which must reach zero before it closes. */
@@ -189,8 +199,8 @@ typedef struct Transaction {
     /** The database this transaction runs against, kept alive for its whole life. */
     PyObject* database;
 
-    /** Whether the transaction watches the keys it touches. */
-    ustore_options_t options;
+    /** Whether the verbs record the keys they touch, unless one call says otherwise. */
+    ustore_watch_t watch;
 } Transaction;
 
 /** A point-in-time view of the whole database, which a read names through its `snapshot` keyword. */
@@ -206,13 +216,7 @@ typedef struct Snapshot {
     PyObject* database;
 } Snapshot;
 
-/**
- *  @brief The database, the view and the arena one verb runs against.
- *
- *  A call addresses exactly one view, so a transaction and a snapshot are never both set. The
- *  arena belongs to @c database for the length of the verb and is returned or adopted before it
- *  ends.
- */
+/** The database and the transaction one verb runs against, as the object it was reached through names them. */
 typedef struct ustore_py_context_t {
 
     /** The database the verb calls into. */
@@ -221,11 +225,8 @@ typedef struct ustore_py_context_t {
     /** The transaction the verb joins, or NULL for the head. */
     ustore_transaction_t transaction;
 
-    /** The snapshot the verb reads, or NULL for the head. */
-    ustore_snapshot_t snapshot;
-
-    /** Options the view adds to the verb's own, such as the watch of a transaction. */
-    ustore_options_t options;
+    /** Whether the transaction records the keys its verbs touch. */
+    ustore_watch_t watch;
 } ustore_py_context_t;
 
 /**
@@ -270,12 +271,12 @@ typedef enum ustore_py_contents_layout_t {
  *  @brief The borrowed byte runs one write batch hands the ABI.
  *
  *  Every value is borrowed rather than copied, so the buffers stay exported for the whole call and
- *  are released together once it returns. A task whose value is @c None removes its key, which the
- *  ABI spells as a null pointer.
+ *  are released together once it returns. A value is never @c None, since removals take a verb of
+ *  their own.
  */
 typedef struct ustore_py_contents_t {
 
-    /** Pointer to the bytes of every task, NULL where the task removes its key. */
+    /** Pointer to the bytes of every task. */
     ustore_bytes_cptr_t* values;
 
     /** Length of the bytes of every task. */
@@ -307,16 +308,17 @@ typedef struct ustore_py_contents_t {
 } ustore_py_contents_t;
 
 /**
- *  @brief One tape of values, read back off the arena that holds it.
+ *  @brief One tape of values, read back off the arena that holds it, with its offsets and presences in tow.
  *
  *  The object owns the arena, exports the tape through the buffer protocol, and slices one task's
- *  bytes out of it without copying. A @c memoryview taken here keeps this object alive, so the
- *  arena outlives every view of it.
+ *  bytes out of it without copying. Its trailing storage holds the @c count + 1 offsets and then the
+ *  presence bits the read wrote, so they live exactly as long as the tape. A @c memoryview taken
+ *  here keeps this object alive, so the arena outlives every view of it.
  */
 typedef struct Values {
 
-    /** The object header every instance carries. */
-    PyObject ob_base;
+    /** The object header every instance carries, sized in bytes of trailing storage. */
+    PyVarObject ob_base;
 
     /** The arena holding the tape, freed when this object dies. */
     ustore_arena_t arena;
@@ -324,38 +326,32 @@ typedef struct Values {
     /** The bytes of every value, laid end to end. */
     ustore_byte_t* tape;
 
-    /** One offset into @c tape per task, plus one closing the last value. */
-    ustore_length_t* offsets;
-
-    /** The length of every value, or @c ustore_length_missing_k where the key was absent. */
-    ustore_length_t* lengths;
+    /** One bit per task marking the present keys, in the trailing storage past @c offsets. */
+    ustore_octet_t* presences;
 
     /** Tasks the read carried. */
     size_t count;
+
+    /** The @c Keys a sample drew, one per value, or NULL for a read that was handed its keys. */
+    PyObject* keys;
+
+    /** One offset into @c tape per task, plus one closing the last value. */
+    ustore_length_t offsets[];
 } Values;
 
 /**
- *  @brief One tape of keys, read back off the arena that holds it.
+ *  @brief The keys one batch scan or sample found, held in the object's own trailing storage.
  *
  *  A scan and a sample answer the same shape: a run of keys per task, laid end to end, with the
- *  boundaries beside them. The object owns the arena on the same terms a tape of values does.
+ *  @c count + 1 boundaries in front of them, sized for every key the limits allow.
  */
 typedef struct Keys {
 
-    /** The object header every instance carries. */
-    PyObject ob_base;
+    /** The object header every instance carries, sized in bytes of trailing storage. */
+    PyVarObject ob_base;
 
-    /** The arena holding the tape, freed when this object dies. */
-    ustore_arena_t arena;
-
-    /** The keys every task found, laid end to end. */
+    /** The keys every task found, laid end to end in the trailing storage past @c offsets. */
     ustore_key_t* tape;
-
-    /** One offset into @c tape per task, plus one closing the last run. */
-    ustore_length_t* offsets;
-
-    /** The number of keys every task found. */
-    ustore_length_t* counts;
 
     /** Tasks the scan or sample carried. */
     size_t count;
@@ -365,21 +361,24 @@ typedef struct Keys {
 
     /** The strides matching @c shape. */
     Py_ssize_t strides[2];
+
+    /** One offset into @c tape per task, plus one closing the last run. */
+    ustore_length_t offsets[];
 } Keys;
 
 /**
- *  @brief The typed columns one gather exported, read back off the arena that holds them.
+ *  @brief The typed columns one gather exported into the object's own trailing storage.
  *
  *  Every column holds one entry per document with three bitmaps beside it; a string column holds
- *  offsets and lengths into the strings every column shares. The object owns the arena on the same
- *  terms a tape of values does.
+ *  offsets and lengths into the strings every column shares, which alone land in the arena this
+ *  object owns on the same terms a tape of values does.
  */
 typedef struct Columns {
 
-    /** The object header every instance carries. */
-    PyObject ob_base;
+    /** The object header every instance carries, sized in bytes of trailing storage. */
+    PyVarObject ob_base;
 
-    /** The arena holding every column, freed when this object dies. */
+    /** The arena holding the joined strings, freed when this object dies. */
     ustore_arena_t arena;
 
     /** One bitmap per field, marking the documents whose value was found and converted. */
@@ -403,7 +402,7 @@ typedef struct Columns {
     /** The contents of every string, joined document by document. */
     ustore_byte_t* joined;
 
-    /** The type every field was converted into, on the heap this object frees. */
+    /** The type every field was converted into. */
     ustore_doc_field_type_t* types;
 
     /** Fields the gather carried, the columns of the result. */
@@ -411,6 +410,9 @@ typedef struct Columns {
 
     /** Documents the gather carried, the rows of every column. */
     size_t docs_count;
+
+    /** The pointer runs above, then every column, the types and the bitmaps, carved at eight-byte boundaries. */
+    uint64_t storage[];
 } Columns;
 
 /**
@@ -418,12 +420,13 @@ typedef struct Columns {
  *
  *  Every edge is three keys - source, target and edge ID - laid end to end vertex after vertex,
  *  so the whole tape exports as an array of shape (edges, 3, 16) bytes. The object owns the arena on
- *  the same terms a tape of values does.
+ *  the same terms a tape of values does, and its trailing storage holds the edge offsets and then
+ *  the degrees.
  */
 typedef struct Edges {
 
-    /** The object header every instance carries. */
-    PyObject ob_base;
+    /** The object header every instance carries, sized in bytes of trailing storage. */
+    PyVarObject ob_base;
 
     /** The arena holding the tape, freed when this object dies. */
     ustore_arena_t arena;
@@ -431,11 +434,8 @@ typedef struct Edges {
     /** Three keys per edge, laid end to end vertex after vertex. */
     ustore_key_t* tape;
 
-    /** The degree of every vertex, or @c ustore_vertex_degree_missing_k where it is absent. */
+    /** The degree of every vertex, or @c ustore_vertex_degree_missing_k where it is absent, past @c offsets. */
     ustore_vertex_degree_t* degrees;
-
-    /** One edge offset per vertex plus one closing the tape, on the heap this object frees. */
-    size_t* offsets;
 
     /** Vertices the lookup carried. */
     size_t count;
@@ -445,6 +445,9 @@ typedef struct Edges {
 
     /** The strides matching @c shape. */
     Py_ssize_t strides[3];
+
+    /** One edge offset per vertex plus one closing the tape. */
+    size_t offsets[];
 } Edges;
 
 /**
@@ -485,11 +488,11 @@ typedef struct Span {
 #pragma region Failures
 
 /**
- *  @brief Raises the exception @p error 's status maps onto.
- *  @param[in] error The outcome of one call, whose message is static and never freed.
+ *  @brief Raises the exception the status of @p outcome maps onto.
+ *  @param[in] outcome The outcome of one call, whose message is static and never freed.
  *  @return -1 with an exception set when the call failed, 0 otherwise.
  */
-int ustore_py_raise_on_error(ustore_error_t const* error);
+int ustore_py_raise_on_outcome(ustore_outcome_t const* outcome);
 
 /**
  *  @brief Raises the exception @p status maps onto, with a formatted message.
@@ -547,14 +550,20 @@ typedef struct ustore_py_verb_options_t {
     /** The collection the tasks address. */
     ustore_collection_id_t collection;
 
-    /** The snapshot a read follows, or NULL for the head. */
+    /** What a read sees: the head, the transaction of the context, or a snapshot. */
+    ustore_view_t view;
+
+    /** The snapshot the `snapshot` keyword names, at which collection names resolve, or NULL for the head. */
     ustore_snapshot_t snapshot;
 
-    /** Flags the verb adds to the view's own. */
-    ustore_options_t options;
+    /** Whether the transaction records the keys this call touches. */
+    ustore_watch_t watch;
+
+    /** How durable the writes are once a call at the head completes. */
+    ustore_durability_t durability;
 } ustore_py_verb_options_t;
 
-/** Starts the shared options from @p context, so a verb only overrides what a keyword names. */
+/** Starts the shared options from @p context, computing its view, so a verb only overrides what a keyword names. */
 void ustore_py_verb_options_init(ustore_py_context_t const* context, ustore_py_verb_options_t* options);
 
 /**
@@ -588,7 +597,7 @@ int ustore_py_verb_options_from_keywords(ustore_py_context_t const* context, PyO
 /**
  *  @brief Fills @p context from a @c Database or a @c Transaction.
  *  @param[in] self The object the verb was reached through.
- *  @param[out] context The database, view and options the verb runs against.
+ *  @param[out] context The database, transaction and watch the verb runs against.
  *  @return 0 on success, -1 with an exception set when the handle is closed.
  */
 int ustore_py_context_from_object(PyObject* self, ustore_py_context_t* context);
@@ -639,8 +648,8 @@ int ustore_py_keys_from_object(PyObject* object, ustore_py_keys_t* batch);
 void ustore_py_keys_release(ustore_py_keys_t* batch);
 
 /**
- *  @brief Borrows the bytes of one value, or notes that the task removes its key.
- *  @param[in] object The value, as anything exporting a buffer, or @c None to remove.
+ *  @brief Borrows the bytes of one value.
+ *  @param[in] object The value, as anything exporting a buffer.
  *  @param[out] batch The batch the borrowed run joins.
  *  @return 0 on success, -1 with an exception set otherwise.
  */
@@ -661,28 +670,23 @@ int ustore_py_contents_reserve(ustore_py_contents_t* batch, size_t count);
 void ustore_py_contents_release(ustore_py_contents_t* batch);
 
 /**
- *  @brief Wraps a tape of values and the arena holding it into a @c Values.
- *  @param[inout] arena The arena the result adopts; it is freed on failure.
- *  @param[in] tape The bytes of every value, laid end to end.
- *  @param[in] offsets One offset per task, plus one closing the last value.
- *  @param[in] lengths The length of every value.
- *  @param[in] count Tasks the read carried.
- *  @return A new reference, or NULL with an exception set.
+ *  @brief Allocates a @c Values whose trailing storage a read of @p count tasks writes its offsets and presences
+ *      into, before the read runs; the read then hands the result its tape and the arena holding it.
+ *  @param[in] count Tasks the read carries.
+ *  @return A new reference with no arena and an empty first offset, or NULL with an exception set.
  */
-PyObject* ustore_py_values_adopt(ustore_arena_t arena, ustore_byte_t* tape, ustore_length_t* offsets,
-                                 ustore_length_t* lengths, size_t count);
+Values* ustore_py_values_adopt(size_t count);
+
+/** Whether task @p task_index of @p values found its key, as the presence bits address it, least significant first. */
+int ustore_py_values_present(Values const* values, size_t task_index);
 
 /**
- *  @brief Wraps a tape of keys and the arena holding it into a @c Keys.
- *  @param[inout] arena The arena the result adopts; it is freed on failure.
- *  @param[in] tape The keys every task found, laid end to end.
- *  @param[in] offsets One offset per task, plus one closing the last run.
- *  @param[in] counts The number of keys every task found.
- *  @param[in] count Tasks the scan or sample carried.
- *  @return A new reference, or NULL with an exception set.
+ *  @brief Allocates a @c Keys whose trailing storage a scan or sample of @p count tasks writes into.
+ *  @param[in] count Tasks the scan or sample carries.
+ *  @param[in] capacity Keys every task may find together, the sum of their limits.
+ *  @return A new reference with an empty first offset, or NULL with an exception set.
  */
-PyObject* ustore_py_keys_adopt(ustore_arena_t arena, ustore_key_t* tape, ustore_length_t* offsets,
-                               ustore_length_t* counts, size_t count);
+Keys* ustore_py_keys_adopt(size_t count, size_t capacity);
 
 /**
  *  @brief Builds a read-only @c memoryview over memory @p owner keeps alive.
@@ -772,29 +776,33 @@ typedef enum ustore_py_naming_t {
 } ustore_py_naming_t;
 
 /**
- *  @brief Reads the collection a name was given, at the head or at the snapshot of @p context.
- *  @param[in] context The database and view to resolve against.
+ *  @brief Reads the collection a name was given at the head, or at @p snapshot when it is set.
+ *  @param[in] context The database to resolve against.
+ *  @param[in] snapshot The snapshot whose names are read, or NULL for the head.
  *  @param[in] name The name's bytes, which need no null terminator.
  *  @param[in] length The name's length in bytes.
  *  @param[out] collection The identifier the name addresses, untouched unless the name was found.
+ *  @param[out] modality What the collection holds, or NULL when the caller does not ask.
  *  @return Whether the name was found, missing, or could not be looked up.
  */
-ustore_py_naming_t ustore_py_collection_named(ustore_py_context_t const* context, char const* name, size_t length,
-                                              ustore_collection_id_t* collection);
+ustore_py_naming_t ustore_py_collection_named(ustore_py_context_t const* context, ustore_snapshot_t snapshot,
+                                              char const* name, size_t length, ustore_collection_id_t* collection,
+                                              ustore_modality_t* modality);
 
 /**
  *  @brief Reads the collection an argument names, accepting an ID, a name, or @c None.
- *  @param[in] context The database and view to resolve a name against.
+ *  @param[in] context The database to resolve a name against.
+ *  @param[in] snapshot The snapshot whose names are read, or NULL for the head.
  *  @param[in] object The collection, as a `uuid.UUID` ID, a string name, or @c None for the main one.
  *  @param[out] collection The identifier the argument addresses.
  *  @return 0 on success, -1 with an exception set otherwise.
  */
-int ustore_py_collection_from_object(ustore_py_context_t const* context, PyObject* object,
+int ustore_py_collection_from_object(ustore_py_context_t const* context, ustore_snapshot_t snapshot, PyObject* object,
                                      ustore_collection_id_t* collection);
 
 /**
- *  @brief Lists the names of collections in the order of their text, up to @p limit of them.
- *  @param[in] context The database and view to list.
+ *  @brief Lists the names of collections at the head in the order of their text, up to @p limit of them.
+ *  @param[in] context The database to list.
  *  @param[in] after The smallest name listed, or NULL to start at the first one.
  *  @param[in] after_length The length of @p after in bytes.
  *  @param[in] limit Most names the walk returns.
@@ -803,7 +811,119 @@ int ustore_py_collection_from_object(ustore_py_context_t const* context, PyObjec
 PyObject* ustore_py_collection_names(ustore_py_context_t const* context, char const* after, size_t after_length,
                                      size_t limit);
 
+/** Every modality a collection holds, as a caller spells it, closed by a nameless row. */
+extern ustore_py_choice_naming_t const ustore_py_modality_namings[];
+
+/**
+ *  @brief Answers the @c Collection a database or a transaction addresses by name, as `db['movies']` does.
+ *  @param[in] view The @c Database or @c Transaction indexed.
+ *  @param[in] name The collection's name, where the empty one is the main collection.
+ *  @return A new reference, or NULL with an exception set.
+ */
+PyObject* ustore_py_collection_subscript(PyObject* view, PyObject* name);
+
 #pragma endregion Names
+
+#pragma region Verb Cores
+
+/**
+ *  @brief Reads a batch of values: the core of `read`, of `Collection.blobs[keys]` and of `Collection.sample`.
+ *  @param[in] context The database and view the read runs against.
+ *  @param[in] options The collection and flags the read carries.
+ *  @param[in] keys The keys to read, NULL only when @p count is zero.
+ *  @param[in] count Keys to read.
+ *  @return A new @c Values, or NULL with an exception set.
+ */
+PyObject* ustore_py_values_read(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
+                                ustore_key_t const* keys, size_t count);
+
+/**
+ *  @brief Reads whether one key is present: the core of `contains` and of `key in Collection.blobs`.
+ *  @return 1 when present, 0 when absent, or -1 with an exception set.
+ */
+int ustore_py_value_contains(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
+                             ustore_key_t const* key);
+
+/**
+ *  @brief Gathers the values of a batch write, broadcasting one value to every key.
+ *  @param[in] object The values: a sequence, or one buffer to broadcast.
+ *  @param[in] count Keys the batch carries.
+ *  @param[out] batch The borrowed runs the ABI reads, and the layout they travel with.
+ *  @return 0 on success, -1 with an exception set otherwise.
+ */
+int ustore_py_contents_from_object(PyObject* object, size_t count, ustore_py_contents_t* batch);
+
+/**
+ *  @brief Upserts a batch of values: the core of `write`, `set` and `Collection.blobs[key] = value`.
+ *  @param[in] contents The borrowed values.
+ *  @return 0 on success, -1 with an exception set otherwise.
+ */
+int ustore_py_values_write(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
+                           ustore_key_t const* keys, size_t count, ustore_py_contents_t const* contents);
+
+/**
+ *  @brief Removes a batch of keys with their values or documents: the core of `remove` and of `del` on every view.
+ *  @return 0 on success, -1 with an exception set otherwise.
+ */
+int ustore_py_values_remove(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
+                            ustore_key_t const* keys, size_t count);
+
+/**
+ *  @brief Lists up to @p count keys from @p start upwards: the core of `scan` and of `Collection.scan`.
+ *  @return A new @c Keys of one task, or NULL with an exception set.
+ */
+PyObject* ustore_py_keys_scan(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
+                              ustore_key_t const* start, size_t count);
+
+/**
+ *  @brief Draws up to @p count keys at random: the core of `sample` and of `Collection.sample`.
+ *  @return A new @c Keys of one task, or NULL with an exception set.
+ */
+PyObject* ustore_py_keys_sample(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
+                                size_t count);
+
+/**
+ *  @brief Reads documents, or one field of each: the core of `docs_read` and of `Collection.docs[key]`.
+ *  @param[in] field A top-level key or a JSON Pointer, or NULL for whole documents.
+ *  @param[in] type How every value is spelled, JSON text or a printed string.
+ *  @return A new @c Values, or NULL with an exception set.
+ */
+PyObject* ustore_py_docs_read(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
+                              ustore_key_t const* keys, size_t count, char const* field, ustore_doc_field_type_t type);
+
+/** How a write spells its documents. */
+typedef enum ustore_py_documents_spelling_t {
+
+    /** As `docs_write` reads them: JSON text or bytes, a dict or list to serialize, or a sequence of those. */
+    ustore_py_documents_as_json_k = 0,
+
+    /** As `Collection.docs` reads them: a sequence of one Python object per key, each serialized. */
+    ustore_py_documents_as_objects_k = 1,
+} ustore_py_documents_spelling_t;
+
+/**
+ *  @brief Upserts whole documents: the core of `Collection.docs[key] = document`.
+ *  @param[in] documents The documents, spelled as @p spelling says.
+ *  @return 0 on success, -1 with an exception set otherwise.
+ */
+int ustore_py_docs_upsert(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
+                          ustore_key_t const* keys, size_t count, PyObject* documents,
+                          ustore_py_documents_spelling_t spelling);
+
+/**
+ *  @brief The Python value of @p value: dict, list, str, int, float, bool or None.
+ *  @return A new reference, or NULL with an exception set.
+ */
+PyObject* ustore_py_object_from_json(yyjson_val* value);
+
+/**
+ *  @brief Serializes @p object into @p document: dict, list, tuple, str, int, float, bool or None.
+ *  @param[out] value The value built inside @p document.
+ *  @return 0 on success, or -1 with a Python error for a type JSON cannot hold.
+ */
+int ustore_py_json_from_object(PyObject* object, yyjson_mut_doc* document, yyjson_mut_val** value);
+
+#pragma endregion Verb Cores
 
 #pragma region Verbs
 
@@ -816,7 +936,7 @@ extern char const doc_sample_batch[];
 extern char const doc_measure[];
 extern char const doc_get[];
 extern char const doc_set[];
-extern char const doc_pop[];
+extern char const doc_remove[];
 extern char const doc_contains[];
 extern char const doc_docs_write[];
 extern char const doc_docs_read[];
@@ -847,8 +967,8 @@ PyObject* ustore_py_api_get(PyObject* self, PyObject* const* args, Py_ssize_t po
                             PyObject* args_names_tuple);
 PyObject* ustore_py_api_set(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
                             PyObject* args_names_tuple);
-PyObject* ustore_py_api_pop(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                            PyObject* args_names_tuple);
+PyObject* ustore_py_api_remove(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                               PyObject* args_names_tuple);
 PyObject* ustore_py_api_contains(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
                                  PyObject* args_names_tuple);
 PyObject* ustore_py_api_docs_write(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,

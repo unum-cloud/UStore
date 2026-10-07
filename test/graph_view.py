@@ -207,6 +207,26 @@ def test_degrees(graphs, count: int):
         ours.degree[count + 1]
 
 
+@pytest.mark.parametrize("kind", ["digraph"], indirect=True)
+def test_find_edges_in_every_role(graphs):
+    ours, _ = graphs
+    ours.add_edges_from_arrays([1, 3], [2, 1])
+    leaving = (key(1), key(2), ustore.default_edge_id)
+    entering = (key(3), key(1), ustore.default_edge_id)
+    assert ours.find_edges(1, role="source")[0] == (leaving,)
+    assert ours.find_edges(1, role="target")[0] == (entering,)
+    assert ours.find_edges(1)[0] == (leaving, entering)
+
+
+@pytest.mark.parametrize("kind", ["digraph"], indirect=True)
+def test_find_edges_of_a_batch(graphs):
+    ours, _ = graphs
+    ours.add_edges_from_arrays([1, 1], [2, 3])
+    ours.add_node(4)
+    stored = ustore.default_edge_id
+    assert list(ours.find_edges([1, 4, 5])) == [((key(1), key(2), stored), (key(1), key(3), stored)), (), None]
+
+
 # endregion Structure
 
 # region Attributes

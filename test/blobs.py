@@ -58,7 +58,7 @@ def test_single_round_trip(view, shape: str):
     view.set(3, value)
     assert view.contains(3)
     assert view.get(3) == value
-    view.pop(3)
+    view.remove(3)
     assert not view.contains(3)
     assert view.get(3) is None
 
@@ -71,10 +71,12 @@ def test_overwrite_changes_length(view, first: bytes, second: bytes):
     assert view.get(7) == second
 
 
-def test_set_none_removes(view):
+def test_set_refuses_none(view):
+    """A None never removes, since `remove` does."""
     view.set(9, b"here")
-    view.set(9, None)
-    assert not view.contains(9)
+    with pytest.raises(TypeError, match="remove"):
+        view.set(9, None)
+    assert view.get(9) == b"here"
 
 
 @pytest.mark.parametrize("boundary", [0, 2**63, 2**64 - 2])
@@ -146,28 +148,29 @@ def test_batch_broadcasts_one_value(view, count: int):
 def test_batch_removes_every_key(view, count: int):
     keys = list(range(count))
     view.write(keys, b"value")
-    view.write(keys, None)
+    view.remove(keys)
     assert all(value is None for value in view.read(keys))
 
 
-@pytest.mark.parametrize("removed", [0, 1])
-def test_batch_removes_one_key_of_many(view, removed: int):
+@pytest.mark.parametrize("values", [[None, b"kept"], [b"kept", None], None], ids=["first", "second", "whole"])
+def test_none_in_a_batch_is_refused(view, values):
+    """A None inside a written batch is refused before anything is written, rather than read as a removal."""
     view.write([30, 31], [b"a", b"b"])
-    view.write([30, 31], [None, b"kept"] if removed == 0 else [b"kept", None])
-    assert view.contains(30 + 1 - removed)
-    assert not view.contains(30 + removed)
+    with pytest.raises(TypeError):
+        view.write([30, 31], values)
+    assert [bytes(value) for value in view.read([30, 31])] == [b"a", b"b"]
 
 
 @pytest.mark.parametrize("keys", [[40], [40, 41], np.array([40, 41], dtype=np.int64)], ids=["one", "two", "numpy"])
-def test_batch_pop(view, keys):
+def test_batch_remove(view, keys):
     view.write([40, 41], [b"a", b"b"])
-    view.pop(keys)
+    view.remove(keys)
     assert not any(view.contains(int(key)) for key in keys)
 
 
-def test_pop_takes_a_bare_key(view):
+def test_remove_takes_a_bare_key(view):
     view.set(40, b"a")
-    view.pop(40)
+    view.remove(40)
     assert not view.contains(40)
 
 

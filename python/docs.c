@@ -6,8 +6,8 @@
  *
  *  A document read answers the same tape a binary read does, one run of bytes per task, while a
  *  gather answers typed columns whose scalars export in place and whose strings decode on access.
- *  Every verb claims the database's arena, drops the interpreter lock around the call, and either
- *  returns the arena or hands it to the result it answers with.
+ *  Every verb drops the interpreter lock around the call, and every read claims the database's
+ *  arena and either returns it or hands it to the result it answers with.
  */
 #include "lib.h"
 
@@ -127,26 +127,260 @@ static int optional_text_from_object(PyObject* object, char const* field, char c
 
 #pragma endregion Field Types
 
+#pragma region JSON Conversions
+
+/** Reads a number too wide for 64 bits, which a document keeps as its digits, as the int or float they spell. */
+static PyObject* object_from_digits(yyjson_val* value) {
+    char const* const digits = yyjson_get_raw(value);
+    size_t const length = yyjson_get_len(value);
+    int integral = length != 0;
+    for (size_t index = 0; index != length; ++index)
+        integral &= (digits[index] >= '0' && digits[index] <= '9') || (index == 0 && digits[index] == '-');
+    PyObject* const text = PyUnicode_DecodeASCII(digits, (Py_ssize_t)length, "strict");
+    if (!text) return NULL;
+    PyObject* const number = integral ? PyLong_FromUnicodeObject(text, 10) : PyFloat_FromString(text);
+    Py_DECREF(text);
+    return number;
+}
+
+/** Builds the list of @p value, converting every element. */
+static PyObject* list_from_json(yyjson_val* value) {
+    PyObject* const list = PyList_New((Py_ssize_t)yyjson_arr_size(value));
+    if (!list) return NULL;
+    size_t index = 0, count = 0;
+    yyjson_val* element = NULL;
+    yyjson_arr_foreach(value, index, count, element) {
+        PyObject* const item = ustore_py_object_from_json(element);
+        if (!item) {
+            Py_DECREF(list);
+            return NULL;
+        }
+        PyList_SET_ITEM(list, (Py_ssize_t)index, item);
+    }
+    return list;
+}
+
+/** Builds the dict of @p value, converting every member, where a repeated key keeps its last value. */
+static PyObject* dict_from_json(yyjson_val* value) {
+    PyObject* const dict = PyDict_New();
+    if (!dict) return NULL;
+    size_t index = 0, count = 0;
+    yyjson_val* key = NULL;
+    yyjson_val* member = NULL;
+    yyjson_obj_foreach(value, index, count, key, member) {
+        PyObject* const name = PyUnicode_DecodeUTF8(yyjson_get_str(key), (Py_ssize_t)yyjson_get_len(key), "strict");
+        PyObject* const item = name ? ustore_py_object_from_json(member) : NULL;
+        int const added = item ? PyDict_SetItem(dict, name, item) : -1;
+        Py_XDECREF(name);
+        Py_XDECREF(item);
+        if (added != 0) {
+            Py_DECREF(dict);
+            return NULL;
+        }
+    }
+    return dict;
+}
+
+PyObject* ustore_py_object_from_json(yyjson_val* value) {
+    switch (yyjson_get_type(value)) {
+    case YYJSON_TYPE_NULL: Py_RETURN_NONE;
+    case YYJSON_TYPE_BOOL: return PyBool_FromLong(yyjson_get_bool(value));
+    case YYJSON_TYPE_NUM:
+        switch (yyjson_get_subtype(value)) {
+        case YYJSON_SUBTYPE_UINT: return PyLong_FromUnsignedLongLong(yyjson_get_uint(value));
+        case YYJSON_SUBTYPE_SINT: return PyLong_FromLongLong(yyjson_get_sint(value));
+        default: return PyFloat_FromDouble(yyjson_get_real(value));
+        }
+    case YYJSON_TYPE_RAW: return object_from_digits(value);
+    case YYJSON_TYPE_STR:
+        return PyUnicode_DecodeUTF8(yyjson_get_str(value), (Py_ssize_t)yyjson_get_len(value), "strict");
+    case YYJSON_TYPE_ARR:
+    case YYJSON_TYPE_OBJ: {
+        // A document nests as deep as its text does, so the C stack is guarded like any recursion in Python.
+        if (Py_EnterRecursiveCall(" while reading a document") != 0) return NULL;
+        PyObject* const container = yyjson_is_arr(value) ? list_from_json(value) : dict_from_json(value);
+        Py_LeaveRecursiveCall();
+        return container;
+    }
+    default: ustore_py_raise(ustore_status_malformed_k, "The document holds a value JSON has no type for"); return NULL;
+    }
+}
+
+/** Serializes an integer, keeping one past 64 bits as its digits, which JSON holds at any width. */
+static int json_from_integer(PyObject* object, yyjson_mut_doc* document, yyjson_mut_val** value) {
+    int overflow = 0;
+    long long const narrow = PyLong_AsLongLongAndOverflow(object, &overflow);
+    if (narrow == -1 && PyErr_Occurred()) return -1;
+    unsigned long long wide = 0;
+    if (!overflow) *value = yyjson_mut_sint(document, narrow);
+    else if (overflow > 0 && (wide = PyLong_AsUnsignedLongLong(object)) != (unsigned long long)-1)
+        *value = yyjson_mut_uint(document, wide);
+    else {
+        if (PyErr_Occurred() && !PyErr_ExceptionMatches(PyExc_OverflowError)) return -1;
+        PyErr_Clear();
+        PyObject* const digits = PyNumber_ToBase(object, 10);
+        if (!digits) return -1;
+        Py_ssize_t length = 0;
+        char const* const text = PyUnicode_AsUTF8AndSize(digits, &length);
+        *value = text ? yyjson_mut_rawncpy(document, text, (size_t)length) : NULL;
+        Py_DECREF(digits);
+        if (!text) return -1;
+    }
+    if (*value) return 0;
+    PyErr_NoMemory();
+    return -1;
+}
+
+/** Serializes a dict, whose keys must be strings, as JSON objects' keys are. */
+static int json_from_dict(PyObject* object, yyjson_mut_doc* document, yyjson_mut_val** value) {
+    yyjson_mut_val* const members = yyjson_mut_obj(document);
+    if (!members) {
+        PyErr_NoMemory();
+        return -1;
+    }
+    int failed = 0;
+    Py_ssize_t position = 0;
+    PyObject* name = NULL;
+    PyObject* member = NULL;
+    ustore_py_critical_section_begin_(object);
+    while (!failed && PyDict_Next(object, &position, &name, &member)) {
+        if (!PyUnicode_Check(name)) {
+            PyErr_Format(PyExc_TypeError, "A document's keys are strings, not %S", Py_TYPE(name));
+            failed = 1;
+            break;
+        }
+        Py_ssize_t length = 0;
+        char const* const text = PyUnicode_AsUTF8AndSize(name, &length);
+        yyjson_mut_val* const key = text ? yyjson_mut_strncpy(document, text, (size_t)length) : NULL;
+        // The member is held, since a nested critical section may let another thread change this dict.
+        PyObject* const held = Py_NewRef(member);
+        yyjson_mut_val* item = NULL;
+        failed = !key || ustore_py_json_from_object(held, document, &item) != 0 ||
+                 !yyjson_mut_obj_add(members, key, item);
+        Py_DECREF(held);
+        if (failed && !PyErr_Occurred()) PyErr_NoMemory();
+    }
+    ustore_py_critical_section_end_();
+    *value = members;
+    return failed ? -1 : 0;
+}
+
+/** Serializes a list or a tuple as a JSON array. */
+static int json_from_sequence(PyObject* object, yyjson_mut_doc* document, yyjson_mut_val** value) {
+    yyjson_mut_val* const items = yyjson_mut_arr(document);
+    if (!items) {
+        PyErr_NoMemory();
+        return -1;
+    }
+    int failed = 0;
+    ustore_py_critical_section_begin_(object);
+    for (Py_ssize_t index = 0; !failed && index < PySequence_Fast_GET_SIZE(object); ++index) {
+        PyObject* const held = Py_NewRef(PySequence_Fast_GET_ITEM(object, index));
+        yyjson_mut_val* item = NULL;
+        failed = ustore_py_json_from_object(held, document, &item) != 0 || !yyjson_mut_arr_append(items, item);
+        Py_DECREF(held);
+        if (failed && !PyErr_Occurred()) PyErr_NoMemory();
+    }
+    ustore_py_critical_section_end_();
+    *value = items;
+    return failed ? -1 : 0;
+}
+
+int ustore_py_json_from_object(PyObject* object, yyjson_mut_doc* document, yyjson_mut_val** value) {
+    // A bool is an int too, so it is told apart first.
+    if (object == Py_None) *value = yyjson_mut_null(document);
+    else if (PyBool_Check(object)) *value = yyjson_mut_bool(document, object == Py_True);
+    else if (PyLong_Check(object)) return json_from_integer(object, document, value);
+    else if (PyFloat_Check(object)) *value = yyjson_mut_real(document, PyFloat_AS_DOUBLE(object));
+    else if (PyUnicode_Check(object)) {
+        Py_ssize_t length = 0;
+        char const* const text = PyUnicode_AsUTF8AndSize(object, &length);
+        if (!text) return -1;
+        *value = yyjson_mut_strncpy(document, text, (size_t)length);
+    }
+    else if (PyDict_Check(object) || PyList_Check(object) || PyTuple_Check(object)) {
+        if (Py_EnterRecursiveCall(" while serializing a document") != 0) return -1;
+        int const serialized = PyDict_Check(object) ? json_from_dict(object, document, value)
+                                                    : json_from_sequence(object, document, value);
+        Py_LeaveRecursiveCall();
+        return serialized;
+    }
+    else {
+        PyErr_Format(PyExc_TypeError, "A document holds dicts, lists, strings, numbers, booleans and None, not %S",
+                     Py_TYPE(object));
+        return -1;
+    }
+    if (*value) return 0;
+    PyErr_NoMemory();
+    return -1;
+}
+
+#pragma endregion JSON Conversions
+
 #pragma region Writes
 
 /**
  *  @brief The documents one write batch hands the ABI.
  *
  *  A string travels as the UTF-8 bytes it caches, so the batch holds a tuple of every document for
- *  the length of the call, which no concurrent change to the caller's list can release.
+ *  the length of the call, which no concurrent change to the caller's list can release. A document
+ *  given as a Python object is serialized into memory the batch owns until it is released.
  */
 typedef struct documents_t {
 
-    /** The borrowed runs the ABI reads, empty when every key is removed. */
+    /** The borrowed runs the ABI reads. */
     ustore_py_contents_t contents;
 
     /** A tuple of the documents, keeping every string alive, or NULL. */
     PyObject* held;
+
+    /** The text of every serialized document, or NULL before the first. */
+    yyjson_alc* serialized;
 } documents_t;
 
-/** Borrows one document, reading a string as its UTF-8 bytes and anything else through its buffer. */
-static int document_borrow(PyObject* object, ustore_py_contents_t* batch) {
-    if (!PyUnicode_Check(object)) return ustore_py_contents_borrow(object, batch);
+/** Appends @p object serialized as JSON to @p documents, keeping the text until the batch is released. */
+static int document_serialize(PyObject* object, documents_t* documents) {
+    if (!documents->serialized && !(documents->serialized = yyjson_alc_dyn_new())) {
+        PyErr_NoMemory();
+        return -1;
+    }
+    yyjson_mut_doc* const document = yyjson_mut_doc_new(NULL);
+    if (!document) {
+        PyErr_NoMemory();
+        return -1;
+    }
+    yyjson_mut_val* root = NULL;
+    yyjson_write_err error = {0};
+    size_t length = 0;
+    // The engine reads NaN and infinities back, as Python's own `json` writes them.
+    char const* const text = ustore_py_json_from_object(object, document, &root) != 0
+                                 ? NULL
+                                 : yyjson_mut_val_write_opts(root, YYJSON_WRITE_ALLOW_INF_AND_NAN,
+                                                             documents->serialized, &length, &error);
+    yyjson_mut_doc_free(document);
+    if (!text) {
+        if (!PyErr_Occurred())
+            ustore_py_raise(error.code == YYJSON_WRITE_ERROR_MEMORY_ALLOCATION ? ustore_status_out_of_memory_k
+                                                                               : ustore_status_malformed_k,
+                            "Cannot serialize the document: %s", error.msg ? error.msg : "no detail");
+        return -1;
+    }
+    ustore_py_contents_t* const batch = &documents->contents;
+    batch->values[batch->count] = (ustore_bytes_cptr_t)text;
+    batch->lengths[batch->count] = (ustore_length_t)length;
+    ++batch->count;
+    return 0;
+}
+
+/** Borrows one document: a string as its UTF-8 bytes, a buffer as it is, and any other object but None
+ *  serialized when the documents are JSON, since a removal takes a verb of its own. */
+static int document_borrow(PyObject* object, ustore_doc_field_type_t type, documents_t* documents) {
+    ustore_py_contents_t* const batch = &documents->contents;
+    if (!PyUnicode_Check(object)) {
+        if (object == Py_None || type != ustore_doc_field_json_k || PyObject_CheckBuffer(object))
+            return ustore_py_contents_borrow(object, batch);
+        return document_serialize(object, documents);
+    }
     Py_ssize_t length = 0;
     char const* const text = PyUnicode_AsUTF8AndSize(object, &length);
     if (!text) return -1;
@@ -160,6 +394,8 @@ static int document_borrow(PyObject* object, ustore_py_contents_t* batch) {
 static void documents_release(documents_t* documents) {
     ustore_py_contents_release(&documents->contents);
     Py_CLEAR(documents->held);
+    if (documents->serialized) yyjson_alc_dyn_free(documents->serialized);
+    documents->serialized = NULL;
 }
 
 /**
@@ -216,19 +452,18 @@ static int scalars_from_object(PyObject* object, ustore_doc_field_type_t type, s
 }
 
 /**
- *  @brief Gathers the documents of a write: a sequence, one document for every key, or None.
- *  @param[in] object The documents, each a string, a bytes-like object, or None to remove it.
+ *  @brief Gathers the documents of a write: a sequence, or one document for every key.
+ *  @param[in] object The documents, each a string, a bytes-like object, or a dict or list to serialize.
+ *  @param[in] type How every document is spelled, where only JSON serializes Python objects.
  *  @param[out] documents The borrowed runs and the layout they travel with.
  *  @return 0 on success, -1 with an exception set otherwise.
  */
-static int documents_from_object(PyObject* object, documents_t* documents) {
+static int documents_from_object(PyObject* object, ustore_doc_field_type_t type, documents_t* documents) {
     memset(documents, 0, sizeof(*documents));
-    if (object == Py_None) return 0;
-
-    // A string or a bytes-like object is one document for every key, not a sequence of characters.
-    if (PyUnicode_Check(object) || PyObject_CheckBuffer(object)) {
+    // A string, a bytes-like object or a dict is one document for every key, not a sequence of characters or keys.
+    if (PyUnicode_Check(object) || PyObject_CheckBuffer(object) || PyDict_Check(object)) {
         if (ustore_py_contents_reserve(&documents->contents, 1) != 0) return -1;
-        if (document_borrow(object, &documents->contents) != 0) {
+        if (document_borrow(object, type, documents) != 0) {
             documents_release(documents);
             return -1;
         }
@@ -238,19 +473,100 @@ static int documents_from_object(PyObject* object, documents_t* documents) {
 
     documents->held = PySequence_Tuple(object);
     if (!documents->held)
-        return ustore_py_raise_from_cause(
-            PyExc_TypeError, "Expected a sequence of documents, one document, or None, not %S", Py_TYPE(object));
+        return ustore_py_raise_from_cause(PyExc_TypeError, "Expected a sequence of documents or one document, not %S",
+                                          Py_TYPE(object));
     size_t const count = (size_t)PyTuple_GET_SIZE(documents->held);
     if (ustore_py_contents_reserve(&documents->contents, count) != 0) {
         Py_CLEAR(documents->held);
         return -1;
     }
     for (size_t task_index = 0; task_index != count; ++task_index)
-        if (document_borrow(PyTuple_GET_ITEM(documents->held, (Py_ssize_t)task_index), &documents->contents) != 0) {
+        if (document_borrow(PyTuple_GET_ITEM(documents->held, (Py_ssize_t)task_index), type, documents) != 0) {
             documents_release(documents);
             return -1;
         }
     return 0;
+}
+
+/**
+ *  @brief Gathers one Python object per key, each serialized as a whole document, so text is a JSON string.
+ *  @param[in] objects A sequence of documents, as `Collection.docs` is assigned them.
+ *  @param[out] documents The serialized runs, one per key.
+ *  @return 0 on success, -1 with an exception set otherwise.
+ */
+static int documents_from_objects(PyObject* objects, documents_t* documents) {
+    memset(documents, 0, sizeof(*documents));
+    if (PyUnicode_Check(objects) || PyDict_Check(objects) || PyObject_CheckBuffer(objects)) {
+        PyErr_Format(PyExc_TypeError, "A batch of documents is a sequence of them, not one %S", Py_TYPE(objects));
+        return -1;
+    }
+    documents->held = PySequence_Tuple(objects);
+    if (!documents->held)
+        return ustore_py_raise_from_cause(PyExc_TypeError, "A batch of documents is a sequence of them, not %S",
+                                          Py_TYPE(objects));
+    size_t const count = (size_t)PyTuple_GET_SIZE(documents->held);
+    if (ustore_py_contents_reserve(&documents->contents, count) != 0) {
+        Py_CLEAR(documents->held);
+        return -1;
+    }
+    for (size_t task_index = 0; task_index != count; ++task_index)
+        if (document_serialize(PyTuple_GET_ITEM(documents->held, (Py_ssize_t)task_index), documents) != 0) {
+            documents_release(documents);
+            return -1;
+        }
+    return 0;
+}
+
+/**
+ *  @brief Runs one @c ustore_docs_write with the transaction of @p context, the options of a call and the runs of
+ *      @p documents.
+ *  @param[inout] write The request, whose tasks, keys and modification the caller filled.
+ *  @return 0 on success, -1 with an exception set otherwise.
+ */
+static int documents_write(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
+                           ustore_docs_write_t* write, documents_t const* documents) {
+    ustore_outcome_t outcome = {0};
+    int const broadcast = documents->contents.layout == ustore_py_contents_broadcast_k;
+    write->database = context->database->handle;
+    write->outcome = &outcome;
+    write->transaction = context->transaction;
+    write->collections = &options->collection;
+    write->values = documents->contents.count ? documents->contents.values : NULL;
+    write->values_stride = broadcast ? 0 : sizeof(ustore_bytes_cptr_t);
+    write->lengths = documents->contents.count ? documents->contents.lengths : NULL;
+    write->lengths_stride = broadcast ? 0 : sizeof(ustore_length_t);
+    write->durability = options->durability;
+    write->watch = options->watch;
+
+    Py_BEGIN_ALLOW_THREADS;
+    ustore_docs_write(write);
+    Py_END_ALLOW_THREADS;
+    return ustore_py_raise_on_outcome(&outcome);
+}
+
+int ustore_py_docs_upsert(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
+                          ustore_key_t const* keys, size_t count, PyObject* objects,
+                          ustore_py_documents_spelling_t spelling) {
+    documents_t documents;
+    int const gathered = spelling == ustore_py_documents_as_objects_k
+                             ? documents_from_objects(objects, &documents)
+                             : documents_from_object(objects, ustore_doc_field_json_k, &documents);
+    if (gathered != 0) return -1;
+    if (documents.held && documents.contents.count != count) {
+        PyErr_Format(PyExc_ValueError, "Got %zu documents for %zu keys", documents.contents.count, count);
+        documents_release(&documents);
+        return -1;
+    }
+
+    ustore_docs_write_t write = {0};
+    write.count = count;
+    write.type = ustore_doc_field_json_k;
+    write.modification = ustore_doc_modify_upsert_k;
+    write.keys = keys;
+    write.keys_stride = sizeof(ustore_key_t);
+    int const written = documents_write(context, options, &write, &documents);
+    documents_release(&documents);
+    return written;
 }
 
 char const doc_docs_write[] =                                                                    //
@@ -263,11 +579,12 @@ char const doc_docs_write[] =                                                   
     "Args:\n"                                                                                    //
     "  keys (Sequence[KeyLike] | buffer | None): The keys to write; None reads every key from\n" //
     "    `id_field` of its document.\n"                                                          //
-    "  documents (Sequence[str | bytes-like | None] | str | bytes-like | None): One document\n"  //
-    "    per key, one document broadcast to every key, or None to remove them all. A None\n"     //
-    "    inside a sequence removes that one document, or the field inside it. Under a\n"         //
-    "    fixed-width `type`, a contiguous buffer of one scalar per key is a column, which\n"     //
-    "    reaches the store without being printed as JSON and parsed back.\n"                     //
+    "  documents (Sequence[str | bytes-like | object] | str | bytes-like | dict): One\n"         //
+    "    document per key, or one document broadcast to every key. Text and bytes are JSON\n"    //
+    "    already, while a dict, a list or a number inside a sequence is serialized. None is\n"   //
+    "    refused: `remove` removes whole documents, and a 'merge' with a JSON null removes\n"    //
+    "    a field. Under a fixed-width `type`, a contiguous buffer of one scalar per key is a\n"  //
+    "    column, which reaches the store without being printed as JSON and parsed back.\n"       //
     "  collection (UUID | str, optional): The collection, by identifier or by name.\n"           //
     "  field (str, optional): A top-level key or a JSON Pointer such as '/user/name' to\n"       //
     "    write inside every document; None writes whole documents.\n"                            //
@@ -278,6 +595,7 @@ char const doc_docs_write[] =                                                   
     "  id_field (str, optional): The field holding every key when `keys` is None.\n"             //
     "  flush (bool, optional): Whether to reach the drive before returning.\n"                   //
     "Raises:\n"                                                                                  //
+    "  TypeError: A document is None.\n"                                                         //
     "  MalformedError: A document does not parse, or its `id_field` holds no integer.\n"         //
     "  MissingError: A field is written inside a document that does not exist.\n"                //
     "  ExistsError: An insert names a document that already exists.";
@@ -328,13 +646,13 @@ PyObject* ustore_py_api_docs_write(PyObject* self, PyObject* const* args, Py_ssi
 
     documents_t documents;
     int const gathered = columnar ? scalars_from_object(args[1], (ustore_doc_field_type_t)type, keys.count, &documents)
-                                  : documents_from_object(args[1], &documents);
+                                  : documents_from_object(args[1], (ustore_doc_field_type_t)type, &documents);
     if (gathered != 0) {
         ustore_py_keys_release(&keys);
         return NULL;
     }
 
-    size_t tasks_count = 0;
+    size_t count = 0;
     if (args[0] == Py_None) {
         // Every key is read out of its own document, so each task needs a document of its own.
         if (!id_field || !documents.held) {
@@ -342,10 +660,10 @@ PyObject* ustore_py_api_docs_write(PyObject* self, PyObject* const* args, Py_ssi
             PyErr_SetString(PyExc_TypeError, "Documents without keys need a sequence of them and an 'id_field'");
             return NULL;
         }
-        tasks_count = documents.contents.count;
+        count = documents.contents.count;
     }
     else {
-        tasks_count = keys.count;
+        count = keys.count;
         if (documents.held && documents.contents.count != keys.count) {
             PyErr_Format(PyExc_ValueError, "Got %zu documents for %zu keys", documents.contents.count, keys.count);
             documents_release(&documents);
@@ -354,36 +672,19 @@ PyObject* ustore_py_api_docs_write(PyObject* self, PyObject* const* args, Py_ssi
         }
     }
 
-    ustore_error_t error = {0};
-    ustore_arena_t arena = ustore_py_arena_claim(context.database);
-
     ustore_docs_write_t write = {0};
-    write.db = context.database->handle;
-    write.error = &error;
-    write.transaction = context.transaction;
-    write.arena = &arena;
-    write.options = options.options;
-    write.tasks_count = tasks_count;
+    write.count = count;
     write.type = (ustore_doc_field_type_t)type;
     write.modification = (ustore_doc_modification_t)modification;
-    write.collections = &options.collection;
     write.keys = keys.keys;
     write.keys_stride = sizeof(ustore_key_t);
     write.fields = field ? &field : NULL;
-    write.values = documents.contents.count ? documents.contents.values : NULL;
-    write.values_stride = documents.contents.layout == ustore_py_contents_broadcast_k ? 0 : sizeof(ustore_bytes_cptr_t);
-    write.lengths = documents.contents.count ? documents.contents.lengths : NULL;
-    write.lengths_stride = documents.contents.layout == ustore_py_contents_broadcast_k ? 0 : sizeof(ustore_length_t);
     write.id_field = id_field;
-
-    Py_BEGIN_ALLOW_THREADS;
-    ustore_docs_write(&write);
-    Py_END_ALLOW_THREADS;
+    int const written = documents_write(&context, &options, &write, &documents);
 
     documents_release(&documents);
     ustore_py_keys_release(&keys);
-    ustore_py_arena_return(context.database, arena);
-    if (ustore_py_raise_on_error(&error) != 0) return NULL;
+    if (written != 0) return NULL;
     Py_RETURN_NONE;
 }
 
@@ -392,8 +693,8 @@ PyObject* ustore_py_api_docs_write(PyObject* self, PyObject* const* args, Py_ssi
 #pragma region Reads
 
 char const doc_docs_read[] =                                                                   //
-    "docs_read(keys, *, collection=None, snapshot=0, field=None, type='json') answers a\n"     //
-    "Values tape.\n"                                                                           //
+    "docs_read(keys, *, collection=None, snapshot=None, field=None, type='json') answers\n"    //
+    "a Values tape.\n"                                                                         //
     "\n"                                                                                       //
     "Reads whole documents, or one field of each, as JSON text or as printed strings. Whole\n" //
     "documents read as JSON pass straight through from the engine, so nothing is parsed.\n"    //
@@ -407,6 +708,41 @@ char const doc_docs_read[] =                                                    
     "  type (str, optional): 'json' for JSON text, or 'str' to print scalars as text.\n"       //
     "Returns:\n"                                                                               //
     "  Values: One entry per key, None where the document or the field is absent.";
+
+PyObject* ustore_py_docs_read(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
+                              ustore_key_t const* keys, size_t count, char const* field, ustore_doc_field_type_t type) {
+    Values* const result = ustore_py_values_adopt(count);
+    if (!result) return NULL;
+    ustore_outcome_t outcome = {0};
+    ustore_arena_t arena = ustore_py_arena_claim(context->database);
+
+    ustore_docs_read_t read = {0};
+    read.database = context->database->handle;
+    read.outcome = &outcome;
+    read.view = options->view;
+    read.count = count;
+    read.collections = &options->collection;
+    read.keys = keys;
+    read.keys_stride = sizeof(ustore_key_t);
+    read.fields = field ? &field : NULL;
+    read.presences = result->presences;
+    read.offsets = result->offsets;
+    read.values = &result->tape;
+    read.arena = &arena;
+    read.type = type;
+
+    Py_BEGIN_ALLOW_THREADS;
+    ustore_docs_read(&read);
+    Py_END_ALLOW_THREADS;
+
+    if (ustore_py_raise_on_outcome(&outcome) != 0) {
+        ustore_py_arena_return(context->database, arena);
+        Py_DECREF(result);
+        return NULL;
+    }
+    result->arena = arena;
+    return (PyObject*)result;
+}
 
 PyObject* ustore_py_api_docs_read(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
                                   PyObject* args_names_tuple) {
@@ -441,42 +777,10 @@ PyObject* ustore_py_api_docs_read(PyObject* self, PyObject* const* args, Py_ssiz
 
     ustore_py_keys_t keys;
     if (ustore_py_keys_from_object(args[0], &keys) != 0) return NULL;
-
-    ustore_length_t* offsets = NULL;
-    ustore_length_t* lengths = NULL;
-    ustore_byte_t* values = NULL;
-    ustore_error_t error = {0};
-    ustore_arena_t arena = ustore_py_arena_claim(context.database);
-
-    ustore_docs_read_t read = {0};
-    read.db = context.database->handle;
-    read.error = &error;
-    read.transaction = context.transaction;
-    read.snapshot = options.snapshot;
-    read.arena = &arena;
-    read.options = options.options;
-    read.type = (ustore_doc_field_type_t)type;
-    read.tasks_count = keys.count;
-    read.collections = &options.collection;
-    read.keys = keys.keys;
-    read.keys_stride = sizeof(ustore_key_t);
-    read.fields = field ? &field : NULL;
-    read.offsets = &offsets;
-    read.lengths = &lengths;
-    read.values = &values;
-
-    Py_BEGIN_ALLOW_THREADS;
-    ustore_docs_read(&read);
-    Py_END_ALLOW_THREADS;
-
-    size_t const tasks_count = keys.count;
+    PyObject* const values = ustore_py_docs_read(&context, &options, keys.keys, keys.count, field,
+                                                 (ustore_doc_field_type_t)type);
     ustore_py_keys_release(&keys);
-    if (error.status != ustore_success_k) {
-        ustore_py_arena_return(context.database, arena);
-        ustore_py_raise_on_error(&error);
-        return NULL;
-    }
-    return ustore_py_values_adopt(arena, values, offsets, lengths, tasks_count);
+    return values;
 }
 
 char const doc_docs_gist[] =                                                                  //
@@ -508,23 +812,21 @@ PyObject* ustore_py_api_docs_gist(PyObject* self, PyObject* const* args, Py_ssiz
     ustore_size_t fields_count = 0;
     ustore_length_t* offsets = NULL;
     ustore_char_t* fields = NULL;
-    ustore_error_t error = {0};
+    ustore_outcome_t outcome = {0};
     ustore_arena_t arena = ustore_py_arena_claim(context.database);
 
     ustore_docs_gist_t gist = {0};
-    gist.db = context.database->handle;
-    gist.error = &error;
-    gist.transaction = context.transaction;
-    gist.snapshot = options.snapshot;
-    gist.arena = &arena;
-    gist.options = options.options;
-    gist.docs_count = keys.count;
+    gist.database = context.database->handle;
+    gist.outcome = &outcome;
+    gist.view = options.view;
+    gist.count = keys.count;
     gist.collections = &options.collection;
     gist.keys = keys.keys;
     gist.keys_stride = sizeof(ustore_key_t);
     gist.fields_count = &fields_count;
     gist.offsets = &offsets;
     gist.fields = &fields;
+    gist.arena = &arena;
 
     Py_BEGIN_ALLOW_THREADS;
     ustore_docs_gist(&gist);
@@ -532,9 +834,8 @@ PyObject* ustore_py_api_docs_gist(PyObject* self, PyObject* const* args, Py_ssiz
 
     ustore_py_keys_release(&keys);
     PyObject* listed = NULL;
-    if (error.status != ustore_success_k) { ustore_py_raise_on_error(&error); }
     // Every path is a `str`, which owns its bytes, so the arena goes back to the database at once.
-    else if ((listed = PyTuple_New((Py_ssize_t)fields_count)) != NULL) {
+    if (ustore_py_raise_on_outcome(&outcome) == 0 && (listed = PyTuple_New((Py_ssize_t)fields_count)) != NULL) {
         for (ustore_size_t field_index = 0; field_index != fields_count; ++field_index) {
             PyObject* const path = PyUnicode_FromString(fields + offsets[field_index]);
             if (!path) {
@@ -552,33 +853,70 @@ PyObject* ustore_py_api_docs_gist(PyObject* self, PyObject* const* args, Py_ssiz
 
 #pragma region Gathers
 
+/** Rounds @p bytes up to the eight bytes every run of the trailing storage of @c Columns starts at. */
+static size_t columns_aligned(size_t bytes) { return (bytes + 7) & ~(size_t)7; }
+
+/** The bytes one column of @p type takes for @p docs_count documents: offsets and lengths for strings, else scalars. */
+static size_t column_bytes(ustore_doc_field_type_t type, size_t docs_count) {
+    if (type == ustore_doc_field_str_k || type == ustore_doc_field_bin_k)
+        return (2 * docs_count + 1) * sizeof(ustore_length_t);
+    return columns_aligned(field_type_width(type) * docs_count);
+}
+
 /**
- *  @brief Wraps the columns of one gather and the arena holding them into a @c Columns.
- *  @param[inout] arena The arena the result adopts; it is freed on failure.
- *  @param[inout] types The heap block of field types the result adopts; it is freed on failure.
- *  @param[in] gather The finished gather, whose outputs point at the columns.
- *  @return A new reference, or NULL with an exception set.
+ *  @brief Allocates a @c Columns whose trailing storage a gather of @p docs_count documents writes every column into.
+ *
+ *  The storage holds the six runs of column pointers the ABI takes, then the columns, then the types, then the three
+ *  bitmaps of every field, which start cleared so the bits past the last document read as unset.
+ *
+ *  @param[in] types The type of every field, copied into the result.
+ *  @return A new reference with no arena, or NULL with an exception set.
  */
-static PyObject* columns_adopt(ustore_arena_t arena, ustore_doc_field_type_t* types,
-                               ustore_docs_gather_t const* gather) {
-    Columns* const instance = PyObject_New(Columns, &ColumnsType);
-    if (!instance) {
-        ustore_arena_free(arena);
-        PyMem_Free(types);
-        return NULL;
+static Columns* columns_adopt(ustore_doc_field_type_t const* types, size_t fields_count, size_t docs_count) {
+    size_t const pointers_bytes = columns_aligned(6 * fields_count * sizeof(void*));
+    size_t columns_bytes = 0;
+    for (size_t field_index = 0; field_index != fields_count; ++field_index)
+        columns_bytes += column_bytes(types[field_index], docs_count);
+    size_t const types_bytes = columns_aligned(fields_count * sizeof(ustore_doc_field_type_t));
+    size_t const bitmap_bytes = (docs_count + 7) / 8;
+    size_t const bitmaps_bytes = 3 * fields_count * bitmap_bytes;
+    size_t const storage_bytes = pointers_bytes + columns_bytes + types_bytes + bitmaps_bytes;
+
+    Columns* const instance = PyObject_NewVar(Columns, &ColumnsType, (Py_ssize_t)storage_bytes);
+    if (!instance) return NULL;
+    unsigned char* const storage = (unsigned char*)instance->storage;
+    void** const pointers = (void**)storage;
+    instance->validities = (ustore_octet_t**)pointers;
+    instance->conversions = (ustore_octet_t**)(pointers + fields_count);
+    instance->collisions = (ustore_octet_t**)(pointers + 2 * fields_count);
+    instance->scalars = (ustore_byte_t**)(pointers + 3 * fields_count);
+    instance->offsets = (ustore_length_t**)(pointers + 4 * fields_count);
+    instance->lengths = (ustore_length_t**)(pointers + 5 * fields_count);
+
+    unsigned char* column = storage + pointers_bytes;
+    for (size_t field_index = 0; field_index != fields_count; ++field_index) {
+        ustore_doc_field_type_t const type = types[field_index];
+        int const textual = type == ustore_doc_field_str_k || type == ustore_doc_field_bin_k;
+        instance->scalars[field_index] = textual ? NULL : column;
+        instance->offsets[field_index] = textual ? (ustore_length_t*)(void*)column : NULL;
+        instance->lengths[field_index] = textual ? (ustore_length_t*)(void*)column + docs_count + 1 : NULL;
+        column += column_bytes(type, docs_count);
     }
-    instance->arena = arena;
-    instance->validities = *gather->columns_validities;
-    instance->conversions = *gather->columns_conversions;
-    instance->collisions = *gather->columns_collisions;
-    instance->scalars = *gather->columns_scalars;
-    instance->offsets = *gather->columns_offsets;
-    instance->lengths = *gather->columns_lengths;
-    instance->joined = *gather->joined_strings;
-    instance->types = types;
-    instance->fields_count = gather->fields_count;
-    instance->docs_count = gather->docs_count;
-    return (PyObject*)instance;
+    instance->types = (ustore_doc_field_type_t*)(void*)column;
+    if (fields_count) memcpy(instance->types, types, fields_count * sizeof(ustore_doc_field_type_t));
+
+    unsigned char* const bitmaps = column + types_bytes;
+    memset(bitmaps, 0, bitmaps_bytes);
+    for (size_t field_index = 0; field_index != fields_count; ++field_index) {
+        instance->validities[field_index] = bitmaps + 3 * field_index * bitmap_bytes;
+        instance->conversions[field_index] = instance->validities[field_index] + bitmap_bytes;
+        instance->collisions[field_index] = instance->conversions[field_index] + bitmap_bytes;
+    }
+    instance->arena = NULL;
+    instance->joined = NULL;
+    instance->fields_count = fields_count;
+    instance->docs_count = docs_count;
+    return instance;
 }
 
 char const doc_docs_gather[] =                                                                //
@@ -630,7 +968,7 @@ PyObject* ustore_py_api_docs_gather(PyObject* self, PyObject* const* args, Py_ss
         return NULL;
     }
 
-    // The types outlive the call inside the result, so they take a block of their own.
+    // The types are copied into the result once its storage is sized by them.
     ustore_str_view_t* const field_texts = (ustore_str_view_t*)PyMem_Malloc((fields_count + 1) *
                                                                             sizeof(ustore_str_view_t));
     ustore_doc_field_type_t* const types = (ustore_doc_field_type_t*)PyMem_Malloc((fields_count + 1) *
@@ -657,46 +995,39 @@ PyObject* ustore_py_api_docs_gather(PyObject* self, PyObject* const* args, Py_ss
 
     ustore_py_keys_t keys;
     if (!failed && ustore_py_keys_from_object(args[0], &keys) != 0) failed = 1;
-    if (failed) {
+    Columns* const columns = failed ? NULL : columns_adopt(types, fields_count, keys.count);
+    PyMem_Free(types);
+    if (!columns) {
+        if (!failed) ustore_py_keys_release(&keys);
         PyMem_Free(field_texts);
-        PyMem_Free(types);
         Py_DECREF(fields_held);
         return NULL;
     }
 
-    ustore_octet_t** validities = NULL;
-    ustore_octet_t** conversions = NULL;
-    ustore_octet_t** collisions = NULL;
-    ustore_byte_t** scalars = NULL;
-    ustore_length_t** offsets = NULL;
-    ustore_length_t** lengths = NULL;
-    ustore_byte_t* joined = NULL;
-    ustore_error_t error = {0};
+    ustore_outcome_t outcome = {0};
     ustore_arena_t arena = ustore_py_arena_claim(context.database);
 
     ustore_docs_gather_t gather = {0};
-    gather.db = context.database->handle;
-    gather.error = &error;
-    gather.transaction = context.transaction;
-    gather.snapshot = options.snapshot;
-    gather.arena = &arena;
-    gather.options = options.options;
-    gather.docs_count = keys.count;
+    gather.database = context.database->handle;
+    gather.outcome = &outcome;
+    gather.view = options.view;
+    gather.count = keys.count;
     gather.fields_count = fields_count;
     gather.collections = &options.collection;
     gather.keys = keys.keys;
     gather.keys_stride = sizeof(ustore_key_t);
     gather.fields = field_texts;
     gather.fields_stride = sizeof(ustore_str_view_t);
-    gather.types = types;
+    gather.types = columns->types;
     gather.types_stride = sizeof(ustore_doc_field_type_t);
-    gather.columns_validities = &validities;
-    gather.columns_conversions = &conversions;
-    gather.columns_collisions = &collisions;
-    gather.columns_scalars = &scalars;
-    gather.columns_offsets = &offsets;
-    gather.columns_lengths = &lengths;
-    gather.joined_strings = &joined;
+    gather.columns_validities = columns->validities;
+    gather.columns_conversions = columns->conversions;
+    gather.columns_collisions = columns->collisions;
+    gather.columns_scalars = columns->scalars;
+    gather.columns_offsets = columns->offsets;
+    gather.columns_lengths = columns->lengths;
+    gather.joined_strings = &columns->joined;
+    gather.arena = &arena;
 
     Py_BEGIN_ALLOW_THREADS;
     ustore_docs_gather(&gather);
@@ -705,13 +1036,13 @@ PyObject* ustore_py_api_docs_gather(PyObject* self, PyObject* const* args, Py_ss
     ustore_py_keys_release(&keys);
     PyMem_Free(field_texts);
     Py_DECREF(fields_held);
-    if (error.status != ustore_success_k) {
-        PyMem_Free(types);
+    if (ustore_py_raise_on_outcome(&outcome) != 0) {
         ustore_py_arena_return(context.database, arena);
-        ustore_py_raise_on_error(&error);
+        Py_DECREF(columns);
         return NULL;
     }
-    return columns_adopt(arena, types, &gather);
+    columns->arena = arena;
+    return (PyObject*)columns;
 }
 
 #pragma endregion Gathers
@@ -719,7 +1050,7 @@ PyObject* ustore_py_api_docs_gather(PyObject* self, PyObject* const* args, Py_ss
 #pragma region Columns
 
 static char const doc_Columns[] =                                                               //
-    "The typed columns one gather exported, read straight out of the arena holding them.\n"     //
+    "The typed columns one gather exported, read straight out of the memory holding them.\n"    //
     "\n"                                                                                        //
     "Indexing a scalar column answers a `memoryview` of its type over the stored scalars, a\n"  //
     "'uuid' column a two-dimensional view of sixteen bytes per document, and a string column\n" //
@@ -727,11 +1058,10 @@ static char const doc_Columns[] =                                               
     "carries the 'e' format, which NumPy reads as float16 without a copy.\n"                    //
     "\n"                                                                                        //
     "The bitmaps address documents least significant bit first, as Apache\n"                    //
-    "Arrow does, and every view keeps this object, and therefore the arena, alive.";
+    "Arrow does, and every view keeps this object, and therefore its memory, alive.";
 
 static void Columns_dealloc(Columns* self) {
     ustore_arena_free(self->arena);
-    PyMem_Free(self->types);
     PyObject_Free(self);
 }
 
@@ -873,6 +1203,7 @@ PyTypeObject ColumnsType = {
         .tp_name = "ustore.Columns",
     .tp_doc = doc_Columns,
     .tp_basicsize = sizeof(Columns),
+    .tp_itemsize = 1,
     .tp_flags = Py_TPFLAGS_DEFAULT,
     .tp_new = NULL,
     .tp_dealloc = (destructor)Columns_dealloc,

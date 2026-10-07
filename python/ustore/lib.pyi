@@ -7,15 +7,19 @@ interpreter running the tests. The package floor is 3.12.
 from collections.abc import Sequence
 from os import PathLike
 from types import TracebackType
-from typing import Literal, Self
+from typing import Literal, Self, overload
 from uuid import UUID
+
+from ustore.graph_view import DiGraph
+from ustore.table_view import Table
 
 type Buffer = memoryview | bytes | bytearray
 type CollectionLike = UUID | str | None
 type KeyLike = UUID | int | str | bytes
 type KeysLike = Sequence[KeyLike] | Buffer
-type ValueLike = Buffer | None
-type DocumentLike = str | Buffer | None
+type ValueLike = Buffer
+type JSONValue = dict[str, JSONValue] | list[JSONValue] | tuple[JSONValue, ...] | str | int | float | bool | None
+type DocumentLike = str | Buffer | dict[str, JSONValue] | list[JSONValue] | int | float | bool
 type FieldType = Literal[
     "json", "str", "bytes", "null", "bool", "f64", "f32", "i64", "i32", "i16", "i8", "u64", "u32", "u16", "u8"
 ]
@@ -39,9 +43,13 @@ def engines_compiled() -> tuple[str, ...]:
 # region: Failures
 
 class Error(RuntimeError):
-    """Every failure the engine reports, carrying the status shared with the C ABI."""
+    """Every failure the engine reports, carrying the status shared with the C ABI.
+
+    A status no subclass names, such as "pending", "contended" or "cancelled", raises this class itself.
+    """
 
     status: str
+    """The C ABI's own spelling of the status, such as "write-conflict" or "out-of-memory"."""
 
 class ArgumentError(Error):
     """An argument is null, contradicts another one, or names a handle that was never opened."""
@@ -75,13 +83,18 @@ class Values:
     """The values one batch read exported, read straight out of the arena holding them."""
 
     lengths: tuple[int | None, ...]
+    """The length of every value, derived from the offsets, with None where the key was absent."""
+    keys: Keys | None
 
     def __len__(self) -> int: ...
     def __getitem__(self, task: int) -> memoryview | None: ...
     def __buffer__(self, flags: int) -> memoryview: ...
+    def __arrow_c_array__(self, requested_schema: object | None = None) -> tuple[object, object]:
+        """The schema and array PyCapsules of the batch as Arrow `large_binary`: the presence bits, offsets and bytes
+        the read wrote, exported in place."""
 
 class Keys:
-    """The keys one batch scan or sample found, read straight out of the arena holding them."""
+    """The keys one batch scan or sample found, held in the object's own memory."""
 
     counts: tuple[int, ...]
 
@@ -117,6 +130,65 @@ class Edges:
 
 # endregion: Result Tapes
 
+# region: Collections
+
+class Collection:
+    """A collection a database or a transaction addresses by name, resolved through its view and created by its first
+    write."""
+
+    name: str
+    id: UUID
+    modality: Modality
+    blobs: BlobsView
+    docs: DocsView
+    docs_json: DocsJSONView
+    graph: DiGraph
+    table: Table
+
+    def sample(self, count: int) -> Values:
+        """Up to `count` values drawn at random, with the keys drawn as their `keys`."""
+
+    def sample_keys(self, count: int) -> Keys:
+        """Up to `count` keys drawn at random."""
+
+    def scan(self, start: KeyLike, count: int) -> Keys:
+        """Up to `count` keys from `start` upwards."""
+
+class BlobsView:
+    """The binary values of a collection: one key reads a zero-copy memoryview, a batch reads Values."""
+
+    @overload
+    def __getitem__(self, key: KeyLike) -> memoryview: ...
+    @overload
+    def __getitem__(self, key: KeysLike) -> Values: ...
+    def __setitem__(self, key: KeyLike | KeysLike, value: Sequence[ValueLike] | ValueLike) -> None: ...
+    def __delitem__(self, key: KeyLike | KeysLike) -> None: ...
+    def __contains__(self, key: KeyLike) -> bool: ...
+
+class DocsView:
+    """The JSON documents of a collection as Python objects, serialized and parsed in C."""
+
+    @overload
+    def __getitem__(self, key: KeyLike) -> JSONValue: ...
+    @overload
+    def __getitem__(self, key: KeysLike) -> list[JSONValue]: ...
+    def __setitem__(self, key: KeyLike | KeysLike, document: JSONValue | Sequence[JSONValue]) -> None: ...
+    def __delitem__(self, key: KeyLike | KeysLike) -> None: ...
+    def __contains__(self, key: KeyLike) -> bool: ...
+
+class DocsJSONView:
+    """The JSON documents of a collection as their text: one key reads a zero-copy memoryview, a batch Values."""
+
+    @overload
+    def __getitem__(self, key: KeyLike) -> memoryview: ...
+    @overload
+    def __getitem__(self, key: KeysLike) -> Values: ...
+    def __setitem__(self, key: KeyLike | KeysLike, text: Sequence[DocumentLike] | DocumentLike) -> None: ...
+    def __delitem__(self, key: KeyLike | KeysLike) -> None: ...
+    def __contains__(self, key: KeyLike) -> bool: ...
+
+# endregion: Collections
+
 # region: Handles
 
 class Database:
@@ -147,7 +219,6 @@ class Database:
         transport: Transport = "automatic",
         gpu_devices: Sequence[int] = (),
         memory_limit: int = 0,
-        threads: int = 0,
         gpu_memory_limit: int = 0,
         shared_io_channels: int = 0,
         queue_depth: int = 0,
@@ -174,6 +245,9 @@ class Database:
         value: BaseException | None = None,
         traceback: TracebackType | None = None,
     ) -> None: ...
+    def __getitem__(self, name: str) -> Collection:
+        """The collection `name` addresses, where the empty name is the main collection."""
+
     def close(self) -> None:
         """Closes the database; every transaction it opened must be closed first."""
 
@@ -239,7 +313,8 @@ class Database:
     def set(
         self, key: KeyLike, value: ValueLike, *, collection: CollectionLike = None, flush: bool = False
     ) -> None: ...
-    def pop(self, keys: KeyLike | KeysLike, *, collection: CollectionLike = None, flush: bool = False) -> None: ...
+    def remove(self, keys: KeyLike | KeysLike, *, collection: CollectionLike = None, flush: bool = False) -> None:
+        """Removes keys with their values or documents."""
     def contains(
         self, key: KeyLike, *, collection: CollectionLike = None, snapshot: Snapshot | None = None
     ) -> bool: ...
@@ -347,6 +422,9 @@ class Transaction:
         value: BaseException | None = None,
         traceback: TracebackType | None = None,
     ) -> None: ...
+    def __getitem__(self, name: str) -> Collection:
+        """The collection `name` addresses, whose verbs stage into this transaction."""
+
     def commit(self, *, flush: bool = False) -> None:
         """Applies every staged change, or none of them."""
 
@@ -354,7 +432,10 @@ class Transaction:
         """Runs the first phase of a two-phase commit, answering the stamp it took."""
 
     def rollback(self) -> None:
-        """Drops every staged change and starts a new generation on the same handle."""
+        """Withdraws a stage, keeping the reads and writes, so the transaction can stage or commit again."""
+
+    def reset(self) -> None:
+        """Drops every read and write and starts a new generation on the same handle."""
 
     def close(self) -> None:
         """Drops whatever is still staged and releases the handle."""
@@ -388,7 +469,7 @@ class Transaction:
         flush: bool = False,
         watch: bool = True,
     ) -> None: ...
-    def pop(
+    def remove(
         self, keys: KeyLike | KeysLike, *, collection: CollectionLike = None, flush: bool = False, watch: bool = True
     ) -> None: ...
     def contains(self, key: KeyLike, *, collection: CollectionLike = None, watch: bool = True) -> bool: ...

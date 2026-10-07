@@ -6,8 +6,8 @@
  *
  *  A graph collection maps every vertex onto its sorted neighborships, so an edge is three keys -
  *  source, target and edge identifier - and a lookup answers a tape of such triples. Every verb
- *  claims the database's arena, drops the interpreter lock around the call, and either returns the
- *  arena or hands it to the tape it answers with.
+ *  drops the interpreter lock around the call, and a lookup of edges claims the database's arena
+ *  and hands it to the tape it answers with.
  */
 #include "lib.h"
 
@@ -155,31 +155,29 @@ PyObject* ustore_py_api_graph_upsert_edges(PyObject* self, PyObject* const* args
                                &batches) != 0)
         return NULL;
 
-    ustore_error_t error = {0};
-    ustore_arena_t arena = ustore_py_arena_claim(context.database);
+    ustore_outcome_t outcome = {0};
 
     ustore_graph_upsert_edges_t upsert = {0};
-    upsert.db = context.database->handle;
-    upsert.error = &error;
+    upsert.database = context.database->handle;
+    upsert.outcome = &outcome;
     upsert.transaction = context.transaction;
-    upsert.arena = &arena;
-    upsert.options = batches.options.options;
-    upsert.tasks_count = batches.sources.count;
+    upsert.count = batches.sources.count;
     upsert.collections = &batches.options.collection;
-    upsert.edges_ids = batches.edges.keys;
+    upsert.edges = batches.edges.keys;
     upsert.edges_stride = sizeof(ustore_key_t);
-    upsert.sources_ids = batches.sources.keys;
+    upsert.sources = batches.sources.keys;
     upsert.sources_stride = sizeof(ustore_key_t);
-    upsert.targets_ids = batches.targets.keys;
+    upsert.targets = batches.targets.keys;
     upsert.targets_stride = sizeof(ustore_key_t);
+    upsert.durability = batches.options.durability;
+    upsert.watch = batches.options.watch;
 
     Py_BEGIN_ALLOW_THREADS;
     ustore_graph_upsert_edges(&upsert);
     Py_END_ALLOW_THREADS;
 
     edge_batches_release(&batches);
-    ustore_py_arena_return(context.database, arena);
-    if (ustore_py_raise_on_error(&error) != 0) return NULL;
+    if (ustore_py_raise_on_outcome(&outcome) != 0) return NULL;
     Py_RETURN_NONE;
 }
 
@@ -206,69 +204,52 @@ PyObject* ustore_py_api_graph_remove_edges(PyObject* self, PyObject* const* args
                                &batches) != 0)
         return NULL;
 
-    ustore_error_t error = {0};
-    ustore_arena_t arena = ustore_py_arena_claim(context.database);
+    ustore_outcome_t outcome = {0};
 
     ustore_graph_remove_edges_t remove = {0};
-    remove.db = context.database->handle;
-    remove.error = &error;
+    remove.database = context.database->handle;
+    remove.outcome = &outcome;
     remove.transaction = context.transaction;
-    remove.arena = &arena;
-    remove.options = batches.options.options;
-    remove.tasks_count = batches.sources.count;
+    remove.count = batches.sources.count;
     remove.collections = &batches.options.collection;
-    remove.edges_ids = batches.edges.keys;
+    remove.edges = batches.edges.keys;
     remove.edges_stride = sizeof(ustore_key_t);
-    remove.sources_ids = batches.sources.keys;
+    remove.sources = batches.sources.keys;
     remove.sources_stride = sizeof(ustore_key_t);
-    remove.targets_ids = batches.targets.keys;
+    remove.targets = batches.targets.keys;
     remove.targets_stride = sizeof(ustore_key_t);
+    remove.durability = batches.options.durability;
+    remove.watch = batches.options.watch;
 
     Py_BEGIN_ALLOW_THREADS;
     ustore_graph_remove_edges(&remove);
     Py_END_ALLOW_THREADS;
 
     edge_batches_release(&batches);
-    ustore_py_arena_return(context.database, arena);
-    if (ustore_py_raise_on_error(&error) != 0) return NULL;
+    if (ustore_py_raise_on_outcome(&outcome) != 0) return NULL;
     Py_RETURN_NONE;
 }
 
 /**
- *  @brief Wraps a tape of edges and the arena holding it into an @c Edges.
- *  @param[inout] arena The arena the result adopts; it is freed on failure.
- *  @param[in] tape Three keys per edge, laid end to end vertex after vertex.
- *  @param[in] degrees The degree of every vertex.
- *  @param[in] count Vertices the lookup carried.
- *  @return A new reference, or NULL with an exception set.
+ *  @brief Allocates an @c Edges whose trailing storage a lookup of @p count vertices writes the degrees into, past
+ *      the edge offsets derived from them once the lookup returns.
+ *  @return A new reference with no arena and no tape, or NULL with an exception set.
  */
-static PyObject* edges_adopt(ustore_arena_t arena, ustore_key_t* tape, ustore_vertex_degree_t* degrees, size_t count) {
-    size_t* const offsets = (size_t*)PyMem_Malloc((count + 1) * sizeof(size_t));
-    Edges* const instance = offsets ? PyObject_New(Edges, &EdgesType) : NULL;
-    if (!instance) {
-        if (!offsets) PyErr_NoMemory();
-        PyMem_Free(offsets);
-        ustore_arena_free(arena);
-        return NULL;
-    }
-    // A missing vertex reports a sentinel degree yet holds no edges on the tape.
-    offsets[0] = 0;
-    for (size_t vertex_index = 0; vertex_index != count; ++vertex_index) {
-        ustore_vertex_degree_t const degree = degrees[vertex_index];
-        offsets[vertex_index + 1] = offsets[vertex_index] + (degree == ustore_vertex_degree_missing_k ? 0 : degree);
-    }
-    instance->arena = arena;
-    instance->tape = tape;
-    instance->degrees = degrees;
-    instance->offsets = offsets;
+static Edges* edges_adopt(size_t count) {
+    size_t const storage_bytes = (count + 1) * sizeof(size_t) + count * sizeof(ustore_vertex_degree_t);
+    Edges* const instance = PyObject_NewVar(Edges, &EdgesType, (Py_ssize_t)storage_bytes);
+    if (!instance) return NULL;
+    instance->arena = NULL;
+    instance->tape = NULL;
+    instance->degrees = (ustore_vertex_degree_t*)(void*)(instance->offsets + count + 1);
     instance->count = count;
-    instance->shape[0] = (Py_ssize_t)offsets[count];
+    instance->shape[0] = 0;
     instance->shape[1] = 3;
     instance->shape[2] = (Py_ssize_t)sizeof(ustore_key_t);
     instance->strides[0] = 3 * (Py_ssize_t)sizeof(ustore_key_t);
     instance->strides[1] = (Py_ssize_t)sizeof(ustore_key_t);
     instance->strides[2] = 1;
-    return (PyObject*)instance;
+    return instance;
 }
 
 char const doc_graph_find_edges[] =                                                              //
@@ -298,39 +279,49 @@ PyObject* ustore_py_api_graph_find_edges(PyObject* self, PyObject* const* args, 
 
     ustore_py_keys_t vertices;
     if (ustore_py_keys_from_object(args[0], &vertices) != 0) return NULL;
+    Edges* const edges = edges_adopt(vertices.count);
+    if (!edges) {
+        ustore_py_keys_release(&vertices);
+        return NULL;
+    }
 
-    ustore_vertex_degree_t* degrees = NULL;
-    ustore_key_t* tape = NULL;
-    ustore_error_t error = {0};
+    ustore_outcome_t outcome = {0};
     ustore_arena_t arena = ustore_py_arena_claim(context.database);
 
     ustore_graph_find_edges_t find = {0};
-    find.db = context.database->handle;
-    find.error = &error;
-    find.transaction = context.transaction;
-    find.snapshot = options.snapshot;
-    find.arena = &arena;
-    find.options = options.options;
-    find.tasks_count = vertices.count;
+    find.database = context.database->handle;
+    find.outcome = &outcome;
+    find.view = options.view;
+    find.count = vertices.count;
     find.collections = &options.collection;
     find.vertices = vertices.keys;
     find.vertices_stride = sizeof(ustore_key_t);
     find.roles = &role;
-    find.degrees_per_vertex = &degrees;
-    find.edges_per_vertex = &tape;
+    find.degrees_per_vertex = edges->degrees;
+    find.degrees_per_vertex_stride = sizeof(ustore_vertex_degree_t);
+    find.edges_per_vertex = &edges->tape;
+    find.arena = &arena;
 
     Py_BEGIN_ALLOW_THREADS;
     ustore_graph_find_edges(&find);
     Py_END_ALLOW_THREADS;
 
-    size_t const vertices_count = vertices.count;
     ustore_py_keys_release(&vertices);
-    if (error.status != ustore_success_k) {
+    if (ustore_py_raise_on_outcome(&outcome) != 0) {
         ustore_py_arena_return(context.database, arena);
-        ustore_py_raise_on_error(&error);
+        Py_DECREF(edges);
         return NULL;
     }
-    return edges_adopt(arena, tape, degrees, vertices_count);
+    // A missing vertex reports a sentinel degree yet holds no edges on the tape.
+    edges->arena = arena;
+    edges->offsets[0] = 0;
+    for (size_t vertex_index = 0; vertex_index != edges->count; ++vertex_index) {
+        ustore_vertex_degree_t const degree = edges->degrees[vertex_index];
+        edges->offsets[vertex_index + 1] = edges->offsets[vertex_index] +
+                                           (degree == ustore_vertex_degree_missing_k ? 0 : degree);
+    }
+    edges->shape[0] = (Py_ssize_t)edges->offsets[edges->count];
+    return (PyObject*)edges;
 }
 
 char const doc_graph_degrees[] =                                                                //
@@ -358,34 +349,34 @@ PyObject* ustore_py_api_graph_degrees(PyObject* self, PyObject* const* args, Py_
 
     ustore_py_keys_t vertices;
     if (ustore_py_keys_from_object(args[0], &vertices) != 0) return NULL;
+    size_t const vertices_count = vertices.count;
+    ustore_vertex_degree_t* const degrees = PyMem_New(ustore_vertex_degree_t, vertices_count ? vertices_count : 1);
+    if (!degrees) {
+        ustore_py_keys_release(&vertices);
+        return PyErr_NoMemory();
+    }
 
-    ustore_vertex_degree_t* degrees = NULL;
-    ustore_error_t error = {0};
-    ustore_arena_t arena = ustore_py_arena_claim(context.database);
-
+    // Degrees alone land in the caller's span, so the lookup needs no arena.
+    ustore_outcome_t outcome = {0};
     ustore_graph_find_edges_t find = {0};
-    find.db = context.database->handle;
-    find.error = &error;
-    find.transaction = context.transaction;
-    find.snapshot = options.snapshot;
-    find.arena = &arena;
-    find.options = options.options;
-    find.tasks_count = vertices.count;
+    find.database = context.database->handle;
+    find.outcome = &outcome;
+    find.view = options.view;
+    find.count = vertices_count;
     find.collections = &options.collection;
     find.vertices = vertices.keys;
     find.vertices_stride = sizeof(ustore_key_t);
     find.roles = &role;
-    find.degrees_per_vertex = &degrees;
+    find.degrees_per_vertex = degrees;
+    find.degrees_per_vertex_stride = sizeof(ustore_vertex_degree_t);
 
     Py_BEGIN_ALLOW_THREADS;
     ustore_graph_find_edges(&find);
     Py_END_ALLOW_THREADS;
 
-    size_t const vertices_count = vertices.count;
     ustore_py_keys_release(&vertices);
     PyObject* counted = NULL;
-    if (error.status != ustore_success_k) { ustore_py_raise_on_error(&error); }
-    else if ((counted = PyTuple_New((Py_ssize_t)vertices_count)) != NULL) {
+    if (ustore_py_raise_on_outcome(&outcome) == 0 && (counted = PyTuple_New((Py_ssize_t)vertices_count)) != NULL) {
         for (size_t vertex_index = 0; vertex_index != vertices_count; ++vertex_index) {
             ustore_vertex_degree_t const degree = degrees[vertex_index];
             PyObject* const entry = degree == ustore_vertex_degree_missing_k ? Py_NewRef(Py_None)
@@ -397,7 +388,7 @@ PyObject* ustore_py_api_graph_degrees(PyObject* self, PyObject* const* args, Py_
             PyTuple_SET_ITEM(counted, (Py_ssize_t)vertex_index, entry);
         }
     }
-    ustore_py_arena_return(context.database, arena);
+    PyMem_Free(degrees);
     return counted;
 }
 
@@ -428,27 +419,25 @@ PyObject* ustore_py_api_graph_upsert_vertices(PyObject* self, PyObject* const* a
     ustore_py_keys_t vertices;
     if (ustore_py_keys_from_object(args[0], &vertices) != 0) return NULL;
 
-    ustore_error_t error = {0};
-    ustore_arena_t arena = ustore_py_arena_claim(context.database);
+    ustore_outcome_t outcome = {0};
 
     ustore_graph_upsert_vertices_t upsert = {0};
-    upsert.db = context.database->handle;
-    upsert.error = &error;
+    upsert.database = context.database->handle;
+    upsert.outcome = &outcome;
     upsert.transaction = context.transaction;
-    upsert.arena = &arena;
-    upsert.options = options.options;
-    upsert.tasks_count = vertices.count;
+    upsert.count = vertices.count;
     upsert.collections = &options.collection;
     upsert.vertices = vertices.keys;
     upsert.vertices_stride = sizeof(ustore_key_t);
+    upsert.durability = options.durability;
+    upsert.watch = options.watch;
 
     Py_BEGIN_ALLOW_THREADS;
     ustore_graph_upsert_vertices(&upsert);
     Py_END_ALLOW_THREADS;
 
     ustore_py_keys_release(&vertices);
-    ustore_py_arena_return(context.database, arena);
-    if (ustore_py_raise_on_error(&error) != 0) return NULL;
+    if (ustore_py_raise_on_outcome(&outcome) != 0) return NULL;
     Py_RETURN_NONE;
 }
 
@@ -477,28 +466,26 @@ PyObject* ustore_py_api_graph_remove_vertices(PyObject* self, PyObject* const* a
     ustore_py_keys_t vertices;
     if (ustore_py_keys_from_object(args[0], &vertices) != 0) return NULL;
 
-    ustore_error_t error = {0};
-    ustore_arena_t arena = ustore_py_arena_claim(context.database);
+    ustore_outcome_t outcome = {0};
 
     ustore_graph_remove_vertices_t remove = {0};
-    remove.db = context.database->handle;
-    remove.error = &error;
+    remove.database = context.database->handle;
+    remove.outcome = &outcome;
     remove.transaction = context.transaction;
-    remove.arena = &arena;
-    remove.options = options.options;
-    remove.tasks_count = vertices.count;
+    remove.count = vertices.count;
     remove.collections = &options.collection;
     remove.vertices = vertices.keys;
     remove.vertices_stride = sizeof(ustore_key_t);
     remove.roles = &role;
+    remove.durability = options.durability;
+    remove.watch = options.watch;
 
     Py_BEGIN_ALLOW_THREADS;
     ustore_graph_remove_vertices(&remove);
     Py_END_ALLOW_THREADS;
 
     ustore_py_keys_release(&vertices);
-    ustore_py_arena_return(context.database, arena);
-    if (ustore_py_raise_on_error(&error) != 0) return NULL;
+    if (ustore_py_raise_on_outcome(&outcome) != 0) return NULL;
     Py_RETURN_NONE;
 }
 
@@ -516,7 +503,6 @@ static char const doc_Edges[] =                                                 
 
 static void Edges_dealloc(Edges* self) {
     ustore_arena_free(self->arena);
-    PyMem_Free(self->offsets);
     PyObject_Free(self);
 }
 
@@ -595,6 +581,7 @@ PyTypeObject EdgesType = {
         .tp_name = "ustore.Edges",
     .tp_doc = doc_Edges,
     .tp_basicsize = sizeof(Edges),
+    .tp_itemsize = 1,
     .tp_flags = Py_TPFLAGS_DEFAULT,
     .tp_new = NULL,
     .tp_dealloc = (destructor)Edges_dealloc,

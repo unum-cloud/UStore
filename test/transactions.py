@@ -40,7 +40,7 @@ def test_commit_publishes_every_write(database, count: int, flush: bool):
 def test_commit_publishes_every_removal(database, count: int):
     database.write(list(range(count)), b"value")
     with database.transaction() as staged:
-        staged.pop(list(range(count)))
+        staged.remove(list(range(count)))
     assert not any(database.contains(key) for key in range(count))
 
 
@@ -60,13 +60,27 @@ def test_staged_work_is_invisible_until_it_commits(database, verb: str):
     assert database.get(1) == b"pending"
 
 
-def test_rollback_drops_the_staged_work(database):
+def test_reset_drops_the_staged_work(database):
     staged = database.transaction()
     staged.set(1, b"pending")
-    staged.rollback()
+    staged.reset()
     staged.commit()
     staged.close()
     assert not database.contains(1)
+
+
+def test_rollback_withdraws_a_stage_and_keeps_the_writes(database):
+    """A rollback only withdraws the stage, so the next commit still publishes what was written."""
+    staged = database.transaction()
+    try:
+        staged.set(1, b"pending")
+        staged.stage()
+        staged.rollback()
+        assert not database.contains(1)
+        staged.commit()
+    finally:
+        staged.close()
+    assert database.get(1) == b"pending"
 
 
 def test_an_exception_leaves_the_work_unpublished(database):
@@ -181,7 +195,7 @@ def test_a_database_waits_for_its_transactions(database):
     staged.close()
 
 
-@pytest.mark.parametrize("verb", ["set", "commit", "stage", "rollback"])
+@pytest.mark.parametrize("verb", ["set", "commit", "stage", "rollback", "reset"])
 def test_a_closed_transaction_refuses_work(database, verb: str):
     staged = database.transaction()
     staged.close()

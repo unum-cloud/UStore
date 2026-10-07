@@ -14,6 +14,7 @@ python_add_library(
     docs.c
     graph.c
     strings.c
+    collection.c
 )
 
 # `ustore/__init__.py` imports it as `ustore.lib`, so the file name is part of the interface. The engines are C++, so
@@ -35,8 +36,9 @@ if (NOT MSVC)
     target_compile_options(ustore_python PRIVATE -Wno-cast-function-type)
 endif ()
 
-# The one library carries every engine the build enables, with the `USTORE_WITH_*` switches `engines_compiled` reads.
-target_link_libraries(ustore_python PRIVATE ustore ustore_warnings)
+# The one library carries every engine the build enables, with the `USTORE_WITH_*` switches `engines_compiled` reads,
+# and documents convert to and from Python objects through the yyjson it already carries.
+target_link_libraries(ustore_python PRIVATE ustore yyjson::yyjson ustore_warnings)
 
 # Named, or every dependency's own install rules land in the wheel beside the extension.
 install(TARGETS ustore_python LIBRARY DESTINATION ustore COMPONENT ustore_python)

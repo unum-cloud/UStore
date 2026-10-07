@@ -36,10 +36,18 @@ static struct {
     /** The type to ready. */
     PyTypeObject* type;
 } const module_types[] = {
-    {"Database", &DatabaseType}, {"Transaction", &TransactionType},
-    {"Snapshot", &SnapshotType}, {"Values", &ValuesType},
-    {"Keys", &KeysType},         {"Columns", &ColumnsType},
-    {"Edges", &EdgesType},       {NULL, &SpanType},
+    {"Database", &DatabaseType},
+    {"Transaction", &TransactionType},
+    {"Snapshot", &SnapshotType},
+    {"Values", &ValuesType},
+    {"Keys", &KeysType},
+    {"Columns", &ColumnsType},
+    {"Edges", &EdgesType},
+    {"Collection", &CollectionType},
+    {"BlobsView", &BlobsViewType},
+    {"DocsView", &DocsViewType},
+    {"DocsJSONView", &DocsJSONViewType},
+    {NULL, &SpanType},
 };
 
 static char const doc_engines_compiled[] =                         //

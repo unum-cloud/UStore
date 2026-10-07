@@ -22,48 +22,44 @@ PyObject* MalformedErrorType = NULL;
 PyObject* CapacityErrorType = NULL;
 PyObject* StorageErrorType = NULL;
 
-/** One status, the exception it raises, and the name it carries into Python. */
-typedef struct status_naming_t {
+/** One status and the exception it raises, where a status no row names raises the base @c Error. */
+typedef struct status_exception_t {
 
     /** The status this row describes. */
     ustore_status_t status;
 
     /** The exception the status raises, read at raise time rather than at load time. */
     PyObject** kind;
+} status_exception_t;
 
-    /** The lowercase, dash-separated spelling the exception carries. */
-    char const* name;
-} status_naming_t;
-
-static status_naming_t const status_namings[] = {
-    {ustore_error_out_of_memory_k, &CapacityErrorType, "out-of-memory"},
-    {ustore_error_invalid_argument_k, &ArgumentErrorType, "invalid-argument"},
-    {ustore_error_uninitialized_k, &ArgumentErrorType, "uninitialized"},
-    {ustore_error_unsupported_k, &UnsupportedErrorType, "unsupported"},
-    {ustore_error_io_k, &StorageErrorType, "io"},
-    {ustore_error_malformed_k, &MalformedErrorType, "malformed"},
-    {ustore_error_not_found_k, &MissingErrorType, "not-found"},
-    {ustore_error_already_exists_k, &ExistsErrorType, "already-exists"},
-    {ustore_error_write_conflict_k, &ConflictErrorType, "write-conflict"},
-    {ustore_error_read_conflict_k, &ConflictErrorType, "read-conflict"},
-    {ustore_error_phantom_conflict_k, &ConflictErrorType, "phantom-conflict"},
-    {ustore_error_capacity_exhausted_k, &CapacityErrorType, "capacity-exhausted"},
-    {ustore_error_device_k, &StorageErrorType, "device"},
-    {ustore_error_internal_k, &StorageErrorType, "internal"},
+static status_exception_t const status_exceptions[] = {
+    {ustore_status_out_of_memory_k, &CapacityErrorType},
+    {ustore_status_invalid_argument_k, &ArgumentErrorType},
+    {ustore_status_uninitialized_k, &ArgumentErrorType},
+    {ustore_status_unsupported_k, &UnsupportedErrorType},
+    {ustore_status_io_k, &StorageErrorType},
+    {ustore_status_malformed_k, &MalformedErrorType},
+    {ustore_status_not_found_k, &MissingErrorType},
+    {ustore_status_already_exists_k, &ExistsErrorType},
+    {ustore_status_write_conflict_k, &ConflictErrorType},
+    {ustore_status_read_conflict_k, &ConflictErrorType},
+    {ustore_status_phantom_conflict_k, &ConflictErrorType},
+    {ustore_status_capacity_exhausted_k, &CapacityErrorType},
+    {ustore_status_device_k, &StorageErrorType},
+    {ustore_status_internal_k, &StorageErrorType},
 };
 
-static status_naming_t const* status_naming(ustore_status_t status) {
-    for (size_t naming_index = 0; naming_index != ustore_py_table_size_(status_namings); ++naming_index)
-        if (status_namings[naming_index].status == status) return &status_namings[naming_index];
-    return NULL;
+static PyObject* status_exception(ustore_status_t status) {
+    for (size_t row_index = 0; row_index != ustore_py_table_size_(status_exceptions); ++row_index)
+        if (status_exceptions[row_index].status == status) return *status_exceptions[row_index].kind;
+    return ErrorType;
 }
 
 int ustore_py_raise(ustore_status_t status, char const* format, ...) {
     // A status this specific supersedes whatever the caller was carrying, and building the
     // instance below must not start with an exception already pending.
     PyErr_Clear();
-    status_naming_t const* const naming = status_naming(status);
-    PyObject* const kind = naming ? *naming->kind : ErrorType;
+    PyObject* const kind = status_exception(status);
 
     va_list arguments;
     va_start(arguments, format);
@@ -75,7 +71,7 @@ int ustore_py_raise(ustore_status_t status, char const* format, ...) {
     Py_DECREF(message);
     if (!instance) return -1;
 
-    PyObject* const status_name = PyUnicode_FromString(naming ? naming->name : "unknown");
+    PyObject* const status_name = PyUnicode_FromString(ustore_status_name(status));
     if (!status_name) {
         Py_DECREF(instance);
         return -1;
@@ -93,10 +89,10 @@ int ustore_py_raise(ustore_status_t status, char const* format, ...) {
     return -1;
 }
 
-int ustore_py_raise_on_error(ustore_error_t const* error) {
-    if (error->status == ustore_success_k) return 0;
-    // The message is static and never freed, so it is handed straight to the formatter.
-    return ustore_py_raise(error->status, error->message ? error->message : "the engine named no detail");
+int ustore_py_raise_on_outcome(ustore_outcome_t const* outcome) {
+    if (outcome->status == ustore_status_success_k) return 0;
+    // The message is static and never freed, so it is handed to the formatter as a `%s` argument.
+    return ustore_py_raise(outcome->status, "%s", outcome->message ? outcome->message : "the engine named no detail");
 }
 
 int ustore_py_raise_from_cause(PyObject* kind, char const* format, ...) {
@@ -526,17 +522,9 @@ int ustore_py_contents_reserve(ustore_py_contents_t* batch, size_t count) {
 
 int ustore_py_contents_borrow(PyObject* object, ustore_py_contents_t* batch) {
     size_t const task = batch->count;
-    if (object == Py_None) {
-        // A null chunk is how the ABI spells a removal, so a task with no value needs no buffer.
-        batch->values[task] = NULL;
-        batch->lengths[task] = 0;
-        ++batch->count;
-        return 0;
-    }
-
     Py_buffer* const buffer = &batch->buffers[batch->borrowed];
     if (PyObject_GetBuffer(object, buffer, PyBUF_SIMPLE) != 0)
-        return ustore_py_raise_from_cause(PyExc_TypeError, "A value must be bytes-like or None, not %S",
+        return ustore_py_raise_from_cause(PyExc_TypeError, "A value must be bytes-like, not %S; remove() removes keys",
                                           Py_TYPE(object));
     ++batch->borrowed;
     batch->values[task] = (ustore_bytes_cptr_t)buffer->buf;
@@ -640,28 +628,33 @@ static char const doc_Values[] =                                                
     "Indexing answers a `memoryview` over the stored bytes, or None where the key was\n"     //
     "absent; nothing is copied, and the view keeps this object, and therefore the arena,\n"  //
     "alive for as long as it is held. `bytes(values[index])` is where a copy happens, and\n" //
-    "nowhere before it.";
+    "nowhere before it. The whole batch exports through the Arrow C data interface as\n"     //
+    "`large_binary`, so `pyarrow.array(values)` reads the arena in place too.";
 
-PyObject* ustore_py_values_adopt(ustore_arena_t arena, ustore_byte_t* tape, ustore_length_t* offsets,
-                                 ustore_length_t* lengths, size_t count) {
-    Values* const instance = PyObject_New(Values, &ValuesType);
-    if (!instance) {
-        ustore_arena_free(arena);
-        return NULL;
-    }
-    instance->arena = arena;
-    instance->tape = tape;
-    instance->offsets = offsets;
-    instance->lengths = lengths;
+Values* ustore_py_values_adopt(size_t count) {
+    size_t const storage_bytes = (count + 1) * sizeof(ustore_length_t) + (count + 7) / 8;
+    Values* const instance = PyObject_NewVar(Values, &ValuesType, (Py_ssize_t)storage_bytes);
+    if (!instance) return NULL;
+    instance->arena = NULL;
+    instance->tape = NULL;
+    instance->presences = (ustore_octet_t*)(instance->offsets + count + 1);
     instance->count = count;
-    return (PyObject*)instance;
+    instance->keys = NULL;
+    // A read of no tasks may leave its spans untouched, while the first offset still closes an empty tape.
+    instance->offsets[0] = 0;
+    return instance;
 }
 
 static void Values_dealloc(Values* self) {
     // Every `memoryview` over this tape holds a reference to the object exporting it, so the last
     // view has died by the time this runs and the arena is safe to release.
     ustore_arena_free(self->arena);
+    Py_XDECREF(self->keys);
     PyObject_Free(self);
+}
+
+int ustore_py_values_present(Values const* values, size_t task_index) {
+    return (values->presences[task_index / 8] >> (task_index % 8)) & 1;
 }
 
 static Py_ssize_t Values_length(Values* self) { return (Py_ssize_t)self->count; }
@@ -672,21 +665,20 @@ static PyObject* Values_item(Values* self, Py_ssize_t task_index) {
         PyErr_SetString(PyExc_IndexError, "Task index out of range");
         return NULL;
     }
-    if (self->lengths[task_index] == ustore_length_missing_k) Py_RETURN_NONE;
-    Py_ssize_t const shape = (Py_ssize_t)self->lengths[task_index];
+    if (!ustore_py_values_present(self, (size_t)task_index)) Py_RETURN_NONE;
+    Py_ssize_t const shape = (Py_ssize_t)(self->offsets[task_index + 1] - self->offsets[task_index]);
     return ustore_py_span_view((PyObject*)self, self->tape + self->offsets[task_index], "B", 1, 1, &shape);
 }
 
 static int Values_getbuffer(Values* self, Py_buffer* view, int flags) {
     // A tape of no values still answers a buffer, so a caller need not special-case an empty read.
-    Py_ssize_t const spanned = self->count ? (Py_ssize_t)self->offsets[self->count] : 0;
     void* const data = self->tape ? (void*)self->tape : (void*)self;
-    return PyBuffer_FillInfo(view, (PyObject*)self, data, spanned, 1, flags);
+    return PyBuffer_FillInfo(view, (PyObject*)self, data, (Py_ssize_t)self->offsets[self->count], 1, flags);
 }
 
 static PyObject* Values_repr(Values* self) {
-    Py_ssize_t const spanned = self->count ? (Py_ssize_t)self->offsets[self->count] : 0;
-    return PyUnicode_FromFormat("Values(count=%zu, bytes=%zd)", self->count, spanned);
+    return PyUnicode_FromFormat("Values(count=%zu, bytes=%llu)", self->count,
+                                (unsigned long long)self->offsets[self->count]);
 }
 
 static char const doc_Values_lengths[] = "The length of every value, with None where the key was absent, as a tuple.";
@@ -695,9 +687,9 @@ static PyObject* Values_get_lengths(Values* self, void* Py_UNUSED(closure)) {
     PyObject* const lengths = PyTuple_New((Py_ssize_t)self->count);
     if (!lengths) return NULL;
     for (size_t task_index = 0; task_index != self->count; ++task_index) {
-        ustore_length_t const length = self->lengths[task_index];
-        PyObject* const entry = length == ustore_length_missing_k ? Py_NewRef(Py_None)
-                                                                  : PyLong_FromUnsignedLongLong(length);
+        ustore_length_t const length = self->offsets[task_index + 1] - self->offsets[task_index];
+        PyObject* const entry = !ustore_py_values_present(self, task_index) ? Py_NewRef(Py_None)
+                                                                            : PyLong_FromUnsignedLongLong(length);
         if (!entry) {
             Py_DECREF(lengths);
             return NULL;
@@ -707,8 +699,160 @@ static PyObject* Values_get_lengths(Values* self, void* Py_UNUSED(closure)) {
     return lengths;
 }
 
+static char const doc_Values_keys[] = "The keys a sample drew, one per value, as Keys, or None for a read.";
+
+static PyObject* Values_get_keys(Values* self, void* Py_UNUSED(closure)) {
+    return Py_NewRef(self->keys ? self->keys : Py_None);
+}
+
+#ifndef ARROW_C_DATA_INTERFACE
+#define ARROW_C_DATA_INTERFACE
+
+#define ARROW_FLAG_DICTIONARY_ORDERED 1
+#define ARROW_FLAG_NULLABLE           2
+#define ARROW_FLAG_MAP_KEYS_SORTED    4
+
+/** The type of an exported array, laid out as the Arrow C data interface fixes it. */
+struct ArrowSchema {
+    char const* format;
+    char const* name;
+    char const* metadata;
+    int64_t flags;
+    int64_t n_children;
+    struct ArrowSchema** children;
+    struct ArrowSchema* dictionary;
+    void (*release)(struct ArrowSchema*);
+    void* private_data;
+};
+
+/** The buffers of an exported array, laid out as the Arrow C data interface fixes it. */
+struct ArrowArray {
+    int64_t length;
+    int64_t null_count;
+    int64_t offset;
+    int64_t n_buffers;
+    int64_t n_children;
+    void const** buffers;
+    struct ArrowArray** children;
+    struct ArrowArray* dictionary;
+    void (*release)(struct ArrowArray*);
+    void* private_data;
+};
+
+#endif // ARROW_C_DATA_INTERFACE
+
+/** What one exported array keeps alive until its consumer releases it: the @c Values and its three buffers. */
+typedef struct values_export_t {
+
+    /** The @c Values owning the tape and its spans, held by a strong reference. */
+    PyObject* owner;
+
+    /** The presence bits, the 64-bit offsets and the bytes, in the order `large_binary` lists them. */
+    void const* buffers[3];
+} values_export_t;
+
+/** Any readable address, for a tape of no bytes that a consumer still dereferences. */
+static int64_t const values_export_empty_k[1] = {0};
+
+static void values_schema_release(struct ArrowSchema* schema) { schema->release = NULL; }
+
+/** Lets go of the exported @c Values, taking the interpreter, as a consumer may release from a thread of its own. */
+static void values_array_release(struct ArrowArray* array) {
+    values_export_t* const exported = (values_export_t*)array->private_data;
+    PyGILState_STATE const state = PyGILState_Ensure();
+    Py_DECREF(exported->owner);
+    PyGILState_Release(state);
+    PyMem_RawFree(exported);
+    array->release = NULL;
+}
+
+static void values_schema_capsule_free(PyObject* capsule) {
+    struct ArrowSchema* const schema = (struct ArrowSchema*)PyCapsule_GetPointer(capsule, "arrow_schema");
+    if (schema->release) schema->release(schema);
+    PyMem_RawFree(schema);
+}
+
+static void values_array_capsule_free(PyObject* capsule) {
+    struct ArrowArray* const array = (struct ArrowArray*)PyCapsule_GetPointer(capsule, "arrow_array");
+    if (array->release) array->release(array);
+    PyMem_RawFree(array);
+}
+
+static char const doc_Values_arrow_c_array[] =                                              //
+    "__arrow_c_array__(requested_schema=None) answers the schema and array PyCapsules.\n"   //
+    "\n"                                                                                    //
+    "Exports the batch as Arrow `large_binary`: 64-bit offsets, with a value missing\n"     //
+    "where the key was absent. The presence bits, offsets and bytes the read wrote are\n"   //
+    "exported in place, and the array keeps this object alive until Arrow releases it. A\n" //
+    "requested schema is ignored, and Arrow casts from `large_binary` where it asked for\n" //
+    "another type.";
+
+static PyObject* Values_arrow_c_array(Values* self, PyObject* const* Py_UNUSED(args), Py_ssize_t positional_args_count,
+                                      PyObject* args_names_tuple) {
+    Py_ssize_t const args_names_count = args_names_tuple ? PyTuple_GET_SIZE(args_names_tuple) : 0;
+    int const named = args_names_count == 1 &&
+                      PyUnicode_CompareWithASCIIString(PyTuple_GET_ITEM(args_names_tuple, 0), "requested_schema") == 0;
+    if (positional_args_count + args_names_count > 1 || (args_names_count && !named)) {
+        PyErr_SetString(PyExc_TypeError, "__arrow_c_array__() takes at most the 'requested_schema' argument");
+        return NULL;
+    }
+
+    struct ArrowSchema* const schema = (struct ArrowSchema*)PyMem_RawCalloc(1, sizeof(struct ArrowSchema));
+    struct ArrowArray* const array = (struct ArrowArray*)PyMem_RawCalloc(1, sizeof(struct ArrowArray));
+    values_export_t* const exported = (values_export_t*)PyMem_RawCalloc(1, sizeof(values_export_t));
+    if (!schema || !array || !exported) {
+        PyMem_RawFree(exported);
+        PyMem_RawFree(array);
+        PyMem_RawFree(schema);
+        PyErr_NoMemory();
+        return NULL;
+    }
+
+    schema->format = "Z";
+    schema->name = "";
+    schema->flags = ARROW_FLAG_NULLABLE;
+    schema->release = values_schema_release;
+
+    exported->owner = Py_NewRef((PyObject*)self);
+    exported->buffers[0] = self->presences;
+    exported->buffers[1] = self->offsets;
+    exported->buffers[2] = self->tape ? (void const*)self->tape : (void const*)values_export_empty_k;
+    array->length = (int64_t)self->count;
+    // The count of absent keys is left for the consumer to take from the presence bits.
+    array->null_count = -1;
+    array->n_buffers = 3;
+    array->buffers = exported->buffers;
+    array->release = values_array_release;
+    array->private_data = exported;
+
+    PyObject* const schema_capsule = PyCapsule_New(schema, "arrow_schema", values_schema_capsule_free);
+    if (!schema_capsule) {
+        PyMem_RawFree(schema);
+        values_array_release(array);
+        PyMem_RawFree(array);
+        return NULL;
+    }
+    PyObject* const array_capsule = PyCapsule_New(array, "arrow_array", values_array_capsule_free);
+    if (!array_capsule) {
+        Py_DECREF(schema_capsule);
+        values_array_release(array);
+        PyMem_RawFree(array);
+        return NULL;
+    }
+    PyObject* const capsules = PyTuple_Pack(2, schema_capsule, array_capsule);
+    Py_DECREF(schema_capsule);
+    Py_DECREF(array_capsule);
+    return capsules;
+}
+
+static PyMethodDef Values_methods[] = {
+    {"__arrow_c_array__", (PyCFunction)Values_arrow_c_array, ustore_py_method_flags_k, doc_Values_arrow_c_array},
+    {NULL, NULL, 0, NULL},
+};
+
 static PyGetSetDef Values_getset[] = {
     {"lengths", (getter)Values_get_lengths, NULL, doc_Values_lengths, NULL},
+    {"keys", (getter)Values_get_keys, NULL, doc_Values_keys, NULL},
     {NULL, NULL, NULL, NULL, NULL},
 };
 
@@ -726,12 +870,14 @@ PyTypeObject ValuesType = {
         .tp_name = "ustore.Values",
     .tp_doc = doc_Values,
     .tp_basicsize = sizeof(Values),
+    .tp_itemsize = 1,
     .tp_flags = Py_TPFLAGS_DEFAULT,
     .tp_new = NULL,
     .tp_dealloc = (destructor)Values_dealloc,
     .tp_repr = (reprfunc)Values_repr,
     .tp_as_sequence = &Values_as_sequence,
     .tp_as_buffer = &Values_as_buffer,
+    .tp_methods = Values_methods,
     .tp_getset = Values_getset,
 };
 
@@ -739,37 +885,35 @@ PyTypeObject ValuesType = {
 
 #pragma region Key Tapes
 
-static char const doc_Keys[] =                                                                //
-    "The keys one batch scan or sample found, read straight out of the arena holding them.\n" //
-    "\n"                                                                                      //
-    "Indexing answers a tuple of `uuid.UUID` keys for one task, which is where a copy\n"      //
-    "happens. The whole tape exports through the buffer protocol as an array of shape\n"      //
-    "(keys, 16) bytes, so `numpy.asarray(keys)` reads the arena without copying, and keeps\n" //
-    "this object, and therefore the arena, alive for as long as it is held.";
+static char const doc_Keys[] =                                                           //
+    "The keys one batch scan or sample found, held in the object's own memory.\n"        //
+    "\n"                                                                                 //
+    "Indexing answers a tuple of `uuid.UUID` keys for one task, which is where a copy\n" //
+    "happens. The whole tape exports through the buffer protocol as an array of shape\n" //
+    "(keys, 16) bytes, so `np.asarray(keys)` reads it without copying, and keeps this\n" //
+    "object alive for as long as it is held.";
 
-PyObject* ustore_py_keys_adopt(ustore_arena_t arena, ustore_key_t* tape, ustore_length_t* offsets,
-                               ustore_length_t* counts, size_t count) {
-    Keys* const instance = PyObject_New(Keys, &KeysType);
-    if (!instance) {
-        ustore_arena_free(arena);
+Keys* ustore_py_keys_adopt(size_t count, size_t capacity) {
+    size_t const offsets_bytes = (count + 1) * sizeof(ustore_length_t);
+    if (capacity > ((size_t)PY_SSIZE_T_MAX - offsets_bytes) / sizeof(ustore_key_t)) {
+        PyErr_NoMemory();
         return NULL;
     }
-    instance->arena = arena;
-    instance->tape = tape;
-    instance->offsets = offsets;
-    instance->counts = counts;
+    size_t const storage_bytes = offsets_bytes + capacity * sizeof(ustore_key_t);
+    Keys* const instance = PyObject_NewVar(Keys, &KeysType, (Py_ssize_t)storage_bytes);
+    if (!instance) return NULL;
+    instance->tape = (ustore_key_t*)(instance->offsets + count + 1);
     instance->count = count;
-    instance->shape[0] = count ? (Py_ssize_t)offsets[count] : 0;
+    instance->shape[0] = 0;
     instance->shape[1] = (Py_ssize_t)sizeof(ustore_key_t);
     instance->strides[0] = (Py_ssize_t)sizeof(ustore_key_t);
     instance->strides[1] = 1;
-    return (PyObject*)instance;
+    // A batch of no tasks never reaches the ABI, while the first offset still closes an empty tape.
+    instance->offsets[0] = 0;
+    return instance;
 }
 
-static void Keys_dealloc(Keys* self) {
-    ustore_arena_free(self->arena);
-    PyObject_Free(self);
-}
+static void Keys_dealloc(Keys* self) { PyObject_Free(self); }
 
 static Py_ssize_t Keys_length(Keys* self) { return (Py_ssize_t)self->count; }
 
@@ -779,7 +923,7 @@ static PyObject* Keys_item(Keys* self, Py_ssize_t task_index) {
         return NULL;
     }
     ustore_key_t const* const run = self->tape + self->offsets[task_index];
-    Py_ssize_t const found = (Py_ssize_t)self->counts[task_index];
+    Py_ssize_t const found = (Py_ssize_t)(self->offsets[task_index + 1] - self->offsets[task_index]);
     PyObject* const keys = PyTuple_New(found);
     if (!keys) return NULL;
     for (Py_ssize_t key_index = 0; key_index != found; ++key_index) {
@@ -794,13 +938,14 @@ static PyObject* Keys_item(Keys* self, Py_ssize_t task_index) {
 }
 
 static int Keys_getbuffer(Keys* self, Py_buffer* view, int flags) {
+    // The keys found are known only once the call wrote the last offset, and never change after.
+    self->shape[0] = (Py_ssize_t)self->offsets[self->count];
     return ustore_py_buffer_fill(view, (PyObject*)self, self->tape, "B", 1, 2, self->shape, self->strides, flags);
 }
 
 static PyObject* Keys_repr(Keys* self) {
-    size_t found = 0;
-    for (size_t task_index = 0; task_index != self->count; ++task_index) found += self->counts[task_index];
-    return PyUnicode_FromFormat("Keys(tasks=%zu, keys=%zu)", self->count, found);
+    return PyUnicode_FromFormat("Keys(tasks=%zu, keys=%llu)", self->count,
+                                (unsigned long long)self->offsets[self->count]);
 }
 
 static char const doc_Keys_counts[] = "The number of keys every task found, as a tuple.";
@@ -809,7 +954,7 @@ static PyObject* Keys_get_counts(Keys* self, void* Py_UNUSED(closure)) {
     PyObject* const counts = PyTuple_New((Py_ssize_t)self->count);
     if (!counts) return NULL;
     for (size_t task_index = 0; task_index != self->count; ++task_index) {
-        PyObject* const entry = PyLong_FromUnsignedLongLong(self->counts[task_index]);
+        PyObject* const entry = PyLong_FromUnsignedLongLong(self->offsets[task_index + 1] - self->offsets[task_index]);
         if (!entry) {
             Py_DECREF(counts);
             return NULL;
@@ -838,6 +983,7 @@ PyTypeObject KeysType = {
         .tp_name = "ustore.Keys",
     .tp_doc = doc_Keys,
     .tp_basicsize = sizeof(Keys),
+    .tp_itemsize = 1,
     .tp_flags = Py_TPFLAGS_DEFAULT,
     .tp_new = NULL,
     .tp_dealloc = (destructor)Keys_dealloc,
@@ -918,7 +1064,7 @@ int ustore_py_context_from_object(PyObject* self, ustore_py_context_t* context) 
         }
         context->database = database;
         context->transaction = transaction->handle;
-        context->options = transaction->options;
+        context->watch = transaction->watch;
         return 0;
     }
     PyErr_Format(PyExc_TypeError, "Expected a Database or a Transaction, got %S", Py_TYPE(self));
@@ -931,22 +1077,21 @@ int ustore_py_context_from_object(PyObject* self, ustore_py_context_t* context) 
 
 void ustore_py_verb_options_init(ustore_py_context_t const* context, ustore_py_verb_options_t* options) {
     options->collection = ustore_collection_main_k;
+    options->view = ustore_transaction_view(context->transaction, context->watch);
     options->snapshot = NULL;
-    options->options = context->options;
+    options->watch = context->watch;
+    options->durability = ustore_durability_buffered_k;
 }
 
 int ustore_py_verb_option_from_keyword(ustore_py_context_t const* context, PyObject* name, PyObject* value,
                                        ustore_py_verb_options_t* options) {
     if (PyUnicode_CompareWithASCIIString(name, "collection") == 0)
-        return ustore_py_collection_from_object(context, value, &options->collection) == 0 ? 1 : -1;
+        return ustore_py_collection_from_object(context, options->snapshot, value, &options->collection) == 0 ? 1 : -1;
     if (PyUnicode_CompareWithASCIIString(name, "snapshot") == 0) {
-        if (value == Py_None) {
-            options->snapshot = NULL;
-            return 1;
-        }
+        if (value == Py_None) return 1;
         // A call addresses exactly one view, so a transaction and a snapshot are never both named.
         if (context->transaction) {
-            ustore_py_raise(ustore_error_invalid_argument_k,
+            ustore_py_raise(ustore_status_invalid_argument_k,
                             "A transaction already fixes the view, so it takes no snapshot");
             return -1;
         }
@@ -960,16 +1105,17 @@ int ustore_py_verb_option_from_keyword(ustore_py_context_t const* context, PyObj
             return -1;
         }
         if (snapshot->database != (PyObject*)context->database) {
-            ustore_py_raise(ustore_error_invalid_argument_k, "The snapshot belongs to another database");
+            ustore_py_raise(ustore_status_invalid_argument_k, "The snapshot belongs to another database");
             return -1;
         }
+        options->view = ustore_snapshot_view(snapshot->handle);
         options->snapshot = snapshot->handle;
         return 1;
     }
     if (PyUnicode_CompareWithASCIIString(name, "flush") == 0) {
         int const flushing = PyObject_IsTrue(value);
         if (flushing < 0) return -1;
-        if (flushing) options->options |= ustore_option_write_flush_k;
+        options->durability = flushing ? ustore_durability_flushed_k : ustore_durability_buffered_k;
         return 1;
     }
     if (PyUnicode_CompareWithASCIIString(name, "watch") == 0) {
@@ -977,11 +1123,11 @@ int ustore_py_verb_option_from_keyword(ustore_py_context_t const* context, PyObj
         if (watching < 0) return -1;
         // Only a transaction has a conflict set, so outside one the keyword would promise nothing.
         if (!context->transaction) {
-            ustore_py_raise(ustore_error_invalid_argument_k, "Only a transaction watches what it touches");
+            ustore_py_raise(ustore_status_invalid_argument_k, "Only a transaction watches what it touches");
             return -1;
         }
-        if (watching) options->options &= (ustore_options_t) ~(unsigned)ustore_option_transaction_dont_watch_k;
-        else options->options |= ustore_option_transaction_dont_watch_k;
+        options->watch = watching ? ustore_watch_keys_k : ustore_watch_none_k;
+        options->view = ustore_transaction_view(context->transaction, options->watch);
         return 1;
     }
     return 0;

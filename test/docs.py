@@ -75,17 +75,20 @@ def test_one_document_broadcasts_to_every_key(view, count: int):
 
 
 @pytest.mark.parametrize("keys", [[1, 2, 3], np.array([1, 2, 3], dtype=np.int64)], ids=["list", "numpy"])
-def test_none_removes_documents(view, keys):
+def test_remove_removes_documents(view, keys):
     view.docs_write(keys, "{}")
-    view.docs_write(keys, None)
+    view.remove(keys)
     assert decoded(view.docs_read(keys)) == [None, None, None]
 
 
-@pytest.mark.parametrize("removed", [0, 1, 2])
-def test_none_inside_a_batch_removes_one_document(view, removed: int):
+@pytest.mark.parametrize("refused", [0, 1, 2, None])
+def test_none_in_a_batch_is_refused(view, refused: int | None):
+    """A None, in a batch or in place of one, is refused before anything is written."""
     view.docs_write([0, 1, 2], "[]")
-    view.docs_write([0, 1, 2], ["[1]" if key != removed else None for key in range(3)])
-    assert decoded(view.docs_read([0, 1, 2])) == [None if key == removed else [1] for key in range(3)]
+    documents = None if refused is None else ["[1]" if key != refused else None for key in range(3)]
+    with pytest.raises(TypeError):
+        view.docs_write([0, 1, 2], documents)
+    assert decoded(view.docs_read([0, 1, 2])) == [[], [], []]
 
 
 @pytest.mark.parametrize(
@@ -147,10 +150,12 @@ def test_field_writes(view, field: str, value: str, expected: dict, modification
     assert decoded(view.docs_read([1])) == [expected]
 
 
-@pytest.mark.parametrize(("field", "expected"), [("a", {"b": {"c": [1, 2]}}), ("/b/c", {"a": 1, "b": {}})])
-def test_none_removes_a_field(view, field: str, expected: dict):
+@pytest.mark.parametrize(
+    ("patch", "expected"), [({"a": None}, {"b": {"c": [1, 2]}}), ({"b": {"c": None}}, {"a": 1, "b": {}})]
+)
+def test_merging_null_removes_a_field(view, patch: dict, expected: dict):
     view.docs_write([1], json.dumps({"a": 1, "b": {"c": [1, 2]}}))
-    view.docs_write([1], None, field=field)
+    view.docs_write([1], json.dumps(patch), modification="merge")
     assert decoded(view.docs_read([1])) == [expected]
 
 
@@ -219,7 +224,6 @@ def test_whole_document_modifications_create_missing_documents(view, modificatio
         (lambda view: view.docs_write([1], "{}", modification="insert"), ustore.ExistsError),
         (lambda view: view.docs_write([404], "1", field="a"), ustore.MissingError),
         (lambda view: view.docs_write([1], "1", field="/nowhere/deep", modification="update"), ustore.MissingError),
-        (lambda view: view.docs_write([1], None, field="absent"), ustore.MissingError),
         (lambda view: view.docs_write([1], "[{}]", modification="patch"), ustore.ArgumentError),
         (
             lambda view: view.docs_write([1], '[{"op": "remove", "path": "/nowhere"}]', modification="patch"),
@@ -235,7 +239,6 @@ def test_whole_document_modifications_create_missing_documents(view, modificatio
         "insert-existing",
         "field-of-missing",
         "update-unresolved",
-        "remove-absent",
         "bad-patch",
         "inapplicable-patch",
         "update-missing",

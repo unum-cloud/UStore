@@ -111,6 +111,19 @@ def value_at(document: Any, column: str) -> Any:
     return document
 
 
+def removal_patch(column: str) -> dict[str, Any]:
+    """The RFC 7386 merge patch whose JSON null removes a column, a top-level key or a JSON Pointer, from a document."""
+    path = (
+        [segment.replace("~1", "/").replace("~0", "~") for segment in column[1:].split("/")]
+        if column.startswith("/")
+        else [column]
+    )
+    patch: Any = None
+    for key in reversed(path):
+        patch = {key: patch}
+    return patch
+
+
 def column_values(gathered: Columns, position: int, dtype: str) -> Any:
     """One gathered column as a NumPy or Pandas array, masking the values that were not found or converted."""
     rows = gathered.rows
@@ -127,6 +140,33 @@ def column_values(gathered: Columns, position: int, dtype: str) -> Any:
     masked = pandas.array(values, dtype=NULLABLE_DTYPES[dtype])
     masked[~valid] = pandas.NA
     return masked
+
+
+class RowSelection:
+    """The rows of a table by key, as `table.loc[[key, ...]]` selects them."""
+
+    def __init__(self, table: Table) -> None:
+        self.table = table
+
+    def __getitem__(self, keys: Sequence[KeyLike]) -> SelectedRows:
+        return SelectedRows(self.table, keys)
+
+
+class SelectedRows:
+    """The rows `Table.loc` selected, which `update` merges fields into."""
+
+    def __init__(self, table: Table, keys: Sequence[KeyLike]) -> None:
+        self.table = table
+        self.keys = keys
+
+    def update(self, fields: Mapping[str, Any]) -> None:
+        """Merges `fields` into every selected document through one `docs_write(..., modification="merge")`.
+
+        The merge follows RFC 7386, so a field set to None is removed, and a row without a document gets one.
+        """
+        self.table.view.docs_write(
+            self.keys, encode_json(dict(fields)), modification="merge", collection=self.table.collection
+        )
 
 
 class Table:
@@ -225,6 +265,11 @@ class Table:
     def sample(self, count: int) -> Table:
         """A view of up to `count` documents drawn at random by the store."""
         return self.derive(index=self.view.sample(count, collection=self.collection)[0])
+
+    @property
+    def loc(self) -> RowSelection:
+        """Rows by key, as `table.loc[[key, ...]]`, whose `update(mapping)` merges into each selected document."""
+        return RowSelection(self)
 
     # endregion Selection
 
@@ -332,7 +377,8 @@ class Table:
         for column in [columns] if isinstance(columns, str) else columns:
             keys, _ = self.present_rows(column)
             if keys:
-                self.view.docs_write(keys, None, field=column, collection=self.collection)
+                patch = encode_json(removal_patch(column))
+                self.view.docs_write(keys, patch, modification="merge", collection=self.collection)
 
     def rename(self, columns: Mapping[str, str]) -> None:
         """Moves the values of every named column under its new name, row by row."""
@@ -340,7 +386,8 @@ class Table:
             keys, values = self.present_rows(old)
             if keys:
                 self.view.docs_write(keys, values, field=new, collection=self.collection)
-                self.view.docs_write(keys, None, field=old, collection=self.collection)
+                patch = encode_json(removal_patch(old))
+                self.view.docs_write(keys, patch, modification="merge", collection=self.collection)
         if self.selected_columns is not None:
             self.selected_columns = [columns.get(column, column) for column in self.selected_columns]
 

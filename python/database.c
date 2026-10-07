@@ -39,7 +39,6 @@ typedef struct nvme_size_keyword_t {
 /** Every size keyword of @c Database.open_nvme, closed by a nameless row. */
 static nvme_size_keyword_t const nvme_size_keywords[] = {
     {"memory_limit", offsetof(ustore_database_init_nvme_t, memory_limit)},
-    {"threads", offsetof(ustore_database_init_nvme_t, threads)},
     {"gpu_memory_limit", offsetof(ustore_database_init_nvme_t, gpu_memory_limit)},
     {"shared_io_channels", offsetof(ustore_database_init_nvme_t, shared_io_channels)},
     {"queue_depth", offsetof(ustore_database_init_nvme_t, queue_depth)},
@@ -189,25 +188,25 @@ static int opening_gpu_devices(opening_t* opening, PyObject* object) {
     return 0;
 }
 
-/** Wraps @p handle, which an init call opened unless @p error is set, in a new database of @p type. */
-static PyObject* database_opened(PyTypeObject* type, ustore_database_t handle, ustore_error_t* error) {
-    if (ustore_py_raise_on_error(error) != 0) return NULL;
+/** Wraps @p handle, which an init call opened unless @p outcome failed, in a new database of @p type. */
+static PyObject* database_opened(PyTypeObject* type, ustore_database_t handle, ustore_outcome_t* outcome) {
+    if (ustore_py_raise_on_outcome(outcome) != 0) return NULL;
 
-    ustore_capabilities_t capabilities = 0;
-    ustore_database_capabilities_t request = {0};
-    request.db = handle;
-    request.error = error;
-    request.capabilities = &capabilities;
-    ustore_database_capabilities(&request);
-    Database* const instance = error->status ? NULL : (Database*)type->tp_alloc(type, 0);
+    ustore_database_description_t description = {0};
+    ustore_database_describe_t describe = {0};
+    describe.database = handle;
+    describe.outcome = outcome;
+    describe.description = &description;
+    ustore_database_describe(&describe);
+    Database* const instance = outcome->status ? NULL : (Database*)type->tp_alloc(type, 0);
     if (!instance) {
         ustore_database_free(handle);
-        if (!PyErr_Occurred()) ustore_py_raise_on_error(error);
+        if (!PyErr_Occurred()) ustore_py_raise_on_outcome(outcome);
         return NULL;
     }
     instance->handle = handle;
     instance->arenas.idle = NULL;
-    instance->capabilities = capabilities;
+    instance->capabilities = description.capabilities;
     instance->transactions = 0;
     instance->snapshots = 0;
     return (PyObject*)instance;
@@ -224,7 +223,10 @@ static char const doc_Database[] =                                              
     "their engine can be asked; engines_compiled() names the ones this build carries, and\n"   //
     "the others refuse to open. The directory belongs to the database, so no two\n"            //
     "processes may open the same one at once. Every database holds a main collection, which\n" //
-    "can be cleared but never dropped, beside the collections it creates.";
+    "can be cleared but never dropped, beside the collections it creates.\n"                   //
+    "\n"                                                                                       //
+    "Indexing it by name, as `db['movies']`, answers a Collection, whose `blobs`, `docs`,\n"   //
+    "`graph` and `table` views create it on their first write.";
 
 static PyObject* Database_tp_new(PyTypeObject* Py_UNUSED(type), PyObject* Py_UNUSED(args),
                                  PyObject* Py_UNUSED(keywords)) {
@@ -264,17 +266,17 @@ static PyObject* Database_open_ram(PyObject* type, PyObject* const* args, Py_ssi
     }
 
     ustore_database_t handle = NULL;
-    ustore_error_t error = {0};
+    ustore_outcome_t outcome = {0};
     ustore_database_init_ram_t init = {0};
-    init.db = &handle;
-    init.error = &error;
+    init.database = &handle;
+    init.outcome = &outcome;
     init.directory = opening.directory ? PyBytes_AS_STRING(opening.directory) : NULL;
     init.isolation = (ustore_isolation_t)isolation;
     Py_BEGIN_ALLOW_THREADS;
     ustore_database_init_ram(&init);
     Py_END_ALLOW_THREADS;
     opening_release(&opening);
-    return database_opened((PyTypeObject*)type, handle, &error);
+    return database_opened((PyTypeObject*)type, handle, &outcome);
 
 failed:
     opening_release(&opening);
@@ -311,10 +313,10 @@ static PyObject* Database_open_rocksdb(PyObject* type, PyObject* const* args, Py
     }
 
     ustore_database_t handle = NULL;
-    ustore_error_t error = {0};
+    ustore_outcome_t outcome = {0};
     ustore_database_init_rocksdb_t init = {0};
-    init.db = &handle;
-    init.error = &error;
+    init.database = &handle;
+    init.outcome = &outcome;
     init.directory = opening.directory ? PyBytes_AS_STRING(opening.directory) : NULL;
     init.data_directories = opening.data_directories;
     init.data_directories_count = (ustore_size_t)opening.data_directories_count;
@@ -322,7 +324,7 @@ static PyObject* Database_open_rocksdb(PyObject* type, PyObject* const* args, Py
     ustore_database_init_rocksdb(&init);
     Py_END_ALLOW_THREADS;
     opening_release(&opening);
-    return database_opened((PyTypeObject*)type, handle, &error);
+    return database_opened((PyTypeObject*)type, handle, &outcome);
 
 failed:
     opening_release(&opening);
@@ -355,38 +357,38 @@ static PyObject* Database_open_leveldb(PyObject* type, PyObject* const* args, Py
     }
 
     ustore_database_t handle = NULL;
-    ustore_error_t error = {0};
+    ustore_outcome_t outcome = {0};
     ustore_database_init_leveldb_t init = {0};
-    init.db = &handle;
-    init.error = &error;
+    init.database = &handle;
+    init.outcome = &outcome;
     init.directory = opening.directory ? PyBytes_AS_STRING(opening.directory) : NULL;
     Py_BEGIN_ALLOW_THREADS;
     ustore_database_init_leveldb(&init);
     Py_END_ALLOW_THREADS;
     opening_release(&opening);
-    return database_opened((PyTypeObject*)type, handle, &error);
+    return database_opened((PyTypeObject*)type, handle, &outcome);
 
 failed:
     opening_release(&opening);
     return NULL;
 }
 
-static char const doc_Database_open_nvme[] =                                                   //
-    "open_nvme(directory, *, transport='automatic', **sizes) answers a database on NVMe.\n"    //
-    "\n"                                                                                       //
-    "Every size keyword names a field of ustore_database_init_nvme_t, like memory_limit,\n"    //
-    "threads, queue_depth or collection_cache_limit, where zero keeps the engine's default.\n" //
-    "\n"                                                                                       //
-    "Args:\n"                                                                                  //
-    "  directory (str | bytes | PathLike): The directory of the database's own files.\n"       //
-    "  data_directories (Sequence): Directories the volumes fill, each a path or a\n"          //
-    "    (path, max_bytes) pair; none keeps one volume inside the directory.\n"                //
-    "  transport (str): How bytes move: 'automatic', 'blocking', 'linux-uring',\n"             //
-    "    'linux-aio' or 'linux-spdk'.\n"                                                       //
-    "  gpu_devices (Sequence[int]): CUDA devices compaction may run on.\n"                     //
-    "Returns:\n"                                                                               //
-    "  Database: The opened database.\n"                                                       //
-    "Raises:\n"                                                                                //
+static char const doc_Database_open_nvme[] =                                                //
+    "open_nvme(directory, *, transport='automatic', **sizes) answers a database on NVMe.\n" //
+    "\n"                                                                                    //
+    "Every size keyword names a field of ustore_database_init_nvme_t, like memory_limit,\n" //
+    "queue_depth or collection_cache_limit, where zero keeps the engine's default.\n"       //
+    "\n"                                                                                    //
+    "Args:\n"                                                                               //
+    "  directory (str | bytes | PathLike): The directory of the database's own files.\n"    //
+    "  data_directories (Sequence): Directories the volumes fill, each a path or a\n"       //
+    "    (path, max_bytes) pair; none keeps one volume inside the directory.\n"             //
+    "  transport (str): How bytes move: 'automatic', 'blocking', 'linux-uring',\n"          //
+    "    'linux-aio' or 'linux-spdk'.\n"                                                    //
+    "  gpu_devices (Sequence[int]): CUDA devices compaction may run on.\n"                  //
+    "Returns:\n"                                                                            //
+    "  Database: The opened database.\n"                                                    //
+    "Raises:\n"                                                                             //
     "  UnsupportedError: This build carries no NVMe engine.";
 
 static PyObject* Database_open_nvme(PyObject* type, PyObject* const* args, Py_ssize_t positional_args_count,
@@ -420,9 +422,9 @@ static PyObject* Database_open_nvme(PyObject* type, PyObject* const* args, Py_ss
     }
 
     ustore_database_t handle = NULL;
-    ustore_error_t error = {0};
-    init.db = &handle;
-    init.error = &error;
+    ustore_outcome_t outcome = {0};
+    init.database = &handle;
+    init.outcome = &outcome;
     init.directory = opening.directory ? PyBytes_AS_STRING(opening.directory) : NULL;
     init.data_directories = opening.data_directories;
     init.data_directories_count = (ustore_size_t)opening.data_directories_count;
@@ -433,7 +435,7 @@ static PyObject* Database_open_nvme(PyObject* type, PyObject* const* args, Py_ss
     ustore_database_init_nvme(&init);
     Py_END_ALLOW_THREADS;
     opening_release(&opening);
-    return database_opened((PyTypeObject*)type, handle, &error);
+    return database_opened((PyTypeObject*)type, handle, &outcome);
 
 failed:
     opening_release(&opening);
@@ -471,12 +473,12 @@ static char const doc_Database_close[] =                                        
 static PyObject* Database_close(PyObject* self, PyObject* Py_UNUSED(ignored)) {
     Database* const database = (Database*)self;
     if (database->transactions != 0) {
-        ustore_py_raise(ustore_error_invalid_argument_k, "%zd transactions of this database are still open",
+        ustore_py_raise(ustore_status_invalid_argument_k, "%zd transactions of this database are still open",
                         database->transactions);
         return NULL;
     }
     if (database->snapshots != 0) {
-        ustore_py_raise(ustore_error_invalid_argument_k, "%zd snapshots of this database are still open",
+        ustore_py_raise(ustore_status_invalid_argument_k, "%zd snapshots of this database are still open",
                         database->snapshots);
         return NULL;
     }
@@ -538,23 +540,23 @@ static PyObject* Database_control(PyObject* self, PyObject* request_object) {
     if (!request) return NULL;
 
     ustore_str_view_t response = NULL;
-    ustore_error_t error = {0};
+    ustore_outcome_t outcome = {0};
     ustore_arena_t arena = ustore_py_arena_claim(context.database);
 
     ustore_database_control_t control = {0};
-    control.db = context.database->handle;
-    control.arena = &arena;
-    control.error = &error;
+    control.database = context.database->handle;
+    control.outcome = &outcome;
     control.request = request;
     control.response = &response;
+    control.arena = &arena;
 
     Py_BEGIN_ALLOW_THREADS;
     ustore_database_control(&control);
     Py_END_ALLOW_THREADS;
 
-    PyObject* answered = NULL;
-    if (error.status != ustore_success_k) { ustore_py_raise_on_error(&error); }
-    else { answered = PyUnicode_FromString(response ? response : ""); }
+    PyObject* const answered = ustore_py_raise_on_outcome(&outcome) == 0
+                                   ? PyUnicode_FromString(response ? response : "")
+                                   : NULL;
     ustore_py_arena_return(context.database, arena);
     return answered;
 }
@@ -571,8 +573,7 @@ static ustore_py_choice_naming_t const drop_namings[] = {
     {NULL, 0},
 };
 
-/** What a collection holds, as a caller spells it. */
-static ustore_py_choice_naming_t const modality_namings[] = {
+ustore_py_choice_naming_t const ustore_py_modality_namings[] = {
     {"any", ustore_modality_any_k},
     {"blobs", ustore_modality_blobs_k},
     {"docs", ustore_modality_docs_k},
@@ -613,7 +614,8 @@ static PyObject* Database_collection_create(PyObject* self, PyObject* const* arg
          ++args_progress, ++names_progress) {
         PyObject* const name = PyTuple_GET_ITEM(args_names_tuple, names_progress);
         if (PyUnicode_CompareWithASCIIString(name, "modality") == 0) {
-            if (ustore_py_choice_from_object(args[args_progress], "modality", modality_namings, &modality) != 0)
+            if (ustore_py_choice_from_object(args[args_progress], "modality", ustore_py_modality_namings, &modality) !=
+                0)
                 return NULL;
         }
         else {
@@ -630,15 +632,15 @@ static PyObject* Database_collection_create(PyObject* self, PyObject* const* arg
     char const* const name = PyUnicode_AsUTF8AndSize(args[0], &name_length);
     if (!name) return NULL;
     if (name_length == 0) {
-        ustore_py_raise(ustore_error_invalid_argument_k, "The main collection has no name and always exists");
+        ustore_py_raise(ustore_status_invalid_argument_k, "The main collection has no name and always exists");
         return NULL;
     }
 
     ustore_collection_id_t created = ustore_collection_main_k;
-    ustore_error_t error = {0};
+    ustore_outcome_t outcome = {0};
     ustore_collection_create_t create = {0};
-    create.db = context.database->handle;
-    create.error = &error;
+    create.database = context.database->handle;
+    create.outcome = &outcome;
     create.name = name;
     create.name_length = (ustore_length_t)name_length;
     create.modality = (ustore_modality_t)modality;
@@ -647,7 +649,7 @@ static PyObject* Database_collection_create(PyObject* self, PyObject* const* arg
     Py_BEGIN_ALLOW_THREADS;
     ustore_collection_create(&create);
     Py_END_ALLOW_THREADS;
-    if (ustore_py_raise_on_error(&error) != 0) return NULL;
+    if (ustore_py_raise_on_outcome(&outcome) != 0) return NULL;
     return ustore_py_uuid_to_object(&created.uuid);
 }
 
@@ -665,7 +667,7 @@ static PyObject* Database_collection_find(PyObject* self, PyObject* name_object)
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
     ustore_collection_id_t found = ustore_collection_main_k;
-    if (ustore_py_collection_from_object(&context, name_object, &found) != 0) return NULL;
+    if (ustore_py_collection_from_object(&context, NULL, name_object, &found) != 0) return NULL;
     return ustore_py_uuid_to_object(&found.uuid);
 }
 
@@ -690,7 +692,7 @@ static PyObject* Database_collection_contains(PyObject* self, PyObject* name_obj
     if (length == 0) Py_RETURN_TRUE;
 
     ustore_collection_id_t found = ustore_collection_main_k;
-    switch (ustore_py_collection_named(&context, name, (size_t)length, &found)) {
+    switch (ustore_py_collection_named(&context, NULL, name, (size_t)length, &found, NULL)) {
     case ustore_py_naming_found_k: Py_RETURN_TRUE;
     case ustore_py_naming_missing_k: Py_RETURN_FALSE;
     case ustore_py_naming_failed_k: return NULL;
@@ -712,26 +714,22 @@ static PyObject* Database_collection_list(PyObject* self, PyObject* Py_UNUSED(ig
 
     ustore_size_t count = 0;
     ustore_collection_id_t* identifiers = NULL;
-    ustore_error_t error = {0};
+    ustore_outcome_t outcome = {0};
     ustore_arena_t arena = ustore_py_arena_claim(context.database);
 
     ustore_collection_list_t list = {0};
-    list.db = context.database->handle;
-    list.error = &error;
-    list.transaction = context.transaction;
-    list.snapshot = context.snapshot;
-    list.arena = &arena;
-    list.options = context.options;
+    list.database = context.database->handle;
+    list.outcome = &outcome;
     list.count = &count;
     list.collections = &identifiers;
+    list.arena = &arena;
 
     Py_BEGIN_ALLOW_THREADS;
     ustore_collection_list(&list);
     Py_END_ALLOW_THREADS;
 
     PyObject* listed = NULL;
-    if (error.status != ustore_success_k) { ustore_py_raise_on_error(&error); }
-    else if ((listed = PyTuple_New((Py_ssize_t)count)) != NULL) {
+    if (ustore_py_raise_on_outcome(&outcome) == 0 && (listed = PyTuple_New((Py_ssize_t)count)) != NULL) {
         for (ustore_size_t entry_index = 0; entry_index != count; ++entry_index) {
             PyObject* const identifier = ustore_py_uuid_to_object(&identifiers[entry_index].uuid);
             if (!identifier) {
@@ -835,18 +833,18 @@ static PyObject* Database_collection_drop(PyObject* self, PyObject* const* args,
 
     // A name resolves first, and the collection it addresses takes the name with it when it goes
     ustore_collection_id_t collection = ustore_collection_main_k;
-    if (ustore_py_collection_from_object(&context, args[0], &collection) != 0) return NULL;
-    ustore_error_t error = {0};
+    if (ustore_py_collection_from_object(&context, NULL, args[0], &collection) != 0) return NULL;
+    ustore_outcome_t outcome = {0};
     ustore_collection_drop_t drop = {0};
-    drop.db = context.database->handle;
-    drop.error = &error;
+    drop.database = context.database->handle;
+    drop.outcome = &outcome;
     drop.collection = collection;
     drop.mode = (ustore_drop_mode_t)mode;
 
     Py_BEGIN_ALLOW_THREADS;
     ustore_collection_drop(&drop);
     Py_END_ALLOW_THREADS;
-    if (ustore_py_raise_on_error(&error) != 0) return NULL;
+    if (ustore_py_raise_on_outcome(&outcome) != 0) return NULL;
     Py_RETURN_NONE;
 }
 
@@ -907,16 +905,16 @@ static PyObject* Database_snapshot(PyObject* self, PyObject* Py_UNUSED(ignored))
     }
 
     ustore_snapshot_t handle = NULL;
-    ustore_error_t error = {0};
+    ustore_outcome_t outcome = {0};
     ustore_snapshot_init_t init = {0};
-    init.db = database->handle;
-    init.error = &error;
     init.snapshot = &handle;
+    init.database = database->handle;
+    init.outcome = &outcome;
 
     Py_BEGIN_ALLOW_THREADS;
     ustore_snapshot_init(&init);
     Py_END_ALLOW_THREADS;
-    if (ustore_py_raise_on_error(&error) != 0) return NULL;
+    if (ustore_py_raise_on_outcome(&outcome) != 0) return NULL;
 
     Snapshot* const instance = (Snapshot*)SnapshotType.tp_alloc(&SnapshotType, 0);
     if (!instance) {
@@ -953,10 +951,10 @@ static PyObject* Snapshot_export(PyObject* self, PyObject* directory) {
     PyObject* encoded = NULL;
     if (!PyUnicode_FSConverter(directory, &encoded)) return NULL;
 
-    ustore_error_t error = {0};
+    ustore_outcome_t outcome = {0};
     ustore_snapshot_export_t exported = {0};
-    exported.db = database->handle;
-    exported.error = &error;
+    exported.database = database->handle;
+    exported.outcome = &outcome;
     exported.snapshot = snapshot->handle;
     exported.path = PyBytes_AS_STRING(encoded);
 
@@ -964,7 +962,7 @@ static PyObject* Snapshot_export(PyObject* self, PyObject* directory) {
     ustore_snapshot_export(&exported);
     Py_END_ALLOW_THREADS;
     Py_DECREF(encoded);
-    if (ustore_py_raise_on_error(&error) != 0) return NULL;
+    if (ustore_py_raise_on_outcome(&outcome) != 0) return NULL;
     Py_RETURN_NONE;
 }
 
@@ -1012,7 +1010,11 @@ static char const doc_Transaction[] =                                           
     "has a conflict set, so a database refuses the keyword.\n"                                //
     "\n"                                                                                      //
     "Used as a context manager, it commits on a clean exit, drops the staged work on an\n"    //
-    "exception, and closes either way.";
+    "exception, and closes either way.\n"                                                     //
+    "\n"                                                                                      //
+    "Indexing it by name, as `txn['payments']`, answers a Collection whose writes stage\n"    //
+    "here: its reads resolve the name through this transaction, while its writes resolve\n"   //
+    "it at the head, where a missing collection is created.";
 
 static PyObject* Transaction_tp_new(PyTypeObject* Py_UNUSED(type), PyObject* Py_UNUSED(args),
                                     PyObject* Py_UNUSED(keywords)) {
@@ -1062,14 +1064,14 @@ static PyObject* Database_transaction(PyObject* self, PyObject* const* args, Py_
                                                                            args_names_tuple, 0);
     if (args_names_count < 0) return NULL;
 
-    ustore_options_t options = ustore_options_default_k;
+    ustore_watch_t watch = ustore_watch_keys_k;
     for (Py_ssize_t names_progress = 0, args_progress = positional_args_count; names_progress != args_names_count;
          ++args_progress, ++names_progress) {
         PyObject* const name = PyTuple_GET_ITEM(args_names_tuple, names_progress);
         if (PyUnicode_CompareWithASCIIString(name, "watch") == 0) {
             int const watching = PyObject_IsTrue(args[args_progress]);
             if (watching < 0) return NULL;
-            if (!watching) options |= ustore_option_transaction_dont_watch_k;
+            watch = watching ? ustore_watch_keys_k : ustore_watch_none_k;
         }
         else {
             PyErr_Format(PyExc_TypeError, "Got unexpected keyword argument: %S", name);
@@ -1078,16 +1080,16 @@ static PyObject* Database_transaction(PyObject* self, PyObject* const* args, Py_
     }
 
     ustore_transaction_t handle = NULL;
-    ustore_error_t error = {0};
+    ustore_outcome_t outcome = {0};
     ustore_transaction_init_t begin = {0};
-    begin.db = database->handle;
-    begin.error = &error;
     begin.transaction = &handle;
+    begin.database = database->handle;
+    begin.outcome = &outcome;
 
     Py_BEGIN_ALLOW_THREADS;
     ustore_transaction_init(&begin);
     Py_END_ALLOW_THREADS;
-    if (ustore_py_raise_on_error(&error) != 0) return NULL;
+    if (ustore_py_raise_on_outcome(&outcome) != 0) return NULL;
 
     Transaction* const instance = (Transaction*)TransactionType.tp_alloc(&TransactionType, 0);
     if (!instance) {
@@ -1096,7 +1098,7 @@ static PyObject* Database_transaction(PyObject* self, PyObject* const* args, Py_
     }
     instance->handle = handle;
     instance->database = Py_NewRef(self);
-    instance->options = options;
+    instance->watch = watch;
     ++database->transactions;
     return (PyObject*)instance;
 }
@@ -1121,14 +1123,14 @@ static PyObject* Transaction_commit(PyObject* self, PyObject* const* args, Py_ss
                                                                            args_names_tuple, 0);
     if (args_names_count < 0) return NULL;
 
-    ustore_options_t options = ustore_options_default_k;
+    ustore_durability_t durability = ustore_durability_buffered_k;
     for (Py_ssize_t names_progress = 0, args_progress = positional_args_count; names_progress != args_names_count;
          ++args_progress, ++names_progress) {
         PyObject* const name = PyTuple_GET_ITEM(args_names_tuple, names_progress);
         if (PyUnicode_CompareWithASCIIString(name, "flush") == 0) {
             int const flushing = PyObject_IsTrue(args[args_progress]);
             if (flushing < 0) return NULL;
-            if (flushing) options |= ustore_option_write_flush_k;
+            durability = flushing ? ustore_durability_flushed_k : ustore_durability_buffered_k;
         }
         else {
             PyErr_Format(PyExc_TypeError, "Got unexpected keyword argument: %S", name);
@@ -1136,17 +1138,17 @@ static PyObject* Transaction_commit(PyObject* self, PyObject* const* args, Py_ss
         }
     }
 
-    ustore_error_t error = {0};
+    ustore_outcome_t outcome = {0};
     ustore_transaction_commit_t commit = {0};
-    commit.db = context.database->handle;
-    commit.error = &error;
+    commit.database = context.database->handle;
+    commit.outcome = &outcome;
     commit.transaction = context.transaction;
-    commit.options = options;
+    commit.durability = durability;
 
     Py_BEGIN_ALLOW_THREADS;
     ustore_transaction_commit(&commit);
     Py_END_ALLOW_THREADS;
-    if (ustore_py_raise_on_error(&error) != 0) return NULL;
+    if (ustore_py_raise_on_outcome(&outcome) != 0) return NULL;
     Py_RETURN_NONE;
 }
 
@@ -1164,41 +1166,64 @@ static PyObject* Transaction_stage(PyObject* self, PyObject* Py_UNUSED(ignored))
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
 
     ustore_stamp_t stamp = 0;
-    ustore_error_t error = {0};
+    ustore_outcome_t outcome = {0};
     ustore_transaction_stage_t stage = {0};
-    stage.db = context.database->handle;
-    stage.error = &error;
+    stage.database = context.database->handle;
+    stage.outcome = &outcome;
     stage.transaction = context.transaction;
     stage.stamp = &stamp;
 
     Py_BEGIN_ALLOW_THREADS;
     ustore_transaction_stage(&stage);
     Py_END_ALLOW_THREADS;
-    if (ustore_py_raise_on_error(&error) != 0) return NULL;
+    if (ustore_py_raise_on_outcome(&outcome) != 0) return NULL;
     return PyLong_FromUnsignedLongLong(stamp);
 }
 
-static char const doc_Transaction_rollback[] =                                           //
-    "rollback() answers None.\n"                                                         //
-    "\n"                                                                                 //
-    "Drops every staged change and starts a new generation on the same handle, so the\n" //
-    "transaction is ready to be used again without allocating another.";
+static char const doc_Transaction_rollback[] =                                            //
+    "rollback() answers None.\n"                                                          //
+    "\n"                                                                                  //
+    "Withdraws a stage, releasing its stamp and whatever it claimed, while keeping the\n" //
+    "reads and writes, so the transaction can stage or commit again. `reset` drops the\n" //
+    "work itself.";
 
 static PyObject* Transaction_rollback(PyObject* self, PyObject* Py_UNUSED(ignored)) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
 
-    Transaction* const transaction = (Transaction*)self;
-    ustore_error_t error = {0};
+    ustore_outcome_t outcome = {0};
+    ustore_transaction_rollback_t rollback = {0};
+    rollback.database = context.database->handle;
+    rollback.outcome = &outcome;
+    rollback.transaction = context.transaction;
+
+    Py_BEGIN_ALLOW_THREADS;
+    ustore_transaction_rollback(&rollback);
+    Py_END_ALLOW_THREADS;
+    if (ustore_py_raise_on_outcome(&outcome) != 0) return NULL;
+    Py_RETURN_NONE;
+}
+
+static char const doc_Transaction_reset[] =                                               //
+    "reset() answers None.\n"                                                             //
+    "\n"                                                                                  //
+    "Drops every read and write and starts a new generation on the same handle, so the\n" //
+    "transaction is ready to be used again without allocating another.";
+
+static PyObject* Transaction_reset(PyObject* self, PyObject* Py_UNUSED(ignored)) {
+    ustore_py_context_t context;
+    if (ustore_py_context_from_object(self, &context) != 0) return NULL;
+
+    ustore_outcome_t outcome = {0};
     ustore_transaction_init_t reset = {0};
-    reset.db = context.database->handle;
-    reset.error = &error;
-    reset.transaction = &transaction->handle;
+    reset.transaction = &((Transaction*)self)->handle;
+    reset.database = context.database->handle;
+    reset.outcome = &outcome;
 
     Py_BEGIN_ALLOW_THREADS;
     ustore_transaction_init(&reset);
     Py_END_ALLOW_THREADS;
-    if (ustore_py_raise_on_error(&error) != 0) return NULL;
+    if (ustore_py_raise_on_outcome(&outcome) != 0) return NULL;
     Py_RETURN_NONE;
 }
 
@@ -1288,7 +1313,7 @@ static PyMethodDef Database_methods[] = {
     {"measure", (PyCFunction)ustore_py_api_measure, ustore_py_method_flags_k, doc_measure},
     {"get", (PyCFunction)ustore_py_api_get, ustore_py_method_flags_k, doc_get},
     {"set", (PyCFunction)ustore_py_api_set, ustore_py_method_flags_k, doc_set},
-    {"pop", (PyCFunction)ustore_py_api_pop, ustore_py_method_flags_k, doc_pop},
+    {"remove", (PyCFunction)ustore_py_api_remove, ustore_py_method_flags_k, doc_remove},
     {"contains", (PyCFunction)ustore_py_api_contains, ustore_py_method_flags_k, doc_contains},
 
     {"docs_write", (PyCFunction)ustore_py_api_docs_write, ustore_py_method_flags_k, doc_docs_write},
@@ -1308,6 +1333,11 @@ static PyMethodDef Database_methods[] = {
     {NULL, NULL, 0, NULL},
 };
 
+/** Indexing a database by name answers the collection, as `db['movies']` does. */
+static PyMappingMethods Database_as_mapping = {
+    .mp_subscript = (binaryfunc)ustore_py_collection_subscript,
+};
+
 PyTypeObject DatabaseType = {
     PyVarObject_HEAD_INIT(NULL, 0) //
         .tp_name = "ustore.Database",
@@ -1317,6 +1347,7 @@ PyTypeObject DatabaseType = {
     .tp_new = Database_tp_new,
     .tp_dealloc = (destructor)Database_dealloc,
     .tp_repr = (reprfunc)Database_repr,
+    .tp_as_mapping = &Database_as_mapping,
     .tp_methods = Database_methods,
     .tp_getset = Database_getset,
 };
@@ -1330,6 +1361,7 @@ static PyMethodDef Transaction_methods[] = {
     {"commit", (PyCFunction)Transaction_commit, ustore_py_method_flags_k, doc_Transaction_commit},
     {"stage", (PyCFunction)Transaction_stage, METH_NOARGS, doc_Transaction_stage},
     {"rollback", (PyCFunction)Transaction_rollback, METH_NOARGS, doc_Transaction_rollback},
+    {"reset", (PyCFunction)Transaction_reset, METH_NOARGS, doc_Transaction_reset},
     {"close", (PyCFunction)Transaction_close, METH_NOARGS, doc_Transaction_close},
     {"__enter__", (PyCFunction)Transaction_enter, METH_NOARGS, NULL},
     {"__exit__", (PyCFunction)Transaction_exit, ustore_py_method_flags_k, NULL},
@@ -1343,7 +1375,7 @@ static PyMethodDef Transaction_methods[] = {
     {"measure", (PyCFunction)ustore_py_api_measure, ustore_py_method_flags_k, doc_measure},
     {"get", (PyCFunction)ustore_py_api_get, ustore_py_method_flags_k, doc_get},
     {"set", (PyCFunction)ustore_py_api_set, ustore_py_method_flags_k, doc_set},
-    {"pop", (PyCFunction)ustore_py_api_pop, ustore_py_method_flags_k, doc_pop},
+    {"remove", (PyCFunction)ustore_py_api_remove, ustore_py_method_flags_k, doc_remove},
     {"contains", (PyCFunction)ustore_py_api_contains, ustore_py_method_flags_k, doc_contains},
 
     {"docs_write", (PyCFunction)ustore_py_api_docs_write, ustore_py_method_flags_k, doc_docs_write},
@@ -1363,6 +1395,11 @@ static PyMethodDef Transaction_methods[] = {
     {NULL, NULL, 0, NULL},
 };
 
+/** Indexing a transaction by name answers the collection its verbs stage into, as `txn['payments']` does. */
+static PyMappingMethods Transaction_as_mapping = {
+    .mp_subscript = (binaryfunc)ustore_py_collection_subscript,
+};
+
 PyTypeObject TransactionType = {
     PyVarObject_HEAD_INIT(NULL, 0) //
         .tp_name = "ustore.Transaction",
@@ -1372,6 +1409,7 @@ PyTypeObject TransactionType = {
     .tp_new = Transaction_tp_new,
     .tp_dealloc = (destructor)Transaction_dealloc,
     .tp_repr = (reprfunc)Transaction_repr,
+    .tp_as_mapping = &Transaction_as_mapping,
     .tp_methods = Transaction_methods,
     .tp_getset = Transaction_getset,
 };

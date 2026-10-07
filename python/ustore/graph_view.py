@@ -270,10 +270,10 @@ class Graph:
         if self.edges_collection is not None:
             found = self.view.graph_find_edges(keys, role="any", collection=self.graph_collection)
             identifiers = [edge for index in range(len(keys)) for _, _, edge in triples_of(found, index)]
-            self.view.pop(identifiers, collection=self.edges_collection)
+            self.view.remove(identifiers, collection=self.edges_collection)
         self.view.graph_remove_vertices(keys, collection=self.graph_collection)
         if self.nodes_collection is not None:
-            self.view.pop(keys, collection=self.nodes_collection)
+            self.view.remove(keys, collection=self.nodes_collection)
 
     # endregion Vertices
 
@@ -409,7 +409,7 @@ class Graph:
                 removed_sources, removed_targets, edges=removed_edges, collection=self.graph_collection
             )
             if self.edges_collection is not None:
-                self.view.pop(removed_edges, collection=self.edges_collection)
+                self.view.remove(removed_edges, collection=self.edges_collection)
         return len(removed)
 
     def remove_edge(self, source: KeyLike, target: KeyLike) -> None:
@@ -439,6 +439,11 @@ class Graph:
                 if identity not in seen:
                     seen.add(identity)
                     yield oriented
+
+    def find_edges(self, vertices: KeyLike | Sequence[KeyLike], role: str = "any") -> Edges:
+        """The edges of every vertex in `role`, as the stored (source, target, edge) triples."""
+        batch = [vertices] if is_one_key(vertices) else vertices
+        return self.view.graph_find_edges(batch, role=role, collection=self.graph_collection)
 
     @property
     def edges(self) -> EdgeView:
@@ -482,7 +487,7 @@ class Graph:
                 self.view.graph_remove_edges(sources, targets, edges=identifiers, collection=self.graph_collection)
         if self.edges_collection is not None:
             for page in batched(scan_keys(self.view, self.edges_collection), PAGE_KEYS):
-                self.view.pop(page, collection=self.edges_collection)
+                self.view.remove(page, collection=self.edges_collection)
         self.next_edge_id = None
 
     def clear(self) -> None:
@@ -492,7 +497,7 @@ class Graph:
         for collection in (self.nodes_collection, self.edges_collection):
             if collection is not None:
                 for page in batched(scan_keys(self.view, collection), PAGE_KEYS):
-                    self.view.pop(page, collection=collection)
+                    self.view.remove(page, collection=collection)
         self.next_edge_id = None
 
     # endregion Edges

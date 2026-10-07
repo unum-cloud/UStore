@@ -15,45 +15,40 @@
 
 #pragma region Lookups
 
-ustore_py_naming_t ustore_py_collection_named(ustore_py_context_t const* context, char const* name, size_t length,
-                                              ustore_collection_id_t* collection) {
+ustore_py_naming_t ustore_py_collection_named(ustore_py_context_t const* context, ustore_snapshot_t snapshot,
+                                              char const* name, size_t length, ustore_collection_id_t* collection,
+                                              ustore_modality_t* modality) {
     ustore_length_t const name_length = (ustore_length_t)length;
-    ustore_octet_t* presences = NULL;
-    ustore_collection_id_t* ids = NULL;
-    ustore_error_t error = {0};
-    ustore_arena_t arena = ustore_py_arena_claim(context->database);
+    ustore_octet_t presence = 0;
+    ustore_collection_id_t found = ustore_collection_main_k;
+    ustore_modality_t held = ustore_modality_any_k;
+    ustore_outcome_t outcome = {0};
 
-    // Names resolve at the head or at the context's snapshot, so a transaction never watches the lookup.
     ustore_collection_find_t find = {0};
-    find.db = context->database->handle;
-    find.error = &error;
-    find.snapshot = context->snapshot;
-    find.arena = &arena;
-    find.tasks_count = 1;
+    find.database = context->database->handle;
+    find.outcome = &outcome;
+    find.snapshot = snapshot;
+    find.count = 1;
     find.names = &name;
     find.names_lengths = &name_length;
-    find.presences = &presences;
-    find.collections = &ids;
+    find.presences = &presence;
+    find.collections = &found;
+    find.collections_stride = sizeof(ustore_collection_id_t);
+    find.modalities = &held;
+    find.modalities_stride = sizeof(ustore_modality_t);
 
     Py_BEGIN_ALLOW_THREADS;
     ustore_collection_find(&find);
     Py_END_ALLOW_THREADS;
 
-    ustore_py_naming_t verdict = ustore_py_naming_missing_k;
-    if (error.status != ustore_success_k) {
-        ustore_py_raise_on_error(&error);
-        verdict = ustore_py_naming_failed_k;
-    }
-    else if (presences[0] & 1) {
-        *collection = ids[0];
-        verdict = ustore_py_naming_found_k;
-    }
-
-    ustore_py_arena_return(context->database, arena);
-    return verdict;
+    if (ustore_py_raise_on_outcome(&outcome) != 0) return ustore_py_naming_failed_k;
+    if (!(presence & 1)) return ustore_py_naming_missing_k;
+    *collection = found;
+    if (modality) *modality = held;
+    return ustore_py_naming_found_k;
 }
 
-int ustore_py_collection_from_object(ustore_py_context_t const* context, PyObject* object,
+int ustore_py_collection_from_object(ustore_py_context_t const* context, ustore_snapshot_t snapshot, PyObject* object,
                                      ustore_collection_id_t* collection) {
     if (!object || object == Py_None) {
         *collection = ustore_collection_main_k;
@@ -67,11 +62,11 @@ int ustore_py_collection_from_object(ustore_py_context_t const* context, PyObjec
             *collection = ustore_collection_main_k;
             return 0;
         }
-        switch (ustore_py_collection_named(context, name, (size_t)length, collection)) {
+        switch (ustore_py_collection_named(context, snapshot, name, (size_t)length, collection, NULL)) {
         case ustore_py_naming_found_k: return 0;
         case ustore_py_naming_failed_k: return -1;
         case ustore_py_naming_missing_k:
-            return ustore_py_raise(ustore_error_not_found_k, "No collection is named %R", object);
+            return ustore_py_raise(ustore_status_not_found_k, "No collection is named %R", object);
         }
     }
     // Only a `uuid.UUID` spells an ID here, since text already means a name
@@ -107,27 +102,23 @@ PyObject* ustore_py_collection_names(ustore_py_context_t const* context, char co
     ustore_size_t count = 0;
     ustore_length_t* names_offsets = NULL;
     ustore_char_t* names = NULL;
-    ustore_error_t error = {0};
+    ustore_outcome_t outcome = {0};
     ustore_arena_t arena = ustore_py_arena_claim(context->database);
 
-    // Names are listed at the head or at the context's snapshot, as they resolve
     ustore_collection_list_t list = {0};
-    list.db = context->database->handle;
-    list.error = &error;
-    list.snapshot = context->snapshot;
-    list.arena = &arena;
-    list.options = context->options;
+    list.database = context->database->handle;
+    list.outcome = &outcome;
     list.count = &count;
     list.names_offsets = &names_offsets;
     list.names = &names;
+    list.arena = &arena;
 
     Py_BEGIN_ALLOW_THREADS;
     ustore_collection_list(&list);
     Py_END_ALLOW_THREADS;
 
-    if (error.status != ustore_success_k) {
+    if (ustore_py_raise_on_outcome(&outcome) != 0) {
         ustore_py_arena_return(context->database, arena);
-        ustore_py_raise_on_error(&error);
         return NULL;
     }
 
