@@ -72,33 +72,28 @@ typedef enum ustore_doc_modification_t {
  *  @brief The arguments of @c ustore_docs_write, which writes whole documents or fields inside them.
  *
  *  Without @c keys, the key of every document is read from its @c id_field, which must hold a non-negative
- *  integer, spelled as the key of that integer, or a UUID in canonical text.
+ *  integer, spelled as the key of that integer, or a UUID in canonical text. Whole documents are removed with
+ *  @c ustore_remove, and fields inside them with a patch or a merge.
  */
 typedef struct ustore_docs_write_t {
 
     /** An open database. */
-    ustore_database_t db;
+    ustore_database_t database;
 
-    /** Output for the error message. */
-    ustore_error_t* error;
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
 
-    /** Transaction the write belongs to, or @c NULL. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call blocks or returns once queued; zero blocks. */
+    ustore_completion_t completion;
+
+    /** Transaction the writes join, where @c NULL writes to the head. */
     ustore_transaction_t transaction;
 
-    /** Reusable memory for intermediate results. */
-    ustore_arena_t* arena;
-
-    /** Write options, or read and write options for modifications that read the document first. */
-    ustore_options_t options;
-
     /** Number of documents or fields to write. */
-    ustore_size_t tasks_count;
-
-    /** Format of the written values. */
-    ustore_doc_field_type_t type;
-
-    /** Modification applied to every document. */
-    ustore_doc_modification_t modification;
+    ustore_size_t count;
 
     /** Collections of the documents, where @c NULL stands for the main collection. */
     ustore_collection_id_t const* collections;
@@ -118,22 +113,19 @@ typedef struct ustore_docs_write_t {
     /** Bytes between consecutive fields, where zero repeats the first one. */
     ustore_size_t fields_stride;
 
-    /** Bitmap of present values, or @c NULL when every value is present. */
-    ustore_octet_t const* presences;
+    /** Starts of the values inside their buffers, or @c NULL to start every value at its buffer. */
+    ustore_length_t const* starts;
 
-    /** Offsets of the values inside their buffers, or @c NULL. */
-    ustore_length_t const* offsets;
+    /** Bytes between consecutive starts, where zero repeats the first one. */
+    ustore_size_t starts_stride;
 
-    /** Bytes between consecutive offsets, where zero repeats the first one. */
-    ustore_size_t offsets_stride;
-
-    /** Lengths of the values, or @c NULL to derive them from @c offsets or null terminators. */
+    /** Lengths of the values, or @c NULL to end every value where the next one starts or at a null terminator. */
     ustore_length_t const* lengths;
 
     /** Bytes between consecutive lengths, where zero repeats the first one. */
     ustore_size_t lengths_stride;
 
-    /** Buffers holding the values. */
+    /** Buffers holding the values, @c NULL only when there are no tasks. */
     ustore_bytes_cptr_t const* values;
 
     /** Bytes between consecutive buffer pointers, where zero repeats the first one. */
@@ -142,13 +134,25 @@ typedef struct ustore_docs_write_t {
     /** Field holding the key of every document when @c keys is @c NULL, such as "_id". */
     ustore_str_view_t id_field;
 
+    /** Format of the written values. */
+    ustore_doc_field_type_t type;
+
+    /** Modification applied to every document. */
+    ustore_doc_modification_t modification;
+
+    /** How durable the writes are once the call completes at the head; a transaction's commit decides its own. */
+    ustore_durability_t durability;
+
+    /** Whether the @c transaction records the documents it reads and writes for conflicts. */
+    ustore_watch_t watch;
+
 } ustore_docs_write_t;
 
 /**
  *  @brief Writes whole documents or fields inside them.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_docs_write(ustore_docs_write_t* arguments);
+USTORE_EXPORT void ustore_docs_write(ustore_docs_write_t* arguments);
 
 /**
  *  @brief The arguments of @c ustore_docs_read, which reads whole documents or fields inside them.
@@ -159,28 +163,22 @@ void ustore_docs_write(ustore_docs_write_t* arguments);
 typedef struct ustore_docs_read_t {
 
     /** An open database. */
-    ustore_database_t db;
+    ustore_database_t database;
 
-    /** Output for the error message. */
-    ustore_error_t* error;
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
 
-    /** Transaction that watches the read documents, or @c NULL. */
-    ustore_transaction_t transaction;
+    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    ustore_outcome_t* outcome;
 
-    /** Optional snapshot whose view is read, never set beside a transaction. */
-    ustore_snapshot_t snapshot;
+    /** Whether the call blocks or returns once queued; zero blocks. */
+    ustore_completion_t completion;
 
-    /** Reusable memory for the results. */
-    ustore_arena_t* arena;
-
-    /** Read options. */
-    ustore_options_t options;
-
-    /** Format to export the values in, either JSON or a string. */
-    ustore_doc_field_type_t type;
+    /** What the read sees, where @c NULL is the head. */
+    ustore_view_t view;
 
     /** Number of documents or fields to read. */
-    ustore_size_t tasks_count;
+    ustore_size_t count;
 
     /** Collections of the documents, where @c NULL stands for the main collection. */
     ustore_collection_id_t const* collections;
@@ -200,17 +198,20 @@ typedef struct ustore_docs_read_t {
     /** Bytes between consecutive fields, where zero repeats the first one. */
     ustore_size_t fields_stride;
 
-    /** Optional output for a bitmap of found values. */
-    ustore_octet_t** presences;
+    /** Optional output for a bitset of at least @c count bits marking found values. */
+    ustore_octet_t* presences;
 
-    /** Optional output for the offsets of the values inside @c values. */
-    ustore_length_t** offsets;
+    /** Optional output for @c count plus one offsets into @c values, the last one closing the final value. */
+    ustore_length_t* offsets;
 
-    /** Optional output for the lengths of the values. */
-    ustore_length_t** lengths;
+    /** Optional output for the tape of values, inside @c arena. */
+    ustore_byte_t** values;
 
-    /** Optional output for the joined contents of the values. */
-    ustore_bytes_ptr_t* values;
+    /** Memory for @c values: reused when it points to an arena, created when it points to @c NULL. */
+    ustore_arena_t* arena;
+
+    /** Format to export the values in, either JSON or a string. */
+    ustore_doc_field_type_t type;
 
 } ustore_docs_read_t;
 
@@ -218,32 +219,29 @@ typedef struct ustore_docs_read_t {
  *  @brief Reads whole documents or fields inside them.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_docs_read(ustore_docs_read_t* arguments);
+USTORE_EXPORT void ustore_docs_read(ustore_docs_read_t* arguments);
 
 /** The arguments of @c ustore_docs_gist, which lists the unique paths to the leaves of the requested
  *  documents. */
 typedef struct ustore_docs_gist_t {
 
     /** An open database. */
-    ustore_database_t db;
+    ustore_database_t database;
 
-    /** Output for the error message. */
-    ustore_error_t* error;
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
 
-    /** Transaction that watches the read documents, or @c NULL. */
-    ustore_transaction_t transaction;
+    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    ustore_outcome_t* outcome;
 
-    /** Optional snapshot whose view is read, never set beside a transaction. */
-    ustore_snapshot_t snapshot;
+    /** Whether the call blocks or returns once queued; zero blocks. */
+    ustore_completion_t completion;
 
-    /** Reusable memory for the results. */
-    ustore_arena_t* arena;
-
-    /** Read options. */
-    ustore_options_t options;
+    /** What the read sees, where @c NULL is the head. */
+    ustore_view_t view;
 
     /** Number of documents to inspect. */
-    ustore_size_t docs_count;
+    ustore_size_t count;
 
     /** Collections of the documents, where @c NULL stands for the main collection. */
     ustore_collection_id_t const* collections;
@@ -260,11 +258,14 @@ typedef struct ustore_docs_gist_t {
     /** Output for the number of unique paths. */
     ustore_size_t* fields_count;
 
-    /** Output for the offsets of the paths inside @c fields. */
+    /** Output for @c fields_count plus one offsets into @c fields, inside @c arena. */
     ustore_length_t** offsets;
 
-    /** Output for the joined null-terminated JSON Pointers. */
+    /** Output for the joined null-terminated JSON Pointers, inside @c arena. */
     ustore_char_t** fields;
+
+    /** Memory for @c offsets and @c fields: reused when it points to an arena, created when it points to @c NULL. */
+    ustore_arena_t* arena;
 
 } ustore_docs_gist_t;
 
@@ -272,13 +273,14 @@ typedef struct ustore_docs_gist_t {
  *  @brief Lists the unique paths to the leaves of the requested documents.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_docs_gist(ustore_docs_gist_t* arguments);
+USTORE_EXPORT void ustore_docs_gist(ustore_docs_gist_t* arguments);
 
 /**
  *  @brief The arguments of @c ustore_docs_gather, which reads @c fields_count fields of
- *      @c docs_count documents into columns.
+ *      @c count documents into columns.
  *
- *  Every output points to an array of @c fields_count columns, each holding @c docs_count entries.
+ *  Every output but the joined strings is an array of @c fields_count pointers to the caller's columns, each
+ *  holding @c count entries, and one more for offsets.
  *  Validity, conversion and collision columns are bitmaps, least significant bit first. A value is
  *  valid when it was found and converted, converted when the conversion changed its semantics, such
  *  as a string parsed into an integer, and colliding when a value of an inconvertible type sits under
@@ -288,25 +290,22 @@ void ustore_docs_gist(ustore_docs_gist_t* arguments);
 typedef struct ustore_docs_gather_t {
 
     /** An open database. */
-    ustore_database_t db;
+    ustore_database_t database;
 
-    /** Output for the error message. */
-    ustore_error_t* error;
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
 
-    /** Transaction that watches the read documents, or @c NULL. */
-    ustore_transaction_t transaction;
+    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    ustore_outcome_t* outcome;
 
-    /** Optional snapshot whose view is read, never set beside a transaction. */
-    ustore_snapshot_t snapshot;
+    /** Whether the call blocks or returns once queued; zero blocks. */
+    ustore_completion_t completion;
 
-    /** Reusable memory for the results. */
-    ustore_arena_t* arena;
-
-    /** Read options. */
-    ustore_options_t options;
+    /** What the read sees, where @c NULL is the head. */
+    ustore_view_t view;
 
     /** Number of documents, the rows of the output. */
-    ustore_size_t docs_count;
+    ustore_size_t count;
 
     /** Number of fields, the columns of the output. */
     ustore_size_t fields_count;
@@ -335,34 +334,37 @@ typedef struct ustore_docs_gather_t {
     /** Bytes between consecutive types, where zero repeats the first one. */
     ustore_size_t types_stride;
 
-    /** Optional output for the validity bitmaps. */
-    ustore_octet_t*** columns_validities;
+    /** Optional outputs for the validity bitmaps. */
+    ustore_octet_t* const* columns_validities;
 
-    /** Optional output for the conversion bitmaps. */
-    ustore_octet_t*** columns_conversions;
+    /** Optional outputs for the conversion bitmaps. */
+    ustore_octet_t* const* columns_conversions;
 
-    /** Optional output for the collision bitmaps. */
-    ustore_octet_t*** columns_collisions;
+    /** Optional outputs for the collision bitmaps. */
+    ustore_octet_t* const* columns_collisions;
 
-    /** Output for the scalar columns, with @c NULL for string columns. */
-    ustore_byte_t*** columns_scalars;
+    /** Outputs for the scalar columns, each as wide as its type, with @c NULL for string columns. */
+    ustore_byte_t* const* columns_scalars;
 
-    /** Output for the offsets of strings inside @c joined_strings, with @c NULL for scalar columns. */
-    ustore_length_t*** columns_offsets;
+    /** Outputs for @c count plus one offsets of strings inside @c joined_strings, with @c NULL for scalar columns. */
+    ustore_length_t* const* columns_offsets;
 
-    /** Output for the lengths of strings, with @c NULL for scalar columns. */
-    ustore_length_t*** columns_lengths;
+    /** Outputs for the lengths of strings, with @c NULL for scalar columns. */
+    ustore_length_t* const* columns_lengths;
 
-    /** Output for the contents of all strings, joined row by row. */
+    /** Output for the contents of all strings, joined row by row inside @c arena. */
     ustore_byte_t** joined_strings;
+
+    /** Memory for @c joined_strings: reused when it points to an arena, created when it points to @c NULL. */
+    ustore_arena_t* arena;
 
 } ustore_docs_gather_t;
 
 /**
- *  @brief Reads, type-checks and converts @c fields_count fields of @c docs_count documents into columns.
+ *  @brief Reads, type-checks and converts @c fields_count fields of @c count documents into columns.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_docs_gather(ustore_docs_gather_t* arguments);
+USTORE_EXPORT void ustore_docs_gather(ustore_docs_gather_t* arguments);
 
 #pragma endregion Primary Functions
 

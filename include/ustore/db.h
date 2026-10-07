@@ -2,16 +2,13 @@
  *  @file include/ustore/db.h
  *  @author Ash Vardanian
  *  @date June 12, 2022
- *  @brief The binary interface every engine implements: databases, snapshots, collections,
- *      transactions, arenas and errors.
+ *  @brief The binary interface every engine implements: databases, snapshots, transactions, views and
+ *      collections.
  */
 
 #pragma once
 
-#include <stdarg.h>
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
+#include "ustore/types.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -28,14 +25,25 @@ extern "C" {
  */
 typedef struct ustore_database_handle_t* ustore_database_t;
 
-/** An opaque handle to a point-in-time view of the whole database, which a read names instead of a
- *  transaction. Short-lived: it pins the versions its reads need until @c ustore_snapshot_free, and is
- *  freed before its database closes. */
+/** An opaque handle to a point-in-time state of the whole database, which reads address through
+ *  @c ustore_snapshot_view. Short-lived: it pins the versions its reads need until @c ustore_snapshot_free,
+ *  and is freed before its database closes. */
 typedef struct ustore_snapshot_handle_t* ustore_snapshot_t;
 
 /** An opaque handle to an optimistic transaction that groups operations across collections and
- *  modalities. Not thread-safe, and freed with @c ustore_transaction_free before its database closes. */
+ *  modalities. Not thread-safe: it has at most one call in flight, and is freed with
+ *  @c ustore_transaction_free before its database closes. */
 typedef struct ustore_transaction_handle_t* ustore_transaction_t;
+
+/**
+ *  @brief An opaque handle to what a read sees: the head of the database, a transaction or a snapshot.
+ *
+ *  @c NULL is the head. Others come from @c ustore_transaction_view and @c ustore_snapshot_view, which tag the
+ *  parent's pointer and allocate nothing, so a view needs no free and dies with its parent. A view names its
+ *  parent, not a moment: after a commit, a transaction's view reads the transaction's next generation. Writes take a
+ *  transaction instead, so nothing can write through a snapshot.
+ */
+typedef struct ustore_view_handle_t* ustore_view_t;
 
 /**
  *  @brief Sixteen bytes naming one thing everywhere, ordered as their bytes and compared with @c memcmp.
@@ -70,76 +78,11 @@ typedef char ustore_char_t;
 /** The length of a value in bytes, or an offset into a tape of values, wide enough for a tape past 4 GB. */
 typedef uint64_t ustore_length_t;
 
-/** A pointer-sized unsigned integer. */
-typedef uint64_t ustore_size_t;
-
 /** The smallest bitset, holding eight bits. */
 typedef uint8_t ustore_octet_t;
 
 /** The position of a commit in the order commits apply in, which grows with every commit. */
 typedef uint64_t ustore_stamp_t;
-
-/** What went wrong, in one vocabulary shared by every engine and binding. */
-typedef enum ustore_status_t {
-
-    /** The call completed; @c message carries nothing. */
-    ustore_success_k = 0,
-
-    /** An allocation could not be satisfied. */
-    ustore_error_out_of_memory_k = 1,
-
-    /** An argument is null, contradicts another one, or carries options the call does not accept. */
-    ustore_error_invalid_argument_k = 2,
-
-    /** The call needs a database or transaction that was never opened. */
-    ustore_error_uninitialized_k = 3,
-
-    /** The engine or build does not implement what the call asks for. */
-    ustore_error_unsupported_k = 4,
-
-    /** A file or directory could not be opened, read, written, or closed. */
-    ustore_error_io_k = 5,
-
-    /** Stored or supplied data could not be decoded, like a corrupted file or an invalid document. */
-    ustore_error_malformed_k = 6,
-
-    /** A snapshot, collection, or document the call addresses does not exist. */
-    ustore_error_not_found_k = 7,
-
-    /** A snapshot, collection, or document the call creates already exists. */
-    ustore_error_already_exists_k = 8,
-
-    /** A concurrent writer changed a key this transaction wrote; retry the transaction. */
-    ustore_error_write_conflict_k = 9,
-
-    /** A concurrent writer changed a key this transaction read; retry the transaction. */
-    ustore_error_read_conflict_k = 10,
-
-    /** A concurrent writer inserted into a range this transaction scanned; retry the transaction. */
-    ustore_error_phantom_conflict_k = 11,
-
-    /** A hard design ceiling was reached, where a smaller request would fit. */
-    ustore_error_capacity_exhausted_k = 12,
-
-    /** A device could not be selected, or its memory could not be claimed. */
-    ustore_error_device_k = 13,
-
-    /** The engine failed in a way no other status names, which points at a defect. */
-    ustore_error_internal_k = 14,
-
-} ustore_status_t;
-
-/** Outcome of one call: a status to branch on, and a static message that is never freed and is @c NULL exactly
- *  when the status is @c ustore_success_k. */
-typedef struct ustore_error_t {
-
-    /** What went wrong, or @c ustore_success_k. */
-    ustore_status_t status;
-
-    /** Static detail the status cannot carry. */
-    char const* message;
-
-} ustore_error_t;
 
 /** A string the caller owns and the database never frees. */
 typedef char const* ustore_str_view_t;
@@ -147,48 +90,48 @@ typedef char const* ustore_str_view_t;
 /** A mutable string the caller owns and the database never frees. */
 typedef char* ustore_str_span_t;
 
-/** An opaque handle to temporary memory for results, which the database allocates and grows and the
- *  caller frees with @c ustore_arena_free. */
-typedef struct ustore_arena_handle_t* ustore_arena_t;
-
 /** A pointer to mutable bytes. */
 typedef uint8_t* ustore_bytes_ptr_t;
 
 /** A pointer to read-only bytes. */
 typedef uint8_t const* ustore_bytes_cptr_t;
 
-/** The argument a callback receives. */
-typedef void* ustore_callback_payload_t;
+/** How durable the writes a call publishes are once the call completes. */
+typedef enum ustore_durability_t {
 
-/** A callback over its payload. */
-typedef void (*ustore_callback_t)(ustore_callback_payload_t);
+    /** The writes are visible, and reach the disk as the engine's buffers fill. */
+    ustore_durability_buffered_k = 0,
 
-/** Flags that adjust reads, writes, scans and transactions. */
-typedef enum {
+    /** The writes are on disk, at a cost that varies by engine and drive. */
+    ustore_durability_flushed_k = 1,
 
-    /** No flags. */
-    ustore_options_default_k = 0,
+} ustore_durability_t;
 
-    /** Flushes writes to disk before returning, at a cost that varies by engine and drive. */
-    ustore_option_write_flush_k = 1 << 1,
+/** Whether a transaction records the keys a call reads or writes, to refuse its commit when another writer
+ *  changes them first. */
+typedef enum ustore_watch_t {
 
-    /** Stops a transaction from watching the keys it reads or writes for conflicts. */
-    ustore_option_transaction_dont_watch_k = 1 << 2,
+    /** Records the keys, so a concurrent change to any of them fails the commit with a conflict. */
+    ustore_watch_keys_k = 0,
 
-    /** Keeps the results of earlier calls in the arena, so they may be passed back in as arguments. */
-    ustore_option_dont_discard_memory_k = 1 << 4,
+    /** Records nothing, so concurrent changes to these keys never fail the commit. */
+    ustore_watch_none_k = 1,
 
-    /** Places results in shared memory that another process can map without copies. */
-    ustore_option_read_shared_memory_k = 1 << 5,
+} ustore_watch_t;
 
-    /** Lets a scan return keys out of order, deleted or repeated, to speed up the read after it;
-     *  has no effect yet. */
-    ustore_option_scan_bulk_k = 0,
+/** In what order a scan hands its keys over. */
+typedef enum ustore_scan_mode_t {
 
-} ustore_options_t;
+    /** Keys come in order, each once, and only while present. */
+    ustore_scan_ordered_k = 0,
+
+    /** Keys may come out of order, deleted or repeated, to speed up the read after the scan; has no effect yet. */
+    ustore_scan_bulk_k = 1,
+
+} ustore_scan_mode_t;
 
 /** What dropping a collection removes. */
-typedef enum {
+typedef enum ustore_drop_mode_t {
 
     /** The collection handle together with all of its contents. */
     ustore_drop_keys_vals_handle_k = 0,
@@ -202,7 +145,7 @@ typedef enum {
 } ustore_drop_mode_t;
 
 /** Capabilities an engine reports. */
-typedef enum {
+typedef enum ustore_capabilities_t {
 
     /** The engine supports transactions. */
     ustore_supports_transactions_k = 1,
@@ -274,11 +217,17 @@ typedef struct ustore_data_directory_t {
 /** The arguments of @c ustore_database_init_ram. */
 typedef struct ustore_database_init_ram_t {
 
-    /** Output for the opened database, unless @c error is set. */
-    ustore_database_t* db;
+    /** Output for the opened database, left @c NULL on failure. */
+    ustore_database_t* database;
 
-    /** Output for the error message. */
-    ustore_error_t* error;
+    /** Executor that runs the open, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call blocks or returns once queued; zero blocks. */
+    ustore_completion_t completion;
 
     /** Directory the database persists in as one image, or null to keep it in memory alone. */
     ustore_str_view_t directory;
@@ -292,16 +241,22 @@ typedef struct ustore_database_init_ram_t {
  *  @brief Opens the in-memory engine, which persists as one image when it names a directory.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_database_init_ram(ustore_database_init_ram_t* arguments);
+USTORE_EXPORT void ustore_database_init_ram(ustore_database_init_ram_t* arguments);
 
 /** The arguments of @c ustore_database_init_rocksdb. */
 typedef struct ustore_database_init_rocksdb_t {
 
-    /** Output for the opened database, unless @c error is set. */
-    ustore_database_t* db;
+    /** Output for the opened database, left @c NULL on failure. */
+    ustore_database_t* database;
 
-    /** Output for the error message. */
-    ustore_error_t* error;
+    /** Executor that runs the open, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call blocks or returns once queued; zero blocks. */
+    ustore_completion_t completion;
 
     /** Directory of the database, which must exist. */
     ustore_str_view_t directory;
@@ -314,34 +269,47 @@ typedef struct ustore_database_init_rocksdb_t {
 
 } ustore_database_init_rocksdb_t;
 
-/** Opens the RocksDB engine, or reports @c ustore_error_unsupported_k in a library built without it. */
-void ustore_database_init_rocksdb(ustore_database_init_rocksdb_t* arguments);
+/** Opens the RocksDB engine, or reports @c ustore_status_unsupported_k in a library built without it. */
+USTORE_EXPORT void ustore_database_init_rocksdb(ustore_database_init_rocksdb_t* arguments);
 
 /** The arguments of @c ustore_database_init_leveldb. */
 typedef struct ustore_database_init_leveldb_t {
 
-    /** Output for the opened database, unless @c error is set. */
-    ustore_database_t* db;
+    /** Output for the opened database, left @c NULL on failure. */
+    ustore_database_t* database;
 
-    /** Output for the error message. */
-    ustore_error_t* error;
+    /** Executor that runs the open, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call blocks or returns once queued; zero blocks. */
+    ustore_completion_t completion;
 
     /** Directory of the database, which must exist. */
     ustore_str_view_t directory;
 
 } ustore_database_init_leveldb_t;
 
-/** Opens the LevelDB engine, or reports @c ustore_error_unsupported_k in a library built without it. */
-void ustore_database_init_leveldb(ustore_database_init_leveldb_t* arguments);
+/** Opens the LevelDB engine, or reports @c ustore_status_unsupported_k in a library built without it. */
+USTORE_EXPORT void ustore_database_init_leveldb(ustore_database_init_leveldb_t* arguments);
 
 /** The arguments of @c ustore_database_init_nvme, where every zero size or count keeps the engine's default. */
 typedef struct ustore_database_init_nvme_t {
 
-    /** Output for the opened database, unless @c error is set. */
-    ustore_database_t* db;
+    /** Output for the opened database, left @c NULL on failure. */
+    ustore_database_t* database;
 
-    /** Output for the error message. */
-    ustore_error_t* error;
+    /** Executor of @c ustore_executor_for_nvme that runs the open, then the background flushes and compactions,
+     *  borrowed until @c ustore_database_free, where @c NULL spawns one with that call's defaults. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call blocks or returns once queued; zero blocks. */
+    ustore_completion_t completion;
 
     /** Directory of the database's own files, which must exist. */
     ustore_str_view_t directory;
@@ -357,9 +325,6 @@ typedef struct ustore_database_init_nvme_t {
 
     /** Bytes of host memory the engine may pin and cache. */
     ustore_size_t memory_limit;
-
-    /** Background threads, derived from the cores by default. */
-    ustore_size_t threads;
 
     /** CUDA devices compaction may run on, or null for none. */
     int const* gpu_devices;
@@ -420,28 +385,42 @@ typedef struct ustore_database_init_nvme_t {
 
 } ustore_database_init_nvme_t;
 
-/** Opens the NVMe engine, or reports @c ustore_error_unsupported_k in a library built without it. */
-void ustore_database_init_nvme(ustore_database_init_nvme_t* arguments);
+/** Opens the NVMe engine, or reports @c ustore_status_unsupported_k in a library built without it. */
+USTORE_EXPORT void ustore_database_init_nvme(ustore_database_init_nvme_t* arguments);
 
-/** The arguments of @c ustore_database_capabilities. */
-typedef struct ustore_database_capabilities_t {
+/** What an open database reports about itself in one call. */
+typedef struct ustore_database_description_t {
+
+    /** The capabilities of the engine. */
+    ustore_capabilities_t capabilities;
+
+} ustore_database_description_t;
+
+/** The arguments of @c ustore_database_describe. */
+typedef struct ustore_database_describe_t {
 
     /** An open database. */
-    ustore_database_t db;
+    ustore_database_t database;
 
-    /** Output for the error message. */
-    ustore_error_t* error;
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
 
-    /** Output for the capabilities of the engine. */
-    ustore_capabilities_t* capabilities;
+    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    ustore_outcome_t* outcome;
 
-} ustore_database_capabilities_t;
+    /** Whether the call blocks or returns once queued; zero blocks. */
+    ustore_completion_t completion;
+
+    /** Output for the description, filled whole. */
+    ustore_database_description_t* description;
+
+} ustore_database_describe_t;
 
 /**
- *  @brief Reports the capabilities of the engine.
+ *  @brief Reports what the engine of an open database supports.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_database_capabilities(ustore_database_capabilities_t* arguments);
+USTORE_EXPORT void ustore_database_describe(ustore_database_describe_t* arguments);
 
 /**
  *  @brief The arguments of @c ustore_database_control, a free-form tunnel to the engine.
@@ -453,19 +432,31 @@ void ustore_database_capabilities(ustore_database_capabilities_t* arguments);
 typedef struct ustore_database_control_t {
 
     /** An open database. */
-    ustore_database_t db;
+    ustore_database_t database;
 
-    /** Reusable memory for the response. */
-    ustore_arena_t* arena;
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
 
-    /** Output for the error message. */
-    ustore_error_t* error;
+    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call blocks or returns once queued; zero blocks. */
+    ustore_completion_t completion;
 
     /** The request as a null-terminated string. */
     ustore_str_view_t request;
 
-    /** Output for the response as a null-terminated string. */
+    /** Output for the response as a null-terminated string, inside @c arena. */
     ustore_str_view_t* response;
+
+    /** Memory for @c response: reused when it points to an arena, created when it points to @c NULL. */
+    ustore_arena_t* arena;
+
+    /** Optional callback reporting the bytes a long request, such as a compaction, has processed. */
+    ustore_progress_callback_t progress;
+
+    /** Opaque pointer passed to @c progress. */
+    void* progress_state;
 
 } ustore_database_control_t;
 
@@ -473,40 +464,52 @@ typedef struct ustore_database_control_t {
  *  @brief Sends a free-form request to the engine.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_database_control(ustore_database_control_t* arguments);
+USTORE_EXPORT void ustore_database_control(ustore_database_control_t* arguments);
 
 #pragma endregion Database
 
-#pragma region Snapshots
+#pragma region Snapshots and Views
 
 /** The arguments of @c ustore_snapshot_init. */
 typedef struct ustore_snapshot_init_t {
 
-    /** An open database. */
-    ustore_database_t db;
-
-    /** Output for the error message. */
-    ustore_error_t* error;
-
     /** Output for the new snapshot, which the caller frees with @c ustore_snapshot_free. */
     ustore_snapshot_t* snapshot;
+
+    /** An open database. */
+    ustore_database_t database;
+
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call blocks or returns once queued; zero blocks. */
+    ustore_completion_t completion;
 
 } ustore_snapshot_init_t;
 
 /**
- *  @brief Pins a point-in-time view of the database until @c ustore_snapshot_free releases it.
+ *  @brief Pins a point-in-time state of the database until @c ustore_snapshot_free releases it.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_snapshot_init(ustore_snapshot_init_t* arguments);
+USTORE_EXPORT void ustore_snapshot_init(ustore_snapshot_init_t* arguments);
 
 /** The arguments of @c ustore_snapshot_export. */
 typedef struct ustore_snapshot_export_t {
 
     /** An open database. */
-    ustore_database_t db;
+    ustore_database_t database;
 
-    /** Output for the error message. */
-    ustore_error_t* error;
+    /** Executor that runs the export, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call blocks or returns once queued; zero blocks. */
+    ustore_completion_t completion;
 
     /** The snapshot to export. */
     ustore_snapshot_t snapshot;
@@ -514,15 +517,28 @@ typedef struct ustore_snapshot_export_t {
     /** Directory that receives the exported database. */
     ustore_str_view_t path;
 
+    /** Optional callback reporting the bytes exported. */
+    ustore_progress_callback_t progress;
+
+    /** Opaque pointer passed to @c progress. */
+    void* progress_state;
+
 } ustore_snapshot_export_t;
 
 /**
  *  @brief Exports a snapshot as a new database.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_snapshot_export(ustore_snapshot_export_t* arguments);
+USTORE_EXPORT void ustore_snapshot_export(ustore_snapshot_export_t* arguments);
 
-#pragma endregion Snapshots
+/**
+ *  @brief Names a snapshot as the view a read sees, without allocating.
+ *  @param[in] snapshot A snapshot, which the view dies with.
+ *  @return The view, or @c NULL, the head, for a @c NULL snapshot.
+ */
+USTORE_EXPORT ustore_view_t ustore_snapshot_view(ustore_snapshot_t snapshot);
+
+#pragma endregion Snapshots and Views
 
 #pragma region Collections
 
@@ -558,38 +574,39 @@ typedef enum ustore_modality_t {
 typedef struct ustore_collection_list_t {
 
     /** An open database. */
-    ustore_database_t db;
+    ustore_database_t database;
 
-    /** Output for the error message. */
-    ustore_error_t* error;
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
 
-    /** Transaction whose view is listed. */
-    ustore_transaction_t transaction;
+    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    ustore_outcome_t* outcome;
 
-    /** Optional snapshot whose view is listed, never set beside a transaction. */
-    ustore_snapshot_t snapshot;
+    /** Whether the call blocks or returns once queued; zero blocks. */
+    ustore_completion_t completion;
 
-    /** Reusable memory for the results. */
-    ustore_arena_t* arena;
-
-    /** Accepts @c ustore_option_dont_discard_memory_k. */
-    ustore_options_t options;
+    /** What the listing sees, where @c NULL is the head. */
+    ustore_view_t view;
 
     /** Output for the number of collections. */
     ustore_size_t* count;
 
-    /** Optional output for the identifiers of the collections. */
+    /** Optional output for the identifiers of the collections, inside @c arena. */
     ustore_collection_id_t** collections;
 
-    /** Optional output for what every collection holds. */
+    /** Optional output for what every collection holds, inside @c arena. */
     ustore_modality_t** modalities;
 
-    /** Optional output for @c count plus one offsets into @c names, where a collection without a name has an empty
-     *  one. */
+    /** Optional output for @c count plus one offsets into @c names, inside @c arena, where a collection without a
+     *  name has an empty one. */
     ustore_length_t** names_offsets;
 
-    /** Optional output for the tape of names, in the order of the identifiers. */
+    /** Optional output for the tape of names, in the order of the identifiers, inside @c arena. */
     ustore_char_t** names;
+
+    /** Memory for @c collections, @c modalities, @c names_offsets and @c names: reused when it points to an arena,
+     *  created when it points to @c NULL. */
+    ustore_arena_t* arena;
 
 } ustore_collection_list_t;
 
@@ -597,7 +614,7 @@ typedef struct ustore_collection_list_t {
  *  @brief Lists the collections of the database.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_collection_list(ustore_collection_list_t* arguments);
+USTORE_EXPORT void ustore_collection_list(ustore_collection_list_t* arguments);
 
 /**
  *  @brief The arguments of @c ustore_collection_create, which always creates an empty collection and answers the
@@ -605,17 +622,23 @@ void ustore_collection_list(ustore_collection_list_t* arguments);
  *
  *  Runs at the head of the database. A name is recorded with the collection in one step and survives a crash beside
  *  it, and a name another collection carries, even one a concurrent creator took first, fails the call with
- *  @c ustore_error_already_exists_k and creates nothing. Each engine keeps the names apart from every collection,
+ *  @c ustore_status_already_exists_k and creates nothing. Each engine keeps the names apart from every collection,
  *  so no identifier reaches them, and a name resolves in two phases: once through @c ustore_collection_find, and
  *  from then on by identifier, as no other call carries one.
  */
 typedef struct ustore_collection_create_t {
 
     /** An open database. */
-    ustore_database_t db;
+    ustore_database_t database;
 
-    /** Output for the error message. */
-    ustore_error_t* error;
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call blocks or returns once queued; zero blocks. */
+    ustore_completion_t completion;
 
     /** Optional name no other collection carries, where @c NULL creates a collection without one. */
     ustore_str_view_t name;
@@ -635,34 +658,35 @@ typedef struct ustore_collection_create_t {
  *  @brief Creates an empty collection, named or not.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_collection_create(ustore_collection_create_t* arguments);
+USTORE_EXPORT void ustore_collection_create(ustore_collection_create_t* arguments);
 
 /**
  *  @brief The arguments of @c ustore_collection_find, which reads the collections a batch of names address.
  *
  *  Names are read at the head of the database or at a snapshot, never inside a transaction, so resolving a name
  *  never joins the conflicts of the work that follows it. A name no collection carries answers
- *  @c ustore_collection_main_k, @c ustore_modality_any_k and an unset presence bit.
+ *  @c ustore_collection_main_k, @c ustore_modality_any_k and an unset presence bit. Every output is a span of the
+ *  caller's, sized by @c count.
  */
 typedef struct ustore_collection_find_t {
 
     /** An open database. */
-    ustore_database_t db;
+    ustore_database_t database;
 
-    /** Output for the error message. */
-    ustore_error_t* error;
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call blocks or returns once queued; zero blocks. */
+    ustore_completion_t completion;
 
     /** Optional snapshot whose names are read, where @c NULL reads the head. */
     ustore_snapshot_t snapshot;
 
-    /** Reusable memory for the results. */
-    ustore_arena_t* arena;
-
-    /** Accepts @c ustore_option_dont_discard_memory_k. */
-    ustore_options_t options;
-
     /** Number of tasks, one per name. */
-    ustore_size_t tasks_count;
+    ustore_size_t count;
 
     /** Names to resolve, @c NULL only when there are no tasks. */
     ustore_str_view_t const* names;
@@ -676,15 +700,21 @@ typedef struct ustore_collection_find_t {
     /** Bytes between consecutive name lengths, where zero repeats the first one. */
     ustore_size_t names_lengths_stride;
 
-    /** Optional output for a bitset of at least @c tasks_count bits marking the names a collection carries,
+    /** Optional output for a bitset of at least @c count bits marking the names a collection carries,
      *  addressed as Apache Arrow does. */
-    ustore_octet_t** presences;
+    ustore_octet_t* presences;
 
     /** Output for the identifiers of the collections the names address. */
-    ustore_collection_id_t** collections;
+    ustore_collection_id_t* collections;
+
+    /** Bytes between consecutive output identifiers, never zero. */
+    ustore_size_t collections_stride;
 
     /** Optional output for what the collections hold. */
-    ustore_modality_t** modalities;
+    ustore_modality_t* modalities;
+
+    /** Bytes between consecutive output modalities, never zero. */
+    ustore_size_t modalities_stride;
 
 } ustore_collection_find_t;
 
@@ -692,17 +722,23 @@ typedef struct ustore_collection_find_t {
  *  @brief Reads the collections a batch of names address.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_collection_find(ustore_collection_find_t* arguments);
+USTORE_EXPORT void ustore_collection_find(ustore_collection_find_t* arguments);
 
 /** The arguments of @c ustore_collection_drop, where the main collection can only be cleared, and dropping a
  *  collection whole forgets its name before the collection goes. */
 typedef struct ustore_collection_drop_t {
 
     /** An open database. */
-    ustore_database_t db;
+    ustore_database_t database;
 
-    /** Output for the error message. */
-    ustore_error_t* error;
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call blocks or returns once queued; zero blocks. */
+    ustore_completion_t completion;
 
     /** Identifier of an existing collection. */
     ustore_collection_id_t collection;
@@ -716,7 +752,7 @@ typedef struct ustore_collection_drop_t {
  *  @brief Removes or clears a collection.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_collection_drop(ustore_collection_drop_t* arguments);
+USTORE_EXPORT void ustore_collection_drop(ustore_collection_drop_t* arguments);
 
 #pragma endregion Collections
 
@@ -725,17 +761,20 @@ void ustore_collection_drop(ustore_collection_drop_t* arguments);
 /** The arguments of @c ustore_transaction_init. */
 typedef struct ustore_transaction_init_t {
 
-    /** An open database. */
-    ustore_database_t db;
-
-    /** Output for the error message. */
-    ustore_error_t* error;
-
-    /** Accepts @c ustore_option_dont_discard_memory_k. */
-    ustore_options_t options;
-
     /** The transaction to begin or to reset for reuse. */
     ustore_transaction_t* transaction;
+
+    /** An open database. */
+    ustore_database_t database;
+
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call blocks or returns once queued; zero blocks. */
+    ustore_completion_t completion;
 
 } ustore_transaction_init_t;
 
@@ -743,23 +782,34 @@ typedef struct ustore_transaction_init_t {
  *  @brief Begins a transaction, or resets an existing one.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_transaction_init(ustore_transaction_init_t* arguments);
+USTORE_EXPORT void ustore_transaction_init(ustore_transaction_init_t* arguments);
+
+/**
+ *  @brief Names a transaction as the view a read sees, without allocating.
+ *  @param[in] transaction A transaction, which the view dies with.
+ *  @param[in] watch Whether reads through the view record their keys for conflicts.
+ *  @return The view, or @c NULL, the head, for a @c NULL transaction.
+ */
+USTORE_EXPORT ustore_view_t ustore_transaction_view(ustore_transaction_t transaction, ustore_watch_t watch);
 
 /** The arguments of @c ustore_transaction_stage, which keeps the contents for logging or retries
  *  whatever the outcome. */
 typedef struct ustore_transaction_stage_t {
 
     /** An open database. */
-    ustore_database_t db;
+    ustore_database_t database;
 
-    /** Output for the error message. */
-    ustore_error_t* error;
+    /** Executor that runs the stage, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call blocks or returns once queued; zero blocks. */
+    ustore_completion_t completion;
 
     /** An initialized transaction. */
     ustore_transaction_t transaction;
-
-    /** Options of the stage. */
-    ustore_options_t options;
 
     /** Optional output for the stamp the stage took. */
     ustore_stamp_t* stamp;
@@ -770,26 +820,32 @@ typedef struct ustore_transaction_stage_t {
  *  @brief Stages a transaction as the first phase of a two-phase commit.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_transaction_stage(ustore_transaction_stage_t* arguments);
+USTORE_EXPORT void ustore_transaction_stage(ustore_transaction_stage_t* arguments);
 
 /** The arguments of @c ustore_transaction_commit, which keeps the contents for logging or retries
  *  whatever the outcome. */
 typedef struct ustore_transaction_commit_t {
 
     /** An open database. */
-    ustore_database_t db;
+    ustore_database_t database;
 
-    /** Output for the error message. */
-    ustore_error_t* error;
+    /** Executor that runs the commit, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
 
-    /** An initialized transaction. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call blocks or returns once queued; zero blocks. */
+    ustore_completion_t completion;
+
+    /** An initialized transaction, staged first when the caller did not. */
     ustore_transaction_t transaction;
-
-    /** Accepts @c ustore_option_write_flush_k. */
-    ustore_options_t options;
 
     /** Optional output for the stamp the commit published under. */
     ustore_stamp_t* stamp;
+
+    /** How durable the writes are once the commit completes. */
+    ustore_durability_t durability;
 
 } ustore_transaction_commit_t;
 
@@ -797,35 +853,56 @@ typedef struct ustore_transaction_commit_t {
  *  @brief Commits a transaction.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_transaction_commit(ustore_transaction_commit_t* arguments);
+USTORE_EXPORT void ustore_transaction_commit(ustore_transaction_commit_t* arguments);
+
+/** The arguments of @c ustore_transaction_rollback. */
+typedef struct ustore_transaction_rollback_t {
+
+    /** An open database. */
+    ustore_database_t database;
+
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call blocks or returns once queued; zero blocks. */
+    ustore_completion_t completion;
+
+    /** A transaction, staged or not. */
+    ustore_transaction_t transaction;
+
+} ustore_transaction_rollback_t;
+
+/**
+ *  @brief Withdraws a stage, releasing its stamp and whatever it claimed, while keeping the reads and writes, so
+ *      the transaction can stage again or be reset through @c ustore_transaction_init.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ */
+USTORE_EXPORT void ustore_transaction_rollback(ustore_transaction_rollback_t* arguments);
 
 #pragma endregion Transactions
 
 #pragma region Memory Reclamation
 
 /**
- *  @brief Frees a reusable arena and everything exported into it.
- *  @param[inout] arena The arena to be freed; @c NULL is safe.
- */
-void ustore_arena_free(ustore_arena_t arena);
-
-/**
- *  @brief Resets a transaction and frees its memory.
+ *  @brief Resets a transaction and frees its memory, along with every view of it.
  *  @param[inout] transaction The transaction to be freed; @c NULL is safe.
  */
-void ustore_transaction_free(ustore_transaction_t transaction);
+USTORE_EXPORT void ustore_transaction_free(ustore_transaction_t transaction);
 
 /**
- *  @brief Releases a snapshot, unpinning the versions only it kept, and frees its memory.
+ *  @brief Releases a snapshot, unpinning the versions only it kept, and frees its memory with every view of it.
  *  @param[inout] snapshot The snapshot to be freed; @c NULL is safe.
  */
-void ustore_snapshot_free(ustore_snapshot_t snapshot);
+USTORE_EXPORT void ustore_snapshot_free(ustore_snapshot_t snapshot);
 
 /**
  *  @brief Closes the database and frees its memory, while the data persists on disk.
  *  @param[inout] database The database to be closed; @c NULL is safe.
  */
-void ustore_database_free(ustore_database_t database);
+USTORE_EXPORT void ustore_database_free(ustore_database_t database);
 
 #pragma endregion Memory Reclamation
 

@@ -26,30 +26,30 @@ extern "C" {
 #pragma region Writes
 
 /**
- *  @brief The arguments of @c ustore_strings_write, which upserts or removes the values of strings.
+ *  @brief The arguments of @c ustore_strings_write, which upserts the values of strings.
  *
- *  A task whose value is absent removes its string, as @c ustore_write removes a key. Strings sharing a
- *  bucket are rewritten together, so one batch touching many of them costs one read and one write.
+ *  Strings sharing a bucket are rewritten together, so one batch touching many of them costs one read and one
+ *  write; @c ustore_strings_remove removes strings.
  */
 typedef struct ustore_strings_write_t {
 
     /** An open database. */
-    ustore_database_t db;
+    ustore_database_t database;
 
-    /** Output for the error message. */
-    ustore_error_t* error;
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
 
-    /** Transaction that watches the written buckets. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call blocks or returns once queued; zero blocks. */
+    ustore_completion_t completion;
+
+    /** Transaction the writes join, where @c NULL writes to the head. */
     ustore_transaction_t transaction;
 
-    /** Reusable memory for intermediate results. */
-    ustore_arena_t* arena;
-
-    /** Read and write options, as @c ustore_read_t and @c ustore_write_t accept them. */
-    ustore_options_t options;
-
     /** Number of tasks, one per string. */
-    ustore_size_t tasks_count;
+    ustore_size_t count;
 
     /** Strings collections owning the strings. */
     ustore_collection_id_t const* collections;
@@ -69,27 +69,31 @@ typedef struct ustore_strings_write_t {
     /** Bytes between consecutive string lengths, where zero repeats the first one. */
     ustore_size_t strings_lengths_stride;
 
-    /** Optional bitset of at least @c tasks_count bits, where a set bit marks a value that is not
-     *  null, addressed as Apache Arrow does. */
-    ustore_octet_t const* values_presences;
+    /** Optional starts of the values within the chunks of @c values, which may skip the header of a runtime
+     *  object, where @c NULL starts every value at its chunk. */
+    ustore_length_t const* values_starts;
 
-    /** Offsets of the values within the chunks of @c values, which may skip the header of a runtime object. */
-    ustore_length_t const* values_offsets;
+    /** Bytes between consecutive value starts, where zero repeats the first one. */
+    ustore_size_t values_starts_stride;
 
-    /** Bytes between consecutive value offsets, where zero repeats the first one. */
-    ustore_size_t values_offsets_stride;
-
-    /** Optional lengths of the values, inferred from consecutive offsets or null terminators when absent. */
+    /** Optional lengths of the values; without them every value ends where the next one starts, reading one start
+     *  past the last value, or at a null terminator when @c values_starts is absent too. */
     ustore_length_t const* values_lengths;
 
     /** Bytes between consecutive value lengths, where zero repeats the first one. */
     ustore_size_t values_lengths_stride;
 
-    /** Pointers to the chunks holding the values, where @c NULL removes every string. */
+    /** Pointers to the chunks holding the values, @c NULL only when there are no tasks. */
     ustore_bytes_cptr_t const* values;
 
     /** Bytes between consecutive chunk pointers, where zero repeats the first one. */
     ustore_size_t values_stride;
+
+    /** How durable the writes are once the call completes at the head; a transaction's commit decides its own. */
+    ustore_durability_t durability;
+
+    /** Whether the @c transaction records the buckets it reads and writes for conflicts. */
+    ustore_watch_t watch;
 
 } ustore_strings_write_t;
 
@@ -97,7 +101,60 @@ typedef struct ustore_strings_write_t {
  *  @brief Writes a batch of strings and their values.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_strings_write(ustore_strings_write_t* arguments);
+USTORE_EXPORT void ustore_strings_write(ustore_strings_write_t* arguments);
+
+/** The arguments of @c ustore_strings_remove, which removes strings with their values in a batch. */
+typedef struct ustore_strings_remove_t {
+
+    /** An open database. */
+    ustore_database_t database;
+
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call blocks or returns once queued; zero blocks. */
+    ustore_completion_t completion;
+
+    /** Transaction the removals join, where @c NULL removes at the head. */
+    ustore_transaction_t transaction;
+
+    /** Number of tasks, one per string. */
+    ustore_size_t count;
+
+    /** Strings collections owning the strings. */
+    ustore_collection_id_t const* collections;
+
+    /** Bytes between consecutive collections, where zero repeats the first one. */
+    ustore_size_t collections_stride;
+
+    /** Strings to remove, @c NULL only when there are no tasks. */
+    ustore_str_view_t const* strings;
+
+    /** Bytes between consecutive string pointers, where zero repeats the first one. */
+    ustore_size_t strings_stride;
+
+    /** Optional lengths of the strings, inferred from null terminators when absent. */
+    ustore_length_t const* strings_lengths;
+
+    /** Bytes between consecutive string lengths, where zero repeats the first one. */
+    ustore_size_t strings_lengths_stride;
+
+    /** How durable the removals are once the call completes at the head; a transaction's commit decides its own. */
+    ustore_durability_t durability;
+
+    /** Whether the @c transaction records the buckets it reads and writes for conflicts. */
+    ustore_watch_t watch;
+
+} ustore_strings_remove_t;
+
+/**
+ *  @brief Removes a batch of strings with their values.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ */
+USTORE_EXPORT void ustore_strings_remove(ustore_strings_remove_t* arguments);
 
 #pragma endregion Writes
 
@@ -107,25 +164,22 @@ void ustore_strings_write(ustore_strings_write_t* arguments);
 typedef struct ustore_strings_read_t {
 
     /** An open database. */
-    ustore_database_t db;
+    ustore_database_t database;
 
-    /** Output for the error message. */
-    ustore_error_t* error;
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
 
-    /** Transaction that watches the read buckets. */
-    ustore_transaction_t transaction;
+    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    ustore_outcome_t* outcome;
 
-    /** Optional snapshot whose view is read, never set beside a transaction. */
-    ustore_snapshot_t snapshot;
+    /** Whether the call blocks or returns once queued; zero blocks. */
+    ustore_completion_t completion;
 
-    /** Reusable memory for the results. */
-    ustore_arena_t* arena;
-
-    /** Read options, as @c ustore_read_t accepts them. */
-    ustore_options_t options;
+    /** What the read sees, where @c NULL is the head. */
+    ustore_view_t view;
 
     /** Number of tasks, one per string. */
-    ustore_size_t tasks_count;
+    ustore_size_t count;
 
     /** Strings collections owning the strings. */
     ustore_collection_id_t const* collections;
@@ -145,19 +199,19 @@ typedef struct ustore_strings_read_t {
     /** Bytes between consecutive string lengths, where zero repeats the first one. */
     ustore_size_t strings_lengths_stride;
 
-    /** Optional output for a bitset of at least @c tasks_count bits marking present strings, addressed
+    /** Optional output for a bitset of at least @c count bits marking present strings, addressed
      *  as Apache Arrow does. */
-    ustore_octet_t** presences;
+    ustore_octet_t* presences;
 
-    /** Optional output for @c tasks_count plus one offsets into @c values, the last one closing the
+    /** Optional output for @c count plus one offsets into @c values, the last one closing the
      *  final value as Apache Arrow expects. */
-    ustore_length_t** offsets;
+    ustore_length_t* offsets;
 
-    /** Optional output for the lengths of the values, with @c ustore_length_missing_k for missing strings. */
-    ustore_length_t** lengths;
-
-    /** Optional output for the tape of values, which follow each other without gaps. */
+    /** Optional output for the tape of values in the order of the strings, inside @c arena. */
     ustore_byte_t** values;
+
+    /** Memory for @c values: reused when it points to an arena, created when it points to @c NULL. */
+    ustore_arena_t* arena;
 
 } ustore_strings_read_t;
 
@@ -165,7 +219,7 @@ typedef struct ustore_strings_read_t {
  *  @brief Reads a batch of values addressed by their strings.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_strings_read(ustore_strings_read_t* arguments);
+USTORE_EXPORT void ustore_strings_read(ustore_strings_read_t* arguments);
 
 #pragma endregion Reads
 
@@ -180,25 +234,22 @@ void ustore_strings_read(ustore_strings_read_t* arguments);
 typedef struct ustore_strings_scan_t {
 
     /** An open database. */
-    ustore_database_t db;
+    ustore_database_t database;
 
-    /** Output for the error message. */
-    ustore_error_t* error;
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
 
-    /** Transaction that watches the scanned buckets. */
-    ustore_transaction_t transaction;
+    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    ustore_outcome_t* outcome;
 
-    /** Optional snapshot whose view is scanned, never set beside a transaction. */
-    ustore_snapshot_t snapshot;
+    /** Whether the call blocks or returns once queued; zero blocks. */
+    ustore_completion_t completion;
 
-    /** Reusable memory for the results. */
-    ustore_arena_t* arena;
-
-    /** Read and scan options, as @c ustore_read_t and @c ustore_scan_t accept them. */
-    ustore_options_t options;
+    /** What the scan sees, where @c NULL is the head. */
+    ustore_view_t view;
 
     /** Number of scans. */
-    ustore_size_t tasks_count;
+    ustore_size_t count;
 
     /** Strings collections to scan. */
     ustore_collection_id_t const* collections;
@@ -236,18 +287,27 @@ typedef struct ustore_strings_scan_t {
     /** Bytes between consecutive limits, where zero repeats the first one. */
     ustore_size_t count_limits_stride;
 
-    /** Optional output for @c tasks_count plus one offsets into the found strings, the last one closing
-     *  the final scan. */
-    ustore_length_t** offsets;
+    /** Output for @c count plus one offsets into the found strings, the last one closing the final scan. */
+    ustore_length_t* offsets;
 
-    /** Optional output for the number of strings every scan found, never above its limit. */
-    ustore_length_t** counts;
+    /** Output for one offset into @c strings per found string, plus one closing the last one, with room for the
+     *  sum of @c count_limits plus one. */
+    ustore_length_t* strings_offsets;
 
-    /** Optional output for one offset into @c strings per found string, plus one closing the last one. */
-    ustore_length_t** strings_offsets;
-
-    /** Output for the tape of found strings, which follow each other without gaps. */
+    /** Output for the tape of found strings, which follow each other without gaps, inside @c arena. */
     ustore_char_t** strings;
+
+    /** Memory for @c strings: reused when it points to an arena, created when it points to @c NULL. */
+    ustore_arena_t* arena;
+
+    /** In what order the strings come. */
+    ustore_scan_mode_t mode;
+
+    /** Optional callback reporting the scans finished. */
+    ustore_progress_callback_t progress;
+
+    /** Opaque pointer passed to @c progress. */
+    void* progress_state;
 
 } ustore_strings_scan_t;
 
@@ -255,7 +315,7 @@ typedef struct ustore_strings_scan_t {
  *  @brief Scans a batch of prefixes.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-void ustore_strings_scan(ustore_strings_scan_t* arguments);
+USTORE_EXPORT void ustore_strings_scan(ustore_strings_scan_t* arguments);
 
 #pragma endregion Scans
 

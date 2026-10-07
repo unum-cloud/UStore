@@ -4,13 +4,16 @@
 The `*.h` headers declare a C99 binary interface that every engine implements — the in-memory SmashTable reference engine, the RocksDB and LevelDB key-value stores, and NVMe on NVMe as a v1 target — so any language with a C FFI can drive the database.
 The `*.hpp` headers beside them wrap the same calls in C++ with RAII handles, batched references and typed ranges, and add no ABI of their own.
 
-| Header     | Declares                                                                                          |
-| :--------- | :------------------------------------------------------------------------------------------------ |
-| `ustore.h` | Every C header below                                                                              |
-| `db.h`     | Databases, collections, snapshots, transactions, arenas and errors                                |
-| `blobs.h`  | Binary values: `ustore_write`, `ustore_read`, `ustore_scan`, `ustore_sample`, `ustore_measure`    |
-| `docs.h`   | JSON documents: `ustore_docs_write`, `ustore_docs_read`, `ustore_docs_gist`, `ustore_docs_gather` |
-| `graph.h`  | Graph edges and vertices                                                                          |
+| Header      | Declares                                                                                          |
+| :---------- | :------------------------------------------------------------------------------------------------ |
+| `ustore.h`  | Every C header below                                                                              |
+| `types.h`   | Statuses, outcomes, completion modes, arenas, progress callbacks and executors                    |
+| `db.h`      | Databases, collections, snapshots, transactions and views                                         |
+| `blobs.h`   | Binary values: `ustore_write`, `ustore_remove`, `ustore_read`, `ustore_scan`, `ustore_sample`     |
+| `strings.h` | String-keyed values: `ustore_strings_write`, `_remove`, `_read` and `_scan`                       |
+| `docs.h`    | JSON documents: `ustore_docs_write`, `ustore_docs_read`, `ustore_docs_gist`, `ustore_docs_gather` |
+| `graph.h`   | Graph edges and vertices                                                                          |
+| `pages.h`   | Ordered documents: one verb per edit, `ustore_pages_read` and `ustore_pages_history`              |
 
 | Header                   | Declares                                                     |
 | :----------------------- | :----------------------------------------------------------- |
@@ -50,41 +53,62 @@ target_link_libraries(your_target PRIVATE ustore::ustore)
 ### Conventions
 
 Every call takes a single pointer to an argument struct named after it with a `_t` suffix, so arguments are named and every omitted one is zero.
-Every fallible call reports through `error`, a `ustore_error_t` whose `status` names the failure and whose static `message` is never freed.
-Reads export into an arena that UStore allocates and grows, which the caller frees once with `ustore_arena_free`.
-The next call through the same arena discards what the previous one exported, unless it passes `ustore_option_dont_discard_memory_k`.
-Every call is a batch of `tasks_count` tasks, with each input array walked by its own stride in bytes, and a zero stride repeats one element for every task.
+Every struct opens with its handle, then `executor`, `outcome` and `completion`, so every call reports through a `ustore_outcome_t` whose `status` names the result and whose static `message` is never freed.
+Statuses read `ustore_status_<name>_k`, from `ustore_status_success_k` through every failure.
+Every call is a batch of `count` tasks, with each input array walked by its own stride in bytes, and a zero stride repeats one element for every task.
 Keys are `ustore_key_t`, 16 bytes of a UUID compared bytewise, and a non-negative integer spells as its 128-bit big-endian bytes, as Python's `uuid.UUID(int=...)` does, so keys made from integers order as the integers.
 
-The examples below share these three handles:
+The examples below share these handles:
 
 ```c
-ustore_database_t db = NULL;
-ustore_status_t status = {0};
+ustore_database_t database = NULL;
+ustore_executor_t executor = NULL;
+ustore_outcome_t outcome = {0};
 ustore_arena_t arena = NULL;
 ```
+
+### Executors, Blocking and Deferred Calls
+
+An executor owns the threads that run calls and the scratch they use, and a `NULL` executor runs a call on the calling thread.
+A call blocks by default and returns with its outcome final, while `ustore_completion_deferred_k` returns once the call is queued:
+
+```c
+ustore_executor_for_ram(&(ustore_executor_for_ram_t){.executor = &executor, .outcome = &outcome, .threads = 0});
+
+ustore_outcome_t outcomes[4] = {{0}};
+for (size_t i = 0; i != 4; ++i) {
+    reads[i].executor = executor, reads[i].outcome = &outcomes[i];
+    reads[i].completion = ustore_completion_deferred_k;
+    ustore_read(&reads[i]);
+}
+for (size_t i = 0; i != 4; ++i) ustore_outcome_wait(&outcomes[i]);
+```
+
+A deferred call's status reads `ustore_status_pending_k` until it ends; the library then stores the message and the final status with release ordering and touches nothing the struct names after that, and the caller reads it with acquire ordering, by waiting or polling.
+Calls on one executor run in submission order, and a deferred submission that finds the executor's in-flight table full finishes at once with `ustore_status_contended_k`.
+A call stops early only when its progress callback returns `ustore_cancel_k`.
 
 ### Opening the Database
 
 ```c
 #include <ustore/ustore.h>
 
-ustore_database_init_rocksdb_t init = {
-    .db = &db,
-    .error = &error,
+ustore_database_init_rocksdb(&(ustore_database_init_rocksdb_t){
+    .database = &database,
+    .outcome = &outcome,
     .directory = "/var/lib/ustore",
-};
-ustore_database_init_rocksdb(&init);
-if (error.status != ustore_success_k)
-    fprintf(stderr, "%s\n", error.message);
+});
+if (outcome.status != ustore_status_success_k)
+    fprintf(stderr, "%s: %s\n", ustore_status_name(outcome.status), outcome.message);
 
 ustore_arena_free(arena);
-ustore_database_free(db);
+ustore_database_free(database);
+ustore_executor_free(executor);
 ```
 
 Each engine opens through its own call, `ustore_database_init_ram`, `_rocksdb`, `_leveldb` or `_nvme`, whose arguments hold what that engine can be asked, and a zero field keeps the engine's default.
 Every freeing function accepts `NULL`.
-`ustore_database_capabilities` reports whether the engine supports transactions, collections and snapshots.
+`ustore_database_describe` fills a `ustore_database_description_t`, whose `capabilities` say whether the engine supports transactions, collections and snapshots.
 
 ### Collections
 
@@ -93,22 +117,20 @@ A collection is created with an optional name and the `ustore_modality_t` it hol
 
 ```c
 ustore_collection_id_t movies = {0};
-ustore_collection_create_t create = {
-    .db = db,
-    .error = &error,
+ustore_collection_create(&(ustore_collection_create_t){
+    .database = database,
+    .outcome = &outcome,
     .name = "movies",
     .modality = ustore_modality_docs_k,
     .collection = &movies,
-};
-ustore_collection_create(&create);
+});
 
-ustore_collection_drop_t drop = {
-    .db = db,
-    .error = &error,
+ustore_collection_drop(&(ustore_collection_drop_t){
+    .database = database,
+    .outcome = &outcome,
     .collection = movies,
     .mode = ustore_drop_keys_vals_handle_k,
-};
-ustore_collection_drop(&drop);
+});
 ```
 
 Each engine records names apart from every collection, so no identifier reaches them, and a name resolves in two phases: once through `ustore_collection_find`, which answers the identifier and the modality of every name of a batch at the head or at a snapshot, and by identifier from then on, as no other call carries one.
@@ -116,50 +138,32 @@ A create records the name in the same step as the collection, refusing a name an
 The main collection is never removed, so only `ustore_drop_keys_vals_k` and `ustore_drop_vals_k` apply to it, and dropping any other collection whole forgets its name before the collection goes.
 `ustore_collection_list` exports the identifier of every other collection and, where asked, its modality and its name, which is empty for a collection created without one.
 
-### Writes
+### Writes and Removals
 
 For task `index`, `ustore_write` slices the written value out of its strided arrays like this:
 
 ```c
 ustore_bytes_cptr_t chunk = *(ustore_bytes_cptr_t const*)((char const*)values + values_stride * index);
-ustore_length_t offset = offsets ? *(ustore_length_t const*)((char const*)offsets + offsets_stride * index) : 0;
+ustore_length_t start = starts ? *(ustore_length_t const*)((char const*)starts + starts_stride * index) : 0;
 ustore_length_t length = *(ustore_length_t const*)((char const*)lengths + lengths_stride * index);
 ```
 
-The value is `length` bytes starting at `chunk + offset`.
-Without `lengths`, each length comes from consecutive `offsets`, and without either it comes from a null terminator.
+The value is `length` bytes starting at `chunk + start`.
+Without `lengths`, each value ends where the next one starts, so `starts` then holds `count + 1` entries, the last one closing the final value.
 A single write looks like this:
 
 ```c
 ustore_key_t key = {.uuid.bytes[15] = 42};
 ustore_bytes_cptr_t value = (ustore_bytes_cptr_t)"meaning of life";
-ustore_write_t write = {
-    .db = db,
-    .error = &error,
-    .arena = &arena,
-    .tasks_count = 1,
+ustore_length_t length = 15;
+ustore_write(&(ustore_write_t){
+    .database = database,
+    .outcome = &outcome,
+    .count = 1,
     .keys = &key,
     .values = &value,
-};
-ustore_write(&write);
-```
-
-A batch passes arrays with their strides:
-
-```c
-ustore_key_t keys[2] = {{.uuid.bytes[15] = 42}, {.uuid.bytes[15] = 43}};
-ustore_bytes_cptr_t values[2] = {(ustore_bytes_cptr_t)"meaning of life", (ustore_bytes_cptr_t)"is unknown"};
-ustore_write_t write = {
-    .db = db,
-    .error = &error,
-    .arena = &arena,
-    .tasks_count = 2,
-    .keys = keys,
-    .keys_stride = sizeof(ustore_key_t),
-    .values = values,
-    .values_stride = sizeof(ustore_bytes_cptr_t),
-};
-ustore_write(&write);
+    .lengths = &length,
+});
 ```
 
 Strides let the same batch come from an array of structures without copying it into separate arrays:
@@ -168,57 +172,60 @@ Strides let the same batch come from an array of structures without copying it i
 typedef struct pair_t {
     ustore_key_t key;
     ustore_bytes_cptr_t value;
+    ustore_length_t length;
 } pair_t;
 
 pair_t pairs[2] = {
-    {{.uuid.bytes[15] = 42}, (ustore_bytes_cptr_t)"meaning of life"},
-    {{.uuid.bytes[15] = 43}, (ustore_bytes_cptr_t)"is unknown"},
+    {{.uuid.bytes[15] = 42}, (ustore_bytes_cptr_t)"meaning of life", 15},
+    {{.uuid.bytes[15] = 43}, (ustore_bytes_cptr_t)"is unknown", 10},
 };
-ustore_write_t write = {
-    .db = db,
-    .error = &error,
-    .arena = &arena,
-    .tasks_count = 2,
+ustore_write(&(ustore_write_t){
+    .database = database,
+    .outcome = &outcome,
+    .count = 2,
     .keys = &pairs[0].key,
     .keys_stride = sizeof(pair_t),
     .values = &pairs[0].value,
     .values_stride = sizeof(pair_t),
-};
-ustore_write(&write);
+    .lengths = &pairs[0].length,
+    .lengths_stride = sizeof(pair_t),
+});
 ```
 
-A `NULL` chunk removes its key, and `.values = NULL` removes every key of the batch.
-A batch is atomic: if one task fails, none is applied.
+Removing keys is its own call, so no `NULL` value ever deletes:
 
-### Reads
+```c
+ustore_remove(&(ustore_remove_t){.database = database, .outcome = &outcome, .count = 1, .keys = &key});
+```
+
+A batch is atomic: if one task fails, none is applied.
+`durability` chooses whether the call returns once the write is buffered or once it is flushed.
+
+### Reads and Arenas
+
+Outputs whose size the inputs bound land in the caller's spans, like `count + 1` offsets or a bitmap of presences.
+Outputs only the call can size, like the values themselves, land in an arena: memory UStore allocates and the caller passes back to the next call, which rewinds and reuses it, growing only when the new outputs outsize everything it held.
 
 ```c
 ustore_key_t key = {.uuid.bytes[15] = 42};
-ustore_bytes_ptr_t values = NULL;
-ustore_length_t* lengths = NULL;
-ustore_read_t read = {
-    .db = db,
-    .error = &error,
-    .arena = &arena,
-    .tasks_count = 1,
+ustore_length_t offsets[2];
+ustore_byte_t* values = NULL;
+ustore_read(&(ustore_read_t){
+    .database = database,
+    .outcome = &outcome,
+    .count = 1,
     .keys = &key,
-    .lengths = &lengths,
+    .offsets = offsets,
     .values = &values,
-};
-ustore_read(&read);
-assert(lengths[0] == 15 && memcmp(values, "meaning of life", lengths[0]) == 0);
+    .arena = &arena,
+});
+assert(offsets[1] - offsets[0] == 15 && memcmp(values + offsets[0], "meaning of life", 15) == 0);
 ```
 
-Every output is optional, so a read that leaves `.values` out exports only lengths, and `.presences` exports a bitmap of the keys that are present.
-A missing key reads with the length `ustore_length_missing_k`.
-
-#### Offsets, Lengths and Tapes
-
-Exported values are joined into one tape instead of being allocated one by one.
-
-- With only `offsets`, entries follow in order without gaps, and `tasks_count + 1` offsets are exported so the last length can be inferred; empty and missing entries look alike unless `presences` are requested too.
-- With only `lengths`, entries follow in order without gaps.
-- With both, entries may sit in the tape in any order.
+Values are joined into one tape as Apache Arrow lays them out: `count + 1` offsets, the last one closing the final value, and the bytes end to end.
+Every output is optional, so a read that leaves `.values` out exports only offsets, and `.presences` exports a bitmap of the keys that are present.
+The outputs stay valid until the next call that takes `&arena`; to keep them past it, pass that call another arena.
+An arena serves one call at a time, and a call whose inputs point into the arena it is about to rewind refuses with `ustore_status_invalid_argument_k`.
 
 ### Scans
 
@@ -227,68 +234,65 @@ Exported values are joined into one tape instead of being allocated one by one.
 ```c
 ustore_key_t start = {0};
 ustore_length_t limit = 100;
-ustore_length_t* counts = NULL;
-ustore_key_t* found = NULL;
-ustore_scan_t scan = {
-    .db = db,
-    .error = &error,
-    .arena = &arena,
-    .tasks_count = 1,
+ustore_length_t offsets[2];
+ustore_key_t found[100];
+ustore_scan(&(ustore_scan_t){
+    .database = database,
+    .outcome = &outcome,
+    .count = 1,
     .start_keys = &start,
     .count_limits = &limit,
-    .counts = &counts,
-    .keys = &found,
-};
-ustore_scan(&scan);
+    .offsets = offsets,
+    .keys = found,
+});
 ```
 
 The next page starts from the key right after the last exported one, its 16 bytes incremented as one big-endian integer, and a `ustore_read` of the found keys fetches their values.
-`ustore_sample` draws keys uniformly at random, and `ustore_measure` bounds the cardinality, value bytes and disk usage between two keys from below and above.
+`ustore_scan_bulk_k` trades key order for throughput, `ustore_sample` draws keys uniformly at random, and `ustore_measure` bounds the cardinality, value bytes and disk usage between two keys from below and above.
 
-### Transactions
+### Transactions and Views
 
 A transaction groups reads and writes across collections and modalities, and commits all of them or none.
-Reads inside it register their keys, and the commit fails if another writer changed any of them since; `ustore_option_transaction_dont_watch_k` skips that registration.
+Writes take the transaction itself, while reads take a view of it, which also chooses whether the read registers its keys so the commit fails if another writer changed them since:
 
 ```c
 ustore_transaction_t transaction = NULL;
-ustore_transaction_init_t transaction_init = {
-    .db = db,
-    .error = &error,
+ustore_transaction_init(&(ustore_transaction_init_t){
     .transaction = &transaction,
-};
-ustore_transaction_init(&transaction_init);
+    .database = database,
+    .outcome = &outcome,
+});
 
-write.transaction = transaction;
-ustore_write(&write);
+ustore_write(&(ustore_write_t){.database = database, .outcome = &outcome, .transaction = transaction, /* ... */});
+ustore_read(&(ustore_read_t){
+    .database = database, .outcome = &outcome,
+    .view = ustore_transaction_view(transaction, ustore_watch_keys_k), /* ... */});
 
-ustore_transaction_commit_t commit = {
-    .db = db,
-    .error = &error,
+ustore_transaction_commit(&(ustore_transaction_commit_t){
+    .database = database,
+    .outcome = &outcome,
     .transaction = transaction,
-};
-ustore_transaction_commit(&commit);
+});
 ustore_transaction_free(transaction);
 ```
 
-A failed commit keeps the contents of the transaction for a retry, and `ustore_transaction_init` on an existing handle resets it while reusing its memory.
+A failed commit keeps the contents of the transaction for a retry, and `ustore_transaction_rollback` drops them while keeping the handle.
 `ustore_transaction_stage` stages the transaction for a two-phase commit, and both calls can export the `ustore_stamp_t` they took.
 
 ### Snapshots
 
-A snapshot is an opaque handle, like a transaction, pinning a point-in-time view of the whole database that reads select through their `snapshot` argument, never beside a `transaction`:
+A snapshot pins a point-in-time view of the whole database, and reads select it through `ustore_snapshot_view`, so a read can name a transaction or a snapshot but never both:
 
 ```c
 ustore_snapshot_t snapshot = NULL;
-ustore_snapshot_init_t snapshot_init = {
-    .db = db,
-    .error = &error,
+ustore_snapshot_init(&(ustore_snapshot_init_t){
     .snapshot = &snapshot,
-};
-ustore_snapshot_init(&snapshot_init);
+    .database = database,
+    .outcome = &outcome,
+});
 
-read.snapshot = snapshot;
-ustore_read(&read);
+ustore_read(&(ustore_read_t){
+    .database = database, .outcome = &outcome, .view = ustore_snapshot_view(snapshot), /* ... */});
 
 ustore_snapshot_free(snapshot);
 ```
@@ -302,7 +306,7 @@ TODO: persistent snapshots, recorded in the catalog under UUIDv7 identifiers and
 A document collection stores JSON text, so reading a document back through `ustore_read` may not return the exact bytes written.
 A field addresses a value inside a document, either as a top-level key such as `_id` or as an RFC 6901 JSON Pointer such as `/posts/0/text`.
 
-- `ustore_docs_write` upserts, updates or inserts whole documents or fields, or applies RFC 6902 patches or RFC 7386 merge patches, as its `modification` selects.
+- `ustore_docs_write` upserts, updates or inserts whole documents or fields, or applies RFC 6902 patches or RFC 7386 merge patches, as its `modification` selects; whole documents are removed with `ustore_remove`.
 - `ustore_docs_read` reads whole documents or fields, as JSON or as values printed into text.
 - `ustore_docs_gist` lists the unique JSON Pointers to the leaves of the requested documents.
 - `ustore_docs_gather` reads many fields of many documents into typed columns, with validity, conversion and collision bitmaps per column.
@@ -310,36 +314,33 @@ A field addresses a value inside a document, either as a top-level key such as `
 ```c
 ustore_key_t key = {.uuid.bytes[15] = 1};
 ustore_str_view_t document = "{\"person\": \"Alice\", \"age\": 27}";
-ustore_docs_write_t docs_write = {
-    .db = db,
-    .error = &error,
-    .arena = &arena,
-    .tasks_count = 1,
+ustore_length_t document_length = 30;
+ustore_docs_write(&(ustore_docs_write_t){
+    .database = database,
+    .outcome = &outcome,
+    .count = 1,
     .type = ustore_doc_field_json_k,
     .modification = ustore_doc_modify_upsert_k,
     .keys = &key,
     .values = (ustore_bytes_cptr_t const*)&document,
-};
-ustore_docs_write(&docs_write);
+    .lengths = &document_length,
+});
 
 ustore_str_view_t field = "/person";
-ustore_bytes_ptr_t person = NULL;
-ustore_length_t* lengths = NULL;
-ustore_docs_read_t docs_read = {
-    .db = db,
-    .error = &error,
-    .arena = &arena,
+ustore_length_t offsets[2];
+ustore_byte_t* person = NULL;
+ustore_docs_read(&(ustore_docs_read_t){
+    .database = database,
+    .outcome = &outcome,
     .type = ustore_doc_field_str_k,
-    .tasks_count = 1,
+    .count = 1,
     .keys = &key,
     .fields = &field,
-    .lengths = &lengths,
+    .offsets = offsets,
     .values = &person,
-};
-ustore_docs_read(&docs_read);
+    .arena = &arena,
+});
 ```
-
-Without `keys`, `ustore_docs_write` reads the key of every document from its `id_field`, which must hold a non-negative integer or a UUID in canonical text.
 
 ### Graphs
 
@@ -357,58 +358,59 @@ Several edges between the same two vertices need distinct edge identifiers, and 
 typedef struct triplet_t {
     ustore_key_t source;
     ustore_key_t target;
-    ustore_key_t id;
+    ustore_key_t edge;
 } triplet_t;
 
 ustore_collection_id_t graph;
-ustore_collection_create_t create = {
-    .db = db,
-    .error = &error,
+ustore_collection_create(&(ustore_collection_create_t){
+    .database = database,
+    .outcome = &outcome,
     .modality = ustore_modality_graph_k,
     .collection = &graph,
-};
-ustore_collection_create(&create);
+});
 
 triplet_t triplets[2] = {
     {{.uuid.bytes[15] = 1}, {.uuid.bytes[15] = 2}, {.uuid.bytes[15] = 9}},
     {{.uuid.bytes[15] = 2}, {.uuid.bytes[15] = 3}, {.uuid.bytes[15] = 10}},
 };
-ustore_graph_upsert_edges_t upsert = {
-    .db = db,
-    .error = &error,
-    .arena = &arena,
-    .tasks_count = 2,
+ustore_graph_upsert_edges(&(ustore_graph_upsert_edges_t){
+    .database = database,
+    .outcome = &outcome,
+    .count = 2,
     .collections = &graph,
-    .edges_ids = &triplets[0].id,
+    .edges = &triplets[0].edge,
     .edges_stride = sizeof(triplet_t),
-    .sources_ids = &triplets[0].source,
+    .sources = &triplets[0].source,
     .sources_stride = sizeof(triplet_t),
-    .targets_ids = &triplets[0].target,
+    .targets = &triplets[0].target,
     .targets_stride = sizeof(triplet_t),
-};
-ustore_graph_upsert_edges(&upsert);
+});
 
 ustore_key_t vertex = {.uuid.bytes[15] = 2};
 ustore_vertex_role_t role = ustore_vertex_role_any_k;
-ustore_vertex_degree_t* degrees = NULL;
+ustore_vertex_degree_t degree = 0;
 ustore_key_t* edges = NULL;
-ustore_graph_find_edges_t find = {
-    .db = db,
-    .error = &error,
-    .arena = &arena,
-    .tasks_count = 1,
+ustore_graph_find_edges(&(ustore_graph_find_edges_t){
+    .database = database,
+    .outcome = &outcome,
+    .count = 1,
     .collections = &graph,
     .vertices = &vertex,
     .roles = &role,
-    .degrees_per_vertex = &degrees,
+    .degrees_per_vertex = &degree,
     .edges_per_vertex = &edges,
-};
-ustore_graph_find_edges(&find);
+    .arena = &arena,
+});
 ```
 
 Every found edge takes three keys of `edges`: its source, its target and its identifier.
 Outgoing edges come first, sorted by target, then incoming edges, sorted by source, and a missing vertex has the degree `ustore_vertex_degree_missing_k`.
 Roles matter only in directed graphs, where `ustore_vertex_source_k` and `ustore_vertex_target_k` select one direction.
+
+### Pages
+
+A pages collection stores ordered documents, edited by one verb per kind of edit, each taking only its own fields: `ustore_pages_import`, `_insert`, `_remove`, `_move`, `_splice`, `_set_attributes` and `_remove_attributes`.
+`ustore_pages_read` reads documents back into an arena, and `ustore_pages_history` lists the edits that produced them.
 
 ## C++ Interface
 
