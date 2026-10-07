@@ -15,30 +15,33 @@
 #include <type_traits> // `std::is_nothrow_move_constructible_v`, `std::remove_cvref_t`, `std::type_identity`
 #include <utility>     // `std::cmp_equal`, `std::move`
 
-#include "ustore/db.h" // `ustore_status_t`, `ustore_error_t`
+#include "ustore/types.h" // `ustore_status_t`, `ustore_outcome_t`
 
 namespace unum::ustore {
 
 /** What went wrong, with one enumerator per @c ustore_status_t that the C header documents. */
 enum class status_code_t : int {
-    success_k = ustore_success_k,
-    out_of_memory_k = ustore_error_out_of_memory_k,
-    invalid_argument_k = ustore_error_invalid_argument_k,
-    uninitialized_k = ustore_error_uninitialized_k,
-    unsupported_k = ustore_error_unsupported_k,
-    input_output_k = ustore_error_io_k,
-    malformed_k = ustore_error_malformed_k,
-    not_found_k = ustore_error_not_found_k,
-    already_exists_k = ustore_error_already_exists_k,
-    write_conflict_k = ustore_error_write_conflict_k,
-    read_conflict_k = ustore_error_read_conflict_k,
-    phantom_conflict_k = ustore_error_phantom_conflict_k,
-    capacity_exhausted_k = ustore_error_capacity_exhausted_k,
-    device_k = ustore_error_device_k,
-    internal_k = ustore_error_internal_k,
+    success_k = ustore_status_success_k,
+    out_of_memory_k = ustore_status_out_of_memory_k,
+    invalid_argument_k = ustore_status_invalid_argument_k,
+    uninitialized_k = ustore_status_uninitialized_k,
+    unsupported_k = ustore_status_unsupported_k,
+    input_output_k = ustore_status_io_k,
+    malformed_k = ustore_status_malformed_k,
+    not_found_k = ustore_status_not_found_k,
+    already_exists_k = ustore_status_already_exists_k,
+    write_conflict_k = ustore_status_write_conflict_k,
+    read_conflict_k = ustore_status_read_conflict_k,
+    phantom_conflict_k = ustore_status_phantom_conflict_k,
+    capacity_exhausted_k = ustore_status_capacity_exhausted_k,
+    device_k = ustore_status_device_k,
+    internal_k = ustore_status_internal_k,
+    pending_k = ustore_status_pending_k,
+    contended_k = ustore_status_contended_k,
+    cancelled_k = ustore_status_cancelled_k,
 };
 
-/** The C++ twin of @c ustore_error_t: a code and a static message, @c nullptr on success. */
+/** The C++ twin of @c ustore_outcome_t: a code and a static message, @c nullptr on success. */
 struct [[nodiscard]] status_t {
 
     /** What went wrong, or @c status_code_t::success_k. */
@@ -49,11 +52,11 @@ struct [[nodiscard]] status_t {
 
     constexpr status_t() noexcept = default;
     constexpr status_t(status_code_t reason, char const* detail = nullptr) noexcept : code(reason), message(detail) {}
-    constexpr status_t(ustore_error_t const& error) noexcept
-        : code(static_cast<status_code_t>(error.status)), message(error.message) {}
+    constexpr status_t(ustore_outcome_t const& outcome) noexcept
+        : code(static_cast<status_code_t>(outcome.status)), message(outcome.message) {}
 
-    /** The same status as the C ABI spells it, for writing into an argument struct. */
-    constexpr operator ustore_error_t() const noexcept { return {static_cast<ustore_status_t>(code), message}; }
+    /** The same status as the C ABI spells it, for writing into an outcome. */
+    constexpr operator ustore_outcome_t() const noexcept { return {static_cast<ustore_status_t>(code), message}; }
 
     constexpr bool succeeded() const noexcept { return code == status_code_t::success_k; }
     constexpr bool failed() const noexcept { return code != status_code_t::success_k; }

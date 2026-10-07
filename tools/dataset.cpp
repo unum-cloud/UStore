@@ -11,8 +11,11 @@
 #include <cstdlib> // `std::free`
 #include <cstring> // `std::strcmp`
 
+#include <array>        // `std::array`
 #include <charconv>     // `std::from_chars`, `std::to_chars`
 #include <limits>       // `std::numeric_limits`
+#include <memory>       // `std::unique_ptr`
+#include <new>          // `std::nothrow`
 #include <span>         // `std::span`
 #include <string_view>  // `std::string_view`
 #include <system_error> // `std::errc`
@@ -22,10 +25,11 @@
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 #include <stringzilla/stringzilla.hpp> // `sz::string_t`, `sz::string_view_t`
 
-#include "ustore/blobs.h"   // `ustore_scan_t`, `ustore_read_t`
-#include "ustore/docs.h"    // `ustore_docs_write_t`, `ustore_docs_read_t`
-#include "ustore/graph.h"   // `ustore_graph_upsert_edges_t`
-#include "ustore/types.hpp" // `sz`, `st`
+#include "ustore/blobs.h"    // `ustore_scan_t`
+#include "ustore/docs.h"     // `ustore_docs_write_t`, `ustore_docs_read_t`
+#include "ustore/graph.h"    // `ustore_graph_upsert_edges_t`
+#include "ustore/ranges.hpp" // `bits_view_t`
+#include "ustore/types.hpp"  // `sz`, `st`
 
 #include "dataset.h"                  // `ustore_docs_import_t`, `ustore_graph_export_t`
 #include "helpers/blocking_files.hpp" // `mapped_file_t`
@@ -49,6 +53,11 @@ enum class dataset_format_t {
     return dataset_format_t::unknown_k;
 }
 
+/** Whether @p outcome already holds a failure, which every later step of a task skips past. */
+[[nodiscard]] bool failed(ustore_outcome_t const* outcome) noexcept {
+    return outcome->status != ustore_status_success_k;
+}
+
 /** A file written through a buffer that is flushed whenever it reaches a byte threshold. */
 class output_file_t {
     std::FILE* file_ = nullptr;
@@ -63,53 +72,53 @@ class output_file_t {
         if (file_) { [[maybe_unused]] int const closed = std::fclose(file_); }
     }
 
-    /** Creates or truncates @p path, reporting a failure into @p error. */
-    void create(ustore_str_view_t path, std::size_t threshold, ustore_error_t* error) noexcept {
+    /** Creates or truncates @p path, reporting a failure into @p outcome. */
+    void create(ustore_str_view_t path, std::size_t threshold, ustore_outcome_t* outcome) noexcept {
         file_ = std::fopen(path, "wb");
         threshold_ = threshold;
-        if (!file_) *error = {ustore_error_io_k, "Failed to create the output file"};
+        if (!file_) *outcome = {ustore_status_io_k, "Failed to create the output file"};
     }
 
-    /** Buffers @p text, writing the buffer out once it reaches the threshold; does nothing after an error. */
-    void append(std::string_view text, ustore_error_t* error) noexcept {
-        if (error->status) return;
-        if (!buffer_.try_append(text.data(), text.size())) {
-            *error = {ustore_error_out_of_memory_k, "Failed to buffer the output"};
+    /** Buffers @p text, writing the buffer out once it reaches the threshold; does nothing after a failure. */
+    void append(std::string_view text, ustore_outcome_t* outcome) noexcept {
+        if (failed(outcome)) return;
+        if (buffer_.try_append(text.data(), text.size()) != sz::status_t::success_k) {
+            *outcome = {ustore_status_out_of_memory_k, "Failed to buffer the output"};
             return;
         }
-        if (buffer_.size() >= threshold_) flush(error);
+        if (buffer_.size() >= threshold_) flush(outcome);
     }
 
     /** Buffers @p key as the decimal digits of the integer it spells, or as quoted UUID text when it spells none. */
-    void append_key(ustore_key_t key, ustore_error_t* error) noexcept {
+    void append_key(ustore_key_t key, ustore_outcome_t* outcome) noexcept {
         if (auto [integer, integer_status] = uuid_to_integer(key.uuid); integer_status.succeeded()) {
             char digits[24];
             std::to_chars_result const printed = std::to_chars(digits, digits + sizeof(digits), integer);
-            append({digits, static_cast<std::size_t>(printed.ptr - digits)}, error);
+            append({digits, static_cast<std::size_t>(printed.ptr - digits)}, outcome);
             return;
         }
         char quoted[uuid_text_length_k + 2];
         quoted[0] = '"';
         uuid_to_text(key.uuid, std::span(quoted).subspan<1, uuid_text_length_k>());
         quoted[uuid_text_length_k + 1] = '"';
-        append({quoted, sizeof(quoted)}, error);
+        append({quoted, sizeof(quoted)}, outcome);
     }
 
-    /** Writes the whole buffer out and empties it, reporting a short or failed write into @p error. */
-    void flush(ustore_error_t* error) noexcept {
+    /** Writes the whole buffer out and empties it, reporting a short or failed write into @p outcome. */
+    void flush(ustore_outcome_t* outcome) noexcept {
         if (std::fwrite(buffer_.data(), 1, buffer_.size(), file_) != buffer_.size()) {
-            *error = {ustore_error_io_k, "Failed to write the output file"};
+            *outcome = {ustore_status_io_k, "Failed to write the output file"};
             return;
         }
         buffer_.clear();
     }
 
-    /** Flushes the buffer and closes the file, reporting either failure into @p error. */
-    void finish(ustore_error_t* error) noexcept {
-        if (!error->status) flush(error);
+    /** Flushes the buffer and closes the file, reporting either failure into @p outcome. */
+    void finish(ustore_outcome_t* outcome) noexcept {
+        if (!failed(outcome)) flush(outcome);
         int const closed = std::fclose(file_);
         file_ = nullptr;
-        if (closed != 0 && !error->status) *error = {ustore_error_io_k, "Failed to close the output file"};
+        if (closed != 0 && !failed(outcome)) *outcome = {ustore_status_io_k, "Failed to close the output file"};
     }
 };
 
@@ -229,23 +238,24 @@ void place(yyjson_mut_doc* builder, yyjson_mut_val* root, ustore_str_view_t fiel
 }
 
 /** Serializes the root of @p builder into @p output. */
-void append_json(yyjson_mut_doc* builder, sz::string_t& output, ustore_error_t* error) noexcept {
+void append_json(yyjson_mut_doc* builder, sz::string_t& output, ustore_outcome_t* outcome) noexcept {
     std::size_t length = 0;
     json_text_t const text {yyjson_mut_write(builder, 0, &length)};
     if (!text.handle) {
-        *error = {ustore_error_out_of_memory_k, "Failed to serialize the document"};
+        *outcome = {ustore_status_out_of_memory_k, "Failed to serialize the document"};
         return;
     }
-    if (!output.try_append(text.handle, length)) *error = {ustore_error_out_of_memory_k, "Failed to buffer a document"};
+    if (output.try_append(text.handle, length) != sz::status_t::success_k)
+        *outcome = {ustore_status_out_of_memory_k, "Failed to buffer a document"};
 }
 
 /** Serializes the @p fields of @p document into @p output, nesting JSON pointers into objects and skipping missing
- * fields. */
-void project(yyjson_val* document, field_list_t fields, sz::string_t& output, ustore_error_t* error) noexcept {
+ *  fields. */
+void project(yyjson_val* document, field_list_t fields, sz::string_t& output, ustore_outcome_t* outcome) noexcept {
     json_builder_t const builder {yyjson_mut_doc_new(nullptr)};
     yyjson_mut_val* const root = builder.handle ? yyjson_mut_obj(builder.handle) : nullptr;
     if (!root) {
-        *error = {ustore_error_out_of_memory_k, "Failed to allocate a JSON document"};
+        *outcome = {ustore_status_out_of_memory_k, "Failed to allocate a JSON document"};
         return;
     }
     yyjson_mut_doc_set_root(builder.handle, root);
@@ -253,7 +263,7 @@ void project(yyjson_val* document, field_list_t fields, sz::string_t& output, us
         yyjson_val* const value = lookup(document, fields[index]);
         if (value) place(builder.handle, root, fields[index], value);
     }
-    append_json(builder.handle, output, error);
+    append_json(builder.handle, output, outcome);
 }
 
 #pragma endregion JSON
@@ -306,12 +316,13 @@ class csv_reader_t {
             while (true) {
                 std::size_t const quote = text_.find('"', cursor);
                 if (quote >= size) return csv_boundary_t::malformed_k;
-                if (!unquoted_.try_append(data + cursor, quote - cursor)) return csv_boundary_t::malformed_k;
+                if (unquoted_.try_append(data + cursor, quote - cursor) != sz::status_t::success_k)
+                    return csv_boundary_t::malformed_k;
                 if (quote + 1 == size || data[quote + 1] != '"') {
                     position_ = quote + 1;
                     break;
                 }
-                if (!unquoted_.try_push_back('"')) return csv_boundary_t::malformed_k;
+                if (unquoted_.try_push_back('"') != sz::status_t::success_k) return csv_boundary_t::malformed_k;
                 cursor = quote + 2;
             }
             field = unquoted_;
@@ -340,16 +351,16 @@ struct csv_column_t {
 
 /** Reads the header record into @p names and @p columns, keeping the columns @p fields names, or all without fields. */
 void read_header(csv_reader_t& reader, field_list_t fields, sz::string_t& names,
-                 st::basic_vector<csv_column_t>& columns, ustore_error_t* error) noexcept {
+                 st::basic_vector<csv_column_t>& columns, ustore_outcome_t* outcome) noexcept {
     if (!reader.has_record()) {
-        *error = {ustore_error_malformed_k, "The CSV file has no header"};
+        *outcome = {ustore_status_malformed_k, "The CSV file has no header"};
         return;
     }
     for (csv_boundary_t boundary = csv_boundary_t::next_field_k; boundary == csv_boundary_t::next_field_k;) {
         std::string_view name;
         boundary = reader.next(name);
         if (boundary == csv_boundary_t::malformed_k) {
-            *error = {ustore_error_malformed_k, "Malformed CSV header"};
+            *outcome = {ustore_status_malformed_k, "Malformed CSV header"};
             return;
         }
         column_use_t use = fields.count == 0 ? column_use_t::kept_k : column_use_t::skipped_k;
@@ -359,8 +370,9 @@ void read_header(csv_reader_t& reader, field_list_t fields, sz::string_t& names,
             if (field == name) use = column_use_t::kept_k;
         }
         csv_column_t const column {names.size(), name.size(), use};
-        if (!names.try_append(name.data(), name.size()) || st::failed(columns.push_back(csv_column_t {column}))) {
-            *error = {ustore_error_out_of_memory_k, "Failed to allocate the CSV header"};
+        if (names.try_append(name.data(), name.size()) != sz::status_t::success_k ||
+            st::failed(columns.push_back(csv_column_t {column}))) {
+            *outcome = {ustore_status_out_of_memory_k, "Failed to allocate the CSV header"};
             return;
         }
     }
@@ -400,15 +412,15 @@ void read_header(csv_reader_t& reader, field_list_t fields, sz::string_t& names,
 }
 
 /** Writes @p text as one quoted CSV field, doubling the quotes inside. */
-void append_quoted(output_file_t& output, sz::string_view_t text, ustore_error_t* error) noexcept {
-    output.append("\"", error);
+void append_quoted(output_file_t& output, sz::string_view_t text, ustore_outcome_t* outcome) noexcept {
+    output.append("\"", outcome);
     std::string_view separator;
     for (sz::string_view_t segment : sz::split(text, "\"")) {
-        output.append(separator, error);
-        output.append(segment, error);
+        output.append(separator, outcome);
+        output.append(segment, outcome);
         separator = "\"\"";
     }
-    output.append("\"", error);
+    output.append("\"", outcome);
 }
 
 #pragma endregion CSV
@@ -416,30 +428,30 @@ void append_quoted(output_file_t& output, sz::string_view_t text, ustore_error_t
 #pragma region Validation
 
 /** Rejects a partly filled @p fields, and one holding a null name; an empty list keeps whole rows. */
-void validate_fields(field_list_t fields, ustore_error_t* error) noexcept {
+void validate_fields(field_list_t fields, ustore_outcome_t* outcome) noexcept {
     if (fields.count == 0 && !fields.begin) return;
     if (fields.count == 0) {
-        *error = {ustore_error_invalid_argument_k, "Fields count must be set along with fields"};
+        *outcome = {ustore_status_invalid_argument_k, "Fields count must be set along with fields"};
         return;
     }
     if (!fields.begin) {
-        *error = {ustore_error_invalid_argument_k, "Fields must be set along with their count"};
+        *outcome = {ustore_status_invalid_argument_k, "Fields must be set along with their count"};
         return;
     }
     if (fields.stride == 0) {
-        *error = {ustore_error_invalid_argument_k, "Fields stride must be set along with fields"};
+        *outcome = {ustore_status_invalid_argument_k, "Fields stride must be set along with fields"};
         return;
     }
     for (std::size_t index = 0; index != fields.count; ++index) {
         if (!fields[index]) {
-            *error = {ustore_error_invalid_argument_k, "Fields must not be null"};
+            *outcome = {ustore_status_invalid_argument_k, "Fields must not be null"};
             return;
         }
     }
 }
 
 /** Answers whether an exported column name is a letter or underscore followed by letters, digits, spaces, dashes or
- * underscores. */
+ *  underscores. */
 [[nodiscard]] bool is_column_name(ustore_str_view_t name) noexcept {
     auto const is_letter = [](char character) noexcept {
         return (character >= 'A' && character <= 'Z') || (character >= 'a' && character <= 'z') || character == '_';
@@ -478,25 +490,24 @@ class document_batch_t {
     [[nodiscard]] std::size_t bytes() const noexcept { return text_.size(); }
 
     /** Stages the text appended since the previous document as one more document. */
-    void commit(ustore_error_t* error) noexcept {
+    void commit(ustore_outcome_t* outcome) noexcept {
         std::size_t const start = documents_.size() == 0 ? 0 : documents_.back().offset + documents_.back().length;
         auto const length = static_cast<ustore_length_t>(text_.size() - start);
         if (st::failed(documents_.push_back(staged_document_t {start, nullptr, length})))
-            *error = {ustore_error_out_of_memory_k, "Failed to stage a document"};
+            *outcome = {ustore_status_out_of_memory_k, "Failed to stage a document"};
     }
 
     /** Upserts every staged document as one batch and empties the batch. */
-    void flush(ustore_docs_import_t const& task, ustore_arena_t* arena) noexcept {
+    void flush(ustore_docs_import_t const& task) noexcept {
         if (documents_.size() == 0) return;
         for (staged_document_t& document : documents_)
             document.value = reinterpret_cast<ustore_bytes_cptr_t>(text_.data() + document.offset);
 
         ustore_docs_write_t write {};
-        write.db = task.db;
-        write.error = task.error;
-        write.arena = arena;
-        write.options = task.options;
-        write.tasks_count = documents_.size();
+        write.database = task.database;
+        write.outcome = task.outcome;
+        write.durability = task.durability;
+        write.count = documents_.size();
         write.type = ustore_doc_field_json_k;
         write.modification = ustore_doc_modify_upsert_k;
         write.collections = &task.collection;
@@ -513,7 +524,7 @@ class document_batch_t {
 };
 
 /** Imports one document per NDJSON line, whole or projected onto @c task.fields. */
-void import_ndjson_documents(ustore_docs_import_t const& task, sz::string_view_t text, ustore_arena_t* arena) noexcept {
+void import_ndjson_documents(ustore_docs_import_t const& task, sz::string_view_t text) noexcept {
     field_list_t const fields {task.fields, task.fields_stride, task.fields_count};
     document_batch_t batch;
     for (sz::string_view_t line : sz::split(text, "\n")) {
@@ -521,43 +532,43 @@ void import_ndjson_documents(ustore_docs_import_t const& task, sz::string_view_t
         if (row.empty()) continue;
 
         if (fields.count == 0) {
-            if (!batch.text().try_append(row.data(), row.size()))
-                *task.error = {ustore_error_out_of_memory_k, "Failed to buffer a document"};
+            if (batch.text().try_append(row.data(), row.size()) != sz::status_t::success_k)
+                *task.outcome = {ustore_status_out_of_memory_k, "Failed to buffer a document"};
         }
         else {
             json_document_t const document {yyjson_read(row.data(), row.size(), 0)};
             yyjson_val* const root = yyjson_doc_get_root(document.handle);
             if (!yyjson_is_obj(root)) {
-                *task.error = {ustore_error_malformed_k, "The input file holds a line that is not a JSON object"};
+                *task.outcome = {ustore_status_malformed_k, "The input file holds a line that is not a JSON object"};
                 return;
             }
-            project(root, fields, batch.text(), task.error);
+            project(root, fields, batch.text(), task.outcome);
         }
-        if (task.error->status) return;
+        if (failed(task.outcome)) return;
 
-        batch.commit(task.error);
-        if (task.error->status) return;
-        if (batch.bytes() >= task.max_batch_size) batch.flush(task, arena);
-        if (task.error->status) return;
+        batch.commit(task.outcome);
+        if (failed(task.outcome)) return;
+        if (batch.bytes() >= task.max_batch_size) batch.flush(task);
+        if (failed(task.outcome)) return;
     }
-    batch.flush(task, arena);
+    batch.flush(task);
 }
 
 /** Imports one document per CSV record, keeping the columns the header marked kept. */
-void import_csv_documents(ustore_docs_import_t const& task, sz::string_view_t text, ustore_arena_t* arena) noexcept {
+void import_csv_documents(ustore_docs_import_t const& task, sz::string_view_t text) noexcept {
     field_list_t const fields {task.fields, task.fields_stride, task.fields_count};
     csv_reader_t reader {text};
     sz::string_t names;
     st::basic_vector<csv_column_t> columns;
-    read_header(reader, fields, names, columns, task.error);
-    if (task.error->status) return;
+    read_header(reader, fields, names, columns, task.outcome);
+    if (failed(task.outcome)) return;
 
     document_batch_t batch;
     while (reader.has_record()) {
         json_builder_t const builder {yyjson_mut_doc_new(nullptr)};
         yyjson_mut_val* const root = builder.handle ? yyjson_mut_obj(builder.handle) : nullptr;
         if (!root) {
-            *task.error = {ustore_error_out_of_memory_k, "Failed to allocate a JSON document"};
+            *task.outcome = {ustore_status_out_of_memory_k, "Failed to allocate a JSON document"};
             return;
         }
         yyjson_mut_doc_set_root(builder.handle, root);
@@ -567,7 +578,7 @@ void import_csv_documents(ustore_docs_import_t const& task, sz::string_view_t te
             std::string_view field;
             boundary = reader.next(field);
             if (boundary == csv_boundary_t::malformed_k) {
-                *task.error = {ustore_error_malformed_k, "Malformed CSV record"};
+                *task.outcome = {ustore_status_malformed_k, "Malformed CSV record"};
                 return;
             }
             if (index >= columns.size() || columns[index].use == column_use_t::skipped_k) continue;
@@ -575,54 +586,58 @@ void import_csv_documents(ustore_docs_import_t const& task, sz::string_view_t te
                                                             columns[index].length);
             yyjson_mut_val* const value = csv_value(builder.handle, field);
             if (!name || !value || !yyjson_mut_obj_add(root, name, value)) {
-                *task.error = {ustore_error_out_of_memory_k, "Failed to allocate a JSON document"};
+                *task.outcome = {ustore_status_out_of_memory_k, "Failed to allocate a JSON document"};
                 return;
             }
         }
 
-        append_json(builder.handle, batch.text(), task.error);
-        if (task.error->status) return;
-        batch.commit(task.error);
-        if (task.error->status) return;
-        if (batch.bytes() >= task.max_batch_size) batch.flush(task, arena);
-        if (task.error->status) return;
+        append_json(builder.handle, batch.text(), task.outcome);
+        if (failed(task.outcome)) return;
+        batch.commit(task.outcome);
+        if (failed(task.outcome)) return;
+        if (batch.bytes() >= task.max_batch_size) batch.flush(task);
+        if (failed(task.outcome)) return;
     }
-    batch.flush(task, arena);
+    batch.flush(task);
 }
 
 /**
  *  @brief Scans the collection of @p task in key order, handing every batch of keys to @p consume.
  *
  *  Stops at the end of the collection, at the first failure, or once a batch comes back short.
- *  @param[in] task The export task naming the database, the collection, the options and the error.
+ *  @param[in] task The export task naming the database, the collection, the view and the outcome.
  *  @param[in] batch_size Keys one scan returns, which bounds the memory the batch occupies.
- *  @param[in] consume Receives each batch of keys and reports its own failures into the task's error.
+ *  @param[in] consume Receives each batch of keys and reports its own failures into the task's outcome.
  */
 template <typename task_type_, typename consumer_type_>
 void scan_keys(task_type_ const& task, ustore_length_t batch_size, consumer_type_&& consume) noexcept {
-    task_arena_t const scan_arena {nullptr};
+    // Left uninitialized, so a page sized by a large memory limit costs only the pages a scan fills
+    std::unique_ptr<ustore_key_t[]> const page {new (std::nothrow) ustore_key_t[batch_size]};
+    if (!page) {
+        *task.outcome = {ustore_status_out_of_memory_k, "Failed to allocate a page of keys"};
+        return;
+    }
     ustore_key_t start = smallest_key_k;
     while (true) {
-        ustore_length_t* counts = nullptr;
-        ustore_key_t* keys = nullptr;
+        ustore_length_t offsets[2] {};
         ustore_scan_t scan {};
-        scan.db = task.db;
-        scan.error = task.error;
-        scan.arena = scan_arena.get();
-        scan.options = task.options;
-        scan.tasks_count = 1;
+        scan.database = task.database;
+        scan.outcome = task.outcome;
+        scan.view = task.view;
+        scan.count = 1;
         scan.collections = &task.collection;
         scan.start_keys = &start;
         scan.count_limits = &batch_size;
-        scan.counts = &counts;
-        scan.keys = &keys;
+        scan.offsets = offsets;
+        scan.keys = page.get();
         ustore_scan(&scan);
-        if (task.error->status || counts[0] == 0) return;
+        if (failed(task.outcome) || offsets[1] == offsets[0]) return;
 
-        ustore_length_t const count = counts[0];
+        ustore_length_t const count = offsets[1] - offsets[0];
+        ustore_key_t const* const keys = page.get() + offsets[0];
         ustore_key_t const last = keys[count - 1];
         consume(std::span<ustore_key_t const>(keys, count));
-        if (task.error->status || count < batch_size || last == largest_key_k) return;
+        if (failed(task.outcome) || count < batch_size || last == largest_key_k) return;
         start = key_after(last);
     }
 }
@@ -650,38 +665,35 @@ struct edge_row_t {
 };
 
 /** Upserts every staged edge as one batch and empties the batch. */
-void upsert_edges(ustore_graph_import_t const& task, ustore_arena_t* arena,
-                  st::basic_vector<edge_row_t>& edges) noexcept {
+void upsert_edges(ustore_graph_import_t const& task, st::basic_vector<edge_row_t>& edges) noexcept {
     if (edges.size() == 0) return;
     ustore_graph_upsert_edges_t upsert {};
-    upsert.db = task.db;
-    upsert.error = task.error;
-    upsert.arena = arena;
-    upsert.options = task.options;
-    upsert.tasks_count = edges.size();
+    upsert.database = task.database;
+    upsert.outcome = task.outcome;
+    upsert.durability = task.durability;
+    upsert.count = edges.size();
     upsert.collections = &task.collection;
-    upsert.edges_ids = &edges.data()->edge;
+    upsert.edges = &edges.data()->edge;
     upsert.edges_stride = sizeof(edge_row_t);
-    upsert.sources_ids = &edges.data()->source;
+    upsert.sources = &edges.data()->source;
     upsert.sources_stride = sizeof(edge_row_t);
-    upsert.targets_ids = &edges.data()->target;
+    upsert.targets = &edges.data()->target;
     upsert.targets_stride = sizeof(edge_row_t);
     ustore_graph_upsert_edges(&upsert);
     edges.clear();
 }
 
 /** Stages @p edge and upserts the batch once it fills the byte budget of @p task. */
-void stage_edge(ustore_graph_import_t const& task, ustore_arena_t* arena, st::basic_vector<edge_row_t>& edges,
-                edge_row_t edge) noexcept {
+void stage_edge(ustore_graph_import_t const& task, st::basic_vector<edge_row_t>& edges, edge_row_t edge) noexcept {
     if (st::failed(edges.push_back(edge_row_t {edge}))) {
-        *task.error = {ustore_error_out_of_memory_k, "Failed to stage an edge"};
+        *task.outcome = {ustore_status_out_of_memory_k, "Failed to stage an edge"};
         return;
     }
-    if (edges.size() >= items_in(task.max_batch_size, sizeof(edge_row_t))) upsert_edges(task, arena, edges);
+    if (edges.size() >= items_in(task.max_batch_size, sizeof(edge_row_t))) upsert_edges(task, edges);
 }
 
 /** Imports one edge per NDJSON line, reading its vertices and edge from integer fields. */
-void import_ndjson_edges(ustore_graph_import_t const& task, sz::string_view_t text, ustore_arena_t* arena) noexcept {
+void import_ndjson_edges(ustore_graph_import_t const& task, sz::string_view_t text) noexcept {
     st::basic_vector<edge_row_t> edges;
     for (sz::string_view_t line : sz::split(text, "\n")) {
         std::string_view const row = without_carriage_return(line);
@@ -693,30 +705,30 @@ void import_ndjson_edges(ustore_graph_import_t const& task, sz::string_view_t te
         if (!yyjson_is_obj(root) || !read_key(root, task.source_id_field, edge.source) ||
             !read_key(root, task.target_id_field, edge.target) ||
             (task.edge_id_field && !read_key(root, task.edge_id_field, edge.edge))) {
-            *task.error = {ustore_error_malformed_k,
-                           "The input file holds a line without integer or UUID vertex or edge fields"};
+            *task.outcome = {ustore_status_malformed_k,
+                             "The input file holds a line without integer or UUID vertex or edge fields"};
             return;
         }
-        stage_edge(task, arena, edges, edge);
-        if (task.error->status) return;
+        stage_edge(task, edges, edge);
+        if (failed(task.outcome)) return;
     }
-    upsert_edges(task, arena, edges);
+    upsert_edges(task, edges);
 }
 
 /** Imports one edge per CSV record, reading its vertices and edge from the columns the header names. */
-void import_csv_edges(ustore_graph_import_t const& task, sz::string_view_t text, ustore_arena_t* arena) noexcept {
+void import_csv_edges(ustore_graph_import_t const& task, sz::string_view_t text) noexcept {
     csv_reader_t reader {text};
     sz::string_t names;
     st::basic_vector<csv_column_t> columns;
-    read_header(reader, field_list_t {}, names, columns, task.error);
-    if (task.error->status) return;
+    read_header(reader, field_list_t {}, names, columns, task.outcome);
+    if (failed(task.outcome)) return;
 
     std::size_t const source_column = column_index(names, columns, task.source_id_field);
     std::size_t const target_column = column_index(names, columns, task.target_id_field);
     std::size_t const edge_column = task.edge_id_field ? column_index(names, columns, task.edge_id_field)
                                                        : std::numeric_limits<std::size_t>::max();
     if (source_column == columns.size() || target_column == columns.size() || edge_column == columns.size()) {
-        *task.error = {ustore_error_malformed_k, "The CSV header lacks a vertex or edge column"};
+        *task.outcome = {ustore_status_malformed_k, "The CSV header lacks a vertex or edge column"};
         return;
     }
 
@@ -729,7 +741,7 @@ void import_csv_edges(ustore_graph_import_t const& task, sz::string_view_t text,
             std::string_view field;
             boundary = reader.next(field);
             if (boundary == csv_boundary_t::malformed_k) {
-                *task.error = {ustore_error_malformed_k, "Malformed CSV record"};
+                *task.outcome = {ustore_status_malformed_k, "Malformed CSV record"};
                 return;
             }
             if (index == source_column) parsed += csv_key(field, edge.source);
@@ -737,14 +749,14 @@ void import_csv_edges(ustore_graph_import_t const& task, sz::string_view_t text,
             if (index == edge_column) parsed += csv_key(field, edge.edge);
         }
         if (parsed != (task.edge_id_field ? 3u : 2u)) {
-            *task.error = {ustore_error_malformed_k,
-                           "The CSV file holds a record without integer vertex or edge fields"};
+            *task.outcome = {ustore_status_malformed_k,
+                             "The CSV file holds a record without integer vertex or edge fields"};
             return;
         }
-        stage_edge(task, arena, edges, edge);
-        if (task.error->status) return;
+        stage_edge(task, edges, edge);
+        if (failed(task.outcome)) return;
     }
-    upsert_edges(task, arena, edges);
+    upsert_edges(task, edges);
 }
 
 #pragma endregion Graph
@@ -758,47 +770,46 @@ void ustore_docs_import(ustore_docs_import_t* task_pointer) {
     using namespace unum::ustore::tools;
     ustore_docs_import_t const& task = *task_pointer;
 
-    if (!task.db) {
-        *task.error = {ustore_error_uninitialized_k, "Database is uninitialized"};
+    if (!task.database) {
+        *task.outcome = {ustore_status_uninitialized_k, "Database is uninitialized"};
         return;
     }
     field_list_t const fields {task.fields, task.fields_stride, task.fields_count};
-    validate_fields(fields, task.error);
-    if (task.error->status) return;
+    validate_fields(fields, task.outcome);
+    if (failed(task.outcome)) return;
     if (!task.id_field) {
-        *task.error = {ustore_error_invalid_argument_k, "Id field must be initialized"};
+        *task.outcome = {ustore_status_invalid_argument_k, "Id field must be initialized"};
         return;
     }
     if (fields.count != 0) {
         std::size_t index = 0;
         while (index != fields.count && std::strcmp(fields[index], task.id_field) != 0) ++index;
         if (index == fields.count) {
-            *task.error = {ustore_error_invalid_argument_k, "Fields must contain the id field"};
+            *task.outcome = {ustore_status_invalid_argument_k, "Fields must contain the id field"};
             return;
         }
     }
     if (!task.path) {
-        *task.error = {ustore_error_invalid_argument_k, "Null path specified"};
+        *task.outcome = {ustore_status_invalid_argument_k, "Null path specified"};
         return;
     }
     if (task.max_batch_size == 0) {
-        *task.error = {ustore_error_invalid_argument_k, "Max batch size is 0"};
+        *task.outcome = {ustore_status_invalid_argument_k, "Max batch size is 0"};
         return;
     }
     dataset_format_t const format = format_of(task.path);
     if (format == dataset_format_t::unknown_k) {
-        *task.error = {ustore_error_unsupported_k, "Unsupported file format, expected .ndjson or .csv"};
+        *task.outcome = {ustore_status_unsupported_k, "Unsupported file format, expected .ndjson or .csv"};
         return;
     }
 
     auto [file, map_status] = mapped_file_t::map(task.path);
     if (map_status.failed()) {
-        *task.error = map_status;
+        *task.outcome = map_status;
         return;
     }
-    task_arena_t const arena {task.arena};
-    if (format == dataset_format_t::ndjson_k) import_ndjson_documents(task, file.view(), arena.get());
-    else import_csv_documents(task, file.view(), arena.get());
+    if (format == dataset_format_t::ndjson_k) import_ndjson_documents(task, file.view());
+    else import_csv_documents(task, file.view());
 }
 
 void ustore_docs_export(ustore_docs_export_t* task_pointer) {
@@ -806,82 +817,84 @@ void ustore_docs_export(ustore_docs_export_t* task_pointer) {
     using namespace unum::ustore::tools;
     ustore_docs_export_t const& task = *task_pointer;
 
-    if (!task.db) {
-        *task.error = {ustore_error_uninitialized_k, "Database is uninitialized"};
+    if (!task.database) {
+        *task.outcome = {ustore_status_uninitialized_k, "Database is uninitialized"};
         return;
     }
     field_list_t const fields {task.fields, task.fields_stride, task.fields_count};
-    validate_fields(fields, task.error);
-    if (task.error->status) return;
+    validate_fields(fields, task.outcome);
+    if (failed(task.outcome)) return;
     if (!task.path) {
-        *task.error = {ustore_error_invalid_argument_k, "Null path specified"};
+        *task.outcome = {ustore_status_invalid_argument_k, "Null path specified"};
         return;
     }
     if (task.max_batch_size == 0) {
-        *task.error = {ustore_error_invalid_argument_k, "Max batch size is 0"};
+        *task.outcome = {ustore_status_invalid_argument_k, "Max batch size is 0"};
         return;
     }
     dataset_format_t const format = format_of(task.path);
     if (format == dataset_format_t::unknown_k) {
-        *task.error = {ustore_error_unsupported_k, "Unsupported file format, expected .ndjson or .csv"};
+        *task.outcome = {ustore_status_unsupported_k, "Unsupported file format, expected .ndjson or .csv"};
         return;
     }
 
     output_file_t output;
-    output.create(task.path, task.max_batch_size, task.error);
-    if (task.error->status) return;
-    if (format == dataset_format_t::csv_k) output.append("_id,doc\n", task.error);
+    output.create(task.path, task.max_batch_size, task.outcome);
+    if (failed(task.outcome)) return;
+    if (format == dataset_format_t::csv_k) output.append("_id,doc\n", task.outcome);
 
     task_arena_t const arena {task.arena};
     sz::string_t projected;
+    std::array<ustore_length_t, documents_per_read_k + 1> offsets;
+    std::array<ustore_octet_t, divide_round_up<std::size_t>(documents_per_read_k, bits_in_byte_k)> presences;
     auto const export_batch = [&](std::span<ustore_key_t const> keys) noexcept {
-        ustore_length_t* offsets = nullptr;
-        ustore_length_t* lengths = nullptr;
         ustore_bytes_ptr_t values = nullptr;
         ustore_docs_read_t read {};
-        read.db = task.db;
-        read.error = task.error;
-        read.arena = arena.get();
-        read.options = task.options;
-        read.type = ustore_doc_field_json_k;
-        read.tasks_count = keys.size();
+        read.database = task.database;
+        read.outcome = task.outcome;
+        read.view = task.view;
+        read.count = keys.size();
         read.collections = &task.collection;
         read.keys = keys.data();
         read.keys_stride = sizeof(ustore_key_t);
-        read.offsets = &offsets;
-        read.lengths = &lengths;
+        read.presences = presences.data();
+        read.offsets = offsets.data();
         read.values = &values;
+        read.arena = arena.get();
+        read.type = ustore_doc_field_json_k;
         ustore_docs_read(&read);
-        if (task.error->status) return;
+        if (failed(task.outcome)) return;
 
-        for (std::size_t index = 0; index != keys.size() && !task.error->status; ++index) {
-            if (lengths[index] == ustore_length_missing_k) continue;
-            sz::string_view_t document {reinterpret_cast<char const*>(values) + offsets[index], lengths[index]};
+        bits_view_t const present {presences.data()};
+        for (std::size_t index = 0; index != keys.size() && !failed(task.outcome); ++index) {
+            if (!present[index]) continue;
+            sz::string_view_t document {reinterpret_cast<char const*>(values) + offsets[index],
+                                        offsets[index + 1] - offsets[index]};
             while (document.size() != 0 && document[document.size() - 1] == '\n')
                 document = sz::string_view_t(document.data(), document.size() - 1);
             if (fields.count != 0) {
                 json_document_t const parsed {yyjson_read(document.data(), document.size(), 0)};
                 projected.clear();
-                project(yyjson_doc_get_root(parsed.handle), fields, projected, task.error);
+                project(yyjson_doc_get_root(parsed.handle), fields, projected, task.outcome);
                 document = projected.view();
             }
             if (format == dataset_format_t::ndjson_k) {
-                output.append("{\"_id\":", task.error);
-                output.append_key(keys[index], task.error);
-                output.append(",\"doc\":", task.error);
-                output.append(document, task.error);
-                output.append("}\n", task.error);
+                output.append("{\"_id\":", task.outcome);
+                output.append_key(keys[index], task.outcome);
+                output.append(",\"doc\":", task.outcome);
+                output.append(document, task.outcome);
+                output.append("}\n", task.outcome);
             }
             else {
-                output.append_key(keys[index], task.error);
-                output.append(",", task.error);
-                append_quoted(output, document, task.error);
-                output.append("\n", task.error);
+                output.append_key(keys[index], task.outcome);
+                output.append(",", task.outcome);
+                append_quoted(output, document, task.outcome);
+                output.append("\n", task.outcome);
             }
         }
     };
     scan_keys(task, documents_per_read_k, export_batch);
-    output.finish(task.error);
+    output.finish(task.outcome);
 }
 
 void ustore_graph_import(ustore_graph_import_t* task_pointer) {
@@ -889,36 +902,35 @@ void ustore_graph_import(ustore_graph_import_t* task_pointer) {
     using namespace unum::ustore::tools;
     ustore_graph_import_t const& task = *task_pointer;
 
-    if (!task.db) {
-        *task.error = {ustore_error_uninitialized_k, "Database is uninitialized"};
+    if (!task.database) {
+        *task.outcome = {ustore_status_uninitialized_k, "Database is uninitialized"};
         return;
     }
     if (!task.source_id_field || !task.target_id_field) {
-        *task.error = {ustore_error_invalid_argument_k, "Source and target id fields must be initialized"};
+        *task.outcome = {ustore_status_invalid_argument_k, "Source and target id fields must be initialized"};
         return;
     }
     if (!task.path) {
-        *task.error = {ustore_error_invalid_argument_k, "Null path specified"};
+        *task.outcome = {ustore_status_invalid_argument_k, "Null path specified"};
         return;
     }
     if (task.max_batch_size == 0) {
-        *task.error = {ustore_error_invalid_argument_k, "Max batch size is 0"};
+        *task.outcome = {ustore_status_invalid_argument_k, "Max batch size is 0"};
         return;
     }
     dataset_format_t const format = format_of(task.path);
     if (format == dataset_format_t::unknown_k) {
-        *task.error = {ustore_error_unsupported_k, "Unsupported file format, expected .ndjson or .csv"};
+        *task.outcome = {ustore_status_unsupported_k, "Unsupported file format, expected .ndjson or .csv"};
         return;
     }
 
     auto [file, map_status] = mapped_file_t::map(task.path);
     if (map_status.failed()) {
-        *task.error = map_status;
+        *task.outcome = map_status;
         return;
     }
-    task_arena_t const arena {task.arena};
-    if (format == dataset_format_t::ndjson_k) import_ndjson_edges(task, file.view(), arena.get());
-    else import_csv_edges(task, file.view(), arena.get());
+    if (format == dataset_format_t::ndjson_k) import_ndjson_edges(task, file.view());
+    else import_csv_edges(task, file.view());
 }
 
 void ustore_graph_export(ustore_graph_export_t* task_pointer) {
@@ -926,105 +938,113 @@ void ustore_graph_export(ustore_graph_export_t* task_pointer) {
     using namespace unum::ustore::tools;
     ustore_graph_export_t const& task = *task_pointer;
 
-    if (!task.db) {
-        *task.error = {ustore_error_uninitialized_k, "Database is uninitialized"};
+    if (!task.database) {
+        *task.outcome = {ustore_status_uninitialized_k, "Database is uninitialized"};
         return;
     }
     if (!task.source_id_field || !task.target_id_field) {
-        *task.error = {ustore_error_invalid_argument_k, "Source and target id fields must be initialized"};
+        *task.outcome = {ustore_status_invalid_argument_k, "Source and target id fields must be initialized"};
         return;
     }
     if (!is_column_name(task.source_id_field) || !is_column_name(task.target_id_field) ||
         (task.edge_id_field && !is_column_name(task.edge_id_field))) {
-        *task.error = {ustore_error_invalid_argument_k,
-                       "Exported field names start with A-Z, a-z or '_' and hold only A-Z, a-z, 0-9, ' ', '-' or '_'"};
+        *task.outcome = {
+            ustore_status_invalid_argument_k,
+            "Exported field names start with A-Z, a-z or '_' and hold only A-Z, a-z, 0-9, ' ', '-' or '_'"};
         return;
     }
     if (!task.path) {
-        *task.error = {ustore_error_invalid_argument_k, "Null path specified"};
+        *task.outcome = {ustore_status_invalid_argument_k, "Null path specified"};
         return;
     }
     if (task.max_batch_size == 0) {
-        *task.error = {ustore_error_invalid_argument_k, "Max batch size is 0"};
+        *task.outcome = {ustore_status_invalid_argument_k, "Max batch size is 0"};
         return;
     }
     dataset_format_t const format = format_of(task.path);
     if (format == dataset_format_t::unknown_k) {
-        *task.error = {ustore_error_unsupported_k, "Unsupported file format, expected .ndjson or .csv"};
+        *task.outcome = {ustore_status_unsupported_k, "Unsupported file format, expected .ndjson or .csv"};
         return;
     }
 
     output_file_t output;
-    output.create(task.path, task.max_batch_size, task.error);
-    if (task.error->status) return;
+    output.create(task.path, task.max_batch_size, task.outcome);
+    if (failed(task.outcome)) return;
     if (format == dataset_format_t::csv_k) {
-        output.append(task.source_id_field, task.error);
-        output.append(",", task.error);
-        output.append(task.target_id_field, task.error);
+        output.append(task.source_id_field, task.outcome);
+        output.append(",", task.outcome);
+        output.append(task.target_id_field, task.outcome);
         if (task.edge_id_field) {
-            output.append(",", task.error);
-            output.append(task.edge_id_field, task.error);
+            output.append(",", task.outcome);
+            output.append(task.edge_id_field, task.outcome);
         }
-        output.append("\n", task.error);
+        output.append("\n", task.outcome);
+    }
+
+    ustore_length_t const batch_size = items_in(task.max_batch_size, 3 * sizeof(ustore_key_t));
+    std::unique_ptr<ustore_vertex_degree_t[]> const degrees {new (std::nothrow) ustore_vertex_degree_t[batch_size]};
+    if (!degrees) {
+        *task.outcome = {ustore_status_out_of_memory_k, "Failed to allocate the degrees of a batch"};
+        return;
     }
 
     task_arena_t const arena {task.arena};
     ustore_vertex_role_t const role = ustore_vertex_source_k;
     auto const export_batch = [&](std::span<ustore_key_t const> vertices) noexcept {
-        ustore_vertex_degree_t* degrees = nullptr;
         ustore_key_t* edges = nullptr;
         ustore_graph_find_edges_t find {};
-        find.db = task.db;
-        find.error = task.error;
-        find.arena = arena.get();
-        find.options = task.options;
-        find.tasks_count = vertices.size();
+        find.database = task.database;
+        find.outcome = task.outcome;
+        find.view = task.view;
+        find.count = vertices.size();
         find.collections = &task.collection;
         find.vertices = vertices.data();
         find.vertices_stride = sizeof(ustore_key_t);
         find.roles = &role;
-        find.degrees_per_vertex = &degrees;
+        find.degrees_per_vertex = degrees.get();
+        find.degrees_per_vertex_stride = sizeof(ustore_vertex_degree_t);
         find.edges_per_vertex = &edges;
+        find.arena = arena.get();
         ustore_graph_find_edges(&find);
-        if (task.error->status) return;
+        if (failed(task.outcome)) return;
 
         std::size_t triples = 0;
         for (std::size_t index = 0; index != vertices.size(); ++index)
             if (degrees[index] != ustore_vertex_degree_missing_k) triples += degrees[index];
 
-        for (std::size_t triple = 0; triple != triples && !task.error->status; ++triple) {
+        for (std::size_t triple = 0; triple != triples && !failed(task.outcome); ++triple) {
             ustore_key_t const* const ids = edges + triple * 3;
             if (format == dataset_format_t::ndjson_k) {
-                output.append("{\"", task.error);
-                output.append(task.source_id_field, task.error);
-                output.append("\":", task.error);
-                output.append_key(ids[0], task.error);
-                output.append(",\"", task.error);
-                output.append(task.target_id_field, task.error);
-                output.append("\":", task.error);
-                output.append_key(ids[1], task.error);
+                output.append("{\"", task.outcome);
+                output.append(task.source_id_field, task.outcome);
+                output.append("\":", task.outcome);
+                output.append_key(ids[0], task.outcome);
+                output.append(",\"", task.outcome);
+                output.append(task.target_id_field, task.outcome);
+                output.append("\":", task.outcome);
+                output.append_key(ids[1], task.outcome);
                 if (task.edge_id_field) {
-                    output.append(",\"", task.error);
-                    output.append(task.edge_id_field, task.error);
-                    output.append("\":", task.error);
-                    output.append_key(ids[2], task.error);
+                    output.append(",\"", task.outcome);
+                    output.append(task.edge_id_field, task.outcome);
+                    output.append("\":", task.outcome);
+                    output.append_key(ids[2], task.outcome);
                 }
-                output.append("}\n", task.error);
+                output.append("}\n", task.outcome);
             }
             else {
-                output.append_key(ids[0], task.error);
-                output.append(",", task.error);
-                output.append_key(ids[1], task.error);
+                output.append_key(ids[0], task.outcome);
+                output.append(",", task.outcome);
+                output.append_key(ids[1], task.outcome);
                 if (task.edge_id_field) {
-                    output.append(",", task.error);
-                    output.append_key(ids[2], task.error);
+                    output.append(",", task.outcome);
+                    output.append_key(ids[2], task.outcome);
                 }
-                output.append("\n", task.error);
+                output.append("\n", task.outcome);
             }
         }
     };
-    scan_keys(task, items_in(task.max_batch_size, 3 * sizeof(ustore_key_t)), export_batch);
-    output.finish(task.error);
+    scan_keys(task, batch_size, export_batch);
+    output.finish(task.outcome);
 }
 
 #pragma endregion C Interface

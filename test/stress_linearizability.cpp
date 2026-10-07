@@ -206,8 +206,10 @@ struct linearizability_run_t {
 [[nodiscard]] std::size_t reopen_run(linearizability_run_t& run) {
     for (writer_slot_t& slot : run.slots) slot.transaction = transaction_t {};
     if (run.database) run.database.close();
-    std::size_t failures = expect(open_database(run.database, *run.config).succeeded());
+    auto [database, open_status] = open_database<database_t>(*run.config);
+    std::size_t failures = expect(open_status.succeeded());
     if (failures) return failures;
+    run.database = std::move(database);
     run.collection = run.database.main();
     for (std::size_t thread = 0; thread != run.slots.size() && !failures; ++thread)
         failures += begin_transaction(run.database, run.slots[thread].transaction);
@@ -398,10 +400,12 @@ int main(int argc, char** argv) {
     }
     test_config_t const config {suite.engine, maybe_directory->path()};
     linearizability_run_t run {&config};
-    if (open_database(run.database, *run.config).failed()) {
+    auto [database, open_status] = open_database<database_t>(*run.config);
+    if (open_status.failed()) {
         fmt::println(stderr, "Cannot open the database");
         return 1;
     }
+    run.database = std::move(database);
     if (!run.database.supports_transactions()) {
         report(totals, "linear_writes", case_result_t::skipped("the engine does not support transactions"));
         return suite_exit_code(totals);

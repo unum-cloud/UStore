@@ -5,6 +5,10 @@ ustore/ustore.h
 ---------------
 .. doxygenfile:: ustore.h
 
+ustore/types.h
+--------------
+.. doxygenfile:: types.h
+
 ustore/db.h
 -----------
 .. doxygenfile:: db.h
@@ -20,6 +24,10 @@ ustore/docs.h
 ustore/graph.h
 --------------
 .. doxygenfile:: graph.h
+
+ustore/pages.h
+--------------
+.. doxygenfile:: pages.h
 
 ustore/strings.h
 ----------------

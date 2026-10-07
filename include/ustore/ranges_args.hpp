@@ -7,7 +7,7 @@
 
 #pragma once
 
-#include <cstddef> // `std::size_t`, `std::nullptr_t`
+#include <cstddef> // `std::size_t`
 #include <cstring> // `std::strlen`
 
 #include <algorithm>   // `std::min`
@@ -19,6 +19,7 @@
 #include <utility>     // `std::move`
 
 #include "ustore/ranges.hpp" // `strided_iterator`
+#include "ustore/status.hpp" // `status_t`
 #include "ustore/types.hpp"  // `collection_key_field_t`
 
 namespace unum::ustore {
@@ -35,7 +36,6 @@ struct place_t {
     ustore_str_view_t field;
 
     collection_key_t collection_key() const noexcept { return {collection, key}; }
-    collection_key_field_t collection_key_field() const noexcept { return {collection, key, field}; }
 };
 
 /** The locations of a batched read or write, as the C ABI receives them. */
@@ -90,8 +90,7 @@ struct strings_arg_t {
 /** The values of a batched write, as the C ABI receives them. */
 struct contents_arg_t {
     using value_type = value_view_t;
-    bits_view_t presences_begin;
-    strided_iterator<ustore_length_t const> offsets_begin;
+    strided_iterator<ustore_length_t const> starts_begin;
     strided_iterator<ustore_length_t const> lengths_begin;
     strided_iterator<ustore_bytes_cptr_t const> contents_begin;
     ustore_size_t count {0};
@@ -100,32 +99,16 @@ struct contents_arg_t {
     std::size_t size() const noexcept { return count; }
     value_view_t operator[](std::size_t index) const noexcept {
         auto const signed_index = static_cast<std::ptrdiff_t>(index);
-        if (!contents_begin || !contents_begin[signed_index] || (presences_begin && !presences_begin[index])) return {};
-
         auto const begin = reinterpret_cast<byte_t const*>(contents_begin[signed_index]);
-        ustore_length_t const offset = offsets_begin ? offsets_begin[signed_index] : 0u;
+        ustore_length_t const start = starts_begin ? starts_begin[signed_index] : 0u;
         ustore_length_t length = 0;
         if (lengths_begin) length = lengths_begin[signed_index];
-        else if (offsets_begin) length = offsets_begin[signed_index + 1] - offset;
+        else if (starts_begin) length = starts_begin[signed_index + 1] - start;
         else {
-            auto const item = reinterpret_cast<char const*>(begin) + offset;
+            char const* const item = reinterpret_cast<char const*>(begin) + start;
             while (item[length] != separator) ++length;
         }
-        return {begin + offset, length};
-    }
-
-    /** Whether the values form one tape indexed by N+1 offsets. */
-    bool is_arrow() const noexcept { return contents_begin.repeats() && offsets_begin && !lengths_begin; }
-
-    /** Whether every value starts right where the one before it ends. */
-    bool is_continuous() const noexcept {
-        value_view_t last = operator[](0);
-        for (std::size_t index = 1; index != size(); ++index) {
-            value_view_t const value = operator[](index);
-            if (value.begin() != last.end()) return false;
-            last = value;
-        }
-        return true;
+        return {begin + start, length};
     }
 };
 
@@ -151,11 +134,6 @@ struct scans_arg_t {
         ustore_length_t limit = limits[signed_index];
         return {collection, min_key, limit};
     }
-
-    /** Whether every task scans the same collection. */
-    bool same_collection() const noexcept {
-        return strided_range<ustore_collection_id_t const>(collections, count).same_elements();
-    }
 };
 
 /** One task of a batched sample. */
@@ -176,11 +154,6 @@ struct sample_args_t {
         ustore_collection_id_t collection = collections ? collections[signed_index] : ustore_collection_main_k;
         ustore_length_t limit = limits[signed_index];
         return {collection, limit};
-    }
-
-    /** Whether every task samples the same collection. */
-    bool same_collection() const noexcept {
-        return strided_range<ustore_collection_id_t const>(collections, count).same_elements();
     }
 };
 
@@ -207,11 +180,6 @@ struct find_edges_t {
         ustore_key_t const& vertex_id = vertex_id_begin[signed_index];
         ustore_vertex_role_t role = roles_begin ? roles_begin[signed_index] : ustore_vertex_role_any_k;
         return {collection, vertex_id, role};
-    }
-
-    /** Whether every task looks inside the same collection. */
-    bool same_collection() const noexcept {
-        return strided_range<ustore_collection_id_t const>(collections_begin, count).same_elements();
     }
 };
 
@@ -414,7 +382,7 @@ struct places_arg_extractor<locations_&> : public places_arg_extractor<locations
 
 #pragma region Content Adapters
 
-/** Resolves values into the strided contents, offsets and lengths of the C ABI, specialized per decayed value type. */
+/** Resolves values into the strided contents, starts and lengths of the C ABI, specialized per decayed value type. */
 template <typename values_>
 struct contents_arg_extractor {};
 
@@ -424,7 +392,7 @@ struct contents_arg_extractor<char const**> {
     strided_iterator<ustore_bytes_cptr_t const> contents(char const** strings) noexcept {
         return {reinterpret_cast<ustore_bytes_cptr_t const*>(strings), sizeof(char const*)};
     }
-    strided_iterator<ustore_length_t const> offsets(char const**) noexcept { return {}; }
+    strided_iterator<ustore_length_t const> starts(char const**) noexcept { return {}; }
     strided_iterator<ustore_length_t const> lengths(char const**) noexcept { return {}; }
 };
 
@@ -434,7 +402,7 @@ struct contents_arg_extractor<char const*> {
     strided_iterator<ustore_bytes_cptr_t const> contents(char const* const& string) noexcept {
         return {reinterpret_cast<ustore_bytes_cptr_t const*>(&string), 0};
     }
-    strided_iterator<ustore_length_t const> offsets(char const* const&) noexcept { return {}; }
+    strided_iterator<ustore_length_t const> starts(char const* const&) noexcept { return {}; }
     strided_iterator<ustore_length_t const> lengths(char const* const&) noexcept { return {}; }
 };
 
@@ -445,7 +413,7 @@ struct contents_arg_extractor<view_*> {
     strided_iterator<ustore_bytes_cptr_t const> contents(view_* views) noexcept {
         return {views->member_ptr(), sizeof(value_view_t)};
     }
-    strided_iterator<ustore_length_t const> offsets(view_*) noexcept { return {}; }
+    strided_iterator<ustore_length_t const> starts(view_*) noexcept { return {}; }
     strided_iterator<ustore_length_t const> lengths(view_* views) noexcept {
         return {views->member_length(), sizeof(value_view_t)};
     }
@@ -457,7 +425,7 @@ struct contents_arg_extractor<value_view_t> {
     strided_iterator<ustore_bytes_cptr_t const> contents(value_view_t const& view) noexcept {
         return {view.member_ptr(), 0};
     }
-    strided_iterator<ustore_length_t const> offsets(value_view_t const&) noexcept { return {}; }
+    strided_iterator<ustore_length_t const> starts(value_view_t const&) noexcept { return {}; }
     strided_iterator<ustore_length_t const> lengths(value_view_t const& view) noexcept {
         return {view.member_length(), 0};
     }
@@ -469,20 +437,12 @@ struct contents_arg_extractor<contents_arg_t> {
     strided_iterator<ustore_bytes_cptr_t const> contents(contents_arg_t const& native) noexcept {
         return native.contents_begin;
     }
-    strided_iterator<ustore_length_t const> offsets(contents_arg_t const& native) noexcept {
-        return native.offsets_begin;
+    strided_iterator<ustore_length_t const> starts(contents_arg_t const& native) noexcept {
+        return native.starts_begin;
     }
     strided_iterator<ustore_length_t const> lengths(contents_arg_t const& native) noexcept {
         return native.lengths_begin;
     }
-};
-
-/** No values, which erases the keys. */
-template <>
-struct contents_arg_extractor<std::nullptr_t> {
-    strided_iterator<ustore_bytes_cptr_t const> contents(std::nullptr_t) noexcept { return {}; }
-    strided_iterator<ustore_length_t const> offsets(std::nullptr_t) noexcept { return {}; }
-    strided_iterator<ustore_length_t const> lengths(std::nullptr_t) noexcept { return {}; }
 };
 
 /** A contiguous container of value views. */
@@ -493,7 +453,7 @@ struct contents_arg_extractor<views_> {
         if (std::ranges::empty(views)) return {};
         return {std::ranges::data(views)->member_ptr(), sizeof(value_view_t)};
     }
-    strided_iterator<ustore_length_t const> offsets(views_ const&) noexcept { return {}; }
+    strided_iterator<ustore_length_t const> starts(views_ const&) noexcept { return {}; }
     strided_iterator<ustore_length_t const> lengths(views_ const& views) noexcept {
         if (std::ranges::empty(views)) return {};
         return {std::ranges::data(views)->member_length(), sizeof(value_view_t)};
@@ -504,99 +464,69 @@ struct contents_arg_extractor<views_> {
 
 #pragma region Validation
 
-/** Whether the tasks address a named collection rather than the main one. */
-inline bool same_collections_are_named(strided_iterator<ustore_collection_id_t const> collections_begin) noexcept {
-    return collections_begin && collections_begin[0] != ustore_collection_main_k;
+/** Checks the keys and choices of a removal, which a write shares. */
+inline status_t validate_remove(ustore_transaction_t const transaction, places_arg_t const& places,
+                                ustore_durability_t const durability, ustore_watch_t const watch) noexcept {
+
+    if (durability != ustore_durability_buffered_k && durability != ustore_durability_flushed_k)
+        return {status_code_t::invalid_argument_k, "Unknown durability"};
+    if (watch != ustore_watch_keys_k && watch != ustore_watch_none_k)
+        return {status_code_t::invalid_argument_k, "Unknown watch"};
+    if (transaction && durability == ustore_durability_flushed_k)
+        return {status_code_t::invalid_argument_k, "A transaction flushes at commit, not at a write"};
+    if (!transaction && watch == ustore_watch_none_k)
+        return {status_code_t::invalid_argument_k, "Only a transaction watches keys"};
+    if (!places.count && places.keys_begin) return {status_code_t::invalid_argument_k, "Keys were given for no tasks"};
+    if (places.count && !places.keys_begin) return {status_code_t::invalid_argument_k, "No keys were provided"};
+    return {};
 }
 
-/** Whether every flag set in @p value is also set in @p allowed. */
-template <typename enum_, typename allowed_mask_>
-bool enum_is_subset(enum_ value, allowed_mask_ allowed) noexcept {
-    return (value & ~allowed) == 0;
+inline status_t validate_write(ustore_transaction_t const transaction, places_arg_t const& places,
+                               contents_arg_t const& contents, ustore_durability_t const durability,
+                               ustore_watch_t const watch) noexcept {
+
+    if (status_t const status = validate_remove(transaction, places, durability, watch); status.failed()) return status;
+    if (places.count && !contents.contents_begin) return {status_code_t::invalid_argument_k, "No values were provided"};
+    return {};
 }
 
-inline void validate_write(ustore_transaction_t const transaction, places_arg_t const& places,
-                           contents_arg_t const& contents, ustore_options_t const options,
-                           ustore_error_t* error) noexcept {
-
-    auto const allowed_options = ustore_option_transaction_dont_watch_k | ustore_option_dont_discard_memory_k |
-                                 ustore_option_write_flush_k;
-    if (!enum_is_subset(options, allowed_options)) {
-        *error = {ustore_error_invalid_argument_k, "Invalid options"};
-        return;
-    }
-    if (transaction && (options & ustore_option_write_flush_k)) {
-        *error = {ustore_error_invalid_argument_k, "A transaction flushes at commit, not at a write"};
-        return;
-    }
-    if (!transaction && (options & ustore_option_transaction_dont_watch_k)) {
-        *error = {ustore_error_invalid_argument_k, "Only a transaction watches keys"};
-        return;
-    }
-    if (!places.count) {
-        if (places.keys_begin) *error = {ustore_error_invalid_argument_k, "Keys were given for no tasks"};
-        return;
-    }
-    if (!places.keys_begin) {
-        *error = {ustore_error_invalid_argument_k, "No keys were provided"};
-        return;
-    }
-    if (!contents.contents_begin && (contents.lengths_begin || contents.offsets_begin))
-        *error = {ustore_error_invalid_argument_k, "Lengths or offsets were given without contents"};
+inline status_t validate_read(places_arg_t const& places) noexcept {
+    if (!places.keys_begin) return {status_code_t::invalid_argument_k, "No keys were provided"};
+    return {};
 }
 
-inline void validate_read(ustore_transaction_t const transaction, places_arg_t const& places,
-                          ustore_options_t const options, ustore_error_t* error) noexcept {
+inline status_t validate_scan(ustore_scan_t const& arguments) noexcept {
 
-    auto const allowed_options = ustore_option_transaction_dont_watch_k | ustore_option_dont_discard_memory_k |
-                                 ustore_option_read_shared_memory_k;
-    if (!enum_is_subset(options, allowed_options)) {
-        *error = {ustore_error_invalid_argument_k, "Invalid options"};
-        return;
-    }
-    if (!transaction && (options & ustore_option_transaction_dont_watch_k)) {
-        *error = {ustore_error_invalid_argument_k, "Only a transaction watches keys"};
-        return;
-    }
-    if (!places.keys_begin) *error = {ustore_error_invalid_argument_k, "No keys were provided"};
+    if (arguments.mode != ustore_scan_ordered_k && arguments.mode != ustore_scan_bulk_k)
+        return {status_code_t::invalid_argument_k, "Unknown scan mode"};
+    if (!arguments.start_keys) return {status_code_t::invalid_argument_k, "No start keys were provided"};
+    if (!arguments.offsets || !arguments.keys)
+        return {status_code_t::invalid_argument_k, "Need outputs for the offsets and the keys"};
+    if (!arguments.count_limits)
+        return {status_code_t::unsupported_k, "Full scans are not supported, paginate with limits"};
+    return {};
 }
 
-inline void validate_scan([[maybe_unused]] ustore_transaction_t const transaction, scans_arg_t const& scans,
-                          ustore_options_t const options, ustore_error_t* error) noexcept {
-
-    auto const allowed_options = ustore_option_transaction_dont_watch_k | ustore_option_dont_discard_memory_k |
-                                 ustore_option_read_shared_memory_k | ustore_option_scan_bulk_k;
-    if (!enum_is_subset(options, allowed_options)) {
-        *error = {ustore_error_invalid_argument_k, "Invalid options"};
-        return;
-    }
-    if (!scans.start_keys) {
-        *error = {ustore_error_invalid_argument_k, "No start keys were provided"};
-        return;
-    }
-    if (!scans.limits) *error = {ustore_error_unsupported_k, "Full scans are not supported, paginate with limits"};
+/** Checks that a measurement has all six outputs, which @c ustore_measure_t documents as required. */
+inline status_t validate_measure(ustore_measure_t const& arguments) noexcept {
+    bool const has_outputs = arguments.min_cardinalities && arguments.max_cardinalities && arguments.min_value_bytes &&
+                             arguments.max_value_bytes && arguments.min_space_usages && arguments.max_space_usages;
+    if (!has_outputs) return {status_code_t::invalid_argument_k, "Need outputs for every bound of the measurement"};
+    return {};
 }
 
-inline void validate_transaction_begin(ustore_transaction_t const* transaction, ustore_options_t const options,
-                                       ustore_error_t* error) noexcept {
-
-    if (!transaction) {
-        *error = {ustore_error_invalid_argument_k, "Need an output for the transaction"};
-        return;
-    }
-    if (!enum_is_subset(options, ustore_option_transaction_dont_watch_k))
-        *error = {ustore_error_invalid_argument_k, "Invalid options"};
+inline status_t validate_transaction_begin(ustore_transaction_t const* transaction) noexcept {
+    if (!transaction) return {status_code_t::invalid_argument_k, "Need an output for the transaction"};
+    return {};
 }
 
-inline void validate_transaction_commit(ustore_transaction_t const transaction, ustore_options_t const options,
-                                        ustore_error_t* error) noexcept {
+inline status_t validate_transaction_commit(ustore_transaction_t const transaction,
+                                            ustore_durability_t const durability) noexcept {
 
-    if (!transaction) {
-        *error = {ustore_error_uninitialized_k, "Transaction is uninitialized"};
-        return;
-    }
-    if (!enum_is_subset(options, ustore_option_write_flush_k))
-        *error = {ustore_error_invalid_argument_k, "Invalid options"};
+    if (!transaction) return {status_code_t::uninitialized_k, "Transaction is uninitialized"};
+    if (durability != ustore_durability_buffered_k && durability != ustore_durability_flushed_k)
+        return {status_code_t::invalid_argument_k, "Unknown durability"};
+    return {};
 }
 
 #pragma endregion Validation

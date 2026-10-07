@@ -25,8 +25,8 @@ using namespace unum;
 /** Calls every C++ wrapper in each accepted form against one database. */
 std::size_t wrappers_compile(test_config_t const& config) {
     std::size_t failures = 0;
-    database_t database;
-    failures += expect(open_database(database, config).succeeded());
+    auto [database, open_status] = open_database<database_t>(config);
+    failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
 
     [[maybe_unused]] auto const main_by_value = database.main();
@@ -65,7 +65,7 @@ std::size_t wrappers_compile(test_config_t const& config) {
     }
 
     // Reusable memory
-    arena_t arena(database);
+    arena_t arena;
     [[maybe_unused]] status_t const arena_cleared =
         main_collection[{key_from_integer(43), key_from_integer(44)}].on(arena).clear();
     [[maybe_unused]] status_t const arena_erased =
@@ -90,17 +90,17 @@ std::size_t wrappers_compile(test_config_t const& config) {
     [[maybe_unused]] auto const cardinality =
         main_collection.members(key_from_integer(100), key_from_integer(200)).size_estimates()->cardinality;
 
-    // Options
-    [[maybe_unused]] status_t const unflushed_clear =
-        main_collection[{key_from_integer(43), key_from_integer(44)}].on(arena).clear(flush_t::dont_flush_k);
-    [[maybe_unused]] status_t const unflushed_erase =
-        main_collection[{key_from_integer(43), key_from_integer(44)}].on(arena).erase(flush_t::dont_flush_k);
+    // Durability and watching
+    [[maybe_unused]] status_t const flushed_clear =
+        main_collection[{key_from_integer(43), key_from_integer(44)}].on(arena).clear(ustore_durability_flushed_k);
+    [[maybe_unused]] status_t const flushed_erase =
+        main_collection[{key_from_integer(43), key_from_integer(44)}].on(arena).erase(ustore_durability_flushed_k);
     [[maybe_unused]] auto const untracked_present =
-        main_collection[{key_from_integer(43), key_from_integer(44)}].on(arena).present(watch_t::dont_watch_k);
+        main_collection[{key_from_integer(43), key_from_integer(44)}].on(arena).present(ustore_watch_none_k);
     [[maybe_unused]] auto const untracked_length =
-        main_collection[{key_from_integer(43), key_from_integer(44)}].on(arena).length(watch_t::dont_watch_k);
+        main_collection[{key_from_integer(43), key_from_integer(44)}].on(arena).length(ustore_watch_none_k);
     [[maybe_unused]] auto const untracked_value =
-        main_collection[{key_from_integer(43), key_from_integer(44)}].on(arena).value(watch_t::dont_watch_k);
+        main_collection[{key_from_integer(43), key_from_integer(44)}].on(arena).value(ustore_watch_none_k);
 
     // Sub-documents
     if (database.supports_collections()) {

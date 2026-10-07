@@ -12,7 +12,7 @@
 #include <concepts>         // `std::same_as`
 #include <initializer_list> // `std::initializer_list`
 #include <type_traits>      // `std::remove_cvref_t`
-#include <utility>          // `std::exchange`, `std::forward`, `std::swap`
+#include <utility>          // `std::forward`, `std::move`
 
 #include "ustore/blobs_range.hpp" // `blobs_range_t`, `keys_range_t`, `pairs_range_t`, `size_range_t`
 #include "ustore/blobs_ref.hpp"   // `blobs_ref`
@@ -35,52 +35,21 @@ class blobs_collection_t {
     ustore_collection_id_t collection_ {ustore_collection_main_k};
     ustore_transaction_t transaction_ {nullptr};
     ustore_snapshot_t snapshot_ {};
-    any_arena_t arena_ {nullptr};
+    any_arena_t arena_;
 
   public:
-    blobs_collection_t() noexcept : arena_(nullptr) {}
+    blobs_collection_t() noexcept = default;
     blobs_collection_t(ustore_database_t database, ustore_collection_id_t collection = ustore_collection_main_k,
                        ustore_transaction_t transaction = nullptr, ustore_snapshot_t snapshot = {},
                        ustore_arena_t* arena = nullptr) noexcept
-        : database_(database), collection_(collection), transaction_(transaction), snapshot_(snapshot),
-          arena_(database_, arena) {}
-
-    blobs_collection_t(blobs_collection_t&& other) noexcept
-        : database_(other.database_), collection_(std::exchange(other.collection_, ustore_collection_main_k)),
-          transaction_(std::exchange(other.transaction_, nullptr)), snapshot_(std::exchange(other.snapshot_, {})),
-          arena_(std::exchange(other.arena_, {nullptr})) {}
-
-    blobs_collection_t& operator=(blobs_collection_t&& other) noexcept {
-        std::swap(database_, other.database_);
-        std::swap(collection_, other.collection_);
-        std::swap(transaction_, other.transaction_);
-        std::swap(snapshot_, other.snapshot_);
-        std::swap(arena_, other.arena_);
-        return *this;
-    }
-
-    blobs_collection_t(blobs_collection_t const& other) noexcept
-        : database_(other.database_), collection_(other.collection_), transaction_(other.transaction_),
-          snapshot_(other.snapshot_), arena_(other.database_) {}
-
-    blobs_collection_t& operator=(blobs_collection_t const& other) noexcept {
-        database_ = other.database_;
-        collection_ = other.collection_;
-        transaction_ = other.transaction_;
-        snapshot_ = other.snapshot_;
-        arena_ = any_arena_t(other.database_);
-        return *this;
-    }
+        : database_(database), collection_(collection), transaction_(transaction), snapshot_(snapshot), arena_(arena) {}
 
     operator ustore_collection_id_t() const noexcept { return collection_; }
     ustore_collection_id_t* member_ptr() noexcept { return &collection_; }
     ustore_arena_t* member_arena() noexcept { return arena_.member_ptr(); }
-    ustore_database_t db() const noexcept { return database_; }
-    ustore_transaction_t txn() const noexcept { return transaction_; }
-    ustore_snapshot_t snap() const noexcept { return snapshot_; }
 
     blobs_range_t members(ustore_key_t min_key = smallest_key_k, ustore_key_t max_key = largest_key_k) const noexcept {
-        return {database_, transaction_, snapshot_, collection_, min_key, max_key};
+        return {database_, view_through(transaction_, snapshot_, ustore_watch_keys_k), collection_, min_key, max_key};
     }
 
     keys_range_t keys(ustore_key_t min_key = smallest_key_k, ustore_key_t max_key = largest_key_k) const noexcept {
@@ -100,9 +69,9 @@ class blobs_collection_t {
     /** Counts the keys by streaming through all of them. */
     expected<std::size_t> size() const noexcept { return keys().size(); }
 
-    status_t clear_values() noexcept { return drop(ustore_drop_vals_k); }
-    status_t clear() noexcept { return drop(ustore_drop_keys_vals_k); }
-    status_t drop() noexcept { return drop(ustore_drop_keys_vals_handle_k); }
+    status_t clear_values() noexcept { return drop_with(ustore_drop_vals_k); }
+    status_t clear() noexcept { return drop_with(ustore_drop_keys_vals_k); }
+    status_t drop() noexcept { return drop_with(ustore_drop_keys_vals_handle_k); }
 
     blobs_ref<places_arg_t> operator[](std::initializer_list<ustore_key_t> keys) noexcept { return at(keys); }
     blobs_ref<places_arg_t> at(std::initializer_list<ustore_key_t> keys) noexcept { return at(strided(keys)); }
@@ -141,15 +110,15 @@ class blobs_collection_t {
     }
 
   private:
-    status_t drop(ustore_drop_mode_t mode) noexcept {
-        ustore_error_t error {};
+    status_t drop_with(ustore_drop_mode_t mode) noexcept {
+        ustore_outcome_t outcome {};
         ustore_collection_drop_t collection_drop {};
-        collection_drop.db = database_;
-        collection_drop.error = &error;
+        collection_drop.database = database_;
+        collection_drop.outcome = &outcome;
         collection_drop.collection = collection_;
         collection_drop.mode = mode;
         ustore_collection_drop(&collection_drop);
-        return status_t {error};
+        return status_t {outcome};
     }
 };
 

@@ -51,10 +51,12 @@ struct fixture_t {
     fixture_t& operator=(fixture_t const&) = delete;
 
     explicit fixture_t(test_config_t const& config) noexcept {
-        if (status_t const opened = open_database(database, config); opened.failed()) {
-            fmt::println(stderr, "  failed to open the database: {}", opened.message);
+        auto [opened, open_status] = open_database<database_t>(config);
+        if (open_status.failed()) {
+            fmt::println(stderr, "  failed to open the database: {}", open_status.message);
             return;
         }
+        database = std::move(opened);
         if (status_t const cleared = database.clear(); cleared.failed()) {
             fmt::println(stderr, "  failed to clear the database: {}", cleared.message);
             return;

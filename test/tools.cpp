@@ -108,14 +108,14 @@ struct fixture_paths_t {
 
 /** Appends @p piece to @p text, answering whether it fit. */
 [[nodiscard]] bool append(sz::string_t& text, std::string_view piece) noexcept {
-    return text.try_append(piece.data(), piece.size());
+    return text.try_append(piece.data(), piece.size()) == sz::status_t::success_k;
 }
 
 /** Appends the decimal digits of @p number to @p text, answering whether they fit. */
 [[nodiscard]] bool append(sz::string_t& text, std::int64_t number) noexcept {
     char digits[24];
     std::to_chars_result const printed = std::to_chars(digits, digits + sizeof(digits), number);
-    return text.try_append(digits, static_cast<std::size_t>(printed.ptr - digits));
+    return text.try_append(digits, static_cast<std::size_t>(printed.ptr - digits)) == sz::status_t::success_k;
 }
 
 /** Appends the NDJSON fixture document with key @p id, without a line break. */
@@ -161,7 +161,8 @@ struct fixture_paths_t {
     if (!file) return false;
     bool loaded = std::fseek(file, 0, SEEK_END) == 0;
     long const size = loaded ? std::ftell(file) : -1;
-    loaded = size >= 0 && std::fseek(file, 0, SEEK_SET) == 0 && content.try_resize(static_cast<std::size_t>(size));
+    loaded = size >= 0 && std::fseek(file, 0, SEEK_SET) == 0 &&
+             content.try_resize(static_cast<std::size_t>(size)) == sz::status_t::success_k;
     loaded = loaded && std::fread(content.data(), 1, content.size(), file) == content.size();
     [[maybe_unused]] int const closed = std::fclose(file);
     return loaded;
@@ -213,42 +214,46 @@ class test_database_t {
 
     /** Opens the database @p config describes and answers whether it opened. */
     [[nodiscard]] bool open(test_config_t const& config) noexcept {
-        status_t const opened = open_raw(config, database_);
-        if (opened.succeeded()) return true;
-        fmt::println(stderr, "  failed to open the database: {}", opened.message);
-        return false;
+        auto [opened, open_status] = open_raw(config);
+        if (open_status.failed()) {
+            fmt::println(stderr, "  failed to open the database: {}", open_status.message);
+            return false;
+        }
+        database_ = opened;
+        return true;
     }
 
     /** Answers whether the engine reports named collections. */
     [[nodiscard]] bool supports_collections() noexcept {
-        ustore_error_t error {};
-        ustore_capabilities_t capabilities {};
-        ustore_database_capabilities_t request {};
-        request.db = database_;
-        request.error = &error;
-        request.capabilities = &capabilities;
-        ustore_database_capabilities(&request);
-        bool const supported = !error.status && (capabilities & ustore_supports_collections_k);
+        ustore_outcome_t outcome {};
+        ustore_database_description_t description {};
+        ustore_database_describe_t request {};
+        request.database = database_;
+        request.outcome = &outcome;
+        request.description = &description;
+        ustore_database_describe(&request);
+        bool const supported = outcome.status == ustore_status_success_k &&
+                               (description.capabilities & ustore_supports_collections_k);
         return supported;
     }
 
     /** Removes every key and value of the main collection. */
     void clear() noexcept {
-        ustore_error_t error {};
+        ustore_outcome_t outcome {};
         ustore_collection_drop_t drop {};
-        drop.db = database_;
-        drop.error = &error;
+        drop.database = database_;
+        drop.outcome = &outcome;
         drop.collection = ustore_collection_main_k;
         drop.mode = ustore_drop_keys_vals_k;
         ustore_collection_drop(&drop);
     }
 
     /** Creates an anonymous graph collection, answering its ID, or the main one after reporting why it could not. */
-    [[nodiscard]] ustore_collection_id_t create_graph(ustore_error_t& error) noexcept {
+    [[nodiscard]] ustore_collection_id_t create_graph(ustore_outcome_t& outcome) noexcept {
         ustore_collection_id_t graph = ustore_collection_main_k;
         ustore_collection_create_t create {};
-        create.db = database_;
-        create.error = &error;
+        create.database = database_;
+        create.outcome = &outcome;
         create.modality = ustore_modality_graph_k;
         create.collection = &graph;
         ustore_collection_create(&create);
@@ -256,10 +261,10 @@ class test_database_t {
     }
 
     /** Drops @p collection together with its handle. */
-    void drop(ustore_collection_id_t collection, ustore_error_t& error) noexcept {
+    void drop(ustore_collection_id_t collection, ustore_outcome_t& outcome) noexcept {
         ustore_collection_drop_t drop {};
-        drop.db = database_;
-        drop.error = &error;
+        drop.database = database_;
+        drop.outcome = &outcome;
         drop.collection = collection;
         drop.mode = ustore_drop_keys_vals_handle_k;
         ustore_collection_drop(&drop);
@@ -299,7 +304,7 @@ struct json_document_t {
         yyjson_mut_doc_set_root(builder, copy);
         text = yyjson_mut_write(builder, 0, &length);
     }
-    bool const serialized = text && output.try_append(text, length);
+    bool const serialized = text && output.try_append(text, length) == sz::status_t::success_k;
     std::free(text);
     yyjson_mut_doc_free(builder);
     return serialized;
@@ -313,22 +318,19 @@ struct json_document_t {
 
 /** Whether @p database holds a collection named @p name. */
 [[nodiscard]] bool lists_collection(ustore_database_t database, char const* name) noexcept {
-    ustore_arena_t arena = nullptr;
-    ustore_error_t error {};
-    ustore_octet_t* presences = nullptr;
-    ustore_collection_id_t* ids = nullptr;
+    ustore_outcome_t outcome {};
+    ustore_octet_t presence = 0;
+    ustore_collection_id_t id = ustore_collection_main_k;
     ustore_collection_find_t find {};
-    find.db = database;
-    find.error = &error;
-    find.arena = &arena;
-    find.tasks_count = 1;
+    find.database = database;
+    find.outcome = &outcome;
+    find.count = 1;
     find.names = &name;
-    find.presences = &presences;
-    find.collections = &ids;
+    find.presences = &presence;
+    find.collections = &id;
+    find.collections_stride = sizeof(ustore_collection_id_t);
     ustore_collection_find(&find);
-    bool const found = !error.status && (presences[0] & 1);
-    ustore_arena_free(arena);
-    return found;
+    return outcome.status == ustore_status_success_k && (presence & 1);
 }
 
 #pragma endregion Helpers
@@ -450,7 +452,7 @@ struct edge_row_t {
             std::string_view separator;
             sz::string_view_t const inner {row.data() + comma + 2, row.size() - comma - 3};
             for (sz::string_view_t segment : sz::split(inner, "\"\"")) {
-                failures += expect(append(unescaped, separator) && unescaped.try_append(segment));
+                failures += expect(append(unescaped, separator) && append(unescaped, segment));
                 separator = "\"";
             }
             failures += check_document(key, unescaped, input, selection);
@@ -482,13 +484,13 @@ struct edge_row_t {
     database.clear();
 
     std::size_t failures = 0;
-    ustore_error_t error {};
-    ustore_collection_id_t const graph = database.create_graph(error);
-    failures += expect_no_error(error);
+    ustore_outcome_t outcome {};
+    ustore_collection_id_t const graph = database.create_graph(outcome);
+    failures += expect_success(outcome);
 
     ustore_graph_import_t importing {};
-    importing.db = database.get();
-    importing.error = &error;
+    importing.database = database.get();
+    importing.outcome = &outcome;
     importing.collection = graph;
     importing.path = input;
     importing.max_batch_size = max_batch_size_k;
@@ -496,11 +498,11 @@ struct edge_row_t {
     importing.target_id_field = target_field_k;
     importing.edge_id_field = edge_field_k;
     ustore_graph_import(&importing);
-    failures += expect_no_error(error);
+    failures += expect_success(outcome);
 
     ustore_graph_export_t exporting {};
-    exporting.db = database.get();
-    exporting.error = &error;
+    exporting.database = database.get();
+    exporting.outcome = &outcome;
     exporting.collection = graph;
     exporting.path = output;
     exporting.max_batch_size = max_batch_size_k;
@@ -508,12 +510,12 @@ struct edge_row_t {
     exporting.target_id_field = target_field_k;
     exporting.edge_id_field = edge_field_k;
     ustore_graph_export(&exporting);
-    failures += expect_no_error(error);
+    failures += expect_success(outcome);
 
     failures += check_edges(output);
     [[maybe_unused]] int const removed = std::remove(output);
-    database.drop(graph, error);
-    failures += expect_no_error(error);
+    database.drop(graph, outcome);
+    failures += expect_success(outcome);
     return failures;
 }
 
@@ -530,10 +532,10 @@ struct edge_row_t {
     std::size_t const fields_count = selection == field_selection_t::selected_k ? fields.size() : 0;
 
     std::size_t failures = 0;
-    ustore_error_t error {};
+    ustore_outcome_t outcome {};
     ustore_docs_import_t importing {};
-    importing.db = database.get();
-    importing.error = &error;
+    importing.database = database.get();
+    importing.outcome = &outcome;
     importing.collection = ustore_collection_main_k;
     importing.path = input;
     importing.max_batch_size = max_batch_size_k;
@@ -542,11 +544,11 @@ struct edge_row_t {
     importing.fields_stride = sizeof(ustore_str_view_t);
     importing.id_field = "id";
     ustore_docs_import(&importing);
-    failures += expect_no_error(error);
+    failures += expect_success(outcome);
 
     ustore_docs_export_t exporting {};
-    exporting.db = database.get();
-    exporting.error = &error;
+    exporting.database = database.get();
+    exporting.outcome = &outcome;
     exporting.collection = ustore_collection_main_k;
     exporting.path = output;
     exporting.max_batch_size = max_batch_size_k;
@@ -554,7 +556,7 @@ struct edge_row_t {
     exporting.fields = fields_count ? fields.data() : nullptr;
     exporting.fields_stride = sizeof(ustore_str_view_t);
     ustore_docs_export(&exporting);
-    failures += expect_no_error(error);
+    failures += expect_success(outcome);
 
     failures += check_documents(output, input, selection);
     [[maybe_unused]] int const removed = std::remove(output);
@@ -573,12 +575,12 @@ struct edge_row_t {
     database.clear();
 
     std::size_t failures = 0;
-    ustore_error_t error {};
-    ustore_collection_id_t const graph = database.create_graph(error);
-    failures += expect_no_error(error);
+    ustore_outcome_t outcome {};
+    ustore_collection_id_t const graph = database.create_graph(outcome);
+    failures += expect_success(outcome);
     ustore_graph_import_t valid {};
-    valid.db = database.get();
-    valid.error = &error;
+    valid.database = database.get();
+    valid.outcome = &outcome;
     valid.collection = graph;
     valid.path = input;
     valid.max_batch_size = max_batch_size_k;
@@ -589,30 +591,30 @@ struct edge_row_t {
     ustore_graph_import_t without_path = valid;
     without_path.path = nullptr;
     ustore_graph_import(&without_path);
-    failures += expect_error(error);
+    failures += expect_failure(outcome);
 
     ustore_graph_import_t without_source = valid;
     without_source.source_id_field = nullptr;
     ustore_graph_import(&without_source);
-    failures += expect_error(error);
+    failures += expect_failure(outcome);
 
     ustore_graph_import_t without_target = valid;
     without_target.target_id_field = nullptr;
     ustore_graph_import(&without_target);
-    failures += expect_error(error);
+    failures += expect_failure(outcome);
 
     ustore_graph_import_t without_edge = valid;
     without_edge.edge_id_field = nullptr;
     ustore_graph_import(&without_edge);
-    failures += expect_no_error(error);
+    failures += expect_success(outcome);
 
     ustore_graph_import_t without_database = valid;
-    without_database.db = nullptr;
+    without_database.database = nullptr;
     ustore_graph_import(&without_database);
-    failures += expect_error(error);
+    failures += expect_failure(outcome);
 
-    database.drop(graph, error);
-    failures += expect_no_error(error);
+    database.drop(graph, outcome);
+    failures += expect_success(outcome);
     return failures;
 }
 
@@ -623,10 +625,10 @@ struct edge_row_t {
     database.clear();
 
     std::size_t failures = 0;
-    ustore_error_t error {};
+    ustore_outcome_t outcome {};
     ustore_graph_export_t valid {};
-    valid.db = database.get();
-    valid.error = &error;
+    valid.database = database.get();
+    valid.outcome = &outcome;
     valid.collection = ustore_collection_main_k;
     valid.path = output;
     valid.max_batch_size = max_batch_size_k;
@@ -637,32 +639,32 @@ struct edge_row_t {
     ustore_graph_export_t without_path = valid;
     without_path.path = nullptr;
     ustore_graph_export(&without_path);
-    failures += expect_error(error);
+    failures += expect_failure(outcome);
 
     ustore_graph_export_t without_source = valid;
     without_source.source_id_field = nullptr;
     ustore_graph_export(&without_source);
-    failures += expect_error(error);
+    failures += expect_failure(outcome);
 
     ustore_graph_export_t without_target = valid;
     without_target.target_id_field = nullptr;
     ustore_graph_export(&without_target);
-    failures += expect_error(error);
+    failures += expect_failure(outcome);
 
     ustore_graph_export_t with_pointer_field = valid;
     with_pointer_field.source_id_field = "/id";
     ustore_graph_export(&with_pointer_field);
-    failures += expect_error(error);
+    failures += expect_failure(outcome);
 
     ustore_graph_export_t without_edge = valid;
     without_edge.edge_id_field = nullptr;
     ustore_graph_export(&without_edge);
-    failures += expect_no_error(error);
+    failures += expect_success(outcome);
 
     ustore_graph_export_t without_database = valid;
-    without_database.db = nullptr;
+    without_database.database = nullptr;
     ustore_graph_export(&without_database);
-    failures += expect_error(error);
+    failures += expect_failure(outcome);
 
     [[maybe_unused]] int const removed = std::remove(output);
     return failures;
@@ -675,10 +677,10 @@ struct edge_row_t {
     database.clear();
 
     std::size_t failures = 0;
-    ustore_error_t error {};
+    ustore_outcome_t outcome {};
     ustore_docs_import_t valid {};
-    valid.db = database.get();
-    valid.error = &error;
+    valid.database = database.get();
+    valid.outcome = &outcome;
     valid.collection = ustore_collection_main_k;
     valid.path = input;
     valid.max_batch_size = max_batch_size_k;
@@ -690,32 +692,32 @@ struct edge_row_t {
     ustore_docs_import_t without_path = valid;
     without_path.path = nullptr;
     ustore_docs_import(&without_path);
-    failures += expect_error(error);
+    failures += expect_failure(outcome);
 
     ustore_docs_import_t without_count = valid;
     without_count.fields_count = 0;
     ustore_docs_import(&without_count);
-    failures += expect_error(error);
+    failures += expect_failure(outcome);
 
     ustore_docs_import_t without_fields = valid;
     without_fields.fields = nullptr;
     ustore_docs_import(&without_fields);
-    failures += expect_error(error);
+    failures += expect_failure(outcome);
 
     ustore_docs_import_t without_stride = valid;
     without_stride.fields_stride = 0;
     ustore_docs_import(&without_stride);
-    failures += expect_error(error);
+    failures += expect_failure(outcome);
 
     ustore_docs_import_t without_id_among_fields = valid;
     without_id_among_fields.id_field = "missing";
     ustore_docs_import(&without_id_among_fields);
-    failures += expect_error(error);
+    failures += expect_failure(outcome);
 
     ustore_docs_import_t without_database = valid;
-    without_database.db = nullptr;
+    without_database.database = nullptr;
     ustore_docs_import(&without_database);
-    failures += expect_error(error);
+    failures += expect_failure(outcome);
 
     database.clear();
     return failures;
@@ -728,10 +730,10 @@ struct edge_row_t {
     database.clear();
 
     std::size_t failures = 0;
-    ustore_error_t error {};
+    ustore_outcome_t outcome {};
     ustore_docs_export_t valid {};
-    valid.db = database.get();
-    valid.error = &error;
+    valid.database = database.get();
+    valid.outcome = &outcome;
     valid.collection = ustore_collection_main_k;
     valid.path = output;
     valid.max_batch_size = max_batch_size_k;
@@ -742,33 +744,33 @@ struct edge_row_t {
     ustore_docs_export_t without_path = valid;
     without_path.path = nullptr;
     ustore_docs_export(&without_path);
-    failures += expect_error(error);
+    failures += expect_failure(outcome);
 
     ustore_docs_export_t without_count = valid;
     without_count.fields_count = 0;
     ustore_docs_export(&without_count);
-    failures += expect_error(error);
+    failures += expect_failure(outcome);
 
     ustore_docs_export_t without_fields = valid;
     without_fields.fields = nullptr;
     ustore_docs_export(&without_fields);
-    failures += expect_error(error);
+    failures += expect_failure(outcome);
 
     ustore_docs_export_t without_stride = valid;
     without_stride.fields_stride = 0;
     ustore_docs_export(&without_stride);
-    failures += expect_error(error);
+    failures += expect_failure(outcome);
 
     test_path_t const unknown_format_output {config.directory(), exported_parquet_k};
     ustore_docs_export_t with_unknown_format = valid;
     with_unknown_format.path = unknown_format_output.c_str();
     ustore_docs_export(&with_unknown_format);
-    failures += expect_error(error);
+    failures += expect_failure(outcome);
 
     ustore_docs_export_t without_database = valid;
-    without_database.db = nullptr;
+    without_database.database = nullptr;
     ustore_docs_export(&without_database);
-    failures += expect_error(error);
+    failures += expect_failure(outcome);
 
     return failures;
 }

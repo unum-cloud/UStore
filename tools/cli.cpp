@@ -21,7 +21,7 @@
 #include <fmt/color.h>  // `fmt::color`, `fmt::fg`, `fmt::text_style`
 #include <fmt/format.h> // `fmt::println`, `fmt::format_to_n`
 
-#include "ustore/db.h"      // `ustore_database_init_t`, `ustore_error_t`
+#include "ustore/db.h"      // `ustore_database_t`, `ustore_outcome_t`
 #include "ustore/types.hpp" // `uuid_to_text`, `uuid_text_length_k`
 
 #include "arguments.hpp" // `parse_arguments`, `print_error`
@@ -162,53 +162,52 @@ struct command_line_t {
 
 #pragma region Commands
 
-/** Prints a red failure line with the database error. */
-void print_failure(char const* what, ustore_error_t const& error) noexcept {
-    fmt::println(style_of(tone_t::failure_k), "{}: {}", what, error.message);
+/** Whether @p outcome holds a failure. */
+[[nodiscard]] bool failed(ustore_outcome_t const& outcome) noexcept {
+    return outcome.status != ustore_status_success_k;
+}
+
+/** Prints a red failure line with the database outcome. */
+void print_failure(char const* what, ustore_outcome_t const& outcome) noexcept {
+    fmt::println(style_of(tone_t::failure_k), "{}: {}", what, outcome.message);
 }
 
 /** Resolves @p name to a collection ID, the main collection for an empty name. */
-void find_collection(ustore_database_t db, std::string_view name, ustore_collection_id_t& id,
-                     ustore_error_t* error) noexcept {
+void find_collection(ustore_database_t database, std::string_view name, ustore_collection_id_t& id,
+                     ustore_outcome_t* outcome) noexcept {
     if (name.empty()) {
         id = ustore_collection_main_k;
         return;
     }
-    ustore_arena_t arena = nullptr;
     ustore_str_view_t const text = name.data();
     auto const text_length = static_cast<ustore_length_t>(name.size());
-    ustore_octet_t* presences = nullptr;
-    ustore_collection_id_t* collections = nullptr;
+    ustore_octet_t presence = 0;
     ustore_collection_find_t find {};
-    find.db = db;
-    find.error = error;
-    find.arena = &arena;
-    find.tasks_count = 1;
+    find.database = database;
+    find.outcome = outcome;
+    find.count = 1;
     find.names = &text;
     find.names_lengths = &text_length;
-    find.presences = &presences;
-    find.collections = &collections;
+    find.presences = &presence;
+    find.collections = &id;
+    find.collections_stride = sizeof(ustore_collection_id_t);
     ustore_collection_find(&find);
-    if (!error->status) {
-        if (!(presences[0] & 1)) *error = {ustore_error_not_found_k, "No such collection"};
-        else id = collections[0];
-    }
-    ustore_arena_free(arena);
+    if (!failed(*outcome) && !(presence & 1)) *outcome = {ustore_status_not_found_k, "No such collection"};
 }
 
 /** Creates a collection under @p name. */
-[[nodiscard]] bool create_collection(ustore_database_t db, std::string_view name) noexcept {
-    ustore_error_t error {};
+[[nodiscard]] bool create_collection(ustore_database_t database, std::string_view name) noexcept {
+    ustore_outcome_t outcome {};
     ustore_collection_id_t id {};
     ustore_collection_create_t create {};
-    create.db = db;
-    create.error = &error;
+    create.database = database;
+    create.outcome = &outcome;
     create.name = name.data();
     create.name_length = static_cast<ustore_length_t>(name.size());
     create.collection = &id;
     ustore_collection_create(&create);
-    if (error.status) {
-        print_failure("Failed to create the collection", error);
+    if (failed(outcome)) {
+        print_failure("Failed to create the collection", outcome);
         return false;
     }
     fmt::println(style_of(tone_t::success_k), "Collection '{}' created", name);
@@ -216,17 +215,17 @@ void find_collection(ustore_database_t db, std::string_view name, ustore_collect
 }
 
 /** Drops the collection @p name addresses, which takes the name with it. */
-[[nodiscard]] bool drop_collection(ustore_database_t db, std::string_view name) noexcept {
-    ustore_error_t error {};
+[[nodiscard]] bool drop_collection(ustore_database_t database, std::string_view name) noexcept {
+    ustore_outcome_t outcome {};
     ustore_collection_drop_t drop {};
-    drop.db = db;
-    drop.error = &error;
+    drop.database = database;
+    drop.outcome = &outcome;
     drop.mode = ustore_drop_keys_vals_handle_k;
-    if (name.empty()) error = {ustore_error_invalid_argument_k, "The main collection is never dropped"};
-    else find_collection(db, name, drop.collection, &error);
-    if (!error.status) ustore_collection_drop(&drop);
-    if (error.status) {
-        print_failure("Failed to drop the collection", error);
+    if (name.empty()) outcome = {ustore_status_invalid_argument_k, "The main collection is never dropped"};
+    else find_collection(database, name, drop.collection, &outcome);
+    if (!failed(outcome)) ustore_collection_drop(&drop);
+    if (failed(outcome)) {
+        print_failure("Failed to drop the collection", outcome);
         return false;
     }
     fmt::println(style_of(tone_t::success_k), "Collection '{}' dropped", name);
@@ -234,8 +233,8 @@ void find_collection(ustore_database_t db, std::string_view name, ustore_collect
 }
 
 /** Prints every collection with its identifier, its name and what it holds. */
-[[nodiscard]] bool list_collections(ustore_database_t db) noexcept {
-    ustore_error_t error {};
+[[nodiscard]] bool list_collections(ustore_database_t database) noexcept {
+    ustore_outcome_t outcome {};
     ustore_arena_t arena = nullptr;
     ustore_size_t count = 0;
     ustore_collection_id_t* ids = nullptr;
@@ -243,8 +242,8 @@ void find_collection(ustore_database_t db, std::string_view name, ustore_collect
     ustore_length_t* names_offsets = nullptr;
     ustore_char_t* names = nullptr;
     ustore_collection_list_t list {};
-    list.db = db;
-    list.error = &error;
+    list.database = database;
+    list.outcome = &outcome;
     list.arena = &arena;
     list.count = &count;
     list.collections = &ids;
@@ -252,7 +251,7 @@ void find_collection(ustore_database_t db, std::string_view name, ustore_collect
     list.names_offsets = &names_offsets;
     list.names = &names;
     ustore_collection_list(&list);
-    for (std::size_t index = 0; !error.status && index != count; ++index) {
+    for (std::size_t index = 0; !failed(outcome) && index != count; ++index) {
         std::string_view const name {names + names_offsets[index], names_offsets[index + 1] - names_offsets[index]};
         std::size_t const modality = static_cast<std::size_t>(modalities[index]);
         char id_text[uuid_text_length_k];
@@ -261,30 +260,30 @@ void find_collection(ustore_database_t db, std::string_view name, ustore_collect
                      modality < modality_names_k.size() ? modality_names_k[modality] : "unknown");
     }
     ustore_arena_free(arena);
-    if (error.status) {
-        print_failure("Failed to list the collections", error);
+    if (failed(outcome)) {
+        print_failure("Failed to list the collections", outcome);
         return false;
     }
     return true;
 }
 
 /** Imports the documents of the file @p line names into the collection it names. */
-[[nodiscard]] bool import_documents(ustore_database_t db, command_line_t const& line) noexcept {
-    ustore_error_t error {};
+[[nodiscard]] bool import_documents(ustore_database_t database, command_line_t const& line) noexcept {
+    ustore_outcome_t outcome {};
     ustore_collection_id_t collection {};
-    find_collection(db, line.collection, collection, &error);
-    if (!error.status) {
+    find_collection(database, line.collection, collection, &outcome);
+    if (!failed(outcome)) {
         ustore_docs_import_t importing {};
-        importing.db = db;
-        importing.error = &error;
+        importing.database = database;
+        importing.outcome = &outcome;
         importing.collection = collection;
         importing.path = line.input.data();
         importing.max_batch_size = line.memory_limit.value;
         importing.id_field = line.id_field.data();
         ustore_docs_import(&importing);
     }
-    if (error.status) {
-        print_failure("Failed to import", error);
+    if (failed(outcome)) {
+        print_failure("Failed to import", outcome);
         return false;
     }
     fmt::println(style_of(tone_t::success_k), "Successfully imported");
@@ -292,21 +291,21 @@ void find_collection(ustore_database_t db, std::string_view name, ustore_collect
 }
 
 /** Exports the collection @p line names into the file it names. */
-[[nodiscard]] bool export_documents(ustore_database_t db, command_line_t const& line) noexcept {
-    ustore_error_t error {};
+[[nodiscard]] bool export_documents(ustore_database_t database, command_line_t const& line) noexcept {
+    ustore_outcome_t outcome {};
     ustore_collection_id_t collection {};
-    find_collection(db, line.collection, collection, &error);
-    if (!error.status) {
+    find_collection(database, line.collection, collection, &outcome);
+    if (!failed(outcome)) {
         ustore_docs_export_t exporting {};
-        exporting.db = db;
-        exporting.error = &error;
+        exporting.database = database;
+        exporting.outcome = &outcome;
         exporting.collection = collection;
         exporting.path = line.output.data();
         exporting.max_batch_size = line.memory_limit.value;
         ustore_docs_export(&exporting);
     }
-    if (error.status) {
-        print_failure("Failed to export", error);
+    if (failed(outcome)) {
+        print_failure("Failed to export", outcome);
         return false;
     }
     fmt::println(style_of(tone_t::success_k), "Successfully exported");
@@ -314,25 +313,25 @@ void find_collection(ustore_database_t db, std::string_view name, ustore_collect
 }
 
 /** Takes a snapshot of the head and writes it to @p path. */
-[[nodiscard]] bool export_snapshot(ustore_database_t db, std::string_view path) noexcept {
-    ustore_error_t error {};
+[[nodiscard]] bool export_snapshot(ustore_database_t database, std::string_view path) noexcept {
+    ustore_outcome_t outcome {};
     ustore_snapshot_t snapshot = nullptr;
     ustore_snapshot_init_t init {};
-    init.db = db;
-    init.error = &error;
+    init.database = database;
+    init.outcome = &outcome;
     init.snapshot = &snapshot;
     ustore_snapshot_init(&init);
-    if (!error.status) {
+    if (!failed(outcome)) {
         ustore_snapshot_export_t exporting {};
-        exporting.db = db;
-        exporting.error = &error;
+        exporting.database = database;
+        exporting.outcome = &outcome;
         exporting.snapshot = snapshot;
         exporting.path = path.data();
         ustore_snapshot_export(&exporting);
     }
     ustore_snapshot_free(snapshot);
-    if (error.status) {
-        print_failure("Failed to export the snapshot", error);
+    if (failed(outcome)) {
+        print_failure("Failed to export the snapshot", outcome);
         return false;
     }
     fmt::println(style_of(tone_t::success_k), "Snapshot exported");
@@ -340,15 +339,15 @@ void find_collection(ustore_database_t db, std::string_view name, ustore_collect
 }
 
 /** Runs the command of @p line and answers whether it succeeded. */
-[[nodiscard]] bool execute(ustore_database_t db, command_line_t const& line) noexcept {
+[[nodiscard]] bool execute(ustore_database_t database, command_line_t const& line) noexcept {
     switch (line.command) {
     case command_t::none_k: return false;
-    case command_t::collection_create_k: return create_collection(db, line.collection);
-    case command_t::collection_drop_k: return drop_collection(db, line.collection);
-    case command_t::collection_list_k: return list_collections(db);
-    case command_t::collection_import_k: return import_documents(db, line);
-    case command_t::collection_export_k: return export_documents(db, line);
-    case command_t::snapshot_export_k: return export_snapshot(db, line.snapshot_path);
+    case command_t::collection_create_k: return create_collection(database, line.collection);
+    case command_t::collection_drop_k: return drop_collection(database, line.collection);
+    case command_t::collection_list_k: return list_collections(database);
+    case command_t::collection_import_k: return import_documents(database, line);
+    case command_t::collection_export_k: return export_documents(database, line);
+    case command_t::snapshot_export_k: return export_snapshot(database, line.snapshot_path);
     }
     return false;
 }
@@ -398,16 +397,16 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    ustore_database_t db = nullptr;
-    ustore_error_t error {};
+    ustore_database_t database = nullptr;
+    ustore_outcome_t outcome {};
     line.engine.directory = line.directory.data();
-    open_engine(line.engine, &db, &error);
-    if (error.status) {
-        print_failure("Failed to open the database", error);
+    open_engine(line.engine, &database, &outcome);
+    if (failed(outcome)) {
+        print_failure("Failed to open the database", outcome);
         return 1;
     }
 
-    bool const succeeded = execute(db, line);
-    ustore_database_free(db);
+    bool const succeeded = execute(database, line);
+    ustore_database_free(database);
     return succeeded ? 0 : 1;
 }

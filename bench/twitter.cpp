@@ -107,7 +107,7 @@ struct json_document_t {
 struct twitter_t {
 
     /** Open database. */
-    ustore_database_t db = nullptr;
+    ustore_database_t database = nullptr;
 
     /** Collection of tweet and author documents. */
     ustore_collection_id_t docs = ustore_collection_main_k;
@@ -183,7 +183,7 @@ struct twitter_t {
 [[nodiscard]] bool append_integer(sz::string_t& text, std::int64_t value) noexcept {
     char digits[24];
     std::to_chars_result const printed = std::to_chars(digits, digits + sizeof(digits), value);
-    return text.try_append(digits, static_cast<std::size_t>(printed.ptr - digits));
+    return text.try_append(digits, static_cast<std::size_t>(printed.ptr - digits)) == sz::status_t::success_k;
 }
 
 /** The tweet @c append_tweet fills with an id, a text, an author and mentions. */
@@ -199,7 +199,8 @@ constexpr std::string_view
     std::size_t cursor = 0;
     for (std::size_t percent = tweet_template.find('%'); percent != std::string_view::npos;
          percent = tweet_template.find('%', cursor)) {
-        if (!output.try_append(tweet_template.data() + cursor, percent - cursor)) return false;
+        if (output.try_append(tweet_template.data() + cursor, percent - cursor) != sz::status_t::success_k)
+            return false;
         if (percent + 3 >= tweet_template.size() || tweet_template[percent + 2] != '$') return false;
         cursor = percent + 4;
         switch (tweet_template[percent + 1]) {
@@ -207,7 +208,7 @@ constexpr std::string_view
             if (!append_integer(output, tweet_id)) return false;
             break;
         case '2':
-            if (!output.try_resize(output.size() + text_length, '_')) return false;
+            if (output.try_resize(output.size() + text_length, '_') != sz::status_t::success_k) return false;
             break;
         case '3':
             if (!append_integer(output, user_id)) return false;
@@ -215,17 +216,19 @@ constexpr std::string_view
         case '4':
             for (std::size_t index = 0; index != mentioned_user_ids.size(); ++index) {
                 std::int64_t const mentioned = mentioned_user_ids[index];
-                if ((index != 0 && !output.try_push_back(',')) ||
-                    !output.try_append(R"({"screen_name":"","name":"","id":)") || !append_integer(output, mentioned) ||
-                    !output.try_append(R"(,"id_str":")") || !append_integer(output, mentioned) ||
-                    !output.try_append(R"(","indices":[]})"))
+                if ((index != 0 && output.try_push_back(',') != sz::status_t::success_k) ||
+                    output.try_append(R"({"screen_name":"","name":"","id":)") != sz::status_t::success_k ||
+                    !append_integer(output, mentioned) ||
+                    output.try_append(R"(,"id_str":")") != sz::status_t::success_k ||
+                    !append_integer(output, mentioned) ||
+                    output.try_append(R"(","indices":[]})") != sz::status_t::success_k)
                     return false;
             }
             break;
         default: return false;
         }
     }
-    return output.try_append(tweet_template.data() + cursor, tweet_template.size() - cursor);
+    return output.try_append(tweet_template.data() + cursor, tweet_template.size() - cursor) == sz::status_t::success_k;
 }
 
 /** Generates @c max_tweets tweets from @c tweet_template_k, one per line, and indexes them. */
@@ -248,7 +251,7 @@ constexpr std::string_view
             if (st::failed(mentioned_user_ids.push_back(std::int64_t {user_ids[random.below(user_ids.size())]})))
                 return false;
         if (!append_tweet(twitter.generated, tweet_id, text_length, user_id, mentioned_user_ids) ||
-            !twitter.generated.try_push_back('\n'))
+            twitter.generated.try_push_back('\n') != sz::status_t::success_k)
             return false;
         [[maybe_unused]] st::status_t const pushed = user_ids.push_back(st::assume_reserved, std::int64_t {user_id});
     }
@@ -314,7 +317,7 @@ void construct_docs(executor_t& executor, settings_t const& settings, twitter_t 
         upsert_scratch_t scratch;
         for (std::size_t call : loop) {
             std::span<batch_document_t const> const batch = staged.subspan(call * batch_size, batch_size);
-            if (!docs_upsert(twitter.db, twitter.docs, batch, scratch)) {
+            if (!docs_upsert(twitter.database, twitter.docs, batch, scratch)) {
                 loop.fail();
                 continue;
             }
@@ -337,7 +340,7 @@ void construct_graph(executor_t& executor, settings_t const& settings, twitter_t
         upsert_scratch_t scratch;
         for (std::size_t call : loop) {
             std::span<graph_edge_t const> const batch = staged.subspan(call * batch_size, batch_size);
-            if (edges_upsert(twitter.db, twitter.graph, batch, scratch))
+            if (edges_upsert(twitter.database, twitter.graph, batch, scratch))
                 loop.count(batch.size(), batch.size() * sizeof(graph_edge_t));
             else loop.fail();
         }
@@ -348,7 +351,11 @@ void construct_graph(executor_t& executor, settings_t const& settings, twitter_t
 
 #pragma region Analytics
 
-/** Random tweet keys one thread cycles through, drawn above its loop, and the arena and error its reads reuse. */
+/** Columns of the gathered table: one string column, then three 32-bit scalar columns. */
+constexpr std::size_t table_columns_k = 4;
+
+/** Random tweet keys one thread cycles through, drawn above its loop, and the arenas, spans and outcome its reads
+ *  reuse. */
 struct tweet_batches_t {
 
     /** Batches a thread cycles through, enough that the ring outgrows the caches one batch would warm. */
@@ -363,18 +370,47 @@ struct tweet_batches_t {
     /** Arena every read of this thread reuses. */
     ustore_arena_t arena = nullptr;
 
-    /** Error slot every read of this thread reuses. */
-    ustore_error_t error {};
+    /** Arena the second hop of a traversal reuses, so the edges of the first hop stay alive as its vertices. */
+    ustore_arena_t second_arena = nullptr;
+
+    /** Outcome slot every read of this thread reuses. */
+    ustore_outcome_t outcome {};
+
+    /** Offsets one read exports, one more than @c batch_size. */
+    st::basic_vector<ustore_length_t> offsets;
+
+    /** Lengths of the strings one gather exports, one per key. */
+    st::basic_vector<ustore_length_t> lengths;
+
+    /** Keys one sample draws. */
+    st::basic_vector<ustore_key_t> sampled;
+
+    /** Scalar columns of the gathered table, back to back. */
+    st::basic_vector<std::uint32_t> scalars;
+
+    /** Validity bitmaps of the gathered table, one per column, back to back. */
+    st::basic_vector<ustore_octet_t> validities;
+
+    /** Degrees one hop of a traversal exports, grown to the most vertices a hop reaches. */
+    st::basic_vector<ustore_vertex_degree_t> degrees;
 
     tweet_batches_t() noexcept = default;
     tweet_batches_t(tweet_batches_t const&) = delete;
     tweet_batches_t& operator=(tweet_batches_t const&) = delete;
-    ~tweet_batches_t() noexcept { ustore_arena_free(arena); }
+    ~tweet_batches_t() noexcept {
+        ustore_arena_free(arena);
+        ustore_arena_free(second_arena);
+    }
 
     /** Draws the keys of @c batches_count_k batches of @p size tweets from the stream keyed @p stream. */
     [[nodiscard]] bool draw(twitter_t const& twitter, std::size_t size, std::uint64_t stream) noexcept {
         batch_size = size;
-        if (st::failed(keys.resize(batches_count_k * size))) return false;
+        if (st::failed(keys.resize(batches_count_k * size)) || st::failed(offsets.resize(size + 1)) ||
+            st::failed(lengths.resize(size)) || st::failed(sampled.resize(size)) ||
+            st::failed(scalars.resize((table_columns_k - 1) * size)) ||
+            st::failed(validities.resize(table_columns_k * divide_round_up<std::size_t>(size, bits_in_byte_k))) ||
+            st::failed(degrees.resize(size)))
+            return false;
         splitmix64_t random {stream};
         for (ustore_key_t& key : keys) {
             std::size_t part = random.below(twitter.documents.size());
@@ -390,10 +426,10 @@ struct tweet_batches_t {
         return keys.data() + (call % batches_count_k) * batch_size;
     }
 
-    /** Answers whether the last read failed, clearing its error. */
+    /** Answers whether the last read failed, clearing its outcome. */
     [[nodiscard]] bool failed() noexcept {
-        if (!error.status) return false;
-        error = {};
+        if (outcome.status == ustore_status_success_k) return false;
+        outcome = {};
         return true;
     }
 };
@@ -419,90 +455,89 @@ void sample(executor_t& executor, settings_t const& settings, twitter_t const& t
 /** Samples batches of tweet keys, reading only the keys the sampler returns. */
 void docs_sample_keys(twitter_t const& twitter, tweet_batches_t& batches, loop_t& loop, std::size_t) noexcept {
     ustore_length_t const limit = 1;
-    ustore_length_t* found_offsets = nullptr;
-    ustore_length_t* found_counts = nullptr;
-    ustore_key_t* found_keys = nullptr;
     ustore_sample_t sample {};
-    sample.db = twitter.db;
-    sample.error = &batches.error;
-    sample.arena = &batches.arena;
-    sample.tasks_count = batches.batch_size;
+    sample.database = twitter.database;
+    sample.outcome = &batches.outcome;
+    sample.count = batches.batch_size;
     sample.collections = &twitter.docs;
     sample.count_limits = &limit;
     sample.count_limits_stride = 0;
-    sample.offsets = &found_offsets;
-    sample.counts = &found_counts;
-    sample.keys = &found_keys;
+    sample.offsets = batches.offsets.data();
+    sample.keys = batches.sampled.data();
     ustore_sample(&sample);
     if (batches.failed()) return loop.fail();
-    loop.count(batches.batch_size, found_offsets[batches.batch_size]);
+    loop.count(batches.batch_size, batches.offsets[batches.batch_size]);
 }
 
 /** Reads whole tweets as JSON, which parses and serializes every document. */
 void docs_sample_objects(twitter_t const& twitter, tweet_batches_t& batches, loop_t& loop, std::size_t call) noexcept {
-    ustore_length_t* offsets = nullptr;
     ustore_bytes_ptr_t values = nullptr;
     ustore_docs_read_t read {};
-    read.db = twitter.db;
-    read.error = &batches.error;
-    read.arena = &batches.arena;
-    read.type = ustore_doc_field_json_k;
-    read.tasks_count = batches.batch_size;
+    read.database = twitter.database;
+    read.outcome = &batches.outcome;
+    read.count = batches.batch_size;
     read.collections = &twitter.docs;
     read.keys = batches.batch(call);
     read.keys_stride = sizeof(ustore_key_t);
-    read.offsets = &offsets;
+    read.offsets = batches.offsets.data();
     read.values = &values;
+    read.arena = &batches.arena;
+    read.type = ustore_doc_field_json_k;
     ustore_docs_read(&read);
     if (batches.failed()) return loop.fail();
-    loop.count(batches.batch_size, offsets[batches.batch_size]);
+    loop.count(batches.batch_size, batches.offsets[batches.batch_size]);
 }
 
 /** Samples batches of tweets, reading one field out of each document. */
 void docs_sample_field(twitter_t const& twitter, tweet_batches_t& batches, loop_t& loop, std::size_t call) noexcept {
     ustore_str_view_t const field = "text";
-    ustore_length_t* offsets = nullptr;
     ustore_bytes_ptr_t values = nullptr;
     ustore_docs_read_t read {};
-    read.db = twitter.db;
-    read.error = &batches.error;
-    read.arena = &batches.arena;
-    read.type = ustore_doc_field_str_k;
-    read.tasks_count = batches.batch_size;
+    read.database = twitter.database;
+    read.outcome = &batches.outcome;
+    read.count = batches.batch_size;
     read.collections = &twitter.docs;
     read.keys = batches.batch(call);
     read.keys_stride = sizeof(ustore_key_t);
     read.fields = &field;
-    read.offsets = &offsets;
+    read.offsets = batches.offsets.data();
     read.values = &values;
+    read.arena = &batches.arena;
+    read.type = ustore_doc_field_str_k;
     ustore_docs_read(&read);
     if (batches.failed()) return loop.fail();
-    loop.count(batches.batch_size, offsets[batches.batch_size]);
+    loop.count(batches.batch_size, batches.offsets[batches.batch_size]);
 }
 
 /** Samples batches of tweets, gathering four typed fields of each into a table. */
 void docs_sample_table(twitter_t const& twitter, tweet_batches_t& batches, loop_t& loop, std::size_t call) noexcept {
-    constexpr std::size_t fields_count_k = 4;
-    ustore_str_view_t const names[fields_count_k] {"timestamp_ms", "reply_count", "retweet_count", "favorite_count"};
-    ustore_doc_field_type_t const types[fields_count_k] {
+    ustore_str_view_t const names[table_columns_k] {"timestamp_ms", "reply_count", "retweet_count", "favorite_count"};
+    ustore_doc_field_type_t const types[table_columns_k] {
         ustore_doc_field_str_k,
         ustore_doc_field_u32_k,
         ustore_doc_field_u32_k,
         ustore_doc_field_u32_k,
     };
 
+    // The first column holds strings, the other three hold 32-bit scalars.
     std::size_t const count = batches.batch_size;
-    ustore_octet_t** validities = nullptr;
-    ustore_byte_t** scalars = nullptr;
-    ustore_length_t** offsets = nullptr;
-    ustore_length_t** lengths = nullptr;
+    std::size_t const bitmap_bytes = divide_round_up<std::size_t>(count, bits_in_byte_k);
+    ustore_octet_t* validities[table_columns_k] {};
+    ustore_byte_t* scalars[table_columns_k] {};
+    ustore_length_t* offsets[table_columns_k] {batches.offsets.data()};
+    ustore_length_t* lengths[table_columns_k] {batches.lengths.data()};
+    for (std::size_t column = 0; column != table_columns_k; ++column) {
+        validities[column] = batches.validities.data() + column * bitmap_bytes;
+        if (column != 0)
+            scalars[column] = reinterpret_cast<ustore_byte_t*>(batches.scalars.data() + (column - 1) * count);
+    }
+
     ustore_byte_t* strings = nullptr;
     ustore_docs_gather_t gather {};
-    gather.db = twitter.db;
-    gather.error = &batches.error;
-    gather.arena = &batches.arena;
-    gather.docs_count = count;
-    gather.fields_count = fields_count_k;
+    gather.database = twitter.database;
+    gather.outcome = &batches.outcome;
+    gather.count = count;
+    gather.fields_count = table_columns_k;
     gather.collections = &twitter.docs;
     gather.keys = batches.batch(call);
     gather.keys_stride = sizeof(ustore_key_t);
@@ -510,19 +545,19 @@ void docs_sample_table(twitter_t const& twitter, tweet_batches_t& batches, loop_
     gather.fields_stride = sizeof(ustore_str_view_t);
     gather.types = types;
     gather.types_stride = sizeof(ustore_doc_field_type_t);
-    gather.columns_validities = &validities;
-    gather.columns_scalars = &scalars;
-    gather.columns_offsets = &offsets;
-    gather.columns_lengths = &lengths;
+    gather.columns_validities = validities;
+    gather.columns_scalars = scalars;
+    gather.columns_offsets = offsets;
+    gather.columns_lengths = lengths;
     gather.joined_strings = &strings;
+    gather.arena = &batches.arena;
     ustore_docs_gather(&gather);
     if (batches.failed()) return loop.fail();
 
-    // The first column holds strings, the other three hold 32-bit scalars.
     std::size_t const string_bytes = std::transform_reduce(
         lengths[0], lengths[0] + count, std::size_t {0}, std::plus<std::size_t> {},
         [](ustore_length_t length) noexcept { return length == ustore_length_missing_k ? 0u : length; });
-    loop.count(count, string_bytes + (fields_count_k - 1) * sizeof(std::uint32_t) * count);
+    loop.count(count, string_bytes + (table_columns_k - 1) * sizeof(std::uint32_t) * count);
 }
 
 /** Sums the @p count degrees, counting a missing vertex as zero. */
@@ -537,24 +572,24 @@ void graph_traverse_two_hops(twitter_t const& twitter, tweet_batches_t& batches,
                              std::size_t call) noexcept {
     ustore_vertex_role_t const role = ustore_vertex_role_any_k;
     std::size_t const count = batches.batch_size;
-    ustore_vertex_degree_t* degrees = nullptr;
     ustore_key_t* ids_in_edges = nullptr;
     ustore_graph_find_edges_t first_hop {};
-    first_hop.db = twitter.db;
-    first_hop.error = &batches.error;
-    first_hop.arena = &batches.arena;
-    first_hop.tasks_count = count;
+    first_hop.database = twitter.database;
+    first_hop.outcome = &batches.outcome;
+    first_hop.count = count;
     first_hop.collections = &twitter.graph;
     first_hop.vertices = batches.batch(call);
     first_hop.vertices_stride = sizeof(ustore_key_t);
     first_hop.roles = &role;
-    first_hop.degrees_per_vertex = &degrees;
+    first_hop.degrees_per_vertex = batches.degrees.data();
+    first_hop.degrees_per_vertex_stride = sizeof(ustore_vertex_degree_t);
     first_hop.edges_per_vertex = &ids_in_edges;
+    first_hop.arena = &batches.arena;
     ustore_graph_find_edges(&first_hop);
     if (batches.failed()) return loop.fail();
 
     // Keeps the two vertices of every (source, target, edge) triple, then only the unique vertices.
-    std::size_t total_edges = sum_degrees(degrees, count);
+    std::size_t total_edges = sum_degrees(batches.degrees.data(), count);
     for (std::size_t index = 0; index != total_edges; ++index) {
         ids_in_edges[index * 2] = ids_in_edges[index * 3];
         ids_in_edges[index * 2 + 1] = ids_in_edges[index * 3 + 1];
@@ -562,15 +597,17 @@ void graph_traverse_two_hops(twitter_t const& twitter, tweet_batches_t& batches,
     std::sort(ids_in_edges, ids_in_edges + total_edges * 2);
     std::size_t const unique_count = static_cast<std::size_t>(
         std::unique(ids_in_edges, ids_in_edges + total_edges * 2) - ids_in_edges);
+    if (batches.degrees.size() < unique_count && st::failed(batches.degrees.resize(unique_count))) return loop.fail();
 
     ustore_graph_find_edges_t second_hop = first_hop;
-    second_hop.options = ustore_option_dont_discard_memory_k;
-    second_hop.tasks_count = unique_count;
+    second_hop.count = unique_count;
     second_hop.vertices = ids_in_edges;
+    second_hop.degrees_per_vertex = batches.degrees.data();
+    second_hop.arena = &batches.second_arena;
     ustore_graph_find_edges(&second_hop);
     if (batches.failed()) return loop.fail();
 
-    total_edges += sum_degrees(degrees, unique_count);
+    total_edges += sum_degrees(batches.degrees.data(), unique_count);
     loop.count(total_edges, total_edges * 3 * sizeof(ustore_key_t));
 }
 
@@ -579,30 +616,31 @@ void graph_traverse_two_hops(twitter_t const& twitter, tweet_batches_t& batches,
 #pragma region Database
 
 /** Creates a collection holding @p modality into @p id, reporting a failure against @p name on the standard error. */
-[[nodiscard]] bool create_collection(ustore_database_t db, char const* name, ustore_modality_t modality,
+[[nodiscard]] bool create_collection(ustore_database_t database, char const* name, ustore_modality_t modality,
                                      ustore_collection_id_t& id) noexcept {
-    ustore_error_t error {};
+    ustore_outcome_t outcome {};
     ustore_collection_create_t create {};
-    create.db = db;
-    create.error = &error;
+    create.database = database;
+    create.outcome = &outcome;
     create.modality = modality;
     create.collection = &id;
     ustore_collection_create(&create);
-    if (!error.status) return true;
-    fmt::println(stderr, "Failed to create {}: {}", name, error.message);
+    if (outcome.status == ustore_status_success_k) return true;
+    fmt::println(stderr, "Failed to create {}: {}", name, outcome.message);
     return false;
 }
 
 /** Drops @p id as @p mode asks, reporting a failure on the standard error. */
-void drop_collection(ustore_database_t db, ustore_collection_id_t id, ustore_drop_mode_t mode) noexcept {
-    ustore_error_t error {};
+void drop_collection(ustore_database_t database, ustore_collection_id_t id, ustore_drop_mode_t mode) noexcept {
+    ustore_outcome_t outcome {};
     ustore_collection_drop_t drop {};
-    drop.db = db;
-    drop.error = &error;
+    drop.database = database;
+    drop.outcome = &outcome;
     drop.collection = id;
     drop.mode = mode;
     ustore_collection_drop(&drop);
-    if (error.status) fmt::println(stderr, "Failed to clear a collection: {}", error.message);
+    if (outcome.status != ustore_status_success_k)
+        fmt::println(stderr, "Failed to clear a collection: {}", outcome.message);
 }
 
 #pragma endregion Database
@@ -652,32 +690,32 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    ustore_error_t error {};
+    ustore_outcome_t outcome {};
     settings.engine.directory = settings.directory.data();
-    open_engine(settings.engine, &twitter.db, &error);
-    if (error.status) {
-        fmt::println(stderr, "Failed to open the database: {}", error.message);
+    open_engine(settings.engine, &twitter.database, &outcome);
+    if (outcome.status != ustore_status_success_k) {
+        fmt::println(stderr, "Failed to open the database: {}", outcome.message);
         return 1;
     }
 
-    ustore_capabilities_t capabilities {};
-    ustore_database_capabilities_t request {};
-    request.db = twitter.db;
-    request.error = &error;
-    request.capabilities = &capabilities;
-    ustore_database_capabilities(&request);
-    if (error.status) {
-        fmt::println(stderr, "Failed to read the database capabilities: {}", error.message);
-        ustore_database_free(twitter.db);
+    ustore_database_description_t description {};
+    ustore_database_describe_t request {};
+    request.database = twitter.database;
+    request.outcome = &outcome;
+    request.description = &description;
+    ustore_database_describe(&request);
+    if (outcome.status != ustore_status_success_k) {
+        fmt::println(stderr, "Failed to describe the database: {}", outcome.message);
+        ustore_database_free(twitter.database);
         return 1;
     }
 
-    bool const supports_collections = (capabilities & ustore_supports_collections_k) != 0;
-    bool const supports_transactions = (capabilities & ustore_supports_transactions_k) != 0;
+    bool const supports_collections = (description.capabilities & ustore_supports_collections_k) != 0;
+    bool const supports_transactions = (description.capabilities & ustore_supports_transactions_k) != 0;
     if (supports_collections &&
-        (!create_collection(twitter.db, "twitter.docs", ustore_modality_docs_k, twitter.docs) ||
-         !create_collection(twitter.db, "twitter.graph", ustore_modality_graph_k, twitter.graph))) {
-        ustore_database_free(twitter.db);
+        (!create_collection(twitter.database, "twitter.docs", ustore_modality_docs_k, twitter.docs) ||
+         !create_collection(twitter.database, "twitter.graph", ustore_modality_graph_k, twitter.graph))) {
+        ustore_database_free(twitter.database);
         return 1;
     }
 
@@ -692,10 +730,10 @@ int main(int argc, char** argv) {
     if (supports_collections) sample(executor, settings, twitter, "graph_traverse_two_hops", graph_traverse_two_hops);
 
     if (supports_collections) {
-        drop_collection(twitter.db, twitter.docs, ustore_drop_keys_vals_handle_k);
-        drop_collection(twitter.db, twitter.graph, ustore_drop_keys_vals_handle_k);
+        drop_collection(twitter.database, twitter.docs, ustore_drop_keys_vals_handle_k);
+        drop_collection(twitter.database, twitter.graph, ustore_drop_keys_vals_handle_k);
     }
-    drop_collection(twitter.db, ustore_collection_main_k, ustore_drop_keys_vals_k);
-    ustore_database_free(twitter.db);
+    drop_collection(twitter.database, ustore_collection_main_k, ustore_drop_keys_vals_k);
+    ustore_database_free(twitter.database);
     return 0;
 }

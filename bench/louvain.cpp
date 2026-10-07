@@ -666,11 +666,11 @@ int main(int argc, char** argv) {
     fmt::println("Graph: {} vertices, {} edges", memory_graph.vertices_count(), edges.size());
 
     ustore_database_t raw = nullptr;
-    ustore_error_t error {};
+    ustore_outcome_t outcome {};
     settings.engine.directory = settings.directory.data();
-    open_engine(settings.engine, &raw, &error);
-    if (error.status) {
-        fmt::println(stderr, "Failed to open the database: {}", error.message ? error.message : "unknown");
+    open_engine(settings.engine, &raw, &outcome);
+    if (outcome.status != ustore_status_success_k) {
+        fmt::println(stderr, "Failed to open the database: {}", outcome.message ? outcome.message : "unknown");
         return 1;
     }
     database_t database {raw};

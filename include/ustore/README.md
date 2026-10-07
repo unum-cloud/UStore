@@ -134,9 +134,11 @@ ustore_collection_drop(&(ustore_collection_drop_t){
 ```
 
 Each engine records names apart from every collection, so no identifier reaches them, and a name resolves in two phases: once through `ustore_collection_find`, which answers the identifier and the modality of every name of a batch at the head or at a snapshot, and by identifier from then on, as no other call carries one.
+Collections are created and dropped only at the head, so their names are never read inside a transaction, and resolving one never joins the conflicts of the work that follows it.
 A create records the name in the same step as the collection, refusing a name another collection carries even under a concurrent creator.
 The main collection is never removed, so only `ustore_drop_keys_vals_k` and `ustore_drop_vals_k` apply to it, and dropping any other collection whole forgets its name before the collection goes.
 `ustore_collection_list` exports the identifier of every other collection and, where asked, its modality and its name, which is empty for a collection created without one.
+A listing describes the database rather than a transaction, so it reads the head or a snapshot.
 
 ### Writes and Removals
 
@@ -478,7 +480,7 @@ Every collection and transaction handle owns one arena, which all references pro
 Threads sharing one handle, or reads interleaved with new requests, pass their own `arena_t` through `on`:
 
 ```cpp
-arena_t arena(db);
+arena_t arena;
 auto lengths = main[{key_from_integer(43), key_from_integer(44)}].on(arena).length();
 ```
 

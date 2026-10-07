@@ -568,8 +568,8 @@ typedef enum ustore_modality_t {
 /**
  *  @brief The arguments of @c ustore_collection_list, which exports every collection with its name and modality.
  *
- *  The main collection is never listed, and the order of the others is the engine's. Listing is the only collection
- *  operation beside @c ustore_collection_find that runs on a snapshot.
+ *  The main collection is never listed, and the order of the others is the engine's. A listing describes the
+ *  database, never a transaction, so it reads the head or a snapshot.
  */
 typedef struct ustore_collection_list_t {
 
@@ -585,8 +585,8 @@ typedef struct ustore_collection_list_t {
     /** Whether the call blocks or returns once queued; zero blocks. */
     ustore_completion_t completion;
 
-    /** What the listing sees, where @c NULL is the head. */
-    ustore_view_t view;
+    /** Optional snapshot whose collections are listed, where @c NULL lists the head. */
+    ustore_snapshot_t snapshot;
 
     /** Output for the number of collections. */
     ustore_size_t* count;
@@ -663,10 +663,10 @@ USTORE_EXPORT void ustore_collection_create(ustore_collection_create_t* argument
 /**
  *  @brief The arguments of @c ustore_collection_find, which reads the collections a batch of names address.
  *
- *  Names are read at the head of the database or at a snapshot, never inside a transaction, so resolving a name
- *  never joins the conflicts of the work that follows it. A name no collection carries answers
- *  @c ustore_collection_main_k, @c ustore_modality_any_k and an unset presence bit. Every output is a span of the
- *  caller's, sized by @c count.
+ *  Collections are created and dropped only at the head, so their names are read at the head or at a snapshot and
+ *  never inside a transaction, and resolving a name never joins the conflicts of the work that follows it. A name no
+ *  collection carries answers @c ustore_collection_main_k, @c ustore_modality_any_k and an unset presence bit. Every
+ *  output is a span of the caller's, sized by @c count.
  */
 typedef struct ustore_collection_find_t {
 

@@ -25,9 +25,21 @@
 #include <type_traits> // `std::remove_cvref_t`, `std::conditional_t`
 #include <utility>     // `std::move`
 
-#include "ustore/types.hpp" // `value_view_t`
+#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+
+#include "ustore/types.hpp" // `value_view_t`, `divide_round_up`
 
 namespace unum::ustore {
+
+#pragma region Views
+
+/** The view a read through @p transaction or @p snapshot sees, which is the head when neither is given. */
+inline ustore_view_t view_through(ustore_transaction_t transaction, ustore_snapshot_t snapshot,
+                                  ustore_watch_t watch) noexcept {
+    return transaction ? ustore_transaction_view(transaction, watch) : ustore_snapshot_view(snapshot);
+}
+
+#pragma endregion Views
 
 #pragma region Batches
 
@@ -282,8 +294,8 @@ strided_range<element_> strided(element_* begin, element_* end) noexcept {
 /** A pair of iterators, so that a move-only stream can drive a range-based loop. */
 template <typename iterator_>
 class range {
-    iterator_ begin_ {nullptr};
-    iterator_ end_ {nullptr};
+    iterator_ begin_ {};
+    iterator_ end_ {};
 
   public:
     range() = default;
@@ -527,6 +539,58 @@ class strings_tape_iterator_t {
 };
 
 #pragma endregion Tapes and Flat Arrays
+
+#pragma region Owned Results
+
+/**
+ *  @brief A view of a call's results, together with the heap buffer holding the spans it views, so they live exactly
+ *      as long as the result, while a tape it reaches stays in the arena of the call until that arena serves again.
+ *
+ *  It moves but never copies, and slices into the plain view wherever a copy that outlives nothing is enough.
+ */
+template <typename view_type_>
+class owning_view : public view_type_ {
+    st::basic_vector<std::byte> buffer_;
+
+  public:
+    owning_view() noexcept = default;
+    owning_view(view_type_ const& view, st::basic_vector<std::byte> buffer) noexcept
+        : view_type_(view), buffer_(std::move(buffer)) {}
+};
+
+/** The presence bits and @c count + 1 offsets a batched read exports into the caller's spans, with the lengths
+ *  derived from them, all carved out of one buffer. */
+struct read_spans_t {
+
+    /** Bits marking the present values. */
+    ustore_octet_t* presences = nullptr;
+
+    /** Offsets into the tape of values, the last one closing the final value. */
+    ustore_length_t* offsets = nullptr;
+
+    /** Lengths of the values, @c ustore_length_missing_k for the absent ones, once @c derive_lengths ran. */
+    ustore_length_t* lengths = nullptr;
+
+    /** Bytes the spans of @p count values take in one buffer. */
+    static constexpr std::size_t bytes(std::size_t count) noexcept {
+        return sizeof(ustore_length_t) * (2 * count + 1) + divide_round_up<std::size_t>(count, bits_in_byte_k);
+    }
+
+    /** Carves the spans of @p count values out of @p buffer, which holds @c bytes(count) aligned for lengths. */
+    static read_spans_t carve(std::byte* buffer, std::size_t count) noexcept {
+        ustore_length_t* const offsets = reinterpret_cast<ustore_length_t*>(buffer);
+        return {reinterpret_cast<ustore_octet_t*>(offsets + 2 * count + 1), offsets, offsets + count + 1};
+    }
+
+    /** Fills the lengths of the first @p count values from the offsets and presences a read exported. */
+    void derive_lengths(std::size_t count) const noexcept {
+        bits_view_t const present {presences};
+        for (std::size_t index = 0; index != count; ++index)
+            lengths[index] = present[index] ? offsets[index + 1] - offsets[index] : ustore_length_missing_k;
+    }
+};
+
+#pragma endregion Owned Results
 
 #pragma region Multiple Dimensions
 

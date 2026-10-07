@@ -203,16 +203,6 @@ enum class watch_t : bool { dont_watch_k, watch_k };
 /** Whether a write returns only after its data reaches the disk. */
 enum class flush_t : bool { dont_flush_k, flush_k };
 
-/** Maps a watch mode onto the options of the C ABI. */
-constexpr ustore_options_t to_options(watch_t watch) noexcept {
-    return watch == watch_t::dont_watch_k ? ustore_option_transaction_dont_watch_k : ustore_options_default_k;
-}
-
-/** Maps a flush mode onto the options of the C ABI. */
-constexpr ustore_options_t to_options(flush_t flush) noexcept {
-    return flush == flush_t::flush_k ? ustore_option_write_flush_k : ustore_options_default_k;
-}
-
 #pragma endregion Access Modes
 
 #pragma region Locations
@@ -414,61 +404,47 @@ value_view_t value_view(container_&& container) noexcept {
 /** Owns an arena the C ABI fills with results, freeing it on destruction. */
 class arena_t {
 
-    ustore_database_t database_ = nullptr;
     ustore_arena_t memory_ = nullptr;
 
   public:
-    arena_t(ustore_database_t database) noexcept : database_(database) {}
+    arena_t() noexcept = default;
     arena_t(arena_t const&) = delete;
     arena_t& operator=(arena_t const&) = delete;
+    ~arena_t() noexcept { ustore_arena_free(memory_); }
 
-    ~arena_t() {
-        ustore_arena_free(memory_);
-        memory_ = nullptr;
-    }
-
-    arena_t(arena_t&& other) noexcept : database_(other.database_), memory_(std::exchange(other.memory_, nullptr)) {}
+    arena_t(arena_t&& other) noexcept : memory_(std::exchange(other.memory_, nullptr)) {}
 
     arena_t& operator=(arena_t&& other) noexcept {
-        std::swap(database_, other.database_);
         std::swap(memory_, other.memory_);
         return *this;
     }
 
     ustore_arena_t* member_ptr() noexcept { return &memory_; }
     operator ustore_arena_t*() & noexcept { return member_ptr(); }
-    ustore_database_t db() const noexcept { return database_; }
 };
 
-/** Either owns an arena or borrows one that a longer-lived container holds. */
+/** Either owns an arena or borrows one that a longer-lived container holds, while a copy owns a fresh arena. */
 class any_arena_t {
 
     arena_t owned_;
-    ustore_arena_t* accessible_ = nullptr;
+    ustore_arena_t* borrowed_ = nullptr;
 
   public:
-    any_arena_t(ustore_database_t database) noexcept : owned_(database), accessible_(nullptr) {}
-    any_arena_t(arena_t& accessible) noexcept : owned_(nullptr), accessible_(accessible.member_ptr()) {}
-    any_arena_t(ustore_database_t database, ustore_arena_t* accessible) noexcept
-        : owned_(accessible ? nullptr : database), accessible_(accessible) {}
+    any_arena_t() noexcept = default;
+    explicit any_arena_t(ustore_arena_t* borrowed) noexcept : borrowed_(borrowed) {}
 
-    any_arena_t(any_arena_t&&) = default;
-    any_arena_t& operator=(any_arena_t&&) = default;
+    any_arena_t(any_arena_t&&) noexcept = default;
+    any_arena_t& operator=(any_arena_t&&) noexcept = default;
 
-    any_arena_t(any_arena_t const& other) noexcept
-        : owned_(other.is_remote() ? nullptr : other.owned_.db()), accessible_(other.accessible_) {}
-
-    any_arena_t& operator=(any_arena_t const& other) noexcept {
-        owned_ = other.is_remote() ? arena_t(nullptr) : other.owned_.db();
-        accessible_ = other.accessible_;
+    any_arena_t(any_arena_t const&) noexcept {}
+    any_arena_t& operator=(any_arena_t const&) noexcept {
+        owned_ = arena_t {};
+        borrowed_ = nullptr;
         return *this;
     }
 
-    /** Whether the arena is borrowed rather than owned. */
-    bool is_remote() const noexcept { return accessible_; }
-    ustore_arena_t* member_ptr() noexcept { return accessible_ ? accessible_ : owned_.member_ptr(); }
+    ustore_arena_t* member_ptr() noexcept { return borrowed_ ? borrowed_ : owned_.member_ptr(); }
     operator ustore_arena_t*() & noexcept { return member_ptr(); }
-    arena_t release_owned() noexcept { return std::exchange(owned_, arena_t {owned_.db()}); }
 };
 
 #pragma endregion Memory Management

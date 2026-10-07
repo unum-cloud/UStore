@@ -276,8 +276,8 @@ int main(int argc, char** argv) {
         return 1;
     }
     test_config_t const config {suite.engine, maybe_directory->path()};
-    database_t database;
-    if (open_database(database, config).failed()) {
+    auto [database, open_status] = open_database<database_t>(config);
+    if (open_status.failed()) {
         fmt::println(stderr, "Cannot open the database");
         return 1;
     }

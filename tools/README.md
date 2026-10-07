@@ -47,14 +47,15 @@ The file extension, `.ndjson` or `.csv`, selects the format, and `--help` prints
 
 The `.ndjson` or `.csv` extension of `path` selects the format: NDJSON is parsed and written with yyjson, and CSV with StringZilla.
 Fields are plain names or JSON pointers, and `max_batch_size` bounds the bytes buffered before each batched write.
+Imports take the `durability` of their writes, and exports the `view` they read through, where a null view reads the head.
 A key in a file is a non-negative integer, read as the key of that integer, or a UUID in canonical text, and an export writes every key back the same way: as its integer when its first eight bytes are zero, and as quoted UUID text otherwise.
 
 ```c
-ustore_error_t error = {0};
+ustore_outcome_t outcome = {0};
 ustore_str_view_t const fields[] = {"id", "text"};
 ustore_docs_import_t import = {
-    .db = db,
-    .error = &error,
+    .database = database,
+    .outcome = &outcome,
     .collection = collection,
     .path = "data/twitter/tweets.ndjson",
     .max_batch_size = 64 * 1024 * 1024,

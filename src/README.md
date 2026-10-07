@@ -4,22 +4,22 @@ Every engine implements the C ABI of `include/ustore/*.h` over its own storage, 
 The engines fill three roles: SmashTable is the reference engine in memory, NVMe is the hyper-converged engine on NVMe drives and GPUs, and RocksDB and LevelDB bring third-party key-value stores behind the same calls.
 Engines aim for the highest isolation SmashTable delivers, each reports the level its transactions actually deliver, and the conformance suite checks every advertised level against behaviour.
 
-| Engine     | Directory         | Role                  | Builds today | Isolation                                    |
-| :--------- | :---------------- | :-------------------- | :----------- | :------------------------------------------- |
-| SmashTable | `src/smashtable/` | reference, in memory  | always       | `strict_serializable` or `snapshot`, at open |
-| RocksDB    | `src/rocksdb/`    | third-party key-value | optional     | start snapshot, validated when staging       |
-| LevelDB    | `src/leveldb/`    | third-party key-value | optional     | snapshot reads, no transactions              |
-| NVMe       | `src/nvme/`       | hyper-converged       | v1 target    | optimistic, SmashTable's levels in v1        |
+| Engine     | Directory              | Role                  | Builds today | Isolation                              |
+| :--------- | :--------------------- | :-------------------- | :----------- | :------------------------------------- |
+| SmashTable | `src/ram/`             | reference, in memory  | always       | `strict_serializable` or `snapshot`    |
+| RocksDB    | `src_oracles/rocksdb/` | third-party key-value | optional     | start snapshot, validated when staging |
+| LevelDB    | `src_oracles/leveldb/` | third-party key-value | optional     | snapshot reads, no transactions        |
+| NVMe       | `src/nvme/`            | hyper-converged       | v1 target    | optimistic, SmashTable's levels in v1  |
 
 ## SmashTable
 
-`src/smashtable/` is the reference in-memory engine, and the one every other engine is checked against.
+`src/ram/` is the reference in-memory engine, and the one every other engine is checked against.
 Collections keyed by UUIDs, their catalog and its counter share one stamp-based SmashTable `partitioned_store` ordered by collection and key, and collections keyed by strings share a second one with the names of collections, ordered by collection and string.
 The catalog maps the UUID of every collection onto the number its pairs are filed under, so a stored key spends eight bytes on its collection rather than sixteen.
 Collections appear at runtime while a `transaction_group` spans stores fixed at compile time, so each store spans every collection of its keying, and both are built into one commit order, so a transaction reaching both publishes under one stamp and a snapshot reads both at it.
-One library serves both isolation levels: the `"isolation"` key picks one at open, each exported call visits the chosen instantiation once, and the `info` request of `ustore_database_control` reports it.
+One library serves both isolation levels: the `isolation` field of `ustore_database_init_ram_t` picks one at open, each exported call visits the chosen instantiation once, and the `info` request of `ustore_database_control` reports it.
 
-- `strict_serializable_k` validates every read and window, so `ustore_option_transaction_dont_watch_k` has nothing to switch off.
+- `strict_serializable_k` validates every read and window, so `ustore_watch_none_k` has nothing to switch off.
 - `snapshot_k` validates only the reads a transaction watches, trading write skew for cheaper commits.
 
 Snapshots map onto the versions the store already keeps.
@@ -27,16 +27,16 @@ A database opened with a directory persists as one binary image, rewritten whole
 
 ## RocksDB
 
-`src/rocksdb/` keeps each collection as a column family of a RocksDB `TransactionDB`, named `<modality>.<UUID>` so an open recovers both: UUID keys and strings alike under the bytewise comparator, the main collection in the default family, and the names of collections in a family of their own that no identifier reaches.
+`src_oracles/rocksdb/` keeps each collection as a column family of a RocksDB `TransactionDB`, named `<modality>.<UUID>` so an open recovers both: UUID keys and strings alike under the bytewise comparator, the main collection in the default family, and the names of collections in a family of their own that no identifier reaches.
 Every write reaches RocksDB's log, which stays in memory until a flushed write or commit, a full buffer or a clean close writes it out, so a crash keeps a consistent prefix of the commits across every collection.
-A transaction reads the snapshot its first read or write took, through its own buffered writes, and records the keys it watches unless a call passes `ustore_option_transaction_dont_watch_k`.
+A transaction reads the snapshot its first read or write took, through its own buffered writes, and records the keys it watches unless a call passes `ustore_watch_none_k`.
 Nothing is locked until it stages, when RocksDB's pessimistic transaction locks and validates every watched read and buffered write and prepares them into the log, so conflicts surface at stage or commit as on SmashTable.
 Scans are not validated, and a prepared transaction a crash leaves behind is rolled back when the database opens.
 This is one design for durability and two-phase commits rather than the settled one, and a log kept above the engine, as a data-lake coordinator would own, remains open.
 
 ## LevelDB
 
-`src_oracles/leveldb/` wraps one LevelDB database with snapshots and collections, but without transactions: `ustore_transaction_init` fails with an error.
+`src_oracles/leveldb/` wraps one LevelDB database with snapshots and collections, but without transactions: `ustore_transaction_init` answers `ustore_status_unsupported_k`.
 LevelDB keeps one sorted keyspace, so every stored key leads with a tag naming its range, and the engine's comparator orders keys by tag, then by the number the catalog gave the collection, then as bytes, keeping each collection one contiguous run:
 
 ```c
@@ -58,7 +58,7 @@ Its isolation ends at reading from a snapshot.
 A `database` holds `collection`s, each an `lsm_tree` of `lsm_level`s whose `lsm_sorted_run` files open with a `sorted_run_index` of `key_slot`s ahead of their `stored_value`s, with optimistic transactions, snapshots and backups.
 Its graph database keeps adjacency in NVMe's own databases, as a fast path beside `c/graph.cpp`.
 Its strings and the names of its collections live in `src/nvme/strings.cpp`, as sorted buckets under integer keys in collections no identifier a caller holds reaches, until the engine keys strings itself.
-It keeps 64-bit keys inside for now, so it takes only keys below 2⁶⁴, refusing the rest with `ustore_error_unsupported_k`, and names a collection by the UUID spelling its catalog number rather than a UUIDv7.
+It keeps 64-bit keys inside for now, so it takes only keys below 2⁶⁴, refusing the rest with `ustore_status_unsupported_k`, and names a collection by the UUID spelling its catalog number rather than a UUIDv7.
 CMake refuses `USTORE_BUILD_NVME` until the sources in this directory build in tree, so everything below is a v1 target:
 
 - __Kernel bypass__ — a transport chosen at mount reaches each data directory through io_uring on `O_DIRECT` files, io_uring on NVMe block devices, NVMe passthrough, or SPDK's user-space driver, and falls back to blocking positioned I/O on macOS, Windows and wherever io_uring is refused.

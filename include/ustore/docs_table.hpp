@@ -7,7 +7,7 @@
 
 #pragma once
 
-#include <cstddef> // `std::size_t`
+#include <cstddef> // `std::byte`, `std::max_align_t`, `std::ptrdiff_t`, `std::size_t`
 
 #include <algorithm>   // `std::copy_n`
 #include <array>       // `std::array`
@@ -16,15 +16,50 @@
 #include <string_view> // `std::string_view`
 #include <tuple>       // `std::tuple`
 #include <type_traits> // `std::conditional_t`
+#include <utility>     // `std::exchange`, `std::move`
 #include <variant>     // `std::monostate`
 
 #include "ustore/docs.h"
-#include "ustore/ranges.hpp" // `strided_iterator`, `strided_range`, `bits_view_t`
-#include "ustore/types.hpp"  // `value_view_t`, `ustore_doc_field`
+#include "ustore/ranges.hpp" // `strided_iterator`, `strided_range`, `bits_view_t`, `owning_view`
+#include "ustore/status.hpp" // `status_t`, `expected`
+#include "ustore/types.hpp"  // `value_view_t`, `ustore_doc_field`, `round_up_to_multiple`
 
 namespace unum::ustore {
 
 #pragma region Cells and Columns
+
+/** Whether a gathered column of @p type holds strings, which offsets and lengths address, rather than scalars. */
+constexpr bool is_variable_length(ustore_doc_field_type_t type) noexcept {
+    return type == ustore_doc_field_str_k || type == ustore_doc_field_bin_k;
+}
+
+/** Bytes one cell of a gathered scalar column of @p type takes, and zero for a type no scalar column holds. */
+constexpr std::size_t scalar_bytes(ustore_doc_field_type_t type) noexcept {
+    switch (type) {
+    case ustore_doc_field_bool_k: return sizeof(bool);
+    case ustore_doc_field_uuid_k: return sizeof(ustore_uuid_t);
+    case ustore_doc_field_f64_k: return sizeof(f64_t);
+    case ustore_doc_field_f32_k: return sizeof(f32_t);
+    case ustore_doc_field_f16_k: return sizeof(u16_t);
+    case ustore_doc_field_i64_k: return sizeof(i64_t);
+    case ustore_doc_field_i32_k: return sizeof(i32_t);
+    case ustore_doc_field_i16_k: return sizeof(i16_t);
+    case ustore_doc_field_i8_k: return sizeof(i8_t);
+    case ustore_doc_field_u64_k: return sizeof(u64_t);
+    case ustore_doc_field_u32_k: return sizeof(u32_t);
+    case ustore_doc_field_u16_k: return sizeof(u16_t);
+    case ustore_doc_field_u8_k: return sizeof(u8_t);
+    default: return 0;
+    }
+}
+
+/** Bytes a gathered column of @p type takes for @p rows documents, its offsets and lengths for strings, aligned for
+ *  any scalar. */
+constexpr std::size_t column_bytes(ustore_doc_field_type_t type, std::size_t rows) noexcept {
+    std::size_t const bytes = is_variable_length(type) ? sizeof(ustore_length_t) * (2 * rows + 1)
+                                                       : scalar_bytes(type) * rows;
+    return round_up_to_multiple<std::size_t>(bytes, alignof(std::max_align_t));
+}
 
 /** Element types stored as offsets and lengths into a joined tape rather than as fixed-width scalars. */
 template <typename element_>
@@ -228,6 +263,9 @@ inline table_header_view_t make_table_header(std::span<field_type_t const> colum
 /**
  *  @brief Results of @c ustore_docs_gather, with documents as rows and fields as columns.
  *
+ *  The columns live in a buffer that @c make allocates and its result owns, while the joined strings stay in the
+ *  arena of the gather.
+ *
  *  @tparam column_types_ Types of the columns, or @c std::monostate alone when they are known only at runtime.
  */
 template <typename... column_types_>
@@ -247,12 +285,9 @@ class docs_table {
     strided_iterator<ustore_str_view_t const> fields_;
     strided_iterator<ustore_doc_field_type_t const> types_;
 
-    ustore_octet_t** columns_validities_ {nullptr};
-    ustore_octet_t** columns_conversions_ {nullptr};
-    ustore_octet_t** columns_collisions_ {nullptr};
-    ustore_byte_t** columns_scalars_ {nullptr};
-    ustore_length_t** columns_offsets_ {nullptr};
-    ustore_length_t** columns_lengths_ {nullptr};
+    /** Six rows of @c fields_count_ column addresses one after another: the validities, conversions, collisions,
+     *  scalars, offsets and lengths. */
+    ustore_octet_t** addresses_ {nullptr};
     ustore_byte_t* tape_ {nullptr};
 
   public:
@@ -260,31 +295,24 @@ class docs_table {
         ustore_size_t docs_count, ustore_size_t fields_count,
         strided_iterator<ustore_collection_id_t const> collections, strided_iterator<ustore_key_t const> keys,
         strided_iterator<ustore_str_view_t const> fields, strided_iterator<ustore_doc_field_type_t const> types,
-        ustore_octet_t** columns_validities = nullptr, ustore_octet_t** columns_conversions = nullptr,
-        ustore_octet_t** columns_collisions = nullptr, ustore_byte_t** columns_scalars = nullptr,
-        ustore_length_t** columns_offsets = nullptr, ustore_length_t** columns_lengths = nullptr,
-        ustore_byte_t* tape = nullptr) noexcept
+        ustore_octet_t** addresses) noexcept
         : docs_count_(docs_count), fields_count_(fields_count), collections_(collections), keys_(keys), fields_(fields),
-          types_(types), columns_validities_(columns_validities), columns_conversions_(columns_conversions),
-          columns_collisions_(columns_collisions), columns_scalars_(columns_scalars), columns_offsets_(columns_offsets),
-          columns_lengths_(columns_lengths), tape_(tape) {}
+          types_(types), addresses_(addresses) {}
 
     table_index_view_t index() const noexcept { return {collections_, keys_, docs_count_}; }
     table_header_view_t header() const noexcept { return {fields_, types_, fields_count_}; }
 
     template <typename element_ = std::monostate>
     auto column(std::size_t index) const noexcept {
+        ustore_octet_t** const validities = columns_validities();
+        ustore_octet_t** const conversions = columns_conversions();
+        ustore_octet_t** const collisions = columns_collisions();
+        ustore_byte_t** const scalars = columns_scalars();
+        ustore_length_t** const offsets = columns_offsets();
+        ustore_length_t** const lengths = columns_lengths();
         column_view_t const punned {
-            columns_validities_[index],
-            columns_conversions_[index],
-            columns_collisions_[index],
-            columns_scalars_[index],
-            tape_,
-            columns_offsets_[index],
-            columns_lengths_[index],
-            docs_count_,
-            fields_[index],
-            types_[index],
+            validities[index], conversions[index], collisions[index], scalars[index], tape_,
+            offsets[index],    lengths[index],     docs_count_,       fields_[index], types_[index],
         };
         if constexpr (std::is_same_v<element_, std::monostate>) return punned;
         else return punned.template as<element_>();
@@ -299,13 +327,62 @@ class docs_table {
     std::size_t rows() const noexcept { return docs_count_; }
     std::size_t columns() const noexcept { return fields_count_; }
 
-    ustore_octet_t*** member_validities() noexcept { return &columns_validities_; }
-    ustore_octet_t*** member_conversions() noexcept { return &columns_conversions_; }
-    ustore_octet_t*** member_collisions() noexcept { return &columns_collisions_; }
-    ustore_byte_t*** member_scalars() noexcept { return &columns_scalars_; }
-    ustore_length_t*** member_offsets() noexcept { return &columns_offsets_; }
-    ustore_length_t*** member_lengths() noexcept { return &columns_lengths_; }
+    ustore_octet_t** columns_validities() const noexcept { return addresses_; }
+    ustore_octet_t** columns_conversions() const noexcept { return addresses_ + fields_count_; }
+    ustore_octet_t** columns_collisions() const noexcept { return addresses_ + 2 * fields_count_; }
+    ustore_byte_t** columns_scalars() const noexcept { return addresses_ + 3 * fields_count_; }
+    ustore_length_t** columns_offsets() const noexcept {
+        return reinterpret_cast<ustore_length_t**>(addresses_ + 4 * fields_count_);
+    }
+    ustore_length_t** columns_lengths() const noexcept { return columns_offsets() + fields_count_; }
     ustore_byte_t** member_tape() noexcept { return &tape_; }
+
+    /** A table of @p docs_count rows and @p fields_count columns, whose cells live in one zeroed buffer: six rows of
+     *  column addresses, then three bitmaps per column, then the columns themselves. The addresses a column's type
+     *  leaves unused stay null. */
+    static expected<owning_view<docs_table>> make( //
+        ustore_size_t docs_count, ustore_size_t fields_count,
+        strided_iterator<ustore_collection_id_t const> collections, strided_iterator<ustore_key_t const> keys,
+        strided_iterator<ustore_str_view_t const> fields,
+        strided_iterator<ustore_doc_field_type_t const> types) noexcept {
+
+        std::size_t const bitmap_bytes = divide_round_up<std::size_t>(docs_count, bits_in_byte_k);
+        std::size_t const addresses_bytes = 6 * sizeof(void*) * fields_count;
+        std::size_t const bitmaps_bytes = round_up_to_multiple<std::size_t>(3 * bitmap_bytes * fields_count,
+                                                                            alignof(std::max_align_t));
+        std::size_t columns_bytes = 0;
+        for (std::size_t field = 0; field != fields_count; ++field)
+            columns_bytes += column_bytes(types[static_cast<std::ptrdiff_t>(field)], docs_count);
+        st::basic_vector<std::byte> buffer;
+        if (st::failed(buffer.resize(addresses_bytes + bitmaps_bytes + columns_bytes)))
+            return status_t {status_code_t::out_of_memory_k, "Failed to allocate the columns of a table"};
+
+        std::byte* const addresses = buffer.data();
+        docs_table const table {
+            docs_count, fields_count, collections, keys, fields, types, reinterpret_cast<ustore_octet_t**>(addresses)};
+        ustore_octet_t* bitmap = reinterpret_cast<ustore_octet_t*>(addresses + addresses_bytes);
+        std::byte* column = addresses + addresses_bytes + bitmaps_bytes;
+        ustore_octet_t** const validities = table.columns_validities();
+        ustore_octet_t** const conversions = table.columns_conversions();
+        ustore_octet_t** const collisions = table.columns_collisions();
+        ustore_byte_t** const scalars = table.columns_scalars();
+        ustore_length_t** const offsets_columns = table.columns_offsets();
+        ustore_length_t** const lengths_columns = table.columns_lengths();
+        for (std::size_t field = 0; field != fields_count; ++field) {
+            validities[field] = std::exchange(bitmap, bitmap + bitmap_bytes);
+            conversions[field] = std::exchange(bitmap, bitmap + bitmap_bytes);
+            collisions[field] = std::exchange(bitmap, bitmap + bitmap_bytes);
+            ustore_doc_field_type_t const type = types[static_cast<std::ptrdiff_t>(field)];
+            if (is_variable_length(type)) {
+                ustore_length_t* const offsets = reinterpret_cast<ustore_length_t*>(column);
+                offsets_columns[field] = offsets;
+                lengths_columns[field] = offsets + docs_count + 1;
+            }
+            else scalars[field] = reinterpret_cast<ustore_byte_t*>(column);
+            column += column_bytes(type, docs_count);
+        }
+        return owning_view<docs_table> {table, std::move(buffer)};
+    }
 };
 
 using docs_table_t = docs_table<std::monostate>;

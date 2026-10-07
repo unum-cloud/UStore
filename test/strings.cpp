@@ -19,6 +19,7 @@
 
 #include <fmt/format.h>
 
+#include "ustore/ranges.hpp" // `bits_view_t`
 #include "ustore/ustore.h"
 
 #include "test.hpp" // `suite_exit_code`, `expect`, `expect_eq`
@@ -41,7 +42,7 @@ struct strings_batch_t {
     /** Length of every string. */
     std::array<ustore_length_t, batch_capacity_k> text_lengths {};
 
-    /** Pointer to the bytes of every value, null where the task removes its string. */
+    /** Pointer to the bytes of every value. */
     std::array<ustore_bytes_cptr_t, batch_capacity_k> values {};
 
     /** Length of every value. */
@@ -56,15 +57,6 @@ struct strings_batch_t {
         text_lengths[count] = static_cast<ustore_length_t>(text.size());
         values[count] = reinterpret_cast<ustore_bytes_cptr_t>(value.data());
         value_lengths[count] = static_cast<ustore_length_t>(value.size());
-        ++count;
-    }
-
-    /** Adds a task removing @p text, which a null value spells. */
-    void erase(std::string_view text) noexcept {
-        texts[count] = text.data();
-        text_lengths[count] = static_cast<ustore_length_t>(text.size());
-        values[count] = nullptr;
-        value_lengths[count] = 0;
         ++count;
     }
 };
@@ -85,18 +77,21 @@ struct fixture_t {
     fixture_t& operator=(fixture_t const&) = delete;
 
     explicit fixture_t(test_config_t const& config) noexcept {
-        if (status_t const opened = open_raw(config, database); opened.failed()) {
-            fmt::println(stderr, "  failed to open the database: {}", opened.message);
+        auto [opened, open_status] = open_raw(config);
+        if (open_status.failed()) {
+            fmt::println(stderr, "  failed to open the database: {}", open_status.message);
             return;
         }
-        ustore_error_t error {};
+        database = opened;
+        ustore_outcome_t outcome {};
         ustore_collection_create_t create {};
-        create.db = database;
-        create.error = &error;
+        create.database = database;
+        create.outcome = &outcome;
         create.modality = ustore_modality_strings_k;
         create.collection = &collection;
         ustore_collection_create(&create);
-        if (error.status) fmt::println(stderr, "  failed to create a strings collection: {}", error.message);
+        if (outcome.status != ustore_status_success_k)
+            fmt::println(stderr, "  failed to create a strings collection: {}", outcome.message);
     }
 
     ~fixture_t() noexcept {
@@ -110,24 +105,23 @@ struct fixture_t {
 
 /** Sends @p batch through @c ustore_strings_write and counts a failure when it is refused. */
 [[nodiscard]] std::size_t write_batch(fixture_t& fixture, strings_batch_t const& batch) noexcept {
-    ustore_error_t error {};
+    ustore_outcome_t outcome {};
     ustore_strings_write_t write {};
-    write.db = fixture.database;
-    write.error = &error;
-    write.arena = &fixture.arena;
+    write.database = fixture.database;
+    write.outcome = &outcome;
+    write.count = batch.count;
     write.collections = &fixture.collection;
-    write.tasks_count = batch.count;
     write.strings = batch.texts.data();
     write.strings_stride = sizeof(ustore_str_view_t);
     write.strings_lengths = batch.text_lengths.data();
     write.strings_lengths_stride = sizeof(ustore_length_t);
-    write.values = batch.values.data();
-    write.values_stride = sizeof(ustore_bytes_cptr_t);
     write.values_lengths = batch.value_lengths.data();
     write.values_lengths_stride = sizeof(ustore_length_t);
+    write.values = batch.values.data();
+    write.values_stride = sizeof(ustore_bytes_cptr_t);
 
     ustore_strings_write(&write);
-    return expect_no_error(error);
+    return expect_success(outcome);
 }
 
 /** Writes one string and its value. */
@@ -137,54 +131,64 @@ struct fixture_t {
     return write_batch(fixture, batch);
 }
 
-/** Removes one string. */
+/** Removes one string through @c ustore_strings_remove. */
 [[nodiscard]] std::size_t erase_one(fixture_t& fixture, std::string_view text) noexcept {
-    strings_batch_t batch;
-    batch.erase(text);
-    return write_batch(fixture, batch);
+    ustore_str_view_t const text_pointer = text.data();
+    ustore_length_t const text_length = static_cast<ustore_length_t>(text.size());
+    ustore_outcome_t outcome {};
+    ustore_strings_remove_t remove {};
+    remove.database = fixture.database;
+    remove.outcome = &outcome;
+    remove.count = 1;
+    remove.collections = &fixture.collection;
+    remove.strings = &text_pointer;
+    remove.strings_lengths = &text_length;
+
+    ustore_strings_remove(&remove);
+    return expect_success(outcome);
 }
 
 /** The values one read exported, addressed by task. */
 struct read_results_t {
 
-    /** Length of every value, @c ustore_length_missing_k for a string the database does not hold. */
-    ustore_length_t* lengths = nullptr;
+    /** Bits marking the strings the database holds. */
+    std::array<ustore_octet_t, divide_round_up(batch_capacity_k, bits_in_byte_k)> presences {};
 
-    /** Offsets of the values inside @c values. */
-    ustore_length_t* offsets = nullptr;
+    /** Offsets of the values inside @c values, one more than the tasks. */
+    std::array<ustore_length_t, batch_capacity_k + 1> offsets {};
 
     /** The tape of values. */
     ustore_byte_t* values = nullptr;
 
     /** Whether the string of task @p index is present. */
-    [[nodiscard]] bool present(std::size_t index) const noexcept { return lengths[index] != ustore_length_missing_k; }
+    [[nodiscard]] bool present(std::size_t index) const noexcept { return bits_view_t {presences.data()}[index]; }
 
     /** The value of task @p index as text. */
     [[nodiscard]] std::string_view value_of(std::size_t index) const noexcept {
-        return {reinterpret_cast<char const*>(values) + offsets[index], lengths[index]};
+        return {reinterpret_cast<char const*>(values) + offsets[index], offsets[index + 1] - offsets[index]};
     }
 };
 
 /** Reads the values of @p batch, counting a failure when the read is refused. */
 [[nodiscard]] std::size_t read_batch(fixture_t& fixture, strings_batch_t const& batch,
                                      read_results_t& results) noexcept {
-    ustore_error_t error {};
+    ustore_outcome_t outcome {};
     ustore_strings_read_t read {};
-    read.db = fixture.database;
-    read.error = &error;
-    read.arena = &fixture.arena;
+    read.database = fixture.database;
+    read.outcome = &outcome;
+    read.count = batch.count;
     read.collections = &fixture.collection;
-    read.tasks_count = batch.count;
     read.strings = batch.texts.data();
     read.strings_stride = sizeof(ustore_str_view_t);
     read.strings_lengths = batch.text_lengths.data();
     read.strings_lengths_stride = sizeof(ustore_length_t);
-    read.offsets = &results.offsets;
-    read.lengths = &results.lengths;
+    read.presences = results.presences.data();
+    read.offsets = results.offsets.data();
     read.values = &results.values;
+    read.arena = &fixture.arena;
 
     ustore_strings_read(&read);
-    return expect_no_error(error);
+    return expect_success(outcome);
 }
 
 /** The strings one scan exported, in the order of their text. */
@@ -193,8 +197,8 @@ struct scan_results_t {
     /** Strings the scan found. */
     ustore_length_t count = 0;
 
-    /** Offsets of the found strings inside @c strings. */
-    ustore_length_t* offsets = nullptr;
+    /** Offsets of the found strings inside @c strings, one more than the strings. */
+    std::array<ustore_length_t, batch_capacity_k + 1> offsets {};
 
     /** The tape of found strings. */
     ustore_char_t* strings = nullptr;
@@ -205,29 +209,33 @@ struct scan_results_t {
     }
 };
 
-/** Walks @p prefix, counting a failure when the scan is refused. */
+/** Walks @p prefix from @p start, at most @c batch_capacity_k strings, counting a failure when the scan is refused. */
 [[nodiscard]] std::size_t scan_prefix(fixture_t& fixture, std::string_view prefix, ustore_length_t limit,
-                                      scan_results_t& results) noexcept {
-    ustore_error_t error {};
+                                      scan_results_t& results, std::string_view start = {}) noexcept {
     ustore_str_view_t const prefix_pointer = prefix.data();
-    auto const prefix_length = static_cast<ustore_length_t>(prefix.size());
-    ustore_length_t* counts = nullptr;
+    ustore_length_t const prefix_length = static_cast<ustore_length_t>(prefix.size());
+    ustore_str_view_t const start_pointer = start.data();
+    ustore_length_t const start_length = static_cast<ustore_length_t>(start.size());
+    ustore_length_t scan_offsets[2] {};
+    ustore_outcome_t outcome {};
     ustore_strings_scan_t scan {};
-    scan.db = fixture.database;
-    scan.error = &error;
-    scan.arena = &fixture.arena;
+    scan.database = fixture.database;
+    scan.outcome = &outcome;
+    scan.count = 1;
     scan.collections = &fixture.collection;
-    scan.tasks_count = 1;
     scan.prefixes = &prefix_pointer;
     scan.prefixes_lengths = &prefix_length;
+    scan.start_strings = &start_pointer;
+    scan.start_strings_lengths = &start_length;
     scan.count_limits = &limit;
-    scan.counts = &counts;
-    scan.strings_offsets = &results.offsets;
+    scan.offsets = scan_offsets;
+    scan.strings_offsets = results.offsets.data();
     scan.strings = &results.strings;
+    scan.arena = &fixture.arena;
 
     ustore_strings_scan(&scan);
-    if (std::size_t const failures = expect_no_error(error)) return failures;
-    results.count = counts[0];
+    if (std::size_t const failures = expect_success(outcome)) return failures;
+    results.count = scan_offsets[1] - scan_offsets[0];
     return 0;
 }
 
@@ -342,7 +350,7 @@ std::size_t strings_empty_and_embedded_zero(test_config_t const& config) {
     return failures;
 }
 
-/** Writing a string again replaces its value, and a task without one removes it. */
+/** Writing a string again replaces its value, and a removal takes it away. */
 std::size_t strings_update_and_remove(test_config_t const& config) {
     std::size_t failures = 0;
     fixture_t fixture {config};
@@ -460,35 +468,12 @@ std::size_t strings_scan_pagination(test_config_t const& config) {
         failures += expect_eq(first_page[1], std::string_view("page:b"));
     }
 
-    ustore_error_t error {};
-    ustore_str_view_t const prefix_pointer = "page:";
-    ustore_length_t const prefix_length = 5;
-    ustore_str_view_t const resume_pointer = "page:c";
-    ustore_length_t const resume_length = 6;
-    ustore_length_t limit = 8;
-    ustore_length_t* counts = nullptr;
     scan_results_t second_page;
-    ustore_strings_scan_t scan {};
-    scan.db = fixture.database;
-    scan.error = &error;
-    scan.arena = &fixture.arena;
-    scan.collections = &fixture.collection;
-    scan.tasks_count = 1;
-    scan.prefixes = &prefix_pointer;
-    scan.prefixes_lengths = &prefix_length;
-    scan.start_strings = &resume_pointer;
-    scan.start_strings_lengths = &resume_length;
-    scan.count_limits = &limit;
-    scan.counts = &counts;
-    scan.strings_offsets = &second_page.offsets;
-    scan.strings = &second_page.strings;
-
-    ustore_strings_scan(&scan);
-    std::size_t const scanned = expect_no_error(error);
+    std::size_t const scanned = scan_prefix(fixture, "page:", 8, second_page, "page:c");
     failures += scanned;
     if (scanned == 0) {
-        failures += expect_eq(static_cast<std::size_t>(counts[0]), 1u);
-        if (counts[0] == 1) failures += expect_eq(second_page[0], std::string_view("page:c"));
+        failures += expect_eq(static_cast<std::size_t>(second_page.count), 1u);
+        if (second_page.count == 1) failures += expect_eq(second_page[0], std::string_view("page:c"));
     }
     return failures;
 }

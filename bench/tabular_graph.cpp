@@ -120,7 +120,7 @@ struct source_file_t {
 struct tabular_t {
 
     /** Open database. */
-    ustore_database_t db = nullptr;
+    ustore_database_t database = nullptr;
 
     /** The graph collection the graph benchmarks import into and export from. */
     ustore_collection_id_t graph = ustore_collection_main_k;
@@ -138,7 +138,9 @@ struct tabular_t {
 /** Remembers the path and size of @p name under @p directory, answering whether both fit. */
 [[nodiscard]] bool remember_file(tabular_t& tabular, sz::string_t const& directory, char const* name) noexcept {
     std::size_t const offset = tabular.paths.size();
-    if (!tabular.paths.try_append(directory) || !tabular.paths.try_append(name) || !tabular.paths.try_push_back('\0'))
+    if (tabular.paths.try_append(directory) != sz::status_t::success_k ||
+        tabular.paths.try_append(name) != sz::status_t::success_k ||
+        tabular.paths.try_push_back('\0') != sz::status_t::success_k)
         return false;
     std::error_code error;
     std::uintmax_t const size = std::filesystem::file_size(tabular.paths.data() + offset, error);
@@ -152,7 +154,8 @@ struct tabular_t {
     std::string_view const extension = format_as(selected_format(settings));
     fmt::println("Will search for .{} files...", extension);
     sz::string_t directory;
-    if (!directory.try_append(settings.dataset.data(), settings.dataset.size()) || !directory.try_push_back('/'))
+    if (directory.try_append(settings.dataset.data(), settings.dataset.size()) != sz::status_t::success_k ||
+        directory.try_push_back('/') != sz::status_t::success_k)
         return false;
 
     std::error_code error;
@@ -180,15 +183,16 @@ struct tabular_t {
 }
 
 /** Drops the keys and values of @p collection, reporting a failure on the standard error. */
-void clear_collection(ustore_database_t db, ustore_collection_id_t collection) noexcept {
-    ustore_error_t error {};
+void clear_collection(ustore_database_t database, ustore_collection_id_t collection) noexcept {
+    ustore_outcome_t outcome {};
     ustore_collection_drop_t drop {};
-    drop.db = db;
-    drop.error = &error;
+    drop.database = database;
+    drop.outcome = &outcome;
     drop.collection = collection;
     drop.mode = ustore_drop_keys_vals_k;
     ustore_collection_drop(&drop);
-    if (error.status) fmt::println(stderr, "Failed to clear a collection: {}", error.message);
+    if (outcome.status != ustore_status_success_k)
+        fmt::println(stderr, "Failed to clear a collection: {}", outcome.message);
 }
 
 /** Answers the size of the exported file at @p path and removes it, or zero when it is missing. */
@@ -207,32 +211,31 @@ void clear_collection(ustore_database_t db, ustore_collection_id_t collection) n
     char infix[24];
     auto const written = fmt::format_to_n(infix, sizeof(infix) - 1, "-{}.", thread_index);
     *written.out = '\0';
-    return path.try_append(settings.directory.data(), settings.directory.size()) && path.try_push_back('/') &&
-           path.try_append(stem.data(), stem.size()) && path.try_append(infix) &&
-           path.try_append(extension.data(), extension.size());
+    return path.try_append(settings.directory.data(), settings.directory.size()) == sz::status_t::success_k &&
+           path.try_push_back('/') == sz::status_t::success_k &&
+           path.try_append(stem.data(), stem.size()) == sz::status_t::success_k &&
+           path.try_append(infix) == sz::status_t::success_k &&
+           path.try_append(extension.data(), extension.size()) == sz::status_t::success_k;
 }
 
 /** Imports every listed file as documents, each thread over its own contiguous share of the files. */
 void bench_docs_import(executor_t& executor, tabular_t const& tabular, settings_t const& settings,
                        std::string_view name) {
     print(run_pass(executor, name, tabular.files.size(), [&](loop_t& loop, std::size_t) noexcept {
-        ustore_arena_t arena = nullptr;
-        ustore_error_t error {};
+        ustore_outcome_t outcome {};
         for (std::size_t file : loop) {
             ustore_docs_import_t importing {};
-            importing.db = tabular.db;
-            importing.error = &error;
-            importing.arena = &arena;
+            importing.database = tabular.database;
+            importing.outcome = &outcome;
             importing.collection = ustore_collection_main_k;
             importing.path = tabular.path(file);
             importing.max_batch_size = settings.memory_limit.value;
             importing.id_field = settings.id_field.data();
             ustore_docs_import(&importing);
-            if (error.status) loop.fail();
+            if (outcome.status != ustore_status_success_k) loop.fail();
             else loop.count(1, tabular.files[file].size);
-            error = {};
+            outcome = {};
         }
-        ustore_arena_free(arena);
     }));
 }
 
@@ -240,13 +243,11 @@ void bench_docs_import(executor_t& executor, tabular_t const& tabular, settings_
 void bench_graph_import(executor_t& executor, tabular_t const& tabular, settings_t const& settings,
                         std::string_view name) {
     print(run_pass(executor, name, tabular.files.size(), [&](loop_t& loop, std::size_t) noexcept {
-        ustore_arena_t arena = nullptr;
-        ustore_error_t error {};
+        ustore_outcome_t outcome {};
         for (std::size_t file : loop) {
             ustore_graph_import_t importing {};
-            importing.db = tabular.db;
-            importing.error = &error;
-            importing.arena = &arena;
+            importing.database = tabular.database;
+            importing.outcome = &outcome;
             importing.collection = tabular.graph;
             importing.path = tabular.path(file);
             importing.max_batch_size = settings.memory_limit.value;
@@ -254,11 +255,10 @@ void bench_graph_import(executor_t& executor, tabular_t const& tabular, settings
             importing.target_id_field = settings.target_field.data();
             importing.edge_id_field = settings.edge_field.data();
             ustore_graph_import(&importing);
-            if (error.status) loop.fail();
+            if (outcome.status != ustore_status_success_k) loop.fail();
             else loop.count(1, tabular.files[file].size);
-            error = {};
+            outcome = {};
         }
-        ustore_arena_free(arena);
     }));
 }
 
@@ -270,19 +270,19 @@ void bench_docs_export(executor_t& executor, tabular_t const& tabular, settings_
         if (!export_path(output, settings, "tabular_graph_docs", thread))
             return loop.skip("no memory for the output path");
         ustore_arena_t arena = nullptr;
-        ustore_error_t error {};
+        ustore_outcome_t outcome {};
         for ([[maybe_unused]] std::size_t call : loop) {
             ustore_docs_export_t exporting {};
-            exporting.db = tabular.db;
-            exporting.error = &error;
+            exporting.database = tabular.database;
+            exporting.outcome = &outcome;
             exporting.arena = &arena;
             exporting.collection = ustore_collection_main_k;
             exporting.path = output.c_str();
             exporting.max_batch_size = settings.memory_limit.value;
             ustore_docs_export(&exporting);
-            if (error.status) loop.fail();
+            if (outcome.status != ustore_status_success_k) loop.fail();
             else loop.count(1, take_exported(output.c_str()));
-            error = {};
+            outcome = {};
         }
         ustore_arena_free(arena);
     }));
@@ -297,9 +297,9 @@ void bench_graph_export(executor_t& executor, tabular_t const& tabular, settings
         sz::string_t target;
         sz::string_t edge;
         if (!export_path(output, settings, "tabular_graph_edges", thread) ||
-            !source.try_append(settings.source_field.data(), settings.source_field.size()) ||
-            !target.try_append(settings.target_field.data(), settings.target_field.size()) ||
-            !edge.try_append(settings.edge_field.data(), settings.edge_field.size()))
+            source.try_append(settings.source_field.data(), settings.source_field.size()) != sz::status_t::success_k ||
+            target.try_append(settings.target_field.data(), settings.target_field.size()) != sz::status_t::success_k ||
+            edge.try_append(settings.edge_field.data(), settings.edge_field.size()) != sz::status_t::success_k)
             return loop.skip("no memory for the export names");
         // Exported column names cannot hold the slashes of JSON pointers.
         for (sz::string_t* name : {&source, &target, &edge})
@@ -307,11 +307,11 @@ void bench_graph_export(executor_t& executor, tabular_t const& tabular, settings
                 if ((*name)[index] == '/') (*name)[index] = '_';
 
         ustore_arena_t arena = nullptr;
-        ustore_error_t error {};
+        ustore_outcome_t outcome {};
         for ([[maybe_unused]] std::size_t call : loop) {
             ustore_graph_export_t exporting {};
-            exporting.db = tabular.db;
-            exporting.error = &error;
+            exporting.database = tabular.database;
+            exporting.outcome = &outcome;
             exporting.arena = &arena;
             exporting.collection = tabular.graph;
             exporting.path = output.c_str();
@@ -320,9 +320,9 @@ void bench_graph_export(executor_t& executor, tabular_t const& tabular, settings
             exporting.target_id_field = target.c_str();
             exporting.edge_id_field = edge.c_str();
             ustore_graph_export(&exporting);
-            if (error.status) loop.fail();
+            if (outcome.status != ustore_status_success_k) loop.fail();
             else loop.count(1, take_exported(output.c_str()));
-            error = {};
+            outcome = {};
         }
         ustore_arena_free(arena);
     }));
@@ -365,29 +365,29 @@ int main(int argc, char** argv) {
     tabular_t tabular;
     if (!list_files(settings, tabular)) return 1;
 
-    ustore_error_t error {};
+    ustore_outcome_t outcome {};
     settings.engine.directory = settings.directory.data();
-    open_engine(settings.engine, &tabular.db, &error);
-    if (error.status) {
-        fmt::println(stderr, "Failed to open the database: {}", error.message);
+    open_engine(settings.engine, &tabular.database, &outcome);
+    if (outcome.status != ustore_status_success_k) {
+        fmt::println(stderr, "Failed to open the database: {}", outcome.message);
         return 1;
     }
     ustore_collection_create_t create {};
-    create.db = tabular.db;
-    create.error = &error;
+    create.database = tabular.database;
+    create.outcome = &outcome;
     create.modality = ustore_modality_graph_k;
     create.collection = &tabular.graph;
     ustore_collection_create(&create);
-    if (error.status) {
-        fmt::println(stderr, "Failed to create the graph collection: {}", error.message);
-        ustore_database_free(tabular.db);
+    if (outcome.status != ustore_status_success_k) {
+        fmt::println(stderr, "Failed to create the graph collection: {}", outcome.message);
+        ustore_database_free(tabular.database);
         return 1;
     }
 
     auto maybe_executor = executor_t::make(settings.threads.value, caller_exclusivity_t::caller_inclusive_k);
     if (!maybe_executor) {
         fmt::println(stderr, "Failed to spawn {} threads", settings.threads.value);
-        ustore_database_free(tabular.db);
+        ustore_database_free(tabular.database);
         return 1;
     }
     executor_t& executor = *maybe_executor;
@@ -398,11 +398,11 @@ int main(int argc, char** argv) {
     std::string const graph_export_name = fmt::format("graph_export_{}", format);
     if (settings.selects(docs_import_name)) bench_docs_import(executor, tabular, settings, docs_import_name);
     if (settings.selects(docs_export_name)) bench_docs_export(executor, tabular, settings, docs_export_name);
-    clear_collection(tabular.db, ustore_collection_main_k);
+    clear_collection(tabular.database, ustore_collection_main_k);
     if (settings.selects(graph_import_name)) bench_graph_import(executor, tabular, settings, graph_import_name);
     if (settings.selects(graph_export_name)) bench_graph_export(executor, tabular, settings, graph_export_name);
-    clear_collection(tabular.db, tabular.graph);
+    clear_collection(tabular.database, tabular.graph);
 
-    ustore_database_free(tabular.db);
+    ustore_database_free(tabular.database);
     return 0;
 }

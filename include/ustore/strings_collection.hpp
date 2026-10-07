@@ -7,14 +7,14 @@
 
 #pragma once
 
-#include <cstddef> // `std::size_t`, `std::ptrdiff_t`
+#include <cstddef> // `std::byte`, `std::size_t`, `std::ptrdiff_t`
 
 #include <iterator>    // `std::forward_iterator_tag`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
-#include <utility>     // `std::exchange`, `std::move`, `std::swap`
+#include <utility>     // `std::move`, `std::swap`
 
-#include "ustore/ranges.hpp" // `embedded_blobs_t`, `joined_strs_t`, `range`
+#include "ustore/ranges.hpp" // `embedded_blobs_t`, `joined_strs_t`, `range`, `owning_view`, `read_spans_t`
 #include "ustore/status.hpp" // `status_t`, `expected`
 #include "ustore/strings.h"
 #include "ustore/types.hpp" // `any_arena_t`, `arena_t`, `value_view_t`
@@ -36,6 +36,37 @@ enum class walk_stage_t : unsigned char {
     exhausted_k,
 };
 
+/** Scans one page of up to @p limit strings of @p prefix from @p start, with their offsets into @p strings_offsets,
+ *  which has room for @p limit plus one, and the strings themselves into @p arena. */
+inline expected<joined_strs_t> scan_strings_page( //
+    ustore_database_t database, ustore_view_t view, ustore_collection_id_t const& collection,
+    value_view_t const& prefix, value_view_t const& start, ustore_length_t const& limit,
+    ustore_length_t* strings_offsets, ustore_arena_t* arena) noexcept {
+
+    ustore_length_t offsets[2] {};
+    ustore_char_t* found_strings = nullptr;
+    ustore_outcome_t outcome {};
+    ustore_strings_scan_t scan {};
+    scan.database = database;
+    scan.outcome = &outcome;
+    scan.view = view;
+    scan.count = 1;
+    scan.collections = &collection;
+    scan.prefixes = reinterpret_cast<ustore_str_view_t const*>(prefix.member_ptr());
+    scan.prefixes_lengths = prefix.member_length();
+    scan.start_strings = reinterpret_cast<ustore_str_view_t const*>(start.member_ptr());
+    scan.start_strings_lengths = start.member_length();
+    scan.count_limits = &limit;
+    scan.offsets = offsets;
+    scan.strings_offsets = strings_offsets;
+    scan.strings = &found_strings;
+    scan.arena = arena;
+
+    ustore_strings_scan(&scan);
+    if (outcome.status != ustore_status_success_k) return status_t {outcome};
+    return joined_strs_t {offsets[1] - offsets[0], strings_offsets + offsets[0], found_strings};
+}
+
 /**
  *  @brief A stream over the strings of one prefix that fetches them in pages, in the order of their text.
  *
@@ -47,18 +78,23 @@ class strings_stream_t {
 
     ustore_database_t database_ {nullptr};
     ustore_collection_id_t collection_ {ustore_collection_main_k};
-    ustore_transaction_t transaction_ {nullptr};
-    ustore_snapshot_t snapshot_ {};
+    ustore_view_t view_ {nullptr};
     value_view_t prefix_ {value_view_t::make_empty()};
 
-    arena_t current_arena_ {nullptr};
-    arena_t previous_arena_ {nullptr};
+    arena_t current_arena_;
+    arena_t previous_arena_;
     ustore_length_t read_ahead_ {0};
+    st::basic_vector<ustore_length_t> strings_offsets_ {};
 
     walk_stage_t stage_ {walk_stage_t::exhausted_k};
     value_view_t resume_ {value_view_t::make_empty()};
     joined_strs_t fetched_ {};
     std::size_t fetched_offset_ {0};
+
+    strings_stream_t(ustore_database_t database, ustore_view_t view, ustore_collection_id_t collection,
+                     value_view_t prefix, std::size_t read_ahead) noexcept
+        : database_(database), collection_(collection), view_(view), prefix_(prefix),
+          read_ahead_(static_cast<ustore_length_t>(read_ahead < 2 ? 2 : read_ahead)) {}
 
     status_t prefetch() noexcept {
 
@@ -71,33 +107,12 @@ class strings_stream_t {
         walk_stage_t const previous_stage = stage_;
         std::swap(current_arena_, previous_arena_);
 
-        ustore_error_t error {};
-        ustore_length_t* found_counts = nullptr;
-        ustore_length_t* found_offsets = nullptr;
-        ustore_char_t* found_strings = nullptr;
+        auto [page, scan_status] = scan_strings_page(database_, view_, collection_, prefix_, resume_, read_ahead_,
+                                                     strings_offsets_.data(), current_arena_.member_ptr());
+        if (scan_status.failed()) return scan_status;
 
-        ustore_strings_scan_t scan {};
-        scan.db = database_;
-        scan.error = &error;
-        scan.transaction = transaction_;
-        scan.snapshot = snapshot_;
-        scan.arena = current_arena_.member_ptr();
-        scan.tasks_count = 1;
-        scan.collections = &collection_;
-        scan.prefixes = reinterpret_cast<ustore_str_view_t const*>(prefix_.member_ptr());
-        scan.prefixes_lengths = prefix_.member_length();
-        scan.start_strings = reinterpret_cast<ustore_str_view_t const*>(resume_.member_ptr());
-        scan.start_strings_lengths = resume_.member_length();
-        scan.count_limits = &read_ahead_;
-        scan.counts = &found_counts;
-        scan.strings_offsets = &found_offsets;
-        scan.strings = &found_strings;
-
-        ustore_strings_scan(&scan);
-        if (error.status) return status_t {error};
-
-        ustore_length_t const found = found_counts[0];
-        fetched_ = joined_strs_t {found, found_offsets, found_strings};
+        std::size_t const found = page.size();
+        fetched_ = page;
         fetched_offset_ = 0;
         if (previous_stage == walk_stage_t::resumed_k && found != 0 && fetched_[0] == std::string_view {resume_})
             fetched_offset_ = 1;
@@ -116,18 +131,21 @@ class strings_stream_t {
     static constexpr std::size_t default_read_ahead_k = 256;
 
     strings_stream_t() noexcept = default;
-    strings_stream_t(ustore_database_t database, ustore_collection_id_t collection = ustore_collection_main_k,
-                     ustore_transaction_t transaction = nullptr, ustore_snapshot_t snapshot = {},
-                     value_view_t prefix = value_view_t::make_empty(),
-                     std::size_t read_ahead = default_read_ahead_k) noexcept
-        : database_(database), collection_(collection), transaction_(transaction), snapshot_(snapshot), prefix_(prefix),
-          current_arena_(database), previous_arena_(database),
-          read_ahead_(static_cast<ustore_length_t>(read_ahead < 2 ? 2 : read_ahead)) {}
-
-    strings_stream_t(strings_stream_t&&) = default;
-    strings_stream_t& operator=(strings_stream_t&&) = default;
+    strings_stream_t(strings_stream_t&&) noexcept = default;
+    strings_stream_t& operator=(strings_stream_t&&) noexcept = default;
     strings_stream_t(strings_stream_t const&) = delete;
     strings_stream_t& operator=(strings_stream_t const&) = delete;
+
+    /** Opens a walk over the strings of @p prefix in @p collection, fetching @p read_ahead of them a page. */
+    static expected<strings_stream_t> make(ustore_database_t database, ustore_view_t view,
+                                           ustore_collection_id_t collection, value_view_t prefix,
+                                           std::size_t read_ahead = default_read_ahead_k) noexcept {
+        strings_stream_t stream {database, view, collection, prefix, read_ahead};
+        if (st::failed(stream.strings_offsets_.resize(stream.read_ahead_ + 1)))
+            return status_t {status_code_t::out_of_memory_k, "Failed to allocate a page of strings"};
+        if (status_t const sought = stream.seek_to_first(); sought.failed()) return sought;
+        return stream;
+    }
 
     /** Restarts the walk at @p start, which is returned too when the collection holds it. */
     status_t seek(value_view_t start) noexcept {
@@ -168,8 +186,8 @@ class strings_stream_t {
     bool is_end() const noexcept { return stage_ == walk_stage_t::exhausted_k && fetched_offset_ >= fetched_.size(); }
 
     bool operator==(strings_stream_t const& other) const noexcept {
-        if (collection_ != other.collection_) return false;
         if (is_end() || other.is_end()) return is_end() == other.is_end();
+        if (collection_ != other.collection_) return false;
         return string() == other.string();
     }
 };
@@ -192,151 +210,142 @@ class strings_collection_t {
     ustore_collection_id_t collection_ {ustore_collection_main_k};
     ustore_transaction_t transaction_ {nullptr};
     ustore_snapshot_t snapshot_ {};
-    any_arena_t arena_ {nullptr};
+    any_arena_t arena_;
 
-    status_t write(std::span<value_view_t const> texts, std::span<value_view_t const> contents,
-                   flush_t flush) noexcept {
-        if (texts.empty()) return {};
+    /** The view reads through this handle see, watching the buckets they read inside a transaction. */
+    ustore_view_t view(ustore_watch_t watch) const noexcept { return view_through(transaction_, snapshot_, watch); }
 
-        ustore_error_t error {};
-        ustore_strings_write_t write {};
-        write.db = database_;
-        write.error = &error;
-        write.transaction = transaction_;
-        write.arena = arena_.member_ptr();
-        write.options = to_options(flush);
-        write.tasks_count = texts.size();
-        write.collections = &collection_;
-        write.strings = reinterpret_cast<ustore_str_view_t const*>(texts.front().member_ptr());
-        write.strings_stride = sizeof(value_view_t);
-        write.strings_lengths = texts.front().member_length();
-        write.strings_lengths_stride = sizeof(value_view_t);
-        if (!contents.empty()) {
-            write.values = contents.front().member_ptr();
-            write.values_stride = sizeof(value_view_t);
-            write.values_lengths = contents.front().member_length();
-            write.values_lengths_stride = sizeof(value_view_t);
-        }
-
-        ustore_strings_write(&write);
-        return status_t {error};
-    }
-
-    status_t drop_with(ustore_drop_mode_t mode) noexcept {
-        ustore_error_t error {};
-        ustore_collection_drop_t collection_drop {};
-        collection_drop.db = database_;
-        collection_drop.error = &error;
-        collection_drop.collection = collection_;
-        collection_drop.mode = mode;
-        ustore_collection_drop(&collection_drop);
-        return status_t {error};
-    }
-
-  public:
-    using prefix_range_t = range<strings_stream_t>;
-
-    strings_collection_t() noexcept : arena_(nullptr) {}
-    strings_collection_t(ustore_database_t database, ustore_collection_id_t collection,
-                         ustore_transaction_t transaction = nullptr, ustore_snapshot_t snapshot = {},
-                         ustore_arena_t* arena = nullptr) noexcept
-        : database_(database), collection_(collection), transaction_(transaction), snapshot_(snapshot),
-          arena_(database_, arena) {}
-
-    strings_collection_t(strings_collection_t&& other) noexcept
-        : database_(other.database_), collection_(std::exchange(other.collection_, ustore_collection_main_k)),
-          transaction_(std::exchange(other.transaction_, nullptr)), snapshot_(std::exchange(other.snapshot_, {})),
-          arena_(std::exchange(other.arena_, {nullptr})) {}
-
-    strings_collection_t& operator=(strings_collection_t&& other) noexcept {
-        std::swap(database_, other.database_);
-        std::swap(collection_, other.collection_);
-        std::swap(transaction_, other.transaction_);
-        std::swap(snapshot_, other.snapshot_);
-        std::swap(arena_, other.arena_);
-        return *this;
-    }
-
-    strings_collection_t(strings_collection_t const& other) noexcept
-        : database_(other.database_), collection_(other.collection_), transaction_(other.transaction_),
-          snapshot_(other.snapshot_), arena_(other.database_) {}
-
-    strings_collection_t& operator=(strings_collection_t const& other) noexcept {
-        database_ = other.database_;
-        collection_ = other.collection_;
-        transaction_ = other.transaction_;
-        snapshot_ = other.snapshot_;
-        arena_ = any_arena_t(other.database_);
-        return *this;
-    }
-
-    operator ustore_collection_id_t() const noexcept { return collection_; }
-    ustore_collection_id_t* member_ptr() noexcept { return &collection_; }
-    ustore_arena_t* member_arena() noexcept { return arena_.member_ptr(); }
-    ustore_database_t db() const noexcept { return database_; }
-    ustore_transaction_t txn() const noexcept { return transaction_; }
-    ustore_snapshot_t snap() const noexcept { return snapshot_; }
-
-    /** Upserts the value of one string, where a @p content without bytes removes it. */
-    status_t assign(value_view_t text, value_view_t content, flush_t flush = flush_t::dont_flush_k) noexcept {
-        return write({&text, 1}, {&content, 1}, flush);
-    }
-
-    /** Upserts the values of a batch of strings, where a content without bytes removes its string. */
-    status_t assign(std::span<value_view_t const> texts, std::span<value_view_t const> contents,
-                    flush_t flush = flush_t::dont_flush_k) noexcept {
-        if (texts.size() != contents.size())
-            return status_t {status_code_t::invalid_argument_k, "Every string of a batch needs its own value"};
-        return write(texts, contents, flush);
-    }
-
-    status_t erase(value_view_t text, flush_t flush = flush_t::dont_flush_k) noexcept {
-        return write({&text, 1}, {}, flush);
-    }
-
-    status_t erase(std::span<value_view_t const> texts, flush_t flush = flush_t::dont_flush_k) noexcept {
-        return write(texts, {}, flush);
-    }
-
-    /** Reads the value of one string, which reads as a missing view when the collection lacks it. */
-    expected<value_view_t> value(value_view_t text, watch_t watch = watch_t::watch_k) noexcept {
-        auto [read, read_status] = values({&text, 1}, watch);
-        if (read_status.failed()) return read_status;
-        return read[0];
-    }
-
-    /** Reads the values of a batch of strings, each addressed by its own offset and length. */
-    expected<embedded_blobs_t> values(std::span<value_view_t const> texts, watch_t watch = watch_t::watch_k) noexcept {
+    /** Reads the values of @p texts into @p spans, with their tape in this handle's arena. */
+    expected<embedded_blobs_t> read(std::span<value_view_t const> texts, read_spans_t const& spans,
+                                    ustore_watch_t watch) noexcept {
         if (texts.empty()) return embedded_blobs_t {};
 
-        ustore_error_t error {};
-        ustore_length_t* found_offsets = nullptr;
-        ustore_length_t* found_lengths = nullptr;
         ustore_byte_t* found_values = nullptr;
-
+        ustore_outcome_t outcome {};
         ustore_strings_read_t read {};
-        read.db = database_;
-        read.error = &error;
-        read.transaction = transaction_;
-        read.snapshot = snapshot_;
-        read.arena = arena_.member_ptr();
-        read.options = to_options(watch);
-        read.tasks_count = texts.size();
+        read.database = database_;
+        read.outcome = &outcome;
+        read.view = view(watch);
+        read.count = texts.size();
         read.collections = &collection_;
         read.strings = reinterpret_cast<ustore_str_view_t const*>(texts.front().member_ptr());
         read.strings_stride = sizeof(value_view_t);
         read.strings_lengths = texts.front().member_length();
         read.strings_lengths_stride = sizeof(value_view_t);
-        read.offsets = &found_offsets;
-        read.lengths = &found_lengths;
+        read.presences = spans.presences;
+        read.offsets = spans.offsets;
         read.values = &found_values;
+        read.arena = arena_.member_ptr();
 
         ustore_strings_read(&read);
-        if (error.status) return status_t {error};
-        return embedded_blobs_t {static_cast<ustore_size_t>(texts.size()), found_offsets, found_lengths, found_values};
+        if (outcome.status != ustore_status_success_k) return status_t {outcome};
+        spans.derive_lengths(texts.size());
+        return embedded_blobs_t {texts.size(), spans.offsets, spans.lengths, found_values};
     }
 
-    expected<bool> present(value_view_t text, watch_t watch = watch_t::watch_k) noexcept {
+    status_t drop_with(ustore_drop_mode_t mode) noexcept {
+        ustore_outcome_t outcome {};
+        ustore_collection_drop_t collection_drop {};
+        collection_drop.database = database_;
+        collection_drop.outcome = &outcome;
+        collection_drop.collection = collection_;
+        collection_drop.mode = mode;
+        ustore_collection_drop(&collection_drop);
+        return status_t {outcome};
+    }
+
+  public:
+    using prefix_range_t = range<strings_stream_t>;
+
+    strings_collection_t() noexcept = default;
+    strings_collection_t(ustore_database_t database, ustore_collection_id_t collection,
+                         ustore_transaction_t transaction = nullptr, ustore_snapshot_t snapshot = {},
+                         ustore_arena_t* arena = nullptr) noexcept
+        : database_(database), collection_(collection), transaction_(transaction), snapshot_(snapshot), arena_(arena) {}
+
+    operator ustore_collection_id_t() const noexcept { return collection_; }
+    ustore_collection_id_t* member_ptr() noexcept { return &collection_; }
+    ustore_arena_t* member_arena() noexcept { return arena_.member_ptr(); }
+
+    /** Upserts the value of one string. */
+    status_t assign(value_view_t text, value_view_t content,
+                    ustore_durability_t durability = ustore_durability_buffered_k) noexcept {
+        return assign({&text, 1}, {&content, 1}, durability);
+    }
+
+    /** Upserts the values of a batch of strings. */
+    status_t assign(std::span<value_view_t const> texts, std::span<value_view_t const> contents,
+                    ustore_durability_t durability = ustore_durability_buffered_k) noexcept {
+        if (texts.size() != contents.size())
+            return status_t {status_code_t::invalid_argument_k, "Every string of a batch needs its own value"};
+        if (texts.empty()) return {};
+
+        ustore_outcome_t outcome {};
+        ustore_strings_write_t write {};
+        write.database = database_;
+        write.outcome = &outcome;
+        write.transaction = transaction_;
+        write.count = texts.size();
+        write.collections = &collection_;
+        write.strings = reinterpret_cast<ustore_str_view_t const*>(texts.front().member_ptr());
+        write.strings_stride = sizeof(value_view_t);
+        write.strings_lengths = texts.front().member_length();
+        write.strings_lengths_stride = sizeof(value_view_t);
+        write.values_lengths = contents.front().member_length();
+        write.values_lengths_stride = sizeof(value_view_t);
+        write.values = contents.front().member_ptr();
+        write.values_stride = sizeof(value_view_t);
+        write.durability = durability;
+
+        ustore_strings_write(&write);
+        return status_t {outcome};
+    }
+
+    status_t erase(value_view_t text, ustore_durability_t durability = ustore_durability_buffered_k) noexcept {
+        return erase({&text, 1}, durability);
+    }
+
+    status_t erase(std::span<value_view_t const> texts,
+                   ustore_durability_t durability = ustore_durability_buffered_k) noexcept {
+        if (texts.empty()) return {};
+
+        ustore_outcome_t outcome {};
+        ustore_strings_remove_t remove {};
+        remove.database = database_;
+        remove.outcome = &outcome;
+        remove.transaction = transaction_;
+        remove.count = texts.size();
+        remove.collections = &collection_;
+        remove.strings = reinterpret_cast<ustore_str_view_t const*>(texts.front().member_ptr());
+        remove.strings_stride = sizeof(value_view_t);
+        remove.strings_lengths = texts.front().member_length();
+        remove.strings_lengths_stride = sizeof(value_view_t);
+        remove.durability = durability;
+
+        ustore_strings_remove(&remove);
+        return status_t {outcome};
+    }
+
+    /** Reads the value of one string, which reads as a missing view when the collection lacks it. */
+    expected<value_view_t> value(value_view_t text, ustore_watch_t watch = ustore_watch_keys_k) noexcept {
+        alignas(ustore_length_t) std::byte single[read_spans_t::bytes(1)] {};
+        auto [found, read_status] = read({&text, 1}, read_spans_t::carve(single, 1), watch);
+        if (read_status.failed()) return read_status;
+        return found[0];
+    }
+
+    /** Reads the values of a batch of strings, each addressed by its own offset and length, which the result owns. */
+    expected<owning_view<embedded_blobs_t>> values(std::span<value_view_t const> texts,
+                                                   ustore_watch_t watch = ustore_watch_keys_k) noexcept {
+        st::basic_vector<std::byte> buffer;
+        if (st::failed(buffer.resize(read_spans_t::bytes(texts.size()))))
+            return status_t {status_code_t::out_of_memory_k, "Failed to allocate the spans of a read"};
+        auto [found, read_status] = read(texts, read_spans_t::carve(buffer.data(), texts.size()), watch);
+        if (read_status.failed()) return read_status;
+        return owning_view<embedded_blobs_t> {found, std::move(buffer)};
+    }
+
+    expected<bool> present(value_view_t text, ustore_watch_t watch = ustore_watch_keys_k) noexcept {
         auto [found, read_status] = value(text, watch);
         if (read_status.failed()) return read_status;
         return static_cast<bool>(found);
@@ -346,48 +355,28 @@ class strings_collection_t {
      *  @brief Lists up to @p limit strings of @p prefix, in the order of their text.
      *
      *  The page starts at @p start, which it returns too when the collection holds it, so a walk that
-     *  pages by hand skips the string it resumed from. The strings live in this handle's arena until
-     *  the next call through it, and @c prefixed streams the pages instead.
+     *  pages by hand skips the string it resumed from. The page owns its offsets, while the strings live in
+     *  this handle's arena until the next call through it, and @c prefixed streams the pages instead.
      */
-    expected<joined_strs_t> prefixed_page(value_view_t prefix, std::size_t limit,
-                                          value_view_t start = value_view_t::make_empty(),
-                                          watch_t watch = watch_t::watch_k) noexcept {
-        ustore_error_t error {};
-        auto const count_limit = static_cast<ustore_length_t>(limit);
-        ustore_length_t* found_counts = nullptr;
-        ustore_length_t* found_offsets = nullptr;
-        ustore_char_t* found_strings = nullptr;
-
-        ustore_strings_scan_t scan {};
-        scan.db = database_;
-        scan.error = &error;
-        scan.transaction = transaction_;
-        scan.snapshot = snapshot_;
-        scan.arena = arena_.member_ptr();
-        scan.options = to_options(watch);
-        scan.tasks_count = 1;
-        scan.collections = &collection_;
-        scan.prefixes = reinterpret_cast<ustore_str_view_t const*>(prefix.member_ptr());
-        scan.prefixes_lengths = prefix.member_length();
-        scan.start_strings = reinterpret_cast<ustore_str_view_t const*>(start.member_ptr());
-        scan.start_strings_lengths = start.member_length();
-        scan.count_limits = &count_limit;
-        scan.counts = &found_counts;
-        scan.strings_offsets = &found_offsets;
-        scan.strings = &found_strings;
-
-        ustore_strings_scan(&scan);
-        if (error.status) return status_t {error};
-        return joined_strs_t {found_counts[0], found_offsets, found_strings};
+    expected<owning_view<joined_strs_t>> prefixed_page(value_view_t prefix, std::size_t limit,
+                                                       value_view_t start = value_view_t::make_empty(),
+                                                       ustore_watch_t watch = ustore_watch_keys_k) noexcept {
+        st::basic_vector<std::byte> buffer;
+        if (st::failed(buffer.resize((limit + 1) * sizeof(ustore_length_t))))
+            return status_t {status_code_t::out_of_memory_k, "Failed to allocate a page of strings"};
+        ustore_length_t const count_limit = static_cast<ustore_length_t>(limit);
+        auto [page, scan_status] = scan_strings_page(database_, view(watch), collection_, prefix, start, count_limit,
+                                                     reinterpret_cast<ustore_length_t*>(buffer.data()),
+                                                     arena_.member_ptr());
+        if (scan_status.failed()) return scan_status;
+        return owning_view<joined_strs_t> {page, std::move(buffer)};
     }
 
     /** Opens a stream over the strings of @p prefix, which outlives the stream. */
     expected<strings_stream_t> prefix_begin(
         value_view_t prefix = value_view_t::make_empty(),
         std::size_t read_ahead = strings_stream_t::default_read_ahead_k) const noexcept {
-        strings_stream_t stream {database_, collection_, transaction_, snapshot_, prefix, read_ahead};
-        if (status_t const sought = stream.seek_to_first(); sought.failed()) return sought;
-        return stream;
+        return strings_stream_t::make(database_, view(ustore_watch_keys_k), collection_, prefix, read_ahead);
     }
 
     /** Walks every string of @p prefix, which outlives the range, in the order of their text. */
@@ -395,8 +384,7 @@ class strings_collection_t {
                                       std::size_t read_ahead = strings_stream_t::default_read_ahead_k) const noexcept {
         auto [begin, prefix_begin_status] = prefix_begin(prefix, read_ahead);
         if (prefix_begin_status.failed()) return prefix_begin_status;
-        strings_stream_t end {database_, collection_, transaction_, snapshot_, prefix, read_ahead};
-        return prefix_range_t {std::move(begin), std::move(end)};
+        return prefix_range_t {std::move(begin), strings_stream_t {}};
     }
 
     /** Counts the strings of @p prefix by streaming through all of them. */

@@ -7,13 +7,13 @@
 
 #pragma once
 
-#include <cstddef> // `std::nullptr_t`
+#include <cstddef> // `std::byte`
 
 #include <span>        // `std::span`
 #include <type_traits> // `std::conditional_t`, `std::decay_t`
 #include <utility>     // `std::forward`, `std::move`
 
-#include "ustore/ranges.hpp"      // `embedded_blobs_t`, `bits_span_t`
+#include "ustore/ranges.hpp"      // `embedded_blobs_t`, `bits_span_t`, `owning_view`, `read_spans_t`
 #include "ustore/ranges_args.hpp" // `location_store`, `places_arg_extractor`
 #include "ustore/status.hpp"      // `status_t`, `expected`
 #include "ustore/types.hpp"       // `arena_t`
@@ -26,7 +26,8 @@ namespace unum::ustore {
  *
  *  One value may go to one key or to many keys, and many values to as many keys. Every proxy made by
  *  one container shares that container's arena, so threads and interleaved requests whose results must
- *  survive the next call hand in their own arena through @c on.
+ *  survive the next call hand in their own arena through @c on. A batch result owns its presences and
+ *  offsets, while its tape of values stays in that arena.
  *
  *  @tparam locations_ A single location, a batch of locations, or a reference to a batch the caller owns.
  */
@@ -40,9 +41,9 @@ class blobs_ref {
     using keys_extractor_t = places_arg_extractor<locations_plain_t>;
     static constexpr bool is_one_k = keys_extractor_t::is_one_k;
 
-    using value_t = std::conditional_t<is_one_k, value_view_t, embedded_blobs_t>;
-    using present_t = std::conditional_t<is_one_k, bool, bits_span_t>;
-    using length_t = std::conditional_t<is_one_k, ustore_length_t, std::span<ustore_length_t>>;
+    using value_t = std::conditional_t<is_one_k, value_view_t, owning_view<embedded_blobs_t>>;
+    using present_t = std::conditional_t<is_one_k, bool, owning_view<bits_span_t>>;
+    using length_t = std::conditional_t<is_one_k, ustore_length_t, owning_view<std::span<ustore_length_t>>>;
 
   protected:
     ustore_database_t database_ {};
@@ -52,10 +53,10 @@ class blobs_ref {
     locations_store_t locations_store_ {};
 
     template <typename contents_arg_>
-    status_t any_assign(contents_arg_&& values_ref, ustore_options_t options) noexcept;
+    status_t any_assign(contents_arg_&& values_ref, ustore_durability_t durability) noexcept;
 
     template <typename expected_>
-    expected<expected_> any_get(ustore_options_t options) noexcept;
+    expected<expected_> any_get(ustore_watch_t watch) noexcept;
 
   public:
     blobs_ref(ustore_database_t database, ustore_transaction_t transaction, ustore_snapshot_t snapshot,
@@ -69,47 +70,57 @@ class blobs_ref {
         return *this;
     }
 
-    expected<value_t> value(watch_t watch = watch_t::watch_k) noexcept { return any_get<value_t>(to_options(watch)); }
+    expected<value_t> value(ustore_watch_t watch = ustore_watch_keys_k) noexcept { return any_get<value_t>(watch); }
 
     operator expected<value_t>() noexcept { return value(); }
 
-    expected<length_t> length(watch_t watch = watch_t::watch_k) noexcept {
-        return any_get<length_t>(to_options(watch));
-    }
+    expected<length_t> length(ustore_watch_t watch = ustore_watch_keys_k) noexcept { return any_get<length_t>(watch); }
 
     /** Checks which keys are present, where a present value may still be empty. */
-    expected<present_t> present(watch_t watch = watch_t::watch_k) noexcept {
-        return any_get<present_t>(to_options(watch));
+    expected<present_t> present(ustore_watch_t watch = ustore_watch_keys_k) noexcept {
+        return any_get<present_t>(watch);
     }
 
     /**
      *  Assigns values to the keys pairwise, or one value to every key.
      *  @param[in] values Values to assign.
-     *  @param[in] flush Whether the call returns only after the data reaches the disk.
+     *  @param[in] durability Whether the call returns only after the data reaches the disk.
      */
     template <typename contents_arg_>
-    status_t assign(contents_arg_&& values, flush_t flush = flush_t::dont_flush_k) noexcept {
-        return any_assign(std::forward<contents_arg_>(values), to_options(flush));
+    status_t assign(contents_arg_&& values, ustore_durability_t durability = ustore_durability_buffered_k) noexcept {
+        return any_assign(std::forward<contents_arg_>(values), durability);
     }
 
     /**
      *  Removes the keys together with their values.
-     *  @param[in] flush Whether the call returns only after the data reaches the disk.
+     *  @param[in] durability Whether the call returns only after the data reaches the disk.
      */
-    status_t erase(flush_t flush = flush_t::dont_flush_k) noexcept { return assign(nullptr, flush); }
+    status_t erase(ustore_durability_t durability = ustore_durability_buffered_k) noexcept {
+        decltype(auto) locations = locations_store_.ref();
+        strided_iterator<ustore_key_t const> const keys = keys_extractor_t {}.keys(locations);
+        strided_iterator<ustore_collection_id_t const> const collections = keys_extractor_t {}.collections(locations);
+
+        ustore_outcome_t outcome {};
+        ustore_remove_t remove {};
+        remove.database = database_;
+        remove.outcome = &outcome;
+        remove.transaction = transaction_;
+        remove.count = keys_extractor_t {}.count(locations);
+        remove.collections = collections.get();
+        remove.collections_stride = collections.stride();
+        remove.keys = keys.get();
+        remove.keys_stride = keys.stride();
+        remove.durability = durability;
+        ustore_remove(&remove);
+        return status_t {outcome};
+    }
 
     /**
      *  Keeps the keys but empties their values.
-     *  @param[in] flush Whether the call returns only after the data reaches the disk.
+     *  @param[in] durability Whether the call returns only after the data reaches the disk.
      */
-    status_t clear(flush_t flush = flush_t::dont_flush_k) noexcept {
-        auto const any = reinterpret_cast<ustore_bytes_ptr_t>(this);
-        ustore_length_t const length = 0;
-        contents_arg_t arg {};
-        arg.lengths_begin = {&length};
-        arg.contents_begin = {&any};
-        arg.count = 1;
-        return assign(arg, flush);
+    status_t clear(ustore_durability_t durability = ustore_durability_buffered_k) noexcept {
+        return assign(value_view_t::make_empty(), durability);
     }
 
     locations_plain_t& locations() noexcept { return locations_store_.ref(); }
@@ -122,59 +133,59 @@ static_assert(!blobs_ref<places_arg_t>::is_one_k);
 
 template <typename locations_>
 template <typename expected_>
-expected<expected_> blobs_ref<locations_>::any_get(ustore_options_t options) noexcept {
-
-    ustore_error_t error {};
-    ustore_length_t* found_offsets = nullptr;
-    ustore_length_t* found_lengths = nullptr;
-    ustore_bytes_ptr_t found_values = nullptr;
-    ustore_octet_t* found_presences = nullptr;
+expected<expected_> blobs_ref<locations_>::any_get(ustore_watch_t watch) noexcept {
 
     decltype(auto) locations = locations_store_.ref();
-    auto const count = keys_extractor_t {}.count(locations);
-    auto const keys = keys_extractor_t {}.keys(locations);
-    auto const collections = keys_extractor_t {}.collections(locations);
+    ustore_size_t const count = keys_extractor_t {}.count(locations);
+    strided_iterator<ustore_key_t const> const keys = keys_extractor_t {}.keys(locations);
+    strided_iterator<ustore_collection_id_t const> const collections = keys_extractor_t {}.collections(locations);
 
+    // A single key reads into the stack, and a batch into one buffer its result owns
+    alignas(ustore_length_t) std::byte single[read_spans_t::bytes(1)] {};
+    st::basic_vector<std::byte> batch;
+    if constexpr (!is_one_k)
+        if (st::failed(batch.resize(read_spans_t::bytes(count))))
+            return status_t {status_code_t::out_of_memory_k, "Failed to allocate the spans of a read"};
+    read_spans_t const spans = read_spans_t::carve(is_one_k ? single : batch.data(), count);
+
+    ustore_byte_t* found_values = nullptr;
+    ustore_outcome_t outcome {};
     ustore_read_t read {};
-    read.db = database_;
-    read.error = &error;
-    read.transaction = transaction_;
-    read.snapshot = snapshot_;
-    read.arena = arena_;
-    read.options = options;
-    read.tasks_count = count;
+    read.database = database_;
+    read.outcome = &outcome;
+    read.view = view_through(transaction_, snapshot_, watch);
+    read.count = count;
     read.collections = collections.get();
     read.collections_stride = collections.stride();
     read.keys = keys.get();
     read.keys_stride = keys.stride();
-    read.presences = std::is_same_v<expected_, present_t> ? &found_presences : nullptr;
-    read.offsets = std::is_same_v<expected_, value_t> ? &found_offsets : nullptr;
-    read.lengths = std::is_same_v<expected_, value_t> || std::is_same_v<expected_, length_t> ? &found_lengths : nullptr;
+    read.presences = spans.presences;
+    read.offsets = spans.offsets;
     read.values = std::is_same_v<expected_, value_t> ? &found_values : nullptr;
+    read.arena = arena_;
 
     ustore_read(&read);
-    if (error.status) return status_t {error};
+    if (outcome.status != ustore_status_success_k) return status_t {outcome};
+    spans.derive_lengths(count);
 
     if constexpr (std::is_same_v<expected_, length_t>) {
-        std::span<ustore_length_t> const many {found_lengths, found_lengths + count};
-        if constexpr (is_one_k) return ustore_length_t {many[0]};
-        else return std::span<ustore_length_t> {many};
+        if constexpr (is_one_k) return ustore_length_t {spans.lengths[0]};
+        else return length_t {std::span<ustore_length_t> {spans.lengths, count}, std::move(batch)};
     }
     else if constexpr (std::is_same_v<expected_, present_t>) {
-        bits_span_t const many {found_presences};
-        if constexpr (is_one_k) return bool(many[0]);
-        else return bits_span_t {many};
+        if constexpr (is_one_k) return bool(bits_span_t {spans.presences}[0]);
+        else return present_t {bits_span_t {spans.presences}, std::move(batch)};
     }
     else {
-        embedded_blobs_t const many {count, found_offsets, found_lengths, found_values};
+        embedded_blobs_t const many {count, spans.offsets, spans.lengths, found_values};
         if constexpr (is_one_k) return value_view_t {many[0]};
-        else return embedded_blobs_t {many};
+        else return value_t {many, std::move(batch)};
     }
 }
 
 template <typename locations_>
 template <typename contents_arg_>
-status_t blobs_ref<locations_>::any_assign(contents_arg_&& values_ref, ustore_options_t options) noexcept {
+status_t blobs_ref<locations_>::any_assign(contents_arg_&& values_ref, ustore_durability_t durability) noexcept {
 
     // Arrays decay into pointers, so the extractor sees one pointer object whose address the C ABI can stride over
     using values_t = std::decay_t<contents_arg_>;
@@ -182,35 +193,32 @@ status_t blobs_ref<locations_>::any_assign(contents_arg_&& values_ref, ustore_op
     values_t const& values = values_ref;
 
     decltype(auto) locations = locations_store_.ref();
-    auto const count = keys_extractor_t {}.count(locations);
-    auto const keys = keys_extractor_t {}.keys(locations);
-    auto const collections = keys_extractor_t {}.collections(locations);
+    strided_iterator<ustore_key_t const> const keys = keys_extractor_t {}.keys(locations);
+    strided_iterator<ustore_collection_id_t const> const collections = keys_extractor_t {}.collections(locations);
+    strided_iterator<ustore_bytes_cptr_t const> const contents = value_extractor_t {}.contents(values);
+    strided_iterator<ustore_length_t const> const starts = value_extractor_t {}.starts(values);
+    strided_iterator<ustore_length_t const> const lengths = value_extractor_t {}.lengths(values);
 
-    auto const contents = value_extractor_t {}.contents(values);
-    auto const offsets = value_extractor_t {}.offsets(values);
-    auto const lengths = value_extractor_t {}.lengths(values);
-
-    ustore_error_t error {};
+    ustore_outcome_t outcome {};
     ustore_write_t write {};
-    write.db = database_;
-    write.error = &error;
+    write.database = database_;
+    write.outcome = &outcome;
     write.transaction = transaction_;
-    write.arena = arena_;
-    write.options = options;
-    write.tasks_count = count;
+    write.count = keys_extractor_t {}.count(locations);
     write.collections = collections.get();
     write.collections_stride = collections.stride();
     write.keys = keys.get();
     write.keys_stride = keys.stride();
-    write.offsets = offsets.get();
-    write.offsets_stride = offsets.stride();
+    write.starts = starts.get();
+    write.starts_stride = starts.stride();
     write.lengths = lengths.get();
     write.lengths_stride = lengths.stride();
     write.values = contents.get();
     write.values_stride = contents.stride();
+    write.durability = durability;
 
     ustore_write(&write);
-    return status_t {error};
+    return status_t {outcome};
 }
 
 } // namespace unum::ustore

@@ -17,16 +17,13 @@ extern "C" {
 typedef struct ustore_docs_import_t {
 
     /** Already open database instance. */
-    ustore_database_t db;
+    ustore_database_t database;
 
-    /** Receives the error message of a failed import. */
-    ustore_error_t* error;
+    /** Receives the outcome of the import. */
+    ustore_outcome_t* outcome;
 
-    /** Reusable memory handle, or null for a private one. */
-    ustore_arena_t* arena;
-
-    /** Options forwarded to the document writes. */
-    ustore_options_t options;
+    /** How durable the document writes are once the import completes. */
+    ustore_durability_t durability;
 
     /** Collection receiving the documents. */
     ustore_collection_id_t collection;
@@ -56,16 +53,16 @@ void ustore_docs_import(ustore_docs_import_t*);
 typedef struct ustore_docs_export_t {
 
     /** Already open database instance. */
-    ustore_database_t db;
+    ustore_database_t database;
 
-    /** Receives the error message of a failed export. */
-    ustore_error_t* error;
+    /** Receives the outcome of the export. */
+    ustore_outcome_t* outcome;
 
     /** Reusable memory handle, or null for a private one. */
     ustore_arena_t* arena;
 
-    /** Options forwarded to the scans and reads. */
-    ustore_options_t options;
+    /** What the scans and reads see, where @c NULL is the head. */
+    ustore_view_t view;
 
     /** Collection to export. */
     ustore_collection_id_t collection;
@@ -92,16 +89,13 @@ void ustore_docs_export(ustore_docs_export_t*);
 typedef struct ustore_graph_import_t {
 
     /** Already open database instance. */
-    ustore_database_t db;
+    ustore_database_t database;
 
-    /** Receives the error message of a failed import. */
-    ustore_error_t* error;
+    /** Receives the outcome of the import. */
+    ustore_outcome_t* outcome;
 
-    /** Reusable memory handle, or null for a private one. */
-    ustore_arena_t* arena;
-
-    /** Options forwarded to the edge upserts. */
-    ustore_options_t options;
+    /** How durable the edge upserts are once the import completes. */
+    ustore_durability_t durability;
 
     /** Collection receiving the edges. */
     ustore_collection_id_t collection;
@@ -128,16 +122,16 @@ void ustore_graph_import(ustore_graph_import_t*);
 typedef struct ustore_graph_export_t {
 
     /** Already open database instance. */
-    ustore_database_t db;
+    ustore_database_t database;
 
-    /** Receives the error message of a failed export. */
-    ustore_error_t* error;
+    /** Receives the outcome of the export. */
+    ustore_outcome_t* outcome;
 
     /** Reusable memory handle, or null for a private one. */
     ustore_arena_t* arena;
 
-    /** Options forwarded to the scans and edge lookups. */
-    ustore_options_t options;
+    /** What the scans and edge lookups see, where @c NULL is the head. */
+    ustore_view_t view;
 
     /** Collection to export. */
     ustore_collection_id_t collection;

@@ -561,30 +561,31 @@ struct engine_options_t {
 };
 
 /** Opens the engine @p options name into @p database; the one place binaries tell the engines apart. */
-inline void open_engine(engine_options_t const& options, ustore_database_t* database, ustore_error_t* error) noexcept {
+inline void open_engine(engine_options_t const& options, ustore_database_t* database,
+                        ustore_outcome_t* outcome) noexcept {
     if (options.name == "ram") {
-        ustore_database_init_ram_t init {.db = database,
-                                         .error = error,
+        ustore_database_init_ram_t init {.database = database,
+                                         .outcome = outcome,
                                          .directory = options.directory,
                                          .isolation = static_cast<ustore_isolation_t>(options.isolation.selected)};
         return ustore_database_init_ram(&init);
     }
     if (options.name == "rocksdb") {
-        ustore_database_init_rocksdb_t init {.db = database, .error = error, .directory = options.directory};
+        ustore_database_init_rocksdb_t init {.database = database, .outcome = outcome, .directory = options.directory};
         return ustore_database_init_rocksdb(&init);
     }
     if (options.name == "leveldb") {
-        ustore_database_init_leveldb_t init {.db = database, .error = error, .directory = options.directory};
+        ustore_database_init_leveldb_t init {.database = database, .outcome = outcome, .directory = options.directory};
         return ustore_database_init_leveldb(&init);
     }
     if (options.name == "nvme") {
-        ustore_database_init_nvme_t init {.db = database,
-                                          .error = error,
+        ustore_database_init_nvme_t init {.database = database,
+                                          .outcome = outcome,
                                           .directory = options.directory,
                                           .transport = static_cast<ustore_transport_t>(options.transport.selected)};
         return ustore_database_init_nvme(&init);
     }
-    *error = {ustore_error_invalid_argument_k, "No engine has that name"};
+    *outcome = {ustore_status_invalid_argument_k, "No engine has that name"};
 }
 
 #pragma endregion Engines

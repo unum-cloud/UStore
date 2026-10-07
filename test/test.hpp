@@ -115,6 +115,9 @@ inline std::size_t expect_near_(double actual, double wanted, char const* expres
     case status_code_t::capacity_exhausted_k: return "capacity_exhausted_k";
     case status_code_t::device_k: return "device_k";
     case status_code_t::internal_k: return "internal_k";
+    case status_code_t::pending_k: return "pending_k";
+    case status_code_t::contended_k: return "contended_k";
+    case status_code_t::cancelled_k: return "cancelled_k";
     }
     return "unknown";
 }
@@ -248,21 +251,21 @@ std::size_t report(suite_totals_t& totals, char const* name, result_type_ (*case
     return 0;
 }
 
-/** Counts one failure when @p error is set, printing it, and clears it either way. */
-[[nodiscard]] inline std::size_t expect_no_error(ustore_error_t& error) {
-    if (!error.status) return 0;
-    fmt::println(stderr, "  unexpected error: {}", error.message);
-    error = {};
+/** Counts one failure when @p outcome is not a success, printing it, and clears it either way. */
+[[nodiscard]] inline std::size_t expect_success(ustore_outcome_t& outcome) {
+    if (outcome.status == ustore_status_success_k) return 0;
+    fmt::println(stderr, "  unexpected {}: {}", ustore_status_name(outcome.status), outcome.message);
+    outcome = {};
     return 1;
 }
 
-/** Counts one failure when @p error is empty, so an invalid call passed, and clears it either way. */
-[[nodiscard]] inline std::size_t expect_error(ustore_error_t& error) {
-    if (!error.status) {
-        fmt::println(stderr, "  an invalid task passed without an error");
+/** Counts one failure when @p outcome is a success, so an invalid call passed, and clears it either way. */
+[[nodiscard]] inline std::size_t expect_failure(ustore_outcome_t& outcome) {
+    if (outcome.status == ustore_status_success_k) {
+        fmt::println(stderr, "  an invalid task passed without a failure");
         return 1;
     }
-    error = {};
+    outcome = {};
     return 0;
 }
 
@@ -482,20 +485,22 @@ class test_config_t {
     engine_options_t options_;
 };
 
-/** Opens the engine @p config names into @p database through the C ABI. */
-inline status_t open_raw(test_config_t const& config, ustore_database_t& database) noexcept {
-    ustore_error_t error {};
-    open_engine(config.options(), &database, &error);
-    return status_t {error};
+/** Opens the engine @p config names through the C ABI. */
+inline expected<ustore_database_t> open_raw(test_config_t const& config) noexcept {
+    ustore_database_t database = nullptr;
+    ustore_outcome_t outcome {};
+    open_engine(config.options(), &database, &outcome);
+    if (outcome.status != ustore_status_success_k) return status_t {outcome};
+    return database;
 }
 
-/** Opens the engine @p config names into the C++ @p database, which adopts the handle. */
+/** Opens the engine @p config names as a C++ @p database_type_, which adopts the handle. A template, so this header
+ *  needs no @c ustore/db.hpp, whose names would clash with the storage suites' own. */
 template <typename database_type_>
-status_t open_database(database_type_& database, test_config_t const& config) noexcept {
-    ustore_database_t raw = nullptr;
-    status_t const opened = open_raw(config, raw);
-    if (opened.succeeded()) database = database_type_ {raw};
-    return opened;
+expected<database_type_> open_database(test_config_t const& config) noexcept {
+    auto [database, open_status] = open_raw(config);
+    if (open_status.failed()) return open_status;
+    return database_type_ {database};
 }
 
 /** Creates @p directory with its missing parents, answering whether it exists. */

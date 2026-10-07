@@ -12,7 +12,7 @@
 #include <concepts>         // `std::same_as`
 #include <initializer_list> // `std::initializer_list`
 #include <type_traits>      // `std::remove_cvref_t`
-#include <utility>          // `std::exchange`, `std::forward`, `std::swap`
+#include <utility>          // `std::forward`, `std::move`
 
 #include "ustore/blobs_range.hpp" // `blobs_range_t`, `keys_range_t`, `size_range_t`
 #include "ustore/docs.h"
@@ -34,72 +34,40 @@ namespace unum::ustore {
  *  The type of a handle shapes only how values cross it, since documents are stored as JSON whatever they arrive as.
  */
 class docs_collection_t {
-    ustore_database_t db_ {nullptr};
+    ustore_database_t database_ {nullptr};
     ustore_collection_id_t collection_ {ustore_collection_main_k};
     ustore_transaction_t transaction_ {nullptr};
     ustore_snapshot_t snapshot_ {};
-    any_arena_t arena_ {nullptr};
+    any_arena_t arena_;
     ustore_doc_field_type_t type_ {ustore_doc_field_json_k};
 
     status_t drop_with(ustore_drop_mode_t mode) noexcept {
-        ustore_error_t error {};
+        ustore_outcome_t outcome {};
         ustore_collection_drop_t collection_drop {};
-        collection_drop.db = db_;
-        collection_drop.error = &error;
+        collection_drop.database = database_;
+        collection_drop.outcome = &outcome;
         collection_drop.collection = collection_;
         collection_drop.mode = mode;
         ustore_collection_drop(&collection_drop);
-        return status_t {error};
+        return status_t {outcome};
     }
 
   public:
     docs_collection_t() noexcept = default;
 
-    docs_collection_t(ustore_database_t db, ustore_collection_id_t collection = ustore_collection_main_k,
+    docs_collection_t(ustore_database_t database, ustore_collection_id_t collection = ustore_collection_main_k,
                       ustore_transaction_t transaction = nullptr, ustore_snapshot_t snapshot = {},
                       ustore_arena_t* arena = nullptr, ustore_doc_field_type_t type = ustore_doc_field_json_k) noexcept
-        : db_(db), collection_(collection), transaction_(transaction), snapshot_(snapshot), arena_(db_, arena),
+        : database_(database), collection_(collection), transaction_(transaction), snapshot_(snapshot), arena_(arena),
           type_(type) {}
-
-    docs_collection_t(docs_collection_t&& other) noexcept
-        : db_(other.db_), collection_(std::exchange(other.collection_, ustore_collection_main_k)),
-          transaction_(std::exchange(other.transaction_, nullptr)), snapshot_(std::exchange(other.snapshot_, {})),
-          arena_(std::exchange(other.arena_, {nullptr})), type_(std::exchange(other.type_, ustore_doc_field_json_k)) {}
-
-    docs_collection_t& operator=(docs_collection_t&& other) noexcept {
-        std::swap(db_, other.db_);
-        std::swap(collection_, other.collection_);
-        std::swap(transaction_, other.transaction_);
-        std::swap(snapshot_, other.snapshot_);
-        std::swap(arena_, other.arena_);
-        std::swap(type_, other.type_);
-        return *this;
-    }
-
-    docs_collection_t(docs_collection_t const& other) noexcept
-        : db_(other.db_), collection_(other.collection_), transaction_(other.transaction_), snapshot_(other.snapshot_),
-          arena_(other.db_), type_(other.type_) {}
-
-    docs_collection_t& operator=(docs_collection_t const& other) noexcept {
-        db_ = other.db_;
-        collection_ = other.collection_;
-        transaction_ = other.transaction_;
-        snapshot_ = other.snapshot_;
-        arena_ = any_arena_t(other.db_);
-        type_ = other.type_;
-        return *this;
-    }
 
     operator ustore_collection_id_t() const noexcept { return collection_; }
     ustore_collection_id_t* member_ptr() noexcept { return &collection_; }
     ustore_arena_t* member_arena() noexcept { return arena_.member_ptr(); }
-    ustore_database_t db() const noexcept { return db_; }
-    ustore_transaction_t transaction() const noexcept { return transaction_; }
-    ustore_snapshot_t snapshot() const noexcept { return snapshot_; }
 
     blobs_range_t members( //
         ustore_key_t min_key = smallest_key_k, ustore_key_t max_key = largest_key_k) const noexcept {
-        return {db_, transaction_, snapshot_, collection_, min_key, max_key};
+        return {database_, view_through(transaction_, snapshot_, ustore_watch_keys_k), collection_, min_key, max_key};
     }
 
     keys_range_t keys( //
@@ -140,7 +108,7 @@ class docs_collection_t {
         places.collections_begin = &collection_;
         places.keys_begin = keys.begin();
         places.count = keys.size();
-        return {db_, transaction_, snapshot_, std::move(places), arena_, type};
+        return {database_, transaction_, snapshot_, std::move(places), arena_, type};
     }
 
     template <typename keys_argument_>
@@ -163,11 +131,12 @@ class docs_collection_t {
             else location.key = keys.key;
 
             if constexpr (has_field_concept<plain_t>) location.field = keys.field;
-            return docs_ref<collection_key_field_t> {db_, transaction_, snapshot_, std::move(location), arena_, type};
+            return docs_ref<collection_key_field_t> {database_,           transaction_, snapshot_,
+                                                     std::move(location), arena_,       type};
         }
         else {
             using locations_t = locations_in_collection<keys_argument_>;
-            return docs_ref<locations_t> {db_,       transaction_,
+            return docs_ref<locations_t> {database_, transaction_,
                                           snapshot_, locations_t {std::forward<keys_argument_>(keys), collection_},
                                           arena_,    type};
         }

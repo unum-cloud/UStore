@@ -81,60 +81,55 @@ struct batch_document_t {
           length(static_cast<ustore_length_t>(document.body.size())) {}
 };
 
-/** The arena, transaction and error one upserting thread reuses across its batches. */
+/** The transaction and outcome one upserting thread reuses across its batches. */
 struct upsert_scratch_t {
-    ustore_arena_t arena = nullptr;
     ustore_transaction_t transaction = nullptr;
-    ustore_error_t error {};
+    ustore_outcome_t outcome {};
 
     upsert_scratch_t() noexcept = default;
     upsert_scratch_t(upsert_scratch_t const&) = delete;
     upsert_scratch_t& operator=(upsert_scratch_t const&) = delete;
-    ~upsert_scratch_t() noexcept {
-        ustore_transaction_free(transaction);
-        ustore_arena_free(arena);
-    }
+    ~upsert_scratch_t() noexcept { ustore_transaction_free(transaction); }
 
-    /** Opens a transaction, answering false when the engine refused it. */
-    [[nodiscard]] bool begin(ustore_database_t db) noexcept {
+    /** Opens the transaction, or resets it after the previous batch, answering false when the engine refused. */
+    [[nodiscard]] bool begin(ustore_database_t database) noexcept {
         ustore_transaction_init_t init {};
-        init.db = db;
-        init.error = &error;
+        init.database = database;
+        init.outcome = &outcome;
         init.transaction = &transaction;
         ustore_transaction_init(&init);
         return !failed();
     }
 
     /** Commits the open transaction, answering false on a conflict or a failure. */
-    [[nodiscard]] bool commit(ustore_database_t db) noexcept {
+    [[nodiscard]] bool commit(ustore_database_t database) noexcept {
         ustore_transaction_commit_t commit {};
-        commit.db = db;
-        commit.error = &error;
+        commit.database = database;
+        commit.outcome = &outcome;
         commit.transaction = transaction;
         ustore_transaction_commit(&commit);
         return !failed();
     }
 
-    /** Answers whether the last call failed, clearing its error. */
+    /** Answers whether the last call failed, clearing its outcome. */
     [[nodiscard]] bool failed() noexcept {
-        if (!error.status) return false;
-        error = {};
+        if (outcome.status == ustore_status_success_k) return false;
+        outcome = {};
         return true;
     }
 };
 
 /** Upserts @p batch into @p collection in one transaction, answering whether it committed. */
-[[nodiscard]] inline bool docs_upsert(ustore_database_t db, ustore_collection_id_t collection,
+[[nodiscard]] inline bool docs_upsert(ustore_database_t database, ustore_collection_id_t collection,
                                       std::span<batch_document_t const> batch, upsert_scratch_t& scratch) noexcept {
-    if (!scratch.begin(db)) return false;
+    if (!scratch.begin(database)) return false;
     ustore_docs_write_t write {};
-    write.db = db;
-    write.error = &scratch.error;
-    write.arena = &scratch.arena;
+    write.database = database;
+    write.outcome = &scratch.outcome;
     write.transaction = scratch.transaction;
     write.type = ustore_doc_field_json_k;
     write.modification = ustore_doc_modify_upsert_k;
-    write.tasks_count = batch.size();
+    write.count = batch.size();
     write.collections = &collection;
     write.keys = &batch.front().key;
     write.keys_stride = sizeof(batch_document_t);
@@ -143,28 +138,27 @@ struct upsert_scratch_t {
     write.values = &batch.front().value;
     write.values_stride = sizeof(batch_document_t);
     ustore_docs_write(&write);
-    return !scratch.failed() && scratch.commit(db);
+    return !scratch.failed() && scratch.commit(database);
 }
 
 /** Upserts @p batch into @p collection in one transaction, answering whether it committed. */
-[[nodiscard]] inline bool edges_upsert(ustore_database_t db, ustore_collection_id_t collection,
+[[nodiscard]] inline bool edges_upsert(ustore_database_t database, ustore_collection_id_t collection,
                                        std::span<graph_edge_t const> batch, upsert_scratch_t& scratch) noexcept {
-    if (!scratch.begin(db)) return false;
+    if (!scratch.begin(database)) return false;
     ustore_graph_upsert_edges_t upsert {};
-    upsert.db = db;
-    upsert.error = &scratch.error;
-    upsert.arena = &scratch.arena;
+    upsert.database = database;
+    upsert.outcome = &scratch.outcome;
     upsert.transaction = scratch.transaction;
-    upsert.tasks_count = batch.size();
+    upsert.count = batch.size();
     upsert.collections = &collection;
-    upsert.edges_ids = &batch.front().id;
+    upsert.edges = &batch.front().id;
     upsert.edges_stride = sizeof(graph_edge_t);
-    upsert.sources_ids = &batch.front().source;
+    upsert.sources = &batch.front().source;
     upsert.sources_stride = sizeof(graph_edge_t);
-    upsert.targets_ids = &batch.front().target;
+    upsert.targets = &batch.front().target;
     upsert.targets_stride = sizeof(graph_edge_t);
     ustore_graph_upsert_edges(&upsert);
-    return !scratch.failed() && scratch.commit(db);
+    return !scratch.failed() && scratch.commit(database);
 }
 
 } // namespace unum::ustore::bench
