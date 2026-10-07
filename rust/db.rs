@@ -1,22 +1,24 @@
 //! Databases, views, transactions, snapshots and arenas - the Rust twin of `include/ustore/db.h`.
 //!
 //! Every call addresses exactly one view of the data: the head of the database, a transaction, or a
-//! snapshot. [`View`] is that view, so the pairing the C ABI refuses cannot be spelled here. Results
-//! land in a caller-owned [`Arena`] that the next call reuses, which is why a call borrows it mutably
-//! and every exported result borrows it back.
+//! snapshot. [`View`] is that view, so a call naming two cannot be spelled here. Results land in a
+//! caller-owned [`Arena`] that the next call reuses, which is why a call borrows it mutably and every
+//! exported result borrows it back.
 
 use std::ffi::{c_char, CStr, CString};
 use std::fmt;
+use std::iter::FusedIterator;
 use std::marker::PhantomData;
+use std::ops::Range;
 use std::ptr;
 
 // region: Raw Declarations
 
-/// One-to-one mirror of `include/ustore/db.h`.
+/// One-to-one mirror of `include/ustore/types.h` and `include/ustore/db.h`.
 pub(crate) mod ffi {
     #![allow(non_camel_case_types)]
 
-    use std::ffi::{c_char, c_int};
+    use std::ffi::{c_char, c_int, c_void};
 
     /// The opaque structs the C ABI hands out pointers to, which Rust never reads through.
     #[repr(C)]
@@ -32,17 +34,29 @@ pub(crate) mod ffi {
         _private: [u8; 0],
     }
     #[repr(C)]
+    pub struct ustore_view_handle_t {
+        _private: [u8; 0],
+    }
+    #[repr(C)]
     pub struct ustore_arena_handle_t {
+        _private: [u8; 0],
+    }
+    #[repr(C)]
+    pub struct ustore_executor_handle_t {
         _private: [u8; 0],
     }
 
     pub type ustore_database_t = *mut ustore_database_handle_t;
     pub type ustore_transaction_t = *mut ustore_transaction_handle_t;
     pub type ustore_snapshot_t = *mut ustore_snapshot_handle_t;
+    pub type ustore_view_t = *mut ustore_view_handle_t;
     pub type ustore_arena_t = *mut ustore_arena_handle_t;
+    pub type ustore_executor_t = *mut ustore_executor_handle_t;
 
-    // The public identifiers are `#[repr(C)]` twins of the structs the header declares, so the ABI names them directly
+    // The public identifiers and choices are `#[repr(C)]` twins of what the header declares, so the ABI names them
     pub type ustore_collection_id_t = super::CollectionID;
+    pub type ustore_durability_t = super::Durability;
+    pub type ustore_watch_t = super::Conflicts;
     pub type ustore_key_t = super::Key;
     pub type ustore_byte_t = u8;
     pub type ustore_char_t = c_char;
@@ -53,10 +67,56 @@ pub(crate) mod ffi {
     pub type ustore_str_view_t = *const c_char;
     pub type ustore_bytes_cptr_t = *const u8;
 
-    /// The `ustore_status_t`, `ustore_options_t`, `ustore_drop_mode_t`, `ustore_capabilities_t`,
-    /// `ustore_isolation_t`, `ustore_transport_t` and `ustore_modality_t` enumerations, each of which lowers to the
-    /// platform `int`.
+    /// The `ustore_drop_mode_t`, `ustore_capabilities_t`, `ustore_isolation_t`, `ustore_transport_t` and
+    /// `ustore_modality_t` enumerations, each of which lowers to the platform `int`.
     pub type ustore_enum_t = c_int;
+
+    /// The `ustore_status_t` a call stores, kept as its integer, since a value no variant of a Rust enum names is
+    /// undefined behavior to read.
+    #[repr(transparent)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+    pub struct ustore_status_t(pub c_int);
+
+    impl ustore_status_t {
+        pub const SUCCESS: ustore_status_t = ustore_status_t(0);
+    }
+
+    /// The outcome of one call: a status, and a static message that is null exactly on success.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct ustore_outcome_t {
+        pub status: ustore_status_t,
+        pub message: *const c_char,
+    }
+
+    impl Default for ustore_outcome_t {
+        fn default() -> Self {
+            ustore_outcome_t {
+                status: ustore_status_t::SUCCESS,
+                message: core::ptr::null(),
+            }
+        }
+    }
+
+    /// Whether a call returns once done or once queued, where the binding only ever blocks.
+    #[repr(C)]
+    #[allow(dead_code)]
+    pub enum ustore_completion_t {
+        Blocking = 0,
+        Deferred = 1,
+    }
+
+    /// In what order a scan hands its keys over, where the binding only ever asks for order.
+    #[repr(C)]
+    #[allow(dead_code)]
+    pub enum ustore_scan_mode_t {
+        Ordered = 0,
+        Bulk = 1,
+    }
+
+    /// A progress callback answering a `ustore_continuation_t`, which the binding never registers.
+    pub type ustore_progress_callback_t =
+        Option<unsafe extern "C" fn(ustore_size_t, ustore_size_t, *mut c_void) -> ustore_enum_t>;
 
     pub const USTORE_ISOLATION_STRICT_SERIALIZABLE_K: ustore_enum_t = 0;
     pub const USTORE_ISOLATION_SNAPSHOT_K: ustore_enum_t = 1;
@@ -74,30 +134,9 @@ pub(crate) mod ffi {
     pub const USTORE_MODALITY_STRINGS_K: ustore_enum_t = 4;
     pub const USTORE_MODALITY_PAGES_K: ustore_enum_t = 5;
 
-    pub const USTORE_OPTIONS_DEFAULT_K: ustore_enum_t = 0;
-    pub const USTORE_OPTION_WRITE_FLUSH_K: ustore_enum_t = 1 << 1;
-    pub const USTORE_OPTION_TRANSACTION_DONT_WATCH_K: ustore_enum_t = 1 << 2;
-
     pub const USTORE_SUPPORTS_TRANSACTIONS_K: ustore_enum_t = 1;
     pub const USTORE_SUPPORTS_COLLECTIONS_K: ustore_enum_t = 2;
     pub const USTORE_SUPPORTS_SNAPSHOTS_K: ustore_enum_t = 4;
-
-    /// The outcome of one call: a status, and a static message that is null exactly on success.
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub struct ustore_error_t {
-        pub status: ustore_enum_t,
-        pub message: *const c_char,
-    }
-
-    impl Default for ustore_error_t {
-        fn default() -> Self {
-            ustore_error_t {
-                status: 0,
-                message: core::ptr::null(),
-            }
-        }
-    }
 
     #[repr(C)]
     pub struct ustore_data_directory_t {
@@ -107,16 +146,20 @@ pub(crate) mod ffi {
 
     #[repr(C)]
     pub struct ustore_database_init_ram_t {
-        pub db: *mut ustore_database_t,
-        pub error: *mut ustore_error_t,
+        pub database: *mut ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
         pub directory: ustore_str_view_t,
         pub isolation: ustore_enum_t,
     }
 
     #[repr(C)]
     pub struct ustore_database_init_rocksdb_t {
-        pub db: *mut ustore_database_t,
-        pub error: *mut ustore_error_t,
+        pub database: *mut ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
         pub directory: ustore_str_view_t,
         pub data_directories: *const ustore_data_directory_t,
         pub data_directories_count: ustore_size_t,
@@ -124,21 +167,24 @@ pub(crate) mod ffi {
 
     #[repr(C)]
     pub struct ustore_database_init_leveldb_t {
-        pub db: *mut ustore_database_t,
-        pub error: *mut ustore_error_t,
+        pub database: *mut ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
         pub directory: ustore_str_view_t,
     }
 
     #[repr(C)]
     pub struct ustore_database_init_nvme_t {
-        pub db: *mut ustore_database_t,
-        pub error: *mut ustore_error_t,
+        pub database: *mut ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
         pub directory: ustore_str_view_t,
         pub data_directories: *const ustore_data_directory_t,
         pub data_directories_count: ustore_size_t,
         pub transport: ustore_enum_t,
         pub memory_limit: ustore_size_t,
-        pub threads: ustore_size_t,
         pub gpu_devices: *const c_int,
         pub gpu_devices_count: ustore_size_t,
         pub gpu_memory_limit: ustore_size_t,
@@ -161,55 +207,74 @@ pub(crate) mod ffi {
     }
 
     #[repr(C)]
-    pub struct ustore_database_capabilities_t {
-        pub db: ustore_database_t,
-        pub error: *mut ustore_error_t,
-        pub capabilities: *mut ustore_enum_t,
+    pub struct ustore_database_description_t {
+        pub capabilities: ustore_enum_t,
+    }
+
+    #[repr(C)]
+    pub struct ustore_database_describe_t {
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
+        pub description: *mut ustore_database_description_t,
     }
 
     #[repr(C)]
     pub struct ustore_database_control_t {
-        pub db: ustore_database_t,
-        pub arena: *mut ustore_arena_t,
-        pub error: *mut ustore_error_t,
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
         pub request: ustore_str_view_t,
         pub response: *mut ustore_str_view_t,
+        pub arena: *mut ustore_arena_t,
+        pub progress: ustore_progress_callback_t,
+        pub progress_state: *mut c_void,
     }
 
     #[repr(C)]
     pub struct ustore_snapshot_init_t {
-        pub db: ustore_database_t,
-        pub error: *mut ustore_error_t,
         pub snapshot: *mut ustore_snapshot_t,
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
     }
 
     #[repr(C)]
     pub struct ustore_snapshot_export_t {
-        pub db: ustore_database_t,
-        pub error: *mut ustore_error_t,
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
         pub snapshot: ustore_snapshot_t,
         pub path: ustore_str_view_t,
+        pub progress: ustore_progress_callback_t,
+        pub progress_state: *mut c_void,
     }
 
     #[repr(C)]
     pub struct ustore_collection_list_t {
-        pub db: ustore_database_t,
-        pub error: *mut ustore_error_t,
-        pub transaction: ustore_transaction_t,
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
         pub snapshot: ustore_snapshot_t,
-        pub arena: *mut ustore_arena_t,
-        pub options: ustore_enum_t,
         pub count: *mut ustore_size_t,
         pub collections: *mut *mut ustore_collection_id_t,
         pub modalities: *mut *mut ustore_enum_t,
         pub names_offsets: *mut *mut ustore_length_t,
         pub names: *mut *mut ustore_char_t,
+        pub arena: *mut ustore_arena_t,
     }
 
     #[repr(C)]
     pub struct ustore_collection_create_t {
-        pub db: ustore_database_t,
-        pub error: *mut ustore_error_t,
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
         pub name: ustore_str_view_t,
         pub name_length: ustore_length_t,
         pub modality: ustore_enum_t,
@@ -218,53 +283,70 @@ pub(crate) mod ffi {
 
     #[repr(C)]
     pub struct ustore_collection_find_t {
-        pub db: ustore_database_t,
-        pub error: *mut ustore_error_t,
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
         pub snapshot: ustore_snapshot_t,
-        pub arena: *mut ustore_arena_t,
-        pub options: ustore_enum_t,
-        pub tasks_count: ustore_size_t,
+        pub count: ustore_size_t,
         pub names: *const ustore_str_view_t,
         pub names_stride: ustore_size_t,
         pub names_lengths: *const ustore_length_t,
         pub names_lengths_stride: ustore_size_t,
-        pub presences: *mut *mut ustore_octet_t,
-        pub collections: *mut *mut ustore_collection_id_t,
-        pub modalities: *mut *mut ustore_enum_t,
+        pub presences: *mut ustore_octet_t,
+        pub collections: *mut ustore_collection_id_t,
+        pub collections_stride: ustore_size_t,
+        pub modalities: *mut ustore_enum_t,
+        pub modalities_stride: ustore_size_t,
     }
 
     #[repr(C)]
     pub struct ustore_collection_drop_t {
-        pub db: ustore_database_t,
-        pub error: *mut ustore_error_t,
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
         pub collection: ustore_collection_id_t,
         pub mode: ustore_enum_t,
     }
 
     #[repr(C)]
     pub struct ustore_transaction_init_t {
-        pub db: ustore_database_t,
-        pub error: *mut ustore_error_t,
-        pub options: ustore_enum_t,
         pub transaction: *mut ustore_transaction_t,
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
     }
 
     #[repr(C)]
     pub struct ustore_transaction_stage_t {
-        pub db: ustore_database_t,
-        pub error: *mut ustore_error_t,
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
         pub transaction: ustore_transaction_t,
-        pub options: ustore_enum_t,
         pub stamp: *mut ustore_stamp_t,
     }
 
     #[repr(C)]
     pub struct ustore_transaction_commit_t {
-        pub db: ustore_database_t,
-        pub error: *mut ustore_error_t,
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
         pub transaction: ustore_transaction_t,
-        pub options: ustore_enum_t,
         pub stamp: *mut ustore_stamp_t,
+        pub durability: ustore_durability_t,
+    }
+
+    #[repr(C)]
+    pub struct ustore_transaction_rollback_t {
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
+        pub transaction: ustore_transaction_t,
     }
 
     extern "C" {
@@ -272,16 +354,19 @@ pub(crate) mod ffi {
         pub static ustore_length_missing_k: ustore_length_t;
         pub static ustore_key_unknown_k: ustore_key_t;
 
+        pub fn ustore_status_name(status: ustore_status_t) -> *const c_char;
+
         pub fn ustore_database_init_ram(arguments: *mut ustore_database_init_ram_t);
         pub fn ustore_database_init_rocksdb(arguments: *mut ustore_database_init_rocksdb_t);
         pub fn ustore_database_init_leveldb(arguments: *mut ustore_database_init_leveldb_t);
         pub fn ustore_database_init_nvme(arguments: *mut ustore_database_init_nvme_t);
 
-        pub fn ustore_database_capabilities(arguments: *mut ustore_database_capabilities_t);
+        pub fn ustore_database_describe(arguments: *mut ustore_database_describe_t);
         pub fn ustore_database_control(arguments: *mut ustore_database_control_t);
 
         pub fn ustore_snapshot_init(arguments: *mut ustore_snapshot_init_t);
         pub fn ustore_snapshot_export(arguments: *mut ustore_snapshot_export_t);
+        pub fn ustore_snapshot_view(snapshot: ustore_snapshot_t) -> ustore_view_t;
 
         pub fn ustore_collection_list(arguments: *mut ustore_collection_list_t);
         pub fn ustore_collection_create(arguments: *mut ustore_collection_create_t);
@@ -289,8 +374,10 @@ pub(crate) mod ffi {
         pub fn ustore_collection_drop(arguments: *mut ustore_collection_drop_t);
 
         pub fn ustore_transaction_init(arguments: *mut ustore_transaction_init_t);
+        pub fn ustore_transaction_view(transaction: ustore_transaction_t, watch: ustore_watch_t) -> ustore_view_t;
         pub fn ustore_transaction_stage(arguments: *mut ustore_transaction_stage_t);
         pub fn ustore_transaction_commit(arguments: *mut ustore_transaction_commit_t);
+        pub fn ustore_transaction_rollback(arguments: *mut ustore_transaction_rollback_t);
 
         pub fn ustore_arena_free(arena: ustore_arena_t);
         pub fn ustore_transaction_free(transaction: ustore_transaction_t);
@@ -336,13 +423,19 @@ pub enum Status {
     Device = 13,
     /// The engine failed in a way no other status names.
     Internal = 14,
+    /// The call was submitted and has not finished.
+    Pending = 15,
+    /// The call found its executor or its arena busy with another call.
+    Contended = 16,
+    /// A progress callback stopped the call, which published nothing.
+    Cancelled = 17,
     /// A status a newer library reported and this binding has no name for.
     Unrecognized = -1,
 }
 
 impl Status {
-    fn from_raw(code: ffi::ustore_enum_t) -> Self {
-        match code {
+    fn from_raw(status: ffi::ustore_status_t) -> Self {
+        match status.0 {
             1 => Status::OutOfMemory,
             2 => Status::InvalidArgument,
             3 => Status::Uninitialized,
@@ -357,7 +450,21 @@ impl Status {
             12 => Status::CapacityExhausted,
             13 => Status::Device,
             14 => Status::Internal,
+            15 => Status::Pending,
+            16 => Status::Contended,
+            17 => Status::Cancelled,
             _ => Status::Unrecognized,
+        }
+    }
+
+    /// The canonical lowercase spelling the library gives this status, such as "out-of-memory", where one it has no
+    /// name for spells as its fallback.
+    pub fn name(self) -> &'static str {
+        // SAFETY: the library answers a static null-terminated spelling for every value, unknown ones included.
+        unsafe {
+            static_string(ffi::ustore_status_name(ffi::ustore_status_t(
+                self as ffi::ustore_enum_t,
+            )))
         }
     }
 }
@@ -390,15 +497,15 @@ impl std::error::Error for Error {}
 /// The result of every fallible call in this crate.
 pub type Result<Value> = std::result::Result<Value, Error>;
 
-/// Turns the error a call wrote into a `Result`.
-pub(crate) fn check(error: ffi::ustore_error_t) -> Result<()> {
-    if error.status == 0 {
+/// Turns the outcome a blocking call stored into a `Result`.
+pub(crate) fn check(outcome: ffi::ustore_outcome_t) -> Result<()> {
+    if outcome.status == ffi::ustore_status_t::SUCCESS {
         return Ok(());
     }
     Err(Error {
-        status: Status::from_raw(error.status),
-        // SAFETY: a failed call writes a static null-terminated message, or null.
-        message: unsafe { static_string(error.message) },
+        status: Status::from_raw(outcome.status),
+        // SAFETY: a failed call stores a static null-terminated message, or null.
+        message: unsafe { static_string(outcome.message) },
     })
 }
 
@@ -627,49 +734,33 @@ pub fn key_unknown() -> Key {
     unsafe { ffi::ustore_key_unknown_k }
 }
 
-/// Whether a write reaches the drive before the call returns.
+/// Whether a write reaches the drive before the call returns, as `ustore_durability_t` spells it.
 ///
 /// A transaction flushes at its commit, so `Flushed` on a transaction's write is refused.
+#[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
 pub enum Durability {
     /// The engine decides when the bytes reach the drive.
     #[default]
-    Buffered,
+    Buffered = 0,
     /// The call returns once the bytes are on the drive, at a cost that varies by engine.
-    Flushed,
+    Flushed = 1,
 }
 
-impl Durability {
-    pub(crate) fn to_raw(self) -> ffi::ustore_enum_t {
-        match self {
-            Durability::Buffered => ffi::USTORE_OPTIONS_DEFAULT_K,
-            Durability::Flushed => ffi::USTORE_OPTION_WRITE_FLUSH_K,
-        }
-    }
-}
-
-/// Whether the calls of a transaction watch what they touch for conflicts.
+/// Whether the calls of a transaction watch what they touch for conflicts, as `ustore_watch_t` spells it.
 ///
 /// Only a transaction watches anything, so the head of a database and a snapshot never carry this, and
 /// it changes what a call does only at [`Isolation::Snapshot`]: a strictly serializable transaction puts
 /// every read it makes into the one serial order whatever this says.
+#[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
 pub enum Conflicts {
     /// Every read and write the view makes is recorded, so a concurrent writer conflicts at the commit.
     #[default]
-    Watched,
+    Watched = 0,
     /// Nothing the view touches is watched, so a snapshot-isolated transaction commits over a concurrent
     /// writer instead of conflicting with it.
-    Unwatched,
-}
-
-impl Conflicts {
-    fn to_raw(self) -> ffi::ustore_enum_t {
-        match self {
-            Conflicts::Watched => ffi::USTORE_OPTIONS_DEFAULT_K,
-            Conflicts::Unwatched => ffi::USTORE_OPTION_TRANSACTION_DONT_WATCH_K,
-        }
-    }
+    Unwatched = 1,
 }
 
 /// What dropping a collection removes.
@@ -687,13 +778,25 @@ pub enum Removed {
 
 // region: Arenas
 
-/// Temporary memory the engine exports results into, which the next call through it reuses.
+/// Temporary memory results land in, which the next call through it reuses.
 ///
-/// Every batch verb takes one mutably and hands back a result borrowing it, so the borrow checker
-/// both keeps a result from outliving its arena and stops the call that would overwrite it.
+/// The library sizes the tapes of values, which land behind the handle, while the outputs a batch bounds land in
+/// the spans beside it, which the binding sizes. Both grow to their high-water mark, so a steady loop allocates once. Every
+/// batch verb takes one mutably and hands back a result borrowing it, so the borrow checker both keeps a result
+/// from outliving its arena and stops the call that would overwrite it.
 #[derive(Debug)]
 pub struct Arena {
-    handle: ffi::ustore_arena_t,
+    pub(crate) handle: ffi::ustore_arena_t,
+    /// Presence bits of a read, one per key.
+    pub(crate) presences: Vec<ffi::ustore_octet_t>,
+    /// Offsets of a read into its tape, or of a scan into its keys, one more than its tasks.
+    pub(crate) offsets: Vec<ffi::ustore_length_t>,
+    /// Keys a scan or a sample found, as many as its limit.
+    pub(crate) keys: Vec<Key>,
+    /// Degrees of the vertices a graph lookup addressed.
+    pub(crate) degrees: Vec<u32>,
+    /// Words the columns of a gather and their addresses are carved from, aligned for any scalar.
+    pub(crate) columns: Vec<u64>,
 }
 
 impl Arena {
@@ -701,20 +804,29 @@ impl Arena {
     pub fn new() -> Self {
         Arena {
             handle: ptr::null_mut(),
+            presences: Vec::new(),
+            offsets: Vec::new(),
+            keys: Vec::new(),
+            degrees: Vec::new(),
+            columns: Vec::new(),
         }
-    }
-
-    /// Releases everything exported into the arena, keeping it usable.
-    pub fn reset(&mut self) {
-        // SAFETY: the handle came from the library, and null is explicitly safe to free.
-        unsafe { ffi::ustore_arena_free(self.handle) };
-        self.handle = ptr::null_mut();
     }
 
     /// The slot the calls grow in place.
     pub(crate) fn slot(&mut self) -> *mut ffi::ustore_arena_t {
         &mut self.handle
     }
+}
+
+/// The first `count` entries of `buffer`, which grows to hold them and never shrinks.
+pub(crate) fn grown<Entry: Copy + Default>(buffer: &mut Vec<Entry>, count: usize) -> Result<&mut [Entry]> {
+    if buffer.len() < count {
+        buffer
+            .try_reserve(count - buffer.len())
+            .map_err(|_| fail(Status::OutOfMemory, "the arena could not grow its spans"))?;
+        buffer.resize(count, Entry::default());
+    }
+    Ok(&mut buffer[..count])
 }
 
 impl Default for Arena {
@@ -733,6 +845,46 @@ impl Drop for Arena {
 // SAFETY: an arena is caller-owned scratch the library never registers anywhere, so it may be
 // handed to another thread outright; every verb needs it mutably, so two cannot share one.
 unsafe impl Send for Arena {}
+
+/// The rows of a batch result in order, from either end, each read through the result's own `get`.
+#[derive(Clone, Debug)]
+pub struct Rows<Results, Row> {
+    results: Results,
+    rows: Range<usize>,
+    row: fn(&Results, usize) -> Row,
+}
+
+impl<Results, Row> Rows<Results, Row> {
+    pub(crate) fn new(results: Results, count: usize, row: fn(&Results, usize) -> Row) -> Self {
+        Rows {
+            results,
+            rows: 0..count,
+            row,
+        }
+    }
+}
+
+impl<Results, Row> Iterator for Rows<Results, Row> {
+    type Item = Row;
+
+    fn next(&mut self) -> Option<Row> {
+        self.rows.next().map(|index| (self.row)(&self.results, index))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.rows.size_hint()
+    }
+}
+
+impl<Results, Row> DoubleEndedIterator for Rows<Results, Row> {
+    fn next_back(&mut self) -> Option<Row> {
+        self.rows.next_back().map(|index| (self.row)(&self.results, index))
+    }
+}
+
+impl<Results, Row> ExactSizeIterator for Rows<Results, Row> {}
+
+impl<Results, Row> FusedIterator for Rows<Results, Row> {}
 
 // endregion: Arenas
 
@@ -754,6 +906,32 @@ pub enum Modality {
     Strings,
     /// Ordered documents.
     Pages,
+}
+
+impl Modality {
+    pub(crate) fn to_raw(self) -> ffi::ustore_enum_t {
+        match self {
+            Modality::Any => ffi::USTORE_MODALITY_ANY_K,
+            Modality::Blobs => ffi::USTORE_MODALITY_BLOBS_K,
+            Modality::Docs => ffi::USTORE_MODALITY_DOCS_K,
+            Modality::Graph => ffi::USTORE_MODALITY_GRAPH_K,
+            Modality::Strings => ffi::USTORE_MODALITY_STRINGS_K,
+            Modality::Pages => ffi::USTORE_MODALITY_PAGES_K,
+        }
+    }
+
+    /// The modality an engine reported, or `None` for one a newer library added.
+    pub(crate) fn from_raw(raw: ffi::ustore_enum_t) -> Option<Self> {
+        match raw {
+            ffi::USTORE_MODALITY_ANY_K => Some(Modality::Any),
+            ffi::USTORE_MODALITY_BLOBS_K => Some(Modality::Blobs),
+            ffi::USTORE_MODALITY_DOCS_K => Some(Modality::Docs),
+            ffi::USTORE_MODALITY_GRAPH_K => Some(Modality::Graph),
+            ffi::USTORE_MODALITY_STRINGS_K => Some(Modality::Strings),
+            ffi::USTORE_MODALITY_PAGES_K => Some(Modality::Pages),
+            _ => None,
+        }
+    }
 }
 
 /// The isolation the in-memory engine delivers to the transactions of a database.
@@ -854,8 +1032,6 @@ pub struct NVMEOptions<'path> {
     pub transport: Transport,
     /// Bytes of host memory the engine may pin and cache.
     pub memory_limit: u64,
-    /// Background threads, derived from the cores by default.
-    pub threads: u64,
     /// CUDA devices compaction may run on.
     pub gpu_devices: &'path [i32],
     /// Bytes of device memory compaction may take on each of `gpu_devices`.
@@ -930,7 +1106,7 @@ fn c_data_directories(directories: &[DataDirectory<'_>]) -> Result<(Vec<CString>
 
 // region: Databases
 
-/// What an engine supports, as `ustore_database_capabilities` reports it.
+/// What an engine supports, as `ustore_database_describe` reports it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub struct Capabilities {
     bits: ffi::ustore_enum_t,
@@ -972,10 +1148,12 @@ impl Database {
     pub fn open_ram(options: &RAMOptions<'_>) -> Result<Self> {
         let directory = options.directory.map(c_path).transpose()?;
         let mut handle: ffi::ustore_database_t = ptr::null_mut();
-        let mut error = ffi::ustore_error_t::default();
+        let mut outcome = ffi::ustore_outcome_t::default();
         let mut arguments = ffi::ustore_database_init_ram_t {
-            db: &mut handle,
-            error: &mut error,
+            database: &mut handle,
+            executor: ptr::null_mut(),
+            outcome: &mut outcome,
+            completion: ffi::ustore_completion_t::Blocking,
             directory: directory.as_ref().map_or(ptr::null(), |path| path.as_ptr()),
             isolation: match options.isolation {
                 Isolation::StrictSerializable => ffi::USTORE_ISOLATION_STRICT_SERIALIZABLE_K,
@@ -984,7 +1162,7 @@ impl Database {
         };
         // SAFETY: every pointer in `arguments` outlives the call, the directory included.
         unsafe { ffi::ustore_database_init_ram(&mut arguments) };
-        Database::opened(handle, error)
+        Database::opened(handle, outcome)
     }
 
     /// Opens the RocksDB engine, or fails with [`Status::Unsupported`] in a build without it.
@@ -992,32 +1170,36 @@ impl Database {
         let directory = c_path(options.directory)?;
         let (_paths, data_directories) = c_data_directories(options.data_directories)?;
         let mut handle: ffi::ustore_database_t = ptr::null_mut();
-        let mut error = ffi::ustore_error_t::default();
+        let mut outcome = ffi::ustore_outcome_t::default();
         let mut arguments = ffi::ustore_database_init_rocksdb_t {
-            db: &mut handle,
-            error: &mut error,
+            database: &mut handle,
+            executor: ptr::null_mut(),
+            outcome: &mut outcome,
+            completion: ffi::ustore_completion_t::Blocking,
             directory: directory.as_ptr(),
             data_directories: data_directories.as_ptr(),
             data_directories_count: data_directories.len() as ffi::ustore_size_t,
         };
         // SAFETY: every pointer in `arguments` outlives the call, the paths included.
         unsafe { ffi::ustore_database_init_rocksdb(&mut arguments) };
-        Database::opened(handle, error)
+        Database::opened(handle, outcome)
     }
 
     /// Opens the LevelDB engine, or fails with [`Status::Unsupported`] in a build without it.
     pub fn open_leveldb(options: &LevelDBOptions<'_>) -> Result<Self> {
         let directory = c_path(options.directory)?;
         let mut handle: ffi::ustore_database_t = ptr::null_mut();
-        let mut error = ffi::ustore_error_t::default();
+        let mut outcome = ffi::ustore_outcome_t::default();
         let mut arguments = ffi::ustore_database_init_leveldb_t {
-            db: &mut handle,
-            error: &mut error,
+            database: &mut handle,
+            executor: ptr::null_mut(),
+            outcome: &mut outcome,
+            completion: ffi::ustore_completion_t::Blocking,
             directory: directory.as_ptr(),
         };
         // SAFETY: every pointer in `arguments` outlives the call, the directory included.
         unsafe { ffi::ustore_database_init_leveldb(&mut arguments) };
-        Database::opened(handle, error)
+        Database::opened(handle, outcome)
     }
 
     /// Opens the NVMe engine, or fails with [`Status::Unsupported`] in a build without it.
@@ -1025,10 +1207,12 @@ impl Database {
         let directory = c_path(options.directory)?;
         let (_paths, data_directories) = c_data_directories(options.data_directories)?;
         let mut handle: ffi::ustore_database_t = ptr::null_mut();
-        let mut error = ffi::ustore_error_t::default();
+        let mut outcome = ffi::ustore_outcome_t::default();
         let mut arguments = ffi::ustore_database_init_nvme_t {
-            db: &mut handle,
-            error: &mut error,
+            database: &mut handle,
+            executor: ptr::null_mut(),
+            outcome: &mut outcome,
+            completion: ffi::ustore_completion_t::Blocking,
             directory: directory.as_ptr(),
             data_directories: data_directories.as_ptr(),
             data_directories_count: data_directories.len() as ffi::ustore_size_t,
@@ -1040,7 +1224,6 @@ impl Database {
                 Transport::LinuxSpdk => ffi::USTORE_TRANSPORT_LINUX_SPDK_K,
             },
             memory_limit: options.memory_limit,
-            threads: options.threads,
             gpu_devices: options.gpu_devices.as_ptr(),
             gpu_devices_count: options.gpu_devices.len() as ffi::ustore_size_t,
             gpu_memory_limit: options.gpu_memory_limit,
@@ -1063,12 +1246,12 @@ impl Database {
         };
         // SAFETY: every pointer in `arguments` outlives the call, the paths and devices included.
         unsafe { ffi::ustore_database_init_nvme(&mut arguments) };
-        Database::opened(handle, error)
+        Database::opened(handle, outcome)
     }
 
-    /// The database an init call opened, or the error it reported.
-    fn opened(handle: ffi::ustore_database_t, error: ffi::ustore_error_t) -> Result<Self> {
-        check(error)?;
+    /// The database an init call opened, or the failure it reported.
+    fn opened(handle: ffi::ustore_database_t, outcome: ffi::ustore_outcome_t) -> Result<Self> {
+        check(outcome)?;
         match handle.is_null() {
             true => Err(fail(Status::Internal, "the library returned no database and no error")),
             false => Ok(Database { handle }),
@@ -1077,17 +1260,21 @@ impl Database {
 
     /// What the engine behind this database supports.
     pub fn capabilities(&self) -> Result<Capabilities> {
-        let mut bits: ffi::ustore_enum_t = 0;
-        let mut error = ffi::ustore_error_t::default();
-        let mut arguments = ffi::ustore_database_capabilities_t {
-            db: self.handle,
-            error: &mut error,
-            capabilities: &mut bits,
+        let mut description = ffi::ustore_database_description_t { capabilities: 0 };
+        let mut outcome = ffi::ustore_outcome_t::default();
+        let mut arguments = ffi::ustore_database_describe_t {
+            database: self.handle,
+            executor: ptr::null_mut(),
+            outcome: &mut outcome,
+            completion: ffi::ustore_completion_t::Blocking,
+            description: &mut description,
         };
         // SAFETY: every pointer in `arguments` outlives the call.
-        unsafe { ffi::ustore_database_capabilities(&mut arguments) };
-        check(error)?;
-        Ok(Capabilities { bits })
+        unsafe { ffi::ustore_database_describe(&mut arguments) };
+        check(outcome)?;
+        Ok(Capabilities {
+            bits: description.capabilities,
+        })
     }
 
     /// Sends a free-form request to the engine - "clear", "reset", "compact", "info" or "usage" -
@@ -1096,17 +1283,21 @@ impl Database {
         let request =
             CString::new(request).map_err(|_| fail(Status::Malformed, "the request holds a null character"))?;
         let mut response: ffi::ustore_str_view_t = ptr::null();
-        let mut error = ffi::ustore_error_t::default();
+        let mut outcome = ffi::ustore_outcome_t::default();
         let mut arguments = ffi::ustore_database_control_t {
-            db: self.handle,
-            arena: arena.slot(),
-            error: &mut error,
+            database: self.handle,
+            executor: ptr::null_mut(),
+            outcome: &mut outcome,
+            completion: ffi::ustore_completion_t::Blocking,
             request: request.as_ptr(),
             response: &mut response,
+            arena: arena.slot(),
+            progress: None,
+            progress_state: ptr::null_mut(),
         };
         // SAFETY: every pointer in `arguments` outlives the call, the request included.
         unsafe { ffi::ustore_database_control(&mut arguments) };
-        check(error)?;
+        check(outcome)?;
         if response.is_null() {
             return Err(fail(
                 Status::Internal,
@@ -1125,9 +1316,10 @@ impl Database {
     pub fn head(&self) -> View<'_> {
         View {
             database: self.handle,
+            view: ptr::null_mut(),
             transaction: ptr::null_mut(),
             snapshot: ptr::null_mut(),
-            options: ffi::USTORE_OPTIONS_DEFAULT_K,
+            watch: Conflicts::Watched,
             marker: PhantomData,
         }
     }
@@ -1142,15 +1334,17 @@ impl Database {
     /// Pins a point-in-time view of the database, which it releases when dropped.
     pub fn snapshot(&self) -> Result<Snapshot<'_>> {
         let mut handle: ffi::ustore_snapshot_t = ptr::null_mut();
-        let mut error = ffi::ustore_error_t::default();
+        let mut outcome = ffi::ustore_outcome_t::default();
         let mut arguments = ffi::ustore_snapshot_init_t {
-            db: self.handle,
-            error: &mut error,
             snapshot: &mut handle,
+            database: self.handle,
+            executor: ptr::null_mut(),
+            outcome: &mut outcome,
+            completion: ffi::ustore_completion_t::Blocking,
         };
         // SAFETY: every pointer in `arguments` outlives the call.
         unsafe { ffi::ustore_snapshot_init(&mut arguments) };
-        check(error)?;
+        check(outcome)?;
         match handle.is_null() {
             true => Err(fail(Status::Internal, "the library returned no snapshot and no error")),
             false => Ok(Snapshot { database: self, handle }),
@@ -1163,23 +1357,25 @@ impl Database {
     }
 
     /// Drops the collection `name` addresses, together with its contents and its name.
-    pub fn drop_collection(&self, arena: &mut Arena, name: &str) -> Result<()> {
-        let collection = self.head().collection(arena, name)?;
+    pub fn drop_collection(&self, name: &str) -> Result<()> {
+        let (collection, _) = self.head().collection(name)?;
         self.clear_collection(collection, Removed::CollectionAndEntries)
     }
 
     /// Removes the contents of a collection, or the collection itself together with its name.
     pub fn clear_collection(&self, collection: CollectionID, removed: Removed) -> Result<()> {
-        let mut error = ffi::ustore_error_t::default();
+        let mut outcome = ffi::ustore_outcome_t::default();
         let mut arguments = ffi::ustore_collection_drop_t {
-            db: self.handle,
-            error: &mut error,
+            database: self.handle,
+            executor: ptr::null_mut(),
+            outcome: &mut outcome,
+            completion: ffi::ustore_completion_t::Blocking,
             collection,
             mode: removed as ffi::ustore_enum_t,
         };
         // SAFETY: every pointer in `arguments` outlives the call.
         unsafe { ffi::ustore_collection_drop(&mut arguments) };
-        check(error)
+        check(outcome)
     }
 
     /// The raw handle the modality verbs pass across the boundary.
@@ -1207,29 +1403,22 @@ pub(crate) unsafe fn exported_slice<'arena, Value>(first: *const Value, count: u
     }
 }
 
-/// How much the one task of a call found, or zero when it never reached an engine.
-pub(crate) fn first_count(counts: *const ffi::ustore_length_t) -> usize {
-    match counts.is_null() {
-        true => 0,
-        // SAFETY: a successful call exports one count per task, and there is exactly one task.
-        false => unsafe { *counts as usize },
-    }
-}
-
 // endregion: Databases
 
 // region: Views
 
 /// The one view a call addresses: the head of a database, a transaction, or a snapshot.
 ///
-/// Every read, write and scan hangs off this type, so a call naming two views at once - which the C
-/// ABI refuses - cannot be written.
+/// Every read, write and scan hangs off this type, so a call naming two views at once cannot be written. Reads
+/// pass the `ustore_view_t` it holds, writes pass its transaction and whether that watches them, and the view is
+/// as cheap to copy as the handles it borrows from its parent.
 #[derive(Clone, Copy, Debug)]
 pub struct View<'view> {
     database: ffi::ustore_database_t,
+    view: ffi::ustore_view_t,
     transaction: ffi::ustore_transaction_t,
     snapshot: ffi::ustore_snapshot_t,
-    options: ffi::ustore_enum_t,
+    watch: Conflicts,
     marker: PhantomData<&'view Database>,
 }
 
@@ -1239,42 +1428,52 @@ impl<'view> View<'view> {
         self.database
     }
 
-    /// The options every call through this view carries, which name its conflict detection.
-    pub(crate) fn options(&self) -> ffi::ustore_enum_t {
-        self.options
+    /// What every read through this view sees, null at the head.
+    pub(crate) fn view(&self) -> ffi::ustore_view_t {
+        self.view
     }
 
-    /// The transaction this view reads and writes through, or null.
-    pub(crate) fn transaction(&self) -> ffi::ustore_transaction_t {
-        self.transaction
+    /// The transaction every write through this view joins, null at the head, refusing a snapshot.
+    pub(crate) fn transaction(&self) -> Result<ffi::ustore_transaction_t> {
+        match self.snapshot.is_null() {
+            true => Ok(self.transaction),
+            false => Err(fail(Status::InvalidArgument, "nothing writes through a snapshot")),
+        }
     }
 
-    /// The snapshot this view reads at, or null.
+    /// Whether the transaction records what the writes through this view touch.
+    pub(crate) fn watch(&self) -> Conflicts {
+        self.watch
+    }
+
+    /// The snapshot a listing through this view reads, null at the head and inside a transaction, whose listings
+    /// read the head as well.
     pub(crate) fn snapshot(&self) -> ffi::ustore_snapshot_t {
         self.snapshot
     }
 
-    /// Every collection this view holds, the main one excluded, exported into the arena.
+    /// Every collection the database holds at this view's snapshot or at the head, the main one excluded, exported
+    /// into the arena.
     pub fn collections<'arena>(&self, arena: &'arena mut Arena) -> Result<&'arena [CollectionID]> {
         let mut count: ffi::ustore_size_t = 0;
         let mut ids: *mut CollectionID = ptr::null_mut();
-        let mut error = ffi::ustore_error_t::default();
+        let mut outcome = ffi::ustore_outcome_t::default();
         let mut arguments = ffi::ustore_collection_list_t {
-            db: self.database,
-            error: &mut error,
-            transaction: self.transaction,
+            database: self.database,
+            executor: ptr::null_mut(),
+            outcome: &mut outcome,
+            completion: ffi::ustore_completion_t::Blocking,
             snapshot: self.snapshot,
-            arena: arena.slot(),
-            options: ffi::USTORE_OPTIONS_DEFAULT_K,
             count: &mut count,
             collections: &mut ids,
             modalities: ptr::null_mut(),
             names_offsets: ptr::null_mut(),
             names: ptr::null_mut(),
+            arena: arena.slot(),
         };
         // SAFETY: every pointer in `arguments` outlives the call.
         unsafe { ffi::ustore_collection_list(&mut arguments) };
-        check(error)?;
+        check(outcome)?;
         // SAFETY: a successful listing writes `count` identifiers into the arena, which stays
         // borrowed for as long as the slice does.
         Ok(unsafe { exported_slice(ids, count as usize) })
@@ -1287,16 +1486,17 @@ impl<'view> View<'view> {
 
 /// Begins a transaction, or resets the one the slot already holds.
 fn begin(database: ffi::ustore_database_t, handle: &mut ffi::ustore_transaction_t) -> Result<()> {
-    let mut error = ffi::ustore_error_t::default();
+    let mut outcome = ffi::ustore_outcome_t::default();
     let mut arguments = ffi::ustore_transaction_init_t {
-        db: database,
-        error: &mut error,
-        options: ffi::USTORE_OPTIONS_DEFAULT_K,
         transaction: handle,
+        database,
+        executor: ptr::null_mut(),
+        outcome: &mut outcome,
+        completion: ffi::ustore_completion_t::Blocking,
     };
     // SAFETY: every pointer in `arguments` outlives the call.
     unsafe { ffi::ustore_transaction_init(&mut arguments) };
-    check(error)
+    check(outcome)
 }
 
 /// An optimistic transaction grouping reads and writes across collections and modalities.
@@ -1314,9 +1514,11 @@ impl<'db> Transaction<'db> {
     pub fn view(&self, conflicts: Conflicts) -> View<'_> {
         View {
             database: self.database.handle(),
+            // SAFETY: the transaction is open, and its view tags the handle without allocating.
+            view: unsafe { ffi::ustore_transaction_view(self.handle, conflicts) },
             transaction: self.handle,
             snapshot: ptr::null_mut(),
-            options: conflicts.to_raw(),
+            watch: conflicts,
             marker: PhantomData,
         }
     }
@@ -1324,42 +1526,60 @@ impl<'db> Transaction<'db> {
     /// Stages the writes as the first phase of a two-phase commit, reporting the stamp the stage took.
     pub fn stage(&mut self) -> Result<Stamp> {
         let mut stamp: Stamp = 0;
-        let mut error = ffi::ustore_error_t::default();
+        let mut outcome = ffi::ustore_outcome_t::default();
         let mut arguments = ffi::ustore_transaction_stage_t {
-            db: self.database.handle(),
-            error: &mut error,
+            database: self.database.handle(),
+            executor: ptr::null_mut(),
+            outcome: &mut outcome,
+            completion: ffi::ustore_completion_t::Blocking,
             transaction: self.handle,
-            options: ffi::USTORE_OPTIONS_DEFAULT_K,
             stamp: &mut stamp,
         };
         // SAFETY: every pointer in `arguments` outlives the call.
         unsafe { ffi::ustore_transaction_stage(&mut arguments) };
-        check(error)?;
+        check(outcome)?;
         Ok(stamp)
     }
 
     /// Commits the writes, reporting the stamp they were published under.
     ///
-    /// A conflict is reported rather than retried, and the transaction keeps its contents either
-    /// way, so a caller may replay them after [`Transaction::rollback`].
+    /// A conflict is reported rather than retried, and the transaction keeps its contents either way, so a caller
+    /// may stage them again after [`Transaction::rollback`] or start over after [`Transaction::reset`].
     pub fn commit(&mut self, durability: Durability) -> Result<Stamp> {
         let mut stamp: Stamp = 0;
-        let mut error = ffi::ustore_error_t::default();
+        let mut outcome = ffi::ustore_outcome_t::default();
         let mut arguments = ffi::ustore_transaction_commit_t {
-            db: self.database.handle(),
-            error: &mut error,
+            database: self.database.handle(),
+            executor: ptr::null_mut(),
+            outcome: &mut outcome,
+            completion: ffi::ustore_completion_t::Blocking,
             transaction: self.handle,
-            options: durability.to_raw(),
             stamp: &mut stamp,
+            durability,
         };
         // SAFETY: every pointer in `arguments` outlives the call.
         unsafe { ffi::ustore_transaction_commit(&mut arguments) };
-        check(error)?;
+        check(outcome)?;
         Ok(stamp)
     }
 
-    /// Discards the writes and reopens the transaction on the newest state, ready for another try.
+    /// Withdraws a stage, releasing its stamp, while keeping the reads and writes to stage again.
     pub fn rollback(&mut self) -> Result<()> {
+        let mut outcome = ffi::ustore_outcome_t::default();
+        let mut arguments = ffi::ustore_transaction_rollback_t {
+            database: self.database.handle(),
+            executor: ptr::null_mut(),
+            outcome: &mut outcome,
+            completion: ffi::ustore_completion_t::Blocking,
+            transaction: self.handle,
+        };
+        // SAFETY: every pointer in `arguments` outlives the call.
+        unsafe { ffi::ustore_transaction_rollback(&mut arguments) };
+        check(outcome)
+    }
+
+    /// Discards the reads and writes and reopens the transaction on the newest state, ready for another try.
+    pub fn reset(&mut self) -> Result<()> {
         begin(self.database.handle(), &mut self.handle)
     }
 }
@@ -1371,6 +1591,10 @@ impl Drop for Transaction<'_> {
         unsafe { ffi::ustore_transaction_free(self.handle) };
     }
 }
+
+// SAFETY: a transaction may move to another thread with its database borrow; it stays `!Sync`, so no two
+// threads ever call through one at once, which is all the C interface asks of it.
+unsafe impl Send for Transaction<'_> {}
 
 // endregion: Transactions
 
@@ -1392,9 +1616,11 @@ impl<'db> Snapshot<'db> {
     pub fn view(&self) -> View<'_> {
         View {
             database: self.database.handle(),
+            // SAFETY: the snapshot is pinned, and its view tags the handle without allocating.
+            view: unsafe { ffi::ustore_snapshot_view(self.handle) },
             transaction: ptr::null_mut(),
             snapshot: self.handle,
-            options: ffi::USTORE_OPTIONS_DEFAULT_K,
+            watch: Conflicts::Unwatched,
             marker: PhantomData,
         }
     }
@@ -1402,16 +1628,20 @@ impl<'db> Snapshot<'db> {
     /// Writes this snapshot into an existing directory as a database of its own.
     pub fn export(&self, path: &str) -> Result<()> {
         let path = CString::new(path).map_err(|_| fail(Status::Malformed, "the path holds a null character"))?;
-        let mut error = ffi::ustore_error_t::default();
+        let mut outcome = ffi::ustore_outcome_t::default();
         let mut arguments = ffi::ustore_snapshot_export_t {
-            db: self.database.handle(),
-            error: &mut error,
+            database: self.database.handle(),
+            executor: ptr::null_mut(),
+            outcome: &mut outcome,
+            completion: ffi::ustore_completion_t::Blocking,
             snapshot: self.handle,
             path: path.as_ptr(),
+            progress: None,
+            progress_state: ptr::null_mut(),
         };
         // SAFETY: every pointer in `arguments` outlives the call, the path included.
         unsafe { ffi::ustore_snapshot_export(&mut arguments) };
-        check(error)
+        check(outcome)
     }
 }
 
@@ -1422,6 +1652,10 @@ impl Drop for Snapshot<'_> {
         unsafe { ffi::ustore_snapshot_free(self.handle) };
     }
 }
+
+// SAFETY: a snapshot may move to another thread with its database borrow; it stays `!Sync`, since the C
+// interface promises concurrent calls only through a database.
+unsafe impl Send for Snapshot<'_> {}
 
 // endregion: Snapshots
 
@@ -1456,7 +1690,7 @@ mod tests {
         let entries = [crate::blobs::Entry::new(key(7), b"alpha").unwrap()];
         database
             .head()
-            .write(&mut arena, CollectionID::main(), &entries, Durability::Flushed)
+            .write(CollectionID::main(), &entries, Durability::Flushed)
             .unwrap();
         drop(database);
 
@@ -1520,7 +1754,7 @@ mod tests {
             let entries = [crate::blobs::Entry::new(key(7), b"alpha").unwrap()];
             database
                 .head()
-                .write(&mut arena, CollectionID::main(), &entries, Durability::Flushed)
+                .write(CollectionID::main(), &entries, Durability::Flushed)
                 .unwrap();
             let values = database
                 .head()
@@ -1545,9 +1779,14 @@ mod tests {
         let mut arena = Arena::new();
 
         let people = database.create_collection("people", Modality::Any).unwrap();
-        let places = database.create_collection("places", Modality::Any).unwrap();
+        let places = database.create_collection("places", Modality::Graph).unwrap();
         assert_ne!(people, places);
-        assert_eq!(database.head().collection(&mut arena, "people").unwrap(), people);
+        assert_eq!(database.head().collection("people").unwrap(), (people, Modality::Any));
+        assert_eq!(
+            database.head().collection("places").unwrap(),
+            (places, Modality::Graph),
+            "a name resolves to the modality it was created with"
+        );
 
         let listed = database.head().collections(&mut arena).unwrap();
         assert_eq!(listed.len(), 2, "the main collection is never listed");
@@ -1559,13 +1798,13 @@ mod tests {
             Status::AlreadyExists
         );
         assert_eq!(
-            database.head().collection(&mut arena, "nowhere").unwrap_err().status,
+            database.head().collection("nowhere").unwrap_err().status,
             Status::NotFound
         );
 
-        database.drop_collection(&mut arena, "people").unwrap();
+        database.drop_collection("people").unwrap();
         assert_eq!(
-            database.head().collection(&mut arena, "people").unwrap_err().status,
+            database.head().collection("people").unwrap_err().status,
             Status::NotFound
         );
         assert_eq!(database.head().collections(&mut arena).unwrap().len(), 1);
@@ -1578,7 +1817,7 @@ mod tests {
         let entries = [crate::blobs::Entry::new(key(1), b"alpha").unwrap()];
         database
             .head()
-            .write(&mut arena, CollectionID::main(), &entries, Durability::Buffered)
+            .write(CollectionID::main(), &entries, Durability::Buffered)
             .unwrap();
 
         let failure = database
@@ -1604,7 +1843,7 @@ mod tests {
         let entries = [crate::blobs::Entry::new(key(1), b"alpha").unwrap()];
         transaction
             .view(Conflicts::Watched)
-            .write(&mut arena, CollectionID::main(), &entries, Durability::Buffered)
+            .write(CollectionID::main(), &entries, Durability::Buffered)
             .unwrap();
 
         // Nothing is visible at the head until the commit lands.
@@ -1626,22 +1865,49 @@ mod tests {
     }
 
     #[test]
-    fn transactions_roll_back_and_run_again() {
+    fn transactions_reset_and_run_again() {
         let database = Database::open_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new();
         let mut transaction = database.transaction().unwrap();
         let abandoned = [crate::blobs::Entry::new(key(2), b"abandoned").unwrap()];
+        let other = [crate::blobs::Entry::new(key(3), b"abandoned").unwrap()];
         transaction
             .view(Conflicts::Watched)
-            .write(&mut arena, CollectionID::main(), &abandoned, Durability::Buffered)
+            .write(CollectionID::main(), &abandoned, Durability::Buffered)
             .unwrap();
-        transaction.rollback().unwrap();
+        transaction
+            .view(Conflicts::Watched)
+            .write(CollectionID::main(), &other, Durability::Buffered)
+            .unwrap();
+        transaction.reset().unwrap();
 
         let kept = [crate::blobs::Entry::new(key(2), b"kept").unwrap()];
         transaction
             .view(Conflicts::Watched)
-            .write(&mut arena, CollectionID::main(), &kept, Durability::Buffered)
+            .write(CollectionID::main(), &kept, Durability::Buffered)
             .unwrap();
+        transaction.commit(Durability::Buffered).unwrap();
+
+        let values = database
+            .head()
+            .read(&mut arena, CollectionID::main(), &keys([2, 3]))
+            .unwrap();
+        assert_eq!(values.get(0), Some(b"kept".as_slice()));
+        assert_eq!(values.get(1), None, "a reset forgets every write before it");
+    }
+
+    #[test]
+    fn transactions_roll_back_a_stage_and_keep_their_writes() {
+        let database = Database::open_ram(&RAMOptions::default()).unwrap();
+        let mut arena = Arena::new();
+        let mut transaction = database.transaction().unwrap();
+        let kept = [crate::blobs::Entry::new(key(2), b"kept").unwrap()];
+        transaction
+            .view(Conflicts::Watched)
+            .write(CollectionID::main(), &kept, Durability::Buffered)
+            .unwrap();
+        transaction.stage().unwrap();
+        transaction.rollback().unwrap();
         transaction.commit(Durability::Buffered).unwrap();
 
         let values = database
@@ -1654,12 +1920,11 @@ mod tests {
     #[test]
     fn transactions_refuse_a_flush_of_their_own() {
         let database = Database::open_ram(&RAMOptions::default()).unwrap();
-        let mut arena = Arena::new();
         let transaction = database.transaction().unwrap();
         let entries = [crate::blobs::Entry::new(key(3), b"alpha").unwrap()];
         let failure = transaction
             .view(Conflicts::Watched)
-            .write(&mut arena, CollectionID::main(), &entries, Durability::Flushed)
+            .write(CollectionID::main(), &entries, Durability::Flushed)
             .unwrap_err();
         assert_eq!(failure.status, Status::InvalidArgument);
     }
@@ -1667,7 +1932,6 @@ mod tests {
     #[test]
     fn transactions_conflict_rather_than_block() {
         let database = Database::open_ram(&RAMOptions::default()).unwrap();
-        let mut arena = Arena::new();
         let mut first = database.transaction().unwrap();
         let mut second = database.transaction().unwrap();
 
@@ -1675,11 +1939,11 @@ mod tests {
         let yours = [crate::blobs::Entry::new(key(4), b"yours").unwrap()];
         first
             .view(Conflicts::Watched)
-            .write(&mut arena, CollectionID::main(), &mine, Durability::Buffered)
+            .write(CollectionID::main(), &mine, Durability::Buffered)
             .unwrap();
         second
             .view(Conflicts::Watched)
-            .write(&mut arena, CollectionID::main(), &yours, Durability::Buffered)
+            .write(CollectionID::main(), &yours, Durability::Buffered)
             .unwrap();
         first.commit(Durability::Buffered).unwrap();
 
@@ -1705,7 +1969,7 @@ mod tests {
         let seed = [crate::blobs::Entry::new(key(8), b"seed").unwrap()];
         database
             .head()
-            .write(&mut arena, CollectionID::main(), &seed, Durability::Buffered)
+            .write(CollectionID::main(), &seed, Durability::Buffered)
             .unwrap();
 
         // A watched read is part of the serial order, so a writer that lands under it conflicts.
@@ -1718,7 +1982,7 @@ mod tests {
         let overwritten = [crate::blobs::Entry::new(key(8), b"overwritten").unwrap()];
         database
             .head()
-            .write(&mut arena, CollectionID::main(), &overwritten, Durability::Buffered)
+            .write(CollectionID::main(), &overwritten, Durability::Buffered)
             .unwrap();
         let failure = watched.commit(Durability::Buffered).unwrap_err();
         assert!(
@@ -1736,7 +2000,7 @@ mod tests {
         let again = [crate::blobs::Entry::new(key(8), b"again").unwrap()];
         database
             .head()
-            .write(&mut arena, CollectionID::main(), &again, Durability::Buffered)
+            .write(CollectionID::main(), &again, Durability::Buffered)
             .unwrap();
         unwatched.commit(Durability::Buffered).unwrap();
     }
@@ -1748,14 +2012,14 @@ mod tests {
         let before = [crate::blobs::Entry::new(key(5), b"before").unwrap()];
         database
             .head()
-            .write(&mut arena, CollectionID::main(), &before, Durability::Buffered)
+            .write(CollectionID::main(), &before, Durability::Buffered)
             .unwrap();
 
         let snapshot = database.snapshot().unwrap();
         let after = [crate::blobs::Entry::new(key(5), b"after").unwrap()];
         database
             .head()
-            .write(&mut arena, CollectionID::main(), &after, Durability::Buffered)
+            .write(CollectionID::main(), &after, Durability::Buffered)
             .unwrap();
 
         let pinned = snapshot
@@ -1768,6 +2032,16 @@ mod tests {
             .read(&mut arena, CollectionID::main(), &keys([5]))
             .unwrap();
         assert_eq!(latest.get(0), Some(b"after".as_slice()));
+
+        let failure = snapshot
+            .view()
+            .write(CollectionID::main(), &after, Durability::Buffered)
+            .unwrap_err();
+        assert_eq!(
+            failure.status,
+            Status::InvalidArgument,
+            "nothing writes through a snapshot"
+        );
     }
 
     #[test]
@@ -1777,7 +2051,7 @@ mod tests {
         let entries = [crate::blobs::Entry::new(key(6), b"exported").unwrap()];
         database
             .head()
-            .write(&mut arena, CollectionID::main(), &entries, Durability::Buffered)
+            .write(CollectionID::main(), &entries, Durability::Buffered)
             .unwrap();
 
         let directory = temporary_directory("snapshot_exports");
@@ -1798,21 +2072,29 @@ mod tests {
 
     #[test]
     fn statuses_map_and_tolerate_newer_libraries() {
-        let written = ffi::ustore_error_t {
-            status: 7,
+        let written = ffi::ustore_outcome_t {
+            status: ffi::ustore_status_t(7),
             message: c"No such collection".as_ptr(),
         };
         let failure = check(written).unwrap_err();
         assert_eq!(failure.status, Status::NotFound);
         assert_eq!(failure.message, "No such collection");
         assert_eq!(failure.to_string(), "No such collection");
+        assert_eq!(failure.status.name(), "not-found");
 
-        let newer = ffi::ustore_error_t {
-            status: 4242,
+        let contended = ffi::ustore_outcome_t {
+            status: ffi::ustore_status_t(16),
+            message: c"The arena serves another call".as_ptr(),
+        };
+        assert_eq!(check(contended).unwrap_err().status, Status::Contended);
+        assert_eq!(Status::Cancelled.name(), "cancelled");
+
+        let newer = ffi::ustore_outcome_t {
+            status: ffi::ustore_status_t(4242),
             message: ptr::null(),
         };
         assert_eq!(check(newer).unwrap_err().status, Status::Unrecognized);
-        assert!(check(ffi::ustore_error_t::default()).is_ok());
+        assert!(check(ffi::ustore_outcome_t::default()).is_ok());
     }
 
     #[test]

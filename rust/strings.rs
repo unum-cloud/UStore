@@ -5,11 +5,13 @@
 //! identifier reaches them.
 
 use std::ffi::c_char;
+use std::iter::Copied;
 use std::ptr;
+use std::slice;
 
 use crate::db::ffi::{
-    self, ustore_char_t, ustore_collection_id_t, ustore_database_t, ustore_error_t, ustore_length_t, ustore_octet_t,
-    ustore_size_t,
+    self, ustore_char_t, ustore_completion_t, ustore_database_t, ustore_enum_t, ustore_length_t, ustore_octet_t,
+    ustore_outcome_t, ustore_size_t,
 };
 use crate::db::{check, described_length, exported_slice, fail, Arena, CollectionID, Modality, Result, Status, View};
 
@@ -41,8 +43,17 @@ impl<'arena> Names<'arena> {
     }
 
     /// Every name the listing kept, in the order of its text.
-    pub fn iter(&self) -> impl Iterator<Item = &'arena str> + '_ {
+    pub fn iter(&self) -> Copied<slice::Iter<'_, &'arena str>> {
         self.names.iter().copied()
+    }
+}
+
+impl<'names, 'arena> IntoIterator for &'names Names<'arena> {
+    type Item = &'arena str;
+    type IntoIter = Copied<slice::Iter<'names, &'arena str>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 
@@ -54,70 +65,71 @@ impl<'arena> Names<'arena> {
 pub(crate) fn create_named(database: ustore_database_t, name: &str, modality: Modality) -> Result<CollectionID> {
     let text_length = described_length(name.len(), "the name is longer than the ABI can describe")?;
     let mut collection = CollectionID::default();
-    let mut error = ustore_error_t::default();
+    let mut outcome = ustore_outcome_t::default();
     let mut arguments = ffi::ustore_collection_create_t {
-        db: database,
-        error: &mut error,
+        database,
+        executor: ptr::null_mut(),
+        outcome: &mut outcome,
+        completion: ustore_completion_t::Blocking,
         name: name.as_ptr().cast::<c_char>(),
         name_length: text_length,
-        modality: match modality {
-            Modality::Any => ffi::USTORE_MODALITY_ANY_K,
-            Modality::Blobs => ffi::USTORE_MODALITY_BLOBS_K,
-            Modality::Docs => ffi::USTORE_MODALITY_DOCS_K,
-            Modality::Graph => ffi::USTORE_MODALITY_GRAPH_K,
-            Modality::Strings => ffi::USTORE_MODALITY_STRINGS_K,
-            Modality::Pages => ffi::USTORE_MODALITY_PAGES_K,
-        },
+        modality: modality.to_raw(),
         collection: &mut collection,
     };
     // SAFETY: the name outlives the call, whose length spares it a null terminator, and so does the output.
     unsafe { ffi::ustore_collection_create(&mut arguments) };
-    check(error)?;
+    check(outcome)?;
     Ok(collection)
 }
 
 impl View<'_> {
-    /// The collection `name` addresses, which [`crate::Database::create_collection`] bound.
+    /// The collection `name` addresses and the modality it holds, which [`crate::Database::create_collection`]
+    /// bound.
     ///
-    /// Names resolve at the view's snapshot or at the head, never inside a transaction, so a lookup
-    /// never joins the conflicts of the work that follows it.
-    pub fn collection(&self, arena: &mut Arena, name: &str) -> Result<CollectionID> {
+    /// Collections are created and dropped only at the head, so names are read at the view's snapshot, or at the
+    /// head for a transaction or the head itself, and never join a transaction's conflicts.
+    pub fn collection(&self, name: &str) -> Result<(CollectionID, Modality)> {
         let text = name.as_ptr().cast::<c_char>();
         let text_length = described_length(name.len(), "the name is longer than the ABI can describe")?;
-        let mut presences: *mut ustore_octet_t = ptr::null_mut();
-        let mut ids: *mut ustore_collection_id_t = ptr::null_mut();
-        let mut error = ustore_error_t::default();
+        let mut presence: ustore_octet_t = 0;
+        let mut collection = CollectionID::main();
+        let mut modality: ustore_enum_t = ffi::USTORE_MODALITY_ANY_K;
+        let mut outcome = ustore_outcome_t::default();
         let mut arguments = ffi::ustore_collection_find_t {
-            db: self.database(),
-            error: &mut error,
+            database: self.database(),
+            executor: ptr::null_mut(),
+            outcome: &mut outcome,
+            completion: ustore_completion_t::Blocking,
             snapshot: self.snapshot(),
-            arena: arena.slot(),
-            options: ffi::USTORE_OPTIONS_DEFAULT_K,
-            tasks_count: 1,
+            count: 1,
             names: &text,
             names_stride: 0,
             names_lengths: &text_length,
             names_lengths_stride: 0,
-            presences: &mut presences,
-            collections: &mut ids,
-            modalities: ptr::null_mut(),
+            presences: &mut presence,
+            collections: &mut collection,
+            collections_stride: size_of::<CollectionID>() as ustore_size_t,
+            modalities: &mut modality,
+            modalities_stride: size_of::<ustore_enum_t>() as ustore_size_t,
         };
         // SAFETY: the name outlives the call, whose length spares it a null terminator, and every
-        // output pointer outlives it too.
+        // output outlives it too.
         unsafe { ffi::ustore_collection_find(&mut arguments) };
-        check(error)?;
-        // SAFETY: a successful lookup exports one presence bit and one identifier into the arena.
-        match unsafe { *presences & 1 } {
-            0 => Err(fail(Status::NotFound, "no collection answers to that name")),
-            _ => Ok(unsafe { *ids }),
+        check(outcome)?;
+        if presence & 1 == 0 {
+            return Err(fail(Status::NotFound, "no collection answers to that name"));
+        }
+        match Modality::from_raw(modality) {
+            Some(modality) => Ok((collection, modality)),
+            None => Err(fail(Status::Malformed, "the engine reported an unknown modality")),
         }
     }
 
     /// Lists up to `limit` collection names under `prefix`, in the order of their text, from `start`
     /// on where one is given.
     ///
-    /// An engine lists its collections in an order of its own, so the names are sorted here, and the
-    /// listing reads them at the view's snapshot or at the head, as a lookup does.
+    /// An engine lists its collections in an order of its own, so the names are sorted here. A listing
+    /// describes the database rather than a transaction, so it reads the view's snapshot or the head.
     pub fn collection_names<'arena>(
         &self,
         arena: &'arena mut Arena,
@@ -128,23 +140,23 @@ impl View<'_> {
         let mut count: ustore_size_t = 0;
         let mut offsets: *mut ustore_length_t = ptr::null_mut();
         let mut tape: *mut ustore_char_t = ptr::null_mut();
-        let mut error = ustore_error_t::default();
+        let mut outcome = ustore_outcome_t::default();
         let mut arguments = ffi::ustore_collection_list_t {
-            db: self.database(),
-            error: &mut error,
-            transaction: ptr::null_mut(),
+            database: self.database(),
+            executor: ptr::null_mut(),
+            outcome: &mut outcome,
+            completion: ustore_completion_t::Blocking,
             snapshot: self.snapshot(),
-            arena: arena.slot(),
-            options: ffi::USTORE_OPTIONS_DEFAULT_K,
             count: &mut count,
             collections: ptr::null_mut(),
             modalities: ptr::null_mut(),
             names_offsets: &mut offsets,
             names: &mut tape,
+            arena: arena.slot(),
         };
         // SAFETY: every output outlives the call.
         unsafe { ffi::ustore_collection_list(&mut arguments) };
-        check(error)?;
+        check(outcome)?;
 
         // A successful listing exports one more offset than collections into one tape, all of it alive
         // for as long as the arena stays borrowed, where a collection without a name has an empty one.
@@ -222,7 +234,7 @@ mod tests {
     #[test]
     fn a_dropped_name_leaves_the_catalog() {
         let (database, mut arena) = cataloged();
-        database.drop_collection(&mut arena, "places").unwrap();
+        database.drop_collection("places").unwrap();
         let names = database.head().collection_names(&mut arena, "", None, 10).unwrap();
         assert_eq!(names.iter().collect::<Vec<&str>>(), vec!["people", "planets"]);
     }
@@ -230,26 +242,24 @@ mod tests {
     #[test]
     fn the_catalog_follows_the_view_it_is_read_through() {
         let database = Database::open_ram(&RAMOptions::default()).unwrap();
-        let mut arena = Arena::new();
         let snapshot = database.snapshot().unwrap();
         let people = database.create_collection("people", Modality::Any).unwrap();
 
         // The snapshot predates the binding, so only the head resolves the name.
-        assert_eq!(database.head().collection(&mut arena, "people").unwrap(), people);
+        assert_eq!(database.head().collection("people").unwrap(), (people, Modality::Any));
         assert_eq!(
-            snapshot.view().collection(&mut arena, "people").unwrap_err().status,
+            snapshot.view().collection("people").unwrap_err().status,
             Status::NotFound
         );
 
-        // A transaction resolves names at the head, so a name created after it began is found.
+        // A transaction resolves names at the head, so it reaches a collection created after it began, and a name
+        // it found missing never fails its commit.
         let mut transaction = database.transaction().unwrap();
+        assert!(transaction.view(Conflicts::Watched).collection("planets").is_err());
         let planets = database.create_collection("planets", Modality::Any).unwrap();
         assert_eq!(
-            transaction
-                .view(Conflicts::Watched)
-                .collection(&mut arena, "planets")
-                .unwrap(),
-            planets
+            transaction.view(Conflicts::Watched).collection("planets").unwrap(),
+            (planets, Modality::Any)
         );
         transaction.commit(Durability::Buffered).unwrap();
     }
@@ -257,13 +267,12 @@ mod tests {
     #[test]
     fn a_taken_name_is_refused_and_a_dropped_one_is_free() {
         let database = Database::open_ram(&RAMOptions::default()).unwrap();
-        let mut arena = Arena::new();
         let first = database.create_collection("people", Modality::Any).unwrap();
         let taken = database.create_collection("people", Modality::Any).unwrap_err();
         assert_eq!(taken.status, Status::AlreadyExists);
-        database.drop_collection(&mut arena, "people").unwrap();
+        database.drop_collection("people").unwrap();
         assert_eq!(
-            database.head().collection(&mut arena, "people").unwrap_err().status,
+            database.head().collection("people").unwrap_err().status,
             Status::NotFound
         );
         let second = database.create_collection("people", Modality::Any).unwrap();

@@ -14,9 +14,9 @@
 //! let ada = Key::from(1u64);
 //!
 //! let documents = [DocumentEntry::<Json>::new(ada, r#"{"name":"Ada","born":1815}"#)?];
-//! database.head().write_documents(&mut arena, people, &documents, Modification::Upsert, Durability::Buffered)?;
+//! database.head().write_documents(people, &documents, Modification::Upsert, Durability::Buffered)?;
 //! let died = [FieldEntry::<i64>::new(ada, c"died", &1852)?];
-//! database.head().write_fields(&mut arena, people, &died, Modification::Upsert, Durability::Buffered)?;
+//! database.head().write_fields(people, &died, Modification::Upsert, Durability::Buffered)?;
 //!
 //! let names = database.head().read_fields::<Text>(&mut arena, people, &[FieldAddress::new(ada, c"name")])?;
 //! assert_eq!(names.get(0), Some(b"Ada".as_slice()));
@@ -79,12 +79,14 @@ use std::ptr;
 
 use crate::blobs::Values;
 use crate::db::ffi::{
-    ustore_arena_t, ustore_byte_t, ustore_bytes_cptr_t, ustore_char_t, ustore_collection_id_t, ustore_database_t,
-    ustore_enum_t, ustore_error_t, ustore_key_t, ustore_length_t, ustore_octet_t, ustore_size_t, ustore_snapshot_t,
-    ustore_str_view_t, ustore_transaction_t,
+    ustore_arena_t, ustore_byte_t, ustore_bytes_cptr_t, ustore_char_t, ustore_collection_id_t, ustore_completion_t,
+    ustore_database_t, ustore_durability_t, ustore_enum_t, ustore_executor_t, ustore_key_t, ustore_length_t,
+    ustore_octet_t, ustore_outcome_t, ustore_size_t, ustore_str_view_t, ustore_transaction_t, ustore_view_t,
+    ustore_watch_t,
 };
 use crate::db::{
-    check, described_length, exported_slice, fail, Arena, Collections, Durability, Key, Result, Status, View, UUID,
+    check, described_length, exported_slice, fail, grown, Arena, Collections, Durability, Key, Result, Rows, Status,
+    View, UUID,
 };
 
 // region: Raw Declarations
@@ -97,61 +99,60 @@ mod ffi {
 
     #[repr(C)]
     pub struct ustore_docs_write_t {
-        pub db: ustore_database_t,
-        pub error: *mut ustore_error_t,
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
         pub transaction: ustore_transaction_t,
-        pub arena: *mut ustore_arena_t,
-        pub options: ustore_enum_t,
-        pub tasks_count: ustore_size_t,
-        pub type_: ustore_enum_t,
-        pub modification: ustore_enum_t,
+        pub count: ustore_size_t,
         pub collections: *const ustore_collection_id_t,
         pub collections_stride: ustore_size_t,
         pub keys: *const ustore_key_t,
         pub keys_stride: ustore_size_t,
         pub fields: *const ustore_str_view_t,
         pub fields_stride: ustore_size_t,
-        pub presences: *const ustore_octet_t,
-        pub offsets: *const ustore_length_t,
-        pub offsets_stride: ustore_size_t,
+        pub starts: *const ustore_length_t,
+        pub starts_stride: ustore_size_t,
         pub lengths: *const ustore_length_t,
         pub lengths_stride: ustore_size_t,
         pub values: *const ustore_bytes_cptr_t,
         pub values_stride: ustore_size_t,
         pub id_field: ustore_str_view_t,
+        pub type_: ustore_enum_t,
+        pub modification: ustore_enum_t,
+        pub durability: ustore_durability_t,
+        pub watch: ustore_watch_t,
     }
 
     #[repr(C)]
     pub struct ustore_docs_read_t {
-        pub db: ustore_database_t,
-        pub error: *mut ustore_error_t,
-        pub transaction: ustore_transaction_t,
-        pub snapshot: ustore_snapshot_t,
-        pub arena: *mut ustore_arena_t,
-        pub options: ustore_enum_t,
-        pub type_: ustore_enum_t,
-        pub tasks_count: ustore_size_t,
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
+        pub view: ustore_view_t,
+        pub count: ustore_size_t,
         pub collections: *const ustore_collection_id_t,
         pub collections_stride: ustore_size_t,
         pub keys: *const ustore_key_t,
         pub keys_stride: ustore_size_t,
         pub fields: *const ustore_str_view_t,
         pub fields_stride: ustore_size_t,
-        pub presences: *mut *mut ustore_octet_t,
-        pub offsets: *mut *mut ustore_length_t,
-        pub lengths: *mut *mut ustore_length_t,
+        pub presences: *mut ustore_octet_t,
+        pub offsets: *mut ustore_length_t,
         pub values: *mut *mut ustore_byte_t,
+        pub arena: *mut ustore_arena_t,
+        pub type_: ustore_enum_t,
     }
 
     #[repr(C)]
     pub struct ustore_docs_gist_t {
-        pub db: ustore_database_t,
-        pub error: *mut ustore_error_t,
-        pub transaction: ustore_transaction_t,
-        pub snapshot: ustore_snapshot_t,
-        pub arena: *mut ustore_arena_t,
-        pub options: ustore_enum_t,
-        pub docs_count: ustore_size_t,
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
+        pub view: ustore_view_t,
+        pub count: ustore_size_t,
         pub collections: *const ustore_collection_id_t,
         pub collections_stride: ustore_size_t,
         pub keys: *const ustore_key_t,
@@ -159,17 +160,17 @@ mod ffi {
         pub fields_count: *mut ustore_size_t,
         pub offsets: *mut *mut ustore_length_t,
         pub fields: *mut *mut ustore_char_t,
+        pub arena: *mut ustore_arena_t,
     }
 
     #[repr(C)]
     pub struct ustore_docs_gather_t {
-        pub db: ustore_database_t,
-        pub error: *mut ustore_error_t,
-        pub transaction: ustore_transaction_t,
-        pub snapshot: ustore_snapshot_t,
-        pub arena: *mut ustore_arena_t,
-        pub options: ustore_enum_t,
-        pub docs_count: ustore_size_t,
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
+        pub view: ustore_view_t,
+        pub count: ustore_size_t,
         pub fields_count: ustore_size_t,
         pub collections: *const ustore_collection_id_t,
         pub collections_stride: ustore_size_t,
@@ -179,13 +180,14 @@ mod ffi {
         pub fields_stride: ustore_size_t,
         pub types: *const ustore_enum_t,
         pub types_stride: ustore_size_t,
-        pub columns_validities: *mut *mut *mut ustore_octet_t,
-        pub columns_conversions: *mut *mut *mut ustore_octet_t,
-        pub columns_collisions: *mut *mut *mut ustore_octet_t,
-        pub columns_scalars: *mut *mut *mut ustore_byte_t,
-        pub columns_offsets: *mut *mut *mut ustore_length_t,
-        pub columns_lengths: *mut *mut *mut ustore_length_t,
+        pub columns_validities: *const *mut ustore_octet_t,
+        pub columns_conversions: *const *mut ustore_octet_t,
+        pub columns_collisions: *const *mut ustore_octet_t,
+        pub columns_scalars: *const *mut ustore_byte_t,
+        pub columns_offsets: *const *mut ustore_length_t,
+        pub columns_lengths: *const *mut ustore_length_t,
         pub joined_strings: *mut *mut ustore_byte_t,
+        pub arena: *mut ustore_arena_t,
     }
 
     extern "C" {
@@ -401,8 +403,7 @@ pub struct DocumentEntry<'value, Format: FieldFormat> {
 }
 
 impl<'value, Format: FieldFormat> DocumentEntry<'value, Format> {
-    /// Pairs a key with the document to store under it, refusing one past the 32-bit length the ABI
-    /// carries.
+    /// Pairs a key with the document to store under it, refusing one longer than the ABI can describe.
     pub fn new(key: Key, value: &'value Format::Value) -> Result<Self> {
         let bytes = Format::bytes(value);
         Ok(DocumentEntry {
@@ -411,16 +412,6 @@ impl<'value, Format: FieldFormat> DocumentEntry<'value, Format> {
             length: described_length(bytes.len(), "the document is longer than the ABI can describe")?,
             marker: PhantomData,
         })
-    }
-
-    /// Names a key whose document a batch removes, which it mixes freely with the entries that carry one.
-    pub fn removal(key: Key) -> Self {
-        DocumentEntry {
-            key,
-            value: ptr::null(),
-            length: 0,
-            marker: PhantomData,
-        }
     }
 
     /// The key this entry stores under.
@@ -439,7 +430,7 @@ pub struct Document<'text> {
 }
 
 impl<'text> Document<'text> {
-    /// Borrows the JSON text of a document, refusing one past the 32-bit length the ABI carries.
+    /// Borrows the JSON text of a document, refusing one longer than the ABI can describe.
     pub fn new(text: &'text str) -> Result<Self> {
         Ok(Document {
             text: text.as_ptr(),
@@ -461,7 +452,7 @@ pub struct FieldEntry<'value, Format: FieldFormat> {
 }
 
 impl<'value, Format: FieldFormat> FieldEntry<'value, Format> {
-    /// Pairs a field with the value to write into it, refusing one past the 32-bit length the ABI carries.
+    /// Pairs a field with the value to write into it, refusing one longer than the ABI can describe.
     pub fn new(key: Key, field: &'value CStr, value: &'value Format::Value) -> Result<Self> {
         let bytes = Format::bytes(value);
         Ok(FieldEntry {
@@ -471,17 +462,6 @@ impl<'value, Format: FieldFormat> FieldEntry<'value, Format> {
             length: described_length(bytes.len(), "the value is longer than the ABI can describe")?,
             marker: PhantomData,
         })
-    }
-
-    /// Names a field to remove from its document, whatever modification the batch applies.
-    pub fn removal(key: Key, field: &'value CStr) -> Self {
-        FieldEntry {
-            key,
-            field: field.as_ptr(),
-            value: ptr::null(),
-            length: 0,
-            marker: PhantomData,
-        }
     }
 }
 
@@ -512,6 +492,8 @@ impl<'field> FieldAddress<'field> {
 pub struct Column<'field> {
     field: *const c_char,
     format: c_int,
+    /// Bytes of one scalar cell, or zero for a column of strings.
+    width: u32,
     marker: PhantomData<&'field CStr>,
 }
 
@@ -521,7 +503,21 @@ impl<'field> Column<'field> {
         Column {
             field: field.as_ptr(),
             format: Format::TYPE,
+            width: size_of::<Format>() as u32,
             marker: PhantomData,
+        }
+    }
+
+    /// Whether the column gathers strings rather than scalars.
+    fn holds_strings(&self) -> bool {
+        self.format == Text::TYPE || self.format == Binary::TYPE
+    }
+
+    /// Words the cells of `rows` rows take: one more offset than strings and a length each, or the scalars end to end.
+    fn cells_words(&self, rows: usize) -> usize {
+        match self.holds_strings() {
+            true => 2 * rows + 1,
+            false => (rows * self.width as usize).div_ceil(size_of::<u64>()),
         }
     }
 }
@@ -572,7 +568,7 @@ impl<'arena> Paths<'arena> {
     }
 }
 
-/// One bit per gathered row, least significant bit first.
+/// One bit per row of a batch, least significant bit first.
 #[derive(Clone, Copy, Debug)]
 pub struct Bitmap<'arena> {
     bytes: &'arena [u8],
@@ -580,6 +576,11 @@ pub struct Bitmap<'arena> {
 }
 
 impl<'arena> Bitmap<'arena> {
+    /// The bitmap of `count` rows in `bytes`, which hold at least one bit per row.
+    pub(crate) fn new(bytes: &'arena [u8], count: usize) -> Self {
+        Bitmap { bytes, count }
+    }
+
     /// How many rows the bitmap covers.
     pub fn len(&self) -> usize {
         self.count
@@ -637,9 +638,26 @@ impl<'arena> Strings<'arena> {
     }
 
     /// Every row in order.
-    pub fn iter(&self) -> impl Iterator<Item = Option<&'arena [u8]>> + 'arena {
-        let strings = *self;
-        (0..strings.len()).map(move |row| strings.get(row))
+    pub fn iter(&self) -> Rows<Strings<'arena>, Option<&'arena [u8]>> {
+        Rows::new(*self, self.len(), Strings::get)
+    }
+}
+
+impl<'arena> IntoIterator for Strings<'arena> {
+    type Item = Option<&'arena [u8]>;
+    type IntoIter = Rows<Strings<'arena>, Option<&'arena [u8]>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<'arena> IntoIterator for &Strings<'arena> {
+    type Item = Option<&'arena [u8]>;
+    type IntoIter = Rows<Strings<'arena>, Option<&'arena [u8]>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 
@@ -765,149 +783,151 @@ impl<'arena> Table<'arena> {
 // region: Verbs
 
 impl View<'_> {
-    /// Writes whole documents under the keys their entries carry, removing the keys whose entries
-    /// carry none.
+    /// Writes whole documents under the keys their entries carry, where [`View::remove`] removes documents.
     ///
     /// The batch writes one format, which is [`Json`] for the text the engine parses and a
     /// [`WritableScalar`] or [`Text`] for a document that is one scalar. A transaction flushes at its
     /// commit, so [`Durability::Flushed`] is refused inside one.
     pub fn write_documents<'collections, Format: FieldFormat>(
         &self,
-        arena: &mut Arena,
         collections: impl Into<Collections<'collections>>,
         documents: &[DocumentEntry<'_, Format>],
         modification: Modification,
         durability: Durability,
     ) -> Result<()> {
+        let transaction = self.transaction()?;
         let Some(first) = documents.first() else {
             return Ok(());
         };
         let collections = collections.into();
         let (collections, collections_stride) = collections.strided(documents.len())?;
         let stride = size_of::<DocumentEntry<'_, Format>>() as ustore_size_t;
-        let mut error = ustore_error_t::default();
+        let mut outcome = ustore_outcome_t::default();
         let mut arguments = ffi::ustore_docs_write_t {
-            db: self.database(),
-            error: &mut error,
-            transaction: self.transaction(),
-            arena: arena.slot(),
-            options: self.options() | durability.to_raw(),
-            tasks_count: documents.len() as ustore_size_t,
-            type_: Format::TYPE,
-            modification: modification as ustore_enum_t,
+            database: self.database(),
+            executor: ptr::null_mut(),
+            outcome: &mut outcome,
+            completion: ustore_completion_t::Blocking,
+            transaction,
+            count: documents.len() as ustore_size_t,
             collections,
             collections_stride,
             keys: &first.key,
             keys_stride: stride,
             fields: ptr::null(),
             fields_stride: 0,
-            presences: ptr::null(),
-            offsets: ptr::null(),
-            offsets_stride: 0,
+            starts: ptr::null(),
+            starts_stride: 0,
             lengths: &first.length,
             lengths_stride: stride,
             values: &first.value,
             values_stride: stride,
             id_field: ptr::null(),
+            type_: Format::TYPE,
+            modification: modification as ustore_enum_t,
+            durability,
+            watch: self.watch(),
         };
         // SAFETY: the documents and the collections outlive the call, and the members of every entry sit
         // `stride` bytes apart, which is what `#[repr(C)]` on `DocumentEntry` promises.
         unsafe { ffi::ustore_docs_write(&mut arguments) };
-        check(error)
+        check(outcome)
     }
 
     /// Writes whole JSON documents under the key each one holds in `id_field`: a non-negative integer, spelled as
     /// [`Key::from`] spells it, or a UUID in canonical text.
     pub fn write_documents_by_id<'collections>(
         &self,
-        arena: &mut Arena,
         collections: impl Into<Collections<'collections>>,
         id_field: &CStr,
         documents: &[Document<'_>],
         modification: Modification,
         durability: Durability,
     ) -> Result<()> {
+        let transaction = self.transaction()?;
         let Some(first) = documents.first() else {
             return Ok(());
         };
         let collections = collections.into();
         let (collections, collections_stride) = collections.strided(documents.len())?;
         let stride = size_of::<Document<'_>>() as ustore_size_t;
-        let mut error = ustore_error_t::default();
+        let mut outcome = ustore_outcome_t::default();
         let mut arguments = ffi::ustore_docs_write_t {
-            db: self.database(),
-            error: &mut error,
-            transaction: self.transaction(),
-            arena: arena.slot(),
-            options: self.options() | durability.to_raw(),
-            tasks_count: documents.len() as ustore_size_t,
-            type_: Json::TYPE,
-            modification: modification as ustore_enum_t,
+            database: self.database(),
+            executor: ptr::null_mut(),
+            outcome: &mut outcome,
+            completion: ustore_completion_t::Blocking,
+            transaction,
+            count: documents.len() as ustore_size_t,
             collections,
             collections_stride,
             keys: ptr::null(),
             keys_stride: 0,
             fields: ptr::null(),
             fields_stride: 0,
-            presences: ptr::null(),
-            offsets: ptr::null(),
-            offsets_stride: 0,
+            starts: ptr::null(),
+            starts_stride: 0,
             lengths: &first.length,
             lengths_stride: stride,
             values: &first.text,
             values_stride: stride,
             id_field: id_field.as_ptr(),
+            type_: Json::TYPE,
+            modification: modification as ustore_enum_t,
+            durability,
+            watch: self.watch(),
         };
         // SAFETY: the documents and the id field outlive the call, and the fields of every document sit
         // `stride` bytes apart, which is what `#[repr(C)]` on `Document` promises.
         unsafe { ffi::ustore_docs_write(&mut arguments) };
-        check(error)
+        check(outcome)
     }
 
-    /// Writes values into fields of existing documents, or removes the fields whose entries carry none.
+    /// Writes values into fields of existing documents, where a merge with a JSON `null` removes a field.
     pub fn write_fields<'collections, Format: FieldFormat>(
         &self,
-        arena: &mut Arena,
         collections: impl Into<Collections<'collections>>,
         fields: &[FieldEntry<'_, Format>],
         modification: Modification,
         durability: Durability,
     ) -> Result<()> {
+        let transaction = self.transaction()?;
         let Some(first) = fields.first() else {
             return Ok(());
         };
         let collections = collections.into();
         let (collections, collections_stride) = collections.strided(fields.len())?;
         let stride = size_of::<FieldEntry<'_, Format>>() as ustore_size_t;
-        let mut error = ustore_error_t::default();
+        let mut outcome = ustore_outcome_t::default();
         let mut arguments = ffi::ustore_docs_write_t {
-            db: self.database(),
-            error: &mut error,
-            transaction: self.transaction(),
-            arena: arena.slot(),
-            options: self.options() | durability.to_raw(),
-            tasks_count: fields.len() as ustore_size_t,
-            type_: Format::TYPE,
-            modification: modification as ustore_enum_t,
+            database: self.database(),
+            executor: ptr::null_mut(),
+            outcome: &mut outcome,
+            completion: ustore_completion_t::Blocking,
+            transaction,
+            count: fields.len() as ustore_size_t,
             collections,
             collections_stride,
             keys: &first.key,
             keys_stride: stride,
             fields: &first.field,
             fields_stride: stride,
-            presences: ptr::null(),
-            offsets: ptr::null(),
-            offsets_stride: 0,
+            starts: ptr::null(),
+            starts_stride: 0,
             lengths: &first.length,
             lengths_stride: stride,
             values: &first.value,
             values_stride: stride,
             id_field: ptr::null(),
+            type_: Format::TYPE,
+            modification: modification as ustore_enum_t,
+            durability,
+            watch: self.watch(),
         };
-        // SAFETY: the entries, their fields and their values outlive the call, the members of every entry
-        // sit `stride` bytes apart as `#[repr(C)]` promises, and a null value is how the ABI spells a removal.
+        // SAFETY: the entries, their fields and their values outlive the call, and the members of every entry
+        // sit `stride` bytes apart as `#[repr(C)]` promises.
         unsafe { ffi::ustore_docs_write(&mut arguments) };
-        check(error)
+        check(outcome)
     }
 
     /// Reads whole documents as the JSON text they were written in.
@@ -935,7 +955,7 @@ impl View<'_> {
         fields: &[FieldAddress<'_>],
     ) -> Result<Values<'arena>> {
         let Some(first) = fields.first() else {
-            return Ok(Values::exported(ptr::null(), ptr::null(), ptr::null(), 0));
+            return Ok(Values::empty());
         };
         let stride = size_of::<FieldAddress<'_>>() as ustore_size_t;
         let tasks = StridedTasks {
@@ -960,15 +980,14 @@ impl View<'_> {
         let mut count: ustore_size_t = 0;
         let mut offsets: *mut ustore_length_t = ptr::null_mut();
         let mut tape: *mut ustore_char_t = ptr::null_mut();
-        let mut error = ustore_error_t::default();
+        let mut outcome = ustore_outcome_t::default();
         let mut arguments = ffi::ustore_docs_gist_t {
-            db: self.database(),
-            error: &mut error,
-            transaction: self.transaction(),
-            snapshot: self.snapshot(),
-            arena: arena.slot(),
-            options: self.options(),
-            docs_count: keys.len() as ustore_size_t,
+            database: self.database(),
+            executor: ptr::null_mut(),
+            outcome: &mut outcome,
+            completion: ustore_completion_t::Blocking,
+            view: self.view(),
+            count: keys.len() as ustore_size_t,
             collections,
             collections_stride,
             keys: keys.as_ptr(),
@@ -976,10 +995,11 @@ impl View<'_> {
             fields_count: &mut count,
             offsets: &mut offsets,
             fields: &mut tape,
+            arena: arena.slot(),
         };
         // SAFETY: the keys, the collections and every output outlive the call.
         unsafe { ffi::ustore_docs_gist(&mut arguments) };
-        check(error)?;
+        check(outcome)?;
         Ok(Paths {
             offsets,
             tape,
@@ -998,61 +1018,105 @@ impl View<'_> {
     ) -> Result<Table<'arena>> {
         let collections = collections.into();
         let (collections, collections_stride) = collections.strided(keys.len())?;
-        let mut validities: *mut *mut ustore_octet_t = ptr::null_mut();
-        let mut conversions: *mut *mut ustore_octet_t = ptr::null_mut();
-        let mut collisions: *mut *mut ustore_octet_t = ptr::null_mut();
-        let mut scalars: *mut *mut ustore_byte_t = ptr::null_mut();
-        let mut offsets: *mut *mut ustore_length_t = ptr::null_mut();
-        let mut lengths: *mut *mut ustore_length_t = ptr::null_mut();
-        let mut joined: *mut ustore_byte_t = ptr::null_mut();
-        let stride = size_of::<Column<'_>>() as ustore_size_t;
-        let (fields, types) = match columns.first() {
-            Some(first) => (
-                &first.field as *const ustore_str_view_t,
-                &first.format as *const ustore_enum_t,
-            ),
-            None => (ptr::null(), ptr::null()),
+        let rows = keys.len();
+        let empty = Table {
+            columns,
+            rows,
+            validities: ptr::null(),
+            conversions: ptr::null(),
+            collisions: ptr::null(),
+            scalars: ptr::null(),
+            offsets: ptr::null(),
+            lengths: ptr::null(),
+            joined: ptr::null(),
         };
-        let mut error = ustore_error_t::default();
+        if rows == 0 || columns.is_empty() {
+            return Ok(empty);
+        }
+
+        // The six arrays of column addresses lead the words, and every column follows them, aligned for any scalar.
+        let fields = columns.len();
+        let bitmap_words = rows.div_ceil(64);
+        let addresses_words = (6 * fields * size_of::<*mut u8>()).div_ceil(size_of::<u64>());
+        let columns_words: usize = columns
+            .iter()
+            .map(|column| 3 * bitmap_words + column.cells_words(rows))
+            .sum();
+        let Arena {
+            handle, columns: words, ..
+        } = arena;
+        let words = grown(words, addresses_words + columns_words)?;
+        let base = words.as_mut_ptr();
+        let addresses = base.cast::<*mut u8>();
+        let mut taken = addresses_words;
+        let mut take = |count: usize| {
+            let address = base.wrapping_add(taken).cast::<u8>();
+            taken += count;
+            address
+        };
+        for (index, column) in columns.iter().enumerate() {
+            let strings = column.holds_strings();
+            let column_addresses = [
+                take(bitmap_words),
+                take(bitmap_words),
+                take(bitmap_words),
+                if strings {
+                    ptr::null_mut()
+                } else {
+                    take(column.cells_words(rows))
+                },
+                if strings { take(rows + 1) } else { ptr::null_mut() },
+                if strings { take(rows) } else { ptr::null_mut() },
+            ];
+            for (array, address) in column_addresses.into_iter().enumerate() {
+                // SAFETY: the words open with six arrays of one address per column.
+                unsafe { addresses.add(array * fields + index).write(address) };
+            }
+        }
+
+        let stride = size_of::<Column<'_>>() as ustore_size_t;
+        let mut joined: *mut ustore_byte_t = ptr::null_mut();
+        let mut outcome = ustore_outcome_t::default();
+        // SAFETY: each of the six arrays of addresses lies `fields` entries past the one before it.
+        let array = |index: usize| unsafe { addresses.add(index * fields) };
         let mut arguments = ffi::ustore_docs_gather_t {
-            db: self.database(),
-            error: &mut error,
-            transaction: self.transaction(),
-            snapshot: self.snapshot(),
-            arena: arena.slot(),
-            options: self.options(),
-            docs_count: keys.len() as ustore_size_t,
-            fields_count: columns.len() as ustore_size_t,
+            database: self.database(),
+            executor: ptr::null_mut(),
+            outcome: &mut outcome,
+            completion: ustore_completion_t::Blocking,
+            view: self.view(),
+            count: rows as ustore_size_t,
+            fields_count: fields as ustore_size_t,
             collections,
             collections_stride,
             keys: keys.as_ptr(),
             keys_stride: size_of::<Key>() as ustore_size_t,
-            fields,
+            fields: &columns[0].field,
             fields_stride: stride,
-            types,
+            types: &columns[0].format,
             types_stride: stride,
-            columns_validities: &mut validities,
-            columns_conversions: &mut conversions,
-            columns_collisions: &mut collisions,
-            columns_scalars: &mut scalars,
-            columns_offsets: &mut offsets,
-            columns_lengths: &mut lengths,
+            columns_validities: array(0),
+            columns_conversions: array(1),
+            columns_collisions: array(2),
+            columns_scalars: array(3),
+            columns_offsets: array(4).cast::<*mut ustore_length_t>(),
+            columns_lengths: array(5).cast::<*mut ustore_length_t>(),
             joined_strings: &mut joined,
+            arena: handle,
         };
         // SAFETY: the keys, the collections, the columns with their fields, and every output outlive the
         // call, and the members of every column sit `stride` bytes apart as `#[repr(C)]` promises.
         unsafe { ffi::ustore_docs_gather(&mut arguments) };
-        check(error)?;
+        check(outcome)?;
         Ok(Table {
-            columns,
-            rows: if validities.is_null() { 0 } else { keys.len() },
-            validities: validities.cast(),
-            conversions: conversions.cast(),
-            collisions: collisions.cast(),
-            scalars: scalars.cast(),
-            offsets: offsets.cast(),
-            lengths: lengths.cast(),
+            validities: array(0) as *const *const ustore_octet_t,
+            conversions: array(1) as *const *const ustore_octet_t,
+            collisions: array(2) as *const *const ustore_octet_t,
+            scalars: array(3) as *const *const ustore_byte_t,
+            offsets: array(4) as *const *const ustore_length_t,
+            lengths: array(5) as *const *const ustore_length_t,
             joined,
+            ..empty
         })
     }
 
@@ -1065,34 +1129,44 @@ impl View<'_> {
         format: c_int,
     ) -> Result<Values<'arena>> {
         let (collections, collections_stride) = collections.strided(tasks.count)?;
-        let mut offsets: *mut ustore_length_t = ptr::null_mut();
-        let mut lengths: *mut ustore_length_t = ptr::null_mut();
+        if tasks.count == 0 {
+            return Ok(Values::empty());
+        }
+        let Arena {
+            handle,
+            presences,
+            offsets,
+            ..
+        } = arena;
+        let presences = grown(presences, tasks.count.div_ceil(8))?;
+        let offsets = grown(offsets, tasks.count + 1)?;
         let mut tape: *mut ustore_byte_t = ptr::null_mut();
-        let mut error = ustore_error_t::default();
+        let mut outcome = ustore_outcome_t::default();
         let mut arguments = ffi::ustore_docs_read_t {
-            db: self.database(),
-            error: &mut error,
-            transaction: self.transaction(),
-            snapshot: self.snapshot(),
-            arena: arena.slot(),
-            options: self.options(),
-            type_: format,
-            tasks_count: tasks.count as ustore_size_t,
+            database: self.database(),
+            executor: ptr::null_mut(),
+            outcome: &mut outcome,
+            completion: ustore_completion_t::Blocking,
+            view: self.view(),
+            count: tasks.count as ustore_size_t,
             collections,
             collections_stride,
             keys: tasks.keys,
             keys_stride: tasks.keys_stride,
             fields: tasks.fields,
             fields_stride: tasks.fields_stride,
-            presences: ptr::null_mut(),
-            offsets: &mut offsets,
-            lengths: &mut lengths,
+            presences: presences.as_mut_ptr(),
+            offsets: offsets.as_mut_ptr(),
             values: &mut tape,
+            arena: handle,
+            type_: format,
         };
         // SAFETY: whatever the tasks address and every output outlive the call.
         unsafe { ffi::ustore_docs_read(&mut arguments) };
-        check(error)?;
-        Ok(Values::exported(offsets, lengths, tape, tasks.count))
+        check(outcome)?;
+        // SAFETY: a successful read fills a presence bit and an offset per task, closes the tape with one more
+        // offset, and lands the tape behind the handle, all of it borrowed for `'arena`.
+        Ok(unsafe { Values::exported(presences, offsets, tape) })
     }
 }
 
@@ -1119,7 +1193,6 @@ mod tests {
     /// A database holding Ada under key one and Grace under key two.
     fn populated() -> (Database, Arena) {
         let database = Database::open_ram(&RAMOptions::default()).unwrap();
-        let mut arena = Arena::new();
         let documents = [
             DocumentEntry::<Json>::new(key(1), r#"{"name":"Ada","born":1815,"languages":["English","French"]}"#)
                 .unwrap(),
@@ -1132,14 +1205,13 @@ mod tests {
         database
             .head()
             .write_documents(
-                &mut arena,
                 CollectionID::main(),
                 &documents,
                 Modification::Upsert,
                 Durability::Buffered,
             )
             .unwrap();
-        (database, arena)
+        (database, Arena::new())
     }
 
     /// The text of the field at `index`, or `None` when it is absent.
@@ -1166,12 +1238,10 @@ mod tests {
     #[test]
     fn documents_refuse_text_that_is_not_json() {
         let database = Database::open_ram(&RAMOptions::default()).unwrap();
-        let mut arena = Arena::new();
         let documents = [DocumentEntry::<Json>::new(key(1), "{\"name\":").unwrap()];
         let failure = database
             .head()
             .write_documents(
-                &mut arena,
                 CollectionID::main(),
                 &documents,
                 Modification::Upsert,
@@ -1187,50 +1257,26 @@ mod tests {
         let again = [DocumentEntry::<Json>::new(key(1), r#"{"name":"Someone else"}"#).unwrap()];
         let failure = database
             .head()
-            .write_documents(
-                &mut arena,
-                CollectionID::main(),
-                &again,
-                Modification::Insert,
-                Durability::Buffered,
-            )
+            .write_documents(CollectionID::main(), &again, Modification::Insert, Durability::Buffered)
             .unwrap_err();
         assert_eq!(failure.status, Status::AlreadyExists);
 
         let fresh = [DocumentEntry::<Json>::new(key(3), r#"{"name":"Katherine"}"#).unwrap()];
         database
             .head()
-            .write_documents(
-                &mut arena,
-                CollectionID::main(),
-                &fresh,
-                Modification::Insert,
-                Durability::Buffered,
-            )
+            .write_documents(CollectionID::main(), &fresh, Modification::Insert, Durability::Buffered)
             .unwrap();
 
         let merge = [DocumentEntry::<Json>::new(key(3), r#"{"born":1918}"#).unwrap()];
         database
             .head()
-            .write_documents(
-                &mut arena,
-                CollectionID::main(),
-                &merge,
-                Modification::Merge,
-                Durability::Buffered,
-            )
+            .write_documents(CollectionID::main(), &merge, Modification::Merge, Durability::Buffered)
             .unwrap();
         let patch =
             [DocumentEntry::<Json>::new(key(3), r#"[{"op":"add","path":"/surname","value":"Johnson"}]"#).unwrap()];
         database
             .head()
-            .write_documents(
-                &mut arena,
-                CollectionID::main(),
-                &patch,
-                Modification::Patch,
-                Durability::Buffered,
-            )
+            .write_documents(CollectionID::main(), &patch, Modification::Patch, Durability::Buffered)
             .unwrap();
 
         let fields = [
@@ -1249,17 +1295,11 @@ mod tests {
 
     #[test]
     fn a_patch_that_does_not_apply_is_refused() {
-        let (database, mut arena) = populated();
+        let (database, _) = populated();
         let patch = [DocumentEntry::<Json>::new(key(1), r#"[{"op":"remove","path":"/nowhere"}]"#).unwrap()];
         let failure = database
             .head()
-            .write_documents(
-                &mut arena,
-                CollectionID::main(),
-                &patch,
-                Modification::Patch,
-                Durability::Buffered,
-            )
+            .write_documents(CollectionID::main(), &patch, Modification::Patch, Durability::Buffered)
             .unwrap_err();
         assert_eq!(failure.status, Status::InvalidArgument, "{failure:?}");
 
@@ -1268,13 +1308,7 @@ mod tests {
             let modifier = [DocumentEntry::<Json>::new(key(42), r#"[]"#).unwrap()];
             let failure = database
                 .head()
-                .write_documents(
-                    &mut arena,
-                    CollectionID::main(),
-                    &modifier,
-                    modification,
-                    Durability::Buffered,
-                )
+                .write_documents(CollectionID::main(), &modifier, modification, Durability::Buffered)
                 .unwrap_err();
             assert_eq!(failure.status, Status::NotFound, "{modification:?}");
         }
@@ -1291,7 +1325,6 @@ mod tests {
         database
             .head()
             .write_documents_by_id(
-                &mut arena,
                 CollectionID::main(),
                 c"_id",
                 &documents,
@@ -1314,7 +1347,6 @@ mod tests {
         let failure = database
             .head()
             .write_documents_by_id(
-                &mut arena,
                 CollectionID::main(),
                 c"_id",
                 &unkeyed,
@@ -1335,7 +1367,6 @@ mod tests {
 
         let died = 1852i64;
         head.write_fields(
-            &mut arena,
             main,
             &[FieldEntry::<i64>::new(key(1), c"died", &died).unwrap()],
             upsert,
@@ -1344,7 +1375,6 @@ mod tests {
         .unwrap();
         let height = 1.65f64;
         head.write_fields(
-            &mut arena,
             main,
             &[FieldEntry::<f64>::new(key(1), c"height", &height).unwrap()],
             upsert,
@@ -1353,7 +1383,6 @@ mod tests {
         .unwrap();
         let countess = true;
         head.write_fields(
-            &mut arena,
             main,
             &[FieldEntry::<bool>::new(key(1), c"countess", &countess).unwrap()],
             upsert,
@@ -1361,12 +1390,12 @@ mod tests {
         )
         .unwrap();
         let title = [FieldEntry::<Text>::new(key(1), c"title", "Countess of Lovelace").unwrap()];
-        head.write_fields(&mut arena, main, &title, upsert, buffered).unwrap();
+        head.write_fields(main, &title, upsert, buffered).unwrap();
         let nested = [
             FieldEntry::<Json>::new(key(1), c"/family", r#"{"father":"Byron"}"#).unwrap(),
             FieldEntry::<Json>::new(key(2), c"/navy/rank", r#""Commodore""#).unwrap(),
         ];
-        head.write_fields(&mut arena, main, &nested, upsert, buffered).unwrap();
+        head.write_fields(main, &nested, upsert, buffered).unwrap();
 
         let fields = [
             FieldAddress::new(key(1), c"died"),
@@ -1401,16 +1430,15 @@ mod tests {
     }
 
     #[test]
-    fn fields_are_removed_by_entries_without_values() {
+    fn fields_are_removed_by_merging_a_null() {
         let (database, mut arena) = populated();
-        let removal = [FieldEntry::<Json>::removal(key(1), c"born")];
+        let removal = [DocumentEntry::<Json>::new(key(1), r#"{"born":null}"#).unwrap()];
         database
             .head()
-            .write_fields(
-                &mut arena,
+            .write_documents(
                 CollectionID::main(),
                 &removal,
-                Modification::Upsert,
+                Modification::Merge,
                 Durability::Buffered,
             )
             .unwrap();
@@ -1419,29 +1447,15 @@ mod tests {
             .read_fields::<Text>(&mut arena, CollectionID::main(), &[FieldAddress::new(key(1), c"born")])
             .unwrap();
         assert_eq!(born.get(0), None);
-
-        // A field already gone does not resolve a second time.
-        let failure = database
-            .head()
-            .write_fields(
-                &mut arena,
-                CollectionID::main(),
-                &removal,
-                Modification::Upsert,
-                Durability::Buffered,
-            )
-            .unwrap_err();
-        assert_eq!(failure.status, Status::NotFound);
     }
 
     #[test]
     fn fields_refuse_a_document_or_a_path_that_is_not_there() {
-        let (database, mut arena) = populated();
+        let (database, _) = populated();
         let orphan = [FieldEntry::<Text>::new(key(42), c"name", "Nobody").unwrap()];
         let failure = database
             .head()
             .write_fields(
-                &mut arena,
                 CollectionID::main(),
                 &orphan,
                 Modification::Upsert,
@@ -1453,13 +1467,7 @@ mod tests {
         let deep = [FieldEntry::<Text>::new(key(1), c"/missing/deeper", "value").unwrap()];
         let failure = database
             .head()
-            .write_fields(
-                &mut arena,
-                CollectionID::main(),
-                &deep,
-                Modification::Update,
-                Durability::Buffered,
-            )
+            .write_fields(CollectionID::main(), &deep, Modification::Update, Durability::Buffered)
             .unwrap_err();
         assert_eq!(failure.status, Status::NotFound);
     }
@@ -1488,7 +1496,7 @@ mod tests {
         let blob = [Entry::new(key(1), b"not a document").unwrap()];
         database
             .head()
-            .write(&mut arena, CollectionID::main(), &blob, Durability::Buffered)
+            .write(CollectionID::main(), &blob, Durability::Buffered)
             .unwrap();
         let failure = database
             .head()
@@ -1523,7 +1531,6 @@ mod tests {
         database
             .head()
             .write_documents(
-                &mut arena,
                 CollectionID::main(),
                 &documents,
                 Modification::Upsert,
@@ -1633,7 +1640,6 @@ mod tests {
 
         let born = 1815i64;
         head.write_documents(
-            &mut arena,
             main,
             &[DocumentEntry::<i64>::new(key(1), &born).unwrap()],
             upsert,
@@ -1642,7 +1648,6 @@ mod tests {
         .unwrap();
         let height = 1.65f64;
         head.write_documents(
-            &mut arena,
             main,
             &[DocumentEntry::<f64>::new(key(2), &height).unwrap()],
             upsert,
@@ -1651,7 +1656,6 @@ mod tests {
         .unwrap();
         let countess = true;
         head.write_documents(
-            &mut arena,
             main,
             &[DocumentEntry::<bool>::new(key(3), &countess).unwrap()],
             upsert,
@@ -1659,7 +1663,6 @@ mod tests {
         )
         .unwrap();
         head.write_documents(
-            &mut arena,
             main,
             &[DocumentEntry::<Text>::new(key(4), "Countess of Lovelace").unwrap()],
             upsert,
@@ -1673,31 +1676,6 @@ mod tests {
         assert_eq!(text(&documents, 1), Some("1.65"));
         assert_eq!(text(&documents, 2), Some("true"));
         assert_eq!(text(&documents, 3), Some(r#""Countess of Lovelace""#));
-    }
-
-    #[test]
-    fn one_batch_of_documents_mixes_writes_and_removals() {
-        let (database, mut arena) = populated();
-        let batch = [
-            DocumentEntry::<Json>::new(key(1), r#"{"name":"Someone else"}"#).unwrap(),
-            DocumentEntry::<Json>::removal(key(2)),
-        ];
-        database
-            .head()
-            .write_documents(
-                &mut arena,
-                CollectionID::main(),
-                &batch,
-                Modification::Upsert,
-                Durability::Buffered,
-            )
-            .unwrap();
-        let documents = database
-            .head()
-            .read_documents(&mut arena, CollectionID::main(), &keys([1, 2]))
-            .unwrap();
-        assert_eq!(text(&documents, 0), Some(r#"{"name":"Someone else"}"#));
-        assert_eq!(documents.get(1), None, "an entry without a document removes its key");
     }
 
     #[test]
@@ -1715,7 +1693,6 @@ mod tests {
         database
             .head()
             .write_documents(
-                &mut arena,
                 spanned.as_slice(),
                 &documents,
                 Modification::Upsert,
@@ -1760,7 +1737,6 @@ mod tests {
         database
             .head()
             .write_documents(
-                &mut arena,
                 CollectionID::main(),
                 &documents,
                 Modification::Upsert,
@@ -1809,16 +1785,9 @@ mod tests {
     fn empty_batches_reach_no_engine() {
         let (database, mut arena) = populated();
         let head = database.head();
-        head.write_documents::<Json>(
-            &mut arena,
-            CollectionID::main(),
-            &[],
-            Modification::Upsert,
-            Durability::Buffered,
-        )
-        .unwrap();
+        head.write_documents::<Json>(CollectionID::main(), &[], Modification::Upsert, Durability::Buffered)
+            .unwrap();
         head.write_documents_by_id(
-            &mut arena,
             CollectionID::main(),
             c"_id",
             &[],
@@ -1826,14 +1795,8 @@ mod tests {
             Durability::Buffered,
         )
         .unwrap();
-        head.write_fields::<Json>(
-            &mut arena,
-            CollectionID::main(),
-            &[],
-            Modification::Upsert,
-            Durability::Buffered,
-        )
-        .unwrap();
+        head.write_fields::<Json>(CollectionID::main(), &[], Modification::Upsert, Durability::Buffered)
+            .unwrap();
         assert!(head
             .read_documents(&mut arena, CollectionID::main(), &[])
             .unwrap()
@@ -1865,23 +1828,11 @@ mod tests {
         let rank = [FieldEntry::<Text>::new(key(2), c"/navy/rank", "Commodore").unwrap()];
         transaction
             .view(Conflicts::Watched)
-            .write_fields(
-                &mut arena,
-                CollectionID::main(),
-                &rank,
-                Modification::Update,
-                Durability::Buffered,
-            )
+            .write_fields(CollectionID::main(), &rank, Modification::Update, Durability::Buffered)
             .unwrap();
         let flushed = transaction
             .view(Conflicts::Watched)
-            .write_fields(
-                &mut arena,
-                CollectionID::main(),
-                &rank,
-                Modification::Update,
-                Durability::Flushed,
-            )
+            .write_fields(CollectionID::main(), &rank, Modification::Update, Durability::Flushed)
             .unwrap_err();
         assert_eq!(flushed.status, Status::InvalidArgument);
 

@@ -14,7 +14,7 @@
 //!
 //! let [ada, grace, kent] = [1u64, 2, 3].map(Key::from);
 //! let edges = [Edge::new(ada, grace), Edge::new(ada, kent), Edge::new(grace, kent)];
-//! database.head().upsert_edges(&mut arena, follows, &edges, Durability::Buffered)?;
+//! database.head().upsert_edges(follows, &edges, Durability::Buffered)?;
 //!
 //! let found = database.head().find_edges(&mut arena, follows, &[ada, kent], Roles::Every(Role::Any))?;
 //! assert_eq!(found.degrees(), &[2, 2]);
@@ -22,28 +22,32 @@
 //! # Ok::<(), ustore::Error>(())
 //! ```
 //!
-//! The edges a lookup found live in the arena, so a write through that arena does not compile while
+//! The edges a lookup found live in the arena, so another lookup through that arena does not compile while
 //! they are still read:
 //!
 //! ```compile_fail
-//! use ustore::{Arena, CollectionID, RAMOptions, Database, Durability, Edge, Key, Role, Roles};
+//! use ustore::{Arena, CollectionID, RAMOptions, Database, Durability, Key, Role, Roles};
 //!
 //! let database = Database::open_ram(&RAMOptions::default())?;
 //! let mut arena = Arena::new();
 //! let vertices = [Key::from(1u64)];
 //! let found = database.head().find_edges(&mut arena, CollectionID::main(), &vertices, Roles::Every(Role::Any))?;
-//! database.head().remove_edges(&mut arena, CollectionID::main(), found.edges(), Durability::Buffered)?;
+//! let degrees = database.head().degrees(&mut arena, CollectionID::main(), &vertices, Roles::Every(Role::Any))?;
+//! database.head().remove_edges(CollectionID::main(), found.edges(), Durability::Buffered)?;
 //! # Ok::<(), ustore::Error>(())
 //! ```
 
+use std::iter::FusedIterator;
 use std::mem::offset_of;
 use std::ptr;
+use std::slice;
 
 use crate::db::ffi::{
-    ustore_arena_t, ustore_collection_id_t, ustore_database_t, ustore_enum_t, ustore_error_t, ustore_key_t,
-    ustore_size_t, ustore_snapshot_t, ustore_transaction_t,
+    ustore_arena_t, ustore_collection_id_t, ustore_completion_t, ustore_database_t, ustore_durability_t, ustore_enum_t,
+    ustore_executor_t, ustore_key_t, ustore_outcome_t, ustore_size_t, ustore_transaction_t, ustore_view_t,
+    ustore_watch_t,
 };
-use crate::db::{check, exported_slice, fail, Arena, Collections, Durability, Key, Result, Status, View};
+use crate::db::{check, exported_slice, fail, grown, Arena, Collections, Durability, Key, Result, Status, View};
 
 // region: Raw Declarations
 
@@ -57,39 +61,42 @@ mod ffi {
 
     #[repr(C)]
     pub struct ustore_graph_find_edges_t {
-        pub db: ustore_database_t,
-        pub error: *mut ustore_error_t,
-        pub transaction: ustore_transaction_t,
-        pub snapshot: ustore_snapshot_t,
-        pub arena: *mut ustore_arena_t,
-        pub options: ustore_enum_t,
-        pub tasks_count: ustore_size_t,
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
+        pub view: ustore_view_t,
+        pub count: ustore_size_t,
         pub collections: *const ustore_collection_id_t,
         pub collections_stride: ustore_size_t,
         pub vertices: *const ustore_key_t,
         pub vertices_stride: ustore_size_t,
         pub roles: *const ustore_enum_t,
         pub roles_stride: ustore_size_t,
-        pub degrees_per_vertex: *mut *mut ustore_vertex_degree_t,
+        pub degrees_per_vertex: *mut ustore_vertex_degree_t,
+        pub degrees_per_vertex_stride: ustore_size_t,
         pub edges_per_vertex: *mut *mut ustore_key_t,
+        pub arena: *mut ustore_arena_t,
     }
 
     #[repr(C)]
     pub struct ustore_graph_upsert_edges_t {
-        pub db: ustore_database_t,
-        pub error: *mut ustore_error_t,
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
         pub transaction: ustore_transaction_t,
-        pub arena: *mut ustore_arena_t,
-        pub options: ustore_enum_t,
-        pub tasks_count: ustore_size_t,
+        pub count: ustore_size_t,
         pub collections: *const ustore_collection_id_t,
         pub collections_stride: ustore_size_t,
-        pub edges_ids: *const ustore_key_t,
+        pub edges: *const ustore_key_t,
         pub edges_stride: ustore_size_t,
-        pub sources_ids: *const ustore_key_t,
+        pub sources: *const ustore_key_t,
         pub sources_stride: ustore_size_t,
-        pub targets_ids: *const ustore_key_t,
+        pub targets: *const ustore_key_t,
         pub targets_stride: ustore_size_t,
+        pub durability: ustore_durability_t,
+        pub watch: ustore_watch_t,
     }
 
     /// The header declares the same members under a second name.
@@ -97,32 +104,36 @@ mod ffi {
 
     #[repr(C)]
     pub struct ustore_graph_upsert_vertices_t {
-        pub db: ustore_database_t,
-        pub error: *mut ustore_error_t,
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
         pub transaction: ustore_transaction_t,
-        pub arena: *mut ustore_arena_t,
-        pub options: ustore_enum_t,
-        pub tasks_count: ustore_size_t,
+        pub count: ustore_size_t,
         pub collections: *const ustore_collection_id_t,
         pub collections_stride: ustore_size_t,
         pub vertices: *const ustore_key_t,
         pub vertices_stride: ustore_size_t,
+        pub durability: ustore_durability_t,
+        pub watch: ustore_watch_t,
     }
 
     #[repr(C)]
     pub struct ustore_graph_remove_vertices_t {
-        pub db: ustore_database_t,
-        pub error: *mut ustore_error_t,
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
         pub transaction: ustore_transaction_t,
-        pub arena: *mut ustore_arena_t,
-        pub options: ustore_enum_t,
-        pub tasks_count: ustore_size_t,
+        pub count: ustore_size_t,
         pub collections: *const ustore_collection_id_t,
         pub collections_stride: ustore_size_t,
         pub vertices: *const ustore_key_t,
         pub vertices_stride: ustore_size_t,
         pub roles: *const ustore_enum_t,
         pub roles_stride: ustore_size_t,
+        pub durability: ustore_durability_t,
+        pub watch: ustore_watch_t,
     }
 
     extern "C" {
@@ -254,19 +265,62 @@ impl<'arena> Neighborhoods<'arena> {
     }
 
     /// The edges of every vertex in order, or `None` for a vertex the graph does not hold.
-    pub fn iter(&self) -> impl Iterator<Item = Option<&'arena [Edge]>> + 'arena {
-        let edges = self.edges;
-        let missing = degree_missing();
-        self.degrees.iter().scan(0usize, move |offset, &degree| {
-            if degree == missing {
-                return Some(None);
-            }
-            let begin = *offset;
-            *offset += degree as usize;
-            Some(edges.get(begin..*offset))
-        })
+    pub fn iter(&self) -> EdgeRuns<'arena> {
+        EdgeRuns {
+            degrees: self.degrees.iter(),
+            edges: self.edges,
+        }
     }
 }
+
+impl<'arena> IntoIterator for Neighborhoods<'arena> {
+    type Item = Option<&'arena [Edge]>;
+    type IntoIter = EdgeRuns<'arena>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<'arena> IntoIterator for &Neighborhoods<'arena> {
+    type Item = Option<&'arena [Edge]>;
+    type IntoIter = EdgeRuns<'arena>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// The edges of every vertex of one lookup in order, or `None` for a vertex the graph does not hold.
+#[derive(Clone, Debug)]
+pub struct EdgeRuns<'arena> {
+    degrees: slice::Iter<'arena, Degree>,
+    edges: &'arena [Edge],
+}
+
+impl<'arena> Iterator for EdgeRuns<'arena> {
+    type Item = Option<&'arena [Edge]>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let degree = *self.degrees.next()?;
+        if degree == degree_missing() {
+            return Some(None);
+        }
+        let Some((run, rest)) = self.edges.split_at_checked(degree as usize) else {
+            return Some(None);
+        };
+        self.edges = rest;
+        Some(Some(run))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.degrees.size_hint()
+    }
+}
+
+impl ExactSizeIterator for EdgeRuns<'_> {}
+
+impl FusedIterator for EdgeRuns<'_> {}
 
 // endregion: Outputs
 
@@ -278,98 +332,100 @@ impl View<'_> {
     /// A transaction flushes at its commit, so [`Durability::Flushed`] is refused inside one.
     pub fn upsert_edges<'collections>(
         &self,
-        arena: &mut Arena,
         collections: impl Into<Collections<'collections>>,
         edges: &[Edge],
         durability: Durability,
     ) -> Result<()> {
         let collections = collections.into();
-        let mut arguments = self.edges_arguments(arena, collections, edges, durability)?;
-        let mut error = ustore_error_t::default();
-        arguments.error = &mut error;
+        let mut arguments = self.edges_arguments(&collections, edges, durability)?;
+        let mut outcome = ustore_outcome_t::default();
+        arguments.outcome = &mut outcome;
         // SAFETY: the edges and the collections outlive the call, and the keys of every edge sit one
         // `Edge` apart, which is what `#[repr(C)]` on `Edge` promises.
         unsafe { ffi::ustore_graph_upsert_edges(&mut arguments) };
-        check(error)
+        check(outcome)
     }
 
     /// Removes edges by source, target and identifier, whether or not the graph holds them.
     pub fn remove_edges<'collections>(
         &self,
-        arena: &mut Arena,
         collections: impl Into<Collections<'collections>>,
         edges: &[Edge],
         durability: Durability,
     ) -> Result<()> {
         let collections = collections.into();
-        let mut arguments = self.edges_arguments(arena, collections, edges, durability)?;
-        let mut error = ustore_error_t::default();
-        arguments.error = &mut error;
+        let mut arguments = self.edges_arguments(&collections, edges, durability)?;
+        let mut outcome = ustore_outcome_t::default();
+        arguments.outcome = &mut outcome;
         // SAFETY: the edges and the collections outlive the call, and the keys of every edge sit one
         // `Edge` apart, which is what `#[repr(C)]` on `Edge` promises.
         unsafe { ffi::ustore_graph_remove_edges(&mut arguments) };
-        check(error)
+        check(outcome)
     }
 
     /// Inserts vertices without edges, keeping every vertex the graph already holds as it is.
     pub fn upsert_vertices<'collections>(
         &self,
-        arena: &mut Arena,
         collections: impl Into<Collections<'collections>>,
         vertices: &[Key],
         durability: Durability,
     ) -> Result<()> {
+        let transaction = self.transaction()?;
         let collections = collections.into();
         let (collections, collections_stride) = collections.strided(vertices.len())?;
-        let mut error = ustore_error_t::default();
+        let mut outcome = ustore_outcome_t::default();
         let mut arguments = ffi::ustore_graph_upsert_vertices_t {
-            db: self.database(),
-            error: &mut error,
-            transaction: self.transaction(),
-            arena: arena.slot(),
-            options: self.options() | durability.to_raw(),
-            tasks_count: vertices.len() as ustore_size_t,
+            database: self.database(),
+            executor: ptr::null_mut(),
+            outcome: &mut outcome,
+            completion: ustore_completion_t::Blocking,
+            transaction,
+            count: vertices.len() as ustore_size_t,
             collections,
             collections_stride,
             vertices: vertices.as_ptr(),
             vertices_stride: size_of::<Key>() as ustore_size_t,
+            durability,
+            watch: self.watch(),
         };
         // SAFETY: the vertices and the collections outlive the call.
         unsafe { ffi::ustore_graph_upsert_vertices(&mut arguments) };
-        check(error)
+        check(outcome)
     }
 
     /// Removes vertices together with every edge they play `roles` in, which only a joining graph needs.
     pub fn remove_vertices<'collections>(
         &self,
-        arena: &mut Arena,
         collections: impl Into<Collections<'collections>>,
         vertices: &[Key],
         roles: Roles<'_>,
         durability: Durability,
     ) -> Result<()> {
+        let transaction = self.transaction()?;
         let collections = collections.into();
         let (collections, collections_stride) = collections.strided(vertices.len())?;
         let (roles, roles_stride) = roles.strided(vertices.len())?;
-        let mut error = ustore_error_t::default();
+        let mut outcome = ustore_outcome_t::default();
         let mut arguments = ffi::ustore_graph_remove_vertices_t {
-            db: self.database(),
-            error: &mut error,
-            transaction: self.transaction(),
-            arena: arena.slot(),
-            options: self.options() | durability.to_raw(),
-            tasks_count: vertices.len() as ustore_size_t,
+            database: self.database(),
+            executor: ptr::null_mut(),
+            outcome: &mut outcome,
+            completion: ustore_completion_t::Blocking,
+            transaction,
+            count: vertices.len() as ustore_size_t,
             collections,
             collections_stride,
             vertices: vertices.as_ptr(),
             vertices_stride: size_of::<Key>() as ustore_size_t,
             roles,
             roles_stride,
+            durability,
+            watch: self.watch(),
         };
         // SAFETY: the vertices, the collections and the roles outlive the call, and `Role` is an `i32`
         // as the ABI enum is.
         unsafe { ffi::ustore_graph_remove_vertices(&mut arguments) };
-        check(error)
+        check(outcome)
     }
 
     /// The degree of every vertex in `roles`, without exporting a single edge.
@@ -380,18 +436,7 @@ impl View<'_> {
         vertices: &[Key],
         roles: Roles<'_>,
     ) -> Result<&'arena [Degree]> {
-        let mut degrees: *mut Degree = ptr::null_mut();
-        self.find(
-            arena,
-            collections.into(),
-            vertices,
-            roles,
-            &mut degrees,
-            ptr::null_mut(),
-        )?;
-        // SAFETY: a successful lookup exports one degree per vertex into the arena, which stays borrowed for
-        // as long as the slice does.
-        Ok(unsafe { exported_slice(degrees, vertices.len()) })
+        self.find(arena, collections.into(), vertices, roles, ptr::null_mut())
     }
 
     /// The degree and the edges of every vertex in `roles`.
@@ -402,12 +447,8 @@ impl View<'_> {
         vertices: &[Key],
         roles: Roles<'_>,
     ) -> Result<Neighborhoods<'arena>> {
-        let mut degrees: *mut Degree = ptr::null_mut();
         let mut tape: *mut ustore_key_t = ptr::null_mut();
-        self.find(arena, collections.into(), vertices, roles, &mut degrees, &mut tape)?;
-        // SAFETY: a successful lookup exports one degree per vertex into the arena, which stays borrowed for
-        // as long as the slice does.
-        let degrees = unsafe { exported_slice(degrees, vertices.len()) };
+        let degrees = self.find(arena, collections.into(), vertices, roles, &mut tape)?;
         let missing = degree_missing();
         let edges_count = degrees
             .iter()
@@ -420,69 +461,74 @@ impl View<'_> {
         Ok(Neighborhoods { degrees, edges })
     }
 
-    /// Runs one lookup, exporting the degrees and, when `tape` is not null, the edges.
-    fn find(
+    /// Runs one lookup into the arena's degrees, exporting the edges too when `tape` is not null.
+    fn find<'arena>(
         &self,
-        arena: &mut Arena,
+        arena: &'arena mut Arena,
         collections: Collections<'_>,
         vertices: &[Key],
         roles: Roles<'_>,
-        degrees: *mut *mut Degree,
         tape: *mut *mut ustore_key_t,
-    ) -> Result<()> {
+    ) -> Result<&'arena [Degree]> {
         let (collections, collections_stride) = collections.strided(vertices.len())?;
         let (roles, roles_stride) = roles.strided(vertices.len())?;
-        let mut error = ustore_error_t::default();
+        let Arena { handle, degrees, .. } = arena;
+        let degrees = grown(degrees, vertices.len())?;
+        let mut outcome = ustore_outcome_t::default();
         let mut arguments = ffi::ustore_graph_find_edges_t {
-            db: self.database(),
-            error: &mut error,
-            transaction: self.transaction(),
-            snapshot: self.snapshot(),
-            arena: arena.slot(),
-            options: self.options(),
-            tasks_count: vertices.len() as ustore_size_t,
+            database: self.database(),
+            executor: ptr::null_mut(),
+            outcome: &mut outcome,
+            completion: ustore_completion_t::Blocking,
+            view: self.view(),
+            count: vertices.len() as ustore_size_t,
             collections,
             collections_stride,
             vertices: vertices.as_ptr(),
             vertices_stride: size_of::<Key>() as ustore_size_t,
             roles,
             roles_stride,
-            degrees_per_vertex: degrees,
+            degrees_per_vertex: degrees.as_mut_ptr(),
+            degrees_per_vertex_stride: size_of::<Degree>() as ustore_size_t,
             edges_per_vertex: tape,
+            arena: handle,
         };
         // SAFETY: the vertices, the collections, the roles and both outputs outlive the call, and `Role` is
         // an `i32` as the ABI enum is.
         unsafe { ffi::ustore_graph_find_edges(&mut arguments) };
-        check(error)
+        check(outcome)?;
+        Ok(degrees)
     }
 
     /// The arguments an edge upsert or removal takes, borrowing the collection and the edges from the caller,
-    /// whose error slot the caller points at its own error.
+    /// whose outcome slot the caller points at its own outcome.
     fn edges_arguments(
         &self,
-        arena: &mut Arena,
-        collections: Collections<'_>,
+        collections: &Collections<'_>,
         edges: &[Edge],
         durability: Durability,
     ) -> Result<ffi::ustore_graph_upsert_edges_t> {
+        let transaction = self.transaction()?;
         let (collections, collections_stride) = collections.strided(edges.len())?;
         let stride = size_of::<Edge>() as ustore_size_t;
         let first = edges.as_ptr();
         Ok(ffi::ustore_graph_upsert_edges_t {
-            db: self.database(),
-            error: ptr::null_mut(),
-            transaction: self.transaction(),
-            arena: arena.slot(),
-            options: self.options() | durability.to_raw(),
-            tasks_count: edges.len() as ustore_size_t,
+            database: self.database(),
+            executor: ptr::null_mut(),
+            outcome: ptr::null_mut(),
+            completion: ustore_completion_t::Blocking,
+            transaction,
+            count: edges.len() as ustore_size_t,
             collections,
             collections_stride,
-            edges_ids: first.wrapping_byte_add(offset_of!(Edge, id)).cast::<ustore_key_t>(),
+            edges: first.wrapping_byte_add(offset_of!(Edge, id)).cast::<ustore_key_t>(),
             edges_stride: stride,
-            sources_ids: first.wrapping_byte_add(offset_of!(Edge, source)).cast::<ustore_key_t>(),
+            sources: first.wrapping_byte_add(offset_of!(Edge, source)).cast::<ustore_key_t>(),
             sources_stride: stride,
-            targets_ids: first.wrapping_byte_add(offset_of!(Edge, target)).cast::<ustore_key_t>(),
+            targets: first.wrapping_byte_add(offset_of!(Edge, target)).cast::<ustore_key_t>(),
             targets_stride: stride,
+            durability,
+            watch: self.watch(),
         })
     }
 }
@@ -501,7 +547,6 @@ mod tests {
     /// A directed graph of one to two, one to three and two to three, in a collection of its own.
     fn populated() -> (Database, Arena, CollectionID) {
         let database = Database::open_ram(&RAMOptions::default()).unwrap();
-        let mut arena = Arena::new();
         let graph = database.create_collection("graph", Modality::Graph).unwrap();
         let edges = [
             Edge::new(key(1), key(2)),
@@ -510,9 +555,9 @@ mod tests {
         ];
         database
             .head()
-            .upsert_edges(&mut arena, graph, &edges, Durability::Buffered)
+            .upsert_edges(graph, &edges, Durability::Buffered)
             .unwrap();
-        (database, arena, graph)
+        (database, Arena::new(), graph)
     }
 
     #[test]
@@ -600,7 +645,7 @@ mod tests {
         assert_eq!(failure.status, Status::InvalidArgument);
         let failure = database
             .head()
-            .remove_vertices(&mut arena, graph, &keys([1]), Roles::Each(&roles), Durability::Buffered)
+            .remove_vertices(graph, &keys([1]), Roles::Each(&roles), Durability::Buffered)
             .unwrap_err();
         assert_eq!(failure.status, Status::InvalidArgument);
     }
@@ -617,7 +662,7 @@ mod tests {
         ];
         database
             .head()
-            .upsert_edges(&mut arena, graph, &edges, Durability::Buffered)
+            .upsert_edges(graph, &edges, Durability::Buffered)
             .unwrap();
         let degrees = database
             .head()
@@ -627,12 +672,7 @@ mod tests {
 
         database
             .head()
-            .remove_edges(
-                &mut arena,
-                graph,
-                &[Edge::with_id(key(1), key(2), key(10))],
-                Durability::Buffered,
-            )
+            .remove_edges(graph, &[Edge::with_id(key(1), key(2), key(10))], Durability::Buffered)
             .unwrap();
         let found = database
             .head()
@@ -643,7 +683,7 @@ mod tests {
         // Removing an edge the graph never held changes nothing.
         database
             .head()
-            .remove_edges(&mut arena, graph, &[Edge::new(key(5), key(6))], Durability::Buffered)
+            .remove_edges(graph, &[Edge::new(key(5), key(6))], Durability::Buffered)
             .unwrap();
     }
 
@@ -652,7 +692,7 @@ mod tests {
         let (database, mut arena, graph) = populated();
         database
             .head()
-            .upsert_vertices(&mut arena, graph, &keys([1, 7]), Durability::Buffered)
+            .upsert_vertices(graph, &keys([1, 7]), Durability::Buffered)
             .unwrap();
         let degrees = database
             .head()
@@ -662,13 +702,7 @@ mod tests {
 
         database
             .head()
-            .remove_vertices(
-                &mut arena,
-                graph,
-                &keys([3]),
-                Roles::Every(Role::Any),
-                Durability::Buffered,
-            )
+            .remove_vertices(graph, &keys([3]), Roles::Every(Role::Any), Durability::Buffered)
             .unwrap();
         let degrees = database
             .head()
@@ -682,13 +716,7 @@ mod tests {
         let (database, mut arena, graph) = populated();
         database
             .head()
-            .remove_vertices(
-                &mut arena,
-                graph,
-                &keys([1]),
-                Roles::Every(Role::Source),
-                Durability::Buffered,
-            )
+            .remove_vertices(graph, &keys([1]), Roles::Every(Role::Source), Durability::Buffered)
             .unwrap();
         let found = database
             .head()
@@ -704,11 +732,11 @@ mod tests {
         let edges = [Edge::new(key(3), key(1))];
         transaction
             .view(Conflicts::Watched)
-            .upsert_edges(&mut arena, graph, &edges, Durability::Buffered)
+            .upsert_edges(graph, &edges, Durability::Buffered)
             .unwrap();
         let flushed = transaction
             .view(Conflicts::Watched)
-            .upsert_edges(&mut arena, graph, &edges, Durability::Flushed)
+            .upsert_edges(graph, &edges, Durability::Flushed)
             .unwrap_err();
         assert_eq!(flushed.status, Status::InvalidArgument);
 
@@ -737,7 +765,7 @@ mod tests {
         let snapshot = database.snapshot().unwrap();
         database
             .head()
-            .remove_edges(&mut arena, graph, &[Edge::new(key(1), key(2))], Durability::Buffered)
+            .remove_edges(graph, &[Edge::new(key(1), key(2))], Durability::Buffered)
             .unwrap();
         let pinned = snapshot
             .view()
@@ -756,7 +784,7 @@ mod tests {
         ];
         database
             .head()
-            .write(&mut arena, CollectionID::main(), &blobs, Durability::Buffered)
+            .write(CollectionID::main(), &blobs, Durability::Buffered)
             .unwrap();
         for vertex in keys([1, 2]) {
             let failure = database
@@ -766,12 +794,7 @@ mod tests {
             assert_eq!(failure.status, Status::InvalidArgument);
             let failure = database
                 .head()
-                .upsert_edges(
-                    &mut arena,
-                    CollectionID::main(),
-                    &[Edge::new(vertex, key(3))],
-                    Durability::Buffered,
-                )
+                .upsert_edges(CollectionID::main(), &[Edge::new(vertex, key(3))], Durability::Buffered)
                 .unwrap_err();
             assert_eq!(failure.status, Status::InvalidArgument);
         }
@@ -788,7 +811,7 @@ mod tests {
         let edges = [Edge::new(key(1), key(2)), Edge::new(key(1), key(3))];
         database
             .head()
-            .upsert_edges(&mut arena, spanned.as_slice(), &edges, Durability::Buffered)
+            .upsert_edges(spanned.as_slice(), &edges, Durability::Buffered)
             .unwrap();
 
         let degrees = database
@@ -823,11 +846,10 @@ mod tests {
     fn empty_batches_reach_no_engine() {
         let (database, mut arena, graph) = populated();
         let head = database.head();
-        head.upsert_edges(&mut arena, graph, &[], Durability::Buffered).unwrap();
-        head.remove_edges(&mut arena, graph, &[], Durability::Buffered).unwrap();
-        head.upsert_vertices(&mut arena, graph, &[], Durability::Buffered)
-            .unwrap();
-        head.remove_vertices(&mut arena, graph, &[], Roles::Each(&[]), Durability::Buffered)
+        head.upsert_edges(graph, &[], Durability::Buffered).unwrap();
+        head.remove_edges(graph, &[], Durability::Buffered).unwrap();
+        head.upsert_vertices(graph, &[], Durability::Buffered).unwrap();
+        head.remove_vertices(graph, &[], Roles::Each(&[]), Durability::Buffered)
             .unwrap();
         assert!(head
             .degrees(&mut arena, graph, &[], Roles::Every(Role::Any))

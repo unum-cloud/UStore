@@ -4,18 +4,20 @@
 //! strided ABI reads in place, so nothing is staged on the way in; outputs land in the [`Arena`] the
 //! call borrows, so nothing is copied on the way out.
 
+use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::ptr;
 
 use crate::db::ffi::{
-    ustore_arena_t, ustore_byte_t, ustore_bytes_cptr_t, ustore_collection_id_t, ustore_database_t, ustore_enum_t,
-    ustore_error_t, ustore_key_t, ustore_length_t, ustore_octet_t, ustore_size_t, ustore_snapshot_t,
-    ustore_transaction_t,
+    ustore_arena_t, ustore_byte_t, ustore_bytes_cptr_t, ustore_collection_id_t, ustore_completion_t, ustore_database_t,
+    ustore_durability_t, ustore_executor_t, ustore_key_t, ustore_length_t, ustore_octet_t, ustore_outcome_t,
+    ustore_progress_callback_t, ustore_scan_mode_t, ustore_size_t, ustore_transaction_t, ustore_view_t, ustore_watch_t,
 };
 use crate::db::{
-    check, described_length, exported_slice, first_count, missing_length, Arena, CollectionID, Collections, Durability,
-    Key, Result, View,
+    check, described_length, exported_slice, fail, grown, Arena, CollectionID, Collections, Durability, Key, Result,
+    Rows, Status, View,
 };
+use crate::docs::Bitmap;
 
 // region: Raw Declarations
 
@@ -27,107 +29,128 @@ mod ffi {
 
     #[repr(C)]
     pub struct ustore_write_t {
-        pub db: ustore_database_t,
-        pub error: *mut ustore_error_t,
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
         pub transaction: ustore_transaction_t,
-        pub arena: *mut ustore_arena_t,
-        pub options: ustore_enum_t,
-        pub tasks_count: ustore_size_t,
+        pub count: ustore_size_t,
         pub collections: *const ustore_collection_id_t,
         pub collections_stride: ustore_size_t,
         pub keys: *const ustore_key_t,
         pub keys_stride: ustore_size_t,
-        pub presences: *const ustore_octet_t,
-        pub offsets: *const ustore_length_t,
-        pub offsets_stride: ustore_size_t,
+        pub starts: *const ustore_length_t,
+        pub starts_stride: ustore_size_t,
         pub lengths: *const ustore_length_t,
         pub lengths_stride: ustore_size_t,
         pub values: *const ustore_bytes_cptr_t,
         pub values_stride: ustore_size_t,
+        pub durability: ustore_durability_t,
+        pub watch: ustore_watch_t,
     }
 
     #[repr(C)]
-    pub struct ustore_read_t {
-        pub db: ustore_database_t,
-        pub error: *mut ustore_error_t,
+    pub struct ustore_remove_t {
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
         pub transaction: ustore_transaction_t,
-        pub snapshot: ustore_snapshot_t,
-        pub arena: *mut ustore_arena_t,
-        pub options: ustore_enum_t,
-        pub tasks_count: ustore_size_t,
+        pub count: ustore_size_t,
         pub collections: *const ustore_collection_id_t,
         pub collections_stride: ustore_size_t,
         pub keys: *const ustore_key_t,
         pub keys_stride: ustore_size_t,
-        pub presences: *mut *mut ustore_octet_t,
-        pub offsets: *mut *mut ustore_length_t,
-        pub lengths: *mut *mut ustore_length_t,
+        pub durability: ustore_durability_t,
+        pub watch: ustore_watch_t,
+    }
+
+    #[repr(C)]
+    pub struct ustore_read_t {
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
+        pub view: ustore_view_t,
+        pub count: ustore_size_t,
+        pub collections: *const ustore_collection_id_t,
+        pub collections_stride: ustore_size_t,
+        pub keys: *const ustore_key_t,
+        pub keys_stride: ustore_size_t,
+        pub presences: *mut ustore_octet_t,
+        pub offsets: *mut ustore_length_t,
         pub values: *mut *mut ustore_byte_t,
+        pub arena: *mut ustore_arena_t,
     }
 
     #[repr(C)]
     pub struct ustore_scan_t {
-        pub db: ustore_database_t,
-        pub error: *mut ustore_error_t,
-        pub transaction: ustore_transaction_t,
-        pub snapshot: ustore_snapshot_t,
-        pub arena: *mut ustore_arena_t,
-        pub options: ustore_enum_t,
-        pub tasks_count: ustore_size_t,
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
+        pub view: ustore_view_t,
+        pub count: ustore_size_t,
         pub collections: *const ustore_collection_id_t,
         pub collections_stride: ustore_size_t,
         pub start_keys: *const ustore_key_t,
         pub start_keys_stride: ustore_size_t,
         pub count_limits: *const ustore_length_t,
         pub count_limits_stride: ustore_size_t,
-        pub offsets: *mut *mut ustore_length_t,
-        pub counts: *mut *mut ustore_length_t,
-        pub keys: *mut *mut ustore_key_t,
+        pub offsets: *mut ustore_length_t,
+        pub keys: *mut ustore_key_t,
+        pub mode: ustore_scan_mode_t,
+        pub progress: ustore_progress_callback_t,
+        pub progress_state: *mut c_void,
     }
 
     #[repr(C)]
     pub struct ustore_sample_t {
-        pub db: ustore_database_t,
-        pub error: *mut ustore_error_t,
-        pub transaction: ustore_transaction_t,
-        pub snapshot: ustore_snapshot_t,
-        pub arena: *mut ustore_arena_t,
-        pub options: ustore_enum_t,
-        pub tasks_count: ustore_size_t,
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
+        pub view: ustore_view_t,
+        pub count: ustore_size_t,
         pub collections: *const ustore_collection_id_t,
         pub collections_stride: ustore_size_t,
         pub count_limits: *const ustore_length_t,
         pub count_limits_stride: ustore_size_t,
-        pub offsets: *mut *mut ustore_length_t,
-        pub counts: *mut *mut ustore_length_t,
-        pub keys: *mut *mut ustore_key_t,
+        pub offsets: *mut ustore_length_t,
+        pub keys: *mut ustore_key_t,
     }
 
     #[repr(C)]
     pub struct ustore_measure_t {
-        pub db: ustore_database_t,
-        pub error: *mut ustore_error_t,
-        pub transaction: ustore_transaction_t,
-        pub snapshot: ustore_snapshot_t,
-        pub arena: *mut ustore_arena_t,
-        pub options: ustore_enum_t,
-        pub tasks_count: ustore_size_t,
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
+        pub view: ustore_view_t,
+        pub count: ustore_size_t,
         pub collections: *const ustore_collection_id_t,
         pub collections_stride: ustore_size_t,
         pub start_keys: *const ustore_key_t,
         pub start_keys_stride: ustore_size_t,
         pub end_keys: *const ustore_key_t,
         pub end_keys_stride: ustore_size_t,
-        pub min_cardinalities: *mut *mut ustore_size_t,
-        pub max_cardinalities: *mut *mut ustore_size_t,
-        pub min_value_bytes: *mut *mut ustore_size_t,
-        pub max_value_bytes: *mut *mut ustore_size_t,
-        pub min_space_usages: *mut *mut ustore_size_t,
-        pub max_space_usages: *mut *mut ustore_size_t,
+        pub min_cardinalities: *mut ustore_size_t,
+        pub min_cardinalities_stride: ustore_size_t,
+        pub max_cardinalities: *mut ustore_size_t,
+        pub max_cardinalities_stride: ustore_size_t,
+        pub min_value_bytes: *mut ustore_size_t,
+        pub min_value_bytes_stride: ustore_size_t,
+        pub max_value_bytes: *mut ustore_size_t,
+        pub max_value_bytes_stride: ustore_size_t,
+        pub min_space_usages: *mut ustore_size_t,
+        pub min_space_usages_stride: ustore_size_t,
+        pub max_space_usages: *mut ustore_size_t,
+        pub max_space_usages_stride: ustore_size_t,
     }
 
     extern "C" {
         pub fn ustore_write(arguments: *mut ustore_write_t);
+        pub fn ustore_remove(arguments: *mut ustore_remove_t);
         pub fn ustore_read(arguments: *mut ustore_read_t);
         pub fn ustore_scan(arguments: *mut ustore_scan_t);
         pub fn ustore_sample(arguments: *mut ustore_sample_t);
@@ -168,26 +191,10 @@ impl<'value> Entry<'value> {
         self.key
     }
 
-    /// Names a key to remove, which a batch mixes freely with the entries that carry values.
-    ///
-    /// The ABI reads a null value pointer as a removal, so no bitset of present values is needed and
-    /// nothing is staged; an empty slice still points somewhere, and writes an empty value.
-    pub fn removal(key: Key) -> Self {
-        Entry {
-            key,
-            value: ptr::null(),
-            length: 0,
-            marker: PhantomData,
-        }
-    }
-
-    /// The bytes this entry stores, or `None` for an entry that removes its key.
-    pub fn value(&self) -> Option<&'value [u8]> {
-        if self.value.is_null() {
-            return None;
-        }
+    /// The bytes this entry stores.
+    pub fn value(&self) -> &'value [u8] {
         // SAFETY: the pointer and the length came from one borrowed slice alive for `'value`.
-        Some(unsafe { exported_slice(self.value, self.length as usize) })
+        unsafe { exported_slice(self.value, self.length as usize) }
     }
 }
 
@@ -197,65 +204,97 @@ impl<'value> Entry<'value> {
 
 /// The values one read exported, addressed by the position of their key in the batch.
 ///
-/// The run borrows the arena it was exported into, so the next call through that arena - which
-/// would overwrite it - cannot be made while it lives.
+/// The presences and the offsets live in the arena's spans and the bytes behind its handle, so the run borrows the
+/// arena, and the next call through it cannot overwrite them while the run lives.
 #[derive(Clone, Copy, Debug)]
 pub struct Values<'arena> {
-    offsets: *const ustore_length_t,
-    lengths: *const ustore_length_t,
-    tape: *const ustore_byte_t,
-    count: usize,
-    marker: PhantomData<&'arena Arena>,
+    presences: &'arena [ustore_octet_t],
+    offsets: &'arena [ustore_length_t],
+    tape: &'arena [ustore_byte_t],
 }
 
 impl<'arena> Values<'arena> {
-    /// The run a read of `count` values exported, or an empty one when the read never reached an engine.
-    pub(crate) fn exported(
-        offsets: *const ustore_length_t,
-        lengths: *const ustore_length_t,
-        tape: *const ustore_byte_t,
-        count: usize,
-    ) -> Self {
+    /// The run of a read that covered no keys.
+    pub(crate) fn empty() -> Self {
         Values {
+            presences: &[],
+            offsets: &[0],
+            tape: &[],
+        }
+    }
+
+    /// The run a read exported: a presence bit per key, one more offset than keys, and the bytes they address.
+    ///
+    /// # Safety
+    /// `offsets` is not empty and never decreases, and `tape` addresses the bytes up to the last of them, alive for
+    /// `'arena`.
+    pub(crate) unsafe fn exported(
+        presences: &'arena [ustore_octet_t],
+        offsets: &'arena [ustore_length_t],
+        tape: *const ustore_byte_t,
+    ) -> Self {
+        let length = offsets[offsets.len() - 1] as usize;
+        Values {
+            presences,
             offsets,
-            lengths,
-            tape,
-            count: if lengths.is_null() { 0 } else { count },
-            marker: PhantomData,
+            tape: exported_slice(tape, length),
         }
     }
 
     /// How many keys the read covered.
     pub fn len(&self) -> usize {
-        self.count
+        self.offsets.len() - 1
     }
 
     /// Whether the read covered no keys at all.
     pub fn is_empty(&self) -> bool {
-        self.count == 0
+        self.len() == 0
     }
 
     /// The value of the key at `index`, or `None` for a key the database does not hold.
     pub fn get(&self, index: usize) -> Option<&'arena [u8]> {
-        if index >= self.count {
+        if !self.presences().get(index) {
             return None;
         }
-        // SAFETY: a successful read exports one length and one offset per key into the arena, which
-        // stays borrowed for `'arena`, and every present value sits inside the tape they address.
-        unsafe {
-            let length = *self.lengths.add(index);
-            if length == missing_length() {
-                return None;
-            }
-            let offset = *self.offsets.add(index) as usize;
-            Some(exported_slice(self.tape.add(offset), length as usize))
-        }
+        let begin = self.offsets[index] as usize;
+        let end = self.offsets[index + 1] as usize;
+        self.tape.get(begin..end)
     }
 
     /// Every value in the order its key was asked for.
-    pub fn iter(&self) -> impl Iterator<Item = Option<&'arena [u8]>> + '_ {
-        let values = *self;
-        (0..values.count).map(move |index| values.get(index))
+    pub fn iter(&self) -> Rows<Values<'arena>, Option<&'arena [u8]>> {
+        Rows::new(*self, self.len(), Values::get)
+    }
+
+    /// Which keys the read found, one bit per key as Arrow reads a validity buffer.
+    pub fn presences(&self) -> Bitmap<'arena> {
+        Bitmap::new(self.presences, self.len())
+    }
+
+    /// Every value on one Arrow-style tape of `len() + 1` offsets into the bytes the read exported, without a copy.
+    ///
+    /// A missing value is empty on the tape, and [`Values::presences`] tells it apart from an empty one.
+    pub fn tape(&self) -> stringtape::BytesTapeViewU64<'arena> {
+        // SAFETY: the offsets never decrease, and the last one closes the tape of bytes they address.
+        unsafe { stringtape::BytesTapeViewU64::from_raw_parts(self.tape, self.offsets) }
+    }
+}
+
+impl<'arena> IntoIterator for Values<'arena> {
+    type Item = Option<&'arena [u8]>;
+    type IntoIter = Rows<Values<'arena>, Option<&'arena [u8]>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<'arena> IntoIterator for &Values<'arena> {
+    type Item = Option<&'arena [u8]>;
+    type IntoIter = Rows<Values<'arena>, Option<&'arena [u8]>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 
@@ -281,88 +320,82 @@ pub struct Measurement {
 // region: Verbs
 
 impl View<'_> {
-    /// Upserts a batch of values, removing the keys whose entries carry none.
+    /// Upserts a batch of values, where an empty value is still a value and [`View::remove`] removes keys.
     ///
     /// The batch spans as many collections as it has entries, and a bare [`CollectionID`] gives every
     /// entry the same one. A transaction flushes at its commit, so [`Durability::Flushed`] is refused
     /// inside one.
     pub fn write<'collections>(
         &self,
-        arena: &mut Arena,
         collections: impl Into<Collections<'collections>>,
         entries: &[Entry<'_>],
         durability: Durability,
     ) -> Result<()> {
-        if entries.is_empty() {
+        let transaction = self.transaction()?;
+        let Some(first) = entries.first() else {
             return Ok(());
-        }
+        };
         let collections = collections.into();
         let (collections, collections_stride) = collections.strided(entries.len())?;
         let stride = size_of::<Entry<'_>>() as ustore_size_t;
-        let first = &entries[0];
-        let mut error = ustore_error_t::default();
+        let mut outcome = ustore_outcome_t::default();
         let mut arguments = ffi::ustore_write_t {
-            db: self.database(),
-            error: &mut error,
-            transaction: self.transaction(),
-            arena: arena.slot(),
-            options: self.options() | durability.to_raw(),
-            tasks_count: entries.len() as ustore_size_t,
+            database: self.database(),
+            executor: ptr::null_mut(),
+            outcome: &mut outcome,
+            completion: ustore_completion_t::Blocking,
+            transaction,
+            count: entries.len() as ustore_size_t,
             collections,
             collections_stride,
             keys: &first.key,
             keys_stride: stride,
-            presences: ptr::null(),
-            offsets: ptr::null(),
-            offsets_stride: 0,
+            starts: ptr::null(),
+            starts_stride: 0,
             lengths: &first.length,
             lengths_stride: stride,
             values: &first.value,
             values_stride: stride,
+            durability,
+            watch: self.watch(),
         };
         // SAFETY: the entries and the collections outlive the call, and the members of every entry sit
         // `stride` bytes apart, which is what `#[repr(C)]` on `Entry` promises.
         unsafe { ffi::ustore_write(&mut arguments) };
-        check(error)
+        check(outcome)
     }
 
-    /// Removes a batch of keys, whether or not the database holds them.
-    pub fn erase<'collections>(
+    /// Removes a batch of keys with their values, whether or not the database holds them.
+    pub fn remove<'collections>(
         &self,
-        arena: &mut Arena,
         collections: impl Into<Collections<'collections>>,
         keys: &[Key],
         durability: Durability,
     ) -> Result<()> {
+        let transaction = self.transaction()?;
         if keys.is_empty() {
             return Ok(());
         }
         let collections = collections.into();
         let (collections, collections_stride) = collections.strided(keys.len())?;
-        let mut error = ustore_error_t::default();
-        let mut arguments = ffi::ustore_write_t {
-            db: self.database(),
-            error: &mut error,
-            transaction: self.transaction(),
-            arena: arena.slot(),
-            options: self.options() | durability.to_raw(),
-            tasks_count: keys.len() as ustore_size_t,
+        let mut outcome = ustore_outcome_t::default();
+        let mut arguments = ffi::ustore_remove_t {
+            database: self.database(),
+            executor: ptr::null_mut(),
+            outcome: &mut outcome,
+            completion: ustore_completion_t::Blocking,
+            transaction,
+            count: keys.len() as ustore_size_t,
             collections,
             collections_stride,
             keys: keys.as_ptr(),
             keys_stride: size_of::<Key>() as ustore_size_t,
-            presences: ptr::null(),
-            offsets: ptr::null(),
-            offsets_stride: 0,
-            lengths: ptr::null(),
-            lengths_stride: 0,
-            values: ptr::null(),
-            values_stride: 0,
+            durability,
+            watch: self.watch(),
         };
-        // SAFETY: the keys and the collections outlive the call, and a null `values` is how the ABI
-        // spells a removal.
-        unsafe { ffi::ustore_write(&mut arguments) };
-        check(error)
+        // SAFETY: the keys and the collections outlive the call.
+        unsafe { ffi::ustore_remove(&mut arguments) };
+        check(outcome)
     }
 
     /// Reads a batch of keys into the arena, one collection per key or one for all of them.
@@ -372,36 +405,74 @@ impl View<'_> {
         collections: impl Into<Collections<'collections>>,
         keys: &[Key],
     ) -> Result<Values<'arena>> {
-        let mut offsets: *mut ustore_length_t = ptr::null_mut();
-        let mut lengths: *mut ustore_length_t = ptr::null_mut();
-        let mut tape: *mut ustore_byte_t = ptr::null_mut();
         if keys.is_empty() {
-            return Ok(Values::exported(offsets, lengths, tape, 0));
+            return Ok(Values::empty());
         }
         let collections = collections.into();
         let (collections, collections_stride) = collections.strided(keys.len())?;
-        let mut error = ustore_error_t::default();
+        let Arena {
+            handle,
+            presences,
+            offsets,
+            ..
+        } = arena;
+        let presences = grown(presences, keys.len().div_ceil(8))?;
+        let offsets = grown(offsets, keys.len() + 1)?;
+        let mut tape: *mut ustore_byte_t = ptr::null_mut();
+        let mut outcome = ustore_outcome_t::default();
         let mut arguments = ffi::ustore_read_t {
-            db: self.database(),
-            error: &mut error,
-            transaction: self.transaction(),
-            snapshot: self.snapshot(),
-            arena: arena.slot(),
-            options: self.options(),
-            tasks_count: keys.len() as ustore_size_t,
+            database: self.database(),
+            executor: ptr::null_mut(),
+            outcome: &mut outcome,
+            completion: ustore_completion_t::Blocking,
+            view: self.view(),
+            count: keys.len() as ustore_size_t,
             collections,
             collections_stride,
             keys: keys.as_ptr(),
             keys_stride: size_of::<Key>() as ustore_size_t,
-            presences: ptr::null_mut(),
-            offsets: &mut offsets,
-            lengths: &mut lengths,
+            presences: presences.as_mut_ptr(),
+            offsets: offsets.as_mut_ptr(),
             values: &mut tape,
+            arena: handle,
         };
         // SAFETY: the keys, the collections and the outputs outlive the call.
         unsafe { ffi::ustore_read(&mut arguments) };
-        check(error)?;
-        Ok(Values::exported(offsets, lengths, tape, keys.len()))
+        check(outcome)?;
+        // SAFETY: a successful read fills a presence bit and an offset per key, closes the tape with one more
+        // offset, and lands the tape behind the handle, all of it borrowed for `'arena`.
+        Ok(unsafe { Values::exported(presences, offsets, tape) })
+    }
+
+    /// Which of `keys` one collection holds, exporting no value.
+    pub(crate) fn contains<'arena>(
+        &self,
+        arena: &'arena mut Arena,
+        collection: CollectionID,
+        keys: &[Key],
+    ) -> Result<Bitmap<'arena>> {
+        let presences = grown(&mut arena.presences, keys.len().div_ceil(8))?;
+        let mut outcome = ustore_outcome_t::default();
+        let mut arguments = ffi::ustore_read_t {
+            database: self.database(),
+            executor: ptr::null_mut(),
+            outcome: &mut outcome,
+            completion: ustore_completion_t::Blocking,
+            view: self.view(),
+            count: keys.len() as ustore_size_t,
+            collections: &collection,
+            collections_stride: 0,
+            keys: keys.as_ptr(),
+            keys_stride: size_of::<Key>() as ustore_size_t,
+            presences: presences.as_mut_ptr(),
+            offsets: ptr::null_mut(),
+            values: ptr::null_mut(),
+            arena: ptr::null_mut(),
+        };
+        // SAFETY: the keys, the collection and the output outlive the call, which exports nothing to an arena.
+        unsafe { ffi::ustore_read(&mut arguments) };
+        check(outcome)?;
+        Ok(Bitmap::new(presences, keys.len()))
     }
 
     /// Lists up to `limit` keys of one collection from `start`, which is how a walk paginates.
@@ -412,33 +483,31 @@ impl View<'_> {
         start: Key,
         limit: u64,
     ) -> Result<&'arena [Key]> {
-        let mut counts: *mut ustore_length_t = ptr::null_mut();
-        let mut keys: *mut ustore_key_t = ptr::null_mut();
-        let mut error = ustore_error_t::default();
+        let (offsets, keys) = found_spans(arena, limit)?;
+        let mut outcome = ustore_outcome_t::default();
         let mut arguments = ffi::ustore_scan_t {
-            db: self.database(),
-            error: &mut error,
-            transaction: self.transaction(),
-            snapshot: self.snapshot(),
-            arena: arena.slot(),
-            options: self.options(),
-            tasks_count: 1,
+            database: self.database(),
+            executor: ptr::null_mut(),
+            outcome: &mut outcome,
+            completion: ustore_completion_t::Blocking,
+            view: self.view(),
+            count: 1,
             collections: &collection,
             collections_stride: 0,
             start_keys: &start,
             start_keys_stride: 0,
             count_limits: &limit,
             count_limits_stride: 0,
-            offsets: ptr::null_mut(),
-            counts: &mut counts,
-            keys: &mut keys,
+            offsets: offsets.as_mut_ptr(),
+            keys: keys.as_mut_ptr(),
+            mode: ustore_scan_mode_t::Ordered,
+            progress: None,
+            progress_state: ptr::null_mut(),
         };
         // SAFETY: the inputs and the outputs outlive the call.
         unsafe { ffi::ustore_scan(&mut arguments) };
-        check(error)?;
-        // SAFETY: a successful scan exports one count and that many keys into the arena, which stays
-        // borrowed for as long as the slice does.
-        Ok(unsafe { exported_slice(keys, first_count(counts)) })
+        check(outcome)?;
+        Ok(found(offsets, keys))
     }
 
     /// Draws up to `limit` keys uniformly at random from one collection.
@@ -448,85 +517,76 @@ impl View<'_> {
         collection: CollectionID,
         limit: u64,
     ) -> Result<&'arena [Key]> {
-        let mut counts: *mut ustore_length_t = ptr::null_mut();
-        let mut keys: *mut ustore_key_t = ptr::null_mut();
-        let mut error = ustore_error_t::default();
+        let (offsets, keys) = found_spans(arena, limit)?;
+        let mut outcome = ustore_outcome_t::default();
         let mut arguments = ffi::ustore_sample_t {
-            db: self.database(),
-            error: &mut error,
-            transaction: self.transaction(),
-            snapshot: self.snapshot(),
-            arena: arena.slot(),
-            options: self.options(),
-            tasks_count: 1,
+            database: self.database(),
+            executor: ptr::null_mut(),
+            outcome: &mut outcome,
+            completion: ustore_completion_t::Blocking,
+            view: self.view(),
+            count: 1,
             collections: &collection,
             collections_stride: 0,
             count_limits: &limit,
             count_limits_stride: 0,
-            offsets: ptr::null_mut(),
-            counts: &mut counts,
-            keys: &mut keys,
+            offsets: offsets.as_mut_ptr(),
+            keys: keys.as_mut_ptr(),
         };
         // SAFETY: the inputs and the outputs outlive the call.
         unsafe { ffi::ustore_sample(&mut arguments) };
-        check(error)?;
-        // SAFETY: a successful sample exports one count and that many keys into the arena, which
-        // stays borrowed for as long as the slice does.
-        Ok(unsafe { exported_slice(keys, first_count(counts)) })
+        check(outcome)?;
+        Ok(found(offsets, keys))
     }
 
     /// Estimates the entries and the space a range of keys takes in one collection.
-    pub fn measure(&self, arena: &mut Arena, collection: CollectionID, start: Key, end: Key) -> Result<Measurement> {
-        let mut min_entries: *mut ustore_size_t = ptr::null_mut();
-        let mut max_entries: *mut ustore_size_t = ptr::null_mut();
-        let mut min_value_bytes: *mut ustore_size_t = ptr::null_mut();
-        let mut max_value_bytes: *mut ustore_size_t = ptr::null_mut();
-        let mut min_space_usages: *mut ustore_size_t = ptr::null_mut();
-        let mut max_space_usages: *mut ustore_size_t = ptr::null_mut();
-        let mut error = ustore_error_t::default();
+    pub fn measure(&self, collection: CollectionID, start: Key, end: Key) -> Result<Measurement> {
+        let mut measured = Measurement::default();
+        let mut outcome = ustore_outcome_t::default();
         let mut arguments = ffi::ustore_measure_t {
-            db: self.database(),
-            error: &mut error,
-            transaction: self.transaction(),
-            snapshot: self.snapshot(),
-            arena: arena.slot(),
-            options: self.options(),
-            tasks_count: 1,
+            database: self.database(),
+            executor: ptr::null_mut(),
+            outcome: &mut outcome,
+            completion: ustore_completion_t::Blocking,
+            view: self.view(),
+            count: 1,
             collections: &collection,
             collections_stride: 0,
             start_keys: &start,
             start_keys_stride: 0,
             end_keys: &end,
             end_keys_stride: 0,
-            min_cardinalities: &mut min_entries,
-            max_cardinalities: &mut max_entries,
-            min_value_bytes: &mut min_value_bytes,
-            max_value_bytes: &mut max_value_bytes,
-            min_space_usages: &mut min_space_usages,
-            max_space_usages: &mut max_space_usages,
+            min_cardinalities: &mut measured.min_entries,
+            min_cardinalities_stride: size_of::<u64>() as ustore_size_t,
+            max_cardinalities: &mut measured.max_entries,
+            max_cardinalities_stride: size_of::<u64>() as ustore_size_t,
+            min_value_bytes: &mut measured.min_value_bytes,
+            min_value_bytes_stride: size_of::<u64>() as ustore_size_t,
+            max_value_bytes: &mut measured.max_value_bytes,
+            max_value_bytes_stride: size_of::<u64>() as ustore_size_t,
+            min_space_usages: &mut measured.min_space_usage,
+            min_space_usages_stride: size_of::<u64>() as ustore_size_t,
+            max_space_usages: &mut measured.max_space_usage,
+            max_space_usages_stride: size_of::<u64>() as ustore_size_t,
         };
         // SAFETY: the inputs and the outputs outlive the call.
         unsafe { ffi::ustore_measure(&mut arguments) };
-        check(error)?;
-        // The estimates are read here, before the call that would overwrite the arena holding them.
-        Ok(Measurement {
-            min_entries: first_estimate(min_entries),
-            max_entries: first_estimate(max_entries),
-            min_value_bytes: first_estimate(min_value_bytes),
-            max_value_bytes: first_estimate(max_value_bytes),
-            min_space_usage: first_estimate(min_space_usages),
-            max_space_usage: first_estimate(max_space_usages),
-        })
+        check(outcome)?;
+        Ok(measured)
     }
 }
 
-/// The estimate one measured column reported for its single range.
-fn first_estimate(column: *const ustore_size_t) -> u64 {
-    match column.is_null() {
-        true => 0,
-        // SAFETY: a successful measurement writes one estimate per column into the arena.
-        false => unsafe { *column },
-    }
+/// The two offsets and the `limit` keys one scan or sample fills, carved from the arena's spans.
+fn found_spans(arena: &mut Arena, limit: u64) -> Result<(&mut [ustore_length_t], &mut [Key])> {
+    let limit =
+        usize::try_from(limit).map_err(|_| fail(Status::OutOfMemory, "the limit outsizes the address space"))?;
+    let Arena { offsets, keys, .. } = arena;
+    Ok((grown(offsets, 2)?, grown(keys, limit)?))
+}
+
+/// The keys one scan or sample found, between the two offsets it filled.
+fn found<'arena>(offsets: &[ustore_length_t], keys: &'arena [Key]) -> &'arena [Key] {
+    &keys[offsets[0] as usize..offsets[1] as usize]
 }
 
 // endregion: Verbs
@@ -542,7 +602,6 @@ mod tests {
     /// A database holding `alpha`, `beta` and `gamma` under the keys one, two and three.
     fn populated() -> (Database, Arena) {
         let database = Database::open_ram(&RAMOptions::default()).unwrap();
-        let mut arena = Arena::new();
         let entries = [
             Entry::new(key(1), b"alpha").unwrap(),
             Entry::new(key(2), b"beta").unwrap(),
@@ -550,9 +609,9 @@ mod tests {
         ];
         database
             .head()
-            .write(&mut arena, CollectionID::main(), &entries, Durability::Buffered)
+            .write(CollectionID::main(), &entries, Durability::Buffered)
             .unwrap();
-        (database, arena)
+        (database, Arena::new())
     }
 
     #[test]
@@ -575,6 +634,14 @@ mod tests {
         );
         // A key past the batch is absent rather than a panic.
         assert_eq!(values.get(3), None);
+        // The rows also walk backwards, know their count, and serve a `for` loop over a borrow.
+        assert_eq!(values.iter().len(), 3);
+        assert_eq!(values.iter().next_back(), Some(Some(b"beta".as_slice())));
+        let mut lengths = 0;
+        for value in &values {
+            lengths += value.map_or(0, <[u8]>::len);
+        }
+        assert_eq!(lengths, "gammaalphabeta".len());
     }
 
     #[test]
@@ -584,7 +651,7 @@ mod tests {
         let entries = [Entry::new(key(1), b"").unwrap()];
         database
             .head()
-            .write(&mut arena, CollectionID::main(), &entries, Durability::Buffered)
+            .write(CollectionID::main(), &entries, Durability::Buffered)
             .unwrap();
 
         let values = database
@@ -600,23 +667,24 @@ mod tests {
         let (database, mut arena) = populated();
         database
             .head()
-            .write(&mut arena, CollectionID::main(), &[], Durability::Buffered)
+            .write(CollectionID::main(), &[], Durability::Buffered)
             .unwrap();
         database
             .head()
-            .erase(&mut arena, CollectionID::main(), &[], Durability::Buffered)
+            .remove(CollectionID::main(), &[], Durability::Buffered)
             .unwrap();
         let values = database.head().read(&mut arena, CollectionID::main(), &[]).unwrap();
         assert!(values.is_empty());
         assert_eq!(values.get(0), None);
+        assert!(values.tape().is_empty() && values.presences().is_empty());
     }
 
     #[test]
-    fn erasing_removes_every_key_it_names() {
+    fn removals_take_every_key_they_name() {
         let (database, mut arena) = populated();
         database
             .head()
-            .erase(&mut arena, CollectionID::main(), &keys([1, 3]), Durability::Buffered)
+            .remove(CollectionID::main(), &keys([1, 3]), Durability::Buffered)
             .unwrap();
         let values = database
             .head()
@@ -632,9 +700,8 @@ mod tests {
         let value = [1u8, 2, 3];
         let entry = Entry::new(key(42), &value).unwrap();
         assert_eq!(entry.key(), key(42));
-        assert_eq!(entry.value(), Some(value.as_slice()));
-        assert_eq!(Entry::new(key(42), b"").unwrap().value(), Some(b"".as_slice()));
-        assert_eq!(Entry::removal(key(42)).value(), None);
+        assert_eq!(entry.value(), value.as_slice());
+        assert_eq!(Entry::new(key(42), b"").unwrap().value(), b"".as_slice());
     }
 
     #[test]
@@ -643,10 +710,7 @@ mod tests {
         let mut arena = Arena::new();
         let named = database.create_collection("people", Modality::Any).unwrap();
         let entries = [Entry::new(key(1), b"in the named one").unwrap()];
-        database
-            .head()
-            .write(&mut arena, named, &entries, Durability::Buffered)
-            .unwrap();
+        database.head().write(named, &entries, Durability::Buffered).unwrap();
 
         let there = database.head().read(&mut arena, named, &keys([1])).unwrap();
         assert_eq!(there.get(0), Some(b"in the named one".as_slice()));
@@ -713,11 +777,8 @@ mod tests {
 
     #[test]
     fn measurements_bound_what_a_range_holds() {
-        let (database, mut arena) = populated();
-        let measured = database
-            .head()
-            .measure(&mut arena, CollectionID::main(), key(1), key(3))
-            .unwrap();
+        let (database, _) = populated();
+        let measured = database.head().measure(CollectionID::main(), key(1), key(3)).unwrap();
         assert!(measured.min_entries <= 3 && measured.max_entries >= measured.min_entries);
         assert!(measured.max_value_bytes >= measured.min_value_bytes);
         assert!(measured.max_space_usage >= measured.min_space_usage);
@@ -737,7 +798,7 @@ mod tests {
         let written = [people, places];
         database
             .head()
-            .write(&mut arena, written.as_slice(), &entries, Durability::Buffered)
+            .write(written.as_slice(), &entries, Durability::Buffered)
             .unwrap();
 
         let values = database
@@ -753,13 +814,13 @@ mod tests {
 
         database
             .head()
-            .erase(&mut arena, written.as_slice(), &keys([1, 1]), Durability::Buffered)
+            .remove(written.as_slice(), &keys([1, 1]), Durability::Buffered)
             .unwrap();
-        let erased = database
+        let removed = database
             .head()
             .read(&mut arena, Collections::Each(&written), &keys([1, 1]))
             .unwrap();
-        assert_eq!((erased.get(0), erased.get(1)), (None, None));
+        assert_eq!((removed.get(0), removed.get(1)), (None, None));
     }
 
     #[test]
@@ -778,32 +839,9 @@ mod tests {
         ];
         let failure = database
             .head()
-            .write(&mut arena, Collections::Each(&one), &entries, Durability::Buffered)
+            .write(Collections::Each(&one), &entries, Durability::Buffered)
             .unwrap_err();
         assert_eq!(failure.status, Status::InvalidArgument);
-    }
-
-    #[test]
-    fn one_batch_mixes_values_and_removals() {
-        let (database, mut arena) = populated();
-        let entries = [
-            Entry::new(key(1), b"rewritten").unwrap(),
-            Entry::removal(key(2)),
-            Entry::new(key(4), b"").unwrap(),
-        ];
-        database
-            .head()
-            .write(&mut arena, CollectionID::main(), &entries, Durability::Buffered)
-            .unwrap();
-
-        let values = database
-            .head()
-            .read(&mut arena, CollectionID::main(), &keys([1, 2, 3, 4]))
-            .unwrap();
-        assert_eq!(values.get(0), Some(b"rewritten".as_slice()));
-        assert_eq!(values.get(1), None, "an entry without a value removes its key");
-        assert_eq!(values.get(2), Some(b"gamma".as_slice()));
-        assert_eq!(values.get(3), Some(b"".as_slice()), "an empty value is not a removal");
     }
 
     #[test]

@@ -5,8 +5,34 @@
 //! header it mirrors.
 //!
 //! A [`Database`] owns its directory, a [`Transaction`] and a [`Snapshot`] borrow it, and every
-//! result borrows the [`Arena`] the engine exported it into - so a value read out of an arena cannot
-//! outlive it, nor survive the call that would overwrite it.
+//! result borrows the [`Arena`] it landed in, so a value read out of an arena cannot outlive it, nor
+//! survive the call that would overwrite it.
+//!
+//! A [`Collection`] addresses one collection by name, as the Python binding does, and creates it with
+//! its first write. Documents parse through JsonTape and batches of values read as StringTape tapes,
+//! and both crates are re-exported here.
+//!
+//! ```no_run
+//! use ustore::{jsontape, Database, Key, RAMOptions, Role};
+//!
+//! let database = Database::open_ram(&RAMOptions::default())?;
+//! let [avatar, titanic] = [1u64, 2].map(Key::from);
+//!
+//! database.collection("movies")?.docs().set(avatar, &jsontape::parse(br#"{"title":"Avatar"}"#)?)?;
+//! database.collection("posters")?.blobs().set(avatar, b"\x89PNG")?;
+//! database.collection("similar")?.graph().add_edge(avatar, titanic)?;
+//!
+//! let mut movies = database.collection("movies")?;
+//! let description = movies.docs().get(avatar)?.expect("the movie was written above");
+//! assert_eq!(description.get("title").as_str(), Some("Avatar"));
+//!
+//! let recommendations = database.collection("similar")?.graph().find_edges(&[avatar], Role::Source)?.edges().len();
+//! let images = database.collection("posters")?.sample(1000)?.keys().len();
+//! assert_eq!((recommendations, images), (1, 1));
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! Beneath the collections, every verb takes a batch and names its collections by identifier:
 //!
 //! ```no_run
 //! use ustore::{Arena, CollectionID, Collections, RAMOptions, Database, Durability, Entry, Key, Modality};
@@ -18,22 +44,24 @@
 //! let [ada, grace, kent] = [1u64, 2, 3].map(Key::from);
 //! let people = database.create_collection("people", Modality::Any)?;
 //! let places = database.create_collection("places", Modality::Any)?;
-//! let entries = [Entry::new(ada, b"Ada")?, Entry::new(grace, b"Grace")?, Entry::removal(kent)];
-//! database.head().write(&mut arena, people, &entries, Durability::Buffered)?;
+//! let entries = [Entry::new(ada, b"Ada")?, Entry::new(grace, b"Grace")?, Entry::new(kent, b"Kent")?];
+//! database.head().write(people, &entries, Durability::Buffered)?;
+//! database.head().remove(people, &[kent], Durability::Buffered)?;
 //!
-//! let values = database.head().read(&mut arena, people, &[ada, grace])?;
+//! let values = database.head().read(&mut arena, people, &[ada, grace, kent])?;
 //! assert_eq!(values.get(0), Some(b"Ada".as_slice()));
+//! assert_eq!(values.get(2), None);
 //!
 //! // A batch carries a collection per task, and a bare one gives every task the same.
 //! let spanned = [people, places];
 //! let across = [Entry::new(ada, b"Ada")?, Entry::new(ada, b"Kent")?];
-//! database.head().write(&mut arena, spanned.as_slice(), &across, Durability::Buffered)?;
+//! database.head().write(spanned.as_slice(), &across, Durability::Buffered)?;
 //! let read = database.head().read(&mut arena, Collections::Each(&spanned), &[ada, ada])?;
 //! assert_eq!(read.get(1), Some(b"Kent".as_slice()));
 //! # Ok::<(), ustore::Error>(())
 //! ```
 //!
-//! The engine resets an arena on every call through it, so a second call would overwrite the run the
+//! The library rewinds an arena on every call through it, so a second call would overwrite the run the
 //! first one exported. That is the borrow the verbs take, and it does not compile:
 //!
 //! ```compile_fail
@@ -48,6 +76,7 @@
 //! ```
 
 pub mod blobs;
+pub mod collection;
 pub mod db;
 pub mod docs;
 pub mod graph;
@@ -56,7 +85,11 @@ pub mod strings;
 #[cfg(test)]
 mod testing;
 
+pub use jsontape;
+pub use stringtape;
+
 pub use blobs::{Entry, Measurement, Values};
+pub use collection::{Blobs, Collection, Docs, Graph, Sample};
 pub use db::{
     key_unknown, Arena, Capabilities, CollectionID, Collections, Conflicts, DataDirectory, Database, Durability, Error,
     Isolation, Key, LevelDBOptions, Modality, NVMEOptions, RAMOptions, Removed, Result, RocksDBOptions, Snapshot,

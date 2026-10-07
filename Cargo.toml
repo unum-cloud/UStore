@@ -41,13 +41,20 @@ include = [
 name = "ustore"
 path = "rust/lib.rs"
 
-# The `ram` engine always builds; each feature adds its engine to the one library, and without it the engine's
+# The `ram` engine always builds; each engine feature adds its engine to the one library, and without it the engine's
 # `Database::open_*` fails with `Status::Unsupported`.
 [features]
 default = ["rocksdb", "leveldb", "nvme"]
 leveldb = []
 nvme = []
 rocksdb = []
+# Reads documents straight into `serde` types.
+serde = ["dep:serde", "jsontape/serde"]
+
+[dependencies]
+jsontape = "0.1.4"
+serde = { version = "1", optional = true }
+stringtape = "2.5.0"
 
 [build-dependencies]
 cmake = "0.1"

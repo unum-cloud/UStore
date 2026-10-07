@@ -69,6 +69,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         let enabled = feature.is_some_and(feature_enabled);
         build.define(*option, if enabled { "ON" } else { "OFF" });
     }
+    // Checkouts the environment names stand in for the nested submodules and the downloads.
+    for (name, value) in env::vars() {
+        if name.starts_with("FETCHCONTENT_SOURCE_DIR_") {
+            println!("cargo:rerun-if-env-changed={name}");
+            build.define(name, value);
+        }
+    }
 
     // fmt suffixes its Debug archive with `d`.
     let fmt = if build.get_profile() == "Debug" {
