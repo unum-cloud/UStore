@@ -39,10 +39,10 @@ typedef struct ustore_strings_write_t {
     /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
     /** Transaction the writes join, where @c NULL writes to the head. */
@@ -71,17 +71,17 @@ typedef struct ustore_strings_write_t {
 
     /** Optional starts of the values within the chunks of @c values, which may skip the header of a runtime
      *  object, where @c NULL starts every value at its chunk. */
-    ustore_length_t const* values_starts;
+    ustore_length_t const* starts;
 
-    /** Bytes between consecutive value starts, where zero repeats the first one. */
-    ustore_size_t values_starts_stride;
+    /** Bytes between consecutive starts, where zero repeats the first one. */
+    ustore_size_t starts_stride;
 
     /** Optional lengths of the values; without them every value ends where the next one starts, reading one start
-     *  past the last value, or at a null terminator when @c values_starts is absent too. */
-    ustore_length_t const* values_lengths;
+     *  past the last value, or at a null terminator when @c starts is absent too. */
+    ustore_length_t const* lengths;
 
-    /** Bytes between consecutive value lengths, where zero repeats the first one. */
-    ustore_size_t values_lengths_stride;
+    /** Bytes between consecutive lengths, where zero repeats the first one. */
+    ustore_size_t lengths_stride;
 
     /** Pointers to the chunks holding the values, @c NULL only when there are no tasks. */
     ustore_bytes_cptr_t const* values;
@@ -89,7 +89,7 @@ typedef struct ustore_strings_write_t {
     /** Bytes between consecutive chunk pointers, where zero repeats the first one. */
     ustore_size_t values_stride;
 
-    /** How durable the writes are once the call completes at the head; a transaction's commit decides its own. */
+    /** How durable the writes are once the call finishes at the head; a transaction's commit decides its own. */
     ustore_durability_t durability;
 
     /** Whether the @c transaction records the buckets it reads and writes for conflicts. */
@@ -112,10 +112,10 @@ typedef struct ustore_strings_remove_t {
     /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
     /** Transaction the removals join, where @c NULL removes at the head. */
@@ -142,7 +142,7 @@ typedef struct ustore_strings_remove_t {
     /** Bytes between consecutive string lengths, where zero repeats the first one. */
     ustore_size_t strings_lengths_stride;
 
-    /** How durable the removals are once the call completes at the head; a transaction's commit decides its own. */
+    /** How durable the removals are once the call finishes at the head; a transaction's commit decides its own. */
     ustore_durability_t durability;
 
     /** Whether the @c transaction records the buckets it reads and writes for conflicts. */
@@ -169,13 +169,13 @@ typedef struct ustore_strings_read_t {
     /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
-    /** What the read sees, where @c NULL is the head. */
+    /** What the call sees, where @c NULL is the head. */
     ustore_view_t view;
 
     /** Number of tasks, one per string. */
@@ -239,13 +239,13 @@ typedef struct ustore_strings_scan_t {
     /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
-    /** What the scan sees, where @c NULL is the head. */
+    /** What the call sees, where @c NULL is the head. */
     ustore_view_t view;
 
     /** Number of scans. */

@@ -15,23 +15,22 @@ The `*.hpp` headers beside them wrap the same calls in C++ with RAII handles, ba
 | `graph.h`   | Graph edges and vertices                                                                          |
 | `pages.h`   | Ordered documents: one verb per edit, `ustore_pages_read` and `ustore_pages_history`              |
 
-| Header                   | Declares                                                     |
-| :----------------------- | :----------------------------------------------------------- |
-| `ustore.hpp`             | Every C++ header below                                       |
-| `db.hpp`                 | `database_t`, and `context_t` with its `transaction_t` alias |
-| `blobs_collection.hpp`   | Binary collections                                           |
-| `blobs_ref.hpp`          | Batched references to binary values                          |
-| `blobs_range.hpp`        | Key ranges                                                   |
-| `docs_collection.hpp`    | Document collections                                         |
-| `docs_ref.hpp`           | Batched references to documents                              |
-| `docs_table.hpp`         | Gathered tables                                              |
-| `graph_collection.hpp`   | Graph collections                                            |
-| `graph_stream.hpp`       | Adjacency streams                                            |
-| `strings_collection.hpp` | String-keyed collections and their prefix walks              |
-| `status.hpp`             | `status_code_t`, `status_t` and `expected`                   |
-| `types.hpp`              | Value views and arenas                                       |
-| `ranges.hpp`             | Strided ranges                                               |
-| `ranges_args.hpp`        | Argument adapters                                            |
+| Header                   | Declares                                                  |
+| :----------------------- | :-------------------------------------------------------- |
+| `ustore.hpp`             | Every C++ header below                                    |
+| `db.hpp`                 | `database_t`, `transaction_t`, `snapshot_t` and receivers |
+| `blobs_collection.hpp`   | Binary collections                                        |
+| `blobs_ref.hpp`          | Batched references to binary values                       |
+| `blobs_range.hpp`        | Key ranges                                                |
+| `docs_collection.hpp`    | Document collections                                      |
+| `docs_ref.hpp`           | Batched references to documents                           |
+| `docs_table.hpp`         | Gathered tables                                           |
+| `graph_collection.hpp`   | Graph collections                                         |
+| `graph_stream.hpp`       | Adjacency streams                                         |
+| `strings_collection.hpp` | String-keyed collections and their prefix walks           |
+| `status.hpp`             | `status_code_t`, `status_t` and `expected`                |
+| `types.hpp`              | Value views and arenas                                    |
+| `ranges.hpp`             | Strided ranges and argument adapters                      |
 
 ## Installation
 
@@ -70,7 +69,9 @@ ustore_arena_t arena = NULL;
 ### Executors, Blocking and Deferred Calls
 
 An executor owns the threads that run calls and the scratch they use, and a `NULL` executor runs a call on the calling thread.
-A call blocks by default and returns with its outcome final, while `ustore_completion_deferred_k` returns once the call is queued:
+`ustore_executor_for_ram` spawns its threads, every core for zero, and holds up to `deferred_limit` deferred calls at once, 256 for zero.
+`ustore_executor_on_pool` borrows a ForkUnion pool another library owns and claims it through `fu_pool_claim` around every batch, so the lender and every other library on that pool claim it around their own dispatches too.
+A call blocks by default and returns with its outcome final, while `ustore_completion_deferred_k` returns once the call is submitted:
 
 ```c
 ustore_executor_for_ram(&(ustore_executor_for_ram_t){.executor = &executor, .outcome = &outcome, .threads = 0});
@@ -84,8 +85,14 @@ for (size_t i = 0; i != 4; ++i) {
 for (size_t i = 0; i != 4; ++i) ustore_outcome_wait(&outcomes[i]);
 ```
 
-A deferred call's status reads `ustore_status_pending_k` until it ends; the library then stores the message and the final status with release ordering and touches nothing the struct names after that, and the caller reads it with acquire ordering, by waiting or polling.
-Calls on one executor run in submission order, and a deferred submission that finds the executor's in-flight table full finishes at once with `ustore_status_contended_k`.
+A deferred call's status reads `ustore_status_deferred_k` until it finishes; the library then stores the message and the final status with release ordering and touches nothing the struct names after that, and the caller reads it with acquire ordering, by waiting or polling.
+Calls on one executor start in submission order, and a blocking call runs alone: after every call submitted before it finishes, and before any submitted after it starts.
+A blocking call on an executor runs on the calling thread, while deferred calls run in batches on the executor's threads.
+`ustore_executor_drain` waits for every call submitted before it began, and sets whether the threads park or spin once idle.
+A call is refused with `ustore_status_contended_k` rather than waited for when the executor's deferred table is full, when its arena or its transaction serves another call, or when it drains or blocks from a callback its own executor runs.
+Freeing a database, transaction or snapshot waits until every deferred call naming it finishes, so a binding may drop its handle before those calls finish, but never from a callback of one of them.
+A progress callback never waits on a call its own executor has not finished, and reads the status instead.
+The C++ wrappers and the Rust and Python bindings choose the executor and the completion by receiver, as `database.on(executor)` and `database.deferred(executor)`, so blocking calls read as they would without executors; the Design sections of `rust/README.md` and `python/README.md` state the rules every binding keeps.
 A call stops early only when its progress callback returns `ustore_cancel_k`.
 
 ### Opening the Database
@@ -129,14 +136,14 @@ ustore_collection_drop(&(ustore_collection_drop_t){
     .database = database,
     .outcome = &outcome,
     .collection = movies,
-    .mode = ustore_drop_keys_vals_handle_k,
+    .mode = ustore_drop_collection_k,
 });
 ```
 
 Each engine records names apart from every collection, so no identifier reaches them, and a name resolves in two phases: once through `ustore_collection_find`, which answers the identifier and the modality of every name of a batch at the head or at a snapshot, and by identifier from then on, as no other call carries one.
 Collections are created and dropped only at the head, so their names are never read inside a transaction, and resolving one never joins the conflicts of the work that follows it.
 A create records the name in the same step as the collection, refusing a name another collection carries even under a concurrent creator.
-The main collection is never removed, so only `ustore_drop_keys_vals_k` and `ustore_drop_vals_k` apply to it, and dropping any other collection whole forgets its name before the collection goes.
+The main collection is never removed, so only `ustore_drop_pairs_k` and `ustore_drop_values_k` apply to it, and dropping any other collection whole forgets its name before the collection goes.
 `ustore_collection_list` exports the identifier of every other collection and, where asked, its modality and its name, which is empty for a collection created without one.
 A listing describes the database rather than a transaction, so it reads the head or a snapshot.
 
@@ -250,7 +257,7 @@ ustore_scan(&(ustore_scan_t){
 ```
 
 The next page starts from the key right after the last exported one, its 16 bytes incremented as one big-endian integer, and a `ustore_read` of the found keys fetches their values.
-`ustore_scan_bulk_k` trades key order for throughput, `ustore_sample` draws keys uniformly at random, and `ustore_measure` bounds the cardinality, value bytes and disk usage between two keys from below and above.
+`ustore_scan_unordered_k` trades key order for throughput, `ustore_sample` draws keys uniformly at random, and `ustore_measure` bounds the cardinality, value bytes and disk usage between two keys from below and above.
 
 ### Transactions and Views
 
@@ -278,8 +285,10 @@ ustore_transaction_commit(&(ustore_transaction_commit_t){
 ustore_transaction_free(transaction);
 ```
 
-A failed commit keeps the contents of the transaction for a retry, and `ustore_transaction_rollback` drops them while keeping the handle.
-`ustore_transaction_stage` stages the transaction for a two-phase commit, and both calls can export the `ustore_stamp_t` they took.
+A failed commit keeps the contents of the transaction for a retry.
+`ustore_transaction_rollback` withdraws a stage, releasing whatever it claimed, while keeping the reads and writes, so the transaction can stage again or be reset through `ustore_transaction_init`.
+`ustore_transaction_stage` stages the transaction for a two-phase commit and can export its `read_stamp`, the `ustore_stamp_t` the transaction reads at and its commit validates against.
+A commit can export its `commit_stamp`, its position in commit order, which every snapshot at or above it sees, and is never below the stage's `read_stamp`.
 
 ### Snapshots
 
@@ -299,7 +308,8 @@ ustore_read(&(ustore_read_t){
 ustore_snapshot_free(snapshot);
 ```
 
-A snapshot lives no longer than the process that took it, and is freed before its database closes.
+`ustore_snapshot_init` can export its `read_stamp`, the stamp the snapshot reads at, which LevelDB, keeping its sequence numbers private, reports as zero.
+A snapshot lives no longer than the process that took it, and holds its database open until freed, as a transaction does, so `ustore_database_free` closes the database only once the last of them is freed.
 `ustore_snapshot_export` writes one out as a new database under a directory, which is how a view outlives the process.
 TODO: persistent snapshots, recorded in the catalog under UUIDv7 identifiers and kept across restarts until dropped.
 
@@ -321,8 +331,8 @@ ustore_docs_write(&(ustore_docs_write_t){
     .database = database,
     .outcome = &outcome,
     .count = 1,
-    .type = ustore_doc_field_json_k,
-    .modification = ustore_doc_modify_upsert_k,
+    .type = ustore_docs_field_json_k,
+    .modification = ustore_docs_modify_upsert_k,
     .keys = &key,
     .values = (ustore_bytes_cptr_t const*)&document,
     .lengths = &document_length,
@@ -334,7 +344,7 @@ ustore_byte_t* person = NULL;
 ustore_docs_read(&(ustore_docs_read_t){
     .database = database,
     .outcome = &outcome,
-    .type = ustore_doc_field_str_k,
+    .type = ustore_docs_field_str_k,
     .count = 1,
     .keys = &key,
     .fields = &field,
@@ -348,11 +358,11 @@ ustore_docs_read(&(ustore_docs_read_t){
 
 A graph collection stores edges as triplets of a source, a target and an edge identifier, indexed from both ends.
 The graph calls address a collection created with `ustore_modality_graph_k`, which the in-memory engine keeps apart from every collection of values.
-Several edges between the same two vertices need distinct edge identifiers, and an edge without one gets `ustore_default_edge_id_k`.
+Several edges between the same two vertices need distinct edge identifiers, and an edge without one gets `ustore_edge_id_default_k`.
 
-- `ustore_graph_upsert_edges` adds edges together with their vertices.
-- `ustore_graph_upsert_vertices` adds vertices without edges.
-- `ustore_graph_find_edges` exports the degree and the edges of every requested vertex in the requested role.
+- `ustore_graph_write_edges` adds edges together with their vertices.
+- `ustore_graph_write_vertices` adds vertices without edges.
+- `ustore_graph_read_edges` exports the degree and the edges of every requested vertex in the requested role.
 - `ustore_graph_remove_edges` removes edges and keeps their vertices.
 - `ustore_graph_remove_vertices` removes vertices together with all their edges.
 
@@ -375,7 +385,7 @@ triplet_t triplets[2] = {
     {{.uuid.bytes[15] = 1}, {.uuid.bytes[15] = 2}, {.uuid.bytes[15] = 9}},
     {{.uuid.bytes[15] = 2}, {.uuid.bytes[15] = 3}, {.uuid.bytes[15] = 10}},
 };
-ustore_graph_upsert_edges(&(ustore_graph_upsert_edges_t){
+ustore_graph_write_edges(&(ustore_graph_write_edges_t){
     .database = database,
     .outcome = &outcome,
     .count = 2,
@@ -392,7 +402,7 @@ ustore_key_t vertex = {.uuid.bytes[15] = 2};
 ustore_vertex_role_t role = ustore_vertex_role_any_k;
 ustore_vertex_degree_t degree = 0;
 ustore_key_t* edges = NULL;
-ustore_graph_find_edges(&(ustore_graph_find_edges_t){
+ustore_graph_read_edges(&(ustore_graph_read_edges_t){
     .database = database,
     .outcome = &outcome,
     .count = 1,
@@ -407,7 +417,7 @@ ustore_graph_find_edges(&(ustore_graph_find_edges_t){
 
 Every found edge takes three keys of `edges`: its source, its target and its identifier.
 Outgoing edges come first, sorted by target, then incoming edges, sorted by source, and a missing vertex has the degree `ustore_vertex_degree_missing_k`.
-Roles matter only in directed graphs, where `ustore_vertex_source_k` and `ustore_vertex_target_k` select one direction.
+Roles matter only in directed graphs, where `ustore_vertex_role_source_k` and `ustore_vertex_role_target_k` select one direction.
 
 ### Pages
 
@@ -422,13 +432,13 @@ Everything lives in `unum::ustore`, and `#include <ustore/ustore.hpp>` brings in
 Fallible calls return a `status_t`, a `status_code_t` beside a static message, or an `expected` that holds either a value or the `status_t` explaining its absence; both are `[[nodiscard]]`.
 Dereferencing an `expected<value_type>` yields the `value_type`, and `auto [value, status]` decomposes one whose value is default constructible.
 `key_from_integer` spells a non-negative integer as a key, and `key_after` answers the key right after another.
-Nothing copies values out of the arena, and the few calls that throw are marked `noexcept(false)`.
+Nothing copies values out of the arena, and nothing throws.
 
 ```cpp
 using namespace unum::ustore;
 
-database_t db;
-if (status_t const status = db.open(); status.failed())
+auto [db, status] = database_t::open_ram();
+if (status.failed())
     std::fprintf(stderr, "%s\n", status.message);
 ```
 
@@ -446,7 +456,7 @@ bool const matches = value && *value == "purpose of life";
 status = main[{key_from_integer(43), key_from_integer(44)}].assign("same value");
 auto present = main[{key_from_integer(43), key_from_integer(44)}].present();
 auto lengths = main[{key_from_integer(43), key_from_integer(44)}].length();
-status = main[key_from_integer(43)].erase();
+status = main[key_from_integer(43)].remove();
 
 std::array<ustore_key_t, 3> keys {key_from_integer(65), key_from_integer(66), key_from_integer(67)};
 auto values = main[keys].value();
@@ -455,20 +465,20 @@ for (value_view_t found : *values)
 ```
 
 A single key yields a `value_view_t`, a `bool` presence and a length, while a batch yields `embedded_blobs_t`, `bits_span_t` and a range of lengths.
-`erase` removes the keys, while `clear` keeps them and empties their values.
-`keys` and `items` range over a collection in key order, and `size_range` estimates how many keys it holds.
+`remove` removes the keys, while `clear_values` keeps them and empties their values.
+`keys` and `pairs` range over a collection in key order from a `start_key` to an `end_key`, and `size_range` estimates how many keys it holds.
 
 ### Named Collections and Transactions
 
 ```cpp
 expected<docs_collection_t> people = db.find_or_create<docs_collection_t>("people");
 
-expected<transaction_t> transaction = db.transact();
+expected<transaction_t> transaction = db.transaction();
 blobs_collection_t inside = transaction->main();
 status = inside[key_from_integer(42)].assign("written inside a transaction");
 status = transaction->commit();
 
-expected<context_t> snapshot = db.snapshot();
+expected<snapshot_t> snapshot = db.snapshot();
 auto pinned = snapshot->main()[key_from_integer(42)].value();
 ```
 
@@ -496,7 +506,7 @@ status_t status = people[key_from_integer(1)].assign(R"({"person": "Alice", "age
 status = people[key_from_integer(2)].assign(R"({"person": "Bob", "age": "27", "weight": 2})");
 
 expected<value_view_t> document = people[key_from_integer(1)].value();
-expected<value_view_t> person = people[collection_key_field_t {key_from_integer(1), "/person"}].value(ustore_doc_field_str_k);
+expected<value_view_t> person = people[collection_key_field_t {key_from_integer(1), "/person"}].value(ustore_docs_field_str_k);
 
 status = people[key_from_integer(1)].patch(R"([{"op": "replace", "path": "/age", "value": 28}])");
 status = people[key_from_integer(2)].merge(R"({"weight": null})");
@@ -528,9 +538,9 @@ A header whose column types are known only at runtime views an array of `field_t
 
 ```cpp
 field_type_t const columns[] = {
-    {"age", ustore_doc_field_i32_k},
-    {"age", ustore_doc_field_str_k},
-    {"person", ustore_doc_field_str_k},
+    {"age", ustore_docs_field_i32_k},
+    {"age", ustore_docs_field_str_k},
+    {"person", ustore_docs_field_str_k},
 };
 auto dynamic = people[keys].gather(make_table_header(columns));
 auto names = dynamic->column(2).as<std::string_view>();
@@ -544,15 +554,15 @@ A `graph_collection_t` batches edges and vertices, and can be used from inside a
 
 ```cpp
 auto [graph, status] = db.create<graph_collection_t>("graph", ustore_modality_graph_k);
-status = graph.upsert_edge(edge_t {key_from_integer(1), key_from_integer(2), key_from_integer(9)});
+status = graph.write_edge(edge_t {key_from_integer(1), key_from_integer(2), key_from_integer(9)});
 
 std::array<edge_t, 2> triplets {edge_t {key_from_integer(2), key_from_integer(3), key_from_integer(10)}, edge_t {key_from_integer(3), key_from_integer(4), key_from_integer(11)}};
-status = graph.upsert_edges(edges(triplets));
+status = graph.write_edges(edges(triplets));
 
 expected<ustore_vertex_degree_t> degree = graph.degree(key_from_integer(2));
 auto successors = graph.successors(key_from_integer(2));
 auto between = graph.edges_between(key_from_integer(1), key_from_integer(2));
-auto touching = graph.edges_containing(key_from_integer(3), ustore_vertex_target_k);
+auto touching = graph.read_edges(key_from_integer(3), ustore_vertex_role_target_k);
 ```
 
 `edges` streams every edge of the collection, and `vertex_stream` every vertex, both reading ahead in batches.

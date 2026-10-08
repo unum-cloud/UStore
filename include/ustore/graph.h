@@ -24,7 +24,7 @@ extern "C" {
 #pragma region Constants
 
 /** The edge identifier of an edge that was given none, every bit of it set like @c ustore_key_unknown_k. */
-extern ustore_key_t const ustore_default_edge_id_k;
+extern ustore_key_t const ustore_edge_id_default_k;
 
 /** The role a vertex plays in an edge, where undirected graphs use @c ustore_vertex_role_any_k.
  *  In a joining graph the members of each collection must stay either sources or targets. */
@@ -34,10 +34,10 @@ typedef enum ustore_vertex_role_t {
     ustore_vertex_role_unknown_k = 0,
 
     /** The vertex an edge leaves. */
-    ustore_vertex_source_k = 1,
+    ustore_vertex_role_source_k = 1,
 
     /** The vertex an edge enters. */
-    ustore_vertex_target_k = 2,
+    ustore_vertex_role_target_k = 2,
 
     /** Either end of an edge. */
     ustore_vertex_role_any_k = 3,
@@ -55,14 +55,14 @@ extern ustore_vertex_degree_t const ustore_vertex_degree_missing_k;
 #pragma region Edges
 
 /**
- *  @brief The arguments of @c ustore_graph_find_edges, which exports the degree and the edges of every vertex.
+ *  @brief The arguments of @c ustore_graph_read_edges, which exports the degree and the edges of every vertex.
  *
  *  Every edge takes three keys on the tape: the source, the target and the edge identifier. Edges of
  *  one vertex in one role come sorted by neighbor; with both roles the outgoing edges, sorted by
  *  target, precede the incoming ones, sorted by source. Whether a vertex exists is cheaper to ask
  *  from @c ustore_read on the same collection.
  */
-typedef struct ustore_graph_find_edges_t {
+typedef struct ustore_graph_read_edges_t {
 
     /** An open database. */
     ustore_database_t database;
@@ -70,13 +70,13 @@ typedef struct ustore_graph_find_edges_t {
     /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
-    /** What the read sees, where @c NULL is the head. */
+    /** What the call sees, where @c NULL is the head. */
     ustore_view_t view;
 
     /** Number of vertices. */
@@ -88,7 +88,7 @@ typedef struct ustore_graph_find_edges_t {
     /** Bytes between consecutive collections, where zero repeats the first one. */
     ustore_size_t collections_stride;
 
-    /** Vertices whose edges are found. */
+    /** Vertices whose edges are read. */
     ustore_key_t const* vertices;
 
     /** Bytes between consecutive vertices, where zero repeats the first one. */
@@ -112,16 +112,16 @@ typedef struct ustore_graph_find_edges_t {
     /** Memory for @c edges_per_vertex: reused when it points to an arena, created when it points to @c NULL. */
     ustore_arena_t* arena;
 
-} ustore_graph_find_edges_t;
+} ustore_graph_read_edges_t;
 
 /**
- *  @brief Finds the edges connected to a batch of vertices.
+ *  @brief Reads the edges connected to a batch of vertices.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-USTORE_EXPORT void ustore_graph_find_edges(ustore_graph_find_edges_t* arguments);
+USTORE_EXPORT void ustore_graph_read_edges(ustore_graph_read_edges_t* arguments);
 
-/** The arguments of @c ustore_graph_upsert_edges. */
-typedef struct ustore_graph_upsert_edges_t {
+/** The arguments of @c ustore_graph_write_edges. */
+typedef struct ustore_graph_write_edges_t {
 
     /** An open database. */
     ustore_database_t database;
@@ -129,10 +129,10 @@ typedef struct ustore_graph_upsert_edges_t {
     /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
     /** Transaction the edits join, where @c NULL writes to the head. */
@@ -165,19 +165,19 @@ typedef struct ustore_graph_upsert_edges_t {
     /** Bytes between consecutive targets, where zero repeats the first one. */
     ustore_size_t targets_stride;
 
-    /** How durable the edits are once the call completes at the head; a transaction's commit decides its own. */
+    /** How durable the edits are once the call finishes at the head; a transaction's commit decides its own. */
     ustore_durability_t durability;
 
     /** Whether the @c transaction records the vertices it reads and writes for conflicts. */
     ustore_watch_t watch;
 
-} ustore_graph_upsert_edges_t;
+} ustore_graph_write_edges_t;
 
 /**
- *  @brief Inserts a batch of edges between existing or new vertices.
+ *  @brief Writes a batch of edges between existing or new vertices.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-USTORE_EXPORT void ustore_graph_upsert_edges(ustore_graph_upsert_edges_t* arguments);
+USTORE_EXPORT void ustore_graph_write_edges(ustore_graph_write_edges_t* arguments);
 
 /** The arguments of @c ustore_graph_remove_edges. */
 typedef struct ustore_graph_remove_edges_t {
@@ -188,10 +188,10 @@ typedef struct ustore_graph_remove_edges_t {
     /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
     /** Transaction the edits join, where @c NULL writes to the head. */
@@ -224,7 +224,7 @@ typedef struct ustore_graph_remove_edges_t {
     /** Bytes between consecutive targets, where zero repeats the first one. */
     ustore_size_t targets_stride;
 
-    /** How durable the edits are once the call completes at the head; a transaction's commit decides its own. */
+    /** How durable the edits are once the call finishes at the head; a transaction's commit decides its own. */
     ustore_durability_t durability;
 
     /** Whether the @c transaction records the vertices it reads and writes for conflicts. */
@@ -242,8 +242,8 @@ USTORE_EXPORT void ustore_graph_remove_edges(ustore_graph_remove_edges_t* argume
 
 #pragma region Vertices
 
-/** The arguments of @c ustore_graph_upsert_vertices. */
-typedef struct ustore_graph_upsert_vertices_t {
+/** The arguments of @c ustore_graph_write_vertices. */
+typedef struct ustore_graph_write_vertices_t {
 
     /** An open database. */
     ustore_database_t database;
@@ -251,10 +251,10 @@ typedef struct ustore_graph_upsert_vertices_t {
     /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
     /** Transaction the edits join, where @c NULL writes to the head. */
@@ -275,19 +275,19 @@ typedef struct ustore_graph_upsert_vertices_t {
     /** Bytes between consecutive vertices, where zero repeats the first one. */
     ustore_size_t vertices_stride;
 
-    /** How durable the edits are once the call completes at the head; a transaction's commit decides its own. */
+    /** How durable the edits are once the call finishes at the head; a transaction's commit decides its own. */
     ustore_durability_t durability;
 
     /** Whether the @c transaction records the vertices it reads and writes for conflicts. */
     ustore_watch_t watch;
 
-} ustore_graph_upsert_vertices_t;
+} ustore_graph_write_vertices_t;
 
 /**
- *  @brief Inserts a batch of vertices without edges, keeping those already present.
+ *  @brief Writes a batch of vertices without edges, keeping those already present.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
-USTORE_EXPORT void ustore_graph_upsert_vertices(ustore_graph_upsert_vertices_t* arguments);
+USTORE_EXPORT void ustore_graph_write_vertices(ustore_graph_write_vertices_t* arguments);
 
 /** The arguments of @c ustore_graph_remove_vertices. */
 typedef struct ustore_graph_remove_vertices_t {
@@ -298,10 +298,10 @@ typedef struct ustore_graph_remove_vertices_t {
     /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
     /** Transaction the edits join, where @c NULL writes to the head. */
@@ -328,7 +328,7 @@ typedef struct ustore_graph_remove_vertices_t {
     /** Bytes between consecutive roles, where zero repeats the first one. */
     ustore_size_t roles_stride;
 
-    /** How durable the edits are once the call completes at the head; a transaction's commit decides its own. */
+    /** How durable the edits are once the call finishes at the head; a transaction's commit decides its own. */
     ustore_durability_t durability;
 
     /** Whether the @c transaction records the vertices it reads and writes for conflicts. */

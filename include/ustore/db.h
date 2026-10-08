@@ -26,13 +26,13 @@ extern "C" {
 typedef struct ustore_database_handle_t* ustore_database_t;
 
 /** An opaque handle to a point-in-time state of the whole database, which reads address through
- *  @c ustore_snapshot_view. Short-lived: it pins the versions its reads need until @c ustore_snapshot_free,
- *  and is freed before its database closes. */
+ *  @c ustore_snapshot_view. Short-lived: it pins the versions its reads need and holds its database open until
+ *  @c ustore_snapshot_free. */
 typedef struct ustore_snapshot_handle_t* ustore_snapshot_t;
 
 /** An opaque handle to an optimistic transaction that groups operations across collections and
- *  modalities. Not thread-safe: it has at most one call in flight, and is freed with
- *  @c ustore_transaction_free before its database closes. */
+ *  modalities. It serves one call at a time, so a call on a transaction that serves an unfinished one finishes
+ *  with @c ustore_status_contended_k, and holds its database open until @c ustore_transaction_free. */
 typedef struct ustore_transaction_handle_t* ustore_transaction_t;
 
 /**
@@ -81,7 +81,8 @@ typedef uint64_t ustore_length_t;
 /** The smallest bitset, holding eight bits. */
 typedef uint8_t ustore_octet_t;
 
-/** The position of a commit in the order commits apply in, which grows with every commit. */
+/** A position in the order commits apply in, which grows with every commit: where a commit landed, or the newest
+ *  commit a transaction or a snapshot reads. */
 typedef uint64_t ustore_stamp_t;
 
 /** A string the caller owns and the database never frees. */
@@ -96,7 +97,7 @@ typedef uint8_t* ustore_bytes_ptr_t;
 /** A pointer to read-only bytes. */
 typedef uint8_t const* ustore_bytes_cptr_t;
 
-/** How durable the writes a call publishes are once the call completes. */
+/** How durable the writes a call publishes are once the call finishes. */
 typedef enum ustore_durability_t {
 
     /** The writes are visible, and reach the disk as the engine's buffers fill. */
@@ -126,21 +127,21 @@ typedef enum ustore_scan_mode_t {
     ustore_scan_ordered_k = 0,
 
     /** Keys may come out of order, deleted or repeated, to speed up the read after the scan; has no effect yet. */
-    ustore_scan_bulk_k = 1,
+    ustore_scan_unordered_k = 1,
 
 } ustore_scan_mode_t;
 
 /** What dropping a collection removes. */
 typedef enum ustore_drop_mode_t {
 
-    /** The collection handle together with all of its contents. */
-    ustore_drop_keys_vals_handle_k = 0,
+    /** The collection together with its name and every pair it holds. */
+    ustore_drop_collection_k = 0,
 
     /** Every key and value, keeping the collection. */
-    ustore_drop_keys_vals_k = 1,
+    ustore_drop_pairs_k = 1,
 
     /** Every value, keeping the keys. */
-    ustore_drop_vals_k = 2,
+    ustore_drop_values_k = 2,
 
 } ustore_drop_mode_t;
 
@@ -148,18 +149,18 @@ typedef enum ustore_drop_mode_t {
 typedef enum ustore_capabilities_t {
 
     /** The engine supports transactions. */
-    ustore_supports_transactions_k = 1,
+    ustore_capabilities_transactions_k = 1,
 
     /** The engine supports collections beyond the main one. */
-    ustore_supports_collections_k = 2,
+    ustore_capabilities_collections_k = 2,
 
     /** The engine supports snapshots. */
-    ustore_supports_snapshots_k = 4,
+    ustore_capabilities_snapshots_k = 4,
 
 } ustore_capabilities_t;
 
-/** The collection every database holds, named by the nil UUID, which @c ustore_drop_keys_vals_k and
- *  @c ustore_drop_vals_k may only clear. */
+/** The collection every database holds, named by the nil UUID, which @c ustore_drop_pairs_k and
+ *  @c ustore_drop_values_k may only clear. */
 extern ustore_collection_id_t const ustore_collection_main_k;
 
 /** The length reported for a missing value. */
@@ -220,13 +221,13 @@ typedef struct ustore_database_init_ram_t {
     /** Output for the opened database, left @c NULL on failure. */
     ustore_database_t* database;
 
-    /** Executor that runs the open, where @c NULL runs it on the calling thread. */
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
     /** Directory the database persists in as one image, or null to keep it in memory alone. */
@@ -249,13 +250,13 @@ typedef struct ustore_database_init_rocksdb_t {
     /** Output for the opened database, left @c NULL on failure. */
     ustore_database_t* database;
 
-    /** Executor that runs the open, where @c NULL runs it on the calling thread. */
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
     /** Directory of the database, which must exist. */
@@ -278,13 +279,13 @@ typedef struct ustore_database_init_leveldb_t {
     /** Output for the opened database, left @c NULL on failure. */
     ustore_database_t* database;
 
-    /** Executor that runs the open, where @c NULL runs it on the calling thread. */
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
     /** Directory of the database, which must exist. */
@@ -301,14 +302,15 @@ typedef struct ustore_database_init_nvme_t {
     /** Output for the opened database, left @c NULL on failure. */
     ustore_database_t* database;
 
-    /** Executor of @c ustore_executor_for_nvme that runs the open, then the background flushes and compactions,
-     *  borrowed until @c ustore_database_free, where @c NULL spawns one with that call's defaults. */
+    /** Executor that runs the call, then the background flushes and compactions, made by
+     *  @c ustore_executor_for_nvme and borrowed until the database closes, where @c NULL spawns one with that
+     *  call's defaults. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
     /** Directory of the database's own files, which must exist. */
@@ -338,7 +340,7 @@ typedef struct ustore_database_init_nvme_t {
     /** I/O channels the threads share beyond their own. */
     ustore_size_t shared_io_channels;
 
-    /** Submissions a channel keeps in flight. */
+    /** Submissions a channel holds at once. */
     ustore_size_t queue_depth;
 
     /** Bytes of each request buffer of a channel. */
@@ -405,10 +407,10 @@ typedef struct ustore_database_describe_t {
     /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
     /** Output for the description, filled whole. */
@@ -437,10 +439,10 @@ typedef struct ustore_database_control_t {
     /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
     /** The request as a null-terminated string. */
@@ -482,11 +484,14 @@ typedef struct ustore_snapshot_init_t {
     /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
+
+    /** Optional output for the stamp the snapshot reads at. */
+    ustore_stamp_t* read_stamp;
 
 } ustore_snapshot_init_t;
 
@@ -502,13 +507,13 @@ typedef struct ustore_snapshot_export_t {
     /** An open database. */
     ustore_database_t database;
 
-    /** Executor that runs the export, where @c NULL runs it on the calling thread. */
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
     /** The snapshot to export. */
@@ -579,10 +584,10 @@ typedef struct ustore_collection_list_t {
     /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
     /** Optional snapshot whose collections are listed, where @c NULL lists the head. */
@@ -634,10 +639,10 @@ typedef struct ustore_collection_create_t {
     /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
     /** Optional name no other collection carries, where @c NULL creates a collection without one. */
@@ -676,10 +681,10 @@ typedef struct ustore_collection_find_t {
     /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
     /** Optional snapshot whose names are read, where @c NULL reads the head. */
@@ -734,10 +739,10 @@ typedef struct ustore_collection_drop_t {
     /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
     /** Identifier of an existing collection. */
@@ -770,10 +775,10 @@ typedef struct ustore_transaction_init_t {
     /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
 } ustore_transaction_init_t;
@@ -799,20 +804,20 @@ typedef struct ustore_transaction_stage_t {
     /** An open database. */
     ustore_database_t database;
 
-    /** Executor that runs the stage, where @c NULL runs it on the calling thread. */
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
     /** An initialized transaction. */
     ustore_transaction_t transaction;
 
-    /** Optional output for the stamp the stage took. */
-    ustore_stamp_t* stamp;
+    /** Optional output for the stamp the transaction reads at, which its commit validates against. */
+    ustore_stamp_t* read_stamp;
 
 } ustore_transaction_stage_t;
 
@@ -829,22 +834,22 @@ typedef struct ustore_transaction_commit_t {
     /** An open database. */
     ustore_database_t database;
 
-    /** Executor that runs the commit, where @c NULL runs it on the calling thread. */
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
     /** An initialized transaction, staged first when the caller did not. */
     ustore_transaction_t transaction;
 
-    /** Optional output for the stamp the commit published under. */
-    ustore_stamp_t* stamp;
+    /** Optional output for the commit's position in commit order, visible to every snapshot at or above it. */
+    ustore_stamp_t* commit_stamp;
 
-    /** How durable the writes are once the commit completes. */
+    /** How durable the writes are once the commit finishes. */
     ustore_durability_t durability;
 
 } ustore_transaction_commit_t;
@@ -864,10 +869,10 @@ typedef struct ustore_transaction_rollback_t {
     /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
     /** A transaction, staged or not. */
@@ -876,8 +881,8 @@ typedef struct ustore_transaction_rollback_t {
 } ustore_transaction_rollback_t;
 
 /**
- *  @brief Withdraws a stage, releasing its stamp and whatever it claimed, while keeping the reads and writes, so
- *      the transaction can stage again or be reset through @c ustore_transaction_init.
+ *  @brief Withdraws a stage, releasing whatever it claimed, while keeping the reads and writes, so the transaction
+ *      can stage again or be reset through @c ustore_transaction_init.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
 USTORE_EXPORT void ustore_transaction_rollback(ustore_transaction_rollback_t* arguments);
@@ -887,19 +892,22 @@ USTORE_EXPORT void ustore_transaction_rollback(ustore_transaction_rollback_t* ar
 #pragma region Memory Reclamation
 
 /**
- *  @brief Resets a transaction and frees its memory, along with every view of it.
+ *  @brief Waits until every deferred call naming the transaction finishes, then resets it and frees its memory with
+ *      every view of it.
  *  @param[inout] transaction The transaction to be freed; @c NULL is safe.
  */
 USTORE_EXPORT void ustore_transaction_free(ustore_transaction_t transaction);
 
 /**
- *  @brief Releases a snapshot, unpinning the versions only it kept, and frees its memory with every view of it.
+ *  @brief Waits until every deferred call naming the snapshot finishes, then releases it, unpinning the versions
+ *      only it kept, and frees its memory with every view of it.
  *  @param[inout] snapshot The snapshot to be freed; @c NULL is safe.
  */
 USTORE_EXPORT void ustore_snapshot_free(ustore_snapshot_t snapshot);
 
 /**
- *  @brief Closes the database and frees its memory, while the data persists on disk.
+ *  @brief Waits until every deferred call naming the database finishes, then closes it and frees its memory once
+ *      no transaction or snapshot of it holds it open, while the data persists on disk.
  *  @param[inout] database The database to be closed; @c NULL is safe.
  */
 USTORE_EXPORT void ustore_database_free(ustore_database_t database);

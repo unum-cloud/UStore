@@ -96,10 +96,10 @@ typedef struct ustore_pages_import_t {
     /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
     /** Transaction the edits join, where @c NULL writes to the head. */
@@ -142,7 +142,7 @@ typedef struct ustore_pages_import_t {
     /** Encoding of the markup. */
     ustore_page_encoding_t encoding;
 
-    /** How durable the edits are once the call completes at the head; a transaction's commit decides its own. */
+    /** How durable the edits are once the call finishes at the head; a transaction's commit decides its own. */
     ustore_durability_t durability;
 
     /** Whether the @c transaction records the pages it reads and writes for conflicts. */
@@ -171,10 +171,10 @@ typedef struct ustore_pages_insert_t {
     /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
     /** Transaction the edits join, where @c NULL writes to the head. */
@@ -242,7 +242,7 @@ typedef struct ustore_pages_insert_t {
     /** Encoding of the fragments. */
     ustore_page_encoding_t encoding;
 
-    /** How durable the edits are once the call completes at the head; a transaction's commit decides its own. */
+    /** How durable the edits are once the call finishes at the head; a transaction's commit decides its own. */
     ustore_durability_t durability;
 
     /** Whether the @c transaction records the pages it reads and writes for conflicts. */
@@ -265,10 +265,10 @@ typedef struct ustore_pages_remove_t {
     /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
     /** Transaction the edits join, where @c NULL writes to the head. */
@@ -295,7 +295,7 @@ typedef struct ustore_pages_remove_t {
     /** Bytes between consecutive elements, where zero repeats the first one. */
     ustore_size_t elements_stride;
 
-    /** How durable the edits are once the call completes at the head; a transaction's commit decides its own. */
+    /** How durable the edits are once the call finishes at the head; a transaction's commit decides its own. */
     ustore_durability_t durability;
 
     /** Whether the @c transaction records the pages it reads and writes for conflicts. */
@@ -318,10 +318,10 @@ typedef struct ustore_pages_move_t {
     /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
     /** Transaction the edits join, where @c NULL writes to the head. */
@@ -360,7 +360,7 @@ typedef struct ustore_pages_move_t {
     /** Bytes between consecutive anchors, where zero repeats the first one. */
     ustore_size_t anchors_stride;
 
-    /** How durable the edits are once the call completes at the head; a transaction's commit decides its own. */
+    /** How durable the edits are once the call finishes at the head; a transaction's commit decides its own. */
     ustore_durability_t durability;
 
     /** Whether the @c transaction records the pages it reads and writes for conflicts. */
@@ -383,10 +383,10 @@ typedef struct ustore_pages_splice_t {
     /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
     /** Transaction the edits join, where @c NULL writes to the head. */
@@ -444,7 +444,7 @@ typedef struct ustore_pages_splice_t {
     /** Bytes between consecutive chunk pointers, where zero repeats the first one. */
     ustore_size_t values_stride;
 
-    /** How durable the edits are once the call completes at the head; a transaction's commit decides its own. */
+    /** How durable the edits are once the call finishes at the head; a transaction's commit decides its own. */
     ustore_durability_t durability;
 
     /** Whether the @c transaction records the pages it reads and writes for conflicts. */
@@ -467,10 +467,10 @@ typedef struct ustore_pages_set_attributes_t {
     /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
     /** Transaction the edits join, where @c NULL writes to the head. */
@@ -523,7 +523,7 @@ typedef struct ustore_pages_set_attributes_t {
     /** Bytes between consecutive chunk pointers, where zero repeats the first one. */
     ustore_size_t values_stride;
 
-    /** How durable the edits are once the call completes at the head; a transaction's commit decides its own. */
+    /** How durable the edits are once the call finishes at the head; a transaction's commit decides its own. */
     ustore_durability_t durability;
 
     /** Whether the @c transaction records the pages it reads and writes for conflicts. */
@@ -546,10 +546,10 @@ typedef struct ustore_pages_remove_attributes_t {
     /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
     /** Transaction the edits join, where @c NULL writes to the head. */
@@ -582,7 +582,7 @@ typedef struct ustore_pages_remove_attributes_t {
     /** Bytes between consecutive names, where zero repeats the first one. */
     ustore_size_t fields_stride;
 
-    /** How durable the edits are once the call completes at the head; a transaction's commit decides its own. */
+    /** How durable the edits are once the call finishes at the head; a transaction's commit decides its own. */
     ustore_durability_t durability;
 
     /** Whether the @c transaction records the pages it reads and writes for conflicts. */
@@ -615,13 +615,13 @@ typedef struct ustore_pages_read_t {
     /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
-    /** What the rendering sees, where @c NULL is the head. */
+    /** What the call sees, where @c NULL is the head. */
     ustore_view_t view;
 
     /** Number of pages or subtrees to render. */
@@ -684,10 +684,10 @@ typedef struct ustore_pages_history_t {
     /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
     /** What bounds the history, where @c NULL is the head. */

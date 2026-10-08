@@ -37,10 +37,10 @@ typedef struct ustore_write_t {
     /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
     /** Transaction the writes join, where @c NULL writes to the head. */
@@ -81,7 +81,7 @@ typedef struct ustore_write_t {
     /** Bytes between consecutive chunk pointers, where zero repeats the first one. */
     ustore_size_t values_stride;
 
-    /** How durable the writes are once the call completes at the head; a transaction's commit decides its own. */
+    /** How durable the writes are once the call finishes at the head; a transaction's commit decides its own. */
     ustore_durability_t durability;
 
     /** Whether the @c transaction records the written keys for conflicts. */
@@ -104,10 +104,10 @@ typedef struct ustore_remove_t {
     /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
     /** Transaction the removals join, where @c NULL removes at the head. */
@@ -128,7 +128,7 @@ typedef struct ustore_remove_t {
     /** Bytes between consecutive keys, where zero repeats the first one. */
     ustore_size_t keys_stride;
 
-    /** How durable the removals are once the call completes at the head; a transaction's commit decides its own. */
+    /** How durable the removals are once the call finishes at the head; a transaction's commit decides its own. */
     ustore_durability_t durability;
 
     /** Whether the @c transaction records the removed keys for conflicts. */
@@ -161,13 +161,13 @@ typedef struct ustore_read_t {
     /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
-    /** What the read sees, where @c NULL is the head. */
+    /** What the call sees, where @c NULL is the head. */
     ustore_view_t view;
 
     /** Number of tasks, one per key. */
@@ -225,13 +225,13 @@ typedef struct ustore_scan_t {
     /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
-    /** What the scan sees, where @c NULL is the head. */
+    /** What the call sees, where @c NULL is the head. */
     ustore_view_t view;
 
     /** Number of scans. */
@@ -292,13 +292,13 @@ typedef struct ustore_sample_t {
     /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
-    /** What the sample sees, where @c NULL is the head. */
+    /** What the call sees, where @c NULL is the head. */
     ustore_view_t view;
 
     /** Number of samples. */
@@ -340,13 +340,13 @@ typedef struct ustore_measure_t {
     /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
 
-    /** Output for the outcome, final once its status leaves @c ustore_status_pending_k. */
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
 
-    /** Whether the call blocks or returns once queued; zero blocks. */
+    /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
-    /** What the measurement sees, where @c NULL is the head. */
+    /** What the call sees, where @c NULL is the head. */
     ustore_view_t view;
 
     /** Number of measured ranges. */
