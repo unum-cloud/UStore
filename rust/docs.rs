@@ -1,29 +1,30 @@
 //! JSON documents - the Rust twin of `include/ustore/docs.h`.
 //!
 //! The ABI carries documents as JSON text both ways and parses them inside the engine, so nothing here
-//! parses JSON. A field is a top-level key or an RFC 6901 pointer the engine reads up to its null
-//! terminator, which is why every field is a `&CStr`: a `c"/user/name"` literal crosses as it stands.
+//! parses JSON. A field is a top-level key or an RFC 6901 pointer, which crosses as the bytes of a `&str`
+//! with no terminator, so a `"/user/name"` literal crosses as it stands, and an empty field addresses the
+//! whole document.
 //!
 //! ```no_run
 //! use ustore::{Arena, Column, RAMOptions, Database, DocumentEntry, Durability, FieldAddress, FieldEntry};
 //! use ustore::{Json, Key, Modality, Modification, Text};
 //!
-//! let database = Database::open_ram(&RAMOptions::default())?;
-//! let mut arena = Arena::new();
-//! let people = database.create_collection("people", Modality::Any)?;
+//! let database = Database::init_ram(&RAMOptions::default())?;
+//! let mut arena = Arena::new()?;
+//! let people = database.collection_create("people", Modality::Any)?;
 //! let ada = Key::from(1u64);
 //!
-//! let documents = [DocumentEntry::<Json>::new(ada, r#"{"name":"Ada","born":1815}"#)?];
-//! database.head().write_documents(people, &documents, Modification::Upsert, Durability::Buffered)?;
-//! let died = [FieldEntry::<i64>::new(ada, c"died", &1852)?];
-//! database.head().write_fields(people, &died, Modification::Upsert, Durability::Buffered)?;
+//! let documents = [DocumentEntry::<Json>::new(ada, r#"{"name":"Ada","born":1815}"#)];
+//! database.head().docs_write(people, &documents, Modification::Upsert, Durability::Buffered)?;
+//! let died = [FieldEntry::<i64>::new(ada, "died", &1852)];
+//! database.head().docs_write(people, &died, Modification::Upsert, Durability::Buffered)?;
 //!
-//! let names = database.head().read_fields::<Text>(&mut arena, people, &[FieldAddress::new(ada, c"name")])?;
+//! let names = database.head().docs_read(people, &[FieldAddress::new(ada, "name")], Text, &mut arena)?;
 //! assert_eq!(names.get(0), Some(b"Ada".as_slice()));
 //!
-//! let columns = [Column::new::<i64>(c"born"), Column::new::<Text>(c"name")];
-//! let table = database.head().gather(&mut arena, people, &[ada], &columns)?;
-//! assert_eq!(table.scalars::<i64>(0)?, &[1815]);
+//! let columns = [Column::new::<i64>("born"), Column::new::<Text>("name")];
+//! let gathered = database.head().docs_gather(people, &[ada], &columns, &mut arena)?;
+//! assert_eq!(gathered.scalars::<i64>(0)?, &[1815]);
 //! # Ok::<(), ustore::Error>(())
 //! ```
 //!
@@ -33,8 +34,7 @@
 //! use ustore::{FieldEntry, Json, Key};
 //!
 //! let ada = Key::from(1u64);
-//! let fields = [FieldEntry::<i64>::new(ada, c"age", &36)?, FieldEntry::<Json>::new(ada, c"name", "\"Ada\"")?];
-//! # Ok::<(), ustore::Error>(())
+//! let fields = [FieldEntry::<i64>::new(ada, "age", &36), FieldEntry::<Json>::new(ada, "name", "\"Ada\"")];
 //! ```
 //!
 //! A batch of whole documents carries one format too, so the same mixture is refused there:
@@ -43,8 +43,7 @@
 //! use ustore::{DocumentEntry, Json, Key};
 //!
 //! let [ada, born] = [1u64, 2].map(Key::from);
-//! let documents = [DocumentEntry::<Json>::new(ada, "{}")?, DocumentEntry::<i64>::new(born, &1815)?];
-//! # Ok::<(), ustore::Error>(())
+//! let documents = [DocumentEntry::<Json>::new(ada, "{}"), DocumentEntry::<i64>::new(born, &1815)];
 //! ```
 //!
 //! Neither [`Half`] nor [`UUID`] is a format a write carries, so a document written as one does not
@@ -53,40 +52,45 @@
 //! ```compile_fail
 //! use ustore::{DocumentEntry, Half, Key};
 //!
-//! let documents = [DocumentEntry::<Half>::new(Key::from(1u64), &Half(0x3e00))?];
-//! # Ok::<(), ustore::Error>(())
+//! let documents = [DocumentEntry::<Half>::new(Key::from(1u64), &Half(0x3e00))];
 //! ```
 //!
-//! A gathered table borrows the arena like any other result, so the call that would overwrite its columns
-//! does not compile while it lives:
+//! Gathered columns borrow the arena like any other result, so the call that would overwrite them does not compile
+//! while they live:
 //!
-//! ```compile_fail
+//! ```compile_fail,E0499
 //! use ustore::{Arena, CollectionID, Column, RAMOptions, Database, Key, Text};
 //!
-//! let database = Database::open_ram(&RAMOptions::default())?;
-//! let mut arena = Arena::new();
-//! let columns = [Column::new::<Text>(c"name")];
+//! let database = Database::init_ram(&RAMOptions::default())?;
+//! let mut arena = Arena::new()?;
+//! let columns = [Column::new::<Text>("name")];
 //! let ada = Key::from(1u64);
-//! let table = database.head().gather(&mut arena, CollectionID::main(), &[ada], &columns)?;
-//! let paths = database.head().gist(&mut arena, CollectionID::main(), &[ada])?;
-//! assert_eq!(table.rows(), paths.len());
+//! let gathered = database.head().docs_gather(CollectionID::main(), &[ada], &columns, &mut arena)?;
+//! let paths = database.head().docs_gist(CollectionID::main(), [ada], &mut arena)?;
+//! assert_eq!(gathered.rows(), paths.len());
 //! # Ok::<(), ustore::Error>(())
 //! ```
 
-use std::ffi::{c_char, c_int, CStr};
+use std::borrow::Cow;
+use std::ffi::{c_char, c_int, c_void};
+use std::fmt;
 use std::marker::PhantomData;
 use std::ptr;
+use std::str::FromStr;
+
+use stringtape::CharsTape;
 
 use crate::blobs::Values;
 use crate::db::ffi::{
-    ustore_arena_t, ustore_byte_t, ustore_bytes_cptr_t, ustore_char_t, ustore_collection_id_t, ustore_completion_t,
-    ustore_database_t, ustore_durability_t, ustore_enum_t, ustore_executor_t, ustore_key_t, ustore_length_t,
-    ustore_octet_t, ustore_outcome_t, ustore_size_t, ustore_str_view_t, ustore_transaction_t, ustore_view_t,
-    ustore_watch_t,
+    ustore_arena_t, ustore_byte_t, ustore_bytes_view_t, ustore_collections_view_t, ustore_completion_t,
+    ustore_database_t, ustore_durability_t, ustore_enum_t, ustore_executor_t, ustore_keys_view_t, ustore_length_t,
+    ustore_octet_t, ustore_outcome_t, ustore_size_t, ustore_strided_view_t, ustore_strings_view_t,
+    ustore_transaction_t, ustore_view_t, ustore_watch_t,
 };
+use crate::db::sealed::{Accepts, Calling, TapeOffset, Writable};
 use crate::db::{
-    check, described_length, exported_slice, fail, grown, Arena, Collections, Durability, Key, Result, Rows, Status,
-    View, UUID,
+    exported_slice, fail, read_spelling, spelling, Address, Arena, Collections, Durability, Error, Key, Result, Rows,
+    Status, Strings, View, UUID,
 };
 
 // region: Raw Declarations
@@ -105,19 +109,11 @@ mod ffi {
         pub completion: ustore_completion_t,
         pub transaction: ustore_transaction_t,
         pub count: ustore_size_t,
-        pub collections: *const ustore_collection_id_t,
-        pub collections_stride: ustore_size_t,
-        pub keys: *const ustore_key_t,
-        pub keys_stride: ustore_size_t,
-        pub fields: *const ustore_str_view_t,
-        pub fields_stride: ustore_size_t,
-        pub starts: *const ustore_length_t,
-        pub starts_stride: ustore_size_t,
-        pub lengths: *const ustore_length_t,
-        pub lengths_stride: ustore_size_t,
-        pub values: *const ustore_bytes_cptr_t,
-        pub values_stride: ustore_size_t,
-        pub id_field: ustore_str_view_t,
+        pub collections: ustore_collections_view_t,
+        pub keys: ustore_keys_view_t,
+        pub id_field: ustore_bytes_view_t,
+        pub fields: ustore_strings_view_t,
+        pub values: ustore_strings_view_t,
         pub type_: ustore_enum_t,
         pub modification: ustore_enum_t,
         pub durability: ustore_durability_t,
@@ -132,17 +128,14 @@ mod ffi {
         pub completion: ustore_completion_t,
         pub view: ustore_view_t,
         pub count: ustore_size_t,
-        pub collections: *const ustore_collection_id_t,
-        pub collections_stride: ustore_size_t,
-        pub keys: *const ustore_key_t,
-        pub keys_stride: ustore_size_t,
-        pub fields: *const ustore_str_view_t,
-        pub fields_stride: ustore_size_t,
-        pub presences: *mut ustore_octet_t,
-        pub offsets: *mut ustore_length_t,
-        pub values: *mut *mut ustore_byte_t,
-        pub arena: *mut ustore_arena_t,
-        pub type_: ustore_enum_t,
+        pub collections: ustore_collections_view_t,
+        pub keys: ustore_keys_view_t,
+        pub fields: ustore_strings_view_t,
+        pub presences: *mut *const ustore_octet_t,
+        pub lengths: *mut *const ustore_length_t,
+        pub values: *mut ustore_strings_view_t,
+        pub arena: ustore_arena_t,
+        pub outputs_type: ustore_enum_t,
     }
 
     #[repr(C)]
@@ -153,14 +146,21 @@ mod ffi {
         pub completion: ustore_completion_t,
         pub view: ustore_view_t,
         pub count: ustore_size_t,
-        pub collections: *const ustore_collection_id_t,
-        pub collections_stride: ustore_size_t,
-        pub keys: *const ustore_key_t,
-        pub keys_stride: ustore_size_t,
-        pub fields_count: *mut ustore_size_t,
-        pub offsets: *mut *mut ustore_length_t,
-        pub fields: *mut *mut ustore_char_t,
-        pub arena: *mut ustore_arena_t,
+        pub collections: ustore_collections_view_t,
+        pub keys: ustore_keys_view_t,
+        pub fields: *mut ustore_strings_view_t,
+        pub written: *mut ustore_size_t,
+        pub arena: ustore_arena_t,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug)]
+    pub struct ustore_docs_column_view_t {
+        pub validities: *const ustore_octet_t,
+        pub conversions: *const ustore_octet_t,
+        pub collisions: *const ustore_octet_t,
+        pub scalars: *const ustore_byte_t,
+        pub strings: ustore_strings_view_t,
     }
 
     #[repr(C)]
@@ -171,23 +171,13 @@ mod ffi {
         pub completion: ustore_completion_t,
         pub view: ustore_view_t,
         pub count: ustore_size_t,
+        pub collections: ustore_collections_view_t,
+        pub keys: ustore_keys_view_t,
         pub fields_count: ustore_size_t,
-        pub collections: *const ustore_collection_id_t,
-        pub collections_stride: ustore_size_t,
-        pub keys: *const ustore_key_t,
-        pub keys_stride: ustore_size_t,
-        pub fields: *const ustore_str_view_t,
-        pub fields_stride: ustore_size_t,
-        pub types: *const ustore_enum_t,
-        pub types_stride: ustore_size_t,
-        pub columns_validities: *const *mut ustore_octet_t,
-        pub columns_conversions: *const *mut ustore_octet_t,
-        pub columns_collisions: *const *mut ustore_octet_t,
-        pub columns_scalars: *const *mut ustore_byte_t,
-        pub columns_offsets: *const *mut ustore_length_t,
-        pub columns_lengths: *const *mut ustore_length_t,
-        pub joined_strings: *mut *mut ustore_byte_t,
-        pub arena: *mut ustore_arena_t,
+        pub fields: ustore_strings_view_t,
+        pub columns: *mut *const ustore_docs_column_view_t,
+        pub arena: ustore_arena_t,
+        pub outputs_types: *const ustore_enum_t,
     }
 
     extern "C" {
@@ -195,6 +185,8 @@ mod ffi {
         pub fn ustore_docs_read(arguments: *mut ustore_docs_read_t);
         pub fn ustore_docs_gist(arguments: *mut ustore_docs_gist_t);
         pub fn ustore_docs_gather(arguments: *mut ustore_docs_gather_t);
+        pub fn ustore_docs_modification_name(modification: ustore_enum_t) -> *const c_char;
+        pub fn ustore_docs_modification_from_name(name: ustore_bytes_view_t) -> ustore_enum_t;
     }
 }
 
@@ -202,16 +194,48 @@ mod ffi {
 
 // region: Formats
 
-/// Keeps the format traits closed over the types this module names.
+/// Keeps the formats and the inputs of the verbs closed over the types this module names.
 mod sealed {
-    /// A format with a `ustore_doc_field_type_t` of its own.
+    use super::*;
+
+    /// A format with a `ustore_docs_field_type_t` of its own.
     pub trait Format {
-        /// The `ustore_doc_field_type_t` this format crosses the ABI as.
-        const TYPE: std::ffi::c_int;
+        /// The `ustore_docs_field_type_t` this format crosses the ABI as.
+        const TYPE: c_int;
+    }
+
+    /// What one docs write carries: whole documents under their keys, documents keyed by a field of their own, or
+    /// values written into fields, each borrowed or owned.
+    pub trait Writes {
+        /// The tasks of the batch, pointing into `self`, or `None` for no documents.
+        fn tasks(&self) -> Result<Option<WriteTasks>>;
+    }
+
+    /// What one docs read addresses: whole documents under keys, or fields inside them, borrowed or owned.
+    pub trait Addresses {
+        /// The keys and fields of the batch, pointing into `self`.
+        fn tasks(&self) -> Result<ReadTasks>;
+    }
+
+    /// The keys, fields and values of a whole-document or a field write, and the format its values cross in.
+    pub struct WriteTasks {
+        pub count: usize,
+        pub keys: ustore_keys_view_t,
+        pub id_field: ustore_bytes_view_t,
+        pub fields: ustore_strings_view_t,
+        pub values: ustore_strings_view_t,
+        pub format: c_int,
+    }
+
+    /// The keys and fields of a read, where a zeroed run of fields reads whole documents.
+    pub struct ReadTasks {
+        pub count: usize,
+        pub keys: ustore_keys_view_t,
+        pub fields: ustore_strings_view_t,
     }
 }
 
-use sealed::Format;
+use sealed::{Addresses, Format, ReadTasks, WriteTasks, Writes};
 
 /// A fixed-width value a gathered column converts into.
 pub trait Scalar: Format + Copy {}
@@ -383,12 +407,46 @@ pub enum Modification {
     Merge = 4,
 }
 
+impl Modification {
+    fn from_raw(raw: ustore_enum_t) -> Option<Self> {
+        match raw {
+            0 => Some(Modification::Upsert),
+            1 => Some(Modification::Update),
+            2 => Some(Modification::Insert),
+            3 => Some(Modification::Patch),
+            4 => Some(Modification::Merge),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Modification {
+    /// Calls `ustore_docs_modification_name`.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(spelling(ffi::ustore_docs_modification_name, *self as ustore_enum_t))
+    }
+}
+
+impl FromStr for Modification {
+    type Err = Error;
+
+    /// Calls `ustore_docs_modification_from_name`.
+    fn from_str(text: &str) -> Result<Self> {
+        read_spelling(
+            text,
+            ffi::ustore_docs_modification_from_name,
+            ffi::ustore_docs_modification_name,
+            Modification::from_raw,
+        )
+    }
+}
+
 // endregion: Formats
 
 // region: Inputs
 
-/// A document and the key it is stored under, laid out so a slice feeds the strided ABI - one array
-/// for the keys, one for the pointers, one for the lengths.
+/// A document and the key it is stored under, laid out so a slice of them crosses as it stands: the keys as one
+/// strided run, and the documents through an accessor over the same entries.
 ///
 /// A whole document is written in one format the batch shares: [`Json`] for the text the engine parses,
 /// [`Text`] for a document that is one JSON string, or any [`WritableScalar`] for a document that is
@@ -397,21 +455,18 @@ pub enum Modification {
 #[derive(Clone, Copy, Debug)]
 pub struct DocumentEntry<'value, Format: FieldFormat> {
     key: Key,
-    value: *const u8,
-    length: ustore_length_t,
+    value: ustore_bytes_view_t,
     marker: PhantomData<&'value Format::Value>,
 }
 
 impl<'value, Format: FieldFormat> DocumentEntry<'value, Format> {
-    /// Pairs a key with the document to store under it, refusing one longer than the ABI can describe.
-    pub fn new(key: Key, value: &'value Format::Value) -> Result<Self> {
-        let bytes = Format::bytes(value);
-        Ok(DocumentEntry {
+    /// Pairs a key with the document to store under it.
+    pub fn new(key: Key, value: &'value Format::Value) -> Self {
+        DocumentEntry {
             key,
-            value: bytes.as_ptr(),
-            length: described_length(bytes.len(), "the document is longer than the ABI can describe")?,
+            value: Format::bytes(value).into(),
             marker: PhantomData,
-        })
+        }
     }
 
     /// The key this entry stores under.
@@ -420,105 +475,295 @@ impl<'value, Format: FieldFormat> DocumentEntry<'value, Format> {
     }
 }
 
-/// A document carrying its own key under an id field, laid out so a slice feeds the strided ABI.
+/// A document carrying its own key under an id field, which [`KeyedBy`] names, laid out so a slice of them crosses
+/// through an accessor.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Document<'text> {
-    text: *const u8,
-    length: ustore_length_t,
+    text: ustore_bytes_view_t,
     marker: PhantomData<&'text str>,
 }
 
 impl<'text> Document<'text> {
-    /// Borrows the JSON text of a document, refusing one longer than the ABI can describe.
-    pub fn new(text: &'text str) -> Result<Self> {
-        Ok(Document {
-            text: text.as_ptr(),
-            length: described_length(text.len(), "the document is longer than the ABI can describe")?,
+    /// Borrows the JSON text of a document.
+    pub fn new(text: &'text str) -> Self {
+        Document {
+            text: text.as_bytes().into(),
             marker: PhantomData,
-        })
+        }
     }
 }
 
-/// A field of one document and the value written into it, laid out so a slice feeds the strided ABI.
+/// Documents carrying their keys under one field of their own, as a docs write takes them: borrowed [`Document`]
+/// values, or an owned `stringtape::CharsTape` of JSON texts, which a deferred write needs beside an owned or
+/// `'static` field.
+#[derive(Clone, Debug)]
+pub struct KeyedBy<Field, Texts>(
+    /// The field holding the key of every document, such as "_id": a non-negative integer, spelled as
+    /// [`Key::from`] spells it, or a UUID in canonical text.
+    pub Field,
+    /// The documents.
+    pub Texts,
+);
+
+/// A field of one document and the value written into it, laid out so a slice of them crosses as it stands.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct FieldEntry<'value, Format: FieldFormat> {
     key: Key,
-    field: *const c_char,
-    value: *const u8,
-    length: ustore_length_t,
+    field: ustore_bytes_view_t,
+    value: ustore_bytes_view_t,
     marker: PhantomData<&'value Format::Value>,
 }
 
 impl<'value, Format: FieldFormat> FieldEntry<'value, Format> {
-    /// Pairs a field with the value to write into it, refusing one longer than the ABI can describe.
-    pub fn new(key: Key, field: &'value CStr, value: &'value Format::Value) -> Result<Self> {
-        let bytes = Format::bytes(value);
-        Ok(FieldEntry {
+    /// Pairs a field with the value to write into it.
+    pub fn new(key: Key, field: &'value str, value: &'value Format::Value) -> Self {
+        FieldEntry {
             key,
-            field: field.as_ptr(),
-            value: bytes.as_ptr(),
-            length: described_length(bytes.len(), "the value is longer than the ABI can describe")?,
+            field: field.as_bytes().into(),
+            value: Format::bytes(value).into(),
             marker: PhantomData,
-        })
+        }
     }
 }
 
-/// A field of one document to read, laid out so a slice feeds the strided ABI.
+/// A field of one document to read, laid out so a slice of them crosses as it stands.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct FieldAddress<'field> {
     key: Key,
-    field: *const c_char,
-    marker: PhantomData<&'field CStr>,
+    field: ustore_bytes_view_t,
+    marker: PhantomData<&'field str>,
 }
 
 impl<'field> FieldAddress<'field> {
     /// Addresses `field` of the document under `key`.
-    pub fn new(key: Key, field: &'field CStr) -> Self {
+    pub fn new(key: Key, field: &'field str) -> Self {
         FieldAddress {
             key,
-            field: field.as_ptr(),
+            field: field.as_bytes().into(),
             marker: PhantomData,
         }
     }
 }
 
-/// A field to gather from every document and the type to convert it into, laid out so a slice feeds
-/// the strided ABI.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
+/// A field to gather from every document, borrowed or owned, and the type to convert it into.
+#[derive(Clone, Debug)]
 pub struct Column<'field> {
-    field: *const c_char,
+    field: Cow<'field, str>,
     format: c_int,
-    /// Bytes of one scalar cell, or zero for a column of strings.
-    width: u32,
-    marker: PhantomData<&'field CStr>,
 }
 
 impl<'field> Column<'field> {
-    /// Gathers `field` converted into `Format`.
-    pub fn new<Format: ColumnFormat>(field: &'field CStr) -> Self {
+    /// Gathers `field`, a `&str` or an owned `String`, converted into `Format`.
+    pub fn new<Format: ColumnFormat>(field: impl Into<Cow<'field, str>>) -> Self {
         Column {
-            field: field.as_ptr(),
+            field: field.into(),
             format: Format::TYPE,
-            width: size_of::<Format>() as u32,
-            marker: PhantomData,
         }
     }
+}
 
-    /// Whether the column gathers strings rather than scalars.
-    fn holds_strings(&self) -> bool {
-        self.format == Text::TYPE || self.format == Binary::TYPE
+/// Writes the view of the field of every column `indices` names out of the slice of [`Column`]s at `handle`.
+unsafe extern "C" fn column_fields(
+    handle: *const c_void,
+    indices: *const ustore_size_t,
+    count: ustore_size_t,
+    views: *mut ustore_bytes_view_t,
+) {
+    let columns = handle.cast::<Column<'static>>();
+    for slot in 0..count as usize {
+        let column = &*columns.add(*indices.add(slot) as usize);
+        *views.add(slot) = column.field.as_bytes().into();
     }
+}
 
-    /// Words the cells of `rows` rows take: one more offset than strings and a length each, or the scalars end to end.
-    fn cells_words(&self, rows: usize) -> usize {
-        match self.holds_strings() {
-            true => 2 * rows + 1,
-            false => (rows * self.width as usize).div_ceil(size_of::<u64>()),
-        }
+/// The view of a tape of `count` strings, refusing a tape of another length.
+fn counted_tape<Offset: TapeOffset>(tape: &CharsTape<Offset>, count: usize) -> Result<ustore_strings_view_t> {
+    if tape.len() != count {
+        return Err(fail(Status::InvalidArgument, "the tape holds a string per key"));
+    }
+    let (bytes, offsets) = tape.arrow_slices();
+    Ok(Offset::tape(bytes, offsets))
+}
+
+impl<Format: FieldFormat> Writes for &[DocumentEntry<'_, Format>] {
+    fn tasks(&self) -> Result<Option<WriteTasks>> {
+        Ok(self.first().map(|first| WriteTasks {
+            count: self.len(),
+            keys: ustore_strided_view_t::inside::<DocumentEntry<'_, Format>>(&first.key),
+            id_field: ustore_bytes_view_t::default(),
+            fields: ustore_strings_view_t::default(),
+            values: ustore_strings_view_t::inside::<DocumentEntry<'_, Format>>(&first.value),
+            format: Format::TYPE,
+        }))
+    }
+}
+
+impl<Format: FieldFormat, const COUNT: usize> Writes for &[DocumentEntry<'_, Format>; COUNT] {
+    fn tasks(&self) -> Result<Option<WriteTasks>> {
+        self.as_slice().tasks()
+    }
+}
+
+/// Keys beside a tape of their JSON texts, which a deferred write owns.
+impl<Keys: AsRef<[Key]>, Offset: TapeOffset> Writes for (Keys, CharsTape<Offset>) {
+    fn tasks(&self) -> Result<Option<WriteTasks>> {
+        let keys = self.0.as_ref();
+        let values = counted_tape(&self.1, keys.len())?;
+        Ok((!keys.is_empty()).then(|| WriteTasks {
+            count: keys.len(),
+            keys: ustore_strided_view_t::packed(keys),
+            id_field: ustore_bytes_view_t::default(),
+            fields: ustore_strings_view_t::default(),
+            values,
+            format: Json::TYPE,
+        }))
+    }
+}
+
+impl<Field: AsRef<str>> Writes for KeyedBy<Field, &[Document<'_>]> {
+    fn tasks(&self) -> Result<Option<WriteTasks>> {
+        let KeyedBy(field, documents) = self;
+        Ok(documents.first().map(|first| WriteTasks {
+            count: documents.len(),
+            keys: ustore_strided_view_t::default(),
+            id_field: field.as_ref().as_bytes().into(),
+            fields: ustore_strings_view_t::default(),
+            values: ustore_strings_view_t::inside::<Document<'_>>(&first.text),
+            format: Json::TYPE,
+        }))
+    }
+}
+
+impl<Field: AsRef<str>, const COUNT: usize> Writes for KeyedBy<Field, &[Document<'_>; COUNT]> {
+    fn tasks(&self) -> Result<Option<WriteTasks>> {
+        KeyedBy(self.0.as_ref(), self.1.as_slice()).tasks()
+    }
+}
+
+/// A tape of JSON texts keyed by a field of their own, which a deferred write owns.
+impl<Field: AsRef<str>, Offset: TapeOffset> Writes for KeyedBy<Field, CharsTape<Offset>> {
+    fn tasks(&self) -> Result<Option<WriteTasks>> {
+        let KeyedBy(field, texts) = self;
+        let (bytes, offsets) = texts.arrow_slices();
+        Ok((!texts.is_empty()).then(|| WriteTasks {
+            count: texts.len(),
+            keys: ustore_strided_view_t::default(),
+            id_field: field.as_ref().as_bytes().into(),
+            fields: ustore_strings_view_t::default(),
+            values: Offset::tape(bytes, offsets),
+            format: Json::TYPE,
+        }))
+    }
+}
+
+impl<Format: FieldFormat> Writes for &[FieldEntry<'_, Format>] {
+    fn tasks(&self) -> Result<Option<WriteTasks>> {
+        Ok(self.first().map(|first| WriteTasks {
+            count: self.len(),
+            keys: ustore_strided_view_t::inside::<FieldEntry<'_, Format>>(&first.key),
+            id_field: ustore_bytes_view_t::default(),
+            fields: ustore_strings_view_t::inside::<FieldEntry<'_, Format>>(&first.field),
+            values: ustore_strings_view_t::inside::<FieldEntry<'_, Format>>(&first.value),
+            format: Format::TYPE,
+        }))
+    }
+}
+
+impl<Format: FieldFormat, const COUNT: usize> Writes for &[FieldEntry<'_, Format>; COUNT] {
+    fn tasks(&self) -> Result<Option<WriteTasks>> {
+        self.as_slice().tasks()
+    }
+}
+
+/// Keys and a tape of paths beside a tape of the JSON values written into them, which a deferred write owns.
+impl<Keys: AsRef<[Key]>, PathsOffset: TapeOffset, ValuesOffset: TapeOffset> Writes
+    for (Keys, CharsTape<PathsOffset>, CharsTape<ValuesOffset>)
+{
+    fn tasks(&self) -> Result<Option<WriteTasks>> {
+        let keys = self.0.as_ref();
+        let fields = counted_tape(&self.1, keys.len())?;
+        let values = counted_tape(&self.2, keys.len())?;
+        Ok((!keys.is_empty()).then(|| WriteTasks {
+            count: keys.len(),
+            keys: ustore_strided_view_t::packed(keys),
+            id_field: ustore_bytes_view_t::default(),
+            fields,
+            values,
+            format: Json::TYPE,
+        }))
+    }
+}
+
+/// The tasks reading the whole documents under `keys`.
+fn whole_documents(keys: &[Key]) -> ReadTasks {
+    ReadTasks {
+        count: keys.len(),
+        keys: ustore_strided_view_t::packed(keys),
+        fields: ustore_strings_view_t::default(),
+    }
+}
+
+impl Addresses for &[Key] {
+    fn tasks(&self) -> Result<ReadTasks> {
+        Ok(whole_documents(self))
+    }
+}
+
+impl<const COUNT: usize> Addresses for &[Key; COUNT] {
+    fn tasks(&self) -> Result<ReadTasks> {
+        Ok(whole_documents(self.as_slice()))
+    }
+}
+
+/// Keys of whole documents, which a deferred read owns.
+impl<const COUNT: usize> Addresses for [Key; COUNT] {
+    fn tasks(&self) -> Result<ReadTasks> {
+        Ok(whole_documents(self))
+    }
+}
+
+/// Keys of whole documents, which a deferred read owns.
+impl Addresses for Vec<Key> {
+    fn tasks(&self) -> Result<ReadTasks> {
+        Ok(whole_documents(self))
+    }
+}
+
+impl Addresses for &[FieldAddress<'_>] {
+    fn tasks(&self) -> Result<ReadTasks> {
+        let Some(first) = self.first() else {
+            return Ok(ReadTasks {
+                count: 0,
+                keys: ustore_strided_view_t::default(),
+                fields: ustore_strings_view_t::default(),
+            });
+        };
+        Ok(ReadTasks {
+            count: self.len(),
+            keys: ustore_strided_view_t::inside::<FieldAddress<'_>>(&first.key),
+            fields: ustore_strings_view_t::inside::<FieldAddress<'_>>(&first.field),
+        })
+    }
+}
+
+impl<const COUNT: usize> Addresses for &[FieldAddress<'_>; COUNT] {
+    fn tasks(&self) -> Result<ReadTasks> {
+        self.as_slice().tasks()
+    }
+}
+
+/// Keys beside a tape of the paths read from them, which a deferred read owns.
+impl<Keys: AsRef<[Key]>, Offset: TapeOffset> Addresses for (Keys, CharsTape<Offset>) {
+    fn tasks(&self) -> Result<ReadTasks> {
+        let keys = self.0.as_ref();
+        Ok(ReadTasks {
+            count: keys.len(),
+            keys: ustore_strided_view_t::packed(keys),
+            fields: counted_tape(&self.1, keys.len())?,
+        })
     }
 }
 
@@ -529,42 +774,45 @@ impl<'field> Column<'field> {
 /// The unique paths to the leaves of the documents one gist inspected, in the order they were found.
 #[derive(Clone, Copy, Debug)]
 pub struct Paths<'arena> {
-    offsets: *const ustore_length_t,
-    tape: *const ustore_char_t,
-    count: usize,
-    marker: PhantomData<&'arena Arena>,
+    paths: Strings<'arena>,
 }
 
 impl<'arena> Paths<'arena> {
+    /// The `count` paths a gist exported as the tape `fields`, refusing one that is not UTF-8.
+    ///
+    /// # Safety
+    /// A successful gist exported `count` paths as the tape `fields`, which stays alive for `'arena`.
+    unsafe fn exported(count: ustore_size_t, fields: ustore_strings_view_t) -> Result<Self> {
+        let paths = Strings::exported(fields, count as usize)?;
+        for index in 0..paths.len() {
+            let path = paths.get(index).unwrap_or_default();
+            std::str::from_utf8(path).map_err(|_| fail(Status::Malformed, "a path is not UTF-8"))?;
+        }
+        Ok(Paths { paths })
+    }
+
     /// How many unique paths the gist found.
     pub fn len(&self) -> usize {
-        self.count
+        self.paths.len()
     }
 
     /// Whether the gist found no leaves at all.
     pub fn is_empty(&self) -> bool {
-        self.count == 0
+        self.len() == 0
     }
 
     /// The JSON Pointer at `index`, ready to address a field, or `None` past the end.
-    pub fn get(&self, index: usize) -> Option<&'arena CStr> {
-        if index >= self.count {
-            return None;
-        }
-        // SAFETY: a successful gist exports `count` plus one offsets into one tape, each path between two
-        // of them closed by its null terminator, all of it alive while the arena stays borrowed.
-        let bytes = unsafe {
-            let begin = *self.offsets.add(index) as usize;
-            let end = *self.offsets.add(index + 1) as usize;
-            exported_slice(self.tape.add(begin).cast::<u8>(), end.saturating_sub(begin))
-        };
-        CStr::from_bytes_with_nul(bytes).ok()
+    pub fn get(&self, index: usize) -> Option<&'arena str> {
+        // SAFETY: every path was checked for UTF-8 when the gist returned.
+        self.paths
+            .get(index)
+            .map(|path| unsafe { std::str::from_utf8_unchecked(path) })
     }
 
     /// Every path in the order the gist found it.
-    pub fn iter(&self) -> impl Iterator<Item = &'arena CStr> + 'arena {
+    pub fn iter(&self) -> impl Iterator<Item = &'arena str> + 'arena {
         let paths = *self;
-        (0..paths.count).filter_map(move |index| paths.get(index))
+        (0..paths.len()).filter_map(move |index| paths.get(index))
     }
 }
 
@@ -604,15 +852,14 @@ impl<'arena> Bitmap<'arena> {
 
 /// A gathered column of strings, whose value in a row is absent unless the row is valid.
 #[derive(Clone, Copy, Debug)]
-pub struct Strings<'arena> {
+pub struct StringColumn<'arena> {
     validities: Bitmap<'arena>,
-    offsets: *const ustore_length_t,
-    lengths: *const ustore_length_t,
-    joined: *const ustore_byte_t,
-    marker: PhantomData<&'arena Arena>,
+    strings: Strings<'arena>,
+    /// Bytes closing every string past its text: the null terminator of [`Text`], and none of [`Binary`].
+    terminator: usize,
 }
 
-impl<'arena> Strings<'arena> {
+impl<'arena> StringColumn<'arena> {
     /// How many rows the column holds.
     pub fn len(&self) -> usize {
         self.validities.len()
@@ -623,62 +870,53 @@ impl<'arena> Strings<'arena> {
         self.validities.is_empty()
     }
 
-    /// The string of `row`, or `None` for a row whose field was missing or would not convert.
+    /// The string of `row` without its terminator, or `None` for a row whose field was missing or would not convert.
     pub fn get(&self, row: usize) -> Option<&'arena [u8]> {
         if !self.validities.get(row) {
             return None;
         }
-        // SAFETY: a valid row lies below the row count, for which a successful gather exported one offset
-        // and one length into the joined strings, all of it alive while the arena stays borrowed.
-        unsafe {
-            let offset = *self.offsets.add(row) as usize;
-            let length = *self.lengths.add(row) as usize;
-            Some(exported_slice(self.joined.add(offset), length))
-        }
+        let string = self.strings.get(row)?;
+        string.get(..string.len().saturating_sub(self.terminator))
     }
 
     /// Every row in order.
-    pub fn iter(&self) -> Rows<Strings<'arena>, Option<&'arena [u8]>> {
-        Rows::new(*self, self.len(), Strings::get)
+    pub fn iter(&self) -> Rows<StringColumn<'arena>, Option<&'arena [u8]>> {
+        Rows::new(*self, self.len(), StringColumn::get)
     }
 }
 
-impl<'arena> IntoIterator for Strings<'arena> {
+impl<'arena> IntoIterator for StringColumn<'arena> {
     type Item = Option<&'arena [u8]>;
-    type IntoIter = Rows<Strings<'arena>, Option<&'arena [u8]>>;
+    type IntoIter = Rows<StringColumn<'arena>, Option<&'arena [u8]>>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
     }
 }
 
-impl<'arena> IntoIterator for &Strings<'arena> {
+impl<'arena> IntoIterator for &StringColumn<'arena> {
     type Item = Option<&'arena [u8]>;
-    type IntoIter = Rows<Strings<'arena>, Option<&'arena [u8]>>;
+    type IntoIter = Rows<StringColumn<'arena>, Option<&'arena [u8]>>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
     }
 }
 
-/// The columns one gather exported, a row per document and a column per requested field.
+/// The columns one gather exported, a row per document and a column per requested field, holding the requests that
+/// name the format of each.
 ///
 /// A value is valid when it was found and converted, converted when the conversion changed its meaning,
 /// such as text parsed into a number, and colliding when a value of an inconvertible type sits there.
 #[derive(Clone, Copy, Debug)]
-pub struct Table<'arena> {
-    columns: &'arena [Column<'arena>],
+pub struct Columns<'arena, Requested> {
+    requested: Requested,
     rows: usize,
-    validities: *const *const ustore_octet_t,
-    conversions: *const *const ustore_octet_t,
-    collisions: *const *const ustore_octet_t,
-    scalars: *const *const ustore_byte_t,
-    offsets: *const *const ustore_length_t,
-    lengths: *const *const ustore_length_t,
-    joined: *const ustore_byte_t,
+    /// One view per requested column, or none for a gather that reached no engine.
+    views: &'arena [ffi::ustore_docs_column_view_t],
 }
 
-impl<'arena> Table<'arena> {
+impl<'arena, 'field, Requested: AsRef<[Column<'field>]>> Columns<'arena, Requested> {
     /// How many documents the gather read.
     pub fn rows(&self) -> usize {
         self.rows
@@ -686,91 +924,82 @@ impl<'arena> Table<'arena> {
 
     /// How many fields the gather read.
     pub fn columns(&self) -> usize {
-        self.columns.len()
+        self.requested.as_ref().len()
     }
 
     /// Which rows of `column` hold a value, or `None` past the last column.
     pub fn validities(&self, column: usize) -> Option<Bitmap<'arena>> {
-        self.bitmap(self.validities, column)
+        self.bitmap(column, |view| view.validities)
     }
 
     /// Which rows of `column` changed their meaning on conversion, or `None` past the last column.
     pub fn conversions(&self, column: usize) -> Option<Bitmap<'arena>> {
-        self.bitmap(self.conversions, column)
+        self.bitmap(column, |view| view.conversions)
     }
 
     /// Which rows of `column` hold a value that would not convert, or `None` past the last column.
     pub fn collisions(&self, column: usize) -> Option<Bitmap<'arena>> {
-        self.bitmap(self.collisions, column)
+        self.bitmap(column, |view| view.collisions)
     }
 
     /// The values of a scalar column, one per row, with zero or a partial conversion in invalid rows.
     pub fn scalars<Value: Scalar>(&self, column: usize) -> Result<&'arena [Value]> {
-        self.requested::<Value>(column)?;
-        if self.rows == 0 {
-            return Ok(&[]);
+        if self.requested_format(column)? != Value::TYPE {
+            return Err(fail(Status::InvalidArgument, "the column was gathered as another type"));
         }
-        // SAFETY: a successful gather exports one column address per field and writes every row of a
-        // column of the requested type, aligned for any scalar, which stays alive while the arena stays
+        let Some(view) = self.views.get(column) else {
+            return Ok(&[]);
+        };
+        // SAFETY: a successful gather writes every row of a column of the requested type into the arena, which stays
         // borrowed; a C++ `bool` holds only zero or one.
-        Ok(unsafe { exported_slice((*self.scalars.add(column)).cast::<Value>(), self.rows) })
+        Ok(unsafe { exported_slice(view.scalars.cast::<Value>(), self.rows) })
     }
 
     /// The values of a column gathered as [`Text`] or [`Binary`].
-    pub fn strings(&self, column: usize) -> Result<Strings<'arena>> {
-        let format = self.requested_format(column)?;
-        if format != Text::TYPE && format != Binary::TYPE {
-            return Err(fail(Status::InvalidArgument, "the column was not gathered as strings"));
-        }
+    pub fn strings(&self, column: usize) -> Result<StringColumn<'arena>> {
+        let terminator = match self.requested_format(column)? {
+            Text::TYPE => 1,
+            Binary::TYPE => 0,
+            _ => return Err(fail(Status::InvalidArgument, "the column was not gathered as strings")),
+        };
         let validities = self
-            .bitmap(self.validities, column)
+            .bitmap(column, |view| view.validities)
             .unwrap_or(Bitmap { bytes: &[], count: 0 });
-        if self.rows == 0 {
-            return Ok(Strings {
-                validities,
-                offsets: ptr::null(),
-                lengths: ptr::null(),
-                joined: ptr::null(),
-                marker: PhantomData,
-            });
-        }
-        // SAFETY: a successful gather exports one offsets and one lengths address per field.
-        let (offsets, lengths) = unsafe { (*self.offsets.add(column), *self.lengths.add(column)) };
-        Ok(Strings {
+        let strings = match self.views.get(column) {
+            // SAFETY: a successful gather exports the strings of every row of a string column as a tape in the arena,
+            // which stays borrowed.
+            Some(view) => unsafe { Strings::exported(view.strings, self.rows)? },
+            None => Strings::empty(),
+        };
+        Ok(StringColumn {
             validities,
-            offsets,
-            lengths,
-            joined: self.joined,
-            marker: PhantomData,
+            strings,
+            terminator,
         })
     }
 
     /// The format `column` was requested in, refusing a column the gather never read.
     fn requested_format(&self, column: usize) -> Result<c_int> {
-        match self.columns.get(column) {
+        match self.requested.as_ref().get(column) {
             Some(request) => Ok(request.format),
             None => Err(fail(Status::InvalidArgument, "the table has no such column")),
         }
     }
 
-    /// Refuses `column` unless it was requested as `Value`.
-    fn requested<Value: Scalar>(&self, column: usize) -> Result<()> {
-        match self.requested_format(column)? == Value::TYPE {
-            true => Ok(()),
-            false => Err(fail(Status::InvalidArgument, "the column was gathered as another type")),
-        }
-    }
-
-    /// One bitmap of `bitmaps` for `column`, or `None` past the last column.
-    fn bitmap(&self, bitmaps: *const *const ustore_octet_t, column: usize) -> Option<Bitmap<'arena>> {
-        if column >= self.columns.len() {
+    /// The bitmap of `column` that `bits` picks out of its view, or `None` past the last column.
+    fn bitmap(
+        &self,
+        column: usize,
+        bits: fn(&ffi::ustore_docs_column_view_t) -> *const ustore_octet_t,
+    ) -> Option<Bitmap<'arena>> {
+        if column >= self.columns() {
             return None;
         }
-        if self.rows == 0 {
-            return Some(Bitmap { bytes: &[], count: 0 });
-        }
-        // SAFETY: a successful gather exports one bitmap address per field, each covering every row.
-        let bytes = unsafe { exported_slice(*bitmaps.add(column), self.rows.div_ceil(8)) };
+        let bytes = match self.views.get(column) {
+            // SAFETY: a successful gather exports every bitmap of a column covering every row, in the arena.
+            Some(view) => unsafe { exported_slice(bits(view), self.rows.div_ceil(8)) },
+            None => &[],
+        };
         Some(Bitmap {
             bytes,
             count: self.rows,
@@ -782,401 +1011,341 @@ impl<'arena> Table<'arena> {
 
 // region: Verbs
 
-impl View<'_> {
-    /// Writes whole documents under the keys their entries carry, where [`View::remove`] removes documents.
+impl<Parent: Writable, Completion: crate::db::sealed::Completion> View<'_, Parent, Completion> {
+    /// Writes whole documents or values into fields inside them, where [`View::remove`] removes documents and a merge
+    /// with a JSON `null` removes a field, and hands what it wrote back.
     ///
-    /// The batch writes one format, which is [`Json`] for the text the engine parses and a
-    /// [`WritableScalar`] or [`Text`] for a document that is one scalar. A transaction flushes at its
-    /// commit, so [`Durability::Flushed`] is refused inside one.
-    pub fn write_documents<'collections, Format: FieldFormat>(
+    /// The batch is one of:
+    /// - borrowed [`DocumentEntry`] values of one format, which is [`Json`] for the text the engine parses and a
+    ///   [`WritableScalar`] or [`Text`] for a document that is one scalar;
+    /// - [`KeyedBy`] documents, carrying their keys under a field of their own;
+    /// - borrowed [`FieldEntry`] values of one format, writing into fields of existing documents;
+    /// - the owned forms a deferred write needs: keys beside a `stringtape::CharsTape` of JSON texts, keys and a tape
+    ///   of paths beside a tape of JSON values, or a tape of JSON texts keyed by a field.
+    ///
+    /// A transaction flushes at its commit, so [`Durability::Flushed`] is refused inside one.
+    ///
+    /// Calls `ustore_docs_write`.
+    pub fn docs_write<'collections, Documents: Writes>(
         &self,
         collections: impl Into<Collections<'collections>>,
-        documents: &[DocumentEntry<'_, Format>],
+        documents: Documents,
         modification: Modification,
         durability: Durability,
-    ) -> Result<()> {
-        let transaction = self.transaction()?;
-        let Some(first) = documents.first() else {
-            return Ok(());
-        };
-        let collections = collections.into();
-        let (collections, collections_stride) = collections.strided(documents.len())?;
-        let stride = size_of::<DocumentEntry<'_, Format>>() as ustore_size_t;
-        let mut outcome = ustore_outcome_t::default();
-        let mut arguments = ffi::ustore_docs_write_t {
-            database: self.database(),
-            executor: ptr::null_mut(),
-            outcome: &mut outcome,
-            completion: ustore_completion_t::Blocking,
-            transaction,
-            count: documents.len() as ustore_size_t,
-            collections,
-            collections_stride,
-            keys: &first.key,
-            keys_stride: stride,
-            fields: ptr::null(),
-            fields_stride: 0,
-            starts: ptr::null(),
-            starts_stride: 0,
-            lengths: &first.length,
-            lengths_stride: stride,
-            values: &first.value,
-            values_stride: stride,
-            id_field: ptr::null(),
-            type_: Format::TYPE,
-            modification: modification as ustore_enum_t,
+    ) -> Completion::Answer<DocsWrite<'collections, Documents>>
+    where
+        Completion: Accepts<Collections<'collections>> + Accepts<Documents>,
+    {
+        let verb = DocsWrite {
+            collections: collections.into(),
+            documents,
+            modification,
             durability,
-            watch: self.watch(),
         };
-        // SAFETY: the documents and the collections outlive the call, and the members of every entry sit
-        // `stride` bytes apart, which is what `#[repr(C)]` on `DocumentEntry` promises.
-        unsafe { ffi::ustore_docs_write(&mut arguments) };
-        check(outcome)
-    }
-
-    /// Writes whole JSON documents under the key each one holds in `id_field`: a non-negative integer, spelled as
-    /// [`Key::from`] spells it, or a UUID in canonical text.
-    pub fn write_documents_by_id<'collections>(
-        &self,
-        collections: impl Into<Collections<'collections>>,
-        id_field: &CStr,
-        documents: &[Document<'_>],
-        modification: Modification,
-        durability: Durability,
-    ) -> Result<()> {
-        let transaction = self.transaction()?;
-        let Some(first) = documents.first() else {
-            return Ok(());
-        };
-        let collections = collections.into();
-        let (collections, collections_stride) = collections.strided(documents.len())?;
-        let stride = size_of::<Document<'_>>() as ustore_size_t;
-        let mut outcome = ustore_outcome_t::default();
-        let mut arguments = ffi::ustore_docs_write_t {
-            database: self.database(),
-            executor: ptr::null_mut(),
-            outcome: &mut outcome,
-            completion: ustore_completion_t::Blocking,
-            transaction,
-            count: documents.len() as ustore_size_t,
-            collections,
-            collections_stride,
-            keys: ptr::null(),
-            keys_stride: 0,
-            fields: ptr::null(),
-            fields_stride: 0,
-            starts: ptr::null(),
-            starts_stride: 0,
-            lengths: &first.length,
-            lengths_stride: stride,
-            values: &first.text,
-            values_stride: stride,
-            id_field: id_field.as_ptr(),
-            type_: Json::TYPE,
-            modification: modification as ustore_enum_t,
-            durability,
-            watch: self.watch(),
-        };
-        // SAFETY: the documents and the id field outlive the call, and the fields of every document sit
-        // `stride` bytes apart, which is what `#[repr(C)]` on `Document` promises.
-        unsafe { ffi::ustore_docs_write(&mut arguments) };
-        check(outcome)
-    }
-
-    /// Writes values into fields of existing documents, where a merge with a JSON `null` removes a field.
-    pub fn write_fields<'collections, Format: FieldFormat>(
-        &self,
-        collections: impl Into<Collections<'collections>>,
-        fields: &[FieldEntry<'_, Format>],
-        modification: Modification,
-        durability: Durability,
-    ) -> Result<()> {
-        let transaction = self.transaction()?;
-        let Some(first) = fields.first() else {
-            return Ok(());
-        };
-        let collections = collections.into();
-        let (collections, collections_stride) = collections.strided(fields.len())?;
-        let stride = size_of::<FieldEntry<'_, Format>>() as ustore_size_t;
-        let mut outcome = ustore_outcome_t::default();
-        let mut arguments = ffi::ustore_docs_write_t {
-            database: self.database(),
-            executor: ptr::null_mut(),
-            outcome: &mut outcome,
-            completion: ustore_completion_t::Blocking,
-            transaction,
-            count: fields.len() as ustore_size_t,
-            collections,
-            collections_stride,
-            keys: &first.key,
-            keys_stride: stride,
-            fields: &first.field,
-            fields_stride: stride,
-            starts: ptr::null(),
-            starts_stride: 0,
-            lengths: &first.length,
-            lengths_stride: stride,
-            values: &first.value,
-            values_stride: stride,
-            id_field: ptr::null(),
-            type_: Format::TYPE,
-            modification: modification as ustore_enum_t,
-            durability,
-            watch: self.watch(),
-        };
-        // SAFETY: the entries, their fields and their values outlive the call, and the members of every entry
-        // sit `stride` bytes apart as `#[repr(C)]` promises.
-        unsafe { ffi::ustore_docs_write(&mut arguments) };
-        check(outcome)
-    }
-
-    /// Reads whole documents as the JSON text they were written in.
-    pub fn read_documents<'arena, 'collections>(
-        &self,
-        arena: &'arena mut Arena,
-        collections: impl Into<Collections<'collections>>,
-        keys: &[Key],
-    ) -> Result<Values<'arena>> {
-        let tasks = StridedTasks {
-            count: keys.len(),
-            keys: keys.as_ptr(),
-            keys_stride: size_of::<Key>() as ustore_size_t,
-            fields: ptr::null(),
-            fields_stride: 0,
-        };
-        self.read_tasks(arena, collections.into(), tasks, Json::TYPE)
-    }
-
-    /// Reads fields of documents in `Format`, reporting a missing document or field as absent.
-    pub fn read_fields<'arena, 'collections, Format: ReadFormat>(
-        &self,
-        arena: &'arena mut Arena,
-        collections: impl Into<Collections<'collections>>,
-        fields: &[FieldAddress<'_>],
-    ) -> Result<Values<'arena>> {
-        let Some(first) = fields.first() else {
-            return Ok(Values::empty());
-        };
-        let stride = size_of::<FieldAddress<'_>>() as ustore_size_t;
-        let tasks = StridedTasks {
-            count: fields.len(),
-            keys: &first.key,
-            keys_stride: stride,
-            fields: &first.field,
-            fields_stride: stride,
-        };
-        self.read_tasks(arena, collections.into(), tasks, Format::TYPE)
-    }
-
-    /// Lists the unique paths to the leaves of the documents under `keys`.
-    pub fn gist<'arena, 'collections>(
-        &self,
-        arena: &'arena mut Arena,
-        collections: impl Into<Collections<'collections>>,
-        keys: &[Key],
-    ) -> Result<Paths<'arena>> {
-        let collections = collections.into();
-        let (collections, collections_stride) = collections.strided(keys.len())?;
-        let mut count: ustore_size_t = 0;
-        let mut offsets: *mut ustore_length_t = ptr::null_mut();
-        let mut tape: *mut ustore_char_t = ptr::null_mut();
-        let mut outcome = ustore_outcome_t::default();
-        let mut arguments = ffi::ustore_docs_gist_t {
-            database: self.database(),
-            executor: ptr::null_mut(),
-            outcome: &mut outcome,
-            completion: ustore_completion_t::Blocking,
-            view: self.view(),
-            count: keys.len() as ustore_size_t,
-            collections,
-            collections_stride,
-            keys: keys.as_ptr(),
-            keys_stride: size_of::<Key>() as ustore_size_t,
-            fields_count: &mut count,
-            offsets: &mut offsets,
-            fields: &mut tape,
-            arena: arena.slot(),
-        };
-        // SAFETY: the keys, the collections and every output outlive the call.
-        unsafe { ffi::ustore_docs_gist(&mut arguments) };
-        check(outcome)?;
-        Ok(Paths {
-            offsets,
-            tape,
-            count: if offsets.is_null() { 0 } else { count as usize },
-            marker: PhantomData,
-        })
-    }
-
-    /// Reads `columns` of the documents under `keys` into typed columns, a row per key.
-    pub fn gather<'arena, 'collections>(
-        &self,
-        arena: &'arena mut Arena,
-        collections: impl Into<Collections<'collections>>,
-        keys: &[Key],
-        columns: &'arena [Column<'arena>],
-    ) -> Result<Table<'arena>> {
-        let collections = collections.into();
-        let (collections, collections_stride) = collections.strided(keys.len())?;
-        let rows = keys.len();
-        let empty = Table {
-            columns,
-            rows,
-            validities: ptr::null(),
-            conversions: ptr::null(),
-            collisions: ptr::null(),
-            scalars: ptr::null(),
-            offsets: ptr::null(),
-            lengths: ptr::null(),
-            joined: ptr::null(),
-        };
-        if rows == 0 || columns.is_empty() {
-            return Ok(empty);
-        }
-
-        // The six arrays of column addresses lead the words, and every column follows them, aligned for any scalar.
-        let fields = columns.len();
-        let bitmap_words = rows.div_ceil(64);
-        let addresses_words = (6 * fields * size_of::<*mut u8>()).div_ceil(size_of::<u64>());
-        let columns_words: usize = columns
-            .iter()
-            .map(|column| 3 * bitmap_words + column.cells_words(rows))
-            .sum();
-        let Arena {
-            handle, columns: words, ..
-        } = arena;
-        let words = grown(words, addresses_words + columns_words)?;
-        let base = words.as_mut_ptr();
-        let addresses = base.cast::<*mut u8>();
-        let mut taken = addresses_words;
-        let mut take = |count: usize| {
-            let address = base.wrapping_add(taken).cast::<u8>();
-            taken += count;
-            address
-        };
-        for (index, column) in columns.iter().enumerate() {
-            let strings = column.holds_strings();
-            let column_addresses = [
-                take(bitmap_words),
-                take(bitmap_words),
-                take(bitmap_words),
-                if strings {
-                    ptr::null_mut()
-                } else {
-                    take(column.cells_words(rows))
-                },
-                if strings { take(rows + 1) } else { ptr::null_mut() },
-                if strings { take(rows) } else { ptr::null_mut() },
-            ];
-            for (array, address) in column_addresses.into_iter().enumerate() {
-                // SAFETY: the words open with six arrays of one address per column.
-                unsafe { addresses.add(array * fields + index).write(address) };
-            }
-        }
-
-        let stride = size_of::<Column<'_>>() as ustore_size_t;
-        let mut joined: *mut ustore_byte_t = ptr::null_mut();
-        let mut outcome = ustore_outcome_t::default();
-        // SAFETY: each of the six arrays of addresses lies `fields` entries past the one before it.
-        let array = |index: usize| unsafe { addresses.add(index * fields) };
-        let mut arguments = ffi::ustore_docs_gather_t {
-            database: self.database(),
-            executor: ptr::null_mut(),
-            outcome: &mut outcome,
-            completion: ustore_completion_t::Blocking,
-            view: self.view(),
-            count: rows as ustore_size_t,
-            fields_count: fields as ustore_size_t,
-            collections,
-            collections_stride,
-            keys: keys.as_ptr(),
-            keys_stride: size_of::<Key>() as ustore_size_t,
-            fields: &columns[0].field,
-            fields_stride: stride,
-            types: &columns[0].format,
-            types_stride: stride,
-            columns_validities: array(0),
-            columns_conversions: array(1),
-            columns_collisions: array(2),
-            columns_scalars: array(3),
-            columns_offsets: array(4).cast::<*mut ustore_length_t>(),
-            columns_lengths: array(5).cast::<*mut ustore_length_t>(),
-            joined_strings: &mut joined,
-            arena: handle,
-        };
-        // SAFETY: the keys, the collections, the columns with their fields, and every output outlive the
-        // call, and the members of every column sit `stride` bytes apart as `#[repr(C)]` promises.
-        unsafe { ffi::ustore_docs_gather(&mut arguments) };
-        check(outcome)?;
-        Ok(Table {
-            validities: array(0) as *const *const ustore_octet_t,
-            conversions: array(1) as *const *const ustore_octet_t,
-            collisions: array(2) as *const *const ustore_octet_t,
-            scalars: array(3) as *const *const ustore_byte_t,
-            offsets: array(4) as *const *const ustore_length_t,
-            lengths: array(5) as *const *const ustore_length_t,
-            joined,
-            ..empty
-        })
-    }
-
-    /// Reads the documents or the fields `tasks` address, exporting them as `format`.
-    fn read_tasks<'arena>(
-        &self,
-        arena: &'arena mut Arena,
-        collections: Collections<'_>,
-        tasks: StridedTasks,
-        format: c_int,
-    ) -> Result<Values<'arena>> {
-        let (collections, collections_stride) = collections.strided(tasks.count)?;
-        if tasks.count == 0 {
-            return Ok(Values::empty());
-        }
-        let Arena {
-            handle,
-            presences,
-            offsets,
-            ..
-        } = arena;
-        let presences = grown(presences, tasks.count.div_ceil(8))?;
-        let offsets = grown(offsets, tasks.count + 1)?;
-        let mut tape: *mut ustore_byte_t = ptr::null_mut();
-        let mut outcome = ustore_outcome_t::default();
-        let mut arguments = ffi::ustore_docs_read_t {
-            database: self.database(),
-            executor: ptr::null_mut(),
-            outcome: &mut outcome,
-            completion: ustore_completion_t::Blocking,
-            view: self.view(),
-            count: tasks.count as ustore_size_t,
-            collections,
-            collections_stride,
-            keys: tasks.keys,
-            keys_stride: tasks.keys_stride,
-            fields: tasks.fields,
-            fields_stride: tasks.fields_stride,
-            presences: presences.as_mut_ptr(),
-            offsets: offsets.as_mut_ptr(),
-            values: &mut tape,
-            arena: handle,
-            type_: format,
-        };
-        // SAFETY: whatever the tasks address and every output outlive the call.
-        unsafe { ffi::ustore_docs_read(&mut arguments) };
-        check(outcome)?;
-        // SAFETY: a successful read fills a presence bit and an offset per task, closes the tape with one more
-        // offset, and lands the tape behind the handle, all of it borrowed for `'arena`.
-        Ok(unsafe { Values::exported(presences, offsets, tape) })
+        Completion::answer(self, verb)
     }
 }
 
-/// The keys and fields of a read, as borrowed strided runs that stay alive for the call.
-struct StridedTasks {
+impl<Parent, Completion: crate::db::sealed::Completion> View<'_, Parent, Completion> {
+    /// Reads whole documents or fields inside them into the arena in `format`, [`Json`] or [`Text`], reporting a
+    /// missing document or field as absent.
+    ///
+    /// The batch is keys of whole documents, borrowed [`FieldAddress`] values, or owned keys beside a
+    /// `stringtape::CharsTape` of paths, a path per key, which a deferred read needs.
+    ///
+    /// Calls `ustore_docs_read`.
+    pub fn docs_read<'arena, 'collections, Targets: Addresses, Format: ReadFormat>(
+        &self,
+        collections: impl Into<Collections<'collections>>,
+        targets: Targets,
+        format: Format,
+        arena: &'arena mut Arena,
+    ) -> Completion::Answer<DocsRead<'arena, 'collections, Targets>>
+    where
+        Completion: Accepts<Collections<'collections>> + Accepts<Targets>,
+    {
+        let _ = format;
+        let verb = DocsRead {
+            collections: collections.into(),
+            targets,
+            arena,
+            format: Format::TYPE,
+            count: 0,
+            presences: Address::default(),
+            values: ustore_strings_view_t::default(),
+        };
+        Completion::answer(self, verb)
+    }
+
+    /// Lists the unique paths to the leaves of the documents under `keys` into the arena.
+    ///
+    /// Calls `ustore_docs_gist`.
+    pub fn docs_gist<'arena, 'collections, Keys: AsRef<[Key]>>(
+        &self,
+        collections: impl Into<Collections<'collections>>,
+        keys: Keys,
+        arena: &'arena mut Arena,
+    ) -> Completion::Answer<DocsGist<'arena, 'collections, Keys>>
+    where
+        Completion: Accepts<Collections<'collections>> + Accepts<Keys>,
+    {
+        let verb = DocsGist {
+            collections: collections.into(),
+            keys,
+            arena,
+            written: 0,
+            fields: ustore_strings_view_t::default(),
+        };
+        Completion::answer(self, verb)
+    }
+
+    /// Reads `columns` of the documents under `keys` into typed columns in the arena, a row per key.
+    ///
+    /// The answered [`Columns`] hold the requested columns, borrowed or owned, while a deferred gather needs owned
+    /// keys and owned columns, whose paths are owned or `'static`.
+    ///
+    /// Calls `ustore_docs_gather`.
+    pub fn docs_gather<'arena, 'collections, Keys: AsRef<[Key]>, Requested>(
+        &self,
+        collections: impl Into<Collections<'collections>>,
+        keys: Keys,
+        columns: Requested,
+        arena: &'arena mut Arena,
+    ) -> Completion::Answer<DocsGather<'arena, 'collections, Keys, Requested>>
+    where
+        Completion: Accepts<Collections<'collections>> + Accepts<Keys> + Accepts<Requested>,
+        DocsGather<'arena, 'collections, Keys, Requested>: Calling,
+    {
+        let verb = DocsGather {
+            collections: collections.into(),
+            keys,
+            columns,
+            arena,
+            formats: Vec::new(),
+            views: Address::default(),
+        };
+        Completion::answer(self, verb)
+    }
+}
+
+/// A write of whole documents or of fields inside them; see [`View::docs_write`].
+#[derive(Debug)]
+pub struct DocsWrite<'collections, Documents> {
+    collections: Collections<'collections>,
+    documents: Documents,
+    modification: Modification,
+    durability: Durability,
+}
+
+impl<Documents: Writes> Calling for DocsWrite<'_, Documents> {
+    type Arguments = ffi::ustore_docs_write_t;
+    type Output = Documents;
+
+    fn arguments<Parent, Completion>(
+        &mut self,
+        view: &View<'_, Parent, Completion>,
+        outcome: *mut ustore_outcome_t,
+        completion: ustore_completion_t,
+    ) -> Result<Option<Self::Arguments>> {
+        let Some(tasks) = self.documents.tasks()? else {
+            return Ok(None);
+        };
+        Ok(Some(ffi::ustore_docs_write_t {
+            database: view.database(),
+            executor: view.executor(),
+            outcome,
+            completion,
+            transaction: view.transaction(),
+            count: tasks.count as ustore_size_t,
+            collections: self.collections.view(tasks.count)?,
+            keys: tasks.keys,
+            id_field: tasks.id_field,
+            fields: tasks.fields,
+            values: tasks.values,
+            type_: tasks.format,
+            modification: self.modification as ustore_enum_t,
+            durability: self.durability,
+            watch: view.watch(),
+        }))
+    }
+
+    unsafe fn call(arguments: *mut Self::Arguments) {
+        ffi::ustore_docs_write(arguments)
+    }
+
+    fn finish(self) -> Result<Documents> {
+        Ok(self.documents)
+    }
+}
+
+/// A read of whole documents or of fields inside them; see [`View::docs_read`].
+#[derive(Debug)]
+pub struct DocsRead<'arena, 'collections, Targets> {
+    collections: Collections<'collections>,
+    targets: Targets,
+    arena: &'arena mut Arena,
+    format: c_int,
+    /// How many documents or fields the read addressed, once its arguments are filled.
     count: usize,
-    keys: *const ustore_key_t,
-    keys_stride: ustore_size_t,
-    fields: *const ustore_str_view_t,
-    fields_stride: ustore_size_t,
+    presences: Address<ustore_octet_t>,
+    values: ustore_strings_view_t,
+}
+
+impl<'arena, Targets: Addresses> Calling for DocsRead<'arena, '_, Targets> {
+    type Arguments = ffi::ustore_docs_read_t;
+    type Output = Values<'arena>;
+
+    fn arguments<Parent, Completion>(
+        &mut self,
+        view: &View<'_, Parent, Completion>,
+        outcome: *mut ustore_outcome_t,
+        completion: ustore_completion_t,
+    ) -> Result<Option<Self::Arguments>> {
+        let tasks = self.targets.tasks()?;
+        let collections = self.collections.view(tasks.count)?;
+        self.count = tasks.count;
+        if tasks.count == 0 {
+            return Ok(None);
+        }
+        Ok(Some(ffi::ustore_docs_read_t {
+            database: view.database(),
+            executor: view.executor(),
+            outcome,
+            completion,
+            view: view.view(),
+            count: tasks.count as ustore_size_t,
+            collections,
+            keys: tasks.keys,
+            fields: tasks.fields,
+            presences: &mut self.presences.0,
+            lengths: ptr::null_mut(),
+            values: &mut self.values,
+            arena: self.arena.handle,
+            outputs_type: self.format,
+        }))
+    }
+
+    unsafe fn call(arguments: *mut Self::Arguments) {
+        ffi::ustore_docs_read(arguments)
+    }
+
+    fn finish(self) -> Result<Values<'arena>> {
+        // SAFETY: the read succeeded over every task, and the arena stays borrowed for `'arena`.
+        unsafe { Values::exported(self.count, self.presences, self.values) }
+    }
+}
+
+/// A listing of the paths to the leaves of documents; see [`View::docs_gist`].
+#[derive(Debug)]
+pub struct DocsGist<'arena, 'collections, Keys> {
+    collections: Collections<'collections>,
+    keys: Keys,
+    arena: &'arena mut Arena,
+    written: ustore_size_t,
+    fields: ustore_strings_view_t,
+}
+
+impl<'arena, Keys: AsRef<[Key]>> Calling for DocsGist<'arena, '_, Keys> {
+    type Arguments = ffi::ustore_docs_gist_t;
+    type Output = Paths<'arena>;
+
+    fn arguments<Parent, Completion>(
+        &mut self,
+        view: &View<'_, Parent, Completion>,
+        outcome: *mut ustore_outcome_t,
+        completion: ustore_completion_t,
+    ) -> Result<Option<Self::Arguments>> {
+        let keys = self.keys.as_ref();
+        Ok(Some(ffi::ustore_docs_gist_t {
+            database: view.database(),
+            executor: view.executor(),
+            outcome,
+            completion,
+            view: view.view(),
+            count: keys.len() as ustore_size_t,
+            collections: self.collections.view(keys.len())?,
+            keys: ustore_strided_view_t::packed(keys),
+            fields: &mut self.fields,
+            written: &mut self.written,
+            arena: self.arena.handle,
+        }))
+    }
+
+    unsafe fn call(arguments: *mut Self::Arguments) {
+        ffi::ustore_docs_gist(arguments)
+    }
+
+    fn finish(self) -> Result<Paths<'arena>> {
+        // SAFETY: the gist succeeded, and the arena stays borrowed for `'arena`.
+        unsafe { Paths::exported(self.written, self.fields) }
+    }
+}
+
+/// A conversion of fields into typed columns; see [`View::docs_gather`].
+#[derive(Debug)]
+pub struct DocsGather<'arena, 'collections, Keys, Requested> {
+    collections: Collections<'collections>,
+    keys: Keys,
+    columns: Requested,
+    arena: &'arena mut Arena,
+    /// The type of every column, packed as the arguments read them until the call is final.
+    formats: Vec<c_int>,
+    views: Address<ffi::ustore_docs_column_view_t>,
+}
+
+impl<'arena, 'field, Keys: AsRef<[Key]>, Requested: AsRef<[Column<'field>]>> Calling
+    for DocsGather<'arena, '_, Keys, Requested>
+{
+    type Arguments = ffi::ustore_docs_gather_t;
+    type Output = Columns<'arena, Requested>;
+
+    fn arguments<Parent, Completion>(
+        &mut self,
+        view: &View<'_, Parent, Completion>,
+        outcome: *mut ustore_outcome_t,
+        completion: ustore_completion_t,
+    ) -> Result<Option<Self::Arguments>> {
+        let (keys, columns) = (self.keys.as_ref(), self.columns.as_ref());
+        let collections = self.collections.view(keys.len())?;
+        if keys.is_empty() || columns.is_empty() {
+            return Ok(None);
+        }
+        self.formats
+            .try_reserve_exact(columns.len())
+            .map_err(|_| fail(Status::OutOfMemory, "the column types could not be staged"))?;
+        self.formats.extend(columns.iter().map(|column| column.format));
+        Ok(Some(ffi::ustore_docs_gather_t {
+            database: view.database(),
+            executor: view.executor(),
+            outcome,
+            completion,
+            view: view.view(),
+            count: keys.len() as ustore_size_t,
+            collections,
+            keys: ustore_strided_view_t::packed(keys),
+            fields_count: columns.len() as ustore_size_t,
+            fields: ustore_strings_view_t::accessor(column_fields, columns.as_ptr().cast()),
+            columns: &mut self.views.0,
+            arena: self.arena.handle,
+            outputs_types: self.formats.as_ptr(),
+        }))
+    }
+
+    unsafe fn call(arguments: *mut Self::Arguments) {
+        ffi::ustore_docs_gather(arguments)
+    }
+
+    fn finish(self) -> Result<Columns<'arena, Requested>> {
+        let fields = self.columns.as_ref().len();
+        // SAFETY: the gather succeeded into the arena, which stays borrowed for `'arena`, or reached no engine and left
+        // the views null.
+        let views = unsafe { exported_slice(self.views.0, fields) };
+        Ok(Columns {
+            rows: self.keys.as_ref().len(),
+            requested: self.columns,
+            views,
+        })
+    }
 }
 
 // endregion: Verbs
@@ -1187,31 +1356,29 @@ struct StridedTasks {
 mod tests {
     use super::*;
     use crate::blobs::Entry;
-    use crate::db::{CollectionID, Collections, Conflicts, Database, Modality, RAMOptions};
+    use crate::db::{CollectionID, Collections, Database, Executor, Modality, RAMOptions, Watch};
     use crate::testing::{key, keys};
 
     /// A database holding Ada under key one and Grace under key two.
     fn populated() -> (Database, Arena) {
-        let database = Database::open_ram(&RAMOptions::default()).unwrap();
+        let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let documents = [
-            DocumentEntry::<Json>::new(key(1), r#"{"name":"Ada","born":1815,"languages":["English","French"]}"#)
-                .unwrap(),
+            DocumentEntry::<Json>::new(key(1), r#"{"name":"Ada","born":1815,"languages":["English","French"]}"#),
             DocumentEntry::<Json>::new(
                 key(2),
                 r#"{"name":"Grace","born":"1906","navy":{"rank":"Rear Admiral"}}"#,
-            )
-            .unwrap(),
+            ),
         ];
         database
             .head()
-            .write_documents(
+            .docs_write(
                 CollectionID::main(),
                 &documents,
                 Modification::Upsert,
                 Durability::Buffered,
             )
             .unwrap();
-        (database, Arena::new())
+        (database, Arena::new().unwrap())
     }
 
     /// The text of the field at `index`, or `None` when it is absent.
@@ -1222,26 +1389,31 @@ mod tests {
     #[test]
     fn whole_documents_read_back_as_written() {
         let (database, mut arena) = populated();
+        let grace = r#"{"name":"Grace","born":"1906","navy":{"rank":"Rear Admiral"}}"#;
         let documents = database
             .head()
-            .read_documents(&mut arena, CollectionID::main(), &keys([2, 1, 3]))
+            .docs_read(CollectionID::main(), keys([2, 1, 3]), Json, &mut arena)
             .unwrap();
         assert_eq!(documents.len(), 3);
-        assert_eq!(
-            text(&documents, 0),
-            Some(r#"{"name":"Grace","born":"1906","navy":{"rank":"Rear Admiral"}}"#)
-        );
+        assert_eq!(text(&documents, 0), Some(grace));
         assert!(text(&documents, 1).unwrap().starts_with(r#"{"name":"Ada""#));
         assert_eq!(documents.get(2), None, "a key nobody wrote holds no document");
+
+        // An empty field addresses the whole document, as the empty JSON Pointer does.
+        let whole = database
+            .head()
+            .docs_read(CollectionID::main(), &[FieldAddress::new(key(2), "")], Json, &mut arena)
+            .unwrap();
+        assert_eq!(text(&whole, 0), Some(grace));
     }
 
     #[test]
     fn documents_refuse_text_that_is_not_json() {
-        let database = Database::open_ram(&RAMOptions::default()).unwrap();
-        let documents = [DocumentEntry::<Json>::new(key(1), "{\"name\":").unwrap()];
+        let database = Database::init_ram(&RAMOptions::default()).unwrap();
+        let documents = [DocumentEntry::<Json>::new(key(1), "{\"name\":")];
         let failure = database
             .head()
-            .write_documents(
+            .docs_write(
                 CollectionID::main(),
                 &documents,
                 Modification::Upsert,
@@ -1254,39 +1426,41 @@ mod tests {
     #[test]
     fn documents_insert_once_and_update_in_place() {
         let (database, mut arena) = populated();
-        let again = [DocumentEntry::<Json>::new(key(1), r#"{"name":"Someone else"}"#).unwrap()];
+        let again = [DocumentEntry::<Json>::new(key(1), r#"{"name":"Someone else"}"#)];
         let failure = database
             .head()
-            .write_documents(CollectionID::main(), &again, Modification::Insert, Durability::Buffered)
+            .docs_write(CollectionID::main(), &again, Modification::Insert, Durability::Buffered)
             .unwrap_err();
         assert_eq!(failure.status, Status::AlreadyExists);
 
-        let fresh = [DocumentEntry::<Json>::new(key(3), r#"{"name":"Katherine"}"#).unwrap()];
+        let fresh = [DocumentEntry::<Json>::new(key(3), r#"{"name":"Katherine"}"#)];
         database
             .head()
-            .write_documents(CollectionID::main(), &fresh, Modification::Insert, Durability::Buffered)
+            .docs_write(CollectionID::main(), &fresh, Modification::Insert, Durability::Buffered)
             .unwrap();
 
-        let merge = [DocumentEntry::<Json>::new(key(3), r#"{"born":1918}"#).unwrap()];
+        let merge = [DocumentEntry::<Json>::new(key(3), r#"{"born":1918}"#)];
         database
             .head()
-            .write_documents(CollectionID::main(), &merge, Modification::Merge, Durability::Buffered)
+            .docs_write(CollectionID::main(), &merge, Modification::Merge, Durability::Buffered)
             .unwrap();
-        let patch =
-            [DocumentEntry::<Json>::new(key(3), r#"[{"op":"add","path":"/surname","value":"Johnson"}]"#).unwrap()];
+        let patch = [DocumentEntry::<Json>::new(
+            key(3),
+            r#"[{"op":"add","path":"/surname","value":"Johnson"}]"#,
+        )];
         database
             .head()
-            .write_documents(CollectionID::main(), &patch, Modification::Patch, Durability::Buffered)
+            .docs_write(CollectionID::main(), &patch, Modification::Patch, Durability::Buffered)
             .unwrap();
 
         let fields = [
-            FieldAddress::new(key(3), c"name"),
-            FieldAddress::new(key(3), c"born"),
-            FieldAddress::new(key(3), c"surname"),
+            FieldAddress::new(key(3), "name"),
+            FieldAddress::new(key(3), "born"),
+            FieldAddress::new(key(3), "surname"),
         ];
         let read = database
             .head()
-            .read_fields::<Text>(&mut arena, CollectionID::main(), &fields)
+            .docs_read(CollectionID::main(), &fields, Text, &mut arena)
             .unwrap();
         assert_eq!(text(&read, 0), Some("Katherine"), "a merge keeps what it does not name");
         assert_eq!(text(&read, 1), Some("1918"));
@@ -1296,19 +1470,22 @@ mod tests {
     #[test]
     fn a_patch_that_does_not_apply_is_refused() {
         let (database, _) = populated();
-        let patch = [DocumentEntry::<Json>::new(key(1), r#"[{"op":"remove","path":"/nowhere"}]"#).unwrap()];
+        let patch = [DocumentEntry::<Json>::new(
+            key(1),
+            r#"[{"op":"remove","path":"/nowhere"}]"#,
+        )];
         let failure = database
             .head()
-            .write_documents(CollectionID::main(), &patch, Modification::Patch, Durability::Buffered)
+            .docs_write(CollectionID::main(), &patch, Modification::Patch, Durability::Buffered)
             .unwrap_err();
         assert_eq!(failure.status, Status::InvalidArgument, "{failure:?}");
 
         // An update or a patch replaces what exists, so a missing document refuses both.
         for modification in [Modification::Update, Modification::Patch] {
-            let modifier = [DocumentEntry::<Json>::new(key(42), r#"[]"#).unwrap()];
+            let modifier = [DocumentEntry::<Json>::new(key(42), r#"[]"#)];
             let failure = database
                 .head()
-                .write_documents(CollectionID::main(), &modifier, modification, Durability::Buffered)
+                .docs_write(CollectionID::main(), &modifier, modification, Durability::Buffered)
                 .unwrap_err();
             assert_eq!(failure.status, Status::NotFound, "{modification:?}");
         }
@@ -1316,40 +1493,39 @@ mod tests {
 
     #[test]
     fn documents_carry_their_keys_under_an_id_field() {
-        let database = Database::open_ram(&RAMOptions::default()).unwrap();
-        let mut arena = Arena::new();
+        let database = Database::init_ram(&RAMOptions::default()).unwrap();
+        let mut arena = Arena::new().unwrap();
         let documents = [
-            Document::new(r#"{"_id":7,"name":"Ada"}"#).unwrap(),
-            Document::new(r#"{"_id":9,"name":"Grace"}"#).unwrap(),
+            Document::new(r#"{"_id":7,"name":"Ada"}"#),
+            Document::new(r#"{"_id":9,"name":"Grace"}"#),
         ];
         database
             .head()
-            .write_documents_by_id(
+            .docs_write(
                 CollectionID::main(),
-                c"_id",
-                &documents,
+                KeyedBy("_id", &documents),
                 Modification::Upsert,
                 Durability::Buffered,
             )
             .unwrap();
         let names = database
             .head()
-            .read_fields::<Text>(
-                &mut arena,
+            .docs_read(
                 CollectionID::main(),
-                &[FieldAddress::new(key(9), c"name"), FieldAddress::new(key(7), c"name")],
+                &[FieldAddress::new(key(9), "name"), FieldAddress::new(key(7), "name")],
+                Text,
+                &mut arena,
             )
             .unwrap();
         assert_eq!(text(&names, 0), Some("Grace"));
         assert_eq!(text(&names, 1), Some("Ada"));
 
-        let unkeyed = [Document::new(r#"{"_id":"seven"}"#).unwrap()];
+        let unkeyed = [Document::new(r#"{"_id":"seven"}"#)];
         let failure = database
             .head()
-            .write_documents_by_id(
+            .docs_write(
                 CollectionID::main(),
-                c"_id",
-                &unkeyed,
+                KeyedBy("_id", &unkeyed),
                 Modification::Upsert,
                 Durability::Buffered,
             )
@@ -1365,48 +1541,30 @@ mod tests {
         let upsert = Modification::Upsert;
         let buffered = Durability::Buffered;
 
-        let died = 1852i64;
-        head.write_fields(
-            main,
-            &[FieldEntry::<i64>::new(key(1), c"died", &died).unwrap()],
-            upsert,
-            buffered,
-        )
-        .unwrap();
-        let height = 1.65f64;
-        head.write_fields(
-            main,
-            &[FieldEntry::<f64>::new(key(1), c"height", &height).unwrap()],
-            upsert,
-            buffered,
-        )
-        .unwrap();
-        let countess = true;
-        head.write_fields(
-            main,
-            &[FieldEntry::<bool>::new(key(1), c"countess", &countess).unwrap()],
-            upsert,
-            buffered,
-        )
-        .unwrap();
-        let title = [FieldEntry::<Text>::new(key(1), c"title", "Countess of Lovelace").unwrap()];
-        head.write_fields(main, &title, upsert, buffered).unwrap();
+        let died = [FieldEntry::<i64>::new(key(1), "died", &1852)];
+        head.docs_write(main, &died, upsert, buffered).unwrap();
+        let height = [FieldEntry::<f64>::new(key(1), "height", &1.65)];
+        head.docs_write(main, &height, upsert, buffered).unwrap();
+        let countess = [FieldEntry::<bool>::new(key(1), "countess", &true)];
+        head.docs_write(main, &countess, upsert, buffered).unwrap();
+        let title = [FieldEntry::<Text>::new(key(1), "title", "Countess of Lovelace")];
+        head.docs_write(main, &title, upsert, buffered).unwrap();
         let nested = [
-            FieldEntry::<Json>::new(key(1), c"/family", r#"{"father":"Byron"}"#).unwrap(),
-            FieldEntry::<Json>::new(key(2), c"/navy/rank", r#""Commodore""#).unwrap(),
+            FieldEntry::<Json>::new(key(1), "/family", r#"{"father":"Byron"}"#),
+            FieldEntry::<Json>::new(key(2), "/navy/rank", r#""Commodore""#),
         ];
-        head.write_fields(main, &nested, upsert, buffered).unwrap();
+        head.docs_write(main, &nested, upsert, buffered).unwrap();
 
         let fields = [
-            FieldAddress::new(key(1), c"died"),
-            FieldAddress::new(key(1), c"height"),
-            FieldAddress::new(key(1), c"countess"),
-            FieldAddress::new(key(1), c"title"),
-            FieldAddress::new(key(1), c"/family/father"),
-            FieldAddress::new(key(2), c"/navy/rank"),
-            FieldAddress::new(key(1), c"/languages/1"),
+            FieldAddress::new(key(1), "died"),
+            FieldAddress::new(key(1), "height"),
+            FieldAddress::new(key(1), "countess"),
+            FieldAddress::new(key(1), "title"),
+            FieldAddress::new(key(1), "/family/father"),
+            FieldAddress::new(key(2), "/navy/rank"),
+            FieldAddress::new(key(1), "/languages/1"),
         ];
-        let texts = head.read_fields::<Text>(&mut arena, main, &fields).unwrap();
+        let texts = head.docs_read(main, &fields, Text, &mut arena).unwrap();
         assert_eq!(text(&texts, 0), Some("1852"));
         assert_eq!(text(&texts, 1), Some("1.65"));
         assert_eq!(text(&texts, 2), Some("true"));
@@ -1416,13 +1574,11 @@ mod tests {
         assert_eq!(text(&texts, 6), Some("French"));
 
         let json = head
-            .read_fields::<Json>(
-                &mut arena,
+            .docs_read(
                 main,
-                &[
-                    FieldAddress::new(key(1), c"title"),
-                    FieldAddress::new(key(1), c"family"),
-                ],
+                &[FieldAddress::new(key(1), "title"), FieldAddress::new(key(1), "family")],
+                Json,
+                &mut arena,
             )
             .unwrap();
         assert_eq!(text(&json, 0), Some(r#""Countess of Lovelace""#));
@@ -1432,10 +1588,10 @@ mod tests {
     #[test]
     fn fields_are_removed_by_merging_a_null() {
         let (database, mut arena) = populated();
-        let removal = [DocumentEntry::<Json>::new(key(1), r#"{"born":null}"#).unwrap()];
+        let removal = [DocumentEntry::<Json>::new(key(1), r#"{"born":null}"#)];
         database
             .head()
-            .write_documents(
+            .docs_write(
                 CollectionID::main(),
                 &removal,
                 Modification::Merge,
@@ -1444,7 +1600,12 @@ mod tests {
             .unwrap();
         let born = database
             .head()
-            .read_fields::<Text>(&mut arena, CollectionID::main(), &[FieldAddress::new(key(1), c"born")])
+            .docs_read(
+                CollectionID::main(),
+                &[FieldAddress::new(key(1), "born")],
+                Text,
+                &mut arena,
+            )
             .unwrap();
         assert_eq!(born.get(0), None);
     }
@@ -1452,10 +1613,10 @@ mod tests {
     #[test]
     fn fields_refuse_a_document_or_a_path_that_is_not_there() {
         let (database, _) = populated();
-        let orphan = [FieldEntry::<Text>::new(key(42), c"name", "Nobody").unwrap()];
+        let orphan = [FieldEntry::<Text>::new(key(42), "name", "Nobody")];
         let failure = database
             .head()
-            .write_fields(
+            .docs_write(
                 CollectionID::main(),
                 &orphan,
                 Modification::Upsert,
@@ -1464,10 +1625,10 @@ mod tests {
             .unwrap_err();
         assert_eq!(failure.status, Status::NotFound);
 
-        let deep = [FieldEntry::<Text>::new(key(1), c"/missing/deeper", "value").unwrap()];
+        let deep = [FieldEntry::<Text>::new(key(1), "/missing/deeper", "value")];
         let failure = database
             .head()
-            .write_fields(CollectionID::main(), &deep, Modification::Update, Durability::Buffered)
+            .docs_write(CollectionID::main(), &deep, Modification::Update, Durability::Buffered)
             .unwrap_err();
         assert_eq!(failure.status, Status::NotFound);
     }
@@ -1476,13 +1637,13 @@ mod tests {
     fn reads_report_missing_documents_and_fields_as_absent() {
         let (database, mut arena) = populated();
         let fields = [
-            FieldAddress::new(key(1), c"name"),
-            FieldAddress::new(key(1), c"nowhere"),
-            FieldAddress::new(key(42), c"name"),
+            FieldAddress::new(key(1), "name"),
+            FieldAddress::new(key(1), "nowhere"),
+            FieldAddress::new(key(42), "name"),
         ];
         let read = database
             .head()
-            .read_fields::<Json>(&mut arena, CollectionID::main(), &fields)
+            .docs_read(CollectionID::main(), &fields, Json, &mut arena)
             .unwrap();
         assert_eq!(text(&read, 0), Some(r#""Ada""#));
         assert_eq!(read.get(1), None);
@@ -1491,16 +1652,21 @@ mod tests {
 
     #[test]
     fn fields_of_a_value_that_is_not_json_are_refused() {
-        let database = Database::open_ram(&RAMOptions::default()).unwrap();
-        let mut arena = Arena::new();
-        let blob = [Entry::new(key(1), b"not a document").unwrap()];
+        let database = Database::init_ram(&RAMOptions::default()).unwrap();
+        let mut arena = Arena::new().unwrap();
+        let blob = [Entry::new(key(1), b"not a document")];
         database
             .head()
             .write(CollectionID::main(), &blob, Durability::Buffered)
             .unwrap();
         let failure = database
             .head()
-            .read_fields::<Text>(&mut arena, CollectionID::main(), &[FieldAddress::new(key(1), c"name")])
+            .docs_read(
+                CollectionID::main(),
+                &[FieldAddress::new(key(1), "name")],
+                Text,
+                &mut arena,
+            )
             .unwrap_err();
         assert_eq!(failure.status, Status::Malformed);
     }
@@ -1510,9 +1676,9 @@ mod tests {
         let (database, mut arena) = populated();
         let paths = database
             .head()
-            .gist(&mut arena, CollectionID::main(), &keys([1, 2, 1, 42]))
+            .docs_gist(CollectionID::main(), keys([1, 2, 1, 42]), &mut arena)
             .unwrap();
-        let mut listed: Vec<&str> = paths.iter().map(|path| path.to_str().unwrap()).collect();
+        let mut listed: Vec<&str> = paths.iter().collect();
         listed.sort_unstable();
         assert_eq!(
             listed,
@@ -1524,13 +1690,13 @@ mod tests {
 
     #[test]
     fn gists_refuse_a_path_past_the_length_they_export() {
-        let database = Database::open_ram(&RAMOptions::default()).unwrap();
-        let mut arena = Arena::new();
+        let database = Database::init_ram(&RAMOptions::default()).unwrap();
+        let mut arena = Arena::new().unwrap();
         let document = format!("{{\"{}\":1}}", "k".repeat(600));
-        let documents = [DocumentEntry::<Json>::new(key(1), &document).unwrap()];
+        let documents = [DocumentEntry::<Json>::new(key(1), &document)];
         database
             .head()
-            .write_documents(
+            .docs_write(
                 CollectionID::main(),
                 &documents,
                 Modification::Upsert,
@@ -1539,7 +1705,7 @@ mod tests {
             .unwrap();
         let failure = database
             .head()
-            .gist(&mut arena, CollectionID::main(), &keys([1]))
+            .docs_gist(CollectionID::main(), keys([1]), &mut arena)
             .unwrap_err();
         assert_eq!(failure.status, Status::CapacityExhausted);
     }
@@ -1548,130 +1714,107 @@ mod tests {
     fn gathers_convert_fields_into_typed_columns() {
         let (database, mut arena) = populated();
         let columns = [
-            Column::new::<u64>(c"born"),
-            Column::new::<f32>(c"born"),
-            Column::new::<Text>(c"name"),
-            Column::new::<Binary>(c"/navy/rank"),
-            Column::new::<bool>(c"navy"),
-            Column::new::<u8>(c"/languages/0"),
+            Column::new::<u64>("born"),
+            Column::new::<f32>("born"),
+            Column::new::<Text>("name"),
+            Column::new::<Binary>("/navy/rank"),
+            Column::new::<bool>("navy"),
+            Column::new::<u8>("/languages/0"),
         ];
-        let table = database
+        let gathered = database
             .head()
-            .gather(&mut arena, CollectionID::main(), &keys([1, 2, 42]), &columns)
+            .docs_gather(CollectionID::main(), &keys([1, 2, 42]), &columns, &mut arena)
             .unwrap();
-        assert_eq!((table.rows(), table.columns()), (3, 6));
+        assert_eq!((gathered.rows(), gathered.columns()), (3, 6));
 
-        let born = table.scalars::<u64>(0).unwrap();
+        let born = gathered.scalars::<u64>(0).unwrap();
         assert_eq!(&born[..2], &[1815, 1906]);
-        let validities = table.validities(0).unwrap();
+        let validities = gathered.validities(0).unwrap();
         assert_eq!(
             (validities.get(0), validities.get(1), validities.get(2)),
             (true, true, false)
         );
-        let conversions = table.conversions(0).unwrap();
+        let conversions = gathered.conversions(0).unwrap();
         assert!(!conversions.get(0), "a positive integer is unsigned as it stands");
         assert!(conversions.get(1), "a string parsed into an integer is a conversion");
         assert_eq!(validities.len(), 3);
         assert_eq!(validities.as_bytes().len(), 1);
 
-        assert_eq!(&table.scalars::<f32>(1).unwrap()[..2], &[1815.0, 1906.0]);
+        assert_eq!(&gathered.scalars::<f32>(1).unwrap()[..2], &[1815.0, 1906.0]);
 
-        let names = table.strings(2).unwrap();
+        let names = gathered.strings(2).unwrap();
         assert_eq!(names.len(), 3);
         assert_eq!(names.get(0), Some(b"Ada".as_slice()));
         assert_eq!(names.get(1), Some(b"Grace".as_slice()));
         assert_eq!(names.get(2), None);
         assert_eq!(names.iter().filter(Option::is_some).count(), 2);
 
-        let ranks = table.strings(3).unwrap();
+        let ranks = gathered.strings(3).unwrap();
         assert_eq!(ranks.get(0), None);
         assert_eq!(ranks.get(1), Some(b"Rear Admiral".as_slice()));
 
         // An object cannot become a boolean, nor a word a byte.
-        let navy = table.collisions(4).unwrap();
+        let navy = gathered.collisions(4).unwrap();
         assert!(!navy.get(0) && navy.get(1));
-        assert!(!table.validities(4).unwrap().get(1));
-        assert!(table.collisions(5).unwrap().get(0));
-        assert_eq!(table.scalars::<bool>(4).unwrap().len(), 3);
+        assert!(!gathered.validities(4).unwrap().get(1));
+        assert!(gathered.collisions(5).unwrap().get(0));
+        assert_eq!(gathered.scalars::<bool>(4).unwrap().len(), 3);
     }
 
     #[test]
-    fn tables_refuse_a_column_read_as_something_else() {
+    fn columns_refuse_to_be_read_as_something_else() {
         let (database, mut arena) = populated();
-        let columns = [Column::new::<i64>(c"born"), Column::new::<Text>(c"name")];
-        let table = database
+        let columns = [Column::new::<i64>("born"), Column::new::<Text>("name")];
+        let gathered = database
             .head()
-            .gather(&mut arena, CollectionID::main(), &keys([1]), &columns)
+            .docs_gather(CollectionID::main(), &keys([1]), &columns, &mut arena)
             .unwrap();
-        assert_eq!(table.scalars::<u64>(0).unwrap_err().status, Status::InvalidArgument);
-        assert_eq!(table.scalars::<i64>(1).unwrap_err().status, Status::InvalidArgument);
-        assert_eq!(table.strings(0).unwrap_err().status, Status::InvalidArgument);
-        assert_eq!(table.scalars::<i64>(2).unwrap_err().status, Status::InvalidArgument);
-        assert!(table.validities(2).is_none());
+        assert_eq!(gathered.scalars::<u64>(0).unwrap_err().status, Status::InvalidArgument);
+        assert_eq!(gathered.scalars::<i64>(1).unwrap_err().status, Status::InvalidArgument);
+        assert_eq!(gathered.strings(0).unwrap_err().status, Status::InvalidArgument);
+        assert_eq!(gathered.scalars::<i64>(2).unwrap_err().status, Status::InvalidArgument);
+        assert!(gathered.validities(2).is_none());
     }
 
     #[test]
     fn gist_paths_address_the_fields_a_gather_reads() {
         let (database, mut paths_arena) = populated();
-        let mut table_arena = Arena::new();
+        let mut columns_arena = Arena::new().unwrap();
         let paths = database
             .head()
-            .gist(&mut paths_arena, CollectionID::main(), &keys([1]))
+            .docs_gist(CollectionID::main(), keys([1]), &mut paths_arena)
             .unwrap();
         let columns: Vec<Column<'_>> = paths.iter().map(Column::new::<Text>).collect();
-        let table = database
+        let gathered = database
             .head()
-            .gather(&mut table_arena, CollectionID::main(), &keys([1]), &columns)
+            .docs_gather(CollectionID::main(), &keys([1]), &columns, &mut columns_arena)
             .unwrap();
-        assert_eq!(table.columns(), 4);
-        for column in 0..table.columns() {
-            assert!(table.validities(column).unwrap().get(0));
+        assert_eq!(gathered.columns(), 4);
+        for column in 0..gathered.columns() {
+            assert!(gathered.validities(column).unwrap().get(0));
         }
     }
 
     #[test]
     fn whole_documents_are_written_as_scalars_and_strings() {
-        let database = Database::open_ram(&RAMOptions::default()).unwrap();
-        let mut arena = Arena::new();
+        let database = Database::init_ram(&RAMOptions::default()).unwrap();
+        let mut arena = Arena::new().unwrap();
         let head = database.head();
         let main = CollectionID::main();
         let upsert = Modification::Upsert;
         let buffered = Durability::Buffered;
 
-        let born = 1815i64;
-        head.write_documents(
-            main,
-            &[DocumentEntry::<i64>::new(key(1), &born).unwrap()],
-            upsert,
-            buffered,
-        )
-        .unwrap();
-        let height = 1.65f64;
-        head.write_documents(
-            main,
-            &[DocumentEntry::<f64>::new(key(2), &height).unwrap()],
-            upsert,
-            buffered,
-        )
-        .unwrap();
-        let countess = true;
-        head.write_documents(
-            main,
-            &[DocumentEntry::<bool>::new(key(3), &countess).unwrap()],
-            upsert,
-            buffered,
-        )
-        .unwrap();
-        head.write_documents(
-            main,
-            &[DocumentEntry::<Text>::new(key(4), "Countess of Lovelace").unwrap()],
-            upsert,
-            buffered,
-        )
-        .unwrap();
+        let born = [DocumentEntry::<i64>::new(key(1), &1815)];
+        head.docs_write(main, &born, upsert, buffered).unwrap();
+        let height = [DocumentEntry::<f64>::new(key(2), &1.65)];
+        head.docs_write(main, &height, upsert, buffered).unwrap();
+        let countess = [DocumentEntry::<bool>::new(key(3), &true)];
+        head.docs_write(main, &countess, upsert, buffered).unwrap();
+        let title = [DocumentEntry::<Text>::new(key(4), "Countess of Lovelace")];
+        head.docs_write(main, &title, upsert, buffered).unwrap();
 
         // A document that is one scalar reads back as the JSON that scalar prints as.
-        let documents = head.read_documents(&mut arena, main, &keys([1, 2, 3, 4])).unwrap();
+        let documents = head.docs_read(main, keys([1, 2, 3, 4]), Json, &mut arena).unwrap();
         assert_eq!(text(&documents, 0), Some("1815"));
         assert_eq!(text(&documents, 1), Some("1.65"));
         assert_eq!(text(&documents, 2), Some("true"));
@@ -1680,19 +1823,19 @@ mod tests {
 
     #[test]
     fn one_batch_of_documents_spans_several_collections() {
-        let database = Database::open_ram(&RAMOptions::default()).unwrap();
-        let mut arena = Arena::new();
-        let people = database.create_collection("people", Modality::Any).unwrap();
-        let places = database.create_collection("places", Modality::Any).unwrap();
+        let database = Database::init_ram(&RAMOptions::default()).unwrap();
+        let mut arena = Arena::new().unwrap();
+        let people = database.collection_create("people", Modality::Any).unwrap();
+        let places = database.collection_create("places", Modality::Any).unwrap();
         let spanned = [people, places];
 
         let documents = [
-            DocumentEntry::<Json>::new(key(1), r#"{"name":"Ada"}"#).unwrap(),
-            DocumentEntry::<Json>::new(key(1), r#"{"name":"Kent"}"#).unwrap(),
+            DocumentEntry::<Json>::new(key(1), r#"{"name":"Ada"}"#),
+            DocumentEntry::<Json>::new(key(1), r#"{"name":"Kent"}"#),
         ];
         database
             .head()
-            .write_documents(
+            .docs_write(
                 spanned.as_slice(),
                 &documents,
                 Modification::Upsert,
@@ -1700,43 +1843,42 @@ mod tests {
             )
             .unwrap();
 
-        let fields = [FieldAddress::new(key(1), c"name"), FieldAddress::new(key(1), c"name")];
+        let fields = [FieldAddress::new(key(1), "name"), FieldAddress::new(key(1), "name")];
         let names = database
             .head()
-            .read_fields::<Text>(&mut arena, Collections::Each(&spanned), &fields)
+            .docs_read(Collections::Each(&spanned), &fields, Text, &mut arena)
             .unwrap();
         assert_eq!((text(&names, 0), text(&names, 1)), (Some("Ada"), Some("Kent")));
 
-        let columns = [Column::new::<Text>(c"name")];
-        let table = database
+        let columns = [Column::new::<Text>("name")];
+        let gathered = database
             .head()
-            .gather(&mut arena, Collections::Each(&spanned), &keys([1, 1]), &columns)
+            .docs_gather(Collections::Each(&spanned), &keys([1, 1]), &columns, &mut arena)
             .unwrap();
-        assert_eq!(table.strings(0).unwrap().get(1), Some(b"Kent".as_slice()));
+        assert_eq!(gathered.strings(0).unwrap().get(1), Some(b"Kent".as_slice()));
 
         // A run of collections that is not one per task is refused before the call.
         let failure = database
             .head()
-            .gather(&mut arena, Collections::Each(&spanned), &keys([1]), &columns)
+            .docs_gather(Collections::Each(&spanned), &keys([1]), &columns, &mut arena)
             .unwrap_err();
         assert_eq!(failure.status, Status::InvalidArgument);
     }
 
     #[test]
     fn gathers_fill_halves_and_uuids() {
-        let database = Database::open_ram(&RAMOptions::default()).unwrap();
-        let mut arena = Arena::new();
+        let database = Database::init_ram(&RAMOptions::default()).unwrap();
+        let mut arena = Arena::new().unwrap();
         let documents = [
             DocumentEntry::<Json>::new(
                 key(1),
                 r#"{"weight":1.5,"id":"123e4567-e89b-12d3-a456-426614174000","huge":70000.0}"#,
-            )
-            .unwrap(),
-            DocumentEntry::<Json>::new(key(2), r#"{"weight":0.0,"id":"not a uuid","huge":1.0}"#).unwrap(),
+            ),
+            DocumentEntry::<Json>::new(key(2), r#"{"weight":0.0,"id":"not a uuid","huge":1.0}"#),
         ];
         database
             .head()
-            .write_documents(
+            .docs_write(
                 CollectionID::main(),
                 &documents,
                 Modification::Upsert,
@@ -1745,21 +1887,21 @@ mod tests {
             .unwrap();
 
         let columns = [
-            Column::new::<Half>(c"weight"),
-            Column::new::<UUID>(c"id"),
-            Column::new::<Half>(c"huge"),
+            Column::new::<Half>("weight"),
+            Column::new::<UUID>("id"),
+            Column::new::<Half>("huge"),
         ];
-        let table = database
+        let gathered = database
             .head()
-            .gather(&mut arena, CollectionID::main(), &keys([1, 2]), &columns)
+            .docs_gather(CollectionID::main(), &keys([1, 2]), &columns, &mut arena)
             .unwrap();
 
         // A half is two bytes the caller reinterprets; 1.5 is sign zero, exponent fifteen, mantissa one half.
-        let weights = table.scalars::<Half>(0).unwrap();
+        let weights = gathered.scalars::<Half>(0).unwrap();
         assert_eq!(weights, &[Half(0x3e00), Half(0)]);
-        assert!(table.validities(0).unwrap().get(0) && table.validities(0).unwrap().get(1));
+        assert!(gathered.validities(0).unwrap().get(0) && gathered.validities(0).unwrap().get(1));
 
-        let identifiers = table.scalars::<UUID>(1).unwrap();
+        let identifiers = gathered.scalars::<UUID>(1).unwrap();
         assert_eq!(
             identifiers[0],
             UUID([0x12, 0x3e, 0x45, 0x67, 0xe8, 0x9b, 0x12, 0xd3, 0xa4, 0x56, 0x42, 0x66, 0x14, 0x17, 0x40, 0x00])
@@ -1769,13 +1911,13 @@ mod tests {
             UUID::default(),
             "text that is no UUID leaves its cell zero"
         );
-        assert!(table.collisions(1).unwrap().get(1));
+        assert!(gathered.collisions(1).unwrap().get(1));
 
         // A magnitude past the range of a half collides rather than rounding to infinity.
-        assert!(table.collisions(2).unwrap().get(0));
-        assert_eq!(table.scalars::<Half>(2).unwrap()[0], Half(0));
+        assert!(gathered.collisions(2).unwrap().get(0));
+        assert_eq!(gathered.scalars::<Half>(2).unwrap()[0], Half(0));
         assert_eq!(
-            table.scalars::<f32>(0).unwrap_err().status,
+            gathered.scalars::<f32>(0).unwrap_err().status,
             Status::InvalidArgument,
             "a half column is not a float column"
         );
@@ -1785,36 +1927,37 @@ mod tests {
     fn empty_batches_reach_no_engine() {
         let (database, mut arena) = populated();
         let head = database.head();
-        head.write_documents::<Json>(CollectionID::main(), &[], Modification::Upsert, Durability::Buffered)
+        let (upsert, buffered) = (Modification::Upsert, Durability::Buffered);
+        let no_documents: &[DocumentEntry<'_, Json>] = &[];
+        head.docs_write(CollectionID::main(), no_documents, upsert, buffered)
             .unwrap();
-        head.write_documents_by_id(
-            CollectionID::main(),
-            c"_id",
-            &[],
-            Modification::Upsert,
-            Durability::Buffered,
-        )
-        .unwrap();
-        head.write_fields::<Json>(CollectionID::main(), &[], Modification::Upsert, Durability::Buffered)
+        let no_texts: &[Document<'_>] = &[];
+        head.docs_write(CollectionID::main(), KeyedBy("_id", no_texts), upsert, buffered)
+            .unwrap();
+        let no_fields: &[FieldEntry<'_, Json>] = &[];
+        head.docs_write(CollectionID::main(), no_fields, upsert, buffered)
             .unwrap();
         assert!(head
-            .read_documents(&mut arena, CollectionID::main(), &[])
+            .docs_read(CollectionID::main(), [], Json, &mut arena)
             .unwrap()
             .is_empty());
+        let no_addresses: &[FieldAddress<'_>] = &[];
         assert!(head
-            .read_fields::<Text>(&mut arena, CollectionID::main(), &[])
+            .docs_read(CollectionID::main(), no_addresses, Text, &mut arena)
             .unwrap()
             .is_empty());
-        assert!(head.gist(&mut arena, CollectionID::main(), &[]).unwrap().is_empty());
+        assert!(head.docs_gist(CollectionID::main(), [], &mut arena).unwrap().is_empty());
 
-        let columns = [Column::new::<i64>(c"born"), Column::new::<Text>(c"name")];
-        let table = head.gather(&mut arena, CollectionID::main(), &[], &columns).unwrap();
-        assert_eq!(table.rows(), 0);
-        assert!(table.scalars::<i64>(0).unwrap().is_empty());
-        assert!(table.strings(1).unwrap().is_empty());
-        assert!(table.validities(0).unwrap().is_empty());
+        let columns = [Column::new::<i64>("born"), Column::new::<Text>("name")];
+        let gathered = head
+            .docs_gather(CollectionID::main(), &[], &columns, &mut arena)
+            .unwrap();
+        assert_eq!(gathered.rows(), 0);
+        assert!(gathered.scalars::<i64>(0).unwrap().is_empty());
+        assert!(gathered.strings(1).unwrap().is_empty());
+        assert!(gathered.validities(0).unwrap().is_empty());
         assert_eq!(
-            head.gather(&mut arena, CollectionID::main(), &keys([1]), &[])
+            head.docs_gather(CollectionID::main(), &keys([1]), &[], &mut arena)
                 .unwrap()
                 .columns(),
             0
@@ -1825,35 +1968,181 @@ mod tests {
     fn transactions_hold_their_field_writes_until_commit() {
         let (database, mut arena) = populated();
         let mut transaction = database.transaction().unwrap();
-        let rank = [FieldEntry::<Text>::new(key(2), c"/navy/rank", "Commodore").unwrap()];
+        let rank = [FieldEntry::<Text>::new(key(2), "/navy/rank", "Commodore")];
         transaction
-            .view(Conflicts::Watched)
-            .write_fields(CollectionID::main(), &rank, Modification::Update, Durability::Buffered)
+            .view(Watch::Keys)
+            .docs_write(CollectionID::main(), &rank, Modification::Update, Durability::Buffered)
             .unwrap();
         let flushed = transaction
-            .view(Conflicts::Watched)
-            .write_fields(CollectionID::main(), &rank, Modification::Update, Durability::Flushed)
+            .view(Watch::Keys)
+            .docs_write(CollectionID::main(), &rank, Modification::Update, Durability::Flushed)
             .unwrap_err();
         assert_eq!(flushed.status, Status::InvalidArgument);
 
-        let address = [FieldAddress::new(key(2), c"/navy/rank")];
+        let address = [FieldAddress::new(key(2), "/navy/rank")];
         let inside = transaction
-            .view(Conflicts::Watched)
-            .read_fields::<Text>(&mut arena, CollectionID::main(), &address)
+            .view(Watch::Keys)
+            .docs_read(CollectionID::main(), &address, Text, &mut arena)
             .unwrap();
         assert_eq!(text(&inside, 0), Some("Commodore"));
         let outside = database
             .head()
-            .read_fields::<Text>(&mut arena, CollectionID::main(), &address)
+            .docs_read(CollectionID::main(), &address, Text, &mut arena)
             .unwrap();
         assert_eq!(text(&outside, 0), Some("Rear Admiral"));
 
         transaction.commit(Durability::Buffered).unwrap();
         let committed = database
             .head()
-            .read_fields::<Text>(&mut arena, CollectionID::main(), &address)
+            .docs_read(CollectionID::main(), &address, Text, &mut arena)
             .unwrap();
         assert_eq!(text(&committed, 0), Some("Commodore"));
+    }
+
+    #[test]
+    fn documents_and_gists_block_or_defer_on_an_executor() {
+        let (database, _) = populated();
+        let executor = Executor::for_ram(&[], 2, 0).unwrap();
+        let mut arena = Arena::new_in(&executor).unwrap();
+        let blocking = database.head().on(&executor);
+        let deferred = database.head().deferred(&executor);
+        let main = CollectionID::main();
+
+        let read = blocking.docs_read(main, keys([1]), Json, &mut arena).unwrap();
+        assert!(text(&read, 0).unwrap().starts_with(r#"{"name":"Ada""#));
+        let read = deferred
+            .docs_read(main, vec![key(2), key(3)], Json, &mut arena)
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(text(&read, 0).unwrap().starts_with(r#"{"name":"Grace""#));
+        assert_eq!(read.get(1), None);
+
+        assert_eq!(blocking.docs_gist(main, keys([1]), &mut arena).unwrap().len(), 4);
+        let paths = deferred
+            .docs_gist(main, keys([1, 2]), &mut arena)
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(paths.len(), 5);
+    }
+
+    #[test]
+    fn whole_documents_write_through_a_deferred_view() {
+        let database = Database::init_ram(&RAMOptions::default()).unwrap();
+        let executor = Executor::for_ram(&[], 1, 0).unwrap();
+        let deferred = database.head().deferred(&executor);
+        let (main, upsert, buffered) = (CollectionID::main(), Modification::Upsert, Durability::Buffered);
+
+        let texts: CharsTape<u64> = [r#"{"name":"Ada"}"#, r#"{"name":"Grace"}"#].into_iter().collect();
+        let writing = deferred.docs_write(main, (vec![key(1), key(2)], texts), upsert, buffered);
+        let (written, _) = writing.unwrap().wait().unwrap();
+        assert_eq!(written, keys([1, 2]), "a write hands its inputs back");
+
+        let mut arena = Arena::new().unwrap();
+        let documents = database.head().docs_read(main, keys([2, 1]), Json, &mut arena).unwrap();
+        assert_eq!(text(&documents, 0), Some(r#"{"name":"Grace"}"#));
+        assert_eq!(text(&documents, 1), Some(r#"{"name":"Ada"}"#));
+
+        let texts: CharsTape<u64> = ["{}"].into_iter().collect();
+        let refused = deferred.docs_write(main, (keys([1, 2]), texts), upsert, buffered);
+        assert_eq!(
+            refused.unwrap_err().status,
+            Status::InvalidArgument,
+            "the tape holds a value per key"
+        );
+    }
+
+    #[test]
+    fn documents_by_id_write_through_a_deferred_view() {
+        let database = Database::init_ram(&RAMOptions::default()).unwrap();
+        let executor = Executor::for_ram(&[], 1, 0).unwrap();
+        let main = CollectionID::main();
+        let texts: CharsTape<u64> = [r#"{"_id":7,"name":"Ada"}"#].into_iter().collect();
+        database
+            .head()
+            .deferred(&executor)
+            .docs_write(
+                main,
+                KeyedBy(String::from("_id"), texts),
+                Modification::Upsert,
+                Durability::Buffered,
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        let mut arena = Arena::new().unwrap();
+        let names = database
+            .head()
+            .docs_read(main, &[FieldAddress::new(key(7), "name")], Text, &mut arena)
+            .unwrap();
+        assert_eq!(text(&names, 0), Some("Ada"));
+    }
+
+    #[test]
+    fn fields_write_through_a_deferred_view() {
+        let (database, mut arena) = populated();
+        let executor = Executor::for_ram(&[], 1, 0).unwrap();
+        let main = CollectionID::main();
+        let paths: CharsTape<u32> = ["died", "/navy/rank"].into_iter().collect();
+        let values: CharsTape<u64> = ["1852", r#""Commodore""#].into_iter().collect();
+        database
+            .head()
+            .deferred(&executor)
+            .docs_write(
+                main,
+                (keys([1, 2]), paths, values),
+                Modification::Upsert,
+                Durability::Buffered,
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        let fields = [
+            FieldAddress::new(key(1), "died"),
+            FieldAddress::new(key(2), "/navy/rank"),
+        ];
+        let read = database.head().docs_read(main, &fields, Text, &mut arena).unwrap();
+        assert_eq!((text(&read, 0), text(&read, 1)), (Some("1852"), Some("Commodore")));
+    }
+
+    #[test]
+    fn fields_read_through_a_deferred_view() {
+        let (database, mut arena) = populated();
+        let executor = Executor::for_ram(&[], 1, 0).unwrap();
+        let deferred = database.head().deferred(&executor);
+        let main = CollectionID::main();
+
+        let paths: CharsTape<u64> = ["name", "/navy/rank"].into_iter().collect();
+        let read = deferred
+            .docs_read(main, (vec![key(1), key(2)], paths), Text, &mut arena)
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(text(&read, 0), Some("Ada"));
+        assert_eq!(text(&read, 1), Some("Rear Admiral"));
+
+        let refused = deferred.docs_read(main, (keys([1]), CharsTape::<u64>::default()), Json, &mut arena);
+        assert_eq!(refused.unwrap_err().status, Status::InvalidArgument, "a path per key");
+    }
+
+    #[test]
+    fn gathers_run_through_a_deferred_view() {
+        let (database, mut arena) = populated();
+        let executor = Executor::for_ram(&[], 1, 0).unwrap();
+        let columns = vec![Column::new::<u64>("born"), Column::new::<Text>(String::from("name"))];
+        let gathered = database
+            .head()
+            .deferred(&executor)
+            .docs_gather(CollectionID::main(), keys([1, 2]), columns, &mut arena)
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(gathered.rows(), 2);
+        assert_eq!(gathered.scalars::<u64>(0).unwrap(), &[1815, 1906]);
+        assert_eq!(gathered.strings(1).unwrap().get(1), Some(b"Grace".as_slice()));
     }
 
     #[test]
@@ -1862,8 +2151,6 @@ mod tests {
         assert_eq!(<f32 as FieldFormat>::bytes(&1.5), &1.5f32.to_ne_bytes());
         assert_eq!(<bool as FieldFormat>::bytes(&true), &[1]);
         assert_eq!(<Json as FieldFormat>::bytes("[]"), b"[]");
-        assert_eq!(size_of::<FieldEntry<'_, Json>>(), 40);
-        assert_eq!(size_of::<Column<'_>>(), 16);
     }
 }
 
