@@ -19,6 +19,7 @@
 #include "ustore/db.h"
 #include "ustore/docs.h"
 #include "ustore/graph.h"
+#include "ustore/ranges.hpp"
 #include "ustore/types.hpp"
 
 namespace unum::ustore::bench {
@@ -31,19 +32,6 @@ struct keyed_document_t {
 
     /** JSON text of the document. */
     std::string_view body;
-};
-
-/** A directed edge between two vertices, labeled by an edge key. */
-struct graph_edge_t {
-
-    /** Source vertex. */
-    ustore_key_t source;
-
-    /** Target vertex. */
-    ustore_key_t target;
-
-    /** Edge key, @c ustore_default_edge_id_k for an unlabeled edge. */
-    ustore_key_t id;
 };
 
 /** Elements the flattened sequence of sequences @p outer holds. */
@@ -63,23 +51,6 @@ template <typename nested_type_, typename element_type_>
         }
     return true;
 }
-
-/** One document of an upsert batch, laid out for the strided C ABI. */
-struct batch_document_t {
-
-    /** Key the document is upserted under. */
-    ustore_key_t key;
-
-    /** First byte of the document's JSON text. */
-    ustore_bytes_cptr_t value;
-
-    /** Bytes of the document's JSON text. */
-    ustore_length_t length;
-
-    batch_document_t(keyed_document_t const& document) noexcept
-        : key(document.key), value(reinterpret_cast<ustore_bytes_cptr_t>(document.body.data())),
-          length(static_cast<ustore_length_t>(document.body.size())) {}
-};
 
 /** The transaction and outcome one upserting thread reuses across its batches. */
 struct upsert_scratch_t {
@@ -121,43 +92,37 @@ struct upsert_scratch_t {
 
 /** Upserts @p batch into @p collection in one transaction, answering whether it committed. */
 [[nodiscard]] inline bool docs_upsert(ustore_database_t database, ustore_collection_id_t collection,
-                                      std::span<batch_document_t const> batch, upsert_scratch_t& scratch) noexcept {
+                                      std::span<keyed_document_t const> batch, upsert_scratch_t& scratch) noexcept {
     if (!scratch.begin(database)) return false;
+    strided_strings<std::string_view> const bodies {strided(batch).members(&keyed_document_t::body).begin()};
     ustore_docs_write_t write {};
     write.database = database;
     write.outcome = &scratch.outcome;
     write.transaction = scratch.transaction;
-    write.type = ustore_doc_field_json_k;
-    write.modification = ustore_doc_modify_upsert_k;
+    write.type = ustore_docs_field_type_json_k;
+    write.modification = ustore_docs_modify_upsert_k;
     write.count = batch.size();
-    write.collections = &collection;
-    write.keys = &batch.front().key;
-    write.keys_stride = sizeof(batch_document_t);
-    write.lengths = &batch.front().length;
-    write.lengths_stride = sizeof(batch_document_t);
-    write.values = &batch.front().value;
-    write.values_stride = sizeof(batch_document_t);
+    write.collections = {&collection, 0};
+    write.keys = {&batch.front().key, sizeof(keyed_document_t)};
+    write.values = bodies.view();
     ustore_docs_write(&write);
     return !scratch.failed() && scratch.commit(database);
 }
 
 /** Upserts @p batch into @p collection in one transaction, answering whether it committed. */
 [[nodiscard]] inline bool edges_upsert(ustore_database_t database, ustore_collection_id_t collection,
-                                       std::span<graph_edge_t const> batch, upsert_scratch_t& scratch) noexcept {
+                                       std::span<edge_t const> batch, upsert_scratch_t& scratch) noexcept {
     if (!scratch.begin(database)) return false;
-    ustore_graph_upsert_edges_t upsert {};
-    upsert.database = database;
-    upsert.outcome = &scratch.outcome;
-    upsert.transaction = scratch.transaction;
-    upsert.count = batch.size();
-    upsert.collections = &collection;
-    upsert.edges = &batch.front().id;
-    upsert.edges_stride = sizeof(graph_edge_t);
-    upsert.sources = &batch.front().source;
-    upsert.sources_stride = sizeof(graph_edge_t);
-    upsert.targets = &batch.front().target;
-    upsert.targets_stride = sizeof(graph_edge_t);
-    ustore_graph_upsert_edges(&upsert);
+    ustore_graph_write_edges_t write {};
+    write.database = database;
+    write.outcome = &scratch.outcome;
+    write.transaction = scratch.transaction;
+    write.count = batch.size();
+    write.collections = {&collection, 0};
+    write.edges = {&batch.front().id, sizeof(edge_t)};
+    write.sources = {&batch.front().source, sizeof(edge_t)};
+    write.targets = {&batch.front().target, sizeof(edge_t)};
+    ustore_graph_write_edges(&write);
     return !scratch.failed() && scratch.commit(database);
 }
 

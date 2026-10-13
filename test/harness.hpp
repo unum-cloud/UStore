@@ -1,5 +1,5 @@
 /**
- *  @file test/test.hpp
+ *  @file test/harness.hpp
  *  @author Ash Vardanian
  *  @date September 15, 2026
  *  @brief Shared checks for the C++ test suites: failure counting, results, the totals, bounded waits, flags and
@@ -17,20 +17,23 @@
 #include <cstdio>  // `stderr`
 #include <cstring> // `std::memcpy`, `std::strlen`
 
-#include <array>        // `std::array`
-#include <chrono>       // `std::chrono::steady_clock`
-#include <filesystem>   // `std::filesystem::create_directories`, `std::filesystem::remove_all`
-#include <span>         // `std::span`
-#include <string>       // `std::string`, what `std::filesystem::path::generic_string` answers
-#include <string_view>  // `std::string_view`
-#include <system_error> // `std::error_code`
-#include <thread>       // `std::thread::hardware_concurrency`
-#include <type_traits>  // `std::type_identity_t`
+#include <array>            // `std::array`
+#include <chrono>           // `std::chrono::steady_clock`
+#include <filesystem>       // `std::filesystem::create_directories`, `std::filesystem::remove_all`
+#include <initializer_list> // `std::initializer_list`
+#include <span>             // `std::span`
+#include <string>           // `std::string`, what `std::filesystem::path::generic_string` answers
+#include <string_view>      // `std::string_view`
+#include <system_error>     // `std::error_code`
+#include <thread>           // `std::thread::hardware_concurrency`
+#include <type_traits>      // `std::type_identity_t`
+#include <utility>          // `std::move`
 
 #include <fmt/format.h>
 
 #include <forkunion/capabilities.hpp> // `fu::preferred_yield_t`
 #include <smashtable/shared.hpp>
+#include <stringzilla/stringzilla.hpp> // `sz::status_t`, `sz::strings_view_t`
 
 #include "ustore/db.h"
 #include "ustore/status.hpp" // `status_t`, `status_code_t`, `expected`
@@ -101,11 +104,12 @@ inline std::size_t expect_near_(double actual, double wanted, char const* expres
 [[nodiscard]] constexpr char const* describe(status_code_t code) noexcept {
     switch (code) {
     case status_code_t::success_k: return "success_k";
+    case status_code_t::deferred_k: return "deferred_k";
     case status_code_t::out_of_memory_k: return "out_of_memory_k";
     case status_code_t::invalid_argument_k: return "invalid_argument_k";
     case status_code_t::uninitialized_k: return "uninitialized_k";
     case status_code_t::unsupported_k: return "unsupported_k";
-    case status_code_t::input_output_k: return "input_output_k";
+    case status_code_t::io_k: return "io_k";
     case status_code_t::malformed_k: return "malformed_k";
     case status_code_t::not_found_k: return "not_found_k";
     case status_code_t::already_exists_k: return "already_exists_k";
@@ -115,9 +119,9 @@ inline std::size_t expect_near_(double actual, double wanted, char const* expres
     case status_code_t::capacity_exhausted_k: return "capacity_exhausted_k";
     case status_code_t::device_k: return "device_k";
     case status_code_t::internal_k: return "internal_k";
-    case status_code_t::pending_k: return "pending_k";
     case status_code_t::contended_k: return "contended_k";
     case status_code_t::cancelled_k: return "cancelled_k";
+    case status_code_t::read_only_k: return "read_only_k";
     }
     return "unknown";
 }
@@ -297,6 +301,15 @@ template <typename body_type_>
     return failures;
 }
 
+/** Fills @p tape with @p texts in order, as a deferred call owns its strings, values or fields, counting one failure
+ *  when it cannot. */
+template <typename tape_type_>
+[[nodiscard]] std::size_t fill_tape(tape_type_& tape, std::initializer_list<sz::string_view_t> texts) {
+    auto gathered = sz::strings_view_t({texts.begin(), texts.size()}).gather();
+    if (gathered.status == sz::status_t::success_k) tape = std::move(gathered.value);
+    return expect(gathered.status == sz::status_t::success_k);
+}
+
 /** Spin ceiling for waits on flags a peer sets within bounded work; expiry proves a broken rendezvous. */
 constexpr std::size_t spin_limit_k = std::size_t {1} << 28;
 
@@ -316,9 +329,9 @@ template <typename condition_type_>
 constexpr char const* needs_directory_k = "needs --directory";
 
 /** A splitmix64 generator, seeded once per suite and forked once per thread, so every draw replays from one seed. */
-class test_random_t {
+class random_t {
   public:
-    explicit constexpr test_random_t(std::uint64_t seed) noexcept : state_(seed) {}
+    explicit constexpr random_t(std::uint64_t seed) noexcept : state_(seed) {}
 
     /** The next 64 random bits. */
     constexpr std::uint64_t next() noexcept {
@@ -332,9 +345,9 @@ class test_random_t {
     constexpr std::uint64_t below(std::uint64_t bound) noexcept { return next() % bound; }
 
     /** The generator of the thread at @p index, which draws a stream distinct from every sibling's. */
-    [[nodiscard]] constexpr test_random_t fork(std::size_t index) const noexcept {
-        test_random_t branch {state_ + (index + 1) * 0xD1B54A32D192ED03ull};
-        return test_random_t {branch.next()};
+    [[nodiscard]] constexpr random_t fork(std::size_t index) const noexcept {
+        random_t branch {state_ + (index + 1) * 0xD1B54A32D192ED03ull};
+        return random_t {branch.next()};
     }
 
   private:
@@ -393,7 +406,7 @@ struct suite_options_t {
     }
 
     /** A generator seeded by these options. */
-    [[nodiscard]] test_random_t random() const noexcept { return test_random_t {seed.value}; }
+    [[nodiscard]] random_t random() const noexcept { return random_t {seed.value}; }
 };
 
 /** Most flags one suite adds to the shared ones. */
@@ -448,13 +461,13 @@ constexpr std::size_t suite_flags_capacity_k = 16;
 constexpr std::size_t path_capacity_k = 4096;
 
 /** A path of one name under one directory, held inline. */
-struct test_path_t {
+struct path_t {
 
     /** The null-terminated path. */
     char text[path_capacity_k] {};
 
     /** Joins @p directory and @p name with a slash, truncated to fit. */
-    test_path_t(char const* directory, char const* name) noexcept {
+    path_t(char const* directory, char const* name) noexcept {
         auto const written = fmt::format_to_n(text, sizeof(text) - 1, "{}/{}", directory, name);
         *written.out = '\0';
     }
@@ -464,11 +477,11 @@ struct test_path_t {
 };
 
 /** The engine a case opens, with the directory it works in. */
-class test_config_t {
+class config_t {
   public:
 
     /** Opens the engine @p options name in @p directory, or in memory when @p directory is null. */
-    explicit test_config_t(engine_options_t options, char const* directory) noexcept : options_(options) {
+    explicit config_t(engine_options_t options, char const* directory) noexcept : options_(options) {
         options_.directory = directory;
     }
 
@@ -486,18 +499,18 @@ class test_config_t {
 };
 
 /** Opens the engine @p config names through the C ABI. */
-inline expected<ustore_database_t> open_raw(test_config_t const& config) noexcept {
+inline expected<ustore_database_t> open_raw(config_t const& config) noexcept {
     ustore_database_t database = nullptr;
     ustore_outcome_t outcome {};
     open_engine(config.options(), &database, &outcome);
-    if (outcome.status != ustore_status_success_k) return status_t {outcome};
+    if (status_t const status {outcome}; status.failed()) return status;
     return database;
 }
 
 /** Opens the engine @p config names as a C++ @p database_type_, which adopts the handle. A template, so this header
  *  needs no @c ustore/db.hpp, whose names would clash with the storage suites' own. */
 template <typename database_type_>
-expected<database_type_> open_database(test_config_t const& config) noexcept {
+expected<database_type_> open_database(config_t const& config) noexcept {
     auto [database, open_status] = open_raw(config);
     if (open_status.failed()) return open_status;
     return database_type_ {database};
@@ -522,18 +535,18 @@ expected<database_type_> open_database(test_config_t const& config) noexcept {
  *
  *  Without a parent it names no path, and the cases that need persistence report skipped.
  */
-class test_directory_t {
+class directory_t {
   public:
-    test_directory_t(test_directory_t&& other) noexcept {
+    directory_t(directory_t&& other) noexcept {
         std::memcpy(path_, other.path_, sizeof(path_));
         other.path_[0] = '\0';
     }
 
-    test_directory_t& operator=(test_directory_t&&) = delete;
-    test_directory_t(test_directory_t const&) = delete;
-    test_directory_t& operator=(test_directory_t const&) = delete;
+    directory_t& operator=(directory_t&&) = delete;
+    directory_t(directory_t const&) = delete;
+    directory_t& operator=(directory_t const&) = delete;
 
-    ~test_directory_t() noexcept {
+    ~directory_t() noexcept {
         if (path_[0] == '\0') return;
         std::error_code error;
         std::filesystem::remove_all(path_, error);
@@ -541,9 +554,9 @@ class test_directory_t {
     }
 
     /** Creates @p parent with its parents and a unique directory inside it, or names none for an empty @p parent. */
-    [[nodiscard]] static st::expected<test_directory_t> make(std::string_view parent) noexcept {
+    [[nodiscard]] static st::expected<directory_t> make(std::string_view parent) noexcept {
         using st::status_t;
-        test_directory_t directory;
+        directory_t directory;
         if (parent.empty()) return directory;
 
         std::error_code error;
@@ -574,7 +587,7 @@ class test_directory_t {
     [[nodiscard]] char const* path() const noexcept { return path_[0] != '\0' ? path_ : nullptr; }
 
   private:
-    test_directory_t() noexcept = default;
+    directory_t() noexcept = default;
 
     /** The null-terminated path, empty when the suite runs without a directory. */
     char path_[path_capacity_k] {};

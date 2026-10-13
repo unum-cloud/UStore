@@ -1,13 +1,14 @@
 # Tests
 
-UStore's suites carry no framework: every check in `test/test.hpp` returns its failure count, counts roll up through each case to `main`, and the process exit code is the result.
+UStore's suites carry no framework: every check in `test/harness.hpp` returns its failure count, counts roll up through each case to `main`, and the process exit code is the result.
 A suite prints one `passed`, `FAILED` or `skipped` line per case and a `total` line last.
 
 ```cpp
-case_result_t database_scan(char const* directory) {
+case_result_t database_scan(config_t const& config) {
     std::size_t failures = 0;
-    failures += expect(database.open(config.c_str()));
-    failures += expect_status(database.remove(missing), status_code_t::not_found_k);
+    auto [database, open_status] = open_database<database_t>(config);
+    failures += expect(open_status.succeeded());
+    failures += expect_status(database.drop("missing"), status_code_t::not_found_k);
     if (!database.supports_snapshots()) return case_result_t::skipped("the engine keeps no snapshots", failures);
     return failures;
 }
@@ -17,7 +18,10 @@ int main(int argc, char** argv) {
     if (argument_status_t const status = parse_suite_options(argc, argv, options); status != argument_status_t::parsed_k)
         return status == argument_status_t::help_k ? 0 : 1;
     suite_totals_t totals = options.totals();
-    report(totals, "database.scan", database_scan(options.directory));
+    auto const test_directory = directory_t::make(options.directory);
+    if (!test_directory) return 1;
+    config_t const config {options.engine, test_directory->path()};
+    report(totals, "database.scan", database_scan, config);
     return suite_exit_code(totals);
 }
 ```
@@ -28,7 +32,7 @@ A skip names the reason a case did not run, so a suite passing on nothing is vis
 
 ## Suites
 
-- __Conformance__ — `units.cpp`, `api.cpp`, `compilation.cpp`, `strings.cpp` and `strings_collection.cpp` check the C ABI and its C++ wrappers, identically on every engine.
+- __Conformance__ — `units.cpp`, `api.cpp`, `compilation.cpp`, `strings.cpp` and `strings_collection.cpp` check the C ABI and its C++ wrappers, identically on every engine, and `c/test.c` calls the C ABI from plain C11 once per shape of its arguments.
 - __Tools__ — `tools.cpp` checks dataset imports and exports, and the CLI against a real directory.
 - __Components__ — `nvme_*.cpp` and `nvme_*.cu` check the NVMe engine's parts below the C ABI, each on every transport the machine offers.
 - __Stress__ — `stress_atomicity.cpp` and `stress_linearizability.cpp` check atomicity and linearizability under concurrent transactions.
@@ -39,15 +43,18 @@ A skip names the reason a case did not run, so a suite passing on nothing is vis
 The C ABI scenarios — collections, transactions, snapshots, scans, documents and graphs — are written once and compiled into one executable per suite, named `ustore_test_<suite>`, which CTest runs once per engine as `ustore_test_<suite>_<engine>`, such as `ustore_test_units_rocksdb`.
 Every engine answers the same questions, and the translation units build in parallel.
 `units.cpp` drives blobs, documents and graphs through the C++ wrappers, `api.cpp` checks that the C ABI accepts valid argument combinations and rejects malformed ones, and `compilation.cpp` calls every wrapper in each accepted form, so a broken call site fails to build.
-Each suite asks the open database through `ustore_get_metadata` whether it supports named collections, transactions and snapshots, and a case needing a missing capability returns without checks.
+Each suite asks the open database through `ustore_database_describe` whether it supports named collections, transactions and snapshots, and a case needing a missing capability returns without checks.
+`c/test.c` builds twice, as `ustore_test_c` against `ustore::static` and `ustore_test_c_shared` against `ustore::shared`, so a function the headers declare but the shared library does not export fails to link.
+Both build with `-Werror` wherever the compiler is not MSVC, so a header that only a C++ compiler accepts fails to build, and a shape the library misreads fails the run.
 
 ### Components
 
 The engine suites share `nvme_fixture.hpp`: one shape per suite, one mount per transport, and a driver that runs every case on memory, on files through the blocking floor and through io_uring, and on a block device.
 A transport the machine does not offer skips with its reason, and a transport the flags claim that then fails to mount fails the suite.
 Every result line reads `<suite>.<transport>.<case>`.
+CMake builds the `.cpp` suites below as `ustore_test_nvme_<suite>`, the Linux transports only on Linux, and the host half of `nvme_compaction.cu` with every test build, while `nvme_write_buffer.cpp` and the other `.cu` suites have no CMake target yet.
 
-- `nvme_ring.cpp`, `nvme_linux_uring.cpp`, `nvme_linux_spdk.cpp` — the ring contract of `nvme_ring_cases.hpp` on the RAM and blocking transports, on io_uring with what only a kernel queue can get wrong, and on SPDK.
+- `nvme_ring.cpp`, `nvme_linux_uring.cpp`, `nvme_linux_aio.cpp`, `nvme_linux_spdk.cpp` — the ring contract of `nvme_ring_cases.hpp` on the RAM and blocking transports, on io_uring with what only a kernel queue can get wrong, on Linux AIO, and on SPDK.
 - `nvme_channels.cpp` — the registered arena, the blocks channels queue pair out of it, and the pipelines that keep a ring at depth.
 - `nvme_volume.cpp` — the catalog of two slots, the crashes it survives, and the router above it.
 - `nvme_catalog.cpp` — the catalog records and the schema blobs a database persists.
@@ -61,7 +68,7 @@ Every result line reads `<suite>.<transport>.<case>`.
 
 ## Building
 
-The SmashTable engine is always built, and each other engine is switched on by its option.
+The `ram` engine is always built, and each other engine is switched on by its option.
 `tools.cpp` builds only when the CLI does, since it drives the CLI of the same engine.
 
 ```sh
@@ -148,7 +155,7 @@ build_debug/build/bin/ustore_test_tools --engine rocksdb --directory /dev/shm/us
 
 ### Stress
 
-Stress suites are separate executables with a time bound, run on demand and in nightly CI rather than on every push.
+Stress suites are separate executables with a time bound, which CTest runs once per engine under the default bound, while longer runs pass their own `--time-limit`.
 Atomicity batch-inserts intersecting key ranges from several threads in rounds, and checks after each round that every batch landed whole or not at all; on an engine without transactions its cases pass without checks.
 Linearizability replays concurrent write transactions in commit order and compares the result with the state the database holds; an engine without transactions reports it `skipped`.
 `--time-limit` bounds the whole run and is shared evenly by every configuration, each of which runs at least one round and at most `--checkpoints` rounds.

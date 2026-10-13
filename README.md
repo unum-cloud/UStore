@@ -1,576 +1,317 @@
 <h1 align="center">UStore</h1>
 <h3 align="center">
-Modular <sup>1</sup> Multi-Modal <sup>2</sup> Transactional <sup>3</sup> Database<br/>
-For Artificial Intelligence <sup>4</sup> and Semantic Search <sup>5</sup><br/>
+GPU-Accelerated Embedded Transactional Database<br/>
+for High-Throughput NVMe Devices
 </h3>
 <br/>
 
 <p align="center">
-<a href="https://www.youtube.com/watch?v=ybWeUf_hC7o"><img height="25" width="25" src="https://github.com/unum-cloud/.github/raw/main/assets/youtube.svg" alt="Youtube"></a>
+<a href="https://discord.gg/4mxGrenbNt"><img height="25" src="https://github.com/unum-cloud/.github/raw/main/assets/discord.svg" alt="Discord"></a>
 &nbsp;&nbsp;&nbsp;
-<a href="https://discord.gg/4mxGrenbNt"><img height="25" width="25" src="https://github.com/unum-cloud/.github/raw/main/assets/discord.svg" alt="Discord"></a>
+<a href="https://www.linkedin.com/company/unum-cloud/"><img height="25" src="https://github.com/unum-cloud/.github/raw/main/assets/linkedin.svg" alt="LinkedIn"></a>
 &nbsp;&nbsp;&nbsp;
-<a href="https://www.linkedin.com/company/unum-cloud/"><img height="25" width="25" src="https://github.com/unum-cloud/.github/raw/main/assets/linkedin.svg" alt="LinkedIn"></a>
+<a href="https://twitter.com/unum_cloud"><img height="25" src="https://github.com/unum-cloud/.github/raw/main/assets/twitter.svg" alt="Twitter"></a>
 &nbsp;&nbsp;&nbsp;
-<a href="https://twitter.com/unum_cloud"><img height="25" width="25" src="https://github.com/unum-cloud/.github/raw/main/assets/twitter.svg" alt="Twitter"></a>
+<a href="https://unum.cloud/post"><img height="25" src="https://github.com/unum-cloud/.github/raw/main/assets/blog.svg" alt="Blog"></a>
 &nbsp;&nbsp;&nbsp;
-<a href="https://unum.cloud/post"><img height="25" width="25" src="https://github.com/unum-cloud/.github/raw/main/assets/blog.svg" alt="Blog"></a>
-&nbsp;&nbsp;&nbsp;
-<a href="https://github.com/unum-cloud/ukv"><img height="25" width="25" src="https://github.com/unum-cloud/.github/raw/main/assets/github.svg" alt="GitHub"></a>
+<a href="https://github.com/unum-cloud/UStore"><img height="25" src="https://github.com/unum-cloud/.github/raw/main/assets/github.svg" alt="GitHub"></a>
 </p>
 
-<div align="center">
-1. supports:
-<a href="https://github.com/facebook/rocksdb">RocksDB</a>
-•
-<a href="https://github.com/google/leveldb">LevelDB</a>
-•
-<a href="https://github.com/unum-cloud/udisk">UDisk</a>
-•
-<a href="https://github.com/unum-cloud/ucset">UCSet</a>
-<a href="backends">backends</a>
+<p align="center">
+Blobs • Documents • Graphs
 <br/>
-2. can store:
-<a href="#Blobs">Blobs</a>
-•
-<a href="#Documents">Documents</a>
-•
-<a href="#Graphs">Graphs</a>
-•
-🔜 Features
-•
-🔜 Texts
-<br/>
-3: guarantees
-<a href="#Atomicity">Atomicity</a>
-•
-<a href="#Consistency">Consistency</a>
-•
-<a href="#Isolation">Isolation</a>
-•
-<a href="#Durability">Durability</a>
-<br/>
-4: comes with
-Pandas
-and
-NetworkX
-API
-and 🔜
-PyTorch data-loaders
-<br/>
-5: brings
-vector-search
-integrated with
-<a href="https://github.com/unum-cloud/usearch">USearch</a>
-and
-<a href="https://github.com/unum-cloud/uform">UForm</a>
-</div>
+C • C++ • Python • Rust
+</p>
 
----
+UStore is a GPU-accelerated embedded DBMS for high-throughput NVMe devices, GPUDirect Storage and similar direct paths between drives, memory and accelerators.
+It links into the process that uses it, and there is no server to deploy.
+It is open about where its speed comes from: kernel bypass through io_uring and SPDK, SIMD for fast point lookups, and GPUs for LSM compactions and other bulk operations.
+Those paths belong to NVMe, the hyper-converged engine that v1 targets, while the reference `ram` engine and the RocksDB and LevelDB engines run behind the same C ABI today, as [Roadmap to v1](#roadmap-to-v1) details.
 
-<div align="center">
-<b>drivers</b>:
-Python
-•
-C
-•
-C++
-•
-GoLang
-•
-Java
-<br/>
-<b>packages</b>:
-<a href="https://pypi.org/project/ukv/">PyPI</a>
-•
-<a href="#cmake">CMake</a>
-•
-<a href="https://hub.docker.com/repository/docker/unum/ustore">Docker Hub</a>
+- __Transactions across collections__ — blobs, documents and graphs stage into one transaction and commit together.
+- __One C ABI over every engine__ — the same calls run on the in-memory `ram` reference engine and on the RocksDB and LevelDB key-value stores, and will run on NVMe once its sources build.
+- __Isolation chosen at open__ — the `ram` engine runs at `strict_serializable` or `snapshot`, picked by the `isolation` field of `ustore_database_init_ram_t`.
+- __Documents without a query language__ — fields are addressed by JSON Pointer and modified by JSON Patch and JSON MergePatch.
+- __Graphs as a modality__ — directed multigraphs with identified edges, stored in the same database as the documents they relate.
+- __Batches with strides__ — every call takes arrays of keys, values and collections, laid out as structures of arrays or arrays of structures.
+- __Sampling as a primitive__ — `ustore_blobs_sample` draws random keys from a collection, next to read, write and scan.
 
-<a href="https://www.youtube.com/watch?v=ybWeUf_hC7o">Youtube</a> intro • 
-<a href="https://discord.gg/4mxGrenbNt">Discord</a> chat • 
-Full <a href="https://unum-cloud.github.io/ustore">documentation</a>
+## Architecture
 
-<a href="https://discord.gg/4mxGrenbNt"><img src="https://img.shields.io/discord/1063947616615923875?label=discord"></a>
-&nbsp;&nbsp;
-<a href="https://www.linkedin.com/company/unum-cloud/"><img src="https://img.shields.io/badge/linkedin-connect_with_us-0a66c2.svg?"/></a>
-&nbsp;&nbsp;
-<a href="https://twitter.com/unum_cloud"><img src="https://img.shields.io/badge/twitter-follow_us-1d9bf0.svg?"/></a>
-&nbsp;&nbsp;
-<a href="https://zenodo.org/badge/latestdoi/502647695"><img src="https://zenodo.org/badge/502647695.svg" alt="DOI"></a>
-&nbsp;&nbsp;
-<a href="https://www.github.com/unum-cloud/"><img src="https://img.shields.io/github/issues-closed-raw/unum-cloud/ustore?"/></a>
-&nbsp;&nbsp;
-<a href="https://www.github.com/unum-cloud/"><img src="https://img.shields.io/github/stars/unum-cloud/ustore?"/></a>
-&nbsp;&nbsp;
-<a href="#"><img src="https://img.shields.io/github/workflow/status/unum-cloud/ustore/Build"/></a>
-</div>
+| Layer      | What it is                                                             | Where                  |
+| :--------- | :--------------------------------------------------------------------- | :--------------------- |
+| Bindings   | C, C++, Python and Rust, each forwarding rather than reimplementing    | `python/`, `rust/`     |
+| C ABI      | One argument struct per call, 128-bit UUID keys                        | `include/ustore/*.h`   |
+| Modalities | Documents and graphs, written once over any engine                     | `src/*.cpp`            |
+| Engines    | `ram` and `nvme` are ours, `rocksdb` and `leveldb` are checked against | `src/`, `src_oracles/` |
+| Hardware   | NVMe drives, GPUs and CPU cores, in one box                            | —                      |
+
+- __The C ABI__ in `include/ustore/*.h` is the only interface: every call takes one argument struct, and every binding forwards to it.
+- __The modalities__ in `src/docs.cpp` and `src/graph.cpp` implement documents and graphs once, on top of whichever engine the library links, while the `ram` engine serves graphs on half-edges of its own and every engine keys its strings collections itself.
+- __The `ram` engine__ is the reference: ordered multi-version stores in memory on SmashTable containers, persisted as one binary image when it opens with a directory.
+- __NVMe__ is the engine the hardware paths serve: each collection is an `lsm_tree` of `lsm_level`s of `lsm_sorted_run`s, point lookups search SmashTable's SIMD row kits, compactions merge sorted runs on the CPU or a GPU, GPUDirect Storage moves runs between drives and GPU memory, and a transport chosen at mount reaches the drive through io_uring, SPDK or blocking positioned I/O.
+- __RocksDB and LevelDB__ keep their own storage formats, so an application moves between them and the other engines without changing a call.
+
+## Why Hyper-Converged
+
+Disaggregated storage puts a network between every query and its data, and a server full of PCIe 5.0 NVMe drives reads faster than the links in front of it carry.
+Compaction then turns into a remote copy, and a GPU that could merge sorted runs waits on bytes crossing the network twice.
+UStore argues for the opposite design: storage, compute and accelerators in one box, each device reached through the most direct path its platform offers.
+Kernel bypass removes the system calls and page-cache copies between the drive and the engine, GPUDirect Storage moves data between drives and GPU memory without staging it in host memory, and SIMD kits keep point lookups on the CPU, where a single lookup is too small to ship anywhere.
+Scale-out stays above the database, where a data-lake layer composes several such boxes through two-phase commits and each box keeps its own drives and accelerators.
 
 ## Quickstart
 
-Installing UStore is a breeze, and the usage is about as simple as a Python `dict`.
+UStore builds with CMake against StringZilla, ForkUnion and SmashTable, pulled as git submodules.
 
-```python
-$ pip install ukv
-$ python
-
-from ukv import umem
-
-db = umem.DataBase()
-db.main[42] = 'Hi'
+```cmake
+FetchContent_Declare(ustore GIT_REPOSITORY https://github.com/unum-cloud/UStore.git)
+FetchContent_MakeAvailable(ustore)
+target_link_libraries(my_app PRIVATE ustore::static)
 ```
 
-We have just create an in-memory embedded transactional database and added one entry in its `main` collection.
-Would you prefer that data on disk?
-Change one line.
+`ustore::static` is an archive that links the storage engines' archives installed beside it, `ustore::shared` exports the C ABI alone, and `-DUSTORE_INSTALL=ON` installs both with a CMake package for `find_package(ustore)`.
+`database_t::init_ram` starts an empty database of the in-memory engine.
 
-```python
-from ukv import rocksdb
+```cpp
+#include <ustore/ustore.hpp>
 
-db = rocksdb.DataBase('/some-folder/')
+using namespace unum::ustore;
+
+int main() {
+    auto [db, status] = database_t::init_ram();
+    if (status.failed())
+        return 1;
+
+    blobs_collection_t main = db.main();
+    if (main[key_from_integer(42)].assign("Hi").failed())
+        return 1;
+
+    auto value = main[key_from_integer(42)].value();
+    return value && *value == "Hi" ? 0 : 1;
+}
 ```
 
-Would you prefer to connect to a remote UStore server?
-UStore comes with an Apache Arrow Flight RPC interface!
+A persistent engine opens through its own constructor, which takes the directory, and the rest of the code stays the same.
 
-```python
-from ukv import flight_client
-
-db = flight_client.DataBase('grpc://0.0.0.0:38709')
+```cpp
+auto [db, status] = database_t::open_rocksdb({.directory = bytes_of("/var/lib/ustore/")});
 ```
 
-Are you storing [NetworkX][networkx]-like `MultiDiGraph`?
-Or [Pandas][pandas]-like `DataFrame`?
+`open_ram` persists the in-memory engine in a directory as one image, and `view_rocksdb` serves a RocksDB directory read-only, refusing every change with `status_code_t::read_only_k`.
+Every fallible C++ call returns a `status_t`, an `expected`, or a `deferred` call whose `wait` answers one, and every C call reports failure through its `ustore_outcome_t` argument, a status beside a static message.
+A deferred C call returns once submitted, and its outcome is polled through `ustore_outcome_status` and waited on through `ustore_outcome_wait`.
+Calls run on the calling thread until a receiver names an executor, which by default spawns a thread for 7/8 of the cores local to the memory domains it serves, and keeps its scratch and its arenas on those domains.
+Scans, cursor pulls, snapshot saves and compactions report their advance to an optional progress callback, which is the only way to cancel a call.
+The C ABI, its argument structs and the C++ wrappers are described in [`include/ustore/README.md`](include/ustore/README.md).
 
-```python
-db = rocksdb.DataBase()
+## Blobs
 
-users_table = db['users'].table
-users_table.merge(pd.DataFrame([
-    {'id': 1, 'name': 'Lex', 'lastname': 'Fridman'},
-    {'id': 2, 'name': 'Joe', 'lastname': 'Rogan'},
-]))
+A collection maps UUID keys to binary values, and the main collection exists in every database.
+Named collections are created on first use and address the same kind of values.
 
-friends_graph = db['friends'].graph
-friends_graph.add_edge(1, 2)
-
-assert friends_graph.has_edge(1, 2) and \
-    friends_graph.has_node(1) and \
-    friends_graph.number_of_edges(1, 2) == 1
+```cpp
+blobs_collection_t archive = *db.find_or_create("archive");
+status_t status = archive[key_from_integer(7)].assign("poster bytes");
+auto lengths = archive[{key_from_integer(1), key_from_integer(2), key_from_integer(7)}].length();
+status = archive[key_from_integer(7)].remove();
 ```
 
-Function calls may look identical, but the underlying implementation can be addressing hundreds of terabytes of data placed somewhere in persistent memory on a remote machine.
+A value sits inside the same transaction as its metadata, so a media file and the document describing it commit or fail together.
+A cursor walks a collection in pages, reading the values of each page in the same call, and resumes past the last key it handed out, so it sees keys written ahead of it and never those behind.
 
----
+Sampling is how a training loop shuffles a dataset whose metadata does not fit in RAM.
+`ustore_blobs_sample` returns a random subset of a collection's keys, and the reads that follow fetch only those.
 
-Is someone else concurrently updating those collections?
-Bundle your operations to guarantee consistency!
+## Documents
 
-```python
-db = rocksdb.DataBase()
-with db.transact() as txn:
-    txn['users'].table.merge(...)
-    txn['friends'].graph.add_edge(1, 2)
+A document collection stores JSON, parsed and modified with yyjson.
+A field is either a top-level key or an RFC 6901 JSON Pointer starting with a slash.
+
+```cpp
+docs_collection_t users = *db.find_or_create<docs_collection_t>("users");
+status_t status = users[key_from_integer(1)].assign(R"({"name": "Alice", "follows": [2, 3]})");
+
+auto name = users[collection_key_field_t {key_from_integer(1), "/name"}].value();
+status = users[key_from_integer(1)].patch(R"([{"op": "add", "path": "/age", "value": 24}])");
+status = users[key_from_integer(1)].merge(R"({"follows": null})");
 ```
 
-So far we have only covered the tip of the UStore.
-You may use it to...
+Modifications follow open RFCs rather than a proprietary query language, and each maps onto one `ustore_docs_modification_t` mode of `ustore_docs_write`:
 
-1. Get C99, Python, GoLang, or Java wrappers for RocksDB or LevelDB.
-2. Serve them via Apache Arrow Flight RPC to Spark, Kafka, or PyTorch.
-3. Store Document and Graphs in embedded DB, avoiding networking overheads.
-4. Tier DBMS between in-memory and persistent backends under one API.
+- [JSON Pointer, RFC 6901][pointer] addresses nested fields.
+- [JSON Patch, RFC 6902][patch] applies field-level updates.
+- [JSON MergePatch, RFC 7386][merge-patch] applies document-level updates.
 
-But UStore can more.
-Here is the map:
-
-- [Basic Usage](#basic-usage):
-  - [Modalities](#modalities)
-    - Storing [Blobs](#blobs)
-    - Storing [Documents](#documents)
-    - Storing [Graphs](#graphs)
-    - Storing [Vectors](#vectors)
-  - [Drivers](#drivers)
-    - For [Python ∆][ustore-python]
-    - For [C ∆][ustore-c]
-    - For [C++ ∆][ustore-cpp]
-    - For [GoLang ∆][ustore-golang]
-    - For [Java ∆][ustore-java]
-  - [AI Usecases ∆][ustore-ai]
-  - [Frequently Questioned Answers](#frequently-questioned-answers)
-  - [Frequently Asked Questions](#frequently-asked-questions)
-- [Advanced Usage](#advanced-usage) for production, performance tuning, and administration:
-  - [Engines](#engines)
-  - [Transactions](#transactions)
-    - [Atomicity](#atomicity)
-    - [Consistency](#consistency)
-    - [Isolation](#isolation)
-    - [Durability](#durability)
-  - [Containers and Cloud Deployments](#containers-and-cloud-deployments)
-  - [Configuration](#configuration)
-    - [Key Sizes](#key-sizes)
-    - [Value Sizes](#value-sizes)
-  - [Tools ∆][ustore-tools]
-  - [Tests ∆][ustore-tests]
-  - [Benchmarks ∆][ustore-benchmarks]
-- For contributors and advanced users looking to fork, extend, wrap, or distribute and, potentially, monetize alternative builds of UStore:
-  - [Architecture and Dependencies ∆][ustore-architecture]
-  - [Roadmap ∆][ustore-roadmap]
-  - [Contributing ∆][ustore-contributing]
-
-[ustore-c]: https://unum.cloud/docs/ustore/c
-[ustore-cpp]: https://unum.cloud/docs/ustore/cpp
-[ustore-python]: https://unum.cloud/docs/ustore/python
-[ustore-java]: https://unum.cloud/docs/ustore/java
-[ustore-golang]: https://unum.cloud/docs/ustore/golang
-
-[ustore-tests]: https://unum.cloud/docs/ustore/tests
-[ustore-benchmarks]: https://unum.cloud/docs/ustore/benchmarks
-[ustore-tools]: https://unum.cloud/docs/ustore/tools
-
-[ustore-ai]: https://unum.cloud/docs/ustore/ai
-[ustore-flight]: https://unum.cloud/docs/ustore/flight
-
-[ustore-architecture]: https://unum.cloud/docs/ustore/architecture
-[ustore-roadmap]: https://github.com/orgs/unum-cloud/projects/2
-[ustore-contributing]: https://unum.cloud/docs/ustore/contributing
-
-[ustore-c-headers]: https://github.com/unum-cloud/ustore/tree/main/include/ustore
-[ustore-new-drivers]: https://github.com/unum-cloud/ustore/c#implementing-a-new-language-binding
-[ustore-new-engine]: https://github.com/unum-cloud/ustore/c#implementing-a-new-engine
-
-
----
-
-## Basic Usage
-
-UStore is intended not just as database, but as "build your database" toolkit and an open standard for NoSQL potentially-transactional databases, defining zero-copy binary interfaces for "Create, Read, Update, Delete" operations, or CRUD for short.
-
-A [few simple C99 headers][ustore-c-headers] can link almost any underlying storage [engine](#engines) to numerous high-level language [drivers](#drivers), extending their support for binary string values to graphs, flexible-schema documents, and other [modalities](#modalities), aiming to replace MongoDB, Neo4J, Pinecone, and ElasticSearch with a single ACID-transactional system.
-
-![UStore: Small Map](assets/charts/Intro.png)
-
-[Redis][redis], for example, provides RediSearch, RedisJSON, and RedisGraph with similar objectives.
-UStore does it better, allowing you to add your favorite Key-Value Stores (KVS), embedded, standalone, or sharded, such as [FoundationDB][foundationdb], multiplying its functionality.
-
-### Modalities
-
-#### Blobs
-
-Binary Large Objects can be placed inside UStore.
-The performance will vastly vary depending on the used underlying technology.
-The in-memory UCSet will be the fastest, but the least suited for larger objects.
-The persistent UDisk, when properly configured, can entirely bypass the the Linux kernel, including the filesystem layer, directly addressing block devices.
-
-![Binary Processing Performance Chart for UDisk and RocksDB](assets/charts/PerformanceBinary.png)
-
-Modern persistent IO on high-end servers can exceed 100 GB/s per socket when built on user-space drivers like [SPDK][spdk].
-This is close to the real-world throughput of high-end RAM and unlocks new, uncommon to databases use cases.
-One may now put a Gigabyte-sized video file in an ACID-transactional database, right next to its metadata, instead of using a separate object store, like MinIO.
-
-#### Documents
-
-JSON is the most commonly used document format these days.
-UStore document collections support JSON, as well as MessagePack, and BSON, used by MongoDB.
-
-![Documents Processing Performance Chart for UStore and MongoDB](assets/charts/PerformanceDocs.png)
-
-UStore doesn't scale horizontally yet, but provides much higher single-node performance, and has almost linear vertical scalability on many-core systems thanks to the open-source `simdjson` and `yyjson` libraries.
-Moreover, to interact with data, you don't need a custom query language like MQL.
-Instead we prioritize open RFC standards to truly avoid vendor locks:
-
-- [JSON Pointer: RFC 6901][pointer] to address nested fields.
-- [JSON Patch: RFC 6902][patch] for field-level updates.
-- [JSON MergePatch: RFC 7386][merge-patch] for document-level updates.
+`insert`, `update` and `upsert` differ only in whether the document must be absent, present, or either.
+`gist` lists the unique paths to the leaves of a set of documents, and `gather` reads chosen fields of many documents into typed columns.
 
 [pointer]: https://datatracker.ietf.org/doc/html/rfc6901
 [patch]: https://datatracker.ietf.org/doc/html/rfc6902
 [merge-patch]: https://datatracker.ietf.org/doc/html/rfc7386
 
-#### Graphs
+## Graphs
 
-Modern Graph databases, like Neo4J, struggle with large workloads.
-They require too much RAM, and their algorithms observe data one entry at a time.
-We optimize on both fronts:
+A graph collection stores a directed multigraph, where every edge carries a source, a target and its own identifier.
 
-- Using delta-coding to compress inverted indexes.
-- Updating classical graph algorithms for high-latency storage to process graphs in Batch-like or Edge-centric fashion.
+```cpp
+graph_collection_t friends = *db.find_or_create<graph_collection_t>("friends");
+status_t status = friends.write_edge(edge_t {key_from_integer(1), key_from_integer(2), key_from_integer(100)});
+status = friends.write_edge(edge_t {key_from_integer(2), key_from_integer(3), key_from_integer(101)});
 
-#### Vectors
-
-Feature Stores and Vector Databases, like Pinecone, Milvus, and USearch provide standalone indexes for vector search.
-UStore implements it as a separate modality, on par with Documents and Graphs.
-Features:
-
-- 8-bit integer quantization.
-- 16-bit floating-point quantization.
-- Cosine, Inner Product, and Euclidean metrics.
-
-### Drivers
-
-UStore for Python and for C++ look very different.
-Our Python SDK mimics other Python libraries - [Pandas][pandas] and [NetworkX][networkx].
-Similarly, C++ library provides the interface C++ developers expect.
-
-![UStore: Frontends](assets/charts/Frontend.png)
-
-As we know, people use different languages for different purposes.
-Some C-level functionality isn't implemented for some languages.
-Either because there was no demand for it, or as we haven't gotten to it yet.
-
-| Name                        | Transact | Collections | Batches | Docs | Graphs | Copies |
-| :-------------------------- | :------: | :---------: | :-----: | :--: | :----: | :----: |
-| [C99 Standard][ustore-c]    | ✓        | ✓           | ✓       | ✓    | ✓      | 0      |
-|                             |          |             |         |      |        |        |
-| [C++ SDK][ustore-cpp]       | ✓        | ✓           | ✓       | ✓    | ✓      | 0      |
-| [Python SDK][ustore-python] | ✓        | ✓           | ✓       | ✓    | ✓      | 0-1    |
-| [GoLang SDK][ustore-golang] | ✓        | ✓           | ✓       | ✗    | ✗      | 1      |
-| [Java SDK][ustore-java]     | ✓        | ✓           | ✗       | ✗    | ✗      | 1      |
-|                             |          |             |         |      |        |        |
-| Arrow Flight API            | ✓        | ✓           | ✓       | ✓    | ✓      | 0-2    |
-
-Some frontends here have entire ecosystems around them!
-[Apache Arrow Flight][flight] API, for instance, has its own drivers for  C, C++, C#, Go, Java, JavaScript, Julia, MATLAB, Python, R, Ruby and Rust.
-
-![UStore: Frontends](assets/charts/Arrow.png)
-
-### Frequently Questioned Answers
-
-- Keys are 64-bit integers, by default. [Why?](#key-sizes)
-- Values are binary strings under 4 GB long. [Why?](#value-sizes)
-
-### Frequently Asked Questions
-
-- Transactions are ACI(D) by-default. [What does it mean?](#transactions)
-- Why not use LevelDB or RocksDB interface? [Answered][ustore-vs-rocks]
-- Why not use SQL, MQL or CYPHER? [Answered][ustore-vs-sql]
-- Does UStore support Time-To-Live? [Answered][ustore-ttl]
-- Does UStore support compression? [Answered][ustore-compression]
-- Does UStore support queues? [Answered][ustore-queues]
-- How can I add drivers for language X? [Answered][ustore-new-drivers]
-- How can I add database X as an engine? [Answered][ustore-new-engine]
-
-[ustore-vs-rocks]: https://unum.cloud/docs/ustore/related#leveldb-rocksdb
-[ustore-vs-sql]: https://unum.cloud/docs/ustore/related#sql-mql-cypher
-
-[ustore-ttl]: https://github.com/unum-cloud/ustore/discussions/230
-[ustore-compression]: https://github.com/unum-cloud/ustore/discussions/232
-[ustore-queues]: https://github.com/unum-cloud/ustore/discussions/228
-
-## Advanced Usage
-
-### Engines
-
-Following engines can be used almost interchangeably.
-Historically, LevelDB was the first one.
-RocksDB then improved on functionality and performance.
-Now it serves as the foundation for half of the DBMS startups.
-
-|                          | LevelDB | RocksDB  |  UDisk  |  UCSet  |
-| :----------------------- | :-----: | :------: | :-----: | :-----: |
-| **Speed**                |   1x    |    2x    | **10x** | **30x** |
-| **Persistent**           |    ✓    |    ✓     |    ✓    |    ✗    |
-| **Transactional**        |    ✗    |    ✓     |    ✓    |    ✓    |
-| **Block Device Support** |    ✗    |    ✗     |    ✓    |    ✗    |
-| Encryption               |    ✗    |    ✗     |    ✓    |    ✗    |
-| [Watches][watch]         |    ✗    |    ✓     |    ✓    |    ✓    |
-| [Snapshots][snap]        |    ✓    |    ✓     |    ✓    |    ✗    |
-| Random Sampling          |    ✗    |    ✗     |    ✓    |    ✓    |
-| Bulk Enumeration         |    ✗    |    ✗     |    ✓    |    ✓    |
-| Named Collections        |    ✗    |    ✓     |    ✓    |    ✓    |
-| Open-Source              |    ✓    |    ✓     |    ✗    |    ✓    |
-| Compatibility            |   Any   |   Any    |  Linux  |   Any   |
-| Maintainer               | Google  | Facebook |  Unum   |  Unum   |
-
-UCSet and UDisk are both designed and maintained by Unum.
-Both are feature-complete, but the most crucial feature our alternatives provide is performance.
-Being fast in memory is easy.
-The core logic of UCSet can be found in the templated header-only <code class="docutils literal notranslate"><a href="https://github.com/unum-cloud/ucset" class="pre">ucset</a></code> library.
-
-Designing UDisk was a much more challenging 7-year long endeavour.
-It included inventing new tree-like structures, implementing partial kernel bypass with `io_uring`, complete bypass with `SPDK`, CUDA GPU acceleration, and even a custom internal filesystem.
-**UDisk is the first engine to be designed from scratch with parallel architectures and kernel-bypass in mind**.
-
-### Transactions
-
-#### Atomicity
-
-Atomicity is always guaranteed.
-Even on non-transactional writes - either all updates pass or all fail.
-
-#### Consistency
-
-Consistency is implemented in the strictest possible form - ["Strict Serializability"][ss] meaning that:
-
-- reads are ["Serializable"][s],
-- writes are ["Linearizable"][l].
-
-The default behavior, however, can be tweaked at the level of specific operations.
-For that the `::ustore_option_transaction_dont_watch_k` can be passed to `ustore_transaction_init()` or any transactional read/write operation, to control the consistency checks during staging.
-
-|                                      |     Reads     |    Writes     |
-| :----------------------------------- | :-----------: | :-----------: |
-| Head                                 | Strict Serial | Strict Serial |
-| Transactions over [Snapshots][snap]  |    Serial     | Strict Serial |
-| Transactions w/out [Snapshots][snap] | Strict Serial | Strict Serial |
-| Transactions w/out Watches           | Strict Serial |  Sequential   |
-
-If this topic is new to you, please check out the [Jepsen.io][jepsen] blog on consistency.
-
-[ss]: https://jepsen.io/consistency/models/strict-serializable
-[s]: https://jepsen.io/consistency/models/serializable
-[l]: https://jepsen.io/consistency/models/linearizable
-[jepsen]: https://jepsen.io/consistency
-[snap]: #snapshots
-
-#### Isolation
-
-|                                      | Reads | Writes |
-| :----------------------------------- | :---: | :----: |
-| Transactions over [Snapshots][snap]  |   ✓   |   ✓    |
-| Transactions w/out [Snapshots][snap] |   ✗   |   ✓    |
-
-#### Durability
-
-Durability doesn't apply to in-memory systems by definition.
-In hybrid or persistent systems we prefer to disable it by default.
-Almost every DBMS that builds on top of KVS prefers to implement its own durability mechanism.
-Even more so in distributed databases, where three separate Write Ahead Logs may exist:
-
-- in KVS,
-- in DBMS,
-- in Distributed Consensus implementation.
-
-If you still need durability, flush writes on commits with an optional flag.
-In the [C driver][ustore-c] you would call `ustore_transaction_commit()` with the `::ustore_option_write_flush_k` flag.
-
-### Containers and Cloud Deployments
-
-The entire DBMS fits into a sub 100 MB Docker image.
-Run the following script to pull and run the container, exposing [Apache Arrow Flight][flight] server on the port `38709`.
-Client SDKs will also communicate through that same port, by default.
-
-```sh
-docker run -d --rm --name ustore-test -p 38709:38709 unum/ustore
+auto [arena, arena_status] = arena_t::make();
+auto neighbors = friends.neighbors(key_from_integer(2), arena);
+auto degree = friends.degree(key_from_integer(2), ustore_vertex_role_source_k);
+auto present = friends.present(key_from_integer(3));
 ```
 
-The default configuration file can be retrieved with:
+The neighbors land in the arena the call is given, while `degree` and `present` of one vertex copy a scalar out of a one-off arena.
+Upserting an edge upserts its vertices, removing an edge keeps them, and removing a vertex removes every edge that touches it.
+The C ABI behind these calls is five functions: `ustore_graph_read_edges`, `ustore_graph_write_edges`, `ustore_graph_remove_edges`, `ustore_graph_write_vertices` and `ustore_graph_remove_vertices`.
 
-```sh
-cat /var/lib/ustore/config.json
+Documents and graphs share one key type, so a user's profile and a user's vertex carry the same key, in one box, inside one transaction.
+
+## Transactions
+
+A transaction reads and writes through the same collection types as the database.
+
+```cpp
+transaction_t transaction = *db.transaction();
+docs_collection_t users = *transaction.find<docs_collection_t>("users");
+graph_collection_t friends = *transaction.find<graph_collection_t>("friends");
+
+status_t status = users[key_from_integer(4)].assign(R"({"name": "Dana"})");
+status = friends.write_edge(edge_t {key_from_integer(1), key_from_integer(4), key_from_integer(102)});
+
+if (auto [commit_stamp, commit_status] = transaction.commit(); commit_status.failed())
+    return 1;
 ```
 
-The simplest way to connect and test would be the following command:
+### Atomicity
 
-```sh
-python ...
+A commit applies every staged write or none of them.
+
+### Consistency and Isolation
+
+A transaction watches the keys it reads and writes, and a commit fails when another transaction committed a colliding write in between.
+`ustore_watch_none_k` turns that collision detection off for one call, trading the guarantee for cheaper commits, and changes nothing on a `ram` database at `strict_serializable`, which validates every read.
+
+A snapshot is an opaque handle pinning a consistent view of the whole database for reads, and `db.snapshot()` returns an `expected<snapshot_t>` that reads through it and frees it when it goes.
+`snapshot.save(path)` writes exactly what the snapshot sees out as a new database of the same engine.
+Spin models in [`verification/`](verification/) check the ring's completion credit, the one-issuer rule that moves a queue pair between threads, and the write, flush, record and sync order behind durability; model-checking the commit protocol under GenMC is a v1 target.
+
+### Durability
+
+Commits do not flush by default, since a database built on top of a key-value store usually keeps its own write-ahead log.
+Durability at commit is one option away.
+
+```c
+ustore_transaction_commit_t commit = {
+    .database = database,
+    .outcome = &outcome,
+    .transaction = transaction,
+    .durability = ustore_durability_flushed_k,
+};
+ustore_transaction_commit(&commit);
 ```
 
-Pre-packaged UStore images are available on multiple platforms:
+A `ram` database without a directory has no durability to offer.
 
-- Docker Hub image: [v0.7](https://hub.docker.com/r/unum/ustore).
-- RedHat OpenShift operator: [v0.7](https://github.com/itroyano/ustore-operator).
-- Amazon AWS Marketplace images:
-  - Free Community Edition: [v0.4](https://aws.amazon.com/marketplace/pp/prodview-ls2zmt5jkhipc?sr=0-1&ref_=beagle&applicationId=AWSMPContessa).
-  - In-Memory Edition: 🔜
-  - Performance Edition: 🔜
+## Engines
 
-Don't hesitate to commercialize and redistribute UStore.
+Every engine implements the same C ABI of `include/ustore/db.h`, `include/ustore/blobs.h` and `include/ustore/strings.h`, and documents and graphs run on top of any of them.
 
-### Configuration
+| Engine    | Role                  | Storage                        | Transactions | Snapshots | Collections |
+| :-------- | :-------------------- | :----------------------------- | :----------- | :-------- | :---------- |
+| `ram`     | reference, in memory  | memory, with an optional image | yes          | yes       | yes         |
+| `nvme`    | hyper-converged, v1   | LSM trees on NVMe or files     | yes          | no        | yes         |
+| `rocksdb` | baseline, third-party | LSM tree on a filesystem       | yes          | yes       | yes         |
+| `leveldb` | baseline, third-party | LSM tree on a filesystem       | no           | yes       | yes         |
 
-Tuning databases is as much art as it is science.
-Projects like RocksDB provide dozens of knobs to optimize the behavior.
-We allow forwarding specialized configuration files to the underlying engine.
+Each carries a limit worth knowing before choosing it.
+The `ram` engine rewrites its whole image on a flush and keeps no log, so a crash loses everything written since the last one.
+NVMe keeps no snapshots yet, so the snapshot cases of the conformance suite skip on it by name rather than pass.
+RocksDB takes a transaction's snapshot at its first read or write rather than when it began, and stages by locking and validating every watched read and buffered write against that snapshot, then preparing the writes into its log.
+LevelDB has no transactions.
 
-```json
-{
-    "version": "1.0",
-    "directory": "./tmp/"
-}
+The engines build into one library, offered as the `ustore_static` archive and the `ustore_shared` library, which holds `ram` and every engine enabled through `USTORE_BUILD_NVME`, `USTORE_WITH_ROCKSDB` and `USTORE_WITH_LEVELDB`.
+
+An engine reports itself through `ustore_database_describe`: its name, what it supports, its isolation, and its estimates of the keys, memory and disk the data takes.
+The C++ `database_t` exposes the capability bits as `supports_transactions`, `supports_snapshots` and `supports_collections`.
+`ustore_database_clear` empties every collection at once, and `ustore_database_compact` reclaims the space overwritten and removed data still takes.
+NVMe's sources are not yet ported to the current C ABI, so `USTORE_BUILD_NVME` stays off until they build.
+Once ported, NVMe runs on every platform through blocking positioned I/O, mounts io_uring on Linux where the kernel and the seccomp profile allow it, and merges on the GPU when built with `USTORE_BUILD_CUDA`; [`src/nvme/README.md`](src/nvme/README.md) describes its layers.
+
+## Compatibility
+
+Builds target the baseline instruction set of each architecture, so one artifact runs on any CPU of it, and v1 picks the fastest SIMD kit the CPU supports once, when a database or structure opens.
+The C headers are C11, checked by `c/test.c` under every platform's compiler against both libraries, while the C++ headers and the engines need C++20, and the CPython core is C11.
+
+| Platform       | C ABI and `ram` | RocksDB | LevelDB | NVMe     | Python | Rust |
+| :------------- | :-------------: | :-----: | :-----: | :------- | :----: | :--: |
+| Linux x86-64   | ✅              | ✅      | ✅      | local    | ✅     | ✅   |
+| Linux AArch64  | ✅              | ✅      | ✅      | untested | ✅     | ✅   |
+| macOS arm64    | ✅              | ✅      | ✅      | untested | ✅     | ✅   |
+| Windows x86-64 | ✅              | ✅      | ✅      | untested | ✅     | ✅   |
+
+Every column but NVMe is exercised by CI on all four platforms: `.github/workflows/prerelease.yml` builds and tests the C ABI and each engine, the Python extension and the Rust crate.
+The NVMe column records the suites in [`test/`](test/) on two Linux x86-64 machines rather than CI, which builds NVMe only once its sources are ported to the current C ABI; the blocking transport compiles for the other platforms and has not been exercised there, io_uring needs Linux 6.12 or newer, and the SPDK transport passes the shared ring cases over NVMe/TCP but is not yet mounted by the engine.
+GPU compaction targets NVIDIA Hopper and Blackwell alike, and its output must match CPU compaction on the same runs.
+The engines and the layout of `src/` are described in [`src/README.md`](src/README.md).
+
+### Why Not the RocksDB Interface
+
+LevelDB and RocksDB expose C++ interfaces built on standard library strings and containers.
+A caller cannot bring its own strings, arena or allocator, and an allocation failure surfaces as an exception, which a database under memory pressure hits routinely.
+Keys are variable-length strings, and the classes rely on virtual calls and inheritance, so the interface is neither ABI-stable nor portable to other languages.
+
+UStore puts a C ABI in front of the same engines instead.
+Each call takes one argument struct, so optional arguments keep their defaults and the argument order stops mattering.
+Outputs are allocated from an arena the caller owns and reuses across calls.
+
+## Keys and Values
+
+Keys are 128-bit UUIDs in `include/ustore/db.h`, compared bytewise, and `key_from_integer` spells a non-negative integer as its big-endian bytes, so keys made from integers order as the integers.
+Collections are named by UUIDv7 identifiers the catalog mints once and never reuses, and the main collection by the nil UUID.
+Fixed-width keys compare as machine words, while variable-length keys force character-wise comparisons and force keys and values to be joined on disk.
+Map strings onto keys once, at the edge of the application, and address documents, graphs and blobs by the resulting identifiers.
+
+Value lengths are `ustore_length_t`, a 64-bit unsigned integer, and a batch of values is one `ustore_strings_view_t`: an Apache Arrow tape of 32-bit offsets as in `binary`, of 64-bit offsets as in `large_binary`, or an accessor callback over any other layout.
+A call writes its tapes with 32-bit offsets while the bytes fit in 4 GiB and 64-bit beyond, so neither one value nor one batch stops at 4 GiB.
+
+## Roadmap to v1
+
+v1 is planned for mid-November 2026.
+
+- __Keys__ — today 128-bit UUID keys and UUIDv7 collection identifiers, except on NVMe, which takes keys below 2⁶⁴ and names collections by catalog numbers; v1 brings both to NVMe, with time-ordered UUIDv7 keys for local inserts.
+- __The `ram` engine__ — today `strict_serializable` or `snapshot` at open, with binary image persistence; v1 targets the conformance suite passing at both levels, every level proven by anomaly tests.
+- __RocksDB, LevelDB__ — today built against their current headers; v1 targets the same conformance suite, each reporting the isolation it delivers.
+- __NVMe__ — today its sources are being ported to the current C ABI, having passed the conformance suite on Linux over blocking and io_uring transports with GPU compaction wired in; v1 targets the port, snapshots, the graph as two collections of one database, backup and export, and CI on every platform.
+- __Kernel bypass__ — today io_uring on files and block devices, with registered buffers where the memlock cap allows and plain pointers otherwise, and an SPDK transport passing the shared ring cases over NVMe/TCP; v1 targets SPDK mounted by the engine and NVMe passthrough.
+- __SIMD point lookups__ — today the sorted-run index is searched on SmashTable's kits; v1 targets one kit chosen per artifact at open.
+- __GPU__ — today LSM compaction on CUB, reached from the engine when built with CUDA, with the host and device merges checked to agree byte for byte on every transport; v1 targets GPUDirect Storage between drives and GPU memory.
+- __Bindings__ — today a raw CPython core in C11 with Pandas and NetworkX adapters, and a Rust crate over the same C ABI; v1 adds an executor for the NVMe engine to both.
+- __Platforms__ — today CI builds and tests the C ABI, `ram`, RocksDB, LevelDB, the Python extension and the Rust crate on Linux x86-64, Linux AArch64, macOS arm64 and Windows x86-64; v1 adds NVMe to that matrix once it builds.
+
+## Repository Layout
+
+```bash
+ustore/
+├── include/ustore/   the C ABI as *.h, its C++ wrappers as *.hpp
+├── c/                the router, documents and graphs, over any engine
+├── src/
+│   ├── ram/          the in-memory engine
+│   └── nvme/         the on-disk engine
+├── src_oracles/
+│   ├── rocksdb/      the RocksDB baseline
+│   └── leveldb/      the LevelDB baseline
+├── python/           the CPython extension and the package around it
+├── rust/             the crate over the C ABI
+├── tools/            the command line interface, dataset import and export
+├── test/             suites, one file per topic
+├── bench/            benchmarks, one file per topic
+├── verification/     models of the concurrency and durability protocols
+└── examples/         one script per modality
 ```
 
-We also have a simpler procedure, which would be enough for 80% of users.
-That can be extended to utilize multiple devices or directories, or to forward a specialized engine config.
-
-```json
-{
-    "version": "1.0",
-    "directory": "/var/lib/ustore",
-    "data_directories": [
-        {
-            "path": "/dev/nvme0p0/",
-            "max_size": "100GB"
-        },
-        {
-            "path": "/dev/nvme1p0/",
-            "max_size": "100GB"
-        }
-    ],
-    "engine": {
-        "config_file_path": "./engine_rocksdb.ini",
-    }
-}
-```
-
-Database collections can also be configured with JSON files.
-
-#### Key Sizes
-
-As of the current version, 64-bit signed integers are used.
-It allows unique keys in the range from `[0, 2^63)`.
-128-bit builds with UUIDs are coming, but variable-length keys are highly discouraged.
-Why so?
-
-Using variable length keys forces numerous limitations on the design of a Key-Value store.
-Firstly, it implies slow character-wise comparisons — a performance killer on modern hyperscalar CPUs.
-Secondly, it forces keys and values to be joined on a disk to minimize the needed metadata for navigation.
-Lastly, it violates our simple logical view of KVS as a "persistent memory allocator", putting a lot more responsibility on it.
-
----
-
-The recommended approach to dealing with string keys is:
-
-1. Choose a mechanism to generate unique integer keys (UID). Ex: monotonically increasing values.
-2. Use ["paths"](#paths) modality build up a persistent hash map of strings to UIDs.
-3. Use those UIDs to address the rest of the data in binary, document and graph modalities.
-
-This will result in a single conversion point from string to integer representations and will keep most of the system snappy and the C-level interfaces simpler than they could have been.
-
-#### Value Sizes
-
-We can only address 4 GB values or smaller as of the current now.
-Why?
-Key-Value Stores are generally intended for high-frequency operations.
-Frequently (thousands of times each second), accessing and modifying 4 GB and larger files is impossible on modern hardware.
-So we stick to smaller length types, making using Apache Arrow representation slightly easier and allowing the KVS to compress indexes better.
-
-## Roadmap
-
-Our [development roadmap][ustore-roadmap] is public and is hosted within the GitHub repository.
-Upcoming tasks include:
-
-- [x] Builds for Arm, MacOS.
-- [x] Persistent Snapshots.
-- [ ] Continuous Replication.
-- [ ] Document-schema validation.
-- [ ] Richer drivers for GoLang, Java, JavaScript.
-- [ ] Improved Vector Search.
-- [ ] Collection-level configuration.
-- [ ] Owning and non-owning C++ wrappers.
-- [ ] Horizontal Scaling.
-
-> [Read full roadmap in our docs here][ustore-architecture].
-
-[ucsb-10]: https://unum.cloud/post/2022-03-22-ucsb
-[ucsb-1]: https://unum.cloud/post/2021-11-25-ycsb
-[ucsb]: https://github.com/unum-cloud/ucsb
-[blas]: https://en.wikipedia.org/wiki/Basic_Linear_Algebra_Subprograms
-[flight]: https://arrow.apache.org/docs/format/Flight.html
-[networkx]: https://networkx.org
-[pandas]: https://pandas.pydata.org
-[watch]: https://redis.io/commands/watch/
-[snap]: https://github.com/facebook/rocksdb/wiki/Snapshot
-[spdk]: https://spdk.io
-[redis]: https://redis.com
-[foundationdb]: https://www.foundationdb.org/
+Conventions, hooks and the commit format are described in [`CONTRIBUTING.md`](CONTRIBUTING.md).

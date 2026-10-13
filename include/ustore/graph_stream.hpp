@@ -14,59 +14,59 @@
 
 #include "ustore/blobs_range.hpp" // `keys_stream_t`
 #include "ustore/graph.h"
-#include "ustore/ranges.hpp"      // `strided`, `transform_reduce_n`
-#include "ustore/ranges_args.hpp" // `edges_span_t`
-#include "ustore/status.hpp"      // `status_t`, `expected`
-#include "ustore/types.hpp"       // `arena_t`, `edge_t`
+#include "ustore/ranges.hpp" // `strided`, `edges_view_t`, `exported_edges`
+#include "ustore/status.hpp" // `status_t`, `expected`
+#include "ustore/types.hpp"  // `arena_t`, `edge_t`, `receiver_t`
 
 namespace unum::ustore {
 
-/** A stream of every edge in a graph, fetched one page of vertices at a time and in no particular order.
- *  A stream made at the end holds no page, and a default-constructed one is at the end. */
+/** A stream of every edge in a graph, pulled one page of vertices at a time from the cursor of its vertex stream and
+ *  in no particular order, the vertices into the arena of that stream and their edges into an arena of its own, as a
+ *  read never takes its inputs from the arena it rewinds. It owns both for its lifetime as shorthand for a range-based
+ *  loop, with no place for an arena. A default-constructed stream is at the end. */
 class graph_stream_t {
 
     ustore_vertex_role_t role_ = ustore_vertex_role_any_k;
 
-    edges_span_t fetched_edges_ {};
+    edges_view_t fetched_edges_ {};
     std::size_t fetched_offset_ {0};
 
     arena_t arena_;
     keys_stream_t vertex_stream_;
-    st::basic_vector<ustore_vertex_degree_t> degrees_ {};
 
-    graph_stream_t(keys_stream_t vertex_stream, ustore_vertex_role_t role) noexcept
-        : role_(role), vertex_stream_(std::move(vertex_stream)) {}
+    graph_stream_t(keys_stream_t vertex_stream, arena_t arena, ustore_vertex_role_t role) noexcept
+        : role_(role), arena_(std::move(arena)), vertex_stream_(std::move(vertex_stream)) {}
 
+    /** Reads the edges of the page of vertices in hand, then of the pages after it until one has edges or the vertices
+     *  run out. */
     status_t prefetch_gather() noexcept {
+        for (;;) {
+            strided_span<ustore_key_t const> const vertices = strided(vertex_stream_.keys_batch());
+            ustore_vertex_degree_t const* degrees = nullptr;
+            ustore_length_t const* edges_offsets = nullptr;
+            ustore_key_t const* edges_per_vertex = nullptr;
+            ustore_outcome_t outcome {};
+            ustore_graph_read_edges_t graph_read_edges {};
+            graph_read_edges.database = vertex_stream_.receiver_.database;
+            graph_read_edges.executor = vertex_stream_.receiver_.executor;
+            graph_read_edges.outcome = &outcome;
+            graph_read_edges.view = vertex_stream_.receiver_.view(ustore_watch_keys_k);
+            graph_read_edges.count = vertices.count();
+            graph_read_edges.collections = {&vertex_stream_.collection_, 0};
+            graph_read_edges.vertices = {vertices.data(), vertices.stride()};
+            graph_read_edges.roles = {&role_, 0};
+            graph_read_edges.degrees_per_vertex = &degrees;
+            graph_read_edges.edges_offsets = &edges_offsets;
+            graph_read_edges.edges_per_vertex = &edges_per_vertex;
+            graph_read_edges.arena = arena_;
 
-        strided_range<ustore_key_t const> const vertices = strided(vertex_stream_.keys_batch());
-        ustore_key_t* edges_per_vertex = nullptr;
-        ustore_outcome_t outcome {};
-        ustore_graph_find_edges_t graph_find_edges {};
-        graph_find_edges.database = vertex_stream_.database_;
-        graph_find_edges.outcome = &outcome;
-        graph_find_edges.view = vertex_stream_.view_;
-        graph_find_edges.count = vertices.count();
-        graph_find_edges.collections = &vertex_stream_.collection_;
-        graph_find_edges.vertices = vertices.begin().get();
-        graph_find_edges.vertices_stride = vertices.stride();
-        graph_find_edges.roles = &role_;
-        graph_find_edges.degrees_per_vertex = degrees_.data();
-        graph_find_edges.degrees_per_vertex_stride = sizeof(ustore_vertex_degree_t);
-        graph_find_edges.edges_per_vertex = &edges_per_vertex;
-        graph_find_edges.arena = arena_.member_ptr();
-
-        ustore_graph_find_edges(&graph_find_edges);
-        if (outcome.status != ustore_status_success_k) return status_t {outcome};
-
-        edge_t* const edges_begin = reinterpret_cast<edge_t*>(edges_per_vertex);
-        std::size_t const edges_count = transform_reduce_n(
-            degrees_.data(), vertices.size(), std::size_t {0}, [](ustore_vertex_degree_t degree) noexcept {
-                return degree == ustore_vertex_degree_missing_k ? 0 : degree;
-            });
-        fetched_offset_ = 0;
-        fetched_edges_ = {edges_begin, edges_begin + edges_count};
-        return {};
+            ustore_graph_read_edges(&graph_read_edges);
+            if (status_t const status {outcome}; status.failed()) return status;
+            fetched_offset_ = 0;
+            fetched_edges_ = exported_edges(edges_per_vertex, edges_offsets, vertices.size());
+            if (fetched_edges_.size() || vertex_stream_.is_end()) return {};
+            if (status_t const pulled = vertex_stream_.seek_to_next_batch(); pulled.failed()) return pulled;
+        }
     }
 
   public:
@@ -84,15 +84,14 @@ class graph_stream_t {
 
     /** Opens a stream over the edges of @p collection in @p role, from the vertex @p start onwards, fetching the edges
      *  of @p read_ahead vertices a page. */
-    static expected<graph_stream_t> make(ustore_database_t database, ustore_view_t view,
-                                         ustore_collection_id_t collection, ustore_vertex_role_t role,
-                                         ustore_key_t start,
+    static expected<graph_stream_t> make(receiver_t receiver, ustore_collection_id_t collection,
+                                         ustore_vertex_role_t role, ustore_key_t start,
                                          std::size_t read_ahead = keys_stream_t::default_read_ahead_k) noexcept {
-        auto [vertex_stream, vertex_stream_status] = keys_stream_t::make(database, view, collection, start, read_ahead);
+        auto [vertex_stream, vertex_stream_status] = keys_stream_t::make(receiver, collection, start, read_ahead);
         if (vertex_stream_status.failed()) return vertex_stream_status;
-        graph_stream_t stream {std::move(vertex_stream), role};
-        if (st::failed(stream.degrees_.resize(stream.vertex_stream_.page_.size())))
-            return status_t {status_code_t::out_of_memory_k, "Failed to allocate a page of degrees"};
+        auto [arena, arena_status] = arena_t::make(receiver.executor);
+        if (arena_status.failed()) return arena_status;
+        graph_stream_t stream {std::move(vertex_stream), std::move(arena), role};
         if (status_t const gathered = stream.prefetch_gather(); gathered.failed()) return gathered;
         return stream;
     }
@@ -103,8 +102,9 @@ class graph_stream_t {
     }
 
     status_t advance() noexcept {
-        if (fetched_offset_ >= fetched_edges_.size() - 1) return seek_to_next_batch();
-        ++fetched_offset_;
+        if (fetched_offset_ + 1 < fetched_edges_.size()) ++fetched_offset_;
+        else if (vertex_stream_.is_end()) fetched_offset_ = fetched_edges_.size();
+        else return seek_to_next_batch();
         return {};
     }
 
@@ -125,7 +125,7 @@ class graph_stream_t {
     }
 
     /** Exposes the whole fetched page, passed edges included, for use with @c seek_to_next_batch. */
-    edges_span_t edges_batch() noexcept {
+    edges_view_t edges_batch() noexcept {
         fetched_offset_ = fetched_edges_.size();
         return fetched_edges_;
     }

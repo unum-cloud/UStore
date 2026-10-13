@@ -48,7 +48,7 @@
 #include "ustore/ustore.hpp"
 
 #include "harness.hpp"
-#include "helpers/blocking_files.hpp" // `mapped_file_t`
+#include "utilities/blocking_files.hpp" // `mapped_file_t`
 
 namespace unum::ustore::bench {
 
@@ -194,7 +194,7 @@ status_t stage_edges(std::span<input_edge_t const> edges, st::basic_vector<edge_
     if (st::failed(staged.reserve(edges.size()))) return status_code_t::out_of_memory_k;
     for (input_edge_t const& edge : edges) {
         [[maybe_unused]] st::status_t const pushed = staged.push_back(
-            st::assume_reserved, edge_t {edge.lower, edge.upper, ustore_default_edge_id_k});
+            st::assume_reserved, edge_t {edge.lower, edge.upper, ustore_edge_id_default_k});
     }
     return {};
 }
@@ -325,6 +325,9 @@ class stored_graph_t {
     /** Sorted vertex keys of the collection, whose positions are the numbering. */
     st::basic_vector<ustore_key_t> keys_;
 
+    /** Arena every neighborhood read reuses, rewound by each. */
+    arena_t arena_;
+
   public:
     stored_graph_t() noexcept = default;
 
@@ -333,9 +336,12 @@ class stored_graph_t {
         auto maybe_stream = collection.vertex_stream();
         if (!maybe_stream) return maybe_stream.status();
         keys_stream_t stream = *std::move(maybe_stream);
+        auto [arena, arena_status] = arena_t::make();
+        if (arena_status.failed()) return arena_status;
 
         stored_graph_t graph;
         graph.collection_ = &collection;
+        graph.arena_ = std::move(arena);
         while (!stream.is_end()) {
             for (ustore_key_t key : stream.keys_batch())
                 if (st::failed(graph.keys_.push_back(ustore_key_t {key}))) return status_code_t::out_of_memory_k;
@@ -350,7 +356,7 @@ class stored_graph_t {
     /** Hands @p visit every distinct neighbor of @p vertex_index, each carrying unit weight. */
     template <typename visitor_type_>
     status_t for_each_neighbor(std::size_t vertex_index, visitor_type_&& visit) noexcept {
-        auto [neighbors, neighbors_status] = collection_->neighbors(keys_[vertex_index]);
+        auto [neighbors, neighbors_status] = collection_->neighbors(keys_[vertex_index], arena_);
         if (neighbors_status.failed()) return neighbors_status;
         for (std::size_t index = 0; index != neighbors.size(); ++index) {
             ustore_key_t const* const found = std::lower_bound(keys_.begin(), keys_.end(), neighbors[index]);
@@ -674,11 +680,11 @@ int main(int argc, char** argv) {
         return 1;
     }
     database_t database {raw};
-    if (status_t const cleared = database.clear(); cleared.failed()) {
+    if (status_t const cleared = database.clear(ustore_drop_collection_k); cleared.failed()) {
         fmt::println(stderr, "Failed to clear the database: {}", cleared.message ? cleared.message : "unknown");
         return 1;
     }
-    auto [graph, graph_status] = database.create<graph_collection_t>("graph", ustore_modality_graph_k);
+    auto [graph, graph_status] = database.create<graph_collection_t>("graph");
     if (graph_status.failed()) {
         fmt::println(stderr, "Failed to create the graph: {}", graph_status.message ? graph_status.message : "unknown");
         return 1;
@@ -695,7 +701,7 @@ int main(int argc, char** argv) {
                 for (std::size_t call : loop) {
                     std::span<edge_t const> const batch = batches.subspan(
                         call * batch_size, std::min(batch_size, batches.size() - call * batch_size));
-                    if (graph.upsert_edges(edges_view_t {batch.data(), batch.data() + batch.size()}).failed())
+                    if (graph.write_edges(edges_view_t {batch.data(), batch.data() + batch.size()}).failed())
                         return loop.skip("failed to upsert a batch of edges");
                     loop.count(batch.size(), batch.size() * sizeof(edge_t));
                 }

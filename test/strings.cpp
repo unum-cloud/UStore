@@ -11,7 +11,6 @@
 
 #include <cstddef> // `std::size_t`
 #include <cstdio>  // `stderr`
-#include <cstring> // `std::memcpy`
 
 #include <array>       // `std::array`
 #include <span>        // `std::span`
@@ -19,44 +18,36 @@
 
 #include <fmt/format.h>
 
-#include "ustore/ranges.hpp" // `bits_view_t`
+#include "ustore/ranges.hpp" // `bits_view_t`, `strided_strings`, `tape_string`, `tape_slice`
 #include "ustore/ustore.h"
 
-#include "test.hpp" // `suite_exit_code`, `expect`, `expect_eq`
+#include "harness.hpp" // `suite_exit_code`, `expect`, `expect_eq`
 
 using namespace unum::ustore;
 using namespace unum::ustore::test;
 using namespace unum;
 
-namespace {
+namespace unum::ustore::test {
 
 /** Most tasks one case sends in a single batch. */
 constexpr std::size_t batch_capacity_k = 64;
 
-/** The strided arrays one batch of strings and values hands to the C ABI. */
+/** The strings and values of one batch, which the C ABI reads through accessors. */
 struct strings_batch_t {
 
-    /** Pointer to the bytes of every string. */
-    std::array<ustore_str_view_t, batch_capacity_k> texts {};
+    /** Every string. */
+    std::array<std::string_view, batch_capacity_k> texts {};
 
-    /** Length of every string. */
-    std::array<ustore_length_t, batch_capacity_k> text_lengths {};
-
-    /** Pointer to the bytes of every value. */
-    std::array<ustore_bytes_cptr_t, batch_capacity_k> values {};
-
-    /** Length of every value. */
-    std::array<ustore_length_t, batch_capacity_k> value_lengths {};
+    /** Every value. */
+    std::array<std::string_view, batch_capacity_k> values {};
 
     /** Tasks the batch holds. */
     std::size_t count = 0;
 
     /** Adds a task writing @p value under @p text. */
     void assign(std::string_view text, std::string_view value) noexcept {
-        texts[count] = text.data();
-        text_lengths[count] = static_cast<ustore_length_t>(text.size());
-        values[count] = reinterpret_cast<ustore_bytes_cptr_t>(value.data());
-        value_lengths[count] = static_cast<ustore_length_t>(value.size());
+        texts[count] = text;
+        values[count] = value;
         ++count;
     }
 };
@@ -76,7 +67,7 @@ struct fixture_t {
     fixture_t(fixture_t const&) = delete;
     fixture_t& operator=(fixture_t const&) = delete;
 
-    explicit fixture_t(test_config_t const& config) noexcept {
+    explicit fixture_t(config_t const& config) noexcept {
         auto [opened, open_status] = open_raw(config);
         if (open_status.failed()) {
             fmt::println(stderr, "  failed to open the database: {}", open_status.message);
@@ -92,6 +83,11 @@ struct fixture_t {
         ustore_collection_create(&create);
         if (outcome.status != ustore_status_success_k)
             fmt::println(stderr, "  failed to create a strings collection: {}", outcome.message);
+
+        ustore_arena_init_t arena_init {.arena = &arena, .executor = nullptr, .outcome = &outcome};
+        ustore_arena_init(&arena_init);
+        if (outcome.status != ustore_status_success_k)
+            fmt::println(stderr, "  failed to make an arena: {}", outcome.message);
     }
 
     ~fixture_t() noexcept {
@@ -99,26 +95,22 @@ struct fixture_t {
         ustore_database_free(database);
     }
 
-    /** Whether the database opened with its strings collection. */
-    [[nodiscard]] bool ready() const noexcept { return database && collection != ustore_collection_main_k; }
+    /** Whether the database opened with its strings collection and the arena exists. */
+    [[nodiscard]] bool ready() const noexcept { return database && collection != ustore_collection_main_k && arena; }
 };
 
 /** Sends @p batch through @c ustore_strings_write and counts a failure when it is refused. */
 [[nodiscard]] std::size_t write_batch(fixture_t& fixture, strings_batch_t const& batch) noexcept {
+    strided_strings<std::string_view> const texts {{batch.texts.data(), sizeof(std::string_view)}};
+    strided_strings<std::string_view> const values {{batch.values.data(), sizeof(std::string_view)}};
     ustore_outcome_t outcome {};
     ustore_strings_write_t write {};
     write.database = fixture.database;
     write.outcome = &outcome;
     write.count = batch.count;
-    write.collections = &fixture.collection;
-    write.strings = batch.texts.data();
-    write.strings_stride = sizeof(ustore_str_view_t);
-    write.strings_lengths = batch.text_lengths.data();
-    write.strings_lengths_stride = sizeof(ustore_length_t);
-    write.values_lengths = batch.value_lengths.data();
-    write.values_lengths_stride = sizeof(ustore_length_t);
-    write.values = batch.values.data();
-    write.values_stride = sizeof(ustore_bytes_cptr_t);
+    write.collections = {&fixture.collection, 0};
+    write.strings = texts.view();
+    write.values = values.view();
 
     ustore_strings_write(&write);
     return expect_success(outcome);
@@ -133,109 +125,97 @@ struct fixture_t {
 
 /** Removes one string through @c ustore_strings_remove. */
 [[nodiscard]] std::size_t erase_one(fixture_t& fixture, std::string_view text) noexcept {
-    ustore_str_view_t const text_pointer = text.data();
-    ustore_length_t const text_length = static_cast<ustore_length_t>(text.size());
+    strided_strings<std::string_view> const texts {{&text, 0}};
     ustore_outcome_t outcome {};
     ustore_strings_remove_t remove {};
     remove.database = fixture.database;
     remove.outcome = &outcome;
     remove.count = 1;
-    remove.collections = &fixture.collection;
-    remove.strings = &text_pointer;
-    remove.strings_lengths = &text_length;
+    remove.collections = {&fixture.collection, 0};
+    remove.strings = texts.view();
 
     ustore_strings_remove(&remove);
     return expect_success(outcome);
 }
 
-/** The values one read exported, addressed by task. */
+/** The values one read exported into the arena of the fixture, addressed by task. */
 struct read_results_t {
 
     /** Bits marking the strings the database holds. */
-    std::array<ustore_octet_t, divide_round_up(batch_capacity_k, bits_in_byte_k)> presences {};
-
-    /** Offsets of the values inside @c values, one more than the tasks. */
-    std::array<ustore_length_t, batch_capacity_k + 1> offsets {};
+    ustore_octet_t const* presences = nullptr;
 
     /** The tape of values. */
-    ustore_byte_t* values = nullptr;
+    ustore_strings_view_t values {};
 
     /** Whether the string of task @p index is present. */
-    [[nodiscard]] bool present(std::size_t index) const noexcept { return bits_view_t {presences.data()}[index]; }
+    [[nodiscard]] bool present(std::size_t index) const noexcept { return bits_view_t {presences}[index]; }
 
     /** The value of task @p index as text. */
     [[nodiscard]] std::string_view value_of(std::size_t index) const noexcept {
-        return {reinterpret_cast<char const*>(values) + offsets[index], offsets[index + 1] - offsets[index]};
+        return string_of(tape_string(values, index));
     }
 };
 
 /** Reads the values of @p batch, counting a failure when the read is refused. */
 [[nodiscard]] std::size_t read_batch(fixture_t& fixture, strings_batch_t const& batch,
                                      read_results_t& results) noexcept {
+    strided_strings<std::string_view> const texts {{batch.texts.data(), sizeof(std::string_view)}};
     ustore_outcome_t outcome {};
     ustore_strings_read_t read {};
     read.database = fixture.database;
     read.outcome = &outcome;
     read.count = batch.count;
-    read.collections = &fixture.collection;
-    read.strings = batch.texts.data();
-    read.strings_stride = sizeof(ustore_str_view_t);
-    read.strings_lengths = batch.text_lengths.data();
-    read.strings_lengths_stride = sizeof(ustore_length_t);
-    read.presences = results.presences.data();
-    read.offsets = results.offsets.data();
+    read.collections = {&fixture.collection, 0};
+    read.strings = texts.view();
+    read.presences = &results.presences;
     read.values = &results.values;
-    read.arena = &fixture.arena;
+    read.arena = fixture.arena;
 
     ustore_strings_read(&read);
-    return expect_success(outcome);
+    ustore_strings_view_t const& values = results.values;
+    bool const exported = values.layout == ustore_strings_u64_tape_k ? values.data.u64_tape.offsets != nullptr
+                                                                     : values.data.u32_tape.offsets != nullptr;
+    return expect_success(outcome) + expect(!batch.count || (results.presences && exported));
 }
 
-/** The strings one scan exported, in the order of their text. */
+/** The strings one scan exported into the arena of the fixture, in the order of their text. */
 struct scan_results_t {
 
     /** Strings the scan found. */
     ustore_length_t count = 0;
 
-    /** Offsets of the found strings inside @c strings, one more than the strings. */
-    std::array<ustore_length_t, batch_capacity_k + 1> offsets {};
-
     /** The tape of found strings. */
-    ustore_char_t* strings = nullptr;
+    ustore_strings_view_t strings {};
 
     /** The string found at @p index. */
     [[nodiscard]] std::string_view operator[](std::size_t index) const noexcept {
-        return {strings + offsets[index], offsets[index + 1] - offsets[index]};
+        return string_of(tape_string(strings, index));
     }
 };
 
 /** Walks @p prefix from @p start, at most @c batch_capacity_k strings, counting a failure when the scan is refused. */
 [[nodiscard]] std::size_t scan_prefix(fixture_t& fixture, std::string_view prefix, ustore_length_t limit,
                                       scan_results_t& results, std::string_view start = {}) noexcept {
-    ustore_str_view_t const prefix_pointer = prefix.data();
-    ustore_length_t const prefix_length = static_cast<ustore_length_t>(prefix.size());
-    ustore_str_view_t const start_pointer = start.data();
-    ustore_length_t const start_length = static_cast<ustore_length_t>(start.size());
-    ustore_length_t scan_offsets[2] {};
+    strided_strings<std::string_view> const prefixes {{&prefix, 0}};
+    strided_strings<std::string_view> const starts {{&start, 0}};
+    ustore_length_t const* scan_offsets = nullptr;
     ustore_outcome_t outcome {};
     ustore_strings_scan_t scan {};
     scan.database = fixture.database;
     scan.outcome = &outcome;
     scan.count = 1;
-    scan.collections = &fixture.collection;
-    scan.prefixes = &prefix_pointer;
-    scan.prefixes_lengths = &prefix_length;
-    scan.start_strings = &start_pointer;
-    scan.start_strings_lengths = &start_length;
-    scan.count_limits = &limit;
-    scan.offsets = scan_offsets;
-    scan.strings_offsets = results.offsets.data();
+    scan.collections = {&fixture.collection, 0};
+    scan.prefixes = prefixes.view();
+    if (!start.empty()) scan.start_strings = starts.view();
+    scan.offsets = &scan_offsets;
     scan.strings = &results.strings;
-    scan.arena = &fixture.arena;
+    scan.arena = fixture.arena;
+    scan.wanted = limit;
 
     ustore_strings_scan(&scan);
-    if (std::size_t const failures = expect_success(outcome)) return failures;
+    if (std::size_t const failures = expect_success(outcome) + expect(scan_offsets != nullptr)) return failures;
     results.count = scan_offsets[1] - scan_offsets[0];
+    results.strings = tape_slice(results.strings, scan_offsets[0]);
     return 0;
 }
 
@@ -252,7 +232,7 @@ struct scan_results_t {
 }
 
 /** Short strings order exactly as their text, whatever byte values they carry. */
-std::size_t strings_short_ordering(test_config_t const& config) {
+std::size_t strings_short_ordering(config_t const& config) {
     std::size_t failures = 0;
     fixture_t fixture {config};
     if (!fixture.ready()) return failures + 1;
@@ -269,7 +249,7 @@ std::size_t strings_short_ordering(test_config_t const& config) {
 }
 
 /** A prefix scan returns the members of the prefix, in order, and nothing else. */
-std::size_t strings_prefix_scan(test_config_t const& config) {
+std::size_t strings_prefix_scan(config_t const& config) {
     std::size_t failures = 0;
     fixture_t fixture {config};
     if (!fixture.ready()) return failures + 1;
@@ -293,7 +273,7 @@ std::size_t strings_prefix_scan(test_config_t const& config) {
 }
 
 /** Strings sharing a long leading run share one bucket, and each keeps its own value. */
-std::size_t strings_shared_prefix(test_config_t const& config) {
+std::size_t strings_shared_prefix(config_t const& config) {
     std::size_t failures = 0;
     fixture_t fixture {config};
     if (!fixture.ready()) return failures + 1;
@@ -321,7 +301,7 @@ std::size_t strings_shared_prefix(test_config_t const& config) {
 }
 
 /** The empty string and a string holding a zero byte are ordinary keys. */
-std::size_t strings_empty_and_embedded_zero(test_config_t const& config) {
+std::size_t strings_empty_and_embedded_zero(config_t const& config) {
     std::size_t failures = 0;
     fixture_t fixture {config};
     if (!fixture.ready()) return failures + 1;
@@ -351,7 +331,7 @@ std::size_t strings_empty_and_embedded_zero(test_config_t const& config) {
 }
 
 /** Writing a string again replaces its value, and a removal takes it away. */
-std::size_t strings_update_and_remove(test_config_t const& config) {
+std::size_t strings_update_and_remove(config_t const& config) {
     std::size_t failures = 0;
     fixture_t fixture {config};
     if (!fixture.ready()) return failures + 1;
@@ -384,7 +364,7 @@ std::size_t strings_update_and_remove(test_config_t const& config) {
 }
 
 /** A bucket grows past one entry and shrinks back, and disappears once its last string goes. */
-std::size_t strings_bucket_growth(test_config_t const& config) {
+std::size_t strings_bucket_growth(config_t const& config) {
     std::size_t failures = 0;
     fixture_t fixture {config};
     if (!fixture.ready()) return failures + 1;
@@ -423,7 +403,7 @@ std::size_t strings_bucket_growth(test_config_t const& config) {
 }
 
 /** A batch touching one bucket many times keeps only the last write of every string. */
-std::size_t strings_batched_bucket(test_config_t const& config) {
+std::size_t strings_batched_bucket(config_t const& config) {
     std::size_t failures = 0;
     fixture_t fixture {config};
     if (!fixture.ready()) return failures + 1;
@@ -449,7 +429,7 @@ std::size_t strings_batched_bucket(test_config_t const& config) {
 }
 
 /** A scan stops at its limit and resumes from the string it is given. */
-std::size_t strings_scan_pagination(test_config_t const& config) {
+std::size_t strings_scan_pagination(config_t const& config) {
     std::size_t failures = 0;
     fixture_t fixture {config};
     if (!fixture.ready()) return failures + 1;
@@ -478,7 +458,7 @@ std::size_t strings_scan_pagination(test_config_t const& config) {
     return failures;
 }
 
-} // namespace
+} // namespace unum::ustore::test
 
 int main(int argc, char** argv) {
     suite_options_t options;
@@ -487,7 +467,7 @@ int main(int argc, char** argv) {
         return status == argument_status_t::help_k ? 0 : 1;
     suite_totals_t totals = options.totals();
 
-    auto const maybe_test_directory = test_directory_t::make(options.directory);
+    auto const maybe_test_directory = directory_t::make(options.directory);
     if (!maybe_test_directory) {
         fmt::println(stderr, "Cannot create a unique directory under {}", options.directory);
         return 1;
@@ -495,7 +475,7 @@ int main(int argc, char** argv) {
     char const* const directory = maybe_test_directory->path();
     if (directory) fmt::println("Will work in directory: {}", directory);
     else fmt::println("Will work with default configuration");
-    test_config_t const config {options.engine, directory};
+    config_t const config {options.engine, directory};
 
     report(totals, "strings.short_ordering", strings_short_ordering, config);
     report(totals, "strings.prefix_scan", strings_prefix_scan, config);

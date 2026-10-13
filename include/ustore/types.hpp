@@ -2,7 +2,8 @@
  *  @file include/ustore/types.hpp
  *  @author Ash Vardanian
  *  @date July 4, 2022
- *  @brief Locations, edges, value views and arenas shared by every C++ wrapper.
+ *  @brief Locations, edges, value views, arenas, stamps, receivers, executors and progress callables shared by every
+ *      C++ wrapper.
  */
 
 #pragma once
@@ -20,7 +21,7 @@
 #include <ranges>      // `std::ranges::contiguous_range`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
-#include <type_traits> // `std::remove_cvref_t`, `std::is_same_v`, `std::type_identity_t`
+#include <type_traits> // `std::remove_cvref_t`, `std::is_scalar_v`, `std::invoke_result_t`, `std::type_identity_t`
 #include <utility>     // `std::exchange`, `std::swap`
 
 #include "ustore/status.hpp" // `expected`, `status_t`
@@ -195,16 +196,6 @@ using u8_t = std::uint8_t;
 /** A single byte of a stored value, kept distinct from characters and integers. */
 using byte_t = std::byte;
 
-#pragma region Access Modes
-
-/** Whether a read inside a transaction registers its keys for conflict detection. */
-enum class watch_t : bool { dont_watch_k, watch_k };
-
-/** Whether a write returns only after its data reaches the disk. */
-enum class flush_t : bool { dont_flush_k, flush_k };
-
-#pragma endregion Access Modes
-
 #pragma region Locations
 
 /** A key inside a collection, laid out so a strided pointer can address either member. */
@@ -236,16 +227,14 @@ struct collection_key_field_t {
     /** Key inside the collection. */
     ustore_key_t key {ustore_key_unknown_k};
 
-    /** Path of the document field, or @c nullptr for the whole value. */
-    ustore_str_view_t field {nullptr};
+    /** Path of the document field, or an empty one for the whole value. */
+    std::string_view field {};
 
     collection_key_field_t() = default;
-    collection_key_field_t(ustore_collection_id_t collection, ustore_key_t key,
-                           ustore_str_view_t field = nullptr) noexcept
+    collection_key_field_t(ustore_collection_id_t collection, ustore_key_t key, std::string_view field = {}) noexcept
         : collection(collection), key(key), field(field) {}
-    collection_key_field_t(ustore_key_t key) noexcept
-        : collection(ustore_collection_main_k), key(key), field(nullptr) {}
-    explicit collection_key_field_t(ustore_key_t key, ustore_str_view_t field) noexcept
+    collection_key_field_t(ustore_key_t key) noexcept : collection(ustore_collection_main_k), key(key) {}
+    explicit collection_key_field_t(ustore_key_t key, std::string_view field) noexcept
         : collection(ustore_collection_main_k), key(key), field(field) {}
 };
 
@@ -270,13 +259,13 @@ concept key_location_concept = std::same_as<std::remove_cvref_t<location_>, usto
 struct edge_t {
 
     /** Vertex the edge leaves. */
-    ustore_key_t source_id;
+    ustore_key_t source;
 
     /** Vertex the edge enters. */
-    ustore_key_t target_id;
+    ustore_key_t target;
 
     /** Identifier of the edge itself. */
-    ustore_key_t id {ustore_default_edge_id_k};
+    ustore_key_t id {ustore_edge_id_default_k};
 
     friend bool operator==(edge_t const&, edge_t const&) = default;
 };
@@ -298,46 +287,53 @@ struct neighborship_t {
 
 #pragma region Variable Length Views
 
-/** A view of a stored value that tells a missing value apart from an empty one.
- *  Its layout of a pointer and a length passes into the C ABI without conversion. */
+/** The length a missing value carries, which no stored value reaches, so a view tells it apart from an empty one. */
+inline constexpr ustore_length_t missing_length_k = std::numeric_limits<ustore_length_t>::max();
+
+/** A view of a stored value that tells a missing value apart from an empty one. */
 class value_view_t {
 
-    ustore_bytes_cptr_t pointer_ = nullptr;
-    ustore_length_t length_ = ustore_length_missing_k;
+    ustore_byte_t const* pointer_ = nullptr;
+    ustore_length_t length_ = missing_length_k;
 
   public:
     using value_type = byte_t;
 
     value_view_t() = default;
-    value_view_t(ustore_bytes_cptr_t pointer, ustore_length_t length) noexcept : pointer_(pointer), length_(length) {}
+    value_view_t(ustore_byte_t const* pointer, ustore_length_t length) noexcept : pointer_(pointer), length_(length) {}
+
+    /** Views the bytes of @p bytes, a value that is always present. */
+    value_view_t(ustore_bytes_view_t bytes) noexcept : pointer_(bytes.data), length_(bytes.length) {}
 
     value_view_t(byte_t const* begin, byte_t const* end) noexcept
-        : pointer_(ustore_bytes_cptr_t(begin)), length_(static_cast<ustore_length_t>(end - begin)) {}
+        : pointer_(reinterpret_cast<ustore_byte_t const*>(begin)), length_(static_cast<ustore_length_t>(end - begin)) {}
 
     value_view_t(byte_t const* begin, std::size_t length) noexcept
-        : pointer_(ustore_bytes_cptr_t(begin)), length_(static_cast<ustore_length_t>(length)) {}
+        : pointer_(reinterpret_cast<ustore_byte_t const*>(begin)), length_(static_cast<ustore_length_t>(length)) {}
 
     value_view_t(char const* string) noexcept
-        : pointer_(ustore_bytes_cptr_t(string)), length_(static_cast<ustore_length_t>(std::strlen(string))) {}
+        : pointer_(reinterpret_cast<ustore_byte_t const*>(string)),
+          length_(static_cast<ustore_length_t>(std::strlen(string))) {}
 
     value_view_t(char const* string, std::size_t length) noexcept
-        : pointer_(ustore_bytes_cptr_t(string)), length_(static_cast<ustore_length_t>(length)) {}
+        : pointer_(reinterpret_cast<ustore_byte_t const*>(string)), length_(static_cast<ustore_length_t>(length)) {}
 
-    template <typename char_, typename traits_>
-    value_view_t(std::basic_string_view<char_, traits_> view) noexcept
-        : pointer_(ustore_bytes_cptr_t(view.data())),
-          length_(static_cast<ustore_length_t>(view.size() * sizeof(char_))) {}
+    template <typename char_type_, typename traits_type_>
+    value_view_t(std::basic_string_view<char_type_, traits_type_> view) noexcept
+        : pointer_(reinterpret_cast<ustore_byte_t const*>(view.data())),
+          length_(static_cast<ustore_length_t>(view.size() * sizeof(char_type_))) {}
 
     value_view_t(std::string_view view) noexcept
-        : pointer_(ustore_bytes_cptr_t(view.data())), length_(static_cast<ustore_length_t>(view.size())) {}
+        : pointer_(reinterpret_cast<ustore_byte_t const*>(view.data())),
+          length_(static_cast<ustore_length_t>(view.size())) {}
 
     /** An empty value that is present, unlike a default-constructed missing one. */
     static value_view_t make_empty() noexcept { return value_view_t {nullptr, nullptr}; }
 
-    operator bool() const noexcept { return length_ != ustore_length_missing_k; }
-    std::size_t size() const noexcept { return length_ == ustore_length_missing_k ? 0 : length_; }
+    operator bool() const noexcept { return length_ != missing_length_k; }
+    std::size_t size() const noexcept { return length_ == missing_length_k ? 0 : length_; }
     byte_t const* data() const noexcept {
-        return length_ != ustore_length_missing_k ? reinterpret_cast<byte_t const*>(pointer_) : nullptr;
+        return length_ != missing_length_k ? reinterpret_cast<byte_t const*>(pointer_) : nullptr;
     }
 
     char const* c_str() const noexcept { return reinterpret_cast<char const*>(pointer_); }
@@ -346,47 +342,21 @@ class value_view_t {
     bool empty() const noexcept { return !size(); }
     operator std::string_view() const noexcept { return {c_str(), size()}; }
 
-    ustore_bytes_cptr_t const* member_ptr() const noexcept { return &pointer_; }
-    ustore_length_t const* member_length() const noexcept { return &length_; }
+    /** The run of bytes the C ABI reads, where a missing value passes as an empty one. */
+    ustore_bytes_view_t bytes() const noexcept { return {pointer_, size()}; }
 
     bool operator==(value_view_t other) const noexcept { return std::ranges::equal(*this, other); }
 };
 
-/** A mutable view of a value inside a tape, addressed by its offset and length. */
-class value_ref_t {
+/** The bytes of @p text, which the C ABI reads without a terminator. */
+inline ustore_bytes_view_t bytes_of(std::string_view text) noexcept {
+    return {reinterpret_cast<ustore_byte_t const*>(text.data()), text.size()};
+}
 
-    ustore_byte_t* pointer_ = nullptr;
-    ustore_length_t* offset_ = nullptr;
-    ustore_length_t* length_ = nullptr;
-
-  public:
-    using value_type = byte_t;
-
-    value_ref_t() = default;
-    value_ref_t(ustore_byte_t* pointer, ustore_length_t& offset, ustore_length_t& length) noexcept
-        : pointer_(pointer), offset_(&offset), length_(&length) {}
-
-    byte_t const* begin() const noexcept { return reinterpret_cast<byte_t const*>(pointer_); }
-    byte_t const* end() const noexcept { return begin() + size(); }
-    char const* c_str() const noexcept { return reinterpret_cast<char const*>(pointer_); }
-    std::size_t size() const noexcept { return *length_ == ustore_length_missing_k ? 0 : *length_; }
-    bool empty() const noexcept { return !size(); }
-    operator bool() const noexcept { return *length_ != ustore_length_missing_k; }
-
-    ustore_byte_t* const* member_ptr() const noexcept { return &pointer_; }
-    ustore_length_t const* member_offset() const noexcept { return offset_; }
-    ustore_length_t const* member_length() const noexcept { return length_; }
-
-    bool operator==(value_ref_t other) const noexcept { return std::ranges::equal(*this, other); }
-
-    void swap(value_ref_t& other) noexcept {
-        std::swap(*pointer_, *other.pointer_);
-        std::swap(*offset_, *other.offset_);
-        std::swap(*length_, *other.length_);
-    }
-
-    friend void swap(value_ref_t& first, value_ref_t& second) noexcept { first.swap(second); }
-};
+/** The text @p bytes spell. */
+inline std::string_view string_of(ustore_bytes_view_t bytes) noexcept {
+    return {reinterpret_cast<char const*>(bytes.data), static_cast<std::size_t>(bytes.length)};
+}
 
 /** Views the bytes of a contiguous container. */
 template <std::ranges::contiguous_range container_>
@@ -401,53 +371,192 @@ value_view_t value_view(container_&& container) noexcept {
 
 #pragma region Memory Management
 
-/** Owns an arena the C ABI fills with results, freeing it on destruction. */
+/** Owns an arena made where an executor computes, which the C ABI fills with results, freeing it on destruction. */
 class arena_t {
 
-    ustore_arena_t memory_ = nullptr;
+    ustore_arena_t arena_ = nullptr;
 
   public:
     arena_t() noexcept = default;
     arena_t(arena_t const&) = delete;
     arena_t& operator=(arena_t const&) = delete;
-    ~arena_t() noexcept { ustore_arena_free(memory_); }
+    ~arena_t() noexcept { ustore_arena_free(arena_); }
 
-    arena_t(arena_t&& other) noexcept : memory_(std::exchange(other.memory_, nullptr)) {}
+    arena_t(arena_t&& other) noexcept : arena_(std::exchange(other.arena_, nullptr)) {}
 
     arena_t& operator=(arena_t&& other) noexcept {
-        std::swap(memory_, other.memory_);
+        std::swap(arena_, other.arena_);
         return *this;
     }
 
-    ustore_arena_t* member_ptr() noexcept { return &memory_; }
-    operator ustore_arena_t*() & noexcept { return member_ptr(); }
+    /** Makes an arena where @p executor computes, or on host pages for calls on the calling thread. */
+    static expected<arena_t> make(ustore_executor_t executor = nullptr) noexcept {
+        arena_t made;
+        ustore_outcome_t outcome {};
+        ustore_arena_init_t init {.arena = &made.arena_, .executor = executor, .outcome = &outcome};
+        ustore_arena_init(&init);
+        if (status_t const status {outcome}; status.failed()) return status;
+        return made;
+    }
+
+    operator ustore_arena_t() const noexcept { return arena_; }
 };
 
-/** Either owns an arena or borrows one that a longer-lived container holds, while a copy owns a fresh arena. */
-class any_arena_t {
-
-    arena_t owned_;
-    ustore_arena_t* borrowed_ = nullptr;
+/** A view of what one call wrote into an arena made for that call alone, which it frees on destruction, as shorthand
+ *  with no place for an arena answers. It moves but never copies, and @c view slices off the plain view. */
+template <typename view_type_>
+class owned : public view_type_ {
+    arena_t arena_;
 
   public:
-    any_arena_t() noexcept = default;
-    explicit any_arena_t(ustore_arena_t* borrowed) noexcept : borrowed_(borrowed) {}
+    owned() noexcept = default;
+    owned(view_type_ const& view, arena_t arena) noexcept : view_type_(view), arena_(std::move(arena)) {}
 
-    any_arena_t(any_arena_t&&) noexcept = default;
-    any_arena_t& operator=(any_arena_t&&) noexcept = default;
-
-    any_arena_t(any_arena_t const&) noexcept {}
-    any_arena_t& operator=(any_arena_t const&) noexcept {
-        owned_ = arena_t {};
-        borrowed_ = nullptr;
-        return *this;
-    }
-
-    ustore_arena_t* member_ptr() noexcept { return borrowed_ ? borrowed_ : owned_.member_ptr(); }
-    operator ustore_arena_t*() & noexcept { return member_ptr(); }
+    view_type_ const& view() const noexcept { return *this; }
 };
 
+using owned_value_t = owned<value_view_t>;
+
+/** What shorthand answers for a call answering @p answer_type_: a scalar copied out of its one-off arena, or a view
+ *  owning that arena. */
+template <typename answer_type_>
+using one_off_t = std::conditional_t<std::is_scalar_v<answer_type_>, answer_type_, owned<answer_type_>>;
+
+/** Runs @p verb on an arena made for it alone where @p executor computes, as shorthand with no place for an arena
+ *  does, answering a scalar copied out of that arena or a view that owns it. */
+template <typename verb_type_>
+auto in_one_off_arena(ustore_executor_t executor, verb_type_&& verb) noexcept {
+    using answer_t = typename std::invoke_result_t<verb_type_&, arena_t&>::value_type;
+    using result_t = expected<one_off_t<answer_t>>;
+    auto [arena, arena_status] = arena_t::make(executor);
+    if (arena_status.failed()) return result_t {arena_status};
+    auto [answer, answer_status] = verb(arena);
+    if (answer_status.failed()) return result_t {answer_status};
+    if constexpr (std::is_scalar_v<answer_t>) return result_t {answer};
+    else return result_t {owned<answer_t> {answer, std::move(arena)}};
+}
+
 #pragma endregion Memory Management
+
+#pragma region Receivers
+
+/** The stamp a transaction or a snapshot reads at, which a commit validates against. */
+enum class read_stamp_t : ustore_stamp_t {};
+
+/** A commit's position in commit order, visible to every snapshot reading at or above it. */
+enum class commit_stamp_t : ustore_stamp_t {};
+
+/** What every call made through one receiver names before its inputs: the database, the executor that runs it, and
+ *  the transaction or snapshot its reads see and its writes go through. */
+struct receiver_t {
+
+    /** An open database. */
+    ustore_database_t database = nullptr;
+
+    /** Executor that runs the calls, where @c nullptr runs them on the calling thread. */
+    ustore_executor_t executor = nullptr;
+
+    /** Transaction the writes go through and the reads see, or @c nullptr for the head. */
+    ustore_transaction_t transaction = nullptr;
+
+    /** Snapshot the reads see when no transaction is named, or @c nullptr for the head. */
+    ustore_snapshot_t snapshot = nullptr;
+
+    /** The view a read sees, which inside a transaction records the keys it reads unless @p watch says otherwise. */
+    ustore_view_t view(ustore_watch_t watch) const noexcept {
+        return transaction ? ustore_transaction_view(transaction, watch) : ustore_snapshot_view(snapshot);
+    }
+
+    /** The same receiver, running its calls on @p runner. */
+    receiver_t on(ustore_executor_t runner) const noexcept { return {database, runner, transaction, snapshot}; }
+};
+
+/** Owns an executor, the threads or I/O rings that run calls on any number of databases, and frees it once drained.
+ *  It never copies, and outlives every call submitted to it. */
+class executor_handle_t {
+    ustore_executor_t executor_ = nullptr;
+
+    /** Creates the executor behind @p init with @p options, whose outputs this call fills in. */
+    template <typename options_type_>
+    static expected<executor_handle_t> make_(void (*init)(options_type_*), options_type_ options) noexcept {
+        executor_handle_t executor;
+        ustore_outcome_t outcome {};
+        options.executor = &executor.executor_;
+        options.outcome = &outcome;
+        init(&options);
+        if (status_t const status {outcome}; status.failed()) return status;
+        return executor;
+    }
+
+  public:
+    executor_handle_t() noexcept = default;
+    executor_handle_t(executor_handle_t const&) = delete;
+    executor_handle_t& operator=(executor_handle_t const&) = delete;
+    executor_handle_t(executor_handle_t&& other) noexcept : executor_(std::exchange(other.executor_, nullptr)) {}
+    executor_handle_t& operator=(executor_handle_t&& other) noexcept {
+        std::swap(executor_, other.executor_);
+        return *this;
+    }
+    ~executor_handle_t() noexcept { ustore_executor_free(executor_); }
+
+    operator ustore_executor_t() const noexcept { return executor_; }
+
+    /** Spawns host threads for the RAM, RocksDB and LevelDB engines. */
+    static expected<executor_handle_t> for_ram(ustore_executor_for_ram_t options = {}) noexcept {
+        return make_(ustore_executor_for_ram, options);
+    }
+
+    /** Borrows the ForkUnion pool @p options name for the RAM, RocksDB and LevelDB engines. */
+    static expected<executor_handle_t> on_pool(ustore_executor_on_pool_t options) noexcept {
+        return make_(ustore_executor_on_pool, options);
+    }
+
+    /** Spawns threads for the NVMe engine, each owning its own I/O ring. */
+    static expected<executor_handle_t> for_nvme(ustore_executor_for_nvme_t options = {}) noexcept {
+        return make_(ustore_executor_for_nvme, options);
+    }
+
+    /** Waits for every call submitted before the drain, leaving the threads in @p mood whenever they go idle. */
+    status_t drain(ustore_mood_t mood = ustore_mood_parked_k) noexcept {
+        ustore_outcome_t outcome {};
+        ustore_executor_drain_t drain {.executor = executor_, .outcome = &outcome, .mood = mood};
+        ustore_executor_drain(&drain);
+        return status_t {outcome};
+    }
+};
+
+/** Whether @p progress_type_ can watch a long call: given the units finished and the units in total, it answers
+ *  whether the call carries on, and never throws. */
+template <typename progress_type_>
+concept progress_concept = requires(progress_type_& progress, ustore_size_t finished, ustore_size_t total) {
+    { progress(finished, total) } noexcept -> std::same_as<ustore_continuation_t>;
+};
+
+/** A callable lent to a long call as the C ABI receives it, a callback and the state it reads, or neither for a call
+ *  nothing watches. The call borrows the callable until it is final. */
+class progress_arg_t {
+
+    template <progress_concept progress_type_>
+    static ustore_continuation_t report_(ustore_size_t finished, ustore_size_t total, void* state) noexcept {
+        return (*static_cast<progress_type_*>(state))(finished, total);
+    }
+
+  public:
+
+    /** Reports the advance of the call, or @c nullptr for a call nothing watches. */
+    ustore_progress_callback_t callback = nullptr;
+
+    /** The callable that @c callback calls. */
+    void* state = nullptr;
+
+    progress_arg_t() noexcept = default;
+
+    /** Lends @p progress, which answers @c ustore_cancel_k to stop the call. */
+    template <progress_concept progress_type_>
+    progress_arg_t(progress_type_& progress) noexcept : callback(&report_<progress_type_>), state(&progress) {}
+};
+
+#pragma endregion Receivers
 
 #pragma region Adapters
 
@@ -475,8 +584,8 @@ struct collection_key_hash_t {
 struct edge_hash_t {
     std::size_t operator()(edge_t const& edge) const noexcept {
         std::size_t result = SIZE_MAX;
-        hash_combine(result, edge.source_id);
-        hash_combine(result, edge.target_id);
+        hash_combine(result, edge.source);
+        hash_combine(result, edge.target);
         hash_combine(result, edge.id);
         return result;
     }
@@ -485,8 +594,8 @@ struct edge_hash_t {
 /** The role the other end of an edge plays. */
 inline ustore_vertex_role_t invert(ustore_vertex_role_t role) noexcept {
     switch (role) {
-    case ustore_vertex_source_k: return ustore_vertex_target_k;
-    case ustore_vertex_target_k: return ustore_vertex_source_k;
+    case ustore_vertex_role_source_k: return ustore_vertex_role_target_k;
+    case ustore_vertex_role_target_k: return ustore_vertex_role_source_k;
     case ustore_vertex_role_any_k: return ustore_vertex_role_unknown_k;
     case ustore_vertex_role_unknown_k: return ustore_vertex_role_any_k;
     }
@@ -520,22 +629,22 @@ constexpr integer_ round_up_to_multiple(integer_ value, std::type_identity_t<int
 
 /** The document field type that stores @p element_. */
 template <typename element_>
-constexpr ustore_doc_field_type_t ustore_doc_field() noexcept {
-    if constexpr (std::is_same_v<element_, bool>) return ustore_doc_field_bool_k;
-    if constexpr (std::is_same_v<element_, f64_t>) return ustore_doc_field_f64_k;
-    if constexpr (std::is_same_v<element_, f32_t>) return ustore_doc_field_f32_k;
-    if constexpr (std::is_same_v<element_, i64_t>) return ustore_doc_field_i64_k;
-    if constexpr (std::is_same_v<element_, i32_t>) return ustore_doc_field_i32_k;
-    if constexpr (std::is_same_v<element_, i16_t>) return ustore_doc_field_i16_k;
-    if constexpr (std::is_same_v<element_, i8_t>) return ustore_doc_field_i8_k;
-    if constexpr (std::is_same_v<element_, u64_t>) return ustore_doc_field_u64_k;
-    if constexpr (std::is_same_v<element_, u32_t>) return ustore_doc_field_u32_k;
-    if constexpr (std::is_same_v<element_, u16_t>) return ustore_doc_field_u16_k;
-    if constexpr (std::is_same_v<element_, u8_t>) return ustore_doc_field_u8_k;
-    if constexpr (std::is_same_v<element_, value_view_t>) return ustore_doc_field_bin_k;
-    if constexpr (std::is_same_v<element_, std::string_view> || std::is_same_v<element_, ustore_str_view_t>)
-        return ustore_doc_field_str_k;
-    return ustore_doc_field_json_k;
+constexpr ustore_docs_field_type_t docs_field_type() noexcept {
+    if constexpr (std::is_same_v<element_, bool>) return ustore_docs_field_type_bool_k;
+    if constexpr (std::is_same_v<element_, f64_t>) return ustore_docs_field_type_f64_k;
+    if constexpr (std::is_same_v<element_, f32_t>) return ustore_docs_field_type_f32_k;
+    if constexpr (std::is_same_v<element_, i64_t>) return ustore_docs_field_type_i64_k;
+    if constexpr (std::is_same_v<element_, i32_t>) return ustore_docs_field_type_i32_k;
+    if constexpr (std::is_same_v<element_, i16_t>) return ustore_docs_field_type_i16_k;
+    if constexpr (std::is_same_v<element_, i8_t>) return ustore_docs_field_type_i8_k;
+    if constexpr (std::is_same_v<element_, u64_t>) return ustore_docs_field_type_u64_k;
+    if constexpr (std::is_same_v<element_, u32_t>) return ustore_docs_field_type_u32_k;
+    if constexpr (std::is_same_v<element_, u16_t>) return ustore_docs_field_type_u16_k;
+    if constexpr (std::is_same_v<element_, u8_t>) return ustore_docs_field_type_u8_k;
+    if constexpr (std::is_same_v<element_, value_view_t>) return ustore_docs_field_type_bin_k;
+    if constexpr (std::is_same_v<element_, std::string_view> || std::is_same_v<element_, char const*>)
+        return ustore_docs_field_type_str_k;
+    return ustore_docs_field_type_json_k;
 }
 
 #pragma endregion Adapters

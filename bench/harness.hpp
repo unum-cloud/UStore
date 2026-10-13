@@ -38,11 +38,12 @@
 #include <smashtable/basic_vector.hpp>
 
 #include "arguments.hpp"
-#include "executor.hpp"
+#include "utilities/ram_device.hpp"
 
 namespace unum::ustore::bench {
 
 using namespace tools;
+using namespace utilities;
 
 using steady_clock_t = std::chrono::steady_clock;
 using time_point_t = steady_clock_t::time_point;

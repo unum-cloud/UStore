@@ -189,7 +189,7 @@ void clear_collection(ustore_database_t database, ustore_collection_id_t collect
     drop.database = database;
     drop.outcome = &outcome;
     drop.collection = collection;
-    drop.mode = ustore_drop_keys_vals_k;
+    drop.mode = ustore_drop_pairs_k;
     ustore_collection_drop(&drop);
     if (outcome.status != ustore_status_success_k)
         fmt::println(stderr, "Failed to clear a collection: {}", outcome.message);
@@ -228,9 +228,9 @@ void bench_docs_import(executor_t& executor, tabular_t const& tabular, settings_
             importing.database = tabular.database;
             importing.outcome = &outcome;
             importing.collection = ustore_collection_main_k;
-            importing.path = tabular.path(file);
+            importing.path = bytes_of(tabular.path(file));
             importing.max_batch_size = settings.memory_limit.value;
-            importing.id_field = settings.id_field.data();
+            importing.id_field = bytes_of(settings.id_field);
             ustore_docs_import(&importing);
             if (outcome.status != ustore_status_success_k) loop.fail();
             else loop.count(1, tabular.files[file].size);
@@ -249,11 +249,11 @@ void bench_graph_import(executor_t& executor, tabular_t const& tabular, settings
             importing.database = tabular.database;
             importing.outcome = &outcome;
             importing.collection = tabular.graph;
-            importing.path = tabular.path(file);
+            importing.path = bytes_of(tabular.path(file));
             importing.max_batch_size = settings.memory_limit.value;
-            importing.source_id_field = settings.source_field.data();
-            importing.target_id_field = settings.target_field.data();
-            importing.edge_id_field = settings.edge_field.data();
+            importing.source_id_field = bytes_of(settings.source_field);
+            importing.target_id_field = bytes_of(settings.target_field);
+            importing.edge_id_field = bytes_of(settings.edge_field);
             ustore_graph_import(&importing);
             if (outcome.status != ustore_status_success_k) loop.fail();
             else loop.count(1, tabular.files[file].size);
@@ -269,22 +269,22 @@ void bench_docs_export(executor_t& executor, tabular_t const& tabular, settings_
         sz::string_t output;
         if (!export_path(output, settings, "tabular_graph_docs", thread))
             return loop.skip("no memory for the output path");
-        ustore_arena_t arena = nullptr;
+        auto [arena, arena_status] = arena_t::make();
+        if (arena_status.failed()) return loop.skip("no memory for the arena");
         ustore_outcome_t outcome {};
         for ([[maybe_unused]] std::size_t call : loop) {
             ustore_docs_export_t exporting {};
             exporting.database = tabular.database;
             exporting.outcome = &outcome;
-            exporting.arena = &arena;
+            exporting.arena = arena;
             exporting.collection = ustore_collection_main_k;
-            exporting.path = output.c_str();
+            exporting.path = bytes_of(output.view());
             exporting.max_batch_size = settings.memory_limit.value;
             ustore_docs_export(&exporting);
             if (outcome.status != ustore_status_success_k) loop.fail();
             else loop.count(1, take_exported(output.c_str()));
             outcome = {};
         }
-        ustore_arena_free(arena);
     }));
 }
 
@@ -306,25 +306,25 @@ void bench_graph_export(executor_t& executor, tabular_t const& tabular, settings
             for (std::size_t index = 0; index != name->size(); ++index)
                 if ((*name)[index] == '/') (*name)[index] = '_';
 
-        ustore_arena_t arena = nullptr;
+        auto [arena, arena_status] = arena_t::make();
+        if (arena_status.failed()) return loop.skip("no memory for the arena");
         ustore_outcome_t outcome {};
         for ([[maybe_unused]] std::size_t call : loop) {
             ustore_graph_export_t exporting {};
             exporting.database = tabular.database;
             exporting.outcome = &outcome;
-            exporting.arena = &arena;
+            exporting.arena = arena;
             exporting.collection = tabular.graph;
-            exporting.path = output.c_str();
+            exporting.path = bytes_of(output.view());
             exporting.max_batch_size = settings.memory_limit.value;
-            exporting.source_id_field = source.c_str();
-            exporting.target_id_field = target.c_str();
-            exporting.edge_id_field = edge.c_str();
+            exporting.source_id_field = bytes_of(source.view());
+            exporting.target_id_field = bytes_of(target.view());
+            exporting.edge_id_field = bytes_of(edge.view());
             ustore_graph_export(&exporting);
             if (outcome.status != ustore_status_success_k) loop.fail();
             else loop.count(1, take_exported(output.c_str()));
             outcome = {};
         }
-        ustore_arena_free(arena);
     }));
 }
 

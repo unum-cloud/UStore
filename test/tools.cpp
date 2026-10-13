@@ -10,7 +10,6 @@
 #include <cstdint> // `std::int64_t`
 #include <cstdio>  // `stderr`, `std::fopen`, `std::fread`, `std::fwrite`, `std::remove`
 #include <cstdlib> // `std::free`, `std::system`
-#include <cstring> // `std::strcmp`
 
 #include <algorithm>    // `std::sort`
 #include <array>        // `std::array`
@@ -28,10 +27,11 @@
 #include <stringzilla/stringzilla.hpp>
 
 #include "ustore/db.h"
+#include "ustore/ranges.hpp" // `strided_strings`, `u64_tape`
 #include "ustore/strings.h"
 
 #include "dataset.h"
-#include "test.hpp" // `suite_exit_code`, `create_directories`, `expect`
+#include "harness.hpp" // `suite_exit_code`, `create_directories`, `expect`
 
 namespace unum::ustore::test {
 
@@ -46,7 +46,7 @@ constexpr char const* exported_ndjson_k = "exported.ndjson";
 constexpr char const* exported_csv_k = "exported.csv";
 constexpr char const* exported_parquet_k = "exported.parquet";
 
-constexpr ustore_str_view_t selected_paths_k[] = {
+constexpr std::string_view selected_paths_k[] = {
     "id",
     "id_str",
     "/user/id",
@@ -57,11 +57,11 @@ constexpr ustore_str_view_t selected_paths_k[] = {
     "/quoted_status/entities/media/0/id",
 };
 
-constexpr ustore_str_view_t selected_columns_k[] = {"id", "id_str", "user_id", "geo_type"};
+constexpr std::string_view selected_columns_k[] = {"id", "id_str", "user_id", "geo_type"};
 
-constexpr ustore_str_view_t source_field_k = "id";
-constexpr ustore_str_view_t target_field_k = "user_id";
-constexpr ustore_str_view_t edge_field_k = "user_followers_count";
+constexpr std::string_view source_field_k = "id";
+constexpr std::string_view target_field_k = "user_id";
+constexpr std::string_view edge_field_k = "user_followers_count";
 
 /** Whether a document case keeps whole rows or only selected fields. */
 enum class field_selection_t : bool {
@@ -78,25 +78,25 @@ struct fixture_paths_t {
     char const* directory;
 
     /** Subdirectory holding the fixtures and the exports. */
-    test_path_t files;
+    path_t files;
 
     /** Documents as NDJSON. */
-    test_path_t documents_ndjson;
+    path_t documents_ndjson;
 
     /** Documents as CSV. */
-    test_path_t documents_csv;
+    path_t documents_csv;
 
     /** Edges as NDJSON. */
-    test_path_t edges_ndjson;
+    path_t edges_ndjson;
 
     /** Edges as CSV. */
-    test_path_t edges_csv;
+    path_t edges_csv;
 
     /** Export target in NDJSON. */
-    test_path_t exported_ndjson;
+    path_t exported_ndjson;
 
     /** Export target in CSV. */
-    test_path_t exported_csv;
+    path_t exported_csv;
 
     /** Names every path under @p test_directory. */
     explicit fixture_paths_t(char const* test_directory) noexcept
@@ -213,7 +213,7 @@ class test_database_t {
     }
 
     /** Opens the database @p config describes and answers whether it opened. */
-    [[nodiscard]] bool open(test_config_t const& config) noexcept {
+    [[nodiscard]] bool open(config_t const& config) noexcept {
         auto [opened, open_status] = open_raw(config);
         if (open_status.failed()) {
             fmt::println(stderr, "  failed to open the database: {}", open_status.message);
@@ -233,7 +233,7 @@ class test_database_t {
         request.description = &description;
         ustore_database_describe(&request);
         bool const supported = outcome.status == ustore_status_success_k &&
-                               (description.capabilities & ustore_supports_collections_k);
+                               (description.capabilities & ustore_capabilities_collections_k);
         return supported;
     }
 
@@ -244,7 +244,7 @@ class test_database_t {
         drop.database = database_;
         drop.outcome = &outcome;
         drop.collection = ustore_collection_main_k;
-        drop.mode = ustore_drop_keys_vals_k;
+        drop.mode = ustore_drop_pairs_k;
         ustore_collection_drop(&drop);
     }
 
@@ -260,13 +260,13 @@ class test_database_t {
         return graph;
     }
 
-    /** Drops @p collection together with its handle. */
+    /** Drops @p collection together with its name. */
     void drop(ustore_collection_id_t collection, ustore_outcome_t& outcome) noexcept {
         ustore_collection_drop_t drop {};
         drop.database = database_;
         drop.outcome = &outcome;
         drop.collection = collection;
-        drop.mode = ustore_drop_keys_vals_handle_k;
+        drop.mode = ustore_drop_collection_k;
         ustore_collection_drop(&drop);
     }
 
@@ -288,8 +288,9 @@ struct json_document_t {
 };
 
 /** Finds @p field in @p object, as a JSON pointer when it starts with a slash and as a key otherwise. */
-[[nodiscard]] yyjson_val* lookup(yyjson_val* object, ustore_str_view_t field) noexcept {
-    return field[0] == '/' ? yyjson_ptr_get(object, field) : yyjson_obj_get(object, field);
+[[nodiscard]] yyjson_val* lookup(yyjson_val* object, std::string_view field) noexcept {
+    return field.starts_with('/') ? yyjson_ptr_getn(object, field.data(), field.size())
+                                  : yyjson_obj_getn(object, field.data(), field.size());
 }
 
 /** Serializes @p value minified into @p output, so equal values of equal key order compare equal as text. */
@@ -316,21 +317,30 @@ struct json_document_t {
     return !text.empty() && parsed.ec == std::errc {} && parsed.ptr == text.data() + text.size();
 }
 
-/** Whether @p database holds a collection named @p name. */
+/** Whether @p database holds a collection named @p name, resolved through a one-off arena. */
 [[nodiscard]] bool lists_collection(ustore_database_t database, char const* name) noexcept {
     ustore_outcome_t outcome {};
-    ustore_octet_t presence = 0;
-    ustore_collection_id_t id = ustore_collection_main_k;
+    ustore_arena_t arena = nullptr;
+    ustore_arena_init_t arena_init {.arena = &arena, .executor = nullptr, .outcome = &outcome};
+    ustore_arena_init(&arena_init);
+    if (outcome.status != ustore_status_success_k) return false;
+
+    std::string_view const text {name};
+    std::uint64_t const offsets[2] {0, text.size()};
+    ustore_octet_t const* presences = nullptr;
+    ustore_collection_id_t const* ids = nullptr;
     ustore_collection_find_t find {};
     find.database = database;
     find.outcome = &outcome;
     find.count = 1;
-    find.names = &name;
-    find.presences = &presence;
-    find.collections = &id;
-    find.collections_stride = sizeof(ustore_collection_id_t);
+    find.names = u64_tape(text.data(), offsets);
+    find.presences = &presences;
+    find.collections = &ids;
+    find.arena = arena;
     ustore_collection_find(&find);
-    return outcome.status == ustore_status_success_k && (presence & 1);
+    bool const found = outcome.status == ustore_status_success_k && (presences[0] & 1);
+    ustore_arena_free(arena);
+    return found;
 }
 
 #pragma endregion Helpers
@@ -367,9 +377,9 @@ struct edge_row_t {
         else {
             json_document_t const document {yyjson_read(line.data(), line.size(), 0)};
             yyjson_val* const root = yyjson_doc_get_root(document.handle);
-            yyjson_val* const source = yyjson_obj_get(root, source_field_k);
-            yyjson_val* const target = yyjson_obj_get(root, target_field_k);
-            yyjson_val* const label = yyjson_obj_get(root, edge_field_k);
+            yyjson_val* const source = lookup(root, source_field_k);
+            yyjson_val* const target = lookup(root, target_field_k);
+            yyjson_val* const label = lookup(root, edge_field_k);
             parsed = yyjson_is_uint(source) && yyjson_is_uint(target) && yyjson_is_uint(label);
             edge = {yyjson_get_uint(source), yyjson_get_uint(target), yyjson_get_uint(label)};
         }
@@ -416,10 +426,10 @@ struct edge_row_t {
         return failures;
     }
 
-    std::span<ustore_str_view_t const> const fields = is_csv(input)
-                                                          ? std::span<ustore_str_view_t const>(selected_columns_k)
-                                                          : std::span<ustore_str_view_t const>(selected_paths_k);
-    for (ustore_str_view_t field : fields) {
+    std::span<std::string_view const> const fields = is_csv(input)
+                                                         ? std::span<std::string_view const>(selected_columns_k)
+                                                         : std::span<std::string_view const>(selected_paths_k);
+    for (std::string_view const field : fields) {
         failures += expect(canonical(lookup(exported_root, field), exported_value) &&
                            canonical(lookup(expected_root, field), expected_value));
         failures += expect(exported_value.size() != 0);
@@ -477,8 +487,7 @@ struct edge_row_t {
 #pragma region Round Trips
 
 /** Imports edges from @p input, exports them to @p output, and checks the export holds exactly the fixture edges. */
-[[nodiscard]] std::size_t graph_round_trip(test_config_t const& config, char const* input,
-                                           char const* output) noexcept {
+[[nodiscard]] std::size_t graph_round_trip(config_t const& config, char const* input, char const* output) noexcept {
     test_database_t database;
     if (!database.open(config)) return 1;
     database.clear();
@@ -492,11 +501,11 @@ struct edge_row_t {
     importing.database = database.get();
     importing.outcome = &outcome;
     importing.collection = graph;
-    importing.path = input;
+    importing.path = bytes_of(input);
     importing.max_batch_size = max_batch_size_k;
-    importing.source_id_field = source_field_k;
-    importing.target_id_field = target_field_k;
-    importing.edge_id_field = edge_field_k;
+    importing.source_id_field = bytes_of(source_field_k);
+    importing.target_id_field = bytes_of(target_field_k);
+    importing.edge_id_field = bytes_of(edge_field_k);
     ustore_graph_import(&importing);
     failures += expect_success(outcome);
 
@@ -504,11 +513,11 @@ struct edge_row_t {
     exporting.database = database.get();
     exporting.outcome = &outcome;
     exporting.collection = graph;
-    exporting.path = output;
+    exporting.path = bytes_of(output);
     exporting.max_batch_size = max_batch_size_k;
-    exporting.source_id_field = source_field_k;
-    exporting.target_id_field = target_field_k;
-    exporting.edge_id_field = edge_field_k;
+    exporting.source_id_field = bytes_of(source_field_k);
+    exporting.target_id_field = bytes_of(target_field_k);
+    exporting.edge_id_field = bytes_of(edge_field_k);
     ustore_graph_export(&exporting);
     failures += expect_success(outcome);
 
@@ -520,16 +529,17 @@ struct edge_row_t {
 }
 
 /** Imports documents from @p input, exports them to @p output, and checks the rows or fields @p selection keeps. */
-[[nodiscard]] std::size_t documents_round_trip(test_config_t const& config, char const* input, char const* output,
+[[nodiscard]] std::size_t documents_round_trip(config_t const& config, char const* input, char const* output,
                                                field_selection_t selection) noexcept {
     test_database_t database;
     if (!database.open(config)) return 1;
     database.clear();
 
-    std::span<ustore_str_view_t const> const fields = is_csv(input)
-                                                          ? std::span<ustore_str_view_t const>(selected_columns_k)
-                                                          : std::span<ustore_str_view_t const>(selected_paths_k);
-    std::size_t const fields_count = selection == field_selection_t::selected_k ? fields.size() : 0;
+    std::span<std::string_view const> const fields = is_csv(input)
+                                                         ? std::span<std::string_view const>(selected_columns_k)
+                                                         : std::span<std::string_view const>(selected_paths_k);
+    bool const selects = selection == field_selection_t::selected_k;
+    strided_strings<std::string_view> const names {strided(fields).begin()};
 
     std::size_t failures = 0;
     ustore_outcome_t outcome {};
@@ -537,12 +547,11 @@ struct edge_row_t {
     importing.database = database.get();
     importing.outcome = &outcome;
     importing.collection = ustore_collection_main_k;
-    importing.path = input;
+    importing.path = bytes_of(input);
     importing.max_batch_size = max_batch_size_k;
-    importing.fields_count = fields_count;
-    importing.fields = fields_count ? fields.data() : nullptr;
-    importing.fields_stride = sizeof(ustore_str_view_t);
-    importing.id_field = "id";
+    importing.fields_count = selects ? fields.size() : 0;
+    importing.fields = selects ? names.view() : ustore_strings_view_t {};
+    importing.id_field = bytes_of("id");
     ustore_docs_import(&importing);
     failures += expect_success(outcome);
 
@@ -550,11 +559,10 @@ struct edge_row_t {
     exporting.database = database.get();
     exporting.outcome = &outcome;
     exporting.collection = ustore_collection_main_k;
-    exporting.path = output;
+    exporting.path = bytes_of(output);
     exporting.max_batch_size = max_batch_size_k;
-    exporting.fields_count = fields_count;
-    exporting.fields = fields_count ? fields.data() : nullptr;
-    exporting.fields_stride = sizeof(ustore_str_view_t);
+    exporting.fields_count = importing.fields_count;
+    exporting.fields = importing.fields;
     ustore_docs_export(&exporting);
     failures += expect_success(outcome);
 
@@ -569,7 +577,7 @@ struct edge_row_t {
 #pragma region Invalid Tasks
 
 /** Graph import rejects a task without a path, source, target or database, and accepts one without edges. */
-[[nodiscard]] std::size_t graph_import_rejects_invalid_tasks(test_config_t const& config, char const* input) noexcept {
+[[nodiscard]] std::size_t graph_import_rejects_invalid_tasks(config_t const& config, char const* input) noexcept {
     test_database_t database;
     if (!database.open(config)) return 1;
     database.clear();
@@ -582,29 +590,29 @@ struct edge_row_t {
     valid.database = database.get();
     valid.outcome = &outcome;
     valid.collection = graph;
-    valid.path = input;
+    valid.path = bytes_of(input);
     valid.max_batch_size = max_batch_size_k;
-    valid.source_id_field = source_field_k;
-    valid.target_id_field = target_field_k;
-    valid.edge_id_field = edge_field_k;
+    valid.source_id_field = bytes_of(source_field_k);
+    valid.target_id_field = bytes_of(target_field_k);
+    valid.edge_id_field = bytes_of(edge_field_k);
 
     ustore_graph_import_t without_path = valid;
-    without_path.path = nullptr;
+    without_path.path = {};
     ustore_graph_import(&without_path);
     failures += expect_failure(outcome);
 
     ustore_graph_import_t without_source = valid;
-    without_source.source_id_field = nullptr;
+    without_source.source_id_field = {};
     ustore_graph_import(&without_source);
     failures += expect_failure(outcome);
 
     ustore_graph_import_t without_target = valid;
-    without_target.target_id_field = nullptr;
+    without_target.target_id_field = {};
     ustore_graph_import(&without_target);
     failures += expect_failure(outcome);
 
     ustore_graph_import_t without_edge = valid;
-    without_edge.edge_id_field = nullptr;
+    without_edge.edge_id_field = {};
     ustore_graph_import(&without_edge);
     failures += expect_success(outcome);
 
@@ -619,7 +627,7 @@ struct edge_row_t {
 }
 
 /** Graph export rejects a task without a path, source, target or database, or with a pointer field. */
-[[nodiscard]] std::size_t graph_export_rejects_invalid_tasks(test_config_t const& config, char const* output) noexcept {
+[[nodiscard]] std::size_t graph_export_rejects_invalid_tasks(config_t const& config, char const* output) noexcept {
     test_database_t database;
     if (!database.open(config)) return 1;
     database.clear();
@@ -630,34 +638,34 @@ struct edge_row_t {
     valid.database = database.get();
     valid.outcome = &outcome;
     valid.collection = ustore_collection_main_k;
-    valid.path = output;
+    valid.path = bytes_of(output);
     valid.max_batch_size = max_batch_size_k;
-    valid.source_id_field = source_field_k;
-    valid.target_id_field = target_field_k;
-    valid.edge_id_field = edge_field_k;
+    valid.source_id_field = bytes_of(source_field_k);
+    valid.target_id_field = bytes_of(target_field_k);
+    valid.edge_id_field = bytes_of(edge_field_k);
 
     ustore_graph_export_t without_path = valid;
-    without_path.path = nullptr;
+    without_path.path = {};
     ustore_graph_export(&without_path);
     failures += expect_failure(outcome);
 
     ustore_graph_export_t without_source = valid;
-    without_source.source_id_field = nullptr;
+    without_source.source_id_field = {};
     ustore_graph_export(&without_source);
     failures += expect_failure(outcome);
 
     ustore_graph_export_t without_target = valid;
-    without_target.target_id_field = nullptr;
+    without_target.target_id_field = {};
     ustore_graph_export(&without_target);
     failures += expect_failure(outcome);
 
     ustore_graph_export_t with_pointer_field = valid;
-    with_pointer_field.source_id_field = "/id";
+    with_pointer_field.source_id_field = bytes_of("/id");
     ustore_graph_export(&with_pointer_field);
     failures += expect_failure(outcome);
 
     ustore_graph_export_t without_edge = valid;
-    without_edge.edge_id_field = nullptr;
+    without_edge.edge_id_field = {};
     ustore_graph_export(&without_edge);
     failures += expect_success(outcome);
 
@@ -670,27 +678,27 @@ struct edge_row_t {
     return failures;
 }
 
-/** Document import rejects a task without a path, fields, stride, database or an identifier among the fields. */
-[[nodiscard]] std::size_t docs_import_rejects_invalid_tasks(test_config_t const& config, char const* input) noexcept {
+/** Document import rejects a task without a path, fields, an accessor, database or an identifier among the fields. */
+[[nodiscard]] std::size_t docs_import_rejects_invalid_tasks(config_t const& config, char const* input) noexcept {
     test_database_t database;
     if (!database.open(config)) return 1;
     database.clear();
 
     std::size_t failures = 0;
     ustore_outcome_t outcome {};
+    strided_strings<std::string_view> const names {strided(selected_columns_k).begin()};
     ustore_docs_import_t valid {};
     valid.database = database.get();
     valid.outcome = &outcome;
     valid.collection = ustore_collection_main_k;
-    valid.path = input;
+    valid.path = bytes_of(input);
     valid.max_batch_size = max_batch_size_k;
     valid.fields_count = std::size(selected_columns_k);
-    valid.fields = selected_columns_k;
-    valid.fields_stride = sizeof(ustore_str_view_t);
-    valid.id_field = "id";
+    valid.fields = names.view();
+    valid.id_field = bytes_of("id");
 
     ustore_docs_import_t without_path = valid;
-    without_path.path = nullptr;
+    without_path.path = {};
     ustore_docs_import(&without_path);
     failures += expect_failure(outcome);
 
@@ -700,17 +708,17 @@ struct edge_row_t {
     failures += expect_failure(outcome);
 
     ustore_docs_import_t without_fields = valid;
-    without_fields.fields = nullptr;
+    without_fields.fields = {};
     ustore_docs_import(&without_fields);
     failures += expect_failure(outcome);
 
-    ustore_docs_import_t without_stride = valid;
-    without_stride.fields_stride = 0;
-    ustore_docs_import(&without_stride);
+    ustore_docs_import_t without_accessor = valid;
+    without_accessor.fields.data.accessor.get = nullptr;
+    ustore_docs_import(&without_accessor);
     failures += expect_failure(outcome);
 
     ustore_docs_import_t without_id_among_fields = valid;
-    without_id_among_fields.id_field = "missing";
+    without_id_among_fields.id_field = bytes_of("missing");
     ustore_docs_import(&without_id_among_fields);
     failures += expect_failure(outcome);
 
@@ -723,26 +731,26 @@ struct edge_row_t {
     return failures;
 }
 
-/** Document export rejects a task without a path, fields, stride or database, or with an unknown format. */
-[[nodiscard]] std::size_t docs_export_rejects_invalid_tasks(test_config_t const& config, char const* output) noexcept {
+/** Document export rejects a task without a path, fields, an accessor or database, or with an unknown format. */
+[[nodiscard]] std::size_t docs_export_rejects_invalid_tasks(config_t const& config, char const* output) noexcept {
     test_database_t database;
     if (!database.open(config)) return 1;
     database.clear();
 
     std::size_t failures = 0;
     ustore_outcome_t outcome {};
+    strided_strings<std::string_view> const names {strided(selected_columns_k).begin()};
     ustore_docs_export_t valid {};
     valid.database = database.get();
     valid.outcome = &outcome;
     valid.collection = ustore_collection_main_k;
-    valid.path = output;
+    valid.path = bytes_of(output);
     valid.max_batch_size = max_batch_size_k;
     valid.fields_count = std::size(selected_columns_k);
-    valid.fields = selected_columns_k;
-    valid.fields_stride = sizeof(ustore_str_view_t);
+    valid.fields = names.view();
 
     ustore_docs_export_t without_path = valid;
-    without_path.path = nullptr;
+    without_path.path = {};
     ustore_docs_export(&without_path);
     failures += expect_failure(outcome);
 
@@ -752,18 +760,18 @@ struct edge_row_t {
     failures += expect_failure(outcome);
 
     ustore_docs_export_t without_fields = valid;
-    without_fields.fields = nullptr;
+    without_fields.fields = {};
     ustore_docs_export(&without_fields);
     failures += expect_failure(outcome);
 
-    ustore_docs_export_t without_stride = valid;
-    without_stride.fields_stride = 0;
-    ustore_docs_export(&without_stride);
+    ustore_docs_export_t without_accessor = valid;
+    without_accessor.fields.data.accessor.get = nullptr;
+    ustore_docs_export(&without_accessor);
     failures += expect_failure(outcome);
 
-    test_path_t const unknown_format_output {config.directory(), exported_parquet_k};
+    path_t const unknown_format_output {config.directory(), exported_parquet_k};
     ustore_docs_export_t with_unknown_format = valid;
-    with_unknown_format.path = unknown_format_output.c_str();
+    with_unknown_format.path = bytes_of(unknown_format_output.c_str());
     ustore_docs_export(&with_unknown_format);
     failures += expect_failure(outcome);
 
@@ -790,7 +798,7 @@ template <typename... arguments_type_>
 }
 
 /** Creates, imports into, exports and drops a named collection, then imports and exports the main one. */
-[[nodiscard]] std::size_t cli_round_trip(fixture_paths_t const& paths, test_config_t const& config,
+[[nodiscard]] std::size_t cli_round_trip(fixture_paths_t const& paths, config_t const& config,
                                          char const* cli) noexcept {
     std::size_t failures = 0;
     char const* const directory = paths.directory;
@@ -849,7 +857,7 @@ template <typename... arguments_type_>
 
 /** Runs every case against the fixtures written under the directory of @p config, and the CLI at @p cli unless it is
  *  empty. */
-void run_cases(suite_totals_t& totals, test_config_t const& config, std::string_view cli) noexcept {
+void run_cases(suite_totals_t& totals, config_t const& config, std::string_view cli) noexcept {
     fixture_paths_t const paths {config.directory()};
     if (!write_fixtures(paths)) {
         report(totals, "tools.fixtures", 1);
@@ -912,13 +920,13 @@ int main(int argc, char** argv) {
         return status == argument_status_t::help_k ? 0 : 1;
     suite_totals_t totals = options.totals();
 
-    auto const maybe_directory = test_directory_t::make(options.directory);
+    auto const maybe_directory = directory_t::make(options.directory);
     if (!maybe_directory) {
         fmt::println(stderr, "Cannot create a unique directory under {}", options.directory);
         return 1;
     }
     char const* const directory = maybe_directory->path();
-    test_config_t const config {options.engine, directory};
+    config_t const config {options.engine, directory};
 
     if (directory) run_cases(totals, config, cli);
     else report(totals, "tools", case_result_t::skipped(needs_directory_k));

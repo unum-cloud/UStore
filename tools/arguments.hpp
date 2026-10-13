@@ -28,6 +28,7 @@
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`
 #include <cstdio>  // `stderr`
+#include <cstring> // `std::strlen`
 
 #include <algorithm>    // `std::any_of`, `std::equal`
 #include <array>        // `std::array`
@@ -560,30 +561,56 @@ struct engine_options_t {
     choice_t transport {transport_names_k};
 };
 
-/** Opens the engine @p options name into @p database; the one place binaries tell the engines apart. */
-inline void open_engine(engine_options_t const& options, ustore_database_t* database,
-                        ustore_outcome_t* outcome) noexcept {
-    if (options.name == "ram") {
+/** Opens the engine @p options name into @p database, running the open on @p executor with @p completion as every
+ *  call does, where NVMe borrows @p executor until close; the one place binaries tell the engines apart. The in-memory
+ *  engine starts empty without a directory, and persists in one otherwise. */
+inline void open_engine(engine_options_t const& options, ustore_database_t* database, ustore_outcome_t* outcome,
+                        ustore_executor_t executor = nullptr,
+                        ustore_completion_t completion = ustore_completion_blocking_k) noexcept {
+    ustore_bytes_view_t const directory {reinterpret_cast<ustore_byte_t const*>(options.directory),
+                                         options.directory ? std::strlen(options.directory) : 0};
+    ustore_isolation_t const isolation = static_cast<ustore_isolation_t>(options.isolation.selected);
+    if (options.name == "ram" && !directory.length) {
         ustore_database_init_ram_t init {.database = database,
+                                         .executor = executor,
                                          .outcome = outcome,
-                                         .directory = options.directory,
-                                         .isolation = static_cast<ustore_isolation_t>(options.isolation.selected)};
+                                         .completion = completion,
+                                         .isolation = isolation};
         return ustore_database_init_ram(&init);
     }
+    if (options.name == "ram") {
+        ustore_database_open_ram_t open {.database = database,
+                                         .executor = executor,
+                                         .outcome = outcome,
+                                         .completion = completion,
+                                         .directory = directory,
+                                         .isolation = isolation};
+        return ustore_database_open_ram(&open);
+    }
     if (options.name == "rocksdb") {
-        ustore_database_init_rocksdb_t init {.database = database, .outcome = outcome, .directory = options.directory};
-        return ustore_database_init_rocksdb(&init);
+        ustore_database_open_rocksdb_t open {.database = database,
+                                             .executor = executor,
+                                             .outcome = outcome,
+                                             .completion = completion,
+                                             .directory = directory};
+        return ustore_database_open_rocksdb(&open);
     }
     if (options.name == "leveldb") {
-        ustore_database_init_leveldb_t init {.database = database, .outcome = outcome, .directory = options.directory};
-        return ustore_database_init_leveldb(&init);
+        ustore_database_open_leveldb_t open {.database = database,
+                                             .executor = executor,
+                                             .outcome = outcome,
+                                             .completion = completion,
+                                             .directory = directory};
+        return ustore_database_open_leveldb(&open);
     }
     if (options.name == "nvme") {
-        ustore_database_init_nvme_t init {.database = database,
+        ustore_database_open_nvme_t open {.database = database,
+                                          .executor = executor,
                                           .outcome = outcome,
-                                          .directory = options.directory,
+                                          .completion = completion,
+                                          .directory = directory,
                                           .transport = static_cast<ustore_transport_t>(options.transport.selected)};
-        return ustore_database_init_nvme(&init);
+        return ustore_database_open_nvme(&open);
     }
     *outcome = {ustore_status_invalid_argument_k, "No engine has that name"};
 }

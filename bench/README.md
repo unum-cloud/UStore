@@ -2,7 +2,7 @@
 
 UStore's speed claims rest on one hyper-converged machine, so this suite measures on one: its NVMe drives, its CPU cores and its GPUs, on Hopper and Blackwell boxes alike.
 Comparisons against other databases live in a separate harness.
-This suite answers _which engine configuration_ and _which component_: SmashTable, RocksDB, LevelDB and NVMe behind the same C ABI, and NVMe's single-collection database against its own configurations.
+This suite answers _which engine configuration_ and _which component_: `ram`, RocksDB, LevelDB and NVMe behind the same C ABI, and NVMe's single-collection database against its own configurations.
 Every binary echoes its flags, then prints its progress and one line per row to standard output, so a run is its own transcript.
 
 ## The Suite
@@ -22,7 +22,7 @@ The three engine benchmarks compile once each, as `ustore_bench_twitter`, `ustor
 ### Building
 
 Every number comes from the `release` preset, which builds into `build_release`.
-The SmashTable engine is always built, and each other engine is switched on by its option.
+The `ram` engine is always built, and each other engine is switched on by its option, while NVMe stays off until its sources build.
 
 ```sh
 cmake --preset release -DUSTORE_BUILD_BENCH=1 -DUSTORE_WITH_ROCKSDB=1 -DUSTORE_WITH_LEVELDB=1
@@ -106,6 +106,7 @@ The imports divide the listed files into one contiguous share per thread, so `--
 ### NVMe Components
 
 `nvme_single_collection_database.cu` reads its workloads from `nvme_single_collection_database.json`, and writes its databases and its log under the required `--directory`, its only flag.
+No CMake target builds it yet.
 Each entry names one value width from 1 byte upward, switches on with `enabled`, and sizes the population, the cache, the write buffer and the LSM levels.
 
 ### Louvain

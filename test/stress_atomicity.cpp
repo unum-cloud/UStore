@@ -24,11 +24,12 @@
 
 #include "ustore/ustore.hpp"
 
-#include "executor.hpp" // `caller_exclusivity_t`, `executor_t`
-#include "test.hpp"     // `suite_exit_code`, `expect`, `suite_totals_t`
+#include "harness.hpp"              // `suite_exit_code`, `expect`, `suite_totals_t`
+#include "utilities/ram_device.hpp" // `caller_exclusivity_t`, `executor_t`
 
 using namespace unum::ustore;
 using namespace unum::ustore::test;
+using namespace unum::ustore::utilities;
 using namespace unum;
 
 /** Workload of the suite, each field set by the flag of the same name. */
@@ -86,8 +87,11 @@ struct atomicity_run_t {
     /** Database opened once for the whole run. */
     database_t& database;
 
-    /** Main collection, whose arena every verification reuses. */
+    /** Main collection, which every verification reads. */
     blobs_collection_t collection;
+
+    /** Arena every verification reads into, rewound by each. */
+    arena_t arena;
 
     /** Every key a round writes, in order, so each batch is a slice of them. */
     st::basic_vector<ustore_key_t> keys;
@@ -128,16 +132,20 @@ struct batches_t {
 
 /** Begins the transaction a slot resets before every attempt. */
 [[nodiscard]] std::size_t begin_transaction(database_t& database, transaction_t& transaction) {
-    auto maybe_transaction = database.transact();
+    auto maybe_transaction = database.transaction();
     std::size_t const failures = expect(maybe_transaction);
     if (failures) return failures;
     transaction = *std::move(maybe_transaction);
     return 0;
 }
 
-/** Fills the keys of @p run, seeds one generator per thread, and begins their transactions when the engine has them. */
-[[nodiscard]] std::size_t prepare_run(atomicity_run_t& run, atomicity_options_t const& options, test_random_t random) {
-    std::size_t failures = expect(st::succeeded(run.keys.resize(options.keys.value)));
+/** Makes the arena of @p run, fills its keys, seeds one generator per thread, and begins their transactions when the
+ *  engine has them. */
+[[nodiscard]] std::size_t prepare_run(atomicity_run_t& run, atomicity_options_t const& options, random_t random) {
+    auto [arena, arena_status] = arena_t::make();
+    run.arena = std::move(arena);
+    std::size_t failures = expect(arena_status.succeeded());
+    failures += expect(st::succeeded(run.keys.resize(options.keys.value)));
     failures += expect(st::succeeded(run.slots.resize(std::ranges::max(options.threads.view()))));
     for (std::size_t index = 0; index != run.keys.size(); ++index) run.keys[index] = key_from_integer(index);
     for (std::size_t index = 0; index != run.slots.size(); ++index)
@@ -159,10 +167,10 @@ std::size_t commit_batch(transaction_t& transaction, keys_view_t keys, value_vie
         std::size_t const failures = expect(transaction.reset().succeeded());
         if (failures) return failures;
         blobs_collection_t collection = transaction.main();
-        bool const staged = operation == batch_operation_t::erase_k ? collection[keys].erase().succeeded()
+        bool const staged = operation == batch_operation_t::erase_k ? collection[keys].remove().succeeded()
                                                                     : collection[keys].assign(value).succeeded();
         if (!staged) continue;
-        if (transaction.commit().succeeded()) return 0;
+        if (transaction.commit()) return 0;
     }
 }
 
@@ -178,9 +186,9 @@ void write_round(writer_slot_t& slot, batches_t const& batches, std::size_t thre
     }
 }
 
-/** Checks that one batch holds one value in all its keys. */
-std::size_t verify_batch(blobs_collection_t& collection, keys_view_t keys) {
-    auto maybe_retrieved = collection[keys].value();
+/** Checks that one batch holds one value in all its keys, reading them into @p arena. */
+std::size_t verify_batch(blobs_collection_t& collection, arena_t& arena, keys_view_t keys) {
+    auto maybe_retrieved = collection[keys].value(arena);
     std::size_t failures = expect(maybe_retrieved);
     if (!maybe_retrieved) return failures;
     auto const& retrieved = *maybe_retrieved;
@@ -195,8 +203,8 @@ std::size_t run_round(atomicity_run_t& run, executor_t& executor, batches_t cons
     std::size_t failures = expect(st::succeeded(executor.for_threads(writer)));
     for (writer_slot_t& slot : slots) failures += std::exchange(slot.failures, 0);
     for (std::size_t batch = 0; batch != batches.count(); ++batch)
-        failures += verify_batch(run.collection, batches[batch]);
-    failures += expect(run.database.clear().succeeded());
+        failures += verify_batch(run.collection, run.arena, batches[batch]);
+    failures += expect(run.database.clear(ustore_drop_collection_k).succeeded());
     return failures;
 }
 
@@ -270,12 +278,12 @@ int main(int argc, char** argv) {
         return status == argument_status_t::help_k ? 0 : 1;
     suite_totals_t totals = suite.totals();
 
-    auto const maybe_directory = test_directory_t::make(suite.directory);
+    auto const maybe_directory = directory_t::make(suite.directory);
     if (!maybe_directory) {
         fmt::println(stderr, "Cannot create a unique directory under {}", suite.directory);
         return 1;
     }
-    test_config_t const config {suite.engine, maybe_directory->path()};
+    config_t const config {suite.engine, maybe_directory->path()};
     auto [database, open_status] = open_database<database_t>(config);
     if (open_status.failed()) {
         fmt::println(stderr, "Cannot open the database");

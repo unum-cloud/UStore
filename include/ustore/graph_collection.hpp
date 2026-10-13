@@ -2,42 +2,236 @@
  *  @file include/ustore/graph_collection.hpp
  *  @author Ash Vardanian
  *  @date June 30, 2022
- *  @brief A handle to one graph collection with typed vertex and edge operations.
+ *  @brief Handles to one graph collection with typed vertex and edge operations, and their deferred twins, whose verbs
+ *      submit to an executor.
  */
 
 #pragma once
 
-#include <cstddef> // `std::byte`, `std::size_t`
+#include <cstddef> // `std::size_t`
 
-#include <algorithm> // `std::ranges::equal_range`
-#include <span>      // `std::span`
-#include <utility>   // `std::forward`, `std::move`, `std::swap`
+#include <algorithm>   // `std::ranges::equal_range`
+#include <span>        // `std::span`
+#include <type_traits> // `std::is_same_v`
+#include <utility>     // `std::forward`, `std::move`, `std::swap`
 
 #include "ustore/blobs_range.hpp" // `keys_range_t`
-#include "ustore/blobs_ref.hpp"   // `blobs_ref`
+#include "ustore/blobs_ref.hpp"   // `blobs_read_ref`
 #include "ustore/graph.h"
 #include "ustore/graph_stream.hpp" // `graph_stream_t`
-#include "ustore/ranges.hpp"       // `range`, `strided`, `transform_reduce_n`, `owning_view`
-#include "ustore/ranges_args.hpp"  // `edges_span_t`, `edges_view_t`, `places_arg_t`
-#include "ustore/status.hpp"       // `status_t`, `expected`
-#include "ustore/types.hpp"        // `any_arena_t`, `collection_key_field_t`, `edge_t`
+#include "ustore/ranges.hpp"       // `range`, `strided`, `exported_edges`, `bits_view_t`, `owned_array_concept`
+#include "ustore/status.hpp"       // `status_t`, `expected`, `deferred`
+#include "ustore/types.hpp"        // `arena_t`, `in_one_off_arena`, `receiver_t`, `collection_key_field_t`, `edge_t`
 
 namespace unum::ustore {
 
-/** A handle to one graph collection, stored as an inverted index from every vertex to its edges.
- *  It reads into a local arena and so serves one thread, though every thread may hold its own
- *  handle to the same collection, inside or outside a transaction. */
-class graph_collection_t {
-    ustore_database_t database_ = nullptr;
-    ustore_collection_id_t collection_ = ustore_collection_main_k;
-    ustore_transaction_t transaction_ = nullptr;
-    ustore_snapshot_t snapshot_ = {};
-    any_arena_t arena_;
+class deferred_graph_read_collection_t;
+class deferred_graph_collection_t;
 
-    status_t drop_with(ustore_drop_mode_t mode) noexcept {
+#pragma region Collections
+
+/** A handle to one graph collection that only reads, stored as an inverted index from every vertex to its edges,
+ *  cheap to construct and to copy. It holds no state of its own, so any number of threads share it, at the head,
+ *  inside a transaction or at a snapshot. */
+class graph_read_collection_t {
+  protected:
+    receiver_t receiver_ {};
+    ustore_collection_id_t collection_ = ustore_collection_main_k;
+
+    /** Reads the degrees of @p vertices into @p arena, with the offsets and edges unless @p edges is null. */
+    status_t read_edges_into_(strided_span<ustore_key_t const> vertices, strided_span<ustore_vertex_role_t const> roles,
+                              arena_t& arena, ustore_watch_t watch, ustore_vertex_degree_t const** degrees,
+                              ustore_length_t const** offsets, ustore_key_t const** edges) noexcept {
+        ustore_outcome_t outcome {};
+        ustore_graph_read_edges_t graph_read_edges {};
+        graph_read_edges.database = receiver_.database;
+        graph_read_edges.executor = receiver_.executor;
+        graph_read_edges.outcome = &outcome;
+        graph_read_edges.view = receiver_.view(watch);
+        graph_read_edges.count = vertices.count();
+        graph_read_edges.collections = {&collection_, 0};
+        graph_read_edges.vertices = {vertices.data(), vertices.stride()};
+        graph_read_edges.roles = {roles.data(), roles.stride()};
+        graph_read_edges.degrees_per_vertex = degrees;
+        graph_read_edges.edges_offsets = offsets;
+        graph_read_edges.edges_per_vertex = edges;
+        graph_read_edges.arena = arena;
+
+        ustore_graph_read_edges(&graph_read_edges);
+        return status_t {outcome};
+    }
+
+  public:
+    using adjacency_range_t = range<graph_stream_t>;
+
+    /** The handle a snapshot hands out for this kind of collection, which only reads. */
+    using read_only_t = graph_read_collection_t;
+
+    /** The twin a deferred receiver hands out, whose verbs answer deferred calls. */
+    using deferred_t = deferred_graph_read_collection_t;
+
+    /** What the collections this kind of handle addresses hold, which a creation records and a lookup checks. */
+    static constexpr ustore_modality_t modality_k = ustore_modality_graph_k;
+
+    graph_read_collection_t() noexcept = default;
+    graph_read_collection_t(receiver_t receiver, ustore_collection_id_t collection = ustore_collection_main_k) noexcept
+        : receiver_(receiver), collection_(collection) {}
+
+    ustore_collection_id_t* member_ptr() noexcept { return &collection_; }
+
+    /** Reads the degree of @p vertex in @p role through a one-off arena. */
+    expected<ustore_vertex_degree_t> degree( //
+        ustore_key_t vertex, ustore_vertex_role_t role = ustore_vertex_role_any_k,
+        ustore_watch_t watch = ustore_watch_keys_k) noexcept {
+        return in_one_off_arena(receiver_.executor, [&](arena_t& arena) noexcept -> expected<ustore_vertex_degree_t> {
+            auto [found, degrees_status] = degrees({{&vertex}, 1}, arena, {{&role}, 1}, watch);
+            if (degrees_status.failed()) return degrees_status;
+            return found[0];
+        });
+    }
+
+    /** Reads the degree of every vertex into @p arena. */
+    expected<std::span<ustore_vertex_degree_t const>> degrees( //
+        strided_span<ustore_key_t const> vertices, arena_t& arena, strided_span<ustore_vertex_role_t const> roles = {},
+        ustore_watch_t watch = ustore_watch_keys_k) noexcept {
+
+        ustore_vertex_degree_t const* found = nullptr;
+        if (status_t const status = read_edges_into_(vertices, roles, arena, watch, &found, nullptr, nullptr);
+            status.failed())
+            return status;
+        return std::span<ustore_vertex_degree_t const> {found, found ? vertices.size() : 0};
+    }
+
+    /** Checks whether @p vertex is present through a one-off arena, including a vertex without edges. */
+    expected<bool> present(ustore_key_t vertex, ustore_watch_t watch = ustore_watch_keys_k) noexcept {
+        return blobs_read_ref<collection_key_field_t>(receiver_, collection_key_field_t {collection_, vertex})
+            .present(watch);
+    }
+
+    /** Checks which vertices are present into @p arena, including those without any edges. */
+    expected<bits_view_t> present( //
+        strided_span<ustore_key_t const> const& vertices, arena_t& arena,
+        ustore_watch_t watch = ustore_watch_keys_k) noexcept {
+        place_batch_t places;
+        places.collections_begin = {&collection_, 0};
+        places.keys_begin = vertices.begin();
+        places.count = vertices.count();
+        return blobs_read_ref<place_batch_t>(receiver_, std::move(places)).present(arena, watch);
+    }
+
+    expected<keys_stream_t> vertex_stream(
+        std::size_t vertices_read_ahead = keys_stream_t::default_read_ahead_k) const noexcept {
+        blobs_range_t members(receiver_, collection_);
+        return members.keys_begin(vertices_read_ahead);
+    }
+
+    /** Counts the vertices by streaming through all of them. */
+    expected<std::size_t> size() noexcept { return keys_range_t {blobs_range_t {receiver_, collection_}}.size(); }
+
+    /** Counts the edges by streaming through the outgoing edges of every vertex. */
+    expected<std::size_t> number_of_edges() noexcept {
+        auto [stream, stream_status] = graph_stream_t::make(receiver_, collection_, ustore_vertex_role_source_k,
+                                                            smallest_key_k);
+        if (stream_status.failed()) return stream_status;
+
+        std::size_t count = 0;
+        for (; !stream.is_end(); ++stream) ++count;
+        return count;
+    }
+
+    expected<adjacency_range_t> edges(
+        ustore_vertex_role_t role = ustore_vertex_role_any_k,
+        std::size_t vertices_read_ahead = keys_stream_t::default_read_ahead_k) const noexcept {
+
+        auto [begin, begin_status] = graph_stream_t::make(receiver_, collection_, role, smallest_key_k,
+                                                          vertices_read_ahead);
+        if (begin_status.failed()) return begin_status;
+        auto [end, end_status] = graph_stream_t::make(receiver_, collection_, role, ustore_key_unknown_k,
+                                                      vertices_read_ahead);
+        if (end_status.failed()) return end_status;
+        return adjacency_range_t {std::move(begin), std::move(end)};
+    }
+
+    /** Reads every edge that has @p vertex in @p role into @p arena. */
+    expected<edges_view_t> read_edges( //
+        ustore_key_t vertex, arena_t& arena, ustore_vertex_role_t role = ustore_vertex_role_any_k,
+        ustore_watch_t watch = ustore_watch_keys_k) noexcept {
+        return read_edges({{&vertex}, 1}, arena, {{&role}, 1}, watch);
+    }
+
+    /** Reads the edges from @p source to @p target into @p arena. */
+    expected<edges_view_t> edges_between(ustore_key_t source, ustore_key_t target, arena_t& arena,
+                                         ustore_watch_t watch = ustore_watch_keys_k) noexcept {
+        auto [all, read_edges_status] = read_edges(source, arena, ustore_vertex_role_source_k, watch);
+        if (read_edges_status.failed()) return read_edges_status;
+
+        auto const matches = std::ranges::equal_range(all.targets.begin(), all.targets.end(), target);
+        std::size_t const offset = static_cast<std::size_t>(matches.begin() - all.targets.begin());
+        std::size_t const count = static_cast<std::size_t>(matches.end() - matches.begin());
+        return edges_view_t {all.sources.subspan(offset, count), all.targets.subspan(offset, count),
+                             all.ids.subspan(offset, count)};
+    }
+
+    /** Reads every edge that has any of @p vertices in an allowed role into @p arena, split by vertex through the
+     *  offsets of the answer, where undirected graphs may repeat an edge reversed. */
+    expected<edges_view_t> read_edges( //
+        strided_span<ustore_key_t const> vertices, arena_t& arena, strided_span<ustore_vertex_role_t const> roles = {},
+        ustore_watch_t watch = ustore_watch_keys_k) noexcept {
+
+        ustore_vertex_degree_t const* degrees = nullptr;
+        ustore_length_t const* offsets = nullptr;
+        ustore_key_t const* edges = nullptr;
+        if (status_t const status = read_edges_into_(vertices, roles, arena, watch, &degrees, &offsets, &edges);
+            status.failed())
+            return status;
+        return exported_edges(edges, offsets, vertices.size());
+    }
+
+    /** Reads the targets of the edges leaving @p vertex into @p arena. */
+    expected<strided_span<ustore_key_t const>> successors(ustore_key_t vertex, arena_t& arena) noexcept {
+        auto [edges, read_edges_status] = read_edges(vertex, arena, ustore_vertex_role_source_k);
+        if (read_edges_status.failed()) return read_edges_status;
+        return edges.targets;
+    }
+
+    /** Reads the sources of the edges entering @p vertex into @p arena. */
+    expected<strided_span<ustore_key_t const>> predecessors(ustore_key_t vertex, arena_t& arena) noexcept {
+        auto [edges, read_edges_status] = read_edges(vertex, arena, ustore_vertex_role_target_k);
+        if (read_edges_status.failed()) return read_edges_status;
+        return edges.sources;
+    }
+
+    /** Lists the distinct neighbors of @p vertex in @p arena, reordering the edges it fetched there in place. */
+    expected<strided_span<ustore_key_t const>> neighbors(
+        ustore_key_t vertex, arena_t& arena, ustore_vertex_role_t role = ustore_vertex_role_any_k) noexcept {
+        auto [fetched, read_edges_status] = read_edges(vertex, arena, role);
+        if (read_edges_status.failed()) return read_edges_status;
+
+        // The arena belongs to the caller, so the edges it holds are reordered where they landed
+        edge_t* const begin = const_cast<edge_t*>(reinterpret_cast<edge_t const*>(fetched.sources.data()));
+        edges_span<ustore_key_t> const edges {begin, begin + fetched.size()};
+
+        // Incoming and outgoing edges hold the neighbor in different columns, so every edge is flipped to target it
+        for (std::size_t index = 0; index != edges.size(); ++index) {
+            ustore_key_t& source = edges.sources[index];
+            ustore_key_t& target = edges.targets[index];
+            if (target == vertex) std::swap(source, target);
+        }
+
+        strided_span<ustore_key_t> const targets = edges.targets;
+        std::size_t const count = sort_and_deduplicate(targets.begin(), targets.end());
+        return strided_span<ustore_key_t const> {{targets.data(), targets.stride()}, count};
+    }
+};
+
+/** A handle to one graph collection that reads and writes the head or the view of a transaction. */
+class graph_collection_t : public graph_read_collection_t {
+
+    status_t drop_with_(ustore_drop_mode_t mode) noexcept {
         ustore_outcome_t outcome {};
         ustore_collection_drop_t collection_drop {};
-        collection_drop.database = database_;
+        collection_drop.database = receiver_.database;
+        collection_drop.executor = receiver_.executor;
         collection_drop.outcome = &outcome;
         collection_drop.collection = collection_;
         collection_drop.mode = mode;
@@ -45,114 +239,75 @@ class graph_collection_t {
         return status_t {outcome};
     }
 
-    /** The view reads through this handle see, watching the vertices they read inside a transaction. */
-    ustore_view_t view(ustore_watch_t watch) const noexcept { return view_through(transaction_, snapshot_, watch); }
-
-    /** Finds the degrees of @p vertices into @p degrees, and their edges into the arena unless @p edges is null. */
-    status_t find_edges(strided_range<ustore_key_t const> vertices, strided_range<ustore_vertex_role_t const> roles,
-                        ustore_watch_t watch, ustore_vertex_degree_t* degrees, ustore_key_t** edges) noexcept {
-        ustore_outcome_t outcome {};
-        ustore_graph_find_edges_t graph_find_edges {};
-        graph_find_edges.database = database_;
-        graph_find_edges.outcome = &outcome;
-        graph_find_edges.view = view(watch);
-        graph_find_edges.count = vertices.count();
-        graph_find_edges.collections = &collection_;
-        graph_find_edges.vertices = vertices.begin().get();
-        graph_find_edges.vertices_stride = vertices.stride();
-        graph_find_edges.roles = roles.begin().get();
-        graph_find_edges.roles_stride = roles.stride();
-        graph_find_edges.degrees_per_vertex = degrees;
-        graph_find_edges.degrees_per_vertex_stride = sizeof(ustore_vertex_degree_t);
-        graph_find_edges.edges_per_vertex = edges;
-        graph_find_edges.arena = arena_;
-
-        ustore_graph_find_edges(&graph_find_edges);
-        return status_t {outcome};
-    }
-
   public:
-    using adjacency_range_t = range<graph_stream_t>;
+    using graph_read_collection_t::graph_read_collection_t;
 
-    graph_collection_t() noexcept = default;
-    graph_collection_t(ustore_database_t database, ustore_collection_id_t collection = ustore_collection_main_k,
-                       ustore_transaction_t transaction = nullptr, ustore_snapshot_t snapshot = {},
-                       ustore_arena_t* arena = nullptr) noexcept
-        : database_(database), collection_(collection), transaction_(transaction), snapshot_(snapshot), arena_(arena) {}
+    /** The twin a deferred receiver hands out, whose verbs answer deferred calls. */
+    using deferred_t = deferred_graph_collection_t;
 
-    graph_collection_t(graph_collection_t&&) = default;
-    graph_collection_t& operator=(graph_collection_t&&) = default;
-    graph_collection_t(graph_collection_t const&) = delete;
-    graph_collection_t& operator=(graph_collection_t const&) = delete;
-
-    ustore_collection_id_t* member_ptr() noexcept { return &collection_; }
-
-    status_t upsert_vertices(strided_range<ustore_key_t const> vertices) noexcept {
+    status_t write_vertices(strided_span<ustore_key_t const> vertices) noexcept {
         ustore_outcome_t outcome {};
-        ustore_graph_upsert_vertices_t upsert {};
-        upsert.database = database_;
-        upsert.outcome = &outcome;
-        upsert.transaction = transaction_;
-        upsert.count = vertices.size();
-        upsert.collections = &collection_;
-        upsert.vertices = vertices.data();
-        upsert.vertices_stride = vertices.stride();
+        ustore_graph_write_vertices_t write {};
+        write.database = receiver_.database;
+        write.executor = receiver_.executor;
+        write.outcome = &outcome;
+        write.transaction = receiver_.transaction;
+        write.count = vertices.size();
+        write.collections = {&collection_, 0};
+        write.vertices = {vertices.data(), vertices.stride()};
 
-        ustore_graph_upsert_vertices(&upsert);
+        ustore_graph_write_vertices(&write);
         return status_t {outcome};
     }
 
-    template <typename keys_arg_>
-    status_t upsert_vertices(keys_arg_&& vertices) noexcept {
-        return upsert_vertices(strided(vertices).immutable());
+    template <typename keys_argument_type_>
+    status_t write_vertices(keys_argument_type_&& vertices) noexcept {
+        return write_vertices(strided(vertices).immutable());
     }
 
-    status_t upsert_vertex(ustore_key_t const vertex) noexcept { return upsert_vertices({{&vertex}, 1}); }
+    status_t write_vertex(ustore_key_t const vertex) noexcept { return write_vertices({{&vertex}, 1}); }
 
-    status_t upsert_edges(edges_view_t const& edges) noexcept {
+    status_t write_edges(edges_view_t const& edges) noexcept {
         ustore_outcome_t outcome {};
-        ustore_graph_upsert_edges_t graph_upsert_edges {};
-        graph_upsert_edges.database = database_;
-        graph_upsert_edges.outcome = &outcome;
-        graph_upsert_edges.transaction = transaction_;
-        graph_upsert_edges.count = edges.size();
-        graph_upsert_edges.collections = &collection_;
-        graph_upsert_edges.edges = edges.edge_ids.begin().get();
-        graph_upsert_edges.edges_stride = edges.edge_ids.stride();
-        graph_upsert_edges.sources = edges.source_ids.begin().get();
-        graph_upsert_edges.sources_stride = edges.source_ids.stride();
-        graph_upsert_edges.targets = edges.target_ids.begin().get();
-        graph_upsert_edges.targets_stride = edges.target_ids.stride();
+        ustore_graph_write_edges_t graph_write_edges {};
+        graph_write_edges.database = receiver_.database;
+        graph_write_edges.executor = receiver_.executor;
+        graph_write_edges.outcome = &outcome;
+        graph_write_edges.transaction = receiver_.transaction;
+        graph_write_edges.count = edges.size();
+        graph_write_edges.collections = {&collection_, 0};
+        graph_write_edges.edges = {edges.ids.data(), edges.ids.stride()};
+        graph_write_edges.sources = {edges.sources.data(), edges.sources.stride()};
+        graph_write_edges.targets = {edges.targets.data(), edges.targets.stride()};
 
-        ustore_graph_upsert_edges(&graph_upsert_edges);
+        ustore_graph_write_edges(&graph_write_edges);
         return status_t {outcome};
     }
 
-    status_t upsert_edge(edge_t const& edge) noexcept { return upsert_edges(edges_view_t {&edge, &edge + 1}); }
+    status_t write_edge(edge_t const& edge) noexcept { return write_edges(edges_view_t {&edge, &edge + 1}); }
 
     status_t remove_vertices( //
-        strided_range<ustore_key_t const> vertices, strided_range<ustore_vertex_role_t const> roles = {},
+        strided_span<ustore_key_t const> vertices, strided_span<ustore_vertex_role_t const> roles = {},
         ustore_durability_t durability = ustore_durability_buffered_k) noexcept {
 
         ustore_outcome_t outcome {};
         ustore_graph_remove_vertices_t graph_remove_vertices {};
-        graph_remove_vertices.database = database_;
+        graph_remove_vertices.database = receiver_.database;
+        graph_remove_vertices.executor = receiver_.executor;
         graph_remove_vertices.outcome = &outcome;
-        graph_remove_vertices.transaction = transaction_;
+        graph_remove_vertices.transaction = receiver_.transaction;
         graph_remove_vertices.count = vertices.count();
-        graph_remove_vertices.collections = &collection_;
-        graph_remove_vertices.vertices = vertices.begin().get();
-        graph_remove_vertices.vertices_stride = vertices.stride();
-        graph_remove_vertices.roles = roles.begin().get();
-        graph_remove_vertices.roles_stride = roles.stride();
+        graph_remove_vertices.collections = {&collection_, 0};
+        graph_remove_vertices.vertices = {vertices.data(), vertices.stride()};
+        graph_remove_vertices.roles = {roles.data(), roles.stride()};
         graph_remove_vertices.durability = durability;
 
         ustore_graph_remove_vertices(&graph_remove_vertices);
         return status_t {outcome};
     }
 
-    template <typename keys_arg_>
-    status_t remove_vertices(keys_arg_&& vertices) noexcept {
+    template <typename keys_argument_type_>
+    status_t remove_vertices(keys_argument_type_&& vertices) noexcept {
         return remove_vertices(strided(vertices).immutable());
     }
 
@@ -165,17 +320,15 @@ class graph_collection_t {
     status_t remove_edges(edges_view_t const& edges) noexcept {
         ustore_outcome_t outcome {};
         ustore_graph_remove_edges_t graph_remove_edges {};
-        graph_remove_edges.database = database_;
+        graph_remove_edges.database = receiver_.database;
+        graph_remove_edges.executor = receiver_.executor;
         graph_remove_edges.outcome = &outcome;
-        graph_remove_edges.transaction = transaction_;
+        graph_remove_edges.transaction = receiver_.transaction;
         graph_remove_edges.count = edges.size();
-        graph_remove_edges.collections = &collection_;
-        graph_remove_edges.edges = edges.edge_ids.begin().get();
-        graph_remove_edges.edges_stride = edges.edge_ids.stride();
-        graph_remove_edges.sources = edges.source_ids.begin().get();
-        graph_remove_edges.sources_stride = edges.source_ids.stride();
-        graph_remove_edges.targets = edges.target_ids.begin().get();
-        graph_remove_edges.targets_stride = edges.target_ids.stride();
+        graph_remove_edges.collections = {&collection_, 0};
+        graph_remove_edges.edges = {edges.ids.data(), edges.ids.stride()};
+        graph_remove_edges.sources = {edges.sources.data(), edges.sources.stride()};
+        graph_remove_edges.targets = {edges.targets.data(), edges.targets.stride()};
 
         ustore_graph_remove_edges(&graph_remove_edges);
         return status_t {outcome};
@@ -184,170 +337,291 @@ class graph_collection_t {
     status_t remove_edge(edge_t const& edge) noexcept { return remove_edges(edges_view_t {&edge, &edge + 1}); }
 
     /** Removes every edge but keeps the vertices. */
-    status_t remove_edges() noexcept { return drop_with(ustore_drop_vals_k); }
+    status_t clear_values() noexcept { return drop_with_(ustore_drop_values_k); }
 
-    status_t clear() noexcept { return drop_with(ustore_drop_keys_vals_k); }
-    status_t drop() noexcept { return drop_with(ustore_drop_keys_vals_handle_k); }
+    status_t clear() noexcept { return drop_with_(ustore_drop_pairs_k); }
+    status_t drop() noexcept { return drop_with_(ustore_drop_collection_k); }
+};
 
-    expected<ustore_vertex_degree_t> degree( //
-        ustore_key_t vertex, ustore_vertex_role_t role = ustore_vertex_role_any_k,
-        ustore_watch_t watch = ustore_watch_keys_k) noexcept {
+#pragma endregion Collections
 
-        ustore_vertex_degree_t found = 0;
-        if (status_t const status = find_edges({{&vertex}, 1}, {{&role}, 1}, watch, &found, nullptr); status.failed())
-            return status;
-        return found;
-    }
+#pragma region Deferred Verbs
 
-    /** Reads the degree of every vertex into a span the result owns. */
-    expected<owning_view<std::span<ustore_vertex_degree_t>>> degrees( //
-        strided_range<ustore_key_t const> vertices, strided_range<ustore_vertex_role_t const> roles = {},
-        ustore_watch_t watch = ustore_watch_keys_k) noexcept {
+/** What a deferred @c ustore_graph_read_edges keeps beside its vertices: the collection and role the arguments point
+ *  to, and the outputs the call writes into the arena it borrows, the edges only when asked for. */
+template <typename answer_type_>
+struct graph_read {
+    using arguments_t = ustore_graph_read_edges_t;
+    using answer_t = expected<answer_type_>;
 
-        st::basic_vector<std::byte> buffer;
-        if (st::failed(buffer.resize(vertices.size() * sizeof(ustore_vertex_degree_t))))
-            return status_t {status_code_t::out_of_memory_k, "Failed to allocate the degrees of vertices"};
-        std::span<ustore_vertex_degree_t> const found {reinterpret_cast<ustore_vertex_degree_t*>(buffer.data()),
-                                                       vertices.size()};
-        if (status_t const status = find_edges(vertices, roles, watch, found.data(), nullptr); status.failed())
-            return status;
-        return owning_view<std::span<ustore_vertex_degree_t>> {found, std::move(buffer)};
-    }
+    /** Collection every vertex lives in. */
+    ustore_collection_id_t collection {};
 
-    expected<bool> contains(ustore_key_t vertex, ustore_watch_t watch = ustore_watch_keys_k) noexcept {
-        return blobs_ref<collection_key_field_t>(database_, transaction_, snapshot_,
-                                                 collection_key_field_t {collection_, vertex}, arena_)
-            .present(watch);
-    }
+    /** Role every vertex plays in the wanted edges. */
+    ustore_vertex_role_t role {};
 
-    /** Checks which vertices are present, including those without any edges. */
-    expected<owning_view<bits_span_t>> contains( //
-        strided_range<ustore_key_t const> const& vertices, ustore_watch_t watch = ustore_watch_keys_k) noexcept {
-        places_arg_t arg;
-        arg.collections_begin = {&collection_, 0};
-        arg.keys_begin = vertices.begin();
-        arg.count = vertices.count();
-        return blobs_ref<places_arg_t>(database_, transaction_, snapshot_, std::move(arg), arena_).present(watch);
-    }
+    /** Number of vertices, the length of the degrees. */
+    ustore_size_t count = 0;
 
-    expected<keys_stream_t> vertex_stream(
-        std::size_t vertices_read_ahead = keys_stream_t::default_read_ahead_k) const noexcept {
-        blobs_range_t members(database_, view(ustore_watch_keys_k), collection_);
-        return members.keys_begin(vertices_read_ahead);
-    }
+    /** Outputs for the degree of every vertex, the offsets of their edges and the tape of edges, three keys per edge,
+     *  inside the arena. */
+    ustore_vertex_degree_t const* degrees = nullptr;
+    ustore_length_t const* offsets = nullptr;
+    ustore_key_t const* edges = nullptr;
 
-    /** Counts the vertices by streaming through all of them. */
-    expected<std::size_t> number_of_vertices() noexcept {
-        return keys_range_t {blobs_range_t {database_, view(ustore_watch_keys_k), collection_}}.size();
-    }
+    static void submit(arguments_t& arguments) noexcept { ustore_graph_read_edges(&arguments); }
 
-    /** Counts the edges by streaming through the outgoing edges of every vertex. */
-    expected<std::size_t> number_of_edges() noexcept {
-        auto [stream, stream_status] = graph_stream_t::make(database_, view(ustore_watch_keys_k), collection_,
-                                                            ustore_vertex_source_k, smallest_key_k);
-        if (stream_status.failed()) return stream_status;
-
-        std::size_t count = 0;
-        for (; !stream.is_end(); ++stream) ++count;
-        return count;
-    }
-
-    expected<adjacency_range_t> edges(
-        ustore_vertex_role_t role = ustore_vertex_role_any_k,
-        std::size_t vertices_read_ahead = keys_stream_t::default_read_ahead_k) const noexcept {
-
-        ustore_view_t const head = view(ustore_watch_keys_k);
-        auto [begin, begin_status] = graph_stream_t::make(database_, head, collection_, role, smallest_key_k,
-                                                          vertices_read_ahead);
-        if (begin_status.failed()) return begin_status;
-        auto [end, end_status] = graph_stream_t::make(database_, head, collection_, role, ustore_key_unknown_k,
-                                                      vertices_read_ahead);
-        if (end_status.failed()) return end_status;
-        return adjacency_range_t {std::move(begin), std::move(end)};
-    }
-
-    expected<edges_span_t> edges_containing( //
-        ustore_key_t vertex, ustore_vertex_role_t role = ustore_vertex_role_any_k,
-        ustore_watch_t watch = ustore_watch_keys_k) noexcept {
-
-        ustore_vertex_degree_t edges_count = 0;
-        ustore_key_t* edges_per_vertex = nullptr;
-        if (status_t const status = find_edges({{&vertex}, 1}, {{&role}, 1}, watch, &edges_count, &edges_per_vertex);
-            status.failed())
-            return status;
-        if (edges_count == ustore_vertex_degree_missing_k) return edges_span_t {};
-
-        edge_t* const edges_begin = reinterpret_cast<edge_t*>(edges_per_vertex);
-        return edges_span_t {edges_begin, edges_begin + edges_count};
-    }
-
-    expected<edges_span_t> edges_between(ustore_key_t source, ustore_key_t target,
-                                         ustore_watch_t watch = ustore_watch_keys_k) noexcept {
-        auto maybe_all = edges_containing(source, ustore_vertex_source_k, watch);
-        if (!maybe_all) return maybe_all;
-
-        edges_span_t all = *maybe_all;
-        auto const matches = std::ranges::equal_range(all.target_ids.begin(), all.target_ids.end(), target);
-        std::size_t const offset = static_cast<std::size_t>(matches.begin() - all.target_ids.begin());
-        std::size_t const count = static_cast<std::size_t>(matches.end() - matches.begin());
-        all.source_ids = all.source_ids.subspan(offset, count);
-        all.target_ids = all.target_ids.subspan(offset, count);
-        all.edge_ids = all.edge_ids.subspan(offset, count);
-        return all;
-    }
-
-    /** Finds every edge that has any of @p vertices in an allowed role,
-     *  where undirected graphs may repeat an edge reversed. */
-    expected<edges_span_t> edges_containing( //
-        strided_range<ustore_key_t const> vertices, strided_range<ustore_vertex_role_t const> roles = {},
-        ustore_watch_t watch = ustore_watch_keys_k) noexcept {
-
-        std::size_t const count = vertices.size();
-        st::basic_vector<ustore_vertex_degree_t> found_degrees;
-        if (st::failed(found_degrees.resize(count)))
-            return status_t {status_code_t::out_of_memory_k, "Failed to allocate the degrees of vertices"};
-        ustore_key_t* edges_per_vertex = nullptr;
-        if (status_t const status = find_edges(vertices, roles, watch, found_degrees.data(), &edges_per_vertex);
-            status.failed())
-            return status;
-
-        edge_t* const edges_begin = reinterpret_cast<edge_t*>(edges_per_vertex);
-        std::size_t const edges_count = transform_reduce_n(
-            found_degrees.data(), count, std::size_t {0}, [](ustore_vertex_degree_t degree) noexcept {
-                return degree == ustore_vertex_degree_missing_k ? 0 : degree;
-            });
-        return edges_span_t {edges_begin, edges_begin + edges_count};
-    }
-
-    expected<strided_range<ustore_key_t>> successors(ustore_key_t vertex) noexcept {
-        auto [edges, edges_containing_status] = edges_containing(vertex, ustore_vertex_source_k);
-        if (edges_containing_status.failed()) return edges_containing_status;
-        return strided_range<ustore_key_t> {edges.target_ids};
-    }
-
-    expected<strided_range<ustore_key_t>> predecessors(ustore_key_t vertex) noexcept {
-        auto [edges, edges_containing_status] = edges_containing(vertex, ustore_vertex_target_k);
-        if (edges_containing_status.failed()) return edges_containing_status;
-        return strided_range<ustore_key_t> {edges.source_ids};
-    }
-
-    /** Lists the distinct neighbors of @p vertex, reordering the fetched edges in place. */
-    expected<strided_range<ustore_key_t>> neighbors(ustore_key_t vertex,
-                                                    ustore_vertex_role_t role = ustore_vertex_role_any_k) noexcept {
-        auto [edges, edges_containing_status] = edges_containing(vertex, role);
-        if (edges_containing_status.failed()) return edges_containing_status;
-
-        // Incoming and outgoing edges hold the neighbor in different columns, so every edge is flipped to target it
-        for (std::size_t index = 0; index != edges.size(); ++index) {
-            ustore_key_t& source = edges.source_ids[index];
-            ustore_key_t& target = edges.target_ids[index];
-            if (target == vertex) std::swap(source, target);
-        }
-
-        strided_range<ustore_key_t> const targets = edges.target_ids;
-        std::size_t const count = sort_and_deduplicate(targets.begin(), targets.end());
-        return strided_range<ustore_key_t> {targets.begin(), count};
+    answer_t finish() && noexcept {
+        if constexpr (std::is_same_v<answer_type_, edges_view_t>) return exported_edges(edges, offsets, count);
+        else return std::span<ustore_vertex_degree_t const> {degrees, degrees ? count : 0};
     }
 };
+
+/** A deferred read of every edge of a batch of vertices, answering the edges in the order of the vertices, split by
+ *  vertex through the offsets of the answer, where undirected graphs may repeat an edge reversed. */
+using graph_read_edges_t = graph_read<edges_view_t>;
+
+/** A deferred read of the degree of every vertex of a batch. */
+using graph_degrees_t = graph_read<std::span<ustore_vertex_degree_t const>>;
+
+/** What a deferred @c ustore_graph_write_edges keeps beside its edges: the collection. */
+struct graph_write_edges_t {
+    using arguments_t = ustore_graph_write_edges_t;
+    using answer_t = status_t;
+
+    /** Collection every edge lives in. */
+    ustore_collection_id_t collection {};
+
+    static void submit(arguments_t& arguments) noexcept { ustore_graph_write_edges(&arguments); }
+    answer_t finish() && noexcept { return {}; }
+};
+
+/** What a deferred @c ustore_graph_remove_edges keeps beside its edges: the collection. */
+struct graph_remove_edges_t {
+    using arguments_t = ustore_graph_remove_edges_t;
+    using answer_t = status_t;
+
+    /** Collection every edge lives in. */
+    ustore_collection_id_t collection {};
+
+    static void submit(arguments_t& arguments) noexcept { ustore_graph_remove_edges(&arguments); }
+    answer_t finish() && noexcept { return {}; }
+};
+
+/** What a deferred @c ustore_graph_write_vertices keeps beside its vertices: the collection. */
+struct graph_write_vertices_t {
+    using arguments_t = ustore_graph_write_vertices_t;
+    using answer_t = status_t;
+
+    /** Collection every vertex lives in. */
+    ustore_collection_id_t collection {};
+
+    static void submit(arguments_t& arguments) noexcept { ustore_graph_write_vertices(&arguments); }
+    answer_t finish() && noexcept { return {}; }
+};
+
+/** What a deferred @c ustore_graph_remove_vertices keeps beside its vertices: the collection and the role. */
+struct graph_remove_vertices_t {
+    using arguments_t = ustore_graph_remove_vertices_t;
+    using answer_t = status_t;
+
+    /** Collection every vertex lives in. */
+    ustore_collection_id_t collection {};
+
+    /** Role every vertex plays, which only joining graphs need. */
+    ustore_vertex_role_t role {};
+
+    static void submit(arguments_t& arguments) noexcept { ustore_graph_remove_vertices(&arguments); }
+    answer_t finish() && noexcept { return {}; }
+};
+
+#pragma endregion Deferred Verbs
+
+#pragma region Deferred Collections
+
+/** A graph collection that only reads, whose verbs submit to an executor and answer deferred calls, as a snapshot
+ *  offers it. Every plain input a verb reads moves into the call, so nothing it borrowed can go before the call is
+ *  final, while an arena is borrowed, since freeing it waits for the call. */
+class deferred_graph_read_collection_t {
+  protected:
+    receiver_t receiver_ {};
+    ustore_collection_id_t collection_ {ustore_collection_main_k};
+
+    /** Submits a read of the edges of @p vertices in @p role into @p arena, exporting the edges themselves only when
+     *  @p answer_type_ asks for them. */
+    template <typename answer_type_, typename vertices_type_>
+    deferred<graph_read<answer_type_>> read_edges_of_(vertices_type_ vertices, arena_t& arena,
+                                                      ustore_vertex_role_t role, ustore_watch_t watch) const noexcept {
+        using verb_t = graph_read<answer_type_>;
+        return deferred<verb_t>::submit(
+            [&](verb_t& verb, ustore_graph_read_edges_t& arguments, vertices_type_ const& owned) noexcept {
+                verb.collection = collection_;
+                verb.role = role;
+                verb.count = owned.size();
+                arguments.database = receiver_.database;
+                arguments.executor = receiver_.executor;
+                arguments.view = receiver_.view(watch);
+                arguments.count = owned.size();
+                arguments.collections = {&verb.collection, 0};
+                arguments.vertices = {owned.data(), sizeof(ustore_key_t)};
+                arguments.roles = {&verb.role, 0};
+                arguments.degrees_per_vertex = &verb.degrees;
+                if constexpr (std::is_same_v<answer_type_, edges_view_t>) {
+                    arguments.edges_offsets = &verb.offsets;
+                    arguments.edges_per_vertex = &verb.edges;
+                }
+                arguments.arena = arena;
+                return status_t {};
+            },
+            std::move(vertices));
+    }
+
+  public:
+    deferred_graph_read_collection_t() noexcept = default;
+    explicit deferred_graph_read_collection_t(receiver_t receiver,
+                                              ustore_collection_id_t collection = ustore_collection_main_k) noexcept
+        : receiver_(receiver), collection_(collection) {}
+
+    operator ustore_collection_id_t() const noexcept { return collection_; }
+
+    /**
+     *  @brief Reads every edge that has any of @p vertices in @p role into @p arena.
+     *  @param[in] vertices Vertices whose edges are read, owned by the call until it is final.
+     *  @param[in] arena Memory the edges land in, borrowed until the call is final, which the answer views.
+     *  @param[in] role Role every vertex plays in the wanted edges.
+     *  @param[in] watch Whether a read inside a transaction records the vertices for conflicts.
+     */
+    template <owned_array_concept<ustore_key_t> vertices_type_>
+    deferred<graph_read_edges_t> read_edges(vertices_type_ vertices, arena_t& arena,
+                                            ustore_vertex_role_t role = ustore_vertex_role_any_k,
+                                            ustore_watch_t watch = ustore_watch_keys_k) const noexcept {
+        return read_edges_of_<edges_view_t>(std::move(vertices), arena, role, watch);
+    }
+
+    /**
+     *  @brief Reads the degree of every vertex of @p vertices in @p role into @p arena.
+     *  @param[in] vertices Vertices whose edges are counted, owned by the call until it is final.
+     *  @param[in] arena Memory the degrees land in, borrowed until the call is final, which the answer views.
+     *  @param[in] role Role every vertex plays in the counted edges.
+     *  @param[in] watch Whether a read inside a transaction records the vertices for conflicts.
+     */
+    template <owned_array_concept<ustore_key_t> vertices_type_>
+    deferred<graph_degrees_t> degrees(vertices_type_ vertices, arena_t& arena,
+                                      ustore_vertex_role_t role = ustore_vertex_role_any_k,
+                                      ustore_watch_t watch = ustore_watch_keys_k) const noexcept {
+        return read_edges_of_<std::span<ustore_vertex_degree_t const>>(std::move(vertices), arena, role, watch);
+    }
+};
+
+/** A graph collection whose verbs submit to an executor and answer deferred calls, reading and writing the head or a
+ *  transaction. */
+class deferred_graph_collection_t : public deferred_graph_read_collection_t {
+
+    /** Fills what a write and a removal of @p edges share. */
+    template <typename verb_type_, typename edges_type_>
+    void edit_edges_(verb_type_& verb, typename verb_type_::arguments_t& arguments, edges_type_ const& edges,
+                     ustore_durability_t durability) const noexcept {
+        edges_view_t const view {edges.data(), edges.data() + edges.size()};
+        verb.collection = collection_;
+        arguments.database = receiver_.database;
+        arguments.executor = receiver_.executor;
+        arguments.transaction = receiver_.transaction;
+        arguments.count = view.size();
+        arguments.collections = {&verb.collection, 0};
+        arguments.edges = {view.ids.data(), view.ids.stride()};
+        arguments.sources = {view.sources.data(), view.sources.stride()};
+        arguments.targets = {view.targets.data(), view.targets.stride()};
+        arguments.durability = durability;
+    }
+
+  public:
+    using deferred_graph_read_collection_t::deferred_graph_read_collection_t;
+
+    /**
+     *  @brief Writes @p edges between existing or new vertices.
+     *  @param[in] edges Edges to write, owned by the call until it is final.
+     *  @param[in] durability Whether the call finishes only after the data reaches the disk.
+     */
+    template <owned_array_concept<edge_t> edges_type_>
+    deferred<graph_write_edges_t> write_edges(
+        edges_type_ edges, ustore_durability_t durability = ustore_durability_buffered_k) const noexcept {
+        return deferred<graph_write_edges_t>::submit(
+            [&](graph_write_edges_t& verb, ustore_graph_write_edges_t& arguments, edges_type_ const& owned) noexcept {
+                edit_edges_(verb, arguments, owned, durability);
+                return status_t {};
+            },
+            std::move(edges));
+    }
+
+    /**
+     *  @brief Removes @p edges, keeping their vertices.
+     *  @param[in] edges Edges to remove, owned by the call until it is final.
+     *  @param[in] durability Whether the call finishes only after the data reaches the disk.
+     */
+    template <owned_array_concept<edge_t> edges_type_>
+    deferred<graph_remove_edges_t> remove_edges(
+        edges_type_ edges, ustore_durability_t durability = ustore_durability_buffered_k) const noexcept {
+        return deferred<graph_remove_edges_t>::submit(
+            [&](graph_remove_edges_t& verb, ustore_graph_remove_edges_t& arguments, edges_type_ const& owned) noexcept {
+                edit_edges_(verb, arguments, owned, durability);
+                return status_t {};
+            },
+            std::move(edges));
+    }
+
+    /**
+     *  @brief Writes @p vertices without edges, keeping those already present.
+     *  @param[in] vertices Vertices to write, owned by the call until it is final.
+     *  @param[in] durability Whether the call finishes only after the data reaches the disk.
+     */
+    template <owned_array_concept<ustore_key_t> vertices_type_>
+    deferred<graph_write_vertices_t> write_vertices(
+        vertices_type_ vertices, ustore_durability_t durability = ustore_durability_buffered_k) const noexcept {
+        return deferred<graph_write_vertices_t>::submit(
+            [&](graph_write_vertices_t& verb, ustore_graph_write_vertices_t& arguments,
+                vertices_type_ const& owned) noexcept {
+                verb.collection = collection_;
+                arguments.database = receiver_.database;
+                arguments.executor = receiver_.executor;
+                arguments.transaction = receiver_.transaction;
+                arguments.count = owned.size();
+                arguments.collections = {&verb.collection, 0};
+                arguments.vertices = {owned.data(), sizeof(ustore_key_t)};
+                arguments.durability = durability;
+                return status_t {};
+            },
+            std::move(vertices));
+    }
+
+    /**
+     *  @brief Removes @p vertices together with every edge they belong to.
+     *  @param[in] vertices Vertices to remove, owned by the call until it is final.
+     *  @param[in] role Role every vertex plays, which only joining graphs need.
+     *  @param[in] durability Whether the call finishes only after the data reaches the disk.
+     */
+    template <owned_array_concept<ustore_key_t> vertices_type_>
+    deferred<graph_remove_vertices_t> remove_vertices(
+        vertices_type_ vertices, ustore_vertex_role_t role = ustore_vertex_role_any_k,
+        ustore_durability_t durability = ustore_durability_buffered_k) const noexcept {
+        return deferred<graph_remove_vertices_t>::submit(
+            [&](graph_remove_vertices_t& verb, ustore_graph_remove_vertices_t& arguments,
+                vertices_type_ const& owned) noexcept {
+                verb.collection = collection_;
+                verb.role = role;
+                arguments.database = receiver_.database;
+                arguments.executor = receiver_.executor;
+                arguments.transaction = receiver_.transaction;
+                arguments.count = owned.size();
+                arguments.collections = {&verb.collection, 0};
+                arguments.vertices = {owned.data(), sizeof(ustore_key_t)};
+                arguments.roles = {&verb.role, 0};
+                arguments.durability = durability;
+                return status_t {};
+            },
+            std::move(vertices));
+    }
+};
+
+#pragma endregion Deferred Collections
 
 } // namespace unum::ustore

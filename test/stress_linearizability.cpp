@@ -26,11 +26,12 @@
 
 #include "ustore/ustore.hpp"
 
-#include "executor.hpp" // `caller_exclusivity_t`, `executor_t`
-#include "test.hpp"     // `suite_exit_code`, `expect`, `expect_eq`
+#include "harness.hpp"              // `suite_exit_code`, `expect`, `expect_eq`
+#include "utilities/ram_device.hpp" // `caller_exclusivity_t`, `executor_t`
 
 using namespace unum::ustore;
 using namespace unum::ustore::test;
+using namespace unum::ustore::utilities;
 using namespace unum;
 
 /** Workload of the suite, each field set by the flag of the same name. */
@@ -100,7 +101,7 @@ struct operation_t {
     payload_t value = 0;
 
     /** Stamp the transaction committed under, or the maximum when it failed. */
-    ustore_stamp_t stamp = std::numeric_limits<ustore_stamp_t>::max();
+    commit_stamp_t stamp {std::numeric_limits<ustore_stamp_t>::max()};
 
     /** Whether the write inserts or removes. */
     operation_code_t code = operation_code_t::insert_k;
@@ -152,13 +153,16 @@ struct writer_slot_t {
 struct linearizability_run_t {
 
     /** Configuration every opening of the database reads. */
-    test_config_t const* config = nullptr;
+    config_t const* config = nullptr;
 
     /** Database reopened for every thread and transaction count, which bounds the tombstones clears leave behind. */
     database_t database;
 
-    /** Main collection of the open database, whose arena every verification reuses. */
+    /** Main collection of the open database, which every verification reads. */
     blobs_collection_t collection;
+
+    /** Arena every verification reads into, rewound by each. */
+    arena_t arena;
 
     /** One slot per thread of the largest configuration. */
     st::basic_vector<writer_slot_t> slots;
@@ -177,23 +181,26 @@ struct linearizability_run_t {
 
 /** Begins the transaction a slot resets before every commit. */
 [[nodiscard]] std::size_t begin_transaction(database_t& database, transaction_t& transaction) {
-    auto maybe_transaction = database.transact();
+    auto maybe_transaction = database.transaction();
     std::size_t const failures = expect(maybe_transaction);
     if (failures) return failures;
     transaction = *std::move(maybe_transaction);
     return 0;
 }
 
-/** Sizes the buffers of @p run for its largest configuration and seeds one generator per thread. */
+/** Makes the arena of @p run, sizes its buffers for its largest configuration and seeds one generator per thread. */
 [[nodiscard]] std::size_t prepare_run(linearizability_run_t& run, linearizability_options_t const& options,
-                                      test_random_t random) {
+                                      random_t random) {
     std::size_t parts = 0;
     for (operations_mix_t const mix : mixes_k) parts = std::max(parts, mix.parts());
     std::size_t const threads_count = std::ranges::max(options.threads.view());
     std::size_t const operations_count = threads_count * std::ranges::max(options.transactions.view()) * parts;
     std::size_t const keys_count = std::max<std::size_t>(operations_count / options.writes_per_key.value, 1) + 1;
 
-    std::size_t failures = expect(st::succeeded(run.slots.resize(threads_count)));
+    auto [arena, arena_status] = arena_t::make();
+    run.arena = std::move(arena);
+    std::size_t failures = expect(arena_status.succeeded());
+    failures += expect(st::succeeded(run.slots.resize(threads_count)));
     failures += expect(st::succeeded(run.operations.resize(operations_count)));
     failures += expect(st::succeeded(run.latest.resize(keys_count)));
     failures += expect(st::succeeded(run.present_keys.resize(keys_count)));
@@ -232,12 +239,12 @@ std::size_t write_transaction(writer_slot_t& slot, std::span<operation_t> batch,
         failures +=
             operation.code == operation_code_t::insert_k
                 ? expect(slot.transaction[key_from_integer(operation.key)].assign(operation.value_view()).succeeded())
-                : expect(slot.transaction[key_from_integer(operation.key)].erase().succeeded());
+                : expect(slot.transaction[key_from_integer(operation.key)].remove().succeeded());
     }
 
-    auto maybe_stamp = slot.transaction.stamped_commit();
+    auto maybe_stamp = slot.transaction.commit();
     bool const committed = maybe_stamp.has_value();
-    ustore_stamp_t const stamp = committed ? *maybe_stamp : std::numeric_limits<ustore_stamp_t>::max();
+    commit_stamp_t const stamp = committed ? *maybe_stamp : commit_stamp_t {std::numeric_limits<ustore_stamp_t>::max()};
     for (operation_t& operation : batch) {
         operation.committed = committed;
         operation.stamp = stamp;
@@ -287,14 +294,14 @@ std::size_t verify_round(linearizability_run_t& run, std::span<operation_t const
         if (leaves_inserted(winner)) run.present_keys[present_count++] = key_from_integer(winner->key);
 
     ustore_key_t const* const keys = run.present_keys.data();
-    auto maybe_retrieved = run.collection[strided(keys, keys + present_count)].value();
+    auto maybe_retrieved = run.collection[strided(keys, keys + present_count)].value(run.arena);
     std::size_t failures = expect(maybe_retrieved);
     if (!maybe_retrieved) return failures;
 
     std::size_t index = 0;
     for (operation_t const* const winner : latest)
         if (leaves_inserted(winner)) failures += expect_payload((*maybe_retrieved)[index++], *winner);
-    failures += expect(run.collection.items().size() == present_count);
+    failures += expect(run.collection.pairs().size() == present_count);
     return failures;
 }
 
@@ -312,7 +319,7 @@ std::size_t run_round(linearizability_run_t& run, executor_t& executor, workload
     std::span<operation_t const*> const latest {run.latest.data(), static_cast<std::size_t>(workload.max_key) + 1};
     replay_round(operations, latest);
     failures += verify_round(run, latest);
-    failures += expect(run.database.clear().succeeded());
+    failures += expect(run.database.clear(ustore_drop_collection_k).succeeded());
     return failures;
 }
 
@@ -393,12 +400,12 @@ int main(int argc, char** argv) {
         return status == argument_status_t::help_k ? 0 : 1;
     suite_totals_t totals = suite.totals();
 
-    auto const maybe_directory = test_directory_t::make(suite.directory);
+    auto const maybe_directory = directory_t::make(suite.directory);
     if (!maybe_directory) {
         fmt::println(stderr, "Cannot create a unique directory under {}", suite.directory);
         return 1;
     }
-    test_config_t const config {suite.engine, maybe_directory->path()};
+    config_t const config {suite.engine, maybe_directory->path()};
     linearizability_run_t run {&config};
     auto [database, open_status] = open_database<database_t>(*run.config);
     if (open_status.failed()) {
