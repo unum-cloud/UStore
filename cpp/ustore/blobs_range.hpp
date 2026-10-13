@@ -1,5 +1,5 @@
 /**
- *  @file include/ustore/blobs_range.hpp
+ *  @file cpp/ustore/blobs_range.hpp
  *  @author Ash Vardanian
  *  @date June 26, 2022
  *  @brief A cursor over the keys and values of one binary collection, the streams built on it, and slices.

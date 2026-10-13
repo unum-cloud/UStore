@@ -1,5 +1,5 @@
 /**
- *  @file include/ustore/graph_collection.hpp
+ *  @file cpp/ustore/graph_collection.hpp
  *  @author Ash Vardanian
  *  @date June 30, 2022
  *  @brief Handles to one graph collection with typed vertex and edge operations, and their deferred twins, whose verbs

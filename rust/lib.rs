@@ -1,7 +1,7 @@
 //! UStore, an embedded multi-modal transactional database, over its C ABI.
 //!
 //! The crate links the engine library CMake builds and consumes it through the stable headers in
-//! `include/ustore/`, so nothing but the vocabulary below crosses the boundary. One module per
+//! `c/ustore/`, so nothing but the vocabulary below crosses the boundary. One module per
 //! header it mirrors.
 //!
 //! A [`Database`] owns its directory, a [`Transaction`] and a [`Snapshot`] borrow it, and every

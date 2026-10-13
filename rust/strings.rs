@@ -1,4 +1,4 @@
-//! The names of collections, which the collection calls of `include/ustore/db.h` record and resolve.
+//! The names of collections, which the collection calls of `c/ustore/db.h` record and resolve.
 //!
 //! Names resolve in two phases: a name maps onto a collection once, and every other call addresses
 //! the collection by its identifier. Each engine keeps the names apart from every collection, so no

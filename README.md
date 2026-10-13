@@ -38,15 +38,15 @@ Those paths belong to NVMe, the hyper-converged engine that v1 targets, while th
 
 ## Architecture
 
-| Layer      | What it is                                                             | Where                  |
-| :--------- | :--------------------------------------------------------------------- | :--------------------- |
-| Bindings   | C, C++, Python and Rust, each forwarding rather than reimplementing    | `python/`, `rust/`     |
-| C ABI      | One argument struct per call, 128-bit UUID keys                        | `include/ustore/*.h`   |
-| Modalities | Documents and graphs, written once over any engine                     | `src/*.cpp`            |
-| Engines    | `ram` and `nvme` are ours, `rocksdb` and `leveldb` are checked against | `src/`, `src_oracles/` |
-| Hardware   | NVMe drives, GPUs and CPU cores, in one box                            | —                      |
+| Layer      | What it is                                                             | Where                      |
+| :--------- | :--------------------------------------------------------------------- | :------------------------- |
+| Bindings   | C, C++, Python and Rust, each forwarding rather than reimplementing    | `cpp/`, `python/`, `rust/` |
+| C ABI      | One argument struct per call, 128-bit UUID keys                        | `c/ustore/*.h`             |
+| Modalities | Documents and graphs, written once over any engine                     | `src/*.cpp`                |
+| Engines    | `ram` and `nvme` are ours, `rocksdb` and `leveldb` are checked against | `src/`, `src_oracles/`     |
+| Hardware   | NVMe drives, GPUs and CPU cores, in one box                            | —                          |
 
-- __The C ABI__ in `include/ustore/*.h` is the only interface: every call takes one argument struct, and every binding forwards to it.
+- __The C ABI__ in `c/ustore/*.h` is the only interface: every call takes one argument struct, and every binding forwards to it.
 - __The modalities__ in `src/docs.cpp` and `src/graph.cpp` implement documents and graphs once, on top of whichever engine the library links, while the `ram` engine serves graphs on half-edges of its own and every engine keys its strings collections itself.
 - __The `ram` engine__ is the reference: ordered multi-version stores in memory on SmashTable containers, persisted as one binary image when it opens with a directory.
 - __NVMe__ is the engine the hardware paths serve: each collection is an `lsm_tree` of `lsm_level`s of `lsm_sorted_run`s, point lookups search SmashTable's SIMD row kits, compactions merge sorted runs on the CPU or a GPU, GPUDirect Storage moves runs between drives and GPU memory, and a transport chosen at mount reaches the drive through io_uring, SPDK or blocking positioned I/O.
@@ -103,7 +103,7 @@ Every fallible C++ call returns a `status_t`, an `expected`, or a `deferred` cal
 A deferred C call returns once submitted, and its outcome is polled through `ustore_outcome_status` and waited on through `ustore_outcome_wait`.
 Calls run on the calling thread until a receiver names an executor, which by default spawns a thread for 7/8 of the cores local to the memory domains it serves, and keeps its scratch and its arenas on those domains.
 Scans, cursor pulls, snapshot saves and compactions report their advance to an optional progress callback, which is the only way to cancel a call.
-The C ABI, its argument structs and the C++ wrappers are described in [`include/ustore/README.md`](include/ustore/README.md).
+The C ABI and its argument structs are described in [`c/README.md`](https://github.com/unum-cloud/UStore/blob/main/c/README.md), and the C++ wrappers in [`cpp/README.md`](https://github.com/unum-cloud/UStore/blob/main/cpp/README.md).
 
 ## Blobs
 
@@ -219,7 +219,7 @@ A `ram` database without a directory has no durability to offer.
 
 ## Engines
 
-Every engine implements the same C ABI of `include/ustore/db.h`, `include/ustore/blobs.h` and `include/ustore/strings.h`, and documents and graphs run on top of any of them.
+Every engine implements the same C ABI of `c/ustore/db.h`, `c/ustore/blobs.h` and `c/ustore/strings.h`, and documents and graphs run on top of any of them.
 
 | Engine    | Role                  | Storage                        | Transactions | Snapshots | Collections |
 | :-------- | :-------------------- | :----------------------------- | :----------- | :-------- | :---------- |
@@ -271,7 +271,7 @@ Outputs are allocated from an arena the caller owns and reuses across calls.
 
 ## Keys and Values
 
-Keys are 128-bit UUIDs in `include/ustore/db.h`, compared bytewise, and `key_from_integer` spells a non-negative integer as its big-endian bytes, so keys made from integers order as the integers.
+Keys are 128-bit UUIDs in `c/ustore/db.h`, compared bytewise, and `key_from_integer` spells a non-negative integer as its big-endian bytes, so keys made from integers order as the integers.
 Collections are named by UUIDv7 identifiers the catalog mints once and never reuses, and the main collection by the nil UUID.
 Fixed-width keys compare as machine words, while variable-length keys force character-wise comparisons and force keys and values to be joined on disk.
 Map strings onto keys once, at the edge of the application, and address documents, graphs and blobs by the resulting identifiers.
@@ -297,9 +297,9 @@ v1 is planned for mid-November 2026.
 
 ```bash
 ustore/
-├── include/ustore/   the C ABI as *.h, its C++ wrappers as *.hpp
-├── c/                the router, documents and graphs, over any engine
-├── src/
+├── c/                the C SDK: the C ABI in ustore/*.h and its plain C11 test
+├── cpp/              the C++ wrappers of the C ABI in ustore/*.hpp
+├── src/              the router, documents and graphs, over any engine
 │   ├── ram/          the in-memory engine
 │   └── nvme/         the on-disk engine
 ├── src_oracles/

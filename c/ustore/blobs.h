@@ -1,5 +1,5 @@
 /**
- *  @file include/ustore/blobs.h
+ *  @file c/ustore/blobs.h
  *  @author Ash Vardanian
  *  @date June 12, 2022
  *  @brief The binary interface for collections of binary values: writes, reads, scans, samples and

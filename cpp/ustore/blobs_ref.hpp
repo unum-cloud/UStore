@@ -1,5 +1,5 @@
 /**
- *  @file include/ustore/blobs_ref.hpp
+ *  @file cpp/ustore/blobs_ref.hpp
  *  @author Ash Vardanian
  *  @date June 26, 2022
  *  @brief Proxies that read, and write, the binary values at a location or a batch of locations.

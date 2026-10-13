@@ -32,8 +32,3 @@ ustore/pages.h
 ustore/strings.h
 ----------------
 .. doxygenfile:: strings.h
-
-C++ Wrappers
-------------
-.. doxygennamespace:: unum::ustore
-   :members:

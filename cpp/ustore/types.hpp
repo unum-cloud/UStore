@@ -1,5 +1,5 @@
 /**
- *  @file include/ustore/types.hpp
+ *  @file cpp/ustore/types.hpp
  *  @author Ash Vardanian
  *  @date July 4, 2022
  *  @brief Locations, edges, value views, arenas, stamps, receivers, executors and progress callables shared by every

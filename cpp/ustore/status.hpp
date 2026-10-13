@@ -1,5 +1,5 @@
 /**
- *  @file include/ustore/status.hpp
+ *  @file cpp/ustore/status.hpp
  *  @author Ash Vardanian
  *  @date July 4, 2022
  *  @brief Statuses with static messages, the expected wrapper that every fallible C++ call returns, and the deferred

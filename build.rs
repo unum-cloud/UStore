@@ -28,8 +28,9 @@ const KNOWN_OPTIONS: &[(&str, Option<&str>)] = &[
 const SOURCES: &[&str] = &[
     "CMakeLists.txt",
     "VERSION",
+    "c",
     "cmake",
-    "include",
+    "cpp",
     "src",
     "src_oracles/leveldb",
     "src_oracles/rocksdb",

@@ -1,5 +1,5 @@
 /**
- *  @file include/ustore/ustore.h
+ *  @file c/ustore/ustore.h
  *  @author Ash Vardanian
  *  @date June 12, 2022
  *  @brief The binary interface of UStore, a GPU-accelerated embedded transactional database for

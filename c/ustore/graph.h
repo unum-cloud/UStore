@@ -1,5 +1,5 @@
 /**
- *  @file include/ustore/graph.h
+ *  @file c/ustore/graph.h
  *  @author Ash Vardanian
  *  @date June 27, 2022
  *  @brief The binary interface for graph collections, stored as an inverted index from every vertex

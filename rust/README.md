@@ -6,7 +6,7 @@
 cargo add ustore
 ```
 
-The crate links the engine library CMake builds and consumes it through the C ABI in `include/ustore/`.
+The crate links the engine library CMake builds and consumes it through the C ABI in `c/ustore/`.
 `build.rs` compiles no C or C++ of its own: it configures CMake, installs the libraries into `OUT_DIR` and links `ustore_static`, the archive that carries the objects of the small libraries it builds on, with the archives of the engines its features enable.
 
 The in-memory `ram` engine always builds, the default `rocksdb` and `leveldb` features add theirs to the one library, and the `nvme` feature adds the NVMe engine when asked for.
@@ -559,7 +559,7 @@ The crate binds none of these:
 
 ## Design
 
-The crate is a thin layer over the C ABI in `include/ustore/`, and every rule below follows from that.
+The crate is a thin layer over the C ABI in `c/ustore/`, and every rule below follows from that.
 
 - __Verbs are named as in C.__
   A C verb drops only what its receiver already names, so `ustore_docs_write` is `docs_write` on a view and `ustore_collection_find` is `collection_find`, while the blob verbs, which reach documents as well, keep their bare names.

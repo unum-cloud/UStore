@@ -1,5 +1,5 @@
 /**
- *  @file include/ustore/types.h
+ *  @file c/ustore/types.h
  *  @author Ash Vardanian
  *  @date June 12, 2022
  *  @brief Shared vocabulary of the UStore C interface: statuses, outcomes, progress callbacks,

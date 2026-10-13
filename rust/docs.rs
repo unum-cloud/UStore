@@ -1,4 +1,4 @@
-//! JSON documents - the Rust twin of `include/ustore/docs.h`.
+//! JSON documents - the Rust twin of `c/ustore/docs.h`.
 //!
 //! The ABI carries documents as JSON text both ways and parses them inside the engine, so nothing here
 //! parses JSON. A field is a top-level key or an RFC 6901 pointer, which crosses as the bytes of a `&str`
@@ -95,7 +95,7 @@ use crate::db::{
 
 // region: Raw Declarations
 
-/// One-to-one mirror of `include/ustore/docs.h`.
+/// One-to-one mirror of `c/ustore/docs.h`.
 mod ffi {
     #![allow(non_camel_case_types)]
 

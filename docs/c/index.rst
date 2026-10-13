@@ -1,4 +1,4 @@
-.. mdinclude:: ../../include/ustore/README.md
+.. mdinclude:: ../../c/README.md
 
 .. toctree::
    :hidden:

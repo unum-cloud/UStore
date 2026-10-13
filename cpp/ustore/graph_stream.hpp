@@ -1,5 +1,5 @@
 /**
- *  @file include/ustore/graph_stream.hpp
+ *  @file cpp/ustore/graph_stream.hpp
  *  @author Ash Vardanian
  *  @date June 30, 2022
  *  @brief A paginated stream over every edge of a graph collection.

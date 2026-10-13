@@ -28,7 +28,7 @@ set_target_properties(
                LINKER_LANGUAGE CXX
 )
 
-target_include_directories(ustore_python PRIVATE ${PROJECT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(ustore_python PRIVATE ${PROJECT_SOURCE_DIR}/c ${CMAKE_CURRENT_SOURCE_DIR})
 
 # The one library carries every engine the build enables, with the `USTORE_WITH_*` switches `engines_compiled` reads,
 # and documents convert to and from Python objects through the yyjson it already carries.

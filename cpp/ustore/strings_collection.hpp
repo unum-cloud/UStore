@@ -1,5 +1,5 @@
 /**
- *  @file include/ustore/strings_collection.hpp
+ *  @file cpp/ustore/strings_collection.hpp
  *  @author Ash Vardanian
  *  @date September 17, 2026
  *  @brief Handles to one collection keyed by variable-length strings, with ordered prefix walks, and their deferred

@@ -1,5 +1,5 @@
 /**
- *  @file include/ustore/docs.h
+ *  @file c/ustore/docs.h
  *  @author Ash Vardanian
  *  @date June 27, 2022
  *  @brief The binary interface for collections of JSON documents.

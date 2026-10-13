@@ -1,5 +1,5 @@
 /**
- *  @file include/ustore/blobs_collection.hpp
+ *  @file cpp/ustore/blobs_collection.hpp
  *  @author Ash Vardanian
  *  @date June 26, 2022
  *  @brief Handles to one binary collection, from which value proxies and key ranges are made, and their deferred

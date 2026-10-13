@@ -445,7 +445,7 @@ check_tag_continuation() {
 # Includes form groups in a fixed order with a blank line between them: the C library, the platform's own
 # headers, the C++ standard library, external libraries, sibling projects, then this project's own headers.
 # Only headers in this repository are quoted, found beside the including file or anywhere in the index, and
-# public ones under `include/` always with the `project_include_prefix`. Includes under an `#if` keep their
+# public ones under `c/` and `cpp/` always with the `project_include_prefix`. Includes under an `#if` keep their
 # quoting but sit outside the grouping; an include guard is not such an `#if`.
 check_include_groups() {
     local misgrouped
@@ -488,8 +488,10 @@ check_include_groups() {
                     else if (touched) { search | getline found; close(search) }
                     if (touched && found == "")
                         printf "line %d: \"%s\" is not in this repository - write <%s>\n", FNR, header, header
-                    if (index(found, "include/" project "/") == 1)
-                        printf "line %d: \"%s\" is a public header - write \"%s\"\n", FNR, header, substr(found, 9)
+                    if (found ~ ("^c(pp)?/" project "/")) {
+                        sub(/^[^\/]*\//, "", found)
+                        printf "line %d: \"%s\" is a public header - write \"%s\"\n", FNR, header, found
+                    }
                     rank = 6
                 }
                 if (touched && quoted && rank != 6)
@@ -693,13 +695,15 @@ top_level_namespaces() { # top_level_namespaces < source
 # Namespaces mirror directories. A nameless `namespace {` hides helpers in a scope no path names, and a
 # namespace no directory backs, like `ram::stores` for `src/ram/engine.cpp`, invents structure the tree does
 # not have. Allowed names: `unum`, `ustore`, the sibling libraries' roots, a directory on the file's path
-# (`src_oracles` answers for `oracles`), and a directory beside the file. The whole staged file, since the
-# namespace is context.
+# (`src_oracles` answers for `oracles`), and a directory beside the file. The `c/` and `cpp/` include roots
+# name none, so `cpp/ustore/` opens `unum::ustore`. The whole staged file, since the namespace is context.
 check_namespace_directories() {
     local directory=${file%/*} allowed name misplaced=""
     [ "$directory" = "$file" ] && directory=.
     allowed=" unum ustore ashvardanian numkong stringzilla forkunion smashtable "
-    for name in $(printf '%s\n' "$directory" | tr '/' '\n'); do allowed="$allowed$name ${name##*_} "; done
+    for name in $(printf '%s\n' "$directory" | sed -E 's#^c(pp)?/##' | tr '/' '\n'); do
+        allowed="$allowed$name ${name##*_} "
+    done
     for name in $(git ls-tree -d --name-only HEAD "$directory/" 2> /dev/null); do allowed="$allowed${name##*/} "; done
     while IFS=: read -r line opened; do
         if [ -z "$opened" ]; then
@@ -1406,7 +1410,7 @@ judge_path() {
         check_trailing_returns
         check_iterator_laundering
         ;;&
-    # Every C++ source: the C bindings under c/ and the C ABI headers keep their C idioms.
+    # Every C++ source: the C SDK under c/ keeps its C idioms.
     *.hpp | *.cpp | *.cc | *.cxx | *.cu | *.cuh)
         check_qualified_namespace
         check_suffixed_template_names
@@ -1432,8 +1436,8 @@ judge_path() {
     *.cu | *.cuh)
         check_host_threads
         ;;&
-    # The shipped library: public headers under include/ and the ABI sources under src/.
-    include/*.h | include/*.hpp | include/*.cuh | src/*.cpp | src/*.cuh)
+    # The shipped library: the C ABI under c/ustore/, its C++ wrappers under cpp/ustore/ and the ABI sources under src/.
+    c/ustore/*.h | cpp/ustore/*.hpp | src/*.cpp | src/*.cuh)
         check_boolean_parameters
         ;;&
     # Test sources, whose oracle stays live in every build.

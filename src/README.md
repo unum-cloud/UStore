@@ -1,6 +1,6 @@
 # Engines
 
-Every engine implements the C ABI of `include/ustore/*.h` over its own storage, and joins `src/lib.cpp`, `src/docs.cpp` and `src/graph.cpp` in the one source list both the `ustore_static` archive and the `ustore_shared` library build from, so documents and graphs work on each of them.
+Every engine implements the C ABI of `c/ustore/*.h` over its own storage, and joins `src/lib.cpp`, `src/docs.cpp` and `src/graph.cpp` in the one source list both the `ustore_static` archive and the `ustore_shared` library build from, so documents and graphs work on each of them.
 The engines fill three roles: `ram` is the reference engine in memory, NVMe is the hyper-converged engine on NVMe drives and GPUs, and RocksDB and LevelDB bring third-party key-value stores behind the same calls.
 Engines aim for the highest isolation `ram` delivers, each reports the level its transactions actually deliver, and the conformance suite checks every advertised level against behaviour.
 

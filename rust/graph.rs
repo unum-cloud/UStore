@@ -1,5 +1,4 @@
-//! Graphs stored as an inverted index from every vertex to its edges - the Rust twin of
-//! `include/ustore/graph.h`.
+//! Graphs stored as an inverted index from every vertex to its edges - the Rust twin of `c/ustore/graph.h`.
 //!
 //! An [`Edge`] is laid out as the three keys the ABI puts on its tapes, so a slice of edges crosses as the
 //! source, target and identifier columns of a write, and the tape a lookup exports reads back as a slice of
@@ -59,7 +58,7 @@ use crate::db::{
 
 // region: Raw Declarations
 
-/// One-to-one mirror of `include/ustore/graph.h`.
+/// One-to-one mirror of `c/ustore/graph.h`.
 mod ffi {
     #![allow(non_camel_case_types)]
 

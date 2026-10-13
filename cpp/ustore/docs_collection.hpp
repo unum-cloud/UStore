@@ -1,5 +1,5 @@
 /**
- *  @file include/ustore/docs_collection.hpp
+ *  @file cpp/ustore/docs_collection.hpp
  *  @author Ash Vardanian
  *  @date June 26, 2022
  *  @brief Handles to a collection of JSON documents, and their deferred twins, whose verbs submit to an executor.

@@ -1,6 +1,6 @@
 # Tools
 
-The tools run on the embedded C ABI of `include/ustore/db.h` and never see which engine is behind it, so the same commands drive the in-memory engine, RocksDB and LevelDB, and NVMe once its sources build, whichever `--engine` names.
+The tools run on the embedded C ABI of `c/ustore/db.h` and never see which engine is behind it, so the same commands drive the in-memory engine, RocksDB and LevelDB, and NVMe once its sources build, whichever `--engine` names.
 
 ## Command-Line Interface
 

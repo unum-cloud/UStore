@@ -1,5 +1,5 @@
 /**
- *  @file include/ustore/db.h
+ *  @file c/ustore/db.h
  *  @author Ash Vardanian
  *  @date June 12, 2022
  *  @brief The binary interface every engine implements: databases, snapshots, transactions, views and

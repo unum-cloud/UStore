@@ -111,7 +111,7 @@ include(GNUInstallDirs)
 
 # Install 3rd Party Packages
 include(FetchContent)
-include_directories(include/)
+include_directories(c cpp)
 include_directories(tools)
 include_directories(src)
 
@@ -283,7 +283,8 @@ foreach (library IN ITEMS ustore_static ustore_shared)
     # public headers from the target instead.
     target_include_directories(
         ${library}
-        PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+        PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/c> $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/cpp>
+               $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
         PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
     )
 endforeach ()
@@ -321,7 +322,7 @@ include("${CMAKE_CURRENT_LIST_DIR}/ustore_targets.cmake")
     install(FILES "${CMAKE_CURRENT_BINARY_DIR}/ustoreConfig.cmake"
                   "${CMAKE_CURRENT_BINARY_DIR}/ustoreConfigVersion.cmake" DESTINATION ${USTORE_CONFIG_INSTALL_DIR}
     )
-    install(DIRECTORY include/ustore DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+    install(DIRECTORY c/ustore cpp/ustore DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 endif ()
 
 if (${USTORE_BUILD_TOOLS})

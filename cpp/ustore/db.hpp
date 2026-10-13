@@ -1,5 +1,5 @@
 /**
- *  @file include/ustore/db.hpp
+ *  @file cpp/ustore/db.hpp
  *  @author Ash Vardanian
  *  @date June 26, 2022
  *  @brief The database, transaction and snapshot handles of the C++ wrappers, and the receivers that run their calls

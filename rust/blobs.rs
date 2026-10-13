@@ -1,4 +1,4 @@
-//! Binary values - the Rust twin of `include/ustore/blobs.h`.
+//! Binary values - the Rust twin of `c/ustore/blobs.h`.
 //!
 //! Every verb takes a batch, and one operation is a batch of one. Keys cross as strided runs the ABI reads in place,
 //! and values as a tape or through an accessor over the entries carrying them, so nothing is staged on the way in;
@@ -26,7 +26,7 @@ use crate::docs::Bitmap;
 
 // region: Raw Declarations
 
-/// One-to-one mirror of `include/ustore/blobs.h`.
+/// One-to-one mirror of `c/ustore/blobs.h`.
 mod ffi {
     #![allow(non_camel_case_types)]
 

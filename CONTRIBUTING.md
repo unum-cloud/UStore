@@ -35,14 +35,14 @@ The `release` and `relwithdebinfo` presets build with whatever toolchain the env
 
 | Path                    | Contents                                              | Namespace                         |
 | :---------------------- | :---------------------------------------------------- | :-------------------------------- |
-| `include/ustore/*.h`    | the C ABI, flat                                       | none                              |
-| `include/ustore/*.hpp`  | the C++ wrappers over the C ABI, flat                 | `unum::ustore`                    |
+| `c/ustore/*.h`          | the C ABI, flat                                       | none                              |
+| `c/test.c`              | compiles the C ABI as plain C11                       | none                              |
+| `cpp/ustore/*.hpp`      | the C++ wrappers over the C ABI, flat                 | `unum::ustore`                    |
 | `src/*.cpp`             | the C ABI dispatch in `lib.cpp`, documents and graphs | `unum::ustore`                    |
 | `src/engine.hpp`        | the table of calls every engine fills                 | `unum::ustore`                    |
 | `src/utilities/`        | arenas, outputs, executors and files engines share    | `unum::ustore::utilities`         |
 | `src/<engine>/`         | `engine.cpp` and the headers of `ram` and `nvme`      | `unum::ustore::<engine>`          |
 | `src_oracles/<engine>/` | `engine.cpp` of RocksDB and LevelDB, kept as oracles  | `unum::ustore::oracles::<engine>` |
-| `c/`                    | `test.c`, which compiles the C ABI as plain C11       | none                              |
 | `tools/`                | the CLI, flag parsing, and dataset import and export  | `unum::ustore::tools`             |
 | `test/`                 | suites mirroring `src/`, and their harness            | `unum::ustore::test`              |
 | `bench/`                | benchmarks mirroring `src/`, and their harness        | `unum::ustore::bench`             |
@@ -50,6 +50,7 @@ The `release` and `relwithdebinfo` presets build with whatever toolchain the env
 
 Namespaces mirror directories and nothing else: a directory adds a namespace component, and no namespace groups symbols by theme.
 `src_oracles/` adds `oracles`, and an engine sees `unum::ustore::utilities` through one `using namespace` right after its own namespace opens.
+`c/` and `cpp/` are include roots that add no component, so `cpp/ustore/` opens `unum::ustore`.
 The pre-commit hook refuses a namespace no directory backs, a nameless one, and one a file opens twice.
 A file name never repeats its directory — `src/nvme/lsm_tree.hpp`, never `src/nvme/nvme_lsm_tree.hpp`.
 
@@ -96,7 +97,7 @@ Fallible calls return a status or `expected`, constructors that can fail become 
 Errors are checked with an explicit `if` and `return`, never a macro.
 The status is `status_t {status_code_t code; char const* message;}`, mirroring the C ABI's `ustore_outcome_t`, and `expected<value_type_>` keeps its value in a union alive only on success, so a move-only type needs no empty state.
 
-No owning standard type that can throw appears in `include/` or `src/`:
+No owning standard type that can throw appears in `cpp/` or `src/`:
 
 | Instead of                     | Use                                                                        |
 | :----------------------------- | :------------------------------------------------------------------------- |
@@ -139,7 +140,7 @@ The arenas place their blocks with `fu_allocate_on_domain_id` and release them w
 ### Includes and Printing
 
 Includes form groups separated by blank lines, alphabetical inside each: C library headers such as `<cstdint>`, platform headers such as `<unistd.h>`, C++ standard headers, external libraries such as `<rocksdb/db.h>` and `<yyjson.h>`, sibling projects such as `<smashtable/basic_vector.hpp>`, then UStore's own headers in quotes, such as `"ustore/db.h"` and `"utilities/ram_buffers.hpp"`.
-Sibling projects are reached through the aliases `fu`, `st` and `sz`, declared once in `include/ustore/types.hpp`, never through spelled-out `ashvardanian::` namespaces or local aliases.
+Sibling projects are reached through the aliases `fu`, `st` and `sz`, declared once in `cpp/ustore/types.hpp`, never through spelled-out `ashvardanian::` namespaces or local aliases.
 C++ prints through `fmt::println` — no iostreams, no `printf`.
 Discard a result through `[[maybe_unused]] T const result = call();`, never `(void)call();`, and declare return types before the name, never after an arrow.
 

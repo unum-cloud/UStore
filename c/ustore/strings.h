@@ -1,5 +1,5 @@
 /**
- *  @file include/ustore/strings.h
+ *  @file c/ustore/strings.h
  *  @author Ash Vardanian
  *  @date September 16, 2026
  *  @brief The binary interface for collections keyed by variable-length strings, mapped onto arbitrary bytes.

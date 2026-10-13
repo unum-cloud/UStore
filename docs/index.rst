@@ -13,6 +13,7 @@ Overview
    :caption: C and C++
 
    c/index
+   cpp/index
 
 .. toctree::
    :hidden:

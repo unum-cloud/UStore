@@ -1,5 +1,5 @@
 /**
- *  @file include/ustore/docs_table.hpp
+ *  @file cpp/ustore/docs_table.hpp
  *  @author Ash Vardanian
  *  @date July 4, 2022
  *  @brief Columnar views over the results of @c ustore_docs_gather.

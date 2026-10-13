@@ -1,6 +1,6 @@
 # Python SDK
 
-The bindings are pure CPython in C11, sitting directly on the C ABI in `include/ustore/`, with no pybind11, NanoBind or SWIG.
+The bindings are pure CPython in C11, sitting directly on the C ABI in `c/ustore/`, with no pybind11, NanoBind or SWIG.
 The native core is one extension, `ustore.lib`, and the `ustore` package re-exports it.
 Every verb is a batch, reached identically through a `Database`, a `Transaction` and a `Snapshot`, which reads only, so a single operation is a batch of one.
 
@@ -372,7 +372,7 @@ The suites live in `test/` as `<topic>.py` beside the C++ ones, and benchmarks i
 
 ## Design
 
-The binding is a thin layer over the C ABI in `include/ustore/`, and every rule below follows from that.
+The binding is a thin layer over the C ABI in `c/ustore/`, and every rule below follows from that.
 
 - __Blocking calls stay as simple as the language allows.__
   `db.read(keys, arena)` takes no executor, completion or view argument and returns its result; nothing about asynchrony reaches a caller who never asks for it.

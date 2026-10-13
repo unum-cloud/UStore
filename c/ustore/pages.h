@@ -1,5 +1,5 @@
 /**
- *  @file include/ustore/pages.h
+ *  @file c/ustore/pages.h
  *  @author Ash Vardanian
  *  @date September 22, 2026
  *  @brief The binary interface for pages: ordered documents such as HTML, XML, Markdown, spreadsheets

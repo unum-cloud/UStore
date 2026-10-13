@@ -1,5 +1,5 @@
-//! Databases, views, transactions, snapshots, arenas and executors - the Rust twin of `include/ustore/types.h` and
-//! `include/ustore/db.h`.
+//! Databases, views, transactions, snapshots, arenas and executors - the Rust twin of `c/ustore/types.h` and
+//! `c/ustore/db.h`.
 //!
 //! Every call addresses exactly one view of the data: the head of the database, a transaction, or a
 //! snapshot. [`View`] is that view, so a call naming two cannot be spelled here, and its parent type names which one
@@ -31,7 +31,7 @@ use crate::graph::{Edge, Roles};
 
 // region: Raw Declarations
 
-/// One-to-one mirror of `include/ustore/types.h` and `include/ustore/db.h`.
+/// One-to-one mirror of `c/ustore/types.h` and `c/ustore/db.h`.
 pub(crate) mod ffi {
     #![allow(non_camel_case_types)]
 

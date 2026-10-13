@@ -32,11 +32,11 @@ jobs:
             pyproject.toml:^version = "(\d+\.\d+\.\d+)"
             Cargo.toml:^version = "(\d+\.\d+\.\d+)"
           update-major-version-in: |
-            include/ustore/types.h:^#define USTORE_VERSION_MAJOR (\d+)
+            c/ustore/types.h:^#define USTORE_VERSION_MAJOR (\d+)
           update-minor-version-in: |
-            include/ustore/types.h:^#define USTORE_VERSION_MINOR (\d+)
+            c/ustore/types.h:^#define USTORE_VERSION_MINOR (\d+)
           update-patch-version-in: |
-            include/ustore/types.h:^#define USTORE_VERSION_PATCH (\d+)
+            c/ustore/types.h:^#define USTORE_VERSION_PATCH (\d+)
           dry-run: "false"
           push: "true"
           create-release: "true"
