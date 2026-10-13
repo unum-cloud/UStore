@@ -32,11 +32,11 @@ jobs:
             pyproject.toml:^version = "(\d+\.\d+\.\d+)"
             Cargo.toml:^version = "(\d+\.\d+\.\d+)"
           update-major-version-in: |
-            include/ustore/ustore.h:^#define USTORE_VERSION_MAJOR (\d+)
+            include/ustore/types.h:^#define USTORE_VERSION_MAJOR (\d+)
           update-minor-version-in: |
-            include/ustore/ustore.h:^#define USTORE_VERSION_MINOR (\d+)
+            include/ustore/types.h:^#define USTORE_VERSION_MINOR (\d+)
           update-patch-version-in: |
-            include/ustore/ustore.h:^#define USTORE_VERSION_PATCH (\d+)
+            include/ustore/types.h:^#define USTORE_VERSION_PATCH (\d+)
           dry-run: "false"
           push: "true"
           create-release: "true"
@@ -127,7 +127,7 @@ jobs:
             -DUSTORE_BUILD_TOOLS=OFF
           cmake --build --preset release
 
-      - name: Archive Headers and Static Libraries
+      - name: Archive the Headers, Libraries and CMake Package
         run: |
           archive="ustore_${{ matrix.platform }}_$(cat VERSION)"
           cmake --install build_release --prefix "$archive"

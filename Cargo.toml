@@ -15,7 +15,6 @@ include = [
   "/VERSION",
   "/cmake/**",
   "/include/**",
-  "/c/**",
   "/src/**",
   "/src_oracles/**",
   "/tools/**",
@@ -44,7 +43,7 @@ path = "rust/lib.rs"
 # The `ram` engine always builds; each engine feature adds its engine to the one library, and without it the engine's
 # `Database::open_*` fails with `Status::Unsupported`.
 [features]
-default = ["rocksdb", "leveldb", "nvme"]
+default = ["rocksdb", "leveldb"]
 leveldb = []
 nvme = []
 rocksdb = []

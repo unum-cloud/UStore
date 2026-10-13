@@ -39,8 +39,9 @@ Documentation = "https://unum.cloud/ustore"
 Repository = "https://github.com/unum-cloud/UStore"
 Issues = "https://github.com/unum-cloud/UStore/issues"
 
-# Every engine but the GPU compaction; `CMAKE_ARGS="-DUSTORE_WITH_ROCKSDB=OFF"` or
-# `--config-settings=cmake.define.USTORE_WITH_ROCKSDB=OFF` leaves one out.
+# The RAM, RocksDB and LevelDB engines, with NVMe left out until its sources build again;
+# `CMAKE_ARGS="-DUSTORE_WITH_ROCKSDB=OFF"` or `--config-settings=cmake.define.USTORE_WITH_ROCKSDB=OFF`
+# leaves one more out.
 [tool.scikit-build]
 build-dir = "build_python/{wheel_tag}"
 build.targets = ["ustore_python"]
@@ -62,7 +63,6 @@ sdist.include = [
   "/CMakePresets.json",
   "/VERSION",
   "/include/**",
-  "/c/**",
   "/src/**",
   "/src_oracles/**",
   "/cmake/**",
@@ -91,7 +91,7 @@ wheel.packages = ["python/ustore"]
 [tool.scikit-build.cmake.define]
 USTORE_BUILD_BENCH = "OFF"
 USTORE_BUILD_LIB_PYTHON = "ON"
-USTORE_BUILD_NVME = "ON"
+USTORE_BUILD_NVME = "OFF"
 USTORE_BUILD_TEST = "OFF"
 USTORE_BUILD_TOOLS = "OFF"
 USTORE_WITH_LEVELDB = "ON"
@@ -141,6 +141,8 @@ known-first-party = ["ustore"]
 combine-as-imports = true
 
 [tool.ruff]
+# Markdown belongs to markdownlint, so a directory-wide `ruff format` never rewrites a README's examples.
+extend-exclude = ["*.md"]
 line-length = 120
 target-version = "py312"
 

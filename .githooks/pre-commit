@@ -657,6 +657,100 @@ check_qualified_namespace() {
         "            or the enclosing namespace; only a foreign template specialization earns it:"
 }
 
+# The namespaces a C++ source opens at file scope, as `line:name`, reading past comments, literals, and
+# preprocessor lines; an anonymous namespace prints as `<anonymous>`.
+top_level_namespaces() { # top_level_namespaces < source
+    awk '
+        continued { continued = ($0 ~ /\\$/); next }
+        {
+            code = ""
+            for (i = 1; i <= length($0); ++i) {
+                c = substr($0, i, 1)
+                pair = substr($0, i, 2)
+                if (state == "block") { if (pair == "*/") { state = ""; ++i } continue }
+                if (state != "") {
+                    if (c == "\\") ++i
+                    else if (c == state) state = ""
+                    continue
+                }
+                if (pair == "//") break
+                if (pair == "/*") { state = "block"; ++i; continue }
+                if (c == "\"" || c == "'\''") { state = c; continue }
+                code = code c
+            }
+            if (state != "block") state = ""
+            if (code ~ /^[[:space:]]*#/) { continued = ($0 ~ /\\$/); next }
+            if (depth == 0 && match(code, /(^|[^A-Za-z0-9_])namespace([[:space:]]+[A-Za-z_][A-Za-z0-9_:]*)?[[:space:]]*\{/)) {
+                name = substr(code, RSTART, RLENGTH)
+                sub(/^.*namespace[[:space:]]*/, "", name)
+                sub(/[[:space:]]*\{$/, "", name)
+                print NR ":" (name == "" ? "<anonymous>" : name)
+            }
+            depth += gsub(/\{/, "{", code) - gsub(/\}/, "}", code)
+        }'
+}
+
+# Namespaces mirror directories. A nameless `namespace {` hides helpers in a scope no path names, and a
+# namespace no directory backs, like `ram::stores` for `src/ram/engine.cpp`, invents structure the tree does
+# not have. Allowed names: `unum`, `ustore`, the sibling libraries' roots, a directory on the file's path
+# (`src_oracles` answers for `oracles`), and a directory beside the file. The whole staged file, since the
+# namespace is context.
+check_namespace_directories() {
+    local directory=${file%/*} allowed name misplaced=""
+    [ "$directory" = "$file" ] && directory=.
+    allowed=" unum ustore ashvardanian numkong stringzilla forkunion smashtable "
+    for name in $(printf '%s\n' "$directory" | tr '/' '\n'); do allowed="$allowed$name ${name##*_} "; done
+    for name in $(git ls-tree -d --name-only HEAD "$directory/" 2> /dev/null); do allowed="$allowed${name##*/} "; done
+    while IFS=: read -r line opened; do
+        if [ -z "$opened" ]; then
+            misplaced="${misplaced}line $line: a nameless namespace
+"
+            continue
+        fi
+        for name in $(printf '%s\n' "$opened" | tr ':' '\n'); do
+            [ -z "$name" ] && continue
+            case "$allowed" in
+            *" $name "*) ;;
+            *) misplaced="${misplaced}line $line: namespace $name
+" ;;
+            esac
+        done
+    done < <(awk '/^[[:space:]]*namespace([[:space:]]+[A-Za-z_][A-Za-z0-9_:]*)?[[:space:]]*\{/ {
+            opened = $0; sub(/^[[:space:]]*namespace[[:space:]]*/, "", opened); sub(/[[:space:]]*\{.*/, "", opened)
+            print NR ":" opened }' "$staged_blob")
+    [ -z "$misplaced" ] || fail "${misplaced%$'\n'}" \
+        "$file opens a namespace no directory backs - use the directory's namespace, and \`static\` for file-local helpers:"
+}
+
+# A namespace opens once per file: closing it only to reopen it splits its body around whatever sits between,
+# usually an include that belongs in the preamble or a handle completed between two halves. The one gap allowed
+# holds a `fmt::` or `std::` specialization, which has to follow the type it formats or hashes and precede the
+# first use, all outside the namespace. The whole staged file, since the namespace is context.
+check_namespace_reopened() {
+    local namespaces reopened
+    namespaces=$(top_level_namespaces < "$staged_blob")
+    [ -n "$namespaces" ] || return 0
+    reopened=$(printf '%s\n' "$namespaces" |
+        awk -F: -v path="$file" '
+            NR == FNR {
+                name = substr($0, index($0, ":") + 1)
+                if (name in opened) reopening[$1 + 0] = name
+                opened[name]
+                next
+            }
+            { lines[FNR] = $0 }
+            END {
+                for (line in reopening) {
+                    foreign = 0
+                    for (gap = line - 1; gap > 0 && lines[gap] !~ ("^\\} // namespace " reopening[line] "$"); --gap)
+                        if (lines[gap] ~ /^struct (fmt|std)::[a-z_]+</) foreign = 1
+                    if (!foreign) printf "%s:%d: reopens namespace %s\n", path, line, reopening[line]
+                }
+            }' - "$staged_blob")
+    [ -z "$reopened" ] || fail "$reopened" \
+        "$file reopens namespace ${reopened##*namespace } - keep includes in the preamble and open each namespace once:"
+}
+
 # Template type parameters carry a trailing underscore - `typename variant_type_`, never
 # `typename multi_t` - a special case of the underscore marking internal symbols: a
 # parameter is internal to its template, exists only to be materialized, and must never
@@ -1042,14 +1136,14 @@ check_annotate_release_before_unlock() {
 
 # region Tests and Verification
 
-# A test's oracle is the `expect` family from test/test.hpp, never `assert`, which compiles out wherever
+# A test's oracle is the `expect` family from test/harness.hpp, never `assert`, which compiles out wherever
 # NDEBUG is defined and, where it is not, aborts the whole run instead of counting one failure.
 check_test_oracle_never_compiled_out() {
     local asserts
     asserts=$(printf '%s\n' "$added" | grep -vE '^\+[[:space:]]*(\*|//|/\*)' |
         grep -E '(^|[^A-Za-z0-9_])assert[[:space:]]*\(' || true)
     [ -z "$asserts" ] || fail "$asserts" \
-        "$file asserts in a test - write \`failures += expect_eq(count, 3);\` from test/test.hpp," \
+        "$file asserts in a test - write \`failures += expect_eq(count, 3);\` from test/harness.hpp," \
         "            which counts the failure and never compiles out:"
 }
 
@@ -1373,6 +1467,14 @@ judge_path() {
         check_python_version_probe
         ;;
     .github/workflows/*.yml | .github/workflows/*.yaml) check_workflow_names ;;
+    esac
+    # Namespaces mirror directories everywhere but NVMe, whose files keep theirs until its engine is ported.
+    case "$file" in
+    src/nvme/* | test/nvme_* | bench/nvme_* | tools/nvme_*) ;;
+    *.c | *.h | *.hpp | *.cpp | *.cc | *.cxx | *.cu | *.cuh)
+        check_namespace_directories
+        check_namespace_reopened
+        ;;
     esac
     case "$file" in
     *.c | *.h | *.hpp | *.cpp | *.cc | *.cxx | *.cu | *.cuh | *.hip | *.metal | *.py | *.pyi | *.rs | *.go | *.swift | \

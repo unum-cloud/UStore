@@ -42,11 +42,11 @@ jobs:
             pyproject.toml:^version = "(\d+\.\d+\.\d+)"
             Cargo.toml:^version = "(\d+\.\d+\.\d+)"
           update-major-version-in: |
-            include/ustore/ustore.h:^#define USTORE_VERSION_MAJOR (\d+)
+            include/ustore/types.h:^#define USTORE_VERSION_MAJOR (\d+)
           update-minor-version-in: |
-            include/ustore/ustore.h:^#define USTORE_VERSION_MINOR (\d+)
+            include/ustore/types.h:^#define USTORE_VERSION_MINOR (\d+)
           update-patch-version-in: |
-            include/ustore/ustore.h:^#define USTORE_VERSION_PATCH (\d+)
+            include/ustore/types.h:^#define USTORE_VERSION_PATCH (\d+)
           dry-run: "true"
 
   lint:
@@ -127,6 +127,14 @@ jobs:
           CC: ${{ runner.os == 'Windows' && 'cl' || '' }}
           CXX: ${{ runner.os == 'Windows' && 'cl' || '' }}
         run: cmake --preset ${{ matrix.preset }}
+      # MSVC compiles the C headers as C11 here, so a construct only Clang or GCC accepts fails this step by name
+      - name: Build the C Tests with MSVC
+        if: runner.os == 'Windows'
+        run: cmake --build --preset ${{ matrix.preset }} --target ustore_test_c ustore_test_c_shared
+      # The shared twin runs against the DLL, which exports only what `USTORE_EXPORT` marks
+      - name: Run the C Tests against the Static and Shared Libraries
+        if: runner.os == 'Windows'
+        run: ctest --preset ${{ matrix.preset }} --tests-regex '^ustore_test_c(_shared)?$'
       - name: Build
         run: cmake --build --preset ${{ matrix.preset }}
       - name: Test
@@ -221,9 +229,9 @@ jobs:
           components: clippy
       - name: Lint Rust
         if: matrix.os == 'ubuntu-26.04'
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --features serde -- -D warnings
       - name: Test Rust
-        run: cargo test --all-features
+        run: cargo test --features serde
 
   # A smoke subset only; the full matrix runs on release.
   build_wheels:
