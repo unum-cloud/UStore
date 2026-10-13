@@ -1,12 +1,13 @@
 /**
- *  @file c/docs.cpp
+ *  @file src/docs.cpp
  *  @author Ash Vardanian
  *  @date December 26, 2022
  *  @brief Documents modality on yyjson, running on top of any engine that implements <ustore/db.h>.
  *
  *  Documents are stored as JSON text.
  *  Whole-document reads and upserts pass straight through to the engine's own read and write, while field access,
- *  conversions and modifications parse every document with yyjson, allocating from the arena of the request.
+ *  conversions and modifications read and parse every document with yyjson in the scratch of the call, so the arena
+ *  of the request holds only its outputs.
  */
 
 #include <cmath>   // `std::abs`, `std::isfinite`, `std::ldexp`
@@ -14,7 +15,6 @@
 #include <cstdint> // `std::uint8_t`, `std::uint16_t`, `std::uint32_t`
 #include <cstring> // `std::memcpy`, `std::memset`, `std::strlen`
 
-#include <algorithm>    // `std::lower_bound`
 #include <bit>          // `std::bit_cast`
 #include <charconv>     // `std::from_chars`
 #include <concepts>     // `std::invocable`
@@ -28,15 +28,19 @@
 #include <fmt/format.h> // `fmt::format_to_n`
 #include <yyjson.h>     // `yyjson_read_opts`, `yyjson_mut_doc`
 
-#include "ustore/docs.h"          // `ustore_docs_write_t`, `ustore_docs_read_t`
-#include "ustore/ranges_args.hpp" // `places_arg_t`, `contents_arg_t`, `arena_t`
+#include <smashtable/basic_flat_set.hpp> // `st::basic_flat_set`
+
+#include "ustore/docs.h"     // `ustore_docs_write_t`, `ustore_docs_read_t`
+#include "ustore/ranges.hpp" // `place_batch_t`, `values_view_t`
 
 #include "engine.hpp"                // `engine_of`, `view_t`, `docs_write_in_json_values`
-#include "helpers/algorithm.hpp"     // `offset_in_sorted`
-#include "helpers/linked_array.hpp"  // `growing_tape_t`, `uninitialized_array`
-#include "helpers/linked_memory.hpp" // `arena_allocate`, `arena_grow`
+#include "utilities/algorithm.hpp"   // `offset_in_sorted`
+#include "utilities/batches.hpp"     // `strings_arg_t`, `places_of`
+#include "utilities/outputs.hpp"     // `read_outputs_t`
+#include "utilities/ram_buffers.hpp" // `arena_allocate`, `arena_grow`, `arena_allocator`, `growing_strings`
 
 namespace unum::ustore {
+using namespace unum::ustore::utilities;
 
 #pragma region Number Formatting
 
@@ -83,7 +87,7 @@ static std::string_view print_number(char* begin, char* end, scalar_ scalar) noe
 
 #pragma region JSON Handles
 
-/** Document parsed from the request arena, which owns all of its memory. */
+/** Document parsed into the scratch of a call, which owns all of its memory. */
 struct json_t {
 
     /** Document as read, or @c nullptr. */
@@ -108,7 +112,7 @@ struct json_value_t {
 };
 
 static void* json_allocate(void* context, std::size_t size) noexcept {
-    auto [bytes, status] = arena_allocate<byte_t>(static_cast<ustore_arena_t*>(context), size,
+    auto [bytes, status] = arena_allocate<byte_t>(static_cast<ustore_arena_t>(context), size,
                                                   alignof(std::max_align_t));
     return bytes.data();
 }
@@ -116,7 +120,7 @@ static void* json_allocate(void* context, std::size_t size) noexcept {
 static void* json_reallocate(void* context, void* pointer, std::size_t old_size, std::size_t size) noexcept {
     if (size <= old_size) return pointer;
     std::span<byte_t> const old_bytes {static_cast<byte_t*>(pointer), old_size};
-    auto [bytes, status] = arena_grow(static_cast<ustore_arena_t*>(context), old_bytes, size - old_size,
+    auto [bytes, status] = arena_grow(static_cast<ustore_arena_t>(context), old_bytes, size - old_size,
                                       alignof(std::max_align_t));
     return bytes.data();
 }
@@ -124,14 +128,16 @@ static void* json_reallocate(void* context, void* pointer, std::size_t old_size,
 /** Arena memory is released with the arena, never one allocation at a time. */
 static void json_free(void*, void*) noexcept {}
 
-static yyjson_alc json_allocator(ustore_arena_t* arena) noexcept {
+static yyjson_alc json_allocator(ustore_arena_t arena) noexcept {
     return {json_allocate, json_reallocate, json_free, arena};
 }
 
-/** Finds @p field in @p json, as a JSON Pointer when it starts with a slash and as a top-level key otherwise. */
-static yyjson_val* json_lookup(yyjson_val* json, ustore_str_view_t field) noexcept {
-    if (!field) return json;
-    return field[0] == '/' ? yyjson_ptr_get(json, field) : yyjson_obj_get(json, field);
+/** Finds @p field in @p json, as a JSON Pointer when it starts with a slash and as a top-level key otherwise, where an
+ *  empty field addresses the whole document. */
+static yyjson_val* json_lookup(yyjson_val* json, std::string_view field) noexcept {
+    if (field.empty()) return json;
+    return field.starts_with('/') ? yyjson_ptr_getn(json, field.data(), field.size())
+                                  : yyjson_obj_getn(json, field.data(), field.size());
 }
 
 /** Characters @p key takes as an RFC 6901 reference token, where a tilde and a slash each take two. */
@@ -155,8 +161,8 @@ static char* escape_into(std::string_view key, char* output) noexcept {
 }
 
 /** Spells @p field as a JSON Pointer, escaping a top-level key into @p arena. */
-static expected<std::string_view> field_pointer(ustore_str_view_t field, ustore_arena_t* arena) noexcept {
-    std::string_view const key {field};
+static expected<std::string_view> field_pointer(std::string_view field, ustore_arena_t arena) noexcept {
+    std::string_view const key = field;
     if (key.starts_with('/')) return key;
 
     auto [pointer, status] = arena_allocate<char>(arena, escaped_length(key) + 1);
@@ -168,7 +174,7 @@ static expected<std::string_view> field_pointer(ustore_str_view_t field, ustore_
 }
 
 /** Parses a JSON document, leaving the result empty for an empty or a missing value. */
-static expected<json_t> json_parse(value_view_t bytes, ustore_arena_t* arena) noexcept {
+static expected<json_t> json_parse(value_view_t bytes, ustore_arena_t arena) noexcept {
     if (bytes.empty()) return json_t {};
 
     yyjson_alc const allocator = json_allocator(arena);
@@ -181,7 +187,7 @@ static expected<json_t> json_parse(value_view_t bytes, ustore_arena_t* arena) no
 }
 
 /** Makes @p document mutable, copying what was parsed or starting an empty document. */
-static expected<yyjson_mut_doc*> json_mutable(json_t& document, ustore_arena_t* arena) noexcept {
+static expected<yyjson_mut_doc*> json_mutable(json_t& document, ustore_arena_t arena) noexcept {
     if (document.mutable_handle) return document.mutable_handle;
 
     yyjson_alc const allocator = json_allocator(arena);
@@ -193,9 +199,9 @@ static expected<yyjson_mut_doc*> json_mutable(json_t& document, ustore_arena_t* 
     return document.mutable_handle;
 }
 
-/** Appends @p value to @p output as JSON text, or appends a missing value when there is none. */
-static status_t json_dump(json_value_t value, ustore_arena_t* arena, growing_tape_t& output) noexcept {
-    if (!value) return output.push_back(value_view_t {}).status();
+/** Prints @p value as JSON text into @p arena, or answers a missing value when there is none. */
+static expected<value_view_t> json_dump(json_value_t value, ustore_arena_t arena) noexcept {
+    if (!value) return value_view_t {};
 
     yyjson_alc const allocator = json_allocator(arena);
     yyjson_write_flag const flags = YYJSON_WRITE_ALLOW_INF_AND_NAN;
@@ -203,8 +209,8 @@ static status_t json_dump(json_value_t value, ustore_arena_t* arena, growing_tap
     char const* const text = value.mutable_handle
                                  ? yyjson_mut_val_write_opts(value.mutable_handle, flags, &allocator, &length, nullptr)
                                  : yyjson_val_write_opts(value.handle, flags, &allocator, &length, nullptr);
-    if (!text) return {status_code_t::out_of_memory_k, "Failed to serialize the document"};
-    return output.push_back(value_view_t {text, length}).status();
+    if (!text) return status_t {status_code_t::out_of_memory_k, "Failed to serialize the document"};
+    return value_view_t {text, length};
 }
 
 #pragma endregion JSON Handles
@@ -334,8 +340,8 @@ static yyjson_mut_val* mutable_scalar(yyjson_mut_doc* document, value_view_t byt
 }
 
 /** Parses @p bytes of @p type into a document, wrapping a scalar into a document of its own. */
-static expected<json_t> any_parse(value_view_t bytes, ustore_doc_field_type_t type, ustore_arena_t* arena) noexcept {
-    if (type == ustore_doc_field_json_k) return json_parse(bytes, arena);
+static expected<json_t> any_parse(value_view_t bytes, ustore_docs_field_type_t type, ustore_arena_t arena) noexcept {
+    if (type == ustore_docs_field_type_json_k) return json_parse(bytes, arena);
 
     json_t document;
     yyjson_alc const allocator = json_allocator(arena);
@@ -346,19 +352,19 @@ static expected<json_t> any_parse(value_view_t bytes, ustore_doc_field_type_t ty
     yyjson_mut_doc* const handle = document.mutable_handle;
     yyjson_mut_val* root = nullptr;
     switch (type) {
-    case ustore_doc_field_null_k: root = yyjson_mut_null(handle); break;
-    case ustore_doc_field_bool_k: root = mutable_scalar<bool>(handle, bytes); break;
-    case ustore_doc_field_f64_k: root = mutable_scalar<double>(handle, bytes); break;
-    case ustore_doc_field_f32_k: root = mutable_scalar<float>(handle, bytes); break;
-    case ustore_doc_field_i64_k: root = mutable_scalar<std::int64_t>(handle, bytes); break;
-    case ustore_doc_field_i32_k: root = mutable_scalar<std::int32_t>(handle, bytes); break;
-    case ustore_doc_field_i16_k: root = mutable_scalar<std::int16_t>(handle, bytes); break;
-    case ustore_doc_field_i8_k: root = mutable_scalar<std::int8_t>(handle, bytes); break;
-    case ustore_doc_field_u64_k: root = mutable_scalar<std::uint64_t>(handle, bytes); break;
-    case ustore_doc_field_u32_k: root = mutable_scalar<std::uint32_t>(handle, bytes); break;
-    case ustore_doc_field_u16_k: root = mutable_scalar<std::uint16_t>(handle, bytes); break;
-    case ustore_doc_field_u8_k: root = mutable_scalar<std::uint8_t>(handle, bytes); break;
-    case ustore_doc_field_str_k: root = yyjson_mut_strncpy(handle, bytes.c_str(), bytes.size()); break;
+    case ustore_docs_field_type_null_k: root = yyjson_mut_null(handle); break;
+    case ustore_docs_field_type_bool_k: root = mutable_scalar<bool>(handle, bytes); break;
+    case ustore_docs_field_type_f64_k: root = mutable_scalar<double>(handle, bytes); break;
+    case ustore_docs_field_type_f32_k: root = mutable_scalar<float>(handle, bytes); break;
+    case ustore_docs_field_type_i64_k: root = mutable_scalar<std::int64_t>(handle, bytes); break;
+    case ustore_docs_field_type_i32_k: root = mutable_scalar<std::int32_t>(handle, bytes); break;
+    case ustore_docs_field_type_i16_k: root = mutable_scalar<std::int16_t>(handle, bytes); break;
+    case ustore_docs_field_type_i8_k: root = mutable_scalar<std::int8_t>(handle, bytes); break;
+    case ustore_docs_field_type_u64_k: root = mutable_scalar<std::uint64_t>(handle, bytes); break;
+    case ustore_docs_field_type_u32_k: root = mutable_scalar<std::uint32_t>(handle, bytes); break;
+    case ustore_docs_field_type_u16_k: root = mutable_scalar<std::uint16_t>(handle, bytes); break;
+    case ustore_docs_field_type_u8_k: root = mutable_scalar<std::uint8_t>(handle, bytes); break;
+    case ustore_docs_field_type_str_k: root = yyjson_mut_strncpy(handle, bytes.c_str(), bytes.size()); break;
     default: break;
     }
 
@@ -371,14 +377,14 @@ static expected<json_t> any_parse(value_view_t bytes, ustore_doc_field_type_t ty
 
 #pragma region Modifications
 
-/** Modifications a request applies, extending @c ustore_doc_modification_t with reads. */
+/** Modifications a request applies, extending @c ustore_docs_modification_t with reads. */
 enum class modification_t {
     nothing_k = -1,
-    upsert_k = ustore_doc_modify_upsert_k,
-    update_k = ustore_doc_modify_update_k,
-    insert_k = ustore_doc_modify_insert_k,
-    patch_k = ustore_doc_modify_patch_k,
-    merge_k = ustore_doc_modify_merge_k,
+    upsert_k = ustore_docs_modify_upsert_k,
+    update_k = ustore_docs_modify_update_k,
+    insert_k = ustore_docs_modify_insert_k,
+    patch_k = ustore_docs_modify_patch_k,
+    merge_k = ustore_docs_modify_merge_k,
 };
 
 /** Adds @p value at the non-empty @p path of @p root, replacing an object member and inserting into an array. */
@@ -447,14 +453,14 @@ static yyjson_mut_val* patch_value(yyjson_mut_doc* document, yyjson_mut_val* roo
     return root;
 }
 
-/** Applies @p modifier to @p field of @p original, or to the whole document when @p field is @c nullptr. */
-static status_t modify(json_t& original, yyjson_mut_val* modifier, ustore_str_view_t field, modification_t modification,
-                       ustore_arena_t* arena) noexcept {
+/** Applies @p modifier to @p field of @p original, or to the whole document when @p field is empty. */
+static status_t modify(json_t& original, yyjson_mut_val* modifier, std::string_view field, modification_t modification,
+                       ustore_arena_t arena) noexcept {
 
     auto [document, status] = json_mutable(original, arena);
     if (status.failed()) return status;
 
-    if (!field) {
+    if (field.empty()) {
         yyjson_mut_val* const root = yyjson_mut_doc_get_root(document);
         yyjson_mut_val* modified = nullptr;
         switch (modification) {
@@ -512,50 +518,36 @@ static status_t modify(json_t& original, yyjson_mut_val* modifier, ustore_str_vi
 /** Receives the index of a task, its field, and the binary document it addresses, and answers a status. */
 template <typename callback_type_>
 concept document_callback =
-    std::is_invocable_r_v<status_t, callback_type_&, std::size_t, ustore_str_view_t, value_view_t>;
+    std::is_invocable_r_v<status_t, callback_type_&, std::size_t, std::string_view, value_view_t>;
 
-/** Binary documents found by one read, indexed by task. */
-struct found_documents_t {
+/** The field of task @p index of @p fields, empty for a whole document and for every task without fields. */
+static std::string_view field_of(strings_arg_t const& fields, std::size_t index) noexcept {
+    return fields ? string_of(fields[index]) : std::string_view {};
+}
 
-    /** Bits marking the documents found. */
-    ustore_octet_t* presences = nullptr;
+/** Whether any of @p count tasks addresses a field rather than a whole document, which only parsing serves. */
+static bool addresses_fields(strings_arg_t const& fields, std::size_t count) noexcept {
+    for (std::size_t index = 0; fields && index != count; ++index)
+        if (fields[index].length) return true;
+    return false;
+}
 
-    /** One offset into @c contents per document, and one more closing the last. */
-    ustore_length_t* offsets = nullptr;
-
-    /** Joined contents of the documents. */
-    ustore_byte_t* contents = nullptr;
-
-    value_view_t operator[](std::size_t index) const noexcept {
-        if (!bits_view_t {presences}[index]) return value_view_t {};
-        return value_view_t {contents + offsets[index], offsets[index + 1] - offsets[index]};
-    }
-};
-
-/** Reads the documents at @p places through @p view with the engine's own read, which appends to @p arena rather
- *  than rewinding it. */
-static expected<found_documents_t> read_documents(ustore_database_t database, places_arg_t const& places,
-                                                  ustore_arena_t* arena, view_t const& view) noexcept {
-    std::size_t const count = places.count;
-    auto [presences, presences_status] = arena_allocate<ustore_octet_t>(arena, divide_round_up(count, bits_in_byte_k));
-    if (presences_status.failed()) return presences_status;
-    auto [offsets, offsets_status] = arena_allocate<ustore_length_t>(arena, count + 1);
-    if (offsets_status.failed()) return offsets_status;
-
-    found_documents_t found {presences.data(), offsets.data(), nullptr};
-    ustore_read_t read {};
+/** Reads the binary documents at @p places through @p view with the engine's own read, which appends to the scratch
+ *  of @p view rather than rewinding it. */
+static expected<values_view_t> read_documents(ustore_database_t database, place_batch_t const& places,
+                                              view_t const& view) noexcept {
+    ustore_octet_t const* presences = nullptr;
+    ustore_strings_view_t contents {};
+    ustore_blobs_read_t read {};
     read.database = database;
-    read.count = count;
-    read.collections = places.collections_begin.get();
-    read.collections_stride = places.collections_begin.stride();
-    read.keys = places.keys_begin.get();
-    read.keys_stride = places.keys_begin.stride();
-    read.presences = found.presences;
-    read.offsets = found.offsets;
-    read.values = &found.contents;
-    read.arena = arena;
-    if (status_t const status = engine_of(database).read(read, view); status.failed()) return status;
-    return found;
+    read.count = places.count;
+    read.collections = places.collections();
+    read.keys = places.keys();
+    read.presences = &presences;
+    read.values = &contents;
+    read.arena = view.scratch;
+    if (status_t const status = engine_of(database).blobs_read(read, view); status.failed()) return status;
+    return values_view_t {places.count, presences, contents};
 }
 
 /**
@@ -565,59 +557,57 @@ static expected<found_documents_t> read_documents(ustore_database_t database, pl
  *  and an insertion of a whole document that already exists.
  */
 template <document_callback callback_type_>
-static status_t read_each_document(ustore_database_t database, places_arg_t const& places, modification_t modification,
-                                   ustore_arena_t* arena, view_t const& view, callback_type_&& callback) noexcept {
+static status_t read_each_document(ustore_database_t database, place_batch_t const& places, strings_arg_t const& fields,
+                                   modification_t modification, view_t const& view,
+                                   callback_type_&& callback) noexcept {
 
-    bool const has_fields = places.fields_begin && (!places.fields_begin.repeats() || *places.fields_begin);
-    auto [found, status] = read_documents(database, places, arena, view);
+    auto [found, status] = read_documents(database, places, view);
     if (status.failed()) return status;
 
+    bool const replaces_existing = modification == modification_t::update_k || modification == modification_t::patch_k;
     for (std::size_t index = 0; index != places.size(); ++index) {
         value_view_t const document = found[index];
-        if (!document && has_fields && modification != modification_t::nothing_k)
+        std::string_view const field = field_of(fields, index);
+        if (!document && !field.empty() && modification != modification_t::nothing_k)
             return {status_code_t::not_found_k, "Modified field belongs to a missing document"};
-        bool const replaces_existing = modification == modification_t::update_k ||
-                                       modification == modification_t::patch_k;
-        if (!document && !has_fields && replaces_existing)
+        if (!document && field.empty() && replaces_existing)
             return {status_code_t::not_found_k, "Updated or patched document is missing"};
-        if (document && !has_fields && modification == modification_t::insert_k)
+        if (document && field.empty() && modification == modification_t::insert_k)
             return {status_code_t::already_exists_k, "Inserted document already exists"};
-        if (status_t const handled = callback(index, places.fields_begin ? places.fields_begin[index] : nullptr,
-                                              document);
-            handled.failed())
-            return handled;
+        if (status_t const handled = callback(index, field, document); handled.failed()) return handled;
     }
     return {};
 }
 
 /** Calls @p callback on the document of every task, reading every distinct document once. */
 template <document_callback callback_type_>
-static status_t read_distinct_documents(ustore_database_t database, places_arg_t const& places, ustore_arena_t* arena,
-                                        view_t const& view, callback_type_&& callback) noexcept {
+static status_t read_distinct_documents(ustore_database_t database, place_batch_t const& places,
+                                        strings_arg_t const& fields, view_t const& view,
+                                        callback_type_&& callback) noexcept {
 
     if (all_ascending(places.keys_begin, places.count))
-        return read_each_document(database, places, modification_t::nothing_k, arena, view, callback);
+        return read_each_document(database, places, fields, modification_t::nothing_k, view, callback);
 
-    auto [distinct, distinct_status] = arena_allocate<collection_key_t>(arena, places.count);
+    auto [distinct, distinct_status] = arena_allocate<collection_key_t>(view.scratch, places.count);
     if (distinct_status.failed()) return distinct_status;
     transform_n(places, places.count, distinct.begin(), [](place_t const& place) { return place.collection_key(); });
     std::size_t const distinct_count = sort_and_deduplicate(distinct.begin(), distinct.end());
     if (distinct_count == places.count)
-        return read_each_document(database, places, modification_t::nothing_k, arena, view, callback);
+        return read_each_document(database, places, fields, modification_t::nothing_k, view, callback);
 
     std::span<collection_key_t> const sorted = distinct.first(distinct_count);
     auto const sorted_strided = strided(sorted).immutable();
-    places_arg_t distinct_places;
+    place_batch_t distinct_places;
     distinct_places.collections_begin = sorted_strided.members(&collection_key_t::collection).begin();
     distinct_places.keys_begin = sorted_strided.members(&collection_key_t::key).begin();
     distinct_places.count = static_cast<ustore_size_t>(distinct_count);
 
-    auto [found, found_status] = read_documents(database, distinct_places, arena, view);
+    auto [found, found_status] = read_documents(database, distinct_places, view);
     if (found_status.failed()) return found_status;
 
     for (std::size_t index = 0; index != places.size(); ++index) {
         place_t const place = places[index];
-        if (status_t const handled = callback(index, place.field,
+        if (status_t const handled = callback(index, field_of(fields, index),
                                               found[offset_in_sorted(sorted, place.collection_key())]);
             handled.failed())
             return handled;
@@ -630,51 +620,48 @@ static status_t read_distinct_documents(ustore_database_t database, places_arg_t
 #pragma region Writing
 
 /** Parses, modifies and writes back the documents at @p places through the engine's own read and write. */
-static status_t read_modify_write(ustore_database_t database, places_arg_t const& places,
-                                  contents_arg_t const& contents, modification_t modification,
-                                  ustore_doc_field_type_t type, ustore_durability_t durability, ustore_arena_t* arena,
+static status_t read_modify_write(ustore_database_t database, place_batch_t const& places, strings_arg_t const& fields,
+                                  strings_arg_t const& values, modification_t modification,
+                                  ustore_docs_field_type_t type, ustore_durability_t durability,
                                   view_t const& view) noexcept {
 
-    growing_tape_t modified {arena};
-    if (status_t const status = modified.reserve(places.size()); status.failed()) return status;
+    ustore_arena_t const scratch = view.scratch;
+    growing_strings<arena_allocator<byte_t>> modified {scratch};
 
-    auto modify_one = [&](std::size_t index, ustore_str_view_t field, value_view_t binary_document) noexcept {
-        auto [document, document_status] = json_parse(binary_document, arena);
+    auto modify_one = [&](std::size_t index, std::string_view field, value_view_t binary_document) noexcept {
+        auto [document, document_status] = json_parse(binary_document, scratch);
         if (document_status.failed()) return document_status;
-        auto [modifier, modifier_status] = any_parse(contents[index], type, arena);
+        auto [modifier, modifier_status] = any_parse(value_view_t {values[index]}, type, scratch);
         if (modifier_status.failed()) return modifier_status;
         if (!modifier) return status_t {status_code_t::malformed_k, "An empty value is no JSON document"};
-        auto [modifier_document, mutable_status] = json_mutable(modifier, arena);
+        auto [modifier_document, mutable_status] = json_mutable(modifier, scratch);
         if (mutable_status.failed()) return mutable_status;
         if (status_t const status = modify(document, yyjson_mut_doc_get_root(modifier_document), field, modification,
-                                           arena);
+                                           scratch);
             status.failed())
             return status;
-        return json_dump({nullptr, yyjson_mut_doc_get_root(document.mutable_handle)}, arena, modified);
+        auto [text, dump_status] = json_dump({nullptr, yyjson_mut_doc_get_root(document.mutable_handle)}, scratch);
+        if (dump_status.failed()) return dump_status;
+        return modified.push_back(text.bytes());
     };
 
     // A transaction watches the documents it rewrites, whatever the caller asked of the writes
     view_t watching = view;
     watching.watch = ustore_watch_keys_k;
-    if (status_t const status = read_each_document(database, places, modification, arena, watching, modify_one);
+    if (status_t const status = read_each_document(database, places, fields, modification, watching, modify_one);
         status.failed())
         return status;
 
-    // Every value ends where the next one starts, as the tape keeps one offset more than values
-    ustore_bytes_cptr_t const modified_contents = reinterpret_cast<ustore_bytes_cptr_t>(
-        modified.contents().begin().get());
-    ustore_write_t write {};
+    strings_arg_t modified_values;
+    modified_values.view = modified.tape();
+    ustore_blobs_write_t write {};
     write.database = database;
     write.count = places.count;
-    write.collections = places.collections_begin.get();
-    write.collections_stride = places.collections_begin.stride();
-    write.keys = places.keys_begin.get();
-    write.keys_stride = places.keys_begin.stride();
-    write.starts = modified.offsets().begin().get();
-    write.starts_stride = modified.offsets().stride();
-    write.values = &modified_contents;
+    write.collections = places.collections();
+    write.keys = places.keys();
+    write.values = modified_values.view;
     write.durability = durability;
-    return engine_of(database).write(write, view);
+    return engine_of(database).blobs_write(write, modified_values, view);
 }
 
 /** Reads @p text as a UUID in its canonical 8-4-4-4-12 hexadecimal form into @p uuid, answering whether it is one. */
@@ -694,12 +681,12 @@ static bool parse_uuid(std::string_view text, ustore_uuid_t& uuid) noexcept {
     return true;
 }
 
-/** Reads the key of every document from its @p id_field into @p keys: a non-negative integer, spelled as the key of
- *  that integer, or a UUID in canonical text. */
-static status_t extract_keys(contents_arg_t const& contents, ustore_str_view_t id_field, ustore_arena_t* arena,
+/** Reads the key of every document of @p values from its @p id_field into @p keys: a non-negative integer, spelled as
+ *  the key of that integer, or a UUID in canonical text. */
+static status_t extract_keys(strings_arg_t const& values, std::string_view id_field, ustore_arena_t arena,
                              std::span<ustore_key_t> keys) noexcept {
-    for (std::size_t index = 0; index != contents.size(); ++index) {
-        auto [document, status] = json_parse(contents[index], arena);
+    for (std::size_t index = 0; index != keys.size(); ++index) {
+        auto [document, status] = json_parse(value_view_t {values[index]}, arena);
         if (status.failed()) return status;
         yyjson_val* const identifier = json_lookup(yyjson_doc_get_root(document.handle), id_field);
         if (yyjson_is_uint(identifier)) {
@@ -718,10 +705,13 @@ static status_t extract_keys(contents_arg_t const& contents, ustore_str_view_t i
 
 #pragma region Gist
 
+/** The paths a gist found so far, sorted in scratch, viewing the bytes of the column that exports them. */
+using sorted_paths_t =
+    st::basic_flat_set<std::string_view, st::less_t, st::native_row_kit_t, arena_allocator<std::string_view>>;
+
 /** Collects the unique paths to the leaves under @p node, extending the null-terminated @p path. */
-static status_t gist_paths(yyjson_val* node, field_path_buffer_t& path,
-                           uninitialized_array<std::string_view>& sorted_paths,
-                           growing_tape_t& exported_paths) noexcept {
+static status_t gist_paths(yyjson_val* node, field_path_buffer_t& path, sorted_paths_t& sorted_paths,
+                           growing_strings<arena_allocator<byte_t>>& exported_paths) noexcept {
 
     std::size_t const path_length = std::strlen(path);
 
@@ -759,51 +749,35 @@ static status_t gist_paths(yyjson_val* node, field_path_buffer_t& path,
     }
 
     std::string_view const leaf {path, path_length};
-    std::size_t const position = std::lower_bound(sorted_paths.begin(), sorted_paths.end(), leaf) -
-                                 sorted_paths.begin();
-    if (position != sorted_paths.size() && sorted_paths[position] == leaf) return {};
+    if (sorted_paths.find(leaf)) return {};
+    if (status_t const status = exported_paths.push_back(bytes_of(leaf)); status.failed()) return status;
 
-    auto [exported, status] = exported_paths.push_back(leaf);
-    if (status.failed()) return status;
-    if (status_t const terminated = exported_paths.add_terminator(byte_t {0}); terminated.failed()) return terminated;
-
-    std::string_view const stored {exported.c_str(), exported.size()};
-    return sorted_paths.insert(position, &stored, &stored + 1);
+    // The column may move as it grows, leaving behind a copy that stays readable until the scratch rewinds
+    return growth_status(sorted_paths.insert(string_of(exported_paths[exported_paths.size() - 1])));
 }
 
 #pragma endregion Gist
 
 #pragma region Gather
 
-/** Bytes a column of @p type takes per document: the scalar, or an offset and a length for strings. */
-static std::size_t field_size_bytes(ustore_doc_field_type_t type) noexcept {
+/** Bytes of the scalar a column of @p type holds per document, or zero for a column of strings or of JSON. */
+static std::size_t field_size_bytes(ustore_docs_field_type_t type) noexcept {
     switch (type) {
-    case ustore_doc_field_bool_k: return sizeof(bool);
-    case ustore_doc_field_uuid_k: return uuid_bytes_k;
-    case ustore_doc_field_f64_k: return sizeof(double);
-    case ustore_doc_field_f32_k: return sizeof(float);
-    case ustore_doc_field_f16_k: return sizeof(std::uint16_t);
-    case ustore_doc_field_i64_k: return sizeof(std::int64_t);
-    case ustore_doc_field_i32_k: return sizeof(std::int32_t);
-    case ustore_doc_field_i16_k: return sizeof(std::int16_t);
-    case ustore_doc_field_i8_k: return sizeof(std::int8_t);
-    case ustore_doc_field_u64_k: return sizeof(std::uint64_t);
-    case ustore_doc_field_u32_k: return sizeof(std::uint32_t);
-    case ustore_doc_field_u16_k: return sizeof(std::uint16_t);
-    case ustore_doc_field_u8_k: return sizeof(std::uint8_t);
-    case ustore_doc_field_bin_k:
-    case ustore_doc_field_str_k: return 2 * sizeof(ustore_length_t);
+    case ustore_docs_field_type_bool_k: return sizeof(bool);
+    case ustore_docs_field_type_uuid_k: return uuid_bytes_k;
+    case ustore_docs_field_type_f64_k: return sizeof(double);
+    case ustore_docs_field_type_f32_k: return sizeof(float);
+    case ustore_docs_field_type_f16_k: return sizeof(std::uint16_t);
+    case ustore_docs_field_type_i64_k: return sizeof(std::int64_t);
+    case ustore_docs_field_type_i32_k: return sizeof(std::int32_t);
+    case ustore_docs_field_type_i16_k: return sizeof(std::int16_t);
+    case ustore_docs_field_type_i8_k: return sizeof(std::int8_t);
+    case ustore_docs_field_type_u64_k: return sizeof(std::uint64_t);
+    case ustore_docs_field_type_u32_k: return sizeof(std::uint32_t);
+    case ustore_docs_field_type_u16_k: return sizeof(std::uint16_t);
+    case ustore_docs_field_type_u8_k: return sizeof(std::uint8_t);
     default: return 0;
     }
-}
-
-/** Whether @p arguments carry the column field @p field_index of @p type writes into, where a type without one needs
- *  none. */
-static bool has_column(ustore_docs_gather_t const& arguments, std::size_t field_index,
-                       ustore_doc_field_type_t type) noexcept {
-    if (type == ustore_doc_field_str_k || type == ustore_doc_field_bin_k)
-        return arguments.columns_offsets && arguments.columns_offsets[field_index];
-    return !field_size_bytes(type) || (arguments.columns_scalars && arguments.columns_scalars[field_index]);
 }
 
 /** Converts @p value into the scalar at @p index of @p column, zeroing a cell that holds no valid value. */
@@ -882,133 +856,117 @@ static conversion_t gather_uuid(yyjson_val* value, ustore_byte_t* column, std::s
 
 #pragma region Document Calls
 
-status_t docs_write_in_json_values(ustore_docs_write_t const& arguments, view_t const& view) noexcept {
+status_t docs_write_in_json_values(ustore_docs_write_t const& arguments, strings_arg_t const& fields,
+                                   strings_arg_t const& values, view_t const& view) noexcept {
     if (!arguments.count) return {};
-    if (!arguments.values) return {status_code_t::invalid_argument_k, "No values were provided"};
-    if (!arguments.keys && !arguments.id_field)
+    if (!values) return {status_code_t::invalid_argument_k, "No values were provided"};
+    std::string_view const id_field = string_of(arguments.id_field);
+    if (!arguments.keys.data && id_field.empty())
         return {status_code_t::invalid_argument_k, "Documents without keys need an id field"};
 
-    // A write carries no arena, so the documents it parses and modifies live in scratch freed once it returns
-    arena_t scratch;
-    strided_iterator<ustore_str_view_t const> const fields {arguments.fields, arguments.fields_stride};
-    strided_iterator<ustore_collection_id_t const> const collections {arguments.collections,
-                                                                      arguments.collections_stride};
-    contents_arg_t const contents {{arguments.starts, arguments.starts_stride},
-                                   {arguments.lengths, arguments.lengths_stride},
-                                   {arguments.values, arguments.values_stride},
-                                   arguments.count};
-
-    strided_iterator<ustore_key_t const> keys {arguments.keys, arguments.keys_stride};
-    if (!arguments.keys) {
+    ustore_arena_t const scratch = view.scratch;
+    place_batch_t places = places_of(arguments);
+    if (!arguments.keys.data) {
         auto [extracted, status] = arena_allocate<ustore_key_t>(scratch, arguments.count);
         if (status.failed()) return status;
-        if (status_t const extracting = extract_keys(contents, arguments.id_field, scratch, extracted);
-            extracting.failed())
+        if (status_t const extracting = extract_keys(values, id_field, scratch, extracted); extracting.failed())
             return extracting;
-        keys = {extracted.data(), sizeof(ustore_key_t)};
+        places.keys_begin = {extracted.data(), sizeof(ustore_key_t)};
     }
-    places_arg_t const places {collections, keys, fields, arguments.count};
 
-    bool const has_fields = fields && (!fields.repeats() || *fields);
-    if (has_fields || arguments.type != ustore_doc_field_json_k || arguments.modification != ustore_doc_modify_upsert_k)
-        return read_modify_write(arguments.database, places, contents,
+    if (addresses_fields(fields, arguments.count) || arguments.type != ustore_docs_field_type_json_k ||
+        arguments.modification != ustore_docs_modify_upsert_k)
+        return read_modify_write(arguments.database, places, fields, values,
                                  static_cast<modification_t>(arguments.modification), arguments.type,
-                                 arguments.durability, scratch, view);
+                                 arguments.durability, view);
 
     // Whole JSON documents pass through once they parse, which extracting the keys has already checked
-    for (std::size_t index = 0; arguments.keys && index != contents.size(); ++index)
-        if (status_t const status = json_parse(contents[index], scratch).status(); status.failed()) return status;
+    for (std::size_t index = 0; arguments.keys.data && index != arguments.count; ++index)
+        if (status_t const status = json_parse(value_view_t {values[index]}, scratch).status(); status.failed())
+            return status;
 
-    ustore_write_t write {};
+    ustore_blobs_write_t write {};
     write.database = arguments.database;
     write.count = arguments.count;
     write.collections = arguments.collections;
-    write.collections_stride = arguments.collections_stride;
-    write.keys = keys.get();
-    write.keys_stride = keys.stride();
-    write.starts = arguments.starts;
-    write.starts_stride = arguments.starts_stride;
-    write.lengths = arguments.lengths;
-    write.lengths_stride = arguments.lengths_stride;
+    write.keys = places.keys();
     write.values = arguments.values;
-    write.values_stride = arguments.values_stride;
     write.durability = arguments.durability;
-    return engine_of(arguments.database).write(write, view);
+    return engine_of(arguments.database).blobs_write(write, values, view);
 }
 
-status_t docs_read_in_json_values(ustore_docs_read_t const& arguments, view_t const& view) noexcept {
+status_t docs_read_in_json_values(ustore_docs_read_t const& arguments, strings_arg_t const& fields,
+                                  view_t const& view) noexcept {
     if (!arguments.count) return {};
 
-    strided_iterator<ustore_str_view_t const> const fields {arguments.fields, arguments.fields_stride};
-    bool const has_fields = fields && (!fields.repeats() || *fields);
-    if (!has_fields && arguments.type == ustore_doc_field_json_k) {
-        ustore_read_t read {};
+    if (!addresses_fields(fields, arguments.count) && arguments.outputs_type == ustore_docs_field_type_json_k) {
+        ustore_blobs_read_t read {};
         read.database = arguments.database;
         read.count = arguments.count;
         read.collections = arguments.collections;
-        read.collections_stride = arguments.collections_stride;
         read.keys = arguments.keys;
-        read.keys_stride = arguments.keys_stride;
         read.presences = arguments.presences;
-        read.offsets = arguments.offsets;
+        read.lengths = arguments.lengths;
         read.values = arguments.values;
         read.arena = arguments.arena;
-        return engine_of(arguments.database).read(read, view);
+        return engine_of(arguments.database).blobs_read(read, view);
     }
-    if (arguments.type != ustore_doc_field_json_k && arguments.type != ustore_doc_field_str_k)
+    if (arguments.outputs_type != ustore_docs_field_type_json_k &&
+        arguments.outputs_type != ustore_docs_field_type_str_k)
         return {status_code_t::unsupported_k, "Documents read only as JSON or strings"};
 
-    strided_iterator<ustore_collection_id_t const> const collections {arguments.collections,
-                                                                      arguments.collections_stride};
-    strided_iterator<ustore_key_t const> const keys {arguments.keys, arguments.keys_stride};
-    places_arg_t const places {collections, keys, fields, arguments.count};
+    place_batch_t const places = places_of(arguments);
+    auto [outputs, outputs_status] = read_outputs_t::make(arguments, view.scratch);
+    if (outputs_status.failed()) return outputs_status;
 
-    growing_tape_t exported {arguments.arena};
-    if (status_t const status = exported.reserve(places.size()); status.failed()) return status;
-
-    // A value is present when its field is, and a missing one takes no bytes of the tape
-    bits_span_t const presences {arguments.presences};
-    auto export_one = [&](std::size_t index, ustore_str_view_t field, value_view_t binary_document) noexcept {
-        auto [document, status] = json_parse(binary_document, arguments.arena);
+    // A value is present when its field is, and its text stays in scratch until the outputs copy it
+    auto export_one = [&](std::size_t, std::string_view field, value_view_t binary_document) noexcept -> status_t {
+        auto [document, status] = json_parse(binary_document, view.scratch);
         if (status.failed()) return status;
 
         yyjson_val* const value = json_lookup(yyjson_doc_get_root(document.handle), field);
-        if (arguments.presences) presences[index] = value != nullptr;
-        if (arguments.type == ustore_doc_field_json_k || !value || yyjson_is_ctn(value))
-            return json_dump({value, nullptr}, arguments.arena, exported);
+        if (!value) {
+            outputs.append_missing();
+            return {};
+        }
+        if (arguments.outputs_type == ustore_docs_field_type_json_k || yyjson_is_ctn(value)) {
+            auto [text, dump_status] = json_dump({value, nullptr}, view.scratch);
+            if (dump_status.failed()) return dump_status;
+            outputs.append(text);
+            return {};
+        }
 
         printed_number_buffer_t print_buffer;
         std::string_view text;
         [[maybe_unused]] conversion_t const conversion = json_to_string(value, print_buffer, text);
-        return exported.push_back(text).status();
+        if (text.data() == print_buffer) {
+            auto [printed, printed_status] = arena_allocate<char>(view.scratch, text.size());
+            if (printed_status.failed()) return printed_status;
+            std::memcpy(printed.data(), text.data(), text.size());
+            text = {printed.data(), text.size()};
+        }
+        outputs.append(text);
+        return {};
     };
-    if (status_t const status = read_distinct_documents(arguments.database, places, arguments.arena, view, export_one);
+    if (status_t const status = read_distinct_documents(arguments.database, places, fields, view, export_one);
         status.failed())
         return status;
-
-    strided_range<ustore_length_t> const exported_offsets = exported.offsets();
-    if (arguments.offsets)
-        for (std::size_t index = 0; index != places.size() + 1; ++index)
-            arguments.offsets[index] = exported_offsets[index];
-    if (arguments.values) *arguments.values = reinterpret_cast<ustore_byte_t*>(exported.contents().begin().get());
-    return {};
+    return outputs.finish(arguments);
 }
 
 status_t docs_gist_in_json_values(ustore_docs_gist_t const& arguments, view_t const& view) noexcept {
+    if (arguments.written) *arguments.written = 0;
     if (!arguments.count) return {};
 
-    strided_iterator<ustore_collection_id_t const> const collections {arguments.collections,
-                                                                      arguments.collections_stride};
-    strided_iterator<ustore_key_t const> const keys {arguments.keys, arguments.keys_stride};
-    places_arg_t const places {collections, keys, {}, arguments.count};
-    auto [found, found_status] = read_documents(arguments.database, places, arguments.arena, view);
+    auto [found, found_status] = read_documents(arguments.database, places_of(arguments), view);
     if (found_status.failed()) return found_status;
 
+    // The paths and their offsets grow side by side in scratch, and only their final lengths reach the arena
     field_path_buffer_t path = {0};
-    uninitialized_array<std::string_view> sorted_paths {arguments.arena};
-    growing_tape_t exported_paths {arguments.arena};
+    sorted_paths_t sorted_paths {{}, {view.scratch}};
+    growing_strings<arena_allocator<byte_t>> exported_paths {view.scratch};
     for (std::size_t index = 0; index != arguments.count; ++index) {
-        auto [document, document_status] = json_parse(found[index], arguments.arena);
+        auto [document, document_status] = json_parse(found[index], view.scratch);
         if (document_status.failed()) return document_status;
         if (!document) continue;
         if (status_t const status = gist_paths(yyjson_doc_get_root(document.handle), path, sorted_paths,
@@ -1017,109 +975,129 @@ status_t docs_gist_in_json_values(ustore_docs_gist_t const& arguments, view_t co
             return status;
     }
 
-    if (arguments.fields_count) *arguments.fields_count = static_cast<ustore_size_t>(sorted_paths.size());
-    if (arguments.offsets) *arguments.offsets = exported_paths.offsets().begin().get();
-    if (arguments.fields) *arguments.fields = reinterpret_cast<ustore_char_t*>(exported_paths.contents().begin().get());
+    if (arguments.fields)
+        if (status_t const status = exported_paths.export_into(arguments.arena, *arguments.fields); status.failed())
+            return status;
+    if (arguments.written) *arguments.written = static_cast<ustore_size_t>(sorted_paths.size());
     return {};
 }
 
-status_t docs_gather_in_json_values(ustore_docs_gather_t const& arguments, view_t const& view) noexcept {
+status_t docs_gather_in_json_values(ustore_docs_gather_t const& arguments, strings_arg_t const& fields,
+                                    view_t const& view) noexcept {
     if (!arguments.count || !arguments.fields_count) return {};
+
+    if (!arguments.columns) return {status_code_t::invalid_argument_k, "Need an output for the columns"};
+    if (!fields || !arguments.outputs_types)
+        return {status_code_t::invalid_argument_k, "Need the fields to gather and the types of their columns"};
 
     std::size_t const fields_count = arguments.fields_count;
     std::size_t const docs_count = arguments.count;
-    strided_iterator<ustore_str_view_t const> const fields {arguments.fields, arguments.fields_stride};
-    strided_iterator<ustore_doc_field_type_t const> const types {arguments.types, arguments.types_stride};
-    for (std::size_t field_index = 0; field_index != fields_count; ++field_index)
-        if (!has_column(arguments, field_index, types[field_index]))
-            return {status_code_t::invalid_argument_k, "Need an output column for every field"};
-
-    strided_iterator<ustore_collection_id_t const> const collections {arguments.collections,
-                                                                      arguments.collections_stride};
-    strided_iterator<ustore_key_t const> const keys {arguments.keys, arguments.keys_stride};
-    places_arg_t const places {collections, keys, {}, docs_count};
-    auto [found, found_status] = read_documents(arguments.database, places, arguments.arena, view);
+    auto [found, found_status] = read_documents(arguments.database, places_of(arguments), view);
     if (found_status.failed()) return found_status;
 
-    printed_number_buffer_t print_buffer;
-    uninitialized_array<char> joined {arguments.arena};
+    // Every document parses once, then the columns fill one after another, each string column growing in scratch
+    auto [roots, roots_status] = arena_allocate<yyjson_val*>(view.scratch, docs_count);
+    if (roots_status.failed()) return roots_status;
     for (std::size_t document_index = 0; document_index != docs_count; ++document_index) {
-        auto [document, document_status] = json_parse(found[document_index], arguments.arena);
+        auto [document, document_status] = json_parse(found[document_index], view.scratch);
         if (document_status.failed()) return document_status;
-        yyjson_val* const root = yyjson_doc_get_root(document.handle);
-        std::size_t const slot = document_index / bits_in_byte_k;
-        ustore_octet_t const mask = static_cast<ustore_octet_t>(1u << (document_index % bits_in_byte_k));
+        roots[document_index] = yyjson_doc_get_root(document.handle);
+    }
 
-        for (std::size_t field_index = 0; field_index != fields_count; ++field_index) {
-            yyjson_val* const value = json_lookup(root, fields[field_index]);
-            ustore_doc_field_type_t const type = types[field_index];
-            ustore_byte_t* const scalar_column = arguments.columns_scalars ? arguments.columns_scalars[field_index]
-                                                                           : nullptr;
+    auto [columns, columns_status] = arena_allocate<ustore_docs_column_view_t>(arguments.arena, fields_count);
+    if (columns_status.failed()) return columns_status;
+    // The three bitmaps of a column share one allocation, each starting aligned as every output does
+    std::size_t const bitmap_stride = round_up_to_multiple(divide_round_up(docs_count, bits_in_byte_k),
+                                                           arena_alignment_k);
+    printed_number_buffer_t print_buffer;
+    for (std::size_t field_index = 0; field_index != fields_count; ++field_index) {
+        ustore_docs_field_type_t const type = arguments.outputs_types[field_index];
+        std::string_view const field = string_of(fields[field_index]);
+        bool const holds_strings = type == ustore_docs_field_type_str_k || type == ustore_docs_field_type_bin_k;
+        auto [bitmaps, bitmaps_status] = arena_allocate<ustore_octet_t>(arguments.arena, 3 * bitmap_stride);
+        if (bitmaps_status.failed()) return bitmaps_status;
+        std::memset(bitmaps.data(), 0, bitmaps.size());
+        auto [scalars, scalars_status] = arena_allocate<ustore_byte_t>(arguments.arena,
+                                                                       docs_count * field_size_bytes(type));
+        if (scalars_status.failed()) return scalars_status;
+        growing_strings<arena_allocator<byte_t>> strings {view.scratch};
+
+        for (std::size_t document_index = 0; document_index != docs_count; ++document_index) {
+            yyjson_val* const value = json_lookup(roots[document_index], field);
+            ustore_byte_t* const scalar_column = scalars.data();
             conversion_t conversion = conversion_t::collides_k;
 
             switch (type) {
-            case ustore_doc_field_bool_k: conversion = gather_scalar<bool>(value, scalar_column, document_index); break;
-            case ustore_doc_field_uuid_k: conversion = gather_uuid(value, scalar_column, document_index); break;
-            case ustore_doc_field_f64_k:
+            case ustore_docs_field_type_bool_k:
+                conversion = gather_scalar<bool>(value, scalar_column, document_index);
+                break;
+            case ustore_docs_field_type_uuid_k: conversion = gather_uuid(value, scalar_column, document_index); break;
+            case ustore_docs_field_type_f64_k:
                 conversion = gather_scalar<double>(value, scalar_column, document_index);
                 break;
-            case ustore_doc_field_f32_k: conversion = gather_scalar<float>(value, scalar_column, document_index); break;
-            case ustore_doc_field_f16_k: conversion = gather_half(value, scalar_column, document_index); break;
-            case ustore_doc_field_i64_k:
+            case ustore_docs_field_type_f32_k:
+                conversion = gather_scalar<float>(value, scalar_column, document_index);
+                break;
+            case ustore_docs_field_type_f16_k: conversion = gather_half(value, scalar_column, document_index); break;
+            case ustore_docs_field_type_i64_k:
                 conversion = gather_scalar<std::int64_t>(value, scalar_column, document_index);
                 break;
-            case ustore_doc_field_i32_k:
+            case ustore_docs_field_type_i32_k:
                 conversion = gather_scalar<std::int32_t>(value, scalar_column, document_index);
                 break;
-            case ustore_doc_field_i16_k:
+            case ustore_docs_field_type_i16_k:
                 conversion = gather_scalar<std::int16_t>(value, scalar_column, document_index);
                 break;
-            case ustore_doc_field_i8_k:
+            case ustore_docs_field_type_i8_k:
                 conversion = gather_scalar<std::int8_t>(value, scalar_column, document_index);
                 break;
-            case ustore_doc_field_u64_k:
+            case ustore_docs_field_type_u64_k:
                 conversion = gather_scalar<std::uint64_t>(value, scalar_column, document_index);
                 break;
-            case ustore_doc_field_u32_k:
+            case ustore_docs_field_type_u32_k:
                 conversion = gather_scalar<std::uint32_t>(value, scalar_column, document_index);
                 break;
-            case ustore_doc_field_u16_k:
+            case ustore_docs_field_type_u16_k:
                 conversion = gather_scalar<std::uint16_t>(value, scalar_column, document_index);
                 break;
-            case ustore_doc_field_u8_k:
+            case ustore_docs_field_type_u8_k:
                 conversion = gather_scalar<std::uint8_t>(value, scalar_column, document_index);
                 break;
-            case ustore_doc_field_str_k:
-            case ustore_doc_field_bin_k: {
+            case ustore_docs_field_type_str_k:
+            case ustore_docs_field_type_bin_k: {
                 std::string_view text;
                 conversion = json_to_string(value, print_buffer, text);
-                ustore_length_t* const offsets = arguments.columns_offsets[field_index];
-                ustore_length_t* const lengths = arguments.columns_lengths ? arguments.columns_lengths[field_index]
-                                                                           : nullptr;
-                offsets[document_index] = static_cast<ustore_length_t>(joined.size());
-                if (lengths) lengths[document_index] = static_cast<ustore_length_t>(text.size());
-                if (status_t const status = joined.insert(joined.size(), text.data(), text.data() + text.size());
+                // yyjson, `print_number` and the literals end every text with a null, which a text column spans
+                std::size_t const terminator = type == ustore_docs_field_type_str_k;
+                char const* const begin = text.empty() ? "" : text.data();
+                if (status_t const status = strings.push_back(bytes_of({begin, text.size() + terminator}));
                     status.failed())
                     return status;
-                if (type == ustore_doc_field_str_k)
-                    if (status_t const status = joined.push_back('\0'); status.failed()) return status;
-                offsets[document_index + 1] = static_cast<ustore_length_t>(joined.size());
                 break;
             }
             default: break;
             }
 
-            // A bitmap the caller asked for none of records into a scratch octet
-            ustore_octet_t ignored = 0;
-            record_conversion(
-                conversion, mask,
-                arguments.columns_validities ? arguments.columns_validities[field_index][slot] : ignored,
-                arguments.columns_conversions ? arguments.columns_conversions[field_index][slot] : ignored,
-                arguments.columns_collisions ? arguments.columns_collisions[field_index][slot] : ignored);
+            std::size_t const slot = document_index / bits_in_byte_k;
+            ustore_octet_t const mask = static_cast<ustore_octet_t>(1u << (document_index % bits_in_byte_k));
+            record_conversion(conversion, mask, bitmaps[slot], bitmaps[bitmap_stride + slot],
+                              bitmaps[2 * bitmap_stride + slot]);
         }
+
+        ustore_strings_view_t column_strings {};
+        if (holds_strings)
+            if (status_t const status = strings.export_into(arguments.arena, column_strings); status.failed())
+                return status;
+        columns[field_index] = {
+            .validities = bitmaps.data(),
+            .conversions = bitmaps.data() + bitmap_stride,
+            .collisions = bitmaps.data() + 2 * bitmap_stride,
+            .scalars = scalars.data(),
+            .strings = column_strings,
+        };
     }
 
-    if (arguments.joined_strings) *arguments.joined_strings = reinterpret_cast<ustore_byte_t*>(joined.data());
+    *arguments.columns = columns.data();
     return {};
 }
 

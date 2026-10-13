@@ -11,7 +11,8 @@
  *  header shares are documented in @c types.h under Verbs, Asynchrony, Memory and Shapes.
  */
 
-#pragma once
+#ifndef UNUM_USTORE_USTORE_H
+#define UNUM_USTORE_USTORE_H
 
 #include "ustore/types.h"
 #include "ustore/db.h"
@@ -21,3 +22,5 @@
 #include "ustore/graph.h"
 #include "ustore/pages.h"
 #include "ustore/strings.h"
+
+#endif // UNUM_USTORE_USTORE_H

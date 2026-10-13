@@ -6,7 +6,8 @@
  *
  *  Strings live in collections created with @c ustore_modality_strings_k, which each engine keys by the strings
  *  themselves, so a prefix walk is an ordered walk of its own keyspace; the other calls refuse such a collection,
- *  and these calls refuse every other one.
+ *  and these calls refuse every other one. Strings and their values both arrive as @c ustore_strings_view_t, so
+ *  this header mirrors @c blobs.h with strings in place of keys.
  *
  *  Strings order by their bytes, unsigned, and a prefix walk hands them over in that order. RAM, RocksDB and
  *  LevelDB key a strings collection by the strings themselves. An engine without such a keyspace maps a
@@ -15,15 +16,14 @@
  *  run shares, so a prefix walk stays an ordered walk of keys.
  */
 
-#pragma once
+#ifndef UNUM_USTORE_STRINGS_H
+#define UNUM_USTORE_STRINGS_H
 
 #include "ustore/db.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-#pragma region Writes
 
 /**
  *  @brief The arguments of @c ustore_strings_write, which upserts the values of strings.
@@ -52,42 +52,13 @@ typedef struct ustore_strings_write_t {
     ustore_size_t count;
 
     /** Strings collections owning the strings. */
-    ustore_collection_id_t const* collections;
+    ustore_collections_view_t collections;
 
-    /** Bytes between consecutive collections, where zero repeats the first one. */
-    ustore_size_t collections_stride;
+    /** Strings to write, one per task. */
+    ustore_strings_view_t strings;
 
-    /** Strings to write, @c NULL only when there are no tasks. */
-    ustore_str_view_t const* strings;
-
-    /** Bytes between consecutive string pointers, where zero repeats the first one. */
-    ustore_size_t strings_stride;
-
-    /** Optional lengths of the strings, inferred from null terminators when absent. */
-    ustore_length_t const* strings_lengths;
-
-    /** Bytes between consecutive string lengths, where zero repeats the first one. */
-    ustore_size_t strings_lengths_stride;
-
-    /** Optional starts of the values within the chunks of @c values, which may skip the header of a runtime
-     *  object, where @c NULL starts every value at its chunk. */
-    ustore_length_t const* starts;
-
-    /** Bytes between consecutive starts, where zero repeats the first one. */
-    ustore_size_t starts_stride;
-
-    /** Optional lengths of the values; without them every value ends where the next one starts, reading one start
-     *  past the last value, or at a null terminator when @c starts is absent too. */
-    ustore_length_t const* lengths;
-
-    /** Bytes between consecutive lengths, where zero repeats the first one. */
-    ustore_size_t lengths_stride;
-
-    /** Pointers to the chunks holding the values, @c NULL only when there are no tasks. */
-    ustore_bytes_cptr_t const* values;
-
-    /** Bytes between consecutive chunk pointers, where zero repeats the first one. */
-    ustore_size_t values_stride;
+    /** Values to write, one per string; a tape @c ustore_strings_read wrote is written back as it is. */
+    ustore_strings_view_t values;
 
     /** How durable the writes are once the call finishes at the head; a transaction's commit decides its own. */
     ustore_durability_t durability;
@@ -125,22 +96,10 @@ typedef struct ustore_strings_remove_t {
     ustore_size_t count;
 
     /** Strings collections owning the strings. */
-    ustore_collection_id_t const* collections;
+    ustore_collections_view_t collections;
 
-    /** Bytes between consecutive collections, where zero repeats the first one. */
-    ustore_size_t collections_stride;
-
-    /** Strings to remove, @c NULL only when there are no tasks. */
-    ustore_str_view_t const* strings;
-
-    /** Bytes between consecutive string pointers, where zero repeats the first one. */
-    ustore_size_t strings_stride;
-
-    /** Optional lengths of the strings, inferred from null terminators when absent. */
-    ustore_length_t const* strings_lengths;
-
-    /** Bytes between consecutive string lengths, where zero repeats the first one. */
-    ustore_size_t strings_lengths_stride;
+    /** Strings to remove, one per task. */
+    ustore_strings_view_t strings;
 
     /** How durable the removals are once the call finishes at the head; a transaction's commit decides its own. */
     ustore_durability_t durability;
@@ -155,10 +114,6 @@ typedef struct ustore_strings_remove_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
 USTORE_EXPORT void ustore_strings_remove(ustore_strings_remove_t* arguments);
-
-#pragma endregion Writes
-
-#pragma region Reads
 
 /** The arguments of @c ustore_strings_read, which reads the values of strings, their lengths or their presence. */
 typedef struct ustore_strings_read_t {
@@ -182,36 +137,24 @@ typedef struct ustore_strings_read_t {
     ustore_size_t count;
 
     /** Strings collections owning the strings. */
-    ustore_collection_id_t const* collections;
+    ustore_collections_view_t collections;
 
-    /** Bytes between consecutive collections, where zero repeats the first one. */
-    ustore_size_t collections_stride;
+    /** Strings to read, one per task. */
+    ustore_strings_view_t strings;
 
-    /** Strings to read, @c NULL only when there are no tasks. */
-    ustore_str_view_t const* strings;
+    /** Optional output for a bitset of @c count bits marking present strings, addressed as Apache Arrow does, inside
+     *  @c arena. */
+    ustore_octet_t const** presences;
 
-    /** Bytes between consecutive string pointers, where zero repeats the first one. */
-    ustore_size_t strings_stride;
+    /** Optional output for the length of every value, for reads that skip the bytes, inside @c arena. */
+    ustore_length_t const** lengths;
 
-    /** Optional lengths of the strings, inferred from null terminators when absent. */
-    ustore_length_t const* strings_lengths;
+    /** Optional output for the values as a tape inside @c arena, in the order of the strings, where a missing string
+     *  reads as an empty value. */
+    ustore_strings_view_t* values;
 
-    /** Bytes between consecutive string lengths, where zero repeats the first one. */
-    ustore_size_t strings_lengths_stride;
-
-    /** Optional output for a bitset of at least @c count bits marking present strings, addressed
-     *  as Apache Arrow does. */
-    ustore_octet_t* presences;
-
-    /** Optional output for @c count plus one offsets into @c values, the last one closing the
-     *  final value as Apache Arrow expects. */
-    ustore_length_t* offsets;
-
-    /** Optional output for the tape of values in the order of the strings, inside @c arena. */
-    ustore_byte_t** values;
-
-    /** Memory for @c values: reused when it points to an arena, created when it points to @c NULL. */
-    ustore_arena_t* arena;
+    /** Rewound by this call, then holding every output it writes; @c NULL is refused. */
+    ustore_arena_t arena;
 
 } ustore_strings_read_t;
 
@@ -221,12 +164,8 @@ typedef struct ustore_strings_read_t {
  */
 USTORE_EXPORT void ustore_strings_read(ustore_strings_read_t* arguments);
 
-#pragma endregion Reads
-
-#pragma region Scans
-
 /**
- *  @brief The arguments of @c ustore_strings_scan, which lists up to a limit of strings under every prefix.
+ *  @brief The arguments of @c ustore_strings_scan, which lists up to @c wanted strings under every prefix.
  *
  *  Strings come in the order of their text. Values are not exported, so a read follows the scan, and a
  *  scan resumes from @c start_strings rather than holding an iterator over concurrent state.
@@ -252,53 +191,25 @@ typedef struct ustore_strings_scan_t {
     ustore_size_t count;
 
     /** Strings collections to scan. */
-    ustore_collection_id_t const* collections;
+    ustore_collections_view_t collections;
 
-    /** Bytes between consecutive collections, where zero repeats the first one. */
-    ustore_size_t collections_stride;
+    /** Prefixes every scan matches, where a zeroed view matches every string. */
+    ustore_strings_view_t prefixes;
 
-    /** Prefixes every scan matches, where an empty prefix walks the whole collection. */
-    ustore_str_view_t const* prefixes;
+    /** Smallest string every scan may return, which paginates a walk of one prefix; a zeroed view starts first. */
+    ustore_strings_view_t start_strings;
 
-    /** Bytes between consecutive prefix pointers, where zero repeats the first one. */
-    ustore_size_t prefixes_stride;
+    /** Output for @c count plus one offsets into @c strings, the last one closing the final scan, inside @c arena. */
+    ustore_length_t const** offsets;
 
-    /** Optional lengths of the prefixes, inferred from null terminators when absent. */
-    ustore_length_t const* prefixes_lengths;
+    /** Output for the found strings as a tape inside @c arena, scan after scan. */
+    ustore_strings_view_t* strings;
 
-    /** Bytes between consecutive prefix lengths, where zero repeats the first one. */
-    ustore_size_t prefixes_lengths_stride;
+    /** Rewound by this call, then holding every output it writes; @c NULL is refused. */
+    ustore_arena_t arena;
 
-    /** Optional smallest string every scan may return, which paginates a walk of one prefix. */
-    ustore_str_view_t const* start_strings;
-
-    /** Bytes between consecutive start strings, where zero repeats the first one. */
-    ustore_size_t start_strings_stride;
-
-    /** Optional lengths of the start strings, inferred from null terminators when absent. */
-    ustore_length_t const* start_strings_lengths;
-
-    /** Bytes between consecutive start string lengths, where zero repeats the first one. */
-    ustore_size_t start_strings_lengths_stride;
-
-    /** Most strings every scan returns, never @c NULL. */
-    ustore_length_t const* count_limits;
-
-    /** Bytes between consecutive limits, where zero repeats the first one. */
-    ustore_size_t count_limits_stride;
-
-    /** Output for @c count plus one offsets into the found strings, the last one closing the final scan. */
-    ustore_length_t* offsets;
-
-    /** Output for one offset into @c strings per found string, plus one closing the last one, with room for the
-     *  sum of @c count_limits plus one. */
-    ustore_length_t* strings_offsets;
-
-    /** Output for the tape of found strings, which follow each other without gaps, inside @c arena. */
-    ustore_char_t** strings;
-
-    /** Memory for @c strings: reused when it points to an arena, created when it points to @c NULL. */
-    ustore_arena_t* arena;
+    /** Most strings every scan returns. */
+    ustore_size_t wanted;
 
     /** In what order the strings come. */
     ustore_scan_mode_t mode;
@@ -317,8 +228,106 @@ typedef struct ustore_strings_scan_t {
  */
 USTORE_EXPORT void ustore_strings_scan(ustore_strings_scan_t* arguments);
 
-#pragma endregion Scans
+/**
+ *  @brief An opaque handle to a walk over the strings of one prefix, which every pull resumes past the last string
+ *      the pull before it handed out.
+ *
+ *  It keeps a copy of its prefix and of the string its next pull starts at, and holds its database open, and the
+ *  transaction or snapshot it reads through, until @c ustore_strings_cursor_free, as @c ustore_blobs_cursor_t does. A
+ *  cursor serves one pull at a time, so a second pull naming it finishes @c ustore_status_contended_k.
+ */
+typedef struct ustore_strings_cursor_handle_t* ustore_strings_cursor_t;
+
+/** The arguments of @c ustore_strings_cursor_init. */
+typedef struct ustore_strings_cursor_init_t {
+
+    /** Output for the new cursor, which the caller frees with @c ustore_strings_cursor_free; @c NULL on failure. */
+    ustore_strings_cursor_t* cursor;
+
+    /** An open database. */
+    ustore_database_t database;
+
+    /** Output for the outcome, final on return. */
+    ustore_outcome_t* outcome;
+
+    /** What the walk sees, where @c NULL is the head, read pull by pull. */
+    ustore_view_t view;
+
+    /** Strings collection to walk. */
+    ustore_collection_id_t collection;
+
+    /** Prefix every string the walk returns starts with, copied, where a zeroed view matches every string. */
+    ustore_bytes_view_t prefix;
+
+    /** Smallest string the walk returns, copied, where a zeroed view starts at the first string of the prefix. */
+    ustore_bytes_view_t start_string;
+
+} ustore_strings_cursor_init_t;
+
+/**
+ *  @brief Opens a walk over the strings of one prefix, reading nothing until its first pull.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ */
+USTORE_EXPORT void ustore_strings_cursor_init(ustore_strings_cursor_init_t* arguments);
+
+/** The arguments of @c ustore_strings_cursor_next, which pulls the next page of a walk, with the values of its strings
+ *  when asked, in one call. */
+typedef struct ustore_strings_cursor_next_t {
+
+    /** The database the cursor was opened on. */
+    ustore_database_t database;
+
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call returns final, the default, or once submitted. */
+    ustore_completion_t completion;
+
+    /** The cursor to advance, which a pull that fails or is cancelled leaves where it was. */
+    ustore_strings_cursor_t cursor;
+
+    /** Output for the strings of the page in the order of their text, as a tape inside @c arena. */
+    ustore_strings_view_t* strings;
+
+    /** Optional output for their values as a tape inside @c arena, where a string removed at the head between the
+     *  listing and the read of one pull reads as an empty value; @c NULL skips them. */
+    ustore_strings_view_t* values;
+
+    /** Output for the strings written, zero once the walk is exhausted; zeroed on failure. */
+    ustore_size_t* written;
+
+    /** Rewound by this call, then holding every output it writes; @c NULL is refused. */
+    ustore_arena_t arena;
+
+    /** Most strings the page holds, where a page of fewer exhausts the walk. */
+    ustore_size_t wanted;
+
+    /** Optional callback reporting the one pull, which may cancel it before the cursor advances. */
+    ustore_progress_callback_t progress;
+
+    /** Opaque pointer passed to @c progress. */
+    void* progress_state;
+
+} ustore_strings_cursor_next_t;
+
+/**
+ *  @brief Pulls the next page of a walk, and the values of its strings when asked.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ */
+USTORE_EXPORT void ustore_strings_cursor_next(ustore_strings_cursor_next_t* arguments);
+
+/**
+ *  @brief Waits until every deferred call naming the cursor finishes, then frees it, giving back the holds it kept on
+ *      its database and on the transaction or snapshot it reads through.
+ *  @param[inout] cursor The cursor to be freed; @c NULL is safe.
+ */
+USTORE_EXPORT void ustore_strings_cursor_free(ustore_strings_cursor_t cursor);
 
 #ifdef __cplusplus
 }
 #endif
+
+#endif // UNUM_USTORE_STRINGS_H

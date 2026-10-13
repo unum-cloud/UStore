@@ -1,5 +1,5 @@
 /**
- *  @file c/graph.cpp
+ *  @file src/graph.cpp
  *  @author Ash Vardanian
  *  @date January 11, 2023
  *  @brief The graph modality over the reads and writes of any engine, storing every vertex as one value of its
@@ -32,17 +32,15 @@
 #include <optional>   // `std::optional`
 #include <span>       // `std::span`
 
-#include "ustore/ranges_args.hpp" // `find_edges_t`, `strided_range`, `collection_key_t`, `arena_t`
+#include "ustore/ranges.hpp" // `strided_span`, `values_view_t`, `collection_key_t`
 
-#include "engine.hpp"                // `engine_of`, `view_t`, `graph_find_edges_in_vertex_values`
-#include "helpers/algorithm.hpp"     // `offset_in_sorted`
-#include "helpers/linked_memory.hpp" // `arena_allocate`
-
-ustore_key_t const ustore_default_edge_id_k = {
-    {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}}};
-ustore_vertex_degree_t const ustore_vertex_degree_missing_k = std::numeric_limits<ustore_vertex_degree_t>::max();
+#include "engine.hpp"                // `engine_of`, `view_t`, `graph_read_edges_in_vertex_values`
+#include "utilities/algorithm.hpp"   // `offset_in_sorted`, `trivial_insert`, `trivial_erase`
+#include "utilities/batches.hpp"     // `edges_batch_t`, `strings_arg_t`
+#include "utilities/ram_buffers.hpp" // `arena_allocate`
 
 namespace unum::ustore {
+using namespace unum::ustore::utilities;
 
 constexpr std::size_t bytes_in_degrees_header_k = 2 * sizeof(ustore_vertex_degree_t);
 
@@ -56,10 +54,10 @@ enum class neighborhood_update_t { upsert_k, erase_k };
 struct updated_entry_t : public collection_key_t {
 
     /** Bytes of the vertex value, degrees first. */
-    ustore_bytes_ptr_t content = nullptr;
+    ustore_byte_t* content = nullptr;
 
-    /** Length of the value, or @c ustore_length_missing_k for a missing vertex. */
-    ustore_length_t length = ustore_length_missing_k;
+    /** Length of the value, or @c missing_length_k for a missing vertex. */
+    ustore_length_t length = missing_length_k;
 
     /** Neighborships the update adds or removes. */
     ustore_vertex_degree_t degree_delta = 0;
@@ -78,14 +76,14 @@ constexpr std::size_t ids_per_neighborship(edge_export_t export_kind) noexcept {
 }
 
 /** Reads the degree at @p index of the header of @p value, which starts wherever its blob does. */
-ustore_vertex_degree_t degree_of(ustore_bytes_cptr_t value, std::size_t index) noexcept {
+ustore_vertex_degree_t degree_of(ustore_byte_t const* value, std::size_t index) noexcept {
     ustore_vertex_degree_t degree;
     std::memcpy(&degree, value + index * sizeof(ustore_vertex_degree_t), sizeof(ustore_vertex_degree_t));
     return degree;
 }
 
 /** Writes @p degree at @p index of the header of @p value. */
-void set_degree(ustore_bytes_ptr_t value, std::size_t index, ustore_vertex_degree_t degree) noexcept {
+void set_degree(ustore_byte_t* value, std::size_t index, ustore_vertex_degree_t degree) noexcept {
     std::memcpy(value + index * sizeof(ustore_vertex_degree_t), &degree, sizeof(ustore_vertex_degree_t));
 }
 
@@ -93,7 +91,7 @@ void set_degree(ustore_bytes_ptr_t value, std::size_t index, ustore_vertex_degre
  *  alignment of its own. */
 class neighborship_iterator_t {
 
-    ustore_bytes_cptr_t bytes_ {nullptr};
+    ustore_byte_t const* bytes_ {nullptr};
 
   public:
     using value_type = neighborship_t;
@@ -102,10 +100,10 @@ class neighborship_iterator_t {
     using iterator_category = std::input_iterator_tag;
 
     neighborship_iterator_t() = default;
-    explicit neighborship_iterator_t(ustore_bytes_cptr_t bytes) noexcept : bytes_(bytes) {}
+    explicit neighborship_iterator_t(ustore_byte_t const* bytes) noexcept : bytes_(bytes) {}
 
     /** The bytes the iterator points at. */
-    ustore_bytes_cptr_t bytes() const noexcept { return bytes_; }
+    ustore_byte_t const* bytes() const noexcept { return bytes_; }
 
     neighborship_t operator*() const noexcept {
         neighborship_t neighborship;
@@ -165,13 +163,13 @@ class neighborships_view_t {
 
   public:
     neighborships_view_t() = default;
-    neighborships_view_t(ustore_bytes_cptr_t bytes, std::size_t count) noexcept : begin_(bytes), count_(count) {}
+    neighborships_view_t(ustore_byte_t const* bytes, std::size_t count) noexcept : begin_(bytes), count_(count) {}
 
     neighborship_iterator_t begin() const noexcept { return begin_; }
     neighborship_iterator_t end() const noexcept { return begin_ + static_cast<std::ptrdiff_t>(count_); }
 
     /** The first byte of the run, from which an offset inside the value is measured. */
-    ustore_bytes_cptr_t bytes() const noexcept { return begin_.bytes(); }
+    ustore_byte_t const* bytes() const noexcept { return begin_.bytes(); }
 
     std::size_t size() const noexcept { return count_; }
     bool empty() const noexcept { return count_ == 0; }
@@ -181,13 +179,13 @@ class neighborships_view_t {
 neighborships_view_t neighbors(value_view_t value, ustore_vertex_role_t role = ustore_vertex_role_any_k) noexcept {
     if (value.size() < bytes_in_degrees_header_k) return {};
 
-    auto const header = reinterpret_cast<ustore_bytes_cptr_t>(value.begin());
-    ustore_bytes_cptr_t const first = header + bytes_in_degrees_header_k;
+    auto const header = reinterpret_cast<ustore_byte_t const*>(value.begin());
+    ustore_byte_t const* const first = header + bytes_in_degrees_header_k;
     std::size_t const outgoing = degree_of(header, 0);
     std::size_t const incoming = degree_of(header, 1);
     switch (role) {
-    case ustore_vertex_source_k: return {first, outgoing};
-    case ustore_vertex_target_k: return {first + outgoing * sizeof(neighborship_t), incoming};
+    case ustore_vertex_role_source_k: return {first, outgoing};
+    case ustore_vertex_role_target_k: return {first + outgoing * sizeof(neighborship_t), incoming};
     case ustore_vertex_role_any_k: return {first, outgoing + incoming};
     case ustore_vertex_role_unknown_k: return {};
     }
@@ -199,7 +197,7 @@ bool is_vertex_value(value_view_t value) noexcept {
     if (value.empty()) return true;
     if (value.size() < bytes_in_degrees_header_k) return false;
 
-    auto const header = reinterpret_cast<ustore_bytes_cptr_t>(value.begin());
+    auto const header = reinterpret_cast<ustore_byte_t const*>(value.begin());
     std::size_t const neighborships_count = std::size_t {degree_of(header, 0)} + degree_of(header, 1);
     return value.size() - bytes_in_degrees_header_k == neighborships_count * sizeof(neighborship_t);
 }
@@ -219,13 +217,13 @@ void insert_into_entry( //
     updated_entry_t& entry, ustore_vertex_role_t role, ustore_key_t neighbor_id, ustore_key_t edge_id) noexcept {
 
     neighborship_t const neighborship {neighbor_id, edge_id};
-    auto const inserted = reinterpret_cast<ustore_bytes_cptr_t>(&neighborship);
-    ustore_bytes_ptr_t const header = entry.content;
-    ustore_bytes_ptr_t const neighborships = header + bytes_in_degrees_header_k;
+    auto const inserted = reinterpret_cast<ustore_byte_t const*>(&neighborship);
+    ustore_byte_t* const header = entry.content;
+    ustore_byte_t* const neighborships = header + bytes_in_degrees_header_k;
 
-    if (entry.length < bytes_in_degrees_header_k || entry.length == ustore_length_missing_k) {
-        set_degree(header, role != ustore_vertex_target_k, 0);
-        set_degree(header, role == ustore_vertex_target_k, 1);
+    if (entry.length < bytes_in_degrees_header_k || entry.length == missing_length_k) {
+        set_degree(header, role != ustore_vertex_role_target_k, 0);
+        set_degree(header, role == ustore_vertex_role_target_k, 1);
         std::memcpy(neighborships, inserted, sizeof(neighborship_t));
         entry.length += bytes_in_degrees_header_k;
         entry.length += sizeof(neighborship_t);
@@ -236,7 +234,7 @@ void insert_into_entry( //
     auto const position = std::ranges::lower_bound(existing, neighborship);
     if (position != existing.end() && *position == neighborship) return;
 
-    std::size_t const role_index = role == ustore_vertex_target_k;
+    std::size_t const role_index = role == ustore_vertex_role_target_k;
     std::size_t const stored = std::size_t {degree_of(header, 0)} + degree_of(header, 1);
     auto const offset = static_cast<std::size_t>(existing.bytes() - neighborships +
                                                  (position - existing.begin()) * sizeof(neighborship_t));
@@ -250,17 +248,17 @@ void erase_from_entry( //
     updated_entry_t& entry, ustore_vertex_role_t role, ustore_key_t neighbor_id,
     std::optional<ustore_key_t> edge_id = {}) noexcept {
 
-    if (entry.length < bytes_in_degrees_header_k || entry.length == ustore_length_missing_k) return;
+    if (entry.length < bytes_in_degrees_header_k || entry.length == missing_length_k) return;
 
-    ustore_bytes_ptr_t const header = entry.content;
-    ustore_bytes_ptr_t const neighborships = header + bytes_in_degrees_header_k;
+    ustore_byte_t* const header = entry.content;
+    ustore_byte_t* const neighborships = header + bytes_in_degrees_header_k;
     neighborships_view_t const existing = neighbors(entry, role);
     auto const matches = edge_id ? std::ranges::equal_range(existing, neighborship_t {neighbor_id, *edge_id})
                                  : std::ranges::equal_range(existing, neighbor_id, std::ranges::less {},
                                                             &neighborship_t::neighbor_id);
     if (matches.empty()) return;
 
-    std::size_t const role_index = role == ustore_vertex_target_k;
+    std::size_t const role_index = role == ustore_vertex_role_target_k;
     std::size_t const stored = std::size_t {degree_of(header, 0)} + degree_of(header, 1);
     auto const offset = static_cast<std::size_t>(existing.bytes() - neighborships +
                                                  (matches.begin() - existing.begin()) * sizeof(neighborship_t));
@@ -271,68 +269,36 @@ void erase_from_entry( //
     entry.length -= static_cast<ustore_length_t>(sizeof(neighborship_t) * count);
 }
 
-/** Vertex values found by one read, indexed by task. */
-struct found_values_t {
-
-    /** Bits marking the vertices found, which tell a missing vertex apart from a bare one. */
-    ustore_octet_t* presences = nullptr;
-
-    /** One offset into @c contents per vertex, and one more closing the last. */
-    ustore_length_t* offsets = nullptr;
-
-    /** Joined values of the vertices. */
-    ustore_byte_t* contents = nullptr;
-
-    value_view_t operator[](std::size_t index) const noexcept {
-        if (!bits_view_t {presences}[index]) return value_view_t {};
-        return value_view_t {contents + offsets[index], offsets[index + 1] - offsets[index]};
-    }
-};
-
-/** Reads the values of @p count vertices through @p view with the engine's own read, which appends to @p arena rather
- *  than rewinding it. */
-expected<found_values_t> read_vertices(ustore_database_t database, std::size_t count,
-                                       strided_iterator<ustore_collection_id_t const> collections,
-                                       strided_iterator<ustore_key_t const> vertices, ustore_arena_t* arena,
-                                       view_t const& view) noexcept {
-    auto [presences, presences_status] = arena_allocate<ustore_octet_t>(arena, divide_round_up(count, bits_in_byte_k));
-    if (presences_status.failed()) return presences_status;
-    auto [offsets, offsets_status] = arena_allocate<ustore_length_t>(arena, count + 1);
-    if (offsets_status.failed()) return offsets_status;
-
-    found_values_t found {presences.data(), offsets.data(), nullptr};
-    ustore_read_t read {};
+/** Reads the values of @p count vertices through @p view with the engine's own read, which appends to the scratch of
+ *  @p view rather than rewinding it, and whose presences tell a missing vertex apart from a bare one. */
+expected<values_view_t> read_vertices(ustore_database_t database, std::size_t count,
+                                      ustore_collections_view_t collections, ustore_keys_view_t vertices,
+                                      view_t const& view) noexcept {
+    ustore_octet_t const* presences = nullptr;
+    ustore_strings_view_t contents {};
+    ustore_blobs_read_t read {};
     read.database = database;
     read.count = count;
-    read.collections = collections.get();
-    read.collections_stride = collections.stride();
-    read.keys = vertices.get();
-    read.keys_stride = vertices.stride();
-    read.presences = found.presences;
-    read.offsets = found.offsets;
-    read.values = &found.contents;
-    read.arena = arena;
-    if (status_t const status = engine_of(database).read(read, view); status.failed()) return status;
-    return found;
+    read.collections = collections;
+    read.keys = vertices;
+    read.presences = &presences;
+    read.values = &contents;
+    read.arena = view.scratch;
+    if (status_t const status = engine_of(database).blobs_read(read, view); status.failed()) return status;
+    return values_view_t {count, presences, contents};
 }
 
-/** Reads the vertices and exports their degrees, and their neighbors or edges when @p export_kind_ asks for them. */
+/** Reads the vertices and exports their degrees, the offsets of their edges when asked for, and their neighbors or
+ *  edges when @p export_kind_ asks for them, into @p arena alone. */
 template <edge_export_t export_kind_>
 status_t export_edge_tuples( //
-    ustore_database_t const database, ustore_size_t const vertices_count, ustore_collection_id_t const* collections,
-    ustore_size_t const collections_stride, ustore_key_t const* vertices, ustore_size_t const vertices_stride,
-    ustore_vertex_role_t const* roles, ustore_size_t const roles_stride,
-    strided_iterator<ustore_vertex_degree_t> const degrees, ustore_key_t** neighborships_per_vertex,
-    ustore_arena_t* arena, view_t const& view) noexcept {
+    ustore_database_t const database, ustore_size_t const vertices_count, ustore_collections_view_t collections,
+    ustore_keys_view_t vertices, ustore_vertex_roles_view_t roles, ustore_vertex_degree_t const** degrees_per_vertex,
+    ustore_length_t const** edges_offsets, ustore_key_t const** neighborships_per_vertex, ustore_arena_t arena,
+    view_t const& view) noexcept {
 
-    find_edges_t const find_edges {
-        {collections, collections_stride},
-        {vertices, vertices_stride},
-        {roles, roles_stride},
-        vertices_count,
-    };
-    auto [values, values_status] = read_vertices(database, vertices_count, find_edges.collections_begin,
-                                                 find_edges.vertex_id_begin, arena, view);
+    edges_batch_t const read_edges {strided(collections), strided(vertices), strided(roles), vertices_count};
+    auto [values, values_status] = read_vertices(database, vertices_count, collections, vertices, view);
     if (values_status.failed()) return values_status;
     constexpr std::size_t ids_per_neighborship_k = ids_per_neighborship(export_kind_);
 
@@ -340,18 +306,23 @@ status_t export_edge_tuples( //
     for (std::size_t index = 0; index != vertices_count; ++index) {
         if (!is_vertex_value(values[index]))
             return {status_code_t::malformed_k, "A vertex holds a value that is not a graph vertex"};
-        ids_count += neighbors(values[index], find_edges[index].role).size();
+        ids_count += neighbors(values[index], read_edges[index].role).size();
     }
     ids_count *= ids_per_neighborship_k;
 
+    auto [degrees, degrees_status] = arena_allocate<ustore_vertex_degree_t>(arena, vertices_count);
+    if (degrees_status.failed()) return degrees_status;
+    auto [offsets, offsets_status] = arena_allocate<ustore_length_t>(arena, edges_offsets ? vertices_count + 1 : 0);
+    if (offsets_status.failed()) return offsets_status;
     auto [ids, ids_status] = arena_allocate<ustore_key_t>(arena, ids_count);
     if (ids_status.failed()) return ids_status;
-    if (neighborships_per_vertex) *neighborships_per_vertex = ids.data();
 
     std::size_t exported_ids = 0;
+    std::size_t exported_edges = 0;
     for (std::size_t index = 0; index != vertices_count; ++index) {
         value_view_t const value = values[index];
-        find_edge_t const find_edge = find_edges[index];
+        edges_task_t const read_edge = read_edges[index];
+        if (edges_offsets) offsets[index] = static_cast<ustore_length_t>(exported_edges);
 
         if (!value) {
             degrees[index] = ustore_vertex_degree_missing_k;
@@ -359,11 +330,11 @@ status_t export_edge_tuples( //
         }
 
         ustore_vertex_degree_t degree = 0;
-        if (find_edge.role & ustore_vertex_source_k) {
-            neighborships_view_t const outgoing = neighbors(value, ustore_vertex_source_k);
+        if (read_edge.role & ustore_vertex_role_source_k) {
+            neighborships_view_t const outgoing = neighbors(value, ustore_vertex_role_source_k);
             if constexpr (export_kind_ == edge_export_t::edges_k) {
                 for (neighborship_t const neighborship : outgoing) {
-                    ids[exported_ids] = find_edge.vertex_id;
+                    ids[exported_ids] = read_edge.vertex_id;
                     ids[exported_ids + 1] = neighborship.neighbor_id;
                     ids[exported_ids + 2] = neighborship.edge_id;
                     exported_ids += ids_per_neighborship_k;
@@ -374,12 +345,12 @@ status_t export_edge_tuples( //
             }
             degree += static_cast<ustore_vertex_degree_t>(outgoing.size());
         }
-        if (find_edge.role & ustore_vertex_target_k) {
-            neighborships_view_t const incoming = neighbors(value, ustore_vertex_target_k);
+        if (read_edge.role & ustore_vertex_role_target_k) {
+            neighborships_view_t const incoming = neighbors(value, ustore_vertex_role_target_k);
             if constexpr (export_kind_ == edge_export_t::edges_k) {
                 for (neighborship_t const neighborship : incoming) {
                     ids[exported_ids] = neighborship.neighbor_id;
-                    ids[exported_ids + 1] = find_edge.vertex_id;
+                    ids[exported_ids + 1] = read_edge.vertex_id;
                     ids[exported_ids + 2] = neighborship.edge_id;
                     exported_ids += ids_per_neighborship_k;
                 }
@@ -390,14 +361,18 @@ status_t export_edge_tuples( //
             degree += static_cast<ustore_vertex_degree_t>(incoming.size());
         }
         degrees[index] = degree;
+        exported_edges += degree;
     }
+    if (edges_offsets) offsets[vertices_count] = static_cast<ustore_length_t>(exported_edges);
+    *degrees_per_vertex = degrees.data();
+    if (edges_offsets) *edges_offsets = offsets.data();
+    if (neighborships_per_vertex) *neighborships_per_vertex = ids.data();
     return {};
 }
 
-/** Reads the current values of @p unique_entries and points every entry at its own bytes. */
+/** Reads the values of @p unique_entries into the scratch of @p view and points every entry at its own bytes. */
 status_t pull_and_link_for_updates( //
-    ustore_database_t const database, strided_range<updated_entry_t> unique_entries, ustore_arena_t* arena,
-    view_t const& view) noexcept {
+    ustore_database_t const database, strided_span<updated_entry_t> unique_entries, view_t const& view) noexcept {
 
     std::size_t const unique_count = unique_entries.size();
     auto const collections = unique_entries.immutable().members(&updated_entry_t::collection);
@@ -406,15 +381,18 @@ status_t pull_and_link_for_updates( //
     // A transaction watches the vertices it rewrites, whatever the caller asked of the writes
     view_t watching = view;
     watching.watch = ustore_watch_keys_k;
-    auto [found, status] = read_vertices(database, unique_count, collections.begin(), keys.begin(), arena, watching);
+    auto [found, status] = read_vertices(database, unique_count, {collections.data(), collections.stride()},
+                                         {keys.data(), keys.stride()}, watching);
     if (status.failed()) return status;
 
+    // The values lie in the scratch of this call, so the updates rewrite them in place
     for (std::size_t index = 0; index != unique_count; ++index) {
         value_view_t const value = found[index];
         if (!is_vertex_value(value))
             return {status_code_t::malformed_k, "A vertex holds a value that is not a graph vertex"};
-        unique_entries[index].content = ustore_bytes_ptr_t(value.data());
-        unique_entries[index].length = value ? static_cast<ustore_length_t>(value.size()) : ustore_length_missing_k;
+        unique_entries[index].content = const_cast<ustore_byte_t*>(
+            reinterpret_cast<ustore_byte_t const*>(value.data()));
+        unique_entries[index].length = value ? static_cast<ustore_length_t>(value.size()) : missing_length_k;
     }
     return {};
 }
@@ -423,44 +401,40 @@ status_t pull_and_link_for_updates( //
 status_t write_entries(ustore_database_t const database, std::span<updated_entry_t const> entries,
                        ustore_durability_t const durability, view_t const& view) noexcept {
     if (entries.empty()) return {};
-    strided_range<updated_entry_t const> const written = strided(entries);
-    strided_range<ustore_collection_id_t const> const collections = written.members(&updated_entry_t::collection);
-    strided_range<ustore_key_t const> const keys = written.members(&updated_entry_t::key);
-    strided_range<ustore_length_t const> const lengths = written.members(&updated_entry_t::length);
-    strided_range<ustore_bytes_ptr_t const> const contents = written.members(&updated_entry_t::content);
+    strided_span<updated_entry_t const> const written = strided(entries);
+    strided_span<ustore_collection_id_t const> const collections = written.members(&updated_entry_t::collection);
+    strided_span<ustore_key_t const> const keys = written.members(&updated_entry_t::key);
 
-    ustore_write_t write {};
+    // The views of the values are gathered here, as the router gathers what an accessor writes
+    auto [values, values_status] = arena_allocate<ustore_bytes_view_t>(view.scratch, entries.size());
+    if (values_status.failed()) return values_status;
+    for (std::size_t index = 0; index != entries.size(); ++index)
+        values[index] = {entries[index].content, entries[index].length};
+
+    ustore_blobs_write_t write {};
     write.database = database;
     write.count = entries.size();
-    write.collections = collections.begin().get();
-    write.collections_stride = collections.stride();
-    write.keys = keys.begin().get();
-    write.keys_stride = keys.stride();
-    write.lengths = lengths.begin().get();
-    write.lengths_stride = lengths.stride();
-    write.values = contents.begin().get();
-    write.values_stride = contents.stride();
+    write.collections = {collections.data(), collections.stride()};
+    write.keys = {keys.data(), keys.stride()};
     write.durability = durability;
-    return engine_of(database).write(write, view);
+    return engine_of(database).blobs_write(write, strings_arg_t::from_views(values.data()), view);
 }
 
 /** Inserts or erases edges in the neighborships of both their ends, and writes every touched vertex back. */
 template <neighborhood_update_t update_, typename arguments_type_>
 status_t update_neighborhoods(arguments_type_ const& arguments, view_t const& view) noexcept {
     if (!arguments.count) return {};
-    if (!arguments.sources || !arguments.targets)
+    if (!arguments.sources.data || !arguments.targets.data)
         return {status_code_t::invalid_argument_k, "Need the sources and the targets of the edges"};
 
-    // An edit carries no arena, so the vertex values it rewrites live in scratch freed once it returns
-    arena_t scratch;
+    ustore_arena_t const scratch = view.scratch;
     std::size_t const edges_count = arguments.count;
     strided_iterator<ustore_collection_id_t const> const edge_collections =
-        arguments.collections
-            ? strided_iterator<ustore_collection_id_t const> {arguments.collections, arguments.collections_stride}
-            : strided_iterator<ustore_collection_id_t const> {&ustore_collection_main_k, 0};
-    strided_iterator<ustore_key_t const> const edges {arguments.edges, arguments.edges_stride};
-    strided_iterator<ustore_key_t const> const sources {arguments.sources, arguments.sources_stride};
-    strided_iterator<ustore_key_t const> const targets {arguments.targets, arguments.targets_stride};
+        arguments.collections.data ? strided(arguments.collections)
+                                   : strided_iterator<ustore_collection_id_t const> {&ustore_collection_main_k, 0};
+    strided_iterator<ustore_key_t const> const edges = strided(arguments.edges);
+    strided_iterator<ustore_key_t const> const sources = strided(arguments.sources);
+    strided_iterator<ustore_key_t const> const targets = strided(arguments.targets);
 
     // Both ends of every edge, deduplicated, so each touched vertex is read and written once
     auto [unique_entries, entries_status] = arena_allocate<updated_entry_t>(scratch, edges_count * 2);
@@ -476,7 +450,7 @@ status_t update_neighborhoods(arguments_type_ const& arguments, view_t const& vi
     std::size_t const unique_count = sort_and_deduplicate(unique_entries.begin(), unique_entries.end());
     unique_entries = unique_entries.first(unique_count);
 
-    if (status_t const status = pull_and_link_for_updates(arguments.database, strided(unique_entries), scratch, view);
+    if (status_t const status = pull_and_link_for_updates(arguments.database, strided(unique_entries), view);
         status.failed())
         return status;
 
@@ -490,8 +464,8 @@ status_t update_neighborhoods(arguments_type_ const& arguments, view_t const& vi
                                                                collection_key_t {collection, source_id});
             std::size_t const target_offset = offset_in_sorted(unique_entries,
                                                                collection_key_t {collection, target_id});
-            update_entry(unique_entries[source_offset], ustore_vertex_source_k, target_id, edge_id);
-            update_entry(unique_entries[target_offset], ustore_vertex_target_k, source_id, edge_id);
+            update_entry(unique_entries[source_offset], ustore_vertex_role_source_k, target_id, edge_id);
+            update_entry(unique_entries[target_offset], ustore_vertex_role_target_k, source_id, edge_id);
         }
     };
 
@@ -501,7 +475,7 @@ status_t update_neighborhoods(arguments_type_ const& arguments, view_t const& vi
         for_each_task(&count_inserts_into_entry);
         for (std::size_t index = 0; index != unique_count; ++index) {
             updated_entry_t& entry = unique_entries[index];
-            std::size_t const bytes_present = entry.length != ustore_length_missing_k ? entry.length : 0;
+            std::size_t const bytes_present = entry.length != missing_length_k ? entry.length : 0;
             std::size_t const bytes_for_relations = entry.degree_delta * sizeof(neighborship_t);
             std::size_t const bytes_for_degrees = bytes_present > bytes_in_degrees_header_k ? 0
                                                                                             : bytes_in_degrees_header_k;
@@ -509,7 +483,7 @@ status_t update_neighborhoods(arguments_type_ const& arguments, view_t const& vi
                                                            bytes_present + bytes_for_relations + bytes_for_degrees);
             if (status.failed()) return status;
             if (bytes_present) std::memcpy(buffer.data(), entry.content, bytes_present);
-            entry.content = reinterpret_cast<ustore_bytes_ptr_t>(buffer.data());
+            entry.content = reinterpret_cast<ustore_byte_t*>(buffer.data());
             entry.length = static_cast<ustore_length_t>(bytes_present);
         }
         for_each_task(&insert_into_entry);
@@ -526,44 +500,34 @@ status_t update_neighborhoods(arguments_type_ const& arguments, view_t const& vi
 status_t remove_entries(ustore_database_t const database, std::span<updated_entry_t const> entries,
                         ustore_durability_t const durability, view_t const& view) noexcept {
     if (entries.empty()) return {};
-    strided_range<updated_entry_t const> const removed = strided(entries);
-    strided_range<ustore_collection_id_t const> const collections = removed.members(&updated_entry_t::collection);
-    strided_range<ustore_key_t const> const keys = removed.members(&updated_entry_t::key);
+    strided_span<updated_entry_t const> const removed = strided(entries);
+    strided_span<ustore_collection_id_t const> const collections = removed.members(&updated_entry_t::collection);
+    strided_span<ustore_key_t const> const keys = removed.members(&updated_entry_t::key);
 
-    ustore_remove_t remove {};
+    ustore_blobs_remove_t remove {};
     remove.database = database;
     remove.count = entries.size();
-    remove.collections = collections.begin().get();
-    remove.collections_stride = collections.stride();
-    remove.keys = keys.begin().get();
-    remove.keys_stride = keys.stride();
+    remove.collections = {collections.data(), collections.stride()};
+    remove.keys = {keys.data(), keys.stride()};
     remove.durability = durability;
-    return engine_of(database).remove(remove, view);
+    return engine_of(database).blobs_remove(remove, view);
 }
 
-status_t graph_find_edges_in_vertex_values(ustore_graph_find_edges_t const& arguments, view_t const& view) noexcept {
+status_t graph_read_edges_in_vertex_values(ustore_graph_read_edges_t const& arguments, view_t const& view) noexcept {
     if (!arguments.count) return {};
     if (!arguments.degrees_per_vertex) return {status_code_t::invalid_argument_k, "Need an output for the degrees"};
-    if (arguments.edges_per_vertex && !arguments.arena)
-        return {status_code_t::invalid_argument_k, "The edges need an arena to land in"};
-
-    // A call asking only for degrees may carry no arena, so the vertex values it reads live in scratch freed on return
-    arena_t scratch;
-    ustore_arena_t* const arena = arguments.arena ? arguments.arena : scratch;
-    strided_iterator<ustore_vertex_degree_t> const degrees {arguments.degrees_per_vertex,
-                                                            arguments.degrees_per_vertex_stride};
+    if (arguments.edges_per_vertex && !arguments.edges_offsets)
+        return {status_code_t::invalid_argument_k, "Need an output for the offsets of the edges"};
     if (arguments.edges_per_vertex)
         return export_edge_tuples<edge_export_t::edges_k>( //
-            arguments.database, arguments.count, arguments.collections, arguments.collections_stride,
-            arguments.vertices, arguments.vertices_stride, arguments.roles, arguments.roles_stride, degrees,
-            arguments.edges_per_vertex, arena, view);
+            arguments.database, arguments.count, arguments.collections, arguments.vertices, arguments.roles,
+            arguments.degrees_per_vertex, arguments.edges_offsets, arguments.edges_per_vertex, arguments.arena, view);
     return export_edge_tuples<edge_export_t::degrees_k>( //
-        arguments.database, arguments.count, arguments.collections, arguments.collections_stride, arguments.vertices,
-        arguments.vertices_stride, arguments.roles, arguments.roles_stride, degrees, nullptr, arena, view);
+        arguments.database, arguments.count, arguments.collections, arguments.vertices, arguments.roles,
+        arguments.degrees_per_vertex, arguments.edges_offsets, nullptr, arguments.arena, view);
 }
 
-status_t graph_upsert_edges_in_vertex_values(ustore_graph_upsert_edges_t const& arguments,
-                                             view_t const& view) noexcept {
+status_t graph_write_edges_in_vertex_values(ustore_graph_write_edges_t const& arguments, view_t const& view) noexcept {
     return update_neighborhoods<neighborhood_update_t::upsert_k>(arguments, view);
 }
 
@@ -572,34 +536,27 @@ status_t graph_remove_edges_in_vertex_values(ustore_graph_remove_edges_t const& 
     return update_neighborhoods<neighborhood_update_t::erase_k>(arguments, view);
 }
 
-status_t graph_upsert_vertices_in_vertex_values(ustore_graph_upsert_vertices_t const& arguments,
-                                                view_t const& view) noexcept {
+status_t graph_write_vertices_in_vertex_values(ustore_graph_write_vertices_t const& arguments,
+                                               view_t const& view) noexcept {
     std::size_t const count = arguments.count;
     if (!count) return {};
 
-    // An edit carries no arena, so the presences it reads and the vertices it writes live in scratch freed on return
-    arena_t scratch;
-    auto [presences, presences_status] = arena_allocate<ustore_octet_t>(scratch,
-                                                                        divide_round_up(count, bits_in_byte_k));
-    if (presences_status.failed()) return presences_status;
-    auto [missing, missing_status] = arena_allocate<updated_entry_t>(scratch, count);
+    auto [missing, missing_status] = arena_allocate<updated_entry_t>(view.scratch, count);
     if (missing_status.failed()) return missing_status;
 
-    ustore_read_t read {};
+    ustore_octet_t const* presences = nullptr;
+    ustore_blobs_read_t read {};
     read.database = arguments.database;
     read.count = count;
     read.collections = arguments.collections;
-    read.collections_stride = arguments.collections_stride;
     read.keys = arguments.vertices;
-    read.keys_stride = arguments.vertices_stride;
-    read.presences = presences.data();
-    read.arena = scratch;
-    if (status_t const status = engine_of(arguments.database).read(read, view); status.failed()) return status;
+    read.presences = &presences;
+    read.arena = view.scratch;
+    if (status_t const status = engine_of(arguments.database).blobs_read(read, view); status.failed()) return status;
 
-    strided_iterator<ustore_collection_id_t const> const collections {arguments.collections,
-                                                                      arguments.collections_stride};
-    strided_iterator<ustore_key_t const> const vertices {arguments.vertices, arguments.vertices_stride};
-    bits_view_t const present {presences.data()};
+    strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
+    strided_iterator<ustore_key_t const> const vertices = strided(arguments.vertices);
+    bits_view_t const present {presences};
     std::size_t missing_count = 0;
     for (std::size_t index = 0; index != count; ++index) {
         if (present[index]) continue;
@@ -613,23 +570,19 @@ status_t graph_remove_vertices_in_vertex_values(ustore_graph_remove_vertices_t c
                                                 view_t const& view) noexcept {
     if (!arguments.count) return {};
 
-    // An edit carries no arena, so the vertex values it rewrites live in scratch freed once it returns
-    arena_t scratch;
+    ustore_arena_t const scratch = view.scratch;
     strided_iterator<ustore_collection_id_t const> const vertex_collections =
-        arguments.collections
-            ? strided_iterator<ustore_collection_id_t const> {arguments.collections, arguments.collections_stride}
-            : strided_iterator<ustore_collection_id_t const> {&ustore_collection_main_k, 0};
-    strided_iterator<ustore_key_t const> const vertices {arguments.vertices, arguments.vertices_stride};
-    strided_iterator<ustore_vertex_role_t const> const vertex_roles {arguments.roles, arguments.roles_stride};
+        arguments.collections.data ? strided(arguments.collections)
+                                   : strided_iterator<ustore_collection_id_t const> {&ustore_collection_main_k, 0};
+    strided_iterator<ustore_key_t const> const vertices = strided(arguments.vertices);
+    strided_iterator<ustore_vertex_role_t const> const vertex_roles = strided(arguments.roles);
 
     // Only the neighbors of every removed vertex are needed to find the references to erase
-    auto [degrees, degrees_status] = arena_allocate<ustore_vertex_degree_t>(scratch, arguments.count);
-    if (degrees_status.failed()) return degrees_status;
-    ustore_key_t* neighbors_per_vertex = nullptr;
+    ustore_vertex_degree_t const* degrees = nullptr;
+    ustore_key_t const* neighbors_per_vertex = nullptr;
     if (status_t const status = export_edge_tuples<edge_export_t::neighbors_k>( //
-            arguments.database, arguments.count, arguments.collections, arguments.collections_stride,
-            arguments.vertices, arguments.vertices_stride, arguments.roles, arguments.roles_stride,
-            {degrees.data(), sizeof(ustore_vertex_degree_t)}, &neighbors_per_vertex, scratch, view);
+            arguments.database, arguments.count, arguments.collections, arguments.vertices, arguments.roles, &degrees,
+            nullptr, &neighbors_per_vertex, scratch, view);
         status.failed())
         return status;
 
@@ -661,7 +614,7 @@ status_t graph_remove_vertices_in_vertex_values(ustore_graph_remove_vertices_t c
     unique_count = sort_and_deduplicate(unique_entries.data(), planned);
     unique_entries = unique_entries.first(unique_count);
 
-    if (status_t const status = pull_and_link_for_updates(arguments.database, strided(unique_entries), scratch, view);
+    if (status_t const status = pull_and_link_for_updates(arguments.database, strided(unique_entries), view);
         status.failed())
         return status;
 
@@ -677,22 +630,22 @@ status_t graph_remove_vertices_in_vertex_values(ustore_graph_remove_vertices_t c
             updated_entry_t& neighbor_entry = unique_entries[offset_in_sorted(
                 unique_entries, collection_key_t {collection, neighborship.neighbor_id})];
             if (vertex_role == ustore_vertex_role_any_k) {
-                erase_from_entry(neighbor_entry, ustore_vertex_source_k, vertex_id);
-                erase_from_entry(neighbor_entry, ustore_vertex_target_k, vertex_id);
+                erase_from_entry(neighbor_entry, ustore_vertex_role_source_k, vertex_id);
+                erase_from_entry(neighbor_entry, ustore_vertex_role_target_k, vertex_id);
             }
             else erase_from_entry(neighbor_entry, invert(vertex_role), vertex_id);
         }
 
         vertex_entry.content = nullptr;
-        vertex_entry.length = ustore_length_missing_k;
+        vertex_entry.length = missing_length_k;
     }
 
     // Rewritten neighbors lead, removed vertices follow, and the untouched rest is never written
     auto const removed_and_untouched = std::ranges::partition(unique_entries, [](updated_entry_t const& entry) {
-        return entry.length != ustore_length_missing_k && entry.degree_delta != 0;
+        return entry.length != missing_length_k && entry.degree_delta != 0;
     });
     auto const untouched = std::ranges::partition(
-        removed_and_untouched, [](updated_entry_t const& entry) { return entry.length == ustore_length_missing_k; });
+        removed_and_untouched, [](updated_entry_t const& entry) { return entry.length == missing_length_k; });
     std::size_t const rewritten_count = static_cast<std::size_t>(removed_and_untouched.begin() -
                                                                  unique_entries.begin());
     std::size_t const removed_count = static_cast<std::size_t>(untouched.begin() - removed_and_untouched.begin());

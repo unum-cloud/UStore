@@ -13,7 +13,8 @@
  *  hyperedges in one undirected graph and tells them apart by their metadata.
  */
 
-#pragma once
+#ifndef UNUM_USTORE_GRAPH_H
+#define UNUM_USTORE_GRAPH_H
 
 #include "ustore/db.h"
 
@@ -21,10 +22,9 @@
 extern "C" {
 #endif
 
-#pragma region Constants
-
 /** The edge identifier of an edge that was given none, every bit of it set like @c ustore_key_unknown_k. */
-extern ustore_key_t const ustore_edge_id_default_k;
+static ustore_key_t const ustore_edge_id_default_k = {
+    {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}}};
 
 /** The role a vertex plays in an edge, where undirected graphs use @c ustore_vertex_role_any_k.
  *  In a joining graph the members of each collection must stay either sources or targets. */
@@ -44,23 +44,37 @@ typedef enum ustore_vertex_role_t {
 
 } ustore_vertex_role_t;
 
+/** The canonical spelling of a role, as @c ustore_vertex_role_source_k spells "source", or "unrecognized". */
+USTORE_EXPORT char const* ustore_vertex_role_name(ustore_vertex_role_t vertex_role);
+
+/** Reads a role back from its canonical spelling; @c ustore_vertex_role_unknown_k when unrecognized. */
+USTORE_EXPORT ustore_vertex_role_t ustore_vertex_role_from_name(ustore_bytes_view_t name);
+
+/** A strided run of roles, one per task, where @c NULL data stands for @c ustore_vertex_role_any_k. */
+typedef struct ustore_vertex_roles_view_t {
+
+    /** First role of the run. */
+    ustore_vertex_role_t const* data;
+
+    /** Bytes between consecutive roles, where zero repeats the first one. */
+    ustore_size_t stride;
+
+} ustore_vertex_roles_view_t;
+
 /** The number of edges a vertex connects to. */
 typedef uint32_t ustore_vertex_degree_t;
 
 /** The degree reported for a missing vertex. */
-extern ustore_vertex_degree_t const ustore_vertex_degree_missing_k;
-
-#pragma endregion Constants
-
-#pragma region Edges
+static ustore_vertex_degree_t const ustore_vertex_degree_missing_k = 0xFFFFFFFFu;
 
 /**
  *  @brief The arguments of @c ustore_graph_read_edges, which exports the degree and the edges of every vertex.
  *
- *  Every edge takes three keys on the tape: the source, the target and the edge identifier. Edges of
- *  one vertex in one role come sorted by neighbor; with both roles the outgoing edges, sorted by
+ *  Every edge takes three keys on the tape: the source, the target and the edge identifier, and the
+ *  edges of vertex @c i span from edge @c edges_offsets[i] up to edge @c edges_offsets[i + 1]. Edges
+ *  of one vertex in one role come sorted by neighbor; with both roles the outgoing edges, sorted by
  *  target, precede the incoming ones, sorted by source. Whether a vertex exists is cheaper to ask
- *  from @c ustore_read on the same collection.
+ *  from @c ustore_blobs_read on the same collection.
  */
 typedef struct ustore_graph_read_edges_t {
 
@@ -82,35 +96,28 @@ typedef struct ustore_graph_read_edges_t {
     /** Number of vertices. */
     ustore_size_t count;
 
-    /** Graph collections, where @c NULL stands for the main collection. */
-    ustore_collection_id_t const* collections;
-
-    /** Bytes between consecutive collections, where zero repeats the first one. */
-    ustore_size_t collections_stride;
+    /** Graph collections, where @c NULL data stands for the main collection. */
+    ustore_collections_view_t collections;
 
     /** Vertices whose edges are read. */
-    ustore_key_t const* vertices;
-
-    /** Bytes between consecutive vertices, where zero repeats the first one. */
-    ustore_size_t vertices_stride;
+    ustore_keys_view_t vertices;
 
     /** Roles the vertices play in the wanted edges. */
-    ustore_vertex_role_t const* roles;
+    ustore_vertex_roles_view_t roles;
 
-    /** Bytes between consecutive roles, where zero repeats the first one. */
-    ustore_size_t roles_stride;
+    /** Output for the degree of every vertex, with @c ustore_vertex_degree_missing_k for missing ones, inside
+     *  @c arena. */
+    ustore_vertex_degree_t const** degrees_per_vertex;
 
-    /** Output for the degree of every vertex, with @c ustore_vertex_degree_missing_k for missing ones. */
-    ustore_vertex_degree_t* degrees_per_vertex;
-
-    /** Bytes between consecutive output degrees, never zero. */
-    ustore_size_t degrees_per_vertex_stride;
+    /** Optional output for @c count plus one offsets into @c edges_per_vertex, counted in edges, where a missing
+     *  vertex spans none, inside @c arena; required with @c edges_per_vertex. */
+    ustore_length_t const** edges_offsets;
 
     /** Optional output for the tape of edges, three keys per edge, inside @c arena. */
-    ustore_key_t** edges_per_vertex;
+    ustore_key_t const** edges_per_vertex;
 
-    /** Memory for @c edges_per_vertex: reused when it points to an arena, created when it points to @c NULL. */
-    ustore_arena_t* arena;
+    /** Rewound by this call, then holding every output it writes; @c NULL is refused. */
+    ustore_arena_t arena;
 
 } ustore_graph_read_edges_t;
 
@@ -141,29 +148,17 @@ typedef struct ustore_graph_write_edges_t {
     /** Number of edges. */
     ustore_size_t count;
 
-    /** Graph collections, where @c NULL stands for the main collection. */
-    ustore_collection_id_t const* collections;
+    /** Graph collections, where @c NULL data stands for the main collection. */
+    ustore_collections_view_t collections;
 
-    /** Bytes between consecutive collections, where zero repeats the first one. */
-    ustore_size_t collections_stride;
-
-    /** Identifiers of the edges. */
-    ustore_key_t const* edges;
-
-    /** Bytes between consecutive edge identifiers, where zero repeats the first one. */
-    ustore_size_t edges_stride;
+    /** Identifiers of the edges, where @c NULL data gives each @c ustore_edge_id_default_k. */
+    ustore_keys_view_t edges;
 
     /** Sources of the edges. */
-    ustore_key_t const* sources;
-
-    /** Bytes between consecutive sources, where zero repeats the first one. */
-    ustore_size_t sources_stride;
+    ustore_keys_view_t sources;
 
     /** Targets of the edges. */
-    ustore_key_t const* targets;
-
-    /** Bytes between consecutive targets, where zero repeats the first one. */
-    ustore_size_t targets_stride;
+    ustore_keys_view_t targets;
 
     /** How durable the edits are once the call finishes at the head; a transaction's commit decides its own. */
     ustore_durability_t durability;
@@ -200,29 +195,17 @@ typedef struct ustore_graph_remove_edges_t {
     /** Number of edges. */
     ustore_size_t count;
 
-    /** Graph collections, where @c NULL stands for the main collection. */
-    ustore_collection_id_t const* collections;
+    /** Graph collections, where @c NULL data stands for the main collection. */
+    ustore_collections_view_t collections;
 
-    /** Bytes between consecutive collections, where zero repeats the first one. */
-    ustore_size_t collections_stride;
-
-    /** Identifiers of the edges. */
-    ustore_key_t const* edges;
-
-    /** Bytes between consecutive edge identifiers, where zero repeats the first one. */
-    ustore_size_t edges_stride;
+    /** Identifiers of the edges, where @c NULL data gives each @c ustore_edge_id_default_k. */
+    ustore_keys_view_t edges;
 
     /** Sources of the edges. */
-    ustore_key_t const* sources;
-
-    /** Bytes between consecutive sources, where zero repeats the first one. */
-    ustore_size_t sources_stride;
+    ustore_keys_view_t sources;
 
     /** Targets of the edges. */
-    ustore_key_t const* targets;
-
-    /** Bytes between consecutive targets, where zero repeats the first one. */
-    ustore_size_t targets_stride;
+    ustore_keys_view_t targets;
 
     /** How durable the edits are once the call finishes at the head; a transaction's commit decides its own. */
     ustore_durability_t durability;
@@ -237,10 +220,6 @@ typedef struct ustore_graph_remove_edges_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
 USTORE_EXPORT void ustore_graph_remove_edges(ustore_graph_remove_edges_t* arguments);
-
-#pragma endregion Edges
-
-#pragma region Vertices
 
 /** The arguments of @c ustore_graph_write_vertices. */
 typedef struct ustore_graph_write_vertices_t {
@@ -263,17 +242,11 @@ typedef struct ustore_graph_write_vertices_t {
     /** Number of vertices. */
     ustore_size_t count;
 
-    /** Graph collections, where @c NULL stands for the main collection. */
-    ustore_collection_id_t const* collections;
-
-    /** Bytes between consecutive collections, where zero repeats the first one. */
-    ustore_size_t collections_stride;
+    /** Graph collections, where @c NULL data stands for the main collection. */
+    ustore_collections_view_t collections;
 
     /** Vertices to insert unless present. */
-    ustore_key_t const* vertices;
-
-    /** Bytes between consecutive vertices, where zero repeats the first one. */
-    ustore_size_t vertices_stride;
+    ustore_keys_view_t vertices;
 
     /** How durable the edits are once the call finishes at the head; a transaction's commit decides its own. */
     ustore_durability_t durability;
@@ -310,23 +283,14 @@ typedef struct ustore_graph_remove_vertices_t {
     /** Number of vertices. */
     ustore_size_t count;
 
-    /** Graph collections, where @c NULL stands for the main collection. */
-    ustore_collection_id_t const* collections;
-
-    /** Bytes between consecutive collections, where zero repeats the first one. */
-    ustore_size_t collections_stride;
+    /** Graph collections, where @c NULL data stands for the main collection. */
+    ustore_collections_view_t collections;
 
     /** Vertices to remove. */
-    ustore_key_t const* vertices;
-
-    /** Bytes between consecutive vertices, where zero repeats the first one. */
-    ustore_size_t vertices_stride;
+    ustore_keys_view_t vertices;
 
     /** Roles of the vertices, needed only by joining graphs. */
-    ustore_vertex_role_t const* roles;
-
-    /** Bytes between consecutive roles, where zero repeats the first one. */
-    ustore_size_t roles_stride;
+    ustore_vertex_roles_view_t roles;
 
     /** How durable the edits are once the call finishes at the head; a transaction's commit decides its own. */
     ustore_durability_t durability;
@@ -342,8 +306,8 @@ typedef struct ustore_graph_remove_vertices_t {
  */
 USTORE_EXPORT void ustore_graph_remove_vertices(ustore_graph_remove_vertices_t* arguments);
 
-#pragma endregion Vertices
-
 #ifdef __cplusplus
 }
 #endif
+
+#endif // UNUM_USTORE_GRAPH_H

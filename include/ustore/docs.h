@@ -8,12 +8,14 @@
  *  so reading a document back through the binary interface may not return the exact bytes written.
  *
  *  A field addresses a value inside a document: a top-level key such as "_id", or an RFC 6901 JSON
- *  Pointer starting with a slash, such as "/user/followers_count" or "/posts/0/text". Reads, writes
- *  and gists take one field per task, while a gather reads every field of every document into
- *  columns, converting each value into the requested type on a best-effort basis.
+ *  Pointer starting with a slash, such as "/user/followers_count" or "/posts/0/text", while an empty
+ *  field addresses the whole document, as the empty JSON Pointer does. Reads and writes take one field
+ *  per task, while a gather reads every field of every document into columns, converting each value
+ *  into the requested type on a best-effort basis.
  */
 
-#pragma once
+#ifndef UNUM_USTORE_DOCS_H
+#define UNUM_USTORE_DOCS_H
 
 #include "ustore/db.h"
 
@@ -21,37 +23,35 @@
 extern "C" {
 #endif
 
-#pragma region Types
-
 /**
  *  @brief Type of a document, or of a value extracted from one.
  *
- *  @c ustore_docs_field_json_k is JSON text, @c ustore_docs_field_str_k is a value printed as text, and
- *  @c ustore_docs_field_bin_k is the same text without a null terminator; the rest are fixed-width scalars.
+ *  @c ustore_docs_field_type_json_k is JSON text, @c ustore_docs_field_type_str_k is a value printed as text, and
+ *  @c ustore_docs_field_type_bin_k is the same text without a null terminator; the rest are fixed-width scalars.
  */
 typedef enum ustore_docs_field_type_t {
-    ustore_docs_field_json_k = 0,
+    ustore_docs_field_type_json_k = 0,
 
-    ustore_docs_field_null_k = 10,
-    ustore_docs_field_bool_k = 11,
-    ustore_docs_field_uuid_k = 12,
+    ustore_docs_field_type_null_k = 10,
+    ustore_docs_field_type_bool_k = 11,
+    ustore_docs_field_type_uuid_k = 12,
 
-    ustore_docs_field_f64_k = 42,
-    ustore_docs_field_f32_k = 41,
-    ustore_docs_field_f16_k = 40,
+    ustore_docs_field_type_f64_k = 42,
+    ustore_docs_field_type_f32_k = 41,
+    ustore_docs_field_type_f16_k = 40,
 
-    ustore_docs_field_i64_k = 23,
-    ustore_docs_field_i32_k = 22,
-    ustore_docs_field_i16_k = 21,
-    ustore_docs_field_i8_k = 20,
+    ustore_docs_field_type_i64_k = 23,
+    ustore_docs_field_type_i32_k = 22,
+    ustore_docs_field_type_i16_k = 21,
+    ustore_docs_field_type_i8_k = 20,
 
-    ustore_docs_field_u64_k = 33,
-    ustore_docs_field_u32_k = 32,
-    ustore_docs_field_u16_k = 31,
-    ustore_docs_field_u8_k = 30,
+    ustore_docs_field_type_u64_k = 33,
+    ustore_docs_field_type_u32_k = 32,
+    ustore_docs_field_type_u16_k = 31,
+    ustore_docs_field_type_u8_k = 30,
 
-    ustore_docs_field_bin_k = 50,
-    ustore_docs_field_str_k = 51,
+    ustore_docs_field_type_bin_k = 50,
+    ustore_docs_field_type_str_k = 51,
 } ustore_docs_field_type_t;
 
 /** Modification @c ustore_docs_write applies: an upsert, update or insert, an RFC 6902 patch, or an
@@ -64,16 +64,24 @@ typedef enum ustore_docs_modification_t {
     ustore_docs_modify_merge_k = 4,
 } ustore_docs_modification_t;
 
-#pragma endregion Types
+/** The canonical spelling of a field type, as @c ustore_docs_field_type_f64_k spells "f64", or "unrecognized". */
+USTORE_EXPORT char const* ustore_docs_field_type_name(ustore_docs_field_type_t field_type);
 
-#pragma region Primary Functions
+/** Reads a field type back from its canonical spelling; @c ustore_docs_field_type_json_k when unrecognized. */
+USTORE_EXPORT ustore_docs_field_type_t ustore_docs_field_type_from_name(ustore_bytes_view_t name);
+
+/** The canonical spelling of a modification, as @c ustore_docs_modify_merge_k spells "merge", or "unrecognized". */
+USTORE_EXPORT char const* ustore_docs_modification_name(ustore_docs_modification_t modification);
+
+/** Reads a modification back from its canonical spelling; @c ustore_docs_modify_upsert_k when unrecognized. */
+USTORE_EXPORT ustore_docs_modification_t ustore_docs_modification_from_name(ustore_bytes_view_t name);
 
 /**
  *  @brief The arguments of @c ustore_docs_write, which writes whole documents or fields inside them.
  *
  *  Without @c keys, the key of every document is read from its @c id_field, which must hold a non-negative
  *  integer, spelled as the key of that integer, or a UUID in canonical text. Whole documents are removed with
- *  @c ustore_remove, and fields inside them with a patch or a merge.
+ *  @c ustore_blobs_remove, and fields inside them with a patch or a merge.
  */
 typedef struct ustore_docs_write_t {
 
@@ -95,44 +103,20 @@ typedef struct ustore_docs_write_t {
     /** Number of documents or fields to write. */
     ustore_size_t count;
 
-    /** Collections of the documents, where @c NULL stands for the main collection. */
-    ustore_collection_id_t const* collections;
+    /** Collections of the documents, where @c NULL data stands for the main collection. */
+    ustore_collections_view_t collections;
 
-    /** Bytes between consecutive collections, where zero repeats the first one. */
-    ustore_size_t collections_stride;
+    /** Keys of the documents, where @c NULL data reads every key from @c id_field. */
+    ustore_keys_view_t keys;
 
-    /** Keys of the documents, or @c NULL to read them from @c id_field. */
-    ustore_key_t const* keys;
+    /** Field holding the key of every document when @c keys has no data, such as "_id". */
+    ustore_bytes_view_t id_field;
 
-    /** Bytes between consecutive keys, where zero repeats the first one. */
-    ustore_size_t keys_stride;
+    /** Fields to modify inside the documents, one per task, where a zeroed view modifies whole documents. */
+    ustore_strings_view_t fields;
 
-    /** Fields to modify inside the documents, or @c NULL for whole documents. */
-    ustore_str_view_t const* fields;
-
-    /** Bytes between consecutive fields, where zero repeats the first one. */
-    ustore_size_t fields_stride;
-
-    /** Starts of the values inside their buffers, or @c NULL to start every value at its buffer. */
-    ustore_length_t const* starts;
-
-    /** Bytes between consecutive starts, where zero repeats the first one. */
-    ustore_size_t starts_stride;
-
-    /** Lengths of the values, or @c NULL to end every value where the next one starts or at a null terminator. */
-    ustore_length_t const* lengths;
-
-    /** Bytes between consecutive lengths, where zero repeats the first one. */
-    ustore_size_t lengths_stride;
-
-    /** Buffers holding the values, @c NULL only when there are no tasks. */
-    ustore_bytes_cptr_t const* values;
-
-    /** Bytes between consecutive buffer pointers, where zero repeats the first one. */
-    ustore_size_t values_stride;
-
-    /** Field holding the key of every document when @c keys is @c NULL, such as "_id". */
-    ustore_str_view_t id_field;
+    /** Values to write, one per task. */
+    ustore_strings_view_t values;
 
     /** Format of the written values. */
     ustore_docs_field_type_t type;
@@ -158,7 +142,7 @@ USTORE_EXPORT void ustore_docs_write(ustore_docs_write_t* arguments);
  *  @brief The arguments of @c ustore_docs_read, which reads whole documents or fields inside them.
  *
  *  Whole documents read as JSON pass straight through to the engine; everything else is parsed and
- *  exported, printing scalars as text for @c ustore_docs_field_str_k and nested values as JSON text.
+ *  exported, printing scalars as text for @c ustore_docs_field_type_str_k and nested values as JSON text.
  */
 typedef struct ustore_docs_read_t {
 
@@ -180,38 +164,29 @@ typedef struct ustore_docs_read_t {
     /** Number of documents or fields to read. */
     ustore_size_t count;
 
-    /** Collections of the documents, where @c NULL stands for the main collection. */
-    ustore_collection_id_t const* collections;
-
-    /** Bytes between consecutive collections, where zero repeats the first one. */
-    ustore_size_t collections_stride;
+    /** Collections of the documents, where @c NULL data stands for the main collection. */
+    ustore_collections_view_t collections;
 
     /** Keys of the documents. */
-    ustore_key_t const* keys;
+    ustore_keys_view_t keys;
 
-    /** Bytes between consecutive keys, where zero repeats the first one. */
-    ustore_size_t keys_stride;
+    /** Fields to read inside the documents, one per task, where a zeroed view reads whole documents. */
+    ustore_strings_view_t fields;
 
-    /** Fields to read inside the documents, or @c NULL for whole documents. */
-    ustore_str_view_t const* fields;
+    /** Optional output for a bitset of @c count bits marking found values, inside @c arena. */
+    ustore_octet_t const** presences;
 
-    /** Bytes between consecutive fields, where zero repeats the first one. */
-    ustore_size_t fields_stride;
+    /** Optional output for the length of every value, for reads that skip the bytes, inside @c arena. */
+    ustore_length_t const** lengths;
 
-    /** Optional output for a bitset of at least @c count bits marking found values. */
-    ustore_octet_t* presences;
+    /** Optional output for the values as a tape inside @c arena, where a missing value reads as an empty one. */
+    ustore_strings_view_t* values;
 
-    /** Optional output for @c count plus one offsets into @c values, the last one closing the final value. */
-    ustore_length_t* offsets;
+    /** Rewound by this call, then holding every output it writes; @c NULL is refused. */
+    ustore_arena_t arena;
 
-    /** Optional output for the tape of values, inside @c arena. */
-    ustore_byte_t** values;
-
-    /** Memory for @c values: reused when it points to an arena, created when it points to @c NULL. */
-    ustore_arena_t* arena;
-
-    /** Format to export the values in, either JSON or a string. */
-    ustore_docs_field_type_t type;
+    /** Format the values are converted into on export, either JSON or a string. */
+    ustore_docs_field_type_t outputs_type;
 
 } ustore_docs_read_t;
 
@@ -243,29 +218,20 @@ typedef struct ustore_docs_gist_t {
     /** Number of documents to inspect. */
     ustore_size_t count;
 
-    /** Collections of the documents, where @c NULL stands for the main collection. */
-    ustore_collection_id_t const* collections;
-
-    /** Bytes between consecutive collections, where zero repeats the first one. */
-    ustore_size_t collections_stride;
+    /** Collections of the documents, where @c NULL data stands for the main collection. */
+    ustore_collections_view_t collections;
 
     /** Keys of the documents. */
-    ustore_key_t const* keys;
+    ustore_keys_view_t keys;
 
-    /** Bytes between consecutive keys, where zero repeats the first one. */
-    ustore_size_t keys_stride;
+    /** Output for the @c written unique JSON Pointers as a tape inside @c arena. */
+    ustore_strings_view_t* fields;
 
-    /** Output for the number of unique paths. */
-    ustore_size_t* fields_count;
+    /** Output for the unique paths written; zeroed on failure. */
+    ustore_size_t* written;
 
-    /** Output for @c fields_count plus one offsets into @c fields, inside @c arena. */
-    ustore_length_t** offsets;
-
-    /** Output for the joined null-terminated JSON Pointers, inside @c arena. */
-    ustore_char_t** fields;
-
-    /** Memory for @c offsets and @c fields: reused when it points to an arena, created when it points to @c NULL. */
-    ustore_arena_t* arena;
+    /** Rewound by this call, then holding every output it writes; @c NULL is refused. */
+    ustore_arena_t arena;
 
 } ustore_docs_gist_t;
 
@@ -276,16 +242,38 @@ typedef struct ustore_docs_gist_t {
 USTORE_EXPORT void ustore_docs_gist(ustore_docs_gist_t* arguments);
 
 /**
+ *  @brief One column of @c ustore_docs_gather: @c count rows of one field, as an Apache Arrow array of its type.
+ *
+ *  Validity, conversion and collision columns are bitmaps, least significant bit first. A value is valid when it was
+ *  found and converted, converted when the conversion changed its semantics, such as a string parsed into an integer,
+ *  and colliding when a value of an inconvertible type sits under the field.
+ */
+typedef struct ustore_docs_column_view_t {
+
+    /** Bits marking the rows whose value was found and converted. */
+    ustore_octet_t const* validities;
+
+    /** Bits marking the rows whose conversion changed the value's semantics. */
+    ustore_octet_t const* conversions;
+
+    /** Bits marking the rows where a value of an inconvertible type sits under the field. */
+    ustore_octet_t const* collisions;
+
+    /** The scalars, each as wide as the column's type and aligned to it, or @c NULL for a string column. */
+    ustore_byte_t const* scalars;
+
+    /** The @c count strings of a string column as a tape, or a zeroed view for a scalar column. */
+    ustore_strings_view_t strings;
+
+} ustore_docs_column_view_t;
+
+/**
  *  @brief The arguments of @c ustore_docs_gather, which reads @c fields_count fields of
  *      @c count documents into columns.
  *
- *  Every output but the joined strings is an array of @c fields_count pointers to the caller's columns, each
- *  holding @c count entries, and one more for offsets.
- *  Validity, conversion and collision columns are bitmaps, least significant bit first. A value is
- *  valid when it was found and converted, converted when the conversion changed its semantics, such
- *  as a string parsed into an integer, and colliding when a value of an inconvertible type sits under
- *  the field. Strings requested as @c ustore_docs_field_str_k end with a null terminator, and binary
- *  strings do not; their offsets and lengths are laid out column by column, their contents row by row.
+ *  Every field lands in one @c ustore_docs_column_view_t of @c count rows inside @c arena, converted into its entry
+ *  of @c outputs_types. Strings requested as @c ustore_docs_field_type_str_k end with a null terminator, which their
+ *  offsets span, and binary strings do not.
  */
 typedef struct ustore_docs_gather_t {
 
@@ -307,56 +295,26 @@ typedef struct ustore_docs_gather_t {
     /** Number of documents, the rows of the output. */
     ustore_size_t count;
 
+    /** Collections of the documents, where @c NULL data stands for the main collection. */
+    ustore_collections_view_t collections;
+
+    /** Keys of the documents. */
+    ustore_keys_view_t keys;
+
     /** Number of fields, the columns of the output. */
     ustore_size_t fields_count;
 
-    /** Collections of the documents, where @c NULL stands for the main collection. */
-    ustore_collection_id_t const* collections;
+    /** Fields to gather from every document, @c fields_count of them. */
+    ustore_strings_view_t fields;
 
-    /** Bytes between consecutive collections, where zero repeats the first one. */
-    ustore_size_t collections_stride;
+    /** Output for @c fields_count columns of @c count rows, one per field, inside @c arena. */
+    ustore_docs_column_view_t const** columns;
 
-    /** Keys of the documents. */
-    ustore_key_t const* keys;
+    /** Rewound by this call, then holding every output it writes; @c NULL is refused. */
+    ustore_arena_t arena;
 
-    /** Bytes between consecutive keys, where zero repeats the first one. */
-    ustore_size_t keys_stride;
-
-    /** Fields to gather from every document. */
-    ustore_str_view_t const* fields;
-
-    /** Bytes between consecutive fields, where zero repeats the first one. */
-    ustore_size_t fields_stride;
-
-    /** Types to convert every field into. */
-    ustore_docs_field_type_t const* types;
-
-    /** Bytes between consecutive types, where zero repeats the first one. */
-    ustore_size_t types_stride;
-
-    /** Optional outputs for the validity bitmaps. */
-    ustore_octet_t* const* columns_validities;
-
-    /** Optional outputs for the conversion bitmaps. */
-    ustore_octet_t* const* columns_conversions;
-
-    /** Optional outputs for the collision bitmaps. */
-    ustore_octet_t* const* columns_collisions;
-
-    /** Outputs for the scalar columns, each as wide as its type, with @c NULL for string columns. */
-    ustore_byte_t* const* columns_scalars;
-
-    /** Outputs for @c count plus one offsets of strings inside @c joined_strings, with @c NULL for scalar columns. */
-    ustore_length_t* const* columns_offsets;
-
-    /** Outputs for the lengths of strings, with @c NULL for scalar columns. */
-    ustore_length_t* const* columns_lengths;
-
-    /** Output for the contents of all strings, joined row by row inside @c arena. */
-    ustore_byte_t** joined_strings;
-
-    /** Memory for @c joined_strings: reused when it points to an arena, created when it points to @c NULL. */
-    ustore_arena_t* arena;
+    /** Types the columns are converted into, @c fields_count of them, one per field. */
+    ustore_docs_field_type_t const* outputs_types;
 
 } ustore_docs_gather_t;
 
@@ -366,8 +324,8 @@ typedef struct ustore_docs_gather_t {
  */
 USTORE_EXPORT void ustore_docs_gather(ustore_docs_gather_t* arguments);
 
-#pragma endregion Primary Functions
-
 #ifdef __cplusplus
 }
 #endif
+
+#endif // UNUM_USTORE_DOCS_H

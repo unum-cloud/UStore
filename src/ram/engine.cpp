@@ -38,8 +38,6 @@
 #include <utility>     // `std::exchange`, `std::forward`, `std::move`
 #include <variant>     // `std::in_place_type`, `std::variant`, `std::visit`
 
-#include <fmt/format.h> // `fmt::format_to_n`
-
 #include <forkunion/atomics.hpp>      // `fu::preferred_atomic_ref`
 #include <forkunion/capabilities.hpp> // `fu::preferred_yield_t`
 #include <smashtable/basic_avl_tree.hpp>
@@ -51,16 +49,19 @@
 #include "ustore/blobs.h"
 #include "ustore/db.h"
 #include "ustore/graph.h"
-#include "ustore/ranges_args.hpp" // `places_arg_t`, `contents_arg_t`, `scans_arg_t`, `strings_arg_t`, `find_edges_t`
+#include "ustore/ranges.hpp" // `place_batch_t`, `edges_view_t`, `strided`
 #include "ustore/strings.h"
 
-#include "engine.hpp"                 // `engine_t`, `handle_t`, `handle_cast`, `view_t`
-#include "helpers/blocking_files.hpp" // `directory_exists`
-#include "helpers/linked_array.hpp"   // `growing_tape_t`, `uninitialized_array`
-#include "helpers/linked_memory.hpp"  // `arena_allocate`, `arena_grow`
-#include "ram/key.hpp"                // `string_key_t`, `half_edge_t`
+#include "engine.hpp"                   // `engine_t`, `handle_t`, `handle_cast`, `view_t`
+#include "ram/key.hpp"                  // `string_key_t`, `half_edge_t`
+#include "utilities/batches.hpp"        // `scan_batch_t`, `strings_arg_t`, `edges_batch_t`, `places_of`, `edges_of`
+#include "utilities/blocking_files.hpp" // `directory_exists`
+#include "utilities/outputs.hpp"        // `read_outputs_t`, `scan_outputs_t`, `collection_list_outputs_t`
+#include "utilities/progress.hpp"       // `progress_t`, `progress_cancelled_k`
+#include "utilities/ram_buffers.hpp"    // `arena_allocate`, `arena_copy`, `arena_allocator`
 
 namespace unum::ustore::ram {
+using namespace unum::ustore::utilities;
 
 #pragma region Stores
 
@@ -197,7 +198,7 @@ constexpr status_t translate(store_status_t status) noexcept {
     case store_status_t::operation_would_block_k:
         return {status_code_t::write_conflict_k, "Gave up after every retry met a conflict"};
     case store_status_t::capacity_exhausted_k: return {status_code_t::capacity_exhausted_k, "Capacity exhausted"};
-    case store_status_t::input_output_k: return {status_code_t::input_output_k, "Input or output failed"};
+    case store_status_t::input_output_k: return {status_code_t::io_k, "Input or output failed"};
     case store_status_t::key_already_exists_k: return {status_code_t::already_exists_k, "Key already exists"};
     case store_status_t::key_not_found_k: return {status_code_t::not_found_k, "Key not found"};
     }
@@ -322,11 +323,12 @@ struct snapshot_handle : handle_t {
 
 #pragma region Retirement
 
-/** Retires @p store at @p stamp, which the catalog stopped listing it at, to be freed once no reader holds an older
- *  stamp. */
+/** Retires @p store at @p commit_stamp, which the catalog stopped listing it at, to be freed once no reader holds an
+ *  older stamp. */
 template <isolation_t isolation_>
-void retire(database_state<isolation_>& state, collection_store<isolation_>* store, generation_t stamp) noexcept {
-    store->retirement_stamp = stamp;
+void retire(database_state<isolation_>& state, collection_store<isolation_>* store,
+            generation_t commit_stamp) noexcept {
+    store->retirement_stamp = commit_stamp;
     fu::standard_atomic_ref<collection_store<isolation_>*> head(state.retired);
     store->next_retired = head.load(st::memory_order_relaxed_k);
     while (!head.compare_exchange_weak(store->next_retired, store, st::memory_order_release_k,
@@ -339,20 +341,20 @@ void free_unreachable(database_state<isolation_>& state) noexcept {
     using store_t = collection_store<isolation_>;
     fu::standard_atomic_ref<store_t*> head(state.retired);
     if (!head.load(st::memory_order_relaxed_k)) return;
-    store_t* pending = head.exchange(nullptr, st::memory_order_acquire_k);
+    store_t* taken = head.exchange(nullptr, st::memory_order_acquire_k);
     // Read after taking the list, so every store taken was retired at or below the stamps it is compared with
     generation_t const oldest_read = state.order.low_water_mark();
     store_t* kept = nullptr;
     store_t* kept_last = nullptr;
-    while (pending) {
-        store_t* const next = pending->next_retired;
-        if (pending->retirement_stamp <= oldest_read) delete pending;
+    while (taken) {
+        store_t* const next = taken->next_retired;
+        if (taken->retirement_stamp <= oldest_read) delete taken;
         else {
-            pending->next_retired = kept;
-            if (!kept) kept_last = pending;
-            kept = pending;
+            taken->next_retired = kept;
+            if (!kept) kept_last = taken;
+            kept = taken;
         }
-        pending = next;
+        taken = next;
     }
     if (!kept) return;
     kept_last->next_retired = head.load(st::memory_order_relaxed_k);
@@ -413,10 +415,10 @@ struct transaction_view {
     transaction_type_& transaction;
 
     /** Whether reads watch what they hand out. */
-    watch_t watch_mode;
+    ustore_watch_t watch_mode;
 
     /** Whether @c find and @c watch record what they hand out. */
-    bool watches() const noexcept { return watch_mode == watch_t::watch_k; }
+    bool watches() const noexcept { return watch_mode == ustore_watch_keys_k; }
 
     template <typename key_type_, typename found_type_, typename missing_type_>
     store_status_t find(key_type_ const& key, found_type_&& found, missing_type_&& missing) const noexcept {
@@ -452,17 +454,17 @@ struct reader_source {
     database_state<isolation_>& state;
 
     /** The stamp every store is read at. */
-    generation_t stamp;
+    generation_t read_stamp;
 
     /** A reader of @p store at the stamp. */
     template <typename store_type_>
     st::expected<reader_view<typename store_type_::reader_t>> view(store_type_& store) const noexcept {
-        return reader_view<typename store_type_::reader_t> {store.reader_at(stamp)};
+        return reader_view<typename store_type_::reader_t> {store.reader_at(read_stamp)};
     }
 
     /** A reader of the catalog at the stamp, which resolves the collections a call names. */
     reader_view<typename collections_by_id_store<isolation_>::reader_t> catalog() const noexcept {
-        return {state.collections_by_id.reader_at(stamp)};
+        return {state.collections_by_id.reader_at(read_stamp)};
     }
 };
 
@@ -479,7 +481,7 @@ struct transaction_source {
     collections_transaction<isolation_>& transaction;
 
     /** Whether reads watch what they hand out, and erases watch the absence of keys already gone. */
-    watch_t watch_mode;
+    ustore_watch_t watch_mode;
 
     /** The part of the transaction over @p store, joining it at the transaction's snapshot unless it already has. */
     template <typename store_type_>
@@ -511,9 +513,9 @@ struct transaction_source {
 /** Whether reads of a transaction at @p isolation_ watch what they hand out when a call asks for @p watch, where a
  *  strictly serializable one records every read already. */
 template <isolation_t isolation_>
-constexpr watch_t watches_reads(ustore_watch_t watch) noexcept {
-    return isolation_ == isolation_t::snapshot_k && watch == ustore_watch_keys_k ? watch_t::watch_k
-                                                                                 : watch_t::dont_watch_k;
+constexpr ustore_watch_t watches_reads(ustore_watch_t watch) noexcept {
+    return isolation_ == isolation_t::snapshot_k && watch == ustore_watch_keys_k ? ustore_watch_keys_k
+                                                                                 : ustore_watch_none_k;
 }
 
 /** Hands @p action the source @p view names: a snapshot, a transaction, or the newest stamp, claimed for the call. */
@@ -599,127 +601,6 @@ using entry_of = typename std::remove_cvref_t<store_type_>::value_t;
 
 #pragma endregion Resolution
 
-#pragma region Output Tapes
-
-/** The columns of a batched read: presences and offsets in the caller's spans, and every value copied into the
- *  caller's arena exactly once. */
-class value_tape {
-    ustore_arena_t* arena_;
-    status_t& outcome_;
-    bits_span_t presences_;
-    ustore_length_t* offsets_;
-    std::span<byte_t> contents_ {};
-    ustore_byte_t** values_;
-    std::size_t count_;
-    std::size_t index_ {0};
-    std::size_t used_ {0};
-
-    /** Makes room for @p length more bytes, extending the tape in place while it ends its arena block. */
-    bool reserve_(std::size_t length) noexcept {
-        if (!values_ || used_ + length <= contents_.size()) return true;
-        std::size_t const predicted = std::max(contents_.size() * 2, length * (count_ - index_));
-        std::size_t const wanted = std::max(predicted, used_ + length);
-        auto [grown, status] = contents_.empty() ? arena_allocate<byte_t>(arena_, wanted)
-                                                 : arena_grow(arena_, contents_, wanted - contents_.size());
-        outcome_ = status;
-        contents_ = grown;
-        return status.succeeded();
-    }
-
-  public:
-    template <typename arguments_type_>
-    value_tape(arguments_type_ const& arguments, status_t& outcome) noexcept
-        : arena_(arguments.arena), outcome_(outcome), presences_(arguments.presences), offsets_(arguments.offsets),
-          values_(arguments.values), count_(arguments.count) {}
-
-    /** Appends a found value. */
-    void append(value_view_t value) noexcept {
-        std::size_t const length = value.size();
-        if (!reserve_(length)) return;
-        if (values_ && length != 0) std::memcpy(contents_.data() + used_, value.data(), length);
-        if (presences_) presences_[index_] = true;
-        if (offsets_) offsets_[index_] = static_cast<ustore_length_t>(used_);
-        used_ += length;
-        ++index_;
-    }
-
-    /** Appends a missing value. */
-    void append_missing() noexcept {
-        if (presences_) presences_[index_] = false;
-        if (offsets_) offsets_[index_] = static_cast<ustore_length_t>(used_);
-        ++index_;
-    }
-
-    /** Closes the offsets and exports the tape of values. */
-    void finish() noexcept {
-        if (offsets_) offsets_[count_] = static_cast<ustore_length_t>(used_);
-        if (values_) *values_ = reinterpret_cast<ustore_byte_t*>(contents_.data());
-    }
-};
-
-/** The columns of batched scans and samples in the caller's spans: an offset per task over one tape of keys, which
- *  the limits of the tasks leave room for. */
-class key_tape {
-    ustore_length_t* offsets_;
-    ustore_key_t* keys_;
-    std::size_t tasks_;
-    std::size_t size_ {0};
-
-  public:
-    key_tape(ustore_length_t* offsets, ustore_key_t* keys, std::size_t tasks) noexcept
-        : offsets_(offsets), keys_(keys), tasks_(tasks) {}
-
-    /** How many keys the tape holds. */
-    std::size_t size() const noexcept { return size_; }
-
-    /** The key at @p index. */
-    ustore_key_t& operator[](std::size_t index) noexcept { return keys_[index]; }
-
-    /** Appends @p key. */
-    void push(ustore_key_t const& key) noexcept { keys_[size_++] = key; }
-
-    /** Records that task @p task starts where the tape ends. */
-    void open_task(std::size_t task) noexcept { offsets_[task] = static_cast<ustore_length_t>(size_); }
-
-    /** Closes the offsets. */
-    void finish() noexcept { offsets_[tasks_] = static_cast<ustore_length_t>(size_); }
-};
-
-/** The found strings of batched strings scans: their bytes end to end in the caller's arena, and one offset per
- *  string plus a closing one in the caller's span, which the limits of the tasks leave room for. */
-class string_tape {
-    uninitialized_array<char> contents_;
-    ustore_length_t* offsets_;
-    std::size_t size_ {0};
-
-  public:
-    string_tape(ustore_arena_t* arena, ustore_length_t* offsets) noexcept : contents_(arena), offsets_(offsets) {
-        offsets_[0] = 0;
-    }
-
-    /** How many strings the tape holds. */
-    std::size_t size() const noexcept { return size_; }
-
-    /** The string at @p index. */
-    std::string_view operator[](std::size_t index) const noexcept {
-        return {contents_.data() + offsets_[index], offsets_[index + 1] - offsets_[index]};
-    }
-
-    /** Appends @p text, failing when the arena refuses. */
-    status_t push(std::string_view text) noexcept {
-        if (status_t const status = contents_.insert(contents_.size(), text.data(), text.data() + text.size());
-            status.failed())
-            return status;
-        offsets_[++size_] = static_cast<ustore_length_t>(contents_.size());
-        return {};
-    }
-
-    /** The bytes of every string, end to end. */
-    ustore_char_t* contents() noexcept { return contents_.data(); }
-};
-
-#pragma endregion Output Tapes
-
 #pragma region Reads
 
 /** Where the entry @p key names sits among entries of @p entry_type_: the pair itself, or the vertex's own entry. */
@@ -743,46 +624,49 @@ constexpr ustore_key_t const& listed_key(half_edge_t const& entry) noexcept { re
 inline value_view_t value_of(value_pair_t const& pair) noexcept { return view_of(pair.mapped); }
 inline value_view_t value_of(half_edge_t const&) noexcept { return {}; }
 
-/** Reads tasks [ @p first, @p end ) of @p places through @p view of a collection of @p entry_type_ into @p tape. */
+/** Reads tasks [ @p first, @p end ) of @p places through @p view of a collection of @p entry_type_ into @p outputs. */
 template <typename entry_type_, typename view_type_>
-store_status_t read_keys(view_type_ const& view, places_arg_t const& places, std::size_t first, std::size_t end,
-                         value_tape& tape, status_t const& outcome) noexcept {
+store_status_t read_keys(view_type_ const& view, place_batch_t const& places, std::size_t first, std::size_t end,
+                         read_outputs_t& outputs) noexcept {
     store_status_t const reserved = view.prepare(end - first);
     if (st::failed(reserved)) return reserved;
-    auto const found = [&](entry_type_ const& entry) noexcept { tape.append(value_of(entry)); };
-    auto const missing = [&]() noexcept { tape.append_missing(); };
-    for (std::size_t index = first; index != end && outcome.succeeded(); ++index) {
+    auto const found = [&](entry_type_ const& entry) noexcept { outputs.append(value_of(entry)); };
+    auto const missing = [&]() noexcept { outputs.append_missing(); };
+    for (std::size_t index = first; index != end; ++index) {
         store_status_t const looked_up = view.find(entry_for<entry_type_>(places[index].key), found, missing);
         if (st::failed(looked_up)) return looked_up;
     }
     return store_status_t::success_k;
 }
 
-/** Watches the entries of the keys the tape holds from @p first on, which only a watching view records, once the
+/** Watches the entries of the keys @p outputs hold from @p first on, which only a watching view records, once the
  *  walk that found them let go of its partitions. */
 template <typename entry_type_, typename view_type_>
-store_status_t watch_keys(view_type_ const& view, key_tape& tape, std::size_t first) noexcept {
+store_status_t watch_keys(view_type_ const& view, scan_outputs_t& outputs, std::size_t first) noexcept {
     if (!view.watches()) return store_status_t::success_k;
-    for (std::size_t index = first; index != tape.size(); ++index) {
-        store_status_t const watched = view.watch(entry_for<entry_type_>(tape[index]));
+    for (std::size_t index = first; index != outputs.size(); ++index) {
+        store_status_t const watched = view.watch(entry_for<entry_type_>(outputs[index]));
         if (st::failed(watched)) return watched;
     }
     return store_status_t::success_k;
 }
 
-/** Appends up to the limit of @p scan keys of a collection of @p entry_type_, from its start key on. */
+/** Appends up to the limit of @p scan keys of a collection of @p entry_type_, from its start key on, halting with
+ *  @p outcome when the scratch refuses. */
 template <typename entry_type_, typename view_type_>
-store_status_t scan_window(view_type_ const& view, scan_t scan, key_tape& tape) noexcept {
-    std::size_t const first = tape.size();
+store_status_t scan_window(view_type_ const& view, scan_task_t scan, scan_outputs_t& outputs,
+                           status_t& outcome) noexcept {
+    std::size_t const first = outputs.size();
     if (scan.limit == 0) return store_status_t::success_k;
     store_status_t const walked = view.range_from(
-        entry_for<entry_type_>(scan.min_key), [&](entry_type_ const& entry) noexcept -> walk_control_t {
+        entry_for<entry_type_>(scan.start_key), [&](entry_type_ const& entry) noexcept -> walk_control_t {
             if (!is_listed(entry)) return walk_control_t::resume_k;
-            tape.push(listed_key(entry));
-            return tape.size() - first == scan.limit ? walk_control_t::halt_k : walk_control_t::resume_k;
+            outcome = outputs.push(listed_key(entry));
+            if (outcome.failed()) return walk_control_t::halt_k;
+            return outputs.size() - first == scan.limit ? walk_control_t::halt_k : walk_control_t::resume_k;
         });
-    if (st::failed(walked)) return walked;
-    return watch_keys<entry_type_>(view, tape, first);
+    if (st::failed(walked) || outcome.failed()) return walked;
+    return watch_keys<entry_type_>(view, outputs, first);
 }
 
 /** A splitmix64 generator, drawing the positions a reservoir keeps. */
@@ -803,11 +687,12 @@ struct sample_generator_t {
     }
 };
 
-/** Appends a uniform reservoir of up to the limit of @p sample keys of a collection of @p entry_type_. */
+/** Appends a uniform reservoir of up to the limit of @p sample keys of a collection of @p entry_type_, halting with
+ *  @p outcome when the scratch refuses. */
 template <typename entry_type_, typename view_type_>
-store_status_t sample_window(view_type_ const& view, sample_arg_t sample, sample_generator_t& generator,
-                             key_tape& tape) noexcept {
-    std::size_t const first = tape.size();
+store_status_t sample_window(view_type_ const& view, sample_task_t sample, sample_generator_t& generator,
+                             scan_outputs_t& outputs, status_t& outcome) noexcept {
+    std::size_t const first = outputs.size();
     if (sample.limit == 0) return store_status_t::success_k;
     std::size_t seen = 0;
     store_status_t const walked = view.range_from(
@@ -816,12 +701,15 @@ store_status_t sample_window(view_type_ const& view, sample_arg_t sample, sample
             std::size_t const slot = seen < sample.limit ? seen : st::draw_below(generator, seen + 1);
             ++seen;
             if (slot >= sample.limit) return walk_control_t::resume_k;
-            if (slot == tape.size() - first) tape.push(listed_key(entry));
-            else tape[first + slot] = listed_key(entry);
-            return walk_control_t::resume_k;
+            if (slot != outputs.size() - first) {
+                outputs[first + slot] = listed_key(entry);
+                return walk_control_t::resume_k;
+            }
+            outcome = outputs.push(listed_key(entry));
+            return outcome.failed() ? walk_control_t::halt_k : walk_control_t::resume_k;
         });
-    if (st::failed(walked)) return walked;
-    return watch_keys<entry_type_>(view, tape, first);
+    if (st::failed(walked) || outcome.failed()) return walked;
+    return watch_keys<entry_type_>(view, outputs, first);
 }
 
 /** The entries, value bytes and space one measured window holds. */
@@ -852,16 +740,16 @@ store_status_t measure_window(view_type_ const& view, ustore_key_t const& lower,
     });
 }
 
-/** Reads the value of every string of tasks [ @p first, @p end ) of @p texts through @p view into @p tape. */
+/** Reads the value of every string of tasks [ @p first, @p end ) of @p texts through @p view into @p outputs. */
 template <typename view_type_>
 store_status_t read_strings(view_type_ const& view, strings_arg_t const& texts, std::size_t first, std::size_t end,
-                            value_tape& tape, status_t const& outcome) noexcept {
+                            read_outputs_t& outputs) noexcept {
     store_status_t const reserved = view.prepare(end - first);
     if (st::failed(reserved)) return reserved;
-    auto const found = [&](string_pair_t const& pair) noexcept { tape.append(view_of(pair.mapped)); };
-    auto const missing = [&]() noexcept { tape.append_missing(); };
-    for (std::size_t index = first; index != end && outcome.succeeded(); ++index) {
-        auto [key, key_status] = string_key_from(texts[index]);
+    auto const found = [&](string_pair_t const& pair) noexcept { outputs.append(view_of(pair.mapped)); };
+    auto const missing = [&]() noexcept { outputs.append_missing(); };
+    for (std::size_t index = first; index != end; ++index) {
+        auto [key, key_status] = string_key_from(string_of(texts[index]));
         if (st::failed(key_status)) return key_status;
         store_status_t const looked_up = view.find(key, found, missing);
         if (st::failed(looked_up)) return looked_up;
@@ -869,26 +757,26 @@ store_status_t read_strings(view_type_ const& view, strings_arg_t const& texts, 
     return store_status_t::success_k;
 }
 
-/** Appends up to @p limit strings starting with @p prefix, from @p start on, to @p found. */
+/** Appends up to @p limit strings starting with @p prefix, from @p start on, to @p outputs. */
 template <typename view_type_>
 store_status_t scan_strings(view_type_ const& view, std::string_view prefix, std::string_view start, std::size_t limit,
-                            string_tape& found, status_t& outcome) noexcept {
+                            strings_scan_outputs_t& outputs, status_t& outcome) noexcept {
     if (limit == 0) return store_status_t::success_k;
     auto [first, first_status] = string_key_from(start > prefix ? start : prefix);
     if (st::failed(first_status)) return first_status;
-    std::size_t const found_before = found.size();
+    std::size_t const found_before = outputs.size();
     store_status_t const walked = view.range_from(first, [&](string_pair_t const& pair) noexcept -> walk_control_t {
         std::string_view const text = pair.key.view();
         if (!text.starts_with(prefix)) return walk_control_t::halt_k;
-        outcome = found.push(text);
+        outcome = outputs.push(text);
         if (outcome.failed()) return walk_control_t::halt_k;
-        return found.size() - found_before == limit ? walk_control_t::halt_k : walk_control_t::resume_k;
+        return outputs.size() - found_before == limit ? walk_control_t::halt_k : walk_control_t::resume_k;
     });
     if (st::failed(walked) || !view.watches()) return walked;
 
     // A walk holds its partitions, so the strings it handed out are watched once it let go of them
-    for (std::size_t index = found_before; index != found.size() && outcome.succeeded(); ++index) {
-        auto [key, key_status] = string_key_from(found[index]);
+    for (std::size_t index = found_before; index != outputs.size() && outcome.succeeded(); ++index) {
+        auto [key, key_status] = string_key_from(outputs[index]);
         store_status_t const watched = st::failed(key_status) ? key_status : view.watch(key);
         if (st::failed(watched)) return watched;
     }
@@ -910,19 +798,19 @@ store_status_t stage_upsert(transaction_type_& transaction, key_type_&& key, val
 
 /** Stages erasing @p key, watching its absence when @p watch asks and the key is already gone. */
 template <typename transaction_type_, typename key_type_>
-store_status_t stage_erase(transaction_type_& transaction, key_type_ const& key, watch_t watch) noexcept {
+store_status_t stage_erase(transaction_type_& transaction, key_type_ const& key, ustore_watch_t watch) noexcept {
     store_status_t const erased = transaction.erase(key);
     if (erased != store_status_t::key_not_found_k) return erased;
-    if (watch == watch_t::dont_watch_k) return store_status_t::success_k;
+    if (watch == ustore_watch_none_k) return store_status_t::success_k;
     return transaction.watch(key);
 }
 
 /** Stages the values of tasks [ @p first, @p end ) of a batch into @p transaction. */
 template <typename transaction_type_>
-store_status_t stage_writes(transaction_type_& transaction, places_arg_t const& places, contents_arg_t const& contents,
+store_status_t stage_writes(transaction_type_& transaction, place_batch_t const& places, strings_arg_t const& values,
                             std::size_t first, std::size_t end) noexcept {
     for (std::size_t index = first; index != end; ++index) {
-        store_status_t const staged = stage_upsert(transaction, places[index].key, contents[index]);
+        store_status_t const staged = stage_upsert(transaction, places[index].key, values[index]);
         if (st::failed(staged)) return staged;
     }
     return store_status_t::success_k;
@@ -930,8 +818,8 @@ store_status_t stage_writes(transaction_type_& transaction, places_arg_t const& 
 
 /** Stages erasing the keys of tasks [ @p first, @p end ) of a batch from @p transaction. */
 template <typename transaction_type_>
-store_status_t stage_removals(transaction_type_& transaction, places_arg_t const& places, std::size_t first,
-                              std::size_t end, watch_t watch) noexcept {
+store_status_t stage_removals(transaction_type_& transaction, place_batch_t const& places, std::size_t first,
+                              std::size_t end, ustore_watch_t watch) noexcept {
     for (std::size_t index = first; index != end; ++index) {
         store_status_t const erased = stage_erase(transaction, places[index].key, watch);
         if (st::failed(erased)) return erased;
@@ -941,12 +829,12 @@ store_status_t stage_removals(transaction_type_& transaction, places_arg_t const
 
 /** Stages the values of tasks [ @p first, @p end ) of a batch of strings into @p transaction. */
 template <typename transaction_type_>
-store_status_t stage_strings(transaction_type_& transaction, strings_arg_t const& texts, contents_arg_t const& contents,
+store_status_t stage_strings(transaction_type_& transaction, strings_arg_t const& texts, strings_arg_t const& values,
                              std::size_t first, std::size_t end) noexcept {
     for (std::size_t index = first; index != end; ++index) {
-        auto [key, key_status] = string_key_from(texts[index]);
+        auto [key, key_status] = string_key_from(string_of(texts[index]));
         if (st::failed(key_status)) return key_status;
-        store_status_t const staged = stage_upsert(transaction, std::move(key), contents[index]);
+        store_status_t const staged = stage_upsert(transaction, std::move(key), values[index]);
         if (st::failed(staged)) return staged;
     }
     return store_status_t::success_k;
@@ -955,9 +843,9 @@ store_status_t stage_strings(transaction_type_& transaction, strings_arg_t const
 /** Stages erasing the strings of tasks [ @p first, @p end ) of a batch from @p transaction. */
 template <typename transaction_type_>
 store_status_t stage_string_removals(transaction_type_& transaction, strings_arg_t const& texts, std::size_t first,
-                                     std::size_t end, watch_t watch) noexcept {
+                                     std::size_t end, ustore_watch_t watch) noexcept {
     for (std::size_t index = first; index != end; ++index) {
-        auto [key, key_status] = string_key_from(texts[index]);
+        auto [key, key_status] = string_key_from(string_of(texts[index]));
         if (st::failed(key_status)) return key_status;
         store_status_t const erased = stage_erase(transaction, key, watch);
         if (st::failed(erased)) return erased;
@@ -968,52 +856,27 @@ store_status_t stage_string_removals(transaction_type_& transaction, strings_arg
 /**
  *  @brief Commits what @p stage_changes stages through a transaction of its own, retrying conflicts up to
  *      @c commit_attempts_k times.
- *  @param[out] stamp Optional output for the stamp the commit published under.
+ *  @param[out] commit_stamp Optional output for the stamp the commit published under.
  *
  *  @p stage_changes takes a @c transaction_source and may refuse the call through its outcome, answering a failure
  *  that is not a conflict, so no attempt follows.
  */
 template <isolation_t isolation_, typename stage_changes_type_>
 store_status_t commit_group(database_state<isolation_>& state, stage_changes_type_&& stage_changes,
-                            generation_t* stamp = nullptr) noexcept {
+                            generation_t* commit_stamp = nullptr) noexcept {
     auto opened = collections_transaction<isolation_>::make(state.order);
     if (!opened) return opened.status();
-    transaction_source<isolation_> source {state, *opened, watch_t::dont_watch_k};
+    transaction_source<isolation_> source {state, *opened, ustore_watch_none_k};
     store_status_t const committed = st::commit_with_retries(
         *opened, commit_attempts_k,
         [&](collections_transaction<isolation_>&) noexcept -> store_status_t { return stage_changes(source); });
-    if (stamp && st::succeeded(committed)) *stamp = opened->commit_stamp();
+    if (commit_stamp && st::succeeded(committed)) *commit_stamp = opened->commit_stamp();
     return committed;
 }
 
 #pragma endregion Writes
 
 #pragma region Catalog
-
-/** The collections a listing exports, with what each holds and the name it carries. */
-struct catalog_listing_t {
-
-    /** The UUID of every collection. */
-    uninitialized_array<ustore_collection_id_t> ids;
-
-    /** What every collection holds. */
-    uninitialized_array<ustore_modality_t> modalities;
-
-    /** The name of every collection, empty for one without. */
-    growing_tape_t names;
-};
-
-/** Appends the catalog entry @p pair to @p listing, skipping the main collection and halting the walk when the arena
- *  refuses. */
-template <isolation_t isolation_>
-walk_control_t list_entry(catalog_listing_t& listing, catalog_pair<isolation_> const& pair,
-                          status_t& outcome) noexcept {
-    if (pair.key == ustore_collection_main_k) return walk_control_t::resume_k;
-    outcome = listing.ids.push_back(pair.key);
-    if (outcome.succeeded()) outcome = listing.modalities.push_back(pair.mapped.modality);
-    if (outcome.succeeded()) outcome = listing.names.push_back(view_of(pair.mapped.name)).status();
-    return outcome.failed() ? walk_control_t::halt_k : walk_control_t::resume_k;
-}
 
 /** One collection as the catalog lists it at some stamp. */
 template <isolation_t isolation_>
@@ -1080,20 +943,20 @@ struct catalog_change {
 template <isolation_t isolation_, typename stage_change_type_>
 store_status_t commit_catalog_change(database_state<isolation_>& state, stage_change_type_&& stage_change) noexcept {
     catalog_change<isolation_> change;
-    generation_t stamp = 0;
+    generation_t commit_stamp = 0;
     store_status_t const committed = commit_group(
         state,
         [&](transaction_source<isolation_>& source) noexcept -> store_status_t {
             change.discard();
             return stage_change(source, change);
         },
-        &stamp);
+        &commit_stamp);
     if (st::failed(committed)) {
         change.discard();
         return committed;
     }
     for (std::size_t index = 0; index != change.taken_out.size(); ++index)
-        retire(state, change.taken_out[index], stamp);
+        retire(state, change.taken_out[index], commit_stamp);
     free_unreachable(state);
     return store_status_t::success_k;
 }
@@ -1237,12 +1100,14 @@ store_status_t walk_direction(view_type_ const& view, ustore_key_t const& vertex
 /** Exports the degree of tasks [ @p first, @p end ) through @p view of a graph into @p degrees, with their edges as
  *  source, target and edge triples when @p edges is given, watching what it walked when the view watches. */
 template <typename view_type_, typename degrees_type_>
-store_status_t export_edges(view_type_ const& view, find_edges_t const& tasks, std::size_t first, std::size_t end,
-                            degrees_type_& degrees, uninitialized_array<ustore_key_t>* edges,
-                            uninitialized_array<half_edge_t>& walked, status_t& outcome) noexcept {
+store_status_t export_edges(view_type_ const& view, edges_batch_t const& tasks, std::size_t first, std::size_t end,
+                            degrees_type_& degrees,
+                            st::basic_vector<ustore_key_t, arena_allocator<ustore_key_t>>* edges,
+                            st::basic_vector<half_edge_t, arena_allocator<half_edge_t>>& walked,
+                            status_t& outcome) noexcept {
     std::size_t const walked_before = walked.size();
     for (std::size_t task = first; task != end && outcome.succeeded(); ++task) {
-        find_edge_t const asked = tasks[task];
+        edges_task_t const asked = tasks[task];
         bool present = false;
         store_status_t const looked_up = view.find(
             half_edge_t::vertex_entry(asked.vertex_id), [&](half_edge_t const&) noexcept { present = true; },
@@ -1255,21 +1120,23 @@ store_status_t export_edges(view_type_ const& view, find_edges_t const& tasks, s
         ustore_vertex_degree_t degree = 0;
         auto const visit = [&](half_edge_t const& entry) noexcept -> walk_control_t {
             ++degree;
-            if (view.watches()) outcome = walked.push_back(entry);
+            if (view.watches()) outcome = translate(walked.emplace_back(entry));
             if (edges && outcome.succeeded()) {
                 bool const outgoing = entry.direction == half_edge_direction_t::outgoing_k;
                 ustore_key_t const triple[3] {outgoing ? entry.vertex : entry.neighbor,
                                               outgoing ? entry.neighbor : entry.vertex, entry.edge};
-                outcome = edges->insert(edges->size(), triple, triple + 3);
+                std::size_t const exported = edges->size();
+                outcome = translate(edges->resize(exported + 3));
+                if (outcome.succeeded()) std::memcpy(edges->data() + exported, triple, sizeof(triple));
             }
             return outcome.failed() ? walk_control_t::halt_k : walk_control_t::resume_k;
         };
-        if (asked.role & ustore_vertex_source_k) {
+        if (asked.role & ustore_vertex_role_source_k) {
             store_status_t const outgoing = walk_direction(view, asked.vertex_id, half_edge_direction_t::outgoing_k,
                                                            visit);
             if (st::failed(outgoing)) return outgoing;
         }
-        if (asked.role & ustore_vertex_target_k) {
+        if (asked.role & ustore_vertex_role_target_k) {
             store_status_t const incoming = walk_direction(view, asked.vertex_id, half_edge_direction_t::incoming_k,
                                                            visit);
             if (st::failed(incoming)) return incoming;
@@ -1283,16 +1150,6 @@ store_status_t export_edges(view_type_ const& view, find_edges_t const& tasks, s
     return store_status_t::success_k;
 }
 
-/** The three key columns of a batch of edges, whose edge IDs default to @c ustore_default_edge_id_k. */
-struct edge_columns_t {
-    strided_iterator<ustore_key_t const> edges;
-    strided_iterator<ustore_key_t const> sources;
-    strided_iterator<ustore_key_t const> targets;
-
-    /** The ID of edge @p index. */
-    ustore_key_t edge(std::size_t index) const noexcept { return edges ? edges[index] : ustore_default_edge_id_k; }
-};
-
 /** Stages @p vertex into @p part of a graph unless it already is one, which never writes over a present vertex, so
  *  edges added to one vertex by two transactions don't conflict over it. */
 template <typename transaction_type_>
@@ -1302,18 +1159,16 @@ store_status_t stage_vertex(transaction_type_& part, ustore_key_t const& vertex)
 
 /** Stages edges [ @p first, @p end ) into @p part of a graph, under both of their ends, and each end as a vertex. */
 template <typename transaction_type_>
-store_status_t stage_edges(transaction_type_& part, edge_columns_t const& columns, std::size_t first,
+store_status_t stage_edges(transaction_type_& part, edges_view_t const& edges, std::size_t first,
                            std::size_t end) noexcept {
     for (std::size_t index = first; index != end; ++index) {
-        ustore_key_t const source = columns.sources[index];
-        ustore_key_t const target = columns.targets[index];
-        ustore_key_t const edge = columns.edge(index);
-        store_status_t status = stage_vertex(part, source);
-        if (st::succeeded(status)) status = stage_vertex(part, target);
+        edge_t const edge = edges[index];
+        store_status_t status = stage_vertex(part, edge.source);
+        if (st::succeeded(status)) status = stage_vertex(part, edge.target);
         if (st::succeeded(status))
-            status = part.upsert(half_edge_t {source, half_edge_direction_t::outgoing_k, target, edge});
+            status = part.upsert(half_edge_t {edge.source, half_edge_direction_t::outgoing_k, edge.target, edge.id});
         if (st::succeeded(status))
-            status = part.upsert(half_edge_t {target, half_edge_direction_t::incoming_k, source, edge});
+            status = part.upsert(half_edge_t {edge.target, half_edge_direction_t::incoming_k, edge.source, edge.id});
         if (st::failed(status)) return status;
     }
     return store_status_t::success_k;
@@ -1329,16 +1184,15 @@ store_status_t stage_absent(transaction_type_& part, half_edge_t const& entry) n
 /** Stages erasing edges [ @p first, @p end ) from @p part of a graph, under both of their ends, keeping the
  *  vertices. */
 template <typename transaction_type_>
-store_status_t stage_edges_removal(transaction_type_& part, edge_columns_t const& columns, std::size_t first,
+store_status_t stage_edges_removal(transaction_type_& part, edges_view_t const& edges, std::size_t first,
                                    std::size_t end) noexcept {
     for (std::size_t index = first; index != end; ++index) {
-        ustore_key_t const source = columns.sources[index];
-        ustore_key_t const target = columns.targets[index];
-        ustore_key_t const edge = columns.edge(index);
-        store_status_t status = stage_absent(part,
-                                             half_edge_t {source, half_edge_direction_t::outgoing_k, target, edge});
+        edge_t const edge = edges[index];
+        store_status_t status = stage_absent(
+            part, half_edge_t {edge.source, half_edge_direction_t::outgoing_k, edge.target, edge.id});
         if (st::succeeded(status))
-            status = stage_absent(part, half_edge_t {target, half_edge_direction_t::incoming_k, source, edge});
+            status = stage_absent(part,
+                                  half_edge_t {edge.target, half_edge_direction_t::incoming_k, edge.source, edge.id});
         if (st::failed(status)) return status;
     }
     return store_status_t::success_k;
@@ -1348,18 +1202,18 @@ store_status_t stage_edges_removal(transaction_type_& part, edge_columns_t const
  *  of its own. */
 template <typename transaction_type_>
 store_status_t stage_vertex_removal(transaction_type_& part, ustore_key_t const& vertex, ustore_vertex_role_t role,
-                                    st::basic_vector<half_edge_t>& walked) noexcept {
+                                    st::basic_vector<half_edge_t, arena_allocator<half_edge_t>>& walked) noexcept {
     std::size_t const first = walked.size();
     store_status_t collected = store_status_t::success_k;
     auto const collect = [&](half_edge_t const& entry) noexcept -> walk_control_t {
-        if (st::succeeded(collected)) collected = walked.push_back(half_edge_t {entry});
+        if (st::succeeded(collected)) collected = walked.emplace_back(entry);
         return st::failed(collected) ? walk_control_t::halt_k : walk_control_t::resume_k;
     };
-    if (role & ustore_vertex_source_k) {
+    if (role & ustore_vertex_role_source_k) {
         store_status_t const outgoing = walk_direction(part, vertex, half_edge_direction_t::outgoing_k, collect);
         if (st::failed(outgoing)) return outgoing;
     }
-    if (role & ustore_vertex_target_k) {
+    if (role & ustore_vertex_role_target_k) {
         store_status_t const incoming = walk_direction(part, vertex, half_edge_direction_t::incoming_k, collect);
         if (st::failed(incoming)) return incoming;
     }
@@ -1481,36 +1335,67 @@ auto first_entry() noexcept {
     else return entry_for<entry_type_>(smallest_key_k);
 }
 
-/** Writes how many entries @p store holds at @p stamp, then every one of them, clearing @p written when any of it
- *  misses @p file. */
+/** Bytes of the key and the value of an entry, which the progress of a save counts, a half-edge being all key. */
+inline std::size_t saved_bytes(value_pair_t const& pair) noexcept { return sizeof(ustore_key_t) + pair.mapped.size(); }
+inline std::size_t saved_bytes(string_pair_t const& pair) noexcept { return pair.key.text.size() + pair.mapped.size(); }
+inline std::size_t saved_bytes(half_edge_t const&) noexcept { return sizeof(half_edge_t); }
+
+/** Counts into @p count the entries @p store holds at @p read_stamp, and adds the bytes of their keys and values to
+ *  @p bytes. */
 template <typename store_type_>
-store_status_t write_entries(std::FILE* file, store_type_ const& store, generation_t stamp, bool& written) noexcept {
+store_status_t tally_entries(store_type_ const& store, generation_t read_stamp, std::uint64_t& count,
+                             std::size_t& bytes) noexcept {
     using entry_t = entry_of<store_type_>;
-    auto const reader = store.reader_at(stamp);
-    std::uint64_t count = 0;
-    store_status_t const counted = reader.range_from(first_entry<entry_t>(), [&](entry_t const&) noexcept { ++count; });
-    if (st::failed(counted)) return counted;
-    written = written && std::fwrite(&count, sizeof(count), 1, file) == 1;
-    return reader.range_from(first_entry<entry_t>(), [&](entry_t const& entry) noexcept -> walk_control_t {
-        written = written && write_entry(file, entry);
-        return written ? walk_control_t::resume_k : walk_control_t::halt_k;
+    return store.reader_at(read_stamp).range_from(first_entry<entry_t>(), [&](entry_t const& entry) noexcept {
+        ++count;
+        bytes += saved_bytes(entry);
     });
 }
 
-/** Writes the image of every collection of @p state at @p stamp into @p directory. */
+/** Writes how many entries @p store holds at @p read_stamp, then every one of them, adding the bytes of their keys and
+ *  values to @p bytes, and clearing @p written when any of it misses @p file. */
+template <typename store_type_>
+store_status_t write_entries(std::FILE* file, store_type_ const& store, generation_t read_stamp, std::size_t& bytes,
+                             bool& written) noexcept {
+    using entry_t = entry_of<store_type_>;
+    std::uint64_t count = 0;
+    store_status_t const counted = tally_entries(store, read_stamp, count, bytes);
+    if (st::failed(counted)) return counted;
+    written = written && std::fwrite(&count, sizeof(count), 1, file) == 1;
+    return store.reader_at(read_stamp)
+        .range_from(first_entry<entry_t>(), [&](entry_t const& entry) noexcept -> walk_control_t {
+            written = written && write_entry(file, entry);
+            return written ? walk_control_t::resume_k : walk_control_t::halt_k;
+        });
+}
+
+/** Writes the image of every collection of @p state at @p read_stamp into @p directory, reporting the bytes of the keys
+ *  and values written to @p progress after each collection, whose cancellation removes the partial image. */
 template <isolation_t isolation_>
-status_t write_image(database_state<isolation_>& state, generation_t stamp, char const* directory) noexcept {
+status_t write_image(database_state<isolation_>& state, generation_t read_stamp, char const* directory,
+                     ustore_progress_callback_t progress = nullptr, void* progress_state = nullptr) noexcept {
     sz::string_t partial_path;
     sz::string_t final_path;
     if (!join_path(partial_path, directory, partial_image_name_k) || !join_path(final_path, directory, image_name_k))
         return {status_code_t::out_of_memory_k, "Failed to build the image path"};
     listed_collections<isolation_> listed;
-    reader_source<isolation_> source {state, stamp};
+    reader_source<isolation_> source {state, read_stamp};
     auto catalog = source.view(state.collections_by_id);
     if (store_status_t const collected = collect_catalog<isolation_>(*catalog, listed); st::failed(collected))
         return translate(collected);
+
+    // The total costs one more walk of every collection, which only a callback needs
+    std::size_t total = 0;
+    for (std::size_t index = 0; progress && index != listed.size(); ++index) {
+        std::uint64_t count = 0;
+        store_status_t const tallied = std::visit(
+            [&](auto const& entries) noexcept { return tally_entries(entries, read_stamp, count, total); },
+            listed[index].store->entries);
+        if (st::failed(tallied)) return translate(tallied);
+    }
+    progress_t reporter {progress, progress_state, total};
     stream_t stream {std::fopen(partial_path.c_str(), "wb")};
-    if (!stream.get()) return {status_code_t::input_output_k, "Failed to open the image for writing"};
+    if (!stream.get()) return {status_code_t::io_k, "Failed to open the image for writing"};
 
     bool written = std::fwrite(image_signature_k, sizeof(image_signature_k), 1, stream.get()) == 1;
     for (std::size_t index = 0; index != listed.size() && written; ++index) {
@@ -1519,17 +1404,25 @@ status_t write_image(database_state<isolation_>& state, generation_t stamp, char
         written = std::fwrite(&collection.id, sizeof(ustore_collection_id_t), 1, stream.get()) == 1 &&
                   std::fwrite(&modality, sizeof(modality), 1, stream.get()) == 1 &&
                   write_blob(stream.get(), collection.name);
+        std::size_t bytes = 0;
         store_status_t const walked = std::visit(
-            [&](auto const& entries) noexcept { return write_entries(stream.get(), entries, stamp, written); },
+            [&](auto const& entries) noexcept {
+                return write_entries(stream.get(), entries, read_stamp, bytes, written);
+            },
             collection.store->entries);
         if (st::failed(walked)) return translate(walked);
+        if (written && !reporter.advance(bytes)) {
+            [[maybe_unused]] bool const closed = stream.close();
+            [[maybe_unused]] int const removed = std::remove(partial_path.c_str());
+            return progress_cancelled_k;
+        }
     }
 
     bool const synced = written && std::fflush(stream.get()) == 0 && sync_file(stream.get());
     bool const closed = stream.close();
-    if (!synced || !closed) return {status_code_t::input_output_k, "Failed to write the image"};
+    if (!synced || !closed) return {status_code_t::io_k, "Failed to write the image"};
     if (!replace_file(partial_path.c_str(), final_path.c_str()))
-        return {status_code_t::input_output_k, "Failed to replace the image"};
+        return {status_code_t::io_k, "Failed to replace the image"};
     return {};
 }
 
@@ -1666,12 +1559,13 @@ status_t open_database(database_state<isolation_>& state, std::string_view direc
     if (directory.empty()) return {};
     if (state.directory.try_assign(sz::string_view_t {directory}) != sz::status_t::success_k)
         return {status_code_t::out_of_memory_k, "Failed to copy the directory"};
+    if (!names_directory(state.directory.c_str())) return {status_code_t::not_found_k, "The directory doesn't exist"};
     return read_image(state, main);
 }
 
-/** Serves "clear", giving every collection a fresh empty store and keeping the catalog and the names. */
+/** Gives every collection a fresh empty store, keeping the catalog and the names. */
 template <isolation_t isolation_>
-status_t clear_pairs(database_state<isolation_>& state, ustore_database_control_t const&) noexcept {
+status_t clear_pairs(database_state<isolation_>& state) noexcept {
     store_status_t const cleared = commit_catalog_change(
         state, [&](transaction_source<isolation_>& source, catalog_change<isolation_>& change) noexcept {
             auto catalog = source.view(state.collections_by_id);
@@ -1687,10 +1581,10 @@ status_t clear_pairs(database_state<isolation_>& state, ustore_database_control_
     return translate(cleared);
 }
 
-/** Serves "reset", removing every collection but the main one, which it empties, and every name, which no open
- *  snapshot may still be reading. */
+/** Removes every collection but the main one, which it empties, and every name, which no open snapshot may still be
+ *  reading. */
 template <isolation_t isolation_>
-status_t reset_database(database_state<isolation_>& state, ustore_database_control_t const&) noexcept {
+status_t reset_database(database_state<isolation_>& state) noexcept {
     if (fu::preferred_atomic_ref<std::size_t>(state.open_snapshots).load(std::memory_order_acquire) != 0)
         return {status_code_t::invalid_argument_k, "A reset waits until every snapshot is freed"};
     store_status_t const reset = commit_catalog_change(
@@ -1712,20 +1606,107 @@ status_t reset_database(database_state<isolation_>& state, ustore_database_contr
     return translate(reset);
 }
 
-/** Serves "compact", reclaiming unreachable versions of every store, freeing unreachable retired stores and
- *  rewriting the image. */
+/** Empties every value of every collection, keeping the keys, which a graph holds none of. */
 template <isolation_t isolation_>
-status_t compact_database(database_state<isolation_>& state, ustore_database_control_t const&) noexcept {
+status_t clear_values(database_state<isolation_>& state) noexcept {
+    status_t outcome;
+    store_status_t const cleared = commit_group(state, [&](transaction_source<isolation_>& source) noexcept {
+        auto catalog = source.view(state.collections_by_id);
+        if (!catalog) return catalog.status();
+        listed_collections<isolation_> listed;
+        store_status_t const collected = collect_catalog<isolation_>(*catalog, listed);
+        for (std::size_t index = 0; index != listed.size() && st::succeeded(collected); ++index) {
+            store_status_t const emptied = stage_values_emptied(source, listed[index].id, outcome);
+            if (st::failed(emptied)) return emptied;
+        }
+        return collected;
+    });
+    return reported(cleared, outcome);
+}
+
+/** Bytes the image of @p state takes on disk, zero for a volatile database or one not yet persisted. */
+template <isolation_t isolation_>
+std::size_t image_bytes(database_state<isolation_> const& state) noexcept {
+    sz::string_t path;
+    if (state.directory.empty() || !join_path(path, state.directory.c_str(), image_name_k)) return 0;
+    expected<seekable_file_t> const image = seekable_file_t::open(path.c_str());
+    if (!image) return 0;
+    expected<std::size_t> const length = image->length();
+    return length ? *length : 0;
+}
+
+#pragma endregion Lifetime
+
+#pragma region Argument Views
+
+/** The tasks of a scan. */
+inline scan_batch_t scans_of(ustore_blobs_scan_t const& arguments) noexcept {
+    return {strided(arguments.collections), strided(arguments.start_keys), arguments.wanted, arguments.count};
+}
+
+/** The tasks of a sample. */
+inline sample_batch_t samples_of(ustore_blobs_sample_t const& arguments) noexcept {
+    return {strided(arguments.collections), arguments.wanted, arguments.count};
+}
+
+#pragma endregion Argument Views
+
+#pragma region Database Calls
+
+/** Implements @c ustore_database_describe, counting the live keys of every collection at the newest stamp. */
+template <isolation_t isolation_>
+status_t serve(database_state<isolation_>& state, ustore_database_describe_t const& arguments, view_t const&) noexcept {
+    if (!arguments.description) return {status_code_t::invalid_argument_k, "Need an output for the description"};
     claim_t claim;
     reader_source<isolation_> source {state, state.order.take_snapshot(claim)};
     listed_collections<isolation_> listed;
     auto catalog = source.view(state.collections_by_id);
     if (store_status_t const collected = collect_catalog<isolation_>(*catalog, listed); st::failed(collected))
         return translate(collected);
+    std::size_t keys = 0;
+    for (std::size_t index = 0; index != listed.size(); ++index)
+        std::visit([&](auto const& entries) noexcept { keys += entries.size(); }, listed[index].store->entries);
+    *arguments.description = {
+        .capabilities = ustore_capabilities_t(ustore_capabilities_transactions_k | ustore_capabilities_collections_k |
+                                              ustore_capabilities_snapshots_k),
+        .engine = ustore_engine_ram_k,
+        .isolation = isolation_ == isolation_t::snapshot_k ? ustore_isolation_snapshot_k
+                                                           : ustore_isolation_strict_serializable_k,
+        .keys = keys,
+        .disk_bytes = image_bytes(state),
+    };
+    return {};
+}
+
+/** Implements @c ustore_database_clear, persisting a change of the names as a drop of one collection does. */
+template <isolation_t isolation_>
+status_t serve(database_state<isolation_>& state, ustore_database_clear_t const& arguments, view_t const&) noexcept {
+    switch (arguments.mode) {
+    case ustore_drop_pairs_k: return clear_pairs(state);
+    case ustore_drop_values_k: return clear_values(state);
+    case ustore_drop_collection_k:
+        if (status_t const status = reset_database(state); status.failed()) return status;
+        return persist(state);
+    default: return {status_code_t::invalid_argument_k, "Unknown drop mode"};
+    }
+}
+
+/** Implements @c ustore_database_compact, reclaiming unreachable versions of every store, freeing unreachable retired
+ *  stores and rewriting the image, reporting one unit per collection, as the versions it frees carry no byte count. */
+template <isolation_t isolation_>
+status_t serve(database_state<isolation_>& state, ustore_database_compact_t const& arguments, view_t const&) noexcept {
+    claim_t claim;
+    reader_source<isolation_> source {state, state.order.take_snapshot(claim)};
+    listed_collections<isolation_> listed;
+    auto catalog = source.view(state.collections_by_id);
+    if (store_status_t const collected = collect_catalog<isolation_>(*catalog, listed); st::failed(collected))
+        return translate(collected);
+    progress_t progress {arguments.progress, arguments.progress_state, listed.size()};
     for (std::size_t index = 0; index != listed.size(); ++index) {
         store_status_t const vacuumed = std::visit([](auto& entries) noexcept { return entries.vacuum().status(); },
                                                    listed[index].store->entries);
         if (st::failed(vacuumed)) return translate(vacuumed);
+        if (!progress.advance(1)) return progress_cancelled_k;
     }
     if (store_status_t const vacuumed = state.collections_by_id.vacuum().status(); st::failed(vacuumed))
         return translate(vacuumed);
@@ -1734,117 +1715,6 @@ status_t compact_database(database_state<isolation_>& state, ustore_database_con
     claim.retire();
     free_unreachable(state);
     return persist(state);
-}
-
-/** Serves "info", naming the engine and its isolation. */
-template <isolation_t isolation_>
-status_t describe_database(database_state<isolation_>&, ustore_database_control_t const& arguments) noexcept {
-    *arguments.response = isolation_ == isolation_t::strict_serializable_k
-                              ? R"({"engine":"ram","isolation":"strict_serializable"})"
-                              : R"({"engine":"ram","isolation":"snapshot"})";
-    return {};
-}
-
-/** Serves "usage", counting keys and versions of every store into the arena. */
-template <isolation_t isolation_>
-status_t report_usage(database_state<isolation_>& state, ustore_database_control_t const& arguments) noexcept {
-    claim_t claim;
-    reader_source<isolation_> source {state, state.order.take_snapshot(claim)};
-    listed_collections<isolation_> listed;
-    auto catalog = source.view(state.collections_by_id);
-    if (store_status_t const collected = collect_catalog<isolation_>(*catalog, listed); st::failed(collected))
-        return translate(collected);
-    std::size_t keys = state.collections_by_id.size() + state.collection_ids_by_name.size();
-    std::size_t versions = state.collections_by_id.versions_count() + state.collection_ids_by_name.versions_count();
-    for (std::size_t index = 0; index != listed.size(); ++index)
-        std::visit(
-            [&](auto const& entries) noexcept {
-                keys += entries.size();
-                versions += entries.versions_count();
-            },
-            listed[index].store->entries);
-
-    constexpr std::size_t response_capacity_k = 96;
-    auto [response, status] = arena_allocate<char>(arguments.arena, response_capacity_k);
-    if (status.failed()) return status;
-    auto const written = fmt::format_to_n(response.data(), response_capacity_k - 1, R"({{"keys":{},"versions":{}}})",
-                                          keys, versions);
-    *written.out = '\0';
-    *arguments.response = response.data();
-    return {};
-}
-
-/** One free-form request of @c ustore_database_control. */
-template <isolation_t isolation_>
-struct control_request {
-
-    /** The name a caller sends. */
-    std::string_view name;
-
-    /** Serves the request. */
-    status_t (*serve)(database_state<isolation_>&, ustore_database_control_t const&) noexcept;
-};
-
-/** Every request @c ustore_database_control serves. */
-template <isolation_t isolation_>
-inline constexpr std::array<control_request<isolation_>, 5> control_requests_k {{
-    {"clear", &clear_pairs<isolation_>},
-    {"reset", &reset_database<isolation_>},
-    {"compact", &compact_database<isolation_>},
-    {"info", &describe_database<isolation_>},
-    {"usage", &report_usage<isolation_>},
-}};
-
-#pragma endregion Lifetime
-
-#pragma region Argument Views
-
-/** The locations of a read, a write or a removal. */
-template <typename arguments_type_>
-places_arg_t places_of(arguments_type_ const& arguments) noexcept {
-    return {{arguments.collections, arguments.collections_stride},
-            {arguments.keys, arguments.keys_stride},
-            {},
-            arguments.count};
-}
-
-/** The values of a write. */
-inline contents_arg_t contents_of(ustore_write_t const& arguments) noexcept {
-    return {{arguments.starts, arguments.starts_stride},
-            {arguments.lengths, arguments.lengths_stride},
-            {arguments.values, arguments.values_stride},
-            arguments.count};
-}
-
-/** The tasks of a scan. */
-inline scans_arg_t scans_of(ustore_scan_t const& arguments) noexcept {
-    return {{arguments.collections, arguments.collections_stride},
-            {arguments.start_keys, arguments.start_keys_stride},
-            {arguments.count_limits, arguments.count_limits_stride},
-            arguments.count};
-}
-
-/** The tasks of a sample. */
-inline sample_args_t samples_of(ustore_sample_t const& arguments) noexcept {
-    return {{arguments.collections, arguments.collections_stride},
-            {arguments.count_limits, arguments.count_limits_stride},
-            arguments.count};
-}
-
-#pragma endregion Argument Views
-
-#pragma region Database Calls
-
-/** Implements @c ustore_database_control through the table of known requests. */
-template <isolation_t isolation_>
-status_t serve(database_state<isolation_>& state, ustore_database_control_t const& arguments, view_t const&) noexcept {
-    if (!arguments.request || !arguments.response)
-        return {status_code_t::invalid_argument_k, "Need a request and an output for the response"};
-    *arguments.response = nullptr;
-    std::string_view const request {arguments.request};
-    for (control_request<isolation_> const& known : control_requests_k<isolation_>)
-        if (known.name == request) return known.serve(state, arguments);
-    return {status_code_t::invalid_argument_k, "Unknown request: expected clear, reset, compact, info or usage"};
 }
 
 #pragma endregion Database Calls
@@ -1859,51 +1729,57 @@ status_t serve(database_state<isolation_>& state, ustore_snapshot_init_t const& 
     if (!handle) return {status_code_t::out_of_memory_k, "Failed to allocate the snapshot"};
     state.order.take_snapshot(handle->claim);
     fu::preferred_atomic_ref<std::size_t>(state.open_snapshots).fetch_add(1, std::memory_order_release);
+    if (arguments.read_stamp) *arguments.read_stamp = handle->claim.snapshot();
     *arguments.snapshot = c_handle<ustore_snapshot_t>(handle);
     return {};
 }
 
-/** Implements @c ustore_snapshot_export as an image in the export directory. */
+/** Implements @c ustore_snapshot_save as an image in the directory it names. */
 template <isolation_t isolation_>
-status_t serve(database_state<isolation_>& state, ustore_snapshot_export_t const& arguments,
+status_t serve(database_state<isolation_>& state, ustore_snapshot_save_t const& arguments,
                view_t const& view) noexcept {
-    if (!view.snapshot) return {status_code_t::invalid_argument_k, "Need a snapshot to export"};
-    if (!arguments.path || !names_directory(arguments.path))
-        return {status_code_t::not_found_k, "The export path isn't a directory"};
-    return write_image(state, handle_cast<snapshot_handle<isolation_>>(view.snapshot)->claim.snapshot(),
-                       arguments.path);
+    sz::string_t path;
+    if (path.try_assign(sz::string_view_t {string_of(arguments.path)}) != sz::status_t::success_k)
+        return {status_code_t::out_of_memory_k, "Failed to copy the save path"};
+    if (path.empty() || !names_directory(path.c_str()))
+        return {status_code_t::not_found_k, "The save path isn't a directory"};
+    return write_image(state, handle_cast<snapshot_handle<isolation_>>(view.snapshot)->claim.snapshot(), path.c_str(),
+                       arguments.progress, arguments.progress_state);
 }
 
 #pragma endregion Snapshot Calls
 
 #pragma region Blob Calls
 
-/** Implements @c ustore_read, copying every value into the caller's arena once, where a graph's vertices read as
- *  empty values. */
+/** Implements @c ustore_blobs_read, copying every value into the caller's arena once, where a graph's vertices read
+ *  as empty values. */
 template <isolation_t isolation_>
-status_t serve(database_state<isolation_>& state, ustore_read_t const& arguments, view_t const& view) noexcept {
+status_t serve(database_state<isolation_>& state, ustore_blobs_read_t const& arguments, view_t const& view) noexcept {
     if (!arguments.count) return {};
-    places_arg_t const places = places_of(arguments);
+    place_batch_t const places = places_of(arguments);
     if (status_t const status = validate_read(places); status.failed()) return status;
     status_t outcome;
-    value_tape tape {arguments, outcome};
+    auto [outputs, outputs_status] = read_outputs_t::make(arguments, view.scratch);
+    if (outputs_status.failed()) return outputs_status;
 
+    // The source's claim keeps every version found alive until the outputs copy its value
     store_status_t const read = with_source(state, view, [&](auto& source) noexcept {
-        return for_each_run(source, places.collections_begin, places.size(), outcome,
-                            [&](auto& entries, std::size_t first, std::size_t end) noexcept -> store_status_t {
-                                using entry_t = entry_of<decltype(entries)>;
-                                if constexpr (std::is_same_v<entry_t, string_pair_t>)
-                                    return refused(outcome, "The collection holds strings");
-                                else {
-                                    auto store = source.view(entries);
-                                    if (!store) return store.status();
-                                    return read_keys<entry_t>(*store, places, first, end, tape, outcome);
-                                }
-                            });
+        store_status_t const runs = for_each_run(
+            source, places.collections_begin, places.size(), outcome,
+            [&](auto& entries, std::size_t first, std::size_t end) noexcept -> store_status_t {
+                using entry_t = entry_of<decltype(entries)>;
+                if constexpr (std::is_same_v<entry_t, string_pair_t>)
+                    return refused(outcome, "The collection holds strings");
+                else {
+                    auto store = source.view(entries);
+                    if (!store) return store.status();
+                    return read_keys<entry_t>(*store, places, first, end, outputs);
+                }
+            });
+        if (st::succeeded(runs) && outcome.succeeded()) outcome = outputs.finish(arguments);
+        return runs;
     });
-    if (status_t const status = reported(read, outcome); status.failed()) return status;
-    tape.finish();
-    return {};
+    return reported(read, outcome);
 }
 
 /** Hands @p stage every run of @p count tasks on a collection of values through @p source, with the part of the
@@ -1965,33 +1841,33 @@ status_t serve_write(database_state<isolation_>& state, ustore_durability_t dura
     return {};
 }
 
-/** Implements @c ustore_write, committing a batch outside a transaction atomically. */
+/** Implements @c ustore_blobs_write, committing a batch outside a transaction atomically. */
 template <isolation_t isolation_>
-status_t serve(database_state<isolation_>& state, ustore_write_t const& arguments, view_t const& view) noexcept {
-    places_arg_t const places = places_of(arguments);
-    contents_arg_t const contents = contents_of(arguments);
-    if (status_t const status = validate_write(view.transaction, places, contents, arguments.durability, view.watch);
+status_t serve(database_state<isolation_>& state, ustore_blobs_write_t const& arguments, strings_arg_t const& values,
+               view_t const& view) noexcept {
+    place_batch_t const places = places_of(arguments);
+    if (status_t const status = validate_write(view.transaction, places, values, arguments.durability, view.watch);
         status.failed() || !arguments.count)
         return status;
     if (view.transaction || places.size() != 1)
         return serve_write(state, arguments.durability, view, [&](auto& source, status_t& outcome) noexcept {
             return stage_value_runs(source, places.collections_begin, places.size(), outcome,
                                     [&](auto& part, std::size_t first, std::size_t end) noexcept {
-                                        return stage_writes(part, places, contents, first, end);
+                                        return stage_writes(part, places, values, first, end);
                                     });
         });
     status_t outcome;
-    store_status_t const written = write_one(state, places.collections_begin, places[0].key, contents[0], outcome);
+    store_status_t const written = write_one(state, places.collections_begin, places[0].key, values[0], outcome);
     if (status_t const status = reported(written, outcome); status.failed()) return status;
     if (arguments.durability == ustore_durability_flushed_k) return persist(state);
     return {};
 }
 
-/** Implements @c ustore_remove, committing a batch outside a transaction atomically, where a key already gone stays
- *  gone. */
+/** Implements @c ustore_blobs_remove, committing a batch outside a transaction atomically, where a key already gone
+ *  stays gone. */
 template <isolation_t isolation_>
-status_t serve(database_state<isolation_>& state, ustore_remove_t const& arguments, view_t const& view) noexcept {
-    places_arg_t const places = places_of(arguments);
+status_t serve(database_state<isolation_>& state, ustore_blobs_remove_t const& arguments, view_t const& view) noexcept {
+    place_batch_t const places = places_of(arguments);
     if (status_t const status = validate_remove(view.transaction, places, arguments.durability, view.watch);
         status.failed() || !arguments.count)
         return status;
@@ -2003,12 +1879,14 @@ status_t serve(database_state<isolation_>& state, ustore_remove_t const& argumen
     });
 }
 
-/** Implements @c ustore_scan as ordered walks of each collection's keys, a graph's being its vertices. */
+/** Implements @c ustore_blobs_scan as ordered walks of each collection's keys, a graph's being its vertices. */
 template <isolation_t isolation_>
-status_t serve(database_state<isolation_>& state, ustore_scan_t const& arguments, view_t const& view) noexcept {
-    scans_arg_t const scans = scans_of(arguments);
+status_t serve(database_state<isolation_>& state, ustore_blobs_scan_t const& arguments, view_t const& view) noexcept {
+    scan_batch_t const scans = scans_of(arguments);
     if (status_t const status = validate_scan(arguments); status.failed() || !arguments.count) return status;
-    key_tape tape {arguments.offsets, arguments.keys, scans.size()};
+    auto [outputs, outputs_status] = scan_outputs_t::make(arguments, view.scratch);
+    if (outputs_status.failed()) return outputs_status;
+    progress_t progress {arguments.progress, arguments.progress_state, arguments.count};
 
     status_t outcome;
     store_status_t const walked = with_source(state, view, [&](auto& source) noexcept {
@@ -2020,34 +1898,32 @@ status_t serve(database_state<isolation_>& state, ustore_scan_t const& arguments
                                 else {
                                     auto store = source.view(entries);
                                     if (!store) return store.status();
-                                    for (std::size_t task = first; task != end; ++task) {
-                                        tape.open_task(task);
-                                        store_status_t const scanned = scan_window<entry_t>(*store, scans[task], tape);
-                                        if (st::failed(scanned)) return scanned;
+                                    for (std::size_t task = first; task != end && outcome.succeeded(); ++task) {
+                                        outputs.open_task(task);
+                                        store_status_t const scanned = scan_window<entry_t>(*store, scans[task],
+                                                                                            outputs, outcome);
+                                        if (st::failed(scanned) || outcome.failed()) return scanned;
+                                        if (!progress.advance(1)) outcome = progress_cancelled_k;
                                     }
                                     return store_status_t::success_k;
                                 }
                             });
     });
     if (status_t const status = reported(walked, outcome); status.failed()) return status;
-    tape.finish();
-    return {};
+    return outputs.finish(arguments);
 }
 
-/** Implements @c ustore_sample as a reservoir filled from a walk of each collection's keys, where samples that draw
- *  no keys at all need no output for them. */
+/** Implements @c ustore_blobs_sample as a reservoir filled from a walk of each collection's keys. */
 template <isolation_t isolation_>
-status_t serve(database_state<isolation_>& state, ustore_sample_t const& arguments, view_t const& view) noexcept {
+status_t serve(database_state<isolation_>& state, ustore_blobs_sample_t const& arguments, view_t const& view) noexcept {
     if (!arguments.count) return {};
-    if (!arguments.count_limits || !arguments.offsets)
-        return {status_code_t::invalid_argument_k, "Need count limits and an output for the offsets"};
-    sample_args_t const samples = samples_of(arguments);
-    std::size_t drawn = 0;
-    for (std::size_t task = 0; task != samples.size(); ++task) drawn += samples[task].limit;
-    if (drawn && !arguments.keys) return {status_code_t::invalid_argument_k, "Need an output for the keys"};
-    key_tape tape {arguments.offsets, arguments.keys, samples.size()};
+    if (!arguments.offsets || !arguments.keys)
+        return {status_code_t::invalid_argument_k, "Need outputs for the offsets and the keys"};
+    sample_batch_t const samples = samples_of(arguments);
+    auto [outputs, outputs_status] = scan_outputs_t::make(arguments, view.scratch);
+    if (outputs_status.failed()) return outputs_status;
     auto const now = static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
-    sample_generator_t generator {now ^ reinterpret_cast<std::uintptr_t>(&tape)};
+    sample_generator_t generator {now ^ reinterpret_cast<std::uintptr_t>(&outputs)};
 
     status_t outcome;
     store_status_t const walked = with_source(state, view, [&](auto& source) noexcept {
@@ -2060,69 +1936,39 @@ status_t serve(database_state<isolation_>& state, ustore_sample_t const& argumen
                                     auto store = source.view(entries);
                                     if (!store) return store.status();
                                     for (std::size_t task = first; task != end; ++task) {
-                                        tape.open_task(task);
-                                        store_status_t const sampled = sample_window<entry_t>(*store, samples[task],
-                                                                                              generator, tape);
-                                        if (st::failed(sampled)) return sampled;
+                                        outputs.open_task(task);
+                                        store_status_t const sampled = sample_window<entry_t>(
+                                            *store, samples[task], generator, outputs, outcome);
+                                        if (st::failed(sampled) || outcome.failed()) return sampled;
                                     }
                                     return store_status_t::success_k;
                                 }
                             });
     });
     if (status_t const status = reported(walked, outcome); status.failed()) return status;
-    tape.finish();
-    return {};
+    return outputs.finish(arguments);
 }
 
-/** The six columns a measurement exports. */
-struct measure_columns_t {
+/** Records the exact measure of @p task into @p outputs. */
+inline void assign_measure(measure_outputs_t& outputs, std::size_t task, window_measure_t measured) noexcept {
+    outputs.min_cardinalities[task] = measured.cardinality;
+    outputs.max_cardinalities[task] = measured.cardinality;
+    outputs.min_value_bytes[task] = measured.value_bytes;
+    outputs.max_value_bytes[task] = measured.value_bytes;
+    outputs.min_space_usages[task] = measured.space_bytes;
+    outputs.max_space_usages[task] = std::numeric_limits<ustore_size_t>::max();
+}
 
-    /** Lower bounds on the entries. */
-    strided_iterator<ustore_size_t> min_cardinalities;
-
-    /** Upper bounds on the entries. */
-    strided_iterator<ustore_size_t> max_cardinalities;
-
-    /** Lower bounds on the value bytes. */
-    strided_iterator<ustore_size_t> min_value_bytes;
-
-    /** Upper bounds on the value bytes. */
-    strided_iterator<ustore_size_t> max_value_bytes;
-
-    /** Lower bounds on the space. */
-    strided_iterator<ustore_size_t> min_space_usages;
-
-    /** Upper bounds on the space. */
-    strided_iterator<ustore_size_t> max_space_usages;
-
-    /** Records the exact measure of @p task. */
-    void assign(std::size_t task, window_measure_t measured) noexcept {
-        min_cardinalities[task] = measured.cardinality;
-        max_cardinalities[task] = measured.cardinality;
-        min_value_bytes[task] = measured.value_bytes;
-        max_value_bytes[task] = measured.value_bytes;
-        min_space_usages[task] = measured.space_bytes;
-        max_space_usages[task] = std::numeric_limits<ustore_size_t>::max();
-    }
-};
-
-/** Implements @c ustore_measure, exact for entries and value bytes at the view it reads. */
+/** Implements @c ustore_blobs_measure, exact for entries and value bytes at the view it reads. */
 template <isolation_t isolation_>
-status_t serve(database_state<isolation_>& state, ustore_measure_t const& arguments, view_t const& view) noexcept {
+status_t serve(database_state<isolation_>& state, ustore_blobs_measure_t const& arguments,
+               view_t const& view) noexcept {
     if (!arguments.count) return {};
-    if (status_t const status = validate_measure(arguments); status.failed()) return status;
-    strided_iterator<ustore_collection_id_t const> const collections {arguments.collections,
-                                                                      arguments.collections_stride};
-    strided_iterator<ustore_key_t const> const start_keys {arguments.start_keys, arguments.start_keys_stride};
-    strided_iterator<ustore_key_t const> const end_keys {arguments.end_keys, arguments.end_keys_stride};
-    measure_columns_t columns {
-        {arguments.min_cardinalities, arguments.min_cardinalities_stride},
-        {arguments.max_cardinalities, arguments.max_cardinalities_stride},
-        {arguments.min_value_bytes, arguments.min_value_bytes_stride},
-        {arguments.max_value_bytes, arguments.max_value_bytes_stride},
-        {arguments.min_space_usages, arguments.min_space_usages_stride},
-        {arguments.max_space_usages, arguments.max_space_usages_stride},
-    };
+    strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
+    strided_iterator<ustore_key_t const> const start_keys = strided(arguments.start_keys);
+    strided_iterator<ustore_key_t const> const end_keys = strided(arguments.end_keys);
+    auto [outputs, outputs_status] = measure_outputs_t::make(arguments);
+    if (outputs_status.failed()) return outputs_status;
 
     status_t outcome;
     store_status_t const walked = with_source(state, view, [&](auto& source) noexcept {
@@ -2141,13 +1987,15 @@ status_t serve(database_state<isolation_>& state, ustore_measure_t const& argume
                                         store_status_t const measuring = measure_window<entry_t>(*store, lower, last,
                                                                                                  measured);
                                         if (st::failed(measuring)) return measuring;
-                                        columns.assign(task, measured);
+                                        assign_measure(outputs, task, measured);
                                     }
                                     return store_status_t::success_k;
                                 }
                             });
     });
-    return reported(walked, outcome);
+    if (status_t const status = reported(walked, outcome); status.failed()) return status;
+    outputs.finish(arguments);
+    return {};
 }
 
 #pragma endregion Blob Calls
@@ -2159,23 +2007,19 @@ status_t serve(database_state<isolation_>& state, ustore_measure_t const& argume
 template <isolation_t isolation_>
 status_t serve(database_state<isolation_>& state, ustore_collection_list_t const& arguments,
                view_t const& view) noexcept {
-    if (!arguments.count) return {status_code_t::invalid_argument_k, "Need an output for the count"};
-    catalog_listing_t listing {{arguments.arena}, {arguments.arena}, {arguments.arena}};
+    if (!arguments.written) return {status_code_t::invalid_argument_k, "Need an output for the collections written"};
+    collection_list_outputs_t outputs {view.scratch};
     status_t outcome;
     store_status_t const walked = with_source(state, view, [&](auto& source) noexcept {
-        return source.catalog().range_from(ustore_collection_id_t {},
-                                           [&](catalog_pair<isolation_> const& pair) noexcept {
-                                               return list_entry<isolation_>(listing, pair, outcome);
-                                           });
+        return source.catalog().range_from(
+            ustore_collection_id_t {}, [&](catalog_pair<isolation_> const& pair) noexcept -> walk_control_t {
+                if (pair.key == ustore_collection_main_k) return walk_control_t::resume_k;
+                outcome = outputs.push(pair.key, pair.mapped.modality, view_of(pair.mapped.name));
+                return outcome.failed() ? walk_control_t::halt_k : walk_control_t::resume_k;
+            });
     });
     if (status_t const status = reported(walked, outcome); status.failed()) return status;
-
-    *arguments.count = static_cast<ustore_size_t>(listing.ids.size());
-    if (arguments.collections) *arguments.collections = listing.ids.begin();
-    if (arguments.modalities) *arguments.modalities = listing.modalities.begin();
-    if (arguments.names_offsets) *arguments.names_offsets = listing.names.offsets().begin().get();
-    if (arguments.names) *arguments.names = reinterpret_cast<ustore_char_t*>(listing.names.contents().begin().get());
-    return {};
+    return outputs.finish(arguments);
 }
 
 /** Implements @c ustore_collection_create as one commit of the entry, its fresh store and the name, a named
@@ -2184,8 +2028,8 @@ template <isolation_t isolation_>
 status_t serve(database_state<isolation_>& state, ustore_collection_create_t const& arguments, view_t const&) noexcept {
     if (!arguments.collection) return {status_code_t::invalid_argument_k, "Need an output for the collection"};
     if (arguments.modality > ustore_modality_pages_k) return {status_code_t::invalid_argument_k, "Unknown modality"};
-    std::string_view const name = string_of(arguments.name, arguments.name_length);
-    if (arguments.name && name.empty())
+    std::string_view const name = string_of(arguments.name);
+    if (arguments.name.data && name.empty())
         return {status_code_t::invalid_argument_k, "A name is never empty, as the main collection has none"};
     auto [created, status] = mint_collection_id();
     if (status.failed()) return status;
@@ -2209,24 +2053,24 @@ template <isolation_t isolation_>
 status_t serve(database_state<isolation_>& state, ustore_collection_drop_t const& arguments, view_t const&) noexcept {
     ustore_collection_id_t const collection = arguments.collection;
     ustore_drop_mode_t const mode = arguments.mode;
-    if (collection == ustore_collection_main_k && mode == ustore_drop_keys_vals_handle_k)
+    if (collection == ustore_collection_main_k && mode == ustore_drop_collection_k)
         return {status_code_t::invalid_argument_k, "The main collection can only be cleared"};
     status_t outcome;
     store_status_t dropped = store_status_t::success_k;
     switch (mode) {
-    case ustore_drop_keys_vals_handle_k:
+    case ustore_drop_collection_k:
         dropped = commit_catalog_change(
             state, [&](transaction_source<isolation_>& source, catalog_change<isolation_>& change) noexcept {
                 return stage_forget(source, change, collection);
             });
         break;
-    case ustore_drop_keys_vals_k:
+    case ustore_drop_pairs_k:
         dropped = commit_catalog_change(
             state, [&](transaction_source<isolation_>& source, catalog_change<isolation_>& change) noexcept {
                 return stage_emptied(source, change, collection);
             });
         break;
-    case ustore_drop_vals_k:
+    case ustore_drop_values_k:
         dropped = commit_group(state, [&](transaction_source<isolation_>& source) noexcept {
             return stage_values_emptied(source, collection, outcome);
         });
@@ -2236,29 +2080,26 @@ status_t serve(database_state<isolation_>& state, ustore_collection_drop_t const
     if (dropped == store_status_t::key_not_found_k && outcome.succeeded())
         return {status_code_t::not_found_k, "No collection has such identifier"};
     if (status_t const status = reported(dropped, outcome); status.failed()) return status;
-    if (mode == ustore_drop_keys_vals_handle_k) return persist(state);
+    if (mode == ustore_drop_collection_k) return persist(state);
     return {};
 }
 
 /** Implements @c ustore_collection_find, reading the names and the catalog at the newest stamp or at a snapshot. */
 template <isolation_t isolation_>
-status_t serve(database_state<isolation_>& state, ustore_collection_find_t const& arguments,
+status_t serve(database_state<isolation_>& state, ustore_collection_find_t const& arguments, strings_arg_t const& names,
                view_t const& view) noexcept {
     if (!arguments.count) return {};
-    if (!arguments.names || !arguments.collections)
+    if (!names || !arguments.collections)
         return {status_code_t::invalid_argument_k, "Need the names and an output for the identifiers"};
-    strings_arg_t const names {{arguments.names, arguments.names_stride},
-                               {arguments.names_lengths, arguments.names_lengths_stride}};
-    strided_iterator<ustore_collection_id_t> const ids {arguments.collections, arguments.collections_stride};
-    strided_iterator<ustore_modality_t> const modalities {arguments.modalities, arguments.modalities_stride};
-    bits_span_t const presences {arguments.presences};
+    auto [outputs, outputs_status] = collection_find_outputs_t::make(arguments);
+    if (outputs_status.failed()) return outputs_status;
 
-    return translate(with_source(state, view, [&](auto& source) noexcept -> store_status_t {
+    status_t const resolved = translate(with_source(state, view, [&](auto& source) noexcept -> store_status_t {
         auto named = source.view(state.collection_ids_by_name);
         if (!named) return named.status();
         auto const catalog = source.catalog();
         for (std::size_t index = 0; index != arguments.count; ++index) {
-            auto [key, key_status] = string_key_from(names[index]);
+            auto [key, key_status] = string_key_from(string_of(names[index]));
             if (st::failed(key_status)) return key_status;
             ustore_collection_id_t id = ustore_collection_main_k;
             bool present = false;
@@ -2276,12 +2117,13 @@ status_t serve(database_state<isolation_>& state, ustore_collection_find_t const
                     st::no_op_t {});
                 if (st::failed(listed)) return listed;
             }
-            ids[index] = present ? id : ustore_collection_main_k;
-            if (modalities) modalities[index] = modality;
-            if (presences) presences[index] = present;
+            outputs.assign(index, present ? id : ustore_collection_main_k, modality, present);
         }
         return store_status_t::success_k;
     }));
+    if (resolved.failed()) return resolved;
+    outputs.finish(arguments);
+    return {};
 }
 
 #pragma endregion Collection Calls
@@ -2308,23 +2150,15 @@ store_status_t stage_string_runs(source_type_& source, strided_iterator<ustore_c
 
 /** Implements @c ustore_strings_write, committing a batch outside a transaction atomically. */
 template <isolation_t isolation_>
-status_t serve(database_state<isolation_>& state, ustore_strings_write_t const& arguments,
-               view_t const& view) noexcept {
+status_t serve(database_state<isolation_>& state, ustore_strings_write_t const& arguments, strings_arg_t const& texts,
+               strings_arg_t const& values, view_t const& view) noexcept {
     if (!arguments.count) return {};
-    if (!arguments.strings || !arguments.values)
-        return {status_code_t::invalid_argument_k, "Need the strings and their values"};
-    strided_iterator<ustore_collection_id_t const> const collections {arguments.collections,
-                                                                      arguments.collections_stride};
-    strings_arg_t const texts {{arguments.strings, arguments.strings_stride},
-                               {arguments.strings_lengths, arguments.strings_lengths_stride}};
-    contents_arg_t const contents {{arguments.values_starts, arguments.values_starts_stride},
-                                   {arguments.values_lengths, arguments.values_lengths_stride},
-                                   {arguments.values, arguments.values_stride},
-                                   arguments.count};
+    if (!texts || !values) return {status_code_t::invalid_argument_k, "Need the strings and their values"};
+    strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     return serve_write(state, arguments.durability, view, [&](auto& source, status_t& outcome) noexcept {
         return stage_string_runs(source, collections, arguments.count, outcome,
                                  [&](auto& part, std::size_t first, std::size_t end) noexcept {
-                                     return stage_strings(part, texts, contents, first, end);
+                                     return stage_strings(part, texts, values, first, end);
                                  });
     });
 }
@@ -2332,14 +2166,11 @@ status_t serve(database_state<isolation_>& state, ustore_strings_write_t const& 
 /** Implements @c ustore_strings_remove, committing a batch outside a transaction atomically, where a string already
  *  gone stays gone. */
 template <isolation_t isolation_>
-status_t serve(database_state<isolation_>& state, ustore_strings_remove_t const& arguments,
+status_t serve(database_state<isolation_>& state, ustore_strings_remove_t const& arguments, strings_arg_t const& texts,
                view_t const& view) noexcept {
     if (!arguments.count) return {};
-    if (!arguments.strings) return {status_code_t::invalid_argument_k, "No strings were provided"};
-    strided_iterator<ustore_collection_id_t const> const collections {arguments.collections,
-                                                                      arguments.collections_stride};
-    strings_arg_t const texts {{arguments.strings, arguments.strings_stride},
-                               {arguments.strings_lengths, arguments.strings_lengths_stride}};
+    if (!texts) return {status_code_t::invalid_argument_k, "No strings were provided"};
+    strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     return serve_write(state, arguments.durability, view, [&](auto& source, status_t& outcome) noexcept {
         return stage_string_runs(source, collections, arguments.count, outcome,
                                  [&](auto& part, std::size_t first, std::size_t end) noexcept {
@@ -2350,48 +2181,46 @@ status_t serve(database_state<isolation_>& state, ustore_strings_remove_t const&
 
 /** Implements @c ustore_strings_read, copying every value into the caller's arena once. */
 template <isolation_t isolation_>
-status_t serve(database_state<isolation_>& state, ustore_strings_read_t const& arguments, view_t const& view) noexcept {
+status_t serve(database_state<isolation_>& state, ustore_strings_read_t const& arguments, strings_arg_t const& texts,
+               view_t const& view) noexcept {
     if (!arguments.count) return {};
-    if (!arguments.strings) return {status_code_t::invalid_argument_k, "No strings were provided"};
-    strided_iterator<ustore_collection_id_t const> const collections {arguments.collections,
-                                                                      arguments.collections_stride};
-    strings_arg_t const texts {{arguments.strings, arguments.strings_stride},
-                               {arguments.strings_lengths, arguments.strings_lengths_stride}};
+    if (!texts) return {status_code_t::invalid_argument_k, "No strings were provided"};
+    strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     status_t outcome;
-    value_tape tape {arguments, outcome};
+    auto [outputs, outputs_status] = read_outputs_t::make(arguments, view.scratch);
+    if (outputs_status.failed()) return outputs_status;
 
+    // The source's claim keeps every version found alive until the outputs copy its value
     store_status_t const read = with_source(state, view, [&](auto& source) noexcept {
-        return for_each_run(source, collections, arguments.count, outcome,
-                            [&](auto& entries, std::size_t first, std::size_t end) noexcept -> store_status_t {
-                                using entry_t = entry_of<decltype(entries)>;
-                                if constexpr (!std::is_same_v<entry_t, string_pair_t>)
-                                    return refused(outcome, "The collection holds no strings");
-                                else {
-                                    auto store = source.view(entries);
-                                    if (!store) return store.status();
-                                    return read_strings(*store, texts, first, end, tape, outcome);
-                                }
-                            });
+        store_status_t const runs = for_each_run(
+            source, collections, arguments.count, outcome,
+            [&](auto& entries, std::size_t first, std::size_t end) noexcept -> store_status_t {
+                using entry_t = entry_of<decltype(entries)>;
+                if constexpr (!std::is_same_v<entry_t, string_pair_t>)
+                    return refused(outcome, "The collection holds no strings");
+                else {
+                    auto store = source.view(entries);
+                    if (!store) return store.status();
+                    return read_strings(*store, texts, first, end, outputs);
+                }
+            });
+        if (st::succeeded(runs) && outcome.succeeded()) outcome = outputs.finish(arguments);
+        return runs;
     });
-    if (status_t const status = reported(read, outcome); status.failed()) return status;
-    tape.finish();
-    return {};
+    return reported(read, outcome);
 }
 
 /** Implements @c ustore_strings_scan as ordered walks of each collection's strings. */
 template <isolation_t isolation_>
-status_t serve(database_state<isolation_>& state, ustore_strings_scan_t const& arguments, view_t const& view) noexcept {
+status_t serve(database_state<isolation_>& state, ustore_strings_scan_t const& arguments, strings_arg_t const& prefixes,
+               strings_arg_t const& starts, view_t const& view) noexcept {
     if (!arguments.count) return {};
-    if (!arguments.count_limits || !arguments.offsets || !arguments.strings_offsets || !arguments.strings)
-        return {status_code_t::invalid_argument_k, "Need the limits and outputs for the offsets and strings"};
-    strided_iterator<ustore_collection_id_t const> const collections {arguments.collections,
-                                                                      arguments.collections_stride};
-    strings_arg_t const prefixes {{arguments.prefixes, arguments.prefixes_stride},
-                                  {arguments.prefixes_lengths, arguments.prefixes_lengths_stride}};
-    strings_arg_t const starts {{arguments.start_strings, arguments.start_strings_stride},
-                                {arguments.start_strings_lengths, arguments.start_strings_lengths_stride}};
-    strided_iterator<ustore_length_t const> const limits {arguments.count_limits, arguments.count_limits_stride};
-    string_tape found {arguments.arena, arguments.strings_offsets};
+    if (!arguments.offsets || !arguments.strings)
+        return {status_code_t::invalid_argument_k, "Need outputs for the offsets and the strings"};
+    strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
+    auto [outputs, outputs_status] = strings_scan_outputs_t::make(arguments, view.scratch);
+    if (outputs_status.failed()) return outputs_status;
+    progress_t progress {arguments.progress, arguments.progress_state, arguments.count};
 
     status_t outcome;
     store_status_t const walked = with_source(state, view, [&](auto& source) noexcept {
@@ -2404,45 +2233,42 @@ status_t serve(database_state<isolation_>& state, ustore_strings_scan_t const& a
                 else {
                     auto store = source.view(entries);
                     if (!store) return store.status();
-                    for (std::size_t task = first; task != end; ++task) {
-                        std::string_view const prefix = arguments.prefixes ? prefixes[task] : std::string_view {};
-                        std::string_view const start = arguments.start_strings ? starts[task] : std::string_view {};
-                        arguments.offsets[task] = static_cast<ustore_length_t>(found.size());
-                        store_status_t const scanned = scan_strings(*store, prefix, start, limits[task], found,
+                    for (std::size_t task = first; task != end && outcome.succeeded(); ++task) {
+                        std::string_view const prefix = prefixes ? string_of(prefixes[task]) : std::string_view {};
+                        std::string_view const start = starts ? string_of(starts[task]) : std::string_view {};
+                        outputs.open_task(task);
+                        store_status_t const scanned = scan_strings(*store, prefix, start, arguments.wanted, outputs,
                                                                     outcome);
                         if (st::failed(scanned) || outcome.failed()) return scanned;
+                        if (!progress.advance(1)) outcome = progress_cancelled_k;
                     }
                     return store_status_t::success_k;
                 }
             });
     });
     if (status_t const status = reported(walked, outcome); status.failed()) return status;
-    arguments.offsets[arguments.count] = static_cast<ustore_length_t>(found.size());
-    *arguments.strings = found.contents();
-    return {};
+    return outputs.finish(arguments);
 }
 
 #pragma endregion Strings Calls
 
 #pragma region Graph Calls
 
-/** Implements @c ustore_graph_find_edges as walks of each vertex's half-edges in the roles it asks for. */
+/** Implements @c ustore_graph_read_edges as walks of each vertex's half-edges in the roles it asks for. */
 template <isolation_t isolation_>
-status_t serve(database_state<isolation_>& state, ustore_graph_find_edges_t const& arguments,
+status_t serve(database_state<isolation_>& state, ustore_graph_read_edges_t const& arguments,
                view_t const& view) noexcept {
     if (!arguments.count) return {};
-    if (!arguments.vertices || !arguments.degrees_per_vertex)
+    if (!arguments.vertices.data || !arguments.degrees_per_vertex)
         return {status_code_t::invalid_argument_k, "Need the vertices and an output for their degrees"};
-    strided_iterator<ustore_collection_id_t const> const collections {arguments.collections,
-                                                                      arguments.collections_stride};
-    find_edges_t const tasks {collections,
-                              {arguments.vertices, arguments.vertices_stride},
-                              {arguments.roles, arguments.roles_stride},
-                              arguments.count};
-    strided_iterator<ustore_vertex_degree_t> degrees {arguments.degrees_per_vertex,
-                                                      arguments.degrees_per_vertex_stride};
-    uninitialized_array<ustore_key_t> edges {arguments.arena};
-    uninitialized_array<half_edge_t> walked {arguments.arena};
+    if (arguments.edges_per_vertex && !arguments.edges_offsets)
+        return {status_code_t::invalid_argument_k, "Need an output for the offsets of the edges"};
+    strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
+    edges_batch_t const tasks {collections, strided(arguments.vertices), strided(arguments.roles), arguments.count};
+    auto [degrees, degrees_status] = arena_allocate<ustore_vertex_degree_t>(arguments.arena, arguments.count);
+    if (degrees_status.failed()) return degrees_status;
+    st::basic_vector<ustore_key_t, arena_allocator<ustore_key_t>> edges {{view.scratch}};
+    st::basic_vector<half_edge_t, arena_allocator<half_edge_t>> walked {{view.scratch}};
 
     status_t outcome;
     store_status_t const exported = with_source(state, view, [&](auto& source) noexcept {
@@ -2460,7 +2286,20 @@ status_t serve(database_state<isolation_>& state, ustore_graph_find_edges_t cons
                             });
     });
     if (status_t const status = reported(exported, outcome); status.failed()) return status;
-    if (arguments.edges_per_vertex) *arguments.edges_per_vertex = edges.begin();
+    auto [copied_edges, edges_status] = arena_copy<ustore_key_t>(arguments.arena, edges);
+    if (edges_status.failed()) return edges_status;
+
+    // A missing vertex spans no edges
+    auto [offsets, offsets_status] = arena_allocate<ustore_length_t>(arguments.arena,
+                                                                     arguments.edges_offsets ? arguments.count + 1 : 0);
+    if (offsets_status.failed()) return offsets_status;
+    if (!offsets.empty()) offsets[0] = 0;
+    for (std::size_t index = 0; index + 1 < offsets.size(); ++index)
+        offsets[index + 1] = offsets[index] + (degrees[index] == ustore_vertex_degree_missing_k ? 0 : degrees[index]);
+
+    *arguments.degrees_per_vertex = degrees.data();
+    if (arguments.edges_offsets) *arguments.edges_offsets = offsets.data();
+    if (arguments.edges_per_vertex) *arguments.edges_per_vertex = copied_edges.data();
     return {};
 }
 
@@ -2482,22 +2321,19 @@ store_status_t stage_graph_runs(source_type_& source, strided_iterator<ustore_co
                         });
 }
 
-/** Implements @c ustore_graph_upsert_edges, filing every edge under both of its ends. */
+/** Implements @c ustore_graph_write_edges, filing every edge under both of its ends. */
 template <isolation_t isolation_>
-status_t serve(database_state<isolation_>& state, ustore_graph_upsert_edges_t const& arguments,
+status_t serve(database_state<isolation_>& state, ustore_graph_write_edges_t const& arguments,
                view_t const& view) noexcept {
     if (!arguments.count) return {};
-    if (!arguments.sources || !arguments.targets)
+    if (!arguments.sources.data || !arguments.targets.data)
         return {status_code_t::invalid_argument_k, "Need the sources and the targets of the edges"};
-    strided_iterator<ustore_collection_id_t const> const collections {arguments.collections,
-                                                                      arguments.collections_stride};
-    edge_columns_t const columns {{arguments.edges, arguments.edges_stride},
-                                  {arguments.sources, arguments.sources_stride},
-                                  {arguments.targets, arguments.targets_stride}};
+    strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
+    edges_view_t const edges = edges_of(arguments);
     return serve_write(state, arguments.durability, view, [&](auto& source, status_t& outcome) noexcept {
         return stage_graph_runs(source, collections, arguments.count, outcome,
                                 [&](auto& part, std::size_t first, std::size_t end) noexcept {
-                                    return stage_edges(part, columns, first, end);
+                                    return stage_edges(part, edges, first, end);
                                 });
     });
 }
@@ -2507,30 +2343,26 @@ template <isolation_t isolation_>
 status_t serve(database_state<isolation_>& state, ustore_graph_remove_edges_t const& arguments,
                view_t const& view) noexcept {
     if (!arguments.count) return {};
-    if (!arguments.sources || !arguments.targets)
+    if (!arguments.sources.data || !arguments.targets.data)
         return {status_code_t::invalid_argument_k, "Need the sources and the targets of the edges"};
-    strided_iterator<ustore_collection_id_t const> const collections {arguments.collections,
-                                                                      arguments.collections_stride};
-    edge_columns_t const columns {{arguments.edges, arguments.edges_stride},
-                                  {arguments.sources, arguments.sources_stride},
-                                  {arguments.targets, arguments.targets_stride}};
+    strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
+    edges_view_t const edges = edges_of(arguments);
     return serve_write(state, arguments.durability, view, [&](auto& source, status_t& outcome) noexcept {
         return stage_graph_runs(source, collections, arguments.count, outcome,
                                 [&](auto& part, std::size_t first, std::size_t end) noexcept {
-                                    return stage_edges_removal(part, columns, first, end);
+                                    return stage_edges_removal(part, edges, first, end);
                                 });
     });
 }
 
-/** Implements @c ustore_graph_upsert_vertices, adding every vertex that is not one already. */
+/** Implements @c ustore_graph_write_vertices, adding every vertex that is not one already. */
 template <isolation_t isolation_>
-status_t serve(database_state<isolation_>& state, ustore_graph_upsert_vertices_t const& arguments,
+status_t serve(database_state<isolation_>& state, ustore_graph_write_vertices_t const& arguments,
                view_t const& view) noexcept {
     if (!arguments.count) return {};
-    if (!arguments.vertices) return {status_code_t::invalid_argument_k, "No vertices were provided"};
-    strided_iterator<ustore_collection_id_t const> const collections {arguments.collections,
-                                                                      arguments.collections_stride};
-    strided_iterator<ustore_key_t const> const vertices {arguments.vertices, arguments.vertices_stride};
+    if (!arguments.vertices.data) return {status_code_t::invalid_argument_k, "No vertices were provided"};
+    strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
+    strided_iterator<ustore_key_t const> const vertices = strided(arguments.vertices);
     return serve_write(state, arguments.durability, view, [&](auto& source, status_t& outcome) noexcept {
         return stage_graph_runs(source, collections, arguments.count, outcome,
                                 [&](auto& part, std::size_t first, std::size_t end) noexcept {
@@ -2549,12 +2381,11 @@ template <isolation_t isolation_>
 status_t serve(database_state<isolation_>& state, ustore_graph_remove_vertices_t const& arguments,
                view_t const& view) noexcept {
     if (!arguments.count) return {};
-    if (!arguments.vertices) return {status_code_t::invalid_argument_k, "No vertices were provided"};
-    strided_iterator<ustore_collection_id_t const> const collections {arguments.collections,
-                                                                      arguments.collections_stride};
-    strided_iterator<ustore_key_t const> const vertices {arguments.vertices, arguments.vertices_stride};
-    strided_iterator<ustore_vertex_role_t const> const roles {arguments.roles, arguments.roles_stride};
-    st::basic_vector<half_edge_t> walked;
+    if (!arguments.vertices.data) return {status_code_t::invalid_argument_k, "No vertices were provided"};
+    strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
+    strided_iterator<ustore_key_t const> const vertices = strided(arguments.vertices);
+    strided_iterator<ustore_vertex_role_t const> const roles = strided(arguments.roles);
+    st::basic_vector<half_edge_t, arena_allocator<half_edge_t>> walked {{view.scratch}};
     return serve_write(state, arguments.durability, view, [&](auto& source, status_t& outcome) noexcept {
         return stage_graph_runs(
             source, collections, arguments.count, outcome,
@@ -2606,7 +2437,7 @@ status_t serve(database_state<isolation_>&, ustore_transaction_stage_t const& ar
     if (!view.transaction) return {status_code_t::uninitialized_k, "Transaction is uninitialized"};
     auto& transaction = handle_cast<transaction_handle<isolation_>>(view.transaction)->transaction;
     if (store_status_t const staged = stage_once<isolation_>(transaction); st::failed(staged)) return translate(staged);
-    if (arguments.stamp) *arguments.stamp = transaction.generation();
+    if (arguments.read_stamp) *arguments.read_stamp = transaction.snapshot();
     return {};
 }
 
@@ -2619,7 +2450,7 @@ status_t serve(database_state<isolation_>& state, ustore_transaction_commit_t co
     auto& transaction = handle_cast<transaction_handle<isolation_>>(view.transaction)->transaction;
     if (store_status_t const staged = stage_once<isolation_>(transaction); st::failed(staged)) return translate(staged);
     if (store_status_t const committed = transaction.commit(); st::failed(committed)) return translate(committed);
-    if (arguments.stamp) *arguments.stamp = transaction.commit_stamp();
+    if (arguments.commit_stamp) *arguments.commit_stamp = transaction.commit_stamp();
     free_unreachable(state);
     if (arguments.durability == ustore_durability_flushed_k) return persist(state);
     return {};
@@ -2639,10 +2470,12 @@ status_t serve(database_state<isolation_>&, ustore_transaction_rollback_t const&
 
 #pragma region Dispatch
 
-/** Serves a call on the database @p arguments names, whose handle the table of @p isolation_ stamped. */
-template <isolation_t isolation_, typename arguments_type_>
-status_t serve_database(arguments_type_ const& arguments, view_t const& view) noexcept {
-    return serve(*handle_cast<database_state<isolation_>>(arguments.database), arguments, view);
+/** Serves a call on the database @p arguments address, whose handle the table of @p isolation_ stamped, with the
+ *  ragged inputs the router gathered for it. */
+template <isolation_t isolation_, typename arguments_type_, typename... strings_types_>
+status_t serve_database(arguments_type_ const& arguments, strings_types_ const&... strings,
+                        view_t const& view) noexcept {
+    return serve(*handle_cast<database_state<isolation_>>(database_of(arguments)), arguments, strings..., view);
 }
 
 /** Allocates a database at @p isolation_ and loads the image of @p directory. */
@@ -2657,14 +2490,12 @@ expected<ustore_database_t> make_database(std::string_view directory) noexcept {
     return c_handle<ustore_database_t>(database);
 }
 
-/** Opens the database @p arguments describe into their output, which stays null unless the open succeeds. */
-status_t open_ram(ustore_database_init_ram_t const& arguments) noexcept {
-    if (arguments.executor) return {status_code_t::unsupported_k, "This build runs every call on the calling thread"};
+/** Opens the database @p arguments describe into their output, which stays null unless the open succeeds, persisting
+ *  in @p directory unless it is empty. */
+template <typename arguments_type_>
+status_t open_in(arguments_type_ const& arguments, std::string_view directory) noexcept {
     if (!arguments.database) return {status_code_t::invalid_argument_k, "Need an output for the database"};
     *arguments.database = nullptr;
-    std::string_view const directory = arguments.directory ? arguments.directory : "";
-    if (!directory.empty() && !names_directory(arguments.directory))
-        return {status_code_t::not_found_k, "The directory doesn't exist"};
     if (arguments.isolation != ustore_isolation_strict_serializable_k &&
         arguments.isolation != ustore_isolation_snapshot_k)
         return {status_code_t::invalid_argument_k, "Unknown isolation"};
@@ -2675,11 +2506,11 @@ status_t open_ram(ustore_database_init_ram_t const& arguments) noexcept {
     return status;
 }
 
-status_t database_describe(ustore_database_describe_t const& arguments, view_t const&) noexcept {
-    if (!arguments.description) return {status_code_t::invalid_argument_k, "Need an output for the description"};
-    *arguments.description = {ustore_capabilities_t(ustore_supports_transactions_k | ustore_supports_collections_k |
-                                                    ustore_supports_snapshots_k)};
-    return {};
+status_t init(ustore_database_init_ram_t const& arguments, view_t const&) noexcept { return open_in(arguments, {}); }
+
+status_t open(ustore_database_open_ram_t const& arguments, view_t const&) noexcept {
+    if (!arguments.directory.length) return {status_code_t::invalid_argument_k, "A database needs a directory"};
+    return open_in(arguments, string_of(arguments.directory));
 }
 
 /** Frees @p transaction, releasing the stamp it claimed, and the stores only it still reached. */
@@ -2712,37 +2543,38 @@ void database_free(ustore_database_t database) noexcept {
 
 template <isolation_t isolation_>
 engine_t const engine_k {
-    .database_describe = &database_describe,
-    .database_control = &serve_database<isolation_, ustore_database_control_t>,
+    .database_describe = &serve_database<isolation_, ustore_database_describe_t>,
+    .database_clear = &serve_database<isolation_, ustore_database_clear_t>,
+    .database_compact = &serve_database<isolation_, ustore_database_compact_t>,
     .snapshot_init = &serve_database<isolation_, ustore_snapshot_init_t>,
-    .snapshot_export = &serve_database<isolation_, ustore_snapshot_export_t>,
+    .snapshot_save = &serve_database<isolation_, ustore_snapshot_save_t>,
     .collection_list = &serve_database<isolation_, ustore_collection_list_t>,
     .collection_create = &serve_database<isolation_, ustore_collection_create_t>,
-    .collection_find = &serve_database<isolation_, ustore_collection_find_t>,
+    .collection_find = &serve_database<isolation_, ustore_collection_find_t, strings_arg_t>,
     .collection_drop = &serve_database<isolation_, ustore_collection_drop_t>,
     .transaction_init = &serve_database<isolation_, ustore_transaction_init_t>,
     .transaction_stage = &serve_database<isolation_, ustore_transaction_stage_t>,
     .transaction_commit = &serve_database<isolation_, ustore_transaction_commit_t>,
     .transaction_rollback = &serve_database<isolation_, ustore_transaction_rollback_t>,
-    .write = &serve_database<isolation_, ustore_write_t>,
-    .remove = &serve_database<isolation_, ustore_remove_t>,
-    .read = &serve_database<isolation_, ustore_read_t>,
-    .scan = &serve_database<isolation_, ustore_scan_t>,
-    .sample = &serve_database<isolation_, ustore_sample_t>,
-    .measure = &serve_database<isolation_, ustore_measure_t>,
+    .blobs_write = &serve_database<isolation_, ustore_blobs_write_t, strings_arg_t>,
+    .blobs_remove = &serve_database<isolation_, ustore_blobs_remove_t>,
+    .blobs_read = &serve_database<isolation_, ustore_blobs_read_t>,
+    .blobs_scan = &serve_database<isolation_, ustore_blobs_scan_t>,
+    .blobs_sample = &serve_database<isolation_, ustore_blobs_sample_t>,
+    .blobs_measure = &serve_database<isolation_, ustore_blobs_measure_t>,
     .docs_write = &docs_write_in_json_values,
     .docs_read = &docs_read_in_json_values,
     .docs_gist = &docs_gist_in_json_values,
     .docs_gather = &docs_gather_in_json_values,
-    .graph_find_edges = &serve_database<isolation_, ustore_graph_find_edges_t>,
-    .graph_upsert_edges = &serve_database<isolation_, ustore_graph_upsert_edges_t>,
+    .graph_read_edges = &serve_database<isolation_, ustore_graph_read_edges_t>,
+    .graph_write_edges = &serve_database<isolation_, ustore_graph_write_edges_t>,
     .graph_remove_edges = &serve_database<isolation_, ustore_graph_remove_edges_t>,
-    .graph_upsert_vertices = &serve_database<isolation_, ustore_graph_upsert_vertices_t>,
+    .graph_write_vertices = &serve_database<isolation_, ustore_graph_write_vertices_t>,
     .graph_remove_vertices = &serve_database<isolation_, ustore_graph_remove_vertices_t>,
-    .strings_write = &serve_database<isolation_, ustore_strings_write_t>,
-    .strings_remove = &serve_database<isolation_, ustore_strings_remove_t>,
-    .strings_read = &serve_database<isolation_, ustore_strings_read_t>,
-    .strings_scan = &serve_database<isolation_, ustore_strings_scan_t>,
+    .strings_write = &serve_database<isolation_, ustore_strings_write_t, strings_arg_t, strings_arg_t>,
+    .strings_remove = &serve_database<isolation_, ustore_strings_remove_t, strings_arg_t>,
+    .strings_read = &serve_database<isolation_, ustore_strings_read_t, strings_arg_t>,
+    .strings_scan = &serve_database<isolation_, ustore_strings_scan_t, strings_arg_t, strings_arg_t>,
     .transaction_free = &transaction_free<isolation_>,
     .snapshot_free = &snapshot_free<isolation_>,
     .database_free = &database_free<isolation_>,
@@ -2756,7 +2588,6 @@ using namespace unum::ustore::ram;
 
 #pragma region C ABI
 
-void ustore_database_init_ram(ustore_database_init_ram_t* arguments) {
-    // Opening runs before any handle exists to route through, so the outcome is stored plainly once it is final
-    *arguments->outcome = open_ram(*arguments);
-}
+void ustore_database_init_ram(ustore_database_init_ram_t* arguments) { route_init(arguments, &init); }
+
+void ustore_database_open_ram(ustore_database_open_ram_t* arguments) { route_init(arguments, &open); }

@@ -1,5 +1,5 @@
 /**
- *  @file src/cuda.hpp
+ *  @file src/utilities/vram_nvidia_device.hpp
  *  @author Ash Vardanian
  *  @date September 15, 2026
  *  @brief CUDA devices from the host: specifications, memory, NUMA placement, streams, events and buffers.
@@ -26,12 +26,12 @@
 #include <smashtable/basic_vector.hpp>
 #include <smashtable/shared.hpp>
 
-#include "executor.hpp"
+#include "utilities/ram_device.hpp"
 #endif
 
 #if __has_include(<cuda_runtime.h>)
 
-namespace unum::ustore {
+namespace unum::ustore::utilities {
 
 #pragma region Devices
 
@@ -650,6 +650,6 @@ using cuda_pinned_buffer = cuda_buffer<element_type_, cuda_pinned_allocator<elem
 
 #pragma endregion Memory
 
-} // namespace unum::ustore
+} // namespace unum::ustore::utilities
 
 #endif

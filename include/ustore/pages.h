@@ -27,7 +27,8 @@
  *  stored; they are the application's ephemeral state.
  */
 
-#pragma once
+#ifndef UNUM_USTORE_PAGES_H
+#define UNUM_USTORE_PAGES_H
 
 #include "ustore/db.h"
 
@@ -35,25 +36,23 @@
 extern "C" {
 #endif
 
-#pragma region Types
-
 /** Encoding a page or a fragment is imported from or rendered into. */
 typedef enum ustore_page_encoding_t {
 
     /** HTML, parsed into elements and rendered back as markup. */
-    ustore_page_html_k = 0,
+    ustore_page_encoding_html_k = 0,
 
     /** XML, with every element and attribute kept as written. */
-    ustore_page_xml_k = 1,
+    ustore_page_encoding_xml_k = 1,
 
     /** Markdown, parsed into headings, paragraphs, lists, tables and code, and rendered back. */
-    ustore_page_markdown_k = 2,
+    ustore_page_encoding_markdown_k = 2,
 
     /** The text of every run in document order, with structure dropped. */
-    ustore_page_text_k = 3,
+    ustore_page_encoding_text_k = 3,
 
     /** The element tree as JSON: key, tag, attributes, text and children, for programmatic access. */
-    ustore_page_json_k = 4,
+    ustore_page_encoding_json_k = 4,
 
 } ustore_page_encoding_t;
 
@@ -83,9 +82,30 @@ typedef enum ustore_page_modification_t {
 
 } ustore_page_modification_t;
 
-#pragma endregion Types
+/** The canonical spelling of an encoding, as @c ustore_page_encoding_markdown_k spells "markdown", or
+ *  "unrecognized". */
+USTORE_EXPORT char const* ustore_page_encoding_name(ustore_page_encoding_t encoding);
 
-#pragma region Edits
+/** Reads an encoding back from its canonical spelling; @c ustore_page_encoding_html_k when unrecognized. */
+USTORE_EXPORT ustore_page_encoding_t ustore_page_encoding_from_name(ustore_bytes_view_t name);
+
+/** The canonical spelling of a modification, as @c ustore_page_modify_set_attributes_k spells "set-attributes", or
+ *  "unrecognized". */
+USTORE_EXPORT char const* ustore_page_modification_name(ustore_page_modification_t modification);
+
+/** Reads a modification back from its canonical spelling; @c ustore_page_modify_import_k when unrecognized. */
+USTORE_EXPORT ustore_page_modification_t ustore_page_modification_from_name(ustore_bytes_view_t name);
+
+/** A strided run of commit stamps, one per task. */
+typedef struct ustore_stamps_view_t {
+
+    /** First stamp of the run. */
+    ustore_stamp_t const* data;
+
+    /** Bytes between consecutive stamps, where zero repeats the first one. */
+    ustore_size_t stride;
+
+} ustore_stamps_view_t;
 
 /** The arguments of @c ustore_pages_import, which replaces whole pages with parsed markup. */
 typedef struct ustore_pages_import_t {
@@ -108,36 +128,14 @@ typedef struct ustore_pages_import_t {
     /** Number of pages. */
     ustore_size_t count;
 
-    /** Collections of the pages, where @c NULL stands for the main collection. */
-    ustore_collection_id_t const* collections;
-
-    /** Bytes between consecutive collections, where zero repeats the first one. */
-    ustore_size_t collections_stride;
+    /** Collections of the pages, where @c NULL data stands for the main collection. */
+    ustore_collections_view_t collections;
 
     /** Keys of the pages. */
-    ustore_key_t const* keys;
+    ustore_keys_view_t keys;
 
-    /** Bytes between consecutive keys, where zero repeats the first one. */
-    ustore_size_t keys_stride;
-
-    /** Optional starts of the markup within the chunks of @c values, where @c NULL starts every page at its chunk. */
-    ustore_length_t const* starts;
-
-    /** Bytes between consecutive starts, where zero repeats the first one. */
-    ustore_size_t starts_stride;
-
-    /** Optional lengths of the markup; without them every page ends where the next one starts, reading one start
-     *  past the last page, or at a null terminator when @c starts is absent too. */
-    ustore_length_t const* lengths;
-
-    /** Bytes between consecutive lengths, where zero repeats the first one. */
-    ustore_size_t lengths_stride;
-
-    /** Pointers to the chunks holding the markup, @c NULL only when there are no tasks. */
-    ustore_bytes_cptr_t const* values;
-
-    /** Bytes between consecutive chunk pointers, where zero repeats the first one. */
-    ustore_size_t values_stride;
+    /** Markup of the pages, one per task. */
+    ustore_strings_view_t values;
 
     /** Encoding of the markup. */
     ustore_page_encoding_t encoding;
@@ -183,64 +181,32 @@ typedef struct ustore_pages_insert_t {
     /** Number of insertions. */
     ustore_size_t count;
 
-    /** Collections of the pages, where @c NULL stands for the main collection. */
-    ustore_collection_id_t const* collections;
-
-    /** Bytes between consecutive collections, where zero repeats the first one. */
-    ustore_size_t collections_stride;
+    /** Collections of the pages, where @c NULL data stands for the main collection. */
+    ustore_collections_view_t collections;
 
     /** Keys of the pages. */
-    ustore_key_t const* keys;
+    ustore_keys_view_t keys;
 
-    /** Bytes between consecutive keys, where zero repeats the first one. */
-    ustore_size_t keys_stride;
-
-    /** Keys to give the inserted elements, where Nil or @c NULL mints one. */
-    ustore_key_t const* elements;
-
-    /** Bytes between consecutive elements, where zero repeats the first one. */
-    ustore_size_t elements_stride;
+    /** Keys to give the inserted elements, where Nil or @c NULL data mints one. */
+    ustore_keys_view_t elements;
 
     /** Parents the elements land under, where Nil stands for the root. */
-    ustore_key_t const* parents;
-
-    /** Bytes between consecutive parents, where zero repeats the first one. */
-    ustore_size_t parents_stride;
+    ustore_keys_view_t parents;
 
     /** Siblings after which the elements land, where Nil stands for the front. */
-    ustore_key_t const* anchors;
+    ustore_keys_view_t anchors;
 
-    /** Bytes between consecutive anchors, where zero repeats the first one. */
-    ustore_size_t anchors_stride;
-
-    /** Optional starts of the fragments within the chunks of @c values, where @c NULL starts every fragment at its
-     *  chunk. */
-    ustore_length_t const* starts;
-
-    /** Bytes between consecutive starts, where zero repeats the first one. */
-    ustore_size_t starts_stride;
-
-    /** Optional lengths of the fragments; without them every fragment ends where the next one starts, reading one
-     *  start past the last fragment, or at a null terminator when @c starts is absent too. */
-    ustore_length_t const* lengths;
-
-    /** Bytes between consecutive lengths, where zero repeats the first one. */
-    ustore_size_t lengths_stride;
-
-    /** Pointers to the chunks holding the fragments, @c NULL only when there are no tasks. */
-    ustore_bytes_cptr_t const* values;
-
-    /** Bytes between consecutive chunk pointers, where zero repeats the first one. */
-    ustore_size_t values_stride;
-
-    /** Optional output for the key every inserted element ended up with, minted or given. */
-    ustore_key_t* effective_keys;
-
-    /** Bytes between consecutive output keys, never zero. */
-    ustore_size_t effective_keys_stride;
+    /** Fragments to parse into elements, one per task. */
+    ustore_strings_view_t values;
 
     /** Encoding of the fragments. */
     ustore_page_encoding_t encoding;
+
+    /** Optional output for the key every inserted element ended up with, minted or given, inside @c arena. */
+    ustore_key_t const** effective_keys;
+
+    /** Rewound by this call, then holding every output it writes; @c NULL is refused. */
+    ustore_arena_t arena;
 
     /** How durable the edits are once the call finishes at the head; a transaction's commit decides its own. */
     ustore_durability_t durability;
@@ -277,23 +243,14 @@ typedef struct ustore_pages_remove_t {
     /** Number of removals. */
     ustore_size_t count;
 
-    /** Collections of the pages, where @c NULL stands for the main collection. */
-    ustore_collection_id_t const* collections;
-
-    /** Bytes between consecutive collections, where zero repeats the first one. */
-    ustore_size_t collections_stride;
+    /** Collections of the pages, where @c NULL data stands for the main collection. */
+    ustore_collections_view_t collections;
 
     /** Keys of the pages. */
-    ustore_key_t const* keys;
-
-    /** Bytes between consecutive keys, where zero repeats the first one. */
-    ustore_size_t keys_stride;
+    ustore_keys_view_t keys;
 
     /** Elements to remove with their subtrees. */
-    ustore_key_t const* elements;
-
-    /** Bytes between consecutive elements, where zero repeats the first one. */
-    ustore_size_t elements_stride;
+    ustore_keys_view_t elements;
 
     /** How durable the edits are once the call finishes at the head; a transaction's commit decides its own. */
     ustore_durability_t durability;
@@ -330,35 +287,20 @@ typedef struct ustore_pages_move_t {
     /** Number of moves. */
     ustore_size_t count;
 
-    /** Collections of the pages, where @c NULL stands for the main collection. */
-    ustore_collection_id_t const* collections;
-
-    /** Bytes between consecutive collections, where zero repeats the first one. */
-    ustore_size_t collections_stride;
+    /** Collections of the pages, where @c NULL data stands for the main collection. */
+    ustore_collections_view_t collections;
 
     /** Keys of the pages. */
-    ustore_key_t const* keys;
-
-    /** Bytes between consecutive keys, where zero repeats the first one. */
-    ustore_size_t keys_stride;
+    ustore_keys_view_t keys;
 
     /** Elements to move with their subtrees. */
-    ustore_key_t const* elements;
-
-    /** Bytes between consecutive elements, where zero repeats the first one. */
-    ustore_size_t elements_stride;
+    ustore_keys_view_t elements;
 
     /** Parents the elements land under, where Nil stands for the root. */
-    ustore_key_t const* parents;
-
-    /** Bytes between consecutive parents, where zero repeats the first one. */
-    ustore_size_t parents_stride;
+    ustore_keys_view_t parents;
 
     /** Siblings after which the elements land, where Nil stands for the front. */
-    ustore_key_t const* anchors;
-
-    /** Bytes between consecutive anchors, where zero repeats the first one. */
-    ustore_size_t anchors_stride;
+    ustore_keys_view_t anchors;
 
     /** How durable the edits are once the call finishes at the head; a transaction's commit decides its own. */
     ustore_durability_t durability;
@@ -395,54 +337,23 @@ typedef struct ustore_pages_splice_t {
     /** Number of splices. */
     ustore_size_t count;
 
-    /** Collections of the pages, where @c NULL stands for the main collection. */
-    ustore_collection_id_t const* collections;
-
-    /** Bytes between consecutive collections, where zero repeats the first one. */
-    ustore_size_t collections_stride;
+    /** Collections of the pages, where @c NULL data stands for the main collection. */
+    ustore_collections_view_t collections;
 
     /** Keys of the pages. */
-    ustore_key_t const* keys;
-
-    /** Bytes between consecutive keys, where zero repeats the first one. */
-    ustore_size_t keys_stride;
+    ustore_keys_view_t keys;
 
     /** Elements whose text is spliced. */
-    ustore_key_t const* elements;
-
-    /** Bytes between consecutive elements, where zero repeats the first one. */
-    ustore_size_t elements_stride;
+    ustore_keys_view_t elements;
 
     /** Bytes into the text of every element where its splice starts. */
-    ustore_length_t const* text_starts;
-
-    /** Bytes between consecutive text starts, where zero repeats the first one. */
-    ustore_size_t text_starts_stride;
+    ustore_lengths_view_t text_starts;
 
     /** Bytes of text every splice replaces, where zero only inserts. */
-    ustore_length_t const* text_lengths;
+    ustore_lengths_view_t text_lengths;
 
-    /** Bytes between consecutive text lengths, where zero repeats the first one. */
-    ustore_size_t text_lengths_stride;
-
-    /** Optional starts of the new bytes within the chunks of @c values, where @c NULL starts them at their chunk. */
-    ustore_length_t const* starts;
-
-    /** Bytes between consecutive starts, where zero repeats the first one. */
-    ustore_size_t starts_stride;
-
-    /** Optional lengths of the new bytes, where zero only removes; without them every run ends where the next one
-     *  starts, reading one start past the last run, or at a null terminator when @c starts is absent too. */
-    ustore_length_t const* lengths;
-
-    /** Bytes between consecutive lengths, where zero repeats the first one. */
-    ustore_size_t lengths_stride;
-
-    /** Pointers to the chunks holding the new bytes, @c NULL only when there are no tasks. */
-    ustore_bytes_cptr_t const* values;
-
-    /** Bytes between consecutive chunk pointers, where zero repeats the first one. */
-    ustore_size_t values_stride;
+    /** New bytes of every splice, where an empty run only removes. */
+    ustore_strings_view_t values;
 
     /** How durable the edits are once the call finishes at the head; a transaction's commit decides its own. */
     ustore_durability_t durability;
@@ -479,49 +390,20 @@ typedef struct ustore_pages_set_attributes_t {
     /** Number of attributes to set. */
     ustore_size_t count;
 
-    /** Collections of the pages, where @c NULL stands for the main collection. */
-    ustore_collection_id_t const* collections;
-
-    /** Bytes between consecutive collections, where zero repeats the first one. */
-    ustore_size_t collections_stride;
+    /** Collections of the pages, where @c NULL data stands for the main collection. */
+    ustore_collections_view_t collections;
 
     /** Keys of the pages. */
-    ustore_key_t const* keys;
-
-    /** Bytes between consecutive keys, where zero repeats the first one. */
-    ustore_size_t keys_stride;
+    ustore_keys_view_t keys;
 
     /** Elements whose attributes are set. */
-    ustore_key_t const* elements;
+    ustore_keys_view_t elements;
 
-    /** Bytes between consecutive elements, where zero repeats the first one. */
-    ustore_size_t elements_stride;
+    /** Names of the attributes to set, one per task. */
+    ustore_strings_view_t fields;
 
-    /** Names of the attributes to set. */
-    ustore_str_view_t const* fields;
-
-    /** Bytes between consecutive names, where zero repeats the first one. */
-    ustore_size_t fields_stride;
-
-    /** Optional starts of the attribute values within the chunks of @c values, where @c NULL starts every value at
-     *  its chunk. */
-    ustore_length_t const* starts;
-
-    /** Bytes between consecutive starts, where zero repeats the first one. */
-    ustore_size_t starts_stride;
-
-    /** Optional lengths of the attribute values; without them every value ends where the next one starts, reading
-     *  one start past the last value, or at a null terminator when @c starts is absent too. */
-    ustore_length_t const* lengths;
-
-    /** Bytes between consecutive lengths, where zero repeats the first one. */
-    ustore_size_t lengths_stride;
-
-    /** Pointers to the chunks holding the attribute values, @c NULL only when there are no tasks. */
-    ustore_bytes_cptr_t const* values;
-
-    /** Bytes between consecutive chunk pointers, where zero repeats the first one. */
-    ustore_size_t values_stride;
+    /** Values of the attributes, one per task. */
+    ustore_strings_view_t values;
 
     /** How durable the edits are once the call finishes at the head; a transaction's commit decides its own. */
     ustore_durability_t durability;
@@ -558,29 +440,17 @@ typedef struct ustore_pages_remove_attributes_t {
     /** Number of attributes to remove. */
     ustore_size_t count;
 
-    /** Collections of the pages, where @c NULL stands for the main collection. */
-    ustore_collection_id_t const* collections;
-
-    /** Bytes between consecutive collections, where zero repeats the first one. */
-    ustore_size_t collections_stride;
+    /** Collections of the pages, where @c NULL data stands for the main collection. */
+    ustore_collections_view_t collections;
 
     /** Keys of the pages. */
-    ustore_key_t const* keys;
-
-    /** Bytes between consecutive keys, where zero repeats the first one. */
-    ustore_size_t keys_stride;
+    ustore_keys_view_t keys;
 
     /** Elements whose attributes are removed. */
-    ustore_key_t const* elements;
+    ustore_keys_view_t elements;
 
-    /** Bytes between consecutive elements, where zero repeats the first one. */
-    ustore_size_t elements_stride;
-
-    /** Names of the attributes to remove. */
-    ustore_str_view_t const* fields;
-
-    /** Bytes between consecutive names, where zero repeats the first one. */
-    ustore_size_t fields_stride;
+    /** Names of the attributes to remove, one per task. */
+    ustore_strings_view_t fields;
 
     /** How durable the edits are once the call finishes at the head; a transaction's commit decides its own. */
     ustore_durability_t durability;
@@ -595,10 +465,6 @@ typedef struct ustore_pages_remove_attributes_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
 USTORE_EXPORT void ustore_pages_remove_attributes(ustore_pages_remove_attributes_t* arguments);
-
-#pragma endregion Edits
-
-#pragma region Reads
 
 /**
  *  @brief The arguments of @c ustore_pages_read, which renders pages or subtrees in one encoding.
@@ -627,38 +493,29 @@ typedef struct ustore_pages_read_t {
     /** Number of pages or subtrees to render. */
     ustore_size_t count;
 
-    /** Collections of the pages, where @c NULL stands for the main collection. */
-    ustore_collection_id_t const* collections;
-
-    /** Bytes between consecutive collections, where zero repeats the first one. */
-    ustore_size_t collections_stride;
+    /** Collections of the pages, where @c NULL data stands for the main collection. */
+    ustore_collections_view_t collections;
 
     /** Keys of the pages. */
-    ustore_key_t const* keys;
+    ustore_keys_view_t keys;
 
-    /** Bytes between consecutive keys, where zero repeats the first one. */
-    ustore_size_t keys_stride;
+    /** Elements to render with their subtrees, where @c NULL data renders whole pages. */
+    ustore_keys_view_t elements;
 
-    /** Elements to render with their subtrees, or @c NULL for whole pages. */
-    ustore_key_t const* elements;
+    /** Optional output for a bitset of @c count bits marking found pages or elements, inside @c arena. */
+    ustore_octet_t const** presences;
 
-    /** Bytes between consecutive elements, where zero repeats the first one. */
-    ustore_size_t elements_stride;
+    /** Optional output for the length of every rendering, for reads that skip the bytes, inside @c arena. */
+    ustore_length_t const** lengths;
 
-    /** Optional output for a bitset of at least @c count bits marking found pages or elements. */
-    ustore_octet_t* presences;
+    /** Optional output for the renderings as a tape inside @c arena. */
+    ustore_strings_view_t* values;
 
-    /** Optional output for @c count plus one offsets into @c values, the last one closing the final rendering. */
-    ustore_length_t* offsets;
+    /** Rewound by this call, then holding every output it writes; @c NULL is refused. */
+    ustore_arena_t arena;
 
-    /** Optional output for the tape of renderings, inside @c arena. */
-    ustore_byte_t** values;
-
-    /** Memory for @c values: reused when it points to an arena, created when it points to @c NULL. */
-    ustore_arena_t* arena;
-
-    /** Encoding to render in. */
-    ustore_page_encoding_t encoding;
+    /** Encoding the renderings are converted into. */
+    ustore_page_encoding_t outputs_encoding;
 
 } ustore_pages_read_t;
 
@@ -671,10 +528,11 @@ USTORE_EXPORT void ustore_pages_read(ustore_pages_read_t* arguments);
 /**
  *  @brief The arguments of @c ustore_pages_history, which lists the edits of pages between two commits.
  *
- *  Edits come oldest first, one row per edit across the outputs, with the bytes of an import, an
- *  insertion, a splice or an attribute in @c values. Only the call finds the number of edits, so every
- *  output but @c edits_offsets lands in @c arena. Replaying the rows of one page, each through the verb
- *  its modification names, onto its rendering at @c since reproduces its rendering at @c until.
+ *  Edits come oldest first, one row per edit across the outputs, with the name of an attribute in
+ *  @c fields and the bytes of an import, an insertion, a splice or an attribute in @c values, each a tape
+ *  of one string per edit, and every output lands in @c arena. Replaying the rows of one page, each
+ *  through the verb its modification names, onto its rendering at @c since reproduces its rendering at
+ *  @c until.
  */
 typedef struct ustore_pages_history_t {
 
@@ -696,72 +554,55 @@ typedef struct ustore_pages_history_t {
     /** Number of pages. */
     ustore_size_t count;
 
-    /** Collections of the pages, where @c NULL stands for the main collection. */
-    ustore_collection_id_t const* collections;
-
-    /** Bytes between consecutive collections, where zero repeats the first one. */
-    ustore_size_t collections_stride;
+    /** Collections of the pages, where @c NULL data stands for the main collection. */
+    ustore_collections_view_t collections;
 
     /** Keys of the pages. */
-    ustore_key_t const* keys;
+    ustore_keys_view_t keys;
 
-    /** Bytes between consecutive keys, where zero repeats the first one. */
-    ustore_size_t keys_stride;
+    /** First commit stamp included, where zero or @c NULL data starts at the page's creation. */
+    ustore_stamps_view_t since;
 
-    /** First commit stamp included, where zero starts at the page's creation. */
-    ustore_stamp_t const* since;
+    /** Last commit stamp included, where zero or @c NULL data ends at the moment read. */
+    ustore_stamps_view_t until;
 
-    /** Bytes between consecutive stamps, where zero repeats the first one. */
-    ustore_size_t since_stride;
+    /** Output for @c count plus one offsets into the rows of edits, the last one closing the final page, inside
+     *  @c arena. */
+    ustore_length_t const** edits_offsets;
 
-    /** Last commit stamp included, where zero ends at the moment read. */
-    ustore_stamp_t const* until;
+    /** Optional output for the commit stamp of every edit, inside @c arena. */
+    ustore_stamp_t const** stamps;
 
-    /** Bytes between consecutive stamps, where zero repeats the first one. */
-    ustore_size_t until_stride;
+    /** Optional output for the modification of every edit, inside @c arena. */
+    ustore_page_modification_t const** modifications;
 
-    /** Output for @c count plus one offsets into the rows of edits, the last one closing the final page. */
-    ustore_length_t* edits_offsets;
+    /** Optional output for the element of every edit, inside @c arena. */
+    ustore_key_t const** elements;
 
-    /** Optional output for the commit stamp of every edit. */
-    ustore_stamp_t** stamps;
+    /** Optional output for the parent of every insertion or move, inside @c arena. */
+    ustore_key_t const** parents;
 
-    /** Optional output for the modification of every edit. */
-    ustore_page_modification_t** modifications;
+    /** Optional output for the anchor of every insertion or move, inside @c arena. */
+    ustore_key_t const** anchors;
 
-    /** Optional output for the element of every edit. */
-    ustore_key_t** elements;
+    /** Optional output for the attribute name of every edit as a tape inside @c arena, empty for edits of other
+     *  kinds. */
+    ustore_strings_view_t* fields;
 
-    /** Optional output for the parent of every insertion or move. */
-    ustore_key_t** parents;
+    /** Optional output for the byte of the text where every splice starts, inside @c arena. */
+    ustore_length_t const** text_starts;
 
-    /** Optional output for the anchor of every insertion or move. */
-    ustore_key_t** anchors;
+    /** Optional output for the bytes of text every splice replaced, inside @c arena. */
+    ustore_length_t const** text_lengths;
 
-    /** Optional output for the attribute name of every attribute edit, joined and null-terminated. */
-    ustore_char_t** fields;
+    /** Optional output for the bytes of every edit as a tape inside @c arena, empty for edits that carry none. */
+    ustore_strings_view_t* values;
 
-    /** Optional output for the byte of the text where every splice starts. */
-    ustore_length_t** text_starts;
+    /** Rewound by this call, then holding every output it writes; @c NULL is refused. */
+    ustore_arena_t arena;
 
-    /** Optional output for the bytes of text every splice replaced. */
-    ustore_length_t** text_lengths;
-
-    /** Optional output for the start of every edit's bytes inside @c values. */
-    ustore_length_t** starts;
-
-    /** Optional output for the length of every edit's bytes. */
-    ustore_length_t** lengths;
-
-    /** Optional output for the joined bytes of every edit. */
-    ustore_byte_t** values;
-
-    /** Memory for every output but @c edits_offsets: reused when it points to an arena, created when it points to
-     *  @c NULL. */
-    ustore_arena_t* arena;
-
-    /** Encoding of the imported and inserted fragments in @c values. */
-    ustore_page_encoding_t encoding;
+    /** Encoding the imported and inserted fragments in @c values are converted into. */
+    ustore_page_encoding_t outputs_encoding;
 
 } ustore_pages_history_t;
 
@@ -771,8 +612,8 @@ typedef struct ustore_pages_history_t {
  */
 USTORE_EXPORT void ustore_pages_history(ustore_pages_history_t* arguments);
 
-#pragma endregion Reads
-
 #ifdef __cplusplus
 }
 #endif
+
+#endif // UNUM_USTORE_PAGES_H

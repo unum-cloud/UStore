@@ -6,15 +6,14 @@
  *      collections.
  */
 
-#pragma once
+#ifndef UNUM_USTORE_DB_H
+#define UNUM_USTORE_DB_H
 
 #include "ustore/types.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-#pragma region Handles and Constants
 
 /**
  *  @brief An opaque handle to an open database, safe to share across threads from open until free.
@@ -39,9 +38,10 @@ typedef struct ustore_transaction_handle_t* ustore_transaction_t;
  *  @brief An opaque handle to what a read sees: the head of the database, a transaction or a snapshot.
  *
  *  @c NULL is the head. Others come from @c ustore_transaction_view and @c ustore_snapshot_view, which tag the
- *  parent's pointer and allocate nothing, so a view needs no free and dies with its parent. A view names its
- *  parent, not a moment: after a commit, a transaction's view reads the transaction's next generation. Writes take a
- *  transaction instead, so nothing can write through a snapshot.
+ *  parent's pointer and allocate nothing, so a view needs no free and dies with its parent, which a cursor reading
+ *  through it holds until the cursor is freed. A view names its parent, not a moment: after a commit, a transaction's
+ *  view reads the transaction's next generation. Writes take a transaction instead, so nothing can write through a
+ *  snapshot.
  */
 typedef struct ustore_view_handle_t* ustore_view_t;
 
@@ -69,13 +69,7 @@ typedef struct ustore_key_t {
 /** The elementary piece of a binary value. */
 typedef uint8_t ustore_byte_t;
 
-/** A single-precision floating-point number. */
-typedef float ustore_float_t;
-
-/** The elementary piece of a string, such as a collection name. */
-typedef char ustore_char_t;
-
-/** The length of a value in bytes, or an offset into a tape of values, wide enough for a tape past 4 GB. */
+/** The length of a value in bytes, or an offset into a run of keys, wide enough for a run past 4 GB. */
 typedef uint64_t ustore_length_t;
 
 /** The smallest bitset, holding eight bits. */
@@ -85,17 +79,38 @@ typedef uint8_t ustore_octet_t;
  *  commit a transaction or a snapshot reads. */
 typedef uint64_t ustore_stamp_t;
 
-/** A string the caller owns and the database never frees. */
-typedef char const* ustore_str_view_t;
+/** A strided run of keys, one per task, where a zero stride repeats the first. */
+typedef struct ustore_keys_view_t {
 
-/** A mutable string the caller owns and the database never frees. */
-typedef char* ustore_str_span_t;
+    /** First key of the run. */
+    ustore_key_t const* data;
 
-/** A pointer to mutable bytes. */
-typedef uint8_t* ustore_bytes_ptr_t;
+    /** Bytes between consecutive keys, where zero repeats the first one. */
+    ustore_size_t stride;
 
-/** A pointer to read-only bytes. */
-typedef uint8_t const* ustore_bytes_cptr_t;
+} ustore_keys_view_t;
+
+/** A strided run of collections, one per task, where @c NULL data stands for the main collection. */
+typedef struct ustore_collections_view_t {
+
+    /** First collection of the run. */
+    ustore_collection_id_t const* data;
+
+    /** Bytes between consecutive collections, where zero repeats the first one. */
+    ustore_size_t stride;
+
+} ustore_collections_view_t;
+
+/** A strided run of lengths or positions, one per task. */
+typedef struct ustore_lengths_view_t {
+
+    /** First length of the run. */
+    ustore_length_t const* data;
+
+    /** Bytes between consecutive lengths, where zero repeats the first one. */
+    ustore_size_t stride;
+
+} ustore_lengths_view_t;
 
 /** How durable the writes a call publishes are once the call finishes. */
 typedef enum ustore_durability_t {
@@ -161,17 +176,11 @@ typedef enum ustore_capabilities_t {
 
 /** The collection every database holds, named by the nil UUID, which @c ustore_drop_pairs_k and
  *  @c ustore_drop_values_k may only clear. */
-extern ustore_collection_id_t const ustore_collection_main_k;
-
-/** The length reported for a missing value. */
-extern ustore_length_t const ustore_length_missing_k;
+static ustore_collection_id_t const ustore_collection_main_k = {{{0}}};
 
 /** The key that stands for no key, every bit of it set. */
-extern ustore_key_t const ustore_key_unknown_k;
-
-#pragma endregion Handles and Constants
-
-#pragma region Database
+static ustore_key_t const ustore_key_unknown_k = {
+    {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}}};
 
 /** How the transactions of the in-memory engine see each other's writes. */
 typedef enum ustore_isolation_t {
@@ -204,11 +213,28 @@ typedef enum ustore_transport_t {
 
 } ustore_transport_t;
 
+/** The engine serving a database, as @c ustore_database_describe reports it. */
+typedef enum ustore_engine_t {
+
+    /** The in-memory engine of @c ustore_database_init_ram and @c ustore_database_open_ram. */
+    ustore_engine_ram_k = 0,
+
+    /** The RocksDB engine of @c ustore_database_open_rocksdb and @c ustore_database_view_rocksdb. */
+    ustore_engine_rocksdb_k = 1,
+
+    /** The LevelDB engine of @c ustore_database_open_leveldb. */
+    ustore_engine_leveldb_k = 2,
+
+    /** The NVMe engine of @c ustore_database_open_nvme. */
+    ustore_engine_nvme_k = 3,
+
+} ustore_engine_t;
+
 /** A directory the data files may occupy, with the bytes they may take there. */
 typedef struct ustore_data_directory_t {
 
     /** The directory, which must exist. */
-    ustore_str_view_t path;
+    ustore_bytes_view_t path;
 
     /** Bytes the files may take there: zero is unlimited on RocksDB and the default volume size on NVMe. */
     ustore_size_t max_bytes;
@@ -218,7 +244,7 @@ typedef struct ustore_data_directory_t {
 /** The arguments of @c ustore_database_init_ram. */
 typedef struct ustore_database_init_ram_t {
 
-    /** Output for the opened database, left @c NULL on failure. */
+    /** Output for the new database, left @c NULL on failure. */
     ustore_database_t* database;
 
     /** Executor that runs the call, where @c NULL runs it on the calling thread. */
@@ -229,9 +255,6 @@ typedef struct ustore_database_init_ram_t {
 
     /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
-
-    /** Directory the database persists in as one image, or null to keep it in memory alone. */
-    ustore_str_view_t directory;
 
     /** How transactions see each other. */
     ustore_isolation_t isolation;
@@ -239,13 +262,43 @@ typedef struct ustore_database_init_ram_t {
 } ustore_database_init_ram_t;
 
 /**
- *  @brief Opens the in-memory engine, which persists as one image when it names a directory.
+ *  @brief Starts an empty database of the in-memory engine, which persists nowhere.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
 USTORE_EXPORT void ustore_database_init_ram(ustore_database_init_ram_t* arguments);
 
-/** The arguments of @c ustore_database_init_rocksdb. */
-typedef struct ustore_database_init_rocksdb_t {
+/** The arguments of @c ustore_database_open_ram. */
+typedef struct ustore_database_open_ram_t {
+
+    /** Output for the opened database, left @c NULL on failure. */
+    ustore_database_t* database;
+
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call returns final, the default, or once submitted. */
+    ustore_completion_t completion;
+
+    /** Directory the database persists in as one image, which must exist. */
+    ustore_bytes_view_t directory;
+
+    /** How transactions see each other. */
+    ustore_isolation_t isolation;
+
+} ustore_database_open_ram_t;
+
+/**
+ *  @brief Serves a directory in place through the in-memory engine, loading the image it holds, if any, and rewriting
+ *      it whole on a flushed commit and on close.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ */
+USTORE_EXPORT void ustore_database_open_ram(ustore_database_open_ram_t* arguments);
+
+/** The arguments of @c ustore_database_open_rocksdb. */
+typedef struct ustore_database_open_rocksdb_t {
 
     /** Output for the opened database, left @c NULL on failure. */
     ustore_database_t* database;
@@ -260,7 +313,7 @@ typedef struct ustore_database_init_rocksdb_t {
     ustore_completion_t completion;
 
     /** Directory of the database, which must exist. */
-    ustore_str_view_t directory;
+    ustore_bytes_view_t directory;
 
     /** Directories the table files fill in order, or null to keep them in @c directory. */
     ustore_data_directory_t const* data_directories;
@@ -268,13 +321,51 @@ typedef struct ustore_database_init_rocksdb_t {
     /** Entries of @c data_directories. */
     ustore_size_t data_directories_count;
 
-} ustore_database_init_rocksdb_t;
+} ustore_database_open_rocksdb_t;
 
-/** Opens the RocksDB engine, or reports @c ustore_status_unsupported_k in a library built without it. */
-USTORE_EXPORT void ustore_database_init_rocksdb(ustore_database_init_rocksdb_t* arguments);
+/** Serves a directory in place through the RocksDB engine, creating the database when it holds none, or reports
+ *  @c ustore_status_unsupported_k in a library built without the engine. */
+USTORE_EXPORT void ustore_database_open_rocksdb(ustore_database_open_rocksdb_t* arguments);
 
-/** The arguments of @c ustore_database_init_leveldb. */
-typedef struct ustore_database_init_leveldb_t {
+/** The arguments of @c ustore_database_view_rocksdb. */
+typedef struct ustore_database_view_rocksdb_t {
+
+    /** Output for the opened database, left @c NULL on failure. */
+    ustore_database_t* database;
+
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call returns final, the default, or once submitted. */
+    ustore_completion_t completion;
+
+    /** Directory of an existing database. */
+    ustore_bytes_view_t directory;
+
+    /** Directories the table files fill, as the database was opened with, or null to find them in @c directory. */
+    ustore_data_directory_t const* data_directories;
+
+    /** Entries of @c data_directories. */
+    ustore_size_t data_directories_count;
+
+} ustore_database_view_rocksdb_t;
+
+/**
+ *  @brief Serves a directory in place through the RocksDB engine, read-only, or reports
+ *      @c ustore_status_unsupported_k in a library built without the engine.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  The database reads the state its directory held at open, and refuses every call that would change it with
+ *  @c ustore_status_read_only_k: writes, removes, transactions, collection creates and drops, clears and compactions.
+ *  Snapshots and their saves still serve.
+ */
+USTORE_EXPORT void ustore_database_view_rocksdb(ustore_database_view_rocksdb_t* arguments);
+
+/** The arguments of @c ustore_database_open_leveldb. */
+typedef struct ustore_database_open_leveldb_t {
 
     /** Output for the opened database, left @c NULL on failure. */
     ustore_database_t* database;
@@ -289,15 +380,16 @@ typedef struct ustore_database_init_leveldb_t {
     ustore_completion_t completion;
 
     /** Directory of the database, which must exist. */
-    ustore_str_view_t directory;
+    ustore_bytes_view_t directory;
 
-} ustore_database_init_leveldb_t;
+} ustore_database_open_leveldb_t;
 
-/** Opens the LevelDB engine, or reports @c ustore_status_unsupported_k in a library built without it. */
-USTORE_EXPORT void ustore_database_init_leveldb(ustore_database_init_leveldb_t* arguments);
+/** Serves a directory in place through the LevelDB engine, creating the database when it holds none, or reports
+ *  @c ustore_status_unsupported_k in a library built without the engine. */
+USTORE_EXPORT void ustore_database_open_leveldb(ustore_database_open_leveldb_t* arguments);
 
-/** The arguments of @c ustore_database_init_nvme, where every zero size or count keeps the engine's default. */
-typedef struct ustore_database_init_nvme_t {
+/** The arguments of @c ustore_database_open_nvme, where every zero size or count keeps the engine's default. */
+typedef struct ustore_database_open_nvme_t {
 
     /** Output for the opened database, left @c NULL on failure. */
     ustore_database_t* database;
@@ -314,7 +406,7 @@ typedef struct ustore_database_init_nvme_t {
     ustore_completion_t completion;
 
     /** Directory of the database's own files, which must exist. */
-    ustore_str_view_t directory;
+    ustore_bytes_view_t directory;
 
     /** Directories the volumes fill, or null for one inside @c directory. */
     ustore_data_directory_t const* data_directories;
@@ -385,16 +477,34 @@ typedef struct ustore_database_init_nvme_t {
     /** Bytes of the largest value of a collection whose values vary in size. */
     ustore_size_t collection_value_max_size;
 
-} ustore_database_init_nvme_t;
+} ustore_database_open_nvme_t;
 
-/** Opens the NVMe engine, or reports @c ustore_status_unsupported_k in a library built without it. */
-USTORE_EXPORT void ustore_database_init_nvme(ustore_database_init_nvme_t* arguments);
+/** Serves a directory in place through the NVMe engine, or reports @c ustore_status_unsupported_k in a library built
+ *  without it. */
+USTORE_EXPORT void ustore_database_open_nvme(ustore_database_open_nvme_t* arguments);
 
-/** What an open database reports about itself in one call. */
+/** What an open database reports about itself in one call, where every size is the engine's estimate, and zero where
+ *  the engine keeps none. */
 typedef struct ustore_database_description_t {
 
     /** The capabilities of the engine. */
     ustore_capabilities_t capabilities;
+
+    /** The engine serving the database. */
+    ustore_engine_t engine;
+
+    /** How transactions see each other: what the RAM engine was opened with, and @c ustore_isolation_snapshot_k
+     *  elsewhere. */
+    ustore_isolation_t isolation;
+
+    /** Keys across every collection, the main one included. */
+    ustore_size_t keys;
+
+    /** Bytes of memory the engine holds for the data. */
+    ustore_size_t memory_bytes;
+
+    /** Bytes the files of the database take on disk. */
+    ustore_size_t disk_bytes;
 
 } ustore_database_description_t;
 
@@ -413,25 +523,19 @@ typedef struct ustore_database_describe_t {
     /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
-    /** Output for the description, filled whole. */
+    /** Output for the description, filled whole; zeroed on failure. */
     ustore_database_description_t* description;
 
 } ustore_database_describe_t;
 
 /**
- *  @brief Reports what the engine of an open database supports.
+ *  @brief Reports the engine of an open database, what it supports and how much it holds.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
 USTORE_EXPORT void ustore_database_describe(ustore_database_describe_t* arguments);
 
-/**
- *  @brief The arguments of @c ustore_database_control, a free-form tunnel to the engine.
- *
- *  Requests have no stable format and are expensive: "clear" removes all data and keeps the
- *  collections, "reset" removes both, "compact" flushes and compacts LSM trees, "info" describes the build,
- *  and "usage" estimates the sizes of collections and the use of memory and disk.
- */
-typedef struct ustore_database_control_t {
+/** The arguments of @c ustore_database_clear, which empties every collection at once at the head. */
+typedef struct ustore_database_clear_t {
 
     /** An open database. */
     ustore_database_t database;
@@ -445,37 +549,59 @@ typedef struct ustore_database_control_t {
     /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
-    /** The request as a null-terminated string. */
-    ustore_str_view_t request;
+    /** What goes: every pair, keeping the collections and their names; every collection but the main one with its
+     *  name, emptying the main one; or every value, keeping the keys where the engine can. */
+    ustore_drop_mode_t mode;
 
-    /** Output for the response as a null-terminated string, inside @c arena. */
-    ustore_str_view_t* response;
+} ustore_database_clear_t;
 
-    /** Memory for @c response: reused when it points to an arena, created when it points to @c NULL. */
-    ustore_arena_t* arena;
+/**
+ *  @brief Empties every collection at once, as @c ustore_collection_drop empties one.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  The RAM and RocksDB engines refuse to drop the collections while a snapshot is open, with
+ *  @c ustore_status_invalid_argument_k, since the snapshot belongs to its holder.
+ */
+USTORE_EXPORT void ustore_database_clear(ustore_database_clear_t* arguments);
 
-    /** Optional callback reporting the bytes a long request, such as a compaction, has processed. */
+/** The arguments of @c ustore_database_compact. */
+typedef struct ustore_database_compact_t {
+
+    /** An open database. */
+    ustore_database_t database;
+
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call returns final, the default, or once submitted. */
+    ustore_completion_t completion;
+
+    /** Optional callback reporting the compaction's advance. */
     ustore_progress_callback_t progress;
 
     /** Opaque pointer passed to @c progress. */
     void* progress_state;
 
-} ustore_database_control_t;
+} ustore_database_compact_t;
 
 /**
- *  @brief Sends a free-form request to the engine.
+ *  @brief Reclaims the space overwritten and removed data still takes: RocksDB and LevelDB flush and compact their
+ *      trees, and the RAM engine frees the versions no reader needs and rewrites its image.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  The work runs one collection at a time, and its progress counts the bytes of the collections compacted where the
+ *  engine measures them, as RocksDB does, and one unit per collection elsewhere. A cancelled compaction stops between
+ *  collections, keeping what it compacted.
  */
-USTORE_EXPORT void ustore_database_control(ustore_database_control_t* arguments);
-
-#pragma endregion Database
-
-#pragma region Snapshots and Views
+USTORE_EXPORT void ustore_database_compact(ustore_database_compact_t* arguments);
 
 /** The arguments of @c ustore_snapshot_init. */
 typedef struct ustore_snapshot_init_t {
 
-    /** Output for the new snapshot, which the caller frees with @c ustore_snapshot_free. */
+    /** Output for the new snapshot, which the caller frees with @c ustore_snapshot_free; @c NULL on failure. */
     ustore_snapshot_t* snapshot;
 
     /** An open database. */
@@ -490,7 +616,7 @@ typedef struct ustore_snapshot_init_t {
     /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
-    /** Optional output for the stamp the snapshot reads at. */
+    /** Optional output for the stamp the snapshot reads at; zeroed on failure. */
     ustore_stamp_t* read_stamp;
 
 } ustore_snapshot_init_t;
@@ -501,11 +627,11 @@ typedef struct ustore_snapshot_init_t {
  */
 USTORE_EXPORT void ustore_snapshot_init(ustore_snapshot_init_t* arguments);
 
-/** The arguments of @c ustore_snapshot_export. */
-typedef struct ustore_snapshot_export_t {
+/** The arguments of @c ustore_snapshot_save. */
+typedef struct ustore_snapshot_save_t {
 
-    /** An open database. */
-    ustore_database_t database;
+    /** The snapshot to save, which holds its database open. */
+    ustore_snapshot_t snapshot;
 
     /** Executor that runs the call, where @c NULL runs it on the calling thread. */
     ustore_executor_t executor;
@@ -516,25 +642,27 @@ typedef struct ustore_snapshot_export_t {
     /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
-    /** The snapshot to export. */
-    ustore_snapshot_t snapshot;
+    /** Directory that receives the saved database. */
+    ustore_bytes_view_t path;
 
-    /** Directory that receives the exported database. */
-    ustore_str_view_t path;
-
-    /** Optional callback reporting the bytes exported. */
+    /** Optional callback reporting the bytes saved. */
     ustore_progress_callback_t progress;
 
     /** Opaque pointer passed to @c progress. */
     void* progress_state;
 
-} ustore_snapshot_export_t;
+} ustore_snapshot_save_t;
 
 /**
- *  @brief Exports a snapshot as a new database.
+ *  @brief Writes a snapshot out as a new database of the same engine, which that engine's open then serves.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  The copy holds exactly the collections and names the snapshot records, whatever changed since. RocksDB and LevelDB
+ *  create @c path, while the RAM engine writes its image into the directory @c path names. Its progress counts the
+ *  bytes of the keys and values saved, and a save its progress callback cancels removes what it wrote, as a failed
+ *  one does.
  */
-USTORE_EXPORT void ustore_snapshot_export(ustore_snapshot_export_t* arguments);
+USTORE_EXPORT void ustore_snapshot_save(ustore_snapshot_save_t* arguments);
 
 /**
  *  @brief Names a snapshot as the view a read sees, without allocating.
@@ -542,10 +670,6 @@ USTORE_EXPORT void ustore_snapshot_export(ustore_snapshot_export_t* arguments);
  *  @return The view, or @c NULL, the head, for a @c NULL snapshot.
  */
 USTORE_EXPORT ustore_view_t ustore_snapshot_view(ustore_snapshot_t snapshot);
-
-#pragma endregion Snapshots and Views
-
-#pragma region Collections
 
 /** What a collection holds, recorded beside its name so a view of another kind is refused. */
 typedef enum ustore_modality_t {
@@ -570,6 +694,56 @@ typedef enum ustore_modality_t {
 
 } ustore_modality_t;
 
+/** The canonical spelling of a durability, as @c ustore_durability_flushed_k spells "flushed", or "unrecognized". */
+USTORE_EXPORT char const* ustore_durability_name(ustore_durability_t durability);
+
+/** Reads a durability back from its canonical spelling; @c ustore_durability_buffered_k when unrecognized. */
+USTORE_EXPORT ustore_durability_t ustore_durability_from_name(ustore_bytes_view_t name);
+
+/** The canonical spelling of a watch, as @c ustore_watch_none_k spells "none", or "unrecognized". */
+USTORE_EXPORT char const* ustore_watch_name(ustore_watch_t watch);
+
+/** Reads a watch back from its canonical spelling; @c ustore_watch_keys_k when unrecognized. */
+USTORE_EXPORT ustore_watch_t ustore_watch_from_name(ustore_bytes_view_t name);
+
+/** The canonical spelling of a scan mode, as @c ustore_scan_unordered_k spells "unordered", or "unrecognized". */
+USTORE_EXPORT char const* ustore_scan_mode_name(ustore_scan_mode_t scan_mode);
+
+/** Reads a scan mode back from its canonical spelling; @c ustore_scan_ordered_k when unrecognized. */
+USTORE_EXPORT ustore_scan_mode_t ustore_scan_mode_from_name(ustore_bytes_view_t name);
+
+/** The canonical spelling of a drop mode, as @c ustore_drop_pairs_k spells "pairs", or "unrecognized". */
+USTORE_EXPORT char const* ustore_drop_mode_name(ustore_drop_mode_t drop_mode);
+
+/** Reads a drop mode back from its canonical spelling; @c ustore_drop_collection_k when unrecognized. */
+USTORE_EXPORT ustore_drop_mode_t ustore_drop_mode_from_name(ustore_bytes_view_t name);
+
+/** The canonical spelling of an isolation, as @c ustore_isolation_strict_serializable_k spells "strict-serializable",
+ *  or "unrecognized". */
+USTORE_EXPORT char const* ustore_isolation_name(ustore_isolation_t isolation);
+
+/** Reads an isolation back from its canonical spelling; @c ustore_isolation_strict_serializable_k when unrecognized. */
+USTORE_EXPORT ustore_isolation_t ustore_isolation_from_name(ustore_bytes_view_t name);
+
+/** The canonical spelling of a transport, as @c ustore_transport_linux_uring_k spells "linux-uring", or
+ *  "unrecognized". */
+USTORE_EXPORT char const* ustore_transport_name(ustore_transport_t transport);
+
+/** Reads a transport back from its canonical spelling; @c ustore_transport_automatic_k when unrecognized. */
+USTORE_EXPORT ustore_transport_t ustore_transport_from_name(ustore_bytes_view_t name);
+
+/** The canonical spelling of an engine, as @c ustore_engine_rocksdb_k spells "rocksdb", or "unrecognized". */
+USTORE_EXPORT char const* ustore_engine_name(ustore_engine_t engine);
+
+/** Reads an engine back from its canonical spelling; @c ustore_engine_ram_k when unrecognized. */
+USTORE_EXPORT ustore_engine_t ustore_engine_from_name(ustore_bytes_view_t name);
+
+/** The canonical spelling of a modality, as @c ustore_modality_graph_k spells "graph", or "unrecognized". */
+USTORE_EXPORT char const* ustore_modality_name(ustore_modality_t modality);
+
+/** Reads a modality back from its canonical spelling; @c ustore_modality_any_k when unrecognized. */
+USTORE_EXPORT ustore_modality_t ustore_modality_from_name(ustore_bytes_view_t name);
+
 /**
  *  @brief The arguments of @c ustore_collection_list, which exports every collection with its name and modality.
  *
@@ -593,25 +767,21 @@ typedef struct ustore_collection_list_t {
     /** Optional snapshot whose collections are listed, where @c NULL lists the head. */
     ustore_snapshot_t snapshot;
 
-    /** Output for the number of collections. */
-    ustore_size_t* count;
-
     /** Optional output for the identifiers of the collections, inside @c arena. */
-    ustore_collection_id_t** collections;
+    ustore_collection_id_t const** collections;
 
     /** Optional output for what every collection holds, inside @c arena. */
-    ustore_modality_t** modalities;
+    ustore_modality_t const** modalities;
 
-    /** Optional output for @c count plus one offsets into @c names, inside @c arena, where a collection without a
-     *  name has an empty one. */
-    ustore_length_t** names_offsets;
+    /** Optional output for the names as a tape inside @c arena, in the order of the identifiers, where a collection
+     *  without a name has an empty one. */
+    ustore_strings_view_t* names;
 
-    /** Optional output for the tape of names, in the order of the identifiers, inside @c arena. */
-    ustore_char_t** names;
+    /** Output for the collections written; zeroed on failure. */
+    ustore_size_t* written;
 
-    /** Memory for @c collections, @c modalities, @c names_offsets and @c names: reused when it points to an arena,
-     *  created when it points to @c NULL. */
-    ustore_arena_t* arena;
+    /** Rewound by this call, then holding every output it writes; @c NULL is refused. */
+    ustore_arena_t arena;
 
 } ustore_collection_list_t;
 
@@ -645,16 +815,13 @@ typedef struct ustore_collection_create_t {
     /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
-    /** Optional name no other collection carries, where @c NULL creates a collection without one. */
-    ustore_str_view_t name;
-
-    /** Length of the name, inferred from a null terminator when zero. */
-    ustore_length_t name_length;
+    /** Optional name no other collection carries, where a zeroed view creates a collection without one. */
+    ustore_bytes_view_t name;
 
     /** What the collection holds, which fixes how it is keyed and so which calls reach it. */
     ustore_modality_t modality;
 
-    /** Output for the identifier of the collection. */
+    /** Output for the identifier of the collection, zeroed on failure. */
     ustore_collection_id_t* collection;
 
 } ustore_collection_create_t;
@@ -671,7 +838,7 @@ USTORE_EXPORT void ustore_collection_create(ustore_collection_create_t* argument
  *  Collections are created and dropped only at the head, so their names are read at the head or at a snapshot and
  *  never inside a transaction, and resolving a name never joins the conflicts of the work that follows it. A name no
  *  collection carries answers @c ustore_collection_main_k, @c ustore_modality_any_k and an unset presence bit. Every
- *  output is a span of the caller's, sized by @c count.
+ *  output holds one entry per name inside @c arena.
  */
 typedef struct ustore_collection_find_t {
 
@@ -693,33 +860,21 @@ typedef struct ustore_collection_find_t {
     /** Number of tasks, one per name. */
     ustore_size_t count;
 
-    /** Names to resolve, @c NULL only when there are no tasks. */
-    ustore_str_view_t const* names;
+    /** Names to resolve, one per task. */
+    ustore_strings_view_t names;
 
-    /** Bytes between consecutive name pointers, where zero repeats the first one. */
-    ustore_size_t names_stride;
+    /** Optional output for a bitset of @c count bits marking the names a collection carries, addressed as Apache Arrow
+     *  does, inside @c arena. */
+    ustore_octet_t const** presences;
 
-    /** Optional lengths of the names, inferred from null terminators when absent. */
-    ustore_length_t const* names_lengths;
+    /** Output for the identifiers of the collections the names address, inside @c arena. */
+    ustore_collection_id_t const** collections;
 
-    /** Bytes between consecutive name lengths, where zero repeats the first one. */
-    ustore_size_t names_lengths_stride;
+    /** Optional output for what the collections hold, inside @c arena. */
+    ustore_modality_t const** modalities;
 
-    /** Optional output for a bitset of at least @c count bits marking the names a collection carries,
-     *  addressed as Apache Arrow does. */
-    ustore_octet_t* presences;
-
-    /** Output for the identifiers of the collections the names address. */
-    ustore_collection_id_t* collections;
-
-    /** Bytes between consecutive output identifiers, never zero. */
-    ustore_size_t collections_stride;
-
-    /** Optional output for what the collections hold. */
-    ustore_modality_t* modalities;
-
-    /** Bytes between consecutive output modalities, never zero. */
-    ustore_size_t modalities_stride;
+    /** Rewound by this call, then holding every output it writes; @c NULL is refused. */
+    ustore_arena_t arena;
 
 } ustore_collection_find_t;
 
@@ -759,14 +914,13 @@ typedef struct ustore_collection_drop_t {
  */
 USTORE_EXPORT void ustore_collection_drop(ustore_collection_drop_t* arguments);
 
-#pragma endregion Collections
-
-#pragma region Transactions
-
 /** The arguments of @c ustore_transaction_init. */
 typedef struct ustore_transaction_init_t {
 
-    /** The transaction to begin or to reset for reuse. */
+    /** In and out: a @c NULL handle here begins a new transaction, which the caller frees with
+     *  @c ustore_transaction_free, written on success and left @c NULL on failure; a transaction of @c database is
+     *  reset in place onto a fresh snapshot, dropping its reads and writes, and keeps its handle whatever the outcome,
+     *  so after a failed reset it can only be freed or initialized again. */
     ustore_transaction_t* transaction;
 
     /** An open database. */
@@ -816,7 +970,8 @@ typedef struct ustore_transaction_stage_t {
     /** An initialized transaction. */
     ustore_transaction_t transaction;
 
-    /** Optional output for the stamp the transaction reads at, which its commit validates against. */
+    /** Optional output for the stamp the transaction reads at, which its commit validates against; zeroed on
+     *  failure. */
     ustore_stamp_t* read_stamp;
 
 } ustore_transaction_stage_t;
@@ -846,7 +1001,8 @@ typedef struct ustore_transaction_commit_t {
     /** An initialized transaction, staged first when the caller did not. */
     ustore_transaction_t transaction;
 
-    /** Optional output for the commit's position in commit order, visible to every snapshot at or above it. */
+    /** Optional output for the commit's position in commit order, visible to every snapshot at or above it; zeroed
+     *  on failure. */
     ustore_stamp_t* commit_stamp;
 
     /** How durable the writes are once the commit finishes. */
@@ -887,33 +1043,29 @@ typedef struct ustore_transaction_rollback_t {
  */
 USTORE_EXPORT void ustore_transaction_rollback(ustore_transaction_rollback_t* arguments);
 
-#pragma endregion Transactions
-
-#pragma region Memory Reclamation
-
 /**
  *  @brief Waits until every deferred call naming the transaction finishes, then resets it and frees its memory with
- *      every view of it.
+ *      every view of it once no cursor reads through it.
  *  @param[inout] transaction The transaction to be freed; @c NULL is safe.
  */
 USTORE_EXPORT void ustore_transaction_free(ustore_transaction_t transaction);
 
 /**
  *  @brief Waits until every deferred call naming the snapshot finishes, then releases it, unpinning the versions
- *      only it kept, and frees its memory with every view of it.
+ *      only it kept, and frees its memory with every view of it once no cursor reads through it.
  *  @param[inout] snapshot The snapshot to be freed; @c NULL is safe.
  */
 USTORE_EXPORT void ustore_snapshot_free(ustore_snapshot_t snapshot);
 
 /**
  *  @brief Waits until every deferred call naming the database finishes, then closes it and frees its memory once
- *      no transaction or snapshot of it holds it open, while the data persists on disk.
+ *      no transaction, snapshot or cursor of it holds it open, while the data persists on disk.
  *  @param[inout] database The database to be closed; @c NULL is safe.
  */
 USTORE_EXPORT void ustore_database_free(ustore_database_t database);
 
-#pragma endregion Memory Reclamation
-
 #ifdef __cplusplus
 }
 #endif
+
+#endif // UNUM_USTORE_DB_H
