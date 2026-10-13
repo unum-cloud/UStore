@@ -197,10 +197,10 @@ def main() -> None:
         graph = stored.graph_collection
         timed(
             "UStore import",
-            lambda: database.graph_upsert_edges(edges[:, 0].copy(), edges[:, 1].copy(), collection=graph),
+            lambda: database.graph_write_edges(edges[:, 0].copy(), edges[:, 1].copy(), collection=graph),
         )
         if isolated:
-            database.graph_upsert_vertices(isolated, collection=graph)
+            database.graph_write_vertices(isolated, collection=graph)
         partition = timed("Python baseline over UStore", lambda: best_partition(stored))
         print(f"  {len(set(partition.values()))} communities", flush=True)
 

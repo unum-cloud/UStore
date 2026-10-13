@@ -2,6 +2,7 @@
 
 import random
 from collections.abc import Callable, Iterator
+from enum import IntEnum
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,11 @@ def pytest_report_header() -> list[str]:
     header.append(f"- Seed: {SETTINGS.seed}")
     header.append(f"- Filter: {SETTINGS.filter or 'none'}")
     return header
+
+
+def pytest_make_parametrize_id(config: pytest.Config, val: object, argname: str) -> str | None:
+    """Names a parametrized status or mode by its member, such as `flushed`, where pytest would print its value."""
+    return val.name.lower() if isinstance(val, IntEnum) else None
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
@@ -52,12 +58,14 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
         return
     needs = [mark.args[0] for mark in metafunc.definition.iter_markers("needs")]
 
-    def configuration(engine: str, isolation: str | None = None):
+    def configuration(engine: str, isolation: ustore.Isolation | None = None):
         missing = [need for need in needs if not SUPPORTS[engine][need]]
         skipping = [pytest.mark.skip(reason=f"{engine} has no {' or '.join(missing)}")] if missing else []
         if "isolation" not in metafunc.fixturenames:
             return pytest.param(engine, marks=skipping, id=engine)
-        return pytest.param(engine, isolation, marks=skipping, id=f"{engine}-{isolation}" if isolation else engine)
+        # The first member is valued zero, so only None stands for no isolation
+        named = engine if isolation is None else f"{engine}-{isolation.name.lower()}"
+        return pytest.param(engine, isolation, marks=skipping, id=named)
 
     if "isolation" in metafunc.fixturenames:
         configurations = [
@@ -73,7 +81,7 @@ def open_database(tmp_path: Path, engine: str) -> Iterator[Callable[..., ustore.
     """Opens databases of the engine in directories of their own, closing whichever the case left open."""
     opened: list[ustore.Database] = []
 
-    def open_one(isolation: str | None = None) -> ustore.Database:
+    def open_one(isolation: ustore.Isolation | None = None) -> ustore.Database:
         directory = tmp_path / f"database-{len(opened)}"
         directory.mkdir()
         opened.append(open_engine(engine, directory, isolation))
@@ -102,3 +110,16 @@ def view(
         pytest.skip(f"{engine} has no transactions")
     with database.transaction() as staged:
         yield staged
+
+
+@pytest.fixture
+def arena() -> ustore.Arena:
+    """Host memory for the outputs of the verbs a case calls, which every call rewinds."""
+    return ustore.Arena()
+
+
+@pytest.fixture
+def later(view: ustore.Database | ustore.Transaction) -> Iterator[ustore.DeferredView]:
+    """A deferred view of `view`, whose executor waits for every call it ran once the case is done."""
+    with ustore.Executor.for_ram(2) as executor:
+        yield view.deferred(executor)

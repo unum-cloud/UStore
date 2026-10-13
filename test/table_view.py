@@ -10,6 +10,7 @@ import pytest
 from capabilities import NEEDS_COLLECTIONS, key, keys
 from pandas.testing import assert_frame_equal, assert_series_equal
 
+from ustore import Modality
 from ustore.table_view import Table
 
 PEOPLE = [
@@ -254,7 +255,7 @@ def test_updating_several_selected_rows_at_once(people):
 
 @NEEDS_COLLECTIONS
 def test_updating_a_missing_row_of_a_collection_by_id(database, view):
-    availability = database.collection_create("availability", modality="docs")
+    availability = database.collection_create("availability", modality=Modality.DOCS)
     Table(view, availability).loc[[key(7)]].update({"quantity": 100})
     assert Table(view, availability).to_pandas().to_dict(orient="records") == [{"quantity": 100}]
     assert Table(view).empty

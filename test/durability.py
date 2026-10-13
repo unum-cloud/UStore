@@ -11,6 +11,8 @@ from pathlib import Path
 
 from capabilities import NEEDS_COLLECTIONS, NEEDS_TRANSACTIONS, open_engine
 
+import ustore
+
 
 def crash_after(engine: str, directory: Path, body: str) -> None:
     """Runs `body` against `engine` opened in `directory`, then exits the process without closing it."""
@@ -24,7 +26,7 @@ def crash_after(engine: str, directory: Path, body: str) -> None:
 
 
 def test_a_flushed_write_survives_a_crash(engine: str, tmp_path: Path):
-    crash_after(engine, tmp_path, 'database.set(1, b"kept", flush=True)')
+    crash_after(engine, tmp_path, 'database.set(1, b"kept", durability=ustore.Durability.FLUSHED)')
     with open_engine(engine, tmp_path) as database:
         assert database.get(1) == b"kept"
 
@@ -37,7 +39,7 @@ def test_a_flushed_commit_survives_a_crash(engine: str, tmp_path: Path):
         """
         transaction = database.transaction()
         transaction.set(1, b"kept")
-        transaction.commit(flush=True)
+        transaction.commit(ustore.Durability.FLUSHED)
         """,
     )
     with open_engine(engine, tmp_path) as database:
@@ -53,7 +55,7 @@ def test_a_crash_keeps_whole_transactions(engine: str, tmp_path: Path):
         """
         left = database.collection_create("left")
         right = database.collection_create("right")
-        database.set(0, b"named", flush=True)
+        database.set(0, b"named", durability=ustore.Durability.FLUSHED)
         for key in range(64):
             with database.transaction() as transaction:
                 transaction.set(key, b"x" * 4096, collection=left)
@@ -61,14 +63,15 @@ def test_a_crash_keeps_whole_transactions(engine: str, tmp_path: Path):
         """,
     )
     with open_engine(engine, tmp_path) as database:
-        left = [length is not None for length in database.read(list(range(64)), collection="left").lengths]
-        right = [length is not None for length in database.read(list(range(64)), collection="right").lengths]
+        arena = ustore.Arena()
+        left = [length is not None for length in database.read(list(range(64)), arena, collection="left").lengths]
+        right = [length is not None for length in database.read(list(range(64)), arena, collection="right").lengths]
         assert left == right
 
 
 @NEEDS_COLLECTIONS
 def test_a_crash_keeps_the_names_of_collections(engine: str, tmp_path: Path):
-    crash_after(engine, tmp_path, 'database.collection_create("kept", modality="docs")')
+    crash_after(engine, tmp_path, 'database.collection_create("kept", modality=ustore.Modality.DOCS)')
     with open_engine(engine, tmp_path) as database:
         assert database.collection_contains("kept")
 
@@ -82,7 +85,7 @@ def test_a_crash_drops_a_staged_transaction(engine: str, tmp_path: Path):
         transaction = database.transaction()
         transaction.set(1, b"staged")
         transaction.stage()
-        database.set(2, b"after", flush=True)
+        database.set(2, b"after", durability=ustore.Durability.FLUSHED)
         """,
     )
     with open_engine(engine, tmp_path) as database:

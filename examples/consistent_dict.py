@@ -95,10 +95,11 @@ def read_one_by_one(database: ustore.Database, keys: np.ndarray) -> int:
 
 
 def read_in_batches(database: ustore.Database, keys: np.ndarray) -> int:
-    """Reads the keys in batches with `read` and returns how many values came back."""
+    """Reads the keys in batches with `read` into one reused arena and returns how many values came back."""
     total_values = 0
+    arena = ustore.Arena()
     for batch in batches(keys):
-        total_values += len(database.read(batch))
+        total_values += len(database.read(batch, arena))
     return total_values
 
 
@@ -126,8 +127,9 @@ def sample_native_dict(native_dict: dict[int, bytes]) -> None:
 
 def sample_collection(database: ustore.Database) -> None:
     """Draws `BATCH_SIZE` keys at random, which the engine answers without listing every key."""
+    arena = ustore.Arena()
     for _ in range(SAMPLE_ROUNDS):
-        database.sample(BATCH_SIZE)
+        database.sample(BATCH_SIZE, arena)
 
 
 def main() -> None:

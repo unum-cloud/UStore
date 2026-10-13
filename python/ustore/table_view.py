@@ -3,8 +3,10 @@
 Rows are documents addressed by their keys, which a frame indexes as `uuid.UUID`, and columns are
 fields: top-level keys, or JSON Pointers such as `/user/name` for nested values. A column given a
 dtype is gathered into typed memory and handed to Pandas without a copy where every value is valid,
-while a column without one is decoded from JSON. Verbs that change columns - assignment, `update`,
-`drop`, `rename` and `merge_from` - write through to the store instead of answering a changed copy.
+while a column without one is decoded from JSON. Every call reads into a one-off `Arena`, which a
+gathered column keeps alive for as long as Pandas holds it. Verbs that change columns, such as
+assignment, `update`, `drop`, `rename` and `merge_from`, write through to the store instead of
+answering a changed copy.
 """
 
 from __future__ import annotations
@@ -19,40 +21,26 @@ import numpy as np
 import pandas
 
 from ustore.keys import PAGE_KEYS, KeyLike, as_key, scan_keys
-from ustore.lib import Columns, Database, Transaction
+from ustore.lib import Arena, Columns, Database, FieldType, Modification, Transaction, View
 
-type View = Database | Transaction
-
-GATHER_TYPES = {
-    "float64": "f64",
-    "float32": "f32",
-    "int64": "i64",
-    "int32": "i32",
-    "int16": "i16",
-    "int8": "i8",
-    "uint64": "u64",
-    "uint32": "u32",
-    "uint16": "u16",
-    "uint8": "u8",
-    "bool": "bool",
-    "str": "str",
-    "bytes": "bytes",
-}
+type Receiver = Database | Transaction | View
 
 # A column of these dtypes is written as raw scalars, so nothing is printed as JSON and parsed back.
 WRITE_TYPES = {
-    "float64": "f64",
-    "float32": "f32",
-    "int64": "i64",
-    "int32": "i32",
-    "int16": "i16",
-    "int8": "i8",
-    "uint64": "u64",
-    "uint32": "u32",
-    "uint16": "u16",
-    "uint8": "u8",
-    "bool": "bool",
+    "float64": FieldType.F64,
+    "float32": FieldType.F32,
+    "int64": FieldType.I64,
+    "int32": FieldType.I32,
+    "int16": FieldType.I16,
+    "int8": FieldType.I8,
+    "uint64": FieldType.U64,
+    "uint32": FieldType.U32,
+    "uint16": FieldType.U16,
+    "uint8": FieldType.U8,
+    "bool": FieldType.BOOL,
 }
+
+GATHER_TYPES = {**WRITE_TYPES, "str": FieldType.STR, "bytes": FieldType.BIN}
 
 NULLABLE_DTYPES = {
     "float64": "Float64",
@@ -82,7 +70,7 @@ def encode_json(value: Any) -> str:
     return json.dumps(value, default=fallback)
 
 
-def scalar_column(values: Any) -> tuple[np.ndarray, str] | None:
+def scalar_column(values: Any) -> tuple[np.ndarray, FieldType] | None:
     """One flat NumPy column of a dtype the store writes as raw scalars, or None for anything else."""
     if not isinstance(values, np.ndarray) or values.ndim != 1:
         return None
@@ -128,11 +116,12 @@ def column_values(gathered: Columns, position: int, dtype: str) -> Any:
     """One gathered column as a NumPy or Pandas array, masking the values that were not found or converted."""
     rows = gathered.rows
     valid = np.unpackbits(
-        np.frombuffer(gathered.validity(position), dtype=np.uint8), count=rows, bitorder="little"
+        np.frombuffer(gathered.validities(position), dtype=np.uint8), count=rows, bitorder="little"
     ).astype(bool)
-    if dtype == "str":
+    kind = gathered.types[position]
+    if kind is FieldType.STR:
         return pandas.array(gathered[position], dtype="str")
-    if dtype == "bytes":
+    if kind is FieldType.BIN:
         return np.array(gathered[position], dtype=object)
     values = np.asarray(gathered[position])
     if valid.all():
@@ -160,12 +149,12 @@ class SelectedRows:
         self.keys = keys
 
     def update(self, fields: Mapping[str, Any]) -> None:
-        """Merges `fields` into every selected document through one `docs_write(..., modification="merge")`.
+        """Merges `fields` into every selected document through one `docs_write(..., modification=Modification.MERGE)`.
 
         The merge follows RFC 7386, so a field set to None is removed, and a row without a document gets one.
         """
         self.table.view.docs_write(
-            self.keys, encode_json(dict(fields)), modification="merge", collection=self.table.collection
+            self.keys, encode_json(dict(fields)), modification=Modification.MERGE, collection=self.table.collection
         )
 
 
@@ -174,7 +163,7 @@ class Table:
 
     def __init__(
         self,
-        view: View,
+        view: Receiver,
         collection: UUID | str | None = None,
         *,
         index: Iterable[KeyLike] | None = None,
@@ -223,9 +212,8 @@ class Table:
             return list(self.selected_columns)
         found: dict[str, None] = {}
         for page in batched(self.index, PAGE_KEYS):
-            found.update(
-                dict.fromkeys(column_of(pointer) for pointer in self.view.docs_gist(page, collection=self.collection))
-            )
+            pointers = self.view.docs_gist(page, Arena(), collection=self.collection)
+            found.update(dict.fromkeys(column_of(pointer) for pointer in pointers))
         return list(found)
 
     def __len__(self) -> int:
@@ -264,7 +252,7 @@ class Table:
 
     def sample(self, count: int) -> Table:
         """A view of up to `count` documents drawn at random by the store."""
-        return self.derive(index=self.view.sample(count, collection=self.collection)[0])
+        return self.derive(index=self.view.sample(count, Arena(), collection=self.collection)[0])
 
     @property
     def loc(self) -> RowSelection:
@@ -282,7 +270,7 @@ class Table:
         typed = [column for column in columns if column in self.dtypes]
         if typed:
             types = [GATHER_TYPES[self.dtypes[column]] for column in typed]
-            gathered = self.view.docs_gather(keys, typed, types, collection=self.collection)
+            gathered = self.view.docs_gather(keys, typed, types, Arena(), collection=self.collection)
             for position, column in enumerate(typed):
                 data[column] = column_values(gathered, position, self.dtypes[column])
 
@@ -290,7 +278,7 @@ class Table:
         if untyped:
             documents = [
                 None if document is None else json.loads(bytes(document))
-                for document in self.view.docs_read(keys, collection=self.collection)
+                for document in self.view.docs_read(keys, Arena(), collection=self.collection)
             ]
             for column in untyped:
                 data[column] = [value_at(document, column) for document in documents]
@@ -365,11 +353,11 @@ class Table:
             encoded = [encode_json(value) for value in selected]
             self.view.docs_write(rows, encoded, field=column, collection=self.collection)
 
-    def present_rows(self, column: str) -> tuple[list[UUID], list[memoryview]]:
+    def present_rows(self, column: str) -> tuple[list[UUID], list[bytes]]:
         """The keys of the rows holding `column`, and the JSON text of the value each holds."""
         keys = self.index
-        found = self.view.docs_read(keys, field=column, collection=self.collection)
-        pairs = [(key, value) for key, value in zip(keys, found, strict=True) if value is not None]
+        found = self.view.docs_read(keys, Arena(), field=column, collection=self.collection)
+        pairs = [(key, bytes(value)) for key, value in zip(keys, found, strict=True) if value is not None]
         return [key for key, _ in pairs], [value for _, value in pairs]
 
     def drop(self, columns: str | Iterable[str]) -> None:
@@ -378,7 +366,7 @@ class Table:
             keys, _ = self.present_rows(column)
             if keys:
                 patch = encode_json(removal_patch(column))
-                self.view.docs_write(keys, patch, modification="merge", collection=self.collection)
+                self.view.docs_write(keys, patch, modification=Modification.MERGE, collection=self.collection)
 
     def rename(self, columns: Mapping[str, str]) -> None:
         """Moves the values of every named column under its new name, row by row."""
@@ -387,18 +375,20 @@ class Table:
             if keys:
                 self.view.docs_write(keys, values, field=new, collection=self.collection)
                 patch = encode_json(removal_patch(old))
-                self.view.docs_write(keys, patch, modification="merge", collection=self.collection)
+                self.view.docs_write(keys, patch, modification=Modification.MERGE, collection=self.collection)
         if self.selected_columns is not None:
             self.selected_columns = [columns.get(column, column) for column in self.selected_columns]
 
     def merge_from(self, other: Table) -> None:
         """Merges every document of `other` into the document of the same key here, as RFC 7386 does."""
         keys = other.index
-        documents = other.view.docs_read(keys, collection=other.collection)
-        pairs = [(key, document) for key, document in zip(keys, documents, strict=True) if document is not None]
+        documents = other.view.docs_read(keys, Arena(), collection=other.collection)
+        pairs = [(key, bytes(document)) for key, document in zip(keys, documents, strict=True) if document is not None]
         if pairs:
             merged_keys, merged_documents = zip(*pairs, strict=True)
-            self.view.docs_write(merged_keys, merged_documents, modification="merge", collection=self.collection)
+            self.view.docs_write(
+                merged_keys, merged_documents, modification=Modification.MERGE, collection=self.collection
+            )
 
     # endregion Writes
 
@@ -407,7 +397,7 @@ class Table:
     @classmethod
     def from_records(
         cls,
-        view: View,
+        view: Receiver,
         records: Sequence[Mapping[str, Any]],
         *,
         collection: UUID | str | None = None,
@@ -421,7 +411,7 @@ class Table:
     @classmethod
     def from_dict(
         cls,
-        view: View,
+        view: Receiver,
         data: Mapping[str, Sequence[Any]],
         *,
         collection: UUID | str | None = None,

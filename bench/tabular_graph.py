@@ -82,7 +82,7 @@ def run_threads(files: list[Path], settings: argparse.Namespace, import_file: Ca
 
 
 def clear_main(database: ustore.Database) -> None:
-    database.collection_drop(0, mode="pairs")
+    database.collection_drop(UUID(int=0), ustore.DropMode.PAIRS)
 
 
 # region Documents
@@ -101,10 +101,10 @@ def bench_docs_import(database: ustore.Database, files: list[Path], settings: ar
 
 
 def exported_documents(database: ustore.Database) -> Iterator[dict]:
+    arena = ustore.Arena()
     for page in batched(scan_keys(database), PAGE_KEYS):
-        for document in database.docs_read(page):
-            if document is not None:
-                yield json.loads(bytes(document))
+        texts = [bytes(document) for document in database.docs_read(page, arena) if document is not None]
+        yield from map(json.loads, texts)
 
 
 def bench_docs_export(database: ustore.Database, settings: argparse.Namespace) -> None:
@@ -135,9 +135,7 @@ def bench_graph_import(database: ustore.Database, graph: UUID, files: list[Path]
         edges = integer_column(table, settings.edge_field)
         for begin in range(0, len(sources), settings.batch_rows):
             end = begin + settings.batch_rows
-            database.graph_upsert_edges(
-                sources[begin:end], targets[begin:end], edges=edges[begin:end], collection=graph
-            )
+            database.graph_write_edges(sources[begin:end], targets[begin:end], edges=edges[begin:end], collection=graph)
         return 0
 
     start = time.perf_counter()
@@ -153,12 +151,15 @@ def bench_graph_export(database: ustore.Database, graph: UUID, settings: argpars
     # Exported column names cannot hold the slashes of JSON Pointers.
     names = [field.replace("/", "_") for field in (settings.source_field, settings.target_field, settings.edge_field)]
     start = time.perf_counter()
+    # Every page stays viewed until the concatenation, so each lands in an arena of its own.
     tapes = [
-        np.asarray(database.graph_find_edges(page, role="source", collection=graph))
+        np.asarray(database.graph_read_edges(page, ustore.Arena(), role=ustore.Role.SOURCE, collection=graph))
         for page in batched(scan_keys(database, graph), PAGE_KEYS)
     ]
-    triples = np.concatenate(tapes) if tapes else np.empty((0, 3), dtype=np.int64)
-    table = pyarrow.Table.from_arrays([pyarrow.array(triples[:, column]) for column in range(3)], names=names)
+    triples = np.concatenate(tapes) if tapes else np.empty((0, 3, 16), dtype=np.uint8)
+    # Keys written from integers hold them in their low eight bytes, big-endian, as `uuid.UUID(int=n)` spells them.
+    integers = np.ascontiguousarray(triples[:, :, 8:]).view(">u8").reshape(-1, 3).astype(np.uint64)
+    table = pyarrow.Table.from_arrays([pyarrow.array(integers[:, column]) for column in range(3)], names=names)
     if settings.format == "ndjson":
         with output.open("w") as file:
             file.writelines(json.dumps(row) + "\n" for row in table.to_pylist())
@@ -185,7 +186,7 @@ def main() -> None:
     with getattr(ustore.Database, f"open_{settings.engine}")(settings.directory) as database:
         bench_docs_import(database, files, settings)
         bench_docs_export(database, settings)
-        graph = database.collection_create("graph", modality="graph")
+        graph = database.collection_create("graph", modality=ustore.Modality.GRAPH)
         bench_graph_import(database, graph, files, settings)
         bench_graph_export(database, graph, settings)
 

@@ -9,7 +9,7 @@ python_add_library(
     WITH_SOABI
     lib.c
     types.c
-    database.c
+    db.c
     blobs.c
     docs.c
     graph.c
@@ -30,15 +30,9 @@ set_target_properties(
 
 target_include_directories(ustore_python PRIVATE ${PROJECT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR})
 
-# A fast-call verb reaches its method table through a cast CPython's own headers prescribe, and no spelling of it
-# satisfies the compiler, so the warning is silenced where the tables live.
-if (NOT MSVC)
-    target_compile_options(ustore_python PRIVATE -Wno-cast-function-type)
-endif ()
-
 # The one library carries every engine the build enables, with the `USTORE_WITH_*` switches `engines_compiled` reads,
 # and documents convert to and from Python objects through the yyjson it already carries.
-target_link_libraries(ustore_python PRIVATE ustore yyjson::yyjson ustore_warnings)
+target_link_libraries(ustore_python PRIVATE ustore::static yyjson::yyjson ustore_warnings)
 
 # Named, or every dependency's own install rules land in the wheel beside the extension.
 install(TARGETS ustore_python LIBRARY DESTINATION ustore COMPONENT ustore_python)

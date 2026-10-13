@@ -16,29 +16,31 @@ def test_indexing_resolves_on_first_use(database):
     """Naming a missing collection costs nothing, while reading from it is refused."""
     posters = database["posters"]
     assert not database.collection_contains("posters")
-    with pytest.raises(ustore.MissingError, match="posters"):
+    with pytest.raises(ustore.NotFoundError, match="posters"):
         posters.blobs[1]
-    with pytest.raises(ustore.MissingError):
+    with pytest.raises(ustore.NotFoundError):
         assert 1 not in posters.docs
 
 
-@pytest.mark.parametrize("modality", ["blobs", "docs"])
-def test_first_write_declares_the_modality(database, modality: str):
-    written = b"bytes" if modality == "blobs" else {"k": 1}
-    getattr(database["things"], modality)[1] = written
-    assert database["things"].modality == modality
-    assert database["things"].id == database.collection_find("things")
+@pytest.mark.parametrize(
+    ("member", "modality", "other"),
+    [("blobs", ustore.Modality.BLOBS, "docs"), ("docs", ustore.Modality.DOCS, "blobs")],
+)
+def test_first_write_declares_the_modality(database, member: str, modality: ustore.Modality, other: str):
+    written = b"bytes" if modality is ustore.Modality.BLOBS else {"k": 1}
+    getattr(database["things"], member)[1] = written
+    assert database["things"].modality is modality
+    assert database["things"].id == database.collection_find("things", ustore.Arena())
 
-    other = "docs" if modality == "blobs" else "blobs"
-    with pytest.raises(TypeError, match=f"'things' holds {modality}, not {other}"):
+    with pytest.raises(ustore.InvalidArgumentError, match=f"'things' holds {member}, not {other}"):
         getattr(database["things"], other)[1]
 
 
-@pytest.mark.parametrize(("member", "modality"), [("graph", "graph"), ("table", "docs")])
-def test_graph_and_table_declare_on_access(database, member: str, modality: str):
+@pytest.mark.parametrize(("member", "modality"), [("graph", ustore.Modality.GRAPH), ("table", ustore.Modality.DOCS)])
+def test_graph_and_table_declare_on_access(database, member: str, modality: ustore.Modality):
     getattr(database["declared"], member)
-    assert database["declared"].modality == modality
-    with pytest.raises(TypeError, match="'declared' holds"):
+    assert database["declared"].modality is modality
+    with pytest.raises(ustore.InvalidArgumentError, match="'declared' holds"):
         database["declared"].blobs[1] = b"refused"
 
 
@@ -49,14 +51,14 @@ def test_any_collection_accepts_every_view(database):
     mixed.blobs[1] = b"bytes"
     mixed.docs[2] = {"k": 2}
     assert mixed.graph.graph_collection == mixed.id
-    assert mixed.modality == "any"
-    assert bytes(mixed.blobs[1]) == b"bytes"
+    assert mixed.modality is ustore.Modality.ANY
+    assert mixed.blobs[1] == b"bytes"
     assert mixed.docs[2] == {"k": 2}
 
 
 def test_main_collection_is_the_empty_name(database):
     database.set(1, b"main")
-    assert bytes(database[""].blobs[1]) == b"main"
+    assert database[""].blobs[1] == b"main"
 
 
 def test_docs_round_trip_python_objects(view):
@@ -68,7 +70,7 @@ def test_docs_round_trip_python_objects(view):
     assert people.docs[1] == NESTED
     assert people.docs[2] == '{"not": "parsed"}'
     assert people.docs[[3, 4]] == [[1, 2], None]
-    assert json.loads(bytes(people.docs_json[1])) == NESTED
+    assert json.loads(people.docs_json[1]) == NESTED
 
 
 def test_docs_refuse_what_json_cannot_hold(database):
@@ -78,11 +80,14 @@ def test_docs_refuse_what_json_cannot_hold(database):
         database["people"].docs[1] = {1: "one"}
 
 
-@pytest.mark.parametrize("member", ["blobs", "docs", "docs_json"])
-def test_missing_keys(database, member: str):
+@pytest.mark.parametrize(
+    ("member", "writer", "written"),
+    [("blobs", "blobs", b"{}"), ("docs", "docs", {}), ("docs_json", "docs", {})],
+    ids=["blobs", "docs", "docs_json"],
+)
+def test_missing_keys(database, member: str, writer: str, written: bytes | dict):
     """One missing key raises KeyError as a mapping does, while a batch answers None in its place."""
-    written = b"{}" if member == "blobs" else {}
-    getattr(database["things"], "docs" if member == "docs_json" else member)[1] = written
+    getattr(database["things"], writer)[1] = written
     mapping = getattr(database["things"], member)
     with pytest.raises(KeyError):
         mapping[2]
@@ -90,18 +95,19 @@ def test_missing_keys(database, member: str):
     assert mapping[[2, 1]][0] is None
 
 
-def test_blobs_read_without_copying(database):
+def test_blobs_copy_out_of_a_one_off_arena(database, arena):
+    """A mapping view has no place for an arena, so it copies, while `read` with an arena of yours does not."""
     database["posters"].blobs[[1, 2]] = [b"first", b"second"]
     poster = database["posters"].blobs[1]
     batch = database["posters"].blobs[[1, 2]]
     gc.collect()
-    assert isinstance(poster, memoryview) and poster.readonly
-    assert bytes(poster) == b"first"
-    assert isinstance(batch, ustore.Values) and [bytes(value) for value in batch] == [b"first", b"second"]
+    assert poster == b"first" and batch == [b"first", b"second"]
+    borrowed = database.read([1, 2], arena, collection="posters")
+    assert isinstance(borrowed[0], memoryview) and [bytes(value) for value in borrowed] == batch
 
 
 def test_deleting_removes_and_never_creates(database):
-    with pytest.raises(ustore.MissingError):
+    with pytest.raises(ustore.NotFoundError):
         del database["posters"].blobs[1]
     assert not database.collection_contains("posters")
     database["posters"].blobs[1] = b"poster"
@@ -121,15 +127,12 @@ def test_transactions_stage_writes_and_create_at_the_head(database):
     assert database["payments"].docs[1] == {"amount": 10}
 
 
-def test_sample_answers_values_with_their_keys(database):
+def test_sample_answers_keys_onto_values(database, arena):
     stored = {key(1): b"one", key(2): b"two", key(3): b"three"}
     database["pictures"].blobs[list(stored)] = list(stored.values())
-    images = database["pictures"].sample(1000)
-    drawn = images.keys[0]
-    assert sorted(drawn) == sorted(stored)
-    assert [bytes(image) for image in images] == [stored[drawn_key] for drawn_key in drawn]
-    assert set(database["pictures"].sample_keys(2)[0]) <= set(stored)
-    assert list(database["pictures"].scan(2, 5)[0]) == keys([2, 3])
+    assert database["pictures"].sample(1000) == stored
+    assert set(database["pictures"].sample_keys(2, arena)[0]) <= set(stored)
+    assert list(database["pictures"].scan(2, 5, arena)[0]) == keys([2, 3])
 
 
 def test_docs_write_serializes_dicts(database):
@@ -139,11 +142,12 @@ def test_docs_write_serializes_dicts(database):
     assert database[""].docs[[1, 2, 3, 4]] == [{"same": True}, {"same": True}, {"n": 3}, {"n": 4}]
 
 
-def test_values_export_as_arrow_large_binary(database):
+def test_values_export_as_arrow_binary(database, arena):
+    """A small read writes 32-bit offsets, so it exports as Arrow `binary` over the arena's own bytes."""
     pyarrow = pytest.importorskip("pyarrow")
     database["posters"].blobs[[1, 2]] = [b"first", b""]
-    values = database["posters"].blobs[[1, 3, 2]]
+    values = database.read([1, 3, 2], arena, collection="posters")
     array = pyarrow.array(values)
-    assert array.type == pyarrow.large_binary()
+    assert array.type == pyarrow.binary()
     assert array.to_pylist() == [b"first", None, b""]
     assert array.buffers()[2].address == np.frombuffer(values, dtype=np.uint8).ctypes.data

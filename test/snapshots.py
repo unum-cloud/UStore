@@ -1,20 +1,19 @@
 """Snapshots over the C ABI: capturing a point in time and reading it back through every read verb."""
 
 import pytest
-from capabilities import NEEDS_SNAPSHOTS, keys, open_engine
+from capabilities import NEEDS_SNAPSHOTS, NEEDS_TRANSACTIONS, keys, open_engine
 
 import ustore
 
 pytestmark = NEEDS_SNAPSHOTS
 
 READ_VERBS = {
-    "get": lambda database, key, snapshot: database.get(key, snapshot=snapshot),
-    "read": lambda database, key, snapshot: (
-        None if (found := database.read([key], snapshot=snapshot)[0]) is None else bytes(found)
+    "get": lambda receiver, key: receiver.get(key),
+    "read": lambda receiver, key: None if (found := receiver.read([key], ustore.Arena())[0]) is None else bytes(found),
+    "docs_read": lambda receiver, key: (
+        None if (found := receiver.docs_read([key], ustore.Arena())[0]) is None else bytes(found)
     ),
-    "docs_read": lambda database, key, snapshot: (
-        None if (found := database.docs_read([key], snapshot=snapshot)[0]) is None else bytes(found)
-    ),
+    "subscript": lambda receiver, key: receiver[""].blobs[[key]][0],
 }
 
 
@@ -24,12 +23,34 @@ def test_a_snapshot_names_its_database(database):
         assert snapshot.database is database
 
 
-def test_a_database_waits_for_its_snapshots(database):
+@NEEDS_TRANSACTIONS
+def test_a_snapshot_and_a_transaction_hold_their_database_open(database):
+    """Closing the database first leaves its snapshot reading and its transaction committing."""
+    database.set(1, b"before")
     snapshot = database.snapshot()
-    with pytest.raises(ustore.ArgumentError):
-        database.close()
+    staged = database.transaction()
+    database.close()
+    with pytest.raises(ustore.UninitializedError):
+        database.get(1)
+    staged.set(2, b"after")
+    staged.commit()
+    assert snapshot.get(1) == b"before" and snapshot.get(2) is None
+    staged.close()
     snapshot.close()
     snapshot.close()
+
+
+@NEEDS_TRANSACTIONS
+def test_a_snapshot_reads_at_or_above_the_commits_it_sees(database):
+    """A commit is visible to every snapshot whose read stamp is at or above its commit stamp, and to none below."""
+    with database.snapshot() as before:
+        staged = database.transaction()
+        staged.set(1, b"committed")
+        commit_stamp = staged.commit()
+        staged.close()
+        with database.snapshot() as after:
+            assert before.read_stamp < commit_stamp <= after.read_stamp
+            assert before.get(1) is None and after.get(1) == b"committed"
 
 
 @pytest.mark.parametrize("verb", READ_VERBS)
@@ -37,57 +58,106 @@ def test_a_snapshot_keeps_the_view_it_captured(database, verb: str):
     database.set(1, b'"before"')
     with database.snapshot() as snapshot:
         database.set(1, b'"after"')
-        assert READ_VERBS[verb](database, 1, None) == b'"after"'
-        assert READ_VERBS[verb](database, 1, snapshot) == b'"before"'
+        assert READ_VERBS[verb](database, 1) == b'"after"'
+        assert READ_VERBS[verb](snapshot, 1) == b'"before"'
 
 
 @pytest.mark.parametrize("verb", READ_VERBS)
 def test_a_snapshot_hides_a_later_insert(database, verb: str):
     with database.snapshot() as snapshot:
         database.set(1, b'"later"')
-        assert READ_VERBS[verb](database, 1, None) is not None
-        assert READ_VERBS[verb](database, 1, snapshot) is None
-        assert not database.contains(1, snapshot=snapshot)
+        assert READ_VERBS[verb](database, 1) is not None
+        assert READ_VERBS[verb](snapshot, 1) is None
+        assert not snapshot.contains(1)
 
 
-def test_batch_verbs_follow_a_snapshot(database):
+def test_batch_verbs_follow_a_snapshot(database, arena):
     database.write([1, 2], [b"a", b"bb"])
     with database.snapshot() as snapshot:
         database.write([1, 2, 3], b"changed")
-        assert [bytes(value) for value in database.read([1, 2], snapshot=snapshot)] == [b"a", b"bb"]
-        assert list(database.scan(0, 3, snapshot=snapshot)[0]) == keys([1, 2])
+        assert [bytes(value) for value in snapshot.read([1, 2], arena)] == [b"a", b"bb"]
+        assert list(snapshot.scan(0, 3, arena)[0]) == keys([1, 2])
+        assert snapshot[""].blobs[1] == b"a"
 
 
-def test_export_writes_a_database_that_opens(database, engine: str, tmp_path):
-    database.set(1, b"exported")
-    directory = tmp_path / "exported"
+def test_a_snapshot_only_reads(database):
+    """A snapshot has no write verbs, and its collections and views refuse every write."""
+    with database.snapshot() as snapshot, ustore.Executor.for_ram(1) as executor:
+        assert not hasattr(snapshot, "write")
+        with pytest.raises(TypeError):
+            snapshot[""].blobs[1] = b"refused"
+        with pytest.raises(TypeError):
+            snapshot.on(executor).set(1, b"refused")
+    assert not database.contains(1)
+
+
+def test_save_writes_a_database_that_opens(database, engine: str, tmp_path):
+    database.set(1, b"saved")
+    directory = tmp_path / "saved"
     directory.mkdir()
 
     with database.snapshot() as snapshot:
         try:
-            snapshot.export(directory)
+            snapshot.save(directory)
         except ustore.UnsupportedError:
-            pytest.skip("The engine exports no snapshots")
+            pytest.skip("The engine saves no snapshots")
 
     with open_engine(engine, directory) as reopened:
-        assert reopened.get(1) == b"exported"
+        assert reopened.get(1) == b"saved"
+
+
+def test_a_deferred_save_writes_a_database_that_opens(database, engine: str, tmp_path):
+    database.set(1, b"saved")
+    directory = tmp_path / "saved"
+    directory.mkdir()
+
+    with database.snapshot() as snapshot, ustore.Executor.for_ram(1) as executor:
+        saving = snapshot.deferred(executor).save(directory, progress=lambda finished, total: finished <= total)
+        try:
+            assert saving.wait() is None
+        except ustore.UnsupportedError:
+            pytest.skip("The engine saves no snapshots")
+
+    with open_engine(engine, directory) as reopened:
+        assert reopened.get(1) == b"saved"
+
+
+def test_a_cancelled_save_leaves_nothing_behind(database, engine: str, tmp_path):
+    """A save its callable cancels removes what it wrote, so a retry at the same path saves a copy that opens."""
+    database.write(list(range(256)), b"v" * 256)
+    directory = tmp_path / "saved"
+    directory.mkdir()
+    with database.snapshot() as snapshot:
+        with pytest.raises(ustore.CancelledError):
+            snapshot.save(directory, progress=lambda finished, total: False)
+        snapshot.save(directory)
+    with open_engine(engine, directory) as reopened:
+        assert reopened.get(255) == b"v" * 256
+
+
+def test_save_needs_a_view_of_a_snapshot(database, tmp_path):
+    with ustore.Executor.for_ram(1) as executor, pytest.raises(TypeError, match="snapshot"):
+        database.deferred(executor).save(tmp_path)
+
+
+def test_a_cursor_reads_its_snapshot_after_the_snapshot_closes(database, arena):
+    """A cursor holds the snapshot it reads through, so its walk sees the pinned state whatever the head does."""
+    database.write([1, 2], b"before")
+    snapshot = database.snapshot()
+    cursor = snapshot.cursor()
+    snapshot.close()
+    database.write([0, 3], b"after")
+    database.remove(1)
+    page = cursor.next(8, arena, values=True)
+    assert list(page) == keys([1, 2])
+    assert [bytes(value) for value in page.values] == [b"before", b"before"]
+    cursor.close()
 
 
 def test_a_closed_snapshot_is_refused(database):
     snapshot = database.snapshot()
     snapshot.close()
-    with pytest.raises(ValueError):
-        database.get(1, snapshot=snapshot)
-    with pytest.raises(ValueError):
-        snapshot.export("anywhere")
-
-
-def test_a_snapshot_of_another_database_is_refused(database, open_database):
-    other = open_database()
-    with other.snapshot() as foreign, pytest.raises(ustore.ArgumentError):
-        database.get(1, snapshot=foreign)
-
-
-def test_an_identifier_is_no_snapshot(database):
-    with pytest.raises(TypeError):
-        database.get(1, snapshot=1)
+    with pytest.raises(ustore.UninitializedError):
+        snapshot.get(1)
+    with pytest.raises(ustore.UninitializedError):
+        snapshot.save("anywhere")

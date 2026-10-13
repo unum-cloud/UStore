@@ -4,24 +4,27 @@
  *  @date September 28, 2026
  *  @brief Collections addressed by name, and the mapping views each one answers for its modality.
  *
- *  Indexing a database or a transaction by name answers a @c Collection, which resolves the name at
- *  the head once, on first use, and remembers what it found. Its @c blobs, @c docs and @c docs_json
- *  views read and write through the verb cores the flat methods share, so no keyword is parsed on
- *  the way. A read of a missing collection is refused, the first write through a view creates it to
- *  hold that view's modality, and a view of another modality is refused unless the collection holds
- *  anything. Collections are created at the head even from a transaction, as the ABI creates them.
+ *  Indexing a receiver by name answers a @c Collection, which resolves the name once, on first use,
+ *  and remembers what it found. Its @c blobs, @c docs and @c docs_json views read and write through
+ *  the verb cores the flat methods share, so no keyword is parsed on the way, and they run as the
+ *  receiver runs its calls. They have no place for an arena, so every read makes a one-off arena,
+ *  copies what it read into Python objects and frees the arena with the call. A read of a missing
+ *  collection is refused, the first write through a view creates it to hold that view's modality,
+ *  and a view of another modality is refused unless the collection holds anything. Collections are
+ *  created at the head even from a transaction, as the ABI creates them, and never from a snapshot,
+ *  which only reads.
  */
 #include "lib.h"
 
 #pragma region Collections
 
-/** A collection a database or a transaction addresses by name, resolved on first use and created by its first write. */
+/** A collection a receiver addresses by name, resolved on first use and created by its first write. */
 typedef struct Collection {
 
     /** The object header every instance carries. */
     PyObject ob_base;
 
-    /** The @c Database or @c Transaction indexed, which every verb runs through and which this keeps alive. */
+    /** The receiver indexed, which every verb runs through and which this keeps alive. */
     PyObject* view;
 
     /** The name, a str, where the empty one is the main collection. */
@@ -62,7 +65,7 @@ static char const* modality_noun(ustore_modality_t modality) {
 /** What resolving a name does when no collection carries it. */
 typedef enum collection_missing_t {
 
-    /** Raise @c MissingError, as every read does. */
+    /** Raise @c NotFoundError, as every read does. */
     collection_missing_refused_k = 0,
 
     /** Create the collection at the head to hold the modality of the view, as the first write does. */
@@ -70,16 +73,15 @@ typedef enum collection_missing_t {
 } collection_missing_t;
 
 /**
- *  @brief Finds the collection @p self names at the head or at the snapshot of @p options, or creates it at the head to
- *      hold @p modality.
+ *  @brief Finds the collection @p self names at the head or at the snapshot of @p context, or creates it at the head
+ *      to hold @p modality.
  *
- *  @param[in] missing Whether a missing name is refused or created.
+ *  @param[in] missing Whether a missing name is refused or created, where a snapshot always refuses.
  *  @param[out] id The collection the name addresses.
  *  @param[out] held What the collection holds.
  *  @return 0 on success, -1 with an exception set otherwise.
  */
-static int collection_lookup(Collection const* self, ustore_py_context_t const* context,
-                             ustore_py_verb_options_t const* options, ustore_modality_t modality,
+static int collection_lookup(Collection const* self, ustore_py_context_t const* context, ustore_modality_t modality,
                              collection_missing_t missing, ustore_collection_id_t* id, ustore_modality_t* held) {
     Py_ssize_t length = 0;
     char const* const name = PyUnicode_AsUTF8AndSize(self->name, &length);
@@ -89,17 +91,17 @@ static int collection_lookup(Collection const* self, ustore_py_context_t const* 
         *held = ustore_modality_any_k;
         return 0;
     }
-    ustore_py_naming_t naming = ustore_py_collection_named(context, options->snapshot, name, (size_t)length, id, held);
+    ustore_py_naming_t naming = ustore_py_collection_named(context, name, (size_t)length, id, held);
     if (naming != ustore_py_naming_missing_k) return naming == ustore_py_naming_found_k ? 0 : -1;
-    if (missing == collection_missing_refused_k)
+    if (missing == collection_missing_refused_k || context->snapshot)
         return ustore_py_raise(ustore_status_not_found_k, "No collection is named %R", self->name);
 
     ustore_outcome_t outcome = {0};
     ustore_collection_create_t create = {0};
-    create.database = context->database->handle;
+    create.database = context->database_handle;
     create.outcome = &outcome;
-    create.name = name;
-    create.name_length = (ustore_length_t)length;
+    create.name.data = (uint8_t const*)name;
+    create.name.length = (ustore_size_t)length;
     create.modality = modality;
     create.collection = id;
 
@@ -109,8 +111,8 @@ static int collection_lookup(Collection const* self, ustore_py_context_t const* 
 
     *held = modality;
     // Another writer may have created it since the lookup, and then the name addresses theirs.
-    if (outcome.status == ustore_status_already_exists_k) {
-        naming = ustore_py_collection_named(context, options->snapshot, name, (size_t)length, id, held);
+    if (ustore_outcome_status(&outcome) == ustore_status_already_exists_k) {
+        naming = ustore_py_collection_named(context, name, (size_t)length, id, held);
         if (naming != ustore_py_naming_missing_k) return naming == ustore_py_naming_found_k ? 0 : -1;
     }
     return ustore_py_raise_on_outcome(&outcome);
@@ -120,14 +122,14 @@ static int collection_lookup(Collection const* self, ustore_py_context_t const* 
  *  @brief Resolves @p self once and checks it holds what a view reads, filling what a verb core runs with.
  *  @param[in] modality What the view reads and writes, where @c ustore_modality_any_k checks nothing.
  *  @param[in] missing Whether a missing collection is refused or created to hold @p modality.
- *  @param[out] context The database and transaction the verb runs against.
+ *  @param[out] context What the verb addresses and how it runs, as the receiver indexed names it.
  *  @param[out] options The view's own options, addressing the collection.
  *  @return 0 on success, -1 with an exception set otherwise.
  */
 static int collection_resolve(Collection* self, ustore_modality_t modality, collection_missing_t missing,
                               ustore_py_context_t* context, ustore_py_verb_options_t* options) {
     if (ustore_py_context_from_object(self->view, context) != 0) return -1;
-    ustore_py_verb_options_init(context, options);
+    ustore_py_verb_options_init(options);
     ustore_collection_id_t id = ustore_collection_main_k;
     ustore_modality_t held = ustore_modality_any_k;
     int resolved = 0;
@@ -138,7 +140,7 @@ static int collection_resolve(Collection* self, ustore_modality_t modality, coll
     ustore_py_critical_section_end_();
 
     if (!resolved) {
-        if (collection_lookup(self, context, options, modality, missing, &id, &held) != 0) return -1;
+        if (collection_lookup(self, context, modality, missing, &id, &held) != 0) return -1;
         ustore_py_critical_section_begin_((PyObject*)self);
         self->id = id;
         self->modality = held;
@@ -147,8 +149,8 @@ static int collection_resolve(Collection* self, ustore_modality_t modality, coll
     }
     options->collection = id;
     if (modality == ustore_modality_any_k || held == ustore_modality_any_k || held == modality) return 0;
-    PyErr_Format(PyExc_TypeError, "%R holds %s, not %s", self->name, modality_noun(held), modality_noun(modality));
-    return -1;
+    return ustore_py_raise(ustore_status_invalid_argument_k, "%R holds %s, not %s", self->name, modality_noun(held),
+                           modality_noun(modality));
 }
 
 PyObject* ustore_py_collection_subscript(PyObject* view, PyObject* name) {
@@ -206,7 +208,7 @@ static PyObject* collection_python_view(Collection* self, ustore_modality_t moda
 }
 
 static char const doc_Collection_blobs[] =
-    "The binary values, as a mapping: `blobs[key]` reads a zero-copy memoryview, a batch of keys reads Values.";
+    "The binary values, as a mapping: `blobs[key]` reads a copy as bytes, a batch of keys a list of them.";
 
 static PyObject* Collection_get_blobs(Collection* self, void* Py_UNUSED(closure)) {
     return collection_view(self, &BlobsViewType);
@@ -220,7 +222,7 @@ static PyObject* Collection_get_docs(Collection* self, void* Py_UNUSED(closure))
 }
 
 static char const doc_Collection_docs_json[] =
-    "The JSON documents as their text, as a mapping: `docs_json[key]` reads a zero-copy memoryview of the JSON.";
+    "The JSON documents as their text, as a mapping: `docs_json[key]` reads a copy of the JSON as bytes.";
 
 static PyObject* Collection_get_docs_json(Collection* self, void* Py_UNUSED(closure)) {
     return collection_view(self, &DocsJSONViewType);
@@ -237,6 +239,11 @@ static char const doc_Collection_table[] =
     "The documents as rows, as a `ustore.table_view.Table`, creating a docs collection when the name is missing.";
 
 static PyObject* Collection_get_table(Collection* self, void* Py_UNUSED(closure)) {
+    ustore_py_context_t context;
+    if (ustore_py_context_from_object(self->view, &context) != 0 ||
+        ustore_py_context_blocking(&context, "A table view pages through several calls",
+                                   "docs_gather() or docs_write()") != 0)
+        return NULL;
     return collection_python_view(self, ustore_modality_docs_k, "ustore.table_view", "Table");
 }
 
@@ -244,7 +251,7 @@ static char const doc_Collection_name[] = "The name the collection was addressed
 
 static PyObject* Collection_get_name(Collection* self, void* Py_UNUSED(closure)) { return Py_NewRef(self->name); }
 
-static char const doc_Collection_id[] = "The ID the name addresses, raising MissingError when it addresses none.";
+static char const doc_Collection_id[] = "The ID the name addresses, raising NotFoundError when it addresses none.";
 
 static PyObject* Collection_get_id(Collection* self, void* Py_UNUSED(closure)) {
     ustore_py_context_t context;
@@ -255,110 +262,122 @@ static PyObject* Collection_get_id(Collection* self, void* Py_UNUSED(closure)) {
 }
 
 static char const doc_Collection_modality[] =
-    "What the collection holds, such as 'docs', raising MissingError when the name addresses none.";
+    "What the collection holds, such as `Modality.DOCS`, raising NotFoundError when the name addresses none.";
 
 static PyObject* Collection_get_modality(Collection* self, void* Py_UNUSED(closure)) {
     ustore_py_context_t context;
     ustore_py_verb_options_t options;
     if (collection_resolve(self, ustore_modality_any_k, collection_missing_refused_k, &context, &options) != 0)
         return NULL;
-    for (ustore_py_choice_naming_t const* naming = ustore_py_modality_namings; naming->name; ++naming)
-        if (naming->value == (int)self->modality) return PyUnicode_FromString(naming->name);
-    return PyUnicode_FromString("unknown");
+    return ustore_py_enum_to_object(ustore_py_enum_modality_k, (int)self->modality);
 }
 
-static char const doc_Collection_sample[] =                                                 //
-    "sample(count) answers the Values of up to `count` keys drawn at random.\n"             //
-    "\n"                                                                                    //
-    "Draws the keys and reads their values through the same view in one call. The keys\n"   //
-    "come back as the `keys` attribute of the answer, and a key removed between the draw\n" //
-    "and the read reads as None.\n"                                                         //
-    "\n"                                                                                    //
-    "Args:\n"                                                                               //
-    "  count (int): Keys to draw.\n"                                                        //
-    "Returns:\n"                                                                            //
-    "  Values: One value per key drawn, with the keys beside them.\n"                       //
-    "Raises:\n"                                                                             //
-    "  MissingError: No collection carries the name.";
+static char const doc_Collection_sample[] =                                                     //
+    "sample(wanted) answers a dict of up to `wanted` keys drawn at random onto their values.\n" //
+    "\n"                                                                                        //
+    "Draws the keys and then reads their values through the same view, each into a one-off\n"   //
+    "arena, and copies every value into bytes, so neither arena outlives the call. A key\n"     //
+    "removed between the draw and the read maps onto None. In a loop, `sample` and `read`\n"    //
+    "with arenas of your own allocate nothing per call.\n"                                      //
+    "\n"                                                                                        //
+    "Args:\n"                                                                                   //
+    "  wanted (int): Most keys to draw.\n"                                                      //
+    "Returns:\n"                                                                                //
+    "  dict[UUID, bytes | None]: Every key drawn, in the order drawn, onto its value.\n"        //
+    "Raises:\n"                                                                                 //
+    "  NotFoundError: No collection carries the name.";
 
-static PyObject* Collection_sample(Collection* self, PyObject* count_object) {
-    size_t count = 0;
-    if (ustore_py_size_from_object(count_object, "count", &count) != 0) return NULL;
+static PyObject* Collection_sample(Collection* self, PyObject* wanted_object) {
+    size_t wanted = 0;
+    if (ustore_py_size_from_object(wanted_object, "wanted", &wanted) != 0) return NULL;
     ustore_py_context_t context;
     ustore_py_verb_options_t options;
-    if (collection_resolve(self, ustore_modality_any_k, collection_missing_refused_k, &context, &options) != 0)
+    if (collection_resolve(self, ustore_modality_any_k, collection_missing_refused_k, &context, &options) != 0 ||
+        ustore_py_context_blocking(&context, "Collection.sample() reads what it draws in a second call",
+                                   "sample() and then read() on the deferred view") != 0)
         return NULL;
 
-    PyObject* const drawn = ustore_py_keys_sample(&context, &options, count);
+    ustore_executor_t const executor = ustore_py_context_executor(&context);
+    PyObject* const drawing = ustore_py_arena_new(executor);
+    PyObject* const drawn = drawing ? ustore_py_keys_sample(&context, &options, wanted, drawing) : NULL;
+    Py_XDECREF(drawing);
     if (!drawn) return NULL;
-    Keys const* const keys = (Keys const*)drawn;
-    PyObject* const values = ustore_py_values_read(&context, &options, keys->tape, (size_t)keys->offsets[1]);
-    if (!values) {
-        Py_DECREF(drawn);
-        return NULL;
-    }
-    ((Values*)values)->keys = drawn;
+    // The tape of the draw exports as 16-byte keys, which the read borrows in place from the other arena
+    ustore_py_read_call_t call;
+    ustore_py_call_open(&context, &ustore_py_read_drawn_verb, &call);
+    PyObject* const reading = ustore_py_arena_new(executor);
+    PyObject* const values = reading && ustore_py_keys_from_object(drawn, &call.keys) == 0
+                                 ? ustore_py_values_read(&context, &options, &ustore_py_read_drawn_verb, &call, reading)
+                                 : ustore_py_call_discard(&context, &ustore_py_read_drawn_verb, &call);
+    Py_XDECREF(reading);
+    Py_DECREF(drawn);
     return values;
 }
 
-static char const doc_Collection_sample_keys[] =                                      //
-    "sample_keys(count) answers a Keys tape of up to `count` keys drawn at random.\n" //
-    "\n"                                                                              //
-    "Args:\n"                                                                         //
-    "  count (int): Keys to draw.\n"                                                  //
-    "Returns:\n"                                                                      //
+static char const doc_Collection_sample_keys[] =                                               //
+    "sample_keys(wanted, arena) answers a Keys tape of up to `wanted` keys drawn at random.\n" //
+    "\n"                                                                                       //
+    "Args:\n"                                                                                  //
+    "  wanted (int): Most keys to draw.\n"                                                     //
+    "  arena (Arena): Where the keys land, rewound by this call.\n"                            //
+    "Returns:\n"                                                                               //
     "  Keys: One run of keys, in no particular order.";
 
-static PyObject* Collection_sample_keys(Collection* self, PyObject* count_object) {
-    size_t count = 0;
-    if (ustore_py_size_from_object(count_object, "count", &count) != 0) return NULL;
+static PyObject* Collection_sample_keys(Collection* self, PyObject* const* args, Py_ssize_t positional_args_count) {
+    if (ustore_py_args_names_count_checked("sample_keys", positional_args_count, NULL, 2) < 0) return NULL;
+    size_t wanted = 0;
+    if (ustore_py_size_from_object(args[0], "wanted", &wanted) != 0) return NULL;
     ustore_py_context_t context;
     ustore_py_verb_options_t options;
     if (collection_resolve(self, ustore_modality_any_k, collection_missing_refused_k, &context, &options) != 0)
         return NULL;
-    return ustore_py_keys_sample(&context, &options, count);
+    return ustore_py_keys_sample(&context, &options, wanted, args[1]);
 }
 
-static char const doc_Collection_scan[] =                                          //
-    "scan(start, count) answers a Keys tape of up to `count` keys from `start`.\n" //
-    "\n"                                                                           //
-    "Args:\n"                                                                      //
-    "  start (KeyLike): The smallest key the scan may return.\n"                   //
-    "  count (int): Most keys the scan returns.\n"                                 //
-    "Returns:\n"                                                                   //
+static char const doc_Collection_scan[] =                                                   //
+    "scan(start, wanted, arena) answers a Keys tape of up to `wanted` keys from `start`.\n" //
+    "\n"                                                                                    //
+    "Args:\n"                                                                               //
+    "  start (KeyLike): The smallest key the scan may return.\n"                            //
+    "  wanted (int): Most keys the scan returns.\n"                                         //
+    "  arena (Arena): Where the keys land, rewound by this call.\n"                         //
+    "Returns:\n"                                                                            //
     "  Keys: One run of keys, in ascending order.";
 
 static PyObject* Collection_scan(Collection* self, PyObject* const* args, Py_ssize_t positional_args_count) {
-    if (positional_args_count != 2) {
-        PyErr_Format(PyExc_TypeError, "scan() takes 2 positional arguments, received %zd", positional_args_count);
-        return NULL;
-    }
+    if (ustore_py_args_names_count_checked("scan", positional_args_count, NULL, 3) < 0) return NULL;
     ustore_key_t start = {0};
-    size_t count = 0;
+    size_t wanted = 0;
     if (ustore_py_key_from_object(args[0], &start) != 0) return NULL;
-    if (ustore_py_size_from_object(args[1], "count", &count) != 0) return NULL;
+    if (ustore_py_size_from_object(args[1], "wanted", &wanted) != 0) return NULL;
     ustore_py_context_t context;
     ustore_py_verb_options_t options;
     if (collection_resolve(self, ustore_modality_any_k, collection_missing_refused_k, &context, &options) != 0)
         return NULL;
-    return ustore_py_keys_scan(&context, &options, &start, count);
+    return ustore_py_keys_scan(&context, &options, &start, wanted, ustore_scan_ordered_k, NULL, args[2]);
 }
 
-static char const doc_Collection[] =                                                         //
-    "A collection a database or a transaction addresses by name, as `db['movies']`.\n"       //
-    "\n"                                                                                     //
-    "The name resolves once, on first use. A read resolves it through the view of the\n"     //
-    "object indexed, so a watching transaction records it, and raises MissingError when\n"   //
-    "no collection carries it there. A write through `blobs` or `docs`, or an access of\n"   //
-    "`graph` or `table`, resolves it at the head instead, creating a missing collection\n"   //
-    "there to hold that modality, so a transaction never conflicts with a collection made\n" //
-    "for it. A view of another modality raises TypeError, and a collection created to\n"     //
-    "hold 'any' accepts every view.";
+static char const doc_Collection[] =                                                           //
+    "A collection a receiver addresses by name, as `db['movies']` or `snapshot['movies']`.\n"  //
+    "\n"                                                                                       //
+    "The name resolves once, on first use, at the snapshot of a snapshot and at the head\n"    //
+    "otherwise, raising NotFoundError on a read when no collection carries it. A write\n"      //
+    "through `blobs` or `docs`, or an access of `graph` or `table`, creates a missing\n"       //
+    "collection at the head to hold that modality, so a transaction never conflicts with a\n"  //
+    "collection made for it. A view of another modality raises InvalidArgumentError, and a\n"  //
+    "collection created to hold 'any' accepts every view.\n"                                   //
+    "\n"                                                                                       //
+    "Its calls run as the receiver's do. The mapping views and `sample` copy what they read\n" //
+    "out of a one-off arena each, while `scan` and `sample_keys` take an Arena of yours.\n"    //
+    "Through a deferred view, `blobs[key]`, `docs[key]`, `docs_json[key]`, `scan`,\n"          //
+    "`sample_keys` and the reads of `graph` that take one call answer a Deferred, while an\n"  //
+    "assignment, `del`, `in`, `sample` and `table` raise TypeError naming the flat verb to\n"  //
+    "call instead.";
 
 static PyMethodDef Collection_methods[] = {
-    {"sample", (PyCFunction)Collection_sample, METH_O, doc_Collection_sample},
-    {"sample_keys", (PyCFunction)Collection_sample_keys, METH_O, doc_Collection_sample_keys},
-    {"scan", (PyCFunction)Collection_scan, METH_FASTCALL, doc_Collection_scan},
+    {"sample", (PyCFunction)(void (*)(void))Collection_sample, METH_O, doc_Collection_sample},
+    {"sample_keys", (PyCFunction)(void (*)(void))Collection_sample_keys, METH_FASTCALL, doc_Collection_sample_keys},
+    {"scan", (PyCFunction)(void (*)(void))Collection_scan, METH_FASTCALL, doc_Collection_scan},
     {NULL, NULL, 0, NULL},
 };
 
@@ -391,80 +410,6 @@ PyTypeObject CollectionType = {
 
 #pragma region Views
 
-/**
- *  @brief Reads a subscript as one key or a batch of them, the way `view[key]` and `view[[keys]]` differ.
- *  @return 1 for one key, 0 for a batch, or -1 with an exception set.
- */
-static int keys_from_subscript(PyObject* object, ustore_py_keys_t* keys) {
-    if (!ustore_py_is_one_key(object)) return ustore_py_keys_from_object(object, keys) == 0 ? 0 : -1;
-    memset(keys, 0, sizeof(*keys));
-    if (ustore_py_key_from_object(object, &keys->inline_keys[0]) != 0) return -1;
-    keys->keys = keys->inline_keys;
-    keys->count = 1;
-    return 1;
-}
-
-/** Answers the only value of @p values, a read of @p key, as a zero-copy memoryview, or raises KeyError. */
-static PyObject* values_single(PyObject* values, PyObject* key) {
-    if (!values) return NULL;
-    Values const* const read = (Values const*)values;
-    PyObject* found = NULL;
-    Py_ssize_t const length = (Py_ssize_t)(read->offsets[1] - read->offsets[0]);
-    if (!ustore_py_values_present(read, 0)) PyErr_SetObject(PyExc_KeyError, key);
-    else found = ustore_py_span_view(values, read->tape + read->offsets[0], "B", 1, 1, &length);
-    Py_DECREF(values);
-    return found;
-}
-
-/** Parses the JSON of task @p task_index of @p values into Python objects, or answers None where it is missing. */
-static PyObject* document_parse(Values const* values, size_t task_index) {
-    if (!ustore_py_values_present(values, task_index)) Py_RETURN_NONE;
-    // yyjson writes into its input only with `YYJSON_READ_INSITU`, which is never set.
-    char* const text = (char*)(values->tape + values->offsets[task_index]);
-    size_t const length = (size_t)(values->offsets[task_index + 1] - values->offsets[task_index]);
-    yyjson_read_flag const flags = YYJSON_READ_ALLOW_COMMENTS | YYJSON_READ_ALLOW_INF_AND_NAN |
-                                   YYJSON_READ_BIGNUM_AS_RAW;
-    yyjson_read_err error = {0};
-    yyjson_doc* const document = yyjson_read_opts(text, length, flags, NULL, &error);
-    if (!document) {
-        ustore_py_raise(ustore_status_malformed_k, "A stored document is not JSON: %s", error.msg);
-        return NULL;
-    }
-    PyObject* const object = ustore_py_object_from_json(yyjson_doc_get_root(document));
-    yyjson_doc_free(document);
-    return object;
-}
-
-/** Parses every document of @p values, answering the only one for a single @p key or a list for a batch. */
-static PyObject* documents_parse(PyObject* values, PyObject* key, int one) {
-    if (!values) return NULL;
-    Values const* const read = (Values const*)values;
-    if (one && !ustore_py_values_present(read, 0)) {
-        PyErr_SetObject(PyExc_KeyError, key);
-        return NULL;
-    }
-    if (one) return document_parse(read, 0);
-    PyObject* const documents = PyList_New((Py_ssize_t)read->count);
-    for (size_t task_index = 0; documents && task_index != read->count; ++task_index) {
-        PyObject* const document = document_parse(read, task_index);
-        if (!document) {
-            Py_DECREF(documents);
-            return NULL;
-        }
-        PyList_SET_ITEM(documents, (Py_ssize_t)task_index, document);
-    }
-    return documents;
-}
-
-/** Releases @p values, giving its arena back to @p database when nothing else holds it, as `get` does. */
-static void values_reclaim(Database* database, PyObject* values) {
-    if (Py_REFCNT(values) == 1) {
-        ustore_py_arena_return(database, ((Values*)values)->arena);
-        ((Values*)values)->arena = NULL;
-    }
-    Py_DECREF(values);
-}
-
 static PyObject* CollectionView_repr(CollectionView* self) {
     char const* const member = Py_TYPE(self) == &BlobsViewType  ? "blobs"
                                : Py_TYPE(self) == &DocsViewType ? "docs"
@@ -477,103 +422,151 @@ static void CollectionView_dealloc(CollectionView* self) {
     PyObject_Free(self);
 }
 
+/** Answers 0 for @p answered, which a mapping protocol discards, or -1 when it is NULL with an exception set. */
+static int answered_nothing(PyObject* answered) {
+    if (!answered) return -1;
+    Py_DECREF(answered);
+    return 0;
+}
+
 /** Answers whether @p key is present in the collection of @p self, which must hold @p modality. */
 static int collection_view_contains(CollectionView* self, PyObject* key, ustore_modality_t modality) {
     ustore_key_t parsed = {0};
     if (ustore_py_key_from_object(key, &parsed) != 0) return -1;
     ustore_py_context_t context;
     ustore_py_verb_options_t options;
-    if (collection_resolve(self->collection, modality, collection_missing_refused_k, &context, &options) != 0)
+    if (collection_resolve(self->collection, modality, collection_missing_refused_k, &context, &options) != 0 ||
+        ustore_py_context_blocking(&context, "`in` answers a bool at once", "contains(key, collection=...)") != 0)
         return -1;
-    return ustore_py_value_contains(&context, &options, &parsed);
+    PyObject* const found = ustore_py_value_contains(&context, &options, &parsed);
+    if (!found) return -1;
+    Py_DECREF(found);
+    return found == Py_True;
+}
+
+/** Fills @p context for a write through @p self, refusing a receiver that defers its calls or only reads. */
+static int collection_view_writing(CollectionView* self, char const* operation, char const* instead,
+                                   ustore_py_context_t* context) {
+    if (ustore_py_context_from_object(self->collection->view, context) != 0) return -1;
+    if (ustore_py_context_blocking(context, operation, instead) != 0) return -1;
+    return ustore_py_context_writable(context);
 }
 
 /** Removes the keys @p key addresses from the collection of @p self, which must hold @p modality and which a
  *  removal never creates. */
 static int collection_view_remove(CollectionView* self, PyObject* key, ustore_modality_t modality) {
-    ustore_py_keys_t keys;
-    if (keys_from_subscript(key, &keys) < 0) return -1;
     ustore_py_context_t context;
+    if (collection_view_writing(self, "`del` discards what it answers", "remove(keys, collection=...)", &context) != 0)
+        return -1;
+    ustore_py_remove_call_t call;
+    ustore_py_call_open(&context, &ustore_py_remove_verb, &call);
     ustore_py_verb_options_t options;
-    int const removed = collection_resolve(self->collection, modality, collection_missing_refused_k, &context,
-                                           &options) == 0
-                            ? ustore_py_values_remove(&context, &options, keys.keys, keys.count)
-                            : -1;
-    ustore_py_keys_release(&keys);
-    return removed;
+    if (ustore_py_keys_from_subscript(key, &call.keys) < 0 ||
+        collection_resolve(self->collection, modality, collection_missing_refused_k, &context, &options) != 0) {
+        ustore_py_call_discard(&context, &ustore_py_remove_verb, &call);
+        return -1;
+    }
+    return answered_nothing(ustore_py_values_remove(&context, &options, &call));
+}
+
+/**
+ *  @brief Opens a read of @p verb through the receiver of @p self, gathering the keys @p key spells into it and
+ *      resolving the collection, which must hold @p modality, into @p options.
+ *  @return The call with its subscript set for one key, or NULL with an exception set.
+ */
+static ustore_py_read_call_t* collection_view_read_open(CollectionView* self, PyObject* key, ustore_modality_t modality,
+                                                        ustore_py_verb_t const* verb, ustore_py_context_t* context,
+                                                        ustore_py_verb_options_t* options,
+                                                        ustore_py_read_call_t* stack) {
+    if (ustore_py_context_from_object(self->collection->view, context) != 0) return NULL;
+    ustore_py_read_call_t* const call = ustore_py_call_open(context, verb, stack);
+    if (!call) return NULL;
+    int const one = ustore_py_keys_from_subscript(key, &call->keys);
+    if (one < 0 ||
+        collection_resolve(self->collection, modality, collection_missing_refused_k, context, options) != 0) {
+        ustore_py_call_discard(context, verb, call);
+        return NULL;
+    }
+    if (one) call->subscript = Py_NewRef(key);
+    return call;
 }
 
 static PyObject* BlobsView_subscript(CollectionView* self, PyObject* key) {
-    ustore_py_keys_t keys;
-    int const one = keys_from_subscript(key, &keys);
-    if (one < 0) return NULL;
     ustore_py_context_t context;
     ustore_py_verb_options_t options;
-    PyObject* const values = collection_resolve(self->collection, ustore_modality_blobs_k, collection_missing_refused_k,
-                                                &context, &options) == 0
-                                 ? ustore_py_values_read(&context, &options, keys.keys, keys.count)
-                                 : NULL;
-    ustore_py_keys_release(&keys);
-    return one ? values_single(values, key) : values;
+    ustore_py_read_call_t stack;
+    ustore_py_verb_t const* const verb = &ustore_py_read_copies_verb;
+    ustore_py_read_call_t* const call = collection_view_read_open(self, key, ustore_modality_blobs_k, verb, &context,
+                                                                  &options, &stack);
+    if (!call) return NULL;
+    PyObject* const arena = ustore_py_arena_new(ustore_py_context_executor(&context));
+    if (!arena) return ustore_py_call_discard(&context, verb, call);
+    PyObject* const answer = ustore_py_values_read(&context, &options, verb, call, arena);
+    Py_DECREF(arena);
+    return answer;
 }
 
 static int BlobsView_ass_subscript(CollectionView* self, PyObject* key, PyObject* value) {
     if (!value) return collection_view_remove(self, key, ustore_modality_blobs_k);
-    ustore_py_keys_t keys;
-    int const one = keys_from_subscript(key, &keys);
-    if (one < 0) return -1;
-
-    // One key takes one bytes-like value, and a batch one per key or one for every key.
-    ustore_py_contents_t contents;
-    memset(&contents, 0, sizeof(contents));
-    int gathered = 0;
-    if (one) {
-        gathered = ustore_py_contents_reserve(&contents, 1);
-        if (gathered == 0) gathered = ustore_py_contents_borrow(value, &contents);
-    }
-    else { gathered = ustore_py_contents_from_object(value, keys.count, &contents); }
-
     ustore_py_context_t context;
+    if (collection_view_writing(self, "Assignment discards what it answers", "write(keys, values, collection=...)",
+                                &context) != 0)
+        return -1;
+    ustore_py_write_call_t call;
+    ustore_py_call_open(&context, &ustore_py_write_verb, &call);
+    int const one = ustore_py_keys_from_subscript(key, &call.keys);
+    // One key takes one bytes-like value, and a batch one per key or one for every key.
+    int gathered = one < 0 ? -1 : 0;
+    if (one > 0) {
+        gathered = ustore_py_contents_reserve(&call.contents, 1, ustore_py_contents_per_task_k);
+        if (gathered == 0) gathered = ustore_py_contents_borrow(value, &call.contents);
+    }
+    else if (one == 0) { gathered = ustore_py_contents_from_object(value, call.keys.count, &call.contents); }
+
+    // The values are gathered before the collection is resolved, so a refused batch creates nothing.
     ustore_py_verb_options_t options;
-    int const written = gathered == 0 && collection_resolve(self->collection, ustore_modality_blobs_k,
-                                                            collection_missing_created_k, &context, &options) == 0
-                            ? ustore_py_values_write(&context, &options, keys.keys, keys.count, &contents)
-                            : -1;
-    ustore_py_contents_release(&contents);
-    ustore_py_keys_release(&keys);
-    return written;
+    if (gathered != 0 || collection_resolve(self->collection, ustore_modality_blobs_k, collection_missing_created_k,
+                                            &context, &options) != 0) {
+        ustore_py_call_discard(&context, &ustore_py_write_verb, &call);
+        return -1;
+    }
+    return answered_nothing(ustore_py_values_write(&context, &options, &call));
 }
 
 static int BlobsView_contains(CollectionView* self, PyObject* key) {
     return collection_view_contains(self, key, ustore_modality_blobs_k);
 }
 
-/** Reads the documents @p key addresses from the collection of @p self, answering their JSON text. */
-static PyObject* docs_view_read(CollectionView* self, PyObject* key, ustore_py_context_t* context, int* one) {
-    ustore_py_keys_t keys;
-    *one = keys_from_subscript(key, &keys);
-    if (*one < 0) return NULL;
+/** Reads the documents @p key addresses from the collection of @p self into a one-off arena, answering them as
+ *  @p verb copies them out. */
+static PyObject* docs_view_read(CollectionView* self, PyObject* key, ustore_py_verb_t const* verb) {
+    ustore_py_context_t context;
     ustore_py_verb_options_t options;
-    PyObject* const values = collection_resolve(self->collection, ustore_modality_docs_k, collection_missing_refused_k,
-                                                context, &options) == 0
-                                 ? ustore_py_docs_read(context, &options, keys.keys, keys.count, NULL,
-                                                       ustore_doc_field_json_k)
-                                 : NULL;
-    ustore_py_keys_release(&keys);
-    return values;
+    ustore_py_read_call_t stack;
+    ustore_py_read_call_t* const call = collection_view_read_open(self, key, ustore_modality_docs_k, verb, &context,
+                                                                  &options, &stack);
+    if (!call) return NULL;
+    PyObject* const arena = ustore_py_arena_new(ustore_py_context_executor(&context));
+    if (!arena) return ustore_py_call_discard(&context, verb, call);
+    PyObject* const answer = ustore_py_docs_read(&context, &options, ustore_docs_field_type_json_k, verb, call, arena);
+    Py_DECREF(arena);
+    return answer;
 }
 
 /** Writes documents under @p key, spelled as @p spelling says, or removes them when @p documents is NULL. */
 static int docs_view_write(CollectionView* self, PyObject* key, PyObject* documents,
                            ustore_py_documents_spelling_t spelling) {
     if (!documents) return collection_view_remove(self, key, ustore_modality_docs_k);
+    ustore_py_context_t context;
+    if (collection_view_writing(self, "Assignment discards what it answers",
+                                "docs_write(keys, documents, collection=...)", &context) != 0)
+        return -1;
     ustore_py_keys_t keys;
-    int const one = keys_from_subscript(key, &keys);
+    int const one = ustore_py_keys_from_subscript(key, &keys);
     if (one < 0) return -1;
     // One key takes its document whole, even a list, so it travels as a batch of one.
     PyObject* const batch = one && spelling == ustore_py_documents_as_objects_k ? PyTuple_Pack(1, documents)
                                                                                 : Py_NewRef(documents);
-    ustore_py_context_t context;
     ustore_py_verb_options_t options;
     int const written = batch && collection_resolve(self->collection, ustore_modality_docs_k,
                                                     collection_missing_created_k, &context, &options) == 0
@@ -585,12 +578,7 @@ static int docs_view_write(CollectionView* self, PyObject* key, PyObject* docume
 }
 
 static PyObject* DocsView_subscript(CollectionView* self, PyObject* key) {
-    ustore_py_context_t context;
-    int one = 0;
-    PyObject* const values = docs_view_read(self, key, &context, &one);
-    PyObject* const documents = documents_parse(values, key, one);
-    if (values) values_reclaim(context.database, values);
-    return documents;
+    return docs_view_read(self, key, &ustore_py_docs_read_objects_verb);
 }
 
 static int DocsView_ass_subscript(CollectionView* self, PyObject* key, PyObject* document) {
@@ -602,23 +590,21 @@ static int DocsView_contains(CollectionView* self, PyObject* key) {
 }
 
 static PyObject* DocsJSONView_subscript(CollectionView* self, PyObject* key) {
-    ustore_py_context_t context;
-    int one = 0;
-    PyObject* const values = docs_view_read(self, key, &context, &one);
-    return one ? values_single(values, key) : values;
+    return docs_view_read(self, key, &ustore_py_docs_read_copies_verb);
 }
 
 static int DocsJSONView_ass_subscript(CollectionView* self, PyObject* key, PyObject* text) {
     return docs_view_write(self, key, text, ustore_py_documents_as_json_k);
 }
 
-static char const doc_BlobsView[] =                                                         //
-    "The binary values of a collection, as a mapping.\n"                                    //
-    "\n"                                                                                    //
-    "`blobs[key]` answers a read-only memoryview over the arena of the read, raising\n"     //
-    "KeyError when the key is absent, and a batch of keys answers Values, which export\n"   //
-    "through the Arrow C data interface. `blobs[key] = value` takes anything bytes-like,\n" //
-    "a batch takes one value per key or one for every key, and `del blobs[key]` removes.";
+static char const doc_BlobsView[] =                                                            //
+    "The binary values of a collection, as a mapping.\n"                                       //
+    "\n"                                                                                       //
+    "`blobs[key]` reads into a one-off arena and answers a copy as bytes, raising KeyError\n"  //
+    "when the key is absent, and a batch of keys answers a list with None in place of every\n" //
+    "absent key; `read` with an arena of yours answers zero-copy Values instead.\n"            //
+    "`blobs[key] = value` takes anything bytes-like, a batch takes one value per key or one\n" //
+    "for every key, and `del blobs[key]` removes.";
 
 static PyMappingMethods BlobsView_as_mapping = {
     .mp_subscript = (binaryfunc)BlobsView_subscript,
@@ -675,9 +661,10 @@ PyTypeObject DocsViewType = {
 static char const doc_DocsJSONView[] =                                                         //
     "The JSON documents of a collection as their text, as a mapping.\n"                        //
     "\n"                                                                                       //
-    "`docs_json[key]` answers a read-only memoryview over the stored JSON, raising KeyError\n" //
-    "when the key is absent, and a batch of keys answers Values. `docs_json[key] = text`\n"    //
-    "stores JSON text or bytes as they are, and `del docs_json[key]` removes.";
+    "`docs_json[key]` answers a copy of the stored JSON as bytes, raising KeyError when the\n" //
+    "key is absent, and a batch of keys answers a list with None in place of every absent\n"   //
+    "key. `docs_json[key] = text` stores JSON text or bytes as they are, and\n"                //
+    "`del docs_json[key]` removes.";
 
 static PyMappingMethods DocsJSONView_as_mapping = {
     .mp_subscript = (binaryfunc)DocsJSONView_subscript,

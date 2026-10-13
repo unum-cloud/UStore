@@ -1,37 +1,35 @@
 """Transactions over the C ABI: commits, rollbacks, conflicts and staging, at every isolation the engine offers."""
 
 import pytest
-from capabilities import NEEDS_TRANSACTIONS, keys
+from capabilities import BATCH_SIZES, NEEDS_TRANSACTIONS, keys
 
 import ustore
 
 pytestmark = NEEDS_TRANSACTIONS
 
-BATCH_SIZES = [1, 17, 100]
-
 
 @pytest.fixture
-def database(open_database, isolation: str | None) -> ustore.Database:
+def database(open_database, isolation: ustore.Isolation | None) -> ustore.Database:
     """A database at one of the isolation levels the engine can be opened at, or the one it has."""
     return open_database(isolation)
 
 
-def read_conflicts(isolation: str | None, watch: bool) -> bool:
+def read_conflicts(isolation: ustore.Isolation | None, watch: ustore.Watch) -> bool:
     """Whether a transaction's read fails its commit once a concurrent writer touches the key."""
     # Strict serializability records every read; weaker levels record only what a transaction watches.
-    return watch or isolation == "strict-serializable"
+    return watch is ustore.Watch.KEYS or isolation is ustore.Isolation.STRICT_SERIALIZABLE
 
 
 # region Publishing
 
 
 @pytest.mark.parametrize("count", BATCH_SIZES)
-@pytest.mark.parametrize("flush", [False, True])
-def test_commit_publishes_every_write(database, count: int, flush: bool):
+@pytest.mark.parametrize("durability", ustore.Durability)
+def test_commit_publishes_every_write(database, count: int, durability: ustore.Durability):
     staged = database.transaction()
     for key in range(count):
         staged.set(key, str(key).encode())
-    staged.commit(flush=flush)
+    staged.commit(durability)
     staged.close()
     assert [database.get(key) for key in range(count)] == [str(key).encode() for key in range(count)]
 
@@ -48,21 +46,21 @@ def test_commit_publishes_every_removal(database, count: int):
 def test_staged_work_is_invisible_until_it_commits(database, verb: str):
     staged = database.transaction()
     if verb == "set":
-        staged.set(1, b"pending")
+        staged.set(1, b"staged")
     else:
-        staged.write([1], [b"pending"])
+        staged.write([1], [b"staged"])
     assert not database.contains(1)
     assert staged.contains(1)
-    assert staged.get(1) == b"pending"
+    assert staged.get(1) == b"staged"
 
     staged.commit()
     staged.close()
-    assert database.get(1) == b"pending"
+    assert database.get(1) == b"staged"
 
 
 def test_reset_drops_the_staged_work(database):
     staged = database.transaction()
-    staged.set(1, b"pending")
+    staged.set(1, b"staged")
     staged.reset()
     staged.commit()
     staged.close()
@@ -73,14 +71,14 @@ def test_rollback_withdraws_a_stage_and_keeps_the_writes(database):
     """A rollback only withdraws the stage, so the next commit still publishes what was written."""
     staged = database.transaction()
     try:
-        staged.set(1, b"pending")
+        staged.set(1, b"staged")
         staged.stage()
         staged.rollback()
         assert not database.contains(1)
         staged.commit()
     finally:
         staged.close()
-    assert database.get(1) == b"pending"
+    assert database.get(1) == b"staged"
 
 
 def test_an_exception_leaves_the_work_unpublished(database):
@@ -88,28 +86,31 @@ def test_an_exception_leaves_the_work_unpublished(database):
         """Raised inside the body to stop it short of a commit."""
 
     with pytest.raises(Interrupted), database.transaction() as staged:
-        staged.set(1, b"pending")
+        staged.set(1, b"staged")
         raise Interrupted
 
     assert not database.contains(1)
 
 
-def test_stage_answers_a_stamp(database):
+def test_stage_reads_at_or_below_the_commit_stamp(database):
+    """Staging reserves no commit position, so the read stamp it answers never passes the commit stamp after it."""
     staged = database.transaction()
     try:
-        staged.set(1, b"pending")
-        assert isinstance(staged.stage(), int)
-        staged.commit()
+        staged.set(1, b"staged")
+        read_stamp = staged.stage()
+        commit_stamp = staged.commit()
+        assert isinstance(read_stamp, int) and isinstance(commit_stamp, int)
+        assert read_stamp <= commit_stamp
     finally:
         staged.close()
-    assert database.get(1) == b"pending"
+    assert database.get(1) == b"staged"
 
 
-def test_batch_verbs_reach_through_a_transaction(database):
+def test_batch_verbs_reach_through_a_transaction(database, arena):
     with database.transaction() as staged:
         staged.write([1, 2, 3], [b"a", b"bb", b"ccc"])
-        assert [bytes(value) for value in staged.read([1, 2, 3])] == [b"a", b"bb", b"ccc"]
-        assert list(staged.scan(0, 3)[0]) == keys([1, 2, 3])
+        assert [bytes(value) for value in staged.read([1, 2, 3], arena)] == [b"a", b"bb", b"ccc"]
+        assert list(staged.scan(0, 3, arena)[0]) == keys([1, 2, 3])
 
 
 # endregion Publishing
@@ -133,13 +134,15 @@ def test_transactions_writing_apart_both_commit(database, stride: int):
     assert all(database.get(key * stride) == str(key).encode() for key in range(100))
 
 
-@pytest.mark.parametrize("watch", [True, False])
+@pytest.mark.parametrize("watch", ustore.Watch)
 @pytest.mark.parametrize("read_verb", ["get", "contains", "read"])
-def test_a_read_conflicts_with_a_concurrent_write_when_recorded(database, isolation, watch: bool, read_verb: str):
-    reader = database.transaction(watch=watch)
+def test_a_read_conflicts_with_a_concurrent_write_when_recorded(
+    database, arena, isolation, watch: ustore.Watch, read_verb: str
+):
+    reader = database.transaction(watch)
     try:
         if read_verb == "read":
-            reader.read([0])
+            reader.read([0], arena)
         else:
             getattr(reader, read_verb)(0)
         database.set(0, b"value")
@@ -177,29 +180,16 @@ def test_a_transaction_names_its_database(database):
         assert staged.database is database
 
 
-@pytest.mark.parametrize("verb", ["get", "contains"])
-def test_a_transaction_refuses_a_snapshot(database, verb: str):
-    with database.transaction() as staged, pytest.raises(ustore.ArgumentError):
-        getattr(staged, verb)(1, snapshot=1)
-
-
 def test_a_transaction_cannot_be_built_by_name():
     with pytest.raises(TypeError):
         ustore.Transaction()
-
-
-def test_a_database_waits_for_its_transactions(database):
-    staged = database.transaction()
-    with pytest.raises(ustore.ArgumentError):
-        database.close()
-    staged.close()
 
 
 @pytest.mark.parametrize("verb", ["set", "commit", "stage", "rollback", "reset"])
 def test_a_closed_transaction_refuses_work(database, verb: str):
     staged = database.transaction()
     staged.close()
-    with pytest.raises(ValueError):
+    with pytest.raises(ustore.UninitializedError):
         if verb == "set":
             staged.set(1, b"late")
         else:
@@ -213,3 +203,33 @@ def test_closing_a_transaction_twice_is_safe(database):
 
 
 # endregion Handles
+
+# region Deferred Calls
+
+
+def test_deferred_calls_stage_and_commit(database):
+    with ustore.Executor.for_ram(2) as executor:
+        staged = database.transaction()
+        try:
+            later = staged.deferred(executor)
+            assert later.write([1, 2], [b"a", b"bb"]).wait() is None
+            assert later.get(2).wait() == b"bb"
+            assert isinstance(later.commit().wait(), int)
+        finally:
+            staged.close()
+    assert database.get(2) == b"bb"
+
+
+def test_a_transaction_serves_one_call_at_a_time(database):
+    """A call on a transaction while a deferred one holds it raises ContendedError, while closing it waits."""
+    with ustore.Executor.for_ram(1) as executor:
+        staged = database.transaction()
+        writing = staged.deferred(executor).write(list(range(4096)), b"v" * 1024)
+        with pytest.raises(ustore.ContendedError):
+            staged.get(1)
+        staged.close()
+        assert writing.status is ustore.Status.SUCCESS
+        assert writing.wait() is None
+
+
+# endregion Deferred Calls

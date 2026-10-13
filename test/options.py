@@ -1,7 +1,7 @@
-"""The options a verb takes as keywords, chiefly the watch one call keeps or drops inside a transaction."""
+"""The options a verb takes as keywords, and the views of a transaction that keep or drop its watch."""
 
 import pytest
-from capabilities import NEEDS_SNAPSHOTS, NEEDS_TRANSACTIONS
+from capabilities import NEEDS_TRANSACTIONS
 
 import ustore
 
@@ -9,26 +9,27 @@ pytestmark = NEEDS_TRANSACTIONS
 
 
 @pytest.fixture
-def database(open_database, isolation: str | None) -> ustore.Database:
+def database(open_database, isolation: ustore.Isolation | None) -> ustore.Database:
     """A database at one of the isolation levels the engine can be opened at, or the one it has."""
     return open_database(isolation)
 
 
-def read_conflicts(isolation: str | None, watch: bool) -> bool:
+def read_conflicts(isolation: ustore.Isolation | None, watch: ustore.Watch) -> bool:
     """Whether a transaction's read fails its commit once a concurrent writer touches the key."""
-    # Strict serializability records every read; weaker levels record only what a call watches.
-    return watch or isolation == "strict-serializable"
+    # Strict serializability records every read; weaker levels record only what a view watches.
+    return watch is ustore.Watch.KEYS or isolation is ustore.Isolation.STRICT_SERIALIZABLE
 
 
 # region Watching
 
 
-@pytest.mark.parametrize("watch", [True, False])
-def test_the_call_decides_the_watch(database, isolation, watch: bool):
-    """The keyword overrides the transaction's own watch for exactly the call it sits on."""
-    reader = database.transaction(watch=not watch)
+@pytest.mark.parametrize("watch", ustore.Watch)
+def test_the_view_decides_the_watch(database, arena, isolation, watch: ustore.Watch):
+    """A view overrides the transaction's own watch for exactly the calls made through it."""
+    other = ustore.Watch.NONE if watch is ustore.Watch.KEYS else ustore.Watch.KEYS
+    reader = database.transaction(other)
     try:
-        reader.read([0], watch=watch)
+        (reader.watched() if watch is ustore.Watch.KEYS else reader.unwatched()).read([0], arena)
         database.set(0, b"value")
         reader.set(1, b"written")
         if read_conflicts(isolation, watch):
@@ -40,12 +41,12 @@ def test_the_call_decides_the_watch(database, isolation, watch: bool):
         reader.close()
 
 
-def test_an_unwatched_read_leaves_the_rest_watching(database, isolation):
+def test_an_unwatched_read_leaves_the_rest_watching(database, arena, isolation):
     """Dropping the watch for one read leaves the reads around it recorded as before."""
     reader = database.transaction()
     try:
-        reader.read([0], watch=False)
-        reader.read([1])
+        reader.unwatched().read([0], arena)
+        reader.read([1], arena)
         database.set(1, b"value")
         with pytest.raises(ustore.ConflictError):
             reader.commit()
@@ -56,20 +57,20 @@ def test_an_unwatched_read_leaves_the_rest_watching(database, isolation):
 @pytest.mark.parametrize(
     "call",
     [
-        lambda view: view.read([1], watch=False),
-        lambda view: view.get(1, watch=False),
-        lambda view: view.contains(1, watch=False),
-        lambda view: view.scan(0, 4, watch=False),
-        lambda view: view.scan_batch([0], [4], watch=False),
-        lambda view: view.sample(2, watch=False),
-        lambda view: view.sample_batch([2], watch=False),
-        lambda view: view.measure(0, 4, watch=False),
-        lambda view: view.docs_read([1], watch=False),
-        lambda view: view.docs_gist([1], watch=False),
-        lambda view: view.docs_gather([1], ["v"], "i64", watch=False),
-        lambda view: view.graph_degrees([9], watch=False, collection="graph"),
-        lambda view: view.write([1], [b"x"], watch=False),
-        lambda view: view.docs_write([2], '{"v": 2}', watch=False),
+        lambda view: view.read([1], ustore.Arena()),
+        lambda view: view.get(1),
+        lambda view: view.contains(1),
+        lambda view: view.scan(0, 4, ustore.Arena()),
+        lambda view: view.scan_batch([0], 4, ustore.Arena()),
+        lambda view: view.sample(2, ustore.Arena()),
+        lambda view: view.sample_batch(1, 2, ustore.Arena()),
+        lambda view: view.measure(0, 4, ustore.Arena()),
+        lambda view: view.docs_read([1], ustore.Arena()),
+        lambda view: view.docs_gist([1], ustore.Arena()),
+        lambda view: view.docs_gather([1], ["v"], ustore.FieldType.I64, ustore.Arena()),
+        lambda view: view.graph_degrees([9], ustore.Arena(), collection="graph"),
+        lambda view: view.write([1], [b"x"]),
+        lambda view: view.docs_write([2], '{"v": 2}'),
     ],
     ids=[
         "read",
@@ -88,48 +89,70 @@ def test_an_unwatched_read_leaves_the_rest_watching(database, isolation):
         "docs-write",
     ],
 )
-def test_every_verb_takes_the_watch(database, call):
-    """The watch is a shared keyword, so every verb a transaction reaches accepts it."""
+def test_every_verb_reaches_through_an_unwatched_view(database, call):
+    """The watch rides on the view, so every verb a transaction reaches runs unwatched through it."""
     database.docs_write([1], '{"v": 1}')
-    database.collection_create("graph", modality="graph")
+    database.collection_create("graph", modality=ustore.Modality.GRAPH)
     with database.transaction() as staged:
-        call(staged)
+        call(staged.unwatched())
 
 
-def test_watch_refused_outside_a_transaction(database):
-    """Only a transaction has a conflict set, so the database itself refuses the keyword."""
-    with pytest.raises(ustore.ArgumentError):
-        database.read([1], watch=False)
-
-
-def test_watch_reads_a_truth_value(database):
-    """The keyword is read as a truth value, as `flush` beside it is."""
-    with database.transaction() as staged:
-        staged.read([1], watch=0)
-        staged.read([1], watch=1)
+def test_only_a_transaction_watches(database):
+    """Only a transaction has a conflict set, so a view of the database refuses to change its watch."""
+    with ustore.Executor.for_ram(1) as executor, pytest.raises(TypeError):
+        database.on(executor).unwatched()
 
 
 # endregion Watching
 
-# region Refused Combinations
-
-
-@NEEDS_SNAPSHOTS
-def test_snapshot_refused_inside_a_transaction(database):
-    """A call addresses one view, so a transaction and a snapshot are never both named."""
-    with database.snapshot() as snapshot, database.transaction() as staged, pytest.raises(ustore.ArgumentError):
-        staged.read([1], snapshot=snapshot)
+# region Refused Keywords
 
 
 @pytest.mark.parametrize(
     "keyword",
-    ["shared_memory", "dont_discard_memory", "bulk"],
-    ids=["shared-memory", "dont-discard-memory", "bulk"],
+    ["shared_memory", "dont_discard_memory", "bulk", "snapshot", "watch", "executor", "flush"],
+    ids=["shared-memory", "dont-discard-memory", "bulk", "snapshot", "watch", "executor", "flush"],
 )
-def test_arena_options_are_not_reachable(database, keyword: str):
-    """The options steering the arena's own memory stay inside the ABI, since no result exposes it."""
+def test_keywords_outside_the_verb_are_refused(database, arena, keyword: str):
+    """Receivers carry the view, the watch and the executor, and the arena's own options stay inside the ABI."""
+    with database.transaction() as staged, pytest.raises(TypeError):
+        staged.read([1], arena, **{keyword: True})
+
+
+# endregion Refused Keywords
+
+# region Enums
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda database: database.transaction(True),
+        lambda database: database.set(1, b"v", durability=True),
+        lambda database: database.collection_drop("", "pairs"),
+    ],
+    ids=["watch-bool", "durability-bool", "drop-mode-text"],
+)
+def test_modes_refuse_bools_and_text(database, call):
+    """A bool would read as whichever member is valued one, and text no longer names a member."""
     with pytest.raises(TypeError):
-        database.read([1], **{keyword: True})
+        call(database)
 
 
-# endregion Refused Combinations
+def test_members_are_named_by_the_library():
+    """Every member is named after the C spelling of its enumerator, upper-cased with dashes as underscores."""
+    assert (ustore.Status.READ_ONLY, ustore.Isolation.STRICT_SERIALIZABLE, ustore.Transport.LINUX_URING) == (18, 0, 2)
+    assert [engine.name for engine in ustore.Engine] == ["RAM", "ROCKSDB", "LEVELDB", "NVME"]
+    assert ustore.version().count(".") == 2
+
+
+def test_modes_accept_plain_integers(database):
+    """A mode is any int a member is valued as, so the C enumerators pass as they are, and nothing else does."""
+    database.set(1, b"v", durability=int(ustore.Durability.FLUSHED))
+    with database.transaction(int(ustore.Watch.NONE)) as staged:
+        staged.set(1, b"w")
+    with pytest.raises(ValueError, match="Watch"):
+        database.transaction(len(ustore.Watch))
+
+
+# endregion Enums

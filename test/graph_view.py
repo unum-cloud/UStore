@@ -208,23 +208,23 @@ def test_degrees(graphs, count: int):
 
 
 @pytest.mark.parametrize("kind", ["digraph"], indirect=True)
-def test_find_edges_in_every_role(graphs):
+def test_read_edges_in_every_role(graphs):
     ours, _ = graphs
     ours.add_edges_from_arrays([1, 3], [2, 1])
-    leaving = (key(1), key(2), ustore.default_edge_id)
-    entering = (key(3), key(1), ustore.default_edge_id)
-    assert ours.find_edges(1, role="source")[0] == (leaving,)
-    assert ours.find_edges(1, role="target")[0] == (entering,)
-    assert ours.find_edges(1)[0] == (leaving, entering)
+    leaving = (key(1), key(2), ustore.edge_id_default)
+    entering = (key(3), key(1), ustore.edge_id_default)
+    assert ours.read_edges(1, role=ustore.Role.SOURCE)[0] == (leaving,)
+    assert ours.read_edges(1, role=ustore.Role.TARGET)[0] == (entering,)
+    assert ours.read_edges(1)[0] == (leaving, entering)
 
 
 @pytest.mark.parametrize("kind", ["digraph"], indirect=True)
-def test_find_edges_of_a_batch(graphs):
+def test_read_edges_of_a_batch(graphs):
     ours, _ = graphs
     ours.add_edges_from_arrays([1, 1], [2, 3])
     ours.add_node(4)
-    stored = ustore.default_edge_id
-    assert list(ours.find_edges([1, 4, 5])) == [((key(1), key(2), stored), (key(1), key(3), stored)), (), None]
+    stored = ustore.edge_id_default
+    assert list(ours.read_edges([1, 4, 5])) == [((key(1), key(2), stored), (key(1), key(3), stored)), (), None]
 
 
 # endregion Structure
@@ -461,3 +461,26 @@ def test_transactions_touching_one_vertex_conflict(database, kind: str):
 
 
 # endregion Transactions
+
+# region Deferred Views
+
+
+@pytest.mark.parametrize("kind", ["digraph"], indirect=True)
+def test_a_deferred_graph_answers_the_reads_of_one_call(graphs, later):
+    """`has_node` and `read_edges` answer a Deferred, while what chains several calls names the verbs instead."""
+    ours, _ = graphs
+    ours.add_edges_from_arrays([1, 2], [2, 3])
+    deferred = later["graph"].graph
+    assert deferred.has_node(1).wait() is True
+    assert deferred.has_node(4).wait() is False
+    found = deferred.read_edges([1, 2], ustore.Role.SOURCE).wait()
+    assert plain([found[0], found[1]]) == [((1, 2, ustore.edge_id_default.int),), ((2, 3, ustore.edge_id_default.int),)]
+    with pytest.raises(TypeError, match="graph_read_edges"):
+        _ = 1 in deferred
+    with pytest.raises(TypeError, match="graph_read_edges"):
+        deferred.successors(1)
+    with pytest.raises(TypeError, match="graph_read_edges"):
+        deferred.add_edge(3, 4)
+
+
+# endregion Deferred Views

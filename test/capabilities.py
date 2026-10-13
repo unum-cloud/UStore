@@ -17,10 +17,12 @@ import ustore
 ENGINES = ustore.engines_compiled()
 
 # Only the in-memory engine takes an isolation; every other engine opens at the one level it has.
-ISOLATIONS = {"ram": ("strict-serializable", "snapshot")}
+ISOLATIONS = {"ram": tuple(ustore.Isolation)}
 
 
-def open_engine(engine: str, directory: str | os.PathLike[str], isolation: str | None = None) -> ustore.Database:
+def open_engine(
+    engine: str, directory: str | os.PathLike[str], isolation: ustore.Isolation | None = None
+) -> ustore.Database:
     """Opens `engine` in `directory`, at `isolation` when the engine takes one."""
     if isolation is not None:
         return ustore.Database.open_ram(directory, isolation=isolation)
@@ -30,14 +32,18 @@ def open_engine(engine: str, directory: str | os.PathLike[str], isolation: str |
 def probe(engine: str) -> dict[str, bool]:
     """What `engine` supports, read from a database opened in a scratch directory."""
     with tempfile.TemporaryDirectory() as directory, open_engine(engine, directory) as database:
+        capabilities = database.capabilities
         return {
-            "transactions": database.supports_transactions,
-            "collections": database.supports_collections,
-            "snapshots": database.supports_snapshots,
+            "transactions": capabilities.transactions,
+            "collections": capabilities.collections,
+            "snapshots": capabilities.snapshots,
         }
 
 
 SUPPORTS = {engine: probe(engine) for engine in ENGINES}
+
+# Batches below, at and past the 16 values and 64 keys a verb lays out on the stack.
+BATCH_SIZES = [0, 1, 16, 17, 64, 65, 1000]
 
 
 def key(integer: int) -> UUID:

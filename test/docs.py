@@ -1,16 +1,16 @@
 """JSON documents over the C ABI: whole and field writes, modifications, reads, gists and typed gathers."""
 
+import asyncio
 import gc
 import json
 import struct
 
 import numpy as np
 import pytest
-from capabilities import key
+from capabilities import BATCH_SIZES, key
 
 import ustore
-
-BATCH_SIZES = [0, 1, 16, 17, 65, 500]
+from ustore import FieldType, Modification
 
 DOCUMENT_SPELLINGS = {
     "str": lambda document: json.dumps(document),
@@ -35,17 +35,17 @@ FIELD_READS = [
 ]
 
 SCALAR_TYPES = {
-    "bool": ("?", bool),
-    "f64": ("d", float),
-    "f32": ("f", float),
-    "i64": ("q", int),
-    "i32": ("i", int),
-    "i16": ("h", int),
-    "i8": ("b", int),
-    "u64": ("Q", int),
-    "u32": ("I", int),
-    "u16": ("H", int),
-    "u8": ("B", int),
+    FieldType.BOOL: ("?", bool),
+    FieldType.F64: ("d", float),
+    FieldType.F32: ("f", float),
+    FieldType.I64: ("q", int),
+    FieldType.I32: ("i", int),
+    FieldType.I16: ("h", int),
+    FieldType.I8: ("b", int),
+    FieldType.U64: ("Q", int),
+    FieldType.U32: ("I", int),
+    FieldType.U16: ("H", int),
+    FieldType.U8: ("B", int),
 }
 
 
@@ -62,33 +62,33 @@ def bit(bitmap: memoryview, row: int) -> bool:
 
 @pytest.mark.parametrize("count", BATCH_SIZES)
 @pytest.mark.parametrize("spelling", DOCUMENT_SPELLINGS)
-def test_whole_documents_round_trip(view, count: int, spelling: str):
+def test_whole_documents_round_trip(view, arena, count: int, spelling: str):
     documents = [{"key": key, "name": f"name-{key}", "tags": list(range(key % 4))} for key in range(count)]
     view.docs_write(list(range(count)), [DOCUMENT_SPELLINGS[spelling](document) for document in documents])
-    assert decoded(view.docs_read(list(range(count)))) == documents
+    assert decoded(view.docs_read(list(range(count)), arena)) == documents
 
 
 @pytest.mark.parametrize("count", BATCH_SIZES)
-def test_one_document_broadcasts_to_every_key(view, count: int):
+def test_one_document_broadcasts_to_every_key(view, arena, count: int):
     view.docs_write(list(range(count)), '{"same": true}')
-    assert decoded(view.docs_read(list(range(count)))) == [{"same": True}] * count
+    assert decoded(view.docs_read(list(range(count)), arena)) == [{"same": True}] * count
 
 
 @pytest.mark.parametrize("keys", [[1, 2, 3], np.array([1, 2, 3], dtype=np.int64)], ids=["list", "numpy"])
-def test_remove_removes_documents(view, keys):
+def test_remove_removes_documents(view, arena, keys):
     view.docs_write(keys, "{}")
     view.remove(keys)
-    assert decoded(view.docs_read(keys)) == [None, None, None]
+    assert decoded(view.docs_read(keys, arena)) == [None, None, None]
 
 
 @pytest.mark.parametrize("refused", [0, 1, 2, None])
-def test_none_in_a_batch_is_refused(view, refused: int | None):
+def test_none_in_a_batch_is_refused(view, arena, refused: int | None):
     """A None, in a batch or in place of one, is refused before anything is written."""
     view.docs_write([0, 1, 2], "[]")
     documents = None if refused is None else ["[1]" if key != refused else None for key in range(3)]
     with pytest.raises(TypeError):
         view.docs_write([0, 1, 2], documents)
-    assert decoded(view.docs_read([0, 1, 2])) == [[], [], []]
+    assert decoded(view.docs_read([0, 1, 2], arena)) == [[], [], []]
 
 
 @pytest.mark.parametrize(
@@ -101,15 +101,15 @@ def test_none_in_a_batch_is_refused(view, refused: int | None):
     ids=["integer", "nested-integer", "uuid-text"],
 )
 @pytest.mark.parametrize("count", [1, 17])
-def test_keys_are_read_out_of_an_id_field(view, id_field: str, spell, count: int):
+def test_keys_are_read_out_of_an_id_field(view, arena, id_field: str, spell, count: int):
     documents = [{**spell(integer * 10), "value": integer} for integer in range(count)]
     view.docs_write(None, [json.dumps(document) for document in documents], id_field=id_field)
-    assert decoded(view.docs_read([integer * 10 for integer in range(count)])) == documents
+    assert decoded(view.docs_read([integer * 10 for integer in range(count)], arena)) == documents
 
 
-def test_documents_read_back_as_zero_copy_views(view):
+def test_documents_read_back_as_zero_copy_views(view, arena):
     view.docs_write([1], '{"a": 1}')
-    found = view.docs_read([1])
+    found = view.docs_read([1], arena)
     assert isinstance(found, ustore.Values)
     held = found[0]
     del found
@@ -123,15 +123,15 @@ def test_documents_read_back_as_zero_copy_views(view):
 
 
 @pytest.mark.parametrize(("field", "as_json", "as_string"), FIELD_READS)
-def test_field_reads(view, field: str, as_json: bytes | None, as_string: bytes | None):
+def test_field_reads(view, arena, field: str, as_json: bytes | None, as_string: bytes | None):
     view.docs_write([6], json.dumps(NESTED))
-    for kind, expected in (("json", as_json), ("str", as_string)):
-        found = view.docs_read([6], field=field, type=kind)[0]
-        assert (None if found is None else bytes(found)) == expected
+    for kind, expected in ((FieldType.JSON, as_json), (FieldType.STR, as_string)):
+        found = view.docs_read([6], arena, field=field, outputs_type=kind)
+        assert (None if found[0] is None else bytes(found[0])) == expected
 
 
-def test_a_field_of_a_missing_document_reads_as_none(view):
-    assert view.docs_read([404], field="name")[0] is None
+def test_a_field_of_a_missing_document_reads_as_none(view, arena):
+    assert view.docs_read([404], arena, field="name")[0] is None
 
 
 @pytest.mark.parametrize(
@@ -143,45 +143,45 @@ def test_a_field_of_a_missing_document_reads_as_none(view):
         ("b", "null", {"a": 1, "b": None}),
     ],
 )
-@pytest.mark.parametrize("modification", ["upsert", "merge"])
-def test_field_writes(view, field: str, value: str, expected: dict, modification: str):
+@pytest.mark.parametrize("modification", [Modification.UPSERT, Modification.MERGE])
+def test_field_writes(view, arena, field: str, value: str, expected: dict, modification: Modification):
     view.docs_write([1], json.dumps({"a": 1, "b": {"c": [1, 2]}}))
     view.docs_write([1], value, field=field, modification=modification)
-    assert decoded(view.docs_read([1])) == [expected]
+    assert decoded(view.docs_read([1], arena)) == [expected]
 
 
 @pytest.mark.parametrize(
     ("patch", "expected"), [({"a": None}, {"b": {"c": [1, 2]}}), ({"b": {"c": None}}, {"a": 1, "b": {}})]
 )
-def test_merging_null_removes_a_field(view, patch: dict, expected: dict):
+def test_merging_null_removes_a_field(view, arena, patch: dict, expected: dict):
     view.docs_write([1], json.dumps({"a": 1, "b": {"c": [1, 2]}}))
-    view.docs_write([1], json.dumps(patch), modification="merge")
-    assert decoded(view.docs_read([1])) == [expected]
+    view.docs_write([1], json.dumps(patch), modification=Modification.MERGE)
+    assert decoded(view.docs_read([1], arena)) == [expected]
 
 
 @pytest.mark.parametrize(
-    ("type_name", "raw", "expected"),
+    ("field_type", "raw", "expected"),
     [
-        ("json", b"[1, 2]", [1, 2]),
-        ("str", b"hello", "hello"),
-        ("null", b"", None),
-        ("bool", b"\x01", True),
-        ("f64", struct.pack("d", 1.5), 1.5),
-        ("f32", struct.pack("f", 0.25), 0.25),
-        ("i64", struct.pack("q", -5), -5),
-        ("i32", struct.pack("i", -6), -6),
-        ("i16", struct.pack("h", -7), -7),
-        ("i8", struct.pack("b", -8), -8),
-        ("u64", struct.pack("Q", 2**40), 2**40),
-        ("u32", struct.pack("I", 2**31), 2**31),
-        ("u16", struct.pack("H", 65535), 65535),
-        ("u8", b"\xff", 255),
+        (FieldType.JSON, b"[1, 2]", [1, 2]),
+        (FieldType.STR, b"hello", "hello"),
+        (FieldType.NULL, b"", None),
+        (FieldType.BOOL, b"\x01", True),
+        (FieldType.F64, struct.pack("d", 1.5), 1.5),
+        (FieldType.F32, struct.pack("f", 0.25), 0.25),
+        (FieldType.I64, struct.pack("q", -5), -5),
+        (FieldType.I32, struct.pack("i", -6), -6),
+        (FieldType.I16, struct.pack("h", -7), -7),
+        (FieldType.I8, struct.pack("b", -8), -8),
+        (FieldType.U64, struct.pack("Q", 2**40), 2**40),
+        (FieldType.U32, struct.pack("I", 2**31), 2**31),
+        (FieldType.U16, struct.pack("H", 65535), 65535),
+        (FieldType.U8, b"\xff", 255),
     ],
 )
-def test_typed_field_writes(view, type_name: str, raw: bytes, expected):
+def test_typed_field_writes(view, arena, field_type: FieldType, raw: bytes, expected):
     view.docs_write([5], "{}")
-    view.docs_write([5], raw, field="v", type=type_name)
-    assert decoded(view.docs_read([5])) == [{"v": expected}]
+    view.docs_write([5], raw, field="v", type=field_type)
+    assert decoded(view.docs_read([5], arena)) == [{"v": expected}]
 
 
 # endregion Fields
@@ -192,48 +192,54 @@ def test_typed_field_writes(view, type_name: str, raw: bytes, expected):
 @pytest.mark.parametrize(
     ("modification", "modifier", "expected"),
     [
-        ("upsert", {"a": 2, "d": 3}, {"a": 2, "d": 3}),
-        ("update", {"a": 2, "d": 3}, {"a": 2, "d": 3}),
-        ("merge", {"a": 2, "d": 3, "b": None}, {"a": 2, "d": 3}),
-        ("merge", {"b": {"e": 4}}, {"a": 1, "b": {"c": [1, 2], "e": 4}}),
+        (Modification.UPSERT, {"a": 2, "d": 3}, {"a": 2, "d": 3}),
+        (Modification.UPDATE, {"a": 2, "d": 3}, {"a": 2, "d": 3}),
+        (Modification.MERGE, {"a": 2, "d": 3, "b": None}, {"a": 2, "d": 3}),
+        (Modification.MERGE, {"b": {"e": 4}}, {"a": 1, "b": {"c": [1, 2], "e": 4}}),
         (
-            "patch",
+            Modification.PATCH,
             [{"op": "replace", "path": "/a", "value": 5}, {"op": "add", "path": "/e", "value": 6}],
             {"a": 5, "b": {"c": [1, 2]}, "e": 6},
         ),
-        ("patch", [{"op": "remove", "path": "/b"}], {"a": 1}),
-        ("patch", [{"op": "copy", "from": "/a", "path": "/f"}], {"a": 1, "b": {"c": [1, 2]}, "f": 1}),
-        ("patch", [{"op": "move", "from": "/a", "path": "/g"}], {"b": {"c": [1, 2]}, "g": 1}),
+        (Modification.PATCH, [{"op": "remove", "path": "/b"}], {"a": 1}),
+        (Modification.PATCH, [{"op": "copy", "from": "/a", "path": "/f"}], {"a": 1, "b": {"c": [1, 2]}, "f": 1}),
+        (Modification.PATCH, [{"op": "move", "from": "/a", "path": "/g"}], {"b": {"c": [1, 2]}, "g": 1}),
     ],
 )
-def test_whole_document_modifications(view, modification: str, modifier, expected: dict):
+def test_whole_document_modifications(view, arena, modification: Modification, modifier, expected: dict):
     view.docs_write([1], json.dumps({"a": 1, "b": {"c": [1, 2]}}))
     view.docs_write([1], json.dumps(modifier), modification=modification)
-    assert decoded(view.docs_read([1])) == [expected]
+    assert decoded(view.docs_read([1], arena)) == [expected]
 
 
-@pytest.mark.parametrize("modification", ["upsert", "insert", "merge"])
-def test_whole_document_modifications_create_missing_documents(view, modification: str):
+@pytest.mark.parametrize("modification", [Modification.UPSERT, Modification.INSERT, Modification.MERGE])
+def test_whole_document_modifications_create_missing_documents(view, arena, modification: Modification):
     view.docs_write([2], '{"a": 1}', modification=modification)
-    assert decoded(view.docs_read([2])) == [{"a": 1}]
+    assert decoded(view.docs_read([2], arena)) == [{"a": 1}]
 
 
 @pytest.mark.parametrize(
     ("call", "failure"),
     [
-        (lambda view: view.docs_write([1], "{}", modification="insert"), ustore.ExistsError),
-        (lambda view: view.docs_write([404], "1", field="a"), ustore.MissingError),
-        (lambda view: view.docs_write([1], "1", field="/nowhere/deep", modification="update"), ustore.MissingError),
-        (lambda view: view.docs_write([1], "[{}]", modification="patch"), ustore.ArgumentError),
+        (lambda view: view.docs_write([1], "{}", modification=Modification.INSERT), ustore.AlreadyExistsError),
+        (lambda view: view.docs_write([404], "1", field="a"), ustore.NotFoundError),
         (
-            lambda view: view.docs_write([1], '[{"op": "remove", "path": "/nowhere"}]', modification="patch"),
-            ustore.ArgumentError,
+            lambda view: view.docs_write([1], "1", field="/nowhere/deep", modification=Modification.UPDATE),
+            ustore.NotFoundError,
         ),
-        (lambda view: view.docs_write([2], "{}", modification="update"), ustore.MissingError),
-        (lambda view: view.docs_write([2], "[]", modification="patch"), ustore.MissingError),
+        (lambda view: view.docs_write([1], "[{}]", modification=Modification.PATCH), ustore.InvalidArgumentError),
+        (
+            lambda view: view.docs_write(
+                [1], '[{"op": "remove", "path": "/nowhere"}]', modification=Modification.PATCH
+            ),
+            ustore.InvalidArgumentError,
+        ),
+        (lambda view: view.docs_write([2], "{}", modification=Modification.UPDATE), ustore.NotFoundError),
+        (lambda view: view.docs_write([2], "[]", modification=Modification.PATCH), ustore.NotFoundError),
         (lambda view: view.docs_write([2], "{bad"), ustore.MalformedError),
         (lambda view: view.docs_write(None, ['{"_id": "text"}'], id_field="_id"), ustore.MalformedError),
-        (lambda view: view.docs_write([1], b"zz", field="v", type="bytes"), ustore.UnsupportedError),
+        (lambda view: view.docs_write([1], b"zz", field="v", type=FieldType.BIN), ustore.UnsupportedError),
+        (lambda view: view.docs_write([1], "{}", type=FieldType.F16), ustore.UnsupportedError),
     ],
     ids=[
         "insert-existing",
@@ -245,7 +251,8 @@ def test_whole_document_modifications_create_missing_documents(view, modificatio
         "patch-missing",
         "bad-json",
         "text-id",
-        "bytes-type",
+        "bin-type",
+        "f16-type",
     ],
 )
 def test_engine_refusals(view, call, failure: type):
@@ -270,11 +277,11 @@ def test_engine_refusals(view, call, failure: type):
         ([], ()),
     ],
 )
-def test_gist_lists_every_leaf_once(view, documents: list[dict], expected: tuple[str, ...]):
+def test_gist_lists_every_leaf_once(view, arena, documents: list[dict], expected: tuple[str, ...]):
     keys = list(range(len(documents)))
     if documents:
         view.docs_write(keys, [json.dumps(document) for document in documents])
-    assert view.docs_gist([*keys, len(keys)]) == expected
+    assert view.docs_gist([*keys, len(keys)], arena) == expected
 
 
 # endregion Gists
@@ -282,7 +289,7 @@ def test_gist_lists_every_leaf_once(view, documents: list[dict], expected: tuple
 # region Gathers
 
 
-@pytest.mark.parametrize("type_name", SCALAR_TYPES)
+@pytest.mark.parametrize("field_type", SCALAR_TYPES)
 @pytest.mark.parametrize(
     ("value", "valid", "converted", "collides"),
     [
@@ -294,85 +301,150 @@ def test_gist_lists_every_leaf_once(view, documents: list[dict], expected: tuple
     ],
     ids=["integer", "real", "text", "object", "null"],
 )
-def test_gather_scalars(view, type_name: str, value, valid: bool, converted: bool | None, collides: bool):
+def test_gather_scalars(view, arena, field_type: FieldType, value, valid: bool, converted: bool | None, collides: bool):
     """Every scalar column converts what it can and records what it could not; exactness varies by source type."""
     view.docs_write([0, 1], [json.dumps({"v": value}), "{}"])
-    columns = view.docs_gather([0, 1], ["v"], type_name)
-    format_char, python_type = SCALAR_TYPES[type_name]
+    columns = view.docs_gather([0, 1], ["v"], field_type, arena)
+    format_char, python_type = SCALAR_TYPES[field_type]
     column = columns[0]
     assert column.format == format_char
     assert len(column) == 2
-    assert bit(columns.validity(0), 0) == valid
-    assert bit(columns.collision(0), 0) == collides
-    assert not bit(columns.validity(0), 1)
+    assert bit(columns.validities(0), 0) == valid
+    assert bit(columns.collisions(0), 0) == collides
+    assert not bit(columns.validities(0), 1)
     if converted is not None:
-        assert bit(columns.conversion(0), 0) == converted
+        assert bit(columns.conversions(0), 0) == converted
     if valid:
         assert column[0] == python_type(value)
 
 
 @pytest.mark.parametrize(
-    ("type_name", "value"),
-    [("u8", 256), ("u8", -1), ("i8", 128), ("i8", -129), ("u64", -1), ("i64", 2**63), ("i32", 1e10), ("f32", 1e39)],
+    ("field_type", "value"),
+    [
+        (FieldType.U8, 256),
+        (FieldType.U8, -1),
+        (FieldType.I8, 128),
+        (FieldType.I8, -129),
+        (FieldType.U64, -1),
+        (FieldType.I64, 2**63),
+        (FieldType.I32, 1e10),
+        (FieldType.F32, 1e39),
+    ],
 )
-def test_gather_refuses_a_value_past_the_range_of_its_column(view, type_name: str, value):
+def test_gather_refuses_a_value_past_the_range_of_its_column(view, arena, field_type: FieldType, value):
     view.docs_write([0], json.dumps({"v": value}))
-    columns = view.docs_gather([0], ["v"], type_name)
-    assert not bit(columns.validity(0), 0)
-    assert bit(columns.collision(0), 0)
+    columns = view.docs_gather([0], ["v"], field_type, arena)
+    assert not bit(columns.validities(0), 0)
+    assert bit(columns.collisions(0), 0)
     assert columns[0][0] == 0
 
 
-@pytest.mark.parametrize("type_name", ["str", "bytes"])
+@pytest.mark.parametrize("field_type", [FieldType.STR, FieldType.BIN])
 @pytest.mark.parametrize(
     ("value", "text"), [("x", "x"), (3, "3"), (2.5, "2.5"), (True, "true"), ("", ""), (None, None), ({"k": 1}, None)]
 )
-def test_gather_strings(view, type_name: str, value, text: str | None):
+def test_gather_strings(view, arena, field_type: FieldType, value, text: str | None):
     view.docs_write([0], json.dumps({"v": value}))
-    column = view.docs_gather([0], ["v"], type_name)[0]
-    expected = None if text is None else text if type_name == "str" else text.encode()
+    column = view.docs_gather([0], ["v"], field_type, arena)[0]
+    expected = None if text is None else text if field_type is FieldType.STR else text.encode()
     assert column == (expected,)
 
 
 @pytest.mark.parametrize("count", BATCH_SIZES)
-def test_gather_columns_line_up_with_keys(view, count: int):
+def test_gather_columns_line_up_with_keys(view, arena, count: int):
     keys = list(range(count))
     view.docs_write(keys, [json.dumps({"n": key, "name": f"row-{key}", "half": key / 2}) for key in keys])
-    columns = view.docs_gather([*keys, count], ["n", "name", "half"], ["i64", "str", "f64"])
+    types = (FieldType.I64, FieldType.STR, FieldType.F64)
+    columns = view.docs_gather([*keys, count], ["n", "name", "half"], types, arena)
     assert len(columns) == 3
     assert columns.rows == count + 1
-    assert columns.types == ("i64", "str", "f64")
+    assert columns.types == types
     assert columns[0].tolist()[:count] == keys
     assert columns[1] == (*(f"row-{key}" for key in keys), None)
     assert np.asarray(columns[2])[:count].tolist() == [key / 2 for key in keys]
-    assert not bit(columns.validity(0), count)
+    assert not bit(columns.validities(0), count)
 
 
-def test_gathered_views_outlive_their_columns(view):
+def test_gathered_views_outlive_their_columns(view, arena):
     view.docs_write([0, 1], ['{"n": 1}', '{"n": 2}'])
-    column = view.docs_gather([0, 1], ["n"], "i64")[0]
+    column = view.docs_gather([0, 1], ["n"], FieldType.I64, arena)[0]
     gc.collect()
     assert column.readonly
     assert column.tolist() == [1, 2]
 
 
-def test_gather_of_no_fields(view):
-    columns = view.docs_gather([0], [], [])
+def test_gather_of_no_fields(view, arena):
+    columns = view.docs_gather([0], [], [], arena)
     assert len(columns) == 0
     assert columns.rows == 1
 
 
 @pytest.mark.parametrize("index", [1, -2])
-def test_gather_rejects_an_index_past_the_fields(view, index: int):
+def test_gather_rejects_an_index_past_the_fields(view, arena, index: int):
     view.docs_write([0], "{}")
-    columns = view.docs_gather([0], ["a"], "i64")
+    columns = view.docs_gather([0], ["a"], FieldType.I64, arena)
     with pytest.raises(IndexError):
         columns[index]
     with pytest.raises(IndexError):
-        columns.validity(index)
+        columns.validities(index)
 
 
 # endregion Gathers
+
+# region Deferred Calls
+
+
+def test_a_deferred_docs_write_lands_once_waited(view, later, arena):
+    """The documents and the field name stay with the call, so the caller's own may go before it runs."""
+    view.docs_write([1, 2], "{}")
+    documents = [json.dumps(NESTED), "{}"]
+    writing = later.docs_write([1, 2], documents, field="o")
+    del documents
+    assert writing.wait() is None
+    assert decoded(view.docs_read([1, 2], arena)) == [{"o": NESTED}, {"o": {}}]
+
+
+def test_a_deferred_docs_read_answers_once_waited(view, later, arena):
+    view.docs_write([1], json.dumps(NESTED))
+    assert decoded(later.docs_read([1, 2], arena).wait()) == [NESTED, None]
+    assert bytes(later.docs_read([1], arena, field="s", outputs_type=FieldType.STR).wait()[0]) == b"x"
+
+
+def test_a_deferred_docs_gist_answers_once_waited(view, later, arena):
+    view.docs_write([1, 2], ['{"a": {"b": 1}}', '{"c": 2}'])
+    assert later.docs_gist([1, 2], arena).wait() == ("/a/b", "/c")
+
+
+def test_a_deferred_docs_gather_answers_once_waited(view, later, arena):
+    view.docs_write([1, 2], ['{"n": 1, "s": "x"}', '{"n": 2}'])
+    columns = later.docs_gather([1, 2], ["n", "s"], [FieldType.I64, FieldType.STR], arena).wait()
+    assert list(columns[0]) == [1, 2]
+    assert columns[1] == ("x", None)
+
+
+def test_deferred_document_subscripts_answer_once_waited(view, later):
+    """`docs[key]` parses what it read once waited for, and `docs_json[key]` answers a copy of the text."""
+    view[""].docs[1] = NESTED
+    collection = later[""]
+    assert collection.docs[1].wait() == NESTED
+    assert collection.docs[[1, 2]].wait() == [NESTED, None]
+    assert json.loads(collection.docs_json[1].wait()) == NESTED
+    missing = collection.docs[2]
+    with pytest.raises(KeyError):
+        missing.wait()
+
+
+def test_await_documents_under_asyncio(view, later, arena):
+    async def main() -> tuple:
+        await later.docs_write([1], json.dumps(NESTED))
+        return await later[""].docs[1], await later.docs_gist([1], arena)
+
+    document, paths = asyncio.run(main())
+    assert document == NESTED
+    assert "/o/k" in paths
+
+
+# endregion Deferred Calls
 
 # region Refusals
 
@@ -384,15 +456,16 @@ def test_gather_rejects_an_index_past_the_fields(view, index: int):
         (lambda view: view.docs_write(None, ["{}"]), TypeError),
         (lambda view: view.docs_write(None, "{}", id_field="_id"), TypeError),
         (lambda view: view.docs_write([1], 42), TypeError),
-        (lambda view: view.docs_write([1], "{}", modification="replace"), ValueError),
-        (lambda view: view.docs_write([1], "{}", type="f16"), ValueError),
+        (lambda view: view.docs_write([1], "{}", modification=len(Modification)), ValueError),
+        (lambda view: view.docs_write([1], "{}", modification="merge"), TypeError),
+        (lambda view: view.docs_write([1], "{}", type=-1), ValueError),
         (lambda view: view.docs_write([1], "{}", field=3), TypeError),
-        (lambda view: view.docs_read([1], typ="json"), TypeError),
-        (lambda view: view.docs_gather([1], "a", "i64"), TypeError),
-        (lambda view: view.docs_gather([1], ["a", "b"], ["i64"]), ValueError),
-        (lambda view: view.docs_gather([1], ["a"], "json"), ValueError),
-        (lambda view: view.docs_gather([1], ["a"], "i128"), ValueError),
-        (lambda view: view.docs_gather([1], [3], "i64"), TypeError),
+        (lambda view: view.docs_read([1], ustore.Arena(), typ=FieldType.JSON), TypeError),
+        (lambda view: view.docs_gather([1], "a", FieldType.I64, ustore.Arena()), TypeError),
+        (lambda view: view.docs_gather([1], ["a", "b"], [FieldType.I64], ustore.Arena()), ValueError),
+        (lambda view: view.docs_gather([1], ["a"], FieldType.JSON, ustore.Arena()), ValueError),
+        (lambda view: view.docs_gather([1], ["a"], 999, ustore.Arena()), ValueError),
+        (lambda view: view.docs_gather([1], [3], FieldType.I64, ustore.Arena()), TypeError),
     ],
     ids=[
         "width",
@@ -400,6 +473,7 @@ def test_gather_rejects_an_index_past_the_fields(view, index: int):
         "keyless-broadcast",
         "integer-document",
         "modification",
+        "modification-text",
         "write-type",
         "field-type",
         "keyword",

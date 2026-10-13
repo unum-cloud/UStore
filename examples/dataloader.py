@@ -51,8 +51,7 @@ class CollectionDataset:
 
     def __len__(self) -> int:
         """How many pairs the collection holds, which the engine measures without listing them."""
-        measured = self.database.measure(KEY_MIN, KEY_MAX, collection=self.collection)
-        return measured["min_cardinality"]
+        return self.database.measure(KEY_MIN, KEY_MAX, ustore.Arena(), collection=self.collection).min_cardinality
 
 
 class CollectionSampler(Sampler):
@@ -69,9 +68,11 @@ class CollectionSampler(Sampler):
     def __iter__(self) -> Iterator[list[int]]:
         """Yields one list of keys per batch, which the loader turns into one call per key."""
         if self.order is Order.SAMPLED:
+            # Every draw is copied into a list before the next one rewinds the arena they share.
+            arena = ustore.Arena()
             for _ in range(self.batch_count):
-                drawn = self.dataset.database.sample(self.batch_size, collection=self.dataset.collection)
-                yield drawn[0].tolist()
+                drawn = self.dataset.database.sample(self.batch_size, arena, collection=self.dataset.collection)
+                yield list(drawn[0])
             return
 
         keys = scan_keys(self.dataset.database, self.dataset.collection)
