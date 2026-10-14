@@ -46,6 +46,7 @@ option(USTORE_BUILD_LIB_PYTHON "Compile the CPython extension; `scikit-build-cor
 option(USTORE_BUILD_NVME "Compile the in-tree NVMe engine" OFF)
 option(USTORE_BUILD_CUDA "Compile NVMe's GPU compaction" OFF)
 option(USTORE_WERROR "Treat compiler warnings as errors" OFF)
+option(USTORE_BUNDLE_SIBLINGS "Copy the ForkUnion and StringZilla objects into ustore_static; Cargo links their own" ON)
 # CUB is all the compaction kernels call, so one plain code per generation covers Ampere through Blackwell.
 set(USTORE_CUDA_ARCHITECTURES
     "80;90;100;120"
@@ -201,7 +202,8 @@ endif ()
 # installed beside it, so a change to UStore never rewrites RocksDB.
 set(USTORE_ENGINE_NAMES "ram")
 set(USTORE_SOURCES src/lib.cpp src/docs.cpp src/graph.cpp src/ram/engine.cpp)
-set(USTORE_DEPENDENCIES forkunion_static stringzilla_static yyjson fmt)
+set(USTORE_SIBLING_ARCHIVES forkunion_static stringzilla_static)
+set(USTORE_DEPENDENCIES ${USTORE_SIBLING_ARCHIVES} yyjson fmt)
 set(USTORE_ENGINE_ARCHIVES)
 set(USTORE_ENGINE_DEFINITIONS)
 
@@ -239,7 +241,9 @@ endif ()
 set(USTORE_DEPENDENCY_OBJECTS)
 set(USTORE_DEPENDENCY_LINKS)
 foreach (dependency IN LISTS USTORE_DEPENDENCIES)
-    list(APPEND USTORE_DEPENDENCY_OBJECTS $<TARGET_OBJECTS:${dependency}>)
+    if (USTORE_BUNDLE_SIBLINGS OR NOT dependency IN_LIST USTORE_SIBLING_ARCHIVES)
+        list(APPEND USTORE_DEPENDENCY_OBJECTS $<TARGET_OBJECTS:${dependency}>)
+    endif ()
     list(APPEND USTORE_DEPENDENCY_LINKS $<BUILD_INTERFACE:${dependency}>)
 endforeach ()
 add_library(ustore_static STATIC ${USTORE_LIB_C_EXCLUSION} ${USTORE_SOURCES} ${USTORE_DEPENDENCY_OBJECTS})

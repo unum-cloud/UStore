@@ -197,6 +197,10 @@ mod testing;
 pub use jsontape;
 pub use stringtape;
 
+// Named only so their archives link, carrying the objects the UStore archive leaves out.
+extern crate forkunion as _;
+extern crate stringzilla as _;
+
 pub use blobs::{Cursor, Entry, Measurement, Page, Values};
 pub use collection::{Blobs, Collection, Docs, Graph, Sample};
 pub use db::{

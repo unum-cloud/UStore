@@ -1,10 +1,10 @@
 //! Builds the one UStore library through CMake and links it with every engine the features enable.
 //!
 //! No C or C++ is compiled here: CMake owns the engines, their dependencies and their flags, and this
-//! script installs its libraries into `OUT_DIR` and links the static one, which carries the objects of
-//! the small siblings it builds on, beside the archives of the storage engines. The `ram` engine always
-//! builds; the `rocksdb`, `leveldb` and `nvme` features add theirs, and a missing one refuses to open at
-//! run time.
+//! script installs its libraries into `OUT_DIR` and links the static one beside the archives of the
+//! storage engines. The sibling crates hand CMake their trees, and ForkUnion and StringZilla link their
+//! own archives, so the UStore archive leaves their objects out. The `ram` engine always builds; the
+//! `rocksdb`, `leveldb` and `nvme` features add theirs, and a missing one refuses to open at run time.
 
 use std::env;
 use std::error::Error;
@@ -34,24 +34,19 @@ const SOURCES: &[&str] = &[
     "src",
     "src_oracles/leveldb",
     "src_oracles/rocksdb",
-    "smashtable/CMakeLists.txt",
-    "smashtable/cmake",
-    "smashtable/include",
-    "stringzilla/CMakeLists.txt",
-    "stringzilla/cmake",
-    "stringzilla/c",
-    "stringzilla/probes",
-    "stringzilla/include",
-    "forkunion/CMakeLists.txt",
-    "forkunion/cmake",
-    "forkunion/c",
-    "forkunion/probes",
-    "forkunion/include",
 ];
 
 /// Whether the named Cargo feature is enabled for this build.
 fn feature_enabled(name: &str) -> bool {
     env::var(format!("CARGO_FEATURE_{}", name.to_uppercase())).is_ok()
+}
+
+/// The tree a sibling crate reports through its `links` metadata.
+fn sibling_source(links: &str) -> Result<String, String> {
+    let variable = format!("DEP_{}_SOURCE", links.to_uppercase());
+    env::var(&variable).map_err(|_| {
+        format!("{variable} is unset: this `{links}` crate predates reporting its tree")
+    })
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -62,17 +57,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         .define("USTORE_BUILD_LIB_C", "ON")
         .define("USTORE_INSTALL", "ON")
         .define("CMAKE_INSTALL_LIBDIR", "lib")
+        .define("USTORE_BUNDLE_SIBLINGS", "OFF")
         .always_configure(false);
     for (option, feature) in KNOWN_OPTIONS {
         let enabled = feature.is_some_and(feature_enabled);
         build.define(*option, if enabled { "ON" } else { "OFF" });
     }
-    // Checkouts the environment names stand in for the nested submodules and the downloads.
-    for (name, value) in env::vars() {
-        if name.starts_with("FETCHCONTENT_SOURCE_DIR_") {
-            println!("cargo:rerun-if-env-changed={name}");
-            build.define(name, value);
-        }
+    for (variable, links) in [
+        ("FETCHCONTENT_SOURCE_DIR_FORKUNION", "forkunion"),
+        ("FETCHCONTENT_SOURCE_DIR_SMASHTABLE", "smashtable"),
+        ("FETCHCONTENT_SOURCE_DIR_STRINGZILLA", "stringzilla"),
+    ] {
+        build.define(variable, sibling_source(links)?);
     }
 
     let prefix = build.build();

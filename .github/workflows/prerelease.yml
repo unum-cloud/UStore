@@ -38,9 +38,9 @@ jobs:
           verbose: "true"
           version-file: "VERSION"
           update-version-in: |
-            CITATION.cff:^version: (\d+\.\d+\.\d+)
-            pyproject.toml:^version = "(\d+\.\d+\.\d+)"
-            Cargo.toml:^version = "(\d+\.\d+\.\d+)"
+            CITATION.cff:^version: (\d+\.\d+\.\d+(?:-rc\.\d+)?)
+            pyproject.toml:^version = "(\d+\.\d+\.\d+(?:-rc\.\d+)?)"
+            Cargo.toml:^version = "(\d+\.\d+\.\d+(?:-rc\.\d+)?)"
           update-major-version-in: |
             c/ustore/types.h:^#define USTORE_VERSION_MAJOR (\d+)
           update-minor-version-in: |

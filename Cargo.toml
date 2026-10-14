@@ -19,22 +19,6 @@ include = [
   "/src/**",
   "/src_oracles/**",
   "/tools/**",
-  "/smashtable/CMakeLists.txt",
-  "/smashtable/VERSION",
-  "/smashtable/cmake/**",
-  "/smashtable/include/**",
-  "/stringzilla/CMakeLists.txt",
-  "/stringzilla/VERSION",
-  "/stringzilla/cmake/**",
-  "/stringzilla/c/**",
-  "/stringzilla/probes/**",
-  "/stringzilla/include/**",
-  "/forkunion/CMakeLists.txt",
-  "/forkunion/VERSION",
-  "/forkunion/cmake/**",
-  "/forkunion/c/**",
-  "/forkunion/probes/**",
-  "/forkunion/include/**",
 ]
 
 [lib]
@@ -52,9 +36,13 @@ rocksdb = []
 serde = ["dep:serde", "jsontape/serde"]
 
 [dependencies]
+# The siblings' crates carry the trees `build.rs` hands CMake, and ForkUnion and StringZilla link their own archives.
+forkunion = { version = "4.0.0-rc.1", default-features = false }
 jsontape = "0.1.4"
 serde = { version = "1", optional = true }
+smashtable = "1.0.0-rc.1"
 stringtape = "2.5.0"
+stringzilla = { version = "6.0.0-rc.1", default-features = false }
 
 [build-dependencies]
 cmake = "0.1"
