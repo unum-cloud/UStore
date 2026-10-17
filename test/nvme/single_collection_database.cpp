@@ -284,10 +284,10 @@ std::size_t every_layout_round_trips(mount_type_ const& mount) {
     return failures;
 }
 
-/** The name the schema blob of this layer answers to, which a crash case removes by hand. */
-[[nodiscard]] blob_name_t schema_blob_name() noexcept {
-    static constexpr char text[] = "single-collection-database.schema";
-    return blob_name_t {reinterpret_cast<byte_t const*>(text), sizeof(text) - 1};
+/** The name copy @p copy of the schema blob of this layer answers to, which a crash case removes by hand. */
+[[nodiscard]] blob_name_t schema_blob_name(std::size_t copy) noexcept {
+    return copy == 0 ? blob_name_of("single-collection-database.schema.0")
+                     : blob_name_of("single-collection-database.schema.1");
 }
 
 /** Sorted runs @p volume names right now, which a reopen neither adds to nor loses. */
@@ -307,10 +307,11 @@ template <typename volume_type_>
     return counted;
 }
 
-/** Runs the schema blob on @p volume names, counted off the length its fixed-width records fix. */
+/** Runs the copy of the schema blob on @p volume that save @p generation wrote names, counted off the length its
+ *  fixed-width records fix. */
 template <typename volume_type_>
-[[nodiscard]] std::size_t runs_named_by_schema(volume_type_ const& volume) noexcept {
-    expected<volume_blob_t> const found = volume.find(schema_blob_name());
+[[nodiscard]] std::size_t runs_named_by_schema(volume_type_ const& volume, std::uint64_t generation) noexcept {
+    expected<volume_blob_t> const found = volume.find(schema_blob_name(catalog_copy_of(generation)));
     if (!found || found->length < sizeof(single_collection_database_schema_record_t)) return 0;
     return static_cast<std::size_t>((found->length - sizeof(single_collection_database_schema_record_t)) /
                                     sizeof(lsm_tree_run_record_t));
@@ -371,7 +372,8 @@ template <typename key_slot_type_, typename mount_type_>
         failures += expect(*merged == compaction_outcome_t::published_k);
 
         // A merge records its new set before it drops what it consumed, so neither outlives the other.
-        failures += expect_eq(runs_named_by_schema(*(*stack)->volume), run_count_of(*(*stack)->volume));
+        failures += expect_eq(runs_named_by_schema(*(*stack)->volume, (*store)->catalog_generation()),
+                              run_count_of(*(*stack)->volume));
 
         // Two overlapping rounds go back onto level zero, so age alone decides which run answers a key,
         // and the keys neither round names can only be answered from the level the merge wrote.
@@ -457,7 +459,8 @@ std::size_t crash_between_seal_and_schema(mount_type_ const& mount) {
             failures += expect((*store)->flush().succeeded());
 
             // A flush seals its run and records it second, so the schema already names every run on the volume.
-            failures += expect_eq(runs_named_by_schema(*(*stack)->volume), run_count_of(*(*stack)->volume));
+            failures += expect_eq(runs_named_by_schema(*(*stack)->volume, (*store)->catalog_generation()),
+                                  run_count_of(*(*stack)->volume));
         }
 
         std::size_t const runs = run_count_of(*(*stack)->volume);
@@ -465,8 +468,11 @@ std::size_t crash_between_seal_and_schema(mount_type_ const& mount) {
         failures += expect(runs != std::size_t {0});
         failures += expect(wasted != std::uint64_t {0});
 
-        // The schema write that would have named those runs never landed.
-        failures += expect((*stack)->volume->drop((*stack)->writing.channel(), schema_blob_name()).succeeded());
+        // No copy of the schema that would have named those runs ever landed.
+        for (std::size_t copy = 0; copy != 2; ++copy)
+            if ((*stack)->volume->names(schema_blob_name(copy)))
+                failures += expect(
+                    (*stack)->volume->drop((*stack)->writing.channel(), schema_blob_name(copy)).succeeded());
 
         expected<typename variable_database_t::database_unique_ptr_t> store = open_over<variable_database_t>(**stack,
                                                                                                              config);
@@ -639,7 +645,7 @@ std::size_t commit_lands_all_or_nothing(mount_type_ const& mount) {
         writer_failures += expect(guard.has_value());
         if (!guard) return;
 
-        expected<typename variable_database_t::transaction_unique_ptr_t> changing = (*store)->create_transaction(7);
+        expected<typename variable_database_t::transaction_unique_ptr_t> changing = (*store)->create_transaction();
         writer_failures += expect(changing.has_value());
         if (!changing) return;
 
@@ -721,8 +727,8 @@ std::size_t conflict_keeps_its_changes(mount_type_ const& mount) {
     failures += expect((*store)->insert(contested_k, std::span<byte_t const> {original}).succeeded());
     failures += expect((*store)->flush().succeeded());
 
-    expected<typename variable_database_t::transaction_unique_ptr_t> first = (*store)->create_transaction(1);
-    expected<typename variable_database_t::transaction_unique_ptr_t> second = (*store)->create_transaction(2);
+    expected<typename variable_database_t::transaction_unique_ptr_t> first = (*store)->create_transaction();
+    expected<typename variable_database_t::transaction_unique_ptr_t> second = (*store)->create_transaction();
     failures += expect(first.has_value() && second.has_value());
     if (!first || !second) return failures;
 
@@ -769,8 +775,8 @@ std::size_t conflict_keeps_its_changes(mount_type_ const& mount) {
     failures += expect_eq(read_counter(std::span<byte_t const> {seen}), std::uint64_t {102});
 
     // A transaction that only read the contested key, and wrote elsewhere, is refused just the same.
-    expected<typename variable_database_t::transaction_unique_ptr_t> observing = (*store)->create_transaction(4);
-    expected<typename variable_database_t::transaction_unique_ptr_t> overwriting = (*store)->create_transaction(5);
+    expected<typename variable_database_t::transaction_unique_ptr_t> observing = (*store)->create_transaction();
+    expected<typename variable_database_t::transaction_unique_ptr_t> overwriting = (*store)->create_transaction();
     failures += expect(observing.has_value() && overwriting.has_value());
     if (!observing || !overwriting) return failures;
 
@@ -803,7 +809,7 @@ std::size_t rollback_and_renew_behave(mount_type_ const& mount) {
     failures += expect(store.has_value());
     if (!store) return failures;
 
-    expected<typename variable_database_t::transaction_unique_ptr_t> changing = (*store)->create_transaction(3);
+    expected<typename variable_database_t::transaction_unique_ptr_t> changing = (*store)->create_transaction();
     failures += expect(changing.has_value());
     if (!changing) return failures;
 
@@ -886,8 +892,7 @@ std::size_t transactions_serialize_under_threads(mount_type_ const& mount) {
             worker_failures[worker] += expect(guard.has_value());
             if (!guard) return;
 
-            expected<typename variable_database_t::transaction_unique_ptr_t> changing = (*store)->create_transaction(
-                static_cast<transaction_id_t>(worker + 1));
+            expected<typename variable_database_t::transaction_unique_ptr_t> changing = (*store)->create_transaction();
             worker_failures[worker] += expect(changing.has_value());
             if (!changing) return;
 

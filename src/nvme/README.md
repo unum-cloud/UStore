@@ -47,7 +47,8 @@ Levels differ by depth:
 - Intermediate levels keep their sorted runs sorted, and still hold tombstones: removals, whose size of zero shadows older values beneath them.
 - The bottom level is sorted too, and compaction into it drops tombstones for good.
 
-Level 0 is due for compaction at 4 sorted runs or at its byte budget, whichever comes first, and every deeper level's budget grows by `level_enlarge_factor`.
+Every deeper level's budget grows by `level_enlarge_factor`, and level 0 is due for compaction at that many sorted runs or at its byte budget, whichever comes first: a flushed run is one write buffer, so level 0 then holds the factor's multiple of a write buffer, the same step between every two levels.
+A tree refuses to mount with a factor outside `[level_min_enlarge_factor_k, level_max_enlarge_factor_k]`, the bounds a collection's configuration is validated against.
 The engine compacts after every write that leaves a collection due, on the thread of that write.
 
 ### Value Layouts
@@ -60,14 +61,25 @@ The engine compacts after every write that leaves a collection due, on the threa
 
 A `database` mixes collections of different value layouts, and its collection scanner scans any of them.
 
-### Snapshots
+### Stamps and snapshots
 
-A snapshot is a held object rather than a named one: `take_snapshot` flushes every write buffer and counts a reader into the level set each flush published, so nothing that set names can be retired while the snapshot lives.
-Taking one copies no data and moves no byte.
-There are no snapshot identifiers and no snapshot persistence, so a snapshot lives exactly as long as the object holding it.
+Every commit draws one stamp from the database's `commit_ledger_t`, over SmashTable's `commit_order_t`, and a graph's two databases share one ledger.
+A write buffer slot carries the stamp of the commit that wrote it, and every sorted run carries a column of its key slots' stamps as an `immutable_packed_array` trailer, frame-of-reference coded from a floor no reader can tell apart, so a cold run spends no bit on them.
+A run may hold several versions of one key, newest first, and the run cutter never splits them.
 
-A hold is what a publication waits on, so a flush, a compaction or a second snapshot taken while one is still alive on the same thread never returns.
-An ordered walk therefore takes a snapshot, reads it and drops it inside the call that needs it, and a caller that mutates what it walked collects the keys first and lets the snapshot go before the first write.
+A reader pins a stamp in the ledger and reads the newest version at or below it.
+A write buffer keeps a version it replaces while the replacing commit is unpublished, and after that only while some pin falls between the two, so a hot key nobody reads keeps one older version at most.
+A flush and a merge keep one version per interval between pinned stamps, every version above the durable horizon, and the newest below it, which with no pin is the newest version alone, as before stamps.
+A reader the memory budget cannot keep history for is refused at its next read with `write_conflict_k`, and the writer never is.
+
+`take_snapshot` still holds the level set each flush published, for the callers inside one call that walk the runs themselves.
+
+### Crash atomicity
+
+The catalog lives in two copies saved in turn, each with a generation and the durable stamp D: every commit at or below D is wholly in the runs that copy names.
+D is the oldest pin a write buffer holds, below its first write, or the published stamp while no buffer holds one.
+A mount reads the newer copy, resumes the stamps at D and merges down every level holding a version above D, dropping those versions, so a crash loses a suffix of commits and never half of one.
+A graph truncates both of its databases at the lesser of their two promises.
 
 Backup, move and sorted-run export are not implemented.
 They belong on the blob surface of `nvme_volume.hpp` rather than on the disk router they were written against, so the files that carried them were removed instead of adapted.
@@ -80,8 +92,9 @@ Single-collection database transactions span one collection, database transactio
 - `commit` stages unless already staged, then applies the changes on the write path the stage took, which is the database's own claim and one channel.
 - `rollback` drops the changes, and `renew` restarts the transaction with its changes kept, which only a transaction without reads may do.
 
-The read set records each watched stored key with the stamp and purpose of its watch, and the transaction registry keeps the keys of every commit made while an older transaction still runs.
-Staging fails with `write_conflict_k` when a commit made after a watch began wrote the watched key.
+A transaction pins its start stamp and reads at it, its own writes first.
+The read set records each watched stored key with the stamp of its watch, a written key keeps its watch beside its write, and a scan records the range it walked.
+Staging fails with `write_conflict_k` when a commit stamped after a watch began wrote a watched key or any key of a watched range, which the write buffer and then the runs whose newest stamp is newer answer exactly, with no fingerprint and no false conflict.
 A watch follows one of four schedules:
 
 | Schedule                      | When it checks                                                  |
@@ -92,9 +105,9 @@ A watch follows one of four schedules:
 | `on_commit_since_operation_k` | Between the operation and the commit                            |
 
 The C ABI watches every read and write on `on_commit_k` when a call asks for `ustore_watch_keys_k`, or on `never_k` for `ustore_watch_none_k`, and a read of a missing key watches its absence.
-Watches cover keys, not ranges, so a scan watches the keys it hands out and reports no phantom, and an ordered walk inside a transaction merges the transaction's own writes over what the store has committed.
-A write that reached no registry would land where no watcher could see it, so a batch the C ABI takes outside a caller's transaction commits through a transaction of its own, sized to that batch.
-Commits are ordered by the stamps the registry issues, which keeps a transaction to one node.
+A scan watches the keys it hands out and the range it covered, so a phantom conflicts too, and an ordered walk inside a transaction merges the transaction's own writes over what the store held at its start.
+A write outside every transaction draws a stamp of its own after its room is reserved, so a watcher sees it.
+Commits are ordered by the stamps the ledger issues, which keeps a transaction to one node.
 
 ## The C ABI
 
@@ -106,7 +119,8 @@ Commits are ordered by the stamps the registry issues, which keeps a transaction
 - `ustore_collection_main_k` is the nil UUID, and the catalog and the names live under two more UUIDs no UUIDv7 spells, which every call refuses as unknown; every other collection carries the UUIDv7 its create minted.
 - A read measures a key and copies its value into the call's scratch, measuring again when the value changed its width in between.
 - A scan, a sample and a measurement walk one collection's runs and write buffer under the database's claim, binary-searching each run for the start key, and merge a transaction's own writes over them.
-- Snapshots answer `ustore_status_unsupported_k`, and the description claims no `ustore_capabilities_snapshots_k`, since a level set held across calls would stall every publication behind it.
+- A snapshot pins a stamp, holds no level set and stalls no writer; reads, scans and collection lookups through it answer at that stamp, a drop leaves the runs of a dropped collection until the last snapshot goes, and a save writes a database of this engine with every collection as the snapshot reads it.
+- With keys watched, committed transactions are strictly serializable in stamp order; with none watched they read one snapshot and the last writer wins; the description reports `ustore_isolation_snapshot_k`.
 - A write that leaves a level due compacts it on the writing thread, and `ustore_database_compact` flushes every collection before merging what is due.
 
 The engine mounts on files through the transport its executor names or the probe settles on: `io_uring` where the kernel allows it, Linux AIO where it refuses a ring, and the blocking floor elsewhere.

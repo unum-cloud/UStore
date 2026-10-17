@@ -212,8 +212,7 @@ std::size_t chunks_land_whole(mount_type_ const& mount) {
             expected<guard_t> guard = (*stack)->fixture->channels.acquire();
             worker_failures[worker] += expect(guard.has_value());
             if (!guard) return;
-            expected<typename database_t::transaction_unique_ptr_t> changing = (*store)->create_transaction(
-                static_cast<transaction_id_t>(worker + 1));
+            expected<typename database_t::transaction_unique_ptr_t> changing = (*store)->create_transaction();
             worker_failures[worker] += expect(changing.has_value());
             if (!changing) return;
 
@@ -338,8 +337,7 @@ std::size_t transactions_replay_in_commit_order(mount_type_ const& mount) {
             expected<guard_t> guard = (*stack)->fixture->channels.acquire();
             worker_failures[worker] += expect(guard.has_value());
             if (!guard) return;
-            expected<typename database_t::transaction_unique_ptr_t> changing = (*store)->create_transaction(
-                static_cast<transaction_id_t>(worker + 1));
+            expected<typename database_t::transaction_unique_ptr_t> changing = (*store)->create_transaction();
             worker_failures[worker] += expect(changing.has_value());
             if (!changing) return;
 

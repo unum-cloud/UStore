@@ -30,6 +30,7 @@
 #include <cstdint> // `std::uint8_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`
 
+#include <algorithm>   // `std::max`
 #include <memory>      // `std::unique_ptr`
 #include <new>         // `std::nothrow`
 #include <optional>    // `std::optional`
@@ -42,7 +43,7 @@
 
 #include "ustore/blobs/nvme_collection.hpp"   // `select_result_t`
 #include "ustore/blobs/nvme_database.hpp"     // `basic_single_collection_database`
-#include "ustore/blobs/nvme_key_slot.hpp"     // `key_slot`, `stored_value_size_t`, `transaction_id_t`
+#include "ustore/blobs/nvme_key_slot.hpp"     // `key_slot`, `stored_value_size_t`, `transaction_stamp_t`
 #include "ustore/blobs/nvme_tree.hpp"         // `single_collection_database_config_t`, `user_collection_config_t`
 #include "ustore/graph/edge_block.hpp"        // `labeled_edge_t`, `labeled_half_edge_t`, `edge_block_t`, `id_chunk_t`
 #include "ustore/graph/vertex_registry.hpp"   // `vertex_registry_t`
@@ -56,12 +57,12 @@
 namespace unum::ustore::graph {
 
 using blobs::basic_single_collection_database;
+using blobs::commit_ledger_t;
 using blobs::create_single_collection_database_config;
 using blobs::key_slot;
 using blobs::select_result_t;
 using blobs::single_collection_database_config_t;
 using blobs::stored_value_size_t;
-using blobs::transaction_id_t;
 using blobs::transaction_stamp_t;
 using blobs::user_single_collection_database_config_t;
 using blobs::value_layout_t;
@@ -1124,15 +1125,25 @@ class basic_graph_store {
 
         single_collection_database_config_t const bounds = config.databases();
         expected<typename vertices_t::database_unique_ptr_t> opened_vertices = vertices_t::open(
-            vertices_volume, store->vertices_writing_.channel(), store->vertices_merging_.channel(), bounds, resources);
+            vertices_volume, store->vertices_writing_.channel(), store->vertices_merging_.channel(), bounds, resources,
+            store->ledger_);
         if (!opened_vertices) return opened_vertices.status();
         store->vertices_ = std::move(*opened_vertices);
 
         expected<typename half_edges_t::database_unique_ptr_t> opened_half_edges = half_edges_t::open(
             half_edges_volume, store->half_edges_writing_.channel(), store->half_edges_merging_.channel(), bounds,
-            std::move(resources));
+            std::move(resources), store->ledger_);
         if (!opened_half_edges) return opened_half_edges.status();
         store->half_edges_ = std::move(*opened_half_edges);
+
+        // Both databases are open and nothing has drawn yet. A commit is whole only at or below what both schemas
+        // promise, so both drop every version above the lesser promise and the shared stamps continue from it.
+        transaction_stamp_t const durable = std::min(store->vertices_->loaded_durable_stamp(),
+                                                     store->half_edges_->loaded_durable_stamp());
+        if (status_t const resumed = store->ledger_.resume(durable); resumed.failed()) return resumed;
+        if (status_t const truncated = store->vertices_->truncate_above(durable); truncated.failed()) return truncated;
+        if (status_t const truncated = store->half_edges_->truncate_above(durable); truncated.failed())
+            return truncated;
         return store;
     }
 
@@ -1155,6 +1166,9 @@ class basic_graph_store {
 
     /** Every graph call, over the two databases themselves rather than over a transaction. */
     [[nodiscard]] access_t access() noexcept { return access_t {*vertices_, *half_edges_}; }
+
+    /** The order both databases draw their stamps from. */
+    [[nodiscard]] commit_ledger_t& ledger() noexcept { return ledger_; }
 
     /** Writes everything staged in both databases as one run each, so a reopen finds it. */
     status_t flush() noexcept {
@@ -1181,6 +1195,9 @@ class basic_graph_store {
 
     /** The second channel a compaction of the half-edges database writes its new runs on. */
     channel_guard_t half_edges_merging_;
+
+    /** The stamps both databases draw, so the two halves of one graph commit land under one stamp. */
+    commit_ledger_t ledger_;
 
     /** The database holding one registry per vertex, which dies before its channels do. */
     typename vertices_t::database_unique_ptr_t vertices_;
@@ -1249,21 +1266,21 @@ class basic_graph_transaction {
     basic_graph_transaction& operator=(basic_graph_transaction&&) = delete;
 
     /**
-     *  @brief Begins one transaction over each of @p store's databases, both under @p id.
+     *  @brief Begins one transaction over each of @p store's databases, both at the stamp their ledger published.
      *  @param[inout] store The graph both halves commit into, borrowed and outliving the transaction.
-     *  @param[in] id The identifier both registries hold a roster slot under, unique among live transactions.
      */
-    static expected<graph_transaction_unique_ptr_t> begin(graph_store_t& store, transaction_id_t id) noexcept {
+    static expected<graph_transaction_unique_ptr_t> begin(graph_store_t& store) noexcept {
         graph_transaction_unique_ptr_t transaction {new (std::nothrow) basic_graph_transaction {}};
         if (!transaction) return status_t {status_code_t::out_of_memory_k, "The graph transaction did not fit"};
+        transaction->store_ = &store;
 
         expected<typename graph_store_t::vertices_t::transaction_unique_ptr_t> vertices =
-            store.vertices().create_transaction(id);
+            store.vertices().create_transaction();
         if (!vertices) return vertices.status();
         transaction->vertices_ = std::move(*vertices);
 
         expected<typename graph_store_t::half_edges_t::transaction_unique_ptr_t> half_edges =
-            store.half_edges().create_transaction(id);
+            store.half_edges().create_transaction();
         if (!half_edges) return half_edges.status();
         transaction->half_edges_ = std::move(*half_edges);
         return transaction;
@@ -1277,12 +1294,12 @@ class basic_graph_transaction {
     [[nodiscard]] access_t access() noexcept { return access_t {*vertices_, *half_edges_}; }
 
     /**
-     *  @brief Stages both halves and then lands both, starting the transaction again.
+     *  @brief Stages both halves and then lands both under one stamp, starting the transaction again.
      *
-     *  Both halves take their write paths before either lands, so a reader that consults a registry before
-     *  the blocks it names waits behind the half that has not landed rather than reading across the two.
-     *  A failure anywhere rolls back whichever half still holds a queue pair, since one left staged would hold
-     *  its database's write path against every reader.
+     *  Both halves take their write paths before either lands, and both land under the one stamp the shared ledger
+     *  draws and publishes only once both have landed, so a reader sees both halves of a commit or neither. A
+     *  failure rolls back whichever half still holds a write path, since one left staged would hold it against
+     *  every reader.
      */
     status_t commit() noexcept {
         if (status_t const staged = vertices_->stage(); staged.failed()) return staged;
@@ -1290,11 +1307,15 @@ class basic_graph_transaction {
             vertices_->rollback();
             return staged;
         }
-        if (status_t const landed = vertices_->commit(); landed.failed()) {
-            half_edges_->rollback();
-            return landed;
-        }
-        return half_edges_->commit();
+        commit_ledger_t::commit_in_flight_t in_flight;
+        transaction_stamp_t const stamp = store_->ledger().begin_commit(in_flight);
+        vertices_->land(stamp);
+        half_edges_->land(stamp);
+        store_->ledger().end_commit(in_flight);
+        // Only now is the stamp published, so both halves start again past it.
+        vertices_->rollback();
+        half_edges_->rollback();
+        return {};
     }
 
     /** Drops every change and every watch of both halves, and starts this transaction again from here. */
@@ -1321,10 +1342,13 @@ class basic_graph_transaction {
 
 #pragma region Private Members
 
-    /** The half committing the registries, which lands before the edge blocks do. */
+    /** The store both halves commit into, whose ledger they draw from, outliving this transaction. */
+    graph_store_t* store_ = nullptr;
+
+    /** The half committing the registries. */
     typename graph_store_t::vertices_t::transaction_unique_ptr_t vertices_;
 
-    /** The half committing the edge blocks, which lands after the registries do. */
+    /** The half committing the edge blocks. */
     typename graph_store_t::half_edges_t::transaction_unique_ptr_t half_edges_;
 
 #pragma endregion Private Members

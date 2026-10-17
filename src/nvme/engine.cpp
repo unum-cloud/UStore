@@ -14,13 +14,23 @@
  *  Every write of a caller goes through a transaction of the database, the caller's or one the call commits alone, so
  *  the registry records every commit a watched read may conflict with. The catalog and the names, which no caller's
  *  transaction reaches, change straight in the store under a claim of their own, so a collection created or dropped
- *  never shows as a commit to the transactions running beside it. A call outside a transaction reads at the head.
- *  Reads resolve collections at the head, as every engine does. A walk merges the runs of one collection with its
- *  write buffer and, inside a transaction, with the transaction's own writes.
+ *  never shows as a commit to the transactions running beside it. A call outside a transaction reads at the head, or
+ *  at its snapshot's stamp. Reads resolve collections at the head, as every engine does, but through a snapshot, which
+ *  resolves them as they stood at its stamp. A walk merges the runs of one collection with its write buffer and,
+ *  inside a transaction, with the transaction's own writes.
+ *
+ *  Isolation, as delivered. Every read of a transaction answers at the stamp it started at, a walk included, so it
+ *  sees one committed state whatever it watches. Watching keys, the default, a commit checks every key it read or
+ *  wrote, and every range it walked, the keys it did not find included, against every commit since its start, all
+ *  under the one write path, and lands under a stamp drawn after that check: committed transactions are strictly
+ *  serializable in the order of their stamps. Watching nothing, a transaction still reads one snapshot, but its writes
+ *  land unchecked and the last writer wins. `describe` reports snapshot isolation, as the C ABI does for every engine
+ *  but the in-memory one.
  *
  *  A staged transaction holds the database's one claim, which every other call waits for, so a stage only checks
- *  the transaction and lets the claim go, and the commit checks it again. Snapshots are not served: a held level set
- *  stops every publication behind it, so one kept across calls would stall the writers until it is freed.
+ *  the transaction and lets the claim go, and the commit checks it again. A snapshot is a stamp pinned in the store's
+ *  ledger and holds no level set: every read through it answers the newest version at or below that stamp, which the
+ *  write buffers and the merges keep for as long as the pin lives, so a snapshot kept across calls stalls no writer.
  */
 
 #include <cstddef> // `std::size_t`
@@ -183,6 +193,13 @@ struct database_state_t : handle_t {
     /** Held by whoever changes the catalog and the names, so a name is checked and taken in one step. */
     std::int32_t catalog_claim = 0;
 
+    /** Snapshots not yet freed, through `fu::preferred_atomic_ref`. */
+    std::size_t open_snapshots = 0;
+
+    /** Collections the catalog no longer lists whose runs an open snapshot may still read, dropped once the last
+     *  snapshot is freed; guarded by @c catalog_claim. */
+    st::basic_vector<ustore_collection_id_t> retired_collections;
+
     database_state_t() noexcept : handle_t {&engine_k} {}
     database_state_t(database_state_t const&) = delete;
     database_state_t& operator=(database_state_t const&) = delete;
@@ -211,6 +228,18 @@ struct transaction_handle_t : handle_t {
         : handle_t {&engine_k}, state(owner), held(std::move(opened)) {}
 };
 
+/** A snapshot handle of the C ABI, pinning the stamp it reads at in the store's ledger until freed. */
+struct snapshot_handle_t : handle_t {
+
+    /** The database the snapshot reads. */
+    database_state_t& state;
+
+    /** The pin, which keeps every version a read at its stamp needs out of the reach of a flush and a merge. */
+    stamp_pin_t pin;
+
+    explicit snapshot_handle_t(database_state_t& owner) noexcept : handle_t {&engine_k}, state(owner) {}
+};
+
 /** Holds the catalog of one database for the life of the guard, waiting while another change holds it. */
 class catalog_guard_t {
     std::int32_t& claim_;
@@ -235,14 +264,10 @@ database_state_t& state_of(arguments_type_ const& arguments) noexcept {
     return *handle_cast<database_state_t>(database_of(arguments));
 }
 
-/** Opens a transaction of @p state whose buffer @p shape bounds, under an identifier no live one holds. */
+/** Opens a transaction of @p state whose buffer @p shape bounds. */
 inline expected<store_transaction_pointer_t> begin_transaction(database_state_t& state,
                                                                transaction_config_t const& shape) noexcept {
-    for (;;) {
-        transaction_id_t const id = uuid_to_u64(uuid_generator());
-        if (id == invalid_transaction_id_k || state.store->has_transaction(id)) continue;
-        return state.store->create_transaction(id, shape);
-    }
+    return state.store->create_transaction(shape);
 }
 
 #pragma endregion Handles
@@ -263,6 +288,9 @@ struct access_t {
 
     /** Where the call keeps the values it read until it exports them. */
     ustore_arena_t scratch = nullptr;
+
+    /** The stamp a call outside a transaction reads at: a snapshot's, or the head's. */
+    transaction_stamp_t stamp = head_stamp_k;
 };
 
 /** The schedule the watches of a call asking for @p watch take. */
@@ -270,11 +298,20 @@ constexpr watch_schedule_t schedule_of(ustore_watch_t watch) noexcept {
     return watch == ustore_watch_keys_k ? watch_schedule_t::on_commit_k : watch_schedule_t::never_k;
 }
 
-/** The access of a call reading through @p view, at the head when it names no transaction. */
+/** The access of a call reading through @p view: its transaction, its snapshot's stamp, or the head. */
 inline access_t access_of(database_state_t& state, view_t const& view) noexcept {
+    if (view.snapshot)
+        return {state, nullptr, watch_schedule_t::never_k, view.scratch,
+                handle_cast<snapshot_handle_t>(view.snapshot)->pin.stamp()};
     if (!view.transaction) return {state, nullptr, watch_schedule_t::never_k, view.scratch};
     store_transaction_t* const transaction = handle_cast<transaction_handle_t>(view.transaction)->held.get();
     return {state, transaction, schedule_of(view.watch), view.scratch};
+}
+
+/** Refuses a read of @p access at a stamp whose history the memory budget let go, which only a snapshot reads at. */
+inline status_t check_history(access_t const& access) noexcept {
+    if (access.stamp >= access.state.store->ledger().refused_below()) return {};
+    return {status_code_t::write_conflict_k, "The history this snapshot reads at outgrew the memory budget"};
 }
 
 /** Watches @p keys of @p collection through the transaction of @p access, when it watches at all. */
@@ -282,6 +319,14 @@ inline status_t watch_keys(access_t const& access, collection_id_t collection,
                            std::span<stored_key_t const> keys) noexcept {
     if (!access.transaction || access.schedule == watch_schedule_t::never_k || keys.empty()) return {};
     return access.transaction->watch_more<watch_schedule_t::on_commit_k>(collection, keys);
+}
+
+/** Watches every key of @p collection from @p lower to @p upper through the transaction of @p access, when it watches
+ *  at all, so a commit landing a key the walk over them did not find conflicts too. */
+inline status_t watch_range(access_t const& access, collection_id_t collection, stored_key_t lower,
+                            stored_key_t upper) noexcept {
+    if (!access.transaction || access.schedule == watch_schedule_t::never_k) return {};
+    return access.transaction->watch_range<watch_schedule_t::on_commit_k>(collection, lower, upper);
 }
 
 /** Copies @p size bytes into the scratch of @p access through @p copy, answering the present value they hold. */
@@ -307,6 +352,7 @@ inline expected<value_view_t> read_value(access_t const& access, collection_id_t
                                          stored_key_t key) noexcept {
     store_t& store = *access.state.store;
     store_transaction_t* const transaction = access.transaction;
+    if (status_t const kept = check_history(access); kept.failed()) return kept;
     if (transaction) {
         write_buffer_status_t const own = transaction->uncommitted(collection, key);
         if (own == write_buffer_status_t::removed_k) return value_view_t {};
@@ -326,13 +372,13 @@ inline expected<value_view_t> read_value(access_t const& access, collection_id_t
     for (std::size_t attempt = 0; attempt != read_attempts_k; ++attempt) {
         stored_value_size_t size = 0;
         status_t const measured = transaction ? transaction->stored_value_size_committed(collection, key, size)
-                                              : store.stored_value_size(collection, key, size);
+                                              : store.stored_value_size(collection, key, size, access.stamp);
         bool const missing = measured == status_code_t::not_found_k;
         if (measured.failed() && !missing) return measured;
         if (!missing) {
             expected<value_view_t> read = copied_value(access, size, [&](std::span<byte_t> into) noexcept {
                 stored_value_size_t copied = 0;
-                if (!transaction) return store.select(collection, key, into, copied);
+                if (!transaction) return store.select(collection, key, into, copied, access.stamp);
                 if (access.schedule == watch_schedule_t::never_k)
                     return transaction->select_committed<watch_schedule_t::never_k>(collection, key, into, copied);
                 return transaction->select_committed<watch_schedule_t::on_commit_k>(collection, key, into, copied);
@@ -382,11 +428,14 @@ struct own_write_t {
 template <typename visitor_type_>
 status_t walk(access_t const& access, collection_id_t collection, stored_key_t from, visitor_type_&& visitor) noexcept {
     store_t const& store = *access.state.store;
+    if (status_t const kept = check_history(access); kept.failed()) return kept;
     if (!access.transaction)
-        return store.scan(collection, from,
-                          [&](stored_key_t key, select_result_t state, stored_value_size_t size) noexcept {
-                              return state != select_result_t::success_k || visitor(key, size);
-                          });
+        return store.scan(
+            collection, from,
+            [&](stored_key_t key, select_result_t state, stored_value_size_t size) noexcept {
+                return state != select_result_t::success_k || visitor(key, size);
+            },
+            access.stamp);
 
     st::basic_vector<own_write_t, arena_allocator<own_write_t>> own {{access.scratch}};
     status_t listed;
@@ -406,15 +455,18 @@ status_t walk(access_t const& access, collection_id_t collection, stored_key_t f
         if (write.status == write_buffer_status_t::found_k) carries_on = visitor(write.key, write.size);
         return carries_on;
     };
-    status_t const walked = store.scan(collection, from,
-                                       [&](stored_key_t key, select_result_t state, stored_value_size_t size) noexcept {
-                                           for (; next != own.size() && own[next].key < key; ++next)
-                                               if (!emit_own(own[next])) return false;
-                                           if (next != own.size() && own[next].key == key) return emit_own(own[next++]);
-                                           if (state != select_result_t::success_k) return true;
-                                           carries_on = visitor(key, size);
-                                           return carries_on;
-                                       });
+    // The store's side is what the transaction started at, which its reads of single keys answer too
+    status_t const walked = store.scan(
+        collection, from,
+        [&](stored_key_t key, select_result_t state, stored_value_size_t size) noexcept {
+            for (; next != own.size() && own[next].key < key; ++next)
+                if (!emit_own(own[next])) return false;
+            if (next != own.size() && own[next].key == key) return emit_own(own[next++]);
+            if (state != select_result_t::success_k) return true;
+            carries_on = visitor(key, size);
+            return carries_on;
+        },
+        access.transaction->start_stamp());
     if (walked.failed()) return walked;
     for (; carries_on && next != own.size(); ++next) emit_own(own[next]);
     return {};
@@ -525,26 +577,29 @@ inline expected<catalog_entry_t> read_catalog_entry(value_view_t held) noexcept 
     return catalog_entry_t {static_cast<ustore_modality_t>(*held.begin()), {held.c_str() + 1, held.size() - 1}};
 }
 
-/** What the catalog records of @p collection at the head, refusing one it does not list, the reserved ones included. */
+/** What the catalog records of @p collection at @p stamp, refusing one it does not list, the reserved ones included. */
 inline expected<catalog_entry_t> look_up(database_state_t& state, ustore_arena_t scratch,
-                                         ustore_collection_id_t const& collection) noexcept {
+                                         ustore_collection_id_t const& collection,
+                                         transaction_stamp_t stamp = head_stamp_k) noexcept {
     if (collection == ustore_collection_main_k) return catalog_entry_t {};
-    access_t const head {state, nullptr, watch_schedule_t::never_k, scratch};
-    auto [held, read_status] = read_value(head, catalog_collection_k, stored_of(collection.uuid));
+    access_t const listed {state, nullptr, watch_schedule_t::never_k, scratch, stamp};
+    auto [held, read_status] = read_value(listed, catalog_collection_k, stored_of(collection.uuid));
     if (read_status.failed()) return read_status;
     if (!held) return status_t {status_code_t::not_found_k, "No such collection"};
     return read_catalog_entry(held);
 }
 
-/** Refuses a batch addressing a collection the catalog does not list or one keyed otherwise than @p keying, looking
- *  each run of tasks on one collection up once. */
-inline status_t resolve_runs(database_state_t& state, ustore_arena_t scratch,
+/** Refuses a batch addressing a collection the catalog does not list, as @p view reads it, or one keyed otherwise
+ *  than @p keying, looking each run of tasks on one collection up once. */
+inline status_t resolve_runs(database_state_t& state, view_t const& view,
                              strided_iterator<ustore_collection_id_t const> collections, std::size_t count,
                              keying_t keying) noexcept {
+    transaction_stamp_t const stamp = view.snapshot ? handle_cast<snapshot_handle_t>(view.snapshot)->pin.stamp()
+                                                    : head_stamp_k;
     for (std::size_t index = 0; index != count; ++index) {
         if (index != 0 && collections && collections[index] == collections[index - 1]) continue;
         ustore_collection_id_t const collection = collections ? collections[index] : ustore_collection_main_k;
-        auto [entry, look_up_status] = look_up(state, scratch, collection);
+        auto [entry, look_up_status] = look_up(state, view.scratch, collection, stamp);
         if (look_up_status.failed()) return look_up_status;
         if (keying_of(entry.modality) != keying)
             return {status_code_t::invalid_argument_k,
@@ -774,10 +829,11 @@ struct listed_collection_t {
     catalog_entry_t entry;
 };
 
-/** Collects every collection the catalog lists at the head into @p listed. */
+/** Collects every collection the catalog lists at @p stamp into @p listed. */
 template <typename listed_type_>
-status_t list_catalog(database_state_t& state, ustore_arena_t scratch, listed_type_& listed) noexcept {
-    access_t const head {state, nullptr, watch_schedule_t::never_k, scratch};
+status_t list_catalog(database_state_t& state, ustore_arena_t scratch, listed_type_& listed,
+                      transaction_stamp_t stamp = head_stamp_k) noexcept {
+    access_t const head {state, nullptr, watch_schedule_t::never_k, scratch, stamp};
     st::basic_vector<stored_key_t, arena_allocator<stored_key_t>> keys {{scratch}};
     if (status_t const collected = collect_keys(head, catalog_collection_k, limit<stored_key_t>::min(),
                                                 std::numeric_limits<std::size_t>::max(), keys);
@@ -798,11 +854,13 @@ status_t list_catalog(database_state_t& state, ustore_arena_t scratch, listed_ty
 }
 
 /**
- *  @brief Forgets @p collection in the catalog and the names, then returns its runs to the volume.
+ *  @brief Forgets @p collection in the catalog and the names, then returns its runs to the volume, or leaves them to
+ *      the snapshots open, which still read them.
  *
  *  The catalog changes under its own claim and straight into the store, outside the registry, since no caller's
  *  transaction reads it, so a catalog change never shows as a commit a transaction's watches might collide with.
- *  The name goes first, so a crash in between leaves a listed collection without a name, never a dangling name.
+ *  The name goes first, so a crash in between leaves a listed collection without a name, never a dangling name, and a
+ *  crash with the runs still kept leaves an unlisted collection, which the next open drops.
  */
 inline status_t drop_collection(database_state_t& state, ustore_arena_t scratch,
                                 ustore_collection_id_t const& collection) noexcept {
@@ -819,8 +877,20 @@ inline status_t drop_collection(database_state_t& state, ustore_arena_t scratch,
             if (status_t const unnamed = stage_name(head, entry.name, nullptr); unnamed.failed()) return unnamed;
         if (status_t const unlisted = write_value(head, catalog_collection_k, listed, {}); unlisted.failed())
             return unlisted;
+        // A snapshot taken before the unlisting still reads the runs, which wait for the last snapshot to go
+        if (fu::preferred_atomic_ref<std::size_t> {state.open_snapshots}.load(std::memory_order_acquire) != 0 &&
+            state.retired_collections.push_back(ustore_collection_id_t {collection}) == st::status_t::success_k)
+            return {};
     }
     return state.store->drop_collection(collection);
+}
+
+/** Drops every collection a drop left for the snapshots, which the last snapshot freed no longer reads. */
+inline void drop_retired(database_state_t& state) noexcept {
+    catalog_guard_t const held {state};
+    for (ustore_collection_id_t const& collection : state.retired_collections) [[maybe_unused]]
+        status_t const dropped = state.store->drop_collection(collection);
+    state.retired_collections.clear();
 }
 
 #pragma endregion Clearing
@@ -833,7 +903,8 @@ status_t database_describe(ustore_database_describe_t const& arguments, view_t c
     if (!arguments.description) return {status_code_t::invalid_argument_k, "Need an output for the description"};
     database_state_t& state = state_of(arguments);
     *arguments.description = {
-        .capabilities = ustore_capabilities_t(ustore_capabilities_transactions_k | ustore_capabilities_collections_k),
+        .capabilities = ustore_capabilities_t(ustore_capabilities_transactions_k | ustore_capabilities_collections_k |
+                                              ustore_capabilities_snapshots_k),
         .engine = ustore_engine_nvme_k,
         .isolation = ustore_isolation_snapshot_k,
         .keys = static_cast<ustore_size_t>(state.store->population_count()),
@@ -886,12 +957,15 @@ status_t database_compact(ustore_database_compact_t const& arguments, view_t con
 
 #pragma region Collection Calls
 
-/** Implements @c ustore_collection_list as a walk of the catalog at the head. */
+/** Implements @c ustore_collection_list as a walk of the catalog at the snapshot it names or at the head. */
 status_t collection_list(ustore_collection_list_t const& arguments, view_t const& view) noexcept {
     if (!arguments.written) return {status_code_t::invalid_argument_k, "Need an output for the collections written"};
     database_state_t& state = state_of(arguments);
     st::basic_vector<listed_collection_t, arena_allocator<listed_collection_t>> listed {{view.scratch}};
-    if (status_t const collected = list_catalog(state, view.scratch, listed); collected.failed()) return collected;
+    transaction_stamp_t const stamp = view.snapshot ? handle_cast<snapshot_handle_t>(view.snapshot)->pin.stamp()
+                                                    : head_stamp_k;
+    if (status_t const collected = list_catalog(state, view.scratch, listed, stamp); collected.failed())
+        return collected;
     collection_list_outputs_t outputs {view.scratch};
     for (std::size_t index = 0; index != listed.size(); ++index) {
         catalog_entry_t const& entry = listed[index].entry;
@@ -981,7 +1055,7 @@ status_t collection_drop(ustore_collection_drop_t const& arguments, view_t const
     return compact_due(state);
 }
 
-/** Implements @c ustore_collection_find, reading the names and the catalog at the head. */
+/** Implements @c ustore_collection_find, reading the names at the snapshot it names or at the head. */
 status_t collection_find(ustore_collection_find_t const& arguments, strings_arg_t const& names,
                          view_t const& view) noexcept {
     if (!arguments.count) return {};
@@ -990,10 +1064,12 @@ status_t collection_find(ustore_collection_find_t const& arguments, strings_arg_
     database_state_t& state = state_of(arguments);
     auto [outputs, outputs_status] = collection_find_outputs_t::make(arguments);
     if (outputs_status.failed()) return outputs_status;
-    access_t const head {state, nullptr, watch_schedule_t::never_k, view.scratch};
+    // Through a snapshot the names read as they stood at its stamp, and through anything else at the head
+    access_t const named = view.snapshot ? access_of(state, view)
+                                         : access_t {state, nullptr, watch_schedule_t::never_k, view.scratch};
     for (std::size_t index = 0; index != arguments.count; ++index) {
         bool present = false;
-        auto [record, record_status] = look_up_name(head, string_of(names[index]), present);
+        auto [record, record_status] = look_up_name(named, string_of(names[index]), present);
         if (record_status.failed()) return record_status;
         outputs.assign(index, present ? record.id() : ustore_collection_main_k, record.modality(), present);
     }
@@ -1012,8 +1088,7 @@ status_t blobs_write(ustore_blobs_write_t const& arguments, strings_arg_t const&
         status.failed() || !arguments.count)
         return status;
     database_state_t& state = state_of(arguments);
-    if (status_t const resolved = resolve_runs(state, view.scratch, places.collections_begin, places.size(),
-                                               keying_t::uuids_k);
+    if (status_t const resolved = resolve_runs(state, view, places.collections_begin, places.size(), keying_t::uuids_k);
         resolved.failed())
         return resolved;
     std::size_t bytes = 0;
@@ -1037,8 +1112,7 @@ status_t blobs_remove(ustore_blobs_remove_t const& arguments, view_t const& view
         status.failed() || !arguments.count)
         return status;
     database_state_t& state = state_of(arguments);
-    if (status_t const resolved = resolve_runs(state, view.scratch, places.collections_begin, places.size(),
-                                               keying_t::uuids_k);
+    if (status_t const resolved = resolve_runs(state, view, places.collections_begin, places.size(), keying_t::uuids_k);
         resolved.failed())
         return resolved;
     return serve_write(state, view, arguments.durability, places.size(), 1, watch_schedule_t::never_k,
@@ -1059,8 +1133,7 @@ status_t blobs_read(ustore_blobs_read_t const& arguments, view_t const& view) no
     place_batch_t const places = places_of(arguments);
     if (status_t const status = validate_read(places); status.failed()) return status;
     database_state_t& state = state_of(arguments);
-    if (status_t const resolved = resolve_runs(state, view.scratch, places.collections_begin, places.size(),
-                                               keying_t::uuids_k);
+    if (status_t const resolved = resolve_runs(state, view, places.collections_begin, places.size(), keying_t::uuids_k);
         resolved.failed())
         return resolved;
     auto [outputs, outputs_status] = read_outputs_t::make(arguments, view.scratch);
@@ -1082,7 +1155,7 @@ status_t blobs_scan(ustore_blobs_scan_t const& arguments, view_t const& view) no
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     scan_batch_t const scans {collections, strided(arguments.start_keys), arguments.wanted, arguments.count};
     database_state_t& state = state_of(arguments);
-    if (status_t const resolved = resolve_runs(state, view.scratch, collections, arguments.count, keying_t::uuids_k);
+    if (status_t const resolved = resolve_runs(state, view, collections, arguments.count, keying_t::uuids_k);
         resolved.failed())
         return resolved;
     auto [outputs, outputs_status] = scan_outputs_t::make(arguments, view.scratch);
@@ -1104,6 +1177,13 @@ status_t blobs_scan(ustore_blobs_scan_t const& arguments, view_t const& view) no
         if (status_t const watched = watch_keys(access, scan.collection, std::span<stored_key_t const> {found});
             watched.failed())
             return watched;
+        // A full page covered the keys up to its last, and a short one every key up to the largest
+        stored_key_t const upper = found.size() == scan.limit && !found.empty() ? found[found.size() - 1]
+                                                                                : limit<stored_key_t>::max();
+        if (scan.limit != 0)
+            if (status_t const watched = watch_range(access, scan.collection, stored_of(scan.start_key.uuid), upper);
+                watched.failed())
+                return watched;
         if (!progress.advance(1)) return progress_cancelled_k;
     }
     return outputs.finish(arguments);
@@ -1135,7 +1215,7 @@ status_t blobs_sample(ustore_blobs_sample_t const& arguments, view_t const& view
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     sample_batch_t const samples {collections, arguments.wanted, arguments.count};
     database_state_t& state = state_of(arguments);
-    if (status_t const resolved = resolve_runs(state, view.scratch, collections, arguments.count, keying_t::uuids_k);
+    if (status_t const resolved = resolve_runs(state, view, collections, arguments.count, keying_t::uuids_k);
         resolved.failed())
         return resolved;
     auto [outputs, outputs_status] = scan_outputs_t::make(arguments, view.scratch);
@@ -1183,7 +1263,7 @@ status_t blobs_measure(ustore_blobs_measure_t const& arguments, view_t const& vi
     strided_iterator<ustore_key_t const> const start_keys = strided(arguments.start_keys);
     strided_iterator<ustore_key_t const> const end_keys = strided(arguments.end_keys);
     database_state_t& state = state_of(arguments);
-    if (status_t const resolved = resolve_runs(state, view.scratch, collections, arguments.count, keying_t::uuids_k);
+    if (status_t const resolved = resolve_runs(state, view, collections, arguments.count, keying_t::uuids_k);
         resolved.failed())
         return resolved;
     auto [outputs, outputs_status] = measure_outputs_t::make(arguments);
@@ -1202,6 +1282,9 @@ status_t blobs_measure(ustore_blobs_measure_t const& arguments, view_t const& vi
                                          return true;
                                      });
         if (walked.failed()) return walked;
+        if (status_t const watched = watch_range(access, task_collection(collections, task), lower, last);
+            watched.failed())
+            return watched;
         outputs.min_cardinalities[task] = cardinality;
         outputs.max_cardinalities[task] = cardinality;
         outputs.min_value_bytes[task] = value_bytes;
@@ -1239,7 +1322,7 @@ status_t serve_strings_write(arguments_type_ const& arguments, strings_arg_t con
                              view_t const& view) noexcept {
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     database_state_t& state = state_of(arguments);
-    if (status_t const resolved = resolve_runs(state, view.scratch, collections, arguments.count, keying_t::strings_k);
+    if (status_t const resolved = resolve_runs(state, view, collections, arguments.count, keying_t::strings_k);
         resolved.failed())
         return resolved;
     auto [tasks, tasks_status] = string_tasks(view, collections, arguments.count, texts, values);
@@ -1272,7 +1355,7 @@ status_t strings_read(ustore_strings_read_t const& arguments, strings_arg_t cons
     if (!texts) return {status_code_t::invalid_argument_k, "No strings were provided"};
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     database_state_t& state = state_of(arguments);
-    if (status_t const resolved = resolve_runs(state, view.scratch, collections, arguments.count, keying_t::strings_k);
+    if (status_t const resolved = resolve_runs(state, view, collections, arguments.count, keying_t::strings_k);
         resolved.failed())
         return resolved;
     auto [outputs, outputs_status] = read_outputs_t::make(arguments, view.scratch);
@@ -1295,7 +1378,7 @@ status_t strings_scan(ustore_strings_scan_t const& arguments, strings_arg_t cons
         return {status_code_t::invalid_argument_k, "Need outputs for the offsets and the strings"};
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     database_state_t& state = state_of(arguments);
-    if (status_t const resolved = resolve_runs(state, view.scratch, collections, arguments.count, keying_t::strings_k);
+    if (status_t const resolved = resolve_runs(state, view, collections, arguments.count, keying_t::strings_k);
         resolved.failed())
         return resolved;
     auto [outputs, outputs_status] = strings_scan_outputs_t::make(arguments, view.scratch);
@@ -1495,6 +1578,33 @@ inline status_t mount_store(database_state_t& state, database_config_t const& tr
     });
 }
 
+/** Opens the store @p resources place, every collection of it shaped as @p shape, reserving the main collection, the
+ *  catalog and the names on the first open. */
+inline expected<std::unique_ptr<database_state_t>> open_state(resources_config_t const& resources,
+                                                              database_config_t const& transactions,
+                                                              collection_config_t const& shape,
+                                                              ustore_arena_t scratch) noexcept {
+    std::unique_ptr<database_state_t> state {new (std::nothrow) database_state_t};
+    if (!state) return status_t {status_code_t::out_of_memory_k, "Failed to allocate the database"};
+    state->collection_shape = shape;
+    state->transaction_shape = transactions.default_transaction;
+    auto [opened, open_status] = open_resources(resources, uuid_t {});
+    if (open_status.failed()) return open_status;
+    state->resources = std::move(opened);
+    state->store.reset(new (std::nothrow) store_t {state->resources});
+    if (!state->store) return status_t {status_code_t::out_of_memory_k, "Failed to allocate the store"};
+    if (status_t const mounted = mount_store(*state, transactions); mounted.failed()) return mounted;
+
+    if (status_t const reserved = reserve_collection(*state, ustore_collection_main_k, "main"); reserved.failed())
+        return reserved;
+    if (status_t const reserved = reserve_collection(*state, catalog_collection_k, "catalog"); reserved.failed())
+        return reserved;
+    if (status_t const reserved = reserve_collection(*state, names_collection_k, "names"); reserved.failed())
+        return reserved;
+    if (status_t const dropped = drop_unlisted(*state, scratch); dropped.failed()) return dropped;
+    return state;
+}
+
 /** Implements @c ustore_database_open_nvme, reserving the main collection, the catalog and the names on the first
  *  open. */
 status_t open(ustore_database_open_nvme_t const& arguments, view_t const& view) noexcept {
@@ -1511,28 +1621,149 @@ status_t open(ustore_database_open_nvme_t const& arguments, view_t const& view) 
     if (exists_status.failed()) return exists_status;
     if (!exists) return {status_code_t::not_found_k, "The directory doesn't exist"};
     if (status_t const read = read_options(arguments, resources, transactions, collections); read.failed()) return read;
-
-    std::unique_ptr<database_state_t> state {new (std::nothrow) database_state_t};
-    if (!state) return {status_code_t::out_of_memory_k, "Failed to allocate the database"};
-    state->collection_shape = create_collection_config(collections);
-    state->transaction_shape = transactions.default_transaction;
-    auto [opened, open_status] = open_resources(resources, uuid_t {});
+    auto [state, open_status] = open_state(resources, transactions, create_collection_config(collections),
+                                           view.scratch);
     if (open_status.failed()) return open_status;
-    state->resources = std::move(opened);
-    state->store.reset(new (std::nothrow) store_t {state->resources});
-    if (!state->store) return {status_code_t::out_of_memory_k, "Failed to allocate the store"};
-    if (status_t const mounted = mount_store(*state, transactions); mounted.failed()) return mounted;
-
-    if (status_t const reserved = reserve_collection(*state, ustore_collection_main_k, "main"); reserved.failed())
-        return reserved;
-    if (status_t const reserved = reserve_collection(*state, catalog_collection_k, "catalog"); reserved.failed())
-        return reserved;
-    if (status_t const reserved = reserve_collection(*state, names_collection_k, "names"); reserved.failed())
-        return reserved;
-    if (status_t const dropped = drop_unlisted(*state, view.scratch); dropped.failed()) return dropped;
     *arguments.database = c_handle<ustore_database_t>(state.release());
     return {};
 }
+
+#pragma endregion Lifetime
+
+#pragma region Snapshot Calls
+
+/** Implements @c ustore_snapshot_init, pinning the newest published stamp in the store's ledger. */
+status_t snapshot_init(ustore_snapshot_init_t const& arguments, view_t const&) noexcept {
+    if (!arguments.snapshot) return {status_code_t::invalid_argument_k, "Need an output for the snapshot"};
+    database_state_t& state = state_of(arguments);
+    auto* const handle = new (std::nothrow) snapshot_handle_t(state);
+    if (!handle) return {status_code_t::out_of_memory_k, "Failed to allocate the snapshot"};
+    transaction_stamp_t const stamp = state.store->ledger().pin_reader(handle->pin);
+    fu::preferred_atomic_ref<std::size_t> {state.open_snapshots}.fetch_add(1, std::memory_order_release);
+    if (arguments.read_stamp) *arguments.read_stamp = static_cast<ustore_stamp_t>(stamp);
+    *arguments.snapshot = c_handle<ustore_snapshot_t>(handle);
+    return {};
+}
+
+/** Copies every pair of @p collection that @p access reads into @p target, under the same identifier and bounds. */
+inline status_t save_collection(access_t const& access, collection_ids_t const& collection, database_state_t& target,
+                                progress_t& progress) noexcept {
+    store_t& store = *access.state.store;
+    if (!target.store->has_collection(collection.id)) {
+        collection_config_t config;
+        if (status_t const shaped = store.collection_config(collection.id, config); shaped.failed()) return shaped;
+        if (status_t const made = target.store->create_collection(collection.id, collection.name.view(), config);
+            made.failed())
+            return made;
+    }
+
+    // One window of keys is one write buffer of the target, which it lands without a flush in between
+    collection_config_t config;
+    if (status_t const shaped = target.store->collection_config(collection.id, config); shaped.failed()) return shaped;
+    std::size_t const window = config.write_buffer_max_elements;
+    st::basic_vector<stored_key_t> keys;
+    st::basic_vector<byte_t> value;
+    stored_key_t from = limit<stored_key_t>::min();
+    for (;;) {
+        keys.clear();
+        if (status_t const collected = collect_keys(access, collection.id, from, window, keys); collected.failed())
+            return collected;
+        for (stored_key_t const& key : keys) {
+            stored_value_size_t size = 0;
+            if (status_t const measured = store.stored_value_size(collection.id, key, size, access.stamp);
+                measured.failed())
+                return measured;
+            if (value.resize(size) != st::status_t::success_k)
+                return {status_code_t::out_of_memory_k, "Failed to hold a value the save copies"};
+            stored_value_size_t copied = 0;
+            if (status_t const read = store.select(collection.id, key, std::span<byte_t> {value}, copied, access.stamp);
+                read.failed())
+                return read;
+            if (status_t const written = target.store->insert(collection.id, key,
+                                                              stored_value_view_t {value.data(), copied});
+                written.failed())
+                return written;
+            if (!progress.advance(sizeof(stored_key_t) + copied)) return progress_cancelled_k;
+        }
+        if (keys.size() < window) return {};
+        from = keys[keys.size() - 1];
+        if (!advance_key(from)) return {};
+    }
+}
+
+/**
+ *  @brief Implements @c ustore_snapshot_save as a database of this engine in the directory it names, holding every
+ *      collection as the snapshot reads it.
+ *
+ *  A save its progress cancels, or one that fails, removes the volume it wrote and the directories it made, so a retry
+ *  at the same path saves afresh.
+ */
+status_t snapshot_save(ustore_snapshot_save_t const& arguments, view_t const& view) noexcept {
+    if (!view.snapshot) return {status_code_t::invalid_argument_k, "A save reads through a snapshot"};
+    database_state_t& source = state_of(arguments);
+    access_t const access = access_of(source, view);
+    if (status_t const kept = check_history(access); kept.failed()) return kept;
+
+    ustore_database_open_nvme_t saving {};
+    saving.directory = arguments.path;
+    if (!saving.directory.length) return {status_code_t::invalid_argument_k, "A save needs a directory"};
+    resources_config_t resources;
+    database_config_t transactions;
+    transactions.default_transaction = source.transaction_shape;
+    user_collection_config_t collections = engine_collection_defaults();
+    if (status_t const read = read_directories(saving, resources); read.failed()) return read;
+    if (status_t const read = read_options(saving, resources, transactions, collections); read.failed()) return read;
+    auto [existed, exists_status] = directory_exists(resources.directory.c_str());
+    if (exists_status.failed()) return exists_status;
+
+    st::basic_vector<collection_ids_t> const held = source.store->list_collections();
+    ustore_size_t total = 0;
+    if (arguments.progress)
+        for (collection_ids_t const& collection : held)
+            if (status_t const measured = walk(access, collection.id, limit<stored_key_t>::min(),
+                                               [&](stored_key_t, stored_value_size_t size) noexcept {
+                                                   total += sizeof(stored_key_t) + size;
+                                                   return true;
+                                               });
+                measured.failed())
+                return measured;
+    progress_t progress {arguments.progress, arguments.progress_state, total};
+
+    status_t saved;
+    {
+        auto [target, open_status] = open_state(resources, transactions, source.collection_shape, view.scratch);
+        saved = open_status;
+        for (collection_ids_t const& collection : held)
+            if (saved.succeeded()) saved = save_collection(access, collection, *target, progress);
+        if (saved.succeeded()) saved = target->store->flush();
+        if (saved.succeeded()) return {};
+    }
+
+    // The store is closed by now, so the volume file it kept, and the directories the open made, go with it
+    for (data_directory_config_t const& directory : resources.data_directories) {
+        char path[path_max_bytes_k];
+        if (join_path(directory.path.c_str(), volume_file_name_k, path).succeeded()) [[maybe_unused]]
+            status_t const removed = remove_file(path);
+        [[maybe_unused]] status_t const emptied = remove_directory(directory.path.c_str());
+    }
+    if (!existed) [[maybe_unused]]
+        status_t const emptied = remove_directory(resources.directory.c_str());
+    return saved;
+}
+
+/** Frees @p snapshot, letting go of the stamp it pinned, and with the last one the runs of the collections dropped
+ *  meanwhile. */
+void snapshot_free(ustore_snapshot_t snapshot) noexcept {
+    auto* const handle = handle_cast<snapshot_handle_t>(snapshot);
+    database_state_t& state = handle->state;
+    delete handle;
+    if (fu::preferred_atomic_ref<std::size_t> {state.open_snapshots}.fetch_sub(1, std::memory_order_acq_rel) == 1)
+        drop_retired(state);
+}
+
+#pragma endregion Snapshot Calls
+
+#pragma region Lifetime
 
 /** Frees @p transaction, retiring it from the registry. */
 void transaction_free(ustore_transaction_t transaction) noexcept {
@@ -1564,6 +1795,8 @@ engine_t const engine_k {
     .database_describe = &database_describe,
     .database_clear = &database_clear,
     .database_compact = &database_compact,
+    .snapshot_init = &snapshot_init,
+    .snapshot_save = &snapshot_save,
     .collection_list = &collection_list,
     .collection_create = &collection_create,
     .collection_find = &collection_find,
@@ -1592,6 +1825,7 @@ engine_t const engine_k {
     .strings_read = &strings_read,
     .strings_scan = &strings_scan,
     .transaction_free = &transaction_free,
+    .snapshot_free = &snapshot_free,
     .database_free = &database_free,
 };
 

@@ -13,7 +13,7 @@ Engines aim for the highest isolation `ram` delivers, each reports the level its
 | `ram`   | `src/ram/`             | reference, in memory  | always       | `strict_serializable` or `snapshot`    |
 | RocksDB | `src_oracles/rocksdb/` | third-party key-value | optional     | start snapshot, validated when staging |
 | LevelDB | `src_oracles/leveldb/` | third-party key-value | optional     | snapshot reads, no transactions        |
-| NVMe    | `src/nvme/`            | hyper-converged       | v1 target    | optimistic, `ram`'s levels in v1       |
+| NVMe    | `src/nvme/`            | hyper-converged       | v1 target    | start snapshot, validated by stamps    |
 
 ## RAM
 
@@ -72,7 +72,7 @@ A save copies the snapshot into a new database a memtable-sized batch at a time,
 
 `src/nvme/` is the hyper-converged engine, and the one UStore's hardware paths serve.
 A `database` holds `collection`s, each an `lsm_tree` of `lsm_level`s whose `lsm_sorted_run` files open with a `sorted_run_index` of `key_slot`s ahead of their `stored_value`s, with optimistic transactions.
-`src/nvme/engine.cpp` serves every slot of `engine_t` the RAM engine serves but the snapshots, which answer `ustore_status_unsupported_k`, since a level set held across calls would stall every publication behind it.
+`src/nvme/engine.cpp` serves every slot of `engine_t` the RAM engine serves, its snapshots as stamps pinned in the database's commit ledger.
 Every collection of the C ABI is one collection of the database under its UUID, keyed by the 16 bytes of `ustore_key_t`, and documents and graphs live in values through `src/docs.cpp` and `src/graph.cpp`.
 Its catalog maps every collection onto its modality and name, and a strings collection and the names file their strings in the buckets of `include/ustore/strings/string_keys.hpp`, sorted runs of strings under a key of their leading 15 bytes and their length.
 `src/nvme/graph_store.hpp` serves the graph calls over the graph store of `include/ustore/graph/nvme_graph.hpp`, whose transactions are its own, so it stays beside the engine's table.

@@ -41,9 +41,12 @@ class write_buffer {
      *  writers may push @c next_stored_value_offset_ past the 32-bit range before the capacity check. */
     using stored_value_offset_in_buffer_t = std::size_t;
 
+    /** Where one written value sits, or that the key was removed, and from when a transaction watches the key for
+     *  another commit writing it, @c invalid_transaction_stamp_k when it does not. */
     struct stored_value_place_t {
         stored_value_offset_in_buffer_t offset;
         stored_value_size_t size;
+        transaction_stamp_t watch_stamp = invalid_transaction_stamp_k;
     };
 
     using stored_key_t = stored_key_;
@@ -87,10 +90,17 @@ class write_buffer {
     inline void select(stored_value_location_ const& location, stored_value_span_t stored_value,
                        notifier_t notifier) const noexcept;
 
-    inline status_t add(stored_key_t stored_key, stored_value_view_t stored_value) noexcept;
-    template <typename serializable_stored_value_>
-    inline status_t add(stored_key_t stored_key, serializable_stored_value_ const& stored_value) noexcept;
-    inline status_t mark_as_removed(stored_key_t stored_key) noexcept;
+    /** Writes @p stored_value under @p stored_key, watched from @p watch_stamp, which only lowers the stamp an
+     *  earlier write of the key took. */
+    inline status_t add(stored_key_t stored_key, stored_value_view_t stored_value,
+                        transaction_stamp_t watch_stamp = invalid_transaction_stamp_k) noexcept;
+
+    /** Writes a removal of @p stored_key, watched from @p watch_stamp as @c add is. */
+    inline status_t mark_as_removed(stored_key_t stored_key,
+                                    transaction_stamp_t watch_stamp = invalid_transaction_stamp_k) noexcept;
+
+    /** Moves every watched write's watch to @p watch_stamp, for a transaction started over with its writes kept. */
+    inline void rescope_watches(transaction_stamp_t watch_stamp) noexcept;
 #pragma endregion Interface Methods
 
 #pragma region Batch Methods
@@ -119,6 +129,10 @@ class write_buffer {
 
 #pragma region Private Members
   private:
+
+    /** The earlier of @p watch_stamp and the watch an earlier write of @p stored_key took. */
+    inline transaction_stamp_t earlier_watch_(stored_key_t stored_key, transaction_stamp_t watch_stamp) const noexcept;
+
     resources_shared_ptr_t resources_;
     std::size_t capacity_bytes_ = 0;
     std::size_t elements_max_count_ = 0;
@@ -328,7 +342,8 @@ inline void write_buffer<stored_key_>::select(stored_value_location_ const& loca
 }
 
 template <typename stored_key_>
-inline status_t write_buffer<stored_key_>::add(stored_key_t stored_key, stored_value_view_t stored_value) noexcept {
+inline status_t write_buffer<stored_key_>::add(stored_key_t stored_key, stored_value_view_t stored_value,
+                                               transaction_stamp_t watch_stamp) noexcept {
 
     auto status = check_stored_value(stored_key, stored_value.size());
     if (status.failed()) return status;
@@ -344,43 +359,41 @@ inline status_t write_buffer<stored_key_>::add(stored_key_t stored_key, stored_v
     }
     else stored_value_offset = empty_stored_value_offset_k;
     stored_values.emplace(stored_key,
-                          stored_value_place_t {stored_value_offset, stored_value_size_t(stored_value.size())},
+                          stored_value_place_t {stored_value_offset, stored_value_size_t(stored_value.size()),
+                                                earlier_watch_(stored_key, watch_stamp)},
                           st::assume_reserved);
 
     return status_t {};
 }
 
 template <typename stored_key_>
-template <typename serializable_stored_value_>
-inline status_t write_buffer<stored_key_>::add(stored_key_t stored_key,
-                                               serializable_stored_value_ const& stored_value) noexcept {
-
-    stored_value_size_t serialized_size = storage_requirements(stored_value);
-    auto status = check_stored_value(stored_key, serialized_size);
-    if (status.failed()) return status;
-
-    if (!can_fit(1, serialized_size)) [[unlikely]]
-        return status_t {status_code_t::capacity_exhausted_k, "Cache is full"};
-
-    stored_value_offset_in_buffer_t stored_value_offset = 0;
-    stored_value_offset = next_stored_value_offset_;
-    next_stored_value_offset_ += serialized_size;
-
-    status = save(stored_value, bytes_span_t {stored_values_buffer.data() + stored_value_offset, serialized_size});
-    if (status.failed()) return status;
-    stored_values.emplace(stored_key, stored_value_place_t {stored_value_offset, serialized_size}, st::assume_reserved);
-
-    return status_t {};
-}
-
-template <typename stored_key_>
-inline status_t write_buffer<stored_key_>::mark_as_removed(stored_key_t stored_key) noexcept {
+inline status_t write_buffer<stored_key_>::mark_as_removed(stored_key_t stored_key,
+                                                           transaction_stamp_t watch_stamp) noexcept {
 
     if (!can_fit(1, 0)) [[unlikely]]
         return status_t {status_code_t::capacity_exhausted_k, "Cache is full"};
 
-    stored_values.emplace(stored_key, stored_value_place_t {tombstone_offset_k, 0}, st::assume_reserved);
+    stored_values.emplace(stored_key,
+                          stored_value_place_t {tombstone_offset_k, 0, earlier_watch_(stored_key, watch_stamp)},
+                          st::assume_reserved);
     return status_t {};
+}
+
+template <typename stored_key_>
+inline void write_buffer<stored_key_>::rescope_watches(transaction_stamp_t watch_stamp) noexcept {
+    [[maybe_unused]] st::status_t const walked = stored_values.for_each([&](auto& entry) noexcept {
+        stored_value_place_t& place = entry.value_ref();
+        if (place.watch_stamp != invalid_transaction_stamp_k) place.watch_stamp = watch_stamp;
+    });
+}
+
+template <typename stored_key_>
+inline transaction_stamp_t write_buffer<stored_key_>::earlier_watch_(stored_key_t stored_key,
+                                                                     transaction_stamp_t watch_stamp) const noexcept {
+    stored_values.probe_to_find(stored_key, [&](auto const& entry) noexcept {
+        watch_stamp = std::min(watch_stamp, entry.value().watch_stamp);
+    });
+    return watch_stamp;
 }
 
 template <typename stored_key_>

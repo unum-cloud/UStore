@@ -41,13 +41,8 @@ using namespace unum::ustore::utilities;
 /** The numbers every case mounts with: channels for a compaction to hold two, the case one, and spares. */
 constexpr fixture_config_t transactions_config_k {.shared_io_channels = 6};
 
-/**
- *  @brief Keys every case writes, split in halves between transactions.
- *
- *  The commit record folds keys onto 65536 slots and refuses a commit whose key shares a slot with one written
- *  since it started, so two disjoint halves stay clear of each other only while they are this small.
- */
-constexpr std::size_t population_k = 128;
+/** Keys every case writes, split in halves between transactions, whose disjoint halves never conflict. */
+constexpr std::size_t population_k = 1000;
 
 /** Every this many values is empty in the layouts whose values vary in width. */
 constexpr std::size_t empty_value_step_k = 10;
@@ -352,7 +347,7 @@ template <watch_schedule_t schedule_ = watch_schedule_t::default_k, typename sou
 
 #pragma region Cases
 
-/** A transaction commits and rolls back with nothing in it, its ID is refused twice, and freed with it. */
+/** A transaction commits and rolls back with nothing in it, and pins its start stamp only while it lives. */
 template <typename layout_type_, typename mount_type_>
 std::size_t create_transaction(mount_type_ const& mount) {
     using types_t = transactions_types<layout_type_, typename mount_type_::fixture_t>;
@@ -362,7 +357,7 @@ std::size_t create_transaction(mount_type_ const& mount) {
     if (!stack) return failures;
     auto& store = *(*stack)->store;
 
-    expected<typename types_t::transaction_pointer_t> first = store.create_transaction(1);
+    expected<typename types_t::transaction_pointer_t> first = store.create_transaction();
     failures += expect(first.has_value());
     if (!first) return failures;
     (*first)->rollback();
@@ -370,16 +365,14 @@ std::size_t create_transaction(mount_type_ const& mount) {
     failures += expect((*first)->commit().succeeded());
     (*first)->rollback();
 
-    expected<typename types_t::transaction_pointer_t> second = store.create_transaction(2);
+    // A live transaction pins the stamp it started at, and gives it back when it dies.
+    expected<typename types_t::transaction_pointer_t> second = store.create_transaction();
     failures += expect(second.has_value());
-    failures += expect(store.has_transaction(2));
-    expected<typename types_t::transaction_pointer_t> repeated = store.create_transaction(2);
-    failures += expect(!repeated.has_value());
-
-    // Once the transaction holding an ID dies, the ID is free again.
+    failures += expect_eq(store.ledger().newest_reader(), store.ledger().published());
+    if (first) first->reset();
     if (second) second->reset();
-    failures += expect(!store.has_transaction(2));
-    expected<typename types_t::transaction_pointer_t> reborn = store.create_transaction(2);
+    failures += expect_eq(store.ledger().newest_reader(), unwritten_stamp_k);
+    expected<typename types_t::transaction_pointer_t> reborn = store.create_transaction();
     failures += expect(reborn.has_value());
     return failures;
 }
@@ -394,8 +387,8 @@ std::size_t create_transactions(mount_type_ const& mount) {
     if (!stack) return failures;
     auto& store = *(*stack)->store;
 
-    expected<typename types_t::transaction_pointer_t> first = store.create_transaction(1);
-    expected<typename types_t::transaction_pointer_t> second = store.create_transaction(2);
+    expected<typename types_t::transaction_pointer_t> first = store.create_transaction();
+    expected<typename types_t::transaction_pointer_t> second = store.create_transaction();
     failures += expect(first.has_value());
     failures += expect(second.has_value());
     if (!first || !second) return failures;
@@ -418,7 +411,7 @@ std::size_t insert_by_one_transaction(mount_type_ const& mount) {
     io_channel_t& channel = (*stack)->channel();
     model_t model;
     failures += plan_model<layout_type_>(store, model);
-    expected<typename types_t::transaction_pointer_t> changing = store.create_transaction(1);
+    expected<typename types_t::transaction_pointer_t> changing = store.create_transaction();
     failures += expect(changing.has_value());
     if (failures != 0) return failures;
     constexpr std::size_t half_k = population_k / 2;
@@ -452,8 +445,8 @@ std::size_t insert_by_two_transactions(mount_type_ const& mount) {
     io_channel_t& channel = (*stack)->channel();
     model_t model;
     failures += plan_model<layout_type_>(store, model);
-    expected<typename types_t::transaction_pointer_t> first = store.create_transaction(1);
-    expected<typename types_t::transaction_pointer_t> second = store.create_transaction(2);
+    expected<typename types_t::transaction_pointer_t> first = store.create_transaction();
+    expected<typename types_t::transaction_pointer_t> second = store.create_transaction();
     failures += expect(first.has_value() && second.has_value());
     if (failures != 0) return failures;
     constexpr std::size_t half_k = population_k / 2;
@@ -482,8 +475,8 @@ std::size_t insert_by_two_intersected_transactions(mount_type_ const& mount) {
     io_channel_t& channel = (*stack)->channel();
     model_t model;
     failures += plan_model<layout_type_>(store, model);
-    expected<typename types_t::transaction_pointer_t> first = store.create_transaction(1);
-    expected<typename types_t::transaction_pointer_t> second = store.create_transaction(2);
+    expected<typename types_t::transaction_pointer_t> first = store.create_transaction();
+    expected<typename types_t::transaction_pointer_t> second = store.create_transaction();
     failures += expect(first.has_value() && second.has_value());
     if (failures != 0) return failures;
     constexpr std::size_t half_k = population_k / 2;
@@ -526,7 +519,7 @@ std::size_t remove_by_one_transaction(mount_type_ const& mount) {
     failures += plan_model<layout_type_>(store, model);
     failures += preload_range(store, model, 0, population_k);
     model.present(0, population_k);
-    expected<typename types_t::transaction_pointer_t> changing = store.create_transaction(1);
+    expected<typename types_t::transaction_pointer_t> changing = store.create_transaction();
     failures += expect(changing.has_value());
     if (failures != 0) return failures;
     constexpr std::size_t half_k = population_k / 2;
@@ -562,8 +555,8 @@ std::size_t remove_by_two_transactions(mount_type_ const& mount) {
     failures += plan_model<layout_type_>(store, model);
     failures += preload_range(store, model, 0, population_k);
     model.present(0, population_k);
-    expected<typename types_t::transaction_pointer_t> first = store.create_transaction(1);
-    expected<typename types_t::transaction_pointer_t> second = store.create_transaction(2);
+    expected<typename types_t::transaction_pointer_t> first = store.create_transaction();
+    expected<typename types_t::transaction_pointer_t> second = store.create_transaction();
     failures += expect(first.has_value() && second.has_value());
     if (failures != 0) return failures;
     constexpr std::size_t half_k = population_k / 2;
@@ -594,8 +587,8 @@ std::size_t remove_by_two_intersected_transactions(mount_type_ const& mount) {
     failures += plan_model<layout_type_>(store, model);
     failures += preload_range(store, model, 0, population_k);
     model.present(0, population_k);
-    expected<typename types_t::transaction_pointer_t> first = store.create_transaction(1);
-    expected<typename types_t::transaction_pointer_t> second = store.create_transaction(2);
+    expected<typename types_t::transaction_pointer_t> first = store.create_transaction();
+    expected<typename types_t::transaction_pointer_t> second = store.create_transaction();
     failures += expect(first.has_value() && second.has_value());
     if (failures != 0) return failures;
     constexpr std::size_t half_k = population_k / 2;
@@ -628,8 +621,7 @@ std::size_t insert_by_two_concurrent_transactions(mount_type_ const& mount) {
 
     std::size_t worker_failures[2] = {0, 0};
     auto work = [&](std::size_t worker) noexcept {
-        expected<typename types_t::transaction_pointer_t> changing = store.create_transaction(
-            static_cast<transaction_id_t>(worker + 1));
+        expected<typename types_t::transaction_pointer_t> changing = store.create_transaction();
         worker_failures[worker] += expect(changing.has_value());
         if (!changing) return;
         std::size_t const first = worker == 0 ? 0 : half_k;
@@ -661,8 +653,8 @@ std::size_t watch_transactions(mount_type_ const& mount) {
     failures += plan_model<layout_type_>(store, model);
     failures += preload_range(store, model, 0, population_k);
     model.present(0, population_k);
-    expected<typename types_t::transaction_pointer_t> first = store.create_transaction(1);
-    expected<typename types_t::transaction_pointer_t> second = store.create_transaction(2);
+    expected<typename types_t::transaction_pointer_t> first = store.create_transaction();
+    expected<typename types_t::transaction_pointer_t> second = store.create_transaction();
     failures += expect(first.has_value() && second.has_value());
     if (failures != 0) return failures;
     auto& one = **first;
@@ -723,7 +715,7 @@ std::size_t stage_and_commit(mount_type_ const& mount) {
     io_channel_t& channel = (*stack)->channel();
     model_t model;
     failures += plan_model<layout_type_>(store, model);
-    expected<typename types_t::transaction_pointer_t> changing = store.create_transaction(1);
+    expected<typename types_t::transaction_pointer_t> changing = store.create_transaction();
     failures += expect(changing.has_value());
     if (failures != 0) return failures;
     constexpr std::size_t half_k = population_k / 2;

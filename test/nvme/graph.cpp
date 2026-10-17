@@ -734,10 +734,8 @@ std::size_t conflicting_transactions_are_refused(mount_type_ const& mount) {
     failures += expect(
         (*store)->access().upsert_vertices(channel, std::span<vertex_t const> {hub}, created).succeeded());
 
-    expected<typename graph_transaction_t::graph_transaction_unique_ptr_t> first = graph_transaction_t::begin(**store,
-                                                                                                              1);
-    expected<typename graph_transaction_t::graph_transaction_unique_ptr_t> second = graph_transaction_t::begin(**store,
-                                                                                                               2);
+    expected<typename graph_transaction_t::graph_transaction_unique_ptr_t> first = graph_transaction_t::begin(**store);
+    expected<typename graph_transaction_t::graph_transaction_unique_ptr_t> second = graph_transaction_t::begin(**store);
     failures += expect(first.has_value());
     failures += expect(second.has_value());
     if (!first || !second) return failures;
@@ -828,7 +826,7 @@ std::size_t commit_shows_both_halves_or_neither(mount_type_ const& mount) {
     }};
 
     expected<typename graph_transaction_t::graph_transaction_unique_ptr_t> changing = graph_transaction_t::begin(
-        **store, 7);
+        **store);
     failures += expect(changing.has_value());
     if (changing)
         for (std::size_t hub = 0; hub != hubs_k; ++hub) {

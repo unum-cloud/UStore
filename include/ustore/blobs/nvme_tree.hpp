@@ -1162,6 +1162,12 @@ class lsm_level {
      *  @param[out] position Where the key sits, which is meaningless when the answer is @c nothing_k.
      */
     [[nodiscard]] find_result_t find(stored_key_t stored_key, lsm_level_position_t& position) const noexcept {
+        return find(stored_key, limit<std::uint64_t>::max(), position);
+    }
+
+    /** As @c find, answering the newest version stamped at or below @p stamp, which a reader pinned there sees. */
+    [[nodiscard]] find_result_t find(stored_key_t stored_key, std::uint64_t stamp,
+                                     lsm_level_position_t& position) const noexcept {
         position = lsm_level_position_t {};
         if (order_ == lsm_level_order_t::overlapping_k) {
             for (std::size_t index = runs_.size(); index-- != 0;) {
@@ -1169,7 +1175,7 @@ class lsm_level {
                 if (run.population_count() == 0) continue;
                 if (stored_key < run.lower_stored_key() || run.upper_stored_key() < stored_key) continue;
                 std::uint64_t at = 0;
-                find_result_t const found = run.find(stored_key, at);
+                find_result_t const found = run.find(stored_key, stamp, at);
                 if (found == find_result_t::nothing_k) continue;
                 position = lsm_level_position_t {static_cast<std::uint32_t>(index), at};
                 return found;
@@ -1191,7 +1197,7 @@ class lsm_level {
                 continue;
             }
             std::uint64_t at = 0;
-            find_result_t const found = run.find(stored_key, at);
+            find_result_t const found = run.find(stored_key, stamp, at);
             if (found != find_result_t::nothing_k)
                 position = lsm_level_position_t {static_cast<std::uint32_t>(middle), at};
             return found;
@@ -1488,6 +1494,9 @@ class lsm_level_merger {
 
         /** The word the merge reads between blocks, or null for a merge nobody stops. */
         compaction_cancellation_t const* cancellation = nullptr;
+
+        /** Which older versions survive for readers and for a mount, and the floor the new runs count from. */
+        compaction_stamps_t stamps;
     };
 
 #pragma endregion Types
@@ -1519,7 +1528,7 @@ class lsm_level_merger {
         compaction_output_t output;
         if (status_t const compacted = run_compaction_(kind_of_(request.upper->order(), request.depth),
                                                        all.first(upper_runs), all.subspan(upper_runs),
-                                                       bounds_of_(request), request.placement, output);
+                                                       bounds_of_(request), request.stamps, request.placement, output);
             compacted.failed())
             return compacted;
 
@@ -1535,9 +1544,9 @@ class lsm_level_merger {
             planned.first_cell = first_cell;
             planned.first_key_slot = first_key_slot;
 
-            auto [written, write_run_status] = write_run_(volume, reading_channel, writing_channel,
-                                                          std::span<sorted_run_t const* const> {sources}, output,
-                                                          planned, request.value_max_size, request.cancellation);
+            auto [written, write_run_status] = write_run_(
+                volume, reading_channel, writing_channel, std::span<sorted_run_t const* const> {sources}, output,
+                planned, request.value_max_size, request.stamps.floor, request.cancellation);
             if (write_run_status.failed()) {
                 [[maybe_unused]] status_t const abandoned = merged.drop(volume, writing_channel);
                 return write_run_status;
@@ -1629,7 +1638,7 @@ class lsm_level_merger {
             if (run.layout().branching != sorted_run_layout_t::branching_k ||
                 cells.size() != run.layout().cells_count())
                 return {status_code_t::malformed_k, "A run's index is not laid out as a merge reads it"};
-            views[index] = sorted_run_index_view<key_slot_t> {cells.data(), run.population_count()};
+            views[index] = sorted_run_index_view<key_slot_t> {cells.data(), run.population_count(), &run.stamps()};
         }
         return {};
     }
@@ -1639,8 +1648,8 @@ class lsm_level_merger {
     /** Compacts on the first device when @p placement asks for one, and on the calling thread otherwise. */
     static status_t run_compaction_(compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_t> const> upper,
                                     std::span<sorted_run_index_view<key_slot_t> const> lower,
-                                    sorted_run_bounds_t const& bounds, compaction_placement_t placement,
-                                    compaction_output_t& output) noexcept {
+                                    sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps,
+                                    compaction_placement_t placement, compaction_output_t& output) noexcept {
         std::uint64_t merged = 0;
         for (std::size_t index = 0; index != upper.size(); ++index) merged += upper[index].key_slots_count;
         for (std::size_t index = 0; index != lower.size(); ++index) merged += lower[index].key_slots_count;
@@ -1649,11 +1658,11 @@ class lsm_level_merger {
         if (placement == compaction_placement_t::automatic_k)
             if (st::expected<std::size_t> const counted = cuda_count_devices(); counted.has_value()) devices = *counted;
         if (choose_compactor(placement, devices, merged) == compactor_choice_t::host_k)
-            return compaction_status(cpu_compactor_t {}.compact(kind, upper, lower, bounds, output));
+            return compaction_status(cpu_compactor_t {}.compact(kind, upper, lower, bounds, stamps, output));
 
         st::expected<gpu_compactor_t> compactor = gpu_compactor_t::make(0);
         if (!compactor) return compaction_status(compactor.status());
-        return compaction_status(compactor->compact(kind, upper, lower, bounds, output));
+        return compaction_status(compactor->compact(kind, upper, lower, bounds, stamps, output));
     }
 
 #else
@@ -1661,11 +1670,11 @@ class lsm_level_merger {
     /** Compacts on the calling thread, which is the only compactor a build without CUDA carries. */
     static status_t run_compaction_(compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_t> const> upper,
                                     std::span<sorted_run_index_view<key_slot_t> const> lower,
-                                    sorted_run_bounds_t const& bounds, compaction_placement_t placement,
-                                    compaction_output_t& output) noexcept {
+                                    sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps,
+                                    compaction_placement_t placement, compaction_output_t& output) noexcept {
         if (choose_compactor(placement, 0, 0) == compactor_choice_t::device_k)
             return {status_code_t::unsupported_k, "This build carries no device compactor"};
-        return compaction_status(cpu_compactor_t {}.compact(kind, upper, lower, bounds, output));
+        return compaction_status(cpu_compactor_t {}.compact(kind, upper, lower, bounds, stamps, output));
     }
 
 #endif
@@ -1696,11 +1705,19 @@ class lsm_level_merger {
                                              io_channel_t& writing_channel,
                                              std::span<sorted_run_t const* const> sources,
                                              compaction_output_t const& output, planned_run_t const& planned,
-                                             stored_value_size_t value_max_size,
+                                             stored_value_size_t value_max_size, std::uint64_t floor,
                                              compaction_cancellation_t const* cancellation) noexcept {
         uuid_t const content_id = uuid_generator();
         if (!content_id.is_valid())
             return status_t {status_code_t::internal_k, "A merge could not name the run it writes"};
+
+        // The compactor already raised every stamp to the floor, so the column packs them as they are.
+        std::uint64_t newest = floor;
+        auto [column, pack_status] = pack_stamps(
+            std::span<std::uint64_t const> {output.stamps.data() + planned.first_key_slot,
+                                            static_cast<std::size_t>(planned.key_slots_count)},
+            floor, newest);
+        if (pack_status.failed()) return pack_status;
 
         sorted_run_header_t header {};
         header.magic = sorted_run_magic_k;
@@ -1712,16 +1729,19 @@ class lsm_level_merger {
         header.branching = static_cast<std::uint16_t>(sorted_run_layout_t::branching_k);
         header.value_layout = value_layout_k;
         header.content_id = content_id;
+        header.stamps_bytes = column.saved_bytes();
+        header.stamps_floor = floor;
+        header.newest_stamp = newest;
 
-        std::uint64_t const reserved_bytes = sorted_run_layout_t::blob_bytes(header.key_slots_count,
-                                                                             header.stored_values_bytes);
+        std::uint64_t const reserved_bytes = sorted_run_layout_t::blob_bytes(
+            header.key_slots_count, header.stored_values_bytes, header.stamps_bytes);
         auto [reserved, create_status] = volume.create(sorted_run_t::name_of(content_id), blob_kind_t::sorted_run_k,
                                                        reserved_bytes);
         if (create_status.failed()) return create_status;
         volume_blob_t const blob = reserved;
 
         if (status_t const written = write_sections_(volume, reading_channel, writing_channel, sources, output, planned,
-                                                     header, blob, cancellation);
+                                                     header, column, blob, cancellation);
             written.failed()) {
             [[maybe_unused]] status_t const abandoned = volume.drop(writing_channel, sorted_run_t::name_of(content_id));
             return written;
@@ -1733,11 +1753,12 @@ class lsm_level_merger {
         return sorted_run_t::attach(volume, writing_channel, blob);
     }
 
-    /** Writes the header, the cells and the gathered values of one new run, and makes all three durable. */
+    /** Writes the header, the cells, the gathered values and the stamps of one new run, and makes all four durable. */
     static status_t write_sections_(volume_t& volume, io_channel_t& reading_channel, io_channel_t& writing_channel,
                                     std::span<sorted_run_t const* const> sources, compaction_output_t const& output,
                                     planned_run_t const& planned, sorted_run_header_t const& header,
-                                    volume_blob_t const& blob, compaction_cancellation_t const* cancellation) noexcept {
+                                    stamps_column_t const& column, volume_blob_t const& blob,
+                                    compaction_cancellation_t const* cancellation) noexcept {
         std::uint64_t const block_bytes = round_down_to_multiple(writing_channel.streams().buffer_bytes(),
                                                                  portable_alignment_k);
         if (block_bytes < sorted_run_layout_t::header_bytes())
@@ -1762,6 +1783,8 @@ class lsm_level_merger {
                                                   blob, block_bytes, cancellation);
             values.failed())
             return values;
+        if (status_t const stamps = sorted_run_t::write_stamps(writer, blob, header, column); stamps.failed())
+            return stamps;
         return writer.make_durable();
     }
 
@@ -2096,6 +2119,10 @@ class lsm_tree {
 
     /** An empty tree of one level zero over @p volume, which must outlive it. */
     static expected<lsm_tree> mount(volume_t& volume, lsm_tree_config_t const& config) noexcept {
+        // The enlarge factor sizes every level and level zero's run count alike, so a tree without one has no shape
+        if (config.level_enlarge_factor < storage_limits_t::level_min_enlarge_factor_k ||
+            config.level_enlarge_factor > storage_limits_t::level_max_enlarge_factor_k)
+            return status_t {status_code_t::invalid_argument_k, "A tree grows its levels by a factor in its bounds"};
         lsm_tree tree;
         tree.volume_ = &volume;
         tree.config_ = config;
@@ -2146,13 +2173,14 @@ class lsm_tree {
      *  @param[in] taken The level set the lookup runs against.
      *  @param[in] stored_key The key to look for.
      *  @param[out] position Where the key sits, which is meaningless when the answer is @c nothing_k.
+     *  @param[in] stamp The stamp a reader is pinned at, which sees the newest version at or below it.
      */
-    [[nodiscard]] find_result_t find(snapshot_t const& taken, stored_key_t stored_key,
-                                     lsm_tree_position_t& position) const noexcept {
+    [[nodiscard]] find_result_t find(snapshot_t const& taken, stored_key_t stored_key, lsm_tree_position_t& position,
+                                     std::uint64_t stamp = limit<std::uint64_t>::max()) const noexcept {
         position = lsm_tree_position_t {};
         for (std::size_t number = 0; number != taken.size(); ++number) {
             lsm_level_position_t inside;
-            find_result_t const found = taken.level(number).find(stored_key, inside);
+            find_result_t const found = taken.level(number).find(stored_key, stamp, inside);
             if (found == find_result_t::nothing_k) continue;
             position = lsm_tree_position_t {static_cast<std::uint32_t>(number), inside};
             return found;
@@ -2171,6 +2199,7 @@ class lsm_tree {
      *  @param[in] stored_keys The keys to read, in any order and with any number of misses among them.
      *  @param[out] results What every key was, which separates a miss from an erased value.
      *  @param[in] sink Called as @c sink(request, offset, bytes) for every key that locates a value.
+     *  @param[in] stamp The stamp a reader is pinned at, which sees the newest version at or below it.
      *  @return Success, or the first failure any of the blocks reported.
      *
      *  @note A value larger than one block arrives as several calls, each carrying the bytes of the value
@@ -2178,14 +2207,15 @@ class lsm_tree {
      */
     template <typename sink_type_>
     status_t read_values(io_channel_t& channel, snapshot_t const& taken, std::span<stored_key_t const> stored_keys,
-                         std::span<find_result_t> results, sink_type_&& sink) const noexcept {
+                         std::span<find_result_t> results, sink_type_&& sink,
+                         std::uint64_t stamp = limit<std::uint64_t>::max()) const noexcept {
         if (results.size() != stored_keys.size())
             return {status_code_t::invalid_argument_k, "A batched read answers one result per key"};
 
         if constexpr (holds_values_inline_k) {
             for (std::size_t request = 0; request != stored_keys.size(); ++request) {
                 lsm_tree_position_t position;
-                results[request] = find(taken, stored_keys[request], position);
+                results[request] = find(taken, stored_keys[request], position, stamp);
                 if (results[request] != find_result_t::success_k) continue;
                 key_slot_t const& slot = taken.level(position.level_number).key_slot(position.level_position);
                 sink(request, std::uint64_t {0}, std::span<byte_t const> {slot.data, slot.size});
@@ -2222,7 +2252,7 @@ class lsm_tree {
                 while (request != stored_keys.size() && reader.can_enqueue()) {
                     if (chunk == 0) {
                         lsm_tree_position_t position;
-                        find_result_t const found = find(taken, stored_keys[request], position);
+                        find_result_t const found = find(taken, stored_keys[request], position, stamp);
                         results[request] = found;
                         window = found == find_result_t::success_k
                                      ? taken.level(position.level_number).value_window(position.level_position)
@@ -2262,13 +2292,16 @@ class lsm_tree {
      *  @brief Writes @p key_slots and @p stored_values as one run and publishes it onto level zero.
      *  @param[inout] channel The channel the run is written on, held by the calling thread.
      *  @param[in] key_slots The key slots in ascending order of their keys, as a write buffer drained them.
+     *  @param[in] stamps The stamp of every key slot, in the same order.
+     *  @param[in] floor The stamp every stamp is raised to at least, since no reader can tell those below it apart.
      *  @param[in] stored_values The values back to back, located from the run's own values offset.
      *  @param[in] value_max_size The largest value the collection admits, kept in the run's header.
      */
-    status_t flush(io_channel_t& channel, std::span<key_slot_t const> key_slots, std::span<byte_t const> stored_values,
+    status_t flush(io_channel_t& channel, std::span<key_slot_t const> key_slots, std::span<std::uint64_t const> stamps,
+                   std::uint64_t floor, std::span<byte_t const> stored_values,
                    stored_value_size_t value_max_size) noexcept {
         auto [written, write_sorted_run_status] = sorted_run_t::write(*volume_, channel, uuid_generator(), key_slots,
-                                                                      stored_values, value_max_size);
+                                                                      stamps, floor, stored_values, value_max_size);
         if (write_sorted_run_status.failed()) return write_sorted_run_status;
         uuid_t const content_id = written.content_id();
 
@@ -2343,6 +2376,17 @@ class lsm_tree {
         return overfull_(sets_[taken.slot_]) != sets_[taken.slot_].size();
     }
 
+    /** The newest stamp any run of the live set carries, which a mount resumes its stamps above. */
+    [[nodiscard]] std::uint64_t newest_stamp() const noexcept {
+        snapshot_t const taken = snapshot();
+        std::uint64_t newest = 0;
+        for (std::size_t number = 0; number != taken.size(); ++number)
+            for (std::size_t index = 0; index != taken.level(number).size(); ++index)
+                if (taken.level(number).run(index).newest_stamp() > newest)
+                    newest = taken.level(number).run(index).newest_stamp();
+        return newest;
+    }
+
     /**
      *  @brief Merges the shallowest level that is over its bounds into the level below it and publishes it.
      *  @param[inout] reading_channel The channel the merge gathers source values on, held by the calling thread.
@@ -2350,19 +2394,47 @@ class lsm_tree {
      *  @param[in] placement Where the compaction runs, which a collection leaves automatic.
      *  @param[in] cancellation The word the merge reads between blocks, or null for a merge nobody stops.
      *  @param[in] published What to call once the merged set is live and before a consumed run is dropped.
+     *  @param[in] stamps Which older versions survive for readers and for a mount, and the floor the new runs count
+     *      from, where the default keeps the newest version of every key alone.
      *  @return What the pass did, or the status that stopped it with the live level set untouched.
      */
     expected<compaction_outcome_t> compact(
         io_channel_t& reading_channel, io_channel_t& writing_channel, compaction_placement_t placement,
         compaction_cancellation_t const* cancellation,
-        lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {}) noexcept {
+        lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {},
+        compaction_stamps_t const& stamps = compaction_stamps_t {}) noexcept {
         if (!claim_compaction_()) return compaction_outcome_t::nothing_to_compact_k;
 
-        expected<compaction_outcome_t> const outcome = compact_once_(reading_channel, writing_channel, placement,
-                                                                     cancellation, published);
+        expected<compaction_outcome_t> const outcome = compact_once_(
+            reading_channel, writing_channel, placement, cancellation, published, stamps, merge_choice_t::overfull_k);
         fu::preferred_atomic_ref<std::int32_t> {compacting_}.store(
             static_cast<std::int32_t>(compaction_state_t::idle_k), std::memory_order_release);
         return outcome;
+    }
+
+    /**
+     *  @brief Drops every version stamped above @p ceiling, merging down each level that holds one until none does.
+     *
+     *  A mount runs this before anything draws a stamp: a crash may leave runs holding commits the catalog it found
+     *  never promised, and those land nowhere else, so dropping them all leaves only commits that landed whole.
+     */
+    status_t truncate_above(io_channel_t& reading_channel, io_channel_t& writing_channel, std::uint64_t ceiling,
+                            lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {}) noexcept {
+        if (!claim_compaction_()) return {status_code_t::invalid_argument_k, "A mount truncates a tree nobody merges"};
+        compaction_stamps_t stamps;
+        stamps.horizon = ceiling;
+        stamps.ceiling = ceiling;
+        stamps.floor = ceiling;
+        status_t result;
+        while (result.succeeded() && above_(sets_[live_slot_()], ceiling) != sets_[live_slot_()].size()) {
+            expected<compaction_outcome_t> const outcome = compact_once_(
+                reading_channel, writing_channel, compaction_placement_t::automatic_k, nullptr, published, stamps,
+                merge_choice_t::above_ceiling_k);
+            if (!outcome) result = outcome.status();
+        }
+        fu::preferred_atomic_ref<std::int32_t> {compacting_}.store(
+            static_cast<std::int32_t>(compaction_state_t::idle_k), std::memory_order_release);
+        return result;
     }
 
 #pragma endregion Publication
@@ -2370,6 +2442,16 @@ class lsm_tree {
   private:
 
 #pragma region Private Types
+
+    /** Which level one merge pass takes down into the level below it. */
+    enum class merge_choice_t : std::uint8_t {
+
+        /** The shallowest level over the bytes its number admits. */
+        overfull_k,
+
+        /** The shallowest level holding a version above the ceiling of the pass's stamps. */
+        above_ceiling_k,
+    };
 
     /** One block of one value's read, kept until its completion carries the block back. */
     struct pending_read_t {
@@ -2481,7 +2563,7 @@ class lsm_tree {
     /** The bytes level @p number admits, which grows by the tree's enlarge factor at every level. */
     [[nodiscard]] std::uint64_t level_bytes_(std::size_t number) const noexcept {
         std::uint64_t bytes = config_.lsm_level_0.max_bytes;
-        std::uint64_t const factor = config_.level_enlarge_factor != 0 ? config_.level_enlarge_factor : 1;
+        std::uint64_t const factor = config_.level_enlarge_factor;
         for (std::size_t step = 0; step != number; ++step) {
             if (bytes > limit<std::uint64_t>::max() / factor) return limit<std::uint64_t>::max();
             bytes *= factor;
@@ -2491,20 +2573,31 @@ class lsm_tree {
 
     /** The shallowest level of @p levels that is over its bounds, or the level count when none is. */
     [[nodiscard]] std::size_t overfull_(level_set_t const& levels) const noexcept {
-        if (!levels.empty() && levels[0].size() >= storage_limits_t::first_level_compaction_threshold_k) return 0;
+        // Every level grows by the factor, and a flushed run is one write buffer, so L0 is due at factor runs.
+        if (!levels.empty() && levels[0].size() >= config_.level_enlarge_factor) return 0;
         for (std::size_t number = 0; number != levels.size(); ++number)
             if (!levels[number].empty() && levels[number].size_bytes() > level_bytes_(number)) return number;
         return levels.size();
     }
 
-    /** Runs one merge and publishes it, which the claim around it keeps to one thread at a time. */
+    /** The shallowest level of @p levels holding a run with a version above @p ceiling, or the level count. */
+    [[nodiscard]] static std::size_t above_(level_set_t const& levels, std::uint64_t ceiling) noexcept {
+        for (std::size_t number = 0; number != levels.size(); ++number)
+            for (std::size_t index = 0; index != levels[number].size(); ++index)
+                if (levels[number].run(index).newest_stamp() > ceiling) return number;
+        return levels.size();
+    }
+
+    /** Runs one merge of the level @p choice picks and publishes it, which the claim around it keeps to one thread. */
     expected<compaction_outcome_t> compact_once_(io_channel_t& reading_channel, io_channel_t& writing_channel,
                                                  compaction_placement_t placement,
                                                  compaction_cancellation_t const* cancellation,
-                                                 lsm_tree_publication_hook_t const& published) noexcept {
+                                                 lsm_tree_publication_hook_t const& published,
+                                                 compaction_stamps_t const& stamps, merge_choice_t choice) noexcept {
         std::size_t const live = live_slot_();
         level_set_t const& source = sets_[live];
-        std::size_t const upper = overfull_(source);
+        std::size_t const upper = choice == merge_choice_t::overfull_k ? overfull_(source)
+                                                                       : above_(source, stamps.ceiling);
         if (upper == source.size()) return compaction_outcome_t::nothing_to_compact_k;
         std::size_t const lower = upper + 1;
         bool const grows = lower == source.size();
@@ -2524,6 +2617,7 @@ class lsm_tree {
         request.run_bytes_limit = storage_limits_t::sorted_run_file_max_size_k;
         request.placement = placement;
         request.cancellation = cancellation;
+        request.stamps = stamps;
         if (!grows && lower + 1 != source.size()) request.depth = lsm_level_depth_t::intermediate_k;
 
         auto [merged, merge_status] = merger_t::merge(*volume_, reading_channel, writing_channel, request);

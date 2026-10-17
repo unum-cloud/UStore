@@ -18,6 +18,7 @@ namespace unum::ustore {
 
 using blobs::compaction_kind_t;
 using blobs::compaction_output;
+using blobs::compaction_stamps_t;
 using blobs::sorted_run_bounds_t;
 using blobs::uuid_stored_key_t;
 
@@ -27,30 +28,30 @@ using views_of = std::span<blobs::sorted_run_index_view<key_slot_type_> const>;
 
 template st::status_t blobs::gpu_compactor_t::compact(compaction_kind_t, views_of<test::inline_key_slot<std::uint64_t>>,
                                                       views_of<test::inline_key_slot<std::uint64_t>>,
-                                                      sorted_run_bounds_t const&,
+                                                      sorted_run_bounds_t const&, compaction_stamps_t const&,
                                                       compaction_output<test::inline_key_slot<std::uint64_t>>&);
 template st::status_t blobs::gpu_compactor_t::compact(compaction_kind_t,
                                                       views_of<test::fixed_width_key_slot<std::uint64_t>>,
                                                       views_of<test::fixed_width_key_slot<std::uint64_t>>,
-                                                      sorted_run_bounds_t const&,
+                                                      sorted_run_bounds_t const&, compaction_stamps_t const&,
                                                       compaction_output<test::fixed_width_key_slot<std::uint64_t>>&);
 template st::status_t blobs::gpu_compactor_t::compact(compaction_kind_t,
                                                       views_of<test::variable_width_key_slot<std::uint64_t>>,
                                                       views_of<test::variable_width_key_slot<std::uint64_t>>,
-                                                      sorted_run_bounds_t const&,
+                                                      sorted_run_bounds_t const&, compaction_stamps_t const&,
                                                       compaction_output<test::variable_width_key_slot<std::uint64_t>>&);
 template st::status_t blobs::gpu_compactor_t::compact(compaction_kind_t,
                                                       views_of<test::inline_key_slot<uuid_stored_key_t>>,
                                                       views_of<test::inline_key_slot<uuid_stored_key_t>>,
-                                                      sorted_run_bounds_t const&,
+                                                      sorted_run_bounds_t const&, compaction_stamps_t const&,
                                                       compaction_output<test::inline_key_slot<uuid_stored_key_t>>&);
 template st::status_t blobs::gpu_compactor_t::compact(
     compaction_kind_t, views_of<test::fixed_width_key_slot<uuid_stored_key_t>>,
-    views_of<test::fixed_width_key_slot<uuid_stored_key_t>>, sorted_run_bounds_t const&,
+    views_of<test::fixed_width_key_slot<uuid_stored_key_t>>, sorted_run_bounds_t const&, compaction_stamps_t const&,
     compaction_output<test::fixed_width_key_slot<uuid_stored_key_t>>&);
 template st::status_t blobs::gpu_compactor_t::compact(
     compaction_kind_t, views_of<test::variable_width_key_slot<uuid_stored_key_t>>,
-    views_of<test::variable_width_key_slot<uuid_stored_key_t>>, sorted_run_bounds_t const&,
+    views_of<test::variable_width_key_slot<uuid_stored_key_t>>, sorted_run_bounds_t const&, compaction_stamps_t const&,
     compaction_output<test::variable_width_key_slot<uuid_stored_key_t>>&);
 
 } // namespace unum::ustore

@@ -51,8 +51,11 @@ struct extract_kernel {
     /** Index of the sorted run. */
     std::uint32_t sorted_run;
 
+    /** The sorted run's stamps in sorted order on the device, or null when it carries none. */
+    std::uint64_t const* stamps;
+
     constexpr void operator()(std::int64_t cell) const noexcept {
-        extract_cell(cells, layout, static_cast<std::uint64_t>(cell), sorted_run, records);
+        extract_cell(cells, layout, static_cast<std::uint64_t>(cell), sorted_run, stamps, records);
     }
 };
 
@@ -69,9 +72,12 @@ struct survivor_kernel {
     /** The kind of compaction, which decides whether tombstones drop. */
     compaction_kind_t kind;
 
+    /** Which older versions survive and which drop, its pinned stamps on the device. */
+    compaction_stamps_t stamps;
+
     constexpr void operator()(std::int64_t index) const noexcept {
         located_key_slot<key_slot_type_> const* const previous = index != 0 ? merged + index - 1 : nullptr;
-        flags[index] = survives(previous, merged[index], kind) ? 1 : 0;
+        flags[index] = survives(previous, merged[index], kind, stamps) ? 1 : 0;
     }
 };
 
@@ -141,6 +147,12 @@ struct place_kernel {
     /** One migration per survivor, or null for stored values held inline. */
     stored_value_migration_t* migrations;
 
+    /** The stamp every survivor's stamp is raised to at least. */
+    std::uint64_t floor;
+
+    /** One stamp per survivor. */
+    std::uint64_t* stamps;
+
     constexpr void operator()(std::int64_t signed_index) const noexcept {
         std::uint64_t const index = static_cast<std::uint64_t>(signed_index);
         std::uint64_t low = 0;
@@ -153,7 +165,8 @@ struct place_kernel {
         sorted_run_placement_t const& placement = placements[low];
         std::uint64_t const preceding = prefix != nullptr ? prefix[index] - prefix[placement.first_key_slot] : 0;
         place_key_slot(survivors[index], placement.layout, index - placement.first_key_slot, placement.section_offset,
-                       preceding, cells + placement.first_cell, migrations != nullptr ? migrations + index : nullptr);
+                       preceding, floor, cells + placement.first_cell,
+                       migrations != nullptr ? migrations + index : nullptr, stamps + index);
     }
 };
 
@@ -162,7 +175,7 @@ template <typename key_slot_type_, typename allocator_type_>
 st::status_t gpu_compactor_t::compact(compaction_kind_t kind,
                                       std::span<sorted_run_index_view<key_slot_type_> const> upper,
                                       std::span<sorted_run_index_view<key_slot_type_> const> lower,
-                                      sorted_run_bounds_t const& bounds,
+                                      sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps,
                                       compaction_output<key_slot_type_, allocator_type_>& output) noexcept {
     using st::basic_vector;
     using st::expected;
@@ -193,6 +206,8 @@ st::status_t gpu_compactor_t::compact(compaction_kind_t kind,
     cuda_device_buffer<record_t> records {cuda_device_allocator<record_t>(device)};
     cuda_device_buffer<record_t> scratch {cuda_device_allocator<record_t>(device)};
     cuda_device_buffer<key_slot_type_> sorted_run_cells {cuda_device_allocator<key_slot_type_>(device)};
+    cuda_device_buffer<std::uint64_t> sorted_run_stamps {cuda_device_allocator<std::uint64_t>(device)};
+    cuda_device_buffer<std::uint64_t> pinned {cuda_device_allocator<std::uint64_t>(device)};
     cuda_device_buffer<std::byte> temporary {cuda_device_allocator<std::byte>(device)};
     status_t status = records.reserve(merged_count);
     if (status != status_t::success_k) return status;
@@ -200,6 +215,23 @@ st::status_t gpu_compactor_t::compact(compaction_kind_t kind,
     if (status != status_t::success_k) return status;
     status = sorted_run_cells.reserve(largest_cells);
     if (status != status_t::success_k) return status;
+    status = sorted_run_stamps.reserve(largest_cells);
+    if (status != status_t::success_k) return status;
+
+    // A run's stamps are packed, so they unpack on the host into one block the size of the largest run.
+    basic_vector<std::uint64_t> unpacked;
+    status = unpacked.resize(largest_cells);
+    if (status != status_t::success_k) return status;
+
+    // The pinned stamps are a few words, read by every survival check, so the device holds its own copy.
+    compaction_stamps_t device_stamps = stamps;
+    if (stamps.pinned_count != 0) {
+        status = pinned.reserve(stamps.pinned_count);
+        if (status != status_t::success_k) return status;
+        status = pinned.copy_in(stamps.pinned, stamps.pinned_count, 0, stream);
+        if (status != status_t::success_k) return status;
+        device_stamps.pinned = pinned.data();
+    }
 
     // Growing the scratch frees the old run, so the kernels still reading it finish first
     auto const grow_temporary = [&temporary, this](std::size_t bytes) noexcept {
@@ -218,8 +250,19 @@ st::status_t gpu_compactor_t::compact(compaction_kind_t kind,
         if (layout.cells_count() == 0) continue;
         status = sorted_run_cells.copy_in(view.cells, layout.cells_count(), 0, stream);
         if (status != status_t::success_k) return status;
+        std::uint64_t const* run_stamps = nullptr;
+        if (view.stamps != nullptr && view.key_slots_count != 0) {
+            // The upload below reads the host block asynchronously, so the previous run's has to finish first.
+            status = stream_.synchronize();
+            if (status != status_t::success_k) return status;
+            for (std::uint64_t sorted = 0; sorted != view.key_slots_count; ++sorted)
+                unpacked[sorted] = (*view.stamps)[static_cast<std::size_t>(sorted)];
+            status = sorted_run_stamps.copy_in(unpacked.data(), view.key_slots_count, 0, stream);
+            if (status != status_t::success_k) return status;
+            run_stamps = sorted_run_stamps.data();
+        }
         extract_kernel<key_slot_type_> const kernel {sorted_run_cells.data(), records.data() + run_offset, layout,
-                                                     static_cast<std::uint32_t>(sorted_run)};
+                                                     static_cast<std::uint32_t>(sorted_run), run_stamps};
         status = cuda_status(cub::DeviceFor::Bulk(static_cast<std::int64_t>(layout.cells_count()), kernel, stream));
         if (status != status_t::success_k) return status;
         run_offset += view.key_slots_count;
@@ -272,7 +315,7 @@ st::status_t gpu_compactor_t::compact(compaction_kind_t kind,
         status = selected.reserve(1);
         if (status != status_t::success_k) return status;
         std::int64_t const count = static_cast<std::int64_t>(merged_count);
-        survivor_kernel<key_slot_type_> const kernel {merged, flags.data(), kind};
+        survivor_kernel<key_slot_type_> const kernel {merged, flags.data(), kind, device_stamps};
         status = cuda_status(cub::DeviceFor::Bulk(count, kernel, stream));
         if (status != status_t::success_k) return status;
         std::size_t bytes = 0;
@@ -316,7 +359,16 @@ st::status_t gpu_compactor_t::compact(compaction_kind_t kind,
         bytes = 0;
         return prefix.size() != 0 ? prefix.copy_out(&bytes, 1, index, stream) : status_t::success_k;
     };
-    status = plan_sorted_runs<key_slot_type_>(survivors, bounds, read_prefix, output.sorted_runs);
+    auto const shares_key = [kept, stream](std::uint64_t index, bool& shared) noexcept {
+        record_t neighbours[2] {};
+        status_t const copied = cuda_status(
+            cudaMemcpyAsync(neighbours, kept + index - 1, sizeof(neighbours), cudaMemcpyDeviceToHost, stream));
+        if (copied != status_t::success_k) return copied;
+        status_t const waited = cuda_status(cudaStreamSynchronize(stream));
+        shared = neighbours[0].key_slot.stored_key == neighbours[1].key_slot.stored_key;
+        return waited;
+    };
+    status = plan_sorted_runs<key_slot_type_>(survivors, bounds, read_prefix, shares_key, output.sorted_runs);
     if (status != status_t::success_k) return status;
 
     basic_vector<sorted_run_placement_t> placements;
@@ -338,6 +390,7 @@ st::status_t gpu_compactor_t::compact(compaction_kind_t kind,
         cuda_device_allocator<sorted_run_placement_t>(device)};
     cuda_device_buffer<key_slot_type_> cells {cuda_device_allocator<key_slot_type_>(device)};
     cuda_device_buffer<stored_value_migration_t> migrations {cuda_device_allocator<stored_value_migration_t>(device)};
+    cuda_device_buffer<std::uint64_t> survivor_stamps {cuda_device_allocator<std::uint64_t>(device)};
     status = device_placements.reserve(placements.size());
     if (status != status_t::success_k) return status;
     status = device_placements.copy_in(placements.data(), placements.size(), 0, stream);
@@ -345,6 +398,8 @@ st::status_t gpu_compactor_t::compact(compaction_kind_t kind,
     status = cells.reserve(cells_count);
     if (status != status_t::success_k) return status;
     status = migrations.reserve(migrations_count);
+    if (status != status_t::success_k) return status;
+    status = survivor_stamps.reserve(survivors);
     if (status != status_t::success_k) return status;
 
     if (cells_count != 0) {
@@ -358,7 +413,9 @@ st::status_t gpu_compactor_t::compact(compaction_kind_t kind,
                                                    device_placements.data(),
                                                    placements.size(),
                                                    cells.data(),
-                                                   migrations_count != 0 ? migrations.data() : nullptr};
+                                                   migrations_count != 0 ? migrations.data() : nullptr,
+                                                   stamps.floor,
+                                                   survivor_stamps.data()};
         status = cuda_status(cub::DeviceFor::Bulk(static_cast<std::int64_t>(survivors), kernel, stream));
         if (status != status_t::success_k) return status;
     }
@@ -370,6 +427,10 @@ st::status_t gpu_compactor_t::compact(compaction_kind_t kind,
     status = output.migrations.resize(migrations_count);
     if (status != status_t::success_k) return status;
     status = migrations.copy_out(output.migrations.data(), migrations_count, 0, stream);
+    if (status != status_t::success_k) return status;
+    status = output.stamps.resize(survivors);
+    if (status != status_t::success_k) return status;
+    status = survivor_stamps.copy_out(output.stamps.data(), survivors, 0, stream);
     if (status != status_t::success_k) return status;
     return stream_.synchronize();
 }

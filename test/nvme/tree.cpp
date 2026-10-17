@@ -172,6 +172,15 @@ struct lsm_types {
 
 #pragma region Model
 
+/** One stamp per key slot of a flush of @p count distinct keys, all newer than every stamp handed out before. */
+inline st::basic_vector<std::uint64_t> fresh_stamps(std::size_t count) {
+    static std::uint64_t drawn = 0;
+    st::basic_vector<std::uint64_t> stamps;
+    [[maybe_unused]] st::status_t const sized = stamps.resize(count);
+    for (std::size_t index = 0; index != stamps.size(); ++index) stamps[index] = ++drawn;
+    return stamps;
+}
+
 /** The key slots and the bytes behind them that one flush writes. */
 struct batch_t {
 
@@ -226,6 +235,7 @@ template <typename tree_type_>
     failures += build_batch(wanted, batch);
     if (failures != 0) return failures;
     failures += expect(tree.flush(channel, std::span<variable_slot_t const> {batch.key_slots},
+                                  std::span<std::uint64_t const> {fresh_stamps(batch.key_slots.size())}, 0,
                                   std::span<byte_t const> {batch.values}, value_max_size_k)
                            .succeeded());
     return failures;
@@ -319,9 +329,10 @@ template <typename level_type_, typename volume_type_>
     batch_t batch;
     failures += build_batch(wanted, batch);
     if (failures != 0) return failures;
-    expected<sorted_run_t> written = sorted_run_t::write(volume, channel, uuid_generator(),
-                                                         std::span<variable_slot_t const> {batch.key_slots},
-                                                         std::span<byte_t const> {batch.values}, value_max_size_k);
+    expected<sorted_run_t> written = sorted_run_t::write(
+        volume, channel, uuid_generator(), std::span<variable_slot_t const> {batch.key_slots},
+        std::span<std::uint64_t const> {fresh_stamps(batch.key_slots.size())}, 0,
+        std::span<byte_t const> {batch.values}, value_max_size_k);
     failures += expect(written.has_value());
     if (!written) return failures;
     failures += expect(level.bind_queue_pair(std::move(*written)).succeeded());

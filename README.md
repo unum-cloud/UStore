@@ -224,13 +224,13 @@ Every engine implements the same C ABI of `c/ustore/db.h`, `c/ustore/blobs.h` an
 | Engine    | Role                  | Storage                        | Transactions | Snapshots | Collections |
 | :-------- | :-------------------- | :----------------------------- | :----------- | :-------- | :---------- |
 | `ram`     | reference, in memory  | memory, with an optional image | yes          | yes       | yes         |
-| `nvme`    | hyper-converged, v1   | LSM trees on NVMe or files     | yes          | no        | yes         |
+| `nvme`    | hyper-converged, v1   | LSM trees on NVMe or files     | yes          | yes       | yes         |
 | `rocksdb` | baseline, third-party | LSM tree on a filesystem       | yes          | yes       | yes         |
 | `leveldb` | baseline, third-party | LSM tree on a filesystem       | no           | yes       | yes         |
 
 Each carries a limit worth knowing before choosing it.
 The `ram` engine rewrites its whole image on a flush and keeps no log, so a crash loses everything written since the last one.
-NVMe keeps no snapshots yet, so the snapshot cases of the conformance suite skip on it by name rather than pass.
+NVMe keeps no write-ahead log, so a crash loses the commits its write buffers held, a suffix of them and never half of one.
 RocksDB takes a transaction's snapshot at its first read or write rather than when it began, and stages by locking and validating every watched read and buffered write against that snapshot, then preparing the writes into its log.
 LevelDB has no transactions.
 
@@ -286,7 +286,7 @@ v1 is planned for mid-November 2026.
 - __Keys__ — today 128-bit UUID keys and UUIDv7 collection identifiers, except on NVMe, which takes keys below 2⁶⁴ and names collections by catalog numbers; v1 brings both to NVMe, with time-ordered UUIDv7 keys for local inserts.
 - __The `ram` engine__ — today `strict_serializable` or `snapshot` at open, with binary image persistence; v1 targets the conformance suite passing at both levels, every level proven by anomaly tests.
 - __RocksDB, LevelDB__ — today built against their current headers; v1 targets the same conformance suite, each reporting the isolation it delivers.
-- __NVMe__ — today its sources are being ported to the current C ABI, having passed the conformance suite on Linux over blocking and io_uring transports with GPU compaction wired in; v1 targets the port, snapshots, the graph as two collections of one database, backup and export, and CI on every platform.
+- __NVMe__ — today its sources are being ported to the current C ABI, having passed the conformance suite on Linux over blocking and io_uring transports with GPU compaction wired in; v1 targets the port, the graph as two collections of one database, backup and export, and CI on every platform.
 - __Kernel bypass__ — today io_uring on files and block devices, with registered buffers where the memlock cap allows and plain pointers otherwise, and an SPDK transport passing the shared ring cases over NVMe/TCP; v1 targets SPDK mounted by the engine and NVMe passthrough.
 - __SIMD point lookups__ — today the sorted-run index is searched on SmashTable's kits; v1 targets one kit chosen per artifact at open.
 - __GPU__ — today LSM compaction on CUB, reached from the engine when built with CUDA, with the host and device merges checked to agree byte for byte on every transport; v1 targets GPUDirect Storage between drives and GPU memory.

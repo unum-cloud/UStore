@@ -25,8 +25,9 @@
 #include <type_traits> // `std::is_trivially_copyable_v`
 #include <utility>     // `std::move`, `std::swap`
 
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
-#include <smashtable/shared.hpp>       // `st::status_t`, `st::default_allocator`
+#include <smashtable/basic_vector.hpp>           // `st::basic_vector`
+#include <smashtable/immutable_packed_array.hpp> // `st::immutable_packed_array`
+#include <smashtable/shared.hpp>                 // `st::status_t`, `st::default_allocator`
 
 #include "ustore/blobs/nvme_key_slot.hpp"          // `limit`, `stored_key_concept`, `sorted_run_index_layout_t`
 #include "ustore/utilities/types.hpp"              // `round_up_to_multiple`
@@ -72,7 +73,10 @@ enum class compaction_kind_t : std::uint8_t {
     sorted_into_bottom_k,
 };
 
-/** The key slots of one sorted run as its sorted run index's cells hold them. */
+/** The stamps of one sorted run's key slots, in sorted order, as the run keeps them packed beside its index. */
+using stamps_column_t = st::immutable_packed_array<std::uint64_t>;
+
+/** The key slots of one sorted run as its sorted run index's cells hold them, and the stamp of every one. */
 template <typename key_slot_type_>
 struct sorted_run_index_view {
 
@@ -81,6 +85,33 @@ struct sorted_run_index_view {
 
     /** Key slots in the sorted run index, padding excluded. */
     std::uint64_t key_slots_count = 0;
+
+    /** The stamp of every key slot in sorted order, or null for a run whose every stamp reads as zero. */
+    stamps_column_t const* stamps = nullptr;
+};
+
+/**
+ *  @brief The stamps a merge keeps versions for beyond the newest of every stored key, and the range it keeps.
+ *
+ *  With no reader pinned and both bounds at their widest, a merge keeps exactly the newest version of every key,
+ *  which is the rule a store without stamps would follow.
+ */
+struct compaction_stamps_t {
+
+    /** Every stamp a live reader reads at, ascending and distinct: the newest version at or below each survives. */
+    std::uint64_t const* pinned = nullptr;
+
+    /** How many stamps @c pinned holds. */
+    std::uint64_t pinned_count = 0;
+
+    /** The newest stamp a catalog can promise durable: every version above it survives, as a mount may drop it. */
+    std::uint64_t horizon = std::numeric_limits<std::uint64_t>::max();
+
+    /** The newest stamp a merge keeps at all, which a mount sets to drop what no durable catalog covers. */
+    std::uint64_t ceiling = std::numeric_limits<std::uint64_t>::max();
+
+    /** The stamp every surviving stamp is raised to at least, which no reader and no mount can tell apart. */
+    std::uint64_t floor = 0;
 };
 
 /** Bounds every sorted run a compaction writes must fit, derived from the sorted run layout and the storage limits. */
@@ -144,6 +175,9 @@ struct compaction_output {
     /** One migration per key slot in sorted order across the sorted runs, empty for stored values held inline. */
     rebound_vector<stored_value_migration_t, allocator_type_> migrations;
 
+    /** One stamp per key slot in sorted order across the sorted runs, each at or above the merge's floor. */
+    rebound_vector<std::uint64_t, allocator_type_> stamps;
+
     compaction_output() noexcept = default;
 
     /** Allocates every buffer through @p allocator. */
@@ -152,10 +186,11 @@ struct compaction_output {
           sorted_runs(typename std::allocator_traits<allocator_type_>::template rebind_alloc<compacted_sorted_run_t>(
               allocator)),
           migrations(typename std::allocator_traits<allocator_type_>::template rebind_alloc<stored_value_migration_t>(
-              allocator)) {}
+              allocator)),
+          stamps(typename std::allocator_traits<allocator_type_>::template rebind_alloc<std::uint64_t>(allocator)) {}
 };
 
-/** A key slot with the index of the sorted run it came from, the unit every merge moves. */
+/** A key slot with the index of the sorted run it came from and its stamp, the unit every merge moves. */
 template <typename key_slot_type_>
 struct located_key_slot {
 
@@ -164,13 +199,16 @@ struct located_key_slot {
 
     /** Index of its sorted run, counting the upper LSM level first and the lower LSM level after it. */
     std::uint32_t sorted_run = 0;
+
+    /** The stamp of the commit that wrote it. */
+    std::uint64_t stamp = 0;
 };
 
 #pragma endregion Vocabulary
 
 #pragma region Rules
 
-/** Orders located key slots by stored key, and equal stored keys so the one that survives comes first. */
+/** Orders located key slots by stored key, and equal stored keys newest first, so the one that survives leads. */
 struct survivor_first_t {
 
     /** Sorted runs of the upper LSM level: a newer upper sorted run shadows older ones, and any upper sorted run every
@@ -183,22 +221,64 @@ struct survivor_first_t {
                               located_key_slot<key_slot_type_> const& second) const noexcept {
         if (first.key_slot.stored_key < second.key_slot.stored_key) return true;
         if (second.key_slot.stored_key < first.key_slot.stored_key) return false;
+        // Versions of one key inside one run keep that run's newest-first order, whatever the sort's stability.
+        if (first.sorted_run == second.sorted_run) return first.stamp > second.stamp;
         bool const both_upper = (first.sorted_run < upper_sorted_runs_count) &
                                 (second.sorted_run < upper_sorted_runs_count);
         return both_upper ? first.sorted_run > second.sorted_run : first.sorted_run < second.sorted_run;
     }
 };
 
-/** Whether @p current survives a merge: it leads its stored key, and is not tombstoned where tombstones drop. */
+/** How many of the readers @p stamps pins read at or above @p stamp, which names the interval between two
+ *  pinned stamps that @p stamp falls into. */
+constexpr std::uint64_t reader_interval(compaction_stamps_t const& stamps, std::uint64_t stamp) noexcept {
+    std::uint64_t low = 0;
+    std::uint64_t high = stamps.pinned_count;
+    while (low < high) {
+        std::uint64_t const middle = low + (high - low) / 2;
+        if (stamps.pinned[middle] < stamp) low = middle + 1;
+        else high = middle;
+    }
+    return stamps.pinned_count - low;
+}
+
+/**
+ *  @brief Whether a version stamped @p current, following one stamped @p previous of the same key in newest-first
+ *      order, is still read by someone.
+ *
+ *  A version is read by the readers pinned at or above it and below the version before it, so it survives when
+ *  the two fall in different reader intervals. Above the durable horizon every version survives, since a mount may
+ *  drop any version above whatever horizon the catalog it finds promises, and needs the one beneath.
+ */
+constexpr bool keeps_older_version(compaction_stamps_t const& stamps, std::uint64_t previous,
+                                   std::uint64_t current) noexcept {
+    if (previous > stamps.ceiling || previous > stamps.horizon || current > stamps.horizon) return true;
+    return reader_interval(stamps, current) != reader_interval(stamps, previous);
+}
+
+/**
+ *  @brief Whether @p current survives a merge: some reader still reads it, and it is no tombstone where nothing
+ *      older survives below it to hide.
+ *
+ *  With no reader pinned and both bounds at their widest, this is the newest version of every key, tombstones
+ *  dropping where the merge writes the bottom level.
+ */
 template <typename key_slot_type_>
 constexpr bool survives(located_key_slot<key_slot_type_> const* previous,
-                        located_key_slot<key_slot_type_> const& current, compaction_kind_t kind) noexcept {
+                        located_key_slot<key_slot_type_> const& current, compaction_kind_t kind,
+                        compaction_stamps_t const& stamps) noexcept {
     assert((previous == nullptr || !(current.key_slot.stored_key < previous->key_slot.stored_key)) &&
            "survivors are flagged over a merge sorted by stored key");
-    if (previous != nullptr && previous->key_slot.stored_key == current.key_slot.stored_key) return false;
+    if (current.stamp > stamps.ceiling) return false;
+    if (previous != nullptr && previous->key_slot.stored_key == current.key_slot.stored_key &&
+        !keeps_older_version(stamps, previous->stamp, current.stamp))
+        return false;
     bool const drops_tombstones = (kind == compaction_kind_t::overlapping_into_bottom_k) |
                                   (kind == compaction_kind_t::sorted_into_bottom_k);
-    return !(drops_tombstones && current.key_slot.is_tombstone());
+    // Only in the oldest interval does every older version of the key fall in the same one and drop with it.
+    bool const oldest = (current.stamp <= stamps.horizon) &
+                        (reader_interval(stamps, current.stamp) == stamps.pinned_count);
+    return !(drops_tombstones && current.key_slot.is_tombstone() && oldest);
 }
 
 /** Bytes of the stored value @p key_slot locates in a stored values section, zero for empty, tombstoned and inline
@@ -242,12 +322,16 @@ constexpr key_slot_type_ padding_key_slot() noexcept {
     return padding;
 }
 
-/** Copies @p cell of a sorted run into its sorted position among @p records, skipping padding. */
+/** Copies @p cell of a sorted run and its stamp out of @p stamps, null reading as zero, into its sorted position
+ *  among @p records, skipping padding. */
 template <typename key_slot_type_>
 constexpr void extract_cell(key_slot_type_ const* cells, sorted_run_index_layout_t const& layout, std::uint64_t cell,
-                            std::uint32_t sorted_run, located_key_slot<key_slot_type_>* records) noexcept {
+                            std::uint32_t sorted_run, std::uint64_t const* stamps,
+                            located_key_slot<key_slot_type_>* records) noexcept {
     std::uint64_t const sorted = layout.cell_to_sorted(cell);
-    if (sorted < layout.key_slots_count) records[sorted] = located_key_slot<key_slot_type_> {cells[cell], sorted_run};
+    if (sorted < layout.key_slots_count)
+        records[sorted] = located_key_slot<key_slot_type_> {cells[cell], sorted_run,
+                                                            stamps != nullptr ? stamps[sorted] : std::uint64_t {0}};
 }
 
 /**
@@ -258,13 +342,17 @@ constexpr void extract_cell(key_slot_type_ const* cells, sorted_run_index_layout
  *  @param[in] position Position of the survivor in the new sorted run's sorted order.
  *  @param[in] section_offset Offset of the new sorted run's stored values section.
  *  @param[in] preceding_bytes Stored value bytes the survivors before it in the new sorted run locate.
+ *  @param[in] floor The stamp the survivor's stamp is raised to at least.
  *  @param[out] cells The new sorted run's cells.
  *  @param[out] migration The survivor's migration, written only for key slots that locate stored values.
+ *  @param[out] stamp The survivor's stamp, raised to @p floor.
  */
 template <typename key_slot_type_>
 constexpr void place_key_slot(located_key_slot<key_slot_type_> const& source, sorted_run_index_layout_t const& layout,
                               std::uint64_t position, std::uint64_t section_offset, std::uint64_t preceding_bytes,
-                              key_slot_type_* cells, stored_value_migration_t* migration) noexcept {
+                              std::uint64_t floor, key_slot_type_* cells, stored_value_migration_t* migration,
+                              std::uint64_t* stamp) noexcept {
+    *stamp = source.stamp > floor ? source.stamp : floor;
     key_slot_type_ key_slot = source.key_slot;
     if constexpr (locates_stored_values_concept<key_slot_type_>) {
         migration->size = static_cast<std::uint32_t>(stored_value_bytes(key_slot));
@@ -279,15 +367,20 @@ constexpr void place_key_slot(located_key_slot<key_slot_type_> const& source, so
 /**
  *  @brief Cuts @p key_slots_count sorted survivors into sorted runs, filling each as far as @p bounds allow.
  *
- *  A sorted run takes the most key slots that fit its capacity and file limit, and always at least one.
+ *  A sorted run takes the most key slots that fit its capacity and file limit, and always at least one. The
+ *  versions of one key never straddle two runs, since a sorted level answers a key from the one run whose bounds
+ *  hold it: a cut moves back to where the key begins, or past where it ends when it began the run.
  *
  *  @param[in] read_prefix Called as @c read_prefix(index, bytes) to write the stored value bytes of the first @c index
  *      survivors.
+ *  @param[in] shares_key Called as @c shares_key(index, shared) to say whether survivor @c index carries the key
+ *      survivor @c index - 1 does.
  *  @param[out] sorted runs The planned sorted runs, replacing what it held.
  */
-template <typename key_slot_type_, typename prefix_reader_type_, typename sorted_runs_type_>
+template <typename key_slot_type_, typename prefix_reader_type_, typename key_sharing_type_, typename sorted_runs_type_>
 st::status_t plan_sorted_runs(std::uint64_t key_slots_count, sorted_run_bounds_t const& bounds,
-                              prefix_reader_type_&& read_prefix, sorted_runs_type_& sorted_runs) noexcept {
+                              prefix_reader_type_&& read_prefix, key_sharing_type_&& shares_key,
+                              sorted_runs_type_& sorted_runs) noexcept {
     using st::status_t;
     sorted_runs.clear();
 
@@ -317,6 +410,29 @@ st::status_t plan_sorted_runs(std::uint64_t key_slots_count, sorted_run_bounds_t
                 else high = middle - 1;
             }
             taken = fitting;
+            status = read_prefix(first + taken, taken_bytes);
+            if (status != status_t::success_k) return status;
+        }
+
+        bool shared = false;
+        if (first + taken != key_slots_count) {
+            status = shares_key(first + taken, shared);
+            if (status != status_t::success_k) return status;
+        }
+        if (shared) {
+            std::uint64_t cut = first + taken;
+            while (shared && cut != first + 1) {
+                status = shares_key(--cut, shared);
+                if (status != status_t::success_k) return status;
+            }
+            // Every survivor of the run so far carries one key, so the run takes that key whole however long it is.
+            if (shared)
+                for (cut = first + taken + 1; cut != key_slots_count; ++cut) {
+                    status = shares_key(cut, shared);
+                    if (status != status_t::success_k) return status;
+                    if (!shared) break;
+                }
+            taken = cut - first;
             status = read_prefix(first + taken, taken_bytes);
             if (status != status_t::success_k) return status;
         }
@@ -356,7 +472,8 @@ struct cpu_compactor_t {
      *  @param[in] upper The upper LSM level's sorted runs, oldest first when they overlap and ascending otherwise.
      *  @param[in] lower The lower LSM level's sorted runs the upper LSM level overlaps, ascending.
      *  @param[in] bounds Bounds every new sorted run fits.
-     *  @param[out] output The new sorted runs, their cells and their stored values' migrations.
+     *  @param[in] stamps Which older versions survive, which versions drop, and the floor every stamp is raised to.
+     *  @param[out] output The new sorted runs, their cells, their stamps and their stored values' migrations.
      *  @retval invalid_argument_k The bounds admit no sorted run, or the LSM levels hold more than 2^32 sorted runs.
      *  @retval out_of_memory_heap_k A buffer could not grow.
      */
@@ -364,7 +481,7 @@ struct cpu_compactor_t {
         requires compactable_key_slot_concept<key_slot_type_>
     st::status_t compact(compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_type_> const> upper,
                          std::span<sorted_run_index_view<key_slot_type_> const> lower,
-                         sorted_run_bounds_t const& bounds,
+                         sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps,
                          compaction_output<key_slot_type_, allocator_type_>& output) const noexcept {
         using st::basic_vector;
         using st::status_t;
@@ -398,8 +515,11 @@ struct cpu_compactor_t {
             if (sorted_run <= upper.size()) run_starts[sorted_run] = run_offset;
             sorted_run_index_layout_t const layout(view.key_slots_count, bounds.branching);
             for (std::uint64_t cell = 0; cell != layout.cells_count(); ++cell)
-                extract_cell(view.cells, layout, cell, static_cast<std::uint32_t>(sorted_run),
+                extract_cell(view.cells, layout, cell, static_cast<std::uint32_t>(sorted_run), nullptr,
                              records.data() + run_offset);
+            if (view.stamps != nullptr)
+                for (std::uint64_t sorted = 0; sorted != view.key_slots_count; ++sorted)
+                    records[run_offset + sorted].stamp = (*view.stamps)[static_cast<std::size_t>(sorted)];
             run_offset += view.key_slots_count;
         }
         run_starts[upper.size()] = upper_key_slots;
@@ -433,7 +553,7 @@ struct cpu_compactor_t {
         std::uint64_t survivors = 0;
         for (std::uint64_t index = 0; index != merged_count; ++index) {
             record_t const* previous = index != 0 ? scratch.data() + index - 1 : nullptr;
-            if (survives(previous, scratch[index], kind)) records[survivors++] = scratch[index];
+            if (survives(previous, scratch[index], kind, stamps)) records[survivors++] = scratch[index];
         }
 
         basic_vector<std::uint64_t> prefix;
@@ -448,7 +568,11 @@ struct cpu_compactor_t {
             bytes = prefix.size() != 0 ? prefix[index] : 0;
             return status_t::success_k;
         };
-        status = plan_sorted_runs<key_slot_type_>(survivors, bounds, read_prefix, output.sorted_runs);
+        auto const shares_key = [&records](std::uint64_t index, bool& shared) noexcept {
+            shared = records[index - 1].key_slot.stored_key == records[index].key_slot.stored_key;
+            return status_t::success_k;
+        };
+        status = plan_sorted_runs<key_slot_type_>(survivors, bounds, read_prefix, shares_key, output.sorted_runs);
         if (status != status_t::success_k) return status;
 
         std::uint64_t cells_count = 0;
@@ -460,6 +584,8 @@ struct cpu_compactor_t {
         for (std::uint64_t cell = 0; cell != cells_count; ++cell) output.cells[cell] = padding;
 
         status = output.migrations.resize(locates_stored_values_concept<key_slot_type_> ? survivors : 0);
+        if (status != status_t::success_k) return status;
+        status = output.stamps.resize(survivors);
         if (status != status_t::success_k) return status;
 
         std::uint64_t first = 0;
@@ -474,8 +600,8 @@ struct cpu_compactor_t {
                 stored_value_migration_t* const migration = output.migrations.size() != 0
                                                                 ? output.migrations.data() + survivor
                                                                 : nullptr;
-                place_key_slot(records[survivor], layout, position, section_offset, preceding,
-                               output.cells.data() + first_cell, migration);
+                place_key_slot(records[survivor], layout, position, section_offset, preceding, stamps.floor,
+                               output.cells.data() + first_cell, migration, output.stamps.data() + survivor);
             }
             first += count;
             first_cell += layout.cells_count();
@@ -505,7 +631,7 @@ class gpu_compactor_t {
         requires compactable_key_slot_concept<key_slot_type_>
     st::status_t compact(compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_type_> const> upper,
                          std::span<sorted_run_index_view<key_slot_type_> const> lower,
-                         sorted_run_bounds_t const& bounds,
+                         sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps,
                          compaction_output<key_slot_type_, allocator_type_>& output) noexcept;
 
     /** The ordinal of the device the compactor runs on. */

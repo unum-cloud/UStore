@@ -103,7 +103,7 @@ struct database_types {
 /** The collection name @p text, owned, as a lookup by name takes it; a suite's literals always fit. */
 string_t owned_name(std::string_view text) noexcept {
     string_t owned;
-    [[maybe_unused]] sz::status_t const assigned = owned.assign(string_view_t {text.data(), text.size()});
+    [[maybe_unused]] sz::status_t const assigned = owned.assign(string_view_t {text});
     return owned;
 }
 
@@ -227,11 +227,14 @@ template <typename volume_type_>
     return counted;
 }
 
-/** Runs the catalog blob on @p volume names, counted off the length its fixed-width records fix. */
+/** Runs the copy of the catalog blob on @p volume that save @p generation wrote names, counted off the length its
+ *  fixed-width records fix. */
 template <typename volume_type_>
-[[nodiscard]] std::size_t runs_named_by_schema(volume_type_ const& volume, std::size_t collections) noexcept {
-    expected<volume_blob_t> const found = volume.find(database_schema_name());
-    std::size_t const fixed = 3 * sizeof(std::uint64_t) + collections * sizeof(collection_record_t);
+[[nodiscard]] std::size_t runs_named_by_schema(volume_type_ const& volume, std::size_t collections,
+                                               std::uint64_t generation) noexcept {
+    expected<volume_blob_t> const found = volume.find(database_schema_name(catalog_copy_of(generation)));
+    std::size_t const fixed = 3 * sizeof(std::uint64_t) + sizeof(catalog_stamps_t) +
+                              collections * sizeof(collection_record_t);
     if (!found || found->length < fixed) return 0;
     return static_cast<std::size_t>((found->length - fixed) / sizeof(lsm_tree_run_record_t));
 }
@@ -289,6 +292,66 @@ expected<std::unique_ptr<typename database_types<typename mount_type_::fixture_t
     if (open_database_status.failed()) return open_database_status;
     stack->store = std::move(store);
     return stack;
+}
+
+/** Copies the whole medium of volume zero of @p fixture into @p image, block by block on @p channel, which is what a
+ *  crash would leave on it at this moment. */
+template <typename fixture_type_>
+status_t capture_medium(fixture_type_& fixture, io_channel_t& channel, st::basic_vector<byte_t>& image) noexcept {
+    std::uint64_t const capacity = fixture.config.volume_bytes;
+    std::uint64_t const block = round_down_to_multiple(channel.requests().buffer_bytes(), portable_alignment_k);
+    if (block == 0) return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than one page"};
+    if (image.resize(static_cast<std::size_t>(capacity)) != st::status_t::success_k)
+        return {status_code_t::out_of_memory_k, "No room for the image of a medium"};
+    basic_read_pipeline<typename fixture_type_::disk_t> reader {fixture.disk, channel, fixture.media[0].reference()};
+    for (std::uint64_t offset = 0; offset < capacity; offset += block) {
+        std::uint64_t const length = capacity - offset < block ? capacity - offset : block;
+        if (status_t const offered = reader.enqueue_read(extent_t {offset, length}, 0); offered.failed())
+            return offered;
+        if (status_t const submitted = reader.submit(); submitted.failed()) return submitted;
+        status_t carried;
+        auto sink = [&](completed_buffer_t const& completed) noexcept {
+            if (status_t const whole = require_completed_in_full(completed); whole.failed()) carried = whole;
+            else std::memcpy(image.data() + offset, completed.bytes.data(), static_cast<std::size_t>(length));
+        };
+        if (status_t const polled = reader.poll_all_completions(sink); polled.failed()) return polled;
+        if (carried.failed()) return carried;
+    }
+    return {};
+}
+
+/** Writes @p image back over the whole medium of volume zero of @p fixture, as a restart after a crash finds it. */
+template <typename fixture_type_>
+status_t restore_medium(fixture_type_& fixture, io_channel_t& channel, std::span<byte_t const> image) noexcept {
+    basic_write_pipeline<typename fixture_type_::disk_t> writer {fixture.disk, channel, fixture.media[0].reference()};
+    std::uint64_t offset = 0;
+    while (offset != image.size()) {
+        auto [buffer, acquire_status] = writer.acquire_buffer_or_poll();
+        if (acquire_status.failed()) return acquire_status;
+        std::uint64_t const room = round_down_to_multiple(buffer.size(), portable_alignment_k);
+        if (room == 0) return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than one page"};
+        std::uint64_t const length = image.size() - offset < room ? image.size() - offset : room;
+        std::memcpy(buffer.bytes().data(), image.data() + offset, static_cast<std::size_t>(length));
+        if (status_t const queued = writer.enqueue_write(std::move(buffer), extent_t {offset, length}); queued.failed())
+            return queued;
+        if (status_t const submitted = writer.submit(); submitted.failed()) return submitted;
+        offset += length;
+    }
+    return writer.make_durable();
+}
+
+/** Mounts volume zero of the fixture of @p stack again into a fresh router, as a process starting after a crash
+ *  does. */
+template <typename stack_type_>
+status_t remount_volume(stack_type_& stack) noexcept {
+    auto [built, make_status] = decltype(stack.router)::make();
+    if (make_status.failed()) return make_status;
+    stack.router = std::move(built);
+    auto [guard, acquire_status] = stack.fixture->channels.acquire();
+    if (acquire_status.failed()) return acquire_status;
+    auto volume = stack.fixture->mount_volume(guard.channel(), 0, volume_recovery_t::refuse_k);
+    if (!volume) return volume.status();
+    return stack.router.bind_queue_pair(std::move(*volume));
 }
 
 #pragma endregion Fixtures
@@ -443,8 +506,9 @@ std::size_t catalog_survives_reopen(mount_type_ const& mount) {
     failures += expect((*stack)->store->compact().succeeded());
 
     // A merge records its new set before it drops what it consumed, so neither outlives the other.
-    failures += expect_eq(runs_named_by_schema((*stack)->router.volume(volume_id_t {0}), 3),
-                          run_count_of((*stack)->router.volume(volume_id_t {0})));
+    failures += expect_eq(
+        runs_named_by_schema((*stack)->router.volume(volume_id_t {0}), 3, (*stack)->store->catalog_generation()),
+        run_count_of((*stack)->router.volume(volume_id_t {0})));
     for (std::uint64_t key = 0; key < keys_k; key += 3) failures += write_painted(*(*stack)->store, named, key, 2);
     failures += expect((*stack)->store->flush().succeeded());
     if (failures != 0) return failures;
@@ -614,7 +678,8 @@ std::size_t crash_between_seal_and_schema(mount_type_ const& mount) {
         failures += expect((*stack)->store->flush().succeeded());
 
         // A flush seals its runs and records them second, so the catalog already names every run.
-        failures += expect_eq(runs_named_by_schema(volume, 1), run_count_of(volume));
+        failures += expect_eq(runs_named_by_schema(volume, 1, (*stack)->store->catalog_generation()),
+                              run_count_of(volume));
         failures += expect((*stack)->store->unmount().succeeded());
         (*stack)->store.reset();
 
@@ -623,12 +688,14 @@ std::size_t crash_between_seal_and_schema(mount_type_ const& mount) {
         failures += expect(runs != std::size_t {0});
         failures += expect(wasted != std::uint64_t {0});
 
-        // The schema write that would have named those runs never landed.
+        // No copy of the schema that would have named those runs ever landed.
         {
             expected<guard_t> guard = (*stack)->fixture->channels.acquire();
             failures += expect(guard.has_value());
             if (!guard) return failures;
-            failures += expect(volume.drop(guard->channel(), database_schema_name()).succeeded());
+            for (std::size_t copy = 0; copy != 2; ++copy)
+                if (volume.names(database_schema_name(copy)))
+                    failures += expect(volume.drop(guard->channel(), database_schema_name(copy)).succeeded());
         }
 
         expected<std::unique_ptr<database_t>> reopened = open_database(**stack);
@@ -701,6 +768,98 @@ std::size_t crash_between_seal_and_schema(mount_type_ const& mount) {
     return failures;
 }
 
+/**
+ *  @brief A crash between a flush and the catalog save loses a suffix of commits and never half of one.
+ *
+ *  A commit lands in two collections; the first flushes it on its own while the second still buffers it, and a catalog
+ *  save then names the first's run. The medium as it stands then is what a crash leaves: a reopen of it drops the
+ *  commit from the run that carries it, every commit after it too, and keeps every commit before it whole.
+ */
+template <typename mount_type_>
+case_result_t crash_keeps_a_prefix_of_commits(mount_type_ const& mount) {
+    using types_t = database_types<typename mount_type_::fixture_t>;
+    using guard_t = typename types_t::guard_t;
+    using database_t = typename types_t::database_t;
+    using stack_t = typename types_t::stack_t;
+    std::size_t failures = 0;
+    if (mount.transport == transport_t::device_k)
+        return case_result_t::skipped("a block device's medium is not one a case may copy", failures);
+    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
+    failures += expect_status(stack, status_code_t::success_k);
+    if (!stack) return failures;
+    database_t& store = *(*stack)->store;
+
+    // The first collection flushes once its buffer holds its few writes, the second never does on its own.
+    collection_config_t narrow = test_config(8, 0);
+    narrow.write_buffer_max_elements = 4;
+    expected<collection_id_t> const first = create_named(store, "first", narrow);
+    expected<collection_id_t> const second = create_named(store, "second", test_config(8, 0));
+    failures += expect(first.has_value() && second.has_value());
+    if (failures != 0) return failures;
+    any_collection_id_t const left {*first};
+    any_collection_id_t const right {*second};
+
+    auto commit_both = [&](std::uint64_t value) noexcept {
+        expected<typename database_t::transaction_unique_ptr_t> transaction = store.create_transaction();
+        if (!transaction) return std::size_t {1};
+        std::array<byte_t, 8> const counter = counted(value);
+        std::size_t missed = 0;
+        missed += expect((*transaction)->insert(left, stored_key_t {0}, stored_value_view_t {counter}).succeeded());
+        missed += expect((*transaction)->insert(right, stored_key_t {0}, stored_value_view_t {counter}).succeeded());
+        missed += expect((*transaction)->commit().succeeded());
+        return missed;
+    };
+    failures += commit_both(1);
+    failures += expect(store.flush().succeeded());
+    failures += commit_both(2);
+    for (std::uint64_t key = 100; key != 104; ++key) {
+        std::array<byte_t, 8> const counter = counted(key);
+        failures += expect(
+            store.insert(left, static_cast<stored_key_t>(key), stored_value_view_t {counter}).succeeded());
+    }
+    failures += expect(create_named(store, "saved", test_config(8, 0)).has_value());
+
+    // Before the crash both collections answer the second commit, the first from a run, the second from its buffer.
+    std::array<byte_t, 8> into {};
+    stored_value_size_t size = 0;
+    failures += expect(store.select(left, stored_key_t {0}, std::span<byte_t> {into}, size).succeeded());
+    failures += expect_eq(counter_of(std::span<byte_t const> {into.data(), size}), std::uint64_t {2});
+    st::basic_vector<byte_t> image;
+    {
+        expected<guard_t> guard = (*stack)->fixture->channels.acquire();
+        failures += expect(guard.has_value());
+        if (!guard) return failures;
+        failures += expect(capture_medium(*(*stack)->fixture, guard->channel(), image).succeeded());
+    }
+    (*stack)->store.reset();
+    {
+        expected<guard_t> guard = (*stack)->fixture->channels.acquire();
+        failures += expect(guard.has_value());
+        if (!guard) return failures;
+        failures += expect(
+            restore_medium(*(*stack)->fixture, guard->channel(), std::span<byte_t const> {image}).succeeded());
+    }
+    failures += expect(remount_volume(**stack).succeeded());
+    expected<std::unique_ptr<database_t>> reopened = open_database(**stack);
+    failures += expect(reopened.has_value());
+    if (failures != 0) return failures;
+
+    // The first commit is whole, the second gone from both sides, and the writes after it gone with it.
+    failures += expect((*reopened)->has_collection(any_collection_id_t {owned_name("saved")}));
+    failures += expect((*reopened)->select(left, stored_key_t {0}, std::span<byte_t> {into}, size).succeeded());
+    failures += expect_eq(counter_of(std::span<byte_t const> {into.data(), size}), std::uint64_t {1});
+    failures += expect((*reopened)->select(right, stored_key_t {0}, std::span<byte_t> {into}, size).succeeded());
+    failures += expect_eq(counter_of(std::span<byte_t const> {into.data(), size}), std::uint64_t {1});
+    for (std::uint64_t key = 100; key != 104; ++key) failures += expect(!(*reopened)->contains(left, key));
+
+    // A commit after the reopen lands under a fresh stamp and reads back.
+    std::array<byte_t, 8> const counter = counted(3);
+    failures += expect((*reopened)->insert(left, stored_key_t {0}, stored_value_view_t {counter}).succeeded());
+    failures += expect((*reopened)->select(left, stored_key_t {0}, std::span<byte_t> {into}, size).succeeded());
+    failures += expect_eq(counter_of(std::span<byte_t const> {into.data(), size}), std::uint64_t {3});
+    return failures;
+}
+
 /** The bytes a caller saves next to the database survive a reopen and a clearing. */
 template <typename mount_type_>
 std::size_t user_data_round_trips(mount_type_ const& mount) {
@@ -742,9 +901,9 @@ std::size_t user_data_round_trips(mount_type_ const& mount) {
 /**
  *  @brief A transaction spanning two collections is never seen half applied.
  *
- *  Each round writes a whole band of keys into both collections, and their write buffers are narrow
- *  enough that applying one band flushes several runs, so the apply phase moves bytes and a reader has
- *  a wide window to land inside. The reader holds one level set per collection at one moment and counts
+ *  Each round writes a whole band of keys into both collections, and their write buffers are narrower
+ *  than a band, so every commit lands past the bounds and flushes the band before it, and a reader has
+ *  runs publishing beside it. The reader holds one level set per collection at one moment and counts
  *  every key that one of them carries and the other does not.
  */
 template <typename mount_type_>
@@ -792,7 +951,7 @@ std::size_t commit_is_all_or_nothing(mount_type_ const& mount) {
     }};
 
     for (std::size_t round = 0; round != rounds_k; ++round) {
-        expected<typename database_t::transaction_unique_ptr_t> transaction = store.create_transaction(1);
+        expected<typename database_t::transaction_unique_ptr_t> transaction = store.create_transaction();
         failures += expect(transaction.has_value());
         if (!transaction) break;
         for (std::size_t step = 0; step != band_k; ++step) {
@@ -848,8 +1007,8 @@ std::size_t conflict_leaves_the_other_collection_untouched(mount_type_ const& mo
     failures += expect(quiet.has_value());
     if (failures != 0) return failures;
 
-    expected<typename database_t::transaction_unique_ptr_t> loser = store.create_transaction(1);
-    expected<typename database_t::transaction_unique_ptr_t> winner = store.create_transaction(2);
+    expected<typename database_t::transaction_unique_ptr_t> loser = store.create_transaction();
+    expected<typename database_t::transaction_unique_ptr_t> winner = store.create_transaction();
     failures += expect(loser.has_value());
     failures += expect(winner.has_value());
     if (failures != 0) return failures;
@@ -905,7 +1064,7 @@ std::size_t rollback_and_renew_behave(mount_type_ const& mount) {
     failures += expect(only.has_value());
     if (!only) return failures;
 
-    expected<typename database_t::transaction_unique_ptr_t> transaction = store.create_transaction(1);
+    expected<typename database_t::transaction_unique_ptr_t> transaction = store.create_transaction();
     failures += expect(transaction.has_value());
     if (!transaction) return failures;
     transaction_t& handler = **transaction;
@@ -1105,9 +1264,8 @@ std::size_t threads_commit_serializably(mount_type_ const& mount) {
     std::atomic<std::size_t> thread_failures {0};
     std::array<std::thread, threads_k> workers;
     for (std::size_t worker = 0; worker != threads_k; ++worker)
-        workers[worker] = std::thread {[&, worker]() noexcept {
-            expected<typename database_t::transaction_unique_ptr_t> transaction = store.create_transaction(
-                static_cast<transaction_id_t>(worker + 1));
+        workers[worker] = std::thread {[&]() noexcept {
+            expected<typename database_t::transaction_unique_ptr_t> transaction = store.create_transaction();
             if (!transaction) {
                 thread_failures.fetch_add(1, std::memory_order_relaxed);
                 return;
@@ -1293,6 +1451,7 @@ int main(int argc, char const* argv[]) {
         report(totals, mount, "catalog_survives_reopen", catalog_survives_reopen);
         report(totals, mount, "dropped_collection_is_gone", dropped_collection_is_gone);
         report(totals, mount, "crash_before_schema", crash_between_seal_and_schema);
+        report(totals, mount, "crash_keeps_a_prefix", crash_keeps_a_prefix_of_commits);
         report(totals, mount, "user_data", user_data_round_trips);
         report(totals, mount, "commit_is_all_or_nothing", commit_is_all_or_nothing);
         report(totals, mount, "conflict_spares_the_other", conflict_leaves_the_other_collection_untouched);

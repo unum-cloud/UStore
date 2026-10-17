@@ -5,9 +5,9 @@
  *  @brief Tests host and GPU compaction against a reference merge and against each other, for 64-bit and 16-byte keys.
  *
  *  The suite compiles as plain C++ twice: the build over the CUDA compactor adds the device cases, which the host build
- *  reports as skipped, and @c compaction_device.cu instantiates that compactor for the suite's key slots. LSM levels
- * are generated from a seed, with overlapping and sorted sorted runs, tombstones, and keys crowded at the edges a
- * comparator gets wrong.
+ *  reports as skipped, and @c compaction_device.cu instantiates that compactor for the suite's key slots. LSM
+ *  levels are generated from a seed, with overlapping and sorted runs, tombstones, versions of one key under
+ *  several stamps, and keys crowded at the edges a comparator gets wrong.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
@@ -233,7 +233,25 @@ struct scenario_t {
 
     /** Bounds of the new sorted runs. */
     sorted_run_bounds_t bounds;
+
+    /** Chance per thousand that a picked key also carries an older version inside the same sorted run. */
+    std::uint64_t versions_per_mille = 0;
+
+    /** Stamps readers pin, drawn at random from the stamps the LSM levels carry. */
+    std::uint64_t pinned = 0;
+
+    /** Where the durable horizon sits among the stamps, per thousand of their range, a thousand keeping it past all. */
+    std::uint64_t horizon_per_mille = 1000;
+
+    /** Where the ceiling sits among the stamps, per thousand of their range, a thousand keeping it past all. */
+    std::uint64_t ceiling_per_mille = 1000;
+
+    /** Where the floor sits among the stamps, per thousand of their range. */
+    std::uint64_t floor_per_mille = 0;
 };
+
+/** Stamps one sorted run's versions are drawn from: each run's own span, newer runs holding greater ones. */
+inline constexpr std::uint64_t stamps_per_sorted_run_k = std::uint64_t {1} << 32;
 
 /** An LSM level under test: each sorted run's sorted key slots, and its cells once laid out. */
 template <typename key_slot_type_>
@@ -242,13 +260,19 @@ struct test_lsm_level {
     /** Every sorted run's key slots in ascending order, one sorted run after another. */
     basic_vector<key_slot_type_> sorted;
 
+    /** The stamp of every key slot of @c sorted, newest first among the versions of one key. */
+    basic_vector<std::uint64_t> stamps;
+
     /** Key slots in each sorted run. */
     basic_vector<std::uint64_t> counts;
 
     /** Every sorted run's cells, one sorted run after another. */
     basic_vector<key_slot_type_> cells;
 
-    /** A view per sorted run into @c cells. */
+    /** Every sorted run's stamps packed, as a run keeps them, or none for an LSM level without stamps. */
+    basic_vector<stamps_column_t> columns;
+
+    /** A view per sorted run into @c cells and @c columns. */
     basic_vector<sorted_run_index_view<key_slot_type_>> views;
 };
 
@@ -271,30 +295,52 @@ std::uint64_t assign_sorted_positions(std::uint64_t* positions, std::uint64_t ro
     return assign_sorted_positions(positions, rows_count, branching, row * (branching + 1) + branching + 1, next);
 }
 
-/** Picks each key of @p keys with the scenario's density, appending its key slot to @p key_slots. */
+/** A key slot state with the scenario's tombstone chance. */
+inline key_slot_state_t random_state(scenario_t const& scenario, random_t& random) noexcept {
+    return random.below(1000) < scenario.tombstones_per_mille ? key_slot_state_t::tombstone_k
+                                                              : key_slot_state_t::alive_k;
+}
+
+/**
+ *  @brief Picks each key of @p keys with the scenario's density, appending its key slot to @p key_slots and its stamp,
+ *      drawn from the span of era @p era, to @p stamps.
+ *
+ *  A key picked twice over carries two versions in this one sorted run, the newer from the upper half of the era.
+ */
 template <typename key_slot_type_>
 st::status_t pick_key_slots(std::span<typename key_slot_type_::stored_key_t const> keys, scenario_t const& scenario,
-                            random_t& random, basic_vector<key_slot_type_>& key_slots) noexcept {
+                            std::uint64_t era, random_t& random, basic_vector<key_slot_type_>& key_slots,
+                            basic_vector<std::uint64_t>& stamps) noexcept {
+    std::uint64_t const half = stamps_per_sorted_run_k / 2;
+    std::uint64_t const base = era * stamps_per_sorted_run_k;
     for (std::size_t index = 0; index != keys.size(); ++index) {
         if (random.below(1000) >= scenario.density_per_mille) continue;
-        key_slot_state_t const state = random.below(1000) < scenario.tombstones_per_mille
-                                           ? key_slot_state_t::tombstone_k
-                                           : key_slot_state_t::alive_k;
-        st::status_t const status = key_slots.push_back(
-            make_key_slot(std::type_identity<key_slot_type_> {}, keys[index], state, random));
+        bool const versioned = random.below(1000) < scenario.versions_per_mille;
+        st::status_t status = key_slots.push_back(
+            make_key_slot(std::type_identity<key_slot_type_> {}, keys[index], random_state(scenario, random), random));
+        if (status != st::status_t::success_k) return status;
+        status = stamps.push_back(base +
+                                  (versioned ? half + random.below(half) : random.below(stamps_per_sorted_run_k)));
+        if (status != st::status_t::success_k) return status;
+        if (!versioned) continue;
+        status = key_slots.push_back(
+            make_key_slot(std::type_identity<key_slot_type_> {}, keys[index], random_state(scenario, random), random));
+        if (status != st::status_t::success_k) return status;
+        status = stamps.push_back(base + random.below(half));
         if (status != st::status_t::success_k) return status;
     }
     return st::status_t::success_k;
 }
 
-/** Adds @p sorted_runs overlapping sorted runs, oldest first, each picking its own keys. */
+/** Adds @p sorted_runs overlapping sorted runs, oldest first, each picking its own keys from an era of its own. */
 template <typename key_slot_type_>
 st::status_t add_overlapping_sorted_runs(std::span<typename key_slot_type_::stored_key_t const> keys,
-                                         scenario_t const& scenario, std::uint64_t sorted_runs, random_t& random,
-                                         test_lsm_level<key_slot_type_>& lsm_level) noexcept {
+                                         scenario_t const& scenario, std::uint64_t sorted_runs, std::uint64_t first_era,
+                                         random_t& random, test_lsm_level<key_slot_type_>& lsm_level) noexcept {
     for (std::uint64_t sorted_run = 0; sorted_run != sorted_runs; ++sorted_run) {
         std::size_t const before = lsm_level.sorted.size();
-        st::status_t status = pick_key_slots<key_slot_type_>(keys, scenario, random, lsm_level.sorted);
+        st::status_t status = pick_key_slots<key_slot_type_>(keys, scenario, first_era + sorted_run, random,
+                                                             lsm_level.sorted, lsm_level.stamps);
         if (status != st::status_t::success_k) return status;
         std::uint64_t const count = lsm_level.sorted.size() - before;
         if (count == 0) continue;
@@ -304,19 +350,24 @@ st::status_t add_overlapping_sorted_runs(std::span<typename key_slot_type_::stor
     return st::status_t::success_k;
 }
 
-/** Adds one sorted LSM level's keys, cut into @p sorted_runs disjoint ascending sorted runs. */
+/** Adds one sorted LSM level's keys from era @p era, cut into @p sorted_runs disjoint ascending sorted runs that never
+ *  split the versions of one key. */
 template <typename key_slot_type_>
 st::status_t add_sorted_sorted_runs(std::span<typename key_slot_type_::stored_key_t const> keys,
-                                    scenario_t const& scenario, std::uint64_t sorted_runs, random_t& random,
-                                    test_lsm_level<key_slot_type_>& lsm_level) noexcept {
-    st::status_t status = pick_key_slots<key_slot_type_>(keys, scenario, random, lsm_level.sorted);
+                                    scenario_t const& scenario, std::uint64_t sorted_runs, std::uint64_t era,
+                                    random_t& random, test_lsm_level<key_slot_type_>& lsm_level) noexcept {
+    st::status_t status = pick_key_slots<key_slot_type_>(keys, scenario, era, random, lsm_level.sorted,
+                                                         lsm_level.stamps);
     if (status != st::status_t::success_k) return status;
     std::uint64_t const total = lsm_level.sorted.size();
     if (total == 0) return st::status_t::success_k;
     std::uint64_t const chunk = divide_round_up(total, sorted_runs);
-    for (std::uint64_t offset = 0; offset < total; offset += chunk) {
-        status = lsm_level.counts.push_back(std::uint64_t {chunk < total - offset ? chunk : total - offset});
+    for (std::uint64_t offset = 0; offset < total;) {
+        std::uint64_t end = chunk < total - offset ? offset + chunk : total;
+        while (end != total && lsm_level.sorted[end].stored_key == lsm_level.sorted[end - 1].stored_key) ++end;
+        status = lsm_level.counts.push_back(std::uint64_t {end - offset});
         if (status != st::status_t::success_k) return status;
+        offset = end;
     }
     return st::status_t::success_k;
 }
@@ -330,6 +381,9 @@ st::status_t lay_out(test_lsm_level<key_slot_type_>& lsm_level, std::uint64_t br
     st::status_t status = lsm_level.cells.resize(cells_count);
     if (status != st::status_t::success_k) return status;
     status = lsm_level.views.resize(lsm_level.counts.size());
+    if (status != st::status_t::success_k) return status;
+    bool const stamped = !lsm_level.stamps.empty();
+    status = lsm_level.columns.resize(stamped ? lsm_level.counts.size() : 0);
     if (status != st::status_t::success_k) return status;
 
     basic_vector<std::uint64_t> positions;
@@ -348,16 +402,30 @@ st::status_t lay_out(test_lsm_level<key_slot_type_>& lsm_level, std::uint64_t br
                                                                          : poison;
         lsm_level.views[sorted_run] = sorted_run_index_view<key_slot_type_> {lsm_level.cells.data() + first_cell,
                                                                              count};
+        if (stamped) {
+            st::expected<stamps_column_t> column = stamps_column_t::make(
+                std::span<std::uint64_t const> {lsm_level.stamps.data() + first, static_cast<std::size_t>(count)});
+            if (!column) return column.status();
+            lsm_level.columns[sorted_run] = std::move(*column);
+            lsm_level.views[sorted_run].stamps = &lsm_level.columns[sorted_run];
+        }
         first += count;
         first_cell += rows * branching;
     }
     return st::status_t::success_k;
 }
 
-/** The survivors a compaction must keep, found by sorting every key slot by stored key and then by survival rank. */
+/**
+ *  @brief The survivors a compaction must keep, found by sorting every key slot by stored key, then newest first, and
+ *      keeping per key what someone can still read.
+ *
+ *  Spelled from what is read rather than from intervals, so it checks the rule instead of restating it: the newest
+ *  version at or below the ceiling, the newest at or below every pinned stamp, every version above the horizon and
+ *  the newest at or below it. A tombstone kept for no reader older than every pin, at the bottom, hides nothing.
+ */
 template <typename key_slot_type_>
 st::status_t reference_survivors(compaction_kind_t kind, test_lsm_level<key_slot_type_> const& upper,
-                                 test_lsm_level<key_slot_type_> const& lower,
+                                 test_lsm_level<key_slot_type_> const& lower, compaction_stamps_t const& stamps,
                                  basic_vector<located_key_slot<key_slot_type_>>& survivors) noexcept {
     using record_t = located_key_slot<key_slot_type_>;
     basic_vector<record_t> all;
@@ -370,8 +438,10 @@ st::status_t reference_survivors(compaction_kind_t kind, test_lsm_level<key_slot
     for (test_lsm_level<key_slot_type_> const* lsm_level : lsm_levels) {
         std::uint64_t first = 0;
         for (std::size_t index = 0; index != lsm_level->counts.size(); ++index, ++sorted_run) {
-            for (std::uint64_t position = 0; position != lsm_level->counts[index]; ++position)
-                all[written++] = record_t {lsm_level->sorted[first + position], sorted_run};
+            for (std::uint64_t position = 0; position != lsm_level->counts[index]; ++position) {
+                std::uint64_t const stamp = lsm_level->stamps.empty() ? 0 : lsm_level->stamps[first + position];
+                all[written++] = record_t {lsm_level->sorted[first + position], sorted_run, stamp};
+            }
             first += lsm_level->counts[index];
         }
     }
@@ -380,20 +450,47 @@ st::status_t reference_survivors(compaction_kind_t kind, test_lsm_level<key_slot
     auto const rank = [upper_count](std::uint32_t index) noexcept {
         return index < upper_count ? upper_count - 1 - index : std::uint64_t {index};
     };
-    std::sort(all.data(), all.data() + all.size(), [&rank](record_t const& first, record_t const& second) noexcept {
-        if (first.key_slot.stored_key < second.key_slot.stored_key) return true;
-        if (second.key_slot.stored_key < first.key_slot.stored_key) return false;
-        return rank(first.sorted_run) < rank(second.sorted_run);
-    });
+    std::stable_sort(all.data(), all.data() + all.size(),
+                     [&rank](record_t const& first, record_t const& second) noexcept {
+                         if (first.key_slot.stored_key < second.key_slot.stored_key) return true;
+                         if (second.key_slot.stored_key < first.key_slot.stored_key) return false;
+                         return rank(first.sorted_run) < rank(second.sorted_run);
+                     });
 
     bool const drops_tombstones = (kind == compaction_kind_t::overlapping_into_bottom_k) |
                                   (kind == compaction_kind_t::sorted_into_bottom_k);
+    std::uint64_t const oldest_pin = stamps.pinned_count != 0 ? stamps.pinned[0] : ~std::uint64_t {0};
+    basic_vector<std::uint8_t> kept;
+    status = kept.resize(all.size());
+    if (status != st::status_t::success_k) return status;
     survivors.clear();
-    for (std::size_t index = 0; index != all.size(); ++index) {
-        if (index != 0 && all[index - 1].key_slot.stored_key == all[index].key_slot.stored_key) continue;
-        if (drops_tombstones && all[index].key_slot.is_tombstone()) continue;
-        status = survivors.push_back(record_t {all[index]});
-        if (status != st::status_t::success_k) return status;
+    for (std::size_t begin = 0; begin != all.size();) {
+        std::size_t end = begin + 1;
+        while (end != all.size() && all[end].key_slot.stored_key == all[begin].key_slot.stored_key) ++end;
+        for (std::size_t index = begin; index != end; ++index) kept[index] = 0;
+
+        // The newest version at or below each of the ceiling, the horizon and every pin is read by someone
+        auto const keep_newest_at_or_below = [&](std::uint64_t bound) noexcept {
+            for (std::size_t index = begin; index != end; ++index)
+                if (all[index].stamp <= bound && all[index].stamp <= stamps.ceiling) {
+                    kept[index] = 1;
+                    return;
+                }
+        };
+        keep_newest_at_or_below(stamps.ceiling);
+        keep_newest_at_or_below(stamps.horizon);
+        for (std::uint64_t pin = 0; pin != stamps.pinned_count; ++pin) keep_newest_at_or_below(stamps.pinned[pin]);
+        for (std::size_t index = begin; index != end; ++index)
+            if (all[index].stamp > stamps.horizon && all[index].stamp <= stamps.ceiling) kept[index] = 1;
+
+        for (std::size_t index = begin; index != end; ++index) {
+            if (!kept[index]) continue;
+            bool const hides_nothing = all[index].stamp <= stamps.horizon && all[index].stamp <= oldest_pin;
+            if (drops_tombstones && all[index].key_slot.is_tombstone() && hides_nothing) continue;
+            status = survivors.push_back(record_t {all[index]});
+            if (status != st::status_t::success_k) return status;
+        }
+        begin = end;
     }
     return st::status_t::success_k;
 }
@@ -405,6 +502,7 @@ st::status_t reference_survivors(compaction_kind_t kind, test_lsm_level<key_slot
 /** Checks a compaction's output against the reference survivors: order, bounds, padding, locations and migrations. */
 template <typename key_slot_type_>
 std::size_t check_compaction(compaction_kind_t kind, sorted_run_bounds_t const& bounds,
+                             compaction_stamps_t const& stamps,
                              basic_vector<located_key_slot<key_slot_type_>> const& wanted_survivors,
                              compaction_output<key_slot_type_> const& output) {
     using stored_key_t = typename key_slot_type_::stored_key_t;
@@ -420,7 +518,24 @@ std::size_t check_compaction(compaction_kind_t kind, sorted_run_bounds_t const& 
     failures += expect_eq(output.cells.size(), std::size_t {cells_count});
     failures += expect_eq(output.migrations.size(),
                           locates_stored_values_concept<key_slot_type_> ? key_slots_count : 0u);
+    failures += expect_eq(output.stamps.size(), std::size_t {key_slots_count});
     if (failures != 0) return failures;
+
+    // Every survivor carries its stamp raised to the floor, and the versions of one key never straddle two runs
+    std::size_t wrong_stamps = 0;
+    for (std::size_t index = 0; index != wanted_survivors.size(); ++index)
+        wrong_stamps += output.stamps[index] != std::max(wanted_survivors[index].stamp, stamps.floor);
+    failures += expect_eq(wrong_stamps, std::size_t {0});
+    std::size_t split_keys = 0;
+    bool versioned = false;
+    for (std::size_t index = 1; index < wanted_survivors.size(); ++index)
+        versioned |= wanted_survivors[index].key_slot.stored_key == wanted_survivors[index - 1].key_slot.stored_key;
+    for (std::uint64_t index = 0, first = 0; index + 1 < output.sorted_runs.size(); ++index) {
+        first += output.sorted_runs[index].key_slots_count;
+        if (first == 0 || first >= wanted_survivors.size()) continue;
+        split_keys += wanted_survivors[first].key_slot.stored_key == wanted_survivors[first - 1].key_slot.stored_key;
+    }
+    failures += expect_eq(split_keys, std::size_t {0});
 
     bool const drops_tombstones = (kind == compaction_kind_t::overlapping_into_bottom_k) |
                                   (kind == compaction_kind_t::sorted_into_bottom_k);
@@ -449,7 +564,8 @@ std::size_t check_compaction(compaction_kind_t kind, sorted_run_bounds_t const& 
         oversized_sorted_runs += (count > 1) &&
                                  sorted_run_file_bytes<key_slot_type_>(bounds, count, sorted_run.stored_values_bytes) >
                                      bounds.file_bytes_limit;
-        if (index + 1 != output.sorted_runs.size() && count != bounds.key_slots_capacity) {
+        // A run cut short to keep a key's versions together is not unfilled, so only unversioned merges check this
+        if (!versioned && index + 1 != output.sorted_runs.size() && count != bounds.key_slots_capacity) {
             std::uint64_t const next_bytes = stored_value_bytes(wanted_survivors[first + count].key_slot);
             unfilled_sorted_runs += sorted_run_file_bytes<key_slot_type_>(
                                         bounds, count + 1, sorted_run.stored_values_bytes + next_bytes) <=
@@ -483,8 +599,11 @@ std::size_t check_compaction(compaction_kind_t kind, sorted_run_bounds_t const& 
             }
             wrong_key_slots += !same_key_slot(got, wanted_key_slot);
             running += stored_value_bytes(wanted.key_slot);
-            tombstones += drops_tombstones && got.is_tombstone();
-            if (first + position != 0) unordered += !(previous < got.stored_key);
+            // A tombstone survives the bottom only where a reader still needs it to hide an older version
+            tombstones += drops_tombstones && got.is_tombstone() && stamps.pinned_count == 0 &&
+                          stamps.horizon == ~std::uint64_t {0};
+            if (first + position != 0)
+                unordered += got.stored_key < previous || (!versioned && got.stored_key == previous);
             previous = got.stored_key;
         }
         wrong_bytes += running != sorted_run.stored_values_bytes;
@@ -524,6 +643,10 @@ std::size_t expect_identical(compaction_output<key_slot_type_> const& host,
         mismatches += host.migrations[index].size != device.migrations[index].size ||
                       host.migrations[index].old_location != device.migrations[index].old_location ||
                       host.migrations[index].old_sorted_run != device.migrations[index].old_sorted_run;
+    failures += expect_eq(device.stamps.size(), host.stamps.size());
+    if (device.stamps.size() == host.stamps.size())
+        for (std::size_t index = 0; index != host.stamps.size(); ++index)
+            mismatches += host.stamps[index] != device.stamps[index];
     failures += expect_eq(mismatches, std::size_t {0});
     return failures;
 }
@@ -620,23 +743,23 @@ std::size_t survives_follows_the_kind() {
                                       (kind == compaction_kind_t::sorted_into_bottom_k);
 
         // The first key slot of a stored key leads, and a tombstone leads only where tombstones stay
-        wrong += !survives(leading, alive, kind);
-        wrong += survives(leading, tombstone, kind) != !drops_tombstones;
-        wrong += !survives(&earlier, alive, kind);
-        wrong += survives(&earlier, tombstone, kind) != !drops_tombstones;
+        wrong += !survives(leading, alive, kind, compaction_stamps_t {});
+        wrong += survives(leading, tombstone, kind, compaction_stamps_t {}) != !drops_tombstones;
+        wrong += !survives(&earlier, alive, kind, compaction_stamps_t {});
+        wrong += survives(&earlier, tombstone, kind, compaction_stamps_t {}) != !drops_tombstones;
 
         // Every later key slot of the same stored key is shadowed, tombstone or not
-        wrong += survives(&alive, shadowed, kind);
-        wrong += survives(&tombstone, shadowed, kind);
-        wrong += survives(&alive, tombstone, kind);
+        wrong += survives(&alive, shadowed, kind, compaction_stamps_t {});
+        wrong += survives(&tombstone, shadowed, kind, compaction_stamps_t {});
+        wrong += survives(&alive, tombstone, kind, compaction_stamps_t {});
     }
     failures += expect_eq(wrong, std::size_t {0});
 
     // Keys at both ends of the type shadow their own repeats and nothing else
     located_key_slot<checked_key_slot_t> const least = checked_record(limit<std::uint64_t>::min(), 0);
     located_key_slot<checked_key_slot_t> const greatest = checked_record(limit<std::uint64_t>::max(), 1);
-    failures += expect(survives(&least, greatest, compaction_kind_t::sorted_into_bottom_k));
-    failures += expect(!survives(&greatest, greatest, compaction_kind_t::sorted_into_bottom_k));
+    failures += expect(survives(&least, greatest, compaction_kind_t::sorted_into_bottom_k, compaction_stamps_t {}));
+    failures += expect(!survives(&greatest, greatest, compaction_kind_t::sorted_into_bottom_k, compaction_stamps_t {}));
     return failures;
 }
 
@@ -657,6 +780,12 @@ std::size_t plan_sorted_runs_cuts_at_the_bounds() {
         return true;
     };
 
+    // Every survivor carries a key of its own, as a merge with no reader pinned leaves them
+    auto const unshared = [](std::uint64_t, bool& shared) noexcept {
+        shared = false;
+        return st::status_t::success_k;
+    };
+
     // A sorted run index of 16-byte cells in rows of two, with no header and no alignment to round past
     sorted_run_bounds_t bounds;
     bounds.key_slots_capacity = 4;
@@ -669,13 +798,13 @@ std::size_t plan_sorted_runs_cuts_at_the_bounds() {
 
     // No key slots leaves no sorted runs at all
     failures += expect(fill_prefix(0, 0));
-    failures += expect(plan_sorted_runs<checked_key_slot_t>(0, bounds, read_prefix, sorted_runs) ==
+    failures += expect(plan_sorted_runs<checked_key_slot_t>(0, bounds, read_prefix, unshared, sorted_runs) ==
                        st::status_t::success_k);
     failures += expect_eq(sorted_runs.size(), std::size_t {0});
 
     // One key slot leaves one sorted run of one
     failures += expect(fill_prefix(1, 24));
-    failures += expect(plan_sorted_runs<checked_key_slot_t>(1, bounds, read_prefix, sorted_runs) ==
+    failures += expect(plan_sorted_runs<checked_key_slot_t>(1, bounds, read_prefix, unshared, sorted_runs) ==
                        st::status_t::success_k);
     failures += expect_eq(sorted_runs.size(), std::size_t {1});
     if (sorted_runs.size() == 1) {
@@ -685,7 +814,7 @@ std::size_t plan_sorted_runs_cuts_at_the_bounds() {
 
     // The key slots capacity cuts a merge of ten into four, four and two
     failures += expect(fill_prefix(10, 24));
-    failures += expect(plan_sorted_runs<checked_key_slot_t>(10, bounds, read_prefix, sorted_runs) ==
+    failures += expect(plan_sorted_runs<checked_key_slot_t>(10, bounds, read_prefix, unshared, sorted_runs) ==
                        st::status_t::success_k);
     failures += expect_eq(sorted_runs.size(), std::size_t {3});
     if (sorted_runs.size() == 3) {
@@ -703,7 +832,7 @@ std::size_t plan_sorted_runs_cuts_at_the_bounds() {
     failures += expect_eq(sorted_run_file_bytes<checked_key_slot_t>(bounds, 3, 30), std::uint64_t {94});
     failures += expect_eq(sorted_run_file_bytes<checked_key_slot_t>(bounds, 4, 40), std::uint64_t {104});
     failures += expect(fill_prefix(10, 10));
-    failures += expect(plan_sorted_runs<checked_key_slot_t>(10, bounds, read_prefix, sorted_runs) ==
+    failures += expect(plan_sorted_runs<checked_key_slot_t>(10, bounds, read_prefix, unshared, sorted_runs) ==
                        st::status_t::success_k);
     failures += expect_eq(sorted_runs.size(), std::size_t {4});
     if (sorted_runs.size() == 4) {
@@ -717,7 +846,7 @@ std::size_t plan_sorted_runs_cuts_at_the_bounds() {
 
     // A key slot whose stored value alone exceeds the file limit still takes a sorted run of its own
     failures += expect(fill_prefix(3, 1000));
-    failures += expect(plan_sorted_runs<checked_key_slot_t>(3, bounds, read_prefix, sorted_runs) ==
+    failures += expect(plan_sorted_runs<checked_key_slot_t>(3, bounds, read_prefix, unshared, sorted_runs) ==
                        st::status_t::success_k);
     failures += expect_eq(sorted_runs.size(), std::size_t {3});
     if (sorted_runs.size() == 3) {
@@ -730,7 +859,7 @@ std::size_t plan_sorted_runs_cuts_at_the_bounds() {
     // A sorted run that exactly fills the file limit is not cut short
     bounds.file_bytes_limit = 104;
     failures += expect(fill_prefix(4, 10));
-    failures += expect(plan_sorted_runs<checked_key_slot_t>(4, bounds, read_prefix, sorted_runs) ==
+    failures += expect(plan_sorted_runs<checked_key_slot_t>(4, bounds, read_prefix, unshared, sorted_runs) ==
                        st::status_t::success_k);
     failures += expect_eq(sorted_runs.size(), std::size_t {1});
     if (sorted_runs.size() == 1) failures += expect_eq(sorted_runs[0].key_slots_count, std::uint64_t {4});
@@ -740,8 +869,98 @@ std::size_t plan_sorted_runs_cuts_at_the_bounds() {
         bytes = 0;
         return st::status_t::unknown_k;
     };
-    failures += expect(plan_sorted_runs<checked_key_slot_t>(4, bounds, failing_prefix, sorted_runs) ==
+    failures += expect(plan_sorted_runs<checked_key_slot_t>(4, bounds, failing_prefix, unshared, sorted_runs) ==
                        st::status_t::unknown_k);
+
+    // Versions of one key stay in one run: keys `aabbbcd` at a capacity of four cut as `aa|bbbc|d`, never inside `bbb`
+    bounds.key_slots_capacity = 4;
+    bounds.file_bytes_limit = std::uint64_t {1} << 40;
+    std::array<int, 7> const grouped {0, 0, 1, 1, 1, 2, 3};
+    auto const shares = [&grouped](std::uint64_t index, bool& shared) noexcept {
+        shared = grouped[index] == grouped[index - 1];
+        return st::status_t::success_k;
+    };
+    failures += expect(fill_prefix(7, 1));
+    failures += expect(plan_sorted_runs<checked_key_slot_t>(7, bounds, read_prefix, shares, sorted_runs) ==
+                       st::status_t::success_k);
+    failures += expect_eq(sorted_runs.size(), std::size_t {3});
+    if (sorted_runs.size() == 3) {
+        failures += expect_eq(sorted_runs[0].key_slots_count, std::uint64_t {2});
+        failures += expect_eq(sorted_runs[1].key_slots_count, std::uint64_t {4});
+        failures += expect_eq(sorted_runs[2].key_slots_count, std::uint64_t {1});
+    }
+
+    // A key longer than the capacity that starts the run takes the run past the capacity rather than splitting
+    std::array<int, 6> const long_key {0, 0, 0, 0, 0, 1};
+    auto const shares_long = [&long_key](std::uint64_t index, bool& shared) noexcept {
+        shared = long_key[index] == long_key[index - 1];
+        return st::status_t::success_k;
+    };
+    failures += expect(fill_prefix(6, 1));
+    failures += expect(plan_sorted_runs<checked_key_slot_t>(6, bounds, read_prefix, shares_long, sorted_runs) ==
+                       st::status_t::success_k);
+    failures += expect_eq(sorted_runs.size(), std::size_t {2});
+    if (sorted_runs.size() == 2) {
+        failures += expect_eq(sorted_runs[0].key_slots_count, std::uint64_t {5});
+        failures += expect_eq(sorted_runs[1].key_slots_count, std::uint64_t {1});
+    }
+    return failures;
+}
+
+/** Checks which older versions survive: one per interval between pinned stamps, every one past the horizon, none
+ *  past the ceiling, and a tombstone at the bottom only where a reader still needs it. */
+std::size_t survives_keeps_what_readers_read() {
+    std::size_t failures = 0;
+    auto const version = [](std::uint64_t stamp, bool tombstone) noexcept {
+        located_key_slot<checked_key_slot_t> record = checked_record(7, 0);
+        record.stamp = stamp;
+        if (tombstone) record.key_slot.size = 0;
+        return record;
+    };
+    constexpr compaction_kind_t bottom = compaction_kind_t::sorted_into_bottom_k;
+    constexpr compaction_kind_t intermediate = compaction_kind_t::sorted_into_intermediate_k;
+
+    // Readers at 20 and 40: versions 50, 45, 30, 25, 10, 5 keep 50 for the head, 30 for 40 and 10 for 20
+    std::array<std::uint64_t, 2> const pins {20, 40};
+    compaction_stamps_t stamps;
+    stamps.pinned = pins.data();
+    stamps.pinned_count = pins.size();
+    std::array<std::uint64_t, 6> const chain {50, 45, 30, 25, 10, 5};
+    std::array<bool, 6> const wanted {true, false, true, false, true, false};
+    std::size_t wrong = 0;
+    for (std::size_t index = 0; index != chain.size(); ++index) {
+        located_key_slot<checked_key_slot_t> const current = version(chain[index], false);
+        located_key_slot<checked_key_slot_t> const previous = version(index ? chain[index - 1] : 0, false);
+        wrong += survives(index ? &previous : nullptr, current, intermediate, stamps) != wanted[index];
+    }
+    failures += expect_eq(wrong, std::size_t {0});
+
+    // A tombstone some reader sees stays even at the bottom; one older than every reader drops
+    located_key_slot<checked_key_slot_t> const newer = version(50, false);
+    failures += expect(survives(&newer, version(30, true), bottom, stamps));
+    failures += expect(!survives(&newer, version(10, true), bottom, stamps));
+    failures += expect(survives(&newer, version(10, true), intermediate, stamps));
+
+    // Past the horizon every version survives, and so does the newest beneath it
+    compaction_stamps_t durable;
+    durable.horizon = 30;
+    failures += expect(survives(&newer, version(45, false), intermediate, durable));
+    located_key_slot<checked_key_slot_t> const above = version(45, false);
+    failures += expect(survives(&above, version(25, false), intermediate, durable));
+    located_key_slot<checked_key_slot_t> const beneath = version(25, false);
+    failures += expect(!survives(&beneath, version(20, false), intermediate, durable));
+    failures += expect(survives(&newer, version(45, true), bottom, durable));
+
+    // Past the ceiling nothing survives, and the newest beneath it leads its key
+    compaction_stamps_t mounted;
+    mounted.horizon = 30;
+    mounted.ceiling = 30;
+    failures += expect(!survives(static_cast<located_key_slot<checked_key_slot_t> const*>(nullptr), version(45, false),
+                                 intermediate, mounted));
+    located_key_slot<checked_key_slot_t> const dropped = version(45, false);
+    failures += expect(survives(&dropped, version(25, false), intermediate, mounted));
+    located_key_slot<checked_key_slot_t> const leader = version(25, false);
+    failures += expect(!survives(&leader, version(20, false), intermediate, mounted));
     return failures;
 }
 
@@ -771,8 +990,9 @@ inline constexpr sorted_run_bounds_t narrow_bounds_k {7, std::uint64_t {4} << 30
 /** Bounds of the large cases, whose sorted runs hold a quarter million key slots. */
 inline constexpr sorted_run_bounds_t large_bounds_k {262'144, std::uint64_t {4} << 30, 4096, 4096, 16};
 
-/** Every compaction the suite runs, for every key slot shape and key type. */
-inline constexpr std::array<scenario_t, 9> scenarios_k {{
+/** Every compaction the suite runs, for every key slot shape and key type: the first nine with no reader pinned and
+ *  both bounds widest, which keep the newest version of every key alone, then the versioned ones. */
+inline constexpr std::array<scenario_t, 15> scenarios_k {{
     {"overlapping_into_intermediate", compaction_kind_t::overlapping_into_intermediate_k, 6, 4, 20'000, 300, 100,
      roomy_bounds_k},
     {"overlapping_into_bottom", compaction_kind_t::overlapping_into_bottom_k, 6, 4, 20'000, 300, 100, tight_bounds_k},
@@ -786,6 +1006,18 @@ inline constexpr std::array<scenario_t, 9> scenarios_k {{
      roomy_bounds_k},
     {"large_overlapping_into_intermediate", compaction_kind_t::overlapping_into_intermediate_k, 4, 3, 0, 500, 50,
      large_bounds_k},
+    {"pinned_overlapping_into_bottom", compaction_kind_t::overlapping_into_bottom_k, 6, 4, 20'000, 400, 200,
+     roomy_bounds_k, 200, 12},
+    {"pinned_sorted_into_intermediate", compaction_kind_t::sorted_into_intermediate_k, 5, 5, 20'000, 400, 200,
+     narrow_bounds_k, 300, 7},
+    {"horizon_overlapping_into_bottom", compaction_kind_t::overlapping_into_bottom_k, 6, 4, 20'000, 400, 200,
+     tight_bounds_k, 100, 3, 600},
+    {"ceiling_drops_above_mount", compaction_kind_t::overlapping_into_bottom_k, 6, 4, 20'000, 400, 200, roomy_bounds_k,
+     100, 0, 550, 550},
+    {"floor_raises_cold_stamps", compaction_kind_t::sorted_into_bottom_k, 5, 5, 20'000, 400, 100, roomy_bounds_k, 100,
+     5, 1000, 1000, 400},
+    {"large_pinned_overlapping_into_intermediate", compaction_kind_t::overlapping_into_intermediate_k, 4, 3, 0, 500, 50,
+     large_bounds_k, 100, 9, 800},
 }};
 
 /** Checks that 16-byte keys order and round-trip exactly as their bytes compare with @c memcmp. */
@@ -928,7 +1160,7 @@ case_result_t cuda_devices_round_trip() {
 
 /** Runs a compaction on the first CUDA device and expects the host's output back in every field. */
 template <typename key_slot_type_>
-case_result_t gpu_case(compaction_kind_t kind, sorted_run_bounds_t const& bounds,
+case_result_t gpu_case(compaction_kind_t kind, sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps,
                        test_lsm_level<key_slot_type_> const& upper, test_lsm_level<key_slot_type_> const& lower,
                        compaction_output<key_slot_type_> const& host) {
     st::expected<std::size_t> const devices = cuda_count_devices();
@@ -938,7 +1170,7 @@ case_result_t gpu_case(compaction_kind_t kind, sorted_run_bounds_t const& bounds
     failures += expect(compactor.has_value());
     if (!compactor) return failures;
     compaction_output<key_slot_type_> device;
-    st::status_t const status = compactor->compact(kind, views_of(upper), views_of(lower), bounds, device);
+    st::status_t const status = compactor->compact(kind, views_of(upper), views_of(lower), bounds, stamps, device);
     failures += expect(status == st::status_t::success_k);
 
     // A status alone cannot say that the build carries no kernel image for this device, so name the CUDA error
@@ -957,8 +1189,9 @@ case_result_t cuda_devices_round_trip() { return case_result_t::skipped("built w
 
 /** A GPU case skips in a build without CUDA. */
 template <typename key_slot_type_>
-case_result_t gpu_case(compaction_kind_t, sorted_run_bounds_t const&, test_lsm_level<key_slot_type_> const&,
-                       test_lsm_level<key_slot_type_> const&, compaction_output<key_slot_type_> const&) {
+case_result_t gpu_case(compaction_kind_t, sorted_run_bounds_t const&, compaction_stamps_t const&,
+                       test_lsm_level<key_slot_type_> const&, test_lsm_level<key_slot_type_> const&,
+                       compaction_output<key_slot_type_> const&) {
     return case_result_t::skipped("built without CUDA");
 }
 
@@ -969,21 +1202,52 @@ case_result_t gpu_case(compaction_kind_t, sorted_run_bounds_t const&, test_lsm_l
 template <typename key_slot_type_>
 std::size_t report_compaction(suite_totals_t& totals, char const* host_name, char const* gpu_name,
                               compaction_kind_t kind, sorted_run_bounds_t const& bounds,
-                              test_lsm_level<key_slot_type_> const& upper,
+                              compaction_stamps_t const& stamps, test_lsm_level<key_slot_type_> const& upper,
                               test_lsm_level<key_slot_type_> const& lower) {
     if (!totals.selects(host_name) && !totals.selects(gpu_name)) return 0;
     std::size_t failures = 0;
     basic_vector<located_key_slot<key_slot_type_>> survivors;
-    st::status_t status = reference_survivors(kind, upper, lower, survivors);
+    st::status_t status = reference_survivors(kind, upper, lower, stamps, survivors);
     failures += expect(status == st::status_t::success_k);
     if (failures != 0) return report(totals, host_name, failures);
 
     compaction_output<key_slot_type_> host;
-    status = cpu_compactor_t {}.compact(kind, views_of(upper), views_of(lower), bounds, host);
+    status = cpu_compactor_t {}.compact(kind, views_of(upper), views_of(lower), bounds, stamps, host);
     failures += expect(status == st::status_t::success_k);
-    if (status == st::status_t::success_k) failures += check_compaction(kind, bounds, survivors, host);
+    if (status == st::status_t::success_k) failures += check_compaction(kind, bounds, stamps, survivors, host);
     std::size_t const host_failures = report(totals, host_name, failures);
-    return host_failures + report(totals, gpu_name, gpu_case<key_slot_type_>, kind, bounds, upper, lower, host);
+    return host_failures + report(totals, gpu_name, gpu_case<key_slot_type_>, kind, bounds, stamps, upper, lower, host);
+}
+
+/** The stamps a scenario compacts with: pins drawn from the stamps its levels carry, and bounds at fractions of
+ *  their range, all widest when the scenario names none. */
+template <typename key_slot_type_>
+compaction_stamps_t scenario_stamps(scenario_t const& scenario, test_lsm_level<key_slot_type_> const& upper,
+                                    test_lsm_level<key_slot_type_> const& lower, random_t& random,
+                                    basic_vector<std::uint64_t>& pins) noexcept {
+    compaction_stamps_t stamps;
+    std::uint64_t const range = (scenario.upper_sorted_runs + 2) * stamps_per_sorted_run_k;
+    auto const at = [range](std::uint64_t per_mille) noexcept {
+        return per_mille >= 1000 ? ~std::uint64_t {0} : range / 1000 * per_mille;
+    };
+    stamps.horizon = at(scenario.horizon_per_mille);
+    stamps.ceiling = at(scenario.ceiling_per_mille);
+    stamps.floor = scenario.floor_per_mille != 0 ? at(scenario.floor_per_mille) : 0;
+    pins.clear();
+    std::size_t const total = upper.stamps.size() + lower.stamps.size();
+    for (std::uint64_t pin = 0; pin != scenario.pinned && total != 0; ++pin) {
+        std::size_t const drawn = static_cast<std::size_t>(random.below(total));
+        std::uint64_t const stamp = drawn < upper.stamps.size() ? upper.stamps[drawn]
+                                                                : lower.stamps[drawn - upper.stamps.size()];
+        // A reader pins a stamp at or above the floor, since the floor is the oldest a reader can still hold
+        if (stamp >= stamps.floor && pins.push_back(std::uint64_t {stamp}) != st::status_t::success_k) break;
+    }
+    std::sort(pins.data(), pins.data() + pins.size());
+    [[maybe_unused]] st::status_t const deduplicated = pins.resize(
+        static_cast<std::size_t>(std::unique(pins.data(), pins.data() + pins.size()) - pins.data()));
+    stamps.pinned = pins.data();
+    stamps.pinned_count = pins.size();
+    return stamps;
 }
 
 /** Generates the LSM levels of @p scenario for one key slot shape, then checks the host compaction and the GPU one. */
@@ -1007,17 +1271,20 @@ std::size_t run_scenario(suite_totals_t& totals, char const* shape, std::size_t 
     std::span<stored_key_t const> const keys {universe};
     bool const overlapping = (scenario.kind == compaction_kind_t::overlapping_into_intermediate_k) |
                              (scenario.kind == compaction_kind_t::overlapping_into_bottom_k);
+    // The lower level is the oldest era, and every upper run is newer than all of it
     test_lsm_level<key_slot_type_> upper;
     test_lsm_level<key_slot_type_> lower;
-    status = overlapping ? add_overlapping_sorted_runs(keys, scenario, scenario.upper_sorted_runs, random, upper)
-                         : add_sorted_sorted_runs(keys, scenario, scenario.upper_sorted_runs, random, upper);
+    status = overlapping ? add_overlapping_sorted_runs(keys, scenario, scenario.upper_sorted_runs, 1, random, upper)
+                         : add_sorted_sorted_runs(keys, scenario, scenario.upper_sorted_runs, 1, random, upper);
     if (status == st::status_t::success_k && scenario.lower_sorted_runs != 0)
-        status = add_sorted_sorted_runs(keys, scenario, scenario.lower_sorted_runs, random, lower);
+        status = add_sorted_sorted_runs(keys, scenario, scenario.lower_sorted_runs, 0, random, lower);
     if (status == st::status_t::success_k) status = lay_out(upper, scenario.bounds.branching);
     if (status == st::status_t::success_k) status = lay_out(lower, scenario.bounds.branching);
     failures += expect(status == st::status_t::success_k);
     if (failures != 0) return report(totals, host_name, failures);
-    return report_compaction(totals, host_name, gpu_name, scenario.kind, scenario.bounds, upper, lower);
+    basic_vector<std::uint64_t> pins;
+    compaction_stamps_t const stamps = scenario_stamps(scenario, upper, lower, random, pins);
+    return report_compaction(totals, host_name, gpu_name, scenario.kind, scenario.bounds, stamps, upper, lower);
 }
 
 #pragma endregion Cases
@@ -1215,7 +1482,8 @@ std::size_t run_handmade_case(suite_totals_t& totals, char const* shape, std::si
     if (status == st::status_t::success_k) status = lay_out(lower, handmade.bounds.branching);
     failures += expect(status == st::status_t::success_k);
     if (failures != 0) return report(totals, host_name, failures);
-    return report_compaction(totals, host_name, gpu_name, handmade.kind, handmade.bounds, upper, lower);
+    return report_compaction(totals, host_name, gpu_name, handmade.kind, handmade.bounds, compaction_stamps_t {}, upper,
+                             lower);
 }
 
 #pragma endregion Handmade Cases
@@ -1238,6 +1506,7 @@ int main(int argc, char** argv) {
     report(totals, "compaction.survivor_first_orders_the_survivor_first", survivor_first_orders_the_survivor_first);
     report(totals, "compaction.survives_follows_the_kind", survives_follows_the_kind);
     report(totals, "compaction.plan_sorted_runs_cuts_at_the_bounds", plan_sorted_runs_cuts_at_the_bounds);
+    report(totals, "compaction.survives_keeps_what_readers_read", survives_keeps_what_readers_read);
     report(totals, "cuda.devices_round_trip", cuda_devices_round_trip);
     for (std::size_t index = 0; index != handmade_cases_k.size(); ++index) {
         handmade_case_t const& handmade = handmade_cases_k[index];

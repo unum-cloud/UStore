@@ -68,8 +68,22 @@ using database_id_t = uuid_t;
 /** The identifier of one snapshot inside its database. */
 using snapshot_id_t = std::uint64_t;
 
-/** The identifier of one transaction inside its database. */
-using transaction_id_t = std::uint64_t;
+/**
+ *  @brief The position of one commit in its ledger's order, which a reader reads at and every version carries.
+ *
+ *  A counter rather than a clock: @c std::chrono::system_clock is neither steady nor distinct across threads, so
+ *  two commits could share an instant and one would hide the other's writes.
+ */
+using transaction_stamp_t = std::uint64_t;
+
+/** The stamp of a key no commit has ever written, which orders before every issued stamp. */
+inline constexpr transaction_stamp_t unwritten_stamp_k = 0;
+
+/** The stamp of a transaction that has not started, or of a watch that was never taken. */
+inline constexpr transaction_stamp_t invalid_transaction_stamp_k = std::numeric_limits<transaction_stamp_t>::max();
+
+/** The stamp a read at the head answers at, which orders after every stamp a commit draws. */
+inline constexpr transaction_stamp_t head_stamp_k = std::numeric_limits<transaction_stamp_t>::max();
 
 /** The identifier of one backup inside its database. */
 using backup_id_t = std::uint64_t;
@@ -85,9 +99,6 @@ inline constexpr collection_id_t collection_invalid_id_k {
 
 /** The identifier of no snapshot. */
 inline constexpr snapshot_id_t invalid_snapshot_id_k = 0;
-
-/** The identifier of no transaction. */
-inline constexpr transaction_id_t invalid_transaction_id_k = std::numeric_limits<transaction_id_t>::max();
 
 /** The identifier of no backup. */
 inline constexpr backup_id_t invalid_backup_id_k = std::numeric_limits<backup_id_t>::max();
@@ -838,11 +849,6 @@ struct storage_limits_t {
     static constexpr std::size_t transaction_write_buffer_elements_min_count_k = 1;
     static constexpr std::size_t transaction_write_buffer_elements_max_count_k = write_buffer_elements_max_count_k;
     static constexpr std::size_t first_level_min_capacity_bytes_k = 1024 * 1024;
-    static constexpr std::size_t first_level_max_sorted_runs_count_k = 1024;
-
-    /** Runs of level zero that make it due for compaction, as each one is another merge input for every read and
-     *  every scan of the collection, whatever bytes they hold. */
-    static constexpr std::size_t first_level_compaction_threshold_k = 4;
     static constexpr std::size_t level_min_enlarge_factor_k = 2;
     static constexpr std::size_t level_max_enlarge_factor_k = 64;
     static constexpr std::size_t sorted_run_file_max_size_k = 4 * 1024 * 1024 * 1024ull - 4096;

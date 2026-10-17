@@ -2,15 +2,16 @@
  *  @file test/nvme/transaction_registry.cpp
  *  @author Ash Vardanian
  *  @date September 19, 2026
- *  @brief What the optimistic transaction layer promises: the conflicts it catches and the ones it invents.
+ *  @brief What the optimistic transaction layer promises: the conflicts it catches, and that it invents none.
  *
- *  The results this file exists for are @c serializable_under_threads and @c write_write_one_winner. A
- *  conflict record that misses a write turns two concurrent transactions into a lost update, which no
- *  single-threaded case can show, so the money-moving case drives real threads at overlapping keys and
- *  checks the one quantity a half-applied or lost commit cannot preserve - the total.
+ *  The results this file exists for are @c serializable_under_threads, @c write_write_one_winner and
+ *  @c disjoint_transactions_never_conflict. A missed write turns two concurrent transactions into a lost update,
+ *  which no single-threaded case can show, so the money-moving case drives real threads at overlapping keys and
+ *  checks the one quantity a half-applied or lost commit cannot preserve - the total. An invented conflict is the
+ *  opposite failure, so two transactions writing a thousand keys each must both land.
  *
- *  Nothing here touches a disk. The registry reaches its store through a handful of calls, so the store
- *  is a table of words in memory and every case runs at memory speed under both sanitizers.
+ *  Nothing here touches a disk. The registry reaches its store through a handful of calls, so the store is a
+ *  table of words and stamps in memory and every case runs at memory speed under both sanitizers.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
@@ -18,18 +19,18 @@
 #include <cstdint> // `std::uint64_t`
 #include <cstring> // `std::memcpy`
 
-#include <array>       // `std::array`
-#include <atomic>      // `std::memory_order`
-#include <memory>      // `std::make_shared`, `std::unique_ptr`
-#include <span>        // `std::span`
-#include <string_view> // `std::string_view`
-#include <thread>      // `std::thread`
-#include <utility>     // `std::move`
-#include <vector>      // `std::vector`
+#include <array>   // `std::array`
+#include <atomic>  // `std::memory_order`
+#include <memory>  // `std::make_shared`, `std::unique_ptr`
+#include <span>    // `std::span`
+#include <thread>  // `std::thread`
+#include <utility> // `std::move`
+#include <vector>  // `std::vector`
 
-#include <forkunion/atomics.hpp> // `fu::preferred_atomic_ref`
+#include <forkunion/atomics.hpp>      // `fu::preferred_atomic_ref`
+#include <forkunion/capabilities.hpp> // `fu::preferred_yield_t`
 
-#include "ustore/blobs/nvme_database.hpp" // `database_transaction_registry`
+#include "ustore/blobs/nvme_database.hpp" // `database_transaction_registry`, `commit_ledger_t`
 
 #include "harness.hpp" // `suite_exit_code`, `expect`, `expect_eq`
 
@@ -50,8 +51,11 @@ constexpr collection_id_t collection_k {uuid_from_integer(7)};
 /** Bytes one value of this suite occupies, which is one word. */
 constexpr std::size_t value_bytes_k = sizeof(std::uint64_t);
 
-/** Keys the store admits, which is also the width of the money-moving case. */
-constexpr std::size_t accounts_k = 64;
+/** Keys the store admits: wide enough for two disjoint bands of a thousand keys, and the money-moving accounts. */
+constexpr std::size_t accounts_k = 4096;
+
+/** Accounts the money-moving case draws from, few enough that its transfers overlap. */
+constexpr std::size_t contended_accounts_k = 64;
 
 /** The balance every account starts at, so the total is known before a single transaction runs. */
 constexpr std::uint64_t initial_balance_k = 1000;
@@ -60,13 +64,7 @@ constexpr std::uint64_t initial_balance_k = 1000;
 constexpr std::size_t write_buffer_bytes_k = 64 * 1024;
 
 /** Keys one transaction's write buffer holds. */
-constexpr std::size_t write_buffer_elements_k = 1024;
-
-/** Commit-record slots the cases build their registries with, wide enough that distinct keys part ways. */
-constexpr std::size_t conflict_slots_k = 1u << 14;
-
-/** Transactions one registry of this suite admits at once. */
-constexpr std::size_t transaction_slots_k = 64;
+constexpr std::size_t write_buffer_elements_k = 2048;
 
 /** What a store does with the writes a commit hands it, so a refusal can be asked for. */
 enum class store_behaviour_t {
@@ -74,7 +72,7 @@ enum class store_behaviour_t {
     /** Every write lands. */
     accepting_k,
 
-    /** Every write is refused, which is what a commit that fails must survive. */
+    /** Every collection refuses the room a commit asks for, so the commit fails before it draws a stamp. */
     refusing_applies_k,
 
     /** Every collection reports itself full and flushes, so a stage makes room before it commits. */
@@ -92,57 +90,78 @@ enum class store_behaviour_t {
 #pragma region Store
 
 /**
- *  @brief The narrowest store a registry can commit into: one collection of words, held in memory.
+ *  @brief The narrowest store a registry can commit into: one collection of words, each beside the stamp of the
+ *      commit that last wrote it, held in memory.
  *
- *  Balances move through atomic references because a transaction reads them outside the staging queue pair
- *  and writes them inside it, which is where the real collection layer keeps its own synchronization.
+ *  Balances move through atomic references because a transaction reads them outside the write path and writes
+ *  them inside it, which is where the real collection layer keeps its own synchronization.
  */
 class test_store_t {
   public:
 
-    /** A store holding @c accounts_k balances, each at @c initial_balance_k. */
+    /** A store holding @c accounts_k balances, each at @c initial_balance_k and written by no commit. */
     test_store_t() noexcept {
         for (std::size_t index = 0; index != accounts_k; ++index) balances_[index] = initial_balance_k;
     }
 
-    /** Takes the store's write path, which the registry holds for one staged transaction at a time. */
-    void acquire_write_path() noexcept { ++write_path_depth_; }
+    /** The order every commit into this store draws its stamp from. */
+    commit_ledger_t& ledger() noexcept { return ledger_; }
+
+    /** Takes the store's write path, which one staged transaction holds at a time. */
+    void acquire_write_path() noexcept {
+        fu::preferred_atomic_ref<std::int32_t> const claim {write_path_};
+        std::int32_t expected_free = 0;
+        while (!claim.compare_exchange_weak(expected_free, 1, std::memory_order_acquire, std::memory_order_relaxed)) {
+            fu::preferred_yield_t {}(write_path_, expected_free, std::size_t {0});
+            expected_free = 0;
+        }
+    }
 
     /** Hands the store's write path back. */
-    void release_write_path() noexcept { --write_path_depth_; }
+    void release_write_path() noexcept {
+        fu::preferred_atomic_ref<std::int32_t> {write_path_}.store(0, std::memory_order_release);
+    }
 
     /** Whether the collection @p group_id names still exists. */
     bool contains_collection(collection_id_t group_id) const noexcept { return group_id == collection_k; }
 
-    /** Whether @p count values of @p bytes still fit in the collection's own write buffer. */
-    bool collection_fits(collection_id_t, std::size_t, std::size_t) const noexcept {
-        return behaviour != store_behaviour_t::always_flushing_k && behaviour != store_behaviour_t::refusing_flushes_k;
+    /** Whether a commit newer than @p from wrote @p stored_key, exactly. */
+    bool written_since(collection_id_t, stored_key_t stored_key, transaction_stamp_t from) const noexcept {
+        return stamps_[stored_key] > from;
     }
 
-    /** Empties the collection's write buffer onto its runs. */
-    status_t flush_collection(collection_id_t) noexcept {
+    /** Whether a commit since @p from wrote any account from @p lower to @p upper inclusive. */
+    bool range_written_since(collection_id_t, stored_key_t lower, stored_key_t upper,
+                             transaction_stamp_t from) const noexcept {
+        for (stored_key_t account = lower; account <= upper && account < accounts_k; ++account)
+            if (stamps_[account] > from) return true;
+        return false;
+    }
+
+    /** Makes room for @p count values in the collection's own write buffer, flushing it when it is full. */
+    status_t prepare_collection(collection_id_t, std::size_t, std::size_t) noexcept {
+        if (behaviour == store_behaviour_t::refusing_applies_k) return {status_code_t::device_k, "Refusing to write"};
+        if (behaviour != store_behaviour_t::always_flushing_k && behaviour != store_behaviour_t::refusing_flushes_k)
+            return {};
         ++flushes;
         if (behaviour == store_behaviour_t::refusing_flushes_k) return {status_code_t::device_k, "Refusing to flush"};
         return {};
     }
 
-    /** Writes @p stored_value under @p stored_key. */
-    status_t insert_in_collection(collection_id_t, stored_key_t stored_key, stored_value_view_t stored_value) noexcept {
-        if (behaviour == store_behaviour_t::refusing_applies_k) return {status_code_t::device_k, "Refusing to write"};
-        if (stored_key >= accounts_k) return {status_code_t::invalid_argument_k, "Key out of range"};
+    /** Writes @p stored_value under @p stored_key at @p stamp, in room the preparation took. */
+    void stage_in_collection(collection_id_t, stored_key_t stored_key, stored_value_view_t stored_value,
+                             transaction_stamp_t stamp) noexcept {
         if (behaviour == store_behaviour_t::pausing_in_apply_k) wait_for_the_suite_();
         std::uint64_t word = 0;
         if (stored_value.size() == value_bytes_k) std::memcpy(&word, stored_value.data(), value_bytes_k);
+        stamps_[stored_key] = stamp;
         balance_(stored_key).store(word, std::memory_order_release);
-        return {};
     }
 
-    /** Drops whatever @p stored_key held. */
-    status_t remove_from_collection(collection_id_t, stored_key_t stored_key) noexcept {
-        if (behaviour == store_behaviour_t::refusing_applies_k) return {status_code_t::device_k, "Refusing to write"};
-        if (stored_key >= accounts_k) return {status_code_t::invalid_argument_k, "Key out of range"};
+    /** Drops whatever @p stored_key held at @p stamp, in room the preparation took. */
+    void stage_erasure_in_collection(collection_id_t, stored_key_t stored_key, transaction_stamp_t stamp) noexcept {
+        stamps_[stored_key] = stamp;
         balance_(stored_key).store(0, std::memory_order_release);
-        return {};
     }
 
     /** The balance @p stored_key holds right now, which a later commit may already have moved. */
@@ -150,14 +169,14 @@ class test_store_t {
         return balance_(stored_key).load(std::memory_order_acquire);
     }
 
-    /** The balances of every account added up, which no serializable run ever changes. */
+    /** The balances of every contended account added up, which no serializable run ever changes. */
     std::uint64_t total() const noexcept {
         std::uint64_t sum = 0;
-        for (std::size_t index = 0; index != accounts_k; ++index) sum += balance(index);
+        for (std::size_t index = 0; index != contended_accounts_k; ++index) sum += balance(index);
         return sum;
     }
 
-    /** Whether a write is waiting inside the store, with its commit's stamp already claimed. */
+    /** Whether a write is waiting inside the store, with its commit's stamp already drawn. */
     bool paused() const noexcept {
         return fu::preferred_atomic_ref<std::int32_t const> {paused_}.load(std::memory_order_acquire) != 0;
     }
@@ -190,11 +209,17 @@ class test_store_t {
         return fu::preferred_atomic_ref<std::uint64_t const> {balances_[stored_key]};
     }
 
-    /** One word per account, read outside the staging queue pair and written inside it. */
+    /** The stamps every commit draws. */
+    commit_ledger_t ledger_;
+
+    /** One word per account, read outside the write path and written inside it. */
     std::uint64_t balances_[accounts_k] {};
 
-    /** The write paths taken and not yet handed back, which the queue pair keeps at one. */
-    std::size_t write_path_depth_ = 0;
+    /** The stamp of the commit that last wrote each account, read and written under the write path. */
+    transaction_stamp_t stamps_[accounts_k] {};
+
+    /** One while a transaction holds the write path. */
+    std::int32_t write_path_ = 0;
 
     /** Raised while a write waits for the suite. */
     std::int32_t paused_ = 0;
@@ -233,16 +258,17 @@ class blobs::database_transaction<stored_key_t, test_store_t> {
         staged_k,
     };
 
-    database_transaction(transaction_id_t id, registry_t& registry, write_buffer_t&& changes,
-                         resources_shared_ptr_t resources) noexcept
-        : id_(id), registry_(&registry), data_(std::move(changes), resources) {
-        start_stamp_ = registry_->request_start_(id_);
+    database_transaction(registry_t& registry, write_buffer_t&& changes, resources_shared_ptr_t resources) noexcept
+        : registry_(&registry), data_(std::move(changes), resources) {
+        start_stamp_ = registry_->request_start_(pin_);
     }
 
     database_transaction(database_transaction const&) = delete;
     database_transaction& operator=(database_transaction const&) = delete;
 
-    ~database_transaction() noexcept { registry_->notify_about_deletion_(id_); }
+    ~database_transaction() noexcept {
+        if (phase_ == phase_t::staged_k) registry_->discard_();
+    }
 
     /** The stamp the transaction started at, which scopes every @c on_commit_k watch it takes. */
     transaction_stamp_t start_stamp() const noexcept { return start_stamp_; }
@@ -260,73 +286,59 @@ class blobs::database_transaction<stored_key_t, test_store_t> {
         return status;
     }
 
-    /** Writes @p word under @p stored_key, watching the key on @p watch_schedule_ as a write. */
+    /** Writes @p word under @p stored_key, watching the key on @p watch_schedule_ beside the write. */
     template <watch_schedule_t watch_schedule_ = watch_schedule_t::on_commit_k>
     status_t insert(stored_key_t stored_key, std::uint64_t word) noexcept {
-        std::array<stored_key_t, 1> const only {stored_key};
-        status_t status = watch_now_or_prepare_for_later_<watch_schedule_>(only);
-        if (status.failed()) return status;
-
-        transaction_stamp_t const watch_stamp = watch_stamp_<watch_schedule_>();
         std::byte payload[value_bytes_k];
         std::memcpy(payload, &word, value_bytes_k);
-        status = data_.changes.add(collection_k, group_config_, stored_key,
-                                   stored_value_view_t {payload, value_bytes_k});
-        watch_later_<watch_schedule_>(only, watch_stamp, watch_purpose_t::write_k);
-        return status;
+        return data_.changes.add(collection_k, group_config_, stored_key, stored_value_view_t {payload, value_bytes_k},
+                                 written_watch_<watch_schedule_>());
     }
 
-    /** Drops @p stored_key, watching the key on @p watch_schedule_ as a write. */
+    /** Drops @p stored_key, watching the key on @p watch_schedule_ beside the write. */
     template <watch_schedule_t watch_schedule_ = watch_schedule_t::on_commit_k>
     status_t remove(stored_key_t stored_key) noexcept {
-        std::array<stored_key_t, 1> const only {stored_key};
-        status_t status = watch_now_or_prepare_for_later_<watch_schedule_>(only);
-        if (status.failed()) return status;
-
-        transaction_stamp_t const watch_stamp = watch_stamp_<watch_schedule_>();
-        status = data_.changes.mark_as_removed(collection_k, group_config_, stored_key);
-        watch_later_<watch_schedule_>(only, watch_stamp, watch_purpose_t::write_k);
-        return status;
+        return data_.changes.mark_as_removed(collection_k, group_config_, stored_key,
+                                             written_watch_<watch_schedule_>());
     }
 
     /** Checks the watched keys and makes room in the store, holding the write path once it answers. */
     status_t stage() noexcept {
         transaction_stamp_t staged_stamp = invalid_transaction_stamp_k;
-        status_t const status = registry_->stage_(id_, data_, staged_stamp);
+        status_t const status = registry_->stage_(data_, start_stamp_, staged_stamp);
         if (status.succeeded()) phase_ = phase_t::staged_k;
         return status;
     }
 
     /** Stages unless already staged, then writes the changes into the store. */
     status_t commit() noexcept {
-        status_t const status = registry_->commit_(id_, data_, last_commit_stamp_);
+        if (phase_ != phase_t::staged_k)
+            if (status_t const staged = stage(); staged.failed()) return staged;
+        last_commit_stamp_ = registry_->commit_(data_);
         phase_ = phase_t::started_k;
-        if (status.succeeded()) {
-            data_.clear();
-            start_stamp_ = registry_->request_start_(id_);
-        }
-        return status;
+        data_.clear();
+        start_stamp_ = registry_->request_start_(pin_);
+        return {};
     }
 
     /** Drops every change and every watch, leaving the registry with no trace of the transaction. */
     void rollback() noexcept {
-        if (phase_ == phase_t::staged_k) registry_->discard_(id_);
+        if (phase_ == phase_t::staged_k) registry_->discard_();
         phase_ = phase_t::started_k;
         data_.clear();
-        registry_->invalidate_(id_);
-        start_stamp_ = registry_->request_start_(id_);
+        start_stamp_ = registry_->request_start_(pin_);
     }
 
     /** Starts over with the changes kept, which a caller retrying a conflict asks for. */
     void renew() noexcept {
-        if (phase_ == phase_t::staged_k) registry_->discard_(id_);
+        if (phase_ == phase_t::staged_k) registry_->discard_();
         phase_ = phase_t::started_k;
         data_.read_set.clear();
-        registry_->invalidate_(id_);
-        start_stamp_ = registry_->request_start_(id_);
+        start_stamp_ = registry_->request_start_(pin_);
+        data_.changes.rescope_watches(start_stamp_);
     }
 
-    /** The stamp of the last commit this transaction attempted. */
+    /** The stamp of the last commit this transaction landed. */
     transaction_stamp_t last_commit_stamp() const noexcept { return last_commit_stamp_; }
 
   private:
@@ -343,6 +355,15 @@ class blobs::database_transaction<stored_key_t, test_store_t> {
         if constexpr (watch_schedule_ == watch_schedule_t::on_commit_since_operation_k)
             return registry_->current_stamp_();
         else return start_stamp_;
+    }
+
+    /** The watch a write on @p watch_schedule_ keeps beside itself, none for a schedule that checks no later. */
+    template <watch_schedule_t watch_schedule_>
+    transaction_stamp_t written_watch_() const noexcept {
+        if constexpr (watch_schedule_ == watch_schedule_t::on_commit_k ||
+                      watch_schedule_ == watch_schedule_t::on_commit_since_operation_k)
+            return watch_stamp_<watch_schedule_>();
+        else return invalid_transaction_stamp_k;
     }
 
     /** Checks @p stored_keys now, or makes room to check them at the commit. */
@@ -366,19 +387,19 @@ class blobs::database_transaction<stored_key_t, test_store_t> {
                 data_.read_set.add(collection_k, stored_key, watch_stamp, purpose, st::assume_reserved);
     }
 
-    /** The identifier the registry knows this transaction by. */
-    transaction_id_t id_;
-
     /** The registry every stage and every commit goes through. */
     registry_t* registry_;
 
     /** The writes and the watches the transaction carries. */
     state_t data_;
 
+    /** The start stamp, pinned against the store's ledger. */
+    stamp_pin_t pin_;
+
     /** The stamp the current attempt started at. */
     transaction_stamp_t start_stamp_ = invalid_transaction_stamp_k;
 
-    /** The stamp the last commit attempt took. */
+    /** The stamp the last commit landed at. */
     transaction_stamp_t last_commit_stamp_ = invalid_transaction_stamp_k;
 
     /** What the transaction is allowed to do next. */
@@ -391,10 +412,10 @@ using transaction_t = database_transaction<stored_key_t, test_store_t>;
 
 #pragma region Fixture
 
-/** A registry over a store of words, with the resources all three are charged to. */
+/** A registry over a store of words, with the resources both are charged to. */
 struct fixture_t {
 
-    /** The budget the registry, the record and every transaction are charged to. */
+    /** The budget every transaction is charged to. */
     resources_shared_ptr_t resources;
 
     /** The collection every commit of the fixture lands in. */
@@ -404,13 +425,12 @@ struct fixture_t {
     registry_t registry;
 
     fixture_t() noexcept
-        : resources(std::make_shared<resources_t>(1ull << 30, 0)), store(),
-          registry(store, resources, conflict_slots_k, transaction_slots_k) {}
+        : resources(std::make_shared<resources_t>(1ull << 30, 0)), store(), registry(store, resources) {}
 
-    /** A transaction of @p id, or nothing when the registry refuses it. */
-    expected<registry_t::transaction_unique_ptr_t> open(transaction_id_t id) noexcept {
+    /** A transaction, or nothing when the registry refuses it. */
+    expected<registry_t::transaction_unique_ptr_t> open() noexcept {
         transaction_config_t const config {write_buffer_bytes_k, write_buffer_elements_k};
-        return registry.create_transaction(id, config);
+        return registry.create_transaction(config);
     }
 };
 
@@ -418,12 +438,10 @@ struct fixture_t {
 
 #pragma region Ordering Cases
 
-/** The commit stamp is a counter, so no two commits of any thread count ever share one. */
+/** Commits of many threads draw distinct stamps, and the watermark covers every one of them once all landed. */
 static std::size_t commit_stamps_are_distinct() {
     std::size_t failures = 0;
-
-    resource_constraint_t budget;
-    commit_record_t record(conflict_slots_k, budget);
+    commit_ledger_t ledger;
 
     constexpr std::size_t threads_k = 8;
     constexpr std::size_t per_thread_k = 20000;
@@ -433,12 +451,15 @@ static std::size_t commit_stamps_are_distinct() {
     for (std::size_t thread_index = 0; thread_index != threads_k; ++thread_index)
         workers.emplace_back([&, thread_index] {
             claimed[thread_index].reserve(per_thread_k);
-            for (std::size_t issue = 0; issue != per_thread_k; ++issue)
-                claimed[thread_index].push_back(record.issue_stamp());
+            for (std::size_t issue = 0; issue != per_thread_k; ++issue) {
+                commit_ledger_t::commit_in_flight_t in_flight;
+                claimed[thread_index].push_back(ledger.begin_commit(in_flight));
+                ledger.end_commit(in_flight);
+            }
         });
     for (std::thread& worker : workers) worker.join();
 
-    std::vector<bool> seen(threads_k * per_thread_k + first_transaction_stamp_k + 1, false);
+    std::vector<bool> seen(threads_k * per_thread_k + 1, false);
     std::size_t repeats = 0;
     transaction_stamp_t highest = unwritten_stamp_k;
     for (std::vector<transaction_stamp_t> const& batch : claimed)
@@ -449,69 +470,50 @@ static std::size_t commit_stamps_are_distinct() {
         }
 
     failures += expect_eq(repeats, std::size_t {0});
-    failures += expect(highest == threads_k * per_thread_k + first_transaction_stamp_k - 1);
-
-    // A watch is scoped from the published watermark, which no unpublished claim has moved.
-    failures += expect(record.watch_stamp() == first_transaction_stamp_k);
-    record.publish_stamp(highest);
-    failures += expect(record.watch_stamp() == highest + 1);
+    failures += expect_eq(highest, transaction_stamp_t {threads_k * per_thread_k});
+    failures += expect_eq(ledger.published(), highest);
     return failures;
 }
 
-/** An unwritten key conflicts with nobody, and a written one conflicts with every earlier watch. */
-static std::size_t record_orders_writes_against_watches() {
+/** Readers and write buffers pin stamps without allocating, and the ledger answers from exactly those pins. */
+static std::size_t pins_answer_the_ledger() {
     std::size_t failures = 0;
+    commit_ledger_t ledger;
+    failures += expect(ledger.resume(41).succeeded());
+    failures += expect(ledger.resume(43).failed());
 
-    resource_constraint_t budget;
-    commit_record_t record(conflict_slots_k, budget);
-    std::uint64_t const key = watched_key_fingerprint<stored_key_t>(collection_k, 11);
+    stamp_pin_t reader;
+    failures += expect_eq(ledger.pin_reader(reader), transaction_stamp_t {41});
+    failures += expect_eq(ledger.newest_reader(), transaction_stamp_t {41});
+    failures += expect_eq(ledger.durable_stamp(), transaction_stamp_t {41});
 
-    transaction_stamp_t const watched_from = record.watch_stamp();
-    failures += expect(!record.conflicts(key, watched_from));
+    commit_ledger_t::commit_in_flight_t in_flight;
+    failures += expect_eq(ledger.begin_commit(in_flight), transaction_stamp_t {42});
+    stamp_pin_t buffer;
+    ledger.pin_staging(buffer, 41);
+    ledger.end_commit(in_flight);
+    failures += expect_eq(ledger.published(), transaction_stamp_t {42});
+    failures += expect_eq(ledger.durable_stamp(), transaction_stamp_t {41});
+    failures += expect_eq(ledger.horizon_besides(buffer), transaction_stamp_t {42});
+    failures += expect_eq(ledger.staging_pins(), std::size_t {1});
 
-    transaction_stamp_t const commit_stamp = record.issue_stamp();
-    record.record(key, commit_stamp);
-    failures += expect(record.conflicts(key, watched_from));
+    // A pin moves by relinking, so the moved-to object answers and the moved-from one holds nothing.
+    stamp_pin_t moved {std::move(reader)};
+    failures += expect(!reader.held() && moved.held());
+    stamp_pin_t later;
+    failures += expect_eq(ledger.pin_reader(later), transaction_stamp_t {42});
+    st::basic_vector<transaction_stamp_t> pinned;
+    failures += expect(ledger.pinned_readers(pinned).succeeded());
+    failures += expect_eq(pinned.size(), std::size_t {2});
+    failures += expect(pinned.size() == 2 && pinned[0] == 41 && pinned[1] == 42);
 
-    // A watch taken after that commit has landed is not troubled by it.
-    record.publish_stamp(commit_stamp);
-    failures += expect(!record.conflicts(key, record.watch_stamp()));
-
-    transaction_stamp_t const newer_stamp = record.issue_stamp();
-    record.record(key, newer_stamp);
-    record.publish_stamp(newer_stamp);
-
-    // A commit arriving late never lowers what a newer one recorded, so the newer write stays seen.
-    record.record(key, commit_stamp);
-    failures += expect(record.conflicts(key, newer_stamp));
-    failures += expect(!record.conflicts(key, record.watch_stamp()));
-    return failures;
-}
-
-/** The roster hands one identifier to exactly one claimant, however many ask at once. */
-static std::size_t roster_admits_one_claimant_per_identifier() {
-    std::size_t failures = 0;
-
-    resource_constraint_t budget;
-    transaction_roster_t roster(transaction_slots_k, budget);
-
-    constexpr std::size_t threads_k = 8;
-    std::vector<std::size_t> enrolled(threads_k, 0);
-    std::vector<std::thread> workers;
-    workers.reserve(threads_k);
-    for (std::size_t thread_index = 0; thread_index != threads_k; ++thread_index)
-        workers.emplace_back([&, thread_index] {
-            for (transaction_id_t id = 1; id <= 16; ++id) enrolled[thread_index] += roster.enroll(id).succeeded();
-        });
-    for (std::thread& worker : workers) worker.join();
-
-    std::size_t winners = 0;
-    for (std::size_t const count : enrolled) winners += count;
-    failures += expect_eq(winners, std::size_t {16});
-    failures += expect_eq(roster.live(), std::size_t {16});
-
-    for (transaction_id_t id = 1; id <= 16; ++id) roster.retire(id);
-    failures += expect_eq(roster.live(), std::size_t {0});
+    moved.release();
+    failures += expect_eq(ledger.newest_reader(), transaction_stamp_t {42});
+    later.release();
+    buffer.release();
+    failures += expect_eq(ledger.newest_reader(), unwritten_stamp_k);
+    failures += expect_eq(ledger.staging_pins(), std::size_t {0});
+    failures += expect_eq(ledger.durable_stamp(), transaction_stamp_t {42});
     return failures;
 }
 
@@ -524,8 +526,8 @@ static std::size_t read_write_conflict_is_caught() {
     std::size_t failures = 0;
     fixture_t fixture;
 
-    auto reader = fixture.open(1);
-    auto writer = fixture.open(2);
+    auto reader = fixture.open();
+    auto writer = fixture.open();
     failures += expect(reader.has_value() && writer.has_value());
     if (failures != 0) return failures;
 
@@ -545,8 +547,8 @@ static std::size_t untouched_key_commits() {
     std::size_t failures = 0;
     fixture_t fixture;
 
-    auto reader = fixture.open(1);
-    auto writer = fixture.open(2);
+    auto reader = fixture.open();
+    auto writer = fixture.open();
     failures += expect(reader.has_value() && writer.has_value());
     if (failures != 0) return failures;
 
@@ -565,8 +567,8 @@ static std::size_t write_write_one_winner() {
     std::size_t failures = 0;
     fixture_t fixture;
 
-    auto first = fixture.open(1);
-    auto second = fixture.open(2);
+    auto first = fixture.open();
+    auto second = fixture.open();
     failures += expect(first.has_value() && second.has_value());
     if (failures != 0) return failures;
 
@@ -585,6 +587,35 @@ static std::size_t write_write_one_winner() {
     return failures;
 }
 
+/** Two transactions writing a thousand watched keys each, disjoint, both land: no conflict is ever invented. */
+static std::size_t disjoint_transactions_never_conflict() {
+    std::size_t failures = 0;
+    fixture_t fixture;
+    constexpr std::size_t band_k = 1000;
+    constexpr std::size_t rounds_k = 20;
+
+    std::size_t refused = 0;
+    for (std::size_t round = 0; round != rounds_k; ++round) {
+        auto first = fixture.open();
+        auto second = fixture.open();
+        failures += expect(first.has_value() && second.has_value());
+        if (failures != 0) return failures;
+        for (std::size_t key = 0; key != band_k; ++key) {
+            failures += expect(first->get()->insert(key, round).succeeded());
+            failures += expect(second->get()->insert(band_k + key, round).succeeded());
+            failures += expect(first->get()
+                                   ->watch<watch_schedule_t::on_commit_k>(2 * band_k + key, watch_purpose_t::read_k)
+                                   .succeeded());
+        }
+        refused += first->get()->commit().failed();
+        refused += second->get()->commit().failed();
+    }
+    failures += expect_eq(refused, std::size_t {0});
+    failures += expect_eq(fixture.store.balance(band_k - 1), std::uint64_t {rounds_k - 1});
+    failures += expect_eq(fixture.store.balance(2 * band_k - 1), std::uint64_t {rounds_k - 1});
+    return failures;
+}
+
 /** Each of the four schedules watches exactly what it says it does. */
 static std::size_t watch_schedules_behave() {
     std::size_t failures = 0;
@@ -592,8 +623,8 @@ static std::size_t watch_schedules_behave() {
     // `never_k` ignores a collision outright.
     {
         fixture_t fixture;
-        auto reader = fixture.open(1);
-        auto writer = fixture.open(2);
+        auto reader = fixture.open();
+        auto writer = fixture.open();
         failures += expect(reader.has_value() && writer.has_value());
         if (failures == 0) {
             failures += expect(reader->get()->watch<watch_schedule_t::never_k>(5, watch_purpose_t::read_k).succeeded());
@@ -608,8 +639,8 @@ static std::size_t watch_schedules_behave() {
     // `now_k` answers in place: clean before the commit, refused after it.
     {
         fixture_t fixture;
-        auto reader = fixture.open(1);
-        auto writer = fixture.open(2);
+        auto reader = fixture.open();
+        auto writer = fixture.open();
         failures += expect(reader.has_value() && writer.has_value());
         if (failures == 0) {
             failures += expect(reader->get()->watch<watch_schedule_t::now_k>(5, watch_purpose_t::read_k).succeeded());
@@ -627,8 +658,8 @@ static std::size_t watch_schedules_behave() {
     // `on_commit_k` is scoped from the transaction start, so a commit before the watch still counts.
     {
         fixture_t fixture;
-        auto reader = fixture.open(1);
-        auto writer = fixture.open(2);
+        auto reader = fixture.open();
+        auto writer = fixture.open();
         failures += expect(reader.has_value() && writer.has_value());
         if (failures == 0) {
             failures += expect(writer->get()->insert(5, 1).succeeded());
@@ -644,8 +675,8 @@ static std::size_t watch_schedules_behave() {
     // `on_commit_since_operation_k` is scoped from the operation, so that same commit does not count.
     {
         fixture_t fixture;
-        auto reader = fixture.open(1);
-        auto writer = fixture.open(2);
+        auto reader = fixture.open();
+        auto writer = fixture.open();
         failures += expect(reader.has_value() && writer.has_value());
         if (failures == 0) {
             failures += expect(writer->get()->insert(5, 1).succeeded());
@@ -657,7 +688,7 @@ static std::size_t watch_schedules_behave() {
             reader->get()->rollback();
 
             // A commit after the operation does count, which is the half that must still refuse.
-            auto second_writer = fixture.open(3);
+            auto second_writer = fixture.open();
             failures += expect(second_writer.has_value());
             if (second_writer.has_value()) {
                 failures += expect(
@@ -684,8 +715,8 @@ static std::size_t failed_commit_keeps_changes() {
     std::size_t failures = 0;
     fixture_t fixture;
 
-    auto transaction = fixture.open(1);
-    auto reader = fixture.open(2);
+    auto transaction = fixture.open();
+    auto reader = fixture.open();
     failures += expect(transaction.has_value() && reader.has_value());
     if (failures != 0) return failures;
 
@@ -698,9 +729,8 @@ static std::size_t failed_commit_keeps_changes() {
     failures += expect(transaction->get()->commit().failed());
     failures += expect_eq(transaction->get()->state().changes.count(), std::size_t {2});
 
-    // The keys were published before the writes that never finished, so a reader spanning the
-    // failure is refused rather than shown a batch that may have landed halfway.
-    failures += expect_status(reader->get()->stage(), status_code_t::write_conflict_k);
+    // The room was refused before a stamp was drawn, so nothing landed and a reader spanning the failure stages.
+    failures += expect(reader->get()->stage().succeeded());
     reader->get()->rollback();
 
     // Retrying is what renewal is for: the changes stay and only the watches and the stamp restart.
@@ -720,13 +750,13 @@ static std::size_t failed_commit_keeps_changes() {
     return failures;
 }
 
-/** A stage that cannot make room reports the refusal and hands the write path back. */
+/** A stage that has to flush first does, and hands the write path back once the commit lands. */
 static std::size_t refused_flush_releases_the_channel() {
     std::size_t failures = 0;
     fixture_t fixture;
     fixture.store.behaviour = store_behaviour_t::always_flushing_k;
 
-    auto transaction = fixture.open(1);
+    auto transaction = fixture.open();
     failures += expect(transaction.has_value());
     if (failures != 0) return failures;
     failures += expect(transaction->get()->insert(3, 7).succeeded());
@@ -735,8 +765,8 @@ static std::size_t refused_flush_releases_the_channel() {
     failures += expect_eq(fixture.store.flushes, std::size_t {1});
     failures += expect(transaction->get()->commit().succeeded());
 
-    // The queue pair was handed back, so the next transaction can still take it.
-    auto second = fixture.open(2);
+    // The write path was handed back, so the next transaction can still take it.
+    auto second = fixture.open();
     failures += expect(second.has_value());
     if (second.has_value()) {
         failures += expect(second->get()->insert(4, 8).succeeded());
@@ -745,13 +775,13 @@ static std::size_t refused_flush_releases_the_channel() {
     return failures;
 }
 
-/** Rollback and renewal leave the registry with no trace of the transaction. */
+/** Rollback and renewal leave the registry with no trace of the transaction, and its pin goes with it. */
 static std::size_t rollback_and_renew_leave_no_trace() {
     std::size_t failures = 0;
     fixture_t fixture;
 
     {
-        auto transaction = fixture.open(1);
+        auto transaction = fixture.open();
         failures += expect(transaction.has_value());
         if (failures != 0) return failures;
 
@@ -769,59 +799,30 @@ static std::size_t rollback_and_renew_leave_no_trace() {
         failures += expect_eq(transaction->get()->state().read_set.count(), std::size_t {0});
         failures += expect(transaction->get()->commit().succeeded());
         failures += expect_eq(fixture.store.balance(3), std::uint64_t {9});
-
-        failures += expect(fixture.registry.has_transaction(1));
+        failures += expect_eq(fixture.store.ledger().newest_reader(), fixture.store.ledger().published());
     }
 
-    // The transaction is gone with its object, and so is its slot.
-    failures += expect(!fixture.registry.has_transaction(1));
+    // The transaction is gone with its object, and so is its pin.
+    failures += expect_eq(fixture.store.ledger().newest_reader(), unwritten_stamp_k);
     return failures;
 }
 
-/** One identifier names one transaction, and a second request for it is refused. */
-static std::size_t duplicate_identifier_is_refused() {
+/** A watcher beside twenty thousand commits is refused by exactly the one that wrote its key, and a watcher of a
+ *  key nobody wrote is refused by none, since the store answers from the stamps it keeps per key. */
+static std::size_t long_watchers_stay_exact() {
     std::size_t failures = 0;
     fixture_t fixture;
 
-    auto first = fixture.open(1);
-    failures += expect(first.has_value());
-    auto second = fixture.open(1);
-    failures += expect(second.failed());
-    failures += expect_status(second, status_code_t::already_exists_k);
-    return failures;
-}
-
-/** The registry refuses a transaction past the slots it was built with, rather than growing. */
-static std::size_t roster_refuses_past_its_slots() {
-    std::size_t failures = 0;
-    resources_shared_ptr_t resources = std::make_shared<resources_t>(1ull << 30, 0);
-    test_store_t store;
-    registry_t registry(store, resources, conflict_slots_k, 2);
-
-    transaction_config_t const config {write_buffer_bytes_k, write_buffer_elements_k};
-    auto first = registry.create_transaction(1, config);
-    auto second = registry.create_transaction(2, config);
-    auto third = registry.create_transaction(3, config);
-    failures += expect(first.has_value() && second.has_value());
-    failures += expect(third.failed());
-    failures += expect_status(third, status_code_t::capacity_exhausted_k);
-    return failures;
-}
-
-/** The committed-key record is a fixed table, so a long transaction beside many commits never grows it. */
-static std::size_t commit_record_is_bounded() {
-    std::size_t failures = 0;
-    fixture_t fixture;
-
-    auto lingering = fixture.open(1);
-    failures += expect(lingering.has_value());
+    auto lingering = fixture.open();
+    auto untouched = fixture.open();
+    failures += expect(lingering.has_value() && untouched.has_value());
     if (failures != 0) return failures;
     // The watched key is written by the very first of the commits below, and by nothing after it.
     failures += expect(lingering->get()->watch<watch_schedule_t::on_commit_k>(1, watch_purpose_t::read_k).succeeded());
+    failures += expect(untouched->get()->watch<watch_schedule_t::on_commit_k>(0, watch_purpose_t::read_k).succeeded());
 
-    std::size_t const before = fixture.registry.shared_state_bytes();
     for (std::size_t round = 0; round != 20000; ++round) {
-        auto writer = fixture.open(2);
+        auto writer = fixture.open();
         if (!writer.has_value()) {
             failures += expect(false);
             break;
@@ -829,15 +830,11 @@ static std::size_t commit_record_is_bounded() {
         failures += expect(writer->get()->insert(round == 0 ? 1 : 2 + round % (accounts_k - 2), round).succeeded());
         if (writer->get()->commit().failed()) failures += expect(false);
     }
-    std::size_t const after = fixture.registry.shared_state_bytes();
 
-    failures += expect_eq(after, before);
-    failures += expect_eq(after, conflict_slots_k * sizeof(transaction_stamp_t) + transaction_slots_k * 16);
-
-    // Twenty thousand commits later the very first of them is still remembered, so bounding the
-    // record cost nothing of the conflict it exists for.
     failures += expect_status(lingering->get()->stage(), status_code_t::write_conflict_k);
     lingering->get()->rollback();
+    failures += expect(untouched->get()->stage().succeeded());
+    untouched->get()->rollback();
     return failures;
 }
 
@@ -850,7 +847,7 @@ static std::size_t commit_record_is_bounded() {
  *
  *  A lost update leaves the total short or long, and a half-applied commit leaves it short by the
  *  half that landed, so the sum is the whole result. Every transaction reads two balances outside
- *  the staging queue pair and writes both inside it, which is the shape a conflict record has to survive.
+ *  the write path and writes both inside it, which is the shape the stamps have to survive.
  */
 static std::size_t serializable_under_threads() {
     std::size_t failures = 0;
@@ -868,7 +865,7 @@ static std::size_t serializable_under_threads() {
 
     for (std::size_t thread_index = 0; thread_index != threads_k; ++thread_index)
         workers.emplace_back([&, thread_index] {
-            auto opened = fixture.open(static_cast<transaction_id_t>(thread_index + 1));
+            auto opened = fixture.open();
             if (!opened.has_value()) return;
             transaction_t& transaction = *opened->get();
 
@@ -877,8 +874,8 @@ static std::size_t serializable_under_threads() {
                 scramble ^= scramble << 13;
                 scramble ^= scramble >> 7;
                 scramble ^= scramble << 17;
-                stored_key_t const from = scramble % accounts_k;
-                stored_key_t const to = (scramble / accounts_k) % accounts_k;
+                stored_key_t const from = scramble % contended_accounts_k;
+                stored_key_t const to = (scramble / contended_accounts_k) % contended_accounts_k;
                 if (from == to) continue;
 
                 // The read is watched from the transaction start, so any commit in between refuses it.
@@ -916,7 +913,7 @@ static std::size_t serializable_under_threads() {
     failures += expect_eq(fixture.store.total(), total_before);
     failures += expect(commits + refusals > 0);
 
-    // A record that refused everything would pass the total while proving nothing, so it must not.
+    // A layer that refused everything would pass the total while proving nothing, so it must not.
     failures += expect(commits > 0);
     return failures;
 }
@@ -925,17 +922,16 @@ static std::size_t serializable_under_threads() {
  *  @brief A transaction starting while a commit is half applied orders before it, not after it.
  *
  *  This is the ordering the money-moving case can only catch by luck, so it is driven here by hand: a
- *  commit is held inside the store with its stamp claimed and its keys recorded but its writes not yet
- *  landed, a reader starts in exactly that window and reads the stale balance, and the stage that
- *  follows has to refuse it. Opening the watermark before the writes land instead of after lets that
- *  reader through with a value that was never committed.
+ *  commit is held inside the store with its stamp drawn but its writes not yet landed, a reader starts in
+ *  exactly that window and reads the stale balance, and the stage that follows has to refuse it. Starting the
+ *  reader at the drawn stamp instead of the published one lets it through with a value that was never committed.
  */
 static std::size_t start_during_apply_still_conflicts() {
     std::size_t failures = 0;
     fixture_t fixture;
     fixture.store.behaviour = store_behaviour_t::pausing_in_apply_k;
 
-    auto writer = fixture.open(1);
+    auto writer = fixture.open();
     failures += expect(writer.has_value());
     if (failures != 0) return failures;
 
@@ -943,10 +939,10 @@ static std::size_t start_during_apply_still_conflicts() {
     failures += expect(writer->get()->insert(5, 77).succeeded());
     std::thread committing([&] { committed = writer->get()->commit().succeeded(); });
 
-    // The commit is now past its stamp and past its record, and has not written a byte.
+    // The commit is now past its stamp and has not written a byte.
     failures += expect(spin_until([&] { return fixture.store.paused(); }));
 
-    auto reader = fixture.open(2);
+    auto reader = fixture.open();
     failures += expect(reader.has_value());
     std::uint64_t seen = 0;
     if (reader.has_value()) {
@@ -970,8 +966,8 @@ static std::size_t start_during_apply_still_conflicts() {
     return failures;
 }
 
-/** Threads opening and closing transactions against one roster leave it empty and unbroken. */
-static std::size_t roster_survives_churn() {
+/** Threads opening and closing transactions against one ledger leave no pin behind. */
+static std::size_t pins_survive_churn() {
     std::size_t failures = 0;
     fixture_t fixture;
 
@@ -984,10 +980,11 @@ static std::size_t roster_survives_churn() {
     for (std::size_t thread_index = 0; thread_index != threads_k; ++thread_index)
         workers.emplace_back([&, thread_index] {
             for (std::size_t round = 0; round != rounds_k; ++round) {
-                auto transaction = fixture.open(static_cast<transaction_id_t>(thread_index * rounds_k + round + 1));
+                auto transaction = fixture.open();
                 if (!transaction.has_value()) continue;
                 ++opened[thread_index];
-                if (transaction->get()->insert(round % accounts_k, round).succeeded()) [[maybe_unused]]
+                if (transaction->get()->insert((thread_index * rounds_k + round) % accounts_k, round).succeeded())
+                    [[maybe_unused]]
                     status_t const committed = transaction->get()->commit();
             }
         });
@@ -995,8 +992,8 @@ static std::size_t roster_survives_churn() {
 
     std::size_t total_opened = 0;
     for (std::size_t const count : opened) total_opened += count;
-    failures += expect(total_opened > 0);
-    failures += expect(!fixture.registry.has_transaction(1));
+    failures += expect_eq(total_opened, threads_k * rounds_k);
+    failures += expect_eq(fixture.store.ledger().newest_reader(), unwritten_stamp_k);
     return failures;
 }
 
@@ -1017,21 +1014,19 @@ int main(int argc, char const* argv[]) {
     suite_totals_t totals = options.totals();
 
     report(totals, "stamps.distinct", commit_stamps_are_distinct);
-    report(totals, "record.orders_writes", record_orders_writes_against_watches);
-    report(totals, "roster.one_claimant", roster_admits_one_claimant_per_identifier);
+    report(totals, "ledger.pins", pins_answer_the_ledger);
     report(totals, "conflict.read_write", read_write_conflict_is_caught);
     report(totals, "conflict.untouched_commits", untouched_key_commits);
     report(totals, "conflict.write_write_one_winner", write_write_one_winner);
+    report(totals, "conflict.disjoint_never", disjoint_transactions_never_conflict);
     report(totals, "conflict.watch_schedules", watch_schedules_behave);
     report(totals, "lifecycle.failed_commit_keeps", failed_commit_keeps_changes);
     report(totals, "lifecycle.flush_releases_channel", refused_flush_releases_the_channel);
     report(totals, "lifecycle.rollback_and_renew", rollback_and_renew_leave_no_trace);
-    report(totals, "lifecycle.duplicate_id", duplicate_identifier_is_refused);
-    report(totals, "lifecycle.roster_refuses", roster_refuses_past_its_slots);
-    report(totals, "lifecycle.record_bounded", commit_record_is_bounded);
+    report(totals, "lifecycle.long_watchers_exact", long_watchers_stay_exact);
     report(totals, "threads.serializable", serializable_under_threads);
     report(totals, "threads.start_during_apply", start_during_apply_still_conflicts);
-    report(totals, "threads.roster_churn", roster_survives_churn);
+    report(totals, "threads.pins_churn", pins_survive_churn);
 
     return suite_exit_code(totals);
 }

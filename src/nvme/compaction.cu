@@ -50,35 +50,72 @@ using inline_64_bytes_slot_t = key_slot<stored_key_t, value_layout_t::inline_64_
 using fixed_width_slot_t = key_slot<stored_key_t, value_layout_t::fixed_width_k>;
 using variable_width_slot_t = key_slot<stored_key_t, value_layout_t::variable_width_k>;
 
-/** The key slot the storage suites model their runs with. */
+/** The key slots the storage suites model their runs with, one per value layout, since a database of them holds a
+ *  collection of any layout. */
+using suite_inline_1_byte_slot_t = key_slot<std::uint64_t, value_layout_t::inline_1_byte_k>;
+using suite_inline_4_bytes_slot_t = key_slot<std::uint64_t, value_layout_t::inline_4_bytes_k>;
+using suite_inline_8_bytes_slot_t = key_slot<std::uint64_t, value_layout_t::inline_8_bytes_k>;
+using suite_inline_16_bytes_slot_t = key_slot<std::uint64_t, value_layout_t::inline_16_bytes_k>;
+using suite_inline_32_bytes_slot_t = key_slot<std::uint64_t, value_layout_t::inline_32_bytes_k>;
+using suite_inline_64_bytes_slot_t = key_slot<std::uint64_t, value_layout_t::inline_64_bytes_k>;
+using suite_fixed_width_slot_t = key_slot<std::uint64_t, value_layout_t::fixed_width_k>;
 using suite_variable_width_slot_t = key_slot<std::uint64_t, value_layout_t::variable_width_k>;
 
 template st::status_t gpu_compactor_t::compact(compaction_kind_t, views_of<inline_1_byte_slot_t>,
                                                views_of<inline_1_byte_slot_t>, sorted_run_bounds_t const&,
-                                               compaction_output<inline_1_byte_slot_t>&);
+                                               compaction_stamps_t const&, compaction_output<inline_1_byte_slot_t>&);
 template st::status_t gpu_compactor_t::compact(compaction_kind_t, views_of<inline_4_bytes_slot_t>,
                                                views_of<inline_4_bytes_slot_t>, sorted_run_bounds_t const&,
-                                               compaction_output<inline_4_bytes_slot_t>&);
+                                               compaction_stamps_t const&, compaction_output<inline_4_bytes_slot_t>&);
 template st::status_t gpu_compactor_t::compact(compaction_kind_t, views_of<inline_8_bytes_slot_t>,
                                                views_of<inline_8_bytes_slot_t>, sorted_run_bounds_t const&,
-                                               compaction_output<inline_8_bytes_slot_t>&);
+                                               compaction_stamps_t const&, compaction_output<inline_8_bytes_slot_t>&);
 template st::status_t gpu_compactor_t::compact(compaction_kind_t, views_of<inline_16_bytes_slot_t>,
                                                views_of<inline_16_bytes_slot_t>, sorted_run_bounds_t const&,
-                                               compaction_output<inline_16_bytes_slot_t>&);
+                                               compaction_stamps_t const&, compaction_output<inline_16_bytes_slot_t>&);
 template st::status_t gpu_compactor_t::compact(compaction_kind_t, views_of<inline_32_bytes_slot_t>,
                                                views_of<inline_32_bytes_slot_t>, sorted_run_bounds_t const&,
-                                               compaction_output<inline_32_bytes_slot_t>&);
+                                               compaction_stamps_t const&, compaction_output<inline_32_bytes_slot_t>&);
 template st::status_t gpu_compactor_t::compact(compaction_kind_t, views_of<inline_64_bytes_slot_t>,
                                                views_of<inline_64_bytes_slot_t>, sorted_run_bounds_t const&,
-                                               compaction_output<inline_64_bytes_slot_t>&);
+                                               compaction_stamps_t const&, compaction_output<inline_64_bytes_slot_t>&);
 template st::status_t gpu_compactor_t::compact(compaction_kind_t, views_of<fixed_width_slot_t>,
                                                views_of<fixed_width_slot_t>, sorted_run_bounds_t const&,
-                                               compaction_output<fixed_width_slot_t>&);
+                                               compaction_stamps_t const&, compaction_output<fixed_width_slot_t>&);
 template st::status_t gpu_compactor_t::compact(compaction_kind_t, views_of<variable_width_slot_t>,
                                                views_of<variable_width_slot_t>, sorted_run_bounds_t const&,
-                                               compaction_output<variable_width_slot_t>&);
+                                               compaction_stamps_t const&, compaction_output<variable_width_slot_t>&);
+template st::status_t gpu_compactor_t::compact(compaction_kind_t, views_of<suite_inline_1_byte_slot_t>,
+                                               views_of<suite_inline_1_byte_slot_t>, sorted_run_bounds_t const&,
+                                               compaction_stamps_t const&,
+                                               compaction_output<suite_inline_1_byte_slot_t>&);
+template st::status_t gpu_compactor_t::compact(compaction_kind_t, views_of<suite_inline_4_bytes_slot_t>,
+                                               views_of<suite_inline_4_bytes_slot_t>, sorted_run_bounds_t const&,
+                                               compaction_stamps_t const&,
+                                               compaction_output<suite_inline_4_bytes_slot_t>&);
+template st::status_t gpu_compactor_t::compact(compaction_kind_t, views_of<suite_inline_16_bytes_slot_t>,
+                                               views_of<suite_inline_16_bytes_slot_t>, sorted_run_bounds_t const&,
+                                               compaction_stamps_t const&,
+                                               compaction_output<suite_inline_16_bytes_slot_t>&);
+template st::status_t gpu_compactor_t::compact(compaction_kind_t, views_of<suite_inline_32_bytes_slot_t>,
+                                               views_of<suite_inline_32_bytes_slot_t>, sorted_run_bounds_t const&,
+                                               compaction_stamps_t const&,
+                                               compaction_output<suite_inline_32_bytes_slot_t>&);
+template st::status_t gpu_compactor_t::compact(compaction_kind_t, views_of<suite_inline_8_bytes_slot_t>,
+                                               views_of<suite_inline_8_bytes_slot_t>, sorted_run_bounds_t const&,
+                                               compaction_stamps_t const&,
+                                               compaction_output<suite_inline_8_bytes_slot_t>&);
+template st::status_t gpu_compactor_t::compact(compaction_kind_t, views_of<suite_inline_64_bytes_slot_t>,
+                                               views_of<suite_inline_64_bytes_slot_t>, sorted_run_bounds_t const&,
+                                               compaction_stamps_t const&,
+                                               compaction_output<suite_inline_64_bytes_slot_t>&);
+template st::status_t gpu_compactor_t::compact(compaction_kind_t, views_of<suite_fixed_width_slot_t>,
+                                               views_of<suite_fixed_width_slot_t>, sorted_run_bounds_t const&,
+                                               compaction_stamps_t const&,
+                                               compaction_output<suite_fixed_width_slot_t>&);
 template st::status_t gpu_compactor_t::compact(compaction_kind_t, views_of<suite_variable_width_slot_t>,
                                                views_of<suite_variable_width_slot_t>, sorted_run_bounds_t const&,
+                                               compaction_stamps_t const&,
                                                compaction_output<suite_variable_width_slot_t>&);
 
 #pragma endregion Instantiations

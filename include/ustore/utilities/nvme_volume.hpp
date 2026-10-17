@@ -49,9 +49,10 @@
 #include <cstring> // `std::memcmp`, `std::memcpy`, `std::memset`, `std::strlen`
 
 #if defined(_WIN32)
-#include <windows.h> // `CreateDirectoryA`
+#include <windows.h> // `CreateDirectoryA`, `DeleteFileA`, `RemoveDirectoryA`
 #else
 #include <sys/stat.h> // `mkdir`
+#include <unistd.h>   // `rmdir`, `unlink`
 #endif
 
 #include <algorithm> // `std::clamp`
@@ -1636,12 +1637,36 @@ inline status_t create_directory(char const* path) noexcept {
     return {status_code_t::io_k, "A directory of the database would not be created"};
 }
 
+/** Removes the file @p path, treating one that is already gone as success. */
+inline status_t remove_file(char const* path) noexcept {
+    if (DeleteFileA(path) != 0 || GetLastError() == ERROR_FILE_NOT_FOUND) return {};
+    return {status_code_t::io_k, "A file of the database would not be removed"};
+}
+
+/** Removes the empty directory @p path, treating one that is already gone as success. */
+inline status_t remove_directory(char const* path) noexcept {
+    if (RemoveDirectoryA(path) != 0 || GetLastError() == ERROR_FILE_NOT_FOUND) return {};
+    return {status_code_t::io_k, "A directory of the database would not be removed"};
+}
+
 #else
 
 /** Creates @p path alone, treating a directory that is already there as success. */
 inline status_t create_directory(char const* path) noexcept {
     if (::mkdir(path, 0755) == 0 || errno == EEXIST) return {};
     return {status_code_t::io_k, "A directory of the database would not be created"};
+}
+
+/** Removes the file @p path, treating one that is already gone as success. */
+inline status_t remove_file(char const* path) noexcept {
+    if (::unlink(path) == 0 || errno == ENOENT) return {};
+    return {status_code_t::io_k, "A file of the database would not be removed"};
+}
+
+/** Removes the empty directory @p path, treating one that is already gone as success. */
+inline status_t remove_directory(char const* path) noexcept {
+    if (::rmdir(path) == 0 || errno == ENOENT) return {};
+    return {status_code_t::io_k, "A directory of the database would not be removed"};
 }
 
 #endif
