@@ -315,6 +315,46 @@ int main(void) {
     if (columns && columns[0].scalars) memcpy(&year, columns[0].scalars, sizeof(year));
     failures += expect(year == 1815 && tape_holds(&columns[1].strings, 0, "ada"), __LINE__);
 
+    // A page imports from XML, takes an insertion after a Nil anchor, and renders back whole and by the inserted key
+    ustore_key_t const page_key = key_from(10);
+    char const* const markups[1] = {"<doc><p>one</p></doc>"};
+    ustore_pages_import_t import_page = {.database = database,
+                                         .outcome = &outcome,
+                                         .count = 1,
+                                         .keys = {&page_key, 0},
+                                         .values = accessor_of(markups),
+                                         .encoding = ustore_page_encoding_xml_k};
+    ustore_pages_import(&import_page);
+    failures += expect_success(&outcome, __LINE__);
+    char const* const fragments[1] = {"<h1>title</h1>"};
+    ustore_key_t const* landed = NULL;
+    ustore_pages_insert_t insert_page = {.database = database,
+                                         .outcome = &outcome,
+                                         .count = 1,
+                                         .keys = {&page_key, 0},
+                                         .values = accessor_of(fragments),
+                                         .encoding = ustore_page_encoding_xml_k,
+                                         .effective_keys = &landed,
+                                         .arena = arena};
+    ustore_pages_insert(&insert_page);
+    failures += expect_success(&outcome, __LINE__);
+    failures += expect(landed != NULL, __LINE__);
+    ustore_key_t const inserted_key = landed ? landed[0] : page_key;
+    ustore_pages_read_t read_page = {.database = database,
+                                     .outcome = &outcome,
+                                     .count = 1,
+                                     .keys = {&page_key, 0},
+                                     .values = &values,
+                                     .arena = arena,
+                                     .outputs_encoding = ustore_page_encoding_xml_k};
+    ustore_pages_read(&read_page);
+    failures += expect_success(&outcome, __LINE__);
+    failures += expect(tape_holds(&values, 0, "<h1>title</h1><doc><p>one</p></doc>"), __LINE__);
+    read_page.elements = (ustore_keys_view_t) {&inserted_key, 0};
+    ustore_pages_read(&read_page);
+    failures += expect_success(&outcome, __LINE__);
+    failures += expect(tape_holds(&values, 0, "<h1>title</h1>"), __LINE__);
+
     // A description counts the keys, which a compaction keeps and a clear of the pairs removes
     ustore_database_description_t description = {0};
     ustore_database_describe_t describe = {.database = database, .outcome = &outcome, .description = &description};

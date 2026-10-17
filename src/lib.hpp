@@ -311,12 +311,6 @@ inline void clear_outputs(ustore_pages_read_t const& arguments) noexcept {
     clear(arguments.presences), clear(arguments.lengths), clear(arguments.values);
 }
 
-inline void clear_outputs(ustore_pages_history_t const& arguments) noexcept {
-    clear(arguments.edits_offsets), clear(arguments.stamps), clear(arguments.modifications), clear(arguments.elements);
-    clear(arguments.parents), clear(arguments.anchors), clear(arguments.fields), clear(arguments.text_starts);
-    clear(arguments.text_lengths), clear(arguments.values);
-}
-
 inline void clear_outputs(ustore_strings_read_t const& arguments) noexcept {
     clear(arguments.presences), clear(arguments.lengths), clear(arguments.values);
 }
@@ -541,11 +535,11 @@ using deferred_arguments_t = std::variant<
     ustore_docs_gist_t, ustore_docs_gather_t, ustore_graph_read_edges_t, ustore_graph_write_edges_t,
     ustore_graph_remove_edges_t, ustore_graph_write_vertices_t, ustore_graph_remove_vertices_t, ustore_pages_import_t,
     ustore_pages_insert_t, ustore_pages_remove_t, ustore_pages_move_t, ustore_pages_splice_t,
-    ustore_pages_set_attributes_t, ustore_pages_remove_attributes_t, ustore_pages_read_t, ustore_pages_history_t,
-    ustore_strings_write_t, ustore_strings_remove_t, ustore_strings_read_t, ustore_strings_scan_t,
-    ustore_blobs_cursor_next_t, ustore_strings_cursor_next_t, routed_init<ustore_database_init_ram_t>,
-    routed_init<ustore_database_open_ram_t>, routed_init<ustore_database_open_rocksdb_t>,
-    routed_init<ustore_database_view_rocksdb_t>, routed_init<ustore_database_open_leveldb_t>>;
+    ustore_pages_set_attributes_t, ustore_pages_remove_attributes_t, ustore_pages_read_t, ustore_strings_write_t,
+    ustore_strings_remove_t, ustore_strings_read_t, ustore_strings_scan_t, ustore_blobs_cursor_next_t,
+    ustore_strings_cursor_next_t, routed_init<ustore_database_init_ram_t>, routed_init<ustore_database_open_ram_t>,
+    routed_init<ustore_database_open_rocksdb_t>, routed_init<ustore_database_view_rocksdb_t>,
+    routed_init<ustore_database_open_leveldb_t>>;
 
 /** What a deferred call leaves its driver, which publishes it once the call's table position is free again. */
 struct deferred_result_t {

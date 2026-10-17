@@ -455,9 +455,9 @@ if (${USTORE_BUILD_TEST})
         add_test(NAME ustore_test_utilities_${test_name} COMMAND ustore_test_utilities_${test_name})
     endforeach ()
 
-    # The docs templates call StringZilla's dispatched kernels, which a header-only StringZilla answers with
+    # The pages and docs templates call StringZilla's dispatched kernels, which a header-only StringZilla answers with
     # `sz_missing_library_k`, so these suites link its compiled library instead of `ustore::header`
-    set(USTORE_TEMPLATES_TEST_PATHS "docs/json_paths")
+    set(USTORE_TEMPLATES_TEST_PATHS "pages/element_tree" "pages/page_fold" "docs/json_paths")
     foreach (test_path IN ITEMS ${USTORE_TEMPLATES_TEST_PATHS})
         string(REPLACE "/" "_" test_name ${test_path})
         add_executable(ustore_test_${test_name} test/${test_path}.cpp)

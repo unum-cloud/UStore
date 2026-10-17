@@ -22,9 +22,9 @@
  *  key doubles as the key of the root element. Tasks of one call apply in order inside one commit, so
  *  a later task may anchor on an element an earlier one minted.
  *
- *  Reads render a page or a subtree as their view sees it, in the encoding the caller asks for, and a
- *  history lists the edits between two commit stamps. Cursors, selections and presence are never
- *  stored; they are the application's ephemeral state.
+ *  A page stores only its current shape, never the edits that produced it, and reads render a page or
+ *  a subtree as their view sees it, in the encoding the caller asks for. Cursors, selections and
+ *  presence are never stored; they are the application's ephemeral state.
  */
 
 #ifndef UNUM_USTORE_PAGES_H
@@ -56,56 +56,12 @@ typedef enum ustore_page_encoding_t {
 
 } ustore_page_encoding_t;
 
-/** The kind of an edit @c ustore_pages_history lists, named after the verb that applies it. */
-typedef enum ustore_page_modification_t {
-
-    /** Replaces a whole page with parsed markup, minting every element, as @c ustore_pages_import does. */
-    ustore_page_modify_import_k = 0,
-
-    /** Parses a fragment into elements under a parent after an anchor, as @c ustore_pages_insert does. */
-    ustore_page_modify_insert_k = 1,
-
-    /** Removes an element with its subtree, as @c ustore_pages_remove does. */
-    ustore_page_modify_remove_k = 2,
-
-    /** Moves an element under a parent after an anchor, keeping its key, as @c ustore_pages_move does. */
-    ustore_page_modify_move_k = 3,
-
-    /** Replaces a run of an element's text with new bytes, as @c ustore_pages_splice does. */
-    ustore_page_modify_splice_k = 4,
-
-    /** Sets an attribute of an element, as @c ustore_pages_set_attributes does. */
-    ustore_page_modify_set_attributes_k = 5,
-
-    /** Removes an attribute of an element, as @c ustore_pages_remove_attributes does. */
-    ustore_page_modify_remove_attributes_k = 6,
-
-} ustore_page_modification_t;
-
 /** The canonical spelling of an encoding, as @c ustore_page_encoding_markdown_k spells "markdown", or
  *  "unrecognized". */
 USTORE_EXPORT char const* ustore_page_encoding_name(ustore_page_encoding_t encoding);
 
 /** Reads an encoding back from its canonical spelling; @c ustore_page_encoding_html_k when unrecognized. */
 USTORE_EXPORT ustore_page_encoding_t ustore_page_encoding_from_name(ustore_bytes_view_t name);
-
-/** The canonical spelling of a modification, as @c ustore_page_modify_set_attributes_k spells "set-attributes", or
- *  "unrecognized". */
-USTORE_EXPORT char const* ustore_page_modification_name(ustore_page_modification_t modification);
-
-/** Reads a modification back from its canonical spelling; @c ustore_page_modify_import_k when unrecognized. */
-USTORE_EXPORT ustore_page_modification_t ustore_page_modification_from_name(ustore_bytes_view_t name);
-
-/** A strided run of commit stamps, one per task. */
-typedef struct ustore_stamps_view_t {
-
-    /** First stamp of the run. */
-    ustore_stamp_t const* data;
-
-    /** Bytes between consecutive stamps, where zero repeats the first one. */
-    ustore_size_t stride;
-
-} ustore_stamps_view_t;
 
 /** The arguments of @c ustore_pages_import, which replaces whole pages with parsed markup. */
 typedef struct ustore_pages_import_t {
@@ -524,93 +480,6 @@ typedef struct ustore_pages_read_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
 USTORE_EXPORT void ustore_pages_read(ustore_pages_read_t* arguments);
-
-/**
- *  @brief The arguments of @c ustore_pages_history, which lists the edits of pages between two commits.
- *
- *  Edits come oldest first, one row per edit across the outputs, with the name of an attribute in
- *  @c fields and the bytes of an import, an insertion, a splice or an attribute in @c values, each a tape
- *  of one string per edit, and every output lands in @c arena. Replaying the rows of one page, each
- *  through the verb its modification names, onto its rendering at @c since reproduces its rendering at
- *  @c until.
- */
-typedef struct ustore_pages_history_t {
-
-    /** An open database. */
-    ustore_database_t database;
-
-    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
-    ustore_executor_t executor;
-
-    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
-    ustore_outcome_t* outcome;
-
-    /** Whether the call returns final, the default, or once submitted. */
-    ustore_completion_t completion;
-
-    /** What bounds the history, where @c NULL is the head. */
-    ustore_view_t view;
-
-    /** Number of pages. */
-    ustore_size_t count;
-
-    /** Collections of the pages, where @c NULL data stands for the main collection. */
-    ustore_collections_view_t collections;
-
-    /** Keys of the pages. */
-    ustore_keys_view_t keys;
-
-    /** First commit stamp included, where zero or @c NULL data starts at the page's creation. */
-    ustore_stamps_view_t since;
-
-    /** Last commit stamp included, where zero or @c NULL data ends at the moment read. */
-    ustore_stamps_view_t until;
-
-    /** Output for @c count plus one offsets into the rows of edits, the last one closing the final page, inside
-     *  @c arena. */
-    ustore_length_t const** edits_offsets;
-
-    /** Optional output for the commit stamp of every edit, inside @c arena. */
-    ustore_stamp_t const** stamps;
-
-    /** Optional output for the modification of every edit, inside @c arena. */
-    ustore_page_modification_t const** modifications;
-
-    /** Optional output for the element of every edit, inside @c arena. */
-    ustore_key_t const** elements;
-
-    /** Optional output for the parent of every insertion or move, inside @c arena. */
-    ustore_key_t const** parents;
-
-    /** Optional output for the anchor of every insertion or move, inside @c arena. */
-    ustore_key_t const** anchors;
-
-    /** Optional output for the attribute name of every edit as a tape inside @c arena, empty for edits of other
-     *  kinds. */
-    ustore_strings_view_t* fields;
-
-    /** Optional output for the byte of the text where every splice starts, inside @c arena. */
-    ustore_length_t const** text_starts;
-
-    /** Optional output for the bytes of text every splice replaced, inside @c arena. */
-    ustore_length_t const** text_lengths;
-
-    /** Optional output for the bytes of every edit as a tape inside @c arena, empty for edits that carry none. */
-    ustore_strings_view_t* values;
-
-    /** Rewound by this call, then holding every output it writes; @c NULL is refused. */
-    ustore_arena_t arena;
-
-    /** Encoding the imported and inserted fragments in @c values are converted into. */
-    ustore_page_encoding_t outputs_encoding;
-
-} ustore_pages_history_t;
-
-/**
- *  @brief Lists the edits of pages between two commits, oldest first.
- *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
- */
-USTORE_EXPORT void ustore_pages_history(ustore_pages_history_t* arguments);
 
 #ifdef __cplusplus
 }

@@ -18,7 +18,7 @@ UStore's sources split into four folders:
 - `strings.h`: string-keyed values, through `ustore_strings_write`, `_remove`, `_read`, `_scan` and cursors.
 - `docs.h`: JSON documents, through `ustore_docs_write`, `ustore_docs_read`, `ustore_docs_gist` and `ustore_docs_gather`.
 - `graph.h`: graph edges and vertices.
-- `pages.h`: ordered documents, through one verb per edit, `ustore_pages_read` and `ustore_pages_history`.
+- `pages.h`: ordered documents, through one verb per edit and `ustore_pages_read`.
 
 ## Installation
 
@@ -579,8 +579,10 @@ A scan lists up to `wanted` strings under every prefix as one tape, split by tas
 ## Pages
 
 A pages collection stores ordered documents, edited by one verb per kind of edit, each taking only its own fields: `ustore_pages_import`, `_insert`, `_remove`, `_move`, `_splice`, `_set_attributes` and `_remove_attributes`.
-`ustore_pages_read` reads documents back into an arena, and `ustore_pages_history` lists the edits that produced them.
-No engine implements these calls yet, so each of them answers `ustore_status_unsupported_k`.
+`ustore_pages_read` reads documents back into an arena.
+A page stores only its current shape, so no call lists the edits that produced it.
+The RAM, RocksDB and LevelDB engines serve them, importing and rendering XML and plain text, while HTML, Markdown and the JSON tree answer `ustore_status_unsupported_k`, and so does every call on the NVMe engine for now.
+An edit of a missing page answers `ustore_status_not_found_k`, an edit of a missing element inside a page does nothing, and a Nil element removes the whole page.
 
 ## Design
 

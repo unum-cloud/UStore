@@ -2,15 +2,500 @@
  *  @file src/pages.cpp
  *  @author Ash Vardanian
  *  @date September 27, 2026
- *  @brief Implements `c/ustore/pages.h`: routing the page calls to their engine, and the spelling of page encodings
- *      and modifications.
+ *  @brief Implements `c/ustore/pages.h`: the pages modality over the blobs calls of any engine, routing the page calls
+ *      to their engine, and the spelling of page encodings.
+ *
+ *  Every page lives as one value in its collection, its current shape: the dense element tree of
+ *  `ustore/pages/element_tree.hpp` under the page key, so rendering a page is one read and one decode. No edit outlives
+ *  the call that applied it.
+ *
+ *  An edit call reads the trees of the pages it touches, watching them in a transaction, and applies its tasks in order
+ *  by the forgiving rules of `page_fold.hpp`. It writes every tree back in one blobs write, then removes the pages the
+ *  call removed. An edit naming a missing page answers @c status_code_t::not_found_k, as a modification of a missing
+ *  document does, while an edit of a missing element inside a page does nothing, as the fold does for racing edits. A
+ *  Nil element removes the whole page.
+ *
+ *  Every call places its edits at one stamp, the wall clock in nanoseconds or one past the newest placement in the
+ *  pages it touches, whichever is newer, which lands an insertion right after its anchor and prefixes the keys minted
+ *  for new elements.
+ *
+ *  Every scratch structure lives in the scratch of the call, so the arena of the request holds only its outputs. XML
+ *  and plain text import and render, while HTML, Markdown and the JSON tree answer @c status_code_t::unsupported_k.
  */
 
-#include "ustore/pages.h" // `ustore_pages_import_t`, `ustore_page_encoding_t`
+#include <cstddef> // `std::size_t`
+#include <cstdint> // `std::uint8_t`, `std::uint32_t`, `std::uint64_t`
+#include <cstring> // `std::memcpy`
 
-#include "lib.hpp" // `route`, `enumerator_spelling`, `name_in`, `value_in`
+#include <algorithm>   // `std::max`
+#include <bit>         // `std::bit_cast`
+#include <chrono>      // `std::chrono::system_clock`
+#include <limits>      // `std::numeric_limits`
+#include <new>         // placement `new`
+#include <span>        // `std::span`
+#include <string_view> // `std::string_view`
+#include <type_traits> // `std::underlying_type_t`
+
+#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+
+#include "ustore/pages.h"    // `ustore_pages_import_t`, `ustore_page_encoding_t`
+#include "ustore/ranges.hpp" // `place_batch_t`, `values_view_t`, `sort_and_deduplicate`
+
+#include "ustore/pages/element_tree.hpp"    // `element_tree`, `element_key_t`, `mint_key`
+#include "ustore/pages/markup.hpp"          // `import_markup`, `render_markup`, `page_encoding_t`
+#include "ustore/pages/page_edits.hpp"      // `edit_t`, `import_edit`, `insert_edit`
+#include "ustore/pages/page_fold.hpp"       // `page_state`
+#include "ustore/utilities/algorithm.hpp"   // `offset_in_sorted`
+#include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_allocator`
+
+#include "engine.hpp"             // `engine_of`, `view_t`, `pages_import_in_page_values`
+#include "lib.hpp"                // `route`, `enumerator_spelling`, `name_in`, `value_in`
+#include "utilities/batches.hpp"  // `strings_arg_t`, `places_of`, `validate_remove`
+#include "utilities/outputs.hpp"  // `read_outputs_t`
+#include "utilities/progress.hpp" // `progress_t`, `progress_cancelled_k`
 
 namespace unum::ustore {
+using namespace unum::ustore::utilities;
+
+#pragma region Vocabulary
+
+/** A growable array in the scratch of a call. */
+template <typename value_type_>
+using scratch_vector = st::basic_vector<value_type_, arena_allocator<value_type_>>;
+
+using page_allocator_t = arena_allocator<byte_t>;
+using page_tree_t = pages::element_tree<page_allocator_t>;
+using page_state_t = pages::page_state<page_allocator_t>;
+
+static_assert(sizeof(ustore_key_t) == sizeof(pages::element_key_t));
+
+/** The element key spelling the same 16 bytes as @p key. */
+static pages::element_key_t element_key_of(ustore_key_t const& key) noexcept {
+    pages::element_key_t element;
+    std::memcpy(element.bytes, &key, sizeof(element.bytes));
+    return element;
+}
+
+/** The key of the C ABI spelling the same 16 bytes as @p element. */
+static ustore_key_t key_of(pages::element_key_t const& element) noexcept {
+    ustore_key_t key;
+    std::memcpy(&key, element.bytes, sizeof(key));
+    return key;
+}
+
+/** The element key at @p index of @p keys, Nil where they carry no data. */
+static pages::element_key_t task_element(ustore_keys_view_t keys, std::size_t index) noexcept {
+    if (!keys.data) return pages::nil_key_k;
+    strided_iterator<ustore_key_t const> const column = strided(keys);
+    return element_key_of(column[static_cast<std::ptrdiff_t>(index)]);
+}
+
+/** The length at @p index of @p lengths, zero where they carry no data. */
+static std::uint64_t task_length(ustore_lengths_view_t lengths, std::size_t index) noexcept {
+    if (!lengths.data) return 0;
+    strided_iterator<ustore_length_t const> const column = strided(lengths);
+    return column[static_cast<std::ptrdiff_t>(index)];
+}
+
+/** The bytes of @p value, empty for a missing one. */
+static std::span<byte_t const> bytes_in(value_view_t value) noexcept { return {value.begin(), value.end()}; }
+
+/** The markup encoding @p encoding names, refusing HTML, Markdown and JSON as unsupported for now and any other value
+ *  as unknown. */
+static expected<pages::page_encoding_t> markup_encoding(ustore_page_encoding_t const& encoding) noexcept {
+    // A C caller may pass any integer, which C++ may not load as the enum, so only the referenced bits are read
+    switch (std::bit_cast<std::underlying_type_t<ustore_page_encoding_t>>(encoding)) {
+    case ustore_page_encoding_xml_k: return pages::page_encoding_t::xml_k;
+    case ustore_page_encoding_text_k: return pages::page_encoding_t::text_k;
+    case ustore_page_encoding_html_k:
+    case ustore_page_encoding_markdown_k:
+    case ustore_page_encoding_json_k:
+        return status_t {status_code_t::unsupported_k, "Pages import and render only XML and text for now"};
+    default: return status_t {status_code_t::invalid_argument_k, "Unknown page encoding"};
+    }
+}
+
+/** Nanoseconds since the Unix epoch on the wall clock, where every call's stamp starts. */
+static std::uint64_t clock_stamp() noexcept {
+    auto const since_epoch = std::chrono::system_clock::now().time_since_epoch();
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(since_epoch).count());
+}
+
+/** The newest placement stamp of any element of @p tree, zero for an empty tree. */
+static std::uint64_t newest_placement(page_tree_t const& tree) noexcept {
+    std::uint64_t newest = 0;
+    pages::element_index_t const root = tree.root();
+    for (pages::element_index_t at = root; at != pages::no_element_k; at = tree.next_in_preorder(at, root))
+        newest = std::max(newest, tree[at].placement.stamp);
+    return newest;
+}
+
+/** Whether @p edit needs its page to exist: every edit but an import and the removal of a whole page. */
+static bool needs_page(pages::edit_t const& edit) noexcept {
+    return edit.modification != pages::modification_t::import_k &&
+           !(edit.modification == pages::modification_t::remove_k && edit.element.is_nil());
+}
+
+#pragma endregion Vocabulary
+
+#pragma region Touched Pages
+
+/** A page an edit call touches: where it lives, its tree as edited so far, and whether it existed before the call. */
+struct touched_page_t {
+    collection_key_t place;
+    page_state_t state;
+    bool existed = false;
+
+    touched_page_t(collection_key_t place, ustore_arena_t scratch) noexcept
+        : place(place), state(page_allocator_t {scratch}) {}
+};
+
+/** The distinct pages of an edit call, sorted, and the page of every task. */
+struct touched_pages_t {
+    std::span<touched_page_t> pages;
+    std::span<std::size_t> pages_of_tasks;
+};
+
+/** Reads the pages @p places address through @p view, each distinct page once, decoding every tree. */
+static expected<touched_pages_t> read_touched_pages(ustore_database_t database, place_batch_t const& places,
+                                                    view_t const& view) noexcept {
+    ustore_arena_t const scratch = view.scratch;
+    auto [distinct, distinct_status] = arena_allocate<collection_key_t>(scratch, places.count);
+    if (distinct_status.failed()) return distinct_status;
+    transform_n(places, places.count, distinct.begin(), [](place_t const& place) { return place.collection_key(); });
+    std::span<collection_key_t> const sorted = distinct.first(sort_and_deduplicate(distinct.begin(), distinct.end()));
+    std::size_t const count = sorted.size();
+
+    auto [pages_of_tasks, mapping_status] = arena_allocate<std::size_t>(scratch, places.count);
+    if (mapping_status.failed()) return mapping_status;
+    for (std::size_t task = 0; task != places.size(); ++task)
+        pages_of_tasks[task] = offset_in_sorted(sorted, places[task].collection_key());
+
+    auto [collections, collections_status] = arena_allocate<ustore_collection_id_t>(scratch, count);
+    if (collections_status.failed()) return collections_status;
+    auto [keys, keys_status] = arena_allocate<ustore_key_t>(scratch, count);
+    if (keys_status.failed()) return keys_status;
+    for (std::size_t index = 0; index != count; ++index)
+        collections[index] = sorted[index].collection, keys[index] = sorted[index].key;
+    ustore_octet_t const* presences = nullptr;
+    ustore_strings_view_t contents {};
+    ustore_blobs_read_t read {};
+    read.database = database;
+    read.count = count;
+    read.collections = {collections.data(), sizeof(ustore_collection_id_t)};
+    read.keys = {keys.data(), sizeof(ustore_key_t)};
+    read.presences = &presences;
+    read.values = &contents;
+    read.arena = scratch;
+    if (status_t const status = engine_of(database).blobs_read(read, view); status.failed()) return status;
+    values_view_t const found {count, presences, contents};
+
+    auto [pages, pages_status] = arena_allocate<touched_page_t>(scratch, count);
+    if (pages_status.failed()) return pages_status;
+    for (std::size_t index = 0; index != count; ++index) {
+        touched_page_t& page = *new (&pages[index]) touched_page_t {sorted[index], scratch};
+        value_view_t const tree = found[index];
+        page.existed = tree && !tree.empty();
+        if (status_t const status = page.state.load(bytes_in(tree)); status.failed()) return status;
+    }
+    return touched_pages_t {pages, pages_of_tasks};
+}
+
+/** Writes every tree of @p pages that exists in one write through @p view, then removes the pages that stopped
+ *  existing. */
+static status_t write_touched_pages(ustore_database_t database, std::span<touched_page_t> pages,
+                                    ustore_durability_t durability, ustore_watch_t watch, view_t const& view) noexcept {
+    ustore_arena_t const scratch = view.scratch;
+    std::size_t const count = pages.size();
+    auto [collections, collections_status] = arena_allocate<ustore_collection_id_t>(scratch, count);
+    if (collections_status.failed()) return collections_status;
+    auto [keys, keys_status] = arena_allocate<ustore_key_t>(scratch, count);
+    if (keys_status.failed()) return keys_status;
+    auto [values, values_status] = arena_allocate<ustore_bytes_view_t>(scratch, count);
+    if (values_status.failed()) return values_status;
+
+    page_allocator_t allocator {scratch};
+    std::size_t written = 0, removed = 0;
+    for (touched_page_t& page : pages) {
+        if (!page.state.exists) {
+            removed += page.existed;
+            continue;
+        }
+        auto [tree, tree_status] = page.state.tree.encode(allocator);
+        if (tree_status.failed()) return tree_status;
+        collections[written] = page.place.collection;
+        keys[written] = page.place.key;
+        values[written++] = value_view_t {tree}.bytes();
+    }
+
+    if (written) {
+        ustore_blobs_write_t write {};
+        write.database = database;
+        write.count = written;
+        write.collections = {collections.data(), sizeof(ustore_collection_id_t)};
+        write.keys = {keys.data(), sizeof(ustore_key_t)};
+        strings_arg_t const written_values = strings_arg_t::from_views(values.data());
+        write.values = written_values.view;
+        write.durability = durability;
+        write.watch = watch;
+        if (status_t const status = engine_of(database).blobs_write(write, written_values, view); status.failed())
+            return status;
+    }
+    if (!removed) return {};
+
+    std::size_t listed = 0;
+    for (touched_page_t const& page : pages)
+        if (page.existed && !page.state.exists)
+            collections[listed] = page.place.collection, keys[listed++] = page.place.key;
+    ustore_blobs_remove_t remove {};
+    remove.database = database;
+    remove.count = listed;
+    remove.collections = {collections.data(), sizeof(ustore_collection_id_t)};
+    remove.keys = {keys.data(), sizeof(ustore_key_t)};
+    remove.durability = durability;
+    remove.watch = watch;
+    return engine_of(database).blobs_remove(remove, view);
+}
+
+/** Receives a task, its placement and the page it edits, and answers the edit of that task. */
+template <typename edit_maker_type_>
+concept edit_maker =
+    std::is_invocable_r_v<expected<pages::edit_t>, edit_maker_type_&, std::size_t, pages::placement_t, touched_page_t&>;
+
+/**
+ *  @brief Applies the edit @p make_edit answers for every task of @p arguments, in order, to the pages they name, and
+ *      writes the pages back.
+ *
+ *  Refuses an edit of a missing page, other than an import or the removal of a whole page, with
+ *  @c status_code_t::not_found_k, and writes nothing on any failure.
+ */
+template <typename arguments_type_, edit_maker make_edit_type_>
+static status_t edit_pages(arguments_type_ const& arguments, view_t const& view, make_edit_type_&& make_edit) noexcept {
+    if (!arguments.count) return {};
+    place_batch_t const places = places_of(arguments);
+    if (status_t const status = validate_remove(arguments.transaction, places, arguments.durability, arguments.watch);
+        status.failed())
+        return status;
+    if (arguments.count > std::numeric_limits<std::uint32_t>::max())
+        return {status_code_t::invalid_argument_k, "One call edits at most 4 Gi tasks"};
+
+    // A transaction watches the pages it rewrites, whatever the caller asked of the writes
+    view_t watching = view;
+    watching.watch = ustore_watch_keys_k;
+    auto [touched, touched_status] = read_touched_pages(arguments.database, places, watching);
+    if (touched_status.failed()) return touched_status;
+
+    std::uint64_t newest = 0;
+    for (touched_page_t const& page : touched.pages) newest = std::max(newest, newest_placement(page.state.tree));
+    std::uint64_t const stamp = std::max(clock_stamp(), newest + 1);
+
+    for (std::size_t task = 0; task != arguments.count; ++task) {
+        touched_page_t& page = touched.pages[touched.pages_of_tasks[task]];
+        pages::placement_t const placement {stamp, static_cast<std::uint32_t>(task)};
+        auto [edit, edit_status] = make_edit(task, placement, page);
+        if (edit_status.failed()) return edit_status;
+        if (!page.state.exists && needs_page(edit))
+            return {status_code_t::not_found_k, "The edited page does not exist"};
+        if (status_t const status = page.state.apply(edit); status.failed()) return status;
+    }
+    return write_touched_pages(arguments.database, touched.pages, arguments.durability, arguments.watch, view);
+}
+
+#pragma endregion Touched Pages
+
+#pragma region Page Calls
+
+status_t pages_import_in_page_values(ustore_pages_import_t const& arguments, strings_arg_t const& values,
+                                     view_t const& view) noexcept {
+    if (!arguments.count) return {};
+    if (!values) return {status_code_t::invalid_argument_k, "No markup was provided"};
+    auto [encoding, encoding_status] = markup_encoding(arguments.encoding);
+    if (encoding_status.failed()) return encoding_status;
+
+    std::size_t total = 0;
+    for (std::size_t task = 0; task != arguments.count; ++task) total += values[task].length;
+    progress_t progress {arguments.progress, arguments.progress_state, total};
+    page_allocator_t allocator {view.scratch};
+    return edit_pages(
+        arguments, view,
+        [&](std::size_t task, pages::placement_t placement, touched_page_t& page) noexcept -> expected<pages::edit_t> {
+            std::uint32_t ordinal = 0;
+            auto mint = [&]() noexcept { return pages::mint_key(placement.stamp, placement.sequence, ordinal++); };
+            std::string_view const markup = string_of(values[task]);
+            pages::element_key_t const root = element_key_of(page.place.key);
+            page_tree_t tree {allocator};
+            if (status_t const status = pages::import_markup(encoding, markup, root, placement, mint, tree);
+                status.failed())
+                return status;
+            auto [dense, dense_status] = tree.encode(allocator);
+            if (dense_status.failed()) return dense_status;
+            if (!progress.advance(markup.size())) return progress_cancelled_k;
+            return pages::import_edit(placement, root, dense);
+        });
+}
+
+status_t pages_insert_in_page_values(ustore_pages_insert_t const& arguments, strings_arg_t const& values,
+                                     view_t const& view) noexcept {
+    if (!arguments.count) return {};
+    if (!values) return {status_code_t::invalid_argument_k, "No fragments were provided"};
+    auto [encoding, encoding_status] = markup_encoding(arguments.encoding);
+    if (encoding_status.failed()) return encoding_status;
+    auto [effective, effective_status] = arena_allocate<ustore_key_t>(
+        arguments.effective_keys ? arguments.arena : view.scratch, arguments.count);
+    if (effective_status.failed()) return effective_status;
+
+    page_allocator_t allocator {view.scratch};
+    status_t const status = edit_pages(
+        arguments, view,
+        [&](std::size_t task, pages::placement_t placement, touched_page_t&) noexcept -> expected<pages::edit_t> {
+            pages::element_key_t const given = task_element(arguments.elements, task);
+            std::uint32_t ordinal = 0;
+            bool first = true;
+            // The given key lands on the first element of the fragment, and every later one is minted
+            auto mint = [&]() noexcept -> pages::element_key_t {
+                if (std::exchange(first, false) && !given.is_nil()) return given;
+                return pages::mint_key(placement.stamp, placement.sequence, ordinal++);
+            };
+            page_tree_t fragment {allocator};
+            if (status_t const parsed = pages::import_markup(encoding, string_of(values[task]), pages::nil_key_k,
+                                                             placement, mint, fragment);
+                parsed.failed())
+                return parsed;
+            auto [dense, dense_status] = fragment.encode(allocator);
+            if (dense_status.failed()) return dense_status;
+            pages::element_index_t const leading = fragment[fragment.root()].first_child;
+            pages::element_key_t const landed = leading == pages::no_element_k ? pages::nil_key_k
+                                                                               : fragment[leading].key;
+            effective[task] = key_of(landed);
+            return pages::insert_edit(placement, landed, task_element(arguments.parents, task),
+                                      task_element(arguments.anchors, task), dense);
+        });
+    if (status.failed()) return status;
+    if (arguments.effective_keys) *arguments.effective_keys = effective.data();
+    return {};
+}
+
+status_t pages_remove_in_page_values(ustore_pages_remove_t const& arguments, view_t const& view) noexcept {
+    if (!arguments.count) return {};
+    if (!arguments.elements.data) return {status_code_t::invalid_argument_k, "No elements were provided"};
+    return edit_pages(
+        arguments, view,
+        [&](std::size_t task, pages::placement_t placement, touched_page_t&) noexcept -> expected<pages::edit_t> {
+            return pages::remove_edit(placement, task_element(arguments.elements, task));
+        });
+}
+
+status_t pages_move_in_page_values(ustore_pages_move_t const& arguments, view_t const& view) noexcept {
+    if (!arguments.count) return {};
+    if (!arguments.elements.data) return {status_code_t::invalid_argument_k, "No elements were provided"};
+    return edit_pages(
+        arguments, view,
+        [&](std::size_t task, pages::placement_t placement, touched_page_t&) noexcept -> expected<pages::edit_t> {
+            return pages::move_edit(placement, task_element(arguments.elements, task),
+                                    task_element(arguments.parents, task), task_element(arguments.anchors, task));
+        });
+}
+
+status_t pages_splice_in_page_values(ustore_pages_splice_t const& arguments, strings_arg_t const& values,
+                                     view_t const& view) noexcept {
+    if (!arguments.count) return {};
+    if (!arguments.elements.data) return {status_code_t::invalid_argument_k, "No elements were provided"};
+    return edit_pages(
+        arguments, view,
+        [&](std::size_t task, pages::placement_t placement, touched_page_t&) noexcept -> expected<pages::edit_t> {
+            std::string_view const bytes = values ? string_of(values[task]) : std::string_view {};
+            return pages::splice_edit(placement, task_element(arguments.elements, task),
+                                      task_length(arguments.text_starts, task),
+                                      task_length(arguments.text_lengths, task), bytes);
+        });
+}
+
+status_t pages_set_attributes_in_page_values(ustore_pages_set_attributes_t const& arguments,
+                                             strings_arg_t const& fields, strings_arg_t const& values,
+                                             view_t const& view) noexcept {
+    if (!arguments.count) return {};
+    if (!arguments.elements.data) return {status_code_t::invalid_argument_k, "No elements were provided"};
+    if (!fields || !values) return {status_code_t::invalid_argument_k, "Attributes need their names and values"};
+    return edit_pages(
+        arguments, view,
+        [&](std::size_t task, pages::placement_t placement, touched_page_t&) noexcept -> expected<pages::edit_t> {
+            return pages::set_attribute_edit(placement, task_element(arguments.elements, task), string_of(fields[task]),
+                                             string_of(values[task]));
+        });
+}
+
+status_t pages_remove_attributes_in_page_values(ustore_pages_remove_attributes_t const& arguments,
+                                                strings_arg_t const& fields, view_t const& view) noexcept {
+    if (!arguments.count) return {};
+    if (!arguments.elements.data) return {status_code_t::invalid_argument_k, "No elements were provided"};
+    if (!fields) return {status_code_t::invalid_argument_k, "No attribute names were provided"};
+    return edit_pages(
+        arguments, view,
+        [&](std::size_t task, pages::placement_t placement, touched_page_t&) noexcept -> expected<pages::edit_t> {
+            return pages::remove_attribute_edit(placement, task_element(arguments.elements, task),
+                                                string_of(fields[task]));
+        });
+}
+
+status_t pages_read_in_page_values(ustore_pages_read_t const& arguments, view_t const& view) noexcept {
+    if (!arguments.count) return {};
+    if (!arguments.keys.data) return {status_code_t::invalid_argument_k, "No keys were provided"};
+    bool const renders = arguments.values || arguments.lengths;
+    pages::page_encoding_t encoding = pages::page_encoding_t::xml_k;
+    if (renders) {
+        auto [chosen, encoding_status] = markup_encoding(arguments.outputs_encoding);
+        if (encoding_status.failed()) return encoding_status;
+        encoding = chosen;
+    }
+
+    ustore_octet_t const* presences = nullptr;
+    ustore_strings_view_t contents {};
+    ustore_blobs_read_t read {};
+    read.database = arguments.database;
+    read.count = arguments.count;
+    read.collections = arguments.collections;
+    read.keys = arguments.keys;
+    read.presences = &presences;
+    read.values = &contents;
+    read.arena = view.scratch;
+    if (status_t const status = engine_of(arguments.database).blobs_read(read, view); status.failed()) return status;
+    values_view_t const found {arguments.count, presences, contents};
+
+    auto [outputs, outputs_status] = read_outputs_t::make(arguments, view.scratch);
+    if (outputs_status.failed()) return outputs_status;
+    page_allocator_t allocator {view.scratch};
+    page_tree_t tree {allocator};
+    place_batch_t const places = places_of(arguments);
+    for (std::size_t task = 0; task != arguments.count; ++task) {
+        value_view_t const page = found[task];
+        if (!page || page.empty()) {
+            outputs.append_missing();
+            continue;
+        }
+        // Consecutive tasks of one page decode it once
+        if (!task || !(places[task].collection_key() == places[task - 1].collection_key()) || tree.empty())
+            if (status_t const status = tree.decode(bytes_in(page)); status.failed()) return status;
+        pages::element_key_t const wanted = task_element(arguments.elements, task);
+        pages::element_index_t const element = wanted.is_nil() ? tree.root() : tree.find(wanted);
+        if (element == pages::no_element_k) {
+            outputs.append_missing();
+            continue;
+        }
+        if (!renders) {
+            outputs.append(value_view_t::make_empty());
+            continue;
+        }
+        scratch_vector<char> rendered {arena_allocator<char> {view.scratch}};
+        if (status_t const status = pages::render_markup(tree, element, encoding, rendered); status.failed())
+            return status;
+        outputs.append(std::string_view(rendered.begin(), rendered.end()));
+    }
+    return outputs.finish(arguments);
+}
+
+#pragma endregion Page Calls
+
+#pragma region Names
 
 /** The canonical spelling of every page encoding. */
 constexpr enumerator_spelling<ustore_page_encoding_t> page_encoding_names_k[] {
@@ -19,16 +504,7 @@ constexpr enumerator_spelling<ustore_page_encoding_t> page_encoding_names_k[] {
     {ustore_page_encoding_json_k, "json"},
 };
 
-/** The canonical spelling of every page modification. */
-constexpr enumerator_spelling<ustore_page_modification_t> page_modification_names_k[] {
-    {ustore_page_modify_import_k, "import"},
-    {ustore_page_modify_insert_k, "insert"},
-    {ustore_page_modify_remove_k, "remove"},
-    {ustore_page_modify_move_k, "move"},
-    {ustore_page_modify_splice_k, "splice"},
-    {ustore_page_modify_set_attributes_k, "set-attributes"},
-    {ustore_page_modify_remove_attributes_k, "remove-attributes"},
-};
+#pragma endregion Names
 
 } // namespace unum::ustore
 
@@ -44,7 +520,6 @@ void ustore_pages_remove_attributes(ustore_pages_remove_attributes_t* arguments)
     route<&engine_t::pages_remove_attributes>(arguments);
 }
 void ustore_pages_read(ustore_pages_read_t* arguments) { route<&engine_t::pages_read>(arguments); }
-void ustore_pages_history(ustore_pages_history_t* arguments) { route<&engine_t::pages_history>(arguments); }
 
 char const* ustore_page_encoding_name(ustore_page_encoding_t encoding) {
     return name_in(page_encoding_names_k, encoding);
@@ -52,12 +527,4 @@ char const* ustore_page_encoding_name(ustore_page_encoding_t encoding) {
 
 ustore_page_encoding_t ustore_page_encoding_from_name(ustore_bytes_view_t name) {
     return value_in(page_encoding_names_k, name);
-}
-
-char const* ustore_page_modification_name(ustore_page_modification_t modification) {
-    return name_in(page_modification_names_k, modification);
-}
-
-ustore_page_modification_t ustore_page_modification_from_name(ustore_bytes_view_t name) {
-    return value_in(page_modification_names_k, name);
 }

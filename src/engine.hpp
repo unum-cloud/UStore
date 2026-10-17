@@ -53,7 +53,7 @@ struct view_t {
  *
  *  Every call is `noexcept` and answers a status, which the router publishes into the caller's outcome: the in-house
  *  engines never throw, and an oracle wraps each call of its library in @c guarded. A null entry answers
- *  @c ustore_status_unsupported_k, as the pages calls do on every engine. Every ragged input arrives readable in any
+ *  @c ustore_status_unsupported_k, as the pages calls do on the NVMe engine. Every ragged input arrives readable in any
  *  layout, in the order its argument structure names them, since the router gathers what an accessor writes.
  */
 struct engine_t {
@@ -96,7 +96,6 @@ struct engine_t {
     status_t (*pages_remove_attributes)(ustore_pages_remove_attributes_t const&, strings_arg_t const& fields,
                                         view_t const&) noexcept;
     status_t (*pages_read)(ustore_pages_read_t const&, view_t const&) noexcept;
-    status_t (*pages_history)(ustore_pages_history_t const&, view_t const&) noexcept;
     status_t (*strings_write)(ustore_strings_write_t const&, strings_arg_t const& strings, strings_arg_t const& values,
                               view_t const&) noexcept;
     status_t (*strings_remove)(ustore_strings_remove_t const&, strings_arg_t const& strings, view_t const&) noexcept;
@@ -184,6 +183,19 @@ status_t graph_write_edges_in_vertex_values(ustore_graph_write_edges_t const&, v
 status_t graph_remove_edges_in_vertex_values(ustore_graph_remove_edges_t const&, view_t const&) noexcept;
 status_t graph_write_vertices_in_vertex_values(ustore_graph_write_vertices_t const&, view_t const&) noexcept;
 status_t graph_remove_vertices_in_vertex_values(ustore_graph_remove_vertices_t const&, view_t const&) noexcept;
+
+/** The page calls of an engine keeping every page as one value, its dense element tree, which `src/pages.cpp` serves
+ *  through the engine's own reads, writes and removes. */
+status_t pages_import_in_page_values(ustore_pages_import_t const&, strings_arg_t const& values, view_t const&) noexcept;
+status_t pages_insert_in_page_values(ustore_pages_insert_t const&, strings_arg_t const& values, view_t const&) noexcept;
+status_t pages_remove_in_page_values(ustore_pages_remove_t const&, view_t const&) noexcept;
+status_t pages_move_in_page_values(ustore_pages_move_t const&, view_t const&) noexcept;
+status_t pages_splice_in_page_values(ustore_pages_splice_t const&, strings_arg_t const& values, view_t const&) noexcept;
+status_t pages_set_attributes_in_page_values(ustore_pages_set_attributes_t const&, strings_arg_t const& fields,
+                                             strings_arg_t const& values, view_t const&) noexcept;
+status_t pages_remove_attributes_in_page_values(ustore_pages_remove_attributes_t const&, strings_arg_t const& fields,
+                                                view_t const&) noexcept;
+status_t pages_read_in_page_values(ustore_pages_read_t const&, view_t const&) noexcept;
 
 /** Mints a UUIDv7 for a new collection, refusing when the system gives no entropy. */
 expected<ustore_collection_id_t> mint_collection_id() noexcept;

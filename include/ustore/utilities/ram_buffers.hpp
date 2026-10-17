@@ -195,6 +195,12 @@ struct arena_allocator {
         return status.failed() ? nullptr : run.data();
     }
     void deallocate(value_type_*, std::size_t) noexcept {}
+
+    /** Whether both allocate from one arena, so either frees what the other allocated. */
+    template <typename other_type_>
+    bool operator==(arena_allocator<other_type_> const& other) const noexcept {
+        return arena == other.arena;
+    }
 };
 
 /** The status of growing a SmashTable container, which fails only when its allocator runs out of memory. */

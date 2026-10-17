@@ -48,6 +48,11 @@ Pin a commit, not a version, when building on them.
   - `json_values.hpp`: JSON documents parsed with yyjson into an arena, and the conversions between their values and the scalars, strings and UUIDs of a gathered column.
   - `json_patch.hpp`: RFC 6902 patches, RFC 7386 merges, and the field-level inserts, updates and upserts of a document.
   - `json_fold.hpp`: `json_fold`, which replays deltas of one modification of one field each as `ustore_docs_write` reads, modifies and writes back today, and composes them without a base where that is sound.
+- `pages/`, in `unum::ustore::pages`:
+  - `element_tree.hpp`: a page as an ordered tree of keyed elements, its dense serialized form, and a view addressing subtrees in place.
+  - `page_edits.hpp`: the edits of a page and their serialized chains.
+  - `page_fold.hpp`: `page_fold`, which applies chains of edits in commit order into a page's current shape, and composes them without a base where that is sound.
+  - `markup.hpp`: XML and text import and render, and XPath reads through StringZilla's subdocuments engine.
 - `strings/`, in `unum::ustore::strings`:
   - `string_keys.hpp`: `string_key_t`, the owned key of a strings collection and of a collection's name, with its order and hash.
 

@@ -7,10 +7,10 @@
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
-#include <cstddef> // `std::size_t`
+#include <cstddef> // `std::byte`, `std::size_t`
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`, `std::uintptr_t`
 #include <cstdio>  // `stderr`
-#include <cstring> // `std::memset`, `std::memcmp`
+#include <cstring> // `std::memcpy`, `std::memset`, `std::memcmp`
 
 #include <algorithm>   // `std::all_of`, `std::sort`
 #include <array>       // `std::array`
@@ -21,6 +21,7 @@
 #include <string>      // `std::string`
 #include <string_view> // `std::string_view`
 #include <thread>      // `std::this_thread::sleep_for`
+#include <type_traits> // `std::underlying_type_t`
 #include <utility>     // `std::as_const`
 
 #include <fmt/format.h>
@@ -2465,7 +2466,6 @@ std::size_t closed_set_names(config_t const&) {
     failures += expect_spellings(ustore_docs_field_type_name, ustore_docs_field_type_from_name, 17);
     failures += expect_spellings(ustore_docs_modification_name, ustore_docs_modification_from_name, 5);
     failures += expect_spellings(ustore_page_encoding_name, ustore_page_encoding_from_name, 5);
-    failures += expect_spellings(ustore_page_modification_name, ustore_page_modification_from_name, 7);
     failures += expect(std::string_view {ustore_isolation_name(ustore_isolation_strict_serializable_k)} ==
                        "strict-serializable");
     int major = 0, minor = 0, patch = 0;
@@ -2619,6 +2619,105 @@ case_result_t database_view_refusals(config_t const& config) {
     ustore_database_free(database);
     return failures;
 }
+
+#pragma region Pages
+
+/** Counts a failure unless @p outcome carries @p wanted, then resets it for the next call. */
+std::size_t refused(ustore_outcome_t& outcome, status_code_t wanted) {
+    std::size_t const failures = expect_status(status_t {outcome}, wanted);
+    outcome = {};
+    return failures;
+}
+
+/** The pages calls refuse what their header refuses, writing no outputs: missing keys and elements, unknown
+ *  encodings, HTML, Markdown and JSON as unsupported, markup that is not well-formed XML, and edits of a missing page,
+ *  while a read asking only for presences takes any encoding. */
+case_result_t pages_refusals(config_t const& config) {
+    std::size_t failures = 0;
+    auto [owner, open_status] = open_database<database_t>(config);
+    auto [arena, arena_status] = arena_t::make();
+    failures += expect(open_status.succeeded() && arena_status.succeeded());
+    if (failures != 0) return failures;
+    failures += expect(owner.clear(ustore_drop_collection_k).succeeded());
+    ustore_database_t const database = owner;
+
+    ustore_key_t const page = key_from_integer(901);
+    ustore_key_t const missing = key_from_integer(902);
+    // C++ may not form an enum value no enumerator names, even by `std::bit_cast`, so the integer lands as bytes
+    using encoding_bits_t = std::underlying_type_t<ustore_page_encoding_t>;
+    auto import = [&](std::string_view markup, encoding_bits_t encoding, ustore_key_t const* key) {
+        strided_strings<std::string_view> const values {{&markup, 0}};
+        ustore_outcome_t outcome {};
+        ustore_pages_import_t import {};
+        import.database = database, import.outcome = &outcome, import.count = 1;
+        import.keys = {key, 0}, import.values = values.view();
+        std::memcpy(reinterpret_cast<std::byte*>(&import.encoding), &encoding, sizeof(encoding));
+        ustore_pages_import(&import);
+        return status_t {outcome};
+    };
+    // A probe through an encoding every engine serving pages takes tells the NVMe engine apart, which serves none yet
+    if (import("<a/>", ustore_page_encoding_xml_k, &page).code == status_code_t::unsupported_k)
+        return case_result_t::skipped("the engine serves no pages yet", failures);
+
+    failures += expect_status(import("<a/>", ustore_page_encoding_html_k, &page), status_code_t::unsupported_k);
+    failures += expect_status(import("# a", ustore_page_encoding_markdown_k, &page), status_code_t::unsupported_k);
+    failures += expect_status(import("{}", ustore_page_encoding_json_k, &page), status_code_t::unsupported_k);
+    failures += expect_status(import("<a/>", 42, &page), status_code_t::invalid_argument_k);
+    failures += expect_status(import("<a/>", ustore_page_encoding_xml_k, nullptr), status_code_t::invalid_argument_k);
+    for (std::string_view malformed : {"<a>", "<a>&nbsp;</a>", "<a b=\"<\"/>", "<a>&#0;</a>", "a & b"})
+        failures += expect_status(import(malformed, ustore_page_encoding_xml_k, &page), status_code_t::malformed_k);
+    failures += expect_status(import("a & b", ustore_page_encoding_text_k, &page), status_code_t::success_k);
+
+    // An insertion refused anywhere leaves its effective keys unwritten
+    std::string_view const fragment = "<b/>";
+    strided_strings<std::string_view> const fragments {{&fragment, 0}};
+    ustore_key_t const* effective = nullptr;
+    ustore_outcome_t outcome {};
+    ustore_pages_insert_t insert {};
+    insert.database = database, insert.outcome = &outcome, insert.count = 1, insert.keys = {&missing, 0};
+    insert.values = fragments.view(), insert.encoding = ustore_page_encoding_xml_k;
+    insert.effective_keys = &effective, insert.arena = arena;
+    ustore_pages_insert(&insert);
+    failures += refused(outcome, status_code_t::not_found_k);
+    failures += expect(effective == nullptr);
+    insert.keys = {&page, 0};
+    insert.values = {};
+    ustore_pages_insert(&insert);
+    failures += refused(outcome, status_code_t::invalid_argument_k);
+    insert.values = fragments.view();
+    ustore_pages_insert(&insert);
+    failures += expect_success(outcome);
+    failures += expect(effective != nullptr);
+
+    ustore_pages_remove_t remove {};
+    remove.database = database, remove.outcome = &outcome, remove.count = 1, remove.keys = {&page, 0};
+    ustore_pages_remove(&remove);
+    failures += refused(outcome, status_code_t::invalid_argument_k);
+
+    ustore_key_t const element = page;
+    ustore_pages_splice_t splice {};
+    splice.database = database, splice.outcome = &outcome, splice.count = 1, splice.keys = {&missing, 0};
+    splice.elements = {&element, 0};
+    ustore_pages_splice(&splice);
+    failures += refused(outcome, status_code_t::not_found_k);
+
+    ustore_octet_t const* presences = nullptr;
+    ustore_strings_view_t values {};
+    ustore_pages_read_t read {};
+    read.database = database, read.outcome = &outcome, read.count = 1, read.keys = {&page, 0};
+    read.presences = &presences, read.values = &values, read.arena = arena;
+    read.outputs_encoding = ustore_page_encoding_html_k;
+    ustore_pages_read(&read);
+    failures += refused(outcome, status_code_t::unsupported_k);
+    failures += expect(presences == nullptr && !tape_written(values));
+    read.values = nullptr;
+    ustore_pages_read(&read);
+    failures += expect_success(outcome);
+    failures += expect(presences != nullptr && (presences[0] & 1));
+    return failures;
+}
+
+#pragma endregion Pages
 
 #pragma region Cursors
 
@@ -3364,6 +3463,7 @@ int main(int argc, char** argv) {
 
     report(totals, "status.names", status_names, config);
     report(totals, "names.closed_sets", closed_set_names, config);
+    report(totals, "pages.refusals", pages_refusals, config);
     report(totals, "database.init_refusals", database_init_refusals, config);
     report(totals, "database.validation", database_validation, config);
     report(totals, "database.forged_views", database_forged_views, config);
