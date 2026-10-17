@@ -88,7 +88,8 @@ Each thread keeps its scratch on its local domain when the options name it, and 
 Zero threads take 7/8 of the cores local to those domains, rounded down and at least one, leaving the rest to the driver thread, to blocking calls on their callers' threads, and to the background flushes and compactions of RocksDB and LevelDB.
 ForkUnion spawns the threads near every domain or near one alone, so naming several domains but not all spreads them over the whole machine.
 `ustore_executor_on_pool` borrows a ForkUnion pool another library owns, which must outlive the executor, and places its scratch and arenas by the same `ram` options; a dispatch on a pool that runs another is refused, so a batch finding the pool running its lender's dispatch runs on the executor's own driver thread instead of forking over the lender.
-`ustore_executor_for_nvme` is declared for the NVMe engine, and answers `ustore_status_unsupported_k` until its sources build.
+`ustore_executor_for_nvme` spawns the threads of the NVMe engine, and its `nvme` options tell every database `ustore_database_open_nvme` opens on it how to move bytes: the transport, the channels and their buffers, read once at the open.
+It may borrow an executor of `ustore_executor_for_vram`, whose CUDA devices the compactions run on, and which answers `ustore_status_unsupported_k` in a library built without CUDA.
 A call blocks by default and returns with its outcome final, while `ustore_completion_deferred_k` returns once the call is submitted:
 
 ```c

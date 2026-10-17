@@ -1870,8 +1870,8 @@ PyTypeObject DeferredType = {
 static char const doc_Executor[] =                                                             //
     "The threads that run calls, shared by any number of databases.\n"                         //
     "\n"                                                                                       //
-    "Built through `Executor.for_ram()`, `on_pool()` or `for_nvme()`, never by name. A\n"      //
-    "receiver names it through `on(executor)`, whose calls block on it, or\n"                  //
+    "Built through `Executor.for_ram()`, `on_pool()`, `for_nvme()` or `for_vram()`, never\n"   //
+    "by name. A receiver names it through `on(executor)`, whose calls block on it, or\n"       //
     "`deferred(executor)`, whose calls it runs while the caller carries on. Calls start in\n"  //
     "submission order, and a blocking call runs alone: after every call submitted before it\n" //
     "finishes. Its deferred table holds `deferred_limit` calls, and a submission that finds\n" //
@@ -1881,7 +1881,8 @@ static char const doc_Executor[] =                                              
 
 static PyObject* Executor_tp_new(PyTypeObject* Py_UNUSED(type), PyObject* Py_UNUSED(args),
                                  PyObject* Py_UNUSED(keywords)) {
-    PyErr_SetString(PyExc_TypeError, "An executor is built through Executor.for_ram(), .on_pool() or .for_nvme()");
+    PyErr_SetString(PyExc_TypeError,
+                    "An executor is built through Executor.for_ram(), .on_pool(), .for_nvme() or .for_vram()");
     return NULL;
 }
 
@@ -1917,37 +1918,39 @@ static int factory_arguments(char const* factory, PyObject* const* args, Py_ssiz
 }
 
 /**
- *  @brief Copies @p object, None or a sequence of NUMA node identifiers, into a new block the caller frees.
- *  @param[out] domains The identifiers, or NULL for None, which derives every domain.
+ *  @brief Copies @p object, None or a sequence of identifiers, such as NUMA nodes or CUDA ordinals, into a new block
+ *      the caller frees.
+ *  @param[in] option The keyword the sequence came in, as a failure names it.
+ *  @param[out] identifiers The identifiers, or NULL for None, which derives every one.
  *  @param[out] count Identifiers the block holds.
  *  @return 0 on success, -1 with an exception set otherwise.
  */
-static int memory_domains_from_object(PyObject* object, int32_t** domains, size_t* count) {
-    *domains = NULL;
+static int identifiers_from_object(PyObject* object, char const* option, int32_t** identifiers, size_t* count) {
+    *identifiers = NULL;
     *count = 0;
     if (!object || object == Py_None) return 0;
-    PyObject* const items = PySequence_Fast(object, "The 'memory_domains' option takes a sequence of NUMA nodes");
+    PyObject* const items = PySequence_Fast(object, "The option takes a sequence of integers");
     if (!items) return -1;
     Py_ssize_t const length = PySequence_Fast_GET_SIZE(items);
-    *domains = PyMem_New(int32_t, (size_t)length + 1);
-    if (!*domains) {
+    *identifiers = PyMem_New(int32_t, (size_t)length + 1);
+    if (!*identifiers) {
         Py_DECREF(items);
         PyErr_NoMemory();
         return -1;
     }
     for (Py_ssize_t index = 0; index != length; ++index) {
-        long const domain = PyLong_AsLong(PySequence_Fast_GET_ITEM(items, index));
-        if (domain == -1 && PyErr_Occurred()) break;
-        if (domain < INT32_MIN || domain > INT32_MAX) {
-            PyErr_Format(PyExc_OverflowError, "A NUMA node identifier fits 32 bits, unlike %ld", domain);
+        long const identifier = PyLong_AsLong(PySequence_Fast_GET_ITEM(items, index));
+        if (identifier == -1 && PyErr_Occurred()) break;
+        if (identifier < INT32_MIN || identifier > INT32_MAX) {
+            PyErr_Format(PyExc_OverflowError, "Every entry of '%s' fits 32 bits, unlike %ld", option, identifier);
             break;
         }
-        (*domains)[index] = (int32_t)domain;
+        (*identifiers)[index] = (int32_t)identifier;
     }
     Py_DECREF(items);
     if (PyErr_Occurred()) {
-        PyMem_Free(*domains);
-        *domains = NULL;
+        PyMem_Free(*identifiers);
+        *identifiers = NULL;
         return -1;
     }
     *count = (size_t)length;
@@ -1997,7 +2000,7 @@ static PyObject* Executor_for_ram(PyObject* type, PyObject* const* args, Py_ssiz
     if (factory_arguments("for_ram", args, positional_args_count, args_names_tuple, names, values, 3, 1, 0) != 0 ||
         (values[0] && ustore_py_size_from_object(values[0], "threads", &threads) != 0) ||
         (values[2] && ustore_py_size_from_object(values[2], "deferred_limit", &deferred_limit) != 0) ||
-        memory_domains_from_object(values[1], &memory_domains, &memory_domains_count) != 0)
+        identifiers_from_object(values[1], "memory_domains", &memory_domains, &memory_domains_count) != 0)
         return NULL;
 
     ustore_executor_t handle = NULL;
@@ -2052,7 +2055,8 @@ static PyObject* Executor_on_pool(PyObject* type, PyObject* const* args, Py_ssiz
     void* const pool = address ? PyLong_AsVoidPtr(address) : NULL;
     Py_XDECREF(address);
     int32_t* memory_domains = NULL;
-    if (PyErr_Occurred() || memory_domains_from_object(values[1], &memory_domains, &memory_domains_count) != 0)
+    if (PyErr_Occurred() ||
+        identifiers_from_object(values[1], "memory_domains", &memory_domains, &memory_domains_count) != 0)
         return NULL;
 
     ustore_executor_t handle = NULL;
@@ -2071,56 +2075,161 @@ static PyObject* Executor_on_pool(PyObject* type, PyObject* const* args, Py_ssiz
     return executor_made(type, handle, &outcome);
 }
 
-static char const doc_Executor_for_nvme[] =                                                  //
-    "for_nvme(threads=0, *, deferred_limit=0) answers an executor of I/O rings.\n"           //
-    "\n"                                                                                     //
-    "Runs the calls of the NVMe engine, every thread submitting and polling a ring of its\n" //
-    "own. Calls `ustore_executor_for_nvme`.\n"                                               //
-    "\n"                                                                                     //
-    "Args:\n"                                                                                //
-    "  threads (int, optional): Threads to spawn; zero derives them from the cores.\n"       //
-    "  deferred_limit (int, optional): Deferred calls the executor holds at once; zero\n"    //
-    "    takes the library's default.\n"                                                     //
-    "Returns:\n"                                                                             //
-    "  Executor: The new executor.\n"                                                        //
-    "Raises:\n"                                                                              //
-    "  UnsupportedError: This build has no NVMe executor.";
+static char const doc_Executor_for_nvme[] =                                                     //
+    "for_nvme(threads=0, *, transport=Transport.AUTOMATIC, vram=None, deferred_limit=0,\n"      //
+    "**sizes) answers an executor of I/O rings.\n"                                              //
+    "\n"                                                                                        //
+    "Runs the calls of the NVMe engine, every thread submitting and polling a ring of its\n"    //
+    "own, and tells every database Database.open_nvme() opens on it how to move bytes. Every\n" //
+    "size keyword names a field of ustore_nvme_options_t: shared_io_channels, queue_depth,\n"   //
+    "request_buffer_bytes, request_buffers_count, stream_buffer_bytes or\n"                     //
+    "stream_buffers_count, where zero keeps the engine's default. Calls\n"                      //
+    "`ustore_executor_for_nvme`.\n"                                                             //
+    "\n"                                                                                        //
+    "Args:\n"                                                                                   //
+    "  threads (int, optional): Threads to spawn; zero derives them from the cores.\n"          //
+    "  transport (Transport, optional): How bytes move between the files and memory.\n"         //
+    "  vram (Executor, optional): An executor of Executor.for_vram() whose devices the\n"       //
+    "    compactions run on, kept until this one closes; None compacts on host threads.\n"      //
+    "  deferred_limit (int, optional): Deferred calls the executor holds at once; zero\n"       //
+    "    takes the library's default.\n"                                                        //
+    "Returns:\n"                                                                                //
+    "  Executor: The new executor.\n"                                                           //
+    "Raises:\n"                                                                                 //
+    "  DeviceError: The `vram` executor was not made by Executor.for_vram().";
+
+/** The size keywords of @c Executor.for_nvme, in the order they follow its other arguments. */
+static char const* const nvme_size_names[] = {"shared_io_channels",    "queue_depth",         "request_buffer_bytes",
+                                              "request_buffers_count", "stream_buffer_bytes", "stream_buffers_count"};
 
 static PyObject* Executor_for_nvme(PyObject* type, PyObject* const* args, Py_ssize_t positional_args_count,
                                    PyObject* args_names_tuple) {
-    static char const* const names[] = {"threads", "deferred_limit"};
-    PyObject* values[2];
-    size_t threads = 0, deferred_limit = 0;
-    if (factory_arguments("for_nvme", args, positional_args_count, args_names_tuple, names, values, 2, 1, 0) != 0 ||
+    static char const* const names[] = {"threads",
+                                        "transport",
+                                        "vram",
+                                        "deferred_limit",
+                                        "shared_io_channels",
+                                        "queue_depth",
+                                        "request_buffer_bytes",
+                                        "request_buffers_count",
+                                        "stream_buffer_bytes",
+                                        "stream_buffers_count"};
+    PyObject* values[10];
+    size_t threads = 0, deferred_limit = 0, sizes[6] = {0};
+    int transport = ustore_transport_automatic_k;
+    if (factory_arguments("for_nvme", args, positional_args_count, args_names_tuple, names, values, 10, 1, 0) != 0 ||
         (values[0] && ustore_py_size_from_object(values[0], "threads", &threads) != 0) ||
-        (values[1] && ustore_py_size_from_object(values[1], "deferred_limit", &deferred_limit) != 0))
+        (values[1] &&
+         ustore_py_enum_from_object(values[1], "transport", ustore_py_enum_transport_k, &transport) != 0) ||
+        (values[3] && ustore_py_size_from_object(values[3], "deferred_limit", &deferred_limit) != 0))
         return NULL;
+    for (size_t index = 0; index != 6; ++index)
+        if (values[4 + index] &&
+            ustore_py_size_from_object(values[4 + index], nvme_size_names[index], &sizes[index]) != 0)
+            return NULL;
+    PyObject* const vram = values[2] && values[2] != Py_None ? values[2] : NULL;
+    if (vram && !PyObject_TypeCheck(vram, &ExecutorType)) {
+        PyErr_Format(PyExc_TypeError, "The 'vram' option takes an Executor or None, got %S", Py_TYPE(vram));
+        return NULL;
+    }
+    if (vram && !((Executor*)vram)->handle) {
+        ustore_py_raise(ustore_status_uninitialized_k, "The executor is closed");
+        return NULL;
+    }
 
     ustore_executor_t handle = NULL;
     ustore_outcome_t outcome = {0};
     ustore_executor_for_nvme_t made = {
         .executor = &handle,
         .outcome = &outcome,
+        .nvme =
+            {
+                .transport = (ustore_transport_t)transport,
+                .shared_io_channels = (ustore_size_t)sizes[0],
+                .queue_depth = (ustore_size_t)sizes[1],
+                .request_buffer_bytes = (ustore_size_t)sizes[2],
+                .request_buffers_count = (ustore_size_t)sizes[3],
+                .stream_buffer_bytes = (ustore_size_t)sizes[4],
+                .stream_buffers_count = (ustore_size_t)sizes[5],
+            },
+        .vram = vram ? ((Executor*)vram)->handle : NULL,
         .threads = (ustore_size_t)threads,
         .deferred_limit = (ustore_size_t)deferred_limit,
     };
     Py_BEGIN_ALLOW_THREADS;
     ustore_executor_for_nvme(&made);
     Py_END_ALLOW_THREADS;
+    PyObject* const made_object = executor_made(type, handle, &outcome);
+    if (made_object && vram) ((Executor*)made_object)->borrowed = Py_NewRef(vram);
+    return made_object;
+}
+
+static char const doc_Executor_for_vram[] =                                                  //
+    "for_vram(devices=None, *, scratch_limit=0, deferred_limit=0) answers an executor of\n"  //
+    "CUDA devices.\n"                                                                        //
+    "\n"                                                                                     //
+    "One host thread drives each device. No engine places a database in VRAM yet, so it\n"   //
+    "serves as the `vram` of Executor.for_nvme(), whose compactions run on its devices.\n"   //
+    "Calls `ustore_executor_for_vram`.\n"                                                    //
+    "\n"                                                                                     //
+    "Args:\n"                                                                                //
+    "  devices (Sequence[int], optional): CUDA ordinals; None takes every visible device.\n" //
+    "  scratch_limit (int, optional): Bytes of device memory the scratch may take on each\n" //
+    "    device; zero takes 256 MiB.\n"                                                      //
+    "  deferred_limit (int, optional): Deferred calls the executor holds at once; zero\n"    //
+    "    takes the library's default.\n"                                                     //
+    "Returns:\n"                                                                             //
+    "  Executor: The new executor.\n"                                                        //
+    "Raises:\n"                                                                              //
+    "  UnsupportedError: This build carries no CUDA devices.\n"                              //
+    "  DeviceError: No device is visible, or an ordinal names none.";
+
+static PyObject* Executor_for_vram(PyObject* type, PyObject* const* args, Py_ssize_t positional_args_count,
+                                   PyObject* args_names_tuple) {
+    static char const* const names[] = {"devices", "scratch_limit", "deferred_limit"};
+    PyObject* values[3];
+    size_t scratch_limit = 0, deferred_limit = 0, devices_count = 0;
+    int32_t* devices = NULL;
+    if (factory_arguments("for_vram", args, positional_args_count, args_names_tuple, names, values, 3, 1, 0) != 0 ||
+        (values[1] && ustore_py_size_from_object(values[1], "scratch_limit", &scratch_limit) != 0) ||
+        (values[2] && ustore_py_size_from_object(values[2], "deferred_limit", &deferred_limit) != 0) ||
+        identifiers_from_object(values[0], "devices", &devices, &devices_count) != 0)
+        return NULL;
+
+    ustore_executor_t handle = NULL;
+    ustore_outcome_t outcome = {0};
+    ustore_executor_for_vram_t made = {
+        .executor = &handle,
+        .outcome = &outcome,
+        .devices = devices,
+        .devices_count = (ustore_size_t)devices_count,
+        .scratch_limit = (ustore_size_t)scratch_limit,
+        .deferred_limit = (ustore_size_t)deferred_limit,
+    };
+    Py_BEGIN_ALLOW_THREADS;
+    ustore_executor_for_vram(&made);
+    Py_END_ALLOW_THREADS;
+    PyMem_Free(devices);
     return executor_made(type, handle, &outcome);
 }
 
 /** Frees the threads of @p executor once its calls finish, leaving the object to refuse further calls. */
 static void executor_close(Executor* executor) {
     ustore_executor_t handle = NULL;
+    PyObject* borrowed = NULL;
     ustore_py_critical_section_begin_((PyObject*)executor);
     handle = executor->handle;
     executor->handle = NULL;
+    borrowed = executor->borrowed;
+    executor->borrowed = NULL;
     ustore_py_critical_section_end_();
-    if (!handle) return;
-    Py_BEGIN_ALLOW_THREADS;
-    ustore_executor_free(handle);
-    Py_END_ALLOW_THREADS;
+    if (handle) {
+        Py_BEGIN_ALLOW_THREADS;
+        ustore_executor_free(handle);
+        Py_END_ALLOW_THREADS;
+    }
+    // The borrowed executor goes only once the one borrowing it has freed its threads
+    Py_XDECREF(borrowed);
 }
 
 static void Executor_dealloc(Executor* self) {
@@ -2196,6 +2305,8 @@ static PyMethodDef Executor_methods[] = {
      doc_Executor_on_pool},
     {"for_nvme", (PyCFunction)(void (*)(void))Executor_for_nvme, ustore_py_method_flags_k | METH_CLASS,
      doc_Executor_for_nvme},
+    {"for_vram", (PyCFunction)(void (*)(void))Executor_for_vram, ustore_py_method_flags_k | METH_CLASS,
+     doc_Executor_for_vram},
     {"drain", (PyCFunction)(void (*)(void))Executor_drain, ustore_py_method_flags_k, doc_Executor_drain},
     {"close", (PyCFunction)(void (*)(void))Executor_close, METH_NOARGS, doc_Executor_close},
     {"__enter__", (PyCFunction)(void (*)(void))Executor_enter, METH_NOARGS, NULL},

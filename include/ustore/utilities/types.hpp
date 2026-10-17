@@ -492,6 +492,11 @@ class value_view_t {
     value_view_t(byte_t const* begin, std::size_t length) noexcept
         : pointer_(reinterpret_cast<ustore_byte_t const*>(begin)), length_(static_cast<ustore_length_t>(length)) {}
 
+    /** Views @p bytes, a value that is always present, an empty one included. */
+    value_view_t(std::span<byte_t const> bytes) noexcept
+        : pointer_(reinterpret_cast<ustore_byte_t const*>(bytes.data())),
+          length_(static_cast<ustore_length_t>(bytes.size())) {}
+
     value_view_t(char const* string) noexcept
         : pointer_(reinterpret_cast<ustore_byte_t const*>(string)),
           length_(static_cast<ustore_length_t>(std::strlen(string))) {}

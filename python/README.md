@@ -147,7 +147,8 @@ arena = ustore.Arena(executor)                          # outputs of calls on th
 ```
 
 `Executor.on_pool(pool, /, *, memory_domains=None, deferred_limit=0)` borrows a ForkUnion `fu_pool_t` another library already runs, given as the integer address `ctypes` or `cffi` hands over, so one process keeps one set of threads; the pool must outlive the executor.
-`Executor.for_nvme(threads=0, *, deferred_limit=0)` makes the I/O rings of the NVMe engine, and raises `UnsupportedError` until that engine builds again.
+`Executor.for_nvme(threads=0, *, transport=Transport.AUTOMATIC, vram=None, deferred_limit=0, **sizes)` makes the I/O rings of the NVMe engine, and tells every database `open_nvme` opens on it how to move bytes: the transport, the channels and their buffers, each size keyword naming a field of `ustore_nvme_options_t`.
+`Executor.for_vram(devices=None, *, scratch_limit=0, deferred_limit=0)` drives CUDA devices, which an NVMe executor given it as `vram` compacts on, and raises `UnsupportedError` in a build without CUDA.
 
 Calls on one executor start in submission order, and a blocking call runs alone: after every call submitted before it finishes.
 A deferred submission that finds the table full finishes with `Status.CONTENDED` and raises `ContendedError` once awaited.
@@ -365,7 +366,6 @@ The suites live in `test/` as `<topic>.py` beside the C++ ones, and benchmarks i
 ## What This Binding Does Not Expose
 
 - The strings and pages verbs, strings cursors among them, which Python and Rust gain together.
-- `open_nvme(executor=...)`: `open_nvme` opens on the calling thread, and the engine spawns the I/O executor it keeps, so `Executor.for_nvme()` serves nothing yet.
 - Deferred constructors: an open takes `executor=` and blocks on it, so a database exists once it answers.
 - Deferred cursors: every pull blocks, so a deferred view opens none.
 - `ustore_status_name` and the other `_name` and `_from_name` functions: the module builds every enum through them at import, so `Status["WRITE_CONFLICT"]` parses a name and no string ever reaches a verb.

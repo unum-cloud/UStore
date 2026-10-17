@@ -71,11 +71,12 @@ A save copies the snapshot into a new database a memtable-sized batch at a time,
 ## NVMe
 
 `src/nvme/` is the hyper-converged engine, and the one UStore's hardware paths serve.
-A `database` holds `collection`s, each an `lsm_tree` of `lsm_level`s whose `lsm_sorted_run` files open with a `sorted_run_index` of `key_slot`s ahead of their `stored_value`s, with optimistic transactions, snapshots and backups.
-Its graph database keeps adjacency in NVMe's own databases, as a fast path beside `src/graph.cpp`.
-Its strings and the names of its collections live in `src/nvme/strings.cpp`, as sorted buckets under integer keys in collections no identifier a caller holds reaches, until the engine keys strings itself.
-It keeps 64-bit keys inside for now, so it takes only keys below 2⁶⁴, refusing the rest with `ustore_status_unsupported_k`, and names a collection by the UUID spelling its catalog number rather than a UUIDv7.
-`USTORE_BUILD_NVME` is off by default, as the sources in this directory are not yet ported to the current C ABI and do not build, so everything below is a v1 target:
+A `database` holds `collection`s, each an `lsm_tree` of `lsm_level`s whose `lsm_sorted_run` files open with a `sorted_run_index` of `key_slot`s ahead of their `stored_value`s, with optimistic transactions.
+`src/nvme/engine.cpp` serves every slot of `engine_t` the RAM engine serves but the snapshots, which answer `ustore_status_unsupported_k`, since a level set held across calls would stall every publication behind it.
+Every collection of the C ABI is one collection of the database under its UUID, keyed by the 16 bytes of `ustore_key_t`, and documents and graphs live in values through `src/docs.cpp` and `src/graph.cpp`.
+Its catalog maps every collection onto its modality and name, and a strings collection and the names file their strings in the buckets of `include/ustore/strings/string_keys.hpp`, sorted runs of strings under a key of their leading 15 bytes and their length.
+`src/nvme/graph_store.hpp` serves the graph calls over the graph store of `include/ustore/graph/nvme_graph.hpp`, whose transactions are its own, so it stays beside the engine's table.
+`USTORE_BUILD_NVME` is off by default, and the Python package turns it on; what follows is a v1 target:
 
 - __Kernel bypass__ — a transport chosen at mount reaches each data directory through io_uring on `O_DIRECT` files, io_uring on NVMe block devices, NVMe passthrough, or SPDK's user-space driver, and falls back to blocking positioned I/O on macOS, Windows and wherever io_uring is refused.
 - __SIMD point lookups__ — sorted run indexes, micro-sets and ring buffers become SmashTable components with compile-time SIMD kits, one artifact carrying all of them and a database choosing one when it opens.

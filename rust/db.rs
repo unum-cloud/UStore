@@ -335,10 +335,33 @@ pub(crate) mod ffi {
     }
 
     #[repr(C)]
+    pub struct ustore_nvme_options_t {
+        pub transport: ustore_enum_t,
+        pub shared_io_channels: ustore_size_t,
+        pub queue_depth: ustore_size_t,
+        pub request_buffer_bytes: ustore_size_t,
+        pub request_buffers_count: ustore_size_t,
+        pub stream_buffer_bytes: ustore_size_t,
+        pub stream_buffers_count: ustore_size_t,
+    }
+
+    #[repr(C)]
     pub struct ustore_executor_for_nvme_t {
         pub executor: *mut ustore_executor_t,
         pub outcome: *mut ustore_outcome_t,
+        pub nvme: ustore_nvme_options_t,
+        pub vram: ustore_executor_t,
         pub threads: ustore_size_t,
+        pub deferred_limit: ustore_size_t,
+    }
+
+    #[repr(C)]
+    pub struct ustore_executor_for_vram_t {
+        pub executor: *mut ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub devices: *const i32,
+        pub devices_count: ustore_size_t,
+        pub scratch_limit: ustore_size_t,
         pub deferred_limit: ustore_size_t,
     }
 
@@ -414,17 +437,7 @@ pub(crate) mod ffi {
         pub directory: ustore_bytes_view_t,
         pub data_directories: *const ustore_data_directory_t,
         pub data_directories_count: ustore_size_t,
-        pub transport: ustore_enum_t,
         pub memory_limit: ustore_size_t,
-        pub gpu_devices: *const c_int,
-        pub gpu_devices_count: ustore_size_t,
-        pub gpu_memory_limit: ustore_size_t,
-        pub shared_io_channels: ustore_size_t,
-        pub queue_depth: ustore_size_t,
-        pub request_buffer_bytes: ustore_size_t,
-        pub request_buffers_count: ustore_size_t,
-        pub stream_buffer_bytes: ustore_size_t,
-        pub stream_buffers_count: ustore_size_t,
         pub transaction_max_bytes: ustore_size_t,
         pub transaction_max_elements: ustore_size_t,
         pub collection_concurrency_limit: ustore_size_t,
@@ -613,6 +626,7 @@ pub(crate) mod ffi {
         pub fn ustore_executor_for_ram(arguments: *mut ustore_executor_for_ram_t);
         pub fn ustore_executor_on_pool(arguments: *mut ustore_executor_on_pool_t);
         pub fn ustore_executor_for_nvme(arguments: *mut ustore_executor_for_nvme_t);
+        pub fn ustore_executor_for_vram(arguments: *mut ustore_executor_for_vram_t);
         pub fn ustore_executor_drain(arguments: *mut ustore_executor_drain_t);
         pub fn ustore_executor_free(executor: ustore_executor_t);
 
@@ -1744,32 +1758,18 @@ impl<'options> LevelDBOptions<'options> {
 }
 
 /// What [`Database::open_nvme`] opens, where every zero size or count keeps the engine's default.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct NVMEOptions<'path> {
     /// The directory of the database's own files.
     pub directory: &'path str,
     /// Directories the volumes fill, or none for one volume inside `directory`.
     pub data_directories: &'path [DataDirectory<'path>],
-    /// How bytes move between the files and memory.
-    pub transport: Transport,
+    /// The executor the open runs on, after the calls submitted there before it; `None` opens on the calling thread.
+    /// The database moves bytes as one of [`Executor::for_nvme`] says, read once at the open, and with that call's
+    /// defaults for any other executor and for none.
+    pub executor: Option<&'path Executor>,
     /// Bytes of host memory the engine may pin and cache.
     pub memory_limit: u64,
-    /// CUDA devices compaction may run on.
-    pub gpu_devices: &'path [i32],
-    /// Bytes of device memory compaction may take on each of `gpu_devices`.
-    pub gpu_memory_limit: u64,
-    /// I/O channels the threads share beyond their own.
-    pub shared_io_channels: usize,
-    /// Submissions a channel holds at once.
-    pub queue_depth: usize,
-    /// Bytes of each request buffer of a channel.
-    pub request_buffer_bytes: u64,
-    /// Request buffers of each channel.
-    pub request_buffers_count: usize,
-    /// Bytes of each streaming buffer of a channel.
-    pub stream_buffer_bytes: u64,
-    /// Streaming buffers of each channel.
-    pub stream_buffers_count: usize,
     /// Bytes a transaction may buffer before it must commit.
     pub transaction_max_bytes: u64,
     /// Writes a transaction may buffer before it must commit.
@@ -1825,6 +1825,39 @@ fn ram_options(memory_domains: &[i32]) -> ffi::ustore_ram_options_t {
     ffi::ustore_ram_options_t {
         memory_domains: memory_domains.as_ptr(),
         memory_domains_count: memory_domains.len() as ffi::ustore_size_t,
+    }
+}
+
+/// How the threads of an executor of [`Executor::for_nvme`] move bytes between the drives and memory, where every
+/// zero size or count keeps the engine's default.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+pub struct IOOptions {
+    /// How bytes move between the files and memory.
+    pub transport: Transport,
+    /// I/O channels the threads outside the executor share.
+    pub shared_io_channels: usize,
+    /// Submissions a channel holds at once.
+    pub queue_depth: usize,
+    /// Bytes of each request buffer of a channel.
+    pub request_buffer_bytes: u64,
+    /// Request buffers of each channel.
+    pub request_buffers_count: usize,
+    /// Bytes of each streaming buffer of a channel.
+    pub stream_buffer_bytes: u64,
+    /// Streaming buffers of each channel.
+    pub stream_buffers_count: usize,
+}
+
+/// The C view of `io`.
+fn nvme_options(io: &IOOptions) -> ffi::ustore_nvme_options_t {
+    ffi::ustore_nvme_options_t {
+        transport: io.transport as ffi::ustore_enum_t,
+        shared_io_channels: io.shared_io_channels as ffi::ustore_size_t,
+        queue_depth: io.queue_depth as ffi::ustore_size_t,
+        request_buffer_bytes: io.request_buffer_bytes,
+        request_buffers_count: io.request_buffers_count as ffi::ustore_size_t,
+        stream_buffer_bytes: io.stream_buffer_bytes,
+        stream_buffers_count: io.stream_buffers_count as ffi::ustore_size_t,
     }
 }
 
@@ -1993,11 +2026,8 @@ impl Database {
         database.opened()
     }
 
-    /// Serves a directory in place through the NVMe engine on the calling thread, or fails with
-    /// [`Status::Unsupported`] in a build without it.
-    ///
-    /// The engine borrows the executor it opens on until it closes, which a `Database` cannot hold, so it spawns one
-    /// of its own.
+    /// Serves a directory in place through the NVMe engine, or fails with [`Status::Unsupported`] in a build without
+    /// it.
     ///
     /// Calls `ustore_database_open_nvme`.
     pub fn open_nvme(options: &NVMEOptions<'_>) -> Result<Self> {
@@ -2008,23 +2038,13 @@ impl Database {
         let mut outcome = ffi::ustore_outcome_t::default();
         let mut arguments = ffi::ustore_database_open_nvme_t {
             database: &mut database.handle,
-            executor: ptr::null_mut(),
+            executor: executor_handle(options.executor),
             outcome: &mut outcome,
             completion: ffi::ustore_completion_t::Blocking,
             directory: options.directory.as_bytes().into(),
             data_directories: data_directories.as_ptr(),
             data_directories_count: data_directories.len() as ffi::ustore_size_t,
-            transport: options.transport as ffi::ustore_enum_t,
             memory_limit: options.memory_limit,
-            gpu_devices: options.gpu_devices.as_ptr(),
-            gpu_devices_count: options.gpu_devices.len() as ffi::ustore_size_t,
-            gpu_memory_limit: options.gpu_memory_limit,
-            shared_io_channels: options.shared_io_channels as ffi::ustore_size_t,
-            queue_depth: options.queue_depth as ffi::ustore_size_t,
-            request_buffer_bytes: options.request_buffer_bytes,
-            request_buffers_count: options.request_buffers_count as ffi::ustore_size_t,
-            stream_buffer_bytes: options.stream_buffer_bytes,
-            stream_buffers_count: options.stream_buffers_count as ffi::ustore_size_t,
             transaction_max_bytes: options.transaction_max_bytes,
             transaction_max_elements: options.transaction_max_elements as ffi::ustore_size_t,
             collection_concurrency_limit: options.collection_concurrency_limit as ffi::ustore_size_t,
@@ -2036,7 +2056,7 @@ impl Database {
             collection_value_size: options.collection_value_size,
             collection_value_max_size: options.collection_value_max_size,
         };
-        // SAFETY: every pointer in `arguments` outlives the call, the paths and devices included.
+        // SAFETY: every pointer in `arguments` outlives the call, the paths included.
         unsafe { ffi::ustore_database_open_nvme(&mut arguments) };
         check(outcome)?;
         database.opened()
@@ -2865,6 +2885,8 @@ struct Lent<Verb: sealed::Calling> {
 #[derive(Debug)]
 pub struct Executor {
     handle: ffi::ustore_executor_t,
+    /// The executor of [`Executor::for_vram`] an NVMe one borrows, freed after it.
+    vram: Option<Box<Executor>>,
 }
 
 // SAFETY: `types.h` shares an executor between any number of databases and threads.
@@ -2924,20 +2946,48 @@ impl Executor {
     }
 
     /// Spawns the threads of the NVMe engine, each submitting and polling its own I/O ring, where zero `threads`
-    /// derives them from the cores, or fails with [`Status::Unsupported`] in a build without it.
+    /// derives them from the cores, and tells every database [`Database::open_nvme`] opens on it to move bytes as
+    /// `io` says, compacting on the devices of `vram`, which it keeps until it is dropped.
     ///
     /// Calls `ustore_executor_for_nvme`.
-    pub fn for_nvme(threads: usize, deferred_limit: usize) -> Result<Self> {
+    pub fn for_nvme(threads: usize, io: &IOOptions, vram: Option<Executor>, deferred_limit: usize) -> Result<Self> {
         let mut handle: ffi::ustore_executor_t = ptr::null_mut();
         let mut outcome = ffi::ustore_outcome_t::default();
         let mut arguments = ffi::ustore_executor_for_nvme_t {
             executor: &mut handle,
             outcome: &mut outcome,
+            nvme: nvme_options(io),
+            vram: vram.as_ref().map_or(ptr::null_mut(), |borrowed| borrowed.handle),
             threads: threads as ffi::ustore_size_t,
             deferred_limit: deferred_limit as ffi::ustore_size_t,
         };
-        // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
+        // SAFETY: every pointer in `arguments` outlives the call, which is final on return, and the new executor
+        // keeps `vram` until it is dropped.
         unsafe { ffi::ustore_executor_for_nvme(&mut arguments) };
+        let mut made = Executor::created(handle, outcome)?;
+        made.vram = vram.map(Box::new);
+        Ok(made)
+    }
+
+    /// Spawns one host thread driving each CUDA device of `devices`, every visible one when empty, with
+    /// `scratch_limit` bytes of device memory on each, or 256 MiB for zero, which an executor of
+    /// [`Executor::for_nvme`] compacts on, or fails with [`Status::Unsupported`] in a build without CUDA and with
+    /// [`Status::Device`] for an ordinal no device carries.
+    ///
+    /// Calls `ustore_executor_for_vram`.
+    pub fn for_vram(devices: &[i32], scratch_limit: usize, deferred_limit: usize) -> Result<Self> {
+        let mut handle: ffi::ustore_executor_t = ptr::null_mut();
+        let mut outcome = ffi::ustore_outcome_t::default();
+        let mut arguments = ffi::ustore_executor_for_vram_t {
+            executor: &mut handle,
+            outcome: &mut outcome,
+            devices: devices.as_ptr(),
+            devices_count: devices.len() as ffi::ustore_size_t,
+            scratch_limit: scratch_limit as ffi::ustore_size_t,
+            deferred_limit: deferred_limit as ffi::ustore_size_t,
+        };
+        // SAFETY: every pointer in `arguments` outlives the call, which is final on return and copies the devices.
+        unsafe { ffi::ustore_executor_for_vram(&mut arguments) };
         Executor::created(handle, outcome)
     }
 
@@ -2946,7 +2996,7 @@ impl Executor {
         check(outcome)?;
         match handle.is_null() {
             true => Err(fail(Status::Internal, "the library returned no executor and no error")),
-            false => Ok(Executor { handle }),
+            false => Ok(Executor { handle, vram: None }),
         }
     }
 
@@ -3620,7 +3670,14 @@ mod tests {
         // SAFETY: a null pool is refused before anything reads it.
         let lent = unsafe { Executor::on_pool(&[], ptr::null_mut(), 0) };
         assert_eq!(lent.unwrap_err().status, Status::InvalidArgument);
-        assert_eq!(Executor::for_nvme(1, 0).unwrap_err().status, Status::Unsupported);
+        let blocking = IOOptions {
+            transport: Transport::Blocking,
+            ..IOOptions::default()
+        };
+        drop(Executor::for_nvme(1, &blocking, None, 0).unwrap());
+        // A build without CUDA refuses every device, and one with CUDA refuses an ordinal no device carries.
+        let devices = Executor::for_vram(&[1 << 20], 0, 0).unwrap_err().status;
+        assert!(devices == Status::Unsupported || devices == Status::Device);
 
         // Zero threads derive their count from the cores of every domain.
         let derived = Executor::for_ram(&[], 0, 0).unwrap();

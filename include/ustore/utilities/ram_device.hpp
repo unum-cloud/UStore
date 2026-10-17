@@ -33,6 +33,9 @@ enum class residency_t : std::uint8_t {
 
     /** Host threads over host pages, as every executor of the RAM, RocksDB, LevelDB and NVMe engines computes. */
     host_k,
+
+    /** Host threads driving CUDA devices, as a VRAM executor computes, where no engine places a database yet. */
+    vram_k,
 };
 
 namespace unum::ustore::utilities {

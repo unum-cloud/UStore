@@ -6,19 +6,20 @@
  *
  *  Nothing here links liburing. A ring is set up with @c io_uring_setup, mapped with @c mmap, fed
  *  with @c io_uring_register and entered with @c io_uring_enter, which is the whole interface and
- *  needs Linux 6.12 or newer for @c DEFER_TASKRUN, @c SINGLE_ISSUER and @c NO_SQARRAY together.
+ *  needs Linux 6.12 or newer, the floor the other transports keep too.
  *
- *  A ring belongs to one queue pair rather than to the disk, because @c SINGLE_ISSUER binds a ring to one
- *  task and answers @c -EEXIST to every other, for @c io_uring_enter and @c io_uring_register alike.
- *  The binding happens at @c io_uring_setup unless the ring is set up disabled, so every ring is
- *  created with @c IORING_SETUP_R_DISABLED at mount - where mapping and the sparse tables can still
- *  fail loudly - and bound to its thread by @c IORING_REGISTER_ENABLE_RINGS when the queue pair is taken.
+ *  A ring belongs to one queue pair rather than to the disk, and the queue pair to one thread at a time,
+ *  which the lease of the queue pair keeps, so no ring is shared between threads entering it at once. A
+ *  queue pair moves between threads with nothing outstanding, and its ring moves with it, since rings are
+ *  set up without @c SINGLE_ISSUER: a ring bound to one task would be rebuilt at every move. Every ring is
+ *  created with @c IORING_SETUP_R_DISABLED at mount - where mapping and the sparse tables can still fail
+ *  loudly - and enabled by @c IORING_REGISTER_ENABLE_RINGS when its queue pair is first taken.
  *
- *  Because only the bound thread may register on its own ring, a registered buffer or medium is
- *  recorded on the disk and copied into a ring's tables by that ring's own thread, at the submission
- *  that first needs it. The disk counts registered memory and medium epochs; a ring rewrites its table
- *  when its epoch is behind. Pinning the ranges is an optimisation the locked-memory cap may refuse,
- *  since every ring is charged for the whole arena; a ring refused the pin addresses them by pointer.
+ *  A registered buffer or medium is recorded on the disk and copied into a ring's tables by the thread
+ *  holding the ring, at the submission that first needs it. The disk counts registered memory and medium
+ *  epochs; a ring rewrites its table when its epoch is behind. Pinning the ranges is an optimisation the
+ *  locked-memory cap may refuse, since every ring is charged for the whole arena; a ring refused the pin
+ *  addresses them by pointer.
  */
 
 #pragma once
@@ -31,7 +32,7 @@
 
 #if defined(__linux__)
 #include <fcntl.h>          // `AT_EMPTY_PATH`
-#include <linux/io_uring.h> // `io_uring_sqe`, `io_uring_cqe`, `IORING_SETUP_DEFER_TASKRUN`
+#include <linux/io_uring.h> // `io_uring_sqe`, `io_uring_cqe`, `IORING_SETUP_R_DISABLED`
 #include <linux/stat.h>     // `struct statx`, `STATX_DIOALIGN`
 #include <sys/mman.h>       // `mmap`, `munmap`, `MAP_SHARED`
 #include <sys/syscall.h>    // `__NR_io_uring_setup`, `__NR_io_uring_enter`, `__NR_statx`
@@ -112,12 +113,6 @@ enum class range_pinning_t : std::uint8_t {
 
 /*  Older distribution headers carry the syscall and miss the newer constants, so the few this
  *  transport needs are spelled out rather than made a build-time requirement. */
-#if !defined(IORING_SETUP_SINGLE_ISSUER)
-#define IORING_SETUP_SINGLE_ISSUER (1U << 12)
-#endif
-#if !defined(IORING_SETUP_DEFER_TASKRUN)
-#define IORING_SETUP_DEFER_TASKRUN (1U << 13)
-#endif
 #if !defined(IORING_SETUP_NO_SQARRAY)
 #define IORING_SETUP_NO_SQARRAY (1U << 16)
 #endif
@@ -339,8 +334,8 @@ class linux_uring_files_disk_t {
      *  @brief Binds @p queue pair and its ring to the calling thread, which is how a moved queue pair changes hands.
      *  @param[in] queue pair The queue pair this thread has just taken over, with nothing outstanding on it.
      *
-     *  @note A ring cannot change its bound thread, so a handover to another thread builds a fresh ring in
-     *      the queue pair's slot; that is why the queue pair must be empty before it moves.
+     *  @note The ring moves with the queue pair, which must be empty before it moves, since completions of
+     *      requests the thread before submitted would land with a thread that never tracked them.
      */
     status_t bind_queue_pair(queue_pair_t const& queue_pair) noexcept {
         queue_pair_slot_t* const slot = slot_of_(queue_pair);
@@ -387,8 +382,8 @@ class linux_uring_files_disk_t {
      *  @param[in] memory Memory the caller owns and keeps alive until it deregisters the range.
      *  @param[in] space Where that memory lives; this transport reaches host memory alone.
      *
-     *  @note The kernel learns of the range on each ring's own thread, at the next submission there,
-     *      since @c io_uring_register answers @c -EEXIST to anyone but the ring's bound_thread.
+     *  @note The kernel learns of the range on each ring's own thread, at the next submission there, so a
+     *      registration never races the thread entering the ring.
      */
     expected<registered_memory_t> register_memory(std::span<byte_t> memory, memory_space_t space) noexcept {
         if (memory.empty()) return status_t {status_code_t::invalid_argument_k, "An empty range registers nothing"};
@@ -564,13 +559,13 @@ class linux_uring_files_disk_t {
     }
 
     /**
-     *  @brief Runs this ring's deferred completion work and copies what landed into @p into.
+     *  @brief Runs this ring's pending completion work and copies what landed into @p into.
      *  @param[in] queue pair The queue pair polling, held by the calling thread that submitted on it.
      *  @param[out] into Room for completions, which bounds how many one call moves.
      *  @return How many completions were moved, which is zero when nothing has landed.
      *
-     *  @note The entry carries @c min_complete of zero, so the call performs the work a deferred ring
-     *      only performs on its owning thread and returns without waiting for anything.
+     *  @note The entry carries @c min_complete of zero, so the call flushes the task work the kernel queued
+     *      for the ring and returns without waiting for anything.
      */
     expected<std::size_t> poll_completions(queue_pair_t const& queue_pair, std::span<completion_t> into) noexcept {
         queue_pair_slot_t* const slot = slot_of_(queue_pair);
@@ -807,9 +802,14 @@ class linux_uring_files_disk_t {
     /** Reaps a drain performs before it calls the ring broken. */
     static constexpr std::size_t drain_spin_limit_k = std::size_t {1} << 24;
 
-    /** The flags every ring of this transport is set up with, and the probe tests for. */
-    static constexpr unsigned ring_setup_flags_k = IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_SINGLE_ISSUER |
-                                                   IORING_SETUP_NO_SQARRAY | IORING_SETUP_R_DISABLED;
+    /**
+     *  @brief The flags every ring of this transport is set up with, and the probe tests for.
+     *
+     *  No @c SINGLE_ISSUER, and so no @c DEFER_TASKRUN: a queue pair moves to whichever thread takes the write path
+     *  or a shared channel, and a ring bound to one task would be rebuilt at every move, its pins and its regions
+     *  freed by the kernel's deferred exit work, until the locked-memory cap refuses the next ring.
+     */
+    static constexpr unsigned ring_setup_flags_k = IORING_SETUP_NO_SQARRAY | IORING_SETUP_R_DISABLED;
 
     /** Grows @p elements to @p count default slots, reporting an allocation failure as a status. */
     template <typename element_type_>
@@ -905,14 +905,9 @@ class linux_uring_files_disk_t {
         return {};
     }
 
-    /**
-     *  @brief Unmaps and closes one ring, leaving the slot ready for a fresh one.
-     *
-     *  Only the bound thread may give the pins back at once; a ring closed by any other thread leaves
-     *  them to the kernel's exit work, which releases them later, and the next pin falls back until then.
-     */
+    /** Unmaps and closes one ring, giving its pins back at once, and leaves the slot ready for a fresh one. */
     static void teardown_ring_(ring_t& ring) noexcept {
-        if (ring.file >= 0 && ring.bound_thread == bound_thread_identity_()) {
+        if (ring.file >= 0) {
             [[maybe_unused]] long const unpinned = ::syscall(__NR_io_uring_register, ring.file,
                                                              IORING_UNREGISTER_BUFFERS, nullptr, 0);
         }
@@ -923,20 +918,20 @@ class linux_uring_files_disk_t {
     }
 
     /**
-     *  @brief Makes @p identity the one thread that may enter and register on @p ring.
+     *  @brief Makes @p identity the one thread that enters and registers on @p ring, until the next handover.
      *
-     *  A ring set up disabled binds to whoever enables it, so the first queue pair costs one register
-     *  call. A ring already bound elsewhere cannot change hands, so a handover builds a fresh one,
-     *  which is only legal because a queue pair moves with nothing outstanding on it. A ring whose last
-     *  build failed is built again here rather than left dead in its slot.
+     *  A ring is set up disabled and enabled by its first queue pair, which costs one register call. A handover
+     *  only records the new thread, which is legal because a queue pair moves with nothing outstanding on it and
+     *  the ring answers whichever task enters it. A ring whose last build failed is built again here rather than
+     *  left dead in its slot.
      */
     status_t bind_ring_(ring_t& ring, thread_identity_t identity) noexcept {
         if (ring.bound_thread == identity) return {};
-        if (ring.bound_thread != 0) teardown_ring_(ring);
         if (ring.file < 0)
             if (status_t const created = create_ring_(ring); created.failed()) return created;
-        if (::syscall(__NR_io_uring_register, ring.file, IORING_REGISTER_ENABLE_RINGS, nullptr, 0) < 0)
-            return native_file_failure(errno, "The ring would not bind to this thread");
+        if (ring.bound_thread == 0)
+            if (::syscall(__NR_io_uring_register, ring.file, IORING_REGISTER_ENABLE_RINGS, nullptr, 0) < 0)
+                return native_file_failure(errno, "The ring would not be enabled");
         ring.bound_thread = identity;
         return {};
     }
@@ -997,7 +992,7 @@ class linux_uring_files_disk_t {
         return range_pinning_t::unpinned_k;
     }
 
-    /** Runs the completion work a deferred ring only performs on its own thread, without waiting. */
+    /** Runs the completion work the kernel queued for @p ring, without waiting. */
     static void enter_for_completions_(ring_t& ring) noexcept {
         [[maybe_unused]] long const entered = ::syscall(__NR_io_uring_enter, ring.file, 0u, 0u, IORING_ENTER_GETEVENTS,
                                                         nullptr, 0);

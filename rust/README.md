@@ -190,12 +190,13 @@ executor.drain(Mood::Parked)?;
 The scratch of each thread and every arena the executor makes live on those domains, and an identifier no domain carries is refused with `Status::InvalidArgument`.
 Zero threads take 7/8 of the cores those domains carry, leaving the rest to the driver thread, to blocking calls and to the background work of RocksDB and LevelDB, and a zero `deferred_limit` takes 256.
 `Executor::on_pool` borrows the threads of a ForkUnion `fu_pool_t`, so several libraries in one process share them, and is `unsafe`, since the pool must outlive the executor.
-`Executor::for_nvme` spawns the threads of the NVMe engine, one I/O ring apiece, and fails with `Status::Unsupported` in a library built without that engine.
+`Executor::for_nvme` spawns the threads of the NVMe engine, one I/O ring apiece, and its `IOOptions` tell every database opened on it how to move bytes: the transport, the channels and their buffers.
+It may own an executor of `Executor::for_vram`, whose CUDA devices its compactions run on, which fails with `Status::Unsupported` in a library built without CUDA.
 `View::on` names the executor and keeps the view blocking, so its verbs answer exactly as they do on the calling thread.
 `Executor::drain` waits for every call submitted before the drain began and leaves the threads in `Mood::Parked` or `Mood::Spinning` whenever they next go idle, and dropping the executor drains it.
 
-Opening a database blocks, and `RAMOptions`, `RocksDBOptions` and `LevelDBOptions` name the executor the open runs on, where `None` opens on the calling thread.
-The NVMe engine borrows the executor it opens on until it closes, which a `Database` cannot hold, so `Database::open_nvme` opens on the calling thread alone.
+Opening a database blocks, and `RAMOptions`, `RocksDBOptions`, `LevelDBOptions` and `NVMEOptions` name the executor the open runs on, where `None` opens on the calling thread.
+The NVMe engine reads the `IOOptions` of its executor once, at the open, so the executor may be dropped before the database.
 
 ## Arenas
 

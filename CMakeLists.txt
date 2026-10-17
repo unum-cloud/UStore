@@ -241,7 +241,7 @@ set(USTORE_ENGINE_DEFINITIONS)
 # The NVMe engine mounts its volumes on files, so it builds everywhere the siblings do; the io_uring transport beside it
 # compiles on every platform and only opens a ring on Linux.
 if (${USTORE_BUILD_NVME})
-    list(APPEND USTORE_SOURCES src/nvme/engine.cpp src/nvme/strings.cpp)
+    list(APPEND USTORE_SOURCES src/nvme/engine.cpp)
     list(APPEND USTORE_ENGINE_DEFINITIONS USTORE_WITH_NVME=1)
     list(APPEND USTORE_ENGINE_NAMES "nvme")
 endif ()

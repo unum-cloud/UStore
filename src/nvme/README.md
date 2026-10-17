@@ -3,8 +3,10 @@
 UStoreNVMe is UStore's NVMe-focused LSM engine, with `io_uring`, Linux AIO, SPDK and blocking transports, GPU compaction and GPUDirect Storage, and SIMD row kits.
 Every collection is a log-structured merge tree of immutable sorted runs, each opening with a memory-mapped B-tree of its keys.
 Keys are fixed-width stored keys, `ustore_key_t` at the C ABI, and values are opaque bytes whose width a collection fixes at compile time.
-The C ABI in `engine.cpp` backs each UStore database with one `database` and each named collection with one `collection`.
-It mounts on files through whichever file transport the probe chose, reserves one collection for `ustore_collection_main_k` and one for the names of the strings modality, and creates every other collection with a variable-width value layout so an empty value keeps its key.
+The C ABI in `engine.cpp` backs each UStore database with one `database` and each collection with one `collection` under the same UUID.
+It mounts on files through whichever file transport its executor names, reserves collections for `ustore_collection_main_k`, the catalog and the names, and creates every other collection with a variable-width value layout so an empty value keeps its key.
+Every write of a caller commits through a transaction of the registry, while the catalog and the names change straight in the store under a claim of their own, as no caller's transaction reaches them.
+A stage checks a transaction and hands the database's claim back at once, so the commit checks it again; a held claim would stall every other call.
 
 ## Data Layout
 
@@ -45,7 +47,8 @@ Levels differ by depth:
 - Intermediate levels keep their sorted runs sorted, and still hold tombstones: removals, whose size of zero shadows older values beneath them.
 - The bottom level is sorted too, and compaction into it drops tombstones for good.
 
-Level 0 has a byte budget, and every deeper level's budget grows by `level_enlarge_factor`.
+Level 0 is due for compaction at 4 sorted runs or at its byte budget, whichever comes first, and every deeper level's budget grows by `level_enlarge_factor`.
+The engine compacts after every write that leaves a collection due, on the thread of that write.
 
 ### Value Layouts
 
@@ -88,24 +91,25 @@ A watch follows one of four schedules:
 | `on_commit_k`                 | Between the transaction's start and its commit, and the default |
 | `on_commit_since_operation_k` | Between the operation and the commit                            |
 
-The C ABI watches every read and write on `on_commit_k`, or on `never_k` when a call passes `ustore_option_transaction_dont_watch_k`.
-Watches cover keys, not ranges, so a scan reports no phantom and an ordered walk inside a transaction reads what the store has committed rather than what the transaction staged.
+The C ABI watches every read and write on `on_commit_k` when a call asks for `ustore_watch_keys_k`, or on `never_k` for `ustore_watch_none_k`, and a read of a missing key watches its absence.
+Watches cover keys, not ranges, so a scan watches the keys it hands out and reports no phantom, and an ordered walk inside a transaction merges the transaction's own writes over what the store has committed.
 A write that reached no registry would land where no watcher could see it, so a batch the C ABI takes outside a caller's transaction commits through a transaction of its own, sized to that batch.
 Commits are ordered by the stamps the registry issues, which keeps a transaction to one node.
 
 ## The C ABI
 
-`engine.cpp` implements `c/ustore/db.h` and `c/ustore/blobs.h` over one `database`, and `c/docs.cpp`, `c/graph.cpp` and `c/strings.cpp` layer the other modalities on top of it, exactly as they do for every other engine.
+`engine.cpp` serves every slot of `src/engine.hpp`'s `engine_t` the RAM engine serves over one `database`, and `src/docs.cpp` and `src/graph.cpp` layer documents and graphs on its blobs, exactly as they do for LevelDB.
 `USTORE_BUILD_NVME` adds the engine to the `ustore` library and `nvme` to the engines every suite runs with `--engine`.
 
-- A configuration names a directory, which becomes the metadata directory; a data directory it does not name defaults to `data` beneath it, and a capacity it does not name defaults to one gibibyte, since a volume file is preallocated.
-- `ustore_collection_main_k` is zero and `ustore_collection_names_k` is one below the largest identifier; both resolve to reserved collections the first mount creates, neither can be dropped rather than cleared, and every other identifier is the number the catalog gave the collection.
-- A read measures every key first, lays the tape out once, then fills it with one batched select per collection, so the ring stays refilled and each value lands where its length said it would.
-- A scan, a sample and a measurement merge the runs of one held level set, since a store of sorted runs offers no cursor of its own; a scan starting past the smallest key binary-searches each run rather than walking to it.
-- `ustore_snapshot_create`, `ustore_snapshot_export` and `ustore_snapshot_drop` answer `unsupported_k`, `ustore_get_metadata` does not claim `ustore_supports_snapshots_k`, and `ustore_snapshot_list` answers zero so a caller that lists before it clears still works.
-- Nothing compacts on its own, so a write carrying `ustore_option_write_flush_k` flushes and then compacts, and `ustore_database_control` serves `clear`, `reset`, `flush`, `compact`, `info` and `usage`.
+- An open names a directory, which becomes the metadata directory; a data directory it does not name defaults to `data` beneath it, and a capacity it does not name defaults to one gibibyte.
+- The executor of `ustore_executor_for_nvme` names the transport, the channels and their buffers, and the VRAM executor compactions run on, read once at the open; any other executor and none keep the defaults.
+- `ustore_collection_main_k` is the nil UUID, and the catalog and the names live under two more UUIDs no UUIDv7 spells, which every call refuses as unknown; every other collection carries the UUIDv7 its create minted.
+- A read measures a key and copies its value into the call's scratch, measuring again when the value changed its width in between.
+- A scan, a sample and a measurement walk one collection's runs and write buffer under the database's claim, binary-searching each run for the start key, and merge a transaction's own writes over them.
+- Snapshots answer `ustore_status_unsupported_k`, and the description claims no `ustore_capabilities_snapshots_k`, since a level set held across calls would stall every publication behind it.
+- A write that leaves a level due compacts it on the writing thread, and `ustore_database_compact` flushes every collection before merging what is due.
 
-The engine mounts on files through whichever of the three file transports the probe settles on, `io_uring` where the kernel allows it, Linux AIO where it refuses a ring, and the blocking floor elsewhere, and `info` reports which one it got, as `uring`, `aio` or `blocking`, and under `io_uring` whether the arena is pinned.
+The engine mounts on files through the transport its executor names or the probe settles on: `io_uring` where the kernel allows it, Linux AIO where it refuses a ring, and the blocking floor elsewhere.
 Only `ram` is refused, since the database the ABI names keeps its volumes in files.
 
 ## Compactions
@@ -170,7 +174,7 @@ The `vertex_registry_t` lists each block's first and last neighbor and a quantiz
 Batched calls read registries and edge blocks once and write the changed vertices and edge blocks together, and looking up many vertex pairs in one call can cut IOPS tenfold.
 
 `graph_store_t` opens both databases under the directory its caller passes and destroys their data when it closes, so a graph does not yet outlive its process.
-`graph_abi.hpp` exposes it through `graph_abi_*` calls over the `ustore_*` graph types, and nothing includes the delta-baseline coder in `delta_coding.hpp`.
+`graph_store.hpp` serves the graph calls of the C ABI over its access, and `engine.cpp` builds them without listing them in its table, as the store's transactions are not the engine's; nothing includes the delta-baseline coder in `delta_coding.hpp`.
 The fast path is headed for `graph.hpp`, storing adjacency directly in UStoreNVMe's files, while `c/graph.cpp` stays the modality every engine shares.
 
 ## Alternatives

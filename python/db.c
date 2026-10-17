@@ -28,13 +28,6 @@ typedef struct nvme_size_keyword_t {
 /** Every size keyword of @c Database.open_nvme, closed by a nameless row. */
 static nvme_size_keyword_t const nvme_size_keywords[] = {
     {"memory_limit", offsetof(ustore_database_open_nvme_t, memory_limit)},
-    {"gpu_memory_limit", offsetof(ustore_database_open_nvme_t, gpu_memory_limit)},
-    {"shared_io_channels", offsetof(ustore_database_open_nvme_t, shared_io_channels)},
-    {"queue_depth", offsetof(ustore_database_open_nvme_t, queue_depth)},
-    {"request_buffer_bytes", offsetof(ustore_database_open_nvme_t, request_buffer_bytes)},
-    {"request_buffers_count", offsetof(ustore_database_open_nvme_t, request_buffers_count)},
-    {"stream_buffer_bytes", offsetof(ustore_database_open_nvme_t, stream_buffer_bytes)},
-    {"stream_buffers_count", offsetof(ustore_database_open_nvme_t, stream_buffers_count)},
     {"transaction_max_bytes", offsetof(ustore_database_open_nvme_t, transaction_max_bytes)},
     {"transaction_max_elements", offsetof(ustore_database_open_nvme_t, transaction_max_elements)},
     {"collection_concurrency_limit", offsetof(ustore_database_open_nvme_t, collection_concurrency_limit)},
@@ -66,12 +59,6 @@ typedef struct opening_t {
 
     /** Entries of @c data_directories. */
     size_t data_directories_count;
-
-    /** The CUDA devices, or NULL for none. */
-    int* gpu_devices;
-
-    /** Entries of @c gpu_devices. */
-    size_t gpu_devices_count;
 } opening_t;
 
 /** Releases whatever @p opening holds. */
@@ -79,7 +66,6 @@ static void opening_release(opening_t* opening) {
     Py_XDECREF(opening->directory);
     Py_XDECREF(opening->paths);
     PyMem_Free(opening->data_directories);
-    PyMem_Free(opening->gpu_devices);
 }
 
 /** Encodes @p object, a str, bytes or PathLike, as the directory, leaving None as no directory. */
@@ -171,36 +157,6 @@ static int opening_data_directories(opening_t* opening, PyObject* object) {
     return 0;
 }
 
-/** Reads @p object, a sequence of CUDA device ordinals, as the GPU devices. */
-static int opening_gpu_devices(opening_t* opening, PyObject* object) {
-    PyObject* const items = PySequence_Fast(object, "The 'gpu_devices' option must be a sequence");
-    if (!items) return -1;
-    Py_ssize_t const count = PySequence_Fast_GET_SIZE(items);
-    PyMem_Free(opening->gpu_devices);
-    opening->gpu_devices = PyMem_Calloc((size_t)count + 1, sizeof(int));
-    opening->gpu_devices_count = (size_t)count;
-    if (!opening->gpu_devices) {
-        Py_DECREF(items);
-        PyErr_NoMemory();
-        return -1;
-    }
-    for (Py_ssize_t index = 0; index != count; ++index) {
-        long const device = PyLong_AsLong(PySequence_Fast_GET_ITEM(items, index));
-        if (device == -1 && PyErr_Occurred()) {
-            Py_DECREF(items);
-            return -1;
-        }
-        if (device < 0 || device > INT_MAX) {
-            Py_DECREF(items);
-            PyErr_Format(PyExc_ValueError, "A CUDA device ordinal must be within [0, %d], got %ld", INT_MAX, device);
-            return -1;
-        }
-        opening->gpu_devices[index] = (int)device;
-    }
-    Py_DECREF(items);
-    return 0;
-}
-
 /** Wraps @p handle, which an init call opened unless @p outcome failed, in a new @c Database. */
 static PyObject* database_opened(ustore_database_t handle, ustore_outcome_t* outcome) {
     if (ustore_py_raise_on_outcome(outcome) != 0) return NULL;
@@ -232,8 +188,8 @@ static char const doc_Database[] =                                              
     "\n"                                                                                       //
     "Database.open_ram(), open_rocksdb(), view_rocksdb(), open_leveldb() and open_nvme()\n"    //
     "each take what their engine can be asked; engines_compiled() names the ones this build\n" //
-    "carries, and the others refuse to open. All but NVMe take an `executor` keyword and\n"    //
-    "block on it, as they block on the calling thread without one. The directory belongs to\n" //
+    "carries, and the others refuse to open. Each takes an `executor` keyword and blocks\n"    //
+    "on it, as it blocks on the calling thread without one. The directory belongs to\n"        //
     "the database, so no two processes may open the same one at once. Every database holds\n"  //
     "a main collection, which can be cleared but never dropped, beside the collections it\n"   //
     "creates.\n"                                                                               //
@@ -460,29 +416,29 @@ failed:
     return NULL;
 }
 
-static char const doc_Database_open_nvme[] =                                                        //
-    "open_nvme(directory, *, transport=Transport.AUTOMATIC, **sizes) answers a database on NVMe.\n" //
-    "\n"                                                                                            //
-    "Every size keyword names a field of ustore_database_open_nvme_t, like memory_limit,\n"         //
-    "queue_depth or collection_cache_limit, where zero keeps the engine's default. It opens\n"      //
-    "on the calling thread, and the engine spawns the I/O executor it keeps.\n"                     //
-    "\n"                                                                                            //
-    "Args:\n"                                                                                       //
-    "  directory (str | bytes | PathLike): The directory of the database's own files.\n"            //
-    "  data_directories (Sequence): Directories the volumes fill, each a path or a\n"               //
-    "    (path, max_bytes) pair; none keeps one volume inside the directory.\n"                     //
-    "  transport (Transport): How bytes move between the files and memory.\n"                       //
-    "  gpu_devices (Sequence[int]): CUDA devices compaction may run on.\n"                          //
-    "Returns:\n"                                                                                    //
-    "  Database: The opened database.\n"                                                            //
-    "Raises:\n"                                                                                     //
+static char const doc_Database_open_nvme[] =                                                    //
+    "open_nvme(directory, *, executor=None, **sizes) answers a database on NVMe.\n"             //
+    "\n"                                                                                        //
+    "Every size keyword names a field of ustore_database_open_nvme_t, like memory_limit,\n"     //
+    "transaction_max_bytes or collection_cache_limit, where zero keeps the engine's default.\n" //
+    "The database moves bytes as an executor of Executor.for_nvme() says, read once here,\n"    //
+    "and with that call's defaults for any other executor and for none.\n"                      //
+    "\n"                                                                                        //
+    "Args:\n"                                                                                   //
+    "  directory (str | bytes | PathLike): The directory of the database's own files.\n"        //
+    "  executor (Executor, optional): The executor the open blocks on, or None to open on\n"    //
+    "    the calling thread.\n"                                                                 //
+    "  data_directories (Sequence): Directories the volumes fill, each a path or a\n"           //
+    "    (path, max_bytes) pair; none keeps one volume inside the directory.\n"                 //
+    "Returns:\n"                                                                                //
+    "  Database: The opened database.\n"                                                        //
+    "Raises:\n"                                                                                 //
     "  UnsupportedError: This build carries no NVMe engine.";
 
 static PyObject* Database_open_nvme(PyObject* Py_UNUSED(type), PyObject* const* args, Py_ssize_t positional_args_count,
                                     PyObject* args_names_tuple) {
     opening_t opening = {0};
     ustore_database_open_nvme_t open_nvme = {0};
-    int transport = ustore_transport_automatic_k;
     Py_ssize_t const args_names_count = opening_positional(&opening, "open_nvme", args, positional_args_count,
                                                            args_names_tuple);
     if (args_names_count < 0) goto failed;
@@ -498,12 +454,9 @@ static PyObject* Database_open_nvme(PyObject* Py_UNUSED(type), PyObject* const* 
             *(ustore_size_t*)((char*)&open_nvme + keyword->offset) = (ustore_size_t)size;
         }
         else if (PyUnicode_CompareWithASCIIString(name, "directory") == 0) read = opening_directory(&opening, value);
+        else if (PyUnicode_CompareWithASCIIString(name, "executor") == 0) read = opening_executor(&opening, value);
         else if (PyUnicode_CompareWithASCIIString(name, "data_directories") == 0)
             read = opening_data_directories(&opening, value);
-        else if (PyUnicode_CompareWithASCIIString(name, "gpu_devices") == 0)
-            read = opening_gpu_devices(&opening, value);
-        else if (PyUnicode_CompareWithASCIIString(name, "transport") == 0)
-            read = ustore_py_enum_from_object(value, "transport", ustore_py_enum_transport_k, &transport);
         else PyErr_Format(PyExc_TypeError, "Got unexpected keyword argument: %S", name);
         if (read != 0) goto failed;
     }
@@ -511,13 +464,11 @@ static PyObject* Database_open_nvme(PyObject* Py_UNUSED(type), PyObject* const* 
     ustore_database_t handle = NULL;
     ustore_outcome_t outcome = {0};
     open_nvme.database = &handle;
+    open_nvme.executor = opening.executor;
     open_nvme.outcome = &outcome;
     open_nvme.directory = path_bytes(opening.directory);
     open_nvme.data_directories = opening.data_directories;
     open_nvme.data_directories_count = (ustore_size_t)opening.data_directories_count;
-    open_nvme.transport = (ustore_transport_t)transport;
-    open_nvme.gpu_devices = opening.gpu_devices;
-    open_nvme.gpu_devices_count = (ustore_size_t)opening.gpu_devices_count;
     Py_BEGIN_ALLOW_THREADS;
     ustore_database_open_nvme(&open_nvme);
     Py_END_ALLOW_THREADS;

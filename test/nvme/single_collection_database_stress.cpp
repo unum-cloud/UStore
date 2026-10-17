@@ -48,10 +48,6 @@ constexpr std::size_t keys_per_worker_k = 256;
 /** Operations every worker runs, about a third each of selects, inserts and removes. */
 constexpr std::size_t operations_per_worker_k = 3000;
 
-/** Why the io_uring transports skip: a write path moving between threads rebinds the writing ring, and the engine
- *  then submits on a ring still bound to the thread before or has the kernel refuse the ring rebuilt. */
-constexpr char const* rebinding_ring_reason_k = "the write path cannot move between threads on io_uring yet";
-
 /** The seed every worker's generator is forked from. */
 constexpr std::uint64_t seed_k = 42;
 
@@ -93,8 +89,7 @@ struct stress_stack {
                                                                 stored_value_size_t value_max_size) noexcept {
     single_collection_database_config_t config;
     config.collection.concurrency_limit = worker_threads_k;
-    // A point select fills the value cache under a read claim other readers share, so concurrent readers race on it.
-    config.collection.cache_limit = 0;
+    config.collection.cache_limit = 1024ull * 1024ull;
     config.collection.write_buffer_max_bytes = 256ull * 1024ull;
     config.collection.write_buffer_max_elements = 512;
     config.collection.lsm_tree.level_enlarge_factor = 4;
@@ -353,15 +348,8 @@ int main(int argc, char const* argv[]) {
         report(totals, mount, "fixed_width", fixed_width_keeps_its_values);
         report(totals, mount, "variable_width", variable_width_keeps_its_values);
     };
-    for (transport_t const transport : every_transport_k) {
-        if (transport == transport_t::linux_uring_k || transport == transport_t::device_k) {
-            case_label_t const label {"scdb_stress", name_of(transport)};
-            if (totals.selects(label.c_str()))
-                report(totals, label.c_str(), case_result_t::skipped(rebinding_ring_reason_k));
-            continue;
-        }
+    for (transport_t const transport : every_transport_k)
         run_on_transport(totals, transport, environment, stress_config_k, 1, "scdb_stress", cases);
-    }
 
     return suite_exit_code(totals);
 }

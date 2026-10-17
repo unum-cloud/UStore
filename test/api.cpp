@@ -1887,7 +1887,6 @@ std::size_t database_free_waits(config_t const&) {
 /** An init runs on an executor as every call does: a blocking one returns with the database open, and a deferred one
  *  submitted behind an unfinished call runs from its copy and writes the database before its outcome is final. */
 case_result_t database_init_on_executor(config_t const& config) {
-    if (config.engine() == "nvme") return case_result_t::skipped("the NVMe init borrows its executor until close");
     std::size_t failures = 0;
     auto [executor, spawn_status] = spawn_executor(0);
     auto [arena, arena_status] = arena_t::make();

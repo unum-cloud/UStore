@@ -39,9 +39,13 @@
 
 #include <algorithm> // `std::min`, `std::sort`
 #include <array>     // `std::array`
+#include <atomic>    // `std::memory_order_acquire`
 #include <bit>       // `std::bit_floor`
 #include <span>      // `std::span`
 #include <utility>   // `std::exchange`, `std::move`, `std::swap`
+
+#include <forkunion/atomics.hpp>      // `fu::preferred_atomic_ref`
+#include <forkunion/capabilities.hpp> // `fu::preferred_yield_t`
 
 #include <smashtable/basic_hash_table.hpp> // `st::hash_map`, `st::assume_reserved`
 #include <smashtable/basic_ring.hpp>       // `st::basic_ring`, `st::ring_eviction_t`
@@ -568,6 +572,7 @@ class collection {
     status_t destroy(io_channel_t& channel) noexcept {
         status_t const dropped = tree_.destroy(channel);
         forget_staged_();
+        cache_guard_t const held {cache_claim_};
         cache_.clear();
         return dropped;
     }
@@ -647,6 +652,7 @@ class collection {
 
         if constexpr (!holds_values_inline_k) {
             bool refused = false;
+            cache_guard_t const held {cache_claim_};
             bool const cached = cache_.visit(stored_key, [&](std::span<byte_t const> bytes) noexcept {
                 if (into.size() < bytes.size()) {
                     refused = true;
@@ -661,7 +667,10 @@ class collection {
 
         if (status_t const read = snapshot_t::of(tree_).select(channel, stored_key, into, size); read.failed())
             return read;
-        if constexpr (!holds_values_inline_k) cache_.add(stored_key, std::span<byte_t const> {into.data(), size});
+        if constexpr (!holds_values_inline_k) {
+            cache_guard_t const held {cache_claim_};
+            cache_.add(stored_key, std::span<byte_t const> {into.data(), size});
+        }
         return {};
     }
 
@@ -702,6 +711,7 @@ class collection {
                 continue;
             }
             if constexpr (!holds_values_inline_k) {
+                cache_guard_t const held {cache_claim_};
                 bool const cached = cache_.visit(stored_keys[request], [&](std::span<byte_t const> bytes) noexcept {
                     sink(request, std::uint64_t {0}, bytes);
                 });
@@ -809,6 +819,7 @@ class collection {
         forget_staged_();
 
         // A cached value the flush has just replaced would outrank the run that now carries it.
+        cache_guard_t const held {cache_claim_};
         cache_.clear();
         return {};
     }
@@ -972,6 +983,28 @@ class collection {
         arena_used_ = 0;
     }
 
+    /** Holds @c cache_ for the life of the guard, waiting while another reader visits or fills it. */
+    class cache_guard_t {
+      public:
+        explicit cache_guard_t(std::int32_t& claim) noexcept : claim_(claim) {
+            fu::preferred_atomic_ref<std::int32_t> const word {claim_};
+            std::int32_t expected_free = 0;
+            while (
+                !word.compare_exchange_weak(expected_free, 1, std::memory_order_acquire, std::memory_order_relaxed)) {
+                fu::preferred_yield_t {}(claim_, expected_free, std::size_t {0});
+                expected_free = 0;
+            }
+        }
+        cache_guard_t(cache_guard_t const&) = delete;
+        cache_guard_t& operator=(cache_guard_t const&) = delete;
+        ~cache_guard_t() noexcept {
+            fu::preferred_atomic_ref<std::int32_t> {claim_}.store(0, std::memory_order_release);
+        }
+
+      private:
+        std::int32_t& claim_;
+    };
+
     /**
      *  @brief Lays the staged writes out as one run's key slots and the bytes they locate.
      *  @param[out] key_slots The key slots in ascending order of their keys, as a run takes them.
@@ -1055,6 +1088,9 @@ class collection {
     /** The values of recently read keys, filled by point reads and emptied by a flush. */
     value_cache_t mutable cache_;
 
+    /** Held by whoever visits, fills or empties @c cache_, since readers sharing the collection fill it too. */
+    std::int32_t mutable cache_claim_ = 0;
+
     /** Bytes every value takes, zero for a layout whose values differ in width. */
     stored_value_size_t value_size_ = 0;
 
@@ -1118,10 +1154,13 @@ class collection_scanner {
     collection_scanner(collection_scanner&&) noexcept = default;
     collection_scanner& operator=(collection_scanner&&) noexcept = default;
 
-    /** A scan of @p source positioned on its smallest key, which must outlive the scanner. */
-    static expected<collection_scanner> over(collection_t const& source) noexcept {
+    /** A scan of @p source positioned on its first key not below @p from, where @p source must outlive the scanner. */
+    static expected<collection_scanner> over(collection_t const& source,
+                                             stored_key_t from = limit<stored_key_t>::min()) noexcept {
         collection_scanner scanner;
         if (status_t const listed = source.staged_in_order(scanner.staged_); listed.failed()) return listed;
+        while (scanner.staged_at_ != scanner.staged_.size() && scanner.staged_[scanner.staged_at_].stored_key < from)
+            ++scanner.staged_at_;
         scanner.levels_ = snapshot_t::of(source.tree());
 
         std::size_t runs = 0;
@@ -1136,8 +1175,8 @@ class collection_scanner {
                 run_cursor_t cursor;
                 cursor.level_number = static_cast<std::uint32_t>(number);
                 cursor.run_index = static_cast<std::uint32_t>(index);
-                cursor.position = 0;
                 cursor.population = level.run(index).population_count();
+                cursor.position = lower_bound_(level.run(index), cursor.population, from);
                 [[maybe_unused]] st::status_t const placed = scanner.cursors_.push_back(std::move(cursor));
             }
         }
@@ -1218,6 +1257,20 @@ class collection_scanner {
 #pragma endregion Private Types
 
 #pragma region Private Methods
+
+    /** The first of the @p population sorted positions of @p run whose key is not below @p from. */
+    template <typename run_type_>
+    [[nodiscard]] static std::uint64_t lower_bound_(run_type_ const& run, std::uint64_t population,
+                                                    stored_key_t from) noexcept {
+        std::uint64_t low = 0;
+        std::uint64_t high = population;
+        while (low != high) {
+            std::uint64_t const middle = low + (high - low) / 2;
+            if (run.key_slot(middle).stored_key < from) low = middle + 1;
+            else high = middle;
+        }
+        return low;
+    }
 
     /** The key slot @p cursor sits on, which must not be spent. */
     [[nodiscard]] key_slot_t const& key_slot_at_(run_cursor_t const& cursor) const noexcept {

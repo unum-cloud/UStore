@@ -529,8 +529,14 @@ def test_an_executor_serves_the_memory_domains_named(database):
         ustore.Executor.for_ram(memory_domains=[1 << 20])
     with pytest.raises(ustore.InvalidArgumentError):
         ustore.Executor.on_pool(0)
-    with pytest.raises(ustore.UnsupportedError):
-        ustore.Executor.for_nvme()
+    with (
+        ustore.Executor.for_nvme(1, transport=ustore.Transport.BLOCKING, queue_depth=32) as executor,
+        pytest.raises(ustore.DeviceError),
+    ):
+        ustore.Executor.for_nvme(vram=executor)
+    # A build without CUDA refuses every device, and one with CUDA refuses an ordinal no device carries
+    with pytest.raises((ustore.UnsupportedError, ustore.DeviceError)):
+        ustore.Executor.for_vram([1 << 20])
 
 
 def test_a_database_opens_on_an_executor(engine: str, tmp_path):

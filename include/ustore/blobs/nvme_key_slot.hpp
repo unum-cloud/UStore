@@ -839,7 +839,10 @@ struct storage_limits_t {
     static constexpr std::size_t transaction_write_buffer_elements_max_count_k = write_buffer_elements_max_count_k;
     static constexpr std::size_t first_level_min_capacity_bytes_k = 1024 * 1024;
     static constexpr std::size_t first_level_max_sorted_runs_count_k = 1024;
-    static constexpr std::size_t first_level_compaction_threshold_k = 768;
+
+    /** Runs of level zero that make it due for compaction, as each one is another merge input for every read and
+     *  every scan of the collection, whatever bytes they hold. */
+    static constexpr std::size_t first_level_compaction_threshold_k = 4;
     static constexpr std::size_t level_min_enlarge_factor_k = 2;
     static constexpr std::size_t level_max_enlarge_factor_k = 64;
     static constexpr std::size_t sorted_run_file_max_size_k = 4 * 1024 * 1024 * 1024ull - 4096;

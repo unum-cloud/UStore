@@ -608,9 +608,24 @@ inline void open_engine(engine_options_t const& options, ustore_database_t* data
                                           .executor = executor,
                                           .outcome = outcome,
                                           .completion = completion,
-                                          .directory = directory,
-                                          .transport = static_cast<ustore_transport_t>(options.transport.selected)};
-        return ustore_database_open_nvme(&open);
+                                          .directory = directory};
+        auto const transport = static_cast<ustore_transport_t>(options.transport.selected);
+        if (executor || transport == ustore_transport_automatic_k) return ustore_database_open_nvme(&open);
+
+        // The transport is the placement of an NVMe executor, which the open reads once, so one made for it alone
+        // may go as soon as the open is final
+        ustore_executor_t moving = nullptr;
+        ustore_executor_for_nvme_t spawn {.executor = &moving,
+                                          .outcome = outcome,
+                                          .nvme = {.transport = transport},
+                                          .threads = 1};
+        ustore_executor_for_nvme(&spawn);
+        if (outcome->status != ustore_status_success_k) return;
+        open.executor = moving;
+        open.completion = ustore_completion_blocking_k;
+        ustore_database_open_nvme(&open);
+        ustore_executor_free(moving);
+        return;
     }
     *outcome = {ustore_status_invalid_argument_k, "No engine has that name"};
 }

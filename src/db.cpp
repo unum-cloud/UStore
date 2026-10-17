@@ -54,13 +54,6 @@ constexpr enumerator_spelling<ustore_isolation_t> isolation_names_k[] {
     {ustore_isolation_snapshot_k, "snapshot"},
 };
 
-/** The canonical spelling of every transport. */
-constexpr enumerator_spelling<ustore_transport_t> transport_names_k[] {
-    {ustore_transport_automatic_k, "automatic"},     {ustore_transport_blocking_k, "blocking"},
-    {ustore_transport_linux_uring_k, "linux-uring"}, {ustore_transport_linux_aio_k, "linux-aio"},
-    {ustore_transport_linux_spdk_k, "linux-spdk"},
-};
-
 /** The canonical spelling of every engine. */
 constexpr enumerator_spelling<ustore_engine_t> engine_names_k[] {
     {ustore_engine_ram_k, "ram"},
@@ -107,6 +100,8 @@ template void route_init(ustore_database_view_rocksdb_t*,
                          status_t (*)(ustore_database_view_rocksdb_t const&, view_t const&) noexcept) noexcept;
 template void route_init(ustore_database_open_leveldb_t*,
                          status_t (*)(ustore_database_open_leveldb_t const&, view_t const&) noexcept) noexcept;
+template void route_init(ustore_database_open_nvme_t*,
+                         status_t (*)(ustore_database_open_nvme_t const&, view_t const&) noexcept) noexcept;
 
 } // namespace unum::ustore
 
@@ -144,8 +139,6 @@ char const* ustore_drop_mode_name(ustore_drop_mode_t drop_mode) { return name_in
 ustore_drop_mode_t ustore_drop_mode_from_name(ustore_bytes_view_t name) { return value_in(drop_mode_names_k, name); }
 char const* ustore_isolation_name(ustore_isolation_t isolation) { return name_in(isolation_names_k, isolation); }
 ustore_isolation_t ustore_isolation_from_name(ustore_bytes_view_t name) { return value_in(isolation_names_k, name); }
-char const* ustore_transport_name(ustore_transport_t transport) { return name_in(transport_names_k, transport); }
-ustore_transport_t ustore_transport_from_name(ustore_bytes_view_t name) { return value_in(transport_names_k, name); }
 char const* ustore_engine_name(ustore_engine_t engine) { return name_in(engine_names_k, engine); }
 ustore_engine_t ustore_engine_from_name(ustore_bytes_view_t name) { return value_in(engine_names_k, name); }
 char const* ustore_modality_name(ustore_modality_t modality) { return name_in(modality_names_k, modality); }

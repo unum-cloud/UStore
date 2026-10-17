@@ -43,10 +43,6 @@ constexpr std::size_t worker_threads_k = 4;
 /** The numbers every case mounts with: three channels for the stack and one for every worker thread. */
 constexpr fixture_config_t stress_config_k {.shared_io_channels = 3 + worker_threads_k + 1};
 
-/** Why the io_uring transports skip: a write path moving between threads rebinds the writing ring, and the engine
- *  then submits on a ring still bound to the thread before or has the kernel refuse the ring rebuilt. */
-constexpr char const* rebinding_ring_reason_k = "the write path cannot move between threads on io_uring yet";
-
 /** The seed every worker's generator is forked from. */
 constexpr std::uint64_t seed_k = 42;
 
@@ -467,15 +463,8 @@ int main(int argc, char const* argv[]) {
         report(totals, mount, "chunks_land_whole", chunks_land_whole);
         report(totals, mount, "replay_in_commit_order", transactions_replay_in_commit_order);
     };
-    for (transport_t const transport : every_transport_k) {
-        if (transport == transport_t::linux_uring_k || transport == transport_t::device_k) {
-            case_label_t const label {"scdb_transaction_stress", name_of(transport)};
-            if (totals.selects(label.c_str()))
-                report(totals, label.c_str(), case_result_t::skipped(rebinding_ring_reason_k));
-            continue;
-        }
+    for (transport_t const transport : every_transport_k)
         run_on_transport(totals, transport, environment, stress_config_k, 1, "scdb_transaction_stress", cases);
-    }
 
     return suite_exit_code(totals);
 }

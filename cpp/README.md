@@ -333,7 +333,7 @@ expected<commit_stamp_t> stamp = deferred_transaction.commit().wait();
 ```
 
 The deferred database also creates, drops and lists collections, and describes, clears and compacts itself, while the deferred snapshot saves itself through `save`.
-Opening blocks instead, as every constructor does: `init_ram`, `open_ram`, `open_rocksdb`, `view_rocksdb` and `open_leveldb` take the executor to block on as their last argument, while `open_nvme` lends the engine the executor its options name until close:
+Opening blocks instead, as every constructor does: `init_ram`, `open_ram`, `open_rocksdb`, `view_rocksdb` and `open_leveldb` take the executor to block on as their last argument, while `open_nvme` blocks on the executor its options name and reads how to move bytes from it once:
 
 ```cpp
 expected<database_t> opened = database_t::open_rocksdb({.directory = bytes_of("/var/lib/ustore")}, executor);

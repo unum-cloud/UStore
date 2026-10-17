@@ -54,7 +54,7 @@ Pin a commit, not a version, when building on them.
   - `page_fold.hpp`: `page_fold`, which applies chains of edits in commit order into a page's current shape, and composes them without a base where that is sound.
   - `markup.hpp`: XML and text import and render, and XPath reads through StringZilla's subdocuments engine.
 - `strings/`, in `unum::ustore::strings`:
-  - `string_keys.hpp`: `string_key_t`, the owned key of a strings collection and of a collection's name, with its order and hash.
+  - `string_keys.hpp`: `string_key_t`, the owned key of a strings collection and of a collection's name, with its order and hash, and the buckets an engine of 16-byte keys files strings in: `bucket_key_of`, `bucket_window_of`, `bucket_view_t` and `write_bucket`.
 
 ## Building
 

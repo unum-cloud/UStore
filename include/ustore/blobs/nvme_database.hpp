@@ -1879,6 +1879,18 @@ class database_transaction {
     }
 
     /**
+     *  @brief Hands back the write path a stage took, keeping every write and every watch, so the next stage or
+     *      commit checks them all again.
+     *
+     *  @note A staged transaction holds the database's one claim, which every other call of the database waits for,
+     *      so a caller that only wants a stage's verdict lets the path go at once.
+     */
+    void unstage() noexcept {
+        if (phase_ == phase_t::staged_k) manager_.discard_(id_);
+        phase_ = phase_t::started_k;
+    }
+
+    /**
      *  @brief Starts over from this moment while keeping the writes, which only a write-only transaction may.
      *  @return @c invalid_argument_k when the transaction has read anything, whose watches cannot move.
      */
@@ -2016,6 +2028,26 @@ class database_transaction {
         status_t const staged = select_uncommitted(id, stored_key, into, size);
         if (staged.succeeded()) return staged;
         return select_committed<watch_schedule_>(id, stored_key, into, size);
+    }
+
+    /** What this transaction's own buffer did to @p stored_key of @p id: wrote it, removed it, or neither. */
+    [[nodiscard]] write_buffer_status_t uncommitted(collection_id_t collection_id,
+                                                    stored_key_t stored_key) const noexcept {
+        return data_.changes.status(collection_id, stored_key);
+    }
+
+    /** Hands @p callback every key this transaction wrote into @p collection_id, in no order, as
+     *  @c callback(stored_key, status, size), the status telling a write from a removal. */
+    template <typename callback_type_>
+    void for_each_uncommitted(collection_id_t collection_id, callback_type_&& callback) const noexcept {
+        auto const group = data_.changes.groups_by_id.find(collection_id);
+        if (group == data_.changes.groups_by_id.end()) return;
+        [[maybe_unused]] st::status_t const walked = group.value().stored_values.for_each(
+            [&](auto const& entry) noexcept {
+                if (entry.value().offset == tombstone_offset_k)
+                    callback(entry.key(), write_buffer_status_t::removed_k, stored_value_size_t {0});
+                else callback(entry.key(), write_buffer_status_t::found_k, entry.value().size);
+            });
     }
 
     /** Whether this transaction's own buffer carries @p stored_key of @p id. */
@@ -2728,6 +2760,33 @@ class basic_database {
             found->held);
     }
 
+    /**
+     *  @brief Hands @p visitor every key of @p id from @p from up in ascending order, staged writes included.
+     *  @param[in] id The collection to walk, named by its ID or by its name.
+     *  @param[in] from The smallest key the walk reports, which need not be in the collection.
+     *  @param[in] visitor Called as @c visitor(stored_key, state, size) for the newest version of every key, erasures
+     *      included, answering whether the walk carries on.
+     *
+     *  @note The walk holds the database's claim, so @p visitor calls nothing of this database.
+     */
+    template <typename visitor_type_>
+    status_t scan(any_collection_id_t const& id, stored_key_t from, visitor_type_&& visitor) const noexcept {
+        [[maybe_unused]] claim_guard_t const held {claim_};
+        collection_entry_t const* const found = entry_at_in_(claimed_catalog_(), id);
+        if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
+        return std::visit(
+            [&](auto const& collection) noexcept -> status_t {
+                using scanner_t =
+                    collection_scanner<typename std::remove_cvref_t<decltype(collection)>::key_slot_t, volume_t>;
+                auto [scanner, over_status] = scanner_t::over(collection, from);
+                if (over_status.failed()) return over_status;
+                for (; !scanner.reached_end(); scanner.advance())
+                    if (!visitor(scanner.stored_key(), scanner.state(), scanner.size())) break;
+                return {};
+            },
+            found->held);
+    }
+
 #pragma endregion Lookups
 
 #pragma region Writes
@@ -2800,6 +2859,16 @@ class basic_database {
         // Every run the flushes wrote is sealed by now, so the catalog may name them.
         if (status_t const saved = save_schema_(claimed->channel()); saved.failed() && first.succeeded()) first = saved;
         return first;
+    }
+
+    /** Whether any collection has a level over its bounds, which @c compact then merges. */
+    [[nodiscard]] bool needs_compaction() const noexcept {
+        [[maybe_unused]] claim_guard_t const held {claim_};
+        for (std::size_t index = 0; index != collections_.size(); ++index)
+            if (std::visit([](auto const& collection) noexcept { return collection.needs_compaction(); },
+                           collections_[index]->held))
+                return true;
+        return false;
     }
 
     /** Merges one overfull level of every collection that has one, which needs two channels at once. */
@@ -4476,6 +4545,7 @@ class basic_single_collection_database {
     /** Writes whatever is still staged onto the volume and names every run, so the data outlives this. */
     ~basic_single_collection_database() noexcept {
         write_path_guard_t const held {*this};
+        if (held.adopted().failed()) return;
         [[maybe_unused]] status_t const flushed = collection_.flush(writing_channel_);
         // A destroyed database dropped its schema, and a close must not write one back over an empty volume.
         if (!volume_.names(schema_blob_name_())) return;

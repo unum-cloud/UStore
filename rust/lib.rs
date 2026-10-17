@@ -205,7 +205,7 @@ pub use blobs::{Cursor, Entry, Measurement, Page, Values};
 pub use collection::{Blobs, Collection, Docs, Graph, Sample};
 pub use db::{
     key_unknown, version, Arena, Blocking, CollectionID, Collections, CommitStamp, DataDirectory, Database, Deferred,
-    DeferredView, Deferring, Description, DropMode, Durability, Engine, Error, Executor, Isolation, Key,
+    DeferredView, Deferring, Description, DropMode, Durability, Engine, Error, Executor, IOOptions, Isolation, Key,
     LevelDBOptions, Modality, Mood, NVMEOptions, ProgressCallback, RAMOptions, ReadStamp, Result, RocksDBOptions,
     Snapshot, Status, Tape, Transaction, Transport, View, Wait, Watch, UUID,
 };

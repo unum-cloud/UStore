@@ -539,7 +539,7 @@ using deferred_arguments_t = std::variant<
     ustore_strings_remove_t, ustore_strings_read_t, ustore_strings_scan_t, ustore_blobs_cursor_next_t,
     ustore_strings_cursor_next_t, routed_init<ustore_database_init_ram_t>, routed_init<ustore_database_open_ram_t>,
     routed_init<ustore_database_open_rocksdb_t>, routed_init<ustore_database_view_rocksdb_t>,
-    routed_init<ustore_database_open_leveldb_t>>;
+    routed_init<ustore_database_open_leveldb_t>, routed_init<ustore_database_open_nvme_t>>;
 
 /** What a deferred call leaves its driver, which publishes it once the call's table position is free again. */
 struct deferred_result_t {
@@ -640,6 +640,21 @@ struct call_executor_t {
 
     /** The memory domain every arena it makes lives on, the first one it serves. */
     fu_memory_domain_id_t memory_domain = 0;
+
+    /** Whether @c ustore_executor_for_nvme made it, so the databases it opens read @c nvme and @c vram. */
+    bool moves_nvme = false;
+
+    /** On an NVMe executor, how the databases it opens move bytes. */
+    ustore_nvme_options_t nvme {};
+
+    /** On an NVMe executor, the VRAM executor its databases compact on, borrowed, or null. */
+    call_executor_t const* vram = nullptr;
+
+    /** On a VRAM executor, the CUDA ordinals it computes on. */
+    st::basic_vector<std::int32_t> devices;
+
+    /** On a VRAM executor, the bytes of device memory its scratch may take on each device. */
+    std::size_t scratch_limit = 0;
 };
 
 #pragma endregion Executors
@@ -939,6 +954,8 @@ void route(arguments_type_* arguments) noexcept {
 template <typename arguments_type_>
 void route_init(arguments_type_* arguments, status_t (*open)(arguments_type_ const&, view_t const&) noexcept) noexcept {
     if (arguments->database) *arguments->database = nullptr;
+    if (residency_of(arguments->executor) != residency_t::host_k)
+        return finish(*arguments->outcome, {status_code_t::device_k, "No engine places a database in device memory"});
     routed_init<arguments_type_> call {*arguments, open};
     dispatch<routed_init<arguments_type_>, &serve_open<arguments_type_>>(&call);
 }

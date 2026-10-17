@@ -249,9 +249,15 @@ class executor_handle_t {
         return make_(ustore_executor_on_pool, options);
     }
 
-    /** Spawns threads for the NVMe engine, each owning its own I/O ring. */
+    /** Spawns threads for the NVMe engine, each owning its own I/O ring, which tell the databases opened on them how
+     *  to move bytes and borrow the VRAM executor @p options name for compactions. */
     static expected<executor_handle_t> for_nvme(ustore_executor_for_nvme_t options = {}) noexcept {
         return make_(ustore_executor_for_nvme, options);
+    }
+
+    /** Spawns one host thread driving each CUDA device @p options name, which an NVMe executor compacts on. */
+    static expected<executor_handle_t> for_vram(ustore_executor_for_vram_t options = {}) noexcept {
+        return make_(ustore_executor_for_vram, options);
     }
 
     /** Waits for every call submitted before the drain, leaving the threads in @p mood whenever they go idle. */

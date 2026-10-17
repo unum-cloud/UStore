@@ -193,26 +193,6 @@ typedef enum ustore_isolation_t {
 
 } ustore_isolation_t;
 
-/** How the NVMe engine moves bytes between its files and memory. */
-typedef enum ustore_transport_t {
-
-    /** io_uring where the kernel offers it, Linux AIO where it offers only that, and blocking calls elsewhere. */
-    ustore_transport_automatic_k = 0,
-
-    /** Positioned reads and writes that block the polling thread, which every platform has. */
-    ustore_transport_blocking_k = 1,
-
-    /** io_uring on unbuffered files, refused where the kernel creates no ring. */
-    ustore_transport_linux_uring_k = 2,
-
-    /** Linux AIO on unbuffered files. */
-    ustore_transport_linux_aio_k = 3,
-
-    /** SPDK's user-space driver on NVMe devices the process owns. */
-    ustore_transport_linux_spdk_k = 4,
-
-} ustore_transport_t;
-
 /** The engine serving a database, as @c ustore_database_describe reports it. */
 typedef enum ustore_engine_t {
 
@@ -394,9 +374,9 @@ typedef struct ustore_database_open_nvme_t {
     /** Output for the opened database, left @c NULL on failure. */
     ustore_database_t* database;
 
-    /** Executor that runs the call, then the background flushes and compactions, made by
-     *  @c ustore_executor_for_nvme and borrowed until the database closes, where @c NULL spawns one with that
-     *  call's defaults. */
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. The database moves bytes as the
+     *  placement of one made by @c ustore_executor_for_nvme names, read once here, and with that call's defaults for
+     *  any other executor and for none. */
     ustore_executor_t executor;
 
     /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
@@ -414,38 +394,8 @@ typedef struct ustore_database_open_nvme_t {
     /** Entries of @c data_directories. */
     ustore_size_t data_directories_count;
 
-    /** How bytes move between the files and memory. */
-    ustore_transport_t transport;
-
     /** Bytes of host memory the engine may pin and cache. */
     ustore_size_t memory_limit;
-
-    /** CUDA devices compaction may run on, or null for none. */
-    int const* gpu_devices;
-
-    /** Entries of @c gpu_devices. */
-    ustore_size_t gpu_devices_count;
-
-    /** Bytes of device memory compaction may take on each of @c gpu_devices. */
-    ustore_size_t gpu_memory_limit;
-
-    /** I/O channels the threads share beyond their own. */
-    ustore_size_t shared_io_channels;
-
-    /** Submissions a channel holds at once. */
-    ustore_size_t queue_depth;
-
-    /** Bytes of each request buffer of a channel. */
-    ustore_size_t request_buffer_bytes;
-
-    /** Request buffers of each channel. */
-    ustore_size_t request_buffers_count;
-
-    /** Bytes of each streaming buffer of a channel. */
-    ustore_size_t stream_buffer_bytes;
-
-    /** Streaming buffers of each channel. */
-    ustore_size_t stream_buffers_count;
 
     /** Bytes a transaction may buffer before it must commit. */
     ustore_size_t transaction_max_bytes;
@@ -724,13 +674,6 @@ USTORE_EXPORT char const* ustore_isolation_name(ustore_isolation_t isolation);
 
 /** Reads an isolation back from its canonical spelling; @c ustore_isolation_strict_serializable_k when unrecognized. */
 USTORE_EXPORT ustore_isolation_t ustore_isolation_from_name(ustore_bytes_view_t name);
-
-/** The canonical spelling of a transport, as @c ustore_transport_linux_uring_k spells "linux-uring", or
- *  "unrecognized". */
-USTORE_EXPORT char const* ustore_transport_name(ustore_transport_t transport);
-
-/** Reads a transport back from its canonical spelling; @c ustore_transport_automatic_k when unrecognized. */
-USTORE_EXPORT ustore_transport_t ustore_transport_from_name(ustore_bytes_view_t name);
 
 /** The canonical spelling of an engine, as @c ustore_engine_rocksdb_k spells "rocksdb", or "unrecognized". */
 USTORE_EXPORT char const* ustore_engine_name(ustore_engine_t engine);

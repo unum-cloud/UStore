@@ -24,9 +24,19 @@
 
 #include "ustore/types.h" // `ustore_executor_for_ram_t`, `ustore_arena_init_t`, `ustore_version`
 
+#if USTORE_WITH_CUDA
+#include "ustore/utilities/vram_nvidia_device.hpp" // `cuda_count_devices`
+#endif
+
 #include "lib.hpp" // `call_executor_t`, `finish`, `run_as`, `wait_finished`, `enumerator_spelling`
 
 namespace unum::ustore {
+
+#if USTORE_WITH_CUDA
+
+/** Bytes of device memory a VRAM executor's scratch takes on each device when its creation names none. */
+constexpr std::size_t vram_scratch_limit_default_k = std::size_t {256} << 20;
+#endif
 
 /** The canonical spelling of every status, indexed by its value. */
 constexpr std::array<std::string_view, ustore_status_read_only_k + 1> status_names_k {
@@ -55,6 +65,13 @@ constexpr std::array<std::string_view, ustore_status_read_only_k + 1> status_nam
 constexpr enumerator_spelling<ustore_mood_t> mood_names_k[] {
     {ustore_mood_parked_k, "parked"},
     {ustore_mood_spinning_k, "spinning"},
+};
+
+/** The canonical spelling of every transport. */
+constexpr enumerator_spelling<ustore_transport_t> transport_names_k[] {
+    {ustore_transport_automatic_k, "automatic"},     {ustore_transport_blocking_k, "blocking"},
+    {ustore_transport_linux_uring_k, "linux-uring"}, {ustore_transport_linux_aio_k, "linux-aio"},
+    {ustore_transport_linux_spdk_k, "linux-spdk"},
 };
 
 /** The version as "major.minor.patch", spelled from the version macros at compile time. */
@@ -190,6 +207,18 @@ std::size_t cores_near(topology_t const& topology, std::span<fu_memory_domain_id
     return cores;
 }
 
+nvme_placement_t nvme_placement_of(ustore_executor_t executor) noexcept {
+    nvme_placement_t placement;
+    if (!executor || !executor->moves_nvme) return placement;
+    placement.nvme = executor->nvme;
+    placement.threads = view_of(executor->pool).threads_count();
+    if (call_executor_t const* const vram = executor->vram) {
+        placement.devices = std::span<std::int32_t const> {vram->devices};
+        placement.scratch_limit = vram->scratch_limit;
+    }
+    return placement;
+}
+
 } // namespace unum::ustore
 
 /** Makes in @p made the executor running calls on @p pool, with its driver and a table of @p deferred_limit calls,
@@ -262,6 +291,8 @@ ustore_status_t ustore_status_from_name(ustore_bytes_view_t name) {
 
 char const* ustore_mood_name(ustore_mood_t mood) { return name_in(mood_names_k, mood); }
 ustore_mood_t ustore_mood_from_name(ustore_bytes_view_t name) { return value_in(mood_names_k, name); }
+char const* ustore_transport_name(ustore_transport_t transport) { return name_in(transport_names_k, transport); }
+ustore_transport_t ustore_transport_from_name(ustore_bytes_view_t name) { return value_in(transport_names_k, name); }
 
 void ustore_version(int* major, int* minor, int* patch) {
     *major = USTORE_VERSION_MAJOR;
@@ -312,9 +343,83 @@ void ustore_executor_on_pool(ustore_executor_on_pool_t* arguments) {
     finish(outcome, make_executor(*pool, *topology, domains, arguments->deferred_limit, *arguments->executor));
 }
 
+/** Makes in @p made an executor of @p threads host threads spread over the whole machine, as the NVMe and VRAM
+ *  executors take, whose scratch lives near each thread. */
+static status_t spawn_across_machine(std::size_t threads, std::size_t deferred_limit,
+                                     ustore_executor_t& made) noexcept {
+    st::expected<topology_t> topology = topology_t::make();
+    if (!topology) return pool_failure(topology.status());
+    st::basic_vector<fu_memory_domain_id_t> domains;
+    if (status_t const status = read_memory_domains({}, *topology, domains); status.failed()) return status;
+    if (!executor_t::spawns_threads()) {
+        if (threads > 1) return {status_code_t::unsupported_k, "This build spawns no threads"};
+        threads = 1;
+    }
+    st::expected<executor_t> pool = executor_t::make(*topology, threads, spawned_exclusivity());
+    if (!pool) return pool_failure(pool.status());
+    return make_executor(std::move(*pool), *topology, domains, deferred_limit, made);
+}
+
 void ustore_executor_for_nvme(ustore_executor_for_nvme_t* arguments) {
-    clear(arguments->executor);
-    finish(*arguments->outcome, {status_code_t::unsupported_k, "This build has no NVMe executor"});
+    ustore_outcome_t& outcome = *arguments->outcome;
+    if (!arguments->executor)
+        return finish(outcome, {status_code_t::invalid_argument_k, "The call needs an output for the executor"});
+    *arguments->executor = nullptr;
+    if (arguments->nvme.transport > ustore_transport_linux_spdk_k)
+        return finish(outcome, {status_code_t::invalid_argument_k, "Unknown transport"});
+    ustore_executor_handle_t const* const vram = arguments->vram;
+    if (vram && vram->residency != residency_t::vram_k)
+        return finish(outcome,
+                      {status_code_t::device_k, "The compactions need an executor of ustore_executor_for_vram"});
+    std::size_t threads = arguments->threads;
+    // Every thread pins a channel of 12 MB by default, so the derived count stays as low as the NVMe mount keeps its
+    // own
+    if (!threads)
+        if (st::expected<std::size_t> const cores = executor_t::logical_cores_count(); cores)
+            threads = std::clamp<std::size_t>(*cores / 2, 1, 8);
+    ustore_executor_t made = nullptr;
+    if (status_t const status = spawn_across_machine(std::max<std::size_t>(threads, 1), arguments->deferred_limit,
+                                                     made);
+        status.failed())
+        return finish(outcome, status);
+    made->moves_nvme = true;
+    made->nvme = arguments->nvme;
+    made->vram = vram;
+    *arguments->executor = made;
+    finish(outcome, {});
+}
+
+void ustore_executor_for_vram(ustore_executor_for_vram_t* arguments) {
+    ustore_outcome_t& outcome = *arguments->outcome;
+    if (!arguments->executor)
+        return finish(outcome, {status_code_t::invalid_argument_k, "The call needs an output for the executor"});
+    *arguments->executor = nullptr;
+#if USTORE_WITH_CUDA
+    st::expected<std::size_t> const visible = cuda_count_devices();
+    if (!visible) return finish(outcome, {status_code_t::device_k, "The CUDA runtime counts no devices"});
+    if (*visible == 0) return finish(outcome, {status_code_t::device_k, "No CUDA device is visible"});
+    bool const derived = !arguments->devices || !arguments->devices_count;
+    std::size_t const count = derived ? *visible : static_cast<std::size_t>(arguments->devices_count);
+    st::basic_vector<std::int32_t> devices;
+    if (st::failed(devices.resize(count)))
+        return finish(outcome, {status_code_t::out_of_memory_k, "Failed to copy the devices"});
+    for (std::size_t index = 0; index != count; ++index) {
+        std::int32_t const ordinal = derived ? static_cast<std::int32_t>(index) : arguments->devices[index];
+        if (ordinal < 0 || static_cast<std::size_t>(ordinal) >= *visible)
+            return finish(outcome, {status_code_t::device_k, "No CUDA device carries the ordinal"});
+        devices[index] = ordinal;
+    }
+    ustore_executor_t made = nullptr;
+    if (status_t const status = spawn_across_machine(count, arguments->deferred_limit, made); status.failed())
+        return finish(outcome, status);
+    made->residency = residency_t::vram_k;
+    made->devices = std::move(devices);
+    made->scratch_limit = arguments->scratch_limit ? arguments->scratch_limit : vram_scratch_limit_default_k;
+    *arguments->executor = made;
+    finish(outcome, {});
+#else
+    finish(outcome, {status_code_t::unsupported_k, "This build carries no CUDA devices"});
+#endif
 }
 
 void ustore_executor_drain(ustore_executor_drain_t* arguments) {
@@ -351,7 +456,9 @@ void ustore_arena_init(ustore_arena_init_t* arguments) {
     if (!arguments->arena)
         return finish(outcome, {status_code_t::invalid_argument_k, "The call needs an output for the arena"});
     *arguments->arena = nullptr;
-    // Every residency this build computes in places its arenas on host pages, which the first call allocates
+    if (residency_of(arguments->executor) == residency_t::vram_k)
+        return finish(outcome, {status_code_t::unsupported_k, "No engine writes outputs into device memory yet"});
+    // Every residency an engine computes in places its arenas on host pages, which the first call allocates
     ustore_arena_t const arena = new (std::nothrow) ustore_arena_handle_t {};
     if (!arena) return finish(outcome, {status_code_t::out_of_memory_k, "Failed to allocate the arena"});
     arena->residency = residency_of(arguments->executor);

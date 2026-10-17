@@ -424,9 +424,28 @@ class Executor:
         the executor. Calls `ustore_executor_on_pool`."""
 
     @classmethod
-    def for_nvme(cls, threads: int = 0, *, deferred_limit: int = 0) -> Self:
-        """Threads each driving an I/O ring for the NVMe engine, refused with `UnsupportedError` until that engine
-        builds again. Calls `ustore_executor_for_nvme`."""
+    def for_nvme(
+        cls,
+        threads: int = 0,
+        *,
+        transport: Transport = Transport.AUTOMATIC,
+        vram: Executor | None = None,
+        deferred_limit: int = 0,
+        shared_io_channels: int = 0,
+        queue_depth: int = 0,
+        request_buffer_bytes: int = 0,
+        request_buffers_count: int = 0,
+        stream_buffer_bytes: int = 0,
+        stream_buffers_count: int = 0,
+    ) -> Self:
+        """Threads each driving an I/O ring for the NVMe engine, telling every database `Database.open_nvme` opens on
+        it how to move bytes, where every zero size keeps the engine's default, and compacting on the devices of
+        `vram`, which it keeps until it closes. Calls `ustore_executor_for_nvme`."""
+
+    @classmethod
+    def for_vram(cls, devices: Sequence[int] | None = None, *, scratch_limit: int = 0, deferred_limit: int = 0) -> Self:
+        """Host threads driving the CUDA `devices`, every visible one for None, which an NVMe executor compacts on,
+        refused with `UnsupportedError` in a build without CUDA. Calls `ustore_executor_for_vram`."""
 
     def drain(self, mood: Mood = Mood.PARKED) -> None:
         """Waits for every call submitted before the drain began, setting what the threads do once idle."""
@@ -734,17 +753,9 @@ class Database(_Writes, _Receivers):
         cls,
         directory: PathLikeOrStr,
         *,
+        executor: Executor | None = None,
         data_directories: Sequence[DataDirectory] = (),
-        transport: Transport = Transport.AUTOMATIC,
-        gpu_devices: Sequence[int] = (),
         memory_limit: int = 0,
-        gpu_memory_limit: int = 0,
-        shared_io_channels: int = 0,
-        queue_depth: int = 0,
-        request_buffer_bytes: int = 0,
-        request_buffers_count: int = 0,
-        stream_buffer_bytes: int = 0,
-        stream_buffers_count: int = 0,
         transaction_max_bytes: int = 0,
         transaction_max_elements: int = 0,
         collection_concurrency_limit: int = 0,
@@ -756,8 +767,8 @@ class Database(_Writes, _Receivers):
         collection_value_size: int = 0,
         collection_value_max_size: int = 0,
     ) -> Self:
-        """A database on the NVMe engine, where every zero size keeps the engine's default, opened on the calling
-        thread while the engine spawns the I/O executor it keeps."""
+        """A database on the NVMe engine, where every zero size keeps the engine's default, opened blocking on
+        `executor`, which tells it how to move bytes when `Executor.for_nvme` made it."""
     def __enter__(self) -> Self: ...
     def __exit__(
         self,

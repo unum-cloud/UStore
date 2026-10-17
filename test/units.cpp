@@ -3003,8 +3003,6 @@ case_result_t executor_deferred_strings(config_t const& config) {
 /** A database opened blocking on an executor keeps a write, and a deferred init submitted behind an unfinished call
  *  stays deferred until that call finishes, then opens the database holding that write. */
 case_result_t executor_deferred_open(config_t const& config) {
-    std::string_view const engine = config.engine();
-    if (engine == "nvme") return case_result_t::skipped("the NVMe init borrows its executor until close");
     if (!config.directory()) return case_result_t::skipped(needs_directory_k);
     std::size_t failures = 0;
     auto [executor, executor_status] = executor_handle_t::for_ram({.threads = 2});

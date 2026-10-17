@@ -7,10 +7,12 @@
 
 #pragma once
 
-#include <cstdint> // `std::uint8_t`, `std::uint32_t`
+#include <cstddef> // `std::size_t`
+#include <cstdint> // `std::int32_t`, `std::uint8_t`, `std::uint32_t`
 #include <cstring> // `std::memcpy`
 
 #include <new>         // `std::bad_alloc`
+#include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 
 #include "ustore/blobs.h"   // `ustore_blobs_read_t`, `ustore_blobs_write_t` and the other binary calls
@@ -162,8 +164,8 @@ ustore_database_t database_of(arguments_type_ const& arguments) noexcept {
  *      blocking on their executor, or submitted to it, served by the engine's @p open, since no handle names the
  *      engine yet.
  *
- *  Defined for the inits, opens and views of the in-memory, RocksDB and LevelDB engines, each of which hands in its own
- *  @p open, so a program still links only the engines it opens.
+ *  Defined for the inits, opens and views of the in-memory, RocksDB, LevelDB and NVMe engines, each of which hands in
+ *  its own @p open, so a program still links only the engines it opens.
  */
 template <typename arguments_type_>
 void route_init(arguments_type_* arguments, status_t (*open)(arguments_type_ const&, view_t const&) noexcept) noexcept;
@@ -199,6 +201,26 @@ status_t pages_read_in_page_values(ustore_pages_read_t const&, view_t const&) no
 
 /** Mints a UUIDv7 for a new collection, refusing when the system gives no entropy. */
 expected<ustore_collection_id_t> mint_collection_id() noexcept;
+
+/** What an executor tells the NVMe databases it opens: how they move bytes and where they compact. */
+struct nvme_placement_t {
+
+    /** How the databases move bytes, zeroed for the engine's defaults. */
+    ustore_nvme_options_t nvme {};
+
+    /** Threads the executor runs, each keeping an I/O channel of its own, or zero for the engine's default. */
+    std::size_t threads = 0;
+
+    /** CUDA ordinals compactions run on, viewing the VRAM executor the NVMe executor borrows, or empty. */
+    std::span<std::int32_t const> devices {};
+
+    /** Bytes of device memory compactions may take on each of @c devices. */
+    std::size_t scratch_limit = 0;
+};
+
+/** The placement @p executor carries when @c ustore_executor_for_nvme made it, and the defaults for any other and for
+ *  none. */
+nvme_placement_t nvme_placement_of(ustore_executor_t executor) noexcept;
 
 /** The C ABI's opaque spelling of @p handle, which @c handle_cast turns back into the engine's own handle. */
 template <typename c_handle_type_>

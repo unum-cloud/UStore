@@ -508,6 +508,65 @@ typedef struct ustore_executor_on_pool_t {
  */
 USTORE_EXPORT void ustore_executor_on_pool(ustore_executor_on_pool_t* arguments);
 
+/** How the NVMe engine moves bytes between its files and memory. */
+typedef enum ustore_transport_t {
+
+    /** io_uring where the kernel offers it, Linux AIO where it offers only that, and blocking calls elsewhere. */
+    ustore_transport_automatic_k = 0,
+
+    /** Positioned reads and writes that block the polling thread, which every platform has. */
+    ustore_transport_blocking_k = 1,
+
+    /** io_uring on unbuffered files, refused where the kernel creates no ring. */
+    ustore_transport_linux_uring_k = 2,
+
+    /** Linux AIO on unbuffered files. */
+    ustore_transport_linux_aio_k = 3,
+
+    /** SPDK's user-space driver on NVMe devices the process owns. */
+    ustore_transport_linux_spdk_k = 4,
+
+} ustore_transport_t;
+
+/** The canonical spelling of a transport, as @c ustore_transport_linux_uring_k spells "linux-uring", or
+ *  "unrecognized". */
+USTORE_EXPORT char const* ustore_transport_name(ustore_transport_t transport);
+
+/** Reads a transport back from its canonical spelling; @c ustore_transport_automatic_k when unrecognized. */
+USTORE_EXPORT ustore_transport_t ustore_transport_from_name(ustore_bytes_view_t name);
+
+/**
+ *  @brief How the threads of an NVMe executor move bytes between the drives and memory, where every zero size or count
+ *      keeps the engine's default.
+ *
+ *  Every thread of the executor keeps a channel of its own, and the threads outside it share @c shared_io_channels
+ *  more. A channel is one queue pair of @c queue_depth submissions over pinned request and streaming buffers.
+ */
+typedef struct ustore_nvme_options_t {
+
+    /** How bytes move between the files and memory. */
+    ustore_transport_t transport;
+
+    /** I/O channels the threads outside the executor share. */
+    ustore_size_t shared_io_channels;
+
+    /** Submissions a channel holds at once. */
+    ustore_size_t queue_depth;
+
+    /** Bytes of each request buffer of a channel. */
+    ustore_size_t request_buffer_bytes;
+
+    /** Request buffers of each channel. */
+    ustore_size_t request_buffers_count;
+
+    /** Bytes of each streaming buffer of a channel. */
+    ustore_size_t stream_buffer_bytes;
+
+    /** Streaming buffers of each channel. */
+    ustore_size_t stream_buffers_count;
+
+} ustore_nvme_options_t;
+
 /** The arguments of @c ustore_executor_for_nvme. */
 typedef struct ustore_executor_for_nvme_t {
 
@@ -516,6 +575,13 @@ typedef struct ustore_executor_for_nvme_t {
 
     /** Output for the outcome, final on return. */
     ustore_outcome_t* outcome;
+
+    /** How the databases it opens move bytes; copied, not borrowed. */
+    ustore_nvme_options_t nvme;
+
+    /** Executor of @c ustore_executor_for_vram whose devices the compactions of the databases it opens run on,
+     *  borrowed until this executor is freed, where @c NULL compacts on host threads. */
+    ustore_executor_t vram;
 
     /** Threads to spawn, each owning one submission ring, where zero derives them from the cores. */
     ustore_size_t threads;
@@ -528,8 +594,46 @@ typedef struct ustore_executor_for_nvme_t {
 /**
  *  @brief Creates an executor for the NVMe engine, whose every thread submits and polls its own I/O ring.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  A database @c ustore_database_open_nvme opens on it moves bytes as @c nvme names, which the open reads once, so the
+ *  executor may be freed before the databases it opened.
  */
 USTORE_EXPORT void ustore_executor_for_nvme(ustore_executor_for_nvme_t* arguments);
+
+/** The arguments of @c ustore_executor_for_vram. */
+typedef struct ustore_executor_for_vram_t {
+
+    /** Output for the new executor, which the caller frees with @c ustore_executor_free; @c NULL on failure. */
+    ustore_executor_t* executor;
+
+    /** Output for the outcome, final on return. */
+    ustore_outcome_t* outcome;
+
+    /** CUDA ordinals of the devices the executor computes on, copied by the call, where @c NULL takes every visible
+     *  device, and an ordinal no device carries is refused with @c ustore_status_device_k. */
+    int32_t const* devices;
+
+    /** Entries of @c devices, where zero takes every visible device as @c NULL does. */
+    ustore_size_t devices_count;
+
+    /** Bytes of device memory the executor's scratch and staging may take on each device, where zero takes a
+     *  default of 256 MiB. */
+    ustore_size_t scratch_limit;
+
+    /** Deferred calls the executor holds at once, sizing its deferred table, where zero takes a default. */
+    ustore_size_t deferred_limit;
+
+} ustore_executor_for_vram_t;
+
+/**
+ *  @brief Creates an executor of CUDA devices, one host thread driving each, or reports @c ustore_status_unsupported_k
+ *      in a library built without CUDA and @c ustore_status_device_k on a machine without a device.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  No engine places a database in VRAM yet, so a call it runs and an arena it makes are refused with
+ *  @c ustore_status_device_k and @c ustore_status_unsupported_k; an NVMe executor borrows it for compactions.
+ */
+USTORE_EXPORT void ustore_executor_for_vram(ustore_executor_for_vram_t* arguments);
 
 /** The arguments of @c ustore_executor_drain. */
 typedef struct ustore_executor_drain_t {

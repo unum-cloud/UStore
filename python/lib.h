@@ -286,6 +286,9 @@ typedef struct Executor {
 
     /** The executor, or NULL once it has been closed. */
     ustore_executor_t handle;
+
+    /** The executor this one borrows, as an NVMe one borrows a VRAM one, released once this one closes, or NULL. */
+    PyObject* borrowed;
 } Executor;
 
 /**
