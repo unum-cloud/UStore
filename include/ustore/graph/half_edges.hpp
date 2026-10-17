@@ -1,82 +1,20 @@
 /**
- *  @file src/ram/key.hpp
+ *  @file include/ustore/graph/half_edges.hpp
  *  @author Ash Vardanian
  *  @date September 15, 2026
- *  @brief The keys the stores of the RAM engine file their entries under, with their orders and hashes.
+ *  @brief Half-edges, the entries a graph collection files every vertex and both ends of every edge under, with
+ *      their order and hash.
  */
 
 #pragma once
 
 #include <cstddef> // `std::size_t`
-#include <cstdint> // `std::uint8_t`, `std::uint64_t`
-#include <cstring> // `std::memcmp`, `std::memcpy`
+#include <cstdint> // `std::uint8_t`
+#include <cstring> // `std::memcmp`
 
-#include <string_view> // `std::string_view`
-#include <utility>     // `std::move`
+#include "ustore/utilities/types.hpp" // `uuid_hash_t`, `ustore_key_t`
 
-#include <smashtable/basic_vector.hpp>
-#include <smashtable/shared.hpp>
-#include <stringzilla/stringzilla.hpp>
-
-#include "ustore/db.h"
-#include "ustore/types.hpp"
-
-namespace unum::ustore::ram {
-
-/** Orders keys and collection IDs by their bytes, as every engine does. */
-struct uuid_order_t {
-    template <typename uuid_type_>
-    constexpr bool operator()(uuid_type_ const& first, uuid_type_ const& second) const noexcept {
-        return first < second;
-    }
-};
-
-/** Hashes a UUID as its two machine words, spreading the keys of a collection over every partition. */
-struct uuid_hash_t {
-    std::size_t operator()(ustore_uuid_t const& uuid) const noexcept {
-        st::hash<std::uint64_t> const mixer;
-        std::uint64_t halves[2];
-        std::memcpy(halves, uuid.bytes, sizeof(halves));
-        return mixer(halves[0] ^ (halves[1] * 0x9E3779B97F4A7C15ull));
-    }
-    std::size_t operator()(ustore_key_t const& key) const noexcept { return (*this)(key.uuid); }
-    std::size_t operator()(ustore_collection_id_t const& id) const noexcept { return (*this)(id.uuid); }
-};
-
-/** A value, or the bytes of a string, owned so it outlives the call that wrote it. */
-using blob_t = st::basic_vector<ustore_byte_t>;
-
-/** A string of a strings collection, or the name of a collection, owning its bytes. */
-struct string_key_t {
-
-    /** Bytes of the string. */
-    blob_t text;
-
-    /** The bytes of the string. */
-    std::string_view view() const noexcept { return {reinterpret_cast<char const*>(text.data()), text.size()}; }
-
-    /** A copy owning bytes of its own, or why they could not be allocated, which the store asks of a key it
-     *  records. */
-    st::expected<string_key_t> copy() const noexcept {
-        st::expected<blob_t> copied = text.copy();
-        if (!copied) return copied.status();
-        return string_key_t {std::move(*copied)};
-    }
-};
-
-/** Orders strings by their bytes, unsigned. */
-struct string_key_order_t {
-    bool operator()(string_key_t const& first, string_key_t const& second) const noexcept {
-        return sz::string_view_t {first.view()} < sz::string_view_t {second.view()};
-    }
-};
-
-/** Hashes a string through StringZilla, spreading the strings of a collection over every partition. */
-struct string_key_hash_t {
-    std::size_t operator()(string_key_t const& stored) const noexcept {
-        return sz::string_view_t {stored.view()}.hash();
-    }
-};
+namespace unum::ustore::graph {
 
 /** Which entry of a vertex's run a half-edge is: the vertex itself, or an edge seen from one of its ends. */
 enum class half_edge_direction_t : std::uint8_t {
@@ -141,7 +79,9 @@ struct half_edge_order_t {
 
 /** Hashes a half-edge by its vertex alone, so the run of one vertex stays in one partition. */
 struct half_edge_hash_t {
-    std::size_t operator()(half_edge_t const& entry) const noexcept { return uuid_hash_t {}(entry.vertex.uuid); }
+    std::size_t operator()(half_edge_t const& entry) const noexcept {
+        return utilities::uuid_hash_t {}(entry.vertex.uuid);
+    }
 };
 
-} // namespace unum::ustore::ram
+} // namespace unum::ustore::graph

@@ -2,6 +2,7 @@
 
 Every engine implements the C ABI of `c/ustore/*.h` over its own storage, and joins the router's sources in the one source list both the `ustore_static` archive and the `ustore_shared` library build from, so documents and graphs work on each of them.
 `src/lib.hpp` is the router every exported call goes through, and each public header has one source implementing it: `types.cpp`, `db.cpp`, `blobs.cpp`, `strings.cpp`, `docs.cpp`, `graph.cpp` and `pages.cpp`.
+`docs.cpp` and `graph.cpp` also keep the documents and graphs any engine serves through its own reads and writes, over the codecs of `include/ustore/docs/` and `include/ustore/graph/`.
 The reusable templates the engines instantiate live in `include/ustore/`, which [its own guide](../include/ustore/README.md) describes.
 The engines fill three roles: `ram` is the reference engine in memory, NVMe is the hyper-converged engine on NVMe drives and GPUs, and RocksDB and LevelDB bring third-party key-value stores behind the same calls.
 Engines aim for the highest isolation `ram` delivers, each reports the level its transactions actually deliver, and the conformance suite checks every advertised level against behaviour.

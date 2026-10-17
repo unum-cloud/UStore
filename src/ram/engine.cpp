@@ -38,12 +38,9 @@
 #include <utility>     // `std::exchange`, `std::forward`, `std::move`
 #include <variant>     // `std::in_place_type`, `std::variant`, `std::visit`
 
-#include <forkunion/atomics.hpp>      // `fu::preferred_atomic_ref`
-#include <forkunion/capabilities.hpp> // `fu::preferred_yield_t`
+#include <forkunion/atomics.hpp> // `fu::preferred_atomic_ref`, `fu::standard_atomic_ref`
 #include <smashtable/basic_avl_tree.hpp>
 #include <smashtable/basic_vector.hpp>
-#include <smashtable/partitioned_store.hpp>
-#include <smashtable/snapshot_store.hpp>
 #include <stringzilla/stringzilla.hpp>
 
 #include "ustore/blobs.h"
@@ -52,170 +49,25 @@
 #include "ustore/ranges.hpp" // `place_batch_t`, `edges_view_t`, `strided`
 #include "ustore/strings.h"
 
+#include "ustore/blobs/ram_store.hpp"          // `collection_store`, `collections_transaction`, `translate`
+#include "ustore/graph/half_edges.hpp"         // `half_edge_t`, `half_edge_direction_t`
+#include "ustore/graph/ram_graph.hpp"          // `export_edges`, `stage_edges`, `stage_vertex_removal`
+#include "ustore/strings/string_keys.hpp"      // `string_key_t`, `blob_t`
 #include "ustore/utilities/blocking_files.hpp" // `directory_exists`
 #include "ustore/utilities/ram_buffers.hpp"    // `arena_allocate`, `arena_copy`, `arena_allocator`
 
 #include "engine.hpp"             // `engine_t`, `handle_t`, `handle_cast`, `view_t`
-#include "ram/key.hpp"            // `string_key_t`, `half_edge_t`
 #include "utilities/batches.hpp"  // `scan_batch_t`, `strings_arg_t`, `edges_batch_t`, `places_of`, `edges_of`
 #include "utilities/outputs.hpp"  // `read_outputs_t`, `scan_outputs_t`, `collection_list_outputs_t`
 #include "utilities/progress.hpp" // `progress_t`, `progress_cancelled_k`
 
 namespace unum::ustore::ram {
+using namespace unum::ustore::blobs;
+using namespace unum::ustore::graph;
+using namespace unum::ustore::strings;
 using namespace unum::ustore::utilities;
 
-#pragma region Stores
-
-/** The status every SmashTable call answers with. */
-using store_status_t = st::status_t;
-
-/** The isolation level a store instantiation promises. */
-using isolation_t = st::isolation_t;
-
-/** Whether a walk carries on after an element. */
-using walk_control_t = st::walk_control_t;
-
-/** Whether a transaction's writes sit in the store, invisible. */
-using staging_t = st::staging_t;
-
-/** A stamp of the commit order: what a snapshot reads at, and what a commit publishes under. */
-using generation_t = st::generation_t;
-
-/** A value filed under its key. */
-using value_pair_t = st::mapping<ustore_key_t, blob_t>;
-
-/** A value filed under its string. */
-using string_pair_t = st::mapping<string_key_t, blob_t>;
-
-/** The ID of a named collection filed under its name. */
-using name_pair_t = st::mapping<string_key_t, ustore_collection_id_t>;
-
-/** The lock each partition takes, owning its word through ForkUnion's reference and stalling through its hint. */
-using engine_mutex_t =
-    st::spin_shared_mutex<st::standard_waiting_policy<fu::preferred_yield_t>, fu::preferred_atomic_ref>;
-
-/** A multi-version store of @p entry_type_ ordered by @p order_type_ at @p isolation_, in partitions @p hash_type_
- *  picks, built into the order of its database. */
-template <typename entry_type_, typename order_type_, typename hash_type_, isolation_t isolation_>
-using ordered_store = st::partitioned_store<
-    st::snapshot_store<st::basic_avl_tree<entry_type_, order_type_, st::default_allocator<entry_type_>>, isolation_>,
-    hash_type_, engine_mutex_t>;
-
-/** A collection of blobs, documents, pages or anything: every key mapped onto the bytes of its value. */
-template <isolation_t isolation_>
-using values_by_key_store = ordered_store<value_pair_t, uuid_order_t, uuid_hash_t, isolation_>;
-
-/** A collection of strings: every string mapped onto the bytes of its value. */
-template <isolation_t isolation_>
-using values_by_string_store = ordered_store<string_pair_t, string_key_order_t, string_key_hash_t, isolation_>;
-
-/** A graph collection: every vertex once and every edge twice, under each of its vertices, with no values. */
-template <isolation_t isolation_>
-using half_edges_store = ordered_store<half_edge_t, half_edge_order_t, half_edge_hash_t, isolation_>;
-
-/** The order every store of a database commits in, so one stamp spans a commit reaching any number of them. */
-using order_t = values_by_key_store<isolation_t::snapshot_k>::order_t;
-
-/** A claim on the stamp a call, a snapshot or a transaction reads at, which keeps every store it may reach alive. */
-using claim_t = order_t::snapshot_claim_t;
-
-template <isolation_t isolation_>
-struct collection_store;
-
-/** What the catalog records of a collection: what it holds, its name, and the store its entries live in. */
-template <isolation_t isolation_>
-struct collection_entry {
-
-    /** What the collection holds, which picked the kind of its store. */
-    ustore_modality_t modality {ustore_modality_any_k};
-
-    /** The name of the collection, empty for one created without. */
-    blob_t name;
-
-    /** The store holding the collection's entries. */
-    collection_store<isolation_>* store {nullptr};
-};
-
-/** A collection's UUID mapped onto what the catalog records of it. */
-template <isolation_t isolation_>
-using catalog_pair = st::mapping<ustore_collection_id_t, collection_entry<isolation_>>;
-
-/** Every collection, the main one included under the nil UUID: its UUID mapped onto its entry. */
-template <isolation_t isolation_>
-using collections_by_id_store = ordered_store<catalog_pair<isolation_>, uuid_order_t, uuid_hash_t, isolation_>;
-
-/** Every named collection: its name mapped onto its UUID. */
-template <isolation_t isolation_>
-using collection_ids_by_name_store = ordered_store<name_pair_t, string_key_order_t, string_key_hash_t, isolation_>;
-
-/** The store of one collection, of the kind its modality picks, which a drop retires rather than frees. */
-template <isolation_t isolation_>
-struct collection_store {
-
-    /** The collection's entries. */
-    std::variant<values_by_key_store<isolation_>, values_by_string_store<isolation_>, half_edges_store<isolation_>>
-        entries;
-
-    /** The store retired before this one, while this one waits to be freed. */
-    collection_store* next_retired {nullptr};
-
-    /** The stamp the change that took this store out of the catalog published under. */
-    generation_t retirement_stamp {0};
-
-    template <typename kind_type_>
-    collection_store(std::in_place_type_t<kind_type_> kind, order_t& order) noexcept : entries(kind, order) {}
-};
-
-/** A transaction over the catalog, the names and every collection store it reaches, published under one stamp. */
-template <isolation_t isolation_>
-using collections_transaction =
-    st::dynamic_transaction_group<collections_by_id_store<isolation_>, collection_ids_by_name_store<isolation_>,
-                                  values_by_key_store<isolation_>, values_by_string_store<isolation_>,
-                                  half_edges_store<isolation_>>;
-
-static_assert(values_by_key_store<isolation_t::strict_serializable_k>::isolation_k ==
-                  isolation_t::strict_serializable_k,
-              "the partitions must keep the strict serializability of their stores");
-
-/** How many times an engine-internal commit is attempted before its conflicts reach the caller. */
-inline constexpr std::size_t commit_attempts_k = 16;
-
-/** The status of the C ABI a caller reads for @p status. */
-constexpr status_t translate(store_status_t status) noexcept {
-    switch (status) {
-    case store_status_t::success_k: return {};
-    case store_status_t::unknown_k: return {status_code_t::internal_k, "SmashTable failed for an unknown reason"};
-    case store_status_t::consistency_k: return {status_code_t::internal_k, "SmashTable found a staged version missing"};
-    case store_status_t::write_conflict_k:
-        return {status_code_t::write_conflict_k, "Write conflict: a written key was committed over"};
-    case store_status_t::read_conflict_k:
-        return {status_code_t::read_conflict_k, "Read conflict: a read key was committed over"};
-    case store_status_t::phantom_conflict_k:
-        return {status_code_t::phantom_conflict_k, "Phantom conflict: a walked range gained or lost a key"};
-    case store_status_t::out_of_memory_heap_k: return {status_code_t::out_of_memory_k, "Out of memory"};
-    case store_status_t::invalid_argument_k: return {status_code_t::invalid_argument_k, "Invalid argument"};
-    case store_status_t::operation_not_permitted_k:
-        return {status_code_t::invalid_argument_k, "Operation not permitted in the transaction's state"};
-    case store_status_t::operation_would_block_k:
-        return {status_code_t::write_conflict_k, "Gave up after every retry met a conflict"};
-    case store_status_t::capacity_exhausted_k: return {status_code_t::capacity_exhausted_k, "Capacity exhausted"};
-    case store_status_t::input_output_k: return {status_code_t::io_k, "Input or output failed"};
-    case store_status_t::key_already_exists_k: return {status_code_t::already_exists_k, "Key already exists"};
-    case store_status_t::key_not_found_k: return {status_code_t::not_found_k, "Key not found"};
-    }
-    return {status_code_t::internal_k, "SmashTable answered an unrecognized status"};
-}
-
-/** The status a call answers: the failure @p outcome recorded first, or else @p status. */
-inline status_t reported(store_status_t status, status_t const& outcome) noexcept {
-    return outcome.failed() ? outcome : translate(status);
-}
-
-/** Refuses a call with @p message, answering the status that stops the walk it is in. */
-inline store_status_t refused(status_t& outcome, char const* message) noexcept {
-    outcome = {status_code_t::invalid_argument_k, message};
-    return store_status_t::invalid_argument_k;
-}
+#pragma region Files
 
 /** Whether @p path names an existing directory. */
 inline bool names_directory(char const* path) noexcept {
@@ -223,38 +75,7 @@ inline bool names_directory(char const* path) noexcept {
     return exists && *exists;
 }
 
-/** Copies @p value into a blob the store owns. */
-inline st::expected<blob_t> copy_blob(value_view_t value) noexcept {
-    blob_t blob;
-    if (st::failed(blob.resize(value.size()))) return store_status_t::out_of_memory_heap_k;
-    if (value.size() != 0) std::memcpy(blob.data(), value.data(), value.size());
-    return blob;
-}
-
-/** Views the bytes of a stored blob. */
-inline value_view_t view_of(blob_t const& blob) noexcept {
-    return value_view_t {blob.data(), static_cast<ustore_length_t>(blob.size())};
-}
-
-/** The key @p text is stored under, owning a copy of its bytes. */
-inline st::expected<string_key_t> string_key_from(std::string_view text) noexcept {
-    auto [copied, copy_blob_status] = copy_blob(value_view_t {text});
-    if (st::failed(copy_blob_status)) return copy_blob_status;
-    return string_key_t {std::move(copied)};
-}
-
-/** Allocates the store a collection holding @p modality keeps its entries in, or answers null. */
-template <isolation_t isolation_>
-collection_store<isolation_>* allocate_store(order_t& order, ustore_modality_t modality) noexcept {
-    using store_t = collection_store<isolation_>;
-    if (modality == ustore_modality_strings_k)
-        return new (std::nothrow) store_t(std::in_place_type<values_by_string_store<isolation_>>, order);
-    if (modality == ustore_modality_graph_k)
-        return new (std::nothrow) store_t(std::in_place_type<half_edges_store<isolation_>>, order);
-    return new (std::nothrow) store_t(std::in_place_type<values_by_key_store<isolation_>>, order);
-}
-
-#pragma endregion Stores
+#pragma endregion Files
 
 #pragma region Handles
 
@@ -1087,151 +908,6 @@ store_status_t stage_values_emptied(transaction_source<isolation_>& source, usto
 }
 
 #pragma endregion Catalog
-
-#pragma region Graph
-
-/** Walks the entries of @p vertex in @p direction through @p view, handing @p visit every one. */
-template <typename view_type_, typename visit_type_>
-store_status_t walk_direction(view_type_ const& view, ustore_key_t const& vertex, half_edge_direction_t direction,
-                              visit_type_&& visit) noexcept {
-    auto const next = static_cast<half_edge_direction_t>(static_cast<std::uint8_t>(direction) + 1);
-    return view.range(half_edge_t::first_of(vertex, direction), half_edge_t::first_of(vertex, next), visit);
-}
-
-/** Exports the degree of tasks [ @p first, @p end ) through @p view of a graph into @p degrees, with their edges as
- *  source, target and edge triples when @p edges is given, watching what it walked when the view watches. */
-template <typename view_type_, typename degrees_type_>
-store_status_t export_edges(view_type_ const& view, edges_batch_t const& tasks, std::size_t first, std::size_t end,
-                            degrees_type_& degrees,
-                            st::basic_vector<ustore_key_t, arena_allocator<ustore_key_t>>* edges,
-                            st::basic_vector<half_edge_t, arena_allocator<half_edge_t>>& walked,
-                            status_t& outcome) noexcept {
-    std::size_t const walked_before = walked.size();
-    for (std::size_t task = first; task != end && outcome.succeeded(); ++task) {
-        edges_task_t const asked = tasks[task];
-        bool present = false;
-        store_status_t const looked_up = view.find(
-            half_edge_t::vertex_entry(asked.vertex_id), [&](half_edge_t const&) noexcept { present = true; },
-            st::no_op_t {});
-        if (st::failed(looked_up)) return looked_up;
-        if (!present) {
-            degrees[task] = ustore_vertex_degree_missing_k;
-            continue;
-        }
-        ustore_vertex_degree_t degree = 0;
-        auto const visit = [&](half_edge_t const& entry) noexcept -> walk_control_t {
-            ++degree;
-            if (view.watches()) outcome = translate(walked.emplace_back(entry));
-            if (edges && outcome.succeeded()) {
-                bool const outgoing = entry.direction == half_edge_direction_t::outgoing_k;
-                ustore_key_t const triple[3] {outgoing ? entry.vertex : entry.neighbor,
-                                              outgoing ? entry.neighbor : entry.vertex, entry.edge};
-                std::size_t const exported = edges->size();
-                outcome = translate(edges->resize(exported + 3));
-                if (outcome.succeeded()) std::memcpy(edges->data() + exported, triple, sizeof(triple));
-            }
-            return outcome.failed() ? walk_control_t::halt_k : walk_control_t::resume_k;
-        };
-        if (asked.role & ustore_vertex_role_source_k) {
-            store_status_t const outgoing = walk_direction(view, asked.vertex_id, half_edge_direction_t::outgoing_k,
-                                                           visit);
-            if (st::failed(outgoing)) return outgoing;
-        }
-        if (asked.role & ustore_vertex_role_target_k) {
-            store_status_t const incoming = walk_direction(view, asked.vertex_id, half_edge_direction_t::incoming_k,
-                                                           visit);
-            if (st::failed(incoming)) return incoming;
-        }
-        degrees[task] = degree;
-    }
-    for (std::size_t index = walked_before; index != walked.size() && outcome.succeeded(); ++index) {
-        store_status_t const watched = view.watch(walked[index]);
-        if (st::failed(watched)) return watched;
-    }
-    return store_status_t::success_k;
-}
-
-/** Stages @p vertex into @p part of a graph unless it already is one, which never writes over a present vertex, so
- *  edges added to one vertex by two transactions don't conflict over it. */
-template <typename transaction_type_>
-store_status_t stage_vertex(transaction_type_& part, ustore_key_t const& vertex) noexcept {
-    return part.insert_if_missing(half_edge_t::vertex_entry(vertex));
-}
-
-/** Stages edges [ @p first, @p end ) into @p part of a graph, under both of their ends, and each end as a vertex. */
-template <typename transaction_type_>
-store_status_t stage_edges(transaction_type_& part, edges_view_t const& edges, std::size_t first,
-                           std::size_t end) noexcept {
-    for (std::size_t index = first; index != end; ++index) {
-        edge_t const edge = edges[index];
-        store_status_t status = stage_vertex(part, edge.source);
-        if (st::succeeded(status)) status = stage_vertex(part, edge.target);
-        if (st::succeeded(status))
-            status = part.upsert(half_edge_t {edge.source, half_edge_direction_t::outgoing_k, edge.target, edge.id});
-        if (st::succeeded(status))
-            status = part.upsert(half_edge_t {edge.target, half_edge_direction_t::incoming_k, edge.source, edge.id});
-        if (st::failed(status)) return status;
-    }
-    return store_status_t::success_k;
-}
-
-/** Stages erasing @p entry from @p part, which may be gone already. */
-template <typename transaction_type_>
-store_status_t stage_absent(transaction_type_& part, half_edge_t const& entry) noexcept {
-    store_status_t const erased = part.erase(entry);
-    return erased == store_status_t::key_not_found_k ? store_status_t::success_k : erased;
-}
-
-/** Stages erasing edges [ @p first, @p end ) from @p part of a graph, under both of their ends, keeping the
- *  vertices. */
-template <typename transaction_type_>
-store_status_t stage_edges_removal(transaction_type_& part, edges_view_t const& edges, std::size_t first,
-                                   std::size_t end) noexcept {
-    for (std::size_t index = first; index != end; ++index) {
-        edge_t const edge = edges[index];
-        store_status_t status = stage_absent(
-            part, half_edge_t {edge.source, half_edge_direction_t::outgoing_k, edge.target, edge.id});
-        if (st::succeeded(status))
-            status = stage_absent(part,
-                                  half_edge_t {edge.target, half_edge_direction_t::incoming_k, edge.source, edge.id});
-        if (st::failed(status)) return status;
-    }
-    return store_status_t::success_k;
-}
-
-/** Stages removing @p vertex from @p part of a graph: the edges its neighbors file of it in @p role, then every entry
- *  of its own. */
-template <typename transaction_type_>
-store_status_t stage_vertex_removal(transaction_type_& part, ustore_key_t const& vertex, ustore_vertex_role_t role,
-                                    st::basic_vector<half_edge_t, arena_allocator<half_edge_t>>& walked) noexcept {
-    std::size_t const first = walked.size();
-    store_status_t collected = store_status_t::success_k;
-    auto const collect = [&](half_edge_t const& entry) noexcept -> walk_control_t {
-        if (st::succeeded(collected)) collected = walked.emplace_back(entry);
-        return st::failed(collected) ? walk_control_t::halt_k : walk_control_t::resume_k;
-    };
-    if (role & ustore_vertex_role_source_k) {
-        store_status_t const outgoing = walk_direction(part, vertex, half_edge_direction_t::outgoing_k, collect);
-        if (st::failed(outgoing)) return outgoing;
-    }
-    if (role & ustore_vertex_role_target_k) {
-        store_status_t const incoming = walk_direction(part, vertex, half_edge_direction_t::incoming_k, collect);
-        if (st::failed(incoming)) return incoming;
-    }
-    if (st::failed(collected)) return collected;
-    for (std::size_t index = first; index != walked.size(); ++index) {
-        half_edge_t const seen = walked[index];
-        half_edge_direction_t const mirrored = seen.direction == half_edge_direction_t::outgoing_k
-                                                   ? half_edge_direction_t::incoming_k
-                                                   : half_edge_direction_t::outgoing_k;
-        store_status_t const erased = stage_absent(part, half_edge_t {seen.neighbor, mirrored, vertex, seen.edge});
-        if (st::failed(erased)) return erased;
-    }
-    return part.erase_range(half_edge_t::vertex_entry(vertex),
-                            half_edge_t::first_of(vertex, half_edge_direction_t::past_k), st::no_op_t {});
-}
-
-#pragma endregion Graph
 
 #pragma region Image
 

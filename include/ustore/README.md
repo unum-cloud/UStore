@@ -20,6 +20,17 @@ Pin a commit, not a version, when building on them.
   - `vram_nvidia_device.hpp`: CUDA devices, streams, events and buffers from the host.
   - `blocking_files.hpp`: whole-file mappings and directory queries.
   - `algorithm.hpp`: searches over sorted batches, reservoir sampling over ordered iterators, and inserts and erases in trivially copyable buffers.
+- `blobs/`, in `unum::ustore::blobs`:
+  - `ram_store.hpp`: the multi-version SmashTable stores of the RAM engine, one per collection, the catalog and the names over them, and `collections_transaction`, which publishes any number of them under one stamp.
+- `graph/`, in `unum::ustore::graph`:
+  - `half_edges.hpp`: `half_edge_t`, the entry a graph collection files every vertex and both ends of every edge under, with its order and hash.
+  - `ram_graph.hpp`: exporting degrees and edges from a store of half-edges, and staging edge and vertex inserts and removals.
+  - `vertex_values.hpp`: the dense codec keeping every vertex as one value of its degrees and sorted neighborships.
+- `docs/`, in `unum::ustore::docs`:
+  - `json_values.hpp`: JSON documents parsed with yyjson into an arena, and the conversions between their values and the scalars, strings and UUIDs of a gathered column.
+  - `json_patch.hpp`: RFC 6902 patches, RFC 7386 merges, and the field-level inserts, updates and upserts of a document.
+- `strings/`, in `unum::ustore::strings`:
+  - `string_keys.hpp`: `string_key_t`, the owned key of a strings collection and of a collection's name, with its order and hash.
 
 ## Building
 
