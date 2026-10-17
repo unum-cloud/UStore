@@ -112,7 +112,7 @@ include(GNUInstallDirs)
 
 # Install 3rd Party Packages
 include(FetchContent)
-include_directories(c cpp)
+include_directories(c cpp include)
 include_directories(tools)
 include_directories(src)
 
@@ -190,6 +190,25 @@ ustore_sibling(stringzilla)
 if (USTORE_BUILD_CUDA OR USTORE_BUILD_TEST)
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/nvme_compaction.cmake")
 endif ()
+
+# The reusable templates of `include/ustore/`, header-only, with the include paths of the siblings and the third-party
+# headers they reach into. The package installs UStore's own headers alone, so a consumer brings each sibling's.
+add_library(ustore_header INTERFACE)
+add_library(ustore::header ALIAS ustore_header)
+set_target_properties(ustore_header PROPERTIES EXPORT_NAME header)
+target_compile_features(ustore_header INTERFACE cxx_std_20)
+target_include_directories(
+    ustore_header
+    INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/c> $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+              $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
+target_include_directories(
+    ustore_header SYSTEM INTERFACE $<BUILD_INTERFACE:${yyjson_SOURCE_DIR}/src> $<BUILD_INTERFACE:${fmt_INCLUDE_DIR}>
+)
+target_link_libraries(
+    ustore_header INTERFACE $<BUILD_INTERFACE:forkunion::header> $<BUILD_INTERFACE:smashtable::header>
+                            $<BUILD_INTERFACE:stringzilla::header>
+)
 
 # Without `USTORE_BUILD_LIB_C`, the libraries build only for the targets that link them
 if (NOT USTORE_BUILD_LIB_C AND NOT USTORE_INSTALL)
@@ -288,7 +307,7 @@ foreach (library IN ITEMS ustore_static ustore_shared)
     target_include_directories(
         ${library}
         PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/c> $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/cpp>
-               $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+               $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
         PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
     )
 endforeach ()
@@ -300,7 +319,7 @@ if (USTORE_INSTALL)
     include(CMakePackageConfigHelpers)
     set(USTORE_CONFIG_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}/cmake/ustore")
     install(
-        TARGETS ustore_static ustore_shared ${USTORE_ENGINE_ARCHIVES}
+        TARGETS ustore_header ustore_static ustore_shared ${USTORE_ENGINE_ARCHIVES}
         EXPORT ustore_targets
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -326,7 +345,7 @@ include("${CMAKE_CURRENT_LIST_DIR}/ustore_targets.cmake")
     install(FILES "${CMAKE_CURRENT_BINARY_DIR}/ustoreConfig.cmake"
                   "${CMAKE_CURRENT_BINARY_DIR}/ustoreConfigVersion.cmake" DESTINATION ${USTORE_CONFIG_INSTALL_DIR}
     )
-    install(DIRECTORY c/ustore cpp/ustore DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+    install(DIRECTORY c/ustore cpp/ustore include/ustore DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 endif ()
 
 if (${USTORE_BUILD_TOOLS})
@@ -407,6 +426,17 @@ if (${USTORE_BUILD_TEST})
                      COMMAND ustore_test_${test_name} --engine ${engine_name} --directory ${CMAKE_BINARY_DIR}/test_data
             )
         endforeach ()
+    endforeach ()
+
+    # The templates of `include/ustore/` build against the header target alone, with no engine linked
+    set(USTORE_UTILITIES_TEST_NAMES "ram_buffers")
+    foreach (test_name IN ITEMS ${USTORE_UTILITIES_TEST_NAMES})
+        add_executable(ustore_test_utilities_${test_name} test/utilities/${test_name}.cpp)
+        target_include_directories(ustore_test_utilities_${test_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
+        target_link_libraries(
+            ustore_test_utilities_${test_name} PRIVATE ustore::header forkunion::static fmt::fmt ustore_warnings
+        )
+        add_test(NAME ustore_test_utilities_${test_name} COMMAND ustore_test_utilities_${test_name})
     endforeach ()
 
     # The C ABI compiles as plain C11, so a header that only a C++ compiler accepts fails to build. It links against

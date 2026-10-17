@@ -614,21 +614,8 @@ ustore_bytes_view_t bytes_of(text_type_ const& text) noexcept {
     else return bytes_of(std::string_view {text});
 }
 
-/** A tape of 32-bit offsets, where string @c i spans @b [offsets[i],offsets[i+1]) of @p data. */
-inline ustore_strings_view_t u32_tape(void const* data, std::uint32_t const* offsets) noexcept {
-    ustore_strings_view_t tape {};
-    tape.layout = ustore_strings_u32_tape_k;
-    tape.data.u32_tape = {static_cast<ustore_byte_t const*>(data), offsets};
-    return tape;
-}
-
-/** A tape of 64-bit offsets, where string @c i spans @b [offsets[i],offsets[i+1]) of @p data. */
-inline ustore_strings_view_t u64_tape(void const* data, std::uint64_t const* offsets) noexcept {
-    ustore_strings_view_t tape {};
-    tape.layout = ustore_strings_u64_tape_k;
-    tape.data.u64_tape = {static_cast<ustore_byte_t const*>(data), offsets};
-    return tape;
-}
+using utilities::u32_tape;
+using utilities::u64_tape;
 
 /** The tape @p strings pass to the C ABI as, or a zeroed view, the input's default, when they hold none. */
 inline ustore_strings_view_t tape_of(values_tape_t const& strings) noexcept {

@@ -8,9 +8,7 @@
  *  other verb addresses that collection by the identifier, so no other call carries a name. Each
  *  engine keeps the names apart from every collection, so no identifier reaches them.
  */
-#include <stdlib.h> // `qsort`
-#include <string.h> // `memcmp`
-
+// Python.h must precede every system header, and brings `qsort` and `memcmp` along
 #include "lib.h"
 
 #pragma region Lookups

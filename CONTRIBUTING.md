@@ -38,9 +38,10 @@ The `release` and `relwithdebinfo` presets build with whatever toolchain the env
 | `c/ustore/*.h`          | the C ABI, flat                                       | none                              |
 | `c/test.c`              | compiles the C ABI as plain C11                       | none                              |
 | `cpp/ustore/*.hpp`      | the C++ wrappers over the C ABI, flat                 | `unum::ustore`                    |
+| `include/ustore/<dir>/` | header-only templates the engines instantiate         | `unum::ustore::<dir>`             |
 | `src/*.cpp`             | the C ABI dispatch in `lib.cpp`, documents and graphs | `unum::ustore`                    |
 | `src/engine.hpp`        | the table of calls every engine fills                 | `unum::ustore`                    |
-| `src/utilities/`        | arenas, outputs, executors and files engines share    | `unum::ustore::utilities`         |
+| `src/utilities/`        | batches, outputs and progress over the C ABI's types  | `unum::ustore::utilities`         |
 | `src/<engine>/`         | `engine.cpp` and the headers of `ram` and `nvme`      | `unum::ustore::<engine>`          |
 | `src_oracles/<engine>/` | `engine.cpp` of RocksDB and LevelDB, kept as oracles  | `unum::ustore::oracles::<engine>` |
 | `tools/`                | the CLI, flag parsing, and dataset import and export  | `unum::ustore::tools`             |
@@ -50,7 +51,7 @@ The `release` and `relwithdebinfo` presets build with whatever toolchain the env
 
 Namespaces mirror directories and nothing else: a directory adds a namespace component, and no namespace groups symbols by theme.
 `src_oracles/` adds `oracles`, and an engine sees `unum::ustore::utilities` through one `using namespace` right after its own namespace opens.
-`c/` and `cpp/` are include roots that add no component, so `cpp/ustore/` opens `unum::ustore`.
+`c/`, `cpp/` and `include/` are include roots that add no component, so `cpp/ustore/` opens `unum::ustore` and `include/ustore/blobs/` opens `unum::ustore::blobs`.
 The pre-commit hook refuses a namespace no directory backs, a nameless one, and one a file opens twice.
 A file name never repeats its directory — `src/nvme/lsm_tree.hpp`, never `src/nvme/nvme_lsm_tree.hpp`.
 
@@ -117,7 +118,7 @@ Per-thread scratch belongs to the executor that owns the threads.
 
 ### Threads and Placement
 
-Threads, topology and domain-placed memory come from ForkUnion's C ABI in `forkunion.h`, wrapped once by the C++ executor of `src/utilities/ram_device.hpp` and the arenas of `src/utilities/ram_buffers.hpp`; nothing else calls `fu_*` directly.
+Threads, topology and domain-placed memory come from ForkUnion's C ABI in `forkunion.h`, wrapped once by the C++ executor of `include/ustore/utilities/ram_device.hpp` and the arenas of `include/ustore/utilities/ram_buffers.hpp`; nothing else calls `fu_*` directly.
 The executor owns a `fu_topology_t` and a `fu_pool_t` created through `fu_topology_new`, `fu_pool_new` and `fu_pool_spawn`, returns `expected` from its factory, deletes the pool in its destructor, and forwards C++ callables to the pool through a C callback.
 A pool another library lends through `ustore_executor_on_pool` is wrapped by `lent_pool_t` instead, which dispatches on it but never deletes or parks it.
 The arenas place their blocks with `fu_allocate_on_domain_id` and release them with `fu_free_on_domain_id`.
@@ -139,7 +140,7 @@ The arenas place their blocks with `fu_allocate_on_domain_id` and release them w
 
 ### Includes and Printing
 
-Includes form groups separated by blank lines, alphabetical inside each: C library headers such as `<cstdint>`, platform headers such as `<unistd.h>`, C++ standard headers, external libraries such as `<rocksdb/db.h>` and `<yyjson.h>`, sibling projects such as `<smashtable/basic_vector.hpp>`, then UStore's own headers in quotes, such as `"ustore/db.h"` and `"utilities/ram_buffers.hpp"`.
+Includes form groups separated by blank lines, alphabetical inside each: C library headers such as `<cstdint>`, platform headers such as `<unistd.h>`, C++ standard headers, external libraries such as `<rocksdb/db.h>` and `<yyjson.h>`, sibling projects such as `<smashtable/basic_vector.hpp>`, then UStore's own headers in quotes, such as `"ustore/db.h"`, `"ustore/utilities/ram_buffers.hpp"` and `"utilities/batches.hpp"`.
 Sibling projects are reached through the aliases `fu`, `st` and `sz`, declared once in `cpp/ustore/types.hpp`, never through spelled-out `ashvardanian::` namespaces or local aliases.
 C++ prints through `fmt::println` — no iostreams, no `printf`.
 Discard a result through `[[maybe_unused]] T const result = call();`, never `(void)call();`, and declare return types before the name, never after an arrow.
@@ -254,7 +255,7 @@ Start with these, in order:
 8. Strings keyed by their own bytes: `ustore_strings_write()`, `ustore_strings_remove()`, `ustore_strings_read()`, `ustore_strings_scan()`.
 9. Sampling and measurements: `ustore_blobs_sample()`, `ustore_blobs_measure()`.
 10. Upkeep of the whole database: `ustore_database_clear()` in every `ustore_drop_mode_t`, `ustore_database_compact()` and `ustore_snapshot_save()`.
-11. Outputs: every output whose length scales with the call lands in the call's `arena` through `src/utilities/ram_buffers.hpp`, while the router makes and frees arenas in `ustore_arena_init()` and `ustore_arena_free()`.
+11. Outputs: every output whose length scales with the call lands in the call's `arena` through `include/ustore/utilities/ram_buffers.hpp`, while the router makes and frees arenas in `ustore_arena_init()` and `ustore_arena_free()`.
 
 Scans, saves and compactions report through the `progress_t` of `src/utilities/progress.hpp`, in the units their verbs document, and unwind with `progress_cancelled_k` once `advance` answers false, leaving nothing a caller would read: a cancelled save removes what it wrote.
 

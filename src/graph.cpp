@@ -34,10 +34,11 @@
 
 #include "ustore/ranges.hpp" // `strided_span`, `values_view_t`, `collection_key_t`
 
-#include "engine.hpp"                // `engine_of`, `view_t`, `graph_read_edges_in_vertex_values`
-#include "utilities/algorithm.hpp"   // `offset_in_sorted`, `trivial_insert`, `trivial_erase`
-#include "utilities/batches.hpp"     // `edges_batch_t`, `strings_arg_t`
-#include "utilities/ram_buffers.hpp" // `arena_allocate`
+#include "ustore/utilities/algorithm.hpp"   // `offset_in_sorted`, `trivial_insert`, `trivial_erase`
+#include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`
+
+#include "engine.hpp"            // `engine_of`, `view_t`, `graph_read_edges_in_vertex_values`
+#include "utilities/batches.hpp" // `edges_batch_t`, `strings_arg_t`
 
 namespace unum::ustore {
 using namespace unum::ustore::utilities;

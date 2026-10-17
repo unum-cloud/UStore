@@ -47,8 +47,9 @@
 
 #include "ustore/ustore.hpp"
 
+#include "ustore/utilities/blocking_files.hpp" // `mapped_file_t`
+
 #include "harness.hpp"
-#include "utilities/blocking_files.hpp" // `mapped_file_t`
 
 namespace unum::ustore::bench {
 

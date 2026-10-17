@@ -1,5 +1,5 @@
 /**
- *  @file src/utilities/blocking_files.hpp
+ *  @file include/ustore/utilities/blocking_files.hpp
  *  @author Ash Vardanian
  *  @date January 11, 2023
  *  @brief Whole-file mappings and directory queries, that block the calling thread.
@@ -24,8 +24,7 @@
 #include <string_view> // `std::string_view`
 #include <utility>     // `std::exchange`, `std::swap`
 
-#include "ustore/status.hpp" // `status_t`, `expected`
-#include "ustore/types.hpp"  // `byte_t`
+#include "ustore/utilities/types.hpp" // `status_t`, `expected`, `byte_t`
 
 namespace unum::ustore::utilities {
 

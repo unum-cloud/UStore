@@ -108,14 +108,14 @@ struct fixture_paths_t {
 
 /** Appends @p piece to @p text, answering whether it fit. */
 [[nodiscard]] bool append(sz::string_t& text, std::string_view piece) noexcept {
-    return text.try_append(piece.data(), piece.size()) == sz::status_t::success_k;
+    return text.append(piece.data(), piece.size()) == sz::status_t::success_k;
 }
 
 /** Appends the decimal digits of @p number to @p text, answering whether they fit. */
 [[nodiscard]] bool append(sz::string_t& text, std::int64_t number) noexcept {
     char digits[24];
     std::to_chars_result const printed = std::to_chars(digits, digits + sizeof(digits), number);
-    return text.try_append(digits, static_cast<std::size_t>(printed.ptr - digits)) == sz::status_t::success_k;
+    return text.append(digits, static_cast<std::size_t>(printed.ptr - digits)) == sz::status_t::success_k;
 }
 
 /** Appends the NDJSON fixture document with key @p id, without a line break. */
@@ -162,7 +162,7 @@ struct fixture_paths_t {
     bool loaded = std::fseek(file, 0, SEEK_END) == 0;
     long const size = loaded ? std::ftell(file) : -1;
     loaded = size >= 0 && std::fseek(file, 0, SEEK_SET) == 0 &&
-             content.try_resize(static_cast<std::size_t>(size)) == sz::status_t::success_k;
+             content.resize(static_cast<std::size_t>(size)) == sz::status_t::success_k;
     loaded = loaded && std::fread(content.data(), 1, content.size(), file) == content.size();
     [[maybe_unused]] int const closed = std::fclose(file);
     return loaded;
@@ -305,7 +305,7 @@ struct json_document_t {
         yyjson_mut_doc_set_root(builder, copy);
         text = yyjson_mut_write(builder, 0, &length);
     }
-    bool const serialized = text && output.try_append(text, length) == sz::status_t::success_k;
+    bool const serialized = text && output.append(text, length) == sz::status_t::success_k;
     std::free(text);
     yyjson_mut_doc_free(builder);
     return serialized;

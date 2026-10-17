@@ -1,6 +1,7 @@
 # Engines
 
 Every engine implements the C ABI of `c/ustore/*.h` over its own storage, and joins `src/lib.cpp`, `src/docs.cpp` and `src/graph.cpp` in the one source list both the `ustore_static` archive and the `ustore_shared` library build from, so documents and graphs work on each of them.
+The reusable templates the engines instantiate live in `include/ustore/`, which [its own guide](../include/ustore/README.md) describes.
 The engines fill three roles: `ram` is the reference engine in memory, NVMe is the hyper-converged engine on NVMe drives and GPUs, and RocksDB and LevelDB bring third-party key-value stores behind the same calls.
 Engines aim for the highest isolation `ram` delivers, each reports the level its transactions actually deliver, and the conformance suite checks every advertised level against behaviour.
 
@@ -83,13 +84,13 @@ See [`nvme/README.md`](nvme/README.md) for its layers.
 
 ## Utilities
 
-`src/utilities/` holds what several engines share, in `unum::ustore::utilities`:
+`src/utilities/` holds what several engines share and what reads the C ABI's own types, in `unum::ustore::utilities`, beside the generic utilities of `include/ustore/utilities/` in the same namespace:
 
-- `ram_buffers.hpp` and `outputs.hpp` — the arena behind each C ABI call and behind the scratch it works in, the `arena_allocator` SmashTable's containers grow inside it, the `growing_strings` column a ragged output grows in, and the output columns every engine writes into the arena, each named for its verb: the values of a read, the keys of a scan or a sample, the strings of a strings scan, the bounds of a measurement, the collections a listing exports and those a name addresses.
+- `ram_buffers.hpp` in `include/ustore/utilities/` and `outputs.hpp` here — the arena behind each C ABI call and behind the scratch it works in, the `arena_allocator` SmashTable's containers grow inside it, the `growing_strings` column a ragged output grows in, and the output columns every engine writes into the arena, each named for its verb: the values of a read, the keys of a scan or a sample, the strings of a strings scan, the bounds of a measurement, the collections a listing exports and those a name addresses.
   Whatever grows while a call runs grows in scratch, and each output is copied into the arena once at its final length, so the arena holds no growth slack and no partial copies.
   An arena's first block spans its first allocation rounded up to a page, and every later block at least doubles the newest, so the one-off arena of a small call takes one page.
-- `algorithm.hpp` — the search over sorted batches that the documents and graphs share, the reservoir sampling of keys over the iterators of RocksDB and LevelDB, and the inserts and erases in buffers of trivially copyable elements.
-- `blocking_files.hpp` — whole-file mappings and directory queries, that block the calling thread and report a `status_t`.
+- `algorithm.hpp` in `include/ustore/utilities/` — the search over sorted batches that the documents and graphs share, the reservoir sampling of keys over the iterators of RocksDB and LevelDB, and the inserts and erases in buffers of trivially copyable elements.
+- `blocking_files.hpp` in `include/ustore/utilities/` — whole-file mappings and directory queries, that block the calling thread and report a `status_t`.
 - `progress.hpp` — `progress_t`, the one reporter of a call's progress, which runs its callback on one thread at a time, so the counts it sees never decrease, and carries a cancellation to every thread of the call.
 
 `batches.hpp` holds `strings_arg_t`, which reads a ragged input in any of its three layouts once the router has gathered what an accessor writes, beside the other batched arguments every engine takes and the checks every engine runs on them.
@@ -97,7 +98,7 @@ See [`nvme/README.md`](nvme/README.md) for its layers.
 
 ## Executors
 
-`src/utilities/ram_device.hpp` holds pools by type: an `executor_t` is spawned and deleted here and is the only kind parked when idle, a `lent_pool_t` is borrowed from another library and never deleted or parked, and both dispatch through a `pool_view_t`.
+`include/ustore/utilities/ram_device.hpp` holds pools by type: an `executor_t` is spawned and deleted here and is the only kind parked when idle, a `lent_pool_t` is borrowed from another library and never deleted or parked, and both dispatch through a `pool_view_t`.
 Every `ustore_executor_t` that `src/lib.cpp` builds holds one of them, a one-thread driver, and a deferred table of `deferred_limit` slots in a ring.
 `ustore_executor_for_ram` spawns its `executor_t` over a `topology_t`, which owns a `fu_topology_t`: `fu_pool_spawn` over every memory domain, `fu_pool_spawn_near_memory_domain` near one of several, and the whole machine for several but not all, since ForkUnion has no spawn over a subset.
 Zero threads take 7/8 of the cores of the compute domains local to the named memory domains, rounded down and at least one.

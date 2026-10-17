@@ -26,9 +26,10 @@
 
 #include "ustore/ustore.hpp"
 
-#include "engine.hpp"               // `engine_t`, `handle_t`, `c_handle`, `view_t`
-#include "harness.hpp"              // `suite_exit_code`, `expect`, `expect_eq`, `expect_status`, `spin_until`
-#include "utilities/ram_device.hpp" // `caller_exclusivity_t`, `executor_t`
+#include "ustore/utilities/ram_device.hpp" // `caller_exclusivity_t`, `executor_t`
+
+#include "engine.hpp"  // `engine_t`, `handle_t`, `c_handle`, `view_t`
+#include "harness.hpp" // `suite_exit_code`, `expect`, `expect_eq`, `expect_status`, `spin_until`
 
 using namespace unum::ustore;
 using namespace unum::ustore::test;

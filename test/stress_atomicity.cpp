@@ -24,8 +24,9 @@
 
 #include "ustore/ustore.hpp"
 
-#include "harness.hpp"              // `suite_exit_code`, `expect`, `suite_totals_t`
-#include "utilities/ram_device.hpp" // `caller_exclusivity_t`, `executor_t`
+#include "ustore/utilities/ram_device.hpp" // `caller_exclusivity_t`, `executor_t`
+
+#include "harness.hpp" // `suite_exit_code`, `expect`, `suite_totals_t`
 
 using namespace unum::ustore;
 using namespace unum::ustore::test;

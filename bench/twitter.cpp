@@ -45,9 +45,10 @@
 #include "ustore/docs.h"
 #include "ustore/graph.h"
 
+#include "ustore/utilities/blocking_files.hpp" // `mapped_file_t`
+
 #include "harness.hpp"
 #include "mixed.hpp"
-#include "utilities/blocking_files.hpp"
 
 namespace unum::ustore::bench {
 
@@ -180,7 +181,7 @@ struct twitter_t {
 [[nodiscard]] bool append_integer(sz::string_t& text, std::int64_t value) noexcept {
     char digits[24];
     std::to_chars_result const printed = std::to_chars(digits, digits + sizeof(digits), value);
-    return text.try_append(digits, static_cast<std::size_t>(printed.ptr - digits)) == sz::status_t::success_k;
+    return text.append(digits, static_cast<std::size_t>(printed.ptr - digits)) == sz::status_t::success_k;
 }
 
 /** The tweet @c append_tweet fills with an id, a text, an author and mentions. */
@@ -196,8 +197,7 @@ constexpr std::string_view
     std::size_t cursor = 0;
     for (std::size_t percent = tweet_template.find('%'); percent != std::string_view::npos;
          percent = tweet_template.find('%', cursor)) {
-        if (output.try_append(tweet_template.data() + cursor, percent - cursor) != sz::status_t::success_k)
-            return false;
+        if (output.append(tweet_template.data() + cursor, percent - cursor) != sz::status_t::success_k) return false;
         if (percent + 3 >= tweet_template.size() || tweet_template[percent + 2] != '$') return false;
         cursor = percent + 4;
         switch (tweet_template[percent + 1]) {
@@ -205,7 +205,7 @@ constexpr std::string_view
             if (!append_integer(output, tweet_id)) return false;
             break;
         case '2':
-            if (output.try_resize(output.size() + text_length, '_') != sz::status_t::success_k) return false;
+            if (output.resize(output.size() + text_length, '_') != sz::status_t::success_k) return false;
             break;
         case '3':
             if (!append_integer(output, user_id)) return false;
@@ -213,19 +213,18 @@ constexpr std::string_view
         case '4':
             for (std::size_t index = 0; index != mentioned_user_ids.size(); ++index) {
                 std::int64_t const mentioned = mentioned_user_ids[index];
-                if ((index != 0 && output.try_push_back(',') != sz::status_t::success_k) ||
-                    output.try_append(R"({"screen_name":"","name":"","id":)") != sz::status_t::success_k ||
+                if ((index != 0 && output.push_back(',') != sz::status_t::success_k) ||
+                    output.append(R"({"screen_name":"","name":"","id":)") != sz::status_t::success_k ||
+                    !append_integer(output, mentioned) || output.append(R"(,"id_str":")") != sz::status_t::success_k ||
                     !append_integer(output, mentioned) ||
-                    output.try_append(R"(,"id_str":")") != sz::status_t::success_k ||
-                    !append_integer(output, mentioned) ||
-                    output.try_append(R"(","indices":[]})") != sz::status_t::success_k)
+                    output.append(R"(","indices":[]})") != sz::status_t::success_k)
                     return false;
             }
             break;
         default: return false;
         }
     }
-    return output.try_append(tweet_template.data() + cursor, tweet_template.size() - cursor) == sz::status_t::success_k;
+    return output.append(tweet_template.data() + cursor, tweet_template.size() - cursor) == sz::status_t::success_k;
 }
 
 /** Generates @c max_tweets tweets from @c tweet_template_k, one per line, and indexes them. */
@@ -248,7 +247,7 @@ constexpr std::string_view
             if (st::failed(mentioned_user_ids.push_back(std::int64_t {user_ids[random.below(user_ids.size())]})))
                 return false;
         if (!append_tweet(twitter.generated, tweet_id, text_length, user_id, mentioned_user_ids) ||
-            twitter.generated.try_push_back('\n') != sz::status_t::success_k)
+            twitter.generated.push_back('\n') != sz::status_t::success_k)
             return false;
         [[maybe_unused]] st::status_t const pushed = user_ids.push_back(st::assume_reserved, std::int64_t {user_id});
     }

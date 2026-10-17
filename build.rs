@@ -31,6 +31,7 @@ const SOURCES: &[&str] = &[
     "c",
     "cmake",
     "cpp",
+    "include",
     "src",
     "src_oracles/leveldb",
     "src_oracles/rocksdb",

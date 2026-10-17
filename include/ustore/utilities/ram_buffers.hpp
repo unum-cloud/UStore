@@ -1,5 +1,5 @@
 /**
- *  @file src/utilities/ram_buffers.hpp
+ *  @file include/ustore/utilities/ram_buffers.hpp
  *  @author Ash Vardanian
  *  @date January 11, 2023
  *  @brief Growing arenas behind @c ustore_arena_t and behind the scratch calls work in, whose blocks ForkUnion places
@@ -24,11 +24,8 @@
 #include <forkunion.h>
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
-#include "ustore/ranges.hpp" // `u32_tape`, `u64_tape`
-#include "ustore/status.hpp" // `expected`, `status_t`
-#include "ustore/types.hpp"  // `round_up_to_multiple`, `divide_round_up`, `ustore_arena_t`
-
-#include "utilities/ram_device.hpp" // `claim_t`, `residency_t`
+#include "ustore/utilities/ram_device.hpp" // `claim_t`, `residency_t`
+#include "ustore/utilities/types.hpp"      // `expected`, `status_t`, `round_up_to_multiple`, `u32_tape`, `u64_tape`
 
 /** An arena made by @c ustore_arena_init: its chain of blocks, newest first, and the words its calls synchronize on. */
 struct ustore_arena_handle_t {
@@ -114,7 +111,8 @@ expected<std::span<element_type_>> arena_allocate(ustore_arena_t arena, std::siz
 inline expected<std::span<ustore_octet_t>> arena_allocate_bits(ustore_arena_t arena, std::size_t count) noexcept {
     auto [bits, status] = arena_allocate<ustore_octet_t>(arena, divide_round_up(count, bits_in_byte_k));
     if (status.failed()) return status;
-    std::memset(bits.data(), 0, bits.size());
+    // An empty span may carry a null pointer, which `memset` must not receive even for zero bytes
+    if (!bits.empty()) std::memset(bits.data(), 0, bits.size());
     return bits;
 }
 

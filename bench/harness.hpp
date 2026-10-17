@@ -37,8 +37,9 @@
 
 #include <smashtable/basic_vector.hpp>
 
+#include "ustore/utilities/ram_device.hpp" // `executor_t`, `caller_exclusivity_t`
+
 #include "arguments.hpp"
-#include "utilities/ram_device.hpp"
 
 namespace unum::ustore::bench {
 

@@ -138,9 +138,9 @@ struct tabular_t {
 /** Remembers the path and size of @p name under @p directory, answering whether both fit. */
 [[nodiscard]] bool remember_file(tabular_t& tabular, sz::string_t const& directory, char const* name) noexcept {
     std::size_t const offset = tabular.paths.size();
-    if (tabular.paths.try_append(directory) != sz::status_t::success_k ||
-        tabular.paths.try_append(name) != sz::status_t::success_k ||
-        tabular.paths.try_push_back('\0') != sz::status_t::success_k)
+    if (tabular.paths.append(directory) != sz::status_t::success_k ||
+        tabular.paths.append(name) != sz::status_t::success_k ||
+        tabular.paths.push_back('\0') != sz::status_t::success_k)
         return false;
     std::error_code error;
     std::uintmax_t const size = std::filesystem::file_size(tabular.paths.data() + offset, error);
@@ -154,8 +154,8 @@ struct tabular_t {
     std::string_view const extension = format_as(selected_format(settings));
     fmt::println("Will search for .{} files...", extension);
     sz::string_t directory;
-    if (directory.try_append(settings.dataset.data(), settings.dataset.size()) != sz::status_t::success_k ||
-        directory.try_push_back('/') != sz::status_t::success_k)
+    if (directory.append(settings.dataset.data(), settings.dataset.size()) != sz::status_t::success_k ||
+        directory.push_back('/') != sz::status_t::success_k)
         return false;
 
     std::error_code error;
@@ -211,11 +211,11 @@ void clear_collection(ustore_database_t database, ustore_collection_id_t collect
     char infix[24];
     auto const written = fmt::format_to_n(infix, sizeof(infix) - 1, "-{}.", thread_index);
     *written.out = '\0';
-    return path.try_append(settings.directory.data(), settings.directory.size()) == sz::status_t::success_k &&
-           path.try_push_back('/') == sz::status_t::success_k &&
-           path.try_append(stem.data(), stem.size()) == sz::status_t::success_k &&
-           path.try_append(infix) == sz::status_t::success_k &&
-           path.try_append(extension.data(), extension.size()) == sz::status_t::success_k;
+    return path.append(settings.directory.data(), settings.directory.size()) == sz::status_t::success_k &&
+           path.push_back('/') == sz::status_t::success_k &&
+           path.append(stem.data(), stem.size()) == sz::status_t::success_k &&
+           path.append(infix) == sz::status_t::success_k &&
+           path.append(extension.data(), extension.size()) == sz::status_t::success_k;
 }
 
 /** Imports every listed file as documents, each thread over its own contiguous share of the files. */
@@ -297,9 +297,9 @@ void bench_graph_export(executor_t& executor, tabular_t const& tabular, settings
         sz::string_t target;
         sz::string_t edge;
         if (!export_path(output, settings, "tabular_graph_edges", thread) ||
-            source.try_append(settings.source_field.data(), settings.source_field.size()) != sz::status_t::success_k ||
-            target.try_append(settings.target_field.data(), settings.target_field.size()) != sz::status_t::success_k ||
-            edge.try_append(settings.edge_field.data(), settings.edge_field.size()) != sz::status_t::success_k)
+            source.append(settings.source_field.data(), settings.source_field.size()) != sz::status_t::success_k ||
+            target.append(settings.target_field.data(), settings.target_field.size()) != sz::status_t::success_k ||
+            edge.append(settings.edge_field.data(), settings.edge_field.size()) != sz::status_t::success_k)
             return loop.skip("no memory for the export names");
         // Exported column names cannot hold the slashes of JSON pointers.
         for (sz::string_t* name : {&source, &target, &edge})

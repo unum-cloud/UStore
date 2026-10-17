@@ -33,11 +33,12 @@
 #include "ustore/docs.h"     // `ustore_docs_write_t`, `ustore_docs_read_t`
 #include "ustore/ranges.hpp" // `place_batch_t`, `values_view_t`
 
-#include "engine.hpp"                // `engine_of`, `view_t`, `docs_write_in_json_values`
-#include "utilities/algorithm.hpp"   // `offset_in_sorted`
-#include "utilities/batches.hpp"     // `strings_arg_t`, `places_of`
-#include "utilities/outputs.hpp"     // `read_outputs_t`
-#include "utilities/ram_buffers.hpp" // `arena_allocate`, `arena_grow`, `arena_allocator`, `growing_strings`
+#include "ustore/utilities/algorithm.hpp"   // `offset_in_sorted`
+#include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_grow`, `arena_allocator`, `growing_strings`
+
+#include "engine.hpp"            // `engine_of`, `view_t`, `docs_write_in_json_values`
+#include "utilities/batches.hpp" // `strings_arg_t`, `places_of`
+#include "utilities/outputs.hpp" // `read_outputs_t`
 
 namespace unum::ustore {
 using namespace unum::ustore::utilities;

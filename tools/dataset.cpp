@@ -28,8 +28,9 @@
 #include "ustore/ranges.hpp" // `bits_view_t`, `tape_string`, `u64_tape`
 #include "ustore/types.hpp"  // `sz`, `st`
 
-#include "dataset.h"                    // `ustore_docs_import_t`, `ustore_graph_export_t`
-#include "utilities/blocking_files.hpp" // `mapped_file_t`
+#include "ustore/utilities/blocking_files.hpp" // `mapped_file_t`
+
+#include "dataset.h" // `ustore_docs_import_t`, `ustore_graph_export_t`
 
 namespace unum::ustore::tools {
 
@@ -78,7 +79,7 @@ class output_file_t {
     /** Buffers @p text, writing the buffer out once it reaches the threshold; does nothing after a failure. */
     void append(std::string_view text, ustore_outcome_t* outcome) noexcept {
         if (failed(outcome)) return;
-        if (buffer_.try_append(text.data(), text.size()) != sz::status_t::success_k) {
+        if (buffer_.append(text.data(), text.size()) != sz::status_t::success_k) {
             *outcome = {ustore_status_out_of_memory_k, "Failed to buffer the output"};
             return;
         }
@@ -153,7 +154,7 @@ void copy_path(ustore_bytes_view_t path, sz::string_t& copy, ustore_outcome_t* o
         *outcome = {ustore_status_invalid_argument_k, "Empty path specified"};
         return;
     }
-    if (copy.try_assign(sz::string_view_t {string_of(path)}) != sz::status_t::success_k)
+    if (copy.assign(sz::string_view_t {string_of(path)}) != sz::status_t::success_k)
         *outcome = {ustore_status_out_of_memory_k, "Failed to copy the path"};
 }
 
@@ -250,7 +251,7 @@ void append_json(yyjson_mut_doc* builder, sz::string_t& output, ustore_outcome_t
         *outcome = {ustore_status_out_of_memory_k, "Failed to serialize the document"};
         return;
     }
-    if (output.try_append(text.handle, length) != sz::status_t::success_k)
+    if (output.append(text.handle, length) != sz::status_t::success_k)
         *outcome = {ustore_status_out_of_memory_k, "Failed to buffer a document"};
 }
 
@@ -321,13 +322,13 @@ class csv_reader_t {
             while (true) {
                 std::size_t const quote = text_.find('"', cursor);
                 if (quote >= size) return csv_boundary_t::malformed_k;
-                if (unquoted_.try_append(data + cursor, quote - cursor) != sz::status_t::success_k)
+                if (unquoted_.append(data + cursor, quote - cursor) != sz::status_t::success_k)
                     return csv_boundary_t::malformed_k;
                 if (quote + 1 == size || data[quote + 1] != '"') {
                     position_ = quote + 1;
                     break;
                 }
-                if (unquoted_.try_push_back('"') != sz::status_t::success_k) return csv_boundary_t::malformed_k;
+                if (unquoted_.push_back('"') != sz::status_t::success_k) return csv_boundary_t::malformed_k;
                 cursor = quote + 2;
             }
             field = unquoted_;
@@ -374,7 +375,7 @@ void read_header(csv_reader_t& reader, field_list_t fields, sz::string_t& names,
             if (field == name) use = column_use_t::kept_k;
         }
         csv_column_t const column {names.size(), name.size(), use};
-        if (names.try_append(name.data(), name.size()) != sz::status_t::success_k ||
+        if (names.append(name.data(), name.size()) != sz::status_t::success_k ||
             st::failed(columns.push_back(csv_column_t {column}))) {
             *outcome = {ustore_status_out_of_memory_k, "Failed to allocate the CSV header"};
             return;
@@ -535,7 +536,7 @@ void import_ndjson_documents(ustore_docs_import_t const& task, field_list_t fiel
         if (row.empty()) continue;
 
         if (fields.empty()) {
-            if (batch.text().try_append(row.data(), row.size()) != sz::status_t::success_k)
+            if (batch.text().append(row.data(), row.size()) != sz::status_t::success_k)
                 *task.outcome = {ustore_status_out_of_memory_k, "Failed to buffer a document"};
         }
         else {

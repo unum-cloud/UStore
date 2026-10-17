@@ -6,7 +6,7 @@ UStore's sources split into four folders:
 
 - `c/`: the public C SDK every wrapper forwards to, the C ABI in `c/ustore/*.h`, with [its own guide](https://github.com/unum-cloud/UStore/blob/main/c/README.md), whose [Installation](https://github.com/unum-cloud/UStore/blob/main/c/README.md#installation) covers the wrappers too.
 - `cpp/`: these wrappers in `cpp/ustore/*.hpp`, in `unum::ustore`, and this guide.
-- `include/`: reserved for the first-party classes and templates that advanced users may reuse to build their own low-level stores, each subfolder `ustore/<dir>/` opening `unum::ustore::<dir>`.
+- `include/`: the first-party classes and templates that advanced users may reuse to build their own low-level stores, each subfolder `ustore/<dir>/` opening `unum::ustore::<dir>`, with [its own guide](../include/ustore/README.md).
 - `src/`: UStore's own instantiations of those templates, the engines behind the C ABI.
 
 `c/` and `cpp/` are both include roots, so every header is spelled `<ustore/...>` in the tree and once installed.
@@ -23,8 +23,8 @@ UStore's sources split into four folders:
 - `graph_collection.hpp`: graph collections and their deferred twins.
 - `graph_stream.hpp`: adjacency streams.
 - `strings_collection.hpp`: string-keyed collections, cursors, prefix walks and deferred twins.
-- `status.hpp`: `status_code_t`, `status_t`, `expected` and `deferred`.
-- `types.hpp`: value views, arenas, stamps, receivers and executors.
+- `status.hpp`: `deferred`, and `status_code_t`, `status_t` and `expected` re-exported from `ustore/utilities/types.hpp`.
+- `types.hpp`: arenas, stamps, receivers and executors, and the keys, edges and value views re-exported from `ustore/utilities/types.hpp`.
 - `ranges.hpp`: strided ranges, argument adapters, read views and tapes.
 
 ## Conventions

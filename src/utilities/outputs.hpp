@@ -19,7 +19,7 @@
 #include "ustore/status.hpp" // `expected`, `status_t`
 #include "ustore/types.hpp"  // `value_view_t`, `string_of`, `round_up_to_multiple`
 
-#include "utilities/ram_buffers.hpp" // `arena_allocate`, `arena_allocator`, `growing_strings`, `export_strings`
+#include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_allocator`, `growing_strings`, `export_strings`
 
 namespace unum::ustore::utilities {
 

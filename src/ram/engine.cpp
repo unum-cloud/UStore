@@ -52,13 +52,14 @@
 #include "ustore/ranges.hpp" // `place_batch_t`, `edges_view_t`, `strided`
 #include "ustore/strings.h"
 
-#include "engine.hpp"                   // `engine_t`, `handle_t`, `handle_cast`, `view_t`
-#include "ram/key.hpp"                  // `string_key_t`, `half_edge_t`
-#include "utilities/batches.hpp"        // `scan_batch_t`, `strings_arg_t`, `edges_batch_t`, `places_of`, `edges_of`
-#include "utilities/blocking_files.hpp" // `directory_exists`
-#include "utilities/outputs.hpp"        // `read_outputs_t`, `scan_outputs_t`, `collection_list_outputs_t`
-#include "utilities/progress.hpp"       // `progress_t`, `progress_cancelled_k`
-#include "utilities/ram_buffers.hpp"    // `arena_allocate`, `arena_copy`, `arena_allocator`
+#include "ustore/utilities/blocking_files.hpp" // `directory_exists`
+#include "ustore/utilities/ram_buffers.hpp"    // `arena_allocate`, `arena_copy`, `arena_allocator`
+
+#include "engine.hpp"             // `engine_t`, `handle_t`, `handle_cast`, `view_t`
+#include "ram/key.hpp"            // `string_key_t`, `half_edge_t`
+#include "utilities/batches.hpp"  // `scan_batch_t`, `strings_arg_t`, `edges_batch_t`, `places_of`, `edges_of`
+#include "utilities/outputs.hpp"  // `read_outputs_t`, `scan_outputs_t`, `collection_list_outputs_t`
+#include "utilities/progress.hpp" // `progress_t`, `progress_cancelled_k`
 
 namespace unum::ustore::ram {
 using namespace unum::ustore::utilities;
@@ -1302,8 +1303,8 @@ class stream_t {
 
 /** Joins @p directory and @p name into @p path, answering whether it fit in memory. */
 inline bool join_path(sz::string_t& path, char const* directory, std::string_view name) noexcept {
-    return path.try_assign(sz::string_view_t {directory}) == sz::status_t::success_k &&
-           path.try_append(name.data(), name.size()) == sz::status_t::success_k;
+    return path.assign(sz::string_view_t {directory}) == sz::status_t::success_k &&
+           path.append(name.data(), name.size()) == sz::status_t::success_k;
 }
 
 /** Writes @p blob as its length and its bytes, answering whether all of it reached @p file. */
@@ -1557,7 +1558,7 @@ status_t open_database(database_state<isolation_>& state, std::string_view direc
         return {status_code_t::out_of_memory_k, "Failed to list the main collection"};
     }
     if (directory.empty()) return {};
-    if (state.directory.try_assign(sz::string_view_t {directory}) != sz::status_t::success_k)
+    if (state.directory.assign(sz::string_view_t {directory}) != sz::status_t::success_k)
         return {status_code_t::out_of_memory_k, "Failed to copy the directory"};
     if (!names_directory(state.directory.c_str())) return {status_code_t::not_found_k, "The directory doesn't exist"};
     return read_image(state, main);
@@ -1739,7 +1740,7 @@ template <isolation_t isolation_>
 status_t serve(database_state<isolation_>& state, ustore_snapshot_save_t const& arguments,
                view_t const& view) noexcept {
     sz::string_t path;
-    if (path.try_assign(sz::string_view_t {string_of(arguments.path)}) != sz::status_t::success_k)
+    if (path.assign(sz::string_view_t {string_of(arguments.path)}) != sz::status_t::success_k)
         return {status_code_t::out_of_memory_k, "Failed to copy the save path"};
     if (path.empty() || !names_directory(path.c_str()))
         return {status_code_t::not_found_k, "The save path isn't a directory"};

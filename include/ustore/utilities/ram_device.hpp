@@ -1,5 +1,5 @@
 /**
- *  @file src/utilities/ram_device.hpp
+ *  @file include/ustore/utilities/ram_device.hpp
  *  @author Ash Vardanian
  *  @date September 15, 2026
  *  @brief The one owner of threads and topology, over ForkUnion's C ABI.
@@ -20,7 +20,7 @@
 
 #include <smashtable/shared.hpp>
 
-#include "ustore/types.hpp"
+#include "ustore/utilities/types.hpp" // `st::status_t`, `st::expected`
 
 /** Whether one call holds a word that every other call finds contended, global like the arena handle carrying it. */
 enum class claim_t : std::uint32_t {

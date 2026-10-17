@@ -58,13 +58,14 @@
 #include "ustore/ranges.hpp" // `place_batch_t`, `strided`
 #include "ustore/status.hpp" // `expected`, `status_t`
 
-#include "engine.hpp"                   // `engine_t`, `handle_t`, `handle_cast`
-#include "utilities/algorithm.hpp"      // `reservoir_sample_iterator`
-#include "utilities/batches.hpp"        // `strings_arg_t`, `validate_write`, `places_of`
-#include "utilities/blocking_files.hpp" // `directory_exists`
-#include "utilities/outputs.hpp"        // `read_outputs_t`, `scan_outputs_t`, `collection_list_outputs_t`
-#include "utilities/progress.hpp"       // `progress_t`, `progress_cancelled_k`
-#include "utilities/ram_buffers.hpp"    // `arena_allocate`, `growth_status`
+#include "ustore/utilities/algorithm.hpp"      // `reservoir_sample_iterator`
+#include "ustore/utilities/blocking_files.hpp" // `directory_exists`
+#include "ustore/utilities/ram_buffers.hpp"    // `arena_allocate`, `growth_status`
+
+#include "engine.hpp"             // `engine_t`, `handle_t`, `handle_cast`
+#include "utilities/batches.hpp"  // `strings_arg_t`, `validate_write`, `places_of`
+#include "utilities/outputs.hpp"  // `read_outputs_t`, `scan_outputs_t`, `collection_list_outputs_t`
+#include "utilities/progress.hpp" // `progress_t`, `progress_cancelled_k`
 
 namespace unum::ustore::oracles::leveldb {
 using namespace unum::ustore::utilities;

@@ -16,6 +16,7 @@ include = [
   "/cmake/**",
   "/c/ustore/**",
   "/cpp/ustore/**",
+  "/include/ustore/**",
   "/src/**",
   "/src_oracles/**",
   "/tools/**",

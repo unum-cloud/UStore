@@ -1,5 +1,5 @@
 /**
- *  @file src/utilities/vram_nvidia_device.hpp
+ *  @file include/ustore/utilities/vram_nvidia_device.hpp
  *  @author Ash Vardanian
  *  @date September 15, 2026
  *  @brief CUDA devices from the host: specifications, memory, NUMA placement, streams, events and buffers.
@@ -26,7 +26,7 @@
 #include <smashtable/basic_vector.hpp>
 #include <smashtable/shared.hpp>
 
-#include "utilities/ram_device.hpp"
+#include "ustore/utilities/ram_device.hpp"
 #endif
 
 #if __has_include(<cuda_runtime.h>)

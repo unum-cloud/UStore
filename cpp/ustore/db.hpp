@@ -140,7 +140,7 @@ inline place_batch_t places_of_(keys_view_t keys) noexcept {
 
 /** Copies @p text into @p copy, answering the bytes of the copy, which a deferred call reads until it is final. */
 inline expected<ustore_bytes_view_t> own_bytes_(std::string_view text, sz::string_t& copy) noexcept {
-    if (copy.try_assign(sz::string_view_t {text}) != sz::status_t::success_k)
+    if (copy.assign(sz::string_view_t {text}) != sz::status_t::success_k)
         return status_t {status_code_t::out_of_memory_k, "Failed to copy a string into a deferred call"};
     return bytes_of(std::string_view {copy});
 }

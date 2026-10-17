@@ -22,8 +22,9 @@
 
 #include "ustore/status.hpp" // `expected`, `status_t`
 
-#include "utilities/batches.hpp"    // `strings_arg_t`
-#include "utilities/ram_device.hpp" // `claim_t`, `residency_t`
+#include "ustore/utilities/ram_device.hpp" // `claim_t`, `residency_t`
+
+#include "utilities/batches.hpp" // `strings_arg_t`
 
 namespace unum::ustore {
 

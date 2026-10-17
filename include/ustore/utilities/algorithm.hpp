@@ -1,5 +1,5 @@
 /**
- *  @file src/utilities/algorithm.hpp
+ *  @file include/ustore/utilities/algorithm.hpp
  *  @author Ash Vardanian
  *  @date January 11, 2023
  *  @brief Searches over sorted batches, reservoir sampling of keys over the iterators of ordered engines, and inserts
@@ -17,10 +17,7 @@
 #include <ranges>      // `std::ranges::random_access_range`
 #include <type_traits> // `std::is_trivially_copyable_v`
 
-#include "ustore/status.hpp" // `status_t`
-#include "ustore/types.hpp"  // `ustore_key_t`
-
-#include "utilities/outputs.hpp" // `scan_outputs_t`
+#include "ustore/utilities/types.hpp" // `status_t`, `ustore_key_t`
 
 namespace unum::ustore::utilities {
 
@@ -34,11 +31,12 @@ std::size_t offset_in_sorted(range_ const& sorted, wanted_ const& wanted) noexce
  *  Appends up to @p limit keys drawn uniformly over a RocksDB or LevelDB iterator to @p outputs.
  *  @param[inout] iterator Engine iterator, rewound to the first key before sampling.
  *  @param[in] limit The most keys the sample draws, fewer only when the collection holds fewer.
- *  @param[inout] outputs The outputs the drawn keys land on, after the keys they already hold.
+ *  @param[inout] outputs The outputs the drawn keys land on, after the keys they already hold, which @c push a key,
+ *      answering a status, and address a key with @c operator[].
  *  @see https://en.wikipedia.org/wiki/Reservoir_sampling
  */
-template <typename iterator_>
-status_t reservoir_sample_iterator(iterator_&& iterator, std::size_t limit, scan_outputs_t& outputs) {
+template <typename iterator_, typename outputs_type_>
+status_t reservoir_sample_iterator(iterator_&& iterator, std::size_t limit, outputs_type_& outputs) {
 
     auto const seed = static_cast<std::minstd_rand::result_type>(
         std::chrono::steady_clock::now().time_since_epoch().count());

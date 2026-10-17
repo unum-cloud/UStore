@@ -64,6 +64,7 @@ sdist.include = [
   "/VERSION",
   "/c/ustore/**",
   "/cpp/ustore/**",
+  "/include/ustore/**",
   "/src/**",
   "/src_oracles/**",
   "/cmake/**",
