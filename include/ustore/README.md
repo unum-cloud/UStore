@@ -20,6 +20,7 @@ Pin a commit, not a version, when building on them.
   - `vram_nvidia_device.hpp`: CUDA devices, streams, events and buffers from the host.
   - `blocking_files.hpp`: whole-file mappings and directory queries.
   - `algorithm.hpp`: searches over sorted batches, reservoir sampling over ordered iterators, and inserts and erases in trivially copyable buffers.
+  - `folds.hpp`: `fold_concept`, which folds the base of a key with the deltas newer than it, and `last_write_fold`, where the newest record wins.
   - `nvme_ring.hpp`: aligned and budgeted allocators, completion counters, 128-bit identifiers, serialization, extents, and the submission and completion ring every NVMe transport exposes.
     It reaches no StringZilla, so CUDA translation units include it.
   - `nvme_disks.hpp`: the ring machinery every disk shares, the volume in memory, and the blocking floor of positioned reads and writes.
@@ -46,6 +47,7 @@ Pin a commit, not a version, when building on them.
   - `json_paths.hpp`: fields translated into chains of JSONPath prefixes and resolved for a batch of documents in one StringZilla subdocuments pass, into the same values yyjson's lookup finds, or handed back to yyjson where the pass cannot read a batch as yyjson does.
   - `json_values.hpp`: JSON documents parsed with yyjson into an arena, and the conversions between their values and the scalars, strings and UUIDs of a gathered column.
   - `json_patch.hpp`: RFC 6902 patches, RFC 7386 merges, and the field-level inserts, updates and upserts of a document.
+  - `json_fold.hpp`: `json_fold`, which replays deltas of one modification of one field each as `ustore_docs_write` reads, modifies and writes back today, and composes them without a base where that is sound.
 - `strings/`, in `unum::ustore::strings`:
   - `string_keys.hpp`: `string_key_t`, the owned key of a strings collection and of a collection's name, with its order and hash.
 

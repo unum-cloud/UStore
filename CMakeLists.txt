@@ -445,7 +445,7 @@ if (${USTORE_BUILD_TEST})
     endforeach ()
 
     # The templates of `include/ustore/` build against the header target alone, with no engine linked
-    set(USTORE_UTILITIES_TEST_NAMES "ram_buffers")
+    set(USTORE_UTILITIES_TEST_NAMES "ram_buffers" "algorithm")
     foreach (test_name IN ITEMS ${USTORE_UTILITIES_TEST_NAMES})
         add_executable(ustore_test_utilities_${test_name} test/utilities/${test_name}.cpp)
         target_include_directories(ustore_test_utilities_${test_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
@@ -468,6 +468,17 @@ if (${USTORE_BUILD_TEST})
         )
         add_test(NAME ustore_test_${test_name} COMMAND ustore_test_${test_name})
     endforeach ()
+
+    # The graph fold calls no StringZilla kernel, so its suite builds against the header target alone
+    add_executable(ustore_test_graph_adjacency_fold test/graph/adjacency_fold.cpp)
+    target_link_libraries(ustore_test_graph_adjacency_fold PRIVATE ustore::header fmt::fmt ustore_warnings)
+    add_test(NAME ustore_test_graph_adjacency_fold COMMAND ustore_test_graph_adjacency_fold)
+
+    # The docs fold is checked against the read-modify-write path of `ustore_docs_write`, so its suite links an engine
+    add_executable(ustore_test_docs_json_fold test/docs/json_fold.cpp)
+    target_include_directories(ustore_test_docs_json_fold PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
+    target_link_libraries(ustore_test_docs_json_fold PRIVATE ustore::static yyjson fmt::fmt ustore_warnings)
+    add_test(NAME ustore_test_docs_json_fold COMMAND ustore_test_docs_json_fold)
 
     # The C ABI compiles as plain C11, so a header that only a C++ compiler accepts fails to build. It links against
     # both libraries, and the shared one exports only what `USTORE_EXPORT` marks.
