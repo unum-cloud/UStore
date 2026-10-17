@@ -1,6 +1,7 @@
 # Engines
 
-Every engine implements the C ABI of `c/ustore/*.h` over its own storage, and joins `src/lib.cpp`, `src/docs.cpp` and `src/graph.cpp` in the one source list both the `ustore_static` archive and the `ustore_shared` library build from, so documents and graphs work on each of them.
+Every engine implements the C ABI of `c/ustore/*.h` over its own storage, and joins the router's sources in the one source list both the `ustore_static` archive and the `ustore_shared` library build from, so documents and graphs work on each of them.
+`src/lib.hpp` is the router every exported call goes through, and each public header has one source implementing it: `types.cpp`, `db.cpp`, `blobs.cpp`, `strings.cpp`, `docs.cpp`, `graph.cpp` and `pages.cpp`.
 The reusable templates the engines instantiate live in `include/ustore/`, which [its own guide](../include/ustore/README.md) describes.
 The engines fill three roles: `ram` is the reference engine in memory, NVMe is the hyper-converged engine on NVMe drives and GPUs, and RocksDB and LevelDB bring third-party key-value stores behind the same calls.
 Engines aim for the highest isolation `ram` delivers, each reports the level its transactions actually deliver, and the conformance suite checks every advertised level against behaviour.
@@ -99,7 +100,7 @@ See [`nvme/README.md`](nvme/README.md) for its layers.
 ## Executors
 
 `include/ustore/utilities/ram_device.hpp` holds pools by type: an `executor_t` is spawned and deleted here and is the only kind parked when idle, a `lent_pool_t` is borrowed from another library and never deleted or parked, and both dispatch through a `pool_view_t`.
-Every `ustore_executor_t` that `src/lib.cpp` builds holds one of them, a one-thread driver, and a deferred table of `deferred_limit` slots in a ring.
+Every `ustore_executor_t` that `src/types.cpp` builds holds one of them, a one-thread driver, and a deferred table of `deferred_limit` slots in a ring.
 `ustore_executor_for_ram` spawns its `executor_t` over a `topology_t`, which owns a `fu_topology_t`: `fu_pool_spawn` over every memory domain, `fu_pool_spawn_near_memory_domain` near one of several, and the whole machine for several but not all, since ForkUnion has no spawn over a subset.
 Zero threads take 7/8 of the cores of the compute domains local to the named memory domains, rounded down and at least one.
 `ustore_executor_on_pool` builds a `lent_pool_t` through `lent_pool_t::borrow`, which refuses a null pool or one holding no threads.
@@ -122,7 +123,7 @@ Every handle, arenas included, also counts its unfinished deferred calls: a subm
 A transaction, a snapshot and a cursor each hold their database open, and a cursor also holds the transaction or snapshot it reads through, so every free drops one hold and the last one frees the handle through its engine.
 In a build without OS threads there is no driver, and every call runs at submission.
 
-Cursors live in `src/lib.cpp` with no engine slot.
+Cursors live in `src/lib.hpp`, `src/blobs.cpp` and `src/strings.cpp` with no engine slot.
 A pull calls the engine's scan slot into the call's scratch, then its read slot into the caller's arena when values are asked for, and copies the keys or the strings into the arena, so the arena holds only outputs.
 A blobs cursor resumes at `key_after` of its last key, and a strings cursor at its last string followed by a zero byte, the smallest string after it.
 A page shorter than `wanted`, or one ending at the largest key, sets the cursor's `exhausted` flag, after which every pull writes zero without reading.

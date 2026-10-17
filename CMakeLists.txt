@@ -220,7 +220,16 @@ endif ()
 # siblings every build needs, as USearch's does, while the storage engines it links stay archives of their own,
 # installed beside it, so a change to UStore never rewrites RocksDB.
 set(USTORE_ENGINE_NAMES "ram")
-set(USTORE_SOURCES src/lib.cpp src/docs.cpp src/graph.cpp src/ram/engine.cpp)
+set(USTORE_SOURCES
+    src/types.cpp
+    src/db.cpp
+    src/blobs.cpp
+    src/strings.cpp
+    src/docs.cpp
+    src/graph.cpp
+    src/pages.cpp
+    src/ram/engine.cpp
+)
 set(USTORE_SIBLING_ARCHIVES forkunion_static stringzilla_static)
 set(USTORE_DEPENDENCIES ${USTORE_SIBLING_ARCHIVES} yyjson fmt)
 set(USTORE_ENGINE_ARCHIVES)

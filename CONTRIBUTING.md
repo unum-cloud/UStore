@@ -33,21 +33,22 @@ The `release` and `relwithdebinfo` presets build with whatever toolchain the env
 
 ## Layout and Namespaces
 
-| Path                    | Contents                                              | Namespace                         |
-| :---------------------- | :---------------------------------------------------- | :-------------------------------- |
-| `c/ustore/*.h`          | the C ABI, flat                                       | none                              |
-| `c/test.c`              | compiles the C ABI as plain C11                       | none                              |
-| `cpp/ustore/*.hpp`      | the C++ wrappers over the C ABI, flat                 | `unum::ustore`                    |
-| `include/ustore/<dir>/` | header-only templates the engines instantiate         | `unum::ustore::<dir>`             |
-| `src/*.cpp`             | the C ABI dispatch in `lib.cpp`, documents and graphs | `unum::ustore`                    |
-| `src/engine.hpp`        | the table of calls every engine fills                 | `unum::ustore`                    |
-| `src/utilities/`        | batches, outputs and progress over the C ABI's types  | `unum::ustore::utilities`         |
-| `src/<engine>/`         | `engine.cpp` and the headers of `ram` and `nvme`      | `unum::ustore::<engine>`          |
-| `src_oracles/<engine>/` | `engine.cpp` of RocksDB and LevelDB, kept as oracles  | `unum::ustore::oracles::<engine>` |
-| `tools/`                | the CLI, flag parsing, and dataset import and export  | `unum::ustore::tools`             |
-| `test/`                 | suites mirroring `src/`, and their harness            | `unum::ustore::test`              |
-| `bench/`                | benchmarks mirroring `src/`, and their harness        | `unum::ustore::bench`             |
-| `verification/`         | Spin models and GenMC checks, run by `check.sh`       | none                              |
+| Path                    | Contents                                             | Namespace                         |
+| :---------------------- | :--------------------------------------------------- | :-------------------------------- |
+| `c/ustore/*.h`          | the C ABI, flat                                      | none                              |
+| `c/test.c`              | compiles the C ABI as plain C11                      | none                              |
+| `cpp/ustore/*.hpp`      | the C++ wrappers over the C ABI, flat                | `unum::ustore`                    |
+| `include/ustore/<dir>/` | header-only templates the engines instantiate        | `unum::ustore::<dir>`             |
+| `src/lib.hpp`           | the router every exported call goes through          | `unum::ustore`                    |
+| `src/*.cpp`             | one source per public header, documents and graphs   | `unum::ustore`                    |
+| `src/engine.hpp`        | the table of calls every engine fills                | `unum::ustore`                    |
+| `src/utilities/`        | batches, outputs and progress over the C ABI's types | `unum::ustore::utilities`         |
+| `src/<engine>/`         | `engine.cpp` and the headers of `ram` and `nvme`     | `unum::ustore::<engine>`          |
+| `src_oracles/<engine>/` | `engine.cpp` of RocksDB and LevelDB, kept as oracles | `unum::ustore::oracles::<engine>` |
+| `tools/`                | the CLI, flag parsing, and dataset import and export | `unum::ustore::tools`             |
+| `test/`                 | suites mirroring `src/`, and their harness           | `unum::ustore::test`              |
+| `bench/`                | benchmarks mirroring `src/`, and their harness       | `unum::ustore::bench`             |
+| `verification/`         | Spin models and GenMC checks, run by `check.sh`      | none                              |
 
 Namespaces mirror directories and nothing else: a directory adds a namespace component, and no namespace groups symbols by theme.
 `src_oracles/` adds `oracles`, and an engine sees `unum::ustore::utilities` through one `using namespace` right after its own namespace opens.

@@ -37,6 +37,7 @@
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_grow`, `arena_allocator`, `growing_strings`
 
 #include "engine.hpp"            // `engine_of`, `view_t`, `docs_write_in_json_values`
+#include "lib.hpp"               // `route`, `enumerator_spelling`, `name_in`, `value_in`
 #include "utilities/batches.hpp" // `strings_arg_t`, `places_of`
 #include "utilities/outputs.hpp" // `read_outputs_t`
 
@@ -1104,4 +1105,49 @@ status_t docs_gather_in_json_values(ustore_docs_gather_t const& arguments, strin
 
 #pragma endregion Document Calls
 
+#pragma region Names
+
+/** The canonical spelling of every document field type. */
+constexpr enumerator_spelling<ustore_docs_field_type_t> docs_field_type_names_k[] {
+    {ustore_docs_field_type_json_k, "json"}, {ustore_docs_field_type_null_k, "null"},
+    {ustore_docs_field_type_bool_k, "bool"}, {ustore_docs_field_type_uuid_k, "uuid"},
+    {ustore_docs_field_type_f64_k, "f64"},   {ustore_docs_field_type_f32_k, "f32"},
+    {ustore_docs_field_type_f16_k, "f16"},   {ustore_docs_field_type_i64_k, "i64"},
+    {ustore_docs_field_type_i32_k, "i32"},   {ustore_docs_field_type_i16_k, "i16"},
+    {ustore_docs_field_type_i8_k, "i8"},     {ustore_docs_field_type_u64_k, "u64"},
+    {ustore_docs_field_type_u32_k, "u32"},   {ustore_docs_field_type_u16_k, "u16"},
+    {ustore_docs_field_type_u8_k, "u8"},     {ustore_docs_field_type_bin_k, "bin"},
+    {ustore_docs_field_type_str_k, "str"},
+};
+
+/** The canonical spelling of every document modification. */
+constexpr enumerator_spelling<ustore_docs_modification_t> docs_modification_names_k[] {
+    {ustore_docs_modify_upsert_k, "upsert"}, {ustore_docs_modify_update_k, "update"},
+    {ustore_docs_modify_insert_k, "insert"}, {ustore_docs_modify_patch_k, "patch"},
+    {ustore_docs_modify_merge_k, "merge"},
+};
+
+#pragma endregion Names
+
 } // namespace unum::ustore
+
+void ustore_docs_write(ustore_docs_write_t* arguments) { route<&engine_t::docs_write>(arguments); }
+void ustore_docs_read(ustore_docs_read_t* arguments) { route<&engine_t::docs_read>(arguments); }
+void ustore_docs_gist(ustore_docs_gist_t* arguments) { route<&engine_t::docs_gist>(arguments); }
+void ustore_docs_gather(ustore_docs_gather_t* arguments) { route<&engine_t::docs_gather>(arguments); }
+
+char const* ustore_docs_field_type_name(ustore_docs_field_type_t field_type) {
+    return name_in(docs_field_type_names_k, field_type);
+}
+
+ustore_docs_field_type_t ustore_docs_field_type_from_name(ustore_bytes_view_t name) {
+    return value_in(docs_field_type_names_k, name);
+}
+
+char const* ustore_docs_modification_name(ustore_docs_modification_t modification) {
+    return name_in(docs_modification_names_k, modification);
+}
+
+ustore_docs_modification_t ustore_docs_modification_from_name(ustore_bytes_view_t name) {
+    return value_in(docs_modification_names_k, name);
+}

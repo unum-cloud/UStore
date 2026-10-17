@@ -2,7 +2,7 @@
  *  @file src/engine.hpp
  *  @author Ash Vardanian
  *  @date September 27, 2026
- *  @brief The table of calls every engine fills, which the C ABI in `src/lib.cpp` routes each handle through.
+ *  @brief The table of calls every engine fills, which the router of `src/lib.hpp` routes each handle through.
  */
 
 #pragma once
@@ -159,7 +159,7 @@ ustore_database_t database_of(arguments_type_ const& arguments) noexcept {
 }
 
 /**
- *  @brief Routes the init @p arguments of an engine as `src/lib.cpp` routes every call: on the calling thread,
+ *  @brief Routes the init @p arguments of an engine as `src/lib.hpp` routes every call: on the calling thread,
  *      blocking on their executor, or submitted to it, served by the engine's @p open, since no handle names the
  *      engine yet.
  *

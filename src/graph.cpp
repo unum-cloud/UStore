@@ -32,12 +32,14 @@
 #include <optional>   // `std::optional`
 #include <span>       // `std::span`
 
+#include "ustore/graph.h"    // `ustore_graph_read_edges_t`, `ustore_vertex_role_t`
 #include "ustore/ranges.hpp" // `strided_span`, `values_view_t`, `collection_key_t`
 
 #include "ustore/utilities/algorithm.hpp"   // `offset_in_sorted`, `trivial_insert`, `trivial_erase`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`
 
 #include "engine.hpp"            // `engine_of`, `view_t`, `graph_read_edges_in_vertex_values`
+#include "lib.hpp"               // `route`, `enumerator_spelling`, `name_in`, `value_in`
 #include "utilities/batches.hpp" // `edges_batch_t`, `strings_arg_t`
 
 namespace unum::ustore {
@@ -660,4 +662,36 @@ status_t graph_remove_vertices_in_vertex_values(ustore_graph_remove_vertices_t c
                           arguments.durability, view);
 }
 
+#pragma region Names
+
+/** The canonical spelling of every vertex role. */
+constexpr enumerator_spelling<ustore_vertex_role_t> vertex_role_names_k[] {
+    {ustore_vertex_role_unknown_k, "unknown"},
+    {ustore_vertex_role_source_k, "source"},
+    {ustore_vertex_role_target_k, "target"},
+    {ustore_vertex_role_any_k, "any"},
+};
+
+#pragma endregion Names
+
 } // namespace unum::ustore
+
+void ustore_graph_read_edges(ustore_graph_read_edges_t* arguments) { route<&engine_t::graph_read_edges>(arguments); }
+void ustore_graph_write_edges(ustore_graph_write_edges_t* arguments) { route<&engine_t::graph_write_edges>(arguments); }
+void ustore_graph_remove_edges(ustore_graph_remove_edges_t* arguments) {
+    route<&engine_t::graph_remove_edges>(arguments);
+}
+void ustore_graph_write_vertices(ustore_graph_write_vertices_t* arguments) {
+    route<&engine_t::graph_write_vertices>(arguments);
+}
+void ustore_graph_remove_vertices(ustore_graph_remove_vertices_t* arguments) {
+    route<&engine_t::graph_remove_vertices>(arguments);
+}
+
+char const* ustore_vertex_role_name(ustore_vertex_role_t vertex_role) {
+    return name_in(vertex_role_names_k, vertex_role);
+}
+
+ustore_vertex_role_t ustore_vertex_role_from_name(ustore_bytes_view_t name) {
+    return value_in(vertex_role_names_k, name);
+}
