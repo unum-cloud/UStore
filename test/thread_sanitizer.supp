@@ -1,0 +1,4 @@
+# ThreadSanitizer suppressions for the `USTORE_BUILD_SANITIZERS=thread` tree, which ctest passes to every suite.
+# RocksDB builds uninstrumented, so its write-thread queues, group commits and arenas synchronize through atomics the
+# sanitizer never sees, while the `memcpy`, `new` and `pthread_cond_*` calls they order are still intercepted.
+race:rocksdb::

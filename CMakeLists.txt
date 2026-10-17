@@ -47,6 +47,11 @@ option(USTORE_BUILD_NVME "Compile the in-tree NVMe engine" OFF)
 option(USTORE_BUILD_CUDA "Compile NVMe's GPU compaction" OFF)
 option(USTORE_WERROR "Treat compiler warnings as errors" OFF)
 option(USTORE_BUNDLE_SIBLINGS "Copy the ForkUnion and StringZilla objects into ustore_static; Cargo links their own" ON)
+set(USTORE_BUILD_SANITIZERS
+    "off"
+    CACHE STRING "Sanitizers for UStore's own targets: off, address (with undefined) or thread"
+)
+set_property(CACHE USTORE_BUILD_SANITIZERS PROPERTY STRINGS off address thread)
 # CUB is all the compaction kernels call, so one plain code per generation covers Ampere through Blackwell.
 set(USTORE_CUDA_ARCHITECTURES
     "80;90;100;120"
@@ -110,6 +115,34 @@ else ()
     endif ()
 endif ()
 
+# Sanitizers instrument UStore's own targets and the sibling headers they compile, while RocksDB, LevelDB, liburing,
+# fmt, yyjson and the sibling archives keep their release flags. -O1 keeps the instrumented suites tolerable outside
+# Debug.
+add_library(ustore_sanitizers INTERFACE)
+if (USTORE_BUILD_SANITIZERS STREQUAL "address")
+    if (MSVC)
+        set(ustore_sanitizer_flags /fsanitize=address)
+    else ()
+        set(ustore_sanitizer_flags -fsanitize=address,undefined)
+    endif ()
+elseif (USTORE_BUILD_SANITIZERS STREQUAL "thread")
+    if (MSVC)
+        message(FATAL_ERROR "MSVC has no ThreadSanitizer, so USTORE_BUILD_SANITIZERS=thread needs Clang or GCC")
+    endif ()
+    set(ustore_sanitizer_flags -fsanitize=thread)
+elseif (NOT USTORE_BUILD_SANITIZERS STREQUAL "off")
+    message(FATAL_ERROR "USTORE_BUILD_SANITIZERS is off, address or thread, not '${USTORE_BUILD_SANITIZERS}'")
+endif ()
+if (ustore_sanitizer_flags AND NOT MSVC)
+    target_compile_options(
+        ustore_sanitizers INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:${ustore_sanitizer_flags};-fno-omit-frame-pointer>"
+                                    "$<$<AND:$<COMPILE_LANGUAGE:C,CXX>,$<NOT:$<CONFIG:Debug>>>:-O1>"
+    )
+    target_link_options(ustore_sanitizers INTERFACE "$<$<LINK_LANGUAGE:C,CXX>:${ustore_sanitizer_flags}>")
+elseif (ustore_sanitizer_flags)
+    target_compile_options(ustore_sanitizers INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:${ustore_sanitizer_flags}>")
+endif ()
+
 find_package(Threads REQUIRED)
 include(GNUInstallDirs)
 
@@ -167,6 +200,11 @@ endfunction ()
 set(FORKUNION_BUILD_TEST OFF)
 set(FORKUNION_INSTALL OFF)
 ustore_sibling(forkunion)
+# Every UStore thread runs inside ForkUnion's compiled pool, whose barriers ThreadSanitizer sees only once that archive
+# is instrumented as well
+if (USTORE_BUILD_SANITIZERS STREQUAL "thread")
+    target_link_libraries(forkunion_static PRIVATE ustore_sanitizers)
+endif ()
 
 # SmashTable's containers, header-only
 set(SMASHTABLE_BUILD_TEST OFF)
@@ -185,7 +223,7 @@ set(STRINGZILLA_BUILD_CUDA OFF)
 set(STRINGZILLA_INSTALL OFF)
 # StringZilla arms sanitizers in Debug by default, which leaves its archive needing a runtime the consumers' link lines
 # do not carry.
-set(STRINGZILLA_USE_SANITIZERS OFF)
+set(STRINGZILLA_BUILD_SANITIZERS OFF)
 ustore_sibling(stringzilla)
 
 # The host half of the compaction suite checks the comparator, the survival rule, the sorted-run split and the placement
@@ -210,7 +248,7 @@ target_include_directories(
 )
 target_link_libraries(
     ustore_header INTERFACE $<BUILD_INTERFACE:forkunion::header> $<BUILD_INTERFACE:smashtable::header>
-                            $<BUILD_INTERFACE:stringzilla::header>
+                            $<BUILD_INTERFACE:stringzilla::header> $<BUILD_INTERFACE:ustore_sanitizers>
 )
 
 # Without `USTORE_BUILD_LIB_C`, the libraries build only for the targets that link them
@@ -311,6 +349,7 @@ foreach (library IN ITEMS ustore_static ustore_shared)
     )
     # Collection identifiers draw their entropy from `BCryptGenRandom` on Windows
     target_link_libraries(${library} PRIVATE $<$<PLATFORM_ID:Windows>:bcrypt> $<BUILD_INTERFACE:ustore_warnings>)
+    target_link_libraries(${library} PUBLIC $<BUILD_INTERFACE:ustore_sanitizers>)
     if (TARGET ustore_nvme_compaction)
         target_link_libraries(${library} PUBLIC ustore_nvme_compaction)
     endif ()
@@ -463,8 +502,14 @@ if (${USTORE_BUILD_TEST})
         add_executable(ustore_test_${test_name} test/${test_path}.cpp)
         target_include_directories(ustore_test_${test_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
         target_link_libraries(
-            ustore_test_${test_name} PRIVATE smashtable::header forkunion::static stringzilla::static yyjson fmt::fmt
-                                             ustore_warnings
+            ustore_test_${test_name}
+            PRIVATE smashtable::header
+                    forkunion::static
+                    stringzilla::static
+                    yyjson
+                    fmt::fmt
+                    ustore_warnings
+                    ustore_sanitizers
         )
         add_test(NAME ustore_test_${test_name} COMMAND ustore_test_${test_name})
     endforeach ()
@@ -488,6 +533,11 @@ if (${USTORE_BUILD_TEST})
     target_link_libraries(ustore_test_c_shared PRIVATE ustore::shared)
     foreach (c_test IN ITEMS ustore_test_c ustore_test_c_shared)
         set_target_properties(${c_test} PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+        # The shared library's C++ reaches the sanitizers' guard and allocation interceptors only when the program
+        # exports them, which the C++ driver alone does
+        if (NOT USTORE_BUILD_SANITIZERS STREQUAL "off")
+            set_target_properties(${c_test} PROPERTIES LINKER_LANGUAGE CXX)
+        endif ()
         target_compile_options(
             ${c_test}
             PRIVATE "$<$<NOT:$<C_COMPILER_ID:MSVC>>:-Wall;-Wextra;-Werror;-Werror=incompatible-pointer-types>"
@@ -524,6 +574,21 @@ if (${USTORE_BUILD_TEST})
             )
         endforeach ()
     endif ()
+
+    # RocksDB builds uninstrumented, so ThreadSanitizer cannot see the barriers of its own threads
+    if (USTORE_BUILD_SANITIZERS STREQUAL "thread")
+        get_property(
+            ustore_test_names
+            DIRECTORY
+            PROPERTY TESTS
+        )
+        set_tests_properties(
+            ${ustore_test_names}
+            PROPERTIES
+                ENVIRONMENT_MODIFICATION
+                "TSAN_OPTIONS=string_prepend:suppressions=${CMAKE_CURRENT_SOURCE_DIR}/test/thread_sanitizer.supp:"
+        )
+    endif ()
 endif ()
 
 # Benchmarks, each picking its engine with `--engine`
@@ -540,8 +605,14 @@ if (${USTORE_BUILD_BENCH})
     # The docs paths benchmark times the templates alone, so it links StringZilla's compiled library and no engine
     add_executable(ustore_bench_docs_paths bench/docs_paths.cpp)
     target_link_libraries(
-        ustore_bench_docs_paths PRIVATE smashtable::header forkunion::static stringzilla::static yyjson fmt::fmt
-                                        ustore_warnings
+        ustore_bench_docs_paths
+        PRIVATE smashtable::header
+                forkunion::static
+                stringzilla::static
+                yyjson
+                fmt::fmt
+                ustore_warnings
+                ustore_sanitizers
     )
 endif ()
 
