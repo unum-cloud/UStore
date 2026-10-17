@@ -448,6 +448,20 @@ if (${USTORE_BUILD_TEST})
         add_test(NAME ustore_test_utilities_${test_name} COMMAND ustore_test_utilities_${test_name})
     endforeach ()
 
+    # The docs templates call StringZilla's dispatched kernels, which a header-only StringZilla answers with
+    # `sz_missing_library_k`, so these suites link its compiled library instead of `ustore::header`
+    set(USTORE_TEMPLATES_TEST_PATHS "docs/json_paths")
+    foreach (test_path IN ITEMS ${USTORE_TEMPLATES_TEST_PATHS})
+        string(REPLACE "/" "_" test_name ${test_path})
+        add_executable(ustore_test_${test_name} test/${test_path}.cpp)
+        target_include_directories(ustore_test_${test_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
+        target_link_libraries(
+            ustore_test_${test_name} PRIVATE smashtable::header forkunion::static stringzilla::static yyjson fmt::fmt
+                                             ustore_warnings
+        )
+        add_test(NAME ustore_test_${test_name} COMMAND ustore_test_${test_name})
+    endforeach ()
+
     # The C ABI compiles as plain C11, so a header that only a C++ compiler accepts fails to build. It links against
     # both libraries, and the shared one exports only what `USTORE_EXPORT` marks.
     add_executable(ustore_test_c c/test.c)
@@ -504,6 +518,13 @@ if (${USTORE_BUILD_BENCH})
 
     add_executable(ustore_bench_louvain bench/louvain.cpp)
     target_link_libraries(ustore_bench_louvain PRIVATE ustore::static fmt::fmt ustore_warnings)
+
+    # The docs paths benchmark times the templates alone, so it links StringZilla's compiled library and no engine
+    add_executable(ustore_bench_docs_paths bench/docs_paths.cpp)
+    target_link_libraries(
+        ustore_bench_docs_paths PRIVATE smashtable::header forkunion::static stringzilla::static yyjson fmt::fmt
+                                        ustore_warnings
+    )
 endif ()
 
 if (${USTORE_BUILD_LIB_PYTHON})

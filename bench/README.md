@@ -12,12 +12,14 @@ Every binary echoes its flags, then prints its progress and one line per row to 
 | `twitter.cpp`                        | Building documents and a graph from tweets, then sampling them      |
 | `tabular_graph.cpp`                  | NDJSON or CSV imported as documents and a graph, then exported back |
 | `louvain.cpp`                        | Louvain communities over a graph collection and over memory         |
+| `docs_paths.cpp`                     | Document fields located by yyjson against StringZilla subdocuments  |
 | `nvme_single_collection_database.cu` | Inserts, lookups, scans and deletions, per value width              |
 
 The Twitter benchmark samples keys, parsed objects, one field, a four-column table and two-hop traversals.
 `mixed.hpp` holds the transactional batch upserts of documents and graph edges that the Twitter benchmark issues.
 `harness.hpp` holds the timed loop, the latency histograms, the result rows and the flags every benchmark shares.
 The three engine benchmarks compile once each, as `ustore_bench_twitter`, `ustore_bench_tabular_graph` and `ustore_bench_louvain`, and open the engine their `--engine` names.
+`ustore_bench_docs_paths` opens no engine: it resolves the fields of generated tweets in memory, through the same conversions a docs gather and a docs read make.
 
 ### Building
 

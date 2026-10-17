@@ -256,6 +256,14 @@ class growing_strings {
         return growth_status(offsets_.emplace_back(static_cast<ustore_length_t>(bytes_.size())));
     }
 
+    /** Appends a copy of @p string followed by a null byte when @p terminated, which the string then spans. */
+    status_t push_back(ustore_bytes_view_t string, bool terminated) noexcept {
+        if (status_t const status = push_back(string); status.failed() || !terminated) return status;
+        if (status_t const status = growth_status(bytes_.push_back(byte_t {0})); status.failed()) return status;
+        offsets_[offsets_.size() - 1] = static_cast<ustore_length_t>(bytes_.size());
+        return {};
+    }
+
     /** How many strings the column holds. */
     std::size_t size() const noexcept { return offsets_.empty() ? 0 : offsets_.size() - 1; }
 
