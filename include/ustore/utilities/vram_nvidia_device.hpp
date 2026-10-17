@@ -200,6 +200,9 @@ struct cuda_memory_usage_t {
     }
 };
 
+/** The memory domain of a device whose nearest NUMA node the system does not say. */
+inline constexpr fu_memory_domain_id_t no_memory_domain_k = -1;
+
 /** The host NUMA node nearest the device @p specs describe, from Linux sysfs, or @c no_memory_domain_k when unsaid. */
 inline fu_memory_domain_id_t cuda_numa_node(cuda_device_specs_t const& specs) noexcept {
     char path[] = "/sys/bus/pci/devices/0000:00:00.0/numa_node";

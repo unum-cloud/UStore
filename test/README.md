@@ -34,7 +34,7 @@ A skip names the reason a case did not run, so a suite passing on nothing is vis
 
 - __Conformance__ — `units.cpp`, `api.cpp`, `compilation.cpp`, `strings.cpp` and `strings_collection.cpp` check the C ABI and its C++ wrappers, identically on every engine, and `c/test.c` calls the C ABI from plain C11 once per shape of its arguments.
 - __Tools__ — `tools.cpp` checks dataset imports and exports, and the CLI against a real directory.
-- __Components__ — `nvme_*.cpp` and `nvme_*.cu` check the NVMe engine's parts below the C ABI, each on every transport the machine offers.
+- __Components__ — `nvme/*.cpp` check the NVMe templates of `include/ustore/` below the C ABI, each on every transport the machine offers.
 - __Stress__ — `stress_atomicity.cpp` and `stress_linearizability.cpp` check atomicity and linearizability under concurrent transactions.
 - __Python__ — the Python suites check the `ustore.lib` extension and its graph and table views, parametrized over batch shapes, views and isolation levels, and gated on what the linked engine supports; NetworkX and pandas serve as oracles for the views.
 
@@ -49,22 +49,26 @@ Both build with `-Werror` wherever the compiler is not MSVC, so a header that on
 
 ### Components
 
-The engine suites share `nvme_fixture.hpp`: one shape per suite, one mount per transport, and a driver that runs every case on memory, on files through the blocking floor and through io_uring, and on a block device.
+The engine suites share `nvme/fixture.hpp`: one shape per suite, one mount per transport, and a driver that runs every case on memory, on files through the blocking floor and through io_uring, and on a block device.
 A transport the machine does not offer skips with its reason, and a transport the flags claim that then fails to mount fails the suite.
 Every result line reads `<suite>.<transport>.<case>`.
-CMake builds the `.cpp` suites below as `ustore_test_nvme_<suite>`, the Linux transports only on Linux, and the host half of `nvme_compaction.cu` with every test build, while `nvme_write_buffer.cpp` and the other `.cu` suites have no CMake target yet.
+CMake builds every suite below as `ustore_test_nvme_<suite>`, the Linux transports only on Linux.
+`cmake/nvme_compaction.cmake` builds the database transaction and stress suites, linking the device compactor when the build carries CUDA.
+No suite reaching the harness compiles under nvcc, since nvcc's front end crashes instantiating StringZilla's string.
+The compaction suite builds twice, as `ustore_test_nvme_compaction_host` with every test build and as `ustore_test_nvme_compaction` over the device compactor, which `nvme/compaction_device.cu` instantiates for the suite's key slots.
 
-- `nvme_ring.cpp`, `nvme_linux_uring.cpp`, `nvme_linux_aio.cpp`, `nvme_linux_spdk.cpp` — the ring contract of `nvme_ring_cases.hpp` on the RAM and blocking transports, on io_uring with what only a kernel queue can get wrong, on Linux AIO, and on SPDK.
-- `nvme_channels.cpp` — the registered arena, the blocks channels queue pair out of it, and the pipelines that keep a ring at depth.
-- `nvme_volume.cpp` — the catalog of two slots, the crashes it survives, and the router above it.
-- `nvme_catalog.cpp` — the catalog records and the schema blobs a database persists.
-- `nvme_sorted_run.cpp` — one sorted run: round trips of every layout, truncation, lookups and read depth.
-- `nvme_lsm.cpp` — the LSM level and the tree: what a flush publishes, what a merge keeps, and what a cancelled compaction leaves.
-- `nvme_collection.cpp` — one collection over a tree: the write buffer, the value cache, snapshots and scans.
-- `nvme_single_collection_database.cpp`, `nvme_single_collection_database_transaction.cu`, `nvme_single_collection_database_stress.cu`, `nvme_single_collection_database_transaction_stress.cu` — a database of one collection, its transactions, and both under concurrent load.
-- `nvme_database.cpp`, `nvme_database_transaction.cu`, `nvme_transactions.cpp` — named collections over a router, and the transactions across them.
-- `nvme_graph.cpp` — a graph over two databases: what a walk sees and what a commit shows.
-- `nvme_compaction.cu` — host and GPU compaction against a reference merge and against each other.
+- `nvme/ring.cpp`, `nvme/linux_uring_disk.cpp`, `nvme/linux_aio_disk.cpp`, `nvme/linux_spdk_disk.cpp` — the ring contract of `nvme/ring_cases.hpp` on the RAM and blocking transports, on io_uring with what only a kernel queue can get wrong, on Linux AIO, and on SPDK.
+- `nvme/channels.cpp` — the registered arena, the blocks channels queue pair out of it, and the pipelines that keep a ring at depth.
+- `nvme/volume.cpp` — the catalog of two slots, the crashes it survives, and the router above it.
+- `nvme/catalog.cpp` — the catalog records and the schema blobs a database persists.
+- `nvme/sorted_run.cpp` — one sorted run: round trips of every layout, truncation, lookups and read depth.
+- `nvme/tree.cpp` — the LSM level and the tree: what a flush publishes, what a merge keeps, and what a cancelled compaction leaves.
+- `nvme/write_buffer.cpp` — the write buffer alone: adds, removals, merges, copies and moves.
+- `nvme/collection.cpp` — one collection over a tree: the write buffer, the value cache, snapshots and scans.
+- `nvme/single_collection_database.cpp`, `nvme/single_collection_database_transaction.cpp`, `nvme/single_collection_database_stress.cpp`, `nvme/single_collection_database_transaction_stress.cpp` — a database of one collection, its transactions, and both under concurrent load.
+- `nvme/database.cpp`, `nvme/database_transaction.cpp`, `nvme/transaction_registry.cpp` — named collections over a router, and the transactions across them.
+- `nvme/graph.cpp` — a graph over two databases keyed by 16-byte IDs: what a walk sees and what a commit shows.
+- `nvme/compaction.cu` — host and GPU compaction against a reference merge and against each other.
 
 ## Building
 
@@ -107,14 +111,14 @@ The engine, isolation and transport flags matter only to the engine suites.
 | :------------- | :------ | :---------------------------------------------------------------- |
 | `--cli <path>` | None    | The CLI executable the CLI round trip drives, skipped when absent |
 
-`nvme_linux_spdk.cpp` also takes:
+`nvme/linux_spdk_disk.cpp` also takes:
 
 | Flag                   | Default   | Meaning                                                        |
 | :--------------------- | :-------- | :------------------------------------------------------------- |
 | `--spdk-root <path>`   | None      | SPDK tree with a finished build, whose target the suite starts |
 | `--spdk-serial <text>` | The rig's | Serial the controller must identify as                         |
 
-`nvme_write_buffer.cpp` also takes:
+`nvme/write_buffer.cpp` also takes:
 
 | Flag                         | Default | Meaning                                            |
 | :--------------------------- | :------ | :------------------------------------------------- |
@@ -122,20 +126,7 @@ The engine, isolation and transport flags matter only to the engine suites.
 | `--empty-value-step <count>` | `50`    | Every this many stored values is empty             |
 | `--value-max-size <size>`    | `10000` | Largest stored value the cache admits, like `10KB` |
 
-`nvme_single_collection_database_transaction.cu` and `nvme_database_transaction.cu` also take:
-
-| Flag                                | Default | Meaning                                                            |
-| :---------------------------------- | :------ | :----------------------------------------------------------------- |
-| `--population <count>`              | `10000` | Stored values every case inserts into each collection              |
-| `--empty-stored-value-step <count>` | `500`   | Every this many stored values is empty in the variable-width cases |
-
-`nvme_single_collection_database_transaction_stress.cu` also takes:
-
-| Flag                   | Default | Meaning                          |
-| :--------------------- | :------ | :------------------------------- |
-| `--population <count>` | `10000` | Keys every case writes and reads |
-
-`nvme_compaction.cu` also takes:
+`nvme/compaction.cu` also takes:
 
 | Flag                       | Default  | Meaning                                                       |
 | :------------------------- | :------- | :------------------------------------------------------------ |

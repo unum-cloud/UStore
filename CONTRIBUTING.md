@@ -43,7 +43,7 @@ The `release` and `relwithdebinfo` presets build with whatever toolchain the env
 | `src/*.cpp`             | one source per public header, documents and graphs   | `unum::ustore`                    |
 | `src/engine.hpp`        | the table of calls every engine fills                | `unum::ustore`                    |
 | `src/utilities/`        | batches, outputs and progress over the C ABI's types | `unum::ustore::utilities`         |
-| `src/<engine>/`         | `engine.cpp` and the headers of `ram` and `nvme`     | `unum::ustore::<engine>`          |
+| `src/<engine>/`         | `engine.cpp` and the glue of `ram` and `nvme`        | `unum::ustore::<engine>`          |
 | `src_oracles/<engine>/` | `engine.cpp` of RocksDB and LevelDB, kept as oracles | `unum::ustore::oracles::<engine>` |
 | `tools/`                | the CLI, flag parsing, and dataset import and export | `unum::ustore::tools`             |
 | `test/`                 | suites mirroring `src/`, and their harness           | `unum::ustore::test`              |
@@ -54,7 +54,7 @@ Namespaces mirror directories and nothing else: a directory adds a namespace com
 `src_oracles/` adds `oracles`, and an engine sees `unum::ustore::utilities` through one `using namespace` right after its own namespace opens.
 `c/`, `cpp/` and `include/` are include roots that add no component, so `cpp/ustore/` opens `unum::ustore` and `include/ustore/blobs/` opens `unum::ustore::blobs`.
 The pre-commit hook refuses a namespace no directory backs, a nameless one, and one a file opens twice.
-A file name never repeats its directory — `src/nvme/lsm_tree.hpp`, never `src/nvme/nvme_lsm_tree.hpp`.
+A file name never repeats its directory — `include/ustore/blobs/nvme_tree.hpp`, never `include/ustore/blobs/blobs_nvme_tree.hpp`.
 
 ## C++
 

@@ -39,17 +39,16 @@
 
 #include "ustore/blobs.h"
 #include "ustore/db.h"
-#include "ustore/ranges_args.hpp" // `places_arg_t`, `contents_arg_t`, `scans_arg_t`, `validate_read`
+#include "ustore/ranges_args.hpp" // `place_batch_t`, `contents_arg_t`, `scan_batch_t`, `validate_read`
 
-#include "engine.hpp"                // `engine_t`, `handle_t`, `handle_cast`
-#include "helpers/linked_array.hpp"  // `uninitialized_array`
-#include "helpers/linked_memory.hpp" // `linked_memory`, `clear_linked_memory`
+#include "engine.hpp"                       // `engine_t`, `handle_t`, `handle_cast`
+#include "utilities/outputs.hpp"            // `uninitialized_array`
+#include "ustore/utilities/ram_buffers.hpp" // `linked_memory`, `clear_linked_memory`
 
-#include "nvme/collection_snapshot.hpp" // `select_result_t`
-#include "nvme/config.hpp"              // `resources_config_t`, `user_collection_config_t`, `validate`
-#include "nvme/database.hpp"            // `database`
-#include "nvme/filesystem.hpp"          // `basic_storage_mount`, `join_path`, `path_max_bytes_k`
-#include "nvme/resources.hpp"           // `open_resources`, `resources_shared_ptr_t`
+#include "ustore/blobs/nvme_collection.hpp" // `select_result_t`
+#include "ustore/blobs/nvme_database.hpp"   // `database`
+#include "ustore/blobs/nvme_tree.hpp"       // `user_collection_config_t`, `validate`
+#include "ustore/utilities/nvme_volume.hpp" // `resources_config_t`, `basic_storage_mount`, `open_resources`
 
 namespace unum::ustore::nvme {
 
@@ -453,7 +452,7 @@ struct sample_generator_t {
 #pragma region Argument Views
 
 /** The locations of a read. */
-[[nodiscard]] inline places_arg_t places_of(ustore_read_t const& arguments) noexcept {
+[[nodiscard]] inline place_batch_t places_of(ustore_read_t const& arguments) noexcept {
     return {{arguments.collections, arguments.collections_stride},
             {arguments.keys, arguments.keys_stride},
             {},
@@ -461,7 +460,7 @@ struct sample_generator_t {
 }
 
 /** The locations of a write. */
-[[nodiscard]] inline places_arg_t places_of(ustore_write_t const& arguments) noexcept {
+[[nodiscard]] inline place_batch_t places_of(ustore_write_t const& arguments) noexcept {
     return {{arguments.collections, arguments.collections_stride},
             {arguments.keys, arguments.keys_stride},
             {},
@@ -478,7 +477,7 @@ struct sample_generator_t {
 }
 
 /** The tasks of a scan. */
-[[nodiscard]] inline scans_arg_t scans_of(ustore_scan_t const& arguments) noexcept {
+[[nodiscard]] inline scan_batch_t scans_of(ustore_scan_t const& arguments) noexcept {
     return {{arguments.collections, arguments.collections_stride},
             {arguments.start_keys, arguments.start_keys_stride},
             {arguments.count_limits, arguments.count_limits_stride},
@@ -486,14 +485,14 @@ struct sample_generator_t {
 }
 
 /** The tasks of a sample. */
-[[nodiscard]] inline sample_args_t samples_of(ustore_sample_t const& arguments) noexcept {
+[[nodiscard]] inline sample_batch_t samples_of(ustore_sample_t const& arguments) noexcept {
     return {{arguments.collections, arguments.collections_stride},
             {arguments.count_limits, arguments.count_limits_stride},
             arguments.tasks_count};
 }
 
 /** The keys @p scans may return together, capped so a huge limit reserves nothing it may never fill. */
-[[nodiscard]] inline std::size_t expected_keys(scans_arg_t const& scans) noexcept {
+[[nodiscard]] inline std::size_t expected_keys(scan_batch_t const& scans) noexcept {
     constexpr std::size_t reservation_cap_k = std::size_t {1} << 16;
     std::size_t expected = 0;
     for (std::size_t task = 0; task != scans.size() && expected < reservation_cap_k; ++task)
@@ -524,7 +523,7 @@ struct batch_group_t {
  *  A read of several collections is several reads of the store, and the store takes its keys
  *  contiguous, so the batch is laid out per collection rather than walked per place.
  */
-inline status_t group_places(places_arg_t const& places, st::basic_vector<batch_group_t>& groups) noexcept {
+inline status_t group_places(place_batch_t const& places, st::basic_vector<batch_group_t>& groups) noexcept {
     for (std::size_t index = 0; index != places.size(); ++index) {
         place_t const place = places[index];
         collection_id_t const collection = place.collection;
@@ -608,7 +607,7 @@ inline status_t read_batched(opened_database_t& database, st::basic_vector<batch
 
 /** Reads every place of @p places through @p transaction into @p tape, one key at a time. */
 inline status_t read_through_transaction(opened_transaction_t const& transaction, watch_schedule_t schedule,
-                                         places_arg_t const& places, std::span<ustore_length_t const> starts,
+                                         place_batch_t const& places, std::span<ustore_length_t const> starts,
                                          std::span<ustore_length_t const> lengths, std::span<byte_t> tape) noexcept {
     for (std::size_t index = 0; index != places.size(); ++index) {
         if (lengths[index] == ustore_length_missing_k) continue;
@@ -647,7 +646,7 @@ inline status_t stage_one(store_transaction_t& handler, watch_schedule_t schedul
  *  caller's transaction takes one of its own; its buffer is sized to the batch rather than to the
  *  bound a caller's transaction takes, since it lives for exactly one call.
  */
-inline status_t commit_batch(opened_database_t& database, places_arg_t const& places,
+inline status_t commit_batch(opened_database_t& database, place_batch_t const& places,
                              contents_arg_t const& contents) noexcept {
     std::size_t bytes = 0;
     for (std::size_t index = 0; index != contents.size(); ++index) bytes += contents[index].size();
@@ -743,7 +742,7 @@ inline status_t resolve_resources(ustore_database_init_nvme_t const& arguments,
                                   resources_config_t& resources) noexcept {
     if (!arguments.directory || arguments.directory[0] == '\0')
         return {status_code_t::invalid_argument_k, "A database needs a directory"};
-    if (!resources.directory.try_assign(string_view_t {arguments.directory}))
+    if (!resources.directory.assign(string_view_t {arguments.directory}))
         return {status_code_t::out_of_memory_k, "No room for the directory of the database"};
     if (arguments.data_directories_count && !arguments.data_directories)
         return {status_code_t::invalid_argument_k, "Counted data directories are null"};
@@ -754,7 +753,7 @@ inline status_t resolve_resources(ustore_database_init_nvme_t const& arguments,
         if (!given.path || given.path[0] == '\0')
             return {status_code_t::invalid_argument_k, "A data directory needs a path"};
         data_directory_config_t directory;
-        if (!directory.path.try_assign(string_view_t {given.path}))
+        if (!directory.path.assign(string_view_t {given.path}))
             return {status_code_t::out_of_memory_k, "No room for a data directory of the database"};
         directory.max_size = given.max_bytes ? given.max_bytes : default_volume_bytes_k;
         if (resources.data_directories.push_back(std::move(directory)) != st::status_t::success_k)
@@ -766,7 +765,7 @@ inline status_t resolve_resources(ustore_database_init_nvme_t const& arguments,
     if (status_t const joined = join_path(resources.directory.c_str(), data_directory_name_k, path); joined.failed())
         return joined;
     data_directory_config_t only;
-    if (!only.path.try_assign(string_view_t {path}))
+    if (!only.path.assign(string_view_t {path}))
         return {status_code_t::out_of_memory_k, "No room for the data directory of the database"};
     only.max_size = default_volume_bytes_k;
     if (resources.data_directories.push_back(std::move(only)) != st::status_t::success_k)
@@ -920,7 +919,7 @@ void read(ustore_read_t& arguments) noexcept {
         *arguments.error = {ustore_error_uninitialized_k, "The database is uninitialized"};
         return;
     }
-    places_arg_t const places = places_of(arguments);
+    place_batch_t const places = places_of(arguments);
     validate_read(arguments.transaction, places, arguments.options, arguments.error);
     if (arguments.error->status) return;
     if (arguments.snapshot) {
@@ -982,7 +981,7 @@ void write(ustore_write_t& arguments) noexcept {
         *arguments.error = {ustore_error_uninitialized_k, "The database is uninitialized"};
         return;
     }
-    places_arg_t const places = places_of(arguments);
+    place_batch_t const places = places_of(arguments);
     contents_arg_t const contents = contents_of(arguments);
     validate_write(arguments.transaction, places, contents, arguments.options, arguments.error);
     if (arguments.error->status) return;
@@ -1009,7 +1008,7 @@ void scan(ustore_scan_t& arguments) noexcept {
         *arguments.error = {ustore_error_uninitialized_k, "The database is uninitialized"};
         return;
     }
-    scans_arg_t const scans = scans_of(arguments);
+    scan_batch_t const scans = scans_of(arguments);
     validate_scan(arguments.transaction, scans, arguments.options, arguments.error);
     if (arguments.error->status || !arguments.tasks_count) return;
     if (!arguments.keys) {
@@ -1031,7 +1030,7 @@ void scan(ustore_scan_t& arguments) noexcept {
     auto [taken, take_snapshot_status] = database.store->take_snapshot();
     if (reported_failure(take_snapshot_status, arguments.error)) return;
     for (std::size_t task = 0; task != scans.size(); ++task) {
-        scan_t const scan = scans[task];
+        scan_task_t const scan = scans[task];
         std::size_t const first = tape.size();
 
         status_t const walked = walk_collection(
@@ -1062,7 +1061,7 @@ void sample(ustore_sample_t& arguments) noexcept {
         return;
     }
 
-    sample_args_t const samples = samples_of(arguments);
+    sample_batch_t const samples = samples_of(arguments);
     opened_database_t& database = database_of(arguments.db);
     linked_memory_lock_t arena = linked_memory(arguments.arena, arguments.options, arguments.error);
     if (arguments.error->status) return;
@@ -1075,7 +1074,7 @@ void sample(ustore_sample_t& arguments) noexcept {
     sample_generator_t generator {now ^ reinterpret_cast<std::uintptr_t>(&tape)};
 
     for (std::size_t task = 0; task != samples.size(); ++task) {
-        sample_arg_t const sample = samples[task];
+        sample_task_t const sample = samples[task];
         std::size_t const first = tape.size();
         std::size_t seen = 0;
         status_t const walked = walk_collection(

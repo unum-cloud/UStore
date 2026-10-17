@@ -12,15 +12,13 @@
 #include <span>    // `std::span`
 #include <utility> // `std::move`
 
-#include <smashtable/shared.hpp>
+#include <smashtable/shared.hpp> // `st::status_t`, `st::expected`
 
-#include "ustore/types.hpp" // `value_layout_t`
+#include "ustore/blobs/nvme_compaction.cuh"        // `compaction_kind_t`, `compaction_output`, `gpu_compactor_t`
+#include "ustore/blobs/nvme_key_slot.hpp"          // `key_slot`, `value_layout_t`
+#include "ustore/utilities/vram_nvidia_device.hpp" // `cuda_count_devices`, `cuda_stream_t`
 
-#include "cuda.hpp"            // `cuda_count_devices`, `cuda_stream_t`
-#include "nvme/compaction.cuh" // `compaction_kind_t`, `compaction_output`, `gpu_compactor_t`
-#include "nvme/key_slot.hpp"   // `key_slot`
-
-namespace unum::ustore::nvme {
+namespace unum::ustore::blobs {
 
 st::expected<gpu_compactor_t> gpu_compactor_t::make(int ordinal) noexcept {
     using st::expected;
@@ -39,7 +37,7 @@ st::expected<gpu_compactor_t> gpu_compactor_t::make(int ordinal) noexcept {
 template <typename key_slot_type_>
 using views_of = std::span<sorted_run_index_view<key_slot_type_> const>;
 
-/** The key the engine stores, the 64-bit integer the keys of the C ABI map onto until NVMe stores sixteen bytes. */
+/** The key the engine stores: the sixteen bytes of the C ABI's key, read as two big-endian words. */
 using stored_key_t = uuid_stored_key_t;
 
 /** The key slots of the engine's collections, one per value layout a collection is created with. */
@@ -85,4 +83,4 @@ template st::status_t gpu_compactor_t::compact(compaction_kind_t, views_of<suite
 
 #pragma endregion Instantiations
 
-} // namespace unum::ustore::nvme
+} // namespace unum::ustore::blobs

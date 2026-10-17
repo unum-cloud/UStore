@@ -21,9 +21,23 @@ A type is named after what it holds and what it does, from the whole database do
 | `key_slot`                   | A stored key with the size and location of its stored value                        |
 | `stored_value`               | One value                                                                          |
 
-Each type lives in the file of its name.
-`collection.hpp` works with `write_buffer.hpp` and `value_cache.hpp`, `lsm_level.hpp` with `lsm_level_merger.hpp`, and `lsm_sorted_run.hpp` with `volume.hpp`, which hands it the extent its blob lives in.
-The sorted run index in `sorted_run_index.hpp` is a B-tree of the run's key slots.
+The types are templates of `include/ustore/`, which `engine.cpp` instantiates, in `unum::ustore::blobs` for the LSM layers and `unum::ustore::utilities` for the I/O kits beneath them:
+
+- `utilities/nvme_ring.hpp` — allocators, completion counters, identifiers, extents and the ring.
+- `utilities/nvme_disks.hpp` — the disk base, the memory disk and the blocking floor.
+- `utilities/nvme_linux_uring_disk.hpp`, `nvme_linux_aio_disk.hpp`, `nvme_linux_spdk_disk.hpp` — the Linux transports.
+- `utilities/nvme_channels.hpp` — the buffer pool, the I/O channels and the pipelines.
+- `utilities/nvme_volume.hpp` — text, catalogs, volumes, the router, the mount and the shared resources.
+- `blobs/nvme_key_slot.hpp` — identifiers, value layouts, stored keys and values, key slots and the sorted run index.
+- `blobs/nvme_sorted_run.hpp` — `lsm_sorted_run`.
+- `blobs/nvme_compaction.hpp` and `nvme_compaction.cuh` — the host compactor, and the kernels of the device one.
+- `blobs/nvme_tree.hpp` — configurations and schemas, `lsm_level`, its merger and `lsm_tree`.
+- `blobs/nvme_write_buffer.hpp` — `write_buffer`.
+- `blobs/nvme_collection.hpp` — the value cache, `collection`, its snapshot and its scanner.
+- `blobs/nvme_database.hpp` — both databases, their snapshots, transactions, registries and read sets.
+- `graph/edge_block.hpp`, `vertex_registry.hpp` and `nvme_graph.hpp` — the graph fast path below.
+
+The sorted run index is a B-tree of the run's key slots, and the merger hands the compactor each run's index.
 
 Levels differ by depth:
 
@@ -41,7 +55,7 @@ Level 0 has a byte budget, and every deeper level's budget grows by `level_enlar
 - `fixed_width_k` stores wider values of one width in the stored values section.
 - `variable_width_k` stores values of any width up to the collection's maximum, and is what a width of zero resolves to.
 
-A `database` mixes collections of different value layouts, and `collection_scanner.hpp` scans any of them.
+A `database` mixes collections of different value layouts, and its collection scanner scans any of them.
 
 ### Snapshots
 
@@ -53,7 +67,7 @@ A hold is what a publication waits on, so a flush, a compaction or a second snap
 An ordered walk therefore takes a snapshot, reads it and drops it inside the call that needs it, and a caller that mutates what it walked collects the keys first and lets the snapshot go before the first write.
 
 Backup, move and sorted-run export are not implemented.
-They belong on the blob surface of `volume.hpp` rather than on the disk router they were written against, so the files that carried them were removed instead of adapted.
+They belong on the blob surface of `nvme_volume.hpp` rather than on the disk router they were written against, so the files that carried them were removed instead of adapted.
 
 ## Transactions
 
@@ -63,7 +77,7 @@ Single-collection database transactions span one collection, database transactio
 - `commit` stages unless already staged, then applies the changes on the write path the stage took, which is the database's own claim and one channel.
 - `rollback` drops the changes, and `renew` restarts the transaction with its changes kept, which only a transaction without reads may do.
 
-`read_set.hpp` records each watched stored key with the stamp and purpose of its watch, and the transaction registry keeps the keys of every commit made while an older transaction still runs.
+The read set records each watched stored key with the stamp and purpose of its watch, and the transaction registry keeps the keys of every commit made while an older transaction still runs.
 Staging fails with `write_conflict_k` when a commit made after a watch began wrote the watched key.
 A watch follows one of four schedules:
 
@@ -81,7 +95,7 @@ Commits are ordered by the stamps the registry issues, which keeps a transaction
 
 ## The C ABI
 
-`engine.cpp` implements `include/ustore/db.h` and `include/ustore/blobs.h` over one `database`, and `c/docs.cpp`, `c/graph.cpp` and `c/strings.cpp` layer the other modalities on top of it, exactly as they do for every other engine.
+`engine.cpp` implements `c/ustore/db.h` and `c/ustore/blobs.h` over one `database`, and `c/docs.cpp`, `c/graph.cpp` and `c/strings.cpp` layer the other modalities on top of it, exactly as they do for every other engine.
 `USTORE_BUILD_NVME` adds the engine to the `ustore` library and `nvme` to the engines every suite runs with `--engine`.
 
 - A configuration names a directory, which becomes the metadata directory; a data directory it does not name defaults to `data` beneath it, and a capacity it does not name defaults to one gibibyte, since a volume file is preallocated.
@@ -103,13 +117,13 @@ Only `ram` is refused, since the database the ABI names keeps its volumes in fil
 
 Compaction merges sorted key slots and plans how their stored values migrate into the new sorted runs, and `compaction_kind_t` names the merge: overlapping or sorted runs, into an intermediate or the bottom level, where tombstones are dropped.
 The host and GPU compactors share one comparator, survival rule, sorted run split and placement, so their outputs match field by field.
-The GPU compactor runs on CUB from CCCL 3.4.2 with no Thrust, takes its devices, streams and buffers from `src/cuda.hpp`, and is chosen once a device is present and a merge exceeds `gpu_compaction_threshold_k`, 900,000 key slots.
+The GPU compactor runs on CUB from CCCL 3.4.2 with no Thrust, takes its devices, streams and buffers from `include/ustore/utilities/vram_nvidia_device.hpp`, and is chosen once a device is present and a merge exceeds `gpu_compaction_threshold_k`, 900,000 key slots.
 GPU compaction is part of v1 and runs on both Hopper and Blackwell.
 
 ## Storage I/O
 
 A disk pairs a __volume__, which maps names to bytes, with a __transport__, which moves them.
-`ring.hpp` is the contract every transport meets: a thread takes a queue pair, registers the memory it will read into and the target it will read from, submits a batch and polls its own completions.
+`nvme_ring.hpp` is the contract every transport meets: a thread takes a queue pair, registers the memory it will read into and the target it will read from, submits a batch and polls its own completions.
 Nothing blocks, no ordering is promised between two submitted requests, and durability is written as submit, poll, flush, poll.
 The ring is exposed rather than hidden behind a blocking read because a blocking read reaches the depth of one thread, while a namespace wants thousands of commands outstanding.
 
@@ -131,26 +145,26 @@ The ring is exposed rather than hidden behind a blocking read because a blocking
 - __`automatic_k`__ — io_uring where the kernel allows it, Linux AIO where it refuses a ring, the blocking floor where it offers neither.
   What the mount settled on is reported back rather than inferred.
 
-Above the transport, `volume.hpp` resolves a name to an extent.
+Above the transport, `nvme_volume.hpp` resolves a name to an extent.
 A volume without a filesystem under it keeps its catalog in two slots of the volume itself: an image is written whole into the older slot, flushed, and from that instant it is the newer one, while a torn image fails the checksum its header carries and a mount reads the other slot.
-`extent_allocator.hpp` rebuilds the free map from the catalog at mount, which is what makes an extent missing from the catalog free after a crash.
-`volume_router.hpp` places a blob on the volume with the most free space that still fits.
+The extent allocator rebuilds the free map from the catalog at mount, which is what makes an extent missing from the catalog free after a crash.
+The volume router places a blob on the volume with the most free space that still fits.
 
 Every I/O buffer comes from one registered arena, because a range can be pinned only once — io_uring answers `EBUSY` on re-registration and a growing arena cannot be pinned at all.
-`buffer_pool.hpp` carves that arena into fixed blocks, `io_channel.hpp` gives each queue pair its own pools and polling room, and `io_pipeline.hpp` holds the ring at its depth by refilling as completions retire rather than submitting a batch and waiting for all of it.
+In `nvme_channels.hpp`, the buffer pool carves that arena into fixed blocks, each I/O channel gives a queue pair its own pools and polling room, and a pipeline holds the ring at its depth by refilling as completions retire rather than submitting a batch and waiting for all of it.
 
 Depth comes from queue pairs rather than threads.
 A dispatch blocks until all its threads return and admits one caller at a time, and ForkUnion bans nested parallelism, so a batch fanned out inside a poll would both serialize two owners and fork a pool that is already forked.
 
 ## Graph Fast Path
 
-`graph_store.hpp` stores graphs of labeled, weighted, directed or undirected edges in two single-collection databases of variable-width values:
+`include/ustore/graph/nvme_graph.hpp` stores graphs of labeled, weighted, directed or undirected edges in two single-collection databases of variable-width values:
 
-- The vertices database, keyed by `id_entity_t`, holds each vertex's `vertex_t` of identifier, weight and label, its payload, and its registry.
+- The vertices database, keyed by `id_entity_t`, the 16-byte `ustore_key_t` of the C ABI, holds each vertex's `vertex_t` of identifier, weight and label, its payload, and its registry.
 - The half-edges database, keyed by `id_chunk_t`, the entity paired with a block's first neighbor, holds the sorted edge blocks of that vertex.
 
 An edge, `labeled_edge_t`, carries its identifier, its `first` and `second` vertices, weight, label and direction.
-Both endpoints store it as a `half_edge_t`: the edge's identifier, weight and label, the other vertex, and the role, which is source, target or undirected member.
+Both endpoints store it as a `labeled_half_edge_t`: the edge's identifier, weight and label, the other vertex, and the role, which is source, target or undirected member.
 A vertex's half-edges split into edge blocks of 16 to 512 half-edges, 128 at best, with every half-edge to one neighbor in the same block, so a small update rewrites one block rather than the whole adjacency list.
 The `vertex_registry_t` lists each block's first and last neighbor and a quantized size class, so small inserts and removals rarely rewrite it.
 Batched calls read registries and edge blocks once and write the changed vertices and edge blocks together, and looking up many vertex pairs in one call can cut IOPS tenfold.

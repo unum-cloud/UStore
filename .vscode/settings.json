@@ -79,6 +79,8 @@
     "yyjson"
   ],
   "files.associations": {
+    "*.cu": "cuda-cpp",
+    "*.cuh": "cuda-cpp",
     "*.inc": "cpp",
     "*.ipp": "cpp",
     "*.tcc": "cpp",

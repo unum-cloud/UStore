@@ -98,9 +98,12 @@ if (MSVC)
         target_compile_options(ustore_warnings INTERFACE /WX)
     endif ()
 else ()
-    # The C ABI takes named arguments as partially designated structs, leaving the rest zeroed.
+    # The C ABI takes named arguments as partially designated structs, leaving the rest zeroed. CUDA sources take the
+    # compactor's own flags instead, since nvcc's host pass reads line markers that pedantic mode rejects.
     target_compile_options(
-        ustore_warnings INTERFACE -Wall -Wextra -Wpedantic -Wno-unknown-pragmas -Wno-missing-field-initializers
+        ustore_warnings
+        INTERFACE
+            "$<$<COMPILE_LANGUAGE:C,CXX>:-Wall;-Wextra;-Wpedantic;-Wno-unknown-pragmas;-Wno-missing-field-initializers>"
     )
     if (USTORE_WERROR)
         target_compile_options(ustore_warnings INTERFACE -Werror)
@@ -375,28 +378,32 @@ if (${USTORE_BUILD_TEST})
             "catalog"
             "volume"
             "sorted_run"
-            "lsm"
+            "tree"
+            "write_buffer"
             "collection"
-            "transactions"
+            "transaction_registry"
             "database"
             "single_collection_database"
+            "graph"
         )
 
         # The io_uring, Linux AIO and SPDK transports are Linux-only and take no option of their own; each suite skips
         # itself where the kernel or the build refuses its transport.
         if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
-            list(APPEND USTORE_STORAGE_TEST_NAMES "linux_uring" "linux_aio" "linux_spdk")
+            list(APPEND USTORE_STORAGE_TEST_NAMES "linux_uring_disk" "linux_aio_disk" "linux_spdk_disk")
         endif ()
 
         # The SPDK suite starts and stops its own target through the rig script, so the script's path is compiled in and
         # `--spdk-root` names the build the script runs; without the option the suite prints its skip line instead.
         foreach (storage_name IN ITEMS ${USTORE_STORAGE_TEST_NAMES})
             set(storage_exe ustore_test_nvme_${storage_name})
-            add_executable(${storage_exe} test/nvme_${storage_name}.cpp)
+            add_executable(${storage_exe} test/nvme/${storage_name}.cpp)
             target_compile_features(${storage_exe} PRIVATE cxx_std_20)
+            target_include_directories(${storage_exe} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
             target_link_libraries(
                 ${storage_exe}
-                PRIVATE forkunion::static
+                PRIVATE ustore::header
+                        forkunion::static
                         smashtable::header
                         stringzilla::static
                         fmt::fmt
@@ -407,11 +414,11 @@ if (${USTORE_BUILD_TEST})
             set(storage_arguments --directory ${CMAKE_BINARY_DIR}/test_data)
             # The LSM suite merges on the device where the build carries one, so on the transports that need no hardware
             # option its device case may no longer skip
-            if (storage_name STREQUAL "lsm" AND TARGET ustore_nvme_compaction)
+            if (storage_name STREQUAL "tree" AND TARGET ustore_nvme_compaction)
                 target_link_libraries(${storage_exe} PRIVATE ustore_nvme_compaction)
                 list(APPEND storage_arguments --no-skips --transports memory,blocking,linux-uring)
             endif ()
-            if (storage_name STREQUAL "linux_spdk")
+            if (storage_name STREQUAL "linux_spdk_disk")
                 target_compile_definitions(
                     ${storage_exe} PRIVATE USTORE_SPDK_RIG="${CMAKE_CURRENT_SOURCE_DIR}/scripts/rigs/spdk_target.sh"
                 )

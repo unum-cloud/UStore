@@ -1,0 +1,60 @@
+{
+  "1_byte": {
+    "enabled": false,
+    "population_count": 100000,
+    "sorted_run_population_count": 10000,
+    "level_max_bytes": 3280000,
+    "level_enlarge_factor": 4
+  },
+  "4_bytes": {
+    "enabled": false,
+    "population_count": 100000,
+    "sorted_run_population_count": 10000,
+    "level_max_bytes": 3520000,
+    "level_enlarge_factor": 4
+  },
+  "8_bytes": {
+    "enabled": false,
+    "population_count": 100000,
+    "sorted_run_population_count": 10000,
+    "level_max_bytes": 3840000,
+    "level_enlarge_factor": 4
+  },
+  "16_bytes": {
+    "enabled": false,
+    "population_count": 100000,
+    "sorted_run_population_count": 10000,
+    "level_max_bytes": 4480000,
+    "level_enlarge_factor": 4
+  },
+  "32_bytes": {
+    "enabled": false,
+    "population_count": 100000,
+    "sorted_run_population_count": 10000,
+    "level_max_bytes": 5760000,
+    "level_enlarge_factor": 4
+  },
+  "64_bytes": {
+    "enabled": false,
+    "population_count": 100000,
+    "sorted_run_population_count": 10000,
+    "level_max_bytes": 8320000,
+    "level_enlarge_factor": 4
+  },
+  "fixed_width": {
+    "enabled": true,
+    "population_count": 100000000,
+    "sorted_run_population_count": 1000,
+    "value_size": 1,
+    "level_max_bytes": 1700000,
+    "level_enlarge_factor": 4
+  },
+  "variable_width": {
+    "enabled": false,
+    "population_count": 100000,
+    "sorted_run_population_count": 10000,
+    "value_max_size": 2048,
+    "level_max_bytes": 131072000,
+    "level_enlarge_factor": 4
+  }
+}
