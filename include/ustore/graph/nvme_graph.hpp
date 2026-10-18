@@ -14,14 +14,12 @@
  *  Every call reads what it needs in one batch and writes what it changed in one pass, which is the point
  *  of this layer: a thousand vertex pairs looked up together cost one depth-filling batch rather than a
  *  thousand round trips. Reads take the caller's channel and run on any number of threads; writes reach the
- *  database's own write path, which admits one writer at a time. Nothing here excludes anything: the one
- *  claim in reach is the write path of the databases underneath, which they take and give back on their own.
+ *  sequencer of the ledger both databases share, which lands one commit at a time. Nothing here excludes
+ *  anything: the one word in reach is that ledger's leader word, which its commits take and give back on their own.
  *
- *  A graph spans two databases, so an indivisible change spans two transactions. Both are staged before
- *  either commits: a staged transaction holds its database's write path, so a reader that consults a
- *  vertex's registry before its edge blocks waits behind whichever half has not landed and sees both
- *  halves of a commit or neither. Nothing is read between the staging and the commit, since a staged
- *  transaction refuses every read.
+ *  A graph spans two databases, so an indivisible change spans two transactions. Both are sealed and then landed
+ *  as one request under one stamp, each half's views published before the stamp is, so a reader at a published
+ *  stamp sees both halves of a commit or neither.
  */
 
 #pragma once
@@ -58,6 +56,7 @@ namespace unum::ustore::graph {
 
 using blobs::basic_single_collection_database;
 using blobs::commit_ledger_t;
+using blobs::commit_request_t;
 using blobs::create_single_collection_database_config;
 using blobs::key_slot;
 using blobs::select_result_t;
@@ -1294,27 +1293,26 @@ class basic_graph_transaction {
     [[nodiscard]] access_t access() noexcept { return access_t {*vertices_, *half_edges_}; }
 
     /**
-     *  @brief Stages both halves and then lands both under one stamp, starting the transaction again.
+     *  @brief Seals both halves and lands them as one request through the shared ledger's sequencer, under one
+     *      stamp, starting the transaction again and then maintaining both databases.
      *
-     *  Both halves take their write paths before either lands, and both land under the one stamp the shared ledger
-     *  draws and publishes only once both have landed, so a reader sees both halves of a commit or neither. A
-     *  failure rolls back whichever half still holds a write path, since one left staged would hold it against
-     *  every reader.
+     *  The leader checks and lays out both halves before it draws the stamp, and publishes both before the stamp
+     *  itself, so a reader sees both halves of a commit or neither. A refusal of either half refuses both, and keeps
+     *  the changes of both.
      */
     status_t commit() noexcept {
-        if (status_t const staged = vertices_->stage(); staged.failed()) return staged;
-        if (status_t const staged = half_edges_->stage(); staged.failed()) {
-            vertices_->rollback();
-            return staged;
-        }
-        commit_ledger_t::commit_in_flight_t in_flight;
-        transaction_stamp_t const stamp = store_->ledger().begin_commit(in_flight);
-        vertices_->land(stamp);
-        half_edges_->land(stamp);
-        store_->ledger().end_commit(in_flight);
-        // Only now is the stamp published, so both halves start again past it.
+        if (status_t const sealed = vertices_->seal(); sealed.failed()) return sealed;
+        if (status_t const sealed = half_edges_->seal(); sealed.failed()) return sealed;
+        commit_request_t request;
+        request.context = this;
+        request.prepare = &prepare_both_;
+        request.publish = &publish_both_;
+        if (status_t const committed = store_->ledger().submit(request).status(); committed.failed()) return committed;
         vertices_->rollback();
         half_edges_->rollback();
+        // Both halves have landed, so a failure to maintain is met again by the next commit making room.
+        [[maybe_unused]] status_t const vertices_maintained = store_->vertices().maintain();
+        [[maybe_unused]] status_t const half_edges_maintained = store_->half_edges().maintain();
         return {};
     }
 
@@ -1339,6 +1337,24 @@ class basic_graph_transaction {
   private:
 
     basic_graph_transaction() noexcept = default;
+
+    /** Checks and lays out both halves on the leader, forgetting the first when the second is refused. */
+    static status_t prepare_both_(void* context) noexcept {
+        basic_graph_transaction& both = *static_cast<basic_graph_transaction*>(context);
+        if (status_t const prepared = both.vertices_->prepare_landing(); prepared.failed()) return prepared;
+        if (status_t const prepared = both.half_edges_->prepare_landing(); prepared.failed()) {
+            both.vertices_->forget_landing();
+            return prepared;
+        }
+        return {};
+    }
+
+    /** Publishes both halves under the one stamp the leader drew. */
+    static void publish_both_(void* context, transaction_stamp_t stamp) noexcept {
+        basic_graph_transaction& both = *static_cast<basic_graph_transaction*>(context);
+        both.vertices_->land(stamp);
+        both.half_edges_->land(stamp);
+    }
 
 #pragma region Private Members
 

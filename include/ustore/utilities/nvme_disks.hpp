@@ -45,6 +45,7 @@
 #include <bit>        // `std::has_single_bit`
 #include <concepts>   // `std::same_as`
 #include <functional> // `std::hash`
+#include <limits>     // `std::numeric_limits`
 #include <span>       // `std::span`
 #include <thread>     // `std::this_thread::get_id`
 #include <utility>    // `std::exchange`, `std::move`
@@ -85,6 +86,10 @@ concept block_device_concept = requires(device_type_& device, device_type_ const
 [[nodiscard]] inline thread_identity_t calling_thread_identity() noexcept {
     return static_cast<std::uint64_t>(std::hash<std::thread::id> {}(std::this_thread::get_id()));
 }
+
+/** The thread index a caller outside every executor reads with, past any executor's threads, so it shares the
+ *  channels and the epoch slots threads of no executor take. */
+inline constexpr std::size_t outside_executor_k = std::numeric_limits<std::size_t>::max();
 
 #pragma endregion Devices
 

@@ -124,8 +124,8 @@ std::uint32_t serve_batch(call_executor_t& executor) noexcept {
     wait_finished(executor, first_ticket);
     auto serve_task = [&executor, head, mask](std::size_t task, std::size_t thread) noexcept {
         deferred_slot_t& slot = executor.deferred[(head + task) & mask];
-        run_as(executor.runners[thread],
-               [&](ustore_arena_t scratch) noexcept { slot.run(&slot.arguments, executor.results[task], scratch); });
+        run_as(executor, thread,
+               [&](view_t const& runner) noexcept { slot.run(&slot.arguments, executor.results[task], runner); });
     };
     // A lent pool running its lender's dispatch refuses ours and runs nothing, so the driver runs the batch itself
     if (st::failed(view_of(executor.pool).for_n_dynamic(count, serve_task)))
@@ -212,6 +212,7 @@ nvme_placement_t nvme_placement_of(ustore_executor_t executor) noexcept {
     if (!executor || !executor->moves_nvme) return placement;
     placement.nvme = executor->nvme;
     placement.threads = view_of(executor->pool).threads_count();
+    placement.executor = executor;
     if (call_executor_t const* const vram = executor->vram) {
         placement.devices = std::span<std::int32_t const> {vram->devices};
         placement.scratch_limit = vram->scratch_limit;
@@ -230,7 +231,7 @@ static status_t make_executor(std::variant<executor_t, lent_pool_t> pool, topolo
     std::size_t const limit = deferred_limit ? deferred_limit : deferred_limit_default_k;
     if (limit > deferred_limit_max_k)
         return {status_code_t::capacity_exhausted_k, "An executor holds at most 2^30 deferred calls"};
-    st::expected<executor_t> driver = executor_t::make(1, spawned_exclusivity());
+    st::expected<executor_t> driver = executor_t::make_unpinned(1, spawned_exclusivity());
     if (!driver) return pool_failure(driver.status());
     std::size_t const threads = view_of(pool).threads_count();
     ustore_executor_handle_t* const executor = new (std::nothrow)

@@ -246,7 +246,7 @@ template <watch_schedule_t watch_schedule_ = watch_schedule_t::default_k, typena
 /** Checks that @p store carries exactly the keys @p filter picks in the collection of @p shape, key by key and in one
  *  batch, each with every byte of its value. */
 template <typename database_type_>
-[[nodiscard]] std::size_t check_database(database_type_ const& store, collections_t const& named, shape_t shape,
+[[nodiscard]] std::size_t check_database(database_type_& store, collections_t const& named, shape_t shape,
                                          filter_t filter) {
     std::size_t failures = 0;
     std::size_t mismatches = 0;
@@ -301,8 +301,8 @@ template <typename database_type_>
 /** Checks that @p transaction sees exactly the keys @p filter picks in the collection of @p shape, reading each one
  *  through the watch schedule @p watch_schedule_. */
 template <watch_schedule_t watch_schedule_ = watch_schedule_t::default_k, typename transaction_type_>
-[[nodiscard]] std::size_t check_transaction(transaction_type_ const& transaction, collections_t const& named,
-                                            shape_t shape, filter_t filter) {
+[[nodiscard]] std::size_t check_transaction(transaction_type_& transaction, collections_t const& named, shape_t shape,
+                                            filter_t filter) {
     std::size_t failures = 0;
     std::size_t mismatches = 0;
     value_buffer_t buffer {};
@@ -327,7 +327,7 @@ template <watch_schedule_t watch_schedule_ = watch_schedule_t::default_k, typena
 
 /** Checks every collection of @p store against one filter per shape, in the order of @c every_shape_k. */
 template <typename database_type_>
-[[nodiscard]] std::size_t check_every_database(database_type_ const& store, collections_t const& named,
+[[nodiscard]] std::size_t check_every_database(database_type_& store, collections_t const& named,
                                                filter_t inline_filter, filter_t fixed_filter,
                                                filter_t variable_filter) {
     return check_database(store, named, shape_t::inline_k, inline_filter) +
@@ -337,7 +337,7 @@ template <typename database_type_>
 
 /** Checks every collection @p transaction sees against one filter per shape, in the order of @c every_shape_k. */
 template <typename transaction_type_>
-[[nodiscard]] std::size_t check_every_transaction(transaction_type_ const& transaction, collections_t const& named,
+[[nodiscard]] std::size_t check_every_transaction(transaction_type_& transaction, collections_t const& named,
                                                   filter_t inline_filter, filter_t fixed_filter,
                                                   filter_t variable_filter) {
     return check_transaction(transaction, named, shape_t::inline_k, inline_filter) +

@@ -36,8 +36,7 @@
  *  Teardown is an order, not a destructor: a queue pair may not be released with work outstanding, a
  *  pinned range may not be unpinned while a request addresses it, and a medium may not be
  *  deregistered while one names it. So the channels drain first, the arena is unpinned next, the targets
- *  go back after that, and the volumes are dropped last. The resources over a mount add the budgets, the
- *  threads and the gate background jobs pass.
+ *  go back after that, and the volumes are dropped last. The resources over a mount add the budgets.
  */
 
 #pragma once
@@ -55,19 +54,15 @@
 #include <unistd.h>   // `rmdir`, `unlink`
 #endif
 
-#include <algorithm> // `std::clamp`
-#include <array>     // `std::array`
-#include <atomic>    // `std::memory_order`
-#include <bit>       // `std::has_single_bit`
-#include <concepts>  // `std::same_as`
-#include <memory>    // `std::shared_ptr`, `std::make_shared`
-#include <new>       // placement `new`
-#include <optional>  // `std::optional`
-#include <span>      // `std::span`
-#include <utility>   // `std::forward`, `std::move`
-#include <variant>   // `std::variant`, `std::visit`, `std::get_if`, `std::monostate`, `std::in_place_type`
+#include <array>    // `std::array`
+#include <bit>      // `std::has_single_bit`
+#include <concepts> // `std::same_as`
+#include <memory>   // `std::shared_ptr`, `std::make_shared`
+#include <new>      // placement `new`
+#include <span>     // `std::span`
+#include <utility>  // `std::forward`, `std::move`
+#include <variant>  // `std::variant`, `std::visit`, `std::get_if`, `std::monostate`, `std::in_place_type`
 
-#include <forkunion/atomics.hpp>       // `fu::preferred_atomic_ref`
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 #include <stringzilla/stringzilla.hpp> // `sz::string_t`
 
@@ -76,7 +71,6 @@
 #include "ustore/utilities/nvme_linux_aio_disk.hpp"   // `linux_aio_files_disk_t`, `linux_aio_probe_t`
 #include "ustore/utilities/nvme_linux_uring_disk.hpp" // `linux_uring_files_disk_t`, `linux_uring_probe_t`
 #include "ustore/utilities/nvme_ring.hpp"             // `extent_t`, `uuid_t`, `ring_concept`, `string_t`
-#include "ustore/utilities/ram_device.hpp"            // `executor_t`, `caller_exclusivity_t`
 #include "ustore/utilities/types.hpp"                 // `status_t`, `status_code_t`, `expected`, `byte_t`
 
 namespace unum::ustore::utilities {
@@ -1467,7 +1461,8 @@ enum class io_transport_t : std::uint8_t {
 /**
  *  @brief Budgets and directories every collection of one database shares, as the NVMe init call names them.
  *
- *  Zero @c threads leaves the count to @c derived_background_threads when the database opens.
+ *  @c threads counts the executor threads that each read on a channel of their own, and zero leaves only the
+ *  shared channels.
  */
 struct resources_config_t {
     std::size_t memory_limit = 4 * 1024 * 1024 * 1024ull;
@@ -1481,10 +1476,6 @@ struct resources_config_t {
     st::basic_vector<data_directory_config_t> data_directories;
 };
 
-/** Half the logical cores, between one and eight, as every thread pins a channel of 12 MB by default. */
-[[nodiscard]] inline std::size_t derived_background_threads(std::size_t logical_cores_count) noexcept {
-    return std::clamp<std::size_t>(logical_cores_count / 2, 1, 8);
-}
 #pragma endregion Mount Configuration
 
 #pragma region Files Disk
@@ -2108,216 +2099,6 @@ class mounted_storage_t {
 
 #pragma region Resources
 
-#pragma region Background Jobs
-
-/**
- *  @brief The flag one owner raises to stop the background jobs it submitted.
- *
- *  An LSM tree flushing its write buffer, a level merger compacting and a backup manager copying
- *  files each hold one, so a job always has a named owner that starts it, observes it and stops
- *  it. Every part of a running job polls @c cancelled between units of work, and the gate refuses
- *  a fresh job whose owner has already raised the flag.
- */
-class job_cancellation_t {
-  public:
-
-    job_cancellation_t() noexcept = default;
-    job_cancellation_t(job_cancellation_t const&) = delete;
-    job_cancellation_t& operator=(job_cancellation_t const&) = delete;
-
-    /** Stops the jobs this owner submitted, and refuses the ones it has not submitted yet. */
-    void cancel() noexcept {
-        flag_reference_().store(static_cast<std::int32_t>(cancellation_state_t::cancelled_k),
-                                std::memory_order_release);
-    }
-
-    /** Admits this owner's jobs again, for a component reopened in place. */
-    void resume() noexcept {
-        flag_reference_().store(static_cast<std::int32_t>(cancellation_state_t::wanted_k), std::memory_order_release);
-    }
-
-    /** Whether the owner has stopped its jobs, which every part of a running one polls. */
-    bool cancelled() const noexcept {
-        return flag_reference_().load(std::memory_order_acquire) !=
-               static_cast<std::int32_t>(cancellation_state_t::wanted_k);
-    }
-
-  private:
-
-    /** A @c cancellation_state_t, moved by @c cancel and @c resume. */
-    std::int32_t flag_ = 0;
-
-    fu::preferred_atomic_ref<std::int32_t> flag_reference_() noexcept {
-        return fu::preferred_atomic_ref<std::int32_t> {flag_};
-    }
-
-    fu::preferred_atomic_ref<std::int32_t const> flag_reference_() const noexcept {
-        return fu::preferred_atomic_ref<std::int32_t const> {flag_};
-    }
-};
-
-/** Where the pool of a @c background_executor_t stands between its making and its first job. */
-enum class pool_state_t : std::int32_t {
-
-    /** No thread exists yet, and the next job admitted spawns them. */
-    dormant_k = 0,
-
-    /** One submitter is spawning the threads, and every other one spins until it is done. */
-    spawning_k = 1,
-
-    /** The threads are up and every job fans out over them. */
-    spawned_k = 2,
-};
-
-/**
- *  @brief The executor every background job of one database runs on, with the bound on jobs in flight.
- *
- *  There are no fibers and no repeating loops: an owner calls @c submit_for_n or @c submit_for_threads
- *  when a threshold it tracks is crossed, the work fans out across the pool, and the call returns once
- *  every part has finished. The gate admits a job only while fewer than @c jobs_limit are running, so
- *  thresholds crossing at once queue at their owners rather than in the pool, whose dispatch admits one
- *  caller at a time. The first job admitted spawns the pool, and every submitter only coordinates it,
- *  so a mounted database that never crosses a threshold owns no threads and pins none.
- */
-class background_executor_t {
-  public:
-
-    background_executor_t(background_executor_t&&) noexcept = default;
-    background_executor_t& operator=(background_executor_t&&) noexcept = default;
-    background_executor_t(background_executor_t const&) = delete;
-    background_executor_t& operator=(background_executor_t const&) = delete;
-
-    /**
-     *  @brief Sets the thread count, spawning nothing yet, and admits @p jobs_limit jobs at a time.
-     *  @param[in] threads Thread count, at least one, which the first job admitted spawns.
-     *  @param[in] jobs_limit Jobs that may be in flight at once, at least one.
-     */
-    static expected<background_executor_t> make(std::size_t threads, std::size_t jobs_limit) noexcept {
-        if (threads == 0 || jobs_limit == 0)
-            return status_t {status_code_t::invalid_argument_k, "A background executor needs a thread and a job"};
-        return background_executor_t {threads, static_cast<std::int32_t>(jobs_limit)};
-    }
-
-    /** The number of threads a job fans out over, which the submitting thread is never among. */
-    [[nodiscard]] std::size_t threads_count() const noexcept { return threads_; }
-
-    /** Whether the pool is still to be spawned, being spawned by a submitter right now, or up. */
-    [[nodiscard]] pool_state_t pool_state() const noexcept {
-        return static_cast<pool_state_t>(pool_state_reference_().load(std::memory_order_acquire));
-    }
-
-    /** The jobs running right now, which never passes the limit the gate was made with. */
-    [[nodiscard]] std::size_t jobs_in_flight() const noexcept {
-        return static_cast<std::size_t>(jobs_in_flight_reference_().load(std::memory_order_acquire));
-    }
-
-    /** The jobs that may run at once. */
-    [[nodiscard]] std::size_t jobs_limit() const noexcept { return static_cast<std::size_t>(jobs_limit_); }
-
-    /**
-     *  @brief Runs @p callback over @p count parts of @p owner's job, split evenly across the threads.
-     *  @param[in] owner The flag the job's owner cancels it through, which the gate reads before admitting it.
-     *  @param[in] count Parts of the job, which may be zero for a job with nothing to do.
-     *  @param[in] callback Runs once per part, with the part index and the index of the thread running it.
-     */
-    template <task_callback callback_>
-    status_t submit_for_n(job_cancellation_t const& owner, std::size_t count, callback_&& callback) noexcept {
-        if (status_t const admitted = admit_(owner); admitted.failed()) return admitted;
-        st::status_t const dispatched = executor_->for_n(count, std::forward<callback_>(callback));
-        retire_();
-        return to_status(dispatched);
-    }
-
-    /**
-     *  @brief Runs @p callback once on every thread of @p owner's job.
-     *  @param[in] owner The flag the job's owner cancels it through, which the gate reads before admitting it.
-     *  @param[in] callback Runs once per thread, with the thread index and, when it takes one, the compute domain.
-     */
-    template <thread_callback callback_>
-    status_t submit_for_threads(job_cancellation_t const& owner, callback_&& callback) noexcept {
-        if (status_t const admitted = admit_(owner); admitted.failed()) return admitted;
-        st::status_t const dispatched = executor_->for_threads(std::forward<callback_>(callback));
-        retire_();
-        return to_status(dispatched);
-    }
-
-  private:
-
-    background_executor_t(std::size_t threads, std::int32_t jobs_limit) noexcept
-        : threads_(threads), jobs_limit_(jobs_limit) {}
-
-    /** Takes one of the job slots, spawning the pool for the first, or reports why this job does not run. */
-    status_t admit_(job_cancellation_t const& owner) noexcept {
-        if (owner.cancelled()) return {status_code_t::uninitialized_k, "The owner cancelled its background jobs"};
-        if (status_t const spawned = spawn_(); spawned.failed()) return spawned;
-        std::int32_t const observed = jobs_in_flight_reference_().fetch_add_if_at_most(1, jobs_limit_,
-                                                                                       std::memory_order_acquire);
-        if (observed + 1 > jobs_limit_)
-            return {status_code_t::capacity_exhausted_k, "Too many background jobs are already in flight"};
-        return {};
-    }
-
-    /** Hands the job slot back, so the next threshold crossing is admitted. */
-    void retire_() noexcept { jobs_in_flight_reference_().sub(1, std::memory_order_release); }
-
-    /** Spawns the pool once, on the first job, spinning out a spawn another submitter has under way. */
-    status_t spawn_() noexcept {
-        constexpr std::int32_t dormant_k = static_cast<std::int32_t>(pool_state_t::dormant_k);
-        constexpr std::int32_t spawning_k = static_cast<std::int32_t>(pool_state_t::spawning_k);
-        constexpr std::int32_t spawned_k = static_cast<std::int32_t>(pool_state_t::spawned_k);
-        fu::preferred_atomic_ref<std::int32_t> const state = pool_state_reference_();
-        std::int32_t observed = dormant_k;
-        while (
-            !state.compare_exchange_weak(observed, spawning_k, std::memory_order_acquire, std::memory_order_acquire)) {
-            if (observed == spawned_k) return {};
-            observed = dormant_k;
-        }
-        st::expected<executor_t> executor = executor_t::make(threads_, caller_exclusivity_t::caller_exclusive_k);
-        if (!executor) {
-            state.store(dormant_k, std::memory_order_release);
-            return to_status(executor.status());
-        }
-        executor_.emplace(std::move(*executor));
-        state.store(spawned_k, std::memory_order_release);
-        return {};
-    }
-
-    fu::preferred_atomic_ref<std::int32_t> jobs_in_flight_reference_() noexcept {
-        return fu::preferred_atomic_ref<std::int32_t> {jobs_in_flight_};
-    }
-
-    fu::preferred_atomic_ref<std::int32_t const> jobs_in_flight_reference_() const noexcept {
-        return fu::preferred_atomic_ref<std::int32_t const> {jobs_in_flight_};
-    }
-
-    fu::preferred_atomic_ref<std::int32_t> pool_state_reference_() noexcept {
-        return fu::preferred_atomic_ref<std::int32_t> {pool_state_};
-    }
-
-    fu::preferred_atomic_ref<std::int32_t const> pool_state_reference_() const noexcept {
-        return fu::preferred_atomic_ref<std::int32_t const> {pool_state_};
-    }
-
-    /** The threads every job fans out over, never parked, since @c fu_pool_sleep races a concurrent @c admit_. */
-    std::optional<executor_t> executor_;
-
-    /** The threads the first job spawns, which @c threads_count answers before and after the spawn. */
-    std::size_t threads_ = 1;
-
-    /** A @c pool_state_t moved by @c spawn_ alone, by compare-exchange out of @c dormant_k. */
-    std::int32_t pool_state_ = 0;
-
-    /** The jobs running right now, raised by @c admit_ and lowered by @c retire_. */
-    std::int32_t jobs_in_flight_ = 0;
-
-    /** The jobs that may run at once, fixed when the gate is made. */
-    std::int32_t jobs_limit_ = 1;
-};
-
-using background_executor_shared_ptr_t = std::shared_ptr<background_executor_t>;
-
-#pragma endregion Background Jobs
-
 #pragma region Shared Resources
 
 /** Budgets and services every collection of one database shares. */
@@ -2331,9 +2112,6 @@ struct resources_t {
 
     /** GPU devices compaction may use. */
     st::basic_vector<int> gpu_devices;
-
-    /** Threads and the job gate every flush, compaction and backup passes. */
-    background_executor_shared_ptr_t executor;
 
     /** The transport, the pinned arena, the channels and the volumes mounted over the data directories. */
     mounted_storage_t storage;
@@ -2360,14 +2138,9 @@ std::shared_ptr<object_> make_constrained_shared(resources_shared_ptr_t const& r
     return std::shared_ptr<object_>(new (pointer) object_(std::forward<arguments_>(arguments)...), deleter);
 }
 
-/** The jobs one database admits at once: one per data directory, one for its metadata and ten for compaction. */
-inline std::size_t background_jobs_limit(std::size_t data_directories_count) noexcept {
-    return data_directories_count + 1 + 10;
-}
-
 /**
- *  @brief Creates the metadata directory, opens the executor and mounts the storage of one database.
- *  @param[in] config Budgets, threads, the metadata directory and the data directories to mount.
+ *  @brief Creates the metadata directory and mounts the storage of one database.
+ *  @param[in] config Budgets, executor threads, the metadata directory and the data directories to mount.
  *  @param[in] database The database the volumes belong to, or an invalid identifier to take any.
  *  @return The resources, whose destructor tears the mount down in the order it was built in.
  */
@@ -2382,19 +2155,8 @@ inline expected<resources_shared_ptr_t> open_resources(resources_config_t const&
     for (std::size_t index = 0; index != config.gpu_devices.size(); ++index)
         resources->gpu_devices[index] = config.gpu_devices[index];
 
-    std::size_t threads = config.threads;
-    if (threads == 0) {
-        auto [cores, logical_cores_count_status] = executor_t::logical_cores_count();
-        if (st::failed(logical_cores_count_status)) return to_status(logical_cores_count_status);
-        threads = derived_background_threads(cores);
-    }
-    expected<background_executor_t> executor = background_executor_t::make(
-        threads, background_jobs_limit(config.data_directories.size()));
-    if (!executor) return executor.status();
-    resources->executor = std::make_shared<background_executor_t>(std::move(*executor));
-
-    if (status_t const mounted = resources->storage.mount(config, resources->memory_constraint,
-                                                          resources->executor->threads_count(), database);
+    if (status_t const mounted = resources->storage.mount(config, resources->memory_constraint, config.threads,
+                                                          database);
         mounted.failed())
         return mounted;
     return resources;

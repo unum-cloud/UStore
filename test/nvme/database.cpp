@@ -17,6 +17,7 @@
 #include <array>       // `std::array`
 #include <atomic>      // `std::atomic`
 #include <chrono>      // `std::chrono::steady_clock`
+#include <limits>      // `std::numeric_limits`
 #include <memory>      // `std::unique_ptr`, `std::make_shared`
 #include <new>         // `std::nothrow`
 #include <span>        // `std::span`
@@ -184,8 +185,8 @@ template <typename database_type_>
 
 /** Reads @p key back out of all three collections and checks every byte against @p round. */
 template <typename database_type_>
-[[nodiscard]] std::size_t check_painted(database_type_ const& store, painted_collections_t const& named,
-                                        std::uint64_t key, std::uint64_t round) {
+[[nodiscard]] std::size_t check_painted(database_type_& store, painted_collections_t const& named, std::uint64_t key,
+                                        std::uint64_t round) {
     std::size_t failures = 0;
     std::array<byte_t, 1024> into {};
     stored_value_size_t size = 0;
@@ -211,12 +212,6 @@ template <typename database_type_>
         if (into[static_cast<std::size_t>(position)] != painted(key + round * 1000 + 99, position)) ++mismatches;
     failures += expect_eq(mismatches, std::size_t {0});
     return failures;
-}
-
-/** Levels the collection at @p index of @p taken holds, which is how a case sees a tree's depth. */
-template <typename snapshot_type_>
-[[nodiscard]] std::size_t levels_held(snapshot_type_ const& taken, std::size_t index) noexcept {
-    return std::visit([](auto const& levels) noexcept { return levels.levels().size(); }, taken.at(index).levels);
 }
 
 /** Sorted runs @p volume names right now, which a reopen neither adds to nor loses. */
@@ -513,18 +508,10 @@ std::size_t catalog_survives_reopen(mount_type_ const& mount) {
     failures += expect((*stack)->store->flush().succeeded());
     if (failures != 0) return failures;
 
-    std::size_t depth = 0;
-    std::size_t shallowest_runs = 0;
-    {
-        expected<typename database_t::snapshot_t> taken = (*stack)->store->take_snapshot();
-        failures += expect(taken.has_value());
-        if (!taken) return failures;
-        depth = levels_held(*taken, 1);
-        shallowest_runs = std::visit([](auto const& levels) noexcept { return levels.levels().level(0).size(); },
-                                     taken->at(1).levels);
-        failures += expect(depth > std::size_t {1});
-        failures += expect(shallowest_runs != std::size_t {0});
-    }
+    // The runs and their bytes are what a reopen must take back, level for level.
+    std::size_t const runs_before = run_count_of((*stack)->router.volume(volume_id_t {0}));
+    std::uint64_t const bytes_before = (*stack)->store->size_bytes();
+    failures += expect(runs_before != std::size_t {0});
 
     // A key of every third is answered from level zero, and every other key from the level below it.
     auto round_of = [](std::uint64_t key) noexcept -> std::uint64_t { return key % 3 == 0 ? 2 : 1; };
@@ -551,16 +538,9 @@ std::size_t catalog_survives_reopen(mount_type_ const& mount) {
     failures += expect_eq(store.buffer_size_for_any_stored_value(any_collection_id_t {*numbers}),
                           stored_value_size_t {8});
 
-    // Every level the close left behind is back, with the same runs on the one a lookup reads first.
-    {
-        expected<typename database_t::snapshot_t> taken = store.take_snapshot();
-        failures += expect(taken.has_value());
-        if (!taken) return failures;
-        failures += expect_eq(levels_held(*taken, 1), depth);
-        failures += expect_eq(std::visit([](auto const& levels) noexcept { return levels.levels().level(0).size(); },
-                                         taken->at(1).levels),
-                              shallowest_runs);
-    }
+    // Every run the close left behind is back, and the reads below tell their levels apart.
+    failures += expect_eq(run_count_of((*stack)->router.volume(volume_id_t {0})), runs_before);
+    failures += expect_eq(store.size_bytes(), bytes_before);
     for (std::uint64_t key = 0; key != keys_k; ++key) failures += check_painted(store, named, key, round_of(key));
 
     // A reopened collection takes writes and answers them, which is what makes the catalog useful.
@@ -1115,7 +1095,6 @@ std::size_t rollback_and_renew_behave(mount_type_ const& mount) {
 template <typename mount_type_>
 std::size_t snapshot_holds_its_moment(mount_type_ const& mount) {
     using types_t = database_types<typename mount_type_::fixture_t>;
-    using guard_t = typename types_t::guard_t;
     using database_t = typename types_t::database_t;
     using stack_t = typename types_t::stack_t;
     std::size_t failures = 0;
@@ -1140,39 +1119,39 @@ std::size_t snapshot_holds_its_moment(mount_type_ const& mount) {
     expected<typename database_t::snapshot_t> taken = store.take_snapshot();
     failures += expect(taken.has_value());
     if (!taken) return failures;
-    failures += expect_eq(taken->size(), std::size_t {2});
-    failures += expect_eq(taken->population_count(), std::uint64_t {2});
+    failures += expect_eq(store.population_count(), std::uint64_t {2});
 
-    // Nothing is flushed while the snapshot lives, since a publication waits for every hold to go.
+    // Later commits and a flush land beside the snapshot, which publishes over nothing it waits for.
     failures += expect(
         store.insert(any_collection_id_t {*left}, stored_key_t {1}, stored_value_view_t {newer}).succeeded());
     failures += expect(
         store.insert(any_collection_id_t {*left}, stored_key_t {2}, stored_value_view_t {newer}).succeeded());
     failures += expect(store.remove(any_collection_id_t {*right}, stored_key_t {1}).succeeded());
 
-    expected<guard_t> guard = (*stack)->fixture->channels.acquire();
-    failures += expect(guard.has_value());
-    if (!guard) return failures;
-
     st::basic_vector<byte_t> into;
     failures += expect(into.resize(8) == st::status_t::success_k);
-    stored_value_size_t size = 0;
-    failures += expect(
-        taken->select(guard->channel(), any_collection_id_t {*left}, stored_key_t {1}, std::span<byte_t> {into}, size)
-            .succeeded());
-    failures += expect_eq(counter_of(std::span<byte_t const> {into.data(), size}), std::uint64_t {1});
-    failures += expect(taken->find(any_collection_id_t {*left}, stored_key_t {2}, size) == select_result_t::nothing_k);
-    failures += expect(taken->find(any_collection_id_t {*right}, stored_key_t {1}, size) == select_result_t::success_k);
+    for (std::size_t round = 0; round != 2; ++round) {
+        stored_value_size_t size = 0;
+        failures += expect(
+            taken->select(any_collection_id_t {*left}, stored_key_t {1}, std::span<byte_t> {into}, size).succeeded());
+        failures += expect_eq(counter_of(std::span<byte_t const> {into.data(), size}), std::uint64_t {1});
+        failures += expect(taken->find(any_collection_id_t {*left}, stored_key_t {2}, size) ==
+                           select_result_t::nothing_k);
+        failures += expect(taken->find(any_collection_id_t {*right}, stored_key_t {1}, size) ==
+                           select_result_t::success_k);
+        // The second round reads what the flush wrote, which kept every version the snapshot pins.
+        if (round == 0) failures += expect(store.flush().succeeded());
+    }
     failures += expect(taken->contains(any_collection_id_t {owned_name("right")}));
     failures += expect(!taken->contains(any_collection_id_t {owned_name("absent")}));
 
     // The store itself has moved on, which is what makes the snapshot's answers its own.
+    stored_value_size_t size = 0;
     failures += expect(
         store.select(any_collection_id_t {*left}, stored_key_t {1}, std::span<byte_t> {into}, size).succeeded());
     failures += expect_eq(counter_of(std::span<byte_t const> {into.data(), size}), std::uint64_t {2});
     failures += expect(!store.contains(any_collection_id_t {*right}, stored_key_t {1}));
 
-    // Letting the hold go is what lets a flush publish over the level sets the snapshot named.
     taken = expected<typename database_t::snapshot_t> {status_t {status_code_t::uninitialized_k, "Let go"}};
     failures += expect(store.flush().succeeded());
     failures += expect(
@@ -1183,12 +1162,13 @@ std::size_t snapshot_holds_its_moment(mount_type_ const& mount) {
 }
 
 /**
- *  @brief Dropping a collection waits for a snapshot still holding its levels, rather than freeing its runs under it.
+ *  @brief Dropping a collection waits for no snapshot, since a snapshot is a pinned stamp that holds no level set,
+ *      and the snapshot finds the collection gone afterwards.
  *
- *  The drop runs on a second thread while the snapshot lives, so it must still be waiting when the snapshot goes.
+ *  The drop runs on a second thread while the snapshot lives, and must finish before the snapshot goes.
  */
 template <typename mount_type_>
-std::size_t drop_waits_for_the_snapshot(mount_type_ const& mount) {
+std::size_t drop_proceeds_beside_the_snapshot(mount_type_ const& mount) {
     using types_t = database_types<typename mount_type_::fixture_t>;
     using database_t = typename types_t::database_t;
     using stack_t = typename types_t::stack_t;
@@ -1209,7 +1189,7 @@ std::size_t drop_waits_for_the_snapshot(mount_type_ const& mount) {
     std::atomic<bool> succeeded {false};
     std::thread dropper;
     {
-        expected<typename database_t::snapshot_t> const taken = store.take_snapshot();
+        expected<typename database_t::snapshot_t> taken = store.take_snapshot();
         failures += expect(taken.has_value());
         if (!taken) return failures;
         dropper = std::thread {[&]() noexcept {
@@ -1217,13 +1197,14 @@ std::size_t drop_waits_for_the_snapshot(mount_type_ const& mount) {
                             std::memory_order_relaxed);
             dropped.store(true, std::memory_order_release);
         }};
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        failures += expect(!dropped.load(std::memory_order_acquire));
+        dropper.join();
+        stored_value_size_t size = 0;
+        failures += expect(taken->find(any_collection_id_t {*doomed}, stored_key_t {1}, size) ==
+                           select_result_t::nothing_k);
     }
-    dropper.join();
     failures += expect(dropped.load(std::memory_order_acquire));
     failures += expect(succeeded.load(std::memory_order_relaxed));
-    failures += expect(!store.contains_collection(*doomed));
+    failures += expect(!store.has_collection(any_collection_id_t {*doomed}));
     return failures;
 }
 
@@ -1341,6 +1322,150 @@ std::size_t threads_commit_serializably(mount_type_ const& mount) {
     return failures;
 }
 
+/** Bytes the value a committer writes in round @p round takes, which differs from round to round. */
+[[nodiscard]] std::size_t round_bytes_of(std::uint64_t round) noexcept {
+    return static_cast<std::size_t>(16 + round % 61);
+}
+
+/**
+ *  @brief Readers walking two collections while two committers write one each, and a third thread flushes and
+ *      compacts both, never see a version older than one returned before the read began, nor a torn value.
+ *
+ *  Committer @c c writes round @c r of its collection under key @c r % keys, its value the round followed by bytes
+ *  painted from it, and publishes the round it started and the round that returned. A reader takes the returned
+ *  round before a read and the started round after it, so the round it reads is at least the last returned one of
+ *  that key and at most the started one, whichever runs, levels or cache answered.
+ */
+template <typename mount_type_>
+std::size_t readers_beside_committers_and_flushes(mount_type_ const& mount) {
+    using types_t = database_types<typename mount_type_::fixture_t>;
+    using database_t = typename types_t::database_t;
+    using stack_t = typename types_t::stack_t;
+    std::size_t failures = 0;
+    constexpr std::size_t committers_k = 2;
+    constexpr std::size_t readers_k = 4;
+    constexpr std::uint64_t rounds_k = 1500;
+    constexpr std::uint64_t keys_k = 64;
+    constexpr std::uint64_t no_round_k = std::numeric_limits<std::uint64_t>::max();
+
+    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
+    failures += expect_status(stack, status_code_t::success_k);
+    if (!stack) return failures;
+    database_t& store = *(*stack)->store;
+
+    // Memory runs of a few dozen records and a shallow level zero, so the committers merge, flush and compact beside
+    // the flusher.
+    collection_config_t config = test_config(0, value_max_size_k);
+    config.write_buffer_max_elements = 32;
+    config.lsm_tree.lsm_level_0.max_bytes = 16 * 1024;
+    std::array<collection_id_t, committers_k> named {};
+    for (std::size_t committer = 0; committer != committers_k; ++committer) {
+        expected<collection_id_t> const created = create_named(
+            store, committer == 0 ? string_view_t {"left"} : string_view_t {"right"}, config);
+        failures += expect(created.has_value());
+        if (!created) return failures;
+        named[committer] = *created;
+    }
+
+    std::array<std::atomic<std::uint64_t>, committers_k> started {};
+    std::array<std::atomic<std::uint64_t>, committers_k> returned {};
+    for (std::size_t committer = 0; committer != committers_k; ++committer) {
+        started[committer].store(no_round_k, std::memory_order_relaxed);
+        returned[committer].store(no_round_k, std::memory_order_relaxed);
+    }
+    std::atomic<std::size_t> committing {committers_k};
+    std::atomic<std::size_t> wrong {0};
+    std::atomic<std::size_t> reads {0};
+
+    std::array<std::thread, committers_k> committers;
+    for (std::size_t committer = 0; committer != committers_k; ++committer)
+        committers[committer] = std::thread {[&, committer]() noexcept {
+            std::array<byte_t, 128> value {};
+            for (std::uint64_t round = 0; round != rounds_k; ++round) {
+                std::size_t const bytes = round_bytes_of(round);
+                std::memcpy(value.data(), &round, sizeof(round));
+                for (std::size_t position = sizeof(round); position != bytes; ++position)
+                    value[position] = painted(round, position);
+                started[committer].store(round, std::memory_order_release);
+                if (store
+                        .insert(any_collection_id_t {named[committer]}, stored_key_t {round % keys_k},
+                                stored_value_view_t {value.data(), bytes})
+                        .failed())
+                    wrong.fetch_add(1, std::memory_order_relaxed);
+                returned[committer].store(round, std::memory_order_release);
+            }
+            committing.fetch_sub(1, std::memory_order_release);
+        }};
+
+    std::thread flusher {[&]() noexcept {
+        while (committing.load(std::memory_order_acquire) != 0) {
+            if (store.flush().failed()) wrong.fetch_add(1, std::memory_order_relaxed);
+            if (store.needs_compaction() && store.compact().failed()) wrong.fetch_add(1, std::memory_order_relaxed);
+        }
+    }};
+
+    std::array<std::thread, readers_k> readers;
+    for (std::size_t reader = 0; reader != readers_k; ++reader)
+        readers[reader] = std::thread {[&, reader]() noexcept {
+            std::array<byte_t, 128> into {};
+            for (std::uint64_t step = reader; committing.load(std::memory_order_acquire) != 0; ++step) {
+                std::size_t const committer = step % committers_k;
+                std::uint64_t const key = (step * 7) % keys_k;
+                std::uint64_t const before = returned[committer].load(std::memory_order_acquire);
+                stored_value_size_t size = 0;
+                status_t const read = store.select(any_collection_id_t {named[committer]}, stored_key_t {key},
+                                                   std::span<byte_t> {into}, size);
+                std::uint64_t const after = started[committer].load(std::memory_order_acquire);
+                reads.fetch_add(1, std::memory_order_relaxed);
+
+                // The last round that wrote this key and returned before the read began, if any did.
+                bool const owed = before != no_round_k && before >= key;
+                std::uint64_t const least = owed ? before - (before - key) % keys_k : no_round_k;
+                if (read.failed()) {
+                    if (owed || !(read == status_code_t::not_found_k)) wrong.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+                std::uint64_t round = 0;
+                if (size >= sizeof(round)) std::memcpy(&round, into.data(), sizeof(round));
+                bool torn = size != round_bytes_of(round) || round % keys_k != key || round > after;
+                if (owed && round < least) torn = true;
+                for (std::size_t position = sizeof(round); !torn && position != size; ++position)
+                    torn = into[position] != painted(round, position);
+                if (torn) wrong.fetch_add(1, std::memory_order_relaxed);
+            }
+        }};
+
+    for (std::thread& committer : committers) committer.join();
+    flusher.join();
+    for (std::thread& reader : readers) reader.join();
+
+    failures += expect_eq(wrong.load(std::memory_order_relaxed), std::size_t {0});
+    failures += expect(reads.load(std::memory_order_relaxed) != 0);
+
+    // Once every commit returned, a point read probes at most (F − 1)(T + 1) memory runs, T = ⌈log_F commits⌉.
+    std::uint64_t const fan_in = config.lsm_tree.level_enlarge_factor;
+    for (std::size_t committer = 0; committer != committers_k; ++committer) {
+        memory_shape_t const shape = store.memory_shape(any_collection_id_t {named[committer]});
+        std::uint64_t tiers = 0;
+        for (std::uint64_t covered = 1; covered < shape.commits; covered *= fan_in) ++tiers;
+        failures += expect(shape.runs <= (fan_in - 1) * (tiers + 1));
+    }
+
+    // Once everything returned, every key holds its last round, wherever the flushes left it.
+    std::array<byte_t, 128> into {};
+    for (std::size_t committer = 0; committer != committers_k; ++committer)
+        for (std::uint64_t key = 0; key != keys_k; ++key) {
+            stored_value_size_t size = 0;
+            failures += expect(
+                store.select(any_collection_id_t {named[committer]}, stored_key_t {key}, std::span<byte_t> {into}, size)
+                    .succeeded());
+            std::uint64_t round = 0;
+            std::memcpy(&round, into.data(), sizeof(round));
+            failures += expect_eq(round, (rounds_k - 1) - (rounds_k - 1 - key) % keys_k);
+        }
+    return failures;
+}
+
 /** Whether the looking-up threads of the contention case keep asking or wind down. */
 enum class reader_phase_t : std::uint8_t {
 
@@ -1384,8 +1509,8 @@ std::size_t lookups_outrun_the_write_path(mount_type_ const& mount) {
     std::atomic<std::size_t> answered {0};
     std::atomic<std::size_t> mismatched {0};
 
-    // The claim is taken before the first reader starts, so a lookup that wants it counts nothing at all.
-    store.acquire_write_path();
+    // The leader word is taken before the first reader starts, so a lookup that wants it counts nothing at all.
+    store.ledger().lead();
     std::array<std::thread, readers_k> readers;
     for (std::size_t reader = 0; reader != readers_k; ++reader)
         readers[reader] = std::thread {[&]() noexcept {
@@ -1405,7 +1530,7 @@ std::size_t lookups_outrun_the_write_path(mount_type_ const& mount) {
         if (progressed >= readers_k * rounds_k) break;
         fu::preferred_yield_t {}(answered, progressed, std::size_t {0});
     }
-    store.release_write_path();
+    store.ledger().stop_leading();
     failures += expect(progressed >= readers_k * rounds_k);
 
     // Every create and every drop republishes the catalog with the readers already inside one.
@@ -1457,8 +1582,9 @@ int main(int argc, char const* argv[]) {
         report(totals, mount, "conflict_spares_the_other", conflict_leaves_the_other_collection_untouched);
         report(totals, mount, "rollback_and_renew", rollback_and_renew_behave);
         report(totals, mount, "snapshot_holds_its_moment", snapshot_holds_its_moment);
-        report(totals, mount, "drop_waits_for_the_snapshot", drop_waits_for_the_snapshot);
+        report(totals, mount, "drop_proceeds_beside_the_snapshot", drop_proceeds_beside_the_snapshot);
         report(totals, mount, "threads_commit_serializably", threads_commit_serializably);
+        report(totals, mount, "readers_beside_committers_and_flushes", readers_beside_committers_and_flushes);
         report(totals, mount, "lookups_outrun_the_write_path", lookups_outrun_the_write_path);
     };
     for (transport_t const transport : every_transport_k)

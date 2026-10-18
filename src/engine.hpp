@@ -32,8 +32,10 @@ namespace unum::ustore {
 
 using utilities::strings_arg_t;
 
+struct call_executor_t;
+
 /** What a call reads through, decoded once by the router from its view, or from the transaction a write carries, and
- *  the scratch it works in. */
+ *  the scratch and the executor thread it works on. */
 struct view_t {
 
     /** Transaction the call reads or writes through, or null. */
@@ -48,6 +50,13 @@ struct view_t {
     /** Where the call keeps whatever it needs only while it runs, so its arena holds only its outputs: the scratch of
      *  the executor thread running it, or one made for this call alone, rewound only before the call starts. */
     ustore_arena_t scratch = nullptr;
+
+    /** The executor whose thread runs the call, compared by address alone, or null for a call run alone. */
+    call_executor_t const* executor = nullptr;
+
+    /** Which thread of @c executor runs the call: a pool thread's index, or the pool's size for a blocking call and a
+     *  batch the driver runs itself, so no other call of that executor runs on the same index meanwhile. */
+    std::size_t thread_index = 0;
 };
 
 /**
@@ -210,6 +219,10 @@ struct nvme_placement_t {
 
     /** Threads the executor runs, each keeping an I/O channel of its own, or zero for the engine's default. */
     std::size_t threads = 0;
+
+    /** The executor whose threads, its blocking caller's included, keep a channel and an epoch slot of their own in
+     *  the databases it opens, or null for an executor of no NVMe placement. */
+    call_executor_t const* executor = nullptr;
 
     /** CUDA ordinals compactions run on, viewing the VRAM executor the NVMe executor borrows, or empty. */
     std::span<std::int32_t const> devices {};

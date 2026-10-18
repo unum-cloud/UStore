@@ -2,12 +2,12 @@
  *  @file test/nvme/collection.cpp
  *  @author Ash Vardanian
  *  @date September 19, 2026
- *  @brief The collection over the ring: what the write buffer answers, what the tree answers, and how deep it reads.
+ *  @brief The collection over the ring: what the memory runs answer, what the tree answers, and how deep it reads.
  *
  *  The results this file exists for are @c holds_its_depth and @c snapshot_holds_its_moment. A batched
  *  select must sit at the queue pair's depth through the middle of a run rather than at the size of whatever
- *  batch a caller handed it, and a snapshot must keep answering the level set it was taken from while
- *  another thread publishes over it.
+ *  batch a caller handed it, and a pinned stamp must keep answering the versions it pinned while another
+ *  thread commits and flushes over them.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
@@ -15,12 +15,13 @@
 #include <cstdint> // `std::uint64_t`
 #include <cstring> // `std::memcmp`
 
-#include <array>   // `std::array`
-#include <memory>  // `std::unique_ptr`
-#include <new>     // `std::nothrow`
-#include <span>    // `std::span`
-#include <thread>  // `std::thread`
-#include <utility> // `std::move`
+#include <array>    // `std::array`
+#include <memory>   // `std::unique_ptr`
+#include <new>      // `std::nothrow`
+#include <optional> // `std::optional`
+#include <span>     // `std::span`
+#include <thread>   // `std::thread`
+#include <utility>  // `std::move`
 
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
@@ -128,7 +129,7 @@ expected<std::unique_ptr<typename collection_types<typename mount_type_::fixture
 
 #pragma region Model
 
-/** Writes every entry of @p wanted through the write buffer of @p store, one call per key. */
+/** Writes every entry of @p wanted into @p store, one commit per key. */
 template <typename collection_type_>
 [[nodiscard]] std::size_t write_model(collection_type_& store, io_channel_t& channel,
                                       std::span<expectation_t const> wanted) {
@@ -137,14 +138,12 @@ template <typename collection_type_>
     for (std::size_t index = 0; index != wanted.size(); ++index) {
         expectation_t const& entry = wanted[index];
         if (entry.state == select_result_t::erased_k) {
-            failures += expect(store.erase(channel, entry.stored_key, store.newest_stamp() + 1).succeeded());
+            failures += expect(store.erase(channel, entry.stored_key).succeeded());
             continue;
         }
         failures += expect(value.resize(static_cast<std::size_t>(entry.bytes)) == st::status_t::success_k);
         paint_into(entry, std::span<byte_t> {value});
-        failures += expect(
-            store.insert(channel, entry.stored_key, std::span<byte_t const> {value}, store.newest_stamp() + 1)
-                .succeeded());
+        failures += expect(store.insert(channel, entry.stored_key, std::span<byte_t const> {value}).succeeded());
     }
     return failures;
 }
@@ -188,7 +187,7 @@ template <typename readable_type_>
 
 /** Reads every key of @p wanted one at a time, which is the path that fills the value cache. */
 template <typename readable_type_>
-[[nodiscard]] std::size_t check_model_one_by_one(readable_type_ const& source, io_channel_t& channel,
+[[nodiscard]] std::size_t check_model_one_by_one(readable_type_& source, io_channel_t& channel,
                                                  std::span<expectation_t const> wanted) {
     std::size_t failures = 0;
     st::basic_vector<byte_t> into;
@@ -214,7 +213,7 @@ template <typename readable_type_>
 
 #pragma region Round Trip Cases
 
-/** Values of many widths survive the write buffer, the flush and the read back, byte for byte. */
+/** Values of many widths survive the memory runs, the flush and the read back, byte for byte. */
 template <typename mount_type_>
 std::size_t mixed_widths_round_trip(mount_type_ const& mount) {
     using types_t = collection_types<typename mount_type_::fixture_t>;
@@ -246,7 +245,7 @@ std::size_t mixed_widths_round_trip(mount_type_ const& mount) {
 
     failures += write_model(*store, (*stack)->channel(), std::span<expectation_t const> {model});
 
-    // Everything is still staged, so the write buffer is what answers.
+    // Nothing is flushed yet, so the memory runs are what answers.
     failures += expect_eq(store->staged_count(), count_k);
     failures += check_model(*store, (*stack)->channel(), std::span<expectation_t const> {model});
 
@@ -301,7 +300,7 @@ template <typename key_slot_type_, typename mount_type_>
     return failures;
 }
 
-/** Every value layout the collection serves round trips through the write buffer and the tree. */
+/** Every value layout the collection serves round trips through the memory runs and the tree. */
 template <typename mount_type_>
 std::size_t every_layout_round_trips(mount_type_ const& mount) {
     std::size_t failures = 0;
@@ -342,17 +341,17 @@ std::size_t misses_and_tombstones(mount_type_ const& mount) {
     for (std::size_t index = 0; index != value.size(); ++index) value[index] = painted(5, index);
 
     failures += expect(
-        store->insert((*stack)->channel(), stored_key_t {10}, std::span<byte_t const> {value}, 1).succeeded());
+        store->insert((*stack)->channel(), stored_key_t {10}, std::span<byte_t const> {value}).succeeded());
     failures += expect(
-        store->insert((*stack)->channel(), stored_key_t {20}, std::span<byte_t const> {value}, 2).succeeded());
+        store->insert((*stack)->channel(), stored_key_t {20}, std::span<byte_t const> {value}).succeeded());
     failures += expect(store->flush((*stack)->channel()).succeeded());
-    failures += expect(store->erase((*stack)->channel(), stored_key_t {20}, 3).succeeded());
+    failures += expect(store->erase((*stack)->channel(), stored_key_t {20}).succeeded());
 
     stored_value_size_t size = 0;
     failures += expect(store->find(stored_key_t {10}, size) == select_result_t::success_k);
     failures += expect_eq(static_cast<std::size_t>(size), value.size());
 
-    // The tombstone is staged, so the write buffer answers before the run that still carries the value.
+    // The removal sits in a memory run, which answers before the run that still carries the value.
     failures += expect(store->find(stored_key_t {20}, size) == select_result_t::erased_k);
     failures += expect(store->find(stored_key_t {30}, size) == select_result_t::nothing_k);
 
@@ -384,7 +383,7 @@ std::size_t misses_and_tombstones(mount_type_ const& mount) {
     return failures;
 }
 
-/** The write buffer answers a value the tree has never seen, and the tree answers it after a flush. */
+/** A memory run answers a value the tree has never seen, and the tree answers it after a flush. */
 template <typename mount_type_>
 std::size_t write_buffer_answers_before_the_tree(mount_type_ const& mount) {
     using types_t = collection_types<typename mount_type_::fixture_t>;
@@ -409,9 +408,9 @@ std::size_t write_buffer_answers_before_the_tree(mount_type_ const& mount) {
     for (std::size_t index = 0; index != newer.size(); ++index) newer[index] = painted(2, index);
 
     failures += expect(
-        store->insert((*stack)->channel(), stored_key_t {77}, std::span<byte_t const> {older}, 1).succeeded());
+        store->insert((*stack)->channel(), stored_key_t {77}, std::span<byte_t const> {older}).succeeded());
     failures += expect(store->flush((*stack)->channel()).succeeded());
-    failures += expect_eq(store->tree().snapshot().population_count(), std::uint64_t {1});
+    failures += expect_eq(store->tree().levels().population_count(), std::uint64_t {1});
 
     // Reading the run once is what puts the older value in the cache a later flush has to drop.
     st::basic_vector<byte_t> cached;
@@ -422,9 +421,9 @@ std::size_t write_buffer_answers_before_the_tree(mount_type_ const& mount) {
     failures += expect_eq(static_cast<std::size_t>(cached_size), older.size());
     failures += expect_eq(std::memcmp(cached.data(), older.data(), older.size()), 0);
 
-    // Staged over the run, the write buffer must be the one that answers.
+    // Committed over the run, the memory run must be the one that answers.
     failures += expect(
-        store->insert((*stack)->channel(), stored_key_t {77}, std::span<byte_t const> {newer}, 2).succeeded());
+        store->insert((*stack)->channel(), stored_key_t {77}, std::span<byte_t const> {newer}).succeeded());
     st::basic_vector<byte_t> into;
     failures += expect(into.resize(newer.size()) == st::status_t::success_k);
     stored_value_size_t size = 0;
@@ -478,7 +477,7 @@ std::size_t full_write_buffer_flushes_itself(mount_type_ const& mount) {
 
     failures += write_model(*store, (*stack)->channel(), std::span<expectation_t const> {model});
     failures += expect(store->staged_count() <= config.write_buffer_max_elements);
-    failures += expect(store->tree().snapshot().level(0).size() > std::size_t {1});
+    failures += expect(store->tree().levels().level(0).size() > std::size_t {1});
     failures += check_model(*store, (*stack)->channel(), std::span<expectation_t const> {model});
 
     // A batch larger than the whole write buffer lands whole, past the bounds, and the next write flushes it.
@@ -495,16 +494,13 @@ std::size_t full_write_buffer_flushes_itself(mount_type_ const& mount) {
     sizes[1] = static_cast<stored_value_size_t>(wide.size() / 2);
     failures += expect(store
                            ->insert((*stack)->channel(), std::span<stored_key_t const> {keys},
-                                    std::span<byte_t const> {wide}, std::span<stored_value_size_t const> {sizes},
-                                    store->newest_stamp() + 1)
+                                    std::span<byte_t const> {wide}, std::span<stored_value_size_t const> {sizes})
                            .succeeded());
     failures += expect_eq(store->staged_count(), std::size_t {2});
     st::basic_vector<byte_t> one;
     failures += expect(one.resize(8) == st::status_t::success_k);
-    failures += expect(store
-                           ->insert((*stack)->channel(), stored_key_t {900003}, std::span<byte_t const> {one},
-                                    store->newest_stamp() + 1)
-                           .succeeded());
+    failures += expect(
+        store->insert((*stack)->channel(), stored_key_t {900003}, std::span<byte_t const> {one}).succeeded());
     failures += expect_eq(store->staged_count(), std::size_t {1});
     stored_value_size_t size = 0;
     failures += expect(store->find(stored_key_t {900002}, size) == select_result_t::success_k);
@@ -538,7 +534,7 @@ std::size_t unaligned_exact_span_is_taken(mount_type_ const& mount) {
     failures += expect(value.resize(bytes_k) == st::status_t::success_k);
     for (std::size_t index = 0; index != bytes_k; ++index) value[index] = painted(9, index);
     failures += expect(
-        store->insert((*stack)->channel(), stored_key_t {3}, std::span<byte_t const> {value}, 1).succeeded());
+        store->insert((*stack)->channel(), stored_key_t {3}, std::span<byte_t const> {value}).succeeded());
     failures += expect(store->flush((*stack)->channel()).succeeded());
 
     // One byte of slack in front makes the span odd, and it is exactly as long as the value.
@@ -582,20 +578,19 @@ std::size_t widest_and_empty_values(mount_type_ const& mount) {
     failures += expect(widest.resize(value_max_size_k) == st::status_t::success_k);
     for (std::size_t index = 0; index != widest.size(); ++index) widest[index] = painted(4, index);
     failures += expect(
-        store->insert((*stack)->channel(), stored_key_t {1}, std::span<byte_t const> {widest}, 1).succeeded());
-    failures += expect(store->insert((*stack)->channel(), stored_key_t {2}, std::span<byte_t const> {}, 2).succeeded());
+        store->insert((*stack)->channel(), stored_key_t {1}, std::span<byte_t const> {widest}).succeeded());
+    failures += expect(store->insert((*stack)->channel(), stored_key_t {2}, std::span<byte_t const> {}).succeeded());
 
-    // Seven bytes ahead of it leave the next staged value on no page boundary, which is what makes an
+    // Seven bytes ahead of it leave the next flushed value on no page boundary, which is what makes an
     // empty value located by an offset rather than by its sentinel cost a read.
     failures += expect(
-        store->insert((*stack)->channel(), stored_key_t {6}, std::span<byte_t const> {widest.data(), 7}, 3)
-            .succeeded());
-    failures += expect(store->insert((*stack)->channel(), stored_key_t {5}, std::span<byte_t const> {}, 4).succeeded());
+        store->insert((*stack)->channel(), stored_key_t {6}, std::span<byte_t const> {widest.data(), 7}).succeeded());
+    failures += expect(store->insert((*stack)->channel(), stored_key_t {5}, std::span<byte_t const> {}).succeeded());
 
-    // One byte past the widest value is refused, whatever the write buffer still has room for.
+    // One byte past the widest value is refused, whatever the memory runs still have room for.
     st::basic_vector<byte_t> wider;
     failures += expect(wider.resize(value_max_size_k + 1) == st::status_t::success_k);
-    failures += expect(store->insert((*stack)->channel(), stored_key_t {4}, std::span<byte_t const> {wider}, 5) ==
+    failures += expect(store->insert((*stack)->channel(), stored_key_t {4}, std::span<byte_t const> {wider}) ==
                        status_code_t::malformed_k);
 
     st::basic_vector<byte_t> into;
@@ -638,53 +633,61 @@ std::size_t widest_and_empty_values(mount_type_ const& mount) {
     return failures;
 }
 
-/** The value cache holds what it was given and evicts the oldest, rather than quietly holding nothing. */
+/** The value cache answers a version only with that version's bytes, never holds more than it was made with however
+ *  many versions displace one another, and gives everything back when it dies. */
 std::size_t value_cache_holds_what_it_took() {
     std::size_t failures = 0;
-    using cache_t = value_cache<stored_key_t, value_layout_t::variable_width_k>;
+    using cache_t = value_cache<stored_key_t>;
     constexpr stored_value_size_t width_k = 300;
+    constexpr std::size_t cache_bytes_k = 1024ull * 1024ull;
     resource_constraint_t budget {std::size_t {8} * 1024 * 1024};
 
-    // A budget that affords entries must hold entries, and the eviction ring only takes a power of two.
-    cache_t cache = cache_t::of(1024ull * 1024ull, width_k, budget);
-    failures += expect(cache.capacity() != 0);
-    failures += expect((cache.capacity() & (cache.capacity() - 1)) == 0);
-    if (cache.capacity() == 0) return failures;
+    // A budget that affords entries must hold entries, and a slot is found by masking, so a power of two of them.
+    std::optional<cache_t> cache {cache_t::of(cache_bytes_k, width_k, budget)};
+    failures += expect(cache->capacity() != 0);
+    failures += expect((cache->capacity() & (cache->capacity() - 1)) == 0);
+    if (cache->capacity() == 0) return failures;
+    std::size_t const slots_bytes = budget.used();
 
     st::basic_vector<byte_t> value;
+    st::basic_vector<byte_t> copied;
     failures += expect(value.resize(width_k) == st::status_t::success_k);
-    std::size_t const held = cache.capacity();
-    for (std::size_t index = 0; index != held + 1; ++index) {
-        for (std::size_t position = 0; position != width_k; ++position) value[position] = painted(index, position);
-        cache.add(static_cast<stored_key_t>(index), std::span<byte_t const> {value});
-    }
-    failures += expect_eq(cache.size(), held);
-
-    std::size_t mismatches = 0;
-    auto check = [&](std::size_t index) noexcept {
-        return cache.visit(static_cast<stored_key_t>(index), [&](std::span<byte_t const> bytes) noexcept {
-            if (bytes.size() != width_k) ++mismatches;
-            for (std::size_t position = 0; position != bytes.size(); ++position)
-                if (bytes[position] != painted(index, position)) ++mismatches;
-        });
+    failures += expect(copied.resize(width_k) == st::status_t::success_k);
+    auto fill = [&](std::size_t index, transaction_stamp_t stamp) noexcept {
+        for (std::size_t position = 0; position != width_k; ++position)
+            value[position] = painted(index + stamp, position);
+        cache->add(static_cast<stored_key_t>(index), stamp, std::span<byte_t const> {value});
     };
-    failures += expect(!check(0));
-    for (std::size_t index = 1; index != held + 1; ++index) failures += expect(check(index));
+    std::size_t mismatches = 0;
+    auto check = [&](std::size_t index, transaction_stamp_t stamp) noexcept {
+        stored_value_size_t size = 0;
+        if (!cache->copy(static_cast<stored_key_t>(index), stamp, std::span<byte_t> {copied}, size)) return false;
+        if (size != width_k) ++mismatches;
+        for (std::size_t position = 0; position != size; ++position)
+            if (copied[position] != painted(index + stamp, position)) ++mismatches;
+        return true;
+    };
+
+    // Two versions of one key are two entries, and a stamp no version carries finds nothing.
+    fill(7, 3);
+    fill(7, 5);
+    failures += expect(check(7, 5));
+    failures += expect(!check(7, 4));
+
+    // Four times as many versions as slots overwrite one another in place, within the bytes the cache was made with,
+    // and whatever is still found is its own version.
+    std::size_t const held = cache->capacity();
+    std::size_t found = 0;
+    for (std::size_t index = 0; index != 4 * held; ++index) fill(index, 1);
+    for (std::size_t index = 0; index != 4 * held; ++index) found += check(index, 1) ? 1 : 0;
+    failures += expect(found != 0);
     failures += expect_eq(mismatches, std::size_t {0});
+    failures += expect(budget.used() <= cache_bytes_k);
 
-    // Writing a key the cache already holds replaces its bytes instead of taking another slot.
-    for (std::size_t position = 0; position != width_k; ++position) value[position] = painted(9999, position);
-    cache.add(static_cast<stored_key_t>(held), std::span<byte_t const> {value});
-    failures += expect_eq(cache.size(), held);
-    std::size_t replaced = 0;
-    failures += expect(cache.visit(static_cast<stored_key_t>(held), [&](std::span<byte_t const> bytes) noexcept {
-        for (std::size_t position = 0; position != bytes.size(); ++position)
-            if (bytes[position] == painted(9999, position)) ++replaced;
-    }));
-    failures += expect_eq(replaced, std::size_t {width_k});
-
-    cache.clear();
-    failures += expect_eq(cache.size(), std::size_t {0});
+    // With the cache gone, the budget holds nothing.
+    cache.reset();
+    failures += expect(slots_bytes != 0);
+    failures += expect_eq(budget.used(), std::size_t {0});
 
     // A budget too small for one entry, and a layout of no width, both hold nothing on purpose.
     failures += expect_eq(cache_t::of(0, width_k, budget).capacity(), std::size_t {0});
@@ -739,7 +742,7 @@ std::size_t batched_select_holds_its_depth(mount_type_ const& mount) {
         failures += expect(store->flush((*stack)->channel()).succeeded());
         if (failures != 0) return failures;
     }
-    failures += expect_eq(store->tree().snapshot().level(0).size(), flushes_k);
+    failures += expect_eq(store->tree().levels().level(0).size(), flushes_k);
 
     st::basic_vector<stored_key_t> keys;
     st::basic_vector<select_result_t> results;
@@ -774,10 +777,10 @@ std::size_t batched_select_holds_its_depth(mount_type_ const& mount) {
 #pragma region Snapshot Cases
 
 /**
- *  @brief A snapshot keeps answering the level set it was taken from while another thread publishes over it.
+ *  @brief A pinned stamp keeps answering the version it pinned while another thread commits and flushes over it.
  *
- *  The writer blocks in its own publication until the snapshot is let go, which is what makes the read
- *  in the middle meaningful: the level set the snapshot holds cannot have been retired under it.
+ *  The writer neither waits for the pin nor drops the older version, since the flush keeps the version a pinned
+ *  reader reads, so the read in the middle sees the older bytes whether it lands before the flush or after.
  */
 template <typename mount_type_>
 std::size_t snapshot_holds_its_moment(mount_type_ const& mount) {
@@ -805,10 +808,9 @@ std::size_t snapshot_holds_its_moment(mount_type_ const& mount) {
     for (std::size_t index = 0; index != bytes_k; ++index) newer[index] = painted(12, index);
 
     failures += expect(
-        store->insert((*stack)->channel(), stored_key_t {42}, std::span<byte_t const> {older}, 1).succeeded());
-    expected<typename variable_collection_t::snapshot_t> taken = store->take_snapshot((*stack)->channel());
-    failures += expect(taken.has_value());
-    if (!taken) return failures;
+        store->insert((*stack)->channel(), stored_key_t {42}, std::span<byte_t const> {older}).succeeded());
+    stamp_pin_t pin;
+    transaction_stamp_t const pinned = (*stack)->ledger.pin_reader(pin);
 
     std::size_t writer_failures = 0;
     std::thread writer {[&]() noexcept {
@@ -816,24 +818,22 @@ std::size_t snapshot_holds_its_moment(mount_type_ const& mount) {
         writer_failures += expect(guard.has_value());
         if (!guard) return;
         writer_failures += expect(
-            store->insert(guard->channel(), stored_key_t {42}, std::span<byte_t const> {newer}, 2).succeeded());
+            store->insert(guard->channel(), stored_key_t {42}, std::span<byte_t const> {newer}).succeeded());
         writer_failures += expect(store->flush(guard->channel()).succeeded());
     }};
 
-    {
+    for (std::size_t round = 0; round != 2; ++round) {
         st::basic_vector<byte_t> into;
         failures += expect(into.resize(bytes_k) == st::status_t::success_k);
         stored_value_size_t size = 0;
         failures += expect(
-            taken->select((*stack)->channel(), stored_key_t {42}, std::span<byte_t> {into}, size).succeeded());
+            store->select((*stack)->channel(), stored_key_t {42}, std::span<byte_t> {into}, size, pinned).succeeded());
         failures += expect_eq(static_cast<std::size_t>(size), bytes_k);
         failures += expect_eq(std::memcmp(into.data(), older.data(), bytes_k), 0);
-        failures += expect_eq(taken->population_count(), std::uint64_t {1});
+        // The second read follows the flush, which kept the pinned version in the run it wrote.
+        if (round == 0) writer.join();
     }
-
-    // Letting the hold go is what lets the writer's publication retire the set it replaced.
-    taken = expected<typename variable_collection_t::snapshot_t> {status_t {status_code_t::uninitialized_k, "Let go"}};
-    writer.join();
+    pin.release();
     failures += writer_failures;
 
     st::basic_vector<byte_t> into;
@@ -850,7 +850,7 @@ std::size_t snapshot_holds_its_moment(mount_type_ const& mount) {
 
 #pragma region Scan Cases
 
-/** A scan visits every key once, in ascending order, across the write buffer and two levels. */
+/** A scan visits every key once, in ascending order, across the memory runs and two levels. */
 template <typename mount_type_>
 std::size_t scan_visits_every_key_in_order(mount_type_ const& mount) {
     using types_t = collection_types<typename mount_type_::fixture_t>;
@@ -905,7 +905,7 @@ std::size_t scan_visits_every_key_in_order(mount_type_ const& mount) {
     failures += expect(merged.has_value());
     if (!merged) return failures;
     failures += expect(*merged == compaction_outcome_t::published_k);
-    failures += expect_eq(store->tree().snapshot().size(), std::size_t {2});
+    failures += expect_eq(store->tree().levels().size(), std::size_t {2});
 
     // Two more flushes put runs back on level zero, and they carry the same keys, so the scan has to
     // pick the younger of two runs of one level as well as the shallower of two levels.
@@ -923,9 +923,9 @@ std::size_t scan_visits_every_key_in_order(mount_type_ const& mount) {
         failures += expect(store->flush((*stack)->channel()).succeeded());
         apply(std::span<expectation_t const> {batch});
     }
-    failures += expect_eq(store->tree().snapshot().level(0).size(), std::size_t {2});
+    failures += expect_eq(store->tree().levels().level(0).size(), std::size_t {2});
 
-    // What stays staged is what the scan must merge in front of every run.
+    // What stays in memory runs is what the scan must merge in front of every run.
     {
         st::basic_vector<expectation_t> batch;
         for (std::size_t index = 0; index < keys_k; index += 25) {

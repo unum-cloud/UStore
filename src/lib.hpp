@@ -448,11 +448,11 @@ status_t pull(engine_t const& engine, ustore_strings_cursor_next_t const& argume
 
 #pragma endregion Cursors
 
-/** Serves @p arguments on the engine of their database in @p scratch through @p slot_, refusing what no engine may
- *  see, and handing every ragged input to the engine readable in any layout. A pull serves through its cursor, whose
- *  walk @p slot_ lists. */
+/** Serves @p arguments on the engine of their database through @p slot_, in the scratch and on the executor thread
+ *  @p runner names, refusing what no engine may see, and handing every ragged input to the engine readable in any
+ *  layout. A pull serves through its cursor, whose walk @p slot_ lists. */
 template <auto slot_, typename arguments_type_>
-status_t serve(arguments_type_ const& arguments, ustore_arena_t scratch) noexcept {
+status_t serve(arguments_type_ const& arguments, view_t const& runner) noexcept {
     ustore_database_t const database = database_of(arguments);
     if (!database) return {status_code_t::uninitialized_k, "The database is uninitialized"};
     engine_t const& engine = engine_of(database);
@@ -464,7 +464,8 @@ status_t serve(arguments_type_ const& arguments, ustore_arena_t scratch) noexcep
         if (arguments.cursor->database != database)
             return {status_code_t::invalid_argument_k, "The cursor walks another database"};
 
-    view_t view {.scratch = scratch};
+    view_t view = runner;
+    ustore_arena_t const scratch = runner.scratch;
     if (!decode_call(arguments, view))
         return {status_code_t::invalid_argument_k, "The view was made by neither view constructor"};
     void* const handle = view.transaction ? static_cast<void*>(view.transaction) : view.snapshot;
@@ -560,8 +561,9 @@ struct deferred_slot_t {
     /** A copy of the caller's argument struct, whose pointees stay borrowed until the call is final. */
     deferred_arguments_t arguments;
 
-    /** Serves @c arguments in a scratch into a result for the driver to publish, as `run_deferred` does. */
-    void (*run)(void* arguments, deferred_result_t& result, ustore_arena_t scratch) noexcept = nullptr;
+    /** Serves @c arguments in a runner's scratch and on its thread into a result for the driver to publish, as
+     *  `run_deferred` does. */
+    void (*run)(void* arguments, deferred_result_t& result, view_t const& runner) noexcept = nullptr;
 
     /** The call's place among every call on the executor, blocking ones included. */
     std::uint32_t ticket = 0;
@@ -827,12 +829,14 @@ inline bool runs_here(call_executor_t& executor) noexcept {
     return false;
 }
 
-/** Runs @p body on the calling thread over the scratch of @p runner, recorded there while it does. */
+/** Runs @p body on the calling thread as runner @p thread_index of @p executor, over its scratch, recorded there while
+ *  it does. */
 template <typename body_type_>
-void run_as(runner_t& runner, body_type_&& body) noexcept {
+void run_as(call_executor_t& executor, std::size_t thread_index, body_type_&& body) noexcept {
+    runner_t& runner = executor.runners[thread_index];
     std::atomic_ref<std::thread::id> const recorded {runner.thread};
     recorded.store(std::this_thread::get_id(), std::memory_order_relaxed);
-    body(&runner.scratch);
+    body(view_t {.scratch = &runner.scratch, .executor = &executor, .thread_index = thread_index});
     recorded.store(std::thread::id {}, std::memory_order_relaxed);
 }
 
@@ -841,11 +845,12 @@ inline pool_view_t view_of(std::variant<executor_t, lent_pool_t> const& pool) no
     return std::visit([](auto const& alternative) noexcept { return alternative.view(); }, pool);
 }
 
-/** Serves @p arguments on the engine of @p slot_ in @p scratch and releases their claims, leaving the outputs of a
- *  failed call null or zero, and answers the status their outcome is to finish with. */
+/** Serves @p arguments on the engine of @p slot_ in the scratch and on the thread @p runner names and releases their
+ *  claims, leaving the outputs of a failed call null or zero, and answers the status their outcome is to finish
+ *  with. */
 template <typename arguments_type_, auto slot_>
-status_t serve_and_release(arguments_type_& arguments, ustore_arena_t scratch) noexcept {
-    status_t const status = serve<slot_>(arguments, scratch);
+status_t serve_and_release(arguments_type_& arguments, view_t const& runner) noexcept {
+    status_t const status = serve<slot_>(arguments, runner);
     if constexpr (requires { clear_outputs(arguments); })
         if (status.failed()) clear_outputs(arguments);
     release_claims(arguments);
@@ -854,41 +859,41 @@ status_t serve_and_release(arguments_type_& arguments, ustore_arena_t scratch) n
 
 /** Opens the database @p call names through its engine's open, which claims nothing. */
 template <typename arguments_type_>
-status_t serve_open(routed_init<arguments_type_>& call, ustore_arena_t scratch) noexcept {
-    return call.open(call, view_t {.scratch = scratch});
+status_t serve_open(routed_init<arguments_type_>& call, view_t const& runner) noexcept {
+    return call.open(call, runner);
 }
 
-/** Serves @p call with @p serve_ in @p scratch, then finishes its outcome. */
-template <typename call_type_, status_t (*serve_)(call_type_&, ustore_arena_t) noexcept>
-void run(call_type_* call, ustore_arena_t scratch) noexcept {
-    finish(*call->outcome, serve_(*call, scratch));
+/** Serves @p call with @p serve_ in the scratch and on the thread @p runner names, then finishes its outcome. */
+template <typename call_type_, status_t (*serve_)(call_type_&, view_t const&) noexcept>
+void run(call_type_* call, view_t const& runner) noexcept {
+    finish(*call->outcome, serve_(*call, runner));
 }
 
 /** Runs @p call on the calling thread over a scratch made for it alone, as a call without an executor keeping scratch
  *  needs: its first page lies on the stack, so a small call allocates nothing, and the blocks it grows into are freed
  *  once the call is final. */
-template <typename call_type_, status_t (*serve_)(call_type_&, ustore_arena_t) noexcept>
+template <typename call_type_, status_t (*serve_)(call_type_&, view_t const&) noexcept>
 void run_alone(call_type_* call) noexcept {
     alignas(arena_alignment_k) byte_t page[arena_page_bytes_k];
     arena_block_t* const first = new (page) arena_block_t {nullptr, sizeof(page), sizeof(arena_block_t)};
     ustore_arena_handle_t scratch {.newest = first};
-    run<call_type_, serve_>(call, &scratch);
+    run<call_type_, serve_>(call, view_t {.scratch = &scratch});
     arena_free_blocks(scratch, first);
 }
 
-/** Serves the copy @p erased holds in @p scratch into @p result, leaving its outcome and its deferred counts to the
- *  driver, which frees the copy's table position first. */
-template <typename call_type_, status_t (*serve_)(call_type_&, ustore_arena_t) noexcept>
-void run_deferred(void* erased, deferred_result_t& result, ustore_arena_t scratch) noexcept {
+/** Serves the copy @p erased holds on the thread @p runner names into @p result, leaving its outcome and its deferred
+ *  counts to the driver, which frees the copy's table position first. */
+template <typename call_type_, status_t (*serve_)(call_type_&, view_t const&) noexcept>
+void run_deferred(void* erased, deferred_result_t& result, view_t const& runner) noexcept {
     call_type_& call = *std::get_if<call_type_>(static_cast<deferred_arguments_t*>(erased));
     // Counted before the call runs, as a transaction init rewrites the handle its arguments point to
     result.deferred_counts = deferred_counts_of(call);
     result.outcome = call.outcome;
-    result.status = serve_(call, scratch);
+    result.status = serve_(call, runner);
 }
 
 /** Runs @p call on the calling thread after every call submitted before it finishes, and before any after. */
-template <typename call_type_, status_t (*serve_)(call_type_&, ustore_arena_t) noexcept>
+template <typename call_type_, status_t (*serve_)(call_type_&, view_t const&) noexcept>
 void run_blocking(call_executor_t& executor, call_type_* call) noexcept {
     if (runs_here(executor))
         return refuse(*call, {status_code_t::contended_k, "A callback cannot block on the executor running it"});
@@ -898,13 +903,13 @@ void run_blocking(call_executor_t& executor, call_type_* call) noexcept {
                                             std::memory_order_relaxed)) {}
     std::uint32_t const ticket = tickets_of(observed);
     wait_finished(executor, ticket);
-    run_as(executor.runners.back(),
-           [call](ustore_arena_t scratch) noexcept { run<call_type_, serve_>(call, scratch); });
+    run_as(executor, executor.runners.size() - 1,
+           [call](view_t const& runner) noexcept { run<call_type_, serve_>(call, runner); });
     advance_finished(executor, ticket + 1);
 }
 
 /** Copies @p call into the deferred table of @p executor, finishing it contended when the table is full. */
-template <typename call_type_, status_t (*serve_)(call_type_&, ustore_arena_t) noexcept>
+template <typename call_type_, status_t (*serve_)(call_type_&, view_t const&) noexcept>
 void submit(call_executor_t& executor, call_type_* call) noexcept {
     if (std::atomic_ref<driver_state_t> {executor.state}.load(std::memory_order_relaxed) == driver_state_t::absent_k)
         return run_alone<call_type_, serve_>(call);
@@ -935,7 +940,7 @@ void submit(call_executor_t& executor, call_type_* call) noexcept {
 }
 
 /** Runs @p call on the calling thread, blocking on its executor, or submits it, as its executor and completion ask. */
-template <typename call_type_, status_t (*serve_)(call_type_&, ustore_arena_t) noexcept>
+template <typename call_type_, status_t (*serve_)(call_type_&, view_t const&) noexcept>
 void dispatch(call_type_* call) noexcept {
     call_executor_t* const executor = call->executor;
     if (!executor) return run_alone<call_type_, serve_>(call);

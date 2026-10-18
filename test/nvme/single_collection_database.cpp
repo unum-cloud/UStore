@@ -395,8 +395,8 @@ template <typename key_slot_type_, typename mount_type_>
         }
         failures += check_model(**store, (*stack)->channel(), std::span<expectation_t const> {model});
 
-        depth = (*store)->records().tree().snapshot().size();
-        shallowest_runs = (*store)->records().tree().snapshot().level(0).size();
+        depth = (*store)->records().tree().levels().size();
+        shallowest_runs = (*store)->records().tree().levels().level(0).size();
         population = (*store)->population_count();
         failures += expect(depth > std::size_t {1});
         failures += expect(shallowest_runs > std::size_t {1});
@@ -406,8 +406,8 @@ template <typename key_slot_type_, typename mount_type_>
     expected<typename database_t::database_unique_ptr_t> store = open_over<database_t>(**stack, config);
     failures += expect(store.has_value());
     if (!store) return failures;
-    failures += expect_eq((*store)->records().tree().snapshot().size(), depth);
-    failures += expect_eq((*store)->records().tree().snapshot().level(0).size(), shallowest_runs);
+    failures += expect_eq((*store)->records().tree().levels().size(), depth);
+    failures += expect_eq((*store)->records().tree().levels().level(0).size(), shallowest_runs);
     failures += expect_eq((*store)->population_count(), population);
     failures += check_model(**store, (*stack)->channel(), std::span<expectation_t const> {model});
     return failures;
@@ -946,12 +946,10 @@ std::size_t transactions_serialize_under_threads(mount_type_ const& mount) {
 #pragma region Snapshot Cases
 
 /**
- *  @brief A snapshot answers the moment it was taken at while another thread publishes over it.
+ *  @brief A snapshot answers the moment it was taken at while another thread commits and flushes over it.
  *
- *  The writer blocks inside its own publication until the snapshot is let go, which is what makes the
- *  reads in the middle meaningful: the level set the snapshot holds cannot have been retired under it.
- *  Nothing on this thread may touch the database until the writer is joined, since the writer holds the
- *  write path for the whole of the flush it is blocked in.
+ *  The writer waits for no snapshot: the reads in the middle run beside its commits and its flush, and see the
+ *  older bytes because the snapshot pins their stamp, which the flush keeps a version for.
  */
 template <typename mount_type_>
 std::size_t snapshot_sees_its_moment(mount_type_ const& mount) {
@@ -981,12 +979,12 @@ std::size_t snapshot_sees_its_moment(mount_type_ const& mount) {
     for (stored_key_t key = 0; key != 8; ++key)
         failures += expect((*store)->insert(key, std::span<byte_t const> {older}).succeeded());
 
-    // A snapshot flushes first, so what was staged is inside it and nothing is left behind.
+    // A snapshot flushes nothing: what the memory runs hold is inside it already.
     expected<typename variable_database_t::snapshot_t> taken = (*store)->take_snapshot();
     failures += expect(taken.has_value());
     if (!taken) return failures;
-    failures += expect_eq(taken->population_count(), std::uint64_t {8});
-    failures += expect_eq((*store)->staged_count(), std::size_t {0});
+    failures += expect_eq((*store)->population_count(), std::uint64_t {8});
+    failures += expect_eq((*store)->staged_count(), std::size_t {8});
 
     std::size_t writer_failures = 0;
     std::thread writer {[&]() noexcept {
@@ -1012,7 +1010,6 @@ std::size_t snapshot_sees_its_moment(mount_type_ const& mount) {
     stored_value_size_t missing = 0;
     failures += expect(taken->find(stored_key_t {100}, missing) == select_result_t::nothing_k);
 
-    // Letting the hold go is what lets the writer's publication retire the set it replaced.
     taken = expected<typename variable_database_t::snapshot_t> {status_t {status_code_t::uninitialized_k, "Let go"}};
     writer.join();
     failures += writer_failures;

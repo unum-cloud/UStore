@@ -168,6 +168,14 @@ A volume without a filesystem under it keeps its catalog in two slots of the vol
 The extent allocator rebuilds the free map from the catalog at mount, which is what makes an extent missing from the catalog free after a crash.
 The volume router places a blob on the volume with the most free space that still fits.
 
+On a raw block device or an SPDK namespace, UStore shares one layout with USearch, so either project's tools can map a drive and tell owners from free space:
+
+- __Slots.__ The device is cut into 1 GiB slots, 2³⁰ bytes counted from byte 0. A volume starts on a slot boundary and its `capacity_bytes` covers whole slots. A database's volumes may occupy separate slot ranges, as the router already spreads one database over several volumes.
+- __No label.__ Slot 0 holds whatever file starts there, and the drive carries no table of contents.
+- __Self-describing starts.__ The first block of a volume's first slot is its `volume_header_t`: the `USTOREV1` magic, `capacity_bytes`, the owning database's UUID and a CRC-32C over the header.
+- __Live or free.__ A mapper reads the first 4 KiB of each slot in order. A slot is live only when a known magic and its check both verify, and then the mapper skips the slots the length covers; any other slot is free. USearch recognizes this header as it is laid out in `nvme_volume.hpp` today, so a change to it is a change to the shared convention.
+- __Deletion.__ Destroying a volume zeroes the first block of its first slot, with `BLKZEROOUT` or an SPDK write-zeroes, so stale bytes never read as a live volume.
+
 Every I/O buffer comes from one registered arena, because a range can be pinned only once — io_uring answers `EBUSY` on re-registration and a growing arena cannot be pinned at all.
 In `nvme_channels.hpp`, the buffer pool carves that arena into fixed blocks, each I/O channel gives a queue pair its own pools and polling room, and a pipeline holds the ring at its depth by refilling as completions retire rather than submitting a batch and waiting for all of it.
 

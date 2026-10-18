@@ -44,6 +44,7 @@
 #include <concepts>    // `std::same_as`
 #include <functional>  // `std::hash`
 #include <limits>      // `std::numeric_limits`
+#include <memory>      // `std::allocator_traits`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 #include <type_traits> // `std::true_type`, `std::is_trivially_copyable_v`
@@ -198,6 +199,14 @@ class constrained_allocator {
 
     /** A moved container keeps charging the budget its allocator named. */
     using propagate_on_container_move_assignment = std::true_type;
+
+    /** The same budget over values of @p other_type_, drawn from the base allocator rebound alike. */
+    template <typename other_type_>
+    struct rebind {
+        using other =
+            constrained_allocator<other_type_,
+                                  typename std::allocator_traits<base_allocator_t>::template rebind_alloc<other_type_>>;
+    };
 
     /** An allocator naming no budget, which refuses every allocation until a named one replaces it. */
     constrained_allocator() noexcept : base_(), constraint_(nullptr) {}

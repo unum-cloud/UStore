@@ -22,13 +22,13 @@
  *  Isolation, as delivered. Every read of a transaction answers at the stamp it started at, a walk included, so it
  *  sees one committed state whatever it watches. Watching keys, the default, a commit checks every key it read or
  *  wrote, and every range it walked, the keys it did not find included, against every commit since its start, all
- *  under the one write path, and lands under a stamp drawn after that check: committed transactions are strictly
+ *  under the ledger's leader word, and lands under a stamp drawn after that check: committed transactions are strictly
  *  serializable in the order of their stamps. Watching nothing, a transaction still reads one snapshot, but its writes
  *  land unchecked and the last writer wins. `describe` reports snapshot isolation, as the C ABI does for every engine
  *  but the in-memory one.
  *
- *  A staged transaction holds the database's one claim, which every other call waits for, so a stage only checks
- *  the transaction and lets the claim go, and the commit checks it again. A snapshot is a stamp pinned in the store's
+ *  A staged transaction holds the ledger's leader word, which every other commit waits for, so a stage only checks
+ *  the transaction and lets the word go, and the commit checks it again. A snapshot is a stamp pinned in the store's
  *  ledger and holds no level set: every read through it answers the newest version at or below that stamp, which the
  *  write buffers and the merges keep for as long as the pin lives, so a snapshot kept across calls stalls no writer.
  */
@@ -178,7 +178,7 @@ extern engine_t const engine_k;
 /** Everything one open database holds, which is the database handle of the C ABI. */
 struct database_state_t : handle_t {
 
-    /** The budgets, the background threads and the mount the store borrows its router and channels from. */
+    /** The budgets and the mount the store borrows its router and channels from. */
     resources_shared_ptr_t resources;
 
     /** The store itself, unmounted before the mount underneath it is torn down. */
@@ -189,6 +189,11 @@ struct database_state_t : handle_t {
 
     /** The buffer every caller's transaction takes. */
     transaction_config_t transaction_shape;
+
+    /** The executor that opened the database, whose threads read on a channel and an epoch slot of their own, or
+     *  null; compared by address alone, as one made where a freed one was has threads as exclusive, and any index
+     *  past the threads the database counted reads as an outside thread's would. */
+    call_executor_t const* executor = nullptr;
 
     /** Held by whoever changes the catalog and the names, so a name is checked and taken in one step. */
     std::int32_t catalog_claim = 0;
@@ -291,6 +296,10 @@ struct access_t {
 
     /** The stamp a call outside a transaction reads at: a snapshot's, or the head's. */
     transaction_stamp_t stamp = head_stamp_k;
+
+    /** The thread of the executor that opened the database running the call, which reads on its own channel and
+     *  epoch slot, or @c outside_executor_k for any other thread. */
+    std::size_t thread_index = outside_executor_k;
 };
 
 /** The schedule the watches of a call asking for @p watch take. */
@@ -298,20 +307,24 @@ constexpr watch_schedule_t schedule_of(ustore_watch_t watch) noexcept {
     return watch == ustore_watch_keys_k ? watch_schedule_t::on_commit_k : watch_schedule_t::never_k;
 }
 
-/** The access of a call reading through @p view: its transaction, its snapshot's stamp, or the head. */
-inline access_t access_of(database_state_t& state, view_t const& view) noexcept {
-    if (view.snapshot)
-        return {state, nullptr, watch_schedule_t::never_k, view.scratch,
-                handle_cast<snapshot_handle_t>(view.snapshot)->pin.stamp()};
-    if (!view.transaction) return {state, nullptr, watch_schedule_t::never_k, view.scratch};
-    store_transaction_t* const transaction = handle_cast<transaction_handle_t>(view.transaction)->held.get();
-    return {state, transaction, schedule_of(view.watch), view.scratch};
+/** The thread index a call running on @p view's thread reads @p state with. */
+inline std::size_t thread_index_of(database_state_t const& state, view_t const& view) noexcept {
+    return view.executor && view.executor == state.executor ? view.thread_index : outside_executor_k;
 }
 
-/** Refuses a read of @p access at a stamp whose history the memory budget let go, which only a snapshot reads at. */
-inline status_t check_history(access_t const& access) noexcept {
-    if (access.stamp >= access.state.store->ledger().refused_below()) return {};
-    return {status_code_t::write_conflict_k, "The history this snapshot reads at outgrew the memory budget"};
+/** The access of a call reading through @p view: its transaction, its snapshot's stamp, or the head. */
+inline access_t access_of(database_state_t& state, view_t const& view) noexcept {
+    std::size_t const thread_index = thread_index_of(state, view);
+    if (view.snapshot)
+        return {state,
+                nullptr,
+                watch_schedule_t::never_k,
+                view.scratch,
+                handle_cast<snapshot_handle_t>(view.snapshot)->pin.stamp(),
+                thread_index};
+    if (!view.transaction) return {state, nullptr, watch_schedule_t::never_k, view.scratch, head_stamp_k, thread_index};
+    store_transaction_t* const transaction = handle_cast<transaction_handle_t>(view.transaction)->held.get();
+    return {state, transaction, schedule_of(view.watch), view.scratch, head_stamp_k, thread_index};
 }
 
 /** Watches @p keys of @p collection through the transaction of @p access, when it watches at all. */
@@ -352,7 +365,6 @@ inline expected<value_view_t> read_value(access_t const& access, collection_id_t
                                          stored_key_t key) noexcept {
     store_t& store = *access.state.store;
     store_transaction_t* const transaction = access.transaction;
-    if (status_t const kept = check_history(access); kept.failed()) return kept;
     if (transaction) {
         write_buffer_status_t const own = transaction->uncommitted(collection, key);
         if (own == write_buffer_status_t::removed_k) return value_view_t {};
@@ -371,17 +383,21 @@ inline expected<value_view_t> read_value(access_t const& access, collection_id_t
     // A value may change its size between the measurement and the copy, which the copy refuses rather than truncates
     for (std::size_t attempt = 0; attempt != read_attempts_k; ++attempt) {
         stored_value_size_t size = 0;
-        status_t const measured = transaction ? transaction->stored_value_size_committed(collection, key, size)
-                                              : store.stored_value_size(collection, key, size, access.stamp);
+        std::size_t const thread_index = access.thread_index;
+        status_t const measured = transaction
+                                      ? transaction->stored_value_size_committed(collection, key, size, thread_index)
+                                      : store.stored_value_size(collection, key, size, access.stamp, thread_index);
         bool const missing = measured == status_code_t::not_found_k;
         if (measured.failed() && !missing) return measured;
         if (!missing) {
             expected<value_view_t> read = copied_value(access, size, [&](std::span<byte_t> into) noexcept {
                 stored_value_size_t copied = 0;
-                if (!transaction) return store.select(collection, key, into, copied, access.stamp);
+                if (!transaction) return store.select(collection, key, into, copied, access.stamp, thread_index);
                 if (access.schedule == watch_schedule_t::never_k)
-                    return transaction->select_committed<watch_schedule_t::never_k>(collection, key, into, copied);
-                return transaction->select_committed<watch_schedule_t::on_commit_k>(collection, key, into, copied);
+                    return transaction->select_committed<watch_schedule_t::never_k>(collection, key, into, copied,
+                                                                                    thread_index);
+                return transaction->select_committed<watch_schedule_t::on_commit_k>(collection, key, into, copied,
+                                                                                    thread_index);
             });
             if (read) return read;
             if (read.status() == status_code_t::invalid_argument_k) continue;
@@ -423,19 +439,19 @@ struct own_write_t {
  *  @brief Hands @p visitor every present key of @p collection from @p from up, as @p access sees it, in ascending
  *      order, as @c visitor(key, size) answering whether the walk carries on.
  *
- *  The store's walk holds the database's claim, so @p visitor collects and calls nothing of the database.
+ *  The store's walk holds the view it loaded, which a flush waits for, so @p visitor collects and calls nothing of the
+ *  database.
  */
 template <typename visitor_type_>
 status_t walk(access_t const& access, collection_id_t collection, stored_key_t from, visitor_type_&& visitor) noexcept {
-    store_t const& store = *access.state.store;
-    if (status_t const kept = check_history(access); kept.failed()) return kept;
+    store_t& store = *access.state.store;
     if (!access.transaction)
         return store.scan(
             collection, from,
             [&](stored_key_t key, select_result_t state, stored_value_size_t size) noexcept {
                 return state != select_result_t::success_k || visitor(key, size);
             },
-            access.stamp);
+            access.stamp, access.thread_index);
 
     st::basic_vector<own_write_t, arena_allocator<own_write_t>> own {{access.scratch}};
     status_t listed;
@@ -466,7 +482,7 @@ status_t walk(access_t const& access, collection_id_t collection, stored_key_t f
             carries_on = visitor(key, size);
             return carries_on;
         },
-        access.transaction->start_stamp());
+        access.transaction->start_stamp(), access.thread_index);
     if (walked.failed()) return walked;
     for (; carries_on && next != own.size(); ++next) emit_own(own[next]);
     return {};
@@ -580,9 +596,10 @@ inline expected<catalog_entry_t> read_catalog_entry(value_view_t held) noexcept 
 /** What the catalog records of @p collection at @p stamp, refusing one it does not list, the reserved ones included. */
 inline expected<catalog_entry_t> look_up(database_state_t& state, ustore_arena_t scratch,
                                          ustore_collection_id_t const& collection,
-                                         transaction_stamp_t stamp = head_stamp_k) noexcept {
+                                         transaction_stamp_t stamp = head_stamp_k,
+                                         std::size_t thread_index = outside_executor_k) noexcept {
     if (collection == ustore_collection_main_k) return catalog_entry_t {};
-    access_t const listed {state, nullptr, watch_schedule_t::never_k, scratch, stamp};
+    access_t const listed {state, nullptr, watch_schedule_t::never_k, scratch, stamp, thread_index};
     auto [held, read_status] = read_value(listed, catalog_collection_k, stored_of(collection.uuid));
     if (read_status.failed()) return read_status;
     if (!held) return status_t {status_code_t::not_found_k, "No such collection"};
@@ -599,7 +616,7 @@ inline status_t resolve_runs(database_state_t& state, view_t const& view,
     for (std::size_t index = 0; index != count; ++index) {
         if (index != 0 && collections && collections[index] == collections[index - 1]) continue;
         ustore_collection_id_t const collection = collections ? collections[index] : ustore_collection_main_k;
-        auto [entry, look_up_status] = look_up(state, view.scratch, collection, stamp);
+        auto [entry, look_up_status] = look_up(state, view.scratch, collection, stamp, thread_index_of(state, view));
         if (look_up_status.failed()) return look_up_status;
         if (keying_of(entry.modality) != keying)
             return {status_code_t::invalid_argument_k,
@@ -1421,7 +1438,7 @@ status_t transaction_init(ustore_transaction_init_t const& arguments, view_t con
 }
 
 /** Implements @c ustore_transaction_stage: checking every watch and that every write fits, then handing the
- *  database's claim back, so the commit checks them again. */
+ *  ledger's leader word back, so the commit checks them again. */
 status_t transaction_stage(ustore_transaction_stage_t const& arguments, view_t const& view) noexcept {
     if (!view.transaction) return {status_code_t::uninitialized_k, "Transaction is uninitialized"};
     transaction_handle_t& handle = *handle_cast<transaction_handle_t>(view.transaction);
@@ -1515,9 +1532,10 @@ inline status_t read_options(ustore_database_open_nvme_t const& arguments, resou
             return {status_code_t::out_of_memory_k, "Failed to list the GPU devices"};
     resources.gpu_memory_limit = placement.devices.empty() ? 0 : placement.scratch_limit;
 
-    // The calls run outside the engine's background threads, so every thread of the executor takes a shared channel
-    resources.threads = 1;
-    resources.shared_io_channels = placement.threads + engine_shared_io_channels_k;
+    // Every thread of the executor, its blocking caller included, keeps a channel, and every other thread shares the
+    // rest
+    resources.threads = placement.threads + 1;
+    resources.shared_io_channels = engine_shared_io_channels_k;
     ustore_nvme_options_t const& moving = placement.nvme;
     if (arguments.collection_value_size) collections.value_max_size = 0;
     bool const fits =
@@ -1624,6 +1642,7 @@ status_t open(ustore_database_open_nvme_t const& arguments, view_t const& view) 
     auto [state, open_status] = open_state(resources, transactions, create_collection_config(collections),
                                            view.scratch);
     if (open_status.failed()) return open_status;
+    state->executor = nvme_placement_of(arguments.executor).executor;
     *arguments.database = c_handle<ustore_database_t>(state.release());
     return {};
 }
@@ -1670,13 +1689,15 @@ inline status_t save_collection(access_t const& access, collection_ids_t const& 
             return collected;
         for (stored_key_t const& key : keys) {
             stored_value_size_t size = 0;
-            if (status_t const measured = store.stored_value_size(collection.id, key, size, access.stamp);
+            if (status_t const measured = store.stored_value_size(collection.id, key, size, access.stamp,
+                                                                  access.thread_index);
                 measured.failed())
                 return measured;
             if (value.resize(size) != st::status_t::success_k)
                 return {status_code_t::out_of_memory_k, "Failed to hold a value the save copies"};
             stored_value_size_t copied = 0;
-            if (status_t const read = store.select(collection.id, key, std::span<byte_t> {value}, copied, access.stamp);
+            if (status_t const read = store.select(collection.id, key, std::span<byte_t> {value}, copied, access.stamp,
+                                                   access.thread_index);
                 read.failed())
                 return read;
             if (status_t const written = target.store->insert(collection.id, key,
@@ -1702,7 +1723,6 @@ status_t snapshot_save(ustore_snapshot_save_t const& arguments, view_t const& vi
     if (!view.snapshot) return {status_code_t::invalid_argument_k, "A save reads through a snapshot"};
     database_state_t& source = state_of(arguments);
     access_t const access = access_of(source, view);
-    if (status_t const kept = check_history(access); kept.failed()) return kept;
 
     ustore_database_open_nvme_t saving {};
     saving.directory = arguments.path;

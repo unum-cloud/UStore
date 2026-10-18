@@ -244,6 +244,24 @@ class executor_t {
         return executor;
     }
 
+    /** Spawns @p threads threads the OS may run on any core, for a thread coordinating a pinned pool, which would
+     *  otherwise share a core with that pool's first thread and wait out a scheduler slice behind it. */
+    [[nodiscard]] static st::expected<executor_t> make_unpinned(std::size_t threads,
+                                                                caller_exclusivity_t exclusivity) noexcept {
+        st::expected<topology_t> topology = topology_t::make();
+        if (!topology) return topology.status();
+        executor_t executor;
+        // Without memory placement ForkUnion spawns a flat pool of plain threads, which pins nothing
+        fu_capabilities_t const unplaced = static_cast<fu_capabilities_t>(fu_capabilities_all_k &
+                                                                          ~fu_capability_place_memory_on_domain_k);
+        if (fu_status_t const status = fu_pool_new(pool_name_k, unplaced, &executor.pool_); status != fu_success_k)
+            return status_from_(status);
+        if (fu_status_t const status = fu_pool_spawn(topology->get(), executor.pool_, threads, spawned_(exclusivity));
+            status != fu_success_k)
+            return status_from_(status);
+        return executor;
+    }
+
     /** Spawns @p threads threads interleaved across the compute domains of @p topology local to @p memory_domain. */
     [[nodiscard]] static st::expected<executor_t> make_near(topology_t const& topology,
                                                             fu_memory_domain_id_t memory_domain, std::size_t threads,

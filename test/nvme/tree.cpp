@@ -267,7 +267,7 @@ template <typename tree_type_>
             if (bytes[index] != painted(wanted[request].seed, offset + index)) ++mismatches;
     };
 
-    typename tree_type_::snapshot_t const taken = tree.snapshot();
+    typename tree_type_::level_set_t const& taken = tree.levels();
     failures += expect(
         tree.read_values(channel, taken, std::span<stored_key_t const> {keys}, std::span<find_result_t> {results}, sink)
             .succeeded());
@@ -383,7 +383,7 @@ std::size_t flush_lands_on_level_zero(mount_type_ const& mount) {
     if (failures != 0) return failures;
 
     {
-        typename tree_t::snapshot_t const taken = tree->snapshot();
+        typename tree_t::level_set_t const& taken = tree->levels();
         failures += expect_eq(taken.size(), std::size_t {1});
         failures += expect_eq(taken.level(0).size(), std::size_t {1});
         failures += expect(taken.level(0).order() == lsm_level_order_t::overlapping_k);
@@ -458,13 +458,13 @@ std::size_t overlapping_runs_take_the_youngest(mount_type_ const& mount) {
     }
 
     {
-        typename tree_t::snapshot_t const taken = tree->snapshot();
+        typename tree_t::level_set_t const& taken = tree->levels();
         failures += expect_eq(taken.level(0).size(), flushes_k);
     }
     failures += check_model(*tree, guard->channel(), std::span<expectation_t const> {model});
 
     // A merged walk of level zero reports every key once, in ascending order, at its youngest run.
-    typename tree_t::snapshot_t const taken = tree->snapshot();
+    typename tree_t::level_set_t const& taken = tree->levels();
     std::size_t visited = 0;
     std::size_t disordered = 0;
     stored_key_t previous = 0;
@@ -541,7 +541,7 @@ std::size_t compaction_drops_tombstones_at_the_bottom(mount_type_ const& mount) 
         if (failures != 0) return failures;
     }
 
-    failures += expect(tree->needs_compaction());
+    failures += expect(tree->needs_compaction(tree->levels()));
     expected<compaction_outcome_t> const outcome = tree->compact(reading->channel(), writing->channel(),
                                                                  compaction_placement_t::host_k, nullptr);
     failures += expect(outcome.has_value());
@@ -553,7 +553,7 @@ std::size_t compaction_drops_tombstones_at_the_bottom(mount_type_ const& mount) 
         if (model[index].state == select_result_t::erased_k) model[index].state = select_result_t::nothing_k;
 
     {
-        typename tree_t::snapshot_t const taken = tree->snapshot();
+        typename tree_t::level_set_t const& taken = tree->levels();
         failures += expect_eq(taken.size(), std::size_t {2});
         failures += expect(taken.level(0).empty());
         failures += expect(!taken.level(1).empty());
@@ -699,7 +699,7 @@ std::size_t cancelled_compaction_leaves_nothing(mount_type_ const& mount) {
         failures += flush_batch(*tree, guard->channel(), std::span<expectation_t const> {batch});
         if (failures != 0) return failures;
     }
-    failures += expect(tree->needs_compaction());
+    failures += expect(tree->needs_compaction(tree->levels()));
 
     std::uint64_t const free_before = volume->free_bytes();
     std::size_t const reserved_before = volume->reservations();
@@ -709,7 +709,7 @@ std::size_t cancelled_compaction_leaves_nothing(mount_type_ const& mount) {
     std::uint64_t population_before = 0;
     std::size_t runs_before = 0;
     {
-        typename tree_t::snapshot_t const taken = tree->snapshot();
+        typename tree_t::level_set_t const& taken = tree->levels();
         population_before = taken.population_count();
         runs_before = taken.level(0).size();
     }
@@ -732,7 +732,7 @@ std::size_t cancelled_compaction_leaves_nothing(mount_type_ const& mount) {
     failures += expect_eq((*fixture)->disk.outstanding(writing->channel().queue_pair()), std::size_t {0});
 
     {
-        typename tree_t::snapshot_t const taken = tree->snapshot();
+        typename tree_t::level_set_t const& taken = tree->levels();
         failures += expect_eq(taken.size(), std::size_t {1});
         failures += expect_eq(taken.level(0).size(), runs_before);
         failures += expect_eq(taken.population_count(), population_before);
@@ -798,7 +798,7 @@ std::size_t raced_cancellation_is_all_or_nothing(mount_type_ const& mount) {
     std::size_t const blobs_before = volume->size();
     std::uint64_t population_before = 0;
     {
-        typename tree_t::snapshot_t const taken = tree->snapshot();
+        typename tree_t::level_set_t const& taken = tree->levels();
         population_before = taken.population_count();
     }
 
@@ -816,7 +816,7 @@ std::size_t raced_cancellation_is_all_or_nothing(mount_type_ const& mount) {
     failures += expect_eq(volume->reservations(), std::size_t {0});
     failures += expect_eq((*fixture)->disk.outstanding(writing->channel().queue_pair()), std::size_t {0});
 
-    typename tree_t::snapshot_t const taken = tree->snapshot();
+    typename tree_t::level_set_t const& taken = tree->levels();
     failures += expect_eq(taken.population_count(), population_before);
     if (!outcome) {
         failures += expect_status(outcome, status_code_t::uninitialized_k);
@@ -1118,7 +1118,7 @@ std::size_t batched_read_holds_its_depth(mount_type_ const& mount) {
             if (bytes[index] != painted(model[request].seed, offset + index)) ++mismatches;
     };
 
-    typename tree_t::snapshot_t const taken = tree->snapshot();
+    typename tree_t::level_set_t const& taken = tree->levels();
     failures += expect_eq(taken.level(0).size(), flushes_k);
     failures += expect(tree->read_values(guard->channel(), taken, std::span<stored_key_t const> {keys},
                                          std::span<find_result_t> {results}, counting)

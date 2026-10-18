@@ -257,14 +257,14 @@ template <typename writer_type_>
 
 /** Reads one key of the database @p source, which takes no watch. */
 template <watch_schedule_t schedule_, typename source_type_>
-status_t read_one(source_type_ const& source, io_channel_t& channel, stored_key_t stored_key, std::span<byte_t> into,
+status_t read_one(source_type_& source, io_channel_t& channel, stored_key_t stored_key, std::span<byte_t> into,
                   stored_value_size_t& size) noexcept {
     return source.select(channel, stored_key, into, size);
 }
 
 /** Reads one key through the transaction @p source, watching it under @p schedule_. */
 template <watch_schedule_t schedule_, typename key_type_, typename store_type_>
-status_t read_one(single_collection_database_transaction<key_type_, store_type_> const& source, io_channel_t& channel,
+status_t read_one(single_collection_database_transaction<key_type_, store_type_>& source, io_channel_t& channel,
                   stored_key_t stored_key, std::span<byte_t> into, stored_value_size_t& size) noexcept {
     return source.template select<schedule_>(channel, stored_key, into, size);
 }
@@ -291,7 +291,7 @@ status_t read_batch(single_collection_database_transaction<key_type_, store_type
  *  a database and of a transaction answer the same model.
  */
 template <watch_schedule_t schedule_ = watch_schedule_t::default_k, typename source_type_>
-[[nodiscard]] std::size_t check_model(source_type_ const& source, io_channel_t& channel, model_t const& model) {
+[[nodiscard]] std::size_t check_model(source_type_& source, io_channel_t& channel, model_t const& model) {
     std::size_t failures = 0;
     st::basic_vector<stored_key_t> keys;
     st::basic_vector<select_result_t> results;

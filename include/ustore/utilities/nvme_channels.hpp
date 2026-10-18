@@ -648,10 +648,10 @@ class basic_io_channel_pool {
         return first;
     }
 
-    /** The channel of executor thread @p thread_index, which nobody else takes. */
+    /** The channel of executor thread @p thread_index, which nobody else takes, or a shared one as @c acquire takes
+     *  for an index past the executor's threads. */
     expected<guard_t> acquire(std::size_t thread_index) noexcept {
-        if (thread_index >= executor_channels_)
-            return status_t {status_code_t::invalid_argument_k, "That thread has no channel of its own"};
+        if (thread_index >= executor_channels_) return acquire();
         io_channel_t& channel = channels_[thread_index];
         if (status_t const adopted = disk_->bind_queue_pair(channel.queue_pair_); adopted.failed()) return adopted;
         fu::preferred_atomic_ref<std::uint64_t> {channel.bound_thread_}.store(calling_thread_identity(),
@@ -679,6 +679,9 @@ class basic_io_channel_pool {
 
     /** Channels the mount opened, which is the executor's threads plus the shared_channels. */
     [[nodiscard]] std::size_t size() const noexcept { return channels_.size(); }
+
+    /** Executor threads with a channel of their own, indexed by the thread. */
+    [[nodiscard]] std::size_t executor_channels() const noexcept { return executor_channels_; }
 
   private:
 

@@ -107,24 +107,6 @@ class test_store_t {
     /** The order every commit into this store draws its stamp from. */
     commit_ledger_t& ledger() noexcept { return ledger_; }
 
-    /** Takes the store's write path, which one staged transaction holds at a time. */
-    void acquire_write_path() noexcept {
-        fu::preferred_atomic_ref<std::int32_t> const claim {write_path_};
-        std::int32_t expected_free = 0;
-        while (!claim.compare_exchange_weak(expected_free, 1, std::memory_order_acquire, std::memory_order_relaxed)) {
-            fu::preferred_yield_t {}(write_path_, expected_free, std::size_t {0});
-            expected_free = 0;
-        }
-    }
-
-    /** Hands the store's write path back. */
-    void release_write_path() noexcept {
-        fu::preferred_atomic_ref<std::int32_t> {write_path_}.store(0, std::memory_order_release);
-    }
-
-    /** Whether the collection @p group_id names still exists. */
-    bool contains_collection(collection_id_t group_id) const noexcept { return group_id == collection_k; }
-
     /** Whether a commit newer than @p from wrote @p stored_key, exactly. */
     bool written_since(collection_id_t, stored_key_t stored_key, transaction_stamp_t from) const noexcept {
         return stamps_[stored_key] > from;
@@ -138,31 +120,55 @@ class test_store_t {
         return false;
     }
 
-    /** Makes room for @p count values in the collection's own write buffer, flushing it when it is full. */
-    status_t prepare_collection(collection_id_t, std::size_t, std::size_t) noexcept {
-        if (behaviour == store_behaviour_t::refusing_applies_k) return {status_code_t::device_k, "Refusing to write"};
-        if (behaviour != store_behaviour_t::always_flushing_k && behaviour != store_behaviour_t::refusing_flushes_k)
-            return {};
-        ++flushes;
-        if (behaviour == store_behaviour_t::refusing_flushes_k) return {status_code_t::device_k, "Refusing to flush"};
+    /** Seals @p changes for the commit that follows, flushing the collection first when it reports itself full. */
+    status_t seal_collection(collection_id_t, grouped_write_buffer<stored_key_t> const& changes,
+                             sealed_commit<stored_key_t>& sealed) noexcept {
+        if (behaviour == store_behaviour_t::always_flushing_k || behaviour == store_behaviour_t::refusing_flushes_k) {
+            ++flushes;
+            if (behaviour == store_behaviour_t::refusing_flushes_k)
+                return {status_code_t::device_k, "Refusing to flush"};
+        }
+        st::basic_vector<keyed_delta<stored_key_t>> deltas;
+        changes.for_each_write([&](collection_id_t, stored_key_t const& stored_key, auto const& place) noexcept {
+            delta_view_t delta {delta_kind_t::remove_k, {}};
+            std::span<byte_t const> const inserted = as_bytes_view(changes.insertions_buffer);
+            if (place.offset != tombstone_offset_k)
+                delta = {delta_kind_t::write_k, inserted.subspan(place.offset, place.size)};
+            [[maybe_unused]] st::status_t const kept = deltas.push_back(keyed_delta<stored_key_t> {stored_key, delta});
+        });
+        if (deltas.empty()) return {};
+        auto [writes, seal_status] = sealed_writes<stored_key_t, constrained_allocator<byte_t>>::seal(
+            std::span<keyed_delta<stored_key_t>> {deltas}, constrained_allocator<byte_t> {budget_});
+        if (seal_status.failed()) return seal_status;
+        sealed.writes = std::move(writes);
         return {};
     }
 
-    /** Writes @p stored_value under @p stored_key at @p stamp, in room the preparation took. */
-    void stage_in_collection(collection_id_t, stored_key_t stored_key, stored_value_view_t stored_value,
-                             transaction_stamp_t stamp) noexcept {
-        if (behaviour == store_behaviour_t::pausing_in_apply_k) wait_for_the_suite_();
-        std::uint64_t word = 0;
-        if (stored_value.size() == value_bytes_k) std::memcpy(&word, stored_value.data(), value_bytes_k);
-        stamps_[stored_key] = stamp;
-        balance_(stored_key).store(word, std::memory_order_release);
+    /** Takes the sealed changes for the commit that follows, or refuses them. */
+    status_t prepare_collection(collection_id_t, sealed_commit<stored_key_t>&) noexcept {
+        if (behaviour == store_behaviour_t::refusing_applies_k) return {status_code_t::device_k, "Refusing to write"};
+        return {};
     }
 
-    /** Drops whatever @p stored_key held at @p stamp, in room the preparation took. */
-    void stage_erasure_in_collection(collection_id_t, stored_key_t stored_key, transaction_stamp_t stamp) noexcept {
-        stamps_[stored_key] = stamp;
-        balance_(stored_key).store(0, std::memory_order_release);
+    /** Writes every sealed change at @p stamp, a removal as a zero balance. */
+    void publish_collection(collection_id_t, sealed_commit<stored_key_t>& sealed, transaction_stamp_t stamp) noexcept {
+        for (std::size_t position = 0; position != sealed.writes.size(); ++position) {
+            if (behaviour == store_behaviour_t::pausing_in_apply_k) wait_for_the_suite_();
+            stored_key_t const stored_key = sealed.writes.stored_key(position);
+            delta_view_t const delta = sealed.writes.delta(position);
+            std::uint64_t word = 0;
+            if (delta.kind == delta_kind_t::write_k && delta.bytes.size() == value_bytes_k)
+                std::memcpy(&word, delta.bytes.data(), value_bytes_k);
+            stamps_[stored_key] = stamp;
+            balance_(stored_key).store(word, std::memory_order_release);
+        }
     }
+
+    /** Forgets nothing, since preparing takes nothing. */
+    void forget_collection(collection_id_t) noexcept {}
+
+    /** Maintains nothing, since balances live in place. */
+    status_t maintain(collection_id_t) noexcept { return {}; }
 
     /** The balance @p stored_key holds right now, which a later commit may already have moved. */
     std::uint64_t balance(stored_key_t stored_key) const noexcept {
@@ -212,14 +218,14 @@ class test_store_t {
     /** The stamps every commit draws. */
     commit_ledger_t ledger_;
 
-    /** One word per account, read outside the write path and written inside it. */
+    /** The budget sealed changes are charged to. */
+    resource_constraint_t budget_ {std::size_t {1} << 30};
+
+    /** One word per account, read by any thread and written by the leader. */
     std::uint64_t balances_[accounts_k] {};
 
-    /** The stamp of the commit that last wrote each account, read and written under the write path. */
+    /** The stamp of the commit that last wrote each account, read and written by the leader. */
     transaction_stamp_t stamps_[accounts_k] {};
-
-    /** One while a transaction holds the write path. */
-    std::int32_t write_path_ = 0;
 
     /** Raised while a write waits for the suite. */
     std::int32_t paused_ = 0;
@@ -254,7 +260,7 @@ class blobs::database_transaction<stored_key_t, test_store_t> {
         /** Reading, writing and watching. */
         started_k,
 
-        /** Staged, holding the store's write path until it commits or rolls back. */
+        /** Staged, holding the ledger's leader word until it commits or rolls back. */
         staged_k,
     };
 
@@ -267,7 +273,7 @@ class blobs::database_transaction<stored_key_t, test_store_t> {
     database_transaction& operator=(database_transaction const&) = delete;
 
     ~database_transaction() noexcept {
-        if (phase_ == phase_t::staged_k) registry_->discard_();
+        if (phase_ == phase_t::staged_k) registry_->discard_(data_);
     }
 
     /** The stamp the transaction started at, which scopes every @c on_commit_k watch it takes. */
@@ -314,7 +320,7 @@ class blobs::database_transaction<stored_key_t, test_store_t> {
     status_t commit() noexcept {
         if (phase_ != phase_t::staged_k)
             if (status_t const staged = stage(); staged.failed()) return staged;
-        last_commit_stamp_ = registry_->commit_(data_);
+        last_commit_stamp_ = registry_->commit_staged_(data_);
         phase_ = phase_t::started_k;
         data_.clear();
         start_stamp_ = registry_->request_start_(pin_);
@@ -323,7 +329,7 @@ class blobs::database_transaction<stored_key_t, test_store_t> {
 
     /** Drops every change and every watch, leaving the registry with no trace of the transaction. */
     void rollback() noexcept {
-        if (phase_ == phase_t::staged_k) registry_->discard_();
+        if (phase_ == phase_t::staged_k) registry_->discard_(data_);
         phase_ = phase_t::started_k;
         data_.clear();
         start_stamp_ = registry_->request_start_(pin_);
@@ -331,7 +337,7 @@ class blobs::database_transaction<stored_key_t, test_store_t> {
 
     /** Starts over with the changes kept, which a caller retrying a conflict asks for. */
     void renew() noexcept {
-        if (phase_ == phase_t::staged_k) registry_->discard_();
+        if (phase_ == phase_t::staged_k) registry_->discard_(data_);
         phase_ = phase_t::started_k;
         data_.read_set.clear();
         start_stamp_ = registry_->request_start_(pin_);
@@ -438,7 +444,12 @@ struct fixture_t {
 
 #pragma region Ordering Cases
 
-/** Commits of many threads draw distinct stamps, and the watermark covers every one of them once all landed. */
+/** A request that checks nothing and publishes nothing, which the sequencer still gives a stamp of its own. */
+static status_t prepare_nothing(void*) noexcept { return {}; }
+static void publish_nothing(void*, transaction_stamp_t) noexcept {}
+
+/** Commits of many threads, combined by whichever of them leads, draw distinct stamps, and the watermark covers every
+ *  one of them once all returned. */
 static std::size_t commit_stamps_are_distinct() {
     std::size_t failures = 0;
     commit_ledger_t ledger;
@@ -446,15 +457,20 @@ static std::size_t commit_stamps_are_distinct() {
     constexpr std::size_t threads_k = 8;
     constexpr std::size_t per_thread_k = 20000;
     std::vector<std::vector<transaction_stamp_t>> claimed(threads_k);
+    std::atomic<std::size_t> unpublished {0};
     std::vector<std::thread> workers;
     workers.reserve(threads_k);
     for (std::size_t thread_index = 0; thread_index != threads_k; ++thread_index)
         workers.emplace_back([&, thread_index] {
             claimed[thread_index].reserve(per_thread_k);
             for (std::size_t issue = 0; issue != per_thread_k; ++issue) {
-                commit_ledger_t::commit_in_flight_t in_flight;
-                claimed[thread_index].push_back(ledger.begin_commit(in_flight));
-                ledger.end_commit(in_flight);
+                commit_request_t request;
+                request.prepare = &prepare_nothing;
+                request.publish = &publish_nothing;
+                expected<transaction_stamp_t> const stamp = ledger.submit(request);
+                if (stamp) claimed[thread_index].push_back(*stamp);
+                // The stamp is published on return, so the committer reads what it wrote.
+                if (!stamp || ledger.published() < *stamp) unpublished.fetch_add(1, std::memory_order_relaxed);
             }
         });
     for (std::thread& worker : workers) worker.join();
@@ -470,12 +486,24 @@ static std::size_t commit_stamps_are_distinct() {
         }
 
     failures += expect_eq(repeats, std::size_t {0});
+    failures += expect_eq(unpublished.load(), std::size_t {0});
     failures += expect_eq(highest, transaction_stamp_t {threads_k * per_thread_k});
     failures += expect_eq(ledger.published(), highest);
     return failures;
 }
 
-/** Readers and write buffers pin stamps without allocating, and the ledger answers from exactly those pins. */
+/** What a collection's first commit into empty memory does to its view's pin, as a request's publication. */
+struct bounding_t {
+    commit_ledger_t* ledger = nullptr;
+    stamp_pin_t* view = nullptr;
+};
+
+static void publish_bounding(void* context, transaction_stamp_t stamp) noexcept {
+    bounding_t const& bounding = *static_cast<bounding_t const*>(context);
+    bounding.ledger->bound_view(*bounding.view, stamp - 1);
+}
+
+/** Readers and views pin stamps without allocating, and the ledger answers from exactly those pins. */
 static std::size_t pins_answer_the_ledger() {
     std::size_t failures = 0;
     commit_ledger_t ledger;
@@ -487,15 +515,20 @@ static std::size_t pins_answer_the_ledger() {
     failures += expect_eq(ledger.newest_reader(), transaction_stamp_t {41});
     failures += expect_eq(ledger.durable_stamp(), transaction_stamp_t {41});
 
-    commit_ledger_t::commit_in_flight_t in_flight;
-    failures += expect_eq(ledger.begin_commit(in_flight), transaction_stamp_t {42});
-    stamp_pin_t buffer;
-    ledger.pin_staging(buffer, 41);
-    ledger.end_commit(in_flight);
+    // A registered view holding no memory runs bounds nothing; its first commit bounds it below that commit.
+    stamp_pin_t view;
+    ledger.register_view(view);
+    failures += expect_eq(ledger.durable_stamp(), transaction_stamp_t {41});
+    bounding_t bounding {&ledger, &view};
+    commit_request_t request;
+    request.context = &bounding;
+    request.prepare = &prepare_nothing;
+    request.publish = &publish_bounding;
+    expected<transaction_stamp_t> const landed = ledger.submit(request);
+    failures += expect(landed && *landed == transaction_stamp_t {42});
     failures += expect_eq(ledger.published(), transaction_stamp_t {42});
     failures += expect_eq(ledger.durable_stamp(), transaction_stamp_t {41});
-    failures += expect_eq(ledger.horizon_besides(buffer), transaction_stamp_t {42});
-    failures += expect_eq(ledger.staging_pins(), std::size_t {1});
+    failures += expect_eq(ledger.horizon_besides(view), transaction_stamp_t {42});
 
     // A pin moves by relinking, so the moved-to object answers and the moved-from one holds nothing.
     stamp_pin_t moved {std::move(reader)};
@@ -510,9 +543,12 @@ static std::size_t pins_answer_the_ledger() {
     moved.release();
     failures += expect_eq(ledger.newest_reader(), transaction_stamp_t {42});
     later.release();
-    buffer.release();
     failures += expect_eq(ledger.newest_reader(), unwritten_stamp_k);
-    failures += expect_eq(ledger.staging_pins(), std::size_t {0});
+    // A flush that writes every memory run out bounds nothing again, and an unregistered view counts for nothing.
+    ledger.bound_view(view, head_stamp_k);
+    failures += expect_eq(ledger.durable_stamp(), transaction_stamp_t {42});
+    ledger.bound_view(view, 30);
+    view.release();
     failures += expect_eq(ledger.durable_stamp(), transaction_stamp_t {42});
     return failures;
 }
