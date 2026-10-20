@@ -86,4 +86,24 @@ struct last_write_fold {
 
 static_assert(fold_concept<last_write_fold>);
 
+/**
+ *  @brief The one record that stands for change @p newer over @p older, which a merge keeps where no reader tells the
+ *      two apart: a write of @p newer applied to a write or a removal below it, or one change composed of both.
+ *  @return The record, whose bytes may sit in @p arena, or the status @p fold refused it with.
+ */
+template <fold_concept fold_type_>
+expected<delta_view_t> fold_pair(fold_type_ const& fold, delta_view_t const& newer, delta_view_t const& older,
+                                 arena_allocator<byte_t>& arena) noexcept {
+    if (older.kind == delta_kind_t::change_k) {
+        delta_view_t const chain[2] {older, newer};
+        auto [composed, compose_status] = fold.compose(std::span<delta_view_t const> {chain}, arena);
+        if (compose_status.failed()) return compose_status;
+        return delta_view_t {delta_kind_t::change_k, composed};
+    }
+    std::span<byte_t const> const base = older.kind == delta_kind_t::write_k ? older.bytes : std::span<byte_t const> {};
+    auto [applied, apply_status] = fold.apply(base, std::span<delta_view_t const> {&newer, 1}, arena);
+    if (apply_status.failed()) return apply_status;
+    return delta_view_t {delta_kind_t::write_k, applied};
+}
+
 } // namespace unum::ustore::utilities

@@ -444,7 +444,6 @@ pub(crate) mod ffi {
         pub collection_cache_limit: ustore_size_t,
         pub collection_write_buffer_max_bytes: ustore_size_t,
         pub collection_write_buffer_max_elements: ustore_size_t,
-        pub collection_first_level_max_bytes: ustore_size_t,
         pub collection_level_enlarge_factor: ustore_size_t,
         pub collection_value_size: ustore_size_t,
         pub collection_value_max_size: ustore_size_t,
@@ -1782,8 +1781,6 @@ pub struct NVMEOptions<'path> {
     pub collection_write_buffer_max_bytes: u64,
     /// Writes each collection buffers before it flushes a sorted run.
     pub collection_write_buffer_max_elements: usize,
-    /// Bytes the first level of each collection holds before it compacts into the next.
-    pub collection_first_level_max_bytes: u64,
     /// How many times larger each level of a collection is than the one above it.
     pub collection_level_enlarge_factor: usize,
     /// Bytes of every value of a collection whose values share one size, or zero for varying sizes.
@@ -2051,7 +2048,6 @@ impl Database {
             collection_cache_limit: options.collection_cache_limit,
             collection_write_buffer_max_bytes: options.collection_write_buffer_max_bytes,
             collection_write_buffer_max_elements: options.collection_write_buffer_max_elements as ffi::ustore_size_t,
-            collection_first_level_max_bytes: options.collection_first_level_max_bytes,
             collection_level_enlarge_factor: options.collection_level_enlarge_factor as ffi::ustore_size_t,
             collection_value_size: options.collection_value_size,
             collection_value_max_size: options.collection_value_max_size,

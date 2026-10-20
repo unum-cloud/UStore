@@ -87,18 +87,15 @@ struct scdb_types {
  *  @brief The database shape a case opens, whose first level fills after a handful of flushes.
  *  @param[in] value_size Bytes every value takes, which is zero for every layout but the fixed one.
  *  @param[in] value_max_size Bytes the largest value takes, which is zero for a fixed-width layout.
- *  @param[in] level_zero_bytes Bytes level zero admits before a compaction is due.
  */
 [[nodiscard]] single_collection_database_config_t test_config(stored_value_size_t value_size,
-                                                              stored_value_size_t value_max_size,
-                                                              std::uint64_t level_zero_bytes) noexcept {
+                                                              stored_value_size_t value_max_size) noexcept {
     single_collection_database_config_t config;
     config.collection.concurrency_limit = 1;
     config.collection.cache_limit = 1024ull * 1024ull;
     config.collection.write_buffer_max_bytes = 8ull * 1024ull * 1024ull;
     config.collection.write_buffer_max_elements = 8192;
     config.collection.lsm_tree.level_enlarge_factor = 4;
-    config.collection.lsm_tree.lsm_level_0.max_bytes = level_zero_bytes;
     config.collection.lsm_tree.lsm_level_0.sorted_run.value_size = value_size;
     config.collection.lsm_tree.lsm_level_0.sorted_run.value_max_size = value_max_size;
     config.default_transaction.write_buffer_max_bytes = 256ull * 1024ull;
@@ -245,8 +242,7 @@ template <typename key_slot_type_, typename mount_type_>
     failures += expect_status(stack, status_code_t::success_k);
     if (!stack) return failures;
 
-    single_collection_database_config_t const config = test_config(value_size, value_max_size,
-                                                                   16ull * 1024ull * 1024ull);
+    single_collection_database_config_t const config = test_config(value_size, value_max_size);
     expected<typename database_t::database_unique_ptr_t> store = open_over<database_t>(**stack, config);
     failures += expect(store.has_value());
     if (!store) return failures;
@@ -321,14 +317,13 @@ template <typename volume_type_>
  *  @brief Writes a model of @p key_slot_type_, closes over its volume and reads every byte back after a reopen.
  *  @param[in] value_size Bytes every value takes, which is zero for every layout but the fixed one.
  *  @param[in] value_max_size Bytes the largest value takes, which is zero for a fixed-width layout.
- *  @param[in] level_zero_bytes Bytes level zero admits, low enough that two flushed rounds overfill it.
  *
  *  The tree is given depth before the close - two flushed rounds merged into a second level, and a third
  *  round flushed over them - so a reopen that took back only level zero would lose the keys the merge buried.
  */
 template <typename key_slot_type_, typename mount_type_>
 [[nodiscard]] std::size_t layout_survives_reopen(mount_type_ const& mount, stored_value_size_t value_size,
-                                                 stored_value_size_t value_max_size, std::uint64_t level_zero_bytes) {
+                                                 stored_value_size_t value_max_size) {
     using types_t = scdb_types<typename mount_type_::fixture_t>;
     using stack_t = typename types_t::stack_t;
     using database_t = basic_single_collection_database<key_slot_type_, typename types_t::volume_t>;
@@ -339,7 +334,9 @@ template <typename key_slot_type_, typename mount_type_>
     failures += expect_status(stack, status_code_t::success_k);
     if (!stack) return failures;
 
-    single_collection_database_config_t const config = test_config(value_size, value_max_size, level_zero_bytes);
+    // The smallest factor makes level zero due at two flushed runs, so two rounds give the tree depth.
+    single_collection_database_config_t config = test_config(value_size, value_max_size);
+    config.collection.lsm_tree.level_enlarge_factor = storage_limits_t::level_min_enlarge_factor_k;
     st::basic_vector<expectation_t> model;
     failures += expect(model.resize(count_k) == st::status_t::success_k);
     if (failures != 0) return failures;
@@ -417,12 +414,10 @@ template <typename key_slot_type_, typename mount_type_>
 template <typename mount_type_>
 std::size_t every_layout_survives_reopen(mount_type_ const& mount) {
     std::size_t failures = 0;
-    failures += layout_survives_reopen<key_slot<stored_key_t, value_layout_t::inline_8_bytes_k>>(mount, 0, 0,
-                                                                                                 8ull * 1024ull);
-    failures += layout_survives_reopen<key_slot<stored_key_t, value_layout_t::fixed_width_k>>(mount, 512, 0,
-                                                                                              64ull * 1024ull);
-    failures += layout_survives_reopen<key_slot<stored_key_t, value_layout_t::variable_width_k>>(
-        mount, 0, value_max_size_k, 64ull * 1024ull);
+    failures += layout_survives_reopen<key_slot<stored_key_t, value_layout_t::inline_8_bytes_k>>(mount, 0, 0);
+    failures += layout_survives_reopen<key_slot<stored_key_t, value_layout_t::fixed_width_k>>(mount, 512, 0);
+    failures += layout_survives_reopen<key_slot<stored_key_t, value_layout_t::variable_width_k>>(mount, 0,
+                                                                                                 value_max_size_k);
     return failures;
 }
 
@@ -439,7 +434,7 @@ std::size_t crash_between_seal_and_schema(mount_type_ const& mount) {
     using variable_database_t = typename types_t::variable_database_t;
     using stack_t = typename types_t::stack_t;
     std::size_t failures = 0;
-    single_collection_database_config_t const config = test_config(0, value_max_size_k, 16ull * 1024ull * 1024ull);
+    single_collection_database_config_t const config = test_config(0, value_max_size_k);
 
     {
         expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
@@ -547,7 +542,7 @@ std::size_t reopen_agrees_on_its_schema(mount_type_ const& mount) {
     failures += expect_status(stack, status_code_t::success_k);
     if (!stack) return failures;
 
-    single_collection_database_config_t const config = test_config(0, value_max_size_k, 16ull * 1024ull * 1024ull);
+    single_collection_database_config_t const config = test_config(0, value_max_size_k);
     st::basic_vector<byte_t> owner_bytes;
     failures += expect(owner_bytes.resize(3000) == st::status_t::success_k);
     for (std::size_t index = 0; index != owner_bytes.size(); ++index) owner_bytes[index] = painted(77, index);
@@ -625,7 +620,7 @@ std::size_t commit_lands_all_or_nothing(mount_type_ const& mount) {
     failures += expect_status(stack, status_code_t::success_k);
     if (!stack) return failures;
 
-    single_collection_database_config_t const config = test_config(0, value_max_size_k, 64ull * 1024ull * 1024ull);
+    single_collection_database_config_t const config = test_config(0, value_max_size_k);
     expected<typename variable_database_t::database_unique_ptr_t> store = open_over<variable_database_t>(**stack,
                                                                                                          config);
     failures += expect(store.has_value());
@@ -716,7 +711,7 @@ std::size_t conflict_keeps_its_changes(mount_type_ const& mount) {
     failures += expect_status(stack, status_code_t::success_k);
     if (!stack) return failures;
 
-    single_collection_database_config_t const config = test_config(0, value_max_size_k, 64ull * 1024ull * 1024ull);
+    single_collection_database_config_t const config = test_config(0, value_max_size_k);
     expected<typename variable_database_t::database_unique_ptr_t> store = open_over<variable_database_t>(**stack,
                                                                                                          config);
     failures += expect(store.has_value());
@@ -803,7 +798,7 @@ std::size_t rollback_and_renew_behave(mount_type_ const& mount) {
     failures += expect_status(stack, status_code_t::success_k);
     if (!stack) return failures;
 
-    single_collection_database_config_t const config = test_config(0, value_max_size_k, 64ull * 1024ull * 1024ull);
+    single_collection_database_config_t const config = test_config(0, value_max_size_k);
     expected<typename variable_database_t::database_unique_ptr_t> store = open_over<variable_database_t>(**stack,
                                                                                                          config);
     failures += expect(store.has_value());
@@ -870,7 +865,7 @@ std::size_t transactions_serialize_under_threads(mount_type_ const& mount) {
     failures += expect_status(stack, status_code_t::success_k);
     if (!stack) return failures;
 
-    single_collection_database_config_t const config = test_config(0, value_max_size_k, 64ull * 1024ull * 1024ull);
+    single_collection_database_config_t const config = test_config(0, value_max_size_k);
     expected<typename variable_database_t::database_unique_ptr_t> store = open_over<variable_database_t>(**stack,
                                                                                                          config);
     failures += expect(store.has_value());
@@ -963,7 +958,7 @@ std::size_t snapshot_sees_its_moment(mount_type_ const& mount) {
     failures += expect_status(stack, status_code_t::success_k);
     if (!stack) return failures;
 
-    single_collection_database_config_t const config = test_config(0, value_max_size_k, 64ull * 1024ull * 1024ull);
+    single_collection_database_config_t const config = test_config(0, value_max_size_k);
     expected<typename variable_database_t::database_unique_ptr_t> store = open_over<variable_database_t>(**stack,
                                                                                                          config);
     failures += expect(store.has_value());
@@ -1042,7 +1037,7 @@ std::size_t scan_visits_every_key_in_order(mount_type_ const& mount) {
     failures += expect_status(stack, status_code_t::success_k);
     if (!stack) return failures;
 
-    single_collection_database_config_t const config = test_config(0, value_max_size_k, 64ull * 1024ull);
+    single_collection_database_config_t const config = test_config(0, value_max_size_k);
     expected<typename variable_database_t::database_unique_ptr_t> store = open_over<variable_database_t>(**stack,
                                                                                                          config);
     failures += expect(store.has_value());
@@ -1115,7 +1110,7 @@ std::size_t scan_visits_every_key_in_order(mount_type_ const& mount) {
         if (scan->state() != wanted.state) ++wrong_state;
         if (static_cast<std::uint64_t>(scan->size()) != wanted.bytes) ++wrong_size;
         ++visited;
-        scan->advance();
+        failures += expect(scan->advance().succeeded());
     }
     failures += expect_eq(visited, keys_k);
     failures += expect_eq(out_of_order, std::size_t {0});

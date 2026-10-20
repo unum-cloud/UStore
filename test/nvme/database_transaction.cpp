@@ -151,7 +151,6 @@ using value_buffer_t = std::array<byte_t, variable_width_max_k>;
     config.write_buffer_max_bytes = 1024ull * 1024ull;
     config.write_buffer_max_elements = 4096;
     config.lsm_tree.level_enlarge_factor = 4;
-    config.lsm_tree.lsm_level_0.max_bytes = 16ull * 1024ull * 1024ull;
     config.lsm_tree.lsm_level_0.sorted_run.value_size = shape == shape_t::inline_k  ? 1
                                                         : shape == shape_t::fixed_k ? fixed_width_k
                                                                                     : 0;

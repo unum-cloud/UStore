@@ -7,8 +7,9 @@ configure_file("${USTORE_COMPACTION_TEST_SOURCE}" "${USTORE_COMPACTION_HOST_SOUR
 add_executable(ustore_test_nvme_compaction_host "${USTORE_COMPACTION_HOST_SOURCE}")
 target_include_directories(ustore_test_nvme_compaction_host PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/test")
 target_compile_features(ustore_test_nvme_compaction_host PRIVATE cxx_std_20)
+# A fold's scratch arena allocates on ForkUnion's memory domains, which the host compactor reaches
 target_link_libraries(
-    ustore_test_nvme_compaction_host PRIVATE ustore_header smashtable::header forkunion::header stringzilla::header
+    ustore_test_nvme_compaction_host PRIVATE ustore_header smashtable::header forkunion::static stringzilla::header
                                              fmt::fmt ustore_warnings
 )
 if (USTORE_BUILD_TEST)
@@ -100,7 +101,9 @@ add_executable(
 target_include_directories(ustore_test_nvme_compaction PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/test")
 target_compile_features(ustore_test_nvme_compaction PRIVATE cxx_std_20)
 set_target_properties(ustore_test_nvme_compaction PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
-target_link_libraries(ustore_test_nvme_compaction PRIVATE ustore_nvme_compaction fmt::fmt ustore_warnings)
+target_link_libraries(
+    ustore_test_nvme_compaction PRIVATE ustore_nvme_compaction forkunion::static fmt::fmt ustore_warnings
+)
 if (USTORE_BUILD_TEST)
     add_test(NAME ustore_test_nvme_compaction COMMAND ustore_test_nvme_compaction)
 endif ()

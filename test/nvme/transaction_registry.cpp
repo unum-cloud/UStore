@@ -130,10 +130,9 @@ class test_store_t {
         }
         st::basic_vector<keyed_delta<stored_key_t>> deltas;
         changes.for_each_write([&](collection_id_t, stored_key_t const& stored_key, auto const& place) noexcept {
-            delta_view_t delta {delta_kind_t::remove_k, {}};
+            delta_view_t delta {static_cast<delta_kind_t>(place.kind), {}};
             std::span<byte_t const> const inserted = as_bytes_view(changes.insertions_buffer);
-            if (place.offset != tombstone_offset_k)
-                delta = {delta_kind_t::write_k, inserted.subspan(place.offset, place.size)};
+            if (place.size != 0) delta.bytes = inserted.subspan(place.offset, place.size);
             [[maybe_unused]] st::status_t const kept = deltas.push_back(keyed_delta<stored_key_t> {stored_key, delta});
         });
         if (deltas.empty()) return {};

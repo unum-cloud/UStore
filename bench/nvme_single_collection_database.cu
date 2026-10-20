@@ -52,7 +52,6 @@ struct single_collection_database_initial_config_t {
     std::size_t write_buffer_max_bytes = 0;
     std::size_t write_buffer_max_elements = 0;
     std::size_t level_enlarge_factor = 0;
-    std::size_t level_max_bytes = 0;
 };
 
 struct bench_config_t {
@@ -97,7 +96,6 @@ std::shared_ptr<single_collection_database<stored_key_t, value_layout_>> open_si
 
     config.collection.lsm_tree.level_enlarge_factor = initial_config.level_enlarge_factor;
 
-    config.collection.lsm_tree.lsm_level_0.max_bytes = initial_config.level_max_bytes;
     config.collection.lsm_tree.lsm_level_0.sorted_run.value_size = initial_config.value_size;
     config.collection.lsm_tree.lsm_level_0.sorted_run.value_max_size = initial_config.value_max_size;
 
@@ -1150,8 +1148,6 @@ void configure_bench_by_workloads(bench_config_t& bench_config, st::basic_vector
             "write_buffer_max_elements");
         bench_config.single_collection_database_1_byte.level_enlarge_factor = workload.get_value<std::size_t>(
             "level_enlarge_factor");
-        bench_config.single_collection_database_1_byte.level_max_bytes = workload.get_value<std::size_t>(
-            "level_max_bytes");
     }
 
     bench_config.single_collection_database_4_bytes.enabled = find_workload("4_bytes", workload);
@@ -1169,8 +1165,6 @@ void configure_bench_by_workloads(bench_config_t& bench_config, st::basic_vector
             "write_buffer_max_elements");
         bench_config.single_collection_database_4_bytes.level_enlarge_factor = workload.get_value<std::size_t>(
             "level_enlarge_factor");
-        bench_config.single_collection_database_4_bytes.level_max_bytes = workload.get_value<std::size_t>(
-            "level_max_bytes");
     }
 
     bench_config.single_collection_database_8_bytes.enabled = find_workload("8_bytes", workload);
@@ -1188,8 +1182,6 @@ void configure_bench_by_workloads(bench_config_t& bench_config, st::basic_vector
             "write_buffer_max_elements");
         bench_config.single_collection_database_8_bytes.level_enlarge_factor = workload.get_value<std::size_t>(
             "level_enlarge_factor");
-        bench_config.single_collection_database_8_bytes.level_max_bytes = workload.get_value<std::size_t>(
-            "level_max_bytes");
     }
 
     bench_config.single_collection_database_16_bytes.enabled = find_workload("16_bytes", workload);
@@ -1207,8 +1199,6 @@ void configure_bench_by_workloads(bench_config_t& bench_config, st::basic_vector
             "write_buffer_max_elements");
         bench_config.single_collection_database_16_bytes.level_enlarge_factor = workload.get_value<std::size_t>(
             "level_enlarge_factor");
-        bench_config.single_collection_database_16_bytes.level_max_bytes = workload.get_value<std::size_t>(
-            "level_max_bytes");
     }
 
     bench_config.single_collection_database_32_bytes.enabled = find_workload("32_bytes", workload);
@@ -1226,8 +1216,6 @@ void configure_bench_by_workloads(bench_config_t& bench_config, st::basic_vector
             "write_buffer_max_elements");
         bench_config.single_collection_database_32_bytes.level_enlarge_factor = workload.get_value<std::size_t>(
             "level_enlarge_factor");
-        bench_config.single_collection_database_32_bytes.level_max_bytes = workload.get_value<std::size_t>(
-            "level_max_bytes");
     }
 
     bench_config.single_collection_database_64_bytes.enabled = find_workload("64_bytes", workload);
@@ -1245,8 +1233,6 @@ void configure_bench_by_workloads(bench_config_t& bench_config, st::basic_vector
             "write_buffer_max_elements");
         bench_config.single_collection_database_64_bytes.level_enlarge_factor = workload.get_value<std::size_t>(
             "level_enlarge_factor");
-        bench_config.single_collection_database_64_bytes.level_max_bytes = workload.get_value<std::size_t>(
-            "level_max_bytes");
     }
 
     bench_config.single_collection_database_fixed_width.enabled = find_workload("fixed_width", workload);
@@ -1265,8 +1251,6 @@ void configure_bench_by_workloads(bench_config_t& bench_config, st::basic_vector
             "write_buffer_max_elements");
         bench_config.single_collection_database_fixed_width.level_enlarge_factor = workload.get_value<std::size_t>(
             "level_enlarge_factor");
-        bench_config.single_collection_database_fixed_width.level_max_bytes = workload.get_value<std::size_t>(
-            "level_max_bytes");
     }
 
     bench_config.single_collection_database_variable_width.enabled = find_workload("variable_width", workload);
@@ -1287,8 +1271,6 @@ void configure_bench_by_workloads(bench_config_t& bench_config, st::basic_vector
             workload.get_value<std::size_t>("write_buffer_max_elements");
         bench_config.single_collection_database_variable_width.level_enlarge_factor = workload.get_value<std::size_t>(
             "level_enlarge_factor");
-        bench_config.single_collection_database_variable_width.level_max_bytes = workload.get_value<std::size_t>(
-            "level_max_bytes");
     }
 }
 

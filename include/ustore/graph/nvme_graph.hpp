@@ -101,9 +101,6 @@ struct graph_store_config_t {
     /** Bytes one write buffer stages before it flushes. */
     std::size_t write_buffer_max_bytes = 8ull * 1024ull * 1024ull;
 
-    /** Bytes level zero admits before a compaction is due. */
-    std::size_t first_level_max_bytes = 64ull * 1024ull * 1024ull;
-
     /** How much deeper each level is than the one above it. */
     std::size_t level_enlarge_factor = 4;
 
@@ -119,7 +116,6 @@ struct graph_store_config_t {
         user.collection.cache_limit = cache_limit;
         user.collection.write_buffer_max_elements = write_buffer_max_elements;
         user.collection.write_buffer_max_bytes = write_buffer_max_bytes;
-        user.collection.first_level_max_bytes = first_level_max_bytes;
         user.collection.level_enlarge_factor = level_enlarge_factor;
         user.collection.value_size = 0;
         user.collection.value_max_size = value_max_size;

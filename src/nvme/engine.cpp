@@ -118,9 +118,6 @@ inline constexpr std::size_t engine_collection_buffer_bytes_k = 16ull * 1024ull 
 /** Writes one collection's write buffer holds at once. */
 inline constexpr std::size_t engine_collection_buffer_elements_k = 64ull * 1024ull;
 
-/** Bytes level zero of a collection admits before a compaction is due. */
-inline constexpr std::size_t engine_first_level_bytes_k = 16ull * 1024ull * 1024ull;
-
 /** Bytes one caller's transaction buffers, which it takes eagerly when it opens. */
 inline constexpr std::size_t engine_transaction_bytes_k = 4ull * 1024ull * 1024ull;
 
@@ -163,7 +160,6 @@ inline user_collection_config_t engine_collection_defaults() noexcept {
     config.cache_limit = engine_collection_buffer_bytes_k;
     config.write_buffer_max_elements = engine_collection_buffer_elements_k;
     config.write_buffer_max_bytes = engine_collection_buffer_bytes_k;
-    config.first_level_max_bytes = engine_first_level_bytes_k;
     config.value_max_size = engine_value_max_size_k;
     return config;
 }
@@ -1553,7 +1549,6 @@ inline status_t read_options(ustore_database_open_nvme_t const& arguments, resou
         take_unless_zero(collections.cache_limit, arguments.collection_cache_limit) &&
         take_unless_zero(collections.write_buffer_max_bytes, arguments.collection_write_buffer_max_bytes) &&
         take_unless_zero(collections.write_buffer_max_elements, arguments.collection_write_buffer_max_elements) &&
-        take_unless_zero(collections.first_level_max_bytes, arguments.collection_first_level_max_bytes) &&
         take_unless_zero(collections.level_enlarge_factor, arguments.collection_level_enlarge_factor) &&
         take_unless_zero(collections.value_size, arguments.collection_value_size) &&
         take_unless_zero(collections.value_max_size, arguments.collection_value_max_size);

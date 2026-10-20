@@ -136,8 +136,8 @@ using namespace unum::ustore::utilities;
 /** The numbers every case mounts with, which are the defaults: channels enough for a compaction to hold two at once. */
 constexpr fixture_config_t lsm_config_k {};
 
-/** The bytes level zero admits before a compaction is due, kept small so a few flushes reach it. */
-constexpr std::uint64_t level_zero_bytes_k = 256ull * 1024ull;
+/** The bytes one flushed write buffer holds, kept small so a few flushes fill level zero. */
+constexpr std::size_t write_buffer_bytes_k = 64ull * 1024ull;
 
 /** The largest value the collection under test admits. */
 constexpr stored_value_size_t value_max_size_k = 128ull * 1024ull;
@@ -162,7 +162,6 @@ struct lsm_types {
 /** The tree shape every case mounts, whose first level fills after a handful of flushes. */
 [[nodiscard]] lsm_tree_config_t test_tree_config() noexcept {
     lsm_tree_config_t config;
-    config.lsm_level_0.max_bytes = level_zero_bytes_k;
     config.lsm_level_0.sorted_run.value_max_size = value_max_size_k;
     config.level_enlarge_factor = 4;
     return config;
@@ -189,12 +188,16 @@ struct batch_t {
 
     /** The values back to back, in the order their key slots locate them. */
     st::basic_vector<byte_t> values;
+
+    /** The @c delta_kind_t of every key slot. */
+    st::basic_vector<std::uint8_t> kinds;
 };
 
-/** Lays @p wanted out as one run's key slots and values, which must already be in ascending key order. */
+/** Lays @p wanted out as one run's key slots, kinds and values, which must already be in ascending key order. */
 [[nodiscard]] std::size_t build_batch(std::span<expectation_t const> wanted, batch_t& into) {
     std::size_t failures = 0;
     failures += expect(into.key_slots.resize(wanted.size()) == st::status_t::success_k);
+    failures += expect(into.kinds.resize(wanted.size()) == st::status_t::success_k);
     if (failures != 0) return failures;
 
     std::uint64_t total = 0;
@@ -207,16 +210,13 @@ struct batch_t {
     std::uint64_t written = 0;
     for (std::size_t index = 0; index != wanted.size(); ++index) {
         expectation_t const& entry = wanted[index];
+        bool const erased = entry.state == select_result_t::erased_k;
         variable_slot_t slot;
         slot.stored_key = entry.stored_key;
-        if (entry.state == select_result_t::erased_k) slot.make_tombstone();
-        else if (entry.bytes == 0) {
-            slot.size = 0;
-            slot.location = empty_stored_value_offset_k;
-        }
-        else {
+        slot.location = static_cast<stored_value_offset_t>(location);
+        into.kinds[index] = static_cast<std::uint8_t>(erased ? delta_kind_t::remove_k : delta_kind_t::write_k);
+        if (!erased) {
             slot.size = static_cast<stored_value_size_t>(entry.bytes);
-            slot.location = static_cast<stored_value_offset_t>(location);
             for (std::uint64_t byte = 0; byte != entry.bytes; ++byte)
                 into.values[static_cast<std::size_t>(written + byte)] = painted(entry.seed, byte);
             location += entry.bytes;
@@ -235,7 +235,8 @@ template <typename tree_type_>
     failures += build_batch(wanted, batch);
     if (failures != 0) return failures;
     failures += expect(tree.flush(channel, std::span<variable_slot_t const> {batch.key_slots},
-                                  std::span<std::uint64_t const> {fresh_stamps(batch.key_slots.size())}, 0,
+                                  std::span<std::uint64_t const> {fresh_stamps(batch.key_slots.size())},
+                                  std::span<std::uint8_t const> {batch.kinds}, 0,
                                   std::span<byte_t const> {batch.values}, value_max_size_k)
                            .succeeded());
     return failures;
@@ -305,8 +306,7 @@ template <typename level_type_>
         for (std::size_t at = 0; at != count; ++at) {
             positions[at] = at;
             starts[at] = base + total;
-            auto const& slot = source.key_slot(at);
-            total += slot.is_tombstone() ? 0 : slot.size;
+            total += source.key_slot(at).size;
         }
         failures += expect(into.resize(base + total) == st::status_t::success_k);
         if (failures != 0) return failures;
@@ -331,8 +331,8 @@ template <typename level_type_, typename volume_type_>
     if (failures != 0) return failures;
     expected<sorted_run_t> written = sorted_run_t::write(
         volume, channel, uuid_generator(), std::span<variable_slot_t const> {batch.key_slots},
-        std::span<std::uint64_t const> {fresh_stamps(batch.key_slots.size())}, 0,
-        std::span<byte_t const> {batch.values}, value_max_size_k);
+        std::span<std::uint64_t const> {fresh_stamps(batch.key_slots.size())},
+        std::span<std::uint8_t const> {batch.kinds}, 0, std::span<byte_t const> {batch.values}, value_max_size_k);
     failures += expect(written.has_value());
     if (!written) return failures;
     failures += expect(level.bind_queue_pair(std::move(*written)).succeeded());
@@ -363,7 +363,7 @@ std::size_t flush_lands_on_level_zero(mount_type_ const& mount) {
     expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
     failures += expect(volume.has_value());
     if (!volume) return failures;
-    expected<tree_t> tree = tree_t::mount(*volume, test_tree_config());
+    expected<tree_t> tree = tree_t::mount(*volume, test_tree_config(), write_buffer_bytes_k);
     failures += expect(tree.has_value());
     if (!tree) return failures;
 
@@ -426,7 +426,7 @@ std::size_t overlapping_runs_take_the_youngest(mount_type_ const& mount) {
     expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
     failures += expect(volume.has_value());
     if (!volume) return failures;
-    expected<tree_t> tree = tree_t::mount(*volume, test_tree_config());
+    expected<tree_t> tree = tree_t::mount(*volume, test_tree_config(), write_buffer_bytes_k);
     failures += expect(tree.has_value());
     if (!tree) return failures;
 
@@ -510,7 +510,7 @@ std::size_t compaction_drops_tombstones_at_the_bottom(mount_type_ const& mount) 
     expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
     failures += expect(volume.has_value());
     if (!volume) return failures;
-    expected<tree_t> tree = tree_t::mount(*volume, test_tree_config());
+    expected<tree_t> tree = tree_t::mount(*volume, test_tree_config(), write_buffer_bytes_k);
     failures += expect(tree.has_value());
     if (!tree) return failures;
 
@@ -542,8 +542,8 @@ std::size_t compaction_drops_tombstones_at_the_bottom(mount_type_ const& mount) 
     }
 
     failures += expect(tree->needs_compaction(tree->levels()));
-    expected<compaction_outcome_t> const outcome = tree->compact(reading->channel(), writing->channel(),
-                                                                 compaction_placement_t::host_k, nullptr);
+    expected<compaction_outcome_t> const outcome = tree->compact(
+        reading->channel(), writing->channel(), compaction_placement_t::host_k, nullptr, last_write_fold {});
     failures += expect(outcome.has_value());
     if (!outcome) return failures;
     failures += expect(*outcome == compaction_outcome_t::published_k);
@@ -625,13 +625,15 @@ std::size_t intermediate_merge_keeps_tombstones(mount_type_ const& mount) {
     request.placement = compaction_placement_t::host_k;
 
     request.depth = lsm_level_depth_t::intermediate_k;
-    expected<level_t> kept = merger_t::merge(*volume, reading->channel(), writing->channel(), request);
+    expected<level_t> kept = merger_t::merge(*volume, reading->channel(), writing->channel(), request,
+                                             last_write_fold {});
     failures += expect_status(kept, status_code_t::success_k);
     if (!kept) return failures;
     failures += expect_eq(kept->population_count(), static_cast<std::uint64_t>(keys_k));
 
     request.depth = lsm_level_depth_t::bottom_k;
-    expected<level_t> dropped = merger_t::merge(*volume, reading->channel(), writing->channel(), request);
+    expected<level_t> dropped = merger_t::merge(*volume, reading->channel(), writing->channel(), request,
+                                                last_write_fold {});
     failures += expect(dropped.has_value());
     if (!dropped) return failures;
     failures += expect_eq(dropped->population_count(), static_cast<std::uint64_t>(keys_k - erased_keys));
@@ -677,7 +679,7 @@ std::size_t cancelled_compaction_leaves_nothing(mount_type_ const& mount) {
     expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
     failures += expect(volume.has_value());
     if (!volume) return failures;
-    expected<tree_t> tree = tree_t::mount(*volume, test_tree_config());
+    expected<tree_t> tree = tree_t::mount(*volume, test_tree_config(), write_buffer_bytes_k);
     failures += expect(tree.has_value());
     if (!tree) return failures;
 
@@ -716,8 +718,8 @@ std::size_t cancelled_compaction_leaves_nothing(mount_type_ const& mount) {
 
     compaction_cancellation_t cancellation;
     cancellation.raise();
-    expected<compaction_outcome_t> const outcome = tree->compact(reading->channel(), writing->channel(),
-                                                                 compaction_placement_t::host_k, &cancellation);
+    expected<compaction_outcome_t> const outcome = tree->compact(
+        reading->channel(), writing->channel(), compaction_placement_t::host_k, &cancellation, last_write_fold {});
     failures += expect(!outcome.has_value());
     failures += expect_status(outcome, status_code_t::uninitialized_k);
 
@@ -740,8 +742,8 @@ std::size_t cancelled_compaction_leaves_nothing(mount_type_ const& mount) {
     failures += check_model(*tree, guard->channel(), std::span<expectation_t const> {model});
 
     // The same tree still compacts once nobody is cancelling it.
-    expected<compaction_outcome_t> const again = tree->compact(reading->channel(), writing->channel(),
-                                                               compaction_placement_t::host_k, nullptr);
+    expected<compaction_outcome_t> const again = tree->compact(
+        reading->channel(), writing->channel(), compaction_placement_t::host_k, nullptr, last_write_fold {});
     failures += expect(again.has_value());
     if (again) failures += expect(*again == compaction_outcome_t::published_k);
     failures += check_model(*tree, guard->channel(), std::span<expectation_t const> {model});
@@ -771,7 +773,7 @@ std::size_t raced_cancellation_is_all_or_nothing(mount_type_ const& mount) {
     expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
     failures += expect(volume.has_value());
     if (!volume) return failures;
-    expected<tree_t> tree = tree_t::mount(*volume, test_tree_config());
+    expected<tree_t> tree = tree_t::mount(*volume, test_tree_config(), write_buffer_bytes_k);
     failures += expect(tree.has_value());
     if (!tree) return failures;
 
@@ -807,8 +809,8 @@ std::size_t raced_cancellation_is_all_or_nothing(mount_type_ const& mount) {
         for (std::size_t spins = 0; spins != 64; ++spins) fu::preferred_yield_t {}(spins, spins, std::size_t {0});
         cancellation.raise();
     }};
-    expected<compaction_outcome_t> const outcome = tree->compact(reading->channel(), writing->channel(),
-                                                                 compaction_placement_t::host_k, &cancellation);
+    expected<compaction_outcome_t> const outcome = tree->compact(
+        reading->channel(), writing->channel(), compaction_placement_t::host_k, &cancellation, last_write_fold {});
     raiser.join();
 
     failures += expect_eq(writing->channel().streams().available_buffers(), lsm_config_k.stream_buffers);
@@ -911,12 +913,14 @@ case_result_t both_compactors_agree(mount_type_ const& mount) {
     request.value_max_size = value_max_size_k;
 
     request.placement = compaction_placement_t::host_k;
-    expected<level_t> host = merger_t::merge(*volume, reading->channel(), writing->channel(), request);
+    expected<level_t> host = merger_t::merge(*volume, reading->channel(), writing->channel(), request,
+                                             last_write_fold {});
     failures += expect(host.has_value());
     if (!host) return failures;
 
     request.placement = compaction_placement_t::device_k;
-    expected<level_t> device = merger_t::merge(*volume, reading->channel(), writing->channel(), request);
+    expected<level_t> device = merger_t::merge(*volume, reading->channel(), writing->channel(), request,
+                                               last_write_fold {});
     if (!device) {
         bool const no_compactor = device == status_code_t::unsupported_k || device == status_code_t::device_k;
         if (!no_compactor) failures += expect_status(device, status_code_t::unsupported_k);
@@ -1034,7 +1038,8 @@ std::size_t merge_charges_no_index_copy(mount_type_ const& mount) {
     request.depth = lsm_level_depth_t::intermediate_k;
     request.value_max_size = value_max_size_k;
     request.placement = compaction_placement_t::host_k;
-    expected<level_t> merged = merger_t::merge(*volume, reading->channel(), writing->channel(), request);
+    expected<level_t> merged = merger_t::merge(*volume, reading->channel(), writing->channel(), request,
+                                               last_write_fold {});
     allocation_watch_t const seen = watch;
     watch = allocation_watch_t {};
     failures += expect_status(merged, status_code_t::success_k);
@@ -1077,7 +1082,7 @@ std::size_t batched_read_holds_its_depth(mount_type_ const& mount) {
     expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
     failures += expect(volume.has_value());
     if (!volume) return failures;
-    expected<tree_t> tree = tree_t::mount(*volume, test_tree_config());
+    expected<tree_t> tree = tree_t::mount(*volume, test_tree_config(), write_buffer_bytes_k);
     failures += expect(tree.has_value());
     if (!tree) return failures;
 

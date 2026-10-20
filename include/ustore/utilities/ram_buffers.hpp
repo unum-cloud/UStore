@@ -203,6 +203,24 @@ struct arena_allocator {
     }
 };
 
+/** An arena one call keeps on its own stack, on the calling thread's memory, freeing every block it grew when it
+ *  dies, as a fold's scratch is. */
+class local_arena_t {
+  public:
+    local_arena_t() noexcept = default;
+    local_arena_t(local_arena_t const&) = delete;
+    local_arena_t& operator=(local_arena_t const&) = delete;
+    ~local_arena_t() noexcept { arena_free_blocks(handle_); }
+
+    /** An allocator drawing from this arena, valid while it lives. */
+    [[nodiscard]] arena_allocator<byte_t> allocator() noexcept { return arena_allocator<byte_t> {&handle_}; }
+
+  private:
+
+    /** The chain of blocks, empty until something allocates. */
+    ustore_arena_handle_t handle_ {};
+};
+
 /** The status of growing a SmashTable container, which fails only when its allocator runs out of memory. */
 inline status_t growth_status(st::status_t status) noexcept {
     if (st::succeeded(status)) return {};

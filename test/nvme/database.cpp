@@ -48,9 +48,6 @@ constexpr fixture_config_t database_config_k {.shared_io_channels = 8};
 /** The largest value the variable-width collections under test admit. */
 constexpr stored_value_size_t value_max_size_k = 4096;
 
-/** Bytes level zero admits where a case wants a tree of depth, so one flushed round overfills it. */
-constexpr std::uint64_t shallow_level_bytes_k = 64ull * 1024ull;
-
 /** The keys every case of this suite drives, and the two ways a collection is named. */
 using stored_key_t = std::uint64_t;
 using any_collection_id_t = std::variant<collection_id_t, collection_alphanumeric_id_t>;
@@ -95,7 +92,6 @@ struct database_types {
     config.write_buffer_max_bytes = 1024ull * 1024ull;
     config.write_buffer_max_elements = 4096;
     config.lsm_tree.level_enlarge_factor = 4;
-    config.lsm_tree.lsm_level_0.max_bytes = 16ull * 1024ull * 1024ull;
     config.lsm_tree.lsm_level_0.sorted_run.value_size = value_size;
     config.lsm_tree.lsm_level_0.sorted_run.value_max_size = value_max_size;
     return config;
@@ -479,9 +475,10 @@ std::size_t catalog_survives_reopen(mount_type_ const& mount) {
     collection_config_t numbers_config = test_config(8, 0);
     collection_config_t blobs_config = test_config(0, value_max_size_k);
     collection_config_t fixed_config = test_config(512, 0);
-    numbers_config.lsm_tree.lsm_level_0.max_bytes = shallow_level_bytes_k;
-    blobs_config.lsm_tree.lsm_level_0.max_bytes = shallow_level_bytes_k;
-    fixed_config.lsm_tree.lsm_level_0.max_bytes = shallow_level_bytes_k;
+    // The smallest factor makes level zero due at two flushed runs, so two rounds give the tree depth.
+    numbers_config.lsm_tree.level_enlarge_factor = storage_limits_t::level_min_enlarge_factor_k;
+    blobs_config.lsm_tree.level_enlarge_factor = storage_limits_t::level_min_enlarge_factor_k;
+    fixed_config.lsm_tree.level_enlarge_factor = storage_limits_t::level_min_enlarge_factor_k;
 
     expected<collection_id_t> const numbers = create_named(*(*stack)->store, "numbers", numbers_config);
     expected<collection_id_t> const blobs = create_named(*(*stack)->store, "blobs", blobs_config);
@@ -1353,11 +1350,9 @@ std::size_t readers_beside_committers_and_flushes(mount_type_ const& mount) {
     if (!stack) return failures;
     database_t& store = *(*stack)->store;
 
-    // Memory runs of a few dozen records and a shallow level zero, so the committers merge, flush and compact beside
-    // the flusher.
+    // Memory runs of a few dozen records, so the committers merge, flush and compact beside the flusher.
     collection_config_t config = test_config(0, value_max_size_k);
     config.write_buffer_max_elements = 32;
-    config.lsm_tree.lsm_level_0.max_bytes = 16 * 1024;
     std::array<collection_id_t, committers_k> named {};
     for (std::size_t committer = 0; committer != committers_k; ++committer) {
         expected<collection_id_t> const created = create_named(

@@ -43,7 +43,7 @@
 #include <cstdint> // `std::uint8_t`, `std::int32_t`, `std::uint16_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`, `std::memset`
 
-#include <algorithm>   // `std::min`
+#include <algorithm>   // `std::copy`, `std::min`
 #include <array>       // `std::array`
 #include <atomic>      // `std::atomic_thread_fence`, `std::memory_order`
 #include <concepts>    // `std::same_as`
@@ -242,22 +242,24 @@ class grouped_write_buffer {
         std::size_t elements_size_bytes;
     };
 
-    /** Where one written value sits in the insertions buffer, or that the key was removed, and from when the
-     *  transaction watches the key for another commit writing it. */
+    /** Where one written value sits in the insertions buffer, what the write does, and from when the transaction
+     *  watches the key for another commit writing it. */
     struct stored_value_place_t {
 
-        /** The first byte of the value, @c tombstone_offset_k for a removal and
-         *  @c empty_stored_value_offset_k for a value of no bytes. */
+        /** The first byte of the value, zero for a removal and for a value of no bytes. */
         stored_value_offset_t offset;
 
         /** The bytes of the value. */
         stored_value_size_t size;
 
+        /** What the write does to the key. */
+        delta_kind_t kind;
+
         /** The stamp a commit writing the key after conflicts, or @c invalid_transaction_stamp_k when unwatched. */
         transaction_stamp_t watch_stamp;
     };
 
-    static_assert(sizeof(stored_value_place_t) == 16, "A write's watch lives in the bytes its place had");
+    static_assert(sizeof(stored_value_place_t) == 24, "A write's kind takes the padding before its watch, not a word");
 
     /** One collection's share of the buffer. */
     struct group_t {
@@ -450,7 +452,7 @@ inline write_buffer_status_t grouped_write_buffer<stored_key_>::status(group_id_
             write_buffer_status_t::found_k,
             write_buffer_status_t::removed_k,
         };
-        result = results[entry.value().offset == tombstone_offset_k];
+        result = results[entry.value().kind == delta_kind_t::remove_k];
     });
 
     return result;
@@ -465,7 +467,7 @@ inline status_t grouped_write_buffer<stored_key_>::stored_value_size(group_id_t 
     if (iterator == groups_by_id.end()) return status;
 
     iterator.value().stored_values.probe_to_find(stored_key, [&](auto const& entry) noexcept {
-        if (entry.value().offset != tombstone_offset_k) size = entry.value().size;
+        if (entry.value().kind != delta_kind_t::remove_k) size = entry.value().size;
         status = status_t {};
     });
 
@@ -483,11 +485,11 @@ inline status_t grouped_write_buffer<stored_key_>::select(group_id_t id, stored_
 
     iterator.value().stored_values.probe_to_find(stored_key, [&](auto const& entry) noexcept {
         auto const& stored_value_place = entry.value();
-        if (stored_value_place.offset == tombstone_offset_k) {
+        if (stored_value_place.kind == delta_kind_t::remove_k) {
             status = status_t {status_code_t::not_found_k, "Object not exists"};
             return;
         }
-        if (stored_value_place.offset == empty_stored_value_offset_k) {
+        if (stored_value_place.size == 0) {
             size = 0;
             status = status_t {};
             return;
@@ -512,7 +514,8 @@ inline write_buffer_status_t grouped_write_buffer<stored_key_>::find(group_id_t 
                                                                      stored_value_location_& location) const noexcept {
 
     location.size_bytes = 0;
-    location.offset = tombstone_offset_k;
+    location.offset = 0;
+    location.kind = delta_kind_t::remove_k;
     location.recipient_id = reinterpret_cast<std::uint64_t>(this);
     location.recipient_state_id = 0;
 
@@ -524,8 +527,9 @@ inline write_buffer_status_t grouped_write_buffer<stored_key_>::find(group_id_t 
         auto const& stored_value_place = entry.value();
         location.offset = stored_value_place.offset;
         location.size_bytes = stored_value_place.size;
+        location.kind = stored_value_place.kind;
         constexpr write_buffer_status_t results[2] = {write_buffer_status_t::found_k, write_buffer_status_t::removed_k};
-        result = results[stored_value_place.offset == tombstone_offset_k];
+        result = results[location.kind == delta_kind_t::remove_k];
     });
 
     return result;
@@ -606,7 +610,7 @@ inline status_t grouped_write_buffer<stored_key_>::add(group_id_t id, config_pro
     if (group->stored_values.reserve_more(1) == group_t::stored_values_t::reserve_result_t::failed_k)
         return status_t {status_code_t::out_of_memory_k, "No room for another key"};
 
-    stored_value_offset_t inserted_offset = empty_stored_value_offset_k;
+    stored_value_offset_t inserted_offset = 0;
     if (!stored_value.empty()) {
         inserted_offset = static_cast<stored_value_offset_t>(next_inserted_offset);
         std::memcpy(insertions_buffer.data() + inserted_offset, stored_value.data(), stored_value.size());
@@ -614,7 +618,7 @@ inline status_t grouped_write_buffer<stored_key_>::add(group_id_t id, config_pro
     }
 
     stored_value_place_t const place {inserted_offset, static_cast<stored_value_size_t>(stored_value.size()),
-                                      watch_stamp};
+                                      delta_kind_t::write_k, watch_stamp};
     auto insert = [&](auto& unused_slot) noexcept {
         new (&unused_slot.key_ref()) stored_key_t {stored_key};
         new (&unused_slot.value_ref()) stored_value_place_t {place};
@@ -651,7 +655,7 @@ inline status_t grouped_write_buffer<stored_key_>::mark_as_removed(group_id_t id
     if (group->stored_values.reserve_more(1) == group_t::stored_values_t::reserve_result_t::failed_k)
         return status_t {status_code_t::out_of_memory_k, "No room for another key"};
 
-    stored_value_place_t const place {tombstone_offset_k, 0, watch_stamp};
+    stored_value_place_t const place {0, 0, delta_kind_t::remove_k, watch_stamp};
     auto insert = [&](auto& unused_slot) noexcept {
         new (&unused_slot.key_ref()) stored_key_t {stored_key};
         new (&unused_slot.value_ref()) stored_value_place_t {place};
@@ -748,8 +752,9 @@ inline bool grouped_write_buffer<stored_key_>::can_fit(std::size_t stored_values
 
     auto used_memory = next_inserted_offset;
     bool has_element_place = elements_count_ + stored_values_count <= elements_max_count_;
+    // A place names its offset in 32 bits, which every value of the buffer stays within.
     bool has_enough_space = (used_memory + stored_values_sum_size <= capacity_bytes_) &
-                            (used_memory + stored_values_sum_size <= empty_stored_value_offset_k);
+                            (used_memory + stored_values_sum_size <= std::numeric_limits<stored_value_offset_t>::max());
     return has_element_place & has_enough_space;
 }
 
@@ -1607,7 +1612,7 @@ class database_transaction {
         if (group == data_.changes.groups_by_id.end()) return;
         [[maybe_unused]] st::status_t const walked = group.value().stored_values.for_each(
             [&](auto const& entry) noexcept {
-                if (entry.value().offset == tombstone_offset_k)
+                if (entry.value().kind == delta_kind_t::remove_k)
                     callback(entry.key(), write_buffer_status_t::removed_k, stored_value_size_t {0});
                 else callback(entry.key(), write_buffer_status_t::found_k, entry.value().size);
             });
@@ -1929,9 +1934,6 @@ struct collection_record_t {
     /** The UUID the catalog, every commit and the C ABI address the collection by. */
     collection_id_t id = collection_invalid_id_k;
 
-    /** Bytes level zero admits before a compaction is due. */
-    std::uint64_t first_level_max_bytes = 0;
-
     /** How fast the bytes a level admits grow with its number. */
     std::uint64_t level_enlarge_factor = 0;
 
@@ -1972,7 +1974,6 @@ struct collection_record_t {
         config.write_buffer_max_bytes = static_cast<std::size_t>(write_buffer_max_bytes);
         config.write_buffer_max_elements = static_cast<std::size_t>(write_buffer_max_elements);
         config.lsm_tree.level_enlarge_factor = static_cast<std::size_t>(level_enlarge_factor);
-        config.lsm_tree.lsm_level_0.max_bytes = static_cast<std::size_t>(first_level_max_bytes);
         config.lsm_tree.lsm_level_0.sorted_run.value_size = static_cast<stored_value_size_t>(value_size);
         config.lsm_tree.lsm_level_0.sorted_run.value_max_size = static_cast<stored_value_size_t>(value_max_size);
         return config;
@@ -1985,8 +1986,11 @@ struct collection_record_t {
 
 /**
  *  @brief The claim a database's maintenance, catalog and blob writes run under, which callers park on rather than
- *      spin on: a count of takes and releases, even while free and odd while held, so a caller parked on one holder
- *      wakes once that holder lets it go, whoever takes it next.
+ *      spin on, so a caller parked on one holder wakes once that holder lets it go, whoever takes it next.
+ *
+ *  The claim is one word kept as ForkUnion's generation clock: @b odd while held and @b even while free, stepped only
+ *  by the take that finds it even and by its holder's release, so every generation advances it by two. A take sets
+ *  the held bit, which leaves an odd word as it was, and answers by the parity it read; a release adds one.
  *
  *  A committer finding it held returns at once rather than waiting, and every holder looks at the views again after
  *  it lets go. The fence after each release pairs with the fence before each attempt, so either the committer takes
@@ -1995,17 +1999,13 @@ struct collection_record_t {
 class parking_claim_t {
   public:
 
-    /** Takes the claim, parked while another caller holds it. */
+    /** Takes the claim, parked on each generation it finds held until that holder lets it go. */
     void take() noexcept {
-        fu::preferred_atomic_ref<std::uint32_t> const word {word_};
-        for (std::uint32_t seen = word.load(std::memory_order_relaxed);;) {
-            if (seen % 2 == 0) {
-                if (word.compare_exchange_weak(seen, seen + 1, std::memory_order_acquire, std::memory_order_relaxed))
-                    return;
-                continue;
-            }
-            st::standard_waiting_policy_t {}.wait_until_changed(word_, seen);
-            seen = word.load(std::memory_order_relaxed);
+        fu::preferred_atomic_ref<std::uint32_t> const epoch {epoch_};
+        // Only the held bit of the old word is tested, so x86 sets it with `lock bts` and reloads the word to park on.
+        while (epoch.fetch_or(1, std::memory_order_acquire) % 2 != 0) {
+            std::uint32_t const seen = epoch.load(std::memory_order_relaxed);
+            if (seen % 2 != 0) st::standard_waiting_policy_t {}.wait_until_changed(epoch_, seen);
         }
     }
 
@@ -2013,31 +2013,31 @@ class parking_claim_t {
     [[nodiscard]] bool take_if_free() noexcept {
         // Pairs with the fence after a release: either this reads the release, or that holder reads what came before.
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        fu::preferred_atomic_ref<std::uint32_t> const word {word_};
-        std::uint32_t seen = word.load(std::memory_order_relaxed);
-        return seen % 2 == 0 &&
-               word.compare_exchange_strong(seen, seen + 1, std::memory_order_acquire, std::memory_order_relaxed);
+        return fu::preferred_atomic_ref<std::uint32_t> {epoch_}.fetch_or(1, std::memory_order_acquire) % 2 == 0;
     }
 
     /** Parks until the caller holding the claim now lets it go, or returns at once while nobody holds it. */
     void wait_until_released() noexcept {
-        std::uint32_t const seen = fu::preferred_atomic_ref<std::uint32_t> {word_}.load(std::memory_order_acquire);
-        if (seen % 2 != 0) st::standard_waiting_policy_t {}.wait_until_changed(word_, seen);
+        fu::preferred_atomic_ref<std::uint32_t> const epoch {epoch_};
+        std::uint32_t const seen = epoch.load(std::memory_order_acquire);
+        if (seen % 2 == 0) return;
+        // The wait reloads relaxed; this reload acquires, so a woken caller reads what the holder wrote at once.
+        do st::standard_waiting_policy_t {}.wait_until_changed(epoch_, seen);
+        while (epoch.load(std::memory_order_acquire) == seen);
     }
 
     /** Hands the claim back, which only its holder does, and wakes every caller parked on it; the holder looks at the
      *  views again only after this. */
     void release() noexcept {
-        fu::preferred_atomic_ref<std::uint32_t> const word {word_};
-        word.store(word.load(std::memory_order_relaxed) + 1, std::memory_order_release);
+        fu::preferred_atomic_ref<std::uint32_t> {epoch_}.add(1, std::memory_order_release);
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        st::standard_waiting_policy_t {}.notify_waiters(word_);
+        st::standard_waiting_policy_t {}.notify_waiters(epoch_);
     }
 
   private:
 
-    /** Even while free, odd while held, off every reader's line. */
-    alignas(fu::default_alignment_k) std::uint32_t word_ = 0;
+    /** The claim's generation: odd while held, even while free, stepped by whoever takes or lets it go. */
+    alignas(fu::default_alignment_k) std::uint32_t epoch_ = 0;
 };
 
 /**
@@ -2488,26 +2488,44 @@ class basic_database {
      *  @param[in] stamp The stamp a reader is pinned at, which sees the newest version at or below it.
      *  @param[in] thread_index The executor thread walking, which announces on its own epoch slot.
      *
-     *  @note The walk holds the view it loaded, which a flush or a compaction waits for, so @p visitor calls nothing
-     *      of this database.
+     *  @note The walk reads one page of keys at a time inside the epochs, finding the collection again for each, and
+     *      hands a page to @p visitor outside them, so a commit waits for one page at most; a collection dropped
+     *      meanwhile ends the walk with @c not_found_k.
      */
     template <typename visitor_type_>
     status_t scan(any_collection_id_t const& id, stored_key_t from, visitor_type_&& visitor,
                   transaction_stamp_t stamp = head_stamp_k, std::size_t thread_index = outside_executor_k) noexcept {
-        reader_t const inside = ledger_.epochs().enter(thread_index);
-        collection_entry_t const* const found = entry_at_in_(catalog_entries_(), id);
-        if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
-        return std::visit(
-            [&](auto const& collection) noexcept -> status_t {
-                using scanner_t =
-                    collection_scanner<typename std::remove_cvref_t<decltype(collection)>::key_slot_t, volume_t>;
-                auto [scanner, over_status] = scanner_t::over(collection, from, stamp, thread_index);
-                if (over_status.failed()) return over_status;
-                for (; !scanner.reached_end(); scanner.advance())
-                    if (!visitor(scanner.stored_key(), scanner.state(), scanner.size())) break;
-                return {};
-            },
-            found->held);
+        // A head walk pins the stamp it starts at, so every page reads the same commits.
+        stamp_pin_t pin;
+        if (stamp == head_stamp_k) stamp = ledger_.pin_reader(pin);
+        std::array<scan_entry<stored_key_t>, scan_page_keys_k<stored_key_t>> page;
+        for (;;) {
+            std::size_t count = 0;
+            bool follows = false;
+            {
+                reader_t const inside = ledger_.epochs().enter(thread_index);
+                collection_entry_t const* const found = entry_at_in_(catalog_entries_(), id);
+                if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
+                status_t const read = std::visit(
+                    [&](auto const& collection) noexcept -> status_t {
+                        using collection_t = std::remove_cvref_t<decltype(collection)>;
+                        using scanner_t = collection_scanner<typename collection_t::key_slot_t, volume_t,
+                                                             typename collection_t::fold_t>;
+                        auto [scanner, over_status] = scanner_t::over(collection, from, stamp, thread_index);
+                        if (over_status.failed()) return over_status;
+                        std::span<scan_entry<stored_key_t> const> const entries = scanner.page();
+                        std::copy(entries.begin(), entries.end(), page.begin());
+                        count = entries.size();
+                        follows = scanner.follows(from);
+                        return {};
+                    },
+                    found->held);
+                if (read.failed()) return read;
+            }
+            for (std::size_t index = 0; index != count; ++index)
+                if (!visitor(page[index].stored_key, page[index].state, page[index].size)) return {};
+            if (!follows) return {};
+        }
     }
 
 #pragma endregion Lookups
@@ -2603,12 +2621,11 @@ class basic_database {
     }
 
     /**
-     *  @brief Once @p collection_id is due, merges every collection's memory runs by generation, and flushes and
-     *      compacts those holding their bounds, which every commit runs for the collections it wrote once it lands.
+     *  @brief Once @p collection_id is due, merges its memory runs by generation, and flushes and compacts them once
+     *      they hold their bounds, which every commit runs for the collections it wrote once it lands.
      *
      *  Returns at once while another caller holds the claim, since that holder looks at every collection again after
-     *  it lets go, so no commit waits behind another's maintenance and nothing a commit made due stays due once every
-     *  call holding the claim returned.
+     *  it lets go, so no commit waits behind another's maintenance.
      *  @note Called outside the ledger's epochs.
      */
     status_t maintain(collection_id_t collection_id) noexcept {
@@ -2621,7 +2638,9 @@ class basic_database {
         }
         claim_guard_t const held = claim_guard_t::taken_if_free(*this);
         if (!held.holding()) return {};
-        return maintain_due_();
+        std::size_t const position = position_at_(any_collection_id_t {collection_id});
+        if (position == collections_.size()) return {};
+        return maintain_collection_(*collections_[position]);
     }
 
     /** How many memory runs @p id's collection holds and how many commits they hold, or none for a missing one. */
@@ -2688,7 +2707,6 @@ class basic_database {
                              sealed_commit<stored_key_t>& sealed) noexcept {
         auto const group = changes.groups_by_id.find(collection_id);
         if (group == changes.groups_by_id.end()) return {};
-        // The transaction's own buffer keeps its sentinels, which become kinds here.
         st::basic_vector<keyed_delta<stored_key_t>, constrained_allocator<keyed_delta<stored_key_t>>> deltas {
             constrained_allocator<keyed_delta<stored_key_t>> {resources_->memory_constraint}};
         if (deltas.reserve(group.value().stored_values.size()) != st::status_t::success_k)
@@ -2696,9 +2714,8 @@ class basic_database {
         [[maybe_unused]] st::status_t const walked = group.value().stored_values.for_each(
             [&](auto const& entry) noexcept {
                 auto const& place = entry.value();
-                delta_view_t delta {delta_kind_t::write_k, {}};
-                if (place.offset == tombstone_offset_k) delta.kind = delta_kind_t::remove_k;
-                else if (place.offset != empty_stored_value_offset_k)
+                delta_view_t delta {place.kind, {}};
+                if (place.size != 0)
                     delta.bytes = as_bytes_view(changes.insertions_buffer).subspan(place.offset, place.size);
                 [[maybe_unused]] st::status_t const placed = deltas.push_back(
                     st::assume_reserved, keyed_delta<stored_key_t> {entry.key(), delta});
@@ -3053,20 +3070,24 @@ class basic_database {
         return {};
     }
 
-    /** Merges every collection's memory runs by generation, and flushes and compacts those holding their bounds,
-     *  holding the claim; answers the first failure, after trying every collection. */
+    /** Merges @p entry's memory runs by generation, and flushes and compacts them once they hold their bounds, holding
+     *  the claim. */
+    status_t maintain_collection_(collection_entry_t& entry) noexcept {
+        return std::visit(
+            [&](auto& collection) noexcept -> status_t {
+                if (status_t const merged = collection.merge_memory_runs(); merged.failed()) return merged;
+                if (!collection.flush_due()) return {};
+                return flush_and_compact_(collection);
+            },
+            entry.held);
+    }
+
+    /** Maintains every collection, holding the claim; answers the first failure, after trying every collection. */
     status_t maintain_due_() noexcept {
         status_t first;
-        for (entry_pointer_t const& entry : collections_) {
-            status_t const maintained = std::visit(
-                [&](auto& collection) noexcept -> status_t {
-                    if (status_t const merged = collection.merge_memory_runs(); merged.failed()) return merged;
-                    if (!collection.flush_due()) return {};
-                    return flush_and_compact_(collection);
-                },
-                entry->held);
-            if (maintained.failed() && first.succeeded()) first = maintained;
-        }
+        for (entry_pointer_t const& entry : collections_)
+            if (status_t const maintained = maintain_collection_(*entry); maintained.failed() && first.succeeded())
+                first = maintained;
         return first;
     }
 
@@ -3080,19 +3101,19 @@ class basic_database {
     }
 
     /**
-     *  @brief Hands the claim back, then looks at every collection again and takes the claim back to maintain them
-     *      for as long as one is due, so a commit that found the claim held left its maintenance to this caller.
+     *  @brief Hands the claim back, then looks once more at every collection and, if one is due and the claim is
+     *      still free, takes it back to maintain them, so a commit that found the claim held left its maintenance to
+     *      this caller.
      *
-     *  A caller that finds the claim taken again stops, since the new holder looks once more after it lets go, and so
-     *  does one whose maintenance failed, which the next commit meets again.
+     *  A caller that finds the claim taken again stops, since the new holder looks once more after it lets go, and a
+     *  failed maintenance is met again by the next commit.
      */
     void release_claim_() noexcept {
         claim_.release();
-        while (maintenance_due_() && claim_.take_if_free()) {
-            status_t const maintained = maintain_due_();
-            claim_.release();
-            if (maintained.failed()) return;
-        }
+        // One look covers a commit that found the claim held; work due after it waits for its collection's next commit.
+        if (!maintenance_due_() || !claim_.take_if_free()) return;
+        [[maybe_unused]] status_t const maintained = maintain_due_();
+        claim_.release();
     }
 
     /** Takes the claim and then a shared channel, which every call that moves bytes runs under. */
@@ -3231,7 +3252,6 @@ class basic_database {
             record.volume = static_cast<std::uint16_t>(entry.volume);
             record.value_size = entry.config.lsm_tree.lsm_level_0.sorted_run.value_size;
             record.value_max_size = entry.config.lsm_tree.lsm_level_0.sorted_run.value_max_size;
-            record.first_level_max_bytes = entry.config.lsm_tree.lsm_level_0.max_bytes;
             record.level_enlarge_factor = entry.config.lsm_tree.level_enlarge_factor;
             record.cache_limit = entry.config.cache_limit;
             record.write_buffer_max_bytes = entry.config.write_buffer_max_bytes;
@@ -4208,7 +4228,7 @@ class single_collection_database_transaction {
         select_result_t answer = select_result_t::nothing_k;
         data_.changes.stored_values.probe_to_find(stored_key, [&](auto const& entry) noexcept {
             auto const& place = entry.value();
-            if (place.offset == tombstone_offset_k) {
+            if (place.kind == delta_kind_t::remove_k) {
                 answer = select_result_t::erased_k;
                 return;
             }
@@ -4496,11 +4516,7 @@ class basic_single_collection_database {
     [[nodiscard]] stored_value_size_t value_max_size() const noexcept { return collection_.value_max_size(); }
 
     /** Whether a value of @p size bytes is one this database's layout can hold. */
-    [[nodiscard]] bool admits(std::size_t size) const noexcept {
-        if constexpr (is_fixed(value_layout_k)) return size == collection_.value_max_size();
-        else if constexpr (is_inline(value_layout_k)) return size != 0 && size <= collection_.value_max_size();
-        else return size <= collection_.value_max_size();
-    }
+    [[nodiscard]] bool admits(std::size_t size) const noexcept { return collection_.admits(size); }
 
     /** Records the memory runs hold plus key slots every level holds, one key counted once per run holding it. */
     [[nodiscard]] std::uint64_t population_count() const noexcept { return collection_.population_count(); }
@@ -4705,14 +4721,12 @@ class basic_single_collection_database {
     /** Seals every change of @p changes into @p sealed on the committing thread, flushing first when the memory runs
      *  are full, so the commit that follows cannot fail halfway. */
     status_t seal_write_buffer(write_buffer_t const& changes, sealed_commit<stored_key_t>& sealed) noexcept {
-        // The transaction's own buffer keeps its sentinels, which become kinds here.
         st::basic_vector<keyed_delta<stored_key_t>> deltas;
         if (deltas.reserve(changes.count()) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "No room to hand a commit over"};
         [[maybe_unused]] st::status_t const walked = changes.stored_values.for_each([&](auto const& entry) noexcept {
             auto const& place = entry.value();
-            delta_view_t delta {delta_kind_t::remove_k, {}};
-            if (place.offset != tombstone_offset_k) delta = {delta_kind_t::write_k, changed_bytes_(changes, place)};
+            delta_view_t const delta {place.kind, changed_bytes_(changes, place)};
             [[maybe_unused]] st::status_t const placed = deltas.push_back(
                 st::assume_reserved, keyed_delta<stored_key_t> {entry.key(), delta});
         });
@@ -4908,20 +4922,19 @@ class basic_single_collection_database {
     }
 
     /**
-     *  @brief Hands the write path back, then looks at the memory runs again and takes it back to maintain them for as
-     *      long as they are due, so a commit that found the write path held left its maintenance to this writer.
+     *  @brief Hands the write path back, then looks once more at the memory runs and, if they are due and the write
+     *      path is still free, takes it back to maintain them, so a commit that found the write path held left its
+     *      maintenance to this writer.
      *
      *  A writer that finds the write path taken again stops, since the new holder looks once more after it lets go,
-     *  and so does one whose maintenance failed, which the next commit meets again.
+     *  and a failed adoption or maintenance is met again by the next commit.
      */
     void release_write_path_() noexcept {
         write_path_claim_.release();
-        while (collection_.maintenance_due() && write_path_claim_.take_if_free()) {
-            adopt_channels_();
-            status_t const maintained = maintain_due_();
-            write_path_claim_.release();
-            if (maintained.failed()) return;
-        }
+        if (!collection_.maintenance_due() || !write_path_claim_.take_if_free()) return;
+        adopt_channels_();
+        [[maybe_unused]] status_t const maintained = maintain_due_();
+        write_path_claim_.release();
     }
 
 #pragma endregion Write Path

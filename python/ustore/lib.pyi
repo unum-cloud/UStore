@@ -762,7 +762,6 @@ class Database(_Writes, _Receivers):
         collection_cache_limit: int = 0,
         collection_write_buffer_max_bytes: int = 0,
         collection_write_buffer_max_elements: int = 0,
-        collection_first_level_max_bytes: int = 0,
         collection_level_enlarge_factor: int = 0,
         collection_value_size: int = 0,
         collection_value_max_size: int = 0,

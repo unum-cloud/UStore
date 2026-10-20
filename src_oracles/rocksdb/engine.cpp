@@ -4,7 +4,7 @@
  *  @date January 9, 2023
  *  @brief Embedded persistent key-value store on RocksDB, with two-phase transactions and snapshots.
  *
- *  Named collections are column families, and keys are fixed-width integers under a custom comparator.
+ *  Named collections are column families, and keys are UUIDs or strings under RocksDB's bytewise comparator.
  *  Tables stay block-based, since the plain-table format lacks non-prefix seeks that scans need.
  *
  *  Every write reaches RocksDB's log, which stays in memory until a flushed write or commit, a full buffer or a clean

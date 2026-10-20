@@ -15,13 +15,15 @@
 #include <cstdint> // `std::uint64_t`
 #include <cstring> // `std::memcmp`
 
-#include <array>    // `std::array`
-#include <memory>   // `std::unique_ptr`
-#include <new>      // `std::nothrow`
-#include <optional> // `std::optional`
-#include <span>     // `std::span`
-#include <thread>   // `std::thread`
-#include <utility>  // `std::move`
+#include <algorithm> // `std::min`
+#include <array>     // `std::array`
+#include <map>       // `std::map`
+#include <memory>    // `std::unique_ptr`
+#include <new>       // `std::nothrow`
+#include <optional>  // `std::optional`
+#include <span>      // `std::span`
+#include <thread>    // `std::thread`
+#include <utility>   // `std::move`
 
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
@@ -80,17 +82,15 @@ struct collection_types {
  *  @brief The collection shape a case mounts, whose first level fills after a handful of flushes.
  *  @param[in] value_size Bytes every value takes, which is zero for every layout but the fixed one.
  *  @param[in] value_max_size Bytes the largest value takes, which is zero for a fixed-width layout.
- *  @param[in] level_zero_bytes Bytes level zero admits before a compaction is due.
  */
-[[nodiscard]] collection_config_t test_config(stored_value_size_t value_size, stored_value_size_t value_max_size,
-                                              std::uint64_t level_zero_bytes) noexcept {
+[[nodiscard]] collection_config_t test_config(stored_value_size_t value_size,
+                                              stored_value_size_t value_max_size) noexcept {
     collection_config_t config;
     config.concurrency_limit = 1;
     config.cache_limit = 1024ull * 1024ull;
     config.write_buffer_max_bytes = 8ull * 1024ull * 1024ull;
     config.write_buffer_max_elements = 8192;
     config.lsm_tree.level_enlarge_factor = 4;
-    config.lsm_tree.lsm_level_0.max_bytes = level_zero_bytes;
     config.lsm_tree.lsm_level_0.sorted_run.value_size = value_size;
     config.lsm_tree.lsm_level_0.sorted_run.value_max_size = value_max_size;
     return config;
@@ -225,7 +225,7 @@ std::size_t mixed_widths_round_trip(mount_type_ const& mount) {
     failures += expect_status(stack, status_code_t::success_k);
     if (!stack) return failures;
 
-    collection_config_t const config = test_config(0, value_max_size_k, 16ull * 1024ull * 1024ull);
+    collection_config_t const config = test_config(0, value_max_size_k);
     expected<variable_collection_t> store = variable_collection_t::mount(
         *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger);
     failures += expect(store.has_value());
@@ -273,7 +273,7 @@ template <typename key_slot_type_, typename mount_type_>
     failures += expect_status(stack, status_code_t::success_k);
     if (!stack) return failures;
 
-    collection_config_t const config = test_config(value_size, value_max_size, 16ull * 1024ull * 1024ull);
+    collection_config_t const config = test_config(value_size, value_max_size);
     expected<collection_t> store = collection_t::mount(
         *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger);
     failures += expect(store.has_value());
@@ -330,7 +330,7 @@ std::size_t misses_and_tombstones(mount_type_ const& mount) {
     failures += expect_status(stack, status_code_t::success_k);
     if (!stack) return failures;
 
-    collection_config_t const config = test_config(0, value_max_size_k, 16ull * 1024ull * 1024ull);
+    collection_config_t const config = test_config(0, value_max_size_k);
     expected<variable_collection_t> store = variable_collection_t::mount(
         *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger);
     failures += expect(store.has_value());
@@ -394,7 +394,7 @@ std::size_t write_buffer_answers_before_the_tree(mount_type_ const& mount) {
     failures += expect_status(stack, status_code_t::success_k);
     if (!stack) return failures;
 
-    collection_config_t const config = test_config(0, value_max_size_k, 16ull * 1024ull * 1024ull);
+    collection_config_t const config = test_config(0, value_max_size_k);
     expected<variable_collection_t> store = variable_collection_t::mount(
         *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger);
     failures += expect(store.has_value());
@@ -455,7 +455,7 @@ std::size_t full_write_buffer_flushes_itself(mount_type_ const& mount) {
     failures += expect_status(stack, status_code_t::success_k);
     if (!stack) return failures;
 
-    collection_config_t config = test_config(0, value_max_size_k, 64ull * 1024ull * 1024ull);
+    collection_config_t config = test_config(0, value_max_size_k);
     config.write_buffer_max_bytes = 32ull * 1024ull;
     config.write_buffer_max_elements = 64;
     expected<variable_collection_t> store = variable_collection_t::mount(
@@ -523,7 +523,7 @@ std::size_t unaligned_exact_span_is_taken(mount_type_ const& mount) {
     failures += expect_status(stack, status_code_t::success_k);
     if (!stack) return failures;
 
-    collection_config_t const config = test_config(0, value_max_size_k, 16ull * 1024ull * 1024ull);
+    collection_config_t const config = test_config(0, value_max_size_k);
     expected<variable_collection_t> store = variable_collection_t::mount(
         *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger);
     failures += expect(store.has_value());
@@ -567,7 +567,7 @@ std::size_t widest_and_empty_values(mount_type_ const& mount) {
     failures += expect_status(stack, status_code_t::success_k);
     if (!stack) return failures;
 
-    collection_config_t const config = test_config(0, value_max_size_k, 16ull * 1024ull * 1024ull);
+    collection_config_t const config = test_config(0, value_max_size_k);
     expected<variable_collection_t> store = variable_collection_t::mount(
         *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger);
     failures += expect(store.has_value());
@@ -581,8 +581,8 @@ std::size_t widest_and_empty_values(mount_type_ const& mount) {
         store->insert((*stack)->channel(), stored_key_t {1}, std::span<byte_t const> {widest}).succeeded());
     failures += expect(store->insert((*stack)->channel(), stored_key_t {2}, std::span<byte_t const> {}).succeeded());
 
-    // Seven bytes ahead of it leave the next flushed value on no page boundary, which is what makes an
-    // empty value located by an offset rather than by its sentinel cost a read.
+    // Seven bytes ahead of it leave the next flushed value on no page boundary, which is what would make an
+    // empty value read by its offset rather than by its size cost a read.
     failures += expect(
         store->insert((*stack)->channel(), stored_key_t {6}, std::span<byte_t const> {widest.data(), 7}).succeeded());
     failures += expect(store->insert((*stack)->channel(), stored_key_t {5}, std::span<byte_t const> {}).succeeded());
@@ -612,8 +612,8 @@ std::size_t widest_and_empty_values(mount_type_ const& mount) {
     }
 
     // Key five was never read one at a time, so nothing of it sits in the value cache and the batch
-    // reaches the run. An empty value is located by a sentinel rather than an offset, so reading it
-    // must take no block at all rather than a page nobody wanted.
+    // reaches the run. An empty value is a write of no bytes, so reading it must take no block at all
+    // rather than a page nobody wanted.
     std::array<stored_key_t, 1> const untouched {stored_key_t {5}};
     std::array<select_result_t, 1> answers {select_result_t::nothing_k};
     std::uint32_t idlest = collection_config_k.request_buffers;
@@ -717,7 +717,7 @@ std::size_t batched_select_holds_its_depth(mount_type_ const& mount) {
     failures += expect_status(stack, status_code_t::success_k);
     if (!stack) return failures;
 
-    collection_config_t const config = test_config(0, value_max_size_k, 64ull * 1024ull * 1024ull);
+    collection_config_t const config = test_config(0, value_max_size_k);
     expected<variable_collection_t> store = variable_collection_t::mount(
         *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger);
     failures += expect(store.has_value());
@@ -794,7 +794,7 @@ std::size_t snapshot_holds_its_moment(mount_type_ const& mount) {
     failures += expect_status(stack, status_code_t::success_k);
     if (!stack) return failures;
 
-    collection_config_t const config = test_config(0, value_max_size_k, 64ull * 1024ull * 1024ull);
+    collection_config_t const config = test_config(0, value_max_size_k);
     expected<variable_collection_t> store = variable_collection_t::mount(
         *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger);
     failures += expect(store.has_value());
@@ -865,7 +865,7 @@ std::size_t scan_visits_every_key_in_order(mount_type_ const& mount) {
     failures += expect_status(stack, status_code_t::success_k);
     if (!stack) return failures;
 
-    collection_config_t const config = test_config(0, value_max_size_k, 64ull * 1024ull);
+    collection_config_t const config = test_config(0, value_max_size_k);
     expected<variable_collection_t> store = variable_collection_t::mount(
         *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger);
     failures += expect(store.has_value());
@@ -958,13 +958,18 @@ std::size_t scan_visits_every_key_in_order(mount_type_ const& mount) {
         expectation_t const& wanted = model[static_cast<std::size_t>(previous)];
         if (scan->state() != wanted.state) ++wrong_state;
         if (static_cast<std::uint64_t>(scan->size()) != wanted.bytes) ++wrong_size;
+        // The scan holds no epoch between pages, so its own thread commits while it walks, past its pinned stamp.
+        if (visited == 0)
+            failures += expect(store->erase((*stack)->channel(), static_cast<stored_key_t>(keys_k - 1)).succeeded());
         ++visited;
-        scan->advance();
+        failures += expect(scan->advance().succeeded());
     }
     failures += expect_eq(visited, keys_k);
     failures += expect_eq(out_of_order, std::size_t {0});
     failures += expect_eq(wrong_state, std::size_t {0});
     failures += expect_eq(wrong_size, std::size_t {0});
+    model[keys_k - 1].state = select_result_t::erased_k;
+    model[keys_k - 1].bytes = 0;
 
     // The newest version of every key must also be the one a read of it brings back.
     failures += check_model(*store, (*stack)->channel(), std::span<expectation_t const> {model});
@@ -972,6 +977,154 @@ std::size_t scan_visits_every_key_in_order(mount_type_ const& mount) {
 }
 
 #pragma endregion Scan Cases
+
+#pragma region Fold Cases
+
+/** A counter of 8 bytes, which a write sets, a removal clears, and a change adds its own 8 bytes to. */
+struct counter_fold {
+    static std::uint64_t count_of(std::span<byte_t const> bytes) noexcept {
+        std::uint64_t count = 0;
+        std::memcpy(&count, bytes.data(), std::min(bytes.size(), sizeof(count)));
+        return count;
+    }
+    static expected<std::span<byte_t const>> counted(std::uint64_t count, arena_allocator<byte_t>& arena) noexcept {
+        byte_t* const bytes = arena.allocate(sizeof(count));
+        if (!bytes) return status_t {status_code_t::out_of_memory_k, "No room for a count"};
+        std::memcpy(bytes, &count, sizeof(count));
+        return std::span<byte_t const> {bytes, sizeof(count)};
+    }
+    expected<std::span<byte_t const>> apply(std::span<byte_t const> base, std::span<delta_view_t const> deltas,
+                                            arena_allocator<byte_t>& arena) const noexcept {
+        std::uint64_t count = count_of(base);
+        for (delta_view_t const& delta : deltas) count += count_of(delta.bytes);
+        return counted(count, arena);
+    }
+    expected<std::span<byte_t const>> compose(std::span<delta_view_t const> deltas,
+                                              arena_allocator<byte_t>& arena) const noexcept {
+        return apply({}, deltas, arena);
+    }
+    bool closes(delta_view_t const& delta) const noexcept { return delta.kind != delta_kind_t::change_k; }
+};
+
+/** Counters folded from change chains read as a map says, while the chains sit in memory runs, once a merge folds
+ *  them, once two flushes leave them in level zero, and once a compaction applies them at the bottom level. */
+template <typename mount_type_>
+std::size_t counter_fold_reads_alike_everywhere(mount_type_ const& mount) {
+    using types_t = collection_types<typename mount_type_::fixture_t>;
+    using guard_t = typename types_t::guard_t;
+    using stack_t = typename types_t::stack_t;
+    using counter_collection_t = collection<variable_slot_t, typename types_t::volume_t, counter_fold>;
+    std::size_t failures = 0;
+    constexpr stored_key_t keys_k = 12;
+    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
+    failures += expect_status(stack, status_code_t::success_k);
+    if (!stack) return failures;
+
+    // A level zero of a few hundred bytes, which one flushed run already overfills.
+    collection_config_t config = test_config(0, value_max_size_k);
+    config.write_buffer_max_bytes = 64;
+    expected<counter_collection_t> store = counter_collection_t::mount(
+        *(*stack)->volume, config, (*stack)->fixture->resources->memory_constraint, (*stack)->ledger);
+    failures += expect(store.has_value());
+    if (!store) return failures;
+
+    // Key zero only ever changes, so its chain has no base until the bottom level folds it onto nothing.
+    std::map<stored_key_t, std::optional<std::uint64_t>> model;
+    auto commit_round = [&](std::uint64_t round) {
+        std::array<std::uint64_t, keys_k> words {};
+        std::array<keyed_delta<stored_key_t>, keys_k> deltas {};
+        for (stored_key_t key = 0; key != keys_k; ++key) {
+            std::uint64_t const op = key == 0 ? 2 : (key * 7 + round) % 5;
+            std::optional<std::uint64_t>& counted = model[key];
+            delta_view_t delta {delta_kind_t::change_k, {}};
+            if (op == 0) {
+                delta.kind = delta_kind_t::write_k;
+                words[key] = round * 1000 + key;
+                counted = words[key];
+            }
+            else if (op == 1) {
+                delta.kind = delta_kind_t::remove_k;
+                counted.reset();
+            }
+            else {
+                words[key] = key + round + 1;
+                counted = counted.value_or(0) + words[key];
+            }
+            if (delta.kind != delta_kind_t::remove_k)
+                delta.bytes = std::as_bytes(std::span<std::uint64_t const, 1> {&words[key], 1});
+            deltas[key] = keyed_delta<stored_key_t> {key, delta};
+        }
+        auto [sealed, seal_status] = store->seal(std::span<keyed_delta<stored_key_t>> {deltas});
+        return expect(seal_status.succeeded() && store->commit(sealed).succeeded());
+    };
+
+    // Point reads, the size a find answers where no level's value needs a read, and one batch, all against the map.
+    auto check = [&](bool finds) {
+        std::size_t wrong = 0;
+        std::array<stored_key_t, keys_k + 1> keys {};
+        std::array<select_result_t, keys_k + 1> answers {};
+        std::array<std::uint64_t, keys_k + 1> batched {};
+        for (stored_key_t key = 0; key != keys_k + 1; ++key) {
+            keys[key] = key;
+            std::optional<std::uint64_t> const wanted = model.count(key) ? model[key] : std::nullopt;
+            std::uint64_t count = 0;
+            stored_value_size_t size = 0;
+            status_t const selected = store->select(
+                (*stack)->channel(), key, std::as_writable_bytes(std::span<std::uint64_t, 1> {&count, 1}), size);
+            wrong += wanted ? selected.failed() || size != sizeof(count) || count != *wanted
+                            : !(selected == status_code_t::not_found_k);
+            select_result_t const found = store->find(key, size);
+            if (finds)
+                wrong += wanted ? found != select_result_t::success_k || size != sizeof(count)
+                                : found == select_result_t::success_k;
+        }
+        auto sink = [&](std::size_t request, std::uint64_t, std::span<byte_t const> bytes) noexcept {
+            batched[request] = counter_fold::count_of(bytes);
+        };
+        failures += expect(store
+                               ->select((*stack)->channel(), std::span<stored_key_t const> {keys},
+                                        std::span<select_result_t> {answers}, sink)
+                               .succeeded());
+        for (stored_key_t key = 0; key != keys_k + 1; ++key) {
+            std::optional<std::uint64_t> const wanted = model.count(key) ? model[key] : std::nullopt;
+            wrong += wanted ? answers[key] != select_result_t::success_k || batched[key] != *wanted
+                            : answers[key] == select_result_t::success_k;
+        }
+        return expect_eq(wrong, std::size_t {0});
+    };
+
+    for (std::uint64_t round = 0; round != 8; ++round) failures += commit_round(round);
+    failures += check(true);
+    failures += expect(store->merge_memory_runs().succeeded());
+    failures += expect(store->memory_shape().runs < 8);
+    failures += check(true);
+
+    for (std::uint64_t round = 8; round != 12; ++round) failures += commit_round(round);
+    failures += expect(store->flush((*stack)->channel()).succeeded());
+    for (std::uint64_t round = 12; round != 14; ++round) failures += commit_round(round);
+    failures += expect(store->flush((*stack)->channel()).succeeded());
+    failures += commit_round(14);
+    // Key zero's chain reaches level zero as changes in both runs, so its reads fold through their values.
+    auto const& flushed = store->tree().levels().level(0);
+    for (std::size_t index = 0; index != flushed.size(); ++index)
+        failures += expect(holds_changes(&flushed.run(index).kinds()));
+    failures += expect_eq(flushed.size(), std::size_t {2});
+    failures += check(false);
+
+    expected<guard_t> writing = (*stack)->fixture->channels.acquire();
+    failures += expect(writing.has_value());
+    if (!writing) return failures;
+    expected<compaction_outcome_t> const compacted = store->compact((*stack)->channel(), writing->channel());
+    failures += expect(compacted.has_value() && *compacted == compaction_outcome_t::published_k);
+    auto const& levels = store->tree().levels();
+    failures += expect(levels.size() == 2 && levels.level(0).empty());
+    for (std::size_t index = 0; levels.size() == 2 && index != levels.level(1).size(); ++index)
+        failures += expect(!holds_changes(&levels.level(1).run(index).kinds()));
+    failures += check(false);
+    return failures;
+}
+
+#pragma endregion Fold Cases
 
 } // namespace unum::ustore::test
 
@@ -1004,6 +1157,7 @@ int main(int argc, char const* argv[]) {
         report(totals, mount, "holds_its_depth", batched_select_holds_its_depth);
         report(totals, mount, "snapshot_holds_its_moment", snapshot_holds_its_moment);
         report(totals, mount, "scan_in_order", scan_visits_every_key_in_order);
+        report(totals, mount, "counter_fold", counter_fold_reads_alike_everywhere);
     };
     for (transport_t const transport : every_transport_k)
         run_on_transport(totals, transport, environment, collection_config_k, 1, "collection", cases);

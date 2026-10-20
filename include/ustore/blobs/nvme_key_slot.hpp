@@ -5,7 +5,8 @@
  *  @brief The vocabulary of UStoreNVMe's LSM trees: identifiers and value layouts, the keys key slots are ordered
  *      by, stored values and their locations, key slots, and the sorted run index laid over them.
  *
- *  A key slot is a stored key with the size and location of its stored value, specialized per value layout. Keys
+ *  A key slot is a stored key with the size and location of its stored value, specialized per value layout, and what
+ *  the record does sits in its run's kinds column beside the stamps, so no size or location means a removal. Keys
  *  carry their bounds through @c limit, and the 16-byte key is ordered like @c memcmp. The sorted run index is
  *  the B-tree whose cells hold a sorted run's key slots, which both compactors lay out the same way.
  */
@@ -26,6 +27,7 @@
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 #include <smashtable/shared.hpp>       // `st::hash`
 
+#include "ustore/utilities/folds.hpp"     // `delta_kind_t`
 #include "ustore/utilities/nvme_ring.hpp" // `disk_id_t`, `file_id_t`, `uuid_t`, `string_t`, `bytes_span_t`
 #include "ustore/utilities/types.hpp"     // `status_t`, `status_code_t`, `expected`, `byte_t`, the rounding helpers
 
@@ -35,6 +37,7 @@ using utilities::buffer_alignment_k;
 using utilities::byte_t;
 using utilities::bytes_span_t;
 using utilities::bytes_view_t;
+using utilities::delta_kind_t;
 using utilities::disk_id_t;
 using utilities::divide_round_up;
 using utilities::expected;
@@ -361,12 +364,6 @@ using stored_value_span_t = bytes_span_t;
 /** The bytes of one stored value a caller may only read. */
 using stored_value_view_t = bytes_view_t;
 
-/** The offset of a key whose value has been erased. */
-inline constexpr stored_value_offset_t tombstone_offset_k = std::numeric_limits<stored_value_offset_t>::max();
-
-/** The offset of a key whose value is present and empty. */
-inline constexpr stored_value_offset_t empty_stored_value_offset_k = tombstone_offset_k - 1;
-
 /** The level or run number of a location that names none. */
 inline constexpr u32_t unknown_run_number_k = std::numeric_limits<u32_t>::max();
 
@@ -410,6 +407,9 @@ struct stored_value_location {
     /** Where the value starts inside its file. */
     stored_value_offset_t offset = 0;
 
+    /** What the record found there does, so a removal and an empty value differ by kind. */
+    delta_kind_t kind = delta_kind_t::write_k;
+
     /** Whether the location names a value, which an unknown layout never does. */
     explicit operator bool() const noexcept { return false; }
 
@@ -437,8 +437,8 @@ struct stored_value_location<value_layout_> : public stored_value_location<value
     /** The sorted run of that level the key slot came from. */
     u32_t sorted_run_number = unknown_run_number_k;
 
-    /** Whether the location names a value, which a zero size does not. */
-    explicit operator bool() const noexcept { return size_bytes != 0; }
+    /** Whether the location names a value, which a removal does not. */
+    explicit operator bool() const noexcept { return kind != delta_kind_t::remove_k; }
 
     /** Bytes the value occupies. */
     stored_value_size_t size() const noexcept { return size_bytes; }
@@ -457,8 +457,8 @@ struct stored_value_location<value_layout_t::fixed_width_k> : public stored_valu
     /** The file holding the value. */
     file_id_t file_id = file_id_t::invalid_k;
 
-    /** Whether the location names a value, which a zero size does not. */
-    explicit operator bool() const noexcept { return size_bytes != 0; }
+    /** Whether the location names a value, which a removal does not. */
+    explicit operator bool() const noexcept { return kind != delta_kind_t::remove_k; }
 
     /** Bytes the value occupies. */
     stored_value_size_t size() const noexcept { return size_bytes; }
@@ -489,16 +489,15 @@ struct stored_value_location<value_layout_t::variable_width_k>
     /** The file holding the value. */
     file_id_t file_id = file_id_t::invalid_k;
 
-    /** Whether the location names a value, which a tombstone does not. */
-    explicit operator bool() const noexcept { return offset != tombstone_offset_k; }
+    /** Whether the location names a value, which a removal does not. */
+    explicit operator bool() const noexcept { return kind != delta_kind_t::remove_k; }
 
     /** Bytes the value occupies. */
     stored_value_size_t size() const noexcept { return size_bytes; }
 
     /** Bytes a buffer needs for the value, rounded out to what unbuffered I/O accepts. */
     stored_value_size_t aligned_buffer_size() const noexcept {
-        bool const is_nonempty = bool(*this) && offset != empty_stored_value_offset_k;
-        stored_value_size_t const padded_size = stored_value_size_t(is_nonempty) * (buffer_padding() + size_bytes);
+        stored_value_size_t const padded_size = stored_value_size_t(size_bytes != 0) * (buffer_padding() + size_bytes);
         return round_up_to_multiple<stored_value_size_t>(padded_size, buffer_alignment_k);
     }
 
@@ -848,7 +847,6 @@ struct storage_limits_t {
     static constexpr std::size_t transaction_write_buffer_max_capacity_k = write_buffer_max_capacity_k;
     static constexpr std::size_t transaction_write_buffer_elements_min_count_k = 1;
     static constexpr std::size_t transaction_write_buffer_elements_max_count_k = write_buffer_elements_max_count_k;
-    static constexpr std::size_t first_level_min_capacity_bytes_k = 1024 * 1024;
     static constexpr std::size_t level_min_enlarge_factor_k = 2;
     static constexpr std::size_t level_max_enlarge_factor_k = 64;
     static constexpr std::size_t sorted_run_file_max_size_k = 4 * 1024 * 1024 * 1024ull - 4096;
@@ -856,9 +854,6 @@ struct storage_limits_t {
     static constexpr std::size_t value_max_size_k = std::max(fixed_value_max_size_k, variable_value_max_size_k);
     static constexpr std::size_t user_data_max_size_k = 4 * 1024 * 1024;
 };
-
-static_assert(storage_limits_t::sorted_run_file_max_size_k <= empty_stored_value_offset_k,
-              "A stored value's location never reaches the offsets that mean empty and erased");
 
 #pragma endregion Storage Limits
 
@@ -872,10 +867,6 @@ struct key_slot {
     stored_key_t stored_key = limit<stored_key_t>::max();
     stored_value_size_t size = 0;
     byte_t data[static_cast<std::uint16_t>(value_layout_k)] = {byte_t(0)};
-
-    constexpr bool is_tombstone() const noexcept { return size == 0; }
-    constexpr void make_tombstone() noexcept { size = 0; }
-    constexpr bool is_stored_value_empty() const noexcept { return size == 0; }
 
     stored_value_size_t aligned_buffer_size() const noexcept { return size; }
     stored_value_offset_t aligned_offset_in_file() const noexcept { return 0; }
@@ -895,10 +886,6 @@ struct key_slot<stored_key_, value_layout_t::fixed_width_k> {
     stored_key_t stored_key = limit<stored_key_t>::max();
     stored_value_size_t size = 0;
     stored_value_offset_t location = 0;
-
-    constexpr bool is_tombstone() const noexcept { return size == 0; }
-    constexpr void make_tombstone() noexcept { size = 0; }
-    constexpr bool is_stored_value_empty() const noexcept { return size == 0; }
 
     stored_value_size_t aligned_buffer_size() const noexcept {
         auto padded_size = stored_value_offset_t(size != 0) * (buffer_padding() + size);
@@ -924,17 +911,8 @@ struct key_slot<stored_key_, value_layout_t::variable_width_k> {
     stored_value_size_t size = 0;
     stored_value_offset_t location = 0;
 
-    constexpr bool is_tombstone() const noexcept { return location == tombstone_offset_k; }
-    constexpr void make_tombstone() noexcept {
-        size = 0;
-        location = tombstone_offset_k;
-    }
-    constexpr bool is_stored_value_empty() const noexcept {
-        return (location == tombstone_offset_k) | (location == empty_stored_value_offset_k);
-    }
-
     stored_value_size_t aligned_buffer_size() const noexcept {
-        auto padded_size = stored_value_offset_t(!is_stored_value_empty()) * (buffer_padding() + size);
+        auto padded_size = stored_value_offset_t(size != 0) * (buffer_padding() + size);
         return round_up_to_multiple<stored_value_size_t>(padded_size, buffer_alignment_k);
     }
     stored_value_offset_t aligned_offset_in_file() const noexcept {

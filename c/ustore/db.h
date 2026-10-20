@@ -415,9 +415,6 @@ typedef struct ustore_database_open_nvme_t {
     /** Writes each collection buffers before it flushes a sorted run. */
     ustore_size_t collection_write_buffer_max_elements;
 
-    /** Bytes the first level of each collection holds before it compacts into the next. */
-    ustore_size_t collection_first_level_max_bytes;
-
     /** How many times larger each level of a collection is than the one above it. */
     ustore_size_t collection_level_enlarge_factor;
 

@@ -519,6 +519,11 @@ if (${USTORE_BUILD_TEST})
     target_link_libraries(ustore_test_graph_adjacency_fold PRIVATE ustore::header fmt::fmt ustore_warnings)
     add_test(NAME ustore_test_graph_adjacency_fold COMMAND ustore_test_graph_adjacency_fold)
 
+    # Memory runs and their views call no StringZilla kernel either, and need only SmashTable's headers
+    add_executable(ustore_test_blobs_memory_run test/blobs/memory_run.cpp)
+    target_link_libraries(ustore_test_blobs_memory_run PRIVATE ustore::header fmt::fmt ustore_warnings)
+    add_test(NAME ustore_test_blobs_memory_run COMMAND ustore_test_blobs_memory_run)
+
     # The docs fold is checked against the read-modify-write path of `ustore_docs_write`, so its suite links an engine
     add_executable(ustore_test_docs_json_fold test/docs/json_fold.cpp)
     target_include_directories(ustore_test_docs_json_fold PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)

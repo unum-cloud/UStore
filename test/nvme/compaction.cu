@@ -52,6 +52,12 @@ enum class key_slot_state_t : bool {
     tombstone_k,
 };
 
+/** The kind a key slot of @p state carries in its run's kinds column. */
+inline std::uint8_t kind_of(key_slot_state_t state) noexcept {
+    return static_cast<std::uint8_t>(state == key_slot_state_t::tombstone_k ? delta_kind_t::remove_k
+                                                                            : delta_kind_t::write_k);
+}
+
 /** An inline key slot of @p key with random inline bytes. */
 template <typename stored_key_type_>
 inline_key_slot<stored_key_type_> make_key_slot(std::type_identity<inline_key_slot<stored_key_type_>>,
@@ -84,12 +90,9 @@ variable_width_key_slot<stored_key_type_> make_key_slot(std::type_identity<varia
                                                         random_t& random) noexcept {
     variable_width_key_slot<stored_key_type_> key_slot;
     key_slot.stored_key = key;
-    if (state == key_slot_state_t::tombstone_k) key_slot.location = tombstone_location_k;
-    else if (random.below(16) == 0) key_slot.location = empty_location_k;
-    else {
-        key_slot.size = static_cast<std::uint32_t>(1 + random.below(200));
-        key_slot.location = static_cast<std::uint32_t>(random.below(std::uint64_t {1} << 30));
-    }
+    if (state == key_slot_state_t::tombstone_k || random.below(16) == 0) return key_slot;
+    key_slot.size = static_cast<std::uint32_t>(1 + random.below(200));
+    key_slot.location = static_cast<std::uint32_t>(random.below(std::uint64_t {1} << 30));
     return key_slot;
 }
 
@@ -263,6 +266,9 @@ struct test_lsm_level {
     /** The stamp of every key slot of @c sorted, newest first among the versions of one key. */
     basic_vector<std::uint64_t> stamps;
 
+    /** The @c delta_kind_t of every key slot of @c sorted. */
+    basic_vector<std::uint8_t> kinds;
+
     /** Key slots in each sorted run. */
     basic_vector<std::uint64_t> counts;
 
@@ -272,7 +278,10 @@ struct test_lsm_level {
     /** Every sorted run's stamps packed, as a run keeps them, or none for an LSM level without stamps. */
     basic_vector<stamps_column_t> columns;
 
-    /** A view per sorted run into @c cells and @c columns. */
+    /** Every sorted run's kinds packed, as a run keeps them. */
+    basic_vector<kinds_column_t> kind_columns;
+
+    /** A view per sorted run into @c cells, @c columns and @c kind_columns. */
     basic_vector<sorted_run_index_view<key_slot_type_>> views;
 };
 
@@ -310,21 +319,25 @@ inline key_slot_state_t random_state(scenario_t const& scenario, random_t& rando
 template <typename key_slot_type_>
 st::status_t pick_key_slots(std::span<typename key_slot_type_::stored_key_t const> keys, scenario_t const& scenario,
                             std::uint64_t era, random_t& random, basic_vector<key_slot_type_>& key_slots,
-                            basic_vector<std::uint64_t>& stamps) noexcept {
+                            basic_vector<std::uint64_t>& stamps, basic_vector<std::uint8_t>& kinds) noexcept {
     std::uint64_t const half = stamps_per_sorted_run_k / 2;
     std::uint64_t const base = era * stamps_per_sorted_run_k;
+    auto const pick = [&](typename key_slot_type_::stored_key_t const& key) noexcept {
+        key_slot_state_t const state = random_state(scenario, random);
+        st::status_t const status = key_slots.push_back(
+            make_key_slot(std::type_identity<key_slot_type_> {}, key, state, random));
+        return status != st::status_t::success_k ? status : kinds.push_back(kind_of(state));
+    };
     for (std::size_t index = 0; index != keys.size(); ++index) {
         if (random.below(1000) >= scenario.density_per_mille) continue;
         bool const versioned = random.below(1000) < scenario.versions_per_mille;
-        st::status_t status = key_slots.push_back(
-            make_key_slot(std::type_identity<key_slot_type_> {}, keys[index], random_state(scenario, random), random));
+        st::status_t status = pick(keys[index]);
         if (status != st::status_t::success_k) return status;
         status = stamps.push_back(base +
                                   (versioned ? half + random.below(half) : random.below(stamps_per_sorted_run_k)));
         if (status != st::status_t::success_k) return status;
         if (!versioned) continue;
-        status = key_slots.push_back(
-            make_key_slot(std::type_identity<key_slot_type_> {}, keys[index], random_state(scenario, random), random));
+        status = pick(keys[index]);
         if (status != st::status_t::success_k) return status;
         status = stamps.push_back(base + random.below(half));
         if (status != st::status_t::success_k) return status;
@@ -340,7 +353,7 @@ st::status_t add_overlapping_sorted_runs(std::span<typename key_slot_type_::stor
     for (std::uint64_t sorted_run = 0; sorted_run != sorted_runs; ++sorted_run) {
         std::size_t const before = lsm_level.sorted.size();
         st::status_t status = pick_key_slots<key_slot_type_>(keys, scenario, first_era + sorted_run, random,
-                                                             lsm_level.sorted, lsm_level.stamps);
+                                                             lsm_level.sorted, lsm_level.stamps, lsm_level.kinds);
         if (status != st::status_t::success_k) return status;
         std::uint64_t const count = lsm_level.sorted.size() - before;
         if (count == 0) continue;
@@ -357,7 +370,7 @@ st::status_t add_sorted_sorted_runs(std::span<typename key_slot_type_::stored_ke
                                     scenario_t const& scenario, std::uint64_t sorted_runs, std::uint64_t era,
                                     random_t& random, test_lsm_level<key_slot_type_>& lsm_level) noexcept {
     st::status_t status = pick_key_slots<key_slot_type_>(keys, scenario, era, random, lsm_level.sorted,
-                                                         lsm_level.stamps);
+                                                         lsm_level.stamps, lsm_level.kinds);
     if (status != st::status_t::success_k) return status;
     std::uint64_t const total = lsm_level.sorted.size();
     if (total == 0) return st::status_t::success_k;
@@ -385,6 +398,9 @@ st::status_t lay_out(test_lsm_level<key_slot_type_>& lsm_level, std::uint64_t br
     bool const stamped = !lsm_level.stamps.empty();
     status = lsm_level.columns.resize(stamped ? lsm_level.counts.size() : 0);
     if (status != st::status_t::success_k) return status;
+    bool const kinded = !lsm_level.kinds.empty();
+    status = lsm_level.kind_columns.resize(kinded ? lsm_level.counts.size() : 0);
+    if (status != st::status_t::success_k) return status;
 
     basic_vector<std::uint64_t> positions;
     key_slot_type_ const poison = poison_key_slot<key_slot_type_>();
@@ -408,6 +424,13 @@ st::status_t lay_out(test_lsm_level<key_slot_type_>& lsm_level, std::uint64_t br
             if (!column) return column.status();
             lsm_level.columns[sorted_run] = std::move(*column);
             lsm_level.views[sorted_run].stamps = &lsm_level.columns[sorted_run];
+        }
+        if (kinded) {
+            st::expected<kinds_column_t> column = kinds_column_t::make(
+                std::span<std::uint8_t const> {lsm_level.kinds.data() + first, static_cast<std::size_t>(count)});
+            if (!column) return column.status();
+            lsm_level.kind_columns[sorted_run] = std::move(*column);
+            lsm_level.views[sorted_run].kinds = &lsm_level.kind_columns[sorted_run];
         }
         first += count;
         first_cell += rows * branching;
@@ -440,7 +463,10 @@ st::status_t reference_survivors(compaction_kind_t kind, test_lsm_level<key_slot
         for (std::size_t index = 0; index != lsm_level->counts.size(); ++index, ++sorted_run) {
             for (std::uint64_t position = 0; position != lsm_level->counts[index]; ++position) {
                 std::uint64_t const stamp = lsm_level->stamps.empty() ? 0 : lsm_level->stamps[first + position];
-                all[written++] = record_t {lsm_level->sorted[first + position], sorted_run, stamp};
+                delta_kind_t const kind = lsm_level->kinds.empty()
+                                              ? delta_kind_t::write_k
+                                              : static_cast<delta_kind_t>(lsm_level->kinds[first + position]);
+                all[written++] = record_t {lsm_level->sorted[first + position], sorted_run, kind, stamp};
             }
             first += lsm_level->counts[index];
         }
@@ -486,7 +512,7 @@ st::status_t reference_survivors(compaction_kind_t kind, test_lsm_level<key_slot
         for (std::size_t index = begin; index != end; ++index) {
             if (!kept[index]) continue;
             bool const hides_nothing = all[index].stamp <= stamps.horizon && all[index].stamp <= oldest_pin;
-            if (drops_tombstones && all[index].key_slot.is_tombstone() && hides_nothing) continue;
+            if (drops_tombstones && all[index].kind == delta_kind_t::remove_k && hides_nothing) continue;
             status = survivors.push_back(record_t {all[index]});
             if (status != st::status_t::success_k) return status;
         }
@@ -519,13 +545,19 @@ std::size_t check_compaction(compaction_kind_t kind, sorted_run_bounds_t const& 
     failures += expect_eq(output.migrations.size(),
                           locates_stored_values_concept<key_slot_type_> ? key_slots_count : 0u);
     failures += expect_eq(output.stamps.size(), std::size_t {key_slots_count});
+    failures += expect_eq(output.kinds.size(), std::size_t {key_slots_count});
     if (failures != 0) return failures;
 
-    // Every survivor carries its stamp raised to the floor, and the versions of one key never straddle two runs
+    // Every survivor carries its stamp raised to the floor and its kind, and the versions of one key never straddle
+    // two runs
     std::size_t wrong_stamps = 0;
-    for (std::size_t index = 0; index != wanted_survivors.size(); ++index)
+    std::size_t wrong_kinds = 0;
+    for (std::size_t index = 0; index != wanted_survivors.size(); ++index) {
         wrong_stamps += output.stamps[index] != std::max(wanted_survivors[index].stamp, stamps.floor);
+        wrong_kinds += output.kinds[index] != static_cast<std::uint8_t>(wanted_survivors[index].kind);
+    }
     failures += expect_eq(wrong_stamps, std::size_t {0});
+    failures += expect_eq(wrong_kinds, std::size_t {0});
     std::size_t split_keys = 0;
     bool versioned = false;
     for (std::size_t index = 1; index < wanted_survivors.size(); ++index)
@@ -590,8 +622,7 @@ std::size_t check_compaction(compaction_kind_t kind, sorted_run_bounds_t const& 
             key_slot_type_ const& got = output.cells[first_cell + cell_of[position]];
             key_slot_type_ wanted_key_slot = wanted.key_slot;
             if constexpr (locates_stored_values_concept<key_slot_type_>) {
-                if (!wanted_key_slot.is_stored_value_empty())
-                    wanted_key_slot.location = static_cast<std::uint32_t>(section_offset + running);
+                wanted_key_slot.location = static_cast<std::uint32_t>(section_offset + running);
                 stored_value_migration_t const& migration = output.migrations[first + position];
                 wrong_migrations += migration.size != stored_value_bytes(wanted.key_slot) ||
                                     migration.old_location != wanted.key_slot.location ||
@@ -600,8 +631,9 @@ std::size_t check_compaction(compaction_kind_t kind, sorted_run_bounds_t const& 
             wrong_key_slots += !same_key_slot(got, wanted_key_slot);
             running += stored_value_bytes(wanted.key_slot);
             // A tombstone survives the bottom only where a reader still needs it to hide an older version
-            tombstones += drops_tombstones && got.is_tombstone() && stamps.pinned_count == 0 &&
-                          stamps.horizon == ~std::uint64_t {0};
+            tombstones += drops_tombstones &&
+                          output.kinds[first + position] == static_cast<std::uint8_t>(delta_kind_t::remove_k) &&
+                          stamps.pinned_count == 0 && stamps.horizon == ~std::uint64_t {0};
             if (first + position != 0)
                 unordered += got.stored_key < previous || (!versioned && got.stored_key == previous);
             previous = got.stored_key;
@@ -647,6 +679,10 @@ std::size_t expect_identical(compaction_output<key_slot_type_> const& host,
     if (device.stamps.size() == host.stamps.size())
         for (std::size_t index = 0; index != host.stamps.size(); ++index)
             mismatches += host.stamps[index] != device.stamps[index];
+    failures += expect_eq(device.kinds.size(), host.kinds.size());
+    if (device.kinds.size() == host.kinds.size())
+        for (std::size_t index = 0; index != host.kinds.size(); ++index)
+            mismatches += host.kinds[index] != device.kinds[index];
     failures += expect_eq(mismatches, std::size_t {0});
     return failures;
 }
@@ -733,9 +769,9 @@ std::size_t survives_follows_the_kind() {
     located_key_slot<checked_key_slot_t> const earlier = checked_record(6, 1);
     located_key_slot<checked_key_slot_t> tombstone = checked_record(7, 0);
     tombstone.key_slot.size = 0;
+    tombstone.kind = delta_kind_t::remove_k;
     located_key_slot<checked_key_slot_t> const* const leading = nullptr;
-    failures += expect(tombstone.key_slot.is_tombstone());
-    failures += expect(!alive.key_slot.is_tombstone());
+    failures += expect(alive.kind == delta_kind_t::write_k);
 
     std::size_t wrong = 0;
     for (compaction_kind_t const kind : kinds) {
@@ -914,7 +950,10 @@ std::size_t survives_keeps_what_readers_read() {
     auto const version = [](std::uint64_t stamp, bool tombstone) noexcept {
         located_key_slot<checked_key_slot_t> record = checked_record(7, 0);
         record.stamp = stamp;
-        if (tombstone) record.key_slot.size = 0;
+        if (tombstone) {
+            record.key_slot.size = 0;
+            record.kind = delta_kind_t::remove_k;
+        }
         return record;
     };
     constexpr compaction_kind_t bottom = compaction_kind_t::sorted_into_bottom_k;
@@ -1211,8 +1250,12 @@ std::size_t report_compaction(suite_totals_t& totals, char const* host_name, cha
     failures += expect(status == st::status_t::success_k);
     if (failures != 0) return report(totals, host_name, failures);
 
+    // Blobs write no change, so a merge with the newest version winning reads no value.
+    auto const read_nothing = [](located_key_slot<key_slot_type_> const&, arena_allocator<byte_t>&,
+                                 std::span<byte_t const>&) noexcept { return st::status_t::invalid_argument_k; };
     compaction_output<key_slot_type_> host;
-    status = cpu_compactor_t {}.compact(kind, views_of(upper), views_of(lower), bounds, stamps, host);
+    status = cpu_compactor_t {}.compact(kind, views_of(upper), views_of(lower), bounds, stamps, last_write_fold {},
+                                        read_nothing, host);
     failures += expect(status == st::status_t::success_k);
     if (status == st::status_t::success_k) failures += check_compaction(kind, bounds, stamps, survivors, host);
     std::size_t const host_failures = report(totals, host_name, failures);
@@ -1441,8 +1484,10 @@ st::status_t spell_lsm_level(std::span<typename key_slot_type_::stored_key_t con
         std::size_t const index = static_cast<std::size_t>(tombstoned ? *letter - 'A' : *letter - 'a');
         if (index >= keys.size()) return st::status_t::invalid_argument_k;
         key_slot_state_t const state = tombstoned ? key_slot_state_t::tombstone_k : key_slot_state_t::alive_k;
-        st::status_t const status = lsm_level.sorted.push_back(
+        st::status_t status = lsm_level.sorted.push_back(
             make_key_slot(std::type_identity<key_slot_type_> {}, keys[index], state, random));
+        if (status != st::status_t::success_k) return status;
+        status = lsm_level.kinds.push_back(kind_of(state));
         if (status != st::status_t::success_k) return status;
         ++key_slots;
     }

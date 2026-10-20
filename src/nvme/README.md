@@ -44,10 +44,11 @@ The sorted run index is a B-tree of the run's key slots, and the merger hands th
 Levels differ by depth:
 
 - Level 0, `L0`, receives one sorted run per flushed write buffer, so its sorted runs overlap and a scan merges them by smallest key.
-- Intermediate levels keep their sorted runs sorted, and still hold tombstones: removals, whose size of zero shadows older values beneath them.
+- Intermediate levels keep their sorted runs sorted, and still hold tombstones: removals, whose kind shadows older values beneath them.
 - The bottom level is sorted too, and compaction into it drops tombstones for good.
 
-Every deeper level's budget grows by `level_enlarge_factor`, and level 0 is due for compaction at that many sorted runs or at its byte budget, whichever comes first: a flushed run is one write buffer, so level 0 then holds the factor's multiple of a write buffer, the same step between every two levels.
+Level 0 admits `level_enlarge_factor` flushed runs of one write buffer each, and every deeper level `level_enlarge_factor` times the bytes of the one above, so no level size is configured on its own.
+Level 0 is due for compaction at that many sorted runs or at that many write buffers' bytes, whichever comes first.
 A tree refuses to mount with a factor outside `[level_min_enlarge_factor_k, level_max_enlarge_factor_k]`, the bounds a collection's configuration is validated against.
 The engine compacts after every write that leaves a collection due, on the thread of that write.
 
@@ -65,6 +66,7 @@ A `database` mixes collections of different value layouts, and its collection sc
 
 Every commit draws one stamp from the database's `commit_ledger_t`, over SmashTable's `commit_order_t`, and a graph's two databases share one ledger.
 A write buffer slot carries the stamp of the commit that wrote it, and every sorted run carries a column of its key slots' stamps as an `immutable_packed_array` trailer, frame-of-reference coded from a floor no reader can tell apart, so a cold run spends no bit on them.
+The trailer's second column holds every key slot's `delta_kind_t`, which tells a write, a removal and a fold's change apart, so no size or location of a key slot is a sentinel, and a run of writes alone spends no bit on it.
 A run may hold several versions of one key, newest first, and the run cutter never splits them.
 
 A reader pins a stamp in the ledger and reads the newest version at or below it.

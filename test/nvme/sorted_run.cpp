@@ -87,6 +87,14 @@ inline st::basic_vector<std::uint64_t> ascending_stamps(std::size_t count) {
     return stamps;
 }
 
+/** One kind per key slot of a run of @p count writes. */
+inline st::basic_vector<std::uint8_t> written_kinds(std::size_t count) {
+    st::basic_vector<std::uint8_t> kinds;
+    [[maybe_unused]] st::status_t const sized = kinds.resize(count);
+    for (std::uint8_t& kind : kinds) kind = static_cast<std::uint8_t>(delta_kind_t::write_k);
+    return kinds;
+}
+
 /** The key slots and the bytes behind them that one variable-width case writes. */
 struct variable_data_t {
 
@@ -98,17 +106,21 @@ struct variable_data_t {
 
     /** Bytes the value of every key slot holds, which a read is checked against. */
     st::basic_vector<std::uint64_t> sizes;
+
+    /** The @c delta_kind_t of every key slot. */
+    st::basic_vector<std::uint8_t> kinds;
 };
 
 /**
  *  @brief Lays out @p count variable-width key slots whose value sizes come from @p sized.
- *  @param[in] sized Called as @c sized(index); a negative answer is a tombstone and zero an empty value.
+ *  @param[in] sized Called as @c sized(index); a negative answer is a removal and zero an empty value.
  */
 template <typename sized_type_>
 [[nodiscard]] std::size_t build_variable(std::size_t count, sized_type_&& sized, variable_data_t& into) {
     std::size_t failures = 0;
     failures += expect(into.sizes.resize(count) == st::status_t::success_k);
     failures += expect(into.key_slots.resize(count) == st::status_t::success_k);
+    failures += expect(into.kinds.resize(count) == st::status_t::success_k);
     if (failures != 0) return failures;
 
     std::uint64_t total = 0;
@@ -125,19 +137,14 @@ template <typename sized_type_>
     for (std::size_t index = 0; index != count; ++index) {
         variable_slot_t slot;
         slot.stored_key = key_of(index);
-        if (sized(index) < 0) slot.make_tombstone();
-        else if (into.sizes[index] == 0) {
-            slot.size = 0;
-            slot.location = empty_stored_value_offset_k;
-        }
-        else {
-            slot.size = static_cast<stored_value_size_t>(into.sizes[index]);
-            slot.location = static_cast<stored_value_offset_t>(location);
-            for (std::uint64_t byte = 0; byte != into.sizes[index]; ++byte)
-                into.values[static_cast<std::size_t>(written + byte)] = painted(index, byte);
-            location += into.sizes[index];
-            written += into.sizes[index];
-        }
+        slot.size = static_cast<stored_value_size_t>(into.sizes[index]);
+        slot.location = static_cast<stored_value_offset_t>(location);
+        into.kinds[index] = static_cast<std::uint8_t>(sized(index) < 0 ? delta_kind_t::remove_k
+                                                                       : delta_kind_t::write_k);
+        for (std::uint64_t byte = 0; byte != into.sizes[index]; ++byte)
+            into.values[static_cast<std::size_t>(written + byte)] = painted(index, byte);
+        location += into.sizes[index];
+        written += into.sizes[index];
         into.key_slots[index] = slot;
     }
     return failures;
@@ -206,8 +213,8 @@ std::size_t run_reads_back_every_value(mount_type_ const& mount) {
 
         expected<variable_run_t> written = variable_run_t::write(
             *mounted, guard->channel(), content_id, std::span<variable_slot_t const> {data.key_slots},
-            std::span<std::uint64_t const> {ascending_stamps(data.key_slots.size())}, 0,
-            std::span<byte_t const> {data.values}, 4096);
+            std::span<std::uint64_t const> {ascending_stamps(data.key_slots.size())},
+            std::span<std::uint8_t const> {data.kinds}, 0, std::span<byte_t const> {data.values}, 4096);
         failures += expect(written.has_value());
         if (!written) return failures;
         failures += expect_eq(written->population_count(), static_cast<std::uint64_t>(count_k));
@@ -271,7 +278,8 @@ std::size_t fixed_width_run_reads_back(mount_type_ const& mount) {
 
     expected<fixed_run_t> written = fixed_run_t::write(
         *volume, guard->channel(), uuid_generator(), std::span<fixed_slot_t const> {key_slots},
-        std::span<std::uint64_t const> {ascending_stamps(key_slots.size())}, 0, std::span<byte_t const> {values},
+        std::span<std::uint64_t const> {ascending_stamps(key_slots.size())},
+        std::span<std::uint8_t const> {written_kinds(key_slots.size())}, 0, std::span<byte_t const> {values},
         value_size_k);
     failures += expect(written.has_value());
     if (!written) return failures;
@@ -333,7 +341,8 @@ std::size_t inline_run_needs_no_reads(mount_type_ const& mount) {
 
     expected<inline_run_t> written = inline_run_t::write(
         *volume, guard->channel(), uuid_generator(), std::span<inline_slot_t const> {key_slots},
-        std::span<std::uint64_t const> {ascending_stamps(key_slots.size())}, 0, std::span<byte_t const> {}, 8);
+        std::span<std::uint64_t const> {ascending_stamps(key_slots.size())},
+        std::span<std::uint8_t const> {written_kinds(key_slots.size())}, 0, std::span<byte_t const> {}, 8);
     failures += expect(written.has_value());
     if (!written) return failures;
 
@@ -359,7 +368,8 @@ std::size_t inline_run_needs_no_reads(mount_type_ const& mount) {
 
     // An inline run carries no values section, so its blob ends where its index does.
     failures += expect_eq(written->size_bytes(),
-                          sorted_run_layout<inline_slot_t>::blob_bytes(count_k, 0, written->stamps().saved_bytes()));
+                          sorted_run_layout<inline_slot_t>::blob_bytes(count_k, 0, written->stamps().saved_bytes(),
+                                                                       written->kinds().saved_bytes()));
     return failures;
 }
 
@@ -423,7 +433,7 @@ case_result_t truncated_index_is_malformed(mount_type_ const& mount) {
     // The blob is as long as the run claims, so nothing but the medium can cut the index short.
     volume_blob_t handed;
     handed.medium = stub;
-    handed.extent = extent_t {0, variable_layout_t::blob_bytes(claimed_k, 0, 0)};
+    handed.extent = extent_t {0, variable_layout_t::blob_bytes(claimed_k, 0, 0, 0)};
     handed.length = handed.extent.length;
     failures += expect(handed.extent.length > stub_bytes_k);
 
@@ -482,8 +492,8 @@ std::size_t missing_run_is_not_found(mount_type_ const& mount) {
     {
         expected<variable_run_t> written = variable_run_t::write(
             *volume, guard->channel(), content_id, std::span<variable_slot_t const> {data.key_slots},
-            std::span<std::uint64_t const> {ascending_stamps(data.key_slots.size())}, 0,
-            std::span<byte_t const> {data.values}, 4096);
+            std::span<std::uint64_t const> {ascending_stamps(data.key_slots.size())},
+            std::span<std::uint8_t const> {data.kinds}, 0, std::span<byte_t const> {data.values}, 4096);
         failures += expect(written.has_value());
         if (!written) return failures;
     }
@@ -492,8 +502,8 @@ std::size_t missing_run_is_not_found(mount_type_ const& mount) {
     // A second run under the same name is refused, since a run is immutable once it is recorded.
     expected<variable_run_t> again = variable_run_t::write(
         *volume, guard->channel(), content_id, std::span<variable_slot_t const> {data.key_slots},
-        std::span<std::uint64_t const> {ascending_stamps(data.key_slots.size())}, 0,
-        std::span<byte_t const> {data.values}, 4096);
+        std::span<std::uint64_t const> {ascending_stamps(data.key_slots.size())},
+        std::span<std::uint8_t const> {data.kinds}, 0, std::span<byte_t const> {data.values}, 4096);
     failures += expect(!again.has_value());
     failures += expect_status(again, status_code_t::already_exists_k);
 
@@ -536,8 +546,8 @@ std::size_t point_lookup_finds_and_misses(mount_type_ const& mount) {
     if (failures != 0) return failures;
     expected<variable_run_t> run = variable_run_t::write(
         *volume, guard->channel(), uuid_generator(), std::span<variable_slot_t const> {data.key_slots},
-        std::span<std::uint64_t const> {ascending_stamps(data.key_slots.size())}, 0,
-        std::span<byte_t const> {data.values}, 4096);
+        std::span<std::uint64_t const> {ascending_stamps(data.key_slots.size())},
+        std::span<std::uint8_t const> {data.kinds}, 0, std::span<byte_t const> {data.values}, 4096);
     failures += expect(run.has_value());
     if (!run) return failures;
 
@@ -599,8 +609,8 @@ std::size_t runs_at_the_smallest_sizes(mount_type_ const& mount) {
     uuid_t const one_id = uuid_generator();
     expected<variable_run_t> one = variable_run_t::write(
         *volume, guard->channel(), one_id, std::span<variable_slot_t const> {alone.key_slots},
-        std::span<std::uint64_t const> {ascending_stamps(alone.key_slots.size())}, 0,
-        std::span<byte_t const> {alone.values}, 4096);
+        std::span<std::uint64_t const> {ascending_stamps(alone.key_slots.size())},
+        std::span<std::uint8_t const> {alone.kinds}, 0, std::span<byte_t const> {alone.values}, 4096);
     failures += expect(one.has_value());
     if (!one) return failures;
     failures += expect_eq(one->population_count(), std::uint64_t {1});
@@ -617,15 +627,15 @@ std::size_t runs_at_the_smallest_sizes(mount_type_ const& mount) {
     uuid_t const empty_id = uuid_generator();
     expected<variable_run_t> empty = variable_run_t::write(
         *volume, guard->channel(), empty_id, std::span<variable_slot_t const> {none.key_slots},
-        std::span<std::uint64_t const> {ascending_stamps(none.key_slots.size())}, 0,
-        std::span<byte_t const> {none.values}, 4096);
+        std::span<std::uint64_t const> {ascending_stamps(none.key_slots.size())},
+        std::span<std::uint8_t const> {none.kinds}, 0, std::span<byte_t const> {none.values}, 4096);
     failures += expect(empty.has_value());
     if (!empty) return failures;
     failures += expect_eq(empty->population_count(), std::uint64_t {0});
-    // An empty run is its header and the trailer of an empty stamps column, which still names its count and width
-    failures += expect_eq(
-        empty->size_bytes(),
-        variable_layout_t::header_bytes() + variable_layout_t::stamps_section_bytes(empty->stamps().saved_bytes()));
+    // An empty run is its header and the trailer of empty stamps and kinds columns, which still name count and width
+    failures += expect_eq(empty->size_bytes(), variable_layout_t::header_bytes() +
+                                                   variable_layout_t::trailer_bytes(empty->stamps().saved_bytes(),
+                                                                                    empty->kinds().saved_bytes()));
     failures += expect(empty->lower_stored_key() == limit<stored_key_t>::max());
     failures += expect(empty->upper_stored_key() == limit<stored_key_t>::min());
     failures += expect(empty->find(key_of(0), position) == find_result_t::nothing_k);
@@ -678,8 +688,8 @@ std::size_t values_at_the_size_extremes(mount_type_ const& mount) {
 
     expected<variable_run_t> run = variable_run_t::write(
         *volume, guard->channel(), uuid_generator(), std::span<variable_slot_t const> {data.key_slots},
-        std::span<std::uint64_t const> {ascending_stamps(data.key_slots.size())}, 0,
-        std::span<byte_t const> {data.values}, largest_k);
+        std::span<std::uint64_t const> {ascending_stamps(data.key_slots.size())},
+        std::span<std::uint8_t const> {data.kinds}, 0, std::span<byte_t const> {data.values}, largest_k);
     failures += expect(run.has_value());
     if (!run) return failures;
     failures += check_variable_values(*run, guard->channel(), data);
@@ -732,8 +742,8 @@ std::size_t tombstones_read_back_as_tombstones(mount_type_ const& mount) {
     {
         expected<variable_run_t> written = variable_run_t::write(
             *volume, guard->channel(), content_id, std::span<variable_slot_t const> {data.key_slots},
-            std::span<std::uint64_t const> {ascending_stamps(data.key_slots.size())}, 0,
-            std::span<byte_t const> {data.values}, 4096);
+            std::span<std::uint64_t const> {ascending_stamps(data.key_slots.size())},
+            std::span<std::uint8_t const> {data.kinds}, 0, std::span<byte_t const> {data.values}, 4096);
         failures += expect(written.has_value());
         if (!written) return failures;
     }
@@ -746,12 +756,12 @@ std::size_t tombstones_read_back_as_tombstones(mount_type_ const& mount) {
         find_result_t const found = run->find(key_of(index), position);
         if (sized(index) < 0) {
             failures += expect(found == find_result_t::stored_key_k);
-            failures += expect(run->key_slot(position).is_tombstone());
+            failures += expect(run->kind(position) == delta_kind_t::remove_k);
             failures += expect_eq(run->value_window(position).extent.length, std::uint64_t {0});
         }
         else {
             failures += expect(found == find_result_t::success_k);
-            failures += expect(!run->key_slot(position).is_tombstone());
+            failures += expect(run->kind(position) == delta_kind_t::write_k);
         }
     }
     failures += check_variable_values(*run, guard->channel(), data);
@@ -795,8 +805,8 @@ std::size_t batched_read_holds_its_depth(mount_type_ const& mount) {
     if (failures != 0) return failures;
     expected<variable_run_t> run = variable_run_t::write(
         *volume, guard->channel(), uuid_generator(), std::span<variable_slot_t const> {data.key_slots},
-        std::span<std::uint64_t const> {ascending_stamps(data.key_slots.size())}, 0,
-        std::span<byte_t const> {data.values}, 4096);
+        std::span<std::uint64_t const> {ascending_stamps(data.key_slots.size())},
+        std::span<std::uint8_t const> {data.kinds}, 0, std::span<byte_t const> {data.values}, 4096);
     failures += expect(run.has_value());
     if (!run) return failures;
 

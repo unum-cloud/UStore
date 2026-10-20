@@ -35,7 +35,6 @@ static nvme_size_keyword_t const nvme_size_keywords[] = {
     {"collection_write_buffer_max_bytes", offsetof(ustore_database_open_nvme_t, collection_write_buffer_max_bytes)},
     {"collection_write_buffer_max_elements",
      offsetof(ustore_database_open_nvme_t, collection_write_buffer_max_elements)},
-    {"collection_first_level_max_bytes", offsetof(ustore_database_open_nvme_t, collection_first_level_max_bytes)},
     {"collection_level_enlarge_factor", offsetof(ustore_database_open_nvme_t, collection_level_enlarge_factor)},
     {"collection_value_size", offsetof(ustore_database_open_nvme_t, collection_value_size)},
     {"collection_value_max_size", offsetof(ustore_database_open_nvme_t, collection_value_max_size)},

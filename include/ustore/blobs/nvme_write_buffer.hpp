@@ -10,12 +10,13 @@
 #include <cstddef> // `std::byte`, `std::size_t`
 
 #include <algorithm> // `std::min`, `std::max`
+#include <limits>    // `std::numeric_limits`
 #include <new>       // placement `new`
 
 #include <smashtable/basic_hash_table.hpp> // `st::hash_map`, `st::assume_reserved`
 #include <smashtable/basic_vector.hpp>     // `st::basic_vector`
 
-#include "ustore/blobs/nvme_key_slot.hpp"   // `limit`, `stored_value_size_t`
+#include "ustore/blobs/nvme_key_slot.hpp"   // `limit`, `stored_value_size_t`, `delta_kind_t`
 #include "ustore/utilities/nvme_ring.hpp"   // `constrained_allocator`
 #include "ustore/utilities/nvme_volume.hpp" // `resources_shared_ptr_t`
 #include "ustore/utilities/types.hpp"       // the `fu` and `st` aliases
@@ -46,6 +47,7 @@ class write_buffer {
     struct stored_value_place_t {
         stored_value_offset_in_buffer_t offset;
         stored_value_size_t size;
+        delta_kind_t kind = delta_kind_t::write_k;
         transaction_stamp_t watch_stamp = invalid_transaction_stamp_k;
     };
 
@@ -230,7 +232,7 @@ inline write_buffer_status_t write_buffer<stored_key_>::status(stored_key_t stor
                 write_buffer_status_t::found_k,
                 write_buffer_status_t::removed_k,
             };
-            result = results[entry.value().offset == tombstone_offset_k];
+            result = results[entry.value().kind == delta_kind_t::remove_k];
         },
         st::assume_reserved);
 
@@ -245,7 +247,7 @@ inline status_t write_buffer<stored_key_>::stored_value_size(stored_key_t stored
     stored_values.probe_to_find(
         stored_key,
         [&](auto const& entry) {
-            if (entry.value().offset != tombstone_offset_k) size = entry.value().size;
+            if (entry.value().kind != delta_kind_t::remove_k) size = entry.value().size;
             status = status_t {};
         },
         st::assume_reserved);
@@ -262,11 +264,11 @@ inline status_t write_buffer<stored_key_>::select(stored_key_t stored_key, store
         stored_key,
         [&](auto const& entry) {
             auto const& stored_value_place = entry.value();
-            if (stored_value_place.offset == tombstone_offset_k) {
+            if (stored_value_place.kind == delta_kind_t::remove_k) {
                 status = status_t {status_code_t::not_found_k, "Object not exists"};
                 return;
             }
-            if (stored_value_place.offset == empty_stored_value_offset_k) {
+            if (stored_value_place.size == 0) {
                 size = 0;
                 status = status_t {};
                 return;
@@ -292,7 +294,8 @@ inline write_buffer_status_t write_buffer<stored_key_>::find(stored_key_t stored
                                                              stored_value_location_& location) const noexcept {
 
     location.size_bytes = 0;
-    location.offset = tombstone_offset_k;
+    location.offset = 0;
+    location.kind = delta_kind_t::remove_k;
     location.recipient_id = reinterpret_cast<u64_t>(this);
     location.recipient_state_id = 0;
 
@@ -301,11 +304,12 @@ inline write_buffer_status_t write_buffer<stored_key_>::find(stored_key_t stored
         stored_key,
         [&](auto const& entry) {
             auto const& stored_value_place = entry.value();
-            location.offset = stored_value_place.offset;
+            location.offset = static_cast<stored_value_offset_t>(stored_value_place.offset);
             location.size_bytes = stored_value_place.size;
+            location.kind = stored_value_place.kind;
             constexpr write_buffer_status_t results[2] = {write_buffer_status_t::found_k,
                                                           write_buffer_status_t::removed_k};
-            result = results[stored_value_place.offset == tombstone_offset_k];
+            result = results[stored_value_place.kind == delta_kind_t::remove_k];
         },
         st::assume_reserved);
 
@@ -357,10 +361,9 @@ inline status_t write_buffer<stored_key_>::add(stored_key_t stored_key, stored_v
         next_stored_value_offset_ += stored_value.size();
         std::memcpy(stored_values_buffer.data() + stored_value_offset, stored_value.data(), stored_value.size());
     }
-    else stored_value_offset = empty_stored_value_offset_k;
     stored_values.emplace(stored_key,
                           stored_value_place_t {stored_value_offset, stored_value_size_t(stored_value.size()),
-                                                earlier_watch_(stored_key, watch_stamp)},
+                                                delta_kind_t::write_k, earlier_watch_(stored_key, watch_stamp)},
                           st::assume_reserved);
 
     return status_t {};
@@ -374,7 +377,7 @@ inline status_t write_buffer<stored_key_>::mark_as_removed(stored_key_t stored_k
         return status_t {status_code_t::capacity_exhausted_k, "Cache is full"};
 
     stored_values.emplace(stored_key,
-                          stored_value_place_t {tombstone_offset_k, 0, earlier_watch_(stored_key, watch_stamp)},
+                          stored_value_place_t {0, 0, delta_kind_t::remove_k, earlier_watch_(stored_key, watch_stamp)},
                           st::assume_reserved);
     return status_t {};
 }
@@ -482,8 +485,9 @@ inline bool write_buffer<stored_key_>::can_fit(std::size_t stored_values_count,
                                                std::size_t stored_values_sum_size) const noexcept {
     auto used_memory = next_stored_value_offset_;
     bool has_element_place = stored_values.size() + stored_values_count <= elements_max_count_;
+    // A location names its offset in 32 bits, which every value of the buffer stays within.
     bool has_enough_space = (used_memory + stored_values_sum_size <= capacity_bytes_) &
-                            (used_memory + stored_values_sum_size <= empty_stored_value_offset_k);
+                            (used_memory + stored_values_sum_size <= std::numeric_limits<stored_value_offset_t>::max());
     return has_element_place & has_enough_space;
 }
 
@@ -498,21 +502,20 @@ inline status_t write_buffer<stored_key_>::unsafe_add(write_buffer const& other)
 
     [[maybe_unused]] auto const walked = other.stored_values.for_each([&](auto const& other_entry) {
         auto const& stored_value_place = other_entry.value();
-        if ((stored_value_place.offset != tombstone_offset_k) &
-            (stored_value_place.offset != empty_stored_value_offset_k)) {
+        if (stored_value_place.size != 0) {
             auto other_stored_value =
                 as_bytes_view(other.stored_values_buffer).subspan(stored_value_place.offset, stored_value_place.size);
             std::memcpy(stored_values_buffer.data() + next_stored_value_offset_, other_stored_value.data(),
                         other_stored_value.size());
-            stored_values.emplace(other_entry.key(),
-                                  stored_value_place_t {next_stored_value_offset_, stored_value_place.size},
-                                  st::assume_reserved);
+            stored_values.emplace(
+                other_entry.key(),
+                stored_value_place_t {next_stored_value_offset_, stored_value_place.size, stored_value_place.kind},
+                st::assume_reserved);
 
             next_stored_value_offset_ += stored_value_place.size;
         }
         else
-            stored_values.emplace(other_entry.key(),
-                                  stored_value_place_t {stored_value_place.offset, stored_value_place.size},
+            stored_values.emplace(other_entry.key(), stored_value_place_t {0, 0, stored_value_place.kind},
                                   st::assume_reserved);
     });
 
@@ -533,7 +536,7 @@ inline void write_buffer<stored_key_>::unsafe_drop_stored_values() noexcept {
 
     [[maybe_unused]] st::status_t const walked = stored_values.for_each([&](auto const& entry) noexcept {
         auto& stored_value_place = entry.value_ref();
-        stored_value_place.offset = empty_stored_value_offset_k;
+        stored_value_place.offset = 0;
         stored_value_place.size = 0;
         return st::walk_control_t::resume_k;
     });

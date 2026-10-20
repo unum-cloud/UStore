@@ -92,7 +92,6 @@ struct graph_types {
     config.cache_limit = cache_limit;
     config.write_buffer_max_elements = 4096;
     config.write_buffer_max_bytes = 4ull * 1024ull * 1024ull;
-    config.first_level_max_bytes = 16ull * 1024ull * 1024ull;
     config.level_enlarge_factor = 4;
     config.value_max_size = 256ull * 1024ull;
     return config;

@@ -101,12 +101,20 @@ class collection_view {
      */
     [[nodiscard]] bool find(stored_key_t const& stored_key, transaction_stamp_t at,
                             delta_view_t& found) const noexcept {
+        transaction_stamp_t version = unwritten_stamp_k;
+        return find(stored_key, at, found, version);
+    }
+
+    /** As @c find, also answering in @p version the stamp of the version found, below which a fold reads on. */
+    [[nodiscard]] bool find(stored_key_t const& stored_key, transaction_stamp_t at, delta_view_t& found,
+                            transaction_stamp_t& version) const noexcept {
         for (run_t const* run : runs_) {
             if (run->oldest_stamp() > at) continue;
             for (std::size_t position = run->lower_bound(stored_key);
                  position != run->size() && run->stored_key(position) == stored_key; ++position)
                 if (run->stamp(position) <= at) {
                     found = run->delta(position);
+                    version = run->stamp(position);
                     return true;
                 }
         }

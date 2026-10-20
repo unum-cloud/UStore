@@ -113,7 +113,6 @@ struct transactions_types {
     config.collection.write_buffer_max_bytes = 16ull * 1024ull * 1024ull;
     config.collection.write_buffer_max_elements = 8192;
     config.collection.lsm_tree.level_enlarge_factor = 8;
-    config.collection.lsm_tree.lsm_level_0.max_bytes = 64ull * 1024ull * 1024ull;
     config.collection.lsm_tree.lsm_level_0.sorted_run.value_size = value_size;
     config.collection.lsm_tree.lsm_level_0.sorted_run.value_max_size = value_max_size;
     config.default_transaction.write_buffer_max_bytes = 16ull * 1024ull * 1024ull;

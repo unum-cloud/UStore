@@ -58,8 +58,10 @@
 #include "ustore/blobs/memory_run.hpp"        // `keyed_delta`, `memory_run`, `sealed_writes`
 #include "ustore/blobs/nvme_key_slot.hpp"     // `limit`, `stored_value_size_t`, `value_layout_t`
 #include "ustore/blobs/nvme_tree.hpp"         // `lsm_tree`, `lsm_tree_position_t`, `collection_config_t`
+#include "ustore/utilities/folds.hpp"         // `fold_concept`, `fold_pair`, `last_write_fold`
 #include "ustore/utilities/nvme_channels.hpp" // `io_channel_t`
 #include "ustore/utilities/nvme_ring.hpp"     // `resource_constraint_t`, `constrained_allocator`
+#include "ustore/utilities/ram_buffers.hpp"   // `local_arena_t`, `arena_allocator`
 #include "ustore/utilities/types.hpp"         // `status_t`, `status_code_t`, `expected`, `byte_t`
 
 namespace unum::ustore::blobs {
@@ -834,7 +836,26 @@ struct sealed_commit {
     std::unique_ptr<memory_run<stored_key_type_, constrained_allocator<byte_t>>> run;
 };
 
-template <typename key_slot_type_, typename volume_type_>
+/** One key a scan hands out: what it carries at the scan's stamp and how wide its value is. */
+template <typename stored_key_type_>
+struct scan_entry {
+
+    /** The key. */
+    stored_key_type_ stored_key {};
+
+    /** Whether the key carries a value or a removal. */
+    select_result_t state = select_result_t::nothing_k;
+
+    /** Bytes the value takes, zero for a removal and for an empty value. */
+    stored_value_size_t size = 0;
+};
+
+/** Keys one page of a scan holds, as many as one page of memory does, which bounds how long a commit waits. */
+template <typename stored_key_type_>
+inline constexpr std::size_t scan_page_keys_k = utilities::arena_page_bytes_k / sizeof(scan_entry<stored_key_type_>);
+
+template <typename key_slot_type_, typename volume_type_,
+          utilities::fold_concept fold_type_ = utilities::last_write_fold>
 class collection_scanner;
 
 #pragma endregion Vocabulary
@@ -852,8 +873,13 @@ class collection_scanner;
  *  it no longer names before returning, once every reader that entered before has left. Merges, flushes, compactions
  *  and truncations of one collection are serialized by its owner. The volume, the budget and every channel are
  *  borrowed and must outlive the collection, and a channel belongs to the thread holding it.
+ *
+ *  The fold decides what a change record does: a read collects a key's versions newest first down to the first that
+ *  closes the chain and applies them, and every merge composes the changes no reader tells apart. A collection of
+ *  blobs folds with @c last_write_fold, writes no change, and reads and merges exactly as if it had no fold.
  */
-template <typename key_slot_type_, typename volume_type_>
+template <typename key_slot_type_, typename volume_type_,
+          utilities::fold_concept fold_type_ = utilities::last_write_fold>
 class collection {
   public:
 
@@ -864,6 +890,9 @@ class collection {
 
     /** The volume every run of this collection lives on. */
     using volume_t = volume_type_;
+
+    /** What a change record of this collection does, which reads and merges fold with. */
+    using fold_t = fold_type_;
 
     /** The key the runs order their key slots by. */
     using stored_key_t = typename key_slot_t::stored_key_t;
@@ -955,7 +984,7 @@ class collection {
         mounted.cache_ = value_cache_t::of(holds_values_inline_k ? 0 : config.cache_limit, mounted.value_max_size_,
                                            constraint);
 
-        auto [tree, mount_tree_status] = tree_t::mount(volume, config.lsm_tree);
+        auto [tree, mount_tree_status] = tree_t::mount(volume, config.lsm_tree, config.write_buffer_max_bytes);
         if (mount_tree_status.failed()) return mount_tree_status;
         mounted.tree_ = std::move(tree);
         mounted.current_.reset(new (std::nothrow) view_t {});
@@ -1038,6 +1067,8 @@ class collection {
      *  @param[out] size Bytes the value takes, which is zero for anything but @c success_k.
      *  @param[in] stamp The stamp a reader is pinned at, or @c head_stamp_k for the published one.
      *  @param[in] thread_index The executor thread reading, which announces on its own epoch slot.
+     *  @return What the key carries, or @c incomplete_k for a fold's chain reaching a level whose values only a
+     *      @c select reads.
      */
     [[nodiscard]] select_result_t find(stored_key_t stored_key, stored_value_size_t& size,
                                        transaction_stamp_t stamp = head_stamp_k,
@@ -1046,13 +1077,16 @@ class collection {
         reader_t const inside = ledger_->epochs().enter(thread_index);
         reading_t const read = reading_(stamp);
         delta_view_t found;
-        if (read.view->memory_runs.find(stored_key, read.stamp, found)) {
+        transaction_stamp_t version = unwritten_stamp_k;
+        if (read.view->memory_runs.find(stored_key, read.stamp, found, version)) {
+            if (found.kind == delta_kind_t::change_k) return find_folded_(read, stored_key, size);
             if (found.kind == delta_kind_t::remove_k) return select_result_t::erased_k;
             size = static_cast<stored_value_size_t>(found.bytes.size());
             return select_result_t::success_k;
         }
-        transaction_stamp_t version = unwritten_stamp_k;
-        return find_in_levels_(*read.view->levels, stored_key, read.stamp, size, version);
+        find_result_t const in_levels = find_in_levels_(*read.view->levels, stored_key, read.stamp, size, version);
+        if (in_levels == find_result_t::changed_k) return find_folded_(read, stored_key, size);
+        return selected_(in_levels);
     }
 
     /**
@@ -1074,6 +1108,7 @@ class collection {
         reading_t const read = reading_(stamp);
         delta_view_t found;
         if (read.view->memory_runs.find(stored_key, read.stamp, found)) {
+            if (found.kind == delta_kind_t::change_k) return select_folded_(channel, read, stored_key, into, size);
             if (found.kind == delta_kind_t::remove_k) return {status_code_t::not_found_k, "A commit erased that key"};
             if (into.size() < found.bytes.size())
                 return {status_code_t::invalid_argument_k, "A buffer shorter than the value"};
@@ -1085,8 +1120,9 @@ class collection {
         level_set_t const& levels = *read.view->levels;
         stored_value_size_t wanted = 0;
         transaction_stamp_t version = unwritten_stamp_k;
-        if (find_in_levels_(levels, stored_key, read.stamp, wanted, version) != select_result_t::success_k)
-            return {status_code_t::not_found_k, "No level carries that key"};
+        find_result_t const in_levels = find_in_levels_(levels, stored_key, read.stamp, wanted, version);
+        if (in_levels == find_result_t::changed_k) return select_folded_(channel, read, stored_key, into, size);
+        if (in_levels != find_result_t::success_k) return {status_code_t::not_found_k, "No level carries that key"};
         if (into.size() < wanted) return {status_code_t::invalid_argument_k, "A buffer shorter than the value"};
 
         if constexpr (!holds_values_inline_k)
@@ -1145,10 +1181,17 @@ class collection {
 
         // A cached value is copied out of its slot before the sink sees it, into one buffer the whole batch reuses.
         constrained_buffer_t cached_value {constrained_allocator<byte_t> {*constraint_}};
+        // A key whose newest version is a fold's change is folded on its own once the batch's reads have retired.
+        deferred_requests_t folded_requests {constrained_allocator<std::size_t> {*constraint_}};
         for (std::size_t request = 0; request != stored_keys.size(); ++request) {
             delta_view_t found;
             if (read.view->memory_runs.find(stored_keys[request], read.stamp, found)) {
-                if (found.kind == delta_kind_t::remove_k) results[request] = select_result_t::erased_k;
+                if (found.kind == delta_kind_t::change_k) {
+                    results[request] = select_result_t::nothing_k;
+                    if (folded_requests.push_back(std::size_t {request}) != st::status_t::success_k)
+                        return {status_code_t::out_of_memory_k, "A collection could not track the keys of a batch"};
+                }
+                else if (found.kind == delta_kind_t::remove_k) results[request] = select_result_t::erased_k;
                 else {
                     results[request] = select_result_t::success_k;
                     sink(request, std::uint64_t {0}, found.bytes);
@@ -1161,7 +1204,7 @@ class collection {
                     stored_value_size_t copied = 0;
                     transaction_stamp_t version = unwritten_stamp_k;
                     bool const cached = find_in_levels_(levels, stored_keys[request], read.stamp, wanted, version) ==
-                                            select_result_t::success_k &&
+                                            find_result_t::success_k &&
                                         cached_value.resize(wanted) == st::status_t::success_k &&
                                         cache_.copy(stored_keys[request], version, std::span<byte_t> {cached_value},
                                                     copied);
@@ -1175,7 +1218,9 @@ class collection {
             [[maybe_unused]] st::status_t const named = deferred_keys.push_back(stored_key_t {stored_keys[request]});
             [[maybe_unused]] st::status_t const tracked = deferred_requests.push_back(std::size_t {request});
         }
-        if (deferred_keys.empty()) return {};
+        if (deferred_keys.empty())
+            return select_folded_(channel, read, stored_keys, std::span<std::size_t const> {folded_requests}, results,
+                                  sink);
 
         // The tree answers in its own vocabulary and the sink is told nothing about sizes, so the bytes every key
         // owed are counted here and compared once the read has run.
@@ -1204,10 +1249,15 @@ class collection {
                 result = select_result_t::erased_k;
                 continue;
             }
+            if (answers[index] == find_result_t::changed_k) {
+                if (folded_requests.push_back(std::size_t {deferred_requests[index]}) != st::status_t::success_k)
+                    return {status_code_t::out_of_memory_k, "A collection could not track the keys of a batch"};
+                continue;
+            }
             stored_value_size_t wanted = 0;
             transaction_stamp_t version = unwritten_stamp_k;
-            [[maybe_unused]] select_result_t const carried = find_in_levels_(levels, deferred_keys[index], read.stamp,
-                                                                             wanted, version);
+            [[maybe_unused]] find_result_t const carried = find_in_levels_(levels, deferred_keys[index], read.stamp,
+                                                                           wanted, version);
             if (delivered[index] == wanted) result = select_result_t::success_k;
             else {
                 result = select_result_t::incomplete_k;
@@ -1217,7 +1267,8 @@ class collection {
 
         // A block short of what it asked for fails its own key; a cancelled or refused one fails the batch.
         if (read_status.failed() && (truncated == 0 || !(read_status == status_code_t::io_k))) return read_status;
-        return {};
+        return select_folded_(channel, read, stored_keys, std::span<std::size_t const> {folded_requests}, results,
+                              sink);
     }
 
 #pragma endregion Lookups
@@ -1230,12 +1281,14 @@ class collection {
     /**
      *  @brief Sorts and copies @p deltas into one commit's records for this collection, on the committer's thread
      *      and off every shared path, and allocates the run they become; no records seal into no run.
-     *  @param[in] deltas The commit's records for this collection, one per key, which this sorts in place.
+     *  @param[in] deltas The commit's records for this collection, one per key, which this sorts in place: writes of
+     *      an admitted width, removals, and a fold's changes, which only a run file's length bounds unless they sit
+     *      inline in a key slot.
      */
     expected<sealed_commit_t> seal(std::span<keyed_delta_t> deltas) const noexcept {
         for (keyed_delta_t const& each : deltas)
-            if (each.delta.kind == delta_kind_t::write_k && !admits_(each.delta.bytes.size()))
-                return status_t {status_code_t::malformed_k, "This collection admits no value of that size"};
+            if (!admits_(each.delta))
+                return status_t {status_code_t::malformed_k, "This collection admits no record of that size"};
         sealed_commit_t sealed;
         if (deltas.empty()) return sealed;
         auto [writes, seal_status] = sealed_writes_t::seal(deltas, constrained_allocator<byte_t> {*constraint_});
@@ -1483,7 +1536,11 @@ class collection {
             // Nothing a memory run holds is durable, so no mount needs a version; a head reader needs those above this.
             survival.horizon = ledger_->published();
             stamped_deltas_t versions {constrained_allocator<stamped_delta_t> {*constraint_}};
-            if (status_t const kept = kept_versions_(std::span<memory_run_t const* const> {group}, survival, versions);
+            // The changes a merge folds sit here until the merged run copies them.
+            utilities::local_arena_t folded;
+            utilities::arena_allocator<byte_t> folded_bytes = folded.allocator();
+            if (status_t const kept = kept_versions_(std::span<memory_run_t const* const> {group}, survival, versions,
+                                                     folded_bytes);
                 kept.failed())
                 return kept;
             auto [merged, merged_status] = memory_run_t::merged(
@@ -1549,14 +1606,17 @@ class collection {
 
         drained_slots_t key_slots {constrained_allocator<key_slot_t> {*constraint_}};
         drained_stamps_t stamps {constrained_allocator<std::uint64_t> {*constraint_}};
+        drained_kinds_t kinds {constrained_allocator<std::uint8_t> {*constraint_}};
         drained_values_t stored_values {constrained_allocator<byte_t> {*constraint_}};
+        utilities::local_arena_t folded;
+        utilities::arena_allocator<byte_t> folded_bytes = folded.allocator();
         if (status_t const drained = drain_(std::span<memory_run_t const* const> {publication.flushed}, survival,
-                                            key_slots, stamps, stored_values);
+                                            folded_bytes, key_slots, stamps, kinds, stored_values);
             drained.failed())
             return drained;
         return tree_.flush(channel, std::span<key_slot_t const> {key_slots}, std::span<std::uint64_t const> {stamps},
-                           survival.floor, std::span<byte_t const> {stored_values}, value_max_size_,
-                           publication.hook());
+                           std::span<std::uint8_t const> {kinds}, survival.floor,
+                           std::span<byte_t const> {stored_values}, value_max_size_, publication.hook());
     }
 
     /** Whether any level of the tree is over the bytes its number admits. */
@@ -1586,7 +1646,7 @@ class collection {
         publication.owner = this;
         publication.oldest_readable = stamps.horizon;
         publication.chained = &published;
-        return tree_.compact(reading_channel, writing_channel, compaction_placement_t::automatic_k, nullptr,
+        return tree_.compact(reading_channel, writing_channel, compaction_placement_t::automatic_k, nullptr, fold_,
                              publication.hook(), stamps);
     }
 
@@ -1604,14 +1664,14 @@ class collection {
         publication_t publication;
         publication.owner = this;
         publication.chained = &published;
-        return tree_.truncate_above(reading_channel, writing_channel, ceiling, publication.hook());
+        return tree_.truncate_above(reading_channel, writing_channel, ceiling, fold_, publication.hook());
     }
 
 #pragma endregion Maintenance
 
   private:
 
-    friend class collection_scanner<key_slot_t, volume_t>;
+    friend class collection_scanner<key_slot_t, volume_t, fold_t>;
 
 #pragma region Private Types
 
@@ -1679,6 +1739,9 @@ class collection {
     /** The stamps of the key slots one flush writes, in the same order. */
     using drained_stamps_t = st::basic_vector<std::uint64_t, constrained_allocator<std::uint64_t>>;
 
+    /** The @c delta_kind_t of the key slots one flush writes, in the same order. */
+    using drained_kinds_t = st::basic_vector<std::uint8_t, constrained_allocator<std::uint8_t>>;
+
     /** The versions one merge or one flush carries over, before and after they are sorted into a run's order. */
     using stamped_deltas_t = st::basic_vector<stamped_delta_t, constrained_allocator<stamped_delta_t>>;
 
@@ -1701,16 +1764,18 @@ class collection {
 
 #pragma region Private Methods
 
-    /**
-     *  @brief Whether a value of @p size bytes is one this collection's layout can hold.
-     *
-     *  @note An inline layout takes no empty value, since a key slot holding zero bytes is the
-     *      tombstone itself and no width is left to tell the two apart.
-     */
+    /** Whether a written value of @p size bytes is one this collection's layout can hold. */
     [[nodiscard]] bool admits_(std::size_t size) const noexcept {
         if constexpr (is_fixed(value_layout_k)) return size == value_size_;
-        else if constexpr (holds_values_inline_k) return size != 0 && size <= value_max_size_;
         else return size <= value_max_size_;
+    }
+
+    /** Whether this collection's layout can hold @p delta: a write of an admitted width, or a removal or a change
+     *  that fits the key slot where values sit inline, the written-value bounds binding writes alone. */
+    [[nodiscard]] bool admits_(delta_view_t const& delta) const noexcept {
+        if (delta.kind == delta_kind_t::write_k) return admits_(delta.bytes.size());
+        if constexpr (holds_values_inline_k) return delta.bytes.size() <= value_max_size_;
+        else return true;
     }
 
     /** Records every memory run of @p view holds. */
@@ -1743,19 +1808,172 @@ class collection {
         }
     }
 
-    /** What @p levels answer for @p stored_key at @p stamp, the bytes its value takes, and the stamp of @p version. */
-    [[nodiscard]] select_result_t find_in_levels_(level_set_t const& levels, stored_key_t stored_key,
-                                                  transaction_stamp_t stamp, stored_value_size_t& size,
-                                                  transaction_stamp_t& version) const noexcept {
+    /** What @p levels answer for @p stored_key at @p stamp, the bytes its value takes, and the stamp of @p version;
+     *  a change answers its own bytes, which the versions below it complete. */
+    [[nodiscard]] find_result_t find_in_levels_(level_set_t const& levels, stored_key_t stored_key,
+                                                transaction_stamp_t stamp, stored_value_size_t& size,
+                                                transaction_stamp_t& version) const noexcept {
         size = 0;
         lsm_tree_position_t position;
         find_result_t const found = tree_.find(levels, stored_key, position, stamp);
-        if (found == find_result_t::nothing_k) return select_result_t::nothing_k;
-        if (found == find_result_t::stored_key_k) return select_result_t::erased_k;
+        if (found == find_result_t::nothing_k || found == find_result_t::stored_key_k) return found;
         auto const& level = levels.level(position.level_number);
         size = static_cast<stored_value_size_t>(level.value_window(position.level_position).bytes);
         version = level.run(position.level_position.run_index).stamp(position.level_position.key_slot_position);
+        return found;
+    }
+
+    /** What a lookup of the levels answering @p found tells a caller, a change aside. */
+    [[nodiscard]] static select_result_t selected_(find_result_t found) noexcept {
+        if (found == find_result_t::nothing_k) return select_result_t::nothing_k;
+        if (found == find_result_t::stored_key_k) return select_result_t::erased_k;
         return select_result_t::success_k;
+    }
+
+    /**
+     *  @brief Folds the versions of @p stored_key at or below @p read's stamp, collected newest first down to the first
+     *      that closes the chain, into the value a reader at that stamp sees.
+     *  @param[in] bytes_of Called as @c bytes_of(run, slot, bytes) for a version a level holds, viewing its bytes in
+     *      the key slot or in @p arena, answering a status.
+     *  @param[out] value The folded value, viewing a memory run, a key slot, or @p arena.
+     *  @return What the key carries, or the status a read or the fold refused it with.
+     */
+    template <typename bytes_of_type_>
+    expected<select_result_t> fold_versions_(reading_t const& read, stored_key_t stored_key, bytes_of_type_&& bytes_of,
+                                             utilities::arena_allocator<byte_t>& arena,
+                                             std::span<byte_t const>& value) const noexcept {
+        value = {};
+        st::basic_vector<delta_view_t, utilities::arena_allocator<delta_view_t>> chain {
+            utilities::arena_allocator<delta_view_t> {arena}};
+        delta_view_t closing {delta_kind_t::remove_k, {}};
+        bool closed = false;
+        for (transaction_stamp_t at = read.stamp;;) {
+            delta_view_t version;
+            transaction_stamp_t stamp = unwritten_stamp_k;
+            if (!read.view->memory_runs.find(stored_key, at, version, stamp)) {
+                lsm_tree_position_t position;
+                find_result_t const found = tree_.find(*read.view->levels, stored_key, position, at);
+                if (found == find_result_t::nothing_k) break;
+                auto const& run =
+                    read.view->levels->level(position.level_number).run(position.level_position.run_index);
+                std::uint64_t const sorted = position.level_position.key_slot_position;
+                stamp = run.stamp(sorted);
+                version.kind = run.kind(sorted);
+                key_slot_t const& slot = run.key_slot(sorted);
+                if (slot.size != 0)
+                    if (status_t const read_bytes = bytes_of(run, slot, version.bytes); read_bytes.failed())
+                        return read_bytes;
+            }
+            if (version.kind != delta_kind_t::change_k || fold_.closes(version)) {
+                closing = version;
+                closed = true;
+                break;
+            }
+            if (chain.push_back(delta_view_t {version}) != st::status_t::success_k)
+                return status_t {status_code_t::out_of_memory_k, "No room to collect a key's changes"};
+            // Versions of one key carry distinct stamps, so the next one older sits at or below this stamp less one.
+            if (stamp == unwritten_stamp_k) break;
+            at = stamp - 1;
+        }
+
+        // A change that closes the chain folds onto nothing, as a chain no version closes does.
+        if (closed && closing.kind == delta_kind_t::change_k) {
+            if (chain.push_back(delta_view_t {closing}) != st::status_t::success_k)
+                return status_t {status_code_t::out_of_memory_k, "No room to collect a key's changes"};
+            closing = delta_view_t {delta_kind_t::remove_k, {}};
+        }
+        if (chain.empty()) {
+            if (!closed) return select_result_t::nothing_k;
+            if (closing.kind == delta_kind_t::remove_k) return select_result_t::erased_k;
+            value = closing.bytes;
+            return select_result_t::success_k;
+        }
+        std::reverse(chain.begin(), chain.end());
+        std::span<byte_t const> const base = closing.kind == delta_kind_t::write_k ? closing.bytes
+                                                                                   : std::span<byte_t const> {};
+        auto [applied, apply_status] = fold_.apply(base, std::span<delta_view_t const> {chain}, arena);
+        if (apply_status.failed()) return apply_status;
+        value = applied;
+        return select_result_t::success_k;
+    }
+
+    /** As @c find answers for a key whose newest version is a change, folding it with no I/O, so a chain reaching a
+     *  level whose values sit apart from their key slots answers @c incomplete_k. */
+    [[nodiscard]] select_result_t find_folded_(reading_t const& read, stored_key_t stored_key,
+                                               stored_value_size_t& size) const noexcept {
+        utilities::local_arena_t scratch;
+        utilities::arena_allocator<byte_t> arena = scratch.allocator();
+        std::span<byte_t const> value;
+        auto bytes_of = [](auto const&, key_slot_t const& slot, std::span<byte_t const>& bytes) noexcept -> status_t {
+            if constexpr (holds_values_inline_k) {
+                bytes = std::span<byte_t const> {slot.data, slot.size};
+                return {};
+            }
+            else return {status_code_t::io_k, "A change's value is read through a channel"};
+        };
+        expected<select_result_t> const folded = fold_versions_(read, stored_key, bytes_of, arena, value);
+        if (!folded) return select_result_t::incomplete_k;
+        if (*folded == select_result_t::success_k) size = static_cast<stored_value_size_t>(value.size());
+        return *folded;
+    }
+
+    /** The bytes of the version @p slot of @p run locates, read on @p channel into @p arena where they sit apart from
+     *  the key slot. */
+    template <typename run_type_>
+    static status_t read_bytes_(io_channel_t& channel, run_type_ const& run, key_slot_t const& slot,
+                                utilities::arena_allocator<byte_t>& arena, std::span<byte_t const>& bytes) noexcept {
+        if constexpr (holds_values_inline_k) {
+            bytes = std::span<byte_t const> {slot.data, slot.size};
+            return {};
+        }
+        else {
+            byte_t* const into = slot.size != 0 ? arena.allocate(slot.size) : nullptr;
+            if (slot.size != 0 && into == nullptr)
+                return {status_code_t::out_of_memory_k, "No room to read a change's value"};
+            if (status_t const read = run.read_value(channel, slot, std::span<byte_t> {into, slot.size}); read.failed())
+                return read;
+            bytes = std::span<byte_t const> {into, slot.size};
+            return {};
+        }
+    }
+
+    /** As @c select answers for a key whose newest version is a change, reading the chain's values on @p channel. */
+    status_t select_folded_(io_channel_t& channel, reading_t const& read, stored_key_t stored_key,
+                            std::span<byte_t> into, stored_value_size_t& size) const noexcept {
+        utilities::local_arena_t scratch;
+        utilities::arena_allocator<byte_t> arena = scratch.allocator();
+        std::span<byte_t const> value;
+        auto bytes_of = [&](auto const& run, key_slot_t const& slot, std::span<byte_t const>& bytes) noexcept {
+            return read_bytes_(channel, run, slot, arena, bytes);
+        };
+        auto [folded, fold_status] = fold_versions_(read, stored_key, bytes_of, arena, value);
+        if (fold_status.failed()) return fold_status;
+        if (folded != select_result_t::success_k) return {status_code_t::not_found_k, "No version carries that key"};
+        if (into.size() < value.size()) return {status_code_t::invalid_argument_k, "A buffer shorter than the value"};
+        if (!value.empty()) std::memcpy(into.data(), value.data(), value.size());
+        size = static_cast<stored_value_size_t>(value.size());
+        return {};
+    }
+
+    /** Folds the keys of @p stored_keys that @p requests names, whose newest versions are changes, once a batched
+     *  select's reads retired, and hands each value to @p sink whole. */
+    template <typename sink_type_>
+    status_t select_folded_(io_channel_t& channel, reading_t const& read, std::span<stored_key_t const> stored_keys,
+                            std::span<std::size_t const> requests, std::span<select_result_t> results,
+                            sink_type_& sink) const noexcept {
+        for (std::size_t const request : requests) {
+            utilities::local_arena_t scratch;
+            utilities::arena_allocator<byte_t> arena = scratch.allocator();
+            std::span<byte_t const> value;
+            auto bytes_of = [&](auto const& run, key_slot_t const& slot, std::span<byte_t const>& bytes) noexcept {
+                return read_bytes_(channel, run, slot, arena, bytes);
+            };
+            auto [folded, fold_status] = fold_versions_(read, stored_keys[request], bytes_of, arena, value);
+            if (fold_status.failed()) return fold_status;
+            results[request] = folded;
+            if (folded == select_result_t::success_k) sink(request, std::uint64_t {0}, value);
+        }
+        return {};
     }
 
     /** A view naming @p newest, when not null, ahead of @p older, below levels its caller fills in, which no reader
@@ -1879,20 +2097,23 @@ class collection {
     }
 
     /**
-     *  @brief Lays the records of @p flushed out as one run's key slots and the bytes they locate.
+     *  @brief Lays the records of @p flushed out as one run's key slots, kinds and the bytes they locate.
      *  @param[in] flushed The memory runs, newest first.
      *  @param[in] survival Which older versions a reader or a mount still needs, as a merge would decide.
+     *  @param[inout] arena Where the values of folded changes sit until the run is written.
      *  @param[out] key_slots The key slots in ascending order of their keys, as a run takes them.
      *  @param[out] stamps The stamp of every key slot, the versions of one key newest first.
+     *  @param[out] kinds The @c delta_kind_t of every key slot, in the same order.
      *  @param[out] stored_values The values back to back, empty for a layout holding them inline.
      */
     status_t drain_(std::span<memory_run_t const* const> flushed, compaction_stamps_t const& survival,
-                    drained_slots_t& key_slots, drained_stamps_t& stamps,
-                    drained_values_t& stored_values) const noexcept {
+                    utilities::arena_allocator<byte_t>& arena, drained_slots_t& key_slots, drained_stamps_t& stamps,
+                    drained_kinds_t& kinds, drained_values_t& stored_values) const noexcept {
         stamped_deltas_t versions {constrained_allocator<stamped_delta_t> {*constraint_}};
-        if (status_t const kept = kept_versions_(flushed, survival, versions); kept.failed()) return kept;
+        if (status_t const kept = kept_versions_(flushed, survival, versions, arena); kept.failed()) return kept;
         if (key_slots.reserve(versions.size()) != st::status_t::success_k ||
-            stamps.reserve(versions.size()) != st::status_t::success_k)
+            stamps.reserve(versions.size()) != st::status_t::success_k ||
+            kinds.reserve(versions.size()) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A flush could not hold its key slots"};
         std::uint64_t total = 0;
         for (stamped_delta_t const& version : versions) total += version.delta.bytes.size();
@@ -1906,33 +2127,35 @@ class collection {
             std::span<byte_t const> const bytes = version.delta.bytes;
             key_slot_t built {};
             built.stored_key = version.stored_key;
-            // The run file keeps its sentinels: a removal is a tombstone slot, and an empty value an empty location.
-            if (version.delta.kind == delta_kind_t::remove_k) built.make_tombstone();
-            else if constexpr (holds_values_inline_k) {
-                built.size = static_cast<stored_value_size_t>(bytes.size());
+            built.size = static_cast<stored_value_size_t>(bytes.size());
+            if constexpr (holds_values_inline_k) {
+                // A merge may compose changes wider than any one of them, which a key slot cannot hold.
+                if (bytes.size() > sizeof(built.data))
+                    return {status_code_t::capacity_exhausted_k, "A folded change outgrows its key slot"};
                 if (!bytes.empty()) std::memcpy(built.data, bytes.data(), bytes.size());
             }
-            else if (bytes.empty()) {
-                built.size = 0;
-                built.location = empty_stored_value_offset_k;
-            }
             else {
-                built.size = static_cast<stored_value_size_t>(bytes.size());
                 built.location = static_cast<stored_value_offset_t>(location);
-                std::memcpy(stored_values.data() + written, bytes.data(), bytes.size());
+                if (!bytes.empty()) std::memcpy(stored_values.data() + written, bytes.data(), bytes.size());
                 location += bytes.size();
                 written += bytes.size();
             }
             [[maybe_unused]] st::status_t const placed = key_slots.push_back(std::move(built));
             [[maybe_unused]] st::status_t const stamped = stamps.push_back(std::uint64_t {version.stamp});
+            [[maybe_unused]] st::status_t const kinded = kinds.push_back(static_cast<std::uint8_t>(version.delta.kind));
         }
         return {};
     }
 
-    /** Gathers every version @p runs hold into @p versions, in key order with a key's versions newest first, dropping
-     *  each older version no reader of @p survival tells apart from the newer one kept before it. */
+    /**
+     *  @brief Gathers every version @p runs hold into @p versions, in key order with a key's versions newest first,
+     *      dropping each older version no reader of @p survival tells apart from the newer one kept before it.
+     *
+     *  Such a version under a kept change folds into it instead, keeping the change's stamp: a write or a removal below
+     *  makes it a write, and a change below composes with it, its bytes landing in @p arena.
+     */
     status_t kept_versions_(std::span<memory_run_t const* const> runs, compaction_stamps_t const& survival,
-                            stamped_deltas_t& versions) const noexcept {
+                            stamped_deltas_t& versions, utilities::arena_allocator<byte_t>& arena) const noexcept {
         std::size_t count = 0;
         for (memory_run_t const* run : runs) count += run->size();
         if (versions.reserve(count) != st::status_t::success_k)
@@ -1950,7 +2173,15 @@ class collection {
         for (std::size_t index = 0; index != versions.size(); ++index) {
             bool const shadowed = kept != 0 && versions[kept - 1].stored_key == versions[index].stored_key &&
                                   !keeps_older_version(survival, versions[kept - 1].stamp, versions[index].stamp);
-            if (!shadowed) versions[kept++] = versions[index];
+            if (!shadowed) {
+                versions[kept++] = versions[index];
+                continue;
+            }
+            delta_view_t& newer = versions[kept - 1].delta;
+            if (newer.kind != delta_kind_t::change_k) continue;
+            auto [folded, fold_status] = utilities::fold_pair(fold_, newer, versions[index].delta, arena);
+            if (fold_status.failed()) return fold_status;
+            newer = folded;
         }
         while (versions.size() != kept) versions.pop_back();
         return {};
@@ -2075,6 +2306,9 @@ class collection {
     /** Bytes the largest value this collection admits takes. */
     stored_value_size_t value_max_size_ = 0;
 
+    /** What a change record does, which reads and merges fold with. */
+    [[no_unique_address]] fold_t fold_ {};
+
 #pragma endregion Private Members
 };
 
@@ -2087,14 +2321,16 @@ class collection {
 #pragma region Scanner
 
 /**
- *  @brief Every key of one collection in ascending order, each with what it is and how wide it is.
+ *  @brief Every key of one collection in ascending order, each with what it is and how wide it is, read a page at a
+ *      time.
  *
- *  The scanner stays inside its ledger's epochs for its whole life, on the thread that took it, and walks the one view
- *  it loaded, so every commit, merge, flush or compaction on another thread that replaces a view waits for it before
- *  returning; a scan is taken, walked and dropped rather than kept beside a writer, and its thread commits nothing
- *  while it lives.
+ *  Each page is read inside the ledger's epochs from whichever view is published, and the epochs are left between
+ *  pages, so a commit, merge, flush or compaction replacing a view waits for at most one page of a scan. Every page
+ *  reads at the one stamp the scan is pinned at, whose versions every merge keeps, and starts at the key past the
+ *  page before it, which that page found without handing it out, so no key is visited twice or skipped. A head scan
+ *  pins the published stamp it starts at for as long as it lives.
  */
-template <typename key_slot_type_, typename volume_type_>
+template <typename key_slot_type_, typename volume_type_, utilities::fold_concept fold_type_>
 class collection_scanner {
   public:
 
@@ -2110,13 +2346,19 @@ class collection_scanner {
     using stored_key_t = typename key_slot_t::stored_key_t;
 
     /** The collection this scanner walks. */
-    using collection_t = collection<key_slot_t, volume_t>;
+    using collection_t = collection<key_slot_t, volume_t, fold_type_>;
 
     /** The view of that collection the scan walks. */
     using view_t = typename collection_t::view_t;
 
     /** One memory run of that view. */
     using memory_run_t = typename collection_t::memory_run_t;
+
+    /** One key of a page. */
+    using entry_t = scan_entry<stored_key_t>;
+
+    /** Keys one page holds. */
+    static constexpr std::size_t page_keys_k = scan_page_keys_k<stored_key_t>;
 
 #pragma endregion Types
 
@@ -2129,40 +2371,16 @@ class collection_scanner {
     collection_scanner& operator=(collection_scanner&&) noexcept = default;
 
     /** A scan of @p source positioned on its first key not below @p from, where @p source must outlive the scanner,
-     *  seeing what a reader pinned at @p stamp sees, announced on executor thread @p thread_index's epoch slot. */
+     *  seeing what a reader pinned at @p stamp sees, announced on executor thread @p thread_index's epoch slot while
+     *  it reads a page, the first of which it reads before returning. */
     static expected<collection_scanner> over(collection_t const& source, stored_key_t from = limit<stored_key_t>::min(),
                                              transaction_stamp_t stamp = head_stamp_k,
                                              std::size_t thread_index = outside_executor_k) noexcept {
         collection_scanner scanner;
-        scanner.inside_ = source.ledger_->epochs().enter(thread_index);
-        typename collection_t::reading_t const read = source.reading_(stamp);
-        scanner.view_ = read.view;
-        scanner.stamp_ = read.stamp;
-
-        std::span<memory_run_t const* const> const memory_runs = read.view->memory_runs.runs();
-        if (scanner.memory_positions_.resize(memory_runs.size()) != st::status_t::success_k)
-            return status_t {status_code_t::out_of_memory_k, "A scan could not hold a cursor per memory run"};
-        for (std::size_t index = 0; index != memory_runs.size(); ++index)
-            scanner.memory_positions_[index] = memory_runs[index]->lower_bound(from);
-
-        typename collection_t::level_set_t const& levels = *read.view->levels;
-        std::size_t runs = 0;
-        for (std::size_t number = 0; number != levels.size(); ++number) runs += levels.level(number).size();
-        if (scanner.cursors_.reserve(runs) != st::status_t::success_k)
-            return status_t {status_code_t::out_of_memory_k, "A scan could not hold a cursor per run"};
-
-        for (std::size_t number = 0; number != levels.size(); ++number) {
-            auto const& level = levels.level(number);
-            for (std::size_t index = 0; index != level.size(); ++index) {
-                run_cursor_t cursor;
-                cursor.level_number = static_cast<std::uint32_t>(number);
-                cursor.run_index = static_cast<std::uint32_t>(index);
-                cursor.population = level.run(index).population_count();
-                cursor.position = lower_bound_(level.run(index), cursor.population, from);
-                [[maybe_unused]] st::status_t const placed = scanner.cursors_.push_back(std::move(cursor));
-            }
-        }
-        scanner.advance();
+        scanner.source_ = &source;
+        scanner.thread_index_ = thread_index;
+        scanner.stamp_ = stamp == head_stamp_k ? source.ledger_->pin_reader(scanner.pin_) : stamp;
+        if (status_t const filled = scanner.fill_(from); filled.failed()) return filled;
         return scanner;
     }
 
@@ -2171,58 +2389,37 @@ class collection_scanner {
 #pragma region Walk
 
     /** Whether every key has been visited. */
-    [[nodiscard]] bool reached_end() const noexcept { return state_ == select_result_t::nothing_k; }
+    [[nodiscard]] bool reached_end() const noexcept { return at_ == page().size() && filled_ <= page_keys_k; }
 
     /** The key the scan sits on, meaningless once the walk has ended. */
-    [[nodiscard]] stored_key_t stored_key() const noexcept { return stored_key_; }
+    [[nodiscard]] stored_key_t stored_key() const noexcept { return page_[at_].stored_key; }
 
-    /** Whether the key the scan sits on carries a value or a tombstone. */
-    [[nodiscard]] select_result_t state() const noexcept { return state_; }
+    /** Whether the key the scan sits on carries a value or a removal, @c nothing_k once the walk has ended. */
+    [[nodiscard]] select_result_t state() const noexcept {
+        return reached_end() ? select_result_t::nothing_k : page_[at_].state;
+    }
 
-    /** Bytes the value of that key takes, which is zero for a tombstone and for an empty value. */
-    [[nodiscard]] stored_value_size_t size() const noexcept { return size_; }
+    /** Bytes the value of that key takes, which is zero for a removal and for an empty value. */
+    [[nodiscard]] stored_value_size_t size() const noexcept { return reached_end() ? 0 : page_[at_].size; }
 
-    /** Moves to the next key, taking its newest version at or below the scan's stamp and skipping the versions behind
-     *  it, and skipping a key whose every version is newer. */
-    void advance() noexcept {
-        std::span<memory_run_t const* const> const memory_runs = view_->memory_runs.runs();
-        for (;;) {
-            stored_key_t smallest = limit<stored_key_t>::max();
-            bool any = false;
-            for (std::size_t index = 0; index != memory_runs.size(); ++index) {
-                if (memory_positions_[index] == memory_runs[index]->size()) continue;
-                stored_key_t const head = memory_runs[index]->stored_key(memory_positions_[index]);
-                if (any && !(head < smallest)) continue;
-                smallest = head;
-                any = true;
-            }
-            for (std::size_t index = 0; index != cursors_.size(); ++index) {
-                if (cursors_[index].position == cursors_[index].population) continue;
-                stored_key_t const head = key_slot_at_(cursors_[index]).stored_key;
-                if (any && !(head < smallest)) continue;
-                smallest = head;
-                any = true;
-            }
-            if (!any) {
-                state_ = select_result_t::nothing_k;
-                size_ = 0;
-                return;
-            }
+    /** The keys of the page the scan sits on, every one of which comes before the keys of the next page. */
+    [[nodiscard]] std::span<entry_t const> page() const noexcept {
+        return std::span<entry_t const> {page_.data(), std::min(filled_, page_keys_k)};
+    }
 
-            stored_key_ = smallest;
-            bool const taken = take_newest_memory_run_(smallest) || take_youngest_run_(smallest);
+    /** Whether a page follows the one the scan sits on, and in @p from the key it starts at. */
+    [[nodiscard]] bool follows(stored_key_t& from) const noexcept {
+        if (filled_ <= page_keys_k) return false;
+        from = page_[page_keys_k].stored_key;
+        return true;
+    }
 
-            // Every run holds the versions of a key side by side, so each cursor passes all of them at once.
-            for (std::size_t index = 0; index != memory_runs.size(); ++index)
-                while (memory_positions_[index] != memory_runs[index]->size() &&
-                       memory_runs[index]->stored_key(memory_positions_[index]) == smallest)
-                    ++memory_positions_[index];
-            for (std::size_t index = 0; index != cursors_.size(); ++index)
-                while (cursors_[index].position != cursors_[index].population &&
-                       key_slot_at_(cursors_[index]).stored_key == smallest)
-                    ++cursors_[index].position;
-            if (taken) return;
-        }
+    /** Moves to the next key, reading the next page once this one is spent. */
+    status_t advance() noexcept {
+        if (at_ != page().size()) ++at_;
+        stored_key_t from {};
+        if (at_ != page().size() || !follows(from)) return {};
+        return fill_(from);
     }
 
 #pragma endregion Walk
@@ -2231,7 +2428,7 @@ class collection_scanner {
 
 #pragma region Private Types
 
-    /** One reader inside the scanned collection's epochs, announced until the scanner dies. */
+    /** One reader inside the scanned collection's epochs, announced while a page is read. */
     using reader_t = epoch_domain::reader_t;
 
     /** Where one run of one level the scan walks has got to. */
@@ -2254,6 +2451,87 @@ class collection_scanner {
 
 #pragma region Private Methods
 
+    /** Reads the keys from @p from on into the page inside the ledger's epochs, from the view published now, with one
+     *  key past the page beside it, which the next page starts at. */
+    status_t fill_(stored_key_t from) noexcept {
+        reader_t const inside = source_->ledger_->epochs().enter(thread_index_);
+        // Every version at or below the pinned stamp stays in whichever view a merge publishes later.
+        view_ = source_->view_.load();
+        at_ = 0;
+        filled_ = 0;
+        status_t const positioned = position_(from);
+        while (positioned.succeeded() && filled_ != page_.size() && next_(page_[filled_])) ++filled_;
+        view_ = nullptr;
+        return positioned;
+    }
+
+    /** Places a cursor on the first key not below @p from in every memory run and every run of every level. */
+    status_t position_(stored_key_t from) noexcept {
+        std::span<memory_run_t const* const> const memory_runs = view_->memory_runs.runs();
+        if (memory_positions_.resize(memory_runs.size()) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "A scan could not hold a cursor per memory run"};
+        for (std::size_t index = 0; index != memory_runs.size(); ++index)
+            memory_positions_[index] = memory_runs[index]->lower_bound(from);
+
+        typename collection_t::level_set_t const& levels = *view_->levels;
+        std::size_t runs = 0;
+        for (std::size_t number = 0; number != levels.size(); ++number) runs += levels.level(number).size();
+        cursors_.clear();
+        if (cursors_.reserve(runs) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "A scan could not hold a cursor per run"};
+        for (std::size_t number = 0; number != levels.size(); ++number) {
+            auto const& level = levels.level(number);
+            for (std::size_t index = 0; index != level.size(); ++index) {
+                run_cursor_t cursor;
+                cursor.level_number = static_cast<std::uint32_t>(number);
+                cursor.run_index = static_cast<std::uint32_t>(index);
+                cursor.population = level.run(index).population_count();
+                cursor.position = lower_bound_(level.run(index), cursor.population, from);
+                [[maybe_unused]] st::status_t const placed = cursors_.push_back(std::move(cursor));
+            }
+        }
+        return {};
+    }
+
+    /** Moves the cursors past the next key, taking its newest version at or below the scan's stamp into @p entry and
+     *  skipping the versions behind it and any key whose every version is newer; answers whether a key was left. */
+    bool next_(entry_t& entry) noexcept {
+        std::span<memory_run_t const* const> const memory_runs = view_->memory_runs.runs();
+        for (;;) {
+            stored_key_t smallest = limit<stored_key_t>::max();
+            bool any = false;
+            for (std::size_t index = 0; index != memory_runs.size(); ++index) {
+                if (memory_positions_[index] == memory_runs[index]->size()) continue;
+                stored_key_t const head = memory_runs[index]->stored_key(memory_positions_[index]);
+                if (any && !(head < smallest)) continue;
+                smallest = head;
+                any = true;
+            }
+            for (std::size_t index = 0; index != cursors_.size(); ++index) {
+                if (cursors_[index].position == cursors_[index].population) continue;
+                stored_key_t const head = key_slot_at_(cursors_[index]).stored_key;
+                if (any && !(head < smallest)) continue;
+                smallest = head;
+                any = true;
+            }
+            if (!any) return false;
+
+            entry.stored_key = smallest;
+            bool const taken = take_newest_memory_run_(entry) || take_youngest_run_(entry);
+
+            // Every run holds the versions of a key side by side, so each cursor passes all of them at once.
+            for (std::size_t index = 0; index != memory_runs.size(); ++index)
+                while (memory_positions_[index] != memory_runs[index]->size() &&
+                       memory_runs[index]->stored_key(memory_positions_[index]) == smallest)
+                    ++memory_positions_[index];
+            for (std::size_t index = 0; index != cursors_.size(); ++index)
+                while (cursors_[index].position != cursors_[index].population &&
+                       key_slot_at_(cursors_[index]).stored_key == smallest)
+                    ++cursors_[index].position;
+            if (taken) return true;
+        }
+    }
+
     /** The first of the @p population sorted positions of @p run whose key is not below @p from. */
     template <typename run_type_>
     [[nodiscard]] static std::uint64_t lower_bound_(run_type_ const& run, std::uint64_t population,
@@ -2273,32 +2551,45 @@ class collection_scanner {
         return view_->levels->level(cursor.level_number).run(cursor.run_index).key_slot(cursor.position);
     }
 
-    /** Takes the newest memory run carrying a version of @p smallest at or below the scan's stamp as the answer, which
-     *  outranks every level; answers whether any does. */
-    bool take_newest_memory_run_(stored_key_t smallest) noexcept {
+    /** Takes the newest memory run carrying a version of @p entry's key at or below the scan's stamp as its answer,
+     *  which outranks every level; answers whether any does. */
+    bool take_newest_memory_run_(entry_t& entry) noexcept {
         std::span<memory_run_t const* const> const memory_runs = view_->memory_runs.runs();
         for (std::size_t index = 0; index != memory_runs.size(); ++index) {
             memory_run_t const& run = *memory_runs[index];
             std::size_t position = memory_positions_[index];
             // A merged run holds a key's versions newest first, and the first at or below the stamp answers.
-            while (position != run.size() && run.stored_key(position) == smallest && run.stamp(position) > stamp_)
+            while (position != run.size() && run.stored_key(position) == entry.stored_key &&
+                   run.stamp(position) > stamp_)
                 ++position;
-            if (position == run.size() || !(run.stored_key(position) == smallest)) continue;
+            if (position == run.size() || !(run.stored_key(position) == entry.stored_key)) continue;
             delta_view_t const delta = run.delta(position);
-            bool const erased = delta.kind == delta_kind_t::remove_k;
-            state_ = erased ? select_result_t::erased_k : select_result_t::success_k;
-            size_ = erased ? 0 : static_cast<stored_value_size_t>(delta.bytes.size());
+            take_(delta.kind, delta.bytes.size(), entry);
             return true;
         }
         return false;
     }
 
+    /** Takes the newest version of @p entry's key at or below the scan's stamp, which does @p kind and carries @p size
+     *  bytes, as its answer, folding the versions below a change. */
+    void take_(delta_kind_t kind, std::size_t size, entry_t& entry) noexcept {
+        entry.size = 0;
+        if (kind == delta_kind_t::change_k)
+            entry.state = source_->find_folded_(typename collection_t::reading_t {view_, stamp_}, entry.stored_key,
+                                                entry.size);
+        else if (kind == delta_kind_t::remove_k) entry.state = select_result_t::erased_k;
+        else {
+            entry.state = select_result_t::success_k;
+            entry.size = static_cast<stored_value_size_t>(size);
+        }
+    }
+
     /**
-     *  @brief Takes the shallowest and, inside a level, the youngest run carrying a version of @p smallest at or below
-     *      the scan's stamp as the answer, the newest such version inside it.
+     *  @brief Takes the shallowest and, inside a level, the youngest run carrying a version of @p entry's key at or
+     *      below the scan's stamp as its answer, the newest such version inside it.
      *  @return Whether any run carries one.
      */
-    bool take_youngest_run_(stored_key_t smallest) noexcept {
+    bool take_youngest_run_(entry_t& entry) noexcept {
         std::size_t chosen = cursors_.size();
         std::uint64_t chosen_position = 0;
         for (std::size_t index = 0; index != cursors_.size(); ++index) {
@@ -2306,19 +2597,17 @@ class collection_scanner {
             if (chosen != cursors_.size() && !outranks_(cursor, cursors_[chosen])) continue;
             auto const& run = view_->levels->level(cursor.level_number).run(cursor.run_index);
             std::uint64_t position = cursor.position;
-            while (position != cursor.population && run.key_slot(position).stored_key == smallest &&
+            while (position != cursor.population && run.key_slot(position).stored_key == entry.stored_key &&
                    run.stamp(position) > stamp_)
                 ++position;
-            if (position == cursor.population || !(run.key_slot(position).stored_key == smallest)) continue;
+            if (position == cursor.population || !(run.key_slot(position).stored_key == entry.stored_key)) continue;
             chosen = index;
             chosen_position = position;
         }
         if (chosen == cursors_.size()) return false;
         run_cursor_t const& cursor = cursors_[chosen];
-        key_slot_t const& slot =
-            view_->levels->level(cursor.level_number).run(cursor.run_index).key_slot(chosen_position);
-        state_ = slot.is_tombstone() ? select_result_t::erased_k : select_result_t::success_k;
-        size_ = slot.is_tombstone() ? 0 : slot.size;
+        auto const& run = view_->levels->level(cursor.level_number).run(cursor.run_index);
+        take_(run.kind(chosen_position), run.key_slot(chosen_position).size, entry);
         return true;
     }
 
@@ -2332,10 +2621,19 @@ class collection_scanner {
 
 #pragma region Private Members
 
-    /** The scanner's place inside the collection's epoch domain, which keeps @c view_ readable. */
-    reader_t inside_;
+    /** The collection walked, which outlives the scanner. */
+    collection_t const* source_ = nullptr;
 
-    /** The view the scan walks, loaded once. */
+    /** The published stamp a head scan reads at, which keeps its versions in every merge while the scan lives. */
+    stamp_pin_t pin_;
+
+    /** The stamp the scan reads at, which sees the newest version of every key at or below it. */
+    transaction_stamp_t stamp_ = head_stamp_k;
+
+    /** The executor thread the scan announces on while it reads a page. */
+    std::size_t thread_index_ = outside_executor_k;
+
+    /** The view the page being read walks, null between pages, when no reader keeps it alive. */
     view_t const* view_ = nullptr;
 
     /** The next sorted position inside every memory run of the view, newest run first. */
@@ -2344,17 +2642,14 @@ class collection_scanner {
     /** One cursor per run of every level the view names. */
     st::basic_vector<run_cursor_t> cursors_;
 
-    /** The key the scan sits on. */
-    stored_key_t stored_key_ = stored_key_t {};
+    /** The keys of the page, then the key the next page starts at. */
+    std::array<entry_t, page_keys_k + 1> page_ {};
 
-    /** What that key carries, which reads as @c nothing_k once the walk has ended. */
-    select_result_t state_ = select_result_t::nothing_k;
+    /** Entries the page read, a page and one more while another page follows. */
+    std::size_t filled_ = 0;
 
-    /** Bytes the value of that key takes. */
-    stored_value_size_t size_ = 0;
-
-    /** The stamp the scan reads at, which sees the newest version of every key at or below it. */
-    transaction_stamp_t stamp_ = head_stamp_k;
+    /** The entry of the page the scan sits on. */
+    std::size_t at_ = 0;
 
 #pragma endregion Private Members
 };

@@ -5,9 +5,10 @@
  *  @brief Compaction of LSM levels into new sorted runs on the host, and the device compactor every compiler sees.
  *
  *  A compaction reads the sorted run indexes of an upper LSM level and of the lower sorted runs it overlaps, keeps the
- *  newest key slot of every stored key, drops tombstones when it writes the bottom LSM level, and lays the survivors
+ *  newest key slot of every stored key, drops removals when it writes the bottom LSM level, and lays the survivors
  *  into sorted runs that fit their bounds, planning where every stored value moves. Both compactors share the rules
- *  below. A build with @c USTORE_WITH_CUDA declares the device compactor for every compiler, its kernels in
+ *  below, and only the host one folds a fold's changes, so a merge of runs holding any change runs on the host. A
+ *  build with @c USTORE_WITH_CUDA declares the device compactor for every compiler, its kernels in
  *  @c nvme_compaction.cuh compile under nvcc alone, and @c compaction.cu instantiates its compaction for the
  *  engine's key slots, so a host TU calls it.
  */
@@ -16,7 +17,8 @@
 
 #include <cassert> // `assert`
 #include <cstddef> // `std::byte`, `std::size_t`
-#include <cstdint> // `std::int64_t`, `std::uint32_t`, `std::uint64_t`
+#include <cstdint> // `std::int64_t`, `std::uint8_t`, `std::uint32_t`, `std::uint64_t`
+#include <cstring> // `std::memcpy`
 
 #include <concepts>    // `std::convertible_to`
 #include <limits>      // `std::numeric_limits`
@@ -30,15 +32,19 @@
 #include <smashtable/shared.hpp>                 // `st::status_t`, `st::default_allocator`
 
 #include "ustore/blobs/nvme_key_slot.hpp"          // `limit`, `stored_key_concept`, `sorted_run_index_layout_t`
+#include "ustore/utilities/folds.hpp"              // `fold_concept`, `fold_pair`, `delta_kind_t`
+#include "ustore/utilities/ram_buffers.hpp"        // `local_arena_t`, `arena_allocator`
 #include "ustore/utilities/types.hpp"              // `round_up_to_multiple`
 #include "ustore/utilities/vram_nvidia_device.hpp" // `cuda_stream_t`
 
 namespace unum::ustore::blobs {
 
+using utilities::delta_view_t;
+
 #pragma region Vocabulary
 
-/** A key slot shape compaction merges: trivially copyable, keyed by a stored key, sized, and able to say whether it is
- *  a tombstone. */
+/** A key slot shape compaction merges: trivially copyable, keyed by a stored key, and sized, with what each record
+ *  does in its run's kinds column. */
 template <typename key_slot_type_>
 concept compactable_key_slot_concept = std::is_trivially_copyable_v<key_slot_type_> &&
                                        stored_key_concept<typename key_slot_type_::stored_key_t> &&
@@ -47,14 +53,12 @@ concept compactable_key_slot_concept = std::is_trivially_copyable_v<key_slot_typ
                                                key_slot.stored_key
                                            } -> std::convertible_to<typename key_slot_type_::stored_key_t>;
                                            { key_slot.size } -> std::convertible_to<std::uint64_t>;
-                                           { key_slot.is_tombstone() } -> std::convertible_to<bool>;
                                        };
 
 /** A key slot shape whose stored values live in its sorted run's stored values section, found by location. */
 template <typename key_slot_type_>
 concept locates_stored_values_concept = requires(key_slot_type_ const& key_slot) {
     { key_slot.location } -> std::convertible_to<std::uint64_t>;
-    { key_slot.is_stored_value_empty() } -> std::convertible_to<bool>;
 };
 
 /** Which LSM levels a compaction merges, fixing whether the upper LSM level overlaps and whether tombstones drop. */
@@ -76,7 +80,10 @@ enum class compaction_kind_t : std::uint8_t {
 /** The stamps of one sorted run's key slots, in sorted order, as the run keeps them packed beside its index. */
 using stamps_column_t = st::immutable_packed_array<std::uint64_t>;
 
-/** The key slots of one sorted run as its sorted run index's cells hold them, and the stamp of every one. */
+/** The @c delta_kind_t of one sorted run's key slots, in sorted order, packed beside its stamps. */
+using kinds_column_t = st::immutable_packed_array<std::uint8_t>;
+
+/** The key slots of one sorted run as its sorted run index's cells hold them, and the stamp and kind of every one. */
 template <typename key_slot_type_>
 struct sorted_run_index_view {
 
@@ -88,7 +95,18 @@ struct sorted_run_index_view {
 
     /** The stamp of every key slot in sorted order, or null for a run whose every stamp reads as zero. */
     stamps_column_t const* stamps = nullptr;
+
+    /** The kind of every key slot in sorted order, or null for a run whose every record is a write. */
+    kinds_column_t const* kinds = nullptr;
 };
+
+/** Whether @p kinds may hold a change, which only a fold's merge reads; a column packs from its least kind to its
+ *  greatest, so the widest kind it can hold is exactly that. */
+inline bool holds_changes(kinds_column_t const* kinds) noexcept {
+    if (kinds == nullptr || kinds->empty()) return false;
+    std::uint64_t const widest = std::uint64_t {kinds->base()} + ((std::uint64_t {1} << kinds->bits()) - 1);
+    return widest >= static_cast<std::uint64_t>(delta_kind_t::change_k);
+}
 
 /**
  *  @brief The stamps a merge keeps versions for beyond the newest of every stored key, and the range it keeps.
@@ -149,10 +167,11 @@ struct stored_value_migration_t {
     /** Bytes of the stored value. */
     std::uint32_t size = 0;
 
-    /** Location of the stored value in its old sorted run. */
+    /** Location of the stored value in its old sorted run, or in the compaction's folded bytes. */
     std::uint32_t old_location = 0;
 
-    /** Index of the old sorted run, counting the upper LSM level first and the lower LSM level after it. */
+    /** Index of the old sorted run, counting the upper LSM level first and the lower LSM level after it, where the
+     *  index past every source run names the compaction's folded bytes. */
     std::uint32_t old_sorted_run = 0;
 };
 
@@ -178,6 +197,12 @@ struct compaction_output {
     /** One stamp per key slot in sorted order across the sorted runs, each at or above the merge's floor. */
     rebound_vector<std::uint64_t, allocator_type_> stamps;
 
+    /** One @c delta_kind_t per key slot in sorted order across the sorted runs. */
+    rebound_vector<std::uint8_t, allocator_type_> kinds;
+
+    /** The values a fold wrote, back to back, which a migration from the index past every source run locates. */
+    rebound_vector<byte_t, allocator_type_> folded;
+
     compaction_output() noexcept = default;
 
     /** Allocates every buffer through @p allocator. */
@@ -187,10 +212,12 @@ struct compaction_output {
               allocator)),
           migrations(typename std::allocator_traits<allocator_type_>::template rebind_alloc<stored_value_migration_t>(
               allocator)),
-          stamps(typename std::allocator_traits<allocator_type_>::template rebind_alloc<std::uint64_t>(allocator)) {}
+          stamps(typename std::allocator_traits<allocator_type_>::template rebind_alloc<std::uint64_t>(allocator)),
+          kinds(typename std::allocator_traits<allocator_type_>::template rebind_alloc<std::uint8_t>(allocator)),
+          folded(typename std::allocator_traits<allocator_type_>::template rebind_alloc<byte_t>(allocator)) {}
 };
 
-/** A key slot with the index of the sorted run it came from and its stamp, the unit every merge moves. */
+/** A key slot with the index of the sorted run it came from, its stamp and its kind, the unit every merge moves. */
 template <typename key_slot_type_>
 struct located_key_slot {
 
@@ -199,6 +226,9 @@ struct located_key_slot {
 
     /** Index of its sorted run, counting the upper LSM level first and the lower LSM level after it. */
     std::uint32_t sorted_run = 0;
+
+    /** What the record does, in the bytes the stamp's alignment leaves. */
+    delta_kind_t kind = delta_kind_t::write_k;
 
     /** The stamp of the commit that wrote it. */
     std::uint64_t stamp = 0;
@@ -256,11 +286,16 @@ constexpr bool keeps_older_version(compaction_stamps_t const& stamps, std::uint6
     return reader_interval(stamps, current) != reader_interval(stamps, previous);
 }
 
+/** Whether a merge of @p kind writes the bottom level, where nothing older is left for a removal to hide. */
+constexpr bool writes_bottom(compaction_kind_t kind) noexcept {
+    return (kind == compaction_kind_t::overlapping_into_bottom_k) | (kind == compaction_kind_t::sorted_into_bottom_k);
+}
+
 /**
- *  @brief Whether @p current survives a merge: some reader still reads it, and it is no tombstone where nothing
+ *  @brief Whether @p current survives a merge: some reader still reads it, and it is no removal where nothing
  *      older survives below it to hide.
  *
- *  With no reader pinned and both bounds at their widest, this is the newest version of every key, tombstones
+ *  With no reader pinned and both bounds at their widest, this is the newest version of every key, removals
  *  dropping where the merge writes the bottom level.
  */
 template <typename key_slot_type_>
@@ -273,20 +308,17 @@ constexpr bool survives(located_key_slot<key_slot_type_> const* previous,
     if (previous != nullptr && previous->key_slot.stored_key == current.key_slot.stored_key &&
         !keeps_older_version(stamps, previous->stamp, current.stamp))
         return false;
-    bool const drops_tombstones = (kind == compaction_kind_t::overlapping_into_bottom_k) |
-                                  (kind == compaction_kind_t::sorted_into_bottom_k);
     // Only in the oldest interval does every older version of the key fall in the same one and drop with it.
     bool const oldest = (current.stamp <= stamps.horizon) &
                         (reader_interval(stamps, current.stamp) == stamps.pinned_count);
-    return !(drops_tombstones && current.key_slot.is_tombstone() && oldest);
+    return !(writes_bottom(kind) && current.kind == delta_kind_t::remove_k && oldest);
 }
 
-/** Bytes of the stored value @p key_slot locates in a stored values section, zero for empty, tombstoned and inline
+/** Bytes of the stored value @p key_slot locates in a stored values section, zero for empty, removed and inline
  *  stored values. */
 template <typename key_slot_type_>
 constexpr std::uint64_t stored_value_bytes(key_slot_type_ const& key_slot) noexcept {
-    if constexpr (locates_stored_values_concept<key_slot_type_>)
-        return key_slot.is_stored_value_empty() ? 0 : key_slot.size;
+    if constexpr (locates_stored_values_concept<key_slot_type_>) return key_slot.size;
     else return 0;
 }
 
@@ -322,16 +354,18 @@ constexpr key_slot_type_ padding_key_slot() noexcept {
     return padding;
 }
 
-/** Copies @p cell of a sorted run and its stamp out of @p stamps, null reading as zero, into its sorted position
- *  among @p records, skipping padding. */
+/** Copies @p cell of a sorted run, its stamp out of @p stamps, null reading as zero, and its kind out of @p kinds,
+ *  null reading as a write, into its sorted position among @p records, skipping padding. */
 template <typename key_slot_type_>
 constexpr void extract_cell(key_slot_type_ const* cells, sorted_run_index_layout_t const& layout, std::uint64_t cell,
-                            std::uint32_t sorted_run, std::uint64_t const* stamps,
+                            std::uint32_t sorted_run, std::uint64_t const* stamps, std::uint8_t const* kinds,
                             located_key_slot<key_slot_type_>* records) noexcept {
     std::uint64_t const sorted = layout.cell_to_sorted(cell);
     if (sorted < layout.key_slots_count)
-        records[sorted] = located_key_slot<key_slot_type_> {cells[cell], sorted_run,
-                                                            stamps != nullptr ? stamps[sorted] : std::uint64_t {0}};
+        records[sorted] = located_key_slot<key_slot_type_> {
+            cells[cell], sorted_run,
+            kinds != nullptr ? static_cast<delta_kind_t>(kinds[sorted]) : delta_kind_t::write_k,
+            stamps != nullptr ? stamps[sorted] : std::uint64_t {0}};
 }
 
 /**
@@ -346,20 +380,21 @@ constexpr void extract_cell(key_slot_type_ const* cells, sorted_run_index_layout
  *  @param[out] cells The new sorted run's cells.
  *  @param[out] migration The survivor's migration, written only for key slots that locate stored values.
  *  @param[out] stamp The survivor's stamp, raised to @p floor.
+ *  @param[out] kind The survivor's kind.
  */
 template <typename key_slot_type_>
 constexpr void place_key_slot(located_key_slot<key_slot_type_> const& source, sorted_run_index_layout_t const& layout,
                               std::uint64_t position, std::uint64_t section_offset, std::uint64_t preceding_bytes,
                               std::uint64_t floor, key_slot_type_* cells, stored_value_migration_t* migration,
-                              std::uint64_t* stamp) noexcept {
+                              std::uint64_t* stamp, std::uint8_t* kind) noexcept {
     *stamp = source.stamp > floor ? source.stamp : floor;
+    *kind = static_cast<std::uint8_t>(source.kind);
     key_slot_type_ key_slot = source.key_slot;
     if constexpr (locates_stored_values_concept<key_slot_type_>) {
         migration->size = static_cast<std::uint32_t>(stored_value_bytes(key_slot));
         migration->old_location = static_cast<std::uint32_t>(key_slot.location);
         migration->old_sorted_run = source.sorted_run;
-        if (!key_slot.is_stored_value_empty())
-            key_slot.location = static_cast<decltype(key_slot.location)>(section_offset + preceding_bytes);
+        key_slot.location = static_cast<decltype(key_slot.location)>(section_offset + preceding_bytes);
     }
     cells[layout.sorted_to_cell(position)] = key_slot;
 }
@@ -468,20 +503,32 @@ struct cpu_compactor_t {
     /**
      *  @brief Merges @p upper into @p lower as @p kind directs, writing the new sorted runs into @p output.
      *
-     *  @param[in] kind Whether the upper LSM level overlaps, and whether tombstones drop.
+     *  A version no reader tells apart from a change kept above it folds into that change, which keeps its stamp, and
+     *  at the bottom level the oldest change of a key folds onto nothing, so a fold's chains shrink with every merge.
+     *  A collection of blobs never writes a change, so its merge folds nothing and reads no value.
+     *
+     *  @param[in] kind Whether the upper LSM level overlaps, and whether removals drop.
      *  @param[in] upper The upper LSM level's sorted runs, oldest first when they overlap and ascending otherwise.
      *  @param[in] lower The lower LSM level's sorted runs the upper LSM level overlaps, ascending.
      *  @param[in] bounds Bounds every new sorted run fits.
      *  @param[in] stamps Which older versions survive, which versions drop, and the floor every stamp is raised to.
-     *  @param[out] output The new sorted runs, their cells, their stamps and their stored values' migrations.
-     *  @retval invalid_argument_k The bounds admit no sorted run, or the LSM levels hold more than 2^32 sorted runs.
+     *  @param[in] fold How the collection's changes compose and apply.
+     *  @param[in] read_value Called as @c read_value(record, arena, bytes) to view the bytes of a record a fold reads,
+     *      answering an @c st::status_t, with any bytes it reads allocated from @c arena.
+     *  @param[out] output The new sorted runs, their cells, stamps and kinds, their stored values' migrations, and the
+     *      values a fold wrote.
+     *  @retval invalid_argument_k The bounds admit no sorted run, the LSM levels hold more than 2^32 sorted runs, or
+     *      the fold refused a chain.
+     *  @retval capacity_exhausted_k A folded value outgrows its inline key slot or the 32-bit locations.
      *  @retval out_of_memory_heap_k A buffer could not grow.
      */
-    template <typename key_slot_type_, typename allocator_type_>
+    template <typename key_slot_type_, utilities::fold_concept fold_type_, typename value_reader_type_,
+              typename allocator_type_>
         requires compactable_key_slot_concept<key_slot_type_>
     st::status_t compact(compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_type_> const> upper,
                          std::span<sorted_run_index_view<key_slot_type_> const> lower,
-                         sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps,
+                         sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps, fold_type_ const& fold,
+                         value_reader_type_&& read_value,
                          compaction_output<key_slot_type_, allocator_type_>& output) const noexcept {
         using st::basic_vector;
         using st::status_t;
@@ -515,11 +562,16 @@ struct cpu_compactor_t {
             if (sorted_run <= upper.size()) run_starts[sorted_run] = run_offset;
             sorted_run_index_layout_t const layout(view.key_slots_count, bounds.branching);
             for (std::uint64_t cell = 0; cell != layout.cells_count(); ++cell)
-                extract_cell(view.cells, layout, cell, static_cast<std::uint32_t>(sorted_run), nullptr,
+                extract_cell(view.cells, layout, cell, static_cast<std::uint32_t>(sorted_run),
+                             static_cast<std::uint64_t const*>(nullptr), static_cast<std::uint8_t const*>(nullptr),
                              records.data() + run_offset);
             if (view.stamps != nullptr)
                 for (std::uint64_t sorted = 0; sorted != view.key_slots_count; ++sorted)
                     records[run_offset + sorted].stamp = (*view.stamps)[static_cast<std::size_t>(sorted)];
+            if (view.kinds != nullptr)
+                for (std::uint64_t sorted = 0; sorted != view.key_slots_count; ++sorted)
+                    records[run_offset + sorted].kind = static_cast<delta_kind_t>(
+                        (*view.kinds)[static_cast<std::size_t>(sorted)]);
             run_offset += view.key_slots_count;
         }
         run_starts[upper.size()] = upper_key_slots;
@@ -550,10 +602,99 @@ struct cpu_compactor_t {
 
         // One merge path joins the upper and lower runs, and the survivors move back
         merge_ranges(records.data(), 0, upper_key_slots, merged_count, scratch.data(), order);
+
+        // The newest survivor's value while versions fold into it, which the folds list keeps once it is settled
+        struct folded_t {
+            std::uint64_t survivor = 0;
+            std::span<byte_t const> bytes;
+        };
+        basic_vector<folded_t> folds;
+        utilities::local_arena_t arena;
+        utilities::arena_allocator<byte_t> arena_bytes = arena.allocator();
+        std::span<byte_t const> head_bytes;
+        bool head_folded = false;
+        bool head_closed = false;
         std::uint64_t survivors = 0;
+        auto const value_of = [&](record_t const& record, std::span<byte_t const>& bytes) noexcept {
+            bytes = {};
+            if (record.kind == delta_kind_t::remove_k) return status_t::success_k;
+            return read_value(record, arena_bytes, bytes);
+        };
+        // Keeps the newest survivor's folded value; at the bottom, the oldest change of a key folds onto nothing.
+        auto const settle = [&](bool key_ends) noexcept {
+            if (survivors == 0) return status_t::success_k;
+            record_t& head = records[survivors - 1];
+            if (key_ends && writes_bottom(kind) && head.kind == delta_kind_t::change_k) {
+                std::span<byte_t const> bytes = head_bytes;
+                if (!head_folded)
+                    if (status_t const read = value_of(head, bytes); read != status_t::success_k) return read;
+                delta_view_t const change {delta_kind_t::change_k, bytes};
+                auto [applied, apply_status] = fold.apply({}, std::span<delta_view_t const> {&change, 1}, arena_bytes);
+                if (apply_status.failed()) return fold_refusal_(apply_status);
+                head.kind = delta_kind_t::write_k;
+                head_bytes = applied;
+                head_folded = true;
+            }
+            if (head_folded && folds.push_back(folded_t {survivors - 1, head_bytes}) != status_t::success_k)
+                return status_t::out_of_memory_heap_k;
+            head_folded = false;
+            head_closed = false;
+            return status_t::success_k;
+        };
         for (std::uint64_t index = 0; index != merged_count; ++index) {
             record_t const* previous = index != 0 ? scratch.data() + index - 1 : nullptr;
-            if (survives(previous, scratch[index], kind, stamps)) records[survivors++] = scratch[index];
+            record_t const& current = scratch[index];
+            if (survives(previous, current, kind, stamps)) {
+                bool const key_ends = survivors == 0 ||
+                                      !(records[survivors - 1].key_slot.stored_key == current.key_slot.stored_key);
+                if (status_t const settled = settle(key_ends); settled != status_t::success_k) return settled;
+                records[survivors++] = current;
+                continue;
+            }
+            if (survivors == 0) continue;
+            record_t& head = records[survivors - 1];
+            if (head.kind != delta_kind_t::change_k || head_closed ||
+                !(head.key_slot.stored_key == current.key_slot.stored_key))
+                continue;
+            // A removal dropped at the bottom hides every older version from the change above it.
+            if (keeps_older_version(stamps, previous->stamp, current.stamp)) {
+                head_closed = true;
+                continue;
+            }
+            std::span<byte_t const> newer = head_bytes;
+            std::span<byte_t const> older;
+            if (!head_folded)
+                if (status_t const read = value_of(head, newer); read != status_t::success_k) return read;
+            if (status_t const read = value_of(current, older); read != status_t::success_k) return read;
+            auto [pair, fold_status] = utilities::fold_pair(fold, delta_view_t {delta_kind_t::change_k, newer},
+                                                            delta_view_t {current.kind, older}, arena_bytes);
+            if (fold_status.failed()) return fold_refusal_(fold_status);
+            head.kind = pair.kind;
+            head_bytes = pair.bytes;
+            head_folded = true;
+        }
+        if (status_t const settled = settle(true); settled != status_t::success_k) return settled;
+
+        // A folded value replaces its survivor's own: inline in the key slot, or in the compaction's folded bytes
+        output.folded.clear();
+        for (folded_t const& folded : folds) {
+            key_slot_type_& key_slot = records[folded.survivor].key_slot;
+            if constexpr (locates_stored_values_concept<key_slot_type_>) {
+                std::size_t const location = output.folded.size();
+                if (location + folded.bytes.size() > std::numeric_limits<std::uint32_t>::max())
+                    return status_t::capacity_exhausted_k;
+                status = output.folded.resize(location + folded.bytes.size());
+                if (status != status_t::success_k) return status;
+                if (!folded.bytes.empty())
+                    std::memcpy(output.folded.data() + location, folded.bytes.data(), folded.bytes.size());
+                key_slot.location = static_cast<decltype(key_slot.location)>(location);
+                records[folded.survivor].sorted_run = static_cast<std::uint32_t>(sorted_runs_count);
+            }
+            else {
+                if (folded.bytes.size() > sizeof(key_slot.data)) return status_t::capacity_exhausted_k;
+                if (!folded.bytes.empty()) std::memcpy(key_slot.data, folded.bytes.data(), folded.bytes.size());
+            }
+            key_slot.size = static_cast<decltype(key_slot.size)>(folded.bytes.size());
         }
 
         basic_vector<std::uint64_t> prefix;
@@ -587,6 +728,8 @@ struct cpu_compactor_t {
         if (status != status_t::success_k) return status;
         status = output.stamps.resize(survivors);
         if (status != status_t::success_k) return status;
+        status = output.kinds.resize(survivors);
+        if (status != status_t::success_k) return status;
 
         std::uint64_t first = 0;
         std::uint64_t first_cell = 0;
@@ -601,12 +744,21 @@ struct cpu_compactor_t {
                                                                 ? output.migrations.data() + survivor
                                                                 : nullptr;
                 place_key_slot(records[survivor], layout, position, section_offset, preceding, stamps.floor,
-                               output.cells.data() + first_cell, migration, output.stamps.data() + survivor);
+                               output.cells.data() + first_cell, migration, output.stamps.data() + survivor,
+                               output.kinds.data() + survivor);
             }
             first += count;
             first_cell += layout.cells_count();
         }
         return status_t::success_k;
+    }
+
+  private:
+
+    /** The compactor's status for a fold that refused a chain, which only running out of memory is not a refusal. */
+    static st::status_t fold_refusal_(utilities::status_t const& refused) noexcept {
+        return refused == utilities::status_code_t::out_of_memory_k ? st::status_t::out_of_memory_heap_k
+                                                                    : st::status_t::invalid_argument_k;
     }
 };
 
@@ -626,7 +778,8 @@ class gpu_compactor_t {
     /** Binds a compactor to device @p ordinal with a new stream, failing when no such device exists. */
     static st::expected<gpu_compactor_t> make(int ordinal) noexcept;
 
-    /** Does what @c cpu_compactor_t::compact does with identical output, and reports CUDA failures as statuses. */
+    /** Does what @c cpu_compactor_t::compact does with identical output for runs holding no change, refusing any that
+     *  holds one with @c invalid_argument_k, and reports CUDA failures as statuses. */
     template <typename key_slot_type_, typename allocator_type_>
         requires compactable_key_slot_concept<key_slot_type_>
     st::status_t compact(compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_type_> const> upper,
