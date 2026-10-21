@@ -1,13 +1,13 @@
 cmake_minimum_required(VERSION 3.25)
 
-file(READ "VERSION" USTORE_VERSION)
-string(STRIP ${USTORE_VERSION} USTORE_VERSION)
-# CMake versions are numeric, so the pre-release suffix of VERSION stays in USTORE_VERSION only.
-string(REGEX MATCH "^[0-9]+\\.[0-9]+\\.[0-9]+" USTORE_VERSION_NUMBER ${USTORE_VERSION})
+file(READ "VERSION" ustore_version_)
+string(STRIP ${ustore_version_} ustore_version_)
+# CMake versions are numeric, so the pre-release suffix of VERSION stays in ustore_version_ only.
+string(REGEX MATCH "^[0-9]+\\.[0-9]+\\.[0-9]+" ustore_version_number_ ${ustore_version_})
 project(
     UStore
     LANGUAGES C CXX
-    VERSION ${USTORE_VERSION_NUMBER}
+    VERSION ${ustore_version_number_}
     HOMEPAGE_URL "https://github.com/unum-cloud/UStore"
     DESCRIPTION "GPU-Accelerated Embedded Transactional Database for High-Throughput NVMe Devices"
 )
@@ -23,10 +23,10 @@ if (USTORE_IS_MAIN_PROJECT AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
     execute_process(
         COMMAND git config core.hooksPath .githooks
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-        RESULT_VARIABLE ustore_hooks_status
+        RESULT_VARIABLE ustore_hooks_status_
         OUTPUT_QUIET ERROR_QUIET
     )
-    if (ustore_hooks_status EQUAL 0)
+    if (ustore_hooks_status_ EQUAL 0)
         message(STATUS "UStore: Git hooks enabled (core.hooksPath -> .githooks)")
     endif ()
 endif ()
@@ -66,14 +66,8 @@ set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 
 set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/")
 set(CMAKE_CACHEFILE_DIR "${CMAKE_SOURCE_DIR}/build")
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY
-    "${CMAKE_BINARY_DIR}/build/lib"
-    CACHE PATH "Path to static libs"
-)
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY
-    "${CMAKE_BINARY_DIR}/build/lib"
-    CACHE PATH "Path to shared libs"
-)
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/build/lib")
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/build/lib")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/build/bin")
 
 message("CMAKE_CXX_COMPILER_ID: ${CMAKE_CXX_COMPILER_ID}")
@@ -121,26 +115,26 @@ endif ()
 add_library(ustore_sanitizers INTERFACE)
 if (USTORE_BUILD_SANITIZERS STREQUAL "address")
     if (MSVC)
-        set(ustore_sanitizer_flags /fsanitize=address)
+        set(ustore_sanitizer_flags_ /fsanitize=address)
     else ()
-        set(ustore_sanitizer_flags -fsanitize=address,undefined)
+        set(ustore_sanitizer_flags_ -fsanitize=address,undefined)
     endif ()
 elseif (USTORE_BUILD_SANITIZERS STREQUAL "thread")
     if (MSVC)
         message(FATAL_ERROR "MSVC has no ThreadSanitizer, so USTORE_BUILD_SANITIZERS=thread needs Clang or GCC")
     endif ()
-    set(ustore_sanitizer_flags -fsanitize=thread)
+    set(ustore_sanitizer_flags_ -fsanitize=thread)
 elseif (NOT USTORE_BUILD_SANITIZERS STREQUAL "off")
     message(FATAL_ERROR "USTORE_BUILD_SANITIZERS is off, address or thread, not '${USTORE_BUILD_SANITIZERS}'")
 endif ()
-if (ustore_sanitizer_flags AND NOT MSVC)
+if (ustore_sanitizer_flags_ AND NOT MSVC)
     target_compile_options(
-        ustore_sanitizers INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:${ustore_sanitizer_flags};-fno-omit-frame-pointer>"
+        ustore_sanitizers INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:${ustore_sanitizer_flags_};-fno-omit-frame-pointer>"
                                     "$<$<AND:$<COMPILE_LANGUAGE:C,CXX>,$<NOT:$<CONFIG:Debug>>>:-O1>"
     )
-    target_link_options(ustore_sanitizers INTERFACE "$<$<LINK_LANGUAGE:C,CXX>:${ustore_sanitizer_flags}>")
-elseif (ustore_sanitizer_flags)
-    target_compile_options(ustore_sanitizers INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:${ustore_sanitizer_flags}>")
+    target_link_options(ustore_sanitizers INTERFACE "$<$<LINK_LANGUAGE:C,CXX>:${ustore_sanitizer_flags_}>")
+elseif (ustore_sanitizer_flags_)
+    target_compile_options(ustore_sanitizers INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:${ustore_sanitizer_flags_}>")
 endif ()
 
 find_package(Threads REQUIRED)
@@ -175,24 +169,21 @@ endif ()
 # Modalities:
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/fmt.cmake")
 # Its objects go inside the UStore libraries, so an install publishes no yyjson header, archive or config of its own
-set(YYJSON_INSTALL
-    OFF
-    CACHE BOOL "" FORCE
-)
+set(YYJSON_INSTALL OFF)
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/yyjson.cmake")
 
 # A sibling builds from its nested checkout, or from the directory `FETCHCONTENT_SOURCE_DIR_<NAME>` names when the
 # submodule is not initialized, as in a workspace that keeps the siblings side by side
-function (ustore_sibling NAME)
-    string(TOUPPER ${NAME} UPPER_NAME)
-    if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${NAME}/CMakeLists.txt")
-        add_subdirectory(${NAME} EXCLUDE_FROM_ALL)
-    elseif (DEFINED FETCHCONTENT_SOURCE_DIR_${UPPER_NAME})
+function (ustore_sibling name_)
+    string(TOUPPER ${name_} name_upper_)
+    if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${name_}/CMakeLists.txt")
+        add_subdirectory(${name_} EXCLUDE_FROM_ALL)
+    elseif (DEFINED FETCHCONTENT_SOURCE_DIR_${name_upper_})
         add_subdirectory(
-            "${FETCHCONTENT_SOURCE_DIR_${UPPER_NAME}}" "${CMAKE_CURRENT_BINARY_DIR}/${NAME}" EXCLUDE_FROM_ALL
+            "${FETCHCONTENT_SOURCE_DIR_${name_upper_}}" "${CMAKE_CURRENT_BINARY_DIR}/${name_}" EXCLUDE_FROM_ALL
         )
     else ()
-        message(FATAL_ERROR "ustore: initialize the ${NAME} submodule or set FETCHCONTENT_SOURCE_DIR_${UPPER_NAME}")
+        message(FATAL_ERROR "ustore: initialize the ${name_} submodule or set FETCHCONTENT_SOURCE_DIR_${name_upper_}")
     endif ()
 endfunction ()
 
@@ -244,7 +235,8 @@ target_include_directories(
               $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 target_include_directories(
-    ustore_header SYSTEM INTERFACE $<BUILD_INTERFACE:${yyjson_SOURCE_DIR}/src> $<BUILD_INTERFACE:${fmt_INCLUDE_DIR}>
+    ustore_header SYSTEM INTERFACE $<BUILD_INTERFACE:${yyjson_SOURCE_DIR}/src>
+                                   $<BUILD_INTERFACE:${ustore_fmt_include_dir_}>
 )
 target_link_libraries(
     ustore_header INTERFACE $<BUILD_INTERFACE:forkunion::header> $<BUILD_INTERFACE:smashtable::header>
@@ -253,15 +245,15 @@ target_link_libraries(
 
 # Without `USTORE_BUILD_LIB_C`, the libraries build only for the targets that link them
 if (NOT USTORE_BUILD_LIB_C AND NOT USTORE_INSTALL)
-    set(USTORE_LIB_C_EXCLUSION EXCLUDE_FROM_ALL)
+    set(ustore_lib_c_exclusion_ EXCLUDE_FROM_ALL)
 endif ()
 
 # One library holds the C ABI and every engine the build enables, each opened through its own `ustore_database_*` calls;
 # every engine is its own object of the archive, so a program links only those it opens. The archive bundles the small
 # siblings every build needs, as USearch's does, while the storage engines it links stay archives of their own,
 # installed beside it, so a change to UStore never rewrites RocksDB.
-set(USTORE_ENGINE_NAMES "ram")
-set(USTORE_SOURCES
+set(ustore_engine_names_ "ram")
+set(ustore_sources_
     src/types.cpp
     src/db.cpp
     src/blobs.cpp
@@ -271,54 +263,54 @@ set(USTORE_SOURCES
     src/pages.cpp
     src/ram/engine.cpp
 )
-set(USTORE_SIBLING_ARCHIVES forkunion_static stringzilla_static)
-set(USTORE_DEPENDENCIES ${USTORE_SIBLING_ARCHIVES} yyjson fmt)
-set(USTORE_ENGINE_ARCHIVES)
-set(USTORE_ENGINE_DEFINITIONS)
+set(ustore_sibling_archives_ forkunion_static stringzilla_static)
+set(ustore_dependencies_ ${ustore_sibling_archives_} yyjson fmt)
+set(ustore_engine_archives_)
+set(ustore_engine_definitions_)
 
 # The NVMe engine mounts its volumes on files, so it builds everywhere the siblings do; the io_uring transport beside it
 # compiles on every platform and only opens a ring on Linux.
 if (${USTORE_BUILD_NVME})
-    list(APPEND USTORE_SOURCES src/nvme/engine.cpp)
-    list(APPEND USTORE_ENGINE_DEFINITIONS USTORE_WITH_NVME=1)
-    list(APPEND USTORE_ENGINE_NAMES "nvme")
+    list(APPEND ustore_sources_ src/nvme/engine.cpp)
+    list(APPEND ustore_engine_definitions_ USTORE_WITH_NVME=1)
+    list(APPEND ustore_engine_names_ "nvme")
 endif ()
 
 if (${USTORE_WITH_ROCKSDB})
-    list(APPEND USTORE_SOURCES src_oracles/rocksdb/engine.cpp)
-    list(APPEND USTORE_ENGINE_ARCHIVES rocksdb)
+    list(APPEND ustore_sources_ src_oracles/rocksdb/engine.cpp)
+    list(APPEND ustore_engine_archives_ rocksdb)
     if (TARGET uring)
-        list(APPEND USTORE_ENGINE_ARCHIVES uring)
+        list(APPEND ustore_engine_archives_ uring)
     endif ()
-    list(APPEND USTORE_ENGINE_DEFINITIONS USTORE_WITH_ROCKSDB=1)
-    list(APPEND USTORE_ENGINE_NAMES "rocksdb")
+    list(APPEND ustore_engine_definitions_ USTORE_WITH_ROCKSDB=1)
+    list(APPEND ustore_engine_names_ "rocksdb")
 endif ()
 
 if (${USTORE_WITH_LEVELDB})
-    list(APPEND USTORE_SOURCES src_oracles/leveldb/engine.cpp)
-    list(APPEND USTORE_ENGINE_ARCHIVES leveldb)
-    list(APPEND USTORE_ENGINE_DEFINITIONS USTORE_WITH_LEVELDB=1)
+    list(APPEND ustore_sources_ src_oracles/leveldb/engine.cpp)
+    list(APPEND ustore_engine_archives_ leveldb)
+    list(APPEND ustore_engine_definitions_ USTORE_WITH_LEVELDB=1)
     if (NOT MSVC)
         set_source_files_properties(src_oracles/leveldb/engine.cpp PROPERTIES COMPILE_FLAGS -fno-rtti)
     endif ()
-    list(APPEND USTORE_ENGINE_NAMES "leveldb")
+    list(APPEND ustore_engine_names_ "leveldb")
 endif ()
 
 # An archive links nothing, so it takes the objects of every library it builds on, while the shared library links them
 # and exports only what `USTORE_EXPORT` marks, which its consumers import on Windows. Inside this tree the archive also
 # links them, since the suites and tools reach the siblings through it.
-set(USTORE_DEPENDENCY_OBJECTS)
-set(USTORE_DEPENDENCY_LINKS)
-foreach (dependency IN LISTS USTORE_DEPENDENCIES)
-    if (USTORE_BUNDLE_SIBLINGS OR NOT dependency IN_LIST USTORE_SIBLING_ARCHIVES)
-        list(APPEND USTORE_DEPENDENCY_OBJECTS $<TARGET_OBJECTS:${dependency}>)
+set(ustore_dependency_objects_)
+set(ustore_dependency_links_)
+foreach (dependency_ IN LISTS ustore_dependencies_)
+    if (USTORE_BUNDLE_SIBLINGS OR NOT dependency_ IN_LIST ustore_sibling_archives_)
+        list(APPEND ustore_dependency_objects_ $<TARGET_OBJECTS:${dependency_}>)
     endif ()
-    list(APPEND USTORE_DEPENDENCY_LINKS $<BUILD_INTERFACE:${dependency}>)
+    list(APPEND ustore_dependency_links_ $<BUILD_INTERFACE:${dependency_}>)
 endforeach ()
-add_library(ustore_static STATIC ${USTORE_LIB_C_EXCLUSION} ${USTORE_SOURCES} ${USTORE_DEPENDENCY_OBJECTS})
+add_library(ustore_static STATIC ${ustore_lib_c_exclusion_} ${ustore_sources_} ${ustore_dependency_objects_})
 add_library(ustore::static ALIAS ustore_static)
 add_library(ustore::ustore ALIAS ustore_static)
-add_library(ustore_shared SHARED ${USTORE_LIB_C_EXCLUSION} ${USTORE_SOURCES})
+add_library(ustore_shared SHARED ${ustore_lib_c_exclusion_} ${ustore_sources_})
 add_library(ustore::shared ALIAS ustore_shared)
 set_target_properties(ustore_static PROPERTIES EXPORT_NAME static)
 set_target_properties(ustore_shared PROPERTIES EXPORT_NAME shared)
@@ -328,11 +320,11 @@ target_compile_definitions(
     INTERFACE USTORE_SHARED
 )
 target_link_libraries(
-    ustore_static PUBLIC Threads::Threads $<BUILD_INTERFACE:smashtable::header> ${USTORE_DEPENDENCY_LINKS}
-                         ${USTORE_ENGINE_ARCHIVES}
+    ustore_static PUBLIC Threads::Threads $<BUILD_INTERFACE:smashtable::header> ${ustore_dependency_links_}
+                         ${ustore_engine_archives_}
 )
 target_link_libraries(
-    ustore_shared PRIVATE Threads::Threads smashtable::header ${USTORE_DEPENDENCIES} ${USTORE_ENGINE_ARCHIVES}
+    ustore_shared PRIVATE Threads::Threads smashtable::header ${ustore_dependencies_} ${ustore_engine_archives_}
 )
 # The archives linked inside keep their exports to themselves, so the shared library exports the C ABI alone
 target_link_options(
@@ -340,23 +332,23 @@ target_link_options(
     $<$<PLATFORM_ID:Darwin>:LINKER:-exported_symbol,_ustore_*>
 )
 
-foreach (library IN ITEMS ustore_static ustore_shared)
-    target_compile_features(${library} PUBLIC cxx_std_20)
+foreach (library_ IN ITEMS ustore_static ustore_shared)
+    target_compile_features(${library_} PUBLIC cxx_std_20)
     target_compile_definitions(
-        ${library}
-        PUBLIC ${USTORE_ENGINE_DEFINITIONS}
-        INTERFACE USTORE_VERSION="${USTORE_VERSION}"
+        ${library_}
+        PUBLIC ${ustore_engine_definitions_}
+        INTERFACE USTORE_VERSION="${ustore_version_}"
     )
     # Collection identifiers draw their entropy from `BCryptGenRandom` on Windows
-    target_link_libraries(${library} PRIVATE $<$<PLATFORM_ID:Windows>:bcrypt> $<BUILD_INTERFACE:ustore_warnings>)
-    target_link_libraries(${library} PUBLIC $<BUILD_INTERFACE:ustore_sanitizers>)
+    target_link_libraries(${library_} PRIVATE $<$<PLATFORM_ID:Windows>:bcrypt> $<BUILD_INTERFACE:ustore_warnings>)
+    target_link_libraries(${library_} PUBLIC $<BUILD_INTERFACE:ustore_sanitizers>)
     if (TARGET ustore_nvme_compaction)
-        target_link_libraries(${library} PUBLIC ustore_nvme_compaction)
+        target_link_libraries(${library_} PUBLIC ustore_nvme_compaction)
     endif ()
     # The `include_directories` above reach this project's targets only, so a consumer linking a library inherits the
     # public headers from the target instead.
     target_include_directories(
-        ${library}
+        ${library_}
         PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/c> $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/cpp>
                $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
         PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -368,24 +360,24 @@ endforeach ()
 # `ustore::static` links
 if (USTORE_INSTALL)
     include(CMakePackageConfigHelpers)
-    set(USTORE_CONFIG_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}/cmake/ustore")
+    set(ustore_config_install_dir_ "${CMAKE_INSTALL_LIBDIR}/cmake/ustore")
     install(
-        TARGETS ustore_header ustore_static ustore_shared ${USTORE_ENGINE_ARCHIVES}
-        EXPORT ustore_targets
+        TARGETS ustore_header ustore_static ustore_shared ${ustore_engine_archives_}
+        EXPORT ustoreTargets
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
     install(
-        EXPORT ustore_targets
+        EXPORT ustoreTargets
         NAMESPACE ustore::
-        DESTINATION ${USTORE_CONFIG_INSTALL_DIR}
+        DESTINATION ${ustore_config_install_dir_}
     )
     file(
         WRITE "${CMAKE_CURRENT_BINARY_DIR}/ustoreConfig.cmake"
         [[include(CMakeFindDependencyMacro)
 find_dependency(Threads)
-include("${CMAKE_CURRENT_LIST_DIR}/ustore_targets.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/ustoreTargets.cmake")
 ]]
     )
     write_basic_package_version_file(
@@ -394,7 +386,7 @@ include("${CMAKE_CURRENT_LIST_DIR}/ustore_targets.cmake")
         COMPATIBILITY SameMajorVersion
     )
     install(FILES "${CMAKE_CURRENT_BINARY_DIR}/ustoreConfig.cmake"
-                  "${CMAKE_CURRENT_BINARY_DIR}/ustoreConfigVersion.cmake" DESTINATION ${USTORE_CONFIG_INSTALL_DIR}
+                  "${CMAKE_CURRENT_BINARY_DIR}/ustoreConfigVersion.cmake" DESTINATION ${ustore_config_install_dir_}
     )
     install(DIRECTORY c/ustore cpp/ustore include/ustore DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 endif ()
@@ -406,12 +398,12 @@ endif ()
 
 if (${USTORE_BUILD_TEST})
     enable_testing()
-    set(USTORE_TEST_NAMES "api" "compilation" "units" "strings" "strings_collection")
+    set(ustore_test_names_ "api" "compilation" "units" "strings" "strings_collection")
 
     # The storage suites build with the NVMe engine they test. The storage ring stands outside the per-engine loop: it
     # links no engine, only the siblings it is written against.
     if (${USTORE_BUILD_NVME})
-        set(USTORE_STORAGE_TEST_NAMES
+        set(ustore_storage_test_names_
             "ring"
             "channels"
             "catalog"
@@ -429,18 +421,18 @@ if (${USTORE_BUILD_TEST})
         # The io_uring, Linux AIO and SPDK transports are Linux-only and take no option of their own; each suite skips
         # itself where the kernel or the build refuses its transport.
         if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
-            list(APPEND USTORE_STORAGE_TEST_NAMES "linux_uring_disk" "linux_aio_disk" "linux_spdk_disk")
+            list(APPEND ustore_storage_test_names_ "linux_uring_disk" "linux_aio_disk" "linux_spdk_disk")
         endif ()
 
         # The SPDK suite starts and stops its own target through the rig script, so the script's path is compiled in and
         # `--spdk-root` names the build the script runs; without the option the suite prints its skip line instead.
-        foreach (storage_name IN ITEMS ${USTORE_STORAGE_TEST_NAMES})
-            set(storage_exe ustore_test_nvme_${storage_name})
-            add_executable(${storage_exe} test/nvme/${storage_name}.cpp)
-            target_compile_features(${storage_exe} PRIVATE cxx_std_20)
-            target_include_directories(${storage_exe} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
+        foreach (storage_name_ IN ITEMS ${ustore_storage_test_names_})
+            set(storage_exe_ ustore_test_nvme_${storage_name_})
+            add_executable(${storage_exe_} test/nvme/${storage_name_}.cpp)
+            target_compile_features(${storage_exe_} PRIVATE cxx_std_20)
+            target_include_directories(${storage_exe_} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
             target_link_libraries(
-                ${storage_exe}
+                ${storage_exe_}
                 PRIVATE ustore::header
                         forkunion::static
                         smashtable::header
@@ -450,59 +442,60 @@ if (${USTORE_BUILD_TEST})
                         $<$<PLATFORM_ID:Windows>:bcrypt>
                         ustore_warnings
             )
-            set(storage_arguments --directory ${CMAKE_BINARY_DIR}/test_data)
+            set(storage_arguments_ --directory ${CMAKE_BINARY_DIR}/test_data)
             # The LSM suite merges on the device where the build carries one, so on the transports that need no hardware
             # option its device case may no longer skip
-            if (storage_name STREQUAL "tree" AND TARGET ustore_nvme_compaction)
-                target_link_libraries(${storage_exe} PRIVATE ustore_nvme_compaction)
-                list(APPEND storage_arguments --no-skips --transports memory,blocking,linux-uring)
+            if (storage_name_ STREQUAL "tree" AND TARGET ustore_nvme_compaction)
+                target_link_libraries(${storage_exe_} PRIVATE ustore_nvme_compaction)
+                list(APPEND storage_arguments_ --no-skips --transports memory,blocking,linux-uring)
             endif ()
-            if (storage_name STREQUAL "linux_spdk_disk")
+            if (storage_name_ STREQUAL "linux_spdk_disk")
                 target_compile_definitions(
-                    ${storage_exe} PRIVATE USTORE_SPDK_RIG="${CMAKE_CURRENT_SOURCE_DIR}/scripts/rigs/spdk_target.sh"
+                    ${storage_exe_} PRIVATE USTORE_SPDK_RIG="${CMAKE_CURRENT_SOURCE_DIR}/scripts/rigs/spdk_target.sh"
                 )
                 if (${USTORE_WITH_SPDK})
-                    target_link_libraries(${storage_exe} PRIVATE ustore_spdk)
-                    list(APPEND storage_arguments --spdk-root ${USTORE_SPDK_ROOT})
+                    target_link_libraries(${storage_exe_} PRIVATE ustore_spdk)
+                    list(APPEND storage_arguments_ --spdk-root ${USTORE_SPDK_ROOT})
                 endif ()
             endif ()
-            add_test(NAME ${storage_exe} COMMAND ${storage_exe} ${storage_arguments})
+            add_test(NAME ${storage_exe_} COMMAND ${storage_exe_} ${storage_arguments_})
         endforeach ()
     endif ()
 
-    set(USTORE_STRESS_NAMES "atomicity" "linearizability")
+    set(ustore_stress_names_ "atomicity" "linearizability")
 
     # Every suite builds once and runs once per engine, picking it with `--engine`
-    foreach (test_name IN ITEMS ${USTORE_TEST_NAMES})
-        add_executable(ustore_test_${test_name} test/${test_name}.cpp)
-        target_link_libraries(ustore_test_${test_name} PRIVATE ustore::static fmt::fmt ustore_warnings)
-        foreach (engine_name IN ITEMS ${USTORE_ENGINE_NAMES})
-            add_test(NAME ustore_test_${test_name}_${engine_name}
-                     COMMAND ustore_test_${test_name} --engine ${engine_name} --directory ${CMAKE_BINARY_DIR}/test_data
+    foreach (test_name_ IN ITEMS ${ustore_test_names_})
+        add_executable(ustore_test_${test_name_} test/${test_name_}.cpp)
+        target_link_libraries(ustore_test_${test_name_} PRIVATE ustore::static fmt::fmt ustore_warnings)
+        foreach (engine_name_ IN ITEMS ${ustore_engine_names_})
+            add_test(NAME ustore_test_${test_name_}_${engine_name_}
+                     COMMAND ustore_test_${test_name_} --engine ${engine_name_} --directory
+                             ${CMAKE_BINARY_DIR}/test_data
             )
         endforeach ()
     endforeach ()
 
     # The templates of `include/ustore/` build against the header target alone, with no engine linked
-    set(USTORE_UTILITIES_TEST_NAMES "ram_buffers" "algorithm")
-    foreach (test_name IN ITEMS ${USTORE_UTILITIES_TEST_NAMES})
-        add_executable(ustore_test_utilities_${test_name} test/utilities/${test_name}.cpp)
-        target_include_directories(ustore_test_utilities_${test_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
+    set(ustore_utilities_test_names_ "ram_buffers" "algorithm")
+    foreach (test_name_ IN ITEMS ${ustore_utilities_test_names_})
+        add_executable(ustore_test_utilities_${test_name_} test/utilities/${test_name_}.cpp)
+        target_include_directories(ustore_test_utilities_${test_name_} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
         target_link_libraries(
-            ustore_test_utilities_${test_name} PRIVATE ustore::header forkunion::static fmt::fmt ustore_warnings
+            ustore_test_utilities_${test_name_} PRIVATE ustore::header forkunion::static fmt::fmt ustore_warnings
         )
-        add_test(NAME ustore_test_utilities_${test_name} COMMAND ustore_test_utilities_${test_name})
+        add_test(NAME ustore_test_utilities_${test_name_} COMMAND ustore_test_utilities_${test_name_})
     endforeach ()
 
     # The pages and docs templates call StringZilla's dispatched kernels, which a header-only StringZilla answers with
     # `sz_missing_library_k`, so these suites link its compiled library instead of `ustore::header`
-    set(USTORE_TEMPLATES_TEST_PATHS "pages/element_tree" "pages/page_fold" "docs/json_paths")
-    foreach (test_path IN ITEMS ${USTORE_TEMPLATES_TEST_PATHS})
-        string(REPLACE "/" "_" test_name ${test_path})
-        add_executable(ustore_test_${test_name} test/${test_path}.cpp)
-        target_include_directories(ustore_test_${test_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
+    set(ustore_templates_test_paths_ "pages/element_tree" "pages/page_fold" "docs/json_paths")
+    foreach (test_path_ IN ITEMS ${ustore_templates_test_paths_})
+        string(REPLACE "/" "_" test_name_ ${test_path_})
+        add_executable(ustore_test_${test_name_} test/${test_path_}.cpp)
+        target_include_directories(ustore_test_${test_name_} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
         target_link_libraries(
-            ustore_test_${test_name}
+            ustore_test_${test_name_}
             PRIVATE smashtable::header
                     forkunion::static
                     stringzilla::static
@@ -511,7 +504,7 @@ if (${USTORE_BUILD_TEST})
                     ustore_warnings
                     ustore_sanitizers
         )
-        add_test(NAME ustore_test_${test_name} COMMAND ustore_test_${test_name})
+        add_test(NAME ustore_test_${test_name_} COMMAND ustore_test_${test_name_})
     endforeach ()
 
     # The graph fold calls no StringZilla kernel, so its suite builds against the header target alone
@@ -536,32 +529,34 @@ if (${USTORE_BUILD_TEST})
     add_executable(ustore_test_c_shared c/test.c)
     target_link_libraries(ustore_test_c PRIVATE ustore::static)
     target_link_libraries(ustore_test_c_shared PRIVATE ustore::shared)
-    foreach (c_test IN ITEMS ustore_test_c ustore_test_c_shared)
-        set_target_properties(${c_test} PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+    foreach (c_test_ IN ITEMS ustore_test_c ustore_test_c_shared)
+        set_target_properties(${c_test_} PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
         # The shared library's C++ reaches the sanitizers' guard and allocation interceptors only when the program
         # exports them, which the C++ driver alone does
         if (NOT USTORE_BUILD_SANITIZERS STREQUAL "off")
-            set_target_properties(${c_test} PROPERTIES LINKER_LANGUAGE CXX)
+            set_target_properties(${c_test_} PROPERTIES LINKER_LANGUAGE CXX)
         endif ()
         target_compile_options(
-            ${c_test}
+            ${c_test_}
             PRIVATE "$<$<NOT:$<C_COMPILER_ID:MSVC>>:-Wall;-Wextra;-Werror;-Werror=incompatible-pointer-types>"
         )
-        add_test(NAME ${c_test} COMMAND ${c_test})
+        add_test(NAME ${c_test_} COMMAND ${c_test_})
     endforeach ()
 
     # RAM stages half-edges and watches its reads only under snapshot isolation, so two suites run there as well
-    set(snapshot_arguments --engine ram --isolation snapshot --directory ${CMAKE_BINARY_DIR}/test_data)
-    foreach (test_name IN ITEMS "api" "units")
-        add_test(NAME ustore_test_${test_name}_ram_snapshot COMMAND ustore_test_${test_name} ${snapshot_arguments})
+    set(ustore_snapshot_arguments_ --engine ram --isolation snapshot --directory ${CMAKE_BINARY_DIR}/test_data)
+    foreach (test_name_ IN ITEMS "api" "units")
+        add_test(NAME ustore_test_${test_name_}_ram_snapshot COMMAND ustore_test_${test_name_}
+                                                                     ${ustore_snapshot_arguments_}
+        )
     endforeach ()
 
-    foreach (stress_name IN ITEMS ${USTORE_STRESS_NAMES})
-        add_executable(ustore_stress_${stress_name} test/stress_${stress_name}.cpp)
-        target_link_libraries(ustore_stress_${stress_name} PRIVATE ustore::static fmt::fmt ustore_warnings)
-        foreach (engine_name IN ITEMS ${USTORE_ENGINE_NAMES})
-            add_test(NAME ustore_stress_${stress_name}_${engine_name}
-                     COMMAND ustore_stress_${stress_name} --engine ${engine_name} --directory
+    foreach (stress_name_ IN ITEMS ${ustore_stress_names_})
+        add_executable(ustore_stress_${stress_name_} test/stress_${stress_name_}.cpp)
+        target_link_libraries(ustore_stress_${stress_name_} PRIVATE ustore::static fmt::fmt ustore_warnings)
+        foreach (engine_name_ IN ITEMS ${ustore_engine_names_})
+            add_test(NAME ustore_stress_${stress_name_}_${engine_name_}
+                     COMMAND ustore_stress_${stress_name_} --engine ${engine_name_} --directory
                              ${CMAKE_BINARY_DIR}/test_data
             )
         endforeach ()
@@ -572,9 +567,9 @@ if (${USTORE_BUILD_TEST})
         add_executable(ustore_test_tools test/tools.cpp tools/dataset.cpp)
         target_link_libraries(ustore_test_tools PRIVATE ustore::static fmt::fmt ustore_warnings)
         add_dependencies(ustore_test_tools ustore_cli)
-        foreach (engine_name IN ITEMS ${USTORE_ENGINE_NAMES})
-            add_test(NAME ustore_test_tools_${engine_name}
-                     COMMAND ustore_test_tools --engine ${engine_name} --directory ${CMAKE_BINARY_DIR}/test_data --cli
+        foreach (engine_name_ IN ITEMS ${ustore_engine_names_})
+            add_test(NAME ustore_test_tools_${engine_name_}
+                     COMMAND ustore_test_tools --engine ${engine_name_} --directory ${CMAKE_BINARY_DIR}/test_data --cli
                              $<TARGET_FILE:ustore_cli>
             )
         endforeach ()
@@ -583,12 +578,12 @@ if (${USTORE_BUILD_TEST})
     # RocksDB builds uninstrumented, so ThreadSanitizer cannot see the barriers of its own threads
     if (USTORE_BUILD_SANITIZERS STREQUAL "thread")
         get_property(
-            ustore_test_names
+            ustore_registered_tests_
             DIRECTORY
             PROPERTY TESTS
         )
         set_tests_properties(
-            ${ustore_test_names}
+            ${ustore_registered_tests_}
             PROPERTIES
                 ENVIRONMENT_MODIFICATION
                 "TSAN_OPTIONS=string_prepend:suppressions=${CMAKE_CURRENT_SOURCE_DIR}/test/thread_sanitizer.supp:"

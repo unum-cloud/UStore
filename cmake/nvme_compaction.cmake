@@ -1,10 +1,10 @@
 # UStoreNVMe's compaction: the CUDA runtime library, and one suite built twice to check the GPU against the host
-set(USTORE_COMPACTION_TEST_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/test/nvme/compaction.cu")
+set(ustore_compaction_test_source_ "${CMAKE_CURRENT_SOURCE_DIR}/test/nvme/compaction.cu")
 
 # The suite as plain C++, so the host path builds and runs without a CUDA compiler
-set(USTORE_COMPACTION_HOST_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/test/nvme/compaction_host.cpp")
-configure_file("${USTORE_COMPACTION_TEST_SOURCE}" "${USTORE_COMPACTION_HOST_SOURCE}" COPYONLY)
-add_executable(ustore_test_nvme_compaction_host "${USTORE_COMPACTION_HOST_SOURCE}")
+set(ustore_compaction_host_source_ "${CMAKE_CURRENT_BINARY_DIR}/test/nvme/compaction_host.cpp")
+configure_file("${ustore_compaction_test_source_}" "${ustore_compaction_host_source_}" COPYONLY)
+add_executable(ustore_test_nvme_compaction_host "${ustore_compaction_host_source_}")
 target_include_directories(ustore_test_nvme_compaction_host PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/test")
 target_compile_features(ustore_test_nvme_compaction_host PRIVATE cxx_std_20)
 # A fold's scratch arena allocates on ForkUnion's memory domains, which the host compactor reaches
@@ -18,16 +18,16 @@ endif ()
 
 # The database suites run as plain C++ everywhere, and merge on the device through the compactor linked further down
 # once the build carries one
-set(USTORE_NVME_DEVICE_SUITES database_transaction single_collection_database_transaction
-                              single_collection_database_stress single_collection_database_transaction_stress
+set(ustore_nvme_device_suites_ database_transaction single_collection_database_transaction
+                               single_collection_database_stress single_collection_database_transaction_stress
 )
 if (USTORE_BUILD_NVME AND USTORE_BUILD_TEST)
-    foreach (suite_name IN ITEMS ${USTORE_NVME_DEVICE_SUITES})
-        add_executable(ustore_test_nvme_${suite_name} "${CMAKE_CURRENT_SOURCE_DIR}/test/nvme/${suite_name}.cpp")
-        target_include_directories(ustore_test_nvme_${suite_name} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/test")
-        target_compile_features(ustore_test_nvme_${suite_name} PRIVATE cxx_std_20)
+    foreach (suite_name_ IN ITEMS ${ustore_nvme_device_suites_})
+        add_executable(ustore_test_nvme_${suite_name_} "${CMAKE_CURRENT_SOURCE_DIR}/test/nvme/${suite_name_}.cpp")
+        target_include_directories(ustore_test_nvme_${suite_name_} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/test")
+        target_compile_features(ustore_test_nvme_${suite_name_} PRIVATE cxx_std_20)
         target_link_libraries(
-            ustore_test_nvme_${suite_name}
+            ustore_test_nvme_${suite_name_}
             PRIVATE ustore_header
                     forkunion::static
                     smashtable::header
@@ -37,8 +37,8 @@ if (USTORE_BUILD_NVME AND USTORE_BUILD_TEST)
                     $<$<PLATFORM_ID:Windows>:bcrypt>
                     ustore_warnings
         )
-        add_test(NAME ustore_test_nvme_${suite_name} COMMAND ustore_test_nvme_${suite_name} --directory
-                                                             ${CMAKE_BINARY_DIR}/test_data
+        add_test(NAME ustore_test_nvme_${suite_name_} COMMAND ustore_test_nvme_${suite_name_} --directory
+                                                              ${CMAKE_BINARY_DIR}/test_data
         )
     endforeach ()
 endif ()
@@ -95,7 +95,7 @@ target_compile_definitions(ustore_nvme_compaction PUBLIC USTORE_WITH_CUDA=1)
 # The device half of the suite is the same source as host C++ over the compiled compactor, since nvcc's front end
 # crashes instantiating StringZilla's string, which the harness reaches; one CUDA TU instantiates the suite's key slots
 add_executable(
-    ustore_test_nvme_compaction "${USTORE_COMPACTION_HOST_SOURCE}"
+    ustore_test_nvme_compaction "${ustore_compaction_host_source_}"
                                 "${CMAKE_CURRENT_SOURCE_DIR}/test/nvme/compaction_device.cu"
 )
 target_include_directories(ustore_test_nvme_compaction PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/test")
@@ -110,7 +110,7 @@ endif ()
 
 # The database suites merge on the device where it exists, through the same compactor the engine links
 if (USTORE_BUILD_NVME AND USTORE_BUILD_TEST)
-    foreach (suite_name IN ITEMS ${USTORE_NVME_DEVICE_SUITES})
-        target_link_libraries(ustore_test_nvme_${suite_name} PRIVATE ustore_nvme_compaction)
+    foreach (suite_name_ IN ITEMS ${ustore_nvme_device_suites_})
+        target_link_libraries(ustore_test_nvme_${suite_name_} PRIVATE ustore_nvme_compaction)
     endforeach ()
 endif ()

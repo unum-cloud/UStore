@@ -188,7 +188,7 @@ A namespace-scope `_k` constant names an invariant — a format, an alignment, a
 
 ## Library Builds
 
-`CMakeLists.txt` builds two libraries from one source list, `USTORE_SOURCES`, which every engine block extends:
+`CMakeLists.txt` builds two libraries from the same sources, every engine adding its own:
 
 - __`ustore_static`__, aliased `ustore::static` and `ustore::ustore`, takes the objects of ForkUnion, StringZilla, yyjson and fmt, and links the engines' own archives, RocksDB, LevelDB and liburing, which install beside it in the same CMake package, so a change to UStore never rewrites them. The suites, benchmarks and tools inside the tree link it as `ustore::static` and reach the siblings through it.
 - __`ustore_shared`__, aliased `ustore::shared`, links the same libraries privately, compiles with `USTORE_EXPORTING`, hands its consumers `USTORE_SHARED`, and exports only the functions `USTORE_EXPORT` marks, as hidden visibility, `--exclude-libs,ALL` on Linux and `-exported_symbol,_ustore_*` on macOS keep every other symbol inside.

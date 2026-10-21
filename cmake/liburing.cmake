@@ -17,10 +17,10 @@ if (NOT EXISTS "${liburing_SOURCE_DIR}/config-host.h")
     execute_process(
         COMMAND sh ./configure --use-libc --cc=${CMAKE_C_COMPILER} --cxx=${CMAKE_CXX_COMPILER}
         WORKING_DIRECTORY "${liburing_SOURCE_DIR}"
-        RESULT_VARIABLE liburing_configured
+        RESULT_VARIABLE ustore_liburing_configured_
         OUTPUT_QUIET
     )
-    if (NOT liburing_configured EQUAL 0)
+    if (NOT ustore_liburing_configured_ EQUAL 0)
         message(FATAL_ERROR "liburing's configure failed, see ${liburing_SOURCE_DIR}/config.log")
     endif ()
 endif ()
