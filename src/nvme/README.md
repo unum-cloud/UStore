@@ -3,7 +3,8 @@
 UStoreNVMe is UStore's NVMe-focused LSM engine, with `io_uring`, Linux AIO, SPDK and blocking transports, GPU compaction and GPUDirect Storage, and SIMD row kits.
 Every collection is a log-structured merge tree of immutable sorted runs, each opening with a memory-mapped B-tree of its keys.
 Keys are fixed-width stored keys, `ustore_key_t` at the C ABI, and values are opaque bytes whose width a collection fixes at compile time.
-The C ABI in `engine.cpp` backs each UStore database with one `database` and each collection with one `collection` under the same UUID.
+The C ABI in `variants.hpp` backs each UStore database with one `database` and each collection with one `collection` under the same UUID.
+Every call is a template on the CPU class, whose atomic reference and waiting policy instantiate the `database`, and `src/nvme/variants_<class>.cpp` compiles one class each; the open in `engine.cpp` takes the newest class the running CPU admits, ending on the serial floor, and every handle it hands out carries that class's table.
 It mounts on files through whichever file transport its executor names, reserves collections for `ustore_collection_main_k`, the catalog and the names, and creates every other collection with a variable-width value layout so an empty value keeps its key.
 Every write of a caller commits through a transaction of the registry, while the catalog and the names change straight in the store under a claim of their own, as no caller's transaction reaches them.
 A stage checks a transaction and hands the database's claim back at once, so the commit checks it again; a held claim would stall every other call.
@@ -23,7 +24,7 @@ A type is named after what it holds and what it does, from the whole database do
 | `key_slot`                   | A stored key with the size and location of its stored value                        |
 | `stored_value`               | One value                                                                          |
 
-The types are templates of `include/ustore/`, which `engine.cpp` instantiates, in `unum::ustore::blobs` for the LSM layers and `unum::ustore::utilities` for the I/O kits beneath them:
+The types are templates of `include/ustore/`, which `variants.hpp` instantiates once per CPU class, in `unum::ustore::blobs` for the LSM layers and `unum::ustore::utilities` for the I/O kits beneath them:
 
 - `utilities/nvme_ring.hpp` — allocators, completion counters, identifiers, extents and the ring.
 - `utilities/nvme_disks.hpp` — the disk base, the memory disk and the blocking floor.
@@ -37,7 +38,7 @@ The types are templates of `include/ustore/`, which `engine.cpp` instantiates, i
 - `blobs/nvme_write_buffer.hpp` — `write_buffer`.
 - `blobs/nvme_collection.hpp` — the value cache, `collection`, its snapshot and its scanner.
 - `blobs/nvme_database.hpp` — both databases, their snapshots, transactions, registries and read sets.
-- `graph/edge_block.hpp`, `vertex_registry.hpp` and `nvme_graph.hpp` — the graph fast path below.
+- `graph/adjacency_fold.hpp` and `nvme_graph.hpp` — the graph store below.
 
 The sorted run index is a B-tree of the run's key slots, and the merger hands the compactor each run's index.
 
@@ -113,7 +114,7 @@ Commits are ordered by the stamps the ledger issues, which keeps a transaction t
 
 ## The C ABI
 
-`engine.cpp` serves every slot of `src/engine.hpp`'s `engine_t` the RAM engine serves over one `database`, and `src/docs.cpp` and `src/graph.cpp` layer documents and graphs on its blobs, exactly as they do for LevelDB.
+`variants.hpp` serves every slot of `src/engine.hpp`'s `engine_t` the RAM engine serves over one `database`, its graph, docs and pages collections through stores of their own, and `src/docs.cpp` and `src/pages.cpp` keep documents and pages of every other collection as whole values, exactly as they do for LevelDB.
 `USTORE_BUILD_NVME` adds the engine to the `ustore` library and `nvme` to the engines every suite runs with `--engine`.
 
 - An open names a directory, which becomes the metadata directory; a data directory it does not name defaults to `data` beneath it, and a capacity it does not name defaults to one gibibyte.
@@ -184,22 +185,18 @@ In `nvme_channels.hpp`, the buffer pool carves that arena into fixed blocks, eac
 Depth comes from queue pairs rather than threads.
 A dispatch blocks until all its threads return and admits one caller at a time, and ForkUnion bans nested parallelism, so a batch fanned out inside a poll would both serialize two owners and fork a pool that is already forked.
 
-## Graph Fast Path
+## Graph Store
 
-`include/ustore/graph/nvme_graph.hpp` stores graphs of labeled, weighted, directed or undirected edges in two single-collection databases of variable-width values:
+`include/ustore/graph/nvme_graph.hpp` keeps a graph collection as one collection of the engine's database, keyed by vertex, beside the blobs stores and under the same ledger:
 
-- The vertices database, keyed by `id_entity_t`, the 16-byte `ustore_key_t` of the C ABI, holds each vertex's `vertex_t` of identifier, weight and label, its payload, and its registry.
-- The half-edges database, keyed by `id_chunk_t`, the entity paired with a block's first neighbor, holds the sorted edge blocks of that vertex.
+- A vertex's value is its half-edges, 48-byte records sorted by neighbor, edge and role, as `adjacency_fold.hpp` lays them out.
+- An edge write appends one change record per endpoint rather than rewriting either, so two transactions adding edges to one vertex both commit.
+- Reads, memory merges, flushes and compactions fold the records into the value through the fold path every collection shares, and a merge holding a change runs on the CPU.
+- A removed vertex is a removal of its key, and its neighbors take a change removing the half-edges they filed of it.
 
-An edge, `labeled_edge_t`, carries its identifier, its `first` and `second` vertices, weight, label and direction.
-Both endpoints store it as a `labeled_half_edge_t`: the edge's identifier, weight and label, the other vertex, and the role, which is source, target or undirected member.
-A vertex's half-edges split into edge blocks of 16 to 512 half-edges, 128 at best, with every half-edge to one neighbor in the same block, so a small update rewrites one block rather than the whole adjacency list.
-The `vertex_registry_t` lists each block's first and last neighbor and a quantized size class, so small inserts and removals rarely rewrite it.
-Batched calls read registries and edge blocks once and write the changed vertices and edge blocks together, and looking up many vertex pairs in one call can cut IOPS tenfold.
-
-`graph_store_t` opens both databases under the directory its caller passes and destroys their data when it closes, so a graph does not yet outlive its process.
-`graph_store.hpp` serves the graph calls of the C ABI over its access, and `engine.cpp` builds them without listing them in its table, as the store's transactions are not the engine's; nothing includes the delta-baseline coder in `delta_coding.hpp`.
-The fast path is headed for `graph.hpp`, storing adjacency directly in UStoreNVMe's files, while `c/graph.cpp` stays the modality every engine shares.
+Every store serves the modalities its fold folds, so a graph of variable-width values lands in this one, and a graph of any other width is refused, as no store keeps it.
+`src/nvme/graph_store.hpp` serves the graph calls of the C ABI over it, batching the vertices of a run of tasks on one collection into one select.
+A write watches what it depends on: a vertex it creates, a vertex a removal of edges changes, and the adjacency a vertex removal reads.
 
 ## Alternatives
 

@@ -50,7 +50,6 @@
 #include <thread>     // `std::this_thread::get_id`
 #include <utility>    // `std::exchange`, `std::move`
 
-#include <forkunion/atomics.hpp>       // `fu::preferred_atomic_ref`
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
 #include "ustore/utilities/nvme_ring.hpp" // `request_t`, `completion_t`, `queue_pair_t`, `extent_t`, `aligned_allocator`
@@ -128,8 +127,10 @@ struct disk_config_t {
  *  as submit, poll, flush, poll. A bounded sequence that must be ordered says so with
  *  @c request_chaining_t::chained_k, which runs the chain in submission order and cuts it with
  *  @c cancelled_k at the first short or failed result.
+ *
+ *  @tparam atomic_reference_ The reference the claim, cancellation and in-flight words are owned through.
  */
-template <typename device_type_>
+template <typename device_type_, template <typename> typename atomic_reference_>
     requires block_device_concept<device_type_>
 class basic_disk {
   public:
@@ -488,20 +489,20 @@ class basic_disk {
         return {};
     }
 
-    static fu::preferred_atomic_ref<std::int32_t> claim_(std::int32_t& word) noexcept {
-        return fu::preferred_atomic_ref<std::int32_t> {word};
+    static atomic_reference_<std::int32_t> claim_(std::int32_t& word) noexcept {
+        return atomic_reference_<std::int32_t> {word};
     }
 
-    static fu::preferred_atomic_ref<std::int32_t> cancelled_(queue_pair_slot_t& slot) noexcept {
-        return fu::preferred_atomic_ref<std::int32_t> {slot.cancelled};
+    static atomic_reference_<std::int32_t> cancelled_(queue_pair_slot_t& slot) noexcept {
+        return atomic_reference_<std::int32_t> {slot.cancelled};
     }
 
-    static fu::preferred_atomic_ref<std::int32_t> in_flight_(registered_memory_slot_t& slot) noexcept {
-        return fu::preferred_atomic_ref<std::int32_t> {slot.in_flight};
+    static atomic_reference_<std::int32_t> in_flight_(registered_memory_slot_t& slot) noexcept {
+        return atomic_reference_<std::int32_t> {slot.in_flight};
     }
 
-    static fu::preferred_atomic_ref<std::int32_t> in_flight_(registered_medium_slot_t& slot) noexcept {
-        return fu::preferred_atomic_ref<std::int32_t> {slot.in_flight};
+    static atomic_reference_<std::int32_t> in_flight_(registered_medium_slot_t& slot) noexcept {
+        return atomic_reference_<std::int32_t> {slot.in_flight};
     }
 
     /** Where one queue pair's requests and completions sit inside the shared windows. */
@@ -821,7 +822,8 @@ class memory_device_t {
 };
 
 /** The ring a suite drives without a device, satisfying the same contract as every disk. */
-using memory_disk_t = basic_disk<memory_device_t>;
+template <template <typename> typename atomic_reference_>
+using memory_disk = basic_disk<memory_device_t, atomic_reference_>;
 
 #pragma endregion Device
 
@@ -1216,7 +1218,8 @@ class blocking_files_device_t {
 };
 
 /** The ring every platform has: positioned reads and writes, performed on the thread that polls. */
-using blocking_files_disk_t = basic_disk<blocking_files_device_t>;
+template <template <typename> typename atomic_reference_>
+using blocking_files_disk = basic_disk<blocking_files_device_t, atomic_reference_>;
 
 #pragma endregion Device
 

@@ -13,9 +13,12 @@
 #include <cstdio>  // `stderr`
 
 #include <array>       // `std::array`
+#include <map>         // `std::map`
 #include <span>        // `std::span`
+#include <string>      // `std::string`
 #include <string_view> // `std::string_view`
 #include <utility>     // `std::move`
+#include <vector>      // `std::vector`
 
 #include <fmt/format.h>
 
@@ -180,6 +183,87 @@ std::size_t strings_collection_paged_walk(config_t const& config) {
     return failures;
 }
 
+/** What a case expects a strings collection to hold: every string it wrote and did not remove, with its last value. */
+using strings_model_t = std::map<std::string, std::string>;
+
+/** Counts the failures of reading every string of @p texts out of @p strings as @p model holds it, and of walking the
+ *  strings @p model holds under @p prefix. */
+[[nodiscard]] std::size_t expect_model(strings_collection_t& strings, std::span<std::string const> texts,
+                                       strings_model_t const& model, std::string_view prefix) noexcept {
+    std::size_t failures = 0;
+    for (std::string const& text : texts) {
+        strings_model_t::const_iterator const held = model.find(text);
+        failures += held == model.end() ? expect_missing(strings, text) : expect_value(strings, text, held->second);
+        if (failures != 0) return failures;
+    }
+    std::vector<std::string_view> prefixed;
+    for (auto const& [text, value] : model)
+        if (std::string_view {text}.starts_with(prefix)) prefixed.push_back(text);
+    return expect_walk(strings, prefix, prefixed);
+}
+
+/** Strings sharing a head, short ones and one of 64 KiB read the same while their commits merge in memory, once
+ *  flushes and compactions move them to disk with rewrites and removals in between, and once the database reopens. */
+std::size_t strings_collection_survives_maintenance(config_t const& config) {
+    std::size_t failures = 0;
+    std::vector<std::string> texts;
+    for (std::size_t index = 0; index != 150; ++index)
+        texts.push_back(fmt::format("shared-prefix!!{:03}{}", index, std::string(index % 40, 'x')));
+    for (std::size_t index = 0; index != 50; ++index) texts.push_back(fmt::format("s{}", index));
+    std::string long_text(64 * 1024, '\0');
+    for (std::size_t index = 0; index != long_text.size(); ++index)
+        long_text[index] = static_cast<char>('a' + index % 26);
+    texts.push_back(std::move(long_text));
+    strings_model_t model;
+    constexpr std::string_view shared_k = "shared-prefix!!";
+
+    {
+        fixture_t fixture {config};
+        if (!fixture.ready()) return failures + 1;
+        // Every string a commit of its own, so the memory runs merge generation after generation
+        for (std::size_t index = 0; index != texts.size(); ++index) {
+            std::string const value = fmt::format("first-{}", index);
+            failures += expect(
+                fixture.strings.assign(std::string_view {texts[index]}, std::string_view {value}).succeeded());
+            model[texts[index]] = value;
+        }
+        failures += expect_model(fixture.strings, texts, model, shared_k);
+
+        // Every round rewrites some strings, removes others, and flushes and compacts, so versions of one string
+        // and its removal land on different levels before a compaction merges them
+        for (std::size_t round = 0; round != 9 && failures == 0; ++round) {
+            for (std::size_t index = round; index < texts.size(); index += 3) {
+                std::string const value = fmt::format("round-{}-{}", round, index);
+                failures += expect(
+                    fixture.strings.assign(std::string_view {texts[index]}, std::string_view {value}).succeeded());
+                model[texts[index]] = value;
+            }
+            for (std::size_t index = round; index < texts.size(); index += 7) {
+                failures += expect(fixture.strings.remove(std::string_view {texts[index]}).succeeded());
+                model.erase(texts[index]);
+            }
+            failures += expect(fixture.database.compact().succeeded());
+            failures += expect_model(fixture.strings, texts, model, shared_k);
+            failures += expect_model(fixture.strings, texts, model, "");
+        }
+    }
+    if (failures != 0 || !config.directory()) return failures;
+
+    auto [database, open_status] = open_database<database_t>(config);
+    failures += expect(open_status.succeeded());
+    if (failures != 0) return failures;
+    auto maybe_strings = database.find<strings_collection_t>(fixture_t::name_k);
+    if (!maybe_strings) return failures + expect(maybe_strings.has_value());
+    failures += expect_model(*maybe_strings, texts, model, shared_k);
+    failures += expect(maybe_strings->assign(std::string_view {texts[1]}, "reopened").succeeded());
+    model[texts[1]] = "reopened";
+    failures += expect_model(*maybe_strings, texts, model, "");
+
+    // A clear walks the strings window by window, removing every one of them
+    failures += expect(maybe_strings->clear().succeeded());
+    return failures + expect_model(*maybe_strings, texts, strings_model_t {}, "");
+}
+
 /** A handle inside a transaction writes through it, and only a commit publishes the strings. */
 std::size_t strings_collection_in_transaction(config_t const& config) {
     std::size_t failures = 0;
@@ -221,6 +305,7 @@ int main(int argc, char** argv) {
     report(totals, "strings_collection.prefix_walk", strings_collection_prefix_walk, config);
     report(totals, "strings_collection.paged_walk", strings_collection_paged_walk, config);
     report(totals, "strings_collection.in_transaction", strings_collection_in_transaction, config);
+    report(totals, "strings_collection.survives_maintenance", strings_collection_survives_maintenance, config);
 
     return suite_exit_code(totals);
 }

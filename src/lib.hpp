@@ -32,6 +32,9 @@
  *  its arena when it takes its slot, and lowers them once its outcome is final, so freeing any of those handles waits
  *  for zero.
  *
+ *  The CPU classes live here too: the atomic reference and the waiter each class pairs, which an engine instantiates
+ *  its templates with per class, and the checks an open picks the newest class the running CPU admits by.
+ *
  *  Cursors live here, with no engine slot of their own: a pull lists the next page through the engine's scan and reads
  *  its values through the engine's read in one call. A cursor holds its database, and the transaction or snapshot it
  *  reads through, as a transaction holds its database, so each closes with the last of its holds.
@@ -52,10 +55,13 @@
 #include <string_view> // `std::string_view`
 #include <thread>      // `std::this_thread::get_id`, `std::thread::id`
 #include <tuple>       // `std::apply`
-#include <type_traits> // `std::underlying_type_t`
+#include <type_traits> // `std::underlying_type_t`, `std::is_same_v`
 #include <variant>     // `std::variant`, `std::visit`, `std::get_if`
 
+#include <forkunion/atomics.hpp>       // `fu::standard_atomic_ref` & kin - the classes' atomic references
+#include <forkunion/capabilities.hpp>  // `fu::x86_pause_t`, `fu::arm64_wfet_t` & waiter kin, `fu::cpu_capabilities`
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/shared.hpp>       // `st::standard_waiting_policy` - the parking around a class's waiter
 #include <stringzilla/stringzilla.hpp> // `sz::string_t`
 
 #include "ustore/types.hpp"                 // `key_after`, `largest_key_k`
@@ -137,6 +143,190 @@ enum_type_ value_in(enumerator_spelling<enum_type_> const (&names)[count_], usto
 }
 
 #pragma endregion Names
+
+#pragma region CPU Classes
+
+/** The CPU families UStore ships variants for, named as USearch names them. Each class bundles the wait instruction
+ *  and the atomics its silicon generation guarantees; the engines inline no compute kit, so only a class whose waiter
+ *  or atomic reference differs from its parent's carries a variant. */
+enum class cpu_class_t : std::uint32_t {
+    unknown_k = 0,
+
+    /** The portable floor: standard atomics, and yields to the scheduler. */
+    serial_k,
+
+    /** Haswell-class x86, and every x86-64 core this engine runs on: @c PAUSE between attempts. */
+    intel_haswell_k,
+
+    /** Sierra Forest-class x86 - the E-core Xeons, and Diamond Rapids after them: @c TPAUSE waits and
+     *  @c CMPCCXADD conditional adds. */
+    intel_sierra_k,
+
+    /** Graviton2-class Arm - Neoverse N1: @c YIELD between attempts. */
+    aws_g2_k,
+
+    /** Armv8.3+ Arm, named for Apple M2: single-instruction LSE read-modify-writes under RCpc acquiring loads. */
+    apple_m2_k,
+
+    /** Graviton5-class Arm - Neoverse V3: the @c apple_m2_k atomics with @c WFET waits. */
+    aws_g5_k,
+};
+
+/** The class a refused rung degrades to - the next one down its own lineage, which is the class a variant must be
+ *  distinct from to earn instantiation. */
+constexpr cpu_class_t parent_class_of(cpu_class_t cpu_class) noexcept {
+    switch (cpu_class) {
+    case cpu_class_t::intel_sierra_k: return cpu_class_t::intel_haswell_k;
+    case cpu_class_t::aws_g5_k: return cpu_class_t::apple_m2_k;
+    case cpu_class_t::apple_m2_k: return cpu_class_t::aws_g2_k;
+    default: return cpu_class_t::serial_k;
+    }
+}
+
+/** The wait instruction one CPU class pairs: x86 spins @c PAUSE, the WAITPKG Xeons arm @c TPAUSE, Arm spins
+ *  @c YIELD and the Armv8.7 classes arm @c WFET, everything else yields - as does any class whose
+ *  @c FORKUNION_TARGET_<BIT> is off in the probe list. */
+template <cpu_class_t cpu_class_>
+struct waiter_for_cpu_class {
+    using type = fu::standard_yield_t;
+};
+#if FORKUNION_TARGET_X86_PAUSE
+template <>
+struct waiter_for_cpu_class<cpu_class_t::intel_haswell_k> {
+    using type = fu::x86_pause_t;
+};
+#endif
+#if FORKUNION_TARGET_X86_TPAUSE
+template <>
+struct waiter_for_cpu_class<cpu_class_t::intel_sierra_k> {
+    using type = fu::x86_tpause_t;
+};
+#endif
+#if FORKUNION_TARGET_ARM64_YIELD
+template <>
+struct waiter_for_cpu_class<cpu_class_t::aws_g2_k> {
+    using type = fu::arm64_yield_t;
+};
+template <>
+struct waiter_for_cpu_class<cpu_class_t::apple_m2_k> {
+    using type = fu::arm64_yield_t;
+};
+#endif
+#if FORKUNION_TARGET_ARM64_WFET
+template <>
+struct waiter_for_cpu_class<cpu_class_t::aws_g5_k> {
+    using type = fu::arm64_wfet_t;
+};
+#endif
+
+/** The waiter a CPU class pairs, spelled short for the variants. */
+template <cpu_class_t cpu_class_>
+using waiter_of = typename waiter_for_cpu_class<cpu_class_>::type;
+
+/** The waiting policy a CPU class pairs: its waiter between attempts, parking on @c std::atomic::wait once a spin is
+ *  spent. */
+template <cpu_class_t cpu_class_>
+using waiting_policy_of = st::standard_waiting_policy<waiter_of<cpu_class_>>;
+
+/** The atomic reference one CPU class pairs: single-instruction LSE read-modify-writes under RCpc acquiring loads on
+ *  the Armv8.3+ classes and conditional adds on the CMPCCXADD Xeons - the floors, the older classes, and any class
+ *  whose @c FORKUNION_TARGET_<BIT> is off in the probe list take the standard one. */
+template <cpu_class_t cpu_class_>
+struct atomic_ref_for_cpu_class {
+    template <typename value_type_>
+    using type = fu::standard_atomic_ref<value_type_>;
+};
+#if FORKUNION_TARGET_X86_CMPCCXADD
+template <>
+struct atomic_ref_for_cpu_class<cpu_class_t::intel_sierra_k> {
+    template <typename value_type_>
+    using type = fu::x86_cmpccxadd_atomic_ref<value_type_>;
+};
+#endif
+#if FORKUNION_TARGET_ARM64_RCPC
+template <>
+struct atomic_ref_for_cpu_class<cpu_class_t::apple_m2_k> {
+    template <typename value_type_>
+    using type = fu::arm64_rcpc_atomic_ref<value_type_>;
+};
+template <>
+struct atomic_ref_for_cpu_class<cpu_class_t::aws_g5_k> {
+    template <typename value_type_>
+    using type = fu::arm64_rcpc_atomic_ref<value_type_>;
+};
+#elif FORKUNION_TARGET_ARM64_LSE
+template <>
+struct atomic_ref_for_cpu_class<cpu_class_t::apple_m2_k> {
+    template <typename value_type_>
+    using type = fu::arm64_lse_atomic_ref<value_type_>;
+};
+template <>
+struct atomic_ref_for_cpu_class<cpu_class_t::aws_g5_k> {
+    template <typename value_type_>
+    using type = fu::arm64_lse_atomic_ref<value_type_>;
+};
+#endif
+
+/** The reference a CPU class owns one word of @p value_type_ through, spelled short for the engines' own words. */
+template <cpu_class_t cpu_class_, typename value_type_>
+using atomic_ref_of = typename atomic_ref_for_cpu_class<cpu_class_>::template type<value_type_>;
+
+/** The spin hints every core of an architecture carries - PAUSE, YIELD, Zihintpause: the runtime confirms nothing
+ *  about them. */
+inline constexpr fu::capabilities_t baseline_hints_k = fu::capability_x86_pause_k | fu::capability_arm64_yield_k |
+                                                       fu::capability_risc5_pause_k;
+
+/** Lowers one CPU class onto ForkUnion's mask - the bits the runtime must confirm before the class's waiter and
+ *  atomic reference are trusted, read off the two types themselves. */
+template <cpu_class_t cpu_class_>
+constexpr fu::capabilities_t forkunion_capabilities_of() noexcept {
+    constexpr fu::capabilities_t waits_k = waiter_of<cpu_class_>::capability_k;
+    constexpr fu::capabilities_t atomics_k = atomic_ref_of<cpu_class_, std::uint32_t>::capabilities_k;
+    return static_cast<fu::capabilities_t>((waits_k | atomics_k) & ~baseline_hints_k);
+}
+
+/** Whether the build compiled the variants of @p cpu_class, as CMake decided and told every unit through
+ *  @c USTORE_TARGET_<CLASS>; a ladder never picks a class without one. */
+constexpr bool cpu_class_compiled(cpu_class_t cpu_class) noexcept {
+    switch (cpu_class) {
+    case cpu_class_t::serial_k: return true;
+#if USTORE_TARGET_INTEL_HASWELL
+    case cpu_class_t::intel_haswell_k: return true;
+#endif
+#if USTORE_TARGET_INTEL_SIERRA
+    case cpu_class_t::intel_sierra_k: return true;
+#endif
+#if USTORE_TARGET_AWS_G2
+    case cpu_class_t::aws_g2_k: return true;
+#endif
+#if USTORE_TARGET_APPLE_M2
+    case cpu_class_t::apple_m2_k: return true;
+#endif
+#if USTORE_TARGET_AWS_G5
+    case cpu_class_t::aws_g5_k: return true;
+#endif
+    default: return false;
+    }
+}
+
+/** Whether one compiled class is distinct from the class it degrades to: another waiter or another atomic reference,
+ *  the one fact justifying its variant. */
+template <cpu_class_t cpu_class_>
+consteval bool rung_advances() noexcept {
+    constexpr cpu_class_t parent_k = parent_class_of(cpu_class_);
+    return cpu_class_compiled(cpu_class_) &&
+           (!std::is_same_v<waiter_of<cpu_class_>, waiter_of<parent_k>> ||
+            !std::is_same_v<atomic_ref_of<cpu_class_, std::uint32_t>, atomic_ref_of<parent_k, std::uint32_t>>);
+}
+
+/** Whether the running CPU confirms every ForkUnion bit one CPU class needs. */
+template <cpu_class_t cpu_class_>
+bool forkunion_admits() noexcept {
+    constexpr fu::capabilities_t wanted = forkunion_capabilities_of<cpu_class_>();
+    return (fu::cpu_capabilities() & wanted) == wanted;
+}
+
+#pragma endregion CPU Classes
 
 /** The tag `ustore_transaction_view` and `ustore_snapshot_view` set in the low bits of a handle. */
 enum class view_tag_t : std::uintptr_t {

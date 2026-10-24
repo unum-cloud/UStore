@@ -17,6 +17,10 @@
 
 #include <fmt/format.h>
 
+#include <forkunion/atomics.hpp> // `fu::standard_atomic_ref`
+#include <forkunion/types.hpp>   // `fu::standard_yield_t`
+#include <smashtable/shared.hpp> // `st::standard_waiting_policy`
+
 #include "ustore/blobs/nvme_write_buffer.hpp" // `write_buffer`, `write_buffer_status_t`
 
 #include "harness.hpp" // `suite_exit_code`, `expect`, `expect_eq`
@@ -29,8 +33,19 @@ using namespace unum::ustore::utilities;
 /** The keys every case writes. */
 using stored_key_t = std::size_t;
 
+/** The atomic reference the buffer is instantiated with: the portable one. */
+template <typename value_type_>
+using atomic_reference = fu::standard_atomic_ref<value_type_>;
+
+/** The waiting policy the buffer is instantiated with, yielding between polls. */
+using waiting_policy_t = st::standard_waiting_policy<fu::standard_yield_t>;
+
+using resources_t = shared_resources<atomic_reference, waiting_policy_t>;
+using resources_shared_ptr_t = resources_shared_ptr<atomic_reference, waiting_policy_t>;
+using countdown_t = countdown<atomic_reference, waiting_policy_t>;
+
 /** The write buffer every case fills. */
-using write_buffer_t = write_buffer<stored_key_t>;
+using write_buffer_t = write_buffer<stored_key_t, atomic_reference, waiting_policy_t>;
 
 /** Flags of this suite, with their defaults. */
 struct options_t {

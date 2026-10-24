@@ -74,7 +74,11 @@ struct transactions_types {
     using fixture_t = fixture_type_;
     using guard_t = typename fixture_t::guard_t;
     using volume_t = typename fixture_t::volume_t;
-    using database_t = basic_single_collection_database<typename layout_type_::key_slot_t, volume_t>;
+    using key_slot_t = typename layout_type_::key_slot_t;
+    using database_t =
+        basic_single_collection_database<typename key_slot_t::stored_key_t, volume_t, atomic_reference,
+                                         waiting_policy_t,
+                                         collection<key_slot_t, volume_t, atomic_reference, waiting_policy_t>>;
     using database_pointer_t = typename database_t::database_unique_ptr_t;
     using transaction_pointer_t = typename database_t::transaction_unique_ptr_t;
 
@@ -263,8 +267,9 @@ status_t read_one(source_type_& source, io_channel_t& channel, stored_key_t stor
 
 /** Reads one key through the transaction @p source, watching it under @p schedule_. */
 template <watch_schedule_t schedule_, typename key_type_, typename store_type_>
-status_t read_one(single_collection_database_transaction<key_type_, store_type_>& source, io_channel_t& channel,
-                  stored_key_t stored_key, std::span<byte_t> into, stored_value_size_t& size) noexcept {
+status_t read_one(
+    single_collection_database_transaction<key_type_, store_type_, atomic_reference, waiting_policy_t>& source,
+    io_channel_t& channel, stored_key_t stored_key, std::span<byte_t> into, stored_value_size_t& size) noexcept {
     return source.template select<schedule_>(channel, stored_key, into, size);
 }
 
@@ -277,9 +282,10 @@ status_t read_batch(source_type_ const& source, io_channel_t& channel, std::span
 
 /** Reads a batch of keys through the transaction @p source, watching them under @p schedule_. */
 template <watch_schedule_t schedule_, typename key_type_, typename store_type_, typename sink_type_>
-status_t read_batch(single_collection_database_transaction<key_type_, store_type_> const& source, io_channel_t& channel,
-                    std::span<stored_key_t const> stored_keys, std::span<select_result_t> results,
-                    sink_type_&& sink) noexcept {
+status_t read_batch(
+    single_collection_database_transaction<key_type_, store_type_, atomic_reference, waiting_policy_t> const& source,
+    io_channel_t& channel, std::span<stored_key_t const> stored_keys, std::span<select_result_t> results,
+    sink_type_&& sink) noexcept {
     return source.template select<schedule_>(channel, stored_keys, results, sink);
 }
 

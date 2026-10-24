@@ -153,10 +153,10 @@ struct lsm_types {
     using fixture_t = fixture_type_;
     using guard_t = typename fixture_t::guard_t;
     using volume_t = typename fixture_t::volume_t;
-    using sorted_run_t = lsm_sorted_run<variable_slot_t, volume_t>;
-    using level_t = lsm_level<variable_slot_t, volume_t>;
-    using merger_t = lsm_level_merger<variable_slot_t, volume_t>;
-    using tree_t = lsm_tree<variable_slot_t, volume_t>;
+    using sorted_run_t = lsm_sorted_run<variable_slot_t, volume_t, waiting_policy_t>;
+    using level_t = lsm_level<variable_slot_t, volume_t, waiting_policy_t>;
+    using merger_t = lsm_level_merger<variable_slot_t, volume_t, atomic_reference, waiting_policy_t>;
+    using tree_t = lsm_tree<variable_slot_t, volume_t, atomic_reference, waiting_policy_t>;
 };
 
 /** The tree shape every case mounts, whose first level fills after a handful of flushes. */
@@ -324,7 +324,7 @@ template <typename level_type_>
 template <typename level_type_, typename volume_type_>
 [[nodiscard]] std::size_t adopt_batch(level_type_& level, volume_type_& volume, io_channel_t& channel,
                                       std::span<expectation_t const> wanted) {
-    using sorted_run_t = lsm_sorted_run<variable_slot_t, volume_type_>;
+    using sorted_run_t = lsm_sorted_run<variable_slot_t, volume_type_, waiting_policy_t>;
     std::size_t failures = 0;
     batch_t batch;
     failures += build_batch(wanted, batch);
@@ -716,7 +716,7 @@ std::size_t cancelled_compaction_leaves_nothing(mount_type_ const& mount) {
         runs_before = taken.level(0).size();
     }
 
-    compaction_cancellation_t cancellation;
+    compaction_cancellation<atomic_reference> cancellation;
     cancellation.raise();
     expected<compaction_outcome_t> const outcome = tree->compact(
         reading->channel(), writing->channel(), compaction_placement_t::host_k, &cancellation, last_write_fold {});
@@ -804,7 +804,7 @@ std::size_t raced_cancellation_is_all_or_nothing(mount_type_ const& mount) {
         population_before = taken.population_count();
     }
 
-    compaction_cancellation_t cancellation;
+    compaction_cancellation<atomic_reference> cancellation;
     std::thread raiser {[&cancellation]() noexcept {
         for (std::size_t spins = 0; spins != 64; ++spins) fu::preferred_yield_t {}(spins, spins, std::size_t {0});
         cancellation.raise();

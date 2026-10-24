@@ -2,8 +2,8 @@
  *  @file include/ustore/docs/json_values.hpp
  *  @author Ash Vardanian
  *  @date December 26, 2022
- *  @brief JSON documents parsed with yyjson into an arena, and the conversions between their values and the fixed-width
- *      scalars, strings and UUIDs a column of a gather holds.
+ *  @brief JSON documents parsed with yyjson into an arena, the conversions between their values and the fixed-width
+ *      scalars, strings and UUIDs a column of a gather holds, and the keys documents name in an id field.
  *
  *  Every document parses into the arena it is given, which owns all of its memory, so nothing is freed one allocation
  *  at a time. A conversion reports how faithfully a value fits its column: exactly, converted, colliding with the
@@ -49,6 +49,9 @@ constexpr std::size_t printed_number_length_limit_k = 32;
 
 /** Bytes of a UUID. */
 constexpr std::size_t uuid_bytes_k = 16;
+
+/** Characters of a UUID in its canonical 8-4-4-4-12 hexadecimal text. */
+constexpr std::size_t uuid_text_length_k = 36;
 
 using printed_number_buffer_t = char[printed_number_length_limit_k];
 
@@ -442,7 +445,6 @@ inline conversion_t gather_half(yyjson_val* value, ustore_byte_t* column, std::s
 /** Parses canonical UUID text such as "123e4567-e89b-12d3-a456-426614174000" into the bytes at @p index of @p column,
  *  in the order they are written. */
 inline conversion_t gather_uuid(yyjson_val* value, ustore_byte_t* column, std::size_t index) noexcept {
-    constexpr std::size_t uuid_text_length_k = 36;
     std::uint8_t parsed[uuid_bytes_k] = {};
     ustore_byte_t* const cell = column + index * uuid_bytes_k;
     std::memset(cell, 0, uuid_bytes_k);
@@ -466,5 +468,47 @@ inline conversion_t gather_uuid(yyjson_val* value, ustore_byte_t* column, std::s
 }
 
 #pragma endregion Gather
+
+#pragma region Keys
+
+/** Reads @p text as a UUID in its canonical 8-4-4-4-12 hexadecimal form into @p uuid, answering whether it is one. */
+inline bool parse_uuid(std::string_view text, ustore_uuid_t& uuid) noexcept {
+    if (text.size() != uuid_text_length_k) return false;
+    std::size_t byte_index = 0;
+    for (std::size_t index = 0; index != text.size();) {
+        if (index == 8 || index == 13 || index == 18 || index == 23) {
+            if (text[index++] != '-') return false;
+            continue;
+        }
+        char const* const pair = text.data() + index;
+        auto const [end, parse_error] = std::from_chars(pair, pair + 2, uuid.bytes[byte_index++], 16);
+        if (parse_error != std::errc {} || end != pair + 2) return false;
+        index += 2;
+    }
+    return true;
+}
+
+/** Reads the key of every one of @p documents from its @p id_field into @p keys: a non-negative integer, spelled as
+ *  the key of that integer, or a UUID in canonical text. */
+template <typename documents_type_>
+status_t extract_keys(documents_type_ const& documents, std::string_view id_field, ustore_arena_t arena,
+                      std::span<ustore_key_t> keys) noexcept {
+    for (std::size_t index = 0; index != keys.size(); ++index) {
+        auto [document, status] = json_parse(value_view_t {documents[index]}, arena);
+        if (status.failed()) return status;
+        yyjson_val* const identifier = json_lookup(yyjson_doc_get_root(document.handle), id_field);
+        if (yyjson_is_uint(identifier)) {
+            keys[index] = utilities::key_from_integer(yyjson_get_uint(identifier));
+            continue;
+        }
+        bool const is_uuid = yyjson_is_str(identifier) &&
+                             parse_uuid({yyjson_get_str(identifier), yyjson_get_len(identifier)}, keys[index].uuid);
+        if (!is_uuid)
+            return {status_code_t::malformed_k, "The id field holds neither a non-negative integer nor a UUID"};
+    }
+    return {};
+}
+
+#pragma endregion Keys
 
 } // namespace unum::ustore::docs

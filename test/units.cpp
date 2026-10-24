@@ -2303,7 +2303,7 @@ struct pages_client_t {
     }
 };
 
-/** Whether the engine behind @p database serves the pages calls, as every engine with blobs but NVMe does. */
+/** Whether the engine behind @p database serves the pages calls, as every engine with blobs does. */
 bool serves_pages(ustore_database_t database) {
     pages_client_t probe {database};
     auto [arena, arena_status] = arena_t::make();
@@ -3027,7 +3027,7 @@ case_result_t executor_deferred_open(config_t const& config) {
     ustore_database_t reopened = nullptr;
     ustore_outcome_t outcome {};
     open_engine(config.options(), &reopened, &outcome, executor, ustore_completion_deferred_k);
-    failures += expect(outcome.status == ustore_status_deferred_k);
+    failures += expect(ustore_outcome_status(&outcome) == ustore_status_deferred_k);
     failures += release_held(held);
     ustore_outcome_wait(&outcome);
     failures += expect_success(outcome);

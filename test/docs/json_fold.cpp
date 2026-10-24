@@ -2,21 +2,22 @@
  *  @file test/docs/json_fold.cpp
  *  @author Ash Vardanian
  *  @date October 16, 2026
- *  @brief Checks the docs fold of `ustore/docs/json_fold.hpp` against `ustore_docs_write` on the in-memory engine,
- *      whose read-modify-write path is the reference, and checks that composed chains apply like the chains they
- *      replace.
+ *  @brief Checks the docs fold of `ustore/docs/json_fold.hpp` against `ustore_docs_write` on a docs collection of the
+ *      engine `--engine` names, the read-modify-write path on the in-memory engine and change records on NVMe, and
+ *      checks that composed chains apply like the chains they replace.
  *
  *  Random streams write, upsert, update, insert, patch, merge and remove whole documents and fields of them, with
  *  values of every type, malformed values and patches whose tests fail. Every modification runs through the engine
  *  and through the fold over the base and the pending chain, which must answer the same status and the same bytes.
  *  Chains compose and bases absorb chains at random points, as compaction would. Composition is then checked alone
- *  on random chains and bases, including malformed and empty documents, against applying the chain as it is.
+ *  on random chains and bases, including malformed and empty documents, against applying the chain as it is. On NVMe,
+ *  random modifications also run beside the in-memory engine while their records flush, compact and reopen.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint64_t`, `std::int64_t`
-#include <cstring> // `std::memcpy`
+#include <cstring> // `std::memcpy`, `std::strlen`
 
 #include <algorithm>   // `std::min`
 #include <map>         // `std::map`
@@ -32,7 +33,7 @@
 #include "ustore/ustore.hpp"                // `database_t`, `arena_t`, `strided_strings`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocator`
 
-#include "harness.hpp" // `suite_exit_code`, `expect`, `expect_eq`, `random_t`
+#include "harness.hpp" // `suite_exit_code`, `expect`, `expect_eq`, `random_t`, `directory_t`
 
 using namespace unum::ustore;
 using namespace unum::ustore::test;
@@ -42,27 +43,47 @@ namespace unum::ustore::test {
 
 #pragma region Reference
 
-/** One document of the in-memory engine, modified through `ustore_docs_write` and read back as stored bytes. */
+/** Creates a collection named @p name holding documents in @p database. */
+expected<ustore_collection_id_t> create_docs_collection(ustore_database_t database, std::string const& name) {
+    ustore_collection_id_t created {};
+    ustore_outcome_t outcome {};
+    ustore_collection_create_t create {};
+    create.database = database, create.outcome = &outcome, create.name = bytes_of(std::string_view(name));
+    create.modality = ustore_modality_docs_k, create.collection = &created;
+    ustore_collection_create(&create);
+    if (status_t const status {outcome}; status.failed()) return status;
+    return created;
+}
+
+/** One document of a docs collection, modified through `ustore_docs_write` and read back as stored bytes, joining
+ *  @c transaction when set. */
 class reference_t {
-    database_t database_;
+    ustore_database_t database_ = nullptr;
+    ustore_collection_id_t collection_ {};
     ustore_key_t key_ = key_from_integer(7);
 
   public:
-    explicit reference_t(database_t database) noexcept : database_(std::move(database)) {}
+    ustore_transaction_t transaction = nullptr;
+
+    reference_t(ustore_database_t database, ustore_collection_id_t collection,
+                ustore_key_t key = key_from_integer(7)) noexcept
+        : database_(database), collection_(collection), key_(key) {}
 
     /** Stores @p bytes as they are, or removes the document without them. */
     status_t reset(std::optional<std::string> const& bytes) noexcept {
         ustore_outcome_t outcome {};
         if (!bytes) {
             ustore_blobs_remove_t remove {};
-            remove.database = database_, remove.outcome = &outcome, remove.count = 1, remove.keys = {&key_, 0};
+            remove.database = database_, remove.outcome = &outcome, remove.transaction = transaction;
+            remove.count = 1, remove.collections = {&collection_, 0}, remove.keys = {&key_, 0};
             ustore_blobs_remove(&remove);
             return status_t {outcome};
         }
         std::string_view const text = *bytes;
         strided_strings<std::string_view> const values {{&text, 0}};
         ustore_blobs_write_t write {};
-        write.database = database_, write.outcome = &outcome, write.count = 1, write.keys = {&key_, 0};
+        write.database = database_, write.outcome = &outcome, write.transaction = transaction;
+        write.count = 1, write.collections = {&collection_, 0}, write.keys = {&key_, 0};
         write.values = values.view();
         ustore_blobs_write(&write);
         return status_t {outcome};
@@ -75,7 +96,8 @@ class reference_t {
         strided_strings<std::string_view> const fields {{&field, 0}};
         strided_strings<std::string_view> const values {{&value, 0}};
         ustore_docs_write_t write {};
-        write.database = database_, write.outcome = &outcome, write.count = 1, write.keys = {&key_, 0};
+        write.database = database_, write.outcome = &outcome, write.transaction = transaction;
+        write.count = 1, write.collections = {&collection_, 0}, write.keys = {&key_, 0};
         if (!field.empty()) write.fields = fields.view();
         write.values = values.view();
         write.type = type;
@@ -95,7 +117,9 @@ class reference_t {
         ustore_octet_t const* presences = nullptr;
         ustore_strings_view_t values {};
         ustore_blobs_read_t read {};
-        read.database = database_, read.outcome = &outcome, read.count = 1, read.keys = {&key_, 0};
+        read.database = database_, read.outcome = &outcome;
+        read.view = transaction ? ustore_transaction_view(transaction, ustore_watch_none_k) : nullptr;
+        read.count = 1, read.collections = {&collection_, 0}, read.keys = {&key_, 0};
         read.presences = &presences, read.values = &values, read.arena = arena;
         ustore_blobs_read(&read);
         if (status_t {outcome}.failed() || !presences || !(presences[0] & 1)) return std::nullopt;
@@ -548,12 +572,15 @@ std::size_t json_fold_reference(config_t const& config, std::uint64_t seed) {
     json_fold const fold;
     std::size_t checked = 0, refused = 0, compositions = 0, records_before = 0, records_after = 0;
     std::map<status_code_t, std::size_t> refusals;
+    auto [database, open_status] = open_database<database_t>(config);
+    failures += expect(open_status.succeeded());
+    if (failures) return failures;
 
     for (std::size_t stream = 0; stream != streams_k && failures == 0; ++stream) {
-        auto [database, open_status] = open_database<database_t>(config);
-        failures += expect(open_status.succeeded());
+        auto [collection, create_status] = create_docs_collection(database, fmt::format("stream-{}", stream));
+        failures += expect(create_status.succeeded());
         if (failures) return failures;
-        reference_t reference {std::move(database)};
+        reference_t reference {database, collection};
 
         std::optional<std::string> base;
         std::uint64_t const start = random.below(6);
@@ -611,8 +638,9 @@ std::size_t json_fold_reference(config_t const& config, std::uint64_t seed) {
             }
             ++checked;
             if (expect_outcome(folded, expected_outcome, "fold against the engine")) {
-                fmt::println(stderr, "  stream {} step {}: {} `{}` of `{}`", stream, step, int(operation.modification),
-                             operation.field, operation.value);
+                fmt::println(stderr, "  stream {} step {}: {} `{}` of `{}` over `{}`", stream, step,
+                             int(operation.modification), operation.field, operation.value,
+                             current.value_or("missing"));
                 return failures + 1;
             }
             if (wanted.failed()) {
@@ -765,6 +793,159 @@ std::size_t json_fold_compose(std::uint64_t seed) {
     return failures;
 }
 
+/** Counts a failure when @p reference reads other than @p wanted, printing both and the @p context. */
+std::size_t expect_document(reference_t& reference, std::optional<std::string> const& wanted,
+                            std::string_view context) {
+    std::optional<std::string> const actual = reference.read();
+    if (actual == wanted) return 0;
+    fmt::println(stderr, "  {}: wanted `{}`, got `{}`", context, wanted.value_or("missing"),
+                 actual.value_or("missing"));
+    return 1;
+}
+
+/** Modifications in a transaction read back folded over the document before it commits, a failing one leaves it as
+ *  it was, and the commit lands the rest. */
+std::size_t json_fold_own_changes(config_t const& config) {
+    std::size_t failures = 0;
+    auto [database, open_status] = open_database<database_t>(config);
+    failures += expect(open_status.succeeded());
+    if (failures) return failures;
+    auto [collection, create_status] = create_docs_collection(database, "own");
+    failures += expect(create_status.succeeded());
+    if (failures) return failures;
+    reference_t head {database, collection};
+    failures += expect(head.reset(R"({"a":1})").succeeded());
+
+    auto [transaction, transaction_status] = database.transaction();
+    failures += expect(transaction_status.succeeded());
+    if (failures) return failures;
+    reference_t own {database, collection};
+    own.transaction = transaction.transaction();
+    constexpr ustore_docs_field_type_t json_k = ustore_docs_field_type_json_k;
+    failures += expect(own.modify(ustore_docs_modify_upsert_k, "b", "2", json_k).succeeded());
+    failures += expect_document(own, R"({"a":1,"b":2})", "an upsert of a field");
+    failures += expect(own.modify(ustore_docs_modify_merge_k, {}, R"({"c":3})", json_k).succeeded());
+    failures += expect(
+        own.modify(ustore_docs_modify_patch_k, {}, R"([{"op":"remove","path":"/a"}])", json_k).succeeded());
+    failures += expect_status(
+        own.modify(ustore_docs_modify_patch_k, {}, R"([{"op":"test","path":"/a","value":1}])", json_k),
+        status_code_t::invalid_argument_k);
+    failures += expect_document(own, R"({"b":2,"c":3})", "a merge and a patch over it");
+    failures += expect_document(head, R"({"a":1})", "the head before the commit");
+    failures += expect(transaction.commit().has_value());
+    failures += expect_document(head, R"({"b":2,"c":3})", "the head after the commit");
+    return failures;
+}
+
+/** Opens the NVMe engine over @p directory, every collection flushing past 64 KiB, every level twice the one above. */
+expected<database_t> open_small_nvme(char const* directory) noexcept {
+    constexpr std::size_t write_buffer_bytes_k = 64 * 1024;
+    ustore_database_t database = nullptr;
+    ustore_outcome_t outcome {};
+    ustore_database_open_nvme_t open {};
+    open.database = &database;
+    open.outcome = &outcome;
+    open.directory = {reinterpret_cast<ustore_byte_t const*>(directory), std::strlen(directory)};
+    open.collection_write_buffer_max_bytes = write_buffer_bytes_k;
+    open.collection_value_max_size = write_buffer_bytes_k / 4;
+    open.transaction_max_bytes = write_buffer_bytes_k / 2;
+    open.collection_level_enlarge_factor = 2;
+    ustore_database_open_nvme(&open);
+    if (status_t const status {outcome}; status.failed()) return status;
+    return database_t {database};
+}
+
+/** Random modifications of a few documents on NVMe, flushed every hundred calls into small levels that merge often,
+ *  agree with the in-memory engine call by call, and read the same as the change records reach flushed runs, after a
+ *  compaction folds them to the bottom, and after a reopen. */
+case_result_t json_fold_maintenance(config_t const& config, std::uint64_t seed) {
+    if (config.engine() != "nvme" || !config.directory())
+        return case_result_t::skipped("needs the NVMe engine and --directory");
+    constexpr std::size_t documents_k = 16, calls_k = 3000, checkpoint_k = 500, flush_k = 100;
+    std::size_t failures = 0;
+    path_t const home {config.directory(), "maintenance"};
+    if (!recreate_directory(home.c_str())) return failures + 1;
+    random_t random {seed ^ 0xf01d};
+    value_writer_t writer {random};
+
+    auto [memory, memory_status] = open_database<database_t>(config_t {engine_options_t {}, nullptr});
+    failures += expect(memory_status.succeeded());
+    if (failures) return failures;
+    auto [memory_collection, memory_create_status] = create_docs_collection(memory, "maintenance");
+    failures += expect(memory_create_status.succeeded());
+    if (failures) return failures;
+    auto const references_of = [&](ustore_database_t database, ustore_collection_id_t collection) {
+        std::vector<reference_t> references;
+        for (std::size_t index = 0; index != documents_k; ++index)
+            references.emplace_back(database, collection, key_from_integer(index));
+        return references;
+    };
+    std::vector<reference_t> expected_documents = references_of(memory, memory_collection);
+    std::vector<reference_t> stored_documents;
+    std::size_t landed = 0;
+    auto const compare_all = [&](std::string_view context) {
+        std::size_t differing = 0;
+        for (std::size_t index = 0; index != documents_k; ++index)
+            differing += expect_document(stored_documents[index], expected_documents[index].read(), context);
+        return differing;
+    };
+
+    ustore_collection_id_t drive_collection {};
+    {
+        auto [drive, drive_status] = open_small_nvme(home.c_str());
+        failures += expect(drive_status.succeeded());
+        if (failures) return failures;
+        auto [created, drive_create_status] = create_docs_collection(drive, "maintenance");
+        failures += expect(drive_create_status.succeeded());
+        if (failures) return failures;
+        drive_collection = created;
+        stored_documents = references_of(drive, drive_collection);
+        for (std::size_t call = 0; call != calls_k && failures == 0; ++call) {
+            std::size_t const index = random.below(documents_k);
+            auto [arena, arena_status] = arena_t::make();
+            failures += expect(arena_status.succeeded());
+            std::optional<std::string> const current = expected_documents[index].read();
+            bool const parses = !current || json_parse(std::string_view(*current), arena).status().succeeded();
+            operation_t const operation = random_operation(
+                random, writer, parses ? typed_upserts_t::allowed_k : typed_upserts_t::refused_k);
+            // A whole write lands through a blobs write a third of the time, which takes text that is no JSON as well
+            bool const as_blob = operation.modification == delta_modification_t::write_k && random.below(3) == 0;
+            auto const apply = [&](reference_t& reference) {
+                if (operation.modification == delta_modification_t::remove_k) return reference.remove();
+                if (as_blob) return reference.reset(operation.value);
+                if (operation.modification == delta_modification_t::write_k)
+                    return reference.modify(ustore_docs_modify_upsert_k, {}, operation.value,
+                                            ustore_docs_field_type_json_k);
+                return reference.modify(static_cast<ustore_docs_modification_t>(operation.modification),
+                                        operation.field, operation.value, operation.type);
+            };
+            status_t const wanted = apply(expected_documents[index]);
+            status_t const answered = apply(stored_documents[index]);
+            if (answered.code != wanted.code) {
+                fmt::println(stderr, "  call {}: wanted {}, got {} for {} `{}` of `{}` over `{}`", call,
+                             describe(wanted.code), describe(answered.code), int(operation.modification),
+                             operation.field, operation.value, current.value_or("missing"));
+                ++failures;
+            }
+            landed += wanted.succeeded();
+            // A compaction flushes the memory runs first, so the records land in runs over bases in older ones
+            if (call % flush_k == 0) failures += expect(drive.compact().succeeded());
+            if (call % checkpoint_k == 0) failures += compare_all("after a checkpoint");
+        }
+        fmt::println("  {} of {} modifications landed", landed, calls_k);
+        failures += expect(landed * 3 > calls_k);
+        failures += compare_all("after every call");
+        failures += expect(drive.compact().succeeded());
+        failures += compare_all("after a compaction");
+    }
+    auto [reopened, reopen_status] = open_small_nvme(home.c_str());
+    failures += expect(reopen_status.succeeded());
+    if (failures) return failures;
+    stored_documents = references_of(reopened, drive_collection);
+    failures += compare_all("after a reopen");
+    return failures;
+}
+
 #pragma endregion Cases
 
 } // namespace unum::ustore::test
@@ -775,12 +956,19 @@ int main(int argc, char** argv) {
         status != argument_status_t::parsed_k)
         return status == argument_status_t::help_k ? 0 : 1;
     suite_totals_t totals = options.totals();
-    config_t const config {options.engine, nullptr};
+    st::expected<directory_t> const directory = directory_t::make(options.directory);
+    if (!directory) {
+        fmt::println(stderr, "  the working directory would not open");
+        return 1;
+    }
+    config_t const config {options.engine, directory->path()};
 
     report(totals, "json_fold.codec", json_fold_codec);
     report(totals, "json_fold.shapes", json_fold_shapes);
     report(totals, "json_fold.reference", json_fold_reference, config, std::uint64_t {options.seed.value});
     report(totals, "json_fold.compose", json_fold_compose, std::uint64_t {options.seed.value});
+    report(totals, "json_fold.own_changes", json_fold_own_changes, config);
+    report(totals, "json_fold.maintenance", json_fold_maintenance, config, std::uint64_t {options.seed.value});
 
     return suite_exit_code(totals);
 }

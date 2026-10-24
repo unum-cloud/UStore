@@ -63,7 +63,14 @@ struct database_types {
     using fixture_t = fixture_type_;
     using volume_t = typename fixture_t::volume_t;
     using router_t = basic_volume_router<volume_t>;
-    using database_t = basic_database<stored_key_t, volume_t>;
+    template <value_layout_t value_layout_>
+    using store_of = collection<key_slot<stored_key_t, value_layout_>, volume_t, atomic_reference, waiting_policy_t>;
+    using database_t =
+        basic_database<stored_key_t, volume_t, atomic_reference, waiting_policy_t,
+                       store_of<value_layout_t::inline_1_byte_k>, store_of<value_layout_t::inline_4_bytes_k>,
+                       store_of<value_layout_t::inline_8_bytes_k>, store_of<value_layout_t::inline_16_bytes_k>,
+                       store_of<value_layout_t::inline_32_bytes_k>, store_of<value_layout_t::inline_64_bytes_k>,
+                       store_of<value_layout_t::fixed_width_k>, store_of<value_layout_t::variable_width_k>>;
     using transaction_t = typename database_t::transaction_t;
     using transaction_unique_ptr_t = typename database_t::transaction_unique_ptr_t;
 
@@ -387,8 +394,9 @@ template <typename database_type_>
     for (shape_t const shape : every_shape_k) {
         collection_id_t const collection_id = minted_collection_id();
         std::string_view const name = name_of(shape);
-        failures += expect(
-            store.create_collection(collection_id, string_view_t {name}, collection_config_of(shape)).succeeded());
+        status_t const created = store.create_collection(collection_id, string_view_t {name}, ustore_modality_blobs_k,
+                                                         collection_config_of(shape));
+        failures += expect(created.succeeded());
         named.ids[static_cast<std::size_t>(shape)] = collection_id;
     }
     return failures;

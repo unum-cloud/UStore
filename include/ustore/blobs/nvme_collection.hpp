@@ -46,9 +46,6 @@
 #include <span>      // `std::span`
 #include <utility>   // `std::exchange`, `std::move`, `std::swap`
 
-#include <forkunion/atomics.hpp>      // `fu::preferred_atomic_ref`
-#include <forkunion/capabilities.hpp> // `fu::preferred_yield_t`
-
 #include <smashtable/basic_hash_table.hpp> // `st::hash_map`, `st::assume_reserved`
 #include <smashtable/basic_ring.hpp>       // `st::basic_ring`, `st::ring_eviction_t`
 #include <smashtable/basic_vector.hpp>     // `st::basic_vector`
@@ -60,20 +57,27 @@
 #include "ustore/blobs/nvme_tree.hpp"         // `lsm_tree`, `lsm_tree_position_t`, `collection_config_t`
 #include "ustore/utilities/folds.hpp"         // `fold_concept`, `fold_pair`, `last_write_fold`
 #include "ustore/utilities/nvme_channels.hpp" // `io_channel_t`
-#include "ustore/utilities/nvme_ring.hpp"     // `resource_constraint_t`, `constrained_allocator`
+#include "ustore/utilities/nvme_ring.hpp"     // `resource_constraint`, `constrained_allocator`
 #include "ustore/utilities/ram_buffers.hpp"   // `local_arena_t`, `arena_allocator`
 #include "ustore/utilities/types.hpp"         // `status_t`, `status_code_t`, `expected`, `byte_t`
 
 namespace unum::ustore::blobs {
 
 using utilities::constrained_allocator;
-using utilities::constrained_buffer_t;
+using utilities::constrained_buffer;
 using utilities::outside_executor_k;
-using utilities::resource_constraint_t;
+using utilities::resource_constraint;
 
 #pragma region Stamps
 
-class commit_ledger_t;
+template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+class commit_ledger;
+
+/** The order a ledger draws its stamps from, shaped as SmashTable's shared default, parking its committers through
+ *  @p waiting_policy_type_. */
+template <typename waiting_policy_type_>
+using commit_order = st::basic_commit_order<st::commit_order_t::ring_k, st::commit_order_t::buckets_k,
+                                            st::commit_order_t::sharing_k, waiting_policy_type_>;
 
 /** Whether a pin holds history for a reader, or registers a collection's published view with the ledger. */
 enum class pin_kind_t : std::uint8_t {
@@ -92,14 +96,19 @@ enum class pin_kind_t : std::uint8_t {
  *  relinking under the ledger's claim, and it gives its stamp back when it dies. A reader's stamp never changes
  *  while linked; a view's is stored in place by whoever publishes the view.
  */
-class stamp_pin_t {
+template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+class stamp_pin {
   public:
-    stamp_pin_t() noexcept = default;
-    stamp_pin_t(stamp_pin_t const&) = delete;
-    stamp_pin_t& operator=(stamp_pin_t const&) = delete;
-    inline stamp_pin_t(stamp_pin_t&& other) noexcept;
-    inline stamp_pin_t& operator=(stamp_pin_t&& other) noexcept;
-    inline ~stamp_pin_t() noexcept;
+
+    /** The ledger a pin links into. */
+    using ledger_t = commit_ledger<atomic_reference_, waiting_policy_type_>;
+
+    stamp_pin() noexcept = default;
+    stamp_pin(stamp_pin const&) = delete;
+    stamp_pin& operator=(stamp_pin const&) = delete;
+    stamp_pin(stamp_pin&& other) noexcept;
+    stamp_pin& operator=(stamp_pin&& other) noexcept;
+    ~stamp_pin() noexcept;
 
     /** Whether this pin holds a stamp. */
     [[nodiscard]] bool held() const noexcept { return ledger_ != nullptr; }
@@ -108,17 +117,17 @@ class stamp_pin_t {
     [[nodiscard]] transaction_stamp_t stamp() const noexcept { return stamp_; }
 
     /** Gives the stamp back, which a pin holding none ignores. */
-    inline void release() noexcept;
+    void release() noexcept;
 
   private:
-    friend class commit_ledger_t;
+    friend class commit_ledger<atomic_reference_, waiting_policy_type_>;
 
     /** The ledger this pin is linked into, null while it holds nothing. */
-    commit_ledger_t* ledger_ = nullptr;
+    ledger_t* ledger_ = nullptr;
 
     /** The neighbours in the ledger's list of pins of the same kind, or this pin itself as a list's head. */
-    stamp_pin_t* previous_ = this;
-    stamp_pin_t* next_ = this;
+    stamp_pin* previous_ = this;
+    stamp_pin* next_ = this;
 
     /** The stamp held. */
     transaction_stamp_t stamp_ = unwritten_stamp_k;
@@ -127,7 +136,7 @@ class stamp_pin_t {
     pin_kind_t kind_ = pin_kind_t::reader_k;
 
     /** A reader's place among the commit order's readers, which holds its low-water mark at or below the stamp. */
-    st::commit_order_t::snapshot_claim_t claim_;
+    typename commit_order<waiting_policy_type_>::snapshot_claim_t claim_;
 };
 
 /** What became of a commit handed to a ledger's sequencer. */
@@ -200,18 +209,28 @@ struct unpublished_t {
  *  staged transaction from its stage to its commit; committers waiting for it park until it is let go, and readers
  *  never touch it. The holder lets the word go first and then frees what it replaced, once every reader that entered
  *  before has left, so a commit returns only after freeing the views its batch replaced and nothing waits for later.
+ *
+ *  @tparam atomic_reference_ The reference every pending, leader, claim and pinned word is owned through.
+ *  @tparam waiting_policy_type_ What a committer's core does between attempts, and how it parks on the leader word.
  */
-class commit_ledger_t {
+template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+class commit_ledger {
   public:
-    using order_t = st::commit_order_t;
+    using order_t = commit_order<waiting_policy_type_>;
+
+    /** One stamp a reader or a view holds against this ledger. */
+    using pin_t = stamp_pin<atomic_reference_, waiting_policy_type_>;
+
+    /** The epochs every reader of this ledger's collections announces. */
+    using epochs_t = epoch_domain<atomic_reference_, waiting_policy_type_>;
 
     /** One commit between drawing its stamp and landing it. */
     using commit_in_flight_t = typename order_t::commit_in_flight_t;
 
-    commit_ledger_t() noexcept { views_.kind_ = pin_kind_t::view_k; }
-    commit_ledger_t(commit_ledger_t const&) = delete;
-    commit_ledger_t& operator=(commit_ledger_t const&) = delete;
-    ~commit_ledger_t() noexcept {
+    commit_ledger() noexcept { views_.kind_ = pin_kind_t::view_k; }
+    commit_ledger(commit_ledger const&) = delete;
+    commit_ledger& operator=(commit_ledger const&) = delete;
+    ~commit_ledger() noexcept {
         assert(readers_.next_ == &readers_ && views_.next_ == &views_ && "Pins outlive their ledger");
     }
 
@@ -222,7 +241,7 @@ class commit_ledger_t {
     }
 
     /** The epochs every reader of every collection on this ledger announces, which a view's replacer waits out. */
-    [[nodiscard]] epoch_domain& epochs() noexcept { return epochs_; }
+    [[nodiscard]] epochs_t& epochs() noexcept { return epochs_; }
 
     /**
      *  @brief Lands @p request with every request pending beside it, combining them on whichever committer takes the
@@ -230,12 +249,12 @@ class commit_ledger_t {
      *  @note A thread already holding the leader word waits on itself here, as a staged transaction's would.
      */
     expected<transaction_stamp_t> submit(commit_request_t& request) noexcept {
-        fu::preferred_atomic_ref<commit_request_t*> const pending {pending_};
+        atomic_reference_<commit_request_t*> const pending {pending_};
         commit_request_t* next = pending.load(std::memory_order_relaxed);
         do request.next = next;
         while (!pending.compare_exchange_weak(next, &request, std::memory_order_release, std::memory_order_relaxed));
 
-        fu::preferred_atomic_ref<commit_outcome_t const> const outcome {request.outcome};
+        atomic_reference_<commit_outcome_t const> const outcome {request.outcome};
         while (outcome.load(std::memory_order_acquire) == commit_outcome_t::pending_k) {
             if (try_lead_()) {
                 combine_();
@@ -244,7 +263,7 @@ class commit_ledger_t {
             }
             // A leader lets the word go only after landing or refusing every request it took, so this wakes either to
             // its outcome or to the word.
-            st::standard_waiting_policy_t {}.wait_until_changed(leader_, std::int32_t {1});
+            waiting_policy_type_ {}.wait_until_changed(&leader_, std::int32_t {1});
         }
         if (request.outcome == commit_outcome_t::refused_k) return request.refusal;
         // Every stamp the leader drew is landed in order, so this returns at once; it holds no lock either way.
@@ -254,7 +273,7 @@ class commit_ledger_t {
 
     /** Takes the leader word, parked while another thread holds it, which a stage, a flush and a compaction do. */
     void lead() noexcept {
-        while (!try_lead_()) st::standard_waiting_policy_t {}.wait_until_changed(leader_, std::int32_t {1});
+        while (!try_lead_()) waiting_policy_type_ {}.wait_until_changed(&leader_, std::int32_t {1});
     }
 
     /**
@@ -264,8 +283,8 @@ class commit_ledger_t {
      */
     void stop_leading() noexcept {
         unpublished_t* unpublished = std::exchange(unpublished_, nullptr);
-        fu::preferred_atomic_ref<std::int32_t> {leader_}.store(0, std::memory_order_release);
-        st::standard_waiting_policy_t {}.notify_waiters(leader_);
+        atomic_reference_<std::int32_t> {leader_}.store(0, std::memory_order_release);
+        waiting_policy_type_ {}.notify_waiters(&leader_);
         if (!unpublished) return;
         epochs_.wait_for_readers();
         while (unpublished) {
@@ -313,7 +332,7 @@ class commit_ledger_t {
     }
 
     /** Pins @p pin at the newest published stamp for a reader, giving back what it held, and answers that stamp. */
-    transaction_stamp_t pin_reader(stamp_pin_t& pin) noexcept {
+    transaction_stamp_t pin_reader(pin_t& pin) noexcept {
         pin.release();
         guard_t const held {claim_};
         pin.stamp_ = static_cast<transaction_stamp_t>(order_.take_snapshot(pin.claim_));
@@ -324,7 +343,7 @@ class commit_ledger_t {
     }
 
     /** Registers a collection's view as @p pin, holding memory runs of no commit yet, which a mount does once. */
-    void register_view(stamp_pin_t& pin) noexcept {
+    void register_view(pin_t& pin) noexcept {
         pin.release();
         guard_t const held {claim_};
         pin.stamp_ = head_stamp_k;
@@ -334,7 +353,7 @@ class commit_ledger_t {
 
     /** Records that the view @p pin registers holds in memory no commit at or below @p stamp, or no commit at all
      *  for @c head_stamp_k; called by whoever publishes that view, holding the leader word, before the stamp. */
-    void bound_view(stamp_pin_t& pin, transaction_stamp_t stamp) noexcept { store_(pin.stamp_, stamp); }
+    void bound_view(pin_t& pin, transaction_stamp_t stamp) noexcept { store_(pin.stamp_, stamp); }
 
     /** The newest stamp any reader pins, or @c unwritten_stamp_k while none does. */
     [[nodiscard]] transaction_stamp_t newest_reader() const noexcept { return load_(newest_reader_); }
@@ -352,7 +371,7 @@ class commit_ledger_t {
     [[nodiscard]] transaction_stamp_t floor() noexcept { return std::min(low_water_mark(), durable_stamp()); }
 
     /** As @c floor, ignoring the memory runs of the view @p own registers, which a flush is about to write out. */
-    [[nodiscard]] transaction_stamp_t floor_besides(stamp_pin_t const& own) noexcept {
+    [[nodiscard]] transaction_stamp_t floor_besides(pin_t const& own) noexcept {
         return std::min(low_water_mark(), horizon_besides(own));
     }
 
@@ -362,10 +381,10 @@ class commit_ledger_t {
      *  The published stamp is read first: every commit at or below it published its views and bounded them before it
      *  landed, so a bound read after it covers that commit, and a commit above it is past the answer anyway.
      */
-    [[nodiscard]] transaction_stamp_t horizon_besides(stamp_pin_t const& own) noexcept {
+    [[nodiscard]] transaction_stamp_t horizon_besides(pin_t const& own) noexcept {
         transaction_stamp_t horizon = published();
         guard_t const held {claim_};
-        for (stamp_pin_t const* pin = views_.next_; pin != &views_; pin = pin->next_)
+        for (pin_t const* pin = views_.next_; pin != &views_; pin = pin->next_)
             if (pin != &own) horizon = std::min(horizon, load_(pin->stamp_));
         return horizon;
     }
@@ -375,7 +394,7 @@ class commit_ledger_t {
         into.clear();
         {
             guard_t const held {claim_};
-            for (stamp_pin_t const* pin = readers_.next_; pin != &readers_; pin = pin->next_)
+            for (pin_t const* pin = readers_.next_; pin != &readers_; pin = pin->next_)
                 if (into.push_back(transaction_stamp_t {pin->stamp_}) != st::status_t::success_k)
                     return {status_code_t::out_of_memory_k, "No room to list the stamps readers pin"};
         }
@@ -388,13 +407,13 @@ class commit_ledger_t {
     }
 
   private:
-    friend class stamp_pin_t;
+    friend class stamp_pin<atomic_reference_, waiting_policy_type_>;
 
     /** Takes the leader word if nobody holds it. */
     [[nodiscard]] bool try_lead_() noexcept {
         std::int32_t idle = 0;
-        return fu::preferred_atomic_ref<std::int32_t> {leader_}.compare_exchange_strong(
-            idle, 1, std::memory_order_acquire, std::memory_order_relaxed);
+        return atomic_reference_<std::int32_t> {leader_}.compare_exchange_strong(idle, 1, std::memory_order_acquire,
+                                                                                 std::memory_order_relaxed);
     }
 
     /** Draws @p request's stamp, publishes its views, lands the stamp, and hands the request back. */
@@ -406,14 +425,14 @@ class commit_ledger_t {
         // The leader draws every stamp and lands it before the next, so the order never waits here.
         order_.end_commit(in_flight);
         request.stamp = stamp;
-        fu::preferred_atomic_ref<commit_outcome_t> {request.outcome}.store(commit_outcome_t::committed_k,
-                                                                           std::memory_order_release);
+        atomic_reference_<commit_outcome_t> {request.outcome}.store(commit_outcome_t::committed_k,
+                                                                    std::memory_order_release);
     }
 
     /** Prepares and lands every pending request in arrival order. */
     void combine_() noexcept {
-        commit_request_t* pushed = fu::preferred_atomic_ref<commit_request_t*> {pending_}.exchange(
-            nullptr, std::memory_order_acquire);
+        commit_request_t* pushed = atomic_reference_<commit_request_t*> {pending_}.exchange(nullptr,
+                                                                                            std::memory_order_acquire);
         commit_request_t* arrived = nullptr;
         while (pushed) {
             commit_request_t* const next = pushed->next;
@@ -427,8 +446,8 @@ class commit_ledger_t {
             arrived = request.next;
             if (status_t const prepared = request.prepare(request.context); prepared.failed()) {
                 request.refusal = prepared;
-                fu::preferred_atomic_ref<commit_outcome_t> {request.outcome}.store(commit_outcome_t::refused_k,
-                                                                                   std::memory_order_release);
+                atomic_reference_<commit_outcome_t> {request.outcome}.store(commit_outcome_t::refused_k,
+                                                                            std::memory_order_release);
                 continue;
             }
             land_(request);
@@ -439,17 +458,17 @@ class commit_ledger_t {
     class guard_t {
       public:
         explicit guard_t(std::int32_t& claim) noexcept : claim_(claim) {
-            fu::preferred_atomic_ref<std::int32_t> const word {claim_};
+            atomic_reference_<std::int32_t> const word {claim_};
             std::int32_t expected_free = 0;
             while (
                 !word.compare_exchange_weak(expected_free, 1, std::memory_order_acquire, std::memory_order_relaxed)) {
-                fu::preferred_yield_t {}(claim_, expected_free, std::size_t {0});
+                waiting_policy_type_ {}(&claim_, expected_free, std::size_t {0});
                 expected_free = 0;
             }
         }
         guard_t(guard_t const&) = delete;
         guard_t& operator=(guard_t const&) = delete;
-        ~guard_t() noexcept { fu::preferred_atomic_ref<std::int32_t> {claim_}.store(0, std::memory_order_release); }
+        ~guard_t() noexcept { atomic_reference_<std::int32_t> {claim_}.store(0, std::memory_order_release); }
 
       private:
         std::int32_t& claim_;
@@ -457,16 +476,16 @@ class commit_ledger_t {
 
     template <typename word_type_>
     static word_type_ load_(word_type_ const& word) noexcept {
-        return fu::preferred_atomic_ref<word_type_ const> {word}.load(std::memory_order_acquire);
+        return atomic_reference_<word_type_ const> {word}.load(std::memory_order_acquire);
     }
 
     template <typename word_type_>
     static void store_(word_type_& word, word_type_ value) noexcept {
-        fu::preferred_atomic_ref<word_type_> {word}.store(value, std::memory_order_release);
+        atomic_reference_<word_type_> {word}.store(value, std::memory_order_release);
     }
 
     /** Appends @p pin to the list @p head starts, under the claim. */
-    void link_(stamp_pin_t& head, stamp_pin_t& pin) noexcept {
+    void link_(pin_t& head, pin_t& pin) noexcept {
         pin.ledger_ = this;
         pin.previous_ = head.previous_;
         pin.next_ = &head;
@@ -475,7 +494,7 @@ class commit_ledger_t {
     }
 
     /** Unlinks @p pin, and answers the claim it held so the caller retires it outside the claim. */
-    void unlink_(stamp_pin_t& pin) noexcept {
+    void unlink_(pin_t& pin) noexcept {
         guard_t const held {claim_};
         pin.previous_->next_ = pin.next_;
         pin.next_->previous_ = pin.previous_;
@@ -483,13 +502,13 @@ class commit_ledger_t {
         pin.ledger_ = nullptr;
         if (pin.kind_ == pin_kind_t::view_k) return;
         transaction_stamp_t newest = unwritten_stamp_k;
-        for (stamp_pin_t const* other = readers_.next_; other != &readers_; other = other->next_)
+        for (pin_t const* other = readers_.next_; other != &readers_; other = other->next_)
             if (newest < other->stamp_) newest = other->stamp_;
         store_(newest_reader_, newest);
     }
 
     /** Moves @p from's place in its list to @p into, under the claim. */
-    void relink_(stamp_pin_t& from, stamp_pin_t& into) noexcept {
+    void relink_(pin_t& from, pin_t& into) noexcept {
         guard_t const held {claim_};
         into.ledger_ = this;
         into.stamp_ = from.stamp_;
@@ -506,10 +525,10 @@ class commit_ledger_t {
     order_t order_;
 
     /** The head of the list of readers' pins. */
-    stamp_pin_t readers_;
+    pin_t readers_;
 
     /** The head of the list of views' pins. */
-    stamp_pin_t views_;
+    pin_t views_;
 
     /** Held by whoever links, unlinks or walks a pin list. */
     std::int32_t claim_ = 0;
@@ -527,17 +546,20 @@ class commit_ledger_t {
     unpublished_t* unpublished_ = nullptr;
 
     /** The epochs readers of every collection on this ledger announce. */
-    epoch_domain epochs_;
+    epochs_t epochs_;
 };
 
-inline stamp_pin_t::stamp_pin_t(stamp_pin_t&& other) noexcept {
+template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+stamp_pin<atomic_reference_, waiting_policy_type_>::stamp_pin(stamp_pin&& other) noexcept {
     if (other.ledger_) {
         other.ledger_->relink_(other, *this);
         claim_ = std::move(other.claim_);
     }
 }
 
-inline stamp_pin_t& stamp_pin_t::operator=(stamp_pin_t&& other) noexcept {
+template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+stamp_pin<atomic_reference_, waiting_policy_type_>& stamp_pin<atomic_reference_, waiting_policy_type_>::operator=(
+    stamp_pin&& other) noexcept {
     if (this == &other) return *this;
     release();
     if (other.ledger_) {
@@ -547,9 +569,13 @@ inline stamp_pin_t& stamp_pin_t::operator=(stamp_pin_t&& other) noexcept {
     return *this;
 }
 
-inline stamp_pin_t::~stamp_pin_t() noexcept { release(); }
+template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+stamp_pin<atomic_reference_, waiting_policy_type_>::~stamp_pin() noexcept {
+    release();
+}
 
-inline void stamp_pin_t::release() noexcept {
+template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+void stamp_pin<atomic_reference_, waiting_policy_type_>::release() noexcept {
     if (!ledger_) return;
     ledger_->unlink_(*this);
     claim_.retire();
@@ -572,8 +598,10 @@ inline void stamp_pin_t::release() noexcept {
  *  overwritten, so nothing is freed until the cache is. Every word moves atomically, so a probe racing a fill copies a
  *  torn version it then drops rather than racing on memory. The words are charged to the budget the cache was made
  *  with, which is borrowed and must outlive the cache.
+ *
+ *  @tparam atomic_reference_ The reference every word of a slot and the budget are owned through.
  */
-template <typename stored_key_type_>
+template <typename stored_key_type_, template <typename> typename atomic_reference_>
 class value_cache {
   public:
 
@@ -612,9 +640,9 @@ class value_cache {
      *  @param[inout] constraint The budget the cached bytes are charged to, which must outlive the cache.
      */
     [[nodiscard]] static value_cache of(std::size_t capacity_bytes, stored_value_size_t value_size,
-                                        resource_constraint_t& constraint) noexcept {
+                                        resource_constraint<atomic_reference_>& constraint) noexcept {
         value_cache cache;
-        cache.slots_ = slots_t {constrained_allocator<std::uint64_t*> {constraint}};
+        cache.slots_ = slots_t {constrained_allocator<std::uint64_t*, atomic_reference_> {constraint}};
         if (capacity_bytes == 0 || value_size == 0) return cache;
         std::size_t const slot_words = value_word_k + words_of_(value_size);
         std::size_t const affordable = capacity_bytes / (slot_words * sizeof(std::uint64_t) + sizeof(std::uint64_t*));
@@ -642,7 +670,7 @@ class value_cache {
                             stored_value_size_t& size) const noexcept {
         if (slots_.empty()) return false;
         std::uint64_t const* const words =
-            fu::preferred_atomic_ref<std::uint64_t* const> {slots_[slot_of_(stored_key, stamp)]}.load(
+            atomic_reference_<std::uint64_t* const> {slots_[slot_of_(stored_key, stamp)]}.load(
                 std::memory_order_acquire);
         if (!words) return false;
         std::uint64_t const sequence = load_(words[sequence_word_k], std::memory_order_acquire);
@@ -667,7 +695,7 @@ class value_cache {
         if (slots_.empty() || words_of_(stored_value.size()) > slot_words_ - value_word_k) return;
         std::uint64_t* const words = words_of_slot_(slots_[slot_of_(stored_key, stamp)]);
         if (!words) return;
-        fu::preferred_atomic_ref<std::uint64_t> const sequence {words[sequence_word_k]};
+        atomic_reference_<std::uint64_t> const sequence {words[sequence_word_k]};
         std::uint64_t stable = sequence.load(std::memory_order_relaxed);
         if (stable % 2 != 0 ||
             !sequence.compare_exchange_strong(stable, stable + 1, std::memory_order_relaxed, std::memory_order_relaxed))
@@ -688,10 +716,10 @@ class value_cache {
 #pragma region Private Types
 
     /** One pointer per slot to the words it owns, null until its first fill, charged to the budget. */
-    using slots_t = st::basic_vector<std::uint64_t*, constrained_allocator<std::uint64_t*>>;
+    using slots_t = st::basic_vector<std::uint64_t*, constrained_allocator<std::uint64_t*, atomic_reference_>>;
 
     /** Allocates the words of a slot from the same budget. */
-    using words_allocator_t = constrained_allocator<std::uint64_t>;
+    using words_allocator_t = constrained_allocator<std::uint64_t, atomic_reference_>;
 
 #pragma endregion Private Types
 
@@ -709,7 +737,7 @@ class value_cache {
     /** The words @p slot owns, allocated with a zero header by the first fill and kept until the cache dies, or null
      *  when the budget refuses them; two first fills racing keep the words of whichever publishes first. */
     [[nodiscard]] std::uint64_t* words_of_slot_(std::uint64_t*& slot) noexcept {
-        fu::preferred_atomic_ref<std::uint64_t*> const published {slot};
+        atomic_reference_<std::uint64_t*> const published {slot};
         if (std::uint64_t* const words = published.load(std::memory_order_acquire)) return words;
         words_allocator_t allocator {slots_.get_allocator()};
         std::uint64_t* const allocated = allocator.allocate(slot_words_);
@@ -724,11 +752,11 @@ class value_cache {
 
     [[nodiscard]] static std::uint64_t load_(std::uint64_t const& word,
                                              std::memory_order order = std::memory_order_relaxed) noexcept {
-        return fu::preferred_atomic_ref<std::uint64_t const> {word}.load(order);
+        return atomic_reference_<std::uint64_t const> {word}.load(order);
     }
 
     static void store_(std::uint64_t& word, std::uint64_t value) noexcept {
-        fu::preferred_atomic_ref<std::uint64_t> {word}.store(value, std::memory_order_relaxed);
+        atomic_reference_<std::uint64_t> {word}.store(value, std::memory_order_relaxed);
     }
 
     /** Stores @p bytes into the words from @p words on, one atomic word at a time, the last padded with zeros. */
@@ -825,15 +853,16 @@ struct memory_shape_t {
 };
 
 /** One commit's records for one collection, sealed off every shared path by its committer, and the run the leader
- *  stamps them into; both outlive the request carrying them only until the commit lands or is refused. */
-template <typename stored_key_type_>
+ *  stamps them into, both charged to a budget whose word @p atomic_reference_ owns; both outlive the request carrying
+ *  them only until the commit lands or is refused. */
+template <typename stored_key_type_, template <typename> typename atomic_reference_>
 struct sealed_commit {
 
     /** The records, sorted and copied, which the leader moves into @c run once it draws the stamp. */
-    sealed_writes<stored_key_type_, constrained_allocator<byte_t>> writes;
+    sealed_writes<stored_key_type_, constrained_allocator<byte_t, atomic_reference_>> writes;
 
     /** The run they become, allocated by the committer, owned by the collection once published. */
-    std::unique_ptr<memory_run<stored_key_type_, constrained_allocator<byte_t>>> run;
+    std::unique_ptr<memory_run<stored_key_type_, constrained_allocator<byte_t, atomic_reference_>>> run;
 };
 
 /** One key a scan hands out: what it carries at the scan's stamp and how wide its value is. */
@@ -854,8 +883,8 @@ struct scan_entry {
 template <typename stored_key_type_>
 inline constexpr std::size_t scan_page_keys_k = utilities::arena_page_bytes_k / sizeof(scan_entry<stored_key_type_>);
 
-template <typename key_slot_type_, typename volume_type_,
-          utilities::fold_concept fold_type_ = utilities::last_write_fold>
+template <typename key_slot_type_, typename volume_type_, template <typename> typename atomic_reference_,
+          typename waiting_policy_type_, utilities::fold_concept fold_type_ = utilities::last_write_fold>
 class collection_scanner;
 
 #pragma endregion Vocabulary
@@ -877,9 +906,13 @@ class collection_scanner;
  *  The fold decides what a change record does: a read collects a key's versions newest first down to the first that
  *  closes the chain and applies them, and every merge composes the changes no reader tells apart. A collection of
  *  blobs folds with @c last_write_fold, writes no change, and reads and merges exactly as if it had no fold.
+ *
+ *  @tparam atomic_reference_ The reference the published view, the cache, the budget and the ledger own their words
+ *      through.
+ *  @tparam waiting_policy_type_ What a core waiting on a read, a barrier or the ledger does, and how it parks.
  */
-template <typename key_slot_type_, typename volume_type_,
-          utilities::fold_concept fold_type_ = utilities::last_write_fold>
+template <typename key_slot_type_, typename volume_type_, template <typename> typename atomic_reference_,
+          typename waiting_policy_type_, utilities::fold_concept fold_type_ = utilities::last_write_fold>
 class collection {
   public:
 
@@ -898,13 +931,22 @@ class collection {
     using stored_key_t = typename key_slot_t::stored_key_t;
 
     /** The tree the flushed writes of this collection live in. */
-    using tree_t = lsm_tree<key_slot_t, volume_t>;
+    using tree_t = lsm_tree<key_slot_t, volume_t, atomic_reference_, waiting_policy_type_>;
 
     /** One level set of that tree, which a view names. */
     using level_set_t = typename tree_t::level_set_t;
 
     /** The values of versions point reads paid I/O for, which this collection keeps. */
-    using value_cache_t = value_cache<stored_key_t>;
+    using value_cache_t = value_cache<stored_key_t, atomic_reference_>;
+
+    /** The stamps this collection's writes carry and its readers pin. */
+    using ledger_t = commit_ledger<atomic_reference_, waiting_policy_type_>;
+
+    /** One stamp a reader or a view of this collection holds against the ledger. */
+    using pin_t = stamp_pin<atomic_reference_, waiting_policy_type_>;
+
+    /** The budget the memory runs and the cache are charged to. */
+    using constraint_t = resource_constraint<atomic_reference_>;
 
     /** Where the sections of one flushed run sit inside its blob. */
     using sorted_run_layout_t = sorted_run_layout<key_slot_t>;
@@ -913,16 +955,16 @@ class collection {
     using keyed_delta_t = keyed_delta<stored_key_t>;
 
     /** One commit's records, sorted and copied, before they are stamped. */
-    using sealed_writes_t = sealed_writes<stored_key_t, constrained_allocator<byte_t>>;
+    using sealed_writes_t = sealed_writes<stored_key_t, constrained_allocator<byte_t, atomic_reference_>>;
 
     /** One commit's records, stamped, which nothing changes once a view names them. */
-    using memory_run_t = memory_run<stored_key_t, constrained_allocator<byte_t>>;
+    using memory_run_t = memory_run<stored_key_t, constrained_allocator<byte_t, atomic_reference_>>;
 
     /** The memory runs one view names, newest first. */
     using memory_view_t = collection_view<memory_run_t>;
 
     /** One commit's records for this collection between its sealing and its landing. */
-    using sealed_commit_t = sealed_commit<stored_key_t>;
+    using sealed_commit_t = sealed_commit<stored_key_t, atomic_reference_>;
 
     /** One version a merge or a flush carries over from a memory run. */
     using stamped_delta_t = stamped_delta<stored_key_t>;
@@ -966,8 +1008,8 @@ class collection {
      *  @param[inout] constraint The budget the memory runs and the cache are charged to.
      *  @param[inout] ledger The stamps the collection's writes carry and its readers pin, outliving the collection.
      */
-    static expected<collection> mount(volume_t& volume, collection_config_t const& config,
-                                      resource_constraint_t& constraint, commit_ledger_t& ledger) noexcept {
+    static expected<collection> mount(volume_t& volume, collection_config_t const& config, constraint_t& constraint,
+                                      ledger_t& ledger) noexcept {
         sorted_run_config_t const& values = config.lsm_tree.lsm_level_0.sorted_run;
         collection mounted;
         mounted.config_ = config;
@@ -993,6 +1035,12 @@ class collection {
         mounted.view_.replace(*mounted.current_);
         ledger.register_view(mounted.view_pin_);
         return mounted;
+    }
+
+    /** Whether a collection of @p modality whose values follow @p layout is one this collection keeps: a modality its
+     *  fold folds, in the value layout of its key slots. */
+    [[nodiscard]] static bool serves(ustore_modality_t modality, value_layout_t layout) noexcept {
+        return fold_t::serves(modality) && layout == value_layout_k;
     }
 
     /** Returns every run to the volume and forgets every memory run, which destroys the data and which only a
@@ -1173,16 +1221,17 @@ class collection {
         level_set_t const& levels = *read.view->levels;
 
         // The tree takes its keys contiguous, so the request each deferred key came from travels beside it.
-        deferred_keys_t deferred_keys {constrained_allocator<stored_key_t> {*constraint_}};
-        deferred_requests_t deferred_requests {constrained_allocator<std::size_t> {*constraint_}};
+        deferred_keys_t deferred_keys {constrained_allocator<stored_key_t, atomic_reference_> {*constraint_}};
+        deferred_requests_t deferred_requests {constrained_allocator<std::size_t, atomic_reference_> {*constraint_}};
         if (deferred_keys.reserve(stored_keys.size()) != st::status_t::success_k ||
             deferred_requests.reserve(stored_keys.size()) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A collection could not track the keys of a batch"};
 
         // A cached value is copied out of its slot before the sink sees it, into one buffer the whole batch reuses.
-        constrained_buffer_t cached_value {constrained_allocator<byte_t> {*constraint_}};
+        constrained_buffer<atomic_reference_> cached_value {
+            constrained_allocator<byte_t, atomic_reference_> {*constraint_}};
         // A key whose newest version is a fold's change is folded on its own once the batch's reads have retired.
-        deferred_requests_t folded_requests {constrained_allocator<std::size_t> {*constraint_}};
+        deferred_requests_t folded_requests {constrained_allocator<std::size_t, atomic_reference_> {*constraint_}};
         for (std::size_t request = 0; request != stored_keys.size(); ++request) {
             delta_view_t found;
             if (read.view->memory_runs.find(stored_keys[request], read.stamp, found)) {
@@ -1224,8 +1273,8 @@ class collection {
 
         // The tree answers in its own vocabulary and the sink is told nothing about sizes, so the bytes every key
         // owed are counted here and compared once the read has run.
-        deferred_answers_t answers {constrained_allocator<find_result_t> {*constraint_}};
-        deferred_delivered_t delivered {constrained_allocator<std::uint64_t> {*constraint_}};
+        deferred_answers_t answers {constrained_allocator<find_result_t, atomic_reference_> {*constraint_}};
+        deferred_delivered_t delivered {constrained_allocator<std::uint64_t, atomic_reference_> {*constraint_}};
         if (answers.resize(deferred_keys.size()) != st::status_t::success_k ||
             delivered.resize(deferred_keys.size()) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A collection could not track the keys of a batch"};
@@ -1291,7 +1340,8 @@ class collection {
                 return status_t {status_code_t::malformed_k, "This collection admits no record of that size"};
         sealed_commit_t sealed;
         if (deltas.empty()) return sealed;
-        auto [writes, seal_status] = sealed_writes_t::seal(deltas, constrained_allocator<byte_t> {*constraint_});
+        auto [writes, seal_status] = sealed_writes_t::seal(
+            deltas, constrained_allocator<byte_t, atomic_reference_> {*constraint_});
         if (seal_status.failed()) return seal_status;
         sealed.writes = std::move(writes);
         sealed.run.reset(new (std::nothrow) memory_run_t {});
@@ -1334,8 +1384,8 @@ class collection {
      *  leader does before it publishes @p stamp itself, so a reader at the stamp finds the run. */
     void publish(sealed_commit_t& sealed, transaction_stamp_t stamp) noexcept {
         assert(prepared_view_ && "A commit publishes only what its leader prepared");
-        expected<memory_run_t> stamped = memory_run_t::stamped(std::move(sealed.writes), stamp,
-                                                               constrained_allocator<byte_t> {*constraint_});
+        expected<memory_run_t> stamped = memory_run_t::stamped(
+            std::move(sealed.writes), stamp, constrained_allocator<byte_t, atomic_reference_> {*constraint_});
         assert(stamped.has_value() && "A drawn stamp packs into no words");
         if (stamped) *sealed.run = std::move(*stamped);
         // The durable horizon stays below the oldest commit that only memory holds.
@@ -1535,17 +1585,17 @@ class collection {
             survival.pinned_count = readers.size();
             // Nothing a memory run holds is durable, so no mount needs a version; a head reader needs those above this.
             survival.horizon = ledger_->published();
-            stamped_deltas_t versions {constrained_allocator<stamped_delta_t> {*constraint_}};
+            stamped_deltas_t versions {constrained_allocator<stamped_delta_t, atomic_reference_> {*constraint_}};
             // The changes a merge folds sit here until the merged run copies them.
             utilities::local_arena_t folded;
             utilities::arena_allocator<byte_t> folded_bytes = folded.allocator();
-            if (status_t const kept = kept_versions_(std::span<memory_run_t const* const> {group}, survival, versions,
-                                                     folded_bytes);
+            if (status_t const kept = kept_versions(std::span<memory_run_t const* const> {group}, survival, fold_,
+                                                    versions, folded_bytes);
                 kept.failed())
                 return kept;
             auto [merged, merged_status] = memory_run_t::merged(
                 std::span<stamped_delta_t const> {versions}, group.back()->oldest_stamp(), group.back()->generation(),
-                constrained_allocator<byte_t> {*constraint_});
+                constrained_allocator<byte_t, atomic_reference_> {*constraint_});
             if (merged_status.failed()) return merged_status;
             std::unique_ptr<memory_run_t> merged_run {new (std::nothrow) memory_run_t {std::move(merged)}};
             // The replaced runs, freed here once the publication waited out every reader that could hold one.
@@ -1604,10 +1654,10 @@ class collection {
         survival.floor = ledger_->floor_besides(view_pin_);
         publication.oldest_readable = survival.horizon;
 
-        drained_slots_t key_slots {constrained_allocator<key_slot_t> {*constraint_}};
-        drained_stamps_t stamps {constrained_allocator<std::uint64_t> {*constraint_}};
-        drained_kinds_t kinds {constrained_allocator<std::uint8_t> {*constraint_}};
-        drained_values_t stored_values {constrained_allocator<byte_t> {*constraint_}};
+        drained_slots_t key_slots {constrained_allocator<key_slot_t, atomic_reference_> {*constraint_}};
+        drained_stamps_t stamps {constrained_allocator<std::uint64_t, atomic_reference_> {*constraint_}};
+        drained_kinds_t kinds {constrained_allocator<std::uint8_t, atomic_reference_> {*constraint_}};
+        drained_values_t stored_values {constrained_allocator<byte_t, atomic_reference_> {*constraint_}};
         utilities::local_arena_t folded;
         utilities::arena_allocator<byte_t> folded_bytes = folded.allocator();
         if (status_t const drained = drain_(std::span<memory_run_t const* const> {publication.flushed}, survival,
@@ -1671,12 +1721,12 @@ class collection {
 
   private:
 
-    friend class collection_scanner<key_slot_t, volume_t, fold_t>;
+    friend class collection_scanner<key_slot_t, volume_t, atomic_reference_, waiting_policy_type_, fold_t>;
 
 #pragma region Private Types
 
     /** One reader inside the ledger's epochs, announced until it dies. */
-    using reader_t = epoch_domain::reader_t;
+    using reader_t = typename ledger_t::epochs_t::reader_t;
 
     /** One commit of this collection alone, as the sequencer hands it to its two steps. */
     struct alone_t {
@@ -1731,34 +1781,36 @@ class collection {
     };
 
     /** The key slots one flush writes, in ascending order of their keys. */
-    using drained_slots_t = st::basic_vector<key_slot_t, constrained_allocator<key_slot_t>>;
+    using drained_slots_t = st::basic_vector<key_slot_t, constrained_allocator<key_slot_t, atomic_reference_>>;
 
     /** The values one flush writes, back to back in the order the key slots locate them. */
-    using drained_values_t = st::basic_vector<byte_t, constrained_allocator<byte_t>>;
+    using drained_values_t = st::basic_vector<byte_t, constrained_allocator<byte_t, atomic_reference_>>;
 
     /** The stamps of the key slots one flush writes, in the same order. */
-    using drained_stamps_t = st::basic_vector<std::uint64_t, constrained_allocator<std::uint64_t>>;
+    using drained_stamps_t = st::basic_vector<std::uint64_t, constrained_allocator<std::uint64_t, atomic_reference_>>;
 
     /** The @c delta_kind_t of the key slots one flush writes, in the same order. */
-    using drained_kinds_t = st::basic_vector<std::uint8_t, constrained_allocator<std::uint8_t>>;
+    using drained_kinds_t = st::basic_vector<std::uint8_t, constrained_allocator<std::uint8_t, atomic_reference_>>;
 
     /** The versions one merge or one flush carries over, before and after they are sorted into a run's order. */
-    using stamped_deltas_t = st::basic_vector<stamped_delta_t, constrained_allocator<stamped_delta_t>>;
+    using stamped_deltas_t =
+        st::basic_vector<stamped_delta_t, constrained_allocator<stamped_delta_t, atomic_reference_>>;
 
     /** The records one commit of its own hands over. */
-    using deltas_t = st::basic_vector<keyed_delta_t, constrained_allocator<keyed_delta_t>>;
+    using deltas_t = st::basic_vector<keyed_delta_t, constrained_allocator<keyed_delta_t, atomic_reference_>>;
 
     /** The keys of a batch that neither a memory run nor the cache answered. */
-    using deferred_keys_t = st::basic_vector<stored_key_t, constrained_allocator<stored_key_t>>;
+    using deferred_keys_t = st::basic_vector<stored_key_t, constrained_allocator<stored_key_t, atomic_reference_>>;
 
     /** The caller's request every deferred key came from. */
-    using deferred_requests_t = st::basic_vector<std::size_t, constrained_allocator<std::size_t>>;
+    using deferred_requests_t = st::basic_vector<std::size_t, constrained_allocator<std::size_t, atomic_reference_>>;
 
     /** What the tree answered for every deferred key. */
-    using deferred_answers_t = st::basic_vector<find_result_t, constrained_allocator<find_result_t>>;
+    using deferred_answers_t = st::basic_vector<find_result_t, constrained_allocator<find_result_t, atomic_reference_>>;
 
     /** Bytes the tree delivered for every deferred key. */
-    using deferred_delivered_t = st::basic_vector<std::uint64_t, constrained_allocator<std::uint64_t>>;
+    using deferred_delivered_t =
+        st::basic_vector<std::uint64_t, constrained_allocator<std::uint64_t, atomic_reference_>>;
 
 #pragma endregion Private Types
 
@@ -2057,7 +2109,7 @@ class collection {
 
     /** Room for @p count records of one commit of its own. */
     expected<deltas_t> deltas_of_(std::size_t count) const noexcept {
-        deltas_t deltas {constrained_allocator<keyed_delta_t> {*constraint_}};
+        deltas_t deltas {constrained_allocator<keyed_delta_t, atomic_reference_> {*constraint_}};
         if (deltas.resize(count) != st::status_t::success_k)
             return status_t {status_code_t::out_of_memory_k, "No room to hand a batch over"};
         return deltas;
@@ -2109,8 +2161,8 @@ class collection {
     status_t drain_(std::span<memory_run_t const* const> flushed, compaction_stamps_t const& survival,
                     utilities::arena_allocator<byte_t>& arena, drained_slots_t& key_slots, drained_stamps_t& stamps,
                     drained_kinds_t& kinds, drained_values_t& stored_values) const noexcept {
-        stamped_deltas_t versions {constrained_allocator<stamped_delta_t> {*constraint_}};
-        if (status_t const kept = kept_versions_(flushed, survival, versions, arena); kept.failed()) return kept;
+        stamped_deltas_t versions {constrained_allocator<stamped_delta_t, atomic_reference_> {*constraint_}};
+        if (status_t const kept = kept_versions(flushed, survival, fold_, versions, arena); kept.failed()) return kept;
         if (key_slots.reserve(versions.size()) != st::status_t::success_k ||
             stamps.reserve(versions.size()) != st::status_t::success_k ||
             kinds.reserve(versions.size()) != st::status_t::success_k)
@@ -2144,46 +2196,6 @@ class collection {
             [[maybe_unused]] st::status_t const stamped = stamps.push_back(std::uint64_t {version.stamp});
             [[maybe_unused]] st::status_t const kinded = kinds.push_back(static_cast<std::uint8_t>(version.delta.kind));
         }
-        return {};
-    }
-
-    /**
-     *  @brief Gathers every version @p runs hold into @p versions, in key order with a key's versions newest first,
-     *      dropping each older version no reader of @p survival tells apart from the newer one kept before it.
-     *
-     *  Such a version under a kept change folds into it instead, keeping the change's stamp: a write or a removal below
-     *  makes it a write, and a change below composes with it, its bytes landing in @p arena.
-     */
-    status_t kept_versions_(std::span<memory_run_t const* const> runs, compaction_stamps_t const& survival,
-                            stamped_deltas_t& versions, utilities::arena_allocator<byte_t>& arena) const noexcept {
-        std::size_t count = 0;
-        for (memory_run_t const* run : runs) count += run->size();
-        if (versions.reserve(count) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A merge could not hold its versions"};
-        for (memory_run_t const* run : runs)
-            for (std::size_t position = 0; position != run->size(); ++position) [[maybe_unused]]
-                st::status_t const placed = versions.push_back(
-                    stamped_delta_t {run->stored_key(position), run->stamp(position), run->delta(position)});
-        std::sort(versions.begin(), versions.end(), [](stamped_delta_t const& first, stamped_delta_t const& second) {
-            if (first.stored_key < second.stored_key) return true;
-            if (second.stored_key < first.stored_key) return false;
-            return first.stamp > second.stamp;
-        });
-        std::size_t kept = 0;
-        for (std::size_t index = 0; index != versions.size(); ++index) {
-            bool const shadowed = kept != 0 && versions[kept - 1].stored_key == versions[index].stored_key &&
-                                  !keeps_older_version(survival, versions[kept - 1].stamp, versions[index].stamp);
-            if (!shadowed) {
-                versions[kept++] = versions[index];
-                continue;
-            }
-            delta_view_t& newer = versions[kept - 1].delta;
-            if (newer.kind != delta_kind_t::change_k) continue;
-            auto [folded, fold_status] = utilities::fold_pair(fold_, newer, versions[index].delta, arena);
-            if (fold_status.failed()) return fold_status;
-            newer = folded;
-        }
-        while (versions.size() != kept) versions.pop_back();
         return {};
     }
 
@@ -2273,19 +2285,19 @@ class collection {
     collection_config_t config_ {};
 
     /** The budget the memory runs and the cache are charged to, null until the collection is mounted. */
-    resource_constraint_t* constraint_ = nullptr;
+    constraint_t* constraint_ = nullptr;
 
     /** The tree the flushed writes live in. */
     tree_t tree_;
 
     /** The stamps this collection's writes carry and its readers pin, borrowed and outliving the collection. */
-    commit_ledger_t* ledger_ = nullptr;
+    ledger_t* ledger_ = nullptr;
 
     /** Registers the published view with the ledger, bounding the durable stamp below the oldest memory run. */
-    stamp_pin_t view_pin_;
+    pin_t view_pin_;
 
     /** The view readers load, which @c current_ owns. */
-    published_view<view_t> view_;
+    published_view<view_t, atomic_reference_> view_;
 
     /** The view published last, owned here and replaced only under the ledger's leader word. */
     std::unique_ptr<view_t> current_;
@@ -2330,7 +2342,8 @@ class collection {
  *  page before it, which that page found without handing it out, so no key is visited twice or skipped. A head scan
  *  pins the published stamp it starts at for as long as it lives.
  */
-template <typename key_slot_type_, typename volume_type_, utilities::fold_concept fold_type_>
+template <typename key_slot_type_, typename volume_type_, template <typename> typename atomic_reference_,
+          typename waiting_policy_type_, utilities::fold_concept fold_type_>
 class collection_scanner {
   public:
 
@@ -2346,7 +2359,7 @@ class collection_scanner {
     using stored_key_t = typename key_slot_t::stored_key_t;
 
     /** The collection this scanner walks. */
-    using collection_t = collection<key_slot_t, volume_t, fold_type_>;
+    using collection_t = collection<key_slot_t, volume_t, atomic_reference_, waiting_policy_type_, fold_type_>;
 
     /** The view of that collection the scan walks. */
     using view_t = typename collection_t::view_t;
@@ -2429,7 +2442,7 @@ class collection_scanner {
 #pragma region Private Types
 
     /** One reader inside the scanned collection's epochs, announced while a page is read. */
-    using reader_t = epoch_domain::reader_t;
+    using reader_t = typename collection_t::ledger_t::epochs_t::reader_t;
 
     /** Where one run of one level the scan walks has got to. */
     struct run_cursor_t {
@@ -2625,7 +2638,7 @@ class collection_scanner {
     collection_t const* source_ = nullptr;
 
     /** The published stamp a head scan reads at, which keeps its versions in every merge while the scan lives. */
-    stamp_pin_t pin_;
+    typename collection_t::pin_t pin_;
 
     /** The stamp the scan reads at, which sees the newest version of every key at or below it. */
     transaction_stamp_t stamp_ = head_stamp_k;

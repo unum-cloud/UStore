@@ -192,7 +192,11 @@ template <typename key_slot_type_, typename mount_type_>
                                                                   stored_value_size_t value_max_size) {
     using stack_t = stress_stack<typename mount_type_::fixture_t>;
     using guard_t = typename stack_t::guard_t;
-    using database_t = basic_single_collection_database<key_slot_type_, typename stack_t::volume_t>;
+    using volume_t = typename stack_t::volume_t;
+    using database_t =
+        basic_single_collection_database<typename key_slot_type_::stored_key_t, volume_t, atomic_reference,
+                                         waiting_policy_t,
+                                         collection<key_slot_type_, volume_t, atomic_reference, waiting_policy_t>>;
     std::size_t failures = 0;
 
     expected<std::unique_ptr<stack_t>> stack = make_stack(mount);

@@ -55,8 +55,8 @@ struct collection_types {
     using fixture_t = fixture_type_;
     using guard_t = typename fixture_t::guard_t;
     using volume_t = typename fixture_t::volume_t;
-    using variable_collection_t = collection<variable_slot_t, volume_t>;
-    using variable_scanner_t = collection_scanner<variable_slot_t, volume_t>;
+    using variable_collection_t = collection<variable_slot_t, volume_t, atomic_reference, waiting_policy_t>;
+    using variable_scanner_t = collection_scanner<variable_slot_t, volume_t, atomic_reference, waiting_policy_t>;
 
     /** A fixture, one checked-out channel and the volume mounted over it, which every case starts from. */
     struct stack_t {
@@ -265,7 +265,7 @@ template <typename key_slot_type_, typename mount_type_>
                                             stored_value_size_t value_max_size) {
     using types_t = collection_types<typename mount_type_::fixture_t>;
     using stack_t = typename types_t::stack_t;
-    using collection_t = collection<key_slot_type_, typename types_t::volume_t>;
+    using collection_t = collection<key_slot_type_, typename types_t::volume_t, atomic_reference, waiting_policy_t>;
     std::size_t failures = 0;
     constexpr std::size_t count_k = 300;
 
@@ -637,7 +637,7 @@ std::size_t widest_and_empty_values(mount_type_ const& mount) {
  *  many versions displace one another, and gives everything back when it dies. */
 std::size_t value_cache_holds_what_it_took() {
     std::size_t failures = 0;
-    using cache_t = value_cache<stored_key_t>;
+    using cache_t = value_cache<stored_key_t, atomic_reference>;
     constexpr stored_value_size_t width_k = 300;
     constexpr std::size_t cache_bytes_k = 1024ull * 1024ull;
     resource_constraint_t budget {std::size_t {8} * 1024 * 1024};
@@ -1013,7 +1013,8 @@ std::size_t counter_fold_reads_alike_everywhere(mount_type_ const& mount) {
     using types_t = collection_types<typename mount_type_::fixture_t>;
     using guard_t = typename types_t::guard_t;
     using stack_t = typename types_t::stack_t;
-    using counter_collection_t = collection<variable_slot_t, typename types_t::volume_t, counter_fold>;
+    using counter_collection_t =
+        collection<variable_slot_t, typename types_t::volume_t, atomic_reference, waiting_policy_t, counter_fold>;
     std::size_t failures = 0;
     constexpr stored_key_t keys_k = 12;
     expected<std::unique_ptr<stack_t>> stack = make_stack(mount);

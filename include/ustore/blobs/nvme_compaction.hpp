@@ -24,7 +24,8 @@
 #include <limits>      // `std::numeric_limits`
 #include <memory>      // `std::allocator_traits`
 #include <span>        // `std::span`
-#include <type_traits> // `std::is_trivially_copyable_v`
+#include <string_view> // `std::string_view`
+#include <type_traits> // `std::is_trivially_copyable_v`, `std::conditional_t`
 #include <utility>     // `std::move`, `std::swap`
 
 #include <smashtable/basic_vector.hpp>           // `st::basic_vector`
@@ -59,6 +60,32 @@ concept compactable_key_slot_concept = std::is_trivially_copyable_v<key_slot_typ
 template <typename key_slot_type_>
 concept locates_stored_values_concept = requires(key_slot_type_ const& key_slot) {
     { key_slot.location } -> std::convertible_to<std::uint64_t>;
+};
+
+/** A key slot shape whose stored key is the head of a longer key, as a string's 16-byte head is, so its runs carry the
+ *  tails the heads cut short, and two key slots carry one key only where their tails match too. Only the host
+ *  compactor merges these. */
+template <typename key_slot_type_>
+concept tailed_key_slot_concept = compactable_key_slot_concept<key_slot_type_> &&
+                                  requires { requires key_slot_type_::carries_tails_k; };
+
+/** The tails of the keys a run's heads cut short, in sorted order: record @c i's tail is @c bytes from @c offsets[i]
+ *  to @c offsets[i + 1], and a run of whole keys carries no offsets at all. */
+struct key_tails_t {
+
+    /** One offset per key slot into @c bytes and one past the last, or none for a run of whole keys. */
+    std::span<std::uint32_t const> offsets;
+
+    /** The tails back to back. */
+    std::span<byte_t const> bytes;
+
+    /** The tail of the key at sorted @p position, empty for a run of whole keys. */
+    [[nodiscard]] std::string_view at(std::uint64_t position) const noexcept {
+        if (offsets.empty()) return {};
+        std::size_t const begin = offsets[static_cast<std::size_t>(position)];
+        std::size_t const end = offsets[static_cast<std::size_t>(position) + 1];
+        return std::string_view {reinterpret_cast<char const*>(bytes.data()) + begin, end - begin};
+    }
 };
 
 /** Which LSM levels a compaction merges, fixing whether the upper LSM level overlaps and whether tombstones drop. */
@@ -98,6 +125,9 @@ struct sorted_run_index_view {
 
     /** The kind of every key slot in sorted order, or null for a run whose every record is a write. */
     kinds_column_t const* kinds = nullptr;
+
+    /** The tails of the keys the key slots' heads cut short, none for a run of whole keys. */
+    key_tails_t tails;
 };
 
 /** Whether @p kinds may hold a change, which only a fold's merge reads; a column packs from its least kind to its
@@ -203,6 +233,12 @@ struct compaction_output {
     /** The values a fold wrote, back to back, which a migration from the index past every source run locates. */
     rebound_vector<byte_t, allocator_type_> folded;
 
+    /** One offset per key slot into @c tails across the sorted runs and one past the last, none for whole keys. */
+    rebound_vector<std::uint64_t, allocator_type_> tail_offsets;
+
+    /** The tails of the key slots back to back in sorted order across the sorted runs. */
+    rebound_vector<byte_t, allocator_type_> tails;
+
     compaction_output() noexcept = default;
 
     /** Allocates every buffer through @p allocator. */
@@ -214,7 +250,10 @@ struct compaction_output {
               allocator)),
           stamps(typename std::allocator_traits<allocator_type_>::template rebind_alloc<std::uint64_t>(allocator)),
           kinds(typename std::allocator_traits<allocator_type_>::template rebind_alloc<std::uint8_t>(allocator)),
-          folded(typename std::allocator_traits<allocator_type_>::template rebind_alloc<byte_t>(allocator)) {}
+          folded(typename std::allocator_traits<allocator_type_>::template rebind_alloc<byte_t>(allocator)),
+          tail_offsets(
+              typename std::allocator_traits<allocator_type_>::template rebind_alloc<std::uint64_t>(allocator)),
+          tails(typename std::allocator_traits<allocator_type_>::template rebind_alloc<byte_t>(allocator)) {}
 };
 
 /** A key slot with the index of the sorted run it came from, its stamp and its kind, the unit every merge moves. */
@@ -233,6 +272,55 @@ struct located_key_slot {
     /** The stamp of the commit that wrote it. */
     std::uint64_t stamp = 0;
 };
+
+/** A located key slot of a tailed shape with the tail of its key, viewing its sorted run's tails, the unit a merge of
+ *  such runs moves. */
+template <typename key_slot_type_>
+struct located_tailed_key_slot {
+
+    /** The key slot with its run, kind and stamp. */
+    located_key_slot<key_slot_type_> located;
+
+    /** The bytes of its key past what the head holds. */
+    std::string_view tail;
+};
+
+/** The located key slot @p record carries, which is itself for a whole key. */
+template <typename key_slot_type_>
+constexpr located_key_slot<key_slot_type_>& located_of(located_key_slot<key_slot_type_>& record) noexcept {
+    return record;
+}
+
+/** The located key slot @p record carries beside its tail. */
+template <typename key_slot_type_>
+constexpr located_key_slot<key_slot_type_>& located_of(located_tailed_key_slot<key_slot_type_>& record) noexcept {
+    return record.located;
+}
+
+template <typename key_slot_type_>
+constexpr located_key_slot<key_slot_type_> const& located_of(located_key_slot<key_slot_type_> const& record) noexcept {
+    return record;
+}
+
+template <typename key_slot_type_>
+constexpr located_key_slot<key_slot_type_> const& located_of(
+    located_tailed_key_slot<key_slot_type_> const& record) noexcept {
+    return record.located;
+}
+
+/** Whether @p first and @p second carry one key, which their stored keys decide. */
+template <typename key_slot_type_>
+constexpr bool same_key(located_key_slot<key_slot_type_> const& first,
+                        located_key_slot<key_slot_type_> const& second) noexcept {
+    return first.key_slot.stored_key == second.key_slot.stored_key;
+}
+
+/** Whether @p first and @p second carry one key, which their heads and then their tails decide. */
+template <typename key_slot_type_>
+constexpr bool same_key(located_tailed_key_slot<key_slot_type_> const& first,
+                        located_tailed_key_slot<key_slot_type_> const& second) noexcept {
+    return first.located.key_slot.stored_key == second.located.key_slot.stored_key && first.tail == second.tail;
+}
 
 #pragma endregion Vocabulary
 
@@ -256,6 +344,15 @@ struct survivor_first_t {
         bool const both_upper = (first.sorted_run < upper_sorted_runs_count) &
                                 (second.sorted_run < upper_sorted_runs_count);
         return both_upper ? first.sorted_run > second.sorted_run : first.sorted_run < second.sorted_run;
+    }
+
+    /** Whether @p first orders before @p second, comparing tails where the heads tie. */
+    template <typename key_slot_type_>
+    constexpr bool operator()(located_tailed_key_slot<key_slot_type_> const& first,
+                              located_tailed_key_slot<key_slot_type_> const& second) const noexcept {
+        if (first.located.key_slot.stored_key == second.located.key_slot.stored_key && first.tail != second.tail)
+            return first.tail < second.tail;
+        return (*this)(first.located, second.located);
     }
 };
 
@@ -312,6 +409,16 @@ constexpr bool survives(located_key_slot<key_slot_type_> const* previous,
     bool const oldest = (current.stamp <= stamps.horizon) &
                         (reader_interval(stamps, current.stamp) == stamps.pinned_count);
     return !(writes_bottom(kind) && current.kind == delta_kind_t::remove_k && oldest);
+}
+
+/** As @c survives for whole keys, where a record before @p current that shares its head and not its tail carries
+ *  another key, so @p current is that key's newest version. */
+template <typename key_slot_type_>
+constexpr bool survives(located_tailed_key_slot<key_slot_type_> const* previous,
+                        located_tailed_key_slot<key_slot_type_> const& current, compaction_kind_t kind,
+                        compaction_stamps_t const& stamps) noexcept {
+    bool const shares_key = previous != nullptr && same_key(*previous, current);
+    return survives(shares_key ? &previous->located : nullptr, current.located, kind, stamps);
 }
 
 /** Bytes of the stored value @p key_slot locates in a stored values section, zero for empty, removed and inline
@@ -505,7 +612,9 @@ struct cpu_compactor_t {
      *
      *  A version no reader tells apart from a change kept above it folds into that change, which keeps its stamp, and
      *  at the bottom level the oldest change of a key folds onto nothing, so a fold's chains shrink with every merge.
-     *  A collection of blobs never writes a change, so its merge folds nothing and reads no value.
+     *  A collection of blobs never writes a change, so its merge folds nothing and reads no value. Key slots of a
+     *  tailed shape move with their tails, which order and tell apart the keys of one head, and a new sorted run never
+     *  splits the key slots of one head, so a sorted level still finds a head in one run.
      *
      *  @param[in] kind Whether the upper LSM level overlaps, and whether removals drop.
      *  @param[in] upper The upper LSM level's sorted runs, oldest first when they overlap and ascending otherwise.
@@ -532,7 +641,9 @@ struct cpu_compactor_t {
                          compaction_output<key_slot_type_, allocator_type_>& output) const noexcept {
         using st::basic_vector;
         using st::status_t;
-        using record_t = located_key_slot<key_slot_type_>;
+        constexpr bool tailed_k = tailed_key_slot_concept<key_slot_type_>;
+        using record_t =
+            std::conditional_t<tailed_k, located_tailed_key_slot<key_slot_type_>, located_key_slot<key_slot_type_>>;
 
         if (!admits_sorted_runs(bounds)) return status_t::invalid_argument_k;
         std::uint64_t const sorted_runs_count = upper.size() + lower.size();
@@ -561,17 +672,22 @@ struct cpu_compactor_t {
                                                                     : lower[sorted_run - upper.size()];
             if (sorted_run <= upper.size()) run_starts[sorted_run] = run_offset;
             sorted_run_index_layout_t const layout(view.key_slots_count, bounds.branching);
-            for (std::uint64_t cell = 0; cell != layout.cells_count(); ++cell)
-                extract_cell(view.cells, layout, cell, static_cast<std::uint32_t>(sorted_run),
-                             static_cast<std::uint64_t const*>(nullptr), static_cast<std::uint8_t const*>(nullptr),
-                             records.data() + run_offset);
+            for (std::uint64_t cell = 0; cell != layout.cells_count(); ++cell) {
+                std::uint64_t const sorted = layout.cell_to_sorted(cell);
+                if (sorted < layout.key_slots_count)
+                    located_of(records[run_offset + sorted]) = located_key_slot<key_slot_type_> {
+                        view.cells[cell], static_cast<std::uint32_t>(sorted_run), delta_kind_t::write_k, 0};
+            }
             if (view.stamps != nullptr)
                 for (std::uint64_t sorted = 0; sorted != view.key_slots_count; ++sorted)
-                    records[run_offset + sorted].stamp = (*view.stamps)[static_cast<std::size_t>(sorted)];
+                    located_of(records[run_offset + sorted]).stamp = (*view.stamps)[static_cast<std::size_t>(sorted)];
             if (view.kinds != nullptr)
                 for (std::uint64_t sorted = 0; sorted != view.key_slots_count; ++sorted)
-                    records[run_offset + sorted].kind = static_cast<delta_kind_t>(
+                    located_of(records[run_offset + sorted]).kind = static_cast<delta_kind_t>(
                         (*view.kinds)[static_cast<std::size_t>(sorted)]);
+            if constexpr (tailed_k)
+                for (std::uint64_t sorted = 0; sorted != view.key_slots_count; ++sorted)
+                    records[run_offset + sorted].tail = view.tails.at(sorted);
             run_offset += view.key_slots_count;
         }
         run_starts[upper.size()] = upper_key_slots;
@@ -617,21 +733,21 @@ struct cpu_compactor_t {
         std::uint64_t survivors = 0;
         auto const value_of = [&](record_t const& record, std::span<byte_t const>& bytes) noexcept {
             bytes = {};
-            if (record.kind == delta_kind_t::remove_k) return status_t::success_k;
-            return read_value(record, arena_bytes, bytes);
+            if (located_of(record).kind == delta_kind_t::remove_k) return status_t::success_k;
+            return read_value(located_of(record), arena_bytes, bytes);
         };
         // Keeps the newest survivor's folded value; at the bottom, the oldest change of a key folds onto nothing.
         auto const settle = [&](bool key_ends) noexcept {
             if (survivors == 0) return status_t::success_k;
             record_t& head = records[survivors - 1];
-            if (key_ends && writes_bottom(kind) && head.kind == delta_kind_t::change_k) {
+            if (key_ends && writes_bottom(kind) && located_of(head).kind == delta_kind_t::change_k) {
                 std::span<byte_t const> bytes = head_bytes;
                 if (!head_folded)
                     if (status_t const read = value_of(head, bytes); read != status_t::success_k) return read;
                 delta_view_t const change {delta_kind_t::change_k, bytes};
                 auto [applied, apply_status] = fold.apply({}, std::span<delta_view_t const> {&change, 1}, arena_bytes);
                 if (apply_status.failed()) return fold_refusal_(apply_status);
-                head.kind = delta_kind_t::write_k;
+                located_of(head).kind = delta_kind_t::write_k;
                 head_bytes = applied;
                 head_folded = true;
             }
@@ -645,19 +761,16 @@ struct cpu_compactor_t {
             record_t const* previous = index != 0 ? scratch.data() + index - 1 : nullptr;
             record_t const& current = scratch[index];
             if (survives(previous, current, kind, stamps)) {
-                bool const key_ends = survivors == 0 ||
-                                      !(records[survivors - 1].key_slot.stored_key == current.key_slot.stored_key);
+                bool const key_ends = survivors == 0 || !same_key(records[survivors - 1], current);
                 if (status_t const settled = settle(key_ends); settled != status_t::success_k) return settled;
                 records[survivors++] = current;
                 continue;
             }
             if (survivors == 0) continue;
             record_t& head = records[survivors - 1];
-            if (head.kind != delta_kind_t::change_k || head_closed ||
-                !(head.key_slot.stored_key == current.key_slot.stored_key))
-                continue;
+            if (located_of(head).kind != delta_kind_t::change_k || head_closed || !same_key(head, current)) continue;
             // A removal dropped at the bottom hides every older version from the change above it.
-            if (keeps_older_version(stamps, previous->stamp, current.stamp)) {
+            if (keeps_older_version(stamps, located_of(*previous).stamp, located_of(current).stamp)) {
                 head_closed = true;
                 continue;
             }
@@ -667,9 +780,10 @@ struct cpu_compactor_t {
                 if (status_t const read = value_of(head, newer); read != status_t::success_k) return read;
             if (status_t const read = value_of(current, older); read != status_t::success_k) return read;
             auto [pair, fold_status] = utilities::fold_pair(fold, delta_view_t {delta_kind_t::change_k, newer},
-                                                            delta_view_t {current.kind, older}, arena_bytes);
+                                                            delta_view_t {located_of(current).kind, older},
+                                                            arena_bytes);
             if (fold_status.failed()) return fold_refusal_(fold_status);
-            head.kind = pair.kind;
+            located_of(head).kind = pair.kind;
             head_bytes = pair.bytes;
             head_folded = true;
         }
@@ -678,7 +792,7 @@ struct cpu_compactor_t {
         // A folded value replaces its survivor's own: inline in the key slot, or in the compaction's folded bytes
         output.folded.clear();
         for (folded_t const& folded : folds) {
-            key_slot_type_& key_slot = records[folded.survivor].key_slot;
+            key_slot_type_& key_slot = located_of(records[folded.survivor]).key_slot;
             if constexpr (locates_stored_values_concept<key_slot_type_>) {
                 std::size_t const location = output.folded.size();
                 if (location + folded.bytes.size() > std::numeric_limits<std::uint32_t>::max())
@@ -688,7 +802,7 @@ struct cpu_compactor_t {
                 if (!folded.bytes.empty())
                     std::memcpy(output.folded.data() + location, folded.bytes.data(), folded.bytes.size());
                 key_slot.location = static_cast<decltype(key_slot.location)>(location);
-                records[folded.survivor].sorted_run = static_cast<std::uint32_t>(sorted_runs_count);
+                located_of(records[folded.survivor]).sorted_run = static_cast<std::uint32_t>(sorted_runs_count);
             }
             else {
                 if (folded.bytes.size() > sizeof(key_slot.data)) return status_t::capacity_exhausted_k;
@@ -703,18 +817,40 @@ struct cpu_compactor_t {
             if (status != status_t::success_k) return status;
             prefix[0] = 0;
             for (std::uint64_t index = 0; index != survivors; ++index)
-                prefix[index + 1] = prefix[index] + stored_value_bytes(records[index].key_slot);
+                prefix[index + 1] = prefix[index] + stored_value_bytes(located_of(records[index]).key_slot);
         }
-        auto const read_prefix = [&prefix](std::uint64_t index, std::uint64_t& bytes) noexcept {
-            bytes = prefix.size() != 0 ? prefix[index] : 0;
+        // Tails take room in a run file beside the values, so the plan bounds both together.
+        basic_vector<std::uint64_t> planned;
+        if constexpr (tailed_k) {
+            status = planned.resize(survivors + 1);
+            if (status != status_t::success_k) return status;
+            planned[0] = 0;
+            for (std::uint64_t index = 0; index != survivors; ++index)
+                planned[index + 1] = planned[index] + (prefix.size() != 0 ? prefix[index + 1] - prefix[index] : 0) +
+                                     records[index].tail.size();
+        }
+        basic_vector<std::uint64_t> const& bounded = tailed_k ? planned : prefix;
+        auto const read_prefix = [&bounded](std::uint64_t index, std::uint64_t& bytes) noexcept {
+            bytes = bounded.size() != 0 ? bounded[index] : 0;
             return status_t::success_k;
         };
+        // Runs split between heads alone, so the key slots of one head stay in one run however their tails differ.
         auto const shares_key = [&records](std::uint64_t index, bool& shared) noexcept {
-            shared = records[index - 1].key_slot.stored_key == records[index].key_slot.stored_key;
+            shared = located_of(records[index - 1]).key_slot.stored_key ==
+                     located_of(records[index]).key_slot.stored_key;
             return status_t::success_k;
         };
         status = plan_sorted_runs<key_slot_type_>(survivors, bounds, read_prefix, shares_key, output.sorted_runs);
         if (status != status_t::success_k) return status;
+        if constexpr (tailed_k) {
+            std::uint64_t planned_first = 0;
+            for (std::size_t index = 0; index != output.sorted_runs.size(); ++index) {
+                std::uint64_t const end = planned_first + output.sorted_runs[index].key_slots_count;
+                output.sorted_runs[index].stored_values_bytes = prefix.size() != 0 ? prefix[end] - prefix[planned_first]
+                                                                                   : 0;
+                planned_first = end;
+            }
+        }
 
         std::uint64_t cells_count = 0;
         for (std::size_t index = 0; index != output.sorted_runs.size(); ++index)
@@ -743,12 +879,31 @@ struct cpu_compactor_t {
                 stored_value_migration_t* const migration = output.migrations.size() != 0
                                                                 ? output.migrations.data() + survivor
                                                                 : nullptr;
-                place_key_slot(records[survivor], layout, position, section_offset, preceding, stamps.floor,
+                place_key_slot(located_of(records[survivor]), layout, position, section_offset, preceding, stamps.floor,
                                output.cells.data() + first_cell, migration, output.stamps.data() + survivor,
                                output.kinds.data() + survivor);
             }
             first += count;
             first_cell += layout.cells_count();
+        }
+
+        output.tail_offsets.clear();
+        output.tails.clear();
+        if constexpr (tailed_k) {
+            std::uint64_t tails_bytes = 0;
+            for (std::uint64_t index = 0; index != survivors; ++index) tails_bytes += records[index].tail.size();
+            status = output.tail_offsets.resize(survivors + 1);
+            if (status != status_t::success_k) return status;
+            status = output.tails.resize(tails_bytes);
+            if (status != status_t::success_k) return status;
+            std::uint64_t written = 0;
+            for (std::uint64_t index = 0; index != survivors; ++index) {
+                std::string_view const tail = records[index].tail;
+                output.tail_offsets[index] = written;
+                if (!tail.empty()) std::memcpy(output.tails.data() + written, tail.data(), tail.size());
+                written += tail.size();
+            }
+            output.tail_offsets[survivors] = written;
         }
         return status_t::success_k;
     }

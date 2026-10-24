@@ -59,7 +59,9 @@ struct stress_stack {
     using fixture_t = fixture_type_;
     using guard_t = typename fixture_t::guard_t;
     using volume_t = typename fixture_t::volume_t;
-    using database_t = basic_single_collection_database<inline_slot_t, volume_t>;
+    using database_t =
+        basic_single_collection_database<stored_key_t, volume_t, atomic_reference, waiting_policy_t,
+                                         collection<inline_slot_t, volume_t, atomic_reference, waiting_policy_t>>;
 
     /** The disk, the arena and the channels. */
     std::unique_ptr<fixture_t> fixture;

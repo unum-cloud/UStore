@@ -26,9 +26,11 @@
 #include <smashtable/immutable_packed_array.hpp> // `st::immutable_packed_array`
 #include <smashtable/shared.hpp>                 // `st::default_allocator`, `st::expected`
 
-#include "ustore/blobs/nvme_key_slot.hpp" // `transaction_stamp_t`, `stored_value_offset_t`, `storage_limits_t`
-#include "ustore/utilities/folds.hpp"     // `delta_kind_t`, `delta_view_t`
-#include "ustore/utilities/types.hpp"     // `byte_t`, `expected`, `status_t`
+#include "ustore/blobs/nvme_compaction.hpp" // `compaction_stamps_t`, `keeps_older_version`
+#include "ustore/blobs/nvme_key_slot.hpp"   // `transaction_stamp_t`, `stored_value_offset_t`, `storage_limits_t`
+#include "ustore/utilities/folds.hpp"       // `delta_kind_t`, `delta_view_t`, `fold_concept`, `fold_pair`
+#include "ustore/utilities/ram_buffers.hpp" // `arena_allocator`
+#include "ustore/utilities/types.hpp"       // `byte_t`, `expected`, `status_t`
 
 namespace unum::ustore::blobs {
 
@@ -342,5 +344,49 @@ class memory_run {
     /** How many merges built the run. */
     std::uint32_t generation_ = 0;
 };
+
+/**
+ *  @brief Gathers every version @p runs hold into @p versions, in key order with a key's versions newest first,
+ *      dropping each older version no reader of @p survival tells apart from the newer one kept before it.
+ *
+ *  Such a version under a kept change folds into it through @p fold instead, keeping the change's stamp: a write or a
+ *  removal below makes it a write, and a change below composes with it, its bytes landing in @p arena. The versions
+ *  view the runs' keys and bytes, so the runs outlive them until a merged run or a flushed one copies them.
+ */
+template <typename run_type_, utilities::fold_concept fold_type_, typename versions_type_>
+status_t kept_versions(std::span<run_type_ const* const> runs, compaction_stamps_t const& survival,
+                       fold_type_ const& fold, versions_type_& versions,
+                       utilities::arena_allocator<byte_t>& arena) noexcept {
+    using version_t = stamped_delta<typename run_type_::stored_key_t>;
+    std::size_t count = 0;
+    for (run_type_ const* run : runs) count += run->size();
+    if (versions.reserve(count) != st::status_t::success_k)
+        return {status_code_t::out_of_memory_k, "A merge could not hold its versions"};
+    for (run_type_ const* run : runs)
+        for (std::size_t position = 0; position != run->size(); ++position) [[maybe_unused]]
+            st::status_t const placed = versions.push_back(
+                st::assume_reserved, version_t {run->stored_key(position), run->stamp(position), run->delta(position)});
+    std::sort(versions.begin(), versions.end(), [](version_t const& first, version_t const& second) noexcept {
+        if (first.stored_key < second.stored_key) return true;
+        if (second.stored_key < first.stored_key) return false;
+        return first.stamp > second.stamp;
+    });
+    std::size_t kept = 0;
+    for (std::size_t index = 0; index != versions.size(); ++index) {
+        bool const shadowed = kept != 0 && versions[kept - 1].stored_key == versions[index].stored_key &&
+                              !keeps_older_version(survival, versions[kept - 1].stamp, versions[index].stamp);
+        if (!shadowed) {
+            versions[kept++] = versions[index];
+            continue;
+        }
+        delta_view_t& newer = versions[kept - 1].delta;
+        if (newer.kind != delta_kind_t::change_k) continue;
+        auto [folded, fold_status] = utilities::fold_pair(fold, newer, versions[index].delta, arena);
+        if (fold_status.failed()) return fold_status;
+        newer = folded;
+    }
+    while (versions.size() != kept) versions.pop_back();
+    return {};
+}
 
 } // namespace unum::ustore::blobs

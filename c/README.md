@@ -582,7 +582,8 @@ A scan lists up to `wanted` strings under every prefix as one tape, split by tas
 A pages collection stores ordered documents, edited by one verb per kind of edit, each taking only its own fields: `ustore_pages_import`, `_insert`, `_remove`, `_move`, `_splice`, `_set_attributes` and `_remove_attributes`.
 `ustore_pages_read` reads documents back into an arena.
 A page stores only its current shape, so no call lists the edits that produced it.
-The RAM, RocksDB and LevelDB engines serve them, importing and rendering XML and plain text, while HTML, Markdown and the JSON tree answer `ustore_status_unsupported_k`, and so does every call on the NVMe engine for now.
+Every engine serves them, importing and rendering XML and plain text, while HTML, Markdown and the JSON tree answer `ustore_status_unsupported_k`.
+An edit watches the page it rewrites, except on a pages collection of the NVMe engine, which keeps the edits themselves, so two transactions editing one page both commit.
 An edit of a missing page answers `ustore_status_not_found_k`, an edit of a missing element inside a page does nothing, and a Nil element removes the whole page.
 
 ## Design

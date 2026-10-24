@@ -18,6 +18,7 @@
 #include <array>   // `std::array`
 #include <memory>  // `std::unique_ptr`
 #include <span>    // `std::span`
+#include <string>  // `std::string`, `std::to_string`
 #include <utility> // `std::move`
 
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
@@ -25,6 +26,7 @@
 #include "ustore/utilities/nvme_channels.hpp" // `basic_read_pipeline`, `basic_write_pipeline`
 #include "ustore/blobs/nvme_key_slot.hpp"     // `key_slot`
 #include "ustore/blobs/nvme_sorted_run.hpp"   // `lsm_sorted_run`, `sorted_run_layout`
+#include "ustore/strings/nvme_strings.hpp"    // `string_key_slot`, `head_of`, `tail_of`
 
 #include "nvme/fixture.hpp" // `basic_fixture`, `run_on_transport`, `painted`
 
@@ -63,11 +65,11 @@ struct run_types {
     using guard_t = typename fixture_t::guard_t;
     using disk_t = typename fixture_t::disk_t;
     using volume_t = typename fixture_t::volume_t;
-    using variable_run_t = lsm_sorted_run<variable_slot_t, volume_t>;
-    using fixed_run_t = lsm_sorted_run<fixed_slot_t, volume_t>;
-    using inline_run_t = lsm_sorted_run<inline_slot_t, volume_t>;
+    using variable_run_t = lsm_sorted_run<variable_slot_t, volume_t, waiting_policy_t>;
+    using fixed_run_t = lsm_sorted_run<fixed_slot_t, volume_t, waiting_policy_t>;
+    using inline_run_t = lsm_sorted_run<inline_slot_t, volume_t, waiting_policy_t>;
     using read_pipeline_t = basic_read_pipeline<disk_t>;
-    using write_pipeline_t = basic_write_pipeline<disk_t>;
+    using write_pipeline_t = basic_write_pipeline<disk_t, waiting_policy_t>;
 };
 
 /** The key the key slot at @p index carries, kept odd so every even key is a miss. */
@@ -392,7 +394,7 @@ status_t paint_stub_header(disk_type_& disk, io_channel_t& channel, medium_refer
     header.value_layout = value_layout_t::variable_width_k;
     header.content_id = uuid_generator();
 
-    basic_write_pipeline<disk_type_> writer {disk, channel, medium};
+    basic_write_pipeline<disk_type_, waiting_policy_t> writer {disk, channel, medium};
     auto [block, acquire_buffer_status] = writer.acquire_buffer();
     if (acquire_buffer_status.failed()) return acquire_buffer_status;
     std::memset(block.bytes().data(), 0, static_cast<std::size_t>(run_config_k.page_bytes));
@@ -864,6 +866,133 @@ std::size_t batched_read_holds_its_depth(mount_type_ const& mount) {
 
 #pragma endregion Depth Cases
 
+#pragma region Tails Cases
+
+/** A run of strings keeps every string's head in its cells and the bytes past the head in its tails, which order the
+ *  strings of one head and read back whole through a volume mounted again, while a run of strings its heads hold whole
+ *  carries neither tails nor their offsets. */
+template <typename mount_type_>
+std::size_t tails_read_back(mount_type_ const& mount) {
+    using types_t = run_types<typename mount_type_::fixture_t>;
+    using fixture_t = typename types_t::fixture_t;
+    using guard_t = typename types_t::guard_t;
+    using volume_t = typename types_t::volume_t;
+    using tailed_slot_t = strings::string_key_slot;
+    using tailed_run_t = lsm_sorted_run<tailed_slot_t, volume_t, waiting_policy_t>;
+    using tailed_layout_t = sorted_run_layout<tailed_slot_t>;
+    std::size_t failures = 0;
+    expected<std::unique_ptr<fixture_t>> fixture = mount();
+    failures += expect_status(fixture, status_code_t::success_k);
+    if (!fixture) return failures;
+    expected<guard_t> guard = (*fixture)->channels.acquire();
+    failures += expect(guard.has_value());
+    if (!guard) return failures;
+
+    // Ascending as whole strings, the two versions of one string newest first, five long strings sharing one head
+    std::string const long_tail(1000, 'z');
+    std::array<std::string, 9> const texts {"",
+                                            "a",
+                                            "fifteen-bytes!!",
+                                            "shared-prefix!!a",
+                                            "shared-prefix!!a",
+                                            "shared-prefix!!ab",
+                                            "shared-prefix!!b",
+                                            "shared-prefix!!" + long_tail,
+                                            "zz"};
+    std::array<std::uint64_t, 9> const stamps {3, 4, 5, 9, 6, 7, 8, 10, 11};
+    st::basic_vector<tailed_slot_t> key_slots;
+    st::basic_vector<std::uint8_t> kinds;
+    st::basic_vector<std::uint32_t> tail_offsets;
+    std::string tails;
+    std::string values;
+    failures += expect(key_slots.resize(texts.size()) == st::status_t::success_k);
+    failures += expect(kinds.resize(texts.size()) == st::status_t::success_k);
+    failures += expect(tail_offsets.resize(texts.size() + 1) == st::status_t::success_k);
+    if (failures != 0) return failures;
+    std::uint64_t const values_offset = tailed_layout_t::values_offset(texts.size());
+    for (std::size_t index = 0; index != texts.size(); ++index) {
+        std::string const value = "value-" + std::to_string(index);
+        tailed_slot_t slot;
+        slot.stored_key = strings::head_of(texts[index]);
+        slot.size = static_cast<stored_value_size_t>(value.size());
+        slot.location = static_cast<stored_value_offset_t>(values_offset + values.size());
+        key_slots[index] = slot;
+        kinds[index] = static_cast<std::uint8_t>(delta_kind_t::write_k);
+        tail_offsets[index] = static_cast<std::uint32_t>(tails.size());
+        tails += strings::tail_of(texts[index]);
+        values += value;
+    }
+    tail_offsets[texts.size()] = static_cast<std::uint32_t>(tails.size());
+    auto const bytes_of = [](std::string const& text) noexcept {
+        return std::span<byte_t const> {reinterpret_cast<byte_t const*>(text.data()), text.size()};
+    };
+    key_tails_t const run_tails {std::span<std::uint32_t const> {tail_offsets}, bytes_of(tails)};
+
+    uuid_t const content_id = uuid_generator();
+    {
+        expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
+        failures += expect(volume.has_value());
+        if (!volume) return failures;
+        expected<tailed_run_t> written = tailed_run_t::write(
+            *volume, guard->channel(), content_id, std::span<tailed_slot_t const> {key_slots},
+            std::span<std::uint64_t const> {stamps}, std::span<std::uint8_t const> {kinds}, 0, bytes_of(values), 4096,
+            run_tails);
+        failures += expect(written.has_value());
+        if (!written) return failures;
+        failures += expect_eq(written->size_bytes(),
+                              tailed_layout_t::blob_bytes(texts.size(), values.size(), written->stamps().saved_bytes(),
+                                                          written->kinds().saved_bytes(), tails.size()));
+
+        // Two strings of one head whose tails descend are out of order, which the run refuses
+        std::array<tailed_slot_t, 2> const swapped_slots {key_slots[6], key_slots[5]};
+        std::array<std::uint32_t, 3> const swapped_offsets {0, 1, 3};
+        std::string const swapped_tails = "bab";
+        std::array<std::uint64_t, 2> const swapped_stamps {1, 2};
+        std::array<std::uint8_t, 2> const swapped_kinds {0, 0};
+        expected<tailed_run_t> misordered = tailed_run_t::write(
+            *volume, guard->channel(), uuid_generator(), std::span<tailed_slot_t const> {swapped_slots},
+            std::span<std::uint64_t const> {swapped_stamps}, std::span<std::uint8_t const> {swapped_kinds}, 0, {}, 4096,
+            key_tails_t {std::span<std::uint32_t const> {swapped_offsets}, bytes_of(swapped_tails)});
+        failures += expect_status(misordered, status_code_t::invalid_argument_k);
+
+        // Strings their heads hold whole save no tails and no offsets
+        std::array<tailed_slot_t, 3> const short_slots {key_slots[0], key_slots[1], key_slots[2]};
+        expected<tailed_run_t> whole = tailed_run_t::write(*volume, guard->channel(), uuid_generator(),
+                                                           std::span<tailed_slot_t const> {short_slots},
+                                                           std::span<std::uint64_t const> {stamps}.first(3),
+                                                           std::span<std::uint8_t const> {kinds}.first(3), 0, {}, 4096);
+        failures += expect(whole.has_value());
+        if (!whole) return failures;
+        failures += expect(whole->tails().offsets.empty() && whole->tail(2).empty());
+        failures += expect_eq(whole->size_bytes(), tailed_layout_t::blob_bytes(3, 0, whole->stamps().saved_bytes(),
+                                                                               whole->kinds().saved_bytes()));
+    }
+
+    expected<volume_t> remounted = (*fixture)->mount_volume(guard->channel(), 0, volume_recovery_t::refuse_k);
+    failures += expect(remounted.has_value());
+    if (!remounted) return failures;
+    expected<tailed_run_t> opened = tailed_run_t::open(*remounted, guard->channel(), content_id);
+    failures += expect(opened.has_value());
+    if (!opened) return failures;
+    failures += expect_eq(opened->population_count(), static_cast<std::uint64_t>(texts.size()));
+    for (std::size_t index = 0; index != texts.size(); ++index) {
+        failures += expect(opened->key_slot(index).stored_key == strings::head_of(texts[index]));
+        failures += expect_eq(opened->tail(index), strings::tail_of(texts[index]));
+        failures += expect_eq(opened->stamp(index), stamps[index]);
+    }
+    std::array<char, 16> read {};
+    std::string_view const expected_value = "value-7";
+    failures += expect(opened
+                           ->read_value(guard->channel(), opened->key_slot(7),
+                                        std::span<byte_t> {reinterpret_cast<byte_t*>(read.data()), read.size()})
+                           .succeeded());
+    std::string_view const value_read(read.data(), expected_value.size());
+    failures += expect_eq(value_read, expected_value);
+    return failures;
+}
+
+#pragma endregion Tails Cases
+
 } // namespace unum::ustore::test
 
 int main(int argc, char const* argv[]) {
@@ -894,6 +1023,7 @@ int main(int argc, char const* argv[]) {
         report(totals, mount, "value_size_extremes", values_at_the_size_extremes);
         report(totals, mount, "tombstones", tombstones_read_back_as_tombstones);
         report(totals, mount, "holds_its_depth", batched_read_holds_its_depth);
+        report(totals, mount, "tails_read_back", tails_read_back);
     };
     for (transport_t const transport : every_transport_k)
         run_on_transport(totals, transport, environment, run_config_k, 1, "run", cases);

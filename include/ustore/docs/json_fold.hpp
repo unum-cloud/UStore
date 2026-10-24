@@ -5,7 +5,7 @@
  *  @brief The docs fold: a whole document as the base, and deltas that each apply one modification of
  *      @c ustore_docs_write to one field, replayed in commit order and composed without a base where that is sound.
  *
- *  A delta carries its commit stamp, its modification, its field and the JSON text of its value, and a chain of them
+ *  A delta carries a stamp, its modification, its field and the JSON text of its value, and a chain of them
  *  is what a @c delta_kind_t::change_k record holds. Beyond the five modifications of @c ustore_docs_write, a delta may
  *  write a whole document as it is, as a whole JSON upsert and @c ustore_blobs_write store it, or remove it.
  *
@@ -67,7 +67,7 @@ enum class delta_modification_t : std::uint8_t {
 /** One modification of one field of a document, as a docs collection logs it. */
 struct json_delta_t {
 
-    /** The commit that wrote the delta. */
+    /** The stamp of the snapshot the writer checked the delta against. */
     std::uint64_t stamp = 0;
 
     /** What the delta does. */
@@ -531,6 +531,9 @@ status_t merge_open_chain(deltas_type_& deltas, keep_type_& keep, ustore_arena_t
 
 /** The fold of docs, fitting the fold concept of `ustore/utilities/folds.hpp`: apply, compose and closes. */
 struct json_fold {
+
+    /** Whether a collection of @p modality folds document deltas, which docs alone do. */
+    static constexpr bool serves(ustore_modality_t modality) noexcept { return modality == ustore_modality_docs_k; }
 
     /**
      *  @brief The document @p base becomes once every delta of @p deltas applies, oldest first.

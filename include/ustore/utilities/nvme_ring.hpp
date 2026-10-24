@@ -50,8 +50,6 @@
 #include <type_traits> // `std::true_type`, `std::is_trivially_copyable_v`
 #include <utility>     // `std::exchange`, `std::move`
 
-#include <forkunion/atomics.hpp>       // `fu::preferred_atomic_ref`
-#include <forkunion/capabilities.hpp>  // `fu::preferred_yield_t`
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 #include <smashtable/shared.hpp>       // `st::status_t`, `st::default_allocator`
 
@@ -137,23 +135,26 @@ inline constexpr std::size_t unlimited_resource_k = static_cast<std::size_t>(-1)
  *  A budget is acquired and released in bytes by however many threads share it, each acquisition
  *  bounded so the budget can never be overdrawn and an exhausted one refuses instead of waiting.
  *  Whoever owns the budget outlives every allocator charging it.
+ *
+ *  @tparam atomic_reference_ The reference the available bytes are owned through, for one operation at a time.
  */
-class resource_constraint_t {
+template <template <typename> typename atomic_reference_>
+class resource_constraint {
   public:
 
     /** A budget of @p capacity bytes, all of them available. */
-    explicit resource_constraint_t(std::size_t capacity = unlimited_resource_k) noexcept
+    explicit resource_constraint(std::size_t capacity = unlimited_resource_k) noexcept
         : capacity_(capacity), available_(capacity) {}
 
-    resource_constraint_t(resource_constraint_t const&) = delete;
-    resource_constraint_t& operator=(resource_constraint_t const&) = delete;
+    resource_constraint(resource_constraint const&) = delete;
+    resource_constraint& operator=(resource_constraint const&) = delete;
 
     /** The bytes the budget allows in total. */
     std::size_t capacity() const noexcept { return capacity_; }
 
     /** The bytes the budget still allows. */
     std::size_t available() const noexcept {
-        return fu::preferred_atomic_ref<std::size_t const> {available_}.load(std::memory_order_acquire);
+        return atomic_reference_<std::size_t const> {available_}.load(std::memory_order_acquire);
     }
 
     /** The bytes the budget currently holds. */
@@ -164,14 +165,14 @@ class resource_constraint_t {
 
     /** Charges @p bytes to the budget, answering whether they fit. */
     bool acquire(std::size_t bytes) noexcept {
-        fu::preferred_atomic_ref<std::size_t> const reference {available_};
+        atomic_reference_<std::size_t> const reference {available_};
         std::size_t const observed = reference.fetch_sub_if_at_least(bytes, 0, std::memory_order_acquire);
         return observed >= bytes;
     }
 
     /** Returns @p bytes to the budget, answering whether they had been charged to it. */
     bool release(std::size_t bytes) noexcept {
-        fu::preferred_atomic_ref<std::size_t> const reference {available_};
+        atomic_reference_<std::size_t> const reference {available_};
         std::size_t const observed = reference.fetch_add_if_at_most(bytes, capacity_, std::memory_order_release);
         return observed + bytes <= capacity_;
     }
@@ -190,12 +191,18 @@ class resource_constraint_t {
  *
  *  Exhaustion answers @c nullptr, which is what every container here already checks, so a budget
  *  reaches a caller as a status rather than as an exception. The budget is borrowed, never owned.
+ *
+ *  @tparam atomic_reference_ The reference the budget owns its word through.
  */
-template <typename value_type_, typename base_allocator_type_ = st::default_allocator<value_type_>>
+template <typename value_type_, template <typename> typename atomic_reference_,
+          typename base_allocator_type_ = st::default_allocator<value_type_>>
 class constrained_allocator {
   public:
     using value_type = value_type_;
     using base_allocator_t = base_allocator_type_;
+
+    /** The budget every allocation is charged to. */
+    using constraint_t = resource_constraint<atomic_reference_>;
 
     /** A moved container keeps charging the budget its allocator named. */
     using propagate_on_container_move_assignment = std::true_type;
@@ -204,7 +211,7 @@ class constrained_allocator {
     template <typename other_type_>
     struct rebind {
         using other =
-            constrained_allocator<other_type_,
+            constrained_allocator<other_type_, atomic_reference_,
                                   typename std::allocator_traits<base_allocator_t>::template rebind_alloc<other_type_>>;
     };
 
@@ -212,12 +219,12 @@ class constrained_allocator {
     constrained_allocator() noexcept : base_(), constraint_(nullptr) {}
 
     /** An allocator charging @p constraint, which must outlive it. */
-    explicit constrained_allocator(resource_constraint_t& constraint, base_allocator_t base = {}) noexcept
+    explicit constrained_allocator(constraint_t& constraint, base_allocator_t base = {}) noexcept
         : base_(base), constraint_(&constraint) {}
 
     /** The rebinding conversion @c std::allocator_traits performs; the budget travels with it. */
     template <typename other_type_, typename other_base_type_>
-    constrained_allocator(constrained_allocator<other_type_, other_base_type_> const& other) noexcept
+    constrained_allocator(constrained_allocator<other_type_, atomic_reference_, other_base_type_> const& other) noexcept
         : base_(), constraint_(other.constraint_pointer()) {}
 
     /** Charges room for @p count values, or answers @c nullptr when the budget refuses them. */
@@ -235,13 +242,14 @@ class constrained_allocator {
     }
 
     /** The budget this allocator charges. */
-    resource_constraint_t& constraint() const noexcept { return *constraint_; }
+    constraint_t& constraint() const noexcept { return *constraint_; }
 
     /** The budget this allocator charges, or null while it names none. */
-    resource_constraint_t* constraint_pointer() const noexcept { return constraint_; }
+    constraint_t* constraint_pointer() const noexcept { return constraint_; }
 
     template <typename other_type_, typename other_base_type_>
-    bool operator==(constrained_allocator<other_type_, other_base_type_> const& other) const noexcept {
+    bool operator==(
+        constrained_allocator<other_type_, atomic_reference_, other_base_type_> const& other) const noexcept {
         return constraint_ == other.constraint_pointer();
     }
 
@@ -251,31 +259,38 @@ class constrained_allocator {
     base_allocator_t base_;
 
     /** The budget every allocation is charged to, owned by whoever named it. */
-    resource_constraint_t* constraint_;
+    constraint_t* constraint_;
 };
 
 #pragma endregion Constrained Allocator
 
 #pragma region Countdown
 
+template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+class notifier;
+
 /**
  *  @brief The parts still owed by one fanned-out job, and the first failure any of them reported.
  *
- *  One owner holds the counter and waits on it; every part holds a @ref notifier_t onto it and
+ *  One owner holds the counter and waits on it; every part holds a @ref notifier onto it and
  *  reports through that, so the counter itself is never copied and outlives every part.
+ *
+ *  @tparam atomic_reference_ The reference the counter's words are owned through.
+ *  @tparam waiting_policy_type_ What the waiting owner's core does between polls.
  */
-class countdown_t {
+template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+class countdown {
   public:
 
-    countdown_t() noexcept = default;
+    countdown() noexcept = default;
 
     /** A counter owed @p parts reports. */
-    explicit countdown_t(std::size_t parts) noexcept : remaining_(static_cast<std::int32_t>(parts)) {}
+    explicit countdown(std::size_t parts) noexcept : remaining_(static_cast<std::int32_t>(parts)) {}
 
-    countdown_t(countdown_t&&) = default;
-    countdown_t& operator=(countdown_t&&) = default;
-    countdown_t(countdown_t const&) = delete;
-    countdown_t& operator=(countdown_t const&) = delete;
+    countdown(countdown&&) = default;
+    countdown& operator=(countdown&&) = default;
+    countdown(countdown const&) = delete;
+    countdown& operator=(countdown const&) = delete;
 
     /** Arms the counter for @p parts reports, forgetting whatever the last round recorded. */
     void reset(std::size_t parts = 1) noexcept {
@@ -311,7 +326,7 @@ class countdown_t {
     bool wait() noexcept {
         for (std::int32_t remaining = remaining_reference_().load(std::memory_order_acquire); remaining > 0;
              remaining = remaining_reference_().load(std::memory_order_acquire))
-            fu::preferred_yield_t {}(remaining_, remaining, std::size_t {0});
+            waiting_policy_type_ {}(&remaining_, remaining, std::size_t {0});
         return !has_failed();
     }
 
@@ -324,7 +339,7 @@ class countdown_t {
 
   private:
 
-    friend class notifier_t;
+    friend class notifier<atomic_reference_, waiting_policy_type_>;
 
     /** The parts still owed, which a failure drives to zero however many are outstanding. */
     std::int32_t remaining_ = 1;
@@ -335,19 +350,17 @@ class countdown_t {
     /** The static message of the first failure, stored before the code that publishes it. */
     char const* message_ = nullptr;
 
-    fu::preferred_atomic_ref<std::int32_t> remaining_reference_() noexcept {
-        return fu::preferred_atomic_ref<std::int32_t> {remaining_};
+    atomic_reference_<std::int32_t> remaining_reference_() noexcept {
+        return atomic_reference_<std::int32_t> {remaining_};
     }
 
-    fu::preferred_atomic_ref<std::int32_t const> remaining_reference_() const noexcept {
-        return fu::preferred_atomic_ref<std::int32_t const> {remaining_};
+    atomic_reference_<std::int32_t const> remaining_reference_() const noexcept {
+        return atomic_reference_<std::int32_t const> {remaining_};
     }
 
-    fu::preferred_atomic_ref<int> code_reference_() noexcept { return fu::preferred_atomic_ref<int> {code_}; }
+    atomic_reference_<int> code_reference_() noexcept { return atomic_reference_<int> {code_}; }
 
-    fu::preferred_atomic_ref<int const> code_reference_() const noexcept {
-        return fu::preferred_atomic_ref<int const> {code_};
-    }
+    atomic_reference_<int const> code_reference_() const noexcept { return atomic_reference_<int const> {code_}; }
 };
 
 /**
@@ -355,17 +368,21 @@ class countdown_t {
  *
  *  Every handle borrows a counter that outlives it, so a part reports without knowing who waits.
  */
-class notifier_t {
+template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+class notifier {
   public:
 
-    notifier_t() = delete;
-    notifier_t(notifier_t const&) = default;
+    /** The counter a handle reports through. */
+    using countdown_t = countdown<atomic_reference_, waiting_policy_type_>;
 
-    /** A handle onto @p countdown, which must outlive every part holding one. */
-    notifier_t(countdown_t& countdown) noexcept : countdown_(countdown) {}
+    notifier() = delete;
+    notifier(notifier const&) = default;
+
+    /** A handle onto @p counter, which must outlive every part holding one. */
+    notifier(countdown_t& counter) noexcept : countdown_(counter) {}
 
     /** The counter this handle reports through. */
-    countdown_t& countdown() const noexcept { return countdown_; }
+    countdown_t& counter() const noexcept { return countdown_; }
 
     /** Reports one part done. */
     void did_one() const noexcept { countdown_.remaining_reference_().sub(1, std::memory_order_release); }
@@ -608,17 +625,20 @@ using buffer_t = st::basic_vector<std::byte>;
 using aligned_buffer_t = st::basic_vector<std::byte, direct_io_allocator<std::byte>>;
 
 /** Bytes charged to a named budget. */
-using constrained_buffer_t = st::basic_vector<std::byte, constrained_allocator<std::byte>>;
+template <template <typename> typename atomic_reference_>
+using constrained_buffer = st::basic_vector<std::byte, constrained_allocator<std::byte, atomic_reference_>>;
 
 /** Bytes of a buffer unbuffered I/O accepts, charged to a named budget. */
-using constrained_aligned_buffer_t =
-    st::basic_vector<std::byte, constrained_allocator<std::byte, direct_io_allocator<std::byte>>>;
+template <template <typename> typename atomic_reference_>
+using constrained_aligned_buffer =
+    st::basic_vector<std::byte, constrained_allocator<std::byte, atomic_reference_, direct_io_allocator<std::byte>>>;
 
 #if __has_include(<cuda_runtime.h>)
 
 /** Bytes of GPU memory, charged to the budget of the device they sit on. */
-using constrained_device_buffer_t =
-    st::basic_vector<std::byte, constrained_allocator<std::byte, cuda_device_allocator<std::byte>>>;
+template <template <typename> typename atomic_reference_>
+using constrained_device_buffer =
+    st::basic_vector<std::byte, constrained_allocator<std::byte, atomic_reference_, cuda_device_allocator<std::byte>>>;
 
 #endif
 
@@ -1579,8 +1599,9 @@ inline constexpr std::size_t poll_spin_limit_k = std::size_t {1} << 30;
  *  @param[in] wanted Completions to wait for, at most the size of @p into.
  *  @param[in] spins_limit Spins before the wait gives up, which a healthy ring never reaches.
  *  @return The completions moved into @p into, which is @p wanted unless the budget ran out.
+ *  @tparam waiting_policy_type_ What the polling core does after a poll that moved nothing.
  */
-template <typename disk_type_>
+template <typename waiting_policy_type_, typename disk_type_>
     requires ring_concept<disk_type_>
 expected<std::size_t> poll_completions_at_least(disk_type_& disk, queue_pair_t const& queue_pair,
                                                 std::span<completion_t> into, std::size_t wanted,
@@ -1591,7 +1612,7 @@ expected<std::size_t> poll_completions_at_least(disk_type_& disk, queue_pair_t c
     for (std::size_t spins = 0; completed < wanted && spins != spins_limit; ++spins) {
         auto [moved, poll_completions_status] = disk.poll_completions(queue_pair, into.subspan(completed));
         if (poll_completions_status.failed()) return poll_completions_status;
-        if (moved == 0) fu::preferred_yield_t {}(spins, spins, std::size_t {0});
+        if (moved == 0) waiting_policy_type_ {}(&spins, spins, std::size_t {0});
         completed += moved;
     }
     return completed;

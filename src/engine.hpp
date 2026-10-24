@@ -64,8 +64,8 @@ struct view_t {
  *
  *  Every call is `noexcept` and answers a status, which the router publishes into the caller's outcome: the in-house
  *  engines never throw, and an oracle wraps each call of its library in @c guarded. A null entry answers
- *  @c ustore_status_unsupported_k, as the pages calls do on the NVMe engine. Every ragged input arrives readable in any
- *  layout, in the order its argument structure names them, since the router gathers what an accessor writes.
+ *  @c ustore_status_unsupported_k. Every ragged input arrives readable in any layout, in the order its argument
+ *  structure names them, since the router gathers what an accessor writes.
  */
 struct engine_t {
     status_t (*database_describe)(ustore_database_describe_t const&, view_t const&) noexcept;
@@ -208,6 +208,34 @@ status_t pages_remove_attributes_in_page_values(ustore_pages_remove_attributes_t
                                                 view_t const&) noexcept;
 status_t pages_read_in_page_values(ustore_pages_read_t const&, view_t const&) noexcept;
 
+/** The edits one page call made to one page, in task order, as a chain of `ustore/pages/page_edits.hpp`. */
+struct page_edits_t {
+    ustore_collection_id_t collection;
+    ustore_key_t key;
+    std::span<utilities::byte_t const> chain;
+};
+
+/** Commits the edit chains of one page call at once, as an engine keeping a page as its edits does. */
+using page_edits_commit_t = status_t (*)(ustore_database_t, std::span<page_edits_t const>, ustore_durability_t,
+                                         view_t const&) noexcept;
+
+/** The page edit calls of an engine keeping a page as its edits, which `src/pages.cpp` serves through the engine's
+ *  own reads, handing the edits of every call to @c commit; reads stay `pages_read_in_page_values`, as the engine's
+ *  reads fold the edits into the tree. */
+status_t pages_import_in_page_edits(ustore_pages_import_t const&, strings_arg_t const& values, view_t const&,
+                                    page_edits_commit_t commit) noexcept;
+status_t pages_insert_in_page_edits(ustore_pages_insert_t const&, strings_arg_t const& values, view_t const&,
+                                    page_edits_commit_t commit) noexcept;
+status_t pages_remove_in_page_edits(ustore_pages_remove_t const&, view_t const&, page_edits_commit_t commit) noexcept;
+status_t pages_move_in_page_edits(ustore_pages_move_t const&, view_t const&, page_edits_commit_t commit) noexcept;
+status_t pages_splice_in_page_edits(ustore_pages_splice_t const&, strings_arg_t const& values, view_t const&,
+                                    page_edits_commit_t commit) noexcept;
+status_t pages_set_attributes_in_page_edits(ustore_pages_set_attributes_t const&, strings_arg_t const& fields,
+                                            strings_arg_t const& values, view_t const&,
+                                            page_edits_commit_t commit) noexcept;
+status_t pages_remove_attributes_in_page_edits(ustore_pages_remove_attributes_t const&, strings_arg_t const& fields,
+                                               view_t const&, page_edits_commit_t commit) noexcept;
+
 /** Mints a UUIDv7 for a new collection, refusing when the system gives no entropy. */
 expected<ustore_collection_id_t> mint_collection_id() noexcept;
 
@@ -266,17 +294,14 @@ constexpr keying_t keying_of(ustore_modality_t modality) noexcept {
     return modality == ustore_modality_strings_k ? keying_t::strings_k : keying_t::uuids_k;
 }
 
-/** The record a collection's name maps onto: the collection ID in bytes @b [0,16), its modality in byte 16. */
+/** The record a collection's name maps onto: the bytes of the collection ID, whose modality the store records. */
 struct name_record_t {
-    char bytes[sizeof(ustore_collection_id_t) + 1] {};
+    char bytes[sizeof(ustore_collection_id_t)] {};
 
-    /** The record of the main collection, which holds anything. */
+    /** The record of the main collection. */
     name_record_t() noexcept = default;
 
-    name_record_t(ustore_collection_id_t id, ustore_modality_t modality) noexcept {
-        std::memcpy(bytes, &id, sizeof(id));
-        bytes[sizeof(id)] = static_cast<char>(modality);
-    }
+    explicit name_record_t(ustore_collection_id_t id) noexcept { std::memcpy(bytes, &id, sizeof(id)); }
 
     [[nodiscard]] std::string_view view() const noexcept { return {bytes, sizeof(bytes)}; }
 
@@ -284,10 +309,6 @@ struct name_record_t {
         ustore_collection_id_t collection;
         std::memcpy(&collection, bytes, sizeof(collection));
         return collection;
-    }
-
-    [[nodiscard]] ustore_modality_t modality() const noexcept {
-        return static_cast<ustore_modality_t>(bytes[sizeof(ustore_collection_id_t)]);
     }
 };
 

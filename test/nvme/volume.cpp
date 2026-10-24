@@ -72,7 +72,7 @@ struct blob_label_t {
 /** Writes the pattern of @p seed over the whole extent of @p blob, zeroing the padding past its length. */
 template <typename disk_type_>
 status_t write_blob(disk_type_& disk, io_channel_t& channel, volume_blob_t const& blob, std::uint64_t seed) noexcept {
-    basic_write_pipeline<disk_type_> writer {disk, channel, blob.medium};
+    basic_write_pipeline<disk_type_, waiting_policy_t> writer {disk, channel, blob.medium};
     std::uint64_t written = 0;
     while (written != blob.extent.length) {
         auto [block, acquire_buffer_or_poll_status] = writer.acquire_buffer_or_poll();
@@ -155,7 +155,7 @@ status_t fetch_page(disk_type_& disk, io_channel_t& channel, medium_reference_t 
 template <typename disk_type_>
 status_t store_page(disk_type_& disk, io_channel_t& channel, medium_reference_t medium, std::uint64_t offset,
                     std::span<byte_t const> from) noexcept {
-    basic_write_pipeline<disk_type_> writer {disk, channel, medium};
+    basic_write_pipeline<disk_type_, waiting_policy_t> writer {disk, channel, medium};
     auto [block, acquire_buffer_status] = writer.acquire_buffer();
     if (acquire_buffer_status.failed()) return acquire_buffer_status;
     std::memcpy(block.bytes().data(), from.data(), from.size());
@@ -222,9 +222,9 @@ expected<bool> slot_is_erased(disk_type_& disk, io_channel_t& channel, medium_re
 
 /** Creates, writes and seals one blob of @p seed, which most cases want as one step. */
 template <typename disk_type_>
-expected<volume_blob_t> publish_blob(disk_type_& disk, io_channel_t& channel, basic_extent_volume<disk_type_>& volume,
-                                     blob_name_t name, blob_kind_t kind, std::uint64_t length,
-                                     std::uint64_t seed) noexcept {
+expected<volume_blob_t> publish_blob(disk_type_& disk, io_channel_t& channel,
+                                     basic_extent_volume<disk_type_, waiting_policy_t>& volume, blob_name_t name,
+                                     blob_kind_t kind, std::uint64_t length, std::uint64_t seed) noexcept {
     auto [blob, create_status] = volume.create(name, kind, length);
     if (create_status.failed()) return create_status;
     if (status_t const written = write_blob(disk, channel, blob, seed); written.failed()) return written;

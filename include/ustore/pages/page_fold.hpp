@@ -125,6 +125,9 @@ class page_state {
 /** The fold of pages, fitting the fold concept of `ustore/utilities/folds.hpp`: apply, compose and closes. */
 struct page_fold {
 
+    /** Whether a collection of @p modality folds page edits, which pages alone do. */
+    static constexpr bool serves(ustore_modality_t modality) noexcept { return modality == ustore_modality_pages_k; }
+
     /**
      *  @brief The dense page that @p base becomes once every edit of @p deltas applies, oldest first.
      *  @return The page in a block of @p allocator, @p base itself without deltas, or @c status_code_t::not_found_k

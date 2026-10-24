@@ -25,9 +25,7 @@
 #include <span>    // `std::span`
 #include <utility> // `std::exchange`, `std::move`, `std::swap`
 
-#include <forkunion/atomics.hpp>      // `fu::preferred_atomic_ref`
-#include <forkunion/capabilities.hpp> // `fu::preferred_yield_t`
-#include <forkunion/types.hpp>        // `fu::default_alignment_k`
+#include <forkunion/types.hpp> // `fu::default_alignment_k`
 
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 #include <smashtable/shared.hpp>       // `st::default_allocator`, `st::hash`
@@ -154,8 +152,8 @@ class collection_view {
 };
 
 /** The one word a collection publishes its view through: replaced with release by the single publisher, and
- *  loaded with acquire by every reader. */
-template <typename view_type_>
+ *  loaded with acquire by every reader through @p atomic_reference_. */
+template <typename view_type_, template <typename> typename atomic_reference_>
 class published_view {
   public:
     using view_t = view_type_;
@@ -175,13 +173,13 @@ class published_view {
 
     /** The view published last, whose runs and their bytes are visible to the caller in whole. */
     [[nodiscard]] view_t const* load() const noexcept {
-        return fu::preferred_atomic_ref<view_t const* const> {view_}.load(std::memory_order_acquire);
+        return atomic_reference_<view_t const* const> {view_}.load(std::memory_order_acquire);
     }
 
     /** Publishes @p newer and answers the view it replaces, which the caller frees once every reader that entered
      *  before has left. */
     view_t const* replace(view_t const& newer) noexcept {
-        fu::preferred_atomic_ref<view_t const*> const word {view_};
+        atomic_reference_<view_t const*> const word {view_};
         // Relaxed, since only the publisher stores this word and it reads its own last store.
         view_t const* const older = word.load(std::memory_order_relaxed);
         word.store(&newer, std::memory_order_release);
@@ -220,7 +218,11 @@ struct alignas(fu::default_alignment_k) epoch_slot_t {
  *  with release, fences, and waits on every slot announcing an older epoch: a reader the scan missed fenced after the
  *  writer did and loads the new view, and one that announced the moved epoch read it from the writer and loads the
  *  new view too. Readers never wait; @c wait_for_readers waits for them, called only outside the domain.
+ *
+ *  @tparam atomic_reference_ The reference every slot, the epoch and the shared table are owned through.
+ *  @tparam waiting_policy_type_ What a waiting writer's core does between reads of a slot.
  */
+template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
 class epoch_domain {
   public:
 
@@ -251,12 +253,12 @@ class epoch_domain {
         void leave_() noexcept {
             if (!slot_) return;
             if (slot_ == &domain_->spilled_)
-                fu::preferred_atomic_ref<std::size_t> {slot_->depth}.fetch_sub(1, std::memory_order_release);
+                atomic_reference_<std::size_t> {slot_->depth}.fetch_sub(1, std::memory_order_release);
             else if (--slot_->depth == 0) {
-                fu::preferred_atomic_ref<std::uint64_t> {slot_->announced}.store(0, std::memory_order_release);
+                atomic_reference_<std::uint64_t> {slot_->announced}.store(0, std::memory_order_release);
                 // Released after the depth, which the next holder's claim acquires; other threads try to claim the
                 // word meanwhile, so even its holder reads it atomically.
-                fu::preferred_atomic_ref<thread_identity_t> const holder {slot_->holder};
+                atomic_reference_<thread_identity_t> const holder {slot_->holder};
                 if (holder.load(std::memory_order_relaxed) != 0) holder.store(0, std::memory_order_release);
             }
             slot_ = nullptr;
@@ -291,7 +293,7 @@ class epoch_domain {
             if (!grown_(shared)) break;
         }
         // A thread no slot could be allocated for is counted on the one spilled slot, which only makes writers wait.
-        fu::preferred_atomic_ref<std::size_t> {spilled_.depth}.fetch_add(1, std::memory_order_relaxed);
+        atomic_reference_<std::size_t> {spilled_.depth}.fetch_add(1, std::memory_order_relaxed);
         std::atomic_thread_fence(std::memory_order_seq_cst);
         return reader_t {*this, spilled_};
     }
@@ -310,16 +312,16 @@ class epoch_domain {
      */
     void wait_for_readers() noexcept {
         // Released, so a reader announcing the moved epoch loads every view published before the call.
-        std::uint64_t const moved =
-            fu::preferred_atomic_ref<std::uint64_t> {epoch_}.fetch_add(1, std::memory_order_release) + 1;
+        std::uint64_t const moved = atomic_reference_<std::uint64_t> {epoch_}.fetch_add(1, std::memory_order_release) +
+                                    1;
         // Pairs with a reader's fence: either this reads its announcement, or the reader loads the new view.
         std::atomic_thread_fence(std::memory_order_seq_cst);
         for (std::size_t spilled = load_(spilled_.depth); spilled != 0; spilled = load_(spilled_.depth))
-            fu::preferred_yield_t {}(spilled_.depth, spilled, std::size_t {0});
+            waiting_policy_type_ {}(&spilled_.depth, spilled, std::size_t {0});
         for_each_slot_([moved](epoch_slot_t& slot) noexcept {
             for (std::uint64_t announced = load_(slot.announced); announced != 0 && announced < moved;
                  announced = load_(slot.announced))
-                fu::preferred_yield_t {}(slot.announced, announced, std::size_t {0});
+                waiting_policy_type_ {}(&slot.announced, announced, std::size_t {0});
         });
     }
 
@@ -338,14 +340,14 @@ class epoch_domain {
 
     template <typename word_type_>
     [[nodiscard]] static word_type_ load_(word_type_ const& word) noexcept {
-        return fu::preferred_atomic_ref<word_type_ const> {word}.load(std::memory_order_acquire);
+        return atomic_reference_<word_type_ const> {word}.load(std::memory_order_acquire);
     }
 
     /** Announces the slot's thread, unless one of its readers already did. */
     reader_t announce_(epoch_slot_t& slot) noexcept {
         if (slot.depth++ == 0) {
             std::uint64_t const epoch = load_(epoch_);
-            fu::preferred_atomic_ref<std::uint64_t> {slot.announced}.store(epoch, std::memory_order_relaxed);
+            atomic_reference_<std::uint64_t> {slot.announced}.store(epoch, std::memory_order_relaxed);
             // Pairs with a waiting writer's fence: either it reads this announcement, or this reader loads its view.
             std::atomic_thread_fence(std::memory_order_seq_cst);
         }
@@ -364,7 +366,7 @@ class epoch_domain {
         std::size_t const home = st::hash<thread_identity_t> {}(identity)&shared->mask;
         for (std::size_t step = 0; step <= shared->mask; ++step) {
             epoch_slot_t& slot = *shared->slots[(home + step) & shared->mask];
-            fu::preferred_atomic_ref<thread_identity_t> const holder {slot.holder};
+            atomic_reference_<thread_identity_t> const holder {slot.holder};
             thread_identity_t held = holder.load(std::memory_order_relaxed);
             if (held == identity) return &slot;
             if (held == 0 &&
@@ -381,10 +383,10 @@ class epoch_domain {
      *      before the domain.
      */
     bool grown_(shared_slots_t const* seen) noexcept {
-        fu::preferred_atomic_ref<std::int32_t> const claim {growing_};
+        atomic_reference_<std::int32_t> const claim {growing_};
         for (std::int32_t idle = 0;
              !claim.compare_exchange_weak(idle, 1, std::memory_order_acquire, std::memory_order_relaxed); idle = 0)
-            fu::preferred_yield_t {}(growing_, idle, std::size_t {0});
+            waiting_policy_type_ {}(&growing_, idle, std::size_t {0});
         bool grown = shared_ != seen;
         if (!grown) grown = append_(seen ? seen->mask + 1 : 0);
         claim.store(0, std::memory_order_release);
@@ -408,7 +410,7 @@ class epoch_domain {
         shared_slots_t* const published = table.get();
         [[maybe_unused]] st::status_t const kept_block = blocks_.push_back(st::assume_reserved, std::move(block));
         [[maybe_unused]] st::status_t const kept_table = tables_.push_back(st::assume_reserved, std::move(table));
-        fu::preferred_atomic_ref<shared_slots_t*> {shared_}.store(published, std::memory_order_release);
+        atomic_reference_<shared_slots_t*> {shared_}.store(published, std::memory_order_release);
         return true;
     }
 

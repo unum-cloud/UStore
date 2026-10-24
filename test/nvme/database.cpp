@@ -59,7 +59,14 @@ struct database_types {
     using guard_t = typename fixture_t::guard_t;
     using volume_t = typename fixture_t::volume_t;
     using router_t = basic_volume_router<volume_t>;
-    using database_t = basic_database<stored_key_t, volume_t>;
+    template <value_layout_t value_layout_>
+    using store_of = collection<key_slot<stored_key_t, value_layout_>, volume_t, atomic_reference, waiting_policy_t>;
+    using database_t =
+        basic_database<stored_key_t, volume_t, atomic_reference, waiting_policy_t,
+                       store_of<value_layout_t::inline_1_byte_k>, store_of<value_layout_t::inline_4_bytes_k>,
+                       store_of<value_layout_t::inline_8_bytes_k>, store_of<value_layout_t::inline_16_bytes_k>,
+                       store_of<value_layout_t::inline_32_bytes_k>, store_of<value_layout_t::inline_64_bytes_k>,
+                       store_of<value_layout_t::fixed_width_k>, store_of<value_layout_t::variable_width_k>>;
     using transaction_t = typename database_t::transaction_t;
 
     /** A fixture, the router over its one volume, and the database mounted over the router. */
@@ -110,7 +117,9 @@ expected<collection_id_t> create_named(store_type_& store, string_view_t name,
                                        collection_config_t const& config) noexcept {
     collection_id_t collection_id;
     std::memcpy(collection_id.uuid.bytes, uuid_generator().bytes, sizeof(collection_id.uuid.bytes));
-    if (status_t const created = store.create_collection(collection_id, name, config); created.failed()) return created;
+    if (status_t const created = store.create_collection(collection_id, name, ustore_modality_blobs_k, config);
+        created.failed())
+        return created;
     return collection_id;
 }
 
@@ -314,7 +323,8 @@ status_t capture_medium(fixture_type_& fixture, io_channel_t& channel, st::basic
 /** Writes @p image back over the whole medium of volume zero of @p fixture, as a restart after a crash finds it. */
 template <typename fixture_type_>
 status_t restore_medium(fixture_type_& fixture, io_channel_t& channel, std::span<byte_t const> image) noexcept {
-    basic_write_pipeline<typename fixture_type_::disk_t> writer {fixture.disk, channel, fixture.media[0].reference()};
+    basic_write_pipeline<typename fixture_type_::disk_t, waiting_policy_t> writer {fixture.disk, channel,
+                                                                                   fixture.media[0].reference()};
     std::uint64_t offset = 0;
     while (offset != image.size()) {
         auto [buffer, acquire_status] = writer.acquire_buffer_or_poll();
@@ -534,6 +544,9 @@ std::size_t catalog_survives_reopen(mount_type_ const& mount) {
     failures += expect_eq(restored.write_buffer_max_elements, std::size_t {4096});
     failures += expect_eq(store.buffer_size_for_any_stored_value(any_collection_id_t {*numbers}),
                           stored_value_size_t {8});
+    ustore_modality_t modality = ustore_modality_any_k;
+    failures += expect(store.collection_modality(*blobs, modality).succeeded());
+    failures += expect(modality == ustore_modality_blobs_k);
 
     // Every run the close left behind is back, and the reads below tell their levels apart.
     failures += expect_eq(run_count_of((*stack)->router.volume(volume_id_t {0})), runs_before);
@@ -543,6 +556,22 @@ std::size_t catalog_survives_reopen(mount_type_ const& mount) {
     // A reopened collection takes writes and answers them, which is what makes the catalog useful.
     for (std::uint64_t key = 0; key != 4; ++key) failures += write_painted(store, named, key, 3);
     for (std::uint64_t key = 0; key != 4; ++key) failures += check_painted(store, named, key, 3);
+    failures += expect(store.unmount().succeeded());
+    (*reopened).reset();
+
+    // A database with no store for the blobs refuses the catalog naming them, and leaves it whole for one that has.
+    using numbers_only_t = basic_database<stored_key_t, typename types_t::volume_t, atomic_reference, waiting_policy_t,
+                                          typename types_t::template store_of<value_layout_t::inline_8_bytes_k>>;
+    {
+        numbers_only_t narrow {(*stack)->fixture->resources};
+        failures += expect_status(narrow.mount((*stack)->router, (*stack)->fixture->channels, test_database_config()),
+                                  status_code_t::unsupported_k);
+    }
+    expected<std::unique_ptr<database_t>> again = open_database(**stack);
+    failures += expect(again.has_value());
+    if (!again) return failures;
+    failures += expect_eq((*again)->size(), std::size_t {3});
+    for (std::uint64_t key = 0; key != 4; ++key) failures += check_painted(**again, named, key, 3);
     return failures;
 }
 

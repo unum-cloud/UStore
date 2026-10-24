@@ -28,8 +28,7 @@
 #include <type_traits> // `std::is_nothrow_move_constructible_v`, `std::remove_cvref_t`, `std::type_identity`
 #include <utility>     // `std::cmp_equal`, `std::move`
 
-#include <forkunion/capabilities.hpp> // `fu::preferred_yield_t`
-#include <smashtable/shared.hpp>      // `st::hash`
+#include <smashtable/shared.hpp> // `st::hash`
 
 #include "ustore/ustore.h"
 
@@ -108,9 +107,6 @@ using u8_t = std::uint8_t;
 
 /** A single byte of a stored value, kept distinct from characters and integers. */
 using byte_t = std::byte;
-
-/** How a thread stalls while it spins on a word: the newest pause, yield or monitored wait this build may run. */
-using waiter_t = fu::preferred_yield_t;
 
 #pragma region Statuses
 

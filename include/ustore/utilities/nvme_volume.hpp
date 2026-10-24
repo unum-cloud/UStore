@@ -67,9 +67,9 @@
 #include <stringzilla/stringzilla.hpp> // `sz::string_t`
 
 #include "ustore/utilities/nvme_channels.hpp"         // `io_channel_t`, `basic_io_channel_pool`, `pooled_buffer_t`
-#include "ustore/utilities/nvme_disks.hpp"            // `blocking_files_disk_t`, `memory_disk_t`
-#include "ustore/utilities/nvme_linux_aio_disk.hpp"   // `linux_aio_files_disk_t`, `linux_aio_probe_t`
-#include "ustore/utilities/nvme_linux_uring_disk.hpp" // `linux_uring_files_disk_t`, `linux_uring_probe_t`
+#include "ustore/utilities/nvme_disks.hpp"            // `blocking_files_disk`, `memory_disk`
+#include "ustore/utilities/nvme_linux_aio_disk.hpp"   // `linux_aio_files_disk`, `linux_aio_probe_t`
+#include "ustore/utilities/nvme_linux_uring_disk.hpp" // `linux_uring_files_disk`, `linux_uring_probe_t`
 #include "ustore/utilities/nvme_ring.hpp"             // `extent_t`, `uuid_t`, `ring_concept`, `string_t`
 #include "ustore/utilities/types.hpp"                 // `status_t`, `status_code_t`, `expected`, `byte_t`
 
@@ -844,8 +844,10 @@ struct volume_format_t {
  *  A reservation is deliberately invisible to @c find and to every publication until its @c seal,
  *  since a catalog that named a range whose bytes are still in flight would publish a hole the next
  *  unrelated @c seal made durable.
+ *
+ *  @tparam waiting_policy_type_ What the core does while it waits for a catalog read or a barrier.
  */
-template <typename disk_type_>
+template <typename disk_type_, typename waiting_policy_type_>
     requires ring_concept<disk_type_>
 class basic_extent_volume {
   public:
@@ -1080,7 +1082,7 @@ class basic_extent_volume {
 
         header_ = header;
         catalog_ = catalog_t {};
-        basic_write_pipeline<disk_type_> writer {disk_, channel, medium_};
+        basic_write_pipeline<disk_type_, waiting_policy_type_> writer {disk_, channel, medium_};
         auto [block, acquire_buffer_status] = writer.acquire_buffer();
         if (acquire_buffer_status.failed()) return acquire_buffer_status;
         if (block.size() < portable_alignment_k)
@@ -1140,8 +1142,8 @@ class basic_extent_volume {
         auto [taken, submit_status] = disk_.submit(channel.queue_pair(), std::span<request_t const> {batch});
         if (submit_status.failed()) return submit_status;
         if (taken != 1) return status_t {status_code_t::io_k, "The ring would not take a catalog read"};
-        auto [completed, poll_completions_status] = poll_completions_at_least(disk_, channel.queue_pair(),
-                                                                              channel.completion_buffer(), 1);
+        auto [completed, poll_completions_status] = poll_completions_at_least<waiting_policy_type_>(
+            disk_, channel.queue_pair(), channel.completion_buffer(), 1);
         if (poll_completions_status.failed()) return poll_completions_status;
         if (completed == 0) return status_t {status_code_t::io_k, "A catalog read never completed"};
 
@@ -1176,7 +1178,7 @@ class basic_extent_volume {
         auto [filled, save_status] = catalog_.save(bytes.first(static_cast<std::size_t>(room)), generation);
         if (save_status.failed()) return save_status;
 
-        basic_write_pipeline<disk_type_> writer {disk_, channel, medium_};
+        basic_write_pipeline<disk_type_, waiting_policy_type_> writer {disk_, channel, medium_};
         if (status_t const queued = writer.enqueue_write(std::move(block), extent_t {slot_offset_(slot), written});
             queued.failed())
             return queued;
@@ -1193,7 +1195,7 @@ class basic_extent_volume {
 
     /** Makes every write the channel has already completed durable, which is the step before recording. */
     status_t flush_bytes_(io_channel_t& channel) noexcept {
-        basic_write_pipeline<disk_type_> writer {disk_, channel, medium_};
+        basic_write_pipeline<disk_type_, waiting_policy_type_> writer {disk_, channel, medium_};
         return writer.make_durable();
     }
 
@@ -1487,31 +1489,44 @@ struct resources_config_t {
  *
  *  The io_uring and AIO alternatives exist on every platform, as stubs that refuse off Linux, so
  *  the type is portable and only the mount's probe decides which alternative is built.
+ *
+ *  @tparam atomic_reference_ The reference every alternative owns its shared words through.
+ *  @tparam waiting_policy_type_ What a draining core does after a poll that moved nothing.
  */
-class any_files_disk_t {
+template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+class any_files_disk {
   public:
 
+    /** The positioned reads and writes on the polling thread. */
+    using blocking_disk_t = blocking_files_disk<atomic_reference_>;
+
+    /** The io_uring transport. */
+    using linux_uring_disk_t = linux_uring_files_disk<atomic_reference_, waiting_policy_type_>;
+
+    /** The Linux AIO transport. */
+    using linux_aio_disk_t = linux_aio_files_disk<atomic_reference_, waiting_policy_type_>;
+
     /** Takes the blocking transport in, which a mount builds where the probe refused a ring. */
-    explicit any_files_disk_t(blocking_files_disk_t&& disk) noexcept
-        : held_(std::in_place_type<blocking_files_disk_t>, std::move(disk)) {}
+    explicit any_files_disk(blocking_disk_t&& disk) noexcept
+        : held_(std::in_place_type<blocking_disk_t>, std::move(disk)) {}
 
     /** Takes the io_uring transport in, which a mount builds where the probe found a ring. */
-    explicit any_files_disk_t(linux_uring_files_disk_t&& disk) noexcept
-        : held_(std::in_place_type<linux_uring_files_disk_t>, std::move(disk)) {}
+    explicit any_files_disk(linux_uring_disk_t&& disk) noexcept
+        : held_(std::in_place_type<linux_uring_disk_t>, std::move(disk)) {}
 
     /** Takes the Linux AIO transport in, which a mount builds where the probe refused a ring and found AIO. */
-    explicit any_files_disk_t(linux_aio_files_disk_t&& disk) noexcept
-        : held_(std::in_place_type<linux_aio_files_disk_t>, std::move(disk)) {}
+    explicit any_files_disk(linux_aio_disk_t&& disk) noexcept
+        : held_(std::in_place_type<linux_aio_disk_t>, std::move(disk)) {}
 
-    any_files_disk_t(any_files_disk_t const&) = delete;
-    any_files_disk_t& operator=(any_files_disk_t const&) = delete;
-    any_files_disk_t(any_files_disk_t&&) noexcept = default;
-    any_files_disk_t& operator=(any_files_disk_t&&) noexcept = default;
+    any_files_disk(any_files_disk const&) = delete;
+    any_files_disk& operator=(any_files_disk const&) = delete;
+    any_files_disk(any_files_disk&&) noexcept = default;
+    any_files_disk& operator=(any_files_disk&&) noexcept = default;
 
     /** The transport held, which is never @c automatic_k. */
     [[nodiscard]] io_transport_t transport() const noexcept {
-        if (std::holds_alternative<linux_uring_files_disk_t>(held_)) return io_transport_t::linux_uring_k;
-        if (std::holds_alternative<linux_aio_files_disk_t>(held_)) return io_transport_t::linux_aio_k;
+        if (std::holds_alternative<linux_uring_disk_t>(held_)) return io_transport_t::linux_uring_k;
+        if (std::holds_alternative<linux_aio_disk_t>(held_)) return io_transport_t::linux_aio_k;
         return io_transport_t::blocking_k;
     }
 
@@ -1522,7 +1537,7 @@ class any_files_disk_t {
 
     /** How the held transport addresses the registered arena; the blocking floor and AIO pin per request. */
     [[nodiscard]] range_pinning_t pinning() const noexcept {
-        linux_uring_files_disk_t const* const linux_uring = std::get_if<linux_uring_files_disk_t>(&held_);
+        linux_uring_disk_t const* const linux_uring = std::get_if<linux_uring_disk_t>(&held_);
         return linux_uring ? linux_uring->pinning() : range_pinning_t::unpinned_k;
     }
 
@@ -1601,10 +1616,10 @@ class any_files_disk_t {
   private:
 
     /** The transport the probe chose, fixed for the life of the mount. */
-    std::variant<blocking_files_disk_t, linux_uring_files_disk_t, linux_aio_files_disk_t> held_;
+    std::variant<blocking_disk_t, linux_uring_disk_t, linux_aio_disk_t> held_;
 };
 
-static_assert(ring_concept<any_files_disk_t>);
+static_assert(ring_concept<any_files_disk<fu::standard_atomic_ref, st::standard_waiting_policy_t>>);
 
 #pragma endregion Disk
 
@@ -1758,20 +1773,29 @@ struct mount_report_t {
  *  It is deliberately neither copyable nor movable: a channel pool and every volume hold a pointer to
  *  the disk beside them, so a mount that moved would leave both addressing a transport that is no
  *  longer there. The variant above it emplaces one rather than assigning one for that reason.
+ *
+ *  @tparam atomic_reference_ The reference the budget and the channels' claims are owned through.
+ *  @tparam waiting_policy_type_ What a core waiting on the volumes' reads and barriers does.
  */
-template <typename disk_type_>
+template <typename disk_type_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
     requires ring_concept<disk_type_>
 class basic_storage_mount {
   public:
 
     /** The volume every data directory of this mount holds, which is one file of the directory. */
-    using volume_t = basic_extent_volume<disk_type_>;
+    using volume_t = basic_extent_volume<disk_type_, waiting_policy_type_>;
 
     /** The volumes of this mount and the free-space placement that spreads blobs over them. */
     using router_t = basic_volume_router<volume_t>;
 
     /** Every queue pair this mount hands out, one per executor thread plus the shared channels. */
-    using channel_pool_t = basic_io_channel_pool<disk_type_>;
+    using channel_pool_t = basic_io_channel_pool<disk_type_, atomic_reference_>;
+
+    /** The one pinned range every I/O buffer is carved out of, charged to the host budget. */
+    using arena_t = registered_memory_arena<atomic_reference_>;
+
+    /** The host budget the arena is charged to. */
+    using constraint_t = resource_constraint<atomic_reference_>;
 
     /** Takes @p disk in, which a mount owns until it is torn down. */
     explicit basic_storage_mount(disk_type_&& disk) noexcept : disk_(std::move(disk)) {}
@@ -1791,7 +1815,7 @@ class basic_storage_mount {
      *  @param[in] database The database the volumes belong to, which a mount refuses to open under another.
      *  @return Success, or the first refusal, after which @c unmount gives back whatever was taken.
      */
-    status_t mount(resources_config_t const& config, resource_constraint_t& constraint, std::size_t threads,
+    status_t mount(resources_config_t const& config, constraint_t& constraint, std::size_t threads,
                    uuid_t const& database) noexcept {
         if (config.data_directories.empty())
             return {status_code_t::invalid_argument_k, "A mount needs a data directory to open a volume in"};
@@ -1800,11 +1824,11 @@ class basic_storage_mount {
 
         memory_arena_config_t arena;
         arena.bytes = config.channels.arena_bytes() * (threads + config.shared_io_channels);
-        auto [pinned, make_arena_status] = registered_memory_arena_t::make(disk_, constraint, arena);
+        auto [pinned, make_arena_status] = arena_t::make(disk_, constraint, arena);
         if (make_arena_status.failed()) return make_arena_status;
         arena_ = std::move(pinned);
 
-        auto [leased, make_channel_pool_status] = channel_pool_t::make(disk_, arena_, threads,
+        auto [leased, make_channel_pool_status] = channel_pool_t::make(disk_, arena_.registration(), threads,
                                                                        config.shared_io_channels, config.channels);
         if (make_channel_pool_status.failed()) return make_channel_pool_status;
         channels_ = std::move(leased);
@@ -1833,7 +1857,7 @@ class basic_storage_mount {
         if (arena_.registered())
             if (status_t const unpinned = arena_.unregister(disk_); unpinned.failed() && first.succeeded())
                 first = unpinned;
-        arena_ = registered_memory_arena_t {};
+        arena_ = arena_t {};
 
         for (std::size_t index = 0; index != media_.size(); ++index) {
             if (!media_[index].held()) continue;
@@ -1860,7 +1884,7 @@ class basic_storage_mount {
     [[nodiscard]] channel_pool_t& channels() noexcept { return channels_; }
 
     /** The one pinned range every I/O buffer of this database is carved out of. */
-    [[nodiscard]] registered_memory_arena_t& arena() noexcept { return arena_; }
+    [[nodiscard]] arena_t& arena() noexcept { return arena_; }
 
   private:
 
@@ -1901,7 +1925,7 @@ class basic_storage_mount {
     disk_type_ disk_;
 
     /** The one pinned range, charged to the host budget once and carved into blocks by the channels. */
-    registered_memory_arena_t arena_;
+    arena_t arena_;
 
     /** Every queue pair of this mount, opened here and lent one operation at a time. */
     channel_pool_t channels_;
@@ -1920,19 +1944,32 @@ class basic_storage_mount {
  *  pays is one @c visit per operation rather than one virtual call per request. A mount on files
  *  holds whichever of the three file transports the probe settled on, so a database materializes over
  *  one disk type; SPDK is named by the configuration and refused here until its disk is ported.
+ *
+ *  @tparam atomic_reference_ The reference every transport, budget and channel owns its words through.
+ *  @tparam waiting_policy_type_ What a core waiting on a transport does between polls.
  */
-class mounted_storage_t {
+template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+class mounted_storage {
   public:
 
+    /** The ring a suite and a benchmark ask for, whose volumes never reach a medium. */
+    using memory_disk_t = memory_disk<atomic_reference_>;
+
+    /** The ring a database gets, on unbuffered files through io_uring, Linux AIO or the blocking floor. */
+    using files_disk_t = any_files_disk<atomic_reference_, waiting_policy_type_>;
+
     /** The mount a suite and a benchmark ask for, whose volumes never reach a medium. */
-    using memory_mount_t = basic_storage_mount<memory_disk_t>;
+    using memory_mount_t = basic_storage_mount<memory_disk_t, atomic_reference_, waiting_policy_type_>;
 
     /** The mount a database gets, on unbuffered files through io_uring, Linux AIO or the blocking floor. */
-    using files_mount_t = basic_storage_mount<any_files_disk_t>;
+    using files_mount_t = basic_storage_mount<files_disk_t, atomic_reference_, waiting_policy_type_>;
 
-    mounted_storage_t() noexcept = default;
-    mounted_storage_t(mounted_storage_t const&) = delete;
-    mounted_storage_t& operator=(mounted_storage_t const&) = delete;
+    /** The host budget a mount charges its arena to. */
+    using constraint_t = resource_constraint<atomic_reference_>;
+
+    mounted_storage() noexcept = default;
+    mounted_storage(mounted_storage const&) = delete;
+    mounted_storage& operator=(mounted_storage const&) = delete;
 
     /**
      *  @brief Probes the transport @p config asks for and mounts the whole storage stack on it.
@@ -1941,13 +1978,13 @@ class mounted_storage_t {
      *  @param[in] threads Executor threads, each of which gets a channel of its own.
      *  @param[in] database The database the volumes belong to, or an invalid identifier to take any.
      */
-    status_t mount(resources_config_t const& config, resource_constraint_t& constraint, std::size_t threads,
+    status_t mount(resources_config_t const& config, constraint_t& constraint, std::size_t threads,
                    uuid_t const& database) noexcept {
         if (mounted()) return {status_code_t::already_exists_k, "This database has already mounted its storage"};
 
         report_ = mount_report_t {};
-        report_.linux_uring = linux_uring_files_disk_t::probe();
-        report_.linux_aio = linux_aio_files_disk_t::probe();
+        report_.linux_uring = files_disk_t::linux_uring_disk_t::probe();
+        report_.linux_aio = files_disk_t::linux_aio_disk_t::probe();
         report_.transport = probed_transport(config.io_transport, report_.linux_uring, report_.linux_aio);
 
         std::uint16_t const owners = bounded_count_(threads + config.shared_io_channels,
@@ -1982,7 +2019,7 @@ class mounted_storage_t {
     status_t unmount() noexcept {
         if (!mounted()) return {};
         status_t const released = visit([](auto& mount) noexcept { return mount.unmount(); });
-        held_.emplace<std::monostate>();
+        held_.template emplace<std::monostate>();
         report_ = mount_report_t {};
         return released;
     }
@@ -2021,22 +2058,22 @@ class mounted_storage_t {
     }
 
     /** Mounts the blocking floor on unbuffered files, with @p owners queue pairs over @p targets directories. */
-    status_t mount_blocking_(resources_config_t const& config, resource_constraint_t& constraint, std::size_t threads,
+    status_t mount_blocking_(resources_config_t const& config, constraint_t& constraint, std::size_t threads,
                              uuid_t const& database, std::uint16_t owners, std::uint16_t targets) noexcept {
         if (status_t const made = create_data_directories(config); made.failed()) return made;
         auto [device, make_device_status] = blocking_files_device_t::make(file_buffering_t::unbuffered_k);
         if (make_device_status.failed()) return make_device_status;
-        expected<blocking_files_disk_t> disk = blocking_files_disk_t::make(std::move(device),
-                                                                           ring_config_(config, owners, targets));
+        using blocking_disk_t = typename files_disk_t::blocking_disk_t;
+        expected<blocking_disk_t> disk = blocking_disk_t::make(std::move(device),
+                                                               ring_config_(config, owners, targets));
         if (!disk) return disk.status();
-        return adopt_<any_files_disk_t>(any_files_disk_t {std::move(*disk)}, config, constraint, threads, database);
+        return adopt_<files_disk_t>(files_disk_t {std::move(*disk)}, config, constraint, threads, database);
     }
 
     /** Mounts io_uring on unbuffered files, one ring per queue pair, with @p owners queue pairs over @p targets
      *  directories. */
-    status_t mount_linux_uring_(resources_config_t const& config, resource_constraint_t& constraint,
-                                std::size_t threads, uuid_t const& database, std::uint16_t owners,
-                                std::uint16_t targets) noexcept {
+    status_t mount_linux_uring_(resources_config_t const& config, constraint_t& constraint, std::size_t threads,
+                                uuid_t const& database, std::uint16_t owners, std::uint16_t targets) noexcept {
         if (status_t const made = create_data_directories(config); made.failed()) return made;
         linux_uring_disk_config_t ring;
         ring.queue_pairs_limit = owners;
@@ -2044,14 +2081,14 @@ class mounted_storage_t {
         ring.registered_memory_limit = 1;
         ring.media_limit = targets;
         ring.buffering = file_buffering_t::unbuffered_k;
-        auto [disk, make_disk_status] = linux_uring_files_disk_t::make(ring);
+        auto [disk, make_disk_status] = files_disk_t::linux_uring_disk_t::make(ring);
         if (make_disk_status.failed()) return make_disk_status;
-        return adopt_<any_files_disk_t>(any_files_disk_t {std::move(disk)}, config, constraint, threads, database);
+        return adopt_<files_disk_t>(files_disk_t {std::move(disk)}, config, constraint, threads, database);
     }
 
     /** Mounts Linux AIO on unbuffered files, one context per queue pair, with @p owners queue pairs over @p targets
      *  directories. */
-    status_t mount_linux_aio_(resources_config_t const& config, resource_constraint_t& constraint, std::size_t threads,
+    status_t mount_linux_aio_(resources_config_t const& config, constraint_t& constraint, std::size_t threads,
                               uuid_t const& database, std::uint16_t owners, std::uint16_t targets) noexcept {
         if (status_t const made = create_data_directories(config); made.failed()) return made;
         linux_aio_disk_config_t contexts;
@@ -2060,9 +2097,9 @@ class mounted_storage_t {
         contexts.registered_memory_limit = 1;
         contexts.media_limit = targets;
         contexts.buffering = file_buffering_t::unbuffered_k;
-        auto [disk, make_disk_status] = linux_aio_files_disk_t::make(contexts);
+        auto [disk, make_disk_status] = files_disk_t::linux_aio_disk_t::make(contexts);
         if (make_disk_status.failed()) return make_disk_status;
-        return adopt_<any_files_disk_t>(any_files_disk_t {std::move(disk)}, config, constraint, threads, database);
+        return adopt_<files_disk_t>(files_disk_t {std::move(disk)}, config, constraint, threads, database);
     }
 
     /** @p wanted as the 16-bit count a ring names things by, or zero when @p reserved leaves no room. */
@@ -2072,12 +2109,12 @@ class mounted_storage_t {
 
     /** Emplaces the mount of @p disk, opens the storage on it and records what it got. */
     template <typename disk_type_>
-    status_t adopt_(disk_type_&& disk, resources_config_t const& config, resource_constraint_t& constraint,
-                    std::size_t threads, uuid_t const& database) noexcept {
-        basic_storage_mount<disk_type_>& opened = held_.template emplace<basic_storage_mount<disk_type_>>(
-            std::move(disk));
+    status_t adopt_(disk_type_&& disk, resources_config_t const& config, constraint_t& constraint, std::size_t threads,
+                    uuid_t const& database) noexcept {
+        using mount_t = basic_storage_mount<disk_type_, atomic_reference_, waiting_policy_type_>;
+        mount_t& opened = held_.template emplace<mount_t>(std::move(disk));
         if (status_t const started = opened.mount(config, constraint, threads, database); started.failed()) {
-            held_.emplace<std::monostate>();
+            held_.template emplace<std::monostate>();
             return started;
         }
         report_.volumes = opened.router().size();
@@ -2101,33 +2138,42 @@ class mounted_storage_t {
 
 #pragma region Shared Resources
 
-/** Budgets and services every collection of one database shares. */
-struct resources_t {
+/**
+ *  @brief Budgets and services every collection of one database shares.
+ *  @tparam atomic_reference_ The reference the budgets and the storage own their words through.
+ *  @tparam waiting_policy_type_ What a core waiting on the storage does between polls.
+ */
+template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+struct shared_resources {
 
     /** Budget of host memory. */
-    resource_constraint_t memory_constraint;
+    resource_constraint<atomic_reference_> memory_constraint;
 
     /** Budget of GPU memory, zero when no GPU is used. */
-    resource_constraint_t gpu_memory_constraint;
+    resource_constraint<atomic_reference_> gpu_memory_constraint;
 
     /** GPU devices compaction may use. */
     st::basic_vector<int> gpu_devices;
 
     /** The transport, the pinned arena, the channels and the volumes mounted over the data directories. */
-    mounted_storage_t storage;
+    mounted_storage<atomic_reference_, waiting_policy_type_> storage;
 
     /** Sets the memory budgets, leaving the services for the caller to attach. */
-    explicit resources_t(std::size_t memory_limit, std::size_t gpu_memory_limit = 0) noexcept
+    explicit shared_resources(std::size_t memory_limit, std::size_t gpu_memory_limit = 0) noexcept
         : memory_constraint(memory_limit), gpu_memory_constraint(gpu_memory_limit) {}
 };
 
-using resources_shared_ptr_t = std::shared_ptr<resources_t>;
+/** The resources of one database, held by the database and every collection and buffer charged to its budgets. */
+template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+using resources_shared_ptr = std::shared_ptr<shared_resources<atomic_reference_, waiting_policy_type_>>;
 
 /** Constructs @p object_ in memory charged to the host budget, or returns an empty pointer once it runs out. */
-template <typename object_, typename... arguments_>
-std::shared_ptr<object_> make_constrained_shared(resources_shared_ptr_t const& resources,
-                                                 arguments_&&... arguments) noexcept {
-    constrained_allocator<byte_t> allocator {resources->memory_constraint};
+template <typename object_, template <typename> typename atomic_reference_, typename waiting_policy_type_,
+          typename... arguments_>
+std::shared_ptr<object_> make_constrained_shared(
+    resources_shared_ptr<atomic_reference_, waiting_policy_type_> const& resources,
+    arguments_&&... arguments) noexcept {
+    constrained_allocator<byte_t, atomic_reference_> allocator {resources->memory_constraint};
     auto* const pointer = reinterpret_cast<object_*>(allocator.allocate(sizeof(object_)));
     if (!pointer) return {};
 
@@ -2144,12 +2190,15 @@ std::shared_ptr<object_> make_constrained_shared(resources_shared_ptr_t const& r
  *  @param[in] database The database the volumes belong to, or an invalid identifier to take any.
  *  @return The resources, whose destructor tears the mount down in the order it was built in.
  */
-inline expected<resources_shared_ptr_t> open_resources(resources_config_t const& config,
-                                                       uuid_t const& database) noexcept {
+template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+expected<resources_shared_ptr<atomic_reference_, waiting_policy_type_>> open_resources(
+    resources_config_t const& config, uuid_t const& database) noexcept {
     if (config.directory.empty()) return status_t {status_code_t::invalid_argument_k, "A database needs a directory"};
     if (status_t const made = create_directories(config.directory.c_str()); made.failed()) return made;
 
-    resources_shared_ptr_t resources = std::make_shared<resources_t>(config.memory_limit, config.gpu_memory_limit);
+    using resources_t = shared_resources<atomic_reference_, waiting_policy_type_>;
+    resources_shared_ptr<atomic_reference_, waiting_policy_type_> resources = std::make_shared<resources_t>(
+        config.memory_limit, config.gpu_memory_limit);
     if (resources->gpu_devices.resize(config.gpu_devices.size()) != st::status_t::success_k)
         return status_t {status_code_t::out_of_memory_k, "A database could not list the GPUs it may use"};
     for (std::size_t index = 0; index != config.gpu_devices.size(); ++index)

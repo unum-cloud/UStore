@@ -47,6 +47,8 @@ namespace unum::ustore::test {
 using namespace unum::ustore::blobs;
 using namespace unum::ustore::utilities;
 
+using linux_spdk_disk_t = linux_spdk_disk<atomic_reference, waiting_policy_t>;
+
 #pragma region Fixtures
 
 static_assert(ring_concept<linux_spdk_disk_t>, "The SPDK transport is a ring in every configuration");

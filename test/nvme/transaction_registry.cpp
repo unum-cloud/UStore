@@ -27,10 +27,10 @@
 #include <utility> // `std::move`
 #include <vector>  // `std::vector`
 
-#include <forkunion/atomics.hpp>      // `fu::preferred_atomic_ref`
-#include <forkunion/capabilities.hpp> // `fu::preferred_yield_t`
+#include <forkunion/atomics.hpp> // `fu::standard_atomic_ref`
+#include <forkunion/types.hpp>   // `fu::standard_yield_t`
 
-#include "ustore/blobs/nvme_database.hpp" // `database_transaction_registry`, `commit_ledger_t`
+#include "ustore/blobs/nvme_database.hpp" // `database_transaction_registry`, `commit_ledger`
 
 #include "harness.hpp" // `suite_exit_code`, `expect`, `expect_eq`
 
@@ -44,6 +44,19 @@ using namespace unum::ustore::utilities;
 
 /** The keys, and the values, every case of this suite moves. */
 using stored_key_t = std::uint64_t;
+
+/** The atomic reference the registry and the store are instantiated with: the portable one. */
+template <typename value_type_>
+using atomic_reference = fu::standard_atomic_ref<value_type_>;
+
+/** The waiting policy the registry and the store are instantiated with, yielding between attempts. */
+using waiting_policy_t = st::standard_waiting_policy<fu::standard_yield_t>;
+
+using commit_ledger_t = commit_ledger<atomic_reference, waiting_policy_t>;
+using stamp_pin_t = stamp_pin<atomic_reference, waiting_policy_t>;
+using resource_constraint_t = resource_constraint<atomic_reference>;
+using resources_t = shared_resources<atomic_reference, waiting_policy_t>;
+using resources_shared_ptr_t = resources_shared_ptr<atomic_reference, waiting_policy_t>;
 
 /** The sole collection the multi-collection registry is driven over here. */
 constexpr collection_id_t collection_k {uuid_from_integer(7)};
@@ -121,8 +134,9 @@ class test_store_t {
     }
 
     /** Seals @p changes for the commit that follows, flushing the collection first when it reports itself full. */
-    status_t seal_collection(collection_id_t, grouped_write_buffer<stored_key_t> const& changes,
-                             sealed_commit<stored_key_t>& sealed) noexcept {
+    status_t seal_collection(collection_id_t,
+                             grouped_write_buffer<stored_key_t, atomic_reference, waiting_policy_t> const& changes,
+                             sealed_commit<stored_key_t, atomic_reference>& sealed) noexcept {
         if (behaviour == store_behaviour_t::always_flushing_k || behaviour == store_behaviour_t::refusing_flushes_k) {
             ++flushes;
             if (behaviour == store_behaviour_t::refusing_flushes_k)
@@ -136,21 +150,22 @@ class test_store_t {
             [[maybe_unused]] st::status_t const kept = deltas.push_back(keyed_delta<stored_key_t> {stored_key, delta});
         });
         if (deltas.empty()) return {};
-        auto [writes, seal_status] = sealed_writes<stored_key_t, constrained_allocator<byte_t>>::seal(
-            std::span<keyed_delta<stored_key_t>> {deltas}, constrained_allocator<byte_t> {budget_});
+        auto [writes, seal_status] = sealed_writes<stored_key_t, constrained_allocator<byte_t, atomic_reference>>::seal(
+            std::span<keyed_delta<stored_key_t>> {deltas}, constrained_allocator<byte_t, atomic_reference> {budget_});
         if (seal_status.failed()) return seal_status;
         sealed.writes = std::move(writes);
         return {};
     }
 
     /** Takes the sealed changes for the commit that follows, or refuses them. */
-    status_t prepare_collection(collection_id_t, sealed_commit<stored_key_t>&) noexcept {
+    status_t prepare_collection(collection_id_t, sealed_commit<stored_key_t, atomic_reference>&) noexcept {
         if (behaviour == store_behaviour_t::refusing_applies_k) return {status_code_t::device_k, "Refusing to write"};
         return {};
     }
 
     /** Writes every sealed change at @p stamp, a removal as a zero balance. */
-    void publish_collection(collection_id_t, sealed_commit<stored_key_t>& sealed, transaction_stamp_t stamp) noexcept {
+    void publish_collection(collection_id_t, sealed_commit<stored_key_t, atomic_reference>& sealed,
+                            transaction_stamp_t stamp) noexcept {
         for (std::size_t position = 0; position != sealed.writes.size(); ++position) {
             if (behaviour == store_behaviour_t::pausing_in_apply_k) wait_for_the_suite_();
             stored_key_t const stored_key = sealed.writes.stored_key(position);
@@ -183,11 +198,11 @@ class test_store_t {
 
     /** Whether a write is waiting inside the store, with its commit's stamp already drawn. */
     bool paused() const noexcept {
-        return fu::preferred_atomic_ref<std::int32_t const> {paused_}.load(std::memory_order_acquire) != 0;
+        return atomic_reference<std::int32_t const> {paused_}.load(std::memory_order_acquire) != 0;
     }
 
     /** Lets the waiting write finish. */
-    void resume() noexcept { fu::preferred_atomic_ref<std::int32_t> {resumed_}.store(1, std::memory_order_release); }
+    void resume() noexcept { atomic_reference<std::int32_t> {resumed_}.store(1, std::memory_order_release); }
 
     /** What the store does with the writes a commit hands it. */
     store_behaviour_t behaviour = store_behaviour_t::accepting_k;
@@ -199,19 +214,19 @@ class test_store_t {
 
     /** Raises the flag and waits, so the suite can run while this commit is half applied. */
     void wait_for_the_suite_() noexcept {
-        fu::preferred_atomic_ref<std::int32_t> {paused_}.store(1, std::memory_order_release);
+        atomic_reference<std::int32_t> {paused_}.store(1, std::memory_order_release);
         [[maybe_unused]] bool const woke = spin_until([this]() noexcept {
-            return fu::preferred_atomic_ref<std::int32_t const> {resumed_}.load(std::memory_order_acquire) != 0;
+            return atomic_reference<std::int32_t const> {resumed_}.load(std::memory_order_acquire) != 0;
         });
-        fu::preferred_atomic_ref<std::int32_t> {paused_}.store(0, std::memory_order_release);
+        atomic_reference<std::int32_t> {paused_}.store(0, std::memory_order_release);
     }
 
-    fu::preferred_atomic_ref<std::uint64_t> balance_(stored_key_t stored_key) noexcept {
-        return fu::preferred_atomic_ref<std::uint64_t> {balances_[stored_key]};
+    atomic_reference<std::uint64_t> balance_(stored_key_t stored_key) noexcept {
+        return atomic_reference<std::uint64_t> {balances_[stored_key]};
     }
 
-    fu::preferred_atomic_ref<std::uint64_t const> balance_(stored_key_t stored_key) const noexcept {
-        return fu::preferred_atomic_ref<std::uint64_t const> {balances_[stored_key]};
+    atomic_reference<std::uint64_t const> balance_(stored_key_t stored_key) const noexcept {
+        return atomic_reference<std::uint64_t const> {balances_[stored_key]};
     }
 
     /** The stamps every commit draws. */
@@ -233,9 +248,10 @@ class test_store_t {
     std::int32_t resumed_ = 0;
 };
 
-using registry_t = database_transaction_registry<stored_key_t, test_store_t>;
+using registry_t = database_transaction_registry<stored_key_t, test_store_t, atomic_reference, waiting_policy_t>;
 
-static_assert(transaction_store_concept<test_store_t, stored_key_t>, "The store must serve the commit path");
+static_assert(transaction_store_concept<test_store_t, stored_key_t, atomic_reference, waiting_policy_t>,
+              "The store must serve the commit path");
 
 #pragma endregion Store
 
@@ -248,7 +264,7 @@ static_assert(transaction_store_concept<test_store_t, stored_key_t>, "The store 
  *  is for: the contract is the list of members below, not a comment describing it.
  */
 template <>
-class blobs::database_transaction<stored_key_t, test_store_t> {
+class blobs::database_transaction<stored_key_t, test_store_t, atomic_reference, waiting_policy_t> {
   public:
     using state_t = registry_t::transaction_state_t;
     using write_buffer_t = registry_t::write_buffer_t;
@@ -411,7 +427,7 @@ class blobs::database_transaction<stored_key_t, test_store_t> {
     phase_t phase_ = phase_t::started_k;
 };
 
-using transaction_t = database_transaction<stored_key_t, test_store_t>;
+using transaction_t = database_transaction<stored_key_t, test_store_t, atomic_reference, waiting_policy_t>;
 
 #pragma endregion Transaction
 

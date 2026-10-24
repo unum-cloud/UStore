@@ -58,7 +58,7 @@ struct channels_types {
     using guard_t = typename fixture_t::guard_t;
     using disk_t = typename fixture_t::disk_t;
     using read_pipeline_t = basic_read_pipeline<disk_t>;
-    using write_pipeline_t = basic_write_pipeline<disk_t>;
+    using write_pipeline_t = basic_write_pipeline<disk_t, waiting_policy_t>;
 };
 
 /** Writes a repeatable pattern of @p seed into @p buffer, so a read can be checked against it. */

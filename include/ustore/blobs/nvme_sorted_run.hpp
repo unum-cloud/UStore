@@ -10,9 +10,24 @@
  *  transfer, which is exactly what a truncated run looks like.
  *
  *  The sections are disjoint, so the write path needs no ordering between them: it stages the header,
- *  the cells, the values and the trailer of stamps and kinds into one reservation, polls them all,
- *  flushes once, and only then asks the volume to record the name. A record's kind tells a removal,
- *  an empty value and a fold's change apart, so no size or location carries a sentinel.
+ *  the cells, the values, the tails and the trailer of stamps, kinds and tail offsets into one reservation,
+ *  polls them all, flushes once, and only then asks the volume to record the name. A record's kind tells a
+ *  removal, an empty value and a fold's change apart, so no size or location carries a sentinel.
+ *
+ *  A cell holds a fixed-width key, which for a string is its 16-byte head, so the bytes of every string past
+ *  what its head holds sit in the tails tape, located by the offsets in the trailer. A run of whole keys has
+ *  no tails, and neither tape nor offsets:
+ *
+ *  @code{.c}
+ *  // blob: header | cells in index order | values | tails | trailer
+ *  struct trailer {
+ *      byte_t stamps[stamps_bytes];          // the saved stamps column
+ *      byte_t kinds[kinds_bytes];            // the saved kinds column
+ *      u32 tail_offsets[n + 1];              // only when key_tails_bytes is not zero
+ *  };
+ *  @endcode
+ *
+ *  The tails are read into memory at open, with the index, so a lookup compares whole keys with no I/O.
  */
 
 #pragma once
@@ -23,7 +38,9 @@
 
 #include <algorithm>   // `std::min`, `std::max`
 #include <array>       // `std::array`
+#include <limits>      // `std::numeric_limits`
 #include <span>        // `std::span`
+#include <string_view> // `std::string_view`
 #include <type_traits> // `std::remove_reference_t`
 #include <utility>     // `std::declval`, `std::move`
 
@@ -119,6 +136,9 @@ struct sorted_run_header_t {
 
     /** Bytes the saved kinds column takes in the trailer, right after the stamps and before their alignment padding. */
     std::uint64_t kinds_bytes = 0;
+
+    /** Bytes of the tails tape, the bytes of every key past what its head holds, zero for a run of whole keys. */
+    std::uint64_t key_tails_bytes = 0;
 };
 
 #pragma pack(pop)
@@ -195,25 +215,44 @@ class sorted_run_layout {
         return holds_values_inline_k ? 0 : round_up_to_multiple(stored_values_bytes, portable_alignment_k);
     }
 
-    /** First byte of the trailer, which holds the saved stamps column after the stored values. */
-    [[nodiscard]] static constexpr std::uint64_t stamps_offset(std::uint64_t key_slots_count,
-                                                               std::uint64_t stored_values_bytes) noexcept {
+    /** First byte of the tails tape, right after the stored values. */
+    [[nodiscard]] static constexpr std::uint64_t tails_offset(std::uint64_t key_slots_count,
+                                                              std::uint64_t stored_values_bytes) noexcept {
         return values_offset(key_slots_count) + values_section_bytes(stored_values_bytes);
     }
 
-    /** Bytes the trailer occupies: the saved stamps, then the saved kinds right after them, which a packed column reads
-     *  at any alignment, so both share one read and the pages of one. */
-    [[nodiscard]] static constexpr std::uint64_t trailer_bytes(std::uint64_t stamps_bytes,
-                                                               std::uint64_t kinds_bytes) noexcept {
-        return round_up_to_multiple(stamps_bytes + kinds_bytes, portable_alignment_k);
+    /** Bytes the tails section occupies, which is none for a run of whole keys. */
+    [[nodiscard]] static constexpr std::uint64_t tails_section_bytes(std::uint64_t key_tails_bytes) noexcept {
+        return round_up_to_multiple(key_tails_bytes, portable_alignment_k);
+    }
+
+    /** Bytes the saved tail offsets take in the trailer: one per key slot and one past the last, none without tails. */
+    [[nodiscard]] static constexpr std::uint64_t tail_offsets_bytes(std::uint64_t key_slots_count,
+                                                                    std::uint64_t key_tails_bytes) noexcept {
+        return key_tails_bytes != 0 ? (key_slots_count + 1) * sizeof(std::uint32_t) : 0;
+    }
+
+    /** First byte of the trailer, which holds the saved stamps column after the stored values and the tails. */
+    [[nodiscard]] static constexpr std::uint64_t stamps_offset(std::uint64_t key_slots_count,
+                                                               std::uint64_t stored_values_bytes,
+                                                               std::uint64_t key_tails_bytes = 0) noexcept {
+        return tails_offset(key_slots_count, stored_values_bytes) + tails_section_bytes(key_tails_bytes);
+    }
+
+    /** Bytes the trailer occupies: the saved stamps, then the saved kinds and the tail offsets right after them, which
+     *  are read at any alignment, so all three share one read and the pages of one. */
+    [[nodiscard]] static constexpr std::uint64_t trailer_bytes(std::uint64_t stamps_bytes, std::uint64_t kinds_bytes,
+                                                               std::uint64_t tail_offsets_bytes = 0) noexcept {
+        return round_up_to_multiple(stamps_bytes + kinds_bytes + tail_offsets_bytes, portable_alignment_k);
     }
 
     /** Bytes the whole run occupies, which is the length its blob is reserved with. */
     [[nodiscard]] static constexpr std::uint64_t blob_bytes(std::uint64_t key_slots_count,
                                                             std::uint64_t stored_values_bytes,
-                                                            std::uint64_t stamps_bytes,
-                                                            std::uint64_t kinds_bytes) noexcept {
-        return stamps_offset(key_slots_count, stored_values_bytes) + trailer_bytes(stamps_bytes, kinds_bytes);
+                                                            std::uint64_t stamps_bytes, std::uint64_t kinds_bytes,
+                                                            std::uint64_t key_tails_bytes = 0) noexcept {
+        return stamps_offset(key_slots_count, stored_values_bytes, key_tails_bytes) +
+               trailer_bytes(stamps_bytes, kinds_bytes, tail_offsets_bytes(key_slots_count, key_tails_bytes));
     }
 };
 
@@ -253,11 +292,13 @@ inline expected<kinds_column_t> pack_kinds(std::span<std::uint8_t const> kinds) 
 /**
  *  @brief One immutable run of key slots and the values they locate, held as one blob of one volume.
  *
- *  The run borrows the volume and the blob, and owns only the cells of its index. Every call that
+ *  The run borrows the volume and the blob, and owns only its index, its columns and its tails. Every call that
  *  moves bytes takes the channel the calling thread holds, since a queue pair belongs to one thread while it
  *  is held and a run outlives every thread that ever reads it.
+ *
+ *  @tparam waiting_policy_type_ What the core does while it waits for an index read or a barrier.
  */
-template <typename key_slot_type_, typename volume_type_>
+template <typename key_slot_type_, typename volume_type_, typename waiting_policy_type_>
 class lsm_sorted_run {
   public:
 
@@ -282,7 +323,7 @@ class lsm_sorted_run {
     using read_pipeline_t = basic_read_pipeline<disk_t>;
 
     /** The pipeline the write path stages its three sections through. */
-    using write_pipeline_t = basic_write_pipeline<disk_t>;
+    using write_pipeline_t = basic_write_pipeline<disk_t, waiting_policy_type_>;
 
     /** How the values of this run are stored. */
     static constexpr value_layout_t value_layout_k = key_slot_t::value_layout_k;
@@ -301,7 +342,8 @@ class lsm_sorted_run {
     lsm_sorted_run(lsm_sorted_run&& other) noexcept
         : volume_(std::exchange(other.volume_, nullptr)), blob_(other.blob_), header_(other.header_),
           layout_(other.layout_), cells_(std::move(other.cells_)), stamps_(std::move(other.stamps_)),
-          kinds_(std::move(other.kinds_)) {
+          kinds_(std::move(other.kinds_)), tail_offsets_(std::move(other.tail_offsets_)),
+          tails_(std::move(other.tails_)) {
         other.blob_ = volume_blob_t {};
         other.header_ = sorted_run_header_t {};
     }
@@ -315,6 +357,8 @@ class lsm_sorted_run {
         cells_ = std::move(other.cells_);
         stamps_ = std::move(other.stamps_);
         kinds_ = std::move(other.kinds_);
+        tail_offsets_ = std::move(other.tail_offsets_);
+        tails_ = std::move(other.tails_);
         other.blob_ = volume_blob_t {};
         other.header_ = sorted_run_header_t {};
         return *this;
@@ -351,23 +395,27 @@ class lsm_sorted_run {
      *  @param[in] floor The stamp every stamp is raised to at least, since no reader can tell those below it apart.
      *  @param[in] stored_values The values back to back, located from @c values_offset of the layout.
      *  @param[in] value_max_size The largest value the writing collection admits, kept for a reader.
+     *  @param[in] tails The tails of the keys the key slots' heads cut short, in the same order, which key slots of
+     *      one head order by; none for a run of whole keys.
      *  @return The run, opened again from the volume, or the status that stopped the write.
      */
     static expected<lsm_sorted_run> write(volume_type_& volume, io_channel_t& channel, uuid_t const& content_id,
                                           std::span<key_slot_t const> key_slots, std::span<std::uint64_t const> stamps,
                                           std::span<std::uint8_t const> kinds, std::uint64_t floor,
-                                          std::span<byte_t const> stored_values,
-                                          stored_value_size_t value_max_size) noexcept {
+                                          std::span<byte_t const> stored_values, stored_value_size_t value_max_size,
+                                          key_tails_t const& tails = {}) noexcept {
         if (!content_id.is_valid())
             return status_t {status_code_t::invalid_argument_k, "A run is named by a valid identifier"};
         if (holds_values_inline_k && !stored_values.empty())
             return status_t {status_code_t::invalid_argument_k, "An inline run carries no stored values"};
         if (stamps.size() != key_slots.size() || kinds.size() != key_slots.size())
             return status_t {status_code_t::invalid_argument_k, "A run takes one stamp and one kind per key slot"};
+        if (status_t const checked = check_tails_(tails, key_slots.size()); checked.failed()) return checked;
         for (std::size_t index = 1; index < key_slots.size(); ++index) {
-            if (key_slots[index].stored_key < key_slots[index - 1].stored_key)
+            int const order = key_order_(key_slots, tails, index);
+            if (order < 0)
                 return status_t {status_code_t::invalid_argument_k, "A run takes its key slots in ascending order"};
-            if (key_slots[index].stored_key == key_slots[index - 1].stored_key && stamps[index] >= stamps[index - 1])
+            if (order == 0 && stamps[index] >= stamps[index - 1])
                 return status_t {status_code_t::invalid_argument_k, "A run takes the versions of a key newest first"};
         }
 
@@ -396,15 +444,17 @@ class lsm_sorted_run {
         header.stamps_floor = floor;
         header.newest_stamp = newest;
         header.kinds_bytes = kinds_column.saved_bytes();
+        header.key_tails_bytes = tails.bytes.size();
 
         std::uint64_t const reserved_bytes = sorted_run_layout_t::blob_bytes(
-            header.key_slots_count, header.stored_values_bytes, header.stamps_bytes, header.kinds_bytes);
+            header.key_slots_count, header.stored_values_bytes, header.stamps_bytes, header.kinds_bytes,
+            header.key_tails_bytes);
         auto [reserved, create_status] = volume.create(name_of(content_id), blob_kind_t::sorted_run_k, reserved_bytes);
         if (create_status.failed()) return create_status;
         volume_blob_t const blob = reserved;
 
         if (status_t const written = write_sections_(volume, channel, blob, header, key_slots, column, kinds_column,
-                                                     stored_values, block_bytes);
+                                                     stored_values, tails, block_bytes);
             written.failed()) {
             [[maybe_unused]] status_t const abandoned = volume.drop(channel, name_of(content_id));
             return written;
@@ -425,7 +475,7 @@ class lsm_sorted_run {
     }
 
     /**
-     *  @brief Reads the header and the whole index of @p blob, which is everything a run keeps in memory.
+     *  @brief Reads the header, the whole index and the tails of @p blob, which is everything a run keeps in memory.
      *  @param[inout] volume The volume the run reads through afterwards, borrowed and outliving it.
      *  @param[inout] channel The channel the header and the index are read on, held by the calling thread.
      *  @param[in] blob The reservation the run occupies, as a lookup or a router handed it over.
@@ -438,6 +488,7 @@ class lsm_sorted_run {
         run.blob_ = blob;
         if (status_t const head = run.read_header_(channel); head.failed()) return head;
         if (status_t const index = run.read_index_(channel); index.failed()) return index;
+        if (status_t const tails = run.read_tails_(channel); tails.failed()) return tails;
         if (status_t const trailer = run.read_trailer_(channel); trailer.failed()) return trailer;
         return run;
     }
@@ -498,6 +549,15 @@ class lsm_sorted_run {
 
     /** Bytes the stamps column takes in memory, which is all a run spends on its stamps. */
     [[nodiscard]] std::uint64_t stamps_bytes() const noexcept { return stamps_.size_bytes(); }
+
+    /** The tail of the key at sorted @p position, which must be below @c population_count: the bytes its head cut
+     *  short, empty for a key its head holds whole. */
+    [[nodiscard]] std::string_view tail(std::uint64_t position) const noexcept { return tails().at(position); }
+
+    /** The tails of every key in sorted order, which a compaction reads in place, none for a run of whole keys. */
+    [[nodiscard]] key_tails_t tails() const noexcept {
+        return key_tails_t {std::span<std::uint32_t const> {tail_offsets_}, std::span<byte_t const> {tails_}};
+    }
 
     /** The least key the run holds, or the greatest key of the type for an empty run. */
     [[nodiscard]] stored_key_t lower_stored_key() const noexcept {
@@ -756,12 +816,60 @@ class lsm_sorted_run {
         }
     }
 
-    /** Stages the header, the cells, the values, the stamps and the kinds into @p blob, and makes them all durable at
-     *  once. */
+    /** Refuses @p tails unless they are none, or one offset per one of @p key_slots_count key slots and one past the
+     *  last, ascending from zero to the bytes they locate. */
+    static status_t check_tails_(key_tails_t const& tails, std::size_t key_slots_count) noexcept {
+        if (tails.offsets.empty()) {
+            if (!tails.bytes.empty()) return {status_code_t::invalid_argument_k, "Tails come with their offsets"};
+            return {};
+        }
+        if (tails.offsets.size() != key_slots_count + 1 || tails.offsets.front() != 0 ||
+            tails.offsets.back() != tails.bytes.size())
+            return {status_code_t::invalid_argument_k, "A run takes one tail offset per key slot and one past them"};
+        for (std::size_t index = 1; index != tails.offsets.size(); ++index)
+            if (tails.offsets[index] < tails.offsets[index - 1])
+                return {status_code_t::invalid_argument_k, "A run takes its tail offsets ascending"};
+        return {};
+    }
+
+    /** How the key of key slot @p index of @p key_slots orders against the one before it: by head, then by tail. */
+    static int key_order_(std::span<key_slot_t const> key_slots, key_tails_t const& tails, std::size_t index) noexcept {
+        if (key_slots[index].stored_key < key_slots[index - 1].stored_key) return -1;
+        if (key_slots[index - 1].stored_key < key_slots[index].stored_key) return 1;
+        return tails.at(index).compare(tails.at(index - 1));
+    }
+
+    /** Stages @p bytes zero-padded to @p section bytes at @p offset of @p blob, a block at a time. */
+    static status_t write_bytes_(write_pipeline_t& writer, volume_blob_t const& blob, std::uint64_t offset,
+                                 std::uint64_t section, std::span<byte_t const> bytes) noexcept {
+        for (std::uint64_t written = 0; written != section;) {
+            auto [block, acquire_buffer_or_poll_status] = writer.acquire_buffer_or_poll();
+            if (acquire_buffer_or_poll_status.failed()) return acquire_buffer_or_poll_status;
+            std::uint64_t const block_bytes = round_down_to_multiple(block.size(), portable_alignment_k);
+            if (block_bytes == 0) return {status_code_t::capacity_exhausted_k, "A channel's block holds no page"};
+            std::uint64_t const room = section - written;
+            std::uint64_t const chunk = block_bytes < room ? block_bytes : room;
+            std::span<byte_t> const staged = block.bytes().first(static_cast<std::size_t>(chunk));
+            std::uint64_t const left = bytes.size() > written ? bytes.size() - written : 0;
+            std::uint64_t const carried = left < chunk ? left : chunk;
+            if (carried != 0) std::memcpy(staged.data(), bytes.data() + written, static_cast<std::size_t>(carried));
+            std::memset(staged.data() + carried, 0, static_cast<std::size_t>(chunk - carried));
+            if (status_t const queued = writer.enqueue_write(std::move(block), blob.slice(offset + written, chunk));
+                queued.failed())
+                return queued;
+            if (status_t const flushed = writer.submit(); flushed.failed()) return flushed;
+            written += chunk;
+        }
+        return {};
+    }
+
+    /** Stages the header, the cells, the values, the tails, the stamps, the kinds and the tail offsets into @p blob,
+     *  and makes them all durable at once. */
     static status_t write_sections_(volume_type_& volume, io_channel_t& channel, volume_blob_t const& blob,
                                     sorted_run_header_t const& header, std::span<key_slot_t const> key_slots,
                                     stamps_column_t const& column, kinds_column_t const& kinds,
-                                    std::span<byte_t const> stored_values, std::uint64_t block_bytes) noexcept {
+                                    std::span<byte_t const> stored_values, key_tails_t const& tails,
+                                    std::uint64_t block_bytes) noexcept {
         write_pipeline_t writer {volume.disk(), channel, blob.medium};
         sorted_run_index_layout_t const layout {header.key_slots_count, header.branching};
 
@@ -791,70 +899,59 @@ class lsm_sorted_run {
             written += chunk;
         }
 
-        std::uint64_t const values_section = sorted_run_layout_t::values_section_bytes(header.stored_values_bytes);
-        std::uint64_t const values_offset = sorted_run_layout_t::values_offset(header.key_slots_count);
-        for (std::uint64_t written = 0; written != values_section;) {
-            std::uint64_t const room = values_section - written;
-            std::uint64_t const chunk = block_bytes < room ? block_bytes : room;
-            auto [block, acquire_buffer_or_poll_status] = writer.acquire_buffer_or_poll();
-            if (acquire_buffer_or_poll_status.failed()) return acquire_buffer_or_poll_status;
-            std::span<byte_t> const bytes = block.bytes().first(static_cast<std::size_t>(chunk));
-            std::uint64_t const left = stored_values.size() > written ? stored_values.size() - written : 0;
-            std::uint64_t const carried = left < chunk ? left : chunk;
-            if (carried != 0)
-                std::memcpy(bytes.data(), stored_values.data() + written, static_cast<std::size_t>(carried));
-            std::memset(bytes.data() + carried, 0, static_cast<std::size_t>(chunk - carried));
-            if (status_t const queued = writer.enqueue_write(std::move(block),
-                                                             blob.slice(values_offset + written, chunk));
-                queued.failed())
-                return queued;
-            if (status_t const flushed = writer.submit(); flushed.failed()) return flushed;
-            written += chunk;
-        }
-
-        if (status_t const trailer = write_trailer(writer, blob, header, column, kinds); trailer.failed())
+        if (status_t const values = write_bytes_(
+                writer, blob, sorted_run_layout_t::values_offset(header.key_slots_count),
+                sorted_run_layout_t::values_section_bytes(header.stored_values_bytes), stored_values);
+            values.failed())
+            return values;
+        if (status_t const written = write_tails(writer, blob, header, tails.bytes); written.failed()) return written;
+        if (status_t const trailer = write_trailer(writer, blob, header, column, kinds, tails.offsets);
+            trailer.failed())
             return trailer;
         return writer.make_durable();
     }
 
   public:
 
-    /** Stages @p stamps and then @p kinds as the trailer of the run @p header describes, which a flush and a merge both
-     *  write. */
+    /** Stages @p tails as the tails section of the run @p header describes, which a flush and a merge both write. */
+    static status_t write_tails(write_pipeline_t& writer, volume_blob_t const& blob, sorted_run_header_t const& header,
+                                std::span<byte_t const> tails) noexcept {
+        if (tails.size() != header.key_tails_bytes)
+            return {status_code_t::internal_k, "A run's tails disagree with the bytes its header names"};
+        return write_bytes_(writer, blob,
+                            sorted_run_layout_t::tails_offset(header.key_slots_count, header.stored_values_bytes),
+                            sorted_run_layout_t::tails_section_bytes(header.key_tails_bytes), tails);
+    }
+
+    /** Stages @p stamps, then @p kinds, then @p tail_offsets, none for a run of whole keys, as the trailer of the run
+     *  @p header describes, which a flush and a merge both write. */
     static status_t write_trailer(write_pipeline_t& writer, volume_blob_t const& blob,
                                   sorted_run_header_t const& header, stamps_column_t const& stamps,
-                                  kinds_column_t const& kinds) noexcept {
+                                  kinds_column_t const& kinds,
+                                  std::span<std::uint32_t const> tail_offsets = {}) noexcept {
+        std::uint64_t const offsets_bytes = sorted_run_layout_t::tail_offsets_bytes(header.key_slots_count,
+                                                                                    header.key_tails_bytes);
+        if (tail_offsets.size_bytes() != offsets_bytes)
+            return {status_code_t::internal_k, "A run's tail offsets disagree with the tails its header names"};
         st::basic_vector<byte_t> saved;
-        if (saved.resize(static_cast<std::size_t>(header.stamps_bytes + header.kinds_bytes)) != st::status_t::success_k)
+        if (saved.resize(static_cast<std::size_t>(header.stamps_bytes + header.kinds_bytes + offsets_bytes)) !=
+            st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A run could not lay its trailer out"};
-        if (stamps.save(std::span<byte_t> {saved}.first(static_cast<std::size_t>(header.stamps_bytes))) !=
-                st::status_t::success_k ||
-            kinds.save(std::span<byte_t> {saved}.subspan(static_cast<std::size_t>(header.stamps_bytes))) !=
+        std::span<byte_t> const room {saved};
+        std::size_t const kinds_begin = static_cast<std::size_t>(header.stamps_bytes);
+        std::size_t const offsets_begin = static_cast<std::size_t>(header.stamps_bytes + header.kinds_bytes);
+        if (stamps.save(room.first(kinds_begin)) != st::status_t::success_k ||
+            kinds.save(room.subspan(kinds_begin, static_cast<std::size_t>(header.kinds_bytes))) !=
                 st::status_t::success_k)
             return {status_code_t::internal_k, "A run's columns outgrew the bytes its header names"};
+        if (offsets_bytes != 0)
+            std::memcpy(saved.data() + offsets_begin, tail_offsets.data(), static_cast<std::size_t>(offsets_bytes));
 
-        std::uint64_t const section = sorted_run_layout_t::trailer_bytes(header.stamps_bytes, header.kinds_bytes);
-        std::uint64_t const offset = sorted_run_layout_t::stamps_offset(header.key_slots_count,
-                                                                        header.stored_values_bytes);
-        for (std::uint64_t written = 0; written != section;) {
-            auto [block, acquire_buffer_or_poll_status] = writer.acquire_buffer_or_poll();
-            if (acquire_buffer_or_poll_status.failed()) return acquire_buffer_or_poll_status;
-            std::uint64_t const block_bytes = round_down_to_multiple(block.size(), portable_alignment_k);
-            if (block_bytes == 0) return {status_code_t::capacity_exhausted_k, "A channel's block holds no page"};
-            std::uint64_t const room = section - written;
-            std::uint64_t const chunk = block_bytes < room ? block_bytes : room;
-            std::span<byte_t> const bytes = block.bytes().first(static_cast<std::size_t>(chunk));
-            std::uint64_t const left = saved.size() > written ? saved.size() - written : 0;
-            std::uint64_t const carried = left < chunk ? left : chunk;
-            if (carried != 0) std::memcpy(bytes.data(), saved.data() + written, static_cast<std::size_t>(carried));
-            std::memset(bytes.data() + carried, 0, static_cast<std::size_t>(chunk - carried));
-            if (status_t const queued = writer.enqueue_write(std::move(block), blob.slice(offset + written, chunk));
-                queued.failed())
-                return queued;
-            if (status_t const flushed = writer.submit(); flushed.failed()) return flushed;
-            written += chunk;
-        }
-        return {};
+        return write_bytes_(writer, blob,
+                            sorted_run_layout_t::stamps_offset(header.key_slots_count, header.stored_values_bytes,
+                                                               header.key_tails_bytes),
+                            sorted_run_layout_t::trailer_bytes(header.stamps_bytes, header.kinds_bytes, offsets_bytes),
+                            std::span<byte_t const> {saved});
     }
 
   private:
@@ -889,8 +986,10 @@ class lsm_sorted_run {
         if (header.key_slot_bytes != sizeof(key_slot_t) || header.value_layout != value_layout_k)
             return {status_code_t::malformed_k, "The run holds key slots of another shape"};
         if (header.branching < 2) return {status_code_t::malformed_k, "The run names no index branching"};
+        if (header.key_tails_bytes > std::numeric_limits<std::uint32_t>::max())
+            return {status_code_t::malformed_k, "The run claims more tails than its offsets reach"};
         if (sorted_run_layout_t::blob_bytes(header.key_slots_count, header.stored_values_bytes, header.stamps_bytes,
-                                            header.kinds_bytes) > blob_.extent.length)
+                                            header.kinds_bytes, header.key_tails_bytes) > blob_.extent.length)
             return {status_code_t::malformed_k, "The run claims more bytes than its blob holds"};
         if (header.newest_stamp < header.stamps_floor)
             return {status_code_t::malformed_k, "The run's newest stamp is below its floor"};
@@ -926,8 +1025,8 @@ class lsm_sorted_run {
                                                                  std::span<request_t const> {batch});
             if (submit_status.failed()) return submit_status;
             if (taken != 1) return {status_code_t::io_k, "The ring would not take an index read"};
-            auto [completed, poll_completions_status] = poll_completions_at_least(volume_->disk(), channel.queue_pair(),
-                                                                                  channel.completion_buffer(), 1);
+            auto [completed, poll_completions_status] = poll_completions_at_least<waiting_policy_type_>(
+                volume_->disk(), channel.queue_pair(), channel.completion_buffer(), 1);
             if (poll_completions_status.failed()) return poll_completions_status;
             if (completed == 0) return {status_code_t::io_k, "An index read never completed"};
             completion_t const& completion = channel.completion_buffer().front();
@@ -945,16 +1044,9 @@ class lsm_sorted_run {
         return {};
     }
 
-    /** Reads the trailer and unpacks the stamps and the kinds columns into owned memory, refusing either one its header
-     *  disagrees with. */
-    status_t read_trailer_(io_channel_t& channel) noexcept {
-        std::uint64_t const section = sorted_run_layout_t::trailer_bytes(header_.stamps_bytes, header_.kinds_bytes);
-        std::uint64_t const offset = sorted_run_layout_t::stamps_offset(header_.key_slots_count,
-                                                                        header_.stored_values_bytes);
-        st::basic_vector<byte_t> saved;
-        if (saved.resize(static_cast<std::size_t>(section)) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A run could not hold its trailer"};
-
+    /** Reads the @p into.size() bytes from @p offset of the blob, a whole number of pages, into @p into. */
+    status_t read_bytes_(io_channel_t& channel, std::uint64_t offset, std::span<byte_t> into) noexcept {
+        std::uint64_t const section = into.size();
         std::uint64_t const block = round_down_to_multiple(channel.requests().buffer_bytes(), portable_alignment_k);
         if (block == 0) return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than one page"};
         read_pipeline_t reader {volume_->disk(), channel, blob_.medium};
@@ -965,21 +1057,54 @@ class lsm_sorted_run {
                 return;
             }
             std::uint64_t const at = static_cast<std::uint64_t>(completed.tag) * block;
-            std::memcpy(saved.data() + at, completed.bytes.data(), completed.bytes.size());
+            std::memcpy(into.data() + at, completed.bytes.data(), completed.bytes.size());
         };
         request_tag_t tag = 0;
         for (std::uint64_t read = 0; read != section;) {
             while (read != section && reader.can_enqueue()) {
                 std::uint64_t const length = block < section - read ? block : section - read;
                 extent_t const piece = blob_.slice(offset + read, length);
-                if (piece.length != length) return {status_code_t::malformed_k, "The run is shorter than its trailer"};
+                if (piece.length != length) return {status_code_t::malformed_k, "The run is shorter than it claims"};
                 if (status_t const offered = reader.enqueue_read(piece, tag++); offered.failed()) return offered;
                 read += length;
             }
             if (status_t const flushed = reader.submit(); flushed.failed()) return flushed;
             if (status_t const polled = reader.poll_all_completions(sink); polled.failed()) return polled;
         }
-        if (moved.failed()) return {status_code_t::malformed_k, "A run's trailer did not read whole"};
+        if (moved.failed()) return {status_code_t::malformed_k, "A run's section did not read whole"};
+        return {};
+    }
+
+    /** Reads the tails tape whole into owned memory, which a run of whole keys has none of. */
+    status_t read_tails_(io_channel_t& channel) noexcept {
+        std::uint64_t const section = sorted_run_layout_t::tails_section_bytes(header_.key_tails_bytes);
+        if (section == 0) return {};
+        if (tails_.resize(static_cast<std::size_t>(section)) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "A run could not hold its tails"};
+        if (status_t const read = read_bytes_(
+                channel, sorted_run_layout_t::tails_offset(header_.key_slots_count, header_.stored_values_bytes),
+                std::span<byte_t> {tails_});
+            read.failed())
+            return read;
+        // The section's last page is padded past the tails, which the run keeps no copy of.
+        if (tails_.resize(static_cast<std::size_t>(header_.key_tails_bytes)) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "A run could not hold its tails"};
+        return {};
+    }
+
+    /** Reads the trailer and unpacks the stamps, the kinds and the tail offsets into owned memory, refusing any its
+     *  header disagrees with. */
+    status_t read_trailer_(io_channel_t& channel) noexcept {
+        std::uint64_t const offsets_bytes = sorted_run_layout_t::tail_offsets_bytes(header_.key_slots_count,
+                                                                                    header_.key_tails_bytes);
+        std::uint64_t const section = sorted_run_layout_t::trailer_bytes(header_.stamps_bytes, header_.kinds_bytes,
+                                                                         offsets_bytes);
+        std::uint64_t const offset = sorted_run_layout_t::stamps_offset(
+            header_.key_slots_count, header_.stored_values_bytes, header_.key_tails_bytes);
+        st::basic_vector<byte_t> saved;
+        if (saved.resize(static_cast<std::size_t>(section)) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "A run could not hold its trailer"};
+        if (status_t const read = read_bytes_(channel, offset, std::span<byte_t> {saved}); read.failed()) return read;
 
         st::expected<st::immutable_packed_array_view<std::uint64_t>> view =
             st::immutable_packed_array_view<std::uint64_t>::make(
@@ -1026,6 +1151,16 @@ class lsm_sorted_run {
                        ? status_t {status_code_t::out_of_memory_k, "A run could not hold its kinds"}
                        : status_t {status_code_t::malformed_k, "A run carries a kind no record has"};
         kinds_ = std::move(*kinds_column);
+
+        if (offsets_bytes == 0) return {};
+        if (tail_offsets_.resize(static_cast<std::size_t>(header_.key_slots_count + 1)) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "A run could not hold its tail offsets"};
+        std::memcpy(tail_offsets_.data(), saved.data() + header_.stamps_bytes + header_.kinds_bytes,
+                    static_cast<std::size_t>(offsets_bytes));
+        bool ascending = tail_offsets_.front() == 0 && tail_offsets_.back() == header_.key_tails_bytes;
+        for (std::size_t index = 1; ascending && index != tail_offsets_.size(); ++index)
+            ascending = tail_offsets_[index - 1] <= tail_offsets_[index];
+        if (!ascending) return {status_code_t::malformed_k, "A run's tail offsets disagree with its tails"};
         return {};
     }
 
@@ -1053,6 +1188,12 @@ class lsm_sorted_run {
 
     /** The @c delta_kind_t of every key slot in sorted order, packed from the least present, read whole at open. */
     kinds_column_t kinds_;
+
+    /** One offset per key slot into @c tails_ and one past the last, read whole at open, none for whole keys. */
+    st::basic_vector<std::uint32_t> tail_offsets_;
+
+    /** The tails of every key back to back in sorted order, read whole at open, none for whole keys. */
+    st::basic_vector<byte_t> tails_;
 
 #pragma endregion Private Members
 };

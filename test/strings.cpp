@@ -14,7 +14,9 @@
 
 #include <array>       // `std::array`
 #include <span>        // `std::span`
+#include <string>      // `std::string`
 #include <string_view> // `std::string_view`
+#include <vector>      // `std::vector`
 
 #include <fmt/format.h>
 
@@ -99,20 +101,31 @@ struct fixture_t {
     [[nodiscard]] bool ready() const noexcept { return database && collection != ustore_collection_main_k && arena; }
 };
 
-/** Sends @p batch through @c ustore_strings_write and counts a failure when it is refused. */
-[[nodiscard]] std::size_t write_batch(fixture_t& fixture, strings_batch_t const& batch) noexcept {
-    strided_strings<std::string_view> const texts {{batch.texts.data(), sizeof(std::string_view)}};
-    strided_strings<std::string_view> const values {{batch.values.data(), sizeof(std::string_view)}};
+/** Writes @p values under @p texts in one call of @c ustore_strings_write, through @p transaction unless it is null,
+ *  and answers its outcome. */
+[[nodiscard]] ustore_outcome_t write_strings(fixture_t& fixture, std::span<std::string_view const> texts,
+                                             std::span<std::string_view const> values,
+                                             ustore_transaction_t transaction = nullptr) noexcept {
+    strided_strings<std::string_view> const strided_texts {{texts.data(), sizeof(std::string_view)}};
+    strided_strings<std::string_view> const strided_values {{values.data(), sizeof(std::string_view)}};
     ustore_outcome_t outcome {};
     ustore_strings_write_t write {};
     write.database = fixture.database;
     write.outcome = &outcome;
-    write.count = batch.count;
+    write.transaction = transaction;
+    write.count = texts.size();
     write.collections = {&fixture.collection, 0};
-    write.strings = texts.view();
-    write.values = values.view();
+    write.strings = strided_texts.view();
+    write.values = strided_values.view();
 
     ustore_strings_write(&write);
+    return outcome;
+}
+
+/** Sends @p batch through @c ustore_strings_write and counts a failure when it is refused. */
+[[nodiscard]] std::size_t write_batch(fixture_t& fixture, strings_batch_t const& batch) noexcept {
+    ustore_outcome_t outcome = write_strings(fixture, std::span {batch.texts.data(), batch.count},
+                                             std::span {batch.values.data(), batch.count});
     return expect_success(outcome);
 }
 
@@ -123,19 +136,60 @@ struct fixture_t {
     return write_batch(fixture, batch);
 }
 
-/** Removes one string through @c ustore_strings_remove. */
-[[nodiscard]] std::size_t erase_one(fixture_t& fixture, std::string_view text) noexcept {
-    strided_strings<std::string_view> const texts {{&text, 0}};
+/** Removes @p texts in one call of @c ustore_strings_remove, counting a failure when it is refused. */
+[[nodiscard]] std::size_t erase_strings(fixture_t& fixture, std::span<std::string_view const> texts) noexcept {
+    strided_strings<std::string_view> const strided_texts {{texts.data(), sizeof(std::string_view)}};
     ustore_outcome_t outcome {};
     ustore_strings_remove_t remove {};
     remove.database = fixture.database;
     remove.outcome = &outcome;
-    remove.count = 1;
+    remove.count = texts.size();
     remove.collections = {&fixture.collection, 0};
-    remove.strings = texts.view();
+    remove.strings = strided_texts.view();
 
     ustore_strings_remove(&remove);
     return expect_success(outcome);
+}
+
+/** Removes one string through @c ustore_strings_remove. */
+[[nodiscard]] std::size_t erase_one(fixture_t& fixture, std::string_view text) noexcept {
+    return erase_strings(fixture, std::span {&text, 1});
+}
+
+/** A transaction the case frees whatever the case ends in. */
+struct transaction_holder_t {
+
+    /** The transaction, null until begun. */
+    ustore_transaction_t transaction = nullptr;
+
+    transaction_holder_t() noexcept = default;
+    transaction_holder_t(transaction_holder_t const&) = delete;
+    transaction_holder_t& operator=(transaction_holder_t const&) = delete;
+    ~transaction_holder_t() noexcept {
+        if (transaction) ustore_transaction_free(transaction);
+    }
+};
+
+/** Begins a transaction of the fixture's database into @p holder, counting a failure when it is refused. */
+[[nodiscard]] std::size_t begin_transaction(fixture_t& fixture, transaction_holder_t& holder) noexcept {
+    ustore_outcome_t outcome {};
+    ustore_transaction_init_t init {};
+    init.transaction = &holder.transaction;
+    init.database = fixture.database;
+    init.outcome = &outcome;
+    ustore_transaction_init(&init);
+    return expect_success(outcome);
+}
+
+/** Commits @p transaction of the fixture's database and answers the outcome. */
+[[nodiscard]] ustore_outcome_t commit_transaction(fixture_t& fixture, ustore_transaction_t transaction) noexcept {
+    ustore_outcome_t outcome {};
+    ustore_transaction_commit_t commit {};
+    commit.database = fixture.database;
+    commit.outcome = &outcome;
+    commit.transaction = transaction;
+    ustore_transaction_commit(&commit);
+    return outcome;
 }
 
 /** The values one read exported into the arena of the fixture, addressed by task. */
@@ -156,17 +210,19 @@ struct read_results_t {
     }
 };
 
-/** Reads the values of @p batch, counting a failure when the read is refused. */
-[[nodiscard]] std::size_t read_batch(fixture_t& fixture, strings_batch_t const& batch,
-                                     read_results_t& results) noexcept {
-    strided_strings<std::string_view> const texts {{batch.texts.data(), sizeof(std::string_view)}};
+/** Reads the values of @p texts through @p view, the head when it is null, counting a failure when the read is
+ *  refused. */
+[[nodiscard]] std::size_t read_strings(fixture_t& fixture, std::span<std::string_view const> texts,
+                                       read_results_t& results, ustore_view_t view = nullptr) noexcept {
+    strided_strings<std::string_view> const strided_texts {{texts.data(), sizeof(std::string_view)}};
     ustore_outcome_t outcome {};
     ustore_strings_read_t read {};
     read.database = fixture.database;
     read.outcome = &outcome;
-    read.count = batch.count;
+    read.view = view;
+    read.count = texts.size();
     read.collections = {&fixture.collection, 0};
-    read.strings = texts.view();
+    read.strings = strided_texts.view();
     read.presences = &results.presences;
     read.values = &results.values;
     read.arena = fixture.arena;
@@ -175,7 +231,13 @@ struct read_results_t {
     ustore_strings_view_t const& values = results.values;
     bool const exported = values.layout == ustore_strings_u64_tape_k ? values.data.u64_tape.offsets != nullptr
                                                                      : values.data.u32_tape.offsets != nullptr;
-    return expect_success(outcome) + expect(!batch.count || (results.presences && exported));
+    return expect_success(outcome) + expect(texts.empty() || (results.presences && exported));
+}
+
+/** Reads the values of @p batch, counting a failure when the read is refused. */
+[[nodiscard]] std::size_t read_batch(fixture_t& fixture, strings_batch_t const& batch,
+                                     read_results_t& results) noexcept {
+    return read_strings(fixture, std::span {batch.texts.data(), batch.count}, results);
 }
 
 /** The strings one scan exported into the arena of the fixture, in the order of their text. */
@@ -195,7 +257,8 @@ struct scan_results_t {
 
 /** Walks @p prefix from @p start, at most @c batch_capacity_k strings, counting a failure when the scan is refused. */
 [[nodiscard]] std::size_t scan_prefix(fixture_t& fixture, std::string_view prefix, ustore_length_t limit,
-                                      scan_results_t& results, std::string_view start = {}) noexcept {
+                                      scan_results_t& results, std::string_view start = {},
+                                      ustore_view_t view = nullptr) noexcept {
     strided_strings<std::string_view> const prefixes {{&prefix, 0}};
     strided_strings<std::string_view> const starts {{&start, 0}};
     ustore_length_t const* scan_offsets = nullptr;
@@ -203,6 +266,7 @@ struct scan_results_t {
     ustore_strings_scan_t scan {};
     scan.database = fixture.database;
     scan.outcome = &outcome;
+    scan.view = view;
     scan.count = 1;
     scan.collections = {&fixture.collection, 0};
     scan.prefixes = prefixes.view();
@@ -272,7 +336,7 @@ std::size_t strings_prefix_scan(config_t const& config) {
     return failures;
 }
 
-/** Strings sharing a long leading run share one bucket, and each keeps its own value. */
+/** Strings sharing a long leading run share one head, and each keeps its own value. */
 std::size_t strings_shared_prefix(config_t const& config) {
     std::size_t failures = 0;
     fixture_t fixture {config};
@@ -363,68 +427,171 @@ std::size_t strings_update_and_remove(config_t const& config) {
     return failures;
 }
 
-/** A bucket grows past one entry and shrinks back, and disappears once its last string goes. */
-std::size_t strings_bucket_growth(config_t const& config) {
-    std::size_t failures = 0;
-    fixture_t fixture {config};
-    if (!fixture.ready()) return failures + 1;
-
-    constexpr std::string_view shared_k = "shared-prefix!!";
-    constexpr std::string_view first_k = "shared-prefix!!one";
-    constexpr std::string_view second_k = "shared-prefix!!two";
-    constexpr std::string_view third_k = "shared-prefix!!three";
-
-    failures += write_one(fixture, first_k, "1");
-    std::array<std::string_view, 1> const alone {first_k};
-    failures += expect_scan(fixture, shared_k, alone);
-
-    failures += write_one(fixture, second_k, "2");
-    failures += write_one(fixture, third_k, "3");
-    std::array<std::string_view, 3> const grown {first_k, third_k, second_k};
-    failures += expect_scan(fixture, shared_k, grown);
-
-    failures += erase_one(fixture, third_k);
-    failures += erase_one(fixture, second_k);
-    failures += expect_scan(fixture, shared_k, alone);
-
-    // The surviving entry still reads back, so shrinking rewrote the bucket rather than truncating it
-    strings_batch_t probe;
-    probe.assign(first_k, "");
-    read_results_t results;
-    failures += read_batch(fixture, probe, results);
-    failures += expect(results.present(0) && results.value_of(0) == std::string_view("1"));
-
-    failures += erase_one(fixture, first_k);
-    std::array<std::string_view, 0> const gone {};
-    failures += expect_scan(fixture, shared_k, gone);
-    failures += read_batch(fixture, probe, results);
-    failures += expect(!results.present(0));
-    return failures;
+/** Counts one failure when a scan of @p prefix through @p view, the head when it is null, does not list exactly
+ *  @p wanted, in that order, reporting only the first string out of place. */
+[[nodiscard]] std::size_t expect_listed(fixture_t& fixture, std::string_view prefix,
+                                        std::span<std::string_view const> wanted,
+                                        ustore_view_t view = nullptr) noexcept {
+    scan_results_t results;
+    std::size_t failures = scan_prefix(fixture, prefix, static_cast<ustore_length_t>(wanted.size() + 1), results, {},
+                                       view);
+    failures += expect_eq(static_cast<std::size_t>(results.count), wanted.size());
+    if (failures != 0) return failures;
+    for (std::size_t index = 0; index != wanted.size(); ++index)
+        if (results[index] != wanted[index]) return expect_eq(results[index], wanted[index]);
+    return 0;
 }
 
-/** A batch touching one bucket many times keeps only the last write of every string. */
-std::size_t strings_batched_bucket(config_t const& config) {
+/** Ten thousand strings sharing their leading 15 bytes, so every head ties, each keep a value of their own, and a
+ *  read and a walk find each, also once half of them are removed; a batch naming one string twice keeps its last
+ *  write. */
+std::size_t strings_shared_heads(config_t const& config) {
     std::size_t failures = 0;
     fixture_t fixture {config};
     if (!fixture.ready()) return failures + 1;
 
+    constexpr std::size_t count_k = 10'000;
+    constexpr std::size_t batch_k = 1'000;
     constexpr std::string_view shared_k = "shared-prefix!!";
-    strings_batch_t batch;
-    batch.assign("shared-prefix!!a", "stale");
-    batch.assign("shared-prefix!!b", "kept");
-    batch.assign("shared-prefix!!a", "fresh");
-    failures += write_batch(fixture, batch);
+    // A hundred bytes of value per string put the strings of the one head past a megabyte together
+    std::vector<std::string> texts(count_k);
+    std::vector<std::string> values(count_k);
+    std::vector<std::string_view> text_views(count_k);
+    std::vector<std::string_view> value_views(count_k);
+    for (std::size_t index = 0; index != count_k; ++index) {
+        texts[index] = fmt::format("{}{:05}", shared_k, index);
+        values[index] = fmt::format("{:0>100}", index);
+        text_views[index] = texts[index];
+        value_views[index] = values[index];
+    }
+    std::span<std::string_view const> const all_texts {text_views};
+    std::span<std::string_view const> const all_values {value_views};
+    for (std::size_t first = 0; first != count_k; first += batch_k) {
+        ustore_outcome_t outcome = write_strings(fixture, all_texts.subspan(first, batch_k),
+                                                 all_values.subspan(first, batch_k));
+        failures += expect_success(outcome);
+    }
+    for (std::size_t first = 0; first != count_k && failures == 0; first += batch_k) {
+        read_results_t results;
+        failures += read_strings(fixture, all_texts.subspan(first, batch_k), results);
+        for (std::size_t index = 0; index != batch_k && failures == 0; ++index)
+            failures += expect(results.present(index) && results.value_of(index) == value_views[first + index]);
+    }
+    failures += expect_listed(fixture, shared_k, all_texts);
 
-    strings_batch_t probe;
-    probe.assign("shared-prefix!!a", "");
-    probe.assign("shared-prefix!!b", "");
+    std::array<std::string_view, 3> const twice {text_views[0], text_views[1], text_views[0]};
+    std::array<std::string_view, 3> const rewrites {"stale", "kept", "fresh"};
+    ustore_outcome_t rewritten = write_strings(fixture, twice, rewrites);
+    failures += expect_success(rewritten);
     read_results_t results;
-    failures += read_batch(fixture, probe, results);
+    failures += read_strings(fixture, std::span {twice}.first(2), results);
     failures += expect(results.present(0) && results.value_of(0) == std::string_view("fresh"));
     failures += expect(results.present(1) && results.value_of(1) == std::string_view("kept"));
 
-    std::array<std::string_view, 2> const ordered {"shared-prefix!!a", "shared-prefix!!b"};
-    failures += expect_scan(fixture, shared_k, ordered);
+    // Every odd string goes, and the even ones stay listed, in order
+    std::vector<std::string_view> odd;
+    std::vector<std::string_view> even;
+    for (std::size_t index = 0; index != count_k; ++index) (index % 2 ? odd : even).push_back(text_views[index]);
+    failures += erase_strings(fixture, odd);
+    failures += expect_listed(fixture, shared_k, even);
+    failures += read_strings(fixture, std::span {odd}.first(2), results);
+    failures += expect(!results.present(0) && !results.present(1));
+    return failures;
+}
+
+/** Two transactions writing two long strings of one head both commit, as every string is watched on its own, while of
+ *  two transactions writing one string the later commit fails. */
+std::size_t strings_one_head_two_writers(config_t const& config) {
+    std::size_t failures = 0;
+    fixture_t fixture {config};
+    if (!fixture.ready()) return failures + 1;
+
+    std::string const first_text = std::string {"shared-prefix!!"} + std::string(40, 'a');
+    std::string const second_text = std::string {"shared-prefix!!"} + std::string(40, 'b');
+    std::array<std::string_view, 1> const first {first_text};
+    std::array<std::string_view, 1> const second {second_text};
+    std::array<std::string_view, 1> const one {"one"};
+    std::array<std::string_view, 1> const two {"two"};
+
+    // Each transaction reads its string before writing it, so the read is watched as well as the write
+    transaction_holder_t first_writer;
+    transaction_holder_t second_writer;
+    failures += begin_transaction(fixture, first_writer) + begin_transaction(fixture, second_writer);
+    if (failures != 0) return failures;
+    read_results_t results;
+    failures += read_strings(fixture, first, results,
+                             ustore_transaction_view(first_writer.transaction, ustore_watch_keys_k));
+    failures += expect(!results.present(0));
+    failures += read_strings(fixture, second, results,
+                             ustore_transaction_view(second_writer.transaction, ustore_watch_keys_k));
+    failures += expect(!results.present(0));
+    ustore_outcome_t outcome = write_strings(fixture, first, one, first_writer.transaction);
+    failures += expect_success(outcome);
+    outcome = write_strings(fixture, second, two, second_writer.transaction);
+    failures += expect_success(outcome);
+    // A walk through a transaction lists its own writes, and nothing another transaction has not committed
+    failures += expect_listed(fixture, "shared-prefix!!", first,
+                              ustore_transaction_view(first_writer.transaction, ustore_watch_keys_k));
+    outcome = commit_transaction(fixture, first_writer.transaction);
+    failures += expect_success(outcome);
+    outcome = commit_transaction(fixture, second_writer.transaction);
+    failures += expect_success(outcome);
+
+    std::array<std::string_view, 2> const both {first_text, second_text};
+    failures += read_strings(fixture, both, results);
+    failures += expect(results.present(0) && results.value_of(0) == std::string_view("one"));
+    failures += expect(results.present(1) && results.value_of(1) == std::string_view("two"));
+
+    transaction_holder_t earlier;
+    transaction_holder_t later;
+    failures += begin_transaction(fixture, earlier) + begin_transaction(fixture, later);
+    if (failures != 0) return failures;
+    outcome = write_strings(fixture, first, two, later.transaction);
+    failures += expect_success(outcome);
+    outcome = write_strings(fixture, first, one, earlier.transaction);
+    failures += expect_success(outcome);
+    outcome = commit_transaction(fixture, earlier.transaction);
+    failures += expect_success(outcome);
+    outcome = commit_transaction(fixture, later.transaction);
+    failures += expect_failure(outcome);
+    failures += read_strings(fixture, first, results);
+    failures += expect(results.present(0) && results.value_of(0) == std::string_view("one"));
+    return failures;
+}
+
+/** A string of 64 KiB is a key like any other, beside a shorter one of the same head: it reads back, a walk of a prefix
+ *  lists it whole, and a removal takes it away. */
+std::size_t strings_long_string(config_t const& config) {
+    std::size_t failures = 0;
+    fixture_t fixture {config};
+    if (!fixture.ready()) return failures + 1;
+
+    std::string long_text(64 * 1024, '\0');
+    for (std::size_t index = 0; index != long_text.size(); ++index)
+        long_text[index] = static_cast<char>('a' + index % 26);
+    std::string const short_text = long_text.substr(0, 20);
+    std::array<std::string_view, 2> const texts {long_text, short_text};
+    std::array<std::string_view, 2> const values {"long", "short"};
+    ustore_outcome_t outcome = write_strings(fixture, texts, values);
+    failures += expect_success(outcome);
+
+    read_results_t results;
+    failures += read_strings(fixture, texts, results);
+    failures += expect(results.present(0) && results.value_of(0) == std::string_view("long"));
+    failures += expect(results.present(1) && results.value_of(1) == std::string_view("short"));
+
+    // A prefix within the head lists both, the shorter first, and a prefix far past the head the long one alone
+    std::array<std::string_view, 2> const ordered {short_text, long_text};
+    failures += expect_listed(fixture, std::string_view {long_text}.substr(0, 10), ordered);
+    std::array<std::string_view, 1> const alone {long_text};
+    failures += expect_listed(fixture, std::string_view {long_text}.substr(0, 40 * 1024), alone);
+
+    failures += erase_one(fixture, long_text);
+    failures += read_strings(fixture, texts, results);
+    failures += expect(!results.present(0));
+    failures += expect(results.present(1) && results.value_of(1) == std::string_view("short"));
+    std::array<std::string_view, 1> const left {short_text};
+    failures += expect_listed(fixture, std::string_view {long_text}.substr(0, 10), left);
     return failures;
 }
 
@@ -482,8 +649,9 @@ int main(int argc, char** argv) {
     report(totals, "strings.shared_prefix", strings_shared_prefix, config);
     report(totals, "strings.empty_and_embedded_zero", strings_empty_and_embedded_zero, config);
     report(totals, "strings.update_and_remove", strings_update_and_remove, config);
-    report(totals, "strings.bucket_growth", strings_bucket_growth, config);
-    report(totals, "strings.batched_bucket", strings_batched_bucket, config);
+    report(totals, "strings.shared_heads", strings_shared_heads, config);
+    report(totals, "strings.one_head_two_writers", strings_one_head_two_writers, config);
+    report(totals, "strings.long_string", strings_long_string, config);
     report(totals, "strings.scan_pagination", strings_scan_pagination, config);
 
     return suite_exit_code(totals);

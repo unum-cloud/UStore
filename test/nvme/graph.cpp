@@ -2,939 +2,483 @@
  *  @file test/nvme/graph.cpp
  *  @author Ash Vardanian
  *  @date September 19, 2026
- *  @brief A graph over two single-collection databases: what a walk sees, and what a commit shows.
+ *  @brief The graph store of the NVMe engine through the C ABI: one vertex past the old value bound, transactions
+ *      adding edges to one vertex side by side, vertex removal, and reads through merges, flushes, compactions and a
+ *      reopen, checked against a model.
  *
- *  The results this file exists for are @c commit_shows_both_halves_or_neither and
- *  @c blocks_split_and_merge. A reader walking a vertex while a transaction lands must see all of that
- *  transaction's edges or none of them, and an adjacency that outgrows one block must break into several
- *  the registry still routes every neighbor through.
+ *  The results this file exists for are @c concurrent_adds_commit and @c fold_survives_maintenance. Transactions
+ *  adding edges to one vertex append change records rather than rewrite it, so every one of them commits, and the
+ *  records fold into the vertex wherever they lie, in memory, in a flushed run or at the bottom of the tree.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
 #include <cstddef> // `std::size_t`
-#include <cstdint> // `std::uint32_t`, `std::uint64_t`
+#include <cstdint> // `std::uint64_t`
+#include <cstring> // `std::strlen`
 
-#include <array>       // `std::array`
-#include <atomic>      // `std::memory_order`
-#include <memory>      // `std::unique_ptr`
-#include <new>         // `std::nothrow`
-#include <span>        // `std::span`
-#include <string_view> // `std::string_view`
-#include <thread>      // `std::thread`
-#include <utility>     // `std::move`
+#include <algorithm> // `std::sort`, `std::ranges::equal`
+#include <array>     // `std::array`
+#include <atomic>    // `std::atomic`
+#include <set>       // `std::set`
+#include <thread>    // `std::thread`
+#include <tuple>     // `std::tuple`
+#include <vector>    // `std::vector`
 
-#include <forkunion/atomics.hpp>       // `fu::preferred_atomic_ref`
-#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <fmt/format.h>
 
-#include "ustore/graph/nvme_graph.hpp" // `basic_graph_transaction`
+#include "ustore/ustore.hpp"
 
-#include "nvme/fixture.hpp" // `basic_fixture`, `run_on_transport`
+#include "harness.hpp" // `expect`, `expect_eq`, `report`, `suite_exit_code`, `directory_t`
 
-namespace unum::ustore::test {
-
-using namespace unum::ustore::blobs;
-using namespace unum::ustore::graph;
-using namespace unum::ustore::utilities;
+using namespace unum::ustore;
+using namespace unum::ustore::test;
 
 #pragma region Shape
 
-/** The numbers every case mounts with: channels for the graph, the case and every worker thread, two volumes each. */
-constexpr fixture_config_t graph_config_k {
-    .volume_bytes = 64ull * 1024ull * 1024ull,
-    .shared_io_channels = 16,
-    .memory_limit = std::size_t {512} * 1024 * 1024,
-};
+/** Edges one call of the hub case writes, so a batch stays one commit of bounded size. */
+constexpr std::size_t hub_batch_edges_k = 20'000;
 
-/** Threads the concurrency cases drive the graph on. */
-constexpr std::size_t worker_threads_k = 4;
+/** Edges the hub case leaves on one vertex: 9.6 MB of 48-byte half-edges, past the old 1 MiB value bound. */
+constexpr std::size_t hub_edges_k = 200'000;
 
-/** The graph and its transactions every case drives over the two volumes of @p fixture_type_. */
-template <typename fixture_type_>
-struct graph_types {
-    using fixture_t = fixture_type_;
-    using guard_t = typename fixture_t::guard_t;
-    using volume_t = typename fixture_t::volume_t;
-    using graph_store_t = basic_graph_store<volume_t>;
-    using graph_transaction_t = basic_graph_transaction<graph_store_t>;
+/** Threads the concurrency case adds edges to one vertex from. */
+constexpr std::size_t adding_threads_k = 4;
 
-    /** A fixture, the channel the calling thread reads on, and the two volumes a graph lives on. */
-    struct stack_t {
+/** Transactions every thread of the concurrency case commits. */
+constexpr std::size_t transactions_per_thread_k = 64;
 
-        /** The graph the two volumes carry. */
-        using store_t = graph_store_t;
+/** Vertices the maintenance case draws its edges between. */
+constexpr std::uint64_t model_vertices_k = 48;
 
-        /** The disk, the arena and the channels. */
-        std::unique_ptr<fixture_t> fixture;
+/** Edge identifiers the maintenance case draws from, so two vertices share parallel edges. */
+constexpr std::uint64_t model_edge_ids_k = 4;
 
-        /** The channel the calling thread reads on. */
-        guard_t reading;
+/** Calls the maintenance case makes, each a small commit of its own. */
+constexpr std::size_t model_calls_k = 3000;
 
-        /** The volume every registry lands on, pinned so a database may point at it. */
-        std::unique_ptr<volume_t> vertices_volume;
+/** Bytes every collection of the maintenance case buffers before it flushes, small enough to flush many times. */
+constexpr std::size_t small_write_buffer_bytes_k = 64 * 1024;
 
-        /** The volume every edge block lands on, pinned so a database may point at it. */
-        std::unique_ptr<volume_t> half_edges_volume;
+/** Parallel edges one round of the bottom case writes and then removes, a chain of 12 KiB per end. */
+constexpr std::size_t bottom_round_edges_k = 256;
 
-        /** The channel of the calling thread, which every read of this stack takes. */
-        [[nodiscard]] io_channel_t& channel() noexcept { return reading.channel(); }
-    };
-};
-
-/**
- *  @brief The bounds a case opens its graph with.
- *  @param[in] cache_limit Bytes each collection's value cache holds, which is zero to force every read.
- */
-[[nodiscard]] graph_store_config_t test_config(std::size_t cache_limit) noexcept {
-    graph_store_config_t config;
-    config.transaction_max_elements = 4096;
-    config.transaction_max_bytes = 4ull * 1024ull * 1024ull;
-    config.concurrency_limit = 1;
-    config.cache_limit = cache_limit;
-    config.write_buffer_max_elements = 4096;
-    config.write_buffer_max_bytes = 4ull * 1024ull * 1024ull;
-    config.level_enlarge_factor = 4;
-    config.value_max_size = 256ull * 1024ull;
-    return config;
-}
-
-/** The key spelling @p number, which orders among the others as the number does. */
-[[nodiscard]] constexpr id_entity_t key_of(std::uint64_t number) noexcept { return key_from_integer(number); }
-
-/** The edge of @p edge_id between @p first_id and @p second_id, which every case builds its graph from. */
-[[nodiscard]] labeled_edge_t made_edge(id_entity_t edge_id, id_entity_t first_id, id_entity_t second_id, float weight,
-                                       std::int32_t label, direction_t direction) noexcept {
-    labeled_edge_t edge;
-    edge.id = edge_id;
-    edge.first = first_id;
-    edge.second = second_id;
-    edge.weight = weight;
-    edge.label.raw = label;
-    edge.direction = direction;
-    return edge;
-}
-
-/** The directed edge of @p edge_id from @p first_id to @p second_id, weighted and labeled by its own number. */
-[[nodiscard]] labeled_edge_t plain_edge(id_entity_t edge_id, id_entity_t first_id, id_entity_t second_id) noexcept {
-    return made_edge(edge_id, first_id, second_id, 1.0f, 1, direction_t::directed_k);
-}
+/** Rounds the bottom case runs, whose removals take 768 KiB of half-edge records unless the bottom applies them. */
+constexpr std::size_t bottom_rounds_k = 32;
 
 #pragma endregion Shape
 
-#pragma region Fixtures
+#pragma region Helpers
 
-/** Mounts a fixture through @p mount, takes the channel a case reads on and formats the two volumes a graph needs. */
-template <typename mount_type_>
-expected<std::unique_ptr<typename graph_types<typename mount_type_::fixture_t>::stack_t>> make_stack(
-    mount_type_ const& mount) noexcept {
-    using types_t = graph_types<typename mount_type_::fixture_t>;
-    using stack_t = typename types_t::stack_t;
-    using volume_t = typename types_t::volume_t;
-    auto stack = std::unique_ptr<stack_t> {new (std::nothrow) stack_t {}};
-    if (!stack) return status_t {status_code_t::out_of_memory_k, "The stack did not fit"};
-
-    expected<std::unique_ptr<typename types_t::fixture_t>> fixture = mount();
-    if (!fixture) return fixture.status();
-    stack->fixture = std::move(*fixture);
-
-    expected<typename types_t::guard_t> reading = stack->fixture->channels.acquire();
-    if (!reading) return reading.status();
-    stack->reading = std::move(*reading);
-
-    expected<volume_t> vertices = stack->fixture->mount_volume(stack->reading.channel(), 0);
-    if (!vertices) return vertices.status();
-    stack->vertices_volume = std::unique_ptr<volume_t> {new (std::nothrow) volume_t {std::move(*vertices)}};
-    if (!stack->vertices_volume) return status_t {status_code_t::out_of_memory_k, "The volume did not fit"};
-
-    expected<volume_t> half_edges = stack->fixture->mount_volume(stack->reading.channel(), 1);
-    if (!half_edges) return half_edges.status();
-    stack->half_edges_volume = std::unique_ptr<volume_t> {new (std::nothrow) volume_t {std::move(*half_edges)}};
-    if (!stack->half_edges_volume) return status_t {status_code_t::out_of_memory_k, "The volume did not fit"};
-    return stack;
+/** Opens the NVMe engine over @p directory, every collection flushing past @p write_buffer_bytes when not zero, every
+ *  level @p enlarge_factor times the one above, and every value @p value_size bytes when not zero. */
+expected<database_t> open_nvme(char const* directory, std::size_t write_buffer_bytes = 0,
+                               std::size_t enlarge_factor = 0, std::size_t value_size = 0) noexcept {
+    ustore_database_t database = nullptr;
+    ustore_outcome_t outcome {};
+    ustore_database_open_nvme_t open {};
+    open.database = &database;
+    open.outcome = &outcome;
+    open.directory = {reinterpret_cast<ustore_byte_t const*>(directory), std::strlen(directory)};
+    if (write_buffer_bytes) {
+        open.collection_write_buffer_max_bytes = write_buffer_bytes;
+        open.collection_value_max_size = write_buffer_bytes / 4;
+        open.transaction_max_bytes = write_buffer_bytes / 2;
+    }
+    open.collection_level_enlarge_factor = enlarge_factor;
+    open.collection_value_size = value_size;
+    ustore_database_open_nvme(&open);
+    if (status_t const status {outcome}; status.failed()) return status;
+    return database_t {database};
 }
 
-/** Opens a graph over the two volumes and the channels of @p stack. */
-template <typename stack_type_>
-expected<typename stack_type_::store_t::graph_store_unique_ptr_t> open_over(
-    stack_type_& stack, graph_store_config_t const& config) noexcept {
-    return stack_type_::store_t::open(*stack.vertices_volume, *stack.half_edges_volume, stack.fixture->channels, config,
-                                      stack.fixture->resources);
+/** The edge from @p source to @p target named @p id, each spelled as the key of that integer. */
+constexpr edge_t edge_of(std::uint64_t source, std::uint64_t target, std::uint64_t id) noexcept {
+    return {key_from_integer(source), key_from_integer(target), key_from_integer(id)};
 }
 
-#pragma endregion Fixtures
+/** Views @p edges as the columns the graph calls take. */
+edges_view_t edges_of(std::vector<edge_t> const& edges) noexcept {
+    return edges_view_t(edges.data(), edges.data() + edges.size());
+}
 
-#pragma region Inspection
-
-/** Reads the registry of @p vertex_id straight out of the vertices database. */
-template <typename graph_store_type_>
-[[nodiscard]] std::size_t read_registry(graph_store_type_& store, io_channel_t& channel, id_entity_t vertex_id,
-                                        vertex_registry_t& into) {
-    std::size_t failures = 0;
-    vertex_batch_t vertices;
-    failures += expect(vertices.request(vertex_id).succeeded());
-    failures += expect(vertices.resolve(store.vertices(), channel).succeeded());
-    vertex_entry_t const* const entry = vertices.find(vertex_id);
-    failures += expect(entry != nullptr && is_live(entry->state));
-    if (failures != 0) return failures;
-    into.clear();
-    into.vertex_info = entry->record.vertex_info;
-    for (std::size_t index = 0; index != entry->record.size(); ++index)
-        failures += expect(into.upsert(entry->record[index]).succeeded());
+/** Answers whether @p graph reports @p wanted as the degree of @p vertex in @p role. */
+std::size_t expect_degree(graph_collection_t& graph, std::uint64_t vertex, ustore_vertex_degree_t wanted,
+                          ustore_vertex_role_t role = ustore_vertex_role_any_k) {
+    auto [degree, degree_status] = graph.degree(key_from_integer(vertex), role);
+    std::size_t failures = expect(degree_status.succeeded());
+    if (degree_status.succeeded()) failures += expect_eq(degree, wanted);
     return failures;
 }
 
-/** Reads every edge block of @p vertex_id and lists the neighbors it carries, block by block. */
-template <typename graph_store_type_>
-[[nodiscard]] std::size_t read_neighbors_in_order(graph_store_type_& store, io_channel_t& channel,
-                                                  id_entity_t vertex_id, st::basic_vector<id_entity_t>& into) {
-    std::size_t failures = 0;
-    vertex_registry_t registry;
-    failures += read_registry(store, channel, vertex_id, registry);
-    if (failures != 0) return failures;
+#pragma endregion Helpers
 
-    edge_block_batch_t blocks;
-    for (id_entity_t const first_neighbor : registry.first_neighbors)
-        failures += expect(blocks.request(id_chunk_t {vertex_id, first_neighbor}).succeeded());
-    failures += expect(blocks.resolve(store.half_edges(), channel).succeeded());
-    if (failures != 0) return failures;
-
-    into.clear();
-    for (std::size_t index = 0; index != blocks.size(); ++index) {
-        edge_block_entry_t const& entry = blocks[index];
-        failures += expect(is_live(entry.state));
-        if (!is_live(entry.state)) continue;
-        // Every block is keyed by its own first neighbor, and every block orders after the one before it.
-        failures += expect_eq(entry.record.neighbor_ids.front(), entry.stored_key.chunk);
-        failures += expect(entry.record.correct_order());
-        failures += expect(entry.record.size() <= edge_block_t::max_count_k);
-        for (id_entity_t const neighbor : entry.record.neighbor_ids)
-            failures += expect(into.push_back(id_entity_t {neighbor}) == st::status_t::success_k);
-    }
-    return failures;
-}
-
-/** What a walk of one vertex saw: the neighbors its blocks carry, and the blocks nothing answered. */
-struct walk_t {
-
-    /** Half-edges the blocks the registry names carry together. */
-    std::size_t neighbors = 0;
-
-    /** Blocks the registry names that the half-edges database does not hold. */
-    std::size_t missing_blocks = 0;
-};
-
-/** Reads the registry of @p vertex_id and then every edge block it names, exactly as a graph call does. */
-template <typename graph_store_type_>
-status_t walk_vertex(graph_store_type_& store, io_channel_t& channel, id_entity_t vertex_id, walk_t& into) {
-    into = walk_t {};
-    vertex_batch_t vertices;
-    if (status_t const named = vertices.request(vertex_id); named.failed()) return named;
-    if (status_t const read = vertices.resolve(store.vertices(), channel); read.failed()) return read;
-    vertex_entry_t const* const entry = vertices.find(vertex_id);
-    if (!entry || !is_live(entry->state)) return {};
-
-    edge_block_batch_t blocks;
-    for (id_entity_t const first_neighbor : entry->record.first_neighbors)
-        if (status_t const named = blocks.request(id_chunk_t {vertex_id, first_neighbor}); named.failed()) return named;
-    if (status_t const read = blocks.resolve(store.half_edges(), channel); read.failed()) return read;
-    for (std::size_t index = 0; index != blocks.size(); ++index) {
-        if (!is_live(blocks[index].state)) ++into.missing_blocks;
-        else into.neighbors += blocks[index].record.size();
-    }
-    return {};
-}
-
-/** Whether @p first and @p second hold the same edges in the same order. */
-[[nodiscard]] std::size_t expect_same_edges(edges_set_t const& first, edges_set_t const& second) {
-    std::size_t failures = expect_eq(first.size(), second.size());
-    if (failures != 0) return failures;
-    auto left = first.begin();
-    auto right = second.begin();
-    for (; left != first.end(); ++left, ++right) failures += expect(labeled_edge_t::equals(*left, *right));
-    return failures;
-}
-
-#pragma endregion Inspection
-
-#pragma region Round Trip Cases
-
-/** Vertices, directed edges and undirected ones come back with their weights, labels and roles. */
-template <typename mount_type_>
-std::size_t vertices_and_edges_round_trip(mount_type_ const& mount) {
-    using types_t = graph_types<typename mount_type_::fixture_t>;
-    using graph_store_t = typename types_t::graph_store_t;
-    using stack_t = typename types_t::stack_t;
-    std::size_t failures = 0;
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    failures += expect_status(stack, status_code_t::success_k);
-    if (!stack) return failures;
-    expected<typename graph_store_t::graph_store_unique_ptr_t> store = open_over(**stack,
-                                                                                 test_config(1024ull * 1024ull));
-    failures += expect(store.has_value());
-    if (!store) return failures;
-    io_channel_t& channel = (*stack)->channel();
-
-    std::array<vertex_t, 5> wanted {};
-    for (std::size_t index = 0; index != wanted.size(); ++index) {
-        wanted[index].id = key_of(index + 1);
-        wanted[index].weight = 0.5f * static_cast<float>(index + 1);
-        wanted[index].label.raw = static_cast<std::int32_t>(index + 10);
-    }
-    std::size_t created = 0;
-    failures += expect(
-        (*store)->access().upsert_vertices(channel, std::span<vertex_t const> {wanted}, created).succeeded());
-    failures += expect_eq(created, wanted.size());
-
-    for (vertex_t const& vertex : wanted) {
-        vertex_t seen;
-        failures += expect((*store)->access().find_vertex(channel, vertex.id, seen).succeeded());
-        failures += expect_eq(seen.id, vertex.id);
-        failures += expect_near(seen.weight, vertex.weight);
-        failures += expect_eq(seen.label.raw, vertex.label.raw);
-    }
-    vertex_t missing;
-    failures += expect_status((*store)->access().find_vertex(channel, key_of(99), missing), status_code_t::not_found_k);
-
-    std::array<labeled_edge_t, 3> edges {
-        made_edge(key_of(100), key_of(1), key_of(2), 2.5f, 7, direction_t::directed_k),
-        made_edge(key_of(101), key_of(3), key_of(4), 1.5f, 8, direction_t::undirected_k),
-        made_edge(key_of(102), key_of(2), key_of(3), 3.5f, 9, direction_t::directed_k),
-    };
-    graph_change_t changed;
-    failures += expect(
-        (*store)->access().upsert_edges(channel, std::span<labeled_edge_t const> {edges}, changed).succeeded());
-    failures += expect_eq(changed.edges, std::size_t {3});
-    failures += expect_eq(changed.vertices, std::size_t {0});
-
-    // Writing the very same edges again changes their weights and labels but adds nothing.
-    failures += expect(
-        (*store)->access().upsert_edges(channel, std::span<labeled_edge_t const> {edges}, changed).succeeded());
-    failures += expect_eq(changed.edges, std::size_t {0});
-
-    std::size_t degree = 0;
-    failures += expect((*store)->access().degree(channel, key_of(1), any_role_k, degree).succeeded());
-    failures += expect_eq(degree, std::size_t {1});
-    failures += expect((*store)->access().degree(channel, key_of(2), any_role_k, degree).succeeded());
-    failures += expect_eq(degree, std::size_t {2});
-    failures += expect((*store)->access().degree(channel, key_of(5), any_role_k, degree).succeeded());
-    failures += expect_eq(degree, std::size_t {0});
-
-    // The source of a directed edge sees it as a source, and the medium sees the very same edge as a medium.
-    edges_set_t outgoing;
-    failures += expect((*store)->access().edges_containing(channel, key_of(1), dedge_source_k, outgoing).succeeded());
-    failures += expect_eq(outgoing.size(), std::size_t {1});
-    if (outgoing.size() == 1) {
-        labeled_edge_t const& seen = *outgoing.begin();
-        failures += expect_eq(seen.id, key_of(100));
-        failures += expect_eq(seen.first, key_of(1));
-        failures += expect_eq(seen.second, key_of(2));
-        failures += expect_near(seen.weight, 2.5f);
-        failures += expect_eq(seen.label.raw, 7);
-        failures += expect(seen.direction == direction_t::directed_k);
-    }
-    edges_set_t incoming;
-    failures += expect((*store)->access().edges_containing(channel, key_of(2), dedge_target_k, incoming).succeeded());
-    failures += expect_eq(incoming.size(), std::size_t {1});
-    if (incoming.size() == 1) failures += expect_eq(incoming.begin()->id, key_of(100));
-    edges_set_t wrong_role;
-    failures += expect((*store)->access().edges_containing(channel, key_of(1), dedge_target_k, wrong_role).succeeded());
-    failures += expect_eq(wrong_role.size(), std::size_t {0});
-
-    // An undirected edge makes both of its ends plain members, whichever end is asked.
-    for (id_entity_t const member : {key_of(3), key_of(4)}) {
-        edges_set_t undirected;
-        failures += expect((*store)->access().edges_containing(channel, member, edge_member_k, undirected).succeeded());
-        failures += expect_eq(undirected.size(), std::size_t {1});
-        if (undirected.size() != 1) continue;
-        labeled_edge_t const& seen = *undirected.begin();
-        failures += expect_eq(seen.id, key_of(101));
-        failures += expect(seen.direction == direction_t::undirected_k);
-        failures += expect_eq(seen.first, key_of(3));
-        failures += expect_eq(seen.second, key_of(4));
-        failures += expect_near(seen.weight, 1.5f);
-    }
-
-    vertex_ids_set_t neighbors;
-    std::array<id_entity_t, 1> const second {key_of(2)};
-    failures += expect(
-        (*store)->access().neighbors(channel, std::span<id_entity_t const> {second}, neighbors).succeeded());
-    failures += expect_eq(neighbors.size(), std::size_t {2});
-    failures += expect(neighbors.find(key_of(1)) != nullptr);
-    failures += expect(neighbors.find(key_of(3)) != nullptr);
-
-    // Either end of a pair answers the lookup, and both answer the same edge.
-    edges_set_t forward;
-    edges_set_t backward;
-    failures += expect(
-        (*store)->access().edges_between(channel, key_of(1), any_role_k, key_of(2), any_role_k, forward).succeeded());
-    failures += expect(
-        (*store)->access().edges_between(channel, key_of(2), any_role_k, key_of(1), any_role_k, backward).succeeded());
-    failures += expect_same_edges(forward, backward);
-    failures += expect_eq(forward.size(), std::size_t {1});
-
-    // Removing an edge takes it out from under both of its ends, and leaves the vertices behind.
-    graph_change_t removed;
-    failures += expect(
-        (*store)->access().remove_edges(channel, std::span<labeled_edge_t const> {&edges[0], 1}, removed).succeeded());
-    failures += expect_eq(removed.edges, std::size_t {1});
-    failures += expect((*store)->access().degree(channel, key_of(1), any_role_k, degree).succeeded());
-    failures += expect_eq(degree, std::size_t {0});
-    failures += expect((*store)->access().degree(channel, key_of(2), any_role_k, degree).succeeded());
-    failures += expect_eq(degree, std::size_t {1});
-    vertex_t still_there;
-    failures += expect((*store)->access().find_vertex(channel, key_of(1), still_there).succeeded());
-    return failures;
-}
-
-/** Removing a vertex takes every edge that touched it, from both sides. */
-template <typename mount_type_>
-std::size_t removing_a_vertex_takes_its_edges(mount_type_ const& mount) {
-    using types_t = graph_types<typename mount_type_::fixture_t>;
-    using graph_store_t = typename types_t::graph_store_t;
-    using stack_t = typename types_t::stack_t;
-    std::size_t failures = 0;
-    constexpr std::size_t spokes_k = 40;
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    failures += expect_status(stack, status_code_t::success_k);
-    if (!stack) return failures;
-    expected<typename graph_store_t::graph_store_unique_ptr_t> store = open_over(**stack,
-                                                                                 test_config(1024ull * 1024ull));
-    failures += expect(store.has_value());
-    if (!store) return failures;
-    io_channel_t& channel = (*stack)->channel();
-
-    st::basic_vector<labeled_edge_t> edges;
-    failures += expect(edges.resize(spokes_k) == st::status_t::success_k);
-    if (failures != 0) return failures;
-    for (std::size_t index = 0; index != spokes_k; ++index)
-        edges[index] = plain_edge(key_of(1000 + index), key_of(1), key_of(index + 2));
-
-    graph_change_t changed;
-    failures += expect(
-        (*store)->access().upsert_edges(channel, std::span<labeled_edge_t const> {edges}, changed).succeeded());
-    failures += expect_eq(changed.edges, spokes_k);
-    failures += expect_eq(changed.vertices, spokes_k + 1);
-
-    std::array<id_entity_t, 1> const hub {key_of(1)};
-    graph_change_t removed;
-    failures += expect(
-        (*store)->access().remove_vertices(channel, std::span<id_entity_t const> {hub}, removed).succeeded());
-    failures += expect_eq(removed.vertices, std::size_t {1});
-    failures += expect_eq(removed.edges, spokes_k);
-
-    vertex_t gone;
-    failures += expect_status((*store)->access().find_vertex(channel, key_of(1), gone), status_code_t::not_found_k);
-    for (std::size_t index = 0; index != spokes_k; ++index) {
-        std::size_t degree = 1;
-        failures += expect((*store)->access().degree(channel, key_of(index + 2), any_role_k, degree).succeeded());
-        failures += expect_eq(degree, std::size_t {0});
-    }
-    return failures;
-}
-
-#pragma endregion Round Trip Cases
-
-#pragma region Block Cases
-
-/** An adjacency that outgrows one block breaks into several, and a removal folds them back together. */
-template <typename mount_type_>
-std::size_t blocks_split_and_merge(mount_type_ const& mount) {
-    using types_t = graph_types<typename mount_type_::fixture_t>;
-    using graph_store_t = typename types_t::graph_store_t;
-    using stack_t = typename types_t::stack_t;
-    std::size_t failures = 0;
-    constexpr std::size_t spokes_k = 600;
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    failures += expect_status(stack, status_code_t::success_k);
-    if (!stack) return failures;
-    expected<typename graph_store_t::graph_store_unique_ptr_t> store = open_over(**stack,
-                                                                                 test_config(1024ull * 1024ull));
-    failures += expect(store.has_value());
-    if (!store) return failures;
-    io_channel_t& channel = (*stack)->channel();
-
-    st::basic_vector<labeled_edge_t> edges;
-    failures += expect(edges.resize(spokes_k) == st::status_t::success_k);
-    if (failures != 0) return failures;
-    for (std::size_t index = 0; index != spokes_k; ++index)
-        edges[index] = plain_edge(key_of(1000 + index), key_of(1), key_of(index + 2));
-
-    graph_change_t changed;
-    failures += expect(
-        (*store)->access().upsert_edges(channel, std::span<labeled_edge_t const> {edges}, changed).succeeded());
-    failures += expect_eq(changed.edges, spokes_k);
-
-    vertex_registry_t registry;
-    failures += read_registry(**store, channel, key_of(1), registry);
-    failures += expect(registry.size() > std::size_t {1});
-    // A split aims at the optimal count, so the blocks stay packed rather than one per neighbor.
-    failures += expect(registry.size() <= 2 * (spokes_k / edge_block_t::optimal_count_k) + 1);
-
-    // Every neighbor is still there, once, and the blocks hand them over in neighbor order.
-    st::basic_vector<id_entity_t> walked;
-    failures += read_neighbors_in_order(**store, channel, key_of(1), walked);
-    failures += expect_eq(walked.size(), spokes_k);
-    for (std::size_t index = 0; index + 1 < walked.size(); ++index)
-        failures += expect(walked[index] < walked[index + 1]);
-    if (walked.size() == spokes_k) {
-        failures += expect_eq(walked.front(), key_of(2));
-        failures += expect_eq(walked.back(), key_of(spokes_k + 1));
-    }
-
-    std::size_t degree = 0;
-    failures += expect((*store)->access().degree(channel, key_of(1), any_role_k, degree).succeeded());
-    failures += expect_eq(degree, spokes_k);
-    std::size_t const blocks_before = registry.size();
-
-    // Keeping a couple of neighbors out of every block leaves each of them under its bound.
-    std::array<id_entity_t, 10> const kept {key_of(2),   key_of(3),   key_of(130), key_of(131), key_of(260),
-                                            key_of(261), key_of(400), key_of(401), key_of(550), key_of(551)};
-    st::basic_vector<labeled_edge_t> doomed;
-    for (std::size_t index = 0; index != spokes_k; ++index) {
-        id_entity_t const neighbor = key_of(index + 2);
-        bool spared = false;
-        for (id_entity_t const keep : kept) spared |= keep == neighbor;
-        if (spared) continue;
-        failures += expect(doomed.push_back(labeled_edge_t {edges[index]}) == st::status_t::success_k);
-    }
-    graph_change_t removed;
-    failures += expect(
-        (*store)->access().remove_edges(channel, std::span<labeled_edge_t const> {doomed}, removed).succeeded());
-    failures += expect_eq(removed.edges, spokes_k - kept.size());
-
-    // What is left fits in one block, so every under-full block took the one after it.
-    failures += read_registry(**store, channel, key_of(1), registry);
-    failures += expect(registry.size() < blocks_before);
-    failures += expect_eq(registry.size(), std::size_t {1});
-    failures += expect((*store)->access().degree(channel, key_of(1), any_role_k, degree).succeeded());
-    failures += expect_eq(degree, kept.size());
-
-    failures += read_neighbors_in_order(**store, channel, key_of(1), walked);
-    failures += expect_eq(walked.size(), kept.size());
-    for (std::size_t index = 0; index != walked.size() && index != kept.size(); ++index)
-        failures += expect_eq(walked[index], kept[index]);
-    return failures;
-}
-
-#pragma endregion Block Cases
-
-#pragma region Batch Cases
-
-/** Looking many vertex pairs up together answers exactly what looking each one up alone answers. */
-template <typename mount_type_>
-std::size_t batched_pairs_agree_with_single_ones(mount_type_ const& mount) {
-    using types_t = graph_types<typename mount_type_::fixture_t>;
-    using graph_store_t = typename types_t::graph_store_t;
-    using stack_t = typename types_t::stack_t;
-    std::size_t failures = 0;
-    constexpr std::size_t vertices_k = 200;
-    constexpr std::size_t edges_k = 600;
-    constexpr std::size_t pairs_k = 300;
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    failures += expect_status(stack, status_code_t::success_k);
-    if (!stack) return failures;
-    expected<typename graph_store_t::graph_store_unique_ptr_t> store = open_over(**stack,
-                                                                                 test_config(1024ull * 1024ull));
-    failures += expect(store.has_value());
-    if (!store) return failures;
-    io_channel_t& channel = (*stack)->channel();
-
-    st::basic_vector<labeled_edge_t> edges;
-    failures += expect(edges.resize(edges_k) == st::status_t::success_k);
-    if (failures != 0) return failures;
-    for (std::size_t index = 0; index != edges_k; ++index) {
-        id_entity_t const first = key_of(index % vertices_k + 1);
-        id_entity_t const second = key_of((index * 7 + 3) % vertices_k + 1);
-        edges[index] = made_edge(key_of(index + 1), first, second, 1.0f + 0.25f * (index % 4),
-                                 static_cast<std::int32_t>(index % 3) + 1,
-                                 index % 2 == 0 ? direction_t::directed_k : direction_t::undirected_k);
-    }
-    graph_change_t changed;
-    failures += expect(
-        (*store)->access().upsert_edges(channel, std::span<labeled_edge_t const> {edges}, changed).succeeded());
-    failures += expect((*store)->flush().succeeded());
-
-    st::basic_vector<id_entity_t> firsts;
-    st::basic_vector<id_entity_t> seconds;
-    failures += expect(firsts.resize(pairs_k) == st::status_t::success_k);
-    failures += expect(seconds.resize(pairs_k) == st::status_t::success_k);
-    if (failures != 0) return failures;
-    for (std::size_t pair = 0; pair != pairs_k; ++pair) {
-        firsts[pair] = key_of(pair % vertices_k + 1);
-        seconds[pair] = key_of((pair * 7 + 3) % vertices_k + 1);
-    }
-
-    edges_set_t batched;
-    failures += expect((*store)
-                           ->access()
-                           .edges_between(channel, std::span<id_entity_t const> {firsts},
-                                          std::span<id_entity_t const> {seconds}, batched)
-                           .succeeded());
-
-    edges_set_t alone;
-    for (std::size_t pair = 0; pair != pairs_k; ++pair)
-        failures += expect((*store)
-                               ->access()
-                               .edges_between(channel, firsts[pair], any_role_k, seconds[pair], any_role_k, alone)
-                               .succeeded());
-    failures += expect(batched.size() > std::size_t {0});
-    failures += expect_same_edges(batched, alone);
-    return failures;
-}
-
-/** A batched read of the edge blocks keeps as many requests in flight as the queue pair has credit for. */
-template <typename mount_type_>
-std::size_t batched_read_fills_the_queue_pair(mount_type_ const& mount) {
-    using types_t = graph_types<typename mount_type_::fixture_t>;
-    using graph_store_t = typename types_t::graph_store_t;
-    using stack_t = typename types_t::stack_t;
-    std::size_t failures = 0;
-    constexpr std::size_t spokes_k = 400;
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    failures += expect_status(stack, status_code_t::success_k);
-    if (!stack) return failures;
-    // No value cache, so every block of the batch is a request the medium has to answer.
-    expected<typename graph_store_t::graph_store_unique_ptr_t> store = open_over(**stack, test_config(0));
-    failures += expect(store.has_value());
-    if (!store) return failures;
-    io_channel_t& channel = (*stack)->channel();
-
-    st::basic_vector<labeled_edge_t> edges;
-    failures += expect(edges.resize(spokes_k) == st::status_t::success_k);
-    if (failures != 0) return failures;
-    for (std::size_t index = 0; index != spokes_k; ++index)
-        edges[index] = plain_edge(key_of(1000 + index), key_of(index * 2 + 2), key_of(index * 2 + 3));
-
-    graph_change_t changed;
-    failures += expect(
-        (*store)->access().upsert_edges(channel, std::span<labeled_edge_t const> {edges}, changed).succeeded());
-    failures += expect((*store)->flush().succeeded());
-
-    st::basic_vector<id_chunk_t> keys;
-    for (std::size_t index = 0; index != spokes_k; ++index) {
-        id_entity_t const vertex_id = key_of(index * 2 + 2);
-        vertex_registry_t registry;
-        failures += read_registry(**store, channel, vertex_id, registry);
-        for (id_entity_t const first_neighbor : registry.first_neighbors)
-            failures += expect(keys.push_back(id_chunk_t {vertex_id, first_neighbor}) == st::status_t::success_k);
-    }
-    failures += expect_eq(keys.size(), spokes_k);
-    if (failures != 0) return failures;
-
-    st::basic_vector<select_result_t> answers;
-    failures += expect(answers.resize(keys.size()) == st::status_t::success_k);
-    if (failures != 0) return failures;
-
-    std::uint32_t idlest = graph_config_k.request_buffers;
-    std::size_t arrivals = 0;
-    auto counting = [&](std::size_t, std::uint64_t, std::span<byte_t const>) noexcept {
-        ++arrivals;
-        std::uint32_t const free_blocks = channel.requests().available_buffers();
-        if (free_blocks < idlest) idlest = free_blocks;
-    };
-    failures += expect(
-        (*store)
-            ->half_edges()
-            .select(channel, std::span<id_chunk_t const> {keys}, std::span<select_result_t> {answers}, counting)
-            .succeeded());
-    failures += expect_eq(arrivals, keys.size());
-    for (select_result_t const answer : answers) failures += expect(answer == select_result_t::success_k);
-    failures += expect_eq(graph_config_k.request_buffers - idlest, graph_config_k.queue_depth);
-    return failures;
-}
-
-#pragma endregion Batch Cases
-
-#pragma region Durability Cases
-
-/** A graph closed and opened again over the same volumes holds every vertex and every edge it held. */
-template <typename mount_type_>
-std::size_t graph_survives_a_reopen(mount_type_ const& mount) {
-    using types_t = graph_types<typename mount_type_::fixture_t>;
-    using graph_store_t = typename types_t::graph_store_t;
-    using stack_t = typename types_t::stack_t;
-    std::size_t failures = 0;
-    constexpr std::size_t vertices_k = 120;
-    constexpr std::size_t edges_k = 400;
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    failures += expect_status(stack, status_code_t::success_k);
-    if (!stack) return failures;
-    graph_store_config_t const config = test_config(1024ull * 1024ull);
-
-    st::basic_vector<labeled_edge_t> edges;
-    failures += expect(edges.resize(edges_k) == st::status_t::success_k);
-    if (failures != 0) return failures;
-    for (std::size_t index = 0; index != edges_k; ++index)
-        edges[index] = made_edge(key_of(index + 1), key_of(index % vertices_k + 1),
-                                 key_of((index * 11 + 5) % vertices_k + 1), 2.0f,
-                                 static_cast<std::int32_t>(index % 3) + 1, direction_t::directed_k);
-
-    edges_set_t before;
-    {
-        expected<typename graph_store_t::graph_store_unique_ptr_t> store = open_over(**stack, config);
-        failures += expect(store.has_value());
-        if (!store) return failures;
-        io_channel_t& channel = (*stack)->channel();
-
-        graph_change_t changed;
-        failures += expect(
-            (*store)->access().upsert_edges(channel, std::span<labeled_edge_t const> {edges}, changed).succeeded());
-        // Two flushed rounds and a merge give the trees depth, so a reopen that lost one would lose keys.
-        failures += expect((*store)->flush().succeeded());
-        failures += expect(
-            (*store)
-                ->access()
-                .upsert_edges(channel, std::span<labeled_edge_t const> {edges.data(), edges.size() / 2}, changed)
-                .succeeded());
-        failures += expect((*store)->flush().succeeded());
-
-        for (std::size_t index = 0; index != vertices_k; ++index)
-            failures += expect(
-                (*store)->access().edges_containing(channel, key_of(index + 1), any_role_k, before).succeeded());
-        failures += expect(before.size() > std::size_t {0});
-        if (failures != 0) return failures;
-    }
-
-    expected<typename graph_store_t::graph_store_unique_ptr_t> store = open_over(**stack, config);
-    failures += expect(store.has_value());
-    if (!store) return failures;
-    io_channel_t& channel = (*stack)->channel();
-
-    edges_set_t after;
-    for (std::size_t index = 0; index != vertices_k; ++index)
-        failures += expect(
-            (*store)->access().edges_containing(channel, key_of(index + 1), any_role_k, after).succeeded());
-    failures += expect_same_edges(before, after);
-    return failures;
-}
-
-#pragma endregion Durability Cases
-
-#pragma region Transaction Cases
-
-/** A transaction spanning both databases is refused when another one wrote the vertex it read. */
-template <typename mount_type_>
-std::size_t conflicting_transactions_are_refused(mount_type_ const& mount) {
-    using types_t = graph_types<typename mount_type_::fixture_t>;
-    using graph_store_t = typename types_t::graph_store_t;
-    using graph_transaction_t = typename types_t::graph_transaction_t;
-    using stack_t = typename types_t::stack_t;
-    std::size_t failures = 0;
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    failures += expect_status(stack, status_code_t::success_k);
-    if (!stack) return failures;
-    expected<typename graph_store_t::graph_store_unique_ptr_t> store = open_over(**stack,
-                                                                                 test_config(1024ull * 1024ull));
-    failures += expect(store.has_value());
-    if (!store) return failures;
-    io_channel_t& channel = (*stack)->channel();
-
-    std::array<vertex_t, 1> const hub {vertex_t {key_of(1), 1.0f, label_t {1}}};
-    std::size_t created = 0;
-    failures += expect(
-        (*store)->access().upsert_vertices(channel, std::span<vertex_t const> {hub}, created).succeeded());
-
-    expected<typename graph_transaction_t::graph_transaction_unique_ptr_t> first = graph_transaction_t::begin(**store);
-    expected<typename graph_transaction_t::graph_transaction_unique_ptr_t> second = graph_transaction_t::begin(**store);
-    failures += expect(first.has_value());
-    failures += expect(second.has_value());
-    if (!first || !second) return failures;
-
-    labeled_edge_t const one = plain_edge(key_of(10), key_of(1), key_of(2));
-    labeled_edge_t const other = plain_edge(key_of(11), key_of(1), key_of(3));
-    graph_change_t changed;
-    failures += expect(
-        (*first)->access().upsert_edges(channel, std::span<labeled_edge_t const> {&one, 1}, changed).succeeded());
-    failures += expect(
-        (*second)->access().upsert_edges(channel, std::span<labeled_edge_t const> {&other, 1}, changed).succeeded());
-
-    failures += expect((*first)->commit().succeeded());
-    failures += expect_status((*second)->commit(), status_code_t::write_conflict_k);
-    (*second)->rollback();
-
-    std::size_t degree = 0;
-    failures += expect((*store)->access().degree(channel, key_of(1), any_role_k, degree).succeeded());
-    failures += expect_eq(degree, std::size_t {1});
-
-    // The refused transaction starts again from the rollback, so doing the work once more lands it.
-    failures += expect(
-        (*second)->access().upsert_edges(channel, std::span<labeled_edge_t const> {&other, 1}, changed).succeeded());
-    failures += expect((*second)->commit().succeeded());
-    failures += expect((*store)->access().degree(channel, key_of(1), any_role_k, degree).succeeded());
-    failures += expect_eq(degree, std::size_t {2});
-    return failures;
-}
+#pragma region Model
 
 /**
- *  @brief A walk of a vertex sees every edge one transaction landed on it, or none of them.
+ *  @brief What a graph holds after a run of calls, kept the plain way: its vertices and its edges.
  *
- *  A walk reads the registry before the blocks it names, so it waits behind whichever half of a commit
- *  has not landed; a count between zero and the whole batch would mean it read across the two databases.
+ *  An edge write creates both ends, a removal of edges keeps the vertices and touches only the ends present, and a
+ *  vertex removal takes every edge touching it.
  */
-template <typename mount_type_>
-std::size_t commit_shows_both_halves_or_neither(mount_type_ const& mount) {
-    using types_t = graph_types<typename mount_type_::fixture_t>;
-    using guard_t = typename types_t::guard_t;
-    using graph_store_t = typename types_t::graph_store_t;
-    using graph_transaction_t = typename types_t::graph_transaction_t;
-    using stack_t = typename types_t::stack_t;
+struct graph_model_t {
+    using triple_t = std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>;
+
+    std::set<std::uint64_t> vertices;
+    std::set<triple_t> edges;
+
+    void write_edge(std::uint64_t source, std::uint64_t target, std::uint64_t id) {
+        vertices.insert(source);
+        vertices.insert(target);
+        edges.insert({source, target, id});
+    }
+
+    void remove_edge(std::uint64_t source, std::uint64_t target, std::uint64_t id) {
+        edges.erase({source, target, id});
+    }
+
+    void remove_vertex(std::uint64_t vertex) {
+        vertices.erase(vertex);
+        for (auto iterator = edges.begin(); iterator != edges.end();)
+            if (std::get<0>(*iterator) == vertex || std::get<1>(*iterator) == vertex) iterator = edges.erase(iterator);
+            else ++iterator;
+    }
+
+    /** The degree of @p vertex in both roles, a loop counting once per role, or the missing degree. */
+    ustore_vertex_degree_t degree(std::uint64_t vertex) const {
+        if (!vertices.contains(vertex)) return ustore_vertex_degree_missing_k;
+        ustore_vertex_degree_t degree = 0;
+        for (triple_t const& edge : edges)
+            degree += (std::get<0>(edge) == vertex ? 1u : 0u) + (std::get<1>(edge) == vertex ? 1u : 0u);
+        return degree;
+    }
+
+    /** The edges leaving @p vertex in the order a read answers them: by target, then by identifier. */
+    std::vector<edge_t> outgoing(std::uint64_t vertex) const {
+        std::vector<edge_t> found;
+        for (triple_t const& edge : edges)
+            if (std::get<0>(edge) == vertex)
+                found.push_back(edge_of(std::get<0>(edge), std::get<1>(edge), std::get<2>(edge)));
+        std::sort(found.begin(), found.end(), [](edge_t const& first, edge_t const& second) {
+            if (first.target != second.target) return first.target < second.target;
+            return first.id < second.id;
+        });
+        return found;
+    }
+};
+
+/** Compares every vertex of the model's range with @p graph: presence, degree in one batched read, and the edges
+ *  leaving it. */
+std::size_t expect_model(graph_collection_t& graph, graph_model_t const& model, arena_t& arena) {
     std::size_t failures = 0;
-    constexpr std::size_t hubs_k = 200;
-    constexpr std::size_t spokes_k = 12;
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    failures += expect_status(stack, status_code_t::success_k);
-    if (!stack) return failures;
-    expected<typename graph_store_t::graph_store_unique_ptr_t> store = open_over(**stack,
-                                                                                 test_config(1024ull * 1024ull));
-    failures += expect(store.has_value());
-    if (!store) return failures;
-    io_channel_t& channel = (*stack)->channel();
-
-    st::basic_vector<vertex_t> hubs;
-    failures += expect(hubs.resize(hubs_k) == st::status_t::success_k);
-    if (failures != 0) return failures;
-    for (std::size_t index = 0; index != hubs_k; ++index) hubs[index].id = key_of(index + 1);
-    std::size_t created = 0;
-    failures += expect(
-        (*store)->access().upsert_vertices(channel, std::span<vertex_t const> {hubs}, created).succeeded());
-
-    // The writer says which hub it is landing, so the reader watches that one rather than sweeping them all.
-    std::int32_t landing = -1;
-    std::int32_t stop = 0;
-    std::size_t torn = 0;
-    std::size_t watched = 0;
-    std::size_t reader_failures = 0;
-    std::thread reader {[&]() noexcept {
-        expected<guard_t> guard = (*stack)->fixture->channels.acquire();
-        reader_failures += expect(guard.has_value());
-        if (!guard) return;
-        fu::preferred_atomic_ref<std::int32_t> const flag {stop};
-        fu::preferred_atomic_ref<std::int32_t> const hub {landing};
-        while (flag.load(std::memory_order_acquire) == 0) {
-            std::int32_t const watching = hub.load(std::memory_order_acquire);
-            if (watching < 0) continue;
-            walk_t walked;
-            if (walk_vertex(**store, guard->channel(), key_of(watching + 1), walked).failed()) {
-                ++reader_failures;
-                return;
-            }
-            ++watched;
-            // A registry naming a block the half-edges do not carry is half of a commit.
-            if (walked.missing_blocks != 0) ++torn;
-            if (walked.neighbors != 0 && walked.neighbors != spokes_k) ++torn;
-        }
-    }};
-
-    expected<typename graph_transaction_t::graph_transaction_unique_ptr_t> changing = graph_transaction_t::begin(
-        **store);
-    failures += expect(changing.has_value());
-    if (changing)
-        for (std::size_t hub = 0; hub != hubs_k; ++hub) {
-            st::basic_vector<labeled_edge_t> edges;
-            failures += expect(edges.resize(spokes_k) == st::status_t::success_k);
-            for (std::size_t spoke = 0; spoke != spokes_k; ++spoke)
-                edges[spoke] = plain_edge(key_of(hub * spokes_k + spoke + 1000), key_of(hub + 1),
-                                          key_of(hubs_k + hub * spokes_k + spoke + 1));
-            graph_change_t changed;
-            failures += expect((*changing)
-                                   ->access()
-                                   .upsert_edges(channel, std::span<labeled_edge_t const> {edges}, changed)
-                                   .succeeded());
-            fu::preferred_atomic_ref<std::int32_t> {landing}.store(static_cast<std::int32_t>(hub),
-                                                                   std::memory_order_release);
-            failures += expect((*changing)->commit().succeeded());
-        }
-
-    fu::preferred_atomic_ref<std::int32_t> {stop}.store(1, std::memory_order_release);
-    reader.join();
-    failures += reader_failures;
-    failures += expect(watched > std::size_t {0});
-    failures += expect_eq(torn, std::size_t {0});
-
-    for (std::size_t hub = 0; hub != hubs_k; ++hub) {
-        std::size_t degree = 0;
-        failures += expect((*store)->access().degree(channel, key_of(hub + 1), any_role_k, degree).succeeded());
-        failures += expect_eq(degree, spokes_k);
+    std::array<ustore_key_t, model_vertices_k> keys;
+    for (std::uint64_t vertex = 0; vertex != model_vertices_k; ++vertex) keys[vertex] = key_from_integer(vertex);
+    auto [degrees, degrees_status] = graph.degrees(strided(keys).immutable(), arena);
+    failures += expect(degrees_status.succeeded());
+    if (degrees_status.failed()) return failures;
+    for (std::uint64_t vertex = 0; vertex != model_vertices_k; ++vertex) {
+        failures += expect_eq(degrees[vertex], model.degree(vertex));
+        failures += expect_eq(*graph.present(keys[vertex]), model.vertices.contains(vertex));
+    }
+    for (std::uint64_t vertex = 0; vertex != model_vertices_k; ++vertex) {
+        auto [found, found_status] = graph.read_edges(keys[vertex], arena, ustore_vertex_role_source_k);
+        failures += expect(found_status.succeeded());
+        if (found_status.failed()) continue;
+        std::vector<edge_t> const wanted = model.outgoing(vertex);
+        failures += expect_eq(found.size(), wanted.size());
+        for (std::size_t index = 0; index != std::min(found.size(), wanted.size()); ++index)
+            failures += expect(found[index] == wanted[index]);
     }
     return failures;
 }
 
-#pragma endregion Transaction Cases
+#pragma endregion Model
 
-#pragma region Concurrency Cases
+#pragma region Cases
 
-/** Threads writing their own vertices and threads walking them leave every adjacency whole. */
-template <typename mount_type_>
-std::size_t threads_write_and_walk_together(mount_type_ const& mount) {
-    using types_t = graph_types<typename mount_type_::fixture_t>;
-    using guard_t = typename types_t::guard_t;
-    using graph_store_t = typename types_t::graph_store_t;
-    using stack_t = typename types_t::stack_t;
+/** One vertex with 200,000 half-edges, read whole in memory, from flushed runs, after compaction and after a reopen. */
+case_result_t hub_past_value_bound(char const* directory) {
+    if (!directory) return case_result_t::skipped(needs_directory_k);
     std::size_t failures = 0;
-    constexpr std::size_t rounds_k = 12;
-    constexpr std::size_t spokes_k = 8;
-    constexpr std::size_t stride_k = 1000;
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    failures += expect_status(stack, status_code_t::success_k);
-    if (!stack) return failures;
-    expected<typename graph_store_t::graph_store_unique_ptr_t> store = open_over(**stack,
-                                                                                 test_config(1024ull * 1024ull));
-    failures += expect(store.has_value());
-    if (!store) return failures;
+    path_t const home {directory, "hub"};
+    if (!recreate_directory(home.c_str())) return failures + 1;
 
-    std::array<std::size_t, worker_threads_k> worker_failures {};
-    std::array<std::thread, worker_threads_k> workers;
-    for (std::size_t worker = 0; worker != worker_threads_k; ++worker)
-        workers[worker] = std::thread {[&, worker]() noexcept {
-            expected<guard_t> guard = (*stack)->fixture->channels.acquire();
-            worker_failures[worker] += expect(guard.has_value());
-            if (!guard) return;
+    auto const check = [&](graph_collection_t& graph) {
+        std::size_t found_failures = expect_degree(graph, 0, hub_edges_k);
+        found_failures += expect_degree(graph, 0, hub_edges_k, ustore_vertex_role_source_k);
+        found_failures += expect_degree(graph, 0, 0, ustore_vertex_role_target_k);
+        found_failures += expect_degree(graph, 1, 1);
+        found_failures += expect_degree(graph, hub_edges_k, 1, ustore_vertex_role_target_k);
+        auto [arena, arena_status] = arena_t::make();
+        found_failures += expect(arena_status.succeeded());
+        if (arena_status.failed()) return found_failures;
+        auto [found, found_status] = graph.read_edges(key_from_integer(0), arena, ustore_vertex_role_source_k);
+        found_failures += expect(found_status.succeeded());
+        if (found_status.failed()) return found_failures;
+        found_failures += expect_eq(found.size(), hub_edges_k);
+        // Every half-edge of the hub is checked, so a single one lost or misordered fails the case once
+        bool ordered = found.size() == hub_edges_k;
+        for (std::size_t index = 0; ordered && index != hub_edges_k; ++index)
+            ordered = found[index] == edge_of(0, index + 1, index + 1);
+        found_failures += expect(ordered);
+        return found_failures;
+    };
 
-            // Each writer owns a range of its own, since two writers sharing a vertex need a transaction.
-            std::uint64_t const base_number = worker * stride_k + 1;
-            id_entity_t const base = key_of(base_number);
-            for (std::size_t round = 0; round != rounds_k; ++round) {
-                std::array<labeled_edge_t, spokes_k> edges {};
-                for (std::size_t spoke = 0; spoke != spokes_k; ++spoke)
-                    edges[spoke] = plain_edge(key_of(worker * stride_k + round * spokes_k + spoke + 1), base,
-                                              key_of(base_number + round * spokes_k + spoke + 1));
-                graph_change_t changed;
-                worker_failures[worker] += expect(
-                    (*store)
-                        ->access()
-                        .upsert_edges(guard->channel(), std::span<labeled_edge_t const> {edges}, changed)
-                        .succeeded());
-                worker_failures[worker] += expect_eq(changed.edges, spokes_k);
-
-                std::size_t degree = 0;
-                worker_failures[worker] += expect(
-                    (*store)->access().degree(guard->channel(), base, any_role_k, degree).succeeded());
-                worker_failures[worker] += expect_eq(degree, (round + 1) * spokes_k);
-            }
-        }};
-    for (std::size_t worker = 0; worker != worker_threads_k; ++worker) workers[worker].join();
-    for (std::size_t worker = 0; worker != worker_threads_k; ++worker) failures += worker_failures[worker];
-
-    io_channel_t& channel = (*stack)->channel();
-    for (std::size_t worker = 0; worker != worker_threads_k; ++worker) {
-        id_entity_t const base = key_of(worker * stride_k + 1);
-        std::size_t degree = 0;
-        failures += expect((*store)->access().degree(channel, base, any_role_k, degree).succeeded());
-        failures += expect_eq(degree, rounds_k * spokes_k);
-        st::basic_vector<id_entity_t> walked;
-        failures += read_neighbors_in_order(**store, channel, base, walked);
-        failures += expect_eq(walked.size(), rounds_k * spokes_k);
+    {
+        auto [database, open_status] = open_nvme(home.c_str());
+        failures += expect(open_status.succeeded());
+        if (failures) return failures;
+        auto [graph, graph_status] = database.create<graph_collection_t>("hub");
+        failures += expect(graph_status.succeeded());
+        if (failures) return failures;
+        std::vector<edge_t> batch;
+        for (std::size_t first = 0; first != hub_edges_k; first += hub_batch_edges_k) {
+            batch.clear();
+            for (std::size_t index = first; index != first + hub_batch_edges_k; ++index)
+                batch.push_back(edge_of(0, index + 1, index + 1));
+            status_t const written = graph.write_edges(edges_of(batch));
+            if (written.failed()) fmt::println(stderr, "  hub write: {}", written.message ? written.message : "");
+            failures += expect(written.succeeded());
+        }
+        failures += check(graph);
+        failures += expect(database.compact().succeeded());
+        failures += check(graph);
     }
+    auto [database, reopen_status] = open_nvme(home.c_str());
+    failures += expect(reopen_status.succeeded());
+    if (failures) return failures;
+    auto [graph, graph_status] = database.find<graph_collection_t>("hub");
+    failures += expect(graph_status.succeeded());
+    if (failures) return failures;
+    failures += check(graph);
     return failures;
 }
 
-#pragma endregion Concurrency Cases
+/** Transactions adding edges to one vertex commit side by side, interleaved on one thread and racing on several. */
+case_result_t concurrent_adds_commit(char const* directory) {
+    if (!directory) return case_result_t::skipped(needs_directory_k);
+    std::size_t failures = 0;
+    path_t const home {directory, "adds"};
+    if (!recreate_directory(home.c_str())) return failures + 1;
+    auto [database, open_status] = open_nvme(home.c_str());
+    failures += expect(open_status.succeeded());
+    if (failures) return failures;
+    auto [graph, graph_status] = database.create<graph_collection_t>("adds");
+    failures += expect(graph_status.succeeded());
+    if (failures) return failures;
+    std::array<ustore_key_t, 1> const hub {key_from_integer(0)};
+    failures += expect(graph.write_vertices(strided(hub)).succeeded());
 
-} // namespace unum::ustore::test
+    transaction_t first = *database.transaction();
+    transaction_t second = *database.transaction();
+    auto [first_graph, first_status] = first.find<graph_collection_t>("adds");
+    auto [second_graph, second_status] = second.find<graph_collection_t>("adds");
+    failures += expect(first_status.succeeded() && second_status.succeeded());
+    if (failures) return failures;
+    failures += expect(first_graph.write_edge(edge_of(0, 1, 1)).succeeded());
+    failures += expect(second_graph.write_edge(edge_of(0, 2, 2)).succeeded());
+    failures += expect(first.commit().has_value());
+    failures += expect(second.commit().has_value());
+    failures += expect_degree(graph, 0, 2);
+
+    // A transaction reads its own changes merged into the committed adjacency
+    transaction_t reading = *database.transaction();
+    auto [reading_graph, reading_status] = reading.find<graph_collection_t>("adds");
+    failures += expect(reading_status.succeeded());
+    if (failures) return failures;
+    failures += expect(reading_graph.write_edge(edge_of(3, 0, 3)).succeeded());
+    failures += expect_eq(*reading_graph.degree(key_from_integer(0)), 3u);
+    failures += expect_eq(*reading_graph.degree(key_from_integer(0), ustore_vertex_role_target_k), 1u);
+    failures += expect(reading.commit().has_value());
+    failures += expect_degree(graph, 0, 3);
+
+    std::atomic<std::size_t> refused {0};
+    std::vector<std::thread> threads;
+    for (std::size_t thread = 0; thread != adding_threads_k; ++thread)
+        threads.emplace_back([&, thread] {
+            for (std::size_t round = 0; round != transactions_per_thread_k; ++round) {
+                auto [transaction, begin_status] = database.transaction();
+                if (begin_status.failed()) {
+                    refused.fetch_add(1);
+                    continue;
+                }
+                auto [adding, adding_status] = transaction.find<graph_collection_t>("adds");
+                std::uint64_t const leaf = 1000 + thread * transactions_per_thread_k + round;
+                bool const committed = adding_status.succeeded() &&
+                                       adding.write_edge(edge_of(0, leaf, leaf)).succeeded() &&
+                                       transaction.commit().has_value();
+                if (!committed) refused.fetch_add(1);
+            }
+        });
+    for (std::thread& thread : threads) thread.join();
+    failures += expect_eq(refused.load(), 0u);
+    failures += expect_degree(graph, 0, 3 + adding_threads_k * transactions_per_thread_k);
+    return failures;
+}
+
+/** A removed vertex goes with every half-edge its neighbors filed of it, and a transaction that read a vertex it
+ *  removes conflicts with an edge added to it meanwhile. */
+case_result_t vertex_removal(char const* directory) {
+    if (!directory) return case_result_t::skipped(needs_directory_k);
+    std::size_t failures = 0;
+    path_t const home {directory, "removal"};
+    if (!recreate_directory(home.c_str())) return failures + 1;
+    auto [database, open_status] = open_nvme(home.c_str());
+    failures += expect(open_status.succeeded());
+    if (failures) return failures;
+    auto [graph, graph_status] = database.create<graph_collection_t>("removal");
+    failures += expect(graph_status.succeeded());
+    if (failures) return failures;
+    // A vertex changes through the graph calls alone, as on the in-memory engine, never through a blobs write
+    blobs_collection_t vertices {database.receiver(), *graph.member_ptr()};
+    failures += expect(vertices[key_from_integer(0)].assign("vertex") == status_code_t::invalid_argument_k);
+    failures += expect(vertices[key_from_integer(0)].remove() == status_code_t::invalid_argument_k);
+
+    std::vector<edge_t> const star {edge_of(0, 1, 1), edge_of(0, 2, 2), edge_of(3, 0, 3), edge_of(0, 0, 4),
+                                    edge_of(1, 2, 5)};
+    failures += expect(graph.write_edges(edges_of(star)).succeeded());
+    failures += expect_degree(graph, 0, 5);
+    failures += expect(graph.remove_vertex(key_from_integer(0)).succeeded());
+    failures += expect(!*graph.present(key_from_integer(0)));
+    failures += expect_degree(graph, 0, ustore_vertex_degree_missing_k);
+    failures += expect_degree(graph, 1, 1);
+    failures += expect_degree(graph, 2, 1);
+    failures += expect_degree(graph, 3, 0);
+    failures += expect(*graph.present(key_from_integer(3)));
+
+    // The removal's own transaction reads the vertex, which an edge landing meanwhile changes
+    failures += expect(graph.write_edge(edge_of(1, 3, 6)).succeeded());
+    transaction_t removing = *database.transaction();
+    auto [removing_graph, removing_status] = removing.find<graph_collection_t>("removal");
+    failures += expect(removing_status.succeeded());
+    if (failures) return failures;
+    failures += expect(removing_graph.remove_vertex(key_from_integer(3)).succeeded());
+    failures += expect(graph.write_edge(edge_of(3, 2, 7)).succeeded());
+    failures += expect(removing.commit().failed());
+    failures += expect_degree(graph, 3, 2);
+    failures += expect_degree(graph, 2, 2);
+    return failures;
+}
+
+/** A database whose values share one width has no store for a graph, whose vertices vary in width, so creating one is
+ *  refused rather than landing in a blobs store, while a blobs collection of that width is created and kept. */
+case_result_t fixed_width_refuses_graph(char const* directory) {
+    if (!directory) return case_result_t::skipped(needs_directory_k);
+    std::size_t failures = 0;
+    path_t const home {directory, "fixed"};
+    if (!recreate_directory(home.c_str())) return failures + 1;
+    auto [database, open_status] = open_nvme(home.c_str(), 0, 0, 8);
+    failures += expect(open_status.succeeded());
+    if (failures) return failures;
+    failures += expect(database.create<graph_collection_t>("graph").status() == status_code_t::unsupported_k);
+    auto [blobs, blobs_status] = database.create<blobs_collection_t>("blobs");
+    failures += expect(blobs_status.succeeded());
+    if (failures) return failures;
+    ustore_key_t const key = key_from_integer(1);
+    failures += expect(blobs[key].assign("12345678").succeeded());
+    failures += expect(blobs[key].value() == "12345678");
+    return failures;
+}
+
+/** Edges written and removed round after round leave no records behind once compactions reach the bottom level,
+ *  where every chain applies onto nothing and its removals drop, rather than lying there as change records that
+ *  every read folds again. */
+case_result_t bottom_applies_chains(char const* directory) {
+    if (!directory) return case_result_t::skipped(needs_directory_k);
+    std::size_t failures = 0;
+    path_t const home {directory, "bottom"};
+    if (!recreate_directory(home.c_str())) return failures + 1;
+    auto [database, open_status] = open_nvme(home.c_str(), small_write_buffer_bytes_k, 2);
+    failures += expect(open_status.succeeded());
+    if (failures) return failures;
+    auto [graph, graph_status] = database.create<graph_collection_t>("bottom");
+    failures += expect(graph_status.succeeded());
+    if (failures) return failures;
+
+    std::vector<edge_t> batch;
+    for (std::size_t round = 0; round != bottom_rounds_k; ++round) {
+        batch.clear();
+        for (std::size_t index = 0; index != bottom_round_edges_k; ++index)
+            batch.push_back(edge_of(0, 1, round * bottom_round_edges_k + index));
+        failures += expect(graph.write_edges(edges_of(batch)).succeeded());
+        failures += expect(graph.remove_edges(edges_of(batch)).succeeded());
+    }
+    failures += expect(database.compact().succeeded());
+    failures += expect_degree(graph, 0, 0);
+    failures += expect_degree(graph, 1, 0);
+
+    // Unapplied, the newest record of every half-edge is its removal, two of 48 bytes per edge at the bottom
+    auto [description, describe_status] = database.describe();
+    failures += expect(describe_status.succeeded());
+    std::size_t const removal_bytes = 2 * bottom_rounds_k * bottom_round_edges_k * 48;
+    if (describe_status.succeeded()) failures += expect(description.disk_bytes < removal_bytes / 2);
+    return failures;
+}
+
+/** Many small commits, removals among them, read against a model as memory runs merge, after a compaction folds them
+ *  down to the bottom level, and after a reopen. */
+case_result_t fold_survives_maintenance(char const* directory, random_t random) {
+    if (!directory) return case_result_t::skipped(needs_directory_k);
+    std::size_t failures = 0;
+    path_t const home {directory, "maintenance"};
+    if (!recreate_directory(home.c_str())) return failures + 1;
+    graph_model_t model;
+    auto [arena, arena_status] = arena_t::make();
+    failures += expect(arena_status.succeeded());
+    if (failures) return failures;
+
+    {
+        auto [database, open_status] = open_nvme(home.c_str(), small_write_buffer_bytes_k, 2);
+        failures += expect(open_status.succeeded());
+        if (failures) return failures;
+        auto [graph, graph_status] = database.create<graph_collection_t>("maintenance");
+        failures += expect(graph_status.succeeded());
+        if (failures) return failures;
+
+        std::vector<edge_t> batch;
+        std::vector<graph_model_t::triple_t> drawn;
+        for (std::size_t call = 0; call != model_calls_k; ++call) {
+            std::uint64_t const draw = random.below(100);
+            batch.clear();
+            drawn.clear();
+            std::size_t const count = 1 + random.below(4);
+            for (std::size_t index = 0; index != count; ++index) {
+                drawn.push_back(
+                    {random.below(model_vertices_k), random.below(model_vertices_k), random.below(model_edge_ids_k)});
+                auto const [source, target, id] = drawn.back();
+                batch.push_back(edge_of(source, target, id));
+            }
+            if (draw < 70) {
+                failures += expect(graph.write_edges(edges_of(batch)).succeeded());
+                for (auto const& [source, target, id] : drawn) model.write_edge(source, target, id);
+            }
+            else if (draw < 90) {
+                failures += expect(graph.remove_edges(edges_of(batch)).succeeded());
+                for (auto const& [source, target, id] : drawn) model.remove_edge(source, target, id);
+            }
+            else {
+                std::uint64_t const vertex = random.below(model_vertices_k);
+                failures += expect(graph.remove_vertex(key_from_integer(vertex)).succeeded());
+                model.remove_vertex(vertex);
+            }
+            if (call == model_calls_k / 2) failures += expect_model(graph, model, arena);
+        }
+        failures += expect_model(graph, model, arena);
+        failures += expect(database.compact().succeeded());
+        failures += expect_model(graph, model, arena);
+    }
+    auto [database, reopen_status] = open_nvme(home.c_str(), small_write_buffer_bytes_k, 2);
+    failures += expect(reopen_status.succeeded());
+    if (failures) return failures;
+    auto [graph, graph_status] = database.find<graph_collection_t>("maintenance");
+    failures += expect(graph_status.succeeded());
+    if (failures) return failures;
+    failures += expect_model(graph, model, arena);
+    return failures;
+}
+
+#pragma endregion Cases
 
 int main(int argc, char const* argv[]) {
-    using namespace unum::ustore;
-    using namespace unum::ustore::test;
-
     suite_options_t options;
     if (argument_status_t const status = parse_suite_options(argc, argv, options);
         status != argument_status_t::parsed_k)
@@ -946,21 +490,12 @@ int main(int argc, char const* argv[]) {
         fmt::println(stderr, "  the working directory would not open");
         return 1;
     }
-    test_environment_t const environment = test_environment_t::of(options, *directory);
-
-    auto const cases = [&](auto const& mount) {
-        report(totals, mount, "round_trip", vertices_and_edges_round_trip);
-        report(totals, mount, "remove_vertex", removing_a_vertex_takes_its_edges);
-        report(totals, mount, "blocks_split_and_merge", blocks_split_and_merge);
-        report(totals, mount, "batched_pairs_agree", batched_pairs_agree_with_single_ones);
-        report(totals, mount, "batched_read_depth", batched_read_fills_the_queue_pair);
-        report(totals, mount, "survives_reopen", graph_survives_a_reopen);
-        report(totals, mount, "conflicts_refused", conflicting_transactions_are_refused);
-        report(totals, mount, "commit_all_or_nothing", commit_shows_both_halves_or_neither);
-        report(totals, mount, "threads_write_and_walk", threads_write_and_walk_together);
-    };
-    for (transport_t const transport : every_transport_k)
-        run_on_transport(totals, transport, environment, graph_config_k, 2, "graph", cases);
-
+    char const* const home = directory->path();
+    report(totals, "graph.hub_past_value_bound", hub_past_value_bound, home);
+    report(totals, "graph.concurrent_adds_commit", concurrent_adds_commit, home);
+    report(totals, "graph.vertex_removal", vertex_removal, home);
+    report(totals, "graph.fixed_width_refuses_graph", fixed_width_refuses_graph, home);
+    report(totals, "graph.bottom_applies_chains", bottom_applies_chains, home);
+    report(totals, "graph.fold_survives_maintenance", fold_survives_maintenance, home, options.random());
     return suite_exit_code(totals);
 }

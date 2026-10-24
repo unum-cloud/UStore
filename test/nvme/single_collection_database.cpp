@@ -57,8 +57,10 @@ struct scdb_types {
     using fixture_t = fixture_type_;
     using guard_t = typename fixture_t::guard_t;
     using volume_t = typename fixture_t::volume_t;
-    using variable_database_t = basic_single_collection_database<variable_slot_t, volume_t>;
-    using variable_scanner_t = collection_scanner<variable_slot_t, volume_t>;
+    using variable_database_t =
+        basic_single_collection_database<stored_key_t, volume_t, atomic_reference, waiting_policy_t,
+                                         collection<variable_slot_t, volume_t, atomic_reference, waiting_policy_t>>;
+    using variable_scanner_t = collection_scanner<variable_slot_t, volume_t, atomic_reference, waiting_policy_t>;
 
     /** A fixture, the channels a database needs, and the volume over them. */
     struct stack_t {
@@ -234,7 +236,11 @@ template <typename key_slot_type_, typename mount_type_>
                                             stored_value_size_t value_max_size) {
     using types_t = scdb_types<typename mount_type_::fixture_t>;
     using stack_t = typename types_t::stack_t;
-    using database_t = basic_single_collection_database<key_slot_type_, typename types_t::volume_t>;
+    using volume_t = typename types_t::volume_t;
+    using database_t =
+        basic_single_collection_database<typename key_slot_type_::stored_key_t, volume_t, atomic_reference,
+                                         waiting_policy_t,
+                                         collection<key_slot_type_, volume_t, atomic_reference, waiting_policy_t>>;
     std::size_t failures = 0;
     constexpr std::size_t count_k = 300;
 
@@ -326,7 +332,11 @@ template <typename key_slot_type_, typename mount_type_>
                                                  stored_value_size_t value_max_size) {
     using types_t = scdb_types<typename mount_type_::fixture_t>;
     using stack_t = typename types_t::stack_t;
-    using database_t = basic_single_collection_database<key_slot_type_, typename types_t::volume_t>;
+    using volume_t = typename types_t::volume_t;
+    using database_t =
+        basic_single_collection_database<typename key_slot_type_::stored_key_t, volume_t, atomic_reference,
+                                         waiting_policy_t,
+                                         collection<key_slot_type_, volume_t, atomic_reference, waiting_policy_t>>;
     std::size_t failures = 0;
     constexpr std::size_t count_k = 400;
 

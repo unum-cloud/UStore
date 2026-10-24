@@ -45,9 +45,9 @@
 #include <span>    // `std::span`
 #include <utility> // `std::move`
 
-#include <forkunion/atomics.hpp>       // `fu::preferred_atomic_ref`
-#include <forkunion/capabilities.hpp>  // `fu::preferred_yield_t`
+#include <forkunion/atomics.hpp>       // `fu::standard_atomic_ref`, the reference the contract is checked with
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/shared.hpp>       // `st::standard_waiting_policy_t`, the policy the contract is checked with
 
 #include "ustore/utilities/nvme_disks.hpp" // `native_file_t`, `open_native_file`, `native_file_capacity`
 #include "ustore/utilities/nvme_ring.hpp"  // `request_t`, `completion_t`, `queue_pair_t`, `extent_t`
@@ -171,16 +171,20 @@ struct direct_alignment_t {
  *  It becomes that one request's completion and leaves its neighbours alone, which is what a chain
  *  of submission entries would do anyway. Only a token that is not this queue pair's fails the whole
  *  @c submit, since a misrouted completion is unrecoverable.
+ *
+ *  @tparam atomic_reference_ The reference the claim, epoch and in-flight words are owned through.
+ *  @tparam waiting_policy_type_ What a draining core does after a poll that moved nothing.
  */
-class linux_uring_files_disk_t {
+template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+class linux_uring_files_disk {
   public:
 
-    linux_uring_files_disk_t() noexcept = default;
-    linux_uring_files_disk_t(linux_uring_files_disk_t const&) = delete;
-    linux_uring_files_disk_t& operator=(linux_uring_files_disk_t const&) = delete;
-    linux_uring_files_disk_t(linux_uring_files_disk_t&&) noexcept = default;
+    linux_uring_files_disk() noexcept = default;
+    linux_uring_files_disk(linux_uring_files_disk const&) = delete;
+    linux_uring_files_disk& operator=(linux_uring_files_disk const&) = delete;
+    linux_uring_files_disk(linux_uring_files_disk&&) noexcept = default;
 
-    linux_uring_files_disk_t& operator=(linux_uring_files_disk_t&& other) noexcept {
+    linux_uring_files_disk& operator=(linux_uring_files_disk&& other) noexcept {
         if (this == &other) return *this;
         close_all_();
         queue_pairs_ = std::move(other.queue_pairs_);
@@ -202,7 +206,7 @@ class linux_uring_files_disk_t {
         return *this;
     }
 
-    ~linux_uring_files_disk_t() noexcept { close_all_(); }
+    ~linux_uring_files_disk() noexcept { close_all_(); }
 
     /**
      *  @brief Sets one tiny ring up and takes it down again, which is the only honest availability test.
@@ -230,7 +234,7 @@ class linux_uring_files_disk_t {
      *  @note No file is opened here; a mount registers each one as a medium, so one disk serves a
      *      directory of many sorted runs rather than one disk per run.
      */
-    static expected<linux_uring_files_disk_t> make(linux_uring_disk_config_t const& config) noexcept {
+    static expected<linux_uring_files_disk> make(linux_uring_disk_config_t const& config) noexcept {
         if (config.queue_pairs_limit == 0 || config.depth_limit == 0)
             return status_t {status_code_t::invalid_argument_k, "A ring needs a queue pair and a request of depth"};
         if (config.queue_pairs_limit == static_cast<std::uint16_t>(queue_pair_id_t::unallocated_k) ||
@@ -243,7 +247,7 @@ class linux_uring_files_disk_t {
             return status_t {status_code_t::invalid_argument_k, "A ring holds fewer requests than that"};
 
         std::size_t const window = static_cast<std::size_t>(config.queue_pairs_limit) * config.depth_limit;
-        linux_uring_files_disk_t disk;
+        linux_uring_files_disk disk;
         disk.depth_limit_ = config.depth_limit;
         disk.queue_pairs_limit_ = config.queue_pairs_limit;
         disk.registered_memories_limit_ = config.registered_memory_limit;
@@ -623,7 +627,7 @@ class linux_uring_files_disk_t {
             if (poll_completions_status.failed()) return poll_completions_status;
             if (moved != 0) continue;
             if (spins == drain_patience_k) cancel(queue_pair);
-            fu::preferred_yield_t {}(spins, spins, std::size_t {0});
+            waiting_policy_type_ {}(&spins, spins, std::size_t {0});
         }
         return {status_code_t::io_k, "The queue pair would not drain"};
     }
@@ -824,20 +828,18 @@ class linux_uring_files_disk_t {
         return static_cast<std::uint64_t>(::gettid());
     }
 
-    static fu::preferred_atomic_ref<std::int32_t> claim_(std::int32_t& word) noexcept {
-        return fu::preferred_atomic_ref<epoch_t> {word};
+    static atomic_reference_<std::int32_t> claim_(std::int32_t& word) noexcept {
+        return atomic_reference_<std::int32_t> {word};
     }
 
-    static fu::preferred_atomic_ref<epoch_t> epoch_(epoch_t& word) noexcept {
-        return fu::preferred_atomic_ref<epoch_t> {word};
+    static atomic_reference_<epoch_t> epoch_(epoch_t& word) noexcept { return atomic_reference_<epoch_t> {word}; }
+
+    static atomic_reference_<std::int32_t> in_flight_(registered_memory_slot_t& slot) noexcept {
+        return atomic_reference_<std::int32_t> {slot.in_flight};
     }
 
-    static fu::preferred_atomic_ref<std::int32_t> in_flight_(registered_memory_slot_t& slot) noexcept {
-        return fu::preferred_atomic_ref<std::int32_t> {slot.in_flight};
-    }
-
-    static fu::preferred_atomic_ref<std::int32_t> in_flight_(registered_medium_slot_t& slot) noexcept {
-        return fu::preferred_atomic_ref<std::int32_t> {slot.in_flight};
+    static atomic_reference_<std::int32_t> in_flight_(registered_medium_slot_t& slot) noexcept {
+        return atomic_reference_<std::int32_t> {slot.in_flight};
     }
 
 #pragma region Rings
@@ -1312,14 +1314,15 @@ class linux_uring_files_disk_t {
  *  The type exists so a caller compiles against it unconditionally and chooses at mount, where a
  *  refused @c make sends it to the blocking floor rather than to a build-time branch.
  */
-class linux_uring_files_disk_t {
+template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+class linux_uring_files_disk {
   public:
 
     /** Answers that this platform has no ring to offer. */
     [[nodiscard]] static linux_uring_probe_t probe() noexcept { return linux_uring_probe_t::refused_k; }
 
     /** Refuses the mount, since this platform has no ring to mount on. */
-    static expected<linux_uring_files_disk_t> make(linux_uring_disk_config_t const&) noexcept {
+    static expected<linux_uring_files_disk> make(linux_uring_disk_config_t const&) noexcept {
         return status_t {status_code_t::unsupported_k, "This platform has no io_uring"};
     }
 
@@ -1390,6 +1393,7 @@ class linux_uring_files_disk_t {
 
 #endif
 
-static_assert(ring_concept<linux_uring_files_disk_t>, "The io_uring transport is a ring like every other");
+static_assert(ring_concept<linux_uring_files_disk<fu::standard_atomic_ref, st::standard_waiting_policy_t>>,
+              "The io_uring transport is a ring like every other");
 
 } // namespace unum::ustore::utilities

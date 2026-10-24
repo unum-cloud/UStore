@@ -39,9 +39,9 @@
 #include <span>    // `std::span`
 #include <utility> // `std::move`
 
-#include <forkunion/atomics.hpp>       // `fu::preferred_atomic_ref`
-#include <forkunion/capabilities.hpp>  // `fu::preferred_yield_t`
+#include <forkunion/atomics.hpp>       // `fu::standard_atomic_ref`, the reference the contract is checked with
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/shared.hpp>       // `st::standard_waiting_policy_t`, the policy the contract is checked with
 
 #include "ustore/utilities/nvme_disks.hpp"            // `native_file_t`, `open_native_file`, `calling_thread_identity`
 #include "ustore/utilities/nvme_linux_uring_disk.hpp" // `direct_alignment_of`, `direct_alignment_t`
@@ -107,16 +107,20 @@ enum class linux_aio_probe_t : std::uint8_t {
  *  write to a medium opened for reading. A kernel out of room keeps the rest staged for the next
  *  poll, so the batch is still taken whole. Only a token that is not this queue pair's fails the
  *  whole @c submit.
+ *
+ *  @tparam atomic_reference_ The reference the claim and in-flight words are owned through.
+ *  @tparam waiting_policy_type_ What a draining core does after a poll that moved nothing.
  */
-class linux_aio_files_disk_t {
+template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+class linux_aio_files_disk {
   public:
 
-    linux_aio_files_disk_t() noexcept = default;
-    linux_aio_files_disk_t(linux_aio_files_disk_t const&) = delete;
-    linux_aio_files_disk_t& operator=(linux_aio_files_disk_t const&) = delete;
-    linux_aio_files_disk_t(linux_aio_files_disk_t&&) noexcept = default;
+    linux_aio_files_disk() noexcept = default;
+    linux_aio_files_disk(linux_aio_files_disk const&) = delete;
+    linux_aio_files_disk& operator=(linux_aio_files_disk const&) = delete;
+    linux_aio_files_disk(linux_aio_files_disk&&) noexcept = default;
 
-    linux_aio_files_disk_t& operator=(linux_aio_files_disk_t&& other) noexcept {
+    linux_aio_files_disk& operator=(linux_aio_files_disk&& other) noexcept {
         if (this == &other) return *this;
         close_all_();
         queue_pairs_ = std::move(other.queue_pairs_);
@@ -132,7 +136,7 @@ class linux_aio_files_disk_t {
         return *this;
     }
 
-    ~linux_aio_files_disk_t() noexcept { close_all_(); }
+    ~linux_aio_files_disk() noexcept { close_all_(); }
 
     /**
      *  @brief Sets one context up and takes it down again, the only honest availability test.
@@ -152,7 +156,7 @@ class linux_aio_files_disk_t {
      *  @note No file is opened here; a mount registers each one as a medium, so one disk serves a
      *      directory of many sorted runs rather than one disk per run.
      */
-    static expected<linux_aio_files_disk_t> make(linux_aio_disk_config_t const& config) noexcept {
+    static expected<linux_aio_files_disk> make(linux_aio_disk_config_t const& config) noexcept {
         if (config.queue_pairs_limit == 0 || config.depth_limit == 0)
             return status_t {status_code_t::invalid_argument_k, "A context needs a queue pair and a request of depth"};
         if (config.queue_pairs_limit == static_cast<std::uint16_t>(queue_pair_id_t::unallocated_k) ||
@@ -165,7 +169,7 @@ class linux_aio_files_disk_t {
             return status_t {status_code_t::invalid_argument_k, "A context holds fewer requests than that"};
 
         std::size_t const window = static_cast<std::size_t>(config.queue_pairs_limit) * config.depth_limit;
-        linux_aio_files_disk_t disk;
+        linux_aio_files_disk disk;
         disk.depth_limit_ = config.depth_limit;
         disk.buffering_ = config.buffering;
         if (status_t const sized = size_(disk.queue_pairs_, config.queue_pairs_limit); sized.failed()) return sized;
@@ -507,7 +511,7 @@ class linux_aio_files_disk_t {
             if (poll_completions_status.failed()) return poll_completions_status;
             if (moved != 0) continue;
             if (spins == drain_patience_k) cancel(queue_pair);
-            fu::preferred_yield_t {}(spins, spins, std::size_t {0});
+            waiting_policy_type_ {}(&spins, spins, std::size_t {0});
         }
         return {status_code_t::io_k, "The queue pair would not drain"};
     }
@@ -636,16 +640,16 @@ class linux_aio_files_disk_t {
         return {};
     }
 
-    static fu::preferred_atomic_ref<std::int32_t> claim_(std::int32_t& word) noexcept {
-        return fu::preferred_atomic_ref<std::int32_t> {word};
+    static atomic_reference_<std::int32_t> claim_(std::int32_t& word) noexcept {
+        return atomic_reference_<std::int32_t> {word};
     }
 
-    static fu::preferred_atomic_ref<std::int32_t> in_flight_(registered_memory_slot_t& slot) noexcept {
-        return fu::preferred_atomic_ref<std::int32_t> {slot.in_flight};
+    static atomic_reference_<std::int32_t> in_flight_(registered_memory_slot_t& slot) noexcept {
+        return atomic_reference_<std::int32_t> {slot.in_flight};
     }
 
-    static fu::preferred_atomic_ref<std::int32_t> in_flight_(registered_medium_slot_t& slot) noexcept {
-        return fu::preferred_atomic_ref<std::int32_t> {slot.in_flight};
+    static atomic_reference_<std::int32_t> in_flight_(registered_medium_slot_t& slot) noexcept {
+        return atomic_reference_<std::int32_t> {slot.in_flight};
     }
 
     /** Takes every context down, which waits out whatever the kernel still holds, then closes every medium. */
@@ -953,14 +957,15 @@ class linux_aio_files_disk_t {
  *  The type exists so a caller compiles against it unconditionally and chooses at mount, where a
  *  refused @c make sends it to the blocking floor rather than to a build-time branch.
  */
-class linux_aio_files_disk_t {
+template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+class linux_aio_files_disk {
   public:
 
     /** Answers that this platform has no AIO to offer. */
     [[nodiscard]] static linux_aio_probe_t probe() noexcept { return linux_aio_probe_t::refused_k; }
 
     /** Refuses the mount, since this platform has no context to mount on. */
-    static expected<linux_aio_files_disk_t> make(linux_aio_disk_config_t const&) noexcept {
+    static expected<linux_aio_files_disk> make(linux_aio_disk_config_t const&) noexcept {
         return status_t {status_code_t::unsupported_k, "This platform has no Linux AIO"};
     }
 
@@ -1028,6 +1033,7 @@ class linux_aio_files_disk_t {
 
 #endif
 
-static_assert(ring_concept<linux_aio_files_disk_t>, "The Linux AIO transport is a ring like every other");
+static_assert(ring_concept<linux_aio_files_disk<fu::standard_atomic_ref, st::standard_waiting_policy_t>>,
+              "The Linux AIO transport is a ring like every other");
 
 } // namespace unum::ustore::utilities

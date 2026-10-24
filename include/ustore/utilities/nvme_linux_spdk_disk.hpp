@@ -38,7 +38,7 @@
 #endif
 
 #include <array>       // `std::array`
-#include <atomic>      // `std::memory_order`
+#include <atomic>      // `std::atomic_ref`, `std::memory_order`
 #include <bit>         // `std::has_single_bit`
 #include <new>         // `std::nothrow`
 #include <span>        // `std::span`
@@ -51,9 +51,9 @@
 #include <spdk/nvme.h>     // `spdk_nvme_connect`, `spdk_nvme_ns_cmd_read`, `spdk_nvme_qpair`
 #endif
 
-#include <forkunion/atomics.hpp>       // `fu::preferred_atomic_ref`
-#include <forkunion/capabilities.hpp>  // `fu::preferred_yield_t`
+#include <forkunion/atomics.hpp>       // `fu::standard_atomic_ref`, the reference the contract is checked with
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/shared.hpp>       // `st::standard_waiting_policy_t`, the policy the contract is checked with
 
 #include "ustore/utilities/nvme_disks.hpp" // `calling_thread_identity`
 #include "ustore/utilities/nvme_ring.hpp"  // `request_t`, `completion_t`, `queue_pair_t`, `extent_t`
@@ -401,14 +401,14 @@ class spdk_environment_t {
     spdk_environment_t() noexcept = default;
 
     spdk_environment_t(spdk_environment_t const& other) noexcept : holders_(other.holders_) {
-        if (holders_) count_(*holders_).add(1, std::memory_order_relaxed);
+        if (holders_) count_(*holders_).fetch_add(1, std::memory_order_relaxed);
     }
 
     spdk_environment_t& operator=(spdk_environment_t const& other) noexcept {
         if (this == &other) return *this;
         forget_();
         holders_ = other.holders_;
-        if (holders_) count_(*holders_).add(1, std::memory_order_relaxed);
+        if (holders_) count_(*holders_).fetch_add(1, std::memory_order_relaxed);
         return *this;
     }
 
@@ -459,9 +459,10 @@ class spdk_environment_t {
     /** Shuts the driver down, which only the last handle of an environment reaches. */
     static void finalize_() noexcept;
 
-    /** The counter of @p block as the atomic it is read and written through. */
-    [[nodiscard]] static fu::preferred_atomic_ref<std::int32_t> count_(holders_t& block) noexcept {
-        return fu::preferred_atomic_ref<std::int32_t> {block.count};
+    /** The counter of @p block as the atomic it is read and written through, once per handle copied or dropped, so
+     *  no CPU class tells it apart. */
+    [[nodiscard]] static std::atomic_ref<std::int32_t> count_(holders_t& block) noexcept {
+        return std::atomic_ref<std::int32_t> {block.count};
     }
 
     /** Drops this handle's share, tearing the environment down when it was the last one. */
@@ -586,15 +587,19 @@ inline void spdk_environment_t::finalize_() noexcept {}
  *  expect, and the admin queue is polled on idle polls, which is where an abort's own completion
  *  lands. What a registered memory must prove depends on the transport: a controller reached by DMA
  *  needs every page in the driver's map, while one reached over a socket takes any host memory.
+ *
+ *  @tparam atomic_reference_ The reference the claim and in-flight words are owned through.
+ *  @tparam waiting_policy_type_ What a draining core does after a poll that moved nothing.
  */
-class linux_spdk_disk_t {
+template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+class linux_spdk_disk {
   public:
 
-    linux_spdk_disk_t() noexcept = default;
-    linux_spdk_disk_t(linux_spdk_disk_t const&) = delete;
-    linux_spdk_disk_t& operator=(linux_spdk_disk_t const&) = delete;
+    linux_spdk_disk() noexcept = default;
+    linux_spdk_disk(linux_spdk_disk const&) = delete;
+    linux_spdk_disk& operator=(linux_spdk_disk const&) = delete;
 
-    linux_spdk_disk_t(linux_spdk_disk_t&& other) noexcept
+    linux_spdk_disk(linux_spdk_disk&& other) noexcept
         : environment_(std::move(other.environment_)), queue_pairs_(std::move(other.queue_pairs_)),
           registered_memories_(std::move(other.registered_memories_)), media_(std::move(other.media_)),
           flights_(std::move(other.flights_)), staged_(std::move(other.staged_)), locals_(std::move(other.locals_)),
@@ -606,7 +611,7 @@ class linux_spdk_disk_t {
           queue_pairs_limit_(std::exchange(other.queue_pairs_limit_, 0)),
           registered_memories_limit_(std::exchange(other.registered_memories_limit_, 0)), reach_(other.reach_) {}
 
-    linux_spdk_disk_t& operator=(linux_spdk_disk_t&& other) noexcept {
+    linux_spdk_disk& operator=(linux_spdk_disk&& other) noexcept {
         if (this == &other) return *this;
         close_all_();
         environment_ = std::move(other.environment_);
@@ -628,7 +633,7 @@ class linux_spdk_disk_t {
         return *this;
     }
 
-    ~linux_spdk_disk_t() noexcept { close_all_(); }
+    ~linux_spdk_disk() noexcept { close_all_(); }
 
     /**
      *  @brief Connects @p address, takes its first active namespace, and sizes the disk's bookkeeping.
@@ -637,8 +642,8 @@ class linux_spdk_disk_t {
      *  @param[in] config The queue pairs wanted, the per-queue pair depth and the ranges registered at once.
      *  @return The mounted disk, or why the controller would not answer.
      */
-    static expected<linux_spdk_disk_t> open(spdk_environment_t environment, char const* address,
-                                            linux_spdk_disk_config_t const& config) noexcept {
+    static expected<linux_spdk_disk> open(spdk_environment_t environment, char const* address,
+                                          linux_spdk_disk_config_t const& config) noexcept {
         if (status_t const sane = inspect_config_(config); sane.failed()) return sane;
         if (!address) return status_t {status_code_t::invalid_argument_k, "A controller needs an address"};
         if (!environment.initialised())
@@ -672,7 +677,7 @@ class linux_spdk_disk_t {
         std::uint16_t const queue_pairs = static_cast<std::uint16_t>(
             config.queue_pairs_limit < queues ? config.queue_pairs_limit : queues);
 
-        linux_spdk_disk_t disk;
+        linux_spdk_disk disk;
         disk.environment_ = std::move(environment);
         disk.controller_ = controller;
         disk.namespace_ = chosen;
@@ -1001,7 +1006,7 @@ class linux_spdk_disk_t {
             flight_t& flight = flights_[base + index];
             if (flight.state != flight_state_t::outstanding_k) continue;
             [[maybe_unused]] int const asked = spdk_nvme_ctrlr_cmd_abort_ext(controller_, slot->queue, &flight,
-                                                                             &linux_spdk_disk_t::aborted_, nullptr);
+                                                                             &linux_spdk_disk::aborted_, nullptr);
         }
     }
 
@@ -1019,7 +1024,7 @@ class linux_spdk_disk_t {
             if (poll_completions_status.failed()) return poll_completions_status;
             if (moved != 0) continue;
             if (spins == drain_patience_k) cancel(queue_pair);
-            fu::preferred_yield_t {}(spins, spins, std::size_t {0});
+            waiting_policy_type_ {}(&spins, spins, std::size_t {0});
         }
         return {status_code_t::io_k, "The queue pair would not drain"};
     }
@@ -1272,16 +1277,16 @@ class linux_spdk_disk_t {
         return {};
     }
 
-    static fu::preferred_atomic_ref<std::int32_t> claim_(std::int32_t& word) noexcept {
-        return fu::preferred_atomic_ref<std::int32_t> {word};
+    static atomic_reference_<std::int32_t> claim_(std::int32_t& word) noexcept {
+        return atomic_reference_<std::int32_t> {word};
     }
 
-    static fu::preferred_atomic_ref<std::int32_t> in_flight_(registered_memory_slot_t& slot) noexcept {
-        return fu::preferred_atomic_ref<std::int32_t> {slot.in_flight};
+    static atomic_reference_<std::int32_t> in_flight_(registered_memory_slot_t& slot) noexcept {
+        return atomic_reference_<std::int32_t> {slot.in_flight};
     }
 
-    static fu::preferred_atomic_ref<std::int32_t> in_flight_(registered_medium_slot_t& slot) noexcept {
-        return fu::preferred_atomic_ref<std::int32_t> {slot.in_flight};
+    static atomic_reference_<std::int32_t> in_flight_(registered_medium_slot_t& slot) noexcept {
+        return atomic_reference_<std::int32_t> {slot.in_flight};
     }
 
 #pragma region Callbacks
@@ -1559,7 +1564,7 @@ class linux_spdk_disk_t {
 
         int issued = 0;
         if (request.kind == request_kind_t::flush_k) {
-            issued = spdk_nvme_ns_cmd_flush(namespace_, slot.queue, &linux_spdk_disk_t::completed_, &flight);
+            issued = spdk_nvme_ns_cmd_flush(namespace_, slot.queue, &linux_spdk_disk::completed_, &flight);
         }
         else {
             registered_memory_slot_t const* const chunk = resolve_(request.buffer);
@@ -1568,9 +1573,9 @@ class linux_spdk_disk_t {
             std::uint32_t const sectors = static_cast<std::uint32_t>(request.extent.length / sector_bytes_);
             issued = request.kind == request_kind_t::read_k
                          ? spdk_nvme_ns_cmd_read(namespace_, slot.queue, payload, first, sectors,
-                                                 &linux_spdk_disk_t::completed_, &flight, 0)
+                                                 &linux_spdk_disk::completed_, &flight, 0)
                          : spdk_nvme_ns_cmd_write(namespace_, slot.queue, payload, first, sectors,
-                                                  &linux_spdk_disk_t::completed_, &flight, 0);
+                                                  &linux_spdk_disk::completed_, &flight, 0);
         }
         if (issued == 0) return index;
         restore_(flight);
@@ -1729,11 +1734,12 @@ class linux_spdk_disk_t {
  *  refused @c open sends it to another transport rather than to a build-time branch. The probe is
  *  not here, because it belongs to the environment and must answer honestly in every build.
  */
-class linux_spdk_disk_t {
+template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+class linux_spdk_disk {
   public:
 
     /** Refuses the mount, since this build carries no driver to mount with. */
-    static expected<linux_spdk_disk_t> open(spdk_environment_t, char const*, linux_spdk_disk_config_t const&) noexcept {
+    static expected<linux_spdk_disk> open(spdk_environment_t, char const*, linux_spdk_disk_config_t const&) noexcept {
         return status_t {status_code_t::unsupported_k, "This build carries no SPDK"};
     }
 
@@ -1804,6 +1810,7 @@ class linux_spdk_disk_t {
 
 #endif
 
-static_assert(ring_concept<linux_spdk_disk_t>, "The SPDK transport is a ring like every other");
+static_assert(ring_concept<linux_spdk_disk<fu::standard_atomic_ref, st::standard_waiting_policy_t>>,
+              "The SPDK transport is a ring like every other");
 
 } // namespace unum::ustore::utilities

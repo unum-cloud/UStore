@@ -18,12 +18,10 @@
 #include <cstdint> // `std::uint8_t`, `std::uint32_t`
 #include <cstring> // `std::memcpy`, `std::memset`, `std::strlen`
 
-#include <algorithm>    // `std::sort`, `std::unique`, `std::lower_bound`
-#include <charconv>     // `std::from_chars`
-#include <span>         // `std::span`
-#include <string_view>  // `std::string_view`
-#include <system_error> // `std::errc`
-#include <type_traits>  // `std::is_invocable_r_v`
+#include <algorithm>   // `std::sort`, `std::unique`, `std::lower_bound`
+#include <span>        // `std::span`
+#include <string_view> // `std::string_view`
+#include <type_traits> // `std::is_invocable_r_v`
 
 #include <yyjson.h> // `yyjson_val`, `yyjson_mut_doc`
 
@@ -34,7 +32,7 @@
 
 #include "ustore/docs/json_patch.hpp"       // `modify`, `modification_t`
 #include "ustore/docs/json_paths.hpp"       // `resolve_fields`, `json_documents_t`, `field_cell_t`
-#include "ustore/docs/json_values.hpp"      // `json_parse`, `json_to_scalar`, `gather_scalar`, `field_size_bytes`
+#include "ustore/docs/json_values.hpp"      // `json_parse`, `gather_scalar`, `field_size_bytes`, `extract_keys`
 #include "ustore/utilities/algorithm.hpp"   // `offset_in_sorted`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_grow`, `arena_allocator`, `growing_strings`
 
@@ -265,43 +263,6 @@ static status_t read_modify_write(ustore_database_t database, place_batch_t cons
     write.values = modified_values.view;
     write.durability = durability;
     return engine_of(database).blobs_write(write, modified_values, view);
-}
-
-/** Reads @p text as a UUID in its canonical 8-4-4-4-12 hexadecimal form into @p uuid, answering whether it is one. */
-static bool parse_uuid(std::string_view text, ustore_uuid_t& uuid) noexcept {
-    if (text.size() != 36) return false;
-    std::size_t byte_index = 0;
-    for (std::size_t index = 0; index != text.size();) {
-        if (index == 8 || index == 13 || index == 18 || index == 23) {
-            if (text[index++] != '-') return false;
-            continue;
-        }
-        char const* const pair = text.data() + index;
-        auto const [end, parse_error] = std::from_chars(pair, pair + 2, uuid.bytes[byte_index++], 16);
-        if (parse_error != std::errc {} || end != pair + 2) return false;
-        index += 2;
-    }
-    return true;
-}
-
-/** Reads the key of every document of @p values from its @p id_field into @p keys: a non-negative integer, spelled as
- *  the key of that integer, or a UUID in canonical text. */
-static status_t extract_keys(strings_arg_t const& values, std::string_view id_field, ustore_arena_t arena,
-                             std::span<ustore_key_t> keys) noexcept {
-    for (std::size_t index = 0; index != keys.size(); ++index) {
-        auto [document, status] = json_parse(value_view_t {values[index]}, arena);
-        if (status.failed()) return status;
-        yyjson_val* const identifier = json_lookup(yyjson_doc_get_root(document.handle), id_field);
-        if (yyjson_is_uint(identifier)) {
-            keys[index] = key_from_integer(yyjson_get_uint(identifier));
-            continue;
-        }
-        bool const is_uuid = yyjson_is_str(identifier) &&
-                             parse_uuid({yyjson_get_str(identifier), yyjson_get_len(identifier)}, keys[index].uuid);
-        if (!is_uuid)
-            return {status_code_t::malformed_k, "The id field holds neither a non-negative integer nor a UUID"};
-    }
-    return {};
 }
 
 #pragma endregion Writing

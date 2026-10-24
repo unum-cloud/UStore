@@ -2654,7 +2654,7 @@ case_result_t pages_refusals(config_t const& config) {
         ustore_pages_import(&import);
         return status_t {outcome};
     };
-    // A probe through an encoding every engine serving pages takes tells the NVMe engine apart, which serves none yet
+    // A probe through an encoding every engine serving pages takes tells apart an engine serving none
     if (import("<a/>", ustore_page_encoding_xml_k, &page).code == status_code_t::unsupported_k)
         return case_result_t::skipped("the engine serves no pages yet", failures);
 

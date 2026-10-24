@@ -38,7 +38,6 @@
 #include <span>    // `std::span`
 #include <utility> // `std::exchange`, `std::move`
 
-#include <forkunion/atomics.hpp>       // `fu::preferred_atomic_ref`
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
 #include "ustore/utilities/nvme_disks.hpp" // `calling_thread_identity`
@@ -67,19 +66,25 @@ struct memory_arena_config_t {
  *  It is charged to its budget once, here, which is why no buffer below it is charged again: the
  *  bytes were paid for when the disk came up, and a mount that cannot afford its I/O memory is a
  *  configuration error rather than a failure discovered under load.
+ *
+ *  @tparam atomic_reference_ The reference the budget owns its word through.
  */
-class registered_memory_arena_t {
+template <template <typename> typename atomic_reference_>
+class registered_memory_arena {
   public:
 
-    registered_memory_arena_t() noexcept = default;
-    registered_memory_arena_t(registered_memory_arena_t const&) = delete;
-    registered_memory_arena_t& operator=(registered_memory_arena_t const&) = delete;
+    /** The budget the whole arena is charged to. */
+    using constraint_t = resource_constraint<atomic_reference_>;
 
-    registered_memory_arena_t(registered_memory_arena_t&& other) noexcept
+    registered_memory_arena() noexcept = default;
+    registered_memory_arena(registered_memory_arena const&) = delete;
+    registered_memory_arena& operator=(registered_memory_arena const&) = delete;
+
+    registered_memory_arena(registered_memory_arena&& other) noexcept
         : storage_(std::move(other.storage_)), registered_memory_(std::move(other.registered_memory_)),
           constraint_(std::exchange(other.constraint_, nullptr)), charged_(std::exchange(other.charged_, 0)) {}
 
-    registered_memory_arena_t& operator=(registered_memory_arena_t&& other) noexcept {
+    registered_memory_arena& operator=(registered_memory_arena&& other) noexcept {
         if (this == &other) return *this;
         refund_();
         storage_ = std::move(other.storage_);
@@ -89,7 +94,7 @@ class registered_memory_arena_t {
         return *this;
     }
 
-    ~registered_memory_arena_t() noexcept { refund_(); }
+    ~registered_memory_arena() noexcept { refund_(); }
 
     /**
      *  @brief Allocates, charges and registers one arena against @p disk.
@@ -100,14 +105,14 @@ class registered_memory_arena_t {
      */
     template <typename disk_type_>
         requires ring_concept<disk_type_>
-    static expected<registered_memory_arena_t> make(disk_type_& disk, resource_constraint_t& constraint,
-                                                    memory_arena_config_t const& config) noexcept {
+    static expected<registered_memory_arena> make(disk_type_& disk, constraint_t& constraint,
+                                                  memory_arena_config_t const& config) noexcept {
         if (config.bytes == 0) return status_t {status_code_t::invalid_argument_k, "An arena holds at least one block"};
         if (config.placement == memory_space_t::gpu_k)
             return status_t {status_code_t::unsupported_k, "Device memory has no arena yet"};
 
         std::size_t const bytes = static_cast<std::size_t>(round_up_to_multiple(config.bytes, portable_alignment_k));
-        registered_memory_arena_t arena;
+        registered_memory_arena arena;
         if (!constraint.acquire(bytes)) return status_t {status_code_t::out_of_memory_k, "The budget refused an arena"};
         arena.constraint_ = &constraint;
         arena.charged_ = bytes;
@@ -143,6 +148,9 @@ class registered_memory_arena_t {
         return registered_memory_.reference(offset);
     }
 
+    /** The registered range over the whole arena, which the channels carve their blocks out of. */
+    [[nodiscard]] registered_memory_t const& registration() const noexcept { return registered_memory_; }
+
   private:
 
     /** The bytes, aligned so a mount demanding the portable alignment can address offset zero. */
@@ -164,7 +172,7 @@ class registered_memory_arena_t {
     registered_memory_t registered_memory_;
 
     /** The budget @c storage_ is charged to, null until the arena is mounted. */
-    resource_constraint_t* constraint_ = nullptr;
+    constraint_t* constraint_ = nullptr;
 
     /** Bytes charged to @c constraint_, returned when the arena dies. */
     std::size_t charged_ = 0;
@@ -256,21 +264,22 @@ class buffer_pool_t {
     buffer_pool_t& operator=(buffer_pool_t&&) noexcept = default;
 
     /**
-     *  @brief Carves @p config blocks out of @p arena, starting at @p region_offset.
-     *  @param[in] arena The registered range the blocks address, which must outlive the pool.
-     *  @param[in] region_offset First byte of this pool's region inside the arena.
+     *  @brief Carves @p config blocks out of @p range, starting at @p region_offset.
+     *  @param[in] range The registered range the blocks address, which must outlive the pool.
+     *  @param[in] region_offset First byte of this pool's region inside the range.
      *  @param[in] config Block size and block count, both fixed from here on.
      */
-    static expected<buffer_pool_t> make(registered_memory_arena_t& arena, std::uint64_t region_offset,
+    static expected<buffer_pool_t> make(registered_memory_t const& range, std::uint64_t region_offset,
                                         buffer_pool_config_t const& config) noexcept {
         if (config.buffer_bytes == 0 || config.buffers_count == 0)
             return status_t {status_code_t::invalid_argument_k, "A pool holds at least one block"};
         std::uint64_t const span = config.buffer_bytes * config.buffers_count;
-        if (region_offset > arena.size() || span > arena.size() - region_offset)
+        std::uint64_t const range_bytes = range.bytes().size();
+        if (region_offset > range_bytes || span > range_bytes - region_offset)
             return status_t {status_code_t::invalid_argument_k, "A pool's region runs past its arena"};
 
         buffer_pool_t pool;
-        pool.arena_ = &arena;
+        pool.range_ = &range;
         pool.region_offset_ = region_offset;
         pool.buffer_bytes_ = config.buffer_bytes;
         if (pool.free_indices_.resize(config.buffers_count) != st::status_t::success_k)
@@ -289,7 +298,7 @@ class buffer_pool_t {
         pooled_buffer_t buffer;
         buffer.pool_ = this;
         buffer.index_ = index;
-        buffer.bytes_ = arena_->bytes().subspan(static_cast<std::size_t>(region_offset_ + index * buffer_bytes_),
+        buffer.bytes_ = range_->bytes().subspan(static_cast<std::size_t>(region_offset_ + index * buffer_bytes_),
                                                 static_cast<std::size_t>(buffer_bytes_));
         return buffer;
     }
@@ -306,7 +315,7 @@ class buffer_pool_t {
     [[nodiscard]] std::uint64_t buffer_bytes() const noexcept { return buffer_bytes_; }
 
     /** Whether the pool was ever carved, which an unmounted device pool is not. */
-    [[nodiscard]] bool made() const noexcept { return arena_ != nullptr; }
+    [[nodiscard]] bool made() const noexcept { return range_ != nullptr; }
 
   private:
 
@@ -319,13 +328,13 @@ class buffer_pool_t {
 
     /** The place of the block at @p index, @p offset bytes in. */
     [[nodiscard]] memory_reference_t place_(std::uint32_t index, std::uint64_t offset) const noexcept {
-        return arena_->reference(region_offset_ + index * buffer_bytes_ + offset);
+        return range_->reference(region_offset_ + index * buffer_bytes_ + offset);
     }
 
-    /** The arena the blocks live in, null until the pool is made. */
-    registered_memory_arena_t* arena_ = nullptr;
+    /** The registered range the blocks live in, null until the pool is made. */
+    registered_memory_t const* range_ = nullptr;
 
-    /** Where the pool's first block sits inside the arena, so a queue pair can mint its place. */
+    /** Where the pool's first block sits inside the range, so a queue pair can mint its place. */
     std::uint64_t region_offset_ = 0;
 
     /** Bytes of one block. */
@@ -394,7 +403,7 @@ struct io_channel_config_t {
 
 #pragma region Channel
 
-template <typename disk_type_>
+template <typename disk_type_, template <typename> typename atomic_reference_>
     requires ring_concept<disk_type_>
 class basic_io_channel_pool;
 
@@ -436,7 +445,7 @@ class io_channel_t {
 
   private:
 
-    template <typename disk_type_>
+    template <typename disk_type_, template <typename> typename atomic_reference_>
         requires ring_concept<disk_type_>
     friend class basic_io_channel_pool;
 
@@ -465,8 +474,10 @@ class io_channel_t {
  *  Draining in the destructor is what makes the queue pair safe to hand to the next caller: the ring
  *  refuses to release a queue pair with work outstanding, and a block cannot be recycled while the device
  *  may still be writing into it.
+ *
+ *  @tparam atomic_reference_ The reference a shared channel's claim word is owned through.
  */
-template <typename disk_type_>
+template <typename disk_type_, template <typename> typename atomic_reference_>
     requires ring_concept<disk_type_>
 class basic_io_channel_guard {
   public:
@@ -521,7 +532,7 @@ class basic_io_channel_guard {
     void surrender_() noexcept {
         if (channel_ && disk_) [[maybe_unused]]
             status_t const drained = disk_->drain(channel_->queue_pair());
-        if (claim_) fu::preferred_atomic_ref<std::int32_t> {*claim_}.store(0, std::memory_order_release);
+        if (claim_) atomic_reference_<std::int32_t> {*claim_}.store(0, std::memory_order_release);
         disk_ = nullptr;
         channel_ = nullptr;
         claim_ = nullptr;
@@ -566,13 +577,15 @@ enum class io_channel_preference_t : std::uint8_t {
  *  Executor threads take their own channel by thread index, so the common path claims nothing. Threads
  *  outside the pool claim one of the shared channels and are refused with @c capacity_exhausted_k when
  *  every shared is out, which is the same back-off the job gate already asks for.
+ *
+ *  @tparam atomic_reference_ The reference the claim and bound-thread words are owned through.
  */
-template <typename disk_type_>
+template <typename disk_type_, template <typename> typename atomic_reference_>
     requires ring_concept<disk_type_>
 class basic_io_channel_pool {
   public:
 
-    using guard_t = basic_io_channel_guard<disk_type_>;
+    using guard_t = basic_io_channel_guard<disk_type_, atomic_reference_>;
 
     basic_io_channel_pool() noexcept = default;
     basic_io_channel_pool(basic_io_channel_pool const&) = delete;
@@ -581,21 +594,21 @@ class basic_io_channel_pool {
     basic_io_channel_pool& operator=(basic_io_channel_pool&&) noexcept = default;
 
     /**
-     *  @brief Opens one channel per executor thread plus @p shared_io_channels more, over @p arena.
+     *  @brief Opens one channel per executor thread plus @p shared_io_channels more, over @p range.
      *  @param[inout] disk The ring every channel queue pairs from, which must outlive the pool.
-     *  @param[inout] arena The registered range the channels carve their blocks out of.
+     *  @param[in] range The registered range the channels carve their blocks out of, outliving the pool.
      *  @param[in] threads Executor threads, each of which gets a channel of its own.
      *  @param[in] shared_io_channels Channels threads outside the executor claim, at least one.
      *  @param[in] config What each channel's share of the arena is carved into.
      */
-    static expected<basic_io_channel_pool> make(disk_type_& disk, registered_memory_arena_t& arena, std::size_t threads,
+    static expected<basic_io_channel_pool> make(disk_type_& disk, registered_memory_t const& range, std::size_t threads,
                                                 std::size_t shared_io_channels,
                                                 io_channel_config_t const& config) noexcept {
         if (shared_io_channels == 0)
             return status_t {status_code_t::invalid_argument_k, "A mount keeps a channel for its own threads"};
         std::size_t const wanted = threads + shared_io_channels;
         std::uint64_t const per_channel = config.arena_bytes();
-        if (per_channel == 0 || arena.size() / per_channel < wanted)
+        if (per_channel == 0 || range.bytes().size() / per_channel < wanted)
             return status_t {status_code_t::capacity_exhausted_k, "The arena does not hold a block for every channel"};
 
         basic_io_channel_pool pool;
@@ -619,7 +632,7 @@ class basic_io_channel_pool {
             buffer_pool_config_t requests;
             requests.buffer_bytes = config.request_buffer_bytes;
             requests.buffers_count = config.request_buffers_count;
-            auto [request_pool, make_request_pool_status] = buffer_pool_t::make(arena, base, requests);
+            auto [request_pool, make_request_pool_status] = buffer_pool_t::make(range, base, requests);
             if (make_request_pool_status.failed()) return make_request_pool_status;
             channel.requests_ = std::move(request_pool);
 
@@ -627,7 +640,7 @@ class basic_io_channel_pool {
             streams.buffer_bytes = config.stream_buffer_bytes;
             streams.buffers_count = config.stream_buffers_count;
             std::uint64_t const stream_base = base + config.request_buffer_bytes * config.request_buffers_count;
-            auto [stream_pool, make_stream_pool_status] = buffer_pool_t::make(arena, stream_base, streams);
+            auto [stream_pool, make_stream_pool_status] = buffer_pool_t::make(range, stream_base, streams);
             if (make_stream_pool_status.failed()) return make_stream_pool_status;
             channel.streams_ = std::move(stream_pool);
         }
@@ -654,8 +667,8 @@ class basic_io_channel_pool {
         if (thread_index >= executor_channels_) return acquire();
         io_channel_t& channel = channels_[thread_index];
         if (status_t const adopted = disk_->bind_queue_pair(channel.queue_pair_); adopted.failed()) return adopted;
-        fu::preferred_atomic_ref<std::uint64_t> {channel.bound_thread_}.store(calling_thread_identity(),
-                                                                              std::memory_order_relaxed);
+        atomic_reference_<std::uint64_t> {channel.bound_thread_}.store(calling_thread_identity(),
+                                                                       std::memory_order_relaxed);
         return guard_t::held(*disk_, channel, nullptr);
     }
 
@@ -694,12 +707,12 @@ class basic_io_channel_pool {
     expected<guard_t> claim_shared_(io_channel_preference_t preference, thread_identity_t bound_thread) noexcept {
         for (std::size_t index = 0; index != shared_claims_.size(); ++index) {
             io_channel_t& channel = channels_[executor_channels_ + index];
-            fu::preferred_atomic_ref<std::uint64_t> bound {channel.bound_thread_};
+            atomic_reference_<std::uint64_t> bound {channel.bound_thread_};
             std::uint64_t const bound_to = bound.load(std::memory_order_relaxed);
             if (preference == io_channel_preference_t::bound_to_this_thread_k && bound_to != bound_thread) continue;
             if (preference == io_channel_preference_t::never_bound_k && bound_to != 0) continue;
             std::int32_t expected_free = 0;
-            fu::preferred_atomic_ref<std::int32_t> claim {shared_claims_[index]};
+            atomic_reference_<std::int32_t> claim {shared_claims_[index]};
             if (!claim.compare_exchange_strong(expected_free, 1, std::memory_order_acquire, std::memory_order_relaxed))
                 continue;
             if (status_t const adopted = disk_->bind_queue_pair(channel.queue_pair_); adopted.failed()) {
@@ -962,8 +975,10 @@ class basic_read_pipeline {
  *
  *  Chaining is not that barrier and is not used for it: a flush covers only what its queue pair has
  *  already completed, so the poll before it is what makes it mean anything.
+ *
+ *  @tparam waiting_policy_type_ What the core does while it waits for the barrier's completion.
  */
-template <typename disk_type_>
+template <typename disk_type_, typename waiting_policy_type_>
     requires ring_concept<disk_type_>
 class basic_write_pipeline {
   public:
@@ -1074,8 +1089,8 @@ class basic_write_pipeline {
         auto [taken, submit_status] = disk_.submit(channel_.queue_pair(), std::span<request_t const> {barrier});
         if (submit_status.failed()) return submit_status;
         if (taken != 1) return {status_code_t::io_k, "The ring would not take a flush"};
-        auto [completed, poll_completions_status] = poll_completions_at_least(disk_, channel_.queue_pair(),
-                                                                              channel_.completion_buffer(), 1);
+        auto [completed, poll_completions_status] = poll_completions_at_least<waiting_policy_type_>(
+            disk_, channel_.queue_pair(), channel_.completion_buffer(), 1);
         if (poll_completions_status.failed()) return poll_completions_status;
         if (completed == 0) return {status_code_t::io_k, "A flush never completed"};
         completion_t const& completion = channel_.completion_buffer().front();

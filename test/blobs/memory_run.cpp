@@ -26,7 +26,9 @@
 
 #include <fmt/format.h> // `fmt::println`
 
-#include <smashtable/shared.hpp> // `st::commit_order_t`
+#include <forkunion/atomics.hpp> // `fu::standard_atomic_ref`
+#include <forkunion/types.hpp>   // `fu::standard_yield_t`
+#include <smashtable/shared.hpp> // `st::commit_order_t`, `st::standard_waiting_policy`
 
 #include "ustore/blobs/collection_view.hpp" // `collection_view`, `published_view`, `epoch_domain`
 #include "ustore/blobs/memory_run.hpp"      // `keyed_delta`, `memory_run`, `sealed_writes`
@@ -40,6 +42,13 @@ using keyed_delta_t = keyed_delta<stored_key_t>;
 using sealed_t = sealed_writes<stored_key_t>;
 using run_t = memory_run<stored_key_t>;
 using view_t = collection_view<run_t>;
+
+/** The atomic reference the views and the epochs are instantiated with: the portable one. */
+template <typename value_type_>
+using atomic_reference = fu::standard_atomic_ref<value_type_>;
+
+/** The epochs every case announces its readers in, waiting out readers by yielding. */
+using epoch_domain_t = epoch_domain<atomic_reference, st::standard_waiting_policy<fu::standard_yield_t>>;
 using bytes_t = std::vector<byte_t>;
 
 #pragma region Harness and Model
@@ -258,7 +267,7 @@ static std::size_t readers_against_one_publisher() {
     for (transaction_stamp_t stamp = 1; stamp <= commits_count_k; ++stamp) writers[key_of(stamp)].push_back(stamp);
 
     st::commit_order_t order;
-    epoch_domain epochs;
+    epoch_domain_t epochs;
     std::size_t failures = check(epochs.reserve_threads(1).succeeded());
     std::atomic<std::size_t> alive {0};
     auto held = [&]() noexcept {
@@ -275,7 +284,7 @@ static std::size_t readers_against_one_publisher() {
     second_runs.reserve(commits_count_k);
     held_view_t* first_current = held();
     held_view_t* second_current = held();
-    published_view<view_t> first, second;
+    published_view<view_t, atomic_reference> first, second;
     [[maybe_unused]] view_t const* const first_empty = first.replace(first_current->view);
     [[maybe_unused]] view_t const* const second_empty = second.replace(second_current->view);
 
@@ -330,8 +339,8 @@ static std::size_t readers_against_one_publisher() {
         std::uniform_int_distribution<stored_key_t> key_pick(0, keys_count_k - 1);
         std::size_t& failures = reader_failures[reader];
         for (transaction_stamp_t at = 0; at != commits_count_k && failures == 0;) {
-            epoch_domain::reader_t const inside = reader == 0 ? epochs.enter(0) : epochs.enter();
-            epoch_domain::reader_t const nested = epochs.enter();
+            epoch_domain_t::reader_t const inside = reader == 0 ? epochs.enter(0) : epochs.enter();
+            epoch_domain_t::reader_t const nested = epochs.enter();
             at = static_cast<transaction_stamp_t>(order.published_stamp());
             view_t const* const first_view = first.load();
             view_t const* const second_view = second.load();

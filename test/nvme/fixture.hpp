@@ -29,15 +29,18 @@
 #include <type_traits> // `std::is_same_v`
 #include <utility>     // `std::exchange`, `std::move`
 
+#include <forkunion/atomics.hpp>       // `fu::standard_atomic_ref`
+#include <forkunion/types.hpp>         // `fu::standard_yield_t`
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/shared.hpp>       // `st::standard_waiting_policy`
 
-#include "ustore/utilities/nvme_disks.hpp"            // `blocking_files_disk_t`, `file_buffering_t`
-#include "ustore/utilities/nvme_linux_aio_disk.hpp"   // `linux_aio_files_disk_t`, `linux_aio_probe_t`
-#include "ustore/utilities/nvme_linux_uring_disk.hpp" // `linux_uring_files_disk_t`, `linux_uring_probe_t`
+#include "ustore/utilities/nvme_disks.hpp"            // `blocking_files_disk`, `file_buffering_t`
+#include "ustore/utilities/nvme_linux_aio_disk.hpp"   // `linux_aio_files_disk`, `linux_aio_probe_t`
+#include "ustore/utilities/nvme_linux_uring_disk.hpp" // `linux_uring_files_disk`, `linux_uring_probe_t`
 
-#include "ustore/utilities/nvme_channels.hpp" // `registered_memory_arena_t`, `memory_arena_config_t`
-#include "ustore/blobs/nvme_collection.hpp"   // `select_result_t`
-#include "ustore/utilities/nvme_volume.hpp"   // `resources_t`, `resources_shared_ptr_t`
+#include "ustore/utilities/nvme_channels.hpp" // `registered_memory_arena`, `memory_arena_config_t`
+#include "ustore/blobs/nvme_collection.hpp"   // `select_result_t`, `commit_ledger`, `stamp_pin`
+#include "ustore/utilities/nvme_volume.hpp"   // `shared_resources`, `resources_shared_ptr`
 
 #include "harness.hpp" // `describe`, `expect_status`, `suite_totals_t`
 
@@ -45,6 +48,30 @@ namespace unum::ustore::test {
 
 using namespace unum::ustore::blobs;
 using namespace unum::ustore::utilities;
+
+#pragma region Instantiation
+
+/** The atomic reference every suite instantiates the engine's templates with: the portable one, as no suite picks a
+ *  CPU class. */
+template <typename value_type_>
+using atomic_reference = fu::standard_atomic_ref<value_type_>;
+
+/** The waiting policy every suite instantiates the engine's templates with, yielding between attempts. */
+using waiting_policy_t = st::standard_waiting_policy<fu::standard_yield_t>;
+
+using memory_disk_t = memory_disk<atomic_reference>;
+using blocking_files_disk_t = blocking_files_disk<atomic_reference>;
+using linux_uring_files_disk_t = linux_uring_files_disk<atomic_reference, waiting_policy_t>;
+using linux_aio_files_disk_t = linux_aio_files_disk<atomic_reference, waiting_policy_t>;
+using resource_constraint_t = resource_constraint<atomic_reference>;
+using registered_memory_arena_t = registered_memory_arena<atomic_reference>;
+using resources_t = shared_resources<atomic_reference, waiting_policy_t>;
+using resources_shared_ptr_t = resources_shared_ptr<atomic_reference, waiting_policy_t>;
+using commit_ledger_t = commit_ledger<atomic_reference, waiting_policy_t>;
+using stamp_pin_t = stamp_pin<atomic_reference, waiting_policy_t>;
+using countdown_t = countdown<atomic_reference, waiting_policy_t>;
+
+#pragma endregion Instantiation
 
 #pragma region Transports
 
@@ -353,8 +380,8 @@ template <typename disk_type_>
 struct basic_fixture {
 
     using disk_t = disk_type_;
-    using volume_t = basic_extent_volume<disk_type_>;
-    using channel_pool_t = basic_io_channel_pool<disk_type_>;
+    using volume_t = basic_extent_volume<disk_type_, waiting_policy_t>;
+    using channel_pool_t = basic_io_channel_pool<disk_type_, atomic_reference>;
     using guard_t = typename channel_pool_t::guard_t;
 
     /** The budgets every allocation is charged to, shared so a case can hold them past the fixture's death. */
@@ -453,7 +480,7 @@ expected<disk_type_> open_disk(fixture_config_t const& config, std::size_t media
 template <typename disk_type_>
 status_t blank_head(disk_type_& disk, io_channel_t& channel, medium_reference_t medium,
                     std::uint64_t page_bytes) noexcept {
-    basic_write_pipeline<disk_type_> writer {disk, channel, medium};
+    basic_write_pipeline<disk_type_, waiting_policy_t> writer {disk, channel, medium};
     auto [block, acquire_buffer_status] = writer.acquire_buffer();
     if (acquire_buffer_status.failed()) return acquire_buffer_status;
     if (block.size() < page_bytes)
@@ -531,8 +558,9 @@ struct basic_mount {
         if (make_arena_status.failed()) return make_arena_status;
         fixture->arena = std::move(pinned);
 
-        auto [pool, make_status] = fixture_t::channel_pool_t::make(
-            fixture->disk, fixture->arena, reshaped.executor_threads, reshaped.shared_io_channels, channels);
+        auto [pool, make_status] = fixture_t::channel_pool_t::make(fixture->disk, fixture->arena.registration(),
+                                                                   reshaped.executor_threads,
+                                                                   reshaped.shared_io_channels, channels);
         if (make_status.failed()) return make_status;
         fixture->channels = std::move(pool);
 
