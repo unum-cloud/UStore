@@ -1,8 +1,8 @@
 /**
- *  @file src/nvme/graph_store.hpp
+ *  @file src/nvme/graph_calls.hpp
  *  @author Ash Vardanian
  *  @date December 1, 2022
- *  @brief The graph calls of the C ABI over the graph stores of `include/ustore/graph/nvme_graph.hpp`, for the NVMe
+ *  @brief The graph calls of the C ABI over the graph stores of `include/ustore/graph/nvme_store.hpp`, for the NVMe
  *      engine's table.
  *
  *  `src/nvme/variants.hpp` includes this file right before its table, as these calls build on its accesses, its

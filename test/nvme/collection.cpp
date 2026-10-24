@@ -27,8 +27,8 @@
 
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
-#include "ustore/blobs/nvme_collection.hpp" // `collection`
-#include "ustore/blobs/nvme_key_slot.hpp"   // `key_slot`
+#include "ustore/blobs/nvme_store.hpp"    // `collection`
+#include "ustore/blobs/nvme_key_slot.hpp" // `key_slot`
 
 #include "nvme/fixture.hpp" // `basic_fixture`, `run_on_transport`, `expectation_t`, `painted`
 

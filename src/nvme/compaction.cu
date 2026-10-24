@@ -14,7 +14,7 @@
 
 #include <smashtable/shared.hpp> // `st::status_t`, `st::expected`
 
-#include "ustore/blobs/nvme_compaction.cuh"        // `compaction_kind_t`, `compaction_output`, `gpu_compactor_t`
+#include "ustore/blobs/vram_nvidia_compaction.cuh" // `compaction_kind_t`, `compaction_output`, `gpu_compactor_t`
 #include "ustore/blobs/nvme_key_slot.hpp"          // `key_slot`, `value_layout_t`
 #include "ustore/utilities/vram_nvidia_device.hpp" // `cuda_count_devices`, `cuda_stream_t`
 

@@ -14,7 +14,7 @@
  *  collection of that database under the same UUID, and three more are the engine's own: the main collection under
  *  the nil UUID, the catalog, and the names. The catalog maps every other collection's UUID onto its name, the store
  *  recording its modality, and the names file every name as a string mapped onto its `name_record_t`. A strings
- *  collection, and the names, live in the strings store of `include/ustore/strings/nvme_strings.hpp`, keyed by whole
+ *  collection, and the names, live in the strings store of `include/ustore/strings/nvme_store.hpp`, keyed by whole
  *  strings, and a transaction's strings ride in the share of it every transaction here joins.
  *
  *  Every write of a caller goes through a transaction of the database, the caller's or one the call commits alone, so
@@ -66,10 +66,10 @@
 
 #include "ustore/blobs/nvme_database.hpp"      // `database`, `watch_schedule_t`, `write_buffer_status_t`
 #include "ustore/blobs/nvme_tree.hpp"          // `user_collection_config_t`, `validate`
-#include "ustore/docs/nvme_docs.hpp"           // `nvme_docs`
-#include "ustore/graph/nvme_graph.hpp"         // `nvme_graph`
-#include "ustore/pages/nvme_pages.hpp"         // `nvme_pages`
-#include "ustore/strings/nvme_strings.hpp"     // `strings_store`, `strings_transaction`, `strings_page_t`
+#include "ustore/docs/nvme_store.hpp"          // `nvme_docs`
+#include "ustore/graph/nvme_store.hpp"         // `nvme_graph`
+#include "ustore/pages/nvme_store.hpp"         // `nvme_pages`
+#include "ustore/strings/nvme_store.hpp"       // `strings_store`, `strings_transaction`, `strings_page_t`
 #include "ustore/utilities/blocking_files.hpp" // `directory_exists`
 #include "ustore/utilities/nvme_volume.hpp"    // `resources_config_t`, `open_resources`, `mounted_storage`
 #include "ustore/utilities/ram_buffers.hpp"    // `arena_allocate`, `arena_allocator`, `growth_status`
@@ -2232,9 +2232,9 @@ void database_free(ustore_database_t database) noexcept {
 
 // The graph, docs and pages calls build on the accesses, writes and catalog lookups above, and the table below names
 // them
-#include "docs_store.hpp"  // `docs_write`, `holds_only`
-#include "graph_store.hpp" // `graph_read_edges`, `graph_write_edges`, `graph_remove_vertices`
-#include "pages_store.hpp" // `pages_import`, `pages_insert`, `commit_page_edits`
+#include "docs_calls.hpp"  // `docs_write`, `holds_only`
+#include "graph_calls.hpp" // `graph_read_edges`, `graph_write_edges`, `graph_remove_vertices`
+#include "pages_calls.hpp" // `pages_import`, `pages_insert`, `commit_page_edits`
 
 namespace unum::ustore::nvme {
 

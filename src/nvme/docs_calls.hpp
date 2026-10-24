@@ -1,8 +1,8 @@
 /**
- *  @file src/nvme/docs_store.hpp
+ *  @file src/nvme/docs_calls.hpp
  *  @author Ash Vardanian
  *  @date October 20, 2026
- *  @brief The document writes of the C ABI over the docs stores of `include/ustore/docs/nvme_docs.hpp`, for the NVMe
+ *  @brief The document writes of the C ABI over the docs stores of `include/ustore/docs/nvme_store.hpp`, for the NVMe
  *      engine's table.
  *
  *  `src/nvme/variants.hpp` includes this file right before its table, as these calls build on its accesses, its

@@ -1,5 +1,5 @@
 /**
- *  @file include/ustore/pages/nvme_pages.hpp
+ *  @file include/ustore/pages/nvme_store.hpp
  *  @author Ash Vardanian
  *  @date October 20, 2026
  *  @brief The NVMe store of a pages collection: one collection keyed by page UUID, whose value is the page's dense
@@ -13,9 +13,9 @@
 
 #pragma once
 
-#include "ustore/blobs/nvme_collection.hpp" // `collection`
-#include "ustore/blobs/nvme_key_slot.hpp"   // `key_slot`, `value_layout_t`
-#include "ustore/pages/page_fold.hpp"       // `page_fold`
+#include "ustore/blobs/nvme_store.hpp"    // `collection`
+#include "ustore/blobs/nvme_key_slot.hpp" // `key_slot`, `value_layout_t`
+#include "ustore/pages/page_fold.hpp"     // `page_fold`
 
 namespace unum::ustore::pages {
 

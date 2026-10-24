@@ -31,17 +31,17 @@ Pin a commit, not a version, when building on them.
   - `ram_store.hpp`: the multi-version SmashTable stores of the RAM engine, one per collection, the catalog and the names over them, and `collections_transaction`, which publishes any number of them under one stamp.
   - `nvme_key_slot.hpp`: identifiers and value layouts of the LSM trees, stored keys and values, key slots and the sorted run index over them.
   - `nvme_sorted_run.hpp`: one immutable sorted run on a volume.
-  - `nvme_compaction.hpp` and `nvme_compaction.cuh`: the host compactor and the device one, whose kernels only nvcc compiles.
+  - `nvme_compaction.hpp` and `vram_nvidia_compaction.cuh`: the host compactor and the device one, whose kernels only nvcc compiles.
   - `nvme_tree.hpp`: configurations and schemas, LSM levels, the merge of one level into the next, and the level set readers see.
   - `nvme_write_buffer.hpp`: the in-memory write buffer of stored values.
-  - `nvme_collection.hpp`: one collection, a write buffer and a value cache in front of a tree, with its snapshots and scanner.
+  - `nvme_store.hpp`: one collection, a write buffer and a value cache in front of a tree, with its snapshots and scanner.
   - `nvme_database.hpp`: databases of named collections and single-collection databases, their snapshots, optimistic transactions, registries and read sets.
 - `graph/`, in `unum::ustore::graph`:
   - `half_edges.hpp`: `half_edge_t`, the entry a graph collection files every vertex and both ends of every edge under, with its order and hash.
   - `ram_graph.hpp`: exporting degrees and edges from a store of half-edges, and staging edge and vertex inserts and removals.
   - `vertex_values.hpp`: the dense codec keeping every vertex as one value of its degrees and sorted neighborships.
   - `adjacency_fold.hpp`: labeled edges and their half-edges, the 48-byte half-edge records a vertex value and its change records share, `adjacency_fold`, and the reads merging both.
-  - `nvme_graph.hpp`: `nvme_graph`, the NVMe store of a graph collection, one collection keyed by vertex and folded by `adjacency_fold`.
+  - `nvme_store.hpp`: `nvme_graph`, the NVMe store of a graph collection, one collection keyed by vertex and folded by `adjacency_fold`.
 - `docs/`, in `unum::ustore::docs`:
   - `json_paths.hpp`: fields translated into chains of JSONPath prefixes and resolved for a batch of documents in one StringZilla subdocuments pass, into the same values yyjson's lookup finds, or handed back to yyjson where the pass cannot read a batch as yyjson does.
   - `json_values.hpp`: JSON documents parsed with yyjson into an arena, and the conversions between their values and the scalars, strings and UUIDs of a gathered column.
@@ -54,8 +54,8 @@ Pin a commit, not a version, when building on them.
   - `markup.hpp`: XML and text import and render, and XPath reads through StringZilla's subdocuments engine.
 - `strings/`, in `unum::ustore::strings`:
   - `string_keys.hpp`: `string_key_t`, the owned key of a strings collection and of a collection's name, with its order and hash, and the 16-byte heads that search strings: `head_of` and `tail_of`.
-  - `strings_run.hpp`: the memory runs of strings, keyed by whole strings on a tape and searched by their heads, and the cursor over a view of them.
-  - `nvme_strings.hpp`: `strings_store`, the NVMe store of a strings collection, whose runs keep each string's head in a cell and the bytes past it in the run's tails, and `strings_transaction`, the strings one database transaction writes and watches, joined to it as a share.
+  - `nvme_memory_run.hpp`: the memory runs of strings, keyed by whole strings on a tape and searched by their heads, and the cursor over a view of them.
+  - `nvme_store.hpp`: `strings_store`, the NVMe store of a strings collection, whose runs keep each string's head in a cell and the bytes past it in the run's tails, and `strings_transaction`, the strings one database transaction writes and watches, joined to it as a share.
 
 ## Building
 

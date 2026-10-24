@@ -1,5 +1,5 @@
 /**
- *  @file include/ustore/docs/nvme_docs.hpp
+ *  @file include/ustore/docs/nvme_store.hpp
  *  @author Ash Vardanian
  *  @date October 20, 2026
  *  @brief The NVMe store of a docs collection: one collection keyed by document UUID, whose value is the document's
@@ -13,9 +13,9 @@
 
 #pragma once
 
-#include "ustore/blobs/nvme_collection.hpp" // `collection`
-#include "ustore/blobs/nvme_key_slot.hpp"   // `key_slot`, `value_layout_t`
-#include "ustore/docs/json_fold.hpp"        // `json_fold`
+#include "ustore/blobs/nvme_store.hpp"    // `collection`
+#include "ustore/blobs/nvme_key_slot.hpp" // `key_slot`, `value_layout_t`
+#include "ustore/docs/json_fold.hpp"      // `json_fold`
 
 namespace unum::ustore::docs {
 

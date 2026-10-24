@@ -1,5 +1,5 @@
 /**
- *  @file include/ustore/strings/strings_run.hpp
+ *  @file include/ustore/strings/nvme_memory_run.hpp
  *  @author Ash Vardanian
  *  @date October 20, 2026
  *  @brief One commit's records for one strings collection, keyed by whole strings on a tape and searched by their
@@ -43,7 +43,7 @@
 #include <smashtable/shared.hpp>                 // `st::default_allocator`, `st::expected`
 #include <stringzilla/stringzilla.hpp>           // `sz::string_view_t`
 
-#include "ustore/blobs/memory_run.hpp"      // `keyed_delta`, `stamped_delta`, `kept_versions`
+#include "ustore/blobs/nvme_memory_run.hpp" // `keyed_delta`, `stamped_delta`, `kept_versions`
 #include "ustore/blobs/nvme_compaction.hpp" // `compaction_stamps_t`
 #include "ustore/blobs/nvme_key_slot.hpp"   // `transaction_stamp_t`, `stored_value_offset_t`, `storage_limits_t`
 #include "ustore/strings/string_keys.hpp"   // `head_of`, `tail_of`

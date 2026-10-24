@@ -1,5 +1,5 @@
 /**
- *  @file include/ustore/blobs/memory_run.hpp
+ *  @file include/ustore/blobs/nvme_memory_run.hpp
  *  @author Ash Vardanian
  *  @date October 18, 2026
  *  @brief One commit's records for one collection, sealed into sorted columns and stamped once into an immutable run.

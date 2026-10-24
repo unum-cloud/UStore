@@ -1,5 +1,5 @@
 /**
- *  @file include/ustore/strings/nvme_strings.hpp
+ *  @file include/ustore/strings/nvme_store.hpp
  *  @author Ash Vardanian
  *  @date October 20, 2026
  *  @brief The NVMe store of a strings collection, keyed by whole strings: strings memory runs in front of an LSM tree
@@ -36,15 +36,15 @@
 #include <smashtable/basic_vector.hpp>     // `st::basic_vector`
 #include <stringzilla/stringzilla.hpp>     // `sz::string_view_t`
 
-#include "ustore/blobs/collection_view.hpp" // `collection_view`, `published_view`
-#include "ustore/blobs/nvme_collection.hpp" // `commit_ledger`, `stamp_pin`, `select_result_t`, `memory_pressure_t`
-#include "ustore/blobs/nvme_database.hpp"   // `transaction_share_t`
-#include "ustore/blobs/nvme_tree.hpp"       // `lsm_tree`, `collection_config_t`, `lsm_tree_publication_hook_t`
-#include "ustore/strings/string_keys.hpp"   // `head_of`, `tail_of`, `head_prefix_bytes_k`
-#include "ustore/strings/strings_run.hpp"   // `strings_memory_run`, `strings_sealed_writes`, `kept_versions`
-#include "ustore/utilities/folds.hpp"       // `last_write_fold`, `delta_view_t`
-#include "ustore/utilities/ram_buffers.hpp" // `local_arena_t`
-#include "ustore/utilities/types.hpp"       // `status_t`, `expected`, `byte_t`
+#include "ustore/blobs/nvme_collection_view.hpp" // `collection_view`, `published_view`
+#include "ustore/blobs/nvme_store.hpp"           // `commit_ledger`, `stamp_pin`, `select_result_t`, `memory_pressure_t`
+#include "ustore/blobs/nvme_database.hpp"        // `transaction_share_t`
+#include "ustore/blobs/nvme_tree.hpp"            // `lsm_tree`, `collection_config_t`, `lsm_tree_publication_hook_t`
+#include "ustore/strings/string_keys.hpp"        // `head_of`, `tail_of`, `head_prefix_bytes_k`
+#include "ustore/strings/nvme_memory_run.hpp"    // `strings_memory_run`, `strings_sealed_writes`, `kept_versions`
+#include "ustore/utilities/folds.hpp"            // `last_write_fold`, `delta_view_t`
+#include "ustore/utilities/ram_buffers.hpp"      // `local_arena_t`
+#include "ustore/utilities/types.hpp"            // `status_t`, `expected`, `byte_t`
 
 namespace unum::ustore::strings {
 

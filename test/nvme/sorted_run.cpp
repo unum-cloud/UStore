@@ -26,7 +26,7 @@
 #include "ustore/utilities/nvme_channels.hpp" // `basic_read_pipeline`, `basic_write_pipeline`
 #include "ustore/blobs/nvme_key_slot.hpp"     // `key_slot`
 #include "ustore/blobs/nvme_sorted_run.hpp"   // `lsm_sorted_run`, `sorted_run_layout`
-#include "ustore/strings/nvme_strings.hpp"    // `string_key_slot`, `head_of`, `tail_of`
+#include "ustore/strings/nvme_store.hpp"      // `string_key_slot`, `head_of`, `tail_of`
 
 #include "nvme/fixture.hpp" // `basic_fixture`, `run_on_transport`, `painted`
 

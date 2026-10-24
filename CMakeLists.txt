@@ -679,16 +679,16 @@ if (${USTORE_BUILD_TEST})
     add_test(NAME ustore_test_graph_adjacency_fold COMMAND ustore_test_graph_adjacency_fold)
 
     # The runs of strings build against the header target alone
-    add_executable(ustore_test_strings_strings_run test/strings/strings_run.cpp)
+    add_executable(ustore_test_strings_nvme_memory_run test/strings/nvme_memory_run.cpp)
     target_link_libraries(
-        ustore_test_strings_strings_run PRIVATE ustore::header forkunion::static fmt::fmt ustore_warnings
+        ustore_test_strings_nvme_memory_run PRIVATE ustore::header forkunion::static fmt::fmt ustore_warnings
     )
-    add_test(NAME ustore_test_strings_strings_run COMMAND ustore_test_strings_strings_run)
+    add_test(NAME ustore_test_strings_nvme_memory_run COMMAND ustore_test_strings_nvme_memory_run)
 
     # Memory runs and their views call no StringZilla kernel either, and need only SmashTable's headers
-    add_executable(ustore_test_blobs_memory_run test/blobs/memory_run.cpp)
-    target_link_libraries(ustore_test_blobs_memory_run PRIVATE ustore::header fmt::fmt ustore_warnings)
-    add_test(NAME ustore_test_blobs_memory_run COMMAND ustore_test_blobs_memory_run)
+    add_executable(ustore_test_blobs_nvme_memory_run test/blobs/nvme_memory_run.cpp)
+    target_link_libraries(ustore_test_blobs_nvme_memory_run PRIVATE ustore::header fmt::fmt ustore_warnings)
+    add_test(NAME ustore_test_blobs_nvme_memory_run COMMAND ustore_test_blobs_nvme_memory_run)
 
     # The docs fold is checked against `ustore_docs_write` on every engine, so its suite links them all
     add_executable(ustore_test_docs_json_fold test/docs/json_fold.cpp)

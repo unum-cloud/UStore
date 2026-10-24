@@ -39,7 +39,7 @@
 #include "ustore/utilities/nvme_linux_uring_disk.hpp" // `linux_uring_files_disk`, `linux_uring_probe_t`
 
 #include "ustore/utilities/nvme_channels.hpp" // `registered_memory_arena`, `memory_arena_config_t`
-#include "ustore/blobs/nvme_collection.hpp"   // `select_result_t`, `commit_ledger`, `stamp_pin`
+#include "ustore/blobs/nvme_store.hpp"        // `select_result_t`, `commit_ledger`, `stamp_pin`
 #include "ustore/utilities/nvme_volume.hpp"   // `shared_resources`, `resources_shared_ptr`
 
 #include "harness.hpp" // `describe`, `expect_status`, `suite_totals_t`

@@ -1,8 +1,8 @@
 /**
- *  @file test/strings/strings_run.cpp
+ *  @file test/strings/nvme_memory_run.cpp
  *  @author Ash Vardanian
  *  @date October 20, 2026
- *  @brief Unit tests of `ustore/strings/strings_run.hpp`: head order, what sealing refuses, reads at every stamp,
+ *  @brief Unit tests of `ustore/strings/nvme_memory_run.hpp`: head order, what sealing refuses, reads at every stamp,
  *      conflict checks and prefix cursors over random commit streams against a reference model, a map of every
  *      version of every string, and generational merges that keep every version a reader still sees.
  *
@@ -29,8 +29,8 @@
 
 #include <fmt/format.h> // `fmt::println`
 
-#include "ustore/blobs/collection_view.hpp" // `collection_view`
-#include "ustore/strings/strings_run.hpp"   // `strings_memory_run`, `strings_cursor`, `kept_versions`
+#include "ustore/blobs/nvme_collection_view.hpp" // `collection_view`
+#include "ustore/strings/nvme_memory_run.hpp"    // `strings_memory_run`, `strings_cursor`, `kept_versions`
 
 namespace unum::ustore::test {
 

@@ -17,7 +17,7 @@
 
 #include "arguments.hpp"
 
-#include "ustore/blobs/nvme_database.hpp"
+#include "ustore/blobs/nvme_single_collection_database.hpp"
 
 using namespace unum::io;
 using namespace unum::ustore;

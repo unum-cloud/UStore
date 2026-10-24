@@ -33,12 +33,12 @@ The types are templates of `include/ustore/`, which `variants.hpp` instantiates 
 - `utilities/nvme_volume.hpp` — text, catalogs, volumes, the router, the mount and the shared resources.
 - `blobs/nvme_key_slot.hpp` — identifiers, value layouts, stored keys and values, key slots and the sorted run index.
 - `blobs/nvme_sorted_run.hpp` — `lsm_sorted_run`.
-- `blobs/nvme_compaction.hpp` and `nvme_compaction.cuh` — the host compactor, and the kernels of the device one.
+- `blobs/nvme_compaction.hpp` and `vram_nvidia_compaction.cuh` — the host compactor, and the kernels of the device one.
 - `blobs/nvme_tree.hpp` — configurations and schemas, `lsm_level`, its merger and `lsm_tree`.
 - `blobs/nvme_write_buffer.hpp` — `write_buffer`.
-- `blobs/nvme_collection.hpp` — the value cache, `collection`, its snapshot and its scanner.
+- `blobs/nvme_store.hpp` — the value cache, `collection`, its snapshot and its scanner.
 - `blobs/nvme_database.hpp` — both databases, their snapshots, transactions, registries and read sets.
-- `graph/adjacency_fold.hpp` and `nvme_graph.hpp` — the graph store below.
+- `graph/adjacency_fold.hpp` and `nvme_store.hpp` — the graph store below.
 
 The sorted run index is a B-tree of the run's key slots, and the merger hands the compactor each run's index.
 
@@ -187,7 +187,7 @@ A dispatch blocks until all its threads return and admits one caller at a time, 
 
 ## Graph Store
 
-`include/ustore/graph/nvme_graph.hpp` keeps a graph collection as one collection of the engine's database, keyed by vertex, beside the blobs stores and under the same ledger:
+`include/ustore/graph/nvme_store.hpp` keeps a graph collection as one collection of the engine's database, keyed by vertex, beside the blobs stores and under the same ledger:
 
 - A vertex's value is its half-edges, 48-byte records sorted by neighbor, edge and role, as `adjacency_fold.hpp` lays them out.
 - An edge write appends one change record per endpoint rather than rewriting either, so two transactions adding edges to one vertex both commit.
@@ -195,7 +195,7 @@ A dispatch blocks until all its threads return and admits one caller at a time, 
 - A removed vertex is a removal of its key, and its neighbors take a change removing the half-edges they filed of it.
 
 Every store serves the modalities its fold folds, so a graph of variable-width values lands in this one, and a graph of any other width is refused, as no store keeps it.
-`src/nvme/graph_store.hpp` serves the graph calls of the C ABI over it, batching the vertices of a run of tasks on one collection into one select.
+`src/nvme/graph_calls.hpp` serves the graph calls of the C ABI over it, batching the vertices of a run of tasks on one collection into one select.
 A write watches what it depends on: a vertex it creates, a vertex a removal of edges changes, and the adjacency a vertex removal reads.
 
 ## Alternatives

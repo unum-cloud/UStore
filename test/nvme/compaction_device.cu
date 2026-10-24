@@ -10,7 +10,7 @@
 
 #include <span> // `std::span`
 
-#include "ustore/blobs/nvme_compaction.cuh" // `gpu_compactor_t`, `compaction_output`, `sorted_run_index_view`
+#include "ustore/blobs/vram_nvidia_compaction.cuh" // `gpu_compactor_t`, `compaction_output`, `sorted_run_index_view`
 
 #include "nvme/compaction_key_slots.hpp" // `inline_key_slot`, `fixed_width_key_slot`, `variable_width_key_slot`
 

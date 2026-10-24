@@ -1,10 +1,10 @@
 /**
- *  @file test/blobs/memory_run.cpp
+ *  @file test/blobs/nvme_memory_run.cpp
  *  @author Ash Vardanian
  *  @date October 18, 2026
- *  @brief Unit tests of `ustore/blobs/memory_run.hpp` and `ustore/blobs/collection_view.hpp`: what sealing refuses,
- *      reads at every stamp and the conflict checks over random commit streams against a reference model, a map of
- *      every version of every key, and readers walking views while one thread publishes.
+ *  @brief Unit tests of `ustore/blobs/nvme_memory_run.hpp` and `ustore/blobs/nvme_collection_view.hpp`: what sealing
+ *      refuses, reads at every stamp and the conflict checks over random commit streams against a reference model, a
+ *      map of every version of every key, and readers walking views while one thread publishes.
  *
  *  The suite prints one line per case and a total, and exits non-zero on a failure.
  */
@@ -30,8 +30,8 @@
 #include <forkunion/types.hpp>   // `fu::standard_yield_t`
 #include <smashtable/shared.hpp> // `st::commit_order_t`, `st::standard_waiting_policy`
 
-#include "ustore/blobs/collection_view.hpp" // `collection_view`, `published_view`, `epoch_domain`
-#include "ustore/blobs/memory_run.hpp"      // `keyed_delta`, `memory_run`, `sealed_writes`
+#include "ustore/blobs/nvme_collection_view.hpp" // `collection_view`, `published_view`, `epoch_domain`
+#include "ustore/blobs/nvme_memory_run.hpp"      // `keyed_delta`, `memory_run`, `sealed_writes`
 
 namespace unum::ustore::test {
 

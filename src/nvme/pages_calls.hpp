@@ -1,8 +1,8 @@
 /**
- *  @file src/nvme/pages_store.hpp
+ *  @file src/nvme/pages_calls.hpp
  *  @author Ash Vardanian
  *  @date October 20, 2026
- *  @brief The page edits of the C ABI over the pages stores of `include/ustore/pages/nvme_pages.hpp`, for the NVMe
+ *  @brief The page edits of the C ABI over the pages stores of `include/ustore/pages/nvme_store.hpp`, for the NVMe
  *      engine's table.
  *
  *  `src/nvme/variants.hpp` includes this file right before its table, as these calls build on its writes and its

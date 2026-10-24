@@ -1,5 +1,5 @@
 /**
- *  @file include/ustore/blobs/nvme_collection.hpp
+ *  @file include/ustore/blobs/nvme_store.hpp
  *  @author Ash Vardanian
  *  @date July 10, 2023
  *  @brief One collection: immutable memory runs and a value cache in front of an LSM tree of sorted runs, the one
@@ -51,15 +51,15 @@
 #include <smashtable/basic_vector.hpp>     // `st::basic_vector`
 #include <smashtable/shared.hpp>           // `st::commit_order_t`, `st::latest_snapshot_k`
 
-#include "ustore/blobs/collection_view.hpp"   // `collection_view`, `epoch_domain`, `published_view`
-#include "ustore/blobs/memory_run.hpp"        // `keyed_delta`, `memory_run`, `sealed_writes`
-#include "ustore/blobs/nvme_key_slot.hpp"     // `limit`, `stored_value_size_t`, `value_layout_t`
-#include "ustore/blobs/nvme_tree.hpp"         // `lsm_tree`, `lsm_tree_position_t`, `collection_config_t`
-#include "ustore/utilities/folds.hpp"         // `fold_concept`, `fold_pair`, `last_write_fold`
-#include "ustore/utilities/nvme_channels.hpp" // `io_channel_t`
-#include "ustore/utilities/nvme_ring.hpp"     // `resource_constraint`, `constrained_allocator`
-#include "ustore/utilities/ram_buffers.hpp"   // `local_arena_t`, `arena_allocator`
-#include "ustore/utilities/types.hpp"         // `status_t`, `status_code_t`, `expected`, `byte_t`
+#include "ustore/blobs/nvme_collection_view.hpp" // `collection_view`, `epoch_domain`, `published_view`
+#include "ustore/blobs/nvme_memory_run.hpp"      // `keyed_delta`, `memory_run`, `sealed_writes`
+#include "ustore/blobs/nvme_key_slot.hpp"        // `limit`, `stored_value_size_t`, `value_layout_t`
+#include "ustore/blobs/nvme_tree.hpp"            // `lsm_tree`, `lsm_tree_position_t`, `collection_config_t`
+#include "ustore/utilities/folds.hpp"            // `fold_concept`, `fold_pair`, `last_write_fold`
+#include "ustore/utilities/nvme_channels.hpp"    // `io_channel_t`
+#include "ustore/utilities/nvme_ring.hpp"        // `resource_constraint`, `constrained_allocator`
+#include "ustore/utilities/ram_buffers.hpp"      // `local_arena_t`, `arena_allocator`
+#include "ustore/utilities/types.hpp"            // `status_t`, `status_code_t`, `expected`, `byte_t`
 
 namespace unum::ustore::blobs {
 

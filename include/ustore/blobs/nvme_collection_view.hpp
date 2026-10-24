@@ -1,5 +1,5 @@
 /**
- *  @file include/ustore/blobs/collection_view.hpp
+ *  @file include/ustore/blobs/nvme_collection_view.hpp
  *  @author Ash Vardanian
  *  @date October 18, 2026
  *  @brief The immutable list of runs a collection's readers walk, and the one word it is published through.

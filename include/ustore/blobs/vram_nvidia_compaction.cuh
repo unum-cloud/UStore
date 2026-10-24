@@ -1,5 +1,5 @@
 /**
- *  @file include/ustore/blobs/nvme_compaction.cuh
+ *  @file include/ustore/blobs/vram_nvidia_compaction.cuh
  *  @author Ash Vardanian
  *  @date July 10, 2023
  *  @brief The kernels of the device compactor: extraction, survival, value sizes, padding and placement on CUB.

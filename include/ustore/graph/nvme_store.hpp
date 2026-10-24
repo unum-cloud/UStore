@@ -1,5 +1,5 @@
 /**
- *  @file include/ustore/graph/nvme_graph.hpp
+ *  @file include/ustore/graph/nvme_store.hpp
  *  @author Ash Vardanian
  *  @date December 1, 2022
  *  @brief The NVMe store of a graph collection: one collection keyed by vertex, whose value is the vertex's sorted
@@ -16,9 +16,9 @@
 
 #pragma once
 
-#include "ustore/blobs/nvme_collection.hpp" // `collection`
-#include "ustore/blobs/nvme_key_slot.hpp"   // `key_slot`, `value_layout_t`
-#include "ustore/graph/adjacency_fold.hpp"  // `adjacency_fold`
+#include "ustore/blobs/nvme_store.hpp"     // `collection`
+#include "ustore/blobs/nvme_key_slot.hpp"  // `key_slot`, `value_layout_t`
+#include "ustore/graph/adjacency_fold.hpp" // `adjacency_fold`
 
 namespace unum::ustore::graph {
 

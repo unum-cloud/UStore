@@ -9,7 +9,7 @@
  *  into sorted runs that fit their bounds, planning where every stored value moves. Both compactors share the rules
  *  below, and only the host one folds a fold's changes, so a merge of runs holding any change runs on the host. A
  *  build with @c USTORE_WITH_CUDA declares the device compactor for every compiler, its kernels in
- *  @c nvme_compaction.cuh compile under nvcc alone, and @c compaction.cu instantiates its compaction for the
+ *  @c vram_nvidia_compaction.cuh compile under nvcc alone, and @c compaction.cu instantiates its compaction for the
  *  engine's key slots, so a host TU calls it.
  */
 
