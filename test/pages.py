@@ -39,6 +39,7 @@ HTML, XML, MARKDOWN, TEXT, JSON = 0, 1, 2, 3, 4
 IMPORT, INSERT, REMOVE, MOVE, SPLICE, SET_ATTRIBUTES, REMOVE_ATTRIBUTES = range(7)
 U32_TAPE, U64_TAPE = 0, 1
 NIL = bytes(16)
+PAGES_MODALITY = 5
 
 
 class Outcome(Structure):
@@ -151,6 +152,9 @@ OpenRocksDB = arguments(
         ("count", c_uint64),
     ],
 )
+CreateCollection = arguments(
+    "CreateCollection", [*HEAD, ("name", BytesView), ("modality", c_int), ("collection", c_void_p)]
+)
 InitArena = arguments(
     "InitArena", [("arena", POINTER(c_void_p)), ("executor", c_void_p), ("outcome", POINTER(Outcome))]
 )
@@ -201,7 +205,7 @@ def tape_strings(view: StringsView, count: int) -> list[bytes]:
 
 
 class Pages:
-    """Blocking page calls on the main collection of one database the shared library opened."""
+    """Blocking page calls on one pages collection of a database the shared library opened."""
 
     def __init__(self, engine: str, directory: Path):
         self.engine = engine
@@ -231,6 +235,13 @@ class Pages:
             return
         LIBRARY.ustore_arena_init(byref(InitArena(ctypes.pointer(self.arena), None, ctypes.pointer(outcome))))
         assert outcome.status == SUCCESS
+        # No collection exists until created, so every call addresses this one
+        self.name, self.collection = ctypes.create_string_buffer(b"pages"), ctypes.create_string_buffer(16)
+        name = BytesView(ctypes.cast(self.name, c_void_p), len(b"pages"))
+        create = CreateCollection(self.database, None, ctypes.pointer(outcome), 0, name, PAGES_MODALITY)
+        create.collection = ctypes.cast(self.collection, c_void_p)
+        LIBRARY.ustore_collection_create(byref(create))
+        self.created = outcome.status
 
     def close(self):
         if self.opened:
@@ -239,7 +250,10 @@ class Pages:
 
     def serves_pages(self) -> bool:
         """Whether the database opened and its engine serves pages, which every engine with blobs does but NVMe."""
-        return self.opened and self.call(IMPORT, key(1), [{"value": b"<probe/>"}])[0] != UNSUPPORTED
+        if not self.opened or self.created == UNSUPPORTED:
+            return False
+        assert self.created == SUCCESS, self.created
+        return self.call(IMPORT, key(1), [{"value": b"<probe/>"}])[0] != UNSUPPORTED
 
     def call(self, verb: int, page: bytes, tasks: list[dict], encoding: int = XML) -> tuple[int, list[bytes]]:
         """Runs `tasks` of `verb` on `page` in one call, answering the status and the effective keys of insertions."""
@@ -261,6 +275,7 @@ class Pages:
 
         page_buffer = keys_buffer([page])
         call = structure(database=self.database, outcome=ctypes.pointer(outcome), count=count)
+        call.collections = StridedView(ctypes.cast(self.collection, c_void_p), 0)
         call.keys = StridedView(ctypes.cast(page_buffer, c_void_p), 0)
         effective = c_void_p()
         if verb in (IMPORT, INSERT):
@@ -296,6 +311,7 @@ class Pages:
             arena=self.arena,
             outputs_encoding=encoding,
         )
+        call.collections = StridedView(ctypes.cast(self.collection, c_void_p), 0)
         call.keys = StridedView(ctypes.cast(page_buffer, c_void_p), 0)
         call.elements = StridedView(ctypes.cast(element_buffer, c_void_p), 0)
         call.presences, call.values = ctypes.pointer(presences), ctypes.pointer(values)

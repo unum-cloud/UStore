@@ -64,8 +64,8 @@ constexpr enumerator_spelling<ustore_engine_t> engine_names_k[] {
 
 /** The canonical spelling of every modality. */
 constexpr enumerator_spelling<ustore_modality_t> modality_names_k[] {
-    {ustore_modality_any_k, "any"},     {ustore_modality_blobs_k, "blobs"},     {ustore_modality_docs_k, "docs"},
-    {ustore_modality_graph_k, "graph"}, {ustore_modality_strings_k, "strings"}, {ustore_modality_pages_k, "pages"},
+    {ustore_modality_blobs_k, "blobs"},     {ustore_modality_docs_k, "docs"},   {ustore_modality_graph_k, "graph"},
+    {ustore_modality_strings_k, "strings"}, {ustore_modality_pages_k, "pages"},
 };
 
 expected<ustore_collection_id_t> mint_collection_id() noexcept {

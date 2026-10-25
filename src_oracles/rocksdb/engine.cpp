@@ -8,11 +8,12 @@
  *  RocksDB's bytewise comparator, which orders 16-byte keys and strings alike, so an open needs no modality:
  *
  *      Collection                      Column family name     Key bytes              Value bytes
- *      main collection                 default                uuid key[16]           bytes
  *      any UUIDs-to-bytes collection   its UUID text          uuid key[16]           bytes
  *      a strings collection            its UUID text          char string[]          uuid value[16]
- *      collections system collection   ustore.collections     uuid collection[16]    u8 modality, char name[]
- *      names system collection         ustore.names           char name[]            uuid collection[16]
+ *      collections system collection   _collections           uuid collection[16]    u8 modality, char name[]
+ *      names system collection         _names                 char name[]            uuid collection[16]
+ *
+ *  RocksDB requires the `default` column family, which exists and stores nothing.
  *
  *  A create adds the column family, then puts both system entries in one batch, and a drop deletes both entries in
  *  one batch, then the column family. A column family no collections entry records is what a crash between the two
@@ -90,7 +91,7 @@ using column_t = ::rocksdb::ColumnFamilyHandle;
  *  the name empty for none. */
 struct family_t {
     column_t* column = nullptr;
-    ustore_modality_t modality = ustore_modality_any_k;
+    ustore_modality_t modality {};
     std::string name;
 };
 
@@ -99,11 +100,11 @@ struct family_t {
 using columns_t = st::hash_map<ustore_collection_id_t, family_t, std::hash<ustore_collection_id_t>>;
 
 /** The name of the column family of the names system collection, mapping every name onto its collection. */
-constexpr char const* names_column_name_k = "ustore.names";
+constexpr char const* names_column_name_k = "_names";
 
 /** The name of the column family of the collections system collection, mapping every collection onto its modality
  *  and its name. */
-constexpr char const* collections_column_name_k = "ustore.collections";
+constexpr char const* collections_column_name_k = "_collections";
 
 /** Reads the collection a column family stores from its name, the collection's UUID text, answering false for a name
  *  this engine gives no collection. */
@@ -125,14 +126,11 @@ extern engine_t const engine_k;
 /** The open database and its column families. */
 struct database_t : handle_t {
 
-    /** The column families of the collections callers created, which leave out the main and the system ones. */
+    /** The column families of the collections callers created, which leave out the system ones. */
     columns_t columns;
 
     /** Shared by every call for as long as it runs, exclusive for a create, a drop or a reset. */
     std::shared_mutex columns_mutex;
-
-    /** The default column family, which holds the main collection. */
-    column_t* main = nullptr;
 
     /** The column family of the names system collection. */
     column_t* names = nullptr;
@@ -161,7 +159,6 @@ struct database_t : handle_t {
         if (!native) return;
         [[maybe_unused]] native_status_t const flushed = native->FlushWAL(true);
         for (auto const& [id, family] : columns) native->DestroyColumnFamilyHandle(family.column);
-        if (main) native->DestroyColumnFamilyHandle(main);
         if (names) native->DestroyColumnFamilyHandle(names);
         if (collections) native->DestroyColumnFamilyHandle(collections);
         [[maybe_unused]] native_status_t const closed = native->Close();
@@ -189,7 +186,7 @@ struct snapshot_t : handle_t {
 
 /** A key a transaction read while watching it, locked and validated when the transaction stages. */
 struct watched_key_t {
-    ustore_collection_id_t collection = ustore_collection_main_k;
+    ustore_collection_id_t collection {};
     ustore_key_t key {};
 
     friend std::strong_ordering operator<=>(watched_key_t const&, watched_key_t const&) noexcept = default;
@@ -299,20 +296,15 @@ status_t status_of(native_status_t const& status) noexcept {
 /** The column family @p collection addresses, or null for any identifier no caller-created column family carries.
  *  The caller holds @c columns_mutex, which keeps the column family alive for as long as it holds it. */
 column_t* column_of(database_t& database, ustore_collection_id_t collection) noexcept {
-    if (collection == ustore_collection_main_k) return database.main;
     auto const found = database.columns.find(collection);
     return found != database.columns.end() ? (*found).mapped.column : nullptr;
 }
 
 /** Refuses @p collection unless a column family keyed as @p layout holds it. The caller holds @c columns_mutex. */
 status_t refuse_collection(database_t& database, ustore_collection_id_t collection, entry_layout_t layout) noexcept {
-    entry_layout_t held = entry_layout_t::uuids_to_bytes_k;
-    if (collection != ustore_collection_main_k) {
-        auto const found = database.columns.find(collection);
-        if (found == database.columns.end()) return {status_code_t::not_found_k, "No such collection"};
-        held = entry_layout_of((*found).mapped.modality);
-    }
-    if (held == layout) return {};
+    auto const found = database.columns.find(collection);
+    if (found == database.columns.end()) return {status_code_t::not_found_k, "No such collection"};
+    if (entry_layout_of((*found).mapped.modality) == layout) return {};
     return collection_holds_another_modality();
 }
 
@@ -320,7 +312,6 @@ status_t refuse_collection(database_t& database, ustore_collection_id_t collecti
  *  @c columns_mutex, so every collection it accepts stays addressable until the call returns. */
 status_t refuse_collections(database_t& database, strided_iterator<ustore_collection_id_t const> collections,
                             std::size_t count, entry_layout_t layout) noexcept {
-    if (!collections) return refuse_collection(database, ustore_collection_main_k, layout);
     for (std::size_t index = 0; index != count; ++index) {
         bool const repeated = index != 0 && collections[index] == collections[index - 1];
         if (repeated) continue;
@@ -338,15 +329,11 @@ status_t refuse_modalities(ustore_database_t handle, ustore_collections_view_t c
     strided_iterator<ustore_collection_id_t const> const tasks = strided(collections);
     std::shared_lock lock {database.columns_mutex};
     for (std::size_t index = 0; index != count; ++index) {
-        if (index != 0 && tasks && tasks[index] == tasks[index - 1]) continue;
-        ustore_modality_t held = ustore_modality_any_k;
-        if (tasks && tasks[index] != ustore_collection_main_k) {
-            auto const found = database.columns.find(tasks[index]);
-            if (found == database.columns.end()) return {status_code_t::not_found_k, "No such collection"};
-            held = (*found).mapped.modality;
-        }
-        if (status_t const admitted = admit_modality(held, modality); admitted.failed()) return admitted;
-        if (!tasks) break;
+        if (index != 0 && tasks[index] == tasks[index - 1]) continue;
+        auto const found = database.columns.find(tasks[index]);
+        if (found == database.columns.end()) return {status_code_t::not_found_k, "No such collection"};
+        if (status_t const admitted = admit_modality((*found).mapped.modality, modality); admitted.failed())
+            return admitted;
     }
     return {};
 }
@@ -627,7 +614,6 @@ bool remove_partial_export(std::string const& path, ::rocksdb::Options const& op
 template <typename arguments_type_>
 status_t open_database(arguments_type_ const& arguments, access_t access) {
     if (!arguments.database) return {status_code_t::invalid_argument_k, "Need an output for the database"};
-    *arguments.database = nullptr;
     if (!arguments.directory.length) return {status_code_t::invalid_argument_k, "A database needs a directory"};
     if (arguments.data_directories_count && !arguments.data_directories)
         return {status_code_t::invalid_argument_k, "Counted data directories are null"};
@@ -692,7 +678,7 @@ status_t open_database(arguments_type_ const& arguments, access_t access) {
     for (column_t* const handle : handles) {
         ustore_collection_id_t id {};
         std::string const& column_name = handle->GetName();
-        if (column_name == ::rocksdb::kDefaultColumnFamilyName) database->main = handle;
+        if (column_name == ::rocksdb::kDefaultColumnFamilyName) database->native->DestroyColumnFamilyHandle(handle);
         else if (column_name == names_column_name_k) database->names = handle;
         else if (column_name == collections_column_name_k) database->collections = handle;
         else if (!read_column_name(column_name, id) ||
@@ -739,6 +725,7 @@ status_t open_database(arguments_type_ const& arguments, access_t access) {
         ::rocksdb::Slice const value = entries->value();
         ustore_collection_id_t id;
         bool const well_formed = key.size() == sizeof(ustore_collection_id_t) && !value.empty() &&
+                                 static_cast<std::uint8_t>(value[0]) >= ustore_modality_blobs_k &&
                                  static_cast<std::uint8_t>(value[0]) <= ustore_modality_pages_k;
         if (!well_formed) return {status_code_t::malformed_k, "The database holds a malformed collections entry"};
         std::memcpy(&id, key.data(), sizeof(ustore_collection_id_t));
@@ -786,13 +773,12 @@ status_t database_view(ustore_database_view_rocksdb_t const& arguments, view_t c
     return open_database(arguments, access_t::read_only_k);
 }
 
-/** Gathers the column families of the main collection, of both system collections and of every collection @p columns
- *  lists into @p families. */
+/** Gathers the column families of both system collections and of every collection @p columns lists into
+ *  @p families. */
 status_t gather_families(database_t const& database, columns_t const& columns,
                          st::basic_vector<column_t*>& families) noexcept {
-    if (st::failed(families.reserve(columns.size() + 3)))
+    if (st::failed(families.reserve(columns.size() + 2)))
         return {status_code_t::out_of_memory_k, "Failed to gather the column families"};
-    [[maybe_unused]] auto const main_gathered = families.emplace_back(st::assume_reserved, database.main);
     [[maybe_unused]] auto const names_gathered = families.emplace_back(st::assume_reserved, database.names);
     [[maybe_unused]] auto const collections_gathered = families.emplace_back(st::assume_reserved, database.collections);
     for (auto const& [id, family] : columns) [[maybe_unused]]
@@ -805,8 +791,8 @@ status_t gather_families(database_t const& database, columns_t const& columns,
 status_t database_describe(ustore_database_describe_t const& arguments, view_t const&) {
     database_t& database = *handle_cast<database_t>(arguments.database);
     ustore_database_description_t& description = *arguments.description;
-    description.capabilities = ustore_capabilities_t(
-        ustore_capabilities_transactions_k | ustore_capabilities_collections_k | ustore_capabilities_snapshots_k);
+    description.capabilities = ustore_capabilities_t(ustore_capabilities_transactions_k |
+                                                     ustore_capabilities_snapshots_k);
     description.engine = ustore_engine_rocksdb_k;
     description.isolation = ustore_isolation_snapshot_k;
     std::shared_lock lock {database.columns_mutex};
@@ -860,8 +846,8 @@ status_t snapshot_save(ustore_snapshot_save_t const& arguments, view_t const& vi
     snapshot_options.fill_cache = false;
     use_snapshot(view, snapshot_options);
 
-    // Every column family travels under its own name and comparator, the main and the system ones among them, so the
-    // saved database opens with the collections entries that describe its column families
+    // Every column family travels under its own name and comparator, the system ones among them, so the saved database
+    // opens with the collections entries that describe its column families
     st::basic_vector<column_t*> families;
     if (status_t const status = gather_families(database, snapshot.columns, families); status.failed()) return status;
     ustore_size_t total = 0;
@@ -885,12 +871,10 @@ status_t snapshot_save(ustore_snapshot_save_t const& arguments, view_t const& vi
     std::string file_path;
     status_t failure;
     for (column_t* const column : families) {
-        column_t* target = exported->DefaultColumnFamily();
-        if (column != database.main) {
-            ::rocksdb::ColumnFamilyOptions column_options;
-            column_options.comparator = column->GetComparator();
-            status = exported->CreateColumnFamily(column_options, column->GetName(), &target);
-        }
+        column_t* target = nullptr;
+        ::rocksdb::ColumnFamilyOptions column_options;
+        column_options.comparator = column->GetComparator();
+        status = exported->CreateColumnFamily(column_options, column->GetName(), &target);
         if (!status.ok()) break;
 
         ustore_size_t bytes = 0;
@@ -898,7 +882,7 @@ status_t snapshot_save(ustore_snapshot_save_t const& arguments, view_t const& vi
         std::unique_ptr<::rocksdb::Iterator> iterator {database.native->NewIterator(snapshot_options, column)};
         status = iterator ? export_column(*iterator, options, file_path, *exported, target, bytes)
                           : native_status_t::Aborted();
-        if (target != exported->DefaultColumnFamily()) exported->DestroyColumnFamilyHandle(target);
+        exported->DestroyColumnFamilyHandle(target);
         if (!status.ok()) break;
         if (!progress.advance(bytes)) {
             failure = progress_cancelled_k;
@@ -1101,7 +1085,7 @@ status_t blobs_measure(ustore_blobs_measure_t const& arguments, view_t const&) {
     std::uint64_t sst_files_size = 0;
 
     for (std::size_t task_index = 0; task_index != arguments.count; ++task_index) {
-        column_t* const column = column_of(database, collections ? collections[task_index] : ustore_collection_main_k);
+        column_t* const column = column_of(database, collections[task_index]);
         ustore_key_t const start_key = start_keys ? start_keys[task_index] : smallest_key_k;
         ustore_key_t const end_key = end_keys ? end_keys[task_index] : largest_key_k;
         ::rocksdb::Range const range(to_slice(start_key), to_slice(end_key));
@@ -1138,7 +1122,6 @@ status_t blobs_measure(ustore_blobs_measure_t const& arguments, view_t const&) {
  *  entries in one batch, answering the identifier of the collection. The caller holds @c columns_mutex exclusively. */
 expected<ustore_collection_id_t> create_family(database_t& database, ustore_modality_t modality,
                                                std::string_view name) {
-    if (modality > ustore_modality_pages_k) return status_t {status_code_t::invalid_argument_k, "Unknown modality"};
     auto [id, mint_status] = mint_collection_id();
     if (mint_status.failed()) return mint_status;
 
@@ -1202,8 +1185,7 @@ status_t drop_family(database_t& database, ustore_collection_id_t id) {
 status_t collection_create(ustore_collection_create_t const& arguments, view_t const&) {
     if (!arguments.collection) return {status_code_t::invalid_argument_k, "Need an output for the collection"};
     std::string_view const name = string_of(arguments.name);
-    if (arguments.name.data && name.empty())
-        return {status_code_t::invalid_argument_k, "A name is never empty, as the main collection has none"};
+    if (arguments.name.data && name.empty()) return {status_code_t::invalid_argument_k, "A name is never empty"};
 
     // Creators take the column families exclusively, so no other one takes the name between the lookup and the batch
     database_t& database = *handle_cast<database_t>(arguments.database);
@@ -1224,8 +1206,6 @@ status_t collection_drop(ustore_collection_drop_t const& arguments, view_t const
     if (arguments.mode != ustore_drop_collection_k && arguments.mode != ustore_drop_pairs_k &&
         arguments.mode != ustore_drop_values_k)
         return {status_code_t::invalid_argument_k, "Unknown drop mode"};
-    if (arguments.collection == ustore_collection_main_k && arguments.mode == ustore_drop_collection_k)
-        return {status_code_t::invalid_argument_k, "The main collection can only be cleared"};
 
     database_t& database = *handle_cast<database_t>(arguments.database);
     if (arguments.mode == ustore_drop_collection_k) {
@@ -1279,7 +1259,7 @@ status_t collection_find(ustore_collection_find_t const& arguments, strings_arg_
         native_status_t const status = database.native->Get(read_options, database.names,
                                                             ::rocksdb::Slice(string_of(names[index])), &entry);
         if (status.IsNotFound()) {
-            outputs.assign(index, ustore_collection_main_k, ustore_modality_any_k, false);
+            outputs.assign(index, ustore_collection_id_t {}, ustore_modality_t {}, false);
             continue;
         }
         if (!status.ok()) return status_of(status);
@@ -1299,8 +1279,6 @@ status_t collection_find(ustore_collection_find_t const& arguments, strings_arg_
  *  every strings collection, whose values are keys. */
 status_t clear_families(database_t& database, ustore_drop_mode_t mode) {
     std::shared_lock lock {database.columns_mutex};
-    native_status_t const cleared = clear_column(database, database.main, mode);
-    if (!cleared.ok()) return status_of(cleared);
     for (auto const& [id, family] : database.columns) {
         bool const keeps_values = mode == ustore_drop_values_k &&
                                   entry_layout_of(family.modality) == entry_layout_t::strings_to_uuids_k;
@@ -1311,8 +1289,8 @@ status_t clear_families(database_t& database, ustore_drop_mode_t mode) {
     return {};
 }
 
-/** Drops every collection with both of its system entries and clears the main one, unless a snapshot is open, as the
- *  caller owns it and would read a database it never saw. */
+/** Drops every collection with both of its system entries, unless a snapshot is open, as the caller owns it and would
+ *  read a database it never saw. */
 status_t reset_database(database_t& database) {
     if (database.open_snapshots.load(std::memory_order_relaxed) != 0)
         return {status_code_t::invalid_argument_k, "Free every snapshot before resetting the database"};
@@ -1326,7 +1304,7 @@ status_t reset_database(database_t& database) {
         auto const gathered = dropped.push_back(st::assume_reserved, ustore_collection_id_t {id});
     for (ustore_collection_id_t const id : dropped)
         if (status_t const status = drop_family(database, id); status.failed()) return status;
-    return status_of(clear_column(database, database.main, ustore_drop_pairs_k));
+    return {};
 }
 
 status_t database_clear(ustore_database_clear_t const& arguments, view_t const&) {
@@ -1788,6 +1766,7 @@ docs_verbs_t const docs_verbs_k {
     .gather = &docs_gather_over_blobs<values_verbs_k, &resolve_modality>,
     .remove = &remove_over_blobs<values_verbs_k, &resolve_modality, ustore_modality_docs_k>,
     .scan = &scan_over_blobs<values_verbs_k, &resolve_modality, ustore_modality_docs_k>,
+    .sample = &sample_over_blobs<values_verbs_k, &resolve_modality, ustore_modality_docs_k>,
 };
 
 /** The verbs of this engine's graph collections. */

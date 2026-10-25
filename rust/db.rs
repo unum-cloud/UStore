@@ -307,7 +307,6 @@ pub(crate) mod ffi {
     pub const USTORE_CANCEL_K: ustore_enum_t = 1;
 
     pub const USTORE_CAPABILITIES_TRANSACTIONS_K: ustore_enum_t = 1;
-    pub const USTORE_CAPABILITIES_COLLECTIONS_K: ustore_enum_t = 2;
     pub const USTORE_CAPABILITIES_SNAPSHOTS_K: ustore_enum_t = 4;
 
     #[repr(C)]
@@ -969,18 +968,11 @@ pub struct ReadStamp(pub ffi::ustore_stamp_t);
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
 pub struct CommitStamp(pub ffi::ustore_stamp_t);
 
-/// The identifier of a collection: a UUIDv7 the catalog mints once and never reuses, so it stays the same across
-/// restarts and never names two collections.
+/// The identifier of a collection: a UUIDv7 its create mints once and never reuses, so it stays the same across
+/// restarts and never names two collections. The nil UUID names none.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct CollectionID(pub UUID);
-
-impl CollectionID {
-    /// The collection every database holds, named by the nil UUID, which may be cleared but never dropped.
-    pub const fn main() -> Self {
-        CollectionID(UUID([0; 16]))
-    }
-}
 
 impl From<UUID> for CollectionID {
     fn from(uuid: UUID) -> Self {
@@ -1508,11 +1500,8 @@ impl Tape<'_> {
 // region: Options
 
 /// What a collection holds, which an engine records beside its name and refuses the verbs of another modality by.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Modality {
-    /// Anything the blob and document verbs write, which the main collection holds.
-    #[default]
-    Any = 0,
     /// Binary values.
     Blobs = 1,
     /// JSON documents.
@@ -1529,7 +1518,6 @@ impl Modality {
     /// The modality an engine reported, or `None` for one a newer library added.
     pub(crate) fn from_raw(raw: ffi::ustore_enum_t) -> Option<Self> {
         match raw {
-            0 => Some(Modality::Any),
             1 => Some(Modality::Blobs),
             2 => Some(Modality::Docs),
             3 => Some(Modality::Graph),
@@ -1872,7 +1860,7 @@ pub struct Description {
     pub engine: Engine,
     /// How transactions see each other: what the RAM engine was started with, and [`Isolation::Snapshot`] elsewhere.
     pub isolation: Isolation,
-    /// Keys across every collection, the main one included.
+    /// Keys across every collection.
     pub keys: usize,
     /// Bytes of memory the engine holds for the data.
     pub memory_bytes: u64,
@@ -1884,11 +1872,6 @@ impl Description {
     /// Whether the engine supports transactions.
     pub fn supports_transactions(self) -> bool {
         self.capabilities & ffi::USTORE_CAPABILITIES_TRANSACTIONS_K != 0
-    }
-
-    /// Whether the engine supports collections beyond the main one.
-    pub fn supports_collections(self) -> bool {
-        self.capabilities & ffi::USTORE_CAPABILITIES_COLLECTIONS_K != 0
     }
 
     /// Whether the engine supports snapshots.
@@ -2313,8 +2296,7 @@ impl<'view, Parent, Completion> View<'view, Parent, Completion> {
 }
 
 impl<Parent, Completion: sealed::Completion> View<'_, Parent, Completion> {
-    /// Every collection the database holds at this view's snapshot or at the head, the main one excluded, exported
-    /// into the arena.
+    /// Every collection the database holds at this view's snapshot or at the head, exported into the arena.
     ///
     /// Calls `ustore_collection_list`.
     pub fn collection_list<'arena>(&self, arena: &'arena mut Arena) -> Completion::Answer<CollectionList<'arena>> {
@@ -2337,8 +2319,8 @@ impl<Completion: sealed::Completion> View<'_, Database, Completion> {
     }
 
     /// Empties every collection at once, as [`View::collection_drop`] empties one: every pair, keeping the
-    /// collections and their names; every collection but the main one with its name, emptying the main one; or
-    /// every value, keeping the keys where the engine can.
+    /// collections and their names; every collection with its name; or every value, keeping the keys where the
+    /// engine can.
     ///
     /// The RAM and RocksDB engines refuse to drop the collections while a snapshot is open, with
     /// [`Status::InvalidArgument`], since the snapshot belongs to its holder.
@@ -3412,25 +3394,22 @@ impl<Path: AsRef<str>> sealed::Calling for Save<'_, Path> {
 mod tests {
     use super::*;
     use crate::testing::temporary_directory;
-    use crate::testing::{block_on, key, keys};
+    use crate::testing::{block_on, created, key, keys};
 
     #[test]
     fn databases_describe_their_engine_and_what_they_hold() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let description = database.describe().unwrap();
         assert!(description.supports_transactions());
-        assert!(description.supports_collections());
         assert!(description.supports_snapshots());
         assert_eq!((description.engine, description.keys), (Engine::RAM, 0));
 
-        let people = database.collection_create("people", Modality::Any).unwrap();
+        let people = database.collection_create("people", Modality::Blobs).unwrap();
+        let places = database.collection_create("places", Modality::Blobs).unwrap();
         let entries = [crate::blobs::Entry::new(key(1), b"Ada")];
-        database
-            .head()
-            .write(CollectionID::main(), &entries, Durability::Buffered)
-            .unwrap();
         database.head().write(people, &entries, Durability::Buffered).unwrap();
-        assert_eq!(database.describe().unwrap().keys, 2, "the main collection counts too");
+        database.head().write(places, &entries, Durability::Buffered).unwrap();
+        assert_eq!(database.describe().unwrap().keys, 2, "every collection counts");
     }
 
     #[test]
@@ -3439,18 +3418,13 @@ mod tests {
         let mut arena = Arena::new().unwrap();
 
         let database = Database::open_ram(directory.path(), &RAMOptions::default()).unwrap();
+        let blobs = created(&database, Modality::Blobs);
         let entries = [crate::blobs::Entry::new(key(7), b"alpha")];
-        database
-            .head()
-            .write(CollectionID::main(), &entries, Durability::Flushed)
-            .unwrap();
+        database.head().write(blobs, &entries, Durability::Flushed).unwrap();
         drop(database);
 
         let reopened = Database::open_ram(directory.path(), &RAMOptions::default()).unwrap();
-        let values = reopened
-            .head()
-            .read(CollectionID::main(), keys([7]), &mut arena)
-            .unwrap();
+        let values = reopened.head().read(blobs, keys([7]), &mut arena).unwrap();
         assert_eq!(values.get(0), Some(b"alpha".as_slice()));
     }
 
@@ -3503,15 +3477,10 @@ mod tests {
                 continue;
             }
             let database = database.unwrap();
+            let blobs = created(&database, Modality::Blobs);
             let entries = [crate::blobs::Entry::new(key(7), b"alpha")];
-            database
-                .head()
-                .write(CollectionID::main(), &entries, Durability::Flushed)
-                .unwrap();
-            let values = database
-                .head()
-                .read(CollectionID::main(), keys([7]), &mut arena)
-                .unwrap();
+            database.head().write(blobs, &entries, Durability::Flushed).unwrap();
+            let values = database.head().read(blobs, keys([7]), &mut arena).unwrap();
             assert_eq!(values.get(0), Some(b"alpha".as_slice()));
         }
 
@@ -3548,11 +3517,10 @@ mod tests {
                 assert_eq!(database.unwrap_err().status, Status::Unsupported);
                 continue;
             }
-            let values = database
-                .unwrap()
-                .head()
-                .read(CollectionID::main(), keys([7]), &mut arena)
-                .unwrap();
+            let database = database.unwrap();
+            let (blobs, modality) = database.head().collection_find("blobs", &mut arena).unwrap();
+            assert_eq!(modality, Modality::Blobs, "a reopened name keeps its modality");
+            let values = database.head().read(blobs, keys([7]), &mut arena).unwrap();
             assert_eq!(values.get(0), Some(b"alpha".as_slice()));
         }
     }
@@ -3562,17 +3530,17 @@ mod tests {
     fn a_viewed_rocksdb_database_reads_and_refuses_changes() {
         let directory = temporary_directory("database_viewed");
         let mut arena = Arena::new().unwrap();
-        let main = CollectionID::main();
         let entries = [crate::blobs::Entry::new(key(7), b"alpha")];
         let written = Database::open_rocksdb(&RocksDBOptions::at(directory.path())).unwrap();
-        written.head().write(main, &entries, Durability::Flushed).unwrap();
+        let blobs = created(&written, Modality::Blobs);
+        written.head().write(blobs, &entries, Durability::Flushed).unwrap();
         drop(written);
 
         let viewed = Database::view_rocksdb(&RocksDBOptions::at(directory.path())).unwrap();
         assert_eq!(viewed.describe().unwrap().engine, Engine::RocksDB);
-        let values = viewed.head().read(main, keys([7]), &mut arena).unwrap();
+        let values = viewed.head().read(blobs, keys([7]), &mut arena).unwrap();
         assert_eq!(values.get(0), Some(b"alpha".as_slice()));
-        let write = viewed.head().write(main, &entries, Durability::Buffered).unwrap_err();
+        let write = viewed.head().write(blobs, &entries, Durability::Buffered).unwrap_err();
         let clear = viewed.clear(DropMode::Pairs).unwrap_err();
         let compact = viewed.compact(None).unwrap_err();
         for refusal in [write, clear, compact] {
@@ -3584,7 +3552,7 @@ mod tests {
     fn databases_clear_values_pairs_or_collections() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new().unwrap();
-        let people = database.collection_create("people", Modality::Any).unwrap();
+        let people = database.collection_create("people", Modality::Blobs).unwrap();
         let entries = [crate::blobs::Entry::new(key(1), b"Ada")];
         database.head().write(people, &entries, Durability::Buffered).unwrap();
 
@@ -3620,7 +3588,7 @@ mod tests {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let entries = [crate::blobs::Entry::new(key(1), b"Ada")];
         for name in ["people", "places"] {
-            let collection = database.collection_create(name, Modality::Any).unwrap();
+            let collection = database.collection_create(name, Modality::Blobs).unwrap();
             database
                 .head()
                 .write(collection, &entries, Durability::Buffered)
@@ -3678,11 +3646,12 @@ mod tests {
         // Zero threads derive their count from the cores of every domain.
         let derived = Executor::for_ram(&[], 0, 0).unwrap();
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
+        let blobs = created(&database, Modality::Blobs);
         let entries = [crate::blobs::Entry::new(key(1), b"Ada")];
         database
             .head()
             .on(&derived)
-            .write(CollectionID::main(), &entries, Durability::Buffered)
+            .write(blobs, &entries, Durability::Buffered)
             .unwrap();
     }
 
@@ -3722,14 +3691,18 @@ mod tests {
     fn collections_are_created_found_listed_and_dropped() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new().unwrap();
+        assert!(
+            database.head().collection_list(&mut arena).unwrap().is_empty(),
+            "a database holds no collection until one is created"
+        );
 
-        let people = database.collection_create("people", Modality::Any).unwrap();
+        let people = database.collection_create("people", Modality::Blobs).unwrap();
         let places = database.collection_create("places", Modality::Graph).unwrap();
         assert_ne!(people, places);
         let head = database.head();
         assert_eq!(
             head.collection_find("people", &mut arena).unwrap(),
-            (people, Modality::Any)
+            (people, Modality::Blobs)
         );
         assert_eq!(
             head.collection_find("places", &mut arena).unwrap(),
@@ -3738,12 +3711,15 @@ mod tests {
         );
 
         let listed = head.collection_list(&mut arena).unwrap();
-        assert_eq!(listed.len(), 2, "the main collection is never listed");
+        assert_eq!(listed.len(), 2, "the system collections are never listed");
         assert!(listed.contains(&people) && listed.contains(&places));
 
         // A name is bound once, and a name nobody bound addresses nothing.
         assert_eq!(
-            database.collection_create("people", Modality::Any).unwrap_err().status,
+            database
+                .collection_create("people", Modality::Blobs)
+                .unwrap_err()
+                .status,
             Status::AlreadyExists
         );
         assert_eq!(
@@ -3760,30 +3736,24 @@ mod tests {
     }
 
     #[test]
-    fn the_main_collection_clears_but_never_drops() {
+    fn collections_clear_their_pairs_or_drop_whole() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new().unwrap();
+        let people = database.collection_create("people", Modality::Blobs).unwrap();
         let entries = [crate::blobs::Entry::new(key(1), b"alpha")];
-        database
-            .head()
-            .write(CollectionID::main(), &entries, Durability::Buffered)
-            .unwrap();
+        database.head().write(people, &entries, Durability::Buffered).unwrap();
 
-        let failure = database
-            .collection_drop(CollectionID::main(), DropMode::Collection)
-            .unwrap_err();
-        assert_eq!(failure.status, Status::InvalidArgument);
-
-        database.collection_drop(CollectionID::main(), DropMode::Pairs).unwrap();
-        let values = database
-            .head()
-            .read(CollectionID::main(), &keys([1]), &mut arena)
-            .unwrap();
+        database.collection_drop(people, DropMode::Pairs).unwrap();
+        let values = database.head().read(people, &keys([1]), &mut arena).unwrap();
         assert_eq!(values.get(0), None);
+        assert_eq!(
+            database.head().collection_list(&mut arena).unwrap(),
+            &[people],
+            "clearing the pairs keeps the collection"
+        );
 
-        // A deferred view of the head clears the same way.
+        // A deferred view of the head drops the collection whole.
         let executor = Executor::for_ram(&[], 1, 0).unwrap();
-        let people = database.collection_create("people", Modality::Any).unwrap();
         database.head().write(people, &entries, Durability::Buffered).unwrap();
         database
             .head()
@@ -3798,60 +3768,53 @@ mod tests {
     #[test]
     fn transactions_commit_what_they_wrote() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
+        let blobs = created(&database, Modality::Blobs);
         let mut arena = Arena::new().unwrap();
         let mut transaction = database.transaction().unwrap();
         let entries = [crate::blobs::Entry::new(key(1), b"alpha")];
         transaction
             .view(Watch::Keys)
-            .write(CollectionID::main(), &entries, Durability::Buffered)
+            .write(blobs, &entries, Durability::Buffered)
             .unwrap();
 
         // Nothing is visible at the head until the commit lands.
-        let before = database
-            .head()
-            .read(CollectionID::main(), keys([1]), &mut arena)
-            .unwrap();
+        let before = database.head().read(blobs, keys([1]), &mut arena).unwrap();
         assert_eq!(before.get(0), None);
 
         let staged = transaction.stage().unwrap();
         let committed = transaction.commit(Durability::Buffered).unwrap();
         assert!(committed.0 >= staged.0);
 
-        let after = database
-            .head()
-            .read(CollectionID::main(), keys([1]), &mut arena)
-            .unwrap();
+        let after = database.head().read(blobs, keys([1]), &mut arena).unwrap();
         assert_eq!(after.get(0), Some(b"alpha".as_slice()));
     }
 
     #[test]
     fn transactions_reset_and_run_again() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
+        let blobs = created(&database, Modality::Blobs);
         let mut arena = Arena::new().unwrap();
         let mut transaction = database.transaction().unwrap();
         let abandoned = [crate::blobs::Entry::new(key(2), b"abandoned")];
         let other = [crate::blobs::Entry::new(key(3), b"abandoned")];
         transaction
             .view(Watch::Keys)
-            .write(CollectionID::main(), &abandoned, Durability::Buffered)
+            .write(blobs, &abandoned, Durability::Buffered)
             .unwrap();
         transaction
             .view(Watch::Keys)
-            .write(CollectionID::main(), &other, Durability::Buffered)
+            .write(blobs, &other, Durability::Buffered)
             .unwrap();
         transaction.reset().unwrap();
 
         let kept = [crate::blobs::Entry::new(key(2), b"kept")];
         transaction
             .view(Watch::Keys)
-            .write(CollectionID::main(), &kept, Durability::Buffered)
+            .write(blobs, &kept, Durability::Buffered)
             .unwrap();
         transaction.commit(Durability::Buffered).unwrap();
 
-        let values = database
-            .head()
-            .read(CollectionID::main(), keys([2, 3]), &mut arena)
-            .unwrap();
+        let values = database.head().read(blobs, keys([2, 3]), &mut arena).unwrap();
         assert_eq!(values.get(0), Some(b"kept".as_slice()));
         assert_eq!(values.get(1), None, "a reset forgets every write before it");
     }
@@ -3859,32 +3822,31 @@ mod tests {
     #[test]
     fn transactions_roll_back_a_stage_and_keep_their_writes() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
+        let blobs = created(&database, Modality::Blobs);
         let mut arena = Arena::new().unwrap();
         let mut transaction = database.transaction().unwrap();
         let kept = [crate::blobs::Entry::new(key(2), b"kept")];
         transaction
             .view(Watch::Keys)
-            .write(CollectionID::main(), &kept, Durability::Buffered)
+            .write(blobs, &kept, Durability::Buffered)
             .unwrap();
         transaction.stage().unwrap();
         transaction.rollback().unwrap();
         transaction.commit(Durability::Buffered).unwrap();
 
-        let values = database
-            .head()
-            .read(CollectionID::main(), keys([2]), &mut arena)
-            .unwrap();
+        let values = database.head().read(blobs, keys([2]), &mut arena).unwrap();
         assert_eq!(values.get(0), Some(b"kept".as_slice()));
     }
 
     #[test]
     fn transactions_refuse_a_flush_of_their_own() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
+        let blobs = created(&database, Modality::Blobs);
         let transaction = database.transaction().unwrap();
         let entries = [crate::blobs::Entry::new(key(3), b"alpha")];
         let failure = transaction
             .view(Watch::Keys)
-            .write(CollectionID::main(), &entries, Durability::Flushed)
+            .write(blobs, &entries, Durability::Flushed)
             .unwrap_err();
         assert_eq!(failure.status, Status::InvalidArgument);
     }
@@ -3892,6 +3854,7 @@ mod tests {
     #[test]
     fn transactions_conflict_rather_than_block() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
+        let blobs = created(&database, Modality::Blobs);
         let mut first = database.transaction().unwrap();
         let mut second = database.transaction().unwrap();
 
@@ -3899,11 +3862,11 @@ mod tests {
         let yours = [crate::blobs::Entry::new(key(4), b"yours")];
         first
             .view(Watch::Keys)
-            .write(CollectionID::main(), &mine, Durability::Buffered)
+            .write(blobs, &mine, Durability::Buffered)
             .unwrap();
         second
             .view(Watch::Keys)
-            .write(CollectionID::main(), &yours, Durability::Buffered)
+            .write(blobs, &yours, Durability::Buffered)
             .unwrap();
         first.commit(Durability::Buffered).unwrap();
 
@@ -3925,24 +3888,19 @@ mod tests {
             ..RAMOptions::default()
         })
         .unwrap();
+        let blobs = created(&database, Modality::Blobs);
         let mut arena = Arena::new().unwrap();
         let seed = [crate::blobs::Entry::new(key(8), b"seed")];
-        database
-            .head()
-            .write(CollectionID::main(), &seed, Durability::Buffered)
-            .unwrap();
+        database.head().write(blobs, &seed, Durability::Buffered).unwrap();
 
         // A watched read is part of the serial order, so a writer that lands under it conflicts.
         let mut watched = database.transaction().unwrap();
-        let read = watched
-            .view(Watch::Keys)
-            .read(CollectionID::main(), keys([8]), &mut arena)
-            .unwrap();
+        let read = watched.view(Watch::Keys).read(blobs, keys([8]), &mut arena).unwrap();
         assert_eq!(read.get(0), Some(b"seed".as_slice()));
         let overwritten = [crate::blobs::Entry::new(key(8), b"overwritten")];
         database
             .head()
-            .write(CollectionID::main(), &overwritten, Durability::Buffered)
+            .write(blobs, &overwritten, Durability::Buffered)
             .unwrap();
         let failure = watched.commit(Durability::Buffered).unwrap_err();
         assert!(
@@ -3952,67 +3910,45 @@ mod tests {
 
         // The same run through an unwatched view records nothing, so the commit stands.
         let mut unwatched = database.transaction().unwrap();
-        let read = unwatched
-            .view(Watch::None)
-            .read(CollectionID::main(), keys([8]), &mut arena)
-            .unwrap();
+        let read = unwatched.view(Watch::None).read(blobs, keys([8]), &mut arena).unwrap();
         assert_eq!(read.get(0), Some(b"overwritten".as_slice()));
         let again = [crate::blobs::Entry::new(key(8), b"again")];
-        database
-            .head()
-            .write(CollectionID::main(), &again, Durability::Buffered)
-            .unwrap();
+        database.head().write(blobs, &again, Durability::Buffered).unwrap();
         unwatched.commit(Durability::Buffered).unwrap();
     }
 
     #[test]
     fn snapshots_hold_the_state_they_were_taken_at() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
+        let blobs = created(&database, Modality::Blobs);
         let executor = Executor::for_ram(&[], 1, 0).unwrap();
         let mut arena = Arena::new().unwrap();
         let before = [crate::blobs::Entry::new(key(5), b"before")];
-        database
-            .head()
-            .write(CollectionID::main(), &before, Durability::Buffered)
-            .unwrap();
+        database.head().write(blobs, &before, Durability::Buffered).unwrap();
 
         let snapshot = database.snapshot().unwrap();
         let after = [crate::blobs::Entry::new(key(5), b"after")];
-        database
-            .head()
-            .write(CollectionID::main(), &after, Durability::Buffered)
-            .unwrap();
+        database.head().write(blobs, &after, Durability::Buffered).unwrap();
 
-        let pinned = snapshot
-            .view()
-            .read(CollectionID::main(), keys([5]), &mut arena)
-            .unwrap();
+        let pinned = snapshot.view().read(blobs, keys([5]), &mut arena).unwrap();
         assert_eq!(pinned.get(0), Some(b"before".as_slice()));
-        let pinned = snapshot
-            .on(&executor)
-            .read(CollectionID::main(), keys([5]), &mut arena)
-            .unwrap();
+        let pinned = snapshot.on(&executor).read(blobs, keys([5]), &mut arena).unwrap();
         assert_eq!(
             pinned.get(0),
             Some(b"before".as_slice()),
             "a snapshot reads the same on an executor"
         );
-        let latest = database
-            .head()
-            .read(CollectionID::main(), keys([5]), &mut arena)
-            .unwrap();
+        let latest = database.head().read(blobs, keys([5]), &mut arena).unwrap();
         assert_eq!(latest.get(0), Some(b"after".as_slice()));
     }
 
     #[test]
     fn snapshots_save_a_database_of_their_own() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
+        let blobs = created(&database, Modality::Blobs);
         let mut arena = Arena::new().unwrap();
         let entries = [crate::blobs::Entry::new(key(6), b"saved")];
-        database
-            .head()
-            .write(CollectionID::main(), &entries, Durability::Buffered)
-            .unwrap();
+        database.head().write(blobs, &entries, Durability::Buffered).unwrap();
 
         let directory = temporary_directory("snapshot_saves");
         let deferred_directory = temporary_directory("snapshot_saves_deferred");
@@ -4032,36 +3968,37 @@ mod tests {
 
         for path in [directory.path(), deferred_directory.path()] {
             let saved = Database::open_ram(path, &RAMOptions::default()).unwrap();
-            let values = saved.head().read(CollectionID::main(), &keys([6]), &mut arena).unwrap();
+            let values = saved.head().read(blobs, &keys([6]), &mut arena).unwrap();
             assert_eq!(values.get(0), Some(b"saved".as_slice()));
         }
     }
 
-    /// A database whose main collection holds `count` keys from zero, so a call over all of them is still deferred
+    /// A database whose blobs collection holds `count` keys from zero, so a call over all of them is still deferred
     /// when the next call is submitted.
-    fn crowded(count: u64) -> Database {
+    fn crowded(count: u64) -> (Database, CollectionID) {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
+        let blobs = created(&database, Modality::Blobs);
         let keys: Vec<Key> = (0..count).map(Key::from).collect();
         let values: stringtape::BytesTape<u64> = keys.iter().map(|_| b"value".as_slice()).collect();
         database
             .head()
-            .write(CollectionID::main(), (keys, values), Durability::Buffered)
+            .write(blobs, (keys, values), Durability::Buffered)
             .unwrap();
-        database
+        (database, blobs)
     }
 
     #[test]
     fn transaction_verbs_block_or_defer_on_an_executor() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
+        let blobs = created(&database, Modality::Blobs);
         let executor = Executor::for_ram(&[], 2, 0).unwrap();
         let mut arena = Arena::new().unwrap();
-        let main = CollectionID::main();
 
         // A blocking view on the executor answers the stamps directly.
         let transaction = database.transaction().unwrap();
         let blocked = [crate::blobs::Entry::new(key(1), b"blocked")];
         let on_executor = transaction.on(&executor);
-        on_executor.write(main, &blocked, Durability::Buffered).unwrap();
+        on_executor.write(blobs, &blocked, Durability::Buffered).unwrap();
         let staged = on_executor.stage().unwrap();
         let first = on_executor.commit(Durability::Buffered).unwrap();
         assert!(staged.0 <= first.0);
@@ -4071,7 +4008,7 @@ mod tests {
         let kept = [crate::blobs::Entry::new(key(2), b"kept")];
         transaction
             .view(Watch::Keys)
-            .write(main, &kept, Durability::Buffered)
+            .write(blobs, &kept, Durability::Buffered)
             .unwrap();
         let deferred = transaction.deferred(&executor);
         let staged = deferred.stage().unwrap().wait().unwrap();
@@ -4083,7 +4020,7 @@ mod tests {
         let abandoned = [crate::blobs::Entry::new(key(3), b"abandoned")];
         transaction
             .view(Watch::Keys)
-            .write(main, &abandoned, Durability::Buffered)
+            .write(blobs, &abandoned, Durability::Buffered)
             .unwrap();
         transaction.deferred(&executor).reset().unwrap().wait().unwrap();
         transaction
@@ -4093,7 +4030,7 @@ mod tests {
             .wait()
             .unwrap();
 
-        let values = database.head().read(main, &keys([1, 2, 3]), &mut arena).unwrap();
+        let values = database.head().read(blobs, &keys([1, 2, 3]), &mut arena).unwrap();
         let read: Vec<Option<&[u8]>> = values.iter().collect();
         assert_eq!(read, [Some(b"blocked".as_slice()), Some(b"kept"), None]);
     }
@@ -4103,7 +4040,7 @@ mod tests {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let executor = Executor::for_ram(&[], 1, 0).unwrap();
         let mut arena = Arena::new_in(&executor).unwrap();
-        let people = database.collection_create("people", Modality::Any).unwrap();
+        let people = database.collection_create("people", Modality::Blobs).unwrap();
         let snapshot = database.snapshot().unwrap();
         let places = database.collection_create("places", Modality::Graph).unwrap();
 
@@ -4128,7 +4065,10 @@ mod tests {
     fn one_arena_serves_every_verb_in_turn() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let executor = Executor::for_ram(&[], 2, 0).unwrap();
-        let people = database.collection_create("people", Modality::Any).unwrap();
+        let people = database.collection_create("people", Modality::Docs).unwrap();
+        let names = created(&database, Modality::Blobs);
+        let entries = [crate::blobs::Entry::new(key(1), b"Ada")];
+        database.head().write(names, &entries, Durability::Buffered).unwrap();
         let documents = [crate::docs::DocumentEntry::<crate::docs::Json>::new(
             key(1),
             r#"{"name":"Ada"}"#,
@@ -4141,13 +4081,14 @@ mod tests {
 
         for mut arena in [Arena::new().unwrap(), Arena::new_in(&executor).unwrap()] {
             let head = database.head().on(&executor);
-            assert_eq!(head.read(people, keys([1, 2]), &mut arena).unwrap().get(1), None);
-            assert_eq!(head.scan(people, key(0), 10, &mut arena).unwrap(), &keys([1]));
+            assert_eq!(head.read(names, keys([1, 2]), &mut arena).unwrap().get(1), None);
+            assert_eq!(head.scan(names, key(0), 10, &mut arena).unwrap(), &keys([1]));
             assert_eq!(head.docs_gist(people, keys([1]), &mut arena).unwrap().len(), 1);
-            assert_eq!(head.collection_list(&mut arena).unwrap(), &[people]);
+            let listed = head.collection_list(&mut arena).unwrap();
+            assert!(listed.len() == 2 && listed.contains(&people) && listed.contains(&names));
             assert_eq!(
                 head.collection_find("people", &mut arena).unwrap(),
-                (people, Modality::Any)
+                (people, Modality::Docs)
             );
         }
     }
@@ -4181,16 +4122,15 @@ mod tests {
 
     #[test]
     fn deferred_calls_resolve_through_await() {
-        let database = crowded(1_000);
+        let (database, blobs) = crowded(1_000);
         let executor = Executor::for_ram(&[], 1, 0).unwrap();
         let mut arena = Arena::new_in(&executor).unwrap();
         let deferred = database.head().deferred(&executor);
-        let main = CollectionID::main();
 
         let values = block_on(async {
             let fresh: stringtape::BytesTape<u64> = [b"fresh".as_slice()].into_iter().collect();
-            deferred.write(main, (keys([7]), fresh), Durability::Buffered)?.await?;
-            deferred.read(main, keys([7, 8, 9_999]), &mut arena)?.await
+            deferred.write(blobs, (keys([7]), fresh), Durability::Buffered)?.await?;
+            deferred.read(blobs, keys([7, 8, 9_999]), &mut arena)?.await
         })
         .unwrap();
         let read: Vec<Option<&[u8]>> = values.iter().collect();
@@ -4205,15 +4145,15 @@ mod tests {
     #[test]
     fn stamps_order_reads_before_commits_before_later_snapshots() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
+        let blobs = created(&database, Modality::Blobs);
         let mut arena = Arena::new().unwrap();
-        let main = CollectionID::main();
         let earlier = database.snapshot().unwrap();
 
         let mut transaction = database.transaction().unwrap();
         let entries = [crate::blobs::Entry::new(key(1), b"alpha")];
         transaction
             .view(Watch::Keys)
-            .write(main, &entries, Durability::Buffered)
+            .write(blobs, &entries, Durability::Buffered)
             .unwrap();
         let read = transaction.stage().unwrap();
         let commit = transaction.commit(Durability::Buffered).unwrap();
@@ -4225,9 +4165,9 @@ mod tests {
             commit.0 <= later.read_stamp().0,
             "a later snapshot reads at or above the commit"
         );
-        let seen = later.view().read(main, &keys([1]), &mut arena).unwrap();
+        let seen = later.view().read(blobs, &keys([1]), &mut arena).unwrap();
         assert_eq!(seen.get(0), Some(b"alpha".as_slice()));
-        let unseen = earlier.view().read(main, &keys([1]), &mut arena).unwrap();
+        let unseen = earlier.view().read(blobs, &keys([1]), &mut arena).unwrap();
         assert_eq!(unseen.get(0), None);
     }
 
@@ -4235,11 +4175,11 @@ mod tests {
     fn a_forgotten_deferred_call_holds_its_database_open() {
         let executor = Executor::for_ram(&[], 1, 0).unwrap();
         let mut arena = Arena::new_in(&executor).unwrap();
-        let database = crowded(100_000);
+        let (database, blobs) = crowded(100_000);
         let scan = database
             .head()
             .deferred(&executor)
-            .scan(CollectionID::main(), key(0), 100_000, &mut arena)
+            .scan(blobs, key(0), 100_000, &mut arena)
             .unwrap();
         let lent = scan.lent;
         std::mem::forget(scan);
@@ -4255,30 +4195,28 @@ mod tests {
     fn a_dropped_deferred_call_waits_until_it_is_final() {
         let executor = Executor::for_ram(&[], 1, 0).unwrap();
         let mut arena = Arena::new_in(&executor).unwrap();
-        let database = crowded(100_000);
-        let main = CollectionID::main();
+        let (database, blobs) = crowded(100_000);
         let scan = database
             .head()
             .deferred(&executor)
-            .scan(main, key(0), 100_000, &mut arena)
+            .scan(blobs, key(0), 100_000, &mut arena)
             .unwrap();
         drop(scan);
 
         // The drop waited for the scan to release the arena, so the next call through it is not contended.
-        assert_eq!(database.head().scan(main, key(0), 1, &mut arena).unwrap(), &keys([0]));
+        assert_eq!(database.head().scan(blobs, key(0), 1, &mut arena).unwrap(), &keys([0]));
     }
 
     #[test]
     fn a_full_deferred_table_answers_contended() {
-        let database = crowded(100_000);
+        let (database, blobs) = crowded(100_000);
         let executor = Executor::for_ram(&[], 1, 1).unwrap();
         let mut scanned = Arena::new_in(&executor).unwrap();
         let mut measured = Arena::new_in(&executor).unwrap();
         let head = database.head().deferred(&executor);
-        let main = CollectionID::main();
 
-        let scan = head.scan(main, key(0), 100_000, &mut scanned).unwrap();
-        let refused = head.measure(main, key(0), key(9), &mut measured).unwrap();
+        let scan = head.scan(blobs, key(0), 100_000, &mut scanned).unwrap();
+        let refused = head.measure(blobs, key(0), key(9), &mut measured).unwrap();
         assert_eq!(
             refused.status(),
             Err(Status::Contended),
@@ -4286,7 +4224,7 @@ mod tests {
         );
         assert_eq!(refused.wait().unwrap_err().status, Status::Contended);
         assert_eq!(scan.wait().unwrap().len(), 100_000);
-        head.measure(main, key(0), key(9), &mut measured)
+        head.measure(blobs, key(0), key(9), &mut measured)
             .unwrap()
             .wait()
             .unwrap();
@@ -4294,28 +4232,27 @@ mod tests {
 
     #[test]
     fn a_transaction_serving_a_deferred_call_answers_contended() {
-        let database = crowded(100_000);
+        let (database, blobs) = crowded(100_000);
         let executor = Executor::for_ram(&[], 1, 0).unwrap();
         let transaction = database.transaction().unwrap();
-        let main = CollectionID::main();
         let mut arena = Arena::new().unwrap();
         let mut deferred_arena = Arena::new_in(&executor).unwrap();
 
         let every: Vec<Key> = (0..100_000u64).map(Key::from).collect();
         let read = transaction
             .deferred(&executor)
-            .read(main, every, &mut deferred_arena)
+            .read(blobs, every, &mut deferred_arena)
             .unwrap();
         let refused = transaction
             .view(Watch::Keys)
-            .read(main, &keys([1]), &mut arena)
+            .read(blobs, &keys([1]), &mut arena)
             .unwrap_err();
         assert_eq!(refused.status, Status::Contended);
 
         assert_eq!(read.wait().unwrap().len(), 100_000);
         let after = transaction
             .view(Watch::Keys)
-            .read(main, &keys([1]), &mut arena)
+            .read(blobs, &keys([1]), &mut arena)
             .unwrap();
         assert_eq!(after.get(0), Some(b"value".as_slice()));
     }
@@ -4323,13 +4260,13 @@ mod tests {
     #[test]
     fn a_drain_returns_once_every_earlier_call_is_final() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
+        let blobs = created(&database, Modality::Blobs);
         let executor = Executor::for_ram(&[], 2, 0).unwrap();
         let head = database.head().deferred(&executor);
         let writes: Vec<_> = (0..4)
             .map(|index| {
                 let value: stringtape::BytesTape<u64> = [b"value".as_slice()].into_iter().collect();
-                head.write(CollectionID::main(), ([key(index)], value), Durability::Buffered)
-                    .unwrap()
+                head.write(blobs, ([key(index)], value), Durability::Buffered).unwrap()
             })
             .collect();
 

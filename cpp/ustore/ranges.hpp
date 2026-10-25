@@ -358,7 +358,7 @@ struct place_batch_t {
     place_t operator[](std::size_t index) const noexcept {
         auto const signed_index = static_cast<std::ptrdiff_t>(index);
         ustore_collection_id_t collection = collections_begin ? collections_begin[signed_index]
-                                                              : ustore_collection_main_k;
+                                                              : ustore_collection_id_t {};
         ustore_key_t const& key = keys_begin[signed_index];
         std::string_view field = fields_begin ? fields_begin[signed_index] : std::string_view {};
         return {collection, key, field};

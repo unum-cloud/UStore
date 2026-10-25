@@ -84,7 +84,7 @@ typedef struct ustore_pages_import_t {
     /** Number of pages. */
     ustore_size_t count;
 
-    /** Collections of the pages, where @c NULL data stands for the main collection. */
+    /** Collections of the pages. */
     ustore_collections_view_t collections;
 
     /** Keys of the pages. */
@@ -137,7 +137,7 @@ typedef struct ustore_pages_insert_t {
     /** Number of insertions. */
     ustore_size_t count;
 
-    /** Collections of the pages, where @c NULL data stands for the main collection. */
+    /** Collections of the pages. */
     ustore_collections_view_t collections;
 
     /** Keys of the pages. */
@@ -199,7 +199,7 @@ typedef struct ustore_pages_remove_t {
     /** Number of removals. */
     ustore_size_t count;
 
-    /** Collections of the pages, where @c NULL data stands for the main collection. */
+    /** Collections of the pages. */
     ustore_collections_view_t collections;
 
     /** Keys of the pages. */
@@ -243,7 +243,7 @@ typedef struct ustore_pages_move_t {
     /** Number of moves. */
     ustore_size_t count;
 
-    /** Collections of the pages, where @c NULL data stands for the main collection. */
+    /** Collections of the pages. */
     ustore_collections_view_t collections;
 
     /** Keys of the pages. */
@@ -293,7 +293,7 @@ typedef struct ustore_pages_splice_t {
     /** Number of splices. */
     ustore_size_t count;
 
-    /** Collections of the pages, where @c NULL data stands for the main collection. */
+    /** Collections of the pages. */
     ustore_collections_view_t collections;
 
     /** Keys of the pages. */
@@ -346,7 +346,7 @@ typedef struct ustore_pages_set_attributes_t {
     /** Number of attributes to set. */
     ustore_size_t count;
 
-    /** Collections of the pages, where @c NULL data stands for the main collection. */
+    /** Collections of the pages. */
     ustore_collections_view_t collections;
 
     /** Keys of the pages. */
@@ -396,7 +396,7 @@ typedef struct ustore_pages_remove_attributes_t {
     /** Number of attributes to remove. */
     ustore_size_t count;
 
-    /** Collections of the pages, where @c NULL data stands for the main collection. */
+    /** Collections of the pages. */
     ustore_collections_view_t collections;
 
     /** Keys of the pages. */
@@ -449,7 +449,7 @@ typedef struct ustore_pages_read_t {
     /** Number of pages or subtrees to render. */
     ustore_size_t count;
 
-    /** Collections of the pages, where @c NULL data stands for the main collection. */
+    /** Collections of the pages. */
     ustore_collections_view_t collections;
 
     /** Keys of the pages. */
@@ -508,7 +508,7 @@ typedef struct ustore_pages_scan_t {
     /** Number of scans. */
     ustore_size_t count;
 
-    /** Collections of the pages, where @c NULL data stands for the main collection. */
+    /** Collections of the pages. */
     ustore_collections_view_t collections;
 
     /** Smallest page key every scan may return, where @c NULL data starts at the first page. */

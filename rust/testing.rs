@@ -1,12 +1,12 @@
-//! A directory the suites open persistent databases in, removed when the test that took it ends, and the one-thread
-//! executor their `async` blocks run on.
+//! A directory the suites open persistent databases in, removed when the test that took it ends, the one-thread
+//! executor their `async` blocks run on, and the collection each suite writes into.
 
 use std::fs;
 use std::future::Future;
 use std::pin::pin;
 use std::task::{Context, Poll, Waker};
 
-use crate::db::Key;
+use crate::db::{CollectionID, Database, Key, Modality};
 
 /// Polls `task` on the calling thread until it is ready, over a waker that does nothing, since a deferred call that
 /// is not final asks to be polled again.
@@ -18,6 +18,11 @@ pub fn block_on<Output>(task: impl Future<Output = Output>) -> Output {
             return output;
         }
     }
+}
+
+/// A collection holding `modality`, named after it, since a database holds none until one is created.
+pub fn created(database: &Database, modality: Modality) -> CollectionID {
+    database.collection_create(&modality.to_string(), modality).unwrap()
 }
 
 /// The key that spells `integer`, which the suites number their keys with.

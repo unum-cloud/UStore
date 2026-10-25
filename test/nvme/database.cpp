@@ -237,8 +237,8 @@ template <typename volume_type_>
 template <typename volume_type_>
 [[nodiscard]] std::size_t runs_named_by_schema(volume_type_ const& volume, std::size_t collections,
                                                std::uint64_t generation) noexcept {
-    expected<volume_blob_t> const found = volume.find(database_schema_name(catalog_copy_of(generation)));
-    std::size_t const fixed = 3 * sizeof(std::uint64_t) + sizeof(catalog_stamps_t) +
+    expected<volume_blob_t> const found = volume.find(database_schema_name(schema_copy_of(generation)));
+    std::size_t const fixed = 3 * sizeof(std::uint64_t) + sizeof(schema_stamps_t) +
                               collections * sizeof(collection_record_t);
     if (!found || found->length < fixed) return 0;
     return static_cast<std::size_t>((found->length - fixed) / sizeof(lsm_tree_run_record_t));
@@ -514,7 +514,7 @@ std::size_t catalog_survives_reopen(mount_type_ const& mount) {
 
     // A merge records its new set before it drops what it consumed, so neither outlives the other.
     failures += expect_eq(
-        runs_named_by_schema((*stack)->router.volume(volume_id_t {0}), 3, (*stack)->store->catalog_generation()),
+        runs_named_by_schema((*stack)->router.volume(volume_id_t {0}), 3, (*stack)->store->schema_generation()),
         run_count_of((*stack)->router.volume(volume_id_t {0})));
     for (std::uint64_t key = 0; key < keys_k; key += 3) failures += write_painted(*(*stack)->store, named, key, 2);
     failures += expect((*stack)->store->flush().succeeded());
@@ -549,7 +549,7 @@ std::size_t catalog_survives_reopen(mount_type_ const& mount) {
     failures += expect_eq(restored.memory_runs_max_deltas, std::size_t {4096});
     failures += expect_eq(store.buffer_size_for_any_stored_value(any_collection_id_t {*numbers}),
                           stored_value_size_t {8});
-    ustore_modality_t modality = ustore_modality_any_k;
+    ustore_modality_t modality {};
     failures += expect(store.collection_modality(*blobs, modality).succeeded());
     failures += expect(modality == ustore_modality_blobs_k);
 
@@ -767,7 +767,7 @@ std::size_t crash_between_seal_and_schema(mount_type_ const& mount) {
         failures += expect((*stack)->store->flush().succeeded());
 
         // A flush seals its runs and records them second, so the catalog already names every run.
-        failures += expect_eq(runs_named_by_schema(volume, 1, (*stack)->store->catalog_generation()),
+        failures += expect_eq(runs_named_by_schema(volume, 1, (*stack)->store->schema_generation()),
                               run_count_of(volume));
         failures += expect((*stack)->store->unmount().succeeded());
         (*stack)->store.reset();

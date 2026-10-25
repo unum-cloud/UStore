@@ -40,7 +40,7 @@ from ustore.lib import (
 
 type Blocking = Database | Transaction | View
 type Receiver = Blocking | DeferredView
-type CollectionLike = UUID | str | None
+type CollectionLike = UUID | str
 type Attributes = dict[str, Any]
 type Triple = tuple[UUID, UUID, UUID]
 type KeysLike = Sequence[KeyLike] | Buffer
@@ -48,8 +48,6 @@ type KeysLike = Sequence[KeyLike] | Buffer
 
 def resolve_collection(view: Receiver, collection: CollectionLike, modality: Modality) -> UUID:
     """Answers the ID a collection argument addresses, creating a named one that is missing to hold `modality`."""
-    if collection is None:
-        return UUID(int=0)
     if not isinstance(collection, str):
         return collection
     database = view if isinstance(view, Database) else view.database
@@ -250,7 +248,7 @@ class Graph:
         return sum(1 for _ in self)
 
     def __contains__(self, node: KeyLike) -> bool:
-        return self.blocking.contains(node, collection=self.graph_collection)
+        return self.blocking.graph_contains(node, collection=self.graph_collection)
 
     def __getitem__(self, node: KeyLike) -> dict[UUID, Any]:
         """The neighbours of a vertex with the attributes of the edges reaching them, keyed by edge in a multigraph."""
@@ -275,7 +273,9 @@ class Graph:
 
     def has_node(self, node: KeyLike) -> bool | Deferred[bool]:
         """Whether the vertex is present, or the `Deferred` of it over a deferred view."""
-        return self.view.contains(node, collection=self.graph_collection)
+        if isinstance(self.view, DeferredView):
+            return self.view.graph_contains(node, collection=self.graph_collection)
+        return node in self
 
     def add_node(self, node: KeyLike, **attributes: Any) -> None:
         self.add_nodes_from([node], **attributes)
@@ -284,8 +284,8 @@ class Graph:
         """Inserts vertices, merging `attributes` into every one of them."""
         keys = nodes if isinstance(nodes, (Buffer, Sequence)) else list(nodes)
         # Only absent vertices are written, since a batch whose every vertex exists is refused by the C ABI.
-        lengths = self.blocking.read(keys, Arena(), collection=self.graph_collection).lengths
-        missing = [key for key, length in zip(keys, lengths, strict=True) if length is None]
+        degrees = self.blocking.graph_degrees(keys, Arena(), collection=self.graph_collection)
+        missing = [key for key, degree in zip(keys, degrees, strict=True) if degree is None]
         if missing:
             self.blocking.graph_write_vertices(missing, collection=self.graph_collection)
         if attributes:

@@ -62,9 +62,8 @@ struct scan_batch_t {
     std::size_t size() const noexcept { return count; }
     scan_task_t operator[](std::size_t index) const noexcept {
         auto const signed_index = static_cast<std::ptrdiff_t>(index);
-        ustore_collection_id_t collection = collections ? collections[signed_index] : ustore_collection_main_k;
         ustore_key_t start_key = start_keys ? start_keys[signed_index] : smallest_key_k;
-        return {collection, start_key, wanted};
+        return {collections[signed_index], start_key, wanted};
     }
 };
 
@@ -82,9 +81,7 @@ struct sample_batch_t {
 
     std::size_t size() const noexcept { return count; }
     sample_task_t operator[](std::size_t index) const noexcept {
-        auto const signed_index = static_cast<std::ptrdiff_t>(index);
-        ustore_collection_id_t collection = collections ? collections[signed_index] : ustore_collection_main_k;
-        return {collection, wanted};
+        return {collections[static_cast<std::ptrdiff_t>(index)], wanted};
     }
 };
 
@@ -106,11 +103,9 @@ struct edges_batch_t {
     std::size_t size() const noexcept { return count; }
     edges_task_t operator[](std::size_t index) const noexcept {
         auto const signed_index = static_cast<std::ptrdiff_t>(index);
-        ustore_collection_id_t collection = collections_begin ? collections_begin[signed_index]
-                                                              : ustore_collection_main_k;
         ustore_key_t const& vertex_id = vertex_id_begin[signed_index];
         ustore_vertex_role_t role = roles_begin ? roles_begin[signed_index] : ustore_vertex_role_any_k;
-        return {collection, vertex_id, role};
+        return {collections_begin[signed_index], vertex_id, role};
     }
 };
 

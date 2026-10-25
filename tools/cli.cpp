@@ -222,8 +222,7 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
     drop.database = database;
     drop.outcome = &outcome;
     drop.mode = ustore_drop_collection_k;
-    if (name.empty()) outcome = {ustore_status_invalid_argument_k, "The main collection is never dropped"};
-    else find_collection(database, name, drop.collection, &outcome);
+    find_collection(database, name, drop.collection, &outcome);
     if (!failed(outcome)) ustore_collection_drop(&drop);
     if (failed(outcome)) {
         print_failure("Failed to drop the collection", outcome);

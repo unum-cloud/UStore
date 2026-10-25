@@ -62,7 +62,7 @@ struct fixture_t {
     ustore_database_t database = nullptr;
 
     /** The strings collection every call of a case addresses. */
-    ustore_collection_id_t collection = ustore_collection_main_k;
+    ustore_collection_id_t collection {};
 
     /** Reusable memory for the results. */
     ustore_arena_t arena = nullptr;
@@ -99,7 +99,7 @@ struct fixture_t {
     }
 
     /** Whether the database opened with its strings collection and the arena exists. */
-    [[nodiscard]] bool ready() const noexcept { return database && collection != ustore_collection_main_k && arena; }
+    [[nodiscard]] bool ready() const noexcept { return database && collection != ustore_collection_id_t {} && arena; }
 };
 
 /** Maps @p texts onto @p values in one call of @c ustore_strings_write, through @p transaction unless it is null,
@@ -532,19 +532,19 @@ std::size_t strings_name_taken_across_modalities(config_t const& config) {
     fixture_t fixture {config};
     if (!fixture.ready()) return failures + 1;
 
-    ustore_collection_id_t blobs = ustore_collection_main_k;
+    ustore_collection_id_t blobs {};
     ustore_outcome_t outcome = create_named(fixture, "taken.by.blobs", ustore_modality_blobs_k, blobs);
     failures += expect_success(outcome);
-    ustore_collection_id_t strings = ustore_collection_main_k;
+    ustore_collection_id_t strings {};
     outcome = create_named(fixture, "taken.by.blobs", ustore_modality_strings_k, strings);
     failures += expect_status(status_t {outcome}, status_code_t::already_exists_k);
-    failures += expect(strings == ustore_collection_main_k);
+    failures += expect(strings == ustore_collection_id_t {});
 
     outcome = create_named(fixture, "taken.by.strings", ustore_modality_strings_k, strings);
     failures += expect_success(outcome);
     outcome = create_named(fixture, "taken.by.strings", ustore_modality_blobs_k, blobs);
     failures += expect_status(status_t {outcome}, status_code_t::already_exists_k);
-    failures += expect(blobs == ustore_collection_main_k);
+    failures += expect(blobs == ustore_collection_id_t {});
     return failures;
 }
 

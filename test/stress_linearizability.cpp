@@ -159,7 +159,7 @@ struct linearizability_run_t {
     /** Database reopened for every thread and transaction count, which bounds the remove deltas clears leave behind. */
     database_t database;
 
-    /** Main collection of the open database, which every verification reads. */
+    /** Collection of the open database every transaction writes and every verification reads. */
     blobs_collection_t collection;
 
     /** Arena every verification reads into, rewound by each. */
@@ -218,7 +218,9 @@ struct linearizability_run_t {
     std::size_t failures = expect(open_status.succeeded());
     if (failures) return failures;
     run.database = std::move(database);
-    run.collection = run.database.main();
+    auto [collection, create_status] = run.database.find_or_create("linearizability");
+    failures += expect(create_status.succeeded());
+    run.collection = collection;
     for (std::size_t thread = 0; thread != run.slots.size() && !failures; ++thread)
         failures += begin_transaction(run.database, run.slots[thread].transaction);
     return failures;
@@ -229,18 +231,18 @@ struct linearizability_run_t {
 #pragma region Round
 
 /** Stages and commits one transaction of random writes, stamping each logged write with the commit's outcome. */
-std::size_t write_transaction(writer_slot_t& slot, std::span<operation_t> batch, operations_mix_t mix,
-                              std::uniform_int_distribution<std::uint64_t>& key_distribution) {
+std::size_t write_transaction(writer_slot_t& slot, ustore_collection_id_t collection, std::span<operation_t> batch,
+                              operations_mix_t mix, std::uniform_int_distribution<std::uint64_t>& key_distribution) {
     std::size_t failures = expect(slot.transaction.reset().succeeded());
+    blobs_collection_t inside {slot.transaction.receiver(), collection};
     for (operation_t& operation : batch) {
         operation.code = slot.random_generator() % mix.parts() < mix.inserts ? operation_code_t::insert_k
                                                                              : operation_code_t::remove_k;
         operation.key = key_distribution(slot.random_generator);
         operation.value = slot.random_generator();
-        failures +=
-            operation.code == operation_code_t::insert_k
-                ? expect(slot.transaction[key_from_integer(operation.key)].assign(operation.value_view()).succeeded())
-                : expect(slot.transaction[key_from_integer(operation.key)].remove().succeeded());
+        failures += operation.code == operation_code_t::insert_k
+                        ? expect(inside[key_from_integer(operation.key)].assign(operation.value_view()).succeeded())
+                        : expect(inside[key_from_integer(operation.key)].remove().succeeded());
     }
 
     auto maybe_stamp = slot.transaction.commit();
@@ -254,11 +256,13 @@ std::size_t write_transaction(writer_slot_t& slot, std::span<operation_t> batch,
 }
 
 /** Commits every transaction of one thread's round, logging its writes into @p log. */
-void write_round(writer_slot_t& slot, std::span<operation_t> log, workload_t const& workload) {
+void write_round(writer_slot_t& slot, ustore_collection_id_t collection, std::span<operation_t> log,
+                 workload_t const& workload) {
     std::uniform_int_distribution<std::uint64_t> key_distribution(1, workload.max_key);
     std::size_t const parts = workload.mix.parts();
     for (std::size_t iteration = 0; iteration != workload.transactions; ++iteration)
-        slot.failures += write_transaction(slot, log.subspan(iteration * parts, parts), workload.mix, key_distribution);
+        slot.failures += write_transaction(slot, collection, log.subspan(iteration * parts, parts), workload.mix,
+                                           key_distribution);
 }
 
 /** Keeps, per key, the committed write with the highest stamp, and the later-logged one among equal stamps. */
@@ -312,7 +316,7 @@ std::size_t run_round(linearizability_run_t& run, executor_t& executor, workload
     std::span<operation_t> const operations {run.operations.data(), workload.threads_count * per_thread};
     std::span<writer_slot_t> const slots {run.slots.data(), workload.threads_count};
     auto writer = [&](std::size_t thread) noexcept {
-        write_round(slots[thread], operations.subspan(thread * per_thread, per_thread), workload);
+        write_round(slots[thread], run.collection, operations.subspan(thread * per_thread, per_thread), workload);
     };
     std::size_t failures = expect(st::succeeded(executor.for_threads(writer)));
     for (writer_slot_t& slot : slots) failures += std::exchange(slot.failures, 0);
@@ -320,7 +324,7 @@ std::size_t run_round(linearizability_run_t& run, executor_t& executor, workload
     std::span<operation_t const*> const latest {run.latest.data(), static_cast<std::size_t>(workload.max_key) + 1};
     replay_round(operations, latest);
     failures += verify_round(run, latest);
-    failures += expect(run.database.clear(ustore_drop_collection_k).succeeded());
+    failures += expect(run.database.clear(ustore_drop_pairs_k).succeeded());
     return failures;
 }
 

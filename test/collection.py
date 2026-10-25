@@ -44,21 +44,24 @@ def test_graph_and_table_declare_on_access(database, member: str, modality: usto
         database["declared"].blobs[1] = b"refused"
 
 
-def test_any_collection_accepts_every_view(database):
-    """The binding lets every view through, while RAM's engine still keeps a graph out of an 'any' collection."""
-    database.collection_create("mixed")
-    mixed = database["mixed"]
-    mixed.blobs[1] = b"bytes"
-    mixed.docs[2] = {"k": 2}
-    assert mixed.graph.graph_collection == mixed.id
-    assert mixed.modality is ustore.Modality.ANY
-    assert mixed.blobs[1] == b"bytes"
-    assert mixed.docs[2] == {"k": 2}
+@pytest.mark.parametrize("modality", list(ustore.Modality))
+def test_a_created_collection_keeps_its_modality(database, modality: ustore.Modality):
+    """Every collection holds the one modality it was created with, so the views of the others are refused."""
+    database.collection_create("declared", modality=modality)
+    assert database["declared"].modality is modality
+    if modality is not ustore.Modality.BLOBS:
+        with pytest.raises(ustore.InvalidArgumentError, match="'declared' holds"):
+            database["declared"].blobs[1] = b"refused"
+    if modality is not ustore.Modality.DOCS:
+        with pytest.raises(ustore.InvalidArgumentError, match="'declared' holds"):
+            database["declared"].docs[1] = {"k": 1}
 
 
-def test_main_collection_is_the_empty_name(database):
-    database.set(1, b"main")
-    assert database[""].blobs[1] == b"main"
+def test_the_empty_name_addresses_no_collection(database):
+    with pytest.raises(ustore.NotFoundError):
+        database[""].blobs[1]
+    with pytest.raises(ustore.NotFoundError):
+        database.get(1, collection="")
 
 
 def test_docs_round_trip_python_objects(view):
@@ -135,11 +138,11 @@ def test_sample_answers_keys_onto_values(database, arena):
     assert list(database["pictures"].scan(2, 5, arena)[0]) == keys([2, 3])
 
 
-def test_docs_write_serializes_dicts(database):
+def test_docs_write_serializes_dicts(database, docs):
     """A dict is one document for every key, not the sequence of its keys, and dicts inside a batch serialize too."""
-    database.docs_write([1, 2], {"same": True})
-    database.docs_write([3, 4], [{"n": 3}, '{"n": 4}'])
-    assert database[""].docs[[1, 2, 3, 4]] == [{"same": True}, {"same": True}, {"n": 3}, {"n": 4}]
+    database.docs_write([1, 2], {"same": True}, collection=docs)
+    database.docs_write([3, 4], [{"n": 3}, '{"n": 4}'], collection=docs)
+    assert database["docs"].docs[[1, 2, 3, 4]] == [{"same": True}, {"same": True}, {"n": 3}, {"n": 4}]
 
 
 def test_values_export_as_arrow_binary(database, arena):

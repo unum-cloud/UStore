@@ -64,10 +64,8 @@ concept fold_concept = requires(fold_ const& fold, std::span<byte_t const> base,
 /** The fold of blobs and strings, where every delta is a whole value or a removal and the newest one wins. */
 struct last_write_fold_t {
 
-    /** Whether a collection of @p modality keeps whole values alone: blobs, and the main one, which holds any. */
-    static constexpr bool serves(ustore_modality_t modality) noexcept {
-        return modality == ustore_modality_any_k || modality == ustore_modality_blobs_k;
-    }
+    /** Whether a collection of @p modality keeps whole values alone, which blobs do. */
+    static constexpr bool serves(ustore_modality_t modality) noexcept { return modality == ustore_modality_blobs_k; }
 
     /** The newest delta, or @p base without any, refusing with @c status_code_t::not_found_k after a removal. */
     expected<std::span<byte_t const>> apply(std::span<byte_t const> base, std::span<delta_view_t const> deltas,

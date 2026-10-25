@@ -1523,7 +1523,7 @@ PyObject* ustore_py_enum_to_object(ustore_py_enum_t kind, int value) {
 #pragma region Verb Options
 
 void ustore_py_verb_options_init(ustore_py_verb_options_t* options) {
-    options->collection = ustore_collection_main_k;
+    options->collection = (ustore_collection_id_t) {{{0}}};
     options->durability = ustore_durability_buffered_k;
 }
 
@@ -2334,7 +2334,6 @@ PyTypeObject* CapabilitiesType = NULL;
 
 static PyStructSequence_Field capabilities_fields[] = {
     {"transactions", "Whether the engine groups operations into transactions."},
-    {"collections", "Whether the engine holds collections beyond the main one."},
     {"snapshots", "Whether the engine pins point-in-time states."},
     {NULL, NULL},
 };
@@ -2343,7 +2342,7 @@ static PyStructSequence_Desc capabilities_description = {
     "ustore.Capabilities",
     "What an engine supports, as `Database.capabilities` reports it.",
     capabilities_fields,
-    3,
+    2,
 };
 
 PyTypeObject* MeasurementType = NULL;
@@ -2371,7 +2370,7 @@ static PyStructSequence_Field description_fields[] = {
     {"capabilities", "What the engine supports, as a Capabilities."},
     {"engine", "The engine serving the database, an Engine."},
     {"isolation", "How transactions see each other: what the RAM engine was opened with, and SNAPSHOT elsewhere."},
-    {"keys", "Keys across every collection, the main one included, as the engine estimates them."},
+    {"keys", "Keys across every collection, as the engine estimates them."},
     {"memory_bytes", "Bytes of memory the engine holds for the data, or zero where it keeps no estimate."},
     {"disk_bytes", "Bytes the files of the database take on disk."},
     {NULL, NULL},

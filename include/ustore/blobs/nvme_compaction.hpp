@@ -159,10 +159,10 @@ struct compaction_stamps_t {
     /** How many stamps @c pinned holds. */
     std::uint64_t pinned_count = 0;
 
-    /** The newest stamp a catalog can promise durable: every version above it survives, as a mount may drop it. */
+    /** The newest stamp a schema can promise durable: every version above it survives, as a mount may drop it. */
     std::uint64_t horizon = std::numeric_limits<std::uint64_t>::max();
 
-    /** The newest stamp a merge keeps at all, which a mount sets to drop what no durable catalog covers. */
+    /** The newest stamp a merge keeps at all, which a mount sets to drop what no durable schema covers. */
     std::uint64_t ceiling = std::numeric_limits<std::uint64_t>::max();
 
     /** The stamp every surviving stamp is raised to at least, which no reader and no mount can tell apart. */
@@ -382,7 +382,7 @@ constexpr std::uint64_t reader_interval(compaction_stamps_t const& stamps, std::
  *
  *  A version is read by the readers pinned at or above it and below the version before it, so it survives when
  *  the two fall in different reader intervals. Above the durable horizon every version survives, since a mount may
- *  drop any version above whatever horizon the catalog it finds promises, and needs the one beneath.
+ *  drop any version above whatever horizon the schema it finds promises, and needs the one beneath.
  */
 constexpr bool keeps_older_version(compaction_stamps_t const& stamps, std::uint64_t previous,
                                    std::uint64_t current) noexcept {

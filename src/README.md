@@ -19,8 +19,8 @@ Engines aim for the highest isolation `ram` delivers, each reports the level its
 ## RAM
 
 `src/ram/` is the reference in-memory engine, and the one every other engine is checked against.
-Every collection keeps a stamp-based SmashTable `partitioned_store` of its own, of the kind its modality picks: UUID keys mapped onto values for blobs, documents and anything else, strings mapped onto values for strings, and the half-edges of a graph, so no stored key carries its collection.
-A catalog store maps the UUID of every collection, the main one under the nil UUID, onto its modality, its name and its store, and a names store maps every name onto its collection's UUID.
+Every collection keeps a stamp-based SmashTable `partitioned_store` of its own, of the kind its modality picks: UUID keys mapped onto values for blobs, documents and pages, strings mapped onto values for strings, and the half-edges of a graph, so no stored key carries its collection.
+The `_collections` system collection maps the UUID of every collection onto its modality, its name and its store, and the `_names` system collection maps every name onto its collection's UUID.
 Every store is built into one commit order, and a `dynamic_transaction_group` joins whichever stores a transaction reaches, so it publishes under one stamp and a snapshot reads all of them at it.
 A stage reports the group's `snapshot()` as its read stamp and a commit its `commit_stamp()`, never the `generation()` that only tags the group's uncommitted versions.
 Dropping a collection retires its store at the drop's stamp, and the store is freed once no reader holds an older one.
@@ -35,7 +35,7 @@ A compaction vacuums one collection at a time, reporting one unit per collection
 
 ## RocksDB
 
-`src_oracles/rocksdb/` keeps each collection as a column family of a RocksDB `TransactionDB`, named `<modality>.<UUID>` so an open recovers both: UUID keys and strings alike under the bytewise comparator, the main collection in the default family, and the names of collections in a family of their own that no identifier reaches.
+`src_oracles/rocksdb/` keeps each collection as a column family of a RocksDB `TransactionDB`, named after its UUID: UUID keys and strings alike under the bytewise comparator, and the `_names` and `_collections` system collections in families of their own that no identifier reaches, while the `default` family RocksDB requires stores nothing.
 Every write reaches RocksDB's log, which stays in memory until a flushed write or commit, a full buffer or a clean close writes it out, so a crash keeps a consistent prefix of the commits across every collection.
 A transaction reads the snapshot its first read or write took, through its own buffered writes, and records the keys it watches unless a call passes `ustore_watch_none_k`.
 Nothing is locked until it stages, when RocksDB's pessimistic transaction locks and validates every watched read and buffered write and prepares them into the log, so conflicts surface at stage or commit as on `ram`.
@@ -53,17 +53,17 @@ A compaction flushes and compacts one family at a time, reporting the bytes of i
 
 `src_oracles/leveldb/` wraps one LevelDB database with snapshots and collections, but without transactions: `ustore_transaction_init` answers `ustore_status_unsupported_k`.
 LevelDB keeps one keyspace in bytewise order, so every stored key leads with the UUID of its collection, keeping each collection one contiguous run, and the collection's modality shapes the rest of the key.
-The catalog and the names are two more collections under reserved UUIDs:
+The `_collections` and `_names` system collections are two more collections under reserved UUIDs:
 
 ```c
-struct pairs   { uint8_t collection[16]; uint8_t key[16]; };    // blobs, documents and graphs, the main one under nil
-struct strings { uint8_t collection[16]; char string[]; };      // strings collections
-struct catalog { uint8_t collection[16]; uint8_t listed[16]; }; // all 0xFF, valued by the modality and the name
-struct names   { uint8_t collection[16]; char name[]; };        // all 0xFF but a last 0xFE, valued by UUID and modality
+struct pairs       { uint8_t collection[16]; uint8_t key[16]; };    // blobs, documents, graphs and pages
+struct strings     { uint8_t collection[16]; char string[]; };      // strings collections
+struct collections { uint8_t collection[16]; uint8_t listed[16]; }; // all 0xFF, valued by the modality and the name
+struct names       { uint8_t collection[16]; char name[]; };        // all 0xFF but a last 0xFE, valued by UUID
 ```
 
-Every collection a call names resolves through the catalog first, so no call reaches the catalog or the names.
-A create writes the catalog entry and the name in one synced batch.
+Every collection a call names resolves through `_collections` first, so no call reaches either system collection.
+A create writes the collections entry and the name in one synced batch.
 A drop removes the entry and the name first, synced, and then the collection's run, so a crash leaves an unlisted run rather than a listed empty collection.
 Its isolation stops at reading from a snapshot, whose read stamp reads zero, as LevelDB keeps sequence numbers private.
 A description reports zero keys, since LevelDB keeps no count, and a compaction compacts one collection's run at a time, in key order.
@@ -75,7 +75,7 @@ A save copies the snapshot into a new database a memtable-sized batch at a time,
 A `database` holds collections, each in an `nvme_store` over an `lsm_tree` of `lsm_level`s whose `lsm_sorted_run` files open with a `sorted_run_index` of `key_slot`s ahead of their `stored_value`s, with optimistic transactions.
 `src/nvme/variants.hpp` serves every slot of `engine_t` the RAM engine serves, its snapshots as stamps pinned in the database's commit ledger, once per CPU class of `src/lib.hpp`, and `src/nvme/engine.cpp` opens a database with the newest class the running CPU admits.
 Every collection of the C ABI is one collection of the database under its UUID, keyed by the 16 bytes of `ustore_key_t`.
-Its catalog maps every collection onto its name, the database's own catalog recording its modality, and a strings collection and the names live in the strings store of `include/ustore/strings/nvme_store.hpp`, keyed by whole strings, whose writes and watches join a transaction as a share of it.
+Its `_collections` system collection maps every collection onto its name, the database's own schema recording its modality, and a strings collection and the names live in the strings store of `include/ustore/strings/nvme_store.hpp`, keyed by whole strings, whose writes and watches join a transaction as a share of it.
 A graph collection lives in the graph store of `include/ustore/graph/nvme_store.hpp`, one key per vertex folded from half-edge change deltas, and `src/nvme/graph_calls.hpp` serves the graph calls of the table over it.
 A docs collection lives in the docs store of `include/ustore/docs/nvme_store.hpp`, whose field writes, patches and merges append `json_fold_t` change deltas through `src/nvme/docs_calls.hpp`.
 A pages collection lives in the pages store of `include/ustore/pages/nvme_store.hpp`, whose edits append `page_fold_t` change deltas that the `*_edits` calls of `src/pages.cpp` encode and `src/nvme/pages_calls.hpp` commits.

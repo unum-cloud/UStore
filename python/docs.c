@@ -591,39 +591,39 @@ int ustore_py_docs_upsert(ustore_py_context_t const* context, ustore_py_verb_opt
     return written ? 0 : -1;
 }
 
-char const doc_docs_write[] =                                                                         //
-    "docs_write(keys, documents, *, collection=None, field=None, modification=Modification.UPSERT,\n" //
-    "           type=FieldType.JSON, id_field=None, durability=Durability.BUFFERED) answers None.\n"  //
-    "\n"                                                                                              //
-    "Writes a batch of JSON documents, or one field inside each of them. Every document is\n"         //
-    "borrowed for the length of the call rather than copied.\n"                                       //
-    "\n"                                                                                              //
-    "Args:\n"                                                                                         //
-    "  keys (Sequence[KeyLike] | buffer | None): The keys to write; None reads every key from\n"      //
-    "    `id_field` of its document.\n"                                                               //
-    "  documents (Sequence[str | bytes-like | object] | str | bytes-like | dict | tape): One\n"       //
-    "    document per key, a tape of them, or one document broadcast to every key. Text,\n"           //
-    "    bytes and a tape, as `write` takes one, are JSON already, while a dict, a list or a\n"       //
-    "    number inside a sequence is serialized. None is refused: `remove` removes whole\n"           //
-    "    documents, and a merge with a JSON null removes a field. Under a fixed-width `type`,\n"      //
-    "    a contiguous buffer of one scalar per key is a column, which reaches the store\n"            //
-    "    without being printed as JSON and parsed back.\n"                                            //
-    "  collection (UUID | str, optional): The collection, by identifier or by name.\n"                //
-    "  field (str, optional): A top-level key or a JSON Pointer such as '/user/name' to\n"            //
-    "    write inside every document; None writes whole documents.\n"                                 //
-    "  modification (Modification, optional): An upsert, update or insert, an RFC 6902\n"             //
-    "    `Modification.PATCH` or an RFC 7386 `Modification.MERGE`.\n"                                 //
-    "  type (FieldType, optional): How every document is spelled: `FieldType.JSON`,\n"                //
-    "    `FieldType.STR` for a plain string, `FieldType.NULL`, or the raw bytes of\n"                 //
-    "    `FieldType.BOOL`, `FieldType.F64`, `FieldType.F32`, `FieldType.I64` through\n"               //
-    "    `FieldType.U8`.\n"                                                                           //
-    "  id_field (str, optional): The field holding every key when `keys` is None.\n"                  //
-    "  durability (Durability, optional): `Durability.FLUSHED` reaches the drive before\n"            //
-    "    returning.\n"                                                                                //
-    "Raises:\n"                                                                                       //
-    "  TypeError: A document is None.\n"                                                              //
-    "  MalformedError: A document does not parse, or its `id_field` holds no integer.\n"              //
-    "  NotFoundError: A field is written inside a document that does not exist.\n"                    //
+char const doc_docs_write[] =                                                                        //
+    "docs_write(keys, documents, *, collection, field=None, modification=Modification.UPSERT,\n"     //
+    "           type=FieldType.JSON, id_field=None, durability=Durability.BUFFERED) answers None.\n" //
+    "\n"                                                                                             //
+    "Writes a batch of JSON documents, or one field inside each of them. Every document is\n"        //
+    "borrowed for the length of the call rather than copied.\n"                                      //
+    "\n"                                                                                             //
+    "Args:\n"                                                                                        //
+    "  keys (Sequence[KeyLike] | buffer | None): The keys to write; None reads every key from\n"     //
+    "    `id_field` of its document.\n"                                                              //
+    "  documents (Sequence[str | bytes-like | object] | str | bytes-like | dict | tape): One\n"      //
+    "    document per key, a tape of them, or one document broadcast to every key. Text,\n"          //
+    "    bytes and a tape, as `write` takes one, are JSON already, while a dict, a list or a\n"      //
+    "    number inside a sequence is serialized. None is refused: `remove` removes whole\n"          //
+    "    documents, and a merge with a JSON null removes a field. Under a fixed-width `type`,\n"     //
+    "    a contiguous buffer of one scalar per key is a column, which reaches the store\n"           //
+    "    without being printed as JSON and parsed back.\n"                                           //
+    "  collection (UUID | str): The collection, by identifier or by name.\n"                         //
+    "  field (str, optional): A top-level key or a JSON Pointer such as '/user/name' to\n"           //
+    "    write inside every document; None writes whole documents.\n"                                //
+    "  modification (Modification, optional): An upsert, update or insert, an RFC 6902\n"            //
+    "    `Modification.PATCH` or an RFC 7386 `Modification.MERGE`.\n"                                //
+    "  type (FieldType, optional): How every document is spelled: `FieldType.JSON`,\n"               //
+    "    `FieldType.STR` for a plain string, `FieldType.NULL`, or the raw bytes of\n"                //
+    "    `FieldType.BOOL`, `FieldType.F64`, `FieldType.F32`, `FieldType.I64` through\n"              //
+    "    `FieldType.U8`.\n"                                                                          //
+    "  id_field (str, optional): The field holding every key when `keys` is None.\n"                 //
+    "  durability (Durability, optional): `Durability.FLUSHED` reaches the drive before\n"           //
+    "    returning.\n"                                                                               //
+    "Raises:\n"                                                                                      //
+    "  TypeError: A document is None.\n"                                                             //
+    "  MalformedError: A document does not parse, or its `id_field` holds no integer.\n"             //
+    "  NotFoundError: A field is written inside a document that does not exist.\n"                   //
     "  AlreadyExistsError: An insert names a document that already exists.";
 
 PyObject* ustore_py_api_docs_write(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
@@ -695,14 +695,14 @@ PyObject* ustore_py_api_docs_write(PyObject* self, PyObject* const* args, Py_ssi
 }
 
 char const doc_docs_remove[] =                                                                  //
-    "docs_remove(keys, *, collection=None, durability=Durability.BUFFERED) answers None.\n"     //
+    "docs_remove(keys, *, collection, durability=Durability.BUFFERED) answers None.\n"          //
     "\n"                                                                                        //
     "Removes a batch of whole documents, or one given on its own; a patch or a merge removes\n" //
     "fields inside them instead.\n"                                                             //
     "\n"                                                                                        //
     "Args:\n"                                                                                   //
     "  keys (KeyLike | Sequence[KeyLike] | buffer): The keys of the documents to remove.\n"     //
-    "  collection (UUID | str, optional): The docs collection, by identifier or by name.\n"     //
+    "  collection (UUID | str): The docs collection, by identifier or by name.\n"               //
     "  durability (Durability, optional): `Durability.FLUSHED` reaches the drive before\n"      //
     "    returning.";
 
@@ -729,7 +729,7 @@ PyObject* ustore_py_api_docs_remove(PyObject* self, PyObject* const* args, Py_ss
 #pragma region Reads
 
 char const doc_docs_read[] =                                                                   //
-    "docs_read(keys, arena, *, collection=None, field=None, outputs_type=FieldType.JSON)\n"    //
+    "docs_read(keys, arena, *, collection, field=None, outputs_type=FieldType.JSON)\n"         //
     "answers a Values tape.\n"                                                                 //
     "\n"                                                                                       //
     "Reads whole documents, or one field of each, as JSON text or as printed strings. Whole\n" //
@@ -738,7 +738,7 @@ char const doc_docs_read[] =                                                    
     "Args:\n"                                                                                  //
     "  keys (Sequence[KeyLike] | buffer): The keys to read.\n"                                 //
     "  arena (Arena): Where the tape lands, rewound by this call.\n"                           //
-    "  collection (UUID | str, optional): The collection, by identifier or by name.\n"         //
+    "  collection (UUID | str): The collection, by identifier or by name.\n"                   //
     "  field (str, optional): A top-level key or a JSON Pointer to read inside every\n"        //
     "    document; None reads whole documents.\n"                                              //
     "  outputs_type (FieldType, optional): `FieldType.JSON` for JSON text, or\n"               //
@@ -793,6 +793,9 @@ ustore_py_verb_t const ustore_py_docs_read_copies_verb = {sizeof(ustore_py_read_
 ustore_py_verb_t const ustore_py_docs_read_objects_verb = {sizeof(ustore_py_read_call_t), docs_read_submit,
                                                            docs_read_answer_objects, ustore_py_read_release};
 
+ustore_py_verb_t const ustore_py_docs_read_drawn_verb = {sizeof(ustore_py_read_call_t), docs_read_submit,
+                                                         ustore_py_read_answer_drawn, ustore_py_read_release};
+
 PyObject* ustore_py_docs_read(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
                               ustore_docs_field_type_t type, ustore_py_verb_t const* verb, ustore_py_read_call_t* call,
                               PyObject* arena) {
@@ -815,6 +818,29 @@ PyObject* ustore_py_docs_read(ustore_py_context_t const* context, ustore_py_verb
     };
     if (call->field) read.fields = ustore_py_strings_repeated(&call->field_view);
     return ustore_py_call_run(context, verb, call, &read);
+}
+
+static PyObject* docs_contains_answer(void* erased) {
+    return PyBool_FromLong(ustore_py_present(((ustore_py_read_call_t const*)erased)->presences, 0));
+}
+
+static ustore_py_verb_t const docs_contains_verb = {sizeof(ustore_py_read_call_t), docs_read_submit,
+                                                    docs_contains_answer, ustore_py_read_release};
+
+PyObject* ustore_py_document_contains(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
+                                      ustore_key_t const* key) {
+    ustore_py_read_call_t stack;
+    ustore_py_read_call_t* const call = ustore_py_call_open(context, &docs_contains_verb, &stack);
+    if (!call) return NULL;
+    call->keys.inline_keys[0] = *key;
+    call->keys.keys = call->keys.inline_keys;
+    call->keys.count = 1;
+    PyObject* const arena = ustore_py_arena_new(ustore_py_context_executor(context));
+    PyObject* const answer = arena ? ustore_py_docs_read(context, options, ustore_docs_field_type_json_k,
+                                                         &docs_contains_verb, call, arena)
+                                   : ustore_py_call_discard(context, &docs_contains_verb, call);
+    Py_XDECREF(arena);
+    return answer;
 }
 
 PyObject* ustore_py_api_docs_read(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
@@ -859,7 +885,7 @@ PyObject* ustore_py_api_docs_read(PyObject* self, PyObject* const* args, Py_ssiz
 }
 
 char const doc_docs_gist[] =                                                                  //
-    "docs_gist(keys, arena, *, collection=None) answers a tuple of JSON Pointers.\n"          //
+    "docs_gist(keys, arena, *, collection) answers a tuple of JSON Pointers.\n"               //
     "\n"                                                                                      //
     "Lists every distinct path to a leaf across the requested documents, in the order they\n" //
     "were first met, which is how a table learns the columns its documents hold.\n"           //
@@ -868,7 +894,7 @@ char const doc_docs_gist[] =                                                    
     "  keys (Sequence[KeyLike] | buffer): The documents to inspect.\n"                        //
     "  arena (Arena): Where the paths land before they are copied out, rewound by this\n"     //
     "    call.\n"                                                                             //
-    "  collection (UUID | str, optional): The collection, by identifier or by name.\n"        //
+    "  collection (UUID | str): The collection, by identifier or by name.\n"                  //
     "Returns:\n"                                                                              //
     "  tuple[str, ...]: One JSON Pointer per leaf, such as '/user/name'.";
 
@@ -946,30 +972,49 @@ PyObject* ustore_py_api_docs_gist(PyObject* self, PyObject* const* args, Py_ssiz
     return ustore_py_call_run(&context, &gist_verb, call, &gist);
 }
 
-char const doc_docs_scan[] =                                                                      //
-    "docs_scan(start, wanted, arena, *, collection=None, mode=ScanMode.ORDERED, progress=None)\n" //
-    "answers a Keys tape.\n"                                                                      //
-    "\n"                                                                                          //
-    "Lists up to `wanted` document keys from `start` upwards, as `scan` lists the keys of\n"      //
-    "blobs. Documents are not exported, so a `docs_read` follows the scan.\n"                     //
-    "\n"                                                                                          //
-    "Args:\n"                                                                                     //
-    "  start (KeyLike): The smallest key the scan may return.\n"                                  //
-    "  wanted (int): Most keys the scan returns.\n"                                               //
-    "  arena (Arena): Where the keys land, rewound by this call.\n"                               //
-    "  collection (UUID | str, optional): The docs collection, by identifier or by name.\n"       //
-    "  mode (ScanMode, optional): In what order the keys come, as `scan` takes it.\n"             //
-    "  progress (Callable[[int, int], bool | None], optional): Called with the scans\n"           //
-    "    finished and the scans in all; a falsy answer other than None cancels the call.\n"       //
-    "Returns:\n"                                                                                  //
-    "  Keys: One run of keys, in ascending order.\n"                                              //
-    "Raises:\n"                                                                                   //
+char const doc_docs_scan[] =                                                                 //
+    "docs_scan(start, wanted, arena, *, collection, mode=ScanMode.ORDERED, progress=None)\n" //
+    "answers a Keys tape.\n"                                                                 //
+    "\n"                                                                                     //
+    "Lists up to `wanted` document keys from `start` upwards, as `scan` lists the keys of\n" //
+    "blobs. Documents are not exported, so a `docs_read` follows the scan.\n"                //
+    "\n"                                                                                     //
+    "Args:\n"                                                                                //
+    "  start (KeyLike): The smallest key the scan may return.\n"                             //
+    "  wanted (int): Most keys the scan returns.\n"                                          //
+    "  arena (Arena): Where the keys land, rewound by this call.\n"                          //
+    "  collection (UUID | str): The docs collection, by identifier or by name.\n"            //
+    "  mode (ScanMode, optional): In what order the keys come, as `scan` takes it.\n"        //
+    "  progress (Callable[[int, int], bool | None], optional): Called with the scans\n"      //
+    "    finished and the scans in all; a falsy answer other than None cancels the call.\n"  //
+    "Returns:\n"                                                                             //
+    "  Keys: One run of keys, in ascending order.\n"                                         //
+    "Raises:\n"                                                                              //
     "  CancelledError: The progress callable stopped the scan.";
 
 PyObject* ustore_py_api_docs_scan(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
                                   PyObject* args_names_tuple) {
     return ustore_py_api_scan_of(self, args, positional_args_count, args_names_tuple, "docs_scan",
                                  ustore_modality_docs_k);
+}
+
+char const doc_docs_sample[] =                                                                  //
+    "docs_sample(wanted, arena, *, collection) answers a Keys tape.\n"                          //
+    "\n"                                                                                        //
+    "Draws document keys uniformly at random from one collection, as `sample` draws the keys\n" //
+    "of blobs. Documents are not exported, so a `docs_read` or a `docs_gather` follows.\n"      //
+    "\n"                                                                                        //
+    "Args:\n"                                                                                   //
+    "  wanted (int): Most keys to draw.\n"                                                      //
+    "  arena (Arena): Where the keys land, rewound by this call.\n"                             //
+    "  collection (UUID | str): The docs collection, by identifier or by name.\n"               //
+    "Returns:\n"                                                                                //
+    "  Keys: One run of keys, in no particular order.";
+
+PyObject* ustore_py_api_docs_sample(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                                    PyObject* args_names_tuple) {
+    return ustore_py_api_sample_of(self, args, positional_args_count, args_names_tuple, "docs_sample",
+                                   ustore_modality_docs_k);
 }
 
 #pragma endregion Reads
@@ -995,7 +1040,7 @@ static PyObject* columns_new(PyObject* arena, ustore_docs_column_view_t const* c
 }
 
 char const doc_docs_gather[] =                                                                //
-    "docs_gather(keys, fields, outputs_types, arena, *, collection=None) answers Columns.\n"  //
+    "docs_gather(keys, fields, outputs_types, arena, *, collection) answers Columns.\n"       //
     "\n"                                                                                      //
     "Reads every field of every document into typed columns, converting each value on a\n"    //
     "best-effort basis and recording what was found, converted, or could not be.\n"           //
@@ -1009,7 +1054,7 @@ char const doc_docs_gather[] =                                                  
     "    exports as a half-precision view NumPy reads as float16, and a `FieldType.UUID`\n"   //
     "    column as sixteen bytes per document.\n"                                             //
     "  arena (Arena): Where the columns land, rewound by this call.\n"                        //
-    "  collection (UUID | str, optional): The collection, by identifier or by name.\n"        //
+    "  collection (UUID | str): The collection, by identifier or by name.\n"                  //
     "Returns:\n"                                                                              //
     "  Columns: One column per field, each holding one entry per document.";
 

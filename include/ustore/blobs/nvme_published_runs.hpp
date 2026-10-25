@@ -184,7 +184,7 @@ struct commit_request_t {
  *  Several databases share one ledger when one commit spans them all, as a graph's two databases do. Pins are
  *  intrusive, so a reader or a collection pins without allocating, and the ledger answers three questions from
  *  them: which stamps a flush or a compaction keeps a version for, the floor stamps below which no reader can
- *  tell apart, and the durable stamp a catalog save may promise.
+ *  tell apart, and the durable stamp a schema save may promise.
  *
  *  Commits are flat-combined. A committer seals its runs on its own thread and pushes a request; whichever committer
  *  takes the leader word checks, stamps and publishes every pending request in arrival order, publishing each one's
@@ -351,7 +351,7 @@ class commit_ledger {
         return static_cast<transaction_stamp_t>(order_.low_water_mark());
     }
 
-    /** The newest stamp every commit at or below which is wholly in runs, which a catalog naming those runs may
+    /** The newest stamp every commit at or below which is wholly in runs, which a schema naming those runs may
      *  promise: the least over every registered view, or the published stamp while no view holds memory runs. */
     [[nodiscard]] transaction_stamp_t durable_stamp() noexcept { return horizon_besides(views_); }
 
@@ -733,7 +733,7 @@ class published_runs {
     /** The stamps the store's writes carry and its readers pin, borrowed and outliving the runs. */
     [[nodiscard]] ledger_t& ledger() const noexcept { return *ledger_; }
 
-    /** The tree the flushed writes live in, which a database compacts and names in its catalog under its writer. */
+    /** The tree the flushed writes live in, which a database compacts and names in its schema under its writer. */
     [[nodiscard]] tree_t& tree() noexcept { return tree_; }
 
     /** The tree the flushed writes live in. */

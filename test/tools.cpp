@@ -223,35 +223,20 @@ class test_database_t {
         return true;
     }
 
-    /** Answers whether the engine reports named collections. */
-    [[nodiscard]] bool supports_collections() noexcept {
-        ustore_outcome_t outcome {};
-        ustore_database_description_t description {};
-        ustore_database_describe_t request {};
-        request.database = database_;
-        request.outcome = &outcome;
-        request.description = &description;
-        ustore_database_describe(&request);
-        bool const supported = outcome.status == ustore_status_success_k &&
-                               (description.capabilities & ustore_capabilities_collections_k);
-        return supported;
-    }
-
-    /** Removes every key and value of the main collection. */
+    /** Drops every collection, so a case starts from an empty database. */
     void clear() noexcept {
         ustore_outcome_t outcome {};
-        ustore_collection_drop_t drop {};
-        drop.database = database_;
-        drop.outcome = &outcome;
-        drop.collection = ustore_collection_main_k;
-        drop.mode = ustore_drop_pairs_k;
-        ustore_collection_drop(&drop);
+        ustore_database_clear_t clear {};
+        clear.database = database_;
+        clear.outcome = &outcome;
+        clear.mode = ustore_drop_collection_k;
+        ustore_database_clear(&clear);
     }
 
-    /** Creates an anonymous collection holding @p modality, answering its ID, or the main one after reporting why it
+    /** Creates an anonymous collection holding @p modality, answering its ID, or the nil UUID after reporting why it
      *  could not. */
     [[nodiscard]] ustore_collection_id_t create(ustore_modality_t modality, ustore_outcome_t& outcome) noexcept {
-        ustore_collection_id_t created = ustore_collection_main_k;
+        ustore_collection_id_t created {};
         ustore_collection_create_t create {};
         create.database = database_;
         create.outcome = &outcome;
@@ -817,39 +802,30 @@ template <typename... arguments_type_>
     char const* const collection = "collection1";
     char const* const input = paths.documents_ndjson.c_str();
     char const* const output = paths.exported_ndjson.c_str();
-    bool supports_collections = false;
+    failures += expect_eq(run_command(cli, "--engine", engine, "--directory", directory, "collection", "create",
+                                      "--collection", collection),
+                          0);
     {
         test_database_t database;
-        failures += expect(database.open(config));
-        supports_collections = database.supports_collections();
+        failures += expect(database.open(config) && lists_collection(database.get(), collection));
     }
 
-    if (supports_collections) {
-        failures += expect_eq(run_command(cli, "--engine", engine, "--directory", directory, "collection", "create",
-                                          "--collection", collection),
-                              0);
-        {
-            test_database_t database;
-            failures += expect(database.open(config) && lists_collection(database.get(), collection));
-        }
+    failures += expect_eq(
+        run_command(cli, "--engine", engine, "--directory", directory, "collection", "import", "--input", input,
+                    "--id-field", "id", "--memory-limit", "1MB", "--collection", collection),
+        0);
+    failures += expect_eq(run_command(cli, "--engine", engine, "--directory", directory, "collection", "export",
+                                      "--output", output, "--memory-limit", "1MB", "--collection", collection),
+                          0);
+    failures += check_documents(output, input, field_selection_t::whole_k);
+    [[maybe_unused]] int const removed_named = std::remove(output);
 
-        failures += expect_eq(
-            run_command(cli, "--engine", engine, "--directory", directory, "collection", "import", "--input", input,
-                        "--id-field", "id", "--memory-limit", "1MB", "--collection", collection),
-            0);
-        failures += expect_eq(run_command(cli, "--engine", engine, "--directory", directory, "collection", "export",
-                                          "--output", output, "--memory-limit", "1MB", "--collection", collection),
-                              0);
-        failures += check_documents(output, input, field_selection_t::whole_k);
-        [[maybe_unused]] int const removed_named = std::remove(output);
-
-        failures += expect_eq(run_command(cli, "--engine", engine, "--directory", directory, "collection", "drop",
-                                          "--collection", collection),
-                              0);
-        {
-            test_database_t database;
-            failures += expect(database.open(config) && !lists_collection(database.get(), collection));
-        }
+    failures += expect_eq(run_command(cli, "--engine", engine, "--directory", directory, "collection", "drop",
+                                      "--collection", collection),
+                          0);
+    {
+        test_database_t database;
+        failures += expect(database.open(config) && !lists_collection(database.get(), collection));
     }
 
     // Documents live only in collections of documents, so an import naming none is refused

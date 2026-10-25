@@ -6,11 +6,11 @@
  *
  *  LevelDB keeps one keyspace in bytewise order, so every stored key leads with the UUID of its collection and the
  *  pairs of each collection lie in one contiguous run. The collection's modality shapes the rest of the key and the
- *  value, and two system collections live under reserved UUIDs: the catalog, recording the modality and the name of
- *  every collection once, and the names, mapping every name onto its collection as a strings collection would:
+ *  value, and two system collections live under reserved UUIDs: `_collections`, recording the modality and the name
+ *  of every collection once, and `_names`, mapping every name onto its collection as a strings collection would:
  *
  *  @code{.c}
- *  struct pairs {              // blobs, docs, graph and any, the main one under the nil UUID, valued by bytes
+ *  struct pairs {              // blobs, docs, graph and pages, valued by bytes
  *      uint8_t collection[16]; // offset 0
  *      uint8_t key[16];        // offset 16, 32 bytes in all
  *  };
@@ -18,11 +18,11 @@
  *      uint8_t collection[16]; // offset 0
  *      char string[];          // offset 16
  *  };
- *  struct catalog {            // every collection but the main one, valued by a `struct catalog_entry`
+ *  struct collections {        // every collection, valued by a `struct collections_entry`
  *      uint8_t collection[16]; // offset 0, all bytes 0xFF
  *      uint8_t listed[16];     // offset 16
  *  };
- *  struct catalog_entry {
+ *  struct collections_entry {
  *      uint8_t modality;       // offset 0
  *      char name[];            // offset 1, empty for an anonymous collection
  *  };
@@ -82,27 +82,26 @@ using native_status_t = ::leveldb::Status;
 /** An owned LevelDB iterator. */
 using iterator_pointer_t = std::unique_ptr<::leveldb::Iterator>;
 
-/** The collection holding the catalog, all bytes `0xFF`, which no minted UUIDv7 reaches, as its byte 6 is `0x7X`. */
-constexpr ustore_collection_id_t catalog_collection_k {
+/** The collections system collection, all bytes `0xFF`, which no minted UUIDv7 reaches, as its byte 6 is `0x7X`. */
+constexpr ustore_collection_id_t collections_collection_k {
     {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}}};
 
-/** The collection holding the names of collections, all bytes `0xFF` but the last `0xFE`, which no minted UUIDv7
- *  reaches either. */
+/** The names system collection, all bytes `0xFF` but the last `0xFE`, which no minted UUIDv7 reaches either. */
 constexpr ustore_collection_id_t names_collection_k {
     {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE}}};
 
 /** Bytes every stored key leads with, the UUID of its collection. */
 constexpr std::size_t collection_bytes_k = sizeof(ustore_collection_id_t);
 
-/** A stored key of a `struct pairs` or a `struct catalog`, which a slice may view for as long as it lives. */
+/** A stored key of a `struct pairs` or a `struct collections`, which a slice may view for as long as it lives. */
 struct uuid_key_t {
     char bytes[collection_bytes_k + sizeof(ustore_uuid_t)];
 
     [[nodiscard]] ::leveldb::Slice slice() const noexcept { return {bytes, sizeof(bytes)}; }
 };
 
-/** The stored key of @p uuid in @p collection: a key of a collection keyed by UUIDs, or a collection the catalog
- *  lists. */
+/** The stored key of @p uuid in @p collection: a key of a collection keyed by UUIDs, or a collection the collections
+ *  system collection lists. */
 inline uuid_key_t uuid_key(ustore_collection_id_t const& collection, ustore_uuid_t const& uuid) noexcept {
     uuid_key_t stored;
     std::memcpy(stored.bytes, collection.uuid.bytes, collection_bytes_k);
@@ -127,7 +126,7 @@ inline ::leveldb::Slice prefix_of(ustore_collection_id_t const& collection) noex
 /** Refuses a temporary collection, which would leave the prefix viewing freed bytes. */
 ::leveldb::Slice prefix_of(ustore_collection_id_t const&&) = delete;
 
-/** The 16 bytes @p stored holds past its collection's UUID: the key of a pair, or the collection a catalog entry
+/** The 16 bytes @p stored holds past its collection's UUID: the key of a pair, or the collection a collections entry
  *  lists. */
 inline ustore_uuid_t tail_uuid_of(::leveldb::Slice const& stored) noexcept {
     ustore_uuid_t uuid;
@@ -140,18 +139,19 @@ inline ::leveldb::Slice tail_of(::leveldb::Slice const& stored) noexcept {
     return {stored.data() + collection_bytes_k, stored.size() - collection_bytes_k};
 }
 
-/** What the catalog records of a collection: `struct catalog_entry`. */
-struct catalog_entry_t {
-    ustore_modality_t modality = ustore_modality_any_k;
+/** What the collections system collection records of a collection: `struct collections_entry`. */
+struct collections_entry_t {
+    ustore_modality_t modality {};
 
     /** The name the collection carries, empty for none, viewing the bytes the entry was read from. */
     std::string_view name;
 };
 
-/** Reads the catalog entry @p held, whose name views the same bytes, refusing bytes too short to be one. */
-inline expected<catalog_entry_t> read_catalog_entry(::leveldb::Slice const& held) noexcept {
-    if (held.empty()) return status_t {status_code_t::malformed_k, "The catalog entry of a collection is malformed"};
-    return catalog_entry_t {static_cast<ustore_modality_t>(held[0]), {held.data() + 1, held.size() - 1}};
+/** Reads the collections entry @p held, whose name views the same bytes, refusing bytes too short to be one. */
+inline expected<collections_entry_t> read_collections_entry(::leveldb::Slice const& held) noexcept {
+    if (held.empty())
+        return status_t {status_code_t::malformed_k, "The collections entry of a collection is malformed"};
+    return collections_entry_t {static_cast<ustore_modality_t>(held[0]), {held.data() + 1, held.size() - 1}};
 }
 
 /** Walks the keys of one collection keyed by UUIDs over @p base, handing the reservoir sampler the key of each. */
@@ -185,8 +185,8 @@ struct database_t : handle_t {
     /** The open database. */
     std::unique_ptr<native_t> native;
 
-    /** Serializes changes to the catalog and the names, so a name is checked and taken in one step. */
-    std::mutex catalog_mutex;
+    /** Serializes changes to both system collections, so a name is checked and taken in one step. */
+    std::mutex collections_mutex;
 };
 
 /** A snapshot handle, pinning one LevelDB snapshot of its database until freed. */
@@ -218,48 +218,43 @@ status_t status_of(native_status_t const& status) noexcept {
     return {status_code_t::internal_k, "LevelDB failed"};
 }
 
-/** What the catalog records of @p collection as @p options read it, whose name views @p held, refusing a collection
- *  the catalog does not list, the reserved ones included. */
-expected<catalog_entry_t> look_up(database_t& database, ustore_collection_id_t const& collection, std::string& held,
-                                  ::leveldb::ReadOptions const& options = {}) {
-    if (collection == ustore_collection_main_k) return catalog_entry_t {};
-
-    uuid_key_t const key = uuid_key(catalog_collection_k, collection.uuid);
+/** What the collections system collection records of @p collection as @p options read it, whose name views @p held,
+ *  refusing a collection it does not list, the reserved ones included. */
+expected<collections_entry_t> look_up(database_t& database, ustore_collection_id_t const& collection, std::string& held,
+                                      ::leveldb::ReadOptions const& options = {}) {
+    uuid_key_t const key = uuid_key(collections_collection_k, collection.uuid);
     native_status_t const status = database.native->Get(options, key.slice(), &held);
     if (status.IsNotFound()) return status_t {status_code_t::not_found_k, "No such collection"};
     if (!status.ok()) return status_of(status);
-    return read_catalog_entry(held);
+    return read_collections_entry(held);
 }
 
-/** Refuses a batch addressing a collection the catalog does not list or one keyed otherwise than @p layout, looking
- *  each run of tasks on one collection up once. */
+/** Refuses a batch addressing a collection the collections system collection does not list or one keyed otherwise
+ *  than @p layout, looking each run of tasks on one collection up once. */
 status_t resolve_collections(database_t& database, strided_iterator<ustore_collection_id_t const> collections,
                              std::size_t count, entry_layout_t layout) {
     std::string held;
     for (std::size_t task_index = 0; task_index != count; ++task_index) {
-        bool const repeated = task_index != 0 && collections && collections[task_index] == collections[task_index - 1];
-        if (repeated) continue;
-        ustore_collection_id_t const collection = collections ? collections[task_index] : ustore_collection_main_k;
-        auto [entry, look_up_status] = look_up(database, collection, held);
+        if (task_index != 0 && collections[task_index] == collections[task_index - 1]) continue;
+        auto [entry, look_up_status] = look_up(database, collections[task_index], held);
         if (look_up_status.failed()) return look_up_status;
         if (entry_layout_of(entry.modality) != layout) return collection_holds_another_modality();
     }
     return {};
 }
 
-/** Refuses a batch addressing a collection the catalog does not list or one @c admit_modality refuses for
- *  @p modality, looking each run of tasks on one collection up once. */
+/** Refuses a batch addressing a collection the collections system collection does not list or one
+ *  @c admit_modality refuses for @p modality, looking each run of tasks on one collection up once. */
 status_t refuse_modalities(ustore_database_t handle, ustore_collections_view_t collections, ustore_size_t count,
                            ustore_modality_t modality) {
     database_t& database = *handle_cast<database_t>(handle);
     strided_iterator<ustore_collection_id_t const> const tasks = strided(collections);
     std::string held;
     for (std::size_t task_index = 0; task_index != count; ++task_index) {
-        if (task_index != 0 && tasks && tasks[task_index] == tasks[task_index - 1]) continue;
-        auto [entry, look_up_status] = look_up(database, tasks ? tasks[task_index] : ustore_collection_main_k, held);
+        if (task_index != 0 && tasks[task_index] == tasks[task_index - 1]) continue;
+        auto [entry, look_up_status] = look_up(database, tasks[task_index], held);
         if (look_up_status.failed()) return look_up_status;
         if (status_t const admitted = admit_modality(entry.modality, modality); admitted.failed()) return admitted;
-        if (!tasks) break;
     }
     return {};
 }
@@ -378,7 +373,6 @@ status_t seek_each(database_t& database, place_batch_t const& places, ::leveldb:
 
 status_t database_open(ustore_database_open_leveldb_t const& arguments, view_t const&) {
     if (!arguments.database) return {status_code_t::invalid_argument_k, "Need an output for the database"};
-    *arguments.database = nullptr;
     if (!arguments.directory.length) return {status_code_t::invalid_argument_k, "A database needs a directory"};
 
     std::string const root(string_of(arguments.directory));
@@ -406,13 +400,13 @@ status_t database_describe(ustore_database_describe_t const& arguments, view_t c
     database_t& database = *handle_cast<database_t>(arguments.database);
     auto [memory_bytes, memory_status] = memory_usage(database);
     if (memory_status.failed()) return memory_status;
-    // Every stored key, the reserved catalog and names included, sorts below one byte past the largest UUID
+    // Every stored key, both system collections included, sorts below one byte past the largest UUID
     std::string const past_last(collection_bytes_k + 1, '\xFF');
     ::leveldb::Range const everything(::leveldb::Slice(), past_last);
     std::uint64_t disk_bytes = 0;
     database.native->GetApproximateSizes(&everything, 1, &disk_bytes);
     *arguments.description = {
-        .capabilities = ustore_capabilities_t(ustore_capabilities_collections_k | ustore_capabilities_snapshots_k),
+        .capabilities = ustore_capabilities_snapshots_k,
         .engine = ustore_engine_leveldb_k,
         .isolation = ustore_isolation_snapshot_k,
         .memory_bytes = memory_bytes,
@@ -637,7 +631,7 @@ status_t blobs_measure(ustore_blobs_measure_t const& arguments, view_t const&) {
         outputs.min_value_bytes[task_index] = static_cast<ustore_size_t>(0);
         outputs.max_value_bytes[task_index] = static_cast<ustore_size_t>(0);
 
-        ustore_collection_id_t const collection = collections ? collections[task_index] : ustore_collection_main_k;
+        ustore_collection_id_t const collection = collections[task_index];
         uuid_key_t const start_key = uuid_key(collection, (start_keys ? start_keys[task_index] : smallest_key_k).uuid);
         uuid_key_t const end_key = uuid_key(collection, (end_keys ? end_keys[task_index] : largest_key_k).uuid);
         ::leveldb::Range const range(start_key.slice(), end_key.slice());
@@ -677,8 +671,8 @@ native_status_t clear_collection(database_t& database, ustore_collection_id_t co
     return status;
 }
 
-/** Drops @p collection, forgetting first and durably its catalog entry and the name the entry records. The caller
- *  holds @c catalog_mutex. */
+/** Drops @p collection, forgetting first and durably its collections entry and the name the entry records. The caller
+ *  holds @c collections_mutex. */
 status_t drop_collection(database_t& database, ustore_collection_id_t const& collection) {
     std::string held;
     auto [entry, look_up_status] = look_up(database, collection, held);
@@ -686,7 +680,7 @@ status_t drop_collection(database_t& database, ustore_collection_id_t const& col
 
     // A crash between the two leaves an unlisted run behind, never a listed or named collection that is gone
     ::leveldb::WriteBatch forgotten;
-    uuid_key_t const listed = uuid_key(catalog_collection_k, collection.uuid);
+    uuid_key_t const listed = uuid_key(collections_collection_k, collection.uuid);
     forgotten.Delete(listed.slice());
     std::string name;
     if (!entry.name.empty()) forgotten.Delete(string_key(names_collection_k, entry.name, name));
@@ -699,14 +693,12 @@ status_t drop_collection(database_t& database, ustore_collection_id_t const& col
 
 status_t collection_create(ustore_collection_create_t const& arguments, view_t const&) {
     if (!arguments.collection) return {status_code_t::invalid_argument_k, "Need an output for the collection"};
-    if (arguments.modality > ustore_modality_pages_k) return {status_code_t::invalid_argument_k, "Unknown modality"};
     std::string_view const name = string_of(arguments.name);
-    if (arguments.name.data && name.empty())
-        return {status_code_t::invalid_argument_k, "A name is never empty, as the main collection has none"};
+    if (arguments.name.data && name.empty()) return {status_code_t::invalid_argument_k, "A name is never empty"};
 
     // The entry and the name reach the log in one batch, so a crash keeps both or neither
     database_t& database = *handle_cast<database_t>(arguments.database);
-    std::lock_guard lock {database.catalog_mutex};
+    std::lock_guard lock {database.collections_mutex};
     std::string name_key;
     if (!name.empty()) {
         std::string record;
@@ -718,7 +710,7 @@ status_t collection_create(ustore_collection_create_t const& arguments, view_t c
     auto [id, mint_status] = mint_collection_id();
     if (mint_status.failed()) return mint_status;
 
-    uuid_key_t const listed = uuid_key(catalog_collection_k, id.uuid);
+    uuid_key_t const listed = uuid_key(collections_collection_k, id.uuid);
     std::string entry(1, static_cast<char>(arguments.modality));
     entry.append(name);
     ::leveldb::WriteBatch batch;
@@ -735,12 +727,10 @@ status_t collection_drop(ustore_collection_drop_t const& arguments, view_t const
     if (arguments.mode != ustore_drop_collection_k && arguments.mode != ustore_drop_pairs_k &&
         arguments.mode != ustore_drop_values_k)
         return {status_code_t::invalid_argument_k, "Unknown drop mode"};
-    if (arguments.collection == ustore_collection_main_k && arguments.mode == ustore_drop_collection_k)
-        return {status_code_t::invalid_argument_k, "The main collection can only be cleared"};
 
     database_t& database = *handle_cast<database_t>(arguments.database);
     if (arguments.mode == ustore_drop_collection_k) {
-        std::lock_guard lock {database.catalog_mutex};
+        std::lock_guard lock {database.collections_mutex};
         return drop_collection(database, arguments.collection);
     }
     std::string held;
@@ -759,15 +749,15 @@ status_t collection_list(ustore_collection_list_t const& arguments, view_t const
     options.fill_cache = false;
     use_snapshot(view, options);
 
-    // The catalog lists every collection but the main one, keyed by its ID
-    ::leveldb::Slice const catalog = prefix_of(catalog_collection_k);
+    // The collections system collection lists every collection, keyed by its ID
+    ::leveldb::Slice const collections = prefix_of(collections_collection_k);
     iterator_pointer_t iterator {database.native->NewIterator(options)};
     collection_list_outputs_t outputs {view.scratch};
-    for (iterator->Seek(catalog); iterator->Valid() && iterator->key().starts_with(catalog); iterator->Next()) {
+    for (iterator->Seek(collections); iterator->Valid() && iterator->key().starts_with(collections); iterator->Next()) {
         ::leveldb::Slice const listed = iterator->key();
-        auto [entry, read_status] = read_catalog_entry(iterator->value());
+        auto [entry, read_status] = read_collections_entry(iterator->value());
         if (read_status.failed() || listed.size() != sizeof(uuid_key_t))
-            return {status_code_t::malformed_k, "The catalog entry of a collection is malformed"};
+            return {status_code_t::malformed_k, "The collections entry of a collection is malformed"};
         value_view_t const name = entry.name.empty() ? value_view_t {} : value_view_t {entry.name};
         if (status_t const status = outputs.push(ustore_collection_id_t {tail_uuid_of(listed)}, entry.modality, name);
             status.failed())
@@ -789,7 +779,7 @@ status_t collection_find(ustore_collection_find_t const& arguments, strings_arg_
     auto [outputs, outputs_status] = collection_find_outputs_t::make(arguments);
     if (outputs_status.failed()) return outputs_status;
 
-    // A name resolves to its collection's UUID, and the catalog then records the collection's modality
+    // A name resolves to its collection's UUID, and the collections system collection then records its modality
     std::string key;
     std::string named;
     std::string held;
@@ -797,7 +787,7 @@ status_t collection_find(ustore_collection_find_t const& arguments, strings_arg_
         native_status_t const status = database.native->Get(
             options, string_key(names_collection_k, string_of(names[index]), key), &named);
         if (status.IsNotFound()) {
-            outputs.assign(index, ustore_collection_main_k, ustore_modality_any_k, false);
+            outputs.assign(index, ustore_collection_id_t {}, ustore_modality_t {}, false);
             continue;
         }
         if (!status.ok()) return status_of(status);
@@ -814,7 +804,7 @@ status_t collection_find(ustore_collection_find_t const& arguments, strings_arg_
 }
 
 /** Clears every collection as the mode asks in one walk of the whole keyspace, in batches the size of a memtable, the
- *  last one synced, where dropping the collections removes the catalog and the names with them, and emptying the
+ *  last one synced, where dropping the collections removes both system collections with them, and emptying the
  *  values leaves every strings collection as it is, whose values are keys. */
 status_t database_clear(ustore_database_clear_t const& arguments, view_t const&) {
     ustore_drop_mode_t const mode = arguments.mode;
@@ -822,30 +812,30 @@ status_t database_clear(ustore_database_clear_t const& arguments, view_t const&)
         return {status_code_t::invalid_argument_k, "Unknown drop mode"};
 
     database_t& database = *handle_cast<database_t>(arguments.database);
-    std::lock_guard lock {database.catalog_mutex};
+    std::lock_guard lock {database.collections_mutex};
     ::leveldb::WriteOptions buffered;
     ::leveldb::WriteOptions synced;
     synced.sync = true;
     ::leveldb::WriteBatch batch;
     native_status_t status;
-    ::leveldb::Slice const catalog = prefix_of(catalog_collection_k);
+    ::leveldb::Slice const collections = prefix_of(collections_collection_k);
     ::leveldb::Slice const names = prefix_of(names_collection_k);
     // The collection the walk is in, looked up once as the walk enters its run
-    ustore_collection_id_t collection = catalog_collection_k;
-    ustore_modality_t modality = ustore_modality_any_k;
+    ustore_collection_id_t collection = collections_collection_k;
+    ustore_modality_t modality {};
     std::string held;
     iterator_pointer_t iterator {database.native->NewIterator(::leveldb::ReadOptions())};
     for (iterator->SeekToFirst(); status.ok() && iterator->Valid(); iterator->Next()) {
         ::leveldb::Slice const key = iterator->key();
         if (mode == ustore_drop_collection_k) batch.Delete(key);
-        else if (key.starts_with(catalog) || key.starts_with(names)) continue;
+        else if (key.starts_with(collections) || key.starts_with(names)) continue;
         else if (mode == ustore_drop_pairs_k) batch.Delete(key);
         else {
             if (!key.starts_with(prefix_of(collection))) {
                 std::memcpy(collection.uuid.bytes, key.data(), collection_bytes_k);
                 auto [entry, look_up_status] = look_up(database, collection, held);
                 if (look_up_status.failed() && look_up_status != status_code_t::not_found_k) return look_up_status;
-                modality = look_up_status.failed() ? ustore_modality_any_k : entry.modality;
+                modality = look_up_status.failed() ? ustore_modality_t {} : entry.modality;
             }
             if (modality == ustore_modality_strings_k) continue;
             batch.Put(key, ::leveldb::Slice());
@@ -859,31 +849,34 @@ status_t database_clear(ustore_database_clear_t const& arguments, view_t const&)
     return status_of(status);
 }
 
-/** Compacts the whole keyspace one collection at a time, in key order from the main one to the names and the catalog,
- *  each flushing the memtable ahead of it, and reports one unit per collection, as LevelDB measures no memtable. */
+/** Compacts the whole keyspace one collection at a time, in key order up to the names and the collections system
+ *  collections, each flushing the memtable ahead of it, and reports one unit per collection, as LevelDB measures no
+ *  memtable. */
 status_t database_compact(ustore_database_compact_t const& arguments, view_t const&) {
     database_t& database = *handle_cast<database_t>(arguments.database);
-    // The catalog lists every collection but the main one in the order of their identifiers, which is key order
+    // The collections system collection lists every collection in the order of their identifiers, which is key order
     st::basic_vector<ustore_collection_id_t> bounds;
-    st::status_t grown = bounds.emplace_back(ustore_collection_main_k);
-    ::leveldb::Slice const catalog = prefix_of(catalog_collection_k);
+    st::status_t grown = st::status_t::success_k;
+    ::leveldb::Slice const collections = prefix_of(collections_collection_k);
     iterator_pointer_t iterator {database.native->NewIterator(::leveldb::ReadOptions())};
-    for (iterator->Seek(catalog); st::succeeded(grown) && iterator->Valid() && iterator->key().starts_with(catalog);
-         iterator->Next())
+    for (iterator->Seek(collections);
+         st::succeeded(grown) && iterator->Valid() && iterator->key().starts_with(collections); iterator->Next())
         grown = bounds.emplace_back(ustore_collection_id_t {tail_uuid_of(iterator->key())});
     if (!iterator->status().ok()) return status_of(iterator->status());
     iterator.reset();
     if (st::succeeded(grown)) grown = bounds.emplace_back(names_collection_k);
-    if (st::succeeded(grown)) grown = bounds.emplace_back(catalog_collection_k);
+    if (st::succeeded(grown)) grown = bounds.emplace_back(collections_collection_k);
     if (st::failed(grown)) return growth_status(grown);
 
-    // A run spans from the prefix of its collection to the prefix of the next one, and the last to the keyspace's end
+    // A run spans from the prefix of its collection to the prefix of the next one, the first from the keyspace's start
+    // and the last to its end
     progress_t progress {arguments.progress, arguments.progress_state, bounds.size()};
     for (std::size_t index = 0; index != bounds.size(); ++index) {
+        bool const first = index == 0;
         bool const last = index + 1 == bounds.size();
         ::leveldb::Slice const begin = prefix_of(bounds[index]);
         ::leveldb::Slice const end = last ? ::leveldb::Slice() : prefix_of(bounds[index + 1]);
-        database.native->CompactRange(&begin, last ? nullptr : &end);
+        database.native->CompactRange(first ? nullptr : &begin, last ? nullptr : &end);
         if (!progress.advance(1)) return progress_cancelled_k;
     }
     return {};
@@ -907,9 +900,8 @@ status_t strings_write(ustore_strings_write_t const& arguments, strings_arg_t co
     ::leveldb::WriteBatch batch;
     std::string key;
     for (std::size_t index = 0; index != arguments.count; ++index) {
-        ustore_collection_id_t const collection = collections ? collections[index] : ustore_collection_main_k;
         ::leveldb::Slice const value {reinterpret_cast<char const*>(values[index].uuid.bytes), sizeof(ustore_key_t)};
-        batch.Put(string_key(collection, string_of(texts[index]), key), value);
+        batch.Put(string_key(collections[index], string_of(texts[index]), key), value);
     }
     return status_of(database.native->Write(write_options_for(arguments.durability), &batch));
 }
@@ -926,10 +918,8 @@ status_t strings_remove(ustore_strings_remove_t const& arguments, strings_arg_t 
 
     ::leveldb::WriteBatch batch;
     std::string key;
-    for (std::size_t index = 0; index != arguments.count; ++index) {
-        ustore_collection_id_t const collection = collections ? collections[index] : ustore_collection_main_k;
-        batch.Delete(string_key(collection, string_of(texts[index]), key));
-    }
+    for (std::size_t index = 0; index != arguments.count; ++index)
+        batch.Delete(string_key(collections[index], string_of(texts[index]), key));
     return status_of(database.native->Write(write_options_for(arguments.durability), &batch));
 }
 
@@ -951,9 +941,8 @@ status_t strings_read(ustore_strings_read_t const& arguments, strings_arg_t cons
     std::string key;
     std::string value;
     for (std::size_t index = 0; index != arguments.count; ++index) {
-        ustore_collection_id_t const collection = collections ? collections[index] : ustore_collection_main_k;
         native_status_t const status = database.native->Get(
-            options, string_key(collection, string_of(texts[index]), key), &value);
+            options, string_key(collections[index], string_of(texts[index]), key), &value);
         if (status.IsNotFound()) {
             outputs.push_missing();
             continue;
@@ -992,7 +981,7 @@ status_t strings_scan(ustore_strings_scan_t const& arguments, strings_arg_t cons
     std::string bound;
     iterator_pointer_t iterator {database.native->NewIterator(options)};
     for (std::size_t task = 0; task != count; ++task) {
-        ustore_collection_id_t const collection = collections ? collections[task] : ustore_collection_main_k;
+        ustore_collection_id_t const collection = collections[task];
         std::string_view const prefix = prefixes ? string_of(prefixes[task]) : std::string_view {};
         std::string_view const start = starts ? string_of(starts[task]) : std::string_view {};
         std::size_t const scan_end = outputs.size() + arguments.wanted;
@@ -1075,6 +1064,7 @@ docs_verbs_t const docs_verbs_k {
     .gather = &docs_gather_over_blobs<values_verbs_k, &resolve_modality>,
     .remove = &remove_over_blobs<values_verbs_k, &resolve_modality, ustore_modality_docs_k>,
     .scan = &scan_over_blobs<values_verbs_k, &resolve_modality, ustore_modality_docs_k>,
+    .sample = &sample_over_blobs<values_verbs_k, &resolve_modality, ustore_modality_docs_k>,
 };
 
 /** The verbs of this engine's graph collections. */

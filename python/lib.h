@@ -750,8 +750,8 @@ typedef struct ustore_py_verb_options_t {
     ustore_durability_t durability;
 } ustore_py_verb_options_t;
 
-/** Starts the shared options at the main collection and buffered writes, so a verb only overrides what a keyword
- *  names. */
+/** Starts the shared options at the nil collection, which every engine refuses, and buffered writes, so a verb only
+ *  overrides what a keyword names. */
 void ustore_py_verb_options_init(ustore_py_verb_options_t* options);
 
 /**
@@ -1058,9 +1058,9 @@ ustore_py_naming_t ustore_py_collection_named(ustore_py_context_t const* context
                                               ustore_collection_id_t* collection, ustore_modality_t* modality);
 
 /**
- *  @brief Reads the collection an argument names, accepting an ID, a name, or @c None.
+ *  @brief Reads the collection an argument names, accepting an ID or a name.
  *  @param[in] context The receiver to resolve a name through.
- *  @param[in] object The collection, as a `uuid.UUID` ID, a string name, or @c None for the main one.
+ *  @param[in] object The collection, as a `uuid.UUID` ID or a string name.
  *  @param[out] collection The identifier the argument addresses.
  *  @return 0 on success, -1 with an exception set otherwise.
  */
@@ -1082,7 +1082,7 @@ PyObject* ustore_py_collection_names(ustore_py_context_t const* context, char co
 /**
  *  @brief Answers the @c Collection a receiver addresses by name, as `db['movies']` does.
  *  @param[in] view The @c Database, @c Transaction, @c Snapshot, @c View or @c DeferredView indexed.
- *  @param[in] name The collection's name, where the empty one is the main collection.
+ *  @param[in] name The collection's name.
  *  @return A new reference, or NULL with an exception set.
  */
 PyObject* ustore_py_collection_subscript(PyObject* view, PyObject* name);
@@ -1133,6 +1133,9 @@ PyObject* ustore_py_read_answer_values(void* call);
 /** Answers copies of what a read of values or documents wrote, as @c ustore_py_read_copies_verb spells them. */
 PyObject* ustore_py_read_answer_copies(void* call);
 
+/** Answers a dict of every key a read of values or documents was handed onto a copy of what it read or None. */
+PyObject* ustore_py_read_answer_drawn(void* call);
+
 /** Lets go of the keys, the field, the subscript and the arena claim of a read. */
 void ustore_py_read_release(void* call);
 
@@ -1156,6 +1159,13 @@ PyObject* ustore_py_values_read(ustore_py_context_t const* context, ustore_py_ve
  */
 PyObject* ustore_py_value_contains(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
                                    ustore_key_t const* key);
+
+/**
+ *  @brief Reads whether one document is present into a one-off arena: the core of `key in Collection.docs`.
+ *  @return True or False, or the @c Deferred of either, or NULL with an exception set.
+ */
+PyObject* ustore_py_document_contains(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
+                                      ustore_key_t const* key);
 
 /**
  *  @brief Gathers the values of a batch write, broadcasting one value to every key.
@@ -1228,13 +1238,18 @@ PyObject* ustore_py_api_scan_of(PyObject* self, PyObject* const* args, Py_ssize_
                                 PyObject* args_names_tuple, char const* name, ustore_modality_t modality);
 
 /**
- *  @brief Draws up to @p wanted keys at random: the core of `sample`, `Collection.sample_keys` and
- *      `Collection.sample`.
+ *  @brief Draws up to @p wanted keys at random through the sample of @p modality: the core of `sample`,
+ *      `docs_sample`, `Collection.sample_keys` and `Collection.sample`.
  *  @param[in] arena The @c Arena the keys land in, claimed here.
  *  @return A new @c Keys of one task, or its @c Deferred, or NULL with an exception set.
  */
 PyObject* ustore_py_keys_sample(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
-                                size_t wanted, PyObject* arena);
+                                ustore_modality_t modality, size_t wanted, PyObject* arena);
+
+/** Parses the arguments of one sample, as `sample` takes them, and runs it through the sample of @p modality: the
+ *  body of `sample` and `docs_sample`, whose name @p name spells. */
+PyObject* ustore_py_api_sample_of(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                                  PyObject* args_names_tuple, char const* name, ustore_modality_t modality);
 
 /** How a write takes its documents. */
 typedef enum ustore_py_documents_spelling_t {
@@ -1251,6 +1266,10 @@ extern ustore_py_verb_t const ustore_py_docs_read_verb;
 
 /** A read of documents answering copies of their JSON text, as `Collection.docs_json` does. */
 extern ustore_py_verb_t const ustore_py_docs_read_copies_verb;
+
+/** A read of documents answering a dict of every key it read onto a copy of its JSON or None, as `Collection.sample`
+ *  does over documents. */
+extern ustore_py_verb_t const ustore_py_docs_read_drawn_verb;
 
 /** A read of documents answering them parsed into Python objects, as `Collection.docs` does. */
 extern ustore_py_verb_t const ustore_py_docs_read_objects_verb;
@@ -1312,8 +1331,10 @@ extern char const doc_docs_gist[];
 extern char const doc_docs_gather[];
 extern char const doc_docs_remove[];
 extern char const doc_docs_scan[];
+extern char const doc_docs_sample[];
 extern char const doc_graph_read_edges[];
 extern char const doc_graph_degrees[];
+extern char const doc_graph_contains[];
 extern char const doc_graph_write_edges[];
 extern char const doc_graph_remove_edges[];
 extern char const doc_graph_write_vertices[];
@@ -1356,10 +1377,14 @@ PyObject* ustore_py_api_docs_remove(PyObject* self, PyObject* const* args, Py_ss
                                     PyObject* args_names_tuple);
 PyObject* ustore_py_api_docs_scan(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
                                   PyObject* args_names_tuple);
+PyObject* ustore_py_api_docs_sample(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                                    PyObject* args_names_tuple);
 PyObject* ustore_py_api_graph_read_edges(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
                                          PyObject* args_names_tuple);
 PyObject* ustore_py_api_graph_degrees(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
                                       PyObject* args_names_tuple);
+PyObject* ustore_py_api_graph_contains(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                                       PyObject* args_names_tuple);
 PyObject* ustore_py_api_graph_write_edges(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
                                           PyObject* args_names_tuple);
 PyObject* ustore_py_api_graph_remove_edges(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,

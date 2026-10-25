@@ -99,9 +99,9 @@ def open_store() -> Store:
     database = ustore.Database.open_ram()
     store = Store(
         database=database,
-        documents=database.collection_create(DOCUMENTS_COLLECTION),
+        documents=database.collection_create(DOCUMENTS_COLLECTION, modality=ustore.Modality.DOCS),
         network=DiGraph(database, NETWORK_COLLECTION),
-        images=database.collection_create(IMAGES_COLLECTION),
+        images=database.collection_create(IMAGES_COLLECTION, modality=ustore.Modality.BLOBS),
     )
     seed_documents(store)
     seed_network(store)

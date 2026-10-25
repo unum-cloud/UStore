@@ -33,7 +33,7 @@ def is_one_key(key: object) -> bool:
 
 def scan_keys(
     view: Database | Transaction | Snapshot | View,
-    collection: UUID | str | None = None,
+    collection: UUID | str,
     page: int = PAGE_KEYS,
     modality: Modality = Modality.BLOBS,
 ) -> Iterator[UUID]:

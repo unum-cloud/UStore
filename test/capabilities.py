@@ -35,7 +35,6 @@ def probe(engine: str) -> dict[str, bool]:
         capabilities = database.capabilities
         return {
             "transactions": capabilities.transactions,
-            "collections": capabilities.collections,
             "snapshots": capabilities.snapshots,
         }
 
@@ -57,5 +56,4 @@ def keys(integers: Iterable[int]) -> list[UUID]:
 
 
 NEEDS_TRANSACTIONS = pytest.mark.needs("transactions")
-NEEDS_COLLECTIONS = pytest.mark.needs("collections")
 NEEDS_SNAPSHOTS = pytest.mark.needs("snapshots")

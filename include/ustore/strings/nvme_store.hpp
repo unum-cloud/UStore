@@ -277,7 +277,7 @@ class nvme_store {
     /** The bounds this store was mounted with. */
     [[nodiscard]] collection_config_t const& config() const noexcept { return runs_.config(); }
 
-    /** The tree the flushed strings live in, which a database compacts and names in its catalog. */
+    /** The tree the flushed strings live in, which a database compacts and names in its schema. */
     [[nodiscard]] tree_t const& tree() const noexcept { return runs_.tree(); }
 
     /** Bytes every value this store admits takes: one 16-byte key. */

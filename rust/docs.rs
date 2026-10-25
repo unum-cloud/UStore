@@ -11,7 +11,7 @@
 //!
 //! let database = Database::init_ram(&RAMOptions::default())?;
 //! let mut arena = Arena::new()?;
-//! let people = database.collection_create("people", Modality::Any)?;
+//! let people = database.collection_create("people", Modality::Docs)?;
 //! let ada = Key::from(1u64);
 //!
 //! let documents = [DocumentEntry::<Json>::new(ada, r#"{"name":"Ada","born":1815}"#)];
@@ -59,14 +59,15 @@
 //! while they live:
 //!
 //! ```compile_fail,E0499
-//! use ustore::{Arena, CollectionID, Column, RAMOptions, Database, Key, Text};
+//! use ustore::{Arena, Column, RAMOptions, Database, Key, Modality, Text};
 //!
 //! let database = Database::init_ram(&RAMOptions::default())?;
 //! let mut arena = Arena::new()?;
+//! let people = database.collection_create("people", Modality::Docs)?;
 //! let columns = [Column::new::<Text>("name")];
 //! let ada = Key::from(1u64);
-//! let gathered = database.head().docs_gather(CollectionID::main(), &[ada], &columns, &mut arena)?;
-//! let paths = database.head().docs_gist(CollectionID::main(), [ada], &mut arena)?;
+//! let gathered = database.head().docs_gather(people, &[ada], &columns, &mut arena)?;
+//! let paths = database.head().docs_gist(people, [ada], &mut arena)?;
 //! assert_eq!(gathered.rows(), paths.len());
 //! # Ok::<(), ustore::Error>(())
 //! ```
@@ -116,6 +117,20 @@ mod ffi {
         pub values: ustore_strings_view_t,
         pub type_: ustore_enum_t,
         pub modification: ustore_enum_t,
+        pub durability: ustore_durability_t,
+        pub watch: ustore_watch_t,
+    }
+
+    #[repr(C)]
+    pub struct ustore_docs_remove_t {
+        pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
+        pub transaction: ustore_transaction_t,
+        pub count: ustore_size_t,
+        pub collections: ustore_collections_view_t,
+        pub keys: ustore_keys_view_t,
         pub durability: ustore_durability_t,
         pub watch: ustore_watch_t,
     }
@@ -182,6 +197,7 @@ mod ffi {
 
     extern "C" {
         pub fn ustore_docs_write(arguments: *mut ustore_docs_write_t);
+        pub fn ustore_docs_remove(arguments: *mut ustore_docs_remove_t);
         pub fn ustore_docs_read(arguments: *mut ustore_docs_read_t);
         pub fn ustore_docs_gist(arguments: *mut ustore_docs_gist_t);
         pub fn ustore_docs_gather(arguments: *mut ustore_docs_gather_t);
@@ -1012,7 +1028,7 @@ impl<'arena, 'field, Requested: AsRef<[Column<'field>]>> Columns<'arena, Request
 // region: Verbs
 
 impl<Parent: Writable, Completion: crate::db::sealed::Completion> View<'_, Parent, Completion> {
-    /// Writes whole documents or values into fields inside them, where [`View::remove`] removes documents and a merge
+    /// Writes whole documents or values into fields inside them, where [`View::docs_remove`] removes documents and a merge
     /// with a JSON `null` removes a field, and hands what it wrote back.
     ///
     /// The batch is one of:
@@ -1040,6 +1056,26 @@ impl<Parent: Writable, Completion: crate::db::sealed::Completion> View<'_, Paren
             collections: collections.into(),
             documents,
             modification,
+            durability,
+        };
+        Completion::answer(self, verb)
+    }
+
+    /// Removes a batch of whole documents, whether or not the collections hold them, and hands the keys back.
+    ///
+    /// Calls `ustore_docs_remove`.
+    pub fn docs_remove<'collections, Keys: AsRef<[Key]>>(
+        &self,
+        collections: impl Into<Collections<'collections>>,
+        keys: Keys,
+        durability: Durability,
+    ) -> Completion::Answer<DocsRemove<'collections, Keys>>
+    where
+        Completion: Accepts<Collections<'collections>> + Accepts<Keys>,
+    {
+        let verb = DocsRemove {
+            collections: collections.into(),
+            keys,
             durability,
         };
         Completion::answer(self, verb)
@@ -1175,6 +1211,51 @@ impl<Documents: Writes> Calling for DocsWrite<'_, Documents> {
 
     fn finish(self) -> Result<Documents> {
         Ok(self.documents)
+    }
+}
+
+/// A removal of a batch of whole documents; see [`View::docs_remove`].
+#[derive(Debug)]
+pub struct DocsRemove<'collections, Keys> {
+    collections: Collections<'collections>,
+    keys: Keys,
+    durability: Durability,
+}
+
+impl<Keys: AsRef<[Key]>> Calling for DocsRemove<'_, Keys> {
+    type Arguments = ffi::ustore_docs_remove_t;
+    type Output = Keys;
+
+    fn arguments<Parent, Completion>(
+        &mut self,
+        view: &View<'_, Parent, Completion>,
+        outcome: *mut ustore_outcome_t,
+        completion: ustore_completion_t,
+    ) -> Result<Option<Self::Arguments>> {
+        let keys = self.keys.as_ref();
+        if keys.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(ffi::ustore_docs_remove_t {
+            database: view.database(),
+            executor: view.executor(),
+            outcome,
+            completion,
+            transaction: view.transaction(),
+            count: keys.len() as ustore_size_t,
+            collections: self.collections.view(keys.len())?,
+            keys: ustore_strided_view_t::packed(keys),
+            durability: self.durability,
+            watch: view.watch(),
+        }))
+    }
+
+    unsafe fn call(arguments: *mut Self::Arguments) {
+        ffi::ustore_docs_remove(arguments)
+    }
+
+    fn finish(self) -> Result<Keys> {
+        Ok(self.keys)
     }
 }
 
@@ -1357,11 +1438,12 @@ mod tests {
     use super::*;
     use crate::blobs::Entry;
     use crate::db::{CollectionID, Collections, Database, Executor, Modality, RAMOptions, Watch};
-    use crate::testing::{key, keys};
+    use crate::testing::{created, key, keys};
 
-    /// A database holding Ada under key one and Grace under key two.
-    fn populated() -> (Database, Arena) {
+    /// A database whose docs collection holds Ada under key one and Grace under key two.
+    fn populated() -> (Database, CollectionID, Arena) {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
+        let docs = created(&database, Modality::Docs);
         let documents = [
             DocumentEntry::<Json>::new(key(1), r#"{"name":"Ada","born":1815,"languages":["English","French"]}"#),
             DocumentEntry::<Json>::new(
@@ -1371,14 +1453,9 @@ mod tests {
         ];
         database
             .head()
-            .docs_write(
-                CollectionID::main(),
-                &documents,
-                Modification::Upsert,
-                Durability::Buffered,
-            )
+            .docs_write(docs, &documents, Modification::Upsert, Durability::Buffered)
             .unwrap();
-        (database, Arena::new().unwrap())
+        (database, docs, Arena::new().unwrap())
     }
 
     /// The text of the field at `index`, or `None` when it is absent.
@@ -1388,11 +1465,11 @@ mod tests {
 
     #[test]
     fn whole_documents_read_back_as_written() {
-        let (database, mut arena) = populated();
+        let (database, docs, mut arena) = populated();
         let grace = r#"{"name":"Grace","born":"1906","navy":{"rank":"Rear Admiral"}}"#;
         let documents = database
             .head()
-            .docs_read(CollectionID::main(), keys([2, 1, 3]), Json, &mut arena)
+            .docs_read(docs, keys([2, 1, 3]), Json, &mut arena)
             .unwrap();
         assert_eq!(documents.len(), 3);
         assert_eq!(text(&documents, 0), Some(grace));
@@ -1402,7 +1479,7 @@ mod tests {
         // An empty field addresses the whole document, as the empty JSON Pointer does.
         let whole = database
             .head()
-            .docs_read(CollectionID::main(), &[FieldAddress::new(key(2), "")], Json, &mut arena)
+            .docs_read(docs, &[FieldAddress::new(key(2), "")], Json, &mut arena)
             .unwrap();
         assert_eq!(text(&whole, 0), Some(grace));
     }
@@ -1410,39 +1487,35 @@ mod tests {
     #[test]
     fn documents_refuse_text_that_is_not_json() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
+        let docs = created(&database, Modality::Docs);
         let documents = [DocumentEntry::<Json>::new(key(1), "{\"name\":")];
         let failure = database
             .head()
-            .docs_write(
-                CollectionID::main(),
-                &documents,
-                Modification::Upsert,
-                Durability::Buffered,
-            )
+            .docs_write(docs, &documents, Modification::Upsert, Durability::Buffered)
             .unwrap_err();
         assert_eq!(failure.status, Status::Malformed);
     }
 
     #[test]
     fn documents_insert_once_and_update_in_place() {
-        let (database, mut arena) = populated();
+        let (database, docs, mut arena) = populated();
         let again = [DocumentEntry::<Json>::new(key(1), r#"{"name":"Someone else"}"#)];
         let failure = database
             .head()
-            .docs_write(CollectionID::main(), &again, Modification::Insert, Durability::Buffered)
+            .docs_write(docs, &again, Modification::Insert, Durability::Buffered)
             .unwrap_err();
         assert_eq!(failure.status, Status::AlreadyExists);
 
         let fresh = [DocumentEntry::<Json>::new(key(3), r#"{"name":"Katherine"}"#)];
         database
             .head()
-            .docs_write(CollectionID::main(), &fresh, Modification::Insert, Durability::Buffered)
+            .docs_write(docs, &fresh, Modification::Insert, Durability::Buffered)
             .unwrap();
 
         let merge = [DocumentEntry::<Json>::new(key(3), r#"{"born":1918}"#)];
         database
             .head()
-            .docs_write(CollectionID::main(), &merge, Modification::Merge, Durability::Buffered)
+            .docs_write(docs, &merge, Modification::Merge, Durability::Buffered)
             .unwrap();
         let patch = [DocumentEntry::<Json>::new(
             key(3),
@@ -1450,7 +1523,7 @@ mod tests {
         )];
         database
             .head()
-            .docs_write(CollectionID::main(), &patch, Modification::Patch, Durability::Buffered)
+            .docs_write(docs, &patch, Modification::Patch, Durability::Buffered)
             .unwrap();
 
         let fields = [
@@ -1458,10 +1531,7 @@ mod tests {
             FieldAddress::new(key(3), "born"),
             FieldAddress::new(key(3), "surname"),
         ];
-        let read = database
-            .head()
-            .docs_read(CollectionID::main(), &fields, Text, &mut arena)
-            .unwrap();
+        let read = database.head().docs_read(docs, &fields, Text, &mut arena).unwrap();
         assert_eq!(text(&read, 0), Some("Katherine"), "a merge keeps what it does not name");
         assert_eq!(text(&read, 1), Some("1918"));
         assert_eq!(text(&read, 2), Some("Johnson"));
@@ -1469,14 +1539,14 @@ mod tests {
 
     #[test]
     fn a_patch_that_does_not_apply_is_refused() {
-        let (database, _) = populated();
+        let (database, docs, _) = populated();
         let patch = [DocumentEntry::<Json>::new(
             key(1),
             r#"[{"op":"remove","path":"/nowhere"}]"#,
         )];
         let failure = database
             .head()
-            .docs_write(CollectionID::main(), &patch, Modification::Patch, Durability::Buffered)
+            .docs_write(docs, &patch, Modification::Patch, Durability::Buffered)
             .unwrap_err();
         assert_eq!(failure.status, Status::InvalidArgument, "{failure:?}");
 
@@ -1485,7 +1555,7 @@ mod tests {
             let modifier = [DocumentEntry::<Json>::new(key(42), r#"[]"#)];
             let failure = database
                 .head()
-                .docs_write(CollectionID::main(), &modifier, modification, Durability::Buffered)
+                .docs_write(docs, &modifier, modification, Durability::Buffered)
                 .unwrap_err();
             assert_eq!(failure.status, Status::NotFound, "{modification:?}");
         }
@@ -1494,6 +1564,7 @@ mod tests {
     #[test]
     fn documents_carry_their_keys_under_an_id_field() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
+        let docs = created(&database, Modality::Docs);
         let mut arena = Arena::new().unwrap();
         let documents = [
             Document::new(r#"{"_id":7,"name":"Ada"}"#),
@@ -1502,7 +1573,7 @@ mod tests {
         database
             .head()
             .docs_write(
-                CollectionID::main(),
+                docs,
                 KeyedBy("_id", &documents),
                 Modification::Upsert,
                 Durability::Buffered,
@@ -1511,7 +1582,7 @@ mod tests {
         let names = database
             .head()
             .docs_read(
-                CollectionID::main(),
+                docs,
                 &[FieldAddress::new(key(9), "name"), FieldAddress::new(key(7), "name")],
                 Text,
                 &mut arena,
@@ -1524,7 +1595,7 @@ mod tests {
         let failure = database
             .head()
             .docs_write(
-                CollectionID::main(),
+                docs,
                 KeyedBy("_id", &unkeyed),
                 Modification::Upsert,
                 Durability::Buffered,
@@ -1535,25 +1606,24 @@ mod tests {
 
     #[test]
     fn fields_write_every_format_and_read_back_as_text_or_json() {
-        let (database, mut arena) = populated();
+        let (database, docs, mut arena) = populated();
         let head = database.head();
-        let main = CollectionID::main();
         let upsert = Modification::Upsert;
         let buffered = Durability::Buffered;
 
         let died = [FieldEntry::<i64>::new(key(1), "died", &1852)];
-        head.docs_write(main, &died, upsert, buffered).unwrap();
+        head.docs_write(docs, &died, upsert, buffered).unwrap();
         let height = [FieldEntry::<f64>::new(key(1), "height", &1.65)];
-        head.docs_write(main, &height, upsert, buffered).unwrap();
+        head.docs_write(docs, &height, upsert, buffered).unwrap();
         let countess = [FieldEntry::<bool>::new(key(1), "countess", &true)];
-        head.docs_write(main, &countess, upsert, buffered).unwrap();
+        head.docs_write(docs, &countess, upsert, buffered).unwrap();
         let title = [FieldEntry::<Text>::new(key(1), "title", "Countess of Lovelace")];
-        head.docs_write(main, &title, upsert, buffered).unwrap();
+        head.docs_write(docs, &title, upsert, buffered).unwrap();
         let nested = [
             FieldEntry::<Json>::new(key(1), "/family", r#"{"father":"Byron"}"#),
             FieldEntry::<Json>::new(key(2), "/navy/rank", r#""Commodore""#),
         ];
-        head.docs_write(main, &nested, upsert, buffered).unwrap();
+        head.docs_write(docs, &nested, upsert, buffered).unwrap();
 
         let fields = [
             FieldAddress::new(key(1), "died"),
@@ -1564,7 +1634,7 @@ mod tests {
             FieldAddress::new(key(2), "/navy/rank"),
             FieldAddress::new(key(1), "/languages/1"),
         ];
-        let texts = head.docs_read(main, &fields, Text, &mut arena).unwrap();
+        let texts = head.docs_read(docs, &fields, Text, &mut arena).unwrap();
         assert_eq!(text(&texts, 0), Some("1852"));
         assert_eq!(text(&texts, 1), Some("1.65"));
         assert_eq!(text(&texts, 2), Some("true"));
@@ -1575,7 +1645,7 @@ mod tests {
 
         let json = head
             .docs_read(
-                main,
+                docs,
                 &[FieldAddress::new(key(1), "title"), FieldAddress::new(key(1), "family")],
                 Json,
                 &mut arena,
@@ -1587,96 +1657,77 @@ mod tests {
 
     #[test]
     fn fields_are_removed_by_merging_a_null() {
-        let (database, mut arena) = populated();
+        let (database, docs, mut arena) = populated();
         let removal = [DocumentEntry::<Json>::new(key(1), r#"{"born":null}"#)];
         database
             .head()
-            .docs_write(
-                CollectionID::main(),
-                &removal,
-                Modification::Merge,
-                Durability::Buffered,
-            )
+            .docs_write(docs, &removal, Modification::Merge, Durability::Buffered)
             .unwrap();
         let born = database
             .head()
-            .docs_read(
-                CollectionID::main(),
-                &[FieldAddress::new(key(1), "born")],
-                Text,
-                &mut arena,
-            )
+            .docs_read(docs, &[FieldAddress::new(key(1), "born")], Text, &mut arena)
             .unwrap();
         assert_eq!(born.get(0), None);
     }
 
     #[test]
     fn fields_refuse_a_document_or_a_path_that_is_not_there() {
-        let (database, _) = populated();
+        let (database, docs, _) = populated();
         let orphan = [FieldEntry::<Text>::new(key(42), "name", "Nobody")];
         let failure = database
             .head()
-            .docs_write(
-                CollectionID::main(),
-                &orphan,
-                Modification::Upsert,
-                Durability::Buffered,
-            )
+            .docs_write(docs, &orphan, Modification::Upsert, Durability::Buffered)
             .unwrap_err();
         assert_eq!(failure.status, Status::NotFound);
 
         let deep = [FieldEntry::<Text>::new(key(1), "/missing/deeper", "value")];
         let failure = database
             .head()
-            .docs_write(CollectionID::main(), &deep, Modification::Update, Durability::Buffered)
+            .docs_write(docs, &deep, Modification::Update, Durability::Buffered)
             .unwrap_err();
         assert_eq!(failure.status, Status::NotFound);
     }
 
     #[test]
     fn reads_report_missing_documents_and_fields_as_absent() {
-        let (database, mut arena) = populated();
+        let (database, docs, mut arena) = populated();
         let fields = [
             FieldAddress::new(key(1), "name"),
             FieldAddress::new(key(1), "nowhere"),
             FieldAddress::new(key(42), "name"),
         ];
-        let read = database
-            .head()
-            .docs_read(CollectionID::main(), &fields, Json, &mut arena)
-            .unwrap();
+        let read = database.head().docs_read(docs, &fields, Json, &mut arena).unwrap();
         assert_eq!(text(&read, 0), Some(r#""Ada""#));
         assert_eq!(read.get(1), None);
         assert_eq!(read.get(2), None);
     }
 
     #[test]
-    fn fields_of_a_value_that_is_not_json_are_refused() {
+    fn a_collection_of_values_refuses_the_document_verbs() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new().unwrap();
+        let values = created(&database, Modality::Blobs);
         let blob = [Entry::new(key(1), b"not a document")];
-        database
-            .head()
-            .write(CollectionID::main(), &blob, Durability::Buffered)
-            .unwrap();
+        database.head().write(values, &blob, Durability::Buffered).unwrap();
         let failure = database
             .head()
-            .docs_read(
-                CollectionID::main(),
-                &[FieldAddress::new(key(1), "name")],
-                Text,
-                &mut arena,
-            )
+            .docs_read(values, &[FieldAddress::new(key(1), "name")], Text, &mut arena)
             .unwrap_err();
-        assert_eq!(failure.status, Status::Malformed);
+        assert_eq!(failure.status, Status::InvalidArgument);
+        let documents = [DocumentEntry::<Json>::new(key(1), "{}")];
+        let failure = database
+            .head()
+            .docs_write(values, &documents, Modification::Upsert, Durability::Buffered)
+            .unwrap_err();
+        assert_eq!(failure.status, Status::InvalidArgument);
     }
 
     #[test]
     fn gists_list_every_leaf_once() {
-        let (database, mut arena) = populated();
+        let (database, docs, mut arena) = populated();
         let paths = database
             .head()
-            .docs_gist(CollectionID::main(), keys([1, 2, 1, 42]), &mut arena)
+            .docs_gist(docs, keys([1, 2, 1, 42]), &mut arena)
             .unwrap();
         let mut listed: Vec<&str> = paths.iter().collect();
         listed.sort_unstable();
@@ -1691,28 +1742,21 @@ mod tests {
     #[test]
     fn gists_refuse_a_path_past_the_length_they_export() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
+        let docs = created(&database, Modality::Docs);
         let mut arena = Arena::new().unwrap();
         let document = format!("{{\"{}\":1}}", "k".repeat(600));
         let documents = [DocumentEntry::<Json>::new(key(1), &document)];
         database
             .head()
-            .docs_write(
-                CollectionID::main(),
-                &documents,
-                Modification::Upsert,
-                Durability::Buffered,
-            )
+            .docs_write(docs, &documents, Modification::Upsert, Durability::Buffered)
             .unwrap();
-        let failure = database
-            .head()
-            .docs_gist(CollectionID::main(), keys([1]), &mut arena)
-            .unwrap_err();
+        let failure = database.head().docs_gist(docs, keys([1]), &mut arena).unwrap_err();
         assert_eq!(failure.status, Status::CapacityExhausted);
     }
 
     #[test]
     fn gathers_convert_fields_into_typed_columns() {
-        let (database, mut arena) = populated();
+        let (database, docs, mut arena) = populated();
         let columns = [
             Column::new::<u64>("born"),
             Column::new::<f32>("born"),
@@ -1723,7 +1767,7 @@ mod tests {
         ];
         let gathered = database
             .head()
-            .docs_gather(CollectionID::main(), &keys([1, 2, 42]), &columns, &mut arena)
+            .docs_gather(docs, &keys([1, 2, 42]), &columns, &mut arena)
             .unwrap();
         assert_eq!((gathered.rows(), gathered.columns()), (3, 6));
 
@@ -1763,11 +1807,11 @@ mod tests {
 
     #[test]
     fn columns_refuse_to_be_read_as_something_else() {
-        let (database, mut arena) = populated();
+        let (database, docs, mut arena) = populated();
         let columns = [Column::new::<i64>("born"), Column::new::<Text>("name")];
         let gathered = database
             .head()
-            .docs_gather(CollectionID::main(), &keys([1]), &columns, &mut arena)
+            .docs_gather(docs, &keys([1]), &columns, &mut arena)
             .unwrap();
         assert_eq!(gathered.scalars::<u64>(0).unwrap_err().status, Status::InvalidArgument);
         assert_eq!(gathered.scalars::<i64>(1).unwrap_err().status, Status::InvalidArgument);
@@ -1778,16 +1822,13 @@ mod tests {
 
     #[test]
     fn gist_paths_address_the_fields_a_gather_reads() {
-        let (database, mut paths_arena) = populated();
+        let (database, docs, mut paths_arena) = populated();
         let mut columns_arena = Arena::new().unwrap();
-        let paths = database
-            .head()
-            .docs_gist(CollectionID::main(), keys([1]), &mut paths_arena)
-            .unwrap();
+        let paths = database.head().docs_gist(docs, keys([1]), &mut paths_arena).unwrap();
         let columns: Vec<Column<'_>> = paths.iter().map(Column::new::<Text>).collect();
         let gathered = database
             .head()
-            .docs_gather(CollectionID::main(), &keys([1]), &columns, &mut columns_arena)
+            .docs_gather(docs, &keys([1]), &columns, &mut columns_arena)
             .unwrap();
         assert_eq!(gathered.columns(), 4);
         for column in 0..gathered.columns() {
@@ -1798,23 +1839,23 @@ mod tests {
     #[test]
     fn whole_documents_are_written_as_scalars_and_strings() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
+        let docs = created(&database, Modality::Docs);
         let mut arena = Arena::new().unwrap();
         let head = database.head();
-        let main = CollectionID::main();
         let upsert = Modification::Upsert;
         let buffered = Durability::Buffered;
 
         let born = [DocumentEntry::<i64>::new(key(1), &1815)];
-        head.docs_write(main, &born, upsert, buffered).unwrap();
+        head.docs_write(docs, &born, upsert, buffered).unwrap();
         let height = [DocumentEntry::<f64>::new(key(2), &1.65)];
-        head.docs_write(main, &height, upsert, buffered).unwrap();
+        head.docs_write(docs, &height, upsert, buffered).unwrap();
         let countess = [DocumentEntry::<bool>::new(key(3), &true)];
-        head.docs_write(main, &countess, upsert, buffered).unwrap();
+        head.docs_write(docs, &countess, upsert, buffered).unwrap();
         let title = [DocumentEntry::<Text>::new(key(4), "Countess of Lovelace")];
-        head.docs_write(main, &title, upsert, buffered).unwrap();
+        head.docs_write(docs, &title, upsert, buffered).unwrap();
 
         // A document that is one scalar reads back as the JSON that scalar prints as.
-        let documents = head.docs_read(main, keys([1, 2, 3, 4]), Json, &mut arena).unwrap();
+        let documents = head.docs_read(docs, keys([1, 2, 3, 4]), Json, &mut arena).unwrap();
         assert_eq!(text(&documents, 0), Some("1815"));
         assert_eq!(text(&documents, 1), Some("1.65"));
         assert_eq!(text(&documents, 2), Some("true"));
@@ -1825,8 +1866,8 @@ mod tests {
     fn one_batch_of_documents_spans_several_collections() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new().unwrap();
-        let people = database.collection_create("people", Modality::Any).unwrap();
-        let places = database.collection_create("places", Modality::Any).unwrap();
+        let people = database.collection_create("people", Modality::Docs).unwrap();
+        let places = database.collection_create("places", Modality::Docs).unwrap();
         let spanned = [people, places];
 
         let documents = [
@@ -1868,6 +1909,7 @@ mod tests {
     #[test]
     fn gathers_fill_halves_and_uuids() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
+        let docs = created(&database, Modality::Docs);
         let mut arena = Arena::new().unwrap();
         let documents = [
             DocumentEntry::<Json>::new(
@@ -1878,12 +1920,7 @@ mod tests {
         ];
         database
             .head()
-            .docs_write(
-                CollectionID::main(),
-                &documents,
-                Modification::Upsert,
-                Durability::Buffered,
-            )
+            .docs_write(docs, &documents, Modification::Upsert, Durability::Buffered)
             .unwrap();
 
         let columns = [
@@ -1893,7 +1930,7 @@ mod tests {
         ];
         let gathered = database
             .head()
-            .docs_gather(CollectionID::main(), &keys([1, 2]), &columns, &mut arena)
+            .docs_gather(docs, &keys([1, 2]), &columns, &mut arena)
             .unwrap();
 
         // A half is two bytes the caller reinterprets; 1.5 is sign zero, exponent fifteen, mantissa one half.
@@ -1925,102 +1962,83 @@ mod tests {
 
     #[test]
     fn empty_batches_reach_no_engine() {
-        let (database, mut arena) = populated();
+        let (database, docs, mut arena) = populated();
         let head = database.head();
         let (upsert, buffered) = (Modification::Upsert, Durability::Buffered);
         let no_documents: &[DocumentEntry<'_, Json>] = &[];
-        head.docs_write(CollectionID::main(), no_documents, upsert, buffered)
-            .unwrap();
+        head.docs_write(docs, no_documents, upsert, buffered).unwrap();
         let no_texts: &[Document<'_>] = &[];
-        head.docs_write(CollectionID::main(), KeyedBy("_id", no_texts), upsert, buffered)
+        head.docs_write(docs, KeyedBy("_id", no_texts), upsert, buffered)
             .unwrap();
         let no_fields: &[FieldEntry<'_, Json>] = &[];
-        head.docs_write(CollectionID::main(), no_fields, upsert, buffered)
-            .unwrap();
-        assert!(head
-            .docs_read(CollectionID::main(), [], Json, &mut arena)
-            .unwrap()
-            .is_empty());
+        head.docs_write(docs, no_fields, upsert, buffered).unwrap();
+        assert!(head.docs_read(docs, [], Json, &mut arena).unwrap().is_empty());
         let no_addresses: &[FieldAddress<'_>] = &[];
-        assert!(head
-            .docs_read(CollectionID::main(), no_addresses, Text, &mut arena)
-            .unwrap()
-            .is_empty());
-        assert!(head.docs_gist(CollectionID::main(), [], &mut arena).unwrap().is_empty());
+        assert!(head.docs_read(docs, no_addresses, Text, &mut arena).unwrap().is_empty());
+        assert!(head.docs_gist(docs, [], &mut arena).unwrap().is_empty());
 
         let columns = [Column::new::<i64>("born"), Column::new::<Text>("name")];
-        let gathered = head
-            .docs_gather(CollectionID::main(), &[], &columns, &mut arena)
-            .unwrap();
+        let gathered = head.docs_gather(docs, &[], &columns, &mut arena).unwrap();
         assert_eq!(gathered.rows(), 0);
         assert!(gathered.scalars::<i64>(0).unwrap().is_empty());
         assert!(gathered.strings(1).unwrap().is_empty());
         assert!(gathered.validities(0).unwrap().is_empty());
         assert_eq!(
-            head.docs_gather(CollectionID::main(), &keys([1]), &[], &mut arena)
-                .unwrap()
-                .columns(),
+            head.docs_gather(docs, &keys([1]), &[], &mut arena).unwrap().columns(),
             0
         );
     }
 
     #[test]
     fn transactions_hold_their_field_writes_until_commit() {
-        let (database, mut arena) = populated();
+        let (database, docs, mut arena) = populated();
         let mut transaction = database.transaction().unwrap();
         let rank = [FieldEntry::<Text>::new(key(2), "/navy/rank", "Commodore")];
         transaction
             .view(Watch::Keys)
-            .docs_write(CollectionID::main(), &rank, Modification::Update, Durability::Buffered)
+            .docs_write(docs, &rank, Modification::Update, Durability::Buffered)
             .unwrap();
         let flushed = transaction
             .view(Watch::Keys)
-            .docs_write(CollectionID::main(), &rank, Modification::Update, Durability::Flushed)
+            .docs_write(docs, &rank, Modification::Update, Durability::Flushed)
             .unwrap_err();
         assert_eq!(flushed.status, Status::InvalidArgument);
 
         let address = [FieldAddress::new(key(2), "/navy/rank")];
         let inside = transaction
             .view(Watch::Keys)
-            .docs_read(CollectionID::main(), &address, Text, &mut arena)
+            .docs_read(docs, &address, Text, &mut arena)
             .unwrap();
         assert_eq!(text(&inside, 0), Some("Commodore"));
-        let outside = database
-            .head()
-            .docs_read(CollectionID::main(), &address, Text, &mut arena)
-            .unwrap();
+        let outside = database.head().docs_read(docs, &address, Text, &mut arena).unwrap();
         assert_eq!(text(&outside, 0), Some("Rear Admiral"));
 
         transaction.commit(Durability::Buffered).unwrap();
-        let committed = database
-            .head()
-            .docs_read(CollectionID::main(), &address, Text, &mut arena)
-            .unwrap();
+        let committed = database.head().docs_read(docs, &address, Text, &mut arena).unwrap();
         assert_eq!(text(&committed, 0), Some("Commodore"));
     }
 
     #[test]
     fn documents_and_gists_block_or_defer_on_an_executor() {
-        let (database, _) = populated();
+        let (database, docs, _) = populated();
         let executor = Executor::for_ram(&[], 2, 0).unwrap();
         let mut arena = Arena::new_in(&executor).unwrap();
         let blocking = database.head().on(&executor);
         let deferred = database.head().deferred(&executor);
-        let main = CollectionID::main();
 
-        let read = blocking.docs_read(main, keys([1]), Json, &mut arena).unwrap();
+        let read = blocking.docs_read(docs, keys([1]), Json, &mut arena).unwrap();
         assert!(text(&read, 0).unwrap().starts_with(r#"{"name":"Ada""#));
         let read = deferred
-            .docs_read(main, vec![key(2), key(3)], Json, &mut arena)
+            .docs_read(docs, vec![key(2), key(3)], Json, &mut arena)
             .unwrap()
             .wait()
             .unwrap();
         assert!(text(&read, 0).unwrap().starts_with(r#"{"name":"Grace""#));
         assert_eq!(read.get(1), None);
 
-        assert_eq!(blocking.docs_gist(main, keys([1]), &mut arena).unwrap().len(), 4);
+        assert_eq!(blocking.docs_gist(docs, keys([1]), &mut arena).unwrap().len(), 4);
         let paths = deferred
-            .docs_gist(main, keys([1, 2]), &mut arena)
+            .docs_gist(docs, keys([1, 2]), &mut arena)
             .unwrap()
             .wait()
             .unwrap();
@@ -2030,22 +2048,23 @@ mod tests {
     #[test]
     fn whole_documents_write_through_a_deferred_view() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
+        let docs = created(&database, Modality::Docs);
         let executor = Executor::for_ram(&[], 1, 0).unwrap();
         let deferred = database.head().deferred(&executor);
-        let (main, upsert, buffered) = (CollectionID::main(), Modification::Upsert, Durability::Buffered);
+        let (upsert, buffered) = (Modification::Upsert, Durability::Buffered);
 
         let texts: CharsTape<u64> = [r#"{"name":"Ada"}"#, r#"{"name":"Grace"}"#].into_iter().collect();
-        let writing = deferred.docs_write(main, (vec![key(1), key(2)], texts), upsert, buffered);
+        let writing = deferred.docs_write(docs, (vec![key(1), key(2)], texts), upsert, buffered);
         let (written, _) = writing.unwrap().wait().unwrap();
         assert_eq!(written, keys([1, 2]), "a write hands its inputs back");
 
         let mut arena = Arena::new().unwrap();
-        let documents = database.head().docs_read(main, keys([2, 1]), Json, &mut arena).unwrap();
+        let documents = database.head().docs_read(docs, keys([2, 1]), Json, &mut arena).unwrap();
         assert_eq!(text(&documents, 0), Some(r#"{"name":"Grace"}"#));
         assert_eq!(text(&documents, 1), Some(r#"{"name":"Ada"}"#));
 
         let texts: CharsTape<u64> = ["{}"].into_iter().collect();
-        let refused = deferred.docs_write(main, (keys([1, 2]), texts), upsert, buffered);
+        let refused = deferred.docs_write(docs, (keys([1, 2]), texts), upsert, buffered);
         assert_eq!(
             refused.unwrap_err().status,
             Status::InvalidArgument,
@@ -2056,14 +2075,14 @@ mod tests {
     #[test]
     fn documents_by_id_write_through_a_deferred_view() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
+        let docs = created(&database, Modality::Docs);
         let executor = Executor::for_ram(&[], 1, 0).unwrap();
-        let main = CollectionID::main();
         let texts: CharsTape<u64> = [r#"{"_id":7,"name":"Ada"}"#].into_iter().collect();
         database
             .head()
             .deferred(&executor)
             .docs_write(
-                main,
+                docs,
                 KeyedBy(String::from("_id"), texts),
                 Modification::Upsert,
                 Durability::Buffered,
@@ -2075,23 +2094,22 @@ mod tests {
         let mut arena = Arena::new().unwrap();
         let names = database
             .head()
-            .docs_read(main, &[FieldAddress::new(key(7), "name")], Text, &mut arena)
+            .docs_read(docs, &[FieldAddress::new(key(7), "name")], Text, &mut arena)
             .unwrap();
         assert_eq!(text(&names, 0), Some("Ada"));
     }
 
     #[test]
     fn fields_write_through_a_deferred_view() {
-        let (database, mut arena) = populated();
+        let (database, docs, mut arena) = populated();
         let executor = Executor::for_ram(&[], 1, 0).unwrap();
-        let main = CollectionID::main();
         let paths: CharsTape<u32> = ["died", "/navy/rank"].into_iter().collect();
         let values: CharsTape<u64> = ["1852", r#""Commodore""#].into_iter().collect();
         database
             .head()
             .deferred(&executor)
             .docs_write(
-                main,
+                docs,
                 (keys([1, 2]), paths, values),
                 Modification::Upsert,
                 Durability::Buffered,
@@ -2104,39 +2122,38 @@ mod tests {
             FieldAddress::new(key(1), "died"),
             FieldAddress::new(key(2), "/navy/rank"),
         ];
-        let read = database.head().docs_read(main, &fields, Text, &mut arena).unwrap();
+        let read = database.head().docs_read(docs, &fields, Text, &mut arena).unwrap();
         assert_eq!((text(&read, 0), text(&read, 1)), (Some("1852"), Some("Commodore")));
     }
 
     #[test]
     fn fields_read_through_a_deferred_view() {
-        let (database, mut arena) = populated();
+        let (database, docs, mut arena) = populated();
         let executor = Executor::for_ram(&[], 1, 0).unwrap();
         let deferred = database.head().deferred(&executor);
-        let main = CollectionID::main();
 
         let paths: CharsTape<u64> = ["name", "/navy/rank"].into_iter().collect();
         let read = deferred
-            .docs_read(main, (vec![key(1), key(2)], paths), Text, &mut arena)
+            .docs_read(docs, (vec![key(1), key(2)], paths), Text, &mut arena)
             .unwrap()
             .wait()
             .unwrap();
         assert_eq!(text(&read, 0), Some("Ada"));
         assert_eq!(text(&read, 1), Some("Rear Admiral"));
 
-        let refused = deferred.docs_read(main, (keys([1]), CharsTape::<u64>::default()), Json, &mut arena);
+        let refused = deferred.docs_read(docs, (keys([1]), CharsTape::<u64>::default()), Json, &mut arena);
         assert_eq!(refused.unwrap_err().status, Status::InvalidArgument, "a path per key");
     }
 
     #[test]
     fn gathers_run_through_a_deferred_view() {
-        let (database, mut arena) = populated();
+        let (database, docs, mut arena) = populated();
         let executor = Executor::for_ram(&[], 1, 0).unwrap();
         let columns = vec![Column::new::<u64>("born"), Column::new::<Text>(String::from("name"))];
         let gathered = database
             .head()
             .deferred(&executor)
-            .docs_gather(CollectionID::main(), keys([1, 2]), columns, &mut arena)
+            .docs_gather(docs, keys([1, 2]), columns, &mut arena)
             .unwrap()
             .wait()
             .unwrap();

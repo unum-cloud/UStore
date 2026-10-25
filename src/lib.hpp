@@ -499,6 +499,10 @@ inline void clear_outputs(ustore_docs_scan_t const& arguments) noexcept {
     clear(arguments.offsets), clear(arguments.keys);
 }
 
+inline void clear_outputs(ustore_docs_sample_t const& arguments) noexcept {
+    clear(arguments.offsets), clear(arguments.keys);
+}
+
 inline void clear_outputs(ustore_graph_read_edges_t const& arguments) noexcept {
     clear(arguments.degrees_per_vertex), clear(arguments.edges_offsets), clear(arguments.edges_per_vertex);
 }
@@ -671,6 +675,15 @@ status_t serve(arguments_type_ const& arguments, view_t const& runner) noexcept 
     if constexpr (requires { arguments.cursor; })
         if (arguments.cursor->database != database)
             return {status_code_t::invalid_argument_k, "The cursor walks another database"};
+    if constexpr (requires { arguments.collections.data; })
+        if (arguments.count && !arguments.collections.data)
+            return {status_code_t::invalid_argument_k, "No collections were named"};
+    if constexpr (std::is_same_v<arguments_type_, ustore_collection_create_t>) {
+        if (arguments.modality < ustore_modality_blobs_k || arguments.modality > ustore_modality_pages_k)
+            return {status_code_t::invalid_argument_k, "Unknown modality"};
+        if (arguments.name.length && arguments.name.data && arguments.name.data[0] == '_')
+            return {status_code_t::invalid_argument_k, "Names starting with _ are reserved for system collections"};
+    }
 
     view_t view = runner;
     ustore_arena_t const scratch = runner.scratch;
@@ -741,8 +754,8 @@ using deferred_arguments_t = std::variant<
     ustore_collection_drop_t, ustore_transaction_init_t, ustore_transaction_stage_t, ustore_transaction_commit_t,
     ustore_transaction_rollback_t, ustore_blobs_write_t, ustore_blobs_remove_t, ustore_blobs_read_t,
     ustore_blobs_scan_t, ustore_blobs_sample_t, ustore_blobs_measure_t, ustore_docs_write_t, ustore_docs_read_t,
-    ustore_docs_gist_t, ustore_docs_gather_t, ustore_docs_remove_t, ustore_docs_scan_t, ustore_graph_read_edges_t,
-    ustore_graph_write_edges_t, ustore_graph_remove_edges_t, ustore_graph_write_vertices_t,
+    ustore_docs_gist_t, ustore_docs_gather_t, ustore_docs_remove_t, ustore_docs_scan_t, ustore_docs_sample_t,
+    ustore_graph_read_edges_t, ustore_graph_write_edges_t, ustore_graph_remove_edges_t, ustore_graph_write_vertices_t,
     ustore_graph_remove_vertices_t, ustore_graph_scan_vertices_t, ustore_pages_import_t, ustore_pages_insert_t,
     ustore_pages_remove_t, ustore_pages_move_t, ustore_pages_splice_t, ustore_pages_set_attributes_t,
     ustore_pages_remove_attributes_t, ustore_pages_read_t, ustore_pages_scan_t, ustore_strings_write_t,

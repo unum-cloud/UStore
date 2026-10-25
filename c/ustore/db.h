@@ -18,9 +18,8 @@ extern "C" {
 /**
  *  @brief An opaque handle to an open database, safe to share across threads from open until free.
  *
- *  An embedded database owns its directory, so no two processes may open the same one at once. Every
- *  database holds @c ustore_collection_main_k, which can be cleared but never dropped, next to the
- *  collections of binary values, documents or graphs it creates.
+ *  An embedded database owns its directory, so no two processes may open the same one at once. A database holds no
+ *  collection until one is created, and every call addresses the collections it created by identifier.
  */
 typedef struct ustore_database_handle_t* ustore_database_t;
 
@@ -55,8 +54,8 @@ typedef struct ustore_uuid_t {
     uint8_t bytes[16];
 } ustore_uuid_t;
 
-/** The identifier of a collection: a UUIDv7 the catalog mints once and never reuses, so it stays the same across
- *  restarts and never names two collections. */
+/** The identifier of a collection: a UUIDv7 its create mints once and never reuses, so it stays the same across
+ *  restarts and never names two collections. The nil UUID names none. */
 typedef struct ustore_collection_id_t {
     ustore_uuid_t uuid;
 } ustore_collection_id_t;
@@ -90,7 +89,8 @@ typedef struct ustore_keys_view_t {
 
 } ustore_keys_view_t;
 
-/** A strided run of collections, one per task, where @c NULL data stands for the main collection. */
+/** A strided run of collections, one per task, whose @c NULL data a call refuses with
+ *  @c ustore_status_invalid_argument_k, as no collection was named. */
 typedef struct ustore_collections_view_t {
 
     /** First collection of the run. */
@@ -167,17 +167,10 @@ typedef enum ustore_capabilities_t {
     /** The engine supports transactions. */
     ustore_capabilities_transactions_k = 1,
 
-    /** The engine supports collections beyond the main one. */
-    ustore_capabilities_collections_k = 2,
-
     /** The engine supports snapshots. */
     ustore_capabilities_snapshots_k = 4,
 
 } ustore_capabilities_t;
-
-/** The collection every database holds, named by the nil UUID, which @c ustore_drop_pairs_k and
- *  @c ustore_drop_values_k may only clear. */
-static ustore_collection_id_t const ustore_collection_main_k = {{{0}}};
 
 /** The key that stands for no key, every bit of it set. */
 static ustore_key_t const ustore_key_unknown_k = {
@@ -445,7 +438,7 @@ typedef struct ustore_database_description_t {
      *  elsewhere. */
     ustore_isolation_t isolation;
 
-    /** Keys across every collection, the main one included. */
+    /** Keys across every collection. */
     ustore_size_t keys;
 
     /** Bytes of memory the engine holds for the data. */
@@ -497,8 +490,8 @@ typedef struct ustore_database_clear_t {
     /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
-    /** What goes: every pair, keeping the collections and their names; every collection but the main one with its
-     *  name, emptying the main one; or every value, keeping the keys where the engine can. */
+    /** What goes: every pair, keeping the collections and their names; every collection with its name; or every
+     *  value, keeping the keys where the engine can. */
     ustore_drop_mode_t mode;
 
 } ustore_database_clear_t;
@@ -619,11 +612,8 @@ USTORE_EXPORT void ustore_snapshot_save(ustore_snapshot_save_t* arguments);
  */
 USTORE_EXPORT ustore_view_t ustore_snapshot_view(ustore_snapshot_t snapshot);
 
-/** What a collection holds, recorded beside its name so a view of another kind is refused. */
+/** What a collection holds, recorded beside its name so a view of another kind is refused. Zero names no modality. */
 typedef enum ustore_modality_t {
-
-    /** Anything, which the main collection and every collection created without a modality hold. */
-    ustore_modality_any_k = 0,
 
     /** Binary values of @c blobs.h. */
     ustore_modality_blobs_k = 1,
@@ -682,14 +672,14 @@ USTORE_EXPORT ustore_engine_t ustore_engine_from_name(ustore_bytes_view_t name);
 /** The canonical spelling of a modality, as @c ustore_modality_graph_k spells "graph", or "unrecognized". */
 USTORE_EXPORT char const* ustore_modality_name(ustore_modality_t modality);
 
-/** Reads a modality back from its canonical spelling; @c ustore_modality_any_k when unrecognized. */
+/** Reads a modality back from its canonical spelling; zero, naming no modality, when unrecognized. */
 USTORE_EXPORT ustore_modality_t ustore_modality_from_name(ustore_bytes_view_t name);
 
 /**
  *  @brief The arguments of @c ustore_collection_list, which exports every collection with its name and modality.
  *
- *  The main collection is never listed, and the order of the others is the engine's. A listing describes the
- *  database, never a transaction, so it reads the head or a snapshot.
+ *  The system collections, @c _names and @c _collections, are never listed, and the order of the others is the
+ *  engine's. A listing describes the database, never a transaction, so it reads the head or a snapshot.
  */
 typedef struct ustore_collection_list_t {
 
@@ -738,9 +728,11 @@ USTORE_EXPORT void ustore_collection_list(ustore_collection_list_t* arguments);
  *
  *  Runs at the head of the database. A name is recorded with the collection in one step and survives a crash beside
  *  it, and a name another collection carries, even one a concurrent creator took first, fails the call with
- *  @c ustore_status_already_exists_k and creates nothing. Each engine keeps the names apart from every collection,
- *  so no identifier reaches them, and a name resolves in two phases: once through @c ustore_collection_find, and
- *  from then on by identifier, as no other call carries one.
+ *  @c ustore_status_already_exists_k and creates nothing. Each engine keeps the names in the system collection
+ *  @c _names and every collection's modality and name in @c _collections, which no identifier reaches, and a name
+ *  resolves in two phases: once through @c ustore_collection_find, and from then on by identifier, as no other call
+ *  carries one. A name starting with `_` is reserved for system collections and refused with
+ *  @c ustore_status_invalid_argument_k.
  */
 typedef struct ustore_collection_create_t {
 
@@ -756,7 +748,8 @@ typedef struct ustore_collection_create_t {
     /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
-    /** Optional name no other collection carries, where a zeroed view creates a collection without one. */
+    /** Optional name no other collection carries and not starting with `_`, where a zeroed view creates a collection
+     *  without one. */
     ustore_bytes_view_t name;
 
     /** What the collection holds, which fixes how it is keyed and so which calls reach it. */
@@ -778,8 +771,8 @@ USTORE_EXPORT void ustore_collection_create(ustore_collection_create_t* argument
  *
  *  Collections are created and dropped only at the head, so their names are read at the head or at a snapshot and
  *  never inside a transaction, and resolving a name never joins the conflicts of the work that follows it. A name no
- *  collection carries answers @c ustore_collection_main_k, @c ustore_modality_any_k and an unset presence bit. Every
- *  output holds one entry per name inside @c arena.
+ *  collection carries, the names of the system collections included, answers the nil UUID, a zero modality and an
+ *  unset presence bit. Every output holds one entry per name inside @c arena.
  */
 typedef struct ustore_collection_find_t {
 
@@ -825,8 +818,8 @@ typedef struct ustore_collection_find_t {
  */
 USTORE_EXPORT void ustore_collection_find(ustore_collection_find_t* arguments);
 
-/** The arguments of @c ustore_collection_drop, where the main collection can only be cleared, and dropping a
- *  collection whole forgets its name before the collection goes. */
+/** The arguments of @c ustore_collection_drop, where dropping a collection whole forgets its name before the
+ *  collection goes. */
 typedef struct ustore_collection_drop_t {
 
     /** An open database. */

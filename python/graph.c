@@ -126,7 +126,7 @@ static int edge_batches_from_args(ustore_py_context_t const* context, char const
 #pragma region Edges
 
 char const doc_graph_write_edges[] =                                                              //
-    "graph_write_edges(sources, targets, *, edges=None, collection=None,\n"                       //
+    "graph_write_edges(sources, targets, *, edges=None, collection,\n"                            //
     "                  durability=Durability.BUFFERED) answers None.\n"                           //
     "\n"                                                                                          //
     "Inserts a batch of edges, creating the vertices they connect. An edge already present\n"     //
@@ -137,7 +137,7 @@ char const doc_graph_write_edges[] =                                            
     "  targets (Sequence[KeyLike] | buffer): The vertex every edge enters.\n"                     //
     "  edges (Sequence[KeyLike] | buffer, optional): The identifier of every edge, which tells\n" //
     "    apart several edges between one pair; None gives every edge `edge_id_default`.\n"        //
-    "  collection (UUID | str, optional): The graph collection, by identifier or by name.\n"      //
+    "  collection (UUID | str): The graph collection, by identifier or by name.\n"                //
     "  durability (Durability, optional): `Durability.FLUSHED` reaches the drive before\n"        //
     "    returning.";
 
@@ -214,7 +214,7 @@ PyObject* ustore_py_api_graph_write_edges(PyObject* self, PyObject* const* args,
 }
 
 char const doc_graph_remove_edges[] =                                                              //
-    "graph_remove_edges(sources, targets, *, edges=None, collection=None,\n"                       //
+    "graph_remove_edges(sources, targets, *, edges=None, collection,\n"                            //
     "                   durability=Durability.BUFFERED) answers None.\n"                           //
     "\n"                                                                                           //
     "Removes a batch of edges and keeps the vertices they connected, even once isolated.\n"        //
@@ -224,7 +224,7 @@ char const doc_graph_remove_edges[] =                                           
     "  targets (Sequence[KeyLike] | buffer): The vertex every edge enters.\n"                      //
     "  edges (Sequence[KeyLike] | buffer, optional): The identifier of every edge; None removes\n" //
     "    the edges that were given `edge_id_default`.\n"                                           //
-    "  collection (UUID | str, optional): The graph collection, by identifier or by name.\n"       //
+    "  collection (UUID | str): The graph collection, by identifier or by name.\n"                 //
     "  durability (Durability, optional): `Durability.FLUSHED` reaches the drive before\n"         //
     "    returning.";
 
@@ -290,21 +290,21 @@ static PyObject* neighborhoods_new(PyObject* arena, ustore_key_t const* tape, us
     return (PyObject*)instance;
 }
 
-char const doc_graph_read_edges[] =                                                                 //
-    "graph_read_edges(vertices, arena, *, role=Role.ANY, collection=None) answers Neighborhoods.\n" //
-    "\n"                                                                                            //
-    "Reads every edge a batch of vertices takes part in. The edges of one vertex come sorted\n"     //
-    "by neighbour; with both roles the outgoing ones precede the incoming ones.\n"                  //
-    "\n"                                                                                            //
-    "Args:\n"                                                                                       //
-    "  vertices (Sequence[KeyLike] | buffer): The vertices whose edges are read.\n"                 //
-    "  arena (Arena): Where the degrees and the edges land, rewound by this call.\n"                //
-    "  role (Role, optional): `Role.SOURCE` for the edges a vertex leaves by, `Role.TARGET`\n"      //
-    "    for those it is entered by, or `Role.ANY` for both, which is how an undirected\n"          //
-    "    graph asks.\n"                                                                             //
-    "  collection (UUID | str, optional): The graph collection, by identifier or by name.\n"        //
-    "Returns:\n"                                                                                    //
-    "  Neighborhoods: One run of (source, target, edge) triples per vertex, None where it is\n"     //
+char const doc_graph_read_edges[] =                                                             //
+    "graph_read_edges(vertices, arena, *, role=Role.ANY, collection) answers Neighborhoods.\n"  //
+    "\n"                                                                                        //
+    "Reads every edge a batch of vertices takes part in. The edges of one vertex come sorted\n" //
+    "by neighbour; with both roles the outgoing ones precede the incoming ones.\n"              //
+    "\n"                                                                                        //
+    "Args:\n"                                                                                   //
+    "  vertices (Sequence[KeyLike] | buffer): The vertices whose edges are read.\n"             //
+    "  arena (Arena): Where the degrees and the edges land, rewound by this call.\n"            //
+    "  role (Role, optional): `Role.SOURCE` for the edges a vertex leaves by, `Role.TARGET`\n"  //
+    "    for those it is entered by, or `Role.ANY` for both, which is how an undirected\n"      //
+    "    graph asks.\n"                                                                         //
+    "  collection (UUID | str): The graph collection, by identifier or by name.\n"              //
+    "Returns:\n"                                                                                //
+    "  Neighborhoods: One run of (source, target, edge) triples per vertex, None where it is\n" //
     "  absent.";
 
 /** A read of the edges or the degrees of a batch of vertices, which its caller gathers in place. */
@@ -353,6 +353,37 @@ static ustore_py_verb_t const neighborhoods_verb = {sizeof(edges_read_call_t), e
 static ustore_py_verb_t const degrees_verb = {sizeof(edges_read_call_t), edges_read_submit, degrees_answer,
                                               edges_read_release};
 
+static PyObject* contains_answer(void* erased) {
+    edges_read_call_t const* const call = (edges_read_call_t const*)erased;
+    return PyBool_FromLong(call->degrees[0] != ustore_vertex_degree_missing_k);
+}
+
+static ustore_py_verb_t const contains_verb = {sizeof(edges_read_call_t), edges_read_submit, contains_answer,
+                                               edges_read_release};
+
+/** Submits the read @p call gathered, its vertices, role, collection and arena set, as @p verb answers it. */
+static PyObject* edges_read_run(ustore_py_context_t const* context, ustore_py_verb_t const* verb,
+                                edges_read_call_t* call) {
+    // Only the edges themselves export edges, every other answer counts degrees.
+    int const exports_edges = verb == &neighborhoods_verb;
+    ustore_graph_read_edges_t read = {
+        .database = context->database_handle,
+        .executor = ustore_py_context_executor(context),
+        .outcome = &call->call.outcome,
+        .completion = context->completion,
+        .view = context->view,
+        .count = call->vertices.count,
+        .collections = {&call->call.collection, 0},
+        .vertices = {call->vertices.keys, sizeof(ustore_key_t)},
+        .roles = {&call->role, 0},
+        .degrees_per_vertex = &call->degrees,
+        .edges_offsets = exports_edges ? &call->edges_offsets : NULL,
+        .edges_per_vertex = exports_edges ? &call->edges : NULL,
+        .arena = ustore_py_arena_handle(call->call.arena),
+    };
+    return ustore_py_call_run(context, verb, call, &read);
+}
+
 /** Reads the edges or the degrees of the vertices `vertices, arena` name, as @p verb answers them. */
 static PyObject* edges_read(PyObject* self, char const* name, ustore_py_verb_t const* verb, PyObject* const* args,
                             Py_ssize_t positional_args_count, PyObject* args_names_tuple) {
@@ -371,24 +402,7 @@ static PyObject* edges_read(PyObject* self, char const* name, ustore_py_verb_t c
         return ustore_py_call_discard(&context, verb, call);
     call->role = role;
     call->call.collection = options.collection;
-    // A count of degrees exports no edges.
-    int const exports_edges = verb == &neighborhoods_verb;
-    ustore_graph_read_edges_t read = {
-        .database = context.database_handle,
-        .executor = ustore_py_context_executor(&context),
-        .outcome = &call->call.outcome,
-        .completion = context.completion,
-        .view = context.view,
-        .count = call->vertices.count,
-        .collections = {&call->call.collection, 0},
-        .vertices = {call->vertices.keys, sizeof(ustore_key_t)},
-        .roles = {&call->role, 0},
-        .degrees_per_vertex = &call->degrees,
-        .edges_offsets = exports_edges ? &call->edges_offsets : NULL,
-        .edges_per_vertex = exports_edges ? &call->edges : NULL,
-        .arena = ustore_py_arena_handle(call->call.arena),
-    };
-    return ustore_py_call_run(&context, verb, call, &read);
+    return edges_read_run(&context, verb, call);
 }
 
 PyObject* ustore_py_api_graph_read_edges(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
@@ -396,18 +410,18 @@ PyObject* ustore_py_api_graph_read_edges(PyObject* self, PyObject* const* args, 
     return edges_read(self, "graph_read_edges", &neighborhoods_verb, args, positional_args_count, args_names_tuple);
 }
 
-char const doc_graph_degrees[] =                                                             //
-    "graph_degrees(vertices, arena, *, role=Role.ANY, collection=None) answers a tuple.\n"   //
-    "\n"                                                                                     //
-    "Counts the edges of a batch of vertices without exporting them.\n"                      //
-    "\n"                                                                                     //
-    "Args:\n"                                                                                //
-    "  vertices (Sequence[KeyLike] | buffer): The vertices whose edges are counted.\n"       //
-    "  arena (Arena): Where the degrees land before they are copied out, rewound by this\n"  //
-    "    call.\n"                                                                            //
-    "  role (Role, optional): The role of every vertex, as `graph_read_edges` takes it.\n"   //
-    "  collection (UUID | str, optional): The graph collection, by identifier or by name.\n" //
-    "Returns:\n"                                                                             //
+char const doc_graph_degrees[] =                                                            //
+    "graph_degrees(vertices, arena, *, role=Role.ANY, collection) answers a tuple.\n"       //
+    "\n"                                                                                    //
+    "Counts the edges of a batch of vertices without exporting them.\n"                     //
+    "\n"                                                                                    //
+    "Args:\n"                                                                               //
+    "  vertices (Sequence[KeyLike] | buffer): The vertices whose edges are counted.\n"      //
+    "  arena (Arena): Where the degrees land before they are copied out, rewound by this\n" //
+    "    call.\n"                                                                           //
+    "  role (Role, optional): The role of every vertex, as `graph_read_edges` takes it.\n"  //
+    "  collection (UUID | str): The graph collection, by identifier or by name.\n"          //
+    "Returns:\n"                                                                            //
     "  tuple[int | None, ...]: The degree of every vertex, None where it is absent.";
 
 PyObject* ustore_py_api_graph_degrees(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
@@ -415,19 +429,57 @@ PyObject* ustore_py_api_graph_degrees(PyObject* self, PyObject* const* args, Py_
     return edges_read(self, "graph_degrees", &degrees_verb, args, positional_args_count, args_names_tuple);
 }
 
+char const doc_graph_contains[] =                                                        //
+    "graph_contains(vertex, *, collection) answers a bool.\n"                            //
+    "\n"                                                                                 //
+    "Whether a vertex is present, read as its degree through a one-off arena, which a\n" //
+    "loop avoids with `graph_degrees` and an arena of its own.\n"                        //
+    "\n"                                                                                 //
+    "Args:\n"                                                                            //
+    "  vertex (KeyLike): The vertex to look for.\n"                                      //
+    "  collection (UUID | str): The graph collection, by identifier or by name.\n"       //
+    "Returns:\n"                                                                         //
+    "  bool: Whether the vertex is present.";
+
+PyObject* ustore_py_api_graph_contains(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                                       PyObject* args_names_tuple) {
+    ustore_py_context_t context;
+    if (ustore_py_context_from_object(self, &context) != 0) return NULL;
+    if (ustore_py_args_names_count_checked("graph_contains", positional_args_count, args_names_tuple, 1) < 0)
+        return NULL;
+    ustore_py_verb_options_t options;
+    if (ustore_py_verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0)
+        return NULL;
+    edges_read_call_t stack;
+    edges_read_call_t* const call = ustore_py_call_open(&context, &contains_verb, &stack);
+    if (!call) return NULL;
+    call->vertices.keys = call->vertices.inline_keys;
+    call->vertices.count = 1;
+    PyObject* const arena = ustore_py_arena_new(ustore_py_context_executor(&context));
+    if (!arena || ustore_py_key_from_object(args[0], call->vertices.inline_keys) != 0 ||
+        ustore_py_arena_claim(arena, &call->call.arena) != 0) {
+        Py_XDECREF(arena);
+        return ustore_py_call_discard(&context, &contains_verb, call);
+    }
+    Py_DECREF(arena);
+    call->role = ustore_vertex_role_any_k;
+    call->call.collection = options.collection;
+    return edges_read_run(&context, &contains_verb, call);
+}
+
 #pragma endregion Edges
 
 #pragma region Vertices
 
 char const doc_graph_write_vertices[] =                                                    //
-    "graph_write_vertices(vertices, *, collection=None, durability=Durability.BUFFERED)\n" //
+    "graph_write_vertices(vertices, *, collection, durability=Durability.BUFFERED)\n"      //
     "answers None.\n"                                                                      //
     "\n"                                                                                   //
     "Inserts a batch of vertices without edges, keeping those already present.\n"          //
     "\n"                                                                                   //
     "Args:\n"                                                                              //
     "  vertices (Sequence[KeyLike] | buffer): The vertices to insert.\n"                   //
-    "  collection (UUID | str, optional): The graph collection, by identifier or name.\n"  //
+    "  collection (UUID | str): The graph collection, by identifier or name.\n"            //
     "  durability (Durability, optional): `Durability.FLUSHED` reaches the drive before\n" //
     "    returning.";
 
@@ -496,7 +548,7 @@ PyObject* ustore_py_api_graph_write_vertices(PyObject* self, PyObject* const* ar
 }
 
 char const doc_graph_remove_vertices[] =                                                         //
-    "graph_remove_vertices(vertices, *, role=Role.ANY, collection=None,\n"                       //
+    "graph_remove_vertices(vertices, *, role=Role.ANY, collection,\n"                            //
     "                      durability=Durability.BUFFERED) answers None.\n"                      //
     "\n"                                                                                         //
     "Removes a batch of vertices together with every edge they take part in.\n"                  //
@@ -505,7 +557,7 @@ char const doc_graph_remove_vertices[] =                                        
     "  vertices (Sequence[KeyLike] | buffer): The vertices to remove.\n"                         //
     "  role (Role, optional): The role every vertex plays, which only a joining graph between\n" //
     "    two collections needs; `Role.ANY` otherwise.\n"                                         //
-    "  collection (UUID | str, optional): The graph collection, by identifier or by name.\n"     //
+    "  collection (UUID | str): The graph collection, by identifier or by name.\n"               //
     "  durability (Durability, optional): `Durability.FLUSHED` reaches the drive before\n"       //
     "    returning.";
 
@@ -542,24 +594,24 @@ PyObject* ustore_py_api_graph_remove_vertices(PyObject* self, PyObject* const* a
     return ustore_py_call_run(&context, &vertices_remove_verb, call, &remove);
 }
 
-char const doc_graph_scan_vertices[] =                                                                      //
-    "graph_scan_vertices(start, wanted, arena, *, collection=None, mode=ScanMode.ORDERED, progress=None)\n" //
-    "answers a Keys tape.\n"                                                                                //
-    "\n"                                                                                                    //
-    "Lists up to `wanted` vertices from `start` upwards, those without edges included.\n"                   //
-    "Edges are not exported, so a `graph_read_edges` follows the scan.\n"                                   //
-    "\n"                                                                                                    //
-    "Args:\n"                                                                                               //
-    "  start (KeyLike): The smallest vertex the scan may return.\n"                                         //
-    "  wanted (int): Most vertices the scan returns.\n"                                                     //
-    "  arena (Arena): Where the vertices land, rewound by this call.\n"                                     //
-    "  collection (UUID | str, optional): The graph collection, by identifier or by name.\n"                //
-    "  mode (ScanMode, optional): In what order the vertices come, as `scan` takes it.\n"                   //
-    "  progress (Callable[[int, int], bool | None], optional): Called with the scans\n"                     //
-    "    finished and the scans in all; a falsy answer other than None cancels the call.\n"                 //
-    "Returns:\n"                                                                                            //
-    "  Keys: One run of vertices, in ascending order.\n"                                                    //
-    "Raises:\n"                                                                                             //
+char const doc_graph_scan_vertices[] =                                                                 //
+    "graph_scan_vertices(start, wanted, arena, *, collection, mode=ScanMode.ORDERED, progress=None)\n" //
+    "answers a Keys tape.\n"                                                                           //
+    "\n"                                                                                               //
+    "Lists up to `wanted` vertices from `start` upwards, those without edges included.\n"              //
+    "Edges are not exported, so a `graph_read_edges` follows the scan.\n"                              //
+    "\n"                                                                                               //
+    "Args:\n"                                                                                          //
+    "  start (KeyLike): The smallest vertex the scan may return.\n"                                    //
+    "  wanted (int): Most vertices the scan returns.\n"                                                //
+    "  arena (Arena): Where the vertices land, rewound by this call.\n"                                //
+    "  collection (UUID | str): The graph collection, by identifier or by name.\n"                     //
+    "  mode (ScanMode, optional): In what order the vertices come, as `scan` takes it.\n"              //
+    "  progress (Callable[[int, int], bool | None], optional): Called with the scans\n"                //
+    "    finished and the scans in all; a falsy answer other than None cancels the call.\n"            //
+    "Returns:\n"                                                                                       //
+    "  Keys: One run of vertices, in ascending order.\n"                                               //
+    "Raises:\n"                                                                                        //
     "  CancelledError: The progress callable stopped the scan.";
 
 PyObject* ustore_py_api_graph_scan_vertices(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,

@@ -118,9 +118,9 @@ def open_store(database: ustore.Database) -> Store:
         database=database,
         follows=DiGraph(database, FOLLOWS_COLLECTION),
         views=DiGraph(database, VIEWS_COLLECTION),
-        people=database.collection_create(PEOPLE_COLLECTION),
-        movies=database.collection_create(MOVIES_COLLECTION),
-        posters=database.collection_create(POSTERS_COLLECTION),
+        people=database.collection_create(PEOPLE_COLLECTION, modality=ustore.Modality.DOCS),
+        movies=database.collection_create(MOVIES_COLLECTION, modality=ustore.Modality.DOCS),
+        posters=database.collection_create(POSTERS_COLLECTION, modality=ustore.Modality.BLOBS),
     )
 
 

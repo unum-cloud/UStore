@@ -263,7 +263,7 @@ typedef enum ustore_status_t {
     ustore_status_out_of_memory_k = 2,
 
     /** An argument is null, contradicts another one, or carries a choice the call does not accept, like a collection
-     *  of another modality, a drop of the main collection, or a batch of strings in an unknown layout. */
+     *  of another modality, a name reserved for a system collection, or a batch of strings in an unknown layout. */
     ustore_status_invalid_argument_k = 3,
 
     /** The call needs a database or transaction that was never opened. */

@@ -27,11 +27,10 @@ using namespace unum::ustore;
 using namespace unum::ustore::test;
 using namespace unum;
 
-/** Whether a value can be assigned through the main collection that @p receiver_type_ hands out. */
+/** Whether a value can be assigned through a binary collection that @p receiver_type_ finds. */
 template <typename receiver_type_>
-concept assigns_through_concept = requires(decltype(std::declval<receiver_type_&>().main()) collection) {
-    collection[key_from_integer(1)].assign("x");
-};
+concept assigns_through_concept = requires(typename decltype(std::declval<receiver_type_&>().find(
+    std::string_view {}))::value_type collection) { collection[key_from_integer(1)].assign("x"); };
 
 /** Whether a deferred read accepts keys and an arena passed as @p keys_type_ and @p arena_type_. */
 template <typename keys_type_, typename arena_type_>
@@ -160,8 +159,9 @@ std::size_t wrappers_compile(config_t const& config) {
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
 
-    [[maybe_unused]] auto const main_by_value = database.main();
-    blobs_collection_t main_collection = database.main();
+    failures += expect(database.clear(ustore_drop_collection_k).succeeded());
+    auto [main_collection, create_status] = database.create("main");
+    failures += expect(create_status.succeeded());
 
     // Single-element access
     failures += expect(main_collection[key_from_integer(42)].assign("purpose of life").succeeded());
@@ -189,12 +189,10 @@ std::size_t wrappers_compile(config_t const& config) {
     for ([[maybe_unused]] value_view_t const element : *listed) {}
 
     // Named collections
-    if (database.supports_collections()) {
-        blobs_collection_t prefixes = *database.find_or_create("prefixes");
-        failures += expect(prefixes.at(key_from_integer(42)).assign("purpose").succeeded());
-        failures += expect(database["articles"]->at(key_from_integer(42)).assign("of").succeeded());
-        failures += expect(database["suffixes"]->at(key_from_integer(42)).assign("life").succeeded());
-    }
+    blobs_collection_t prefixes = *database.find_or_create("prefixes");
+    failures += expect(prefixes.at(key_from_integer(42)).assign("purpose").succeeded());
+    failures += expect(database["articles"]->at(key_from_integer(42)).assign("of").succeeded());
+    failures += expect(database["suffixes"]->at(key_from_integer(42)).assign("life").succeeded());
 
     // Reusable memory
     auto [arena, arena_status] = arena_t::make();
@@ -234,12 +232,11 @@ std::size_t wrappers_compile(config_t const& config) {
         ustore_watch_none_k);
 
     // Sub-documents
-    if (database.supports_collections()) {
-        docs_collection_t documents = *database.find_or_create<docs_collection_t>("docs");
-        failures += expect(documents[key_from_integer(56)].assign(R"({"hello":"world","answer":42})").succeeded());
-        [[maybe_unused]] bool const field_matches =
-            documents[collection_key_field_t {key_from_integer(56), "hello"}].value() == "world";
-    }
+    docs_collection_t documents_collection = *database.find_or_create<docs_collection_t>("docs");
+    failures += expect(
+        documents_collection[key_from_integer(56)].assign(R"({"hello":"world","answer":42})").succeeded());
+    [[maybe_unused]] bool const field_matches =
+        documents_collection[collection_key_field_t {key_from_integer(56), "hello"}].value() == "world";
 
     // The same proxies running on an executor, and deferred verbs taking owned inputs
     auto [executor, executor_status] = executor_handle_t::for_ram({.threads = 1});
@@ -247,13 +244,13 @@ std::size_t wrappers_compile(config_t const& config) {
     if (failures != 0) return failures;
     failures += expect(database_t::init_ram({}, executor).has_value());
     database_ref_t head_on_executor = database.on(executor);
-    blobs_collection_t on_executor = head_on_executor.main();
+    blobs_collection_t on_executor = *head_on_executor.find("main");
     failures += expect(on_executor[key_from_integer(42)].assign("purpose of life").succeeded());
     [[maybe_unused]] auto const on_executor_value = on_executor[key_from_integer(42)].value();
-    if (database.supports_collections())
-        failures += expect(head_on_executor["articles"]->at(key_from_integer(42)).assign("of").succeeded());
+    failures += expect(head_on_executor["articles"]->at(key_from_integer(42)).assign("of").succeeded());
 
-    deferred_blobs_collection_t deferred_main = database.deferred(executor).main();
+    deferred_database_t const deferred_database = database.deferred(executor);
+    deferred_blobs_collection_t deferred_main = deferred_database[main_collection];
     std::array<ustore_key_t, 2> const owned_keys {key_from_integer(43), key_from_integer(44)};
     deferred<blobs_read_t> reading = deferred_main.read(owned_keys, arena);
     [[maybe_unused]] status_code_t const polled = reading.status();
@@ -264,15 +261,13 @@ std::size_t wrappers_compile(config_t const& config) {
     deferred<blobs_remove_t> removing = deferred_main.remove(owned_keys);
     failures += expect(std::move(removing).wait().succeeded());
     deferred_database_t deferred_head = database.deferred(executor);
-    if (database.supports_collections()) {
-        expected<ustore_collection_id_t> created = deferred_head.create("created").wait();
-        failures += expect(created.has_value());
-        if (created) {
-            failures += expect(deferred_head[*created].remove(owned_keys).wait().succeeded());
-            failures += expect(deferred_head.drop(*created).wait().succeeded());
-        }
-        failures += expect(deferred_head.collections(arena).wait().has_value());
+    expected<ustore_collection_id_t> created = deferred_head.create("created").wait();
+    failures += expect(created.has_value());
+    if (created) {
+        failures += expect(deferred_head[*created].remove(owned_keys).wait().succeeded());
+        failures += expect(deferred_head.drop(*created).wait().succeeded());
     }
+    failures += expect(deferred_head.collections(arena).wait().has_value());
 
     // Deferred documents, graphs and strings, each verb taking owned inputs
     failures += expect(database.find_or_create<docs_collection_t>("docs").has_value());
@@ -288,33 +283,30 @@ std::size_t wrappers_compile(config_t const& config) {
         deferred_documents.gather(owned_keys, std::move(hello), std::array {ustore_docs_field_type_str_k}, arena)
             .wait();
     failures += expect(deferred_documents.remove(owned_keys).wait().succeeded());
-    if (database.supports_collections()) {
-        failures += expect(database.create<graph_collection_t>("graph").has_value());
-        deferred_graph_collection_t deferred_graph = *deferred_head.find<graph_collection_t>("graph");
-        std::array<edge_t, 1> const owned_edges {edge_t {key_from_integer(43), key_from_integer(44)}};
-        failures += expect(deferred_graph.write_edges(owned_edges).wait().succeeded());
-        failures += expect(deferred_graph.write_vertices(owned_keys).wait().succeeded());
-        [[maybe_unused]] expected<edges_view_t> const edges_read = deferred_graph.read_edges(owned_keys, arena).wait();
-        [[maybe_unused]] expected<std::span<ustore_vertex_degree_t const>> const degrees =
-            deferred_graph.degrees(owned_keys, arena, ustore_vertex_role_source_k).wait();
-        failures += expect(deferred_graph.remove_edges(owned_edges).wait().succeeded());
-        failures += expect(deferred_graph.remove_vertices(owned_keys).wait().succeeded());
+    failures += expect(database.create<graph_collection_t>("graph").has_value());
+    deferred_graph_collection_t deferred_graph = *deferred_head.find<graph_collection_t>("graph");
+    std::array<edge_t, 1> const owned_edges {edge_t {key_from_integer(43), key_from_integer(44)}};
+    failures += expect(deferred_graph.write_edges(owned_edges).wait().succeeded());
+    failures += expect(deferred_graph.write_vertices(owned_keys).wait().succeeded());
+    [[maybe_unused]] expected<edges_view_t> const edges_read = deferred_graph.read_edges(owned_keys, arena).wait();
+    [[maybe_unused]] expected<std::span<ustore_vertex_degree_t const>> const degrees =
+        deferred_graph.degrees(owned_keys, arena, ustore_vertex_role_source_k).wait();
+    failures += expect(deferred_graph.remove_edges(owned_edges).wait().succeeded());
+    failures += expect(deferred_graph.remove_vertices(owned_keys).wait().succeeded());
 
-        failures += expect(database.create<strings_collection_t>("strings").has_value());
-        deferred_strings_collection_t deferred_strings = *deferred_head.find<strings_collection_t>("strings");
-        values_tape_t texts, asked, prefixes, removed;
-        failures += fill_tape(texts, {"hello", "help"});
-        failures += fill_tape(asked, {"hello"});
-        failures += fill_tape(prefixes, {"hel"});
-        failures += fill_tape(removed, {"help"});
-        std::array<ustore_key_t, 2> const string_keys {key_from_integer(1), key_from_integer(2)};
-        failures += expect(deferred_strings.write(std::move(texts), string_keys).wait().succeeded());
-        [[maybe_unused]] expected<keys_view_t> const strings_read =
-            deferred_strings.read(std::move(asked), arena).wait();
-        [[maybe_unused]] expected<strings_scan_t::finished_t> const scanned =
-            deferred_strings.scan(std::move(prefixes), 8, arena).wait();
-        failures += expect(deferred_strings.remove(std::move(removed)).wait().succeeded());
-    }
+    failures += expect(database.create<strings_collection_t>("strings").has_value());
+    deferred_strings_collection_t deferred_strings = *deferred_head.find<strings_collection_t>("strings");
+    values_tape_t texts, asked, string_prefixes, removed_strings;
+    failures += fill_tape(texts, {"hello", "help"});
+    failures += fill_tape(asked, {"hello"});
+    failures += fill_tape(string_prefixes, {"hel"});
+    failures += fill_tape(removed_strings, {"help"});
+    std::array<ustore_key_t, 2> const string_keys {key_from_integer(1), key_from_integer(2)};
+    failures += expect(deferred_strings.write(std::move(texts), string_keys).wait().succeeded());
+    [[maybe_unused]] expected<keys_view_t> const strings_read = deferred_strings.read(std::move(asked), arena).wait();
+    [[maybe_unused]] expected<strings_scan_t::finished_t> const scanned =
+        deferred_strings.scan(std::move(string_prefixes), 8, arena).wait();
+    failures += expect(deferred_strings.remove(std::move(removed_strings)).wait().succeeded());
 
     // Transactions on an executor, and their deferred verbs
     if (database.supports_transactions()) {
@@ -323,7 +315,7 @@ std::size_t wrappers_compile(config_t const& config) {
             "docs");
         deferred_transaction_t deferred_transaction = transaction.deferred(executor);
         [[maybe_unused]] expected<deferred_blobs_collection_t> const deferred_named = deferred_transaction["docs"];
-        failures += expect(deferred_transaction.main().remove(owned_keys).wait().succeeded());
+        failures += expect(deferred_transaction.find("main")->remove(owned_keys).wait().succeeded());
         [[maybe_unused]] expected<read_stamp_t> const staged = deferred_transaction.stage().wait();
         [[maybe_unused]] status_t const rolled_back = deferred_transaction.rollback().wait();
         [[maybe_unused]] expected<commit_stamp_t> const committed = deferred_transaction.commit().wait();
@@ -334,13 +326,14 @@ std::size_t wrappers_compile(config_t const& config) {
     if (database.supports_snapshots()) {
         snapshot_t snapshot = *database.on(executor).snapshot();
         [[maybe_unused]] read_stamp_t const snapshot_stamp = snapshot.read_stamp();
-        [[maybe_unused]] auto const snapshot_value = snapshot.main().at(key_from_integer(42)).value();
+        [[maybe_unused]] auto const snapshot_value = snapshot.find("main")->at(key_from_integer(42)).value();
         [[maybe_unused]] expected<docs_read_collection_t> const snapshot_documents = snapshot.find<docs_collection_t>(
             "docs");
-        [[maybe_unused]] expected<graph_read_collection_t> const snapshot_graph = snapshot.find<graph_collection_t>();
+        [[maybe_unused]] expected<graph_read_collection_t> const snapshot_graph = snapshot.find<graph_collection_t>(
+            "graph");
         [[maybe_unused]] expected<strings_read_collection_t> const snapshot_strings =
             snapshot.find<strings_collection_t>("strings");
-        deferred_blobs_read_collection_t deferred_snapshot = snapshot.deferred(executor).main();
+        deferred_blobs_read_collection_t deferred_snapshot = *snapshot.deferred(executor).find("main");
         failures += expect(deferred_snapshot.read(owned_keys, arena).wait().has_value());
         deferred_docs_read_collection_t deferred_snapshot_documents =
             *snapshot.deferred(executor).find<docs_collection_t>("docs");

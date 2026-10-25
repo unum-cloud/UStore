@@ -960,7 +960,7 @@ struct single_collection_database_schema_record_t {
     std::uint64_t run_count = 0;
 
     /** Which of the two copies is newer, and the commits the runs this copy names hold whole. */
-    catalog_stamps_t stamps;
+    schema_stamps_t stamps;
 };
 
 static_assert(sizeof(single_collection_database_schema_record_t) == 48, "The schema record is its own bytes");
@@ -1221,8 +1221,8 @@ class basic_single_collection_database {
     /** How many memory runs the collection holds, and how many commits they hold. */
     [[nodiscard]] memory_shape_t memory_shape() const noexcept { return collection_.memory_shape(); }
 
-    /** How many times the schema blob has been saved, whose @c catalog_copy_of names the copy a mount reads. */
-    [[nodiscard]] std::uint64_t catalog_generation() const noexcept { return generation_; }
+    /** How many times the schema blob has been saved, whose @c schema_copy_of names the copy a mount reads. */
+    [[nodiscard]] std::uint64_t schema_generation() const noexcept { return generation_; }
 
     /** Drops every version above @p ceiling, which a mount runs once its ledger has resumed at @p ceiling. */
     status_t truncate_above(transaction_stamp_t ceiling) noexcept {
@@ -1647,7 +1647,7 @@ class basic_single_collection_database {
         std::memcpy(image.data(), &record, sizeof(record));
         if (!runs.empty())
             std::memcpy(image.data() + sizeof(record), runs.data(), runs.size() * sizeof(lsm_tree_run_record_t));
-        if (status_t const written = write_blob_(schema_blob_name_(catalog_copy_of(record.stamps.generation)),
+        if (status_t const written = write_blob_(schema_blob_name_(schema_copy_of(record.stamps.generation)),
                                                  blob_kind_t::schema_k, std::span<byte_t const> {image});
             written.failed())
             return written;

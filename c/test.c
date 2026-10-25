@@ -107,6 +107,17 @@ int main(void) {
     failures += expect_success(&outcome, __LINE__);
     if (failures) return 1;
 
+    // No collection exists until one is created, and every call names the collections it addresses
+    ustore_collection_id_t blobs = {{{0}}};
+    ustore_collection_create_t create_blobs = {.database = database,
+                                               .outcome = &outcome,
+                                               .name = bytes_of("values"),
+                                               .modality = ustore_modality_blobs_k,
+                                               .collection = &blobs};
+    ustore_collection_create(&create_blobs);
+    failures += expect_success(&outcome, __LINE__);
+    ustore_collections_view_t const blobs_view = {&blobs, 0};
+
     // The same three values as a u32 tape, a u64 tape and an accessor, each written over the last
     ustore_key_t const keys[3] = {key_from(1), key_from(2), key_from(3)};
     ustore_keys_view_t const keys_view = {keys, sizeof(ustore_key_t)};
@@ -118,6 +129,7 @@ int main(void) {
     ustore_blobs_write_t write = {.database = database,
                                   .outcome = &outcome,
                                   .count = 3,
+                                  .collections = blobs_view,
                                   .keys = keys_view,
                                   .values = narrow_tape};
     ustore_blobs_write(&write);
@@ -136,6 +148,7 @@ int main(void) {
     ustore_blobs_read_t read = {.database = database,
                                 .outcome = &outcome,
                                 .count = 3,
+                                .collections = blobs_view,
                                 .keys = keys_view,
                                 .presences = &presences,
                                 .lengths = &lengths,
@@ -152,6 +165,7 @@ int main(void) {
     ustore_blobs_scan_t scan = {.database = database,
                                 .outcome = &outcome,
                                 .count = 1,
+                                .collections = blobs_view,
                                 .start_keys = {keys, 0},
                                 .offsets = &scan_offsets,
                                 .keys = &found_keys,
@@ -179,7 +193,7 @@ int main(void) {
                                      .arena = arena};
     ustore_collection_list(&list);
     failures += expect_success(&outcome, __LINE__);
-    failures += expect(listed == 1 && tape_holds(&names, 0, "colors"), __LINE__);
+    failures += expect(listed == 2 && (tape_holds(&names, 0, "colors") || tape_holds(&names, 1, "colors")), __LINE__);
 
     // Strings read through an accessor map onto strided keys, and read back through a tape of the same strings
     ustore_collections_view_t const colors_view = {&colors, 0};
@@ -205,9 +219,12 @@ int main(void) {
     failures += expect(presences && presences[0] == 7 && color_keys, __LINE__);
     failures += expect(color_keys && memcmp(color_keys, keys, sizeof(keys)) == 0, __LINE__);
 
-    // A cursor pulls the keys of the main collection with their values, then nothing once a page came back short
+    // A cursor pulls the keys of a collection with their values, then nothing once a page came back short
     ustore_blobs_cursor_t keys_cursor = NULL;
-    ustore_blobs_cursor_init_t keys_cursor_init = {.cursor = &keys_cursor, .database = database, .outcome = &outcome};
+    ustore_blobs_cursor_init_t keys_cursor_init = {.cursor = &keys_cursor,
+                                                   .database = database,
+                                                   .outcome = &outcome,
+                                                   .collection = blobs};
     ustore_blobs_cursor_init(&keys_cursor_init);
     failures += expect_success(&outcome, __LINE__);
     ustore_size_t pulled = 0;

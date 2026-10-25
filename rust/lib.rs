@@ -45,8 +45,8 @@
 //!
 //! // Keys are UUIDs, and an integer spells as its big-endian bytes.
 //! let [ada, grace, kent] = [1u64, 2, 3].map(Key::from);
-//! let people = database.collection_create("people", Modality::Any)?;
-//! let places = database.collection_create("places", Modality::Any)?;
+//! let people = database.collection_create("people", Modality::Blobs)?;
+//! let places = database.collection_create("places", Modality::Blobs)?;
 //! let entries = [Entry::new(ada, b"Ada"), Entry::new(grace, b"Grace"), Entry::new(kent, b"Kent")];
 //! database.head().write(people, &entries, Durability::Buffered)?;
 //! database.head().remove(people, &[kent], Durability::Buffered)?;
@@ -89,7 +89,7 @@
 //! let database = Database::init_ram(&RAMOptions::default())?;
 //! let executor = Executor::for_ram(&[], 8, 256)?;
 //! let mut arena = Arena::new_in(&executor)?;
-//! let people = database.collection_create("people", Modality::Any)?;
+//! let people = database.collection_create("people", Modality::Blobs)?;
 //! let [ada, grace] = [1u64, 2].map(Key::from);
 //!
 //! let names: BytesTape<u32> = [b"Ada".as_slice(), b"Grace"].into_iter().collect();
@@ -113,12 +113,13 @@
 //! first one exported. That is the borrow the verbs take, and using a result after the next call does not compile:
 //!
 //! ```compile_fail,E0499
-//! use ustore::{Arena, CollectionID, RAMOptions, Database, Key};
+//! use ustore::{Arena, RAMOptions, Database, Key, Modality};
 //!
 //! let database = Database::init_ram(&RAMOptions::default())?;
 //! let mut arena = Arena::new()?;
-//! let values = database.head().read(CollectionID::main(), &[Key::from(1u64)], &mut arena)?;
-//! let overwritten = database.head().read(CollectionID::main(), &[Key::from(2u64)], &mut arena)?;
+//! let people = database.collection_create("people", Modality::Blobs)?;
+//! let values = database.head().read(people, &[Key::from(1u64)], &mut arena)?;
+//! let overwritten = database.head().read(people, &[Key::from(2u64)], &mut arena)?;
 //! assert_eq!(values.get(0), None);
 //! # Ok::<(), ustore::Error>(())
 //! ```
@@ -127,13 +128,14 @@
 //! it borrows the arena, whose free waits for the call:
 //!
 //! ```compile_fail,E0277
-//! use ustore::{Arena, CollectionID, Database, Executor, Key, RAMOptions};
+//! use ustore::{Arena, Database, Executor, Key, Modality, RAMOptions};
 //!
 //! let database = Database::init_ram(&RAMOptions::default())?;
 //! let executor = Executor::for_ram(&[], 2, 0)?;
 //! let mut arena = Arena::new_in(&executor)?;
+//! let people = database.collection_create("people", Modality::Blobs)?;
 //! let keys = [Key::from(1u64)];
-//! let reading = database.head().deferred(&executor).read(CollectionID::main(), &keys, &mut arena)?;
+//! let reading = database.head().deferred(&executor).read(people, &keys, &mut arena)?;
 //! # Ok::<(), ustore::Error>(())
 //! ```
 //!
@@ -165,22 +167,24 @@
 //! Only the head clears and drops collections:
 //!
 //! ```compile_fail,E0599
-//! use ustore::{CollectionID, Database, DropMode, RAMOptions, Watch};
+//! use ustore::{Database, DropMode, Modality, RAMOptions, Watch};
 //!
 //! let database = Database::init_ram(&RAMOptions::default())?;
+//! let people = database.collection_create("people", Modality::Blobs)?;
 //! let transaction = database.transaction()?;
-//! transaction.view(Watch::Keys).collection_drop(CollectionID::main(), DropMode::Pairs)?;
+//! transaction.view(Watch::Keys).collection_drop(people, DropMode::Pairs)?;
 //! # Ok::<(), ustore::Error>(())
 //! ```
 //!
 //! Nothing writes through a snapshot:
 //!
 //! ```compile_fail,E0599
-//! use ustore::{CollectionID, Database, Durability, Key, RAMOptions};
+//! use ustore::{Database, Durability, Key, Modality, RAMOptions};
 //!
 //! let database = Database::init_ram(&RAMOptions::default())?;
+//! let people = database.collection_create("people", Modality::Blobs)?;
 //! let snapshot = database.snapshot()?;
-//! snapshot.view().remove(CollectionID::main(), [Key::from(1u64)], Durability::Buffered)?;
+//! snapshot.view().remove(people, [Key::from(1u64)], Durability::Buffered)?;
 //! # Ok::<(), ustore::Error>(())
 //! ```
 

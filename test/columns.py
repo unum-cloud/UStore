@@ -43,72 +43,84 @@ def decoded(values) -> list:
 
 
 @pytest.mark.parametrize("field_type", list(COLUMN_DTYPES))
-def test_column_write_round_trip(view, arena, field_type: FieldType):
+def test_column_write_round_trip(view, docs, arena, field_type: FieldType):
     """A NumPy column of scalars reaches every document without being printed as JSON."""
     dtype, values = COLUMN_DTYPES[field_type]
     keys = [3, 4, 5]
-    view.docs_write(keys, ["{}"] * len(keys))
-    view.docs_write(keys, np.array(values, dtype=dtype), field="v", type=field_type)
-    assert decoded(view.docs_read(keys, arena)) == [{"v": value} for value in values]
+    view.docs_write(keys, ["{}"] * len(keys), collection=docs)
+    view.docs_write(keys, np.array(values, dtype=dtype), field="v", type=field_type, collection=docs)
+    assert decoded(view.docs_read(keys, arena, collection=docs)) == [{"v": value} for value in values]
 
 
-def test_column_write_accepts_bytes(view, arena):
+def test_column_write_accepts_bytes(view, docs, arena):
     """A plain buffer of bytes carries no width of its own, so it splits by the field's."""
     keys = [1, 2, 3]
-    view.docs_write(keys, ["{}"] * len(keys))
-    view.docs_write(keys, struct.pack("<3i", 7, 8, 9), field="v", type=FieldType.I32)
-    assert decoded(view.docs_read(keys, arena)) == [{"v": 7}, {"v": 8}, {"v": 9}]
+    view.docs_write(keys, ["{}"] * len(keys), collection=docs)
+    view.docs_write(keys, struct.pack("<3i", 7, 8, 9), field="v", type=FieldType.I32, collection=docs)
+    assert decoded(view.docs_read(keys, arena, collection=docs)) == [{"v": 7}, {"v": 8}, {"v": 9}]
 
 
-def test_column_write_broadcasts_one_scalar(view, arena):
+def test_column_write_broadcasts_one_scalar(view, docs, arena):
     """One scalar the width of the field stands for every key, as one document does."""
     keys = [1, 2, 3]
-    view.docs_write(keys, ["{}"] * len(keys))
-    view.docs_write(keys, np.array([2.5], dtype=np.float64), field="v", type=FieldType.F64)
-    assert decoded(view.docs_read(keys, arena)) == [{"v": 2.5}] * 3
+    view.docs_write(keys, ["{}"] * len(keys), collection=docs)
+    view.docs_write(keys, np.array([2.5], dtype=np.float64), field="v", type=FieldType.F64, collection=docs)
+    assert decoded(view.docs_read(keys, arena, collection=docs)) == [{"v": 2.5}] * 3
 
 
-def test_column_write_refuses_a_strided_view(view, arena):
+def test_column_write_refuses_a_strided_view(view, docs, arena):
     """A column is borrowed rather than copied, so a slice with gaps in it is refused outright."""
     keys = [1, 2, 3]
-    view.docs_write(keys, ["{}"] * len(keys))
+    view.docs_write(keys, ["{}"] * len(keys), collection=docs)
     strided = np.arange(6, dtype=np.int64)[::2]
     with pytest.raises(TypeError):
-        view.docs_write(keys, strided, field="v", type=FieldType.I64)
-    view.docs_write(keys, np.ascontiguousarray(strided), field="v", type=FieldType.I64)
-    assert decoded(view.docs_read(keys, arena)) == [{"v": 0}, {"v": 2}, {"v": 4}]
+        view.docs_write(keys, strided, field="v", type=FieldType.I64, collection=docs)
+    view.docs_write(keys, np.ascontiguousarray(strided), field="v", type=FieldType.I64, collection=docs)
+    assert decoded(view.docs_read(keys, arena, collection=docs)) == [{"v": 0}, {"v": 2}, {"v": 4}]
 
 
-def test_column_write_replaces_whole_documents(view, arena):
+def test_column_write_replaces_whole_documents(view, docs, arena):
     """Without a field the scalars replace the documents themselves, one per key."""
     keys = [1, 2]
-    view.docs_write(keys, np.array([4.5, 5.5], dtype=np.float64), type=FieldType.F64)
-    assert decoded(view.docs_read(keys, arena)) == [4.5, 5.5]
+    view.docs_write(keys, np.array([4.5, 5.5], dtype=np.float64), type=FieldType.F64, collection=docs)
+    assert decoded(view.docs_read(keys, arena, collection=docs)) == [4.5, 5.5]
 
 
 @pytest.mark.parametrize(
     ("call", "failure"),
     [
         (
-            lambda view: view.docs_write([1, 2, 3], np.zeros(2, dtype=np.float64), field="v", type=FieldType.F64),
+            lambda view: view.docs_write(
+                [1, 2, 3], np.zeros(2, dtype=np.float64), field="v", type=FieldType.F64, collection="docs"
+            ),
             ValueError,
         ),
         (
-            lambda view: view.docs_write([1, 2, 3], np.zeros(3, dtype=np.float32), field="v", type=FieldType.F64),
+            lambda view: view.docs_write(
+                [1, 2, 3], np.zeros(3, dtype=np.float32), field="v", type=FieldType.F64, collection="docs"
+            ),
             ValueError,
         ),
-        (lambda view: view.docs_write([1, 2], b"\x00" * 3, field="v", type=FieldType.I32), ValueError),
         (
-            lambda view: view.docs_write([1], np.zeros(1, dtype=np.float16), field="v", type=FieldType.F16),
+            lambda view: view.docs_write([1, 2], b"\x00" * 3, field="v", type=FieldType.I32, collection="docs"),
+            ValueError,
+        ),
+        (
+            lambda view: view.docs_write(
+                [1], np.zeros(1, dtype=np.float16), field="v", type=FieldType.F16, collection="docs"
+            ),
             UnsupportedError,
         ),
-        (lambda view: view.docs_write([1], bytes(16), field="v", type=FieldType.UUID), UnsupportedError),
+        (
+            lambda view: view.docs_write([1], bytes(16), field="v", type=FieldType.UUID, collection="docs"),
+            UnsupportedError,
+        ),
     ],
     ids=["short-column", "narrow-items", "ragged-bytes", "unwritable-f16", "unwritable-uuid"],
 )
-def test_column_write_refusals(view, call, failure):
+def test_column_write_refusals(view, docs, call, failure):
     """A column whose values do not fit its type, and a type no write spells, are refused."""
-    view.docs_write([1, 2, 3], ["{}"] * 3)
+    view.docs_write([1, 2, 3], ["{}"] * 3, collection=docs)
     with pytest.raises(failure):
         call(view)
 
@@ -118,10 +130,10 @@ def test_column_write_refusals(view, call, failure):
 # region Half Precision Gathers
 
 
-def test_gather_half_precision(view, arena):
+def test_gather_half_precision(view, docs, arena):
     """A half-precision column exports the 'e' format, which NumPy reads as float16 without a copy."""
-    view.docs_write([0, 1], [json.dumps({"v": 1.5}), json.dumps({"v": -0.25})])
-    columns = view.docs_gather([0, 1], ["v"], FieldType.F16, arena)
+    view.docs_write([0, 1], [json.dumps({"v": 1.5}), json.dumps({"v": -0.25})], collection=docs)
+    columns = view.docs_gather([0, 1], ["v"], FieldType.F16, arena, collection=docs)
     column = columns[0]
     assert column.format == "e"
     assert column.itemsize == 2
@@ -130,26 +142,26 @@ def test_gather_half_precision(view, arena):
     assert bit(columns.validities(0), 0) and bit(columns.validities(0), 1)
 
 
-def test_gather_half_precision_as_bytes(view, arena):
+def test_gather_half_precision_as_bytes(view, docs, arena):
     """Without NumPy the same column reads as the bytes behind it, which struct unpacks."""
-    view.docs_write([0], json.dumps({"v": 2.5}))
-    column = view.docs_gather([0], ["v"], FieldType.F16, arena)[0]
+    view.docs_write([0], json.dumps({"v": 2.5}), collection=docs)
+    column = view.docs_gather([0], ["v"], FieldType.F16, arena, collection=docs)[0]
     assert struct.unpack("<e", bytes(column.cast("B"))) == (2.5,)
 
 
-def test_gather_half_precision_overflows(view, arena):
+def test_gather_half_precision_overflows(view, docs, arena):
     """A magnitude past the largest finite half collides, and the cell is left at zero."""
-    view.docs_write([0, 1], [json.dumps({"v": 1e9}), json.dumps({"v": 1.0})])
-    columns = view.docs_gather([0, 1], ["v"], FieldType.F16, arena)
+    view.docs_write([0, 1], [json.dumps({"v": 1e9}), json.dumps({"v": 1.0})], collection=docs)
+    columns = view.docs_gather([0, 1], ["v"], FieldType.F16, arena, collection=docs)
     assert bit(columns.collisions(0), 0)
     assert not bit(columns.collisions(0), 1)
     assert np.asarray(columns[0])[1] == np.float16(1.0)
 
 
-def test_gather_half_precision_converts(view, arena):
+def test_gather_half_precision_converts(view, docs, arena):
     """An integer reaches a half column converted, which the conversion bitmap records."""
-    view.docs_write([0, 1], [json.dumps({"v": 3}), json.dumps({"v": 0.1})])
-    columns = view.docs_gather([0, 1], ["v"], FieldType.F16, arena)
+    view.docs_write([0, 1], [json.dumps({"v": 3}), json.dumps({"v": 0.1})], collection=docs)
+    columns = view.docs_gather([0, 1], ["v"], FieldType.F16, arena, collection=docs)
     assert bit(columns.conversions(0), 0)
     assert not bit(columns.conversions(0), 1)
     assert np.asarray(columns[0]).tolist() == [3.0, np.float16(0.1)]
@@ -160,10 +172,10 @@ def test_gather_half_precision_converts(view, arena):
 # region UUID Gathers
 
 
-def test_gather_uuid(view, arena):
+def test_gather_uuid(view, docs, arena):
     """A UUID column exports sixteen bytes per document, as a two-dimensional view."""
-    view.docs_write([0], json.dumps({"v": UUID_TEXT}))
-    columns = view.docs_gather([0], ["v"], FieldType.UUID, arena)
+    view.docs_write([0], json.dumps({"v": UUID_TEXT}), collection=docs)
+    columns = view.docs_gather([0], ["v"], FieldType.UUID, arena, collection=docs)
     column = columns[0]
     assert column.shape == (1, 16)
     assert column.tolist() == [list(UUID_BYTES)]
@@ -176,43 +188,43 @@ def test_gather_uuid(view, arena):
     ["not-a-uuid", "12345678-1234-5678-1234-56781234567", 42, {"k": 1}],
     ids=["text", "short", "integer", "object"],
 )
-def test_gather_uuid_collides(view, arena, value):
+def test_gather_uuid_collides(view, docs, arena, value):
     """A value no UUID text spells collides, and the cell is left at sixteen zeroes."""
-    view.docs_write([0], json.dumps({"v": value}))
-    columns = view.docs_gather([0], ["v"], FieldType.UUID, arena)
+    view.docs_write([0], json.dumps({"v": value}), collection=docs)
+    columns = view.docs_gather([0], ["v"], FieldType.UUID, arena, collection=docs)
     assert bit(columns.collisions(0), 0)
     assert not bit(columns.validities(0), 0)
     assert bytes(columns[0]) == bytes(16)
 
 
-def test_gather_uuid_beside_a_scalar(view, arena):
+def test_gather_uuid_beside_a_scalar(view, docs, arena):
     """Columns of differing widths stand side by side, each naming the type it was gathered as."""
-    view.docs_write([0], json.dumps({"id": UUID_TEXT, "n": 7}))
-    columns = view.docs_gather([0], ["id", "n"], [FieldType.UUID, FieldType.I64], arena)
+    view.docs_write([0], json.dumps({"id": UUID_TEXT, "n": 7}), collection=docs)
+    columns = view.docs_gather([0], ["id", "n"], [FieldType.UUID, FieldType.I64], arena, collection=docs)
     assert columns.types == (FieldType.UUID, FieldType.I64)
     assert bytes(columns[0]) == UUID_BYTES
     assert np.asarray(columns[1]).tolist() == [7]
 
 
-def test_gather_holds_its_arena(view, arena):
+def test_gather_holds_its_arena(view, docs, arena):
     """A view outlives the result it came from, since the memoryview keeps the arena alive."""
-    view.docs_write([0], json.dumps({"v": UUID_TEXT}))
-    column = view.docs_gather([0], ["v"], FieldType.UUID, arena)[0]
-    view.docs_write([1], json.dumps({"v": UUID_TEXT}))
+    view.docs_write([0], json.dumps({"v": UUID_TEXT}), collection=docs)
+    column = view.docs_gather([0], ["v"], FieldType.UUID, arena, collection=docs)[0]
+    view.docs_write([1], json.dumps({"v": UUID_TEXT}), collection=docs)
     assert bytes(column) == UUID_BYTES
 
 
 @pytest.mark.parametrize("field_type", [FieldType.JSON, FieldType.NULL, 128])
-def test_gather_refuses_unconvertible_types(view, arena, field_type: FieldType | int):
+def test_gather_refuses_unconvertible_types(view, docs, arena, field_type: FieldType | int):
     """A gather converts into scalars, UUIDs, strings or bytes, and into no other type or value."""
-    view.docs_write([0], "{}")
+    view.docs_write([0], "{}", collection=docs)
     with pytest.raises(ValueError):
-        view.docs_gather([0], ["v"], field_type, arena)
+        view.docs_gather([0], ["v"], field_type, arena, collection=docs)
 
 
-def test_gather_of_no_documents(view, arena):
+def test_gather_of_no_documents(view, docs, arena):
     """An empty gather answers empty columns of the types it was asked for."""
-    columns = view.docs_gather([], ["v"], FieldType.F16, arena)
+    columns = view.docs_gather([], ["v"], FieldType.F16, arena, collection=docs)
     assert columns.rows == 0
     assert len(columns[0]) == 0
 
@@ -222,34 +234,37 @@ def test_gather_of_no_documents(view, arena):
 # region Table Columns
 
 
-def test_table_column_assignment_is_typed(view, arena):
+def test_table_column_assignment_is_typed(view, docs, arena):
     """Assigning a NumPy column writes raw scalars, so the stored values keep their dtype exactly."""
-    table = Table.from_records(view, [{"n": row} for row in range(4)])
+    table = Table.from_records(view, [{"n": row} for row in range(4)], collection=docs)
     table["score"] = np.array([0.1, 0.25, 0.5, 0.75], dtype=np.float64)
-    assert decoded(view.docs_read(table.index, arena)) == [
+    assert decoded(view.docs_read(table.index, arena, collection=docs)) == [
         {"n": row, "score": score} for row, score in enumerate([0.1, 0.25, 0.5, 0.75])
     ]
 
 
 @pytest.mark.parametrize("dtype", [np.int64, np.int32, np.uint16, np.float32, np.bool_])
-def test_table_column_assignment_dtypes(view, arena, dtype):
+def test_table_column_assignment_dtypes(view, docs, arena, dtype):
     """Every dtype a column writes as raw scalars round-trips through the table view."""
-    table = Table.from_records(view, [{"n": row} for row in range(3)])
+    table = Table.from_records(view, [{"n": row} for row in range(3)], collection=docs)
     table["v"] = np.array([1, 0, 1], dtype=dtype)
-    gathered = view.docs_gather(table.index, ["v"], WRITE_TYPES[np.dtype(dtype).name], arena)
+    gathered = view.docs_gather(table.index, ["v"], WRITE_TYPES[np.dtype(dtype).name], arena, collection=docs)
     assert np.asarray(gathered[0]).tolist() == np.array([1, 0, 1], dtype=dtype).tolist()
 
 
-def test_table_column_of_objects_still_writes_json(view, arena):
+def test_table_column_of_objects_still_writes_json(view, docs, arena):
     """A column of Python objects has no scalar width, so it is spelled as JSON as before."""
-    table = Table.from_records(view, [{"n": row} for row in range(2)])
+    table = Table.from_records(view, [{"n": row} for row in range(2)], collection=docs)
     table["tag"] = ["first", "second"]
-    assert decoded(view.docs_read(table.index, arena)) == [{"n": 0, "tag": "first"}, {"n": 1, "tag": "second"}]
+    assert decoded(view.docs_read(table.index, arena, collection=docs)) == [
+        {"n": 0, "tag": "first"},
+        {"n": 1, "tag": "second"},
+    ]
 
 
-def test_table_column_of_the_wrong_length(view):
+def test_table_column_of_the_wrong_length(view, docs):
     """A column shorter than the rows it would fill is refused before anything is written."""
-    table = Table.from_records(view, [{"n": row} for row in range(3)])
+    table = Table.from_records(view, [{"n": row} for row in range(3)], collection=docs)
     with pytest.raises(ValueError):
         table["v"] = np.zeros(2, dtype=np.float64)
 

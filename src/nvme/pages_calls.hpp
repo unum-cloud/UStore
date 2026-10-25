@@ -6,7 +6,7 @@
  *      engine's table.
  *
  *  `src/nvme/variants.hpp` includes this file right before its table, as these calls build on its writes and its
- *  catalog lookups. An edit call addressing any collection but a pages one is refused. The `*_edits` calls of
+ *  collection lookups. An edit call addressing any collection but a pages one is refused. The `*_edits` calls of
  *  `src/pages.cpp` read the pages unwatched through the engine's own reads, check and apply the edits, and answer the
  *  edits of every page as one chain, which @c commit_page_edits lands. A chain that imports or removes the page decides
  *  it whole, so the page it leaves is written, or removed, and any other chain is appended as one @c page_fold_t change

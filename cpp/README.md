@@ -47,28 +47,29 @@ if (status.failed())
 
 ## Blobs
 
+No collection exists until one is created, so every call names one.
 A collection handle is cheap to construct and holds no state, and its `[]` operator returns a `blobs_ref` over one key or a batch of keys that reads and writes through the C interface:
 
 ```cpp
-blobs_collection_t main = db.main();
+auto [blobs, create_status] = db.create<blobs_collection_t>("blobs");
 
-status_t status = main[key_from_integer(42)].assign("purpose of life");
-expected<owned_value_t> value = main[key_from_integer(42)].value();
+status_t status = blobs[key_from_integer(42)].assign("purpose of life");
+expected<owned_value_t> value = blobs[key_from_integer(42)].value();
 bool const matches = value && *value == "purpose of life";
 
-status = main[{key_from_integer(43), key_from_integer(44)}].assign("same value");
-expected<bool> present = main[key_from_integer(43)].present();
-status = main[key_from_integer(43)].remove();
+status = blobs[{key_from_integer(43), key_from_integer(44)}].assign("same value");
+expected<bool> present = blobs[key_from_integer(43)].present();
+status = blobs[key_from_integer(43)].remove();
 
 auto [arena, arena_status] = arena_t::make();
 std::array<ustore_key_t, 3> keys {key_from_integer(65), key_from_integer(66), key_from_integer(67)};
-expected<values_view_t> values = main.read(keys, arena);
+expected<values_view_t> values = blobs.read(keys, arena);
 for (value_view_t found : *values)
     std::printf("%zu bytes\n", found.size());
 ```
 
 Read without an arena, `value`, `present` and `length` are shorthand: a single key answers an `owned_value_t`, a `bool` or a length, and a batch an `owned<values_view_t>`, an owned `bits_view_t` or owned `lengths_view_t`.
-Given an `arena_t&`, as `main.read(keys, arena)` or `main[keys].value(arena)`, `.present(arena)` and `.length(arena)` are, the same reads answer plain views into that arena.
+Given an `arena_t&`, as `blobs.read(keys, arena)` or `blobs[keys].value(arena)`, `.present(arena)` and `.length(arena)` are, the same reads answer plain views into that arena.
 `remove` removes the keys, while `clear_values` keeps them and empties their values.
 `keys` and `pairs` range over a collection in key order from a `start_key` to an `end_key`, and `size_range` estimates how many keys it holds.
 Each stream is shorthand for a range-based loop, which has no place for an arena, so it pulls pages from a cursor into one arena it owns for its lifetime.
@@ -78,7 +79,7 @@ Each stream is shorthand for a range-based loop, which has no place for an arena
 Shorthand and verbs trade convenience for reuse, as in every binding:
 
 - __Shorthand makes a one-off arena.__
-  `main[key].value()` calls `ustore_arena_init`, reads into that arena, and hands it to its answer, which frees it on destruction, so nothing is copied and no handle keeps state.
+  `blobs[key].value()` calls `ustore_arena_init`, reads into that arena, and hands it to its answer, which frees it on destruction, so nothing is copied and no handle keeps state.
   A scalar answer, such as a presence or a degree, is copied out and the arena freed at once.
   The price is one arena per call, so a loop reads through a verb instead.
 - __Verbs reuse a caller's arena.__
@@ -88,7 +89,7 @@ Shorthand and verbs trade convenience for reuse, as in every binding:
 ```cpp
 auto [arena, arena_status] = arena_t::make(executor);
 for (std::span<ustore_key_t const> batch : batches) {
-    auto [values, read_status] = db.on(executor).main().read(batch, arena);
+    auto [values, read_status] = db.on(executor).find("blobs")->read(batch, arena);
     if (read_status.failed()) break;
     consume(values); // valid until the next call given `arena`
 }
@@ -100,7 +101,7 @@ Collections, transactions and snapshots hold no arena, so threads share one hand
 Walks split the same way: the `keys`, `pairs` and `prefixed` streams own one arena each, while `blobs_cursor_t` and `strings_cursor_t` take the caller's on every pull, so a loop reuses one arena it keeps:
 
 ```cpp
-auto [cursor, cursor_status] = blobs_cursor_t::make(db.receiver(), ustore_collection_main_k);
+auto [cursor, cursor_status] = blobs_cursor_t::make(db.receiver(), blobs);
 std::size_t const wanted = 256;
 for (std::size_t pulled = wanted; cursor_status.succeeded() && pulled == wanted;) {
     auto [page, page_status] = cursor.next_pairs(wanted, arena);
@@ -119,15 +120,15 @@ for (std::size_t pulled = wanted; cursor_status.succeeded() && pulled == wanted;
 expected<docs_collection_t> people = db.find_or_create<docs_collection_t>("people");
 
 expected<transaction_t> transaction = db.transaction();
-blobs_collection_t inside = transaction->main();
+blobs_collection_t inside = *transaction->find("blobs");
 status = inside[key_from_integer(42)].assign("written inside a transaction");
 expected<commit_stamp_t> committed = transaction->commit();
 
 expected<snapshot_t> snapshot = db.snapshot();
-auto pinned = snapshot->main()[key_from_integer(42)].value();
+auto pinned = (*snapshot->find("blobs"))[key_from_integer(42)].value();
 ```
 
-Each collection type names the modality it holds as `modality_k`, so `create` records it, `find` refuses a collection holding another with `status_code_t::invalid_argument_k`, and `find_or_create` creates only when no collection carries the name.
+Each collection type names the modality it holds as `modality_k`, so `create` records it and refuses a name starting with `_`, which system collections keep, `find` refuses a collection holding another with `status_code_t::invalid_argument_k`, and `find_or_create` creates only when no collection carries the name.
 A handle taken from a transaction reads and writes through it, and a transaction commits only when `commit` is called, answering the commit's position in commit order.
 A snapshot hands out the read-only twin of every collection, such as `docs_read_collection_t` for `find<docs_collection_t>`, so nothing writes through it, and `save(path)` writes it out as a new database.
 
@@ -159,7 +160,7 @@ A progress callable answers `ustore_continue_k` or `ustore_cancel_k` and is `noe
 A `docs_collection_t` hands out `docs_ref` proxies, which read and write JSON through `ustore_docs_read` and `ustore_docs_write`:
 
 ```cpp
-docs_collection_t people = db.main<docs_collection_t>();
+auto [people, people_status] = db.create<docs_collection_t>("people");
 status_t status = people[key_from_integer(1)].assign(R"({"person": "Alice", "age": 27, "height": 1})");
 status = people[key_from_integer(2)].assign(R"({"person": "Bob", "age": "27", "weight": 2})");
 
@@ -261,12 +262,12 @@ The receiver chooses where a call runs, and the verb stays.
 
 ```cpp
 auto [executor, executor_status] = executor_handle_t::for_ram({.threads = 4});
-blobs_collection_t on_executor = db.on(executor).main();
+blobs_collection_t on_executor = *db.on(executor).find("blobs");
 status = on_executor[key_from_integer(42)].assign("purpose of life");
 ```
 
 `deferred(executor)` hands out the deferred twin of every collection, whose verbs mirror [the C calls](https://github.com/unum-cloud/UStore/blob/main/c/README.md#executors-blocking-and-deferred-calls) and answer a `deferred<verb>` once submitted.
-`main<docs_collection_t>()` and `find<graph_collection_t>(name)` pick the twin by modality, read-only at a snapshot, while the deferred database's `[]` takes a binary collection by the identifier `create` or `find` resolved, so addressing it never blocks.
+`find<graph_collection_t>(name)` picks the twin by modality, read-only at a snapshot, while the deferred database's `[]` takes a binary collection by the identifier `create` or `find` resolved, so addressing it never blocks.
 `status()` polls without blocking, `std::move(call).wait()` answers what the call produced, and a `deferred` dropped unwaited waits in its destructor:
 
 ```cpp
@@ -277,9 +278,9 @@ std::array<sz::string_view_t, 2> const texts {R"({"person": "Alice"})", R"({"per
 
 sz::expected<values_tape_t> values = sz::strings_view_t(texts).gather();
 if (!values) return;
-deferred<blobs_write_t> writing = later.main().write(keys, std::move(values.value));
+deferred<blobs_write_t> writing = later[blobs].write(keys, std::move(values.value));
 status = std::move(writing).wait();
-deferred<blobs_read_t> reading = later.main().read(keys, arena);
+deferred<blobs_read_t> reading = later[blobs].read(keys, arena);
 expected<values_view_t> read = std::move(reading).wait();
 for (value_view_t found : *read)
     std::printf("%zu bytes\n", found.size());
@@ -288,7 +289,7 @@ for (value_view_t found : *read)
 Documents are written and read whole or by field, under any modification, and a gather answers a table together with the rows and columns it views outside the arena:
 
 ```cpp
-deferred_docs_collection_t people = later.main<docs_collection_t>();
+deferred_docs_collection_t people = *later.find<docs_collection_t>("people");
 sz::expected<values_tape_t> documents = sz::strings_view_t(texts).gather();
 if (!documents) return;
 status = people.write(keys, std::move(documents.value), {}, ustore_docs_modify_merge_k).wait();
@@ -327,7 +328,7 @@ A transaction defers its own verbs too, `reset` among them:
 
 ```cpp
 deferred_transaction_t deferred_transaction = transaction->deferred(executor);
-status = deferred_transaction.main().remove(keys).wait();
+status = deferred_transaction.find("blobs")->remove(keys).wait();
 expected<read_stamp_t> staged = deferred_transaction.stage().wait();
 expected<commit_stamp_t> stamp = deferred_transaction.commit().wait();
 ```

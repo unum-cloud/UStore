@@ -6,7 +6,7 @@
  *      engine's table.
  *
  *  `src/nvme/variants.hpp` includes this file right before its table, as these calls build on its accesses, its
- *  writes and its catalog lookups. Every vertex is one key of its graph collection, holding the half-edges of
+ *  writes and its collection lookups. Every vertex is one key of its graph collection, holding the half-edges of
  *  `include/ustore/graph/adjacency_fold.hpp`, and every edge is a half-edge filed under each of its ends.
  *
  *  A write appends one change delta per touched vertex and reads nothing, so two transactions adding edges to one
@@ -90,7 +90,6 @@ inline watch_schedule_t graph_write_schedule(view_t const& view) noexcept {
 /** Where the tasks on the collection of task @p first end: the next task naming another one. */
 inline std::size_t run_end(strided_iterator<ustore_collection_id_t const> collections, std::size_t first,
                            std::size_t count) noexcept {
-    if (!collections) return count;
     std::size_t end = first + 1;
     while (end != count && collections[end] == collections[first]) ++end;
     return end;
@@ -182,8 +181,8 @@ status_t read_task_vertices(call_access<cpu_class_> const& access,
                             std::span<stored_key_t const> keys, std::span<vertex_read_t> reads) noexcept {
     for (std::size_t first = 0; first != keys.size();) {
         std::size_t const end = run_end(collections, first, keys.size());
-        if (status_t const read = read_vertices(access, task_collection(collections, first),
-                                                keys.subspan(first, end - first), reads.subspan(first, end - first));
+        if (status_t const read = read_vertices(access, collections[first], keys.subspan(first, end - first),
+                                                reads.subspan(first, end - first));
             read.failed())
             return read;
         first = end;
@@ -273,7 +272,7 @@ expected<std::span<vertex_delta_t>> edge_deltas(arguments_type_ const& arguments
         half_edge_delta_t records[2];
         std::size_t const filed = deltas_of_edge(edge, operation, ends, records);
         for (std::size_t end = 0; end != filed; ++end, ++count)
-            deltas[count] = vertex_delta_t {task_collection(collections, index), ends[end], records[end], count};
+            deltas[count] = vertex_delta_t {collections[index], ends[end], records[end], count};
     }
     return deltas.first(count);
 }
@@ -445,7 +444,7 @@ status_t graph_write_vertices(ustore_graph_write_vertices_t const& arguments, vi
         state, view, arguments.durability, arguments.count, 1, graph_write_schedule(view),
         [&](call_access<cpu_class_> const& access) noexcept -> status_t {
             for (std::size_t index = 0; index != arguments.count; ++index) {
-                collection_id_t const collection = task_collection(collections, index);
+                collection_id_t const collection = collections[index];
                 stored_key_t const key = stored_of(vertices[index].uuid);
                 if (visible_vertex(access, collection, key)) continue;
                 if (!committed_vertex(access, collection, key))
@@ -499,8 +498,7 @@ status_t graph_remove_vertices(ustore_graph_remove_vertices_t const& arguments, 
                     if (!(half_edge.role & wanted) || half_edge.neighbor_id == vertex) continue;
                     half_edge_delta_t const removal = half_edge_delta_t::remove(vertex, half_edge.edge_id,
                                                                                 mirrored_role(half_edge.role));
-                    vertex_delta_t const filed {task_collection(collections, index), half_edge.neighbor_id, removal,
-                                                deltas.size()};
+                    vertex_delta_t const filed {collections[index], half_edge.neighbor_id, removal, deltas.size()};
                     if (status_t const kept = growth_status(deltas.push_back(vertex_delta_t {filed})); kept.failed())
                         return kept;
                 }
@@ -519,8 +517,7 @@ status_t graph_remove_vertices(ustore_graph_remove_vertices_t const& arguments, 
             // The removals go last, so one outranks a change this batch appended to a vertex it also removes
             for (std::size_t index = 0; index != count; ++index) {
                 if (!reads[index].present) continue;
-                if (status_t const removed = write_value(access, task_collection(collections, index), keys[index],
-                                                         value_view_t {});
+                if (status_t const removed = write_value(access, collections[index], keys[index], value_view_t {});
                     removed.failed())
                     return removed;
             }

@@ -164,7 +164,7 @@ class Table:
     def __init__(
         self,
         view: Receiver,
-        collection: UUID | str | None = None,
+        collection: UUID | str,
         *,
         index: Iterable[KeyLike] | None = None,
         columns: Iterable[str] | None = None,
@@ -252,7 +252,7 @@ class Table:
 
     def sample(self, count: int) -> Table:
         """A view of up to `count` documents drawn at random by the store."""
-        return self.derive(index=self.view.sample(count, Arena(), collection=self.collection)[0])
+        return self.derive(index=self.view.docs_sample(count, Arena(), collection=self.collection)[0])
 
     @property
     def loc(self) -> RowSelection:
@@ -400,7 +400,7 @@ class Table:
         view: Receiver,
         records: Sequence[Mapping[str, Any]],
         *,
-        collection: UUID | str | None = None,
+        collection: UUID | str,
         index: Iterable[KeyLike] | None = None,
     ) -> Table:
         """Writes one document per record, keyed by `index` or by position, and views the collection."""
@@ -414,7 +414,7 @@ class Table:
         view: Receiver,
         data: Mapping[str, Sequence[Any]],
         *,
-        collection: UUID | str | None = None,
+        collection: UUID | str,
         index: Iterable[KeyLike] | None = None,
     ) -> Table:
         """Writes one document per row of equally long columns, keyed by `index` or by position."""

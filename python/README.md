@@ -39,14 +39,15 @@ from ustore.table_view import Table
 
 with ustore.Database.open_ram() as database:
     arena = ustore.Arena()                              # host pages for calls on the calling thread
-    database.write([1, 2], [b"a", b"bb"])
-    values = database.read([1, 2], arena)               # Values, indexed as memoryviews over the arena
-    database.scan_batch([1, 100], 16, arena)            # Keys, rewinding the arena, so `values` goes stale
-    with database.cursor() as cursor:                   # a walk over the main collection, page by page
+    blobs = database.collection_create("blobs", modality=ustore.Modality.BLOBS)  # none exists until created
+    database.write([1, 2], [b"a", b"bb"], collection=blobs)
+    values = database.read([1, 2], arena, collection=blobs)  # Values, indexed as memoryviews over the arena
+    database.scan_batch([1, 100], 16, arena, collection=blobs)  # Keys, rewinding the arena: `values` goes stale
+    with database.cursor(collection=blobs) as cursor:   # a walk over one collection, page by page
         while page := cursor.next(1024, arena, values=True):
             list(page), page.values                     # UUID keys and their Values, in one call per page
 
-    people = database.collection_create("people")
+    people = database.collection_create("people", modality=ustore.Modality.DOCS)
     database.docs_write([10, 11], ['{"name": "Lex", "tweets": 2221}', '{"name": "Joe"}'], collection=people)
     database.docs_gist([10, 11], arena, collection=people)  # ("/name", "/tweets")
     types = [ustore.FieldType.STR, ustore.FieldType.I64]
@@ -60,7 +61,7 @@ with ustore.Database.open_ram() as database:
     neighborhoods = database.graph_read_edges([1, 2, 3], arena, role=ustore.Role.ANY, collection=follows)
     np.asarray(neighborhoods)                           # (edges, 3, 16) bytes of source, target, edge
 
-    database.get(1), 1 in database[""].blobs           # shorthand copies out of a one-off arena: b"a", True
+    database.get(1, collection=blobs), 1 in database["blobs"].blobs  # one-off arena copies: b"a", True
     graph = DiGraph(database, "graph", nodes="nodes", edges="edges")
     graph.add_edge(1, 2, weight=3)
     list(graph.edges(data=True))                        # [(UUID(int=1), UUID(int=2), {"weight": 3})]
@@ -85,25 +86,25 @@ async def main(directory, keys, key, payloads):
     with ustore.Executor.for_ram(8, deferred_limit=256) as executor:
         database = ustore.Database.open_rocksdb(directory, executor=executor)  # blocks on the executor
         arena = ustore.Arena(executor)                       # placed where the executor computes
-        values = database.on(executor).read(keys, arena)     # blocking, after every earlier submission
+        values = database.on(executor).read(keys, arena, collection="movies")  # blocking, after earlier submissions
         poster = database.on(executor)["movies"].blobs[key]  # shorthand, copied out of a one-off arena
 
         later = database.deferred(executor)
-        reading = later.read(keys, arena)                    # ustore.Deferred, submitted now, holding the arena
+        reading = later.read(keys, arena, collection="movies")  # ustore.Deferred, submitted now, holding the arena
         fetching = later["movies"].blobs[key]                # a Deferred owning its one-off arena
         reading.status                                       # ustore.Status.DEFERRED until final
         values = await reading                               # or: reading.wait()
         poster = await fetching                              # a missing key raises KeyError
 
         transaction = database.transaction(ustore.Watch.KEYS)
-        await transaction.deferred(executor).write(keys, payloads)
-        peek = transaction.unwatched().read(keys, arena)     # recorded for no conflict
+        await transaction.deferred(executor).write(keys, payloads, collection="movies")
+        peek = transaction.unwatched().read(keys, arena, collection="movies")  # recorded for no conflict
         read_stamp = transaction.stage()
         commit_stamp = await transaction.deferred(executor).commit(ustore.Durability.FLUSHED)
         transaction.close()
 
         with database.snapshot() as snapshot:
-            old = snapshot.read(keys, arena)
+            old = snapshot.read(keys, arena, collection="movies")
             old_poster = snapshot["movies"].blobs[key]
             snapshot.read_stamp                              # sees every commit stamp at or below it
         executor.drain(ustore.Mood.SPINNING)
@@ -120,7 +121,7 @@ async def fan_out(database, executor, keys, key, sources, targets):
     later, types = database.deferred(executor), [ustore.FieldType.STR, ustore.FieldType.I64]
     gathering = later.docs_gather(keys, ["name", "tweets"], types, ustore.Arena(executor), collection="people")
     linking = later.graph_write_edges(sources, targets, collection="follows")
-    present = later.contains(key)                            # Deferred[bool], since `key in ...` must answer a bool
+    present = later.contains(key, collection="movies")       # Deferred[bool], since `key in ...` must answer a bool
     document = later["people"].docs[key]                     # Deferred of the parsed document
     edges = later["follows"].graph.read_edges(keys)          # Deferred[Neighborhoods] over a one-off arena
     return await gathering, await linking, await present, await document, await edges
@@ -196,10 +197,10 @@ A stale result raises `UninitializedError` when indexed, exported or asked for i
 ```python
 arena = ustore.Arena()
 for batch in batches:
-    values = database.read(batch, arena)                # rewinds: the last batch's values are gone
+    values = database.read(batch, arena, collection="movies")  # rewinds: the last batch's values are gone
     total += sum(length or 0 for length in values.lengths)
-held = database.read(keys, arena)[0]                    # a memoryview, pinning the arena
-database.read(keys, ustore.Arena())                     # another arena serves the next call meanwhile
+held = database.read(keys, arena, collection="movies")[0]  # a memoryview, pinning the arena
+database.read(keys, ustore.Arena(), collection="movies")  # another arena serves the next call meanwhile
 held.release()                                          # and this one serves calls again
 ```
 
@@ -258,15 +259,16 @@ An argument of the wrong Python type raises `TypeError`, and a snapshot refuses 
 
 ## Binary Values
 
-`write`, `set`, `read`, `get`, `contains` and `remove` address binary values by key, while `scan`, `sample` and `measure` walk them.
+`write`, `set`, `read`, `get`, `contains` and `remove` address binary values by key, while `scan`, `sample` and `measure` walk them, each in the blobs collection its `collection=` names.
 A write takes one bytes-like value per key, one value broadcast to every key, or a tape, and borrows every value for the length of the call rather than copying it:
 
 ```python
-database.write(keys, [b"a", b"bb", b"ccc"])            # one value per key, read by an accessor
-database.write(keys, b"same")                           # one value every key repeats
-database.write(keys, pyarrow.array([b"a", b"bb", b"ccc"]))  # an Arrow binary array, passed as its u32 tape
-database.write(keys, (data, np.array([0, 1, 3, 6], dtype=np.uint64)))  # bytes and their offsets, a u64 tape
-database.write(other_keys, database.read(keys, arena))  # a read's Values, written back as the tape it is
+posters = database.collection_create("posters", modality=ustore.Modality.BLOBS)
+database.write(keys, [b"a", b"bb", b"ccc"], collection=posters)  # one value per key, read by an accessor
+database.write(keys, b"same", collection=posters)       # one value every key repeats
+database.write(keys, pyarrow.array([b"a", b"bb", b"ccc"]), collection=posters)  # an Arrow binary array, a u32 tape
+database.write(keys, (data, np.array([0, 1, 3, 6], dtype=np.uint64)), collection=posters)  # bytes and offsets, u64
+database.write(other_keys, database.read(keys, arena, collection=posters), collection=posters)  # a read, as a tape
 ```
 
 A tape is an Arrow `binary`, `large_binary`, `string` or `large_string` array, or a `(data, offsets)` tuple of buffers whose offsets are unsigned 32-bit or 64-bit integers, one more than the values, climbing within the data.
@@ -277,7 +279,7 @@ A read answers the tape the engine wrote, with 32-bit offsets while its bytes fi
 `scan_batch(starts, wanted, arena)` runs one scan per start in one call, and `sample_batch(count, wanted, arena)` draws `count` samples, all from the one collection `collection=` names, every one held to the same `wanted`, which is what the C ABI takes; `scan` and `sample` remain the single forms.
 `measure(start, end, arena)` answers a `Measurement` of the bounds on the entries, the bytes of their values and the space they take, without walking the range.
 
-`cursor(start=0, *, collection=None)` opens a walk over the keys of one collection, and its `next(wanted, arena, *, values=False)` pulls the next page into the arena that pull names, with the values of its keys in the same call when asked:
+`cursor(start=0, *, collection)` opens a walk over the keys of one collection, and its `next(wanted, arena, *, values=False)` pulls the next page into the arena that pull names, with the values of its keys in the same call when asked:
 
 ```python
 arena = ustore.Arena()
@@ -313,7 +315,7 @@ An edge is a source, a target and an optional identifier, so distinct identifier
 Every C enum a caller meets is an `enum.IntEnum` of `ustore`: `Status`, `Mood`, `Watch`, `Durability`, `DropMode`, `ScanMode`, `Modality`, `Isolation`, `Transport`, `Engine`, `Role`, `FieldType` and `Modification`.
 The module builds each one at import through the C `_name` functions, valued as the enumerators and named by their canonical spellings in upper case, dashes as underscores, so "strict-serializable" is `Isolation.STRICT_SERIALIZABLE` and "read-only" is `Status.READ_ONLY`.
 A verb takes any `int` that is an enumerator, refusing a bool, which would read as zero or one, and text.
-`Error.status` and `Deferred.status` are `Status` members, `measure()` answers a `Measurement` struct sequence, `database.capabilities` a `Capabilities` one of `transactions`, `collections` and `snapshots`, and `Columns.types` holds `FieldType` members.
+`Error.status` and `Deferred.status` are `Status` members, `measure()` answers a `Measurement` struct sequence, `database.capabilities` a `Capabilities` one of `transactions` and `snapshots`, and `Columns.types` holds `FieldType` members.
 
 `describe()` answers a `Description` struct sequence of the `capabilities`, the `engine`, the `isolation`, and the `keys`, `memory_bytes` and `disk_bytes` the engine estimates, zero where it keeps no estimate.
 `clear(mode)` empties every collection at once, as `collection_drop` empties one, and `compact()` reclaims the space overwritten and removed data takes, one collection at a time.
@@ -328,10 +330,11 @@ with database.snapshot() as snapshot:
 ```
 
 Every other field of the C ABI's argument structs that a caller chooses, such as `collection`, `durability` or `role`, is a keyword, while a verb whose only option is a mode, such as `transaction(watch)`, `commit(durability)`, `drain(mood)` or `collection_drop(collection, mode)`, takes it by position too.
-A collection is a `uuid.UUID` identifier, a name resolved on the calling thread, or `None` for the main one, and `database["movies"]` answers a `Collection` whose `blobs`, `docs`, `graph` and `table` views create it on their first write.
+No collection exists until `collection_create(name, modality=...)` makes it to hold one modality, and names starting with `_` are reserved for the system collections, which no listing shows.
+Every verb names its collection as a `uuid.UUID` identifier or a name resolved on the calling thread, and `database["movies"]` answers a `Collection` whose `blobs`, `docs`, `graph` and `table` views create it on their first write.
 
 ```python
-database.set(key, value, durability=ustore.Durability.FLUSHED)
+database.set(key, value, collection="movies", durability=ustore.Durability.FLUSHED)
 database.collection_drop("movies", ustore.DropMode.PAIRS)
 ```
 

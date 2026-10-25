@@ -485,7 +485,7 @@ class nvme_store {
     /** The bounds this collection was mounted with. */
     [[nodiscard]] collection_config_t const& config() const noexcept { return runs_.config(); }
 
-    /** The tree the flushed writes live in, which a database compacts and names in its catalog under its writer. */
+    /** The tree the flushed writes live in, which a database compacts and names in its schema under its writer. */
     [[nodiscard]] tree_t& tree() noexcept { return runs_.tree(); }
 
     /** The tree the flushed writes live in. */

@@ -272,11 +272,11 @@ mod tests {
     use super::*;
     use crate::db::{Database, DropMode, Durability, Executor, RAMOptions, Watch};
 
-    /// A database whose catalog holds three named collections.
-    fn cataloged() -> (Database, Arena) {
+    /// A database holding three named collections.
+    fn three_named() -> (Database, Arena) {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         for name in ["people", "places", "planets"] {
-            database.collection_create(name, Modality::Any).unwrap();
+            database.collection_create(name, Modality::Blobs).unwrap();
         }
         (database, Arena::new().unwrap())
     }
@@ -289,7 +289,7 @@ mod tests {
 
     #[test]
     fn names_walk_in_the_order_of_their_text() {
-        let (database, mut arena) = cataloged();
+        let (database, mut arena) = three_named();
         let names = database.head().collection_names("", None, 10, &mut arena).unwrap();
         assert_eq!(names.len(), 3);
         assert!(!names.is_empty());
@@ -300,7 +300,7 @@ mod tests {
 
     #[test]
     fn names_walk_under_a_prefix_and_resume_from_a_start() {
-        let (database, mut arena) = cataloged();
+        let (database, mut arena) = three_named();
         let under = database.head().collection_names("pl", None, 10, &mut arena).unwrap();
         assert_eq!(under.iter().collect::<Vec<&str>>(), vec!["places", "planets"]);
 
@@ -319,24 +319,24 @@ mod tests {
     }
 
     #[test]
-    fn a_dropped_name_leaves_the_catalog() {
-        let (database, mut arena) = cataloged();
+    fn a_dropped_name_leaves_the_listing() {
+        let (database, mut arena) = three_named();
         drop_named(&database, "places", &mut arena);
         let names = database.head().collection_names("", None, 10, &mut arena).unwrap();
         assert_eq!(names.iter().collect::<Vec<&str>>(), vec!["people", "planets"]);
     }
 
     #[test]
-    fn the_catalog_follows_the_view_it_is_read_through() {
+    fn names_follow_the_view_they_are_read_through() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new().unwrap();
         let snapshot = database.snapshot().unwrap();
-        let people = database.collection_create("people", Modality::Any).unwrap();
+        let people = database.collection_create("people", Modality::Blobs).unwrap();
 
         // The snapshot predates the binding, so only the head resolves the name.
         assert_eq!(
             database.head().collection_find("people", &mut arena).unwrap(),
-            (people, Modality::Any)
+            (people, Modality::Blobs)
         );
         assert_eq!(
             snapshot
@@ -354,13 +354,13 @@ mod tests {
             .view(Watch::Keys)
             .collection_find("planets", &mut arena)
             .is_err());
-        let planets = database.collection_create("planets", Modality::Any).unwrap();
+        let planets = database.collection_create("planets", Modality::Blobs).unwrap();
         assert_eq!(
             transaction
                 .view(Watch::Keys)
                 .collection_find("planets", &mut arena)
                 .unwrap(),
-            (planets, Modality::Any)
+            (planets, Modality::Blobs)
         );
         transaction.commit(Durability::Buffered).unwrap();
     }
@@ -369,8 +369,8 @@ mod tests {
     fn a_taken_name_is_refused_and_a_dropped_one_is_free() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new().unwrap();
-        let first = database.collection_create("people", Modality::Any).unwrap();
-        let taken = database.collection_create("people", Modality::Any).unwrap_err();
+        let first = database.collection_create("people", Modality::Blobs).unwrap();
+        let taken = database.collection_create("people", Modality::Blobs).unwrap_err();
         assert_eq!(taken.status, Status::AlreadyExists);
         drop_named(&database, "people", &mut arena);
         assert_eq!(
@@ -381,13 +381,23 @@ mod tests {
                 .status,
             Status::NotFound
         );
-        let second = database.collection_create("people", Modality::Any).unwrap();
+        let second = database.collection_create("people", Modality::Blobs).unwrap();
         assert_ne!(first, second);
+
+        // Names starting with `_` belong to the system collections, which no lookup or listing reaches.
+        let reserved = database.collection_create("_people", Modality::Blobs).unwrap_err();
+        assert_eq!(reserved.status, Status::InvalidArgument);
+        for system in ["_names", "_collections"] {
+            let lookup = database.head().collection_find(system, &mut arena).unwrap_err();
+            assert_eq!(lookup.status, Status::NotFound);
+        }
+        let names = database.head().collection_names("", None, 10, &mut arena).unwrap();
+        assert_eq!(names.iter().collect::<Vec<&str>>(), vec!["people"]);
     }
 
     #[test]
     fn names_resolve_through_a_deferred_view() {
-        let (database, mut arena) = cataloged();
+        let (database, mut arena) = three_named();
         let executor = Executor::for_ram(&[], 1, 0).unwrap();
         let deferred = database.head().deferred(&executor);
         let found = deferred
@@ -406,7 +416,7 @@ mod tests {
 
     #[test]
     fn names_walk_through_a_deferred_view() {
-        let (database, mut arena) = cataloged();
+        let (database, mut arena) = three_named();
         let executor = Executor::for_ram(&[], 1, 0).unwrap();
         let deferred = database.head().deferred(&executor);
         let listing = deferred

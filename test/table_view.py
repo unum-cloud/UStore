@@ -7,7 +7,7 @@ from uuid import UUID
 import numpy as np
 import pandas
 import pytest
-from capabilities import NEEDS_COLLECTIONS, key, keys
+from capabilities import key, keys
 from pandas.testing import assert_frame_equal, assert_series_equal
 
 from ustore import Modality
@@ -33,8 +33,8 @@ def frame(rows: dict[str, list], integers: list[int], dtypes: dict[str, str] | N
 
 
 @pytest.fixture
-def people(view) -> Table:
-    return Table.from_records(view, PEOPLE)
+def people(view, docs) -> Table:
+    return Table.from_records(view, PEOPLE, collection=docs)
 
 
 # region Exports
@@ -81,16 +81,16 @@ def test_text_columns(people, dtype: str):
 
 
 @pytest.mark.parametrize("dtype", [*INTEGER_DTYPES, "float64", "bool"])
-def test_missing_values_mask_a_typed_column(view, dtype: str):
-    Table.from_records(view, [{"v": 1}, {"other": 2}, {"v": 0}])
-    column = Table(view).astype({"v": dtype}).to_pandas()["v"]
+def test_missing_values_mask_a_typed_column(view, docs, dtype: str):
+    Table.from_records(view, [{"v": 1}, {"other": 2}, {"v": 0}], collection=docs)
+    column = Table(view, docs).astype({"v": dtype}).to_pandas()["v"]
     assert column.isna().tolist() == [False, True, False]
     assert column.iloc[0] == 1 and column.iloc[2] == 0
 
 
-def test_nested_fields_are_json_pointers(view):
-    Table.from_records(view, [{"user": {"name": "Lex", "id": 7}}, {"user": {"name": "Joe", "id": 8}}])
-    table = Table(view)
+def test_nested_fields_are_json_pointers(view, docs):
+    Table.from_records(view, [{"user": {"name": "Lex", "id": 7}}, {"user": {"name": "Joe", "id": 8}}], collection=docs)
+    table = Table(view, docs)
     assert table.columns == ["/user/name", "/user/id"]
     exported = table.astype({"/user/id": "int64"}).to_pandas()
     assert exported["/user/name"].tolist() == ["Lex", "Joe"]
@@ -161,8 +161,8 @@ def test_to_json(people, tmp_path, destination: str):
     ],
     ids=["ragged", "rectangular", "single", "none"],
 )
-def test_shape_size_and_emptiness(view, records: list[dict], shape: tuple[int, int]):
-    table = Table.from_records(view, records)
+def test_shape_size_and_emptiness(view, docs, records: list[dict], shape: tuple[int, int]):
+    table = Table.from_records(view, records, collection=docs)
     assert table.shape == shape
     assert table.size == shape[0] * shape[1]
     assert table.empty == (0 in shape)
@@ -175,12 +175,12 @@ def test_head(people, count: int):
 
 
 @pytest.mark.parametrize("count", [1, 3, 7])
-def test_sample(view, count: int):
+def test_sample(view, docs, count: int):
     records = [
         {"name": name, "tweets": index}
         for index, name in enumerate(["Lex", "Andrew", "Joe", "Charls", "Carl", "Jack", "Fred"])
     ]
-    table = Table.from_records(view, records).astype({"name": "str", "tweets": "int64"})
+    table = Table.from_records(view, records, collection=docs).astype({"name": "str", "tweets": "int64"})
     for _ in range(5):
         drawn = table.sample(count).to_pandas()
         assert len(drawn) <= count
@@ -203,8 +203,8 @@ def test_rejects_an_unknown_dtype(people):
     [[b"Fridman", b"Rogan"], ["Fridman", "Rogan"], np.array(["Fridman", "Rogan"])],
     ids=["bytes", "str", "numpy"],
 )
-def test_assigning_a_column(view, values):
-    table = Table.from_records(view, [{"name": "Lex"}, {"name": "Joe"}])
+def test_assigning_a_column(view, docs, values):
+    table = Table.from_records(view, [{"name": "Lex"}, {"name": "Joe"}], collection=docs)
     table["lastname"] = values
     assert table.astype("str").to_pandas().to_dict(orient="records") == [
         {"name": "Lex", "lastname": "Fridman"},
@@ -253,12 +253,11 @@ def test_updating_several_selected_rows_at_once(people):
     assert people["verified"].tolist() == [True, None, True]
 
 
-@NEEDS_COLLECTIONS
-def test_updating_a_missing_row_of_a_collection_by_id(database, view):
+def test_updating_a_missing_row_of_a_collection_by_id(database, docs, view):
     availability = database.collection_create("availability", modality=Modality.DOCS)
     Table(view, availability).loc[[key(7)]].update({"quantity": 100})
     assert Table(view, availability).to_pandas().to_dict(orient="records") == [{"quantity": 100}]
-    assert Table(view).empty
+    assert Table(view, docs).empty
 
 
 @pytest.mark.parametrize(
@@ -271,30 +270,31 @@ def test_drop(people, dropped):
     exported = typed.to_pandas()
     for column in ["name", "lastname", "tweets"]:
         assert exported[column].isna().all() == (column in names)
-    assert Table(people.view).columns == [column for column in ["name", "lastname", "tweets"] if column not in names]
+    assert Table(people.view, people.collection).columns == [
+        column for column in ["name", "lastname", "tweets"] if column not in names
+    ]
 
 
-def test_drop_skips_rows_without_the_column(view):
-    table = Table.from_records(view, [{"name": "Lex", "tweets": 0}, {"name": "Joe"}])
+def test_drop_skips_rows_without_the_column(view, docs):
+    table = Table.from_records(view, [{"name": "Lex", "tweets": 0}, {"name": "Joe"}], collection=docs)
     table.drop("tweets")
     assert table.columns == ["name"]
 
 
-def test_rename(view):
+def test_rename(view, docs):
     data = [{"col1": 3, "col2": "a"}, {"col1": 2, "col2": "b"}, {"col1": 1}]
-    table = Table.from_records(view, data)
+    table = Table.from_records(view, data, collection=docs)
     table.rename({"col1": "column_1", "col2": "column_2"})
     assert table.columns == ["column_1", "column_2"]
     assert table.astype({"column_1": "int64"}).to_pandas()["column_1"].tolist() == [3, 2, 1]
     assert table.to_pandas()["column_2"].tolist()[:2] == ["a", "b"]
 
 
-@NEEDS_COLLECTIONS
 def test_merge_from(database):
     first = Table.from_records(
         database,
         [{"name": "Lex", "tweets": 0}, {"name": "Andrew", "tweets": 1}, {"name": "Joe", "tweets": 2}],
-        collection=database.collection_create("first"),
+        collection=database.collection_create("first", modality=Modality.DOCS),
     )
     second = Table.from_records(
         database,
@@ -303,7 +303,7 @@ def test_merge_from(database):
             {"name": "Charls", "lastname": "Huberman"},
             {"name": "Carl", "lastname": "Rogan", "tweets": 3},
         ],
-        collection=database.collection_create("second"),
+        collection=database.collection_create("second", modality=Modality.DOCS),
         index=[0, 1, 3],
     )
     first.merge_from(second)
@@ -323,9 +323,9 @@ def test_merge_from(database):
 
 
 @pytest.mark.parametrize("index", [None, [10, 20, 30, 40]], ids=["positions", "keys"])
-def test_from_dict(view, index: list[int] | None):
+def test_from_dict(view, docs, index: list[int] | None):
     data = {"col1": [3, 2, 1, 0], "col2": ["a", "b", "c", "d"]}
-    table = Table.from_dict(view, data, index=index)
+    table = Table.from_dict(view, data, index=index, collection=docs)
     assert table.index == keys(index or [0, 1, 2, 3])
     assert_frame_equal(
         table.to_pandas(), pandas.DataFrame(data, index=pandas.Index(keys(index or [0, 1, 2, 3]), dtype=object))
@@ -333,15 +333,15 @@ def test_from_dict(view, index: list[int] | None):
 
 
 @pytest.mark.parametrize("dtype", ["int64", "uint8", "float32"])
-def test_from_records_with_numpy_scalars(view, dtype: str):
+def test_from_records_with_numpy_scalars(view, docs, dtype: str):
     values = np.array([3, 2, 1], dtype=dtype)
-    table = Table.from_records(view, [{"v": value} for value in values])
+    table = Table.from_records(view, [{"v": value} for value in values], collection=docs)
     assert table.astype({"v": dtype}).to_pandas()["v"].tolist() == values.tolist()
 
 
-def test_from_dict_rejects_ragged_columns(view):
+def test_from_dict_rejects_ragged_columns(view, docs):
     with pytest.raises(ValueError):
-        Table.from_dict(view, {"col1": [1, 2], "col2": [1]})
+        Table.from_dict(view, {"col1": [1, 2], "col2": [1]}, collection=docs)
 
 
 # endregion Construction

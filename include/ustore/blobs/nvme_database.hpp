@@ -5,15 +5,15 @@
  *  @brief Databases of named collections, with their snapshots, their optimistic transactions, and the registries
  *      and read sets that order and check those transactions.
  *
- *  A database is a catalog and nothing else: it resolves a name to a collection, hands that collection
- *  a channel, and persists the mapping as one named blob of a volume so a reopen finds the same names.
+ *  A database is a list of collections and nothing else: it resolves a name to a collection, hands that collection
+ *  a channel, and persists the list as one named schema blob of a volume so a reopen finds the same names.
  *  Every byte of data belongs to the collection below it, and every conflict belongs to the registry
  *  beside it; what is left is placement, naming and the order the two are changed in. One claim guards every
- *  call that changes the catalog, a tree or a blob, since flushes, compactions and catalog saves are serialized by
+ *  call that changes the collections, a tree or a blob, since flushes, compactions and schema saves are serialized by
  *  it; commits land through the ledger's sequencer and take it only to pay for the maintenance they made due. A read
  *  takes no claim: a collection publishes immutable views a reader walks inside its ledger's epochs, the entries are
- *  pinned on the heap, and the catalog is one more immutable view published the same way and freed by whoever
- *  replaces it, once its readers left.
+ *  pinned on the heap, and the list of collections is one more immutable view published the same way and freed by
+ *  whoever replaces it, once its readers left.
  *
  *  A snapshot copies no run and moves no byte: it pins the stamp the ledger last published, which every merge
  *  keeps the versions of, and reads through whatever view each collection publishes. Every commit ordered at or
@@ -1263,8 +1263,8 @@ class database_transaction {
         /** The value widths that collection admits, which every write of it is checked against. */
         value_widths_t widths {};
 
-        /** The catalog version the answer was read at, which a create and a drop both move past. */
-        std::uint64_t catalog_version = 0;
+        /** The version of the collections the answer was read at, which a create and a drop both move past. */
+        std::uint64_t collections_version = 0;
     };
 
 #pragma endregion Private Types
@@ -1278,18 +1278,18 @@ class database_transaction {
     [[nodiscard]] store_t& store_() const noexcept { return *manager_.store_; }
 
     /**
-     *  @brief What @p id resolves to, taken from the last answer while the catalog has not moved.
+     *  @brief What @p id resolves to, taken from the last answer while the collections have not moved.
      *  @param[in] id The collection to resolve, named by its ID or by its name.
      *  @return Its ID and its widths, the ID invalid when the store names no such collection.
      *
-     *  @note One catalog lookup answers both, and a run of calls over one collection takes one lookup
+     *  @note One collection lookup answers both, and a run of calls over one collection takes one lookup
      *      rather than one per key; a create or a drop moves the version and the next call reads again.
      */
     [[nodiscard]] resolved_collection_t resolve_(any_collection_id_t const& id) noexcept {
-        std::uint64_t const version = store_().catalog_version();
+        std::uint64_t const version = store_().collections_version();
         collection_id_t const* const identified = std::get_if<collection_id_t>(&id);
         if (identified != nullptr && resolved_.id != collection_invalid_id_k && *identified == resolved_.id &&
-            version == resolved_.catalog_version)
+            version == resolved_.collections_version)
             return resolved_;
 
         collection_id_t collection_id = collection_invalid_id_k;
@@ -1298,7 +1298,7 @@ class database_transaction {
         resolved_.id = collection_id;
         resolved_.widths = value_widths_t {shape.lsm_tree.lsm_level_0.sorted_run.value_size,
                                            shape.lsm_tree.lsm_level_0.sorted_run.value_max_size};
-        resolved_.catalog_version = version;
+        resolved_.collections_version = version;
         return resolved_;
     }
 
@@ -1401,7 +1401,7 @@ class database_transaction {
 
 #pragma region Schema
 
-/** The layout the catalog blob follows, which a database of another version refuses to open. */
+/** The layout the schema blob follows, which a database of another version refuses to open. */
 inline constexpr std::uint64_t database_schema_version_k = 2;
 
 /** @p text as the bytes a volume names a blob by, without its terminator. */
@@ -1411,25 +1411,25 @@ template <std::size_t length_>
 }
 
 /**
- *  @brief What every copy of a catalog carries besides its collections: which copy is newer and what it promises.
+ *  @brief What every copy of a schema carries besides its collections: which copy is newer and what it promises.
  *
- *  A catalog is saved to its two copies in turn, so replacing one never leaves a mount without the other.
+ *  A schema is saved to its two copies in turn, so replacing one never leaves a mount without the other.
  */
-struct catalog_stamps_t {
+struct schema_stamps_t {
 
-    /** How many times the catalog has been saved, of which the higher copy is the one a mount reads. */
+    /** How many times the schema has been saved, of which the higher copy is the one a mount reads. */
     std::uint64_t generation = 0;
 
     /** Every commit at or below this is wholly in the runs the copy names, and a mount drops every one above. */
     transaction_stamp_t durable = unwritten_stamp_k;
 };
 
-/** Which of the two copies of a catalog the save of @p generation replaces. */
-[[nodiscard]] constexpr std::size_t catalog_copy_of(std::uint64_t generation) noexcept {
+/** Which of the two copies of a schema the save of @p generation replaces. */
+[[nodiscard]] constexpr std::size_t schema_copy_of(std::uint64_t generation) noexcept {
     return static_cast<std::size_t>(generation % 2);
 }
 
-/** The name copy @p copy of the catalog of a database is stored under, on whichever volume placement gave it. */
+/** The name copy @p copy of the schema of a database is stored under, on whichever volume placement gave it. */
 [[nodiscard]] inline blob_name_t database_schema_name(std::size_t copy) noexcept {
     return copy == 0 ? blob_name_of("ustore.database.schema.0") : blob_name_of("ustore.database.schema.1");
 }
@@ -1441,14 +1441,14 @@ struct catalog_stamps_t {
 inline constexpr std::size_t collection_name_max_bytes_k = 64;
 
 /**
- *  @brief One collection as the catalog blob names it, which is all a mount needs to open it again.
+ *  @brief One collection as the schema blob names it, which is all a mount needs to open it again.
  *
  *  Every field is stored as it lies, so the image is the object representation and no field of it is
  *  ever read through a pointer the layout did not align.
  */
 struct collection_record_t {
 
-    /** The UUID the catalog, every commit and the C ABI address the collection by. */
+    /** The UUID the schema, every commit and the C ABI address the collection by. */
     collection_id_t id = collection_invalid_id_k;
 
     /** How fast the bytes a level admits grow with its number. */
@@ -1505,7 +1505,7 @@ struct collection_record_t {
 #pragma region Database
 
 /**
- *  @brief The claim a database's maintenance, catalog and blob writes run under, which callers park on rather than
+ *  @brief The claim a database's maintenance, schema and blob writes run under, which callers park on rather than
  *      spin on, so a caller parked on one holder wakes once that holder lets it go, whoever takes it next.
  *
  *  The claim is one word kept as the epoch clock of ForkUnion's @c flat_pool: @b odd while held and @b even while
@@ -1570,7 +1570,7 @@ class maintenance_claim {
 
 /**
  *  @brief What a database asks of the store one collection lives in: which collections it keeps, its mount, its
- *      reads, the steps of a commit, its maintenance and the runs a catalog names.
+ *      reads, the steps of a commit, its maintenance and the runs a schema names.
  *
  *  A scan walks the store through the @c nvme_store_cursor its key slot and fold name.
  */
@@ -1619,7 +1619,7 @@ concept nvme_store_concept = requires(
 };
 
 /**
- *  @brief Named collections of one database, the catalog that resolves them and the transactions they share.
+ *  @brief Named collections of one database, the schema that resolves them and the transactions they share.
  *  @tparam stored_key_ The key every collection of this database is addressed by.
  *  @tparam volume_type_ The volume every run of every collection lives on.
  *  @tparam stores_ The stores a collection may live in, of which a create and a mount take the first that serves its
@@ -1675,17 +1675,17 @@ class basic_database {
     /** One collection, held by the store its modality and value layout picked when it was created. */
     using any_collection_t = std::variant<stores_...>;
 
-    /** One entry of the catalog: what a collection is called, how it is shaped, and the collection itself. */
+    /** One entry of the schema: what a collection is called, how it is shaped, and the collection itself. */
     struct collection_entry_t {
 
-        /** The UUID the catalog, every commit and the C ABI address this collection by. */
+        /** The UUID the schema, every commit and the C ABI address this collection by. */
         collection_id_t id = collection_invalid_id_k;
 
         /** The name a caller reaches this collection by. */
         string_t name;
 
         /** What this collection holds, which with its value layout picked its store. */
-        ustore_modality_t modality = ustore_modality_any_k;
+        ustore_modality_t modality {};
 
         /** The bounds this collection was mounted with. */
         collection_config_t config {};
@@ -1713,7 +1713,7 @@ class basic_database {
     ~basic_database() noexcept { [[maybe_unused]] status_t const closed = unmount(); }
 
     /**
-     *  @brief Opens every collection @p router already names, or starts an empty catalog.
+     *  @brief Opens every collection @p router already names, or starts an empty schema.
      *  @param[inout] router The volumes every run lands on, borrowed and outliving the database.
      *  @param[inout] channels The queue pairs every call borrows one of, borrowed and outliving the database.
      *  @param[in] config The delta bounds a transaction takes when its caller names none.
@@ -1723,9 +1723,9 @@ class basic_database {
         router_ = &router;
         channels_ = &channels;
         config_ = config;
-        status_t const opened = open_catalog_();
+        status_t const opened = open_schema_();
         if (opened.failed()) {
-            // A catalog this database could not open stays as it lies, never saved again without what it missed.
+            // A schema this database could not open stays as it lies, never saved again without what it missed.
             collections_.clear();
             router_ = nullptr;
             channels_ = nullptr;
@@ -1734,7 +1734,7 @@ class basic_database {
     }
 
     /**
-     *  @brief Flushes every collection, rewrites the catalog and lets every collection go.
+     *  @brief Flushes every collection, rewrites the schema and lets every collection go.
      *
      *  @note The router and the channels are still needed here, so this runs before the mount underneath
      *      is torn down; the destructor calls it for a caller that did not.
@@ -1755,10 +1755,10 @@ class basic_database {
                 if (status_t const saved = save_schema_(claimed->channel()); saved.failed() && first.succeeded())
                     first = saved;
             }
-            // The entries outlive the publication that stops naming them, which waits out every reader of the catalog
-            // it replaced.
+            // The entries outlive the publication that stops naming them, which waits out every reader of the
+            // collections it replaced.
             st::basic_vector<entry_pointer_t> released = std::move(collections_);
-            [[maybe_unused]] status_t const emptied = publish_catalog_();
+            [[maybe_unused]] status_t const emptied = publish_collections_();
         }
         router_ = nullptr;
         channels_ = nullptr;
@@ -1772,26 +1772,26 @@ class basic_database {
     /** Collections this database names right now. */
     [[nodiscard]] std::size_t size() noexcept {
         reader_t const inside = ledger_.epochs().enter();
-        return catalog_entries_().size();
+        return collection_entries_().size();
     }
 
     /** Whether @p id names a collection of this database. */
     [[nodiscard]] bool has_collection(any_collection_id_t const& id) noexcept {
         reader_t const inside = ledger_.epochs().enter();
-        return entry_at_in_(catalog_entries_(), id) != nullptr;
+        return entry_at_in_(collection_entries_(), id) != nullptr;
     }
 
     /** The ID @p id resolves to, or @c collection_invalid_id_k when it names nothing. */
     [[nodiscard]] collection_id_t collection_id(any_collection_id_t const& id) noexcept {
         reader_t const inside = ledger_.epochs().enter();
-        collection_entry_t const* const found = entry_at_in_(catalog_entries_(), id);
+        collection_entry_t const* const found = entry_at_in_(collection_entries_(), id);
         return found ? found->id : collection_invalid_id_k;
     }
 
     /** The name @p collection_id answers to, which is empty when it names nothing. */
     [[nodiscard]] string_t collection_name(collection_id_t collection_id) noexcept {
         reader_t const inside = ledger_.epochs().enter();
-        collection_entry_t const* const found = entry_with_id_in_(catalog_entries_(), collection_id);
+        collection_entry_t const* const found = entry_with_id_in_(collection_entries_(), collection_id);
         string_t name;
         if (found) { [[maybe_unused]] sz::status_t const copied = name.assign(found->name.view()); }
         return name;
@@ -1800,7 +1800,7 @@ class basic_database {
     /** The bounds @p collection_id was created with, which a transaction checks every write against. */
     status_t collection_config(collection_id_t collection_id, collection_config_t& config) noexcept {
         reader_t const inside = ledger_.epochs().enter();
-        collection_entry_t const* const found = entry_with_id_in_(catalog_entries_(), collection_id);
+        collection_entry_t const* const found = entry_with_id_in_(collection_entries_(), collection_id);
         if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
         config = found->config;
         return {};
@@ -1809,7 +1809,7 @@ class basic_database {
     /** What @p collection_id holds, which a copy of it is created with. */
     status_t collection_modality(collection_id_t collection_id, ustore_modality_t& modality) noexcept {
         reader_t const inside = ledger_.epochs().enter();
-        collection_entry_t const* const found = entry_with_id_in_(catalog_entries_(), collection_id);
+        collection_entry_t const* const found = entry_with_id_in_(collection_entries_(), collection_id);
         if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
         modality = found->modality;
         return {};
@@ -1824,25 +1824,25 @@ class basic_database {
     status_t resolve_collection(any_collection_id_t const& id, collection_id_t& collection_id,
                                 collection_config_t& config) noexcept {
         reader_t const inside = ledger_.epochs().enter();
-        collection_entry_t const* const found = entry_at_in_(catalog_entries_(), id);
+        collection_entry_t const* const found = entry_at_in_(collection_entries_(), id);
         collection_id = found ? found->id : collection_invalid_id_k;
         if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
         config = found->config;
         return {};
     }
 
-    /** How many times the catalog has been saved, whose @c catalog_copy_of names the copy a mount reads. */
-    [[nodiscard]] std::uint64_t catalog_generation() const noexcept { return generation_; }
+    /** How many times the schema has been saved, whose @c schema_copy_of names the copy a mount reads. */
+    [[nodiscard]] std::uint64_t schema_generation() const noexcept { return generation_; }
 
-    /** How many times the catalog has been published, which a memo of a lookup is checked against. */
-    [[nodiscard]] std::uint64_t catalog_version() const noexcept {
-        return atomic_reference_<std::uint64_t const> {catalog_version_}.load(std::memory_order_acquire);
+    /** How many times the collections have been published, which a memo of a lookup is checked against. */
+    [[nodiscard]] std::uint64_t collections_version() const noexcept {
+        return atomic_reference_<std::uint64_t const> {collections_version_}.load(std::memory_order_acquire);
     }
 
     /** The name and the number of every collection, which is short of the full list only when memory runs out. */
     [[nodiscard]] st::basic_vector<collection_ids_t> list_collections() noexcept {
         reader_t const inside = ledger_.epochs().enter();
-        std::span<collection_entry_t* const> const entries = catalog_entries_();
+        std::span<collection_entry_t* const> const entries = collection_entries_();
         st::basic_vector<collection_ids_t> listed;
         if (listed.reserve(entries.size()) != st::status_t::success_k) return listed;
         for (collection_entry_t const* entry : entries) {
@@ -1873,8 +1873,8 @@ class basic_database {
             return status_t {status_code_t::invalid_argument_k, "That ID names no collection"};
         expected<claimed_channel_t> claimed = claim_channel_();
         if (!claimed) return claimed.status();
-        if (entry_named_in_(catalog_entries_(), name) != nullptr ||
-            entry_with_id_in_(catalog_entries_(), collection_id) != nullptr)
+        if (entry_named_in_(collection_entries_(), name) != nullptr ||
+            entry_with_id_in_(collection_entries_(), collection_id) != nullptr)
             return status_t {status_code_t::already_exists_k, "The database already names that collection"};
 
         auto [placed, optimal_volume_status] = router_->optimal_volume(1);
@@ -1896,7 +1896,7 @@ class basic_database {
             collections_.erase(collections_.size() - 1);
             return saved;
         }
-        if (status_t const publication = publish_catalog_(); publication.failed()) {
+        if (status_t const publication = publish_collections_(); publication.failed()) {
             collections_.erase(collections_.size() - 1);
             return publication;
         }
@@ -1911,19 +1911,19 @@ class basic_database {
         if (position == collections_.size())
             return {status_code_t::not_found_k, "The database names no such collection"};
 
-        // The catalog stops naming the runs before a single one of them is handed back. The publication takes the
+        // The schema stops naming the runs before a single one of them is handed back. The publication takes the
         // leader word, which keeps a staged or combining commit from publishing into the collection meanwhile, and a
         // request still pending finds it gone; it returns once no reader is left in a view of the collection.
         entry_pointer_t doomed = std::move(collections_[position]);
         collections_.erase(position);
-        status_t const publication = publish_catalog_();
+        status_t const publication = publish_collections_();
         if (publication.failed()) {
             [[maybe_unused]] st::status_t const returned = collections_.push_back(std::move(doomed));
             return publication;
         }
         if (status_t const saved = save_schema_(claimed->channel()); saved.failed()) {
             [[maybe_unused]] st::status_t const returned = collections_.push_back(std::move(doomed));
-            [[maybe_unused]] status_t const restored = publish_catalog_();
+            [[maybe_unused]] status_t const restored = publish_collections_();
             return saved;
         }
         return std::visit([&](auto& held) noexcept { return held.destroy(claimed->channel()); }, doomed->held);
@@ -1937,7 +1937,7 @@ class basic_database {
     [[nodiscard]] std::uint64_t population_count() noexcept {
         reader_t const inside = ledger_.epochs().enter();
         std::uint64_t counted = 0;
-        for (collection_entry_t const* entry : catalog_entries_())
+        for (collection_entry_t const* entry : collection_entries_())
             counted += std::visit([](auto const& collection) noexcept { return collection.population_count(); },
                                   entry->held);
         return counted;
@@ -1947,7 +1947,7 @@ class basic_database {
     [[nodiscard]] std::uint64_t size_bytes() noexcept {
         reader_t const inside = ledger_.epochs().enter();
         std::uint64_t counted = 0;
-        for (collection_entry_t const* entry : catalog_entries_())
+        for (collection_entry_t const* entry : collection_entries_())
             counted += std::visit([](auto const& collection) noexcept { return collection.size_bytes(); }, entry->held);
         return counted;
     }
@@ -1955,7 +1955,7 @@ class basic_database {
     /** Bytes the largest value @p id admits takes, which is what a caller sizes a read buffer by. */
     [[nodiscard]] stored_value_size_t buffer_size_for_any_stored_value(any_collection_id_t const& id) noexcept {
         reader_t const inside = ledger_.epochs().enter();
-        collection_entry_t const* const found = entry_at_in_(catalog_entries_(), id);
+        collection_entry_t const* const found = entry_at_in_(collection_entries_(), id);
         if (!found) return 0;
         return std::visit([](auto const& collection) noexcept { return collection.value_max_size(); }, found->held);
     }
@@ -1972,7 +1972,7 @@ class basic_database {
                                        std::size_t thread_index = outside_executor_k) noexcept {
         size = 0;
         reader_t const inside = ledger_.epochs().enter(thread_index);
-        collection_entry_t const* const found = entry_at_in_(catalog_entries_(), id);
+        collection_entry_t const* const found = entry_at_in_(collection_entries_(), id);
         if (!found) return lookup_result_t::missing_k;
         return std::visit(
             [&]<typename store_type_>(store_type_ const& collection) noexcept {
@@ -2030,7 +2030,7 @@ class basic_database {
                     std::size_t thread_index = outside_executor_k) noexcept {
         size = 0;
         reader_t const inside = ledger_.epochs().enter(thread_index);
-        collection_entry_t* const found = entry_at_in_(catalog_entries_(), id);
+        collection_entry_t* const found = entry_at_in_(collection_entries_(), id);
         if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
         auto [channel, acquire_status] = channels_->acquire(thread_index);
         if (acquire_status.failed()) return acquire_status;
@@ -2057,7 +2057,7 @@ class basic_database {
                     std::span<lookup_result_t> results, sink_type_&& sink, transaction_stamp_t stamp = head_stamp_k,
                     std::size_t thread_index = outside_executor_k) noexcept {
         reader_t const inside = ledger_.epochs().enter(thread_index);
-        collection_entry_t const* const found = entry_at_in_(catalog_entries_(), id);
+        collection_entry_t const* const found = entry_at_in_(collection_entries_(), id);
         if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
         auto [channel, acquire_status] = channels_->acquire(thread_index);
         if (acquire_status.failed()) return acquire_status;
@@ -2095,7 +2095,7 @@ class basic_database {
             bool follows = false;
             {
                 reader_t const inside = ledger_.epochs().enter(thread_index);
-                collection_entry_t const* const found = entry_at_in_(catalog_entries_(), id);
+                collection_entry_t const* const found = entry_at_in_(collection_entries_(), id);
                 if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
                 status_t const read = std::visit(
                     [&]<typename store_type_>(store_type_ const& collection) noexcept -> status_t {
@@ -2187,7 +2187,7 @@ class basic_database {
                                                     collections_[index]->held);
                 flushed.failed() && first.succeeded())
                 first = flushed;
-        // Every run the flushes wrote is sealed by now, so the catalog may name them.
+        // Every run the flushes wrote is sealed by now, so the schema may name them.
         if (status_t const saved = save_schema_(claimed->channel()); saved.failed() && first.succeeded()) first = saved;
         return first;
     }
@@ -2195,7 +2195,7 @@ class basic_database {
     /** Whether any collection has a level over its bounds, which @c compact then merges. */
     [[nodiscard]] bool needs_compaction() noexcept {
         reader_t const inside = ledger_.epochs().enter();
-        for (collection_entry_t const* entry : catalog_entries_())
+        for (collection_entry_t const* entry : collection_entries_())
             if (std::visit([](auto const& collection) noexcept { return collection.needs_compaction(); }, entry->held))
                 return true;
         return false;
@@ -2236,7 +2236,7 @@ class basic_database {
     status_t maintain(collection_id_t collection_id) noexcept {
         {
             reader_t const inside = ledger_.epochs().enter();
-            collection_entry_t const* const found = entry_with_id_in_(catalog_entries_(), collection_id);
+            collection_entry_t const* const found = entry_with_id_in_(collection_entries_(), collection_id);
             if (!found ||
                 !std::visit([](auto const& collection) noexcept { return collection.maintenance_due(); }, found->held))
                 return {};
@@ -2251,7 +2251,7 @@ class basic_database {
     /** How many memory runs @p id's collection holds and how many commits they hold, or none for a missing one. */
     [[nodiscard]] memory_shape_t memory_shape(any_collection_id_t const& id) noexcept {
         reader_t const inside = ledger_.epochs().enter();
-        collection_entry_t const* const found = entry_at_in_(catalog_entries_(), id);
+        collection_entry_t const* const found = entry_at_in_(collection_entries_(), id);
         if (!found) return {};
         return std::visit([](auto const& collection) noexcept { return collection.memory_shape(); }, found->held);
     }
@@ -2285,7 +2285,7 @@ class basic_database {
     [[nodiscard]] bool written_since(collection_id_t collection_id, stored_key_t stored_key,
                                      transaction_stamp_t from) noexcept {
         reader_t const inside = ledger_.epochs().enter();
-        collection_entry_t const* const found = entry_with_id_in_(catalog_entries_(), collection_id);
+        collection_entry_t const* const found = entry_with_id_in_(collection_entries_(), collection_id);
         if (!found) return true;
         return std::visit(
             [&]<typename store_type_>(store_type_ const& collection) noexcept {
@@ -2300,7 +2300,7 @@ class basic_database {
     [[nodiscard]] bool range_written_since(collection_id_t collection_id, stored_key_t lower, stored_key_t upper,
                                            transaction_stamp_t from) noexcept {
         reader_t const inside = ledger_.epochs().enter();
-        collection_entry_t const* const found = entry_with_id_in_(catalog_entries_(), collection_id);
+        collection_entry_t const* const found = entry_with_id_in_(collection_entries_(), collection_id);
         if (!found) return true;
         return std::visit(
             [&]<typename store_type_>(store_type_ const& collection) noexcept {
@@ -2340,7 +2340,7 @@ class basic_database {
     status_t prepare_collection(collection_id_t collection_id,
                                 sealed_commit<stored_key_t, atomic_reference_>& sealed) noexcept {
         reader_t const inside = ledger_.epochs().enter();
-        collection_entry_t* const found = entry_with_id_in_(catalog_entries_(), collection_id);
+        collection_entry_t* const found = entry_with_id_in_(collection_entries_(), collection_id);
         if (!found) return {status_code_t::write_conflict_k, "A collection the transaction wrote is gone"};
         return std::visit(
             [&]<typename store_type_>(store_type_& collection) noexcept -> status_t {
@@ -2355,7 +2355,7 @@ class basic_database {
     void publish_collection(collection_id_t collection_id, sealed_commit<stored_key_t, atomic_reference_>& sealed,
                             transaction_stamp_t stamp) noexcept {
         reader_t const inside = ledger_.epochs().enter();
-        collection_entry_t* const found = entry_with_id_in_(catalog_entries_(), collection_id);
+        collection_entry_t* const found = entry_with_id_in_(collection_entries_(), collection_id);
         std::visit(
             [&]<typename store_type_>(store_type_& collection) noexcept {
                 if constexpr (keyed_by_database<store_type_>()) collection.publish(sealed, stamp);
@@ -2366,7 +2366,7 @@ class basic_database {
     /** Forgets the view @c prepare_collection laid out for a commit the leader refuses. */
     void forget_collection(collection_id_t collection_id) noexcept {
         reader_t const inside = ledger_.epochs().enter();
-        if (collection_entry_t* const found = entry_with_id_in_(catalog_entries_(), collection_id))
+        if (collection_entry_t* const found = entry_with_id_in_(collection_entries_(), collection_id))
             std::visit([](auto& collection) noexcept { collection.forget_prepared(); }, found->held);
     }
 
@@ -2377,7 +2377,7 @@ class basic_database {
     status_t visit_store(any_collection_id_t const& id, visitor_type_&& visitor,
                          std::size_t thread_index = outside_executor_k) noexcept {
         reader_t const inside = ledger_.epochs().enter(thread_index);
-        collection_entry_t* const found = entry_at_in_(catalog_entries_(), id);
+        collection_entry_t* const found = entry_at_in_(collection_entries_(), id);
         if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
         return std::visit(std::forward<visitor_type_>(visitor), found->held);
     }
@@ -2431,17 +2431,17 @@ class basic_database {
 
 #pragma region Private Types
 
-    /** One catalog entry, heap-pinned so a snapshot and a live transaction may name it. */
+    /** One schema entry, heap-pinned so a snapshot and a live transaction may name it. */
     using entry_pointer_t = std::unique_ptr<collection_entry_t>;
 
     /**
-     *  @brief One published catalog, naming every entry the database held when it was laid out.
+     *  @brief One published list of collections, naming every entry the database held when it was laid out.
      *
      *  A lookup that reads nothing but a name, an ID or a shape needs no claim: every entry is pinned on the heap, so
      *  a create and a drop publish only a new list naming them, and free the one it replaces once every reader that
      *  loaded it has left.
      */
-    struct catalog_view_t {
+    struct published_collections_t {
 
         /** The entries, in the order @c collections_ held them. */
         st::basic_vector<collection_entry_t*> entries;
@@ -2456,7 +2456,7 @@ class basic_database {
     /**
      *  @brief The database's one claim, held for the life of the guard.
      *
-     *  It orders whatever rewrites the catalog, a tree or a blob: creates, drops, the maintenance commits pay for, the
+     *  It orders whatever rewrites the schema, a tree or a blob: creates, drops, the maintenance commits pay for, the
      *  explicit flushes and compactions, and the caller's own blob. No read takes it. A commit takes it once it landed,
      *  or returns at once when another caller has it, since every holder looks at the views again after it lets go.
      */
@@ -2541,39 +2541,41 @@ class basic_database {
     }
 
     /**
-     *  @brief The entries of the catalog published last, empty before the mount publishes one.
+     *  @brief The entries of the collections published last, empty before the mount publishes them.
      *  @note A caller inside the ledger's epochs walks them until it leaves; one holding the claim reads them in step
      *      with @c collections_, since only a claim holder publishes.
      */
-    [[nodiscard]] std::span<collection_entry_t* const> catalog_entries_() const noexcept {
-        catalog_view_t const* const published = catalog_view_.load();
+    [[nodiscard]] std::span<collection_entry_t* const> collection_entries_() const noexcept {
+        published_collections_t const* const published = published_collections_.load();
         if (!published) return {};
         return published->entries;
     }
 
     /**
-     *  @brief Lays out a catalog naming every entry of @c collections_, publishes it under the leader word, and frees
+     *  @brief Lays out a list naming every entry of @c collections_, publishes it under the leader word, and frees
      *      the one it replaces as it lets the word go, once every reader that could hold it has left.
-     *  @note Only a caller holding the claim and inside no epoch publishes, so an entry the new catalog no longer names
+     *  @note Only a caller holding the claim and inside no epoch publishes, so an entry the new list no longer names
      *      may be destroyed as soon as this returns.
      */
-    status_t publish_catalog_() noexcept {
-        std::unique_ptr<catalog_view_t> next {new (std::nothrow) catalog_view_t {}};
+    status_t publish_collections_() noexcept {
+        std::unique_ptr<published_collections_t> next {new (std::nothrow) published_collections_t {}};
         if (!next || next->entries.reserve(collections_.size()) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "No room to publish the catalog"};
+            return {status_code_t::out_of_memory_k, "No room to publish the collections"};
         for (entry_pointer_t const& entry : collections_) [[maybe_unused]]
             st::status_t const named = next->entries.push_back(st::assume_reserved, entry.get());
         ledger_.lead();
-        atomic_reference_<std::uint64_t> const version {catalog_version_};
+        atomic_reference_<std::uint64_t> const version {collections_version_};
         version.store(version.load(std::memory_order_relaxed) + 1, std::memory_order_release);
-        catalog_view_.replace(*next);
-        if (catalog_view_t* const older = std::exchange(catalog_, std::move(next)).release())
-            ledger_.unpublish(older->unpublished, older, &destroy_catalog_);
+        published_collections_.replace(*next);
+        if (published_collections_t* const older = std::exchange(latest_collections_, std::move(next)).release())
+            ledger_.unpublish(older->unpublished, older, &destroy_collections_);
         ledger_.stop_leading();
         return {};
     }
 
-    static void destroy_catalog_(void* catalog) noexcept { delete static_cast<catalog_view_t*>(catalog); }
+    static void destroy_collections_(void* collections) noexcept {
+        delete static_cast<published_collections_t*>(collections);
+    }
 
     /** The entry @p collection_id names in @p entries, or null when they name none. */
     [[nodiscard]] static collection_entry_t* entry_with_id_in_(std::span<collection_entry_t* const> entries,
@@ -2629,7 +2631,7 @@ class basic_database {
         head.store = this;
         {
             reader_t const inside = ledger_.epochs().enter();
-            collection_entry_t const* const found = entry_at_in_(catalog_entries_(), id);
+            collection_entry_t const* const found = entry_at_in_(collection_entries_(), id);
             if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
             head.id = found->id;
         }
@@ -2652,7 +2654,7 @@ class basic_database {
                         sealer_type_&& sealer) noexcept {
         {
             reader_t const inside = ledger_.epochs().enter();
-            collection_entry_t const* const found = entry_with_id_in_(catalog_entries_(), collection_id);
+            collection_entry_t const* const found = entry_with_id_in_(collection_entries_(), collection_id);
             if (!found) return {status_code_t::write_conflict_k, "A collection the transaction wrote is gone"};
             status_t const status = std::visit(
                 [&]<typename store_type_>(store_type_ const& collection) noexcept -> status_t {
@@ -2682,7 +2684,7 @@ class basic_database {
         for (;;) {
             {
                 reader_t const inside = ledger_.epochs().enter();
-                collection_entry_t const* const found = entry_with_id_in_(catalog_entries_(), collection_id);
+                collection_entry_t const* const found = entry_with_id_in_(collection_entries_(), collection_id);
                 if (!found) return {status_code_t::write_conflict_k, "A collection the transaction wrote is gone"};
                 memory_pressure_t const pressure = std::visit(
                     [&](auto const& collection) noexcept {
@@ -2710,7 +2712,7 @@ class basic_database {
         }
     }
 
-    /** Flushes @p collection's memory runs, saves the catalog naming the run, and compacts the tree for as long as the
+    /** Flushes @p collection's memory runs, saves the schema naming the run, and compacts the tree for as long as the
      *  flush left a level over its bounds, holding the claim. */
     template <typename collection_type_>
     status_t flush_and_compact_(collection_type_& collection) noexcept {
@@ -2755,10 +2757,10 @@ class basic_database {
         return first;
     }
 
-    /** Whether any collection the catalog names is due for a merge or a flush, read from the published views. */
+    /** Whether any collection the schema names is due for a merge or a flush, read from the published views. */
     [[nodiscard]] bool maintenance_due_() noexcept {
         reader_t const inside = ledger_.epochs().enter();
-        for (collection_entry_t const* entry : catalog_entries_())
+        for (collection_entry_t const* entry : collection_entries_())
             if (std::visit([](auto const& collection) noexcept { return collection.maintenance_due(); }, entry->held))
                 return true;
         return false;
@@ -2788,7 +2790,7 @@ class basic_database {
         return claimed_channel_t {std::move(claim), std::move(guard)};
     }
 
-    /** Where @p id sits in the catalog, or the catalog's size when it names nothing. */
+    /** Where @p id sits in the schema, or the schema's size when it names nothing. */
     [[nodiscard]] std::size_t position_at_(any_collection_id_t const& id) const noexcept {
         if (collection_id_t const* const identified = std::get_if<collection_id_t>(&id)) {
             for (std::size_t index = 0; index != collections_.size(); ++index)
@@ -2882,19 +2884,19 @@ class basic_database {
     }
 
     /**
-     *  @brief Writes the catalog out over its older copy, which every change to it does.
+     *  @brief Writes the schema out over its older copy, which every change to it does.
      *
      *  The durable stamp is read before the runs are listed: every commit at or below it is in some run already, and
      *  a run a flush adds in between only holds commits above it, which a mount of this copy drops.
      */
     status_t save_schema_(io_channel_t& channel) noexcept {
-        catalog_stamps_t stamps;
+        schema_stamps_t stamps;
         stamps.durable = ledger_.durable_stamp();
         stamps.generation = generation_ + 1;
         st::basic_vector<collection_record_t> records;
         st::basic_vector<lsm_tree_run_record_t> runs;
         if (records.reserve(collections_.size()) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "No room to lay the catalog out"};
+            return {status_code_t::out_of_memory_k, "No room to lay the schema out"};
         for (std::size_t index = 0; index != collections_.size(); ++index) {
             collection_entry_t const& entry = *collections_[index];
             collection_record_t record;
@@ -2906,7 +2908,7 @@ class basic_database {
                 return named;
             record.run_count = runs.size() - named_before;
             if (entry.name.size() > collection_name_max_bytes_k)
-                return {status_code_t::capacity_exhausted_k, "A collection name outgrew the catalog's record"};
+                return {status_code_t::capacity_exhausted_k, "A collection name outgrew the schema's record"};
             std::memcpy(record.name_storage.data(), entry.name.data(), entry.name.size());
             record.name_bytes = static_cast<std::uint16_t>(entry.name.size());
             record.volume = static_cast<std::uint16_t>(entry.volume);
@@ -2918,16 +2920,16 @@ class basic_database {
             record.memory_runs_max_bytes = entry.config.memory_runs_max_bytes;
             record.memory_runs_max_deltas = entry.config.memory_runs_max_deltas;
             if (records.push_back(std::move(record)) != st::status_t::success_k)
-                return {status_code_t::out_of_memory_k, "No room to lay the catalog out"};
+                return {status_code_t::out_of_memory_k, "No room to lay the schema out"};
         }
 
         std::uint64_t const version = database_schema_version_k;
         st::basic_vector<byte_t> image;
         if (image.resize(fields_storage_requirements(version, stamps, records, runs)) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "No room to lay the catalog out"};
+            return {status_code_t::out_of_memory_k, "No room to lay the schema out"};
         if (status_t const laid = save_fields(bytes_span_t {image}, version, stamps, records, runs); laid.failed())
             return laid;
-        if (status_t const written = write_blob_(channel, database_schema_name(catalog_copy_of(stamps.generation)),
+        if (status_t const written = write_blob_(channel, database_schema_name(schema_copy_of(stamps.generation)),
                                                  blob_kind_t::schema_k, std::span<byte_t const> {image});
             written.failed())
             return written;
@@ -2935,8 +2937,8 @@ class basic_database {
         return {};
     }
 
-    /** Reads copy @p copy of the catalog into its fields, or leaves @p stamps at generation zero when it is absent. */
-    status_t read_schema_copy_(io_channel_t& channel, std::size_t copy, catalog_stamps_t& stamps,
+    /** Reads copy @p copy of the schema into its fields, or leaves @p stamps at generation zero when it is absent. */
+    status_t read_schema_copy_(io_channel_t& channel, std::size_t copy, schema_stamps_t& stamps,
                                st::basic_vector<collection_record_t>& records,
                                st::basic_vector<lsm_tree_run_record_t>& runs) const noexcept {
         auto [found, find_status] = router_->find(database_schema_name(copy));
@@ -2944,7 +2946,7 @@ class basic_database {
 
         st::basic_vector<byte_t> image;
         if (image.resize(static_cast<std::size_t>(found.length)) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "No room to read the catalog into"};
+            return {status_code_t::out_of_memory_k, "No room to read the schema into"};
         if (status_t const read = read_blob_(channel, database_schema_name(copy), std::span<byte_t> {image});
             read.failed())
             return read;
@@ -2953,14 +2955,14 @@ class basic_database {
         if (status_t const parsed = load_fields(bytes_view_t {image}, version, stamps, records, runs); parsed.failed())
             return parsed;
         if (version != database_schema_version_k)
-            return {status_code_t::unsupported_k, "The catalog follows another schema version"};
-        if (stamps.generation == 0) return {status_code_t::malformed_k, "A saved catalog counts at least one save"};
+            return {status_code_t::unsupported_k, "The schema follows another version"};
+        if (stamps.generation == 0) return {status_code_t::malformed_k, "A saved schema counts at least one save"};
         return {};
     }
 
-    /** Opens every collection the catalog names, drops the versions a crash tore and publishes the catalog, which a
+    /** Opens every collection the schema names, drops the versions a crash tore and publishes the collections, which a
      *  mount does once, leaving nothing published when it fails. */
-    status_t open_catalog_() noexcept {
+    status_t open_schema_() noexcept {
         // Every executor thread with a channel of its own reads on an epoch slot of its own too.
         if (status_t const reserved = ledger_.epochs().reserve_threads(channels_->executor_channels());
             reserved.failed())
@@ -2970,7 +2972,7 @@ class basic_database {
         if (status_t const loaded = load_schema_(claimed->channel()); loaded.failed()) return loaded;
 
         // The stamps continue above the durable stamp, and every version above it is a commit a crash tore, which
-        // is dropped before anything draws a stamp; resuming first is what lets the truncation's catalog promise it.
+        // is dropped before anything draws a stamp; resuming first is what lets the truncation's schema promise it.
         if (status_t const resumed = ledger_.resume(loaded_durable_); resumed.failed()) return resumed;
         auto [writing, acquire_status] = channels_->acquire();
         if (acquire_status.failed()) return acquire_status;
@@ -2986,13 +2988,13 @@ class basic_database {
                     collections_[index]->held);
                 truncated.failed())
                 return truncated;
-        return publish_catalog_();
+        return publish_collections_();
     }
 
     /** Opens every collection the schema blob names, which is what a mount of an older database does. */
     status_t load_schema_(io_channel_t& channel) noexcept {
         // A copy is sealed only once durable, so whichever copies a crash left are whole, and the newer one wins.
-        std::array<catalog_stamps_t, 2> stamps {};
+        std::array<schema_stamps_t, 2> stamps {};
         std::array<st::basic_vector<collection_record_t>, 2> records;
         std::array<st::basic_vector<lsm_tree_run_record_t>, 2> runs_of;
         for (std::size_t copy = 0; copy != 2; ++copy)
@@ -3010,11 +3012,11 @@ class basic_database {
     status_t adopt_all_(io_channel_t& channel, st::basic_vector<collection_record_t> const& records,
                         st::basic_vector<lsm_tree_run_record_t> const& runs) noexcept {
         if (collections_.reserve(records.size()) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "No room for the collections the catalog names"};
+            return {status_code_t::out_of_memory_k, "No room for the collections the schema names"};
         std::size_t named = 0;
         for (std::size_t index = 0; index != records.size(); ++index) {
             if (records[index].run_count > runs.size() - named)
-                return {status_code_t::malformed_k, "The catalog names more runs than it carries"};
+                return {status_code_t::malformed_k, "The schema names more runs than it carries"};
             std::size_t const count = static_cast<std::size_t>(records[index].run_count);
             if (status_t const opened = adopt_(channel, records[index],
                                                std::span<lsm_tree_run_record_t const> {runs.data() + named, count});
@@ -3022,15 +3024,15 @@ class basic_database {
                 return opened;
             named += count;
         }
-        if (named != runs.size()) return {status_code_t::malformed_k, "The catalog carries runs no collection claims"};
+        if (named != runs.size()) return {status_code_t::malformed_k, "The schema carries runs no collection claims"};
         return {};
     }
 
-    /** Opens the collection @p record describes over the runs @p runs names, and takes it into the catalog. */
+    /** Opens the collection @p record describes over the runs @p runs names, and takes it into the schema. */
     status_t adopt_(io_channel_t& channel, collection_record_t const& record,
                     std::span<lsm_tree_run_record_t const> runs) noexcept {
         if (static_cast<std::size_t>(record.volume) >= router_->size())
-            return {status_code_t::malformed_k, "The catalog names a volume this mount did not open"};
+            return {status_code_t::malformed_k, "The schema names a volume this mount did not open"};
 
         entry_pointer_t entry {new (std::nothrow) collection_entry_t {}};
         if (!entry) return {status_code_t::out_of_memory_k, "No room for another collection"};
@@ -3053,14 +3055,14 @@ class basic_database {
     /** What a compaction's hook is handed, which is the database and the channel it records through. */
     struct schema_write_t {
 
-        /** The database whose catalog the hook writes out. */
+        /** The database whose schema the hook writes out. */
         basic_database* store = nullptr;
 
         /** The channel the schema blob is queued and sealed on, held by the compacting thread. */
         io_channel_t* channel = nullptr;
     };
 
-    /** Writes the catalog out for a compaction that has published, before it drops what it consumed. */
+    /** Writes the schema out for a compaction that has published, before it drops what it consumed. */
     static status_t record_schema_(void* context) noexcept {
         schema_write_t const& writing = *static_cast<schema_write_t const*>(context);
         return writing.store->save_schema_(*writing.channel);
@@ -3079,10 +3081,10 @@ class basic_database {
     /** The transactions of this database, which names this store for as long as it lives. */
     registry_t transactions_;
 
-    /** How many times the catalog has been saved, which names the copy the next save replaces. */
+    /** How many times the schema has been saved, which names the copy the next save replaces. */
     std::uint64_t generation_ = 0;
 
-    /** The durable stamp of the catalog the mount read, above which it dropped every version. */
+    /** The durable stamp of the schema the mount read, above which it dropped every version. */
     transaction_stamp_t loaded_durable_ = unwritten_stamp_k;
 
     /** The volumes every run lands on, null until the database is mounted. */
@@ -3094,19 +3096,19 @@ class basic_database {
     /** The delta bounds a transaction takes when its caller names none. */
     database_config_t config_ {};
 
-    /** Every collection the catalog names, pinned so a snapshot may point into one. */
+    /** Every collection the schema names, pinned so a snapshot may point into one. */
     st::basic_vector<entry_pointer_t> collections_;
 
-    /** The catalog readers load, which @c catalog_ owns. */
-    published_view<catalog_view_t, atomic_reference_> catalog_view_;
+    /** The collections readers load, which @c latest_collections_ owns. */
+    published_view<published_collections_t, atomic_reference_> published_collections_;
 
-    /** The catalog published last, owned until the publication replacing it frees it. */
-    std::unique_ptr<catalog_view_t> catalog_;
+    /** The collections published last, owned until the publication replacing them frees them. */
+    std::unique_ptr<published_collections_t> latest_collections_;
 
-    /** How many catalogs have been published, which is what lets a caller memoize a lookup. */
-    std::uint64_t catalog_version_ = 0;
+    /** How many times the collections have been published, which is what lets a caller memoize a lookup. */
+    std::uint64_t collections_version_ = 0;
 
-    /** Held by whichever call changes the catalog, a tree or a blob, a commit paying for its maintenance included. */
+    /** Held by whichever call changes the schema, a tree or a blob, a commit paying for its maintenance included. */
     maintenance_claim<atomic_reference_, waiter_type_> claim_;
 
 #pragma endregion Private Members

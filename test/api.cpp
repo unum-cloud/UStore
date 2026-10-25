@@ -46,8 +46,9 @@ using namespace unum;
 constexpr std::string_view stored_value_k = "value";
 strided_strings<std::string_view> const stored_values_k {{&stored_value_k, 0}};
 
-/** Writes @p text under every key of @p keys in the main collection, joining @p transaction when one is given. */
-std::size_t write_text(ustore_database_t database, std::span<ustore_key_t const> keys, std::string_view text,
+/** Writes @p text under every key of @p keys in @p collection, joining @p transaction when one is given. */
+std::size_t write_text(ustore_database_t database, ustore_collection_id_t const& collection,
+                       std::span<ustore_key_t const> keys, std::string_view text,
                        ustore_transaction_t transaction = nullptr) {
     strided_strings<std::string_view> const repeated {{&text, 0}};
     ustore_outcome_t outcome {};
@@ -56,15 +57,17 @@ std::size_t write_text(ustore_database_t database, std::span<ustore_key_t const>
     write.outcome = &outcome;
     write.transaction = transaction;
     write.count = keys.size();
+    write.collections = {&collection, 0};
     write.keys = {keys.data(), sizeof(ustore_key_t)};
     write.values = repeated.view();
     ustore_blobs_write(&write);
     return expect_success(outcome);
 }
 
-/** Submits one deferred write of @c stored_value_k per key of @p keys to @p executor, each into its own outcome. */
-void submit_writes(ustore_database_t database, ustore_executor_t executor, std::span<ustore_key_t const> keys,
-                   std::span<ustore_outcome_t> outcomes) noexcept {
+/** Submits one deferred write of @c stored_value_k per key of @p keys in @p collection to @p executor, each into its
+ *  own outcome, borrowing @p collection until every write is final. */
+void submit_writes(ustore_database_t database, ustore_collection_id_t const& collection, ustore_executor_t executor,
+                   std::span<ustore_key_t const> keys, std::span<ustore_outcome_t> outcomes) noexcept {
     for (std::size_t index = 0; index != keys.size(); ++index) {
         ustore_blobs_write_t write {};
         write.database = database;
@@ -72,6 +75,7 @@ void submit_writes(ustore_database_t database, ustore_executor_t executor, std::
         write.outcome = &outcomes[index];
         write.completion = ustore_completion_deferred_k;
         write.count = 1;
+        write.collections = {&collection, 0};
         write.keys = {&keys[index], 0};
         write.values = stored_values_k.view();
         ustore_blobs_write(&write);
@@ -95,7 +99,7 @@ expected<ustore_executor_t> spawn_executor(ustore_size_t deferred_limit) noexcep
 
 /** Creates a collection named @p name, which holds @p modality. */
 expected<ustore_collection_id_t> create_collection(ustore_database_t database, std::string_view name,
-                                                   ustore_modality_t modality = ustore_modality_any_k) noexcept {
+                                                   ustore_modality_t modality) noexcept {
     ustore_collection_id_t created {};
     ustore_outcome_t outcome {};
     ustore_collection_create_t create {.database = database,
@@ -123,13 +127,15 @@ struct read_columns_t {
     std::string_view value(std::size_t index) const noexcept { return string_of(tape_string(values, index)); }
 };
 
-/** A blocking read of @p keys from the main collection into @p columns inside @p arena, finishing into @p outcome. */
-ustore_blobs_read_t read_of(ustore_database_t database, std::span<ustore_key_t const> keys, read_columns_t& columns,
-                            ustore_arena_t arena, ustore_outcome_t& outcome) noexcept {
+/** A blocking read of @p keys from @p collection into @p columns inside @p arena, finishing into @p outcome. */
+ustore_blobs_read_t read_of(ustore_database_t database, ustore_collection_id_t const& collection,
+                            std::span<ustore_key_t const> keys, read_columns_t& columns, ustore_arena_t arena,
+                            ustore_outcome_t& outcome) noexcept {
     ustore_blobs_read_t read {};
     read.database = database;
     read.outcome = &outcome;
     read.count = keys.size();
+    read.collections = {&collection, 0};
     read.keys = {keys.data(), sizeof(ustore_key_t)};
     read.presences = &columns.presences;
     read.values = &columns.values;
@@ -161,8 +167,8 @@ std::size_t database_validation(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    expected<ustore_collection_id_t> const named = create_collection(database, "col");
-    failures += expect(named.has_value() == database.supports_collections());
+    auto [blobs, blobs_status] = create_collection(database, "database_validation.blobs", ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
     expected<transaction_t> maybe_transaction = database.transaction();
     ustore_transaction_t const transaction = maybe_transaction ? maybe_transaction->transaction() : nullptr;
     auto [arena, arena_status] = arena_t::make();
@@ -182,7 +188,7 @@ std::size_t database_validation(config_t const& config) {
         .database = database,
         .outcome = &outcome,
         .count = count,
-        .collections = {&ustore_collection_main_k, 0},
+        .collections = {&blobs, 0},
         .keys = {keys.data(), sizeof(ustore_key_t)},
         .values = u32_tape(numbers.data(), number_offsets.data()),
     };
@@ -194,34 +200,25 @@ std::size_t database_validation(config_t const& config) {
         failures += expect_success(outcome);
     }
 
-    if (!database.supports_collections()) {
-        std::array<ustore_collection_id_t, count> collections {
-            {{uuid_from_integer(1)}, {uuid_from_integer(2)}, {uuid_from_integer(3)}}};
-        ustore_blobs_write_t write_unnamed = write_head;
-        write_unnamed.collections = {collections.data(), sizeof(ustore_collection_id_t)};
-        ustore_blobs_write(&write_unnamed);
-        failures += expect_failure(outcome);
+    // Collections nobody created, the nil UUID among them
+    std::array<ustore_collection_id_t, count> collections {
+        {{uuid_from_integer(1)}, {uuid_from_integer(2)}, {uuid_from_integer(3)}}};
+    ustore_blobs_write_t write_unnamed = write_head;
+    write_unnamed.collections = {collections.data(), sizeof(ustore_collection_id_t)};
+    ustore_blobs_write(&write_unnamed);
+    failures += expect_failure(outcome);
 
-        std::array<ustore_collection_id_t, count> collections_only_main {
-            ustore_collection_main_k, ustore_collection_main_k, ustore_collection_main_k};
-        ustore_blobs_write_t write_main = write_head;
-        write_main.collections = {collections_only_main.data(), sizeof(ustore_collection_id_t)};
-        ustore_blobs_write(&write_main);
-        failures += expect_success(outcome);
-    }
+    ustore_collection_id_t const nil_collection {};
+    ustore_blobs_write_t write_nil = write_head;
+    write_nil.collections = {&nil_collection, 0};
+    ustore_blobs_write(&write_nil);
+    failures += expect_failure(outcome);
 
+    // No collection at all
     ustore_blobs_write_t write_null_collection = write_head;
     write_null_collection.collections = {};
     ustore_blobs_write(&write_null_collection);
-    failures += expect_success(outcome);
-
-    if (named) {
-        ustore_collection_id_t const named_collection = *named;
-        ustore_blobs_write_t write_named = write_head;
-        write_named.collections = {&named_collection, 0};
-        ustore_blobs_write(&write_named);
-        failures += expect_success(outcome);
-    }
+    failures += expect_status(outcome, status_code_t::invalid_argument_k);
 
     if (transaction) {
         ustore_blobs_write_t write = write_head;
@@ -264,7 +261,7 @@ std::size_t database_validation(config_t const& config) {
 #pragma region Reads
 
     read_columns_t columns;
-    ustore_blobs_read_t read = read_of(database, keys, columns, arena, outcome);
+    ustore_blobs_read_t read = read_of(database, blobs, keys, columns, arena, outcome);
     ustore_blobs_read(&read);
     failures += expect_success(outcome);
     if (tape_written(columns.values)) failures += expect_eq(columns.value(2).size(), sizeof(std::uint64_t));
@@ -313,7 +310,7 @@ std::size_t database_validation(config_t const& config) {
         .outcome = &outcome,
         .view = ustore_transaction_view(transaction, ustore_watch_keys_k),
         .count = 1,
-        .collections = {&ustore_collection_main_k, 0},
+        .collections = {&blobs, 0},
         .start_keys = {keys.data(), 0},
         .offsets = &scan_offsets,
         .keys = &found_keys,
@@ -348,14 +345,17 @@ std::size_t database_forged_views(config_t const& config) {
     if (failures != 0) return failures;
     auto [arena, arena_status] = arena_t::make();
     failures += expect(arena_status.succeeded());
+    auto [blobs, blobs_status] = create_collection(database, "database_forged_views.blobs", ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
 
-    // The read names an arena, so the view, not a missing arena, is what the router refuses
+    // The read names an arena and a collection, so the view, not a missing input, is what the router refuses
     ustore_key_t const key = key_from_integer(1);
     ustore_outcome_t outcome {};
     ustore_blobs_read_t read {};
     read.database = database;
     read.outcome = &outcome;
     read.count = 1;
+    read.collections = {&blobs, 0};
     read.keys = {&key, 0};
     read.arena = arena;
 
@@ -414,6 +414,8 @@ case_result_t database_foreign_handles(config_t const& config) {
 
     auto [arena, arena_status] = arena_t::make();
     failures += expect(arena_status.succeeded());
+    auto [blobs, blobs_status] = create_collection(database, "database_foreign_handles.blobs", ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
     ustore_key_t const key = key_from_integer(1);
     ustore_outcome_t outcome {};
     ustore_blobs_read_t read {};
@@ -421,6 +423,7 @@ case_result_t database_foreign_handles(config_t const& config) {
     read.outcome = &outcome;
     read.view = foreign;
     read.count = 1;
+    read.collections = {&blobs, 0};
     read.keys = {&key, 0};
     read.arena = arena;
     ustore_blobs_read(&read);
@@ -432,6 +435,7 @@ case_result_t database_foreign_handles(config_t const& config) {
     write.outcome = &outcome;
     write.transaction = maybe_transaction->transaction();
     write.count = 1;
+    write.collections = {&blobs, 0};
     write.keys = {&key, 0};
     write.values = stored_values_k.view();
     ustore_blobs_write(&write);
@@ -520,17 +524,16 @@ std::size_t database_failed_reports_zeroed(config_t const& config) {
     failures += expect_status(outcome, status_code_t::capacity_exhausted_k);
     failures += expect_eq(paths, 0u);
 
-    if (database.supports_collections()) {
-        failures += expect(create_collection(database, "failed.reports").has_value());
-        ustore_collection_id_t collection {uuid_from_integer(0x4242)};
-        ustore_collection_create_t create {.database = database,
-                                           .outcome = &outcome,
-                                           .name = bytes_of("failed.reports"),
-                                           .collection = &collection};
-        ustore_collection_create(&create);
-        failures += expect_failure(outcome);
-        failures += expect(collection == ustore_collection_main_k);
-    }
+    failures += expect(create_collection(database, "failed.reports", ustore_modality_blobs_k).has_value());
+    ustore_collection_id_t collection {uuid_from_integer(0x4242)};
+    ustore_collection_create_t create {.database = database,
+                                       .outcome = &outcome,
+                                       .name = bytes_of("failed.reports"),
+                                       .modality = ustore_modality_blobs_k,
+                                       .collection = &collection};
+    ustore_collection_create(&create);
+    failures += expect_failure(outcome);
+    failures += expect(collection == ustore_collection_id_t {});
 
     // An executor whose table outgrows its counters is never made
     ustore_executor_t executor = reinterpret_cast<ustore_executor_t>(stale_handle);
@@ -576,8 +579,11 @@ case_result_t database_transaction_reset_elsewhere(config_t const& config) {
     failures += expect_status(outcome, status_code_t::invalid_argument_k);
     failures += expect(transaction == begun);
 
+    auto [blobs, blobs_status] = create_collection(database, "database_transaction_reset_elsewhere.blobs",
+                                                   ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
     ustore_key_t const key = key_from_integer(460);
-    failures += write_text(database, {&key, 1}, "value", transaction);
+    failures += write_text(database, blobs, {&key, 1}, "value", transaction);
     ustore_transaction_commit_t commit {.database = database, .outcome = &outcome, .transaction = transaction};
     ustore_transaction_commit(&commit);
     failures += expect_success(outcome);
@@ -594,13 +600,15 @@ std::size_t arena_null_refused(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
+    auto [blobs, blobs_status] = create_collection(database, "arena_null_refused.blobs", ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
 
     ustore_key_t const key = key_from_integer(200);
-    failures += write_text(database, {&key, 1}, "value");
+    failures += write_text(database, blobs, {&key, 1}, "value");
     std::uint32_t const sentinel = 0;
     read_columns_t columns {reinterpret_cast<ustore_octet_t const*>(&sentinel), u32_tape(&sentinel, &sentinel)};
     ustore_outcome_t outcome {};
-    ustore_blobs_read_t read = read_of(database, {&key, 1}, columns, nullptr, outcome);
+    ustore_blobs_read_t read = read_of(database, blobs, {&key, 1}, columns, nullptr, outcome);
     ustore_blobs_read(&read);
     failures += expect_status(outcome, status_code_t::invalid_argument_k);
     failures += expect(!columns.presences && !tape_written(columns.values));
@@ -617,6 +625,8 @@ std::size_t arena_reuse(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
+    auto [blobs, blobs_status] = create_collection(database, "arena_reuse.blobs", ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
     auto [arena, arena_status] = arena_t::make();
     failures += expect(arena_status.succeeded());
     if (failures != 0) return failures;
@@ -624,10 +634,10 @@ std::size_t arena_reuse(config_t const& config) {
     // Three present keys and a missing one past them, which no other case writes between
     std::array<ustore_key_t, 4> const keys {key_from_integer(300), key_from_integer(301), key_from_integer(302),
                                             key_from_integer(303)};
-    failures += write_text(database, std::span {keys}.first(3), "value");
+    failures += write_text(database, blobs, std::span {keys}.first(3), "value");
     read_columns_t columns;
     ustore_outcome_t outcome {};
-    ustore_blobs_read_t read = read_of(database, keys, columns, arena, outcome);
+    ustore_blobs_read_t read = read_of(database, blobs, keys, columns, arena, outcome);
     ustore_blobs_read(&read);
     failures += expect_success(outcome);
     failures += expect(columns.presences && tape_written(columns.values));
@@ -642,6 +652,7 @@ std::size_t arena_reuse(config_t const& config) {
         .database = database,
         .outcome = &outcome,
         .count = 1,
+        .collections = {&blobs, 0},
         .start_keys = {&keys[0], 0},
         .offsets = &offsets,
         .keys = &found,
@@ -661,6 +672,9 @@ std::size_t arena_failed_outputs_null(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
+    auto [blobs, blobs_status] = create_collection(database, "arena_failed_outputs_null.blobs",
+                                                   ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
     auto [executor, spawn_status] = spawn_executor(0);
     failures += expect(spawn_status.succeeded());
     if (failures != 0) return failures;
@@ -676,7 +690,7 @@ std::size_t arena_failed_outputs_null(config_t const& config) {
          std::array {ustore_completion_blocking_k, ustore_completion_deferred_k}) {
         read_columns_t columns = stale;
         ustore_outcome_t outcome {};
-        ustore_blobs_read_t read = read_of(database, {&key, 1}, columns, arena, outcome);
+        ustore_blobs_read_t read = read_of(database, blobs, {&key, 1}, columns, arena, outcome);
         read.executor = executor;
         read.completion = completion;
         read.collections = {&missing, 0};
@@ -693,6 +707,7 @@ std::size_t arena_failed_outputs_null(config_t const& config) {
         .database = database,
         .outcome = &outcome,
         .count = 1,
+        .collections = {&blobs, 0},
         .offsets = &offsets,
         .arena = arena,
         .wanted = 1,
@@ -714,6 +729,8 @@ std::size_t arena_aligned_outputs(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
+    auto [blobs, blobs_status] = create_collection(database, "arena_aligned_outputs.blobs", ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
     auto [arena, arena_status] = arena_t::make();
     failures += expect(arena_status.succeeded());
     if (failures != 0) return failures;
@@ -775,7 +792,7 @@ std::size_t arena_aligned_outputs(config_t const& config) {
     failures += expect_eq(tape_string(columns[2].strings, 0).length, 4u);
 
     read_columns_t read_columns;
-    ustore_blobs_read_t read = read_of(database, keys, read_columns, arena, outcome);
+    ustore_blobs_read_t read = read_of(database, blobs, keys, read_columns, arena, outcome);
     ustore_blobs_read(&read);
     failures += expect_success(outcome);
     failures += expect(read_columns.presences && tape_written(read_columns.values));
@@ -789,6 +806,7 @@ std::size_t arena_aligned_outputs(config_t const& config) {
         .database = database,
         .outcome = &outcome,
         .count = 1,
+        .collections = {&blobs, 0},
         .start_keys = {&lowest, 0},
         .end_keys = {&highest, 0},
         .min_cardinalities = &bounds[0],
@@ -869,6 +887,8 @@ std::size_t arena_outputs_only(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
+    auto [blobs, blobs_status] = create_collection(database, "arena_outputs_only.blobs", ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
     auto [arena, arena_status] = arena_t::make();
     failures += expect(arena_status.succeeded());
     auto [graph, graph_status] = create_collection(database, "outputs.graph", ustore_modality_graph_k);
@@ -891,6 +911,7 @@ std::size_t arena_outputs_only(config_t const& config) {
     write.database = database;
     write.outcome = &outcome;
     write.count = docs_count;
+    write.collections = {&blobs, 0};
     write.keys = {keys.data(), sizeof(ustore_key_t)};
     write.values = values.view();
     ustore_blobs_write(&write);
@@ -942,7 +963,7 @@ std::size_t arena_outputs_only(config_t const& config) {
     failures += expect_success(outcome);
     std::array<ustore_key_t, many_count> scanned {};
     for (std::size_t index = 0; index != many_count; ++index) scanned[index] = key_from_integer(5000 + index);
-    failures += write_text(database, scanned, "value");
+    failures += write_text(database, blobs, scanned, "value");
     auto [strings, strings_status] = create_collection(database, "outputs.strings", ustore_modality_strings_k);
     failures += expect(strings_status.succeeded());
     std::array<std::string, many_count> texts {};
@@ -959,7 +980,7 @@ std::size_t arena_outputs_only(config_t const& config) {
     ustore_strings_write(&write_strings);
     failures += expect_success(outcome);
     std::string const long_name(5000, 'n');
-    failures += expect(create_collection(database, long_name).has_value());
+    failures += expect(create_collection(database, long_name, ustore_modality_blobs_k).has_value());
     if (failures != 0) return failures;
 
     // The listing exports every collection, earlier cases' included, the long name outgrowing the first page
@@ -1076,17 +1097,17 @@ std::size_t arena_outputs_only(config_t const& config) {
         failures += expect_only_outputs(arena, read);
 
         // A blob read copies every document once, however long, and leaves no room for more behind them
-        read_columns_t blobs;
-        ustore_blobs_read_t read_blobs = read_of(database, keys, blobs, arena, outcome);
+        read_columns_t blob_reads;
+        ustore_blobs_read_t read_blobs = read_of(database, blobs, keys, blob_reads, arena, outcome);
         read_blobs.view = view;
         ustore_blobs_read(&read_blobs);
         failures += expect_success(outcome);
-        failures += expect(blobs.presences && tape_written(blobs.values));
-        if (!blobs.presences || !tape_written(blobs.values)) continue;
-        failures += expect_eq(blobs.value(3), documents[3]);
-        std::array<output_extent_t, 2> const blobs_tape = tape_extents(blobs.values, docs_count);
+        failures += expect(blob_reads.presences && tape_written(blob_reads.values));
+        if (!blob_reads.presences || !tape_written(blob_reads.values)) continue;
+        failures += expect_eq(blob_reads.value(3), documents[3]);
+        std::array<output_extent_t, 2> const blobs_tape = tape_extents(blob_reads.values, docs_count);
         std::array<output_extent_t, 3> blob_columns {{
-            {blobs.presences, bitmap_bytes},
+            {blob_reads.presences, bitmap_bytes},
             blobs_tape[0],
             blobs_tape[1],
         }};
@@ -1159,6 +1180,7 @@ std::size_t arena_outputs_only(config_t const& config) {
                 .outcome = &outcome,
                 .view = view,
                 .count = 1,
+                .collections = {&blobs, 0},
                 .start_keys = {&scanned[0], 0},
                 .offsets = &offsets,
                 .keys = &found,
@@ -1328,6 +1350,7 @@ struct held_scan_t {
     ustore_status_t drained = ustore_status_success_k;
     ustore_outcome_t outcome {};
     ustore_key_t start_key {};
+    ustore_collection_id_t collection {};
     arena_t arena;
     ustore_blobs_scan_t scan {};
 };
@@ -1360,6 +1383,7 @@ std::size_t submit_held(held_scan_t& held, ustore_executor_t executor) noexcept 
         .outcome = &held.outcome,
         .completion = ustore_completion_deferred_k,
         .count = 1,
+        .collections = {&held.collection, 0},
         .start_keys = {&held.start_key, 0},
         .arena = held.arena,
         .progress = &hold_until_released,
@@ -1387,6 +1411,9 @@ std::size_t executor_deferred_round_trip(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
+    auto [blobs, blobs_status] = create_collection(database, "executor_deferred_round_trip.blobs",
+                                                   ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
     auto [executor, spawn_status] = spawn_executor(0);
     failures += expect(spawn_status.succeeded());
     if (failures != 0) return failures;
@@ -1402,19 +1429,20 @@ std::size_t executor_deferred_round_trip(config_t const& config) {
     write.outcome = &outcome;
     write.completion = ustore_completion_deferred_k;
     write.count = keys.size();
+    write.collections = {&blobs, 0};
     write.keys = {keys.data(), sizeof(ustore_key_t)};
     write.values = stored_values_k.view();
     ustore_blobs_write(&write);
     failures += expect(ustore_outcome_wait(&outcome) == ustore_status_success_k);
 
     read_columns_t deferred_columns;
-    ustore_blobs_read_t deferred_read = read_of(database, keys, deferred_columns, executor_arena, outcome);
+    ustore_blobs_read_t deferred_read = read_of(database, blobs, keys, deferred_columns, executor_arena, outcome);
     deferred_read.executor = executor;
     deferred_read.completion = ustore_completion_deferred_k;
     ustore_blobs_read(&deferred_read);
     failures += expect(ustore_outcome_wait(&outcome) == ustore_status_success_k);
     read_columns_t blocking_columns;
-    ustore_blobs_read_t blocking_read = read_of(database, keys, blocking_columns, calling_arena, outcome);
+    ustore_blobs_read_t blocking_read = read_of(database, blobs, keys, blocking_columns, calling_arena, outcome);
     ustore_blobs_read(&blocking_read);
     failures += expect_success(outcome);
 
@@ -1436,6 +1464,9 @@ std::size_t executor_copied_submission(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
+    auto [blobs, blobs_status] = create_collection(database, "executor_copied_submission.blobs",
+                                                   ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
     auto [executor, spawn_status] = spawn_executor(0);
     failures += expect(spawn_status.succeeded());
     if (failures != 0) return failures;
@@ -1443,14 +1474,14 @@ std::size_t executor_copied_submission(config_t const& config) {
     failures += expect(arena_status.succeeded());
 
     std::array<ustore_key_t, 3> const keys {key_from_integer(400), key_from_integer(401), key_from_integer(402)};
-    failures += write_text(database, keys, "value");
+    failures += write_text(database, blobs, keys, "value");
 
     // The read waits behind the held scan, so it cannot run before its struct is scribbled over
     held_scan_t held;
     failures += submit_held(held, executor);
     read_columns_t columns;
     ustore_outcome_t outcome {};
-    ustore_blobs_read_t read = read_of(database, keys, columns, arena, outcome);
+    ustore_blobs_read_t read = read_of(database, blobs, keys, columns, arena, outcome);
     read.executor = executor;
     read.completion = ustore_completion_deferred_k;
     ustore_blobs_read(&read);
@@ -1494,13 +1525,15 @@ std::size_t arena_free_waits(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
+    auto [blobs, blobs_status] = create_collection(database, "arena_free_waits.blobs", ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
     auto [executor, spawn_status] = spawn_executor(0);
     st::expected<executor_t> freeing_thread = executor_t::make(1, caller_exclusivity_t::caller_exclusive_k);
     failures += expect(spawn_status.succeeded() && freeing_thread.has_value());
     if (failures != 0) return failures;
 
     ustore_key_t const key = key_from_integer(600);
-    failures += write_text(database, {&key, 1}, "value");
+    failures += write_text(database, blobs, {&key, 1}, "value");
     ustore_arena_t arena = nullptr;
     ustore_outcome_t outcome {};
     ustore_arena_init_t init {.arena = &arena, .executor = executor, .outcome = &outcome};
@@ -1510,7 +1543,7 @@ std::size_t arena_free_waits(config_t const& config) {
     held_scan_t held;
     failures += submit_held(held, executor);
     read_columns_t columns;
-    ustore_blobs_read_t read = read_of(database, {&key, 1}, columns, arena, outcome);
+    ustore_blobs_read_t read = read_of(database, blobs, {&key, 1}, columns, arena, outcome);
     read.executor = executor;
     read.completion = ustore_completion_deferred_k;
     ustore_blobs_read(&read);
@@ -1536,6 +1569,8 @@ std::size_t executor_full_table(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
+    auto [blobs, blobs_status] = create_collection(database, "executor_full_table.blobs", ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
     auto [executor, spawn_status] = spawn_executor(1);
     failures += expect(spawn_status.succeeded());
     if (failures != 0) return failures;
@@ -1544,7 +1579,7 @@ std::size_t executor_full_table(config_t const& config) {
     failures += submit_held(held, executor);
     ustore_key_t const key = key_from_integer(74);
     ustore_outcome_t outcome {};
-    submit_writes(database, executor, {&key, 1}, {&outcome, 1});
+    submit_writes(database, blobs, executor, {&key, 1}, {&outcome, 1});
     failures += expect_status(outcome, status_code_t::contended_k);
     failures += expect(held.drained == ustore_status_contended_k);
     failures += release_held(held);
@@ -1558,6 +1593,9 @@ std::size_t executor_blocking_after_deferred(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
+    auto [blobs, blobs_status] = create_collection(database, "executor_blocking_after_deferred.blobs",
+                                                   ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
     auto [executor, spawn_status] = spawn_executor(0);
     failures += expect(spawn_status.succeeded());
     if (failures != 0) return failures;
@@ -1572,13 +1610,14 @@ std::size_t executor_blocking_after_deferred(config_t const& config) {
     write.outcome = &written;
     write.completion = ustore_completion_deferred_k;
     write.count = keys.size();
+    write.collections = {&blobs, 0};
     write.keys = {keys.data(), sizeof(ustore_key_t)};
     write.values = stored_values_k.view();
     ustore_blobs_write(&write);
 
     read_columns_t columns;
     ustore_outcome_t outcome {};
-    ustore_blobs_read_t read = read_of(database, keys, columns, arena, outcome);
+    ustore_blobs_read_t read = read_of(database, blobs, keys, columns, arena, outcome);
     read.executor = executor;
     ustore_blobs_read(&read);
     failures += expect_success(outcome);
@@ -1595,6 +1634,9 @@ std::size_t executor_submit_after_wait(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
+    auto [blobs, blobs_status] = create_collection(database, "executor_submit_after_wait.blobs",
+                                                   ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
     auto [executor, spawn_status] = spawn_executor(1);
     failures += expect(spawn_status.succeeded());
     if (failures != 0) return failures;
@@ -1602,13 +1644,13 @@ std::size_t executor_submit_after_wait(config_t const& config) {
     failures += expect(arena_status.succeeded());
 
     ustore_key_t const key = key_from_integer(900);
-    failures += write_text(database, {&key, 1}, "value");
+    failures += write_text(database, blobs, {&key, 1}, "value");
     std::size_t contended = 0;
     std::size_t failed = 0;
     for (std::size_t round = 0; round != 1000; ++round) {
         read_columns_t columns;
         ustore_outcome_t outcome {};
-        ustore_blobs_read_t read = read_of(database, {&key, 1}, columns, arena, outcome);
+        ustore_blobs_read_t read = read_of(database, blobs, {&key, 1}, columns, arena, outcome);
         read.executor = executor;
         read.completion = ustore_completion_deferred_k;
         ustore_blobs_read(&read);
@@ -1628,6 +1670,8 @@ std::size_t executor_drain(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
+    auto [blobs, blobs_status] = create_collection(database, "executor_drain.blobs", ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
     auto [executor, spawn_status] = spawn_executor(0);
     failures += expect(spawn_status.succeeded());
     if (failures != 0) return failures;
@@ -1635,7 +1679,7 @@ std::size_t executor_drain(config_t const& config) {
     std::array<ustore_key_t, 4> const keys {key_from_integer(78), key_from_integer(79), key_from_integer(80),
                                             key_from_integer(81)};
     std::array<ustore_outcome_t, 4> outcomes {};
-    submit_writes(database, executor, keys, outcomes);
+    submit_writes(database, blobs, executor, keys, outcomes);
 
     ustore_outcome_t outcome {};
     ustore_executor_drain_t drain {.executor = executor, .outcome = &outcome, .mood = ustore_mood_spinning_k};
@@ -1655,6 +1699,8 @@ std::size_t executor_contended_arena(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
+    auto [blobs, blobs_status] = create_collection(database, "executor_contended_arena.blobs", ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
     auto [executor, spawn_status] = spawn_executor(0);
     failures += expect(spawn_status.succeeded());
     if (failures != 0) return failures;
@@ -1662,19 +1708,19 @@ std::size_t executor_contended_arena(config_t const& config) {
     failures += expect(arena_status.succeeded());
 
     ustore_key_t const key = key_from_integer(82);
-    failures += write_text(database, {&key, 1}, "value");
+    failures += write_text(database, blobs, {&key, 1}, "value");
     held_scan_t held;
     failures += submit_held(held, executor);
     read_columns_t deferred_columns;
     ustore_outcome_t deferred_outcome {};
-    ustore_blobs_read_t deferred_read = read_of(database, {&key, 1}, deferred_columns, arena, deferred_outcome);
+    ustore_blobs_read_t deferred_read = read_of(database, blobs, {&key, 1}, deferred_columns, arena, deferred_outcome);
     deferred_read.executor = executor;
     deferred_read.completion = ustore_completion_deferred_k;
     ustore_blobs_read(&deferred_read);
 
     read_columns_t columns;
     ustore_outcome_t outcome {};
-    ustore_blobs_read_t read = read_of(database, {&key, 1}, columns, arena, outcome);
+    ustore_blobs_read_t read = read_of(database, blobs, {&key, 1}, columns, arena, outcome);
     ustore_blobs_read(&read);
     failures += expect_status(outcome, status_code_t::contended_k);
 
@@ -1694,6 +1740,9 @@ case_result_t executor_contended_transaction(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
+    auto [blobs, blobs_status] = create_collection(database, "executor_contended_transaction.blobs",
+                                                   ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
     if (!database.supports_transactions()) return case_result_t::skipped("the engine keeps no transactions", failures);
     auto [executor, spawn_status] = spawn_executor(0);
     failures += expect(spawn_status.succeeded());
@@ -1709,7 +1758,7 @@ case_result_t executor_contended_transaction(config_t const& config) {
     ustore_key_t const key = key_from_integer(83);
     read_columns_t columns;
     ustore_outcome_t deferred_outcome {};
-    ustore_blobs_read_t deferred_read = read_of(database, {&key, 1}, columns, arena, deferred_outcome);
+    ustore_blobs_read_t deferred_read = read_of(database, blobs, {&key, 1}, columns, arena, deferred_outcome);
     deferred_read.executor = executor;
     deferred_read.completion = ustore_completion_deferred_k;
     deferred_read.view = ustore_transaction_view(transaction->transaction(), ustore_watch_keys_k);
@@ -1721,6 +1770,7 @@ case_result_t executor_contended_transaction(config_t const& config) {
     write.outcome = &outcome;
     write.transaction = transaction->transaction();
     write.count = 1;
+    write.collections = {&blobs, 0};
     write.keys = {&key, 0};
     write.values = stored_values_k.view();
     ustore_blobs_write(&write);
@@ -1782,6 +1832,8 @@ std::size_t executor_on_pool(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
+    auto [blobs, blobs_status] = create_collection(database, "executor_on_pool.blobs", ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
     st::expected<executor_t> lender = executor_t::make(2, caller_exclusivity_t::caller_exclusive_k);
     st::expected<executor_t> lending_thread = executor_t::make(1, caller_exclusivity_t::caller_exclusive_k);
     failures += expect(lender.has_value() && lending_thread.has_value());
@@ -1804,7 +1856,7 @@ std::size_t executor_on_pool(config_t const& config) {
     std::array<ustore_key_t, 8> held_keys {};
     std::array<ustore_outcome_t, 8> held_outcomes {};
     for (std::size_t index = 0; index != held_keys.size(); ++index) held_keys[index] = key_from_integer(700 + index);
-    submit_writes(database, executor, held_keys, held_outcomes);
+    submit_writes(database, blobs, executor, held_keys, held_outcomes);
     for (ustore_outcome_t& written : held_outcomes)
         failures += expect(ustore_outcome_wait(&written) == ustore_status_success_k);
     std::atomic_ref<std::uint32_t> const released {hold.released};
@@ -1821,7 +1873,7 @@ std::size_t executor_on_pool(config_t const& config) {
     std::array<ustore_key_t, writes_k> keys {};
     std::array<ustore_outcome_t, writes_k> outcomes {};
     for (std::size_t index = 0; index != writes_k; ++index) keys[index] = key_from_integer(100 + index);
-    submit_writes(database, executor, keys, outcomes);
+    submit_writes(database, blobs, executor, keys, outcomes);
     for (ustore_outcome_t& written : outcomes) {
         failures += expect(ustore_outcome_wait(&written) == ustore_status_success_k);
         std::atomic_ref<std::size_t> {lending.writes_finished}.fetch_add(1, std::memory_order_release);
@@ -1833,7 +1885,7 @@ std::size_t executor_on_pool(config_t const& config) {
     auto [arena, arena_status] = arena_t::make(executor);
     failures += expect(arena_status.succeeded());
     read_columns_t columns;
-    ustore_blobs_read_t read = read_of(database, keys, columns, arena, outcome);
+    ustore_blobs_read_t read = read_of(database, blobs, keys, columns, arena, outcome);
     read.executor = executor;
     ustore_blobs_read(&read);
     failures += expect_success(outcome);
@@ -1859,6 +1911,7 @@ std::size_t executor_residency_mismatch(config_t const&) {
     failures += expect(arena_status.succeeded());
     if (failures != 0) return failures;
 
+    ustore_collection_id_t const blobs {};
     ustore_length_t const* offsets = nullptr;
     ustore_key_t const* keys = nullptr;
     ustore_outcome_t outcome {};
@@ -1866,6 +1919,7 @@ std::size_t executor_residency_mismatch(config_t const&) {
         .database = c_handle<ustore_database_t>(&database),
         .outcome = &outcome,
         .count = 1,
+        .collections = {&blobs, 0},
         .offsets = &offsets,
         .keys = &keys,
         .arena = arena,
@@ -1938,8 +1992,11 @@ case_result_t database_init_on_executor(config_t const& config) {
     open_engine(config.options(), &database, &outcome, executor, ustore_completion_blocking_k);
     failures += expect_success(outcome);
     failures += expect(database != nullptr);
+    auto [blobs, blobs_status] = create_collection(database, "database_init_on_executor.blobs",
+                                                   ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
     ustore_key_t const key = key_from_integer(1200);
-    if (database) failures += write_text(database, {&key, 1}, "value");
+    if (database) failures += write_text(database, blobs, {&key, 1}, "value");
     ustore_database_free(database);
 
     // The init waits behind the held scan, so it runs only after its struct died with the frame that built it
@@ -1948,13 +2005,12 @@ case_result_t database_init_on_executor(config_t const& config) {
     database = nullptr;
     open_engine(config.options(), &database, &outcome, executor, ustore_completion_deferred_k);
     failures += expect(ustore_outcome_status(&outcome) == ustore_status_deferred_k);
-    failures += expect(database == nullptr);
     failures += release_held(held);
     failures += expect(ustore_outcome_wait(&outcome) == ustore_status_success_k);
     failures += expect(database != nullptr);
     if (database) {
         read_columns_t columns;
-        ustore_blobs_read_t read = read_of(database, {&key, 1}, columns, arena, outcome);
+        ustore_blobs_read_t read = read_of(database, blobs, {&key, 1}, columns, arena, outcome);
         ustore_blobs_read(&read);
         failures += expect_success(outcome);
         failures += expect(tape_written(columns.values) && columns.value(0) == "value");
@@ -1973,16 +2029,18 @@ std::size_t database_read_offsets(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
+    auto [blobs, blobs_status] = create_collection(database, "database_read_offsets.blobs", ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
     auto [arena, arena_status] = arena_t::make();
     failures += expect(arena_status.succeeded());
 
     std::array<ustore_key_t, 3> const keys {key_from_integer(41), key_from_integer(42), key_from_integer(43)};
-    failures += write_text(database, {&keys[0], 1}, "a");
-    failures += write_text(database, {&keys[2], 1}, "bcd");
+    failures += write_text(database, blobs, {&keys[0], 1}, "a");
+    failures += write_text(database, blobs, {&keys[2], 1}, "bcd");
     read_columns_t columns;
     ustore_length_t const* lengths = nullptr;
     ustore_outcome_t outcome {};
-    ustore_blobs_read_t read = read_of(database, keys, columns, arena, outcome);
+    ustore_blobs_read_t read = read_of(database, blobs, keys, columns, arena, outcome);
     read.lengths = &lengths;
     ustore_blobs_read(&read);
     failures += expect_success(outcome);
@@ -2009,6 +2067,8 @@ std::size_t database_write_layouts(config_t const& config) {
     auto [arena, arena_status] = arena_t::make();
     failures += expect(arena_status.succeeded());
     if (failures != 0) return failures;
+    auto [blobs, blobs_status] = create_collection(database, "database_write_layouts.blobs", ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
 
     std::array<std::string_view, 3> const texts {"alpha", "", "gamma"};
     std::string_view const joined = "alphagamma";
@@ -2026,13 +2086,14 @@ std::size_t database_write_layouts(config_t const& config) {
         write.database = database;
         write.outcome = &outcome;
         write.count = keys.size();
+        write.collections = {&blobs, 0};
         write.keys = {keys.data(), sizeof(ustore_key_t)};
         write.values = layouts[layout];
         ustore_blobs_write(&write);
         failures += expect_success(outcome);
 
         read_columns_t columns;
-        ustore_blobs_read_t read = read_of(database, keys, columns, arena, outcome);
+        ustore_blobs_read_t read = read_of(database, blobs, keys, columns, arena, outcome);
         ustore_blobs_read(&read);
         failures += expect_success(outcome);
         failures += expect(columns.presences && tape_written(columns.values));
@@ -2065,6 +2126,8 @@ std::size_t database_write_broadcast(config_t const& config) {
     auto [arena, arena_status] = arena_t::make();
     failures += expect(arena_status.succeeded());
     if (failures != 0) return failures;
+    auto [blobs, blobs_status] = create_collection(database, "database_write_broadcast.blobs", ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
 
     constexpr std::size_t count = 150;
     std::array<ustore_key_t, count> keys {};
@@ -2076,6 +2139,7 @@ std::size_t database_write_broadcast(config_t const& config) {
     write.database = database;
     write.outcome = &outcome;
     write.count = count;
+    write.collections = {&blobs, 0};
     write.keys = {keys.data(), sizeof(ustore_key_t)};
     write.values.layout = ustore_strings_accessor_k;
     write.values.data.accessor = {&get_repeated, &repeating};
@@ -2084,7 +2148,7 @@ std::size_t database_write_broadcast(config_t const& config) {
     failures += expect(largest_block != 0 && largest_block <= 64);
 
     read_columns_t columns;
-    ustore_blobs_read_t read = read_of(database, keys, columns, arena, outcome);
+    ustore_blobs_read_t read = read_of(database, blobs, keys, columns, arena, outcome);
     ustore_blobs_read(&read);
     failures += expect_success(outcome);
     failures += expect(tape_written(columns.values));
@@ -2101,6 +2165,8 @@ std::size_t database_unknown_layout(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
+    auto [blobs, blobs_status] = create_collection(database, "database_unknown_layout.blobs", ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
 
     ustore_key_t const key = key_from_integer(1700);
     ustore_outcome_t outcome {};
@@ -2108,6 +2174,7 @@ std::size_t database_unknown_layout(config_t const& config) {
     write.database = database;
     write.outcome = &outcome;
     write.count = 1;
+    write.collections = {&blobs, 0};
     write.keys = {&key, 0};
     write.values = stored_values_k.view();
     write.values.layout = static_cast<ustore_strings_layout_t>(3);
@@ -2124,6 +2191,8 @@ std::size_t database_zeroed_fields(config_t const& config) {
     auto [arena, arena_status] = arena_t::make();
     failures += expect(arena_status.succeeded());
     if (failures != 0) return failures;
+    auto [blobs, blobs_status] = create_collection(database, "database_zeroed_fields.blobs", ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
 
     auto [docs, docs_status] = create_collection(database, "zeroed.docs", ustore_modality_docs_k);
     failures += expect(docs_status.succeeded());
@@ -2164,16 +2233,14 @@ std::size_t database_zeroed_fields(config_t const& config) {
     return failures;
 }
 
-/** The verbs of every modality refuse a collection holding another one, so a document's bytes stay out of reach of
- *  the blobs verbs and a blobs collection takes no documents. */
+/** The verbs of every modality refuse a collection holding another one, so a document's bytes and keys stay out of
+ *  reach of the blobs verbs, documents are drawn by their own sample, and a blobs collection takes no documents. */
 case_result_t database_modality_refusals(config_t const& config) {
     std::size_t failures = 0;
     auto [database, open_status] = open_database<database_t>(config);
     auto [arena, arena_status] = arena_t::make();
     failures += expect(open_status.succeeded() && arena_status.succeeded());
     if (failures != 0) return failures;
-    if (!database.supports_collections())
-        return case_result_t::skipped("the engine keeps no named collections", failures);
     auto [blobs, blobs_status] = create_collection(database, "modality.blobs", ustore_modality_blobs_k);
     auto [docs, docs_status] = create_collection(database, "modality.docs", ustore_modality_docs_k);
     auto [graph, graph_status] = create_collection(database, "modality.graph", ustore_modality_graph_k);
@@ -2196,9 +2263,41 @@ case_result_t database_modality_refusals(config_t const& config) {
     failures += expect_success(outcome);
 
     read_columns_t columns;
-    ustore_blobs_read_t read = read_of(database, {&key, 1}, columns, arena, outcome);
+    ustore_blobs_read_t read = read_of(database, blobs, {&key, 1}, columns, arena, outcome);
     read.collections = {&docs, 0};
     ustore_blobs_read(&read);
+    failures += expect_status(status_t {outcome}, status_code_t::invalid_argument_k);
+
+    // Documents draw their keys through a sample of their own, which the blobs sample never stands in for
+    ustore_length_t const* offsets = nullptr;
+    ustore_key_t const* drawn = nullptr;
+    ustore_docs_sample_t sample_documents {
+        .database = database,
+        .outcome = &outcome,
+        .count = 1,
+        .collections = {&docs, 0},
+        .offsets = &offsets,
+        .keys = &drawn,
+        .arena = arena,
+        .wanted = 4,
+    };
+    ustore_docs_sample(&sample_documents);
+    failures += expect_success(outcome);
+    failures += expect(offsets && drawn && offsets[1] == 1 && drawn[0] == key);
+    sample_documents.collections = {&blobs, 0};
+    ustore_docs_sample(&sample_documents);
+    failures += expect_status(status_t {outcome}, status_code_t::invalid_argument_k);
+    ustore_blobs_sample_t sample_blobs {
+        .database = database,
+        .outcome = &outcome,
+        .count = 1,
+        .collections = {&docs, 0},
+        .offsets = &offsets,
+        .keys = &drawn,
+        .arena = arena,
+        .wanted = 4,
+    };
+    ustore_blobs_sample(&sample_blobs);
     failures += expect_status(status_t {outcome}, status_code_t::invalid_argument_k);
 
     write_document.collections = {&blobs, 0};
@@ -2232,8 +2331,6 @@ case_result_t database_modality_keys(config_t const& config) {
     auto [arena, arena_status] = arena_t::make();
     failures += expect(open_status.succeeded() && arena_status.succeeded());
     if (failures != 0) return failures;
-    if (!database.supports_collections())
-        return case_result_t::skipped("the engine keeps no named collections", failures);
     auto [docs, docs_status] = create_collection(database, "keys.docs", ustore_modality_docs_k);
     auto [graph, graph_status] = create_collection(database, "keys.graph", ustore_modality_graph_k);
     auto [pages, pages_status] = create_collection(database, "keys.pages", ustore_modality_pages_k);
@@ -2316,8 +2413,6 @@ case_result_t database_strings_layouts(config_t const& config) {
     auto [arena, arena_status] = arena_t::make();
     failures += expect(arena_status.succeeded());
     if (failures != 0) return failures;
-    if (!database.supports_collections())
-        return case_result_t::skipped("the engine keeps no named collections", failures);
     auto [strings, strings_status] = create_collection(database, "layouts.strings", ustore_modality_strings_k);
     failures += expect(strings_status.succeeded());
     if (failures != 0) return failures;
@@ -2366,11 +2461,13 @@ std::size_t database_measure_whole(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
+    auto [blobs, blobs_status] = create_collection(database, "database_measure_whole.blobs", ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
     auto [arena, arena_status] = arena_t::make();
     failures += expect(arena_status.succeeded());
 
     ustore_key_t const key = key_from_integer(950);
-    failures += write_text(database, {&key, 1}, "value");
+    failures += write_text(database, blobs, {&key, 1}, "value");
     ustore_size_t const* min_cardinalities = nullptr;
     ustore_size_t const* max_cardinalities = nullptr;
     ustore_outcome_t outcome {};
@@ -2378,6 +2475,7 @@ std::size_t database_measure_whole(config_t const& config) {
         .database = database,
         .outcome = &outcome,
         .count = 1,
+        .collections = {&blobs, 0},
         .min_cardinalities = &min_cardinalities,
         .max_cardinalities = &max_cardinalities,
         .arena = arena,
@@ -2395,11 +2493,13 @@ std::size_t database_remove(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
+    auto [blobs, blobs_status] = create_collection(database, "database_remove.blobs", ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
     auto [arena, arena_status] = arena_t::make();
     failures += expect(arena_status.succeeded());
 
     std::array<ustore_key_t, 3> const keys {key_from_integer(51), key_from_integer(52), key_from_integer(53)};
-    failures += write_text(database, keys, "value");
+    failures += write_text(database, blobs, keys, "value");
 
     // The first and the last key go in one batch, which strides over the middle one
     ustore_outcome_t outcome {};
@@ -2407,12 +2507,13 @@ std::size_t database_remove(config_t const& config) {
     remove.database = database;
     remove.outcome = &outcome;
     remove.count = 2;
+    remove.collections = {&blobs, 0};
     remove.keys = {keys.data(), 2 * sizeof(ustore_key_t)};
     ustore_blobs_remove(&remove);
     failures += expect_success(outcome);
 
     read_columns_t columns;
-    ustore_blobs_read_t read = read_of(database, keys, columns, arena, outcome);
+    ustore_blobs_read_t read = read_of(database, blobs, keys, columns, arena, outcome);
     ustore_blobs_read(&read);
     failures += expect_success(outcome);
     failures += expect(columns.presences && columns.presences[0] == 0b010);
@@ -2425,6 +2526,8 @@ case_result_t database_rollback(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
+    auto [blobs, blobs_status] = create_collection(database, "database_rollback.blobs", ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
     if (!database.supports_transactions()) return case_result_t::skipped("the engine keeps no transactions", failures);
     expected<transaction_t> maybe_transaction = database.transaction();
     failures += expect(maybe_transaction.has_value());
@@ -2432,7 +2535,7 @@ case_result_t database_rollback(config_t const& config) {
     ustore_transaction_t const transaction = maybe_transaction->transaction();
 
     ustore_key_t const key = key_from_integer(61);
-    failures += write_text(database, {&key, 1}, "staged", transaction);
+    failures += write_text(database, blobs, {&key, 1}, "staged", transaction);
     ustore_outcome_t outcome {};
     ustore_transaction_stage_t stage {.database = database, .outcome = &outcome, .transaction = transaction};
     ustore_transaction_stage(&stage);
@@ -2447,7 +2550,7 @@ case_result_t database_rollback(config_t const& config) {
     auto [arena, arena_status] = arena_t::make();
     failures += expect(arena_status.succeeded());
     read_columns_t columns;
-    ustore_blobs_read_t read = read_of(database, {&key, 1}, columns, arena, outcome);
+    ustore_blobs_read_t read = read_of(database, blobs, {&key, 1}, columns, arena, outcome);
     ustore_blobs_read(&read);
     failures += expect_success(outcome);
     failures += expect(tape_written(columns.values) && columns.value(0) == "staged");
@@ -2461,17 +2564,19 @@ case_result_t database_stamps(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
+    auto [blobs, blobs_status] = create_collection(database, "database_stamps.blobs", ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
     if (!database.supports_transactions() || !database.supports_snapshots())
         return case_result_t::skipped("the engine keeps no transactions or no snapshots", failures);
 
     // A commit at the head first, so the stage reads above zero and a commit reporting nothing reads below it
     ustore_key_t const key = key_from_integer(62);
-    failures += write_text(database, {&key, 1}, "head");
+    failures += write_text(database, blobs, {&key, 1}, "head");
     expected<transaction_t> maybe_transaction = database.transaction();
     failures += expect(maybe_transaction.has_value());
     if (failures != 0) return failures;
     ustore_transaction_t const transaction = maybe_transaction->transaction();
-    failures += write_text(database, {&key, 1}, "staged", transaction);
+    failures += write_text(database, blobs, {&key, 1}, "staged", transaction);
 
     ustore_stamp_t read_stamp = std::numeric_limits<ustore_stamp_t>::max();
     ustore_stamp_t commit_stamp = 0;
@@ -2527,6 +2632,8 @@ case_result_t database_free_holds(config_t const& config) {
         ustore_database_free(database);
         return case_result_t::skipped("the engine keeps no transactions or no snapshots", failures);
     }
+    auto [blobs, blobs_status] = create_collection(database, "database_free_holds.blobs", ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
 
     ustore_transaction_t transaction = nullptr;
     ustore_transaction_init_t transaction_init {.transaction = &transaction, .database = database, .outcome = &outcome};
@@ -2539,7 +2646,7 @@ case_result_t database_free_holds(config_t const& config) {
     ustore_database_free(database);
 
     ustore_key_t const key = key_from_integer(90);
-    failures += write_text(database, {&key, 1}, "held", transaction);
+    failures += write_text(database, blobs, {&key, 1}, "held", transaction);
     ustore_transaction_commit_t commit {.database = database, .outcome = &outcome, .transaction = transaction};
     ustore_transaction_commit(&commit);
     failures += expect_success(outcome);
@@ -2548,7 +2655,7 @@ case_result_t database_free_holds(config_t const& config) {
     auto [arena, arena_status] = arena_t::make();
     failures += expect(arena_status.succeeded());
     read_columns_t columns;
-    ustore_blobs_read_t read = read_of(database, {&key, 1}, columns, arena, outcome);
+    ustore_blobs_read_t read = read_of(database, blobs, {&key, 1}, columns, arena, outcome);
     read.view = ustore_snapshot_view(snapshot);
     ustore_blobs_read(&read);
     failures += expect_success(outcome);
@@ -2562,19 +2669,43 @@ case_result_t database_free_holds(config_t const& config) {
     return failures;
 }
 
+/** A fresh database holds no collection until one is created, never listing its system collections, and refuses a
+ *  name starting with `_`, which they keep. */
+case_result_t database_fresh_collections(config_t const& config) {
+    std::size_t failures = 0;
+    expected<database_t> fresh = status_t {status_code_t::uninitialized_k, "No fresh database"};
+    if (config.engine() == "ram") fresh = open_database<database_t>(config_t {config.options(), nullptr});
+    else if (config.directory()) {
+        path_t const directory {config.directory(), "fresh"};
+        failures += expect(recreate_directory(directory.c_str()));
+        fresh = open_database<database_t>(config_t {config.options(), directory.c_str()});
+    }
+    else return case_result_t::skipped(needs_directory_k, failures);
+    auto [arena, arena_status] = arena_t::make();
+    failures += expect(fresh.has_value() && arena_status.succeeded());
+    if (failures != 0) return failures;
+
+    auto [listed, list_status] = fresh->collections(arena);
+    failures += expect(list_status.succeeded());
+    failures += expect_eq(listed.size(), 0u);
+    failures += expect_status(collection_named(fresh->receiver(), "_names"), status_code_t::not_found_k);
+    failures += expect_status(create_collection(*fresh, "_x", ustore_modality_blobs_k),
+                              status_code_t::invalid_argument_k);
+    return failures;
+}
+
 /** A name resolves at the snapshot it is read at, so a collection created after the snapshot stays missing there. */
 case_result_t database_find_at_snapshot(config_t const& config) {
     std::size_t failures = 0;
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    if (!database.supports_snapshots() || !database.supports_collections())
-        return case_result_t::skipped("the engine keeps no snapshots of named collections", failures);
+    if (!database.supports_snapshots()) return case_result_t::skipped("the engine keeps no snapshots", failures);
 
     expected<snapshot_t> snapshot = database.snapshot();
     failures += expect(snapshot.has_value());
     if (failures != 0) return failures;
-    failures += expect(create_collection(database, "later").has_value());
+    failures += expect(create_collection(database, "later", ustore_modality_blobs_k).has_value());
     auto [arena, arena_status] = arena_t::make();
     failures += expect(arena_status.succeeded());
 
@@ -2599,7 +2730,7 @@ case_result_t database_find_at_snapshot(config_t const& config) {
     ustore_collection_find(&find);
     failures += expect_success(outcome);
     failures += expect(presences && found && presences[0] == 0);
-    if (found) failures += expect(std::memcmp(found, &ustore_collection_main_k, sizeof(ustore_collection_id_t)) == 0);
+    if (found) failures += expect(found[0] == ustore_collection_id_t {});
     return failures;
 }
 
@@ -2649,7 +2780,7 @@ std::size_t closed_set_names(config_t const&) {
     failures += expect_spellings(ustore_isolation_name, ustore_isolation_from_name, 2);
     failures += expect_spellings(ustore_transport_name, ustore_transport_from_name, 5);
     failures += expect_spellings(ustore_engine_name, ustore_engine_from_name, 4);
-    failures += expect_spellings(ustore_modality_name, ustore_modality_from_name, 6);
+    failures += expect_spellings(ustore_modality_name, ustore_modality_from_name, 5);
     failures += expect_spellings(ustore_vertex_role_name, ustore_vertex_role_from_name, 4);
     failures += expect_spellings(ustore_docs_field_type_name, ustore_docs_field_type_from_name, 17);
     failures += expect_spellings(ustore_docs_modification_name, ustore_docs_modification_from_name, 5);
@@ -2670,8 +2801,11 @@ std::size_t database_describe_compact(config_t const& config) {
     auto [arena, arena_status] = arena_t::make();
     failures += expect(open_status.succeeded() && arena_status.succeeded());
     if (failures != 0) return failures;
+    auto [blobs, blobs_status] = create_collection(database, "database_describe_compact.blobs",
+                                                   ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
     std::array<ustore_key_t, 3> const keys {key_from_integer(31), key_from_integer(32), key_from_integer(33)};
-    failures += write_text(database, keys, "kept");
+    failures += write_text(database, blobs, keys, "kept");
 
     ustore_outcome_t outcome {};
     ustore_database_description_t description {};
@@ -2689,7 +2823,7 @@ std::size_t database_describe_compact(config_t const& config) {
     ustore_database_compact(&compact);
     failures += expect_success(outcome);
     read_columns_t columns;
-    ustore_blobs_read_t read = read_of(database, keys, columns, arena, outcome);
+    ustore_blobs_read_t read = read_of(database, blobs, keys, columns, arena, outcome);
     ustore_blobs_read(&read);
     failures += expect_success(outcome);
     failures += expect(columns.presences && columns.presences[0] == 7 && columns.value(2) == "kept");
@@ -2698,20 +2832,21 @@ std::size_t database_describe_compact(config_t const& config) {
 }
 
 /** A clear empties every value keeping the keys, then removes every pair keeping the collections, then drops every
- *  collection but the main one, as each mode asks. */
+ *  collection, as each mode asks. */
 std::size_t database_clear_modes(config_t const& config) {
     std::size_t failures = 0;
     auto [database, open_status] = open_raw(config);
     auto [arena, arena_status] = arena_t::make();
     failures += expect(open_status.succeeded() && arena_status.succeeded());
     if (failures != 0) return failures;
-    failures += expect(create_collection(database, "clear.kept").has_value());
+    auto [blobs, blobs_status] = create_collection(database, "clear.kept", ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
     ustore_key_t const key = key_from_integer(77);
-    failures += write_text(database, {&key, 1}, "value");
+    failures += write_text(database, blobs, {&key, 1}, "value");
 
     ustore_outcome_t outcome {};
     read_columns_t columns;
-    ustore_blobs_read_t read = read_of(database, {&key, 1}, columns, arena, outcome);
+    ustore_blobs_read_t read = read_of(database, blobs, {&key, 1}, columns, arena, outcome);
     ustore_database_clear_t clear {.database = database, .outcome = &outcome, .mode = ustore_drop_values_k};
     ustore_database_clear(&clear);
     failures += expect_success(outcome);
@@ -2752,8 +2887,10 @@ case_result_t database_view_refusals(config_t const& config) {
     ustore_database_open_rocksdb(&open);
     failures += expect_success(outcome);
     if (failures != 0) return failures;
-    failures += write_text(database, {&key, 1}, "viewed");
-    auto [created, create_status] = create_collection(database, "view.kept");
+    auto [blobs, blobs_status] = create_collection(database, "view.blobs", ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
+    failures += write_text(database, blobs, {&key, 1}, "viewed");
+    auto [created, create_status] = create_collection(database, "view.kept", ustore_modality_blobs_k);
     failures += expect(create_status.succeeded());
     ustore_database_free(database);
 
@@ -2764,7 +2901,7 @@ case_result_t database_view_refusals(config_t const& config) {
     failures += expect(arena_status.succeeded());
     if (failures != 0) return failures;
     read_columns_t columns;
-    ustore_blobs_read_t read = read_of(database, {&key, 1}, columns, arena, outcome);
+    ustore_blobs_read_t read = read_of(database, blobs, {&key, 1}, columns, arena, outcome);
     ustore_blobs_read(&read);
     failures += expect_success(outcome);
     failures += expect(tape_written(columns.values) && columns.value(0) == "viewed");
@@ -2782,11 +2919,16 @@ case_result_t database_view_refusals(config_t const& config) {
     ustore_blobs_write_t write {.database = database,
                                 .outcome = &outcome,
                                 .count = 1,
+                                .collections = {&blobs, 0},
                                 .keys = {&key, 0},
                                 .values = stored_values_k.view()};
     ustore_blobs_write(&write);
     failures += expect_status(status_t {outcome}, status_code_t::read_only_k);
-    ustore_blobs_remove_t remove {.database = database, .outcome = &outcome, .count = 1, .keys = {&key, 0}};
+    ustore_blobs_remove_t remove {.database = database,
+                                  .outcome = &outcome,
+                                  .count = 1,
+                                  .collections = {&blobs, 0},
+                                  .keys = {&key, 0}};
     ustore_blobs_remove(&remove);
     failures += expect_status(status_t {outcome}, status_code_t::read_only_k);
     ustore_transaction_t transaction = nullptr;
@@ -2794,7 +2936,8 @@ case_result_t database_view_refusals(config_t const& config) {
     ustore_transaction_init(&begin);
     failures += expect_status(status_t {outcome}, status_code_t::read_only_k);
     failures += expect(transaction == nullptr);
-    failures += expect_status(create_collection(database, "view.created"), status_code_t::read_only_k);
+    failures += expect_status(create_collection(database, "view.created", ustore_modality_blobs_k),
+                              status_code_t::read_only_k);
     ustore_collection_drop_t drop {.database = database, .outcome = &outcome, .collection = created};
     ustore_collection_drop(&drop);
     failures += expect_status(status_t {outcome}, status_code_t::read_only_k);
@@ -2987,9 +3130,7 @@ case_result_t cursor_whole_walk(config_t const& config) {
     auto [arena, arena_status] = arena_t::make();
     failures += expect(open_status.succeeded() && arena_status.succeeded());
     if (failures != 0) return failures;
-    if (!database.supports_collections())
-        return case_result_t::skipped("the engine keeps no named collections", failures);
-    auto [blobs, blobs_status] = create_collection(database, "cursor.walk");
+    auto [blobs, blobs_status] = create_collection(database, "cursor.walk", ustore_modality_blobs_k);
     auto [strings, strings_status] = create_collection(database, "cursor.walk.strings", ustore_modality_strings_k);
     failures += expect(blobs_status.succeeded() && strings_status.succeeded());
     if (failures != 0) return failures;
@@ -3065,9 +3206,7 @@ case_result_t cursor_resume_after_writes(config_t const& config) {
     auto [arena, arena_status] = arena_t::make();
     failures += expect(open_status.succeeded() && arena_status.succeeded());
     if (failures != 0) return failures;
-    if (!database.supports_collections())
-        return case_result_t::skipped("the engine keeps no named collections", failures);
-    auto [collection, create_status] = create_collection(database, "cursor.resume");
+    auto [collection, create_status] = create_collection(database, "cursor.resume", ustore_modality_blobs_k);
     failures += expect(create_status.succeeded());
     if (failures != 0) return failures;
 
@@ -3114,9 +3253,8 @@ case_result_t cursor_snapshot_view(config_t const& config) {
     auto [arena, arena_status] = arena_t::make();
     failures += expect(open_status.succeeded() && arena_status.succeeded());
     if (failures != 0) return failures;
-    if (!database.supports_collections() || !database.supports_snapshots())
-        return case_result_t::skipped("the engine keeps no named collections or snapshots", failures);
-    auto [collection, create_status] = create_collection(database, "cursor.snapshot");
+    if (!database.supports_snapshots()) return case_result_t::skipped("the engine keeps no snapshots", failures);
+    auto [collection, create_status] = create_collection(database, "cursor.snapshot", ustore_modality_blobs_k);
     failures += expect(create_status.succeeded());
     if (failures != 0) return failures;
 
@@ -3171,11 +3309,9 @@ case_result_t cursor_free_waits(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
-    if (!database.supports_collections())
-        return case_result_t::skipped("the engine keeps no named collections", failures);
     auto [executor, spawn_status] = spawn_executor(0);
     st::expected<executor_t> freeing_thread = executor_t::make(1, caller_exclusivity_t::caller_exclusive_k);
-    auto [collection, create_status] = create_collection(database, "cursor.free");
+    auto [collection, create_status] = create_collection(database, "cursor.free", ustore_modality_blobs_k);
     failures += expect(spawn_status.succeeded() && freeing_thread.has_value() && create_status.succeeded());
     if (failures != 0) return failures;
     auto [arena, arena_status] = arena_t::make(executor);
@@ -3299,8 +3435,10 @@ case_result_t progress_cancel_scans(config_t const& config) {
     auto [arena, arena_status] = arena_t::make();
     failures += expect(open_status.succeeded() && arena_status.succeeded());
     if (failures != 0) return failures;
+    auto [blobs, blobs_status] = create_collection(database, "progress_cancel_scans.blobs", ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
     std::array<ustore_key_t, 3> const keys {key_from_integer(1), key_from_integer(2), key_from_integer(3)};
-    failures += write_text(database, keys, "scanned");
+    failures += write_text(database, blobs, keys, "scanned");
 
     ustore_outcome_t outcome {};
     progress_record_t record {.cancelling_report = 1};
@@ -3309,6 +3447,7 @@ case_result_t progress_cancel_scans(config_t const& config) {
     ustore_blobs_scan_t scan {.database = database,
                               .outcome = &outcome,
                               .count = 3,
+                              .collections = {&blobs, 0},
                               .start_keys = {&keys[0], 0},
                               .offsets = &offsets,
                               .keys = &found,
@@ -3322,8 +3461,6 @@ case_result_t progress_cancel_scans(config_t const& config) {
     failures += expect_eq(record.calls, 1u);
     failures += expect_eq(record.total, 3u);
 
-    if (!database.supports_collections())
-        return case_result_t::skipped("the engine keeps no named collections", failures);
     auto [strings, strings_status] = create_collection(database, "progress.strings", ustore_modality_strings_k);
     failures += expect(strings_status.succeeded());
     if (failures != 0) return failures;
@@ -3365,9 +3502,7 @@ case_result_t progress_cancel_cursor(config_t const& config) {
     auto [arena, arena_status] = arena_t::make();
     failures += expect(open_status.succeeded() && arena_status.succeeded());
     if (failures != 0) return failures;
-    if (!database.supports_collections())
-        return case_result_t::skipped("the engine keeps no named collections", failures);
-    auto [collection, create_status] = create_collection(database, "progress.cursor");
+    auto [collection, create_status] = create_collection(database, "progress.cursor", ustore_modality_blobs_k);
     failures += expect(create_status.succeeded());
     std::array<ustore_key_t, 3> const keys {key_from_integer(1), key_from_integer(2), key_from_integer(3)};
     failures += write_into(database, collection, keys, "pulled");
@@ -3430,9 +3565,11 @@ case_result_t progress_cancel_save(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
+    auto [blobs, blobs_status] = create_collection(database, "progress_cancel_save.blobs", ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
     if (!database.supports_snapshots()) return case_result_t::skipped("the engine keeps no snapshots", failures);
     ustore_key_t const key = key_from_integer(9);
-    failures += write_text(database, {&key, 1}, "saved");
+    failures += write_text(database, blobs, {&key, 1}, "saved");
     path_t const saved {config.directory(), "progress.saved"};
     failures += expect(ready_save_path(config, saved.c_str()));
 
@@ -3469,11 +3606,10 @@ case_result_t progress_cancel_compact(config_t const& config) {
     auto [arena, arena_status] = arena_t::make();
     failures += expect(open_status.succeeded() && arena_status.succeeded());
     if (failures != 0) return failures;
-    if (!database.supports_collections())
-        return case_result_t::skipped("the engine keeps no named collections", failures);
-    failures += expect(create_collection(database, "progress.compacted").has_value());
+    auto [blobs, blobs_status] = create_collection(database, "progress.compacted", ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
     ustore_key_t const key = key_from_integer(11);
-    failures += write_text(database, {&key, 1}, "compacted");
+    failures += write_text(database, blobs, {&key, 1}, "compacted");
 
     ustore_outcome_t outcome {};
     progress_record_t record {.cancelling_report = 1};
@@ -3487,7 +3623,7 @@ case_result_t progress_cancel_compact(config_t const& config) {
     failures += expect(record.finished <= record.total);
 
     read_columns_t columns;
-    ustore_blobs_read_t read = read_of(database, {&key, 1}, columns, arena, outcome);
+    ustore_blobs_read_t read = read_of(database, blobs, {&key, 1}, columns, arena, outcome);
     ustore_blobs_read(&read);
     failures += expect_success(outcome);
     failures += expect(tape_written(columns.values) && columns.value(0) == "compacted");
@@ -3505,9 +3641,11 @@ std::size_t progress_serialized(config_t const& config) {
     if (failures != 0) return failures;
     auto [arena, arena_status] = arena_t::make(executor);
     failures += expect(arena_status.succeeded());
+    auto [blobs, blobs_status] = create_collection(database, "progress_serialized.blobs", ustore_modality_blobs_k);
+    failures += expect(blobs_status.succeeded());
     std::array<ustore_key_t, 4> const keys {key_from_integer(1), key_from_integer(2), key_from_integer(3),
                                             key_from_integer(4)};
-    failures += write_text(database, keys, "reported");
+    failures += write_text(database, blobs, keys, "reported");
     if (failures != 0) return failures;
 
     // Every report must come back clean, and a wait between the calls checks none comes late
@@ -3525,6 +3663,7 @@ std::size_t progress_serialized(config_t const& config) {
                               .outcome = &outcome,
                               .completion = ustore_completion_deferred_k,
                               .count = 64,
+                              .collections = {&blobs, 0},
                               .start_keys = {&keys[0], 0},
                               .offsets = &offsets,
                               .keys = &found,
@@ -3537,7 +3676,7 @@ std::size_t progress_serialized(config_t const& config) {
     failures += expect_clean(scanned, 64);
 
     progress_record_t pulled_record {.outcome = &outcome};
-    auto [cursor, cursor_status] = open_cursor(database, ustore_collection_main_k);
+    auto [cursor, cursor_status] = open_cursor(database, blobs);
     failures += expect(cursor_status.succeeded());
     pulled_keys_t pulled;
     ustore_blobs_cursor_next_t next = pull_of(database, cursor, pulled, arena, 2, outcome);
@@ -3602,9 +3741,8 @@ case_result_t snapshot_save_recorded(config_t const& config) {
     auto [arena, arena_status] = arena_t::make();
     failures += expect(open_status.succeeded() && arena_status.succeeded());
     if (failures != 0) return failures;
-    if (!database.supports_collections() || !database.supports_snapshots())
-        return case_result_t::skipped("the engine keeps no named collections or snapshots", failures);
-    auto [dropped, dropped_status] = create_collection(database, "save.dropped");
+    if (!database.supports_snapshots()) return case_result_t::skipped("the engine keeps no snapshots", failures);
+    auto [dropped, dropped_status] = create_collection(database, "save.dropped", ustore_modality_blobs_k);
     failures += expect(dropped_status.succeeded());
     ustore_key_t const key = key_from_integer(21);
     failures += write_into(database, dropped, {&key, 1}, "recorded");
@@ -3615,7 +3753,7 @@ case_result_t snapshot_save_recorded(config_t const& config) {
     ustore_snapshot_init_t snapshot_init {.snapshot = &snapshot, .database = database, .outcome = &outcome};
     ustore_snapshot_init(&snapshot_init);
     failures += expect_success(outcome);
-    failures += expect(create_collection(database, "save.created").has_value());
+    failures += expect(create_collection(database, "save.created", ustore_modality_blobs_k).has_value());
     ustore_collection_drop_t drop {.database = database, .outcome = &outcome, .collection = dropped};
     ustore_collection_drop(&drop);
     failures += expect_success(outcome);
@@ -3636,8 +3774,7 @@ case_result_t snapshot_save_recorded(config_t const& config) {
     auto [kept, kept_status] = collection_named(receiver_t {copy}, "save.dropped");
     failures += expect(kept_status.succeeded() && kept == dropped);
     read_columns_t columns;
-    ustore_blobs_read_t read = read_of(copy, {&key, 1}, columns, arena, outcome);
-    read.collections = {&dropped, 0};
+    ustore_blobs_read_t read = read_of(copy, dropped, {&key, 1}, columns, arena, outcome);
     ustore_blobs_read(&read);
     failures += expect_success(outcome);
     failures += expect(tape_written(columns.values) && columns.value(0) == "recorded");
@@ -3682,6 +3819,7 @@ int main(int argc, char** argv) {
     report(totals, "database.stamps", database_stamps, config);
     report(totals, "database.free_holds", database_free_holds, config);
     report(totals, "database.find_at_snapshot", database_find_at_snapshot, config);
+    report(totals, "database.fresh_collections", database_fresh_collections, config);
     report(totals, "database.describe_compact", database_describe_compact, config);
     report(totals, "database.clear_modes", database_clear_modes, config);
     report(totals, "database.view_refusals", database_view_refusals, config);

@@ -5,8 +5,8 @@ Every collection is a log-structured merge tree of immutable sorted runs, each o
 Keys are fixed-width stored keys, `ustore_key_t` at the C ABI, and values are opaque bytes whose width a collection fixes at compile time.
 The C ABI in `variants.hpp` backs each UStore database with one `database` and each collection with one `nvme_store` under the same UUID.
 Every call is a template on the CPU class, whose atomic reference and waiter instantiate the `database`, and `src/nvme/variants_<class>.cpp` compiles one class each; the open in `engine.cpp` takes the newest class the running CPU admits, ending on the serial floor, and every handle it hands out carries that class's table.
-It mounts on files through whichever file transport its executor names, reserves collections for `ustore_collection_main_k`, the catalog and the names, and creates every other collection with a variable-width value layout so an empty value keeps its key.
-Every write of a caller commits through a transaction of the registry, while the catalog and the names change straight in the store under a claim of their own, as no caller's transaction reaches them.
+It mounts on files through whichever file transport its executor names, reserves the `_collections` and `_names` system collections, and creates every other collection with a variable-width value layout so an empty value keeps its key.
+Every write of a caller commits through a transaction of the registry, while both system collections change straight in the store under a claim of their own, as no caller's transaction reaches them.
 A stage checks a transaction and hands the database's claim back at once, so the commit checks it again; a held claim would stall every other call.
 
 ## Data Layout
@@ -15,7 +15,7 @@ A type is named after what it holds and what it does, from the whole database do
 
 | Type                         | What it is                                                                         |
 | :--------------------------- | :--------------------------------------------------------------------------------- |
-| `database`                   | A named database of collections that share one catalog and one set of transactions |
+| `database`                   | A named database of collections that share one schema and one set of transactions  |
 | `single_collection_database` | A named database of one collection, with its own transactions and snapshots        |
 | `nvme_store`                 | The store of one collection: memory runs and a value cache in front of an LSM tree |
 | `lsm_tree`                   | One LSM tree of levels, with the compaction that republishes them                  |
@@ -79,7 +79,7 @@ A reader the memory budget cannot keep history for is refused at its next read w
 
 ### Crash atomicity
 
-The catalog lives in two copies saved in turn, each with a generation and the durable stamp D: every commit at or below D is wholly in the runs that copy names.
+The schema lives in two copies saved in turn, each with a generation and the durable stamp D: every commit at or below D is wholly in the runs that copy names.
 D is the least stamp below the oldest commit any collection holds in memory runs alone, or the published stamp while no collection holds one.
 A mount reads the newer copy, resumes the stamps at D and merges down every level holding a version above D, dropping those versions, so a crash loses a suffix of commits and never half of one.
 A graph truncates both of its databases at the lesser of their two promises.
@@ -119,7 +119,7 @@ Commits are ordered by the stamps the ledger issues, which keeps a transaction t
 
 - An open names a directory, which becomes the metadata directory; a data directory it does not name defaults to `data` beneath it, and a capacity it does not name defaults to one gibibyte.
 - The executor of `ustore_executor_for_nvme` names the transport, the channels and their buffers, and the VRAM executor compactions run on, read once at the open; any other executor and none keep the defaults.
-- `ustore_collection_main_k` is the nil UUID, and the catalog and the names live under two more UUIDs no UUIDv7 spells, which every call refuses as unknown; every other collection carries the UUIDv7 its create minted.
+- The `_collections` and `_names` system collections live under two UUIDs no UUIDv7 spells, which every call refuses as unknown, as it does the nil UUID; every other collection carries the UUIDv7 its create minted.
 - A read measures a key and copies its value into the call's scratch, measuring again when the value changed its width in between.
 - A scan, a sample and a measurement walk one collection's runs and memory runs under the database's claim, binary-searching each run for the start key, and merge a transaction's own writes over them.
 - A snapshot pins a stamp, holds no level set and stalls no writer; reads, scans and collection lookups through it answer at that stamp, a drop leaves the runs of a dropped collection until the last snapshot goes, and a save writes a database of this engine with every collection as the snapshot reads it.

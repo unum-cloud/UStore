@@ -12,8 +12,8 @@ PEOPLE = [{"name": f"person-{row}", "tweets": row * 3, "score": row / 4} for row
 
 
 @pytest.fixture
-def people(view) -> Table:
-    return Table.from_records(view, PEOPLE)
+def people(view, docs) -> Table:
+    return Table.from_records(view, PEOPLE, collection=docs)
 
 
 @pytest.mark.parametrize("page", [1, 5, ROWS - 1, ROWS, ROWS + 1, 1000])
@@ -43,9 +43,9 @@ def test_paged_narrowed_view(people):
     assert narrowed.to_pandas(page=3).index.tolist() == keys([2, 4, 6, 8])
 
 
-def test_paged_empty_view(view):
+def test_paged_empty_view(view, docs):
     """An empty collection pages into the same empty frame an unpaged call answers."""
-    empty = Table(view)
+    empty = Table(view, docs)
     assert_frame_equal(empty.to_pandas(page=4), empty.to_pandas())
 
 

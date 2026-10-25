@@ -211,9 +211,7 @@ status_t update_neighborhoods(blobs_verbs_t const& values_verbs, arguments_type_
 
     ustore_arena_t const scratch = view.scratch;
     std::size_t const edges_count = arguments.count;
-    strided_iterator<ustore_collection_id_t const> const edge_collections =
-        arguments.collections.data ? strided(arguments.collections)
-                                   : strided_iterator<ustore_collection_id_t const> {&ustore_collection_main_k, 0};
+    strided_iterator<ustore_collection_id_t const> const edge_collections = strided(arguments.collections);
     strided_iterator<ustore_key_t const> const edges = strided(arguments.edges);
     strided_iterator<ustore_key_t const> const sources = strided(arguments.sources);
     strided_iterator<ustore_key_t const> const targets = strided(arguments.targets);
@@ -348,8 +346,7 @@ status_t graph_write_vertices_over_blobs(blobs_verbs_t const& values_verbs,
     std::size_t missing_count = 0;
     for (std::size_t index = 0; index != count; ++index) {
         if (present[index]) continue;
-        ustore_collection_id_t const collection = collections ? collections[index] : ustore_collection_main_k;
-        missing[missing_count++] = updated_entry_t {{collection, vertices[index]}, nullptr, 0, 0};
+        missing[missing_count++] = updated_entry_t {{collections[index], vertices[index]}, nullptr, 0, 0};
     }
     return write_entries(values_verbs, arguments.database, missing.first(missing_count), arguments.durability, view);
 }
@@ -360,9 +357,7 @@ status_t graph_remove_vertices_over_blobs(blobs_verbs_t const& values_verbs,
     if (!arguments.count) return {};
 
     ustore_arena_t const scratch = view.scratch;
-    strided_iterator<ustore_collection_id_t const> const vertex_collections =
-        arguments.collections.data ? strided(arguments.collections)
-                                   : strided_iterator<ustore_collection_id_t const> {&ustore_collection_main_k, 0};
+    strided_iterator<ustore_collection_id_t const> const vertex_collections = strided(arguments.collections);
     strided_iterator<ustore_key_t const> const vertices = strided(arguments.vertices);
     strided_iterator<ustore_vertex_role_t const> const vertex_roles = strided(arguments.roles);
 

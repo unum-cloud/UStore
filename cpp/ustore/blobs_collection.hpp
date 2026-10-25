@@ -35,7 +35,7 @@ class deferred_blobs_collection_t;
 class blobs_read_collection_t {
   protected:
     receiver_t receiver_ {};
-    ustore_collection_id_t collection_ {ustore_collection_main_k};
+    ustore_collection_id_t collection_ {};
 
     /** A @p reference_ proxy over one location or a batch of them inside this collection, whose own collection wins
      *  over the one a location names. */
@@ -79,7 +79,7 @@ class blobs_read_collection_t {
     static constexpr ustore_modality_t modality_k = ustore_modality_blobs_k;
 
     blobs_read_collection_t() noexcept = default;
-    blobs_read_collection_t(receiver_t receiver, ustore_collection_id_t collection = ustore_collection_main_k) noexcept
+    blobs_read_collection_t(receiver_t receiver, ustore_collection_id_t collection) noexcept
         : receiver_(receiver), collection_(collection) {}
 
     operator ustore_collection_id_t() const noexcept { return collection_; }
@@ -239,12 +239,11 @@ struct blobs_remove_t {
 class deferred_blobs_read_collection_t {
   protected:
     receiver_t receiver_ {};
-    ustore_collection_id_t collection_ {ustore_collection_main_k};
+    ustore_collection_id_t collection_ {};
 
   public:
     deferred_blobs_read_collection_t() noexcept = default;
-    explicit deferred_blobs_read_collection_t(receiver_t receiver,
-                                              ustore_collection_id_t collection = ustore_collection_main_k) noexcept
+    explicit deferred_blobs_read_collection_t(receiver_t receiver, ustore_collection_id_t collection) noexcept
         : receiver_(receiver), collection_(collection) {}
 
     operator ustore_collection_id_t() const noexcept { return collection_; }

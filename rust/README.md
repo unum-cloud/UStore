@@ -57,7 +57,7 @@ transaction.commit(Durability::Buffered)?;
 ```
 
 A collection resolves its name through its view once, and every verb goes through a view of one modality: `blobs`, `docs` or `graph`.
-The first write through a view creates a missing collection holding that view's modality, a read of a missing one fails with `Status::NotFound`, and a view of another modality fails with `Status::InvalidArgument`, while a collection created with `Modality::Any` takes every view.
+The first write through a view creates a missing collection holding that view's modality, a read of a missing one fails with `Status::NotFound`, and a view of another modality fails with `Status::InvalidArgument`.
 `sample` draws keys at random and reads their values through the same view, so a sample holds both.
 
 A collection keeps no arena.
@@ -182,7 +182,8 @@ let near = Executor::for_ram(&[0], 0, 0)?;                // 7/8 of the cores lo
 let shared = unsafe { Executor::on_pool(&[], pool, 0)? }; // borrows a ForkUnion pool's threads
 let people = Database::open_rocksdb(&RocksDBOptions { executor: Some(&executor), ..RocksDBOptions::at("/var/lib/people") })?;
 let mut arena = Arena::new_in(&executor)?;
-let values = people.head().on(&executor).read(CollectionID::main(), &[ada, grace], &mut arena)?;
+let (names, _) = people.head().on(&executor).collection_find("names", &mut arena)?;
+let values = people.head().on(&executor).read(names, &[ada, grace], &mut arena)?;
 executor.drain(Mood::Parked)?;
 ```
 
@@ -230,7 +231,7 @@ The library never frees an arena under a call: dropping one waits for the calls 
 
 A `Key` is a `UUID`, sixteen bytes ordered as their bytes, and converts from `[u8; 16]`, from a `UUID`, or from a `u64` or `u128` spelled big-endian, so keys made from integers order as the integers.
 `Key::next` is the key right after one in their order, where a scan resumes past it, and `key_unknown` is the key that stands for no key, every bit of it set.
-A `CollectionID` is a UUIDv7 the catalog mints when a collection is created, and `CollectionID::main` is the nil one every database holds.
+A `CollectionID` is a UUIDv7 minted when a collection is created, and the nil one names none, as a database holds no collection until one is created.
 A batch of keys is anything that reads as `&[Key]`: an array, a `Vec`, or a borrow of either.
 
 ```rust
@@ -281,7 +282,7 @@ people.snapshot()?.save("/var/lib/people-copy", None)?;
 A database `view_rocksdb` opened reads the state its directory held at open and refuses every call that would change it with `Status::ReadOnly`: writes, removes, transactions, collection creates and drops, clears and compactions, while snapshots and their saves still serve.
 `describe` answers the engine, the isolation transactions see, the keys across every collection, and the bytes the data takes in memory and on disk, where every size is the engine's estimate and zero where it keeps none.
 
-`clear` empties every collection at once, as `collection_drop` empties one: `DropMode::Pairs` keeps the collections and their names, `DropMode::Collection` drops every collection but the main one with its name, and `DropMode::Values` keeps the keys where the engine can.
+`clear` empties every collection at once, as `collection_drop` empties one: `DropMode::Pairs` keeps the collections and their names, `DropMode::Collection` drops every collection with its name, and `DropMode::Values` keeps the keys where the engine can.
 The RAM and RocksDB engines refuse to drop the collections while a snapshot is open, with `Status::InvalidArgument`, since the snapshot belongs to its holder.
 `compact` reclaims space one collection at a time: RocksDB and LevelDB flush and compact their trees, and the RAM engine frees the versions no reader needs and rewrites its image.
 `Snapshot::save` writes the snapshot out as a new database of the same engine, holding exactly the collections and names the snapshot records, which that engine's open then serves.
@@ -317,13 +318,13 @@ A deferred view takes only a `'static` handler, since the library calls it after
 ## Collections & Names
 
 Collections are created under a name and the modality they hold, resolved by name once and addressed by identifier from then on, and dropping one forgets its name.
-Each engine keeps the names apart from every collection, so no identifier reaches them.
+Each engine keeps the names in the system collection `_names` and every collection's modality and name in `_collections`, which no identifier reaches, so a name starting with `_` is refused with `Status::InvalidArgument`.
 A name is read through a view as a value is, so a watching transaction conflicts with a concurrent create or drop of a name it resolved, while a listing describes the database and reads the view's snapshot or the head.
 
 ```rust
 use ustore::DropMode;
 
-let people = database.collection_create("people", Modality::Any)?;
+let people = database.collection_create("people", Modality::Blobs)?;
 let (same, modality) = database.head().collection_find("people", &mut arena)?;
 let every = database.head().collection_list(&mut arena)?;
 
@@ -334,7 +335,7 @@ for name in database.head().collection_names("pe", None, 100, &mut arena)?.iter(
 database.collection_drop(people, DropMode::Collection)?;
 ```
 
-`CollectionID::main` is the collection every database holds, which `Database::collection_drop` may empty of its pairs or values with `DropMode::Pairs` or `DropMode::Values`, but nothing may drop.
+A database holds no collection until one is created, and `Database::collection_drop` empties a collection of its pairs or values with `DropMode::Pairs` or `DropMode::Values`, or drops it whole with `DropMode::Collection`.
 Walks paginate rather than hold an iterator over concurrent state: a cursor resumes past the last key it handed out, a scan from `Key::next` of the last key it found, and a name walk from a name.
 
 The ABI carries a collection per task, so a batch spans as many collections as it has entries.
@@ -364,7 +365,7 @@ let database = Database::init_ram(&RAMOptions::default())?;
 let mut arena = Arena::new()?;
 
 let [ada, grace, kent] = [1u64, 2, 3].map(Key::from);
-let people = database.collection_create("people", Modality::Any)?;
+let people = database.collection_create("people", Modality::Blobs)?;
 let entries = [Entry::new(ada, b"Ada"), Entry::new(grace, b"Grace")];
 database.head().write(people, &entries, Durability::Buffered)?;
 

@@ -6,7 +6,7 @@ from uuid import UUID
 
 import numpy as np
 import pytest
-from capabilities import BATCH_SIZES, NEEDS_COLLECTIONS, NEEDS_SNAPSHOTS, NEEDS_TRANSACTIONS, key, keys
+from capabilities import BATCH_SIZES, NEEDS_SNAPSHOTS, NEEDS_TRANSACTIONS, key, keys
 
 import ustore
 from ustore import Modality, Role
@@ -29,12 +29,6 @@ def expected_edges(sources: list[int], targets: list[int], identifiers: list[UUI
     outgoing = sorted((edge for edge in triples if edge[0] == key(vertex)), key=lambda edge: (edge[1], edge[2]))
     incoming = sorted((edge for edge in triples if edge[1] == key(vertex)), key=lambda edge: (edge[0], edge[2]))
     return {Role.SOURCE: outgoing, Role.TARGET: incoming, Role.ANY: outgoing + incoming}[role]
-
-
-@pytest.fixture
-def graph(database: ustore.Database) -> UUID:
-    """A graph collection for the graph calls, as the main collection holds values."""
-    return database.collection_create("graph", modality=Modality.GRAPH)
 
 
 # region Edges
@@ -92,7 +86,7 @@ def test_remove_edges_keeps_the_vertices(view, arena, graph, identifiers: str):
     view.graph_write_edges(sources, targets, edges=given, collection=graph)
     view.graph_remove_edges(sources[:2], targets[:2], edges=None if given is None else given[:2], collection=graph)
     assert view.graph_degrees([1, 2, 3], arena, role=Role.SOURCE, collection=graph) == (0, 1, 1)
-    assert all(view.contains(vertex, collection=graph) for vertex in (1, 2, 3))
+    assert None not in view.graph_degrees([1, 2, 3], arena, collection=graph)
 
 
 def test_removing_by_pair_spares_edges_with_identifiers(view, arena, graph):
@@ -140,7 +134,7 @@ def test_empty_reads(view, arena, graph):
 def test_write_vertices_without_edges(view, arena, graph, count: int):
     vertices = list(range(count))
     view.graph_write_vertices(vertices, collection=graph)
-    assert all(view.contains(vertex, collection=graph) for vertex in vertices)
+    assert None not in view.graph_degrees(vertices, arena, collection=graph)
     assert view.graph_degrees(vertices, arena, collection=graph) == (0,) * count
 
 
@@ -159,7 +153,7 @@ def test_remove_vertices_removes_their_edges(view, arena, graph, removed: list[i
         (source, target) for source, target in zip(sources, targets, strict=True) if not {source, target} & set(removed)
     ]
     for vertex in (1, 2, 3):
-        assert view.contains(vertex, collection=graph) == (vertex not in removed)
+        assert (view.graph_degrees([vertex], arena, collection=graph)[0] is not None) == (vertex not in removed)
         if vertex not in removed:
             expected = sorted(target for source, target in remaining if source == vertex)
             found = view.graph_read_edges([vertex], arena, role=Role.SOURCE, collection=graph)[0]
@@ -167,15 +161,15 @@ def test_remove_vertices_removes_their_edges(view, arena, graph, removed: list[i
 
 
 @pytest.mark.parametrize("stored", [b"abc", b'{"name": "Ada Lovelace", "born": 1815}'], ids=["blob", "document"])
-def test_a_collection_of_values_refuses_the_graph_calls(view, arena, stored: bytes):
+def test_a_collection_of_values_refuses_the_graph_calls(view, blobs, arena, stored: bytes):
     """An engine storing vertices as values finds a value that is not one, and one keeping graphs apart refuses."""
-    view.set(1, stored)
+    view.set(1, stored, collection=blobs)
     with pytest.raises((ustore.MalformedError, ustore.InvalidArgumentError)):
-        view.graph_read_edges([1], arena)
+        view.graph_read_edges([1], arena, collection=blobs)
     with pytest.raises((ustore.MalformedError, ustore.InvalidArgumentError)):
-        view.graph_write_edges([1], [2])
+        view.graph_write_edges([1], [2], collection=blobs)
     with pytest.raises((ustore.MalformedError, ustore.InvalidArgumentError)):
-        view.graph_remove_vertices([1])
+        view.graph_remove_vertices([1], collection=blobs)
 
 
 # endregion Vertices
@@ -183,7 +177,6 @@ def test_a_collection_of_values_refuses_the_graph_calls(view, arena, stored: byt
 # region Collections
 
 
-@NEEDS_COLLECTIONS
 def test_graphs_in_named_collections_stay_apart(database, arena):
     database.collection_create("first", modality=Modality.GRAPH)
     database.collection_create("second", modality=Modality.GRAPH)
@@ -193,7 +186,7 @@ def test_graphs_in_named_collections_stay_apart(database, arena):
     second = ((key(1), key(3), ustore.edge_id_default),)
     assert database.graph_read_edges([1], arena, collection="first")[0] == first
     assert database.graph_read_edges([1], arena, collection="second")[0] == second
-    assert not database.contains(1)
+    assert database.graph_degrees([3], arena, collection="first") == (None,)
 
 
 # endregion Collections
@@ -320,17 +313,17 @@ def test_await_graph_calls_under_asyncio(arena, graph, later):
 @pytest.mark.parametrize(
     ("call", "failure"),
     [
-        (lambda view: view.graph_write_edges([1, 2], [3]), ValueError),
-        (lambda view: view.graph_write_edges([1], [2], edges=[1, 2]), ValueError),
-        (lambda view: view.graph_write_edges([1], [2], [3]), TypeError),
-        (lambda view: view.graph_read_edges([1], ustore.Arena(), role=len(Role)), ValueError),
-        (lambda view: view.graph_degrees([1], ustore.Arena(), role="any"), TypeError),
-        (lambda view: view.graph_remove_vertices([1.5]), TypeError),
-        (lambda view: view.graph_write_vertices([1], roles=Role.ANY), TypeError),
+        (lambda view: view.graph_write_edges([1, 2], [3], collection="graph"), ValueError),
+        (lambda view: view.graph_write_edges([1], [2], edges=[1, 2], collection="graph"), ValueError),
+        (lambda view: view.graph_write_edges([1], [2], [3], collection="graph"), TypeError),
+        (lambda view: view.graph_read_edges([1], ustore.Arena(), role=len(Role), collection="graph"), ValueError),
+        (lambda view: view.graph_degrees([1], ustore.Arena(), role="any", collection="graph"), TypeError),
+        (lambda view: view.graph_remove_vertices([1.5], collection="graph"), TypeError),
+        (lambda view: view.graph_write_vertices([1], roles=Role.ANY, collection="graph"), TypeError),
     ],
     ids=["widths", "identifier-width", "positional-identifiers", "role-value", "role-type", "vertex-type", "keyword"],
 )
-def test_binding_refusals(view, call, failure: type):
+def test_binding_refusals(view, graph, call, failure: type):
     with pytest.raises(failure):
         call(view)
 

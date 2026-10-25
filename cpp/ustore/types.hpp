@@ -74,9 +74,9 @@ struct collection_key_field_t {
     collection_key_field_t() = default;
     collection_key_field_t(ustore_collection_id_t collection, ustore_key_t key, std::string_view field = {}) noexcept
         : collection(collection), key(key), field(field) {}
-    collection_key_field_t(ustore_key_t key) noexcept : collection(ustore_collection_main_k), key(key) {}
-    explicit collection_key_field_t(ustore_key_t key, std::string_view field) noexcept
-        : collection(ustore_collection_main_k), key(key), field(field) {}
+
+    /** A field of @p key in whichever collection the handle addressing it names. */
+    explicit collection_key_field_t(ustore_key_t key, std::string_view field) noexcept : key(key), field(field) {}
 };
 
 /** A location that names the collection it lives in. */
@@ -87,10 +87,9 @@ concept has_collection_concept = requires(location_ const& location) { location.
 template <typename location_>
 concept has_field_concept = requires(location_ const& location) { location.field; };
 
-/** A single key, bare or with its collection, that widens into a @c collection_key_field_t. */
+/** A single key with its collection, that widens into a @c collection_key_field_t. */
 template <typename location_>
-concept key_location_concept = std::same_as<std::remove_cvref_t<location_>, ustore_key_t> ||
-                               std::same_as<std::remove_cvref_t<location_>, collection_key_t>;
+concept key_location_concept = std::same_as<std::remove_cvref_t<location_>, collection_key_t>;
 
 #pragma endregion Locations
 

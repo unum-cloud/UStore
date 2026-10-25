@@ -123,10 +123,10 @@ struct tabular_t {
     ustore_database_t database = nullptr;
 
     /** The docs collection the document benchmarks import into and export from. */
-    ustore_collection_id_t docs = ustore_collection_main_k;
+    ustore_collection_id_t docs {};
 
     /** The graph collection the graph benchmarks import into and export from. */
-    ustore_collection_id_t graph = ustore_collection_main_k;
+    ustore_collection_id_t graph {};
 
     /** Null-terminated paths of the input files, one after another. */
     sz::string_t paths;

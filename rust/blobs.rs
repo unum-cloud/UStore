@@ -1002,21 +1002,19 @@ impl<'arena> Page<'arena> {
 mod tests {
     use super::*;
     use crate::db::{CollectionID, Collections, Database, DropMode, Executor, Modality, RAMOptions, Status, UUID};
-    use crate::testing::{key, keys};
+    use crate::testing::{created, key, keys};
 
-    /// A database holding `alpha`, `beta` and `gamma` under the keys one, two and three.
-    fn populated() -> (Database, Arena) {
+    /// A database whose blobs collection holds `alpha`, `beta` and `gamma` under the keys one, two and three.
+    fn populated() -> (Database, CollectionID, Arena) {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
+        let blobs = created(&database, Modality::Blobs);
         let entries = [
             Entry::new(key(1), b"alpha"),
             Entry::new(key(2), b"beta"),
             Entry::new(key(3), b"gamma"),
         ];
-        database
-            .head()
-            .write(CollectionID::main(), &entries, Durability::Buffered)
-            .unwrap();
-        (database, Arena::new().unwrap())
+        database.head().write(blobs, &entries, Durability::Buffered).unwrap();
+        (database, blobs, Arena::new().unwrap())
     }
 
     /// A tape holding `values` in order.
@@ -1026,11 +1024,8 @@ mod tests {
 
     #[test]
     fn batches_write_and_read_back_in_order() {
-        let (database, mut arena) = populated();
-        let values = database
-            .head()
-            .read(CollectionID::main(), keys([3, 1, 2]), &mut arena)
-            .unwrap();
+        let (database, blobs, mut arena) = populated();
+        let values = database.head().read(blobs, keys([3, 1, 2]), &mut arena).unwrap();
         assert_eq!(values.len(), 3);
         assert!(!values.is_empty());
         let read: Vec<Option<&[u8]>> = values.iter().collect();
@@ -1058,29 +1053,23 @@ mod tests {
     fn reads_report_a_missing_key_apart_from_an_empty_value() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new().unwrap();
+        let blobs = created(&database, Modality::Blobs);
         let entries = [Entry::new(key(1), b"")];
-        database
-            .head()
-            .write(CollectionID::main(), &entries, Durability::Buffered)
-            .unwrap();
+        database.head().write(blobs, &entries, Durability::Buffered).unwrap();
 
-        let values = database
-            .head()
-            .read(CollectionID::main(), keys([1, 2]), &mut arena)
-            .unwrap();
+        let values = database.head().read(blobs, keys([1, 2]), &mut arena).unwrap();
         assert_eq!(values.get(0), Some(b"".as_slice()), "an empty value is present");
         assert_eq!(values.get(1), None, "a key nobody wrote is missing");
     }
 
     #[test]
     fn empty_batches_reach_no_engine() {
-        let (database, mut arena) = populated();
+        let (database, blobs, mut arena) = populated();
         let head = database.head();
-        let main = CollectionID::main();
-        head.write(main, &[], Durability::Buffered).unwrap();
-        head.write(main, ([], tape([])), Durability::Buffered).unwrap();
-        head.remove(main, [], Durability::Buffered).unwrap();
-        let values = head.read(main, [], &mut arena).unwrap();
+        head.write(blobs, &[], Durability::Buffered).unwrap();
+        head.write(blobs, ([], tape([])), Durability::Buffered).unwrap();
+        head.remove(blobs, [], Durability::Buffered).unwrap();
+        let values = head.read(blobs, [], &mut arena).unwrap();
         assert!(values.is_empty());
         assert_eq!(values.get(0), None);
         assert!(values.tape().is_empty() && values.presences().is_empty());
@@ -1088,15 +1077,12 @@ mod tests {
 
     #[test]
     fn removals_take_every_key_they_name() {
-        let (database, mut arena) = populated();
+        let (database, blobs, mut arena) = populated();
         database
             .head()
-            .remove(CollectionID::main(), keys([1, 3]), Durability::Buffered)
+            .remove(blobs, keys([1, 3]), Durability::Buffered)
             .unwrap();
-        let values = database
-            .head()
-            .read(CollectionID::main(), keys([1, 2, 3]), &mut arena)
-            .unwrap();
+        let values = database.head().read(blobs, keys([1, 2, 3]), &mut arena).unwrap();
         assert_eq!(values.get(0), None);
         assert_eq!(values.get(1), Some(b"beta".as_slice()));
         assert_eq!(values.get(2), None);
@@ -1106,11 +1092,11 @@ mod tests {
     fn tapes_of_either_width_write_a_value_per_key() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new().unwrap();
-        let main = CollectionID::main();
+        let blobs = created(&database, Modality::Blobs);
         let written = database
             .head()
             .write(
-                main,
+                blobs,
                 (keys([1, 2, 3]), tape([b"alpha", b"", b"gamma"])),
                 Durability::Buffered,
             )
@@ -1119,11 +1105,11 @@ mod tests {
         let narrow: BytesTape<u32> = [b"delta".as_slice()].into_iter().collect();
         database
             .head()
-            .write(main, (keys([4]), narrow), Durability::Buffered)
+            .write(blobs, (keys([4]), narrow), Durability::Buffered)
             .unwrap();
 
         // A read whose bytes fit in 4 GiB answers a tape of 32-bit offsets.
-        let values = database.head().read(main, keys([1, 2, 3, 4]), &mut arena).unwrap();
+        let values = database.head().read(blobs, keys([1, 2, 3, 4]), &mut arena).unwrap();
         let read: Vec<Option<&[u8]>> = values.iter().collect();
         assert_eq!(
             read,
@@ -1133,7 +1119,7 @@ mod tests {
 
         let failure = database
             .head()
-            .write(main, (keys([1, 2]), tape([b"alpha"])), Durability::Buffered)
+            .write(blobs, (keys([1, 2]), tape([b"alpha"])), Durability::Buffered)
             .unwrap_err();
         assert_eq!(failure.status, Status::InvalidArgument);
     }
@@ -1144,20 +1130,20 @@ mod tests {
         let executor = Executor::for_ram(&[], 2, 0).unwrap();
         let blocking = database.head().on(&executor);
         let deferred = database.head().deferred(&executor);
-        let main = CollectionID::main();
+        let blobs = created(&database, Modality::Blobs);
         let pairs = (keys([1, 2, 3]), tape([b"alpha", b"beta", b"gamma"]));
 
         // Writes and removals hand their inputs back, whichever way the call finishes.
-        let pairs = blocking.write(main, pairs, Durability::Buffered).unwrap();
+        let pairs = blocking.write(blobs, pairs, Durability::Buffered).unwrap();
         let (written, _) = deferred
-            .write(main, pairs, Durability::Buffered)
+            .write(blobs, pairs, Durability::Buffered)
             .unwrap()
             .wait()
             .unwrap();
         assert_eq!(written, keys([1, 2, 3]));
-        let removed = blocking.remove(main, keys([3]), Durability::Buffered).unwrap();
+        let removed = blocking.remove(blobs, keys([3]), Durability::Buffered).unwrap();
         let removed = deferred
-            .remove(main, removed, Durability::Buffered)
+            .remove(blobs, removed, Durability::Buffered)
             .unwrap()
             .wait()
             .unwrap();
@@ -1165,50 +1151,46 @@ mod tests {
 
         // Reads borrow one arena on either view, and each call rewinds it for the next.
         let mut arena = Arena::new_in(&executor).unwrap();
-        let read = blocking.read(main, keys([1, 3]), &mut arena).unwrap();
+        let read = blocking.read(blobs, keys([1, 3]), &mut arena).unwrap();
         assert_eq!(read.get(0), Some(b"alpha".as_slice()));
         let read = deferred
-            .read(main, vec![key(2), key(3)], &mut arena)
+            .read(blobs, vec![key(2), key(3)], &mut arena)
             .unwrap()
             .wait()
             .unwrap();
         assert_eq!(read.get(0), Some(b"beta".as_slice()));
         assert_eq!(read.get(1), None);
 
-        let scanned = deferred.scan(main, key(2), 10, &mut arena).unwrap().wait().unwrap();
+        let scanned = deferred.scan(blobs, key(2), 10, &mut arena).unwrap().wait().unwrap();
         assert_eq!(scanned, &keys([2]));
-        assert_eq!(blocking.scan(main, key(0), 1, &mut arena).unwrap(), &keys([1]));
-        let sampled = deferred.sample(main, 10, &mut arena).unwrap().wait().unwrap();
+        assert_eq!(blocking.scan(blobs, key(0), 1, &mut arena).unwrap(), &keys([1]));
+        let sampled = deferred.sample(blobs, 10, &mut arena).unwrap().wait().unwrap();
         assert_eq!(sampled.len(), 2);
-        assert_eq!(blocking.sample(main, 1, &mut arena).unwrap().len(), 1);
+        assert_eq!(blocking.sample(blobs, 1, &mut arena).unwrap().len(), 1);
         let measured = deferred
-            .measure(main, key(1), key(3), &mut arena)
+            .measure(blobs, key(1), key(3), &mut arena)
             .unwrap()
             .wait()
             .unwrap();
         assert!(measured.max_cardinality >= measured.min_cardinality);
-        let measured = blocking.measure(main, key(1), key(3), &mut arena).unwrap();
+        let measured = blocking.measure(blobs, key(1), key(3), &mut arena).unwrap();
         assert!(measured.max_value_bytes >= measured.min_value_bytes);
     }
 
     #[test]
     fn a_refused_deferred_call_never_reaches_the_library() {
-        let (database, mut arena) = populated();
+        let (database, blobs, mut arena) = populated();
         let executor = Executor::for_ram(&[], 1, 0).unwrap();
-        static MAIN_ALONE: [CollectionID; 1] = [CollectionID(UUID([0; 16]))];
+        static ONE_ALONE: [CollectionID; 1] = [CollectionID(UUID([0; 16]))];
         let refused = database
             .head()
             .deferred(&executor)
-            .read(Collections::Each(&MAIN_ALONE), keys([1, 2]), &mut arena)
+            .read(Collections::Each(&ONE_ALONE), keys([1, 2]), &mut arena)
             .unwrap_err();
         assert_eq!(refused.status, Status::InvalidArgument, "a collection per task");
 
         // An empty batch reaches no engine and is final at once.
-        let empty = database
-            .head()
-            .deferred(&executor)
-            .read(CollectionID::main(), [], &mut arena)
-            .unwrap();
+        let empty = database.head().deferred(&executor).read(blobs, [], &mut arena).unwrap();
         assert_eq!(empty.status(), Ok(()));
         assert!(empty.wait().unwrap().is_empty());
     }
@@ -1226,16 +1208,14 @@ mod tests {
     fn writes_land_in_the_collection_they_name() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new().unwrap();
-        let named = database.collection_create("people", Modality::Any).unwrap();
+        let named = database.collection_create("people", Modality::Blobs).unwrap();
+        let other = created(&database, Modality::Blobs);
         let entries = [Entry::new(key(1), b"in the named one")];
         database.head().write(named, &entries, Durability::Buffered).unwrap();
 
         let there = database.head().read(named, keys([1]), &mut arena).unwrap();
         assert_eq!(there.get(0), Some(b"in the named one".as_slice()));
-        let elsewhere = database
-            .head()
-            .read(CollectionID::main(), keys([1]), &mut arena)
-            .unwrap();
+        let elsewhere = database.head().read(other, keys([1]), &mut arena).unwrap();
         assert_eq!(elsewhere.get(0), None);
 
         // Dropping the collection takes its contents with it.
@@ -1245,43 +1225,30 @@ mod tests {
 
     #[test]
     fn scans_walk_in_key_order_and_paginate() {
-        let (database, mut arena) = populated();
-        let first_page = database
-            .head()
-            .scan(CollectionID::main(), key(0), 2, &mut arena)
-            .unwrap();
+        let (database, blobs, mut arena) = populated();
+        let first_page = database.head().scan(blobs, key(0), 2, &mut arena).unwrap();
         assert_eq!(first_page, &keys([1, 2]));
 
         let resume = first_page[first_page.len() - 1].next();
-        let second_page = database
-            .head()
-            .scan(CollectionID::main(), resume, 2, &mut arena)
-            .unwrap();
+        let second_page = database.head().scan(blobs, resume, 2, &mut arena).unwrap();
         assert_eq!(second_page, &keys([3]));
 
         // A walk starting past the last key finds nothing.
-        assert!(database
-            .head()
-            .scan(CollectionID::main(), key(99), 2, &mut arena)
-            .unwrap()
-            .is_empty());
+        assert!(database.head().scan(blobs, key(99), 2, &mut arena).unwrap().is_empty());
     }
 
     #[test]
     fn scans_refuse_a_limit_of_nothing_to_walk() {
-        let (database, mut arena) = populated();
-        let found = database
-            .head()
-            .scan(CollectionID::main(), key(0), 0, &mut arena)
-            .unwrap();
+        let (database, blobs, mut arena) = populated();
+        let found = database.head().scan(blobs, key(0), 0, &mut arena).unwrap();
         assert!(found.is_empty(), "wanting nothing walks nothing");
     }
 
     #[test]
     fn cursors_resume_past_the_last_key_until_a_short_page() {
-        let (database, mut arena) = populated();
-        let (head, main) = (database.head(), CollectionID::main());
-        let mut cursor = head.cursor(main, key(0)).unwrap();
+        let (database, blobs, mut arena) = populated();
+        let head = database.head();
+        let mut cursor = head.cursor(blobs, key(0)).unwrap();
         let page = cursor.next_pairs(2, &mut arena).unwrap();
         assert_eq!(page.keys(), &keys([1, 2]));
         let values = (page.get(0), page.get(1), page.get(2));
@@ -1289,26 +1256,23 @@ mod tests {
 
         // A key written behind the walk is never handed out, and one written ahead of it is.
         let late = [Entry::new(key(0), b"behind"), Entry::new(key(4), b"ahead")];
-        head.write(main, &late, Durability::Buffered).unwrap();
+        head.write(blobs, &late, Durability::Buffered).unwrap();
         assert_eq!(cursor.next(2, &mut arena).unwrap(), &keys([3, 4]));
 
         // A page shorter than wanted exhausts the walk for good.
         assert!(cursor.next(2, &mut arena).unwrap().is_empty());
         let later = [Entry::new(key(5), b"later")];
-        head.write(main, &later, Durability::Buffered).unwrap();
+        head.write(blobs, &later, Durability::Buffered).unwrap();
         assert!(cursor.next(2, &mut arena).unwrap().is_empty());
     }
 
     #[test]
     fn cursors_read_through_the_snapshot_they_were_opened_at() {
-        let (database, mut arena) = populated();
+        let (database, blobs, mut arena) = populated();
         let executor = Executor::for_ram(&[], 1, 0).unwrap();
         let snapshot = database.snapshot().unwrap();
-        let mut cursor = snapshot.on(&executor).cursor(CollectionID::main(), key(0)).unwrap();
-        database
-            .head()
-            .remove(CollectionID::main(), keys([2]), Durability::Buffered)
-            .unwrap();
+        let mut cursor = snapshot.on(&executor).cursor(blobs, key(0)).unwrap();
+        database.head().remove(blobs, keys([2]), Durability::Buffered).unwrap();
 
         let page = cursor.next_pairs(10, &mut arena).unwrap();
         assert_eq!(page.keys(), &keys([1, 2, 3]));
@@ -1318,8 +1282,8 @@ mod tests {
 
     #[test]
     fn samples_draw_from_what_the_collection_holds() {
-        let (database, mut arena) = populated();
-        let drawn = database.head().sample(CollectionID::main(), 2, &mut arena).unwrap();
+        let (database, blobs, mut arena) = populated();
+        let drawn = database.head().sample(blobs, 2, &mut arena).unwrap();
         assert_eq!(drawn.len(), 2);
         for drawn_key in drawn {
             assert!(
@@ -1331,11 +1295,8 @@ mod tests {
 
     #[test]
     fn measurements_bound_what_a_range_holds() {
-        let (database, mut arena) = populated();
-        let measured = database
-            .head()
-            .measure(CollectionID::main(), key(1), key(3), &mut arena)
-            .unwrap();
+        let (database, blobs, mut arena) = populated();
+        let measured = database.head().measure(blobs, key(1), key(3), &mut arena).unwrap();
         assert!(measured.min_cardinality <= 3 && measured.max_cardinality >= measured.min_cardinality);
         assert!(measured.max_value_bytes >= measured.min_value_bytes);
         assert!(measured.max_space_usage >= measured.min_space_usage);
@@ -1345,8 +1306,8 @@ mod tests {
     fn one_batch_spans_several_collections() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new().unwrap();
-        let people = database.collection_create("people", Modality::Any).unwrap();
-        let places = database.collection_create("places", Modality::Any).unwrap();
+        let people = database.collection_create("people", Modality::Blobs).unwrap();
+        let places = database.collection_create("places", Modality::Blobs).unwrap();
 
         let entries = [Entry::new(key(1), b"Ada"), Entry::new(key(1), b"Kent")];
         let written = [people, places];
@@ -1379,8 +1340,8 @@ mod tests {
 
     #[test]
     fn a_batch_of_collections_matches_the_batch_of_tasks() {
-        let (database, mut arena) = populated();
-        let one = [CollectionID::main()];
+        let (database, blobs, mut arena) = populated();
+        let one = [blobs];
         let failure = database
             .head()
             .read(Collections::Each(&one), keys([1, 2]), &mut arena)
@@ -1397,7 +1358,7 @@ mod tests {
 
     #[test]
     fn an_unknown_collection_is_refused() {
-        let (database, mut arena) = populated();
+        let (database, _, mut arena) = populated();
         // Every call resolves its collections first, so an identifier nobody created reaches nothing.
         let failure = database
             .head()

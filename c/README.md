@@ -182,8 +182,8 @@ The `ram` and RocksDB engines refuse to drop the collections while a snapshot is
 
 ## Collections
 
-Every database has a main collection, `ustore_collection_main_k`, named by the nil UUID, which a `collections` view with `NULL` data addresses.
-A collection is created with an optional name and the `ustore_modality_t` it holds, and addressed afterwards by the identifier the call answers, a UUIDv7 the catalog mints once and never reuses:
+A database holds no collection until one is created, and every call names the collections it addresses, refusing a `collections` view with `NULL` data with `ustore_status_invalid_argument_k`.
+A collection is created with an optional name and the `ustore_modality_t` it holds, and addressed afterwards by the identifier the call answers, a UUIDv7 its create mints once and never reuses:
 
 ```c
 char const name[] = "movies";
@@ -196,19 +196,22 @@ ustore_collection_create(&(ustore_collection_create_t){
     .collection = &movies,
 });
 
-ustore_collection_drop(&(ustore_collection_drop_t){
+ustore_collection_id_t values = {0};
+ustore_collection_create(&(ustore_collection_create_t){
     .database = database,
     .outcome = &outcome,
-    .collection = movies,
-    .mode = ustore_drop_collection_k,
+    .modality = ustore_modality_blobs_k,
+    .collection = &values,
 });
 ```
 
-Each engine records names apart from every collection, so no identifier reaches them, and a name resolves in two phases: once through `ustore_collection_find`, which answers the identifier and the modality of every name of a batch at the head or at a snapshot, and by identifier from then on, as no other call carries one.
+The examples below write binary values into `values` and documents into `movies`.
+
+Each engine records names in the `_names` system collection and every collection's modality and name in `_collections`, which no identifier reaches and no listing shows, so a name starting with `_` is refused, and a name resolves in two phases: once through `ustore_collection_find`, which answers the identifier and the modality of every name of a batch at the head or at a snapshot, and by identifier from then on, as no other call carries one.
 Collections are created and dropped only at the head, so their names are never read inside a transaction, and resolving one never joins the conflicts of the work that follows it.
 A create records the name in the same step as the collection, refusing a name another collection carries even under a concurrent creator.
-The main collection is never removed, so only `ustore_drop_pairs_k` and `ustore_drop_values_k` apply to it, and dropping any other collection whole forgets its name before the collection goes.
-`ustore_collection_list` exports the identifier of every other collection and, where asked, its modality and its name, as a tape where a collection created without one has an empty name.
+A name no collection carries resolves to the nil UUID with its presence bit cleared, and `ustore_collection_drop` with `ustore_drop_collection_k` forgets a collection's name before the collection goes.
+`ustore_collection_list` exports the identifier of every collection and, where asked, its modality and its name, as a tape where a collection created without one has an empty name.
 A listing describes the database rather than a transaction, so it reads the head or a snapshot.
 
 ## Writes and Removals
@@ -229,6 +232,7 @@ ustore_blobs_write(&(ustore_blobs_write_t){
     .database = database,
     .outcome = &outcome,
     .count = 1,
+    .collections = {&values, 0},
     .keys = {&key, sizeof(ustore_key_t)},
     .values = {.layout = ustore_strings_u32_tape_k, .data.u32_tape = {(uint8_t const*)value, offsets}},
 });
@@ -263,6 +267,7 @@ ustore_blobs_write(&(ustore_blobs_write_t){
     .database = database,
     .outcome = &outcome,
     .count = 2,
+    .collections = {&values, 0},
     .keys = {&pairs[0].key, sizeof(pair_t)},
     .values = {.layout = ustore_strings_accessor_k, .data.accessor = {get_texts, pairs}},
 });
@@ -273,7 +278,8 @@ An accessor writing the same view for every index writes one value under every k
 Removing keys is its own call, so no value ever deletes, and an empty value is still a value:
 
 ```c
-ustore_blobs_remove(&(ustore_blobs_remove_t){.database = database, .outcome = &outcome, .count = 1, .keys = {&key, 0}});
+ustore_blobs_remove(&(ustore_blobs_remove_t){
+    .database = database, .outcome = &outcome, .count = 1, .collections = {&values, 0}, .keys = {&key, 0}});
 ```
 
 A batch is atomic: if one task fails, none is applied.
@@ -293,6 +299,7 @@ ustore_blobs_read(&(ustore_blobs_read_t){
     .database = database,
     .outcome = &outcome,
     .count = 1,
+    .collections = {&values, 0},
     .keys = {&key, sizeof(ustore_key_t)},
     .presences = &presences,
     .values = &values,
@@ -322,6 +329,7 @@ ustore_blobs_scan(&(ustore_blobs_scan_t){
     .database = database,
     .outcome = &outcome,
     .count = 1,
+    .collections = {&values, 0},
     .start_keys = {&start, sizeof(ustore_key_t)},
     .offsets = &offsets,
     .keys = &found,
@@ -345,7 +353,7 @@ ustore_blobs_cursor_init(&(ustore_blobs_cursor_init_t){
     .cursor = &cursor,
     .database = database,
     .outcome = &outcome,
-    .collection = ustore_collection_main_k,
+    .collection = values,
 });
 
 ustore_size_t const wanted = 256;
@@ -430,7 +438,7 @@ ustore_snapshot_free(snapshot);
 A snapshot lives no longer than the process that took it, and holds its database open until freed, as a transaction does, so `ustore_database_free` closes the database only once the last of them is freed.
 `ustore_snapshot_save` writes one out as a new database of the same engine, holding exactly the collections and names the snapshot records, which that engine's open then serves, so a save is how a view outlives the process.
 RocksDB and LevelDB create its `path`, while the `ram` engine writes its image into the directory `path` names.
-Persistent snapshots, recorded in the catalog under UUIDv7 identifiers and kept across restarts until dropped, are planned.
+Persistent snapshots, recorded in a system collection under UUIDv7 identifiers and kept across restarts until dropped, are planned.
 
 ## Progress and Cancellation
 
@@ -476,6 +484,7 @@ A field addresses a value inside a document, either as a top-level key such as `
 - `ustore_docs_gist` lists the unique JSON Pointers to the leaves of the requested documents.
 - `ustore_docs_gather` reads many fields of many documents into typed columns, with validity, conversion and collision bitmaps per column.
 - `ustore_docs_remove` removes whole documents, and `ustore_docs_scan` lists their keys as `ustore_blobs_scan` lists the keys of blobs.
+- `ustore_docs_sample` draws document keys at random as `ustore_blobs_sample` draws the keys of blobs.
 
 ```c
 ustore_key_t key = {.uuid.bytes[15] = 1};
@@ -485,6 +494,7 @@ ustore_docs_write(&(ustore_docs_write_t){
     .database = database,
     .outcome = &outcome,
     .count = 1,
+    .collections = {&movies, 0},
     .keys = {&key, sizeof(ustore_key_t)},
     .values = {.layout = ustore_strings_u32_tape_k, .data.u32_tape = {(uint8_t const*)document, document_offsets}},
     .type = ustore_docs_field_type_json_k,
@@ -498,6 +508,7 @@ ustore_docs_read(&(ustore_docs_read_t){
     .database = database,
     .outcome = &outcome,
     .count = 1,
+    .collections = {&movies, 0},
     .keys = {&key, sizeof(ustore_key_t)},
     .fields = {.layout = ustore_strings_u32_tape_k, .data.u32_tape = {(uint8_t const*)field, field_offsets}},
     .values = &person,

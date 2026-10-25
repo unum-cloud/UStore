@@ -103,7 +103,7 @@ typedef struct ustore_docs_write_t {
     /** Number of documents or fields to write. */
     ustore_size_t count;
 
-    /** Collections of the documents, where @c NULL data stands for the main collection. */
+    /** Collections of the documents. */
     ustore_collections_view_t collections;
 
     /** Keys of the documents, where @c NULL data reads every key from @c id_field. */
@@ -164,7 +164,7 @@ typedef struct ustore_docs_read_t {
     /** Number of documents or fields to read. */
     ustore_size_t count;
 
-    /** Collections of the documents, where @c NULL data stands for the main collection. */
+    /** Collections of the documents. */
     ustore_collections_view_t collections;
 
     /** Keys of the documents. */
@@ -218,7 +218,7 @@ typedef struct ustore_docs_gist_t {
     /** Number of documents to inspect. */
     ustore_size_t count;
 
-    /** Collections of the documents, where @c NULL data stands for the main collection. */
+    /** Collections of the documents. */
     ustore_collections_view_t collections;
 
     /** Keys of the documents. */
@@ -295,7 +295,7 @@ typedef struct ustore_docs_gather_t {
     /** Number of documents, the rows of the output. */
     ustore_size_t count;
 
-    /** Collections of the documents, where @c NULL data stands for the main collection. */
+    /** Collections of the documents. */
     ustore_collections_view_t collections;
 
     /** Keys of the documents. */
@@ -345,7 +345,7 @@ typedef struct ustore_docs_remove_t {
     /** Number of tasks, one per document. */
     ustore_size_t count;
 
-    /** Collections of the documents, where @c NULL data stands for the main collection. */
+    /** Collections of the documents. */
     ustore_collections_view_t collections;
 
     /** Keys of the documents to remove. */
@@ -392,7 +392,7 @@ typedef struct ustore_docs_scan_t {
     /** Number of scans. */
     ustore_size_t count;
 
-    /** Collections to scan, where @c NULL data stands for the main collection. */
+    /** Collections to scan. */
     ustore_collections_view_t collections;
 
     /** Smallest key every scan may return, where @c NULL data starts at the first key. */
@@ -426,6 +426,51 @@ typedef struct ustore_docs_scan_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
 USTORE_EXPORT void ustore_docs_scan(ustore_docs_scan_t* arguments);
+
+/** The arguments of @c ustore_docs_sample, which draws up to @c wanted document keys uniformly at random from every
+ *  collection, exporting no documents, so a read or a gather follows the sample. */
+typedef struct ustore_docs_sample_t {
+
+    /** An open database. */
+    ustore_database_t database;
+
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call returns final, the default, or once submitted. */
+    ustore_completion_t completion;
+
+    /** What the call sees, where @c NULL is the head. */
+    ustore_view_t view;
+
+    /** Number of samples. */
+    ustore_size_t count;
+
+    /** Collections to sample. */
+    ustore_collections_view_t collections;
+
+    /** Output for @c count plus one offsets into @c keys, the last one closing the final sample, inside @c arena. */
+    ustore_length_t const** offsets;
+
+    /** Output for the sampled keys, sample after sample, inside @c arena. */
+    ustore_key_t const** keys;
+
+    /** Rewound by this call, then holding every output it writes; @c NULL is refused. */
+    ustore_arena_t arena;
+
+    /** Most keys every sample draws. */
+    ustore_size_t wanted;
+
+} ustore_docs_sample_t;
+
+/**
+ *  @brief Samples document keys from a batch of collections.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ */
+USTORE_EXPORT void ustore_docs_sample(ustore_docs_sample_t* arguments);
 
 #ifdef __cplusplus
 }

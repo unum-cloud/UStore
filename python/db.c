@@ -188,9 +188,8 @@ static char const doc_Database[] =                                              
     "each take what their engine can be asked; engines_compiled() names the ones this build\n" //
     "carries, and the others refuse to open. Each takes an `executor` keyword and blocks\n"    //
     "on it, as it blocks on the calling thread without one. The directory belongs to\n"        //
-    "the database, so no two processes may open the same one at once. Every database holds\n"  //
-    "a main collection, which can be cleared but never dropped, beside the collections it\n"   //
-    "creates.\n"                                                                               //
+    "the database, so no two processes may open the same one at once. No collection exists\n"  //
+    "until `collection_create` makes it, and names starting with `_` are reserved.\n"          //
     "\n"                                                                                       //
     "Indexing it by name, as `db['movies']`, answers a Collection, whose `blobs`, `docs`,\n"   //
     "`graph` and `table` views create it on their first write. Its verbs run on the calling\n" //
@@ -522,15 +521,14 @@ static PyObject* Database_repr(Database* self) {
 static PyObject* capabilities_object(ustore_capabilities_t flags) {
     PyObject* const capabilities = PyStructSequence_New(CapabilitiesType);
     if (!capabilities) return NULL;
-    ustore_capabilities_t const named[3] = {ustore_capabilities_transactions_k, ustore_capabilities_collections_k,
-                                            ustore_capabilities_snapshots_k};
-    for (Py_ssize_t index = 0; index != 3; ++index)
+    ustore_capabilities_t const named[2] = {ustore_capabilities_transactions_k, ustore_capabilities_snapshots_k};
+    for (Py_ssize_t index = 0; index != 2; ++index)
         PyStructSequence_SetItem(capabilities, index, PyBool_FromLong((flags & named[index]) != 0));
     return capabilities;
 }
 
 static char const doc_Database_capabilities[] =
-    "What the engine supports, as a Capabilities of `transactions`, `collections` and `snapshots`.";
+    "What the engine supports, as a Capabilities of `transactions` and `snapshots`.";
 
 static PyObject* Database_get_capabilities(Database* self, void* Py_UNUSED(closure)) {
     return capabilities_object(self->capabilities);
@@ -574,9 +572,8 @@ static char const doc_Database_clear[] =                                        
     "\n"                                                                                      //
     "Args:\n"                                                                                 //
     "  mode (DropMode): `DropMode.PAIRS` removes every key and value and keeps the\n"         //
-    "    collections, `DropMode.COLLECTION` drops every collection but the main one with\n"   //
-    "    its name and empties the main one, and `DropMode.VALUES` empties every value and\n"  //
-    "    keeps the keys.\n"                                                                   //
+    "    collections, `DropMode.COLLECTION` drops every collection with its name, and\n"      //
+    "    `DropMode.VALUES` empties every value and keeps the keys.\n"                         //
     "Raises:\n"                                                                               //
     "  InvalidArgumentError: The RAM and RocksDB engines drop no collection while a\n"        //
     "    snapshot is open, since the snapshot belongs to its holder.\n"                       //
@@ -710,21 +707,21 @@ static PyObject* Database_describe(PyObject* self, PyObject* Py_UNUSED(ignored))
 
 #pragma region Collections
 
-static char const doc_Database_collection_create[] =                                               //
-    "collection_create(name, *, modality=Modality.ANY) answers the new collection's identifier.\n" //
-    "\n"                                                                                           //
-    "Creates an empty collection and records the name for it, in the two phases a name\n"          //
-    "always resolves through. Every other verb addresses the collection by the identifier\n"       //
-    "this answers.\n"                                                                              //
-    "\n"                                                                                           //
-    "Args:\n"                                                                                      //
-    "  name (str): The name to record, which must not already be taken.\n"                         //
-    "  modality (Modality): What the collection holds.\n"                                          //
-    "Returns:\n"                                                                                   //
-    "  UUID: The identifier addressing the new collection.\n"                                      //
-    "Raises:\n"                                                                                    //
-    "  AlreadyExistsError: A collection already carries the name.\n"                               //
-    "  UnsupportedError: The engine holds only the main collection.";
+static char const doc_Database_collection_create[] =                                          //
+    "collection_create(name, *, modality) answers the new collection's identifier.\n"         //
+    "\n"                                                                                      //
+    "Creates an empty collection and records the name for it, in the two phases a name\n"     //
+    "always resolves through. Every other verb addresses the collection by the identifier\n"  //
+    "this answers.\n"                                                                         //
+    "\n"                                                                                      //
+    "Args:\n"                                                                                 //
+    "  name (str): The name to record, which must not already be taken nor start with `_`.\n" //
+    "  modality (Modality): What the collection holds.\n"                                     //
+    "Returns:\n"                                                                              //
+    "  UUID: The identifier addressing the new collection.\n"                                 //
+    "Raises:\n"                                                                               //
+    "  AlreadyExistsError: A collection already carries the name.\n"                          //
+    "  InvalidArgumentError: The name is empty or starts with `_`, reserved for the system.";
 
 static PyObject* Database_collection_create(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
                                             PyObject* args_names_tuple) {
@@ -735,20 +732,23 @@ static PyObject* Database_collection_create(PyObject* self, PyObject* const* arg
                                                                            args_names_tuple, 1);
     if (args_names_count < 0) return NULL;
 
-    int modality = ustore_modality_any_k;
+    PyObject* modality_object = NULL;
     for (Py_ssize_t names_progress = 0, args_progress = positional_args_count; names_progress != args_names_count;
          ++args_progress, ++names_progress) {
         PyObject* const name = PyTuple_GET_ITEM(args_names_tuple, names_progress);
-        if (PyUnicode_CompareWithASCIIString(name, "modality") == 0) {
-            if (ustore_py_enum_from_object(args[args_progress], "modality", ustore_py_enum_modality_k, &modality) != 0)
-                return NULL;
-        }
+        if (PyUnicode_CompareWithASCIIString(name, "modality") == 0) { modality_object = args[args_progress]; }
         else {
             PyErr_Format(PyExc_TypeError, "Got unexpected keyword argument: %S", name);
             return NULL;
         }
     }
 
+    if (!modality_object) {
+        PyErr_SetString(PyExc_TypeError, "collection_create() needs the modality the collection holds");
+        return NULL;
+    }
+    int modality = ustore_modality_blobs_k;
+    if (ustore_py_enum_from_object(modality_object, "modality", ustore_py_enum_modality_k, &modality) != 0) return NULL;
     if (!PyUnicode_Check(args[0])) {
         PyErr_Format(PyExc_TypeError, "A collection name is a string, got %S", Py_TYPE(args[0]));
         return NULL;
@@ -756,12 +756,8 @@ static PyObject* Database_collection_create(PyObject* self, PyObject* const* arg
     Py_ssize_t name_length = 0;
     char const* const name = PyUnicode_AsUTF8AndSize(args[0], &name_length);
     if (!name) return NULL;
-    if (name_length == 0) {
-        ustore_py_raise(ustore_status_invalid_argument_k, "The main collection has no name and always exists");
-        return NULL;
-    }
 
-    ustore_collection_id_t created = ustore_collection_main_k;
+    ustore_collection_id_t created = {{{0}}};
     ustore_outcome_t outcome = {0};
     ustore_collection_create_t create = {0};
     create.database = context.database_handle;
@@ -785,7 +781,7 @@ static char const doc_Database_collection_find[] =                              
     "transaction never creates or drops collections.\n"                                  //
     "\n"                                                                                 //
     "Args:\n"                                                                            //
-    "  name (str): The name to resolve; the empty one is the main collection.\n"         //
+    "  name (str): The name to resolve.\n"                                               //
     "  arena (Arena): Where the lookup lands before it is copied out, rewound by this\n" //
     "    call.\n"                                                                        //
     "Returns:\n"                                                                         //
@@ -812,7 +808,7 @@ typedef struct find_call_t {
     ustore_collection_id_t const* collections;
 } find_call_t;
 
-// A collection given by ID, or the main one, needs no lookup, so its call is final at once.
+// A collection given by ID needs no lookup, so its call is final at once.
 static void find_submit(void* arguments) {
     ustore_collection_find_t* const find = (ustore_collection_find_t*)arguments;
     if (find->count) ustore_collection_find(find);
@@ -843,7 +839,7 @@ static PyObject* Database_collection_find(PyObject* self, PyObject* const* args,
     find_call_t* const call = ustore_py_call_open(&context, &find_verb, &stack);
     if (!call) return NULL;
     Py_ssize_t length = 0;
-    int const looked_up = PyUnicode_Check(name_object) && PyUnicode_GET_LENGTH(name_object) != 0;
+    int const looked_up = PyUnicode_Check(name_object);
     if (!looked_up && ustore_py_collection_from_object(&context, name_object, &call->call.collection) != 0)
         return ustore_py_call_discard(&context, &find_verb, call);
     if (looked_up && !(call->text.data = (uint8_t const*)PyUnicode_AsUTF8AndSize(name_object, &length)))
@@ -867,12 +863,12 @@ static PyObject* Database_collection_find(PyObject* self, PyObject* const* args,
     return ustore_py_call_run(&context, &find_verb, call, &find);
 }
 
-static char const doc_Database_collection_contains[] =                            //
-    "collection_contains(name) answers whether a collection carries the name.\n"  //
-    "\n"                                                                          //
-    "Args:\n"                                                                     //
-    "  name (str): The name to look for; the empty one is the main collection.\n" //
-    "Returns:\n"                                                                  //
+static char const doc_Database_collection_contains[] =                           //
+    "collection_contains(name) answers whether a collection carries the name.\n" //
+    "\n"                                                                         //
+    "Args:\n"                                                                    //
+    "  name (str): The name to look for.\n"                                      //
+    "Returns:\n"                                                                 //
     "  bool: Whether the name is taken.";
 
 static PyObject* Database_collection_contains(PyObject* self, PyObject* name_object) {
@@ -885,9 +881,8 @@ static PyObject* Database_collection_contains(PyObject* self, PyObject* name_obj
     Py_ssize_t length = 0;
     char const* const name = PyUnicode_AsUTF8AndSize(name_object, &length);
     if (!name) return NULL;
-    if (length == 0) Py_RETURN_TRUE;
 
-    ustore_collection_id_t found = ustore_collection_main_k;
+    ustore_collection_id_t found = {{{0}}};
     switch (ustore_py_collection_named(&context, name, (size_t)length, &found, NULL)) {
     case ustore_py_naming_found_k: Py_RETURN_TRUE;
     case ustore_py_naming_missing_k: Py_RETURN_FALSE;
@@ -900,7 +895,7 @@ static char const doc_Database_collection_list[] =                              
     "collection_list(arena) answers the identifiers of every collection.\n"               //
     "\n"                                                                                  //
     "Lists the collections at the snapshot of a snapshot, and at the head otherwise.\n"   //
-    "The main collection is never listed, and collection_names answers the names.\n"      //
+    "System collections are never listed, and collection_names answers the names.\n"      //
     "\n"                                                                                  //
     "Args:\n"                                                                             //
     "  arena (Arena): Where the listing lands before it is copied out, rewound by this\n" //
@@ -1026,7 +1021,7 @@ static char const doc_Database_collection_drop[] =                              
     "  collection (UUID | str): The collection, by identifier or by name.\n"                 //
     "  mode (DropMode, optional): `DropMode.COLLECTION` removes the handle and everything\n" //
     "    in it, `DropMode.PAIRS` removes every key and value, and `DropMode.VALUES` every\n" //
-    "    value. The main collection accepts the latter two alone.\n"                         //
+    "    value.\n"                                                                           //
     "Raises:\n"                                                                              //
     "  NotFoundError: No collection carries the name.";
 
@@ -1044,7 +1039,7 @@ static PyObject* Database_collection_drop(PyObject* self, PyObject* const* args,
         return NULL;
 
     // A name resolves first, and the collection it addresses takes the name with it when it goes
-    ustore_collection_id_t collection = ustore_collection_main_k;
+    ustore_collection_id_t collection = {{{0}}};
     if (ustore_py_collection_from_object(&context, args[0], &collection) != 0) return NULL;
     ustore_outcome_t outcome = {0};
     ustore_collection_drop_t drop = {0};
@@ -1732,6 +1727,7 @@ static PyMethodDef Database_methods[] = {
     {"docs_gist", (PyCFunction)(void (*)(void))ustore_py_api_docs_gist, ustore_py_method_flags_k, doc_docs_gist},
     {"docs_gather", (PyCFunction)(void (*)(void))ustore_py_api_docs_gather, ustore_py_method_flags_k, doc_docs_gather},
     {"docs_scan", (PyCFunction)(void (*)(void))ustore_py_api_docs_scan, ustore_py_method_flags_k, doc_docs_scan},
+    {"docs_sample", (PyCFunction)(void (*)(void))ustore_py_api_docs_sample, ustore_py_method_flags_k, doc_docs_sample},
     {"docs_remove", (PyCFunction)(void (*)(void))ustore_py_api_docs_remove, ustore_py_method_flags_k, doc_docs_remove},
     {"graph_write_edges", (PyCFunction)(void (*)(void))ustore_py_api_graph_write_edges, ustore_py_method_flags_k,
      doc_graph_write_edges},
@@ -1741,6 +1737,8 @@ static PyMethodDef Database_methods[] = {
      doc_graph_read_edges},
     {"graph_degrees", (PyCFunction)(void (*)(void))ustore_py_api_graph_degrees, ustore_py_method_flags_k,
      doc_graph_degrees},
+    {"graph_contains", (PyCFunction)(void (*)(void))ustore_py_api_graph_contains, ustore_py_method_flags_k,
+     doc_graph_contains},
     {"graph_scan_vertices", (PyCFunction)(void (*)(void))ustore_py_api_graph_scan_vertices, ustore_py_method_flags_k,
      doc_graph_scan_vertices},
     {"graph_write_vertices", (PyCFunction)(void (*)(void))ustore_py_api_graph_write_vertices, ustore_py_method_flags_k,
@@ -1806,6 +1804,7 @@ static PyMethodDef Transaction_methods[] = {
     {"docs_gist", (PyCFunction)(void (*)(void))ustore_py_api_docs_gist, ustore_py_method_flags_k, doc_docs_gist},
     {"docs_gather", (PyCFunction)(void (*)(void))ustore_py_api_docs_gather, ustore_py_method_flags_k, doc_docs_gather},
     {"docs_scan", (PyCFunction)(void (*)(void))ustore_py_api_docs_scan, ustore_py_method_flags_k, doc_docs_scan},
+    {"docs_sample", (PyCFunction)(void (*)(void))ustore_py_api_docs_sample, ustore_py_method_flags_k, doc_docs_sample},
     {"docs_remove", (PyCFunction)(void (*)(void))ustore_py_api_docs_remove, ustore_py_method_flags_k, doc_docs_remove},
     {"graph_write_edges", (PyCFunction)(void (*)(void))ustore_py_api_graph_write_edges, ustore_py_method_flags_k,
      doc_graph_write_edges},
@@ -1815,6 +1814,8 @@ static PyMethodDef Transaction_methods[] = {
      doc_graph_read_edges},
     {"graph_degrees", (PyCFunction)(void (*)(void))ustore_py_api_graph_degrees, ustore_py_method_flags_k,
      doc_graph_degrees},
+    {"graph_contains", (PyCFunction)(void (*)(void))ustore_py_api_graph_contains, ustore_py_method_flags_k,
+     doc_graph_contains},
     {"graph_scan_vertices", (PyCFunction)(void (*)(void))ustore_py_api_graph_scan_vertices, ustore_py_method_flags_k,
      doc_graph_scan_vertices},
     {"graph_write_vertices", (PyCFunction)(void (*)(void))ustore_py_api_graph_write_vertices, ustore_py_method_flags_k,
@@ -1870,10 +1871,13 @@ static PyMethodDef Snapshot_methods[] = {
     {"docs_gist", (PyCFunction)(void (*)(void))ustore_py_api_docs_gist, ustore_py_method_flags_k, doc_docs_gist},
     {"docs_gather", (PyCFunction)(void (*)(void))ustore_py_api_docs_gather, ustore_py_method_flags_k, doc_docs_gather},
     {"docs_scan", (PyCFunction)(void (*)(void))ustore_py_api_docs_scan, ustore_py_method_flags_k, doc_docs_scan},
+    {"docs_sample", (PyCFunction)(void (*)(void))ustore_py_api_docs_sample, ustore_py_method_flags_k, doc_docs_sample},
     {"graph_read_edges", (PyCFunction)(void (*)(void))ustore_py_api_graph_read_edges, ustore_py_method_flags_k,
      doc_graph_read_edges},
     {"graph_degrees", (PyCFunction)(void (*)(void))ustore_py_api_graph_degrees, ustore_py_method_flags_k,
      doc_graph_degrees},
+    {"graph_contains", (PyCFunction)(void (*)(void))ustore_py_api_graph_contains, ustore_py_method_flags_k,
+     doc_graph_contains},
     {"graph_scan_vertices", (PyCFunction)(void (*)(void))ustore_py_api_graph_scan_vertices, ustore_py_method_flags_k,
      doc_graph_scan_vertices},
     {NULL, NULL, 0, NULL},
@@ -1933,6 +1937,7 @@ static PyMethodDef View_methods[] = {
     {"docs_gist", (PyCFunction)(void (*)(void))ustore_py_api_docs_gist, ustore_py_method_flags_k, doc_docs_gist},
     {"docs_gather", (PyCFunction)(void (*)(void))ustore_py_api_docs_gather, ustore_py_method_flags_k, doc_docs_gather},
     {"docs_scan", (PyCFunction)(void (*)(void))ustore_py_api_docs_scan, ustore_py_method_flags_k, doc_docs_scan},
+    {"docs_sample", (PyCFunction)(void (*)(void))ustore_py_api_docs_sample, ustore_py_method_flags_k, doc_docs_sample},
     {"docs_remove", (PyCFunction)(void (*)(void))ustore_py_api_docs_remove, ustore_py_method_flags_k, doc_docs_remove},
     {"graph_write_edges", (PyCFunction)(void (*)(void))ustore_py_api_graph_write_edges, ustore_py_method_flags_k,
      doc_graph_write_edges},
@@ -1942,6 +1947,8 @@ static PyMethodDef View_methods[] = {
      doc_graph_read_edges},
     {"graph_degrees", (PyCFunction)(void (*)(void))ustore_py_api_graph_degrees, ustore_py_method_flags_k,
      doc_graph_degrees},
+    {"graph_contains", (PyCFunction)(void (*)(void))ustore_py_api_graph_contains, ustore_py_method_flags_k,
+     doc_graph_contains},
     {"graph_scan_vertices", (PyCFunction)(void (*)(void))ustore_py_api_graph_scan_vertices, ustore_py_method_flags_k,
      doc_graph_scan_vertices},
     {"graph_write_vertices", (PyCFunction)(void (*)(void))ustore_py_api_graph_write_vertices, ustore_py_method_flags_k,
@@ -1999,6 +2006,7 @@ static PyMethodDef DeferredView_methods[] = {
     {"docs_gist", (PyCFunction)(void (*)(void))ustore_py_api_docs_gist, ustore_py_method_flags_k, doc_docs_gist},
     {"docs_gather", (PyCFunction)(void (*)(void))ustore_py_api_docs_gather, ustore_py_method_flags_k, doc_docs_gather},
     {"docs_scan", (PyCFunction)(void (*)(void))ustore_py_api_docs_scan, ustore_py_method_flags_k, doc_docs_scan},
+    {"docs_sample", (PyCFunction)(void (*)(void))ustore_py_api_docs_sample, ustore_py_method_flags_k, doc_docs_sample},
     {"docs_remove", (PyCFunction)(void (*)(void))ustore_py_api_docs_remove, ustore_py_method_flags_k, doc_docs_remove},
     {"graph_write_edges", (PyCFunction)(void (*)(void))ustore_py_api_graph_write_edges, ustore_py_method_flags_k,
      doc_graph_write_edges},
@@ -2008,6 +2016,8 @@ static PyMethodDef DeferredView_methods[] = {
      doc_graph_read_edges},
     {"graph_degrees", (PyCFunction)(void (*)(void))ustore_py_api_graph_degrees, ustore_py_method_flags_k,
      doc_graph_degrees},
+    {"graph_contains", (PyCFunction)(void (*)(void))ustore_py_api_graph_contains, ustore_py_method_flags_k,
+     doc_graph_contains},
     {"graph_scan_vertices", (PyCFunction)(void (*)(void))ustore_py_api_graph_scan_vertices, ustore_py_method_flags_k,
      doc_graph_scan_vertices},
     {"graph_write_vertices", (PyCFunction)(void (*)(void))ustore_py_api_graph_write_vertices, ustore_py_method_flags_k,

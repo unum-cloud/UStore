@@ -4,6 +4,7 @@ import random
 from collections.abc import Callable, Iterator
 from enum import IntEnum
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 from base import SETTINGS
@@ -21,7 +22,7 @@ def pytest_report_header() -> list[str]:
     header = [f"- UStore: {ustore.__version__} from {ustore.lib.__file__}"]
     for engine in ENGINES:
         supported = ", ".join(name for name, present in SUPPORTS[engine].items() if present)
-        header.append(f"- Engine {engine}: {supported or 'no transactions, collections or snapshots'}")
+        header.append(f"- Engine {engine}: {supported or 'no transactions or snapshots'}")
     header.append(f"- Seed: {SETTINGS.seed}")
     header.append(f"- Filter: {SETTINGS.filter or 'none'}")
     return header
@@ -96,6 +97,24 @@ def open_database(tmp_path: Path, engine: str) -> Iterator[Callable[..., ustore.
 def database(open_database: Callable[..., ustore.Database]) -> ustore.Database:
     """A database at the engine's default isolation, closed once the case is done."""
     return open_database()
+
+
+@pytest.fixture
+def blobs(database: ustore.Database) -> UUID:
+    """A collection of binary values, since no collection exists until created."""
+    return database.collection_create("blobs", modality=ustore.Modality.BLOBS)
+
+
+@pytest.fixture
+def docs(database: ustore.Database) -> UUID:
+    """A collection of JSON documents."""
+    return database.collection_create("docs", modality=ustore.Modality.DOCS)
+
+
+@pytest.fixture
+def graph(database: ustore.Database) -> UUID:
+    """A graph collection."""
+    return database.collection_create("graph", modality=ustore.Modality.GRAPH)
 
 
 @pytest.fixture(params=["database", "transaction"])

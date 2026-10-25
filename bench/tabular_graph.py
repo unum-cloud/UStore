@@ -81,18 +81,18 @@ def run_threads(files: list[Path], settings: argparse.Namespace, import_file: Ca
         return sum(pool.map(lambda shard: sum(import_file(path) for path in shard), shards))
 
 
-def clear_main(database: ustore.Database) -> None:
-    database.collection_drop(UUID(int=0), ustore.DropMode.PAIRS)
-
-
 # region Documents
 
 
-def bench_docs_import(database: ustore.Database, files: list[Path], settings: argparse.Namespace) -> None:
+def bench_docs_import(
+    database: ustore.Database, documents: UUID, files: list[Path], settings: argparse.Namespace
+) -> None:
     def import_file(path: Path) -> int:
         rows = read_table(path, settings.format).to_pylist()
         for batch in batched(rows, settings.batch_rows):
-            database.docs_write(None, [json.dumps(row) for row in batch], id_field=settings.id_field)
+            database.docs_write(
+                None, [json.dumps(row) for row in batch], id_field=settings.id_field, collection=documents
+            )
         return path.stat().st_size
 
     start = time.perf_counter()
@@ -100,26 +100,30 @@ def bench_docs_import(database: ustore.Database, files: list[Path], settings: ar
     report(f"docs_import_{settings.format}", imported, time.perf_counter() - start)
 
 
-def exported_documents(database: ustore.Database) -> Iterator[dict]:
+def exported_documents(database: ustore.Database, documents: UUID) -> Iterator[dict]:
     arena = ustore.Arena()
-    for page in batched(scan_keys(database), PAGE_KEYS):
-        texts = [bytes(document) for document in database.docs_read(page, arena) if document is not None]
+    for page in batched(scan_keys(database, documents, modality=ustore.Modality.DOCS), PAGE_KEYS):
+        texts = [
+            bytes(document)
+            for document in database.docs_read(page, arena, collection=documents)
+            if document is not None
+        ]
         yield from map(json.loads, texts)
 
 
-def bench_docs_export(database: ustore.Database, settings: argparse.Namespace) -> None:
+def bench_docs_export(database: ustore.Database, documents: UUID, settings: argparse.Namespace) -> None:
     output = settings.directory / f"tabular_graph_docs.{settings.format}"
     start = time.perf_counter()
     if settings.format == "ndjson":
         with output.open("w") as file:
-            file.writelines(json.dumps(document) + "\n" for document in exported_documents(database))
+            file.writelines(json.dumps(document) + "\n" for document in exported_documents(database, documents))
     else:
-        pyarrow.csv.write_csv(pyarrow.Table.from_pylist(list(exported_documents(database))), output)
+        pyarrow.csv.write_csv(pyarrow.Table.from_pylist(list(exported_documents(database, documents))), output)
     duration = time.perf_counter() - start
     exported = output.stat().st_size
     output.unlink()
     report(f"docs_export_{settings.format}", exported, duration)
-    clear_main(database)
+    database.collection_drop(documents)
 
 
 # endregion Documents
@@ -184,8 +188,9 @@ def main() -> None:
     settings.directory.mkdir(parents=True, exist_ok=True)
 
     with getattr(ustore.Database, f"open_{settings.engine}")(settings.directory) as database:
-        bench_docs_import(database, files, settings)
-        bench_docs_export(database, settings)
+        documents = database.collection_create("documents", modality=ustore.Modality.DOCS)
+        bench_docs_import(database, documents, files, settings)
+        bench_docs_export(database, documents, settings)
         graph = database.collection_create("graph", modality=ustore.Modality.GRAPH)
         bench_graph_import(database, graph, files, settings)
         bench_graph_export(database, graph, settings)

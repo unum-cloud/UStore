@@ -2473,7 +2473,7 @@ class lsm_tree {
     /**
      *  @brief Drops every version stamped above @p ceiling, merging down each level that holds one until none does.
      *
-     *  A mount runs this before anything draws a stamp: a crash may leave runs holding commits the catalog it found
+     *  A mount runs this before anything draws a stamp: a crash may leave runs holding commits the schema it found
      *  never promised, and those land nowhere else, so dropping them all leaves only commits that landed whole.
      */
     template <utilities::fold_concept fold_type_>

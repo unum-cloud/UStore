@@ -35,7 +35,7 @@ class deferred_graph_collection_t;
 class graph_read_collection_t {
   protected:
     receiver_t receiver_ {};
-    ustore_collection_id_t collection_ = ustore_collection_main_k;
+    ustore_collection_id_t collection_ {};
 
     /** Reads the degrees of @p vertices into @p arena, with the offsets and edges unless @p edges is null. */
     status_t read_edges_into_(strided_span<ustore_key_t const> vertices, strided_span<ustore_vertex_role_t const> roles,
@@ -73,7 +73,7 @@ class graph_read_collection_t {
     static constexpr ustore_modality_t modality_k = ustore_modality_graph_k;
 
     graph_read_collection_t() noexcept = default;
-    graph_read_collection_t(receiver_t receiver, ustore_collection_id_t collection = ustore_collection_main_k) noexcept
+    graph_read_collection_t(receiver_t receiver, ustore_collection_id_t collection) noexcept
         : receiver_(receiver), collection_(collection) {}
 
     ustore_collection_id_t* member_ptr() noexcept { return &collection_; }
@@ -453,7 +453,7 @@ struct graph_remove_vertices_t {
 class deferred_graph_read_collection_t {
   protected:
     receiver_t receiver_ {};
-    ustore_collection_id_t collection_ {ustore_collection_main_k};
+    ustore_collection_id_t collection_ {};
 
     /** Submits a read of the edges of @p vertices in @p role into @p arena, exporting the edges themselves only when
      *  @p answer_type_ asks for them. */
@@ -486,8 +486,7 @@ class deferred_graph_read_collection_t {
 
   public:
     deferred_graph_read_collection_t() noexcept = default;
-    explicit deferred_graph_read_collection_t(receiver_t receiver,
-                                              ustore_collection_id_t collection = ustore_collection_main_k) noexcept
+    explicit deferred_graph_read_collection_t(receiver_t receiver, ustore_collection_id_t collection) noexcept
         : receiver_(receiver), collection_(collection) {}
 
     operator ustore_collection_id_t() const noexcept { return collection_; }

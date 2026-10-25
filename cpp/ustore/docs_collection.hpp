@@ -39,7 +39,7 @@ class deferred_docs_collection_t;
 class docs_read_collection_t {
   protected:
     receiver_t receiver_ {};
-    ustore_collection_id_t collection_ {ustore_collection_main_k};
+    ustore_collection_id_t collection_ {};
     ustore_docs_field_type_t type_ {ustore_docs_field_type_json_k};
 
     /** A @p reference_ proxy over one location or a batch of them inside this collection, read and written as
@@ -86,7 +86,7 @@ class docs_read_collection_t {
 
     docs_read_collection_t() noexcept = default;
 
-    docs_read_collection_t(receiver_t receiver, ustore_collection_id_t collection = ustore_collection_main_k,
+    docs_read_collection_t(receiver_t receiver, ustore_collection_id_t collection,
                            ustore_docs_field_type_t type = ustore_docs_field_type_json_k) noexcept
         : receiver_(receiver), collection_(collection), type_(type) {}
 
@@ -349,12 +349,11 @@ struct docs_gather_t {
 class deferred_docs_read_collection_t {
   protected:
     receiver_t receiver_ {};
-    ustore_collection_id_t collection_ {ustore_collection_main_k};
+    ustore_collection_id_t collection_ {};
 
   public:
     deferred_docs_read_collection_t() noexcept = default;
-    explicit deferred_docs_read_collection_t(receiver_t receiver,
-                                             ustore_collection_id_t collection = ustore_collection_main_k) noexcept
+    explicit deferred_docs_read_collection_t(receiver_t receiver, ustore_collection_id_t collection) noexcept
         : receiver_(receiver), collection_(collection) {}
 
     operator ustore_collection_id_t() const noexcept { return collection_; }

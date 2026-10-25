@@ -23,7 +23,7 @@ class _ArrowArray(Protocol):
     def __arrow_c_array__(self, requested_schema: object | None = None) -> tuple[object, object]: ...
 
 type Buffer = memoryview | bytes | bytearray
-type CollectionLike = UUID | str | None
+type CollectionLike = UUID | str
 type KeyLike = UUID | int | str | bytes
 type KeysLike = Sequence[KeyLike] | Buffer
 type ValueLike = Buffer
@@ -106,7 +106,6 @@ class ScanMode(IntEnum):
 class Modality(IntEnum):
     """What a collection holds, valued as `ustore_modality_t`."""
 
-    ANY = 0
     BLOBS = 1
     DOCS = 2
     GRAPH = 3
@@ -482,16 +481,12 @@ class Deferred[T]:
 # region: Handles
 
 @final
-class Capabilities(structseq[bool], tuple[bool, bool, bool]):
+class Capabilities(structseq[bool], tuple[bool, bool]):
     """What an engine supports, as `Database.capabilities` reports it."""
 
     @property
     def transactions(self) -> bool:
         """Whether the engine groups operations into transactions."""
-
-    @property
-    def collections(self) -> bool:
-        """Whether the engine holds collections beyond the main one."""
 
     @property
     def snapshots(self) -> bool:
@@ -543,7 +538,7 @@ class Description(structseq[Any], tuple[Capabilities, Engine, Isolation, int, in
 
     @property
     def keys(self) -> int:
-        """Keys across every collection, the main one included."""
+        """Keys across every collection."""
 
     @property
     def memory_bytes(self) -> int:
@@ -558,16 +553,16 @@ class _Reads:
     """The read verbs every blocking receiver answers, and the views it derives."""
 
     def __getitem__(self, name: str) -> Collection:
-        """The collection `name` addresses, where the empty name is the main collection."""
+        """The collection `name` addresses."""
 
-    def read(self, keys: KeysLike, arena: Arena, /, *, collection: CollectionLike = None) -> Values: ...
-    def get(self, key: KeyLike, *, collection: CollectionLike = None) -> bytes | None:
+    def read(self, keys: KeysLike, arena: Arena, /, *, collection: CollectionLike) -> Values: ...
+    def get(self, key: KeyLike, *, collection: CollectionLike) -> bytes | None:
         """Copies one value out of a one-off arena, which `read` with an arena of yours avoids."""
 
-    def contains(self, key: KeyLike, *, collection: CollectionLike = None) -> bool:
+    def contains(self, key: KeyLike, *, collection: CollectionLike) -> bool:
         """Reads one presence into a one-off arena."""
 
-    def cursor(self, start: KeyLike = 0, /, *, collection: CollectionLike = None) -> Cursor:
+    def cursor(self, start: KeyLike = 0, /, *, collection: CollectionLike) -> Cursor:
         """A walk over the keys of one collection from `start`, reading nothing until its first pull, whose every pull
         blocks as this receiver's calls do. Calls `ustore_blobs_cursor_init`."""
 
@@ -578,7 +573,7 @@ class _Reads:
         arena: Arena,
         /,
         *,
-        collection: CollectionLike = None,
+        collection: CollectionLike,
         mode: ScanMode = ScanMode.ORDERED,
         progress: Progress | None = None,
     ) -> Keys: ...
@@ -589,28 +584,26 @@ class _Reads:
         arena: Arena,
         /,
         *,
-        collection: CollectionLike = None,
+        collection: CollectionLike,
         mode: ScanMode = ScanMode.ORDERED,
         progress: Progress | None = None,
     ) -> Keys:
         """One scan per start, reporting the scans finished to `progress`."""
-    def sample(self, wanted: int, arena: Arena, /, *, collection: CollectionLike = None) -> Keys: ...
-    def sample_batch(self, count: int, wanted: int, arena: Arena, /, *, collection: CollectionLike = None) -> Keys:
+    def sample(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Keys: ...
+    def sample_batch(self, count: int, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Keys:
         """`count` samples of up to `wanted` keys each, all drawn from the one collection named."""
-    def measure(
-        self, start: KeyLike, end: KeyLike, arena: Arena, /, *, collection: CollectionLike = None
-    ) -> Measurement: ...
+    def measure(self, start: KeyLike, end: KeyLike, arena: Arena, /, *, collection: CollectionLike) -> Measurement: ...
     def docs_read(
         self,
         keys: KeysLike,
         arena: Arena,
         /,
         *,
-        collection: CollectionLike = None,
+        collection: CollectionLike,
         field: str | None = None,
         outputs_type: FieldType = FieldType.JSON,
     ) -> Values: ...
-    def docs_gist(self, keys: KeysLike, arena: Arena, /, *, collection: CollectionLike = None) -> tuple[str, ...]: ...
+    def docs_gist(self, keys: KeysLike, arena: Arena, /, *, collection: CollectionLike) -> tuple[str, ...]: ...
     def docs_gather(
         self,
         keys: KeysLike,
@@ -619,7 +612,7 @@ class _Reads:
         arena: Arena,
         /,
         *,
-        collection: CollectionLike = None,
+        collection: CollectionLike,
     ) -> Columns: ...
     def docs_scan(
         self,
@@ -628,16 +621,20 @@ class _Reads:
         arena: Arena,
         /,
         *,
-        collection: CollectionLike = None,
+        collection: CollectionLike,
         mode: ScanMode = ScanMode.ORDERED,
         progress: Progress | None = None,
     ) -> Keys: ...
+    def docs_sample(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Keys:
+        """Up to `wanted` document keys drawn at random, which a `docs_read` or a `docs_gather` follows."""
     def graph_read_edges(
-        self, vertices: KeysLike, arena: Arena, /, *, role: Role = Role.ANY, collection: CollectionLike = None
+        self, vertices: KeysLike, arena: Arena, /, *, role: Role = Role.ANY, collection: CollectionLike
     ) -> Neighborhoods: ...
     def graph_degrees(
-        self, vertices: KeysLike, arena: Arena, /, *, role: Role = Role.ANY, collection: CollectionLike = None
+        self, vertices: KeysLike, arena: Arena, /, *, role: Role = Role.ANY, collection: CollectionLike
     ) -> tuple[int | None, ...]: ...
+    def graph_contains(self, vertex: KeyLike, /, *, collection: CollectionLike) -> bool:
+        """Whether the vertex is present, read as its degree through a one-off arena."""
     def graph_scan_vertices(
         self,
         start: KeyLike,
@@ -645,7 +642,7 @@ class _Reads:
         arena: Arena,
         /,
         *,
-        collection: CollectionLike = None,
+        collection: CollectionLike,
         mode: ScanMode = ScanMode.ORDERED,
         progress: Progress | None = None,
     ) -> Keys: ...
@@ -669,7 +666,7 @@ class _Writes(_Reads):
         keys: KeysLike,
         values: Sequence[ValueLike] | ValueLike | TapeLike,
         *,
-        collection: CollectionLike = None,
+        collection: CollectionLike,
         durability: Durability = Durability.BUFFERED,
     ) -> None: ...
     def set(
@@ -677,14 +674,14 @@ class _Writes(_Reads):
         key: KeyLike,
         value: ValueLike,
         *,
-        collection: CollectionLike = None,
+        collection: CollectionLike,
         durability: Durability = Durability.BUFFERED,
     ) -> None: ...
     def remove(
         self,
         keys: KeyLike | KeysLike,
         *,
-        collection: CollectionLike = None,
+        collection: CollectionLike,
         durability: Durability = Durability.BUFFERED,
     ) -> None:
         """Removes keys with their values."""
@@ -693,7 +690,7 @@ class _Writes(_Reads):
         keys: KeysLike | None,
         documents: Sequence[DocumentLike] | DocumentLike | TapeLike,
         *,
-        collection: CollectionLike = None,
+        collection: CollectionLike,
         field: str | None = None,
         modification: Modification = Modification.UPSERT,
         type: FieldType = FieldType.JSON,
@@ -704,7 +701,7 @@ class _Writes(_Reads):
         self,
         keys: KeyLike | KeysLike,
         *,
-        collection: CollectionLike = None,
+        collection: CollectionLike,
         durability: Durability = Durability.BUFFERED,
     ) -> None:
         """Removes whole documents."""
@@ -714,7 +711,7 @@ class _Writes(_Reads):
         targets: KeysLike,
         *,
         edges: KeysLike | None = None,
-        collection: CollectionLike = None,
+        collection: CollectionLike,
         durability: Durability = Durability.BUFFERED,
     ) -> None: ...
     def graph_remove_edges(
@@ -723,18 +720,18 @@ class _Writes(_Reads):
         targets: KeysLike,
         *,
         edges: KeysLike | None = None,
-        collection: CollectionLike = None,
+        collection: CollectionLike,
         durability: Durability = Durability.BUFFERED,
     ) -> None: ...
     def graph_write_vertices(
-        self, vertices: KeysLike, *, collection: CollectionLike = None, durability: Durability = Durability.BUFFERED
+        self, vertices: KeysLike, *, collection: CollectionLike, durability: Durability = Durability.BUFFERED
     ) -> None: ...
     def graph_remove_vertices(
         self,
         vertices: KeysLike,
         *,
         role: Role = Role.ANY,
-        collection: CollectionLike = None,
+        collection: CollectionLike,
         durability: Durability = Durability.BUFFERED,
     ) -> None: ...
 
@@ -810,7 +807,7 @@ class Database(_Writes, _Receivers):
         keep working, each holding the database open until it closes too."""
 
     def clear(self, mode: DropMode, /) -> None:
-        """Empties every collection at once: its pairs, every collection but the main one, or its values."""
+        """Empties every collection at once: its pairs, every collection with its name, or its values."""
 
     def compact(self, *, progress: Progress | None = None) -> None:
         """Reclaims the space overwritten and removed data takes, one collection at a time, reporting bytes where the
@@ -819,8 +816,8 @@ class Database(_Writes, _Receivers):
     def describe(self) -> Description:
         """The engine, its capabilities and isolation, and the keys, memory and disk it holds."""
 
-    def collection_create(self, name: str, *, modality: Modality = Modality.ANY) -> UUID:
-        """Creates an empty collection and records the name for it."""
+    def collection_create(self, name: str, *, modality: Modality) -> UUID:
+        """Creates an empty collection holding `modality` and records the name for it, which may not start with `_`."""
 
     def collection_find(self, name: str, arena: Arena, /) -> UUID:
         """The collection ID the name addresses."""
@@ -829,7 +826,7 @@ class Database(_Writes, _Receivers):
         """Whether a collection carries the name, read into a one-off arena."""
 
     def collection_list(self, arena: Arena, /) -> tuple[UUID, ...]:
-        """The IDs of every collection but the main one."""
+        """The IDs of every collection, never a system one."""
 
     def collection_names(self, arena: Arena, /, *, after: str | None = None, limit: int = 1024) -> tuple[str, ...]:
         """One page of the names recorded for collections, in the order of their text."""
@@ -865,7 +862,7 @@ class Snapshot(_Reads, _Receivers):
         """The collection ID the name addresses at this snapshot."""
 
     def collection_list(self, arena: Arena, /) -> tuple[UUID, ...]:
-        """The IDs of every collection but the main one at this snapshot."""
+        """The IDs of every collection at this snapshot, never a system one."""
 
     def close(self) -> None:
         """Releases the snapshot once its deferred calls finished, unpinning the versions only it kept."""
@@ -940,7 +937,7 @@ class View(_Writes, _Receivers):
         """The collection ID the name addresses, at the snapshot of a snapshot and at the head otherwise."""
 
     def collection_list(self, arena: Arena, /) -> tuple[UUID, ...]:
-        """The IDs of every collection but the main one, at the snapshot of a snapshot and at the head otherwise."""
+        """The IDs of every collection, at the snapshot of a snapshot and at the head otherwise."""
 
 class DeferredView:
     """What a database, transaction or snapshot addresses, with the executor its calls go to, each verb answering a
@@ -957,11 +954,11 @@ class DeferredView:
     def deferred(self, executor: Executor) -> DeferredView: ...
     def watched(self) -> DeferredView: ...
     def unwatched(self) -> DeferredView: ...
-    def read(self, keys: KeysLike, arena: Arena, /, *, collection: CollectionLike = None) -> Deferred[Values]: ...
-    def get(self, key: KeyLike, *, collection: CollectionLike = None) -> Deferred[bytes | None]:
+    def read(self, keys: KeysLike, arena: Arena, /, *, collection: CollectionLike) -> Deferred[Values]: ...
+    def get(self, key: KeyLike, *, collection: CollectionLike) -> Deferred[bytes | None]:
         """The `Deferred` of a copy of one value, owning the one-off arena it reads into."""
 
-    def contains(self, key: KeyLike, *, collection: CollectionLike = None) -> Deferred[bool]:
+    def contains(self, key: KeyLike, *, collection: CollectionLike) -> Deferred[bool]:
         """The `Deferred` of one presence, owning the one-off arena it reads into."""
 
     def scan(
@@ -971,7 +968,7 @@ class DeferredView:
         arena: Arena,
         /,
         *,
-        collection: CollectionLike = None,
+        collection: CollectionLike,
         mode: ScanMode = ScanMode.ORDERED,
         progress: Progress | None = None,
     ) -> Deferred[Keys]: ...
@@ -982,17 +979,17 @@ class DeferredView:
         arena: Arena,
         /,
         *,
-        collection: CollectionLike = None,
+        collection: CollectionLike,
         mode: ScanMode = ScanMode.ORDERED,
         progress: Progress | None = None,
     ) -> Deferred[Keys]:
         """The `Deferred` of one scan per start, whose `progress` runs on the executor's threads."""
-    def sample(self, wanted: int, arena: Arena, /, *, collection: CollectionLike = None) -> Deferred[Keys]: ...
+    def sample(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Deferred[Keys]: ...
     def sample_batch(
-        self, count: int, wanted: int, arena: Arena, /, *, collection: CollectionLike = None
+        self, count: int, wanted: int, arena: Arena, /, *, collection: CollectionLike
     ) -> Deferred[Keys]: ...
     def measure(
-        self, start: KeyLike, end: KeyLike, arena: Arena, /, *, collection: CollectionLike = None
+        self, start: KeyLike, end: KeyLike, arena: Arena, /, *, collection: CollectionLike
     ) -> Deferred[Measurement]: ...
     def docs_read(
         self,
@@ -1000,12 +997,12 @@ class DeferredView:
         arena: Arena,
         /,
         *,
-        collection: CollectionLike = None,
+        collection: CollectionLike,
         field: str | None = None,
         outputs_type: FieldType = FieldType.JSON,
     ) -> Deferred[Values]: ...
     def docs_gist(
-        self, keys: KeysLike, arena: Arena, /, *, collection: CollectionLike = None
+        self, keys: KeysLike, arena: Arena, /, *, collection: CollectionLike
     ) -> Deferred[tuple[str, ...]]: ...
     def docs_gather(
         self,
@@ -1015,7 +1012,7 @@ class DeferredView:
         arena: Arena,
         /,
         *,
-        collection: CollectionLike = None,
+        collection: CollectionLike,
     ) -> Deferred[Columns]: ...
     def docs_scan(
         self,
@@ -1024,16 +1021,18 @@ class DeferredView:
         arena: Arena,
         /,
         *,
-        collection: CollectionLike = None,
+        collection: CollectionLike,
         mode: ScanMode = ScanMode.ORDERED,
         progress: Progress | None = None,
     ) -> Deferred[Keys]: ...
+    def docs_sample(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Deferred[Keys]: ...
     def graph_read_edges(
-        self, vertices: KeysLike, arena: Arena, /, *, role: Role = Role.ANY, collection: CollectionLike = None
+        self, vertices: KeysLike, arena: Arena, /, *, role: Role = Role.ANY, collection: CollectionLike
     ) -> Deferred[Neighborhoods]: ...
     def graph_degrees(
-        self, vertices: KeysLike, arena: Arena, /, *, role: Role = Role.ANY, collection: CollectionLike = None
+        self, vertices: KeysLike, arena: Arena, /, *, role: Role = Role.ANY, collection: CollectionLike
     ) -> Deferred[tuple[int | None, ...]]: ...
+    def graph_contains(self, vertex: KeyLike, /, *, collection: CollectionLike) -> Deferred[bool]: ...
     def graph_scan_vertices(
         self,
         start: KeyLike,
@@ -1041,7 +1040,7 @@ class DeferredView:
         arena: Arena,
         /,
         *,
-        collection: CollectionLike = None,
+        collection: CollectionLike,
         mode: ScanMode = ScanMode.ORDERED,
         progress: Progress | None = None,
     ) -> Deferred[Keys]: ...
@@ -1056,7 +1055,7 @@ class DeferredView:
         keys: KeysLike,
         values: Sequence[ValueLike] | ValueLike | TapeLike,
         *,
-        collection: CollectionLike = None,
+        collection: CollectionLike,
         durability: Durability = Durability.BUFFERED,
     ) -> Deferred[None]: ...
     def set(
@@ -1064,14 +1063,14 @@ class DeferredView:
         key: KeyLike,
         value: ValueLike,
         *,
-        collection: CollectionLike = None,
+        collection: CollectionLike,
         durability: Durability = Durability.BUFFERED,
     ) -> Deferred[None]: ...
     def remove(
         self,
         keys: KeyLike | KeysLike,
         *,
-        collection: CollectionLike = None,
+        collection: CollectionLike,
         durability: Durability = Durability.BUFFERED,
     ) -> Deferred[None]: ...
     def docs_write(
@@ -1079,7 +1078,7 @@ class DeferredView:
         keys: KeysLike | None,
         documents: Sequence[DocumentLike] | DocumentLike | TapeLike,
         *,
-        collection: CollectionLike = None,
+        collection: CollectionLike,
         field: str | None = None,
         modification: Modification = Modification.UPSERT,
         type: FieldType = FieldType.JSON,
@@ -1090,7 +1089,7 @@ class DeferredView:
         self,
         keys: KeyLike | KeysLike,
         *,
-        collection: CollectionLike = None,
+        collection: CollectionLike,
         durability: Durability = Durability.BUFFERED,
     ) -> Deferred[None]: ...
     def graph_write_edges(
@@ -1099,7 +1098,7 @@ class DeferredView:
         targets: KeysLike,
         *,
         edges: KeysLike | None = None,
-        collection: CollectionLike = None,
+        collection: CollectionLike,
         durability: Durability = Durability.BUFFERED,
     ) -> Deferred[None]: ...
     def graph_remove_edges(
@@ -1108,18 +1107,18 @@ class DeferredView:
         targets: KeysLike,
         *,
         edges: KeysLike | None = None,
-        collection: CollectionLike = None,
+        collection: CollectionLike,
         durability: Durability = Durability.BUFFERED,
     ) -> Deferred[None]: ...
     def graph_write_vertices(
-        self, vertices: KeysLike, *, collection: CollectionLike = None, durability: Durability = Durability.BUFFERED
+        self, vertices: KeysLike, *, collection: CollectionLike, durability: Durability = Durability.BUFFERED
     ) -> Deferred[None]: ...
     def graph_remove_vertices(
         self,
         vertices: KeysLike,
         *,
         role: Role = Role.ANY,
-        collection: CollectionLike = None,
+        collection: CollectionLike,
         durability: Durability = Durability.BUFFERED,
     ) -> Deferred[None]: ...
     def commit(self, durability: Durability = Durability.BUFFERED) -> Deferred[int]: ...

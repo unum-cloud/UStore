@@ -88,7 +88,7 @@ struct atomicity_run_t {
     /** Database opened once for the whole run. */
     database_t& database;
 
-    /** Main collection, which every verification reads. */
+    /** Collection every batch lands in and every verification reads. */
     blobs_collection_t collection;
 
     /** Arena every verification reads into, rewound by each. */
@@ -162,12 +162,12 @@ struct batches_t {
 #pragma region Round
 
 /** Commits one batch, retrying staging and conflicts until it lands, and fails only when no transaction begins. */
-std::size_t commit_batch(transaction_t& transaction, keys_view_t keys, value_view_t value,
-                         batch_operation_t operation) {
+std::size_t commit_batch(transaction_t& transaction, ustore_collection_id_t target, keys_view_t keys,
+                         value_view_t value, batch_operation_t operation) {
     while (true) {
         std::size_t const failures = expect(transaction.reset().succeeded());
         if (failures) return failures;
-        blobs_collection_t collection = transaction.main();
+        blobs_collection_t collection {transaction.receiver(), target};
         bool const staged = operation == batch_operation_t::erase_k ? collection[keys].remove().succeeded()
                                                                     : collection[keys].assign(value).succeeded();
         if (!staged) continue;
@@ -176,14 +176,14 @@ std::size_t commit_batch(transaction_t& transaction, keys_view_t keys, value_vie
 }
 
 /** Writes every batch once from @p thread, stopping at its first failure. */
-void write_round(writer_slot_t& slot, batches_t const& batches, std::size_t thread) {
+void write_round(writer_slot_t& slot, ustore_collection_id_t collection, batches_t const& batches, std::size_t thread) {
     for (std::size_t batch = 0; batch != batches.count() && !slot.failures; ++batch) {
         std::uint64_t const number = batch * batches.threads_count + thread;
         value_view_t const value(reinterpret_cast<byte_t const*>(&number), sizeof(number));
         bool const erases = batches.deletes == round_deletes_t::with_deletes_k &&
                             slot.random_generator() % batches.deletes_periodicity == 0;
         batch_operation_t const operation = erases ? batch_operation_t::erase_k : batch_operation_t::overwrite_k;
-        slot.failures += commit_batch(slot.transaction, batches[batch], value, operation);
+        slot.failures += commit_batch(slot.transaction, collection, batches[batch], value, operation);
     }
 }
 
@@ -200,12 +200,12 @@ std::size_t verify_batch(blobs_collection_t& collection, arena_t& arena, keys_vi
 /** Runs one round: every thread writes every batch, then the main thread checks what they left and clears it. */
 std::size_t run_round(atomicity_run_t& run, executor_t& executor, batches_t const& batches) {
     std::span<writer_slot_t> const slots {run.slots.data(), batches.threads_count};
-    auto writer = [&](std::size_t thread) noexcept { write_round(slots[thread], batches, thread); };
+    auto writer = [&](std::size_t thread) noexcept { write_round(slots[thread], run.collection, batches, thread); };
     std::size_t failures = expect(st::succeeded(executor.for_threads(writer)));
     for (writer_slot_t& slot : slots) failures += std::exchange(slot.failures, 0);
     for (std::size_t batch = 0; batch != batches.count(); ++batch)
         failures += verify_batch(run.collection, run.arena, batches[batch]);
-    failures += expect(run.database.clear(ustore_drop_collection_k).succeeded());
+    failures += expect(run.database.clear(ustore_drop_pairs_k).succeeded());
     return failures;
 }
 
@@ -291,7 +291,13 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    atomicity_run_t run {database, database.main()};
+    auto [collection, create_status] = database.find_or_create("atomicity");
+    if (create_status.failed()) {
+        fmt::println(stderr, "Cannot create the collection");
+        return 1;
+    }
+
+    atomicity_run_t run {database, collection};
     if (std::size_t const failures = prepare_run(run, options, suite.random()); failures) {
         report(totals, "setup", failures);
         return suite_exit_code(totals);

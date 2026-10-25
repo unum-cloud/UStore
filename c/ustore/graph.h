@@ -96,7 +96,7 @@ typedef struct ustore_graph_read_edges_t {
     /** Number of vertices. */
     ustore_size_t count;
 
-    /** Graph collections, where @c NULL data stands for the main collection. */
+    /** Graph collections. */
     ustore_collections_view_t collections;
 
     /** Vertices whose edges are read. */
@@ -148,7 +148,7 @@ typedef struct ustore_graph_write_edges_t {
     /** Number of edges. */
     ustore_size_t count;
 
-    /** Graph collections, where @c NULL data stands for the main collection. */
+    /** Graph collections. */
     ustore_collections_view_t collections;
 
     /** Identifiers of the edges, where @c NULL data gives each @c ustore_edge_id_default_k. */
@@ -195,7 +195,7 @@ typedef struct ustore_graph_remove_edges_t {
     /** Number of edges. */
     ustore_size_t count;
 
-    /** Graph collections, where @c NULL data stands for the main collection. */
+    /** Graph collections. */
     ustore_collections_view_t collections;
 
     /** Identifiers of the edges, where @c NULL data gives each @c ustore_edge_id_default_k. */
@@ -242,7 +242,7 @@ typedef struct ustore_graph_write_vertices_t {
     /** Number of vertices. */
     ustore_size_t count;
 
-    /** Graph collections, where @c NULL data stands for the main collection. */
+    /** Graph collections. */
     ustore_collections_view_t collections;
 
     /** Vertices to insert unless present. */
@@ -283,7 +283,7 @@ typedef struct ustore_graph_remove_vertices_t {
     /** Number of vertices. */
     ustore_size_t count;
 
-    /** Graph collections, where @c NULL data stands for the main collection. */
+    /** Graph collections. */
     ustore_collections_view_t collections;
 
     /** Vertices to remove. */
@@ -333,7 +333,7 @@ typedef struct ustore_graph_scan_vertices_t {
     /** Number of scans. */
     ustore_size_t count;
 
-    /** Graph collections, where @c NULL data stands for the main collection. */
+    /** Graph collections. */
     ustore_collections_view_t collections;
 
     /** Smallest vertex every scan may return, where @c NULL data starts at the first vertex. */

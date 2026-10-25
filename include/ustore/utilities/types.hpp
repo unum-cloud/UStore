@@ -401,7 +401,7 @@ inline expected<ustore_uuid_t> uuid_from_text(std::string_view text) noexcept {
 struct collection_key_t {
 
     /** Collection owning the key. */
-    ustore_collection_id_t collection {ustore_collection_main_k};
+    ustore_collection_id_t collection {};
 
     /** Key inside the collection. */
     ustore_key_t key {};

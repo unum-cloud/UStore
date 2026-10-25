@@ -24,6 +24,7 @@ https://arrow.apache.org/docs/cpp/examples/row_columnar_conversion.html
 
 import struct
 from functools import partial
+from uuid import UUID
 
 import cudf
 import cuxfilter as cux
@@ -188,18 +189,18 @@ def check_round_trip(zip_codes: list[int]) -> None:
         assert original[column].equals(recovered[column]), f"{column} did not survive the round trip"
 
 
-def store_batches(database: ustore.Database, zip_codes: list[int]) -> None:
+def store_batches(database: ustore.Database, collection: UUID, zip_codes: list[int]) -> None:
     """Writes each batch as one blob, keyed by batch index rather than by withdrawal."""
     for batch_index in range(BATCH_COUNT):
         start_time = START_TIME + batch_index * ROWS_PER_BATCH * SECONDS_BETWEEN_EVENTS
         rows = generate_rows(zip_codes, ROWS_PER_BATCH, start_time)
-        database.set(batch_index, bytes(pack_rows(rows)))
+        database.set(batch_index, bytes(pack_rows(rows)), collection=collection)
 
 
-def load_measurements(database: ustore.Database) -> pd.DataFrame:
+def load_measurements(database: ustore.Database, collection: UUID) -> pd.DataFrame:
     """Reads every stored blob back as one batch and concatenates them into one frame."""
-    keys = list(scan_keys(database))
-    stored = database.read(keys, ustore.Arena())
+    keys = list(scan_keys(database, collection))
+    stored = database.read(keys, ustore.Arena(), collection=collection)
     return pd.concat([parse_rows(bytes(blob)) for blob in stored], ignore_index=True)
 
 
@@ -257,8 +258,9 @@ def main() -> None:
     check_round_trip(zip_codes)
 
     with ustore.Database.open_ram() as database:
-        store_batches(database, zip_codes)
-        recovered = load_measurements(database)
+        withdrawals = database.collection_create("withdrawals", modality=ustore.Modality.BLOBS)
+        store_batches(database, withdrawals, zip_codes)
+        recovered = load_measurements(database, withdrawals)
 
     smoothed = rolling_mean_amounts(recovered["amounts"])
     print(f"Recovered {len(recovered)} withdrawals, smoothed into {len(smoothed)} windowed means")

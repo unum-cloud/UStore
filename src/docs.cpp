@@ -641,6 +641,7 @@ void ustore_docs_gist(ustore_docs_gist_t* arguments) { route<&engine_t::docs, &d
 void ustore_docs_gather(ustore_docs_gather_t* arguments) { route<&engine_t::docs, &docs_verbs_t::gather>(arguments); }
 void ustore_docs_remove(ustore_docs_remove_t* arguments) { route<&engine_t::docs, &docs_verbs_t::remove>(arguments); }
 void ustore_docs_scan(ustore_docs_scan_t* arguments) { route<&engine_t::docs, &docs_verbs_t::scan>(arguments); }
+void ustore_docs_sample(ustore_docs_sample_t* arguments) { route<&engine_t::docs, &docs_verbs_t::sample>(arguments); }
 
 char const* ustore_docs_field_type_name(ustore_docs_field_type_t field_type) {
     return name_in(docs_field_type_names_k, field_type);

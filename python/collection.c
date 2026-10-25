@@ -10,7 +10,7 @@
  *  receiver runs its calls. They have no place for an arena, so every read makes a one-off arena,
  *  copies what it read into Python objects and frees the arena with the call. A read of a missing
  *  collection is refused, the first write through a view creates it to hold that view's modality,
- *  and a view of another modality is refused unless the collection holds anything. Collections are
+ *  and a view of another modality is refused. Collections are
  *  created at the head even from a transaction, as the ABI creates them, and never from a snapshot,
  *  which only reads.
  */
@@ -27,7 +27,7 @@ typedef struct Collection {
     /** The receiver indexed, which every verb runs through and which this keeps alive. */
     PyObject* view;
 
-    /** The name, a str, where the empty one is the main collection. */
+    /** The name, a str. */
     PyObject* name;
 
     /** The collection the name addresses, once @c resolved. */
@@ -58,7 +58,7 @@ static char const* modality_noun(ustore_modality_t modality) {
     case ustore_modality_graph_k: return "a graph";
     case ustore_modality_strings_k: return "strings";
     case ustore_modality_pages_k: return "pages";
-    default: return "anything";
+    default: return "an unknown modality";
     }
 }
 
@@ -86,11 +86,6 @@ static int collection_lookup(Collection const* self, ustore_py_context_t const* 
     Py_ssize_t length = 0;
     char const* const name = PyUnicode_AsUTF8AndSize(self->name, &length);
     if (!name) return -1;
-    if (length == 0) {
-        *id = ustore_collection_main_k;
-        *held = ustore_modality_any_k;
-        return 0;
-    }
     ustore_py_naming_t naming = ustore_py_collection_named(context, name, (size_t)length, id, held);
     if (naming != ustore_py_naming_missing_k) return naming == ustore_py_naming_found_k ? 0 : -1;
     if (missing == collection_missing_refused_k || context->snapshot)
@@ -119,8 +114,48 @@ static int collection_lookup(Collection const* self, ustore_py_context_t const* 
 }
 
 /**
+ *  @brief Resolves @p self once, filling what a verb core runs with, whatever the collection holds.
+ *  @param[in] modality What a missing collection is created to hold, when @p missing creates it.
+ *  @param[in] missing Whether a missing collection is refused or created to hold @p modality.
+ *  @param[out] context What the verb addresses and how it runs, as the receiver indexed names it.
+ *  @param[out] options The view's own options, addressing the collection.
+ *  @param[out] held What the collection holds.
+ *  @return 0 on success, -1 with an exception set otherwise.
+ */
+static int collection_resolve_any(Collection* self, ustore_modality_t modality, collection_missing_t missing,
+                                  ustore_py_context_t* context, ustore_py_verb_options_t* options,
+                                  ustore_modality_t* held) {
+    if (ustore_py_context_from_object(self->view, context) != 0) return -1;
+    ustore_py_verb_options_init(options);
+    ustore_collection_id_t id = {{{0}}};
+    int resolved = 0;
+    ustore_py_critical_section_begin_((PyObject*)self);
+    id = self->id;
+    *held = self->modality;
+    resolved = self->resolved;
+    ustore_py_critical_section_end_();
+
+    if (!resolved) {
+        if (collection_lookup(self, context, modality, missing, &id, held) != 0) return -1;
+        ustore_py_critical_section_begin_((PyObject*)self);
+        self->id = id;
+        self->modality = *held;
+        self->resolved = 1;
+        ustore_py_critical_section_end_();
+    }
+    options->collection = id;
+    return 0;
+}
+
+/** Resolves @p self once, refusing a missing collection, whatever it holds. */
+static int collection_found(Collection* self, ustore_py_context_t* context, ustore_py_verb_options_t* options,
+                            ustore_modality_t* held) {
+    return collection_resolve_any(self, ustore_modality_blobs_k, collection_missing_refused_k, context, options, held);
+}
+
+/**
  *  @brief Resolves @p self once and checks it holds what a view reads, filling what a verb core runs with.
- *  @param[in] modality What the view reads and writes, where @c ustore_modality_any_k checks nothing.
+ *  @param[in] modality What the view reads and writes.
  *  @param[in] missing Whether a missing collection is refused or created to hold @p modality.
  *  @param[out] context What the verb addresses and how it runs, as the receiver indexed names it.
  *  @param[out] options The view's own options, addressing the collection.
@@ -128,27 +163,9 @@ static int collection_lookup(Collection const* self, ustore_py_context_t const* 
  */
 static int collection_resolve(Collection* self, ustore_modality_t modality, collection_missing_t missing,
                               ustore_py_context_t* context, ustore_py_verb_options_t* options) {
-    if (ustore_py_context_from_object(self->view, context) != 0) return -1;
-    ustore_py_verb_options_init(options);
-    ustore_collection_id_t id = ustore_collection_main_k;
-    ustore_modality_t held = ustore_modality_any_k;
-    int resolved = 0;
-    ustore_py_critical_section_begin_((PyObject*)self);
-    id = self->id;
-    held = self->modality;
-    resolved = self->resolved;
-    ustore_py_critical_section_end_();
-
-    if (!resolved) {
-        if (collection_lookup(self, context, modality, missing, &id, &held) != 0) return -1;
-        ustore_py_critical_section_begin_((PyObject*)self);
-        self->id = id;
-        self->modality = held;
-        self->resolved = 1;
-        ustore_py_critical_section_end_();
-    }
-    options->collection = id;
-    if (modality == ustore_modality_any_k || held == ustore_modality_any_k || held == modality) return 0;
+    ustore_modality_t held = modality;
+    if (collection_resolve_any(self, modality, missing, context, options, &held) != 0) return -1;
+    if (held == modality) return 0;
     return ustore_py_raise(ustore_status_invalid_argument_k, "%R holds %s, not %s", self->name, modality_noun(held),
                            modality_noun(modality));
 }
@@ -162,8 +179,8 @@ PyObject* ustore_py_collection_subscript(PyObject* view, PyObject* name) {
     if (!collection) return NULL;
     collection->view = Py_NewRef(view);
     collection->name = Py_NewRef(name);
-    collection->id = ustore_collection_main_k;
-    collection->modality = ustore_modality_any_k;
+    collection->id = (ustore_collection_id_t) {{{0}}};
+    collection->modality = ustore_modality_blobs_k;
     collection->resolved = 0;
     return (PyObject*)collection;
 }
@@ -256,8 +273,8 @@ static char const doc_Collection_id[] = "The ID the name addresses, raising NotF
 static PyObject* Collection_get_id(Collection* self, void* Py_UNUSED(closure)) {
     ustore_py_context_t context;
     ustore_py_verb_options_t options;
-    if (collection_resolve(self, ustore_modality_any_k, collection_missing_refused_k, &context, &options) != 0)
-        return NULL;
+    ustore_modality_t held = ustore_modality_blobs_k;
+    if (collection_found(self, &context, &options, &held) != 0) return NULL;
     return ustore_py_uuid_to_object(&options.collection.uuid);
 }
 
@@ -267,9 +284,9 @@ static char const doc_Collection_modality[] =
 static PyObject* Collection_get_modality(Collection* self, void* Py_UNUSED(closure)) {
     ustore_py_context_t context;
     ustore_py_verb_options_t options;
-    if (collection_resolve(self, ustore_modality_any_k, collection_missing_refused_k, &context, &options) != 0)
-        return NULL;
-    return ustore_py_enum_to_object(ustore_py_enum_modality_k, (int)self->modality);
+    ustore_modality_t held = ustore_modality_blobs_k;
+    if (collection_found(self, &context, &options, &held) != 0) return NULL;
+    return ustore_py_enum_to_object(ustore_py_enum_modality_k, (int)held);
 }
 
 static char const doc_Collection_sample[] =                                                     //
@@ -292,23 +309,29 @@ static PyObject* Collection_sample(Collection* self, PyObject* wanted_object) {
     if (ustore_py_size_from_object(wanted_object, "wanted", &wanted) != 0) return NULL;
     ustore_py_context_t context;
     ustore_py_verb_options_t options;
-    if (collection_resolve(self, ustore_modality_any_k, collection_missing_refused_k, &context, &options) != 0 ||
+    ustore_modality_t held = ustore_modality_blobs_k;
+    if (collection_found(self, &context, &options, &held) != 0 ||
         ustore_py_context_blocking(&context, "Collection.sample() reads what it draws in a second call",
                                    "sample() and then read() on the deferred view") != 0)
         return NULL;
 
     ustore_executor_t const executor = ustore_py_context_executor(&context);
     PyObject* const drawing = ustore_py_arena_new(executor);
-    PyObject* const drawn = drawing ? ustore_py_keys_sample(&context, &options, wanted, drawing) : NULL;
+    PyObject* const drawn = drawing ? ustore_py_keys_sample(&context, &options, held, wanted, drawing) : NULL;
     Py_XDECREF(drawing);
     if (!drawn) return NULL;
     // The tape of the draw exports as 16-byte keys, which the read borrows in place from the other arena
+    int const documents = held == ustore_modality_docs_k;
+    ustore_py_verb_t const* const verb = documents ? &ustore_py_docs_read_drawn_verb : &ustore_py_read_drawn_verb;
     ustore_py_read_call_t call;
-    ustore_py_call_open(&context, &ustore_py_read_drawn_verb, &call);
+    ustore_py_call_open(&context, verb, &call);
     PyObject* const reading = ustore_py_arena_new(executor);
-    PyObject* const values = reading && ustore_py_keys_from_object(drawn, &call.keys) == 0
-                                 ? ustore_py_values_read(&context, &options, &ustore_py_read_drawn_verb, &call, reading)
-                                 : ustore_py_call_discard(&context, &ustore_py_read_drawn_verb, &call);
+    PyObject* values = NULL;
+    if (!reading || ustore_py_keys_from_object(drawn, &call.keys) != 0)
+        values = ustore_py_call_discard(&context, verb, &call);
+    else if (documents)
+        values = ustore_py_docs_read(&context, &options, ustore_docs_field_type_json_k, verb, &call, reading);
+    else values = ustore_py_values_read(&context, &options, verb, &call, reading);
     Py_XDECREF(reading);
     Py_DECREF(drawn);
     return values;
@@ -329,9 +352,9 @@ static PyObject* Collection_sample_keys(Collection* self, PyObject* const* args,
     if (ustore_py_size_from_object(args[0], "wanted", &wanted) != 0) return NULL;
     ustore_py_context_t context;
     ustore_py_verb_options_t options;
-    if (collection_resolve(self, ustore_modality_any_k, collection_missing_refused_k, &context, &options) != 0)
-        return NULL;
-    return ustore_py_keys_sample(&context, &options, wanted, args[1]);
+    ustore_modality_t held = ustore_modality_blobs_k;
+    if (collection_found(self, &context, &options, &held) != 0) return NULL;
+    return ustore_py_keys_sample(&context, &options, held, wanted, args[1]);
 }
 
 static char const doc_Collection_scan[] =                                                   //
@@ -354,12 +377,8 @@ static PyObject* Collection_scan(Collection* self, PyObject* const* args, Py_ssi
     if (ustore_py_size_from_object(args[1], "wanted", &wanted) != 0) return NULL;
     ustore_py_context_t context;
     ustore_py_verb_options_t options;
-    if (collection_resolve(self, ustore_modality_any_k, collection_missing_refused_k, &context, &options) != 0)
-        return NULL;
-    ustore_modality_t held = ustore_modality_any_k;
-    ustore_py_critical_section_begin_((PyObject*)self);
-    held = self->modality;
-    ustore_py_critical_section_end_();
+    ustore_modality_t held = ustore_modality_blobs_k;
+    if (collection_found(self, &context, &options, &held) != 0) return NULL;
     return ustore_py_keys_scan(&context, &options, held, &start, wanted, ustore_scan_ordered_k, NULL, args[2]);
 }
 
@@ -370,8 +389,7 @@ static char const doc_Collection[] =                                            
     "otherwise, raising NotFoundError on a read when no collection carries it. A write\n"      //
     "through `blobs` or `docs`, or an access of `graph` or `table`, creates a missing\n"       //
     "collection at the head to hold that modality, so a transaction never conflicts with a\n"  //
-    "collection made for it. A view of another modality raises InvalidArgumentError, and a\n"  //
-    "collection created to hold 'any' accepts every view.\n"                                   //
+    "collection made for it. A view of another modality raises InvalidArgumentError.\n"        //
     "\n"                                                                                       //
     "Its calls run as the receiver's do. The mapping views and `sample` copy what they read\n" //
     "out of a one-off arena each, while `scan` and `sample_keys` take an Arena of yours.\n"    //
@@ -444,7 +462,9 @@ static int collection_view_contains(CollectionView* self, PyObject* key, ustore_
     if (collection_resolve(self->collection, modality, collection_missing_refused_k, &context, &options) != 0 ||
         ustore_py_context_blocking(&context, "`in` answers a bool at once", "contains(key, collection=...)") != 0)
         return -1;
-    PyObject* const found = ustore_py_value_contains(&context, &options, &parsed);
+    PyObject* const found = modality == ustore_modality_docs_k
+                                ? ustore_py_document_contains(&context, &options, &parsed)
+                                : ustore_py_value_contains(&context, &options, &parsed);
     if (!found) return -1;
     Py_DECREF(found);
     return found == Py_True;

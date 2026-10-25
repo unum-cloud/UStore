@@ -3,7 +3,7 @@
 //! A [`Collection`] resolves its name once, at the head or at its view's snapshot, and reads and writes through its
 //! view. Its first write creates a missing collection holding the modality of the view that wrote it, a read of a
 //! missing one fails with [`Status::NotFound`], and a view of another modality fails with
-//! [`Status::InvalidArgument`], unless the collection holds [`Modality::Any`].
+//! [`Status::InvalidArgument`].
 //!
 //! A collection keeps no arena. A call with no arena to pass makes a one-off arena, copies what it read out of it,
 //! and frees it: slower than reusing an arena, and stateless. Batch reads take the [`Arena`] they land in instead.
@@ -133,9 +133,10 @@ impl<'view, Parent: Writable> Collection<'view, Parent> {
         Graph { collection: self }
     }
 
-    /// Draws up to `wanted` keys uniformly at random into `arena`, each with its value read through the same view.
+    /// Draws up to `wanted` keys of a blobs collection uniformly at random into `arena`, each with its value read
+    /// through the same view.
     pub fn sample<'arena>(&mut self, wanted: usize, arena: &'arena mut Arena) -> Result<Sample<'arena>> {
-        let collection = self.existing(Modality::Any)?;
+        let collection = self.existing(Modality::Blobs)?;
         let keys = self.view.sample(collection, wanted, arena)?.to_vec();
         let values = self.view.read(collection, &keys, arena)?;
         Ok(Sample { keys, values })
@@ -181,7 +182,7 @@ impl<'view, Parent: Writable> Collection<'view, Parent> {
 
 /// The collection `found` names, when a view of `modality` may reach what it holds.
 fn accepted((collection, held): (CollectionID, Modality), modality: Modality) -> Result<CollectionID> {
-    if held == modality || held == Modality::Any || modality == Modality::Any {
+    if held == modality {
         return Ok(collection);
     }
     let message = match modality {
@@ -287,7 +288,9 @@ impl<Parent: Writable> Docs<'_, '_, Parent> {
     /// Removes the document under `key`, whether or not the collection holds one.
     pub fn remove(self, key: Key) -> Result<()> {
         let collection = self.collection.existing(Modality::Docs)?;
-        self.collection.view.remove(collection, [key], Durability::Buffered)?;
+        self.collection
+            .view
+            .docs_remove(collection, [key], Durability::Buffered)?;
         Ok(())
     }
 
@@ -535,11 +538,11 @@ mod tests {
         let failure = movies.graph().read_edges(&[avatar], Role::Any).unwrap_err();
         assert_eq!(failure.status, Status::InvalidArgument);
 
-        // A collection holding anything takes documents and blobs alike.
-        database.collection_create("anything", Modality::Any).unwrap();
-        let mut anything = database.collection("anything").unwrap();
-        anything.docs().set(avatar, &document("[]")).unwrap();
-        assert_eq!(anything.blobs().get(avatar).unwrap(), Some(b"[]".to_vec()));
+        // A collection created to hold blobs refuses documents the same way.
+        database.collection_create("posters", Modality::Blobs).unwrap();
+        let mut posters = database.collection("posters").unwrap();
+        let failure = posters.docs().set(avatar, &document("[]")).unwrap_err();
+        assert_eq!(failure.status, Status::InvalidArgument);
     }
 
     #[test]

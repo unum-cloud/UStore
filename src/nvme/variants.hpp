@@ -11,22 +11,21 @@
  *  `src/nvme/engine.cpp` keeps them out of the unit that picks the class.
  *
  *  One mount opens the volumes and one database of 16-byte keys lives on them. Every collection of the C ABI is one
- *  collection of that database under the same UUID, and three more are the engine's own: the main collection under
- *  the nil UUID, and two system collections. The collections system collection, `catalog_collection_k`, maps every
- *  other collection's UUID onto its name, while the store schema records its modality, which a mount needs before it
- *  opens the collection. The names system collection maps every name onto the bare UUID of its collection. A strings
+ *  collection of that database under the same UUID, and two more are the engine's own system collections. The
+ *  collections system collection, `collections_collection_k`, maps every other collection's UUID onto its name, while
+ *  the store schema records its modality, which a mount needs before it opens the collection. The names system
+ *  collection, `names_collection_k`, maps every name onto the bare UUID of its collection. A strings
  *  collection, and the names, live in the strings store of `include/ustore/strings/nvme_store.hpp`, keyed by whole
  *  strings, each mapped onto a 16-byte key held in its cell, and a transaction's strings ride in the share of it every
  *  transaction here joins.
  *
  *  Every write of a caller goes through a transaction of the database, the caller's or one the call commits alone, so
  *  the registry records every commit a watched read may conflict with. The two system collections, which no caller's
- *  transaction reaches, change under a claim of their own, the catalog straight in the store and the names through a
- *  commit watching nothing, so a collection created or dropped never conflicts with the transactions running beside
- *  it. A call outside a transaction reads at the head, or
- *  at its snapshot's stamp. Reads resolve collections at the head, as every engine does, but through a snapshot, which
- *  resolves them as they stood at its stamp. A walk merges the runs of one collection with its memory runs and,
- *  inside a transaction, with the transaction's own writes.
+ *  transaction reaches, change under a claim of their own, the collections straight in the store and the names through
+ *  a commit watching nothing, so a collection created or dropped never conflicts with the transactions running beside
+ *  it. A call outside a transaction reads at the head, or at its snapshot's stamp. Reads resolve collections at the
+ *  head, as every engine does, but through a snapshot, which resolves them as they stood at its stamp. A walk merges
+ *  the runs of one collection with its memory runs and, inside a transaction, with the transaction's own writes.
  *
  *  Isolation, as delivered. Every read of a transaction answers at the stamp it started at, a walk included, so it
  *  sees one committed state whatever it watches. Watching keys, the default, a commit checks every key it read or
@@ -106,7 +105,8 @@ using graph_device_fold_t = graph::vram_nvidia_adjacency_fold_t;
 using graph_device_fold_t = blobs::no_device_fold_t;
 #endif
 
-/** The store of a blobs collection, and of the main one, whose values follow @p value_layout_. */
+/** The store of a blobs collection, and of the collections system collection, whose values follow
+ *  @p value_layout_. */
 template <cpu_class_t cpu_class_, value_layout_t value_layout_>
 using blobs_store_of =
     blobs::nvme_store<key_slot<stored_key_t, value_layout_>, typename storage_mount_of<cpu_class_>::volume_t,
@@ -162,9 +162,9 @@ using database_transaction_of = typename database_of<cpu_class_>::transaction_t;
 template <cpu_class_t cpu_class_>
 using strings_transaction_of = nvme_transaction<database_of<cpu_class_>, strings_store_of<cpu_class_>>;
 
-/** The collections system collection, the catalog, mapping every collection's UUID onto its name, which no minted
- *  UUIDv7 spells, as its byte 6 is `0x7X`. */
-inline constexpr ustore_collection_id_t catalog_collection_k {
+/** The collections system collection, mapping every collection's UUID onto its name, which no minted UUIDv7 spells,
+ *  as its byte 6 is `0x7X`. */
+inline constexpr ustore_collection_id_t collections_collection_k {
     {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD}}};
 
 /** The names system collection, a strings collection mapping every collection's name onto its UUID, which no minted
@@ -233,7 +233,7 @@ inline collection_config_t strings_shape_of(collection_config_t shape) noexcept 
 
 /** Whether @p collection is one the engine keeps for itself, which no call of the C ABI may address. */
 inline bool reserved(ustore_collection_id_t const& collection) noexcept {
-    return collection == catalog_collection_k || collection == names_collection_k;
+    return collection == collections_collection_k || collection == names_collection_k;
 }
 
 /** The shape every collection of a database takes unless its open names another. */
@@ -305,14 +305,14 @@ struct database_state : handle_t {
      *  past the threads the database counted reads as an outside thread's would. */
     call_executor_t const* executor = nullptr;
 
-    /** Held by whoever changes the catalog and the names, so a name is checked and taken in one step. */
-    std::int32_t catalog_claim = 0;
+    /** Held by whoever changes both system collections, so a name is checked and taken in one step. */
+    std::int32_t collections_claim = 0;
 
     /** Snapshots not yet freed, through the class's atomic reference. */
     std::size_t open_snapshots = 0;
 
-    /** Collections the catalog no longer lists whose runs an open snapshot may still read, dropped once the last
-     *  snapshot is freed; guarded by @c catalog_claim. */
+    /** Collections the collections system collection no longer lists whose runs an open snapshot may still read,
+     *  dropped once the last snapshot is freed; guarded by @c collections_claim. */
     st::basic_vector<ustore_collection_id_t> retired_collections;
 
     database_state() noexcept : handle_t {&nvme_variant<cpu_class_>::engine_k} {}
@@ -364,13 +364,14 @@ struct snapshot_handle : handle_t {
         : handle_t {&nvme_variant<cpu_class_>::engine_k}, state(owner) {}
 };
 
-/** Holds the catalog of one database for the life of the guard, waiting while another change holds it. */
+/** Holds both system collections of one database for the life of the guard, waiting while another change holds
+ *  them. */
 template <cpu_class_t cpu_class_>
-class catalog_guard {
+class collections_guard {
     std::int32_t& claim_;
 
   public:
-    explicit catalog_guard(database_state<cpu_class_>& state) noexcept : claim_(state.catalog_claim) {
+    explicit collections_guard(database_state<cpu_class_>& state) noexcept : claim_(state.collections_claim) {
         atomic_ref_of<cpu_class_, std::int32_t> const word {claim_};
         std::int32_t expected_free = 0;
         while (!word.compare_exchange_weak(expected_free, 1, std::memory_order_acquire, std::memory_order_relaxed)) {
@@ -378,9 +379,11 @@ class catalog_guard {
             expected_free = 0;
         }
     }
-    catalog_guard(catalog_guard const&) = delete;
-    catalog_guard& operator=(catalog_guard const&) = delete;
-    ~catalog_guard() noexcept { atomic_ref_of<cpu_class_, std::int32_t> {claim_}.store(0, std::memory_order_release); }
+    collections_guard(collections_guard const&) = delete;
+    collections_guard& operator=(collections_guard const&) = delete;
+    ~collections_guard() noexcept {
+        atomic_ref_of<cpu_class_, std::int32_t> {claim_}.store(0, std::memory_order_release);
+    }
 };
 
 /** The database a call addresses. */
@@ -580,7 +583,7 @@ expected<value_view_t> read_value(call_access<cpu_class_> const& access, collect
 }
 
 /** Writes @p value under @p key of @p collection, a missing value removing it: through the transaction of @p access,
- *  or straight into the store for the catalog and the names, which no transaction reaches. */
+ *  or straight into the store for both system collections, which no transaction reaches. */
 template <cpu_class_t cpu_class_>
 status_t write_value(call_access<cpu_class_> const& access, collection_id_t collection, stored_key_t key,
                      value_view_t value) noexcept {
@@ -764,40 +767,43 @@ status_t serve_write(database_state<cpu_class_>& state, view_t const& view, usto
 
 #pragma endregion Maintenance
 
-#pragma region Catalog
+#pragma region Collections
 
 /** What the engine knows of a listed collection: its modality, which the store records, and its name, which the
- *  catalog records, empty for an anonymous one. */
-struct catalog_entry_t {
-    ustore_modality_t modality = ustore_modality_any_k;
+ *  collections system collection records, empty for an anonymous one. */
+struct collections_entry_t {
+    ustore_modality_t modality {};
     std::string_view name;
 };
 
-/** The entry of @p collection, whose catalog listing is @p held, refusing one the store no longer holds. */
+/** The entry of @p collection, whose listing in the collections system collection is @p held, refusing one the store
+ *  no longer holds. */
 template <cpu_class_t cpu_class_>
-expected<catalog_entry_t> read_catalog_entry(database_state<cpu_class_>& state,
-                                             ustore_collection_id_t const& collection, value_view_t held) noexcept {
-    catalog_entry_t entry {ustore_modality_any_k, std::string_view {held}};
+expected<collections_entry_t> read_collections_entry(database_state<cpu_class_>& state,
+                                                     ustore_collection_id_t const& collection,
+                                                     value_view_t held) noexcept {
+    collections_entry_t entry {ustore_modality_t {}, std::string_view {held}};
     if (status_t const known = state.store->collection_modality(collection, entry.modality); known.failed())
         return known;
     return entry;
 }
 
-/** What the catalog records of @p collection at @p stamp, refusing one it does not list, the reserved ones included. */
+/** What the collections system collection records of @p collection at @p stamp, refusing one it does not list, the
+ *  reserved ones included. */
 template <cpu_class_t cpu_class_>
-expected<catalog_entry_t> look_up(database_state<cpu_class_>& state, ustore_arena_t scratch,
-                                  ustore_collection_id_t const& collection, transaction_stamp_t stamp = head_stamp_k,
-                                  std::size_t thread_index = outside_executor_k) noexcept {
-    if (collection == ustore_collection_main_k) return catalog_entry_t {};
+expected<collections_entry_t> look_up(database_state<cpu_class_>& state, ustore_arena_t scratch,
+                                      ustore_collection_id_t const& collection,
+                                      transaction_stamp_t stamp = head_stamp_k,
+                                      std::size_t thread_index = outside_executor_k) noexcept {
     call_access<cpu_class_> const listed {state, nullptr, watch_schedule_t::never_k, scratch, stamp, thread_index};
-    auto [held, read_status] = read_value(listed, catalog_collection_k, stored_of(collection.uuid));
+    auto [held, read_status] = read_value(listed, collections_collection_k, stored_of(collection.uuid));
     if (read_status.failed()) return read_status;
     if (!held) return status_t {status_code_t::not_found_k, "No such collection"};
-    return read_catalog_entry(state, collection, held);
+    return read_collections_entry(state, collection, held);
 }
 
-/** Refuses a batch addressing a collection the catalog does not list, as @p view reads it, or one @c admit_modality
- *  refuses for @p modality, looking each run of tasks on one collection up once. */
+/** Refuses a batch addressing a collection the collections system collection does not list, as @p view reads it, or
+ *  one @c admit_modality refuses for @p modality, looking each run of tasks on one collection up once. */
 template <cpu_class_t cpu_class_>
 status_t resolve_runs(database_state<cpu_class_>& state, view_t const& view,
                       strided_iterator<ustore_collection_id_t const> collections, std::size_t count,
@@ -806,12 +812,11 @@ status_t resolve_runs(database_state<cpu_class_>& state, view_t const& view,
                                           ? handle_cast<snapshot_handle<cpu_class_>>(view.snapshot)->pin.stamp()
                                           : head_stamp_k;
     for (std::size_t index = 0; index != count; ++index) {
-        if (index != 0 && collections && collections[index] == collections[index - 1]) continue;
-        ustore_collection_id_t const collection = collections ? collections[index] : ustore_collection_main_k;
-        auto [entry, look_up_status] = look_up(state, view.scratch, collection, stamp, thread_index_of(state, view));
+        if (index != 0 && collections[index] == collections[index - 1]) continue;
+        auto [entry, look_up_status] = look_up(state, view.scratch, collections[index], stamp,
+                                               thread_index_of(state, view));
         if (look_up_status.failed()) return look_up_status;
         if (status_t const admitted = admit_modality(entry.modality, modality); admitted.failed()) return admitted;
-        if (!collections) return {};
     }
     return {};
 }
@@ -824,13 +829,7 @@ status_t resolve_modality(ustore_database_t database, ustore_collections_view_t 
                         modality);
 }
 
-/** The collection task @p index of @p collections names, the main one when they name none. */
-inline ustore_collection_id_t task_collection(strided_iterator<ustore_collection_id_t const> collections,
-                                              std::size_t index) noexcept {
-    return collections ? collections[index] : ustore_collection_main_k;
-}
-
-#pragma endregion Catalog
+#pragma endregion Collections
 
 #pragma region Strings
 
@@ -1136,29 +1135,29 @@ status_t empty_collection(database_state<cpu_class_>& state, ustore_arena_t scra
     }
 }
 
-/** Every collection the catalog lists at the head, with its entry, the main one excluded. */
+/** Every collection the collections system collection lists at the head, with its entry. */
 struct listed_collection_t {
     ustore_collection_id_t id;
-    catalog_entry_t entry;
+    collections_entry_t entry;
 };
 
-/** Collects every collection the catalog lists at @p stamp into @p listed. */
+/** Collects every collection the collections system collection lists at @p stamp into @p listed. */
 template <cpu_class_t cpu_class_, typename listed_type_>
-status_t list_catalog(database_state<cpu_class_>& state, ustore_arena_t scratch, listed_type_& listed,
-                      transaction_stamp_t stamp = head_stamp_k) noexcept {
+status_t list_collections(database_state<cpu_class_>& state, ustore_arena_t scratch, listed_type_& listed,
+                          transaction_stamp_t stamp = head_stamp_k) noexcept {
     call_access<cpu_class_> const head {state, nullptr, watch_schedule_t::never_k, scratch, stamp};
     st::basic_vector<stored_key_t, arena_allocator<stored_key_t>> keys {{scratch}};
-    if (status_t const collected = collect_keys(head, catalog_collection_k, limit<stored_key_t>::min(),
+    if (status_t const collected = collect_keys(head, collections_collection_k, limit<stored_key_t>::min(),
                                                 std::numeric_limits<std::size_t>::max(), keys);
         collected.failed())
         return collected;
     for (std::size_t index = 0; index != keys.size(); ++index) {
-        auto [held, read_status] = read_value(head, catalog_collection_k, keys[index]);
+        auto [held, read_status] = read_value(head, collections_collection_k, keys[index]);
         if (read_status.failed()) return read_status;
         if (!held) continue;
         ustore_collection_id_t id;
         keys[index].to_bytes(std::as_writable_bytes(std::span<std::uint8_t, 16> {id.uuid.bytes}));
-        auto [entry, entry_status] = read_catalog_entry(state, id, held);
+        auto [entry, entry_status] = read_collections_entry(state, id, held);
         if (entry_status.failed()) return entry_status;
         if (status_t const pushed = growth_status(listed.push_back(listed_collection_t {id, entry})); pushed.failed())
             return pushed;
@@ -1167,11 +1166,12 @@ status_t list_catalog(database_state<cpu_class_>& state, ustore_arena_t scratch,
 }
 
 /**
- *  @brief Forgets @p collection in the catalog and the names, then returns its runs to the volume, or leaves them to
+ *  @brief Forgets @p collection in both system collections, then returns its runs to the volume, or leaves them to
  *      the snapshots open, which still read them.
  *
- *  The catalog changes under its own claim and straight into the store, outside the registry, since no caller's
- *  transaction reads it, so a catalog change never shows as a commit a transaction's watches might collide with.
+ *  The collections system collection changes under its own claim and straight into the store, outside the registry,
+ *  since no caller's transaction reads it, so its change never shows as a commit a transaction's watches might collide
+ *  with.
  *  The name goes first, so a crash in between leaves a listed collection without a name, never a dangling name, and a
  *  crash with the runs still kept leaves an unlisted collection, which the next open drops.
  */
@@ -1179,15 +1179,15 @@ template <cpu_class_t cpu_class_>
 status_t drop_collection(database_state<cpu_class_>& state, ustore_arena_t scratch,
                          ustore_collection_id_t const& collection) noexcept {
     {
-        catalog_guard<cpu_class_> const held {state};
+        collections_guard<cpu_class_> const held {state};
         call_access<cpu_class_> const head {state, nullptr, watch_schedule_t::never_k, scratch};
         stored_key_t const listed = stored_of(collection.uuid);
-        auto [listing, read_status] = read_value(head, catalog_collection_k, listed);
+        auto [listing, read_status] = read_value(head, collections_collection_k, listed);
         if (read_status.failed()) return read_status;
         if (!listing) return {status_code_t::not_found_k, "No collection has such identifier"};
         if (std::string_view const name {listing}; !name.empty())
             if (status_t const unnamed = write_name(state, scratch, name, nullptr); unnamed.failed()) return unnamed;
-        if (status_t const unlisted = write_value(head, catalog_collection_k, listed, {}); unlisted.failed())
+        if (status_t const unlisted = write_value(head, collections_collection_k, listed, {}); unlisted.failed())
             return unlisted;
         // A snapshot taken before the unlisting still reads the runs, which wait for the last snapshot to go
         if (atomic_ref_of<cpu_class_, std::size_t> {state.open_snapshots}.load(std::memory_order_acquire) != 0 &&
@@ -1200,7 +1200,7 @@ status_t drop_collection(database_state<cpu_class_>& state, ustore_arena_t scrat
 /** Drops every collection a drop left for the snapshots, which the last snapshot freed no longer reads. */
 template <cpu_class_t cpu_class_>
 void drop_retired(database_state<cpu_class_>& state) noexcept {
-    catalog_guard<cpu_class_> const held {state};
+    collections_guard<cpu_class_> const held {state};
     for (ustore_collection_id_t const& collection : state.retired_collections) [[maybe_unused]]
         status_t const dropped = state.store->drop_collection(collection);
     state.retired_collections.clear();
@@ -1217,8 +1217,7 @@ status_t database_describe(ustore_database_describe_t const& arguments, view_t c
     if (!arguments.description) return {status_code_t::invalid_argument_k, "Need an output for the description"};
     database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
     *arguments.description = {
-        .capabilities = ustore_capabilities_t(ustore_capabilities_transactions_k | ustore_capabilities_collections_k |
-                                              ustore_capabilities_snapshots_k),
+        .capabilities = ustore_capabilities_t(ustore_capabilities_transactions_k | ustore_capabilities_snapshots_k),
         .engine = ustore_engine_nvme_k,
         .isolation = ustore_isolation_snapshot_k,
         .keys = static_cast<ustore_size_t>(state.store->population_count()),
@@ -1228,8 +1227,7 @@ status_t database_describe(ustore_database_describe_t const& arguments, view_t c
     return {};
 }
 
-/** Implements @c ustore_database_clear: removing every named collection and emptying the main one, or emptying every
- *  collection's pairs or values. */
+/** Implements @c ustore_database_clear: removing every collection, or emptying every collection's pairs or values. */
 template <cpu_class_t cpu_class_>
 status_t database_clear(ustore_database_clear_t const& arguments, view_t const& view) noexcept {
     ustore_drop_mode_t const mode = arguments.mode;
@@ -1237,7 +1235,7 @@ status_t database_clear(ustore_database_clear_t const& arguments, view_t const& 
         return {status_code_t::invalid_argument_k, "Unknown drop mode"};
     database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
     st::basic_vector<listed_collection_t, arena_allocator<listed_collection_t>> listed {{view.scratch}};
-    if (status_t const collected = list_catalog(state, view.scratch, listed); collected.failed()) return collected;
+    if (status_t const collected = list_collections(state, view.scratch, listed); collected.failed()) return collected;
     for (std::size_t index = 0; index != listed.size(); ++index) {
         // A string always maps onto a key, so emptying every value leaves the strings collections as they are
         if (mode == ustore_drop_values_k &&
@@ -1249,11 +1247,6 @@ status_t database_clear(ustore_database_clear_t const& arguments, view_t const& 
                                                         listed[index].entry.modality, mode);
         if (cleared.failed()) return cleared;
     }
-    ustore_drop_mode_t const main_mode = mode == ustore_drop_collection_k ? ustore_drop_pairs_k : mode;
-    if (status_t const cleared = empty_collection(state, view.scratch, ustore_collection_main_k, ustore_modality_any_k,
-                                                  main_mode);
-        cleared.failed())
-        return cleared;
     if (status_t const flushed = state.store->flush(); flushed.failed()) return flushed;
     return compact_due(state);
 }
@@ -1277,7 +1270,8 @@ status_t database_compact(ustore_database_compact_t const& arguments, view_t con
 
 #pragma region Collection Calls
 
-/** Implements @c ustore_collection_list as a walk of the catalog at the snapshot it names or at the head. */
+/** Implements @c ustore_collection_list as a walk of the collections system collection at the snapshot it names or at
+ *  the head. */
 template <cpu_class_t cpu_class_>
 status_t collection_list(ustore_collection_list_t const& arguments, view_t const& view) noexcept {
     if (!arguments.written) return {status_code_t::invalid_argument_k, "Need an output for the collections written"};
@@ -1286,11 +1280,11 @@ status_t collection_list(ustore_collection_list_t const& arguments, view_t const
     transaction_stamp_t const stamp = view.snapshot
                                           ? handle_cast<snapshot_handle<cpu_class_>>(view.snapshot)->pin.stamp()
                                           : head_stamp_k;
-    if (status_t const collected = list_catalog(state, view.scratch, listed, stamp); collected.failed())
+    if (status_t const collected = list_collections(state, view.scratch, listed, stamp); collected.failed())
         return collected;
     collection_list_outputs_t outputs {view.scratch};
     for (std::size_t index = 0; index != listed.size(); ++index) {
-        catalog_entry_t const& entry = listed[index].entry;
+        collections_entry_t const& entry = listed[index].entry;
         value_view_t const name = entry.name.empty() ? value_view_t {} : value_view_t {entry.name};
         if (status_t const pushed = outputs.push(listed[index].id, entry.modality, name); pushed.failed())
             return pushed;
@@ -1298,15 +1292,13 @@ status_t collection_list(ustore_collection_list_t const& arguments, view_t const
     return outputs.finish(arguments);
 }
 
-/** Implements @c ustore_collection_create: the collection's runs first, then its catalog entry and name in one
+/** Implements @c ustore_collection_create: the collection's runs first, then its collections entry and name in one
  *  commit, which drops the runs again when the name is taken. */
 template <cpu_class_t cpu_class_>
 status_t collection_create(ustore_collection_create_t const& arguments, view_t const& view) noexcept {
     if (!arguments.collection) return {status_code_t::invalid_argument_k, "Need an output for the collection"};
-    if (arguments.modality > ustore_modality_pages_k) return {status_code_t::invalid_argument_k, "Unknown modality"};
     std::string_view const name = string_of(arguments.name);
-    if (arguments.name.data && name.empty())
-        return {status_code_t::invalid_argument_k, "A name is never empty, as the main collection has none"};
+    if (arguments.name.data && name.empty()) return {status_code_t::invalid_argument_k, "A name is never empty"};
     database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
     auto [created, mint_status] = mint_collection_id();
     if (mint_status.failed()) return mint_status;
@@ -1322,10 +1314,11 @@ status_t collection_create(ustore_collection_create_t const& arguments, view_t c
         made.failed())
         return made;
 
-    // The catalog changes under its own claim, outside the registry, and lists the collection before it names it
+    // The collections system collection changes under its own claim, outside the registry, and lists the collection
+    // before the names system collection names it
     status_t listed;
     {
-        catalog_guard<cpu_class_> const held {state};
+        collections_guard<cpu_class_> const held {state};
         call_access<cpu_class_> const head {state, nullptr, watch_schedule_t::never_k, view.scratch};
         bool taken = false;
         ustore_collection_id_t holder;
@@ -1333,11 +1326,11 @@ status_t collection_create(ustore_collection_create_t const& arguments, view_t c
         if (listed.succeeded() && taken)
             listed = {status_code_t::already_exists_k, "A collection already carries the name"};
         if (listed.succeeded())
-            listed = write_value(head, catalog_collection_k, stored_of(created.uuid), value_view_t {name});
+            listed = write_value(head, collections_collection_k, stored_of(created.uuid), value_view_t {name});
         if (listed.succeeded() && !name.empty()) {
             listed = write_name(state, view.scratch, name, &created);
             if (listed.failed()) {
-                [[maybe_unused]] status_t const unlisted = write_value(head, catalog_collection_k,
+                [[maybe_unused]] status_t const unlisted = write_value(head, collections_collection_k,
                                                                        stored_of(created.uuid), {});
             }
         }
@@ -1359,8 +1352,6 @@ status_t collection_drop(ustore_collection_drop_t const& arguments, view_t const
     ustore_drop_mode_t const mode = arguments.mode;
     if (mode != ustore_drop_collection_k && mode != ustore_drop_pairs_k && mode != ustore_drop_values_k)
         return {status_code_t::invalid_argument_k, "Unknown drop mode"};
-    if (collection == ustore_collection_main_k && mode == ustore_drop_collection_k)
-        return {status_code_t::invalid_argument_k, "The main collection can only be cleared"};
     if (reserved(collection)) return {status_code_t::not_found_k, "No collection has such identifier"};
     database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
     if (mode == ustore_drop_collection_k) {
@@ -1396,9 +1387,9 @@ status_t collection_find(ustore_collection_find_t const& arguments, strings_arg_
         if (status_t const looked = look_up_name(named, string_of(names[index]), found, present); looked.failed())
             return looked;
         // A drop unnames a collection before the store lets it go, so a name whose store is gone is a drop in flight
-        ustore_modality_t modality = ustore_modality_any_k;
+        ustore_modality_t modality {};
         if (present && state.store->collection_modality(found, modality).failed()) present = false;
-        outputs.assign(index, present ? found : ustore_collection_main_k, modality, present);
+        outputs.assign(index, present ? found : ustore_collection_id_t {}, modality, present);
     }
     outputs.finish(arguments);
     return {};
@@ -1563,18 +1554,16 @@ struct sample_generator_t {
     }
 };
 
-/** Implements @c ustore_blobs_sample as a reservoir filled from a walk of each collection. */
+/** Samples keys as a reservoir filled from a walk of the store of each collection, for a caller whose resolver
+ *  checked the collections. */
 template <cpu_class_t cpu_class_>
-status_t blobs_sample(ustore_blobs_sample_t const& arguments, view_t const& view) noexcept {
+status_t sample_values(ustore_blobs_sample_t const& arguments, view_t const& view) noexcept {
     if (!arguments.count) return {};
     if (!arguments.offsets || !arguments.keys)
         return {status_code_t::invalid_argument_k, "Need outputs for the offsets and the keys"};
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     sample_batch_t const samples {collections, arguments.wanted, arguments.count};
     database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
-    if (status_t const resolved = resolve_runs(state, view, collections, arguments.count, ustore_modality_blobs_k);
-        resolved.failed())
-        return resolved;
     auto [outputs, outputs_status] = scan_outputs_t::make(arguments, view.scratch);
     if (outputs_status.failed()) return outputs_status;
     auto const now = static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
@@ -1613,6 +1602,16 @@ status_t blobs_sample(ustore_blobs_sample_t const& arguments, view_t const& view
     return outputs.finish(arguments);
 }
 
+/** Implements @c ustore_blobs_sample over the collections holding blobs. */
+template <cpu_class_t cpu_class_>
+status_t blobs_sample(ustore_blobs_sample_t const& arguments, view_t const& view) noexcept {
+    if (status_t const resolved = resolve_modality<cpu_class_>(arguments.database, arguments.collections,
+                                                               arguments.count, ustore_modality_blobs_k, view);
+        resolved.failed())
+        return resolved;
+    return sample_values<cpu_class_>(arguments, view);
+}
+
 /** Implements @c ustore_blobs_measure, exact for keys and value bytes at the view it reads. */
 template <cpu_class_t cpu_class_>
 status_t blobs_measure(ustore_blobs_measure_t const& arguments, view_t const& view) noexcept {
@@ -1632,7 +1631,7 @@ status_t blobs_measure(ustore_blobs_measure_t const& arguments, view_t const& vi
         stored_key_t const last = stored_of((end_keys ? end_keys[task] : largest_key_k).uuid);
         std::size_t cardinality = 0;
         std::size_t value_bytes = 0;
-        status_t const walked = walk(access, task_collection(collections, task), lower,
+        status_t const walked = walk(access, collections[task], lower,
                                      [&](stored_key_t key, stored_value_size_t size) noexcept {
                                          if (last < key) return false;
                                          ++cardinality;
@@ -1640,8 +1639,7 @@ status_t blobs_measure(ustore_blobs_measure_t const& arguments, view_t const& vi
                                          return true;
                                      });
         if (walked.failed()) return walked;
-        if (status_t const watched = watch_range(access, task_collection(collections, task), lower, last);
-            watched.failed())
+        if (status_t const watched = watch_range(access, collections[task], lower, last); watched.failed())
             return watched;
         outputs.min_cardinalities[task] = cardinality;
         outputs.max_cardinalities[task] = cardinality;
@@ -1667,9 +1665,9 @@ inline expected<std::span<string_task_t>> string_tasks(view_t const& view,
     auto [tasks, allocate_status] = arena_allocate<string_task_t>(view.scratch, count);
     if (allocate_status.failed()) return allocate_status;
     for (std::size_t index = 0; index != count; ++index)
-        tasks[index] = values ? string_task_t {task_collection(collections, index), string_of(texts[index]),
-                                               delta_kind_t::write_k, values[index].uuid}
-                              : string_task_t {task_collection(collections, index), string_of(texts[index])};
+        tasks[index] = values ? string_task_t {collections[index], string_of(texts[index]), delta_kind_t::write_k,
+                                               values[index].uuid}
+                              : string_task_t {collections[index], string_of(texts[index])};
     return tasks;
 }
 
@@ -1728,8 +1726,7 @@ status_t strings_read(ustore_strings_read_t const& arguments, strings_arg_t cons
     for (std::size_t index = 0; index != arguments.count; ++index) {
         ustore_key_t value;
         bool present = false;
-        if (status_t const read = read_string(access, task_collection(collections, index), string_of(texts[index]),
-                                              value.uuid, present);
+        if (status_t const read = read_string(access, collections[index], string_of(texts[index]), value.uuid, present);
             read.failed())
             return read;
         if (present) outputs.push_present(value);
@@ -1759,8 +1756,7 @@ status_t strings_scan(ustore_strings_scan_t const& arguments, strings_arg_t cons
         std::string_view const prefix = prefixes ? string_of(prefixes[task]) : std::string_view {};
         std::string_view const start = starts ? string_of(starts[task]) : std::string_view {};
         outputs.open_task(task);
-        if (status_t const scanned = scan_strings(access, task_collection(collections, task), prefix, start,
-                                                  arguments.wanted, outputs);
+        if (status_t const scanned = scan_strings(access, collections[task], prefix, start, arguments.wanted, outputs);
             scanned.failed())
             return scanned;
         if (!progress.advance(1)) return progress_cancelled_k;
@@ -1929,15 +1925,15 @@ status_t reserve_collection(database_state<cpu_class_>& state, collection_id_t c
     return state.store->create_collection(collection, string_view_t {name}, modality, shape);
 }
 
-/** Drops every collection of the store the catalog does not list, which a crash between a create's two steps
- *  leaves behind. */
+/** Drops every collection of the store the collections system collection does not list, which a crash between a
+ *  create's two steps leaves behind. */
 template <cpu_class_t cpu_class_>
 status_t drop_unlisted(database_state<cpu_class_>& state, ustore_arena_t scratch) noexcept {
     st::basic_vector<collection_ids_t> const held = state.store->list_collections();
     status_t first;
     for (std::size_t index = 0; index != held.size() && first.succeeded(); ++index) {
         ustore_collection_id_t const id = held[index].id;
-        if (id == ustore_collection_main_k || reserved(id)) continue;
+        if (reserved(id)) continue;
         auto [entry, look_up_status] = look_up(state, scratch, id);
         if (look_up_status == status_code_t::not_found_k) first = state.store->drop_collection(id);
         else if (look_up_status.failed()) first = look_up_status;
@@ -1956,8 +1952,8 @@ status_t mount_store(database_state<cpu_class_>& state, database_config_t const&
     });
 }
 
-/** Opens the store @p resources place, every collection of it shaped as @p shape, reserving the main collection, the
- *  catalog and the names on the first open. */
+/** Opens the store @p resources place, every collection of it shaped as @p shape, reserving both system collections
+ *  on the first open. */
 template <cpu_class_t cpu_class_>
 expected<std::unique_ptr<database_state<cpu_class_>>> open_state(resources_config_t const& resources,
                                                                  database_config_t const& transactions,
@@ -1976,22 +1972,18 @@ expected<std::unique_ptr<database_state<cpu_class_>>> open_state(resources_confi
     if (!state->store) return status_t {status_code_t::out_of_memory_k, "Failed to allocate the store"};
     if (status_t const mounted = mount_store(*state, transactions); mounted.failed()) return mounted;
 
-    if (status_t const reserved = reserve_collection(*state, ustore_collection_main_k, "main", ustore_modality_any_k,
-                                                     shape);
-        reserved.failed())
-        return reserved;
-    // The catalog holds the names of collections, whatever one width the caller's values take
+    // The collections system collection holds the names of collections, whatever one width the caller's values take
     collection_config_t records = shape;
     sorted_run_config_t& record_values = records.lsm_tree.lsm_level_0.sorted_run;
     if (record_values.value_size != 0)
         record_values.value_max_size = static_cast<stored_value_size_t>(
             std::min<std::size_t>(engine_value_max_size_k, records.memory_runs_max_bytes));
     record_values.value_size = 0;
-    if (status_t const reserved = reserve_collection(*state, catalog_collection_k, "catalog", ustore_modality_blobs_k,
-                                                     records);
+    if (status_t const reserved = reserve_collection(*state, collections_collection_k, "_collections",
+                                                     ustore_modality_blobs_k, records);
         reserved.failed())
         return reserved;
-    if (status_t const reserved = reserve_collection(*state, names_collection_k, "names", ustore_modality_strings_k,
+    if (status_t const reserved = reserve_collection(*state, names_collection_k, "_names", ustore_modality_strings_k,
                                                      strings_shape_of(shape));
         reserved.failed())
         return reserved;
@@ -1999,12 +1991,10 @@ expected<std::unique_ptr<database_state<cpu_class_>>> open_state(resources_confi
     return state;
 }
 
-/** Implements @c ustore_database_open_nvme, reserving the main collection, the catalog and the names on the first
- *  open. */
+/** Implements @c ustore_database_open_nvme, reserving both system collections on the first open. */
 template <cpu_class_t cpu_class_>
 status_t nvme_variant<cpu_class_>::open(ustore_database_open_nvme_t const& arguments, view_t const& view) noexcept {
     if (!arguments.database) return {status_code_t::invalid_argument_k, "Need an output for the database"};
-    *arguments.database = nullptr;
     if (!arguments.directory.length) return {status_code_t::invalid_argument_k, "A database needs a directory"};
 
     resources_config_t resources;
@@ -2100,7 +2090,7 @@ template <cpu_class_t cpu_class_>
 status_t save_collection(call_access<cpu_class_> const& access, collection_ids_t const& collection,
                          database_state<cpu_class_>& target, progress_t& progress) noexcept {
     database_of<cpu_class_>& store = *access.state.store;
-    ustore_modality_t modality = ustore_modality_any_k;
+    ustore_modality_t modality {};
     if (status_t const held = store.collection_modality(collection.id, modality); held.failed()) return held;
     if (!target.store->has_collection(collection.id)) {
         collection_config_t config;
@@ -2178,7 +2168,7 @@ status_t snapshot_save(ustore_snapshot_save_t const& arguments, view_t const& vi
     ustore_size_t total = 0;
     if (arguments.progress)
         for (collection_ids_t const& collection : held) {
-            ustore_modality_t modality = ustore_modality_any_k;
+            ustore_modality_t modality {};
             if (status_t const known = source.store->collection_modality(collection.id, modality); known.failed())
                 return known;
             status_t const measured = entry_layout_of(modality) == entry_layout_t::strings_to_uuids_k
@@ -2252,7 +2242,7 @@ void database_free(ustore_database_t database) noexcept {
 
 } // namespace unum::ustore::nvme
 
-// The graph, docs and pages calls build on the accesses, writes and catalog lookups above, and the table below names
+// The graph, docs and pages calls build on the accesses, writes and collection lookups above, and the table below names
 // them
 #include "docs_calls.hpp"  // `docs_write`
 #include "graph_calls.hpp" // `graph_read_edges`, `graph_write_edges`, `graph_remove_vertices`
@@ -2287,6 +2277,7 @@ blobs_verbs_t const nvme_variant<cpu_class_>::values_verbs_k {
     .remove = &remove_values<cpu_class_>,
     .read = &read_values<cpu_class_>,
     .scan = &scan_values<cpu_class_>,
+    .sample = &sample_values<cpu_class_>,
 };
 
 template <cpu_class_t cpu_class_>
@@ -2315,6 +2306,7 @@ docs_verbs_t const nvme_variant<cpu_class_>::docs_verbs_k {
     .gather = &docs_gather_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>>,
     .remove = &remove_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>, ustore_modality_docs_k>,
     .scan = &scan_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>, ustore_modality_docs_k>,
+    .sample = &sample_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>, ustore_modality_docs_k>,
 };
 
 template <cpu_class_t cpu_class_>

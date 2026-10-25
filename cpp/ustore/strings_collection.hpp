@@ -136,7 +136,7 @@ class strings_cursor_t {
 class strings_stream_t {
 
     receiver_t receiver_ {};
-    ustore_collection_id_t collection_ {ustore_collection_main_k};
+    ustore_collection_id_t collection_ {};
     value_view_t prefix_ {value_view_t::make_empty()};
 
     strings_cursor_t cursor_;
@@ -244,7 +244,7 @@ class strings_stream_t {
 class strings_read_collection_t {
   protected:
     receiver_t receiver_ {};
-    ustore_collection_id_t collection_ {ustore_collection_main_k};
+    ustore_collection_id_t collection_ {};
 
   public:
     using prefix_range_t = range<strings_stream_t>;
@@ -525,12 +525,11 @@ struct strings_scan_t {
 class deferred_strings_read_collection_t {
   protected:
     receiver_t receiver_ {};
-    ustore_collection_id_t collection_ {ustore_collection_main_k};
+    ustore_collection_id_t collection_ {};
 
   public:
     deferred_strings_read_collection_t() noexcept = default;
-    explicit deferred_strings_read_collection_t(receiver_t receiver,
-                                                ustore_collection_id_t collection = ustore_collection_main_k) noexcept
+    explicit deferred_strings_read_collection_t(receiver_t receiver, ustore_collection_id_t collection) noexcept
         : receiver_(receiver), collection_(collection) {}
 
     operator ustore_collection_id_t() const noexcept { return collection_; }

@@ -70,7 +70,7 @@ struct fixture_t {
     }
 
     /** Whether the database opened with its strings collection. */
-    [[nodiscard]] bool ready() const noexcept { return database && strings != ustore_collection_main_k; }
+    [[nodiscard]] bool ready() const noexcept { return database && strings != ustore_collection_id_t {}; }
 };
 
 /** Counts one failure when the collection lacks @p text or maps it onto another key than @p wanted. */

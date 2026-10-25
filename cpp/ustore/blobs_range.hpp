@@ -162,7 +162,7 @@ class keys_stream_t {
     friend class graph_stream_t;
 
     receiver_t receiver_ {};
-    ustore_collection_id_t collection_ {ustore_collection_main_k};
+    ustore_collection_id_t collection_ {};
     ustore_modality_t modality_ {ustore_modality_blobs_k};
 
     arena_t arena_;
@@ -268,7 +268,7 @@ class keys_stream_t {
 class pairs_stream_t {
 
     receiver_t receiver_ {};
-    ustore_collection_id_t collection_ {ustore_collection_main_k};
+    ustore_collection_id_t collection_ {};
 
     blobs_cursor_t cursor_;
     arena_t arena_;
@@ -388,9 +388,8 @@ class blobs_range_t {
     ustore_modality_t modality_;
 
   public:
-    blobs_range_t(receiver_t receiver, ustore_collection_id_t collection = ustore_collection_main_k,
-                  ustore_key_t start_key = smallest_key_k, ustore_key_t end_key = largest_key_k,
-                  ustore_modality_t modality = ustore_modality_blobs_k) noexcept
+    blobs_range_t(receiver_t receiver, ustore_collection_id_t collection, ustore_key_t start_key = smallest_key_k,
+                  ustore_key_t end_key = largest_key_k, ustore_modality_t modality = ustore_modality_blobs_k) noexcept
         : receiver_(receiver), collection_(collection), start_key_(start_key), end_key_(end_key), modality_(modality) {}
 
     receiver_t receiver() const noexcept { return receiver_; }

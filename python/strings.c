@@ -54,18 +54,10 @@ ustore_py_naming_t ustore_py_collection_named(ustore_py_context_t const* context
 
 int ustore_py_collection_from_object(ustore_py_context_t const* context, PyObject* object,
                                      ustore_collection_id_t* collection) {
-    if (!object || object == Py_None) {
-        *collection = ustore_collection_main_k;
-        return 0;
-    }
     if (PyUnicode_Check(object)) {
         Py_ssize_t length = 0;
         char const* const name = PyUnicode_AsUTF8AndSize(object, &length);
         if (!name) return -1;
-        if (length == 0) {
-            *collection = ustore_collection_main_k;
-            return 0;
-        }
         switch (ustore_py_collection_named(context, name, (size_t)length, collection, NULL)) {
         case ustore_py_naming_found_k: return 0;
         case ustore_py_naming_failed_k: return -1;
@@ -75,7 +67,7 @@ int ustore_py_collection_from_object(ustore_py_context_t const* context, PyObjec
     }
     // Only a `uuid.UUID` spells an ID here, since text already means a name
     if (!PyObject_TypeCheck(object, (PyTypeObject*)UUIDType)) {
-        PyErr_Format(PyExc_TypeError, "A collection is a UUID, a name, or None, not %S", Py_TYPE(object));
+        PyErr_Format(PyExc_TypeError, "A collection is a UUID or a name, not %S", Py_TYPE(object));
         return -1;
     }
     return ustore_py_uuid_from_object(object, &collection->uuid);

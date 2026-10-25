@@ -215,8 +215,8 @@ class strings_scan_outputs_t {
     }
 };
 
-/** The columns of a collection listing, which grow in scratch while the catalog is walked and are copied into the
- *  arena of the call once: identifiers, modalities, and the names end to end after their offsets. */
+/** The columns of a collection listing, which grow in scratch while the collections system collection is walked and
+ *  are copied into the arena of the call once: identifiers, modalities, and names end to end after their offsets. */
 class collection_list_outputs_t {
     st::basic_vector<ustore_collection_id_t, arena_allocator<ustore_collection_id_t>> ids_;
     st::basic_vector<ustore_modality_t, arena_allocator<ustore_modality_t>> modalities_;

@@ -18,6 +18,7 @@ from collections.abc import Callable, Iterator
 from random import sample
 from time import perf_counter
 from typing import Any
+from uuid import UUID
 
 import numpy as np
 
@@ -59,23 +60,23 @@ def fill_native_dict(keys: np.ndarray) -> dict[int, bytes]:
     return native_dict
 
 
-def fill_one_by_one(database: ustore.Database, keys: np.ndarray) -> None:
+def fill_one_by_one(database: ustore.Database, collection: UUID, keys: np.ndarray) -> None:
     """Writes every key separately with `set`, paying one round trip per key."""
     for key in keys:
-        database.set(int(key), VALUE)
+        database.set(int(key), VALUE, collection=collection)
 
 
-def fill_in_batches(database: ustore.Database, keys: np.ndarray) -> None:
+def fill_in_batches(database: ustore.Database, collection: UUID, keys: np.ndarray) -> None:
     """Writes the keys in `BATCH_SIZE`-long batches, passing a value for each key."""
     values = [VALUE] * BATCH_SIZE
     for batch in batches(keys):
-        database.write(batch, values[: len(batch)])
+        database.write(batch, values[: len(batch)], collection=collection)
 
 
-def fill_by_broadcast(database: ustore.Database, keys: np.ndarray) -> None:
+def fill_by_broadcast(database: ustore.Database, collection: UUID, keys: np.ndarray) -> None:
     """Writes one shared value across each batch, without building a value per key."""
     for batch in batches(keys):
-        database.write(batch, VALUE)
+        database.write(batch, VALUE, collection=collection)
 
 
 def read_native_dict(native_dict: dict[int, bytes], keys: np.ndarray) -> int:
@@ -86,20 +87,20 @@ def read_native_dict(native_dict: dict[int, bytes], keys: np.ndarray) -> int:
     return total_bytes
 
 
-def read_one_by_one(database: ustore.Database, keys: np.ndarray) -> int:
+def read_one_by_one(database: ustore.Database, collection: UUID, keys: np.ndarray) -> int:
     """Reads every key separately with `get` and returns the total number of bytes seen."""
     total_bytes = 0
     for key in keys:
-        total_bytes += len(database.get(int(key)))
+        total_bytes += len(database.get(int(key), collection=collection))
     return total_bytes
 
 
-def read_in_batches(database: ustore.Database, keys: np.ndarray) -> int:
+def read_in_batches(database: ustore.Database, collection: UUID, keys: np.ndarray) -> int:
     """Reads the keys in batches with `read` into one reused arena and returns how many values came back."""
     total_values = 0
     arena = ustore.Arena()
     for batch in batches(keys):
-        total_values += len(database.read(batch, arena))
+        total_values += len(database.read(batch, arena, collection=collection))
     return total_values
 
 
@@ -111,10 +112,10 @@ def scan_native_dict(native_dict: dict[int, bytes]) -> int:
     return keys_sum
 
 
-def scan_collection(database: ustore.Database) -> int:
+def scan_collection(database: ustore.Database, collection: UUID) -> int:
     """Walks every key the collection holds and returns their sum, for comparison with the `dict`."""
     keys_sum = 0
-    for key in scan_keys(database):
+    for key in scan_keys(database, collection):
         keys_sum += int(key)
     return keys_sum
 
@@ -125,43 +126,44 @@ def sample_native_dict(native_dict: dict[int, bytes]) -> None:
         sample(list(native_dict.keys()), BATCH_SIZE)
 
 
-def sample_collection(database: ustore.Database) -> None:
+def sample_collection(database: ustore.Database, collection: UUID) -> None:
     """Draws `BATCH_SIZE` keys at random, which the engine answers without listing every key."""
     arena = ustore.Arena()
     for _ in range(SAMPLE_ROUNDS):
-        database.sample(BATCH_SIZE, arena)
+        database.sample(BATCH_SIZE, arena, collection=collection)
 
 
 def main() -> None:
     """Runs every phase against both stores and prints the timings side by side."""
     keys = generate_keys()
     with ustore.Database.open_ram() as database:
+        collection = database.collection_create("values", modality=ustore.Modality.BLOBS)
         native_seconds, native_dict = timed(fill_native_dict, keys)
-        single_seconds, _ = timed(fill_one_by_one, database, keys)
-        batch_seconds, _ = timed(fill_in_batches, database, keys)
-        broadcast_seconds, _ = timed(fill_by_broadcast, database, keys)
+        single_seconds, _ = timed(fill_one_by_one, database, collection, keys)
+        batch_seconds, _ = timed(fill_in_batches, database, collection, keys)
+        broadcast_seconds, _ = timed(fill_by_broadcast, database, collection, keys)
         print(
             f"Writes: {native_seconds:.3f}s native, {single_seconds:.3f}s one by one, "
             f"{batch_seconds:.3f}s batched, {broadcast_seconds:.3f}s broadcast"
         )
 
         native_seconds, native_bytes = timed(read_native_dict, native_dict, keys)
-        single_seconds, collection_bytes = timed(read_one_by_one, database, keys)
-        batch_seconds, batched_values = timed(read_in_batches, database, keys)
+        single_seconds, collection_bytes = timed(read_one_by_one, database, collection, keys)
+        batch_seconds, batched_values = timed(read_in_batches, database, collection, keys)
         print(
             f"Reads: {native_seconds:.3f}s native, {single_seconds:.3f}s one by one, {batch_seconds:.3f}s batched, "
             f"{native_bytes} and {collection_bytes} bytes read, {batched_values} values in batches"
         )
 
         native_seconds, native_keys_sum = timed(scan_native_dict, native_dict)
-        collection_seconds, collection_keys_sum = timed(scan_collection, database)
+        collection_seconds, collection_keys_sum = timed(scan_collection, database, collection)
         print(
             f"Scans: {native_seconds:.3f}s native, {collection_seconds:.3f}s persistent, "
             f"key sums {native_keys_sum} and {collection_keys_sum}"
         )
 
         native_seconds, _ = timed(sample_native_dict, native_dict)
-        collection_seconds, _ = timed(sample_collection, database)
+        collection_seconds, _ = timed(sample_collection, database, collection)
         print(f"Samples: {native_seconds:.3f}s native, {collection_seconds:.3f}s persistent")
 
 

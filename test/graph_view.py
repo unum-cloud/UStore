@@ -6,7 +6,7 @@ from uuid import UUID
 import networkx
 import numpy as np
 import pytest
-from capabilities import NEEDS_COLLECTIONS, NEEDS_TRANSACTIONS, key
+from capabilities import NEEDS_TRANSACTIONS, key
 
 import ustore
 from ustore.graph_view import DiGraph, Graph, MultiDiGraph, MultiGraph
@@ -232,7 +232,6 @@ def test_read_edges_of_a_batch(graphs):
 # region Attributes
 
 
-@NEEDS_COLLECTIONS
 @pytest.mark.parametrize("weight", [1, 2.5])
 def test_weighted_degrees_and_size(attributed, kind: str, weight: float):
     reference = GRAPH_KINDS[kind][1]()
@@ -243,7 +242,6 @@ def test_weighted_degrees_and_size(attributed, kind: str, weight: float):
     assert attributed.size() == reference.size()
 
 
-@NEEDS_COLLECTIONS
 def test_a_weight_that_is_not_a_number_is_refused(attributed):
     attributed.add_edge(1, 2, weight="heavy")
     attributed.add_edge(2, 3, weight=1)
@@ -251,7 +249,6 @@ def test_a_weight_that_is_not_a_number_is_refused(attributed):
         attributed.size(weight="weight")
 
 
-@NEEDS_COLLECTIONS
 def test_node_attributes(attributed):
     expected = {}
     for node in range(10):
@@ -277,7 +274,6 @@ def test_node_attributes(attributed):
     assert all(data == {"name": "node"} for _, data in attributed.nodes(data=True))
 
 
-@NEEDS_COLLECTIONS
 def test_set_node_attributes(attributed):
     attributed.add_nodes_from([0, 1, 2])
     attributed.set_node_attributes(1, name="weight")
@@ -292,7 +288,6 @@ def test_set_node_attributes(attributed):
     }
 
 
-@NEEDS_COLLECTIONS
 def test_edge_attributes_match_networkx(attributed, kind: str):
     reference = GRAPH_KINDS[kind][1]()
     for node in range(20):
@@ -318,7 +313,6 @@ def test_edge_attributes_match_networkx(attributed, kind: str):
     assert attributed.get_edge_data(40, 41, default="none") == "none"
 
 
-@NEEDS_COLLECTIONS
 def test_edge_attributes_in_batches(attributed):
     sources = np.array([1, 2, 3])
     targets = np.array([2, 3, 1])
@@ -334,7 +328,6 @@ def test_edge_attributes_in_batches(attributed):
     }
 
 
-@NEEDS_COLLECTIONS
 @pytest.mark.parametrize("kind", ["graph", "digraph"], indirect=True)
 def test_set_edge_attributes_of_simple_graphs(attributed):
     for node in range(3):
@@ -350,7 +343,6 @@ def test_set_edge_attributes_of_simple_graphs(attributed):
     ]
 
 
-@NEEDS_COLLECTIONS
 @pytest.mark.parametrize("kind", ["multigraph", "multidigraph"], indirect=True)
 def test_set_edge_attributes_of_multigraphs(attributed):
     keys = [attributed.add_edge(node, node + 1) for node in range(3)]
@@ -362,7 +354,6 @@ def test_set_edge_attributes_of_multigraphs(attributed):
     assert attributed.get_edge_data(0, 1, keys[0]) == {"name": "edge0"}
 
 
-@NEEDS_COLLECTIONS
 def test_adding_an_edge_again_merges_its_attributes(attributed):
     attributed.add_edge(1, 2, name="edge1", weight=2)
     if not attributed.is_multigraph():
@@ -377,7 +368,6 @@ def test_adding_an_edge_again_merges_its_attributes(attributed):
     ]
 
 
-@NEEDS_COLLECTIONS
 @pytest.mark.parametrize("kind", ["multigraph", "multidigraph"], indirect=True)
 def test_multigraph_keys(attributed):
     for weight in (1, 2, 3):
@@ -401,7 +391,6 @@ def test_multigraph_keys(attributed):
     ]
 
 
-@NEEDS_COLLECTIONS
 def test_attributes_never_share_the_graph_collection(view):
     with pytest.raises(ValueError):
         Graph(view, "graph", nodes="graph")

@@ -105,6 +105,7 @@ struct docs_verbs_t {
     status_t (*gather)(ustore_docs_gather_t const&, strings_arg_t const& fields, view_t const&) noexcept;
     status_t (*remove)(ustore_docs_remove_t const&, view_t const&) noexcept;
     status_t (*scan)(ustore_docs_scan_t const&, view_t const&) noexcept;
+    status_t (*sample)(ustore_docs_sample_t const&, view_t const&) noexcept;
 };
 
 /** The verbs of graph collections. */
@@ -215,9 +216,9 @@ inline status_t collection_holds_another_modality() noexcept {
     return {status_code_t::invalid_argument_k, "The collection holds another modality"};
 }
 
-/** Admits a collection holding @p held to the verbs of @p served, the main collection only to the blobs verbs. */
+/** Admits a collection holding @p held to the verbs of @p served only when both name one modality. */
 inline status_t admit_modality(ustore_modality_t held, ustore_modality_t served) noexcept {
-    if (held == served || (held == ustore_modality_any_k && served == ustore_modality_blobs_k)) return {};
+    if (held == served) return {};
     return collection_holds_another_modality();
 }
 
@@ -465,6 +466,28 @@ status_t scan_over_blobs(arguments_type_ const& arguments, view_t const& view) n
     return values_verbs_.scan(scan, view);
 }
 
+/** Samples the keys of collections holding @p modality_ through @p values_verbs_, after @p resolve_ refuses every
+ *  collection holding another modality: the documents of @c ustore_docs_sample. */
+template <blobs_verbs_t const& values_verbs_, auto resolve_, ustore_modality_t modality_, typename arguments_type_>
+status_t sample_over_blobs(arguments_type_ const& arguments, view_t const& view) noexcept {
+    status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count, modality_, view);
+    if (resolved.failed()) return resolved;
+    ustore_blobs_sample_t const sample {
+        .database = arguments.database,
+        .executor = arguments.executor,
+        .outcome = arguments.outcome,
+        .completion = arguments.completion,
+        .view = arguments.view,
+        .count = arguments.count,
+        .collections = arguments.collections,
+        .offsets = arguments.offsets,
+        .keys = arguments.keys,
+        .arena = arguments.arena,
+        .wanted = arguments.wanted,
+    };
+    return values_verbs_.sample(sample, view);
+}
+
 /** The edits one page call made to one page, in task order, as a chain of `ustore/pages/page_edits.hpp`. */
 struct page_edits_t {
     ustore_collection_id_t collection;
@@ -547,7 +570,7 @@ status_t guarded(arguments_types_ const&... arguments) noexcept {
 /** What the entries of a collection map, which picks how an engine serializes them. */
 enum class entry_layout_t : std::uint8_t {
 
-    /** A 16-byte UUID onto bytes: blobs, documents, pages, graph vertices and the main collection. */
+    /** A 16-byte UUID onto bytes: blobs, documents, pages, graph vertices and the collections system collection. */
     uuids_to_bytes_k,
 
     /** A string onto a 16-byte UUID: the strings modality, and the names system collection. */

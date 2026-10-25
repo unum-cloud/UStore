@@ -28,7 +28,7 @@ Pin a commit, not a version, when building on them.
   - `nvme_channels.hpp`: the pinned buffer pool, the channels checking a queue pair out with its blocks, and the pipelines holding a ring at depth.
   - `nvme_volume.hpp`: owned text, catalogs, volumes and the router placing blobs across them, and the mount of one database's storage with its shared resources.
 - `blobs/`, in `unum::ustore::blobs`:
-  - `ram_store.hpp`: the multi-version SmashTable stores of the RAM engine, one per collection, the catalog and the names over them, and `collections_transaction`, which publishes any number of them under one stamp.
+  - `ram_store.hpp`: the multi-version SmashTable stores of the RAM engine, one per collection, the `_collections` and `_names` system collections over them, and `collections_transaction`, which publishes any number of them under one stamp.
   - `nvme_key_slot.hpp`: identifiers and value layouts of the LSM trees, stored keys and values, key slots and the sorted run index over them.
   - `nvme_sorted_run.hpp`: one immutable sorted run on a volume.
   - `nvme_compaction.hpp` and `vram_nvidia_compaction.cuh`: the host compactor and the device one, whose kernels only nvcc compiles.

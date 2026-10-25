@@ -109,10 +109,10 @@ struct twitter_t {
     ustore_database_t database = nullptr;
 
     /** Collection of tweet and author documents. */
-    ustore_collection_id_t docs = ustore_collection_main_k;
+    ustore_collection_id_t docs {};
 
     /** Collection of the graph between tweets and authors. */
-    ustore_collection_id_t graph = ustore_collection_main_k;
+    ustore_collection_id_t graph {};
 
     /** Memory-mapped NDJSON files the tweets come from. */
     st::basic_vector<mapped_file_t> files;
@@ -668,11 +668,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    bool const supports_collections = (description.capabilities & ustore_capabilities_collections_k) != 0;
     bool const supports_transactions = (description.capabilities & ustore_capabilities_transactions_k) != 0;
-    if (supports_collections &&
-        (!create_collection(twitter.database, "twitter.docs", ustore_modality_docs_k, twitter.docs) ||
-         !create_collection(twitter.database, "twitter.graph", ustore_modality_graph_k, twitter.graph))) {
+    if (!create_collection(twitter.database, "twitter.docs", ustore_modality_docs_k, twitter.docs) ||
+        !create_collection(twitter.database, "twitter.graph", ustore_modality_graph_k, twitter.graph)) {
         ustore_database_free(twitter.database);
         return 1;
     }
@@ -680,18 +678,15 @@ int main(int argc, char** argv) {
     fmt::println("Will benchmark...");
     std::size_t const construction_batch_size = settings.batch_sizes.values[2];
     if (supports_transactions) construct_docs(executor, settings, twitter, construction_batch_size);
-    if (supports_collections) construct_graph(executor, settings, twitter, construction_batch_size);
+    construct_graph(executor, settings, twitter, construction_batch_size);
     sample(executor, settings, twitter, "docs_sample_keys", docs_sample_keys);
     sample(executor, settings, twitter, "docs_sample_objects", docs_sample_objects);
     sample(executor, settings, twitter, "docs_sample_field", docs_sample_field);
     sample(executor, settings, twitter, "docs_sample_table", docs_sample_table);
-    if (supports_collections) sample(executor, settings, twitter, "graph_traverse_two_hops", graph_traverse_two_hops);
+    sample(executor, settings, twitter, "graph_traverse_two_hops", graph_traverse_two_hops);
 
-    if (supports_collections) {
-        drop_collection(twitter.database, twitter.docs, ustore_drop_collection_k);
-        drop_collection(twitter.database, twitter.graph, ustore_drop_collection_k);
-    }
-    drop_collection(twitter.database, ustore_collection_main_k, ustore_drop_pairs_k);
+    drop_collection(twitter.database, twitter.docs, ustore_drop_collection_k);
+    drop_collection(twitter.database, twitter.graph, ustore_drop_collection_k);
     ustore_database_free(twitter.database);
     return 0;
 }

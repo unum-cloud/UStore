@@ -313,7 +313,7 @@ template <typename volume_type_>
  *  fixed-width records fix. */
 template <typename volume_type_>
 [[nodiscard]] std::size_t runs_named_by_schema(volume_type_ const& volume, std::uint64_t generation) noexcept {
-    expected<volume_blob_t> const found = volume.find(schema_blob_name(catalog_copy_of(generation)));
+    expected<volume_blob_t> const found = volume.find(schema_blob_name(schema_copy_of(generation)));
     if (!found || found->length < sizeof(single_collection_database_schema_record_t)) return 0;
     return static_cast<std::size_t>((found->length - sizeof(single_collection_database_schema_record_t)) /
                                     sizeof(lsm_tree_run_record_t));
@@ -378,7 +378,7 @@ template <typename key_slot_type_, typename mount_type_>
         failures += expect(*merged == compaction_outcome_t::published_k);
 
         // A merge records its new set before it drops what it consumed, so neither outlives the other.
-        failures += expect_eq(runs_named_by_schema(*(*stack)->volume, (*store)->catalog_generation()),
+        failures += expect_eq(runs_named_by_schema(*(*stack)->volume, (*store)->schema_generation()),
                               run_count_of(*(*stack)->volume));
 
         // Two overlapping rounds go back onto level zero, so age alone decides which run answers a key,
@@ -464,7 +464,7 @@ std::size_t crash_between_seal_and_schema(mount_type_ const& mount) {
             failures += expect((*store)->flush().succeeded());
 
             // A flush seals its run and records it second, so the schema already names every run on the volume.
-            failures += expect_eq(runs_named_by_schema(*(*stack)->volume, (*store)->catalog_generation()),
+            failures += expect_eq(runs_named_by_schema(*(*stack)->volume, (*store)->schema_generation()),
                                   run_count_of(*(*stack)->volume));
         }
 

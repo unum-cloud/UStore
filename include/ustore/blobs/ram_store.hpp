@@ -3,8 +3,8 @@
  *  @author Ash Vardanian
  *  @date January 9, 2023
  *  @brief The multi-version stores of the RAM engine on SmashTable: one per collection of the kind its modality picks,
- *      the catalog and the names system collections over them, and the transaction group spanning any of them under one
- *      stamp.
+ *      the collections and the names system collections over them, and the transaction group spanning any of them under
+ *      one stamp.
  *
  *  Every store is a partitioned AVL tree of versions, each partition locked by a spin lock owning its word through the
  *  atomic reference and stalling through the waiter every store here takes. A blobs, documents or pages collection
@@ -77,7 +77,7 @@ using ordered_store = st::partitioned_store<
     st::snapshot_store<st::basic_avl_tree<entry_type_, order_type_, st::default_allocator<entry_type_>>, isolation_>,
     hash_type_, engine_mutex<atomic_reference_, waiter_type_>>;
 
-/** A collection of blobs, documents, pages or anything: every key mapped onto the bytes of its value. */
+/** A collection of blobs, documents or pages: every key mapped onto the bytes of its value. */
 template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_>
 using values_by_key_store =
     ordered_store<value_pair_t, uuid_order_t, uuid_hash_t, isolation_, atomic_reference_, waiter_type_>;
@@ -102,12 +102,13 @@ using claim_t = order_t::snapshot_claim_t;
 template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_>
 struct collection_store;
 
-/** What the catalog records of a collection: what it holds, its name, and the store its entries live in. */
+/** What the collections system collection records of a collection: what it holds, its name, and the store its
+ *  entries live in. */
 template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_>
 struct collection_entry {
 
     /** What the collection holds, which picked the kind of its store. */
-    ustore_modality_t modality {ustore_modality_any_k};
+    ustore_modality_t modality {};
 
     /** The name of the collection, empty for one created without. */
     blob_t name;
@@ -116,14 +117,15 @@ struct collection_entry {
     collection_store<isolation_, atomic_reference_, waiter_type_>* store {nullptr};
 };
 
-/** A collection's UUID mapped onto what the catalog records of it. */
+/** A collection's UUID mapped onto what the collections system collection records of it. */
 template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_>
-using catalog_pair = st::mapping<ustore_collection_id_t, collection_entry<isolation_, atomic_reference_, waiter_type_>>;
+using collections_pair =
+    st::mapping<ustore_collection_id_t, collection_entry<isolation_, atomic_reference_, waiter_type_>>;
 
-/** Every collection, the main one included under the nil UUID: its UUID mapped onto its entry. */
+/** The collections system collection: every collection's UUID mapped onto its entry. */
 template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_>
-using collections_by_id_store = ordered_store<catalog_pair<isolation_, atomic_reference_, waiter_type_>, uuid_order_t,
-                                              uuid_hash_t, isolation_, atomic_reference_, waiter_type_>;
+using collections_by_id_store = ordered_store<collections_pair<isolation_, atomic_reference_, waiter_type_>,
+                                              uuid_order_t, uuid_hash_t, isolation_, atomic_reference_, waiter_type_>;
 
 /** The store of one collection, of the kind its modality picks, which a drop retires rather than frees. */
 template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_>
@@ -138,14 +140,14 @@ struct collection_store {
     /** The store retired before this one, while this one waits to be freed. */
     collection_store* next_retired {nullptr};
 
-    /** The stamp the change that took this store out of the catalog published under. */
+    /** The stamp the change that took this store out of the collections system collection published under. */
     generation_t retirement_stamp {0};
 
     template <typename kind_type_>
     collection_store(std::in_place_type_t<kind_type_> kind, order_t& order) noexcept : entries(kind, order) {}
 };
 
-/** A transaction over the catalog, the names and every collection store it reaches, published under one stamp. */
+/** A transaction over both system collections and every collection store it reaches, published under one stamp. */
 template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_>
 using collections_transaction =
     st::dynamic_transaction_group<collections_by_id_store<isolation_, atomic_reference_, waiter_type_>,

@@ -47,7 +47,7 @@ typedef struct ustore_blobs_write_t {
     /** Number of tasks, one per key. */
     ustore_size_t count;
 
-    /** Collections owning the keys, where @c NULL data stands for the main collection. */
+    /** Collections owning the keys. */
     ustore_collections_view_t collections;
 
     /** Keys to write. */
@@ -91,7 +91,7 @@ typedef struct ustore_blobs_remove_t {
     /** Number of tasks, one per key. */
     ustore_size_t count;
 
-    /** Collections owning the keys, where @c NULL data stands for the main collection. */
+    /** Collections owning the keys. */
     ustore_collections_view_t collections;
 
     /** Keys to remove. */
@@ -137,7 +137,7 @@ typedef struct ustore_blobs_read_t {
     /** Number of tasks, one per key. */
     ustore_size_t count;
 
-    /** Collections owning the keys, where @c NULL data stands for the main collection. */
+    /** Collections owning the keys. */
     ustore_collections_view_t collections;
 
     /** Keys to read. */
@@ -190,7 +190,7 @@ typedef struct ustore_blobs_scan_t {
     /** Number of scans. */
     ustore_size_t count;
 
-    /** Collections to scan, where @c NULL data stands for the main collection. */
+    /** Collections to scan. */
     ustore_collections_view_t collections;
 
     /** Smallest key every scan may return, where @c NULL data starts at the first key. */
@@ -343,7 +343,7 @@ typedef struct ustore_blobs_sample_t {
     /** Number of samples. */
     ustore_size_t count;
 
-    /** Collections to sample, where @c NULL data stands for the main collection. */
+    /** Collections to sample. */
     ustore_collections_view_t collections;
 
     /** Output for @c count plus one offsets into @c keys, the last one closing the final sample, inside @c arena. */
@@ -388,7 +388,7 @@ typedef struct ustore_blobs_measure_t {
     /** Number of measured ranges. */
     ustore_size_t count;
 
-    /** Collections to measure, where @c NULL data stands for the main collection. */
+    /** Collections to measure. */
     ustore_collections_view_t collections;
 
     /** First key of every range, where @c NULL data starts at the first key. */

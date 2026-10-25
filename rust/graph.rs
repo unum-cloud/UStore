@@ -25,15 +25,15 @@
 //! they are still read:
 //!
 //! ```compile_fail,E0499
-//! use ustore::{Arena, CollectionID, RAMOptions, Database, Durability, Key, Role, Roles};
+//! use ustore::{Arena, RAMOptions, Database, Durability, Key, Modality, Role, Roles};
 //!
 //! let database = Database::init_ram(&RAMOptions::default())?;
 //! let mut arena = Arena::new()?;
 //! let vertices = [Key::from(1u64)];
-//! let main = CollectionID::main();
-//! let found = database.head().graph_read_edges(main, &vertices, Roles::Every(Role::Any), &mut arena)?;
-//! let degrees = database.head().graph_degrees(main, &vertices, Roles::Every(Role::Any), &mut arena)?;
-//! database.head().graph_remove_edges(main, found.edges(), Durability::Buffered)?;
+//! let follows = database.collection_create("follows", Modality::Graph)?;
+//! let found = database.head().graph_read_edges(follows, &vertices, Roles::Every(Role::Any), &mut arena)?;
+//! let degrees = database.head().graph_degrees(follows, &vertices, Roles::Every(Role::Any), &mut arena)?;
+//! database.head().graph_remove_edges(follows, found.edges(), Durability::Buffered)?;
 //! # Ok::<(), ustore::Error>(())
 //! ```
 
@@ -1073,23 +1073,21 @@ mod tests {
     fn a_collection_of_values_refuses_the_graph_verbs() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let mut arena = Arena::new().unwrap();
+        let values = database.collection_create("values", Modality::Blobs).unwrap();
         let blobs = [
             Entry::new(key(1), b"abc"),
             Entry::new(key(2), br#"{"name":"Ada Lovelace","born":1815}"#),
         ];
-        database
-            .head()
-            .write(CollectionID::main(), &blobs, Durability::Buffered)
-            .unwrap();
+        database.head().write(values, &blobs, Durability::Buffered).unwrap();
         for vertex in keys([1, 2]) {
             let failure = database
                 .head()
-                .graph_read_edges(CollectionID::main(), [vertex], Roles::Every(Role::Any), &mut arena)
+                .graph_read_edges(values, [vertex], Roles::Every(Role::Any), &mut arena)
                 .unwrap_err();
             assert_eq!(failure.status, Status::InvalidArgument);
             let failure = database
                 .head()
-                .graph_write_edges(CollectionID::main(), [Edge::new(vertex, key(3))], Durability::Buffered)
+                .graph_write_edges(values, [Edge::new(vertex, key(3))], Durability::Buffered)
                 .unwrap_err();
             assert_eq!(failure.status, Status::InvalidArgument);
         }

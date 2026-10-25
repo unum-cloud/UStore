@@ -6,7 +6,7 @@
  *      engine's table.
  *
  *  `src/nvme/variants.hpp` includes this file right before its table, as these calls build on its accesses, its
- *  writes and its catalog lookups. A write addressing any collection but a docs one is refused. An upsert of a whole
+ *  writes and its collection lookups. A write addressing any collection but a docs one is refused. An upsert of a whole
  *  document writes it, JSON as written and any other type printed as JSON, and reads nothing. An update, an
  *  insertion, a patch, a merge, and an upsert of a field each append one @c json_delta_t to the document's change
  *  delta, after replaying it over the document as the transaction sees it, read and watched. A modification that
