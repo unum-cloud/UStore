@@ -27,27 +27,21 @@ using utilities::constrained_allocator;
 using utilities::notifier;
 using utilities::resources_shared_ptr;
 
-enum class write_buffer_status_t {
-    mismatch_k,
-    found_k,
-    removed_k,
-};
-
 /**
  *  @brief The writes of one collection not yet sealed, keyed by stored key, charged to one database's budget.
  *  @tparam atomic_reference_ The reference the budget owns its word through.
- *  @tparam waiting_policy_type_ What a core waiting on a batch's counter does between polls.
+ *  @tparam waiter_type_ What a core waiting on a batch's counter does between polls.
  */
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
 class write_buffer {
   public:
 #pragma region Types
 
     /** The resources the buffer charges and keeps alive. */
-    using resources_ptr_t = resources_shared_ptr<atomic_reference_, waiting_policy_type_>;
+    using resources_ptr_t = resources_shared_ptr<atomic_reference_, waiter_type_>;
 
     /** The handle a batched select reports each part through. */
-    using notifier_t = notifier<atomic_reference_, waiting_policy_type_>;
+    using notifier_t = notifier<atomic_reference_, waiter_type_>;
 
     /** Offset into @c stored_values_buffer, 64-bit even though files stay under 4GB, since concurrent
      *  writers may push @c next_stored_value_offset_ past the 32-bit range before the capacity check. */
@@ -90,7 +84,7 @@ class write_buffer {
     inline std::size_t capacity() const noexcept { return capacity_bytes_; }
     inline std::size_t stored_value_max_size() const noexcept { return std::max(value_size_, value_max_size_); }
 
-    inline write_buffer_status_t status(stored_key_t stored_key) const noexcept;
+    inline lookup_result_t status(stored_key_t stored_key) const noexcept;
 
     inline status_t stored_value_size(stored_key_t stored_key, stored_value_size_t& size) const noexcept;
 
@@ -98,7 +92,7 @@ class write_buffer {
                            stored_value_size_t& size) const noexcept;
 
     template <typename stored_value_location_>
-    inline write_buffer_status_t find(stored_key_t stored_key, stored_value_location_& location) const noexcept;
+    inline lookup_result_t find(stored_key_t stored_key, stored_value_location_& location) const noexcept;
     template <typename stored_value_location_>
     inline void select(stored_value_location_ const& location, stored_value_span_t stored_value,
                        notifier_t notifier) const noexcept;
@@ -155,8 +149,8 @@ class write_buffer {
 #pragma endregion Private Members
 };
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
-inline write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::write_buffer(
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
+inline write_buffer<stored_key_, atomic_reference_, waiter_type_>::write_buffer(
     std::size_t capacity_bytes, std::size_t elements_max_count, std::size_t concurrency_limit, std::size_t value_size,
     std::size_t value_max_size, resources_ptr_t resources)
     : stored_values({}, {}, constrained_allocator<std::byte, atomic_reference_> {resources->memory_constraint}),
@@ -171,8 +165,8 @@ inline write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::write
         capacity_bytes_ = 0;
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
-inline write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::write_buffer(write_buffer const& other)
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
+inline write_buffer<stored_key_, atomic_reference_, waiter_type_>::write_buffer(write_buffer const& other)
     : stored_values({}, {}, constrained_allocator<std::byte, atomic_reference_> {other.resources_->memory_constraint}),
       stored_values_buffer(constrained_allocator<std::byte, atomic_reference_> {other.resources_->memory_constraint}),
       next_stored_value_offset_(0), resources_(other.resources_), capacity_bytes_(other.capacity_bytes_),
@@ -187,17 +181,17 @@ inline write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::write
     [[maybe_unused]] status_t const copied = unsafe_add(other);
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
-inline write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::write_buffer(write_buffer&& other) noexcept
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
+inline write_buffer<stored_key_, atomic_reference_, waiter_type_>::write_buffer(write_buffer&& other) noexcept
     : stored_values(std::move(other.stored_values)), stored_values_buffer(std::move(other.stored_values_buffer)),
       next_stored_value_offset_(std::move(other.next_stored_value_offset_)), resources_(std::move(other.resources_)),
       capacity_bytes_(std::move(other.capacity_bytes_)), elements_max_count_(std::move(other.elements_max_count_)),
       concurrency_limit_(std::move(other.concurrency_limit_)), value_size_(std::move(other.value_size_)),
       value_max_size_(std::move(other.value_max_size_)) {}
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
-inline write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>&
-write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::operator=(write_buffer const& other) {
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
+inline write_buffer<stored_key_, atomic_reference_, waiter_type_>&
+write_buffer<stored_key_, atomic_reference_, waiter_type_>::operator=(write_buffer const& other) {
 
     stored_values = stored_values_hash_map_t(
         {}, {}, constrained_allocator<std::byte, atomic_reference_> {resources_->memory_constraint});
@@ -220,9 +214,9 @@ write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::operator=(wr
     return *this;
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
-inline write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>&
-write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::operator=(write_buffer&& other) noexcept {
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
+inline write_buffer<stored_key_, atomic_reference_, waiter_type_>&
+write_buffer<stored_key_, atomic_reference_, waiter_type_>::operator=(write_buffer&& other) noexcept {
     std::swap(stored_values, other.stored_values);
     std::swap(stored_values_buffer, other.stored_values_buffer);
     std::swap(next_stored_value_offset_, other.next_stored_value_offset_);
@@ -235,17 +229,17 @@ write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::operator=(wr
     return *this;
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
-inline write_buffer_status_t write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::status(
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
+inline lookup_result_t write_buffer<stored_key_, atomic_reference_, waiter_type_>::status(
     stored_key_t stored_key) const noexcept {
 
-    auto result = write_buffer_status_t::mismatch_k;
+    auto result = lookup_result_t::missing_k;
     stored_values.probe_to_find(
         stored_key,
         [&result](auto const& entry) {
-            constexpr write_buffer_status_t results[2] = {
-                write_buffer_status_t::found_k,
-                write_buffer_status_t::removed_k,
+            constexpr lookup_result_t results[2] = {
+                lookup_result_t::written_k,
+                lookup_result_t::removed_k,
             };
             result = results[entry.value().kind == delta_kind_t::remove_k];
         },
@@ -254,8 +248,8 @@ inline write_buffer_status_t write_buffer<stored_key_, atomic_reference_, waitin
     return result;
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
-inline status_t write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::stored_value_size(
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
+inline status_t write_buffer<stored_key_, atomic_reference_, waiter_type_>::stored_value_size(
     stored_key_t stored_key, stored_value_size_t& size) const noexcept {
 
     auto status = status_t {status_code_t::not_found_k, "Object not exists"};
@@ -270,8 +264,8 @@ inline status_t write_buffer<stored_key_, atomic_reference_, waiting_policy_type
     return status;
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
-inline status_t write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::select(
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
+inline status_t write_buffer<stored_key_, atomic_reference_, waiter_type_>::select(
     stored_key_t stored_key, stored_value_span_t stored_value, stored_value_size_t& size) const noexcept {
 
     status_t status = status_t {status_code_t::not_found_k, "Object not exists"};
@@ -303,9 +297,9 @@ inline status_t write_buffer<stored_key_, atomic_reference_, waiting_policy_type
     return status;
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
 template <typename stored_value_location_>
-inline write_buffer_status_t write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::find(
+inline lookup_result_t write_buffer<stored_key_, atomic_reference_, waiter_type_>::find(
     stored_key_t stored_key, stored_value_location_& location) const noexcept {
 
     location.size_bytes = 0;
@@ -314,7 +308,7 @@ inline write_buffer_status_t write_buffer<stored_key_, atomic_reference_, waitin
     location.recipient_id = reinterpret_cast<u64_t>(this);
     location.recipient_state_id = 0;
 
-    auto result = write_buffer_status_t::mismatch_k;
+    auto result = lookup_result_t::missing_k;
     stored_values.probe_to_find(
         stored_key,
         [&](auto const& entry) {
@@ -322,8 +316,7 @@ inline write_buffer_status_t write_buffer<stored_key_, atomic_reference_, waitin
             location.offset = static_cast<stored_value_offset_t>(stored_value_place.offset);
             location.size_bytes = stored_value_place.size;
             location.kind = stored_value_place.kind;
-            constexpr write_buffer_status_t results[2] = {write_buffer_status_t::found_k,
-                                                          write_buffer_status_t::removed_k};
+            constexpr lookup_result_t results[2] = {lookup_result_t::written_k, lookup_result_t::removed_k};
             result = results[stored_value_place.kind == delta_kind_t::remove_k];
         },
         st::assume_reserved);
@@ -331,10 +324,11 @@ inline write_buffer_status_t write_buffer<stored_key_, atomic_reference_, waitin
     return result;
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
 template <typename stored_value_location_>
-inline void write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::select(
-    stored_value_location_ const& location, stored_value_span_t stored_value, notifier_t notifier) const noexcept {
+inline void write_buffer<stored_key_, atomic_reference_, waiter_type_>::select(stored_value_location_ const& location,
+                                                                               stored_value_span_t stored_value,
+                                                                               notifier_t notifier) const noexcept {
     if (!location) {
         notifier.fail({status_code_t::invalid_argument_k, "A stored value location naming nothing"});
         return;
@@ -360,8 +354,8 @@ inline void write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::
     notifier.did_one();
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
-inline status_t write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::add(
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
+inline status_t write_buffer<stored_key_, atomic_reference_, waiter_type_>::add(
     stored_key_t stored_key, stored_value_view_t stored_value, transaction_stamp_t watch_stamp) noexcept {
 
     auto status = check_stored_value(stored_key, stored_value.size());
@@ -384,8 +378,8 @@ inline status_t write_buffer<stored_key_, atomic_reference_, waiting_policy_type
     return status_t {};
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
-inline status_t write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::mark_as_removed(
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
+inline status_t write_buffer<stored_key_, atomic_reference_, waiter_type_>::mark_as_removed(
     stored_key_t stored_key, transaction_stamp_t watch_stamp) noexcept {
 
     if (!can_fit(1, 0)) [[unlikely]]
@@ -397,8 +391,8 @@ inline status_t write_buffer<stored_key_, atomic_reference_, waiting_policy_type
     return status_t {};
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
-inline void write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::rescope_watches(
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
+inline void write_buffer<stored_key_, atomic_reference_, waiter_type_>::rescope_watches(
     transaction_stamp_t watch_stamp) noexcept {
     [[maybe_unused]] st::status_t const walked = stored_values.for_each([&](auto& entry) noexcept {
         stored_value_place_t& place = entry.value_ref();
@@ -406,8 +400,8 @@ inline void write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::
     });
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
-inline transaction_stamp_t write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::earlier_watch_(
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
+inline transaction_stamp_t write_buffer<stored_key_, atomic_reference_, waiter_type_>::earlier_watch_(
     stored_key_t stored_key, transaction_stamp_t watch_stamp) const noexcept {
     stored_values.probe_to_find(stored_key, [&](auto const& entry) noexcept {
         watch_stamp = std::min(watch_stamp, entry.value().watch_stamp);
@@ -415,9 +409,9 @@ inline transaction_stamp_t write_buffer<stored_key_, atomic_reference_, waiting_
     return watch_stamp;
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
 template <typename stored_value_location_>
-inline status_t write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::find(
+inline status_t write_buffer<stored_key_, atomic_reference_, waiter_type_>::find(
     std::span<stored_key_t const> stored_keys, std::span<stored_value_location_> locations,
     missing_locations_t missing_locations) const {
 
@@ -434,16 +428,16 @@ inline status_t write_buffer<stored_key_, atomic_reference_, waiting_policy_type
         for (std::size_t index = 0; index < stored_keys.size(); ++index) {
             stored_value_location_ location;
             auto status = find<stored_value_location_>(stored_keys[index], location);
-            if (status != write_buffer_status_t::mismatch_k) locations[index] = location;
+            if (status != lookup_result_t::missing_k) locations[index] = location;
         }
     }
 
     return status_t {};
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
 template <typename stored_value_location_>
-inline void write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::select(
+inline void write_buffer<stored_key_, atomic_reference_, waiter_type_>::select(
     std::span<stored_value_location_ const> locations, bytes_span_t buffer, notifier_t notifier) const {
 
     for (std::size_t index = 0, offset = 0; (index < locations.size()) & !notifier.has_failed(); ++index) {
@@ -460,8 +454,8 @@ inline void write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::
     }
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
-inline status_t write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::check_stored_values(
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
+inline status_t write_buffer<stored_key_, atomic_reference_, waiter_type_>::check_stored_values(
     std::span<stored_key_t const> stored_keys, std::span<stored_value_size_t const> sizes) const noexcept {
 
     status_t status = status_t {status_code_t::not_found_k, "It is empty"};
@@ -474,8 +468,8 @@ inline status_t write_buffer<stored_key_, atomic_reference_, waiting_policy_type
     return status;
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
-inline status_t write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::check_stored_values(
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
+inline status_t write_buffer<stored_key_, atomic_reference_, waiter_type_>::check_stored_values(
     write_buffer const& other) const noexcept {
 
     status_t status = status_t {status_code_t::not_found_k, "It is empty"};
@@ -486,8 +480,8 @@ inline status_t write_buffer<stored_key_, atomic_reference_, waiting_policy_type
     return status;
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
-inline status_t write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::check_stored_value(
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
+inline status_t write_buffer<stored_key_, atomic_reference_, waiter_type_>::check_stored_value(
     stored_key_t stored_key, stored_value_size_t stored_value_size) const noexcept {
 
     bool valid_key = stored_key != limit<stored_key_t>::max();
@@ -497,8 +491,8 @@ inline status_t write_buffer<stored_key_, atomic_reference_, waiting_policy_type
     return valid ? status_t {} : status_t {status_code_t::malformed_k, "Invalid stored value"};
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
-inline bool write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::can_fit(
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
+inline bool write_buffer<stored_key_, atomic_reference_, waiter_type_>::can_fit(
     std::size_t stored_values_count, std::size_t stored_values_sum_size) const noexcept {
     auto used_memory = next_stored_value_offset_;
     bool has_element_place = stored_values.size() + stored_values_count <= elements_max_count_;
@@ -508,8 +502,8 @@ inline bool write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::
     return has_element_place & has_enough_space;
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
-inline status_t write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::unsafe_add(
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
+inline status_t write_buffer<stored_key_, atomic_reference_, waiter_type_>::unsafe_add(
     write_buffer const& other) noexcept {
 
     if (!can_fit(other.stored_values.size(), other.next_stored_value_offset_)) [[unlikely]]
@@ -540,14 +534,14 @@ inline status_t write_buffer<stored_key_, atomic_reference_, waiting_policy_type
     return status_t {};
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
-inline void write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::unsafe_clear() noexcept {
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
+inline void write_buffer<stored_key_, atomic_reference_, waiter_type_>::unsafe_clear() noexcept {
     stored_values.clear();
     next_stored_value_offset_ = 0;
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
-inline void write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::unsafe_drop_stored_values() noexcept {
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
+inline void write_buffer<stored_key_, atomic_reference_, waiter_type_>::unsafe_drop_stored_values() noexcept {
 
     // Only a cache of variable-width stored values accepts an empty stored value
     assert(check_stored_value(limit<stored_key_t>::min(), 0).succeeded() && "Not supported");

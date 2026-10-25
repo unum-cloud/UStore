@@ -26,7 +26,6 @@
 
 #pragma once
 
-#include <cassert> // `assert`
 #include <cerrno>  // `errno`, `EINTR`, `ENOMEM`
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint64_t`
@@ -51,13 +50,10 @@
 #include <spdk/nvme.h>     // `spdk_nvme_connect`, `spdk_nvme_ns_cmd_read`, `spdk_nvme_qpair`
 #endif
 
-#include <forkunion/atomics.hpp>       // `fu::standard_atomic_ref`, the reference the contract is checked with
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
-#include <smashtable/shared.hpp>       // `st::standard_waiting_policy_t`, the policy the contract is checked with
 
-#include "ustore/utilities/nvme_disks.hpp" // `calling_thread_identity`
-#include "ustore/utilities/nvme_ring.hpp"  // `request_t`, `completion_t`, `queue_pair_t`, `extent_t`
-#include "ustore/utilities/types.hpp"      // `status_t`, `status_code_t`, `expected`, `byte_t`
+#include "ustore/utilities/nvme_ring.hpp" // `request_t`, `completion_t`, `queue_pair_t`, `extent_t`
+#include "ustore/utilities/types.hpp"     // `status_t`, `status_code_t`, `expected`, `byte_t`
 
 namespace unum::ustore::utilities {
 
@@ -589,9 +585,9 @@ inline void spdk_environment_t::finalize_() noexcept {}
  *  needs every page in the driver's map, while one reached over a socket takes any host memory.
  *
  *  @tparam atomic_reference_ The reference the claim and in-flight words are owned through.
- *  @tparam waiting_policy_type_ What a draining core does after a poll that moved nothing.
+ *  @tparam waiter_type_ What a draining core does after a poll that moved nothing.
  */
-template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+template <template <typename> typename atomic_reference_, typename waiter_type_>
 class linux_spdk_disk {
   public:
 
@@ -758,7 +754,6 @@ class linux_spdk_disk {
             slot.depth = depth;
             slot.locals_first = 0;
             slot.locals_count = 0;
-            slot.bound_thread = calling_thread_identity();
             link_free_lists_(seat);
             return queue_pair_t::leased(static_cast<queue_pair_id_t>(seat), slot.generation, depth);
         }
@@ -777,7 +772,6 @@ class linux_spdk_disk {
         if (!slot) return {status_code_t::invalid_argument_k, "The queue pair is not this ring's"};
         if (outstanding_(*slot) != 0)
             return {status_code_t::invalid_argument_k, "Drain the queue pair before handing it over"};
-        slot->bound_thread = calling_thread_identity();
         return {};
     }
 
@@ -798,7 +792,6 @@ class linux_spdk_disk {
         slot->queue = nullptr;
         ++slot->generation;
         slot->depth = 0;
-        slot->bound_thread = 0;
         claim_(slot->leased).store(0, std::memory_order_release);
         queue_pair.surrender();
         return {};
@@ -912,7 +905,6 @@ class linux_spdk_disk {
     expected<std::size_t> submit(queue_pair_t const& queue_pair, std::span<request_t const> requests) noexcept {
         queue_pair_slot_t* const slot = slot_of_(queue_pair);
         if (!slot) return status_t {status_code_t::invalid_argument_k, "The queue pair is not this ring's"};
-        assert(slot->bound_thread == calling_thread_identity() && "Only the thread holding a queue pair submits on it");
         for (request_t const& request : requests)
             if (request.token.queue_pair() != queue_pair.id() || request.token.generation() != queue_pair.generation())
                 return status_t {status_code_t::invalid_argument_k, "A request carries another queue pair's token"};
@@ -977,7 +969,6 @@ class linux_spdk_disk {
     expected<std::size_t> poll_completions(queue_pair_t const& queue_pair, std::span<completion_t> into) noexcept {
         queue_pair_slot_t* const slot = slot_of_(queue_pair);
         if (!slot) return status_t {status_code_t::invalid_argument_k, "The queue pair is not this ring's"};
-        assert(slot->bound_thread == calling_thread_identity() && "Only the thread holding a queue pair polls on it");
         if (into.empty()) return std::size_t {0};
         std::uint32_t const base = window_of_(queue_pair.id());
         if (slot->flights_count != 0) {
@@ -1024,7 +1015,7 @@ class linux_spdk_disk {
             if (poll_completions_status.failed()) return poll_completions_status;
             if (moved != 0) continue;
             if (spins == drain_patience_k) cancel(queue_pair);
-            waiting_policy_type_ {}(&spins, spins, std::size_t {0});
+            waiter_type_ {}(&spins, spins, std::size_t {0});
         }
         return {status_code_t::io_k, "The queue pair would not drain"};
     }
@@ -1114,9 +1105,6 @@ class linux_spdk_disk {
 
         /** Reaps since the admin queue was last polled that found nothing on the queue pair. */
         std::uint32_t idle_polls = 0;
-
-        /** The thread that took the queue pair, which every submit and poll is checked against. */
-        thread_identity_t bound_thread = 0;
 
         /** The queue pair this queue pair owns, which exactly one thread may ever poll. */
         spdk_nvme_qpair* queue = nullptr;
@@ -1734,7 +1722,7 @@ class linux_spdk_disk {
  *  refused @c open sends it to another transport rather than to a build-time branch. The probe is
  *  not here, because it belongs to the environment and must answer honestly in every build.
  */
-template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+template <template <typename> typename atomic_reference_, typename waiter_type_>
 class linux_spdk_disk {
   public:
 
@@ -1809,8 +1797,5 @@ class linux_spdk_disk {
 #pragma endregion Absent
 
 #endif
-
-static_assert(ring_concept<linux_spdk_disk<fu::standard_atomic_ref, st::standard_waiting_policy_t>>,
-              "The SPDK transport is a ring like every other");
 
 } // namespace unum::ustore::utilities

@@ -7,8 +7,8 @@
  *      reopen, checked against a model.
  *
  *  The results this file exists for are @c concurrent_adds_commit and @c fold_survives_maintenance. Transactions
- *  adding edges to one vertex append change records rather than rewrite it, so every one of them commits, and the
- *  records fold into the vertex wherever they lie, in memory, in a flushed run or at the bottom of the tree.
+ *  adding edges to one vertex append change deltas rather than rewrite it, so every one of them commits, and the
+ *  deltas fold into the vertex wherever they lie, in memory, in a flushed run or at the bottom of the tree.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
@@ -56,8 +56,9 @@ constexpr std::uint64_t model_edge_ids_k = 4;
 /** Calls the maintenance case makes, each a small commit of its own. */
 constexpr std::size_t model_calls_k = 3000;
 
-/** Bytes every collection of the maintenance case buffers before it flushes, small enough to flush many times. */
-constexpr std::size_t small_write_buffer_bytes_k = 64 * 1024;
+/** Bytes of memory runs every collection of the maintenance case holds before it flushes, small enough to flush many
+ *  times. */
+constexpr std::size_t small_memory_runs_bytes_k = 64 * 1024;
 
 /** Parallel edges one round of the bottom case writes and then removes, a chain of 12 KiB per end. */
 constexpr std::size_t bottom_round_edges_k = 256;
@@ -69,20 +70,20 @@ constexpr std::size_t bottom_rounds_k = 32;
 
 #pragma region Helpers
 
-/** Opens the NVMe engine over @p directory, every collection flushing past @p write_buffer_bytes when not zero, every
+/** Opens the NVMe engine over @p directory, every collection flushing past @p memory_runs_bytes when not zero, every
  *  level @p enlarge_factor times the one above, and every value @p value_size bytes when not zero. */
-expected<database_t> open_nvme(char const* directory, std::size_t write_buffer_bytes = 0,
-                               std::size_t enlarge_factor = 0, std::size_t value_size = 0) noexcept {
+expected<database_t> open_nvme(char const* directory, std::size_t memory_runs_bytes = 0, std::size_t enlarge_factor = 0,
+                               std::size_t value_size = 0) noexcept {
     ustore_database_t database = nullptr;
     ustore_outcome_t outcome {};
     ustore_database_open_nvme_t open {};
     open.database = &database;
     open.outcome = &outcome;
     open.directory = {reinterpret_cast<ustore_byte_t const*>(directory), std::strlen(directory)};
-    if (write_buffer_bytes) {
-        open.collection_write_buffer_max_bytes = write_buffer_bytes;
-        open.collection_value_max_size = write_buffer_bytes / 4;
-        open.transaction_max_bytes = write_buffer_bytes / 2;
+    if (memory_runs_bytes) {
+        open.collection_memory_runs_max_bytes = memory_runs_bytes;
+        open.collection_value_max_size = memory_runs_bytes / 4;
+        open.transaction_max_bytes = memory_runs_bytes / 2;
     }
     open.collection_level_enlarge_factor = enlarge_factor;
     open.collection_value_size = value_size;
@@ -379,15 +380,15 @@ case_result_t fixed_width_refuses_graph(char const* directory) {
     return failures;
 }
 
-/** Edges written and removed round after round leave no records behind once compactions reach the bottom level,
- *  where every chain applies onto nothing and its removals drop, rather than lying there as change records that
+/** Edges written and removed round after round leave no deltas behind once compactions reach the bottom level,
+ *  where every chain applies onto nothing and its removals drop, rather than lying there as change deltas that
  *  every read folds again. */
 case_result_t bottom_applies_chains(char const* directory) {
     if (!directory) return case_result_t::skipped(needs_directory_k);
     std::size_t failures = 0;
     path_t const home {directory, "bottom"};
     if (!recreate_directory(home.c_str())) return failures + 1;
-    auto [database, open_status] = open_nvme(home.c_str(), small_write_buffer_bytes_k, 2);
+    auto [database, open_status] = open_nvme(home.c_str(), small_memory_runs_bytes_k, 2);
     failures += expect(open_status.succeeded());
     if (failures) return failures;
     auto [graph, graph_status] = database.create<graph_collection_t>("bottom");
@@ -427,7 +428,7 @@ case_result_t fold_survives_maintenance(char const* directory, random_t random) 
     if (failures) return failures;
 
     {
-        auto [database, open_status] = open_nvme(home.c_str(), small_write_buffer_bytes_k, 2);
+        auto [database, open_status] = open_nvme(home.c_str(), small_memory_runs_bytes_k, 2);
         failures += expect(open_status.succeeded());
         if (failures) return failures;
         auto [graph, graph_status] = database.create<graph_collection_t>("maintenance");
@@ -466,7 +467,7 @@ case_result_t fold_survives_maintenance(char const* directory, random_t random) 
         failures += expect(database.compact().succeeded());
         failures += expect_model(graph, model, arena);
     }
-    auto [database, reopen_status] = open_nvme(home.c_str(), small_write_buffer_bytes_k, 2);
+    auto [database, reopen_status] = open_nvme(home.c_str(), small_memory_runs_bytes_k, 2);
     failures += expect(reopen_status.succeeded());
     if (failures) return failures;
     auto [graph, graph_status] = database.find<graph_collection_t>("maintenance");

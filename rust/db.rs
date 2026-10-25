@@ -439,11 +439,11 @@ pub(crate) mod ffi {
         pub data_directories_count: ustore_size_t,
         pub memory_limit: ustore_size_t,
         pub transaction_max_bytes: ustore_size_t,
-        pub transaction_max_elements: ustore_size_t,
+        pub transaction_max_deltas: ustore_size_t,
         pub collection_concurrency_limit: ustore_size_t,
         pub collection_cache_limit: ustore_size_t,
-        pub collection_write_buffer_max_bytes: ustore_size_t,
-        pub collection_write_buffer_max_elements: ustore_size_t,
+        pub collection_memory_runs_max_bytes: ustore_size_t,
+        pub collection_memory_runs_max_deltas: ustore_size_t,
         pub collection_level_enlarge_factor: ustore_size_t,
         pub collection_value_size: ustore_size_t,
         pub collection_value_max_size: ustore_size_t,
@@ -1771,16 +1771,16 @@ pub struct NVMEOptions<'path> {
     pub memory_limit: u64,
     /// Bytes a transaction may buffer before it must commit.
     pub transaction_max_bytes: u64,
-    /// Writes a transaction may buffer before it must commit.
-    pub transaction_max_elements: usize,
+    /// Deltas a transaction may buffer before it must commit.
+    pub transaction_max_deltas: usize,
     /// Operations that may run on one collection at once.
     pub collection_concurrency_limit: usize,
     /// Bytes of values each collection may cache.
     pub collection_cache_limit: u64,
-    /// Bytes each collection buffers before it flushes a sorted run.
-    pub collection_write_buffer_max_bytes: u64,
-    /// Writes each collection buffers before it flushes a sorted run.
-    pub collection_write_buffer_max_elements: usize,
+    /// Bytes of memory runs a collection holds before the commit that crosses them flushes level 0.
+    pub collection_memory_runs_max_bytes: u64,
+    /// Deltas of memory runs a collection holds before the commit that crosses them flushes level 0.
+    pub collection_memory_runs_max_deltas: usize,
     /// How many times larger each level of a collection is than the one above it.
     pub collection_level_enlarge_factor: usize,
     /// Bytes of every value of a collection whose values share one size, or zero for varying sizes.
@@ -2043,11 +2043,11 @@ impl Database {
             data_directories_count: data_directories.len() as ffi::ustore_size_t,
             memory_limit: options.memory_limit,
             transaction_max_bytes: options.transaction_max_bytes,
-            transaction_max_elements: options.transaction_max_elements as ffi::ustore_size_t,
+            transaction_max_deltas: options.transaction_max_deltas as ffi::ustore_size_t,
             collection_concurrency_limit: options.collection_concurrency_limit as ffi::ustore_size_t,
             collection_cache_limit: options.collection_cache_limit,
-            collection_write_buffer_max_bytes: options.collection_write_buffer_max_bytes,
-            collection_write_buffer_max_elements: options.collection_write_buffer_max_elements as ffi::ustore_size_t,
+            collection_memory_runs_max_bytes: options.collection_memory_runs_max_bytes,
+            collection_memory_runs_max_deltas: options.collection_memory_runs_max_deltas as ffi::ustore_size_t,
             collection_level_enlarge_factor: options.collection_level_enlarge_factor as ffi::ustore_size_t,
             collection_value_size: options.collection_value_size,
             collection_value_max_size: options.collection_value_max_size,

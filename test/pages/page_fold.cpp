@@ -32,7 +32,7 @@
 
 #include "ustore/pages/element_tree.hpp" // `element_tree`, `mint_key`
 #include "ustore/pages/page_edits.hpp"   // `edit_t`, `encode_edits`, `decode_edit`
-#include "ustore/pages/page_fold.hpp"    // `page_fold`, `page_state`
+#include "ustore/pages/page_fold.hpp"    // `page_fold_t`, `page_state`
 
 #include "model.hpp" // `model_page_t`, `model_edit_t`, `node_spec_t`, `hex`
 
@@ -418,7 +418,7 @@ std::size_t random_streams() {
         }
         if (failures) return failures;
 
-        page_fold const fold;
+        page_fold_t const fold;
         test_arena_t scratch;
         bytes_allocator_t scratch_allocator(&scratch);
         auto const all = deltas_of(commits, 0, commits.size());
@@ -449,7 +449,7 @@ std::size_t compose_is_sound() {
         stream_generator_t generator(random);
         std::vector<commit_t> commits;
         for (std::size_t round = 0; round != 80; ++round) commits.push_back(generator.next());
-        page_fold const fold;
+        page_fold_t const fold;
         for (std::size_t trial = 0; trial != 30; ++trial) {
             test_arena_t arena;
             bytes_allocator_t allocator(&arena);
@@ -503,7 +503,7 @@ std::size_t compose_shapes() {
     element_key_t const page = mint_key(1, 0, 0), paragraph = mint_key(1, 0, 1);
     bytes_t const tree = encode_fragment(
         page, {node_spec_t {paragraph, element_kind_t::element_k, "p", "hello", {}, 1}}, {1, 0});
-    page_fold const fold;
+    page_fold_t const fold;
     auto count_of = [&](std::span<byte_t const> chain) {
         std::size_t count = 0;
         (void)for_each_edit(chain, [&](edit_t const&) noexcept -> status_t {
@@ -609,7 +609,7 @@ std::size_t concurrent_inserts_converge() {
     }
     std::vector<std::size_t> order {0, 1, 2, 3};
     std::string wanted;
-    page_fold const fold;
+    page_fold_t const fold;
     do {
         std::vector<delta_view_t> deltas;
         for (std::size_t author : order) deltas.push_back(delta_view_t {delta_kind_t::change_k, chains[author]});

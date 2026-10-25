@@ -5,20 +5,22 @@
  *  @brief Embedded on-disk engine over the LSM templates of `include/ustore/blobs/`, one NVMe collection per
  *      collection of the C ABI, served by one variant per CPU class.
  *
- *  Every call is a template on the CPU class, whose atomic reference and waiting policy instantiate the store, and
+ *  Every call is a template on the CPU class, whose atomic reference and waiter instantiate the store, and
  *  @c nvme_variant names the table of one class and its open. Its members are defined below it, so the explicit
  *  instantiation in `src/nvme/variants_<class>.cpp` compiles every call of the class there, and the @c extern one in
  *  `src/nvme/engine.cpp` keeps them out of the unit that picks the class.
  *
  *  One mount opens the volumes and one database of 16-byte keys lives on them. Every collection of the C ABI is one
  *  collection of that database under the same UUID, and three more are the engine's own: the main collection under
- *  the nil UUID, the catalog, and the names. The catalog maps every other collection's UUID onto its name, the store
- *  recording its modality, and the names file every name as a string mapped onto its `name_record_t`. A strings
+ *  the nil UUID, and two system collections. The collections system collection, `catalog_collection_k`, maps every
+ *  other collection's UUID onto its name, while the store schema records its modality, which a mount needs before it
+ *  opens the collection. The names system collection maps every name onto the bare UUID of its collection. A strings
  *  collection, and the names, live in the strings store of `include/ustore/strings/nvme_store.hpp`, keyed by whole
- *  strings, and a transaction's strings ride in the share of it every transaction here joins.
+ *  strings, each mapped onto a 16-byte key held in its cell, and a transaction's strings ride in the share of it every
+ *  transaction here joins.
  *
  *  Every write of a caller goes through a transaction of the database, the caller's or one the call commits alone, so
- *  the registry records every commit a watched read may conflict with. The catalog and the names, which no caller's
+ *  the registry records every commit a watched read may conflict with. The two system collections, which no caller's
  *  transaction reaches, change under a claim of their own, the catalog straight in the store and the names through a
  *  commit watching nothing, so a collection created or dropped never conflicts with the transactions running beside
  *  it. A call outside a transaction reads at the head, or
@@ -64,18 +66,18 @@
 #include "ustore/ranges.hpp" // `place_batch_t`, `strided`
 #include "ustore/strings.h"
 
-#include "ustore/blobs/nvme_database.hpp"      // `database`, `watch_schedule_t`, `write_buffer_status_t`
+#include "ustore/blobs/nvme_database.hpp"      // `basic_database`, `watch_schedule_t`, `lookup_result_t`
 #include "ustore/blobs/nvme_tree.hpp"          // `user_collection_config_t`, `validate`
-#include "ustore/docs/nvme_store.hpp"          // `nvme_docs`
-#include "ustore/graph/nvme_store.hpp"         // `nvme_graph`
-#include "ustore/pages/nvme_store.hpp"         // `nvme_pages`
-#include "ustore/strings/nvme_store.hpp"       // `strings_store`, `strings_transaction`, `strings_page_t`
+#include "ustore/docs/nvme_store.hpp"          // `docs::nvme_store`
+#include "ustore/graph/nvme_store.hpp"         // `graph::nvme_store`
+#include "ustore/pages/nvme_store.hpp"         // `pages::nvme_store`
+#include "ustore/strings/nvme_store.hpp"       // `strings::nvme_store`, `nvme_transaction`, `strings_page_t`
 #include "ustore/utilities/blocking_files.hpp" // `directory_exists`
 #include "ustore/utilities/nvme_volume.hpp"    // `resources_config_t`, `open_resources`, `mounted_storage`
 #include "ustore/utilities/ram_buffers.hpp"    // `arena_allocate`, `arena_allocator`, `growth_status`
 
 #include "engine.hpp"             // `engine_t`, `handle_t`, `handle_cast`, `view_t`, `nvme_placement_of`
-#include "lib.hpp"                // `cpu_class_t`, `atomic_ref_for_cpu_class`, `waiting_policy_of`, `waiter_of`
+#include "lib.hpp"                // `cpu_class_t`, `atomic_ref_for_cpu_class`, `waiter_of`
 #include "utilities/batches.hpp"  // `strings_arg_t`, `places_of`, `validate_write`
 #include "utilities/outputs.hpp"  // `read_outputs_t`, `scan_outputs_t`, `collection_list_outputs_t`
 #include "utilities/progress.hpp" // `progress_t`, `progress_cancelled_k`
@@ -88,72 +90,72 @@ using namespace unum::ustore::utilities;
 #pragma region Store
 
 /** The key every collection of this engine stores: the 16 bytes of the C ABI's key, ordered like `memcmp`. */
-using stored_key_t = uuid_stored_key_t;
+using stored_key_t = st::key128_t;
 
 /** The mount the volumes of a store of @p cpu_class_ are opened over, which lends it its router and channels. */
 template <cpu_class_t cpu_class_>
-using storage_mount_of = typename mounted_storage<atomic_ref_for_cpu_class<cpu_class_>::template type,
-                                                  waiting_policy_of<cpu_class_>>::files_mount_t;
+using storage_mount_of =
+    typename mounted_storage<atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>>::files_mount_t;
 
 /** The store of a blobs collection, and of the main one, whose values follow @p value_layout_. */
 template <cpu_class_t cpu_class_, value_layout_t value_layout_>
 using blobs_store_of =
-    collection<key_slot<stored_key_t, value_layout_>, typename storage_mount_of<cpu_class_>::volume_t,
-               atomic_ref_for_cpu_class<cpu_class_>::template type, waiting_policy_of<cpu_class_>, last_write_fold>;
+    blobs::nvme_store<key_slot<stored_key_t, value_layout_>, typename storage_mount_of<cpu_class_>::volume_t,
+                      atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>, last_write_fold_t>;
 
 /** The store of a graph collection. */
 template <cpu_class_t cpu_class_>
-using graph_store_of =
-    graph::nvme_graph<stored_key_t, typename storage_mount_of<cpu_class_>::volume_t,
-                      atomic_ref_for_cpu_class<cpu_class_>::template type, waiting_policy_of<cpu_class_>>;
+using graph_store_of = graph::nvme_store<stored_key_t, typename storage_mount_of<cpu_class_>::volume_t,
+                                         atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>>;
 
 /** The store of a docs collection. */
 template <cpu_class_t cpu_class_>
-using docs_store_of =
-    docs::nvme_docs<stored_key_t, typename storage_mount_of<cpu_class_>::volume_t,
-                    atomic_ref_for_cpu_class<cpu_class_>::template type, waiting_policy_of<cpu_class_>>;
+using docs_store_of = docs::nvme_store<stored_key_t, typename storage_mount_of<cpu_class_>::volume_t,
+                                       atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>>;
 
 /** The store of a pages collection. */
 template <cpu_class_t cpu_class_>
-using pages_store_of =
-    pages::nvme_pages<stored_key_t, typename storage_mount_of<cpu_class_>::volume_t,
-                      atomic_ref_for_cpu_class<cpu_class_>::template type, waiting_policy_of<cpu_class_>>;
+using pages_store_of = pages::nvme_store<stored_key_t, typename storage_mount_of<cpu_class_>::volume_t,
+                                         atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>>;
 
 /** The store of a strings collection, keyed by whole strings. */
 template <cpu_class_t cpu_class_>
 using strings_store_of =
-    strings_store<typename storage_mount_of<cpu_class_>::volume_t, atomic_ref_for_cpu_class<cpu_class_>::template type,
-                  waiting_policy_of<cpu_class_>>;
+    strings::nvme_store<typename storage_mount_of<cpu_class_>::volume_t,
+                        atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>>;
 
-/** The store every call of @p cpu_class_ runs against, whose volumes live in files, owning its words through the
+/** The database every call of @p cpu_class_ runs against, whose volumes live in files, owning its words through the
  *  class's atomic reference and waiting through its waiter, and whose collections live in the one store serving
  *  their modality and value layout, a pair no store serves being refused. */
 template <cpu_class_t cpu_class_>
-using store_of = basic_database<stored_key_t, typename storage_mount_of<cpu_class_>::volume_t,
-                                atomic_ref_for_cpu_class<cpu_class_>::template type, waiting_policy_of<cpu_class_>,
-                                strings_store_of<cpu_class_>, graph_store_of<cpu_class_>, docs_store_of<cpu_class_>,
-                                pages_store_of<cpu_class_>, blobs_store_of<cpu_class_, value_layout_t::inline_1_byte_k>,
-                                blobs_store_of<cpu_class_, value_layout_t::inline_4_bytes_k>,
-                                blobs_store_of<cpu_class_, value_layout_t::inline_8_bytes_k>,
-                                blobs_store_of<cpu_class_, value_layout_t::inline_16_bytes_k>,
-                                blobs_store_of<cpu_class_, value_layout_t::inline_32_bytes_k>,
-                                blobs_store_of<cpu_class_, value_layout_t::inline_64_bytes_k>,
-                                blobs_store_of<cpu_class_, value_layout_t::fixed_width_k>,
-                                blobs_store_of<cpu_class_, value_layout_t::variable_width_k>>;
+using database_of =
+    basic_database<stored_key_t, typename storage_mount_of<cpu_class_>::volume_t,
+                   atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>,
+                   strings_store_of<cpu_class_>, graph_store_of<cpu_class_>, docs_store_of<cpu_class_>,
+                   pages_store_of<cpu_class_>, blobs_store_of<cpu_class_, value_layout_t::inline_1_byte_k>,
+                   blobs_store_of<cpu_class_, value_layout_t::inline_4_bytes_k>,
+                   blobs_store_of<cpu_class_, value_layout_t::inline_8_bytes_k>,
+                   blobs_store_of<cpu_class_, value_layout_t::inline_16_bytes_k>,
+                   blobs_store_of<cpu_class_, value_layout_t::inline_32_bytes_k>,
+                   blobs_store_of<cpu_class_, value_layout_t::inline_64_bytes_k>,
+                   blobs_store_of<cpu_class_, value_layout_t::fixed_width_k>,
+                   blobs_store_of<cpu_class_, value_layout_t::variable_width_k>>;
 
-/** One transaction over the collections of that store. */
+/** One transaction over the collections of that database. */
 template <cpu_class_t cpu_class_>
-using store_transaction_of = typename store_of<cpu_class_>::transaction_t;
+using database_transaction_of = typename database_of<cpu_class_>::transaction_t;
 
-/** The strings one transaction of that store writes and watches, joined to it as a share. */
+/** The strings one transaction of that database writes and watches, joined to it as a share. */
 template <cpu_class_t cpu_class_>
-using strings_transaction_of = strings_transaction<store_of<cpu_class_>, strings_store_of<cpu_class_>>;
+using strings_transaction_of = nvme_transaction<database_of<cpu_class_>, strings_store_of<cpu_class_>>;
 
-/** The collection the catalog lives in, which no minted UUIDv7 spells, as its byte 6 is `0x7X`. */
+/** The collections system collection, the catalog, mapping every collection's UUID onto its name, which no minted
+ *  UUIDv7 spells, as its byte 6 is `0x7X`. */
 inline constexpr ustore_collection_id_t catalog_collection_k {
     {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD}}};
 
-/** The collection the names of collections live in, which no minted UUIDv7 spells either. */
+/** The names system collection, a strings collection mapping every collection's name onto its UUID, which no minted
+ *  UUIDv7 spells either. */
 inline constexpr ustore_collection_id_t names_collection_k {
     {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE}}};
 
@@ -169,17 +171,17 @@ inline constexpr std::size_t engine_shared_io_channels_k = 4;
 /** Bytes the largest value of a collection takes. */
 inline constexpr stored_value_size_t engine_value_max_size_k = 1024u * 1024u;
 
-/** Bytes one collection's write buffer and one collection's value cache each hold. */
-inline constexpr std::size_t engine_collection_buffer_bytes_k = 16ull * 1024ull * 1024ull;
+/** Bytes one collection's memory runs hold before a flush is due, and bytes one collection's value cache holds. */
+inline constexpr std::size_t engine_collection_bytes_k = 16ull * 1024ull * 1024ull;
 
-/** Writes one collection's write buffer holds at once. */
-inline constexpr std::size_t engine_collection_buffer_elements_k = 64ull * 1024ull;
+/** Deltas one collection's memory runs hold before a flush is due. */
+inline constexpr std::size_t engine_memory_runs_deltas_k = 64ull * 1024ull;
 
 /** Bytes one caller's transaction buffers, which it takes eagerly when it opens. */
 inline constexpr std::size_t engine_transaction_bytes_k = 4ull * 1024ull * 1024ull;
 
-/** Writes one caller's transaction buffers at once. */
-inline constexpr std::size_t engine_transaction_elements_k = 16ull * 1024ull;
+/** Deltas one caller's transaction buffers at once. */
+inline constexpr std::size_t engine_transaction_deltas_k = 16ull * 1024ull;
 
 /** Times a call retries a commit of its own whose watched reads conflicted. */
 inline constexpr std::size_t commit_attempts_k = 64;
@@ -197,13 +199,23 @@ inline constexpr std::size_t compaction_passes_k = 8;
 inline constexpr byte_t empty_value_bytes_k[1] {};
 
 /** The stored key holding the 16 bytes of @p uuid. */
-inline stored_key_t stored_of(ustore_uuid_t const& uuid) noexcept { return stored_key_t::from_bytes(uuid.bytes); }
+inline stored_key_t stored_of(ustore_uuid_t const& uuid) noexcept {
+    return stored_key_t::from_bytes(std::as_bytes(std::span<std::uint8_t const, 16> {uuid.bytes}));
+}
 
 /** The key of the C ABI whose 16 bytes @p stored holds. */
 inline ustore_key_t key_of(stored_key_t const& stored) noexcept {
     ustore_key_t key;
-    stored.to_bytes(key.uuid.bytes);
+    stored.to_bytes(std::as_writable_bytes(std::span<std::uint8_t, 16> {key.uuid.bytes}));
     return key;
+}
+
+/** The shape of a strings collection: @p shape, every value of which is one 16-byte key. */
+inline collection_config_t strings_shape_of(collection_config_t shape) noexcept {
+    sorted_run_config_t& values = shape.lsm_tree.lsm_level_0.sorted_run;
+    values.value_size = sizeof(ustore_uuid_t);
+    values.value_max_size = 0;
+    return shape;
 }
 
 /** Whether @p collection is one the engine keeps for itself, which no call of the C ABI may address. */
@@ -214,9 +226,9 @@ inline bool reserved(ustore_collection_id_t const& collection) noexcept {
 /** The shape every collection of a database takes unless its open names another. */
 inline user_collection_config_t engine_collection_defaults() noexcept {
     user_collection_config_t config;
-    config.cache_limit = engine_collection_buffer_bytes_k;
-    config.write_buffer_max_elements = engine_collection_buffer_elements_k;
-    config.write_buffer_max_bytes = engine_collection_buffer_bytes_k;
+    config.cache_limit = engine_collection_bytes_k;
+    config.memory_runs_max_deltas = engine_memory_runs_deltas_k;
+    config.memory_runs_max_bytes = engine_collection_bytes_k;
     config.value_max_size = engine_value_max_size_k;
     return config;
 }
@@ -242,10 +254,10 @@ template <cpu_class_t cpu_class_>
 struct database_state : handle_t {
 
     /** The budgets and the mount the store borrows its router and channels from. */
-    resources_shared_ptr<atomic_ref_for_cpu_class<cpu_class_>::template type, waiting_policy_of<cpu_class_>> resources;
+    resources_shared_ptr<atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>> resources;
 
     /** The store itself, unmounted before the mount underneath it is torn down. */
-    std::unique_ptr<store_of<cpu_class_>> store;
+    std::unique_ptr<database_of<cpu_class_>> store;
 
     /** The shape every collection this database creates takes. */
     collection_config_t collection_shape;
@@ -291,13 +303,13 @@ struct transaction_handle : handle_t {
     strings_transaction_of<cpu_class_> strings;
 
     /** The transaction itself, retired when the handle dies. */
-    typename store_of<cpu_class_>::transaction_unique_ptr_t held;
+    typename database_of<cpu_class_>::transaction_unique_ptr_t held;
 
     /** Whether the caller staged it, which a rollback withdraws and a commit consumes, refusing writes meanwhile. */
     bool staged = false;
 
     transaction_handle(database_state<cpu_class_>& owner,
-                       typename store_of<cpu_class_>::transaction_unique_ptr_t&& opened) noexcept
+                       typename database_of<cpu_class_>::transaction_unique_ptr_t&& opened) noexcept
         : handle_t {&nvme_variant<cpu_class_>::engine_k}, state(owner), strings(*owner.store), held(std::move(opened)) {
         strings.join(*held);
     }
@@ -311,7 +323,7 @@ struct snapshot_handle : handle_t {
     database_state<cpu_class_>& state;
 
     /** The pin, which keeps every version a read at its stamp needs out of the reach of a flush and a merge. */
-    typename store_of<cpu_class_>::pin_t pin;
+    typename database_of<cpu_class_>::pin_t pin;
 
     explicit snapshot_handle(database_state<cpu_class_>& owner) noexcept
         : handle_t {&nvme_variant<cpu_class_>::engine_k}, state(owner) {}
@@ -339,12 +351,12 @@ class catalog_guard {
 /** The database a call addresses. */
 template <cpu_class_t cpu_class_, typename arguments_type_>
 database_state<cpu_class_>& state_of(arguments_type_ const& arguments) noexcept {
-    return *handle_cast<database_state<cpu_class_>>(database_of(arguments));
+    return *handle_cast<database_state<cpu_class_>>(ustore::database_of(arguments));
 }
 
 /** Opens a transaction of @p state whose buffer @p shape bounds. */
 template <cpu_class_t cpu_class_>
-expected<typename store_of<cpu_class_>::transaction_unique_ptr_t> begin_transaction(
+expected<typename database_of<cpu_class_>::transaction_unique_ptr_t> begin_transaction(
     database_state<cpu_class_>& state, transaction_config_t const& shape) noexcept {
     return state.store->create_transaction(shape);
 }
@@ -361,7 +373,7 @@ struct call_access {
     database_state<cpu_class_>& state;
 
     /** The transaction it reads and writes through, or null to read at the head. */
-    store_transaction_of<cpu_class_>* transaction = nullptr;
+    database_transaction_of<cpu_class_>* transaction = nullptr;
 
     /** Whether the transaction watches what the call reads and writes. */
     watch_schedule_t schedule = watch_schedule_t::never_k;
@@ -480,15 +492,15 @@ expected<value_view_t> fold_own_change(call_access<cpu_class_> const& access, co
 template <cpu_class_t cpu_class_>
 expected<value_view_t> read_value(call_access<cpu_class_> const& access, collection_id_t collection,
                                   stored_key_t key) noexcept {
-    store_of<cpu_class_>& store = *access.state.store;
-    store_transaction_of<cpu_class_>* const transaction = access.transaction;
+    database_of<cpu_class_>& store = *access.state.store;
+    database_transaction_of<cpu_class_>* const transaction = access.transaction;
     delta_view_t own;
     bool const changed = transaction && transaction->uncommitted_delta(collection, key, own) &&
                          own.kind == delta_kind_t::change_k;
     if (transaction) {
-        write_buffer_status_t const own_status = transaction->uncommitted(collection, key);
-        if (own_status == write_buffer_status_t::removed_k) return value_view_t {};
-        if (own_status == write_buffer_status_t::found_k && !changed) {
+        lookup_result_t const own_status = transaction->uncommitted(collection, key);
+        if (own_status == lookup_result_t::removed_k) return value_view_t {};
+        if (own_status == lookup_result_t::written_k && !changed) {
             stored_value_size_t size = 0;
             if (status_t const measured = transaction->stored_value_size_uncommitted(collection, key, size);
                 measured.failed())
@@ -539,10 +551,10 @@ status_t write_value(call_access<cpu_class_> const& access, collection_id_t coll
                      value_view_t value) noexcept {
     stored_value_view_t const bytes {reinterpret_cast<byte_t const*>(value.data()), value.size()};
     if (!access.transaction) {
-        store_of<cpu_class_>& store = *access.state.store;
+        database_of<cpu_class_>& store = *access.state.store;
         return value ? store.insert(collection, key, bytes) : store.remove(collection, key);
     }
-    store_transaction_of<cpu_class_>& transaction = *access.transaction;
+    database_transaction_of<cpu_class_>& transaction = *access.transaction;
     bool const watched = access.schedule != watch_schedule_t::never_k;
     if (!value)
         return watched ? transaction.template remove<watch_schedule_t::on_commit_k>(collection, key)
@@ -568,12 +580,12 @@ struct own_write_t {
 template <cpu_class_t cpu_class_, typename visitor_type_>
 status_t walk(call_access<cpu_class_> const& access, collection_id_t collection, stored_key_t from,
               visitor_type_&& visitor) noexcept {
-    store_of<cpu_class_>& store = *access.state.store;
+    database_of<cpu_class_>& store = *access.state.store;
     if (!access.transaction)
         return store.scan(
             collection, from,
-            [&](stored_key_t key, select_result_t state, stored_value_size_t size) noexcept {
-                return state != select_result_t::success_k || visitor(key, size);
+            [&](stored_key_t key, lookup_result_t state, stored_value_size_t size) noexcept {
+                return state != lookup_result_t::written_k || visitor(key, size);
             },
             access.stamp, access.thread_index);
 
@@ -606,11 +618,11 @@ status_t walk(call_access<cpu_class_> const& access, collection_id_t collection,
     // The store's side is what the transaction started at, which its reads of single keys answer too
     status_t const walked = store.scan(
         collection, from,
-        [&](stored_key_t key, select_result_t state, stored_value_size_t size) noexcept {
+        [&](stored_key_t key, lookup_result_t state, stored_value_size_t size) noexcept {
             for (; next != own.size() && own[next].key < key; ++next)
                 if (!emit_own(own[next])) return false;
             if (next != own.size() && own[next].key == key) return emit_own(own[next++]);
-            if (state != select_result_t::success_k) return true;
+            if (state != lookup_result_t::written_k) return true;
             carries_on = visitor(key, size);
             return carries_on;
         },
@@ -660,19 +672,19 @@ status_t settle(database_state<cpu_class_>& state, ustore_durability_t durabilit
 }
 
 /**
- *  @brief Commits what @p stage stages through a transaction of its own, retrying conflicts of its watched reads.
- *  @param[in] count The writes @p stage makes at most, sizing the transaction's buffer.
- *  @param[in] bytes The bytes those writes take, a hint the buffer doubles past when @p stage outgrows it.
- *  @param[in] schedule Whether @p stage watches what it reads, which a read-modify-write needs.
+ *  @brief Commits what @p writes writes through a transaction of its own, retrying conflicts of its watched reads.
+ *  @param[in] count The writes @p writes makes at most, sizing the transaction's buffer.
+ *  @param[in] bytes The bytes those writes take, a hint the buffer doubles past when @p writes outgrows it.
+ *  @param[in] schedule Whether @p writes watches what it reads, which a read-modify-write needs.
  *
- *  @p stage is invoked as `stage(access)` on every attempt, and a failure it answers ends the call.
+ *  @p writes is invoked as `writes(access)` on every attempt, and a failure it answers ends the call.
  */
-template <cpu_class_t cpu_class_, typename stage_type_>
+template <cpu_class_t cpu_class_, typename writes_type_>
 status_t commit_alone(database_state<cpu_class_>& state, ustore_arena_t scratch, std::size_t count, std::size_t bytes,
-                      watch_schedule_t schedule, stage_type_&& stage) noexcept {
+                      watch_schedule_t schedule, writes_type_&& writes) noexcept {
     transaction_config_t shape;
-    shape.write_buffer_max_elements = std::max<std::size_t>(count, 1);
-    shape.write_buffer_max_bytes = std::max<std::size_t>(bytes, 1);
+    shape.max_deltas = std::max<std::size_t>(count, 1);
+    shape.max_bytes = std::max<std::size_t>(bytes, 1);
     for (std::size_t attempt = 0; attempt != commit_attempts_k; ++attempt) {
         // Declared first, so the transaction it joins dies before it does.
         strings_transaction_of<cpu_class_> strings {*state.store};
@@ -681,15 +693,14 @@ status_t commit_alone(database_state<cpu_class_>& state, ustore_arena_t scratch,
         strings.join(*held);
         call_access<cpu_class_> const access {state,        held.get(),         schedule, scratch,
                                               head_stamp_k, outside_executor_k, &strings};
-        status_t const staged = stage(access);
-        if (staged == status_code_t::capacity_exhausted_k &&
-            shape.write_buffer_max_bytes < storage_limits_t::transaction_write_buffer_max_capacity_k) {
-            shape.write_buffer_max_bytes *= 2;
-            shape.write_buffer_max_elements = std::min(shape.write_buffer_max_elements * 2,
-                                                       storage_limits_t::transaction_write_buffer_elements_max_count_k);
+        status_t const written = writes(access);
+        if (written == status_code_t::capacity_exhausted_k &&
+            shape.max_bytes < storage_limits_t::transaction_max_bytes_k) {
+            shape.max_bytes *= 2;
+            shape.max_deltas = std::min(shape.max_deltas * 2, storage_limits_t::transaction_max_deltas_k);
             continue;
         }
-        if (staged.failed()) return staged;
+        if (written.failed()) return written;
         status_t const committed = strings.commit(*held);
         if (committed == status_code_t::write_conflict_k && schedule != watch_schedule_t::never_k) continue;
         return committed;
@@ -697,20 +708,21 @@ status_t commit_alone(database_state<cpu_class_>& state, ustore_arena_t scratch,
     return {status_code_t::write_conflict_k, "Concurrent commits kept conflicting with the call"};
 }
 
-/** Stages @p stage into the transaction @p view carries, or commits it as a transaction of its own, flushed when
+/** Writes @p writes into the transaction @p view carries, or commits them as a transaction of their own, flushed when
  *  @p durability asks, for every call that writes. */
-template <cpu_class_t cpu_class_, typename stage_type_>
+template <cpu_class_t cpu_class_, typename writes_type_>
 status_t serve_write(database_state<cpu_class_>& state, view_t const& view, ustore_durability_t durability,
-                     std::size_t count, std::size_t bytes, watch_schedule_t schedule, stage_type_&& stage) noexcept {
+                     std::size_t count, std::size_t bytes, watch_schedule_t schedule, writes_type_&& writes) noexcept {
     if (view.transaction) {
         transaction_handle<cpu_class_>& handle = *handle_cast<transaction_handle<cpu_class_>>(view.transaction);
         if (handle.staged)
             return {status_code_t::invalid_argument_k, "A staged transaction takes no writes until rolled back"};
         call_access<cpu_class_> access = access_of(state, view);
         if (schedule != watch_schedule_t::never_k) access.schedule = schedule;
-        return stage(access);
+        return writes(access);
     }
-    if (status_t const committed = commit_alone(state, view.scratch, count, bytes, schedule, stage); committed.failed())
+    if (status_t const committed = commit_alone(state, view.scratch, count, bytes, schedule, writes);
+        committed.failed())
         return committed;
     return settle(state, durability);
 }
@@ -751,7 +763,7 @@ expected<catalog_entry_t> look_up(database_state<cpu_class_>& state, ustore_aren
 
 /** Admits a collection keyed by UUIDs, which the reads of blobs reach, a graph's vertices included. */
 inline status_t holds_keys(ustore_modality_t modality) noexcept {
-    if (keying_of(modality) == keying_t::strings_k)
+    if (entry_layout_of(modality) == entry_layout_t::strings_to_uuids_k)
         return {status_code_t::invalid_argument_k, "The collection holds strings"};
     return {};
 }
@@ -766,7 +778,7 @@ inline status_t holds_values(ustore_modality_t modality) noexcept {
 
 /** Admits a collection keyed by strings. */
 inline status_t holds_strings(ustore_modality_t modality) noexcept {
-    if (keying_of(modality) != keying_t::strings_k)
+    if (entry_layout_of(modality) != entry_layout_t::strings_to_uuids_k)
         return {status_code_t::invalid_argument_k, "The collection holds no strings"};
     return {};
 }
@@ -806,8 +818,11 @@ struct string_task_t {
     ustore_collection_id_t collection;
     std::string_view text;
 
-    /** The value written, or a missing one for a removal. */
-    value_view_t value;
+    /** Whether the task writes @c value or removes the string. */
+    delta_kind_t kind = delta_kind_t::remove_k;
+
+    /** The 16 bytes of the key the string maps onto, nil for a removal. */
+    ustore_uuid_t value {};
 };
 
 /** Calls @p visitor with the strings store of @p collection inside the database's epochs, which keep it alive until
@@ -843,9 +858,9 @@ template <cpu_class_t cpu_class_>
 status_t stage_strings(call_access<cpu_class_> const& access, std::span<string_task_t const> tasks) noexcept {
     transaction_stamp_t const watch_stamp = watch_stamp_of(access);
     for (string_task_t const& task : tasks) {
-        delta_view_t const delta = task.value
+        delta_view_t const delta = task.kind == delta_kind_t::write_k
                                        ? delta_view_t {delta_kind_t::write_k,
-                                                       std::span<byte_t const> {task.value.begin(), task.value.end()}}
+                                                       std::as_bytes(std::span {task.value.bytes})}
                                        : delta_view_t {delta_kind_t::remove_k, {}};
         if (status_t const written = access.strings->write(task.collection, task.text, delta, watch_stamp);
             written.failed())
@@ -855,61 +870,36 @@ status_t stage_strings(call_access<cpu_class_> const& access, std::span<string_t
 }
 
 /**
- *  @brief The value of @p text in @p collection as @p access sees it, copied into its scratch, or a missing value.
+ *  @brief The key @p text maps onto in @p collection as @p access sees it, and whether any write carries it.
  *
- *  A transaction's own write outranks the store, and its own removal hides the store's value. A read through a watching
+ *  A transaction's own write outranks the store, and its own removal hides the store's key. A read through a watching
  *  transaction watches the string, its absence included, so a commit landing on it in between conflicts.
  */
 template <cpu_class_t cpu_class_>
-expected<value_view_t> read_string(call_access<cpu_class_> const& access, collection_id_t collection,
-                                   std::string_view text) noexcept {
+status_t read_string(call_access<cpu_class_> const& access, collection_id_t collection, std::string_view text,
+                     ustore_uuid_t& value, bool& present) noexcept {
+    std::span<byte_t, sizeof(ustore_uuid_t)> const bytes = std::as_writable_bytes(std::span {value.bytes});
     delta_view_t own;
     if (access.strings && access.strings->uncommitted(collection, text, own)) {
-        if (own.kind == delta_kind_t::remove_k) return value_view_t {};
-        return copied_value(access, static_cast<stored_value_size_t>(own.bytes.size()),
-                            [&](std::span<byte_t> into) noexcept -> status_t {
-                                if (!into.empty()) std::memcpy(into.data(), own.bytes.data(), into.size());
-                                return {};
-                            });
+        present = own.kind != delta_kind_t::remove_k;
+        if (present) std::memcpy(bytes.data(), own.bytes.data(), bytes.size());
+        return {};
     }
     transaction_stamp_t const stamp = read_stamp_of(access);
     if (transaction_stamp_t const watch_stamp = watch_stamp_of(access); watch_stamp != invalid_transaction_stamp_k)
         if (status_t const watched = access.strings->watch(collection, text, watch_stamp); watched.failed())
             return watched;
-
-    // A value may change its size between the measurement and the copy at the head, which the copy refuses
-    for (std::size_t attempt = 0; attempt != read_attempts_k; ++attempt) {
-        stored_value_size_t size = 0;
-        select_result_t found = select_result_t::nothing_k;
-        if (status_t const measured = visit_strings(access, collection,
-                                                    [&](auto const& store) noexcept -> status_t {
-                                                        found = store.find(text, size, stamp, access.thread_index);
-                                                        return {};
-                                                    });
-            measured.failed())
-            return measured;
-        if (found != select_result_t::success_k) return value_view_t {};
-        expected<value_view_t> read = copied_value(access, size, [&](std::span<byte_t> into) noexcept -> status_t {
-            auto [channel, acquire_status] = access.state.store->channels().acquire(access.thread_index);
-            if (acquire_status.failed()) return acquire_status;
-            return visit_strings(access, collection, [&](auto& store) noexcept {
-                stored_value_size_t copied = 0;
-                return store.select(channel.channel(), text, into, copied, stamp, access.thread_index);
-            });
-        });
-        if (read) return read;
-        if (read.status() == status_code_t::invalid_argument_k) continue;
-        if (read.status() == status_code_t::not_found_k) return value_view_t {};
-        return read.status();
-    }
-    return status_t {status_code_t::contended_k, "A value kept changing its size while it was read"};
+    return visit_strings(access, collection, [&](auto const& store) noexcept -> status_t {
+        present = store.find(text, bytes, stamp, access.thread_index) == lookup_result_t::written_k;
+        return {};
+    });
 }
 
 /**
  *  @brief Hands @p visitor every string of @p collection starting with @p prefix and not below @p start, in order, as
  *      the store holds them at @p stamp, each with what its newest version carries, a removal included.
- *  @param[in] visitor Called as @c visitor(text, state, size) outside the epochs, answering whether the walk carries
- *      on; the text lives until it returns.
+ *  @param[in] visitor Called as @c visitor(text, state, value) outside the epochs, answering whether the walk carries
+ *      on, with the key the string maps onto; the text lives until it returns.
  *
  *  A page is read inside the epochs at a time, finding the collection again for each, so a commit waits for one page
  *  at most, and a head walk pins the stamp it starts at, so every page reads the same commits.
@@ -917,7 +907,7 @@ expected<value_view_t> read_string(call_access<cpu_class_> const& access, collec
 template <cpu_class_t cpu_class_, typename visitor_type_>
 status_t walk_strings(call_access<cpu_class_> const& access, collection_id_t collection, std::string_view prefix,
                       std::string_view start, transaction_stamp_t stamp, visitor_type_&& visitor) noexcept {
-    typename store_of<cpu_class_>::pin_t pin;
+    typename database_of<cpu_class_>::pin_t pin;
     if (stamp == head_stamp_k) stamp = access.state.store->ledger().pin_reader(pin);
     strings_page_t page;
     st::basic_vector<char> from;
@@ -935,7 +925,7 @@ status_t walk_strings(call_access<cpu_class_> const& access, collection_id_t col
             read.failed())
             return read;
         for (std::size_t index = 0; index != page.size(); ++index)
-            if (!visitor(page.text(index), page.listed[index].state, page.listed[index].size)) return {};
+            if (!visitor(page.text(index), page.listed[index].state, page.listed[index].value)) return {};
         if (page.size() != strings_page_k) return {};
         // The smallest string past the last one listed is that string and one zero byte more.
         std::string_view const last = page.text(page.size() - 1);
@@ -986,11 +976,11 @@ status_t scan_strings(call_access<cpu_class_> const& access, collection_id_t col
     auto const emit_own = [&](own_string_t const& written) noexcept { return !written.present || emit(written.text); };
     status_t const walked = walk_strings(
         access, collection, prefix, lower, read_stamp_of(access),
-        [&](std::string_view text, select_result_t state, stored_value_size_t) noexcept {
+        [&](std::string_view text, lookup_result_t state, ustore_key_t const&) noexcept {
             for (; next != own.size() && own[next].text < text; ++next)
                 if (!emit_own(own[next])) return false;
             if (next != own.size() && own[next].text == text) return emit_own(own[next++]);
-            return state != select_result_t::success_k || emit(text);
+            return state != lookup_result_t::written_k || emit(text);
         });
     if (walked.failed()) return walked;
     for (; found != limit && next != own.size() && pushed.succeeded(); ++next) emit_own(own[next]);
@@ -1007,7 +997,7 @@ template <cpu_class_t cpu_class_>
 status_t write_strings_alone(database_state<cpu_class_>& state, ustore_arena_t scratch,
                              std::span<string_task_t const> tasks) noexcept {
     std::size_t bytes = 0;
-    for (string_task_t const& task : tasks) bytes += task.text.size() + task.value.size();
+    for (string_task_t const& task : tasks) bytes += task.text.size() + sizeof(task.value);
     return commit_alone(state, scratch, tasks.size(), bytes, watch_schedule_t::never_k,
                         [&](call_access<cpu_class_> const& access) noexcept { return stage_strings(access, tasks); });
 }
@@ -1016,23 +1006,20 @@ status_t write_strings_alone(database_state<cpu_class_>& state, ustore_arena_t s
 
 #pragma region Names
 
-/** The record @p name maps onto at the head, and whether any collection carries the name. */
+/** The collection @p name maps onto as @p access reads the names, and whether any collection carries the name. */
 template <cpu_class_t cpu_class_>
-expected<name_record_t> look_up_name(call_access<cpu_class_> const& access, std::string_view name,
-                                     bool& present) noexcept {
-    present = false;
-    auto [record, read_status] = read_string(access, names_collection_k, name);
-    if (read_status.failed()) return read_status;
-    if (!record) return name_record_t {};
-    present = true;
-    return read_name_record(record);
+status_t look_up_name(call_access<cpu_class_> const& access, std::string_view name, ustore_collection_id_t& collection,
+                      bool& present) noexcept {
+    return read_string(access, names_collection_k, name, collection.uuid, present);
 }
 
-/** Commits @p name mapped onto @p record, or its removal when @p record is null, as a write of its own. */
+/** Commits @p name mapped onto @p collection, or its removal when @p collection is null, as a write of its own. */
 template <cpu_class_t cpu_class_>
 status_t write_name(database_state<cpu_class_>& state, ustore_arena_t scratch, std::string_view name,
-                    name_record_t const* record) noexcept {
-    string_task_t const task {names_collection_k, name, record ? value_view_t {record->view()} : value_view_t {}};
+                    ustore_collection_id_t const* collection) noexcept {
+    string_task_t const task = collection
+                                   ? string_task_t {names_collection_k, name, delta_kind_t::write_k, collection->uuid}
+                                   : string_task_t {names_collection_k, name};
     return write_strings_alone(state, scratch, std::span<string_task_t const> {&task, 1});
 }
 
@@ -1040,14 +1027,15 @@ status_t write_name(database_state<cpu_class_>& state, ustore_arena_t scratch, s
 
 #pragma region Clearing
 
-/** Empties the strings collection @p collection: removing every string for @c ustore_drop_pairs_k, or emptying every
- *  value for @c ustore_drop_values_k, in windows committed one after another, so the transaction of each stays
- *  bounded. */
+/** Empties the strings collection @p collection for @c ustore_drop_pairs_k, removing every string in windows committed
+ *  one after another, so the transaction of each stays bounded, and refuses @c ustore_drop_values_k, as a string always
+ *  maps onto a key. */
 template <cpu_class_t cpu_class_>
 status_t empty_strings(database_state<cpu_class_>& state, ustore_arena_t scratch, collection_id_t collection,
                        ustore_drop_mode_t mode) noexcept {
+    if (mode == ustore_drop_values_k)
+        return {status_code_t::invalid_argument_k, "A string always maps onto a key, so its value never empties"};
     call_access<cpu_class_> const head {state, nullptr, watch_schedule_t::never_k, scratch};
-    value_view_t const emptied = mode == ustore_drop_values_k ? value_view_t::make_empty() : value_view_t {};
     st::basic_vector<char> from;
     st::basic_vector<char> texts;
     st::basic_vector<std::size_t> ends;
@@ -1059,8 +1047,8 @@ status_t empty_strings(database_state<cpu_class_>& state, ustore_arena_t scratch
         status_t room;
         status_t const walked = walk_strings(
             head, collection, {}, std::string_view {from.begin(), from.end()}, head_stamp_k,
-            [&](std::string_view text, select_result_t found, stored_value_size_t) noexcept {
-                if (found != select_result_t::success_k) return true;
+            [&](std::string_view text, lookup_result_t found, ustore_key_t const&) noexcept {
+                if (found != lookup_result_t::written_k) return true;
                 std::size_t const offset = texts.size();
                 room = growth_status(texts.resize(offset + text.size()));
                 if (room.succeeded()) room = growth_status(ends.push_back(offset + text.size()));
@@ -1074,12 +1062,12 @@ status_t empty_strings(database_state<cpu_class_>& state, ustore_arena_t scratch
         if (status_t const reserved = growth_status(tasks.reserve(ends.size())); reserved.failed()) return reserved;
         for (std::size_t index = 0, begin = 0; index != ends.size(); begin = ends[index++]) [[maybe_unused]]
             st::status_t const placed = tasks.push_back(
-                string_task_t {collection, std::string_view {texts.data() + begin, ends[index] - begin}, emptied});
+                string_task_t {collection, std::string_view {texts.data() + begin, ends[index] - begin}});
         if (status_t const written = write_strings_alone(state, scratch, std::span<string_task_t const> {tasks});
             written.failed())
             return written;
         if (ends.size() < clear_window_keys_k) return {};
-        // An emptied string stays, so the next window starts past the last string of this one.
+        // The next window starts past the last string of this one, past the removals the walk would list again.
         std::string_view const last = tasks[tasks.size() - 1].text;
         if (from.resize(last.size() + 1) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A clear could not hold where it resumes"};
@@ -1090,15 +1078,16 @@ status_t empty_strings(database_state<cpu_class_>& state, ustore_arena_t scratch
 
 /**
  *  @brief Empties @p collection holding @p modality: removing every key for @c ustore_drop_pairs_k, or emptying every
- *      value for @c ustore_drop_values_k, a strings collection keeping its strings and a graph, whose vertices hold
- *      no values but their edges, keeping everything, as on the in-memory engine.
+ *      value for @c ustore_drop_values_k, which a strings collection refuses and a graph, whose vertices hold no
+ *      values but their edges, answers by keeping everything, as on the in-memory engine.
  *
  *  The keys are rewritten in windows committed one after another, so the transaction of each stays bounded.
  */
 template <cpu_class_t cpu_class_>
 status_t empty_collection(database_state<cpu_class_>& state, ustore_arena_t scratch, collection_id_t collection,
                           ustore_modality_t modality, ustore_drop_mode_t mode) noexcept {
-    if (keying_of(modality) == keying_t::strings_k) return empty_strings(state, scratch, collection, mode);
+    if (entry_layout_of(modality) == entry_layout_t::strings_to_uuids_k)
+        return empty_strings(state, scratch, collection, mode);
     if (modality == ustore_modality_graph_k && mode == ustore_drop_values_k) return {};
     call_access<cpu_class_> const head {state, nullptr, watch_schedule_t::never_k, scratch};
     st::basic_vector<stored_key_t, arena_allocator<stored_key_t>> keys {{scratch}};
@@ -1147,7 +1136,7 @@ status_t list_catalog(database_state<cpu_class_>& state, ustore_arena_t scratch,
         if (read_status.failed()) return read_status;
         if (!held) continue;
         ustore_collection_id_t id;
-        keys[index].to_bytes(id.uuid.bytes);
+        keys[index].to_bytes(std::as_writable_bytes(std::span<std::uint8_t, 16> {id.uuid.bytes}));
         auto [entry, entry_status] = read_catalog_entry(state, id, held);
         if (entry_status.failed()) return entry_status;
         if (status_t const pushed = growth_status(listed.push_back(listed_collection_t {id, entry})); pushed.failed())
@@ -1229,6 +1218,10 @@ status_t database_clear(ustore_database_clear_t const& arguments, view_t const& 
     st::basic_vector<listed_collection_t, arena_allocator<listed_collection_t>> listed {{view.scratch}};
     if (status_t const collected = list_catalog(state, view.scratch, listed); collected.failed()) return collected;
     for (std::size_t index = 0; index != listed.size(); ++index) {
+        // A string always maps onto a key, so emptying every value leaves the strings collections as they are
+        if (mode == ustore_drop_values_k &&
+            entry_layout_of(listed[index].entry.modality) == entry_layout_t::strings_to_uuids_k)
+            continue;
         status_t const cleared = mode == ustore_drop_collection_k
                                      ? drop_collection(state, view.scratch, listed[index].id)
                                      : empty_collection(state, view.scratch, listed[index].id,
@@ -1300,8 +1293,11 @@ status_t collection_create(ustore_collection_create_t const& arguments, view_t c
     // The engine's own name of a collection is its UUID's text, which never leaves the engine
     char text[uuid_t::printed_length_k] = {};
     uuid_t {std::span<std::uint8_t const, uuid_t::size_bytes_k> {created.uuid.bytes}}.print(text);
+    collection_config_t const shape = entry_layout_of(arguments.modality) == entry_layout_t::strings_to_uuids_k
+                                          ? strings_shape_of(state.collection_shape)
+                                          : state.collection_shape;
     if (status_t const made = state.store->create_collection(created, string_view_t {text, sizeof(text)},
-                                                             arguments.modality, state.collection_shape);
+                                                             arguments.modality, shape);
         made.failed())
         return made;
 
@@ -1311,14 +1307,14 @@ status_t collection_create(ustore_collection_create_t const& arguments, view_t c
         catalog_guard<cpu_class_> const held {state};
         call_access<cpu_class_> const head {state, nullptr, watch_schedule_t::never_k, view.scratch};
         bool taken = false;
-        if (!name.empty()) listed = look_up_name(head, name, taken).status();
+        ustore_collection_id_t holder;
+        if (!name.empty()) listed = look_up_name(head, name, holder, taken);
         if (listed.succeeded() && taken)
             listed = {status_code_t::already_exists_k, "A collection already carries the name"};
         if (listed.succeeded())
             listed = write_value(head, catalog_collection_k, stored_of(created.uuid), value_view_t {name});
-        name_record_t const record {created};
         if (listed.succeeded() && !name.empty()) {
-            listed = write_name(state, view.scratch, name, &record);
+            listed = write_name(state, view.scratch, name, &created);
             if (listed.failed()) {
                 [[maybe_unused]] status_t const unlisted = write_value(head, catalog_collection_k,
                                                                        stored_of(created.uuid), {});
@@ -1375,12 +1371,13 @@ status_t collection_find(ustore_collection_find_t const& arguments, strings_arg_
     call_access<cpu_class_> const named = view.snapshot ? access_of(state, view) : head;
     for (std::size_t index = 0; index != arguments.count; ++index) {
         bool present = false;
-        auto [record, record_status] = look_up_name(named, string_of(names[index]), present);
-        if (record_status.failed()) return record_status;
+        ustore_collection_id_t found;
+        if (status_t const looked = look_up_name(named, string_of(names[index]), found, present); looked.failed())
+            return looked;
         // A drop unnames a collection before the store lets it go, so a name whose store is gone is a drop in flight
         ustore_modality_t modality = ustore_modality_any_k;
-        if (present && state.store->collection_modality(record.id(), modality).failed()) present = false;
-        outputs.assign(index, present ? record.id() : ustore_collection_main_k, modality, present);
+        if (present && state.store->collection_modality(found, modality).failed()) present = false;
+        outputs.assign(index, present ? found : ustore_collection_main_k, modality, present);
     }
     outputs.finish(arguments);
     return {};
@@ -1615,24 +1612,26 @@ status_t blobs_measure(ustore_blobs_measure_t const& arguments, view_t const& vi
 
 #pragma region Strings Calls
 
-/** Lays the tasks of a strings write or removal out in the scratch of @p view, a null @p values removing them. */
+/** Lays the tasks of a strings write or removal out in the scratch of @p view, writing the keys of @p values, or
+ *  removing the strings when @p values view none. */
 inline expected<std::span<string_task_t>> string_tasks(view_t const& view,
                                                        strided_iterator<ustore_collection_id_t const> collections,
                                                        std::size_t count, strings_arg_t const& texts,
-                                                       strings_arg_t const* values) noexcept {
+                                                       strided_iterator<ustore_key_t const> values) noexcept {
     auto [tasks, allocate_status] = arena_allocate<string_task_t>(view.scratch, count);
     if (allocate_status.failed()) return allocate_status;
     for (std::size_t index = 0; index != count; ++index)
-        tasks[index] = string_task_t {task_collection(collections, index), string_of(texts[index]),
-                                      values ? value_view_t {(*values)[index]} : value_view_t {}};
+        tasks[index] = values ? string_task_t {task_collection(collections, index), string_of(texts[index]),
+                                               delta_kind_t::write_k, values[index].uuid}
+                              : string_task_t {task_collection(collections, index), string_of(texts[index])};
     return tasks;
 }
 
 /** Writes or removes the strings of a batch, each one on its own, watched as the call's transaction watches and not
  *  at all outside one, where the last writer wins. */
 template <cpu_class_t cpu_class_, typename arguments_type_>
-status_t serve_strings_write(arguments_type_ const& arguments, strings_arg_t const& texts, strings_arg_t const* values,
-                             view_t const& view) noexcept {
+status_t serve_strings_write(arguments_type_ const& arguments, strings_arg_t const& texts,
+                             strided_iterator<ustore_key_t const> values, view_t const& view) noexcept {
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
     if (status_t const resolved = resolve_runs(state, view, collections, arguments.count, holds_strings);
@@ -1641,7 +1640,7 @@ status_t serve_strings_write(arguments_type_ const& arguments, strings_arg_t con
     auto [tasks, tasks_status] = string_tasks(view, collections, arguments.count, texts, values);
     if (tasks_status.failed()) return tasks_status;
     std::size_t bytes = 0;
-    for (string_task_t const& task : tasks) bytes += task.text.size() + task.value.size();
+    for (string_task_t const& task : tasks) bytes += task.text.size() + sizeof(task.value);
     return serve_write(state, view, arguments.durability, arguments.count, bytes, watch_schedule_t::never_k,
                        [&](call_access<cpu_class_> const& access) noexcept {
                            return stage_strings(access, std::span<string_task_t const> {tasks});
@@ -1650,11 +1649,12 @@ status_t serve_strings_write(arguments_type_ const& arguments, strings_arg_t con
 
 /** Implements @c ustore_strings_write, committing a batch outside a transaction atomically. */
 template <cpu_class_t cpu_class_>
-status_t strings_write(ustore_strings_write_t const& arguments, strings_arg_t const& texts, strings_arg_t const& values,
+status_t strings_write(ustore_strings_write_t const& arguments, strings_arg_t const& texts,
                        view_t const& view) noexcept {
     if (!arguments.count) return {};
-    if (!texts || !values) return {status_code_t::invalid_argument_k, "Need the strings and their values"};
-    return serve_strings_write<cpu_class_>(arguments, texts, &values, view);
+    strided_iterator<ustore_key_t const> const values = strided(arguments.values);
+    if (!texts || !values) return {status_code_t::invalid_argument_k, "Need the strings and their keys"};
+    return serve_strings_write<cpu_class_>(arguments, texts, values, view);
 }
 
 /** Implements @c ustore_strings_remove, committing a batch outside a transaction atomically. */
@@ -1663,10 +1663,10 @@ status_t strings_remove(ustore_strings_remove_t const& arguments, strings_arg_t 
                         view_t const& view) noexcept {
     if (!arguments.count) return {};
     if (!texts) return {status_code_t::invalid_argument_k, "No strings were provided"};
-    return serve_strings_write<cpu_class_>(arguments, texts, nullptr, view);
+    return serve_strings_write<cpu_class_>(arguments, texts, strided_iterator<ustore_key_t const> {}, view);
 }
 
-/** Implements @c ustore_strings_read, reading every string on its own. */
+/** Implements @c ustore_strings_read, reading the key of every string on its own. */
 template <cpu_class_t cpu_class_>
 status_t strings_read(ustore_strings_read_t const& arguments, strings_arg_t const& texts, view_t const& view) noexcept {
     if (!arguments.count) return {};
@@ -1676,16 +1676,21 @@ status_t strings_read(ustore_strings_read_t const& arguments, strings_arg_t cons
     if (status_t const resolved = resolve_runs(state, view, collections, arguments.count, holds_strings);
         resolved.failed())
         return resolved;
-    auto [outputs, outputs_status] = read_outputs_t::make(arguments, view.scratch);
+    auto [outputs, outputs_status] = strings_read_outputs_t::make(arguments);
     if (outputs_status.failed()) return outputs_status;
     call_access<cpu_class_> const access = access_of(state, view);
     for (std::size_t index = 0; index != arguments.count; ++index) {
-        auto [value, read_status] = read_string(access, task_collection(collections, index), string_of(texts[index]));
-        if (read_status.failed()) return read_status;
-        if (value) outputs.append(value);
-        else outputs.append_missing();
+        ustore_key_t value;
+        bool present = false;
+        if (status_t const read = read_string(access, task_collection(collections, index), string_of(texts[index]),
+                                              value.uuid, present);
+            read.failed())
+            return read;
+        if (present) outputs.push_present(value);
+        else outputs.push_missing();
     }
-    return outputs.finish(arguments);
+    outputs.finish(arguments);
+    return {};
 }
 
 /** Implements @c ustore_strings_scan as ordered walks of each collection's strings. */
@@ -1845,24 +1850,23 @@ inline status_t read_options(ustore_database_open_nvme_t const& arguments, resou
     resources.shared_io_channels = engine_shared_io_channels_k;
     ustore_nvme_options_t const& moving = placement.nvme;
     if (arguments.collection_value_size) collections.value_max_size = 0;
-    bool const fits =
-        take_unless_zero(resources.memory_limit, arguments.memory_limit) &&
-        take_unless_zero(resources.shared_io_channels, moving.shared_io_channels) &&
-        take_unless_zero(resources.channels.depth, moving.queue_depth) &&
-        take_unless_zero(resources.channels.request_buffer_bytes, moving.request_buffer_bytes) &&
-        take_unless_zero(resources.channels.request_buffers_count, moving.request_buffers_count) &&
-        take_unless_zero(resources.channels.stream_buffer_bytes, moving.stream_buffer_bytes) &&
-        take_unless_zero(resources.channels.stream_buffers_count, moving.stream_buffers_count) &&
-        take_unless_zero(transactions.default_transaction.write_buffer_max_bytes, arguments.transaction_max_bytes) &&
-        take_unless_zero(transactions.default_transaction.write_buffer_max_elements,
-                         arguments.transaction_max_elements) &&
-        take_unless_zero(collections.concurrency_limit, arguments.collection_concurrency_limit) &&
-        take_unless_zero(collections.cache_limit, arguments.collection_cache_limit) &&
-        take_unless_zero(collections.write_buffer_max_bytes, arguments.collection_write_buffer_max_bytes) &&
-        take_unless_zero(collections.write_buffer_max_elements, arguments.collection_write_buffer_max_elements) &&
-        take_unless_zero(collections.level_enlarge_factor, arguments.collection_level_enlarge_factor) &&
-        take_unless_zero(collections.value_size, arguments.collection_value_size) &&
-        take_unless_zero(collections.value_max_size, arguments.collection_value_max_size);
+    bool const fits = take_unless_zero(resources.memory_limit, arguments.memory_limit) &&
+                      take_unless_zero(resources.shared_io_channels, moving.shared_io_channels) &&
+                      take_unless_zero(resources.channels.depth, moving.queue_depth) &&
+                      take_unless_zero(resources.channels.request_buffer_bytes, moving.request_buffer_bytes) &&
+                      take_unless_zero(resources.channels.request_buffers_count, moving.request_buffers_count) &&
+                      take_unless_zero(resources.channels.stream_buffer_bytes, moving.stream_buffer_bytes) &&
+                      take_unless_zero(resources.channels.stream_buffers_count, moving.stream_buffers_count) &&
+                      take_unless_zero(transactions.default_transaction.max_bytes, arguments.transaction_max_bytes) &&
+                      take_unless_zero(transactions.default_transaction.max_deltas, arguments.transaction_max_deltas) &&
+                      take_unless_zero(collections.concurrency_limit, arguments.collection_concurrency_limit) &&
+                      take_unless_zero(collections.cache_limit, arguments.collection_cache_limit) &&
+                      take_unless_zero(collections.memory_runs_max_bytes, arguments.collection_memory_runs_max_bytes) &&
+                      take_unless_zero(collections.memory_runs_max_deltas,
+                                       arguments.collection_memory_runs_max_deltas) &&
+                      take_unless_zero(collections.level_enlarge_factor, arguments.collection_level_enlarge_factor) &&
+                      take_unless_zero(collections.value_size, arguments.collection_value_size) &&
+                      take_unless_zero(collections.value_max_size, arguments.collection_value_max_size);
     if (!fits) return {status_code_t::invalid_argument_k, "An option of the engine exceeds its range"};
     auto ignore_issue = [](issue_kind_t, std::string_view) noexcept {};
     if (!validate(resources, transactions, ignore_issue) || !validate(resources, collections, ignore_issue))
@@ -1918,11 +1922,11 @@ expected<std::unique_ptr<database_state<cpu_class_>>> open_state(resources_confi
     state->collection_shape = shape;
     state->transaction_shape = transactions.default_transaction;
     auto [opened, open_status] =
-        open_resources<atomic_ref_for_cpu_class<cpu_class_>::template type, waiting_policy_of<cpu_class_>>(resources,
-                                                                                                           uuid_t {});
+        open_resources<atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>>(resources,
+                                                                                                   uuid_t {});
     if (open_status.failed()) return open_status;
     state->resources = std::move(opened);
-    state->store.reset(new (std::nothrow) store_of<cpu_class_> {state->resources});
+    state->store.reset(new (std::nothrow) database_of<cpu_class_> {state->resources});
     if (!state->store) return status_t {status_code_t::out_of_memory_k, "Failed to allocate the store"};
     if (status_t const mounted = mount_store(*state, transactions); mounted.failed()) return mounted;
 
@@ -1930,19 +1934,19 @@ expected<std::unique_ptr<database_state<cpu_class_>>> open_state(resources_confi
                                                      shape);
         reserved.failed())
         return reserved;
-    // The catalog and the names hold the engine's own records, whatever one width the caller's values take
+    // The catalog holds the names of collections, whatever one width the caller's values take
     collection_config_t records = shape;
     sorted_run_config_t& record_values = records.lsm_tree.lsm_level_0.sorted_run;
     if (record_values.value_size != 0)
         record_values.value_max_size = static_cast<stored_value_size_t>(
-            std::min<std::size_t>(engine_value_max_size_k, records.write_buffer_max_bytes));
+            std::min<std::size_t>(engine_value_max_size_k, records.memory_runs_max_bytes));
     record_values.value_size = 0;
     if (status_t const reserved = reserve_collection(*state, catalog_collection_k, "catalog", ustore_modality_blobs_k,
                                                      records);
         reserved.failed())
         return reserved;
     if (status_t const reserved = reserve_collection(*state, names_collection_k, "names", ustore_modality_strings_k,
-                                                     records);
+                                                     strings_shape_of(shape));
         reserved.failed())
         return reserved;
     if (status_t const dropped = drop_unlisted(*state, scratch); dropped.failed()) return dropped;
@@ -1959,7 +1963,7 @@ status_t nvme_variant<cpu_class_>::open(ustore_database_open_nvme_t const& argum
 
     resources_config_t resources;
     database_config_t transactions;
-    transactions.default_transaction = {engine_transaction_bytes_k, engine_transaction_elements_k};
+    transactions.default_transaction = {engine_transaction_bytes_k, engine_transaction_deltas_k};
     user_collection_config_t collections = engine_collection_defaults();
     if (status_t const read = read_directories(arguments, resources); read.failed()) return read;
     auto [exists, exists_status] = directory_exists(resources.directory.c_str());
@@ -1992,74 +1996,46 @@ status_t snapshot_init(ustore_snapshot_init_t const& arguments, view_t const&) n
     return {};
 }
 
-/** Copies every string of @p collection that @p access reads into @p target, @p window strings per commit. */
+/** Copies every string of @p collection that @p access reads into @p target with its key, @p window strings per
+ *  commit. */
 template <cpu_class_t cpu_class_>
 status_t save_strings(call_access<cpu_class_> const& access, collection_id_t collection,
                       database_state<cpu_class_>& target, std::size_t window, progress_t& progress) noexcept {
     st::basic_vector<char> from;
     st::basic_vector<char> texts;
     st::basic_vector<std::size_t> text_ends;
-    st::basic_vector<byte_t> values;
-    st::basic_vector<std::size_t> value_ends;
+    st::basic_vector<ustore_uuid_t> values;
     st::basic_vector<string_task_t> tasks;
     for (;;) {
         texts.clear();
         text_ends.clear();
         values.clear();
-        value_ends.clear();
         tasks.clear();
         status_t room;
         status_t const walked = walk_strings(
             access, collection, {}, std::string_view {from.begin(), from.end()}, access.stamp,
-            [&](std::string_view text, select_result_t found, stored_value_size_t) noexcept {
-                if (found != select_result_t::success_k) return true;
+            [&](std::string_view text, lookup_result_t found, ustore_key_t const& value) noexcept {
+                if (found != lookup_result_t::written_k) return true;
                 std::size_t const offset = texts.size();
                 room = growth_status(texts.resize(offset + text.size()));
                 if (room.succeeded()) room = growth_status(text_ends.push_back(offset + text.size()));
+                if (room.succeeded()) room = growth_status(values.resize(values.size() + 1));
                 if (room.failed()) return false;
                 if (!text.empty()) std::memcpy(texts.data() + offset, text.data(), text.size());
+                values[values.size() - 1] = value.uuid;
                 return text_ends.size() != window;
             });
         if (walked.failed()) return walked;
         if (room.failed()) return room;
-
-        // The snapshot's stamp is pinned, so a value measured once keeps its size until it is read.
-        for (std::size_t index = 0, begin = 0; index != text_ends.size(); begin = text_ends[index++]) {
-            std::string_view const text {texts.data() + begin, text_ends[index] - begin};
-            stored_value_size_t size = 0;
-            if (status_t const measured = visit_strings(access, collection,
-                                                        [&](auto const& store) noexcept -> status_t {
-                                                            [[maybe_unused]] select_result_t const found = store.find(
-                                                                text, size, access.stamp, access.thread_index);
-                                                            return {};
-                                                        });
-                measured.failed())
-                return measured;
-            std::size_t const offset = values.size();
-            if (values.resize(offset + size) != st::status_t::success_k ||
-                value_ends.push_back(offset + size) != st::status_t::success_k)
-                return {status_code_t::out_of_memory_k, "Failed to hold the values the save copies"};
-            auto [channel, acquire_status] = access.state.store->channels().acquire(access.thread_index);
-            if (acquire_status.failed()) return acquire_status;
-            if (status_t const read = visit_strings(
-                    access, collection,
-                    [&](auto& store) noexcept {
-                        stored_value_size_t copied = 0;
-                        return store.select(channel.channel(), text, std::span<byte_t> {values.data() + offset, size},
-                                            copied, access.stamp, access.thread_index);
-                    });
-                read.failed())
-                return read;
-            if (!progress.advance(text.size() + size)) return progress_cancelled_k;
-        }
         if (text_ends.empty()) return {};
         if (status_t const reserved = growth_status(tasks.reserve(text_ends.size())); reserved.failed())
             return reserved;
-        for (std::size_t index = 0, text_begin = 0, value_begin = 0; index != text_ends.size();
-             text_begin = text_ends[index], value_begin = value_ends[index], ++index) [[maybe_unused]]
-            st::status_t const placed = tasks.push_back(
-                string_task_t {collection, std::string_view {texts.data() + text_begin, text_ends[index] - text_begin},
-                               value_view_t {values.data() + value_begin, value_ends[index] - value_begin}});
+        for (std::size_t index = 0, begin = 0; index != text_ends.size(); begin = text_ends[index++]) {
+            std::string_view const text {texts.data() + begin, text_ends[index] - begin};
+            [[maybe_unused]] st::status_t const placed = tasks.push_back(
+                string_task_t {collection, text, delta_kind_t::write_k, values[index]});
+            if (!progress.advance(text.size() + sizeof(ustore_uuid_t))) return progress_cancelled_k;
+        }
         if (status_t const written = write_strings_alone(target, access.scratch,
                                                          std::span<string_task_t const> {tasks});
             written.failed())
@@ -2077,7 +2053,7 @@ status_t save_strings(call_access<cpu_class_> const& access, collection_id_t col
 template <cpu_class_t cpu_class_>
 status_t save_collection(call_access<cpu_class_> const& access, collection_ids_t const& collection,
                          database_state<cpu_class_>& target, progress_t& progress) noexcept {
-    store_of<cpu_class_>& store = *access.state.store;
+    database_of<cpu_class_>& store = *access.state.store;
     ustore_modality_t modality = ustore_modality_any_k;
     if (status_t const held = store.collection_modality(collection.id, modality); held.failed()) return held;
     if (!target.store->has_collection(collection.id)) {
@@ -2092,8 +2068,8 @@ status_t save_collection(call_access<cpu_class_> const& access, collection_ids_t
     // One window of keys is one write buffer of the target, which it lands without a flush in between
     collection_config_t config;
     if (status_t const shaped = target.store->collection_config(collection.id, config); shaped.failed()) return shaped;
-    std::size_t const window = config.write_buffer_max_elements;
-    if (keying_of(modality) == keying_t::strings_k)
+    std::size_t const window = config.memory_runs_max_deltas;
+    if (entry_layout_of(modality) == entry_layout_t::strings_to_uuids_k)
         return save_strings(access, collection.id, target, window, progress);
     st::basic_vector<stored_key_t> keys;
     st::basic_vector<byte_t> value;
@@ -2159,12 +2135,12 @@ status_t snapshot_save(ustore_snapshot_save_t const& arguments, view_t const& vi
             ustore_modality_t modality = ustore_modality_any_k;
             if (status_t const known = source.store->collection_modality(collection.id, modality); known.failed())
                 return known;
-            status_t const measured = keying_of(modality) == keying_t::strings_k
+            status_t const measured = entry_layout_of(modality) == entry_layout_t::strings_to_uuids_k
                                           ? walk_strings(access, collection.id, {}, {}, access.stamp,
-                                                         [&](std::string_view text, select_result_t found,
-                                                             stored_value_size_t size) noexcept {
-                                                             if (found == select_result_t::success_k)
-                                                                 total += text.size() + size;
+                                                         [&](std::string_view text, lookup_result_t found,
+                                                             ustore_key_t const&) noexcept {
+                                                             if (found == lookup_result_t::written_k)
+                                                                 total += text.size() + sizeof(ustore_uuid_t);
                                                              return true;
                                                          })
                                           : walk(access, collection.id, limit<stored_key_t>::min(),

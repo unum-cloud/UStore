@@ -155,7 +155,8 @@ typedef enum ustore_drop_mode_t {
     /** Every key and value, keeping the collection. */
     ustore_drop_pairs_k = 1,
 
-    /** Every value, keeping the keys. */
+    /** Every value, keeping the keys, which a strings collection refuses, as its values are keys.
+     *  @c ustore_database_clear with this mode leaves strings collections untouched. */
     ustore_drop_values_k = 2,
 
 } ustore_drop_mode_t;
@@ -400,8 +401,8 @@ typedef struct ustore_database_open_nvme_t {
     /** Bytes a transaction may buffer before it must commit. */
     ustore_size_t transaction_max_bytes;
 
-    /** Writes a transaction may buffer before it must commit. */
-    ustore_size_t transaction_max_elements;
+    /** Deltas a transaction may buffer before it must commit. */
+    ustore_size_t transaction_max_deltas;
 
     /** Operations that may run on one collection at once. */
     ustore_size_t collection_concurrency_limit;
@@ -409,11 +410,11 @@ typedef struct ustore_database_open_nvme_t {
     /** Bytes of values each collection may cache. */
     ustore_size_t collection_cache_limit;
 
-    /** Bytes each collection buffers before it flushes a sorted run. */
-    ustore_size_t collection_write_buffer_max_bytes;
+    /** Bytes of memory runs a collection holds before the commit that crosses them flushes level 0. */
+    ustore_size_t collection_memory_runs_max_bytes;
 
-    /** Writes each collection buffers before it flushes a sorted run. */
-    ustore_size_t collection_write_buffer_max_elements;
+    /** Deltas of memory runs a collection holds before the commit that crosses them flushes level 0. */
+    ustore_size_t collection_memory_runs_max_deltas;
 
     /** How many times larger each level of a collection is than the one above it. */
     ustore_size_t collection_level_enlarge_factor;

@@ -5,15 +5,16 @@
  *  @brief Embedded persistent key-value store on LevelDB, with collections as key ranges and without transactions.
  *
  *  LevelDB keeps one keyspace in bytewise order, so every stored key leads with the UUID of its collection and the
- *  pairs of each collection lie in one contiguous run. The collection's modality shapes the rest of the key, and the
- *  catalog and the names are two more collections under reserved UUIDs:
+ *  pairs of each collection lie in one contiguous run. The collection's modality shapes the rest of the key and the
+ *  value, and two system collections live under reserved UUIDs: the catalog, recording the modality and the name of
+ *  every collection once, and the names, mapping every name onto its collection as a strings collection would:
  *
  *  @code{.c}
- *  struct pairs {              // blobs, docs, graph and any collections, the main one under the nil UUID
+ *  struct pairs {              // blobs, docs, graph and any, the main one under the nil UUID, valued by bytes
  *      uint8_t collection[16]; // offset 0
  *      uint8_t key[16];        // offset 16, 32 bytes in all
  *  };
- *  struct strings {            // strings collections
+ *  struct strings {            // strings collections, valued by the 16-byte key the string maps onto
  *      uint8_t collection[16]; // offset 0
  *      char string[];          // offset 16
  *  };
@@ -25,7 +26,7 @@
  *      uint8_t modality;       // offset 0
  *      char name[];            // offset 1, empty for an anonymous collection
  *  };
- *  struct names {              // valued by a `name_record_t`
+ *  struct names {              // every named collection, valued by its 16-byte UUID
  *      uint8_t collection[16]; // offset 0, all bytes 0xFF but the last, 0xFE
  *      char name[];            // offset 16
  *  };
@@ -217,22 +218,23 @@ status_t status_of(native_status_t const& status) noexcept {
     return {status_code_t::internal_k, "LevelDB failed"};
 }
 
-/** What the catalog records of @p collection, whose name views @p held, refusing a collection the catalog does not
- *  list, the reserved ones included. */
-expected<catalog_entry_t> look_up(database_t& database, ustore_collection_id_t const& collection, std::string& held) {
+/** What the catalog records of @p collection as @p options read it, whose name views @p held, refusing a collection
+ *  the catalog does not list, the reserved ones included. */
+expected<catalog_entry_t> look_up(database_t& database, ustore_collection_id_t const& collection, std::string& held,
+                                  ::leveldb::ReadOptions const& options = {}) {
     if (collection == ustore_collection_main_k) return catalog_entry_t {};
 
     uuid_key_t const key = uuid_key(catalog_collection_k, collection.uuid);
-    native_status_t const status = database.native->Get(::leveldb::ReadOptions(), key.slice(), &held);
+    native_status_t const status = database.native->Get(options, key.slice(), &held);
     if (status.IsNotFound()) return status_t {status_code_t::not_found_k, "No such collection"};
     if (!status.ok()) return status_of(status);
     return read_catalog_entry(held);
 }
 
-/** Refuses a batch addressing a collection the catalog does not list or one keyed otherwise than @p keying, looking
+/** Refuses a batch addressing a collection the catalog does not list or one keyed otherwise than @p layout, looking
  *  each run of tasks on one collection up once. */
 status_t resolve_collections(database_t& database, strided_iterator<ustore_collection_id_t const> collections,
-                             std::size_t count, keying_t keying) {
+                             std::size_t count, entry_layout_t layout) {
     std::string held;
     for (std::size_t task_index = 0; task_index != count; ++task_index) {
         bool const repeated = task_index != 0 && collections && collections[task_index] == collections[task_index - 1];
@@ -240,9 +242,10 @@ status_t resolve_collections(database_t& database, strided_iterator<ustore_colle
         ustore_collection_id_t const collection = collections ? collections[task_index] : ustore_collection_main_k;
         auto [entry, look_up_status] = look_up(database, collection, held);
         if (look_up_status.failed()) return look_up_status;
-        if (keying_of(entry.modality) != keying)
-            return {status_code_t::invalid_argument_k,
-                    keying == keying_t::strings_k ? "The collection holds no strings" : "The collection holds strings"};
+        if (entry_layout_of(entry.modality) != layout)
+            return {status_code_t::invalid_argument_k, layout == entry_layout_t::strings_to_uuids_k
+                                                           ? "The collection holds no strings"
+                                                           : "The collection holds strings"};
     }
     return {};
 }
@@ -472,7 +475,7 @@ status_t blobs_write(ustore_blobs_write_t const& arguments, strings_arg_t const&
     status_t const validated = validate_write(view.transaction, places, values, arguments.durability, view.watch);
     if (validated.failed() || !arguments.count) return validated;
     status_t const resolved = resolve_collections(database, places.collections_begin, arguments.count,
-                                                  keying_t::uuids_k);
+                                                  entry_layout_t::uuids_to_bytes_k);
     if (resolved.failed()) return resolved;
 
     ::leveldb::WriteOptions const options = write_options_for(arguments.durability);
@@ -487,7 +490,7 @@ status_t blobs_remove(ustore_blobs_remove_t const& arguments, view_t const& view
     status_t const validated = validate_remove(view.transaction, places, arguments.durability, view.watch);
     if (validated.failed() || !arguments.count) return validated;
     status_t const resolved = resolve_collections(database, places.collections_begin, arguments.count,
-                                                  keying_t::uuids_k);
+                                                  entry_layout_t::uuids_to_bytes_k);
     if (resolved.failed()) return resolved;
 
     ::leveldb::WriteBatch batch;
@@ -506,7 +509,7 @@ status_t blobs_read(ustore_blobs_read_t const& arguments, view_t const& view) {
 
     if (status_t const status = validate_read(places); status.failed()) return status;
     status_t const resolved = resolve_collections(database, places.collections_begin, arguments.count,
-                                                  keying_t::uuids_k);
+                                                  entry_layout_t::uuids_to_bytes_k);
     if (resolved.failed()) return resolved;
 
     ::leveldb::ReadOptions options;
@@ -532,7 +535,8 @@ status_t blobs_scan(ustore_blobs_scan_t const& arguments, view_t const& view) {
     scan_batch_t const scans {collections, strided(arguments.start_keys), arguments.wanted, arguments.count};
 
     if (status_t const status = validate_scan(arguments); status.failed() || !arguments.count) return status;
-    status_t const resolved = resolve_collections(database, collections, arguments.count, keying_t::uuids_k);
+    status_t const resolved = resolve_collections(database, collections, arguments.count,
+                                                  entry_layout_t::uuids_to_bytes_k);
     if (resolved.failed()) return resolved;
 
     ::leveldb::ReadOptions options;
@@ -567,7 +571,8 @@ status_t blobs_sample(ustore_blobs_sample_t const& arguments, view_t const& view
     database_t& database = *handle_cast<database_t>(arguments.database);
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     sample_batch_t const samples {collections, arguments.wanted, arguments.count};
-    status_t const resolved = resolve_collections(database, collections, arguments.count, keying_t::uuids_k);
+    status_t const resolved = resolve_collections(database, collections, arguments.count,
+                                                  entry_layout_t::uuids_to_bytes_k);
     if (resolved.failed()) return resolved;
 
     ::leveldb::ReadOptions options;
@@ -596,7 +601,8 @@ status_t blobs_measure(ustore_blobs_measure_t const& arguments, view_t const&) {
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     strided_iterator<ustore_key_t const> const start_keys = strided(arguments.start_keys);
     strided_iterator<ustore_key_t const> const end_keys = strided(arguments.end_keys);
-    status_t const resolved = resolve_collections(database, collections, arguments.count, keying_t::uuids_k);
+    status_t const resolved = resolve_collections(database, collections, arguments.count,
+                                                  entry_layout_t::uuids_to_bytes_k);
     if (resolved.failed()) return resolved;
     auto [outputs, outputs_status] = measure_outputs_t::make(arguments);
     if (outputs_status.failed()) return outputs_status;
@@ -695,10 +701,9 @@ status_t collection_create(ustore_collection_create_t const& arguments, view_t c
     uuid_key_t const listed = uuid_key(catalog_collection_k, id.uuid);
     std::string entry(1, static_cast<char>(arguments.modality));
     entry.append(name);
-    name_record_t const record {id, arguments.modality};
     ::leveldb::WriteBatch batch;
     batch.Put(listed.slice(), entry);
-    if (!name.empty()) batch.Put(name_key, ::leveldb::Slice(record.bytes, sizeof(record.bytes)));
+    if (!name.empty()) batch.Put(name_key, ::leveldb::Slice(reinterpret_cast<char const*>(id.uuid.bytes), sizeof(id)));
     ::leveldb::WriteOptions synced;
     synced.sync = true;
     if (status_t const status = status_of(database.native->Write(synced, &batch)); status.failed()) return status;
@@ -719,7 +724,10 @@ status_t collection_drop(ustore_collection_drop_t const& arguments, view_t const
         return drop_collection(database, arguments.collection);
     }
     std::string held;
-    if (status_t const status = look_up(database, arguments.collection, held).status(); status.failed()) return status;
+    auto [entry, look_up_status] = look_up(database, arguments.collection, held);
+    if (look_up_status.failed()) return look_up_status;
+    if (entry.modality == ustore_modality_strings_k && arguments.mode == ustore_drop_values_k)
+        return {status_code_t::invalid_argument_k, "A strings collection's values are keys, which can't be emptied"};
     return status_of(clear_collection(database, arguments.collection, arguments.mode));
 }
 
@@ -761,23 +769,33 @@ status_t collection_find(ustore_collection_find_t const& arguments, strings_arg_
     auto [outputs, outputs_status] = collection_find_outputs_t::make(arguments);
     if (outputs_status.failed()) return outputs_status;
 
+    // A name resolves to its collection's UUID, and the catalog then records the collection's modality
     std::string key;
-    std::string record;
+    std::string named;
+    std::string held;
     for (std::size_t index = 0; index != arguments.count; ++index) {
         native_status_t const status = database.native->Get(
-            options, string_key(names_collection_k, string_of(names[index]), key), &record);
-        bool const present = status.ok();
-        if (!present && !status.IsNotFound()) return status_of(status);
-        auto [named, named_status] = present ? read_name_record(record) : name_record_t {};
-        if (named_status.failed()) return named_status;
-        outputs.assign(index, named.id(), named.modality(), present);
+            options, string_key(names_collection_k, string_of(names[index]), key), &named);
+        if (status.IsNotFound()) {
+            outputs.assign(index, ustore_collection_main_k, ustore_modality_any_k, false);
+            continue;
+        }
+        if (!status.ok()) return status_of(status);
+        if (named.size() != sizeof(ustore_collection_id_t))
+            return {status_code_t::malformed_k, "The names entry of a collection is malformed"};
+        ustore_collection_id_t collection;
+        std::memcpy(collection.uuid.bytes, named.data(), sizeof(collection.uuid.bytes));
+        auto [entry, look_up_status] = look_up(database, collection, held, options);
+        if (look_up_status.failed()) return look_up_status;
+        outputs.assign(index, collection, entry.modality, true);
     }
     outputs.finish(arguments);
     return {};
 }
 
 /** Clears every collection as the mode asks in one walk of the whole keyspace, in batches the size of a memtable, the
- *  last one synced, where dropping the collections removes the catalog and the names with them. */
+ *  last one synced, where dropping the collections removes the catalog and the names with them, and emptying the
+ *  values leaves every strings collection as it is, whose values are keys. */
 status_t database_clear(ustore_database_clear_t const& arguments, view_t const&) {
     ustore_drop_mode_t const mode = arguments.mode;
     if (mode != ustore_drop_collection_k && mode != ustore_drop_pairs_k && mode != ustore_drop_values_k)
@@ -792,13 +810,26 @@ status_t database_clear(ustore_database_clear_t const& arguments, view_t const&)
     native_status_t status;
     ::leveldb::Slice const catalog = prefix_of(catalog_collection_k);
     ::leveldb::Slice const names = prefix_of(names_collection_k);
+    // The collection the walk is in, looked up once as the walk enters its run
+    ustore_collection_id_t collection = catalog_collection_k;
+    ustore_modality_t modality = ustore_modality_any_k;
+    std::string held;
     iterator_pointer_t iterator {database.native->NewIterator(::leveldb::ReadOptions())};
     for (iterator->SeekToFirst(); status.ok() && iterator->Valid(); iterator->Next()) {
         ::leveldb::Slice const key = iterator->key();
         if (mode == ustore_drop_collection_k) batch.Delete(key);
         else if (key.starts_with(catalog) || key.starts_with(names)) continue;
-        else if (mode == ustore_drop_values_k) batch.Put(key, ::leveldb::Slice());
-        else batch.Delete(key);
+        else if (mode == ustore_drop_pairs_k) batch.Delete(key);
+        else {
+            if (!key.starts_with(prefix_of(collection))) {
+                std::memcpy(collection.uuid.bytes, key.data(), collection_bytes_k);
+                auto [entry, look_up_status] = look_up(database, collection, held);
+                if (look_up_status.failed() && look_up_status != status_code_t::not_found_k) return look_up_status;
+                modality = look_up_status.failed() ? ustore_modality_any_k : entry.modality;
+            }
+            if (modality == ustore_modality_strings_k) continue;
+            batch.Put(key, ::leveldb::Slice());
+        }
         if (batch.ApproximateSize() < database.options.write_buffer_size) continue;
         status = database.native->Write(buffered, &batch);
         batch.Clear();
@@ -842,21 +873,23 @@ status_t database_compact(ustore_database_compact_t const& arguments, view_t con
 
 #pragma region Strings
 
-status_t strings_write(ustore_strings_write_t const& arguments, strings_arg_t const& texts, strings_arg_t const& values,
-                       view_t const&) {
+status_t strings_write(ustore_strings_write_t const& arguments, strings_arg_t const& texts, view_t const&) {
     if (!arguments.count) return {};
+    strided_iterator<ustore_key_t const> const values = strided(arguments.values);
     if (!texts || !values) return {status_code_t::invalid_argument_k, "Need the strings and their values"};
 
     database_t& database = *handle_cast<database_t>(arguments.database);
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
-    status_t const resolved = resolve_collections(database, collections, arguments.count, keying_t::strings_k);
+    status_t const resolved = resolve_collections(database, collections, arguments.count,
+                                                  entry_layout_t::strings_to_uuids_k);
     if (resolved.failed()) return resolved;
 
     ::leveldb::WriteBatch batch;
     std::string key;
     for (std::size_t index = 0; index != arguments.count; ++index) {
         ustore_collection_id_t const collection = collections ? collections[index] : ustore_collection_main_k;
-        batch.Put(string_key(collection, string_of(texts[index]), key), to_slice(values[index]));
+        ::leveldb::Slice const value {reinterpret_cast<char const*>(values[index].uuid.bytes), sizeof(ustore_key_t)};
+        batch.Put(string_key(collection, string_of(texts[index]), key), value);
     }
     return status_of(database.native->Write(write_options_for(arguments.durability), &batch));
 }
@@ -867,7 +900,8 @@ status_t strings_remove(ustore_strings_remove_t const& arguments, strings_arg_t 
 
     database_t& database = *handle_cast<database_t>(arguments.database);
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
-    status_t const resolved = resolve_collections(database, collections, arguments.count, keying_t::strings_k);
+    status_t const resolved = resolve_collections(database, collections, arguments.count,
+                                                  entry_layout_t::strings_to_uuids_k);
     if (resolved.failed()) return resolved;
 
     ::leveldb::WriteBatch batch;
@@ -888,10 +922,11 @@ status_t strings_read(ustore_strings_read_t const& arguments, strings_arg_t cons
     use_snapshot(view, options);
 
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
-    status_t const resolved = resolve_collections(database, collections, arguments.count, keying_t::strings_k);
+    status_t const resolved = resolve_collections(database, collections, arguments.count,
+                                                  entry_layout_t::strings_to_uuids_k);
     if (resolved.failed()) return resolved;
 
-    auto [outputs, outputs_status] = read_outputs_t::make(arguments, view.scratch);
+    auto [outputs, outputs_status] = strings_read_outputs_t::make(arguments);
     if (outputs_status.failed()) return outputs_status;
     std::string key;
     std::string value;
@@ -899,11 +934,19 @@ status_t strings_read(ustore_strings_read_t const& arguments, strings_arg_t cons
         ustore_collection_id_t const collection = collections ? collections[index] : ustore_collection_main_k;
         native_status_t const status = database.native->Get(
             options, string_key(collection, string_of(texts[index]), key), &value);
-        if (!status.ok() && !status.IsNotFound()) return status_of(status);
-        value_view_t const found = status.ok() ? to_value(value) : value_view_t {};
-        if (status_t const appended = append_staged(outputs, found, view.scratch); appended.failed()) return appended;
+        if (status.IsNotFound()) {
+            outputs.push_missing();
+            continue;
+        }
+        if (!status.ok()) return status_of(status);
+        if (value.size() != sizeof(ustore_key_t))
+            return {status_code_t::malformed_k, "The key a string maps onto is malformed"};
+        ustore_key_t found;
+        std::memcpy(found.uuid.bytes, value.data(), sizeof(found.uuid.bytes));
+        outputs.push_present(found);
     }
-    return outputs.finish(arguments);
+    outputs.finish(arguments);
+    return {};
 }
 
 status_t strings_scan(ustore_strings_scan_t const& arguments, strings_arg_t const& prefixes,
@@ -919,7 +962,7 @@ status_t strings_scan(ustore_strings_scan_t const& arguments, strings_arg_t cons
 
     std::size_t const count = arguments.count;
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
-    status_t const resolved = resolve_collections(database, collections, count, keying_t::strings_k);
+    status_t const resolved = resolve_collections(database, collections, count, entry_layout_t::strings_to_uuids_k);
     if (resolved.failed()) return resolved;
 
     auto [outputs, outputs_status] = strings_scan_outputs_t::make(arguments, view.scratch);

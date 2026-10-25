@@ -3,7 +3,7 @@
  *  @author Ash Vardanian
  *  @date October 16, 2026
  *  @brief Checks the docs fold of `ustore/docs/json_fold.hpp` against `ustore_docs_write` on a docs collection of the
- *      engine `--engine` names, the read-modify-write path on the in-memory engine and change records on NVMe, and
+ *      engine `--engine` names, the read-modify-write path on the in-memory engine and change deltas on NVMe, and
  *      checks that composed chains apply like the chains they replace.
  *
  *  Random streams write, upsert, update, insert, patch, merge and remove whole documents and fields of them, with
@@ -29,7 +29,7 @@
 
 #include <fmt/format.h> // `fmt::println`
 
-#include "ustore/docs/json_fold.hpp"        // `json_fold`, `json_delta_t`, `encode_deltas`
+#include "ustore/docs/json_fold.hpp"        // `json_fold_t`, `json_delta_t`, `encode_deltas`
 #include "ustore/ustore.hpp"                // `database_t`, `arena_t`, `strided_strings`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocator`
 
@@ -329,7 +329,7 @@ operation_t random_operation(random_t& random, value_writer_t& writer, typed_ups
 
 #pragma region Chains
 
-/** One delta record a collection holds: what it does and the bytes it carries. */
+/** One delta a collection holds: its kind and the bytes it carries. */
 struct pending_t {
     delta_kind_t kind = delta_kind_t::change_k;
     std::string bytes;
@@ -349,14 +349,14 @@ std::span<byte_t const> base_of(std::optional<std::string> const& base) noexcept
     return {reinterpret_cast<byte_t const*>(base->data()), base->size()};
 }
 
-/** Encodes @p deltas into one change record, counting a failure into @p failures. */
+/** Encodes @p deltas into one change delta, counting a failure into @p failures. */
 pending_t change_of(std::span<json_delta_t const> deltas, ustore_arena_t arena, std::size_t& failures) {
     auto [chain, status] = encode_deltas(deltas, arena);
     failures += expect(status.succeeded());
     return {delta_kind_t::change_k, std::string(text_of_bytes(chain))};
 }
 
-/** The record @p delta becomes, as the glue logs it: writes and removals as records of their own. */
+/** The store delta @p delta becomes, as the glue logs it: writes and removals as deltas of their own. */
 pending_t pending_of(json_delta_t const& delta, ustore_arena_t arena, std::size_t& failures) {
     if (delta.modification == delta_modification_t::write_k) return {delta_kind_t::write_k, std::string(delta.value)};
     if (delta.modification == delta_modification_t::remove_k) return {delta_kind_t::remove_k, {}};
@@ -433,7 +433,7 @@ std::size_t json_fold_codec() {
         for_each_delta(bytes_of_text(unknown), [](json_delta_t const&) noexcept { return status_t {}; }),
         status_code_t::malformed_k);
 
-    json_fold const fold;
+    json_fold_t const fold;
     auto const closes_chain = [&](json_delta_t const& delta) {
         auto [encoded, encoded_status] = encode_deltas(std::span<json_delta_t const>(&delta, 1), arena);
         return encoded_status.succeeded() && fold.closes({delta_kind_t::change_k, encoded});
@@ -462,7 +462,7 @@ composed_t compose_and_apply(std::optional<std::string> const& base, std::span<j
     auto [arena, arena_status] = arena_t::make();
     result.failures += expect(arena_status.succeeded());
     arena_allocator<byte_t> allocator {arena};
-    json_fold const fold;
+    json_fold_t const fold;
     std::vector<pending_t> pending;
     for (json_delta_t const& delta : deltas) pending.push_back(pending_of(delta, arena, result.failures));
     std::vector<delta_view_t> const views = views_of(pending);
@@ -569,7 +569,7 @@ std::size_t json_fold_reference(config_t const& config, std::uint64_t seed) {
     constexpr std::size_t streams_k = 60, steps_k = 160;
     random_t random {seed};
     value_writer_t writer {random};
-    json_fold const fold;
+    json_fold_t const fold;
     std::size_t checked = 0, refused = 0, compositions = 0, records_before = 0, records_after = 0;
     std::map<status_code_t, std::size_t> refusals;
     auto [database, open_status] = open_database<database_t>(config);
@@ -682,7 +682,7 @@ std::size_t json_fold_compose(std::uint64_t seed) {
     std::size_t failures = 0;
     random_t random {seed ^ 0x5eed};
     value_writer_t writer {random};
-    json_fold const fold;
+    json_fold_t const fold;
     constexpr std::string_view few_fields_k[] = {"", "a", "/a", "/a/b", "/a/c", "/b", "/a/0", "/a/1", "/c/a"};
     std::size_t records_before = 0, records_after = 0, failing = 0, rounds = 0;
 
@@ -777,9 +777,9 @@ std::size_t json_fold_compose(std::uint64_t seed) {
         if (split == 0 || split == views.size()) continue;
         auto [prefix, prefix_status] = fold.compose(std::span<delta_view_t const>(views.data(), split), allocator);
         failures += expect(prefix_status.succeeded());
-        std::vector<delta_view_t> staged {{delta_kind_t::change_k, prefix}};
-        staged.insert(staged.end(), views.begin() + std::ptrdiff_t(split), views.end());
-        auto [again, again_status] = fold.compose(staged, allocator);
+        std::vector<delta_view_t> resumed {{delta_kind_t::change_k, prefix}};
+        resumed.insert(resumed.end(), views.begin() + std::ptrdiff_t(split), views.end());
+        auto [again, again_status] = fold.compose(resumed, allocator);
         failures += expect(again_status.succeeded());
         delta_view_t const recomposed {delta_kind_t::change_k, again};
         failures += expect_outcome(
@@ -809,7 +809,7 @@ std::size_t json_fold_own_changes(config_t const& config) {
     std::size_t failures = 0;
     auto [database, open_status] = open_database<database_t>(config);
     failures += expect(open_status.succeeded());
-    if (failures) return failures;
+    if (failures || !database.supports_transactions()) return failures;
     auto [collection, create_status] = create_docs_collection(database, "own");
     failures += expect(create_status.succeeded());
     if (failures) return failures;
@@ -839,16 +839,16 @@ std::size_t json_fold_own_changes(config_t const& config) {
 
 /** Opens the NVMe engine over @p directory, every collection flushing past 64 KiB, every level twice the one above. */
 expected<database_t> open_small_nvme(char const* directory) noexcept {
-    constexpr std::size_t write_buffer_bytes_k = 64 * 1024;
+    constexpr std::size_t memory_runs_bytes_k = 64 * 1024;
     ustore_database_t database = nullptr;
     ustore_outcome_t outcome {};
     ustore_database_open_nvme_t open {};
     open.database = &database;
     open.outcome = &outcome;
     open.directory = {reinterpret_cast<ustore_byte_t const*>(directory), std::strlen(directory)};
-    open.collection_write_buffer_max_bytes = write_buffer_bytes_k;
-    open.collection_value_max_size = write_buffer_bytes_k / 4;
-    open.transaction_max_bytes = write_buffer_bytes_k / 2;
+    open.collection_memory_runs_max_bytes = memory_runs_bytes_k;
+    open.collection_value_max_size = memory_runs_bytes_k / 4;
+    open.transaction_max_bytes = memory_runs_bytes_k / 2;
     open.collection_level_enlarge_factor = 2;
     ustore_database_open_nvme(&open);
     if (status_t const status {outcome}; status.failed()) return status;
@@ -856,7 +856,7 @@ expected<database_t> open_small_nvme(char const* directory) noexcept {
 }
 
 /** Random modifications of a few documents on NVMe, flushed every hundred calls into small levels that merge often,
- *  agree with the in-memory engine call by call, and read the same as the change records reach flushed runs, after a
+ *  agree with the in-memory engine call by call, and read the same as the change deltas reach flushed runs, after a
  *  compaction folds them to the bottom, and after a reopen. */
 case_result_t json_fold_maintenance(config_t const& config, std::uint64_t seed) {
     if (config.engine() != "nvme" || !config.directory())

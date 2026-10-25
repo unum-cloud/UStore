@@ -23,7 +23,7 @@
 
 #include <fmt/format.h> // `fmt::println`
 
-#include "ustore/utilities/algorithm.hpp" // `compare_128`, `sorted_128_cursor`, `intersect_sorted_128`
+#include "ustore/utilities/algorithm.hpp" // `compare_128`, `sorted_128_cursor_t`, `intersect_sorted_128`
 
 namespace unum::ustore::test {
 
@@ -107,14 +107,14 @@ std::size_t cursor_seeks() {
     for (std::size_t round = 0; round != 500; ++round) {
         std::vector<ustore_key_t> const keys = random_sorted(generator, generator() % 200);
         std::vector<ustore_key_t> const unique = distinct(keys);
-        sorted_128_cursor walk(keys);
+        sorted_128_cursor_t walk(keys);
         for (ustore_key_t const& key : unique) {
             failures += check(walk.valid() && key_equal(walk.key(), key));
             failures += check(walk.next().succeeded());
         }
         failures += check(!walk.valid());
 
-        sorted_128_cursor seeker(keys);
+        sorted_128_cursor_t seeker(keys);
         std::size_t lowest = 0;
         for (std::size_t probe = 0; probe != 40; ++probe) {
             ustore_key_t const wanted = random_key(generator);
@@ -151,7 +151,7 @@ std::size_t intersections_match() {
         for (std::size_t index = 0; index != std::min(count, wanted.size()); ++index)
             failures += check(key_equal(output[index], wanted[index]));
 
-        sorted_128_cursor first_cursor(first), second_cursor(second);
+        sorted_128_cursor_t first_cursor(first), second_cursor(second);
         std::size_t seen = 0;
         status_t const status = intersect_sorted_128(first_cursor, second_cursor, [&](ustore_key_t const& key) {
             if (seen < wanted.size()) failures += check(key_equal(key, wanted[seen]));
@@ -163,7 +163,7 @@ std::size_t intersections_match() {
 
     // A failure from the callback stops the walk and comes back
     std::vector<ustore_key_t> const shared = distinct(random_sorted(generator, 100));
-    sorted_128_cursor first_cursor(shared), second_cursor(shared);
+    sorted_128_cursor_t first_cursor(shared), second_cursor(shared);
     std::size_t calls = 0;
     status_t const stopped = intersect_sorted_128(first_cursor, second_cursor, [&](ustore_key_t const&) {
         return ++calls == 3 ? status_t {status_code_t::invalid_argument_k, "stop"} : status_t {};

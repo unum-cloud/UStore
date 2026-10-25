@@ -15,10 +15,10 @@
 #include <string_view> // `std::string_view`
 #include <utility>     // `std::move`, `std::swap`, `std::exchange`
 
-#include "ustore/ranges.hpp" // `strings_of`, `range`, `values_view_t`, `values_tape_t`
+#include "ustore/ranges.hpp" // `strings_of`, `range`, `keys_view_t`, `bits_view_t`, `values_tape_t`
 #include "ustore/status.hpp" // `status_t`, `expected`, `deferred`
 #include "ustore/strings.h"
-#include "ustore/types.hpp" // `arena_t`, `one_off_t`, `in_one_off_arena`, `receiver_t`, `value_view_t`
+#include "ustore/types.hpp" // `arena_t`, `receiver_t`, `value_view_t`
 
 namespace unum::ustore {
 
@@ -234,8 +234,8 @@ class strings_stream_t {
 #pragma region Collections
 
 /**
- *  @brief A handle to one collection of arbitrary bytes keyed by variable-length strings that only reads, cheap to
- *      construct and to copy.
+ *  @brief A handle to one collection mapping variable-length strings onto keys that only reads, cheap to construct and
+ *      to copy.
  *
  *  It addresses either the latest state or the view of a transaction or snapshot, holds no state of its own, so any
  *  number of threads share it, and never outlives its database. Strings carry explicit lengths, so a zero byte inside
@@ -265,14 +265,15 @@ class strings_read_collection_t {
     operator ustore_collection_id_t() const noexcept { return collection_; }
     ustore_collection_id_t* member_ptr() noexcept { return &collection_; }
 
-    /** Reads the values of a batch of strings into @p arena. */
-    expected<values_view_t> read(std::span<value_view_t const> texts, arena_t& arena,
-                                 ustore_watch_t watch = ustore_watch_keys_k) noexcept {
-        if (texts.empty()) return values_view_t {};
+    /** Reads the keys a batch of strings map onto into @p arena, where a missing string reads as the nil UUID, and
+     *  marks the present strings in @p presences when asked. */
+    expected<keys_view_t> read(std::span<value_view_t const> texts, arena_t& arena,
+                               ustore_watch_t watch = ustore_watch_keys_k, bits_view_t* presences = nullptr) noexcept {
+        if (texts.empty()) return keys_view_t {};
 
         strided_strings<value_view_t> const strings {strided(texts).begin()};
-        ustore_octet_t const* presences = nullptr;
-        ustore_strings_view_t values {};
+        ustore_octet_t const* found_presences = nullptr;
+        ustore_key_t const* keys = nullptr;
         ustore_outcome_t outcome {};
         ustore_strings_read_t read {};
         read.database = receiver_.database;
@@ -282,30 +283,33 @@ class strings_read_collection_t {
         read.count = texts.size();
         read.collections = {&collection_, 0};
         read.strings = strings.view();
-        read.presences = &presences;
-        read.values = &values;
+        read.presences = presences ? &found_presences : nullptr;
+        read.values = &keys;
         read.arena = arena;
 
         ustore_strings_read(&read);
         if (status_t const status {outcome}; status.failed()) return status;
-        return values_view_t {texts.size(), presences, values};
+        if (presences) *presences = bits_view_t {found_presences};
+        return keys_view_t {{keys, sizeof(ustore_key_t)}, texts.size()};
     }
 
-    /** Reads the value of one string into a one-off arena, which the answer owns, as a missing view when the
-     *  collection lacks the string. */
-    expected<owned_value_t> value(value_view_t text, ustore_watch_t watch = ustore_watch_keys_k) noexcept {
-        return in_one_off_arena(receiver_.executor, [&](arena_t& arena) noexcept -> expected<value_view_t> {
-            auto [found, read_status] = read({&text, 1}, arena, watch);
-            if (read_status.failed()) return read_status;
-            return found[0];
-        });
+    /** Reads the key @p text maps onto through a one-off arena, the nil UUID when the collection lacks the string. */
+    expected<ustore_key_t> value(value_view_t text, ustore_watch_t watch = ustore_watch_keys_k) noexcept {
+        auto [arena, arena_status] = arena_t::make(receiver_.executor);
+        if (arena_status.failed()) return arena_status;
+        auto [keys, read_status] = read({&text, 1}, arena, watch);
+        if (read_status.failed()) return read_status;
+        return keys[0];
     }
 
     /** Checks whether the collection holds @p text through a one-off arena. */
     expected<bool> present(value_view_t text, ustore_watch_t watch = ustore_watch_keys_k) noexcept {
-        auto [found, value_status] = value(text, watch);
-        if (value_status.failed()) return value_status;
-        return static_cast<bool>(found.view());
+        auto [arena, arena_status] = arena_t::make(receiver_.executor);
+        if (arena_status.failed()) return arena_status;
+        bits_view_t presences;
+        expected<keys_view_t> const found = read({&text, 1}, arena, watch, &presences);
+        if (found.failed()) return found.status();
+        return presences && presences[0];
     }
 
     /**
@@ -346,8 +350,8 @@ class strings_read_collection_t {
     }
 };
 
-/** A handle to one collection of arbitrary bytes keyed by variable-length strings, cheap to construct, which reads and
- *  writes the head or the view of a transaction. */
+/** A handle to one collection mapping variable-length strings onto keys, cheap to construct, which reads and writes the
+ *  head or the view of a transaction. */
 class strings_collection_t : public strings_read_collection_t {
 
     status_t drop_with_(ustore_drop_mode_t mode) noexcept {
@@ -368,21 +372,20 @@ class strings_collection_t : public strings_read_collection_t {
     /** The twin a deferred receiver hands out, whose verbs answer deferred calls. */
     using deferred_t = deferred_strings_collection_t;
 
-    /** Upserts the value of one string. */
-    status_t assign(value_view_t text, value_view_t content,
+    /** Upserts the key one string maps onto. */
+    status_t assign(value_view_t text, ustore_key_t key,
                     ustore_durability_t durability = ustore_durability_buffered_k) noexcept {
-        return assign({&text, 1}, {&content, 1}, durability);
+        return assign({&text, 1}, {&key, 1}, durability);
     }
 
-    /** Upserts the values of a batch of strings. */
-    status_t assign(std::span<value_view_t const> texts, std::span<value_view_t const> contents,
+    /** Upserts the keys a batch of strings map onto, one per string. */
+    status_t assign(std::span<value_view_t const> texts, std::span<ustore_key_t const> keys,
                     ustore_durability_t durability = ustore_durability_buffered_k) noexcept {
-        if (texts.size() != contents.size())
-            return status_t {status_code_t::invalid_argument_k, "Every string of a batch needs its own value"};
+        if (texts.size() != keys.size())
+            return status_t {status_code_t::invalid_argument_k, "Every string of a batch needs its own key"};
         if (texts.empty()) return {};
 
         strided_strings<value_view_t> const strings {strided(texts).begin()};
-        strided_strings<value_view_t> const values {strided(contents).begin()};
         ustore_outcome_t outcome {};
         ustore_strings_write_t write {};
         write.database = receiver_.database;
@@ -392,7 +395,7 @@ class strings_collection_t : public strings_read_collection_t {
         write.count = texts.size();
         write.collections = {&collection_, 0};
         write.strings = strings.view();
-        write.values = values.view();
+        write.values = {keys.data(), sizeof(ustore_key_t)};
         write.durability = durability;
 
         ustore_strings_write(&write);
@@ -435,26 +438,25 @@ class strings_collection_t : public strings_read_collection_t {
 #pragma region Deferred Verbs
 
 /** What a deferred @c ustore_strings_read keeps beside its strings: the collection the arguments point to, and the
- *  outputs the call writes into the arena it borrows. */
+ *  keys the call writes into the arena it borrows. */
 struct strings_read_t {
     using arguments_t = ustore_strings_read_t;
-    using answer_t = expected<values_view_t>;
+    using answer_t = expected<keys_view_t>;
 
     /** Collection every string lives in. */
     ustore_collection_id_t collection {};
 
-    /** Number of strings, the length of every output. */
+    /** Number of strings, the length of the output. */
     ustore_size_t count = 0;
 
-    /** Outputs for the presences and the tape of values, inside the arena. */
-    ustore_octet_t const* presences = nullptr;
-    ustore_strings_view_t values {};
+    /** Output for the key of every string inside the arena, where a missing string reads as the nil UUID. */
+    ustore_key_t const* keys = nullptr;
 
     static void submit(arguments_t& arguments) noexcept { ustore_strings_read(&arguments); }
-    answer_t finish() && noexcept { return values_view_t {count, presences, values}; }
+    answer_t finish() && noexcept { return keys_view_t {{keys, sizeof(ustore_key_t)}, count}; }
 };
 
-/** What a deferred @c ustore_strings_write keeps beside its strings and values: the collection. */
+/** What a deferred @c ustore_strings_write keeps beside its strings and keys: the collection. */
 struct strings_write_t {
     using arguments_t = ustore_strings_write_t;
     using answer_t = status_t;
@@ -534,9 +536,9 @@ class deferred_strings_read_collection_t {
     operator ustore_collection_id_t() const noexcept { return collection_; }
 
     /**
-     *  @brief Reads the values of @p texts into @p arena.
+     *  @brief Reads the keys @p texts map onto into @p arena, where a missing string reads as the nil UUID.
      *  @param[in] texts Strings to read, owned by the call until it is final.
-     *  @param[in] arena Memory the values land in, borrowed until the call is final, which the answer views.
+     *  @param[in] arena Memory the keys land in, borrowed until the call is final, which the answer views.
      *  @param[in] watch Whether a read inside a transaction records the strings for conflicts.
      */
     deferred<strings_read_t> read(values_tape_t texts, arena_t& arena,
@@ -551,8 +553,7 @@ class deferred_strings_read_collection_t {
                 arguments.count = owned.size();
                 arguments.collections = {&verb.collection, 0};
                 arguments.strings = tape_of(owned);
-                arguments.presences = &verb.presences;
-                arguments.values = &verb.values;
+                arguments.values = &verb.keys;
                 arguments.arena = arena;
                 return status_t {};
             },
@@ -602,18 +603,19 @@ class deferred_strings_collection_t : public deferred_strings_read_collection_t 
     using deferred_strings_read_collection_t::deferred_strings_read_collection_t;
 
     /**
-     *  @brief Upserts the values of @p contents into the strings of @p texts pairwise.
+     *  @brief Upserts the keys of @p keys onto the strings of @p texts pairwise.
      *  @param[in] texts Strings to write, owned by the call until it is final.
-     *  @param[in] contents One value per string, owned by the call until it is final.
+     *  @param[in] keys One key per string, owned by the call until it is final.
      *  @param[in] durability Whether the call finishes only after the data reaches the disk.
      */
-    deferred<strings_write_t> write(values_tape_t texts, values_tape_t contents,
+    template <owned_array_concept<ustore_key_t> keys_type_>
+    deferred<strings_write_t> write(values_tape_t texts, keys_type_ keys,
                                     ustore_durability_t durability = ustore_durability_buffered_k) const noexcept {
         return deferred<strings_write_t>::submit(
             [&](strings_write_t& verb, ustore_strings_write_t& arguments, values_tape_t const& owned_texts,
-                values_tape_t const& owned_contents) noexcept {
-                if (owned_texts.size() != owned_contents.size())
-                    return status_t {status_code_t::invalid_argument_k, "Every string of a write needs its own value"};
+                keys_type_ const& owned_keys) noexcept {
+                if (owned_texts.size() != owned_keys.size())
+                    return status_t {status_code_t::invalid_argument_k, "Every string of a write needs its own key"};
                 verb.collection = collection_;
                 arguments.database = receiver_.database;
                 arguments.executor = receiver_.executor;
@@ -621,15 +623,15 @@ class deferred_strings_collection_t : public deferred_strings_read_collection_t 
                 arguments.count = owned_texts.size();
                 arguments.collections = {&verb.collection, 0};
                 arguments.strings = tape_of(owned_texts);
-                arguments.values = tape_of(owned_contents);
+                arguments.values = {owned_keys.data(), sizeof(ustore_key_t)};
                 arguments.durability = durability;
                 return status_t {};
             },
-            std::move(texts), std::move(contents));
+            std::move(texts), std::move(keys));
     }
 
     /**
-     *  @brief Removes the strings of @p texts together with their values.
+     *  @brief Removes the strings of @p texts together with their keys.
      *  @param[in] texts Strings to remove, owned by the call until it is final.
      *  @param[in] durability Whether the call finishes only after the data reaches the disk.
      */

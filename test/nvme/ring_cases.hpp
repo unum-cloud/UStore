@@ -116,7 +116,7 @@ std::size_t ring_reads_back_what_it_wrote(disk_type_& disk, medium_reference_t m
     failures += expect(submitted == blocks_k);
 
     std::array<completion_t, polling_room_k> completions {};
-    expected<std::size_t> const written = poll_completions_at_least<waiting_policy_t>(
+    expected<std::size_t> const written = poll_completions_at_least<waiter_t>(
         disk, queue_pair, std::span<completion_t> {completions}, blocks_k);
     failures += expect(written == blocks_k);
     for (std::size_t index = 0; index != blocks_k; ++index) {
@@ -131,7 +131,7 @@ std::size_t ring_reads_back_what_it_wrote(disk_type_& disk, medium_reference_t m
                                     queue_pair.token(static_cast<std::uint32_t>(blocks_k + index)));
     expected<std::size_t> const asked = disk.submit(queue_pair, std::span<request_t const> {reads});
     failures += expect(asked == blocks_k);
-    expected<std::size_t> const read = poll_completions_at_least<waiting_policy_t>(
+    expected<std::size_t> const read = poll_completions_at_least<waiter_t>(
         disk, queue_pair, std::span<completion_t> {completions}, blocks_k);
     failures += expect(read == blocks_k);
     for (std::size_t index = 0; index != blocks_k; ++index) failures += expect(completions[index].completed_in_full());
@@ -179,7 +179,7 @@ std::size_t ring_reaches_depth_beyond_its_credit(disk_type_& disk, medium_refere
         }
         expected<std::size_t> const submitted = disk.submit(queue_pair, std::span<request_t const> {batch});
         failures += expect(submitted == queue_pair_depth_k);
-        expected<std::size_t> const completed = poll_completions_at_least<waiting_policy_t>(
+        expected<std::size_t> const completed = poll_completions_at_least<waiter_t>(
             disk, queue_pair, std::span<completion_t> {completions}, queue_pair_depth_k);
         failures += expect(completed == queue_pair_depth_k);
         for (std::size_t index = 0; index != queue_pair_depth_k; ++index)
@@ -228,7 +228,7 @@ std::size_t ring_refuses_when_full(disk_type_& disk, medium_reference_t medium) 
     failures += expect_eq(disk.outstanding(queue_pair), std::size_t {queue_pair_depth_k});
 
     std::array<completion_t, polling_room_k> completions {};
-    expected<std::size_t> const completed = poll_completions_at_least<waiting_policy_t>(
+    expected<std::size_t> const completed = poll_completions_at_least<waiter_t>(
         disk, queue_pair, std::span<completion_t> {completions}, queue_pair_depth_k);
     failures += expect(completed == std::size_t {queue_pair_depth_k});
     expected<std::size_t> const third = disk.submit(queue_pair, std::span<request_t const> {batch}.first(1));
@@ -273,7 +273,7 @@ std::size_t ring_reports_a_partial_transfer(disk_type_& disk, medium_reference_t
     failures += expect(submitted == std::size_t {1});
 
     std::array<completion_t, polling_room_k> completions {};
-    expected<std::size_t> const completed = poll_completions_at_least<waiting_policy_t>(
+    expected<std::size_t> const completed = poll_completions_at_least<waiter_t>(
         disk, queue_pair, std::span<completion_t> {completions}, 1);
     failures += expect(completed == std::size_t {1});
     failures += expect(!completions[0].completed_in_full());
@@ -324,7 +324,7 @@ std::size_t ring_refuses_a_torn_read(disk_type_& disk, medium_reference_t medium
     failures += expect(submitted == std::size_t {1});
 
     std::array<completion_t, polling_room_k> completions {};
-    expected<std::size_t> const completed = poll_completions_at_least<waiting_policy_t>(
+    expected<std::size_t> const completed = poll_completions_at_least<waiter_t>(
         disk, queue_pair, std::span<completion_t> {completions}, 1);
     failures += expect(completed == std::size_t {1});
     failures += expect(!completions[0].completed_in_full());
@@ -446,7 +446,7 @@ case_result_t ring_separates_two_queue_pairs(disk_type_& disk, medium_reference_
                        std::size_t {queue_pair_depth_k - 4});
 
     std::array<completion_t, polling_room_k> completions {};
-    expected<std::size_t> const first_reaped = poll_completions_at_least<waiting_policy_t>(
+    expected<std::size_t> const first_reaped = poll_completions_at_least<waiter_t>(
         disk, first, std::span<completion_t> {completions}, queue_pair_depth_k);
     failures += expect(first_reaped == std::size_t {queue_pair_depth_k});
     for (std::size_t index = 0; index != queue_pair_depth_k; ++index) {
@@ -454,7 +454,7 @@ case_result_t ring_separates_two_queue_pairs(disk_type_& disk, medium_reference_
         failures += expect(completions[index].token.tag() < 100u);
     }
 
-    expected<std::size_t> const second_reaped = poll_completions_at_least<waiting_policy_t>(
+    expected<std::size_t> const second_reaped = poll_completions_at_least<waiter_t>(
         disk, second, std::span<completion_t> {completions}, 4);
     failures += expect(second_reaped == std::size_t {4});
     for (std::size_t index = 0; index != 4; ++index) {
@@ -534,8 +534,8 @@ std::size_t ring_holds_a_registered_memory_in_flight(disk_type_& disk, medium_re
     failures += expect(registered_memory.held());
 
     std::array<completion_t, polling_room_k> completions {};
-    failures += expect(poll_completions_at_least<waiting_policy_t>(
-                           disk, queue_pair, std::span<completion_t> {completions}, 1) == std::size_t {1});
+    failures += expect(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions},
+                                                           1) == std::size_t {1});
     failures += expect(disk.unregister_memory(registered_memory).succeeded());
     failures += expect(!registered_memory.held());
     failures += expect(disk.release_queue_pair(queue_pair).succeeded());
@@ -575,8 +575,8 @@ std::size_t ring_cuts_a_chain(disk_type_& disk, medium_reference_t medium) {
 
     failures += expect(disk.submit(queue_pair, std::span<request_t const> {chain}) == std::size_t {3});
     std::array<completion_t, polling_room_k> completions {};
-    failures += expect(poll_completions_at_least<waiting_policy_t>(
-                           disk, queue_pair, std::span<completion_t> {completions}, 3) == std::size_t {3});
+    failures += expect(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions},
+                                                           3) == std::size_t {3});
     failures += expect(completions[0].completed_in_full());
     failures += expect(!completions[1].completed_in_full());
     failures += expect(completions[2].state == completion_state_t::cancelled_k);
@@ -613,14 +613,14 @@ std::size_t ring_flushes_what_it_reaped(disk_type_& disk, medium_reference_t med
         write_request(medium, extent_t {0, block_bytes_k}, registered_memory.reference(0), queue_pair.token(0))};
     failures += expect(disk.submit(queue_pair, std::span<request_t const> {writes}) == std::size_t {1});
     std::array<completion_t, polling_room_k> completions {};
-    failures += expect(poll_completions_at_least<waiting_policy_t>(
-                           disk, queue_pair, std::span<completion_t> {completions}, 1) == std::size_t {1});
+    failures += expect(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions},
+                                                           1) == std::size_t {1});
     failures += expect(completions[0].completed_in_full());
 
     std::array<request_t, 1> flushes {flush_request(medium, queue_pair.token(1))};
     failures += expect(disk.submit(queue_pair, std::span<request_t const> {flushes}) == std::size_t {1});
-    failures += expect(poll_completions_at_least<waiting_policy_t>(
-                           disk, queue_pair, std::span<completion_t> {completions}, 1) == std::size_t {1});
+    failures += expect(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions},
+                                                           1) == std::size_t {1});
     failures += expect(completions[0].completed_in_full());
     failures += expect_eq(completions[0].token.tag(), std::uint32_t {1});
 
@@ -663,8 +663,8 @@ std::size_t ring_fails_a_misaligned_request(disk_type_& disk, medium_reference_t
     failures += expect(disk.submit(queue_pair, std::span<request_t const> {batch}) == std::size_t {3});
 
     std::array<completion_t, polling_room_k> completions {};
-    failures += expect(poll_completions_at_least<waiting_policy_t>(
-                           disk, queue_pair, std::span<completion_t> {completions}, 3) == std::size_t {3});
+    failures += expect(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions},
+                                                           3) == std::size_t {3});
     failures += expect(completions[0].state == completion_state_t::failed_k);
     failures += expect_status(completions[0].status, status_code_t::invalid_argument_k);
     failures += expect(completions[1].state == completion_state_t::failed_k);
@@ -804,8 +804,8 @@ std::size_t ring_holds_a_medium_in_flight(disk_type_& disk, medium_options_t con
     failures += expect(registered_medium.held());
 
     std::array<completion_t, polling_room_k> completions {};
-    failures += expect(poll_completions_at_least<waiting_policy_t>(
-                           disk, queue_pair, std::span<completion_t> {completions}, 1) == std::size_t {1});
+    failures += expect(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions},
+                                                           1) == std::size_t {1});
     failures += expect(disk.unregister_memory(registered_memory).succeeded());
     failures += expect(disk.release_queue_pair(queue_pair).succeeded());
     failures += expect(disk.unregister_medium(registered_medium).succeeded());
@@ -824,8 +824,8 @@ std::size_t ring_refuses_an_oversized_wait(disk_type_& disk, [[maybe_unused]] me
     queue_pair_t queue_pair = std::move(*leased);
 
     std::array<completion_t, 2> room {};
-    expected<std::size_t> const wanted = poll_completions_at_least<waiting_policy_t>(
-        disk, queue_pair, std::span<completion_t> {room}, 3, 1);
+    expected<std::size_t> const wanted = poll_completions_at_least<waiter_t>(disk, queue_pair,
+                                                                             std::span<completion_t> {room}, 3, 1);
     failures += expect(!wanted.has_value());
     failures += expect_status(wanted, status_code_t::invalid_argument_k);
 
@@ -862,7 +862,7 @@ std::size_t ring_moves_a_queue_pair_between_threads(disk_type_& disk, medium_ref
             read_request(medium, extent_t {0, block_bytes_k}, registered_memory.reference(0), queue_pair.token(0))};
         moved_failures += expect(disk.submit(queue_pair, std::span<request_t const> {batch}) == std::size_t {1});
         std::array<completion_t, polling_room_k> completions {};
-        moved_failures += expect(poll_completions_at_least<waiting_policy_t>(
+        moved_failures += expect(poll_completions_at_least<waiter_t>(
                                      disk, queue_pair, std::span<completion_t> {completions}, 1) == std::size_t {1});
         moved_failures += expect(completions[0].completed_in_full());
     }};
@@ -910,12 +910,12 @@ std::size_t ring_keeps_what_it_flushed(disk_type_& disk, medium_options_t const&
         std::array<request_t, 1> writes {write_request(registered_medium.reference(), extent_t {0, block_bytes_k},
                                                        registered_memory.reference(0), queue_pair.token(0))};
         failures += expect(disk.submit(queue_pair, std::span<request_t const> {writes}) == std::size_t {1});
-        failures += expect(poll_completions_at_least<waiting_policy_t>(
-                               disk, queue_pair, std::span<completion_t> {completions}, 1) == std::size_t {1});
+        failures += expect(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions},
+                                                               1) == std::size_t {1});
         std::array<request_t, 1> flushes {flush_request(registered_medium.reference(), queue_pair.token(1))};
         failures += expect(disk.submit(queue_pair, std::span<request_t const> {flushes}) == std::size_t {1});
-        failures += expect(poll_completions_at_least<waiting_policy_t>(
-                               disk, queue_pair, std::span<completion_t> {completions}, 1) == std::size_t {1});
+        failures += expect(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions},
+                                                               1) == std::size_t {1});
         failures += expect(disk.unregister_medium(registered_medium).succeeded());
     }
 
@@ -928,8 +928,8 @@ std::size_t ring_keeps_what_it_flushed(disk_type_& disk, medium_options_t const&
         std::array<request_t, 1> reads {read_request(registered_medium.reference(), extent_t {0, block_bytes_k},
                                                      registered_memory.reference(block_bytes_k), queue_pair.token(2))};
         failures += expect(disk.submit(queue_pair, std::span<request_t const> {reads}) == std::size_t {1});
-        failures += expect(poll_completions_at_least<waiting_policy_t>(
-                               disk, queue_pair, std::span<completion_t> {completions}, 1) == std::size_t {1});
+        failures += expect(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions},
+                                                               1) == std::size_t {1});
         failures += expect(completions[0].completed_in_full());
         failures += expect(
             same_bytes(whole(buffer).first(block_bytes_k), whole(buffer).subspan(block_bytes_k, block_bytes_k)));

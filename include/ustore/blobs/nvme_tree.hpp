@@ -7,10 +7,10 @@
  *
  *  Configurations and on-disk schemas are kept as JSON through yyjson and validated against @c storage_limits_t.
  *
- *  Level zero takes one run per flushed write buffer, so its runs overlap and only their age tells which
+ *  Level zero takes one run per flush of the memory runs, so its runs overlap and only their age tells which
  *  version of a key is current: a lookup walks them newest first and a scan merges them by smallest key.
  *  Every deeper level is written by a merge, so its runs are disjoint and ascending and a lookup is a
- *  binary search over their bounds. Both shapes carry tombstones; only the bottom level may forget one,
+ *  binary search over their bounds. Both shapes carry remove deltas; only the bottom level may forget one,
  *  which is a property of the merge that writes it rather than of the level that holds it.
  *
  *  A level holds its runs through pointers that never move, so the level set a compaction publishes can
@@ -54,7 +54,7 @@
 
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
-#include "ustore/blobs/nvme_compaction.hpp"   // `cpu_compactor_t`, `compaction_output`, `compaction_kind_t`
+#include "ustore/blobs/nvme_compaction.hpp"   // `host_compactor_t`, `compaction_output`, `compaction_kind_t`
 #include "ustore/blobs/nvme_key_slot.hpp"     // `storage_limits_t`, `stored_value_size_t`, `value_layout_t`
 #include "ustore/blobs/nvme_sorted_run.hpp"   // `lsm_sorted_run`, `sorted_run_header_t`, `sorted_run_layout`
 #include "ustore/utilities/nvme_channels.hpp" // `io_channel_t`, `io_channel_config_t`, `basic_read_pipeline`
@@ -123,8 +123,8 @@ inline constexpr char const format_version_k[] = "1.0";
 struct user_collection_config_t {
     std::size_t concurrency_limit = 32;
     std::size_t cache_limit = 100 * 1024 * 1024ull;
-    std::size_t write_buffer_max_elements = 100'000;
-    std::size_t write_buffer_max_bytes = 100 * 1024 * 1024ull;
+    std::size_t memory_runs_max_deltas = 100'000;
+    std::size_t memory_runs_max_bytes = 100 * 1024 * 1024ull;
     std::size_t level_enlarge_factor = 4;
     stored_value_size_t value_size = 0;
     stored_value_size_t value_max_size = 4 * 1024;
@@ -152,14 +152,14 @@ struct collection_config_t {
     lsm_tree_config_t lsm_tree;
     std::size_t concurrency_limit = 0;
     std::size_t cache_limit = 0;
-    std::size_t write_buffer_max_bytes = 0;
-    std::size_t write_buffer_max_elements = 0;
+    std::size_t memory_runs_max_bytes = 0;
+    std::size_t memory_runs_max_deltas = 0;
 };
 
-/** Write buffer limits of one transaction, which the @c transaction_max_* fields of the NVMe init call set. */
+/** Delta limits of one transaction, which the @c transaction_max_* fields of the NVMe init call set. */
 struct transaction_config_t {
-    std::size_t write_buffer_max_bytes = 0;
-    std::size_t write_buffer_max_elements = 0;
+    std::size_t max_bytes = 0;
+    std::size_t max_deltas = 0;
 };
 
 /** Configuration of one single-collection database: a collection with transactions of its own. */
@@ -184,8 +184,8 @@ inline collection_config_t create_collection_config(user_collection_config_t con
     collection_config_t config;
     config.concurrency_limit = user_config.concurrency_limit;
     config.cache_limit = user_config.cache_limit;
-    config.write_buffer_max_bytes = user_config.write_buffer_max_bytes;
-    config.write_buffer_max_elements = user_config.write_buffer_max_elements;
+    config.memory_runs_max_bytes = user_config.memory_runs_max_bytes;
+    config.memory_runs_max_deltas = user_config.memory_runs_max_deltas;
     config.lsm_tree.level_enlarge_factor = user_config.level_enlarge_factor;
     config.lsm_tree.lsm_level_0.sorted_run.value_size = user_config.value_size;
     config.lsm_tree.lsm_level_0.sorted_run.value_max_size = user_config.value_max_size;
@@ -239,7 +239,7 @@ struct collection_schema_t {
     lsm_tree_schema_t lsm_tree;
 };
 
-/** The files a snapshot of one collection shares with its source. */
+/** The files a saved snapshot of one collection shares with its source; saved snapshots are not yet written. */
 struct collection_snapshot_schema_t {
     lsm_tree_schema_t lsm_tree;
     collection_id_t source_id;
@@ -250,7 +250,7 @@ struct single_collection_database_schema_t {
     static constexpr schema_kind_t schema_kind_k = schema_kind_t::database_k;
     static constexpr database_kind_t database_kind_k = database_kind_t::single_collection_database_k;
 
-    /** One snapshot of the single-collection database's collection. */
+    /** One saved snapshot of the single-collection database's collection, which nothing writes yet. */
     struct snapshot_t {
         collection_snapshot_schema_t collection;
         snapshot_id_t id = invalid_snapshot_id_k;
@@ -277,10 +277,10 @@ struct database_schema_t {
         value_layout_t type = value_layout_t::unknown_k;
     };
 
-    /** One snapshot across the database's collections. */
+    /** One saved snapshot across the database's collections, which nothing writes yet. */
     struct snapshot_t {
 
-        /** One collection within the snapshot. */
+        /** One collection within the saved snapshot. */
         struct collection_t {
             collection_config_t source_config;
             string_t source_name;
@@ -458,8 +458,8 @@ inline status_t read_json_version(yyjson_val* root) noexcept {
     return read_json(yyjson_obj_get(object, "lsm_tree"), config.lsm_tree) &&
            read_json(yyjson_obj_get(object, "concurrency_limit"), config.concurrency_limit) &&
            read_json(yyjson_obj_get(object, "cache_limit"), config.cache_limit) &&
-           read_json(yyjson_obj_get(object, "write_buffer_max_bytes"), config.write_buffer_max_bytes) &&
-           read_json(yyjson_obj_get(object, "write_buffer_max_elements"), config.write_buffer_max_elements);
+           read_json(yyjson_obj_get(object, "memory_runs_max_bytes"), config.memory_runs_max_bytes) &&
+           read_json(yyjson_obj_get(object, "memory_runs_max_deltas"), config.memory_runs_max_deltas);
 }
 
 [[nodiscard]] inline bool read_json(yyjson_val* object, sorted_run_schema_t& schema) noexcept {
@@ -646,10 +646,10 @@ template <typename element_, template <typename> typename allocator_>
                          add_json_member(document, object, "concurrency_limit",
                                          write_json(document, config.concurrency_limit)) &&
                          add_json_member(document, object, "cache_limit", write_json(document, config.cache_limit)) &&
-                         add_json_member(document, object, "write_buffer_max_bytes",
-                                         write_json(document, config.write_buffer_max_bytes)) &&
-                         add_json_member(document, object, "write_buffer_max_elements",
-                                         write_json(document, config.write_buffer_max_elements));
+                         add_json_member(document, object, "memory_runs_max_bytes",
+                                         write_json(document, config.memory_runs_max_bytes)) &&
+                         add_json_member(document, object, "memory_runs_max_deltas",
+                                         write_json(document, config.memory_runs_max_deltas));
     return written ? object : nullptr;
 }
 
@@ -825,19 +825,17 @@ template <issue_sink_concept sink_>
     return true;
 }
 
-/** Checks the write buffer of one transaction against the storage limits. */
+/** Checks the delta limits of one transaction against the storage limits. */
 template <issue_sink_concept sink_>
 [[nodiscard]] bool validate(transaction_config_t const& config, sink_&& sink) noexcept {
-    if (config.write_buffer_max_elements < storage_limits_t::transaction_write_buffer_elements_min_count_k ||
-        config.write_buffer_max_elements > storage_limits_t::transaction_write_buffer_elements_max_count_k)
-        return report_issue(sink, issue_kind_t::error_k, "Transaction elements must be within [{}, {}]",
-                            storage_limits_t::transaction_write_buffer_elements_min_count_k,
-                            storage_limits_t::transaction_write_buffer_elements_max_count_k);
-    if (config.write_buffer_max_bytes < storage_limits_t::transaction_write_buffer_min_capacity_k ||
-        config.write_buffer_max_bytes > storage_limits_t::transaction_write_buffer_max_capacity_k)
+    if (config.max_deltas < storage_limits_t::transaction_min_deltas_k ||
+        config.max_deltas > storage_limits_t::transaction_max_deltas_k)
+        return report_issue(sink, issue_kind_t::error_k, "Transaction deltas must be within [{}, {}]",
+                            storage_limits_t::transaction_min_deltas_k, storage_limits_t::transaction_max_deltas_k);
+    if (config.max_bytes < storage_limits_t::transaction_min_bytes_k ||
+        config.max_bytes > storage_limits_t::transaction_max_bytes_k)
         return report_issue(sink, issue_kind_t::error_k, "Transaction bytes must be within [{}, {}]",
-                            storage_limits_t::transaction_write_buffer_min_capacity_k,
-                            storage_limits_t::transaction_write_buffer_max_capacity_k);
+                            storage_limits_t::transaction_min_bytes_k, storage_limits_t::transaction_max_bytes_k);
     return true;
 }
 
@@ -883,19 +881,18 @@ template <issue_sink_concept sink_>
             report_issue(sink, issue_kind_t::warning_k, "Value cache holds more values than it can index");
     }
 
-    if (config.concurrency_limit == 0 || config.concurrency_limit >= config.write_buffer_max_elements)
+    if (config.concurrency_limit == 0 || config.concurrency_limit >= config.memory_runs_max_deltas)
         return report_issue(sink, issue_kind_t::error_k,
-                            "Concurrency limit must be within [1, write_buffer_max_elements)");
-    if (config.write_buffer_max_elements > storage_limits_t::write_buffer_elements_max_count_k)
-        return report_issue(sink, issue_kind_t::error_k, "Write buffer elements must not exceed {}",
-                            storage_limits_t::write_buffer_elements_max_count_k);
-    if (config.write_buffer_max_bytes < storage_limits_t::write_buffer_min_capacity_k ||
-        config.write_buffer_max_bytes > storage_limits_t::write_buffer_max_capacity_k)
-        return report_issue(sink, issue_kind_t::error_k, "Write buffer bytes must be within [{}, {}]",
-                            storage_limits_t::write_buffer_min_capacity_k,
-                            storage_limits_t::write_buffer_max_capacity_k);
-    if (config.write_buffer_max_bytes < value_max_size)
-        return report_issue(sink, issue_kind_t::error_k, "Write buffer bytes cannot hold the largest value");
+                            "Concurrency limit must be within [1, memory_runs_max_deltas)");
+    if (config.memory_runs_max_deltas > storage_limits_t::memory_runs_max_deltas_k)
+        return report_issue(sink, issue_kind_t::error_k, "Memory run deltas must not exceed {}",
+                            storage_limits_t::memory_runs_max_deltas_k);
+    if (config.memory_runs_max_bytes < storage_limits_t::memory_runs_min_bytes_k ||
+        config.memory_runs_max_bytes > storage_limits_t::memory_runs_max_bytes_k)
+        return report_issue(sink, issue_kind_t::error_k, "Memory run bytes must be within [{}, {}]",
+                            storage_limits_t::memory_runs_min_bytes_k, storage_limits_t::memory_runs_max_bytes_k);
+    if (config.memory_runs_max_bytes < value_max_size)
+        return report_issue(sink, issue_kind_t::error_k, "Memory run bytes cannot hold the largest value");
     if (config.level_enlarge_factor < storage_limits_t::level_min_enlarge_factor_k ||
         config.level_enlarge_factor > storage_limits_t::level_max_enlarge_factor_k)
         return report_issue(sink, issue_kind_t::error_k, "Level enlarge factor must be within [{}, {}]",
@@ -908,7 +905,7 @@ template <issue_sink_concept sink_>
 [[nodiscard]] bool validate(resources_config_t const& resources, database_config_t const& config,
                             sink_&& sink) noexcept {
     if (!validate(resources, sink) || !validate(config.default_transaction, sink)) return false;
-    if (resources.memory_limit < config.default_transaction.write_buffer_max_bytes)
+    if (resources.memory_limit < config.default_transaction.max_bytes)
         return report_issue(sink, issue_kind_t::error_k, "Memory limit cannot hold one transaction");
     return true;
 }
@@ -918,14 +915,13 @@ template <issue_sink_concept sink_>
 [[nodiscard]] bool validate(resources_config_t const& resources, user_single_collection_database_config_t const& config,
                             sink_&& sink) noexcept {
     if (!validate(resources, sink) || !validate(config.default_transaction, sink)) return false;
-    if (config.default_transaction.write_buffer_max_elements > config.collection.write_buffer_max_elements ||
-        config.default_transaction.write_buffer_max_bytes > config.collection.write_buffer_max_bytes)
+    if (config.default_transaction.max_deltas > config.collection.memory_runs_max_deltas ||
+        config.default_transaction.max_bytes > config.collection.memory_runs_max_bytes)
         return report_issue(sink, issue_kind_t::error_k,
-                            "Transaction buffer exceeds the single-collection database's write buffer");
+                            "Transaction limits exceed the single-collection database's memory run bounds");
     if (!validate(config.collection, resolve_value_layout(config.collection.value_size), sink)) return false;
-    if (resources.memory_limit <
-        config.default_transaction.write_buffer_max_bytes + config.collection.write_buffer_max_bytes)
-        return report_issue(sink, issue_kind_t::error_k, "Memory limit cannot hold a transaction and a write buffer");
+    if (resources.memory_limit < config.default_transaction.max_bytes + config.collection.memory_runs_max_bytes)
+        return report_issue(sink, issue_kind_t::error_k, "Memory limit cannot hold a transaction and the memory runs");
     return true;
 }
 
@@ -934,8 +930,8 @@ template <issue_sink_concept sink_>
 [[nodiscard]] bool validate(resources_config_t const& resources, user_collection_config_t const& config,
                             sink_&& sink) noexcept {
     if (!validate(resources, sink) || !validate(config, resolve_value_layout(config.value_size), sink)) return false;
-    if (resources.memory_limit < config.write_buffer_max_bytes)
-        return report_issue(sink, issue_kind_t::error_k, "Memory limit cannot hold a write buffer");
+    if (resources.memory_limit < config.memory_runs_max_bytes)
+        return report_issue(sink, issue_kind_t::error_k, "Memory limit cannot hold the memory runs");
     return true;
 }
 
@@ -957,13 +953,13 @@ enum class lsm_level_order_t : std::uint8_t {
     sorted_k,
 };
 
-/** Whether anything is stored below a level, which decides whether a merge into it may drop tombstones. */
+/** Whether anything is stored below a level, which decides whether a merge into it may drop remove deltas. */
 enum class lsm_level_depth_t : std::uint8_t {
 
-    /** Levels sit below this one, so a tombstone still shadows what they hold. */
+    /** Levels sit below this one, so a remove delta still shadows what they hold. */
     intermediate_k,
 
-    /** Nothing sits below this one, so a tombstone shadows nothing and is dropped for good. */
+    /** Nothing sits below this one, so a remove delta shadows nothing and is dropped for good. */
     bottom_k,
 };
 
@@ -987,9 +983,9 @@ struct lsm_level_position_t {
  *  Every run is one heap allocation the level owns, so a successor level set copies the pointer rather
  *  than the index behind it and a reader of either set reads the same bytes.
  *
- *  @tparam waiting_policy_type_ What the core does while a run waits for its reads.
+ *  @tparam waiter_type_ What the core does while a run waits for its reads.
  */
-template <typename key_slot_type_, typename volume_type_, typename waiting_policy_type_>
+template <typename key_slot_type_, typename volume_type_, typename waiter_type_>
 class lsm_level {
   public:
 
@@ -1002,7 +998,7 @@ class lsm_level {
     using volume_t = volume_type_;
 
     /** One immutable run of this level. */
-    using sorted_run_t = lsm_sorted_run<key_slot_t, volume_t, waiting_policy_type_>;
+    using sorted_run_t = lsm_sorted_run<key_slot_t, volume_t, waiter_type_>;
 
     /** The key the runs order their key slots by. */
     using stored_key_t = typename key_slot_t::stored_key_t;
@@ -1069,7 +1065,7 @@ class lsm_level {
         return {};
     }
 
-    /** Names every run @p other names, which is how a staged level set carries an untouched level. */
+    /** Names every run @p other names, which is how a prepared level set carries an untouched level. */
     status_t carry(lsm_level const& other) noexcept {
         if (runs_.reserve(runs_.size() + other.runs_.size()) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A level could not name that many runs"};
@@ -1150,15 +1146,15 @@ class lsm_level {
     /**
      *  @brief Whether the level carries @p stored_key, and whether the key slot holding it locates a value.
      *  @param[in] stored_key The key to look for.
-     *  @param[out] position Where the key sits, which is meaningless when the answer is @c nothing_k.
+     *  @param[out] position Where the key sits, which is meaningless when the answer is @c missing_k.
      */
-    [[nodiscard]] find_result_t find(stored_key_t stored_key, lsm_level_position_t& position) const noexcept {
+    [[nodiscard]] lookup_result_t find(stored_key_t stored_key, lsm_level_position_t& position) const noexcept {
         return find(stored_key, limit<std::uint64_t>::max(), position);
     }
 
     /** As @c find, answering the newest version stamped at or below @p stamp, which a reader pinned there sees. */
-    [[nodiscard]] find_result_t find(stored_key_t stored_key, std::uint64_t stamp,
-                                     lsm_level_position_t& position) const noexcept {
+    [[nodiscard]] lookup_result_t find(stored_key_t stored_key, std::uint64_t stamp,
+                                       lsm_level_position_t& position) const noexcept {
         position = lsm_level_position_t {};
         if (order_ == lsm_level_order_t::overlapping_k) {
             for (std::size_t index = runs_.size(); index-- != 0;) {
@@ -1166,12 +1162,12 @@ class lsm_level {
                 if (run.population_count() == 0) continue;
                 if (stored_key < run.lower_stored_key() || run.upper_stored_key() < stored_key) continue;
                 std::uint64_t at = 0;
-                find_result_t const found = run.find(stored_key, stamp, at);
-                if (found == find_result_t::nothing_k) continue;
+                lookup_result_t const found = run.find(stored_key, stamp, at);
+                if (found == lookup_result_t::missing_k) continue;
                 position = lsm_level_position_t {static_cast<std::uint32_t>(index), at};
                 return found;
             }
-            return find_result_t::nothing_k;
+            return lookup_result_t::missing_k;
         }
 
         std::size_t low = 0;
@@ -1188,15 +1184,15 @@ class lsm_level {
                 continue;
             }
             std::uint64_t at = 0;
-            find_result_t const found = run.find(stored_key, stamp, at);
-            if (found != find_result_t::nothing_k)
+            lookup_result_t const found = run.find(stored_key, stamp, at);
+            if (found != lookup_result_t::missing_k)
                 position = lsm_level_position_t {static_cast<std::uint32_t>(middle), at};
             return found;
         }
-        return find_result_t::nothing_k;
+        return lookup_result_t::missing_k;
     }
 
-    /** The key slot at @p position, which must have come from a @c find that answered anything but nothing. */
+    /** The key slot at @p position, which must have come from a @c find that answered anything but missing. */
     [[nodiscard]] key_slot_t const& key_slot(lsm_level_position_t position) const noexcept {
         return runs_[position.run_index]->key_slot(position.key_slot_position);
     }
@@ -1322,10 +1318,10 @@ enum class compaction_placement_t : std::uint8_t {
 /** Which compactor a merge takes, once the placement and the size of the merge are both known. */
 enum class compactor_choice_t : std::uint8_t {
 
-    /** @c cpu_compactor_t, on the calling thread. */
+    /** @c host_compactor_t, on the calling thread. */
     host_k,
 
-    /** @c gpu_compactor_t, on the first CUDA device. */
+    /** @c cuda_compactor_t, on the first device the executor named. */
     device_k,
 };
 
@@ -1368,8 +1364,9 @@ class compaction_cancellation {
                                                             std::uint64_t key_slots_count) noexcept {
     if (placement == compaction_placement_t::host_k) return compactor_choice_t::host_k;
     if (placement == compaction_placement_t::device_k) return compactor_choice_t::device_k;
-    return devices != 0 && key_slots_count > storage_limits_t::gpu_compaction_threshold_k ? compactor_choice_t::device_k
-                                                                                          : compactor_choice_t::host_k;
+    return devices != 0 && key_slots_count > storage_limits_t::cuda_compaction_threshold_k
+               ? compactor_choice_t::device_k
+               : compactor_choice_t::host_k;
 }
 
 /** The engine's status for the @p status a compactor reported. */
@@ -1418,10 +1415,10 @@ class channel_drain {
  *  level holds are the only survivors and every source run is free the moment the merge is published.
  *
  *  @tparam atomic_reference_ The reference a caller's cancellation word is read through.
- *  @tparam waiting_policy_type_ What the core does while the merge waits for its reads and barriers.
+ *  @tparam waiter_type_ What the core does while the merge waits for its reads and barriers.
  */
 template <typename key_slot_type_, typename volume_type_, template <typename> typename atomic_reference_,
-          typename waiting_policy_type_>
+          typename waiter_type_>
 class lsm_level_merger {
   public:
 
@@ -1434,7 +1431,7 @@ class lsm_level_merger {
     using volume_t = volume_type_;
 
     /** The level this merge reads and writes. */
-    using level_t = lsm_level<key_slot_t, volume_t, waiting_policy_type_>;
+    using level_t = lsm_level<key_slot_t, volume_t, waiter_type_>;
 
     /** One immutable run of a level. */
     using sorted_run_t = typename level_t::sorted_run_t;
@@ -1455,7 +1452,7 @@ class lsm_level_merger {
     using read_pipeline_t = basic_read_pipeline<disk_t>;
 
     /** The pipeline every section of every new run is written through. */
-    using write_pipeline_t = basic_write_pipeline<disk_t, waiting_policy_type_>;
+    using write_pipeline_t = basic_write_pipeline<disk_t, waiter_type_>;
 
     /** What one compaction answers: the new runs, their cells and where their values come from. */
     using compaction_output_t = compaction_output<key_slot_t>;
@@ -1478,20 +1475,23 @@ class lsm_level_merger {
         /** The number the new level takes. */
         std::uint32_t number = 0;
 
-        /** Whether anything sits below the new level, which decides whether tombstones drop. */
+        /** Whether anything sits below the new level, which decides whether remove deltas drop. */
         lsm_level_depth_t depth = lsm_level_depth_t::intermediate_k;
 
         /** The largest value the collection admits, which every new run's header carries. */
         stored_value_size_t value_max_size = 0;
 
         /** Most key slots one new run takes, which bounds how far a binary search inside it walks. */
-        std::uint64_t run_key_slots_capacity = storage_limits_t::write_buffer_elements_max_count_k;
+        std::uint64_t run_key_slots_capacity = storage_limits_t::memory_runs_max_deltas_k;
 
         /** Largest new run in bytes, which a run of one key slot may still exceed. */
         std::uint64_t run_bytes_limit = storage_limits_t::sorted_run_file_max_size_k;
 
         /** Where the compaction runs. */
         compaction_placement_t placement = compaction_placement_t::automatic_k;
+
+        /** The devices the executor named, the first of which a device compaction runs on, empty for the host alone. */
+        std::span<int const> devices;
 
         /** The word the merge reads between blocks, or null for a merge nobody stops. */
         cancellation_t const* cancellation = nullptr;
@@ -1524,8 +1524,8 @@ class lsm_level_merger {
 
         st::basic_vector<sorted_run_t const*> sources;
         st::basic_vector<sorted_run_index_view<key_slot_t>> views;
-        if (status_t const staged = stage_indexes_(*request.upper, request.lower, sources, views); staged.failed())
-            return staged;
+        if (status_t const pointed = point_views_(*request.upper, request.lower, sources, views); pointed.failed())
+            return pointed;
 
         // A fold reads the values of the changes it folds, from their runs, one at a time.
         auto read_value = [&](located_key_slot<key_slot_t> const& record, utilities::arena_allocator<byte_t>& arena,
@@ -1544,7 +1544,7 @@ class lsm_level_merger {
         compaction_output_t output;
         if (status_t const compacted = run_compaction_(
                 kind_of_(request.upper->order(), request.depth), all.first(upper_runs), all.subspan(upper_runs),
-                bounds_of_(request), request.stamps, request.placement, fold, read_value, output);
+                bounds_of_(request), request.stamps, request.placement, request.devices, fold, read_value, output);
             compacted.failed())
             return compacted;
 
@@ -1638,9 +1638,9 @@ class lsm_level_merger {
     }
 
     /** Points a view of @p views at every source run's own cells, which the compactor reads in place. */
-    static status_t stage_indexes_(level_t const& upper, level_t const* lower,
-                                   st::basic_vector<sorted_run_t const*>& sources,
-                                   st::basic_vector<sorted_run_index_view<key_slot_t>>& views) noexcept {
+    static status_t point_views_(level_t const& upper, level_t const* lower,
+                                 st::basic_vector<sorted_run_t const*>& sources,
+                                 st::basic_vector<sorted_run_index_view<key_slot_t>>& views) noexcept {
         std::size_t const lower_runs = lower != nullptr ? lower->size() : 0;
         std::size_t const runs = upper.size() + lower_runs;
         if (sources.resize(runs) != st::status_t::success_k || views.resize(runs) != st::status_t::success_k)
@@ -1662,14 +1662,15 @@ class lsm_level_merger {
 
 #if USTORE_WITH_CUDA
 
-    /** Compacts on the first device when @p placement asks for one and no run holds a change, which only the host
-     *  folds, and on the calling thread otherwise, where runs carrying tails always merge. */
+    /** Compacts on the first of @p devices when @p placement asks for one and no run holds a change, which only the
+     *  host folds, and on the calling thread otherwise, where runs carrying tails always merge. */
     template <typename fold_type_, typename value_reader_type_>
     static status_t run_compaction_(compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_t> const> upper,
                                     std::span<sorted_run_index_view<key_slot_t> const> lower,
                                     sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps,
-                                    compaction_placement_t placement, fold_type_ const& fold,
-                                    value_reader_type_&& read_value, compaction_output_t& output) noexcept {
+                                    compaction_placement_t placement, std::span<int const> devices,
+                                    fold_type_ const& fold, value_reader_type_&& read_value,
+                                    compaction_output_t& output) noexcept {
         // No device compaction is compiled for key slots carrying tails.
         if constexpr (!tailed_key_slot_concept<key_slot_t>) {
             std::uint64_t merged = 0;
@@ -1683,18 +1684,15 @@ class lsm_level_merger {
                 changes |= holds_changes(lower[index].kinds);
             }
 
-            std::size_t devices = 0;
-            if (placement == compaction_placement_t::automatic_k)
-                if (st::expected<std::size_t> const counted = cuda_count_devices(); counted.has_value())
-                    devices = *counted;
-            if (!changes && choose_compactor(placement, devices, merged) == compactor_choice_t::device_k) {
-                st::expected<gpu_compactor_t> compactor = gpu_compactor_t::make(0);
+            if (!changes && choose_compactor(placement, devices.size(), merged) == compactor_choice_t::device_k) {
+                if (devices.empty()) return {status_code_t::device_k, "A device compaction names no device"};
+                st::expected<cuda_compactor_t> compactor = cuda_compactor_t::make(devices.front());
                 if (!compactor) return compaction_status(compactor.status());
                 return compaction_status(compactor->compact(kind, upper, lower, bounds, stamps, output));
             }
         }
         return compaction_status(
-            cpu_compactor_t {}.compact(kind, upper, lower, bounds, stamps, fold, read_value, output));
+            host_compactor_t {}.compact(kind, upper, lower, bounds, stamps, fold, read_value, output));
     }
 
 #else
@@ -1704,12 +1702,12 @@ class lsm_level_merger {
     static status_t run_compaction_(compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_t> const> upper,
                                     std::span<sorted_run_index_view<key_slot_t> const> lower,
                                     sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps,
-                                    compaction_placement_t placement, fold_type_ const& fold,
+                                    compaction_placement_t placement, std::span<int const>, fold_type_ const& fold,
                                     value_reader_type_&& read_value, compaction_output_t& output) noexcept {
         if (choose_compactor(placement, 0, 0) == compactor_choice_t::device_k)
             return {status_code_t::unsupported_k, "This build carries no device compactor"};
         return compaction_status(
-            cpu_compactor_t {}.compact(kind, upper, lower, bounds, stamps, fold, read_value, output));
+            host_compactor_t {}.compact(kind, upper, lower, bounds, stamps, fold, read_value, output));
     }
 
 #endif
@@ -1800,7 +1798,7 @@ class lsm_level_merger {
         if (create_status.failed()) return create_status;
         volume_blob_t const blob = reserved;
 
-        key_tails_t const run_tails {std::span<std::uint32_t const> {tail_offsets}, tails};
+        key_tails_column_t const run_tails {std::span<std::uint32_t const> {tail_offsets}, tails};
         if (status_t const written = write_sections_(volume, reading_channel, writing_channel, sources, output, planned,
                                                      header, column, kinds, run_tails, blob, cancellation);
             written.failed()) {
@@ -1820,7 +1818,7 @@ class lsm_level_merger {
                                     std::span<sorted_run_t const* const> sources, compaction_output_t const& output,
                                     planned_run_t const& planned, sorted_run_header_t const& header,
                                     stamps_column_t const& column, kinds_column_t const& kinds,
-                                    key_tails_t const& tails, volume_blob_t const& blob,
+                                    key_tails_column_t const& tails, volume_blob_t const& blob,
                                     cancellation_t const* cancellation) noexcept {
         std::uint64_t const block_bytes = round_down_to_multiple(writing_channel.streams().buffer_bytes(),
                                                                  portable_alignment_k);
@@ -1908,7 +1906,7 @@ class lsm_level_merger {
                 return {status_code_t::out_of_memory_k, "A merge could not track its reads in flight"};
             st::basic_vector<byte_t> scratch;
             if (scratch.resize(static_cast<std::size_t>(block_bytes + read_block)) != st::status_t::success_k)
-                return {status_code_t::out_of_memory_k, "A merge could not stage the values it gathers"};
+                return {status_code_t::out_of_memory_k, "A merge could not hold the values it gathers"};
 
             read_pipeline_t reader {volume.disk(), reading_channel, volume.medium()};
             channel_drain<disk_t> const parked {volume.disk(), reading_channel};
@@ -1927,7 +1925,7 @@ class lsm_level_merger {
             std::uint64_t survivor = planned.first_key_slot;
             std::uint64_t const survivors_end = planned.first_key_slot + planned.key_slots_count;
             std::uint64_t chunk_offset = 0;
-            std::uint64_t staged = 0;
+            std::uint64_t gathered = 0;
             std::uint64_t written = 0;
             request_tag_t tag = 0;
             while (written != section) {
@@ -1936,8 +1934,8 @@ class lsm_level_merger {
                     return cancelled_status_();
                 }
 
-                while (staged < block_bytes && survivor != survivors_end) {
-                    while (staged < block_bytes && survivor != survivors_end && reader.can_enqueue()) {
+                while (gathered < block_bytes && survivor != survivors_end) {
+                    while (gathered < block_bytes && survivor != survivors_end && reader.can_enqueue()) {
                         stored_value_migration_t const& migration = output.migrations[survivor];
                         if (migration.size == 0) {
                             ++survivor;
@@ -1948,10 +1946,10 @@ class lsm_level_merger {
                         if (migration.old_sorted_run == sources.size()) {
                             std::uint64_t const length = std::min<std::uint64_t>(read_block,
                                                                                  migration.size - chunk_offset);
-                            std::memcpy(scratch.data() + staged,
+                            std::memcpy(scratch.data() + gathered,
                                         output.folded.data() + migration.old_location + chunk_offset,
                                         static_cast<std::size_t>(length));
-                            staged += length;
+                            gathered += length;
                             chunk_offset += length;
                             if (chunk_offset == migration.size) {
                                 ++survivor;
@@ -1975,13 +1973,13 @@ class lsm_level_merger {
                         std::uint64_t const to = chunk_offset + length < wanted_last ? chunk_offset + length
                                                                                      : wanted_last;
                         pending_piece_t piece;
-                        piece.destination = staged;
+                        piece.destination = gathered;
                         piece.skipped = static_cast<std::uint32_t>(from - chunk_offset);
                         piece.carried = static_cast<std::uint32_t>(to > from ? to - from : 0);
                         pending[tag % depth] = piece;
                         if (reader.enqueue_read(extent_t {window.offset + chunk_offset, length}, tag).failed()) break;
                         ++tag;
-                        staged += piece.carried;
+                        gathered += piece.carried;
                         chunk_offset += length;
                         if (chunk_offset == covered) {
                             ++survivor;
@@ -1998,7 +1996,7 @@ class lsm_level_merger {
 
                 std::uint64_t const room = section - written;
                 std::uint64_t const chunk = block_bytes < room ? block_bytes : room;
-                std::uint64_t const carried = staged < chunk ? staged : chunk;
+                std::uint64_t const carried = gathered < chunk ? gathered : chunk;
                 auto [block, acquire_buffer_or_poll_status] = acquire_buffer_or_poll_(writer);
                 if (acquire_buffer_or_poll_status.failed()) return acquire_buffer_or_poll_status;
                 std::span<byte_t> const bytes = block.bytes().first(static_cast<std::size_t>(chunk));
@@ -2010,9 +2008,10 @@ class lsm_level_merger {
                     return queued;
                 if (status_t const flushed = writer.submit(); flushed.failed()) return flushed;
                 written += chunk;
-                if (staged > carried)
-                    std::memmove(scratch.data(), scratch.data() + carried, static_cast<std::size_t>(staged - carried));
-                staged -= carried;
+                if (gathered > carried)
+                    std::memmove(scratch.data(), scratch.data() + carried,
+                                 static_cast<std::size_t>(gathered - carried));
+                gathered -= carried;
             }
             return first;
         }
@@ -2089,10 +2088,10 @@ struct lsm_tree_publication_hook_t {
  *  the set is the only allocation a reader walks, so moving the tree moves no set.
  *
  *  @tparam atomic_reference_ The reference the compaction claim and a caller's cancellation word are owned through.
- *  @tparam waiting_policy_type_ What the core does while the tree waits for its reads and barriers.
+ *  @tparam waiter_type_ What the core does while the tree waits for its reads and barriers.
  */
 template <typename key_slot_type_, typename volume_type_, template <typename> typename atomic_reference_,
-          typename waiting_policy_type_>
+          typename waiter_type_>
 class lsm_tree {
   public:
 
@@ -2105,7 +2104,7 @@ class lsm_tree {
     using volume_t = volume_type_;
 
     /** One level of the tree. */
-    using level_t = lsm_level<key_slot_t, volume_t, waiting_policy_type_>;
+    using level_t = lsm_level<key_slot_t, volume_t, waiter_type_>;
 
     /** One immutable run of a level. */
     using sorted_run_t = typename level_t::sorted_run_t;
@@ -2117,7 +2116,7 @@ class lsm_tree {
     using disk_t = std::remove_reference_t<decltype(std::declval<volume_type_&>().disk())>;
 
     /** The compaction that replaces two levels with one. */
-    using merger_t = lsm_level_merger<key_slot_t, volume_t, atomic_reference_, waiting_policy_type_>;
+    using merger_t = lsm_level_merger<key_slot_t, volume_t, atomic_reference_, waiter_type_>;
 
     /** The word a caller raises to stop a merge. */
     using cancellation_t = compaction_cancellation<atomic_reference_>;
@@ -2187,10 +2186,10 @@ class lsm_tree {
     lsm_tree(lsm_tree&&) noexcept = default;
     lsm_tree& operator=(lsm_tree&&) noexcept = default;
 
-    /** An empty tree of one level zero over @p volume, which must outlive it, flushed one write buffer of
-     *  @p write_buffer_max_bytes at a time. */
+    /** An empty tree of one level zero over @p volume, which must outlive it, flushed memory runs of up to
+     *  @p memory_runs_max_bytes at a time. */
     static expected<lsm_tree> mount(volume_t& volume, lsm_tree_config_t const& config,
-                                    std::size_t write_buffer_max_bytes) noexcept {
+                                    std::size_t memory_runs_max_bytes) noexcept {
         // The enlarge factor sizes every level and level zero's run count alike, so a tree without one has no shape
         if (config.level_enlarge_factor < storage_limits_t::level_min_enlarge_factor_k ||
             config.level_enlarge_factor > storage_limits_t::level_max_enlarge_factor_k)
@@ -2198,7 +2197,7 @@ class lsm_tree {
         lsm_tree tree;
         tree.volume_ = &volume;
         tree.config_ = config;
-        tree.write_buffer_max_bytes_ = write_buffer_max_bytes;
+        tree.memory_runs_max_bytes_ = memory_runs_max_bytes;
         tree.levels_.reset(new (std::nothrow) level_set_t {});
         if (!tree.levels_ || tree.levels_->levels_.push_back(level_t::of(0, lsm_level_order_t::overlapping_k)) !=
                                  st::status_t::success_k)
@@ -2228,20 +2227,20 @@ class lsm_tree {
      *  @brief Whether @p taken carries @p stored_key, and whether the key slot holding it locates a value.
      *  @param[in] taken The level set the lookup runs against.
      *  @param[in] stored_key The key to look for.
-     *  @param[out] position Where the key sits, which is meaningless when the answer is @c nothing_k.
+     *  @param[out] position Where the key sits, which is meaningless when the answer is @c missing_k.
      *  @param[in] stamp The stamp a reader is pinned at, which sees the newest version at or below it.
      */
-    [[nodiscard]] find_result_t find(level_set_t const& taken, stored_key_t stored_key, lsm_tree_position_t& position,
-                                     std::uint64_t stamp = limit<std::uint64_t>::max()) const noexcept {
+    [[nodiscard]] lookup_result_t find(level_set_t const& taken, stored_key_t stored_key, lsm_tree_position_t& position,
+                                       std::uint64_t stamp = limit<std::uint64_t>::max()) const noexcept {
         position = lsm_tree_position_t {};
         for (std::size_t number = 0; number != taken.size(); ++number) {
             lsm_level_position_t inside;
-            find_result_t const found = taken.level(number).find(stored_key, stamp, inside);
-            if (found == find_result_t::nothing_k) continue;
+            lookup_result_t const found = taken.level(number).find(stored_key, stamp, inside);
+            if (found == lookup_result_t::missing_k) continue;
             position = lsm_tree_position_t {static_cast<std::uint32_t>(number), inside};
             return found;
         }
-        return find_result_t::nothing_k;
+        return lookup_result_t::missing_k;
     }
 
 #pragma endregion Lookups
@@ -2253,7 +2252,7 @@ class lsm_tree {
      *  @param[inout] channel The channel the reads are submitted and completed on, held by the calling thread.
      *  @param[in] taken The level set every lookup runs against.
      *  @param[in] stored_keys The keys to read, in any order and with any number of misses among them.
-     *  @param[out] results What every key was, which separates a miss from an erased value.
+     *  @param[out] results What every key was, which separates a miss from a removed value.
      *  @param[in] sink Called as @c sink(request, offset, bytes) for every key that locates a value.
      *  @param[in] stamp The stamp a reader is pinned at, which sees the newest version at or below it.
      *  @return Success, or the first failure any of the blocks reported.
@@ -2263,7 +2262,7 @@ class lsm_tree {
      */
     template <typename sink_type_>
     status_t read_values(io_channel_t& channel, level_set_t const& taken, std::span<stored_key_t const> stored_keys,
-                         std::span<find_result_t> results, sink_type_&& sink,
+                         std::span<lookup_result_t> results, sink_type_&& sink,
                          std::uint64_t stamp = limit<std::uint64_t>::max()) const noexcept {
         if (results.size() != stored_keys.size())
             return {status_code_t::invalid_argument_k, "A batched read answers one result per key"};
@@ -2272,7 +2271,7 @@ class lsm_tree {
             for (std::size_t request = 0; request != stored_keys.size(); ++request) {
                 lsm_tree_position_t position;
                 results[request] = find(taken, stored_keys[request], position, stamp);
-                if (results[request] != find_result_t::success_k) continue;
+                if (results[request] != lookup_result_t::written_k) continue;
                 key_slot_t const& slot = taken.level(position.level_number).key_slot(position.level_position);
                 sink(request, std::uint64_t {0}, std::span<byte_t const> {slot.data, slot.size});
             }
@@ -2308,13 +2307,13 @@ class lsm_tree {
                 while (request != stored_keys.size() && reader.can_enqueue()) {
                     if (chunk == 0) {
                         lsm_tree_position_t position;
-                        find_result_t const found = find(taken, stored_keys[request], position, stamp);
+                        lookup_result_t const found = find(taken, stored_keys[request], position, stamp);
                         results[request] = found;
-                        window = found == find_result_t::success_k
+                        window = found == lookup_result_t::written_k
                                      ? taken.level(position.level_number).value_window(position.level_position)
                                      : value_window_t {};
                         if (window.extent.length == 0) {
-                            if (found == find_result_t::success_k)
+                            if (found == lookup_result_t::written_k)
                                 sink(request, std::uint64_t {0}, std::span<byte_t const> {});
                             ++request;
                             continue;
@@ -2360,7 +2359,7 @@ class lsm_tree {
                    std::span<std::uint8_t const> kinds, std::uint64_t floor, std::span<byte_t const> stored_values,
                    stored_value_size_t value_max_size,
                    lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {},
-                   key_tails_t const& tails = {}) noexcept {
+                   key_tails_column_t const& tails = {}) noexcept {
         auto [written, write_sorted_run_status] = sorted_run_t::write(
             *volume_, channel, uuid_generator(), key_slots, stamps, kinds, floor, stored_values, value_max_size, tails);
         if (write_sorted_run_status.failed()) return write_sorted_run_status;
@@ -2403,7 +2402,7 @@ class lsm_tree {
         // The set owns every run it opens, so abandoning it frees them all.
         std::unique_ptr<level_set_t> next {new (std::nothrow) level_set_t {}};
         if (!next || next->levels_.reserve(std::size_t {deepest} + 1) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A tree could not stage the levels it restores"};
+            return {status_code_t::out_of_memory_k, "A tree could not hold the levels it restores"};
         for (std::uint32_t number = 0; number <= deepest; ++number) {
             level_t level = level_t::of(number,
                                         number == 0 ? lsm_level_order_t::overlapping_k : lsm_level_order_t::sorted_k);
@@ -2430,6 +2429,7 @@ class lsm_tree {
      *  @param[inout] reading_channel The channel the merge gathers source values on, held by the calling thread.
      *  @param[inout] writing_channel The channel the merge writes its new runs on, which is not @p reading_channel.
      *  @param[in] placement Where the compaction runs, which a collection leaves automatic.
+     *  @param[in] devices The devices the executor named, the first of which a device compaction runs on.
      *  @param[in] cancellation The word the merge reads between blocks, or null for a merge nobody stops.
      *  @param[in] fold How the collection's changes compose and apply.
      *  @param[in] published What to call once the merged set is current, which returns once no reader holds the set
@@ -2441,13 +2441,13 @@ class lsm_tree {
     template <utilities::fold_concept fold_type_>
     expected<compaction_outcome_t> compact(
         io_channel_t& reading_channel, io_channel_t& writing_channel, compaction_placement_t placement,
-        cancellation_t const* cancellation, fold_type_ const& fold,
+        std::span<int const> devices, cancellation_t const* cancellation, fold_type_ const& fold,
         lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {},
         compaction_stamps_t const& stamps = compaction_stamps_t {}) noexcept {
         if (!claim_compaction_()) return compaction_outcome_t::nothing_to_compact_k;
 
         expected<compaction_outcome_t> const outcome = compact_once_(reading_channel, writing_channel, placement,
-                                                                     cancellation, fold, published, stamps,
+                                                                     devices, cancellation, fold, published, stamps,
                                                                      merge_choice_t::overfull_k);
         atomic_reference_<std::int32_t> {compacting_}.store(static_cast<std::int32_t>(compaction_state_t::idle_k),
                                                             std::memory_order_release);
@@ -2472,7 +2472,7 @@ class lsm_tree {
         status_t result;
         while (result.succeeded() && above_(*levels_, ceiling) != levels_->size()) {
             expected<compaction_outcome_t> const outcome = compact_once_(
-                reading_channel, writing_channel, compaction_placement_t::automatic_k, nullptr, fold, published, stamps,
+                reading_channel, writing_channel, compaction_placement_t::host_k, {}, nullptr, fold, published, stamps,
                 merge_choice_t::above_ceiling_k);
             if (!outcome) result = outcome.status();
         }
@@ -2574,7 +2574,7 @@ class lsm_tree {
         level_set_t const& source = *levels_;
         std::unique_ptr<level_set_t> next {new (std::nothrow) level_set_t {}};
         if (!next || next->levels_.reserve(source.size()) != st::status_t::success_k)
-            return status_t {status_code_t::out_of_memory_k, "A tree could not stage its next level set"};
+            return status_t {status_code_t::out_of_memory_k, "A tree could not prepare its next level set"};
 
         for (std::size_t number = 0; number != source.size(); ++number) {
             level_t level = level_t::of(source.level(number).number(), source.level(number).order());
@@ -2622,7 +2622,7 @@ class lsm_tree {
     /** Level 0 holds F flushed runs of one write buffer each, and every level below F times the one above. */
     [[nodiscard]] std::uint64_t level_bytes_(std::size_t number) const noexcept {
         std::uint64_t const factor = config_.level_enlarge_factor;
-        std::uint64_t bytes = write_buffer_max_bytes_ * factor;
+        std::uint64_t bytes = memory_runs_max_bytes_ * factor;
         for (std::size_t step = 0; step != number; ++step) {
             if (bytes > limit<std::uint64_t>::max() / factor) return limit<std::uint64_t>::max();
             bytes *= factor;
@@ -2651,8 +2651,9 @@ class lsm_tree {
     /** Runs one merge of the level @p choice picks and publishes it, which the claim around it keeps to one thread. */
     template <typename fold_type_>
     expected<compaction_outcome_t> compact_once_(io_channel_t& reading_channel, io_channel_t& writing_channel,
-                                                 compaction_placement_t placement, cancellation_t const* cancellation,
-                                                 fold_type_ const& fold, lsm_tree_publication_hook_t const& published,
+                                                 compaction_placement_t placement, std::span<int const> devices,
+                                                 cancellation_t const* cancellation, fold_type_ const& fold,
+                                                 lsm_tree_publication_hook_t const& published,
                                                  compaction_stamps_t const& stamps, merge_choice_t choice) noexcept {
         level_set_t const& source = *levels_;
         std::size_t const upper = choice == merge_choice_t::overfull_k ? overfull_(source)
@@ -2672,9 +2673,10 @@ class lsm_tree {
         request.number = static_cast<std::uint32_t>(lower);
         request.depth = lsm_level_depth_t::bottom_k;
         request.value_max_size = static_cast<stored_value_size_t>(config_.lsm_level_0.sorted_run.value_max_size);
-        request.run_key_slots_capacity = storage_limits_t::write_buffer_elements_max_count_k;
+        request.run_key_slots_capacity = storage_limits_t::memory_runs_max_deltas_k;
         request.run_bytes_limit = storage_limits_t::sorted_run_file_max_size_k;
         request.placement = placement;
+        request.devices = devices;
         request.cancellation = cancellation;
         request.stamps = stamps;
         if (!grows && lower + 1 != source.size()) request.depth = lsm_level_depth_t::intermediate_k;
@@ -2731,7 +2733,7 @@ class lsm_tree {
     lsm_tree_config_t config_ {};
 
     /** Bytes one flushed write buffer holds, which level zero admits F of. */
-    std::uint64_t write_buffer_max_bytes_ = 0;
+    std::uint64_t memory_runs_max_bytes_ = 0;
 
     /** The level set the last publication made current, which owns every run it names. */
     std::unique_ptr<level_set_t> levels_;

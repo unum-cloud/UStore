@@ -40,9 +40,8 @@
 
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
-#include "ustore/utilities/nvme_disks.hpp" // `calling_thread_identity`
-#include "ustore/utilities/nvme_ring.hpp"  // `registered_memory_t`, `ring_concept`, `aligned_allocator`
-#include "ustore/utilities/types.hpp"      // `status_t`, `status_code_t`, `expected`, `byte_t`
+#include "ustore/utilities/nvme_ring.hpp" // `registered_memory_t`, `ring_concept`, `aligned_allocator`
+#include "ustore/utilities/types.hpp"     // `status_t`, `status_code_t`, `expected`, `byte_t`
 
 namespace unum::ustore::utilities {
 
@@ -463,9 +462,6 @@ class io_channel_t {
 
     /** The tag the next request of this channel carries, wrapping harmlessly past the depth. */
     request_tag_t next_tag_ = 0;
-
-    /** The thread that last adopted this channel, a hint the shared acquire ranks by and never trusts. */
-    thread_identity_t bound_thread_ = 0;
 };
 
 /**
@@ -553,32 +549,13 @@ class basic_io_channel_guard {
 #pragma region Pool
 
 /**
- *  @brief Which free shared channels one pass of an acquire may claim, from the cheapest to adopt to any.
- *
- *  Adopting a channel on a thread other than the one that last held it costs an io_uring transport a
- *  ring rebuild, so an acquire tries the tiers in order: a shared this thread bound stays with it, a
- *  shared nobody bound is taken before another thread's is stolen, and any free one ends the search.
- */
-enum class io_channel_preference_t : std::uint8_t {
-
-    /** A free shared whose last adopter is the calling thread, which adopts at no cost. */
-    bound_to_this_thread_k,
-
-    /** A free shared no thread has adopted yet, whose first adoption binds it here. */
-    never_bound_k,
-
-    /** Any free shared, which may cost the transport a rebind. */
-    any_free_k,
-};
-
-/**
  *  @brief Every queue pair one disk hands out, opened at mount and lent one operation at a time.
  *
  *  Executor threads take their own channel by thread index, so the common path claims nothing. Threads
  *  outside the pool claim one of the shared channels and are refused with @c capacity_exhausted_k when
  *  every shared is out, which is the same back-off the job gate already asks for.
  *
- *  @tparam atomic_reference_ The reference the claim and bound-thread words are owned through.
+ *  @tparam atomic_reference_ The reference the shared claim words are owned through.
  */
 template <typename disk_type_, template <typename> typename atomic_reference_>
     requires ring_concept<disk_type_>
@@ -667,27 +644,25 @@ class basic_io_channel_pool {
         if (thread_index >= executor_channels_) return acquire();
         io_channel_t& channel = channels_[thread_index];
         if (status_t const adopted = disk_->bind_queue_pair(channel.queue_pair_); adopted.failed()) return adopted;
-        atomic_reference_<std::uint64_t> {channel.bound_thread_}.store(calling_thread_identity(),
-                                                                       std::memory_order_relaxed);
         return guard_t::held(*disk_, channel, nullptr);
     }
 
-    /**
-     *  @brief A shared channel for a thread outside the executor, or @c capacity_exhausted_k when every shared is out.
-     *
-     *  The shared this thread last held is preferred, so a host that calls from the same few threads
-     *  never pays the transport a rebind after its first call from each; the hint is read before the
-     *  claim, so a stale read costs one rebind and never a wrong queue_pair.
-     */
+    /** The first free shared channel, for a thread outside the executor, or @c capacity_exhausted_k when every
+     *  shared is out. */
     expected<guard_t> acquire() noexcept {
-        thread_identity_t const bound_thread = calling_thread_identity();
-        if (expected<guard_t> claimed = claim_shared_(io_channel_preference_t::bound_to_this_thread_k, bound_thread);
-            !exhausted_(claimed))
-            return claimed;
-        if (expected<guard_t> claimed = claim_shared_(io_channel_preference_t::never_bound_k, bound_thread);
-            !exhausted_(claimed))
-            return claimed;
-        return claim_shared_(io_channel_preference_t::any_free_k, bound_thread);
+        for (std::size_t index = 0; index != shared_claims_.size(); ++index) {
+            std::int32_t expected_free = 0;
+            atomic_reference_<std::int32_t> claim {shared_claims_[index]};
+            if (!claim.compare_exchange_strong(expected_free, 1, std::memory_order_acquire, std::memory_order_relaxed))
+                continue;
+            io_channel_t& channel = channels_[executor_channels_ + index];
+            if (status_t const adopted = disk_->bind_queue_pair(channel.queue_pair_); adopted.failed()) {
+                claim.store(0, std::memory_order_release);
+                return adopted;
+            }
+            return guard_t::held(*disk_, channel, &shared_claims_[index]);
+        }
+        return status_t {status_code_t::capacity_exhausted_k, "Every shared channel of this mount is out"};
     }
 
     /** Channels the mount opened, which is the executor's threads plus the shared_channels. */
@@ -697,33 +672,6 @@ class basic_io_channel_pool {
     [[nodiscard]] std::size_t executor_channels() const noexcept { return executor_channels_; }
 
   private:
-
-    /** Whether @p claimed says that no shared met the pass, as opposed to a shared refusing adoption. */
-    [[nodiscard]] static bool exhausted_(expected<guard_t> const& claimed) noexcept {
-        return claimed == status_code_t::capacity_exhausted_k;
-    }
-
-    /** The first free shared @p preference admits for @p bound thread, or @c capacity_exhausted_k when none does. */
-    expected<guard_t> claim_shared_(io_channel_preference_t preference, thread_identity_t bound_thread) noexcept {
-        for (std::size_t index = 0; index != shared_claims_.size(); ++index) {
-            io_channel_t& channel = channels_[executor_channels_ + index];
-            atomic_reference_<std::uint64_t> bound {channel.bound_thread_};
-            std::uint64_t const bound_to = bound.load(std::memory_order_relaxed);
-            if (preference == io_channel_preference_t::bound_to_this_thread_k && bound_to != bound_thread) continue;
-            if (preference == io_channel_preference_t::never_bound_k && bound_to != 0) continue;
-            std::int32_t expected_free = 0;
-            atomic_reference_<std::int32_t> claim {shared_claims_[index]};
-            if (!claim.compare_exchange_strong(expected_free, 1, std::memory_order_acquire, std::memory_order_relaxed))
-                continue;
-            if (status_t const adopted = disk_->bind_queue_pair(channel.queue_pair_); adopted.failed()) {
-                claim.store(0, std::memory_order_release);
-                return adopted;
-            }
-            bound.store(bound_thread, std::memory_order_relaxed);
-            return guard_t::held(*disk_, channel, &shared_claims_[index]);
-        }
-        return status_t {status_code_t::capacity_exhausted_k, "Every shared channel of this mount is out"};
-    }
 
     /** The disk every channel queue pairs from, null until the pool is made. */
     disk_type_* disk_ = nullptr;
@@ -976,9 +924,9 @@ class basic_read_pipeline {
  *  Chaining is not that barrier and is not used for it: a flush covers only what its queue pair has
  *  already completed, so the poll before it is what makes it mean anything.
  *
- *  @tparam waiting_policy_type_ What the core does while it waits for the barrier's completion.
+ *  @tparam waiter_type_ What the core does while it waits for the barrier's completion.
  */
-template <typename disk_type_, typename waiting_policy_type_>
+template <typename disk_type_, typename waiter_type_>
     requires ring_concept<disk_type_>
 class basic_write_pipeline {
   public:
@@ -1089,7 +1037,7 @@ class basic_write_pipeline {
         auto [taken, submit_status] = disk_.submit(channel_.queue_pair(), std::span<request_t const> {barrier});
         if (submit_status.failed()) return submit_status;
         if (taken != 1) return {status_code_t::io_k, "The ring would not take a flush"};
-        auto [completed, poll_completions_status] = poll_completions_at_least<waiting_policy_type_>(
+        auto [completed, poll_completions_status] = poll_completions_at_least<waiter_type_>(
             disk_, channel_.queue_pair(), channel_.completion_buffer(), 1);
         if (poll_completions_status.failed()) return poll_completions_status;
         if (completed == 0) return {status_code_t::io_k, "A flush never completed"};

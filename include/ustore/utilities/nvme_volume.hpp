@@ -845,9 +845,9 @@ struct volume_format_t {
  *  since a catalog that named a range whose bytes are still in flight would publish a hole the next
  *  unrelated @c seal made durable.
  *
- *  @tparam waiting_policy_type_ What the core does while it waits for a catalog read or a barrier.
+ *  @tparam waiter_type_ What the core does while it waits for a catalog read or a barrier.
  */
-template <typename disk_type_, typename waiting_policy_type_>
+template <typename disk_type_, typename waiter_type_>
     requires ring_concept<disk_type_>
 class basic_extent_volume {
   public:
@@ -1082,7 +1082,7 @@ class basic_extent_volume {
 
         header_ = header;
         catalog_ = catalog_t {};
-        basic_write_pipeline<disk_type_, waiting_policy_type_> writer {disk_, channel, medium_};
+        basic_write_pipeline<disk_type_, waiter_type_> writer {disk_, channel, medium_};
         auto [block, acquire_buffer_status] = writer.acquire_buffer();
         if (acquire_buffer_status.failed()) return acquire_buffer_status;
         if (block.size() < portable_alignment_k)
@@ -1142,7 +1142,7 @@ class basic_extent_volume {
         auto [taken, submit_status] = disk_.submit(channel.queue_pair(), std::span<request_t const> {batch});
         if (submit_status.failed()) return submit_status;
         if (taken != 1) return status_t {status_code_t::io_k, "The ring would not take a catalog read"};
-        auto [completed, poll_completions_status] = poll_completions_at_least<waiting_policy_type_>(
+        auto [completed, poll_completions_status] = poll_completions_at_least<waiter_type_>(
             disk_, channel.queue_pair(), channel.completion_buffer(), 1);
         if (poll_completions_status.failed()) return poll_completions_status;
         if (completed == 0) return status_t {status_code_t::io_k, "A catalog read never completed"};
@@ -1178,7 +1178,7 @@ class basic_extent_volume {
         auto [filled, save_status] = catalog_.save(bytes.first(static_cast<std::size_t>(room)), generation);
         if (save_status.failed()) return save_status;
 
-        basic_write_pipeline<disk_type_, waiting_policy_type_> writer {disk_, channel, medium_};
+        basic_write_pipeline<disk_type_, waiter_type_> writer {disk_, channel, medium_};
         if (status_t const queued = writer.enqueue_write(std::move(block), extent_t {slot_offset_(slot), written});
             queued.failed())
             return queued;
@@ -1195,7 +1195,7 @@ class basic_extent_volume {
 
     /** Makes every write the channel has already completed durable, which is the step before recording. */
     status_t flush_bytes_(io_channel_t& channel) noexcept {
-        basic_write_pipeline<disk_type_, waiting_policy_type_> writer {disk_, channel, medium_};
+        basic_write_pipeline<disk_type_, waiter_type_> writer {disk_, channel, medium_};
         return writer.make_durable();
     }
 
@@ -1491,9 +1491,9 @@ struct resources_config_t {
  *  the type is portable and only the mount's probe decides which alternative is built.
  *
  *  @tparam atomic_reference_ The reference every alternative owns its shared words through.
- *  @tparam waiting_policy_type_ What a draining core does after a poll that moved nothing.
+ *  @tparam waiter_type_ What a draining core does after a poll that moved nothing.
  */
-template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+template <template <typename> typename atomic_reference_, typename waiter_type_>
 class any_files_disk {
   public:
 
@@ -1501,10 +1501,10 @@ class any_files_disk {
     using blocking_disk_t = blocking_files_disk<atomic_reference_>;
 
     /** The io_uring transport. */
-    using linux_uring_disk_t = linux_uring_files_disk<atomic_reference_, waiting_policy_type_>;
+    using linux_uring_disk_t = linux_uring_files_disk<atomic_reference_, waiter_type_>;
 
     /** The Linux AIO transport. */
-    using linux_aio_disk_t = linux_aio_files_disk<atomic_reference_, waiting_policy_type_>;
+    using linux_aio_disk_t = linux_aio_files_disk<atomic_reference_, waiter_type_>;
 
     /** Takes the blocking transport in, which a mount builds where the probe refused a ring. */
     explicit any_files_disk(blocking_disk_t&& disk) noexcept
@@ -1618,8 +1618,6 @@ class any_files_disk {
     /** The transport the probe chose, fixed for the life of the mount. */
     std::variant<blocking_disk_t, linux_uring_disk_t, linux_aio_disk_t> held_;
 };
-
-static_assert(ring_concept<any_files_disk<fu::standard_atomic_ref, st::standard_waiting_policy_t>>);
 
 #pragma endregion Disk
 
@@ -1775,15 +1773,15 @@ struct mount_report_t {
  *  longer there. The variant above it emplaces one rather than assigning one for that reason.
  *
  *  @tparam atomic_reference_ The reference the budget and the channels' claims are owned through.
- *  @tparam waiting_policy_type_ What a core waiting on the volumes' reads and barriers does.
+ *  @tparam waiter_type_ What a core waiting on the volumes' reads and barriers does.
  */
-template <typename disk_type_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
+template <typename disk_type_, template <typename> typename atomic_reference_, typename waiter_type_>
     requires ring_concept<disk_type_>
 class basic_storage_mount {
   public:
 
     /** The volume every data directory of this mount holds, which is one file of the directory. */
-    using volume_t = basic_extent_volume<disk_type_, waiting_policy_type_>;
+    using volume_t = basic_extent_volume<disk_type_, waiter_type_>;
 
     /** The volumes of this mount and the free-space placement that spreads blobs over them. */
     using router_t = basic_volume_router<volume_t>;
@@ -1946,9 +1944,9 @@ class basic_storage_mount {
  *  one disk type; SPDK is named by the configuration and refused here until its disk is ported.
  *
  *  @tparam atomic_reference_ The reference every transport, budget and channel owns its words through.
- *  @tparam waiting_policy_type_ What a core waiting on a transport does between polls.
+ *  @tparam waiter_type_ What a core waiting on a transport does between polls.
  */
-template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+template <template <typename> typename atomic_reference_, typename waiter_type_>
 class mounted_storage {
   public:
 
@@ -1956,13 +1954,13 @@ class mounted_storage {
     using memory_disk_t = memory_disk<atomic_reference_>;
 
     /** The ring a database gets, on unbuffered files through io_uring, Linux AIO or the blocking floor. */
-    using files_disk_t = any_files_disk<atomic_reference_, waiting_policy_type_>;
+    using files_disk_t = any_files_disk<atomic_reference_, waiter_type_>;
 
     /** The mount a suite and a benchmark ask for, whose volumes never reach a medium. */
-    using memory_mount_t = basic_storage_mount<memory_disk_t, atomic_reference_, waiting_policy_type_>;
+    using memory_mount_t = basic_storage_mount<memory_disk_t, atomic_reference_, waiter_type_>;
 
     /** The mount a database gets, on unbuffered files through io_uring, Linux AIO or the blocking floor. */
-    using files_mount_t = basic_storage_mount<files_disk_t, atomic_reference_, waiting_policy_type_>;
+    using files_mount_t = basic_storage_mount<files_disk_t, atomic_reference_, waiter_type_>;
 
     /** The host budget a mount charges its arena to. */
     using constraint_t = resource_constraint<atomic_reference_>;
@@ -2111,7 +2109,7 @@ class mounted_storage {
     template <typename disk_type_>
     status_t adopt_(disk_type_&& disk, resources_config_t const& config, constraint_t& constraint, std::size_t threads,
                     uuid_t const& database) noexcept {
-        using mount_t = basic_storage_mount<disk_type_, atomic_reference_, waiting_policy_type_>;
+        using mount_t = basic_storage_mount<disk_type_, atomic_reference_, waiter_type_>;
         mount_t& opened = held_.template emplace<mount_t>(std::move(disk));
         if (status_t const started = opened.mount(config, constraint, threads, database); started.failed()) {
             held_.template emplace<std::monostate>();
@@ -2141,9 +2139,9 @@ class mounted_storage {
 /**
  *  @brief Budgets and services every collection of one database shares.
  *  @tparam atomic_reference_ The reference the budgets and the storage own their words through.
- *  @tparam waiting_policy_type_ What a core waiting on the storage does between polls.
+ *  @tparam waiter_type_ What a core waiting on the storage does between polls.
  */
-template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+template <template <typename> typename atomic_reference_, typename waiter_type_>
 struct shared_resources {
 
     /** Budget of host memory. */
@@ -2156,7 +2154,7 @@ struct shared_resources {
     st::basic_vector<int> gpu_devices;
 
     /** The transport, the pinned arena, the channels and the volumes mounted over the data directories. */
-    mounted_storage<atomic_reference_, waiting_policy_type_> storage;
+    mounted_storage<atomic_reference_, waiter_type_> storage;
 
     /** Sets the memory budgets, leaving the services for the caller to attach. */
     explicit shared_resources(std::size_t memory_limit, std::size_t gpu_memory_limit = 0) noexcept
@@ -2164,15 +2162,14 @@ struct shared_resources {
 };
 
 /** The resources of one database, held by the database and every collection and buffer charged to its budgets. */
-template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
-using resources_shared_ptr = std::shared_ptr<shared_resources<atomic_reference_, waiting_policy_type_>>;
+template <template <typename> typename atomic_reference_, typename waiter_type_>
+using resources_shared_ptr = std::shared_ptr<shared_resources<atomic_reference_, waiter_type_>>;
 
 /** Constructs @p object_ in memory charged to the host budget, or returns an empty pointer once it runs out. */
-template <typename object_, template <typename> typename atomic_reference_, typename waiting_policy_type_,
+template <typename object_, template <typename> typename atomic_reference_, typename waiter_type_,
           typename... arguments_>
-std::shared_ptr<object_> make_constrained_shared(
-    resources_shared_ptr<atomic_reference_, waiting_policy_type_> const& resources,
-    arguments_&&... arguments) noexcept {
+std::shared_ptr<object_> make_constrained_shared(resources_shared_ptr<atomic_reference_, waiter_type_> const& resources,
+                                                 arguments_&&... arguments) noexcept {
     constrained_allocator<byte_t, atomic_reference_> allocator {resources->memory_constraint};
     auto* const pointer = reinterpret_cast<object_*>(allocator.allocate(sizeof(object_)));
     if (!pointer) return {};
@@ -2190,14 +2187,14 @@ std::shared_ptr<object_> make_constrained_shared(
  *  @param[in] database The database the volumes belong to, or an invalid identifier to take any.
  *  @return The resources, whose destructor tears the mount down in the order it was built in.
  */
-template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
-expected<resources_shared_ptr<atomic_reference_, waiting_policy_type_>> open_resources(
-    resources_config_t const& config, uuid_t const& database) noexcept {
+template <template <typename> typename atomic_reference_, typename waiter_type_>
+expected<resources_shared_ptr<atomic_reference_, waiter_type_>> open_resources(resources_config_t const& config,
+                                                                               uuid_t const& database) noexcept {
     if (config.directory.empty()) return status_t {status_code_t::invalid_argument_k, "A database needs a directory"};
     if (status_t const made = create_directories(config.directory.c_str()); made.failed()) return made;
 
-    using resources_t = shared_resources<atomic_reference_, waiting_policy_type_>;
-    resources_shared_ptr<atomic_reference_, waiting_policy_type_> resources = std::make_shared<resources_t>(
+    using resources_t = shared_resources<atomic_reference_, waiter_type_>;
+    resources_shared_ptr<atomic_reference_, waiter_type_> resources = std::make_shared<resources_t>(
         config.memory_limit, config.gpu_memory_limit);
     if (resources->gpu_devices.resize(config.gpu_devices.size()) != st::status_t::success_k)
         return status_t {status_code_t::out_of_memory_k, "A database could not list the GPUs it may use"};

@@ -61,7 +61,7 @@
 #include <forkunion/atomics.hpp>       // `fu::standard_atomic_ref` & kin - the classes' atomic references
 #include <forkunion/capabilities.hpp>  // `fu::x86_pause_t`, `fu::arm64_wfet_t` & waiter kin, `fu::cpu_capabilities`
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
-#include <smashtable/shared.hpp>       // `st::standard_waiting_policy` - the parking around a class's waiter
+#include <stringzilla/capabilities.h>  // `sz_capabilities_enabled_cpu`
 #include <stringzilla/stringzilla.hpp> // `sz::string_t`
 
 #include "ustore/types.hpp"                 // `key_after`, `largest_key_k`
@@ -223,11 +223,6 @@ struct waiter_for_cpu_class<cpu_class_t::aws_g5_k> {
 template <cpu_class_t cpu_class_>
 using waiter_of = typename waiter_for_cpu_class<cpu_class_>::type;
 
-/** The waiting policy a CPU class pairs: its waiter between attempts, parking on @c std::atomic::wait once a spin is
- *  spent. */
-template <cpu_class_t cpu_class_>
-using waiting_policy_of = st::standard_waiting_policy<waiter_of<cpu_class_>>;
-
 /** The atomic reference one CPU class pairs: single-instruction LSE read-modify-writes under RCpc acquiring loads on
  *  the Armv8.3+ classes and conditional adds on the CMPCCXADD Xeons - the floors, the older classes, and any class
  *  whose @c FORKUNION_TARGET_<BIT> is off in the probe list take the standard one. */
@@ -324,6 +319,15 @@ template <cpu_class_t cpu_class_>
 bool forkunion_admits() noexcept {
     constexpr fu::capabilities_t wanted = forkunion_capabilities_of<cpu_class_>();
     return (fu::cpu_capabilities() & wanted) == wanted;
+}
+
+/** The capabilities of this CPU that StringZilla dispatches on, probed once per process. */
+inline sz_capability_t stringzilla_capabilities() noexcept {
+    static sz_capability_t const capabilities = []() noexcept {
+        sz_capability_t probed = 0;
+        return sz_capabilities_enabled_cpu(&probed) == sz_success_k ? probed : sz_capability_t {0};
+    }();
+    return capabilities;
 }
 
 #pragma endregion CPU Classes
@@ -502,7 +506,7 @@ inline void clear_outputs(ustore_pages_read_t const& arguments) noexcept {
 }
 
 inline void clear_outputs(ustore_strings_read_t const& arguments) noexcept {
-    clear(arguments.presences), clear(arguments.lengths), clear(arguments.values);
+    clear(arguments.presences), clear(arguments.values);
 }
 
 inline void clear_outputs(ustore_strings_scan_t const& arguments) noexcept {
@@ -568,8 +572,8 @@ inline std::array<ragged_input_t, 1> ragged_inputs(ustore_pages_remove_attribute
     return {{{arguments.fields, arguments.count}}};
 }
 
-inline std::array<ragged_input_t, 2> ragged_inputs(ustore_strings_write_t const& arguments) noexcept {
-    return {{{arguments.strings, arguments.count}, {arguments.values, arguments.count}}};
+inline std::array<ragged_input_t, 1> ragged_inputs(ustore_strings_write_t const& arguments) noexcept {
+    return {{{arguments.strings, arguments.count}}};
 }
 
 inline std::array<ragged_input_t, 1> ragged_inputs(ustore_strings_remove_t const& arguments) noexcept {

@@ -25,6 +25,8 @@
 #include <fmt/format.h> // `fmt::println`
 #include <yyjson.h>     // `yyjson_val`
 
+#include <stringzilla/capabilities.h> // `sz_capabilities_enabled_cpu`
+
 #include "ustore/docs/json_paths.hpp"       // `resolve_fields`, `append_json_paths`
 #include "ustore/docs/json_values.hpp"      // `json_parse`, `json_lookup`, `gather_scalar`, `json_to_string`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_free`, `arena_allocator`, `growing_strings`
@@ -37,6 +39,15 @@ using namespace unum::ustore::docs;
 using namespace unum::ustore::utilities;
 
 namespace unum::ustore::test {
+
+/** The StringZilla kernels this CPU allows, probed once as `src/` does before it resolves. */
+inline sz_capability_t stringzilla_capabilities() noexcept {
+    static sz_capability_t const capabilities = []() noexcept {
+        sz_capability_t probed = 0;
+        return sz_capabilities_enabled_cpu(&probed) == sz_success_k ? probed : sz_capability_t {0};
+    }();
+    return capabilities;
+}
 
 /** An arena freed with every block it grew when the test ends. */
 class scoped_arena_t {
@@ -296,7 +307,8 @@ std::size_t compare_batch(documents_batch_t& batch, std::span<std::string_view c
     auto const cell_of = [&](std::size_t cell) noexcept {
         return field_cell_t {cell % documents.count, cell / documents.count};
     };
-    if (!resolve_fields(documents, fields, cells_count, cell_of, containers_parsed, arena, values)) {
+    if (!resolve_fields(documents, fields, cells_count, cell_of, containers_parsed, arena, stringzilla_capabilities(),
+                        values)) {
         ++fallbacks;
         return failures;
     }
@@ -461,7 +473,8 @@ std::size_t json_paths_refusals() {
         json_documents_t const documents = batch.view();
         yyjson_val* value = nullptr;
         auto const cell_of = [](std::size_t) noexcept { return field_cell_t {0, 0}; };
-        bool const resolved = resolve_fields(documents, fields, 1, cell_of, true, arena, {&value, 1});
+        bool const resolved = resolve_fields(documents, fields, 1, cell_of, true, arena, stringzilla_capabilities(),
+                                             {&value, 1});
         auto [parsed, status] = json_parse(text, arena);
         // NaN is lenient JSON, which yyjson reads and the engine hands back
         if (status.failed() || !resolved) continue;
@@ -474,7 +487,8 @@ std::size_t json_paths_refusals() {
         scoped_arena_t arena;
         yyjson_val* value = nullptr;
         auto const cell_of = [](std::size_t) noexcept { return field_cell_t {0, 0}; };
-        failures += expect(!resolve_fields(batch.view(), fields, 1, cell_of, true, arena, {&value, 1}));
+        failures += expect(
+            !resolve_fields(batch.view(), fields, 1, cell_of, true, arena, stringzilla_capabilities(), {&value, 1}));
     }
     return failures;
 }

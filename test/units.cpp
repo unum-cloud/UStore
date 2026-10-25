@@ -187,7 +187,7 @@ std::size_t check_equalities(reference_type_<locations_type_>& reference, triple
     return check_equalities(reference, triplet.views());
 }
 
-/** Checks overwrites, cleared values keeping their keys, key streaming and erasure on @p collection. */
+/** Checks overwrites, cleared values keeping their keys, key streaming and removal on @p collection. */
 std::size_t check_binary_collection(blobs_collection_t& collection) {
     std::size_t failures = 0;
     triplet_t triplet;
@@ -570,7 +570,7 @@ case_result_t database_collections_resolve(config_t const& config) {
         failures += expect(keyed[key_from_integer(1)].assign("intruder") == status_code_t::not_found_k);
         failures += expect(keyed.clear() == status_code_t::not_found_k);
         strings_collection_t stringed {database.receiver(), unknown};
-        failures += expect(stringed.assign("intruder", "value") == status_code_t::not_found_k);
+        failures += expect(stringed.assign("intruder", key_from_integer(1)) == status_code_t::not_found_k);
     }
 
     // A modality fixes how a collection is keyed, and calls keyed the other way are refused
@@ -582,10 +582,10 @@ case_result_t database_collections_resolve(config_t const& config) {
     blobs_collection_t keyed_words {database.receiver(), words};
     failures += expect(keyed_words[key_from_integer(1)].assign("number") == status_code_t::invalid_argument_k);
     strings_collection_t stringed_numbers {database.receiver(), *maybe_numbers};
-    failures += expect(stringed_numbers.assign("word", "value") == status_code_t::invalid_argument_k);
+    failures += expect(stringed_numbers.assign("word", key_from_integer(1)) == status_code_t::invalid_argument_k);
     strings_collection_t stringed_main {database.receiver(), ustore_collection_main_k};
-    failures += expect(stringed_main.assign("word", "value") == status_code_t::invalid_argument_k);
-    failures += expect(maybe_words->assign("word", "value").succeeded());
+    failures += expect(stringed_main.assign("word", key_from_integer(1)) == status_code_t::invalid_argument_k);
+    failures += expect(maybe_words->assign("word", key_from_integer(1)).succeeded());
 
     // A name is never a collection, and dropping a collection by identifier takes its name too
     auto [arena, arena_status] = arena_t::make();
@@ -2950,8 +2950,8 @@ case_result_t executor_deferred_graph(config_t const& config) {
     return failures;
 }
 
-/** A deferred write of strings and then deferred reads hand back their values, a missing value for a string never
- *  written, and a page of strings for every prefix. */
+/** A deferred write of strings and then deferred reads hand back their keys, the nil UUID for a string never written,
+ *  and a page of strings for every prefix. */
 case_result_t executor_deferred_strings(config_t const& config) {
     std::size_t failures = 0;
     auto [database, open_status] = open_database<database_t>(config);
@@ -2966,10 +2966,10 @@ case_result_t executor_deferred_strings(config_t const& config) {
     failures += expect(words_status.succeeded());
     if (failures != 0) return failures;
 
-    values_tape_t texts, contents;
+    values_tape_t texts;
     failures += fill_tape(texts, {"apple", "apricot", "banana"});
-    failures += fill_tape(contents, {"red", "orange", "yellow"});
-    failures += expect(words.write(std::move(texts), std::move(contents)).wait().succeeded());
+    std::array<ustore_key_t, 3> const keys {key_from_integer(1), key_from_integer(2), key_from_integer(3)};
+    failures += expect(words.write(std::move(texts), keys).wait().succeeded());
 
     auto [arena, arena_status] = arena_t::make(executor);
     failures += expect(arena_status.succeeded());
@@ -2980,9 +2980,9 @@ case_result_t executor_deferred_strings(config_t const& config) {
     failures += expect(read_status.succeeded());
     failures += expect_eq(read.size(), 3u);
     if (read.size() == 3) {
-        failures += expect_eq(as_text(read[0]), std::string_view("yellow"));
-        failures += expect(!read[1]);
-        failures += expect_eq(as_text(read[2]), std::string_view("red"));
+        failures += expect_eq(read[0], keys[2]);
+        failures += expect_eq(read[1], ustore_key_t {});
+        failures += expect_eq(read[2], keys[0]);
     }
 
     values_tape_t prefixes;

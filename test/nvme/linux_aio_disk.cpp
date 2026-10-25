@@ -245,7 +245,7 @@ std::size_t aio_runs_a_chain_in_order(linux_aio_files_disk_t& disk, medium_refer
             failures += expect(disk.submit(queue_pair, std::span<request_t const> {chain}) == links_k);
             failures += expect_eq(disk.outstanding(queue_pair), links_k);
             std::array<completion_t, links_k> completions {};
-            failures += expect(poll_completions_at_least<waiting_policy_t>(
+            failures += expect(poll_completions_at_least<waiter_t>(
                                    disk, queue_pair, std::span<completion_t> {completions}, links_k) == links_k);
             for (std::size_t index = 0; index != links_k; ++index) {
                 failures += expect(completions[index].completed_in_full());
@@ -276,9 +276,9 @@ std::size_t aio_cancels_a_held_chain(linux_aio_files_disk_t& disk, medium_refere
             disk.cancel(queue_pair);
 
             std::array<completion_t, links_k + 1> completions {};
-            failures += expect(poll_completions_at_least<waiting_policy_t>(disk, queue_pair,
-                                                                           std::span<completion_t> {completions},
-                                                                           links_k + 1) == links_k + 1);
+            failures += expect(poll_completions_at_least<waiter_t>(disk, queue_pair,
+                                                                   std::span<completion_t> {completions},
+                                                                   links_k + 1) == links_k + 1);
             std::array<std::size_t, links_k + 1> seen {};
             for (completion_t const& completion : completions) {
                 std::uint32_t const tag = completion.token.tag();
@@ -313,7 +313,7 @@ std::size_t aio_polls_through_a_narrow_window(linux_aio_files_disk_t& disk, medi
                 failures += expect(disk.submit(queue_pair, requests.first(1)) == std::size_t {0});
                 std::array<completion_t, 1> narrow {};
                 for (std::size_t index = 0; index != deep_queue_depth_k; ++index) {
-                    failures += expect(poll_completions_at_least<waiting_policy_t>(
+                    failures += expect(poll_completions_at_least<waiter_t>(
                                            disk, queue_pair, std::span<completion_t> {narrow}, 1) == std::size_t {1});
                     failures += expect(narrow[0].completed_in_full());
                 }

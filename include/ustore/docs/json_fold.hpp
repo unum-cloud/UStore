@@ -5,9 +5,9 @@
  *  @brief The docs fold: a whole document as the base, and deltas that each apply one modification of
  *      @c ustore_docs_write to one field, replayed in commit order and composed without a base where that is sound.
  *
- *  A delta carries a stamp, its modification, its field and the JSON text of its value, and a chain of them
- *  is what a @c delta_kind_t::change_k record holds. Beyond the five modifications of @c ustore_docs_write, a delta may
- *  write a whole document as it is, as a whole JSON upsert and @c ustore_blobs_write store it, or remove it.
+ *  A delta carries a stamp, its modification, its field and the JSON text of its value, and a chain of them is what a
+ *  @c delta_kind_t::change_k delta of the store holds. Beyond the five modifications of @c ustore_docs_write, a delta
+ *  may write a whole document as it is, as a whole JSON upsert and @c ustore_blobs_write store it, or remove it.
  *
  *  Each modification replays exactly as `src/docs.cpp` reads, modifies and writes back a document today. A field of a
  *  missing document, and an update or a patch of a whole missing document, fail with @c status_code_t::not_found_k,
@@ -530,7 +530,7 @@ status_t merge_open_chain(deltas_type_& deltas, keep_type_& keep, ustore_arena_t
 #pragma region Fold
 
 /** The fold of docs, fitting the fold concept of `ustore/utilities/folds.hpp`: apply, compose and closes. */
-struct json_fold {
+struct json_fold_t {
 
     /** Whether a collection of @p modality folds document deltas, which docs alone do. */
     static constexpr bool serves(ustore_modality_t modality) noexcept { return modality == ustore_modality_docs_k; }
@@ -554,7 +554,7 @@ struct json_fold {
         return replay.document.bytes;
     }
 
-    /** Whether @p delta makes every older record irrelevant: a write, a removal, or a chain holding a whole upsert,
+    /** Whether @p delta makes every older delta irrelevant: a write, a removal, or a chain holding a whole upsert,
      *  a write or a removal. */
     bool closes(delta_view_t const& delta) const noexcept {
         if (delta.kind != delta_kind_t::change_k) return true;
@@ -607,7 +607,7 @@ struct json_fold {
     }
 };
 
-static_assert(utilities::fold_concept<json_fold>);
+static_assert(utilities::fold_concept<json_fold_t>);
 
 #pragma endregion Fold
 

@@ -357,14 +357,21 @@ set(ustore_sibling_archives_ forkunion_static stringzilla_static)
 set(ustore_dependencies_ ${ustore_sibling_archives_} yyjson fmt)
 set(ustore_engine_archives_)
 set(ustore_engine_definitions_)
+set(ustore_compiled_objects_)
 
 # The NVMe engine mounts its volumes on files, so it builds everywhere the siblings do; the io_uring transport beside it
 # compiles on every platform and only opens a ring on Linux.
 if (${USTORE_BUILD_NVME})
     list(APPEND ustore_sources_ src/nvme/engine.cpp)
     foreach (class_ IN LISTS ustore_cpu_classes_)
-        list(APPEND ustore_sources_ src/nvme/variants_${class_}.cpp)
+        list(APPEND ustore_nvme_variants_ src/nvme/variants_${class_}.cpp)
     endforeach ()
+    # Both libraries link one copy of every CPU class's engine, compiled position-independent once
+    add_library(ustore_nvme_variants OBJECT ${ustore_lib_c_exclusion_} ${ustore_nvme_variants_})
+    set_target_properties(ustore_nvme_variants PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_link_libraries(ustore_nvme_variants PRIVATE Threads::Threads smashtable::header ${ustore_dependencies_})
+    list(APPEND ustore_sources_ $<TARGET_OBJECTS:ustore_nvme_variants>)
+    list(APPEND ustore_compiled_objects_ ustore_nvme_variants)
     list(APPEND ustore_engine_definitions_ USTORE_WITH_NVME=1)
     list(APPEND ustore_engine_names_ "nvme")
 endif ()
@@ -425,7 +432,7 @@ target_link_options(
     $<$<PLATFORM_ID:Darwin>:LINKER:-exported_symbol,_ustore_*>
 )
 
-foreach (library_ IN ITEMS ustore_static ustore_shared)
+foreach (library_ IN ITEMS ustore_static ustore_shared ${ustore_compiled_objects_})
     target_compile_features(${library_} PUBLIC cxx_std_20)
     target_compile_definitions(
         ${library_}

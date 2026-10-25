@@ -24,7 +24,6 @@
 
 #pragma once
 
-#include <cassert> // `assert`
 #include <cerrno>  // `errno`, `EAGAIN`, `EINTR`, `EINVAL`
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint64_t`
@@ -39,11 +38,9 @@
 #include <span>    // `std::span`
 #include <utility> // `std::move`
 
-#include <forkunion/atomics.hpp>       // `fu::standard_atomic_ref`, the reference the contract is checked with
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
-#include <smashtable/shared.hpp>       // `st::standard_waiting_policy_t`, the policy the contract is checked with
 
-#include "ustore/utilities/nvme_disks.hpp"            // `native_file_t`, `open_native_file`, `calling_thread_identity`
+#include "ustore/utilities/nvme_disks.hpp"            // `native_file_t`, `open_native_file`
 #include "ustore/utilities/nvme_linux_uring_disk.hpp" // `direct_alignment_of`, `direct_alignment_t`
 #include "ustore/utilities/nvme_ring.hpp"             // `request_t`, `completion_t`, `queue_pair_t`, `extent_t`
 #include "ustore/utilities/types.hpp"                 // `status_t`, `status_code_t`, `expected`, `byte_t`
@@ -109,9 +106,9 @@ enum class linux_aio_probe_t : std::uint8_t {
  *  whole @c submit.
  *
  *  @tparam atomic_reference_ The reference the claim and in-flight words are owned through.
- *  @tparam waiting_policy_type_ What a draining core does after a poll that moved nothing.
+ *  @tparam waiter_type_ What a draining core does after a poll that moved nothing.
  */
-template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+template <template <typename> typename atomic_reference_, typename waiter_type_>
 class linux_aio_files_disk {
   public:
 
@@ -240,7 +237,6 @@ class linux_aio_files_disk {
             slot.flights_count = 0;
             slot.locals_first = 0;
             slot.locals_count = 0;
-            slot.bound_thread = calling_thread_identity();
             return queue_pair_t::leased(static_cast<queue_pair_id_t>(index), slot.generation, depth);
         }
         return status_t {status_code_t::capacity_exhausted_k, "Every queue pair of this disk is already held"};
@@ -258,7 +254,6 @@ class linux_aio_files_disk {
         if (!slot) return {status_code_t::invalid_argument_k, "The queue pair is not this disk's"};
         if (outstanding_(*slot) != 0)
             return {status_code_t::invalid_argument_k, "Drain the queue pair before handing it over"};
-        slot->bound_thread = calling_thread_identity();
         return {};
     }
 
@@ -274,7 +269,6 @@ class linux_aio_files_disk {
         ++slot->generation;
         slot->depth = 0;
         slot->free_seats = 0;
-        slot->bound_thread = 0;
         claim_(slot->leased).store(0, std::memory_order_release);
         queue_pair.surrender();
         return {};
@@ -402,7 +396,6 @@ class linux_aio_files_disk {
     expected<std::size_t> submit(queue_pair_t const& queue_pair, std::span<request_t const> requests) noexcept {
         queue_pair_slot_t* const slot = slot_of_(queue_pair);
         if (!slot) return status_t {status_code_t::invalid_argument_k, "The queue pair is not this disk's"};
-        assert(slot->bound_thread == calling_thread_identity() && "Only the thread holding a queue pair submits on it");
         for (request_t const& request : requests)
             if (request.token.queue_pair() != queue_pair.id() || request.token.generation() != queue_pair.generation())
                 return status_t {status_code_t::invalid_argument_k, "A request carries another queue pair's token"};
@@ -448,7 +441,6 @@ class linux_aio_files_disk {
     expected<std::size_t> poll_completions(queue_pair_t const& queue_pair, std::span<completion_t> into) noexcept {
         queue_pair_slot_t* const slot = slot_of_(queue_pair);
         if (!slot) return status_t {status_code_t::invalid_argument_k, "The queue pair is not this disk's"};
-        assert(slot->bound_thread == calling_thread_identity() && "Only the thread holding a queue pair polls on it");
         std::uint32_t const base = window_of_(queue_pair.id());
 
         std::size_t moved = 0;
@@ -511,7 +503,7 @@ class linux_aio_files_disk {
             if (poll_completions_status.failed()) return poll_completions_status;
             if (moved != 0) continue;
             if (spins == drain_patience_k) cancel(queue_pair);
-            waiting_policy_type_ {}(&spins, spins, std::size_t {0});
+            waiter_type_ {}(&spins, spins, std::size_t {0});
         }
         return {status_code_t::io_k, "The queue pair would not drain"};
     }
@@ -549,9 +541,6 @@ class linux_aio_files_disk {
 
         /** Completions the disk answered itself, which no event ever carried. */
         std::uint32_t locals_count = 0;
-
-        /** The thread that took the queue pair, which every submit and poll is checked against. */
-        thread_identity_t bound_thread = 0;
     };
 
     /** One recorded memory range, and the count of requests the kernel may still be writing into it. */
@@ -957,7 +946,7 @@ class linux_aio_files_disk {
  *  The type exists so a caller compiles against it unconditionally and chooses at mount, where a
  *  refused @c make sends it to the blocking floor rather than to a build-time branch.
  */
-template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+template <template <typename> typename atomic_reference_, typename waiter_type_>
 class linux_aio_files_disk {
   public:
 
@@ -1032,8 +1021,5 @@ class linux_aio_files_disk {
 #pragma endregion Absent
 
 #endif
-
-static_assert(ring_concept<linux_aio_files_disk<fu::standard_atomic_ref, st::standard_waiting_policy_t>>,
-              "The Linux AIO transport is a ring like every other");
 
 } // namespace unum::ustore::utilities

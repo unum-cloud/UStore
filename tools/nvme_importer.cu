@@ -84,8 +84,8 @@ user_collection_config_t build_collection_config(options_t const& options) noexc
 
     user_collection_config_t config;
     config.concurrency_limit = options.threads.value;
-    config.write_buffer_max_elements = 100'000;
-    config.write_buffer_max_bytes = 200 * 1024 * 1024ull;
+    config.memory_runs_max_deltas = 100'000;
+    config.memory_runs_max_bytes = 200 * 1024 * 1024ull;
     config.value_size = 0;
     config.value_max_size = options.max_file_size.value;
 

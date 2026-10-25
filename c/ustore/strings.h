@@ -2,18 +2,17 @@
  *  @file c/ustore/strings.h
  *  @author Ash Vardanian
  *  @date September 16, 2026
- *  @brief The binary interface for collections keyed by variable-length strings, mapped onto arbitrary bytes.
+ *  @brief The binary interface for collections mapping variable-length strings onto keys of other collections.
  *
- *  Strings live in collections created with @c ustore_modality_strings_k, which each engine keys by the strings
- *  themselves, so a prefix walk is an ordered walk of its own keyspace; the other calls refuse such a collection,
- *  and these calls refuse every other one. Strings and their values both arrive as @c ustore_strings_view_t, so
- *  this header mirrors @c blobs.h with strings in place of keys.
+ *  Strings live in collections created with @c ustore_modality_strings_k, which map every string onto exactly one
+ *  @c ustore_key_t: names, paths and terms resolved into the keys every other modality uses. Each engine keys such a
+ *  collection by the strings themselves, so a prefix walk is an ordered walk of its own keyspace; the other calls
+ *  refuse such a collection, and these calls refuse every other one. Strings arrive as @c ustore_strings_view_t and
+ *  their values as @c ustore_keys_view_t, so this header mirrors @c blobs.h with strings in place of keys and keys in
+ *  place of values.
  *
- *  Strings order by their bytes, unsigned, and a prefix walk hands them over in that order. RAM, RocksDB and
- *  LevelDB key a strings collection by the strings themselves. An engine without such a keyspace maps a
- *  string onto a key of its leading @c sizeof(ustore_key_t) minus one bytes, zero-padded, followed by its
- *  length, and a longer string takes a marker length and lives in a sorted bucket under the key its leading
- *  run shares, so a prefix walk stays an ordered walk of keys.
+ *  Strings order by their bytes, unsigned, and a prefix walk hands them over in that order. Every value is one key,
+ *  so a strings collection holds no empty values, and @c ustore_drop_values_k refuses it.
  */
 
 #ifndef UNUM_USTORE_STRINGS_H
@@ -25,12 +24,8 @@
 extern "C" {
 #endif
 
-/**
- *  @brief The arguments of @c ustore_strings_write, which upserts the values of strings.
- *
- *  Strings sharing a bucket are rewritten together, so one batch touching many of them costs one read and one
- *  write; @c ustore_strings_remove removes strings.
- */
+/** The arguments of @c ustore_strings_write, which upserts the keys strings map onto; @c ustore_strings_remove
+ *  removes strings. */
 typedef struct ustore_strings_write_t {
 
     /** An open database. */
@@ -57,19 +52,19 @@ typedef struct ustore_strings_write_t {
     /** Strings to write, one per task. */
     ustore_strings_view_t strings;
 
-    /** Values to write, one per string; a tape @c ustore_strings_read wrote is written back as it is. */
-    ustore_strings_view_t values;
+    /** The key every string maps onto, one per string. */
+    ustore_keys_view_t values;
 
     /** How durable the writes are once the call finishes at the head; a transaction's commit decides its own. */
     ustore_durability_t durability;
 
-    /** Whether the @c transaction records the buckets it reads and writes for conflicts. */
+    /** Whether the @c transaction records the strings it reads and writes for conflicts. */
     ustore_watch_t watch;
 
 } ustore_strings_write_t;
 
 /**
- *  @brief Writes a batch of strings and their values.
+ *  @brief Writes a batch of strings and the keys they map onto.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
 USTORE_EXPORT void ustore_strings_write(ustore_strings_write_t* arguments);
@@ -104,7 +99,7 @@ typedef struct ustore_strings_remove_t {
     /** How durable the removals are once the call finishes at the head; a transaction's commit decides its own. */
     ustore_durability_t durability;
 
-    /** Whether the @c transaction records the buckets it reads and writes for conflicts. */
+    /** Whether the @c transaction records the strings it reads and writes for conflicts. */
     ustore_watch_t watch;
 
 } ustore_strings_remove_t;
@@ -115,7 +110,7 @@ typedef struct ustore_strings_remove_t {
  */
 USTORE_EXPORT void ustore_strings_remove(ustore_strings_remove_t* arguments);
 
-/** The arguments of @c ustore_strings_read, which reads the values of strings, their lengths or their presence. */
+/** The arguments of @c ustore_strings_read, which reads the keys strings map onto, or their presence. */
 typedef struct ustore_strings_read_t {
 
     /** An open database. */
@@ -146,12 +141,9 @@ typedef struct ustore_strings_read_t {
      *  @c arena. */
     ustore_octet_t const** presences;
 
-    /** Optional output for the length of every value, for reads that skip the bytes, inside @c arena. */
-    ustore_length_t const** lengths;
-
-    /** Optional output for the values as a tape inside @c arena, in the order of the strings, where a missing string
-     *  reads as an empty value. */
-    ustore_strings_view_t* values;
+    /** Optional output for the key of every string inside @c arena, in the order of the strings, where a missing
+     *  string reads as the nil UUID. */
+    ustore_key_t const** values;
 
     /** Rewound by this call, then holding every output it writes; @c NULL is refused. */
     ustore_arena_t arena;
@@ -159,7 +151,7 @@ typedef struct ustore_strings_read_t {
 } ustore_strings_read_t;
 
 /**
- *  @brief Reads a batch of values addressed by their strings.
+ *  @brief Reads the keys a batch of strings map onto.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  */
 USTORE_EXPORT void ustore_strings_read(ustore_strings_read_t* arguments);
@@ -292,9 +284,9 @@ typedef struct ustore_strings_cursor_next_t {
     /** Output for the strings of the page in the order of their text, as a tape inside @c arena. */
     ustore_strings_view_t* strings;
 
-    /** Optional output for their values as a tape inside @c arena, where a string removed at the head between the
-     *  listing and the read of one pull reads as an empty value; @c NULL skips them. */
-    ustore_strings_view_t* values;
+    /** Optional output for the keys of the page's strings inside @c arena, where a string removed at the head
+     *  between the listing and the read of one pull reads as the nil UUID; @c NULL skips them. */
+    ustore_key_t const** values;
 
     /** Output for the strings written, zero once the walk is exhausted; zeroed on failure. */
     ustore_size_t* written;

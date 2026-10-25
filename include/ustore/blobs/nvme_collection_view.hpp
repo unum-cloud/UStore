@@ -28,18 +28,15 @@
 #include <forkunion/types.hpp> // `fu::default_alignment_k`
 
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
-#include <smashtable/shared.hpp>       // `st::default_allocator`, `st::hash`
+#include <smashtable/shared.hpp>       // `st::default_allocator`
 
-#include "ustore/blobs/nvme_key_slot.hpp"  // `transaction_stamp_t`, `unwritten_stamp_k`
-#include "ustore/utilities/folds.hpp"      // `delta_view_t`
-#include "ustore/utilities/nvme_disks.hpp" // `calling_thread_identity`, `thread_identity_t`
-#include "ustore/utilities/types.hpp"      // `expected`, `status_t`
+#include "ustore/blobs/nvme_key_slot.hpp" // `transaction_stamp_t`, `unwritten_stamp_k`
+#include "ustore/utilities/folds.hpp"     // `delta_view_t`
+#include "ustore/utilities/types.hpp"     // `expected`, `status_t`
 
 namespace unum::ustore::blobs {
 
-using utilities::calling_thread_identity;
 using utilities::delta_view_t;
-using utilities::thread_identity_t;
 
 /**
  *  @brief The runs one collection's readers see, newest first, which nothing changes once it is published.
@@ -201,9 +198,9 @@ struct alignas(fu::default_alignment_k) epoch_slot_t {
     /** Readers its thread holds at once, so a nested one neither announces nor leaves; that thread's alone. */
     std::size_t depth = 0;
 
-    /** The thread outside the executor holding the slot, zero while it is free; claimed by that thread's outermost
-     *  reader and given back when it leaves, and always zero on an executor thread's own slot. */
-    thread_identity_t holder = 0;
+    /** One while a reader outside the executor holds the slot, zero while it is free; claimed by that one reader and
+     *  given back when it leaves, and always zero on an executor thread's own slot. */
+    std::int32_t claimed = 0;
 };
 
 /**
@@ -211,18 +208,18 @@ struct alignas(fu::default_alignment_k) epoch_slot_t {
  *      before it frees the view.
  *
  *  A reader loads the epoch, stores it to its own slot, fences, and only then loads a view; leaving stores zero. An
- *  executor thread takes the slot its index names and writes no shared word. Any other thread's outermost reader
- *  claims a free shared slot, starting at the one its identity hashes to, so a thread keeps finding the line it
- *  claimed last, and gives it back when it leaves; the shared slots double only when every one is held at once, so
- *  their count is bounded by the most outside readers ever inside together. A writer publishes, moves the epoch on
- *  with release, fences, and waits on every slot announcing an older epoch: a reader the scan missed fenced after the
- *  writer did and loads the new view, and one that announced the moved epoch read it from the writer and loads the
- *  new view too. Readers never wait; @c wait_for_readers waits for them, called only outside the domain.
+ *  executor thread takes the slot its index names and writes no shared word. Every other reader, a nested one
+ *  included, claims the first free shared slot and gives it back when it leaves; the shared slots double only when
+ *  every one is held at once, so their count is bounded by the most outside readers ever inside together. A writer
+ *  publishes, moves the epoch on with release, fences, and waits on every slot announcing an older epoch: a reader the
+ *  scan missed fenced after the writer did and loads the new view, and one that announced the moved epoch read it from
+ *  the writer and loads the new view too. Readers never wait; @c wait_for_readers waits for them, called only outside
+ *  the domain.
  *
  *  @tparam atomic_reference_ The reference every slot, the epoch and the shared table are owned through.
- *  @tparam waiting_policy_type_ What a waiting writer's core does between reads of a slot.
+ *  @tparam waiter_type_ What a waiting writer's core does between reads of a slot.
  */
-template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+template <template <typename> typename atomic_reference_, typename waiter_type_>
 class epoch_domain {
   public:
 
@@ -258,8 +255,8 @@ class epoch_domain {
                 atomic_reference_<std::uint64_t> {slot_->announced}.store(0, std::memory_order_release);
                 // Released after the depth, which the next holder's claim acquires; other threads try to claim the
                 // word meanwhile, so even its holder reads it atomically.
-                atomic_reference_<thread_identity_t> const holder {slot_->holder};
-                if (holder.load(std::memory_order_relaxed) != 0) holder.store(0, std::memory_order_release);
+                atomic_reference_<std::int32_t> const claimed {slot_->claimed};
+                if (claimed.load(std::memory_order_relaxed) != 0) claimed.store(0, std::memory_order_release);
             }
             slot_ = nullptr;
         }
@@ -285,11 +282,10 @@ class epoch_domain {
         return {};
     }
 
-    /** Announces a thread outside the executor on a shared slot its outermost reader claims, before it loads a view. */
+    /** Announces a reader outside the executor on a shared slot of its own, before it loads a view. */
     [[nodiscard]] reader_t enter() noexcept {
-        thread_identity_t const identity = calling_thread_identity();
         for (shared_slots_t const* shared = load_(shared_);; shared = load_(shared_)) {
-            if (epoch_slot_t* const slot = claimed_(shared, identity)) return announce_(*slot);
+            if (epoch_slot_t* const slot = claimed_(shared)) return announce_(*slot);
             if (!grown_(shared)) break;
         }
         // A thread no slot could be allocated for is counted on the one spilled slot, which only makes writers wait.
@@ -317,11 +313,11 @@ class epoch_domain {
         // Pairs with a reader's fence: either this reads its announcement, or the reader loads the new view.
         std::atomic_thread_fence(std::memory_order_seq_cst);
         for (std::size_t spilled = load_(spilled_.depth); spilled != 0; spilled = load_(spilled_.depth))
-            waiting_policy_type_ {}(&spilled_.depth, spilled, std::size_t {0});
+            waiter_type_ {}(&spilled_.depth, spilled, std::size_t {0});
         for_each_slot_([moved](epoch_slot_t& slot) noexcept {
             for (std::uint64_t announced = load_(slot.announced); announced != 0 && announced < moved;
                  announced = load_(slot.announced))
-                waiting_policy_type_ {}(&slot.announced, announced, std::size_t {0});
+                waiter_type_ {}(&slot.announced, announced, std::size_t {0});
         });
     }
 
@@ -354,24 +350,14 @@ class epoch_domain {
         return reader_t {*this, slot};
     }
 
-    /**
-     *  @brief The shared slot of @p shared @p identity already holds, so a nested reader keeps it, or one it claims
-     *      now, probing from the slot its identity hashes to; null while every slot is held.
-     *
-     *  Only the thread @p identity names stores it into a slot, so finding it there is never stale, and a slot freed
-     *  ahead of the one held only makes a nested reader announce twice, which is as safe.
-     */
-    [[nodiscard]] static epoch_slot_t* claimed_(shared_slots_t const* shared, thread_identity_t identity) noexcept {
+    /** The first free slot of @p shared, claimed now for one reader, which a nested reader announcing on a slot of
+     *  its own makes no less safe; null while every slot is held. */
+    [[nodiscard]] static epoch_slot_t* claimed_(shared_slots_t const* shared) noexcept {
         if (!shared) return nullptr;
-        std::size_t const home = st::hash<thread_identity_t> {}(identity)&shared->mask;
-        for (std::size_t step = 0; step <= shared->mask; ++step) {
-            epoch_slot_t& slot = *shared->slots[(home + step) & shared->mask];
-            atomic_reference_<thread_identity_t> const holder {slot.holder};
-            thread_identity_t held = holder.load(std::memory_order_relaxed);
-            if (held == identity) return &slot;
-            if (held == 0 &&
-                holder.compare_exchange_strong(held, identity, std::memory_order_acquire, std::memory_order_relaxed))
-                return &slot;
+        for (std::size_t index = 0; index <= shared->mask; ++index) {
+            atomic_reference_<std::int32_t> const claimed {shared->slots[index]->claimed};
+            if (claimed.load(std::memory_order_relaxed) == 0 && claimed.fetch_or(1, std::memory_order_acquire) == 0)
+                return shared->slots[index];
         }
         return nullptr;
     }
@@ -386,7 +372,7 @@ class epoch_domain {
         atomic_reference_<std::int32_t> const claim {growing_};
         for (std::int32_t idle = 0;
              !claim.compare_exchange_weak(idle, 1, std::memory_order_acquire, std::memory_order_relaxed); idle = 0)
-            waiting_policy_type_ {}(&growing_, idle, std::size_t {0});
+            waiter_type_ {}(&growing_, idle, std::size_t {0});
         bool grown = shared_ != seen;
         if (!grown) grown = append_(seen ? seen->mask + 1 : 0);
         claim.store(0, std::memory_order_release);

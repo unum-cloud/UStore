@@ -8,16 +8,16 @@
  *  `src/nvme/variants.hpp` includes this file right before its table, as these calls build on its accesses, its
  *  writes and its catalog lookups. In a write addressing only docs collections, an upsert of a whole document writes
  *  it, JSON as written and any other type printed as JSON, and reads nothing. An update, an insertion, a patch, a
- *  merge, and an upsert of a field each append one @c json_fold delta to the document's change record, after
+ *  merge, and an upsert of a field each append one @c json_delta_t to the document's change delta, after
  *  replaying it over the document as the transaction sees it, read and watched. A modification that would fail
  *  answers as the read-modify-write of `src/docs.cpp` does and never lands, and a commit that changed the document
- *  since conflicts, so no record holds a delta that fails.
+ *  since conflicts, so no change delta carries a @c json_delta_t that fails.
  *
  *  The tasks of one call on one document apply in task order, each seeing the ones before it, and a call whose tasks
  *  leave a document known whole, past a whole upsert or over a document of no bytes, writes that document, since a
- *  change record over no bytes would fold as over a missing document. A write addressing any other collection,
+ *  change delta over no bytes would fold as over a missing document. A write addressing any other collection,
  *  the main one included, takes the read-modify-write of `src/docs.cpp` whole, as RAM does. Reads stay with
- *  `src/docs.cpp`, which reads through the engine's own blobs reads, folding the records.
+ *  `src/docs.cpp`, which reads through the engine's own blobs reads, folding the deltas.
  */
 
 #pragma once
@@ -30,7 +30,7 @@
 #include "ustore/docs.h"     // `ustore_docs_write_t`
 #include "ustore/ranges.hpp" // `place_batch_t`, `strided`
 
-#include "ustore/docs/json_fold.hpp"        // `json_fold`, `json_delta_t`, `encode_deltas`, `modifier_text`
+#include "ustore/docs/json_fold.hpp"        // `json_fold_t`, `json_delta_t`, `encode_deltas`, `modifier_text`
 #include "ustore/docs/json_values.hpp"      // `json_parse`, `extract_keys`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_allocator`
 
@@ -38,10 +38,10 @@ namespace unum::ustore::nvme {
 
 using docs::delta_modification_t;
 using docs::json_delta_t;
-using docs::json_fold;
+using docs::json_fold_t;
 
-/** The fold every change record of a docs collection is written for. */
-inline constexpr json_fold docs_fold_k {};
+/** The fold every change delta of a docs collection is written for. */
+inline constexpr json_fold_t docs_fold_k {};
 
 /** Whether every task of @p collections names a collection the catalog lists as holding @p modality, as @p view
  *  reads it, looking each run of tasks on one collection up once; a collection the catalog misses answers false, so
@@ -87,17 +87,17 @@ struct document_deltas_t {
 
 /**
  *  @brief Replays the deltas of @p document one by one over the document as @p access sees it, failing as the first
- *      failing one does, and stages them: the document they leave when it is known whole, or one change record.
+ *      failing one does, and writes them: the document they leave when it is known whole, or one change delta.
  *
  *  Stamps the deltas with the transaction's start, which the document they were checked against was read at.
  */
 template <cpu_class_t cpu_class_>
-status_t stage_document(call_access<cpu_class_> const& access, document_deltas_t const& document) noexcept {
+status_t write_document(call_access<cpu_class_> const& access, document_deltas_t const& document) noexcept {
     collection_id_t const collection = document.collection;
     stored_key_t const key = stored_of(document.key.uuid);
 
     // A present document of no bytes still views a byte, so the replay tells it from a missing one, while a change
-    // record over it would fold over no bytes, which is a missing document, so its changes write it whole
+    // delta over it would fold over no bytes, which is a missing document, so its changes write it whole
     docs::document_state_t replayed;
     bool whole = document.writes_whole();
     if (document.reads_base()) {
@@ -199,8 +199,8 @@ status_t docs_write(ustore_docs_write_t const& arguments, strings_arg_t const& f
                        reads ? watch_schedule_t::on_commit_k : watch_schedule_t::never_k,
                        [&](call_access<cpu_class_> const& access) noexcept -> status_t {
                            for (std::size_t index = 0; index != documents_count; ++index)
-                               if (status_t const staged = stage_document(access, documents[index]); staged.failed())
-                                   return staged;
+                               if (status_t const written = write_document(access, documents[index]); written.failed())
+                                   return written;
                            return {};
                        });
 }

@@ -3,7 +3,7 @@
  *  @author Ash Vardanian
  *  @date October 16, 2026
  *  @brief The fold that turns a stored base and the newer deltas of one key into the value a read sees, and
- *      @c last_write_fold, where the newest record wins.
+ *      @c last_write_fold_t, where the newest delta wins.
  *
  *  A collection keeps a base per key and appends deltas newer than it. A read folds the base with the deltas, oldest
  *  first, and a compaction folds a chain of deltas without its base into one, so the fold of a modality decides what a
@@ -22,26 +22,26 @@
 
 namespace unum::ustore::utilities {
 
-/** What one delta record does to the value of its key. */
+/** What one delta does to the value of its key. */
 enum class delta_kind_t : std::uint8_t {
 
-    /** Replaces the whole value, closing every older record. */
+    /** Replaces the whole value, closing every older delta. */
     write_k = 0,
 
-    /** Removes the key, closing every older record. */
+    /** Removes the key, closing every older delta. */
     remove_k = 1,
 
     /** Changes part of the value, which only the modality's fold reads. */
     change_k = 2,
 };
 
-/** One delta record of a key: what it does and the bytes it carries. */
+/** One delta of a key: its kind and the bytes it carries. */
 struct delta_view_t {
 
-    /** What the record does to the value. */
+    /** What the delta does to the value. */
     delta_kind_t kind = delta_kind_t::write_k;
 
-    /** The bytes the record carries, empty for a removal. */
+    /** The bytes the delta carries, empty for a removal. */
     std::span<byte_t const> bytes;
 };
 
@@ -49,7 +49,7 @@ struct delta_view_t {
  *  @brief Folds the base of a key and the deltas newer than it into the value a read sees.
  *
  *  Deltas arrive oldest first, so the newest is last. @c apply folds a base with its deltas, @c compose folds a chain
- *  of deltas without a base into one equivalent delta, as compaction does, and @c closes tells a record after which no
+ *  of deltas without a base into one equivalent delta, as compaction does, and @c closes tells a delta after which no
  *  older one matters, such as a removal or a full rewrite. A result may view the inputs, or bytes the fold wrote into
  *  the arena it is given.
  */
@@ -62,7 +62,7 @@ concept fold_concept = requires(fold_ const& fold, std::span<byte_t const> base,
 };
 
 /** The fold of blobs and strings, where every delta is a whole value or a removal and the newest one wins. */
-struct last_write_fold {
+struct last_write_fold_t {
 
     /** Whether a collection of @p modality keeps whole values alone: blobs, and the main one, which holds any. */
     static constexpr bool serves(ustore_modality_t modality) noexcept {
@@ -85,20 +85,20 @@ struct last_write_fold {
         return deltas.back().bytes;
     }
 
-    /** Every record replaces or removes the whole value, so each one closes the chain behind it. */
+    /** Every delta replaces or removes the whole value, so each one closes the chain behind it. */
     bool closes(delta_view_t const&) const noexcept { return true; }
 };
 
-static_assert(fold_concept<last_write_fold>);
+static_assert(fold_concept<last_write_fold_t>);
 
 /**
- *  @brief The one record that stands for change @p newer over @p older, which a merge keeps where no reader tells the
+ *  @brief The one delta that stands for change @p newer over @p older, which a merge keeps where no reader tells the
  *      two apart: a write of @p newer applied to a write or a removal below it, or one change composed of both.
- *  @return The record, whose bytes may sit in @p arena, or the status @p fold refused it with.
+ *  @return The delta, whose bytes may sit in @p arena, or the status @p fold refused it with.
  */
 template <fold_concept fold_type_>
-expected<delta_view_t> fold_pair(fold_type_ const& fold, delta_view_t const& newer, delta_view_t const& older,
-                                 arena_allocator<byte_t>& arena) noexcept {
+expected<delta_view_t> fold_delta_pair(fold_type_ const& fold, delta_view_t const& newer, delta_view_t const& older,
+                                       arena_allocator<byte_t>& arena) noexcept {
     if (older.kind == delta_kind_t::change_k) {
         delta_view_t const chain[2] {older, newer};
         auto [composed, compose_status] = fold.compose(std::span<delta_view_t const> {chain}, arena);

@@ -127,7 +127,7 @@ std::size_t uring_fails_one_request_of_a_batch(linux_uring_files_disk_t& disk, m
             failures += expect(disk.submit(queue_pair, std::span<request_t const> {batch}) == std::size_t {3});
 
             std::array<completion_t, polling_room_k> completions {};
-            failures += expect(poll_completions_at_least<waiting_policy_t>(
+            failures += expect(poll_completions_at_least<waiter_t>(
                                    disk, queue_pair, std::span<completion_t> {completions}, 3) == std::size_t {3});
             std::size_t refused = 0;
             std::size_t whole = 0;
@@ -163,7 +163,7 @@ std::size_t uring_cuts_a_chain_on_a_short_read(linux_uring_files_disk_t& disk, m
 
             failures += expect(disk.submit(queue_pair, std::span<request_t const> {chain}) == std::size_t {3});
             std::array<completion_t, polling_room_k> completions {};
-            failures += expect(poll_completions_at_least<waiting_policy_t>(
+            failures += expect(poll_completions_at_least<waiter_t>(
                                    disk, queue_pair, std::span<completion_t> {completions}, 3) == std::size_t {3});
             failures += expect(completions[0].state == completion_state_t::partial_k);
             failures += expect_eq(completions[0].transferred_bytes, reachable_k);
@@ -191,7 +191,7 @@ std::size_t uring_counts_completions_after_a_cancel(linux_uring_files_disk_t& di
             disk.cancel(queue_pair);
 
             std::array<completion_t, polling_room_k> completions {};
-            failures += expect(poll_completions_at_least<waiting_policy_t>(
+            failures += expect(poll_completions_at_least<waiter_t>(
                                    disk, queue_pair, std::span<completion_t> {completions}, queue_pair_depth_k) ==
                                std::size_t {queue_pair_depth_k});
             std::array<std::size_t, queue_pair_depth_k> seen {};
@@ -237,7 +237,7 @@ std::size_t uring_polls_an_overflowed_queue(linux_uring_files_disk_t& disk, medi
             std::array<completion_t, 1> narrow {};
             std::array<std::size_t, queue_pair_depth_k> seen {};
             for (std::size_t index = 0; index != queue_pair_depth_k; ++index) {
-                failures += expect(poll_completions_at_least<waiting_policy_t>(
+                failures += expect(poll_completions_at_least<waiter_t>(
                                        disk, queue_pair, std::span<completion_t> {narrow}, 1) == std::size_t {1});
                 std::uint32_t const tag = narrow[0].token.tag();
                 failures += expect(tag < queue_pair_depth_k);
@@ -272,7 +272,7 @@ std::size_t uring_polls_through_a_narrow_window(linux_uring_files_disk_t& disk, 
                                    std::size_t {queue_pair_depth_k});
                 std::array<completion_t, 1> narrow {};
                 for (std::size_t index = 0; index != queue_pair_depth_k; ++index) {
-                    failures += expect(poll_completions_at_least<waiting_policy_t>(
+                    failures += expect(poll_completions_at_least<waiter_t>(
                                            disk, queue_pair, std::span<completion_t> {narrow}, 1) == std::size_t {1});
                     failures += expect(narrow[0].completed_in_full());
                 }

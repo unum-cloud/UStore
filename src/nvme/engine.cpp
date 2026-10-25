@@ -5,7 +5,7 @@
  *  @brief The open of the NVMe engine, which picks the variant of `src/nvme/variants.hpp` the running CPU admits.
  *
  *  Every CPU class this build compiled has a variant, its calls instantiated in `src/nvme/variants_<class>.cpp` with
- *  the class's atomic reference and waiting policy. An open walks the classes newest first and takes the first one
+ *  the class's atomic reference and waiter. An open walks the classes newest first and takes the first one
  *  the machine confirms, ending on the serial floor, and every handle the variant hands out carries its table, so a
  *  call reaches the class it was opened with through that one pointer.
  */

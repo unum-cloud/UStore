@@ -71,14 +71,14 @@ A save copies the snapshot into a new database a memtable-sized batch at a time,
 ## NVMe
 
 `src/nvme/` is the hyper-converged engine, and the one UStore's hardware paths serve.
-A `database` holds `collection`s, each an `lsm_tree` of `lsm_level`s whose `lsm_sorted_run` files open with a `sorted_run_index` of `key_slot`s ahead of their `stored_value`s, with optimistic transactions.
+A `database` holds collections, each in an `nvme_store` over an `lsm_tree` of `lsm_level`s whose `lsm_sorted_run` files open with a `sorted_run_index` of `key_slot`s ahead of their `stored_value`s, with optimistic transactions.
 `src/nvme/variants.hpp` serves every slot of `engine_t` the RAM engine serves, its snapshots as stamps pinned in the database's commit ledger, once per CPU class of `src/lib.hpp`, and `src/nvme/engine.cpp` opens a database with the newest class the running CPU admits.
 Every collection of the C ABI is one collection of the database under its UUID, keyed by the 16 bytes of `ustore_key_t`.
 Its catalog maps every collection onto its name, the database's own catalog recording its modality, and a strings collection and the names live in the strings store of `include/ustore/strings/nvme_store.hpp`, keyed by whole strings, whose writes and watches join a transaction as a share of it.
-A graph collection lives in the graph store of `include/ustore/graph/nvme_store.hpp`, one key per vertex folded from half-edge change records, and `src/nvme/graph_calls.hpp` serves the graph calls of the table over it.
-A docs collection lives in the docs store of `include/ustore/docs/nvme_store.hpp`, whose field writes, patches and merges append `json_fold` change records through `src/nvme/docs_calls.hpp`.
-A pages collection lives in the pages store of `include/ustore/pages/nvme_store.hpp`, whose edits append `page_fold` change records through the `*_in_page_edits` calls of `src/pages.cpp` and `src/nvme/pages_calls.hpp`.
-Every other collection, the main one included, keeps documents and pages as whole values through `src/docs.cpp` and `src/pages.cpp`, as RAM does, and every read of either goes through the engine's blobs reads, which fold the change records.
+A graph collection lives in the graph store of `include/ustore/graph/nvme_store.hpp`, one key per vertex folded from half-edge change deltas, and `src/nvme/graph_calls.hpp` serves the graph calls of the table over it.
+A docs collection lives in the docs store of `include/ustore/docs/nvme_store.hpp`, whose field writes, patches and merges append `json_fold_t` change deltas through `src/nvme/docs_calls.hpp`.
+A pages collection lives in the pages store of `include/ustore/pages/nvme_store.hpp`, whose edits append `page_fold_t` change deltas through the `*_in_page_edits` calls of `src/pages.cpp` and `src/nvme/pages_calls.hpp`.
+Every other collection, the main one included, keeps documents and pages as whole values through `src/docs.cpp` and `src/pages.cpp`, as RAM does, and every read of either goes through the engine's blobs reads, which fold the change deltas.
 `USTORE_BUILD_NVME` is off by default, and the Python package turns it on; what follows is a v1 target:
 
 - __Kernel bypass__ — a transport chosen at mount reaches each data directory through io_uring on `O_DIRECT` files, io_uring on NVMe block devices, NVMe passthrough, or SPDK's user-space driver, and falls back to blocking positioned I/O on macOS, Windows and wherever io_uring is refused.

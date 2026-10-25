@@ -20,7 +20,7 @@ Pin a commit, not a version, when building on them.
   - `vram_nvidia_device.hpp`: CUDA devices, streams, events and buffers from the host.
   - `blocking_files.hpp`: whole-file mappings and directory queries.
   - `algorithm.hpp`: searches over sorted batches, reservoir sampling over ordered iterators, and inserts and erases in trivially copyable buffers.
-  - `folds.hpp`: `fold_concept`, which folds the base of a key with the deltas newer than it, and `last_write_fold`, where the newest record wins.
+  - `folds.hpp`: `fold_concept`, which folds the base of a key with the deltas newer than it, and `last_write_fold_t`, where the newest delta wins.
   - `nvme_ring.hpp`: aligned and budgeted allocators, completion counters, 128-bit identifiers, serialization, extents, and the submission and completion ring every NVMe transport exposes.
     It reaches no StringZilla, so CUDA translation units include it.
   - `nvme_disks.hpp`: the ring machinery every disk shares, the volume in memory, and the blocking floor of positioned reads and writes.
@@ -34,32 +34,32 @@ Pin a commit, not a version, when building on them.
   - `nvme_compaction.hpp` and `vram_nvidia_compaction.cuh`: the host compactor and the device one, whose kernels only nvcc compiles.
   - `nvme_tree.hpp`: configurations and schemas, LSM levels, the merge of one level into the next, and the level set readers see.
   - `nvme_write_buffer.hpp`: the in-memory write buffer of stored values.
-  - `nvme_store.hpp`: one collection, a write buffer and a value cache in front of a tree, with its snapshots and scanner.
+  - `nvme_store.hpp`: `nvme_store`, the store of one collection, memory runs and a value cache in front of a tree, with its snapshots and `nvme_store_cursor`.
   - `nvme_database.hpp`: databases of named collections and single-collection databases, their snapshots, optimistic transactions, registries and read sets.
 - `graph/`, in `unum::ustore::graph`:
   - `half_edges.hpp`: `half_edge_t`, the entry a graph collection files every vertex and both ends of every edge under, with its order and hash.
   - `ram_graph.hpp`: exporting degrees and edges from a store of half-edges, and staging edge and vertex inserts and removals.
   - `vertex_values.hpp`: the dense codec keeping every vertex as one value of its degrees and sorted neighborships.
-  - `adjacency_fold.hpp`: labeled edges and their half-edges, the 48-byte half-edge records a vertex value and its change records share, `adjacency_fold`, and the reads merging both.
-  - `nvme_store.hpp`: `nvme_graph`, the NVMe store of a graph collection, one collection keyed by vertex and folded by `adjacency_fold`.
+  - `adjacency_fold.hpp`: labeled edges and their half-edges, the 48-byte half-edge records a vertex value and its change deltas share, `adjacency_fold_t`, and the reads merging both.
+  - `nvme_store.hpp`: `nvme_store`, the NVMe store of a graph collection, one store keyed by vertex and folded by `adjacency_fold_t`.
 - `docs/`, in `unum::ustore::docs`:
   - `json_paths.hpp`: fields translated into chains of JSONPath prefixes and resolved for a batch of documents in one StringZilla subdocuments pass, into the same values yyjson's lookup finds, or handed back to yyjson where the pass cannot read a batch as yyjson does.
   - `json_values.hpp`: JSON documents parsed with yyjson into an arena, and the conversions between their values and the scalars, strings and UUIDs of a gathered column.
   - `json_patch.hpp`: RFC 6902 patches, RFC 7386 merges, and the field-level inserts, updates and upserts of a document.
-  - `json_fold.hpp`: `json_fold`, which replays deltas of one modification of one field each as `ustore_docs_write` reads, modifies and writes back today, and composes them without a base where that is sound.
+  - `json_fold.hpp`: `json_fold_t`, which replays deltas of one modification of one field each as `ustore_docs_write` reads, modifies and writes back today, and composes them without a base where that is sound.
 - `pages/`, in `unum::ustore::pages`:
   - `element_tree.hpp`: a page as an ordered tree of keyed elements, its dense serialized form, and a view addressing subtrees in place.
   - `page_edits.hpp`: the edits of a page and their serialized chains.
-  - `page_fold.hpp`: `page_fold`, which applies chains of edits in commit order into a page's current shape, and composes them without a base where that is sound.
+  - `page_fold.hpp`: `page_fold_t`, which applies chains of edits in commit order into a page's current shape, and composes them without a base where that is sound.
   - `markup.hpp`: XML and text import and render, and XPath reads through StringZilla's subdocuments engine.
 - `strings/`, in `unum::ustore::strings`:
   - `string_keys.hpp`: `string_key_t`, the owned key of a strings collection and of a collection's name, with its order and hash, and the 16-byte heads that search strings: `head_of` and `tail_of`.
   - `nvme_memory_run.hpp`: the memory runs of strings, keyed by whole strings on a tape and searched by their heads, and the cursor over a view of them.
-  - `nvme_store.hpp`: `strings_store`, the NVMe store of a strings collection, whose runs keep each string's head in a cell and the bytes past it in the run's tails, and `strings_transaction`, the strings one database transaction writes and watches, joined to it as a share.
+  - `nvme_store.hpp`: `nvme_store`, the NVMe store of a strings collection, whose runs keep each string's head in a cell and the bytes past it in the run's tails, and `nvme_transaction`, the strings one database transaction writes and watches, joined to it as a share.
 
 ## Building
 
-Every template that owns a shared word or waits on one takes the atomic reference and the waiting policy as template parameters, and names no CPU class, instruction or ForkUnion `preferred_*` alias; `src/` picks both per CPU class.
+Every template that owns a shared word or waits on one takes the atomic reference and the waiter as template parameters, wrapping the waiter in SmashTable's parking policy itself, and names no CPU class, instruction or ForkUnion `preferred_*` alias; `src/` picks both per CPU class.
 CMake exports the headers as the `ustore::header` interface target, which carries the include paths of `c/` and `include/` and links the header targets of ForkUnion, SmashTable and StringZilla, plus the include paths of yyjson and fmt, in the build tree.
 An install copies `include/ustore/` beside `c/ustore/` and `cpp/ustore/`, but none of the siblings' headers, so a consumer of the installed package brings each sibling's own package, as the C++ SDK already asks.
 Headers that call ForkUnion's C ABI, such as `ram_buffers.hpp` and `ram_device.hpp`, also need `forkunion::static` or `ustore::static` at link time.

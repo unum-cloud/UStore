@@ -9,11 +9,9 @@
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::int32_t`, `std::uint8_t`, `std::uint32_t`
-#include <cstring> // `std::memcpy`
 
-#include <new>         // `std::bad_alloc`
-#include <span>        // `std::span`
-#include <string_view> // `std::string_view`
+#include <new>  // `std::bad_alloc`
+#include <span> // `std::span`
 
 #include "ustore/blobs.h"   // `ustore_blobs_read_t`, `ustore_blobs_write_t` and the other binary calls
 #include "ustore/db.h"      // `ustore_database_t`, `ustore_transaction_t`, `ustore_view_t` and the calls on them
@@ -107,8 +105,7 @@ struct engine_t {
     status_t (*pages_remove_attributes)(ustore_pages_remove_attributes_t const&, strings_arg_t const& fields,
                                         view_t const&) noexcept;
     status_t (*pages_read)(ustore_pages_read_t const&, view_t const&) noexcept;
-    status_t (*strings_write)(ustore_strings_write_t const&, strings_arg_t const& strings, strings_arg_t const& values,
-                              view_t const&) noexcept;
+    status_t (*strings_write)(ustore_strings_write_t const&, strings_arg_t const& strings, view_t const&) noexcept;
     status_t (*strings_remove)(ustore_strings_remove_t const&, strings_arg_t const& strings, view_t const&) noexcept;
     status_t (*strings_read)(ustore_strings_read_t const&, strings_arg_t const& strings, view_t const&) noexcept;
     status_t (*strings_scan)(ustore_strings_scan_t const&, strings_arg_t const& prefixes,
@@ -283,43 +280,20 @@ status_t guarded(arguments_types_ const&... arguments) noexcept {
     }
 }
 
-/** How a call keys the collections it addresses. */
-enum class keying_t : std::uint8_t {
-    uuids_k,
-    strings_k,
+/** What the entries of a collection map, which picks how an engine serializes them. */
+enum class entry_layout_t : std::uint8_t {
+
+    /** A 16-byte UUID onto bytes: blobs, documents, pages, graph vertices and the main collection. */
+    uuids_to_bytes_k,
+
+    /** A string onto a 16-byte UUID: the strings modality, and the names system collection. */
+    strings_to_uuids_k,
 };
 
-/** How a collection holding @p modality is keyed. */
-constexpr keying_t keying_of(ustore_modality_t modality) noexcept {
-    return modality == ustore_modality_strings_k ? keying_t::strings_k : keying_t::uuids_k;
-}
-
-/** The record a collection's name maps onto: the bytes of the collection ID, whose modality the store records. */
-struct name_record_t {
-    char bytes[sizeof(ustore_collection_id_t)] {};
-
-    /** The record of the main collection. */
-    name_record_t() noexcept = default;
-
-    explicit name_record_t(ustore_collection_id_t id) noexcept { std::memcpy(bytes, &id, sizeof(id)); }
-
-    [[nodiscard]] std::string_view view() const noexcept { return {bytes, sizeof(bytes)}; }
-
-    [[nodiscard]] ustore_collection_id_t id() const noexcept {
-        ustore_collection_id_t collection;
-        std::memcpy(&collection, bytes, sizeof(collection));
-        return collection;
-    }
-};
-
-/** The record the bytes of @p record hold, refusing bytes of any other length. */
-template <typename bytes_type_>
-expected<name_record_t> read_name_record(bytes_type_ const& record) noexcept {
-    name_record_t read;
-    if (record.size() != sizeof(read.bytes))
-        return status_t {status_code_t::malformed_k, "A name holds no collection record"};
-    std::memcpy(read.bytes, record.data(), sizeof(read.bytes));
-    return read;
+/** The layout of the entries of a collection holding @p modality. */
+constexpr entry_layout_t entry_layout_of(ustore_modality_t modality) noexcept {
+    return modality == ustore_modality_strings_k ? entry_layout_t::strings_to_uuids_k
+                                                 : entry_layout_t::uuids_to_bytes_k;
 }
 
 } // namespace unum::ustore

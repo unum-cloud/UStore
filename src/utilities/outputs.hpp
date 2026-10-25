@@ -88,6 +88,48 @@ class read_outputs_t {
     }
 };
 
+/** The columns of a batched strings read in its arena: presences and the key every string maps onto, both sized by
+ *  the batch, so every key lands in place as it is found and nothing waits for @c finish. */
+class strings_read_outputs_t {
+    bits_span_t presences_ {};
+    ustore_key_t* keys_ = nullptr;
+    std::size_t index_ = 0;
+
+  public:
+
+    /** Opens the presences and keys @p arguments ask for in their arena. */
+    static expected<strings_read_outputs_t> make(ustore_strings_read_t const& arguments) noexcept {
+        std::size_t const count = arguments.count;
+        auto [presences, presences_status] = arena_allocate_bits(arguments.arena, arguments.presences ? count : 0);
+        if (presences_status.failed()) return presences_status;
+        auto [keys, keys_status] = arena_allocate<ustore_key_t>(arguments.arena, arguments.values ? count : 0);
+        if (keys_status.failed()) return keys_status;
+        strings_read_outputs_t outputs;
+        outputs.presences_ = presences.data();
+        outputs.keys_ = keys.data();
+        return outputs;
+    }
+
+    /** Appends the key a present string maps onto. */
+    void push_present(ustore_key_t key) noexcept {
+        if (presences_) presences_[index_] = true;
+        if (keys_) keys_[index_] = key;
+        ++index_;
+    }
+
+    /** Appends a missing string, which reads as the nil UUID. */
+    void push_missing() noexcept {
+        if (keys_) keys_[index_] = ustore_key_t {};
+        ++index_;
+    }
+
+    /** Exports every column into the outputs of @p arguments. */
+    void finish(ustore_strings_read_t const& arguments) const noexcept {
+        if (arguments.presences) *arguments.presences = presences_.get();
+        if (arguments.values) *arguments.values = keys_;
+    }
+};
+
 /** The columns of batched scans and samples: an offset per task in their arena, then the keys, which grow in scratch
  *  and are copied in once their count is known. */
 class scan_outputs_t {

@@ -3,14 +3,14 @@
  *  @author Ash Vardanian
  *  @date October 16, 2026
  *  @brief The graph adjacency fold: one value per vertex holding its sorted half-edges as the base, half-edge inserts
- *      and removals as change records, and reads that merge both in one pass.
+ *      and removals as change deltas, and reads that merge both in one pass.
  *
  *  A graph is one collection keyed by vertex, and the value of a vertex is its half-edges, ordered by neighbor, edge
  *  and role, which is also what names one, so an insert of a half-edge already held overwrites its weight and label.
- *  A write appends change records instead of rewriting the value: an insert or a removal of one half-edge, or a
- *  removal of every half-edge of the vertex, which closes every older record.
+ *  A write appends change deltas instead of rewriting the value: an insert or a removal of one half-edge, or a
+ *  removal of every half-edge of the vertex, which closes every older delta.
  *
- *  A change record and a half-edge of the base share one fixed-width layout, a base being the inserts of its
+ *  A change delta and a half-edge of the base share one fixed-width layout, a base being the inserts of its
  *  half-edges back to back. Folding is then a merge of two sorted arrays of one record type, which a GPU runs as well
  *  as a CPU, and a read seeks either array by binary search without decoding it. The fields take 42 bytes, padded to
  *  48, the next multiple of 16, so both identifiers of every record in a 16-byte aligned value stay aligned, at three
@@ -203,7 +203,7 @@ struct labeled_half_edge_t {
 
 #pragma region Delta Records
 
-/** What one change record does to the adjacency of its vertex. */
+/** What one change delta does to the adjacency of its vertex. */
 enum class half_edge_operation_t : std::uint8_t {
 
     /** Adds a half-edge, or overwrites the weight and label of the one with its neighbor, edge and role. */
@@ -212,7 +212,7 @@ enum class half_edge_operation_t : std::uint8_t {
     /** Removes the half-edge with its neighbor, edge and role, if there is one. */
     remove_k = 1,
 
-    /** Removes every half-edge of the vertex, closing every older record of it. */
+    /** Removes every half-edge of the vertex, closing every older delta of it. */
     remove_vertex_k = 2,
 };
 
@@ -349,15 +349,15 @@ expected<std::span<byte_t const>> encode_deltas(std::span<half_edge_delta_t cons
 }
 
 /** Records back to back, read in place: a chain of changes, or a vertex value. */
-class delta_chain_view {
+class half_edge_deltas_view_t {
   public:
-    delta_chain_view() noexcept = default;
+    half_edge_deltas_view_t() noexcept = default;
 
     /** The records @p bytes holds, refusing a ragged length; @ref check_composed and @ref check_base judge them. */
-    static expected<delta_chain_view> make(std::span<byte_t const> bytes) noexcept {
+    static expected<half_edge_deltas_view_t> make(std::span<byte_t const> bytes) noexcept {
         if (bytes.size() % half_edge_delta_bytes_k)
             return status_t {status_code_t::malformed_k, "A chain of half-edge deltas has a ragged length"};
-        delta_chain_view view;
+        half_edge_deltas_view_t view;
         view.bytes_ = bytes;
         return view;
     }
@@ -389,9 +389,9 @@ class delta_chain_view {
     std::span<byte_t const> bytes_;
 };
 
-/** Refuses @p chain unless it is as @c adjacency_fold::compose writes one: well-formed records naming strictly
+/** Refuses @p chain unless it is as @c adjacency_fold_t::compose writes one: well-formed records naming strictly
  *  ascending half-edges, after at most one removal of the vertex at its head. */
-inline status_t check_composed(delta_chain_view chain) noexcept {
+inline status_t check_composed(half_edge_deltas_view_t chain) noexcept {
     for (std::size_t index = 0; index != chain.size(); ++index) {
         if (status_t const status = check_delta(chain.record(index)); status.failed()) return status;
         if (chain.operation(index) == half_edge_operation_t::remove_vertex_k) {
@@ -405,8 +405,8 @@ inline status_t check_composed(delta_chain_view chain) noexcept {
     return {};
 }
 
-/** Refuses @p base unless it is as @c adjacency_fold::apply writes a vertex value: a composed chain of inserts. */
-inline status_t check_base(delta_chain_view base) noexcept {
+/** Refuses @p base unless it is as @c adjacency_fold_t::apply writes a vertex value: a composed chain of inserts. */
+inline status_t check_base(half_edge_deltas_view_t base) noexcept {
     for (std::size_t index = 0; index != base.size(); ++index)
         if (base.operation(index) != half_edge_operation_t::insert_k)
             return {status_code_t::malformed_k, "A vertex value holds a record other than an insert"};
@@ -422,15 +422,16 @@ inline status_t check_base(delta_chain_view base) noexcept {
  *
  *  An insert in the chain adds or overwrites the half-edge it names, a removal hides the one it names, and a removal
  *  of the vertex at the head of the chain hides the whole value, so the walk yields exactly the records
- *  @c adjacency_fold::apply writes, without writing them. A seek leaps over both arrays by binary search.
+ *  @c adjacency_fold_t::apply writes, without writing them. A seek leaps over both arrays by binary search.
  */
-class half_edge_cursor {
+class half_edge_cursor_t {
   public:
-    half_edge_cursor() noexcept = default;
+    half_edge_cursor_t() noexcept = default;
 
-    /** A walk over @p base, a vertex value, and @p chain, a chain @c adjacency_fold::compose wrote, both of which
+    /** A walk over @p base, a vertex value, and @p chain, a chain @c adjacency_fold_t::compose wrote, both of which
      *  must outlive it, standing on the first live half-edge. */
-    half_edge_cursor(delta_chain_view base, delta_chain_view chain) noexcept : base_(base), chain_(chain) {
+    half_edge_cursor_t(half_edge_deltas_view_t base, half_edge_deltas_view_t chain) noexcept
+        : base_(base), chain_(chain) {
         if (chain_.size() && chain_.operation(0) == half_edge_operation_t::remove_vertex_k)
             base_ = {}, chain_offset_ = 1;
         settle_();
@@ -494,18 +495,18 @@ class half_edge_cursor {
         }
     }
 
-    delta_chain_view base_, chain_;
+    half_edge_deltas_view_t base_, chain_;
     std::size_t base_offset_ = 0, chain_offset_ = 0;
     byte_t const* record_ = nullptr;
 };
 
 /** Walks the distinct neighbors of a half-edge walk, fitting `sorted_128_cursor_concept` for 128-bit intersections. */
-class neighbor_cursor {
+class neighbor_cursor_t {
   public:
-    neighbor_cursor() noexcept = default;
+    neighbor_cursor_t() noexcept = default;
 
     /** The neighbors of @p half_edges. */
-    explicit neighbor_cursor(half_edge_cursor half_edges) noexcept : half_edges_(half_edges) {}
+    explicit neighbor_cursor_t(half_edge_cursor_t half_edges) noexcept : half_edges_(half_edges) {}
 
     /** Whether the walk still stands on a neighbor. */
     bool valid() const noexcept { return half_edges_.valid(); }
@@ -528,10 +529,10 @@ class neighbor_cursor {
     }
 
   private:
-    half_edge_cursor half_edges_;
+    half_edge_cursor_t half_edges_;
 };
 
-static_assert(utilities::sorted_128_cursor_concept<neighbor_cursor>);
+static_assert(utilities::sorted_128_cursor_concept<neighbor_cursor_t>);
 
 #pragma endregion Merging Cursor
 
@@ -563,9 +564,9 @@ inline bool sequenced_less(sequenced_record_t const& first, sequenced_record_t c
  *  after which a removal of one half-edge has nothing left to hide and goes too. Without such a removal an insert
  *  followed by a removal of one half-edge still becomes the removal, because an older version may hold the half-edge.
  */
-struct adjacency_fold {
+struct adjacency_fold_t {
 
-    /** Bytes of every change record, one width for all, so a device merge can compose chains in place. */
+    /** Bytes of every change delta, one width for all, so a device merge can compose chains in place. */
     static constexpr std::size_t change_bytes_k = half_edge_delta_bytes_k;
 
     /** Whether a collection of @p modality folds half-edges, which a graph alone does. */
@@ -585,7 +586,7 @@ struct adjacency_fold {
             base = deltas[index].kind == delta_kind_t::write_k ? deltas[index].bytes : std::span<byte_t const> {};
             first_change = index + 1;
         }
-        auto base_view = delta_chain_view::make(base);
+        auto base_view = half_edge_deltas_view_t::make(base);
         if (!base_view) return base_view.status();
         if (status_t const status = check_base(*base_view); status.failed()) return status;
         std::span<delta_view_t const> const changes = deltas.subspan(first_change);
@@ -599,7 +600,7 @@ struct adjacency_fold {
         byte_t* const block = allocator.allocate(capacity);
         if (!block) return status_t {status_code_t::out_of_memory_k, "No room for a folded vertex value"};
         std::size_t written = 0;
-        for (half_edge_cursor cursor(*base_view, *delta_chain_view::make(*chain_bytes)); cursor.valid();
+        for (half_edge_cursor_t cursor(*base_view, *half_edge_deltas_view_t::make(*chain_bytes)); cursor.valid();
              cursor.next(), written += half_edge_delta_bytes_k)
             std::memcpy(block + written, cursor.record(), half_edge_delta_bytes_k);
         return std::span<byte_t const>(block, written);
@@ -622,7 +623,7 @@ struct adjacency_fold {
         for (delta_view_t const& delta : deltas) {
             if (delta.kind != delta_kind_t::change_k)
                 return status_t {status_code_t::invalid_argument_k, "A value write or removal is a base to apply"};
-            auto chain = delta_chain_view::make(delta.bytes);
+            auto chain = half_edge_deltas_view_t::make(delta.bytes);
             if (!chain) return chain.status();
             for (std::size_t index = 0; index != chain->size(); ++index)
                 if (status_t const status = check_delta(chain->record(index)); status.failed()) return status;
@@ -640,7 +641,7 @@ struct adjacency_fold {
         if (!entries) return status_t {status_code_t::out_of_memory_k, "No room to compose half-edge deltas"};
         std::size_t count = 0;
         for (delta_view_t const& delta : deltas) {
-            delta_chain_view const chain = *delta_chain_view::make(delta.bytes);
+            half_edge_deltas_view_t const chain = *half_edge_deltas_view_t::make(delta.bytes);
             for (std::size_t index = 0; index != chain.size(); ++index, ++count)
                 new (entries + count) sequenced_record_t {chain.record(index), static_cast<std::uint32_t>(count)};
         }
@@ -678,7 +679,7 @@ struct adjacency_fold {
         return std::span<byte_t const>(block, bytes);
     }
 
-    /** Whether @p delta makes every older record of its key irrelevant: a value write or removal, or a chain led by a
+    /** Whether @p delta makes every older delta of its key irrelevant: a value write or removal, or a chain led by a
      *  removal of the vertex, as every composed chain holding one is. */
     bool closes(delta_view_t const& delta) const noexcept {
         if (delta.kind != delta_kind_t::change_k) return true;
@@ -687,7 +688,7 @@ struct adjacency_fold {
     }
 };
 
-static_assert(utilities::fold_concept<adjacency_fold>);
+static_assert(utilities::fold_concept<adjacency_fold_t>);
 
 #pragma endregion Fold
 
@@ -697,35 +698,35 @@ static_assert(utilities::fold_concept<adjacency_fold>);
  *  @brief The adjacency of one vertex as a read sees it: its value merged with the composed chain of its pending
  *      changes, walked in place.
  *
- *  The value is checked for its length alone, trusted to be as @c adjacency_fold::apply wrote it, so a seek stays
+ *  The value is checked for its length alone, trusted to be as @c adjacency_fold_t::apply wrote it, so a seek stays
  *  logarithmic in the half-edges, while the pending chain is checked whole. Without pending changes a degree is the
  *  length of the value.
  */
-class vertex_adjacency {
+class vertex_adjacency_t {
   public:
 
-    /** The adjacency of @p vertex, whose value is @p base, with @p pending, a chain @c adjacency_fold::compose wrote,
+    /** The adjacency of @p vertex, whose value is @p base, with @p pending, a chain @c adjacency_fold_t::compose wrote,
      *  folded over it, both of which must outlive every read. */
-    static expected<vertex_adjacency> make(id_entity_t const& vertex, std::span<byte_t const> base,
-                                           std::span<byte_t const> pending) noexcept {
-        auto base_view = delta_chain_view::make(base);
+    static expected<vertex_adjacency_t> make(id_entity_t const& vertex, std::span<byte_t const> base,
+                                             std::span<byte_t const> pending) noexcept {
+        auto base_view = half_edge_deltas_view_t::make(base);
         if (!base_view) return base_view.status();
-        auto chain = delta_chain_view::make(pending);
+        auto chain = half_edge_deltas_view_t::make(pending);
         if (!chain) return chain.status();
         if (status_t const status = check_composed(*chain); status.failed()) return status;
-        return vertex_adjacency(vertex, *base_view, *chain);
+        return vertex_adjacency_t(vertex, *base_view, *chain);
     }
 
     /** A walk over every live half-edge. */
-    half_edge_cursor half_edges() const noexcept { return half_edge_cursor(base_, pending_); }
+    half_edge_cursor_t half_edges() const noexcept { return half_edge_cursor_t(base_, pending_); }
 
     /** A walk over the distinct neighbors, for `intersect_sorted_128`. */
-    neighbor_cursor neighbors() const noexcept { return neighbor_cursor(half_edges()); }
+    neighbor_cursor_t neighbors() const noexcept { return neighbor_cursor_t(half_edges()); }
 
     /** Calls @p callback with every live half-edge in order, stopping at the first failure it answers. */
     template <typename callback_type_>
     status_t for_each(callback_type_&& callback) const noexcept {
-        for (half_edge_cursor cursor = half_edges(); cursor.valid(); cursor.next())
+        for (half_edge_cursor_t cursor = half_edges(); cursor.valid(); cursor.next())
             if (status_t const status = callback(cursor.current()); status.failed()) return status;
         return {};
     }
@@ -734,7 +735,7 @@ class vertex_adjacency {
     std::size_t degree(role_t roles = any_role_k) const noexcept {
         if (!pending_.size() && roles == any_role_k) return base_.size();
         std::size_t count = 0;
-        for (half_edge_cursor cursor = half_edges(); cursor.valid(); cursor.next())
+        for (half_edge_cursor_t cursor = half_edges(); cursor.valid(); cursor.next())
             count += (cursor.current().role & roles) ? 1 : 0;
         return count;
     }
@@ -742,7 +743,7 @@ class vertex_adjacency {
     /** Calls @p callback with every live half-edge to @p neighbor, stopping at the first failure it answers. */
     template <typename callback_type_>
     status_t edges_to(id_entity_t const& neighbor, callback_type_&& callback) const noexcept {
-        half_edge_cursor cursor = half_edges();
+        half_edge_cursor_t cursor = half_edges();
         cursor.seek_neighbor(neighbor);
         for (; cursor.valid() && cursor.neighbor() == neighbor; cursor.next())
             if (status_t const status = callback(cursor.current()); status.failed()) return status;
@@ -753,16 +754,17 @@ class vertex_adjacency {
     id_entity_t vertex() const noexcept { return vertex_; }
 
   private:
-    vertex_adjacency(id_entity_t const& vertex, delta_chain_view base, delta_chain_view pending) noexcept
+    vertex_adjacency_t(id_entity_t const& vertex, half_edge_deltas_view_t base,
+                       half_edge_deltas_view_t pending) noexcept
         : vertex_(vertex), base_(base), pending_(pending) {}
 
     id_entity_t vertex_ {};
-    delta_chain_view base_, pending_;
+    half_edge_deltas_view_t base_, pending_;
 };
 
 /** Calls @p callback with every edge between @p adjacency's vertex and @p neighbor, as @p adjacency stores them. */
 template <typename callback_type_>
-status_t edges_between(vertex_adjacency const& adjacency, id_entity_t const& neighbor,
+status_t edges_between(vertex_adjacency_t const& adjacency, id_entity_t const& neighbor,
                        callback_type_&& callback) noexcept {
     id_entity_t const vertex = adjacency.vertex();
     return adjacency.edges_to(
@@ -772,9 +774,9 @@ status_t edges_between(vertex_adjacency const& adjacency, id_entity_t const& nei
 /** Calls @p callback with every distinct neighbor two vertices share, in order, through a 128-bit sorted
  *  intersection that leaps over the half-edges neither needs. */
 template <typename callback_type_>
-status_t common_neighbors(vertex_adjacency const& first, vertex_adjacency const& second,
+status_t common_neighbors(vertex_adjacency_t const& first, vertex_adjacency_t const& second,
                           callback_type_&& callback) noexcept {
-    neighbor_cursor first_neighbors = first.neighbors(), second_neighbors = second.neighbors();
+    neighbor_cursor_t first_neighbors = first.neighbors(), second_neighbors = second.neighbors();
     return intersect_sorted_128(first_neighbors, second_neighbors, callback);
 }
 

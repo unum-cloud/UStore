@@ -35,7 +35,6 @@
 #include <yyjson.h> // `yyjson_val`, `yyjson_read_number`
 
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
-#include <stringzilla/capabilities.h>  // `sz_capabilities_enabled_cpu`
 #include <stringzilla/find.h>          // `sz_find_byteset_best`
 #include <stringzilla/strings.h>       // `sz_strings_unescape_best`
 #include <stringzilla/subdocuments.h>  // `sz_subdocuments_engine_init`, `sz_subdocuments_find`
@@ -78,15 +77,6 @@ inline sz_allocator_t stringzilla_allocator(ustore_arena_t arena) noexcept {
     return {stringzilla_allocate, stringzilla_reallocate, stringzilla_free, arena};
 }
 
-/** The capabilities of this CPU that StringZilla dispatches on, probed once per process. */
-inline sz_capability_t stringzilla_capabilities() noexcept {
-    static sz_capability_t const capabilities = []() noexcept {
-        sz_capability_t probed = 0;
-        return sz_capabilities_enabled_cpu(&probed) == sz_success_k ? probed : sz_capability_t {0};
-    }();
-    return capabilities;
-}
-
 /** Views @p text as StringZilla's pointer and length. */
 inline sz_string_view_t stringzilla_view(std::string_view text) noexcept {
     sz_string_view_t view;
@@ -95,10 +85,12 @@ inline sz_string_view_t stringzilla_view(std::string_view text) noexcept {
     return view;
 }
 
-/** The first byte of @p text inside @p set at or after @p offset, or the length of @p text without one. */
-inline std::size_t find_byte_of(std::string_view text, std::size_t offset, sz_byteset_t const& set) noexcept {
+/** The first byte of @p text inside @p set at or after @p offset, or the length of @p text without one, found with
+ *  the StringZilla kernels @p capabilities allow. */
+inline std::size_t find_byte_of(std::string_view text, std::size_t offset, sz_byteset_t const& set,
+                                sz_capability_t capabilities) noexcept {
     sz_cptr_t match = nullptr;
-    sz_find_byteset_best(text.data() + offset, text.size() - offset, &set, &match, stringzilla_capabilities(), nullptr);
+    sz_find_byteset_best(text.data() + offset, text.size() - offset, &set, &match, capabilities, nullptr);
     return match ? static_cast<std::size_t>(match - text.data()) : text.size();
 }
 
@@ -249,13 +241,13 @@ struct field_cell_t {
 /** How a string body reads: whether it holds escapes, and whether yyjson would refuse its raw control bytes. */
 enum class string_body_t { plain_k, escaped_k, refused_k };
 
-/** Classifies the body of a string, between its quotes. */
-inline string_body_t classify_string_body(std::string_view body) noexcept {
+/** Classifies the body of a string, between its quotes, with the StringZilla kernels @p capabilities allow. */
+inline string_body_t classify_string_body(std::string_view body, sz_capability_t capabilities) noexcept {
     // Every control byte and `\`
     constexpr sz_byteset_t special_k {{0x00000000FFFFFFFFull, 0x0000000010000000ull, 0, 0}};
     string_body_t kind = string_body_t::plain_k;
-    for (std::size_t position = find_byte_of(body, 0, special_k); position != body.size();
-         position = find_byte_of(body, position, special_k)) {
+    for (std::size_t position = find_byte_of(body, 0, special_k, capabilities); position != body.size();
+         position = find_byte_of(body, position, special_k, capabilities)) {
         if (body[position] != '\\') return string_body_t::refused_k;
         kind = string_body_t::escaped_k;
         position += 2;
@@ -301,11 +293,12 @@ class subdocuments_engine_t {
         if (compiled_) sz_subdocuments_engine_free(&engine_, nullptr);
     }
 
-    /** Compiles the JSONPath @p paths with blocks of @p allocator, answering whether they compiled. */
-    bool compile(sz_strings_view_t const& paths, sz_allocator_t& allocator) noexcept {
+    /** Compiles the JSONPath @p paths with blocks of @p allocator for the kernels @p capabilities allow, answering
+     *  whether they compiled. */
+    bool compile(sz_strings_view_t const& paths, sz_allocator_t& allocator, sz_capability_t capabilities) noexcept {
         sz_size_t malformed_index = 0;
         compiled_ = succeeded(sz_subdocuments_engine_init(&engine_, &paths, sz_subdocuments_json_k, &malformed_index,
-                                                          stringzilla_capabilities(), &allocator, nullptr));
+                                                          capabilities, &allocator, nullptr));
         return compiled_;
     }
 
@@ -328,13 +321,14 @@ class subdocuments_engine_t {
  *  @param[in] cell_of Called as `cell_of(index)`, answering the @c field_cell_t of cell @p index.
  *  @param[in] containers_parsed Whether objects and arrays parse with yyjson, or only carry their type.
  *  @param[in] scratch Holds the engine, the span table and every value, until it rewinds.
+ *  @param[in] capabilities The StringZilla kernels the running CPU allows, which `src/` probes once.
  *  @param[out] values One value per cell, @c nullptr where the field is missing.
  *  @return Whether every cell resolved; false asks the caller to parse the documents with yyjson instead.
  */
 template <typename cell_of_type_>
 bool resolve_fields(json_documents_t const& documents, std::span<std::string_view const> fields,
                     std::size_t cells_count, cell_of_type_ const& cell_of, bool containers_parsed,
-                    ustore_arena_t scratch, std::span<yyjson_val*> values) noexcept {
+                    ustore_arena_t scratch, sz_capability_t capabilities, std::span<yyjson_val*> values) noexcept {
     if (!cells_count) return true;
     if (documents.tape.layout != ustore_strings_u32_tape_k && documents.tape.layout != ustore_strings_u64_tape_k)
         return false;
@@ -393,7 +387,7 @@ bool resolve_fields(json_documents_t const& documents, std::span<std::string_vie
     paths_view.count = paths_count;
     paths_view.data.u64_tape.data = reinterpret_cast<sz_cptr_t>(paths_tape.data.u64_tape.data);
     paths_view.data.u64_tape.offsets = paths_tape.data.u64_tape.offsets;
-    if (!engine.compile(paths_view, allocator)) return false;
+    if (!engine.compile(paths_view, allocator, capabilities)) return false;
 
     auto [matches_offsets, offsets_status] = arena_allocate<sz_size_t>(scratch, documents_count + 1);
     if (offsets_status.failed()) return false;
@@ -460,7 +454,7 @@ bool resolve_fields(json_documents_t const& documents, std::span<std::string_vie
         case '"': {
             if (text.size() < 2 || text.back() != '"') return false;
             std::string_view const body = text.substr(1, text.size() - 2);
-            string_body_t const kind = classify_string_body(body);
+            string_body_t const kind = classify_string_body(body, capabilities);
             if (kind == string_body_t::refused_k) return false;
             bodies[bodies_count++] = stringzilla_view(body);
             if (kind == string_body_t::escaped_k) escaped_cells[escaped_count++] = cell_index;
@@ -482,7 +476,7 @@ bool resolve_fields(json_documents_t const& documents, std::span<std::string_vie
         sz_strings_from_string_views(bodies.data(), bodies_count, &bodies_view);
         sz_size_t malformed_index = 0;
         if (!succeeded(sz_utf8_count_strings_best(&bodies_view, nullptr, bodies_count, nullptr, &malformed_index,
-                                                  stringzilla_capabilities(), nullptr)))
+                                                  capabilities, nullptr)))
             return false;
     }
 
@@ -497,7 +491,7 @@ bool resolve_fields(json_documents_t const& documents, std::span<std::string_vie
         sz_strings_span_t unescaped {};
         sz_size_t malformed_index = 0;
         if (!succeeded(sz_strings_unescape_best(&escaped_view, nullptr, escaped_count, sz_escape_json_k, &allocator,
-                                                &unescaped, &malformed_index, stringzilla_capabilities(), nullptr)))
+                                                &unescaped, &malformed_index, capabilities, nullptr)))
             return false;
         for (std::size_t escaped_index = 0; escaped_index != escaped_count; ++escaped_index) {
             std::size_t begin = 0, end = 0;

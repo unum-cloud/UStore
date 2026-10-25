@@ -5,14 +5,15 @@
  *  @brief The NVMe store of a strings collection, keyed by whole strings: strings memory runs in front of an LSM tree
  *      whose runs carry the tails of their strings, and the strings one database transaction writes and watches.
  *
- *  Every string is a key of its own. A memory run keeps it whole on its key tape, and a run file keeps its 16-byte
- *  head in a cell and the bytes past the head in the run's tails, which are read into memory with the index, so a
- *  lookup binary-searches the heads and compares tails only between equal heads, with no I/O. Two strings sharing
+ *  Every string is a key of its own, mapped onto one 16-byte key of another collection. A memory run keeps it whole on
+ *  its key tape, and a run file keeps its 16-byte head and its 16-byte value in a 32-byte cell and the bytes past the
+ *  head in the run's tails, which are read into memory with the index, so a lookup binary-searches the heads and
+ *  compares tails only between equal heads, and answers the value from the cell, with no I/O. Two strings sharing
  *  their leading 15 bytes stay two keys everywhere: in a commit's watches, in a merge, which keeps the newest version
  *  of each, and in a sorted level, whose runs never split one head, so a level finds a head in one run.
  *
  *  The store lives in a database beside the blobs stores and draws its stamps from the same ledger. The database keys
- *  its own transactions by 16 bytes, so the strings of a transaction ride in a @c strings_transaction, which joins the
+ *  its own transactions by 16 bytes, so the strings of a transaction ride in a @c nvme_transaction, which joins the
  *  database transaction as a share: its owner seals it before the commit, and the leader checks its watches, lays out
  *  its views and publishes them under the stamp the rest of the commit lands under.
  */
@@ -27,7 +28,7 @@
 #include <compare>     // `std::strong_ordering`
 #include <memory>      // `std::unique_ptr`
 #include <new>         // `std::nothrow`
-#include <span>        // `std::span`
+#include <span>        // `std::span`, `std::as_bytes`
 #include <string_view> // `std::string_view`
 #include <type_traits> // `std::is_same_v`, `std::remove_cvref_t`
 #include <utility>     // `std::exchange`, `std::move`
@@ -37,12 +38,12 @@
 #include <stringzilla/stringzilla.hpp>     // `sz::string_view_t`
 
 #include "ustore/blobs/nvme_collection_view.hpp" // `collection_view`, `published_view`
-#include "ustore/blobs/nvme_store.hpp"           // `commit_ledger`, `stamp_pin`, `select_result_t`, `memory_pressure_t`
+#include "ustore/blobs/nvme_store.hpp"           // `commit_ledger`, `stamp_pin`, `lookup_result_t`, `memory_pressure_t`
 #include "ustore/blobs/nvme_database.hpp"        // `transaction_share_t`
 #include "ustore/blobs/nvme_tree.hpp"            // `lsm_tree`, `collection_config_t`, `lsm_tree_publication_hook_t`
-#include "ustore/strings/string_keys.hpp"        // `head_of`, `tail_of`, `head_prefix_bytes_k`
-#include "ustore/strings/nvme_memory_run.hpp"    // `strings_memory_run`, `strings_sealed_writes`, `kept_versions`
-#include "ustore/utilities/folds.hpp"            // `last_write_fold`, `delta_view_t`
+#include "ustore/strings/string_keys.hpp"        // `head_of`, `head_length_of`, `tail_of`, `head_prefix_bytes_k`
+#include "ustore/strings/nvme_memory_run.hpp"    // `memory_run`, `sealed_deltas`, `kept_versions`
+#include "ustore/utilities/folds.hpp"            // `last_write_fold_t`, `delta_view_t`
 #include "ustore/utilities/ram_buffers.hpp"      // `local_arena_t`
 #include "ustore/utilities/types.hpp"            // `status_t`, `expected`, `byte_t`
 
@@ -58,7 +59,9 @@ using blobs::compaction_placement_t;
 using blobs::head_stamp_k;
 using blobs::invalid_transaction_stamp_k;
 using blobs::key_slot;
+using blobs::key_tails_column_t;
 using blobs::key_tails_t;
+using blobs::lookup_result_t;
 using blobs::lsm_level_order_t;
 using blobs::lsm_tree;
 using blobs::lsm_tree_publication_hook_t;
@@ -66,10 +69,7 @@ using blobs::lsm_tree_run_record_t;
 using blobs::memory_pressure_t;
 using blobs::memory_shape_t;
 using blobs::published_view;
-using blobs::scan_page_keys_k;
-using blobs::select_result_t;
-using blobs::sorted_run_config_t;
-using blobs::sorted_run_layout;
+using blobs::scan_page_keys;
 using blobs::stamp_pin;
 using blobs::stored_value_size_t;
 using blobs::transaction_share_t;
@@ -82,36 +82,28 @@ using utilities::resource_constraint;
 
 #pragma region Keys
 
-/** The cell of a strings run: the head of a string, and the size and location of its value. */
-struct string_key_slot : key_slot<ustore_key_t, value_layout_t::variable_width_k> {
-
-    /** Runs of these cells carry the tails of their strings, which tell the strings of one head apart. */
-    static constexpr bool carries_tails_k = true;
-};
-
 /** Orders the string of head @p first_head and tail @p first_tail against another, by heads and then by tails, which
  *  unsigned byte order of the whole strings agrees with. */
-inline std::strong_ordering order_keys(ustore_key_t const& first_head, std::string_view first_tail,
-                                       ustore_key_t const& second_head, std::string_view second_tail) noexcept {
+inline std::strong_ordering order_keys(st::key128_t const& first_head, std::string_view first_tail,
+                                       st::key128_t const& second_head, std::string_view second_tail) noexcept {
     std::strong_ordering const heads = first_head <=> second_head;
     if (heads != 0) return heads;
     return first_tail.compare(second_tail) <=> 0;
 }
 
-/** The string whose head is @p head and whose tail is @p tail: viewing the head when it holds the string whole, and
- *  otherwise copied into @p whole, which @p tail must not view. */
+/** The string whose head is @p head and whose tail is @p tail, copied into @p whole, which @p tail must not view;
+ *  a string the head holds whole has no tail. */
 template <typename buffer_type_>
-status_t string_of_key(ustore_key_t const& head, std::string_view tail, buffer_type_& whole,
+status_t string_of_key(st::key128_t const& head, std::string_view tail, buffer_type_& whole,
                        std::string_view& text) noexcept {
-    std::uint8_t const length = head.uuid.bytes[head_prefix_bytes_k];
-    if (length <= head_prefix_bytes_k) {
-        text = std::string_view {reinterpret_cast<char const*>(head.uuid.bytes), length};
-        return {};
-    }
-    if (whole.resize(head_prefix_bytes_k + tail.size()) != st::status_t::success_k)
+    std::size_t const length = head_length_of(head);
+    std::size_t const leading = length <= head_prefix_bytes_k ? length : head_prefix_bytes_k;
+    if (whole.resize(leading + tail.size()) != st::status_t::success_k)
         return {status_code_t::out_of_memory_k, "No room to put a string back together"};
-    std::memcpy(whole.data(), head.uuid.bytes, head_prefix_bytes_k);
-    if (!tail.empty()) std::memcpy(whole.data() + head_prefix_bytes_k, tail.data(), tail.size());
+    std::byte head_bytes[sizeof(st::key128_t)];
+    head.to_bytes(head_bytes);
+    if (leading != 0) std::memcpy(whole.data(), head_bytes, leading);
+    if (!tail.empty()) std::memcpy(whole.data() + leading, tail.data(), tail.size());
     text = std::string_view {whole.begin(), whole.end()};
     return {};
 }
@@ -121,7 +113,7 @@ status_t string_of_key(ustore_key_t const& head, std::string_view tail, buffer_t
 #pragma region Pages
 
 /** Strings one page of a walk lists at most, as many as a page of a scan of 16-byte keys holds. */
-inline constexpr std::size_t strings_page_k = scan_page_keys_k<std::string_view>;
+inline constexpr std::size_t strings_page_k = scan_page_keys<std::string_view>();
 
 /** One string a page of a walk lists, located in the page's texts. */
 struct listed_string_t {
@@ -133,10 +125,10 @@ struct listed_string_t {
     std::size_t length = 0;
 
     /** Whether its newest version carries a value or a removal. */
-    select_result_t state = select_result_t::nothing_k;
+    lookup_result_t state = lookup_result_t::missing_k;
 
-    /** Bytes the value takes, zero for a removal. */
-    stored_value_size_t size = 0;
+    /** The 16 bytes of the value as they were written, zero for a removal. */
+    ustore_key_t value {};
 };
 
 /** The strings one page of a walk read, in order, copied out of the runs, so they outlive the epoch they were read in;
@@ -171,32 +163,33 @@ struct strings_page_t {
  *  A reader announces itself in its ledger's epochs, loads the published stamp and then the view, and walks immutable
  *  runs with no lock. A committer seals its strings into one memory run on its own thread, and the ledger's leader
  *  publishes a view naming it ahead of the others. Merges of memory runs, flushes, compactions and truncations follow
- *  @c blobs::collection, and are serialized by the database that owns the store. A string's newest version answers it,
+ *  @c blobs::nvme_store, and are serialized by the database that owns the store. A string's newest version answers it,
  *  a removal included, and every version a pinned reader or a mount needs survives a merge.
  *
  *  @tparam atomic_reference_ The reference the published view, the budget and the ledger own their words through.
- *  @tparam waiting_policy_type_ What a core waiting on a read, a barrier or the ledger does, and how it parks.
+ *  @tparam waiter_type_ What a core waiting on a read, a barrier or the ledger does between attempts, before it parks.
  */
-template <typename volume_type_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
-class strings_store {
+template <typename volume_type_, template <typename> typename atomic_reference_, typename waiter_type_>
+class nvme_store {
   public:
 
 #pragma region Types
 
-    /** The cell every run of this store holds. */
-    using key_slot_t = string_key_slot;
+    /** The cell every run of this store holds: the head of a string and the 16 bytes of its value, in runs that carry
+     *  the tails of their strings, which tell the strings of one head apart. */
+    using key_slot_t = key_slot<st::key128_t, value_layout_t::uuid_k, key_tails_t::carried_k>;
 
     /** The volume every run of this store lives on. */
     using volume_t = volume_type_;
 
-    /** What a record of this store does, which is always a whole value or a removal. */
-    using fold_t = utilities::last_write_fold;
+    /** What a delta of this store does, which is always a whole value or a removal. */
+    using fold_t = utilities::last_write_fold_t;
 
     /** The key a caller addresses this store by. */
     using stored_key_t = std::string_view;
 
     /** The tree the flushed strings live in. */
-    using tree_t = lsm_tree<key_slot_t, volume_t, atomic_reference_, waiting_policy_type_>;
+    using tree_t = lsm_tree<key_slot_t, volume_t, atomic_reference_, waiter_type_>;
 
     /** One level set of that tree, which a view names. */
     using level_set_t = typename tree_t::level_set_t;
@@ -205,10 +198,10 @@ class strings_store {
     using sorted_run_t = typename tree_t::sorted_run_t;
 
     /** The stamps this store's writes carry and its readers pin. */
-    using ledger_t = commit_ledger<atomic_reference_, waiting_policy_type_>;
+    using ledger_t = commit_ledger<atomic_reference_, waiter_type_>;
 
     /** One stamp a reader or a view of this store holds against the ledger. */
-    using pin_t = stamp_pin<atomic_reference_, waiting_policy_type_>;
+    using pin_t = stamp_pin<atomic_reference_, waiter_type_>;
 
     /** The budget the memory runs are charged to. */
     using constraint_t = resource_constraint<atomic_reference_>;
@@ -217,29 +210,26 @@ class strings_store {
     using allocator_t = constrained_allocator<byte_t, atomic_reference_>;
 
     /** One commit's strings, sorted and copied, before they are stamped. */
-    using sealed_writes_t = strings_sealed_writes<allocator_t>;
+    using sealed_deltas_t = sealed_deltas<allocator_t>;
 
     /** One commit's strings, stamped, which nothing changes once a view names them. */
-    using memory_run_t = strings_memory_run<allocator_t>;
+    using memory_run_t = memory_run<allocator_t>;
 
     /** The memory runs one view names, newest first. */
     using memory_view_t = collection_view<memory_run_t>;
 
-    /** One record a commit hands over: the string, what the record does, and its bytes. */
+    /** One delta a commit hands over: the string, its kind, and its bytes. */
     using keyed_delta_t = keyed_delta<std::string_view>;
 
     /** One version a merge or a flush carries over from a memory run. */
     using stamped_delta_t = stamped_delta<std::string_view>;
 
-    /** Where the sections of one flushed run sit inside its blob. */
-    using sorted_run_layout_t = sorted_run_layout<key_slot_t>;
-
     /** One commit's strings for this store, sealed off every shared path by its committer, and the run the leader
      *  stamps them into, both charged to the store's budget. */
     struct sealed_commit_t {
 
-        /** The records, sorted and copied, which the leader moves into @c run once it draws the stamp. */
-        sealed_writes_t writes;
+        /** The deltas, sorted and copied, which the leader moves into @c run once it draws the stamp. */
+        sealed_deltas_t deltas;
 
         /** The run they become, allocated by the committer, owned by the store once published. */
         std::unique_ptr<memory_run_t> run;
@@ -265,34 +255,29 @@ class strings_store {
 
 #pragma region Construction
 
-    strings_store() noexcept = default;
-    strings_store(strings_store const&) = delete;
-    strings_store& operator=(strings_store const&) = delete;
-    strings_store(strings_store&&) noexcept = default;
-    strings_store& operator=(strings_store&&) noexcept = default;
+    nvme_store() noexcept = default;
+    nvme_store(nvme_store const&) = delete;
+    nvme_store& operator=(nvme_store const&) = delete;
+    nvme_store(nvme_store&&) noexcept = default;
+    nvme_store& operator=(nvme_store&&) noexcept = default;
 
     /**
      *  @brief An empty store over @p volume, whose memory is charged to @p constraint.
      *  @param[inout] volume The volume every run lands on, borrowed and outliving the store.
-     *  @param[in] config The bounds of the memory runs, the widths of the values and the shape of the tree below.
+     *  @param[in] config The bounds of the memory runs and the shape of the tree below.
      *  @param[inout] constraint The budget the memory runs are charged to.
      *  @param[inout] ledger The stamps the store's writes carry and its readers pin, outliving the store.
      */
-    static expected<strings_store> mount(volume_t& volume, collection_config_t const& config, constraint_t& constraint,
-                                         ledger_t& ledger) noexcept {
-        sorted_run_config_t const& values = config.lsm_tree.lsm_level_0.sorted_run;
-        strings_store mounted;
+    static expected<nvme_store> mount(volume_t& volume, collection_config_t const& config, constraint_t& constraint,
+                                      ledger_t& ledger) noexcept {
+        nvme_store mounted;
         mounted.config_ = config;
         mounted.constraint_ = &constraint;
         mounted.ledger_ = &ledger;
-        mounted.value_size_ = values.value_size;
-        mounted.value_max_size_ = values.value_size != 0 ? values.value_size : values.value_max_size;
-        if (mounted.value_max_size_ == 0)
-            return status_t {status_code_t::invalid_argument_k, "A collection admits values of some width"};
-        if (config.write_buffer_max_elements == 0)
+        if (config.memory_runs_max_deltas == 0)
             return status_t {status_code_t::invalid_argument_k, "A collection holds at least one write in memory"};
 
-        auto [tree, mount_tree_status] = tree_t::mount(volume, config.lsm_tree, config.write_buffer_max_bytes);
+        auto [tree, mount_tree_status] = tree_t::mount(volume, config.lsm_tree, config.memory_runs_max_bytes);
         if (mount_tree_status.failed()) return mount_tree_status;
         mounted.tree_ = std::move(tree);
         mounted.current_.reset(new (std::nothrow) view_t {});
@@ -303,10 +288,10 @@ class strings_store {
         return mounted;
     }
 
-    /** Whether a collection of @p modality is one this store keeps: the strings modality, whatever its values' layout,
-     *  as a strings run locates its values by size and offset. */
-    [[nodiscard]] static bool serves(ustore_modality_t modality, value_layout_t) noexcept {
-        return modality == ustore_modality_strings_k;
+    /** Whether a collection of @p modality with values of @p layout is one this store keeps: the strings modality,
+     *  every value of which is one 16-byte key. */
+    [[nodiscard]] static bool serves(ustore_modality_t modality, value_layout_t layout) noexcept {
+        return modality == ustore_modality_strings_k && layout == value_layout_t::uuid_k;
     }
 
     /** Returns every run to the volume and forgets every memory run, which destroys the data and which only a store no
@@ -328,8 +313,8 @@ class strings_store {
     /** The tree the flushed strings live in, which a database compacts and names in its catalog. */
     [[nodiscard]] tree_t const& tree() const noexcept { return tree_; }
 
-    /** Bytes the largest value this store admits takes. */
-    [[nodiscard]] stored_value_size_t value_max_size() const noexcept { return value_max_size_; }
+    /** Bytes every value this store admits takes: one 16-byte key. */
+    [[nodiscard]] stored_value_size_t value_max_size() const noexcept { return key_slot_t::size; }
 
     /** How many memory runs the published view names, and how many commits they hold. */
     [[nodiscard]] memory_shape_t memory_shape() const noexcept {
@@ -337,19 +322,18 @@ class strings_store {
         memory_shape_t shape;
         for (memory_run_t const* run : view_.load()->memory_runs.runs()) {
             std::uint64_t commits = 1;
-            for (std::uint32_t generation = 0; generation != run->generation(); ++generation)
-                commits *= config_.lsm_tree.level_enlarge_factor;
+            for (std::uint32_t tier = 0; tier != run->tier(); ++tier) commits *= config_.lsm_tree.level_enlarge_factor;
             shape.commits += commits;
             ++shape.runs;
         }
         return shape;
     }
 
-    /** Records the memory runs hold plus key slots every level holds, one string counted once per run holding it. */
+    /** Deltas the memory runs hold plus key slots every level holds, one string counted once per run holding it. */
     [[nodiscard]] std::uint64_t population_count() const noexcept {
         reader_t const inside = ledger_->epochs().enter();
         view_t const& view = *view_.load();
-        return memory_records_(view) + view.levels->population_count();
+        return memory_deltas_(view) + view.levels->population_count();
     }
 
     /** Bytes every run of every level takes on its volume. */
@@ -363,54 +347,48 @@ class strings_store {
 #pragma region Lookups
 
     /**
-     *  @brief Whether anything carries @p text, and how many bytes its value takes.
-     *  @param[out] size Bytes the value takes, which is zero for anything but @c success_k.
+     *  @brief Whether anything carries @p text, copying its 16-byte value into @p value from a memory run or from a
+     *      cell, with no I/O.
+     *  @param[out] value The value, written only for @c written_k.
      *  @param[in] stamp The stamp a reader is pinned at, or @c head_stamp_k for the published one.
      *  @param[in] thread_index The executor thread reading, which announces on its own epoch slot.
      */
-    [[nodiscard]] select_result_t find(std::string_view text, stored_value_size_t& size,
+    [[nodiscard]] lookup_result_t find(std::string_view text, std::span<byte_t, key_slot_t::size> value,
                                        transaction_stamp_t stamp = head_stamp_k,
                                        std::size_t thread_index = outside_executor_k) const noexcept {
-        size = 0;
         reader_t const inside = ledger_->epochs().enter(thread_index);
         reading_t const read = reading_(stamp);
         found_t found;
-        if (!newest_(*read.view, text, read.stamp, found)) return select_result_t::nothing_k;
-        if (found.delta.kind == delta_kind_t::remove_k) return select_result_t::erased_k;
-        size = found.run ? found.run->key_slot(found.position).size
-                         : static_cast<stored_value_size_t>(found.delta.bytes.size());
-        return select_result_t::success_k;
+        if (!newest_(*read.view, text, read.stamp, found)) return lookup_result_t::missing_k;
+        if (found.delta.kind == delta_kind_t::remove_k) return lookup_result_t::removed_k;
+        std::memcpy(value.data(), found.run ? found.run->key_slot(found.position).data : found.delta.bytes.data(),
+                    key_slot_t::size);
+        return lookup_result_t::written_k;
+    }
+
+    /** Whether anything carries @p text, answering in @p size the 16 bytes its value takes, or zero for anything but
+     *  @c written_k, as a database asks of every store. */
+    [[nodiscard]] lookup_result_t find(std::string_view text, stored_value_size_t& size,
+                                       transaction_stamp_t stamp = head_stamp_k,
+                                       std::size_t thread_index = outside_executor_k) const noexcept {
+        byte_t value[key_slot_t::size];
+        lookup_result_t const found = find(text, value, stamp, thread_index);
+        size = found == lookup_result_t::written_k ? key_slot_t::size : 0;
+        return found;
     }
 
     /**
-     *  @brief Copies the value of @p text into @p into, which needs only the value's own bytes.
-     *  @param[inout] channel The channel a value of a level is read on, held by the calling thread.
+     *  @brief Copies the 16-byte value of @p text into @p into, as a database asks of every store, with no I/O.
      *  @param[out] size Bytes written, which is zero for every failure.
-     *  @return @c not_found_k for a miss or a removal, @c invalid_argument_k for a buffer shorter than the value.
+     *  @return @c not_found_k for a miss or a removal, @c invalid_argument_k for a buffer shorter than 16 bytes.
      */
-    status_t select(io_channel_t& channel, std::string_view text, std::span<byte_t> into, stored_value_size_t& size,
+    status_t select(io_channel_t&, std::string_view text, std::span<byte_t> into, stored_value_size_t& size,
                     transaction_stamp_t stamp = head_stamp_k, std::size_t thread_index = outside_executor_k) noexcept {
         size = 0;
-        reader_t const inside = ledger_->epochs().enter(thread_index);
-        reading_t const read = reading_(stamp);
-        found_t found;
-        if (!newest_(*read.view, text, read.stamp, found))
+        if (into.size() < key_slot_t::size) return {status_code_t::invalid_argument_k, "A buffer shorter than a key"};
+        if (find(text, into.first<key_slot_t::size>(), stamp, thread_index) != lookup_result_t::written_k)
             return {status_code_t::not_found_k, "No version carries that string"};
-        if (found.delta.kind == delta_kind_t::remove_k) return {status_code_t::not_found_k, "A commit removed it"};
-        if (!found.run) {
-            if (into.size() < found.delta.bytes.size())
-                return {status_code_t::invalid_argument_k, "A buffer shorter than the value"};
-            if (!found.delta.bytes.empty())
-                std::memcpy(into.data(), found.delta.bytes.data(), found.delta.bytes.size());
-            size = static_cast<stored_value_size_t>(found.delta.bytes.size());
-            return {};
-        }
-        key_slot_t const& slot = found.run->key_slot(found.position);
-        if (into.size() < slot.size) return {status_code_t::invalid_argument_k, "A buffer shorter than the value"};
-        if (status_t const read_status = found.run->read_value(channel, slot, into.first(slot.size));
-            read_status.failed())
-            return read_status;
-        size = slot.size;
+        size = key_slot_t::size;
         return {};
     }
 
@@ -436,7 +414,7 @@ class strings_store {
         st::basic_vector<cursor_t> cursors;
         if (cursors.reserve(runs) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A walk could not hold a cursor per run"};
-        ustore_key_t const from_head = head_of(from);
+        st::key128_t const from_head = head_of(from);
         std::string_view const from_tail = tail_of(from);
         for (memory_run_t const* run : view.memory_runs.runs()) {
             cursor_t cursor;
@@ -470,7 +448,7 @@ class strings_store {
             }
             if (smallest == cursors.size()) return {};
 
-            ustore_key_t const head = cursor_head_(cursors[smallest]);
+            st::key128_t const head = cursor_head_(cursors[smallest]);
             std::string_view const tail = cursor_tail_(cursors[smallest]);
             listed_string_t listed;
             bool taken = false;
@@ -487,13 +465,14 @@ class strings_store {
                     delta_kind_t const kind = cursor.memory ? cursor.memory->delta(cursor.position).kind
                                                             : cursor.level->kind(cursor.position);
                     if (kind == delta_kind_t::remove_k) {
-                        listed.state = select_result_t::erased_k;
+                        listed.state = lookup_result_t::removed_k;
                         continue;
                     }
-                    listed.state = select_result_t::success_k;
-                    listed.size = cursor.memory ? static_cast<stored_value_size_t>(
-                                                      cursor.memory->delta(cursor.position).bytes.size())
-                                                : cursor.level->key_slot(cursor.position).size;
+                    listed.state = lookup_result_t::written_k;
+                    std::memcpy(&listed.value,
+                                cursor.memory ? cursor.memory->delta(cursor.position).bytes.data()
+                                              : cursor.level->key_slot(cursor.position).data,
+                                key_slot_t::size);
                 }
             if (!taken) continue;
 
@@ -514,37 +493,35 @@ class strings_store {
 
 #pragma region Writes
 
-    /** Whether a written value of @p size bytes is one this store admits. */
-    [[nodiscard]] bool admits(std::size_t size) const noexcept {
-        return value_size_ != 0 ? size == value_size_ : size <= value_max_size_;
-    }
+    /** Whether a written value of @p size bytes is one this store admits: one 16-byte key. */
+    [[nodiscard]] static bool admits(std::size_t size) noexcept { return size == key_slot_t::size; }
 
     /**
-     *  @brief Sorts and copies @p deltas into one commit's records for this store, on the committer's thread and off
-     *      every shared path, and allocates the run they become; no records seal into no run.
-     *  @param[in] deltas One record per string, which this sorts in place: writes of an admitted width and removals.
+     *  @brief Sorts and copies @p deltas into one commit's sealed deltas for this store, on the committer's thread and
+     *      off every shared path, and allocates the run they become; no deltas seal into no run.
+     *  @param[in] deltas One delta per string, which this sorts in place: writes of one 16-byte key and removals.
      */
     expected<sealed_commit_t> seal(std::span<keyed_delta_t> deltas) const noexcept {
         for (keyed_delta_t const& each : deltas) {
             if (each.delta.kind == delta_kind_t::change_k)
                 return status_t {status_code_t::invalid_argument_k, "A string takes whole values and removals"};
             if (each.delta.kind == delta_kind_t::write_k && !admits(each.delta.bytes.size()))
-                return status_t {status_code_t::malformed_k, "This collection admits no value of that size"};
+                return status_t {status_code_t::malformed_k, "A string maps onto one 16-byte key"};
         }
         sealed_commit_t sealed;
         if (deltas.empty()) return sealed;
-        auto [writes, seal_status] = sealed_writes_t::seal(deltas, allocator_t {*constraint_});
+        auto [sealed_deltas, seal_status] = sealed_deltas_t::seal(deltas, allocator_t {*constraint_});
         if (seal_status.failed()) return seal_status;
-        sealed.writes = std::move(writes);
+        sealed.deltas = std::move(sealed_deltas);
         sealed.run.reset(new (std::nothrow) memory_run_t {});
         if (!sealed.run) return status_t {status_code_t::out_of_memory_k, "No room for another memory run"};
         return sealed;
     }
 
     /** Seals one value per string of @p texts, a repeated string taking its last value, out of @p values cut by
-     *  @p sizes. */
-    expected<sealed_commit_t> seal_inserts(std::span<std::string_view const> texts, std::span<byte_t const> values,
-                                           std::span<stored_value_size_t const> sizes) const noexcept {
+     *  @p sizes, each of which names 16 bytes. */
+    expected<sealed_commit_t> seal_writes(std::span<std::string_view const> texts, std::span<byte_t const> values,
+                                          std::span<stored_value_size_t const> sizes) const noexcept {
         if (sizes.size() != texts.size())
             return status_t {status_code_t::invalid_argument_k, "A batched insert names the size of every value"};
         std::uint64_t total = 0;
@@ -563,7 +540,7 @@ class strings_store {
     }
 
     /** Seals a removal of every string of @p texts. */
-    expected<sealed_commit_t> seal_erasures(std::span<std::string_view const> texts) const noexcept {
+    expected<sealed_commit_t> seal_removals(std::span<std::string_view const> texts) const noexcept {
         auto [deltas, deltas_status] = deltas_of_(texts.size());
         if (deltas_status.failed()) return deltas_status;
         for (std::size_t index = 0; index != texts.size(); ++index)
@@ -576,13 +553,13 @@ class strings_store {
         reader_t const inside = ledger_->epochs().enter();
         view_t const& view = *view_.load();
         if (view.memory_runs.runs().empty()) return memory_pressure_t::fits_k;
-        std::uint64_t const records = memory_records_(view) + sealed.writes.size();
-        std::uint64_t const bytes = memory_bytes_(view) + sealed.writes.keys_bytes() + sealed.writes.values_bytes();
-        std::uint64_t const elements_bound = config_.write_buffer_max_elements;
-        std::uint64_t const bytes_bound = config_.write_buffer_max_bytes;
+        std::uint64_t const deltas = memory_deltas_(view) + sealed.deltas.size();
+        std::uint64_t const bytes = memory_bytes_(view) + sealed.deltas.keys_bytes() + sealed.deltas.values_bytes();
+        std::uint64_t const deltas_bound = config_.memory_runs_max_deltas;
+        std::uint64_t const bytes_bound = config_.memory_runs_max_bytes;
         // One flush in flight and one buffer filling behind it.
-        if (records > 2 * elements_bound || bytes > 2 * bytes_bound) return memory_pressure_t::stalled_k;
-        if (records > elements_bound || bytes > bytes_bound) return memory_pressure_t::flush_due_k;
+        if (deltas > 2 * deltas_bound || bytes > 2 * bytes_bound) return memory_pressure_t::stalled_k;
+        if (deltas > deltas_bound || bytes > bytes_bound) return memory_pressure_t::flush_due_k;
         return memory_pressure_t::fits_k;
     }
 
@@ -607,7 +584,7 @@ class strings_store {
      *  leader does before it publishes @p stamp itself, so a reader at the stamp finds the run. */
     void publish(sealed_commit_t& sealed, transaction_stamp_t stamp) noexcept {
         if (!sealed.run) return;
-        expected<memory_run_t> stamped = memory_run_t::stamped(std::move(sealed.writes), stamp,
+        expected<memory_run_t> stamped = memory_run_t::stamped(std::move(sealed.deltas), stamp,
                                                                allocator_t {*constraint_});
         if (stamped) *sealed.run = std::move(*stamped);
         // The durable horizon stays below the oldest commit that only memory holds.
@@ -642,7 +619,7 @@ class strings_store {
         reader_t const inside = ledger_->epochs().enter();
         view_t const& view = *view_.load();
         if (view.memory_runs.range_written_since(lower, upper, from)) return true;
-        ustore_key_t const upper_head = head_of(upper);
+        st::key128_t const upper_head = head_of(upper);
         std::string_view const upper_tail = tail_of(upper);
         return any_level_run_(*view.levels, [&](sorted_run_t const& run) noexcept {
             if (run.newest_stamp() <= from) return false;
@@ -690,8 +667,8 @@ class strings_store {
 #pragma region Maintenance
 
     /**
-     *  @brief Merges F memory runs of one generation into one run of the next, F being the level enlarge factor, until
-     *      no generation holds F runs, as @c blobs::collection does.
+     *  @brief Merges F memory runs of one tier into one run of the next tier, F being the level enlarge factor, until
+     *      no tier holds F runs, as @c blobs::nvme_store does.
      *  @note The owner serializes it with flushes, compactions and truncations, and the calling thread is inside no
      *      epoch.
      */
@@ -724,8 +701,8 @@ class strings_store {
                 kept.failed())
                 return kept;
             auto [merged, merged_status] = memory_run_t::merged(std::span<stamped_delta_t const> {versions},
-                                                                group.back()->oldest_stamp(),
-                                                                group.back()->generation(), allocator_t {*constraint_});
+                                                                group.back()->oldest_stamp(), group.back()->tier(),
+                                                                allocator_t {*constraint_});
             if (merged_status.failed()) return merged_status;
             std::unique_ptr<memory_run_t> merged_run {new (std::nothrow) memory_run_t {std::move(merged)}};
             // The replaced runs, freed here once the publication waited out every reader that could hold one.
@@ -745,13 +722,13 @@ class strings_store {
         return flush_due_(*view_.load());
     }
 
-    /** Whether the memory runs are due for a merge, holding F runs of generation zero, or for a flush. */
+    /** Whether the memory runs are due for a merge, holding F runs of tier zero, or for a flush. */
     [[nodiscard]] bool maintenance_due() const noexcept {
         reader_t const inside = ledger_->epochs().enter();
         view_t const& view = *view_.load();
         std::size_t newest = 0;
         for (memory_run_t const* run : view.memory_runs.runs()) {
-            if (run->generation() != 0) break;
+            if (run->tier() != 0) break;
             ++newest;
         }
         return newest >= config_.lsm_tree.level_enlarge_factor || flush_due_(view);
@@ -797,14 +774,15 @@ class strings_store {
         drained_t drained;
         if (status_t const laid = drain_(std::span<stamped_delta_t const> {versions}, drained); laid.failed())
             return laid;
-        key_tails_t const tails = drained.tails.empty()
-                                      ? key_tails_t {}
-                                      : key_tails_t {std::span<std::uint32_t const> {drained.tail_offsets},
-                                                     std::span<byte_t const> {drained.tails}};
+        key_tails_column_t const tails = drained.tails.empty()
+                                             ? key_tails_column_t {}
+                                             : key_tails_column_t {
+                                                   std::span<std::uint32_t const> {drained.tail_offsets},
+                                                   std::span<byte_t const> {drained.tails}};
         return tree_.flush(channel, std::span<key_slot_t const> {drained.key_slots},
                            std::span<std::uint64_t const> {drained.stamps},
-                           std::span<std::uint8_t const> {drained.kinds}, survival.floor,
-                           std::span<byte_t const> {drained.values}, value_max_size_, publication.hook(), tails);
+                           std::span<std::uint8_t const> {drained.kinds}, survival.floor, {}, key_slot_t::size,
+                           publication.hook(), tails);
     }
 
     /** Whether any level of the tree is over the bytes its number admits. */
@@ -818,9 +796,11 @@ class strings_store {
      *  @param[inout] reading_channel The channel the merge gathers source values on, held by the calling thread.
      *  @param[inout] writing_channel The channel the merge writes its new runs on, which is not @p reading_channel.
      *  @param[in] published What to call once the merged set is live and before a consumed run is dropped.
+     *
+     *  The devices the executor named go unused, as no device compaction is compiled for keys carrying tails.
      */
     expected<compaction_outcome_t> compact(
-        io_channel_t& reading_channel, io_channel_t& writing_channel,
+        io_channel_t& reading_channel, io_channel_t& writing_channel, std::span<int const>,
         lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {}) noexcept {
         // A pinned reader keeps the version it reads, and the durable horizon keeps the version a mount falls back to.
         st::basic_vector<transaction_stamp_t> readers;
@@ -834,7 +814,7 @@ class strings_store {
         publication.owner = this;
         publication.oldest_readable = stamps.horizon;
         publication.chained = &published;
-        return tree_.compact(reading_channel, writing_channel, compaction_placement_t::host_k, nullptr, fold_,
+        return tree_.compact(reading_channel, writing_channel, compaction_placement_t::host_k, {}, nullptr, fold_,
                              publication.hook(), stamps);
     }
 
@@ -866,7 +846,7 @@ class strings_store {
     /** The versions one merge or one flush carries over, before and after they are sorted into a run's order. */
     using stamped_deltas_t = st::basic_vector<stamped_delta_t>;
 
-    /** The records one batch of its own hands over. */
+    /** The deltas one batch of its own hands over. */
     using deltas_t = st::basic_vector<keyed_delta_t, constrained_allocator<keyed_delta_t, atomic_reference_>>;
 
     /** The view a read walks and the stamp it reads at. */
@@ -909,21 +889,20 @@ class strings_store {
         std::uint64_t end = 0;
     };
 
-    /** The columns one flush writes: cells in ascending order, their stamps, kinds, values, and tails. */
+    /** The columns one flush writes: cells holding the values in ascending order, their stamps, kinds, and tails. */
     struct drained_t {
         st::basic_vector<key_slot_t> key_slots;
         st::basic_vector<std::uint64_t> stamps;
         st::basic_vector<std::uint8_t> kinds;
-        st::basic_vector<byte_t> values;
         st::basic_vector<std::uint32_t> tail_offsets;
         st::basic_vector<byte_t> tails;
     };
 
-    /** What a publication of a new level set hands its hooks, as @c blobs::collection's does. */
+    /** What a publication of a new level set hands its hooks, as @c blobs::nvme_store's does. */
     struct publication_t {
 
         /** The store publishing. */
-        strings_store* owner = nullptr;
+        nvme_store* owner = nullptr;
 
         /** The memory runs a flush wrote out, newest first, as the view it read named them; none for a merge. */
         st::basic_vector<memory_run_t const*> flushed;
@@ -954,14 +933,14 @@ class strings_store {
 
 #pragma region Private Methods
 
-    /** Records every memory run of @p view holds. */
-    [[nodiscard]] static std::size_t memory_records_(view_t const& view) noexcept {
-        std::size_t records = 0;
-        for (memory_run_t const* run : view.memory_runs.runs()) records += run->size();
-        return records;
+    /** Deltas every memory run of @p view holds. */
+    [[nodiscard]] static std::size_t memory_deltas_(view_t const& view) noexcept {
+        std::size_t deltas = 0;
+        for (memory_run_t const* run : view.memory_runs.runs()) deltas += run->size();
+        return deltas;
     }
 
-    /** String and value bytes every memory run of @p view holds. */
+    /** String and value bytes every memory run of @p view holds, 16 per value. */
     [[nodiscard]] static std::uint64_t memory_bytes_(view_t const& view) noexcept {
         std::uint64_t bytes = 0;
         for (memory_run_t const* run : view.memory_runs.runs()) bytes += run->keys_bytes() + run->values_bytes();
@@ -970,11 +949,11 @@ class strings_store {
 
     /** Whether the memory runs of @p view hold the bounds they were mounted with. */
     [[nodiscard]] bool flush_due_(view_t const& view) const noexcept {
-        return memory_records_(view) >= config_.write_buffer_max_elements ||
-               memory_bytes_(view) >= config_.write_buffer_max_bytes;
+        return memory_deltas_(view) >= config_.memory_runs_max_deltas ||
+               memory_bytes_(view) >= config_.memory_runs_max_bytes;
     }
 
-    /** The view a read at @p stamp walks and the stamp it answers at, as @c blobs::collection reads: a head read
+    /** The view a read at @p stamp walks and the stamp it answers at, as @c blobs::nvme_store reads: a head read
      *  retries past a merge that raised the oldest readable stamp above the one it took. */
     [[nodiscard]] reading_t reading_(transaction_stamp_t stamp) const noexcept {
         for (;;) {
@@ -985,7 +964,7 @@ class strings_store {
     }
 
     /** The head of the key at sorted @p position of a memory run. */
-    [[nodiscard]] static ustore_key_t const& head_at_(memory_run_t const& run, std::uint64_t position) noexcept {
+    [[nodiscard]] static st::key128_t const& head_at_(memory_run_t const& run, std::uint64_t position) noexcept {
         return run.head(static_cast<std::size_t>(position));
     }
 
@@ -995,7 +974,7 @@ class strings_store {
     }
 
     /** The head of the key at sorted @p position of a run of a level. */
-    [[nodiscard]] static ustore_key_t const& head_at_(sorted_run_t const& run, std::uint64_t position) noexcept {
+    [[nodiscard]] static st::key128_t const& head_at_(sorted_run_t const& run, std::uint64_t position) noexcept {
         return run.key_slot(position).stored_key;
     }
 
@@ -1007,7 +986,7 @@ class strings_store {
     /** The first of the @p count sorted positions of @p run whose key is not below @p head and @p tail. */
     template <typename run_type_>
     [[nodiscard]] static std::uint64_t lower_bound_in_(run_type_ const& run, std::uint64_t count,
-                                                       ustore_key_t const& head, std::string_view tail) noexcept {
+                                                       st::key128_t const& head, std::string_view tail) noexcept {
         std::uint64_t low = 0;
         std::uint64_t high = count;
         while (low != high) {
@@ -1019,7 +998,7 @@ class strings_store {
     }
 
     /** The first of the @p count sorted positions of @p run past every string starting with @p prefix, as
-     *  @c strings_sealed_writes::prefix_end finds it. */
+     *  @c sealed_deltas::prefix_end finds it. */
     template <typename run_type_>
     [[nodiscard]] static std::uint64_t prefix_end_in_(run_type_ const& run, std::uint64_t count,
                                                       std::string_view prefix) noexcept {
@@ -1029,14 +1008,15 @@ class strings_store {
         std::uint64_t high = count;
         while (low != high) {
             std::uint64_t const middle = low + (high - low) / 2;
-            ustore_key_t const& head = head_at_(run, middle);
-            std::string_view const head_bytes {reinterpret_cast<char const*>(head.uuid.bytes), leading.size()};
-            int const order = head_bytes.compare(leading);
+            st::key128_t const& head = head_at_(run, middle);
+            std::byte head_bytes[sizeof(st::key128_t)];
+            head.to_bytes(head_bytes);
+            std::string_view const head_leading {reinterpret_cast<char const*>(head_bytes), leading.size()};
+            int const order = head_leading.compare(leading);
             // Only a string longer than its head can reach past the leading bytes of a longer prefix.
-            bool const within_or_below = order < 0 ||
-                                         (order == 0 && (trailing.empty() ||
-                                                         head.uuid.bytes[head_prefix_bytes_k] != long_head_length_k ||
-                                                         tail_at_(run, middle).substr(0, trailing.size()) <= trailing));
+            bool const within_or_below =
+                order < 0 || (order == 0 && (trailing.empty() || head_length_of(head) != long_head_length_k ||
+                                             tail_at_(run, middle).substr(0, trailing.size()) <= trailing));
             if (within_or_below) low = middle + 1;
             else high = middle;
         }
@@ -1045,14 +1025,14 @@ class strings_store {
 
     /** Whether the key at sorted @p position of @p run is the string of @p head and @p tail. */
     template <typename run_type_>
-    [[nodiscard]] static bool same_key_at_(run_type_ const& run, std::uint64_t position, ustore_key_t const& head,
+    [[nodiscard]] static bool same_key_at_(run_type_ const& run, std::uint64_t position, st::key128_t const& head,
                                            std::string_view tail) noexcept {
         return head_at_(run, position) == head && tail_at_(run, position) == tail;
     }
 
     /** The run of the sorted @p level whose heads cover @p head, which only one run's may, or null. */
     [[nodiscard]] static sorted_run_t const* run_holding_(typename tree_t::level_t const& level,
-                                                          ustore_key_t const& head) noexcept {
+                                                          st::key128_t const& head) noexcept {
         std::size_t low = 0;
         std::size_t high = level.size();
         while (low != high) {
@@ -1067,7 +1047,7 @@ class strings_store {
 
     /** Whether @p run holds a version of the string of @p head and @p tail stamped at or below @p at, answering the
      *  newest one in @p found. */
-    [[nodiscard]] static bool version_in_(sorted_run_t const& run, ustore_key_t const& head, std::string_view tail,
+    [[nodiscard]] static bool version_in_(sorted_run_t const& run, st::key128_t const& head, std::string_view tail,
                                           transaction_stamp_t at, found_t& found) noexcept {
         std::uint64_t const count = run.population_count();
         if (count == 0 || head < run.lower_stored_key() || run.upper_stored_key() < head) return false;
@@ -1082,7 +1062,7 @@ class strings_store {
 
     /** Whether any level of @p levels holds a version of the string of @p head and @p tail at or below @p at,
      *  answering the newest in @p found: the youngest run of level zero first, then each sorted level's one run. */
-    [[nodiscard]] static bool newest_in_levels_(level_set_t const& levels, ustore_key_t const& head,
+    [[nodiscard]] static bool newest_in_levels_(level_set_t const& levels, st::key128_t const& head,
                                                 std::string_view tail, transaction_stamp_t at,
                                                 found_t& found) noexcept {
         for (std::size_t number = 0; number != levels.size(); ++number) {
@@ -1116,7 +1096,7 @@ class strings_store {
     }
 
     /** The head and the tail of the key a walk's @p cursor sits on. */
-    [[nodiscard]] static ustore_key_t const& cursor_head_(cursor_t const& cursor) noexcept {
+    [[nodiscard]] static st::key128_t const& cursor_head_(cursor_t const& cursor) noexcept {
         return cursor.memory ? head_at_(*cursor.memory, cursor.position) : head_at_(*cursor.level, cursor.position);
     }
 
@@ -1124,25 +1104,17 @@ class strings_store {
         return cursor.memory ? tail_at_(*cursor.memory, cursor.position) : tail_at_(*cursor.level, cursor.position);
     }
 
-    /** Lays @p versions out as one run's cells, stamps, kinds, values and tails, the values located from the run's own
-     *  values offset. */
+    /** Lays @p versions out as one run's cells, each holding its value, and their stamps, kinds and tails. */
     status_t drain_(std::span<stamped_delta_t const> versions, drained_t& drained) const noexcept {
-        std::uint64_t values_bytes = 0;
         std::uint64_t tails_bytes = 0;
-        for (stamped_delta_t const& version : versions) {
-            values_bytes += version.delta.bytes.size();
-            tails_bytes += tail_of(version.stored_key).size();
-        }
+        for (stamped_delta_t const& version : versions) tails_bytes += tail_of(version.stored_key).size();
         if (drained.key_slots.resize(versions.size()) != st::status_t::success_k ||
             drained.stamps.resize(versions.size()) != st::status_t::success_k ||
             drained.kinds.resize(versions.size()) != st::status_t::success_k ||
-            drained.values.resize(static_cast<std::size_t>(values_bytes)) != st::status_t::success_k ||
             drained.tail_offsets.resize(tails_bytes != 0 ? versions.size() + 1 : 0) != st::status_t::success_k ||
             drained.tails.resize(static_cast<std::size_t>(tails_bytes)) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A flush could not hold its columns"};
 
-        std::uint64_t const values_offset = sorted_run_layout_t::values_offset(versions.size());
-        std::uint64_t written_values = 0;
         std::uint64_t written_tails = 0;
         for (std::size_t index = 0; index != versions.size(); ++index) {
             stamped_delta_t const& version = versions[index];
@@ -1151,14 +1123,11 @@ class strings_store {
             key_slot_t& built = drained.key_slots[index];
             built = key_slot_t {};
             built.stored_key = head_of(version.stored_key);
-            built.size = static_cast<stored_value_size_t>(bytes.size());
-            built.location = static_cast<blobs::stored_value_offset_t>(values_offset + written_values);
-            if (!bytes.empty()) std::memcpy(drained.values.data() + written_values, bytes.data(), bytes.size());
+            if (!bytes.empty()) std::memcpy(built.data, bytes.data(), key_slot_t::size);
             if (tails_bytes != 0) drained.tail_offsets[index] = static_cast<std::uint32_t>(written_tails);
             if (!tail.empty()) std::memcpy(drained.tails.data() + written_tails, tail.data(), tail.size());
             drained.stamps[index] = version.stamp;
             drained.kinds[index] = static_cast<std::uint8_t>(version.delta.kind);
-            written_values += bytes.size();
             written_tails += tail.size();
         }
         if (tails_bytes != 0) drained.tail_offsets[versions.size()] = static_cast<std::uint32_t>(written_tails);
@@ -1195,7 +1164,7 @@ class strings_store {
      *  but those the publication wrote out, which are the oldest, since commits only prepend. */
     static status_t prepare_levels_(void* context) noexcept {
         publication_t& publication = *static_cast<publication_t*>(context);
-        strings_store& owner = *publication.owner;
+        nvme_store& owner = *publication.owner;
         owner.ledger_->lead();
         std::span<memory_run_t const* const> const runs = owner.current_->memory_runs.runs();
         std::size_t const kept = runs.size() - publication.flushed.size();
@@ -1215,7 +1184,7 @@ class strings_store {
      *  memory still holds, lets the leader word go, frees the runs, and calls the hook it chains to. */
     static status_t publish_levels_(void* context) noexcept {
         publication_t& publication = *static_cast<publication_t*>(context);
-        strings_store& owner = *publication.owner;
+        nvme_store& owner = *publication.owner;
         publication.next->levels = &owner.tree_.levels();
         owner.replace_view_(std::move(publication.next));
         if (!publication.flushed.empty()) {
@@ -1236,7 +1205,7 @@ class strings_store {
         return chained->notify(chained->context);
     }
 
-    /** Room for @p count records of one batch of its own. */
+    /** Room for @p count deltas of one batch of its own. */
     expected<deltas_t> deltas_of_(std::size_t count) const noexcept {
         deltas_t deltas {constrained_allocator<keyed_delta_t, atomic_reference_> {*constraint_}};
         if (deltas.resize(count) != st::status_t::success_k)
@@ -1244,7 +1213,7 @@ class strings_store {
         return deltas;
     }
 
-    /** Keeps the last record of every string of @p deltas, which a batch naming a string twice takes. */
+    /** Keeps the last delta of every string of @p deltas, which a batch naming a string twice takes. */
     [[nodiscard]] static std::span<keyed_delta_t> last_of_each_string_(deltas_t& deltas) noexcept {
         std::stable_sort(deltas.begin(), deltas.end(), [](keyed_delta_t const& first, keyed_delta_t const& second) {
             return first.stored_key < second.stored_key;
@@ -1258,13 +1227,13 @@ class strings_store {
         return std::span<keyed_delta_t> {deltas.data(), kept};
     }
 
-    /** The oldest F runs of the lowest generation holding F of @p runs, newest first, or none. */
+    /** The oldest F runs of the lowest tier holding F of @p runs, newest first, or none. */
     [[nodiscard]] std::span<memory_run_t const* const> due_group_(
         std::span<memory_run_t const* const> runs) const noexcept {
         std::size_t const fan_in = config_.lsm_tree.level_enlarge_factor;
         for (std::size_t first = 0; first != runs.size();) {
             std::size_t end = first;
-            while (end != runs.size() && runs[end]->generation() == runs[first]->generation()) ++end;
+            while (end != runs.size() && runs[end]->tier() == runs[first]->tier()) ++end;
             if (end - first >= fan_in) return runs.subspan(end - fan_in, fan_in);
             first = end;
         }
@@ -1339,13 +1308,7 @@ class strings_store {
     /** The view a leader laid out for the commit it prepared, published or forgotten before it lets the word go. */
     std::unique_ptr<view_t> prepared_view_;
 
-    /** Bytes every value takes, zero for values that differ in width. */
-    stored_value_size_t value_size_ = 0;
-
-    /** Bytes the largest value this store admits takes. */
-    stored_value_size_t value_max_size_ = 0;
-
-    /** What a record does, which merges fold with. */
+    /** What a delta does, which merges fold with. */
     [[no_unique_address]] fold_t fold_ {};
 
 #pragma endregion Private Members
@@ -1364,11 +1327,11 @@ class strings_store {
  *  A string written twice keeps its last write and its earliest watch. A read is watched apart from the writes, and a
  *  walk as a range of strings, so a commit landing on any watched string since its watch conflicts, the strings no
  *  walk found included, and two strings sharing a head never conflict with each other. The strings sit on one tape
- *  this owns, which the tables locate them on, so nothing here moves once constructed, and nothing is shared: a
- *  transaction belongs to the thread holding it.
+ *  this owns, which the tables locate them on, and each write keeps its 16-byte value beside it, so nothing here moves
+ *  once constructed, and nothing is shared: a transaction belongs to the thread holding it.
  */
 template <typename database_type_, typename store_type_>
-class strings_transaction {
+class nvme_transaction {
   public:
 
     /** The database every collection lives in. */
@@ -1380,11 +1343,11 @@ class strings_transaction {
     /** The database transaction this joins. */
     using transaction_t = typename database_t::transaction_t;
 
-    /** One record a commit hands a store over. */
+    /** One delta a commit hands a store over. */
     using keyed_delta_t = keyed_delta<std::string_view>;
 
     /** A transaction of @p database writing and watching nothing yet, joined to none. */
-    explicit strings_transaction(database_t& database) noexcept
+    explicit nvme_transaction(database_t& database) noexcept
         : database_(&database), writes_(place_hash_t {&tape_}, place_equals_t {&tape_}) {
         share_.context = this;
         share_.prepare = &prepare_share_;
@@ -1392,25 +1355,26 @@ class strings_transaction {
         share_.forget = &forget_share_;
     }
 
-    strings_transaction(strings_transaction const&) = delete;
-    strings_transaction(strings_transaction&&) = delete;
-    strings_transaction& operator=(strings_transaction const&) = delete;
-    strings_transaction& operator=(strings_transaction&&) = delete;
+    nvme_transaction(nvme_transaction const&) = delete;
+    nvme_transaction(nvme_transaction&&) = delete;
+    nvme_transaction& operator=(nvme_transaction const&) = delete;
+    nvme_transaction& operator=(nvme_transaction&&) = delete;
 
     /** Joins @p transaction, which lays these strings out and lands them with every stage and commit from now on, and
      *  which this must outlive. */
     void join(transaction_t& transaction) noexcept { transaction.join(share_); }
 
-    /** Writes @p delta, a value or a removal, under @p text of @p collection, watched from @p watch_stamp, which only
-     *  lowers the watch an earlier write of the string took, or @c invalid_transaction_stamp_k for none. */
+    /** Writes @p delta, a 16-byte value or a removal, under @p text of @p collection, watched from @p watch_stamp,
+     *  which only lowers the watch an earlier write of the string took, or @c invalid_transaction_stamp_k for none. */
     status_t write(collection_id_t collection, std::string_view text, delta_view_t delta,
                    transaction_stamp_t watch_stamp) noexcept {
+        std::size_t const carried = delta.kind == delta_kind_t::remove_k ? 0 : sizeof(ustore_key_t);
+        if (delta.bytes.size() != carried)
+            return {status_code_t::invalid_argument_k, "A string maps onto one 16-byte key"};
         if (writes_.reserve_more(1) == writes_t::reserve_result_t::failed_k)
             return {status_code_t::out_of_memory_k, "No room for another string"};
-        auto [value, value_status] = append_(
-            std::string_view {reinterpret_cast<char const*>(delta.bytes.data()), delta.bytes.size()});
-        if (value_status.failed()) return value_status;
-        write_t const written {value.offset, value.size, delta.kind, watch_stamp};
+        write_t written {ustore_key_t {}, delta.kind, watch_stamp};
+        if (carried != 0) std::memcpy(&written.value, delta.bytes.data(), carried);
         bool updated = false;
         writes_.probe_to_find(probe_t {collection, text}, [&](auto& slot) noexcept {
             write_t& held = slot.value_ref();
@@ -1427,8 +1391,8 @@ class strings_transaction {
         return {};
     }
 
-    /** What this transaction wrote under @p text of @p collection, viewing its bytes until the next write, and whether
-     *  it wrote anything there. */
+    /** What this transaction wrote under @p text of @p collection, viewing its value until the next write, and
+     *  whether it wrote anything there. */
     [[nodiscard]] bool uncommitted(collection_id_t collection, std::string_view text,
                                    delta_view_t& found) const noexcept {
         bool written = false;
@@ -1440,7 +1404,7 @@ class strings_transaction {
     }
 
     /** Hands @p callback every string this transaction wrote into @p collection, in no order, as
-     *  @c callback(text, delta), both viewing the tape until the next write. */
+     *  @c callback(text, delta), both viewing this transaction until the next write. */
     template <typename callback_type_>
     void for_each_uncommitted(collection_id_t collection, callback_type_&& callback) const noexcept {
         [[maybe_unused]] st::status_t const walked = writes_.for_each([&](auto const& slot) noexcept {
@@ -1528,10 +1492,10 @@ class strings_transaction {
         std::string_view text;
     };
 
-    /** What a transaction wrote under one string: where its bytes sit on the tape, what it does, and its watch. */
+    /** What a transaction wrote under one string: the 16 bytes of its value, zero for a removal, what it does, and
+     *  its watch. */
     struct write_t {
-        std::uint64_t offset = 0;
-        std::uint32_t size = 0;
+        ustore_key_t value {};
         delta_kind_t kind = delta_kind_t::write_k;
         transaction_stamp_t watch_stamp = invalid_transaction_stamp_k;
     };
@@ -1608,10 +1572,9 @@ class strings_transaction {
         return std::string_view {tape_.data() + place.offset, place.size};
     }
 
-    [[nodiscard]] delta_view_t delta_of_(write_t const& written) const noexcept {
-        return delta_view_t {
-            written.kind,
-            std::span<byte_t const> {reinterpret_cast<byte_t const*>(tape_.data()) + written.offset, written.size}};
+    [[nodiscard]] static delta_view_t delta_of_(write_t const& written) noexcept {
+        if (written.kind == delta_kind_t::remove_k) return delta_view_t {written.kind, {}};
+        return delta_view_t {written.kind, std::as_bytes(std::span<ustore_key_t const, 1> {&written.value, 1})};
     }
 
     /** Calls @p visitor with the strings store of @p collection inside the database's epochs, answering what it
@@ -1712,7 +1675,7 @@ class strings_transaction {
     }
 
     static status_t prepare_share_(void* context) noexcept {
-        strings_transaction& owner = *static_cast<strings_transaction*>(context);
+        nvme_transaction& owner = *static_cast<nvme_transaction*>(context);
         if (owner.conflicting_()) return {status_code_t::write_conflict_k, "Strings conflict"};
         for (std::size_t index = 0; index != owner.sealed_.size(); ++index) {
             sealed_collection_t& sealed = owner.sealed_[index];
@@ -1727,7 +1690,7 @@ class strings_transaction {
     }
 
     static void publish_share_(void* context, transaction_stamp_t stamp) noexcept {
-        strings_transaction& owner = *static_cast<strings_transaction*>(context);
+        nvme_transaction& owner = *static_cast<nvme_transaction*>(context);
         for (sealed_collection_t& sealed : owner.sealed_) [[maybe_unused]]
             status_t const published = owner.with_store_(sealed.collection, [&](store_t& store) noexcept -> status_t {
                 store.publish(sealed.commit, stamp);
@@ -1736,14 +1699,14 @@ class strings_transaction {
     }
 
     static void forget_share_(void* context) noexcept {
-        strings_transaction& owner = *static_cast<strings_transaction*>(context);
+        nvme_transaction& owner = *static_cast<nvme_transaction*>(context);
         owner.forget_(owner.sealed_.size());
     }
 
     /** The database every collection lives in, which outlives this. */
     database_t* database_ = nullptr;
 
-    /** Every string and value this transaction wrote or watched, back to back. */
+    /** Every string this transaction wrote or watched, back to back. */
     st::basic_vector<char> tape_;
 
     /** The last write of every string, located on the tape. */

@@ -181,27 +181,29 @@ int main(void) {
     failures += expect_success(&outcome, __LINE__);
     failures += expect(listed == 1 && tape_holds(&names, 0, "colors"), __LINE__);
 
-    // Strings keyed by an accessor take values from a tape, and read back through a tape of the same strings
+    // Strings read through an accessor map onto strided keys, and read back through a tape of the same strings
     ustore_collections_view_t const colors_view = {&colors, 0};
     ustore_strings_write_t write_strings = {.database = database,
                                             .outcome = &outcome,
                                             .count = 3,
                                             .collections = colors_view,
                                             .strings = accessor_of(texts),
-                                            .values = narrow_tape};
+                                            .values = keys_view};
     ustore_strings_write(&write_strings);
     failures += expect_success(&outcome, __LINE__);
+    ustore_key_t const* color_keys = NULL;
     ustore_strings_read_t read_strings = {.database = database,
                                           .outcome = &outcome,
                                           .count = 3,
                                           .collections = colors_view,
                                           .strings = narrow_tape,
                                           .presences = &presences,
-                                          .values = &values,
+                                          .values = &color_keys,
                                           .arena = arena};
     ustore_strings_read(&read_strings);
     failures += expect_success(&outcome, __LINE__);
-    failures += expect(presences && presences[0] == 7 && tape_holds(&values, 1, "green"), __LINE__);
+    failures += expect(presences && presences[0] == 7 && color_keys, __LINE__);
+    failures += expect(color_keys && memcmp(color_keys, keys, sizeof(keys)) == 0, __LINE__);
 
     // A cursor pulls the keys of the main collection with their values, then nothing once a page came back short
     ustore_blobs_cursor_t keys_cursor = NULL;
@@ -227,7 +229,7 @@ int main(void) {
     failures += expect(pulled == 0 && found_keys == NULL, __LINE__);
     ustore_blobs_cursor_free(keys_cursor);
 
-    // A strings cursor copies its prefix and walks the strings it starts
+    // A strings cursor copies its prefix and walks the strings it starts, with the keys they map onto
     ustore_strings_cursor_t strings_cursor = NULL;
     ustore_strings_cursor_init_t strings_cursor_init = {.cursor = &strings_cursor,
                                                         .database = database,
@@ -237,16 +239,19 @@ int main(void) {
     ustore_strings_cursor_init(&strings_cursor_init);
     failures += expect_success(&outcome, __LINE__);
     ustore_strings_view_t walked = {0};
+    ustore_key_t const* walked_keys = NULL;
     ustore_strings_cursor_next_t strings_next = {.database = database,
                                                  .outcome = &outcome,
                                                  .cursor = strings_cursor,
                                                  .strings = &walked,
+                                                 .values = &walked_keys,
                                                  .written = &pulled,
                                                  .arena = arena,
                                                  .wanted = 8};
     ustore_strings_cursor_next(&strings_next);
     failures += expect_success(&outcome, __LINE__);
     failures += expect(pulled == 1 && tape_holds(&walked, 0, "green"), __LINE__);
+    failures += expect(walked_keys && memcmp(walked_keys, &keys[1], sizeof(ustore_key_t)) == 0, __LINE__);
     ustore_strings_cursor_free(strings_cursor);
 
     // An executor serves every memory domain the process may allocate on when its options name none

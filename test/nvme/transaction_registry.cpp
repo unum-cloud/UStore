@@ -49,14 +49,14 @@ using stored_key_t = std::uint64_t;
 template <typename value_type_>
 using atomic_reference = fu::standard_atomic_ref<value_type_>;
 
-/** The waiting policy the registry and the store are instantiated with, yielding between attempts. */
-using waiting_policy_t = st::standard_waiting_policy<fu::standard_yield_t>;
+/** The waiter the registry and the store are instantiated with, yielding between attempts. */
+using waiter_t = fu::standard_yield_t;
 
-using commit_ledger_t = commit_ledger<atomic_reference, waiting_policy_t>;
-using stamp_pin_t = stamp_pin<atomic_reference, waiting_policy_t>;
+using commit_ledger_t = commit_ledger<atomic_reference, waiter_t>;
+using stamp_pin_t = stamp_pin<atomic_reference, waiter_t>;
 using resource_constraint_t = resource_constraint<atomic_reference>;
-using resources_t = shared_resources<atomic_reference, waiting_policy_t>;
-using resources_shared_ptr_t = resources_shared_ptr<atomic_reference, waiting_policy_t>;
+using resources_t = shared_resources<atomic_reference, waiter_t>;
+using resources_shared_ptr_t = resources_shared_ptr<atomic_reference, waiter_t>;
 
 /** The sole collection the multi-collection registry is driven over here. */
 constexpr collection_id_t collection_k {uuid_from_integer(7)};
@@ -135,7 +135,7 @@ class test_store_t {
 
     /** Seals @p changes for the commit that follows, flushing the collection first when it reports itself full. */
     status_t seal_collection(collection_id_t,
-                             grouped_write_buffer<stored_key_t, atomic_reference, waiting_policy_t> const& changes,
+                             grouped_write_buffer<stored_key_t, atomic_reference, waiter_t> const& changes,
                              sealed_commit<stored_key_t, atomic_reference>& sealed) noexcept {
         if (behaviour == store_behaviour_t::always_flushing_k || behaviour == store_behaviour_t::refusing_flushes_k) {
             ++flushes;
@@ -150,10 +150,12 @@ class test_store_t {
             [[maybe_unused]] st::status_t const kept = deltas.push_back(keyed_delta<stored_key_t> {stored_key, delta});
         });
         if (deltas.empty()) return {};
-        auto [writes, seal_status] = sealed_writes<stored_key_t, constrained_allocator<byte_t, atomic_reference>>::seal(
-            std::span<keyed_delta<stored_key_t>> {deltas}, constrained_allocator<byte_t, atomic_reference> {budget_});
+        auto [sealed_deltas, seal_status] =
+            blobs::sealed_deltas<stored_key_t, constrained_allocator<byte_t, atomic_reference>>::seal(
+                std::span<keyed_delta<stored_key_t>> {deltas},
+                constrained_allocator<byte_t, atomic_reference> {budget_});
         if (seal_status.failed()) return seal_status;
-        sealed.writes = std::move(writes);
+        sealed.deltas = std::move(sealed_deltas);
         return {};
     }
 
@@ -166,10 +168,10 @@ class test_store_t {
     /** Writes every sealed change at @p stamp, a removal as a zero balance. */
     void publish_collection(collection_id_t, sealed_commit<stored_key_t, atomic_reference>& sealed,
                             transaction_stamp_t stamp) noexcept {
-        for (std::size_t position = 0; position != sealed.writes.size(); ++position) {
+        for (std::size_t position = 0; position != sealed.deltas.size(); ++position) {
             if (behaviour == store_behaviour_t::pausing_in_apply_k) wait_for_the_suite_();
-            stored_key_t const stored_key = sealed.writes.stored_key(position);
-            delta_view_t const delta = sealed.writes.delta(position);
+            stored_key_t const stored_key = sealed.deltas.stored_key(position);
+            delta_view_t const delta = sealed.deltas.delta(position);
             std::uint64_t word = 0;
             if (delta.kind == delta_kind_t::write_k && delta.bytes.size() == value_bytes_k)
                 std::memcpy(&word, delta.bytes.data(), value_bytes_k);
@@ -248,9 +250,9 @@ class test_store_t {
     std::int32_t resumed_ = 0;
 };
 
-using registry_t = database_transaction_registry<stored_key_t, test_store_t, atomic_reference, waiting_policy_t>;
+using registry_t = database_transaction_registry<stored_key_t, test_store_t, atomic_reference, waiter_t>;
 
-static_assert(transaction_store_concept<test_store_t, stored_key_t, atomic_reference, waiting_policy_t>,
+static_assert(transaction_store_concept<test_store_t, stored_key_t, atomic_reference, waiter_t>,
               "The store must serve the commit path");
 
 #pragma endregion Store
@@ -264,7 +266,7 @@ static_assert(transaction_store_concept<test_store_t, stored_key_t, atomic_refer
  *  is for: the contract is the list of members below, not a comment describing it.
  */
 template <>
-class blobs::database_transaction<stored_key_t, test_store_t, atomic_reference, waiting_policy_t> {
+class blobs::database_transaction<stored_key_t, test_store_t, atomic_reference, waiter_t> {
   public:
     using state_t = registry_t::transaction_state_t;
     using write_buffer_t = registry_t::write_buffer_t;
@@ -427,7 +429,7 @@ class blobs::database_transaction<stored_key_t, test_store_t, atomic_reference, 
     phase_t phase_ = phase_t::started_k;
 };
 
-using transaction_t = database_transaction<stored_key_t, test_store_t, atomic_reference, waiting_policy_t>;
+using transaction_t = database_transaction<stored_key_t, test_store_t, atomic_reference, waiter_t>;
 
 #pragma endregion Transaction
 

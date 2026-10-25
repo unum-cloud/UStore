@@ -3,8 +3,8 @@
 UStoreNVMe is UStore's NVMe-focused LSM engine, with `io_uring`, Linux AIO, SPDK and blocking transports, GPU compaction and GPUDirect Storage, and SIMD row kits.
 Every collection is a log-structured merge tree of immutable sorted runs, each opening with a memory-mapped B-tree of its keys.
 Keys are fixed-width stored keys, `ustore_key_t` at the C ABI, and values are opaque bytes whose width a collection fixes at compile time.
-The C ABI in `variants.hpp` backs each UStore database with one `database` and each collection with one `collection` under the same UUID.
-Every call is a template on the CPU class, whose atomic reference and waiting policy instantiate the `database`, and `src/nvme/variants_<class>.cpp` compiles one class each; the open in `engine.cpp` takes the newest class the running CPU admits, ending on the serial floor, and every handle it hands out carries that class's table.
+The C ABI in `variants.hpp` backs each UStore database with one `database` and each collection with one `nvme_store` under the same UUID.
+Every call is a template on the CPU class, whose atomic reference and waiter instantiate the `database`, and `src/nvme/variants_<class>.cpp` compiles one class each; the open in `engine.cpp` takes the newest class the running CPU admits, ending on the serial floor, and every handle it hands out carries that class's table.
 It mounts on files through whichever file transport its executor names, reserves collections for `ustore_collection_main_k`, the catalog and the names, and creates every other collection with a variable-width value layout so an empty value keeps its key.
 Every write of a caller commits through a transaction of the registry, while the catalog and the names change straight in the store under a claim of their own, as no caller's transaction reaches them.
 A stage checks a transaction and hands the database's claim back at once, so the commit checks it again; a held claim would stall every other call.
@@ -17,7 +17,7 @@ A type is named after what it holds and what it does, from the whole database do
 | :--------------------------- | :--------------------------------------------------------------------------------- |
 | `database`                   | A named database of collections that share one catalog and one set of transactions |
 | `single_collection_database` | A named database of one collection, with its own transactions and snapshots        |
-| `collection`                 | One collection: a write buffer and a value cache in front of an LSM tree           |
+| `nvme_store`                 | The store of one collection: memory runs and a value cache in front of an LSM tree |
 | `lsm_tree`                   | One LSM tree of levels, with the compaction that republishes them                  |
 | `lsm_level`                  | One level of sorted runs                                                           |
 | `lsm_sorted_run`             | One immutable file: a header, the sorted run index, then the stored values         |
@@ -36,7 +36,7 @@ The types are templates of `include/ustore/`, which `variants.hpp` instantiates 
 - `blobs/nvme_compaction.hpp` and `vram_nvidia_compaction.cuh` — the host compactor, and the kernels of the device one.
 - `blobs/nvme_tree.hpp` — configurations and schemas, `lsm_level`, its merger and `lsm_tree`.
 - `blobs/nvme_write_buffer.hpp` — `write_buffer`.
-- `blobs/nvme_store.hpp` — the value cache, `collection`, its snapshot and its scanner.
+- `blobs/nvme_store.hpp` — the value cache, `nvme_store`, its snapshot and `nvme_store_cursor`.
 - `blobs/nvme_database.hpp` — both databases, their snapshots, transactions, registries and read sets.
 - `graph/adjacency_fold.hpp` and `nvme_store.hpp` — the graph store below.
 
@@ -45,8 +45,8 @@ The sorted run index is a B-tree of the run's key slots, and the merger hands th
 Levels differ by depth:
 
 - Level 0, `L0`, receives one sorted run per flushed write buffer, so its sorted runs overlap and a scan merges them by smallest key.
-- Intermediate levels keep their sorted runs sorted, and still hold tombstones: removals, whose kind shadows older values beneath them.
-- The bottom level is sorted too, and compaction into it drops tombstones for good.
+- Intermediate levels keep their sorted runs sorted, and still hold remove deltas, whose kind shadows older values beneath them.
+- The bottom level is sorted too, and compaction into it drops remove deltas for good.
 
 Level 0 admits `level_enlarge_factor` flushed runs of one write buffer each, and every deeper level `level_enlarge_factor` times the bytes of the one above, so no level size is configured on its own.
 Level 0 is due for compaction at that many sorted runs or at that many write buffers' bytes, whichever comes first.
@@ -75,7 +75,7 @@ A write buffer keeps a version it replaces while the replacing commit is unpubli
 A flush and a merge keep one version per interval between pinned stamps, every version above the durable horizon, and the newest below it, which with no pin is the newest version alone, as before stamps.
 A reader the memory budget cannot keep history for is refused at its next read with `write_conflict_k`, and the writer never is.
 
-`take_snapshot` still holds the level set each flush published, for the callers inside one call that walk the runs themselves.
+`pin_stamp` still holds the level set each flush published, for the callers inside one call that walk the runs themselves.
 
 ### Crash atomicity
 
@@ -136,9 +136,9 @@ Only `ram` is refused, since the database the ABI names keeps its volumes in fil
 - A sorted level with nothing to merge beneath it descends one level whole, and compacting the bottom level appends a new level below it.
 - A tree keeps two level sets and stores which of them is live, so a publication builds the next one beside the one readers hold and waits only on the readers of the set it retires.
 
-Compaction merges sorted key slots and plans how their stored values migrate into the new sorted runs, and `compaction_kind_t` names the merge: overlapping or sorted runs, into an intermediate or the bottom level, where tombstones are dropped.
+Compaction merges sorted key slots and plans how their stored values migrate into the new sorted runs, and `compaction_kind_t` names the merge: overlapping or sorted runs, into an intermediate or the bottom level, where remove deltas are dropped.
 The host and GPU compactors share one comparator, survival rule, sorted run split and placement, so their outputs match field by field.
-The GPU compactor runs on CUB from CCCL 3.4.2 with no Thrust, takes its devices, streams and buffers from `include/ustore/utilities/vram_nvidia_device.hpp`, and is chosen once a device is present and a merge exceeds `gpu_compaction_threshold_k`, 900,000 key slots.
+The GPU compactor runs on CUB from CCCL 3.4.2 with no Thrust, takes its devices, streams and buffers from `include/ustore/utilities/vram_nvidia_device.hpp`, and is chosen once a device is present and a merge exceeds `cuda_compaction_threshold_k`, 900,000 key slots.
 GPU compaction is part of v1 and runs on both Hopper and Blackwell.
 
 ## Storage I/O
@@ -190,8 +190,8 @@ A dispatch blocks until all its threads return and admits one caller at a time, 
 `include/ustore/graph/nvme_store.hpp` keeps a graph collection as one collection of the engine's database, keyed by vertex, beside the blobs stores and under the same ledger:
 
 - A vertex's value is its half-edges, 48-byte records sorted by neighbor, edge and role, as `adjacency_fold.hpp` lays them out.
-- An edge write appends one change record per endpoint rather than rewriting either, so two transactions adding edges to one vertex both commit.
-- Reads, memory merges, flushes and compactions fold the records into the value through the fold path every collection shares, and a merge holding a change runs on the CPU.
+- An edge write appends one change delta per endpoint rather than rewriting either, so two transactions adding edges to one vertex both commit.
+- Reads, memory merges, flushes and compactions fold the deltas into the value through the fold path every store shares, and a merge holding a change runs on the CPU.
 - A removed vertex is a removal of its key, and its neighbors take a change removing the half-edges they filed of it.
 
 Every store serves the modalities its fold folds, so a graph of variable-width values lands in this one, and a graph of any other width is refused, as no store keeps it.

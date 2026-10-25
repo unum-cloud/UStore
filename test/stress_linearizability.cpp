@@ -156,7 +156,7 @@ struct linearizability_run_t {
     /** Configuration every opening of the database reads. */
     config_t const* config = nullptr;
 
-    /** Database reopened for every thread and transaction count, which bounds the tombstones clears leave behind. */
+    /** Database reopened for every thread and transaction count, which bounds the remove deltas clears leave behind. */
     database_t database;
 
     /** Main collection of the open database, which every verification reads. */

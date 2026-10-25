@@ -26,7 +26,7 @@
 #include "ustore/utilities/nvme_channels.hpp" // `basic_read_pipeline`, `basic_write_pipeline`
 #include "ustore/blobs/nvme_key_slot.hpp"     // `key_slot`
 #include "ustore/blobs/nvme_sorted_run.hpp"   // `lsm_sorted_run`, `sorted_run_layout`
-#include "ustore/strings/nvme_store.hpp"      // `string_key_slot`, `head_of`, `tail_of`
+#include "ustore/strings/nvme_store.hpp"      // `head_of`, `tail_of`
 
 #include "nvme/fixture.hpp" // `basic_fixture`, `run_on_transport`, `painted`
 
@@ -65,11 +65,11 @@ struct run_types {
     using guard_t = typename fixture_t::guard_t;
     using disk_t = typename fixture_t::disk_t;
     using volume_t = typename fixture_t::volume_t;
-    using variable_run_t = lsm_sorted_run<variable_slot_t, volume_t, waiting_policy_t>;
-    using fixed_run_t = lsm_sorted_run<fixed_slot_t, volume_t, waiting_policy_t>;
-    using inline_run_t = lsm_sorted_run<inline_slot_t, volume_t, waiting_policy_t>;
+    using variable_run_t = lsm_sorted_run<variable_slot_t, volume_t, waiter_t>;
+    using fixed_run_t = lsm_sorted_run<fixed_slot_t, volume_t, waiter_t>;
+    using inline_run_t = lsm_sorted_run<inline_slot_t, volume_t, waiter_t>;
     using read_pipeline_t = basic_read_pipeline<disk_t>;
-    using write_pipeline_t = basic_write_pipeline<disk_t, waiting_policy_t>;
+    using write_pipeline_t = basic_write_pipeline<disk_t, waiter_t>;
 };
 
 /** The key the key slot at @p index carries, kept odd so every even key is a miss. */
@@ -394,7 +394,7 @@ status_t paint_stub_header(disk_type_& disk, io_channel_t& channel, medium_refer
     header.value_layout = value_layout_t::variable_width_k;
     header.content_id = uuid_generator();
 
-    basic_write_pipeline<disk_type_, waiting_policy_t> writer {disk, channel, medium};
+    basic_write_pipeline<disk_type_, waiter_t> writer {disk, channel, medium};
     auto [block, acquire_buffer_status] = writer.acquire_buffer();
     if (acquire_buffer_status.failed()) return acquire_buffer_status;
     std::memset(block.bytes().data(), 0, static_cast<std::size_t>(run_config_k.page_bytes));
@@ -555,20 +555,20 @@ std::size_t point_lookup_finds_and_misses(mount_type_ const& mount) {
 
     for (std::size_t index = 0; index != count_k; ++index) {
         std::uint64_t position = 0;
-        failures += expect(run->find(key_of(index), position) == find_result_t::success_k);
+        failures += expect(run->find(key_of(index), position) == lookup_result_t::written_k);
         failures += expect_eq(position, static_cast<std::uint64_t>(index));
         failures += expect_eq(run->key_slot(position).stored_key, key_of(index));
     }
     for (std::size_t index = 0; index != count_k; ++index) {
         std::uint64_t position = 0;
-        failures += expect(run->find(key_of(index) + 1, position) == find_result_t::nothing_k);
+        failures += expect(run->find(key_of(index) + 1, position) == lookup_result_t::missing_k);
         failures += expect_eq(position, static_cast<std::uint64_t>(count_k));
     }
 
     // Keys outside the run's bounds miss as cleanly as keys inside the gaps do.
     std::uint64_t position = 0;
-    failures += expect(run->find(0, position) == find_result_t::nothing_k);
-    failures += expect(run->find(key_of(count_k) + 1000, position) == find_result_t::nothing_k);
+    failures += expect(run->find(0, position) == lookup_result_t::missing_k);
+    failures += expect(run->find(key_of(count_k) + 1000, position) == lookup_result_t::missing_k);
 
     // A walk visits every key slot exactly once, in ascending order of the keys.
     std::size_t visited = 0;
@@ -619,9 +619,9 @@ std::size_t runs_at_the_smallest_sizes(mount_type_ const& mount) {
     failures += expect_eq(one->lower_stored_key(), key_of(0));
     failures += expect_eq(one->upper_stored_key(), key_of(0));
     std::uint64_t position = 0;
-    failures += expect(one->find(key_of(0), position) == find_result_t::success_k);
+    failures += expect(one->find(key_of(0), position) == lookup_result_t::written_k);
     failures += expect_eq(position, std::uint64_t {0});
-    failures += expect(one->find(key_of(1), position) == find_result_t::nothing_k);
+    failures += expect(one->find(key_of(1), position) == lookup_result_t::missing_k);
     failures += check_variable_values(*one, guard->channel(), alone);
 
     variable_data_t none;
@@ -640,7 +640,7 @@ std::size_t runs_at_the_smallest_sizes(mount_type_ const& mount) {
                                                                                     empty->kinds().saved_bytes()));
     failures += expect(empty->lower_stored_key() == limit<stored_key_t>::max());
     failures += expect(empty->upper_stored_key() == limit<stored_key_t>::min());
-    failures += expect(empty->find(key_of(0), position) == find_result_t::nothing_k);
+    failures += expect(empty->find(key_of(0), position) == lookup_result_t::missing_k);
     failures += expect_eq(position, std::uint64_t {0});
     failures += check_variable_values(*empty, guard->channel(), none);
 
@@ -698,20 +698,20 @@ std::size_t values_at_the_size_extremes(mount_type_ const& mount) {
 
     // The widest value needs more than one block, so its window is wider than the channel's block.
     std::uint64_t position = 0;
-    failures += expect(run->find(key_of(3), position) == find_result_t::success_k);
+    failures += expect(run->find(key_of(3), position) == lookup_result_t::written_k);
     value_window_t const widest = run->value_window(position);
     failures += expect(widest.extent.length > run_config_k.request_buffer_bytes);
     failures += expect_eq(static_cast<std::uint64_t>(widest.bytes), static_cast<std::uint64_t>(largest_k));
 
     // A present but empty value needs no read at all, and says so with an empty window.
-    failures += expect(run->find(key_of(1), position) == find_result_t::success_k);
+    failures += expect(run->find(key_of(1), position) == lookup_result_t::written_k);
     failures += expect_eq(run->value_window(position).extent.length, std::uint64_t {0});
     return failures;
 }
 
-/** A tombstone is a key the run carries and a value it does not, at every layer that reports it. */
+/** A remove delta is a key the run carries and a value it does not, at every layer that reports it. */
 template <typename mount_type_>
-std::size_t tombstones_read_back_as_tombstones(mount_type_ const& mount) {
+std::size_t remove_deltas_read_back_as_removals(mount_type_ const& mount) {
     using types_t = run_types<typename mount_type_::fixture_t>;
     using fixture_t = typename types_t::fixture_t;
     using guard_t = typename types_t::guard_t;
@@ -730,7 +730,7 @@ std::size_t tombstones_read_back_as_tombstones(mount_type_ const& mount) {
     failures += expect(volume.has_value());
     if (!volume) return failures;
 
-    // Every third key is erased, every fifth holds a value that is present and empty.
+    // Every third key is removed, every fifth holds a value that is present and empty.
     auto sized = [](std::size_t index) -> std::int64_t {
         if (index % 3 == 0) return -1;
         if (index % 5 == 0) return 0;
@@ -755,14 +755,14 @@ std::size_t tombstones_read_back_as_tombstones(mount_type_ const& mount) {
 
     for (std::size_t index = 0; index != count_k; ++index) {
         std::uint64_t position = 0;
-        find_result_t const found = run->find(key_of(index), position);
+        lookup_result_t const found = run->find(key_of(index), position);
         if (sized(index) < 0) {
-            failures += expect(found == find_result_t::stored_key_k);
+            failures += expect(found == lookup_result_t::removed_k);
             failures += expect(run->kind(position) == delta_kind_t::remove_k);
             failures += expect_eq(run->value_window(position).extent.length, std::uint64_t {0});
         }
         else {
-            failures += expect(found == find_result_t::success_k);
+            failures += expect(found == lookup_result_t::written_k);
             failures += expect(run->kind(position) == delta_kind_t::write_k);
         }
     }
@@ -868,17 +868,17 @@ std::size_t batched_read_holds_its_depth(mount_type_ const& mount) {
 
 #pragma region Tails Cases
 
-/** A run of strings keeps every string's head in its cells and the bytes past the head in its tails, which order the
- *  strings of one head and read back whole through a volume mounted again, while a run of strings its heads hold whole
- *  carries neither tails nor their offsets. */
+/** A run of strings keeps every string's head and its 16-byte value in a 32-byte cell, with no values section, and the
+ *  bytes past the head in its tails, which order the strings of one head and read back whole through a volume mounted
+ *  again, while a run of strings its heads hold whole carries neither tails nor their offsets. */
 template <typename mount_type_>
 std::size_t tails_read_back(mount_type_ const& mount) {
     using types_t = run_types<typename mount_type_::fixture_t>;
     using fixture_t = typename types_t::fixture_t;
     using guard_t = typename types_t::guard_t;
     using volume_t = typename types_t::volume_t;
-    using tailed_slot_t = strings::string_key_slot;
-    using tailed_run_t = lsm_sorted_run<tailed_slot_t, volume_t, waiting_policy_t>;
+    using tailed_slot_t = key_slot<st::key128_t, value_layout_t::uuid_k, key_tails_t::carried_k>;
+    using tailed_run_t = lsm_sorted_run<tailed_slot_t, volume_t, waiter_t>;
     using tailed_layout_t = sorted_run_layout<tailed_slot_t>;
     std::size_t failures = 0;
     expected<std::unique_ptr<fixture_t>> fixture = mount();
@@ -904,29 +904,25 @@ std::size_t tails_read_back(mount_type_ const& mount) {
     st::basic_vector<std::uint8_t> kinds;
     st::basic_vector<std::uint32_t> tail_offsets;
     std::string tails;
-    std::string values;
     failures += expect(key_slots.resize(texts.size()) == st::status_t::success_k);
     failures += expect(kinds.resize(texts.size()) == st::status_t::success_k);
     failures += expect(tail_offsets.resize(texts.size() + 1) == st::status_t::success_k);
     if (failures != 0) return failures;
-    std::uint64_t const values_offset = tailed_layout_t::values_offset(texts.size());
     for (std::size_t index = 0; index != texts.size(); ++index) {
-        std::string const value = "value-" + std::to_string(index);
         tailed_slot_t slot;
         slot.stored_key = strings::head_of(texts[index]);
-        slot.size = static_cast<stored_value_size_t>(value.size());
-        slot.location = static_cast<stored_value_offset_t>(values_offset + values.size());
+        for (std::size_t position = 0; position != tailed_slot_t::size; ++position)
+            slot.data[position] = painted(index, position);
         key_slots[index] = slot;
         kinds[index] = static_cast<std::uint8_t>(delta_kind_t::write_k);
         tail_offsets[index] = static_cast<std::uint32_t>(tails.size());
         tails += strings::tail_of(texts[index]);
-        values += value;
     }
     tail_offsets[texts.size()] = static_cast<std::uint32_t>(tails.size());
     auto const bytes_of = [](std::string const& text) noexcept {
         return std::span<byte_t const> {reinterpret_cast<byte_t const*>(text.data()), text.size()};
     };
-    key_tails_t const run_tails {std::span<std::uint32_t const> {tail_offsets}, bytes_of(tails)};
+    key_tails_column_t const run_tails {std::span<std::uint32_t const> {tail_offsets}, bytes_of(tails)};
 
     uuid_t const content_id = uuid_generator();
     {
@@ -935,12 +931,12 @@ std::size_t tails_read_back(mount_type_ const& mount) {
         if (!volume) return failures;
         expected<tailed_run_t> written = tailed_run_t::write(
             *volume, guard->channel(), content_id, std::span<tailed_slot_t const> {key_slots},
-            std::span<std::uint64_t const> {stamps}, std::span<std::uint8_t const> {kinds}, 0, bytes_of(values), 4096,
+            std::span<std::uint64_t const> {stamps}, std::span<std::uint8_t const> {kinds}, 0, {}, tailed_slot_t::size,
             run_tails);
         failures += expect(written.has_value());
         if (!written) return failures;
         failures += expect_eq(written->size_bytes(),
-                              tailed_layout_t::blob_bytes(texts.size(), values.size(), written->stamps().saved_bytes(),
+                              tailed_layout_t::blob_bytes(texts.size(), 0, written->stamps().saved_bytes(),
                                                           written->kinds().saved_bytes(), tails.size()));
 
         // Two strings of one head whose tails descend are out of order, which the run refuses
@@ -951,16 +947,17 @@ std::size_t tails_read_back(mount_type_ const& mount) {
         std::array<std::uint8_t, 2> const swapped_kinds {0, 0};
         expected<tailed_run_t> misordered = tailed_run_t::write(
             *volume, guard->channel(), uuid_generator(), std::span<tailed_slot_t const> {swapped_slots},
-            std::span<std::uint64_t const> {swapped_stamps}, std::span<std::uint8_t const> {swapped_kinds}, 0, {}, 4096,
-            key_tails_t {std::span<std::uint32_t const> {swapped_offsets}, bytes_of(swapped_tails)});
+            std::span<std::uint64_t const> {swapped_stamps}, std::span<std::uint8_t const> {swapped_kinds}, 0, {},
+            tailed_slot_t::size,
+            key_tails_column_t {std::span<std::uint32_t const> {swapped_offsets}, bytes_of(swapped_tails)});
         failures += expect_status(misordered, status_code_t::invalid_argument_k);
 
         // Strings their heads hold whole save no tails and no offsets
         std::array<tailed_slot_t, 3> const short_slots {key_slots[0], key_slots[1], key_slots[2]};
-        expected<tailed_run_t> whole = tailed_run_t::write(*volume, guard->channel(), uuid_generator(),
-                                                           std::span<tailed_slot_t const> {short_slots},
-                                                           std::span<std::uint64_t const> {stamps}.first(3),
-                                                           std::span<std::uint8_t const> {kinds}.first(3), 0, {}, 4096);
+        expected<tailed_run_t> whole = tailed_run_t::write(
+            *volume, guard->channel(), uuid_generator(), std::span<tailed_slot_t const> {short_slots},
+            std::span<std::uint64_t const> {stamps}.first(3), std::span<std::uint8_t const> {kinds}.first(3), 0, {},
+            tailed_slot_t::size);
         failures += expect(whole.has_value());
         if (!whole) return failures;
         failures += expect(whole->tails().offsets.empty() && whole->tail(2).empty());
@@ -975,19 +972,18 @@ std::size_t tails_read_back(mount_type_ const& mount) {
     failures += expect(opened.has_value());
     if (!opened) return failures;
     failures += expect_eq(opened->population_count(), static_cast<std::uint64_t>(texts.size()));
+    failures += expect_eq(opened->header().key_slot_bytes, std::uint32_t {32});
+    failures += expect(opened->header().value_layout == value_layout_t::uuid_k);
+    failures += expect_eq(opened->header().stored_values_bytes, std::uint64_t {0});
     for (std::size_t index = 0; index != texts.size(); ++index) {
         failures += expect(opened->key_slot(index).stored_key == strings::head_of(texts[index]));
         failures += expect_eq(opened->tail(index), strings::tail_of(texts[index]));
         failures += expect_eq(opened->stamp(index), stamps[index]);
     }
-    std::array<char, 16> read {};
-    std::string_view const expected_value = "value-7";
-    failures += expect(opened
-                           ->read_value(guard->channel(), opened->key_slot(7),
-                                        std::span<byte_t> {reinterpret_cast<byte_t*>(read.data()), read.size()})
-                           .succeeded());
-    std::string_view const value_read(read.data(), expected_value.size());
-    failures += expect_eq(value_read, expected_value);
+    std::array<byte_t, tailed_slot_t::size> read {};
+    failures += expect(opened->read_value(guard->channel(), opened->key_slot(7), std::span<byte_t> {read}).succeeded());
+    for (std::size_t position = 0; position != read.size(); ++position)
+        failures += expect(read[position] == painted(7, position));
     return failures;
 }
 
@@ -1021,7 +1017,7 @@ int main(int argc, char const* argv[]) {
         report(totals, mount, "point_lookup", point_lookup_finds_and_misses);
         report(totals, mount, "smallest_sizes", runs_at_the_smallest_sizes);
         report(totals, mount, "value_size_extremes", values_at_the_size_extremes);
-        report(totals, mount, "tombstones", tombstones_read_back_as_tombstones);
+        report(totals, mount, "remove_deltas", remove_deltas_read_back_as_removals);
         report(totals, mount, "holds_its_depth", batched_read_holds_its_depth);
         report(totals, mount, "tails_read_back", tails_read_back);
     };

@@ -9,7 +9,7 @@
  *  writes and its catalog lookups. Every vertex is one key of its graph collection, holding the half-edges of
  *  `include/ustore/graph/adjacency_fold.hpp`, and every edge is a half-edge filed under each of its ends.
  *
- *  A write appends one change record per touched vertex and reads nothing, so two transactions adding edges to one
+ *  A write appends one change delta per touched vertex and reads nothing, so two transactions adding edges to one
  *  vertex both commit. What a write does depend on is watched, as a read is: a vertex an edge or a vertex write
  *  creates, which two transactions creating it conflict over, as the in-memory engine's do; a vertex a removal of edges
  *  changes, which must still be there; and the adjacency a vertex removal reads to find the other ends of its edges.
@@ -30,26 +30,26 @@
 #include "ustore/graph.h"    // `ustore_graph_read_edges_t`, `ustore_vertex_role_t`
 #include "ustore/ranges.hpp" // `strided`, `strided_iterator`
 
-#include "ustore/graph/adjacency_fold.hpp"  // `adjacency_fold`, `vertex_adjacency`, `deltas_of_edge`
+#include "ustore/graph/adjacency_fold.hpp"  // `adjacency_fold_t`, `vertex_adjacency_t`, `deltas_of_edge`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_allocator`, `growth_status`
 
 namespace unum::ustore::nvme {
 
-using graph::adjacency_fold;
+using graph::adjacency_fold_t;
 using graph::any_role_k;
 using graph::dedge_source_k;
 using graph::dedge_target_k;
 using graph::deltas_of_edge;
 using graph::encode_deltas;
-using graph::half_edge_cursor;
+using graph::half_edge_cursor_t;
 using graph::half_edge_delta_t;
 using graph::half_edge_operation_t;
 using graph::labeled_edge_t;
 using graph::role_t;
-using graph::vertex_adjacency;
+using graph::vertex_adjacency_t;
 
-/** The fold every change record of a graph collection is written for. */
-inline constexpr adjacency_fold graph_fold_k {};
+/** The fold every change delta of a graph collection is written for. */
+inline constexpr adjacency_fold_t graph_fold_k {};
 
 /** The half-edge roles a vertex plays as @p role names it, every role for any. */
 constexpr role_t half_edge_roles_of(ustore_vertex_role_t role) noexcept {
@@ -139,12 +139,12 @@ template <cpu_class_t cpu_class_>
 status_t read_vertices(call_access<cpu_class_> const& access, collection_id_t collection,
                        std::span<stored_key_t const> keys, std::span<vertex_read_t> reads) noexcept {
     using value_t = st::basic_vector<byte_t, arena_allocator<byte_t>>;
-    auto [results, results_status] = arena_allocate<select_result_t>(access.scratch, keys.size());
+    auto [results, results_status] = arena_allocate<lookup_result_t>(access.scratch, keys.size());
     if (results_status.failed()) return results_status;
     st::basic_vector<value_t, arena_allocator<value_t>> values {{access.scratch}};
     if (status_t const room = growth_status(values.reserve(keys.size())); room.failed()) return room;
     for (std::size_t index = 0; index != keys.size(); ++index) {
-        results[index] = select_result_t::nothing_k;
+        results[index] = lookup_result_t::missing_k;
         [[maybe_unused]] st::status_t const made = values.push_back(st::assume_reserved,
                                                                     value_t {arena_allocator<byte_t> {access.scratch}});
     }
@@ -164,11 +164,11 @@ status_t read_vertices(call_access<cpu_class_> const& access, collection_id_t co
     if (grown.failed()) return grown;
 
     for (std::size_t index = 0; index != keys.size(); ++index) {
-        if (results[index] == select_result_t::incomplete_k)
+        if (results[index] == lookup_result_t::incomplete_k)
             return {status_code_t::io_k, "The medium moved fewer bytes than a vertex claims"};
         vertex_read_t& read = reads[index];
         read = vertex_read_t {};
-        if (results[index] == select_result_t::success_k)
+        if (results[index] == lookup_result_t::written_k)
             read = vertex_read_t {true, std::span<byte_t const> {values[index].data(), values[index].size()}, {}};
         delta_view_t own;
         if (!access.transaction || !access.transaction->uncommitted_delta(collection, keys[index], own)) continue;
@@ -202,8 +202,8 @@ status_t read_task_vertices(call_access<cpu_class_> const& access,
 
 #pragma region Vertex Writes
 
-/** One record a write appends to the vertex it names, with its place in the batch, which orders records of one
- *  half-edge. */
+/** One half-edge delta a write appends to the vertex it names, with its place in the batch, which orders the deltas of
+ *  one half-edge. */
 struct vertex_delta_t {
     ustore_collection_id_t collection;
     ustore_key_t vertex;
@@ -249,7 +249,7 @@ status_t chain_by_vertex(std::span<vertex_delta_t> deltas, ustore_arena_t scratc
 
 /** Appends @p chain to its vertex through the transaction of @p access, folded after the vertex's own writes. */
 template <cpu_class_t cpu_class_>
-status_t stage_chain(call_access<cpu_class_> const& access, vertex_chain_t const& chain) noexcept {
+status_t append_chain(call_access<cpu_class_> const& access, vertex_chain_t const& chain) noexcept {
     return access.transaction->change(chain.collection, stored_of(chain.vertex.uuid), chain.records, graph_fold_k);
 }
 
@@ -326,8 +326,8 @@ status_t graph_read_edges(ustore_graph_read_edges_t const& arguments, view_t con
             degrees[index] = ustore_vertex_degree_missing_k;
             continue;
         }
-        expected<vertex_adjacency> const adjacency = vertex_adjacency::make(vertices[index], reads[index].base,
-                                                                            reads[index].pending);
+        expected<vertex_adjacency_t> const adjacency = vertex_adjacency_t::make(vertices[index], reads[index].base,
+                                                                                reads[index].pending);
         if (!adjacency) return adjacency.status();
         std::size_t const degree = adjacency->degree(
             half_edge_roles_of(roles ? roles[index] : ustore_vertex_role_any_k));
@@ -346,10 +346,10 @@ status_t graph_read_edges(ustore_graph_read_edges_t const& arguments, view_t con
         if (!reads[index].present) continue;
         ustore_key_t const vertex = vertices[index];
         role_t const wanted = half_edge_roles_of(roles ? roles[index] : ustore_vertex_role_any_k);
-        auto const adjacency = *vertex_adjacency::make(vertex, reads[index].base, reads[index].pending);
+        auto const adjacency = *vertex_adjacency_t::make(vertex, reads[index].base, reads[index].pending);
         for (role_t const role : {dedge_source_k, dedge_target_k}) {
             if (!(role & wanted)) continue;
-            for (half_edge_cursor cursor = adjacency.half_edges(); cursor.valid(); cursor.next()) {
+            for (half_edge_cursor_t cursor = adjacency.half_edges(); cursor.valid(); cursor.next()) {
                 graph::labeled_half_edge_t const half_edge = cursor.current();
                 if (!(half_edge.role & role)) continue;
                 bool const outgoing = role == dedge_source_k;
@@ -392,7 +392,7 @@ status_t graph_write_edges(ustore_graph_write_edges_t const& arguments, view_t c
                 if (access.schedule != watch_schedule_t::never_k && !committed_vertex(access, collection, key))
                     if (status_t const watched = watch_vertex(access, collection, key); watched.failed())
                         return watched;
-                if (status_t const staged = stage_chain(access, chain); staged.failed()) return staged;
+                if (status_t const appended = append_chain(access, chain); appended.failed()) return appended;
             }
             return {};
         });
@@ -426,7 +426,8 @@ status_t graph_remove_edges(ustore_graph_remove_edges_t const& arguments, view_t
                                if (!visible_vertex(access, collection, key)) continue;
                                if (status_t const watched = watch_vertex(access, collection, key); watched.failed())
                                    return watched;
-                               if (status_t const staged = stage_chain(access, chain); staged.failed()) return staged;
+                               if (status_t const appended = append_chain(access, chain); appended.failed())
+                                   return appended;
                            }
                            return {};
                        });
@@ -456,9 +457,9 @@ status_t graph_write_vertices(ustore_graph_write_vertices_t const& arguments, vi
                 if (!committed_vertex(access, collection, key))
                     if (status_t const watched = watch_vertex(access, collection, key); watched.failed())
                         return watched;
-                if (status_t const staged = access.transaction->change(collection, key, {}, graph_fold_k);
-                    staged.failed())
-                    return staged;
+                if (status_t const created = access.transaction->change(collection, key, {}, graph_fold_k);
+                    created.failed())
+                    return created;
             }
             return {};
         });
@@ -495,10 +496,10 @@ status_t graph_remove_vertices(ustore_graph_remove_vertices_t const& arguments, 
                 if (!reads[index].present) continue;
                 ustore_key_t const vertex = vertices[index];
                 role_t const wanted = half_edge_roles_of(roles ? roles[index] : ustore_vertex_role_any_k);
-                expected<vertex_adjacency> const adjacency = vertex_adjacency::make(vertex, reads[index].base,
-                                                                                    reads[index].pending);
+                expected<vertex_adjacency_t> const adjacency = vertex_adjacency_t::make(vertex, reads[index].base,
+                                                                                        reads[index].pending);
                 if (!adjacency) return adjacency.status();
-                for (half_edge_cursor cursor = adjacency->half_edges(); cursor.valid(); cursor.next()) {
+                for (half_edge_cursor_t cursor = adjacency->half_edges(); cursor.valid(); cursor.next()) {
                     graph::labeled_half_edge_t const half_edge = cursor.current();
                     if (!(half_edge.role & wanted) || half_edge.neighbor_id == vertex) continue;
                     half_edge_delta_t const removal = half_edge_delta_t::remove(vertex, half_edge.edge_id,
@@ -518,7 +519,7 @@ status_t graph_remove_vertices(ustore_graph_remove_vertices_t const& arguments, 
                 stored_key_t const key = stored_of(chain.vertex.uuid);
                 if (!visible_vertex(access, collection, key)) continue;
                 if (status_t const watched = watch_vertex(access, collection, key); watched.failed()) return watched;
-                if (status_t const staged = stage_chain(access, chain); staged.failed()) return staged;
+                if (status_t const appended = append_chain(access, chain); appended.failed()) return appended;
             }
             // The removals go last, so one outranks a change this batch appended to a vertex it also removes
             for (std::size_t index = 0; index != count; ++index) {

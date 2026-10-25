@@ -31,6 +31,7 @@
 #include <yyjson.h>
 
 #include <smashtable/basic_vector.hpp>
+#include <stringzilla/capabilities.h> // `sz_capabilities_enabled_cpu`
 
 #include "ustore/docs/json_paths.hpp"       // `resolve_fields`, `json_documents_t`
 #include "ustore/docs/json_values.hpp"      // `json_parse`, `json_lookup`, `gather_scalar`, `json_to_string`
@@ -41,6 +42,15 @@
 namespace unum::ustore::bench {
 
 using namespace unum::ustore::docs;
+
+/** The StringZilla kernels this CPU allows, probed once as `src/` does before it resolves. */
+inline sz_capability_t stringzilla_capabilities() noexcept {
+    static sz_capability_t const capabilities = []() noexcept {
+        sz_capability_t probed = 0;
+        return sz_capabilities_enabled_cpu(&probed) == sz_success_k ? probed : sz_capability_t {0};
+    }();
+    return capabilities;
+}
 
 #pragma region Settings
 
@@ -213,7 +223,8 @@ bool resolve_with_subdocuments(json_documents_t const& documents, std::span<std:
                                bool containers_parsed, ustore_arena_t scratch, std::span<yyjson_val*> values) noexcept {
     std::size_t const count = documents.count;
     auto const cell_of = [count](std::size_t cell) noexcept { return field_cell_t {cell % count, cell / count}; };
-    return resolve_fields(documents, fields, count * fields.size(), cell_of, containers_parsed, scratch, values);
+    return resolve_fields(documents, fields, count * fields.size(), cell_of, containers_parsed, scratch,
+                          stringzilla_capabilities(), values);
 }
 
 /** Runs one row: each call resolves the next batch of the corpus with @p subdocuments or yyjson, then fills

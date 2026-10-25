@@ -112,12 +112,12 @@ concept sorted_128_cursor_concept = requires(cursor_type_& cursor, cursor_type_ 
 };
 
 /** Walks a sorted span of keys one distinct key at a time, galloping forward on a seek. */
-class sorted_128_cursor {
+class sorted_128_cursor_t {
   public:
-    sorted_128_cursor() noexcept = default;
+    sorted_128_cursor_t() noexcept = default;
 
     /** A walk over @p keys, sorted bytewise and possibly repeating, which must outlive the walk. */
-    explicit sorted_128_cursor(std::span<ustore_key_t const> keys) noexcept : keys_(keys) {}
+    explicit sorted_128_cursor_t(std::span<ustore_key_t const> keys) noexcept : keys_(keys) {}
 
     /** Whether the walk still stands on a key. */
     bool valid() const noexcept { return offset_ < keys_.size(); }
@@ -159,7 +159,7 @@ class sorted_128_cursor {
     std::size_t offset_ = 0;
 };
 
-static_assert(sorted_128_cursor_concept<sorted_128_cursor>);
+static_assert(sorted_128_cursor_concept<sorted_128_cursor_t>);
 
 /**
  *  @brief Calls @p callback with every key both walks hold, once each and in order, leapfrogging the walk that lags.
@@ -187,7 +187,7 @@ status_t intersect_sorted_128(first_cursor_& first, second_cursor_& second, call
  *  many. */
 inline std::size_t intersect_sorted_128(std::span<ustore_key_t const> first, std::span<ustore_key_t const> second,
                                         ustore_key_t* output) noexcept {
-    sorted_128_cursor first_cursor(first), second_cursor(second);
+    sorted_128_cursor_t first_cursor(first), second_cursor(second);
     std::size_t count = 0;
     [[maybe_unused]] status_t const status = intersect_sorted_128(first_cursor, second_cursor,
                                                                   [&](ustore_key_t const& key) noexcept {
@@ -206,7 +206,7 @@ inline std::size_t intersect_sorted_128(std::span<ustore_key_t const> first, std
 template <typename callback_type_>
 status_t merge_sorted_128(std::span<ustore_key_t const> first, std::span<ustore_key_t const> second,
                           callback_type_&& callback) noexcept {
-    sorted_128_cursor first_cursor(first), second_cursor(second);
+    sorted_128_cursor_t first_cursor(first), second_cursor(second);
     while (first_cursor.valid() || second_cursor.valid()) {
         int const order = !first_cursor.valid()    ? 1
                           : !second_cursor.valid() ? -1

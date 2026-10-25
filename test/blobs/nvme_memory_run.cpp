@@ -28,10 +28,10 @@
 
 #include <forkunion/atomics.hpp> // `fu::standard_atomic_ref`
 #include <forkunion/types.hpp>   // `fu::standard_yield_t`
-#include <smashtable/shared.hpp> // `st::commit_order_t`, `st::standard_waiting_policy`
+#include <smashtable/shared.hpp> // `st::commit_order_t`
 
 #include "ustore/blobs/nvme_collection_view.hpp" // `collection_view`, `published_view`, `epoch_domain`
-#include "ustore/blobs/nvme_memory_run.hpp"      // `keyed_delta`, `memory_run`, `sealed_writes`
+#include "ustore/blobs/nvme_memory_run.hpp"      // `keyed_delta`, `memory_run`, `sealed_deltas`
 
 namespace unum::ustore::test {
 
@@ -39,7 +39,7 @@ using namespace unum::ustore::blobs;
 
 using stored_key_t = std::uint64_t;
 using keyed_delta_t = keyed_delta<stored_key_t>;
-using sealed_t = sealed_writes<stored_key_t>;
+using sealed_t = sealed_deltas<stored_key_t>;
 using run_t = memory_run<stored_key_t>;
 using view_t = collection_view<run_t>;
 
@@ -48,7 +48,7 @@ template <typename value_type_>
 using atomic_reference = fu::standard_atomic_ref<value_type_>;
 
 /** The epochs every case announces its readers in, waiting out readers by yielding. */
-using epoch_domain_t = epoch_domain<atomic_reference, st::standard_waiting_policy<fu::standard_yield_t>>;
+using epoch_domain_t = epoch_domain<atomic_reference, fu::standard_yield_t>;
 using bytes_t = std::vector<byte_t>;
 
 #pragma region Harness and Model
@@ -165,7 +165,7 @@ static std::size_t random_streams_match_model() {
     std::size_t failures = 0;
     for (std::uint64_t seed = 1; seed <= 3 && failures == 0; ++seed) {
         std::mt19937_64 generator(seed);
-        std::uniform_int_distribution<std::size_t> records_count(1, 8), kind_pick(0, 9), length_pick(0, 16);
+        std::uniform_int_distribution<std::size_t> deltas_count(1, 8), kind_pick(0, 9), length_pick(0, 16);
         // A few keys past the written ones are probed and never found.
         std::uniform_int_distribution<stored_key_t> key_pick(0, keys_count_k - 1), probe_pick(0, keys_count_k + 7);
         std::uniform_int_distribution<int> byte_pick(0, 255);
@@ -180,7 +180,7 @@ static std::size_t random_streams_match_model() {
         for (transaction_stamp_t stamp = 1; stamp <= commits_count_k && failures == 0; ++stamp) {
             std::vector<keyed_delta_t> deltas;
             std::vector<bytes_t> payloads;
-            std::size_t const wanted = records_count(generator);
+            std::size_t const wanted = deltas_count(generator);
             payloads.reserve(wanted);
             for (std::size_t index = 0; index != wanted; ++index) {
                 stored_key_t const stored_key = key_pick(generator);

@@ -5,7 +5,7 @@
  *  @brief Stress tests running concurrent transactions on a UStoreNVMe single-collection database and replaying them in
  *      commit order.
  *
- *  Every commit claims a stamp, and the stamps order the commits as they landed. Writers record what they committed
+ *  Every commit draws a stamp, and the stamps order the commits as they landed. Writers record what they committed
  *  under its stamp, readers record what a read-only transaction saw under the stamp of its own commit, and once the
  *  threads are joined the records are replayed in stamp order: every read must match the model right before its
  *  stamp, and the database must end as the whole replay does.
@@ -60,8 +60,8 @@ struct stress_stack {
     using guard_t = typename fixture_t::guard_t;
     using volume_t = typename fixture_t::volume_t;
     using database_t =
-        basic_single_collection_database<stored_key_t, volume_t, atomic_reference, waiting_policy_t,
-                                         collection<inline_slot_t, volume_t, atomic_reference, waiting_policy_t>>;
+        basic_single_collection_database<stored_key_t, volume_t, atomic_reference, waiter_t,
+                                         nvme_store<inline_slot_t, volume_t, atomic_reference, waiter_t>>;
 
     /** The disk, the arena and the channels. */
     std::unique_ptr<fixture_t> fixture;
@@ -87,11 +87,11 @@ struct stress_stack {
     single_collection_database_config_t config;
     config.collection.concurrency_limit = worker_threads_k;
     config.collection.cache_limit = 1024ull * 1024ull;
-    config.collection.write_buffer_max_bytes = 256ull * 1024ull;
-    config.collection.write_buffer_max_elements = 2048;
+    config.collection.memory_runs_max_bytes = 256ull * 1024ull;
+    config.collection.memory_runs_max_deltas = 2048;
     config.collection.lsm_tree.level_enlarge_factor = 4;
-    config.default_transaction.write_buffer_max_bytes = 64ull * 1024ull;
-    config.default_transaction.write_buffer_max_elements = 1024;
+    config.default_transaction.max_bytes = 64ull * 1024ull;
+    config.default_transaction.max_deltas = 1024;
     return config;
 }
 
@@ -158,7 +158,7 @@ expected<typename stack_type_::database_t::database_unique_ptr_t> open_over(stac
 template <typename reader_type_>
 status_t read_counters(reader_type_ const& reader, io_channel_t& channel, std::span<stored_key_t const> keys,
                        st::basic_vector<bool>& present, st::basic_vector<std::uint64_t>& counters) noexcept {
-    st::basic_vector<select_result_t> results;
+    st::basic_vector<lookup_result_t> results;
     st::basic_vector<std::array<byte_t, value_bytes_k>> values;
     if (results.resize(keys.size()) != st::status_t::success_k ||
         values.resize(keys.size()) != st::status_t::success_k ||
@@ -169,10 +169,10 @@ status_t read_counters(reader_type_ const& reader, io_channel_t& channel, std::s
         for (std::size_t index = 0; index != bytes.size() && offset + index < value_bytes_k; ++index)
             values[request][static_cast<std::size_t>(offset + index)] = bytes[index];
     };
-    if (status_t const read = reader.select(channel, keys, std::span<select_result_t> {results}, sink); read.failed())
+    if (status_t const read = reader.select(channel, keys, std::span<lookup_result_t> {results}, sink); read.failed())
         return read;
     for (std::size_t index = 0; index != keys.size(); ++index) {
-        present[index] = results[index] == select_result_t::success_k;
+        present[index] = results[index] == lookup_result_t::written_k;
         counters[index] = present[index] ? read_counter(std::span<byte_t const> {values[index]}) : 0;
     }
     return {};
@@ -279,8 +279,8 @@ std::size_t chunks_land_whole(mount_type_ const& mount) {
 /** What one committed transaction did, filed under the stamp its commit claimed. */
 struct record_t {
 
-    /** Whether the transaction wrote, erased or only read. */
-    enum class kind_t : std::uint8_t { insert_k, erase_k, read_k };
+    /** Whether the transaction wrote, removed or only read. */
+    enum class kind_t : std::uint8_t { insert_k, remove_k, read_k };
 
     /** The stamp the commit claimed, which orders it among every other. */
     transaction_stamp_t stamp = 0;
@@ -306,7 +306,7 @@ struct record_order_t {
 };
 
 /**
- *  @brief Writers, an eraser and readers run transactions at once, and every read replays at its commit's stamp.
+ *  @brief Writers, a remover and readers run transactions at once, and every read replays at its commit's stamp.
  *
  *  A read-only transaction that commits had nothing it watched written since it started, so what it read is the
  *  state every commit stamped before it left. A read a conflict refused is rolled back and recorded nowhere.
@@ -321,7 +321,7 @@ std::size_t transactions_replay_in_commit_order(mount_type_ const& mount) {
     constexpr std::size_t transactions_k = 100;
     constexpr std::size_t operations_max_k = 32;
     constexpr std::size_t inserters_k = 1;
-    constexpr std::size_t erasers_k = 1;
+    constexpr std::size_t removers_k = 1;
 
     expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
     failures += expect_status(stack, status_code_t::success_k);
@@ -343,9 +343,9 @@ std::size_t transactions_replay_in_commit_order(mount_type_ const& mount) {
             if (!changing) return;
 
             random_t random = random_t {seed_k}.fork(worker);
-            record_t::kind_t const kind = worker < inserters_k               ? record_t::kind_t::insert_k
-                                          : worker < inserters_k + erasers_k ? record_t::kind_t::erase_k
-                                                                             : record_t::kind_t::read_k;
+            record_t::kind_t const kind = worker < inserters_k                ? record_t::kind_t::insert_k
+                                          : worker < inserters_k + removers_k ? record_t::kind_t::remove_k
+                                                                              : record_t::kind_t::read_k;
             std::array<byte_t, value_bytes_k> value {};
             for (std::size_t round = 0; round != transactions_k; ++round) {
                 record_t record;
@@ -373,7 +373,7 @@ std::size_t transactions_replay_in_commit_order(mount_type_ const& mount) {
                         status_t const written = kind == record_t::kind_t::insert_k
                                                      ? (*changing)->insert(record.keys[index],
                                                                            std::span<byte_t const> {value})
-                                                     : (*changing)->erase(record.keys[index]);
+                                                     : (*changing)->remove(record.keys[index]);
                         worker_failures[worker] += expect(written.succeeded());
                     }
 
@@ -412,7 +412,7 @@ std::size_t transactions_replay_in_commit_order(mount_type_ const& mount) {
                 model_present[key] = true;
                 model_counters[key] = record->counters[index];
                 break;
-            case record_t::kind_t::erase_k: model_present[key] = false; break;
+            case record_t::kind_t::remove_k: model_present[key] = false; break;
             case record_t::kind_t::read_k:
                 failures += expect_eq(record->present[index], model_present[key]);
                 if (model_present[key]) failures += expect_eq(record->counters[index], model_counters[key]);

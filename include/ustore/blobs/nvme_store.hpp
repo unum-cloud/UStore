@@ -2,8 +2,8 @@
  *  @file include/ustore/blobs/nvme_store.hpp
  *  @author Ash Vardanian
  *  @date July 10, 2023
- *  @brief One collection: immutable memory runs and a value cache in front of an LSM tree of sorted runs, the one
- *      view every read runs against, and the ordered walk over any value layout.
+ *  @brief The NVMe store of one collection: immutable memory runs and a value cache in front of an LSM tree of sorted
+ *      runs, the one view every read runs against, and the ordered walk over any value layout.
  *
  *  Three places can answer a key, and they are consulted newest first: the memory runs hold what has
  *  not been flushed, the value cache holds what a point read already paid for, and the tree holds the
@@ -26,7 +26,7 @@
  *  runs included, and nothing is materialized. Where several runs carry the same key the newest memory run
  *  wins, then the shallowest level, and inside a level that may overlap the youngest run. There is no prefetcher,
  *  and adding one would be a mistake rather than an optimization: a scan that wants bytes hands the next keys to
- *  @c collection::select, which already refills the ring as completions retire, while a second pipeline reading
+ *  @c nvme_store::select, which already refills the ring as completions retire, while a second pipeline reading
  *  ahead on the same channel would poll the first one's completions and drop them.
  */
 
@@ -52,10 +52,10 @@
 #include <smashtable/shared.hpp>           // `st::commit_order_t`, `st::latest_snapshot_k`
 
 #include "ustore/blobs/nvme_collection_view.hpp" // `collection_view`, `epoch_domain`, `published_view`
-#include "ustore/blobs/nvme_memory_run.hpp"      // `keyed_delta`, `memory_run`, `sealed_writes`
+#include "ustore/blobs/nvme_memory_run.hpp"      // `keyed_delta`, `memory_run`, `sealed_deltas`
 #include "ustore/blobs/nvme_key_slot.hpp"        // `limit`, `stored_value_size_t`, `value_layout_t`
 #include "ustore/blobs/nvme_tree.hpp"            // `lsm_tree`, `lsm_tree_position_t`, `collection_config_t`
-#include "ustore/utilities/folds.hpp"            // `fold_concept`, `fold_pair`, `last_write_fold`
+#include "ustore/utilities/folds.hpp"            // `fold_concept`, `fold_delta_pair`, `last_write_fold_t`
 #include "ustore/utilities/nvme_channels.hpp"    // `io_channel_t`
 #include "ustore/utilities/nvme_ring.hpp"        // `resource_constraint`, `constrained_allocator`
 #include "ustore/utilities/ram_buffers.hpp"      // `local_arena_t`, `arena_allocator`
@@ -70,14 +70,14 @@ using utilities::resource_constraint;
 
 #pragma region Stamps
 
-template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+template <template <typename> typename atomic_reference_, typename waiter_type_>
 class commit_ledger;
 
-/** The order a ledger draws its stamps from, shaped as SmashTable's shared default, parking its committers through
- *  @p waiting_policy_type_. */
-template <typename waiting_policy_type_>
+/** The order a ledger draws its stamps from, shaped as SmashTable's shared default, its committers spinning through
+ *  @p waiter_type_ before they park. */
+template <typename waiter_type_>
 using commit_order = st::basic_commit_order<st::commit_order_t::ring_k, st::commit_order_t::buckets_k,
-                                            st::commit_order_t::sharing_k, waiting_policy_type_>;
+                                            st::commit_order_t::sharing_k, st::standard_waiting_policy<waiter_type_>>;
 
 /** Whether a pin holds history for a reader, or registers a collection's published view with the ledger. */
 enum class pin_kind_t : std::uint8_t {
@@ -96,12 +96,12 @@ enum class pin_kind_t : std::uint8_t {
  *  relinking under the ledger's claim, and it gives its stamp back when it dies. A reader's stamp never changes
  *  while linked; a view's is stored in place by whoever publishes the view.
  */
-template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+template <template <typename> typename atomic_reference_, typename waiter_type_>
 class stamp_pin {
   public:
 
     /** The ledger a pin links into. */
-    using ledger_t = commit_ledger<atomic_reference_, waiting_policy_type_>;
+    using ledger_t = commit_ledger<atomic_reference_, waiter_type_>;
 
     stamp_pin() noexcept = default;
     stamp_pin(stamp_pin const&) = delete;
@@ -120,7 +120,7 @@ class stamp_pin {
     void release() noexcept;
 
   private:
-    friend class commit_ledger<atomic_reference_, waiting_policy_type_>;
+    friend class commit_ledger<atomic_reference_, waiter_type_>;
 
     /** The ledger this pin is linked into, null while it holds nothing. */
     ledger_t* ledger_ = nullptr;
@@ -136,7 +136,7 @@ class stamp_pin {
     pin_kind_t kind_ = pin_kind_t::reader_k;
 
     /** A reader's place among the commit order's readers, which holds its low-water mark at or below the stamp. */
-    typename commit_order<waiting_policy_type_>::snapshot_claim_t claim_;
+    typename commit_order<waiter_type_>::snapshot_claim_t claim_;
 };
 
 /** What became of a commit handed to a ledger's sequencer. */
@@ -211,18 +211,22 @@ struct unpublished_t {
  *  before has left, so a commit returns only after freeing the views its batch replaced and nothing waits for later.
  *
  *  @tparam atomic_reference_ The reference every pending, leader, claim and pinned word is owned through.
- *  @tparam waiting_policy_type_ What a committer's core does between attempts, and how it parks on the leader word.
+ *  @tparam waiter_type_ What a committer's core does between attempts, before it parks on the leader word.
  */
-template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+template <template <typename> typename atomic_reference_, typename waiter_type_>
 class commit_ledger {
   public:
-    using order_t = commit_order<waiting_policy_type_>;
+
+    /** Spins through @p waiter_type_, then parks on the leader word. */
+    using waiting_policy_t = st::standard_waiting_policy<waiter_type_>;
+
+    using order_t = commit_order<waiter_type_>;
 
     /** One stamp a reader or a view holds against this ledger. */
-    using pin_t = stamp_pin<atomic_reference_, waiting_policy_type_>;
+    using pin_t = stamp_pin<atomic_reference_, waiter_type_>;
 
     /** The epochs every reader of this ledger's collections announces. */
-    using epochs_t = epoch_domain<atomic_reference_, waiting_policy_type_>;
+    using epochs_t = epoch_domain<atomic_reference_, waiter_type_>;
 
     /** One commit between drawing its stamp and landing it. */
     using commit_in_flight_t = typename order_t::commit_in_flight_t;
@@ -263,7 +267,7 @@ class commit_ledger {
             }
             // A leader lets the word go only after landing or refusing every request it took, so this wakes either to
             // its outcome or to the word.
-            waiting_policy_type_ {}.wait_until_changed(&leader_, std::int32_t {1});
+            waiting_policy_t {}.wait_until_changed(&leader_, std::int32_t {1});
         }
         if (request.outcome == commit_outcome_t::refused_k) return request.refusal;
         // Every stamp the leader drew is landed in order, so this returns at once; it holds no lock either way.
@@ -273,7 +277,7 @@ class commit_ledger {
 
     /** Takes the leader word, parked while another thread holds it, which a stage, a flush and a compaction do. */
     void lead() noexcept {
-        while (!try_lead_()) waiting_policy_type_ {}.wait_until_changed(&leader_, std::int32_t {1});
+        while (!try_lead_()) waiting_policy_t {}.wait_until_changed(&leader_, std::int32_t {1});
     }
 
     /**
@@ -284,7 +288,7 @@ class commit_ledger {
     void stop_leading() noexcept {
         unpublished_t* unpublished = std::exchange(unpublished_, nullptr);
         atomic_reference_<std::int32_t> {leader_}.store(0, std::memory_order_release);
-        waiting_policy_type_ {}.notify_waiters(&leader_);
+        waiting_policy_t {}.notify_waiters(&leader_);
         if (!unpublished) return;
         epochs_.wait_for_readers();
         while (unpublished) {
@@ -407,7 +411,7 @@ class commit_ledger {
     }
 
   private:
-    friend class stamp_pin<atomic_reference_, waiting_policy_type_>;
+    friend class stamp_pin<atomic_reference_, waiter_type_>;
 
     /** Takes the leader word if nobody holds it. */
     [[nodiscard]] bool try_lead_() noexcept {
@@ -462,7 +466,7 @@ class commit_ledger {
             std::int32_t expected_free = 0;
             while (
                 !word.compare_exchange_weak(expected_free, 1, std::memory_order_acquire, std::memory_order_relaxed)) {
-                waiting_policy_type_ {}(&claim_, expected_free, std::size_t {0});
+                waiter_type_ {}(&claim_, expected_free, std::size_t {0});
                 expected_free = 0;
             }
         }
@@ -549,16 +553,16 @@ class commit_ledger {
     epochs_t epochs_;
 };
 
-template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
-stamp_pin<atomic_reference_, waiting_policy_type_>::stamp_pin(stamp_pin&& other) noexcept {
+template <template <typename> typename atomic_reference_, typename waiter_type_>
+stamp_pin<atomic_reference_, waiter_type_>::stamp_pin(stamp_pin&& other) noexcept {
     if (other.ledger_) {
         other.ledger_->relink_(other, *this);
         claim_ = std::move(other.claim_);
     }
 }
 
-template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
-stamp_pin<atomic_reference_, waiting_policy_type_>& stamp_pin<atomic_reference_, waiting_policy_type_>::operator=(
+template <template <typename> typename atomic_reference_, typename waiter_type_>
+stamp_pin<atomic_reference_, waiter_type_>& stamp_pin<atomic_reference_, waiter_type_>::operator=(
     stamp_pin&& other) noexcept {
     if (this == &other) return *this;
     release();
@@ -569,13 +573,13 @@ stamp_pin<atomic_reference_, waiting_policy_type_>& stamp_pin<atomic_reference_,
     return *this;
 }
 
-template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
-stamp_pin<atomic_reference_, waiting_policy_type_>::~stamp_pin() noexcept {
+template <template <typename> typename atomic_reference_, typename waiter_type_>
+stamp_pin<atomic_reference_, waiter_type_>::~stamp_pin() noexcept {
     release();
 }
 
-template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
-void stamp_pin<atomic_reference_, waiting_policy_type_>::release() noexcept {
+template <template <typename> typename atomic_reference_, typename waiter_type_>
+void stamp_pin<atomic_reference_, waiter_type_>::release() noexcept {
     if (!ledger_) return;
     ledger_->unlink_(*this);
     claim_.retire();
@@ -809,25 +813,9 @@ class value_cache {
 
 #pragma endregion Value Cache
 
-#pragma region Collection
+#pragma region Store
 
 #pragma region Vocabulary
-
-/** What one key of a select answered, which separates a miss from an erasure and from a truncated run. */
-enum class select_result_t : std::uint8_t {
-
-    /** Neither a memory run nor any level carries that key. */
-    nothing_k,
-
-    /** A removal carries that key, so its value has been erased. */
-    erased_k,
-
-    /** Every byte the key slot claims arrived. */
-    success_k,
-
-    /** The medium moved fewer bytes than the key slot claims, so this one key failed. */
-    incomplete_k,
-};
 
 /** How full a collection's memory runs would be with one more commit, against the bounds it was mounted with. */
 enum class memory_pressure_t : std::uint8_t {
@@ -848,20 +836,20 @@ struct memory_shape_t {
     /** The memory runs, which a point read probes one after another. */
     std::size_t runs = 0;
 
-    /** The commits they hold: one per run of generation zero, and F times a run's for one generation past it. */
+    /** The commits they hold: one per run of tier zero, and F times a run's for one tier above it. */
     std::uint64_t commits = 0;
 };
 
-/** One commit's records for one collection, sealed off every shared path by its committer, and the run the leader
+/** One commit's deltas for one collection, sealed off every shared path by its committer, and the run the leader
  *  stamps them into, both charged to a budget whose word @p atomic_reference_ owns; both outlive the request carrying
  *  them only until the commit lands or is refused. */
 template <typename stored_key_type_, template <typename> typename atomic_reference_>
 struct sealed_commit {
 
-    /** The records, sorted and copied, which the leader moves into @c run once it draws the stamp. */
-    sealed_writes<stored_key_type_, constrained_allocator<byte_t, atomic_reference_>> writes;
+    /** The deltas, sorted and copied, which the leader moves into @c run once it draws the stamp. */
+    sealed_deltas<stored_key_type_, constrained_allocator<byte_t, atomic_reference_>> deltas;
 
-    /** The run they become, allocated by the committer, owned by the collection once published. */
+    /** The run they become, allocated by the committer, owned by the store once published. */
     std::unique_ptr<memory_run<stored_key_type_, constrained_allocator<byte_t, atomic_reference_>>> run;
 };
 
@@ -873,7 +861,7 @@ struct scan_entry {
     stored_key_type_ stored_key {};
 
     /** Whether the key carries a value or a removal. */
-    select_result_t state = select_result_t::nothing_k;
+    lookup_result_t state = lookup_result_t::missing_k;
 
     /** Bytes the value takes, zero for a removal and for an empty value. */
     stored_value_size_t size = 0;
@@ -881,57 +869,60 @@ struct scan_entry {
 
 /** Keys one page of a scan holds, as many as one page of memory does, which bounds how long a commit waits. */
 template <typename stored_key_type_>
-inline constexpr std::size_t scan_page_keys_k = utilities::arena_page_bytes_k / sizeof(scan_entry<stored_key_type_>);
+constexpr std::size_t scan_page_keys() noexcept {
+    return utilities::arena_page_bytes_k / sizeof(scan_entry<stored_key_type_>);
+}
 
 template <typename key_slot_type_, typename volume_type_, template <typename> typename atomic_reference_,
-          typename waiting_policy_type_, utilities::fold_concept fold_type_ = utilities::last_write_fold>
-class collection_scanner;
+          typename waiter_type_, utilities::fold_concept fold_type_ = utilities::last_write_fold_t>
+class nvme_store_cursor;
 
 #pragma endregion Vocabulary
 
-#pragma region Collection
+#pragma region Store
 
 /**
- *  @brief Immutable memory runs and a value cache in front of an LSM tree of sorted runs, behind one published view.
+ *  @brief The store of one collection: immutable memory runs and a value cache in front of an LSM tree of sorted runs,
+ *      behind one published view.
  *
  *  A reader announces itself in its ledger's epochs, loads the published stamp and then the view, and walks immutable
- *  runs with no lock. A committer seals its records into one memory run on its own thread, and the ledger's leader
- *  publishes a view naming it ahead of the others. A merge folds F runs of one generation into one run of the next,
+ *  runs with no lock. A committer seals its deltas into one memory run on its own thread, and the ledger's leader
+ *  publishes a view naming it ahead of the others. A merge folds F runs of one tier into one run of the next tier,
  *  and a flush writes the memory runs of one view as one run of level zero, each with no lock held, then takes the
  *  leader word only to publish a view without exactly those runs. Whoever replaces a view frees the view and the runs
  *  it no longer names before returning, once every reader that entered before has left. Merges, flushes, compactions
- *  and truncations of one collection are serialized by its owner. The volume, the budget and every channel are
- *  borrowed and must outlive the collection, and a channel belongs to the thread holding it.
+ *  and truncations of one store are serialized by its owner. The volume, the budget and every channel are borrowed
+ *  and must outlive the store, and a channel belongs to the thread holding it.
  *
- *  The fold decides what a change record does: a read collects a key's versions newest first down to the first that
- *  closes the chain and applies them, and every merge composes the changes no reader tells apart. A collection of
- *  blobs folds with @c last_write_fold, writes no change, and reads and merges exactly as if it had no fold.
+ *  The fold decides what a change delta does: a read collects a key's versions newest first down to the first that
+ *  closes the chain and applies them, and every merge composes the changes no reader tells apart. A store of blobs
+ *  folds with @c last_write_fold_t, writes no change, and reads and merges exactly as if it had no fold.
  *
  *  @tparam atomic_reference_ The reference the published view, the cache, the budget and the ledger own their words
  *      through.
- *  @tparam waiting_policy_type_ What a core waiting on a read, a barrier or the ledger does, and how it parks.
+ *  @tparam waiter_type_ What a core waiting on a read, a barrier or the ledger does between attempts, before it parks.
  */
 template <typename key_slot_type_, typename volume_type_, template <typename> typename atomic_reference_,
-          typename waiting_policy_type_, utilities::fold_concept fold_type_ = utilities::last_write_fold>
-class collection {
+          typename waiter_type_, utilities::fold_concept fold_type_ = utilities::last_write_fold_t>
+class nvme_store {
   public:
 
 #pragma region Types
 
-    /** The key slot every run of this collection holds. */
+    /** The key slot every run of this store holds. */
     using key_slot_t = key_slot_type_;
 
-    /** The volume every run of this collection lives on. */
+    /** The volume every run of this store lives on. */
     using volume_t = volume_type_;
 
-    /** What a change record of this collection does, which reads and merges fold with. */
+    /** What a change delta of this store does, which reads and merges fold with. */
     using fold_t = fold_type_;
 
     /** The key the runs order their key slots by. */
     using stored_key_t = typename key_slot_t::stored_key_t;
 
     /** The tree the flushed writes of this collection live in. */
-    using tree_t = lsm_tree<key_slot_t, volume_t, atomic_reference_, waiting_policy_type_>;
+    using tree_t = lsm_tree<key_slot_t, volume_t, atomic_reference_, waiter_type_>;
 
     /** One level set of that tree, which a view names. */
     using level_set_t = typename tree_t::level_set_t;
@@ -940,10 +931,10 @@ class collection {
     using value_cache_t = value_cache<stored_key_t, atomic_reference_>;
 
     /** The stamps this collection's writes carry and its readers pin. */
-    using ledger_t = commit_ledger<atomic_reference_, waiting_policy_type_>;
+    using ledger_t = commit_ledger<atomic_reference_, waiter_type_>;
 
     /** One stamp a reader or a view of this collection holds against the ledger. */
-    using pin_t = stamp_pin<atomic_reference_, waiting_policy_type_>;
+    using pin_t = stamp_pin<atomic_reference_, waiter_type_>;
 
     /** The budget the memory runs and the cache are charged to. */
     using constraint_t = resource_constraint<atomic_reference_>;
@@ -951,19 +942,19 @@ class collection {
     /** Where the sections of one flushed run sit inside its blob. */
     using sorted_run_layout_t = sorted_run_layout<key_slot_t>;
 
-    /** One record a commit hands over: the key, what the record does, and its bytes. */
+    /** One delta a commit hands over: the key, its kind, and its bytes. */
     using keyed_delta_t = keyed_delta<stored_key_t>;
 
-    /** One commit's records, sorted and copied, before they are stamped. */
-    using sealed_writes_t = sealed_writes<stored_key_t, constrained_allocator<byte_t, atomic_reference_>>;
+    /** One commit's deltas, sorted and copied, before they are stamped. */
+    using sealed_deltas_t = sealed_deltas<stored_key_t, constrained_allocator<byte_t, atomic_reference_>>;
 
-    /** One commit's records, stamped, which nothing changes once a view names them. */
+    /** One commit's deltas, stamped, which nothing changes once a view names them. */
     using memory_run_t = memory_run<stored_key_t, constrained_allocator<byte_t, atomic_reference_>>;
 
     /** The memory runs one view names, newest first. */
     using memory_view_t = collection_view<memory_run_t>;
 
-    /** One commit's records for this collection between its sealing and its landing. */
+    /** One commit's deltas for this store between their sealing and their landing. */
     using sealed_commit_t = sealed_commit<stored_key_t, atomic_reference_>;
 
     /** One version a merge or a flush carries over from a memory run. */
@@ -995,23 +986,23 @@ class collection {
 
 #pragma region Construction
 
-    collection() noexcept = default;
-    collection(collection const&) = delete;
-    collection& operator=(collection const&) = delete;
-    collection(collection&&) noexcept = default;
-    collection& operator=(collection&&) noexcept = default;
+    nvme_store() noexcept = default;
+    nvme_store(nvme_store const&) = delete;
+    nvme_store& operator=(nvme_store const&) = delete;
+    nvme_store(nvme_store&&) noexcept = default;
+    nvme_store& operator=(nvme_store&&) noexcept = default;
 
     /**
-     *  @brief An empty collection over @p volume, whose memory is charged to @p constraint.
-     *  @param[inout] volume The volume every run lands on, borrowed and outliving the collection.
+     *  @brief An empty store over @p volume, whose memory is charged to @p constraint.
+     *  @param[inout] volume The volume every run lands on, borrowed and outliving the store.
      *  @param[in] config The bounds of the memory runs, the cache bound and the shape of the tree below.
      *  @param[inout] constraint The budget the memory runs and the cache are charged to.
-     *  @param[inout] ledger The stamps the collection's writes carry and its readers pin, outliving the collection.
+     *  @param[inout] ledger The stamps the store's writes carry and its readers pin, outliving the store.
      */
-    static expected<collection> mount(volume_t& volume, collection_config_t const& config, constraint_t& constraint,
+    static expected<nvme_store> mount(volume_t& volume, collection_config_t const& config, constraint_t& constraint,
                                       ledger_t& ledger) noexcept {
         sorted_run_config_t const& values = config.lsm_tree.lsm_level_0.sorted_run;
-        collection mounted;
+        nvme_store mounted;
         mounted.config_ = config;
         mounted.constraint_ = &constraint;
         mounted.ledger_ = &ledger;
@@ -1021,12 +1012,12 @@ class collection {
                                       : (is_fixed(value_layout_k) ? values.value_size : values.value_max_size);
         if (mounted.value_max_size_ == 0)
             return status_t {status_code_t::invalid_argument_k, "A collection admits values of some width"};
-        if (config.write_buffer_max_elements == 0)
+        if (config.memory_runs_max_deltas == 0)
             return status_t {status_code_t::invalid_argument_k, "A collection holds at least one write in memory"};
         mounted.cache_ = value_cache_t::of(holds_values_inline_k ? 0 : config.cache_limit, mounted.value_max_size_,
                                            constraint);
 
-        auto [tree, mount_tree_status] = tree_t::mount(volume, config.lsm_tree, config.write_buffer_max_bytes);
+        auto [tree, mount_tree_status] = tree_t::mount(volume, config.lsm_tree, config.memory_runs_max_bytes);
         if (mount_tree_status.failed()) return mount_tree_status;
         mounted.tree_ = std::move(tree);
         mounted.current_.reset(new (std::nothrow) view_t {});
@@ -1037,8 +1028,8 @@ class collection {
         return mounted;
     }
 
-    /** Whether a collection of @p modality whose values follow @p layout is one this collection keeps: a modality its
-     *  fold folds, in the value layout of its key slots. */
+    /** Whether a collection of @p modality whose values follow @p layout is one this store keeps: a modality its fold
+     *  folds, in the value layout of its key slots. */
     [[nodiscard]] static bool serves(ustore_modality_t modality, value_layout_t layout) noexcept {
         return fold_t::serves(modality) && layout == value_layout_k;
     }
@@ -1068,21 +1059,20 @@ class collection {
     /** Bytes the largest value this collection admits takes. */
     [[nodiscard]] stored_value_size_t value_max_size() const noexcept { return value_max_size_; }
 
-    /** Records the memory runs hold, which no flush has written yet. */
-    [[nodiscard]] std::size_t staged_count() const noexcept {
+    /** Deltas the memory runs hold, which no flush has written yet. */
+    [[nodiscard]] std::size_t memory_deltas_count() const noexcept {
         reader_t const inside = ledger_->epochs().enter();
-        return memory_records_(*view_.load());
+        return memory_deltas_(*view_.load());
     }
 
-    /** How many memory runs the published view names, and how many commits they hold, which merges by generation keep
+    /** How many memory runs the published view names, and how many commits they hold, which merges by tier keep
      *  within (F − 1)(T + 1) runs for T = ⌈log_F commits⌉ once every commit returned, F being the enlarge factor. */
     [[nodiscard]] memory_shape_t memory_shape() const noexcept {
         reader_t const inside = ledger_->epochs().enter();
         memory_shape_t shape;
         for (memory_run_t const* run : view_.load()->memory_runs.runs()) {
             std::uint64_t commits = 1;
-            for (std::uint32_t generation = 0; generation != run->generation(); ++generation)
-                commits *= config_.lsm_tree.level_enlarge_factor;
+            for (std::uint32_t tier = 0; tier != run->tier(); ++tier) commits *= config_.lsm_tree.level_enlarge_factor;
             shape.commits += commits;
             ++shape.runs;
         }
@@ -1092,11 +1082,11 @@ class collection {
     /** Whether no memory run and no level holds a key. */
     [[nodiscard]] bool empty() const noexcept { return population_count() == 0; }
 
-    /** Records the memory runs hold plus key slots every level holds, one key counted once per run holding it. */
+    /** Deltas the memory runs hold plus key slots every level holds, one key counted once per run holding it. */
     [[nodiscard]] std::uint64_t population_count() const noexcept {
         reader_t const inside = ledger_->epochs().enter();
         view_t const& view = *view_.load();
-        return memory_records_(view) + view.levels->population_count();
+        return memory_deltas_(view) + view.levels->population_count();
     }
 
     /** Bytes every run of every level takes on its volume. */
@@ -1112,13 +1102,13 @@ class collection {
     /**
      *  @brief Whether anything carries @p stored_key, and how many bytes its value takes.
      *  @param[in] stored_key The key to look for.
-     *  @param[out] size Bytes the value takes, which is zero for anything but @c success_k.
+     *  @param[out] size Bytes the value takes, which is zero for anything but @c written_k.
      *  @param[in] stamp The stamp a reader is pinned at, or @c head_stamp_k for the published one.
      *  @param[in] thread_index The executor thread reading, which announces on its own epoch slot.
      *  @return What the key carries, or @c incomplete_k for a fold's chain reaching a level whose values only a
      *      @c select reads.
      */
-    [[nodiscard]] select_result_t find(stored_key_t stored_key, stored_value_size_t& size,
+    [[nodiscard]] lookup_result_t find(stored_key_t stored_key, stored_value_size_t& size,
                                        transaction_stamp_t stamp = head_stamp_k,
                                        std::size_t thread_index = outside_executor_k) const noexcept {
         size = 0;
@@ -1128,12 +1118,12 @@ class collection {
         transaction_stamp_t version = unwritten_stamp_k;
         if (read.view->memory_runs.find(stored_key, read.stamp, found, version)) {
             if (found.kind == delta_kind_t::change_k) return find_folded_(read, stored_key, size);
-            if (found.kind == delta_kind_t::remove_k) return select_result_t::erased_k;
+            if (found.kind == delta_kind_t::remove_k) return lookup_result_t::removed_k;
             size = static_cast<stored_value_size_t>(found.bytes.size());
-            return select_result_t::success_k;
+            return lookup_result_t::written_k;
         }
-        find_result_t const in_levels = find_in_levels_(*read.view->levels, stored_key, read.stamp, size, version);
-        if (in_levels == find_result_t::changed_k) return find_folded_(read, stored_key, size);
+        lookup_result_t const in_levels = find_in_levels_(*read.view->levels, stored_key, read.stamp, size, version);
+        if (in_levels == lookup_result_t::changed_k) return find_folded_(read, stored_key, size);
         return selected_(in_levels);
     }
 
@@ -1145,7 +1135,7 @@ class collection {
      *  @param[out] size Bytes written, which is zero for every failure.
      *  @param[in] stamp The stamp a reader is pinned at, or @c head_stamp_k for the published one.
      *  @param[in] thread_index The executor thread reading, which announces on its own epoch slot.
-     *  @return @c not_found_k for a miss or an erasure, @c input_output_k for a run shorter than its index claims.
+     *  @return @c not_found_k for a miss or a removal, @c input_output_k for a run shorter than its index claims.
      *
      *  Not @c const: a read that pays I/O files the version it read in the value cache.
      */
@@ -1157,7 +1147,7 @@ class collection {
         delta_view_t found;
         if (read.view->memory_runs.find(stored_key, read.stamp, found)) {
             if (found.kind == delta_kind_t::change_k) return select_folded_(channel, read, stored_key, into, size);
-            if (found.kind == delta_kind_t::remove_k) return {status_code_t::not_found_k, "A commit erased that key"};
+            if (found.kind == delta_kind_t::remove_k) return {status_code_t::not_found_k, "A commit removed that key"};
             if (into.size() < found.bytes.size())
                 return {status_code_t::invalid_argument_k, "A buffer shorter than the value"};
             if (!found.bytes.empty()) std::memcpy(into.data(), found.bytes.data(), found.bytes.size());
@@ -1168,9 +1158,9 @@ class collection {
         level_set_t const& levels = *read.view->levels;
         stored_value_size_t wanted = 0;
         transaction_stamp_t version = unwritten_stamp_k;
-        find_result_t const in_levels = find_in_levels_(levels, stored_key, read.stamp, wanted, version);
-        if (in_levels == find_result_t::changed_k) return select_folded_(channel, read, stored_key, into, size);
-        if (in_levels != find_result_t::success_k) return {status_code_t::not_found_k, "No level carries that key"};
+        lookup_result_t const in_levels = find_in_levels_(levels, stored_key, read.stamp, wanted, version);
+        if (in_levels == lookup_result_t::changed_k) return select_folded_(channel, read, stored_key, into, size);
+        if (in_levels != lookup_result_t::written_k) return {status_code_t::not_found_k, "No level carries that key"};
         if (into.size() < wanted) return {status_code_t::invalid_argument_k, "A buffer shorter than the value"};
 
         if constexpr (!holds_values_inline_k)
@@ -1182,9 +1172,9 @@ class collection {
             delivered += bytes.size();
         };
         std::array<stored_key_t, 1> const keys {stored_key};
-        std::array<find_result_t, 1> answers {find_result_t::nothing_k};
+        std::array<lookup_result_t, 1> answers {lookup_result_t::missing_k};
         if (status_t const read_status = tree_.read_values(channel, levels, std::span<stored_key_t const> {keys},
-                                                           std::span<find_result_t> {answers}, sink, read.stamp);
+                                                           std::span<lookup_result_t> {answers}, sink, read.stamp);
             read_status.failed())
             return read_status;
         // One key has no rest of a batch to keep, so a block short of its last one fails the whole call.
@@ -1199,7 +1189,7 @@ class collection {
      *  @brief Reads the values of @p stored_keys, refilling the channel as completions retire.
      *  @param[inout] channel The channel the reads are submitted and completed on, held by the calling thread.
      *  @param[in] stored_keys The keys to read, in any order and with any number of misses among them.
-     *  @param[out] results What every key answered, which separates a miss from an erasure.
+     *  @param[out] results What every key answered, which separates a miss from a removal.
      *  @param[in] sink Called as @c sink(request, offset, bytes) for every key that locates a value.
      *  @param[in] stamp The stamp a reader is pinned at, or @c head_stamp_k for the published one.
      *  @param[in] thread_index The executor thread reading, which announces on its own epoch slot.
@@ -1212,7 +1202,7 @@ class collection {
      */
     template <typename sink_type_>
     status_t select(io_channel_t& channel, std::span<stored_key_t const> stored_keys,
-                    std::span<select_result_t> results, sink_type_&& sink, transaction_stamp_t stamp = head_stamp_k,
+                    std::span<lookup_result_t> results, sink_type_&& sink, transaction_stamp_t stamp = head_stamp_k,
                     std::size_t thread_index = outside_executor_k) const noexcept {
         if (results.size() != stored_keys.size())
             return {status_code_t::invalid_argument_k, "A batched select answers one result per key"};
@@ -1236,13 +1226,13 @@ class collection {
             delta_view_t found;
             if (read.view->memory_runs.find(stored_keys[request], read.stamp, found)) {
                 if (found.kind == delta_kind_t::change_k) {
-                    results[request] = select_result_t::nothing_k;
+                    results[request] = lookup_result_t::missing_k;
                     if (folded_requests.push_back(std::size_t {request}) != st::status_t::success_k)
                         return {status_code_t::out_of_memory_k, "A collection could not track the keys of a batch"};
                 }
-                else if (found.kind == delta_kind_t::remove_k) results[request] = select_result_t::erased_k;
+                else if (found.kind == delta_kind_t::remove_k) results[request] = lookup_result_t::removed_k;
                 else {
-                    results[request] = select_result_t::success_k;
+                    results[request] = lookup_result_t::written_k;
                     sink(request, std::uint64_t {0}, found.bytes);
                 }
                 continue;
@@ -1253,17 +1243,17 @@ class collection {
                     stored_value_size_t copied = 0;
                     transaction_stamp_t version = unwritten_stamp_k;
                     bool const cached = find_in_levels_(levels, stored_keys[request], read.stamp, wanted, version) ==
-                                            find_result_t::success_k &&
+                                            lookup_result_t::written_k &&
                                         cached_value.resize(wanted) == st::status_t::success_k &&
                                         cache_.copy(stored_keys[request], version, std::span<byte_t> {cached_value},
                                                     copied);
                     if (cached) {
-                        results[request] = select_result_t::success_k;
+                        results[request] = lookup_result_t::written_k;
                         sink(request, std::uint64_t {0}, std::span<byte_t const> {cached_value}.first(copied));
                         continue;
                     }
                 }
-            results[request] = select_result_t::nothing_k;
+            results[request] = lookup_result_t::missing_k;
             [[maybe_unused]] st::status_t const named = deferred_keys.push_back(stored_key_t {stored_keys[request]});
             [[maybe_unused]] st::status_t const tracked = deferred_requests.push_back(std::size_t {request});
         }
@@ -1273,13 +1263,13 @@ class collection {
 
         // The tree answers in its own vocabulary and the sink is told nothing about sizes, so the bytes every key
         // owed are counted here and compared once the read has run.
-        deferred_answers_t answers {constrained_allocator<find_result_t, atomic_reference_> {*constraint_}};
+        deferred_answers_t answers {constrained_allocator<lookup_result_t, atomic_reference_> {*constraint_}};
         deferred_delivered_t delivered {constrained_allocator<std::uint64_t, atomic_reference_> {*constraint_}};
         if (answers.resize(deferred_keys.size()) != st::status_t::success_k ||
             delivered.resize(deferred_keys.size()) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A collection could not track the keys of a batch"};
         for (std::size_t index = 0; index != deferred_keys.size(); ++index) {
-            answers[index] = find_result_t::nothing_k;
+            answers[index] = lookup_result_t::missing_k;
             delivered[index] = 0;
         }
 
@@ -1288,28 +1278,28 @@ class collection {
             sink(deferred_requests[index], offset, bytes);
         };
         status_t const read_status = tree_.read_values(channel, levels, std::span<stored_key_t const> {deferred_keys},
-                                                       std::span<find_result_t> {answers}, relay, read.stamp);
+                                                       std::span<lookup_result_t> {answers}, relay, read.stamp);
 
         std::size_t truncated = 0;
         for (std::size_t index = 0; index != deferred_keys.size(); ++index) {
-            select_result_t& result = results[deferred_requests[index]];
-            if (answers[index] == find_result_t::nothing_k) continue;
-            if (answers[index] == find_result_t::stored_key_k) {
-                result = select_result_t::erased_k;
+            lookup_result_t& result = results[deferred_requests[index]];
+            if (answers[index] == lookup_result_t::missing_k) continue;
+            if (answers[index] == lookup_result_t::removed_k) {
+                result = lookup_result_t::removed_k;
                 continue;
             }
-            if (answers[index] == find_result_t::changed_k) {
+            if (answers[index] == lookup_result_t::changed_k) {
                 if (folded_requests.push_back(std::size_t {deferred_requests[index]}) != st::status_t::success_k)
                     return {status_code_t::out_of_memory_k, "A collection could not track the keys of a batch"};
                 continue;
             }
             stored_value_size_t wanted = 0;
             transaction_stamp_t version = unwritten_stamp_k;
-            [[maybe_unused]] find_result_t const carried = find_in_levels_(levels, deferred_keys[index], read.stamp,
-                                                                           wanted, version);
-            if (delivered[index] == wanted) result = select_result_t::success_k;
+            [[maybe_unused]] lookup_result_t const carried = find_in_levels_(levels, deferred_keys[index], read.stamp,
+                                                                             wanted, version);
+            if (delivered[index] == wanted) result = lookup_result_t::written_k;
             else {
-                result = select_result_t::incomplete_k;
+                result = lookup_result_t::incomplete_k;
                 ++truncated;
             }
         }
@@ -1328,22 +1318,22 @@ class collection {
     [[nodiscard]] bool admits(std::size_t size) const noexcept { return admits_(size); }
 
     /**
-     *  @brief Sorts and copies @p deltas into one commit's records for this collection, on the committer's thread
-     *      and off every shared path, and allocates the run they become; no records seal into no run.
-     *  @param[in] deltas The commit's records for this collection, one per key, which this sorts in place: writes of
-     *      an admitted width, removals, and a fold's changes, which only a run file's length bounds unless they sit
+     *  @brief Sorts and copies @p deltas into one commit's sealed deltas for this store, on the committer's thread
+     *      and off every shared path, and allocates the run they become; no deltas seal into no run.
+     *  @param[in] deltas The commit's deltas for this store, one per key, which this sorts in place: writes of an
+     *      admitted width, removals, and a fold's changes, which only a run file's length bounds unless they sit
      *      inline in a key slot.
      */
     expected<sealed_commit_t> seal(std::span<keyed_delta_t> deltas) const noexcept {
         for (keyed_delta_t const& each : deltas)
             if (!admits_(each.delta))
-                return status_t {status_code_t::malformed_k, "This collection admits no record of that size"};
+                return status_t {status_code_t::malformed_k, "This collection admits no delta of that size"};
         sealed_commit_t sealed;
         if (deltas.empty()) return sealed;
-        auto [writes, seal_status] = sealed_writes_t::seal(
+        auto [sealed_deltas, seal_status] = sealed_deltas_t::seal(
             deltas, constrained_allocator<byte_t, atomic_reference_> {*constraint_});
         if (seal_status.failed()) return seal_status;
-        sealed.writes = std::move(writes);
+        sealed.deltas = std::move(sealed_deltas);
         sealed.run.reset(new (std::nothrow) memory_run_t {});
         if (!sealed.run) return status_t {status_code_t::out_of_memory_k, "No room for another memory run"};
         return sealed;
@@ -1354,13 +1344,13 @@ class collection {
         reader_t const inside = ledger_->epochs().enter();
         view_t const& view = *view_.load();
         if (view.memory_runs.runs().empty()) return memory_pressure_t::fits_k;
-        std::uint64_t const records = memory_records_(view) + sealed.writes.size();
-        std::uint64_t const bytes = memory_bytes_(view) + sealed.writes.values_bytes();
-        std::uint64_t const elements_bound = config_.write_buffer_max_elements;
-        std::uint64_t const bytes_bound = config_.write_buffer_max_bytes;
+        std::uint64_t const deltas = memory_deltas_(view) + sealed.deltas.size();
+        std::uint64_t const bytes = memory_bytes_(view) + sealed.deltas.values_bytes();
+        std::uint64_t const deltas_bound = config_.memory_runs_max_deltas;
+        std::uint64_t const bytes_bound = config_.memory_runs_max_bytes;
         // One flush in flight and one buffer filling behind it.
-        if (records > 2 * elements_bound || bytes > 2 * bytes_bound) return memory_pressure_t::stalled_k;
-        if (records > elements_bound || bytes > bytes_bound) return memory_pressure_t::flush_due_k;
+        if (deltas > 2 * deltas_bound || bytes > 2 * bytes_bound) return memory_pressure_t::stalled_k;
+        if (deltas > deltas_bound || bytes > bytes_bound) return memory_pressure_t::flush_due_k;
         return memory_pressure_t::fits_k;
     }
 
@@ -1385,7 +1375,7 @@ class collection {
     void publish(sealed_commit_t& sealed, transaction_stamp_t stamp) noexcept {
         assert(prepared_view_ && "A commit publishes only what its leader prepared");
         expected<memory_run_t> stamped = memory_run_t::stamped(
-            std::move(sealed.writes), stamp, constrained_allocator<byte_t, atomic_reference_> {*constraint_});
+            std::move(sealed.deltas), stamp, constrained_allocator<byte_t, atomic_reference_> {*constraint_});
         assert(stamped.has_value() && "A drawn stamp packs into no words");
         if (stamped) *sealed.run = std::move(*stamped);
         // The durable horizon stays below the oldest commit that only memory holds.
@@ -1428,7 +1418,7 @@ class collection {
             auto const& level = taken.level(number);
             if (level.order() == lsm_level_order_t::sorted_k) {
                 lsm_level_position_t position;
-                if (level.find(stored_key, position) == find_result_t::nothing_k) continue;
+                if (level.find(stored_key, position) == lookup_result_t::missing_k) continue;
                 auto const& run = level.run(position.run_index);
                 return run.stamp(position.key_slot_position) > from;
             }
@@ -1445,7 +1435,7 @@ class collection {
 
     /**
      *  @brief Whether a commit newer than @p from wrote any key from @p lower to @p upper inclusive, which is what a
-     *      walk over the range watches, so a key inserted or erased where it found none conflicts too.
+     *      walk over the range watches, so a key inserted or removed where it found none conflicts too.
      *
      *  Every version counts, not only the newest, since a key written twice since @p from was written since. A run
      *  is skipped by its newest stamp.
@@ -1486,7 +1476,7 @@ class collection {
     }
 
     /** Removes @p stored_key as a commit of its own, flushing first as @c insert does. */
-    status_t erase(io_channel_t& channel, stored_key_t stored_key) noexcept {
+    status_t remove(io_channel_t& channel, stored_key_t stored_key) noexcept {
         keyed_delta_t delta {stored_key, delta_view_t {delta_kind_t::remove_k, {}}};
         return commit_alone_(channel, seal(std::span<keyed_delta_t> {&delta, 1}));
     }
@@ -1500,18 +1490,18 @@ class collection {
      */
     status_t insert(io_channel_t& channel, std::span<stored_key_t const> stored_keys,
                     std::span<byte_t const> stored_values, std::span<stored_value_size_t const> sizes) noexcept {
-        return commit_alone_(channel, seal_inserts(stored_keys, stored_values, sizes));
+        return commit_alone_(channel, seal_writes(stored_keys, stored_values, sizes));
     }
 
     /** Removes every key of @p stored_keys as one commit of its own, flushing first as @c insert does. */
-    status_t erase(io_channel_t& channel, std::span<stored_key_t const> stored_keys) noexcept {
-        return commit_alone_(channel, seal_erasures(stored_keys));
+    status_t remove(io_channel_t& channel, std::span<stored_key_t const> stored_keys) noexcept {
+        return commit_alone_(channel, seal_removals(stored_keys));
     }
 
     /** Seals one value per key of @p stored_keys, a repeated key taking its last value, as @c insert takes them. */
-    expected<sealed_commit_t> seal_inserts(std::span<stored_key_t const> stored_keys,
-                                           std::span<byte_t const> stored_values,
-                                           std::span<stored_value_size_t const> sizes) const noexcept {
+    expected<sealed_commit_t> seal_writes(std::span<stored_key_t const> stored_keys,
+                                          std::span<byte_t const> stored_values,
+                                          std::span<stored_value_size_t const> sizes) const noexcept {
         if (status_t const checked = check_batch(stored_keys, stored_values, sizes); checked.failed()) return checked;
         auto [deltas, deltas_status] = deltas_of_(stored_keys.size());
         if (deltas_status.failed()) return deltas_status;
@@ -1524,8 +1514,8 @@ class collection {
         return seal(last_of_each_key_(deltas));
     }
 
-    /** Seals a removal of every key of @p stored_keys, as @c erase takes them. */
-    expected<sealed_commit_t> seal_erasures(std::span<stored_key_t const> stored_keys) const noexcept {
+    /** Seals a removal of every key of @p stored_keys, as @c remove takes them. */
+    expected<sealed_commit_t> seal_removals(std::span<stored_key_t const> stored_keys) const noexcept {
         auto [deltas, deltas_status] = deltas_of_(stored_keys.size());
         if (deltas_status.failed()) return deltas_status;
         for (std::size_t index = 0; index != stored_keys.size(); ++index)
@@ -1554,8 +1544,8 @@ class collection {
 #pragma region Maintenance
 
     /**
-     *  @brief Merges F memory runs of one generation into one run of the next, F being the level enlarge factor, until
-     *      no generation holds F runs, the lowest generation and its oldest runs first.
+     *  @brief Merges F memory runs of one tier into one run of the next tier, F being the level enlarge factor, until
+     *      no tier holds F runs, the lowest tier and its oldest runs first.
      *
      *  Every merge reads immutable runs with no lock held, keeps the versions a pinned reader needs and every version
      *  above the stamp published when it began, and takes the leader word only to publish a view naming the merged run
@@ -1594,7 +1584,7 @@ class collection {
                 kept.failed())
                 return kept;
             auto [merged, merged_status] = memory_run_t::merged(
-                std::span<stamped_delta_t const> {versions}, group.back()->oldest_stamp(), group.back()->generation(),
+                std::span<stamped_delta_t const> {versions}, group.back()->oldest_stamp(), group.back()->tier(),
                 constrained_allocator<byte_t, atomic_reference_> {*constraint_});
             if (merged_status.failed()) return merged_status;
             std::unique_ptr<memory_run_t> merged_run {new (std::nothrow) memory_run_t {std::move(merged)}};
@@ -1615,7 +1605,7 @@ class collection {
         return flush_due_(*view_.load());
     }
 
-    /** Whether the memory runs are due for a merge, holding F runs of generation zero, or for a flush; the commit that
+    /** Whether the memory runs are due for a merge, holding F runs of tier zero, or for a flush; the commit that
      *  made them so runs either before it returns. */
     [[nodiscard]] bool maintenance_due() const noexcept {
         reader_t const inside = ledger_->epochs().enter();
@@ -1679,10 +1669,11 @@ class collection {
      *  @brief Merges the shallowest level that is over its bounds into the level below it.
      *  @param[inout] reading_channel The channel the merge gathers source values on, held by the calling thread.
      *  @param[inout] writing_channel The channel the merge writes its new runs on, which is not @p reading_channel.
+     *  @param[in] devices The devices the executor named, the first of which a large merge runs on, empty for the host.
      *  @param[in] published What to call once the merged set is live and before a consumed run is dropped.
      */
     expected<compaction_outcome_t> compact(
-        io_channel_t& reading_channel, io_channel_t& writing_channel,
+        io_channel_t& reading_channel, io_channel_t& writing_channel, std::span<int const> devices,
         lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {}) noexcept {
         // A pinned reader keeps the version it reads, and the durable horizon keeps the version a mount falls back to.
         st::basic_vector<transaction_stamp_t> readers;
@@ -1696,8 +1687,8 @@ class collection {
         publication.owner = this;
         publication.oldest_readable = stamps.horizon;
         publication.chained = &published;
-        return tree_.compact(reading_channel, writing_channel, compaction_placement_t::automatic_k, nullptr, fold_,
-                             publication.hook(), stamps);
+        return tree_.compact(reading_channel, writing_channel, compaction_placement_t::automatic_k, devices, nullptr,
+                             fold_, publication.hook(), stamps);
     }
 
     /** Drops every version a mount found stamped above @p ceiling, which only a collection holding no memory run
@@ -1721,18 +1712,18 @@ class collection {
 
   private:
 
-    friend class collection_scanner<key_slot_t, volume_t, atomic_reference_, waiting_policy_type_, fold_t>;
+    friend class nvme_store_cursor<key_slot_t, volume_t, atomic_reference_, waiter_type_, fold_t>;
 
 #pragma region Private Types
 
     /** One reader inside the ledger's epochs, announced until it dies. */
     using reader_t = typename ledger_t::epochs_t::reader_t;
 
-    /** One commit of this collection alone, as the sequencer hands it to its two steps. */
+    /** One commit of this store alone, as the sequencer hands it to its two steps. */
     struct alone_t {
 
-        /** The collection committed to. */
-        collection* owner = nullptr;
+        /** The store committed to. */
+        nvme_store* owner = nullptr;
 
         /** What its committer sealed. */
         sealed_commit_t* sealed = nullptr;
@@ -1752,8 +1743,8 @@ class collection {
      *  and the hook it calls once no reader is left in the views before it. */
     struct publication_t {
 
-        /** The collection publishing. */
-        collection* owner = nullptr;
+        /** The store publishing. */
+        nvme_store* owner = nullptr;
 
         /** The memory runs a flush wrote out, newest first, as the view it read named them; none for a merge. */
         st::basic_vector<memory_run_t const*> flushed;
@@ -1796,7 +1787,7 @@ class collection {
     using stamped_deltas_t =
         st::basic_vector<stamped_delta_t, constrained_allocator<stamped_delta_t, atomic_reference_>>;
 
-    /** The records one commit of its own hands over. */
+    /** The deltas one commit of its own hands over. */
     using deltas_t = st::basic_vector<keyed_delta_t, constrained_allocator<keyed_delta_t, atomic_reference_>>;
 
     /** The keys of a batch that neither a memory run nor the cache answered. */
@@ -1806,7 +1797,8 @@ class collection {
     using deferred_requests_t = st::basic_vector<std::size_t, constrained_allocator<std::size_t, atomic_reference_>>;
 
     /** What the tree answered for every deferred key. */
-    using deferred_answers_t = st::basic_vector<find_result_t, constrained_allocator<find_result_t, atomic_reference_>>;
+    using deferred_answers_t =
+        st::basic_vector<lookup_result_t, constrained_allocator<lookup_result_t, atomic_reference_>>;
 
     /** Bytes the tree delivered for every deferred key. */
     using deferred_delivered_t =
@@ -1830,11 +1822,11 @@ class collection {
         else return true;
     }
 
-    /** Records every memory run of @p view holds. */
-    [[nodiscard]] static std::size_t memory_records_(view_t const& view) noexcept {
-        std::size_t records = 0;
-        for (memory_run_t const* run : view.memory_runs.runs()) records += run->size();
-        return records;
+    /** Deltas every memory run of @p view holds. */
+    [[nodiscard]] static std::size_t memory_deltas_(view_t const& view) noexcept {
+        std::size_t deltas = 0;
+        for (memory_run_t const* run : view.memory_runs.runs()) deltas += run->size();
+        return deltas;
     }
 
     /** Value bytes every memory run of @p view holds. */
@@ -1862,13 +1854,13 @@ class collection {
 
     /** What @p levels answer for @p stored_key at @p stamp, the bytes its value takes, and the stamp of @p version;
      *  a change answers its own bytes, which the versions below it complete. */
-    [[nodiscard]] find_result_t find_in_levels_(level_set_t const& levels, stored_key_t stored_key,
-                                                transaction_stamp_t stamp, stored_value_size_t& size,
-                                                transaction_stamp_t& version) const noexcept {
+    [[nodiscard]] lookup_result_t find_in_levels_(level_set_t const& levels, stored_key_t stored_key,
+                                                  transaction_stamp_t stamp, stored_value_size_t& size,
+                                                  transaction_stamp_t& version) const noexcept {
         size = 0;
         lsm_tree_position_t position;
-        find_result_t const found = tree_.find(levels, stored_key, position, stamp);
-        if (found == find_result_t::nothing_k || found == find_result_t::stored_key_k) return found;
+        lookup_result_t const found = tree_.find(levels, stored_key, position, stamp);
+        if (found == lookup_result_t::missing_k || found == lookup_result_t::removed_k) return found;
         auto const& level = levels.level(position.level_number);
         size = static_cast<stored_value_size_t>(level.value_window(position.level_position).bytes);
         version = level.run(position.level_position.run_index).stamp(position.level_position.key_slot_position);
@@ -1876,10 +1868,10 @@ class collection {
     }
 
     /** What a lookup of the levels answering @p found tells a caller, a change aside. */
-    [[nodiscard]] static select_result_t selected_(find_result_t found) noexcept {
-        if (found == find_result_t::nothing_k) return select_result_t::nothing_k;
-        if (found == find_result_t::stored_key_k) return select_result_t::erased_k;
-        return select_result_t::success_k;
+    [[nodiscard]] static lookup_result_t selected_(lookup_result_t found) noexcept {
+        if (found == lookup_result_t::missing_k) return lookup_result_t::missing_k;
+        if (found == lookup_result_t::removed_k) return lookup_result_t::removed_k;
+        return lookup_result_t::written_k;
     }
 
     /**
@@ -1891,7 +1883,7 @@ class collection {
      *  @return What the key carries, or the status a read or the fold refused it with.
      */
     template <typename bytes_of_type_>
-    expected<select_result_t> fold_versions_(reading_t const& read, stored_key_t stored_key, bytes_of_type_&& bytes_of,
+    expected<lookup_result_t> fold_versions_(reading_t const& read, stored_key_t stored_key, bytes_of_type_&& bytes_of,
                                              utilities::arena_allocator<byte_t>& arena,
                                              std::span<byte_t const>& value) const noexcept {
         value = {};
@@ -1904,8 +1896,8 @@ class collection {
             transaction_stamp_t stamp = unwritten_stamp_k;
             if (!read.view->memory_runs.find(stored_key, at, version, stamp)) {
                 lsm_tree_position_t position;
-                find_result_t const found = tree_.find(*read.view->levels, stored_key, position, at);
-                if (found == find_result_t::nothing_k) break;
+                lookup_result_t const found = tree_.find(*read.view->levels, stored_key, position, at);
+                if (found == lookup_result_t::missing_k) break;
                 auto const& run =
                     read.view->levels->level(position.level_number).run(position.level_position.run_index);
                 std::uint64_t const sorted = position.level_position.key_slot_position;
@@ -1935,10 +1927,10 @@ class collection {
             closing = delta_view_t {delta_kind_t::remove_k, {}};
         }
         if (chain.empty()) {
-            if (!closed) return select_result_t::nothing_k;
-            if (closing.kind == delta_kind_t::remove_k) return select_result_t::erased_k;
+            if (!closed) return lookup_result_t::missing_k;
+            if (closing.kind == delta_kind_t::remove_k) return lookup_result_t::removed_k;
             value = closing.bytes;
-            return select_result_t::success_k;
+            return lookup_result_t::written_k;
         }
         std::reverse(chain.begin(), chain.end());
         std::span<byte_t const> const base = closing.kind == delta_kind_t::write_k ? closing.bytes
@@ -1946,12 +1938,12 @@ class collection {
         auto [applied, apply_status] = fold_.apply(base, std::span<delta_view_t const> {chain}, arena);
         if (apply_status.failed()) return apply_status;
         value = applied;
-        return select_result_t::success_k;
+        return lookup_result_t::written_k;
     }
 
     /** As @c find answers for a key whose newest version is a change, folding it with no I/O, so a chain reaching a
      *  level whose values sit apart from their key slots answers @c incomplete_k. */
-    [[nodiscard]] select_result_t find_folded_(reading_t const& read, stored_key_t stored_key,
+    [[nodiscard]] lookup_result_t find_folded_(reading_t const& read, stored_key_t stored_key,
                                                stored_value_size_t& size) const noexcept {
         utilities::local_arena_t scratch;
         utilities::arena_allocator<byte_t> arena = scratch.allocator();
@@ -1963,9 +1955,9 @@ class collection {
             }
             else return {status_code_t::io_k, "A change's value is read through a channel"};
         };
-        expected<select_result_t> const folded = fold_versions_(read, stored_key, bytes_of, arena, value);
-        if (!folded) return select_result_t::incomplete_k;
-        if (*folded == select_result_t::success_k) size = static_cast<stored_value_size_t>(value.size());
+        expected<lookup_result_t> const folded = fold_versions_(read, stored_key, bytes_of, arena, value);
+        if (!folded) return lookup_result_t::incomplete_k;
+        if (*folded == lookup_result_t::written_k) size = static_cast<stored_value_size_t>(value.size());
         return *folded;
     }
 
@@ -2000,7 +1992,7 @@ class collection {
         };
         auto [folded, fold_status] = fold_versions_(read, stored_key, bytes_of, arena, value);
         if (fold_status.failed()) return fold_status;
-        if (folded != select_result_t::success_k) return {status_code_t::not_found_k, "No version carries that key"};
+        if (folded != lookup_result_t::written_k) return {status_code_t::not_found_k, "No version carries that key"};
         if (into.size() < value.size()) return {status_code_t::invalid_argument_k, "A buffer shorter than the value"};
         if (!value.empty()) std::memcpy(into.data(), value.data(), value.size());
         size = static_cast<stored_value_size_t>(value.size());
@@ -2011,7 +2003,7 @@ class collection {
      *  select's reads retired, and hands each value to @p sink whole. */
     template <typename sink_type_>
     status_t select_folded_(io_channel_t& channel, reading_t const& read, std::span<stored_key_t const> stored_keys,
-                            std::span<std::size_t const> requests, std::span<select_result_t> results,
+                            std::span<std::size_t const> requests, std::span<lookup_result_t> results,
                             sink_type_& sink) const noexcept {
         for (std::size_t const request : requests) {
             utilities::local_arena_t scratch;
@@ -2023,7 +2015,7 @@ class collection {
             auto [folded, fold_status] = fold_versions_(read, stored_keys[request], bytes_of, arena, value);
             if (fold_status.failed()) return fold_status;
             results[request] = folded;
-            if (folded == select_result_t::success_k) sink(request, std::uint64_t {0}, value);
+            if (folded == lookup_result_t::written_k) sink(request, std::uint64_t {0}, value);
         }
         return {};
     }
@@ -2062,7 +2054,7 @@ class collection {
      */
     static status_t prepare_levels_(void* context) noexcept {
         publication_t& publication = *static_cast<publication_t*>(context);
-        collection& owner = *publication.owner;
+        nvme_store& owner = *publication.owner;
         owner.ledger_->lead();
         std::span<memory_run_t const* const> const runs = owner.current_->memory_runs.runs();
         std::size_t const kept = runs.size() - publication.flushed.size();
@@ -2086,11 +2078,11 @@ class collection {
      *  is left that could hold a flushed run or the replaced set, frees the runs, and calls the hook it chains to. */
     static status_t publish_levels_(void* context) noexcept {
         publication_t& publication = *static_cast<publication_t*>(context);
-        collection& owner = *publication.owner;
+        nvme_store& owner = *publication.owner;
         publication.next->levels = &owner.tree_.levels();
         owner.replace_view_(std::move(publication.next));
         if (!publication.flushed.empty()) {
-            // The flushed runs are the oldest, which the collection owns first.
+            // The flushed runs are the oldest, which the store owns first.
             for (std::size_t index = 0; index != publication.flushed.size(); ++index) [[maybe_unused]]
                 st::status_t const taken = publication.freed.push_back(st::assume_reserved,
                                                                        std::move(owner.memory_runs_[index]));
@@ -2107,7 +2099,7 @@ class collection {
         return chained->notify(chained->context);
     }
 
-    /** Room for @p count records of one commit of its own. */
+    /** Room for @p count deltas of one commit of its own. */
     expected<deltas_t> deltas_of_(std::size_t count) const noexcept {
         deltas_t deltas {constrained_allocator<keyed_delta_t, atomic_reference_> {*constraint_}};
         if (deltas.resize(count) != st::status_t::success_k)
@@ -2115,7 +2107,7 @@ class collection {
         return deltas;
     }
 
-    /** Keeps the last record of every key of @p deltas, in their order, which a batch naming a key twice takes. */
+    /** Keeps the last delta of every key of @p deltas, in their order, which a batch naming a key twice takes. */
     [[nodiscard]] static std::span<keyed_delta_t> last_of_each_key_(deltas_t& deltas) noexcept {
         std::stable_sort(deltas.begin(), deltas.end(), [](keyed_delta_t const& first, keyed_delta_t const& second) {
             return first.stored_key < second.stored_key;
@@ -2149,7 +2141,7 @@ class collection {
     }
 
     /**
-     *  @brief Lays the records of @p flushed out as one run's key slots, kinds and the bytes they locate.
+     *  @brief Lays the deltas of @p flushed out as one run's key slots, kinds and the bytes they locate.
      *  @param[in] flushed The memory runs, newest first.
      *  @param[in] survival Which older versions a reader or a mount still needs, as a merge would decide.
      *  @param[inout] arena Where the values of folded changes sit until the run is written.
@@ -2200,17 +2192,17 @@ class collection {
     }
 
     /**
-     *  @brief The oldest F runs of the lowest generation holding F of @p runs, newest first, or none.
+     *  @brief The oldest F runs of the lowest tier holding F of @p runs, newest first, or none.
      *
-     *  Commits prepend runs of generation zero and a merge puts its run where the oldest it replaced sat, so
-     *  generations never fall from the newest run to the oldest and every generation's runs sit side by side.
+     *  Commits prepend runs of tier zero and a merge puts its run where the oldest it replaced sat, so tiers never
+     *  fall from the newest run to the oldest and every tier's runs sit side by side.
      */
     [[nodiscard]] std::span<memory_run_t const* const> due_group_(
         std::span<memory_run_t const* const> runs) const noexcept {
         std::size_t const fan_in = config_.lsm_tree.level_enlarge_factor;
         for (std::size_t first = 0; first != runs.size();) {
             std::size_t end = first;
-            while (end != runs.size() && runs[end]->generation() == runs[first]->generation()) ++end;
+            while (end != runs.size() && runs[end]->tier() == runs[first]->tier()) ++end;
             if (end - first >= fan_in) return runs.subspan(end - fan_in, fan_in);
             first = end;
         }
@@ -2219,15 +2211,15 @@ class collection {
 
     /** Whether the memory runs of @p view hold the bounds they were mounted with. */
     [[nodiscard]] bool flush_due_(view_t const& view) const noexcept {
-        return memory_records_(view) >= config_.write_buffer_max_elements ||
-               memory_bytes_(view) >= config_.write_buffer_max_bytes;
+        return memory_deltas_(view) >= config_.memory_runs_max_deltas ||
+               memory_bytes_(view) >= config_.memory_runs_max_bytes;
     }
 
-    /** Whether @p view is due for a merge, holding F runs of generation zero, or for a flush. */
+    /** Whether @p view is due for a merge, holding F runs of tier zero, or for a flush. */
     [[nodiscard]] bool maintenance_due_(view_t const& view) const noexcept {
         std::size_t newest = 0;
         for (memory_run_t const* run : view.memory_runs.runs()) {
-            if (run->generation() != 0) break;
+            if (run->tier() != 0) break;
             ++newest;
         }
         return newest >= config_.lsm_tree.level_enlarge_factor || flush_due_(view);
@@ -2318,23 +2310,22 @@ class collection {
     /** Bytes the largest value this collection admits takes. */
     stored_value_size_t value_max_size_ = 0;
 
-    /** What a change record does, which reads and merges fold with. */
+    /** What a change delta does, which reads and merges fold with. */
     [[no_unique_address]] fold_t fold_ {};
 
 #pragma endregion Private Members
 };
 
-#pragma endregion Collection
+#pragma endregion Store
 
-#pragma endregion Collection
+#pragma endregion Store
 
-#pragma region Collection Scanner
+#pragma region Store Cursor
 
-#pragma region Scanner
+#pragma region Cursor
 
 /**
- *  @brief Every key of one collection in ascending order, each with what it is and how wide it is, read a page at a
- *      time.
+ *  @brief Every key of one store in ascending order, each with what it is and how wide it is, read a page at a time.
  *
  *  Each page is read inside the ledger's epochs from whichever view is published, and the epochs are left between
  *  pages, so a commit, merge, flush or compaction replacing a view waits for at most one page of a scan. Every page
@@ -2343,58 +2334,58 @@ class collection {
  *  pins the published stamp it starts at for as long as it lives.
  */
 template <typename key_slot_type_, typename volume_type_, template <typename> typename atomic_reference_,
-          typename waiting_policy_type_, utilities::fold_concept fold_type_>
-class collection_scanner {
+          typename waiter_type_, utilities::fold_concept fold_type_>
+class nvme_store_cursor {
   public:
 
 #pragma region Types
 
-    /** The key slot every run of the scanned collection holds. */
+    /** The key slot every run of the walked store holds. */
     using key_slot_t = key_slot_type_;
 
-    /** The volume every run of the scanned collection lives on. */
+    /** The volume every run of the walked store lives on. */
     using volume_t = volume_type_;
 
     /** The key the runs order their key slots by. */
     using stored_key_t = typename key_slot_t::stored_key_t;
 
-    /** The collection this scanner walks. */
-    using collection_t = collection<key_slot_t, volume_t, atomic_reference_, waiting_policy_type_, fold_type_>;
+    /** The store this cursor walks. */
+    using nvme_store_t = nvme_store<key_slot_t, volume_t, atomic_reference_, waiter_type_, fold_type_>;
 
-    /** The view of that collection the scan walks. */
-    using view_t = typename collection_t::view_t;
+    /** The view of that store the walk reads. */
+    using view_t = typename nvme_store_t::view_t;
 
     /** One memory run of that view. */
-    using memory_run_t = typename collection_t::memory_run_t;
+    using memory_run_t = typename nvme_store_t::memory_run_t;
 
     /** One key of a page. */
     using entry_t = scan_entry<stored_key_t>;
 
     /** Keys one page holds. */
-    static constexpr std::size_t page_keys_k = scan_page_keys_k<stored_key_t>;
+    static constexpr std::size_t page_keys_k = scan_page_keys<stored_key_t>();
 
 #pragma endregion Types
 
 #pragma region Construction
 
-    collection_scanner() noexcept = default;
-    collection_scanner(collection_scanner const&) = delete;
-    collection_scanner& operator=(collection_scanner const&) = delete;
-    collection_scanner(collection_scanner&&) noexcept = default;
-    collection_scanner& operator=(collection_scanner&&) noexcept = default;
+    nvme_store_cursor() noexcept = default;
+    nvme_store_cursor(nvme_store_cursor const&) = delete;
+    nvme_store_cursor& operator=(nvme_store_cursor const&) = delete;
+    nvme_store_cursor(nvme_store_cursor&&) noexcept = default;
+    nvme_store_cursor& operator=(nvme_store_cursor&&) noexcept = default;
 
-    /** A scan of @p source positioned on its first key not below @p from, where @p source must outlive the scanner,
+    /** A walk over @p source positioned on its first key not below @p from, where @p source must outlive the cursor,
      *  seeing what a reader pinned at @p stamp sees, announced on executor thread @p thread_index's epoch slot while
      *  it reads a page, the first of which it reads before returning. */
-    static expected<collection_scanner> over(collection_t const& source, stored_key_t from = limit<stored_key_t>::min(),
-                                             transaction_stamp_t stamp = head_stamp_k,
-                                             std::size_t thread_index = outside_executor_k) noexcept {
-        collection_scanner scanner;
-        scanner.source_ = &source;
-        scanner.thread_index_ = thread_index;
-        scanner.stamp_ = stamp == head_stamp_k ? source.ledger_->pin_reader(scanner.pin_) : stamp;
-        if (status_t const filled = scanner.fill_(from); filled.failed()) return filled;
-        return scanner;
+    static expected<nvme_store_cursor> over(nvme_store_t const& source, stored_key_t from = limit<stored_key_t>::min(),
+                                            transaction_stamp_t stamp = head_stamp_k,
+                                            std::size_t thread_index = outside_executor_k) noexcept {
+        nvme_store_cursor cursor;
+        cursor.source_ = &source;
+        cursor.thread_index_ = thread_index;
+        cursor.stamp_ = stamp == head_stamp_k ? source.ledger_->pin_reader(cursor.pin_) : stamp;
+        if (status_t const filled = cursor.fill_(from); filled.failed()) return filled;
+        return cursor;
     }
 
 #pragma endregion Construction
@@ -2407,9 +2398,9 @@ class collection_scanner {
     /** The key the scan sits on, meaningless once the walk has ended. */
     [[nodiscard]] stored_key_t stored_key() const noexcept { return page_[at_].stored_key; }
 
-    /** Whether the key the scan sits on carries a value or a removal, @c nothing_k once the walk has ended. */
-    [[nodiscard]] select_result_t state() const noexcept {
-        return reached_end() ? select_result_t::nothing_k : page_[at_].state;
+    /** Whether the key the scan sits on carries a value or a removal, @c missing_k once the walk has ended. */
+    [[nodiscard]] lookup_result_t state() const noexcept {
+        return reached_end() ? lookup_result_t::missing_k : page_[at_].state;
     }
 
     /** Bytes the value of that key takes, which is zero for a removal and for an empty value. */
@@ -2442,7 +2433,7 @@ class collection_scanner {
 #pragma region Private Types
 
     /** One reader inside the scanned collection's epochs, announced while a page is read. */
-    using reader_t = typename collection_t::ledger_t::epochs_t::reader_t;
+    using reader_t = typename nvme_store_t::ledger_t::epochs_t::reader_t;
 
     /** Where one run of one level the scan walks has got to. */
     struct run_cursor_t {
@@ -2486,7 +2477,7 @@ class collection_scanner {
         for (std::size_t index = 0; index != memory_runs.size(); ++index)
             memory_positions_[index] = memory_runs[index]->lower_bound(from);
 
-        typename collection_t::level_set_t const& levels = *view_->levels;
+        typename nvme_store_t::level_set_t const& levels = *view_->levels;
         std::size_t runs = 0;
         for (std::size_t number = 0; number != levels.size(); ++number) runs += levels.level(number).size();
         cursors_.clear();
@@ -2588,11 +2579,11 @@ class collection_scanner {
     void take_(delta_kind_t kind, std::size_t size, entry_t& entry) noexcept {
         entry.size = 0;
         if (kind == delta_kind_t::change_k)
-            entry.state = source_->find_folded_(typename collection_t::reading_t {view_, stamp_}, entry.stored_key,
+            entry.state = source_->find_folded_(typename nvme_store_t::reading_t {view_, stamp_}, entry.stored_key,
                                                 entry.size);
-        else if (kind == delta_kind_t::remove_k) entry.state = select_result_t::erased_k;
+        else if (kind == delta_kind_t::remove_k) entry.state = lookup_result_t::removed_k;
         else {
-            entry.state = select_result_t::success_k;
+            entry.state = lookup_result_t::written_k;
             entry.size = static_cast<stored_value_size_t>(size);
         }
     }
@@ -2634,11 +2625,11 @@ class collection_scanner {
 
 #pragma region Private Members
 
-    /** The collection walked, which outlives the scanner. */
-    collection_t const* source_ = nullptr;
+    /** The store walked, which outlives the cursor. */
+    nvme_store_t const* source_ = nullptr;
 
     /** The published stamp a head scan reads at, which keeps its versions in every merge while the scan lives. */
-    typename collection_t::pin_t pin_;
+    typename nvme_store_t::pin_t pin_;
 
     /** The stamp the scan reads at, which sees the newest version of every key at or below it. */
     transaction_stamp_t stamp_ = head_stamp_k;
@@ -2667,8 +2658,8 @@ class collection_scanner {
 #pragma endregion Private Members
 };
 
-#pragma endregion Scanner
+#pragma endregion Cursor
 
-#pragma endregion Collection Scanner
+#pragma endregion Store Cursor
 
 } // namespace unum::ustore::blobs

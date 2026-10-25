@@ -258,7 +258,7 @@ struct xml_attribute_token_t {
 template <typename allocator_type_>
 class xml_tokenizer {
     template <typename value_type_>
-    using rebound_t = typename std::allocator_traits<allocator_type_>::template rebind_alloc<value_type_>;
+    using rebound = typename std::allocator_traits<allocator_type_>::template rebind_alloc<value_type_>;
 
     struct name_t {
         std::uint32_t offset;
@@ -267,8 +267,8 @@ class xml_tokenizer {
 
     allocator_type_ allocator_;
     std::string_view document_;
-    st::basic_vector<xml_token_t, rebound_t<xml_token_t>> tokens_;
-    st::basic_vector<xml_attribute_token_t, rebound_t<xml_attribute_token_t>> attributes_;
+    st::basic_vector<xml_token_t, rebound<xml_token_t>> tokens_;
+    st::basic_vector<xml_attribute_token_t, rebound<xml_attribute_token_t>> attributes_;
     stringzilla_allocator<allocator_type_> bridge_;
     sz_allocator_t c_allocator_ {};
     sz_strings_span_t tape_ {};
@@ -304,7 +304,7 @@ class xml_tokenizer {
 
     status_t split() noexcept {
         status_t const malformed {status_code_t::malformed_k, "The XML is malformed"};
-        st::basic_vector<name_t, rebound_t<name_t>> open {rebound_t<name_t>(allocator_)};
+        st::basic_vector<name_t, rebound<name_t>> open {rebound<name_t>(allocator_)};
         std::size_t const size = document_.size();
         std::size_t at = 0;
         while (at < size) {
@@ -406,7 +406,7 @@ class xml_tokenizer {
     }
 
     status_t unescape() noexcept {
-        st::basic_vector<sz_string_view_t, rebound_t<sz_string_view_t>> runs {rebound_t<sz_string_view_t>(allocator_)};
+        st::basic_vector<sz_string_view_t, rebound<sz_string_view_t>> runs {rebound<sz_string_view_t>(allocator_)};
         auto enlist = [&](std::uint32_t offset, std::uint32_t length, std::uint32_t& unescaped) noexcept -> status_t {
             if (!escaped(offset, length)) return {};
             if (!references_well_formed(document_.substr(offset, length)))
@@ -432,8 +432,8 @@ class xml_tokenizer {
 
   public:
     explicit xml_tokenizer(allocator_type_ allocator = {}) noexcept
-        : allocator_(allocator), tokens_(rebound_t<xml_token_t>(allocator)),
-          attributes_(rebound_t<xml_attribute_token_t>(allocator)), bridge_(allocator),
+        : allocator_(allocator), tokens_(rebound<xml_token_t>(allocator)),
+          attributes_(rebound<xml_attribute_token_t>(allocator)), bridge_(allocator),
           c_allocator_(bridge_.c_allocator()) {}
     xml_tokenizer(xml_tokenizer const&) = delete;
     xml_tokenizer& operator=(xml_tokenizer const&) = delete;

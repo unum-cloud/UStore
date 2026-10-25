@@ -21,8 +21,10 @@
 #include <memory>      // `std::unique_ptr`, `std::make_shared`
 #include <new>         // `std::nothrow`
 #include <span>        // `std::span`
+#include <string>      // `std::string`
 #include <string_view> // `std::string_view`
 #include <thread>      // `std::thread`
+#include <type_traits> // `std::is_same_v`
 #include <utility>     // `std::move`
 #include <variant>     // `std::visit`
 
@@ -30,6 +32,7 @@
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
 #include "ustore/blobs/nvme_database.hpp"   // `basic_database`
+#include "ustore/strings/nvme_store.hpp"    // `strings::nvme_store`, `strings::nvme_transaction`
 #include "ustore/utilities/nvme_volume.hpp" // `resources_t`
 
 #include "nvme/fixture.hpp" // `basic_fixture`, `run_on_transport`, `painted`
@@ -60,13 +63,14 @@ struct database_types {
     using volume_t = typename fixture_t::volume_t;
     using router_t = basic_volume_router<volume_t>;
     template <value_layout_t value_layout_>
-    using store_of = collection<key_slot<stored_key_t, value_layout_>, volume_t, atomic_reference, waiting_policy_t>;
-    using database_t =
-        basic_database<stored_key_t, volume_t, atomic_reference, waiting_policy_t,
-                       store_of<value_layout_t::inline_1_byte_k>, store_of<value_layout_t::inline_4_bytes_k>,
-                       store_of<value_layout_t::inline_8_bytes_k>, store_of<value_layout_t::inline_16_bytes_k>,
-                       store_of<value_layout_t::inline_32_bytes_k>, store_of<value_layout_t::inline_64_bytes_k>,
-                       store_of<value_layout_t::fixed_width_k>, store_of<value_layout_t::variable_width_k>>;
+    using blobs_store_of = nvme_store<key_slot<stored_key_t, value_layout_>, volume_t, atomic_reference, waiter_t>;
+    using strings_store_t = strings::nvme_store<volume_t, atomic_reference, waiter_t>;
+    using database_t = basic_database<
+        stored_key_t, volume_t, atomic_reference, waiter_t, strings_store_t,
+        blobs_store_of<value_layout_t::inline_1_byte_k>, blobs_store_of<value_layout_t::inline_4_bytes_k>,
+        blobs_store_of<value_layout_t::inline_8_bytes_k>, blobs_store_of<value_layout_t::inline_16_bytes_k>,
+        blobs_store_of<value_layout_t::inline_32_bytes_k>, blobs_store_of<value_layout_t::inline_64_bytes_k>,
+        blobs_store_of<value_layout_t::fixed_width_k>, blobs_store_of<value_layout_t::variable_width_k>>;
     using transaction_t = typename database_t::transaction_t;
 
     /** A fixture, the router over its one volume, and the database mounted over the router. */
@@ -96,8 +100,8 @@ struct database_types {
     collection_config_t config;
     config.concurrency_limit = 1;
     config.cache_limit = 1024ull * 1024ull;
-    config.write_buffer_max_bytes = 1024ull * 1024ull;
-    config.write_buffer_max_elements = 4096;
+    config.memory_runs_max_bytes = 1024ull * 1024ull;
+    config.memory_runs_max_deltas = 4096;
     config.lsm_tree.level_enlarge_factor = 4;
     config.lsm_tree.lsm_level_0.sorted_run.value_size = value_size;
     config.lsm_tree.lsm_level_0.sorted_run.value_max_size = value_max_size;
@@ -126,8 +130,8 @@ expected<collection_id_t> create_named(store_type_& store, string_view_t name,
 /** The transaction shape every case creates, which holds a whole case's writes. */
 [[nodiscard]] database_config_t test_database_config() noexcept {
     database_config_t config;
-    config.default_transaction.write_buffer_max_bytes = 1024ull * 1024ull;
-    config.default_transaction.write_buffer_max_elements = 4096;
+    config.default_transaction.max_bytes = 1024ull * 1024ull;
+    config.default_transaction.max_deltas = 4096;
     return config;
 }
 
@@ -323,8 +327,8 @@ status_t capture_medium(fixture_type_& fixture, io_channel_t& channel, st::basic
 /** Writes @p image back over the whole medium of volume zero of @p fixture, as a restart after a crash finds it. */
 template <typename fixture_type_>
 status_t restore_medium(fixture_type_& fixture, io_channel_t& channel, std::span<byte_t const> image) noexcept {
-    basic_write_pipeline<typename fixture_type_::disk_t, waiting_policy_t> writer {fixture.disk, channel,
-                                                                                   fixture.media[0].reference()};
+    basic_write_pipeline<typename fixture_type_::disk_t, waiter_t> writer {fixture.disk, channel,
+                                                                           fixture.media[0].reference()};
     std::uint64_t offset = 0;
     while (offset != image.size()) {
         auto [buffer, acquire_status] = writer.acquire_buffer_or_poll();
@@ -444,17 +448,17 @@ std::size_t named_collections_round_trip(mount_type_ const& mount) {
 
     // One batched select answers every key of a collection at once, misses included.
     std::array<stored_key_t, 3> const batch {stored_key_t {0}, stored_key_t {keys_k - 1}, stored_key_t {keys_k + 5}};
-    std::array<select_result_t, 3> answers {select_result_t::nothing_k, select_result_t::nothing_k,
-                                            select_result_t::nothing_k};
+    std::array<lookup_result_t, 3> answers {lookup_result_t::missing_k, lookup_result_t::missing_k,
+                                            lookup_result_t::missing_k};
     std::size_t carried = 0;
     auto sink = [&](std::size_t, std::uint64_t, std::span<byte_t const> bytes) noexcept { carried += bytes.size(); };
     failures += expect(store
                            .select(any_collection_id_t {*blobs}, std::span<stored_key_t const> {batch},
-                                   std::span<select_result_t> {answers}, sink)
+                                   std::span<lookup_result_t> {answers}, sink)
                            .succeeded());
-    failures += expect(answers[0] == select_result_t::success_k);
-    failures += expect(answers[1] == select_result_t::success_k);
-    failures += expect(answers[2] == select_result_t::nothing_k);
+    failures += expect(answers[0] == lookup_result_t::written_k);
+    failures += expect(answers[1] == lookup_result_t::written_k);
+    failures += expect(answers[2] == lookup_result_t::missing_k);
     failures += expect_eq(carried, std::size_t {1} + (1 + (keys_k - 1) % 1000));
 
     // A removal hides the key in the collection it names and leaves the others alone.
@@ -541,7 +545,7 @@ std::size_t catalog_survives_reopen(mount_type_ const& mount) {
     collection_config_t restored;
     failures += expect(store.collection_config(*blobs, restored).succeeded());
     failures += expect_eq(restored.lsm_tree.lsm_level_0.sorted_run.value_max_size, value_max_size_k);
-    failures += expect_eq(restored.write_buffer_max_elements, std::size_t {4096});
+    failures += expect_eq(restored.memory_runs_max_deltas, std::size_t {4096});
     failures += expect_eq(store.buffer_size_for_any_stored_value(any_collection_id_t {*numbers}),
                           stored_value_size_t {8});
     ustore_modality_t modality = ustore_modality_any_k;
@@ -560,8 +564,8 @@ std::size_t catalog_survives_reopen(mount_type_ const& mount) {
     (*reopened).reset();
 
     // A database with no store for the blobs refuses the catalog naming them, and leaves it whole for one that has.
-    using numbers_only_t = basic_database<stored_key_t, typename types_t::volume_t, atomic_reference, waiting_policy_t,
-                                          typename types_t::template store_of<value_layout_t::inline_8_bytes_k>>;
+    using numbers_only_t = basic_database<stored_key_t, typename types_t::volume_t, atomic_reference, waiter_t,
+                                          typename types_t::template blobs_store_of<value_layout_t::inline_8_bytes_k>>;
     {
         numbers_only_t narrow {(*stack)->fixture->resources};
         failures += expect_status(narrow.mount((*stack)->router, (*stack)->fixture->channels, test_database_config()),
@@ -572,6 +576,84 @@ std::size_t catalog_survives_reopen(mount_type_ const& mount) {
     if (!again) return failures;
     failures += expect_eq((*again)->size(), std::size_t {3});
     for (std::uint64_t key = 0; key != 4; ++key) failures += check_painted(**again, named, key, 3);
+    return failures;
+}
+
+/** A strings collection, as the engine's names system collection is one, survives a reopen: strings sharing their
+ *  15-byte heads map onto the same 16-byte keys, answered from the 32-byte cells of a flushed run, whose header records
+ *  the width of its cells and holds no values section. */
+template <typename mount_type_>
+std::size_t strings_survive_reopen(mount_type_ const& mount) {
+    using types_t = database_types<typename mount_type_::fixture_t>;
+    using database_t = typename types_t::database_t;
+    using stack_t = typename types_t::stack_t;
+    using strings_store_t = typename types_t::strings_store_t;
+    using key_slot_t = typename strings_store_t::key_slot_t;
+    constexpr std::size_t strings_k = 64;
+    std::size_t failures = 0;
+    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
+    failures += expect_status(stack, status_code_t::success_k);
+    if (!stack) return failures;
+
+    collection_id_t names;
+    std::memcpy(names.uuid.bytes, uuid_generator().bytes, sizeof(names.uuid.bytes));
+    failures += expect(
+        (*stack)
+            ->store->create_collection(names, "names", ustore_modality_strings_k, test_config(sizeof(ustore_uuid_t), 0))
+            .succeeded());
+    if (failures != 0) return failures;
+
+    std::array<std::string, strings_k> texts;
+    std::array<std::array<byte_t, key_slot_t::size>, strings_k> keys;
+    for (std::size_t index = 0; index != strings_k; ++index) {
+        texts[index] = "collection-name" + std::to_string(index);
+        for (std::size_t position = 0; position != key_slot_t::size; ++position)
+            keys[index][position] = painted(index, position);
+    }
+    {
+        strings::nvme_transaction<database_t, strings_store_t> written {*(*stack)->store};
+        auto [held, begin_status] = (*stack)->store->create_transaction(test_database_config().default_transaction);
+        failures += expect(begin_status.succeeded());
+        if (failures != 0) return failures;
+        written.join(*held);
+        for (std::size_t index = 0; index != strings_k; ++index)
+            failures += expect(written
+                                   .write(names, texts[index], delta_view_t {delta_kind_t::write_k, keys[index]},
+                                          invalid_transaction_stamp_k)
+                                   .succeeded());
+        failures += expect(written.commit(*held).succeeded());
+    }
+    failures += expect((*stack)->store->flush().succeeded());
+    failures += expect((*stack)->store->unmount().succeeded());
+    (*stack)->store.reset();
+
+    expected<std::unique_ptr<database_t>> reopened = open_database(**stack);
+    failures += expect(reopened.has_value());
+    if (!reopened) return failures;
+    failures += expect_eq((*reopened)->collection_id(any_collection_id_t {owned_name("names")}), names);
+    status_t const visited = (*reopened)->visit_store(
+        any_collection_id_t {names}, [&]<typename store_type_>(store_type_& store) noexcept -> status_t {
+            if constexpr (!std::is_same_v<store_type_, strings_store_t>)
+                return {status_code_t::invalid_argument_k, "A strings collection mounted in another store"};
+            else {
+                typename strings_store_t::tree_t::level_t const& level = store.tree().levels().level(0);
+                failures += expect_eq(level.size(), std::size_t {1});
+                if (level.size() == 1) {
+                    failures += expect_eq(level.run(0).header().key_slot_bytes, std::uint32_t {32});
+                    failures += expect(level.run(0).header().value_layout == value_layout_t::uuid_k);
+                    failures += expect_eq(level.run(0).header().stored_values_bytes, std::uint64_t {0});
+                }
+                for (std::size_t index = 0; index != strings_k; ++index) {
+                    std::array<byte_t, key_slot_t::size> value {};
+                    failures += expect(store.find(texts[index], value) == lookup_result_t::written_k);
+                    failures += expect(value == keys[index]);
+                }
+                std::array<byte_t, key_slot_t::size> missing {};
+                failures += expect(store.find("collection-name", missing) == lookup_result_t::missing_k);
+                return {};
+            }
+        });
+    failures += expect(visited.succeeded());
     return failures;
 }
 
@@ -797,7 +879,7 @@ case_result_t crash_keeps_a_prefix_of_commits(mount_type_ const& mount) {
 
     // The first collection flushes once its buffer holds its few writes, the second never does on its own.
     collection_config_t narrow = test_config(8, 0);
-    narrow.write_buffer_max_elements = 4;
+    narrow.memory_runs_max_deltas = 4;
     expected<collection_id_t> const first = create_named(store, "first", narrow);
     expected<collection_id_t> const second = create_named(store, "second", test_config(8, 0));
     failures += expect(first.has_value() && second.has_value());
@@ -927,8 +1009,8 @@ std::size_t commit_is_all_or_nothing(mount_type_ const& mount) {
     database_t& store = *(*stack)->store;
 
     collection_config_t narrow = test_config(8, 0);
-    narrow.write_buffer_max_elements = 6;
-    narrow.write_buffer_max_bytes = 8ull * 1024ull;
+    narrow.memory_runs_max_deltas = 6;
+    narrow.memory_runs_max_bytes = 8ull * 1024ull;
     expected<collection_id_t> const first = create_named(store, "first", narrow);
     expected<collection_id_t> const second = create_named(store, "second", narrow);
     failures += expect(first.has_value());
@@ -940,16 +1022,16 @@ std::size_t commit_is_all_or_nothing(mount_type_ const& mount) {
     std::atomic<std::size_t> observations {0};
     std::thread reader {[&]() noexcept {
         while (writing.load(std::memory_order_acquire)) {
-            expected<typename database_t::snapshot_t> taken = store.take_snapshot();
+            expected<typename database_t::snapshot_t> taken = store.pin_stamp();
             if (!taken) continue;
             stored_value_size_t left = 0;
             stored_value_size_t right = 0;
             for (std::size_t key = 0; key != keys_k; ++key) {
-                select_result_t const here = taken->find(any_collection_id_t {*first}, static_cast<stored_key_t>(key),
+                lookup_result_t const here = taken->find(any_collection_id_t {*first}, static_cast<stored_key_t>(key),
                                                          left);
-                select_result_t const there = taken->find(any_collection_id_t {*second}, static_cast<stored_key_t>(key),
+                lookup_result_t const there = taken->find(any_collection_id_t {*second}, static_cast<stored_key_t>(key),
                                                           right);
-                if ((here == select_result_t::success_k) != (there == select_result_t::success_k))
+                if ((here == lookup_result_t::written_k) != (there == lookup_result_t::written_k))
                     half_applied.fetch_add(1, std::memory_order_relaxed);
             }
             observations.fetch_add(1, std::memory_order_relaxed);
@@ -1142,7 +1224,7 @@ std::size_t snapshot_holds_its_moment(mount_type_ const& mount) {
     failures += expect(
         store.insert(any_collection_id_t {*right}, stored_key_t {1}, stored_value_view_t {older}).succeeded());
 
-    expected<typename database_t::snapshot_t> taken = store.take_snapshot();
+    expected<typename database_t::snapshot_t> taken = store.pin_stamp();
     failures += expect(taken.has_value());
     if (!taken) return failures;
     failures += expect_eq(store.population_count(), std::uint64_t {2});
@@ -1162,9 +1244,9 @@ std::size_t snapshot_holds_its_moment(mount_type_ const& mount) {
             taken->select(any_collection_id_t {*left}, stored_key_t {1}, std::span<byte_t> {into}, size).succeeded());
         failures += expect_eq(counter_of(std::span<byte_t const> {into.data(), size}), std::uint64_t {1});
         failures += expect(taken->find(any_collection_id_t {*left}, stored_key_t {2}, size) ==
-                           select_result_t::nothing_k);
+                           lookup_result_t::missing_k);
         failures += expect(taken->find(any_collection_id_t {*right}, stored_key_t {1}, size) ==
-                           select_result_t::success_k);
+                           lookup_result_t::written_k);
         // The second round reads what the flush wrote, which kept every version the snapshot pins.
         if (round == 0) failures += expect(store.flush().succeeded());
     }
@@ -1215,7 +1297,7 @@ std::size_t drop_proceeds_beside_the_snapshot(mount_type_ const& mount) {
     std::atomic<bool> succeeded {false};
     std::thread dropper;
     {
-        expected<typename database_t::snapshot_t> taken = store.take_snapshot();
+        expected<typename database_t::snapshot_t> taken = store.pin_stamp();
         failures += expect(taken.has_value());
         if (!taken) return failures;
         dropper = std::thread {[&]() noexcept {
@@ -1226,7 +1308,7 @@ std::size_t drop_proceeds_beside_the_snapshot(mount_type_ const& mount) {
         dropper.join();
         stored_value_size_t size = 0;
         failures += expect(taken->find(any_collection_id_t {*doomed}, stored_key_t {1}, size) ==
-                           select_result_t::nothing_k);
+                           lookup_result_t::missing_k);
     }
     failures += expect(dropped.load(std::memory_order_acquire));
     failures += expect(succeeded.load(std::memory_order_relaxed));
@@ -1379,9 +1461,9 @@ std::size_t readers_beside_committers_and_flushes(mount_type_ const& mount) {
     if (!stack) return failures;
     database_t& store = *(*stack)->store;
 
-    // Memory runs of a few dozen records, so the committers merge, flush and compact beside the flusher.
+    // Memory runs of a few dozen deltas, so the committers merge, flush and compact beside the flusher.
     collection_config_t config = test_config(0, value_max_size_k);
-    config.write_buffer_max_elements = 32;
+    config.memory_runs_max_deltas = 32;
     std::array<collection_id_t, committers_k> named {};
     for (std::size_t committer = 0; committer != committers_k; ++committer) {
         expected<collection_id_t> const created = create_named(
@@ -1598,6 +1680,7 @@ int main(int argc, char const* argv[]) {
     auto const cases = [&](auto const& mount) {
         report(totals, mount, "named_collections", named_collections_round_trip);
         report(totals, mount, "catalog_survives_reopen", catalog_survives_reopen);
+        report(totals, mount, "strings_survive_reopen", strings_survive_reopen);
         report(totals, mount, "dropped_collection_is_gone", dropped_collection_is_gone);
         report(totals, mount, "crash_before_schema", crash_between_seal_and_schema);
         report(totals, mount, "crash_keeps_a_prefix", crash_keeps_a_prefix_of_commits);

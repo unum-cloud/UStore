@@ -924,7 +924,7 @@ std::size_t arena_outputs_only(config_t const& config) {
         .count = many_count,
         .collections = {&strings, 0},
         .strings = text_strings.view(),
-        .values = stored_values_k.view(),
+        .values = {scanned.data(), sizeof(ustore_key_t)},
     };
     ustore_strings_write(&write_strings);
     failures += expect_success(outcome);
@@ -2118,8 +2118,8 @@ std::size_t database_zeroed_fields(config_t const& config) {
     return failures;
 }
 
-/** A strings write takes its strings as a u64 tape and its values through an accessor, and a read naming the same
- *  strings by a u32 tape finds every value. */
+/** A strings write takes its strings as a u64 tape and its keys as a strided view, and a read naming the same strings
+ *  by a u32 tape finds every key. */
 case_result_t database_strings_layouts(config_t const& config) {
     std::size_t failures = 0;
     auto [database, open_status] = open_database<database_t>(config);
@@ -2136,38 +2136,38 @@ case_result_t database_strings_layouts(config_t const& config) {
     std::string_view const joined = "applebanana";
     std::array<std::uint64_t, 3> const wide_offsets {0, 5, 11};
     std::array<std::uint32_t, 3> const narrow_offsets {0, 5, 11};
-    std::array<std::string_view, 2> const colors {"red", "yellow"};
-    strided_strings<std::string_view> const accessed {strided(colors).begin()};
+    std::array<ustore_key_t, 2> const keys {key_from_integer(1), key_from_integer(2)};
     ustore_outcome_t outcome {};
     ustore_strings_write_t write {
         .database = database,
         .outcome = &outcome,
-        .count = colors.size(),
+        .count = keys.size(),
         .collections = {&strings, 0},
         .strings = u64_tape(joined.data(), wide_offsets.data()),
-        .values = accessed.view(),
+        .values = {keys.data(), sizeof(ustore_key_t)},
     };
     ustore_strings_write(&write);
     failures += expect_success(outcome);
 
-    read_columns_t columns;
+    ustore_octet_t const* presences = nullptr;
+    ustore_key_t const* values = nullptr;
     ustore_strings_read_t read {
         .database = database,
         .outcome = &outcome,
-        .count = colors.size(),
+        .count = keys.size(),
         .collections = {&strings, 0},
         .strings = u32_tape(joined.data(), narrow_offsets.data()),
-        .presences = &columns.presences,
-        .values = &columns.values,
+        .presences = &presences,
+        .values = &values,
         .arena = arena,
     };
     ustore_strings_read(&read);
     failures += expect_success(outcome);
-    failures += expect(columns.presences && tape_written(columns.values));
+    failures += expect(presences && values);
     if (failures != 0) return failures;
-    failures += expect_eq(columns.presences[0], 0b11);
-    failures += expect_eq(columns.value(0), colors[0]);
-    failures += expect_eq(columns.value(1), colors[1]);
+    failures += expect_eq(presences[0], 0b11);
+    failures += expect_eq(values[0], keys[0]);
+    failures += expect_eq(values[1], keys[1]);
     return failures;
 }
 
@@ -2817,13 +2817,15 @@ case_result_t cursor_whole_walk(config_t const& config) {
     ustore_blobs_cursor_free(cursor);
 
     std::array<std::string_view, 4> const texts {"b:1", "a:3", "a:1", "a:2"};
+    std::array<ustore_key_t, 4> const text_keys {key_from_integer(21), key_from_integer(13), key_from_integer(11),
+                                                 key_from_integer(12)};
     strided_strings<std::string_view> const accessed {strided(texts).begin()};
     ustore_strings_write_t write {.database = database,
                                   .outcome = &outcome,
                                   .count = texts.size(),
                                   .collections = {&strings, 0},
                                   .strings = accessed.view(),
-                                  .values = accessed.view()};
+                                  .values = {text_keys.data(), sizeof(ustore_key_t)}};
     ustore_strings_write(&write);
     failures += expect_success(outcome);
     ustore_strings_cursor_t walk = nullptr;
@@ -2835,9 +2837,10 @@ case_result_t cursor_whole_walk(config_t const& config) {
     ustore_strings_cursor_init(&init);
     failures += expect_success(outcome);
     std::array<std::string_view, 3> const prefixed {"a:1", "a:2", "a:3"};
+    std::array<ustore_key_t, 3> const prefixed_keys {text_keys[2], text_keys[3], text_keys[1]};
     for (std::size_t first : {0u, 2u, 3u}) {
         ustore_strings_view_t found {};
-        ustore_strings_view_t values {};
+        ustore_key_t const* values = nullptr;
         ustore_size_t written = 0;
         ustore_strings_cursor_next_t next {.database = database,
                                            .outcome = &outcome,
@@ -2852,7 +2855,7 @@ case_result_t cursor_whole_walk(config_t const& config) {
         failures += expect_eq(written, std::min<std::size_t>(2, 3 - first));
         for (std::size_t index = 0; index != written && first + index != prefixed.size(); ++index) {
             failures += expect_eq(string_of(tape_string(found, index)), prefixed[first + index]);
-            failures += expect_eq(string_of(tape_string(values, index)), prefixed[first + index]);
+            failures += expect_eq(values[index], prefixed_keys[first + index]);
         }
     }
     ustore_strings_cursor_free(walk);
@@ -3130,13 +3133,14 @@ case_result_t progress_cancel_scans(config_t const& config) {
     failures += expect(strings_status.succeeded());
     if (failures != 0) return failures;
     std::array<std::string_view, 2> const prefixes {"a", "b"};
+    std::array<ustore_key_t, 2> const prefix_keys {key_from_integer(1), key_from_integer(2)};
     strided_strings<std::string_view> const accessed {strided(prefixes).begin()};
     ustore_strings_write_t write {.database = database,
                                   .outcome = &outcome,
                                   .count = prefixes.size(),
                                   .collections = {&strings, 0},
                                   .strings = accessed.view(),
-                                  .values = accessed.view()};
+                                  .values = {prefix_keys.data(), sizeof(ustore_key_t)}};
     ustore_strings_write(&write);
     failures += expect_success(outcome);
     record = {.cancelling_report = 1};

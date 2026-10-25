@@ -9,10 +9,10 @@
  *  catalog lookups. An edit call addressing only pages collections runs through the `*_in_page_edits` calls of
  *  `src/pages.cpp`, which read the pages unwatched, check and apply the edits, and hand the edits of every page to
  *  @c commit_page_edits as one chain. A chain that imports or removes the page decides it whole, so the page it leaves
- *  is written, or removed, and any other chain is appended as one @c page_fold change record, watching nothing, so two
+ *  is written, or removed, and any other chain is appended as one @c page_fold_t change delta, watching nothing, so two
  *  commits editing one page both land. A call addressing any other collection, the main one included, rewrites its
  *  pages through the `*_in_page_values` calls, as RAM does. Reads stay with `pages_read_in_page_values`, which reads
- *  through the engine's own blobs reads, folding the records.
+ *  through the engine's own blobs reads, folding the deltas.
  */
 
 #pragma once
@@ -23,15 +23,15 @@
 
 #include "ustore/pages.h" // `ustore_pages_import_t`, `ustore_pages_insert_t`
 
-#include "ustore/pages/page_fold.hpp"       // `page_fold`
+#include "ustore/pages/page_fold.hpp"       // `page_fold_t`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocator`
 
 namespace unum::ustore::nvme {
 
-using ustore::pages::page_fold;
+using ustore::pages::page_fold_t;
 
-/** The fold every change record of a pages collection is written for. */
-inline constexpr page_fold pages_fold_k {};
+/** The fold every change delta of a pages collection is written for. */
+inline constexpr page_fold_t pages_fold_k {};
 
 /** Implements @c page_edits_commit_t over a database of @p cpu_class_, committing the chains @p edited lists in one
  *  transaction, the caller's or one of their own flushed when @p durability asks. */
@@ -49,9 +49,9 @@ status_t commit_page_edits(ustore_database_t database, std::span<page_edits_t co
                 stored_key_t const key = stored_of(page.key.uuid);
                 delta_view_t const change {delta_kind_t::change_k, page.chain};
                 if (!pages_fold_k.closes(change)) {
-                    if (status_t const staged = access.transaction->change(collection, key, page.chain, pages_fold_k);
-                        staged.failed())
-                        return staged;
+                    if (status_t const changed = access.transaction->change(collection, key, page.chain, pages_fold_k);
+                        changed.failed())
+                        return changed;
                     continue;
                 }
                 arena_allocator<byte_t> arena {access.scratch};

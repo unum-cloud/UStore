@@ -24,7 +24,7 @@
 
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
-#include "ustore/blobs/nvme_store.hpp"                      // `collection_scanner`
+#include "ustore/blobs/nvme_store.hpp"                      // `nvme_store`, `nvme_store_cursor`
 #include "ustore/blobs/nvme_key_slot.hpp"                   // `key_slot`
 #include "ustore/blobs/nvme_single_collection_database.hpp" // `basic_single_collection_database`
 
@@ -51,16 +51,16 @@ constexpr stored_value_size_t value_max_size_k = 4096;
 using stored_key_t = std::uint64_t;
 using variable_slot_t = key_slot<stored_key_t, value_layout_t::variable_width_k>;
 
-/** The databases and the scanners every case drives over the volume of @p fixture_type_. */
+/** The databases and the cursors every case drives over the volume of @p fixture_type_. */
 template <typename fixture_type_>
 struct scdb_types {
     using fixture_t = fixture_type_;
     using guard_t = typename fixture_t::guard_t;
     using volume_t = typename fixture_t::volume_t;
     using variable_database_t =
-        basic_single_collection_database<stored_key_t, volume_t, atomic_reference, waiting_policy_t,
-                                         collection<variable_slot_t, volume_t, atomic_reference, waiting_policy_t>>;
-    using variable_scanner_t = collection_scanner<variable_slot_t, volume_t, atomic_reference, waiting_policy_t>;
+        basic_single_collection_database<stored_key_t, volume_t, atomic_reference, waiter_t,
+                                         nvme_store<variable_slot_t, volume_t, atomic_reference, waiter_t>>;
+    using variable_cursor_t = nvme_store_cursor<variable_slot_t, volume_t, atomic_reference, waiter_t>;
 
     /** A fixture, the channels a database needs, and the volume over them. */
     struct stack_t {
@@ -95,13 +95,13 @@ struct scdb_types {
     single_collection_database_config_t config;
     config.collection.concurrency_limit = 1;
     config.collection.cache_limit = 1024ull * 1024ull;
-    config.collection.write_buffer_max_bytes = 8ull * 1024ull * 1024ull;
-    config.collection.write_buffer_max_elements = 8192;
+    config.collection.memory_runs_max_bytes = 8ull * 1024ull * 1024ull;
+    config.collection.memory_runs_max_deltas = 8192;
     config.collection.lsm_tree.level_enlarge_factor = 4;
     config.collection.lsm_tree.lsm_level_0.sorted_run.value_size = value_size;
     config.collection.lsm_tree.lsm_level_0.sorted_run.value_max_size = value_max_size;
-    config.default_transaction.write_buffer_max_bytes = 256ull * 1024ull;
-    config.default_transaction.write_buffer_max_elements = 1024;
+    config.default_transaction.max_bytes = 256ull * 1024ull;
+    config.default_transaction.max_deltas = 1024;
     return config;
 }
 
@@ -177,8 +177,8 @@ template <typename database_type_>
     st::basic_vector<byte_t> value;
     for (std::size_t index = 0; index != wanted.size(); ++index) {
         expectation_t const& entry = wanted[index];
-        if (entry.state == select_result_t::erased_k) {
-            failures += expect(store.erase(entry.stored_key).succeeded());
+        if (entry.state == lookup_result_t::removed_k) {
+            failures += expect(store.remove(entry.stored_key).succeeded());
             continue;
         }
         failures += expect(value.resize(static_cast<std::size_t>(entry.bytes)) == st::status_t::success_k);
@@ -196,7 +196,7 @@ template <typename readable_type_>
     std::size_t failures = 0;
     std::size_t const count = wanted.size();
     st::basic_vector<stored_key_t> keys;
-    st::basic_vector<select_result_t> results;
+    st::basic_vector<lookup_result_t> results;
     st::basic_vector<std::uint64_t> seen;
     failures += expect(keys.resize(count) == st::status_t::success_k);
     failures += expect(results.resize(count) == st::status_t::success_k);
@@ -204,7 +204,7 @@ template <typename readable_type_>
     if (failures != 0) return failures;
     for (std::size_t index = 0; index != count; ++index) {
         keys[index] = wanted[index].stored_key;
-        results[index] = select_result_t::nothing_k;
+        results[index] = lookup_result_t::missing_k;
         seen[index] = 0;
     }
 
@@ -215,13 +215,13 @@ template <typename readable_type_>
             if (bytes[index] != painted(wanted[request].seed, offset + index)) ++mismatches;
     };
     failures += expect(
-        source.select(channel, std::span<stored_key_t const> {keys}, std::span<select_result_t> {results}, sink)
+        source.select(channel, std::span<stored_key_t const> {keys}, std::span<lookup_result_t> {results}, sink)
             .succeeded());
     failures += expect_eq(mismatches, std::size_t {0});
 
     for (std::size_t index = 0; index != count; ++index) {
         failures += expect(results[index] == wanted[index].state);
-        if (wanted[index].state == select_result_t::success_k) failures += expect_eq(seen[index], wanted[index].bytes);
+        if (wanted[index].state == lookup_result_t::written_k) failures += expect_eq(seen[index], wanted[index].bytes);
     }
     return failures;
 }
@@ -238,9 +238,8 @@ template <typename key_slot_type_, typename mount_type_>
     using stack_t = typename types_t::stack_t;
     using volume_t = typename types_t::volume_t;
     using database_t =
-        basic_single_collection_database<typename key_slot_type_::stored_key_t, volume_t, atomic_reference,
-                                         waiting_policy_t,
-                                         collection<key_slot_type_, volume_t, atomic_reference, waiting_policy_t>>;
+        basic_single_collection_database<typename key_slot_type_::stored_key_t, volume_t, atomic_reference, waiter_t,
+                                         nvme_store<key_slot_type_, volume_t, atomic_reference, waiter_t>>;
     std::size_t failures = 0;
     constexpr std::size_t count_k = 300;
 
@@ -260,8 +259,8 @@ template <typename key_slot_type_, typename mount_type_>
     for (std::size_t index = 0; index != count_k; ++index) {
         expectation_t entry;
         entry.stored_key = static_cast<stored_key_t>(index) * 3;
-        entry.state = index % 13 == 0 ? select_result_t::erased_k : select_result_t::success_k;
-        entry.bytes = entry.state != select_result_t::success_k ? 0 : value_size != 0 ? value_size : 1 + index % widest;
+        entry.state = index % 13 == 0 ? lookup_result_t::removed_k : lookup_result_t::written_k;
+        entry.bytes = entry.state != lookup_result_t::written_k ? 0 : value_size != 0 ? value_size : 1 + index % widest;
         entry.seed = index + widest;
         model[index] = entry;
     }
@@ -269,7 +268,7 @@ template <typename key_slot_type_, typename mount_type_>
     failures += write_model(**store, std::span<expectation_t const> {model});
     failures += check_model(**store, (*stack)->channel(), std::span<expectation_t const> {model});
     failures += expect((*store)->flush().succeeded());
-    failures += expect_eq((*store)->staged_count(), std::size_t {0});
+    failures += expect_eq((*store)->memory_deltas_count(), std::size_t {0});
     failures += check_model(**store, (*stack)->channel(), std::span<expectation_t const> {model});
     return failures;
 }
@@ -334,9 +333,8 @@ template <typename key_slot_type_, typename mount_type_>
     using stack_t = typename types_t::stack_t;
     using volume_t = typename types_t::volume_t;
     using database_t =
-        basic_single_collection_database<typename key_slot_type_::stored_key_t, volume_t, atomic_reference,
-                                         waiting_policy_t,
-                                         collection<key_slot_type_, volume_t, atomic_reference, waiting_policy_t>>;
+        basic_single_collection_database<typename key_slot_type_::stored_key_t, volume_t, atomic_reference, waiter_t,
+                                         nvme_store<key_slot_type_, volume_t, atomic_reference, waiter_t>>;
     std::size_t failures = 0;
     constexpr std::size_t count_k = 400;
 
@@ -364,7 +362,7 @@ template <typename key_slot_type_, typename mount_type_>
             for (std::size_t index = 0; index != count_k; ++index) {
                 expectation_t entry;
                 entry.stored_key = static_cast<stored_key_t>(index) * 3;
-                entry.state = select_result_t::success_k;
+                entry.state = lookup_result_t::written_k;
                 entry.bytes = value_size != 0 ? value_size : 1 + index % widest;
                 entry.seed = index + round * 7919;
                 model[index] = entry;
@@ -389,8 +387,8 @@ template <typename key_slot_type_, typename mount_type_>
             std::size_t const stride = again == 0 ? 3 : 6;
             for (std::size_t index = 0; index < count_k; index += stride) {
                 expectation_t entry = model[index];
-                entry.state = again == 0 && index % 9 == 0 ? select_result_t::erased_k : select_result_t::success_k;
-                entry.bytes = entry.state != select_result_t::success_k ? 0
+                entry.state = again == 0 && index % 9 == 0 ? lookup_result_t::removed_k : lookup_result_t::written_k;
+                entry.bytes = entry.state != lookup_result_t::written_k ? 0
                               : value_size != 0                         ? value_size
                                                                         : 1 + (index + 5 + again) % widest;
                 entry.seed = index + 104729 + again * 31;
@@ -614,7 +612,7 @@ std::size_t reopen_agrees_on_its_schema(mount_type_ const& mount) {
  *  @brief A reader passing over every key sees the whole of a commit or none of it.
  *
  *  Every pass is one batched select, which holds the read path for all of its keys, so a pass that
- *  carried two generations at once would be a commit landing in the middle of a reader.
+ *  carried two versions at once would be a commit landing in the middle of a reader.
  */
 template <typename mount_type_>
 std::size_t commit_lands_all_or_nothing(mount_type_ const& mount) {
@@ -657,9 +655,8 @@ std::size_t commit_lands_all_or_nothing(mount_type_ const& mount) {
         st::basic_vector<byte_t> painted_value;
         writer_failures += expect(painted_value.resize(value_bytes_k) == st::status_t::success_k);
         for (std::size_t round = 0; round != commits_k; ++round) {
-            std::uint64_t const generation = 1 + round % 2;
-            for (std::size_t index = 0; index != value_bytes_k; ++index)
-                painted_value[index] = painted(generation, index);
+            std::uint64_t const version = 1 + round % 2;
+            for (std::size_t index = 0; index != value_bytes_k; ++index) painted_value[index] = painted(version, index);
             for (stored_key_t key = 0; key != keys_k; ++key)
                 writer_failures += expect(
                     (*changing)->insert(key, std::span<byte_t const> {painted_value}).succeeded());
@@ -671,7 +668,7 @@ std::size_t commit_lands_all_or_nothing(mount_type_ const& mount) {
     std::size_t unknown = 0;
     std::size_t passes = 0;
     st::basic_vector<stored_key_t> keys;
-    st::basic_vector<select_result_t> results;
+    st::basic_vector<lookup_result_t> results;
     st::basic_vector<byte_t> carried;
     failures += expect(keys.resize(keys_k) == st::status_t::success_k);
     failures += expect(results.resize(keys_k) == st::status_t::success_k);
@@ -685,21 +682,21 @@ std::size_t commit_lands_all_or_nothing(mount_type_ const& mount) {
     while (passes != 400) {
         failures += expect((*store)
                                ->select((*stack)->channel(), std::span<stored_key_t const> {keys},
-                                        std::span<select_result_t> {results}, sink)
+                                        std::span<lookup_result_t> {results}, sink)
                                .succeeded());
-        std::size_t generations = 0;
-        for (std::uint64_t generation = 1; generation != 3; ++generation) {
+        std::size_t versions_seen = 0;
+        for (std::uint64_t version = 1; version != 3; ++version) {
             std::size_t matching = 0;
             for (std::size_t request = 0; request != keys_k; ++request) {
                 std::size_t same = 0;
                 for (std::size_t index = 0; index != value_bytes_k; ++index)
-                    same += carried[request * value_bytes_k + index] == painted(generation, index);
+                    same += carried[request * value_bytes_k + index] == painted(version, index);
                 matching += same == value_bytes_k;
             }
-            generations += matching != 0;
+            versions_seen += matching != 0;
             if (matching != 0 && matching != keys_k) ++torn;
         }
-        unknown += generations == 0;
+        unknown += versions_seen == 0;
         ++passes;
     }
     writer.join();
@@ -760,7 +757,7 @@ std::size_t conflict_keeps_its_changes(mount_type_ const& mount) {
 
     // The refused stage keeps the changes, so the caller can still read back what it could not commit.
     stored_value_size_t kept = 0;
-    failures += expect((*second)->find_uncommitted(contested_k, kept) == select_result_t::success_k);
+    failures += expect((*second)->find_uncommitted(contested_k, kept) == lookup_result_t::written_k);
     failures += expect_eq(static_cast<std::size_t>(kept), counter_bytes_k);
     failures += expect((*second)->select((*stack)->channel(), contested_k, std::span<byte_t> {seen}, size).succeeded());
     failures += expect_eq(read_counter(std::span<byte_t const> {seen}), std::uint64_t {202});
@@ -771,7 +768,7 @@ std::size_t conflict_keeps_its_changes(mount_type_ const& mount) {
 
     // Rolling back and doing the work again is what the loser is supposed to do next.
     (*second)->rollback();
-    failures += expect((*second)->find_uncommitted(contested_k, kept) == select_result_t::nothing_k);
+    failures += expect((*second)->find_uncommitted(contested_k, kept) == lookup_result_t::missing_k);
     failures += expect((*second)->select((*stack)->channel(), contested_k, std::span<byte_t> {seen}, size).succeeded());
     write_counter(read_counter(std::span<byte_t const> {seen}) + 1, std::span<byte_t> {from_second});
     failures += expect((*second)->insert(contested_k, std::span<byte_t const> {from_second}).succeeded());
@@ -793,7 +790,7 @@ std::size_t conflict_keeps_its_changes(mount_type_ const& mount) {
     status_t const observed = (*observing)->stage();
     failures += expect_status(observed, status_code_t::write_conflict_k);
     if (observed.succeeded()) (*observing)->rollback();
-    failures += expect((*store)->find(stored_key_t {99}, size) == select_result_t::nothing_k);
+    failures += expect((*store)->find(stored_key_t {99}, size) == lookup_result_t::missing_k);
     return failures;
 }
 
@@ -825,15 +822,15 @@ std::size_t rollback_and_renew_behave(mount_type_ const& mount) {
     // A rollback leaves neither the change nor a trace of it in the database.
     failures += expect((*changing)->insert(stored_key_t {1}, std::span<byte_t const> {value}).succeeded());
     (*changing)->rollback();
-    failures += expect((*changing)->find_uncommitted(stored_key_t {1}, size) == select_result_t::nothing_k);
-    failures += expect((*store)->find(stored_key_t {1}, size) == select_result_t::nothing_k);
+    failures += expect((*changing)->find_uncommitted(stored_key_t {1}, size) == lookup_result_t::missing_k);
+    failures += expect((*store)->find(stored_key_t {1}, size) == lookup_result_t::missing_k);
 
     // A renew keeps the changes of a transaction that has only written.
     failures += expect((*changing)->insert(stored_key_t {2}, std::span<byte_t const> {value}).succeeded());
     failures += expect((*changing)->renew().succeeded());
-    failures += expect((*changing)->find_uncommitted(stored_key_t {2}, size) == select_result_t::success_k);
+    failures += expect((*changing)->find_uncommitted(stored_key_t {2}, size) == lookup_result_t::written_k);
     failures += expect((*changing)->commit().succeeded());
-    failures += expect((*store)->find(stored_key_t {2}, size) == select_result_t::success_k);
+    failures += expect((*store)->find(stored_key_t {2}, size) == lookup_result_t::written_k);
 
     // A transaction that has read something may not renew, whatever it has written since.
     std::array<byte_t, counter_bytes_k> seen {};
@@ -841,18 +838,18 @@ std::size_t rollback_and_renew_behave(mount_type_ const& mount) {
         (*changing)->select((*stack)->channel(), stored_key_t {2}, std::span<byte_t> {seen}, size).succeeded());
     failures += expect_status((*changing)->renew(), status_code_t::invalid_argument_k);
 
-    // Nor may a staged transaction, and the staging queue pair is handed back by the rollback and not by the renew.
+    // Nor may a staged transaction, and the stage's queue pair is handed back by the rollback and not by the renew.
     (*changing)->rollback();
     failures += expect((*changing)->insert(stored_key_t {3}, std::span<byte_t const> {value}).succeeded());
     failures += expect((*changing)->stage().succeeded());
     failures += expect_status((*changing)->renew(), status_code_t::invalid_argument_k);
     (*changing)->rollback();
-    failures += expect((*store)->find(stored_key_t {3}, size) == select_result_t::nothing_k);
+    failures += expect((*store)->find(stored_key_t {3}, size) == lookup_result_t::missing_k);
 
     // The transaction is running again after all of that, so it still commits.
     failures += expect((*changing)->insert(stored_key_t {4}, std::span<byte_t const> {value}).succeeded());
     failures += expect((*changing)->commit().succeeded());
-    failures += expect((*store)->find(stored_key_t {4}, size) == select_result_t::success_k);
+    failures += expect((*store)->find(stored_key_t {4}, size) == lookup_result_t::written_k);
     return failures;
 }
 
@@ -985,11 +982,11 @@ std::size_t snapshot_sees_its_moment(mount_type_ const& mount) {
         failures += expect((*store)->insert(key, std::span<byte_t const> {older}).succeeded());
 
     // A snapshot flushes nothing: what the memory runs hold is inside it already.
-    expected<typename variable_database_t::snapshot_t> taken = (*store)->take_snapshot();
+    expected<typename variable_database_t::snapshot_t> taken = (*store)->pin_stamp();
     failures += expect(taken.has_value());
     if (!taken) return failures;
     failures += expect_eq((*store)->population_count(), std::uint64_t {8});
-    failures += expect_eq((*store)->staged_count(), std::size_t {8});
+    failures += expect_eq((*store)->memory_deltas_count(), std::size_t {8});
 
     std::size_t writer_failures = 0;
     std::thread writer {[&]() noexcept {
@@ -1013,12 +1010,12 @@ std::size_t snapshot_sees_its_moment(mount_type_ const& mount) {
 
     // A key written after the snapshot was taken is not a key the snapshot has.
     stored_value_size_t missing = 0;
-    failures += expect(taken->find(stored_key_t {100}, missing) == select_result_t::nothing_k);
+    failures += expect(taken->find(stored_key_t {100}, missing) == lookup_result_t::missing_k);
 
     taken = expected<typename variable_database_t::snapshot_t> {status_t {status_code_t::uninitialized_k, "Let go"}};
     writer.join();
     failures += writer_failures;
-    failures += expect((*store)->find(stored_key_t {100}, missing) == select_result_t::success_k);
+    failures += expect((*store)->find(stored_key_t {100}, missing) == lookup_result_t::written_k);
 
     // The database itself moved on, and every key of it now carries the newer bytes.
     for (stored_key_t key = 0; key != 8; ++key) {
@@ -1033,12 +1030,12 @@ std::size_t snapshot_sees_its_moment(mount_type_ const& mount) {
 
 #pragma region Scan Cases
 
-/** An ordered scan visits every key once, across the staged writes and several levels. */
+/** An ordered scan visits every key once, across the memory runs and several levels. */
 template <typename mount_type_>
 std::size_t scan_visits_every_key_in_order(mount_type_ const& mount) {
     using types_t = scdb_types<typename mount_type_::fixture_t>;
     using variable_database_t = typename types_t::variable_database_t;
-    using variable_scanner_t = typename types_t::variable_scanner_t;
+    using variable_cursor_t = typename types_t::variable_cursor_t;
     using stack_t = typename types_t::stack_t;
     std::size_t failures = 0;
     constexpr std::size_t keys_k = 800;
@@ -1068,7 +1065,7 @@ std::size_t scan_visits_every_key_in_order(mount_type_ const& mount) {
         for (std::size_t index = round; index < keys_k; index += rounds_k) {
             expectation_t entry;
             entry.stored_key = static_cast<stored_key_t>(index);
-            entry.state = select_result_t::success_k;
+            entry.state = lookup_result_t::written_k;
             entry.bytes = 40 + index % 97;
             entry.seed = index * 31 + round;
             failures += expect(batch.push_back(expectation_t {entry}) == st::status_t::success_k);
@@ -1086,23 +1083,23 @@ std::size_t scan_visits_every_key_in_order(mount_type_ const& mount) {
     if (!merged) return failures;
     failures += expect(*merged == compaction_outcome_t::published_k);
 
-    // What stays staged is what the scan must merge in front of every run.
+    // What stays in memory runs is what the scan must merge in front of every run.
     {
         st::basic_vector<expectation_t> batch;
         for (std::size_t index = 0; index < keys_k; index += 25) {
             expectation_t entry;
             entry.stored_key = static_cast<stored_key_t>(index);
-            entry.state = index % 50 == 0 ? select_result_t::erased_k : select_result_t::success_k;
-            entry.bytes = entry.state == select_result_t::success_k ? 13 + index % 29 : 0;
+            entry.state = index % 50 == 0 ? lookup_result_t::removed_k : lookup_result_t::written_k;
+            entry.bytes = entry.state == lookup_result_t::written_k ? 13 + index % 29 : 0;
             entry.seed = index * 7 + 3;
             failures += expect(batch.push_back(expectation_t {entry}) == st::status_t::success_k);
         }
         failures += write_model(**store, std::span<expectation_t const> {batch});
         apply(std::span<expectation_t const> {batch});
     }
-    failures += expect((*store)->staged_count() != 0);
+    failures += expect((*store)->memory_deltas_count() != 0);
 
-    expected<variable_scanner_t> scan = variable_scanner_t::over((*store)->records());
+    expected<variable_cursor_t> scan = variable_cursor_t::over((*store)->records());
     failures += expect(scan.has_value());
     if (!scan) return failures;
 

@@ -54,7 +54,7 @@ A transport the machine does not offer skips with its reason, and a transport th
 Every result line reads `<suite>.<transport>.<case>`.
 CMake builds every suite below as `ustore_test_nvme_<suite>`, the Linux transports only on Linux.
 The database transaction and stress suites link the device compactor when the build carries CUDA.
-Every suite instantiates the templates with ForkUnion's standard atomic reference and a yielding waiting policy, as no suite picks a CPU class.
+Every suite instantiates the templates with ForkUnion's standard atomic reference and a yielding waiter, as no suite picks a CPU class.
 No suite reaching the harness compiles under nvcc, since nvcc's front end crashes instantiating StringZilla's string.
 The compaction suite builds twice, as `ustore_test_nvme_compaction_host` with every test build and as `ustore_test_nvme_compaction` over the device compactor, which `nvme/compaction_device.cu` instantiates for the suite's key slots.
 

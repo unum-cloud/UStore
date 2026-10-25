@@ -123,7 +123,7 @@ class page_state {
 };
 
 /** The fold of pages, fitting the fold concept of `ustore/utilities/folds.hpp`: apply, compose and closes. */
-struct page_fold {
+struct page_fold_t {
 
     /** Whether a collection of @p modality folds page edits, which pages alone do. */
     static constexpr bool serves(ustore_modality_t modality) noexcept { return modality == ustore_modality_pages_k; }
@@ -148,7 +148,7 @@ struct page_fold {
         return state.tree.encode(allocator);
     }
 
-    /** Whether @p delta makes every older record irrelevant: a write, a removal, or a chain holding an import or a
+    /** Whether @p delta makes every older delta irrelevant: a write, a removal, or a chain holding an import or a
      *  page removal. */
     bool closes(delta_view_t const& delta) const noexcept {
         if (delta.kind != delta_kind_t::change_k) return true;
@@ -296,6 +296,6 @@ struct page_fold {
     }
 };
 
-static_assert(utilities::fold_concept<page_fold>);
+static_assert(utilities::fold_concept<page_fold_t>);
 
 } // namespace unum::ustore::pages

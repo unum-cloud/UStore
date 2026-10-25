@@ -4,11 +4,12 @@
  *  @date October 20, 2026
  *  @brief Unit tests of `ustore/strings/nvme_memory_run.hpp`: head order, what sealing refuses, reads at every stamp,
  *      conflict checks and prefix cursors over random commit streams against a reference model, a map of every
- *      version of every string, and generational merges that keep every version a reader still sees.
+ *      version of every string, and merges by tier that keep every version a reader still sees.
  *
  *  The strings share long prefixes on purpose: ten thousand share their leading 15 bytes, so their heads tie, and the
  *  rest cover empty strings, strings of 1, 15, 16 and 17 bytes, zero and 0xFF bytes inside them, and a 64 KiB string.
- *  The suite prints one line per case and a total, and exits non-zero on a failure.
+ *  Every write maps its string onto one random 16-byte key. The suite prints one line per case and a total, and exits
+ *  non-zero on a failure.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
@@ -30,7 +31,7 @@
 #include <fmt/format.h> // `fmt::println`
 
 #include "ustore/blobs/nvme_collection_view.hpp" // `collection_view`
-#include "ustore/strings/nvme_memory_run.hpp"    // `strings_memory_run`, `strings_cursor`, `kept_versions`
+#include "ustore/strings/nvme_memory_run.hpp"    // `memory_run`, `memory_run_cursor`, `kept_versions`
 
 namespace unum::ustore::test {
 
@@ -38,10 +39,10 @@ using namespace unum::ustore::strings;
 
 using blobs::head_stamp_k;
 
-using sealed_t = strings_sealed_writes<>;
-using run_t = strings_memory_run<>;
+using sealed_t = strings::sealed_deltas<>;
+using run_t = strings::memory_run<>;
 using view_t = blobs::collection_view<run_t>;
-using cursor_t = strings_cursor<view_t>;
+using cursor_t = memory_run_cursor<view_t>;
 using keyed_delta_t = keyed_delta<std::string_view>;
 using stamped_delta_t = stamped_delta<std::string_view>;
 using bytes_t = std::vector<byte_t>;
@@ -179,14 +180,14 @@ static std::string start_pick(std::vector<std::string> const& pool, std::mt19937
     }
 }
 
-/** Draws one commit's records over @p pool into @p deltas, appending them to @p model under @p stamp; the payloads
- *  land in @p payloads, which must outlive the sealing. */
+/** Draws one commit's deltas over @p pool into @p deltas, appending them to @p model under @p stamp; the 16-byte keys
+ *  written land in @p payloads, which must outlive the sealing. */
 static void draw_commit(std::vector<std::string> const& pool, std::mt19937_64& generator, transaction_stamp_t stamp,
                         model_t& model, std::vector<keyed_delta_t>& deltas, std::vector<bytes_t>& payloads) {
-    std::uniform_int_distribution<std::size_t> records_count(1, 32), string_pick(0, pool.size() - 1),
-        shared_pick(0, 9'999), kind_pick(0, 9), length_pick(0, 24), large_pick(0, 199);
+    std::uniform_int_distribution<std::size_t> deltas_count(1, 32), string_pick(0, pool.size() - 1),
+        shared_pick(0, 9'999), kind_pick(0, 9);
     std::uniform_int_distribution<int> byte_pick(0, 255);
-    std::size_t const wanted = records_count(generator);
+    std::size_t const wanted = deltas_count(generator);
     deltas.clear();
     payloads.clear();
     payloads.reserve(wanted);
@@ -197,8 +198,7 @@ static void draw_commit(std::vector<std::string> const& pool, std::mt19937_64& g
         if (!chosen.insert(text).second) continue;
         delta_kind_t const kind = kind_pick(generator) < 7 ? delta_kind_t::write_k : delta_kind_t::remove_k;
         bytes_t& payload = payloads.emplace_back();
-        if (kind == delta_kind_t::write_k)
-            payload.resize(large_pick(generator) == 0 ? 64 * 1024 : length_pick(generator));
+        if (kind == delta_kind_t::write_k) payload.resize(sizeof(ustore_key_t));
         for (byte_t& value : payload) value = static_cast<byte_t>(byte_pick(generator));
         deltas.push_back(keyed_delta_t {text, {kind, payload}});
         model[text].push_back(model_version_t {stamp, kind, payload});
@@ -242,8 +242,8 @@ static std::size_t heads_order_as_strings() {
     for (std::size_t pair = 0; pair != 200'000 && failures == 0; ++pair) {
         std::string const& first = pool[string_pick(generator)];
         std::string const& second = pool[string_pick(generator)];
-        ustore_key_t const first_head = head_of(first);
-        ustore_key_t const second_head = head_of(second);
+        st::key128_t const first_head = head_of(first);
+        st::key128_t const second_head = head_of(second);
         if (first_head < second_head) failures += check(first < second);
         if (first < second) failures += check(!(second_head < first_head));
         if (first_head == second_head)
@@ -252,17 +252,18 @@ static std::size_t heads_order_as_strings() {
         std::strong_ordering const ordered = order_strings(first_head, first, second_head, second);
         failures += check(ordered == (first <=> second));
     }
-    failures += check(head_of({}) == ustore_key_t {});
-    failures += check(head_of(std::string(1, '\0')).uuid.bytes[head_prefix_bytes_k] == 1);
-    failures += check(head_of(std::string(17, 'a')).uuid.bytes[head_prefix_bytes_k] == long_head_length_k);
+    failures += check(head_of({}) == st::key128_t {});
+    failures += check(head_length_of(head_of(std::string(1, '\0'))) == 1);
+    failures += check(head_length_of(head_of(std::string(17, 'a'))) == long_head_length_k);
     failures += check(tail_of(std::string(15, 'a')).empty() && tail_of(std::string(17, 'a')).size() == 2);
     return failures;
 }
 
-/** Sealing refuses what a run cannot hold, and a run keeps a removal apart from an empty value. */
+/** Sealing refuses what a run cannot hold, a write of anything but one 16-byte key included, and a run keeps a removal
+ *  apart from a write. */
 static std::size_t refusals() {
     std::size_t failures = 0;
-    bytes_t const payload(4, byte_t {7});
+    bytes_t const payload(sizeof(ustore_key_t), byte_t {7});
     std::vector<keyed_delta_t> none;
     failures += check(sealed_t::seal(none).code() == status_code_t::invalid_argument_k);
 
@@ -274,6 +275,12 @@ static std::size_t refusals() {
     std::vector<keyed_delta_t> loaded_removal {{"key", {delta_kind_t::remove_k, payload}}};
     failures += check(sealed_t::seal(loaded_removal).code() == status_code_t::invalid_argument_k);
 
+    bytes_t const short_payload(4, byte_t {7});
+    std::vector<keyed_delta_t> short_write {{"key", {delta_kind_t::write_k, short_payload}}};
+    failures += check(sealed_t::seal(short_write).code() == status_code_t::invalid_argument_k);
+    std::vector<keyed_delta_t> empty_write {{"key", {delta_kind_t::write_k, {}}}};
+    failures += check(sealed_t::seal(empty_write).code() == status_code_t::invalid_argument_k);
+
     std::vector<keyed_delta_t> one {{"key", {delta_kind_t::write_k, payload}}};
     expected<sealed_t> sealed = sealed_t::seal(one);
     if (check(sealed.has_value())) return failures + 1;
@@ -281,8 +288,9 @@ static std::size_t refusals() {
                       status_code_t::invalid_argument_k);
 
     std::string const empty_string;
+    bytes_t const other_payload(sizeof(ustore_key_t), byte_t {9});
     std::vector<keyed_delta_t> deltas {{"gone", {delta_kind_t::remove_k, {}}},
-                                       {"blank", {delta_kind_t::write_k, {}}},
+                                       {"blank", {delta_kind_t::write_k, other_payload}},
                                        {empty_string, {delta_kind_t::write_k, payload}}};
     expected<run_t> stamped = run_t::stamped(*sealed_t::seal(deltas), 5);
     if (check(stamped.has_value())) return failures + 1;
@@ -290,9 +298,12 @@ static std::size_t refusals() {
     expected<view_t> view = view_t::extended(empty, *stamped);
     if (check(view.has_value())) return failures + 1;
     delta_view_t found;
-    failures += check(view->find("blank", 5, found) && found.kind == delta_kind_t::write_k && found.bytes.empty());
+    failures += check(view->find("blank", 5, found) && found.kind == delta_kind_t::write_k &&
+                      found.bytes.size() == other_payload.size() &&
+                      std::memcmp(found.bytes.data(), other_payload.data(), other_payload.size()) == 0);
     failures += check(view->find("gone", 5, found) && found.kind == delta_kind_t::remove_k && found.bytes.empty());
     failures += check(view->find(empty_string, 5, found) && found.bytes.size() == payload.size());
+    failures += check(stamped->values_bytes() == deltas.size() * sizeof(ustore_key_t));
     failures += check(!view->find("blank", 4, found) && !view->find(std::string_view("blank\0", 6), 5, found));
     failures += check(view->written_since("gone", 4) && !view->written_since("gone", 5));
     failures += check(view->range_written_since("a", "blank", 4) && !view->range_written_since("c", "f", 4));
@@ -368,7 +379,7 @@ static std::size_t random_streams_match_model() {
 }
 
 /**
- *  @brief Merges the oldest four runs of the lowest generation holding four after every commit, as the owner's pass
+ *  @brief Merges the oldest four runs of the lowest tier holding four after every commit, as the owner's pass
  *      does, keeping versions for readers pinned at every 23rd stamp and above the stamp published at the merge.
  *
  *  A reader at a pinned stamp, or at or above the last merge's horizon, must read what the model holds at its stamp,
@@ -406,7 +417,7 @@ static std::size_t merges_keep_visible_versions() {
         std::size_t end = 0;
         for (; first != listed.size(); first = end) {
             end = first;
-            while (end != listed.size() && listed[end]->generation() == listed[first]->generation()) ++end;
+            while (end != listed.size() && listed[end]->tier() == listed[first]->tier()) ++end;
             if (end - first >= fan_in_k) break;
         }
         if (first != listed.size()) {
@@ -419,13 +430,13 @@ static std::size_t merges_keep_visible_versions() {
             utilities::local_arena_t folded;
             utilities::arena_allocator<byte_t> folded_bytes = folded.allocator();
             failures += check(
-                kept_versions(group, survival, utilities::last_write_fold {}, versions, folded_bytes).succeeded());
+                kept_versions(group, survival, utilities::last_write_fold_t {}, versions, folded_bytes).succeeded());
             expected<run_t> merged = run_t::merged(std::span<stamped_delta_t const> {versions},
-                                                   group.back()->oldest_stamp(), group.back()->generation());
+                                                   group.back()->oldest_stamp(), group.back()->tier());
             if (check(merged.has_value())) return failures + 1;
             std::size_t replaced = 0;
             for (run_t const* run : group) replaced += run->size();
-            failures += check(merged->generation() == group.back()->generation() + 1 &&
+            failures += check(merged->tier() == group.back()->tier() + 1 &&
                               merged->oldest_stamp() == group.back()->oldest_stamp() &&
                               merged->newest_stamp() == group.front()->newest_stamp() && merged->size() <= replaced);
             failures += run_is_ordered(*merged);
@@ -475,10 +486,10 @@ int main() {
     using namespace unum::ustore::test;
     std::size_t failed = 0, total = 0;
     auto counted = [&](char const* name, auto body) { run(name, body, failed), ++total; };
-    counted("strings_run.heads_order_as_strings", heads_order_as_strings);
-    counted("strings_run.refusals", refusals);
-    counted("strings_run.random_streams_match_model", random_streams_match_model);
-    counted("strings_run.merges_keep_visible_versions", merges_keep_visible_versions);
+    counted("strings_memory_run.heads_order_as_strings", heads_order_as_strings);
+    counted("strings_memory_run.refusals", refusals);
+    counted("strings_memory_run.random_streams_match_model", random_streams_match_model);
+    counted("strings_memory_run.merges_keep_visible_versions", merges_keep_visible_versions);
     fmt::println("total {} passed, {} failed", total - failed, failed);
     return failed ? 1 : 0;
 }

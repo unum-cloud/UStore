@@ -30,7 +30,7 @@
 
 #include <fmt/format.h> // `fmt::println`
 
-#include "ustore/graph/adjacency_fold.hpp" // `adjacency_fold`, `vertex_adjacency`, `half_edge_delta_t`
+#include "ustore/graph/adjacency_fold.hpp" // `adjacency_fold_t`, `vertex_adjacency_t`, `half_edge_delta_t`
 
 namespace unum::ustore::test {
 
@@ -219,7 +219,7 @@ static std::vector<delta_view_t> views_of(std::vector<bytes_t> const& chains) {
 /** The composition of @p views as bytes, or nothing on a refusal. */
 static bytes_t composed_bytes(std::span<delta_view_t const> views, test_arena_t& arena) {
     bytes_allocator_t allocator(&arena);
-    auto composed = adjacency_fold {}.compose(views, allocator);
+    auto composed = adjacency_fold_t {}.compose(views, allocator);
     return composed ? to_bytes(*composed) : bytes_t {};
 }
 
@@ -239,7 +239,7 @@ static expected<std::span<byte_t const>> pending_chain(stored_vertex_t const& ve
     if (vertex.pending.empty()) return std::span<byte_t const> {};
     bytes_allocator_t allocator(&arena);
     std::vector<delta_view_t> const views = views_of(vertex.pending);
-    return adjacency_fold {}.compose(views, allocator);
+    return adjacency_fold_t {}.compose(views, allocator);
 }
 
 /** Folds the pending chains of @p vertex into its value, as compaction does, which must equal @p model's value. */
@@ -248,7 +248,7 @@ static std::size_t fold_vertex(stored_vertex_t& vertex, model_adjacency_t const&
     test_arena_t arena;
     bytes_allocator_t allocator(&arena);
     std::vector<delta_view_t> const views = views_of(vertex.pending);
-    auto result = adjacency_fold {}.apply(vertex.value, views, allocator);
+    auto result = adjacency_fold_t {}.apply(vertex.value, views, allocator);
     failures += check_code(result.code(), status_code_t::success_k);
     if (!result) return failures;
     vertex.value = to_bytes(*result);
@@ -267,13 +267,13 @@ static std::size_t check_reads(stored_vertex_t const& vertex, model_adjacency_t 
     auto pending = pending_chain(vertex, arena);
     failures += check_code(pending.code(), status_code_t::success_k);
     if (!pending) return failures;
-    auto adjacency = vertex_adjacency::make(vertex.vertex, vertex.value, *pending);
+    auto adjacency = vertex_adjacency_t::make(vertex.vertex, vertex.value, *pending);
     failures += check_code(adjacency.code(), status_code_t::success_k);
     if (!adjacency) return failures;
 
     // The walk yields the records the fold would write, so they concatenate into the model's value
     bytes_t walked;
-    for (half_edge_cursor cursor = adjacency->half_edges(); cursor.valid(); cursor.next())
+    for (half_edge_cursor_t cursor = adjacency->half_edges(); cursor.valid(); cursor.next())
         walked.insert(walked.end(), cursor.record(), cursor.record() + half_edge_delta_bytes_k);
     failures += check(walked == value_of_model(model));
     std::size_t visited = 0;
@@ -329,7 +329,7 @@ static std::size_t check_reads(stored_vertex_t const& vertex, model_adjacency_t 
     auto other_pending = pending_chain(other, other_arena);
     failures += check(other_pending.has_value());
     if (!other_pending) return failures;
-    auto other_adjacency = vertex_adjacency::make(other.vertex, other.value, *other_pending);
+    auto other_adjacency = vertex_adjacency_t::make(other.vertex, other.value, *other_pending);
     failures += check(other_adjacency.has_value());
     if (!other_adjacency) return failures;
     std::set<model_key_t> first_neighbors, second_neighbors;
@@ -378,8 +378,9 @@ std::size_t codecs() {
     failures += check(check_delta(record).succeeded());
     save_delta(half_edge_delta_t::remove_vertex(), record);
     failures += check(check_delta(record).succeeded());
-    failures += check_code(delta_chain_view::make(std::span<byte_t const>(record, half_edge_delta_bytes_k - 1)).code(),
-                           status_code_t::malformed_k);
+    failures += check_code(
+        half_edge_deltas_view_t::make(std::span<byte_t const>(record, half_edge_delta_bytes_k - 1)).code(),
+        status_code_t::malformed_k);
 
     // A value out of order, with a repeated half-edge, or holding a removal is refused by the fold
     model_adjacency_t pair;
@@ -387,7 +388,7 @@ std::size_t codecs() {
     bytes_t const value = value_of_model(pair);
     test_arena_t arena;
     bytes_allocator_t allocator(&arena);
-    adjacency_fold const fold;
+    adjacency_fold_t const fold;
     failures += check(fold.apply(value, {}, allocator).has_value());
     bytes_t swapped(value.begin() + half_edge_delta_bytes_k, value.end());
     swapped.insert(swapped.end(), value.begin(), value.begin() + half_edge_delta_bytes_k);
@@ -398,7 +399,7 @@ std::size_t codecs() {
     bytes_t holding_removal = value;
     holding_removal[delta_operation_offset_k] = byte_t {1};
     failures += check_code(fold.apply(holding_removal, {}, allocator).code(), status_code_t::malformed_k);
-    failures += check_code(vertex_adjacency::make(pools.vertices[0], value, swapped).code(),
+    failures += check_code(vertex_adjacency_t::make(pools.vertices[0], value, swapped).code(),
                            status_code_t::malformed_k);
 
     // Edges file one half-edge per end, a directed loop two, and an undirected loop one
@@ -428,7 +429,7 @@ std::size_t compose_matches_sequential() {
     std::mt19937_64 generator(5);
     // Few enough half-edges that chains hit what the base holds
     key_pools_t const pools(generator, 3, 90);
-    adjacency_fold const fold;
+    adjacency_fold_t const fold;
     for (std::size_t round = 0; round != 1500; ++round) {
         model_adjacency_t base_model;
         std::size_t const base_size = round % 5 ? generator() % 80 : generator() % 700;
@@ -466,7 +467,7 @@ std::size_t compose_matches_sequential() {
 
         // A composed chain names each half-edge once, in order, after at most one leading removal of the vertex,
         // which it holds whenever a record it composed removed the vertex
-        auto chain = delta_chain_view::make(whole);
+        auto chain = half_edge_deltas_view_t::make(whole);
         failures += check(chain.has_value() && check_composed(*chain).succeeded());
         bool removes_vertex = false;
         for (bytes_t const& bytes : chains)
@@ -517,7 +518,7 @@ std::size_t compose_matches_sequential() {
             std::size_t const at = generator() % (mixed.size() + 1);
             mixed.insert(mixed.begin() + std::ptrdiff_t(at), delta_view_t {delta_kind_t::write_k, restart_value});
             for (std::size_t index = at + 1; index != mixed.size(); ++index) {
-                auto records = *delta_chain_view::make(mixed[index].bytes);
+                auto records = *half_edge_deltas_view_t::make(mixed[index].bytes);
                 for (std::size_t record = 0; record != records.size(); ++record) model_apply(restart, records[record]);
             }
             auto restarted = fold.apply(base, mixed, allocator);
@@ -535,7 +536,7 @@ std::size_t compose_shapes() {
     std::size_t failures = 0;
     std::mt19937_64 generator(9);
     key_pools_t const pools(generator, 2, 20);
-    adjacency_fold const fold;
+    adjacency_fold_t const fold;
     test_arena_t arena;
     bytes_allocator_t allocator(&arena);
     labeled_half_edge_t half_edge;
@@ -566,7 +567,7 @@ std::size_t compose_shapes() {
     bytes_t const base = value_of_model(base_model);
     auto cleared = fold.apply(base, std::span<delta_view_t const>(&composed_view, 1), allocator);
     failures += check(cleared.has_value() && cleared->empty());
-    auto reread = vertex_adjacency::make(pools.vertices[0], base, *closed);
+    auto reread = vertex_adjacency_t::make(pools.vertices[0], base, *closed);
     failures += check(reread.has_value() && reread->degree() == 0 && !reread->half_edges().valid());
 
     bytes_t const empty_chain;
@@ -673,7 +674,7 @@ std::size_t hub_vertex() {
                                            records.begin() + std::ptrdiff_t((part + 1) * half_edges / 4))));
     test_arena_t arena;
     bytes_allocator_t allocator(&arena);
-    adjacency_fold const fold;
+    adjacency_fold_t const fold;
     std::vector<delta_view_t> const views = views_of(chains);
     auto built = fold.apply({}, views, allocator);
     failures += check(built.has_value() && to_bytes(*built) == value_of_model(model));

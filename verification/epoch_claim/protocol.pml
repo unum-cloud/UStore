@@ -2,7 +2,7 @@
  *  @file verification/epoch_claim/protocol.pml
  *  @author Ash Vardanian
  *  @date October 20, 2026
- *  @brief Spin model of @c parking_claim_t in `include/ustore/blobs/nvme_database.hpp` as an epoch:
+ *  @brief Spin model of @c maintenance_claim in `include/ustore/blobs/nvme_database.hpp` as an epoch:
  *      one word, odd while held and even while free, taken by a @c fetch_or and stepped by its holder.
  *
  *  The claim orders a database's maintenance, catalog and blob writes. @c take_if_free is a
@@ -174,7 +174,7 @@ inline set_held(t, seen) {
 }
 
 /** The fence, then one @c fetch_or, which holds the claim if @p seen reads even:
- *  @c parking_claim_t::take_if_free. */
+ *  @c maintenance_claim::take_if_free. */
 inline take_if_free(t, seen) {
     if
     :: try_fence -> fence_seq_cst(t)
@@ -196,7 +196,7 @@ inline wait_until_changed(t, seen, now) {
 }
 
 /** The epoch read with an acquire, and while it reads held, a park until it moves:
- *  @c parking_claim_t::wait_until_released. */
+ *  @c maintenance_claim::wait_until_released. */
 inline wait_until_released(t, seen, now) {
     load(t, epoch, order_acquire, seen);
     if
@@ -255,7 +255,7 @@ inline take_announced(t, seen, now) {
 }
 
 /** The @c fetch_or, retried after a park on the odd value it read, or under @c handoff, once, and
- *  then announced: @c parking_claim_t::take. */
+ *  then announced: @c maintenance_claim::take. */
 inline take(t, seen, now) {
     if
     :: waiting == retried ->
@@ -333,7 +333,7 @@ inline hand_over(t) {
     }
 }
 
-/** @c parking_claim_t::release: under @c retried the epoch let go; under @c handoff the fenced
+/** @c maintenance_claim::release: under @c retried the epoch let go; under @c handoff the fenced
  *  scan and the handoff, else the epoch let go, the look, and on an announcement the claim taken
  *  back and scanned for again. */
 inline release(t) {

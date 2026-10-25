@@ -14,13 +14,11 @@
 #include <cstdint> // `std::uint64_t`
 
 #include <array>   // `std::array`
-#include <atomic>  // `std::atomic`
 #include <memory>  // `std::unique_ptr`
 #include <span>    // `std::span`
 #include <thread>  // `std::thread`
 #include <utility> // `std::move`
 
-#include <forkunion/capabilities.hpp>  // `fu::preferred_yield_t`
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
 #include "ustore/utilities/nvme_channels.hpp" // `buffer_pool_t`, `pooled_buffer_t`
@@ -58,7 +56,7 @@ struct channels_types {
     using guard_t = typename fixture_t::guard_t;
     using disk_t = typename fixture_t::disk_t;
     using read_pipeline_t = basic_read_pipeline<disk_t>;
-    using write_pipeline_t = basic_write_pipeline<disk_t, waiting_policy_t>;
+    using write_pipeline_t = basic_write_pipeline<disk_t, waiter_t>;
 };
 
 /** Writes a repeatable pattern of @p seed into @p buffer, so a read can be checked against it. */
@@ -232,57 +230,6 @@ std::size_t channels_refuse_beyond_their_spares(mount_type_ const& mount) {
     guards.clear();
     expected<guard_t> reclaimed = (*fixture)->channels.acquire();
     failures += expect(reclaimed.has_value());
-    return failures;
-}
-
-/**
- *  @brief Two strictly alternating threads each keep the shared channel they bound, and never share one.
- *
- *  Without affinity the second thread takes the first free shared channel, which the first thread just
- *  released, and on a ring that rebinds on a foreign adoption every acquire rebuilds that spare's
- *  ring; with it each thread finds its own spare free on every round after the first.
- */
-template <typename mount_type_>
-std::size_t spare_channel_stays_with_its_thread(mount_type_ const& mount) {
-    using types_t = channels_types<typename mount_type_::fixture_t>;
-    using fixture_t = typename types_t::fixture_t;
-    using guard_t = typename types_t::guard_t;
-    std::size_t failures = 0;
-    constexpr std::size_t spares_k = 4;
-    constexpr std::size_t rounds_k = 64;
-    fixture_config_t spared = mount.config;
-    spared.shared_io_channels = spares_k;
-    expected<std::unique_ptr<fixture_t>> fixture = mount(spared);
-    failures += expect_status(fixture, status_code_t::success_k);
-    if (!fixture) return failures;
-
-    std::atomic<std::size_t> turn {0};
-    std::array<std::array<queue_pair_id_t, rounds_k>, 2> seen {};
-    std::array<std::size_t, 2> thread_failures {};
-    auto alternate = [&](std::size_t self) noexcept {
-        for (std::size_t round = 0; round != rounds_k; ++round) {
-            for (std::size_t seen = turn.load(std::memory_order_acquire); seen % 2 != self;
-                 seen = turn.load(std::memory_order_acquire))
-                fu::preferred_yield_t {}(turn, seen, self);
-            {
-                expected<guard_t> guard = (*fixture)->channels.acquire();
-                thread_failures[self] += expect(guard.has_value());
-                if (guard) seen[self][round] = guard->channel().queue_pair().id();
-            }
-            turn.fetch_add(1, std::memory_order_release);
-        }
-    };
-    std::thread first {alternate, std::size_t {0}};
-    std::thread second {alternate, std::size_t {1}};
-    first.join();
-    second.join();
-    failures += thread_failures[0] + thread_failures[1];
-
-    for (std::size_t round = 1; round != rounds_k; ++round) {
-        failures += expect(seen[0][round] == seen[0][0]);
-        failures += expect(seen[1][round] == seen[1][0]);
-    }
-    failures += expect(seen[0][0] != seen[1][0]);
     return failures;
 }
 
@@ -502,7 +449,6 @@ int main(int argc, char const* argv[]) {
         report(totals, mount, "pool_recycles_exactly_once", pool_recycles_exactly_once);
         report(totals, mount, "separate_threads", channels_separate_executor_threads);
         report(totals, mount, "refuse_beyond_spares", channels_refuse_beyond_their_spares);
-        report(totals, mount, "spare_stays_with_thread", spare_channel_stays_with_its_thread);
         report(totals, mount, "pipeline_reads_back", pipeline_reads_back_what_it_wrote);
         report(totals, mount, "pipeline_holds_its_depth", pipeline_holds_its_depth);
         report(totals, mount, "pipeline_refuses_short_write", pipeline_refuses_a_short_write);

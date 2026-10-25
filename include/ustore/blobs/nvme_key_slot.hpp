@@ -5,9 +5,9 @@
  *  @brief The vocabulary of UStoreNVMe's LSM trees: identifiers and value layouts, the keys key slots are ordered
  *      by, stored values and their locations, key slots, and the sorted run index laid over them.
  *
- *  A key slot is a stored key with the size and location of its stored value, specialized per value layout, and what
- *  the record does sits in its run's kinds column beside the stamps, so no size or location means a removal. Keys
- *  carry their bounds through @c limit, and the 16-byte key is ordered like @c memcmp. The sorted run index is
+ *  A key slot is a stored key with the size and location of its stored value, specialized per value layout, and the
+ *  kind of its delta sits in its run's kinds column beside the stamps, so a remove delta needs no size or location.
+ *  Keys carry their bounds through @c limit, and the 16-byte key is ordered like @c memcmp. The sorted run index is
  *  the B-tree whose cells hold a sorted run's key slots, which both compactors lay out the same way.
  */
 
@@ -25,6 +25,7 @@
 #include <variant>     // `std::variant`, `std::visit`
 
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/row_layout.hpp>   // `st::key128_t`
 #include <smashtable/shared.hpp>       // `st::hash`
 
 #include "ustore/utilities/folds.hpp"     // `delta_kind_t`
@@ -143,6 +144,28 @@ enum class missing_locations_t : bool {
     keep_k,
 };
 
+/** What a lookup of one key found, named after the kind of the newest delta carrying it. */
+enum class lookup_result_t : std::uint8_t {
+
+    /** No delta carries the key. */
+    missing_k,
+
+    /** A write delta carries the whole value, or a fold completed it. */
+    written_k,
+
+    /** A remove delta carries the key, so it holds no value. */
+    removed_k,
+
+    /** A change delta carries the key, which older deltas complete. */
+    changed_k,
+
+    /** The medium moved fewer bytes than the delta claims, so this one key failed. */
+    incomplete_k,
+};
+
+/** Whether a run keeps the bytes of each key past its 16-byte head beside its key slots, as strings runs do. */
+enum class key_tails_t : bool { absent_k = false, carried_k = true };
+
 /** Whether files reach their destination as copies or leave their source. */
 enum class transfer_mode_t : bool {
 
@@ -153,7 +176,7 @@ enum class transfer_mode_t : bool {
     move_k,
 };
 
-/** How values of a collection are stored: inline values of a width, fixed-size or variable-size. */
+/** How values of a collection are stored: inline values of a width, fixed-size, variable-size, or one 16-byte key. */
 enum class value_layout_t : std::uint16_t {
     unknown_k = 0,
 
@@ -166,6 +189,9 @@ enum class value_layout_t : std::uint16_t {
 
     fixed_width_k,
     variable_width_k,
+
+    /** Every value is one 16-byte key, held in the key slot: the strings modality's layout. */
+    uuid_k,
 };
 
 /** Bit fields describing a sequence of values: completeness, ordering, sorting and tree shape. */
@@ -189,11 +215,12 @@ enum class data_structure_info_t : std::uint16_t {
 
 #pragma region Value Layouts
 
-/** Whether @p value_layout stores values of that width inside the key slot itself. */
+/** Whether @p value_layout stores values inside the key slot itself, of its width or as one 16-byte key. */
 constexpr bool is_inline(value_layout_t value_layout) noexcept {
     return value_layout == value_layout_t::inline_1_byte_k || value_layout == value_layout_t::inline_4_bytes_k ||
            value_layout == value_layout_t::inline_8_bytes_k || value_layout == value_layout_t::inline_16_bytes_k ||
-           value_layout == value_layout_t::inline_32_bytes_k || value_layout == value_layout_t::inline_64_bytes_k;
+           value_layout == value_layout_t::inline_32_bytes_k || value_layout == value_layout_t::inline_64_bytes_k ||
+           value_layout == value_layout_t::uuid_k;
 }
 
 /** Whether @p value_layout stores values of one width outside the key slot. */
@@ -227,49 +254,6 @@ constexpr value_layout_t resolve_value_layout(std::size_t value_size) noexcept {
 
 #pragma region Stored Key
 
-/**
- *  @brief A 16-byte key held as two words, each read big-endian from its eight bytes.
- *
- *  Comparing @c high and then @c low as unsigned words orders keys exactly as @c memcmp orders their bytes,
- *  so an integer identity below 2^64 keeps @c high zero and orders as its value.
- */
-struct uuid_stored_key_t {
-
-    /** The first eight bytes, read big-endian. */
-    std::uint64_t high = 0;
-
-    /** The last eight bytes, read big-endian. */
-    std::uint64_t low = 0;
-
-    /** Reads a key from the 16 bytes at @p bytes. */
-    static constexpr uuid_stored_key_t from_bytes(std::uint8_t const* bytes) noexcept {
-        uuid_stored_key_t key;
-        for (int index = 0; index != 8; ++index) {
-            key.high = (key.high << 8) | bytes[index];
-            key.low = (key.low << 8) | bytes[8 + index];
-        }
-        return key;
-    }
-
-    /** Writes the key's 16 bytes to @p bytes. */
-    constexpr void to_bytes(std::uint8_t* bytes) const noexcept {
-        for (int index = 0; index != 8; ++index) {
-            bytes[index] = static_cast<std::uint8_t>(high >> (56 - 8 * index));
-            bytes[8 + index] = static_cast<std::uint8_t>(low >> (56 - 8 * index));
-        }
-    }
-
-    /** Whether both keys hold the same 16 bytes. */
-    friend constexpr bool operator==(uuid_stored_key_t const& first, uuid_stored_key_t const& second) noexcept {
-        return (first.high == second.high) & (first.low == second.low);
-    }
-
-    /** Whether @p first orders before @p second, as @c memcmp orders their bytes. */
-    friend constexpr bool operator<(uuid_stored_key_t const& first, uuid_stored_key_t const& second) noexcept {
-        return (first.high < second.high) | ((first.high == second.high) & (first.low < second.low));
-    }
-};
-
 /** The least and the greatest value of a key type, one specialization per type. */
 template <typename value_type_>
 struct limit;
@@ -290,26 +274,15 @@ struct limit<value_type_> {
     static constexpr value_type_ max_k = std::numeric_limits<value_type_>::max();
 };
 
-/** Bounds of a 16-byte key: all bytes zero and all bytes one. */
+/** Bounds of a 16-byte key, whose two words order as @c memcmp orders its bytes: all bytes zero and all bytes one. */
 template <>
-struct limit<uuid_stored_key_t> {
+struct limit<st::key128_t> {
 
     /** The key of 16 zero bytes. */
-    static constexpr uuid_stored_key_t min() noexcept { return {0, 0}; }
+    static constexpr st::key128_t min() noexcept { return {0, 0}; }
 
     /** The key of 16 bytes with every bit set. */
-    static constexpr uuid_stored_key_t max() noexcept { return {~std::uint64_t {0}, ~std::uint64_t {0}}; }
-};
-
-/** Bounds of the C ABI's key: the nil key and the key of every bit set. */
-template <>
-struct limit<ustore_key_t> {
-
-    /** The nil key. */
-    static constexpr ustore_key_t min() noexcept { return utilities::smallest_key_k; }
-
-    /** The key of 16 bytes with every bit set. */
-    static constexpr ustore_key_t max() noexcept { return utilities::largest_key_k; }
+    static constexpr st::key128_t max() noexcept { return {~std::uint64_t {0}, ~std::uint64_t {0}}; }
 };
 
 /** Bounds of a composite key that names its own, through static @c min and @c max members. */
@@ -327,16 +300,12 @@ struct limit<value_type_> {
     static constexpr value_type_ max() noexcept { return value_type_::max(); }
 };
 
-/** Hashes a key a key slot carries: a 16-byte key by folding its two words, any other through SmashTable's own. */
+/** Hashes a key a key slot carries through SmashTable's own hash. */
 struct stored_key_hash_t {
     template <typename stored_key_type_>
     std::size_t operator()(stored_key_type_ const& key) const noexcept {
         return st::hash<stored_key_type_> {}(key);
     }
-    std::size_t operator()(uuid_stored_key_t const& key) const noexcept {
-        return st::hash<std::uint64_t> {}(key.high ^ (key.low * 0x9E3779B97F4A7C15ull));
-    }
-    std::size_t operator()(ustore_key_t const& key) const noexcept { return utilities::uuid_hash_t {}(key); }
 };
 
 /** A key a key slot carries: trivially copyable, ordered by @c < and @c ==, with bounds from @c limit. */
@@ -407,7 +376,7 @@ struct stored_value_location {
     /** Where the value starts inside its file. */
     stored_value_offset_t offset = 0;
 
-    /** What the record found there does, so a removal and an empty value differ by kind. */
+    /** The kind of the delta found there, so a removal and an empty value differ by kind. */
     delta_kind_t kind = delta_kind_t::write_k;
 
     /** Whether the location names a value, which an unknown layout never does. */
@@ -839,18 +808,18 @@ struct storage_limits_t {
     static constexpr std::size_t variable_value_min_size_k = 0;
     static constexpr std::size_t variable_value_max_size_k = 4 * 1024 * 1024;
     static constexpr std::size_t cache_limit_max_size_k = 100 * 1024 * 1024 * 1024ull;
-    static constexpr std::size_t write_buffer_min_capacity_k = 1024;
-    static constexpr std::size_t write_buffer_max_capacity_k = 1024 * 1024 * 1024ull;
-    static constexpr std::size_t write_buffer_elements_min_count_k = 16;
-    static constexpr std::size_t write_buffer_elements_max_count_k = 1024 * 1024;
-    static constexpr std::size_t transaction_write_buffer_min_capacity_k = 1;
-    static constexpr std::size_t transaction_write_buffer_max_capacity_k = write_buffer_max_capacity_k;
-    static constexpr std::size_t transaction_write_buffer_elements_min_count_k = 1;
-    static constexpr std::size_t transaction_write_buffer_elements_max_count_k = write_buffer_elements_max_count_k;
+    static constexpr std::size_t memory_runs_min_bytes_k = 1024;
+    static constexpr std::size_t memory_runs_max_bytes_k = 1024 * 1024 * 1024ull;
+    static constexpr std::size_t memory_runs_min_deltas_k = 16;
+    static constexpr std::size_t memory_runs_max_deltas_k = 1024 * 1024;
+    static constexpr std::size_t transaction_min_bytes_k = 1;
+    static constexpr std::size_t transaction_max_bytes_k = memory_runs_max_bytes_k;
+    static constexpr std::size_t transaction_min_deltas_k = 1;
+    static constexpr std::size_t transaction_max_deltas_k = memory_runs_max_deltas_k;
     static constexpr std::size_t level_min_enlarge_factor_k = 2;
     static constexpr std::size_t level_max_enlarge_factor_k = 64;
     static constexpr std::size_t sorted_run_file_max_size_k = 4 * 1024 * 1024 * 1024ull - 4096;
-    static constexpr std::size_t gpu_compaction_threshold_k = 900'000;
+    static constexpr std::size_t cuda_compaction_threshold_k = 900'000;
     static constexpr std::size_t value_max_size_k = std::max(fixed_value_max_size_k, variable_value_max_size_k);
     static constexpr std::size_t user_data_max_size_k = 4 * 1024 * 1024;
 };
@@ -859,7 +828,7 @@ struct storage_limits_t {
 
 #pragma region Key Slot
 
-template <typename stored_key_, value_layout_t value_layout_>
+template <typename stored_key_, value_layout_t value_layout_, key_tails_t key_tails_ = key_tails_t::absent_k>
 struct key_slot {
     using stored_key_t = stored_key_;
     static constexpr value_layout_t value_layout_k = value_layout_;
@@ -902,10 +871,11 @@ struct key_slot<stored_key_, value_layout_t::fixed_width_k> {
     constexpr bool operator<(stored_key_t other) const noexcept { return stored_key < other; }
 };
 
-template <typename stored_key_>
-struct key_slot<stored_key_, value_layout_t::variable_width_k> {
+template <typename stored_key_, key_tails_t key_tails_>
+struct key_slot<stored_key_, value_layout_t::variable_width_k, key_tails_> {
     using stored_key_t = stored_key_;
     static constexpr value_layout_t value_layout_k = value_layout_t::variable_width_k;
+    static constexpr bool carries_tails_k = key_tails_ == key_tails_t::carried_k;
 
     stored_key_t stored_key = limit<stored_key_t>::max();
     stored_value_size_t size = 0;
@@ -925,6 +895,26 @@ struct key_slot<stored_key_, value_layout_t::variable_width_k> {
     constexpr bool operator<(key_slot const& other) const noexcept { return stored_key < other.stored_key; }
     constexpr bool operator<(stored_key_t other) const noexcept { return stored_key < other; }
 };
+
+/** A key slot holding its 16-byte value inline, with no size, as every value has the same one. */
+template <typename stored_key_, key_tails_t key_tails_>
+struct key_slot<stored_key_, value_layout_t::uuid_k, key_tails_> {
+    using stored_key_t = stored_key_;
+    static constexpr value_layout_t value_layout_k = value_layout_t::uuid_k;
+    static constexpr bool carries_tails_k = key_tails_ == key_tails_t::carried_k;
+    static constexpr stored_value_size_t size = 16;
+
+    stored_key_t stored_key = limit<stored_key_t>::max();
+    byte_t data[size] {};
+
+    constexpr bool operator==(key_slot const& other) const noexcept { return stored_key == other.stored_key; }
+    constexpr bool operator==(stored_key_t other) const noexcept { return stored_key == other; }
+    constexpr bool operator<(key_slot const& other) const noexcept { return stored_key < other.stored_key; }
+    constexpr bool operator<(stored_key_t other) const noexcept { return stored_key < other; }
+};
+
+static_assert(sizeof(key_slot<st::key128_t, value_layout_t::uuid_k, key_tails_t::carried_k>) == 32,
+              "A strings cell is a 16-byte head and its 16-byte value");
 
 #pragma endregion Key Slot
 

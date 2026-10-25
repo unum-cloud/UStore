@@ -49,8 +49,8 @@ struct single_collection_database_initial_config_t {
     stored_value_size_t value_size = 0;
     stored_value_size_t value_max_size = 0;
     std::size_t cache_limit = 0;
-    std::size_t write_buffer_max_bytes = 0;
-    std::size_t write_buffer_max_elements = 0;
+    std::size_t memory_runs_max_bytes = 0;
+    std::size_t memory_runs_max_deltas = 0;
     std::size_t level_enlarge_factor = 0;
 };
 
@@ -86,13 +86,13 @@ std::shared_ptr<single_collection_database<stored_key_t, value_layout_>> open_si
 
     single_collection_database_config_t config;
 
-    config.default_transaction.write_buffer_max_bytes = initial_config.write_buffer_max_bytes;
-    config.default_transaction.write_buffer_max_elements = initial_config.write_buffer_max_elements;
+    config.default_transaction.max_bytes = initial_config.memory_runs_max_bytes;
+    config.default_transaction.max_deltas = initial_config.memory_runs_max_deltas;
 
     config.collection.concurrency_limit = 1;
     config.collection.cache_limit = initial_config.cache_limit;
-    config.collection.write_buffer_max_bytes = initial_config.write_buffer_max_bytes;
-    config.collection.write_buffer_max_elements = initial_config.write_buffer_max_elements;
+    config.collection.memory_runs_max_bytes = initial_config.memory_runs_max_bytes;
+    config.collection.memory_runs_max_deltas = initial_config.memory_runs_max_deltas;
 
     config.collection.lsm_tree.level_enlarge_factor = initial_config.level_enlarge_factor;
 
@@ -243,8 +243,7 @@ void insert(bm::State& state, single_collection_database_initial_config_t const&
         while (iterations) {
             state.PauseTiming();
             auto stored_key = atomic_increment_fetch(operations_count);
-            if ((operations_count % initial_config.write_buffer_max_elements) ==
-                initial_config.write_buffer_max_elements - 1)
+            if ((operations_count % initial_config.memory_runs_max_deltas) == initial_config.memory_runs_max_deltas - 1)
                 --stored_key;
             buffer_t stored_value;
             create_stored_value(initial_config.value_size, initial_config.value_max_size, stored_value);
@@ -1142,10 +1141,10 @@ void configure_bench_by_workloads(bench_config_t& bench_config, st::basic_vector
         bench_config.single_collection_database_1_byte.value_size = 1;
         bench_config.single_collection_database_1_byte.value_max_size = 0;
         bench_config.single_collection_database_1_byte.cache_limit = workload.get_value<std::size_t>("cache_limit");
-        bench_config.single_collection_database_1_byte.write_buffer_max_bytes = workload.get_value<std::size_t>(
-            "write_buffer_max_bytes");
-        bench_config.single_collection_database_1_byte.write_buffer_max_elements = workload.get_value<std::size_t>(
-            "write_buffer_max_elements");
+        bench_config.single_collection_database_1_byte.memory_runs_max_bytes = workload.get_value<std::size_t>(
+            "memory_runs_max_bytes");
+        bench_config.single_collection_database_1_byte.memory_runs_max_deltas = workload.get_value<std::size_t>(
+            "memory_runs_max_deltas");
         bench_config.single_collection_database_1_byte.level_enlarge_factor = workload.get_value<std::size_t>(
             "level_enlarge_factor");
     }
@@ -1159,10 +1158,10 @@ void configure_bench_by_workloads(bench_config_t& bench_config, st::basic_vector
         bench_config.single_collection_database_4_bytes.value_size = 4;
         bench_config.single_collection_database_4_bytes.value_max_size = 0;
         bench_config.single_collection_database_4_bytes.cache_limit = workload.get_value<std::size_t>("cache_limit");
-        bench_config.single_collection_database_4_bytes.write_buffer_max_bytes = workload.get_value<std::size_t>(
-            "write_buffer_max_bytes");
-        bench_config.single_collection_database_4_bytes.write_buffer_max_elements = workload.get_value<std::size_t>(
-            "write_buffer_max_elements");
+        bench_config.single_collection_database_4_bytes.memory_runs_max_bytes = workload.get_value<std::size_t>(
+            "memory_runs_max_bytes");
+        bench_config.single_collection_database_4_bytes.memory_runs_max_deltas = workload.get_value<std::size_t>(
+            "memory_runs_max_deltas");
         bench_config.single_collection_database_4_bytes.level_enlarge_factor = workload.get_value<std::size_t>(
             "level_enlarge_factor");
     }
@@ -1176,10 +1175,10 @@ void configure_bench_by_workloads(bench_config_t& bench_config, st::basic_vector
         bench_config.single_collection_database_8_bytes.value_size = 8;
         bench_config.single_collection_database_8_bytes.value_max_size = 0;
         bench_config.single_collection_database_8_bytes.cache_limit = workload.get_value<std::size_t>("cache_limit");
-        bench_config.single_collection_database_8_bytes.write_buffer_max_bytes = workload.get_value<std::size_t>(
-            "write_buffer_max_bytes");
-        bench_config.single_collection_database_8_bytes.write_buffer_max_elements = workload.get_value<std::size_t>(
-            "write_buffer_max_elements");
+        bench_config.single_collection_database_8_bytes.memory_runs_max_bytes = workload.get_value<std::size_t>(
+            "memory_runs_max_bytes");
+        bench_config.single_collection_database_8_bytes.memory_runs_max_deltas = workload.get_value<std::size_t>(
+            "memory_runs_max_deltas");
         bench_config.single_collection_database_8_bytes.level_enlarge_factor = workload.get_value<std::size_t>(
             "level_enlarge_factor");
     }
@@ -1193,10 +1192,10 @@ void configure_bench_by_workloads(bench_config_t& bench_config, st::basic_vector
         bench_config.single_collection_database_16_bytes.value_size = 16;
         bench_config.single_collection_database_16_bytes.value_max_size = 0;
         bench_config.single_collection_database_16_bytes.cache_limit = workload.get_value<std::size_t>("cache_limit");
-        bench_config.single_collection_database_16_bytes.write_buffer_max_bytes = workload.get_value<std::size_t>(
-            "write_buffer_max_bytes");
-        bench_config.single_collection_database_16_bytes.write_buffer_max_elements = workload.get_value<std::size_t>(
-            "write_buffer_max_elements");
+        bench_config.single_collection_database_16_bytes.memory_runs_max_bytes = workload.get_value<std::size_t>(
+            "memory_runs_max_bytes");
+        bench_config.single_collection_database_16_bytes.memory_runs_max_deltas = workload.get_value<std::size_t>(
+            "memory_runs_max_deltas");
         bench_config.single_collection_database_16_bytes.level_enlarge_factor = workload.get_value<std::size_t>(
             "level_enlarge_factor");
     }
@@ -1210,10 +1209,10 @@ void configure_bench_by_workloads(bench_config_t& bench_config, st::basic_vector
         bench_config.single_collection_database_32_bytes.value_size = 32;
         bench_config.single_collection_database_32_bytes.value_max_size = 0;
         bench_config.single_collection_database_32_bytes.cache_limit = workload.get_value<std::size_t>("cache_limit");
-        bench_config.single_collection_database_32_bytes.write_buffer_max_bytes = workload.get_value<std::size_t>(
-            "write_buffer_max_bytes");
-        bench_config.single_collection_database_32_bytes.write_buffer_max_elements = workload.get_value<std::size_t>(
-            "write_buffer_max_elements");
+        bench_config.single_collection_database_32_bytes.memory_runs_max_bytes = workload.get_value<std::size_t>(
+            "memory_runs_max_bytes");
+        bench_config.single_collection_database_32_bytes.memory_runs_max_deltas = workload.get_value<std::size_t>(
+            "memory_runs_max_deltas");
         bench_config.single_collection_database_32_bytes.level_enlarge_factor = workload.get_value<std::size_t>(
             "level_enlarge_factor");
     }
@@ -1227,10 +1226,10 @@ void configure_bench_by_workloads(bench_config_t& bench_config, st::basic_vector
         bench_config.single_collection_database_64_bytes.value_size = 64;
         bench_config.single_collection_database_64_bytes.value_max_size = 0;
         bench_config.single_collection_database_64_bytes.cache_limit = workload.get_value<std::size_t>("cache_limit");
-        bench_config.single_collection_database_64_bytes.write_buffer_max_bytes = workload.get_value<std::size_t>(
-            "write_buffer_max_bytes");
-        bench_config.single_collection_database_64_bytes.write_buffer_max_elements = workload.get_value<std::size_t>(
-            "write_buffer_max_elements");
+        bench_config.single_collection_database_64_bytes.memory_runs_max_bytes = workload.get_value<std::size_t>(
+            "memory_runs_max_bytes");
+        bench_config.single_collection_database_64_bytes.memory_runs_max_deltas = workload.get_value<std::size_t>(
+            "memory_runs_max_deltas");
         bench_config.single_collection_database_64_bytes.level_enlarge_factor = workload.get_value<std::size_t>(
             "level_enlarge_factor");
     }
@@ -1245,10 +1244,10 @@ void configure_bench_by_workloads(bench_config_t& bench_config, st::basic_vector
         bench_config.single_collection_database_fixed_width.value_max_size = 0;
         bench_config.single_collection_database_fixed_width.cache_limit = workload.get_value<std::size_t>(
             "cache_limit");
-        bench_config.single_collection_database_fixed_width.write_buffer_max_bytes = workload.get_value<std::size_t>(
-            "write_buffer_max_bytes");
-        bench_config.single_collection_database_fixed_width.write_buffer_max_elements = workload.get_value<std::size_t>(
-            "write_buffer_max_elements");
+        bench_config.single_collection_database_fixed_width.memory_runs_max_bytes = workload.get_value<std::size_t>(
+            "memory_runs_max_bytes");
+        bench_config.single_collection_database_fixed_width.memory_runs_max_deltas = workload.get_value<std::size_t>(
+            "memory_runs_max_deltas");
         bench_config.single_collection_database_fixed_width.level_enlarge_factor = workload.get_value<std::size_t>(
             "level_enlarge_factor");
     }
@@ -1265,10 +1264,10 @@ void configure_bench_by_workloads(bench_config_t& bench_config, st::basic_vector
             "value_max_size");
         bench_config.single_collection_database_variable_width.cache_limit = workload.get_value<std::size_t>(
             "cache_limit");
-        bench_config.single_collection_database_variable_width.write_buffer_max_bytes = workload.get_value<std::size_t>(
-            "write_buffer_max_bytes");
-        bench_config.single_collection_database_variable_width.write_buffer_max_elements =
-            workload.get_value<std::size_t>("write_buffer_max_elements");
+        bench_config.single_collection_database_variable_width.memory_runs_max_bytes = workload.get_value<std::size_t>(
+            "memory_runs_max_bytes");
+        bench_config.single_collection_database_variable_width.memory_runs_max_deltas = workload.get_value<std::size_t>(
+            "memory_runs_max_deltas");
         bench_config.single_collection_database_variable_width.level_enlarge_factor = workload.get_value<std::size_t>(
             "level_enlarge_factor");
     }

@@ -19,7 +19,7 @@
 #include <cub/version.cuh>
 #endif
 
-#include "ustore/blobs/nvme_compaction.hpp"        // `gpu_compactor_t`, `compaction_kind_t`, `compaction_output`
+#include "ustore/blobs/nvme_compaction.hpp"        // `cuda_compactor_t`, `compaction_kind_t`, `compaction_output`
 #include "ustore/utilities/vram_nvidia_device.hpp" // `cuda_stream_t`, `cuda_status`
 
 #if defined(__CUDACC__)
@@ -178,11 +178,11 @@ struct place_kernel {
 
 template <typename key_slot_type_, typename allocator_type_>
     requires compactable_key_slot_concept<key_slot_type_>
-st::status_t gpu_compactor_t::compact(compaction_kind_t kind,
-                                      std::span<sorted_run_index_view<key_slot_type_> const> upper,
-                                      std::span<sorted_run_index_view<key_slot_type_> const> lower,
-                                      sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps,
-                                      compaction_output<key_slot_type_, allocator_type_>& output) noexcept {
+st::status_t cuda_compactor_t::compact(compaction_kind_t kind,
+                                       std::span<sorted_run_index_view<key_slot_type_> const> upper,
+                                       std::span<sorted_run_index_view<key_slot_type_> const> lower,
+                                       sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps,
+                                       compaction_output<key_slot_type_, allocator_type_>& output) noexcept {
     using st::basic_vector;
     using st::expected;
     using st::status_t;

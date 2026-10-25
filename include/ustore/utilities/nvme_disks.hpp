@@ -23,7 +23,6 @@
 
 #pragma once
 
-#include <cassert> // `assert`
 #include <cerrno>  // `errno`
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint64_t`
@@ -41,14 +40,12 @@
 #include <sys/ioctl.h> // `ioctl`
 #endif
 
-#include <atomic>     // `std::memory_order`
-#include <bit>        // `std::has_single_bit`
-#include <concepts>   // `std::same_as`
-#include <functional> // `std::hash`
-#include <limits>     // `std::numeric_limits`
-#include <span>       // `std::span`
-#include <thread>     // `std::this_thread::get_id`
-#include <utility>    // `std::exchange`, `std::move`
+#include <atomic>   // `std::memory_order`
+#include <bit>      // `std::has_single_bit`
+#include <concepts> // `std::same_as`
+#include <limits>   // `std::numeric_limits`
+#include <span>     // `std::span`
+#include <utility>  // `std::exchange`, `std::move`
 
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
@@ -80,11 +77,6 @@ concept block_device_concept = requires(device_type_& device, device_type_ const
     { constant.capacity(index) } -> std::same_as<std::uint64_t>;
     { constant.capabilities() } -> std::same_as<ring_capabilities_t>;
 };
-
-/** Identifies the thread holding a queue pair, so a foreign bound thread trips an assertion and not a driver. */
-[[nodiscard]] inline thread_identity_t calling_thread_identity() noexcept {
-    return static_cast<std::uint64_t>(std::hash<std::thread::id> {}(std::this_thread::get_id()));
-}
 
 /** The thread index a caller outside every executor reads with, past any executor's threads, so it shares the
  *  channels and the epoch slots threads of no executor take. */
@@ -197,7 +189,6 @@ class basic_disk {
             slot.pending_count = 0;
             slot.ready_first = 0;
             slot.ready_count = 0;
-            slot.bound_thread = calling_thread_identity();
             return queue_pair_t::leased(static_cast<queue_pair_id_t>(index), slot.generation, depth);
         }
         return status_t {status_code_t::capacity_exhausted_k, "Every queue pair of this ring is already held"};
@@ -215,7 +206,6 @@ class basic_disk {
         if (!slot) return {status_code_t::invalid_argument_k, "The queue pair is not this ring's"};
         if (slot->pending_count != 0 || slot->ready_count != 0)
             return {status_code_t::invalid_argument_k, "Drain the queue pair before handing it over"};
-        slot->bound_thread = calling_thread_identity();
         return {};
     }
 
@@ -230,7 +220,6 @@ class basic_disk {
             return {status_code_t::invalid_argument_k, "Drain the queue pair before releasing it"};
         ++slot->generation;
         slot->depth = 0;
-        slot->bound_thread = 0;
         claim_(slot->leased).store(0, std::memory_order_release);
         queue_pair.surrender();
         return {};
@@ -346,7 +335,6 @@ class basic_disk {
     expected<std::size_t> submit(queue_pair_t const& queue_pair, std::span<request_t const> requests) noexcept {
         queue_pair_slot_t* const slot = slot_of_(queue_pair);
         if (!slot) return status_t {status_code_t::invalid_argument_k, "The queue pair is not this ring's"};
-        assert(slot->bound_thread == calling_thread_identity() && "Only the thread holding a queue pair submits on it");
         for (request_t const& request : requests)
             if (request.token.queue_pair() != queue_pair.id() || request.token.generation() != queue_pair.generation())
                 return status_t {status_code_t::invalid_argument_k, "A request carries another queue pair's token"};
@@ -372,7 +360,6 @@ class basic_disk {
     expected<std::size_t> poll_completions(queue_pair_t const& queue_pair, std::span<completion_t> into) noexcept {
         queue_pair_slot_t* const slot = slot_of_(queue_pair);
         if (!slot) return status_t {status_code_t::invalid_argument_k, "The queue pair is not this ring's"};
-        assert(slot->bound_thread == calling_thread_identity() && "Only the thread holding a queue pair polls on it");
         std::uint32_t const base = window_of_(queue_pair.id());
         perform_(*slot, base);
 
@@ -435,9 +422,6 @@ class basic_disk {
 
         /** Completions performed and not yet completed. */
         std::uint32_t ready_count = 0;
-
-        /** The thread that took the queue pair, which every submit and poll is checked against. */
-        thread_identity_t bound_thread = 0;
     };
 
     /** One pinned memory range, and the count of requests the device may still be writing into it. */

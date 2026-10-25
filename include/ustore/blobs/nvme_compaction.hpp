@@ -33,7 +33,7 @@
 #include <smashtable/shared.hpp>                 // `st::status_t`, `st::default_allocator`
 
 #include "ustore/blobs/nvme_key_slot.hpp"          // `limit`, `stored_key_concept`, `sorted_run_index_layout_t`
-#include "ustore/utilities/folds.hpp"              // `fold_concept`, `fold_pair`, `delta_kind_t`
+#include "ustore/utilities/folds.hpp"              // `fold_concept`, `fold_delta_pair`, `delta_kind_t`
 #include "ustore/utilities/ram_buffers.hpp"        // `local_arena_t`, `arena_allocator`
 #include "ustore/utilities/types.hpp"              // `round_up_to_multiple`
 #include "ustore/utilities/vram_nvidia_device.hpp" // `cuda_stream_t`
@@ -44,8 +44,8 @@ using utilities::delta_view_t;
 
 #pragma region Vocabulary
 
-/** A key slot shape compaction merges: trivially copyable, keyed by a stored key, and sized, with what each record
- *  does in its run's kinds column. */
+/** A key slot shape compaction merges: trivially copyable, keyed by a stored key, and sized, with the kind of each
+ *  delta in its run's kinds column. */
 template <typename key_slot_type_>
 concept compactable_key_slot_concept = std::is_trivially_copyable_v<key_slot_type_> &&
                                        stored_key_concept<typename key_slot_type_::stored_key_t> &&
@@ -55,6 +55,12 @@ concept compactable_key_slot_concept = std::is_trivially_copyable_v<key_slot_typ
                                            } -> std::convertible_to<typename key_slot_type_::stored_key_t>;
                                            { key_slot.size } -> std::convertible_to<std::uint64_t>;
                                        };
+
+/** A key slot shape recording the size of each stored value, which a shape holding one width for every value lacks. */
+template <typename key_slot_type_>
+concept sizes_stored_values_concept = requires(key_slot_type_& key_slot) {
+    key_slot.size = static_cast<stored_value_size_t>(0);
+};
 
 /** A key slot shape whose stored values live in its sorted run's stored values section, found by location. */
 template <typename key_slot_type_>
@@ -69,9 +75,9 @@ template <typename key_slot_type_>
 concept tailed_key_slot_concept = compactable_key_slot_concept<key_slot_type_> &&
                                   requires { requires key_slot_type_::carries_tails_k; };
 
-/** The tails of the keys a run's heads cut short, in sorted order: record @c i's tail is @c bytes from @c offsets[i]
- *  to @c offsets[i + 1], and a run of whole keys carries no offsets at all. */
-struct key_tails_t {
+/** The tails of the keys a run's heads cut short, in sorted order: key slot @c i's tail is @c bytes from
+ *  @c offsets[i] to @c offsets[i + 1], and a run of whole keys carries no offsets at all. */
+struct key_tails_column_t {
 
     /** One offset per key slot into @c bytes and one past the last, or none for a run of whole keys. */
     std::span<std::uint32_t const> offsets;
@@ -88,19 +94,19 @@ struct key_tails_t {
     }
 };
 
-/** Which LSM levels a compaction merges, fixing whether the upper LSM level overlaps and whether tombstones drop. */
+/** Which LSM levels a compaction merges, fixing whether the upper LSM level overlaps and whether remove deltas drop. */
 enum class compaction_kind_t : std::uint8_t {
 
-    /** Overlapping L0 sorted runs into an LSM level with LSM levels below it, keeping tombstones. */
+    /** Overlapping L0 sorted runs into an LSM level with LSM levels below it, keeping remove deltas. */
     overlapping_into_intermediate_k,
 
-    /** Overlapping L0 sorted runs into the bottom LSM level, dropping tombstones. */
+    /** Overlapping L0 sorted runs into the bottom LSM level, dropping remove deltas. */
     overlapping_into_bottom_k,
 
-    /** A sorted LSM level into the LSM level below it, which has LSM levels below it too, keeping tombstones. */
+    /** A sorted LSM level into the LSM level below it, which has LSM levels below it too, keeping remove deltas. */
     sorted_into_intermediate_k,
 
-    /** A sorted LSM level into the bottom LSM level, or into a new bottom LSM level, dropping tombstones. */
+    /** A sorted LSM level into the bottom LSM level, or into a new bottom LSM level, dropping remove deltas. */
     sorted_into_bottom_k,
 };
 
@@ -123,11 +129,11 @@ struct sorted_run_index_view {
     /** The stamp of every key slot in sorted order, or null for a run whose every stamp reads as zero. */
     stamps_column_t const* stamps = nullptr;
 
-    /** The kind of every key slot in sorted order, or null for a run whose every record is a write. */
+    /** The kind of every key slot in sorted order, or null for a run whose every delta is a write. */
     kinds_column_t const* kinds = nullptr;
 
     /** The tails of the keys the key slots' heads cut short, none for a run of whole keys. */
-    key_tails_t tails;
+    key_tails_column_t tails;
 };
 
 /** Whether @p kinds may hold a change, which only a fold's merge reads; a column packs from its least kind to its
@@ -266,7 +272,7 @@ struct located_key_slot {
     /** Index of its sorted run, counting the upper LSM level first and the lower LSM level after it. */
     std::uint32_t sorted_run = 0;
 
-    /** What the record does, in the bytes the stamp's alignment leaves. */
+    /** The kind of its delta, in the bytes the stamp's alignment leaves. */
     delta_kind_t kind = delta_kind_t::write_k;
 
     /** The stamp of the commit that wrote it. */
@@ -605,7 +611,7 @@ constexpr void merge_ranges(record_type_ const* source, std::uint64_t begin, std
 }
 
 /** Compacts LSM levels on the calling thread. */
-struct cpu_compactor_t {
+struct host_compactor_t {
 
     /**
      *  @brief Merges @p upper into @p lower as @p kind directs, writing the new sorted runs into @p output.
@@ -779,9 +785,9 @@ struct cpu_compactor_t {
             if (!head_folded)
                 if (status_t const read = value_of(head, newer); read != status_t::success_k) return read;
             if (status_t const read = value_of(current, older); read != status_t::success_k) return read;
-            auto [pair, fold_status] = utilities::fold_pair(fold, delta_view_t {delta_kind_t::change_k, newer},
-                                                            delta_view_t {located_of(current).kind, older},
-                                                            arena_bytes);
+            auto [pair, fold_status] = utilities::fold_delta_pair(fold, delta_view_t {delta_kind_t::change_k, newer},
+                                                                  delta_view_t {located_of(current).kind, older},
+                                                                  arena_bytes);
             if (fold_status.failed()) return fold_refusal_(fold_status);
             located_of(head).kind = pair.kind;
             head_bytes = pair.bytes;
@@ -808,7 +814,9 @@ struct cpu_compactor_t {
                 if (folded.bytes.size() > sizeof(key_slot.data)) return status_t::capacity_exhausted_k;
                 if (!folded.bytes.empty()) std::memcpy(key_slot.data, folded.bytes.data(), folded.bytes.size());
             }
-            key_slot.size = static_cast<decltype(key_slot.size)>(folded.bytes.size());
+            if constexpr (sizes_stored_values_concept<key_slot_type_>)
+                key_slot.size = static_cast<stored_value_size_t>(folded.bytes.size());
+            else if (folded.bytes.size() != key_slot_type_::size) return status_t::invalid_argument_k;
         }
 
         basic_vector<std::uint64_t> prefix;
@@ -923,17 +931,16 @@ struct cpu_compactor_t {
 
 #pragma region Device
 
-using utilities::cuda_count_devices;
 using utilities::cuda_stream_t;
 
 /** Compacts LSM levels on one CUDA device, queueing every transfer and kernel on a stream of its own. */
-class gpu_compactor_t {
+class cuda_compactor_t {
   public:
 
     /** Binds a compactor to device @p ordinal with a new stream, failing when no such device exists. */
-    static st::expected<gpu_compactor_t> make(int ordinal) noexcept;
+    static st::expected<cuda_compactor_t> make(int ordinal) noexcept;
 
-    /** Does what @c cpu_compactor_t::compact does with identical output for runs holding no change, refusing any that
+    /** Does what @c host_compactor_t::compact does with identical output for runs holding no change, refusing any that
      *  holds one with @c invalid_argument_k, and reports CUDA failures as statuses. */
     template <typename key_slot_type_, typename allocator_type_>
         requires compactable_key_slot_concept<key_slot_type_>
@@ -946,7 +953,7 @@ class gpu_compactor_t {
     int device() const noexcept { return stream_.device(); }
 
   private:
-    explicit gpu_compactor_t(cuda_stream_t&& stream) noexcept : stream_(std::move(stream)) {}
+    explicit cuda_compactor_t(cuda_stream_t&& stream) noexcept : stream_(std::move(stream)) {}
 
     /** The stream every transfer and kernel of the compactor queues on. */
     cuda_stream_t stream_;

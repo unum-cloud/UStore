@@ -64,13 +64,13 @@ struct database_types {
     using volume_t = typename fixture_t::volume_t;
     using router_t = basic_volume_router<volume_t>;
     template <value_layout_t value_layout_>
-    using store_of = collection<key_slot<stored_key_t, value_layout_>, volume_t, atomic_reference, waiting_policy_t>;
-    using database_t =
-        basic_database<stored_key_t, volume_t, atomic_reference, waiting_policy_t,
-                       store_of<value_layout_t::inline_1_byte_k>, store_of<value_layout_t::inline_4_bytes_k>,
-                       store_of<value_layout_t::inline_8_bytes_k>, store_of<value_layout_t::inline_16_bytes_k>,
-                       store_of<value_layout_t::inline_32_bytes_k>, store_of<value_layout_t::inline_64_bytes_k>,
-                       store_of<value_layout_t::fixed_width_k>, store_of<value_layout_t::variable_width_k>>;
+    using blobs_store_of = nvme_store<key_slot<stored_key_t, value_layout_>, volume_t, atomic_reference, waiter_t>;
+    using database_t = basic_database<
+        stored_key_t, volume_t, atomic_reference, waiter_t, blobs_store_of<value_layout_t::inline_1_byte_k>,
+        blobs_store_of<value_layout_t::inline_4_bytes_k>, blobs_store_of<value_layout_t::inline_8_bytes_k>,
+        blobs_store_of<value_layout_t::inline_16_bytes_k>, blobs_store_of<value_layout_t::inline_32_bytes_k>,
+        blobs_store_of<value_layout_t::inline_64_bytes_k>, blobs_store_of<value_layout_t::fixed_width_k>,
+        blobs_store_of<value_layout_t::variable_width_k>>;
     using transaction_t = typename database_t::transaction_t;
     using transaction_unique_ptr_t = typename database_t::transaction_unique_ptr_t;
 
@@ -155,8 +155,8 @@ using value_buffer_t = std::array<byte_t, variable_width_max_k>;
     collection_config_t config;
     config.concurrency_limit = 1;
     config.cache_limit = 1024ull * 1024ull;
-    config.write_buffer_max_bytes = 1024ull * 1024ull;
-    config.write_buffer_max_elements = 4096;
+    config.memory_runs_max_bytes = 1024ull * 1024ull;
+    config.memory_runs_max_deltas = 4096;
     config.lsm_tree.level_enlarge_factor = 4;
     config.lsm_tree.lsm_level_0.sorted_run.value_size = shape == shape_t::inline_k  ? 1
                                                         : shape == shape_t::fixed_k ? fixed_width_k
@@ -168,8 +168,8 @@ using value_buffer_t = std::array<byte_t, variable_width_max_k>;
 /** The transaction shape every case creates, which holds a whole case's writes. */
 [[nodiscard]] database_config_t test_database_config() noexcept {
     database_config_t config;
-    config.default_transaction.write_buffer_max_bytes = 16ull * 1024ull * 1024ull;
-    config.default_transaction.write_buffer_max_elements = 16384;
+    config.default_transaction.max_bytes = 16ull * 1024ull * 1024ull;
+    config.default_transaction.max_deltas = 16384;
     return config;
 }
 
@@ -274,7 +274,7 @@ template <typename database_type_>
 
     // One batch answers the same as the keys one at a time.
     st::basic_vector<stored_key_t> keys;
-    st::basic_vector<select_result_t> results;
+    st::basic_vector<lookup_result_t> results;
     st::basic_vector<std::size_t> arrived;
     failures += expect(keys.resize(population_k) == st::status_t::success_k);
     failures += expect(results.resize(population_k) == st::status_t::success_k);
@@ -289,15 +289,15 @@ template <typename database_type_>
         mismatches += mismatches_in(shape, keys[request], offset, bytes);
     };
     failures += expect(
-        store.select(named[shape], std::span<stored_key_t const> {keys}, std::span<select_result_t> {results}, sink)
+        store.select(named[shape], std::span<stored_key_t const> {keys}, std::span<lookup_result_t> {results}, sink)
             .succeeded());
     for (std::size_t index = 0; index != population_k; ++index) {
         stored_key_t const key = keys[index];
         if (!filter(key)) {
-            failures += expect(results[index] != select_result_t::success_k);
+            failures += expect(results[index] != lookup_result_t::written_k);
             continue;
         }
-        failures += expect(results[index] == select_result_t::success_k);
+        failures += expect(results[index] == lookup_result_t::written_k);
         failures += expect_eq(arrived[index], width_of(shape, key));
     }
     failures += expect_eq(mismatches, std::size_t {0});
@@ -866,8 +866,8 @@ std::size_t disjoint_bands_never_conflict(mount_type_ const& mount) {
     // Each transaction buffers its own band alone, so twenty of them fit the budget one whole case's shape takes.
     std::size_t const band_keys = population_k / bands_k;
     transaction_config_t band_shape;
-    band_shape.write_buffer_max_bytes = band_keys * fixed_width_k;
-    band_shape.write_buffer_max_elements = band_keys;
+    band_shape.max_bytes = band_keys * fixed_width_k;
+    band_shape.max_deltas = band_keys;
     std::array<transaction_unique_ptr_t, bands_k> transactions;
     for (std::size_t band = 0; band != bands_k; ++band) {
         expected<transaction_unique_ptr_t> created = store.create_transaction(band_shape);
@@ -980,7 +980,7 @@ std::size_t range_watches_catch_phantoms(mount_type_ const& mount) {
         (*walker)->insert(named[shape_t::inline_k], 0, value_of(shape_t::inline_k, 0, buffer)).succeeded());
     failures += expect((*walker)->commit().succeeded());
 
-    // An erasure inside the range is a commit landing there too.
+    // A removal inside the range is a commit landing there too.
     failures += expect(
         (*walker)->watch_range(named[shape_t::inline_k], stored_key_t {600}, stored_key_t {700}).succeeded());
     failures += expect(store.remove(named[shape_t::inline_k], 650).succeeded());

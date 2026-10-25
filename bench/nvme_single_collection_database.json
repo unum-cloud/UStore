@@ -4,8 +4,8 @@
     "threads": 1,
     "population_count": 100000,
     "cache_limit": 10000,
-    "write_buffer_max_elements": 10000,
-    "write_buffer_max_bytes": 410000,
+    "memory_runs_max_deltas": 10000,
+    "memory_runs_max_bytes": 410000,
     "level_enlarge_factor": 4
   },
   "4_bytes": {
@@ -13,8 +13,8 @@
     "threads": 1,
     "population_count": 100000,
     "cache_limit": 40000,
-    "write_buffer_max_elements": 10000,
-    "write_buffer_max_bytes": 440000,
+    "memory_runs_max_deltas": 10000,
+    "memory_runs_max_bytes": 440000,
     "level_enlarge_factor": 4
   },
   "8_bytes": {
@@ -22,8 +22,8 @@
     "threads": 1,
     "population_count": 100000,
     "cache_limit": 80000,
-    "write_buffer_max_elements": 10000,
-    "write_buffer_max_bytes": 480000,
+    "memory_runs_max_deltas": 10000,
+    "memory_runs_max_bytes": 480000,
     "level_enlarge_factor": 4
   },
   "16_bytes": {
@@ -31,8 +31,8 @@
     "threads": 1,
     "population_count": 100000,
     "cache_limit": 160000,
-    "write_buffer_max_elements": 10000,
-    "write_buffer_max_bytes": 560000,
+    "memory_runs_max_deltas": 10000,
+    "memory_runs_max_bytes": 560000,
     "level_enlarge_factor": 4
   },
   "32_bytes": {
@@ -40,8 +40,8 @@
     "threads": 1,
     "population_count": 100000,
     "cache_limit": 320000,
-    "write_buffer_max_elements": 10000,
-    "write_buffer_max_bytes": 720000,
+    "memory_runs_max_deltas": 10000,
+    "memory_runs_max_bytes": 720000,
     "level_enlarge_factor": 4
   },
   "64_bytes": {
@@ -49,8 +49,8 @@
     "threads": 1,
     "population_count": 100000,
     "cache_limit": 640000,
-    "write_buffer_max_elements": 10000,
-    "write_buffer_max_bytes": 1040000,
+    "memory_runs_max_deltas": 10000,
+    "memory_runs_max_bytes": 1040000,
     "level_enlarge_factor": 4
   },
   "fixed_width": {
@@ -59,8 +59,8 @@
     "population_count": 100000,
     "value_size": 1024,
     "cache_limit": 10000000,
-    "write_buffer_max_elements": 10000,
-    "write_buffer_max_bytes": 10240000,
+    "memory_runs_max_deltas": 10000,
+    "memory_runs_max_bytes": 10240000,
     "level_enlarge_factor": 4
   },
   "variable_width": {
@@ -69,8 +69,8 @@
     "population_count": 100000,
     "value_max_size": 2048,
     "cache_limit": 10000000,
-    "write_buffer_max_elements": 10000,
-    "write_buffer_max_bytes": 10240000,
+    "memory_runs_max_deltas": 10000,
+    "memory_runs_max_bytes": 10240000,
     "level_enlarge_factor": 4
   }
 }

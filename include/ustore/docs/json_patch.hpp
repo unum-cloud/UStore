@@ -25,7 +25,7 @@ namespace unum::ustore::docs {
 
 /** Modifications a request applies, extending @c ustore_docs_modification_t with reads. */
 enum class modification_t {
-    nothing_k = -1,
+    read_k = -1,
     upsert_k = ustore_docs_modify_upsert_k,
     update_k = ustore_docs_modify_update_k,
     insert_k = ustore_docs_modify_insert_k,

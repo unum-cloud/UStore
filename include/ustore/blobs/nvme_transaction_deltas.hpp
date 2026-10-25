@@ -19,10 +19,10 @@
 #include <smashtable/basic_hash_table.hpp> // `st::hash_map`, `st::assume_reserved`
 #include <smashtable/basic_vector.hpp>     // `st::basic_vector`
 
-#include "ustore/blobs/nvme_key_slot.hpp"     // `stored_value_size_t`, `transaction_stamp_t`, `collection_id_hash_t`
+#include "ustore/blobs/nvme_key_slot.hpp"     // `lookup_result_t`, `stored_value_size_t`, `transaction_stamp_t`
 #include "ustore/blobs/nvme_memory_run.hpp"   // `delta_view_t`
-#include "ustore/blobs/nvme_write_buffer.hpp" // `write_buffer_status_t`, `constrained_allocator`, `notifier`
-#include "ustore/utilities/folds.hpp"         // `fold_concept`, `fold_pair`, `delta_kind_t`
+#include "ustore/blobs/nvme_write_buffer.hpp" // `constrained_allocator`, `notifier`
+#include "ustore/utilities/folds.hpp"         // `fold_concept`, `fold_delta_pair`, `delta_kind_t`
 #include "ustore/utilities/ram_buffers.hpp"   // `local_arena_t`, `arena_allocator`
 #include "ustore/utilities/types.hpp"         // `status_t`, `status_code_t`, `byte_t`
 
@@ -34,7 +34,7 @@ namespace unum::ustore::blobs {
  *  @brief The uncommitted writes of one transaction, keyed by stored key inside each collection.
  *  @note Owned by one transaction and touched by its thread alone, so nothing here is atomic.
  */
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
 class grouped_write_buffer {
   public:
 #pragma region Types
@@ -121,7 +121,7 @@ class grouped_write_buffer {
 #pragma region Construction
 
     inline grouped_write_buffer(std::size_t capacity_bytes, std::size_t elements_max_count,
-                                resources_shared_ptr<atomic_reference_, waiting_policy_type_> resources) noexcept;
+                                resources_shared_ptr<atomic_reference_, waiter_type_> resources) noexcept;
 
     inline grouped_write_buffer(grouped_write_buffer const& other) = delete;
     inline grouped_write_buffer(grouped_write_buffer&& other) noexcept;
@@ -139,7 +139,7 @@ class grouped_write_buffer {
     template <typename callback_>
     inline void for_each_group(callback_&& callback) const noexcept;
 
-    inline write_buffer_status_t status(group_id_t id, stored_key_t stored_key) const noexcept;
+    inline lookup_result_t status(group_id_t id, stored_key_t stored_key) const noexcept;
 
     inline status_t stored_value_size(group_id_t id, stored_key_t stored_key, stored_value_size_t& size) const noexcept;
 
@@ -147,11 +147,11 @@ class grouped_write_buffer {
                            stored_value_size_t& size) const noexcept;
 
     template <typename stored_value_location_>
-    inline write_buffer_status_t find(group_id_t id, stored_key_t stored_key,
-                                      stored_value_location_& location) const noexcept;
+    inline lookup_result_t find(group_id_t id, stored_key_t stored_key,
+                                stored_value_location_& location) const noexcept;
     template <typename stored_value_location_>
     inline void select(stored_value_location_ const& location, stored_value_span_t stored_value,
-                       notifier<atomic_reference_, waiting_policy_type_> notifier) const noexcept;
+                       notifier<atomic_reference_, waiter_type_> notifier) const noexcept;
 
     /** Writes @p stored_value under @p stored_key of @p id, watched from @p watch_stamp, which only lowers the stamp
      *  an earlier write of the key took. */
@@ -165,7 +165,7 @@ class grouped_write_buffer {
     inline status_t mark_as_removed(group_id_t id, config_provider_ config_provider, stored_key_t stored_key,
                                     transaction_stamp_t watch_stamp = invalid_transaction_stamp_k) noexcept;
 
-    /** Writes @p change, a change record of @p fold, under @p stored_key of @p id, folded after whatever the buffer
+    /** Writes @p change, a change delta of @p fold, under @p stored_key of @p id, folded after whatever the buffer
      *  holds for the key, keeping that write's watch and taking none of its own. */
     template <typename config_provider_, utilities::fold_concept fold_type_>
     inline status_t add_change(group_id_t id, config_provider_ config_provider, stored_key_t stored_key,
@@ -192,7 +192,7 @@ class grouped_write_buffer {
                          missing_locations_t missing_locations = missing_locations_t::invalidate_k) const;
     template <typename stored_value_location_>
     inline void select(std::span<stored_value_location_ const> locations, bytes_span_t buffer,
-                       notifier<atomic_reference_, waiting_policy_type_> notifier) const;
+                       notifier<atomic_reference_, waiter_type_> notifier) const;
 
 #pragma endregion Batch Methods
 
@@ -219,7 +219,7 @@ class grouped_write_buffer {
 #pragma region Private Members
 
     /** The budget every share of the buffer is charged to. */
-    resources_shared_ptr<atomic_reference_, waiting_policy_type_> resources_;
+    resources_shared_ptr<atomic_reference_, waiter_type_> resources_;
 
     /** The bytes @c insertions_buffer holds. */
     std::size_t capacity_bytes_ = 0;
@@ -233,10 +233,10 @@ class grouped_write_buffer {
 #pragma endregion Private Members
 };
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
-inline grouped_write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::grouped_write_buffer(
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
+inline grouped_write_buffer<stored_key_, atomic_reference_, waiter_type_>::grouped_write_buffer(
     std::size_t capacity_bytes, std::size_t elements_max_count,
-    resources_shared_ptr<atomic_reference_, waiting_policy_type_> resources) noexcept
+    resources_shared_ptr<atomic_reference_, waiter_type_> resources) noexcept
     : groups_by_id({}, {}, constrained_allocator<std::byte, atomic_reference_> {resources->memory_constraint}),
       insertions_buffer(constrained_allocator<std::byte, atomic_reference_> {resources->memory_constraint}),
       next_inserted_offset(0), resources_(resources), capacity_bytes_(capacity_bytes),
@@ -245,18 +245,17 @@ inline grouped_write_buffer<stored_key_, atomic_reference_, waiting_policy_type_
     if (st::failed(insertions_buffer.resize(capacity_bytes))) capacity_bytes_ = 0;
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
-inline grouped_write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::grouped_write_buffer(
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
+inline grouped_write_buffer<stored_key_, atomic_reference_, waiter_type_>::grouped_write_buffer(
     grouped_write_buffer&& other) noexcept
     : groups_by_id(std::move(other.groups_by_id)), insertions_buffer(std::move(other.insertions_buffer)),
       next_inserted_offset(other.next_inserted_offset), resources_(std::move(other.resources_)),
       capacity_bytes_(other.capacity_bytes_), elements_max_count_(other.elements_max_count_),
       elements_count_(other.elements_count_) {}
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
-inline grouped_write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>&
-grouped_write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::operator=(
-    grouped_write_buffer&& other) noexcept {
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
+inline grouped_write_buffer<stored_key_, atomic_reference_, waiter_type_>&
+grouped_write_buffer<stored_key_, atomic_reference_, waiter_type_>::operator=(grouped_write_buffer&& other) noexcept {
     std::swap(groups_by_id, other.groups_by_id);
     std::swap(insertions_buffer, other.insertions_buffer);
     std::swap(next_inserted_offset, other.next_inserted_offset);
@@ -267,27 +266,27 @@ grouped_write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::oper
     return *this;
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
 template <typename callback_>
-inline void grouped_write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::for_each_group(
+inline void grouped_write_buffer<stored_key_, atomic_reference_, waiter_type_>::for_each_group(
     callback_&& callback) const noexcept {
     [[maybe_unused]] st::status_t const walked = groups_by_id.for_each([&](auto const& entry) noexcept {
         callback(group_info_t {entry.key(), entry.value().stored_values.size(), entry.value().elements_size_bytes});
     });
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
-inline write_buffer_status_t grouped_write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::status(
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
+inline lookup_result_t grouped_write_buffer<stored_key_, atomic_reference_, waiter_type_>::status(
     group_id_t id, stored_key_t stored_key) const noexcept {
 
-    auto result = write_buffer_status_t::mismatch_k;
+    auto result = lookup_result_t::missing_k;
     auto iterator = groups_by_id.find(id);
     if (iterator == groups_by_id.end()) return result;
 
     iterator.value().stored_values.probe_to_find(stored_key, [&result](auto const& entry) noexcept {
-        constexpr write_buffer_status_t results[2] = {
-            write_buffer_status_t::found_k,
-            write_buffer_status_t::removed_k,
+        constexpr lookup_result_t results[2] = {
+            lookup_result_t::written_k,
+            lookup_result_t::removed_k,
         };
         result = results[entry.value().kind == delta_kind_t::remove_k];
     });
@@ -295,8 +294,8 @@ inline write_buffer_status_t grouped_write_buffer<stored_key_, atomic_reference_
     return result;
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
-inline status_t grouped_write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::stored_value_size(
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
+inline status_t grouped_write_buffer<stored_key_, atomic_reference_, waiter_type_>::stored_value_size(
     group_id_t id, stored_key_t stored_key, stored_value_size_t& size) const noexcept {
 
     auto status = status_t {status_code_t::not_found_k, "Object not exists"};
@@ -311,8 +310,8 @@ inline status_t grouped_write_buffer<stored_key_, atomic_reference_, waiting_pol
     return status;
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
-inline status_t grouped_write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::select(
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
+inline status_t grouped_write_buffer<stored_key_, atomic_reference_, waiter_type_>::select(
     group_id_t id, stored_key_t stored_key, stored_value_span_t stored_value,
     stored_value_size_t& size) const noexcept {
 
@@ -345,9 +344,9 @@ inline status_t grouped_write_buffer<stored_key_, atomic_reference_, waiting_pol
     return status;
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
 template <typename stored_value_location_>
-inline write_buffer_status_t grouped_write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::find(
+inline lookup_result_t grouped_write_buffer<stored_key_, atomic_reference_, waiter_type_>::find(
     group_id_t id, stored_key_t stored_key, stored_value_location_& location) const noexcept {
 
     location.size_bytes = 0;
@@ -356,7 +355,7 @@ inline write_buffer_status_t grouped_write_buffer<stored_key_, atomic_reference_
     location.recipient_id = reinterpret_cast<std::uint64_t>(this);
     location.recipient_state_id = 0;
 
-    auto result = write_buffer_status_t::mismatch_k;
+    auto result = lookup_result_t::missing_k;
     auto iterator = groups_by_id.find(id);
     if (iterator == groups_by_id.end()) return result;
 
@@ -365,18 +364,18 @@ inline write_buffer_status_t grouped_write_buffer<stored_key_, atomic_reference_
         location.offset = stored_value_place.offset;
         location.size_bytes = stored_value_place.size;
         location.kind = stored_value_place.kind;
-        constexpr write_buffer_status_t results[2] = {write_buffer_status_t::found_k, write_buffer_status_t::removed_k};
+        constexpr lookup_result_t results[2] = {lookup_result_t::written_k, lookup_result_t::removed_k};
         result = results[location.kind == delta_kind_t::remove_k];
     });
 
     return result;
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
 template <typename stored_value_location_>
-inline void grouped_write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::select(
+inline void grouped_write_buffer<stored_key_, atomic_reference_, waiter_type_>::select(
     stored_value_location_ const& location, stored_value_span_t stored_value,
-    notifier<atomic_reference_, waiting_policy_type_> notifier) const noexcept {
+    notifier<atomic_reference_, waiter_type_> notifier) const noexcept {
 
     if (!location) {
         notifier.fail({status_code_t::invalid_argument_k, "A stored value location naming nothing"});
@@ -402,9 +401,9 @@ inline void grouped_write_buffer<stored_key_, atomic_reference_, waiting_policy_
     notifier.did_one();
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
 template <typename config_provider_>
-inline status_t grouped_write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::reach_group_(
+inline status_t grouped_write_buffer<stored_key_, atomic_reference_, waiter_type_>::reach_group_(
     group_id_t id, config_provider_ config_provider, group_t*& group) noexcept {
 
     auto iterator = groups_by_id.find(id);
@@ -429,9 +428,9 @@ inline status_t grouped_write_buffer<stored_key_, atomic_reference_, waiting_pol
     return status_t {};
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
 template <typename config_provider_>
-inline status_t grouped_write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::add(
+inline status_t grouped_write_buffer<stored_key_, atomic_reference_, waiter_type_>::add(
     group_id_t id, config_provider_ config_provider, stored_key_t stored_key, stored_value_view_t stored_value,
     transaction_stamp_t watch_stamp) noexcept {
 
@@ -478,9 +477,9 @@ inline status_t grouped_write_buffer<stored_key_, atomic_reference_, waiting_pol
     return status_t {};
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
 template <typename config_provider_>
-inline status_t grouped_write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::mark_as_removed(
+inline status_t grouped_write_buffer<stored_key_, atomic_reference_, waiter_type_>::mark_as_removed(
     group_id_t id, config_provider_ config_provider, stored_key_t stored_key,
     transaction_stamp_t watch_stamp) noexcept {
 
@@ -513,9 +512,9 @@ inline status_t grouped_write_buffer<stored_key_, atomic_reference_, waiting_pol
     return status_t {};
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
 template <typename config_provider_, utilities::fold_concept fold_type_>
-inline status_t grouped_write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::add_change(
+inline status_t grouped_write_buffer<stored_key_, atomic_reference_, waiter_type_>::add_change(
     group_id_t id, config_provider_ config_provider, stored_key_t stored_key, stored_value_view_t change,
     fold_type_ const& fold) noexcept {
 
@@ -526,7 +525,7 @@ inline status_t grouped_write_buffer<stored_key_, atomic_reference_, waiting_pol
     if (group->stored_values.reserve_more(1) == group_t::stored_values_t::reserve_result_t::failed_k)
         return status_t {status_code_t::out_of_memory_k, "No room for another key"};
 
-    // A change composes with a buffered change and applies to a buffered write or removal, so one record per key
+    // A change composes with a buffered change and applies to a buffered write or removal, so one delta per key
     // reaches the seal, and a lone one is composed too, so every buffered chain reads in the fold's own order
     utilities::local_arena_t scratch;
     utilities::arena_allocator<byte_t> arena = scratch.allocator();
@@ -535,7 +534,7 @@ inline status_t grouped_write_buffer<stored_key_, atomic_reference_, waiting_pol
     bool const held = delta(id, stored_key, older);
     delta_view_t folded {delta_kind_t::change_k, {}};
     if (held) {
-        auto [paired, pair_status] = utilities::fold_pair(fold, newer, older, arena);
+        auto [paired, pair_status] = utilities::fold_delta_pair(fold, newer, older, arena);
         if (pair_status.failed()) return pair_status;
         folded = paired;
     }
@@ -575,8 +574,8 @@ inline status_t grouped_write_buffer<stored_key_, atomic_reference_, waiting_pol
     return status_t {};
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
-inline bool grouped_write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::delta(
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
+inline bool grouped_write_buffer<stored_key_, atomic_reference_, waiter_type_>::delta(
     group_id_t id, stored_key_t stored_key, delta_view_t& held) const noexcept {
     auto iterator = groups_by_id.find(id);
     if (iterator == groups_by_id.end()) return false;
@@ -590,8 +589,8 @@ inline bool grouped_write_buffer<stored_key_, atomic_reference_, waiting_policy_
     return found;
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
-inline void grouped_write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::rescope_watches(
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
+inline void grouped_write_buffer<stored_key_, atomic_reference_, waiter_type_>::rescope_watches(
     transaction_stamp_t watch_stamp) noexcept {
     [[maybe_unused]] st::status_t const walked = groups_by_id.for_each([&](auto& group) noexcept {
         [[maybe_unused]] st::status_t const rescoped = group.value_ref().stored_values.for_each(
@@ -602,9 +601,9 @@ inline void grouped_write_buffer<stored_key_, atomic_reference_, waiting_policy_
     });
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
 template <typename callback_>
-inline void grouped_write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::for_each_write(
+inline void grouped_write_buffer<stored_key_, atomic_reference_, waiter_type_>::for_each_write(
     callback_&& callback) const noexcept {
     [[maybe_unused]] st::status_t const walked = groups_by_id.for_each([&](auto const& group) noexcept {
         [[maybe_unused]] st::status_t const listed = group.value().stored_values.for_each(
@@ -612,9 +611,9 @@ inline void grouped_write_buffer<stored_key_, atomic_reference_, waiting_policy_
     });
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
 template <typename stored_value_location_>
-inline status_t grouped_write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::find(
+inline status_t grouped_write_buffer<stored_key_, atomic_reference_, waiter_type_>::find(
     group_id_t id, std::span<stored_key_t const> stored_keys, std::span<stored_value_location_> locations,
     missing_locations_t missing_locations) const {
 
@@ -628,17 +627,17 @@ inline status_t grouped_write_buffer<stored_key_, atomic_reference_, waiting_pol
         for (std::size_t index = 0; index < stored_keys.size(); ++index) {
             stored_value_location_ location;
             auto const found = find<stored_value_location_>(id, stored_keys[index], location);
-            if (found != write_buffer_status_t::mismatch_k) locations[index] = location;
+            if (found != lookup_result_t::missing_k) locations[index] = location;
         }
 
     return status_t {};
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
 template <typename stored_value_location_>
-inline void grouped_write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::select(
+inline void grouped_write_buffer<stored_key_, atomic_reference_, waiter_type_>::select(
     std::span<stored_value_location_ const> locations, bytes_span_t buffer,
-    notifier<atomic_reference_, waiting_policy_type_> notifier) const {
+    notifier<atomic_reference_, waiter_type_> notifier) const {
 
     for (std::size_t index = 0, offset = 0; (index < locations.size()) & !notifier.has_failed(); ++index) {
         auto const& location = locations[index];
@@ -654,8 +653,8 @@ inline void grouped_write_buffer<stored_key_, atomic_reference_, waiting_policy_
     }
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
-inline status_t grouped_write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::check_stored_value(
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
+inline status_t grouped_write_buffer<stored_key_, atomic_reference_, waiter_type_>::check_stored_value(
     group_config_t const& config, stored_key_t stored_key, stored_value_size_t stored_value_size) const noexcept {
 
     bool valid_key = stored_key != limit<stored_key_t>::max();
@@ -665,8 +664,8 @@ inline status_t grouped_write_buffer<stored_key_, atomic_reference_, waiting_pol
     return valid ? status_t {} : status_t {status_code_t::malformed_k, "Invalid stored value"};
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
-inline bool grouped_write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::can_fit(
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
+inline bool grouped_write_buffer<stored_key_, atomic_reference_, waiter_type_>::can_fit(
     std::size_t stored_values_count, std::size_t stored_values_sum_size) const noexcept {
 
     auto used_memory = next_inserted_offset;
@@ -677,8 +676,8 @@ inline bool grouped_write_buffer<stored_key_, atomic_reference_, waiting_policy_
     return has_element_place & has_enough_space;
 }
 
-template <typename stored_key_, template <typename> typename atomic_reference_, typename waiting_policy_type_>
-inline void grouped_write_buffer<stored_key_, atomic_reference_, waiting_policy_type_>::clear() noexcept {
+template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
+inline void grouped_write_buffer<stored_key_, atomic_reference_, waiter_type_>::clear() noexcept {
     groups_by_id.clear();
     next_inserted_offset = 0;
     elements_count_ = 0;

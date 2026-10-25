@@ -22,11 +22,24 @@
 
 #include "ustore/utilities/types.hpp" // `status_t`, `expected`
 
-#include "ustore/utilities/nvme_disks.hpp" // `blocking_files_disk_t`
+#include "ustore/utilities/nvme_disks.hpp"            // `blocking_files_disk_t`
+#include "ustore/utilities/nvme_linux_aio_disk.hpp"   // `linux_aio_files_disk`
+#include "ustore/utilities/nvme_linux_spdk_disk.hpp"  // `linux_spdk_disk`
+#include "ustore/utilities/nvme_linux_uring_disk.hpp" // `linux_uring_files_disk`
+#include "ustore/utilities/nvme_volume.hpp"           // `any_files_disk`
 
 #include "nvme/ring_cases.hpp" // `ring_cases`, `ring_fails_a_misaligned_request`
 
 namespace unum::ustore::test {
+
+static_assert(ring_concept<linux_spdk_disk<atomic_reference, waiter_t>>,
+              "The SPDK transport is a ring like every other");
+static_assert(ring_concept<linux_uring_files_disk<atomic_reference, waiter_t>>,
+              "The io_uring transport is a ring like every other");
+static_assert(ring_concept<linux_aio_files_disk<atomic_reference, waiter_t>>,
+              "The Linux AIO transport is a ring like every other");
+static_assert(ring_concept<any_files_disk<atomic_reference, waiter_t>>,
+              "Any file transport is a ring like every other");
 
 /** Mounts the RAM transport and runs the suite on it, with and without demanded alignment. */
 void memory_transport(suite_totals_t& totals) {

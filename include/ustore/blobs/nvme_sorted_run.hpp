@@ -9,9 +9,9 @@
  *  because a namespace has no page cache to map through and a mapped read cannot report a short
  *  transfer, which is exactly what a truncated run looks like.
  *
- *  The sections are disjoint, so the write path needs no ordering between them: it stages the header,
+ *  The sections are disjoint, so the write path needs no ordering between them: it queues the header,
  *  the cells, the values, the tails and the trailer of stamps, kinds and tail offsets into one reservation,
- *  polls them all, flushes once, and only then asks the volume to record the name. A record's kind tells a
+ *  polls them all, flushes once, and only then asks the volume to record the name. A delta's kind tells a
  *  removal, an empty value and a fold's change apart, so no size or location carries a sentinel.
  *
  *  A cell holds a fixed-width key, which for a string is its 16-byte head, so the bytes of every string past
@@ -70,22 +70,6 @@ using utilities::request_tag_t;
 using utilities::volume_blob_t;
 
 #pragma region Vocabulary
-
-/** What a lookup found, which separates a missing key from one whose value was erased. */
-enum class find_result_t : std::uint8_t {
-
-    /** No key slot of the run carries that key. */
-    nothing_k,
-
-    /** A key slot carries that key and erases its value. */
-    stored_key_k,
-
-    /** A key slot carries that key and locates its value. */
-    success_k,
-
-    /** A key slot carries that key and a change of its value, which the versions below it complete. */
-    changed_k,
-};
 
 /** The word the first eight bytes of a sorted run carry. */
 inline constexpr std::uint64_t sorted_run_magic_k = magic_of("USTORERN");
@@ -296,9 +280,9 @@ inline expected<kinds_column_t> pack_kinds(std::span<std::uint8_t const> kinds) 
  *  moves bytes takes the channel the calling thread holds, since a queue pair belongs to one thread while it
  *  is held and a run outlives every thread that ever reads it.
  *
- *  @tparam waiting_policy_type_ What the core does while it waits for an index read or a barrier.
+ *  @tparam waiter_type_ What the core does while it waits for an index read or a barrier.
  */
-template <typename key_slot_type_, typename volume_type_, typename waiting_policy_type_>
+template <typename key_slot_type_, typename volume_type_, typename waiter_type_>
 class lsm_sorted_run {
   public:
 
@@ -323,7 +307,7 @@ class lsm_sorted_run {
     using read_pipeline_t = basic_read_pipeline<disk_t>;
 
     /** The pipeline the write path stages its three sections through. */
-    using write_pipeline_t = basic_write_pipeline<disk_t, waiting_policy_type_>;
+    using write_pipeline_t = basic_write_pipeline<disk_t, waiter_type_>;
 
     /** How the values of this run are stored. */
     static constexpr value_layout_t value_layout_k = key_slot_t::value_layout_k;
@@ -386,7 +370,7 @@ class lsm_sorted_run {
     /**
      *  @brief Writes a whole run into a fresh reservation of @p volume and records it under @p content_id.
      *  @param[inout] volume The volume the blob is reserved on, borrowed and outliving the run.
-     *  @param[inout] channel The channel the sections are staged on, held by the calling thread.
+     *  @param[inout] channel The channel the sections are queued on, held by the calling thread.
      *  @param[in] content_id The identifier the run is named by, which must name no blob yet.
      *  @param[in] key_slots The key slots in ascending order of their keys, the versions of one key newest first, which
      *      the index is laid from.
@@ -403,7 +387,7 @@ class lsm_sorted_run {
                                           std::span<key_slot_t const> key_slots, std::span<std::uint64_t const> stamps,
                                           std::span<std::uint8_t const> kinds, std::uint64_t floor,
                                           std::span<byte_t const> stored_values, stored_value_size_t value_max_size,
-                                          key_tails_t const& tails = {}) noexcept {
+                                          key_tails_column_t const& tails = {}) noexcept {
         if (!content_id.is_valid())
             return status_t {status_code_t::invalid_argument_k, "A run is named by a valid identifier"};
         if (holds_values_inline_k && !stored_values.empty())
@@ -511,6 +495,9 @@ class lsm_sorted_run {
     /** Bytes the run's blob takes on its volume. */
     [[nodiscard]] std::uint64_t size_bytes() const noexcept { return blob_.extent.length; }
 
+    /** The header the run was written or opened with, which records the width of its cells and its value layout. */
+    [[nodiscard]] sorted_run_header_t const& header() const noexcept { return header_; }
+
     /** The blob the run occupies, which a router or a backup moves by. */
     [[nodiscard]] volume_blob_t const& blob() const noexcept { return blob_; }
 
@@ -555,8 +542,8 @@ class lsm_sorted_run {
     [[nodiscard]] std::string_view tail(std::uint64_t position) const noexcept { return tails().at(position); }
 
     /** The tails of every key in sorted order, which a compaction reads in place, none for a run of whole keys. */
-    [[nodiscard]] key_tails_t tails() const noexcept {
-        return key_tails_t {std::span<std::uint32_t const> {tail_offsets_}, std::span<byte_t const> {tails_}};
+    [[nodiscard]] key_tails_column_t tails() const noexcept {
+        return key_tails_column_t {std::span<std::uint32_t const> {tail_offsets_}, std::span<byte_t const> {tails_}};
     }
 
     /** The least key the run holds, or the greatest key of the type for an empty run. */
@@ -594,23 +581,23 @@ class lsm_sorted_run {
      *  @param[in] stored_key The key to look for.
      *  @param[out] position Where the key sits, or @c population_count when the run holds no such key.
      */
-    [[nodiscard]] find_result_t find(stored_key_t stored_key, std::uint64_t& position) const noexcept {
+    [[nodiscard]] lookup_result_t find(stored_key_t stored_key, std::uint64_t& position) const noexcept {
         position = position_of(stored_key);
-        if (position == header_.key_slots_count) return find_result_t::nothing_k;
+        if (position == header_.key_slots_count) return lookup_result_t::missing_k;
         return result_at_(position);
     }
 
     /** As @c find, answering the newest version of @p stored_key stamped at or below @p at, which is what a reader
      *  pinned at @p at sees; the versions of one key sit newest first. */
-    [[nodiscard]] find_result_t find(stored_key_t stored_key, std::uint64_t at,
-                                     std::uint64_t& position) const noexcept {
+    [[nodiscard]] lookup_result_t find(stored_key_t stored_key, std::uint64_t at,
+                                       std::uint64_t& position) const noexcept {
         position = position_of(stored_key);
         while (position != header_.key_slots_count && stamp(position) > at) {
             ++position;
             if (position != header_.key_slots_count && !(key_slot(position).stored_key == stored_key))
                 position = header_.key_slots_count;
         }
-        if (position == header_.key_slots_count) return find_result_t::nothing_k;
+        if (position == header_.key_slots_count) return lookup_result_t::missing_k;
         return result_at_(position);
     }
 
@@ -717,11 +704,11 @@ class lsm_sorted_run {
 #pragma region Private Methods
 
     /** What the key slot at @p position answers a lookup by its kind. */
-    [[nodiscard]] find_result_t result_at_(std::uint64_t position) const noexcept {
+    [[nodiscard]] lookup_result_t result_at_(std::uint64_t position) const noexcept {
         switch (kind(position)) {
-        case delta_kind_t::remove_k: return find_result_t::stored_key_k;
-        case delta_kind_t::change_k: return find_result_t::changed_k;
-        default: return find_result_t::success_k;
+        case delta_kind_t::remove_k: return lookup_result_t::removed_k;
+        case delta_kind_t::change_k: return lookup_result_t::changed_k;
+        default: return lookup_result_t::written_k;
         }
     }
 
@@ -806,11 +793,11 @@ class lsm_sorted_run {
             std::uint64_t const at = section_offset + written;
             std::uint64_t const inside = at % sizeof(key_slot_t);
             std::uint64_t const sorted = layout.cell_to_sorted(at / sizeof(key_slot_t));
-            key_slot_t const staged = sorted < key_slots.size() ? key_slots[static_cast<std::size_t>(sorted)]
-                                                                : key_slot_t {};
+            key_slot_t const cell = sorted < key_slots.size() ? key_slots[static_cast<std::size_t>(sorted)]
+                                                              : key_slot_t {};
             std::uint64_t const room = sizeof(key_slot_t) - inside;
             std::uint64_t const chunk = room < bytes.size() - written ? room : bytes.size() - written;
-            std::memcpy(bytes.data() + written, reinterpret_cast<byte_t const*>(&staged) + inside,
+            std::memcpy(bytes.data() + written, reinterpret_cast<byte_t const*>(&cell) + inside,
                         static_cast<std::size_t>(chunk));
             written += chunk;
         }
@@ -818,7 +805,7 @@ class lsm_sorted_run {
 
     /** Refuses @p tails unless they are none, or one offset per one of @p key_slots_count key slots and one past the
      *  last, ascending from zero to the bytes they locate. */
-    static status_t check_tails_(key_tails_t const& tails, std::size_t key_slots_count) noexcept {
+    static status_t check_tails_(key_tails_column_t const& tails, std::size_t key_slots_count) noexcept {
         if (tails.offsets.empty()) {
             if (!tails.bytes.empty()) return {status_code_t::invalid_argument_k, "Tails come with their offsets"};
             return {};
@@ -833,7 +820,8 @@ class lsm_sorted_run {
     }
 
     /** How the key of key slot @p index of @p key_slots orders against the one before it: by head, then by tail. */
-    static int key_order_(std::span<key_slot_t const> key_slots, key_tails_t const& tails, std::size_t index) noexcept {
+    static int key_order_(std::span<key_slot_t const> key_slots, key_tails_column_t const& tails,
+                          std::size_t index) noexcept {
         if (key_slots[index].stored_key < key_slots[index - 1].stored_key) return -1;
         if (key_slots[index - 1].stored_key < key_slots[index].stored_key) return 1;
         return tails.at(index).compare(tails.at(index - 1));
@@ -849,11 +837,11 @@ class lsm_sorted_run {
             if (block_bytes == 0) return {status_code_t::capacity_exhausted_k, "A channel's block holds no page"};
             std::uint64_t const room = section - written;
             std::uint64_t const chunk = block_bytes < room ? block_bytes : room;
-            std::span<byte_t> const staged = block.bytes().first(static_cast<std::size_t>(chunk));
+            std::span<byte_t> const payload = block.bytes().first(static_cast<std::size_t>(chunk));
             std::uint64_t const left = bytes.size() > written ? bytes.size() - written : 0;
             std::uint64_t const carried = left < chunk ? left : chunk;
-            if (carried != 0) std::memcpy(staged.data(), bytes.data() + written, static_cast<std::size_t>(carried));
-            std::memset(staged.data() + carried, 0, static_cast<std::size_t>(chunk - carried));
+            if (carried != 0) std::memcpy(payload.data(), bytes.data() + written, static_cast<std::size_t>(carried));
+            std::memset(payload.data() + carried, 0, static_cast<std::size_t>(chunk - carried));
             if (status_t const queued = writer.enqueue_write(std::move(block), blob.slice(offset + written, chunk));
                 queued.failed())
                 return queued;
@@ -868,7 +856,7 @@ class lsm_sorted_run {
     static status_t write_sections_(volume_type_& volume, io_channel_t& channel, volume_blob_t const& blob,
                                     sorted_run_header_t const& header, std::span<key_slot_t const> key_slots,
                                     stamps_column_t const& column, kinds_column_t const& kinds,
-                                    std::span<byte_t const> stored_values, key_tails_t const& tails,
+                                    std::span<byte_t const> stored_values, key_tails_column_t const& tails,
                                     std::uint64_t block_bytes) noexcept {
         write_pipeline_t writer {volume.disk(), channel, blob.medium};
         sorted_run_index_layout_t const layout {header.key_slots_count, header.branching};
@@ -1025,7 +1013,7 @@ class lsm_sorted_run {
                                                                  std::span<request_t const> {batch});
             if (submit_status.failed()) return submit_status;
             if (taken != 1) return {status_code_t::io_k, "The ring would not take an index read"};
-            auto [completed, poll_completions_status] = poll_completions_at_least<waiting_policy_type_>(
+            auto [completed, poll_completions_status] = poll_completions_at_least<waiter_type_>(
                 volume_->disk(), channel.queue_pair(), channel.completion_buffer(), 1);
             if (poll_completions_status.failed()) return poll_completions_status;
             if (completed == 0) return {status_code_t::io_k, "An index read never completed"};
@@ -1149,7 +1137,7 @@ class lsm_sorted_run {
         if (!kinds_column)
             return kinds_column.status() == st::status_t::out_of_memory_heap_k
                        ? status_t {status_code_t::out_of_memory_k, "A run could not hold its kinds"}
-                       : status_t {status_code_t::malformed_k, "A run carries a kind no record has"};
+                       : status_t {status_code_t::malformed_k, "A run carries a kind no delta has"};
         kinds_ = std::move(*kinds_column);
 
         if (offsets_bytes == 0) return {};

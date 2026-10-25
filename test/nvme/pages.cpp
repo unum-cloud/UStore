@@ -5,8 +5,8 @@
  *  @brief The pages store of the NVMe engine through the C ABI, checked against the in-memory engine: transactions
  *      editing one page side by side, and random edits read through merges, flushes, compactions and a reopen.
  *
- *  Edits of a pages collection append change records rather than rewrite the page, so two transactions editing one
- *  page both commit, and the records fold into the page wherever they lie. The in-memory engine rewrites the page on
+ *  Edits of a pages collection append change deltas rather than rewrite the page, so two transactions editing one
+ *  page both commit, and the deltas fold into the page wherever they lie. The in-memory engine rewrites the page on
  *  every call, so the two engines meet only in what a read renders, which every case compares.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
@@ -43,8 +43,9 @@ constexpr std::size_t checkpoint_calls_k = 500;
 /** Calls between two compactions, each flushing the memory runs first. */
 constexpr std::size_t flush_calls_k = 100;
 
-/** Bytes every collection of the maintenance case buffers before it flushes, small enough to flush many times. */
-constexpr std::size_t small_write_buffer_bytes_k = 64 * 1024;
+/** Bytes of memory runs every collection of the maintenance case holds before it flushes, small enough to flush many
+ *  times. */
+constexpr std::size_t small_memory_runs_bytes_k = 64 * 1024;
 
 /** What a read of a missing page renders. */
 constexpr std::string_view page_absent_k = "<absent>";
@@ -61,9 +62,9 @@ expected<database_t> open_small_nvme(char const* directory) noexcept {
     open.database = &database;
     open.outcome = &outcome;
     open.directory = {reinterpret_cast<ustore_byte_t const*>(directory), std::strlen(directory)};
-    open.collection_write_buffer_max_bytes = small_write_buffer_bytes_k;
-    open.collection_value_max_size = small_write_buffer_bytes_k / 4;
-    open.transaction_max_bytes = small_write_buffer_bytes_k / 2;
+    open.collection_memory_runs_max_bytes = small_memory_runs_bytes_k;
+    open.collection_value_max_size = small_memory_runs_bytes_k / 4;
+    open.transaction_max_bytes = small_memory_runs_bytes_k / 2;
     open.collection_level_enlarge_factor = 2;
     ustore_database_open_nvme(&open);
     if (status_t const status {outcome}; status.failed()) return status;

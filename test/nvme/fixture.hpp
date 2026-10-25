@@ -32,14 +32,13 @@
 #include <forkunion/atomics.hpp>       // `fu::standard_atomic_ref`
 #include <forkunion/types.hpp>         // `fu::standard_yield_t`
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
-#include <smashtable/shared.hpp>       // `st::standard_waiting_policy`
 
 #include "ustore/utilities/nvme_disks.hpp"            // `blocking_files_disk`, `file_buffering_t`
 #include "ustore/utilities/nvme_linux_aio_disk.hpp"   // `linux_aio_files_disk`, `linux_aio_probe_t`
 #include "ustore/utilities/nvme_linux_uring_disk.hpp" // `linux_uring_files_disk`, `linux_uring_probe_t`
 
 #include "ustore/utilities/nvme_channels.hpp" // `registered_memory_arena`, `memory_arena_config_t`
-#include "ustore/blobs/nvme_store.hpp"        // `select_result_t`, `commit_ledger`, `stamp_pin`
+#include "ustore/blobs/nvme_store.hpp"        // `lookup_result_t`, `commit_ledger`, `stamp_pin`
 #include "ustore/utilities/nvme_volume.hpp"   // `shared_resources`, `resources_shared_ptr`
 
 #include "harness.hpp" // `describe`, `expect_status`, `suite_totals_t`
@@ -56,20 +55,20 @@ using namespace unum::ustore::utilities;
 template <typename value_type_>
 using atomic_reference = fu::standard_atomic_ref<value_type_>;
 
-/** The waiting policy every suite instantiates the engine's templates with, yielding between attempts. */
-using waiting_policy_t = st::standard_waiting_policy<fu::standard_yield_t>;
+/** The waiter every suite instantiates the engine's templates with, yielding between attempts. */
+using waiter_t = fu::standard_yield_t;
 
 using memory_disk_t = memory_disk<atomic_reference>;
 using blocking_files_disk_t = blocking_files_disk<atomic_reference>;
-using linux_uring_files_disk_t = linux_uring_files_disk<atomic_reference, waiting_policy_t>;
-using linux_aio_files_disk_t = linux_aio_files_disk<atomic_reference, waiting_policy_t>;
+using linux_uring_files_disk_t = linux_uring_files_disk<atomic_reference, waiter_t>;
+using linux_aio_files_disk_t = linux_aio_files_disk<atomic_reference, waiter_t>;
 using resource_constraint_t = resource_constraint<atomic_reference>;
 using registered_memory_arena_t = registered_memory_arena<atomic_reference>;
-using resources_t = shared_resources<atomic_reference, waiting_policy_t>;
-using resources_shared_ptr_t = resources_shared_ptr<atomic_reference, waiting_policy_t>;
-using commit_ledger_t = commit_ledger<atomic_reference, waiting_policy_t>;
-using stamp_pin_t = stamp_pin<atomic_reference, waiting_policy_t>;
-using countdown_t = countdown<atomic_reference, waiting_policy_t>;
+using resources_t = shared_resources<atomic_reference, waiter_t>;
+using resources_shared_ptr_t = resources_shared_ptr<atomic_reference, waiter_t>;
+using commit_ledger_t = commit_ledger<atomic_reference, waiter_t>;
+using stamp_pin_t = stamp_pin<atomic_reference, waiter_t>;
+using countdown_t = countdown<atomic_reference, waiter_t>;
 
 #pragma endregion Instantiation
 
@@ -380,7 +379,7 @@ template <typename disk_type_>
 struct basic_fixture {
 
     using disk_t = disk_type_;
-    using volume_t = basic_extent_volume<disk_type_, waiting_policy_t>;
+    using volume_t = basic_extent_volume<disk_type_, waiter_t>;
     using channel_pool_t = basic_io_channel_pool<disk_type_, atomic_reference>;
     using guard_t = typename channel_pool_t::guard_t;
 
@@ -480,7 +479,7 @@ expected<disk_type_> open_disk(fixture_config_t const& config, std::size_t media
 template <typename disk_type_>
 status_t blank_head(disk_type_& disk, io_channel_t& channel, medium_reference_t medium,
                     std::uint64_t page_bytes) noexcept {
-    basic_write_pipeline<disk_type_, waiting_policy_t> writer {disk, channel, medium};
+    basic_write_pipeline<disk_type_, waiter_t> writer {disk, channel, medium};
     auto [block, acquire_buffer_status] = writer.acquire_buffer();
     if (acquire_buffer_status.failed()) return acquire_buffer_status;
     if (block.size() < page_bytes)
@@ -743,9 +742,9 @@ struct expectation_t {
     std::uint64_t stored_key = 0;
 
     /** What a lookup of that key should answer. */
-    select_result_t state = select_result_t::nothing_k;
+    lookup_result_t state = lookup_result_t::missing_k;
 
-    /** Bytes the value should hold, which is zero for an erased or a present but empty value. */
+    /** Bytes the value should hold, which is zero for a removed or a present but empty value. */
     std::uint64_t bytes = 0;
 
     /** The seed the value's bytes are painted from. */

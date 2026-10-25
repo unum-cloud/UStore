@@ -73,20 +73,26 @@ struct fixture_t {
     [[nodiscard]] bool ready() const noexcept { return database && strings != ustore_collection_main_k; }
 };
 
-/** Counts one failure when the value of @p text is not @p wanted. */
+/** Counts one failure when the collection lacks @p text or maps it onto another key than @p wanted. */
 [[nodiscard]] std::size_t expect_value(strings_collection_t& strings, std::string_view text,
-                                       std::string_view wanted) noexcept {
+                                       ustore_key_t wanted) noexcept {
+    auto maybe_present = strings.present(text);
+    if (!maybe_present) return expect(maybe_present.has_value());
+    if (!*maybe_present) return expect(*maybe_present);
     auto maybe_value = strings.value(text);
     if (!maybe_value) return expect(maybe_value.has_value());
-    if (!*maybe_value) return expect(static_cast<bool>(*maybe_value));
-    return expect_eq(std::string_view {*maybe_value}, wanted);
+    return expect_eq(*maybe_value, wanted);
 }
 
-/** Counts one failure when the collection still holds @p text. */
+/** Counts one failure when the collection still holds @p text, or a read of it answers another key than the nil
+ *  UUID. */
 [[nodiscard]] std::size_t expect_missing(strings_collection_t& strings, std::string_view text) noexcept {
     auto maybe_present = strings.present(text);
     if (!maybe_present) return expect(maybe_present.has_value());
-    return expect(!*maybe_present);
+    if (*maybe_present) return expect(!*maybe_present);
+    auto maybe_value = strings.value(text);
+    if (!maybe_value) return expect(maybe_value.has_value());
+    return expect_eq(*maybe_value, ustore_key_t {});
 }
 
 /** Counts one failure when a walk of @p prefix is not exactly @p wanted, in that order. */
@@ -114,7 +120,8 @@ std::size_t strings_collection_prefix_walk(config_t const& config) {
     if (!fixture.ready()) return failures + 1;
 
     std::array<value_view_t, 4> const texts {"user:2", "team:1", "user:10", "user:1"};
-    std::array<value_view_t, 4> const values {"second", "team", "tenth", "first"};
+    std::array<ustore_key_t, 4> const values {key_from_integer(2), key_from_integer(100), key_from_integer(10),
+                                              key_from_integer(1)};
     failures += expect(fixture.strings.assign(texts, values).succeeded());
 
     std::array<std::string_view, 3> const users {"user:1", "user:10", "user:2"};
@@ -127,15 +134,14 @@ std::size_t strings_collection_prefix_walk(config_t const& config) {
     std::array<std::string_view, 0> const absent {};
     failures += expect_walk(fixture.strings, "missing", absent);
 
-    // A batch read exports every value into the arena it is given, behind one offset more than the strings
+    // A batch read exports the key of every string into the arena it is given
     auto [arena, arena_status] = arena_t::make();
     if (arena_status.failed()) return failures + expect(arena_status.succeeded());
     auto maybe_values = fixture.strings.read(texts, arena);
     if (!maybe_values) return failures + expect(maybe_values.has_value());
-    values_view_t const read = *maybe_values;
+    keys_view_t const read = *maybe_values;
     failures += expect_eq(read.size(), texts.size());
-    for (std::size_t index = 0; index != texts.size(); ++index)
-        failures += expect_eq(std::string_view {read[index]}, std::string_view {values[index]});
+    for (std::size_t index = 0; index != texts.size(); ++index) failures += expect_eq(read[index], values[index]);
 
     // A batch removes the strings a batch wrote
     failures += expect(fixture.strings.remove(texts).succeeded());
@@ -151,7 +157,7 @@ std::size_t strings_collection_paged_walk(config_t const& config) {
     if (!fixture.ready()) return failures + 1;
 
     std::array<value_view_t, 3> const texts {"page:a", "page:b", "page:c"};
-    std::array<value_view_t, 3> const values {"1", "2", "3"};
+    std::array<ustore_key_t, 3> const values {key_from_integer(1), key_from_integer(2), key_from_integer(3)};
     failures += expect(fixture.strings.assign(texts, values).succeeded());
 
     auto [first_arena, first_arena_status] = arena_t::make();
@@ -183,8 +189,8 @@ std::size_t strings_collection_paged_walk(config_t const& config) {
     return failures;
 }
 
-/** What a case expects a strings collection to hold: every string it wrote and did not remove, with its last value. */
-using strings_model_t = std::map<std::string, std::string>;
+/** What a case expects a strings collection to hold: every string it wrote and did not remove, with its last key. */
+using strings_model_t = std::map<std::string, ustore_key_t>;
 
 /** Counts the failures of reading every string of @p texts out of @p strings as @p model holds it, and of walking the
  *  strings @p model holds under @p prefix. */
@@ -222,9 +228,8 @@ std::size_t strings_collection_survives_maintenance(config_t const& config) {
         if (!fixture.ready()) return failures + 1;
         // Every string a commit of its own, so the memory runs merge generation after generation
         for (std::size_t index = 0; index != texts.size(); ++index) {
-            std::string const value = fmt::format("first-{}", index);
-            failures += expect(
-                fixture.strings.assign(std::string_view {texts[index]}, std::string_view {value}).succeeded());
+            ustore_key_t const value = key_from_integer(index + 1);
+            failures += expect(fixture.strings.assign(std::string_view {texts[index]}, value).succeeded());
             model[texts[index]] = value;
         }
         failures += expect_model(fixture.strings, texts, model, shared_k);
@@ -233,9 +238,8 @@ std::size_t strings_collection_survives_maintenance(config_t const& config) {
         // and its removal land on different levels before a compaction merges them
         for (std::size_t round = 0; round != 9 && failures == 0; ++round) {
             for (std::size_t index = round; index < texts.size(); index += 3) {
-                std::string const value = fmt::format("round-{}-{}", round, index);
-                failures += expect(
-                    fixture.strings.assign(std::string_view {texts[index]}, std::string_view {value}).succeeded());
+                ustore_key_t const value = key_from_integer((round + 1) * texts.size() + index + 1);
+                failures += expect(fixture.strings.assign(std::string_view {texts[index]}, value).succeeded());
                 model[texts[index]] = value;
             }
             for (std::size_t index = round; index < texts.size(); index += 7) {
@@ -255,8 +259,9 @@ std::size_t strings_collection_survives_maintenance(config_t const& config) {
     auto maybe_strings = database.find<strings_collection_t>(fixture_t::name_k);
     if (!maybe_strings) return failures + expect(maybe_strings.has_value());
     failures += expect_model(*maybe_strings, texts, model, shared_k);
-    failures += expect(maybe_strings->assign(std::string_view {texts[1]}, "reopened").succeeded());
-    model[texts[1]] = "reopened";
+    constexpr ustore_key_t reopened_k = key_from_integer(1'000'000);
+    failures += expect(maybe_strings->assign(std::string_view {texts[1]}, reopened_k).succeeded());
+    model[texts[1]] = reopened_k;
     failures += expect_model(*maybe_strings, texts, model, "");
 
     // A clear walks the strings window by window, removing every one of them
@@ -276,10 +281,11 @@ std::size_t strings_collection_in_transaction(config_t const& config) {
 
     auto maybe_inside = maybe_transaction->find<strings_collection_t>(fixture_t::name_k);
     if (!maybe_inside) return failures + expect(maybe_inside.has_value());
-    failures += expect(maybe_inside->assign("staged", "value").succeeded());
+    constexpr ustore_key_t staged_k = key_from_integer(1);
+    failures += expect(maybe_inside->assign("staged", staged_k).succeeded());
     failures += expect_missing(fixture.strings, "staged");
     failures += expect(maybe_transaction->commit().has_value());
-    failures += expect_value(fixture.strings, "staged", "value");
+    failures += expect_value(fixture.strings, "staged", staged_k);
     return failures;
 }
 

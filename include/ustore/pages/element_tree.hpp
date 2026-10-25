@@ -390,13 +390,13 @@ class element_tree {
 
   private:
     template <typename value_type_>
-    using rebound_t = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
+    using rebound = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
 
     allocator_t allocator_;
-    st::basic_vector<element_t, rebound_t<element_t>> elements_;
-    st::basic_vector<attribute_t, rebound_t<attribute_t>> attributes_;
-    st::basic_vector<char, rebound_t<char>> strings_;
-    st::basic_vector<element_index_t, rebound_t<element_index_t>> slots_;
+    st::basic_vector<element_t, rebound<element_t>> elements_;
+    st::basic_vector<attribute_t, rebound<attribute_t>> attributes_;
+    st::basic_vector<char, rebound<char>> strings_;
+    st::basic_vector<element_index_t, rebound<element_index_t>> slots_;
     std::size_t indexed_ = 0;
     std::size_t live_ = 0;
 
@@ -419,7 +419,7 @@ class element_tree {
 
     status_t grow_index() noexcept {
         std::size_t capacity = slots_.size() ? slots_.size() * 2 : 16;
-        st::basic_vector<element_index_t, rebound_t<element_index_t>> old {rebound_t<element_index_t>(allocator_)};
+        st::basic_vector<element_index_t, rebound<element_index_t>> old {rebound<element_index_t>(allocator_)};
         if (status_t status = growth_status(old.swap(slots_)); status.failed()) return status;
         if (status_t status = growth_status(slots_.resize(capacity, no_element_k)); status.failed()) return status;
         for (element_index_t index : old)
@@ -472,9 +472,8 @@ class element_tree {
 
   public:
     explicit element_tree(allocator_t allocator = {}) noexcept
-        : allocator_(allocator), elements_(rebound_t<element_t>(allocator)),
-          attributes_(rebound_t<attribute_t>(allocator)), strings_(rebound_t<char>(allocator)),
-          slots_(rebound_t<element_index_t>(allocator)) {}
+        : allocator_(allocator), elements_(rebound<element_t>(allocator)), attributes_(rebound<attribute_t>(allocator)),
+          strings_(rebound<char>(allocator)), slots_(rebound<element_index_t>(allocator)) {}
 
     element_tree(element_tree&&) noexcept = default;
     element_tree& operator=(element_tree&&) noexcept = default;
@@ -681,7 +680,7 @@ class element_tree {
         if (collides(fragment)) return {status_code_t::already_exists_k, "A fragment key is taken"};
         element_index_t const top = fragment.root();
         // The copy of every fragment element's parent is the copy linked last at the depth above it
-        st::basic_vector<element_index_t, rebound_t<element_index_t>> copies {rebound_t<element_index_t>(allocator_)};
+        st::basic_vector<element_index_t, rebound<element_index_t>> copies {rebound<element_index_t>(allocator_)};
         if (status_t status = growth_status(copies.resize(fragment.capacity(), no_element_k)); status.failed())
             return status;
         copies[top] = parent;
@@ -751,8 +750,8 @@ class element_tree {
             element_key_t key;
             std::uint32_t position;
         };
-        st::basic_vector<directed_t, rebound_t<directed_t>> entries {rebound_t<directed_t>(allocator_)};
-        st::basic_vector<std::uint32_t, rebound_t<std::uint32_t>> open {rebound_t<std::uint32_t>(allocator_)};
+        st::basic_vector<directed_t, rebound<directed_t>> entries {rebound<directed_t>(allocator_)};
+        st::basic_vector<std::uint32_t, rebound<std::uint32_t>> open {rebound<std::uint32_t>(allocator_)};
         if (status_t status = growth_status(entries.reserve(count)); status.failed()) return status;
         if (status_t status = growth_status(open.reserve(count)); status.failed()) return status;
 
@@ -848,7 +847,7 @@ class element_tree {
             element_index_t index;
             std::uint32_t end;
         };
-        st::basic_vector<open_t, rebound_t<open_t>> open {rebound_t<open_t>(allocator_)};
+        st::basic_vector<open_t, rebound<open_t>> open {rebound<open_t>(allocator_)};
         if (status_t status = growth_status(open.reserve(view.size())); status.failed()) return status;
         (void)open.push_back(st::assume_reserved, open_t {0, top.subtree_size});
         auto copy_attributes = [&](element_index_t index, page_record_t const& record) noexcept -> status_t {

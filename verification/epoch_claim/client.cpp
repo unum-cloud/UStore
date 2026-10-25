@@ -2,7 +2,7 @@
  *  @file verification/epoch_claim/client.cpp
  *  @author Ash Vardanian
  *  @date October 20, 2026
- *  @brief GenMC client for the epoch claim of @c parking_claim_t in
+ *  @brief GenMC client for the epoch claim of @c maintenance_claim in
  *      `include/ustore/blobs/nvme_database.hpp`, spelled line for line over @c std::atomic.
  *
  *  ForkUnion's references spell the same calls as single instructions, which GenMC cannot load, so
@@ -87,9 +87,9 @@ constexpr knobs_t rounds_1_wake_order_acquire_k {.wake_order = std::memory_order
 
 /** The claim, odd while held and even while free, stepped by its holder. */
 template <knobs_t const& knobs_>
-class parking_claim {
+class maintenance_claim {
   public:
-    explicit parking_claim(std::uint32_t epoch, std::atomic<std::uint32_t>* parked_on = nullptr) noexcept
+    explicit maintenance_claim(std::uint32_t epoch, std::atomic<std::uint32_t>* parked_on = nullptr) noexcept
         : epoch_(epoch), parked_on_(parked_on) {}
 
     [[nodiscard]] bool take_if_free() noexcept {
@@ -136,7 +136,7 @@ class parking_claim {
 /** The words of @c committer_and_holder: the claim starts held by the holder. */
 template <knobs_t const& knobs_>
 struct maintenance {
-    parking_claim<knobs_> claim {1};
+    maintenance_claim<knobs_> claim {1};
     std::atomic<std::uint32_t> view {0};
     bool maintained = false; // ? Written only under the claim
 };
@@ -182,7 +182,7 @@ int committer_and_holder_() noexcept {
 /** The words of @c explicit_verbs: a free claim and the tally its holders add to. */
 template <knobs_t const& knobs_>
 struct verbs {
-    parking_claim<knobs_> claim {0};
+    maintenance_claim<knobs_> claim {0};
     std::size_t tally = 0; // ? Plain, so a holder outside the claim's order is a data race
 };
 
@@ -224,7 +224,7 @@ template <knobs_t const& knobs_>
 struct stall {
     std::atomic<std::uint32_t> parked_on {0}; // ? Ghost: the epoch the committer last parked on
     std::atomic<std::uint32_t> done {0};      // ? Ghost: the committer saw the pressure relieved
-    parking_claim<knobs_> claim {1, &parked_on};
+    maintenance_claim<knobs_> claim {1, &parked_on};
     std::atomic<std::uint32_t> pressure {1};
 };
 

@@ -45,9 +45,7 @@
 #include <span>    // `std::span`
 #include <utility> // `std::move`
 
-#include <forkunion/atomics.hpp>       // `fu::standard_atomic_ref`, the reference the contract is checked with
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
-#include <smashtable/shared.hpp>       // `st::standard_waiting_policy_t`, the policy the contract is checked with
 
 #include "ustore/utilities/nvme_disks.hpp" // `native_file_t`, `open_native_file`, `native_file_capacity`
 #include "ustore/utilities/nvme_ring.hpp"  // `request_t`, `completion_t`, `queue_pair_t`, `extent_t`
@@ -173,9 +171,9 @@ struct direct_alignment_t {
  *  @c submit, since a misrouted completion is unrecoverable.
  *
  *  @tparam atomic_reference_ The reference the claim, epoch and in-flight words are owned through.
- *  @tparam waiting_policy_type_ What a draining core does after a poll that moved nothing.
+ *  @tparam waiter_type_ What a draining core does after a poll that moved nothing.
  */
-template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+template <template <typename> typename atomic_reference_, typename waiter_type_>
 class linux_uring_files_disk {
   public:
 
@@ -627,7 +625,7 @@ class linux_uring_files_disk {
             if (poll_completions_status.failed()) return poll_completions_status;
             if (moved != 0) continue;
             if (spins == drain_patience_k) cancel(queue_pair);
-            waiting_policy_type_ {}(&spins, spins, std::size_t {0});
+            waiter_type_ {}(&spins, spins, std::size_t {0});
         }
         return {status_code_t::io_k, "The queue pair would not drain"};
     }
@@ -1314,7 +1312,7 @@ class linux_uring_files_disk {
  *  The type exists so a caller compiles against it unconditionally and chooses at mount, where a
  *  refused @c make sends it to the blocking floor rather than to a build-time branch.
  */
-template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+template <template <typename> typename atomic_reference_, typename waiter_type_>
 class linux_uring_files_disk {
   public:
 
@@ -1392,8 +1390,5 @@ class linux_uring_files_disk {
 #pragma endregion Absent
 
 #endif
-
-static_assert(ring_concept<linux_uring_files_disk<fu::standard_atomic_ref, st::standard_waiting_policy_t>>,
-              "The io_uring transport is a ring like every other");
 
 } // namespace unum::ustore::utilities

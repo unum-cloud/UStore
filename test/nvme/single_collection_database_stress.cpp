@@ -4,11 +4,11 @@
  *  @date July 10, 2023
  *  @brief Stress tests running concurrent selects, inserts and removes on a UStoreNVMe single-collection database.
  *
- *  Several threads hammer one database at once, each reading anywhere while it writes and erases only the keys it
+ *  Several threads hammer one database at once, each reading anywhere while it writes and removes only the keys it
  *  owns, so every thread keeps an exact model of its own keys. Every key is written and flushed into a run first, so
- *  the threads read through the write buffer and the runs alike, and once they are joined every key must answer its
- *  owner's model, before and after the last flush. The write buffer is small, so flushes publish new runs under the
- *  readers all along, from whichever thread holds the write path.
+ *  the threads read through the memory runs and the runs alike, and once they are joined every key must answer its
+ *  owner's model, before and after the last flush. The memory run bounds are small, so flushes publish new runs under
+ *  the readers all along, from whichever thread holds the write path.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
@@ -42,7 +42,7 @@ constexpr std::size_t worker_threads_k = 4;
 /** The numbers every case mounts with: three channels for the stack and one for every worker thread. */
 constexpr fixture_config_t stress_config_k {.shared_io_channels = 3 + worker_threads_k + 1};
 
-/** Keys every worker owns, writing and erasing them alone. */
+/** Keys every worker owns, writing and removing them alone. */
 constexpr std::size_t keys_per_worker_k = 256;
 
 /** Operations every worker runs, about a third each of selects, inserts and removes. */
@@ -90,13 +90,13 @@ struct stress_stack {
     single_collection_database_config_t config;
     config.collection.concurrency_limit = worker_threads_k;
     config.collection.cache_limit = 1024ull * 1024ull;
-    config.collection.write_buffer_max_bytes = 256ull * 1024ull;
-    config.collection.write_buffer_max_elements = 512;
+    config.collection.memory_runs_max_bytes = 256ull * 1024ull;
+    config.collection.memory_runs_max_deltas = 512;
     config.collection.lsm_tree.level_enlarge_factor = 4;
     config.collection.lsm_tree.lsm_level_0.sorted_run.value_size = value_size;
     config.collection.lsm_tree.lsm_level_0.sorted_run.value_max_size = value_max_size;
-    config.default_transaction.write_buffer_max_bytes = 256ull * 1024ull;
-    config.default_transaction.write_buffer_max_elements = 512;
+    config.default_transaction.max_bytes = 256ull * 1024ull;
+    config.default_transaction.max_deltas = 512;
     return config;
 }
 
@@ -144,7 +144,7 @@ template <typename database_type_>
     std::size_t failures = 0;
     std::size_t const count = wanted.size();
     st::basic_vector<stored_key_t> keys;
-    st::basic_vector<select_result_t> results;
+    st::basic_vector<lookup_result_t> results;
     st::basic_vector<std::uint64_t> seen;
     failures += expect(keys.resize(count) == st::status_t::success_k);
     failures += expect(results.resize(count) == st::status_t::success_k);
@@ -152,7 +152,7 @@ template <typename database_type_>
     if (failures != 0) return failures;
     for (std::size_t index = 0; index != count; ++index) {
         keys[index] = wanted[index].stored_key;
-        results[index] = select_result_t::nothing_k;
+        results[index] = lookup_result_t::missing_k;
         seen[index] = 0;
     }
 
@@ -163,14 +163,14 @@ template <typename database_type_>
             if (bytes[index] != painted(wanted[request].seed, offset + index)) ++mismatches;
     };
     failures += expect(
-        store.select(channel, std::span<stored_key_t const> {keys}, std::span<select_result_t> {results}, sink)
+        store.select(channel, std::span<stored_key_t const> {keys}, std::span<lookup_result_t> {results}, sink)
             .succeeded());
     failures += expect_eq(mismatches, std::size_t {0});
 
     for (std::size_t index = 0; index != count; ++index) {
-        // A key never written answers nothing, and a key erased answers its tombstone; neither carries a value.
-        bool const absent_wanted = wanted[index].state != select_result_t::success_k;
-        bool const absent_seen = results[index] != select_result_t::success_k;
+        // A key never written answers missing, and a removed key answers its remove delta; neither carries a value.
+        bool const absent_wanted = wanted[index].state != lookup_result_t::written_k;
+        bool const absent_seen = results[index] != lookup_result_t::written_k;
         failures += expect(absent_wanted == absent_seen);
         if (!absent_wanted) failures += expect_eq(seen[index], wanted[index].bytes);
     }
@@ -182,7 +182,8 @@ template <typename database_type_>
 #pragma region Stress Cases
 
 /**
- *  @brief Threads select anywhere and insert and erase their own keys at once, and every key ends as its owner left it.
+ *  @brief Threads select anywhere and insert and remove their own keys at once, and every key ends as its owner left
+ *      it.
  *  @param[in] value_size Bytes every value takes, which is zero for every layout but the fixed one.
  *  @param[in] value_max_size Bytes the largest value takes, which is zero for a fixed-width layout.
  */
@@ -194,9 +195,8 @@ template <typename key_slot_type_, typename mount_type_>
     using guard_t = typename stack_t::guard_t;
     using volume_t = typename stack_t::volume_t;
     using database_t =
-        basic_single_collection_database<typename key_slot_type_::stored_key_t, volume_t, atomic_reference,
-                                         waiting_policy_t,
-                                         collection<key_slot_type_, volume_t, atomic_reference, waiting_policy_t>>;
+        basic_single_collection_database<typename key_slot_type_::stored_key_t, volume_t, atomic_reference, waiter_t,
+                                         nvme_store<key_slot_type_, volume_t, atomic_reference, waiter_t>>;
     std::size_t failures = 0;
 
     expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
@@ -224,7 +224,7 @@ template <typename key_slot_type_, typename mount_type_>
     if (failures != 0) return failures;
     for (std::size_t worker = 0; worker != worker_threads_k; ++worker)
         for (expectation_t& entry : models[worker]) {
-            entry.state = select_result_t::success_k;
+            entry.state = lookup_result_t::written_k;
             entry.bytes = value_size != 0 ? value_size : 1 + entry.stored_key % widest;
             entry.seed = entry.stored_key + widest;
             std::span<byte_t> const painted_value {first.data(), static_cast<std::size_t>(entry.bytes)};
@@ -263,7 +263,7 @@ template <typename key_slot_type_, typename mount_type_>
                     status_t const read = (*store)->select(guard->channel(), key, std::span<byte_t> {value}, size);
                     if (read.succeeded()) {
                         if (owned) {
-                            worker_failures[worker] += expect(entry.state == select_result_t::success_k);
+                            worker_failures[worker] += expect(entry.state == lookup_result_t::written_k);
                             worker_failures[worker] += expect_eq(std::uint64_t {size}, entry.bytes);
                             for (std::size_t position = 0; position != size; ++position)
                                 worker_failures[worker] += expect(value[position] == painted(entry.seed, position));
@@ -271,11 +271,11 @@ template <typename key_slot_type_, typename mount_type_>
                     }
                     else {
                         worker_failures[worker] += expect(read == status_code_t::not_found_k);
-                        if (owned) worker_failures[worker] += expect(entry.state != select_result_t::success_k);
+                        if (owned) worker_failures[worker] += expect(entry.state != lookup_result_t::written_k);
                     }
                 }
                 else if (choice == 1) {
-                    entry.state = select_result_t::success_k;
+                    entry.state = lookup_result_t::written_k;
                     entry.bytes = value_size != 0 ? value_size : 1 + random.below(widest);
                     entry.seed = random.next();
                     std::span<byte_t> const painted_value {value.data(), static_cast<std::size_t>(entry.bytes)};
@@ -285,9 +285,9 @@ template <typename key_slot_type_, typename mount_type_>
                         status_code_t::success_k);
                 }
                 else {
-                    entry.state = select_result_t::erased_k;
+                    entry.state = lookup_result_t::removed_k;
                     entry.bytes = 0;
-                    worker_failures[worker] += expect_status((*store)->erase(entry.stored_key),
+                    worker_failures[worker] += expect_status((*store)->remove(entry.stored_key),
                                                              status_code_t::success_k);
                 }
             }
@@ -295,7 +295,7 @@ template <typename key_slot_type_, typename mount_type_>
     for (std::size_t worker = 0; worker != worker_threads_k; ++worker) workers[worker].join();
     for (std::size_t worker = 0; worker != worker_threads_k; ++worker) failures += worker_failures[worker];
 
-    // Once with the last writes still staged, and once more out of the runs alone.
+    // Once with the last writes still in memory runs, and once more out of the runs alone.
     for (std::size_t worker = 0; worker != worker_threads_k; ++worker)
         failures += check_model(**store, (*stack)->channel(), std::span<expectation_t const> {models[worker]});
     failures += expect((*store)->flush().succeeded());

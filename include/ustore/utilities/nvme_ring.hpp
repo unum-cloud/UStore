@@ -266,7 +266,7 @@ class constrained_allocator {
 
 #pragma region Countdown
 
-template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+template <template <typename> typename atomic_reference_, typename waiter_type_>
 class notifier;
 
 /**
@@ -276,9 +276,9 @@ class notifier;
  *  reports through that, so the counter itself is never copied and outlives every part.
  *
  *  @tparam atomic_reference_ The reference the counter's words are owned through.
- *  @tparam waiting_policy_type_ What the waiting owner's core does between polls.
+ *  @tparam waiter_type_ What the waiting owner's core does between polls.
  */
-template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+template <template <typename> typename atomic_reference_, typename waiter_type_>
 class countdown {
   public:
 
@@ -326,7 +326,7 @@ class countdown {
     bool wait() noexcept {
         for (std::int32_t remaining = remaining_reference_().load(std::memory_order_acquire); remaining > 0;
              remaining = remaining_reference_().load(std::memory_order_acquire))
-            waiting_policy_type_ {}(&remaining_, remaining, std::size_t {0});
+            waiter_type_ {}(&remaining_, remaining, std::size_t {0});
         return !has_failed();
     }
 
@@ -339,7 +339,7 @@ class countdown {
 
   private:
 
-    friend class notifier<atomic_reference_, waiting_policy_type_>;
+    friend class notifier<atomic_reference_, waiter_type_>;
 
     /** The parts still owed, which a failure drives to zero however many are outstanding. */
     std::int32_t remaining_ = 1;
@@ -368,12 +368,12 @@ class countdown {
  *
  *  Every handle borrows a counter that outlives it, so a part reports without knowing who waits.
  */
-template <template <typename> typename atomic_reference_, typename waiting_policy_type_>
+template <template <typename> typename atomic_reference_, typename waiter_type_>
 class notifier {
   public:
 
     /** The counter a handle reports through. */
-    using countdown_t = countdown<atomic_reference_, waiting_policy_type_>;
+    using countdown_t = countdown<atomic_reference_, waiter_type_>;
 
     notifier() = delete;
     notifier(notifier const&) = default;
@@ -1599,9 +1599,9 @@ inline constexpr std::size_t poll_spin_limit_k = std::size_t {1} << 30;
  *  @param[in] wanted Completions to wait for, at most the size of @p into.
  *  @param[in] spins_limit Spins before the wait gives up, which a healthy ring never reaches.
  *  @return The completions moved into @p into, which is @p wanted unless the budget ran out.
- *  @tparam waiting_policy_type_ What the polling core does after a poll that moved nothing.
+ *  @tparam waiter_type_ What the polling core does after a poll that moved nothing.
  */
-template <typename waiting_policy_type_, typename disk_type_>
+template <typename waiter_type_, typename disk_type_>
     requires ring_concept<disk_type_>
 expected<std::size_t> poll_completions_at_least(disk_type_& disk, queue_pair_t const& queue_pair,
                                                 std::span<completion_t> into, std::size_t wanted,
@@ -1612,7 +1612,7 @@ expected<std::size_t> poll_completions_at_least(disk_type_& disk, queue_pair_t c
     for (std::size_t spins = 0; completed < wanted && spins != spins_limit; ++spins) {
         auto [moved, poll_completions_status] = disk.poll_completions(queue_pair, into.subspan(completed));
         if (poll_completions_status.failed()) return poll_completions_status;
-        if (moved == 0) waiting_policy_type_ {}(&spins, spins, std::size_t {0});
+        if (moved == 0) waiter_type_ {}(&spins, spins, std::size_t {0});
         completed += moved;
     }
     return completed;

@@ -5,7 +5,7 @@
  *  @brief Unit tests for transactions over a single UStoreNVMe single-collection database.
  *
  *  Every case runs on every value layout and every transport: transactions are created and refused by ID,
- *  insert and erase alone, in pairs over disjoint and over intersecting keys, from two threads at once, watch
+ *  insert and remove alone, in pairs over disjoint and over intersecting keys, from two threads at once, watch
  *  reads and writes on every schedule, and stage before they commit, roll back or die.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
@@ -76,9 +76,8 @@ struct transactions_types {
     using volume_t = typename fixture_t::volume_t;
     using key_slot_t = typename layout_type_::key_slot_t;
     using database_t =
-        basic_single_collection_database<typename key_slot_t::stored_key_t, volume_t, atomic_reference,
-                                         waiting_policy_t,
-                                         collection<key_slot_t, volume_t, atomic_reference, waiting_policy_t>>;
+        basic_single_collection_database<typename key_slot_t::stored_key_t, volume_t, atomic_reference, waiter_t,
+                                         nvme_store<key_slot_t, volume_t, atomic_reference, waiter_t>>;
     using database_pointer_t = typename database_t::database_unique_ptr_t;
     using transaction_pointer_t = typename database_t::transaction_unique_ptr_t;
 
@@ -114,13 +113,13 @@ struct transactions_types {
     single_collection_database_config_t config;
     config.collection.concurrency_limit = 2;
     config.collection.cache_limit = 1024ull * 1024ull;
-    config.collection.write_buffer_max_bytes = 16ull * 1024ull * 1024ull;
-    config.collection.write_buffer_max_elements = 8192;
+    config.collection.memory_runs_max_bytes = 16ull * 1024ull * 1024ull;
+    config.collection.memory_runs_max_deltas = 8192;
     config.collection.lsm_tree.level_enlarge_factor = 8;
     config.collection.lsm_tree.lsm_level_0.sorted_run.value_size = value_size;
     config.collection.lsm_tree.lsm_level_0.sorted_run.value_max_size = value_max_size;
-    config.default_transaction.write_buffer_max_bytes = 16ull * 1024ull * 1024ull;
-    config.default_transaction.write_buffer_max_elements = 4096;
+    config.default_transaction.max_bytes = 16ull * 1024ull * 1024ull;
+    config.default_transaction.max_deltas = 4096;
     return config;
 }
 
@@ -174,24 +173,24 @@ make_stack(mount_type_ const& mount) noexcept {
 /**
  *  @brief The values a case writes and what every key should answer right now.
  *
- *  Every key starts out missing; a landed insert makes it present and a landed erase leaves its tombstone.
+ *  Every key starts out missing; a landed insert makes it present and a landed removal leaves its remove delta.
  */
 struct model_t {
 
-    /** The value every key is written with, which answers @c success_k once it lands. */
+    /** The value every key is written with, which answers @c written_k once it lands. */
     st::basic_vector<expectation_t> planned;
 
     /** What a lookup of every key should answer now. */
-    st::basic_vector<select_result_t> states;
+    st::basic_vector<lookup_result_t> states;
 
     /** Marks the keys between @p first and @p last as present. */
     void present(std::size_t first, std::size_t last) noexcept {
-        for (std::size_t index = first; index != last; ++index) states[index] = select_result_t::success_k;
+        for (std::size_t index = first; index != last; ++index) states[index] = lookup_result_t::written_k;
     }
 
-    /** Marks the keys between @p first and @p last as erased. */
-    void erased(std::size_t first, std::size_t last) noexcept {
-        for (std::size_t index = first; index != last; ++index) states[index] = select_result_t::erased_k;
+    /** Marks the keys between @p first and @p last as removed. */
+    void removed(std::size_t first, std::size_t last) noexcept {
+        for (std::size_t index = first; index != last; ++index) states[index] = lookup_result_t::removed_k;
     }
 };
 
@@ -206,14 +205,14 @@ template <typename layout_type_, typename database_type_>
     for (std::size_t index = 0; index != population_k; ++index) {
         expectation_t entry;
         entry.stored_key = static_cast<stored_key_t>(index);
-        entry.state = select_result_t::success_k;
+        entry.state = lookup_result_t::written_k;
         if (layout_type_::value_size_k != 0) entry.bytes = layout_type_::value_size_k;
         else if (layout_type_::value_max_size_k != 0 && index % empty_value_step_k == empty_value_step_k - 1)
             entry.bytes = 0;
         else entry.bytes = 1 + index % widest;
         entry.seed = index * 31 + 7;
         model.planned[index] = entry;
-        model.states[index] = select_result_t::nothing_k;
+        model.states[index] = lookup_result_t::missing_k;
     }
     return failures;
 }
@@ -249,12 +248,12 @@ template <typename database_type_>
     return failures;
 }
 
-/** Erases every key between @p first and @p last through the transaction @p writer. */
+/** Removes every key between @p first and @p last through the transaction @p writer. */
 template <typename writer_type_>
-[[nodiscard]] std::size_t erase_range(writer_type_& writer, std::size_t first, std::size_t last) {
+[[nodiscard]] std::size_t remove_range(writer_type_& writer, std::size_t first, std::size_t last) {
     std::size_t failures = 0;
     for (std::size_t index = first; index != last; ++index)
-        failures += expect(writer.erase(static_cast<stored_key_t>(index)).succeeded());
+        failures += expect(writer.remove(static_cast<stored_key_t>(index)).succeeded());
     return failures;
 }
 
@@ -267,24 +266,24 @@ status_t read_one(source_type_& source, io_channel_t& channel, stored_key_t stor
 
 /** Reads one key through the transaction @p source, watching it under @p schedule_. */
 template <watch_schedule_t schedule_, typename key_type_, typename store_type_>
-status_t read_one(
-    single_collection_database_transaction<key_type_, store_type_, atomic_reference, waiting_policy_t>& source,
-    io_channel_t& channel, stored_key_t stored_key, std::span<byte_t> into, stored_value_size_t& size) noexcept {
+status_t read_one(single_collection_database_transaction<key_type_, store_type_, atomic_reference, waiter_t>& source,
+                  io_channel_t& channel, stored_key_t stored_key, std::span<byte_t> into,
+                  stored_value_size_t& size) noexcept {
     return source.template select<schedule_>(channel, stored_key, into, size);
 }
 
 /** Reads a batch of keys of the database @p source, which takes no watch. */
 template <watch_schedule_t schedule_, typename source_type_, typename sink_type_>
 status_t read_batch(source_type_ const& source, io_channel_t& channel, std::span<stored_key_t const> stored_keys,
-                    std::span<select_result_t> results, sink_type_&& sink) noexcept {
+                    std::span<lookup_result_t> results, sink_type_&& sink) noexcept {
     return source.select(channel, stored_keys, results, sink);
 }
 
 /** Reads a batch of keys through the transaction @p source, watching them under @p schedule_. */
 template <watch_schedule_t schedule_, typename key_type_, typename store_type_, typename sink_type_>
 status_t read_batch(
-    single_collection_database_transaction<key_type_, store_type_, atomic_reference, waiting_policy_t> const& source,
-    io_channel_t& channel, std::span<stored_key_t const> stored_keys, std::span<select_result_t> results,
+    single_collection_database_transaction<key_type_, store_type_, atomic_reference, waiter_t> const& source,
+    io_channel_t& channel, std::span<stored_key_t const> stored_keys, std::span<lookup_result_t> results,
     sink_type_&& sink) noexcept {
     return source.template select<schedule_>(channel, stored_keys, results, sink);
 }
@@ -299,7 +298,7 @@ template <watch_schedule_t schedule_ = watch_schedule_t::default_k, typename sou
 [[nodiscard]] std::size_t check_model(source_type_& source, io_channel_t& channel, model_t const& model) {
     std::size_t failures = 0;
     st::basic_vector<stored_key_t> keys;
-    st::basic_vector<select_result_t> results;
+    st::basic_vector<lookup_result_t> results;
     st::basic_vector<std::uint64_t> seen;
     failures += expect(keys.resize(population_k) == st::status_t::success_k);
     failures += expect(results.resize(population_k) == st::status_t::success_k);
@@ -307,7 +306,7 @@ template <watch_schedule_t schedule_ = watch_schedule_t::default_k, typename sou
     if (failures != 0) return failures;
     for (std::size_t index = 0; index != population_k; ++index) {
         keys[index] = model.planned[index].stored_key;
-        results[index] = select_result_t::nothing_k;
+        results[index] = lookup_result_t::missing_k;
         seen[index] = 0;
     }
 
@@ -318,7 +317,7 @@ template <watch_schedule_t schedule_ = watch_schedule_t::default_k, typename sou
             if (bytes[index] != painted(model.planned[request].seed, offset + index)) ++mismatches;
     };
     failures += expect(read_batch<schedule_>(source, channel, std::span<stored_key_t const> {keys},
-                                             std::span<select_result_t> {results}, sink)
+                                             std::span<lookup_result_t> {results}, sink)
                            .succeeded());
     failures += expect_eq(mismatches, std::size_t {0});
 
@@ -327,7 +326,7 @@ template <watch_schedule_t schedule_ = watch_schedule_t::default_k, typename sou
     std::size_t wrong_values = 0;
     for (std::size_t index = 0; index != population_k; ++index) {
         if (results[index] != model.states[index]) ++wrong_states;
-        if (model.states[index] != select_result_t::success_k) continue;
+        if (model.states[index] != lookup_result_t::written_k) continue;
         expectation_t const& entry = model.planned[index];
         if (seen[index] != entry.bytes) ++wrong_values;
         failures += expect(value.resize(static_cast<std::size_t>(entry.bytes) + 1) == st::status_t::success_k);
@@ -510,7 +509,7 @@ std::size_t insert_by_two_intersected_transactions(mount_type_ const& mount) {
     return failures;
 }
 
-/** One transaction's erasures land only at its commit, and a rollback drops the ones it had not committed. */
+/** One transaction's removals land only at its commit, and a rollback drops the ones it had not committed. */
 template <typename layout_type_, typename mount_type_>
 std::size_t remove_by_one_transaction(mount_type_ const& mount) {
     using types_t = transactions_types<layout_type_, typename mount_type_::fixture_t>;
@@ -529,24 +528,24 @@ std::size_t remove_by_one_transaction(mount_type_ const& mount) {
     if (failures != 0) return failures;
     constexpr std::size_t half_k = population_k / 2;
 
-    failures += erase_range(**changing, half_k, population_k);
+    failures += remove_range(**changing, half_k, population_k);
     failures += check_model(store, channel, model);
     failures += expect((*changing)->commit().succeeded());
-    model.erased(half_k, population_k);
+    model.removed(half_k, population_k);
     failures += check_model(store, channel, model);
 
-    failures += erase_range(**changing, 0, half_k);
+    failures += remove_range(**changing, 0, half_k);
     (*changing)->rollback();
     failures += check_model(store, channel, model);
 
-    failures += erase_range(**changing, 0, half_k);
+    failures += remove_range(**changing, 0, half_k);
     failures += expect((*changing)->commit().succeeded());
-    model.erased(0, half_k);
+    model.removed(0, half_k);
     failures += check_model(store, channel, model);
     return failures;
 }
 
-/** Two transactions erasing disjoint halves land one after the other, each at its own commit. */
+/** Two transactions removing disjoint halves land one after the other, each at its own commit. */
 template <typename layout_type_, typename mount_type_>
 std::size_t remove_by_two_transactions(mount_type_ const& mount) {
     using types_t = transactions_types<layout_type_, typename mount_type_::fixture_t>;
@@ -566,19 +565,19 @@ std::size_t remove_by_two_transactions(mount_type_ const& mount) {
     if (failures != 0) return failures;
     constexpr std::size_t half_k = population_k / 2;
 
-    failures += erase_range(**first, 0, half_k);
-    failures += erase_range(**second, half_k, population_k);
+    failures += remove_range(**first, 0, half_k);
+    failures += remove_range(**second, half_k, population_k);
     failures += check_model(store, channel, model);
     failures += expect((*first)->commit().succeeded());
-    model.erased(0, half_k);
+    model.removed(0, half_k);
     failures += check_model(store, channel, model);
     failures += expect((*second)->commit().succeeded());
-    model.erased(half_k, population_k);
+    model.removed(half_k, population_k);
     failures += check_model(store, channel, model);
     return failures;
 }
 
-/** Two transactions erasing one shared key: the second to commit is refused and erases nothing. */
+/** Two transactions removing one shared key: the second to commit is refused and removes nothing. */
 template <typename layout_type_, typename mount_type_>
 std::size_t remove_by_two_intersected_transactions(mount_type_ const& mount) {
     using types_t = transactions_types<layout_type_, typename mount_type_::fixture_t>;
@@ -598,11 +597,11 @@ std::size_t remove_by_two_intersected_transactions(mount_type_ const& mount) {
     if (failures != 0) return failures;
     constexpr std::size_t half_k = population_k / 2;
 
-    failures += erase_range(**first, 0, half_k + 1);
-    failures += erase_range(**second, half_k, population_k);
+    failures += remove_range(**first, 0, half_k + 1);
+    failures += remove_range(**second, half_k, population_k);
     failures += check_model(store, channel, model);
     failures += expect((*second)->commit().succeeded());
-    model.erased(half_k, population_k);
+    model.removed(half_k, population_k);
     failures += check_model(store, channel, model);
     failures += expect_status((*first)->commit(), status_code_t::write_conflict_k);
     failures += check_model(store, channel, model);

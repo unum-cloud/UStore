@@ -37,7 +37,7 @@
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_grow`, `arena_allocator`, `growing_strings`
 
 #include "engine.hpp"            // `engine_of`, `view_t`, `docs_write_in_json_values`
-#include "lib.hpp"               // `route`, `enumerator_spelling`, `name_in`, `value_in`
+#include "lib.hpp"               // `route`, `enumerator_spelling`, `name_in`, `value_in`, `stringzilla_capabilities`
 #include "utilities/batches.hpp" // `strings_arg_t`, `places_of`
 #include "utilities/outputs.hpp" // `read_outputs_t`
 
@@ -125,7 +125,7 @@ static status_t read_each_document(ustore_database_t database, place_batch_t con
     for (std::size_t index = 0; index != places.size(); ++index) {
         value_view_t const document = found[index];
         std::string_view const field = field_of(fields, index);
-        if (!document && !field.empty() && modification != modification_t::nothing_k)
+        if (!document && !field.empty() && modification != modification_t::read_k)
             return {status_code_t::not_found_k, "Modified field belongs to a missing document"};
         if (!document && field.empty() && replaces_existing)
             return {status_code_t::not_found_k, "Updated or patched document is missing"};
@@ -425,7 +425,7 @@ status_t docs_read_in_json_values(ustore_docs_read_t const& arguments, strings_a
         return field_cell_t {read.document_of(task), task_fields.fields_of_tasks[task]};
     };
     bool const resolved = resolve_fields(read.documents, task_fields.distinct, arguments.count, cell_of, true,
-                                         view.scratch, values);
+                                         view.scratch, stringzilla_capabilities(), values);
     for (std::size_t task = 0; task != arguments.count; ++task) {
         yyjson_val* value = values[task];
         if (!resolved) {
@@ -491,7 +491,7 @@ status_t docs_gather_in_json_values(ustore_docs_gather_t const& arguments, strin
         return field_cell_t {cell % docs_count, cell / docs_count};
     };
     bool const resolved = resolve_fields(documents, field_names, docs_count * fields_count, cell_of, false,
-                                         view.scratch, values);
+                                         view.scratch, stringzilla_capabilities(), values);
 
     // Without it, every document parses once, then the columns fill one after another
     std::span<yyjson_val*> roots;

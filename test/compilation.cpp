@@ -90,11 +90,11 @@ concept owns_arena_concept = std::is_nothrow_move_constructible_v<result_type_> 
                                  { result.view() } -> std::same_as<view_type_ const&>;
                              };
 
-/** Whether a deferred write of strings accepts strings and values passed as @p texts_type_ and @p contents_type_. */
-template <typename texts_type_, typename contents_type_>
+/** Whether a deferred write of strings accepts strings and keys passed as @p texts_type_ and @p keys_type_. */
+template <typename texts_type_, typename keys_type_>
 concept writes_strings_deferred_concept = requires(deferred_strings_collection_t const& collection, texts_type_&& texts,
-                                                   contents_type_&& contents) {
-    collection.write(std::forward<texts_type_>(texts), std::forward<contents_type_>(contents));
+                                                   keys_type_&& keys) {
+    collection.write(std::forward<texts_type_>(texts), std::forward<keys_type_>(keys));
 };
 
 // A snapshot hands out read-only collections, so nothing writes through it, while a transaction does
@@ -136,9 +136,10 @@ static_assert(!writes_edges_deferred_concept<edges_view_t>);
 static_assert(reads_strings_deferred_concept<values_tape_t, arena_t&>);
 static_assert(!reads_strings_deferred_concept<values_tape_t&, arena_t&>);
 static_assert(!reads_strings_deferred_concept<std::span<value_view_t const>, arena_t&>);
-static_assert(writes_strings_deferred_concept<values_tape_t, values_tape_t>);
-static_assert(!writes_strings_deferred_concept<values_tape_t, values_tape_t&>);
-static_assert(!writes_strings_deferred_concept<std::span<value_view_t const>, values_tape_t>);
+static_assert(writes_strings_deferred_concept<values_tape_t, std::array<ustore_key_t, 2>>);
+static_assert(!writes_strings_deferred_concept<values_tape_t, values_tape_t>);
+static_assert(!writes_strings_deferred_concept<values_tape_t, std::span<ustore_key_t const>>);
+static_assert(!writes_strings_deferred_concept<std::span<value_view_t const>, std::array<ustore_key_t, 2>>);
 
 // A shorthand result owns its one-off arena, while a view only borrows one
 static_assert(owns_arena_concept<owned_value_t, value_view_t>);
@@ -300,14 +301,14 @@ std::size_t wrappers_compile(config_t const& config) {
 
         failures += expect(database.create<strings_collection_t>("strings").has_value());
         deferred_strings_collection_t deferred_strings = *deferred_head.find<strings_collection_t>("strings");
-        values_tape_t texts, contents, asked, prefixes, removed;
+        values_tape_t texts, asked, prefixes, removed;
         failures += fill_tape(texts, {"hello", "help"});
-        failures += fill_tape(contents, {"world", "me"});
         failures += fill_tape(asked, {"hello"});
         failures += fill_tape(prefixes, {"hel"});
         failures += fill_tape(removed, {"help"});
-        failures += expect(deferred_strings.write(std::move(texts), std::move(contents)).wait().succeeded());
-        [[maybe_unused]] expected<values_view_t> const strings_read =
+        std::array<ustore_key_t, 2> const string_keys {key_from_integer(1), key_from_integer(2)};
+        failures += expect(deferred_strings.write(std::move(texts), string_keys).wait().succeeded());
+        [[maybe_unused]] expected<keys_view_t> const strings_read =
             deferred_strings.read(std::move(asked), arena).wait();
         [[maybe_unused]] expected<strings_scan_t::finished_t> const scanned =
             deferred_strings.scan(std::move(prefixes), 8, arena).wait();

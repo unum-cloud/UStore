@@ -19,9 +19,8 @@
 
 #include <forkunion/atomics.hpp> // `fu::standard_atomic_ref`
 #include <forkunion/types.hpp>   // `fu::standard_yield_t`
-#include <smashtable/shared.hpp> // `st::standard_waiting_policy`
 
-#include "ustore/blobs/nvme_write_buffer.hpp" // `write_buffer`, `write_buffer_status_t`
+#include "ustore/blobs/nvme_write_buffer.hpp" // `write_buffer`, `lookup_result_t`
 
 #include "harness.hpp" // `suite_exit_code`, `expect`, `expect_eq`
 
@@ -37,15 +36,15 @@ using stored_key_t = std::size_t;
 template <typename value_type_>
 using atomic_reference = fu::standard_atomic_ref<value_type_>;
 
-/** The waiting policy the buffer is instantiated with, yielding between polls. */
-using waiting_policy_t = st::standard_waiting_policy<fu::standard_yield_t>;
+/** The waiter the buffer is instantiated with, yielding between polls. */
+using waiter_t = fu::standard_yield_t;
 
-using resources_t = shared_resources<atomic_reference, waiting_policy_t>;
-using resources_shared_ptr_t = resources_shared_ptr<atomic_reference, waiting_policy_t>;
-using countdown_t = countdown<atomic_reference, waiting_policy_t>;
+using resources_t = shared_resources<atomic_reference, waiter_t>;
+using resources_shared_ptr_t = resources_shared_ptr<atomic_reference, waiter_t>;
+using countdown_t = countdown<atomic_reference, waiter_t>;
 
 /** The write buffer every case fills. */
-using write_buffer_t = write_buffer<stored_key_t, atomic_reference, waiting_policy_t>;
+using write_buffer_t = write_buffer<stored_key_t, atomic_reference, waiter_t>;
 
 /** Flags of this suite, with their defaults. */
 struct options_t {
@@ -101,7 +100,7 @@ std::size_t ensure_cache_is_empty(write_buffer_t const& cache) {
     std::size_t failures = 0;
     failures += expect_eq(cache.count(), std::size_t {0});
     for (stored_key_t const stored_key : stored_keys)
-        failures += expect(cache.status(stored_key) == write_buffer_status_t::mismatch_k);
+        failures += expect(cache.status(stored_key) == lookup_result_t::missing_k);
     return failures;
 }
 
@@ -114,12 +113,12 @@ std::size_t check_stored_values(options_t const& options, st::basic_vector<buffe
     using stored_value_location_t = stored_value_location<value_layout_t::variable_width_k>;
 
     for (std::size_t index = 0; index < options.stored_values.value; ++index) {
-        write_buffer_status_t const status = cache.status(stored_keys[index]);
+        lookup_result_t const status = cache.status(stored_keys[index]);
         failures += expect(status == status_must_be(index));
         stored_value_location_t location;
-        write_buffer_status_t const found = cache.find(stored_keys[index], location);
+        lookup_result_t const found = cache.find(stored_keys[index], location);
         failures += expect(found == status);
-        if (status != write_buffer_status_t::found_k) continue;
+        if (status != lookup_result_t::written_k) continue;
         failures += expect(static_cast<bool>(location));
         if (location.size() == 0) continue;
 
@@ -157,7 +156,7 @@ std::size_t test_insertions(options_t const& options, st::basic_vector<buffer_t>
         failures += expect(status.succeeded());
     }
 
-    auto filter = [](std::size_t) { return write_buffer_status_t::found_k; };
+    auto filter = [](std::size_t) { return lookup_result_t::written_k; };
     failures += check_stored_values(options, stored_values, cache, filter);
 
     cache.unsafe_clear();
@@ -176,7 +175,7 @@ std::size_t test_removals(options_t const& options, st::basic_vector<buffer_t> c
         failures += expect(status.succeeded());
     }
 
-    auto filter = [](std::size_t) { return write_buffer_status_t::removed_k; };
+    auto filter = [](std::size_t) { return lookup_result_t::removed_k; };
     failures += check_stored_values(options, stored_values, cache, filter);
 
     cache.unsafe_clear();
@@ -213,9 +212,9 @@ std::size_t test_mixed_insertions_and_removals(options_t const& options,
     }
 
     auto filter = [&options](std::size_t index) {
-        if (index < options.stored_values.value / 2 && index % 2 == 0) return write_buffer_status_t::found_k;
-        else if (index >= options.stored_values.value / 2 && index % 2 != 0) return write_buffer_status_t::found_k;
-        else return write_buffer_status_t::removed_k;
+        if (index < options.stored_values.value / 2 && index % 2 == 0) return lookup_result_t::written_k;
+        else if (index >= options.stored_values.value / 2 && index % 2 != 0) return lookup_result_t::written_k;
+        else return lookup_result_t::removed_k;
     };
     failures += check_stored_values(options, stored_values, cache, filter);
 
@@ -274,8 +273,8 @@ std::size_t test_batch(options_t const& options, st::basic_vector<buffer_t> cons
     failures += expect(first_cache.unsafe_add(second_cache).succeeded());
 
     auto filter = [](std::size_t index) {
-        if (index % 2 == 0) return write_buffer_status_t::found_k;
-        else return write_buffer_status_t::removed_k;
+        if (index % 2 == 0) return lookup_result_t::written_k;
+        else return lookup_result_t::removed_k;
     };
     failures += check_stored_values(options, stored_values, first_cache, filter);
 
@@ -332,13 +331,12 @@ std::size_t test_copy(options_t const& options, st::basic_vector<buffer_t> const
     }
 
     auto filter1 = [&options](std::size_t index) {
-        return (index < options.stored_values.value / 2) ? write_buffer_status_t::found_k
-                                                         : write_buffer_status_t::mismatch_k;
+        return (index < options.stored_values.value / 2) ? lookup_result_t::written_k : lookup_result_t::missing_k;
     };
     failures += check_stored_values(options, stored_values, cache_copy, filter1);
 
     cache_copy = cache;
-    auto filter2 = [](std::size_t) { return write_buffer_status_t::found_k; };
+    auto filter2 = [](std::size_t) { return lookup_result_t::written_k; };
     failures += check_stored_values(options, stored_values, cache_copy, filter2);
 
     cache.unsafe_clear();
@@ -365,7 +363,7 @@ std::size_t test_move(options_t const& options, st::basic_vector<buffer_t> const
         failures += expect(status.succeeded());
     }
 
-    auto filter = [](std::size_t) { return write_buffer_status_t::found_k; };
+    auto filter = [](std::size_t) { return lookup_result_t::written_k; };
     failures += check_stored_values(options, stored_values, cache_moved, filter);
 
     cache = std::move(cache_moved);

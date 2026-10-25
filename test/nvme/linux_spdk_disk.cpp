@@ -47,7 +47,7 @@ namespace unum::ustore::test {
 using namespace unum::ustore::blobs;
 using namespace unum::ustore::utilities;
 
-using linux_spdk_disk_t = linux_spdk_disk<atomic_reference, waiting_policy_t>;
+using linux_spdk_disk_t = linux_spdk_disk<atomic_reference, waiter_t>;
 
 #pragma region Fixtures
 
