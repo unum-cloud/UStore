@@ -9,13 +9,13 @@
  *  @c delta_kind_t::change_k delta of the store holds. Beyond the five modifications of @c ustore_docs_write, a delta
  *  may write a whole document as it is, as a whole JSON upsert and @c ustore_blobs_write store it, or remove it.
  *
- *  Each modification replays exactly as `src/docs.cpp` reads, modifies and writes back a document today. A field of a
- *  missing document, and an update or a patch of a whole missing document, fail with @c status_code_t::not_found_k,
- *  and inserting a whole document that exists fails with @c status_code_t::already_exists_k. Then the document and
- *  the value parse, so either one malformed fails with @c status_code_t::malformed_k, and a patch whose test or path
- *  fails answers @c status_code_t::invalid_argument_k. A write, a removal and an upsert of a whole document close the
- *  chain: no base or older delta matters after them, so they also clear a failure older deltas left, as an LSM that
- *  drops what they close would.
+ *  Each modification replays exactly as `src/blobs_layers/docs.hpp` reads, modifies and writes back a document today.
+ *  A field of a missing document, and an update or a patch of a whole missing document, fail with
+ *  @c status_code_t::not_found_k, and inserting a whole document that exists fails with
+ *  @c status_code_t::already_exists_k. Then the document and the value parse, so either one malformed fails with
+ *  @c status_code_t::malformed_k, and a patch whose test or path fails answers @c status_code_t::invalid_argument_k.
+ *  A write, a removal and an upsert of a whole document close the chain: no base or older delta matters after them, so
+ *  they also clear a failure older deltas left, as an LSM that drops what they close would.
  *
  *  Composition keeps the chain minus what merges soundly for every base. After the newest closing delta the document
  *  is known, so the chain folds into one write or removal, unless a delta fails there. Before it, an upsert or an
@@ -193,7 +193,7 @@ struct document_state_t {
 /** The bytes an existing empty document views, so they never read as missing. */
 inline constexpr byte_t empty_document_k[1] = {};
 
-/** Applies @p delta to @p document as `src/docs.cpp` reads, modifies and writes it back, in @p arena. */
+/** Applies @p delta to @p document as `src/blobs_layers/docs.hpp` reads, modifies and writes it back, in @p arena. */
 inline status_t apply_delta(document_state_t& document, json_delta_t const& delta, ustore_arena_t arena) noexcept {
     switch (delta.modification) {
     case delta_modification_t::write_k:

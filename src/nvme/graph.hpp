@@ -1,5 +1,5 @@
 /**
- *  @file src/nvme/graph_calls.hpp
+ *  @file src/nvme/graph.hpp
  *  @author Ash Vardanian
  *  @date December 1, 2022
  *  @brief The graph calls of the C ABI over the graph stores of `include/ustore/graph/nvme_store.hpp`, for the NVMe
@@ -32,6 +32,8 @@
 
 #include "ustore/graph/adjacency_fold.hpp"  // `adjacency_fold_t`, `vertex_adjacency_t`, `deltas_of_edge`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_allocator`, `growth_status`
+
+#include "database.hpp" // `call_access`, `access_of`, `resolve_runs`, `watch_keys`, `serve_write`
 
 namespace unum::ustore::nvme {
 

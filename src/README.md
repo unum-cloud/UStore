@@ -2,8 +2,8 @@
 
 Every engine implements the C ABI of `c/ustore/*.h` over its own storage, and joins the router's sources in the one source list both the `ustore_static` archive and the `ustore_shared` library build from, so documents and graphs work on each of them.
 `src/lib.hpp` is the router every exported call goes through, and each public header has one source implementing it: `types.cpp`, `db.cpp`, `blobs.cpp`, `strings.cpp`, `docs.cpp`, `graph.cpp` and `pages.cpp`.
-`docs.cpp` and `graph.cpp` also keep documents and graphs as read-modify-writes over the codecs of `include/ustore/docs/` and `include/ustore/graph/`, through the unchecked whole-value verbs of the one engine instantiating their `*_over_blobs` templates.
-`pages.cpp` keeps pages the same way, each as one value under its page key: its current shape, the dense element tree of `include/ustore/pages/`.
+`blobs_layers/docs.hpp` and `blobs_layers/graph.hpp` also keep documents and graphs as read-modify-writes over the codecs of `include/ustore/docs/` and `include/ustore/graph/`, through the unchecked whole-value verbs of the one engine instantiating their `*_over_blobs` templates.
+`blobs_layers/pages.hpp` keeps pages the same way, each as one value under its page key: its current shape, the dense element tree of `include/ustore/pages/`.
 Every verb serves only collections of its own modality: each engine's resolver refuses any other with the one status of `collection_holds_another_modality`, and its public blobs verbs wrap the unchecked ones in that check.
 The reusable templates the engines instantiate live in `include/ustore/`, which [its own guide](../include/ustore/README.md) describes.
 The engines fill three roles: `ram` is the reference engine in memory, NVMe is the hyper-converged engine on NVMe drives and GPUs, and RocksDB and LevelDB bring third-party key-value stores behind the same calls.
@@ -76,10 +76,10 @@ A `database` holds collections, each in an `nvme_store` over an `lsm_tree` of `l
 `src/nvme/variants.hpp` serves every slot of `engine_t` the RAM engine serves, its snapshots as stamps pinned in the database's commit ledger, once per CPU class of `src/lib.hpp`, and `src/nvme/engine.cpp` opens a database with the newest class the running CPU admits.
 Every collection of the C ABI is one collection of the database under its UUID, keyed by the 16 bytes of `ustore_key_t`.
 Its `_collections` system collection maps every collection onto its name, the database's own schema recording its modality, and a strings collection and the names live in the strings store of `include/ustore/strings/nvme_store.hpp`, keyed by whole strings, whose writes and watches join a transaction as a share of it.
-A graph collection lives in the graph store of `include/ustore/graph/nvme_store.hpp`, one key per vertex folded from half-edge change deltas, and `src/nvme/graph_calls.hpp` serves the graph calls of the table over it.
-A docs collection lives in the docs store of `include/ustore/docs/nvme_store.hpp`, whose field writes, patches and merges append `json_fold_t` change deltas through `src/nvme/docs_calls.hpp`.
-A pages collection lives in the pages store of `include/ustore/pages/nvme_store.hpp`, whose edits append `page_fold_t` change deltas that the `*_edits` calls of `src/pages.cpp` encode and `src/nvme/pages_calls.hpp` commits.
-Reads of documents and pages take the read paths of `src/docs.cpp` and `src/pages.cpp` over the engine's own reads of those stores, which fold the change deltas.
+A graph collection lives in the graph store of `include/ustore/graph/nvme_store.hpp`, one key per vertex folded from half-edge change deltas, and `src/nvme/graph.hpp` serves the graph calls of the table over it.
+A docs collection lives in the docs store of `include/ustore/docs/nvme_store.hpp`, whose field writes, patches and merges append `json_fold_t` change deltas through `src/nvme/docs.hpp`.
+A pages collection lives in the pages store of `include/ustore/pages/nvme_store.hpp`, whose edits append `page_fold_t` change deltas that the `*_edits` calls of `src/blobs_layers/pages.hpp` encode and `src/nvme/pages.hpp` commits.
+Reads of documents and pages take the read paths of `src/blobs_layers/docs.hpp` and `src/blobs_layers/pages.hpp` over the engine's own reads of those stores, which fold the change deltas.
 `USTORE_BUILD_NVME` is off by default, and the Python package turns it on; what follows is a v1 target:
 
 - __Kernel bypass__ — a transport chosen at mount reaches each data directory through io_uring on `O_DIRECT` files, io_uring on NVMe block devices, NVMe passthrough, or SPDK's user-space driver, and falls back to blocking positioned I/O on macOS, Windows and wherever io_uring is refused.

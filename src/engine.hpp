@@ -242,8 +242,9 @@ status_t guarded_by(arguments_type_ const& arguments, strings_arg_t const& value
     return resolved.failed() ? resolved : serve_(arguments, values, view);
 }
 
-/** The document verbs of an engine keeping every document as one whole value of JSON text, served by `src/docs.cpp`
- *  as read-modify-writes through @p values_verbs, the unchecked whole-value verbs of that one engine. */
+/** The document verbs of an engine keeping every document as one whole value of JSON text, served by
+ *  `src/blobs_layers/docs.hpp` as read-modify-writes through @p values_verbs, the unchecked whole-value verbs of that
+ *  one engine. */
 status_t docs_write_over_blobs(blobs_verbs_t const& values_verbs, ustore_docs_write_t const&,
                                strings_arg_t const& fields, strings_arg_t const& values, view_t const&) noexcept;
 status_t docs_read_over_blobs(blobs_verbs_t const& values_verbs, ustore_docs_read_t const&, strings_arg_t const& fields,
@@ -253,7 +254,7 @@ status_t docs_gather_over_blobs(blobs_verbs_t const& values_verbs, ustore_docs_g
                                 strings_arg_t const& fields, view_t const&) noexcept;
 
 /** The graph verbs of an engine keeping every vertex as one value of its degrees and sorted neighborships, served by
- *  `src/graph.cpp` as read-modify-writes through @p values_verbs. */
+ *  `src/blobs_layers/graph.hpp` as read-modify-writes through @p values_verbs. */
 status_t graph_read_edges_over_blobs(blobs_verbs_t const& values_verbs, ustore_graph_read_edges_t const&,
                                      view_t const&) noexcept;
 status_t graph_write_edges_over_blobs(blobs_verbs_t const& values_verbs, ustore_graph_write_edges_t const&,
@@ -265,8 +266,8 @@ status_t graph_write_vertices_over_blobs(blobs_verbs_t const& values_verbs, usto
 status_t graph_remove_vertices_over_blobs(blobs_verbs_t const& values_verbs, ustore_graph_remove_vertices_t const&,
                                           view_t const&) noexcept;
 
-/** The page verbs of an engine keeping every page as one value, its dense element tree, served by `src/pages.cpp` as
- *  read-modify-writes through @p values_verbs. */
+/** The page verbs of an engine keeping every page as one value, its dense element tree, served by
+ *  `src/blobs_layers/pages.hpp` as read-modify-writes through @p values_verbs. */
 status_t pages_import_over_blobs(blobs_verbs_t const& values_verbs, ustore_pages_import_t const&,
                                  strings_arg_t const& values, view_t const&) noexcept;
 status_t pages_insert_over_blobs(blobs_verbs_t const& values_verbs, ustore_pages_insert_t const&,
@@ -287,8 +288,8 @@ status_t pages_read_over_blobs(blobs_verbs_t const& values_verbs, ustore_pages_r
  *  @brief The verbs of the layers over blobs bound to one engine: its unchecked whole-value verbs @p values_verbs_,
  *      and its resolver @p resolve_, which refuses every collection holding another modality first.
  *
- *  `src/docs.cpp`, `src/graph.cpp` and `src/pages.cpp` serve the read-modify-writes these name, so each engine
- *  instantiating them reaches only its own values.
+ *  `src/blobs_layers/docs.hpp`, `src/blobs_layers/graph.hpp` and `src/blobs_layers/pages.hpp` serve the
+ *  read-modify-writes these name, so each engine instantiating them reaches only its own values.
  */
 template <blobs_verbs_t const& values_verbs_, auto resolve_>
 status_t docs_write_over_blobs(ustore_docs_write_t const& arguments, strings_arg_t const& fields,
@@ -495,9 +496,10 @@ struct page_edits_t {
     std::span<utilities::byte_t const> chain;
 };
 
-/** The edit chains of the page edit calls of an engine keeping a page as its edits, which `src/pages.cpp` checks and
- *  applies over the pages read unwatched through @p values_verbs, so concurrent edits of one page both land, leaving
- *  the chain of every page the call touched in the scratch of the call for the engine to commit. */
+/** The edit chains of the page edit calls of an engine keeping a page as its edits, which
+ *  `src/blobs_layers/pages.hpp` checks and applies over the pages read unwatched through @p values_verbs, so concurrent
+ *  edits of one page both land, leaving the chain of every page the call touched in the scratch of the call for the
+ *  engine to commit. */
 expected<std::span<page_edits_t const>> pages_import_edits(blobs_verbs_t const& values_verbs,
                                                            ustore_pages_import_t const&, strings_arg_t const& values,
                                                            view_t const&) noexcept;

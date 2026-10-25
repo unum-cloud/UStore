@@ -1,5 +1,5 @@
 /**
- *  @file src/nvme/docs_calls.hpp
+ *  @file src/nvme/docs.hpp
  *  @author Ash Vardanian
  *  @date October 20, 2026
  *  @brief The document writes of the C ABI over the docs stores of `include/ustore/docs/nvme_store.hpp`, for the NVMe
@@ -10,13 +10,13 @@
  *  document writes it, JSON as written and any other type printed as JSON, and reads nothing. An update, an
  *  insertion, a patch, a merge, and an upsert of a field each append one @c json_delta_t to the document's change
  *  delta, after replaying it over the document as the transaction sees it, read and watched. A modification that
- *  would fail answers as the read-modify-write of `src/docs.cpp` does and never lands, and a commit that changed the
- *  document since conflicts, so no change delta carries a @c json_delta_t that fails.
+ *  would fail answers as the read-modify-write of `src/blobs_layers/docs.hpp` does and never lands, and a commit that
+ *  changed the document since conflicts, so no change delta carries a @c json_delta_t that fails.
  *
  *  The tasks of one call on one document apply in task order, each seeing the ones before it, and a call whose tasks
  *  leave a document known whole, past a whole upsert or over a document of no bytes, writes that document, since a
- *  change delta over no bytes would fold as over a missing document. Reads take the read paths of `src/docs.cpp`
- *  over the engine's own reads of the docs store, which fold the deltas.
+ *  change delta over no bytes would fold as over a missing document. Reads take the read paths of
+ *  `src/blobs_layers/docs.hpp` over the engine's own reads of the docs store, which fold the deltas.
  */
 
 #pragma once
@@ -32,6 +32,8 @@
 #include "ustore/docs/json_fold.hpp"        // `json_fold_t`, `json_delta_t`, `encode_deltas`, `modifier_text`
 #include "ustore/docs/json_values.hpp"      // `json_parse`, `extract_keys`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_allocator`
+
+#include "database.hpp" // `call_access`, `resolve_runs`, `read_value`, `write_value`, `serve_write`
 
 namespace unum::ustore::nvme {
 

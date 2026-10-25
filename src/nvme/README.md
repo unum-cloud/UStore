@@ -195,7 +195,7 @@ A dispatch blocks until all its threads return and admits one caller at a time, 
 - A removed vertex is a removal of its key, and its neighbors take a change removing the half-edges they filed of it.
 
 Every store serves the modalities its fold folds, so a graph of variable-width values lands in this one, and a graph of any other width is refused, as no store keeps it.
-`src/nvme/graph_calls.hpp` serves the graph calls of the C ABI over it, batching the vertices of a run of tasks on one collection into one select.
+`src/nvme/graph.hpp` serves the graph calls of the C ABI over it, batching the vertices of a run of tasks on one collection into one select.
 A write watches what it depends on: a vertex it creates, a vertex a removal of edges changes, and the adjacency a vertex removal reads.
 
 ## Alternatives

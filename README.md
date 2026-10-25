@@ -47,7 +47,7 @@ Those paths belong to NVMe, the hyper-converged engine that v1 targets, while th
 | Hardware   | NVMe drives, GPUs and CPU cores, in one box                            | —                          |
 
 - __The C ABI__ in `c/ustore/*.h` is the only interface: every call takes one argument struct, and every binding forwards to it.
-- __The modalities__ in `src/docs.cpp` and `src/graph.cpp` implement documents and graphs once, on top of whichever engine the library links, while the `ram` engine serves graphs on half-edges of its own and every engine keys its strings collections itself.
+- __The modalities__ in `src/blobs_layers/docs.hpp` and `src/blobs_layers/graph.hpp` implement documents and graphs once, on top of whichever engine the library links, while the `ram` engine serves graphs on half-edges of its own and every engine keys its strings collections itself.
 - __The `ram` engine__ is the reference: ordered multi-version stores in memory on SmashTable containers, persisted as one binary image when it opens with a directory.
 - __NVMe__ is the engine the hardware paths serve: each collection is an `lsm_tree` of `lsm_level`s of `lsm_sorted_run`s, point lookups search SmashTable's SIMD row kits, compactions merge sorted runs on the CPU or a GPU, GPUDirect Storage moves runs between drives and GPU memory, and a transport chosen at mount reaches the drive through io_uring, SPDK or blocking positioned I/O.
 - __RocksDB and LevelDB__ keep their own storage formats, so an application moves between them and the other engines without changing a call.

@@ -242,7 +242,7 @@ cargo test --no-default-features --features rocksdb  # RAM and RocksDB alone
 ## Implementing a New Engine
 
 An engine fills the table of calls in `src/engine.hpp`, one entry per call of the C ABI.
-For documents and graphs it plugs in the shared implementations of `src/docs.cpp` and `src/graph.cpp`, which run on its own reads and writes, as RocksDB and LevelDB do, or serves them itself, as `ram` serves graphs on half-edges of its own.
+For documents and graphs it plugs in the shared implementations of `src/blobs_layers/docs.hpp` and `src/blobs_layers/graph.hpp`, which run on its own reads and writes, as RocksDB and LevelDB do, or serves them itself, as `ram` serves graphs on half-edges of its own.
 An entry the engine leaves null answers `ustore_status_unsupported_k`, as every pages entry does today.
 Start with these, in order:
 
