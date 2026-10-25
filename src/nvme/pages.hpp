@@ -5,13 +5,13 @@
  *  @brief The page edits of the C ABI over the pages stores of `include/ustore/pages/nvme_store.hpp`, for the NVMe
  *      engine's table.
  *
- *  `src/nvme/variants.hpp` includes this file right before its table, as these calls build on its writes and its
- *  collection lookups. An edit call addressing any collection but a pages one is refused. The `*_edits` calls of
- *  `src/blobs_layers/pages.hpp` read the pages unwatched through the engine's own reads, check and apply the edits,
- *  and answer the edits of every page as one chain, which @c commit_page_edits lands. A chain that imports or removes
- *  the page decides it whole, so the page it leaves is written, or removed, and any other chain is appended as one
- *  @c page_fold_t change delta, watching nothing, so two commits editing one page both land. Reads take
- *  `pages_read_over_blobs` over the engine's own reads of the pages store, which fold the deltas.
+ *  These calls build on the writes and the collection lookups of `src/nvme/database.hpp`. An edit call addressing
+ *  any collection but a pages one is refused. The `*_edits` calls of `src/blobs_layers/pages.hpp` read the pages
+ *  unwatched through the engine's own reads, check and apply the edits, and answer the edits of every page as one
+ *  chain, which @c commit_page_edits lands. A chain that imports or removes the page decides it whole, so the page it
+ *  leaves is written, or removed, and any other chain is appended as one @c page_fold_t change delta, watching
+ *  nothing, so two commits editing one page both land. Reads take `pages_read_over_blobs` over the engine's own reads
+ *  of the pages store, which fold the deltas.
  */
 
 #pragma once
@@ -24,6 +24,8 @@
 
 #include "ustore/pages/page_fold.hpp"       // `page_fold_t`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocator`
+
+#include "blobs_layers/pages.hpp" // `page_edits_t`, `pages_import_edits`, `pages_insert_edits`
 
 #include "database.hpp" // `call_access`, `resolve_runs`, `write_value`, `serve_write`
 

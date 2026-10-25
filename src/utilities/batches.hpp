@@ -159,7 +159,9 @@ inline status_t validate_read(place_batch_t const& places) noexcept {
     return {};
 }
 
-inline status_t validate_scan(ustore_blobs_scan_t const& arguments) noexcept {
+/** Checks the mode and the outputs of a scan of any modality. */
+template <typename arguments_type_>
+status_t validate_scan(arguments_type_ const& arguments) noexcept {
 
     if (arguments.mode != ustore_scan_ordered_k && arguments.mode != ustore_scan_unordered_k)
         return {status_code_t::invalid_argument_k, "Unknown scan mode"};

@@ -2,23 +2,14 @@
  *  @file src/docs.cpp
  *  @author Ash Vardanian
  *  @date December 26, 2022
- *  @brief Documents modality on yyjson and StringZilla, over the whole-value verbs of the one engine serving it.
- *
- *  Documents are stored as JSON text.
- *  Whole-document reads and upserts pass straight through to the engine's own unchecked read and write.
- *  Field reads and gathers locate their fields with one StringZilla subdocuments pass over the documents read.
- *  They parse with yyjson only a batch that pass cannot read as yyjson would.
- *  Gists and modifications parse every document with yyjson.
- *  All of it lives in the scratch of the call, so the arena of the request holds only its outputs.
- *  The paths, parsing, conversions and modifications live in `ustore/docs/json_paths.hpp`,
- *  `ustore/docs/json_values.hpp` and `ustore/docs/json_patch.hpp`, and this file implements `c/ustore/docs.h`.
+ *  @brief Implements `c/ustore/docs.h`: routes every document call to the docs verbs of the engine serving its
+ *      database, and spells the document field types and modifications.
  */
 
 #include "ustore/docs.h" // `ustore_docs_field_type_t`, `ustore_docs_modification_t`
 
-#include "blobs_layers/docs.hpp" // `docs_write_over_blobs`, `docs_read_over_blobs`, `docs_gather_over_blobs`
-#include "engine.hpp"            // `engine_t`, `docs_verbs_t`
-#include "lib.hpp"               // `route`, `enumerator_spelling`, `name_in`, `value_in`
+#include "engine.hpp" // `engine_t`, `docs_verbs_t`
+#include "lib.hpp"    // `route`, `enumerator_spelling`, `name_in`, `value_in`
 
 namespace unum::ustore {
 

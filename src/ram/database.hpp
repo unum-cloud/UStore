@@ -9,7 +9,7 @@
 #pragma once
 
 #include <cstddef> // `std::size_t`
-#include <cstdint> // `std::uint8_t`, `std::uint64_t`
+#include <cstdint> // `std::uint8_t`, `std::uint64_t`, `std::uintptr_t`
 #include <cstdio>  // `std::FILE`, `std::fopen`, `std::fread`, `std::fwrite`, `std::rename`
 #include <cstring> // `std::memcmp`, `std::memcpy`
 
@@ -23,6 +23,7 @@
 #include <algorithm>   // `std::max`
 #include <array>       // `std::array`
 #include <atomic>      // `std::memory_order`
+#include <chrono>      // `std::chrono::steady_clock`
 #include <limits>      // `std::numeric_limits`
 #include <new>         // `std::nothrow`
 #include <span>        // `std::span`
@@ -356,6 +357,18 @@ constexpr ustore_watch_t watches_reads(ustore_watch_t watch) noexcept {
                                                                                  : ustore_watch_none_k;
 }
 
+/** @p source as is, which records no reads. */
+template <isolation_t isolation_>
+reader_source<isolation_> reading_as(reader_source<isolation_> const& source, ustore_watch_t) noexcept {
+    return source;
+}
+
+/** @p source watching what it hands out as @p watch asks. */
+template <isolation_t isolation_>
+transaction_source<isolation_> reading_as(transaction_source<isolation_> const& source, ustore_watch_t watch) noexcept {
+    return {source.state, source.transaction, watches_reads<isolation_>(watch)};
+}
+
 /** Hands @p action the source @p view names: a snapshot, a transaction, or the newest stamp, claimed for the call. */
 template <isolation_t isolation_, typename action_type_>
 auto with_source(database_state<isolation_>& state, view_t const& view, action_type_&& action) noexcept {
@@ -481,18 +494,26 @@ constexpr auto entry_for(ustore_key_t const& key) noexcept {
 }
 
 /** Whether a walk of a collection's keys hands @p entry out: every pair, but only the vertex entries of a graph. */
-constexpr bool is_listed(value_pair_t const&) noexcept { return true; }
+template <typename mapped_type_>
+constexpr bool is_listed(st::mapping<ustore_key_t, mapped_type_> const&) noexcept {
+    return true;
+}
 constexpr bool is_listed(half_edge_t const& entry) noexcept {
     return entry.direction == half_edge_direction_t::vertex_k;
 }
 
 /** The key a listed entry names. */
-constexpr ustore_key_t const& listed_key(value_pair_t const& pair) noexcept { return pair.key; }
+template <typename mapped_type_>
+constexpr ustore_key_t const& listed_key(st::mapping<ustore_key_t, mapped_type_> const& pair) noexcept {
+    return pair.key;
+}
 constexpr ustore_key_t const& listed_key(half_edge_t const& entry) noexcept { return entry.vertex; }
 
-/** The value an entry reads as: its bytes, or none for a vertex, which keeps no value. */
-inline value_view_t value_of(value_pair_t const& pair) noexcept { return view_of(pair.mapped); }
-inline value_view_t value_of(half_edge_t const&) noexcept { return {}; }
+/** The bytes a blob, a document or a page reads as. */
+template <typename mapped_type_>
+value_view_t value_of(st::mapping<ustore_key_t, mapped_type_> const& pair) noexcept {
+    return view_of(blob_of(pair.mapped));
+}
 
 /** Reads tasks [ @p first, @p end ) of @p places through @p view of a collection of @p entry_type_ into @p outputs. */
 template <typename entry_type_, typename view_type_>
@@ -657,12 +678,13 @@ store_status_t scan_strings(view_type_ const& view, std::string_view prefix, std
 
 #pragma region Writes
 
-/** Stages @p content under @p key into @p transaction, which may be a store publishing it at once. */
-template <typename transaction_type_>
+/** Stages @p content under @p key into @p transaction, which may be a store publishing it at once, as the blob, the
+ *  document or the page an entry of @p entry_type_ holds. */
+template <typename entry_type_, typename transaction_type_>
 store_status_t stage_upsert(transaction_type_& transaction, ustore_key_t const& key, value_view_t content) noexcept {
     auto [copied, copy_blob_status] = copy_blob(content);
     if (st::failed(copy_blob_status)) return copy_blob_status;
-    return transaction.upsert(value_pair_t {key, std::move(copied)});
+    return transaction.upsert(entry_type_ {key, typename entry_type_::mapped_type {std::move(copied)}});
 }
 
 /** Stages erasing @p key, watching its absence when @p watch asks and the key is already gone. */
@@ -674,12 +696,12 @@ store_status_t stage_erase(transaction_type_& transaction, key_type_ const& key,
     return transaction.watch(key);
 }
 
-/** Stages the values of tasks [ @p first, @p end ) of a batch into @p transaction. */
-template <typename transaction_type_>
+/** Stages the values of tasks [ @p first, @p end ) of a batch into @p transaction, as entries of @p entry_type_. */
+template <typename entry_type_, typename transaction_type_>
 store_status_t stage_writes(transaction_type_& transaction, place_batch_t const& places, strings_arg_t const& values,
                             std::size_t first, std::size_t end) noexcept {
     for (std::size_t index = first; index != end; ++index) {
-        store_status_t const staged = stage_upsert(transaction, places[index].key, values[index]);
+        store_status_t const staged = stage_upsert<entry_type_>(transaction, places[index].key, values[index]);
         if (st::failed(staged)) return staged;
     }
     return store_status_t::success_k;
@@ -764,6 +786,61 @@ status_t serve_write(database_state<isolation_>& state, ustore_durability_t dura
     if (status_t const status = reported(committed, outcome); status.failed()) return status;
     if (durability == ustore_durability_flushed_k) return persist(state);
     return {};
+}
+
+/** Hands @p stage every run of @p count tasks on a collection whose store holds @p entry_type_ through @p source, with
+ *  the part of the transaction over that store, refusing a collection of any other modality. */
+template <typename entry_type_, typename source_type_, typename stage_type_>
+store_status_t stage_runs_of(source_type_& source, strided_iterator<ustore_collection_id_t const> collections,
+                             std::size_t count, status_t& outcome, stage_type_&& stage) noexcept {
+    return for_each_run(source, collections, count, outcome,
+                        [&](auto& entries, std::size_t first, std::size_t end) noexcept -> store_status_t {
+                            if constexpr (!std::is_same_v<entry_of<decltype(entries)>, entry_type_>)
+                                return refused_modality(outcome);
+                            else {
+                                auto part = source.part(entries);
+                                if (!part) return part.status();
+                                return stage(**part, first, end);
+                            }
+                        });
+}
+
+/** Removes the keys @p arguments name from collections whose stores hold @p entry_type_, committing a batch outside a
+ *  transaction atomically, where a key already gone stays gone. */
+template <typename entry_type_, isolation_t isolation_, typename arguments_type_>
+status_t remove_keys(database_state<isolation_>& state, arguments_type_ const& arguments, view_t const& view) noexcept {
+    place_batch_t const places = places_of(arguments);
+    if (status_t const status = validate_remove(view.transaction, places, arguments.durability, view.watch);
+        status.failed() || !arguments.count)
+        return status;
+    return serve_write(state, arguments.durability, view, [&](auto& source, status_t& outcome) noexcept {
+        return stage_runs_of<entry_type_>(source, places.collections_begin, places.size(), outcome,
+                                          [&](auto& part, std::size_t first, std::size_t end) noexcept {
+                                              return stage_removals(part, places, first, end, source.watch_mode);
+                                          });
+    });
+}
+
+/**
+ *  @brief Serves a read-modify-write of documents or pages through @c serve_write, reading and writing in one
+ *      transaction: the caller's, or one of the call's own, retried on conflicts.
+ *
+ *  @p modify is invoked as `modify(source, failure)` on every attempt and answers the status of the call, recording
+ *  into `failure` the first failure of the stores, which a commit retries when it is a conflict.
+ */
+template <isolation_t isolation_, typename modify_type_>
+status_t serve_read_modify_write(database_state<isolation_>& state, ustore_durability_t durability, view_t const& view,
+                                 modify_type_&& modify) noexcept {
+    return serve_write(state, durability, view,
+                       [&](transaction_source<isolation_>& source, status_t& outcome) noexcept -> store_status_t {
+                           store_status_t failure = store_status_t::success_k;
+                           outcome = modify(source, failure);
+                           if (st::failed(failure)) {
+                               outcome = {};
+                               return failure;
+                           }
+                           return outcome.failed() ? store_status_t::invalid_argument_k : store_status_t::success_k;
+                       });
 }
 
 #pragma endregion Writes
@@ -944,20 +1021,20 @@ store_status_t stage_emptied(transaction_source<isolation_>& source, collections
         collections_pair<isolation_, ram_atomic_ref, ram_waiter_t> {collection, std::move(emptied)});
 }
 
-/** Stages emptying every value @p transaction reaches, keeping every key. */
-template <typename transaction_type_>
+/** Stages emptying every blob, document or page of @p entry_type_ that @p transaction reaches, keeping every key. */
+template <typename entry_type_, typename transaction_type_>
 store_status_t stage_emptied_values(transaction_type_& transaction) noexcept {
     st::basic_vector<ustore_key_t> keys;
     store_status_t copied = store_status_t::success_k;
     store_status_t const walked = transaction.range_from(
-        smallest_key_k, [&](value_pair_t const& pair) noexcept -> walk_control_t {
+        smallest_key_k, [&](entry_type_ const& pair) noexcept -> walk_control_t {
             copied = keys.emplace_back(pair.key);
             return st::failed(copied) ? walk_control_t::halt_k : walk_control_t::resume_k;
         });
     if (st::failed(walked)) return walked;
     if (st::failed(copied)) return copied;
     for (std::size_t index = 0; index != keys.size(); ++index) {
-        store_status_t const emptied = stage_upsert(transaction, keys[index], value_view_t {});
+        store_status_t const emptied = transaction.upsert(entry_type_ {keys[index]});
         if (st::failed(emptied)) return emptied;
     }
     return store_status_t::success_k;
@@ -978,7 +1055,7 @@ store_status_t stage_values_emptied(transaction_source<isolation_>& source, usto
             else {
                 auto part = source.part(entries);
                 if (!part) return part.status();
-                return stage_emptied_values(**part);
+                return stage_emptied_values<entry_t>(**part);
             }
         });
 }
@@ -1066,9 +1143,10 @@ inline bool write_blob(std::FILE* file, blob_t const& blob) noexcept {
            (length == 0 || std::fwrite(blob.data(), 1, length, file) == length);
 }
 
-/** Writes one entry of a collection of values, answering whether all of it reached @p file. */
-inline bool write_entry(std::FILE* file, value_pair_t const& pair) noexcept {
-    return std::fwrite(&pair.key, sizeof(ustore_key_t), 1, file) == 1 && write_blob(file, pair.mapped);
+/** Writes one entry of a collection of blobs, documents or pages, answering whether all of it reached @p file. */
+template <typename mapped_type_>
+bool write_entry(std::FILE* file, st::mapping<ustore_key_t, mapped_type_> const& pair) noexcept {
+    return std::fwrite(&pair.key, sizeof(ustore_key_t), 1, file) == 1 && write_blob(file, blob_of(pair.mapped));
 }
 
 /** Writes one entry of a collection of strings, answering whether all of it reached @p file. */
@@ -1089,7 +1167,10 @@ auto first_entry() noexcept {
 }
 
 /** Bytes of the key and the value of an entry, which the progress of a save counts, a half-edge being all key. */
-inline std::size_t saved_bytes(value_pair_t const& pair) noexcept { return sizeof(ustore_key_t) + pair.mapped.size(); }
+template <typename mapped_type_>
+std::size_t saved_bytes(st::mapping<ustore_key_t, mapped_type_> const& pair) noexcept {
+    return sizeof(ustore_key_t) + blob_of(pair.mapped).size();
+}
 inline std::size_t saved_bytes(string_pair_t const& pair) noexcept {
     return pair.key.text.size() + sizeof(ustore_key_t);
 }
@@ -1225,8 +1306,9 @@ image_step_t load_entry(std::FILE* file, store_type_& store) noexcept {
         blob_t value;
         if (std::fread(&key, sizeof(ustore_key_t), 1, file) != 1) return image_step_t::truncated_k;
         if (image_step_t const loaded = load_blob(file, value); loaded != image_step_t::loaded_k) return loaded;
-        return st::failed(store.upsert(value_pair_t {key, std::move(value)})) ? image_step_t::refused_k
-                                                                              : image_step_t::loaded_k;
+        using mapped_t = typename entry_t::mapped_type;
+        return st::failed(store.upsert(entry_t {key, mapped_t {std::move(value)}})) ? image_step_t::refused_k
+                                                                                    : image_step_t::loaded_k;
     }
 }
 
@@ -1380,17 +1462,161 @@ std::size_t image_bytes(database_state<isolation_> const& state) noexcept {
 
 #pragma region Argument Views
 
-/** The tasks of a scan. */
-inline scan_batch_t scans_of(ustore_blobs_scan_t const& arguments) noexcept {
+/** The tasks of a scan of any modality. */
+template <typename arguments_type_>
+scan_batch_t scans_of(arguments_type_ const& arguments) noexcept {
     return {strided(arguments.collections), strided(arguments.start_keys), arguments.wanted, arguments.count};
 }
 
-/** The tasks of a sample. */
-inline sample_batch_t samples_of(ustore_blobs_sample_t const& arguments) noexcept {
+/** The tasks of a sample of any modality. */
+template <typename arguments_type_>
+sample_batch_t samples_of(arguments_type_ const& arguments) noexcept {
     return {strided(arguments.collections), arguments.wanted, arguments.count};
 }
 
 #pragma endregion Argument Views
+
+#pragma region Calls of Every Modality
+
+/** Implements the read of whole values from collections whose stores hold @p entry_type_, refusing any other, copying
+ *  every value into the caller's arena once. */
+template <typename entry_type_, isolation_t isolation_, typename arguments_type_>
+status_t read_values(database_state<isolation_>& state, arguments_type_ const& arguments, view_t const& view) noexcept {
+    if (!arguments.count) return {};
+    place_batch_t const places = places_of(arguments);
+    if (status_t const status = validate_read(places); status.failed()) return status;
+    status_t outcome;
+    auto [outputs, outputs_status] = read_outputs_t::make(arguments, view.scratch);
+    if (outputs_status.failed()) return outputs_status;
+
+    // The source's claim keeps every version found alive until the outputs copy its value
+    store_status_t const read = with_source(state, view, [&](auto& source) noexcept {
+        store_status_t const runs = for_each_run(
+            source, places.collections_begin, places.size(), outcome,
+            [&](auto& entries, std::size_t first, std::size_t end) noexcept -> store_status_t {
+                if constexpr (!std::is_same_v<entry_of<decltype(entries)>, entry_type_>)
+                    return refused_modality(outcome);
+                else {
+                    auto store = source.view(entries);
+                    if (!store) return store.status();
+                    return read_keys<entry_type_>(*store, places, first, end, outputs);
+                }
+            });
+        if (st::succeeded(runs) && outcome.succeeded()) outcome = outputs.finish(arguments);
+        return runs;
+    });
+    return reported(read, outcome);
+}
+
+/**
+ *  @brief Reads the documents or pages at @p places of collections whose stores hold @p entry_type_, refusing any
+ *      other, through @p source watching as @p view asks, appending their bytes to its scratch.
+ *  @param[out] presences The presence bits of the values read, in the scratch.
+ *  @param[out] contents The values read, missing ones empty, in the scratch.
+ *  @param[out] failure The failure of the stores, which a commit retries when it is a conflict.
+ */
+template <typename entry_type_, typename source_type_>
+status_t read_into_scratch(source_type_& source, place_batch_t const& places, view_t const& view,
+                           ustore_octet_t const*& presences, ustore_strings_view_t& contents,
+                           store_status_t& failure) noexcept {
+    ustore_blobs_read_t read {};
+    read.count = places.count;
+    read.presences = &presences;
+    read.values = &contents;
+    read.arena = view.scratch;
+    auto [outputs, outputs_status] = read_outputs_t::make(read, view.scratch);
+    if (outputs_status.failed()) return outputs_status;
+    source_type_ reading = reading_as(source, view.watch);
+    status_t outcome;
+    store_status_t const runs = for_each_run(
+        reading, places.collections_begin, places.size(), outcome,
+        [&](auto& entries, std::size_t first, std::size_t end) noexcept -> store_status_t {
+            if constexpr (!std::is_same_v<entry_of<decltype(entries)>, entry_type_>) return refused_modality(outcome);
+            else {
+                auto store = reading.view(entries);
+                if (!store) return store.status();
+                return read_keys<entry_type_>(*store, places, first, end, outputs);
+            }
+        });
+    if (outcome.failed()) return outcome;
+    if (st::failed(runs)) {
+        failure = runs;
+        return translate(runs);
+    }
+    return outputs.finish(read);
+}
+
+/** Implements the scan of collections whose stores hold @p entry_type_, refusing any other, as ordered walks of each
+ *  collection's keys, a graph's being its vertices. */
+template <typename entry_type_, isolation_t isolation_, typename arguments_type_>
+status_t scan_keys(database_state<isolation_>& state, arguments_type_ const& arguments, view_t const& view) noexcept {
+    scan_batch_t const scans = scans_of(arguments);
+    if (status_t const status = validate_scan(arguments); status.failed() || !arguments.count) return status;
+    auto [outputs, outputs_status] = scan_outputs_t::make(arguments, view.scratch);
+    if (outputs_status.failed()) return outputs_status;
+    progress_t progress {arguments.progress, arguments.progress_state, arguments.count};
+
+    status_t outcome;
+    store_status_t const walked = with_source(state, view, [&](auto& source) noexcept {
+        return for_each_run(source, scans.collections, scans.size(), outcome,
+                            [&](auto& entries, std::size_t first, std::size_t end) noexcept -> store_status_t {
+                                if constexpr (!std::is_same_v<entry_of<decltype(entries)>, entry_type_>)
+                                    return refused_modality(outcome);
+                                else {
+                                    auto store = source.view(entries);
+                                    if (!store) return store.status();
+                                    for (std::size_t task = first; task != end && outcome.succeeded(); ++task) {
+                                        outputs.open_task(task);
+                                        store_status_t const scanned = scan_window<entry_type_>(*store, scans[task],
+                                                                                                outputs, outcome);
+                                        if (st::failed(scanned) || outcome.failed()) return scanned;
+                                        if (!progress.advance(1)) outcome = progress_cancelled_k;
+                                    }
+                                    return store_status_t::success_k;
+                                }
+                            });
+    });
+    if (status_t const status = reported(walked, outcome); status.failed()) return status;
+    return outputs.finish(arguments);
+}
+
+/** Implements the sample of collections whose stores hold @p entry_type_, refusing any other, as a reservoir filled
+ *  from a walk of each collection's keys. */
+template <typename entry_type_, isolation_t isolation_, typename arguments_type_>
+status_t sample_keys(database_state<isolation_>& state, arguments_type_ const& arguments, view_t const& view) noexcept {
+    if (!arguments.count) return {};
+    if (!arguments.offsets || !arguments.keys)
+        return {status_code_t::invalid_argument_k, "Need outputs for the offsets and the keys"};
+    sample_batch_t const samples = samples_of(arguments);
+    auto [outputs, outputs_status] = scan_outputs_t::make(arguments, view.scratch);
+    if (outputs_status.failed()) return outputs_status;
+    auto const now = static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+    sample_generator_t generator {now ^ reinterpret_cast<std::uintptr_t>(&outputs)};
+
+    status_t outcome;
+    store_status_t const walked = with_source(state, view, [&](auto& source) noexcept {
+        return for_each_run(source, samples.collections, samples.size(), outcome,
+                            [&](auto& entries, std::size_t first, std::size_t end) noexcept -> store_status_t {
+                                if constexpr (!std::is_same_v<entry_of<decltype(entries)>, entry_type_>)
+                                    return refused_modality(outcome);
+                                else {
+                                    auto store = source.view(entries);
+                                    if (!store) return store.status();
+                                    for (std::size_t task = first; task != end; ++task) {
+                                        outputs.open_task(task);
+                                        store_status_t const sampled = sample_window<entry_type_>(
+                                            *store, samples[task], generator, outputs, outcome);
+                                        if (st::failed(sampled) || outcome.failed()) return sampled;
+                                    }
+                                    return store_status_t::success_k;
+                                }
+                            });
+    });
+    if (status_t const status = reported(walked, outcome); status.failed()) return status;
+    return outputs.finish(arguments);
+}
+
+#pragma endregion Calls of Every Modality
 
 #pragma region Database Calls
 

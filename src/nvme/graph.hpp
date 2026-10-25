@@ -5,9 +5,9 @@
  *  @brief The graph calls of the C ABI over the graph stores of `include/ustore/graph/nvme_store.hpp`, for the NVMe
  *      engine's table.
  *
- *  `src/nvme/variants.hpp` includes this file right before its table, as these calls build on its accesses, its
- *  writes and its collection lookups. Every vertex is one key of its graph collection, holding the half-edges of
- *  `include/ustore/graph/adjacency_fold.hpp`, and every edge is a half-edge filed under each of its ends.
+ *  These calls build on the accesses, the writes and the collection lookups of `src/nvme/database.hpp`. Every vertex
+ *  is one key of its graph collection, holding the half-edges of `include/ustore/graph/adjacency_fold.hpp`, and every
+ *  edge is a half-edge filed under each of its ends.
  *
  *  A write appends one change delta per touched vertex and reads nothing, so two transactions adding edges to one
  *  vertex both commit. What a write does depend on is watched, as a read is: a vertex an edge or a vertex write

@@ -7,9 +7,10 @@
  *      one stamp.
  *
  *  Every store is a partitioned AVL tree of versions, each partition locked by a spin lock owning its word through the
- *  atomic reference and stalling through the waiter every store here takes. A blobs, documents or pages collection
- *  maps UUID keys onto values, a strings collection and the names map strings onto 16-byte keys held inline, and a
- *  graph collection holds half-edges with no values.
+ *  atomic reference and stalling through the waiter every store here takes. A blobs collection maps UUID keys onto
+ *  values, a documents collection onto JSON text and a pages collection onto dense element trees, each a store of its
+ *  own type, a strings collection and the names map strings onto 16-byte keys held inline, and a graph collection
+ *  holds half-edges with no values.
  */
 
 #pragma once
@@ -58,8 +59,47 @@ using staging_t = st::staging_t;
 /** A stamp of the commit order: what a snapshot reads at, and what a commit publishes under. */
 using generation_t = st::generation_t;
 
+/** The JSON text of a document, owning its bytes, apart from a blob so a documents store is a type of its own. */
+struct document_text_t {
+
+    /** Bytes of the JSON text. */
+    blob_t text;
+
+    /** A copy owning bytes of its own, or why they could not be allocated. */
+    st::expected<document_text_t> copy() const noexcept {
+        st::expected<blob_t> copied = text.copy();
+        if (!copied) return copied.status();
+        return document_text_t {std::move(*copied)};
+    }
+};
+
+/** The dense element tree of a page, owning its bytes, apart from a blob so a pages store is a type of its own. */
+struct page_tree_bytes_t {
+
+    /** Bytes of the encoded tree. */
+    blob_t tree;
+
+    /** A copy owning bytes of its own, or why they could not be allocated. */
+    st::expected<page_tree_bytes_t> copy() const noexcept {
+        st::expected<blob_t> copied = tree.copy();
+        if (!copied) return copied.status();
+        return page_tree_bytes_t {std::move(*copied)};
+    }
+};
+
+/** The bytes a blob, a document or a page holds. */
+inline blob_t const& blob_of(blob_t const& value) noexcept { return value; }
+inline blob_t const& blob_of(document_text_t const& document) noexcept { return document.text; }
+inline blob_t const& blob_of(page_tree_bytes_t const& page) noexcept { return page.tree; }
+
 /** A value filed under its key. */
 using value_pair_t = st::mapping<ustore_key_t, blob_t>;
+
+/** A document filed under its key. */
+using document_pair_t = st::mapping<ustore_key_t, document_text_t>;
+
+/** A page filed under its key. */
+using page_pair_t = st::mapping<ustore_key_t, page_tree_bytes_t>;
 
 /** A string and the 16-byte key it maps onto, held inline. */
 using string_pair_t = st::mapping<string_key_t, ustore_key_t>;
@@ -77,10 +117,20 @@ using ordered_store = st::partitioned_store<
     st::snapshot_store<st::basic_avl_tree<entry_type_, order_type_, st::default_allocator<entry_type_>>, isolation_>,
     hash_type_, engine_mutex<atomic_reference_, waiter_type_>>;
 
-/** A collection of blobs, documents or pages: every key mapped onto the bytes of its value. */
+/** A blobs collection: every key mapped onto the bytes of its value. */
 template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_>
 using values_by_key_store =
     ordered_store<value_pair_t, uuid_order_t, uuid_hash_t, isolation_, atomic_reference_, waiter_type_>;
+
+/** A documents collection: every key mapped onto the JSON text of its document, edited in place. */
+template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_>
+using documents_by_key_store =
+    ordered_store<document_pair_t, uuid_order_t, uuid_hash_t, isolation_, atomic_reference_, waiter_type_>;
+
+/** A pages collection: every key mapped onto the dense element tree of its page, edited in place. */
+template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_>
+using pages_by_key_store =
+    ordered_store<page_pair_t, uuid_order_t, uuid_hash_t, isolation_, atomic_reference_, waiter_type_>;
 
 /** A strings collection, and the names system collection, which maps names onto collection IDs. */
 template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_>
@@ -134,7 +184,9 @@ struct collection_store {
     /** The collection's entries. */
     std::variant<values_by_key_store<isolation_, atomic_reference_, waiter_type_>,
                  keys_by_string_store<isolation_, atomic_reference_, waiter_type_>,
-                 half_edges_store<isolation_, atomic_reference_, waiter_type_>>
+                 half_edges_store<isolation_, atomic_reference_, waiter_type_>,
+                 documents_by_key_store<isolation_, atomic_reference_, waiter_type_>,
+                 pages_by_key_store<isolation_, atomic_reference_, waiter_type_>>
         entries;
 
     /** The store retired before this one, while this one waits to be freed. */
@@ -153,7 +205,9 @@ using collections_transaction =
     st::dynamic_transaction_group<collections_by_id_store<isolation_, atomic_reference_, waiter_type_>,
                                   values_by_key_store<isolation_, atomic_reference_, waiter_type_>,
                                   keys_by_string_store<isolation_, atomic_reference_, waiter_type_>,
-                                  half_edges_store<isolation_, atomic_reference_, waiter_type_>>;
+                                  half_edges_store<isolation_, atomic_reference_, waiter_type_>,
+                                  documents_by_key_store<isolation_, atomic_reference_, waiter_type_>,
+                                  pages_by_key_store<isolation_, atomic_reference_, waiter_type_>>;
 
 /** How many times an engine-internal commit is attempted before its conflicts reach the caller. */
 inline constexpr std::size_t commit_attempts_k = 16;
@@ -226,6 +280,12 @@ collection_store<isolation_, atomic_reference_, waiter_type_>* allocate_store(or
     if (modality == ustore_modality_graph_k)
         return new (std::nothrow)
             store_t(std::in_place_type<half_edges_store<isolation_, atomic_reference_, waiter_type_>>, order);
+    if (modality == ustore_modality_docs_k)
+        return new (std::nothrow)
+            store_t(std::in_place_type<documents_by_key_store<isolation_, atomic_reference_, waiter_type_>>, order);
+    if (modality == ustore_modality_pages_k)
+        return new (std::nothrow)
+            store_t(std::in_place_type<pages_by_key_store<isolation_, atomic_reference_, waiter_type_>>, order);
     return new (std::nothrow)
         store_t(std::in_place_type<values_by_key_store<isolation_, atomic_reference_, waiter_type_>>, order);
 }

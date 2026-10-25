@@ -35,7 +35,10 @@
  *  A block stores the bytes a key shares with its predecessor once, so the leading UUID costs little on disk.
  */
 
-#include "engine.hpp" // `engine_t`, `guarded`, `route_init`, `docs_read_over_blobs`, `pages_read_over_blobs`
+#include "blobs_layers/docs.hpp"  // `docs_write_over_blobs`, `docs_read_over_blobs`, `docs_gist_over_blobs`
+#include "blobs_layers/graph.hpp" // `graph_read_edges_over_blobs`, `graph_write_edges_over_blobs`
+#include "blobs_layers/pages.hpp" // `pages_import_over_blobs`, `pages_read_over_blobs`
+#include "engine.hpp"             // `engine_t`, `guarded`, `route_init`, `remove_over_blobs`, `scan_over_blobs`
 
 #include "database.hpp" // `database_open`, `database_describe`, `collection_create`, `snapshot_init`
 #include "blobs.hpp"    // `blobs_write`, `blobs_remove`, `blobs_read`, `blobs_scan`, `blobs_sample`

@@ -5,13 +5,15 @@
  *  @brief Embedded in-memory engine on SmashTable, strictly serializable or snapshot-isolated as configured at open.
  *
  *  Every collection keeps a partitioned multi-version store of its own, of the kind its modality picks: key UUIDs
- *  mapped onto values for blobs, documents and pages, strings mapped onto 16-byte keys for strings, and the
- *  half-edges of a graph. No stored key carries its collection. The `_collections` system collection maps every
- *  collection's UUID onto its modality, its name and its store, and the `_names` system collection, a store of the
- *  strings kind, maps every name onto its collection's UUID. Every store is built into one commit order, so a
- *  transaction spanning any number of them publishes under one stamp and a snapshot reads all of them at it.
- *  Dropping a collection retires its store at the drop's stamp, and the store is freed once no reader holds an older
- *  one. A database with a directory persists as one binary image, rewritten whole on a flush and on close.
+ *  mapped onto values for blobs, onto JSON text for documents and onto dense element trees for pages, strings mapped
+ *  onto 16-byte keys for strings, and the half-edges of a graph. Documents and pages are edited in place, each edit
+ *  reading, modifying and writing them back inside one transaction. No stored key carries its collection. The
+ *  `_collections` system collection maps every collection's UUID onto its modality, its name and its store, and the
+ *  `_names` system collection, a store of the strings kind, maps every name onto its collection's UUID. Every store
+ *  is built into one commit order, so a transaction spanning any number of them publishes under one stamp and a
+ *  snapshot reads all of them at it. Dropping a collection retires its store at the drop's stamp, and the store is
+ *  freed once no reader holds an older one. A database with a directory persists as one binary image, rewritten whole
+ *  on a flush and on close.
  */
 
 #include <atomic>      // `std::memory_order`
@@ -20,13 +22,15 @@
 
 #include "ustore/db.h"
 
-#include "engine.hpp" // `engine_t`, `handle_cast`, `c_handle`, `guarded_by`, `docs_read_over_blobs`
+#include "engine.hpp" // `engine_t`, `handle_cast`, `c_handle`, `guarded_by`
 #include "lib.hpp"    // `route_init`
 
 #include "database.hpp" // `database_state`, `transaction_handle`, `snapshot_handle`, `resolve_modality`, `persist`
 #include "blobs.hpp"    // the `serve` overloads of the blobs calls
 #include "strings.hpp"  // the `serve` overloads of the strings calls
+#include "docs.hpp"     // the `serve` overloads of the documents calls
 #include "graph.hpp"    // the `serve` overloads of the graph calls
+#include "pages.hpp"    // the `serve` overloads of the pages calls
 
 namespace unum::ustore::ram {
 
@@ -123,27 +127,21 @@ database_verbs_t const database_verbs_k {
     .database_free = &database_free<isolation_>,
 };
 
-/** The unchecked whole-value verbs at @p isolation_ of every collection keyed by UUIDs, which the layers over blobs
- *  reach. */
-template <isolation_t isolation_>
-constexpr blobs_verbs_t values_verbs_k {
-    .write = &serve_database<isolation_, ustore_blobs_write_t, strings_arg_t>,
-    .remove = &serve_database<isolation_, ustore_blobs_remove_t>,
-    .read = &serve_database<isolation_, ustore_blobs_read_t>,
-    .scan = &serve_database<isolation_, ustore_blobs_scan_t>,
-    .sample = &serve_database<isolation_, ustore_blobs_sample_t>,
-    .measure = &serve_database<isolation_, ustore_blobs_measure_t>,
-};
-
 /** The verbs of this engine's blobs collections at @p isolation_. */
 template <isolation_t isolation_>
 blobs_verbs_t const blobs_verbs_k {
-    .write = &guarded_by<ustore_modality_blobs_k, &resolve_modality<isolation_>, values_verbs_k<isolation_>.write>,
-    .remove = &guarded_by<ustore_modality_blobs_k, &resolve_modality<isolation_>, values_verbs_k<isolation_>.remove>,
-    .read = &guarded_by<ustore_modality_blobs_k, &resolve_modality<isolation_>, values_verbs_k<isolation_>.read>,
-    .scan = &guarded_by<ustore_modality_blobs_k, &resolve_modality<isolation_>, values_verbs_k<isolation_>.scan>,
-    .sample = &guarded_by<ustore_modality_blobs_k, &resolve_modality<isolation_>, values_verbs_k<isolation_>.sample>,
-    .measure = &guarded_by<ustore_modality_blobs_k, &resolve_modality<isolation_>, values_verbs_k<isolation_>.measure>,
+    .write = &guarded_by<ustore_modality_blobs_k, &resolve_modality<isolation_>,
+                         &serve_database<isolation_, ustore_blobs_write_t, strings_arg_t>>,
+    .remove = &guarded_by<ustore_modality_blobs_k, &resolve_modality<isolation_>,
+                          &serve_database<isolation_, ustore_blobs_remove_t>>,
+    .read = &guarded_by<ustore_modality_blobs_k, &resolve_modality<isolation_>,
+                        &serve_database<isolation_, ustore_blobs_read_t>>,
+    .scan = &guarded_by<ustore_modality_blobs_k, &resolve_modality<isolation_>,
+                        &serve_database<isolation_, ustore_blobs_scan_t>>,
+    .sample = &guarded_by<ustore_modality_blobs_k, &resolve_modality<isolation_>,
+                          &serve_database<isolation_, ustore_blobs_sample_t>>,
+    .measure = &guarded_by<ustore_modality_blobs_k, &resolve_modality<isolation_>,
+                           &serve_database<isolation_, ustore_blobs_measure_t>>,
 };
 
 /** The verbs of this engine's strings collections at @p isolation_. */
@@ -155,16 +153,16 @@ strings_verbs_t const strings_verbs_k {
     .scan = &serve_database<isolation_, ustore_strings_scan_t, strings_arg_t, strings_arg_t>,
 };
 
-/** The verbs of this engine's documents collections at @p isolation_, over its values until it keeps them natively. */
+/** The verbs of this engine's documents collections at @p isolation_. */
 template <isolation_t isolation_>
 docs_verbs_t const docs_verbs_k {
-    .write = &docs_write_over_blobs<values_verbs_k<isolation_>, &resolve_modality<isolation_>>,
-    .read = &docs_read_over_blobs<values_verbs_k<isolation_>, &resolve_modality<isolation_>>,
-    .gist = &docs_gist_over_blobs<values_verbs_k<isolation_>, &resolve_modality<isolation_>>,
-    .gather = &docs_gather_over_blobs<values_verbs_k<isolation_>, &resolve_modality<isolation_>>,
-    .remove = &remove_over_blobs<values_verbs_k<isolation_>, &resolve_modality<isolation_>, ustore_modality_docs_k>,
-    .scan = &scan_over_blobs<values_verbs_k<isolation_>, &resolve_modality<isolation_>, ustore_modality_docs_k>,
-    .sample = &sample_over_blobs<values_verbs_k<isolation_>, &resolve_modality<isolation_>, ustore_modality_docs_k>,
+    .write = &serve_database<isolation_, ustore_docs_write_t, strings_arg_t, strings_arg_t>,
+    .read = &serve_database<isolation_, ustore_docs_read_t, strings_arg_t>,
+    .gist = &serve_database<isolation_, ustore_docs_gist_t>,
+    .gather = &serve_database<isolation_, ustore_docs_gather_t, strings_arg_t>,
+    .remove = &serve_database<isolation_, ustore_docs_remove_t>,
+    .scan = &serve_database<isolation_, ustore_docs_scan_t>,
+    .sample = &serve_database<isolation_, ustore_docs_sample_t>,
 };
 
 /** The verbs of this engine's graph collections at @p isolation_. */
@@ -175,22 +173,21 @@ graph_verbs_t const graph_verbs_k {
     .remove_edges = &serve_database<isolation_, ustore_graph_remove_edges_t>,
     .write_vertices = &serve_database<isolation_, ustore_graph_write_vertices_t>,
     .remove_vertices = &serve_database<isolation_, ustore_graph_remove_vertices_t>,
-    .scan_vertices =
-        &scan_over_blobs<values_verbs_k<isolation_>, &resolve_modality<isolation_>, ustore_modality_graph_k>,
+    .scan_vertices = &serve_database<isolation_, ustore_graph_scan_vertices_t>,
 };
 
-/** The verbs of this engine's pages collections at @p isolation_, over its values until it keeps them natively. */
+/** The verbs of this engine's pages collections at @p isolation_. */
 template <isolation_t isolation_>
 pages_verbs_t const pages_verbs_k {
-    .import = &pages_import_over_blobs<values_verbs_k<isolation_>, &resolve_modality<isolation_>>,
-    .insert = &pages_insert_over_blobs<values_verbs_k<isolation_>, &resolve_modality<isolation_>>,
-    .remove = &pages_remove_over_blobs<values_verbs_k<isolation_>, &resolve_modality<isolation_>>,
-    .move = &pages_move_over_blobs<values_verbs_k<isolation_>, &resolve_modality<isolation_>>,
-    .splice = &pages_splice_over_blobs<values_verbs_k<isolation_>, &resolve_modality<isolation_>>,
-    .set_attributes = &pages_set_attributes_over_blobs<values_verbs_k<isolation_>, &resolve_modality<isolation_>>,
-    .remove_attributes = &pages_remove_attributes_over_blobs<values_verbs_k<isolation_>, &resolve_modality<isolation_>>,
-    .read = &pages_read_over_blobs<values_verbs_k<isolation_>, &resolve_modality<isolation_>>,
-    .scan = &scan_over_blobs<values_verbs_k<isolation_>, &resolve_modality<isolation_>, ustore_modality_pages_k>,
+    .import = &serve_database<isolation_, ustore_pages_import_t, strings_arg_t>,
+    .insert = &serve_database<isolation_, ustore_pages_insert_t, strings_arg_t>,
+    .remove = &serve_database<isolation_, ustore_pages_remove_t>,
+    .move = &serve_database<isolation_, ustore_pages_move_t>,
+    .splice = &serve_database<isolation_, ustore_pages_splice_t, strings_arg_t>,
+    .set_attributes = &serve_database<isolation_, ustore_pages_set_attributes_t, strings_arg_t, strings_arg_t>,
+    .remove_attributes = &serve_database<isolation_, ustore_pages_remove_attributes_t, strings_arg_t>,
+    .read = &serve_database<isolation_, ustore_pages_read_t>,
+    .scan = &serve_database<isolation_, ustore_pages_scan_t>,
 };
 
 template <isolation_t isolation_>

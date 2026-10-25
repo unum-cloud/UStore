@@ -43,6 +43,9 @@
 
 #pragma once
 
+#include "blobs_layers/docs.hpp"  // `docs_read_over_blobs`, `docs_gist_over_blobs`, `docs_gather_over_blobs`
+#include "blobs_layers/pages.hpp" // `pages_read_over_blobs`
+
 #include "database.hpp" // `nvme_variant`, `database_describe`, `resolve_modality`, `transaction_free`
 #include "blobs.hpp"    // `blobs_write`, `remove_values`, `read_values`, `scan_values`, `sample_values`
 #include "strings.hpp"  // `strings_write`, `strings_remove`, `strings_read`, `strings_scan`

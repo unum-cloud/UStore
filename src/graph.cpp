@@ -2,19 +2,14 @@
  *  @file src/graph.cpp
  *  @author Ash Vardanian
  *  @date January 11, 2023
- *  @brief The graph modality over the whole-value verbs of the one engine serving it, storing every vertex as one value
- *      of its degrees and sorted neighborships.
- *
- *  The codec of a vertex value, its degrees and its sorted neighborships, lives in `ustore/graph/vertex_values.hpp`.
- *  This file reads and writes those values through the engine's own unchecked whole-value verbs, and implements
- *  `c/ustore/graph.h` over them: routing every graph call to its engine, and the spelling of vertex roles.
+ *  @brief Implements `c/ustore/graph.h`: routes every graph call to the graph verbs of the engine serving its
+ *      database, and spells the vertex roles.
  */
 
 #include "ustore/graph.h" // `ustore_vertex_role_t`
 
-#include "blobs_layers/graph.hpp" // `graph_read_edges_over_blobs`, `graph_write_edges_over_blobs`
-#include "engine.hpp"             // `engine_t`, `graph_verbs_t`
-#include "lib.hpp"                // `route`, `enumerator_spelling`, `name_in`, `value_in`
+#include "engine.hpp" // `engine_t`, `graph_verbs_t`
+#include "lib.hpp"    // `route`, `enumerator_spelling`, `name_in`, `value_in`
 
 namespace unum::ustore {
 

@@ -21,7 +21,7 @@
 #include "ustore/graph/ram_graph.hpp"       // `export_edges`, `stage_edges`, `stage_vertex_removal`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_copy`, `arena_allocator`
 
-#include "database.hpp"          // `database_state`, `with_source`, `for_each_run`, `serve_write`
+#include "database.hpp"          // `database_state`, `with_source`, `stage_runs_of`, `serve_write`, `scan_keys`
 #include "utilities/batches.hpp" // `edges_batch_t`, `edges_of`
 
 namespace unum::ustore::ram {
@@ -76,23 +76,6 @@ status_t serve(database_state<isolation_>& state, ustore_graph_read_edges_t cons
     return {};
 }
 
-/** Hands @p stage every run of @p count tasks on a graph collection through @p source, with the part of the
- *  transaction over its half-edges, refusing a collection that holds no graph. */
-template <typename source_type_, typename stage_type_>
-store_status_t stage_graph_runs(source_type_& source, strided_iterator<ustore_collection_id_t const> collections,
-                                std::size_t count, status_t& outcome, stage_type_&& stage) noexcept {
-    return for_each_run(source, collections, count, outcome,
-                        [&](auto& entries, std::size_t first, std::size_t end) noexcept -> store_status_t {
-                            using entry_t = entry_of<decltype(entries)>;
-                            if constexpr (!std::is_same_v<entry_t, half_edge_t>) return refused_modality(outcome);
-                            else {
-                                auto part = source.part(entries);
-                                if (!part) return part.status();
-                                return stage(**part, first, end);
-                            }
-                        });
-}
-
 /** Implements @c ustore_graph_write_edges, filing every edge under both of its ends. */
 template <isolation_t isolation_>
 status_t serve(database_state<isolation_>& state, ustore_graph_write_edges_t const& arguments,
@@ -103,10 +86,10 @@ status_t serve(database_state<isolation_>& state, ustore_graph_write_edges_t con
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     edges_view_t const edges = edges_of(arguments);
     return serve_write(state, arguments.durability, view, [&](auto& source, status_t& outcome) noexcept {
-        return stage_graph_runs(source, collections, arguments.count, outcome,
-                                [&](auto& part, std::size_t first, std::size_t end) noexcept {
-                                    return stage_edges(part, edges, first, end);
-                                });
+        return stage_runs_of<half_edge_t>(source, collections, arguments.count, outcome,
+                                          [&](auto& part, std::size_t first, std::size_t end) noexcept {
+                                              return stage_edges(part, edges, first, end);
+                                          });
     });
 }
 
@@ -120,10 +103,10 @@ status_t serve(database_state<isolation_>& state, ustore_graph_remove_edges_t co
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     edges_view_t const edges = edges_of(arguments);
     return serve_write(state, arguments.durability, view, [&](auto& source, status_t& outcome) noexcept {
-        return stage_graph_runs(source, collections, arguments.count, outcome,
-                                [&](auto& part, std::size_t first, std::size_t end) noexcept {
-                                    return stage_edges_removal(part, edges, first, end);
-                                });
+        return stage_runs_of<half_edge_t>(source, collections, arguments.count, outcome,
+                                          [&](auto& part, std::size_t first, std::size_t end) noexcept {
+                                              return stage_edges_removal(part, edges, first, end);
+                                          });
     });
 }
 
@@ -136,14 +119,14 @@ status_t serve(database_state<isolation_>& state, ustore_graph_write_vertices_t 
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     strided_iterator<ustore_key_t const> const vertices = strided(arguments.vertices);
     return serve_write(state, arguments.durability, view, [&](auto& source, status_t& outcome) noexcept {
-        return stage_graph_runs(source, collections, arguments.count, outcome,
-                                [&](auto& part, std::size_t first, std::size_t end) noexcept {
-                                    for (std::size_t index = first; index != end; ++index) {
-                                        store_status_t const staged = stage_vertex(part, vertices[index]);
-                                        if (st::failed(staged)) return staged;
-                                    }
-                                    return store_status_t::success_k;
-                                });
+        return stage_runs_of<half_edge_t>(source, collections, arguments.count, outcome,
+                                          [&](auto& part, std::size_t first, std::size_t end) noexcept {
+                                              for (std::size_t index = first; index != end; ++index) {
+                                                  store_status_t const staged = stage_vertex(part, vertices[index]);
+                                                  if (st::failed(staged)) return staged;
+                                              }
+                                              return store_status_t::success_k;
+                                          });
     });
 }
 
@@ -159,7 +142,7 @@ status_t serve(database_state<isolation_>& state, ustore_graph_remove_vertices_t
     strided_iterator<ustore_vertex_role_t const> const roles = strided(arguments.roles);
     st::basic_vector<half_edge_t, arena_allocator<half_edge_t>> walked {{view.scratch}};
     return serve_write(state, arguments.durability, view, [&](auto& source, status_t& outcome) noexcept {
-        return stage_graph_runs(
+        return stage_runs_of<half_edge_t>(
             source, collections, arguments.count, outcome,
             [&](auto& part, std::size_t first, std::size_t end) noexcept {
                 for (std::size_t index = first; index != end; ++index) {
@@ -170,6 +153,13 @@ status_t serve(database_state<isolation_>& state, ustore_graph_remove_vertices_t
                 return store_status_t::success_k;
             });
     });
+}
+
+/** Implements @c ustore_graph_scan_vertices as ordered walks of each graph's vertex entries. */
+template <isolation_t isolation_>
+status_t serve(database_state<isolation_>& state, ustore_graph_scan_vertices_t const& arguments,
+               view_t const& view) noexcept {
+    return scan_keys<half_edge_t>(state, arguments, view);
 }
 
 #pragma endregion Graph Calls

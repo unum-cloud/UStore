@@ -40,6 +40,7 @@ using utilities::byte_t;
 using utilities::expected;
 using utilities::status_code_t;
 using utilities::status_t;
+using utilities::uuid_text_length_k;
 using utilities::value_view_t;
 
 #pragma region Number Formatting
@@ -49,9 +50,6 @@ constexpr std::size_t printed_number_length_limit_k = 32;
 
 /** Bytes of a UUID. */
 constexpr std::size_t uuid_bytes_k = 16;
-
-/** Characters of a UUID in its canonical 8-4-4-4-12 hexadecimal text. */
-constexpr std::size_t uuid_text_length_k = 36;
 
 using printed_number_buffer_t = char[printed_number_length_limit_k];
 

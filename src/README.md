@@ -2,8 +2,10 @@
 
 Every engine implements the C ABI of `c/ustore/*.h` over its own storage, and joins the router's sources in the one source list both the `ustore_static` archive and the `ustore_shared` library build from, so documents and graphs work on each of them.
 `src/lib.hpp` is the router every exported call goes through, and each public header has one source implementing it: `types.cpp`, `db.cpp`, `blobs.cpp`, `strings.cpp`, `docs.cpp`, `graph.cpp` and `pages.cpp`.
-`blobs_layers/docs.hpp` and `blobs_layers/graph.hpp` also keep documents and graphs as read-modify-writes over the codecs of `include/ustore/docs/` and `include/ustore/graph/`, through the unchecked whole-value verbs of the one engine instantiating their `*_over_blobs` templates.
+Those sources only route: each engine includes the layers it serves a modality through.
+`blobs_layers/docs.hpp` and `blobs_layers/graph.hpp` keep documents and graphs as read-modify-writes over the codecs of `include/ustore/docs/` and `include/ustore/graph/`, through the unchecked whole-value verbs of the one engine instantiating their `*_over_blobs` templates.
 `blobs_layers/pages.hpp` keeps pages the same way, each as one value under its page key: its current shape, the dense element tree of `include/ustore/pages/`.
+The document and page paths take the reads and writes of an engine as an object, so `ram` runs them over its own stores.
 Every verb serves only collections of its own modality: each engine's resolver refuses any other with the one status of `collection_holds_another_modality`, and its public blobs verbs wrap the unchecked ones in that check.
 The reusable templates the engines instantiate live in `include/ustore/`, which [its own guide](../include/ustore/README.md) describes.
 The engines fill three roles: `ram` is the reference engine in memory, NVMe is the hyper-converged engine on NVMe drives and GPUs, and RocksDB and LevelDB bring third-party key-value stores behind the same calls.
@@ -19,7 +21,8 @@ Engines aim for the highest isolation `ram` delivers, each reports the level its
 ## RAM
 
 `src/ram/` is the reference in-memory engine, and the one every other engine is checked against.
-Every collection keeps a stamp-based SmashTable `partitioned_store` of its own, of the kind its modality picks: UUID keys mapped onto values for blobs, documents and pages, strings mapped onto values for strings, and the half-edges of a graph, so no stored key carries its collection.
+Every collection keeps a stamp-based SmashTable `partitioned_store` of its own, of the kind its modality picks: UUID keys mapped onto values for blobs, onto JSON text for documents and onto dense element trees for pages, strings mapped onto values for strings, and the half-edges of a graph, so no stored key carries its collection.
+`src/ram/docs.hpp` and `src/ram/pages.hpp` edit documents and pages in place, reading, modifying and writing them back inside one transaction, the caller's or one of the call's own retried on conflicts.
 The `_collections` system collection maps the UUID of every collection onto its modality, its name and its store, and the `_names` system collection maps every name onto its collection's UUID.
 Every store is built into one commit order, and a `dynamic_transaction_group` joins whichever stores a transaction reaches, so it publishes under one stamp and a snapshot reads all of them at it.
 A stage reports the group's `snapshot()` as its read stamp and a commit its `commit_stamp()`, never the `generation()` that only tags the group's uncommitted versions.
