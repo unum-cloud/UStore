@@ -64,7 +64,8 @@ struct database_types {
     using volume_t = typename fixture_t::volume_t;
     using router_t = basic_volume_router<volume_t>;
     template <value_layout_t value_layout_>
-    using blobs_store_of = nvme_store<key_slot<stored_key_t, value_layout_>, volume_t, atomic_reference, waiter_t>;
+    using blobs_store_of = nvme_store<key_slot<stored_key_t, value_layout_>, volume_t, atomic_reference, waiter_t,
+                                      last_write_fold_t, no_device_fold_t>;
     using database_t = basic_database<
         stored_key_t, volume_t, atomic_reference, waiter_t, blobs_store_of<value_layout_t::inline_1_byte_k>,
         blobs_store_of<value_layout_t::inline_4_bytes_k>, blobs_store_of<value_layout_t::inline_8_bytes_k>,

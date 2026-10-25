@@ -63,7 +63,8 @@ struct database_types {
     using volume_t = typename fixture_t::volume_t;
     using router_t = basic_volume_router<volume_t>;
     template <value_layout_t value_layout_>
-    using blobs_store_of = nvme_store<key_slot<stored_key_t, value_layout_>, volume_t, atomic_reference, waiter_t>;
+    using blobs_store_of = nvme_store<key_slot<stored_key_t, value_layout_>, volume_t, atomic_reference, waiter_t,
+                                      last_write_fold_t, no_device_fold_t>;
     using strings_store_t = strings::nvme_store<volume_t, atomic_reference, waiter_t>;
     using database_t = basic_database<
         stored_key_t, volume_t, atomic_reference, waiter_t, strings_store_t,
@@ -989,7 +990,7 @@ std::size_t user_data_round_trips(mount_type_ const& mount) {
 /**
  *  @brief A transaction spanning two collections is never seen half applied.
  *
- *  Each round writes a whole band of keys into both collections, and their write buffers are narrower
+ *  Each round writes a whole band of keys into both collections, and their memory-run bounds are narrower
  *  than a band, so every commit lands past the bounds and flushes the band before it, and a reader has
  *  runs publishing beside it. The reader holds one level set per collection at one moment and counts
  *  every key that one of them carries and the other does not.

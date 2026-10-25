@@ -81,7 +81,7 @@ struct stress_stack {
 };
 
 /**
- *  @brief The database shape every case opens, whose small write buffer flushes many times under the threads.
+ *  @brief The database shape every case opens, whose small memory runs flush many times under the threads.
  *  @param[in] value_size Bytes every value takes, which is zero for every layout but the fixed one.
  *  @param[in] value_max_size Bytes the largest value takes, which is zero for a fixed-width layout.
  */
@@ -194,9 +194,9 @@ template <typename key_slot_type_, typename mount_type_>
     using stack_t = stress_stack<typename mount_type_::fixture_t>;
     using guard_t = typename stack_t::guard_t;
     using volume_t = typename stack_t::volume_t;
-    using database_t =
-        basic_single_collection_database<typename key_slot_type_::stored_key_t, volume_t, atomic_reference, waiter_t,
-                                         nvme_store<key_slot_type_, volume_t, atomic_reference, waiter_t>>;
+    using database_t = basic_single_collection_database<
+        typename key_slot_type_::stored_key_t, volume_t, atomic_reference, waiter_t,
+        nvme_store<key_slot_type_, volume_t, atomic_reference, waiter_t, last_write_fold_t, no_device_fold_t>>;
     std::size_t failures = 0;
 
     expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
@@ -218,7 +218,7 @@ template <typename key_slot_type_, typename mount_type_>
             models[worker][index].stored_key = static_cast<stored_key_t>(worker * keys_per_worker_k + index);
     }
 
-    // Every key starts written and flushed, so the reads below reach the runs as well as the write buffer.
+    // Every key starts written and flushed, so the reads below reach the runs as well as the memory runs.
     st::basic_vector<byte_t> first;
     failures += expect(first.resize(widest) == st::status_t::success_k);
     if (failures != 0) return failures;

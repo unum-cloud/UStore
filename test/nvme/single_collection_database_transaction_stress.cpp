@@ -59,9 +59,9 @@ struct stress_stack {
     using fixture_t = fixture_type_;
     using guard_t = typename fixture_t::guard_t;
     using volume_t = typename fixture_t::volume_t;
-    using database_t =
-        basic_single_collection_database<stored_key_t, volume_t, atomic_reference, waiter_t,
-                                         nvme_store<inline_slot_t, volume_t, atomic_reference, waiter_t>>;
+    using database_t = basic_single_collection_database<
+        stored_key_t, volume_t, atomic_reference, waiter_t,
+        nvme_store<inline_slot_t, volume_t, atomic_reference, waiter_t, last_write_fold_t, no_device_fold_t>>;
 
     /** The disk, the arena and the channels. */
     std::unique_ptr<fixture_t> fixture;
@@ -82,7 +82,7 @@ struct stress_stack {
     [[nodiscard]] io_channel_t& channel() noexcept { return reading.channel(); }
 };
 
-/** The database shape every case opens, whose small write buffer flushes many times under the threads. */
+/** The database shape every case opens, whose small memory runs flush many times under the threads. */
 [[nodiscard]] single_collection_database_config_t stress_config() noexcept {
     single_collection_database_config_t config;
     config.collection.concurrency_limit = worker_threads_k;

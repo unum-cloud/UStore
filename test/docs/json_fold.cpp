@@ -745,7 +745,7 @@ std::size_t json_fold_compose(std::uint64_t seed) {
             deltas.push_back(
                 {index + 1, operations[index].modification, operations[index].field, operations[index].value});
 
-        // The chain lands in records of random lengths, as write buffers flush them
+        // The chain lands in records of random lengths, as flushes of memory runs write them
         std::vector<pending_t> pending;
         for (std::size_t index = 0; index != deltas.size();) {
             std::size_t const length = std::min<std::size_t>(1 + random.below(4), deltas.size() - index);

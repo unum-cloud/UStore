@@ -4,6 +4,12 @@
  *  @date July 10, 2023
  *  @brief Single-collection databases, with their snapshots, their optimistic transactions, and the registries that
  *      order those transactions.
+ *
+ *  A single-collection database is the smallest thing that can be committed to: one collection, the
+ *  registry that orders the commits landing in it, and two blobs on the volume - the schema a reopen
+ *  checks itself against, and whatever bytes the owner keeps beside the data.
+ *  Reads take the caller's channel, so any number of threads read at once; flushes, compactions and blob writes
+ *  take the two channels the database was opened with, under its claim, which one thread holds at a time.
  */
 
 #pragma once
@@ -25,37 +31,41 @@
 #include <smashtable/basic_vector.hpp>     // `st::basic_vector`
 #include <smashtable/shared.hpp>           // `st::walk_control_t`
 
-#include "ustore/blobs/nvme_database.hpp"     // `read_set`, `maintenance_claim`, `watch_schedule_t`, `catalog_stamps_t`
-#include "ustore/blobs/nvme_key_slot.hpp"     // `key_slot`, `value_layout_t`
-#include "ustore/blobs/nvme_store.hpp"        // `nvme_store_cursor`, `commit_ledger`, `sealed_commit`
-#include "ustore/blobs/nvme_tree.hpp"         // `lsm_tree_run_record_t`, `lsm_tree_publication_hook_t`
-#include "ustore/blobs/nvme_write_buffer.hpp" // `write_buffer`
-#include "ustore/utilities/nvme_channels.hpp" // `io_channel_t`
-#include "ustore/utilities/types.hpp"         // `status_t`, `status_code_t`, `expected`
+#include "ustore/blobs/nvme_database.hpp"           // `read_set`, `maintenance_claim`, `watch_schedule_t`
+#include "ustore/blobs/nvme_key_slot.hpp"           // `key_slot`, `value_layout_t`, `collection_id_t`
+#include "ustore/blobs/nvme_store.hpp"              // `nvme_store_cursor`, `commit_ledger`, `sealed_commit`
+#include "ustore/blobs/nvme_transaction_deltas.hpp" // `transaction_deltas`
+#include "ustore/blobs/nvme_tree.hpp"               // `lsm_tree_run_record_t`, `lsm_tree_publication_hook_t`
+#include "ustore/utilities/nvme_channels.hpp"       // `io_channel_t`
+#include "ustore/utilities/types.hpp"               // `status_t`, `status_code_t`, `expected`
 
 namespace unum::ustore::blobs {
 
 #pragma region Single Collection Database Transaction State
 
+/** The ID a single-collection transaction files its deltas under, the nil UUID, as the database has one collection. */
+inline constexpr collection_id_t single_collection_id_k {};
+
 template <typename stored_key_, template <typename> typename atomic_reference_, typename waiter_type_>
 struct single_collection_database_transaction_state {
     using stored_key_t = stored_key_;
-    using write_buffer_t = write_buffer<stored_key_t, atomic_reference_, waiter_type_>;
+    using transaction_deltas_t = transaction_deltas<stored_key_t, atomic_reference_, waiter_type_>;
     using read_set_t = read_set<stored_key_t, atomic_reference_, waiter_type_>;
 
     inline single_collection_database_transaction_state(
-        write_buffer_t&& write_buffer, resources_shared_ptr<atomic_reference_, waiter_type_> resources) noexcept
-        : changes(std::forward<write_buffer_t>(write_buffer)), read_set(resources) {}
+        transaction_deltas_t&& written, resources_shared_ptr<atomic_reference_, waiter_type_> resources) noexcept
+        : deltas(std::move(written)), read_set(resources) {}
 
-    inline bool empty() const noexcept { return changes.empty() && read_set.empty(); }
+    inline bool empty() const noexcept { return deltas.empty() && read_set.empty(); }
 
     inline void clear() {
-        changes.unsafe_clear();
+        deltas.clear();
         read_set.clear();
         sealed = sealed_commit<stored_key_t, atomic_reference_> {};
     }
 
-    write_buffer_t changes;
+    /** The deltas the transaction wrote, filed under the one collection's ID. */
+    transaction_deltas_t deltas;
     read_set_t read_set;
 
     /** The writes sealed by a stage or a commit, emptied once it lands or is refused. */
@@ -78,20 +88,21 @@ class single_collection_database_transaction;
 /**
  *  @brief What a registry needs from the single collection beneath it to stage and to commit.
  *
- *  A whole write buffer travels across this boundary rather than one key at a time, because the sole
+ *  A transaction's whole deltas travel across this boundary rather than one key at a time, because the sole
  *  collection seals the batch in one call and has nothing to group it by. The committer seals on its own thread;
  *  the thread holding the ledger's leader word prepares, publishes, or forgets what it prepared; and the committer
  *  maintains the collection once its commit lands.
  */
-template <typename store_type_, typename write_buffer_type_, typename stored_key_type_,
-          template <typename> typename atomic_reference_, typename waiter_type_>
+template <typename store_type_, typename stored_key_type_, template <typename> typename atomic_reference_,
+          typename waiter_type_>
 concept single_collection_transaction_store_concept = requires(
-    store_type_& store, store_type_ const& constant, write_buffer_type_ const& changes,
+    store_type_& store, store_type_ const& constant,
+    transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_> const& deltas,
     sealed_commit<stored_key_type_, atomic_reference_>& sealed, stored_key_type_ stored_key,
     transaction_stamp_t stamp) {
     { store.ledger() } -> std::same_as<commit_ledger<atomic_reference_, waiter_type_>&>;
     { constant.written_since(stored_key, stamp) } -> std::same_as<bool>;
-    { store.seal_write_buffer(changes, sealed) } -> std::same_as<status_t>;
+    { store.seal_deltas(deltas, sealed) } -> std::same_as<status_t>;
     { store.prepare_sealed(sealed) } -> std::same_as<status_t>;
     { store.publish_sealed(sealed, stamp) } -> std::same_as<void>;
     { store.forget_sealed() } -> std::same_as<void>;
@@ -117,7 +128,7 @@ class single_collection_database_transaction_registry {
         single_collection_database_transaction<stored_key_, store_type_, atomic_reference_, waiter_type_>;
     using transaction_state_t =
         single_collection_database_transaction_state<stored_key_t, atomic_reference_, waiter_type_>;
-    using write_buffer_t = typename transaction_state_t::write_buffer_t;
+    using transaction_deltas_t = typename transaction_state_t::transaction_deltas_t;
     using transaction_unique_ptr_t = std::unique_ptr<transaction_t>;
     using return_transaction_t = expected<transaction_unique_ptr_t>;
 
@@ -142,9 +153,8 @@ class single_collection_database_transaction_registry {
 
 #pragma region Interface Methods
 
-    /** A transaction whose write buffer @p config bounds and admits values of the widths the collection does. */
-    inline return_transaction_t create_transaction(transaction_config_t const& config, std::size_t value_size,
-                                                   std::size_t value_max_size) noexcept;
+    /** A transaction whose deltas @p config bounds. */
+    inline return_transaction_t create_transaction(transaction_config_t const& config) noexcept;
 
 #pragma endregion Interface Methods
 
@@ -214,13 +224,11 @@ template <typename stored_key_, typename store_type_, template <typename> typena
           typename waiter_type_>
 inline typename single_collection_database_transaction_registry<stored_key_, store_type_, atomic_reference_,
                                                                 waiter_type_>::return_transaction_t
-single_collection_database_transaction_registry<stored_key_, store_type_, atomic_reference_,
-                                                waiter_type_>::create_transaction(transaction_config_t const& config,
-                                                                                  std::size_t value_size,
-                                                                                  std::size_t value_max_size) noexcept {
+single_collection_database_transaction_registry<stored_key_, store_type_, atomic_reference_, waiter_type_>::
+    create_transaction(transaction_config_t const& config) noexcept {
 
-    write_buffer_t changes(config.max_bytes, config.max_deltas, 1, value_size, value_max_size, resources_);
-    transaction_unique_ptr_t transaction {new (std::nothrow) transaction_t {*this, std::move(changes), resources_}};
+    transaction_deltas_t deltas(config.max_bytes, config.max_deltas, resources_);
+    transaction_unique_ptr_t transaction {new (std::nothrow) transaction_t {*this, std::move(deltas), resources_}};
     if (!transaction) return status_t {status_code_t::out_of_memory_k, "No room for another transaction"};
     return transaction;
 }
@@ -302,8 +310,8 @@ inline status_t
 single_collection_database_transaction_registry<stored_key_, store_type_, atomic_reference_, waiter_type_>::seal_(
     transaction_state_t& data) noexcept {
     data.sealed = sealed_commit<stored_key_t, atomic_reference_> {};
-    if (data.changes.empty()) return status_t {};
-    return store_->seal_write_buffer(data.changes, data.sealed);
+    if (data.deltas.empty()) return status_t {};
+    return store_->seal_deltas(data.deltas, data.sealed);
 }
 
 /** Checks the watches against the views published so far and lays out the collection's view, on the thread holding
@@ -370,12 +378,10 @@ inline bool single_collection_database_transaction_registry<stored_key_, store_t
 
     // First-committer-wins over the watched writes, then every key read or tracked.
     bool conflict = false;
-    [[maybe_unused]] st::status_t const written = data.changes.stored_values.for_each(
-        [&](auto const& entry) noexcept -> st::walk_control_t {
-            transaction_stamp_t const from = entry.value().watch_stamp;
-            conflict = from != invalid_transaction_stamp_k && store_->written_since(entry.key(), from);
-            return conflict ? st::walk_control_t::halt_k : st::walk_control_t::resume_k;
-        });
+    data.deltas.for_each_write([&](collection_id_t, stored_key_t const& stored_key, auto const& place) noexcept {
+        if (!conflict && place.watch_stamp != invalid_transaction_stamp_k)
+            conflict = store_->written_since(stored_key, place.watch_stamp);
+    });
     if (conflict) return true;
     [[maybe_unused]] st::status_t const watched = data.read_set.stored_keys.for_each(
         [&](auto const& watch) noexcept -> st::walk_control_t {
@@ -510,8 +516,8 @@ class single_collection_database_transaction {
     using transaction_state_t =
         single_collection_database_transaction_state<stored_key_t, atomic_reference_, waiter_type_>;
 
-    /** The write buffer the uncommitted changes live in. */
-    using write_buffer_t = typename transaction_state_t::write_buffer_t;
+    /** The deltas the uncommitted writes live in. */
+    using transaction_deltas_t = typename transaction_state_t::transaction_deltas_t;
 
 #pragma endregion Types
 
@@ -525,12 +531,12 @@ class single_collection_database_transaction {
     /**
      *  @brief A transaction started at the newest stamp @p manager has published, which it pins until it dies.
      *  @param[inout] manager The registry this transaction stages and commits through, outliving it.
-     *  @param[in] changes The write buffer the uncommitted writes land in, moved in and owned from here on.
+     *  @param[in] deltas The deltas the uncommitted writes land in, moved in and owned from here on.
      *  @param[in] resources The budget the watched keys are charged to.
      */
-    single_collection_database_transaction(registry_t& manager, write_buffer_t&& changes,
+    single_collection_database_transaction(registry_t& manager, transaction_deltas_t&& deltas,
                                            resources_shared_ptr<atomic_reference_, waiter_type_> resources) noexcept
-        : manager_(manager), data_(std::move(changes), std::move(resources)) {
+        : manager_(manager), data_(std::move(deltas), std::move(resources)) {
         start_stamp_ = manager_.request_start_(pin_);
         state_ = state_t::started_k;
     }
@@ -601,7 +607,7 @@ class single_collection_database_transaction {
         if (data_.read_set.count(watch_purpose_t::read_k) != 0)
             return {status_code_t::invalid_argument_k, "That transaction has read something"};
         start_stamp_ = manager_.request_start_(pin_);
-        data_.changes.rescope_watches(start_stamp_);
+        data_.deltas.rescope_watches(start_stamp_);
         return {};
     }
 
@@ -609,9 +615,9 @@ class single_collection_database_transaction {
 
 #pragma region Writes
 
-    /** Whether @p count more values of @p bytes together still fit in this transaction's write buffer. */
+    /** Whether @p count more values of @p bytes together still fit in this transaction's deltas. */
     [[nodiscard]] bool has_available_space_for(std::size_t count, std::size_t bytes) const noexcept {
-        return state_ == state_t::started_k && data_.changes.can_fit(count, bytes);
+        return state_ == state_t::started_k && data_.deltas.can_fit(count, bytes);
     }
 
     /** Writes @p stored_value under @p stored_key, which reaches the database only at the commit, watching the key
@@ -622,7 +628,8 @@ class single_collection_database_transaction {
         if (!manager_.store_->admits(stored_value.size()))
             return {status_code_t::malformed_k, "This database admits no value of that size"};
         if (status_t const checked = check_write_now_<watch_schedule_>(stored_key); checked.failed()) return checked;
-        return data_.changes.add(stored_key, stored_value, watch_stamp_for_<watch_schedule_>());
+        return data_.deltas.write(single_collection_id_k, manager_.store_->value_widths(), stored_key, stored_value,
+                                  watch_stamp_for_<watch_schedule_>());
     }
 
     /** Removes @p stored_key, which reaches the database as a remove delta only at the commit, watched as @c insert
@@ -631,7 +638,8 @@ class single_collection_database_transaction {
     status_t remove(stored_key_t stored_key) noexcept {
         if (state_ != state_t::started_k) return {status_code_t::invalid_argument_k, "That transaction is staged"};
         if (status_t const checked = check_write_now_<watch_schedule_>(stored_key); checked.failed()) return checked;
-        return data_.changes.mark_as_removed(stored_key, watch_stamp_for_<watch_schedule_>());
+        return data_.deltas.remove(single_collection_id_k, manager_.store_->value_widths(), stored_key,
+                                   watch_stamp_for_<watch_schedule_>());
     }
 
     /** Watches @p stored_keys for conflicts until the next commit or rollback, without reading them. */
@@ -668,7 +676,7 @@ class single_collection_database_transaction {
         return carried;
     }
 
-    /** What this transaction's own write buffer holds under @p stored_key, without touching the database. */
+    /** What this transaction's own deltas hold under @p stored_key, without touching the database. */
     [[nodiscard]] lookup_result_t find_uncommitted(stored_key_t stored_key, stored_value_size_t& size) const noexcept {
         size = 0;
         stored_value_size_t held = 0;
@@ -811,27 +819,17 @@ class single_collection_database_transaction {
 
     /**
      *  @brief Calls @p visitor with the bytes this transaction wrote under @p stored_key.
-     *  @param[in] stored_key The key to look for in this transaction's own write buffer.
+     *  @param[in] stored_key The key to look for in this transaction's own deltas.
      *  @param[in] visitor Called once with the written bytes, which are empty for an empty value.
-     *  @return What the write buffer holds, which is @c missing_k when it holds nothing at all.
+     *  @return What the deltas hold, which is @c missing_k when they hold nothing at all.
      */
     template <typename visitor_type_>
     [[nodiscard]] lookup_result_t visit_uncommitted_(stored_key_t stored_key, visitor_type_&& visitor) const noexcept {
-        lookup_result_t answer = lookup_result_t::missing_k;
-        data_.changes.stored_values.probe_to_find(stored_key, [&](auto const& entry) noexcept {
-            auto const& place = entry.value();
-            if (place.kind == delta_kind_t::remove_k) {
-                answer = lookup_result_t::removed_k;
-                return;
-            }
-            answer = lookup_result_t::written_k;
-            if (place.size == 0) {
-                visitor(std::span<byte_t const> {});
-                return;
-            }
-            visitor(std::span<byte_t const> {data_.changes.stored_values_buffer.data() + place.offset, place.size});
-        });
-        return answer;
+        delta_view_t held;
+        if (!data_.deltas.delta(single_collection_id_k, stored_key, held)) return lookup_result_t::missing_k;
+        if (held.kind == delta_kind_t::remove_k) return lookup_result_t::removed_k;
+        visitor(held.bytes);
+        return lookup_result_t::written_k;
     }
 
     /** The stamp a watch taken under @p watch_schedule_ is scoped from. */
@@ -1003,8 +1001,8 @@ class basic_single_collection_database {
     using disk_t = std::remove_reference_t<decltype(std::declval<volume_t&>().disk())>;
 
     /** An ordered walk over that collection, memory runs merged in front of every run. */
-    using scanner_t =
-        nvme_store_cursor<key_slot_t, volume_t, atomic_reference_, waiter_type_, typename collection_t::fold_t>;
+    using scanner_t = nvme_store_cursor<key_slot_t, volume_t, atomic_reference_, waiter_type_,
+                                        typename collection_t::fold_t, typename collection_t::device_fold_t>;
 
     /** One moment of this database, a pinned stamp no publication waits behind. */
     using snapshot_t = single_collection_database_snapshot<basic_single_collection_database>;
@@ -1020,8 +1018,11 @@ class basic_single_collection_database {
     using registry_t = single_collection_database_transaction_registry<stored_key_t, basic_single_collection_database,
                                                                        atomic_reference_, waiter_type_>;
 
-    /** The uncommitted changes of one transaction, as the registry hands them over. */
-    using write_buffer_t = write_buffer<stored_key_t, atomic_reference_, waiter_type_>;
+    /** The uncommitted deltas of one transaction, as the registry hands them over. */
+    using transaction_deltas_t = transaction_deltas<stored_key_t, atomic_reference_, waiter_type_>;
+
+    /** The value widths the collection admits, which every write of a transaction is checked against. */
+    using value_widths_t = typename transaction_deltas_t::value_widths_t;
 
     /** A database, which is pinned and therefore always owned through a pointer. */
     using database_unique_ptr_t = std::unique_ptr<basic_single_collection_database>;
@@ -1043,14 +1044,12 @@ class basic_single_collection_database {
 
     /** Writes whatever the memory runs still hold onto the volume and names every run, so the data outlives this. */
     ~basic_single_collection_database() noexcept {
-        write_path_guard_t const held {*this};
-        if (held.adopted().succeeded()) {
-            [[maybe_unused]] status_t const flushed = collection_.flush(writing_channel_);
-            // A destroyed database dropped its schema, and a close must not write one back over an empty volume.
-            if (volume_.names(schema_blob_name_(0)) || volume_.names(schema_blob_name_(1))) {
-                [[maybe_unused]] status_t const saved = save_schema_();
-            }
-        }
+        // A database that never mounted whole, or was destroyed, names no schema and must not write one back.
+        if (generation_ == 0) return;
+        claim_guard_t const held {*this};
+        if (held.adopted().failed()) return;
+        [[maybe_unused]] status_t const flushed = collection_.flush(writing_channel_);
+        [[maybe_unused]] status_t const saved = save_schema_();
     }
 
     /**
@@ -1078,8 +1077,9 @@ class basic_single_collection_database {
 
     /** Drops both blobs and every run, which destroys the data and leaves the volume empty of it. */
     status_t destroy() noexcept {
-        write_path_guard_t const held {*this};
+        claim_guard_t const held {*this};
         if (held.adopted().failed()) return held.adopted();
+        generation_ = 0;
         status_t first;
         for (std::size_t copy = 0; copy != 2; ++copy)
             if (volume_.names(schema_blob_name_(copy)))
@@ -1198,7 +1198,7 @@ class basic_single_collection_database {
 
     /** Writes every memory run as one run of level zero. */
     status_t flush() noexcept {
-        write_path_guard_t const held {*this};
+        claim_guard_t const held {*this};
         if (held.adopted().failed()) return held.adopted();
         if (status_t const flushed = collection_.flush(writing_channel_); flushed.failed()) return flushed;
         // The run the flush wrote is sealed by now, so the schema may name it.
@@ -1210,7 +1210,7 @@ class basic_single_collection_database {
 
     /** Merges the shallowest level that is over its bounds, reading on one channel and writing on the other. */
     expected<compaction_outcome_t> compact() noexcept {
-        write_path_guard_t const held {*this};
+        claim_guard_t const held {*this};
         if (held.adopted().failed()) return held.adopted();
         lsm_tree_publication_hook_t published;
         published.notify = &record_schema_;
@@ -1226,7 +1226,7 @@ class basic_single_collection_database {
 
     /** Drops every version above @p ceiling, which a mount runs once its ledger has resumed at @p ceiling. */
     status_t truncate_above(transaction_stamp_t ceiling) noexcept {
-        write_path_guard_t const held {*this};
+        claim_guard_t const held {*this};
         if (held.adopted().failed()) return held.adopted();
         lsm_tree_publication_hook_t published;
         published.notify = &record_schema_;
@@ -1247,14 +1247,17 @@ class basic_single_collection_database {
             config.max_deltas > config_.collection.memory_runs_max_deltas)
             return status_t {status_code_t::invalid_argument_k,
                              "A transaction may not outgrow the memory runs it commits into"};
-
-        // The write buffer takes exactly one of the two widths, and which one is the layout's own answer.
-        std::size_t const exact = is_fixed(value_layout_k) ? collection_.value_max_size() : 0;
-        std::size_t const bounded = is_fixed(value_layout_k) ? 0 : collection_.value_max_size();
-        return registry_.create_transaction(config, exact, bounded);
+        return registry_.create_transaction(config);
     }
 
-    /** A transaction with the write-buffer bounds this database was opened with. */
+    /** The widths a transaction checks every write against, exactly one of them set, as the layout fixes or bounds
+     *  every value. */
+    [[nodiscard]] value_widths_t value_widths() const noexcept {
+        if (is_fixed(value_layout_k)) return {collection_.value_max_size(), 0};
+        return {0, collection_.value_max_size()};
+    }
+
+    /** A transaction with the delta bounds this database was opened with. */
     expected<transaction_unique_ptr_t> create_transaction() noexcept {
         return create_transaction(config_.default_transaction);
     }
@@ -1279,7 +1282,7 @@ class basic_single_collection_database {
 
     /** Replaces the owner's blob with @p bytes, which the volume keeps beside the runs. */
     status_t save_user_data(std::span<byte_t const> bytes) noexcept {
-        write_path_guard_t const held {*this};
+        claim_guard_t const held {*this};
         if (held.adopted().failed()) return held.adopted();
         if (bytes.empty()) return drop_blob_(user_data_blob_name_());
         return write_blob_(user_data_blob_name_(), blob_kind_t::user_data_k, bytes);
@@ -1295,7 +1298,7 @@ class basic_single_collection_database {
 
     /** Forgets the owner's blob, which a volume holding none reports as @c not_found_k. */
     status_t clear_user_data() noexcept {
-        write_path_guard_t const held {*this};
+        claim_guard_t const held {*this};
         if (held.adopted().failed()) return held.adopted();
         return drop_blob_(user_data_blob_name_());
     }
@@ -1304,18 +1307,16 @@ class basic_single_collection_database {
 
 #pragma region Transaction Store Interface
 
-    /** Seals every change of @p changes into @p sealed on the committing thread, flushing first when the memory runs
+    /** Seals every delta of @p written into @p sealed on the committing thread, flushing first when the memory runs
      *  are full, so the commit that follows cannot fail halfway. */
-    status_t seal_write_buffer(write_buffer_t const& changes,
-                               sealed_commit<stored_key_t, atomic_reference_>& sealed) noexcept {
+    status_t seal_deltas(transaction_deltas_t const& written,
+                         sealed_commit<stored_key_t, atomic_reference_>& sealed) noexcept {
         st::basic_vector<keyed_delta<stored_key_t>> deltas;
-        if (deltas.reserve(changes.count()) != st::status_t::success_k)
+        if (deltas.reserve(written.count(single_collection_id_k)) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "No room to hand a commit over"};
-        [[maybe_unused]] st::status_t const walked = changes.stored_values.for_each([&](auto const& entry) noexcept {
-            auto const& place = entry.value();
-            delta_view_t const delta {place.kind, changed_bytes_(changes, place)};
+        written.for_each_delta(single_collection_id_k, [&](stored_key_t stored_key, delta_view_t delta) noexcept {
             [[maybe_unused]] st::status_t const placed = deltas.push_back(
-                st::assume_reserved, keyed_delta<stored_key_t> {entry.key(), delta});
+                st::assume_reserved, keyed_delta<stored_key_t> {stored_key, delta});
         });
         auto [taken, seal_status] = collection_.seal(std::span<keyed_delta<stored_key_t>> {deltas});
         if (seal_status.failed()) return seal_status;
@@ -1340,13 +1341,13 @@ class basic_single_collection_database {
      *  @brief Merges the memory runs by tier, and flushes them and compacts the tree once they hold their bounds,
      *      which every commit runs once it lands.
      *
-     *  Returns at once while another writer holds the write path, since that writer looks at the memory runs again
+     *  Returns at once while another writer holds the claim, since that writer looks at the memory runs again
      *  after it lets go, so no commit waits behind another's maintenance.
      *  @note Called outside the ledger's epochs.
      */
     status_t maintain() noexcept {
         if (!collection_.maintenance_due()) return {};
-        write_path_guard_t const held = write_path_guard_t::taken_if_free(*this);
+        claim_guard_t const held = claim_guard_t::taken_if_free(*this);
         if (!held.holding()) return {};
         return maintain_due_();
     }
@@ -1363,40 +1364,40 @@ class basic_single_collection_database {
      *  A queue pair belongs to the thread that announced itself on it, so the holder adopts both channels before it
      *  writes through them; the claim is what makes that handoff a handoff and not a share.
      */
-    class write_path_guard_t {
+    class claim_guard_t {
       public:
 
-        /** Takes @p owner's write path, parked while another writer holds it, and adopts both channels. */
-        explicit write_path_guard_t(basic_single_collection_database& owner) noexcept : owner_(&owner) {
-            owner.write_path_claim_.take();
+        /** Takes @p owner's claim, parked while another writer holds it, and adopts both channels. */
+        explicit claim_guard_t(basic_single_collection_database& owner) noexcept : owner_(&owner) {
+            owner.claim_.take();
             owner.adopt_channels_();
         }
 
-        /** Takes @p owner's write path if no writer holds it, or answers a guard holding nothing. */
-        [[nodiscard]] static write_path_guard_t taken_if_free(basic_single_collection_database& owner) noexcept {
-            write_path_guard_t guard;
-            if (!owner.write_path_claim_.take_if_free()) return guard;
+        /** Takes @p owner's claim if no writer holds it, or answers a guard holding nothing. */
+        [[nodiscard]] static claim_guard_t taken_if_free(basic_single_collection_database& owner) noexcept {
+            claim_guard_t guard;
+            if (!owner.claim_.take_if_free()) return guard;
             owner.adopt_channels_();
             guard.owner_ = &owner;
             return guard;
         }
 
-        write_path_guard_t(write_path_guard_t const&) = delete;
-        write_path_guard_t& operator=(write_path_guard_t const&) = delete;
-        write_path_guard_t(write_path_guard_t&& other) noexcept : owner_(std::exchange(other.owner_, nullptr)) {}
-        ~write_path_guard_t() noexcept {
-            if (owner_) owner_->release_write_path_();
+        claim_guard_t(claim_guard_t const&) = delete;
+        claim_guard_t& operator=(claim_guard_t const&) = delete;
+        claim_guard_t(claim_guard_t&& other) noexcept : owner_(std::exchange(other.owner_, nullptr)) {}
+        ~claim_guard_t() noexcept {
+            if (owner_) owner_->release_claim_();
         }
 
-        /** Whether this guard holds the write path. */
+        /** Whether this guard holds the claim. */
         [[nodiscard]] bool holding() const noexcept { return owner_ != nullptr; }
 
         /** Whether this thread took the channels over, which every write through them needs. */
-        status_t adopted() const noexcept { return owner_->write_path_adoption_; }
+        status_t adopted() const noexcept { return owner_->channel_adoption_; }
 
       private:
 
-        write_path_guard_t() noexcept = default;
+        claim_guard_t() noexcept = default;
 
         /** The database whose collection this guard holds, borrowed for the guard's life, null once moved from. */
         basic_single_collection_database* owner_ = nullptr;
@@ -1433,22 +1434,45 @@ class basic_single_collection_database {
             volume, writing_channel, merging_channel, config, std::move(resources), std::move(mounted), ledger,
             std::move(owned)}};
         if (!opened) return status_t {status_code_t::out_of_memory_k, "The database did not fit"};
-        if (status_t const agreed = opened->agree_on_schema_(); agreed.failed()) return agreed;
-        if (status_t const resumed = ledger.resume(opened->loaded_durable_); resumed.failed()) return resumed;
-        if (status_t const truncated = opened->truncate_above(opened->loaded_durable_); truncated.failed())
-            return truncated;
+        if (status_t const restored = opened->mount_(); restored.failed()) {
+            // The schema the mount read stays as it lies, never saved again without the runs it failed to take back.
+            opened->generation_ = 0;
+            return restored;
+        }
         return opened;
+    }
+
+    /**
+     *  @brief Takes back the runs the newer schema copy names, resumes the ledger above its durable stamp, drops every
+     *      version above that, and only then writes the schema a fresh volume lacks.
+     *
+     *  The ledger resumes before the truncation, which is what lets the truncation's schema promise its stamp.
+     */
+    status_t mount_() noexcept {
+        claim_guard_t const held {*this};
+        if (held.adopted().failed()) return held.adopted();
+        if (status_t const agreed = agree_on_schema_(); agreed.failed()) return agreed;
+        if (status_t const resumed = ledger_.resume(loaded_durable_); resumed.failed()) return resumed;
+        lsm_tree_publication_hook_t published;
+        published.notify = &record_schema_;
+        published.context = this;
+        if (status_t const truncated = collection_.truncate_above(writing_channel_, merging_channel_, loaded_durable_,
+                                                                  published);
+            truncated.failed())
+            return truncated;
+        if (generation_ != 0) return {};
+        return save_schema_();
     }
 
 #pragma endregion Private Construction
 
-#pragma region Write Path
+#pragma region Claim
 
-    /** Binds both channels to the thread that took the write path, which every write through them needs. */
+    /** Binds both channels to the thread that took the claim, which every write through them needs. */
     void adopt_channels_() noexcept {
-        write_path_adoption_ = volume_.disk().bind_queue_pair(writing_channel_.queue_pair());
-        if (write_path_adoption_.succeeded())
-            write_path_adoption_ = volume_.disk().bind_queue_pair(merging_channel_.queue_pair());
+        channel_adoption_ = volume_.disk().bind_queue_pair(writing_channel_.queue_pair());
+        if (channel_adoption_.succeeded())
+            channel_adoption_ = volume_.disk().bind_queue_pair(merging_channel_.queue_pair());
     }
 
     /** Lands @p sealed as a commit of its own, making room first while the memory runs are past twice their bounds,
@@ -1465,16 +1489,16 @@ class basic_single_collection_database {
 
     /**
      *  @brief Flushes the memory runs while @p sealed would leave them past twice their bounds, holding no epoch and
-     *      parking rather than spinning while another writer holds the write path.
+     *      parking rather than spinning while another writer holds the claim.
      *  @return Success once the commit fits, or why a flush could not make room.
      */
     status_t make_room_(sealed_commit<stored_key_t, atomic_reference_> const& sealed) noexcept {
         if (!sealed.run) return {};
         while (collection_.memory_pressure(sealed) == memory_pressure_t::stalled_k) {
-            write_path_guard_t const held = write_path_guard_t::taken_if_free(*this);
+            claim_guard_t const held = claim_guard_t::taken_if_free(*this);
             if (!held.holding()) {
-                // Whoever holds the write path may be flushing already, so the pressure is read again after.
-                write_path_claim_.wait_until_released();
+                // Whoever holds the claim may be flushing already, so the pressure is read again after.
+                claim_.wait_until_released();
                 continue;
             }
             if (held.adopted().failed()) return held.adopted();
@@ -1484,7 +1508,7 @@ class basic_single_collection_database {
     }
 
     /** Flushes the memory runs, saves the schema naming the run, and compacts the tree for as long as the flush left
-     *  a level over its bounds, holding the write path. */
+     *  a level over its bounds, holding the claim. */
     status_t flush_and_compact_() noexcept {
         if (status_t const flushed = collection_.flush(writing_channel_); flushed.failed()) return flushed;
         if (status_t const saved = save_schema_(); saved.failed()) return saved;
@@ -1500,41 +1524,34 @@ class basic_single_collection_database {
         return {};
     }
 
-    /** Merges the memory runs by tier, and flushes and compacts once they hold their bounds, holding the write
-     *  path with both channels adopted. */
+    /** Merges the memory runs by tier, and flushes and compacts once they hold their bounds, holding the claim with
+     *  both channels adopted. */
     status_t maintain_due_() noexcept {
-        if (write_path_adoption_.failed()) return write_path_adoption_;
+        if (channel_adoption_.failed()) return channel_adoption_;
         if (status_t const merged = collection_.merge_memory_runs(); merged.failed()) return merged;
         if (!collection_.flush_due()) return {};
         return flush_and_compact_();
     }
 
     /**
-     *  @brief Hands the write path back, then looks once more at the memory runs and, if they are due and the write
-     *      path is still free, takes it back to maintain them, so a commit that found the write path held left its
-     *      maintenance to this writer.
+     *  @brief Hands the claim back, then looks once more at the memory runs and, if they are due and the claim is
+     *      still free, takes it back to maintain them, so a commit that found the claim held left its maintenance to
+     *      this writer.
      *
-     *  A writer that finds the write path taken again stops, since the new holder looks once more after it lets go,
+     *  A writer that finds the claim taken again stops, since the new holder looks once more after it lets go,
      *  and a failed adoption or maintenance is met again by the next commit.
      */
-    void release_write_path_() noexcept {
-        write_path_claim_.release();
-        if (!collection_.maintenance_due() || !write_path_claim_.take_if_free()) return;
+    void release_claim_() noexcept {
+        claim_.release();
+        if (!collection_.maintenance_due() || !claim_.take_if_free()) return;
         adopt_channels_();
         [[maybe_unused]] status_t const maintained = maintain_due_();
-        write_path_claim_.release();
+        claim_.release();
     }
 
-#pragma endregion Write Path
+#pragma endregion Claim
 
 #pragma region Private Methods
-
-    /** The bytes @p place names inside @p changes, empty for an empty value. */
-    [[nodiscard]] static std::span<byte_t const> changed_bytes_(write_buffer_t const& changes,
-                                                                auto const& place) noexcept {
-        if (place.size == 0) return {};
-        return std::span<byte_t const> {changes.stored_values_buffer.data() + place.offset, place.size};
-    }
 
     /** The name copy @p copy of the schema blob answers to on the volume. */
     [[nodiscard]] static blob_name_t schema_blob_name_(std::size_t copy) noexcept {
@@ -1568,14 +1585,12 @@ class basic_single_collection_database {
     }
 
     /**
-     *  @brief Reads the newer copy of the schema blob and takes its runs back, or writes the one this database would
-     *      have written.
+     *  @brief Reads the newer copy of the schema blob and takes its runs back, leaving a volume that holds no copy as
+     *      it is, holding the claim.
      *
      *  A copy is sealed only once durable, so whichever copies a crash left are whole, and the newer one wins.
      */
     status_t agree_on_schema_() noexcept {
-        write_path_guard_t const held {*this};
-        if (held.adopted().failed()) return held.adopted();
         single_collection_database_schema_record_t const wanted = wanted_schema_();
 
         std::array<st::basic_vector<byte_t>, 2> images;
@@ -1585,7 +1600,7 @@ class basic_single_collection_database {
             if (!images[copy].empty()) std::memcpy(&records[copy], images[copy].data(), sizeof(records[copy]));
         }
         std::size_t const newer = records[1].stamps.generation > records[0].stamps.generation ? 1 : 0;
-        if (images[newer].empty()) return write_schema_(std::span<lsm_tree_run_record_t const> {});
+        if (images[newer].empty()) return {};
         st::basic_vector<byte_t> const& image = images[newer];
         single_collection_database_schema_record_t const& carried = records[newer];
         if (carried.magic != single_collection_database_magic_k)
@@ -1621,8 +1636,7 @@ class basic_single_collection_database {
     }
 
     /** Lays the schema record and @p runs out back to back and replaces the older copy of the schema blob. */
-    status_t write_schema_(std::span<lsm_tree_run_record_t const> runs,
-                           transaction_stamp_t durable = unwritten_stamp_k) noexcept {
+    status_t write_schema_(std::span<lsm_tree_run_record_t const> runs, transaction_stamp_t durable) noexcept {
         single_collection_database_schema_record_t record = wanted_schema_();
         record.run_count = runs.size();
         record.stamps.generation = generation_ + 1;
@@ -1764,10 +1778,10 @@ class basic_single_collection_database {
     registry_t registry_;
 
     /** Held by whichever writer flushes, compacts or saves a blob, a commit paying for its maintenance included. */
-    maintenance_claim<atomic_reference_, waiter_type_> write_path_claim_;
+    maintenance_claim<atomic_reference_, waiter_type_> claim_;
 
-    /** Whether the writer holding the path took both channels over, written only under the claim. */
-    status_t write_path_adoption_;
+    /** Whether the writer holding the claim took both channels over, written only under it. */
+    status_t channel_adoption_;
 
 #pragma endregion Private Members
 };

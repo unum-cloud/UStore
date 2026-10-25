@@ -64,10 +64,9 @@ The compaction suite builds twice, as `ustore_test_nvme_compaction_host` with ev
 - `nvme/catalog.cpp` — the catalog records and the schema blobs a database persists.
 - `nvme/sorted_run.cpp` — one sorted run: round trips of every layout, truncation, lookups and read depth.
 - `nvme/tree.cpp` — the LSM level and the tree: what a flush publishes, what a merge keeps, and what a cancelled compaction leaves.
-- `nvme/write_buffer.cpp` — the write buffer alone: adds, removals, merges, copies and moves.
-- `nvme/collection.cpp` — one collection over a tree: the write buffer, the value cache, snapshots and scans.
+- `nvme/collection.cpp` — one collection over a tree: the memory runs, the value cache, snapshots and scans.
 - `nvme/single_collection_database.cpp`, `nvme/single_collection_database_transaction.cpp`, `nvme/single_collection_database_stress.cpp`, `nvme/single_collection_database_transaction_stress.cpp` — a database of one collection, its transactions, and both under concurrent load.
-- `nvme/database.cpp`, `nvme/database_transaction.cpp`, `nvme/transaction_registry.cpp` — named collections over a router, and the transactions across them.
+- `nvme/database.cpp`, `nvme/database_transaction.cpp`, `nvme/transaction_registry.cpp` — named collections over a router, the transactions across them, and the deltas a transaction files its writes in.
 - `nvme/graph.cpp` — a graph over two databases keyed by 16-byte IDs: what a walk sees and what a commit shows.
 - `nvme/compaction.cu` — host and GPU compaction against a reference merge and against each other.
 
@@ -118,14 +117,6 @@ The engine, isolation and transport flags matter only to the engine suites.
 | :--------------------- | :-------- | :------------------------------------------------------------- |
 | `--spdk-root <path>`   | None      | SPDK tree with a finished build, whose target the suite starts |
 | `--spdk-serial <text>` | The rig's | Serial the controller must identify as                         |
-
-`nvme/write_buffer.cpp` also takes:
-
-| Flag                         | Default | Meaning                                            |
-| :--------------------------- | :------ | :------------------------------------------------- |
-| `--stored-values <count>`    | `1000`  | Stored values every case writes into the cache     |
-| `--empty-value-step <count>` | `50`    | Every this many stored values is empty             |
-| `--value-max-size <size>`    | `10000` | Largest stored value the cache admits, like `10KB` |
 
 `nvme/compaction.cu` also takes:
 

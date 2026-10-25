@@ -1512,11 +1512,13 @@ class lsm_level_merger {
      *  @param[in] request Which levels merge, what the new runs may grow to, and where the compaction runs.
      *  @param[in] fold How the collection's changes compose and apply, which reads their values on
      *      @p reading_channel before any is gathered.
+     *  @param[in] device_fold How a device composes the collection's changes, or @c no_device_fold_t where none does.
      *  @return The new level, or the status that stopped the merge with every new run already dropped.
      */
-    template <utilities::fold_concept fold_type_>
+    template <utilities::fold_concept fold_type_, typename device_fold_type_>
     static expected<level_t> merge(volume_t& volume, io_channel_t& reading_channel, io_channel_t& writing_channel,
-                                   merge_request_t const& request, fold_type_ const& fold) noexcept {
+                                   merge_request_t const& request, fold_type_ const& fold,
+                                   device_fold_type_ const& device_fold) noexcept {
         if (request.upper == nullptr)
             return status_t {status_code_t::invalid_argument_k, "A merge reads an upper level"};
         if (&reading_channel == &writing_channel)
@@ -1542,9 +1544,10 @@ class lsm_level_merger {
         std::size_t const upper_runs = request.upper->size();
         std::span<sorted_run_index_view<key_slot_t> const> const all {views};
         compaction_output_t output;
-        if (status_t const compacted = run_compaction_(
-                kind_of_(request.upper->order(), request.depth), all.first(upper_runs), all.subspan(upper_runs),
-                bounds_of_(request), request.stamps, request.placement, request.devices, fold, read_value, output);
+        if (status_t const compacted = run_compaction_(kind_of_(request.upper->order(), request.depth),
+                                                       all.first(upper_runs), all.subspan(upper_runs),
+                                                       bounds_of_(request), request.stamps, request.placement,
+                                                       request.devices, fold, device_fold, read_value, output);
             compacted.failed())
             return compacted;
 
@@ -1662,15 +1665,15 @@ class lsm_level_merger {
 
 #if USTORE_WITH_CUDA
 
-    /** Compacts on the first of @p devices when @p placement asks for one and no run holds a change, which only the
-     *  host folds, and on the calling thread otherwise, where runs carrying tails always merge. */
-    template <typename fold_type_, typename value_reader_type_>
+    /** Compacts on the first of @p devices when @p placement asks for one and no run holds a change, or one does and
+     *  @p device_fold composes changes, and on the calling thread otherwise, where runs carrying tails always merge. */
+    template <typename fold_type_, typename device_fold_type_, typename value_reader_type_>
     static status_t run_compaction_(compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_t> const> upper,
                                     std::span<sorted_run_index_view<key_slot_t> const> lower,
                                     sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps,
                                     compaction_placement_t placement, std::span<int const> devices,
-                                    fold_type_ const& fold, value_reader_type_&& read_value,
-                                    compaction_output_t& output) noexcept {
+                                    fold_type_ const& fold, [[maybe_unused]] device_fold_type_ const& device_fold,
+                                    value_reader_type_&& read_value, compaction_output_t& output) noexcept {
         // No device compaction is compiled for key slots carrying tails.
         if constexpr (!tailed_key_slot_concept<key_slot_t>) {
             std::uint64_t merged = 0;
@@ -1684,11 +1687,20 @@ class lsm_level_merger {
                 changes |= holds_changes(lower[index].kinds);
             }
 
-            if (!changes && choose_compactor(placement, devices.size(), merged) == compactor_choice_t::device_k) {
+            constexpr bool device_folds_k = !std::same_as<device_fold_type_, no_device_fold_t>;
+            if ((!changes || device_folds_k) &&
+                choose_compactor(placement, devices.size(), merged) == compactor_choice_t::device_k) {
                 if (devices.empty()) return {status_code_t::device_k, "A device compaction names no device"};
                 st::expected<cuda_compactor_t> compactor = cuda_compactor_t::make(devices.front());
                 if (!compactor) return compaction_status(compactor.status());
-                return compaction_status(compactor->compact(kind, upper, lower, bounds, stamps, output));
+                if constexpr (device_folds_k)
+                    return compaction_status(
+                        compactor->compact(kind, upper, lower, bounds, stamps, fold, device_fold, read_value, output));
+                // No run holds a change here, so the compaction built for the last write serves every fold
+                else
+                    return compaction_status(compactor->compact(kind, upper, lower, bounds, stamps,
+                                                                utilities::last_write_fold_t {}, no_device_fold_t {},
+                                                                located_value_reader<key_slot_t> {}, output));
             }
         }
         return compaction_status(
@@ -1698,12 +1710,13 @@ class lsm_level_merger {
 #else
 
     /** Compacts on the calling thread, which is the only compactor a build without CUDA carries. */
-    template <typename fold_type_, typename value_reader_type_>
+    template <typename fold_type_, typename device_fold_type_, typename value_reader_type_>
     static status_t run_compaction_(compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_t> const> upper,
                                     std::span<sorted_run_index_view<key_slot_t> const> lower,
                                     sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps,
                                     compaction_placement_t placement, std::span<int const>, fold_type_ const& fold,
-                                    value_reader_type_&& read_value, compaction_output_t& output) noexcept {
+                                    device_fold_type_ const&, value_reader_type_&& read_value,
+                                    compaction_output_t& output) noexcept {
         if (choose_compactor(placement, 0, 0) == compactor_choice_t::device_k)
             return {status_code_t::unsupported_k, "This build carries no device compactor"};
         return compaction_status(
@@ -2346,7 +2359,7 @@ class lsm_tree {
     /**
      *  @brief Writes @p key_slots and @p stored_values as one run and publishes it onto level zero.
      *  @param[inout] channel The channel the run is written on, held by the calling thread.
-     *  @param[in] key_slots The key slots in ascending order of their keys, as a write buffer drained them.
+     *  @param[in] key_slots The key slots in ascending order of their keys, as a flush drained them from memory runs.
      *  @param[in] stamps The stamp of every key slot, in the same order.
      *  @param[in] kinds The @c delta_kind_t of every key slot, in the same order.
      *  @param[in] floor The stamp every stamp is raised to at least, since no reader can tell those below it apart.
@@ -2432,23 +2445,26 @@ class lsm_tree {
      *  @param[in] devices The devices the executor named, the first of which a device compaction runs on.
      *  @param[in] cancellation The word the merge reads between blocks, or null for a merge nobody stops.
      *  @param[in] fold How the collection's changes compose and apply.
+     *  @param[in] device_fold How a device composes the collection's changes, or @c no_device_fold_t where none does,
+     *      which keeps every merge holding a change on the host.
      *  @param[in] published What to call once the merged set is current, which returns once no reader holds the set
      *      it replaced and before a consumed run is dropped.
      *  @param[in] stamps Which older versions survive for readers and for a mount, and the floor the new runs count
      *      from, where the default keeps the newest version of every key alone.
      *  @return What the pass did, or the status that stopped it with the current level set untouched.
      */
-    template <utilities::fold_concept fold_type_>
+    template <utilities::fold_concept fold_type_, typename device_fold_type_>
     expected<compaction_outcome_t> compact(
         io_channel_t& reading_channel, io_channel_t& writing_channel, compaction_placement_t placement,
         std::span<int const> devices, cancellation_t const* cancellation, fold_type_ const& fold,
+        device_fold_type_ const& device_fold,
         lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {},
         compaction_stamps_t const& stamps = compaction_stamps_t {}) noexcept {
         if (!claim_compaction_()) return compaction_outcome_t::nothing_to_compact_k;
 
         expected<compaction_outcome_t> const outcome = compact_once_(reading_channel, writing_channel, placement,
-                                                                     devices, cancellation, fold, published, stamps,
-                                                                     merge_choice_t::overfull_k);
+                                                                     devices, cancellation, fold, device_fold,
+                                                                     published, stamps, merge_choice_t::overfull_k);
         atomic_reference_<std::int32_t> {compacting_}.store(static_cast<std::int32_t>(compaction_state_t::idle_k),
                                                             std::memory_order_release);
         return outcome;
@@ -2471,9 +2487,10 @@ class lsm_tree {
         stamps.floor = ceiling;
         status_t result;
         while (result.succeeded() && above_(*levels_, ceiling) != levels_->size()) {
+            // A mount truncates on the host, so no device composes a change
             expected<compaction_outcome_t> const outcome = compact_once_(
-                reading_channel, writing_channel, compaction_placement_t::host_k, {}, nullptr, fold, published, stamps,
-                merge_choice_t::above_ceiling_k);
+                reading_channel, writing_channel, compaction_placement_t::host_k, {}, nullptr, fold,
+                no_device_fold_t {}, published, stamps, merge_choice_t::above_ceiling_k);
             if (!outcome) result = outcome.status();
         }
         atomic_reference_<std::int32_t> {compacting_}.store(static_cast<std::int32_t>(compaction_state_t::idle_k),
@@ -2619,7 +2636,7 @@ class lsm_tree {
         return first;
     }
 
-    /** Level 0 holds F flushed runs of one write buffer each, and every level below F times the one above. */
+    /** Level 0 holds F runs of one flush each, and every level below F times the one above. */
     [[nodiscard]] std::uint64_t level_bytes_(std::size_t number) const noexcept {
         std::uint64_t const factor = config_.level_enlarge_factor;
         std::uint64_t bytes = memory_runs_max_bytes_ * factor;
@@ -2632,7 +2649,7 @@ class lsm_tree {
 
     /** The shallowest level of @p levels that is over its bounds, or the level count when none is. */
     [[nodiscard]] std::size_t overfull_(level_set_t const& levels) const noexcept {
-        // Every level grows by the factor, and a flushed run is one write buffer, so L0 is due at factor runs.
+        // Every level grows by the factor, and a flushed run is one flush of memory runs, so L0 is due at factor runs.
         if (levels.size() != 0 && levels.level(0).size() >= config_.level_enlarge_factor) return 0;
         for (std::size_t number = 0; number != levels.size(); ++number)
             if (!levels.level(number).empty() && levels.level(number).size_bytes() > level_bytes_(number))
@@ -2649,10 +2666,11 @@ class lsm_tree {
     }
 
     /** Runs one merge of the level @p choice picks and publishes it, which the claim around it keeps to one thread. */
-    template <typename fold_type_>
+    template <typename fold_type_, typename device_fold_type_>
     expected<compaction_outcome_t> compact_once_(io_channel_t& reading_channel, io_channel_t& writing_channel,
                                                  compaction_placement_t placement, std::span<int const> devices,
                                                  cancellation_t const* cancellation, fold_type_ const& fold,
+                                                 device_fold_type_ const& device_fold,
                                                  lsm_tree_publication_hook_t const& published,
                                                  compaction_stamps_t const& stamps, merge_choice_t choice) noexcept {
         level_set_t const& source = *levels_;
@@ -2681,7 +2699,8 @@ class lsm_tree {
         request.stamps = stamps;
         if (!grows && lower + 1 != source.size()) request.depth = lsm_level_depth_t::intermediate_k;
 
-        auto [merged, merge_status] = merger_t::merge(*volume_, reading_channel, writing_channel, request, fold);
+        auto [merged, merge_status] = merger_t::merge(*volume_, reading_channel, writing_channel, request, fold,
+                                                      device_fold);
         if (merge_status.failed()) return merge_status;
 
         auto [next, carried_status] = carried_(upper, last_consumed);
@@ -2732,7 +2751,7 @@ class lsm_tree {
     /** How fast the bytes a level admits grow with depth, and the value sizes of its runs. */
     lsm_tree_config_t config_ {};
 
-    /** Bytes one flushed write buffer holds, which level zero admits F of. */
+    /** Bytes the memory runs of one flush hold, which level zero admits F of. */
     std::uint64_t memory_runs_max_bytes_ = 0;
 
     /** The level set the last publication made current, which owns every run it names. */

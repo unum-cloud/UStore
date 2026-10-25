@@ -2,7 +2,11 @@
  *  @file include/ustore/blobs/vram_nvidia_compaction.cuh
  *  @author Ash Vardanian
  *  @date July 10, 2023
- *  @brief The kernels of the device compactor: extraction, survival, value sizes, padding and placement on CUB.
+ *  @brief The kernels of the device compactor on CUB: extraction, survival, folding, value sizes, padding and
+ *      placement.
+ *
+ *  A merge holding changes copies its merged records back once survival is settled, walks them on the host as the host
+ *  compactor does, hands the chains of changes alone to the device fold it was given, and folds the rest on the host.
  *
  *  Only nvcc compiles this half, so a host translation unit including it sees the host compactor of
  *  @c nvme_compaction.hpp alone, and @c compaction.cu instantiates the device compactor per key slot.
@@ -176,13 +180,185 @@ struct place_kernel {
     }
 };
 
-template <typename key_slot_type_, typename allocator_type_>
+/** Writes each folded survivor over the survivor it replaces. */
+template <typename key_slot_type_>
+struct folded_survivor_kernel {
+
+    /** The survivors in sorted order. */
+    located_key_slot<key_slot_type_>* survivors;
+
+    /** The index of every folded survivor among the survivors. */
+    std::uint64_t const* indices;
+
+    /** Every folded survivor. */
+    located_key_slot<key_slot_type_> const* folded;
+
+    constexpr void operator()(std::int64_t index) const noexcept { survivors[indices[index]] = folded[index]; }
+};
+
+/**
+ *  @brief Folds what the survivors of a merge fold, as @c host_compactor_t::compact does, writing their values into
+ *      @p output's folded bytes and the folded survivors over @p survivors on the device.
+ *
+ *  The merged records and their survival flags come back to the host, which finds the versions behind every surviving
+ *  change through @c folded_versions, as the host compactor does. A surviving change whose older versions are all
+ *  changes, and which the bottom level does not apply onto its empty base, becomes one chain that @p device_fold
+ *  composes with every other such chain at once. Every other chain folds on the host through @c fold_versions.
+ */
+template <typename key_slot_type_, typename fold_type_, typename device_fold_type_, typename allocator_type_>
+st::status_t fold_survivors(cuda_stream_t const& stream, compaction_kind_t kind, compaction_stamps_t const& stamps,
+                            std::uint64_t sorted_runs_count, located_key_slot<key_slot_type_> const* merged,
+                            std::uint8_t const* flags, std::uint64_t merged_count,
+                            located_key_slot<key_slot_type_>* survivors, fold_type_ const& fold,
+                            device_fold_type_ const& device_fold, located_value_reader<key_slot_type_> read_value,
+                            compaction_output<key_slot_type_, allocator_type_>& output) noexcept {
+    using st::basic_vector;
+    using st::status_t;
+    using record_t = located_key_slot<key_slot_type_>;
+    cudaStream_t const handle = stream.handle();
+
+    basic_vector<record_t> records;
+    basic_vector<std::uint8_t> kept;
+    status_t status = records.resize(merged_count);
+    if (status != status_t::success_k) return status;
+    status = kept.resize(merged_count);
+    if (status != status_t::success_k) return status;
+    status = cuda_status(
+        cudaMemcpyAsync(records.data(), merged, merged_count * sizeof(record_t), cudaMemcpyDeviceToHost, handle));
+    if (status != status_t::success_k) return status;
+    status = cuda_status(cudaMemcpyAsync(kept.data(), flags, merged_count, cudaMemcpyDeviceToHost, handle));
+    if (status != status_t::success_k) return status;
+    status = stream.synchronize();
+    if (status != status_t::success_k) return status;
+
+    utilities::local_arena_t arena;
+    utilities::arena_allocator<byte_t> arena_bytes = arena.allocator();
+    auto const value_of = [&](record_t const& record, std::span<byte_t const>& bytes) noexcept {
+        bytes = {};
+        if (record.kind == delta_kind_t::remove_k) return status_t::success_k;
+        return read_value(record, arena_bytes, bytes);
+    };
+
+    // A folded survivor: its value folded here, or the chain the device composes it from
+    struct folded_t {
+        std::uint64_t survivor = 0;
+        std::uint64_t merged = 0;
+        delta_kind_t kind = delta_kind_t::change_k;
+        std::span<byte_t const> bytes;
+        std::uint64_t chain = std::numeric_limits<std::uint64_t>::max();
+    };
+    basic_vector<folded_t> folds;
+    basic_vector<delta_view_t> changes;
+    basic_vector<std::uint64_t> chain_starts;
+    status = chain_starts.push_back(std::uint64_t {0});
+    if (status != status_t::success_k) return status;
+
+    std::uint64_t survivor = 0;
+    for (std::uint64_t head = 0; head != merged_count; ++head) {
+        if (!kept[head]) continue;
+        std::uint64_t const ordinal = survivor++;
+        if (records[head].kind != delta_kind_t::change_k) continue;
+        folded_versions_t const versions = folded_versions(kind, stamps, records.data(), kept.data(), merged_count,
+                                                           head);
+        if (versions.end == head + 1 && !versions.applies) continue;
+        bool only_changes = true;
+        for (std::uint64_t older = head + 1; older != versions.end; ++older)
+            only_changes &= records[older].kind == delta_kind_t::change_k;
+
+        if (only_changes && !versions.applies) {
+            for (std::uint64_t version = versions.end; version != head; --version) {
+                std::span<byte_t const> bytes;
+                if ((status = value_of(records[version - 1], bytes)) != status_t::success_k) return status;
+                if ((status = changes.push_back(delta_view_t {delta_kind_t::change_k, bytes})) != status_t::success_k)
+                    return status;
+            }
+            if ((status = chain_starts.push_back(std::uint64_t {changes.size()})) != status_t::success_k) return status;
+            status = folds.push_back(folded_t {ordinal, head, delta_kind_t::change_k, {}, chain_starts.size() - 2});
+            if (status != status_t::success_k) return status;
+            continue;
+        }
+
+        delta_view_t folded;
+        status = fold_versions(fold, records.data(), head, versions, value_of, arena_bytes, folded);
+        if (status != status_t::success_k) return status;
+        status = folds.push_back(folded_t {ordinal, head, folded.kind, folded.bytes});
+        if (status != status_t::success_k) return status;
+    }
+
+    basic_vector<byte_t> composed;
+    basic_vector<std::uint64_t> composed_offsets;
+    if (chain_starts.size() > 1) {
+        status = device_fold.compose(stream, changes, chain_starts, composed, composed_offsets);
+        if (status != status_t::success_k) return status;
+    }
+
+    // A folded value replaces its survivor's own: inline in the key slot, or in the compaction's folded bytes
+    basic_vector<std::uint64_t> indices;
+    basic_vector<record_t> replacements;
+    status = indices.resize(folds.size());
+    if (status != status_t::success_k) return status;
+    status = replacements.resize(folds.size());
+    if (status != status_t::success_k) return status;
+    for (std::size_t index = 0; index != folds.size(); ++index) {
+        folded_t const& folded = folds[index];
+        std::span<byte_t const> const bytes =
+            folded.chain == std::numeric_limits<std::uint64_t>::max()
+                ? folded.bytes
+                : std::span<byte_t const> {composed.data() + composed_offsets[folded.chain],
+                                           composed_offsets[folded.chain + 1] - composed_offsets[folded.chain]};
+        record_t record = records[folded.merged];
+        record.kind = folded.kind;
+        key_slot_type_& key_slot = record.key_slot;
+        if constexpr (locates_stored_values_concept<key_slot_type_>) {
+            std::size_t const location = output.folded.size();
+            if (location + bytes.size() > std::numeric_limits<std::uint32_t>::max())
+                return status_t::capacity_exhausted_k;
+            status = output.folded.resize(location + bytes.size());
+            if (status != status_t::success_k) return status;
+            if (!bytes.empty()) std::memcpy(output.folded.data() + location, bytes.data(), bytes.size());
+            key_slot.location = static_cast<decltype(key_slot.location)>(location);
+            record.sorted_run = static_cast<std::uint32_t>(sorted_runs_count);
+        }
+        else {
+            if (bytes.size() > sizeof(key_slot.data)) return status_t::capacity_exhausted_k;
+            if (!bytes.empty()) std::memcpy(key_slot.data, bytes.data(), bytes.size());
+        }
+        if constexpr (sizes_stored_values_concept<key_slot_type_>)
+            key_slot.size = static_cast<stored_value_size_t>(bytes.size());
+        else if (bytes.size() != key_slot_type_::size) return status_t::invalid_argument_k;
+        indices[index] = folded.survivor;
+        replacements[index] = record;
+    }
+    if (folds.empty()) return status_t::success_k;
+
+    int const device = stream.device();
+    cuda_device_buffer<std::uint64_t> device_indices {cuda_device_allocator<std::uint64_t>(device)};
+    cuda_device_buffer<record_t> device_replacements {cuda_device_allocator<record_t>(device)};
+    status = device_indices.reserve(folds.size());
+    if (status != status_t::success_k) return status;
+    status = device_replacements.reserve(folds.size());
+    if (status != status_t::success_k) return status;
+    status = device_indices.copy_in(indices.data(), indices.size(), 0, handle);
+    if (status != status_t::success_k) return status;
+    status = device_replacements.copy_in(replacements.data(), replacements.size(), 0, handle);
+    if (status != status_t::success_k) return status;
+    folded_survivor_kernel<key_slot_type_> const kernel {survivors, device_indices.data(), device_replacements.data()};
+    status = cuda_status(cub::DeviceFor::Bulk(static_cast<std::int64_t>(folds.size()), kernel, handle));
+    if (status != status_t::success_k) return status;
+    // The buffers above free on return, so the kernel reading them finishes first
+    return stream.synchronize();
+}
+
+template <typename key_slot_type_, utilities::fold_concept fold_type_, typename device_fold_type_,
+          typename allocator_type_>
     requires compactable_key_slot_concept<key_slot_type_>
-st::status_t cuda_compactor_t::compact(compaction_kind_t kind,
-                                       std::span<sorted_run_index_view<key_slot_type_> const> upper,
-                                       std::span<sorted_run_index_view<key_slot_type_> const> lower,
-                                       sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps,
-                                       compaction_output<key_slot_type_, allocator_type_>& output) noexcept {
+st::status_t cuda_compactor_t::compact(
+    compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_type_> const> upper,
+    std::span<sorted_run_index_view<key_slot_type_> const> lower, sorted_run_bounds_t const& bounds,
+    compaction_stamps_t const& stamps, [[maybe_unused]] fold_type_ const& fold,
+    [[maybe_unused]] device_fold_type_ const& device_fold,
+    [[maybe_unused]] std::type_identity_t<located_value_reader<key_slot_type_>> read_value,
+    compaction_output<key_slot_type_, allocator_type_>& output) noexcept {
     using st::basic_vector;
     using st::expected;
     using st::status_t;
@@ -195,16 +371,20 @@ st::status_t cuda_compactor_t::compact(compaction_kind_t kind,
     cudaStream_t const stream = stream_.handle();
     expected<cuda_device_scope_t> const scope = cuda_device_scope_t::make(device);
     if (!scope) return scope.status();
+    output.folded.clear();
 
+    constexpr bool device_folds_k = !std::is_same_v<device_fold_type_, no_device_fold_t>;
     std::uint64_t upper_key_slots = 0;
     std::uint64_t merged_count = 0;
     std::uint64_t largest_cells = 0;
+    bool changes = false;
     for (std::uint64_t sorted_run = 0; sorted_run != sorted_runs_count; ++sorted_run) {
         sorted_run_index_view<key_slot_type_> const& view = sorted_run < upper.size()
                                                                 ? upper[sorted_run]
                                                                 : lower[sorted_run - upper.size()];
-        // Changes fold on the host alone, where every merge holding one runs.
-        if (holds_changes(view.kinds)) return status_t::invalid_argument_k;
+        changes |= holds_changes(view.kinds);
+        // Without a device fold, changes fold on the host alone, where every merge holding one runs.
+        if (!device_folds_k && changes) return status_t::invalid_argument_k;
         std::uint64_t const cells = round_up_to_multiple(view.key_slots_count, bounds.branching);
         largest_cells = cells > largest_cells ? cells : largest_cells;
         merged_count += view.key_slots_count;
@@ -361,6 +541,12 @@ st::status_t cuda_compactor_t::compact(compaction_kind_t kind,
         status = selected.copy_out(&selected_count, 1, 0, stream);
         if (status != status_t::success_k) return status;
         survivors = static_cast<std::uint64_t>(selected_count);
+        if constexpr (device_folds_k)
+            if (changes) {
+                status = fold_survivors(stream_, kind, stamps, sorted_runs_count, merged, flags.data(), merged_count,
+                                        kept, fold, device_fold, read_value, output);
+                if (status != status_t::success_k) return status;
+            }
     }
 
     cuda_device_buffer<std::uint64_t> prefix {cuda_device_allocator<std::uint64_t>(device)};
@@ -470,7 +656,6 @@ st::status_t cuda_compactor_t::compact(compaction_kind_t kind,
     if (status != status_t::success_k) return status;
     status = survivor_kinds.copy_out(output.kinds.data(), survivors, 0, stream);
     if (status != status_t::success_k) return status;
-    output.folded.clear();
     return stream_.synchronize();
 }
 

@@ -7,7 +7,8 @@
  *  The suite compiles as plain C++ twice: the build over the CUDA compactor adds the device cases, which the host build
  *  reports as skipped, and @c compaction_device.cu instantiates that compactor for the suite's key slots. LSM
  *  levels are generated from a seed, with overlapping and sorted runs, remove deltas, versions of one key under
- *  several stamps, and keys crowded at the edges a comparator gets wrong.
+ *  several stamps, and keys crowded at the edges a comparator gets wrong. Graph levels of half-edge changes check the
+ *  device fold against the host fold byte for byte.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
@@ -17,6 +18,7 @@
 
 #include <algorithm>   // `std::sort`, `std::unique`
 #include <array>       // `std::array`
+#include <chrono>      // `std::chrono::steady_clock`
 #include <limits>      // `std::numeric_limits`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
@@ -28,6 +30,7 @@
 #include <smashtable/shared.hpp>
 
 #include "ustore/blobs/nvme_compaction.hpp"        // `host_compactor_t`, `compacted_sorted_run_t`, `compaction_kind_t`
+#include "ustore/graph/adjacency_fold.hpp"         // `adjacency_fold_t`, `vram_nvidia_adjacency_fold_t`, `save_delta`
 #include "ustore/utilities/types.hpp"              // `status_t`, `status_code_t`
 #include "ustore/utilities/vram_nvidia_device.hpp" // `cuda_count_devices`, `cuda_pinned_allocator`
 
@@ -654,15 +657,16 @@ std::size_t check_compaction(compaction_kind_t kind, sorted_run_bounds_t const& 
     return failures;
 }
 
-/** Expects two compactions of the same LSM levels to agree in every sorted run, cell field and migration. */
+/** How many sizes, sorted runs, cell fields, migrations, stamps, kinds and folded bytes two compactions of the same LSM
+ *  levels disagree in. */
 template <typename key_slot_type_>
-std::size_t expect_identical(compaction_output<key_slot_type_> const& host,
-                             compaction_output<key_slot_type_> const& device) {
-    std::size_t failures = 0;
-    failures += expect_eq(device.sorted_runs.size(), host.sorted_runs.size());
-    failures += expect_eq(device.cells.size(), host.cells.size());
-    failures += expect_eq(device.migrations.size(), host.migrations.size());
-    if (failures != 0) return failures;
+std::size_t differences(compaction_output<key_slot_type_> const& host,
+                        compaction_output<key_slot_type_> const& device) {
+    std::size_t const unequal_sizes =
+        (device.sorted_runs.size() != host.sorted_runs.size()) + (device.cells.size() != host.cells.size()) +
+        (device.migrations.size() != host.migrations.size()) + (device.stamps.size() != host.stamps.size()) +
+        (device.kinds.size() != host.kinds.size()) + (device.folded.size() != host.folded.size());
+    if (unequal_sizes != 0) return unequal_sizes;
 
     std::size_t mismatches = 0;
     for (std::size_t index = 0; index != host.sorted_runs.size(); ++index)
@@ -674,16 +678,21 @@ std::size_t expect_identical(compaction_output<key_slot_type_> const& host,
         mismatches += host.migrations[index].size != device.migrations[index].size ||
                       host.migrations[index].old_location != device.migrations[index].old_location ||
                       host.migrations[index].old_sorted_run != device.migrations[index].old_sorted_run;
-    failures += expect_eq(device.stamps.size(), host.stamps.size());
-    if (device.stamps.size() == host.stamps.size())
-        for (std::size_t index = 0; index != host.stamps.size(); ++index)
-            mismatches += host.stamps[index] != device.stamps[index];
-    failures += expect_eq(device.kinds.size(), host.kinds.size());
-    if (device.kinds.size() == host.kinds.size())
-        for (std::size_t index = 0; index != host.kinds.size(); ++index)
-            mismatches += host.kinds[index] != device.kinds[index];
-    failures += expect_eq(mismatches, std::size_t {0});
-    return failures;
+    for (std::size_t index = 0; index != host.stamps.size(); ++index)
+        mismatches += host.stamps[index] != device.stamps[index];
+    for (std::size_t index = 0; index != host.kinds.size(); ++index)
+        mismatches += host.kinds[index] != device.kinds[index];
+    for (std::size_t index = 0; index != host.folded.size(); ++index)
+        mismatches += host.folded[index] != device.folded[index];
+    return mismatches;
+}
+
+/** Expects two compactions of the same LSM levels to agree in every sorted run, cell field, migration and folded
+ *  byte. */
+template <typename key_slot_type_>
+std::size_t expect_identical(compaction_output<key_slot_type_> const& host,
+                             compaction_output<key_slot_type_> const& device) {
+    return expect_eq(differences(host, device), std::size_t {0});
 }
 
 #pragma endregion Checks
@@ -1207,7 +1216,9 @@ case_result_t gpu_case(compaction_kind_t kind, sorted_run_bounds_t const& bounds
     failures += expect(compactor.has_value());
     if (!compactor) return failures;
     compaction_output<key_slot_type_> device;
-    st::status_t const status = compactor->compact(kind, views_of(upper), views_of(lower), bounds, stamps, device);
+    st::status_t const status = compactor->compact(kind, views_of(upper), views_of(lower), bounds, stamps,
+                                                   last_write_fold_t {}, no_device_fold_t {},
+                                                   located_value_reader<key_slot_type_> {}, device);
     failures += expect(status == st::status_t::success_k);
 
     // A status alone cannot say that the build carries no kernel image for this device, so name the CUDA error
@@ -1533,6 +1544,283 @@ std::size_t run_handmade_case(suite_totals_t& totals, char const* shape, std::si
 
 #pragma endregion Handmade Cases
 
+#pragma region Graph Folds
+
+/** The key slot a graph's merges move: a vertex's key, and the size and location of its value. */
+using graph_key_slot_t = variable_width_key_slot<std::uint64_t>;
+
+/** The LSM levels of a graph collection, and the values every key slot of theirs locates. */
+struct graph_levels_t {
+
+    /** The overlapping level of change deltas, each run newer than every lower one. */
+    test_lsm_level<graph_key_slot_t> upper;
+
+    /** The sorted level below it. */
+    test_lsm_level<graph_key_slot_t> lower;
+
+    /** The values of every key slot of both levels back to back, where their locations point. */
+    basic_vector<byte_t> values;
+
+    /** Records across every change delta of both levels. */
+    std::uint64_t half_edges = 0;
+};
+
+/** One merge of a graph's levels, which the suite runs on the host and on the device. */
+struct graph_case_t {
+
+    /** Name printed with the result. */
+    char const* name;
+
+    /** Kind of compaction. */
+    compaction_kind_t kind;
+
+    /** Sorted runs on the upper level, which overlap. */
+    std::uint64_t upper_sorted_runs;
+
+    /** Sorted runs on the lower level. */
+    std::uint64_t lower_sorted_runs;
+
+    /** Vertices the levels key. */
+    std::uint64_t vertices;
+
+    /** Records the change deltas carry across both levels, roughly. */
+    std::uint64_t half_edges;
+
+    /** Chance per thousand that a change delta removes every half-edge of its vertex somewhere among its records. */
+    std::uint64_t vertex_removals_per_mille;
+
+    /** Chance per thousand that a lower key slot writes a whole vertex value instead of changing it. */
+    std::uint64_t bases_per_mille;
+
+    /** Chance per thousand that a lower key slot removes the vertex value instead of changing it. */
+    std::uint64_t removals_per_mille;
+
+    /** Stamps readers pin, so some keys keep older versions that changes fold into separately. */
+    std::uint64_t pinned;
+};
+
+/** The graph merges: long chains of inserts and removals, chains a removal of the vertex cuts, and chains reaching a
+ *  write or a removal below them, which fold on the host beside the chains the device composes. */
+inline constexpr std::array<graph_case_t, 3> graph_cases_k {{
+    {"graph.chains_of_half_edges", compaction_kind_t::overlapping_into_intermediate_k, 6, 3, 4096, 200'000, 0, 0, 0, 0},
+    {"graph.chains_cut_by_vertex_removals", compaction_kind_t::overlapping_into_intermediate_k, 6, 3, 2048, 50'000, 200,
+     0, 0, 0},
+    {"graph.chains_reaching_bases", compaction_kind_t::overlapping_into_intermediate_k, 6, 3, 2048, 50'000, 100, 300,
+     150, 9},
+}};
+
+/** The order the host reads the records of every change in: as written, or reversed, which a fold must not confuse. */
+enum class sequence_order_t : bool { oldest_first_k, reversed_k };
+
+/** The identifier numbered @p number. */
+graph::id_entity_t numbered_entity(std::uint64_t number) noexcept { return utilities::key_from_integer(number); }
+
+/** A random half-edge record among few neighbors, edges and roles, so later records of a chain overwrite earlier
+ *  ones. */
+graph::half_edge_delta_t random_half_edge(random_t& random) noexcept {
+    std::array<graph::role_t, 3> const roles {graph::edge_member_k, graph::dedge_source_k, graph::dedge_target_k};
+    graph::labeled_half_edge_t half_edge;
+    half_edge.neighbor_id = numbered_entity(random.below(24));
+    half_edge.edge_id = numbered_entity(random.below(2));
+    half_edge.edge_weight = static_cast<float>(random.below(1000)) / 8;
+    half_edge.edge_label = graph::label_t {static_cast<std::int32_t>(random.below(5))};
+    half_edge.role = roles[random.below(roles.size())];
+    if (random.below(10) < 3)
+        return graph::half_edge_delta_t::remove(half_edge.neighbor_id, half_edge.edge_id, half_edge.role);
+    return graph::half_edge_delta_t::insert(half_edge);
+}
+
+/** Appends one key slot of @p vertex to the last run of @p level, its value written into @p levels' values: a chain of
+ *  about @p records changes, a vertex value of inserts, or a removal. */
+st::status_t add_graph_key_slot(graph_case_t const& graph_case, std::uint64_t vertex, std::uint64_t stamp,
+                                std::uint64_t records, random_t& random, graph_levels_t& levels,
+                                test_lsm_level<graph_key_slot_t>& level) noexcept {
+    bool const lower = &level == &levels.lower;
+    std::uint64_t const roll = random.below(1000);
+    delta_kind_t kind = delta_kind_t::change_k;
+    if (lower && roll < graph_case.bases_per_mille) kind = delta_kind_t::write_k;
+    else if (lower && roll < graph_case.bases_per_mille + graph_case.removals_per_mille) kind = delta_kind_t::remove_k;
+
+    basic_vector<graph::half_edge_delta_t> deltas;
+    std::uint64_t const count = 1 + random.below(2 * records);
+    for (std::uint64_t index = 0; index != count && kind != delta_kind_t::remove_k; ++index)
+        if (st::status_t const status = deltas.push_back(random_half_edge(random)); status != st::status_t::success_k)
+            return status;
+    if (kind == delta_kind_t::change_k && random.below(1000) < graph_case.vertex_removals_per_mille)
+        deltas[random.below(deltas.size())] = graph::half_edge_delta_t::remove_vertex();
+    // A vertex value holds the inserts of distinct half-edges, sorted
+    std::size_t kept = deltas.size();
+    if (kind == delta_kind_t::write_k) {
+        for (graph::half_edge_delta_t& delta : deltas) delta.operation = graph::half_edge_operation_t::insert_k;
+        auto const less = [](graph::half_edge_delta_t const& first, graph::half_edge_delta_t const& second) noexcept {
+            byte_t first_bytes[graph::half_edge_delta_bytes_k], second_bytes[graph::half_edge_delta_bytes_k];
+            graph::save_delta(first, first_bytes);
+            graph::save_delta(second, second_bytes);
+            return graph::compare_half_edges(first_bytes, second_bytes) < 0;
+        };
+        std::sort(deltas.data(), deltas.data() + deltas.size(), less);
+        kept = static_cast<std::size_t>(std::unique(deltas.data(), deltas.data() + deltas.size(),
+                                                    [&](auto const& first, auto const& second) noexcept {
+                                                        return !less(first, second) && !less(second, first);
+                                                    }) -
+                                        deltas.data());
+    }
+    else levels.half_edges += kept;
+
+    graph_key_slot_t key_slot;
+    key_slot.stored_key = vertex;
+    key_slot.location = static_cast<std::uint32_t>(levels.values.size());
+    key_slot.size = static_cast<std::uint32_t>(kept * graph::half_edge_delta_bytes_k);
+    st::status_t status = levels.values.resize(levels.values.size() + key_slot.size);
+    if (status != st::status_t::success_k) return status;
+    for (std::size_t index = 0; index != kept; ++index)
+        graph::save_delta(deltas[index],
+                          levels.values.data() + key_slot.location + index * graph::half_edge_delta_bytes_k);
+    if ((status = level.sorted.push_back(graph_key_slot_t {key_slot})) != st::status_t::success_k) return status;
+    if ((status = level.stamps.push_back(std::uint64_t {stamp})) != st::status_t::success_k) return status;
+    return level.kinds.push_back(static_cast<std::uint8_t>(kind));
+}
+
+/** Generates the levels of @p graph_case: every run keys about half the vertices, the lower level one era older than
+ *  every upper run, and lays them out. */
+st::status_t make_graph_levels(graph_case_t const& graph_case, sorted_run_bounds_t const& bounds, random_t& random,
+                               graph_levels_t& levels) noexcept {
+    std::uint64_t const runs = graph_case.upper_sorted_runs + 1;
+    std::uint64_t const records = graph_case.half_edges / (graph_case.vertices * runs / 2) + 1;
+    st::status_t status = st::status_t::success_k;
+    for (std::uint64_t run = 0; run != graph_case.upper_sorted_runs; ++run) {
+        std::size_t const before = levels.upper.sorted.size();
+        for (std::uint64_t vertex = 0; vertex != graph_case.vertices && status == st::status_t::success_k; ++vertex)
+            if (random.below(2) == 0)
+                status = add_graph_key_slot(graph_case, vertex,
+                                            (run + 1) * stamps_per_sorted_run_k + random.below(stamps_per_sorted_run_k),
+                                            records, random, levels, levels.upper);
+        if (status != st::status_t::success_k) return status;
+        if (levels.upper.sorted.size() != before)
+            if ((status = levels.upper.counts.push_back(std::uint64_t {levels.upper.sorted.size() - before})) !=
+                st::status_t::success_k)
+                return status;
+    }
+    for (std::uint64_t vertex = 0; vertex != graph_case.vertices && status == st::status_t::success_k; ++vertex)
+        if (random.below(2) == 0)
+            status = add_graph_key_slot(graph_case, vertex, random.below(stamps_per_sorted_run_k), records, random,
+                                        levels, levels.lower);
+    if (status != st::status_t::success_k) return status;
+    std::uint64_t const total = levels.lower.sorted.size();
+    std::uint64_t const chunk = divide_round_up(total, graph_case.lower_sorted_runs);
+    for (std::uint64_t offset = 0; offset < total; offset += chunk)
+        if ((status = levels.lower.counts.push_back(std::uint64_t {chunk < total - offset ? chunk : total - offset})) !=
+            st::status_t::success_k)
+            return status;
+    if ((status = lay_out(levels.upper, bounds.branching)) != st::status_t::success_k) return status;
+    return lay_out(levels.lower, bounds.branching);
+}
+
+/** Pins @p count stamps drawn from the levels, as readers would. */
+compaction_stamps_t graph_stamps(graph_levels_t const& levels, std::uint64_t count, random_t& random,
+                                 basic_vector<std::uint64_t>& pins) noexcept {
+    pins.clear();
+    std::size_t const total = levels.upper.stamps.size() + levels.lower.stamps.size();
+    for (std::uint64_t pin = 0; pin != count && total != 0; ++pin) {
+        std::size_t const drawn = static_cast<std::size_t>(random.below(total));
+        std::uint64_t const stamp = drawn < levels.upper.stamps.size()
+                                        ? levels.upper.stamps[drawn]
+                                        : levels.lower.stamps[drawn - levels.upper.stamps.size()];
+        if (pins.push_back(std::uint64_t {stamp}) != st::status_t::success_k) break;
+    }
+    std::sort(pins.data(), pins.data() + pins.size());
+    [[maybe_unused]] st::status_t const deduplicated = pins.resize(
+        static_cast<std::size_t>(std::unique(pins.data(), pins.data() + pins.size()) - pins.data()));
+    compaction_stamps_t stamps;
+    stamps.pinned = pins.data();
+    stamps.pinned_count = pins.size();
+    return stamps;
+}
+
+#if USTORE_WITH_CUDA
+
+/** Milliseconds since @p start. */
+double milliseconds_since(std::chrono::steady_clock::time_point start) noexcept {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+
+/** Merges the levels of @p graph_case on the host and on the first CUDA device, composing its chains with the graph's
+ *  device fold, and expects identical outputs; with @p order reversed, the host reads every change's records in
+ *  reverse, which the device output must expose. */
+case_result_t graph_gpu_case(graph_case_t const& graph_case, std::size_t case_index, sequence_order_t order,
+                             options_t const& options) {
+    st::expected<std::size_t> const devices = cuda_count_devices();
+    if (!devices || *devices == 0) return case_result_t::skipped("no CUDA device");
+    std::size_t failures = 0;
+    random_t random = options.random.fork(case_index);
+    graph_levels_t levels;
+    failures += expect(make_graph_levels(graph_case, roomy_bounds_k, random, levels) == st::status_t::success_k);
+    if (failures != 0) return failures;
+    basic_vector<std::uint64_t> pins;
+    compaction_stamps_t const stamps = graph_stamps(levels, graph_case.pinned, random, pins);
+
+    using record_t = located_key_slot<graph_key_slot_t>;
+    auto const read_value = [&levels](record_t const& record, arena_allocator<byte_t>&,
+                                      std::span<byte_t const>& bytes) noexcept {
+        bytes = {levels.values.data() + record.key_slot.location, record.key_slot.size};
+        return st::status_t::success_k;
+    };
+    auto const read_reversed = [&levels](record_t const& record, arena_allocator<byte_t>& arena,
+                                         std::span<byte_t const>& bytes) noexcept {
+        std::size_t const size = record.key_slot.size;
+        byte_t* const into = size != 0 ? arena.allocate(size) : nullptr;
+        if (size != 0 && into == nullptr) return st::status_t::out_of_memory_heap_k;
+        std::size_t const count = size / graph::half_edge_delta_bytes_k;
+        for (std::size_t index = 0; index != count; ++index)
+            std::memcpy(into + (count - 1 - index) * graph::half_edge_delta_bytes_k,
+                        levels.values.data() + record.key_slot.location + index * graph::half_edge_delta_bytes_k,
+                        graph::half_edge_delta_bytes_k);
+        bytes = {into, size};
+        return st::status_t::success_k;
+    };
+
+    compaction_output<graph_key_slot_t> host;
+    std::chrono::steady_clock::time_point const host_start = std::chrono::steady_clock::now();
+    st::status_t status = order == sequence_order_t::reversed_k
+                              ? host_compactor_t {}.compact(graph_case.kind, views_of(levels.upper),
+                                                            views_of(levels.lower), roomy_bounds_k, stamps,
+                                                            graph::adjacency_fold_t {}, read_reversed, host)
+                              : host_compactor_t {}.compact(graph_case.kind, views_of(levels.upper),
+                                                            views_of(levels.lower), roomy_bounds_k, stamps,
+                                                            graph::adjacency_fold_t {}, read_value, host);
+    double const host_milliseconds = milliseconds_since(host_start);
+    failures += expect(status == st::status_t::success_k);
+    failures += expect(!host.folded.empty());
+
+    st::expected<cuda_compactor_t> compactor = cuda_compactor_t::make(0);
+    failures += expect(compactor.has_value());
+    if (failures != 0) return failures;
+    compaction_output<graph_key_slot_t> device;
+    std::chrono::steady_clock::time_point const device_start = std::chrono::steady_clock::now();
+    status = compactor->compact(graph_case.kind, views_of(levels.upper), views_of(levels.lower), roomy_bounds_k, stamps,
+                                graph::adjacency_fold_t {}, graph::vram_nvidia_adjacency_fold_t {}, read_value, device);
+    double const device_milliseconds = milliseconds_since(device_start);
+    failures += expect(status == st::status_t::success_k);
+    if (status != st::status_t::success_k) return failures;
+    if (order == sequence_order_t::reversed_k) failures += expect(differences(host, device) != 0);
+    else failures += expect_identical(host, device);
+    fmt::println("  {} half-edges: host {:.1f} ms, {:.1f} M/s; device {:.1f} ms, {:.1f} M/s", levels.half_edges,
+                 host_milliseconds, levels.half_edges / host_milliseconds / 1e3, device_milliseconds,
+                 levels.half_edges / device_milliseconds / 1e3);
+    return failures;
+}
+
+#else
+
+/** A graph's device fold skips in a build without CUDA. */
+case_result_t graph_gpu_case(graph_case_t const&, std::size_t, sequence_order_t, options_t const&) {
+    return case_result_t::skipped("built without CUDA");
+}
+
+#endif
+
+#pragma endregion Graph Folds
+
 int main(int argc, char** argv) {
     suite_options_t suite;
     options_t options;
@@ -1573,5 +1861,11 @@ int main(int argc, char** argv) {
         run_scenario<fixed_width_key_slot<st::key128_t>>(totals, "fixed_uuid", index, scenario, options);
         run_scenario<variable_width_key_slot<st::key128_t>>(totals, "variable_width_uuid", index, scenario, options);
     }
+    for (std::size_t index = 0; index != graph_cases_k.size(); ++index)
+        report(totals, graph_cases_k[index].name, graph_gpu_case, graph_cases_k[index], index,
+               sequence_order_t::oldest_first_k, options);
+    // Reading every change's records in reverse must show in the output, or parity proves nothing about the order
+    report(totals, "graph.reversed_sequences_differ", graph_gpu_case, graph_cases_k[1], std::size_t {1},
+           sequence_order_t::reversed_k, options);
     return suite_exit_code(totals);
 }

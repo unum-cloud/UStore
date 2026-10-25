@@ -73,11 +73,11 @@ constexpr std::size_t contended_accounts_k = 64;
 /** The balance every account starts at, so the total is known before a single transaction runs. */
 constexpr std::uint64_t initial_balance_k = 1000;
 
-/** Bytes one transaction's write buffer holds. */
-constexpr std::size_t write_buffer_bytes_k = 64 * 1024;
+/** Bytes one transaction's deltas hold. */
+constexpr std::size_t deltas_bytes_k = 64 * 1024;
 
-/** Keys one transaction's write buffer holds. */
-constexpr std::size_t write_buffer_elements_k = 2048;
+/** Keys one transaction's deltas hold. */
+constexpr std::size_t deltas_max_count_k = 2048;
 
 /** What a store does with the writes a commit hands it, so a refusal can be asked for. */
 enum class store_behaviour_t {
@@ -133,9 +133,9 @@ class test_store_t {
         return false;
     }
 
-    /** Seals @p changes for the commit that follows, flushing the collection first when it reports itself full. */
-    status_t seal_collection(collection_id_t,
-                             grouped_write_buffer<stored_key_t, atomic_reference, waiter_t> const& changes,
+    /** Seals @p written for the commit that follows, flushing the collection first when it reports itself full. */
+    status_t seal_collection(collection_id_t collection_id,
+                             transaction_deltas<stored_key_t, atomic_reference, waiter_t> const& written,
                              sealed_commit<stored_key_t, atomic_reference>& sealed) noexcept {
         if (behaviour == store_behaviour_t::always_flushing_k || behaviour == store_behaviour_t::refusing_flushes_k) {
             ++flushes;
@@ -143,10 +143,7 @@ class test_store_t {
                 return {status_code_t::device_k, "Refusing to flush"};
         }
         st::basic_vector<keyed_delta<stored_key_t>> deltas;
-        changes.for_each_write([&](collection_id_t, stored_key_t const& stored_key, auto const& place) noexcept {
-            delta_view_t delta {static_cast<delta_kind_t>(place.kind), {}};
-            std::span<byte_t const> const inserted = as_bytes_view(changes.insertions_buffer);
-            if (place.size != 0) delta.bytes = inserted.subspan(place.offset, place.size);
+        written.for_each_delta(collection_id, [&](stored_key_t stored_key, delta_view_t delta) noexcept {
             [[maybe_unused]] st::status_t const kept = deltas.push_back(keyed_delta<stored_key_t> {stored_key, delta});
         });
         if (deltas.empty()) return {};
@@ -269,7 +266,10 @@ template <>
 class blobs::database_transaction<stored_key_t, test_store_t, atomic_reference, waiter_t> {
   public:
     using state_t = registry_t::transaction_state_t;
-    using write_buffer_t = registry_t::write_buffer_t;
+    using transaction_deltas_t = registry_t::transaction_deltas_t;
+
+    /** The widths the sole collection admits, which every write is checked against. */
+    static constexpr transaction_deltas_t::value_widths_t widths_k {value_bytes_k, 0};
 
     /** What the transaction is allowed to do next. */
     enum class phase_t {
@@ -281,8 +281,8 @@ class blobs::database_transaction<stored_key_t, test_store_t, atomic_reference, 
         staged_k,
     };
 
-    database_transaction(registry_t& registry, write_buffer_t&& changes, resources_shared_ptr_t resources) noexcept
-        : registry_(&registry), data_(std::move(changes), resources) {
+    database_transaction(registry_t& registry, transaction_deltas_t&& deltas, resources_shared_ptr_t resources) noexcept
+        : registry_(&registry), data_(std::move(deltas), resources) {
         start_stamp_ = registry_->request_start_(pin_);
     }
 
@@ -314,15 +314,14 @@ class blobs::database_transaction<stored_key_t, test_store_t, atomic_reference, 
     status_t insert(stored_key_t stored_key, std::uint64_t word) noexcept {
         std::byte payload[value_bytes_k];
         std::memcpy(payload, &word, value_bytes_k);
-        return data_.changes.add(collection_k, group_config_, stored_key, stored_value_view_t {payload, value_bytes_k},
-                                 written_watch_<watch_schedule_>());
+        return data_.deltas.write(collection_k, widths_k, stored_key, stored_value_view_t {payload, value_bytes_k},
+                                  written_watch_<watch_schedule_>());
     }
 
     /** Drops @p stored_key, watching the key on @p watch_schedule_ beside the write. */
     template <watch_schedule_t watch_schedule_ = watch_schedule_t::on_commit_k>
     status_t remove(stored_key_t stored_key) noexcept {
-        return data_.changes.mark_as_removed(collection_k, group_config_, stored_key,
-                                             written_watch_<watch_schedule_>());
+        return data_.deltas.remove(collection_k, widths_k, stored_key, written_watch_<watch_schedule_>());
     }
 
     /** Checks the watched keys and makes room in the store, holding the write path once it answers. */
@@ -358,19 +357,13 @@ class blobs::database_transaction<stored_key_t, test_store_t, atomic_reference, 
         phase_ = phase_t::started_k;
         data_.read_set.clear();
         start_stamp_ = registry_->request_start_(pin_);
-        data_.changes.rescope_watches(start_stamp_);
+        data_.deltas.rescope_watches(start_stamp_);
     }
 
     /** The stamp of the last commit this transaction landed. */
     transaction_stamp_t last_commit_stamp() const noexcept { return last_commit_stamp_; }
 
   private:
-
-    /** The widths the sole collection admits, which every write is checked against. */
-    static status_t group_config_(collection_id_t, write_buffer_t::group_config_t& config) noexcept {
-        config = {value_bytes_k, 0};
-        return {};
-    }
 
     /** The stamp a watch on @p watch_schedule_ is scoped from. */
     template <watch_schedule_t watch_schedule_>
@@ -452,12 +445,78 @@ struct fixture_t {
 
     /** A transaction, or nothing when the registry refuses it. */
     expected<registry_t::transaction_unique_ptr_t> open() noexcept {
-        transaction_config_t const config {write_buffer_bytes_k, write_buffer_elements_k};
+        transaction_config_t const config {deltas_bytes_k, deltas_max_count_k};
         return registry.create_transaction(config);
     }
 };
 
 #pragma endregion Fixture
+
+#pragma region Deltas Cases
+
+/** The deltas a transaction files its writes in, driven here apart from any registry. */
+using transaction_deltas_t = transaction_deltas<stored_key_t, atomic_reference, waiter_t>;
+
+/** A second collection, whose keys the deltas keep apart from those of @c collection_k. */
+constexpr collection_id_t other_collection_k {uuid_from_integer(8)};
+
+/** The last delta of a key wins inside its own collection alone, an empty value reads back empty, a value past the
+ *  collection's width is refused, and every byte returns to the budget once the deltas die. */
+static std::size_t deltas_read_back_per_collection() {
+    std::size_t failures = 0;
+    resources_shared_ptr_t const resources = std::make_shared<resources_t>(1ull << 20, 0);
+    {
+        transaction_deltas_t deltas(deltas_bytes_k, deltas_max_count_k, resources);
+        transaction_deltas_t::value_widths_t const widths {0, 4};
+        std::array<byte_t, 3> const first {byte_t {1}, byte_t {2}, byte_t {3}};
+        std::array<byte_t, 2> const second {byte_t {7}, byte_t {8}};
+        std::array<byte_t, 5> too_wide {};
+        failures += expect(deltas.write(collection_k, widths, 1, first).succeeded());
+        failures += expect(deltas.write(other_collection_k, widths, 1, first).succeeded());
+        failures += expect(deltas.remove(collection_k, widths, 1).succeeded());
+        failures += expect(deltas.write(collection_k, widths, 1, second).succeeded());
+        failures += expect(deltas.remove(collection_k, widths, 2).succeeded());
+        failures += expect(deltas.write(collection_k, widths, 3, stored_value_view_t {}).succeeded());
+        failures += expect_status(deltas.write(collection_k, widths, 4, too_wide), status_code_t::malformed_k);
+        failures += expect_eq(deltas.count(), std::size_t {4});
+        failures += expect_eq(deltas.count(collection_k), std::size_t {3});
+        failures += expect(deltas.lookup(collection_k, 2) == lookup_result_t::removed_k);
+        failures += expect(deltas.lookup(collection_k, 4) == lookup_result_t::missing_k);
+        failures += expect(deltas.lookup(other_collection_k, 2) == lookup_result_t::missing_k);
+
+        std::array<byte_t, 4> into {};
+        stored_value_size_t size = 0;
+        failures += expect(deltas.select(collection_k, 1, into, size).succeeded());
+        failures += expect_eq(std::size_t {size}, second.size());
+        failures += expect(std::memcmp(into.data(), second.data(), second.size()) == 0);
+        failures += expect(deltas.select(other_collection_k, 1, into, size).succeeded());
+        failures += expect_eq(std::size_t {size}, first.size());
+        failures += expect(std::memcmp(into.data(), first.data(), first.size()) == 0);
+        failures += expect(deltas.select(collection_k, 3, into, size).succeeded());
+        failures += expect_eq(std::size_t {size}, std::size_t {0});
+        failures += expect_status(deltas.select(collection_k, 2, into, size), status_code_t::not_found_k);
+    }
+    failures += expect_eq(resources->memory_constraint.used(), std::size_t {0});
+    return failures;
+}
+
+/** Deltas holding as many keys as they admit refuse the next key with @c capacity_exhausted_k and keep the rest. */
+static std::size_t deltas_refuse_past_their_bound() {
+    std::size_t failures = 0;
+    resources_shared_ptr_t const resources = std::make_shared<resources_t>(1ull << 20, 0);
+    constexpr std::size_t bound_k = 8;
+    transaction_deltas_t deltas(deltas_bytes_k, bound_k, resources);
+    transaction_deltas_t::value_widths_t const widths {value_bytes_k, 0};
+    for (stored_key_t key = 0; key != bound_k; ++key)
+        failures += expect(deltas.remove(collection_k, widths, key).succeeded());
+    failures += expect_status(deltas.remove(collection_k, widths, bound_k), status_code_t::capacity_exhausted_k);
+    failures += expect_eq(deltas.count(), bound_k);
+    failures += expect(deltas.lookup(collection_k, bound_k - 1) == lookup_result_t::removed_k);
+    failures += expect(deltas.lookup(collection_k, bound_k) == lookup_result_t::missing_k);
+    return failures;
+}
+
+#pragma endregion Deltas Cases
 
 #pragma region Ordering Cases
 
@@ -635,7 +694,7 @@ static std::size_t write_write_one_winner() {
     failures += expect_eq(fixture.store.balance(9), std::uint64_t {111});
 
     // The loser's writes survive its refusal, which is what a caller logging them relies on.
-    failures += expect_eq(second->get()->state().changes.count(), std::size_t {1});
+    failures += expect_eq(second->get()->state().deltas.count(), std::size_t {1});
     second->get()->rollback();
     return failures;
 }
@@ -780,7 +839,7 @@ static std::size_t failed_commit_keeps_changes() {
 
     fixture.store.behaviour = store_behaviour_t::refusing_applies_k;
     failures += expect(transaction->get()->commit().failed());
-    failures += expect_eq(transaction->get()->state().changes.count(), std::size_t {2});
+    failures += expect_eq(transaction->get()->state().deltas.count(), std::size_t {2});
 
     // The room was refused before a stamp was drawn, so nothing landed and a reader spanning the failure stages.
     failures += expect(reader->get()->stage().succeeded());
@@ -788,12 +847,12 @@ static std::size_t failed_commit_keeps_changes() {
 
     // Retrying is what renewal is for: the changes stay and only the watches and the stamp restart.
     transaction->get()->renew();
-    failures += expect_eq(transaction->get()->state().changes.count(), std::size_t {2});
+    failures += expect_eq(transaction->get()->state().deltas.count(), std::size_t {2});
 
     // A refused stage leaves them too, which is the other half of the same promise.
     fixture.store.behaviour = store_behaviour_t::refusing_flushes_k;
     failures += expect_status(transaction->get()->stage(), status_code_t::device_k);
-    failures += expect_eq(transaction->get()->state().changes.count(), std::size_t {2});
+    failures += expect_eq(transaction->get()->state().deltas.count(), std::size_t {2});
 
     // The refused stage handed the write path back, so the retry can still take it.
     fixture.store.behaviour = store_behaviour_t::accepting_k;
@@ -841,14 +900,14 @@ static std::size_t rollback_and_renew_leave_no_trace() {
         failures += expect(transaction->get()->insert(3, 7).succeeded());
         failures += expect(transaction->get()->stage().succeeded());
         transaction->get()->rollback();
-        failures += expect_eq(transaction->get()->state().changes.count(), std::size_t {0});
+        failures += expect_eq(transaction->get()->state().deltas.count(), std::size_t {0});
         failures += expect_eq(transaction->get()->state().read_set.count(), std::size_t {0});
 
         // Renewal keeps the changes and drops only the watches.
         failures += expect(transaction->get()->insert(3, 9).succeeded());
         failures += expect(transaction->get()->stage().succeeded());
         transaction->get()->renew();
-        failures += expect_eq(transaction->get()->state().changes.count(), std::size_t {1});
+        failures += expect_eq(transaction->get()->state().deltas.count(), std::size_t {1});
         failures += expect_eq(transaction->get()->state().read_set.count(), std::size_t {0});
         failures += expect(transaction->get()->commit().succeeded());
         failures += expect_eq(fixture.store.balance(3), std::uint64_t {9});
@@ -1066,6 +1125,8 @@ int main(int argc, char const* argv[]) {
         return status == argument_status_t::help_k ? 0 : 1;
     suite_totals_t totals = options.totals();
 
+    report(totals, "deltas.per_collection", deltas_read_back_per_collection);
+    report(totals, "deltas.bound", deltas_refuse_past_their_bound);
     report(totals, "stamps.distinct", commit_stamps_are_distinct);
     report(totals, "ledger.pins", pins_answer_the_ledger);
     report(totals, "conflict.read_write", read_write_conflict_is_caught);

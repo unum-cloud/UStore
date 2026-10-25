@@ -344,7 +344,7 @@ template <typename level_type_, typename volume_type_>
 
 #pragma region Flush Cases
 
-/** A flushed write buffer becomes one level-zero run whose keys a point lookup finds. */
+/** One flush of memory runs becomes one level-zero run whose keys a point lookup finds. */
 template <typename mount_type_>
 std::size_t flush_lands_on_level_zero(mount_type_ const& mount) {
     using types_t = lsm_types<typename mount_type_::fixture_t>;
@@ -543,8 +543,9 @@ std::size_t compaction_drops_remove_deltas_at_the_bottom(mount_type_ const& moun
     }
 
     failures += expect(tree->needs_compaction(tree->levels()));
-    expected<compaction_outcome_t> const outcome = tree->compact(
-        reading->channel(), writing->channel(), compaction_placement_t::host_k, {}, nullptr, last_write_fold_t {});
+    expected<compaction_outcome_t> const outcome = tree->compact(reading->channel(), writing->channel(),
+                                                                 compaction_placement_t::host_k, {}, nullptr,
+                                                                 last_write_fold_t {}, no_device_fold_t {});
     failures += expect(outcome.has_value());
     if (!outcome) return failures;
     failures += expect(*outcome == compaction_outcome_t::published_k);
@@ -627,14 +628,14 @@ std::size_t intermediate_merge_keeps_remove_deltas(mount_type_ const& mount) {
 
     request.depth = lsm_level_depth_t::intermediate_k;
     expected<level_t> kept = merger_t::merge(*volume, reading->channel(), writing->channel(), request,
-                                             last_write_fold_t {});
+                                             last_write_fold_t {}, no_device_fold_t {});
     failures += expect_status(kept, status_code_t::success_k);
     if (!kept) return failures;
     failures += expect_eq(kept->population_count(), static_cast<std::uint64_t>(keys_k));
 
     request.depth = lsm_level_depth_t::bottom_k;
     expected<level_t> dropped = merger_t::merge(*volume, reading->channel(), writing->channel(), request,
-                                                last_write_fold_t {});
+                                                last_write_fold_t {}, no_device_fold_t {});
     failures += expect(dropped.has_value());
     if (!dropped) return failures;
     failures += expect_eq(dropped->population_count(), static_cast<std::uint64_t>(keys_k - removed_keys));
@@ -721,7 +722,7 @@ std::size_t cancelled_compaction_leaves_nothing(mount_type_ const& mount) {
     cancellation.raise();
     expected<compaction_outcome_t> const outcome = tree->compact(reading->channel(), writing->channel(),
                                                                  compaction_placement_t::host_k, {}, &cancellation,
-                                                                 last_write_fold_t {});
+                                                                 last_write_fold_t {}, no_device_fold_t {});
     failures += expect(!outcome.has_value());
     failures += expect_status(outcome, status_code_t::uninitialized_k);
 
@@ -744,8 +745,9 @@ std::size_t cancelled_compaction_leaves_nothing(mount_type_ const& mount) {
     failures += check_model(*tree, guard->channel(), std::span<expectation_t const> {model});
 
     // The same tree still compacts once nobody is cancelling it.
-    expected<compaction_outcome_t> const again = tree->compact(
-        reading->channel(), writing->channel(), compaction_placement_t::host_k, {}, nullptr, last_write_fold_t {});
+    expected<compaction_outcome_t> const again = tree->compact(reading->channel(), writing->channel(),
+                                                               compaction_placement_t::host_k, {}, nullptr,
+                                                               last_write_fold_t {}, no_device_fold_t {});
     failures += expect(again.has_value());
     if (again) failures += expect(*again == compaction_outcome_t::published_k);
     failures += check_model(*tree, guard->channel(), std::span<expectation_t const> {model});
@@ -813,7 +815,7 @@ std::size_t raced_cancellation_is_all_or_nothing(mount_type_ const& mount) {
     }};
     expected<compaction_outcome_t> const outcome = tree->compact(reading->channel(), writing->channel(),
                                                                  compaction_placement_t::host_k, {}, &cancellation,
-                                                                 last_write_fold_t {});
+                                                                 last_write_fold_t {}, no_device_fold_t {});
     raiser.join();
 
     failures += expect_eq(writing->channel().streams().available_buffers(), lsm_config_k.stream_buffers);
@@ -917,7 +919,7 @@ case_result_t both_compactors_agree(mount_type_ const& mount) {
 
     request.placement = compaction_placement_t::host_k;
     expected<level_t> host = merger_t::merge(*volume, reading->channel(), writing->channel(), request,
-                                             last_write_fold_t {});
+                                             last_write_fold_t {}, no_device_fold_t {});
     failures += expect(host.has_value());
     if (!host) return failures;
 
@@ -925,7 +927,7 @@ case_result_t both_compactors_agree(mount_type_ const& mount) {
     request.placement = compaction_placement_t::device_k;
     request.devices = first_device;
     expected<level_t> device = merger_t::merge(*volume, reading->channel(), writing->channel(), request,
-                                               last_write_fold_t {});
+                                               last_write_fold_t {}, no_device_fold_t {});
     if (!device) {
         bool const no_compactor = device == status_code_t::unsupported_k || device == status_code_t::device_k;
         if (!no_compactor) failures += expect_status(device, status_code_t::unsupported_k);
@@ -1044,7 +1046,7 @@ std::size_t merge_charges_no_index_copy(mount_type_ const& mount) {
     request.value_max_size = value_max_size_k;
     request.placement = compaction_placement_t::host_k;
     expected<level_t> merged = merger_t::merge(*volume, reading->channel(), writing->channel(), request,
-                                               last_write_fold_t {});
+                                               last_write_fold_t {}, no_device_fold_t {});
     allocation_watch_t const seen = watch;
     watch = allocation_watch_t {};
     failures += expect_status(merged, status_code_t::success_k);

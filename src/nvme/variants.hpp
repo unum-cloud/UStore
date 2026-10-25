@@ -25,7 +25,7 @@
  *  commit watching nothing, so a collection created or dropped never conflicts with the transactions running beside
  *  it. A call outside a transaction reads at the head, or
  *  at its snapshot's stamp. Reads resolve collections at the head, as every engine does, but through a snapshot, which
- *  resolves them as they stood at its stamp. A walk merges the runs of one collection with its write buffer and,
+ *  resolves them as they stood at its stamp. A walk merges the runs of one collection with its memory runs and,
  *  inside a transaction, with the transaction's own writes.
  *
  *  Isolation, as delivered. Every read of a transaction answers at the stamp it started at, a walk included, so it
@@ -39,7 +39,7 @@
  *  A staged transaction holds the ledger's leader word, which every other commit waits for, so a stage only checks
  *  the transaction and lets the word go, and the commit checks it again. A snapshot is a stamp pinned in the store's
  *  ledger and holds no level set: every read through it answers the newest version at or below that stamp, which the
- *  write buffers and the merges keep for as long as the pin lives, so a snapshot kept across calls stalls no writer.
+ *  memory runs and the merges keep for as long as the pin lives, so a snapshot kept across calls stalls no writer.
  */
 
 #pragma once
@@ -69,6 +69,7 @@
 #include "ustore/blobs/nvme_database.hpp"      // `basic_database`, `watch_schedule_t`, `lookup_result_t`
 #include "ustore/blobs/nvme_tree.hpp"          // `user_collection_config_t`, `validate`
 #include "ustore/docs/nvme_store.hpp"          // `docs::nvme_store`
+#include "ustore/graph/adjacency_fold.hpp"     // `vram_nvidia_adjacency_fold_t`
 #include "ustore/graph/nvme_store.hpp"         // `graph::nvme_store`
 #include "ustore/pages/nvme_store.hpp"         // `pages::nvme_store`
 #include "ustore/strings/nvme_store.hpp"       // `strings::nvme_store`, `nvme_transaction`, `strings_page_t`
@@ -97,26 +98,38 @@ template <cpu_class_t cpu_class_>
 using storage_mount_of =
     typename mounted_storage<atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>>::files_mount_t;
 
+/** What composes the half-edge changes of a graph's merge on a device: the CUDA tower in a build carrying CUDA, and
+ *  nothing otherwise, which keeps such merges on the host. */
+#if USTORE_WITH_CUDA
+using graph_device_fold_t = graph::vram_nvidia_adjacency_fold_t;
+#else
+using graph_device_fold_t = blobs::no_device_fold_t;
+#endif
+
 /** The store of a blobs collection, and of the main one, whose values follow @p value_layout_. */
 template <cpu_class_t cpu_class_, value_layout_t value_layout_>
 using blobs_store_of =
     blobs::nvme_store<key_slot<stored_key_t, value_layout_>, typename storage_mount_of<cpu_class_>::volume_t,
-                      atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>, last_write_fold_t>;
+                      atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>, last_write_fold_t,
+                      blobs::no_device_fold_t>;
 
 /** The store of a graph collection. */
 template <cpu_class_t cpu_class_>
-using graph_store_of = graph::nvme_store<stored_key_t, typename storage_mount_of<cpu_class_>::volume_t,
-                                         atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>>;
+using graph_store_of =
+    graph::nvme_store<stored_key_t, typename storage_mount_of<cpu_class_>::volume_t,
+                      atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>, graph_device_fold_t>;
 
 /** The store of a docs collection. */
 template <cpu_class_t cpu_class_>
 using docs_store_of = docs::nvme_store<stored_key_t, typename storage_mount_of<cpu_class_>::volume_t,
-                                       atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>>;
+                                       atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>,
+                                       blobs::no_device_fold_t>;
 
 /** The store of a pages collection. */
 template <cpu_class_t cpu_class_>
 using pages_store_of = pages::nvme_store<stored_key_t, typename storage_mount_of<cpu_class_>::volume_t,
-                                         atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>>;
+                                         atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>,
+                                         blobs::no_device_fold_t>;
 
 /** The store of a strings collection, keyed by whole strings. */
 template <cpu_class_t cpu_class_>
@@ -498,7 +511,7 @@ expected<value_view_t> read_value(call_access<cpu_class_> const& access, collect
     bool const changed = transaction && transaction->uncommitted_delta(collection, key, own) &&
                          own.kind == delta_kind_t::change_k;
     if (transaction) {
-        lookup_result_t const own_status = transaction->uncommitted(collection, key);
+        lookup_result_t const own_status = transaction->lookup_uncommitted(collection, key);
         if (own_status == lookup_result_t::removed_k) return value_view_t {};
         if (own_status == lookup_result_t::written_k && !changed) {
             stored_value_size_t size = 0;
@@ -2065,7 +2078,7 @@ status_t save_collection(call_access<cpu_class_> const& access, collection_ids_t
             return made;
     }
 
-    // One window of keys is one write buffer of the target, which it lands without a flush in between
+    // One window of keys is one commit's memory run of the target, which it lands without a flush in between
     collection_config_t config;
     if (status_t const shaped = target.store->collection_config(collection.id, config); shaped.failed()) return shaped;
     std::size_t const window = config.memory_runs_max_deltas;

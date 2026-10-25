@@ -79,7 +79,7 @@ resources_config_t build_resources_config(options_t const& options) noexcept {
     return config;
 }
 
-/** The write buffer, level and value limits @p options names. */
+/** The memory-run, level and value limits @p options names. */
 user_collection_config_t build_collection_config(options_t const& options) noexcept {
 
     user_collection_config_t config;

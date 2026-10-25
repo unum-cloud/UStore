@@ -514,7 +514,6 @@ if (${USTORE_BUILD_TEST})
             "volume"
             "sorted_run"
             "tree"
-            "write_buffer"
             "collection"
             "transaction_registry"
             "database"

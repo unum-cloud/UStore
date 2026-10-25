@@ -31,31 +31,29 @@
 #include <span>        // `std::span`, `std::as_bytes`
 #include <string_view> // `std::string_view`
 #include <type_traits> // `std::is_same_v`, `std::remove_cvref_t`
-#include <utility>     // `std::exchange`, `std::move`
+#include <utility>     // `std::move`
 
 #include <smashtable/basic_hash_table.hpp> // `st::hash_map`
 #include <smashtable/basic_vector.hpp>     // `st::basic_vector`
 #include <stringzilla/stringzilla.hpp>     // `sz::string_view_t`
 
-#include "ustore/blobs/nvme_collection_view.hpp" // `collection_view`, `published_view`
-#include "ustore/blobs/nvme_store.hpp"           // `commit_ledger`, `stamp_pin`, `lookup_result_t`, `memory_pressure_t`
-#include "ustore/blobs/nvme_database.hpp"        // `transaction_share_t`
-#include "ustore/blobs/nvme_tree.hpp"            // `lsm_tree`, `collection_config_t`, `lsm_tree_publication_hook_t`
-#include "ustore/strings/string_keys.hpp"        // `head_of`, `head_length_of`, `tail_of`, `head_prefix_bytes_k`
-#include "ustore/strings/nvme_memory_run.hpp"    // `memory_run`, `sealed_deltas`, `kept_versions`
-#include "ustore/utilities/folds.hpp"            // `last_write_fold_t`, `delta_view_t`
-#include "ustore/utilities/ram_buffers.hpp"      // `local_arena_t`
-#include "ustore/utilities/types.hpp"            // `status_t`, `expected`, `byte_t`
+#include "ustore/blobs/nvme_published_runs.hpp" // `published_runs`, `memory_pressure_t`, `memory_shape_t`
+#include "ustore/blobs/nvme_store.hpp"          // `commit_ledger`, `stamp_pin`, `lookup_result_t`
+#include "ustore/blobs/nvme_database.hpp"       // `transaction_share_t`
+#include "ustore/blobs/nvme_tree.hpp"           // `collection_config_t`, `lsm_tree_publication_hook_t`
+#include "ustore/strings/string_keys.hpp"       // `head_of`, `head_length_of`, `tail_of`, `head_prefix_bytes_k`
+#include "ustore/strings/nvme_memory_run.hpp"   // `memory_run`, `sealed_deltas`, `kept_versions`
+#include "ustore/utilities/folds.hpp"           // `last_write_fold_t`, `delta_view_t`
+#include "ustore/utilities/ram_buffers.hpp"     // `local_arena_t`
+#include "ustore/utilities/types.hpp"           // `status_t`, `expected`, `byte_t`
 
 namespace unum::ustore::strings {
 
 using blobs::collection_config_t;
 using blobs::collection_id_hash_t;
 using blobs::collection_id_t;
-using blobs::collection_view;
 using blobs::commit_ledger;
 using blobs::compaction_outcome_t;
-using blobs::compaction_placement_t;
 using blobs::head_stamp_k;
 using blobs::invalid_transaction_stamp_k;
 using blobs::key_slot;
@@ -63,17 +61,15 @@ using blobs::key_tails_column_t;
 using blobs::key_tails_t;
 using blobs::lookup_result_t;
 using blobs::lsm_level_order_t;
-using blobs::lsm_tree;
 using blobs::lsm_tree_publication_hook_t;
 using blobs::lsm_tree_run_record_t;
 using blobs::memory_pressure_t;
 using blobs::memory_shape_t;
-using blobs::published_view;
+using blobs::published_runs;
 using blobs::scan_page_keys;
 using blobs::stamp_pin;
 using blobs::stored_value_size_t;
 using blobs::transaction_share_t;
-using blobs::unpublished_t;
 using blobs::value_layout_t;
 using utilities::constrained_allocator;
 using utilities::io_channel_t;
@@ -188,15 +184,6 @@ class nvme_store {
     /** The key a caller addresses this store by. */
     using stored_key_t = std::string_view;
 
-    /** The tree the flushed strings live in. */
-    using tree_t = lsm_tree<key_slot_t, volume_t, atomic_reference_, waiter_type_>;
-
-    /** One level set of that tree, which a view names. */
-    using level_set_t = typename tree_t::level_set_t;
-
-    /** One immutable run of a level. */
-    using sorted_run_t = typename tree_t::sorted_run_t;
-
     /** The stamps this store's writes carry and its readers pin. */
     using ledger_t = commit_ledger<atomic_reference_, waiter_type_>;
 
@@ -215,8 +202,20 @@ class nvme_store {
     /** One commit's strings, stamped, which nothing changes once a view names them. */
     using memory_run_t = memory_run<allocator_t>;
 
-    /** The memory runs one view names, newest first. */
-    using memory_view_t = collection_view<memory_run_t>;
+    /** The tree, memory runs and view this store publishes, and every merge, flush and compaction of them. */
+    using published_runs_t = published_runs<key_slot_t, memory_run_t, volume_t, atomic_reference_, waiter_type_>;
+
+    /** The tree the flushed strings live in. */
+    using tree_t = typename published_runs_t::tree_t;
+
+    /** One level set of that tree, which a view names. */
+    using level_set_t = typename tree_t::level_set_t;
+
+    /** One immutable run of a level. */
+    using sorted_run_t = typename tree_t::sorted_run_t;
+
+    /** Everything a reader of this store needs, which nothing changes once it is published. */
+    using view_t = typename published_runs_t::view_t;
 
     /** One delta a commit hands over: the string, its kind, and its bytes. */
     using keyed_delta_t = keyed_delta<std::string_view>;
@@ -233,22 +232,6 @@ class nvme_store {
 
         /** The run they become, allocated by the committer, owned by the store once published. */
         std::unique_ptr<memory_run_t> run;
-    };
-
-    /** Everything a reader of this store needs, which nothing changes once it is published. */
-    struct view_t {
-
-        /** The memory runs, newest first, every stamp of which is newer than any level's. */
-        memory_view_t memory_runs;
-
-        /** The levels below them. */
-        level_set_t const* levels = nullptr;
-
-        /** The oldest stamp a reader that pins none may read at, raised by every merge to the horizon it kept. */
-        transaction_stamp_t oldest_readable = unwritten_stamp_k;
-
-        /** Its room in the ledger's list of what the leader unpublished, once a publication replaces it. */
-        unpublished_t unpublished;
     };
 
 #pragma endregion Types
@@ -271,20 +254,9 @@ class nvme_store {
     static expected<nvme_store> mount(volume_t& volume, collection_config_t const& config, constraint_t& constraint,
                                       ledger_t& ledger) noexcept {
         nvme_store mounted;
-        mounted.config_ = config;
-        mounted.constraint_ = &constraint;
-        mounted.ledger_ = &ledger;
-        if (config.memory_runs_max_deltas == 0)
-            return status_t {status_code_t::invalid_argument_k, "A collection holds at least one write in memory"};
-
-        auto [tree, mount_tree_status] = tree_t::mount(volume, config.lsm_tree, config.memory_runs_max_bytes);
-        if (mount_tree_status.failed()) return mount_tree_status;
-        mounted.tree_ = std::move(tree);
-        mounted.current_.reset(new (std::nothrow) view_t {});
-        if (!mounted.current_) return status_t {status_code_t::out_of_memory_k, "A store could not hold a view"};
-        mounted.current_->levels = &mounted.tree_.levels();
-        mounted.view_.replace(*mounted.current_);
-        ledger.register_view(mounted.view_pin_);
+        if (status_t const mounted_runs = mounted.runs_.mount(volume, config, constraint, ledger);
+            mounted_runs.failed())
+            return mounted_runs;
         return mounted;
     }
 
@@ -296,51 +268,29 @@ class nvme_store {
 
     /** Returns every run to the volume and forgets every memory run, which destroys the data and which only a store no
      *  reader reaches and no commit names may. */
-    status_t destroy(io_channel_t& channel) noexcept {
-        current_->memory_runs = memory_view_t::of(typename memory_view_t::runs_t {});
-        memory_runs_.clear();
-        ledger_->bound_view(view_pin_, head_stamp_k);
-        return tree_.destroy(channel);
-    }
+    status_t destroy(io_channel_t& channel) noexcept { return runs_.destroy(channel); }
 
 #pragma endregion Construction
 
 #pragma region Shape
 
     /** The bounds this store was mounted with. */
-    [[nodiscard]] collection_config_t const& config() const noexcept { return config_; }
+    [[nodiscard]] collection_config_t const& config() const noexcept { return runs_.config(); }
 
     /** The tree the flushed strings live in, which a database compacts and names in its catalog. */
-    [[nodiscard]] tree_t const& tree() const noexcept { return tree_; }
+    [[nodiscard]] tree_t const& tree() const noexcept { return runs_.tree(); }
 
     /** Bytes every value this store admits takes: one 16-byte key. */
     [[nodiscard]] stored_value_size_t value_max_size() const noexcept { return key_slot_t::size; }
 
     /** How many memory runs the published view names, and how many commits they hold. */
-    [[nodiscard]] memory_shape_t memory_shape() const noexcept {
-        reader_t const inside = ledger_->epochs().enter();
-        memory_shape_t shape;
-        for (memory_run_t const* run : view_.load()->memory_runs.runs()) {
-            std::uint64_t commits = 1;
-            for (std::uint32_t tier = 0; tier != run->tier(); ++tier) commits *= config_.lsm_tree.level_enlarge_factor;
-            shape.commits += commits;
-            ++shape.runs;
-        }
-        return shape;
-    }
+    [[nodiscard]] memory_shape_t memory_shape() const noexcept { return runs_.memory_shape(); }
 
     /** Deltas the memory runs hold plus key slots every level holds, one string counted once per run holding it. */
-    [[nodiscard]] std::uint64_t population_count() const noexcept {
-        reader_t const inside = ledger_->epochs().enter();
-        view_t const& view = *view_.load();
-        return memory_deltas_(view) + view.levels->population_count();
-    }
+    [[nodiscard]] std::uint64_t population_count() const noexcept { return runs_.population_count(); }
 
     /** Bytes every run of every level takes on its volume. */
-    [[nodiscard]] std::uint64_t size_bytes() const noexcept {
-        reader_t const inside = ledger_->epochs().enter();
-        return view_.load()->levels->size_bytes();
-    }
+    [[nodiscard]] std::uint64_t size_bytes() const noexcept { return runs_.size_bytes(); }
 
 #pragma endregion Shape
 
@@ -356,8 +306,8 @@ class nvme_store {
     [[nodiscard]] lookup_result_t find(std::string_view text, std::span<byte_t, key_slot_t::size> value,
                                        transaction_stamp_t stamp = head_stamp_k,
                                        std::size_t thread_index = outside_executor_k) const noexcept {
-        reader_t const inside = ledger_->epochs().enter(thread_index);
-        reading_t const read = reading_(stamp);
+        reader_t const inside = runs_.enter(thread_index);
+        reading_t const read = runs_.reading(stamp);
         found_t found;
         if (!newest_(*read.view, text, read.stamp, found)) return lookup_result_t::missing_k;
         if (found.delta.kind == delta_kind_t::remove_k) return lookup_result_t::removed_k;
@@ -406,8 +356,8 @@ class nvme_store {
                        std::size_t thread_index, strings_page_t& page) const noexcept {
         page.texts.clear();
         page.listed.clear();
-        reader_t const inside = ledger_->epochs().enter(thread_index);
-        view_t const& view = *view_.load();
+        reader_t const inside = runs_.enter(thread_index);
+        view_t const& view = *runs_.view();
         level_set_t const& levels = *view.levels;
         std::size_t runs = view.memory_runs.runs().size();
         for (std::size_t number = 0; number != levels.size(); ++number) runs += levels.level(number).size();
@@ -510,7 +460,7 @@ class nvme_store {
         }
         sealed_commit_t sealed;
         if (deltas.empty()) return sealed;
-        auto [sealed_deltas, seal_status] = sealed_deltas_t::seal(deltas, allocator_t {*constraint_});
+        auto [sealed_deltas, seal_status] = sealed_deltas_t::seal(deltas, allocator_t {runs_.constraint()});
         if (seal_status.failed()) return seal_status;
         sealed.deltas = std::move(sealed_deltas);
         sealed.run.reset(new (std::nothrow) memory_run_t {});
@@ -550,17 +500,7 @@ class nvme_store {
 
     /** How full the memory runs of the published view would be with @p sealed beside them. */
     [[nodiscard]] memory_pressure_t memory_pressure(sealed_commit_t const& sealed) const noexcept {
-        reader_t const inside = ledger_->epochs().enter();
-        view_t const& view = *view_.load();
-        if (view.memory_runs.runs().empty()) return memory_pressure_t::fits_k;
-        std::uint64_t const deltas = memory_deltas_(view) + sealed.deltas.size();
-        std::uint64_t const bytes = memory_bytes_(view) + sealed.deltas.keys_bytes() + sealed.deltas.values_bytes();
-        std::uint64_t const deltas_bound = config_.memory_runs_max_deltas;
-        std::uint64_t const bytes_bound = config_.memory_runs_max_bytes;
-        // One flush in flight and one buffer filling behind it.
-        if (deltas > 2 * deltas_bound || bytes > 2 * bytes_bound) return memory_pressure_t::stalled_k;
-        if (deltas > deltas_bound || bytes > bytes_bound) return memory_pressure_t::flush_due_k;
-        return memory_pressure_t::fits_k;
+        return runs_.memory_pressure(sealed.deltas.size(), sealed.deltas.keys_bytes() + sealed.deltas.values_bytes());
     }
 
     /**
@@ -569,15 +509,11 @@ class nvme_store {
      *      the word go.
      */
     status_t prepare(sealed_commit_t& sealed) noexcept {
-        forget_prepared();
-        if (!sealed.run) return {};
-        auto [view, view_status] = next_view_(sealed.run.get(), current_->memory_runs.runs(),
-                                              current_->oldest_readable);
-        if (view_status.failed() || memory_runs_.reserve(memory_runs_.size() + 1) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "No room to prepare a commit"};
-        view->levels = current_->levels;
-        prepared_view_ = std::move(view);
-        return {};
+        if (!sealed.run) {
+            runs_.forget_prepared();
+            return {};
+        }
+        return runs_.prepare(sealed.run.get());
     }
 
     /** Stamps @p sealed's run with @p stamp, publishes the view @c prepare laid out, and takes the run over, which the
@@ -585,21 +521,18 @@ class nvme_store {
     void publish(sealed_commit_t& sealed, transaction_stamp_t stamp) noexcept {
         if (!sealed.run) return;
         expected<memory_run_t> stamped = memory_run_t::stamped(std::move(sealed.deltas), stamp,
-                                                               allocator_t {*constraint_});
+                                                               allocator_t {runs_.constraint()});
         if (stamped) *sealed.run = std::move(*stamped);
-        // The durable horizon stays below the oldest commit that only memory holds.
-        if (current_->memory_runs.runs().empty()) ledger_->bound_view(view_pin_, stamp - 1);
-        replace_view_(std::move(prepared_view_));
-        [[maybe_unused]] st::status_t const owned = memory_runs_.push_back(st::assume_reserved, std::move(sealed.run));
+        runs_.publish(std::move(sealed.run), stamp);
     }
 
     /** Drops the view @c prepare laid out, which the leader does for a commit it then refuses. */
-    void forget_prepared() noexcept { prepared_view_.reset(); }
+    void forget_prepared() noexcept { runs_.forget_prepared(); }
 
     /** Whether a commit newer than @p from wrote @p text, which only the string's newest version decides. */
     [[nodiscard]] bool written_since(std::string_view text, transaction_stamp_t from) const noexcept {
-        reader_t const inside = ledger_->epochs().enter();
-        view_t const& view = *view_.load();
+        reader_t const inside = runs_.enter();
+        view_t const& view = *runs_.view();
         // Memory runs sit newest first and above every level, so one no newer than the watch ends the search.
         for (memory_run_t const* run : view.memory_runs.runs()) {
             if (run->newest_stamp() <= from) return false;
@@ -616,8 +549,8 @@ class nvme_store {
     [[nodiscard]] bool range_written_since(std::string_view lower, std::string_view upper,
                                            transaction_stamp_t from) const noexcept {
         if (upper < lower) return false;
-        reader_t const inside = ledger_->epochs().enter();
-        view_t const& view = *view_.load();
+        reader_t const inside = runs_.enter();
+        view_t const& view = *runs_.view();
         if (view.memory_runs.range_written_since(lower, upper, from)) return true;
         st::key128_t const upper_head = head_of(upper);
         std::string_view const upper_tail = tail_of(upper);
@@ -637,8 +570,8 @@ class nvme_store {
     [[nodiscard]] bool prefix_written_since(std::string_view prefix, std::string_view lower,
                                             transaction_stamp_t from) const noexcept {
         std::string_view const first = std::max(lower, prefix);
-        reader_t const inside = ledger_->epochs().enter();
-        view_t const& view = *view_.load();
+        reader_t const inside = runs_.enter();
+        view_t const& view = *runs_.view();
         for (memory_run_t const* run : view.memory_runs.runs()) {
             if (run->newest_stamp() <= from) break;
             std::size_t const end = run->prefix_end(prefix);
@@ -657,9 +590,7 @@ class nvme_store {
 
     /** Opens the runs @p runs names as this store's tree, which a mount does before anything reads. */
     status_t restore(io_channel_t& channel, std::span<lsm_tree_run_record_t const> runs) noexcept {
-        publication_t publication;
-        publication.owner = this;
-        return tree_.restore(channel, runs, publication.hook());
+        return runs_.restore(channel, runs);
     }
 
 #pragma endregion Writes
@@ -672,67 +603,13 @@ class nvme_store {
      *  @note The owner serializes it with flushes, compactions and truncations, and the calling thread is inside no
      *      epoch.
      */
-    status_t merge_memory_runs() noexcept {
-        std::size_t const fan_in = config_.lsm_tree.level_enlarge_factor;
-        st::basic_vector<memory_run_t const*> group;
-        if (group.resize(fan_in) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A merge could not list its memory runs"};
-        for (;;) {
-            {
-                reader_t const inside = ledger_->epochs().enter();
-                std::span<memory_run_t const* const> const due = due_group_(view_.load()->memory_runs.runs());
-                if (due.empty()) return {};
-                // Only this store's owner frees memory runs, so these outlive the reader.
-                for (std::size_t index = 0; index != fan_in; ++index) group[index] = due[index];
-            }
-
-            st::basic_vector<transaction_stamp_t> readers;
-            if (status_t const listed = ledger_->pinned_readers(readers); listed.failed()) return listed;
-            compaction_stamps_t survival;
-            survival.pinned = readers.data();
-            survival.pinned_count = readers.size();
-            // Nothing a memory run holds is durable, so no mount needs a version; a head reader needs those above this.
-            survival.horizon = ledger_->published();
-            stamped_deltas_t versions;
-            utilities::local_arena_t folded;
-            utilities::arena_allocator<byte_t> folded_bytes = folded.allocator();
-            if (status_t const kept = kept_versions(std::span<memory_run_t const* const> {group}, survival, fold_,
-                                                    versions, folded_bytes);
-                kept.failed())
-                return kept;
-            auto [merged, merged_status] = memory_run_t::merged(std::span<stamped_delta_t const> {versions},
-                                                                group.back()->oldest_stamp(), group.back()->tier(),
-                                                                allocator_t {*constraint_});
-            if (merged_status.failed()) return merged_status;
-            std::unique_ptr<memory_run_t> merged_run {new (std::nothrow) memory_run_t {std::move(merged)}};
-            // The replaced runs, freed here once the publication waited out every reader that could hold one.
-            st::basic_vector<std::unique_ptr<memory_run_t>> away;
-            if (!merged_run || away.reserve(fan_in) != st::status_t::success_k)
-                return {status_code_t::out_of_memory_k, "No room to merge memory runs"};
-            if (status_t const published = publish_merged_(std::span<memory_run_t const* const> {group},
-                                                           std::move(merged_run), away, survival.horizon);
-                published.failed())
-                return published;
-        }
-    }
+    status_t merge_memory_runs() noexcept { return runs_.merge_memory_runs(fold_); }
 
     /** Whether the memory runs hold the bounds they were mounted with, so a flush is due. */
-    [[nodiscard]] bool flush_due() const noexcept {
-        reader_t const inside = ledger_->epochs().enter();
-        return flush_due_(*view_.load());
-    }
+    [[nodiscard]] bool flush_due() const noexcept { return runs_.flush_due(); }
 
     /** Whether the memory runs are due for a merge, holding F runs of tier zero, or for a flush. */
-    [[nodiscard]] bool maintenance_due() const noexcept {
-        reader_t const inside = ledger_->epochs().enter();
-        view_t const& view = *view_.load();
-        std::size_t newest = 0;
-        for (memory_run_t const* run : view.memory_runs.runs()) {
-            if (run->tier() != 0) break;
-            ++newest;
-        }
-        return newest >= config_.lsm_tree.level_enlarge_factor || flush_due_(view);
-    }
+    [[nodiscard]] bool maintenance_due() const noexcept { return runs_.maintenance_due(); }
 
     /**
      *  @brief Writes the memory runs of the published view as one run of level zero, heads in its cells and tails in
@@ -740,98 +617,50 @@ class nvme_store {
      *  @note The owner serializes flushes, compactions and truncations, and the calling thread is inside no epoch.
      */
     status_t flush(io_channel_t& channel) noexcept {
-        publication_t publication;
-        publication.owner = this;
-        {
-            reader_t const inside = ledger_->epochs().enter();
-            std::span<memory_run_t const* const> const runs = view_.load()->memory_runs.runs();
-            if (runs.empty()) return {};
-            // Only this store's owner frees memory runs, merging or flushing one at a time, so these outlive the
-            // reader.
-            if (publication.flushed.resize(runs.size()) != st::status_t::success_k)
-                return {status_code_t::out_of_memory_k, "A flush could not list its memory runs"};
-            for (std::size_t index = 0; index != runs.size(); ++index) publication.flushed[index] = runs[index];
-        }
-
-        // A replaced version survives for a pinned reader, or for a mount promising the durable horizon this flush
-        // leaves; at or below both, every stamp reads alike, so the run packs only above.
-        st::basic_vector<transaction_stamp_t> readers;
-        if (status_t const listed = ledger_->pinned_readers(readers); listed.failed()) return listed;
-        compaction_stamps_t survival;
-        survival.pinned = readers.data();
-        survival.pinned_count = readers.size();
-        survival.horizon = ledger_->horizon_besides(view_pin_);
-        survival.floor = ledger_->floor_besides(view_pin_);
-        publication.oldest_readable = survival.horizon;
-
-        stamped_deltas_t versions;
-        utilities::local_arena_t folded;
-        utilities::arena_allocator<byte_t> folded_bytes = folded.allocator();
-        if (status_t const kept = kept_versions(std::span<memory_run_t const* const> {publication.flushed}, survival,
-                                                fold_, versions, folded_bytes);
-            kept.failed())
-            return kept;
-        drained_t drained;
-        if (status_t const laid = drain_(std::span<stamped_delta_t const> {versions}, drained); laid.failed())
-            return laid;
-        key_tails_column_t const tails = drained.tails.empty()
-                                             ? key_tails_column_t {}
-                                             : key_tails_column_t {
-                                                   std::span<std::uint32_t const> {drained.tail_offsets},
-                                                   std::span<byte_t const> {drained.tails}};
-        return tree_.flush(channel, std::span<key_slot_t const> {drained.key_slots},
-                           std::span<std::uint64_t const> {drained.stamps},
-                           std::span<std::uint8_t const> {drained.kinds}, survival.floor, {}, key_slot_t::size,
-                           publication.hook(), tails);
+        return runs_.flush([&](tree_t& tree, std::span<memory_run_t const* const> flushed,
+                               compaction_stamps_t const& survival,
+                               lsm_tree_publication_hook_t const& published) noexcept -> status_t {
+            stamped_deltas_t versions;
+            utilities::local_arena_t folded;
+            utilities::arena_allocator<byte_t> folded_bytes = folded.allocator();
+            if (status_t const kept = kept_versions(flushed, survival, fold_, versions, folded_bytes); kept.failed())
+                return kept;
+            drained_t drained;
+            if (status_t const laid = drain_(std::span<stamped_delta_t const> {versions}, drained); laid.failed())
+                return laid;
+            key_tails_column_t const tails = drained.tails.empty()
+                                                 ? key_tails_column_t {}
+                                                 : key_tails_column_t {
+                                                       std::span<std::uint32_t const> {drained.tail_offsets},
+                                                       std::span<byte_t const> {drained.tails}};
+            return tree.flush(channel, std::span<key_slot_t const> {drained.key_slots},
+                              std::span<std::uint64_t const> {drained.stamps},
+                              std::span<std::uint8_t const> {drained.kinds}, survival.floor, {}, key_slot_t::size,
+                              published, tails);
+        });
     }
 
     /** Whether any level of the tree is over the bytes its number admits. */
-    [[nodiscard]] bool needs_compaction() const noexcept {
-        reader_t const inside = ledger_->epochs().enter();
-        return tree_.needs_compaction(*view_.load()->levels);
-    }
+    [[nodiscard]] bool needs_compaction() const noexcept { return runs_.needs_compaction(); }
 
     /**
-     *  @brief Merges the shallowest level that is over its bounds into the level below it, on the host.
+     *  @brief Merges the shallowest level that is over its bounds into the level below it.
      *  @param[inout] reading_channel The channel the merge gathers source values on, held by the calling thread.
      *  @param[inout] writing_channel The channel the merge writes its new runs on, which is not @p reading_channel.
+     *  @param[in] devices The devices the executor named, which the tree passes over for runs carrying tails, as no
+     *      device compaction is compiled for them.
      *  @param[in] published What to call once the merged set is live and before a consumed run is dropped.
-     *
-     *  The devices the executor named go unused, as no device compaction is compiled for keys carrying tails.
      */
     expected<compaction_outcome_t> compact(
-        io_channel_t& reading_channel, io_channel_t& writing_channel, std::span<int const>,
+        io_channel_t& reading_channel, io_channel_t& writing_channel, std::span<int const> devices,
         lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {}) noexcept {
-        // A pinned reader keeps the version it reads, and the durable horizon keeps the version a mount falls back to.
-        st::basic_vector<transaction_stamp_t> readers;
-        if (status_t const listed = ledger_->pinned_readers(readers); listed.failed()) return listed;
-        compaction_stamps_t stamps;
-        stamps.pinned = readers.data();
-        stamps.pinned_count = readers.size();
-        stamps.horizon = ledger_->durable_stamp();
-        stamps.floor = ledger_->floor();
-        publication_t publication;
-        publication.owner = this;
-        publication.oldest_readable = stamps.horizon;
-        publication.chained = &published;
-        return tree_.compact(reading_channel, writing_channel, compaction_placement_t::host_k, {}, nullptr, fold_,
-                             publication.hook(), stamps);
+        return runs_.compact(reading_channel, writing_channel, devices, fold_, blobs::no_device_fold_t {}, published);
     }
 
     /** Drops every version a mount found stamped above @p ceiling, which only a store holding no memory run takes. */
     status_t truncate_above(io_channel_t& reading_channel, io_channel_t& writing_channel, transaction_stamp_t ceiling,
                             lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {}) noexcept {
-        {
-            reader_t const inside = ledger_->epochs().enter();
-            view_t const& taken = *view_.load();
-            if (!taken.memory_runs.runs().empty())
-                return {status_code_t::invalid_argument_k, "A store truncates only its runs"};
-            if (taken.levels->newest_stamp() <= ceiling) return {};
-        }
-        publication_t publication;
-        publication.owner = this;
-        publication.chained = &published;
-        return tree_.truncate_above(reading_channel, writing_channel, ceiling, fold_, publication.hook());
+        return runs_.truncate_above(reading_channel, writing_channel, ceiling, fold_, published);
     }
 
 #pragma endregion Maintenance
@@ -841,23 +670,16 @@ class nvme_store {
 #pragma region Private Types
 
     /** One reader inside the ledger's epochs, announced until it dies. */
-    using reader_t = typename ledger_t::epochs_t::reader_t;
+    using reader_t = typename published_runs_t::reader_t;
+
+    /** The view a read walks and the stamp it reads at. */
+    using reading_t = typename published_runs_t::reading_t;
 
     /** The versions one merge or one flush carries over, before and after they are sorted into a run's order. */
     using stamped_deltas_t = st::basic_vector<stamped_delta_t>;
 
     /** The deltas one batch of its own hands over. */
     using deltas_t = st::basic_vector<keyed_delta_t, constrained_allocator<keyed_delta_t, atomic_reference_>>;
-
-    /** The view a read walks and the stamp it reads at. */
-    struct reading_t {
-
-        /** The view loaded after the stamp, which names every commit at or below it. */
-        view_t const* view = nullptr;
-
-        /** The stamp the read answers at. */
-        transaction_stamp_t stamp = head_stamp_k;
-    };
 
     /** The newest version of one string a read found: what it does, and its bytes in a memory run or its position in a
      *  run of a level. */
@@ -898,70 +720,9 @@ class nvme_store {
         st::basic_vector<byte_t> tails;
     };
 
-    /** What a publication of a new level set hands its hooks, as @c blobs::nvme_store's does. */
-    struct publication_t {
-
-        /** The store publishing. */
-        nvme_store* owner = nullptr;
-
-        /** The memory runs a flush wrote out, newest first, as the view it read named them; none for a merge. */
-        st::basic_vector<memory_run_t const*> flushed;
-
-        /** The horizon the merge kept, which the published view raises its oldest readable stamp to. */
-        transaction_stamp_t oldest_readable = unwritten_stamp_k;
-
-        /** The view laid out under the leader word just before the set becomes current. */
-        std::unique_ptr<view_t> next;
-
-        /** The flushed runs, taken over under the leader word and freed once no reader can hold one. */
-        st::basic_vector<std::unique_ptr<memory_run_t>> freed;
-
-        /** The hook of whoever records the new set, called last, or null for none. */
-        lsm_tree_publication_hook_t const* chained = nullptr;
-
-        /** The hooks a tree calls with this publication as their context. */
-        [[nodiscard]] lsm_tree_publication_hook_t hook() noexcept {
-            lsm_tree_publication_hook_t hook;
-            hook.prepare = &prepare_levels_;
-            hook.notify = &publish_levels_;
-            hook.context = this;
-            return hook;
-        }
-    };
-
 #pragma endregion Private Types
 
 #pragma region Private Methods
-
-    /** Deltas every memory run of @p view holds. */
-    [[nodiscard]] static std::size_t memory_deltas_(view_t const& view) noexcept {
-        std::size_t deltas = 0;
-        for (memory_run_t const* run : view.memory_runs.runs()) deltas += run->size();
-        return deltas;
-    }
-
-    /** String and value bytes every memory run of @p view holds, 16 per value. */
-    [[nodiscard]] static std::uint64_t memory_bytes_(view_t const& view) noexcept {
-        std::uint64_t bytes = 0;
-        for (memory_run_t const* run : view.memory_runs.runs()) bytes += run->keys_bytes() + run->values_bytes();
-        return bytes;
-    }
-
-    /** Whether the memory runs of @p view hold the bounds they were mounted with. */
-    [[nodiscard]] bool flush_due_(view_t const& view) const noexcept {
-        return memory_deltas_(view) >= config_.memory_runs_max_deltas ||
-               memory_bytes_(view) >= config_.memory_runs_max_bytes;
-    }
-
-    /** The view a read at @p stamp walks and the stamp it answers at, as @c blobs::nvme_store reads: a head read
-     *  retries past a merge that raised the oldest readable stamp above the one it took. */
-    [[nodiscard]] reading_t reading_(transaction_stamp_t stamp) const noexcept {
-        for (;;) {
-            transaction_stamp_t const at = stamp == head_stamp_k ? ledger_->published() : stamp;
-            view_t const* const view = view_.load();
-            if (stamp != head_stamp_k || at >= view->oldest_readable) return reading_t {view, at};
-        }
-    }
 
     /** The head of the key at sorted @p position of a memory run. */
     [[nodiscard]] static st::key128_t const& head_at_(memory_run_t const& run, std::uint64_t position) noexcept {
@@ -1134,80 +895,9 @@ class nvme_store {
         return {};
     }
 
-    /** A view naming @p newest, when not null, ahead of @p older, below levels its caller fills in. */
-    static expected<std::unique_ptr<view_t>> next_view_(memory_run_t const* newest,
-                                                        std::span<memory_run_t const* const> older,
-                                                        transaction_stamp_t oldest_readable) noexcept {
-        std::size_t const ahead = newest != nullptr ? 1 : 0;
-        typename memory_view_t::runs_t runs;
-        if (runs.resize(older.size() + ahead) != st::status_t::success_k)
-            return status_t {status_code_t::out_of_memory_k, "No room to lay out a view"};
-        if (newest != nullptr) runs[0] = newest;
-        for (std::size_t index = 0; index != older.size(); ++index) runs[index + ahead] = older[index];
-        std::unique_ptr<view_t> view {new (std::nothrow)
-                                          view_t {memory_view_t::of(std::move(runs)), nullptr, oldest_readable}};
-        if (!view) return status_t {status_code_t::out_of_memory_k, "No room to lay out a view"};
-        return view;
-    }
-
-    /** Publishes @p newer in place of the current view, which only the thread holding the leader word does, and hands
-     *  the view it replaces to the ledger, which frees it once that thread lets the word go and its readers left. */
-    void replace_view_(std::unique_ptr<view_t> newer) noexcept {
-        view_.replace(*newer);
-        view_t* const older = std::exchange(current_, std::move(newer)).release();
-        ledger_->unpublish(older->unpublished, older, &destroy_view_);
-    }
-
-    static void destroy_view_(void* view) noexcept { delete static_cast<view_t*>(view); }
-
-    /** Takes the leader word and lays out the view the tree's next level set will be named by: the current memory runs
-     *  but those the publication wrote out, which are the oldest, since commits only prepend. */
-    static status_t prepare_levels_(void* context) noexcept {
-        publication_t& publication = *static_cast<publication_t*>(context);
-        nvme_store& owner = *publication.owner;
-        owner.ledger_->lead();
-        std::span<memory_run_t const* const> const runs = owner.current_->memory_runs.runs();
-        std::size_t const kept = runs.size() - publication.flushed.size();
-        auto [next, next_status] = next_view_(nullptr, runs.first(kept),
-                                              std::max(owner.current_->oldest_readable, publication.oldest_readable));
-        if (next_status.succeeded() && publication.freed.reserve(publication.flushed.size()) != st::status_t::success_k)
-            next_status = status_t {status_code_t::out_of_memory_k, "A flush could not take its memory runs over"};
-        if (next_status.failed()) {
-            owner.ledger_->stop_leading();
-            return next_status;
-        }
-        publication.next = std::move(next);
-        return {};
-    }
-
-    /** Publishes the view @c prepare_levels_ laid out, takes the flushed runs over, bounds the durable stamp by what
-     *  memory still holds, lets the leader word go, frees the runs, and calls the hook it chains to. */
-    static status_t publish_levels_(void* context) noexcept {
-        publication_t& publication = *static_cast<publication_t*>(context);
-        nvme_store& owner = *publication.owner;
-        publication.next->levels = &owner.tree_.levels();
-        owner.replace_view_(std::move(publication.next));
-        if (!publication.flushed.empty()) {
-            // The flushed runs are the oldest, which the store owns first.
-            for (std::size_t index = 0; index != publication.flushed.size(); ++index) [[maybe_unused]]
-                st::status_t const taken = publication.freed.push_back(st::assume_reserved,
-                                                                       std::move(owner.memory_runs_[index]));
-            for (std::size_t index = 0; index != publication.flushed.size(); ++index) owner.memory_runs_.erase(0);
-            std::span<memory_run_t const* const> const kept = owner.current_->memory_runs.runs();
-            owner.ledger_->bound_view(owner.view_pin_, kept.empty() ? head_stamp_k : kept.back()->oldest_stamp() - 1);
-            publication.flushed.clear();
-        }
-        // Every reader that could hold a flushed run entered before the view replaced above, which this waits out.
-        owner.ledger_->stop_leading();
-        publication.freed.clear();
-        lsm_tree_publication_hook_t const* const chained = publication.chained;
-        if (chained == nullptr || chained->notify == nullptr) return {};
-        return chained->notify(chained->context);
-    }
-
     /** Room for @p count deltas of one batch of its own. */
     expected<deltas_t> deltas_of_(std::size_t count) const noexcept {
-        deltas_t deltas {constrained_allocator<keyed_delta_t, atomic_reference_> {*constraint_}};
+        deltas_t deltas {constrained_allocator<keyed_delta_t, atomic_reference_> {runs_.constraint()}};
         if (deltas.resize(count) != st::status_t::success_k)
             return status_t {status_code_t::out_of_memory_k, "No room to hand a batch over"};
         return deltas;
@@ -1227,86 +917,12 @@ class nvme_store {
         return std::span<keyed_delta_t> {deltas.data(), kept};
     }
 
-    /** The oldest F runs of the lowest tier holding F of @p runs, newest first, or none. */
-    [[nodiscard]] std::span<memory_run_t const* const> due_group_(
-        std::span<memory_run_t const* const> runs) const noexcept {
-        std::size_t const fan_in = config_.lsm_tree.level_enlarge_factor;
-        for (std::size_t first = 0; first != runs.size();) {
-            std::size_t end = first;
-            while (end != runs.size() && runs[end]->tier() == runs[first]->tier()) ++end;
-            if (end - first >= fan_in) return runs.subspan(end - fan_in, fan_in);
-            first = end;
-        }
-        return {};
-    }
-
-    /** Takes the leader word, publishes a view naming @p merged where exactly the runs of @p group sat, moves those
-     *  runs into @p away, and lets the word go, which returns once no reader can reach them. */
-    status_t publish_merged_(std::span<memory_run_t const* const> group, std::unique_ptr<memory_run_t> merged,
-                             st::basic_vector<std::unique_ptr<memory_run_t>>& away,
-                             transaction_stamp_t horizon) noexcept {
-        ledger_->lead();
-        std::span<memory_run_t const* const> const runs = current_->memory_runs.runs();
-        std::size_t first = 0;
-        while (runs[first] != group.front()) ++first;
-        typename memory_view_t::runs_t laid_out;
-        if (laid_out.resize(runs.size() - group.size() + 1) != st::status_t::success_k) {
-            ledger_->stop_leading();
-            return {status_code_t::out_of_memory_k, "No room to lay out a merged view"};
-        }
-        for (std::size_t index = 0; index != first; ++index) laid_out[index] = runs[index];
-        laid_out[first] = merged.get();
-        for (std::size_t index = first + group.size(); index != runs.size(); ++index)
-            laid_out[index - group.size() + 1] = runs[index];
-        std::unique_ptr<view_t> next {new (std::nothrow) view_t {memory_view_t::of(std::move(laid_out)),
-                                                                 current_->levels,
-                                                                 std::max(current_->oldest_readable, horizon),
-                                                                 {}}};
-        if (!next) {
-            ledger_->stop_leading();
-            return {status_code_t::out_of_memory_k, "No room to lay out a merged view"};
-        }
-        // The runs the store owns run oldest first, opposite to the view, so the group's oldest sits here.
-        std::size_t const oldest = runs.size() - first - group.size();
-        replace_view_(std::move(next));
-        for (std::size_t index = 0; index != group.size(); ++index) [[maybe_unused]]
-            st::status_t const taken = away.push_back(st::assume_reserved, std::move(memory_runs_[oldest + index]));
-        memory_runs_[oldest] = std::move(merged);
-        for (std::size_t index = 1; index != group.size(); ++index) memory_runs_.erase(oldest + 1);
-        ledger_->stop_leading();
-        return {};
-    }
-
 #pragma endregion Private Methods
 
 #pragma region Private Members
 
-    /** The bounds this store was mounted with. */
-    collection_config_t config_ {};
-
-    /** The budget the memory runs are charged to, null until the store is mounted. */
-    constraint_t* constraint_ = nullptr;
-
-    /** The tree the flushed strings live in. */
-    tree_t tree_;
-
-    /** The stamps this store's writes carry and its readers pin, borrowed and outliving the store. */
-    ledger_t* ledger_ = nullptr;
-
-    /** Registers the published view with the ledger, bounding the durable stamp below the oldest memory run. */
-    pin_t view_pin_;
-
-    /** The view readers load, which @c current_ owns. */
-    published_view<view_t, atomic_reference_> view_;
-
-    /** The view published last, owned here and replaced only under the ledger's leader word. */
-    std::unique_ptr<view_t> current_;
-
-    /** Every memory run the current view names, oldest first. */
-    st::basic_vector<std::unique_ptr<memory_run_t>> memory_runs_;
-
-    /** The view a leader laid out for the commit it prepared, published or forgotten before it lets the word go. */
-    std::unique_ptr<view_t> prepared_view_;
+    /** The tree, memory runs and view this store publishes, and every merge, flush and compaction of them. */
+    published_runs_t runs_;
 
     /** What a delta does, which merges fold with. */
     [[no_unique_address]] fold_t fold_ {};

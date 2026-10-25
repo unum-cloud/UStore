@@ -7,8 +7,9 @@
  *  A compaction reads the sorted run indexes of an upper LSM level and of the lower sorted runs it overlaps, keeps the
  *  newest key slot of every stored key, drops removals when it writes the bottom LSM level, and lays the survivors
  *  into sorted runs that fit their bounds, planning where every stored value moves. Both compactors share the rules
- *  below, and only the host one folds a fold's changes, so a merge of runs holding any change runs on the host. A
- *  build with @c USTORE_WITH_CUDA declares the device compactor for every compiler, its kernels in
+ *  below. The device one composes chains of changes only through a device fold the caller passes, and folds on the
+ *  host every chain reaching a write or a base, so without a device fold a merge of runs holding a change runs on the
+ *  host. A build with @c USTORE_WITH_CUDA declares the device compactor for every compiler, its kernels in
  *  @c vram_nvidia_compaction.cuh compile under nvcc alone, and @c compaction.cu instantiates its compaction for the
  *  engine's key slots, so a host TU calls it.
  */
@@ -25,7 +26,7 @@
 #include <memory>      // `std::allocator_traits`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
-#include <type_traits> // `std::is_trivially_copyable_v`, `std::conditional_t`
+#include <type_traits> // `std::is_trivially_copyable_v`, `std::conditional_t`, `std::type_identity_t`
 #include <utility>     // `std::move`, `std::swap`
 
 #include <smashtable/basic_vector.hpp>           // `st::basic_vector`
@@ -610,6 +611,72 @@ constexpr void merge_ranges(record_type_ const* source, std::uint64_t begin, std
     while (right != end) target[output++] = source[right++];
 }
 
+/** The compactor's status for a fold that refused a chain, which only running out of memory is not a refusal. */
+inline st::status_t fold_refusal(utilities::status_t const& refused) noexcept {
+    return refused == utilities::status_code_t::out_of_memory_k ? st::status_t::out_of_memory_heap_k
+                                                                : st::status_t::invalid_argument_k;
+}
+
+/** The versions a merge folds into a surviving change, and whether its chain applies onto nothing. */
+struct folded_versions_t {
+
+    /** The first merged record past the versions that fold into the change. */
+    std::uint64_t end = 0;
+
+    /** Whether the change is the oldest survivor of its key where the merge writes the bottom level. */
+    bool applies = false;
+};
+
+/**
+ *  @brief The versions that fold into the surviving change at @p head of @p merged: the dropped versions of its key
+ *      behind it, up to the first a reader still tells apart from the version before it.
+ *  @param[in] merged The merged records, in key order with the versions of a key newest first.
+ *  @param[in] kept Whether each merged record survives.
+ */
+template <typename record_type_>
+constexpr folded_versions_t folded_versions(compaction_kind_t kind, compaction_stamps_t const& stamps,
+                                            record_type_ const* merged, std::uint8_t const* kept,
+                                            std::uint64_t merged_count, std::uint64_t head) noexcept {
+    std::uint64_t end = head + 1;
+    // A removal dropped at the bottom hides every older version from the change above it.
+    while (end != merged_count && !kept[end] && same_key(merged[end], merged[head]) &&
+           !keeps_older_version(stamps, located_of(merged[end - 1]).stamp, located_of(merged[end]).stamp))
+        ++end;
+    std::uint64_t next = end;
+    while (next != merged_count && !kept[next]) ++next;
+    bool const applies = writes_bottom(kind) && (next == merged_count || !same_key(merged[next], merged[head]));
+    return folded_versions_t {end, applies};
+}
+
+/**
+ *  @brief Folds the versions @p versions names into the surviving change at @p head of @p merged, newest first, until
+ *      one closes it, and at the bottom applies a change left open onto nothing, as every compactor folds on the host.
+ *  @param[in] value_of Called as @c value_of(record, bytes) to view the value of a merged record, answering an
+ *      @c st::status_t, with any bytes it reads allocated from @p arena.
+ *  @param[out] folded What the change folds to, a write, a removal or a change, its bytes in @p arena or a record.
+ */
+template <typename record_type_, utilities::fold_concept fold_type_, typename value_of_type_>
+st::status_t fold_versions(fold_type_ const& fold, record_type_ const* merged, std::uint64_t head,
+                           folded_versions_t const& versions, value_of_type_&& value_of,
+                           utilities::arena_allocator<byte_t>& arena, delta_view_t& folded) noexcept {
+    folded = delta_view_t {delta_kind_t::change_k, {}};
+    if (st::status_t const read = value_of(merged[head], folded.bytes); read != st::status_t::success_k) return read;
+    for (std::uint64_t older = head + 1; older != versions.end && folded.kind == delta_kind_t::change_k; ++older) {
+        delta_view_t version {located_of(merged[older]).kind, {}};
+        if (st::status_t const read = value_of(merged[older], version.bytes); read != st::status_t::success_k)
+            return read;
+        auto [pair, fold_status] = utilities::fold_delta_pair(fold, folded, version, arena);
+        if (fold_status.failed()) return fold_refusal(fold_status);
+        folded = pair;
+    }
+    if (versions.applies && folded.kind == delta_kind_t::change_k) {
+        auto [applied, apply_status] = fold.apply({}, std::span<delta_view_t const> {&folded, 1}, arena);
+        if (apply_status.failed()) return fold_refusal(apply_status);
+        folded = delta_view_t {delta_kind_t::write_k, applied};
+    }
+    return st::status_t::success_k;
+}
+
 /** Compacts LSM levels on the calling thread. */
 struct host_compactor_t {
 
@@ -725,7 +792,14 @@ struct host_compactor_t {
         // One merge path joins the upper and lower runs, and the survivors move back
         merge_ranges(records.data(), 0, upper_key_slots, merged_count, scratch.data(), order);
 
-        // The newest survivor's value while versions fold into it, which the folds list keeps once it is settled
+        // Survival settles before any fold, so a fold sees every version dropped behind its change
+        basic_vector<std::uint8_t> kept;
+        status = kept.resize(merged_count);
+        if (status != status_t::success_k) return status;
+        for (std::uint64_t index = 0; index != merged_count; ++index)
+            kept[index] = survives(index != 0 ? scratch.data() + index - 1 : nullptr, scratch[index], kind, stamps);
+
+        // A folded survivor's value, which replaces its own once every survivor is placed
         struct folded_t {
             std::uint64_t survivor = 0;
             std::span<byte_t const> bytes;
@@ -733,67 +807,27 @@ struct host_compactor_t {
         basic_vector<folded_t> folds;
         utilities::local_arena_t arena;
         utilities::arena_allocator<byte_t> arena_bytes = arena.allocator();
-        std::span<byte_t const> head_bytes;
-        bool head_folded = false;
-        bool head_closed = false;
-        std::uint64_t survivors = 0;
         auto const value_of = [&](record_t const& record, std::span<byte_t const>& bytes) noexcept {
             bytes = {};
             if (located_of(record).kind == delta_kind_t::remove_k) return status_t::success_k;
             return read_value(located_of(record), arena_bytes, bytes);
         };
-        // Keeps the newest survivor's folded value; at the bottom, the oldest change of a key folds onto nothing.
-        auto const settle = [&](bool key_ends) noexcept {
-            if (survivors == 0) return status_t::success_k;
-            record_t& head = records[survivors - 1];
-            if (key_ends && writes_bottom(kind) && located_of(head).kind == delta_kind_t::change_k) {
-                std::span<byte_t const> bytes = head_bytes;
-                if (!head_folded)
-                    if (status_t const read = value_of(head, bytes); read != status_t::success_k) return read;
-                delta_view_t const change {delta_kind_t::change_k, bytes};
-                auto [applied, apply_status] = fold.apply({}, std::span<delta_view_t const> {&change, 1}, arena_bytes);
-                if (apply_status.failed()) return fold_refusal_(apply_status);
-                located_of(head).kind = delta_kind_t::write_k;
-                head_bytes = applied;
-                head_folded = true;
-            }
-            if (head_folded && folds.push_back(folded_t {survivors - 1, head_bytes}) != status_t::success_k)
-                return status_t::out_of_memory_heap_k;
-            head_folded = false;
-            head_closed = false;
-            return status_t::success_k;
-        };
+        std::uint64_t survivors = 0;
         for (std::uint64_t index = 0; index != merged_count; ++index) {
-            record_t const* previous = index != 0 ? scratch.data() + index - 1 : nullptr;
-            record_t const& current = scratch[index];
-            if (survives(previous, current, kind, stamps)) {
-                bool const key_ends = survivors == 0 || !same_key(records[survivors - 1], current);
-                if (status_t const settled = settle(key_ends); settled != status_t::success_k) return settled;
-                records[survivors++] = current;
-                continue;
-            }
-            if (survivors == 0) continue;
-            record_t& head = records[survivors - 1];
-            if (located_of(head).kind != delta_kind_t::change_k || head_closed || !same_key(head, current)) continue;
-            // A removal dropped at the bottom hides every older version from the change above it.
-            if (keeps_older_version(stamps, located_of(*previous).stamp, located_of(current).stamp)) {
-                head_closed = true;
-                continue;
-            }
-            std::span<byte_t const> newer = head_bytes;
-            std::span<byte_t const> older;
-            if (!head_folded)
-                if (status_t const read = value_of(head, newer); read != status_t::success_k) return read;
-            if (status_t const read = value_of(current, older); read != status_t::success_k) return read;
-            auto [pair, fold_status] = utilities::fold_delta_pair(fold, delta_view_t {delta_kind_t::change_k, newer},
-                                                                  delta_view_t {located_of(current).kind, older},
-                                                                  arena_bytes);
-            if (fold_status.failed()) return fold_refusal_(fold_status);
-            located_of(head).kind = pair.kind;
-            head_bytes = pair.bytes;
-            head_folded = true;
+            if (!kept[index]) continue;
+            record_t& survivor = records[survivors++];
+            survivor = scratch[index];
+            if (located_of(survivor).kind != delta_kind_t::change_k) continue;
+            folded_versions_t const versions = folded_versions(kind, stamps, scratch.data(), kept.data(), merged_count,
+                                                               index);
+            if (versions.end == index + 1 && !versions.applies) continue;
+            delta_view_t folded;
+            status = fold_versions(fold, scratch.data(), index, versions, value_of, arena_bytes, folded);
+            if (status != status_t::success_k) return status;
+            located_of(survivor).kind = folded.kind;
+            if (folds.push_back(folded_t {survivors - 1, folded.bytes}) != status_t::success_k)
+                return status_t::out_of_memory_heap_k;
         }
-        if (status_t const settled = settle(true); settled != status_t::success_k) return settled;
 
         // A folded value replaces its survivor's own: inline in the key slot, or in the compaction's folded bytes
         output.folded.clear();
@@ -915,23 +949,62 @@ struct host_compactor_t {
         }
         return status_t::success_k;
     }
-
-  private:
-
-    /** The compactor's status for a fold that refused a chain, which only running out of memory is not a refusal. */
-    static st::status_t fold_refusal_(utilities::status_t const& refused) noexcept {
-        return refused == utilities::status_code_t::out_of_memory_k ? st::status_t::out_of_memory_heap_k
-                                                                    : st::status_t::invalid_argument_k;
-    }
 };
 
 #pragma endregion Host
 
-#if USTORE_WITH_CUDA
-
 #pragma region Device
 
+/** The device fold of a collection no device composes the changes of, so a merge of runs holding a change runs on the
+ *  host. */
+struct no_device_fold_t {};
+
+#if USTORE_WITH_CUDA
+
 using utilities::cuda_stream_t;
+
+/** A borrowed reader of the values a fold reads, called as @c host_compactor_t calls its own, so one device compaction
+ *  compiled per key slot serves a reader of any type. */
+template <typename key_slot_type_>
+class located_value_reader {
+  public:
+
+    /** A reader refusing every read, for a merge that folds nothing. */
+    located_value_reader() noexcept = default;
+
+    /** Borrows @p reader, which must outlive every read. */
+    template <typename reader_type_>
+    located_value_reader(reader_type_ const& reader) noexcept
+        : context_(&reader), read_(&read_through_<reader_type_>) {}
+
+    /** Views the bytes of @p record in @p bytes, allocating any it reads from @p arena. */
+    st::status_t operator()(located_key_slot<key_slot_type_> const& record, utilities::arena_allocator<byte_t>& arena,
+                            std::span<byte_t const>& bytes) const noexcept {
+        return read_(context_, record, arena, bytes);
+    }
+
+  private:
+    using read_t = st::status_t (*)(void const*, located_key_slot<key_slot_type_> const&,
+                                    utilities::arena_allocator<byte_t>&, std::span<byte_t const>&) noexcept;
+
+    template <typename reader_type_>
+    static st::status_t read_through_(void const* context, located_key_slot<key_slot_type_> const& record,
+                                      utilities::arena_allocator<byte_t>& arena,
+                                      std::span<byte_t const>& bytes) noexcept {
+        return (*static_cast<reader_type_ const*>(context))(record, arena, bytes);
+    }
+
+    static st::status_t refuse_(void const*, located_key_slot<key_slot_type_> const&,
+                                utilities::arena_allocator<byte_t>&, std::span<byte_t const>&) noexcept {
+        return st::status_t::invalid_argument_k;
+    }
+
+    /** The borrowed reader. */
+    void const* context_ = nullptr;
+
+    /** Calls the borrowed reader as its own type. */
+    read_t read_ = &refuse_;
+};
 
 /** Compacts LSM levels on one CUDA device, queueing every transfer and kernel on a stream of its own. */
 class cuda_compactor_t {
@@ -940,13 +1013,22 @@ class cuda_compactor_t {
     /** Binds a compactor to device @p ordinal with a new stream, failing when no such device exists. */
     static st::expected<cuda_compactor_t> make(int ordinal) noexcept;
 
-    /** Does what @c host_compactor_t::compact does with identical output for runs holding no change, refusing any that
-     *  holds one with @c invalid_argument_k, and reports CUDA failures as statuses. */
-    template <typename key_slot_type_, typename allocator_type_>
+    /**
+     *  @brief Does what @c host_compactor_t::compact does with identical output, composing the chains of changes alone
+     *      through @p device_fold and applying on the host, through @p fold, every chain that reaches a write, a
+     *      removal or the bottom level's empty base.
+     *
+     *  With @c no_device_fold_t it refuses runs holding a change with @c invalid_argument_k, and with no change to fold
+     *  the folds and @p read_value go unused. CUDA failures come back as statuses.
+     */
+    template <typename key_slot_type_, utilities::fold_concept fold_type_, typename device_fold_type_,
+              typename allocator_type_>
         requires compactable_key_slot_concept<key_slot_type_>
     st::status_t compact(compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_type_> const> upper,
                          std::span<sorted_run_index_view<key_slot_type_> const> lower,
-                         sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps,
+                         sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps, fold_type_ const& fold,
+                         device_fold_type_ const& device_fold,
+                         std::type_identity_t<located_value_reader<key_slot_type_>> read_value,
                          compaction_output<key_slot_type_, allocator_type_>& output) noexcept;
 
     /** The ordinal of the device the compactor runs on. */
@@ -959,8 +1041,8 @@ class cuda_compactor_t {
     cuda_stream_t stream_;
 };
 
-#pragma endregion Device
-
 #endif
+
+#pragma endregion Device
 
 } // namespace unum::ustore::blobs

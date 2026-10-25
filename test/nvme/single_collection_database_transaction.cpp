@@ -75,9 +75,9 @@ struct transactions_types {
     using guard_t = typename fixture_t::guard_t;
     using volume_t = typename fixture_t::volume_t;
     using key_slot_t = typename layout_type_::key_slot_t;
-    using database_t =
-        basic_single_collection_database<typename key_slot_t::stored_key_t, volume_t, atomic_reference, waiter_t,
-                                         nvme_store<key_slot_t, volume_t, atomic_reference, waiter_t>>;
+    using database_t = basic_single_collection_database<
+        typename key_slot_t::stored_key_t, volume_t, atomic_reference, waiter_t,
+        nvme_store<key_slot_t, volume_t, atomic_reference, waiter_t, last_write_fold_t, no_device_fold_t>>;
     using database_pointer_t = typename database_t::database_unique_ptr_t;
     using transaction_pointer_t = typename database_t::transaction_unique_ptr_t;
 
@@ -107,7 +107,7 @@ struct transactions_types {
     };
 };
 
-/** A database shape whose write buffers hold a whole population, so nothing here waits on a flush. */
+/** A database shape whose memory runs hold a whole population, so nothing here waits on a flush. */
 [[nodiscard]] single_collection_database_config_t test_config(stored_value_size_t value_size,
                                                               stored_value_size_t value_max_size) noexcept {
     single_collection_database_config_t config;

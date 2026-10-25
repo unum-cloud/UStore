@@ -33,14 +33,17 @@ Pin a commit, not a version, when building on them.
   - `nvme_sorted_run.hpp`: one immutable sorted run on a volume.
   - `nvme_compaction.hpp` and `vram_nvidia_compaction.cuh`: the host compactor and the device one, whose kernels only nvcc compiles.
   - `nvme_tree.hpp`: configurations and schemas, LSM levels, the merge of one level into the next, and the level set readers see.
-  - `nvme_write_buffer.hpp`: the in-memory write buffer of stored values.
+  - `nvme_published_runs.hpp`: `commit_ledger` and `stamp_pin`, the stamps and the sequencer every NVMe store commits through, and `published_runs`, the tree, memory runs and published view every NVMe store owns, with the commits, merges, flushes, compactions and truncations that move its runs.
   - `nvme_store.hpp`: `nvme_store`, the store of one collection, memory runs and a value cache in front of a tree, with its snapshots and `nvme_store_cursor`.
-  - `nvme_database.hpp`: databases of named collections and single-collection databases, their snapshots, optimistic transactions, registries and read sets.
+  - `nvme_transaction_deltas.hpp`: `transaction_deltas`, the uncommitted deltas of one transaction, filed under each collection it wrote.
+  - `nvme_database.hpp`: databases of named collections, their snapshots, optimistic transactions, registries and read sets.
+  - `nvme_single_collection_database.hpp`: single-collection databases, their snapshots, transactions and registries.
 - `graph/`, in `unum::ustore::graph`:
   - `half_edges.hpp`: `half_edge_t`, the entry a graph collection files every vertex and both ends of every edge under, with its order and hash.
   - `ram_graph.hpp`: exporting degrees and edges from a store of half-edges, and staging edge and vertex inserts and removals.
   - `vertex_values.hpp`: the dense codec keeping every vertex as one value of its degrees and sorted neighborships.
-  - `adjacency_fold.hpp`: labeled edges and their half-edges, the 48-byte half-edge records a vertex value and its change deltas share, `adjacency_fold_t`, and the reads merging both.
+  - `adjacency_fold.hpp`: labeled edges and their half-edges, the 48-byte half-edge records a vertex value and its change deltas share, `adjacency_fold_t`, the declaration of its device tower `vram_nvidia_adjacency_fold_t`, and the reads merging both.
+  - `vram_nvidia_adjacency_fold.cuh`: the kernels and the device composition of `vram_nvidia_adjacency_fold_t`, which only nvcc compiles.
   - `nvme_store.hpp`: `nvme_store`, the NVMe store of a graph collection, one store keyed by vertex and folded by `adjacency_fold_t`.
 - `docs/`, in `unum::ustore::docs`:
   - `json_paths.hpp`: fields translated into chains of JSONPath prefixes and resolved for a batch of documents in one StringZilla subdocuments pass, into the same values yyjson's lookup finds, or handed back to yyjson where the pass cannot read a batch as yyjson does.

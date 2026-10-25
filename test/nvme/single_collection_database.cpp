@@ -57,10 +57,11 @@ struct scdb_types {
     using fixture_t = fixture_type_;
     using guard_t = typename fixture_t::guard_t;
     using volume_t = typename fixture_t::volume_t;
-    using variable_database_t =
-        basic_single_collection_database<stored_key_t, volume_t, atomic_reference, waiter_t,
-                                         nvme_store<variable_slot_t, volume_t, atomic_reference, waiter_t>>;
-    using variable_cursor_t = nvme_store_cursor<variable_slot_t, volume_t, atomic_reference, waiter_t>;
+    using variable_database_t = basic_single_collection_database<
+        stored_key_t, volume_t, atomic_reference, waiter_t,
+        nvme_store<variable_slot_t, volume_t, atomic_reference, waiter_t, last_write_fold_t, no_device_fold_t>>;
+    using variable_cursor_t =
+        nvme_store_cursor<variable_slot_t, volume_t, atomic_reference, waiter_t, last_write_fold_t, no_device_fold_t>;
 
     /** A fixture, the channels a database needs, and the volume over them. */
     struct stack_t {
@@ -237,9 +238,9 @@ template <typename key_slot_type_, typename mount_type_>
     using types_t = scdb_types<typename mount_type_::fixture_t>;
     using stack_t = typename types_t::stack_t;
     using volume_t = typename types_t::volume_t;
-    using database_t =
-        basic_single_collection_database<typename key_slot_type_::stored_key_t, volume_t, atomic_reference, waiter_t,
-                                         nvme_store<key_slot_type_, volume_t, atomic_reference, waiter_t>>;
+    using database_t = basic_single_collection_database<
+        typename key_slot_type_::stored_key_t, volume_t, atomic_reference, waiter_t,
+        nvme_store<key_slot_type_, volume_t, atomic_reference, waiter_t, last_write_fold_t, no_device_fold_t>>;
     std::size_t failures = 0;
     constexpr std::size_t count_k = 300;
 
@@ -273,7 +274,7 @@ template <typename key_slot_type_, typename mount_type_>
     return failures;
 }
 
-/** Every value layout the database serves round trips through the write buffer and the tree. */
+/** Every value layout the database serves round trips through the memory runs and the tree. */
 template <typename mount_type_>
 std::size_t every_layout_round_trips(mount_type_ const& mount) {
     std::size_t failures = 0;
@@ -332,9 +333,9 @@ template <typename key_slot_type_, typename mount_type_>
     using types_t = scdb_types<typename mount_type_::fixture_t>;
     using stack_t = typename types_t::stack_t;
     using volume_t = typename types_t::volume_t;
-    using database_t =
-        basic_single_collection_database<typename key_slot_type_::stored_key_t, volume_t, atomic_reference, waiter_t,
-                                         nvme_store<key_slot_type_, volume_t, atomic_reference, waiter_t>>;
+    using database_t = basic_single_collection_database<
+        typename key_slot_type_::stored_key_t, volume_t, atomic_reference, waiter_t,
+        nvme_store<key_slot_type_, volume_t, atomic_reference, waiter_t, last_write_fold_t, no_device_fold_t>>;
     std::size_t failures = 0;
     constexpr std::size_t count_k = 400;
 
@@ -430,7 +431,8 @@ std::size_t every_layout_survives_reopen(mount_type_ const& mount) {
 }
 
 /**
- *  @brief A schema that never reached the medium wastes its runs, and one naming a missing run is refused.
+ *  @brief A schema that never reached the medium wastes its runs, and one naming a missing run is refused on every
+ *      reopen, as a refused mount saves nothing.
  *
  *  A flush seals the run first and records it second, so the only state a crash between the two leaves
  *  is a run nobody names. The other order would leave a schema naming bytes the volume never got, which
@@ -513,10 +515,13 @@ std::size_t crash_between_seal_and_schema(mount_type_ const& mount) {
             st::basic_vector<byte_t> value;
             failures += expect(value.resize(200) == st::status_t::success_k);
             for (std::size_t index = 0; index != value.size(); ++index) value[index] = painted(5, index);
-            for (stored_key_t key = 0; key != 64; ++key)
-                failures += expect((*store)->insert(key, std::span<byte_t const> {value}).succeeded());
-            failures += expect((*store)->flush().succeeded());
+            for (stored_key_t round = 0; round != 2; ++round) {
+                for (stored_key_t key = round * 64; key != round * 64 + 64; ++key)
+                    failures += expect((*store)->insert(key, std::span<byte_t const> {value}).succeeded());
+                failures += expect((*store)->flush().succeeded());
+            }
         }
+        failures += expect_eq(run_count_of(*(*stack)->volume), std::size_t {2});
 
         std::array<byte_t, blob_name_max_bytes_k> named {};
         std::size_t named_bytes = 0;
@@ -528,13 +533,16 @@ std::size_t crash_between_seal_and_schema(mount_type_ const& mount) {
         failures += expect(named_bytes != std::size_t {0});
         if (named_bytes == 0) return failures;
 
-        // The bytes of the one run the schema names never reached the environment.
+        // The bytes of one of the two runs the schema names never reached the environment.
         failures += expect(
             (*stack)->volume->drop((*stack)->writing.channel(), blob_name_t {named.data(), named_bytes}).succeeded());
 
-        expected<typename variable_database_t::database_unique_ptr_t> const store = open_over<variable_database_t>(
-            **stack, config);
-        failures += expect_status(store, status_code_t::not_found_k);
+        // A mount refused after taking back the other run saves no schema naming that run alone, so it refuses again.
+        for (std::size_t attempt = 0; attempt != 2; ++attempt) {
+            expected<typename variable_database_t::database_unique_ptr_t> const store = open_over<variable_database_t>(
+                **stack, config);
+            failures += expect_status(store, status_code_t::not_found_k);
+        }
     }
     return failures;
 }

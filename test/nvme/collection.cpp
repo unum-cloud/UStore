@@ -56,8 +56,10 @@ struct collection_types {
     using fixture_t = fixture_type_;
     using guard_t = typename fixture_t::guard_t;
     using volume_t = typename fixture_t::volume_t;
-    using variable_store_t = nvme_store<variable_slot_t, volume_t, atomic_reference, waiter_t>;
-    using variable_cursor_t = nvme_store_cursor<variable_slot_t, volume_t, atomic_reference, waiter_t>;
+    using variable_store_t =
+        nvme_store<variable_slot_t, volume_t, atomic_reference, waiter_t, last_write_fold_t, no_device_fold_t>;
+    using variable_cursor_t =
+        nvme_store_cursor<variable_slot_t, volume_t, atomic_reference, waiter_t, last_write_fold_t, no_device_fold_t>;
 
     /** A fixture, one checked-out channel and the volume mounted over it, which every case starts from. */
     struct stack_t {
@@ -266,7 +268,8 @@ template <typename key_slot_type_, typename mount_type_>
                                             stored_value_size_t value_max_size) {
     using types_t = collection_types<typename mount_type_::fixture_t>;
     using stack_t = typename types_t::stack_t;
-    using nvme_store_t = nvme_store<key_slot_type_, typename types_t::volume_t, atomic_reference, waiter_t>;
+    using nvme_store_t = nvme_store<key_slot_type_, typename types_t::volume_t, atomic_reference, waiter_t,
+                                    last_write_fold_t, no_device_fold_t>;
     std::size_t failures = 0;
     constexpr std::size_t count_k = 300;
 
@@ -386,7 +389,7 @@ std::size_t misses_and_remove_deltas(mount_type_ const& mount) {
 
 /** A memory run answers a value the tree has never seen, and the tree answers it after a flush. */
 template <typename mount_type_>
-std::size_t write_buffer_answers_before_the_tree(mount_type_ const& mount) {
+std::size_t memory_runs_answer_before_the_tree(mount_type_ const& mount) {
     using types_t = collection_types<typename mount_type_::fixture_t>;
     using variable_store_t = typename types_t::variable_store_t;
     using stack_t = typename types_t::stack_t;
@@ -444,9 +447,9 @@ std::size_t write_buffer_answers_before_the_tree(mount_type_ const& mount) {
     return failures;
 }
 
-/** A write buffer too small for the batch flushes itself, and every value survives the flushes it forced. */
+/** Memory runs too small for the batch flush themselves, and every value survives the flushes it forced. */
 template <typename mount_type_>
-std::size_t full_write_buffer_flushes_itself(mount_type_ const& mount) {
+std::size_t full_memory_runs_flush_themselves(mount_type_ const& mount) {
     using types_t = collection_types<typename mount_type_::fixture_t>;
     using variable_store_t = typename types_t::variable_store_t;
     using stack_t = typename types_t::stack_t;
@@ -481,7 +484,7 @@ std::size_t full_write_buffer_flushes_itself(mount_type_ const& mount) {
     failures += expect(store->tree().levels().level(0).size() > std::size_t {1});
     failures += check_model(*store, (*stack)->channel(), std::span<expectation_t const> {model});
 
-    // A batch larger than the whole write buffer lands whole, past the bounds, and the next write flushes it.
+    // A batch larger than the bounds of the memory runs lands whole, past the bounds, and the next write flushes it.
     st::basic_vector<byte_t> wide;
     failures += expect(wide.resize(64ull * 1024ull) == st::status_t::success_k);
     for (std::size_t index = 0; index != wide.size(); ++index) wide[index] = painted(7, index);
@@ -1014,8 +1017,8 @@ std::size_t counter_fold_reads_alike_everywhere(mount_type_ const& mount) {
     using types_t = collection_types<typename mount_type_::fixture_t>;
     using guard_t = typename types_t::guard_t;
     using stack_t = typename types_t::stack_t;
-    using counter_store_t =
-        nvme_store<variable_slot_t, typename types_t::volume_t, atomic_reference, waiter_t, counter_fold>;
+    using counter_store_t = nvme_store<variable_slot_t, typename types_t::volume_t, atomic_reference, waiter_t,
+                                       counter_fold, no_device_fold_t>;
     std::size_t failures = 0;
     constexpr stored_key_t keys_k = 12;
     expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
@@ -1152,8 +1155,8 @@ int main(int argc, char const* argv[]) {
         report(totals, mount, "mixed_widths_round_trip", mixed_widths_round_trip);
         report(totals, mount, "every_layout", every_layout_round_trips);
         report(totals, mount, "misses_and_remove_deltas", misses_and_remove_deltas);
-        report(totals, mount, "buffer_before_tree", write_buffer_answers_before_the_tree);
-        report(totals, mount, "full_buffer_flushes", full_write_buffer_flushes_itself);
+        report(totals, mount, "buffer_before_tree", memory_runs_answer_before_the_tree);
+        report(totals, mount, "full_buffer_flushes", full_memory_runs_flush_themselves);
         report(totals, mount, "unaligned_exact_span", unaligned_exact_span_is_taken);
         report(totals, mount, "widest_and_empty", widest_and_empty_values);
         report(totals, mount, "holds_its_depth", batched_select_holds_its_depth);

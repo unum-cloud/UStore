@@ -35,21 +35,21 @@ The types are templates of `include/ustore/`, which `variants.hpp` instantiates 
 - `blobs/nvme_sorted_run.hpp` — `lsm_sorted_run`.
 - `blobs/nvme_compaction.hpp` and `vram_nvidia_compaction.cuh` — the host compactor, and the kernels of the device one.
 - `blobs/nvme_tree.hpp` — configurations and schemas, `lsm_level`, its merger and `lsm_tree`.
-- `blobs/nvme_write_buffer.hpp` — `write_buffer`.
 - `blobs/nvme_store.hpp` — the value cache, `nvme_store`, its snapshot and `nvme_store_cursor`.
-- `blobs/nvme_database.hpp` — both databases, their snapshots, transactions, registries and read sets.
+- `blobs/nvme_transaction_deltas.hpp` — `transaction_deltas`.
+- `blobs/nvme_database.hpp` and `nvme_single_collection_database.hpp` — both databases, their snapshots, transactions, registries and read sets.
 - `graph/adjacency_fold.hpp` and `nvme_store.hpp` — the graph store below.
 
 The sorted run index is a B-tree of the run's key slots, and the merger hands the compactor each run's index.
 
 Levels differ by depth:
 
-- Level 0, `L0`, receives one sorted run per flushed write buffer, so its sorted runs overlap and a scan merges them by smallest key.
+- Level 0, `L0`, receives one sorted run per flush of a collection's memory runs, so its sorted runs overlap and a scan merges them by smallest key.
 - Intermediate levels keep their sorted runs sorted, and still hold remove deltas, whose kind shadows older values beneath them.
 - The bottom level is sorted too, and compaction into it drops remove deltas for good.
 
-Level 0 admits `level_enlarge_factor` flushed runs of one write buffer each, and every deeper level `level_enlarge_factor` times the bytes of the one above, so no level size is configured on its own.
-Level 0 is due for compaction at that many sorted runs or at that many write buffers' bytes, whichever comes first.
+Level 0 admits `level_enlarge_factor` runs of one flush each, and every deeper level `level_enlarge_factor` times the bytes of the one above, so no level size is configured on its own.
+Level 0 is due for compaction at that many sorted runs or at that many flushes' worth of memory-run bytes, whichever comes first.
 A tree refuses to mount with a factor outside `[level_min_enlarge_factor_k, level_max_enlarge_factor_k]`, the bounds a collection's configuration is validated against.
 The engine compacts after every write that leaves a collection due, on the thread of that write.
 
@@ -66,12 +66,12 @@ A `database` mixes collections of different value layouts, and its collection sc
 ### Stamps and snapshots
 
 Every commit draws one stamp from the database's `commit_ledger_t`, over SmashTable's `commit_order_t`, and a graph's two databases share one ledger.
-A write buffer slot carries the stamp of the commit that wrote it, and every sorted run carries a column of its key slots' stamps as an `immutable_packed_array` trailer, frame-of-reference coded from a floor no reader can tell apart, so a cold run spends no bit on them.
+A memory run carries the stamp of the commit that wrote each of its deltas, and every sorted run carries a column of its key slots' stamps as an `immutable_packed_array` trailer, frame-of-reference coded from a floor no reader can tell apart, so a cold run spends no bit on them.
 The trailer's second column holds every key slot's `delta_kind_t`, which tells a write, a removal and a fold's change apart, so no size or location of a key slot is a sentinel, and a run of writes alone spends no bit on it.
 A run may hold several versions of one key, newest first, and the run cutter never splits them.
 
 A reader pins a stamp in the ledger and reads the newest version at or below it.
-A write buffer keeps a version it replaces while the replacing commit is unpublished, and after that only while some pin falls between the two, so a hot key nobody reads keeps one older version at most.
+A merge of memory runs keeps a version it replaces only while some pin falls between the two or the replacing commit is newer than the stamp published when the merge began, so a hot key nobody reads keeps one older version at most.
 A flush and a merge keep one version per interval between pinned stamps, every version above the durable horizon, and the newest below it, which with no pin is the newest version alone, as before stamps.
 A reader the memory budget cannot keep history for is refused at its next read with `write_conflict_k`, and the writer never is.
 
@@ -80,7 +80,7 @@ A reader the memory budget cannot keep history for is refused at its next read w
 ### Crash atomicity
 
 The catalog lives in two copies saved in turn, each with a generation and the durable stamp D: every commit at or below D is wholly in the runs that copy names.
-D is the oldest pin a write buffer holds, below its first write, or the published stamp while no buffer holds one.
+D is the least stamp below the oldest commit any collection holds in memory runs alone, or the published stamp while no collection holds one.
 A mount reads the newer copy, resumes the stamps at D and merges down every level holding a version above D, dropping those versions, so a crash loses a suffix of commits and never half of one.
 A graph truncates both of its databases at the lesser of their two promises.
 
@@ -91,13 +91,13 @@ They belong on the blob surface of `nvme_volume.hpp` rather than on the disk rou
 
 Single-collection database transactions span one collection, database transactions span the collections of a database, and both are optimistic with a two-phase commit:
 
-- `stage` checks the read set for conflicts and flushes the write buffer when the changes would not fit, and a failure keeps the changes so they can be logged.
+- `stage` checks the read set for conflicts and flushes the memory runs when the changes would not fit beside them, and a failure keeps the changes so they can be logged.
 - `commit` stages unless already staged, then applies the changes on the write path the stage took, which is the database's own claim and one channel.
 - `rollback` drops the changes, and `renew` restarts the transaction with its changes kept, which only a transaction without reads may do.
 
 A transaction pins its start stamp and reads at it, its own writes first.
 The read set records each watched stored key with the stamp of its watch, a written key keeps its watch beside its write, and a scan records the range it walked.
-Staging fails with `write_conflict_k` when a commit stamped after a watch began wrote a watched key or any key of a watched range, which the write buffer and then the runs whose newest stamp is newer answer exactly, with no fingerprint and no false conflict.
+Staging fails with `write_conflict_k` when a commit stamped after a watch began wrote a watched key or any key of a watched range, which the memory runs and then the runs whose newest stamp is newer answer exactly, with no fingerprint and no false conflict.
 A watch follows one of four schedules:
 
 | Schedule                      | When it checks                                                  |
@@ -121,7 +121,7 @@ Commits are ordered by the stamps the ledger issues, which keeps a transaction t
 - The executor of `ustore_executor_for_nvme` names the transport, the channels and their buffers, and the VRAM executor compactions run on, read once at the open; any other executor and none keep the defaults.
 - `ustore_collection_main_k` is the nil UUID, and the catalog and the names live under two more UUIDs no UUIDv7 spells, which every call refuses as unknown; every other collection carries the UUIDv7 its create minted.
 - A read measures a key and copies its value into the call's scratch, measuring again when the value changed its width in between.
-- A scan, a sample and a measurement walk one collection's runs and write buffer under the database's claim, binary-searching each run for the start key, and merge a transaction's own writes over them.
+- A scan, a sample and a measurement walk one collection's runs and memory runs under the database's claim, binary-searching each run for the start key, and merge a transaction's own writes over them.
 - A snapshot pins a stamp, holds no level set and stalls no writer; reads, scans and collection lookups through it answer at that stamp, a drop leaves the runs of a dropped collection until the last snapshot goes, and a save writes a database of this engine with every collection as the snapshot reads it.
 - With keys watched, committed transactions are strictly serializable in stamp order; with none watched they read one snapshot and the last writer wins; the description reports `ustore_isolation_snapshot_k`.
 - A write that leaves a level due compacts it on the writing thread, and `ustore_database_compact` flushes every collection before merging what is due.
@@ -131,7 +131,7 @@ Only `ram` is refused, since the database the ABI names keeps its volumes in fil
 
 ## Compactions
 
-- Flushing a write buffer writes one L0 sorted run from key slots held in RAM.
+- Flushing a collection's memory runs writes one L0 sorted run from key slots held in RAM.
 - Compaction is a call rather than a background loop: `compact` takes two channels, merges the shallowest level that is over its bounds into the level below, and writes new sorted runs.
 - A sorted level with nothing to merge beneath it descends one level whole, and compacting the bottom level appends a new level below it.
 - A tree keeps two level sets and stores which of them is live, so a publication builds the next one beside the one readers hold and waits only on the readers of the set it retires.

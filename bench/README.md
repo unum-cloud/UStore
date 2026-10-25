@@ -109,7 +109,7 @@ The imports divide the listed files into one contiguous share per thread, so `--
 
 `nvme_single_collection_database.cu` reads its workloads from `nvme_single_collection_database.json`, and writes its databases and its log under the required `--directory`, its only flag.
 No CMake target builds it yet.
-Each entry names one value width from 1 byte upward, switches on with `enabled`, and sizes the population, the cache, the write buffer and the LSM levels.
+Each entry names one value width from 1 byte upward, switches on with `enabled`, and sizes the population, the cache, the memory runs and the LSM levels.
 
 ### Louvain
 

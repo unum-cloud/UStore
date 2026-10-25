@@ -45,6 +45,9 @@
 #include <new>       // placement `new`
 #include <span>      // `std::span`
 
+#include <smashtable/basic_vector.hpp> // `st::basic_vector`
+#include <smashtable/shared.hpp>       // `st::status_t`
+
 #include "ustore/utilities/algorithm.hpp" // `compare_128`, `intersect_sorted_128`, `sorted_128_cursor_concept`
 #include "ustore/utilities/folds.hpp"     // `delta_kind_t`, `delta_view_t`, `fold_concept`
 #include "ustore/utilities/types.hpp"     // `byte_t`, `expected`, `round_up_to_multiple`, `smallest_key_k`
@@ -689,6 +692,28 @@ struct adjacency_fold_t {
 };
 
 static_assert(utilities::fold_concept<adjacency_fold_t>);
+
+/**
+ *  @brief The device fold of graph adjacency, composing on one NVIDIA device what @c adjacency_fold_t composes on the
+ *      host, for a compaction's chains of half-edge changes all at once.
+ *
+ *  Host translation units name it, as the tree and the engine pick it for a graph's merges; its @c compose runs on
+ *  NVIDIA devices and is defined in @c vram_nvidia_adjacency_fold.cuh, which only nvcc compiles.
+ */
+struct vram_nvidia_adjacency_fold_t {
+
+    /**
+     *  @brief Composes chain @c c, the changes from @p chain_starts[c] to @p chain_starts[c + 1] oldest first, into the
+     *      bytes of @p composed from @p composed_offsets[c] to @p composed_offsets[c + 1], on the device of @p stream.
+     *  @tparam stream_type_ The CUDA stream the device work queues on, @c utilities::cuda_stream_t.
+     *  @retval invalid_argument_k A delta is no change, or carries a ragged or malformed record.
+     *  @retval out_of_memory_heap_k A buffer could not grow.
+     */
+    template <typename stream_type_>
+    st::status_t compose(stream_type_ const& stream, std::span<delta_view_t const> changes,
+                         std::span<std::uint64_t const> chain_starts, st::basic_vector<byte_t>& composed,
+                         st::basic_vector<std::uint64_t>& composed_offsets) const noexcept;
+};
 
 #pragma endregion Fold
 

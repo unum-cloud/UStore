@@ -230,7 +230,7 @@ Every engine implements the same C ABI of `c/ustore/db.h`, `c/ustore/blobs.h` an
 
 Each carries a limit worth knowing before choosing it.
 The `ram` engine rewrites its whole image on a flush and keeps no log, so a crash loses everything written since the last one.
-NVMe keeps no write-ahead log, so a crash loses the commits its write buffers held, a suffix of them and never half of one.
+NVMe keeps no write-ahead log, so a crash loses the commits its memory runs held, a suffix of them and never half of one.
 RocksDB takes a transaction's snapshot at its first read or write rather than when it began, and stages by locking and validating every watched read and buffered write against that snapshot, then preparing the writes into its log.
 LevelDB has no transactions.
 

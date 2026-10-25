@@ -307,6 +307,9 @@ class memory_run {
     /** Bytes every delta's value takes together. */
     [[nodiscard]] std::size_t values_bytes() const noexcept { return deltas_.values_bytes(); }
 
+    /** Bytes the run charges against its store's memory bounds: its values, as its keys take a fixed width. */
+    [[nodiscard]] std::uint64_t memory_bytes() const noexcept { return values_bytes(); }
+
     /** The key at sorted @p position. */
     [[nodiscard]] stored_key_t const& stored_key(std::size_t position) const noexcept {
         return deltas_.stored_key(position);
