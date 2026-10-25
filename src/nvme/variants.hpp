@@ -255,6 +255,28 @@ inline user_collection_config_t engine_collection_defaults() noexcept {
 template <cpu_class_t cpu_class_>
 struct nvme_variant {
 
+    /** The database verbs of this class. */
+    static database_verbs_t const database_verbs_k;
+
+    /** The unchecked whole-value reads, removals and key scans of this class, through each collection's own store,
+     *  which its docs, graph and pages verbs reach after their resolver. */
+    static blobs_verbs_t const values_verbs_k;
+
+    /** The verbs of this class's blobs collections. */
+    static blobs_verbs_t const blobs_verbs_k;
+
+    /** The verbs of this class's strings collections. */
+    static strings_verbs_t const strings_verbs_k;
+
+    /** The verbs of this class's documents collections. */
+    static docs_verbs_t const docs_verbs_k;
+
+    /** The verbs of this class's graph collections. */
+    static graph_verbs_t const graph_verbs_k;
+
+    /** The verbs of this class's pages collections. */
+    static pages_verbs_t const pages_verbs_k;
+
     /** The table every handle the open of this class hands out is stamped with. */
     static engine_t const engine_k;
 
@@ -774,34 +796,12 @@ expected<catalog_entry_t> look_up(database_state<cpu_class_>& state, ustore_aren
     return read_catalog_entry(state, collection, held);
 }
 
-/** Admits a collection keyed by UUIDs, which the reads of blobs reach, a graph's vertices included. */
-inline status_t holds_keys(ustore_modality_t modality) noexcept {
-    if (entry_layout_of(modality) == entry_layout_t::strings_to_uuids_k)
-        return {status_code_t::invalid_argument_k, "The collection holds strings"};
-    return {};
-}
-
-/** Admits a collection whose values the writes of blobs replace, refusing a graph, which changes through the graph
- *  calls alone, as the in-memory engine does. */
-inline status_t holds_values(ustore_modality_t modality) noexcept {
-    if (modality == ustore_modality_graph_k)
-        return {status_code_t::invalid_argument_k, "A graph collection changes through the graph calls"};
-    return holds_keys(modality);
-}
-
-/** Admits a collection keyed by strings. */
-inline status_t holds_strings(ustore_modality_t modality) noexcept {
-    if (entry_layout_of(modality) != entry_layout_t::strings_to_uuids_k)
-        return {status_code_t::invalid_argument_k, "The collection holds no strings"};
-    return {};
-}
-
-/** Refuses a batch addressing a collection the catalog does not list, as @p view reads it, or one whose modality
- *  @p admits refuses, called as `admits(modality)`, looking each run of tasks on one collection up once. */
-template <cpu_class_t cpu_class_, typename admits_type_>
+/** Refuses a batch addressing a collection the catalog does not list, as @p view reads it, or one @c admit_modality
+ *  refuses for @p modality, looking each run of tasks on one collection up once. */
+template <cpu_class_t cpu_class_>
 status_t resolve_runs(database_state<cpu_class_>& state, view_t const& view,
                       strided_iterator<ustore_collection_id_t const> collections, std::size_t count,
-                      admits_type_&& admits) noexcept {
+                      ustore_modality_t modality) noexcept {
     transaction_stamp_t const stamp = view.snapshot
                                           ? handle_cast<snapshot_handle<cpu_class_>>(view.snapshot)->pin.stamp()
                                           : head_stamp_k;
@@ -810,10 +810,18 @@ status_t resolve_runs(database_state<cpu_class_>& state, view_t const& view,
         ustore_collection_id_t const collection = collections ? collections[index] : ustore_collection_main_k;
         auto [entry, look_up_status] = look_up(state, view.scratch, collection, stamp, thread_index_of(state, view));
         if (look_up_status.failed()) return look_up_status;
-        if (status_t const admitted = admits(entry.modality); admitted.failed()) return admitted;
+        if (status_t const admitted = admit_modality(entry.modality, modality); admitted.failed()) return admitted;
         if (!collections) return {};
     }
     return {};
+}
+
+/** The resolver of this engine, which its docs and pages verbs run first. */
+template <cpu_class_t cpu_class_>
+status_t resolve_modality(ustore_database_t database, ustore_collections_view_t collections, ustore_size_t count,
+                          ustore_modality_t modality, view_t const& view) noexcept {
+    return resolve_runs(*handle_cast<database_state<cpu_class_>>(database), view, strided(collections), count,
+                        modality);
 }
 
 /** The collection task @p index of @p collections names, the main one when they name none. */
@@ -847,7 +855,7 @@ status_t visit_strings(call_access<cpu_class_> const& access, collection_id_t co
         collection,
         [&]<typename store_type_>(store_type_& store) noexcept -> status_t {
             if constexpr (std::is_same_v<store_type_, strings_store_of<cpu_class_>>) return visitor(store);
-            else return {status_code_t::invalid_argument_k, "The collection holds no strings"};
+            else return collection_holds_another_modality();
         },
         access.thread_index);
 }
@@ -1408,7 +1416,8 @@ status_t blobs_write(ustore_blobs_write_t const& arguments, strings_arg_t const&
         status.failed() || !arguments.count)
         return status;
     database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
-    if (status_t const resolved = resolve_runs(state, view, places.collections_begin, places.size(), holds_values);
+    if (status_t const resolved = resolve_runs(state, view, places.collections_begin, places.size(),
+                                               ustore_modality_blobs_k);
         resolved.failed())
         return resolved;
     std::size_t bytes = 0;
@@ -1425,17 +1434,15 @@ status_t blobs_write(ustore_blobs_write_t const& arguments, strings_arg_t const&
                        });
 }
 
-/** Implements @c ustore_blobs_remove, committing a batch outside a transaction atomically. */
+/** Removes whole values through the store of each collection, committing a batch outside a transaction atomically,
+ *  for a caller whose resolver checked the collections. */
 template <cpu_class_t cpu_class_>
-status_t blobs_remove(ustore_blobs_remove_t const& arguments, view_t const& view) noexcept {
+status_t remove_values(ustore_blobs_remove_t const& arguments, view_t const& view) noexcept {
     place_batch_t const places = places_of(arguments);
     if (status_t const status = validate_remove(view.transaction, places, arguments.durability, view.watch);
         status.failed() || !arguments.count)
         return status;
     database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
-    if (status_t const resolved = resolve_runs(state, view, places.collections_begin, places.size(), holds_values);
-        resolved.failed())
-        return resolved;
     return serve_write(state, view, arguments.durability, places.size(), 1, watch_schedule_t::never_k,
                        [&](call_access<cpu_class_> const& access) noexcept -> status_t {
                            for (std::size_t index = 0; index != places.size(); ++index) {
@@ -1448,16 +1455,24 @@ status_t blobs_remove(ustore_blobs_remove_t const& arguments, view_t const& view
                        });
 }
 
-/** Implements @c ustore_blobs_read, copying every value into the scratch once and into the arena at the end. */
+/** Implements @c ustore_blobs_remove over the values of blobs collections alone. */
 template <cpu_class_t cpu_class_>
-status_t blobs_read(ustore_blobs_read_t const& arguments, view_t const& view) noexcept {
+status_t blobs_remove(ustore_blobs_remove_t const& arguments, view_t const& view) noexcept {
+    if (status_t const resolved = resolve_modality<cpu_class_>(arguments.database, arguments.collections,
+                                                               arguments.count, ustore_modality_blobs_k, view);
+        resolved.failed())
+        return resolved;
+    return remove_values<cpu_class_>(arguments, view);
+}
+
+/** Reads whole values through the store of each collection, folded as its modality folds them, copying every value
+ *  into the scratch once and into the arena at the end, for a caller whose resolver checked the collections. */
+template <cpu_class_t cpu_class_>
+status_t read_values(ustore_blobs_read_t const& arguments, view_t const& view) noexcept {
     if (!arguments.count) return {};
     place_batch_t const places = places_of(arguments);
     if (status_t const status = validate_read(places); status.failed()) return status;
     database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
-    if (status_t const resolved = resolve_runs(state, view, places.collections_begin, places.size(), holds_keys);
-        resolved.failed())
-        return resolved;
     auto [outputs, outputs_status] = read_outputs_t::make(arguments, view.scratch);
     if (outputs_status.failed()) return outputs_status;
     call_access<cpu_class_> const access = access_of(state, view);
@@ -1471,16 +1486,24 @@ status_t blobs_read(ustore_blobs_read_t const& arguments, view_t const& view) no
     return outputs.finish(arguments);
 }
 
-/** Implements @c ustore_blobs_scan as ordered walks of each collection, watching what a transaction hands out. */
+/** Implements @c ustore_blobs_read over the values of blobs collections alone. */
 template <cpu_class_t cpu_class_>
-status_t blobs_scan(ustore_blobs_scan_t const& arguments, view_t const& view) noexcept {
+status_t blobs_read(ustore_blobs_read_t const& arguments, view_t const& view) noexcept {
+    if (status_t const resolved = resolve_modality<cpu_class_>(arguments.database, arguments.collections,
+                                                               arguments.count, ustore_modality_blobs_k, view);
+        resolved.failed())
+        return resolved;
+    return read_values<cpu_class_>(arguments, view);
+}
+
+/** Scans keys as ordered walks of the store of each collection, a graph's being its vertices, watching what a
+ *  transaction hands out, for a caller whose resolver checked the collections. */
+template <cpu_class_t cpu_class_>
+status_t scan_values(ustore_blobs_scan_t const& arguments, view_t const& view) noexcept {
     if (status_t const status = validate_scan(arguments); status.failed() || !arguments.count) return status;
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     scan_batch_t const scans {collections, strided(arguments.start_keys), arguments.wanted, arguments.count};
     database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
-    if (status_t const resolved = resolve_runs(state, view, collections, arguments.count, holds_keys);
-        resolved.failed())
-        return resolved;
     auto [outputs, outputs_status] = scan_outputs_t::make(arguments, view.scratch);
     if (outputs_status.failed()) return outputs_status;
     progress_t progress {arguments.progress, arguments.progress_state, arguments.count};
@@ -1512,6 +1535,16 @@ status_t blobs_scan(ustore_blobs_scan_t const& arguments, view_t const& view) no
     return outputs.finish(arguments);
 }
 
+/** Implements @c ustore_blobs_scan over the keys of blobs collections alone. */
+template <cpu_class_t cpu_class_>
+status_t blobs_scan(ustore_blobs_scan_t const& arguments, view_t const& view) noexcept {
+    if (status_t const resolved = resolve_modality<cpu_class_>(arguments.database, arguments.collections,
+                                                               arguments.count, ustore_modality_blobs_k, view);
+        resolved.failed())
+        return resolved;
+    return scan_values<cpu_class_>(arguments, view);
+}
+
 /** A splitmix64 generator, drawing the positions a reservoir keeps. */
 struct sample_generator_t {
     using result_type = std::uint64_t;
@@ -1539,7 +1572,7 @@ status_t blobs_sample(ustore_blobs_sample_t const& arguments, view_t const& view
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     sample_batch_t const samples {collections, arguments.wanted, arguments.count};
     database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
-    if (status_t const resolved = resolve_runs(state, view, collections, arguments.count, holds_keys);
+    if (status_t const resolved = resolve_runs(state, view, collections, arguments.count, ustore_modality_blobs_k);
         resolved.failed())
         return resolved;
     auto [outputs, outputs_status] = scan_outputs_t::make(arguments, view.scratch);
@@ -1588,7 +1621,7 @@ status_t blobs_measure(ustore_blobs_measure_t const& arguments, view_t const& vi
     strided_iterator<ustore_key_t const> const start_keys = strided(arguments.start_keys);
     strided_iterator<ustore_key_t const> const end_keys = strided(arguments.end_keys);
     database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
-    if (status_t const resolved = resolve_runs(state, view, collections, arguments.count, holds_keys);
+    if (status_t const resolved = resolve_runs(state, view, collections, arguments.count, ustore_modality_blobs_k);
         resolved.failed())
         return resolved;
     auto [outputs, outputs_status] = measure_outputs_t::make(arguments);
@@ -1647,7 +1680,7 @@ status_t serve_strings_write(arguments_type_ const& arguments, strings_arg_t con
                              strided_iterator<ustore_key_t const> values, view_t const& view) noexcept {
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
-    if (status_t const resolved = resolve_runs(state, view, collections, arguments.count, holds_strings);
+    if (status_t const resolved = resolve_runs(state, view, collections, arguments.count, ustore_modality_strings_k);
         resolved.failed())
         return resolved;
     auto [tasks, tasks_status] = string_tasks(view, collections, arguments.count, texts, values);
@@ -1686,7 +1719,7 @@ status_t strings_read(ustore_strings_read_t const& arguments, strings_arg_t cons
     if (!texts) return {status_code_t::invalid_argument_k, "No strings were provided"};
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
-    if (status_t const resolved = resolve_runs(state, view, collections, arguments.count, holds_strings);
+    if (status_t const resolved = resolve_runs(state, view, collections, arguments.count, ustore_modality_strings_k);
         resolved.failed())
         return resolved;
     auto [outputs, outputs_status] = strings_read_outputs_t::make(arguments);
@@ -1715,7 +1748,7 @@ status_t strings_scan(ustore_strings_scan_t const& arguments, strings_arg_t cons
         return {status_code_t::invalid_argument_k, "Need outputs for the offsets and the strings"};
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
-    if (status_t const resolved = resolve_runs(state, view, collections, arguments.count, holds_strings);
+    if (status_t const resolved = resolve_runs(state, view, collections, arguments.count, ustore_modality_strings_k);
         resolved.failed())
         return resolved;
     auto [outputs, outputs_status] = strings_scan_outputs_t::make(arguments, view.scratch);
@@ -2221,7 +2254,7 @@ void database_free(ustore_database_t database) noexcept {
 
 // The graph, docs and pages calls build on the accesses, writes and catalog lookups above, and the table below names
 // them
-#include "docs_calls.hpp"  // `docs_write`, `holds_only`
+#include "docs_calls.hpp"  // `docs_write`
 #include "graph_calls.hpp" // `graph_read_edges`, `graph_write_edges`, `graph_remove_vertices`
 #include "pages_calls.hpp" // `pages_import`, `pages_insert`, `commit_page_edits`
 
@@ -2230,10 +2263,10 @@ namespace unum::ustore::nvme {
 #pragma region Table
 
 template <cpu_class_t cpu_class_>
-engine_t const nvme_variant<cpu_class_>::engine_k {
-    .database_describe = &database_describe<cpu_class_>,
-    .database_clear = &database_clear<cpu_class_>,
-    .database_compact = &database_compact<cpu_class_>,
+database_verbs_t const nvme_variant<cpu_class_>::database_verbs_k {
+    .describe = &database_describe<cpu_class_>,
+    .clear = &database_clear<cpu_class_>,
+    .compact = &database_compact<cpu_class_>,
     .snapshot_init = &snapshot_init<cpu_class_>,
     .snapshot_save = &snapshot_save<cpu_class_>,
     .collection_list = &collection_list<cpu_class_>,
@@ -2244,36 +2277,77 @@ engine_t const nvme_variant<cpu_class_>::engine_k {
     .transaction_stage = &transaction_stage<cpu_class_>,
     .transaction_commit = &transaction_commit<cpu_class_>,
     .transaction_rollback = &transaction_rollback<cpu_class_>,
-    .blobs_write = &blobs_write<cpu_class_>,
-    .blobs_remove = &blobs_remove<cpu_class_>,
-    .blobs_read = &blobs_read<cpu_class_>,
-    .blobs_scan = &blobs_scan<cpu_class_>,
-    .blobs_sample = &blobs_sample<cpu_class_>,
-    .blobs_measure = &blobs_measure<cpu_class_>,
-    .docs_write = &docs_write<cpu_class_>,
-    .docs_read = &docs_read_in_json_values,
-    .docs_gist = &docs_gist_in_json_values,
-    .docs_gather = &docs_gather_in_json_values,
-    .graph_read_edges = &graph_read_edges<cpu_class_>,
-    .graph_write_edges = &graph_write_edges<cpu_class_>,
-    .graph_remove_edges = &graph_remove_edges<cpu_class_>,
-    .graph_write_vertices = &graph_write_vertices<cpu_class_>,
-    .graph_remove_vertices = &graph_remove_vertices<cpu_class_>,
-    .pages_import = &pages_import<cpu_class_>,
-    .pages_insert = &pages_insert<cpu_class_>,
-    .pages_remove = &pages_remove<cpu_class_>,
-    .pages_move = &pages_move<cpu_class_>,
-    .pages_splice = &pages_splice<cpu_class_>,
-    .pages_set_attributes = &pages_set_attributes<cpu_class_>,
-    .pages_remove_attributes = &pages_remove_attributes<cpu_class_>,
-    .pages_read = &pages_read_in_page_values,
-    .strings_write = &strings_write<cpu_class_>,
-    .strings_remove = &strings_remove<cpu_class_>,
-    .strings_read = &strings_read<cpu_class_>,
-    .strings_scan = &strings_scan<cpu_class_>,
     .transaction_free = &transaction_free<cpu_class_>,
     .snapshot_free = &snapshot_free<cpu_class_>,
     .database_free = &database_free<cpu_class_>,
+};
+
+template <cpu_class_t cpu_class_>
+blobs_verbs_t const nvme_variant<cpu_class_>::values_verbs_k {
+    .remove = &remove_values<cpu_class_>,
+    .read = &read_values<cpu_class_>,
+    .scan = &scan_values<cpu_class_>,
+};
+
+template <cpu_class_t cpu_class_>
+blobs_verbs_t const nvme_variant<cpu_class_>::blobs_verbs_k {
+    .write = &blobs_write<cpu_class_>,
+    .remove = &blobs_remove<cpu_class_>,
+    .read = &blobs_read<cpu_class_>,
+    .scan = &blobs_scan<cpu_class_>,
+    .sample = &blobs_sample<cpu_class_>,
+    .measure = &blobs_measure<cpu_class_>,
+};
+
+template <cpu_class_t cpu_class_>
+strings_verbs_t const nvme_variant<cpu_class_>::strings_verbs_k {
+    .write = &strings_write<cpu_class_>,
+    .remove = &strings_remove<cpu_class_>,
+    .read = &strings_read<cpu_class_>,
+    .scan = &strings_scan<cpu_class_>,
+};
+
+template <cpu_class_t cpu_class_>
+docs_verbs_t const nvme_variant<cpu_class_>::docs_verbs_k {
+    .write = &docs_write<cpu_class_>,
+    .read = &docs_read_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>>,
+    .gist = &docs_gist_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>>,
+    .gather = &docs_gather_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>>,
+    .remove = &remove_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>, ustore_modality_docs_k>,
+    .scan = &scan_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>, ustore_modality_docs_k>,
+};
+
+template <cpu_class_t cpu_class_>
+graph_verbs_t const nvme_variant<cpu_class_>::graph_verbs_k {
+    .read_edges = &graph_read_edges<cpu_class_>,
+    .write_edges = &graph_write_edges<cpu_class_>,
+    .remove_edges = &graph_remove_edges<cpu_class_>,
+    .write_vertices = &graph_write_vertices<cpu_class_>,
+    .remove_vertices = &graph_remove_vertices<cpu_class_>,
+    .scan_vertices = &scan_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>, ustore_modality_graph_k>,
+};
+
+template <cpu_class_t cpu_class_>
+pages_verbs_t const nvme_variant<cpu_class_>::pages_verbs_k {
+    .import = &pages_import<cpu_class_>,
+    .insert = &pages_insert<cpu_class_>,
+    .remove = &pages_remove<cpu_class_>,
+    .move = &pages_move<cpu_class_>,
+    .splice = &pages_splice<cpu_class_>,
+    .set_attributes = &pages_set_attributes<cpu_class_>,
+    .remove_attributes = &pages_remove_attributes<cpu_class_>,
+    .read = &pages_read_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>>,
+    .scan = &scan_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>, ustore_modality_pages_k>,
+};
+
+template <cpu_class_t cpu_class_>
+engine_t const nvme_variant<cpu_class_>::engine_k {
+    .database = &database_verbs_k,
+    .blobs = &blobs_verbs_k,
+    .strings = &strings_verbs_k,
+    .docs = &docs_verbs_k,
+    .graph = &graph_verbs_k,
+    .pages = &pages_verbs_k,
 };
 
 #pragma endregion Table

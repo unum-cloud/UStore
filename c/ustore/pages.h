@@ -481,6 +481,68 @@ typedef struct ustore_pages_read_t {
  */
 USTORE_EXPORT void ustore_pages_read(ustore_pages_read_t* arguments);
 
+/**
+ *  @brief The arguments of @c ustore_pages_scan, which lists up to @c wanted page keys from a start key in every
+ *      collection.
+ *
+ *  Pages are not rendered, so @c ustore_pages_read follows the scan. Consistent iterators over concurrent state are
+ *  costly, so scans paginate instead.
+ */
+typedef struct ustore_pages_scan_t {
+
+    /** An open database. */
+    ustore_database_t database;
+
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call returns final, the default, or once submitted. */
+    ustore_completion_t completion;
+
+    /** What the call sees, where @c NULL is the head. */
+    ustore_view_t view;
+
+    /** Number of scans. */
+    ustore_size_t count;
+
+    /** Collections of the pages, where @c NULL data stands for the main collection. */
+    ustore_collections_view_t collections;
+
+    /** Smallest page key every scan may return, where @c NULL data starts at the first page. */
+    ustore_keys_view_t start_keys;
+
+    /** Output for @c count plus one offsets into @c keys, the last one closing the final scan, inside @c arena. */
+    ustore_length_t const** offsets;
+
+    /** Output for the found page keys, scan after scan, inside @c arena. */
+    ustore_key_t const** keys;
+
+    /** Rewound by this call, then holding every output it writes; @c NULL is refused. */
+    ustore_arena_t arena;
+
+    /** Most page keys every scan returns. */
+    ustore_size_t wanted;
+
+    /** In what order the page keys come. */
+    ustore_scan_mode_t mode;
+
+    /** Optional callback reporting the scans finished. */
+    ustore_progress_callback_t progress;
+
+    /** Opaque pointer passed to @c progress. */
+    void* progress_state;
+
+} ustore_pages_scan_t;
+
+/**
+ *  @brief Scans a batch of page key ranges.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ */
+USTORE_EXPORT void ustore_pages_scan(ustore_pages_scan_t* arguments);
+
 #ifdef __cplusplus
 }
 #endif

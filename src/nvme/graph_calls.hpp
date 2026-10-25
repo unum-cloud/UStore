@@ -68,13 +68,6 @@ constexpr role_t mirrored_role(role_t role) noexcept {
     return role;
 }
 
-/** Admits a graph collection, which the graph calls alone address. */
-inline status_t holds_graph(ustore_modality_t modality) noexcept {
-    if (modality != ustore_modality_graph_k)
-        return {status_code_t::invalid_argument_k, "The collection holds no graph"};
-    return {};
-}
-
 /** Refuses a graph write of @p durability, or one watching as @p watch, that the transaction or its absence rules
  *  out, as every write of the engine does. */
 inline status_t validate_graph_write(ustore_transaction_t transaction, ustore_durability_t durability,
@@ -301,7 +294,8 @@ status_t graph_read_edges(ustore_graph_read_edges_t const& arguments, view_t con
         return {status_code_t::invalid_argument_k, "Need an output for the offsets of the edges"};
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
-    if (status_t const resolved = resolve_runs(state, view, collections, count, holds_graph); resolved.failed())
+    if (status_t const resolved = resolve_runs(state, view, collections, count, ustore_modality_graph_k);
+        resolved.failed())
         return resolved;
     call_access<cpu_class_> const access = access_of(state, view);
 
@@ -374,7 +368,7 @@ status_t graph_write_edges(ustore_graph_write_edges_t const& arguments, view_t c
         return {status_code_t::invalid_argument_k, "Need the sources and the targets of the edges"};
     database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
     if (status_t const resolved = resolve_runs(state, view, strided(arguments.collections), arguments.count,
-                                               holds_graph);
+                                               ustore_modality_graph_k);
         resolved.failed())
         return resolved;
     auto [deltas, deltas_status] = edge_deltas(arguments, half_edge_operation_t::insert_k, view.scratch);
@@ -409,7 +403,7 @@ status_t graph_remove_edges(ustore_graph_remove_edges_t const& arguments, view_t
         return {status_code_t::invalid_argument_k, "Need the sources and the targets of the edges"};
     database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
     if (status_t const resolved = resolve_runs(state, view, strided(arguments.collections), arguments.count,
-                                               holds_graph);
+                                               ustore_modality_graph_k);
         resolved.failed())
         return resolved;
     auto [deltas, deltas_status] = edge_deltas(arguments, half_edge_operation_t::remove_k, view.scratch);
@@ -443,7 +437,7 @@ status_t graph_write_vertices(ustore_graph_write_vertices_t const& arguments, vi
     if (!arguments.vertices.data) return {status_code_t::invalid_argument_k, "No vertices were provided"};
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
-    if (status_t const resolved = resolve_runs(state, view, collections, arguments.count, holds_graph);
+    if (status_t const resolved = resolve_runs(state, view, collections, arguments.count, ustore_modality_graph_k);
         resolved.failed())
         return resolved;
     strided_iterator<ustore_key_t const> const vertices = strided(arguments.vertices);
@@ -476,7 +470,8 @@ status_t graph_remove_vertices(ustore_graph_remove_vertices_t const& arguments, 
     std::size_t const count = arguments.count;
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
     database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
-    if (status_t const resolved = resolve_runs(state, view, collections, count, holds_graph); resolved.failed())
+    if (status_t const resolved = resolve_runs(state, view, collections, count, ustore_modality_graph_k);
+        resolved.failed())
         return resolved;
     strided_iterator<ustore_key_t const> const vertices = strided(arguments.vertices);
     strided_iterator<ustore_vertex_role_t const> const roles = strided(arguments.roles);

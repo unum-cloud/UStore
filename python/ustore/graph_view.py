@@ -244,7 +244,7 @@ class Graph:
     # region Vertices
 
     def __iter__(self) -> Iterator[UUID]:
-        return scan_keys(self.blocking, self.graph_collection)
+        return scan_keys(self.blocking, self.graph_collection, modality=Modality.GRAPH)
 
     def __len__(self) -> int:
         return sum(1 for _ in self)
@@ -302,10 +302,10 @@ class Graph:
         if self.edges_collection is not None:
             found = self.blocking.graph_read_edges(keys, Arena(), role=Role.ANY, collection=self.graph_collection)
             identifiers = [edge for index in range(len(keys)) for _, _, edge in triples_of(found, index)]
-            self.blocking.remove(identifiers, collection=self.edges_collection)
+            self.blocking.docs_remove(identifiers, collection=self.edges_collection)
         self.blocking.graph_remove_vertices(keys, collection=self.graph_collection)
         if self.nodes_collection is not None:
-            self.blocking.remove(keys, collection=self.nodes_collection)
+            self.blocking.docs_remove(keys, collection=self.nodes_collection)
 
     # endregion Vertices
 
@@ -443,7 +443,7 @@ class Graph:
                 removed_sources, removed_targets, edges=removed_edges, collection=self.graph_collection
             )
             if self.edges_collection is not None:
-                self.blocking.remove(removed_edges, collection=self.edges_collection)
+                self.blocking.docs_remove(removed_edges, collection=self.edges_collection)
         return len(removed)
 
     def remove_edge(self, source: KeyLike, target: KeyLike) -> None:
@@ -527,8 +527,8 @@ class Graph:
                 sources, targets, identifiers = zip(*stored, strict=True)
                 self.blocking.graph_remove_edges(sources, targets, edges=identifiers, collection=self.graph_collection)
         if self.edges_collection is not None:
-            for page in batched(scan_keys(self.blocking, self.edges_collection), PAGE_KEYS):
-                self.blocking.remove(page, collection=self.edges_collection)
+            for page in batched(scan_keys(self.blocking, self.edges_collection, modality=Modality.DOCS), PAGE_KEYS):
+                self.blocking.docs_remove(page, collection=self.edges_collection)
         self.next_edge_id = None
 
     def clear(self) -> None:
@@ -537,8 +537,8 @@ class Graph:
             self.blocking.graph_remove_vertices(page, collection=self.graph_collection)
         for collection in (self.nodes_collection, self.edges_collection):
             if collection is not None:
-                for page in batched(scan_keys(self.blocking, collection), PAGE_KEYS):
-                    self.blocking.remove(page, collection=collection)
+                for page in batched(scan_keys(self.blocking, collection, modality=Modality.DOCS), PAGE_KEYS):
+                    self.blocking.docs_remove(page, collection=collection)
         self.next_edge_id = None
 
     # endregion Edges

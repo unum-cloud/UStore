@@ -20,7 +20,7 @@
 
 namespace unum::ustore {
 
-/** A stream of every edge in a graph, pulled one page of vertices at a time from the cursor of its vertex stream and
+/** A stream of every edge in a graph, pulled one page of vertices at a time from the vertex scans of its stream and
  *  in no particular order, the vertices into the arena of that stream and their edges into an arena of its own, as a
  *  read never takes its inputs from the arena it rewinds. It owns both for its lifetime as shorthand for a range-based
  *  loop, with no place for an arena. A default-constructed stream is at the end. */
@@ -87,7 +87,8 @@ class graph_stream_t {
     static expected<graph_stream_t> make(receiver_t receiver, ustore_collection_id_t collection,
                                          ustore_vertex_role_t role, ustore_key_t start,
                                          std::size_t read_ahead = keys_stream_t::default_read_ahead_k) noexcept {
-        auto [vertex_stream, vertex_stream_status] = keys_stream_t::make(receiver, collection, start, read_ahead);
+        auto [vertex_stream, vertex_stream_status] = keys_stream_t::make(receiver, collection, start, read_ahead,
+                                                                         ustore_modality_graph_k);
         if (vertex_stream_status.failed()) return vertex_stream_status;
         auto [arena, arena_status] = arena_t::make(receiver.executor);
         if (arena_status.failed()) return arena_status;

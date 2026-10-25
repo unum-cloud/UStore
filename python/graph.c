@@ -542,6 +542,32 @@ PyObject* ustore_py_api_graph_remove_vertices(PyObject* self, PyObject* const* a
     return ustore_py_call_run(&context, &vertices_remove_verb, call, &remove);
 }
 
+char const doc_graph_scan_vertices[] =                                                                      //
+    "graph_scan_vertices(start, wanted, arena, *, collection=None, mode=ScanMode.ORDERED, progress=None)\n" //
+    "answers a Keys tape.\n"                                                                                //
+    "\n"                                                                                                    //
+    "Lists up to `wanted` vertices from `start` upwards, those without edges included.\n"                   //
+    "Edges are not exported, so a `graph_read_edges` follows the scan.\n"                                   //
+    "\n"                                                                                                    //
+    "Args:\n"                                                                                               //
+    "  start (KeyLike): The smallest vertex the scan may return.\n"                                         //
+    "  wanted (int): Most vertices the scan returns.\n"                                                     //
+    "  arena (Arena): Where the vertices land, rewound by this call.\n"                                     //
+    "  collection (UUID | str, optional): The graph collection, by identifier or by name.\n"                //
+    "  mode (ScanMode, optional): In what order the vertices come, as `scan` takes it.\n"                   //
+    "  progress (Callable[[int, int], bool | None], optional): Called with the scans\n"                     //
+    "    finished and the scans in all; a falsy answer other than None cancels the call.\n"                 //
+    "Returns:\n"                                                                                            //
+    "  Keys: One run of vertices, in ascending order.\n"                                                    //
+    "Raises:\n"                                                                                             //
+    "  CancelledError: The progress callable stopped the scan.";
+
+PyObject* ustore_py_api_graph_scan_vertices(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                                            PyObject* args_names_tuple) {
+    return ustore_py_api_scan_of(self, args, positional_args_count, args_names_tuple, "graph_scan_vertices",
+                                 ustore_modality_graph_k);
+}
+
 #pragma endregion Vertices
 
 #pragma region Neighborhood Tapes

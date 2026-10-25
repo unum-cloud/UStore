@@ -340,9 +340,30 @@ static void remove_release(void* erased) {
 ustore_py_verb_t const ustore_py_remove_verb = {sizeof(ustore_py_remove_call_t), remove_submit,
                                                 ustore_py_call_answer_none, remove_release};
 
+static void docs_remove_submit(void* arguments) { ustore_docs_remove((ustore_docs_remove_t*)arguments); }
+
+// It answers and releases as a removal of values does, so a call opened for either runs through either
+static ustore_py_verb_t const docs_remove_verb = {sizeof(ustore_py_remove_call_t), docs_remove_submit,
+                                                  ustore_py_call_answer_none, remove_release};
+
 PyObject* ustore_py_values_remove(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
-                                  ustore_py_remove_call_t* call) {
+                                  ustore_modality_t modality, ustore_py_remove_call_t* call) {
     call->call.collection = options->collection;
+    if (modality == ustore_modality_docs_k) {
+        ustore_docs_remove_t remove = {
+            .database = context->database_handle,
+            .executor = ustore_py_context_executor(context),
+            .outcome = &call->call.outcome,
+            .completion = context->completion,
+            .transaction = context->transaction,
+            .count = call->keys.count,
+            .collections = {&call->call.collection, 0},
+            .keys = {call->keys.keys, sizeof(ustore_key_t)},
+            .durability = options->durability,
+            .watch = context->watch,
+        };
+        return ustore_py_call_run(context, &docs_remove_verb, call, &remove);
+    }
     ustore_blobs_remove_t remove = {
         .database = context->database_handle,
         .executor = ustore_py_context_executor(context),
@@ -434,15 +455,16 @@ PyObject* ustore_py_api_set(PyObject* self, PyObject* const* args, Py_ssize_t po
     return ustore_py_values_write(&context, &options, call);
 }
 
-char const doc_remove[] =                                                                    //
-    "remove(keys, *, collection=None, durability=Durability.BUFFERED) answers None.\n"       //
-    "\n"                                                                                     //
-    "Removes a batch of keys with their values or documents, or one key given on its own.\n" //
-    "\n"                                                                                     //
-    "Args:\n"                                                                                //
-    "  keys (KeyLike | Sequence[KeyLike] | buffer): The keys to remove.\n"                   //
-    "  collection (UUID | str, optional): The collection, by identifier or by name.\n"       //
-    "  durability (Durability, optional): `Durability.FLUSHED` reaches the drive before\n"   //
+char const doc_remove[] =                                                                  //
+    "remove(keys, *, collection=None, durability=Durability.BUFFERED) answers None.\n"     //
+    "\n"                                                                                   //
+    "Removes a batch of keys with their values, or one key given on its own, while\n"      //
+    "`docs_remove` removes documents.\n"                                                   //
+    "\n"                                                                                   //
+    "Args:\n"                                                                              //
+    "  keys (KeyLike | Sequence[KeyLike] | buffer): The keys to remove.\n"                 //
+    "  collection (UUID | str, optional): The collection, by identifier or by name.\n"     //
+    "  durability (Durability, optional): `Durability.FLUSHED` reaches the drive before\n" //
     "    returning.";
 
 PyObject* ustore_py_api_remove(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
@@ -460,7 +482,7 @@ PyObject* ustore_py_api_remove(PyObject* self, PyObject* const* args, Py_ssize_t
     if (!call) return NULL;
     if (ustore_py_keys_from_subscript(args[0], &call->keys) < 0)
         return ustore_py_call_discard(&context, &ustore_py_remove_verb, call);
-    return ustore_py_values_remove(&context, &options, call);
+    return ustore_py_values_remove(&context, &options, ustore_modality_blobs_k, call);
 }
 
 #pragma endregion Writes
@@ -536,17 +558,74 @@ static void sample_submit(void* arguments) {
     if (sample->count) ustore_blobs_sample(sample);
 }
 
+static void docs_scan_submit(void* arguments) {
+    ustore_docs_scan_t* const scan = (ustore_docs_scan_t*)arguments;
+    if (scan->count) ustore_docs_scan(scan);
+}
+
+static void vertices_scan_submit(void* arguments) {
+    ustore_graph_scan_vertices_t* const scan = (ustore_graph_scan_vertices_t*)arguments;
+    if (scan->count) ustore_graph_scan_vertices(scan);
+}
+
 static ustore_py_verb_t const scan_verb = {sizeof(keys_call_t), scan_submit, keys_answer, keys_release};
+
+// They answer and release as a scan of keys does, so a call opened for one runs through any of them
+static ustore_py_verb_t const docs_scan_verb = {sizeof(keys_call_t), docs_scan_submit, keys_answer, keys_release};
+static ustore_py_verb_t const vertices_scan_verb = {sizeof(keys_call_t), vertices_scan_submit, keys_answer,
+                                                    keys_release};
 
 static ustore_py_verb_t const sample_verb = {sizeof(keys_call_t), sample_submit, keys_answer, keys_release};
 
-/** Runs the scans gathered into @p call, reporting to @p progress and claiming @p arena for their keys. */
-static PyObject* keys_scan(ustore_py_context_t const* context, ustore_py_verb_options_t const* options, size_t wanted,
-                           ustore_scan_mode_t mode, PyObject* progress, keys_call_t* call, PyObject* arena) {
+/** Runs the scans gathered into @p call through the scan of @p modality, reporting to @p progress and claiming
+ *  @p arena for their keys. */
+static PyObject* keys_scan(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
+                           ustore_modality_t modality, size_t wanted, ustore_scan_mode_t mode, PyObject* progress,
+                           keys_call_t* call, PyObject* arena) {
     if (ustore_py_arena_claim(arena, &call->call.arena) != 0) return ustore_py_call_discard(context, &scan_verb, call);
     call->call.collection = options->collection;
     call->call.progress = Py_XNewRef(progress);
     call->tasks = call->starts.count;
+    if (modality == ustore_modality_docs_k) {
+        ustore_docs_scan_t scan = {
+            .database = context->database_handle,
+            .executor = ustore_py_context_executor(context),
+            .outcome = &call->call.outcome,
+            .completion = context->completion,
+            .view = context->view,
+            .count = call->tasks,
+            .collections = {&call->call.collection, 0},
+            .start_keys = {call->starts.keys, sizeof(ustore_key_t)},
+            .offsets = &call->offsets,
+            .keys = &call->keys,
+            .arena = ustore_py_arena_handle(call->call.arena),
+            .wanted = wanted,
+            .mode = mode,
+            .progress = ustore_py_progress_callback(&call->call),
+            .progress_state = &call->call,
+        };
+        return ustore_py_call_run(context, &docs_scan_verb, call, &scan);
+    }
+    if (modality == ustore_modality_graph_k) {
+        ustore_graph_scan_vertices_t scan = {
+            .database = context->database_handle,
+            .executor = ustore_py_context_executor(context),
+            .outcome = &call->call.outcome,
+            .completion = context->completion,
+            .view = context->view,
+            .count = call->tasks,
+            .collections = {&call->call.collection, 0},
+            .start_keys = {call->starts.keys, sizeof(ustore_key_t)},
+            .offsets = &call->offsets,
+            .keys = &call->keys,
+            .arena = ustore_py_arena_handle(call->call.arena),
+            .wanted = wanted,
+            .mode = mode,
+            .progress = ustore_py_progress_callback(&call->call),
+            .progress_state = &call->call,
+        };
+        return ustore_py_call_run(context, &vertices_scan_verb, call, &scan);
+    }
     ustore_blobs_scan_t scan = {
         .database = context->database_handle,
         .executor = ustore_py_context_executor(context),
@@ -589,22 +668,22 @@ char const doc_scan[] =                                                         
     "  CancelledError: The progress callable stopped the scan.";
 
 PyObject* ustore_py_keys_scan(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
-                              ustore_key_t const* start, size_t wanted, ustore_scan_mode_t mode, PyObject* progress,
-                              PyObject* arena) {
+                              ustore_modality_t modality, ustore_key_t const* start, size_t wanted,
+                              ustore_scan_mode_t mode, PyObject* progress, PyObject* arena) {
     keys_call_t stack;
     keys_call_t* const call = ustore_py_call_open(context, &scan_verb, &stack);
     if (!call) return NULL;
     call->starts.inline_keys[0] = *start;
     call->starts.keys = call->starts.inline_keys;
     call->starts.count = 1;
-    return keys_scan(context, options, wanted, mode, progress, call, arena);
+    return keys_scan(context, options, modality, wanted, mode, progress, call, arena);
 }
 
-PyObject* ustore_py_api_scan(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
-                             PyObject* args_names_tuple) {
+PyObject* ustore_py_api_scan_of(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                                PyObject* args_names_tuple, char const* name, ustore_modality_t modality) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
-    if (ustore_py_args_names_count_checked("scan", positional_args_count, args_names_tuple, 3) < 0) return NULL;
+    if (ustore_py_args_names_count_checked(name, positional_args_count, args_names_tuple, 3) < 0) return NULL;
 
     ustore_py_verb_options_t options;
     ustore_scan_mode_t mode = ustore_scan_ordered_k;
@@ -617,7 +696,12 @@ PyObject* ustore_py_api_scan(PyObject* self, PyObject* const* args, Py_ssize_t p
     size_t wanted = 0;
     if (ustore_py_key_from_object(args[0], &start) != 0) return NULL;
     if (ustore_py_size_from_object(args[1], "wanted", &wanted) != 0) return NULL;
-    return ustore_py_keys_scan(&context, &options, &start, wanted, mode, progress, args[2]);
+    return ustore_py_keys_scan(&context, &options, modality, &start, wanted, mode, progress, args[2]);
+}
+
+PyObject* ustore_py_api_scan(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                             PyObject* args_names_tuple) {
+    return ustore_py_api_scan_of(self, args, positional_args_count, args_names_tuple, "scan", ustore_modality_blobs_k);
 }
 
 char const doc_scan_batch[] =                                                                       //
@@ -663,7 +747,7 @@ PyObject* ustore_py_api_scan_batch(PyObject* self, PyObject* const* args, Py_ssi
     if (!call) return NULL;
     if (ustore_py_keys_from_object(args[0], &call->starts) != 0)
         return ustore_py_call_discard(&context, &scan_verb, call);
-    return keys_scan(&context, &options, wanted, mode, progress, call, args[2]);
+    return keys_scan(&context, &options, ustore_modality_blobs_k, wanted, mode, progress, call, args[2]);
 }
 
 /** Runs @p tasks samples of up to @p wanted keys each, claiming @p arena for their keys. */

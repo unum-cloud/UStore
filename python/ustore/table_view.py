@@ -21,7 +21,7 @@ import numpy as np
 import pandas
 
 from ustore.keys import PAGE_KEYS, KeyLike, as_key, scan_keys
-from ustore.lib import Arena, Columns, Database, FieldType, Modification, Transaction, View
+from ustore.lib import Arena, Columns, Database, FieldType, Modality, Modification, Transaction, View
 
 type Receiver = Database | Transaction | View
 
@@ -203,7 +203,7 @@ class Table:
         """The keys of the rows, in ascending order unless the view was narrowed to others."""
         if self.selected_index is not None:
             return list(self.selected_index)
-        return list(scan_keys(self.view, self.collection))
+        return list(scan_keys(self.view, self.collection, modality=Modality.DOCS))
 
     @property
     def columns(self) -> list[str]:

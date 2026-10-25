@@ -2,18 +2,18 @@
  *  @file src/pages.cpp
  *  @author Ash Vardanian
  *  @date September 27, 2026
- *  @brief Implements `c/ustore/pages.h`: the pages modality over the blobs calls of any engine, routing the page calls
- *      to their engine, and the spelling of page encodings.
+ *  @brief Implements `c/ustore/pages.h`: the pages modality over the whole-value verbs of the one engine serving it,
+ *      routing the page calls to their engine, and the spelling of page encodings.
  *
  *  Every page reads as one value in its collection, its current shape: the dense element tree of
  *  `ustore/pages/element_tree.hpp` under the page key, so rendering a page is one read and one decode.
  *
  *  An edit call reads the trees of the pages it touches and applies its tasks in order by the forgiving rules of
- *  `page_fold.hpp`. An engine keeping every page as one value, served by the `*_in_page_values` calls, reads the pages
- *  watched in a transaction, writes every tree back in one blobs write, then removes the pages the call removed. An
- *  engine keeping a page as its edits, served by the `*_in_page_edits` calls, reads them unwatched, since the fold lets
- *  concurrent edits of one page land, and commits the edits of every page as one chain. An edit naming a missing page
- *  answers @c status_code_t::not_found_k, as a modification of a missing document does, while an edit of a missing
+ *  `page_fold.hpp`. An engine keeping every page as one value, served by the `*_over_blobs` verbs, reads the pages
+ *  watched in a transaction, writes every tree back in one write, then removes the pages the call removed. An engine
+ *  keeping a page as its edits takes the chains of the `*_edits` calls, which read the pages unwatched, since the fold
+ *  lets concurrent edits of one page land, and commits the edits of every page as one chain. An edit naming a missing
+ *  page answers @c status_code_t::not_found_k, as a modification of a missing document does, while an edit of a missing
  *  element inside a page does nothing, as the fold does for racing edits. A Nil element removes the whole page.
  *
  *  Every call places its edits at one stamp, the wall clock in nanoseconds or one past the newest placement in the
@@ -49,7 +49,7 @@
 #include "ustore/utilities/algorithm.hpp"   // `offset_in_sorted`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_allocator`
 
-#include "engine.hpp"             // `engine_of`, `view_t`, `pages_import_in_page_values`
+#include "engine.hpp"             // `blobs_verbs_t`, `view_t`, `page_edits_t`, `pages_import_over_blobs`
 #include "lib.hpp"                // `route`, `enumerator_spelling`, `name_in`, `value_in`
 #include "utilities/batches.hpp"  // `strings_arg_t`, `places_of`, `validate_remove`
 #include "utilities/outputs.hpp"  // `read_outputs_t`
@@ -159,9 +159,10 @@ struct touched_pages_t {
     std::span<std::size_t> pages_of_tasks;
 };
 
-/** Reads the pages @p places address through @p view, each distinct page once, decoding every tree. */
-static expected<touched_pages_t> read_touched_pages(ustore_database_t database, place_batch_t const& places,
-                                                    view_t const& view) noexcept {
+/** Reads the pages @p places address through @p view with the engine's own @p values_verbs, each distinct page once,
+ *  decoding every tree. */
+static expected<touched_pages_t> read_touched_pages(blobs_verbs_t const& values_verbs, ustore_database_t database,
+                                                    place_batch_t const& places, view_t const& view) noexcept {
     ustore_arena_t const scratch = view.scratch;
     auto [distinct, distinct_status] = arena_allocate<collection_key_t>(scratch, places.count);
     if (distinct_status.failed()) return distinct_status;
@@ -190,7 +191,7 @@ static expected<touched_pages_t> read_touched_pages(ustore_database_t database, 
     read.presences = &presences;
     read.values = &contents;
     read.arena = scratch;
-    if (status_t const status = engine_of(database).blobs_read(read, view); status.failed()) return status;
+    if (status_t const status = values_verbs.read(read, view); status.failed()) return status;
     values_view_t const found {count, presences, contents};
 
     auto [pages, pages_status] = arena_allocate<touched_page_t>(scratch, count);
@@ -204,10 +205,11 @@ static expected<touched_pages_t> read_touched_pages(ustore_database_t database, 
     return touched_pages_t {pages, pages_of_tasks};
 }
 
-/** Writes every tree of @p pages that exists in one write through @p view, then removes the pages that stopped
- *  existing. */
-static status_t write_touched_pages(ustore_database_t database, std::span<touched_page_t> pages,
-                                    ustore_durability_t durability, ustore_watch_t watch, view_t const& view) noexcept {
+/** Writes every tree of @p pages that exists in one write through @p view with the engine's own @p values_verbs, then
+ *  removes the pages that stopped existing. */
+static status_t write_touched_pages(blobs_verbs_t const& values_verbs, ustore_database_t database,
+                                    std::span<touched_page_t> pages, ustore_durability_t durability,
+                                    ustore_watch_t watch, view_t const& view) noexcept {
     ustore_arena_t const scratch = view.scratch;
     std::size_t const count = pages.size();
     auto [collections, collections_status] = arena_allocate<ustore_collection_id_t>(scratch, count);
@@ -241,8 +243,7 @@ static status_t write_touched_pages(ustore_database_t database, std::span<touche
         write.values = written_values.view;
         write.durability = durability;
         write.watch = watch;
-        if (status_t const status = engine_of(database).blobs_write(write, written_values, view); status.failed())
-            return status;
+        if (status_t const status = values_verbs.write(write, written_values, view); status.failed()) return status;
     }
     if (!removed) return {};
 
@@ -257,42 +258,48 @@ static status_t write_touched_pages(ustore_database_t database, std::span<touche
     remove.keys = {keys.data(), sizeof(ustore_key_t)};
     remove.durability = durability;
     remove.watch = watch;
-    return engine_of(database).blobs_remove(remove, view);
+    return values_verbs.remove(remove, view);
 }
 
-/** Lands an edit call on an engine keeping every page as one value, reading the pages watched, as a transaction
- *  watches the pages it rewrites whatever the caller asked of the writes, and writing every tree back. */
+/** Lands an edit call on an engine keeping every page as one value, reading the pages watched through its own
+ *  @c values_verbs, as a transaction watches the pages it rewrites whatever the caller asked of the writes, and
+ *  writing every tree back through them. */
 struct rewritten_pages_t {
     static constexpr ustore_watch_t reads_watch_k = ustore_watch_keys_k;
 
+    blobs_verbs_t const& values_verbs;
+
     template <typename arguments_type_>
     status_t operator()(arguments_type_ const& arguments, std::span<touched_page_t> pages,
                         view_t const& view) const noexcept {
-        return write_touched_pages(arguments.database, pages, arguments.durability, arguments.watch, view);
+        return write_touched_pages(values_verbs, arguments.database, pages, arguments.durability, arguments.watch,
+                                   view);
     }
 };
 
-/** Lands an edit call on an engine keeping a page as its edits, reading the pages unwatched and handing the edits of
- *  every page to @c commit as one chain. */
+/** Lands an edit call on an engine keeping a page as its edits, reading the pages unwatched through its own
+ *  @c values_verbs and encoding the edits of every page as one chain into @c chains, which the engine commits. */
 struct appended_edits_t {
     static constexpr ustore_watch_t reads_watch_k = ustore_watch_none_k;
 
-    /** The engine's commit of the chains. */
-    page_edits_commit_t commit;
+    blobs_verbs_t const& values_verbs;
+
+    /** The chain of every page the call touched, in the scratch of the call. */
+    std::span<page_edits_t const>& chains;
 
     template <typename arguments_type_>
-    status_t operator()(arguments_type_ const& arguments, std::span<touched_page_t> pages,
-                        view_t const& view) const noexcept {
-        auto [chains, chains_status] = arena_allocate<page_edits_t>(view.scratch, pages.size());
-        if (chains_status.failed()) return chains_status;
+    status_t operator()(arguments_type_ const&, std::span<touched_page_t> pages, view_t const& view) const noexcept {
+        auto [encoded, encoded_status] = arena_allocate<page_edits_t>(view.scratch, pages.size());
+        if (encoded_status.failed()) return encoded_status;
         page_allocator_t allocator {view.scratch};
         for (std::size_t index = 0; index != pages.size(); ++index) {
             touched_page_t const& page = pages[index];
             auto [chain, chain_status] = pages::encode_edits(std::span<pages::edit_t const> {page.edits}, allocator);
             if (chain_status.failed()) return chain_status;
-            chains[index] = page_edits_t {page.place.collection, page.place.key, chain};
+            encoded[index] = page_edits_t {page.place.collection, page.place.key, chain};
         }
-        return commit(arguments.database, chains, arguments.durability, view);
+        chains = encoded;
+        return {};
     }
 };
 
@@ -302,8 +309,8 @@ concept edit_maker =
     std::is_invocable_r_v<expected<pages::edit_t>, edit_maker_type_&, std::size_t, pages::placement_t, touched_page_t&>;
 
 /**
- *  @brief Applies the edit @p make_edit answers for every task of @p arguments, in order, to the pages they name, and
- *      lands them through @p land.
+ *  @brief Applies the edit @p make_edit answers for every task of @p arguments, in order, to the pages they name, read
+ *      through the values verbs of @p land, and lands them through @p land.
  *
  *  Refuses an edit of a missing page, other than an import or the removal of a whole page, with
  *  @c status_code_t::not_found_k, and writes nothing on any failure.
@@ -321,7 +328,7 @@ static status_t edit_pages(arguments_type_ const& arguments, view_t const& view,
 
     view_t reading = view;
     reading.watch = lander_type_::reads_watch_k;
-    auto [touched, touched_status] = read_touched_pages(arguments.database, places, reading);
+    auto [touched, touched_status] = read_touched_pages(land.values_verbs, arguments.database, places, reading);
     if (touched_status.failed()) return touched_status;
 
     std::uint64_t newest = 0;
@@ -504,78 +511,112 @@ static status_t serve_remove_attributes(ustore_pages_remove_attributes_t const& 
 
 #pragma region Page Calls
 
-status_t pages_import_in_page_values(ustore_pages_import_t const& arguments, strings_arg_t const& values,
-                                     view_t const& view) noexcept {
-    return serve_import(arguments, values, view, rewritten_pages_t {});
+status_t pages_import_over_blobs(blobs_verbs_t const& values_verbs, ustore_pages_import_t const& arguments,
+                                 strings_arg_t const& values, view_t const& view) noexcept {
+    return serve_import(arguments, values, view, rewritten_pages_t {values_verbs});
 }
 
-status_t pages_insert_in_page_values(ustore_pages_insert_t const& arguments, strings_arg_t const& values,
-                                     view_t const& view) noexcept {
-    return serve_insert(arguments, values, view, rewritten_pages_t {});
+status_t pages_insert_over_blobs(blobs_verbs_t const& values_verbs, ustore_pages_insert_t const& arguments,
+                                 strings_arg_t const& values, view_t const& view) noexcept {
+    return serve_insert(arguments, values, view, rewritten_pages_t {values_verbs});
 }
 
-status_t pages_remove_in_page_values(ustore_pages_remove_t const& arguments, view_t const& view) noexcept {
-    return serve_remove(arguments, view, rewritten_pages_t {});
+status_t pages_remove_over_blobs(blobs_verbs_t const& values_verbs, ustore_pages_remove_t const& arguments,
+                                 view_t const& view) noexcept {
+    return serve_remove(arguments, view, rewritten_pages_t {values_verbs});
 }
 
-status_t pages_move_in_page_values(ustore_pages_move_t const& arguments, view_t const& view) noexcept {
-    return serve_move(arguments, view, rewritten_pages_t {});
+status_t pages_move_over_blobs(blobs_verbs_t const& values_verbs, ustore_pages_move_t const& arguments,
+                               view_t const& view) noexcept {
+    return serve_move(arguments, view, rewritten_pages_t {values_verbs});
 }
 
-status_t pages_splice_in_page_values(ustore_pages_splice_t const& arguments, strings_arg_t const& values,
-                                     view_t const& view) noexcept {
-    return serve_splice(arguments, values, view, rewritten_pages_t {});
+status_t pages_splice_over_blobs(blobs_verbs_t const& values_verbs, ustore_pages_splice_t const& arguments,
+                                 strings_arg_t const& values, view_t const& view) noexcept {
+    return serve_splice(arguments, values, view, rewritten_pages_t {values_verbs});
 }
 
-status_t pages_set_attributes_in_page_values(ustore_pages_set_attributes_t const& arguments,
-                                             strings_arg_t const& fields, strings_arg_t const& values,
-                                             view_t const& view) noexcept {
-    return serve_set_attributes(arguments, fields, values, view, rewritten_pages_t {});
+status_t pages_set_attributes_over_blobs(blobs_verbs_t const& values_verbs,
+                                         ustore_pages_set_attributes_t const& arguments, strings_arg_t const& fields,
+                                         strings_arg_t const& values, view_t const& view) noexcept {
+    return serve_set_attributes(arguments, fields, values, view, rewritten_pages_t {values_verbs});
 }
 
-status_t pages_remove_attributes_in_page_values(ustore_pages_remove_attributes_t const& arguments,
-                                                strings_arg_t const& fields, view_t const& view) noexcept {
-    return serve_remove_attributes(arguments, fields, view, rewritten_pages_t {});
+status_t pages_remove_attributes_over_blobs(blobs_verbs_t const& values_verbs,
+                                            ustore_pages_remove_attributes_t const& arguments,
+                                            strings_arg_t const& fields, view_t const& view) noexcept {
+    return serve_remove_attributes(arguments, fields, view, rewritten_pages_t {values_verbs});
 }
 
-status_t pages_import_in_page_edits(ustore_pages_import_t const& arguments, strings_arg_t const& values,
-                                    view_t const& view, page_edits_commit_t commit) noexcept {
-    return serve_import(arguments, values, view, appended_edits_t {commit});
+expected<std::span<page_edits_t const>> pages_import_edits(blobs_verbs_t const& values_verbs,
+                                                           ustore_pages_import_t const& arguments,
+                                                           strings_arg_t const& values, view_t const& view) noexcept {
+    std::span<page_edits_t const> chains;
+    status_t const status = serve_import(arguments, values, view, appended_edits_t {values_verbs, chains});
+    if (status.failed()) return status;
+    return chains;
 }
 
-status_t pages_insert_in_page_edits(ustore_pages_insert_t const& arguments, strings_arg_t const& values,
-                                    view_t const& view, page_edits_commit_t commit) noexcept {
-    return serve_insert(arguments, values, view, appended_edits_t {commit});
+expected<std::span<page_edits_t const>> pages_insert_edits(blobs_verbs_t const& values_verbs,
+                                                           ustore_pages_insert_t const& arguments,
+                                                           strings_arg_t const& values, view_t const& view) noexcept {
+    std::span<page_edits_t const> chains;
+    status_t const status = serve_insert(arguments, values, view, appended_edits_t {values_verbs, chains});
+    if (status.failed()) return status;
+    return chains;
 }
 
-status_t pages_remove_in_page_edits(ustore_pages_remove_t const& arguments, view_t const& view,
-                                    page_edits_commit_t commit) noexcept {
-    return serve_remove(arguments, view, appended_edits_t {commit});
+expected<std::span<page_edits_t const>> pages_remove_edits(blobs_verbs_t const& values_verbs,
+                                                           ustore_pages_remove_t const& arguments,
+                                                           view_t const& view) noexcept {
+    std::span<page_edits_t const> chains;
+    status_t const status = serve_remove(arguments, view, appended_edits_t {values_verbs, chains});
+    if (status.failed()) return status;
+    return chains;
 }
 
-status_t pages_move_in_page_edits(ustore_pages_move_t const& arguments, view_t const& view,
-                                  page_edits_commit_t commit) noexcept {
-    return serve_move(arguments, view, appended_edits_t {commit});
+expected<std::span<page_edits_t const>> pages_move_edits(blobs_verbs_t const& values_verbs,
+                                                         ustore_pages_move_t const& arguments,
+                                                         view_t const& view) noexcept {
+    std::span<page_edits_t const> chains;
+    status_t const status = serve_move(arguments, view, appended_edits_t {values_verbs, chains});
+    if (status.failed()) return status;
+    return chains;
 }
 
-status_t pages_splice_in_page_edits(ustore_pages_splice_t const& arguments, strings_arg_t const& values,
-                                    view_t const& view, page_edits_commit_t commit) noexcept {
-    return serve_splice(arguments, values, view, appended_edits_t {commit});
+expected<std::span<page_edits_t const>> pages_splice_edits(blobs_verbs_t const& values_verbs,
+                                                           ustore_pages_splice_t const& arguments,
+                                                           strings_arg_t const& values, view_t const& view) noexcept {
+    std::span<page_edits_t const> chains;
+    status_t const status = serve_splice(arguments, values, view, appended_edits_t {values_verbs, chains});
+    if (status.failed()) return status;
+    return chains;
 }
 
-status_t pages_set_attributes_in_page_edits(ustore_pages_set_attributes_t const& arguments, strings_arg_t const& fields,
-                                            strings_arg_t const& values, view_t const& view,
-                                            page_edits_commit_t commit) noexcept {
-    return serve_set_attributes(arguments, fields, values, view, appended_edits_t {commit});
+expected<std::span<page_edits_t const>> pages_set_attributes_edits(blobs_verbs_t const& values_verbs,
+                                                                   ustore_pages_set_attributes_t const& arguments,
+                                                                   strings_arg_t const& fields,
+                                                                   strings_arg_t const& values,
+                                                                   view_t const& view) noexcept {
+    std::span<page_edits_t const> chains;
+    status_t const status = serve_set_attributes(arguments, fields, values, view,
+                                                 appended_edits_t {values_verbs, chains});
+    if (status.failed()) return status;
+    return chains;
 }
 
-status_t pages_remove_attributes_in_page_edits(ustore_pages_remove_attributes_t const& arguments,
-                                               strings_arg_t const& fields, view_t const& view,
-                                               page_edits_commit_t commit) noexcept {
-    return serve_remove_attributes(arguments, fields, view, appended_edits_t {commit});
+expected<std::span<page_edits_t const>> pages_remove_attributes_edits(blobs_verbs_t const& values_verbs,
+                                                                      ustore_pages_remove_attributes_t const& arguments,
+                                                                      strings_arg_t const& fields,
+                                                                      view_t const& view) noexcept {
+    std::span<page_edits_t const> chains;
+    status_t const status = serve_remove_attributes(arguments, fields, view, appended_edits_t {values_verbs, chains});
+    if (status.failed()) return status;
+    return chains;
 }
 
-status_t pages_read_in_page_values(ustore_pages_read_t const& arguments, view_t const& view) noexcept {
+status_t pages_read_over_blobs(blobs_verbs_t const& values_verbs, ustore_pages_read_t const& arguments,
+                               view_t const& view) noexcept {
     if (!arguments.count) return {};
     if (!arguments.keys.data) return {status_code_t::invalid_argument_k, "No keys were provided"};
     bool const renders = arguments.values || arguments.lengths;
@@ -596,7 +637,7 @@ status_t pages_read_in_page_values(ustore_pages_read_t const& arguments, view_t 
     read.presences = &presences;
     read.values = &contents;
     read.arena = view.scratch;
-    if (status_t const status = engine_of(arguments.database).blobs_read(read, view); status.failed()) return status;
+    if (status_t const status = values_verbs.read(read, view); status.failed()) return status;
     values_view_t const found {arguments.count, presences, contents};
 
     auto [outputs, outputs_status] = read_outputs_t::make(arguments, view.scratch);
@@ -646,18 +687,27 @@ constexpr enumerator_spelling<ustore_page_encoding_t> page_encoding_names_k[] {
 
 } // namespace unum::ustore
 
-void ustore_pages_import(ustore_pages_import_t* arguments) { route<&engine_t::pages_import>(arguments); }
-void ustore_pages_insert(ustore_pages_insert_t* arguments) { route<&engine_t::pages_insert>(arguments); }
-void ustore_pages_remove(ustore_pages_remove_t* arguments) { route<&engine_t::pages_remove>(arguments); }
-void ustore_pages_move(ustore_pages_move_t* arguments) { route<&engine_t::pages_move>(arguments); }
-void ustore_pages_splice(ustore_pages_splice_t* arguments) { route<&engine_t::pages_splice>(arguments); }
+void ustore_pages_import(ustore_pages_import_t* arguments) {
+    route<&engine_t::pages, &pages_verbs_t::import>(arguments);
+}
+void ustore_pages_insert(ustore_pages_insert_t* arguments) {
+    route<&engine_t::pages, &pages_verbs_t::insert>(arguments);
+}
+void ustore_pages_remove(ustore_pages_remove_t* arguments) {
+    route<&engine_t::pages, &pages_verbs_t::remove>(arguments);
+}
+void ustore_pages_move(ustore_pages_move_t* arguments) { route<&engine_t::pages, &pages_verbs_t::move>(arguments); }
+void ustore_pages_splice(ustore_pages_splice_t* arguments) {
+    route<&engine_t::pages, &pages_verbs_t::splice>(arguments);
+}
 void ustore_pages_set_attributes(ustore_pages_set_attributes_t* arguments) {
-    route<&engine_t::pages_set_attributes>(arguments);
+    route<&engine_t::pages, &pages_verbs_t::set_attributes>(arguments);
 }
 void ustore_pages_remove_attributes(ustore_pages_remove_attributes_t* arguments) {
-    route<&engine_t::pages_remove_attributes>(arguments);
+    route<&engine_t::pages, &pages_verbs_t::remove_attributes>(arguments);
 }
-void ustore_pages_read(ustore_pages_read_t* arguments) { route<&engine_t::pages_read>(arguments); }
+void ustore_pages_read(ustore_pages_read_t* arguments) { route<&engine_t::pages, &pages_verbs_t::read>(arguments); }
+void ustore_pages_scan(ustore_pages_scan_t* arguments) { route<&engine_t::pages, &pages_verbs_t::scan>(arguments); }
 
 char const* ustore_page_encoding_name(ustore_page_encoding_t encoding) {
     return name_in(page_encoding_names_k, encoding);

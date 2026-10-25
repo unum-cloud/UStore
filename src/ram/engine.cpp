@@ -444,6 +444,38 @@ store_status_t for_each_run(source_type_& source, strided_iterator<ustore_collec
 template <typename store_type_>
 using entry_of = typename std::remove_cvref_t<store_type_>::value_t;
 
+/** Refuses into @p outcome a collection whose store holds entries of another modality than the call serves. */
+inline store_status_t refused_modality(status_t& outcome) noexcept {
+    outcome = collection_holds_another_modality();
+    return store_status_t::invalid_argument_k;
+}
+
+/** The resolver of this engine at @p isolation_, which every checked verb and every layer over blobs runs first,
+ *  reading the catalog as @p view sees it. */
+template <isolation_t isolation_>
+status_t resolve_modality(ustore_database_t database, ustore_collections_view_t collections, ustore_size_t count,
+                          ustore_modality_t modality, view_t const& view) noexcept {
+    strided_iterator<ustore_collection_id_t const> const tasks = strided(collections);
+    status_t outcome;
+    database_state<isolation_>& state = *handle_cast<database_state<isolation_>>(database);
+    store_status_t const resolved = with_source(state, view, [&](auto& source) noexcept -> store_status_t {
+        for (std::size_t index = 0; index != count; ++index) {
+            if (index != 0 && tasks && tasks[index] == tasks[index - 1]) continue;
+            resolved_collection<isolation_> collection;
+            store_status_t const listed = resolve(source, tasks ? tasks[index] : ustore_collection_main_k, collection);
+            if (listed == store_status_t::key_not_found_k) {
+                outcome = {status_code_t::not_found_k, "No such collection"};
+                return listed;
+            }
+            if (st::failed(listed)) return listed;
+            outcome = admit_modality(collection.modality, modality);
+            if (outcome.failed() || !tasks) break;
+        }
+        return store_status_t::success_k;
+    });
+    return reported(resolved, outcome);
+}
+
 #pragma endregion Resolution
 
 #pragma region Reads
@@ -1481,8 +1513,7 @@ status_t serve(database_state<isolation_>& state, ustore_blobs_read_t const& arg
             source, places.collections_begin, places.size(), outcome,
             [&](auto& entries, std::size_t first, std::size_t end) noexcept -> store_status_t {
                 using entry_t = entry_of<decltype(entries)>;
-                if constexpr (std::is_same_v<entry_t, string_pair_t>)
-                    return refused(outcome, "The collection holds strings");
+                if constexpr (std::is_same_v<entry_t, string_pair_t>) return refused_modality(outcome);
                 else {
                     auto store = source.view(entries);
                     if (!store) return store.status();
@@ -1503,10 +1534,7 @@ store_status_t stage_value_runs(source_type_& source, strided_iterator<ustore_co
     return for_each_run(source, collections, count, outcome,
                         [&](auto& entries, std::size_t first, std::size_t end) noexcept -> store_status_t {
                             using entry_t = entry_of<decltype(entries)>;
-                            if constexpr (std::is_same_v<entry_t, string_pair_t>)
-                                return refused(outcome, "The collection holds strings");
-                            else if constexpr (std::is_same_v<entry_t, half_edge_t>)
-                                return refused(outcome, "A graph collection changes through the graph calls");
+                            if constexpr (!std::is_same_v<entry_t, value_pair_t>) return refused_modality(outcome);
                             else {
                                 auto part = source.part(entries);
                                 if (!part) return part.status();
@@ -1525,10 +1553,7 @@ store_status_t write_one(database_state<isolation_>& state, strided_iterator<ust
     return for_each_run(source, collections, 1, outcome,
                         [&](auto& entries, std::size_t, std::size_t) noexcept -> store_status_t {
                             using entry_t = entry_of<decltype(entries)>;
-                            if constexpr (std::is_same_v<entry_t, string_pair_t>)
-                                return refused(outcome, "The collection holds strings");
-                            else if constexpr (std::is_same_v<entry_t, half_edge_t>)
-                                return refused(outcome, "A graph collection changes through the graph calls");
+                            if constexpr (!std::is_same_v<entry_t, value_pair_t>) return refused_modality(outcome);
                             else return stage_upsert(entries, key, content);
                         });
 }
@@ -1606,8 +1631,7 @@ status_t serve(database_state<isolation_>& state, ustore_blobs_scan_t const& arg
         return for_each_run(source, scans.collections, scans.size(), outcome,
                             [&](auto& entries, std::size_t first, std::size_t end) noexcept -> store_status_t {
                                 using entry_t = entry_of<decltype(entries)>;
-                                if constexpr (std::is_same_v<entry_t, string_pair_t>)
-                                    return refused(outcome, "The collection holds strings");
+                                if constexpr (std::is_same_v<entry_t, string_pair_t>) return refused_modality(outcome);
                                 else {
                                     auto store = source.view(entries);
                                     if (!store) return store.status();
@@ -1643,8 +1667,7 @@ status_t serve(database_state<isolation_>& state, ustore_blobs_sample_t const& a
         return for_each_run(source, samples.collections, samples.size(), outcome,
                             [&](auto& entries, std::size_t first, std::size_t end) noexcept -> store_status_t {
                                 using entry_t = entry_of<decltype(entries)>;
-                                if constexpr (std::is_same_v<entry_t, string_pair_t>)
-                                    return refused(outcome, "The collection holds strings");
+                                if constexpr (std::is_same_v<entry_t, string_pair_t>) return refused_modality(outcome);
                                 else {
                                     auto store = source.view(entries);
                                     if (!store) return store.status();
@@ -1688,8 +1711,7 @@ status_t serve(database_state<isolation_>& state, ustore_blobs_measure_t const& 
         return for_each_run(source, collections, arguments.count, outcome,
                             [&](auto& entries, std::size_t first, std::size_t end) noexcept -> store_status_t {
                                 using entry_t = entry_of<decltype(entries)>;
-                                if constexpr (std::is_same_v<entry_t, string_pair_t>)
-                                    return refused(outcome, "The collection holds strings");
+                                if constexpr (std::is_same_v<entry_t, string_pair_t>) return refused_modality(outcome);
                                 else {
                                     auto store = source.view(entries);
                                     if (!store) return store.status();
@@ -1853,8 +1875,7 @@ store_status_t stage_string_runs(source_type_& source, strided_iterator<ustore_c
     return for_each_run(source, collections, count, outcome,
                         [&](auto& entries, std::size_t first, std::size_t end) noexcept -> store_status_t {
                             using entry_t = entry_of<decltype(entries)>;
-                            if constexpr (!std::is_same_v<entry_t, string_pair_t>)
-                                return refused(outcome, "The collection holds no strings");
+                            if constexpr (!std::is_same_v<entry_t, string_pair_t>) return refused_modality(outcome);
                             else {
                                 auto part = source.part(entries);
                                 if (!part) return part.status();
@@ -1910,8 +1931,7 @@ status_t serve(database_state<isolation_>& state, ustore_strings_read_t const& a
         return for_each_run(source, collections, arguments.count, outcome,
                             [&](auto& entries, std::size_t first, std::size_t end) noexcept -> store_status_t {
                                 using entry_t = entry_of<decltype(entries)>;
-                                if constexpr (!std::is_same_v<entry_t, string_pair_t>)
-                                    return refused(outcome, "The collection holds no strings");
+                                if constexpr (!std::is_same_v<entry_t, string_pair_t>) return refused_modality(outcome);
                                 else {
                                     auto store = source.view(entries);
                                     if (!store) return store.status();
@@ -1942,8 +1962,7 @@ status_t serve(database_state<isolation_>& state, ustore_strings_scan_t const& a
             source, collections, arguments.count, outcome,
             [&](auto& entries, std::size_t first, std::size_t end) noexcept -> store_status_t {
                 using entry_t = entry_of<decltype(entries)>;
-                if constexpr (!std::is_same_v<entry_t, string_pair_t>)
-                    return refused(outcome, "The collection holds no strings");
+                if constexpr (!std::is_same_v<entry_t, string_pair_t>) return refused_modality(outcome);
                 else {
                     auto store = source.view(entries);
                     if (!store) return store.status();
@@ -1989,8 +2008,7 @@ status_t serve(database_state<isolation_>& state, ustore_graph_read_edges_t cons
         return for_each_run(source, collections, arguments.count, outcome,
                             [&](auto& entries, std::size_t first, std::size_t end) noexcept -> store_status_t {
                                 using entry_t = entry_of<decltype(entries)>;
-                                if constexpr (!std::is_same_v<entry_t, half_edge_t>)
-                                    return refused(outcome, "The collection holds no graph");
+                                if constexpr (!std::is_same_v<entry_t, half_edge_t>) return refused_modality(outcome);
                                 else {
                                     auto store = source.view(entries);
                                     if (!store) return store.status();
@@ -2025,8 +2043,7 @@ store_status_t stage_graph_runs(source_type_& source, strided_iterator<ustore_co
     return for_each_run(source, collections, count, outcome,
                         [&](auto& entries, std::size_t first, std::size_t end) noexcept -> store_status_t {
                             using entry_t = entry_of<decltype(entries)>;
-                            if constexpr (!std::is_same_v<entry_t, half_edge_t>)
-                                return refused(outcome, "The collection holds no graph");
+                            if constexpr (!std::is_same_v<entry_t, half_edge_t>) return refused_modality(outcome);
                             else {
                                 auto part = source.part(entries);
                                 if (!part) return part.status();
@@ -2255,11 +2272,12 @@ void database_free(ustore_database_t database) noexcept {
     delete state;
 }
 
+/** The database verbs of this engine at @p isolation_. */
 template <isolation_t isolation_>
-engine_t const engine_k {
-    .database_describe = &serve_database<isolation_, ustore_database_describe_t>,
-    .database_clear = &serve_database<isolation_, ustore_database_clear_t>,
-    .database_compact = &serve_database<isolation_, ustore_database_compact_t>,
+database_verbs_t const database_verbs_k {
+    .describe = &serve_database<isolation_, ustore_database_describe_t>,
+    .clear = &serve_database<isolation_, ustore_database_clear_t>,
+    .compact = &serve_database<isolation_, ustore_database_compact_t>,
     .snapshot_init = &serve_database<isolation_, ustore_snapshot_init_t>,
     .snapshot_save = &serve_database<isolation_, ustore_snapshot_save_t>,
     .collection_list = &serve_database<isolation_, ustore_collection_list_t>,
@@ -2270,36 +2288,88 @@ engine_t const engine_k {
     .transaction_stage = &serve_database<isolation_, ustore_transaction_stage_t>,
     .transaction_commit = &serve_database<isolation_, ustore_transaction_commit_t>,
     .transaction_rollback = &serve_database<isolation_, ustore_transaction_rollback_t>,
-    .blobs_write = &serve_database<isolation_, ustore_blobs_write_t, strings_arg_t>,
-    .blobs_remove = &serve_database<isolation_, ustore_blobs_remove_t>,
-    .blobs_read = &serve_database<isolation_, ustore_blobs_read_t>,
-    .blobs_scan = &serve_database<isolation_, ustore_blobs_scan_t>,
-    .blobs_sample = &serve_database<isolation_, ustore_blobs_sample_t>,
-    .blobs_measure = &serve_database<isolation_, ustore_blobs_measure_t>,
-    .docs_write = &docs_write_in_json_values,
-    .docs_read = &docs_read_in_json_values,
-    .docs_gist = &docs_gist_in_json_values,
-    .docs_gather = &docs_gather_in_json_values,
-    .graph_read_edges = &serve_database<isolation_, ustore_graph_read_edges_t>,
-    .graph_write_edges = &serve_database<isolation_, ustore_graph_write_edges_t>,
-    .graph_remove_edges = &serve_database<isolation_, ustore_graph_remove_edges_t>,
-    .graph_write_vertices = &serve_database<isolation_, ustore_graph_write_vertices_t>,
-    .graph_remove_vertices = &serve_database<isolation_, ustore_graph_remove_vertices_t>,
-    .pages_import = &pages_import_in_page_values,
-    .pages_insert = &pages_insert_in_page_values,
-    .pages_remove = &pages_remove_in_page_values,
-    .pages_move = &pages_move_in_page_values,
-    .pages_splice = &pages_splice_in_page_values,
-    .pages_set_attributes = &pages_set_attributes_in_page_values,
-    .pages_remove_attributes = &pages_remove_attributes_in_page_values,
-    .pages_read = &pages_read_in_page_values,
-    .strings_write = &serve_database<isolation_, ustore_strings_write_t, strings_arg_t>,
-    .strings_remove = &serve_database<isolation_, ustore_strings_remove_t, strings_arg_t>,
-    .strings_read = &serve_database<isolation_, ustore_strings_read_t, strings_arg_t>,
-    .strings_scan = &serve_database<isolation_, ustore_strings_scan_t, strings_arg_t, strings_arg_t>,
     .transaction_free = &transaction_free<isolation_>,
     .snapshot_free = &snapshot_free<isolation_>,
     .database_free = &database_free<isolation_>,
+};
+
+/** The unchecked whole-value verbs at @p isolation_ of every collection keyed by UUIDs, which the layers over blobs
+ *  reach. */
+template <isolation_t isolation_>
+constexpr blobs_verbs_t values_verbs_k {
+    .write = &serve_database<isolation_, ustore_blobs_write_t, strings_arg_t>,
+    .remove = &serve_database<isolation_, ustore_blobs_remove_t>,
+    .read = &serve_database<isolation_, ustore_blobs_read_t>,
+    .scan = &serve_database<isolation_, ustore_blobs_scan_t>,
+    .sample = &serve_database<isolation_, ustore_blobs_sample_t>,
+    .measure = &serve_database<isolation_, ustore_blobs_measure_t>,
+};
+
+/** The verbs of this engine's blobs collections at @p isolation_. */
+template <isolation_t isolation_>
+blobs_verbs_t const blobs_verbs_k {
+    .write = &guarded_by<ustore_modality_blobs_k, &resolve_modality<isolation_>, values_verbs_k<isolation_>.write>,
+    .remove = &guarded_by<ustore_modality_blobs_k, &resolve_modality<isolation_>, values_verbs_k<isolation_>.remove>,
+    .read = &guarded_by<ustore_modality_blobs_k, &resolve_modality<isolation_>, values_verbs_k<isolation_>.read>,
+    .scan = &guarded_by<ustore_modality_blobs_k, &resolve_modality<isolation_>, values_verbs_k<isolation_>.scan>,
+    .sample = &guarded_by<ustore_modality_blobs_k, &resolve_modality<isolation_>, values_verbs_k<isolation_>.sample>,
+    .measure = &guarded_by<ustore_modality_blobs_k, &resolve_modality<isolation_>, values_verbs_k<isolation_>.measure>,
+};
+
+/** The verbs of this engine's strings collections at @p isolation_. */
+template <isolation_t isolation_>
+strings_verbs_t const strings_verbs_k {
+    .write = &serve_database<isolation_, ustore_strings_write_t, strings_arg_t>,
+    .remove = &serve_database<isolation_, ustore_strings_remove_t, strings_arg_t>,
+    .read = &serve_database<isolation_, ustore_strings_read_t, strings_arg_t>,
+    .scan = &serve_database<isolation_, ustore_strings_scan_t, strings_arg_t, strings_arg_t>,
+};
+
+/** The verbs of this engine's documents collections at @p isolation_, over its values until it keeps them natively. */
+template <isolation_t isolation_>
+docs_verbs_t const docs_verbs_k {
+    .write = &docs_write_over_blobs<values_verbs_k<isolation_>, &resolve_modality<isolation_>>,
+    .read = &docs_read_over_blobs<values_verbs_k<isolation_>, &resolve_modality<isolation_>>,
+    .gist = &docs_gist_over_blobs<values_verbs_k<isolation_>, &resolve_modality<isolation_>>,
+    .gather = &docs_gather_over_blobs<values_verbs_k<isolation_>, &resolve_modality<isolation_>>,
+    .remove = &remove_over_blobs<values_verbs_k<isolation_>, &resolve_modality<isolation_>, ustore_modality_docs_k>,
+    .scan = &scan_over_blobs<values_verbs_k<isolation_>, &resolve_modality<isolation_>, ustore_modality_docs_k>,
+};
+
+/** The verbs of this engine's graph collections at @p isolation_. */
+template <isolation_t isolation_>
+graph_verbs_t const graph_verbs_k {
+    .read_edges = &serve_database<isolation_, ustore_graph_read_edges_t>,
+    .write_edges = &serve_database<isolation_, ustore_graph_write_edges_t>,
+    .remove_edges = &serve_database<isolation_, ustore_graph_remove_edges_t>,
+    .write_vertices = &serve_database<isolation_, ustore_graph_write_vertices_t>,
+    .remove_vertices = &serve_database<isolation_, ustore_graph_remove_vertices_t>,
+    .scan_vertices =
+        &scan_over_blobs<values_verbs_k<isolation_>, &resolve_modality<isolation_>, ustore_modality_graph_k>,
+};
+
+/** The verbs of this engine's pages collections at @p isolation_, over its values until it keeps them natively. */
+template <isolation_t isolation_>
+pages_verbs_t const pages_verbs_k {
+    .import = &pages_import_over_blobs<values_verbs_k<isolation_>, &resolve_modality<isolation_>>,
+    .insert = &pages_insert_over_blobs<values_verbs_k<isolation_>, &resolve_modality<isolation_>>,
+    .remove = &pages_remove_over_blobs<values_verbs_k<isolation_>, &resolve_modality<isolation_>>,
+    .move = &pages_move_over_blobs<values_verbs_k<isolation_>, &resolve_modality<isolation_>>,
+    .splice = &pages_splice_over_blobs<values_verbs_k<isolation_>, &resolve_modality<isolation_>>,
+    .set_attributes = &pages_set_attributes_over_blobs<values_verbs_k<isolation_>, &resolve_modality<isolation_>>,
+    .remove_attributes = &pages_remove_attributes_over_blobs<values_verbs_k<isolation_>, &resolve_modality<isolation_>>,
+    .read = &pages_read_over_blobs<values_verbs_k<isolation_>, &resolve_modality<isolation_>>,
+    .scan = &scan_over_blobs<values_verbs_k<isolation_>, &resolve_modality<isolation_>, ustore_modality_pages_k>,
+};
+
+template <isolation_t isolation_>
+engine_t const engine_k {
+    .database = &database_verbs_k<isolation_>,
+    .blobs = &blobs_verbs_k<isolation_>,
+    .strings = &strings_verbs_k<isolation_>,
+    .docs = &docs_verbs_k<isolation_>,
+    .graph = &graph_verbs_k<isolation_>,
+    .pages = &pages_verbs_k<isolation_>,
 };
 
 #pragma endregion Dispatch

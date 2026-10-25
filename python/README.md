@@ -292,7 +292,7 @@ A page shorter than `wanted` exhausts the walk for good: every later pull answer
 A key removed at the head between the listing and the read of one pull reads as an empty value, and a pull that fails or is cancelled leaves the cursor where it was.
 The cursor holds its database open, and the transaction or snapshot it reads through, until it closes, so a snapshot may close before the walk ends.
 Every pull blocks, on the receiver's executor or the calling thread, so a deferred view opens no cursor, and a cursor serves one pull at a time.
-`ustore.keys.scan_keys(view, collection)` yields every key through one cursor and one arena it keeps for the walk, which the NetworkX and Pandas views build on.
+`ustore.keys.scan_keys(view, collection, modality=...)` yields every key through the scans of that modality, `scan`, `docs_scan` or `graph_scan_vertices`, and one arena it keeps for the walk, which the NetworkX and Pandas views build on.
 
 ## Documents
 

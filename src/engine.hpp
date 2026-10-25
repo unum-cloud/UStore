@@ -2,7 +2,7 @@
  *  @file src/engine.hpp
  *  @author Ash Vardanian
  *  @date September 27, 2026
- *  @brief The table of calls every engine fills, which the router of `src/lib.hpp` routes each handle through.
+ *  @brief The verb tables every engine fills, which the router of `src/lib.hpp` routes each handle through.
  */
 
 #pragma once
@@ -57,18 +57,11 @@ struct view_t {
     std::size_t thread_index = 0;
 };
 
-/**
- *  @brief One engine's implementation of every call of the C ABI but its own init.
- *
- *  Every call is `noexcept` and answers a status, which the router publishes into the caller's outcome: the in-house
- *  engines never throw, and an oracle wraps each call of its library in @c guarded. A null entry answers
- *  @c ustore_status_unsupported_k. Every ragged input arrives readable in any layout, in the order its argument
- *  structure names them, since the router gathers what an accessor writes.
- */
-struct engine_t {
-    status_t (*database_describe)(ustore_database_describe_t const&, view_t const&) noexcept;
-    status_t (*database_clear)(ustore_database_clear_t const&, view_t const&) noexcept;
-    status_t (*database_compact)(ustore_database_compact_t const&, view_t const&) noexcept;
+/** The database, snapshot, collection and transaction verbs every engine serves. */
+struct database_verbs_t {
+    status_t (*describe)(ustore_database_describe_t const&, view_t const&) noexcept;
+    status_t (*clear)(ustore_database_clear_t const&, view_t const&) noexcept;
+    status_t (*compact)(ustore_database_compact_t const&, view_t const&) noexcept;
     status_t (*snapshot_init)(ustore_snapshot_init_t const&, view_t const&) noexcept;
     status_t (*snapshot_save)(ustore_snapshot_save_t const&, view_t const&) noexcept;
     status_t (*collection_list)(ustore_collection_list_t const&, view_t const&) noexcept;
@@ -79,40 +72,81 @@ struct engine_t {
     status_t (*transaction_stage)(ustore_transaction_stage_t const&, view_t const&) noexcept;
     status_t (*transaction_commit)(ustore_transaction_commit_t const&, view_t const&) noexcept;
     status_t (*transaction_rollback)(ustore_transaction_rollback_t const&, view_t const&) noexcept;
-    status_t (*blobs_write)(ustore_blobs_write_t const&, strings_arg_t const& values, view_t const&) noexcept;
-    status_t (*blobs_remove)(ustore_blobs_remove_t const&, view_t const&) noexcept;
-    status_t (*blobs_read)(ustore_blobs_read_t const&, view_t const&) noexcept;
-    status_t (*blobs_scan)(ustore_blobs_scan_t const&, view_t const&) noexcept;
-    status_t (*blobs_sample)(ustore_blobs_sample_t const&, view_t const&) noexcept;
-    status_t (*blobs_measure)(ustore_blobs_measure_t const&, view_t const&) noexcept;
-    status_t (*docs_write)(ustore_docs_write_t const&, strings_arg_t const& fields, strings_arg_t const& values,
-                           view_t const&) noexcept;
-    status_t (*docs_read)(ustore_docs_read_t const&, strings_arg_t const& fields, view_t const&) noexcept;
-    status_t (*docs_gist)(ustore_docs_gist_t const&, view_t const&) noexcept;
-    status_t (*docs_gather)(ustore_docs_gather_t const&, strings_arg_t const& fields, view_t const&) noexcept;
-    status_t (*graph_read_edges)(ustore_graph_read_edges_t const&, view_t const&) noexcept;
-    status_t (*graph_write_edges)(ustore_graph_write_edges_t const&, view_t const&) noexcept;
-    status_t (*graph_remove_edges)(ustore_graph_remove_edges_t const&, view_t const&) noexcept;
-    status_t (*graph_write_vertices)(ustore_graph_write_vertices_t const&, view_t const&) noexcept;
-    status_t (*graph_remove_vertices)(ustore_graph_remove_vertices_t const&, view_t const&) noexcept;
-    status_t (*pages_import)(ustore_pages_import_t const&, strings_arg_t const& values, view_t const&) noexcept;
-    status_t (*pages_insert)(ustore_pages_insert_t const&, strings_arg_t const& values, view_t const&) noexcept;
-    status_t (*pages_remove)(ustore_pages_remove_t const&, view_t const&) noexcept;
-    status_t (*pages_move)(ustore_pages_move_t const&, view_t const&) noexcept;
-    status_t (*pages_splice)(ustore_pages_splice_t const&, strings_arg_t const& values, view_t const&) noexcept;
-    status_t (*pages_set_attributes)(ustore_pages_set_attributes_t const&, strings_arg_t const& fields,
-                                     strings_arg_t const& values, view_t const&) noexcept;
-    status_t (*pages_remove_attributes)(ustore_pages_remove_attributes_t const&, strings_arg_t const& fields,
-                                        view_t const&) noexcept;
-    status_t (*pages_read)(ustore_pages_read_t const&, view_t const&) noexcept;
-    status_t (*strings_write)(ustore_strings_write_t const&, strings_arg_t const& strings, view_t const&) noexcept;
-    status_t (*strings_remove)(ustore_strings_remove_t const&, strings_arg_t const& strings, view_t const&) noexcept;
-    status_t (*strings_read)(ustore_strings_read_t const&, strings_arg_t const& strings, view_t const&) noexcept;
-    status_t (*strings_scan)(ustore_strings_scan_t const&, strings_arg_t const& prefixes,
-                             strings_arg_t const& start_strings, view_t const&) noexcept;
     void (*transaction_free)(ustore_transaction_t) noexcept;
     void (*snapshot_free)(ustore_snapshot_t) noexcept;
     void (*database_free)(ustore_database_t) noexcept;
+};
+
+/** The verbs of blobs collections. */
+struct blobs_verbs_t {
+    status_t (*write)(ustore_blobs_write_t const&, strings_arg_t const& values, view_t const&) noexcept;
+    status_t (*remove)(ustore_blobs_remove_t const&, view_t const&) noexcept;
+    status_t (*read)(ustore_blobs_read_t const&, view_t const&) noexcept;
+    status_t (*scan)(ustore_blobs_scan_t const&, view_t const&) noexcept;
+    status_t (*sample)(ustore_blobs_sample_t const&, view_t const&) noexcept;
+    status_t (*measure)(ustore_blobs_measure_t const&, view_t const&) noexcept;
+};
+
+/** The verbs of strings collections. */
+struct strings_verbs_t {
+    status_t (*write)(ustore_strings_write_t const&, strings_arg_t const& strings, view_t const&) noexcept;
+    status_t (*remove)(ustore_strings_remove_t const&, strings_arg_t const& strings, view_t const&) noexcept;
+    status_t (*read)(ustore_strings_read_t const&, strings_arg_t const& strings, view_t const&) noexcept;
+    status_t (*scan)(ustore_strings_scan_t const&, strings_arg_t const& prefixes, strings_arg_t const& start_strings,
+                     view_t const&) noexcept;
+};
+
+/** The verbs of documents collections. */
+struct docs_verbs_t {
+    status_t (*write)(ustore_docs_write_t const&, strings_arg_t const& fields, strings_arg_t const& values,
+                      view_t const&) noexcept;
+    status_t (*read)(ustore_docs_read_t const&, strings_arg_t const& fields, view_t const&) noexcept;
+    status_t (*gist)(ustore_docs_gist_t const&, view_t const&) noexcept;
+    status_t (*gather)(ustore_docs_gather_t const&, strings_arg_t const& fields, view_t const&) noexcept;
+    status_t (*remove)(ustore_docs_remove_t const&, view_t const&) noexcept;
+    status_t (*scan)(ustore_docs_scan_t const&, view_t const&) noexcept;
+};
+
+/** The verbs of graph collections. */
+struct graph_verbs_t {
+    status_t (*read_edges)(ustore_graph_read_edges_t const&, view_t const&) noexcept;
+    status_t (*write_edges)(ustore_graph_write_edges_t const&, view_t const&) noexcept;
+    status_t (*remove_edges)(ustore_graph_remove_edges_t const&, view_t const&) noexcept;
+    status_t (*write_vertices)(ustore_graph_write_vertices_t const&, view_t const&) noexcept;
+    status_t (*remove_vertices)(ustore_graph_remove_vertices_t const&, view_t const&) noexcept;
+    status_t (*scan_vertices)(ustore_graph_scan_vertices_t const&, view_t const&) noexcept;
+};
+
+/** The verbs of pages collections. */
+struct pages_verbs_t {
+    status_t (*import)(ustore_pages_import_t const&, strings_arg_t const& values, view_t const&) noexcept;
+    status_t (*insert)(ustore_pages_insert_t const&, strings_arg_t const& values, view_t const&) noexcept;
+    status_t (*remove)(ustore_pages_remove_t const&, view_t const&) noexcept;
+    status_t (*move)(ustore_pages_move_t const&, view_t const&) noexcept;
+    status_t (*splice)(ustore_pages_splice_t const&, strings_arg_t const& values, view_t const&) noexcept;
+    status_t (*set_attributes)(ustore_pages_set_attributes_t const&, strings_arg_t const& fields,
+                               strings_arg_t const& values, view_t const&) noexcept;
+    status_t (*remove_attributes)(ustore_pages_remove_attributes_t const&, strings_arg_t const& fields,
+                                  view_t const&) noexcept;
+    status_t (*read)(ustore_pages_read_t const&, view_t const&) noexcept;
+    status_t (*scan)(ustore_pages_scan_t const&, view_t const&) noexcept;
+};
+
+/**
+ *  @brief One engine: its database verbs, and the verbs of every modality it keeps, null for one it does not.
+ *
+ *  Every verb is `noexcept` and answers a status, which the router publishes into the caller's outcome: the in-house
+ *  engines never throw, and an oracle wraps each call of its library in @c guarded. A null table or verb answers
+ *  @c ustore_status_unsupported_k. Every ragged input arrives readable in any layout, in the order its argument
+ *  structure names them, since the router gathers what an accessor writes.
+ */
+struct engine_t {
+    database_verbs_t const* database;
+    blobs_verbs_t const* blobs;
+    strings_verbs_t const* strings;
+    docs_verbs_t const* docs;
+    graph_verbs_t const* graph;
+    pages_verbs_t const* pages;
 };
 
 /** Whether a database takes changes, or the router refuses every call that would change it. */
@@ -176,34 +210,260 @@ ustore_database_t database_of(arguments_type_ const& arguments) noexcept {
 template <typename arguments_type_>
 void route_init(arguments_type_* arguments, status_t (*open)(arguments_type_ const&, view_t const&) noexcept) noexcept;
 
-/** The document calls of an engine keeping every document as one value of JSON text, which `src/docs.cpp` serves
- *  through the engine's own reads and writes. */
-status_t docs_write_in_json_values(ustore_docs_write_t const&, strings_arg_t const& fields, strings_arg_t const& values,
-                                   view_t const&) noexcept;
-status_t docs_read_in_json_values(ustore_docs_read_t const&, strings_arg_t const& fields, view_t const&) noexcept;
-status_t docs_gist_in_json_values(ustore_docs_gist_t const&, view_t const&) noexcept;
-status_t docs_gather_in_json_values(ustore_docs_gather_t const&, strings_arg_t const& fields, view_t const&) noexcept;
+/** The status every verb answers for a collection holding another modality than the verb serves. */
+inline status_t collection_holds_another_modality() noexcept {
+    return {status_code_t::invalid_argument_k, "The collection holds another modality"};
+}
 
-/** The graph calls of an engine keeping every vertex as one value of its degrees and sorted neighborships, which
- *  `src/graph.cpp` serves through the engine's own reads and writes. */
-status_t graph_read_edges_in_vertex_values(ustore_graph_read_edges_t const&, view_t const&) noexcept;
-status_t graph_write_edges_in_vertex_values(ustore_graph_write_edges_t const&, view_t const&) noexcept;
-status_t graph_remove_edges_in_vertex_values(ustore_graph_remove_edges_t const&, view_t const&) noexcept;
-status_t graph_write_vertices_in_vertex_values(ustore_graph_write_vertices_t const&, view_t const&) noexcept;
-status_t graph_remove_vertices_in_vertex_values(ustore_graph_remove_vertices_t const&, view_t const&) noexcept;
+/** Admits a collection holding @p held to the verbs of @p served, the main collection only to the blobs verbs. */
+inline status_t admit_modality(ustore_modality_t held, ustore_modality_t served) noexcept {
+    if (held == served || (held == ustore_modality_any_k && served == ustore_modality_blobs_k)) return {};
+    return collection_holds_another_modality();
+}
 
-/** The page calls of an engine keeping every page as one value, its dense element tree, which `src/pages.cpp` serves
- *  through the engine's own reads, writes and removes. */
-status_t pages_import_in_page_values(ustore_pages_import_t const&, strings_arg_t const& values, view_t const&) noexcept;
-status_t pages_insert_in_page_values(ustore_pages_insert_t const&, strings_arg_t const& values, view_t const&) noexcept;
-status_t pages_remove_in_page_values(ustore_pages_remove_t const&, view_t const&) noexcept;
-status_t pages_move_in_page_values(ustore_pages_move_t const&, view_t const&) noexcept;
-status_t pages_splice_in_page_values(ustore_pages_splice_t const&, strings_arg_t const& values, view_t const&) noexcept;
-status_t pages_set_attributes_in_page_values(ustore_pages_set_attributes_t const&, strings_arg_t const& fields,
-                                             strings_arg_t const& values, view_t const&) noexcept;
-status_t pages_remove_attributes_in_page_values(ustore_pages_remove_attributes_t const&, strings_arg_t const& fields,
-                                                view_t const&) noexcept;
-status_t pages_read_in_page_values(ustore_pages_read_t const&, view_t const&) noexcept;
+/**
+ *  @brief Serves @p serve_, an unchecked verb of one engine, after @p resolve_, that engine's resolver, refuses every
+ *      collection of the call holding no @p modality_.
+ *
+ *  Every engine's resolver is called as `resolve_(database, collections, count, modality, view)`, refusing a
+ *  collection it does not list, as @p view sees it, and one @c admit_modality refuses.
+ */
+template <ustore_modality_t modality_, auto resolve_, auto serve_, typename arguments_type_>
+status_t guarded_by(arguments_type_ const& arguments, view_t const& view) noexcept {
+    status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count, modality_, view);
+    return resolved.failed() ? resolved : serve_(arguments, view);
+}
+
+/** Serves @p serve_, taking one ragged input, after @p resolve_ refuses every collection holding no @p modality_. */
+template <ustore_modality_t modality_, auto resolve_, auto serve_, typename arguments_type_>
+status_t guarded_by(arguments_type_ const& arguments, strings_arg_t const& values, view_t const& view) noexcept {
+    status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count, modality_, view);
+    return resolved.failed() ? resolved : serve_(arguments, values, view);
+}
+
+/** The document verbs of an engine keeping every document as one whole value of JSON text, served by `src/docs.cpp`
+ *  as read-modify-writes through @p values_verbs, the unchecked whole-value verbs of that one engine. */
+status_t docs_write_over_blobs(blobs_verbs_t const& values_verbs, ustore_docs_write_t const&,
+                               strings_arg_t const& fields, strings_arg_t const& values, view_t const&) noexcept;
+status_t docs_read_over_blobs(blobs_verbs_t const& values_verbs, ustore_docs_read_t const&, strings_arg_t const& fields,
+                              view_t const&) noexcept;
+status_t docs_gist_over_blobs(blobs_verbs_t const& values_verbs, ustore_docs_gist_t const&, view_t const&) noexcept;
+status_t docs_gather_over_blobs(blobs_verbs_t const& values_verbs, ustore_docs_gather_t const&,
+                                strings_arg_t const& fields, view_t const&) noexcept;
+
+/** The graph verbs of an engine keeping every vertex as one value of its degrees and sorted neighborships, served by
+ *  `src/graph.cpp` as read-modify-writes through @p values_verbs. */
+status_t graph_read_edges_over_blobs(blobs_verbs_t const& values_verbs, ustore_graph_read_edges_t const&,
+                                     view_t const&) noexcept;
+status_t graph_write_edges_over_blobs(blobs_verbs_t const& values_verbs, ustore_graph_write_edges_t const&,
+                                      view_t const&) noexcept;
+status_t graph_remove_edges_over_blobs(blobs_verbs_t const& values_verbs, ustore_graph_remove_edges_t const&,
+                                       view_t const&) noexcept;
+status_t graph_write_vertices_over_blobs(blobs_verbs_t const& values_verbs, ustore_graph_write_vertices_t const&,
+                                         view_t const&) noexcept;
+status_t graph_remove_vertices_over_blobs(blobs_verbs_t const& values_verbs, ustore_graph_remove_vertices_t const&,
+                                          view_t const&) noexcept;
+
+/** The page verbs of an engine keeping every page as one value, its dense element tree, served by `src/pages.cpp` as
+ *  read-modify-writes through @p values_verbs. */
+status_t pages_import_over_blobs(blobs_verbs_t const& values_verbs, ustore_pages_import_t const&,
+                                 strings_arg_t const& values, view_t const&) noexcept;
+status_t pages_insert_over_blobs(blobs_verbs_t const& values_verbs, ustore_pages_insert_t const&,
+                                 strings_arg_t const& values, view_t const&) noexcept;
+status_t pages_remove_over_blobs(blobs_verbs_t const& values_verbs, ustore_pages_remove_t const&,
+                                 view_t const&) noexcept;
+status_t pages_move_over_blobs(blobs_verbs_t const& values_verbs, ustore_pages_move_t const&, view_t const&) noexcept;
+status_t pages_splice_over_blobs(blobs_verbs_t const& values_verbs, ustore_pages_splice_t const&,
+                                 strings_arg_t const& values, view_t const&) noexcept;
+status_t pages_set_attributes_over_blobs(blobs_verbs_t const& values_verbs, ustore_pages_set_attributes_t const&,
+                                         strings_arg_t const& fields, strings_arg_t const& values,
+                                         view_t const&) noexcept;
+status_t pages_remove_attributes_over_blobs(blobs_verbs_t const& values_verbs, ustore_pages_remove_attributes_t const&,
+                                            strings_arg_t const& fields, view_t const&) noexcept;
+status_t pages_read_over_blobs(blobs_verbs_t const& values_verbs, ustore_pages_read_t const&, view_t const&) noexcept;
+
+/**
+ *  @brief The verbs of the layers over blobs bound to one engine: its unchecked whole-value verbs @p values_verbs_,
+ *      and its resolver @p resolve_, which refuses every collection holding another modality first.
+ *
+ *  `src/docs.cpp`, `src/graph.cpp` and `src/pages.cpp` serve the read-modify-writes these name, so each engine
+ *  instantiating them reaches only its own values.
+ */
+template <blobs_verbs_t const& values_verbs_, auto resolve_>
+status_t docs_write_over_blobs(ustore_docs_write_t const& arguments, strings_arg_t const& fields,
+                               strings_arg_t const& values, view_t const& view) noexcept {
+    status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count,
+                                       ustore_modality_docs_k, view);
+    return resolved.failed() ? resolved : docs_write_over_blobs(values_verbs_, arguments, fields, values, view);
+}
+
+template <blobs_verbs_t const& values_verbs_, auto resolve_>
+status_t docs_read_over_blobs(ustore_docs_read_t const& arguments, strings_arg_t const& fields,
+                              view_t const& view) noexcept {
+    status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count,
+                                       ustore_modality_docs_k, view);
+    return resolved.failed() ? resolved : docs_read_over_blobs(values_verbs_, arguments, fields, view);
+}
+
+template <blobs_verbs_t const& values_verbs_, auto resolve_>
+status_t docs_gist_over_blobs(ustore_docs_gist_t const& arguments, view_t const& view) noexcept {
+    status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count,
+                                       ustore_modality_docs_k, view);
+    return resolved.failed() ? resolved : docs_gist_over_blobs(values_verbs_, arguments, view);
+}
+
+template <blobs_verbs_t const& values_verbs_, auto resolve_>
+status_t docs_gather_over_blobs(ustore_docs_gather_t const& arguments, strings_arg_t const& fields,
+                                view_t const& view) noexcept {
+    status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count,
+                                       ustore_modality_docs_k, view);
+    return resolved.failed() ? resolved : docs_gather_over_blobs(values_verbs_, arguments, fields, view);
+}
+
+template <blobs_verbs_t const& values_verbs_, auto resolve_>
+status_t graph_read_edges_over_blobs(ustore_graph_read_edges_t const& arguments, view_t const& view) noexcept {
+    status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count,
+                                       ustore_modality_graph_k, view);
+    return resolved.failed() ? resolved : graph_read_edges_over_blobs(values_verbs_, arguments, view);
+}
+
+template <blobs_verbs_t const& values_verbs_, auto resolve_>
+status_t graph_write_edges_over_blobs(ustore_graph_write_edges_t const& arguments, view_t const& view) noexcept {
+    status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count,
+                                       ustore_modality_graph_k, view);
+    return resolved.failed() ? resolved : graph_write_edges_over_blobs(values_verbs_, arguments, view);
+}
+
+template <blobs_verbs_t const& values_verbs_, auto resolve_>
+status_t graph_remove_edges_over_blobs(ustore_graph_remove_edges_t const& arguments, view_t const& view) noexcept {
+    status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count,
+                                       ustore_modality_graph_k, view);
+    return resolved.failed() ? resolved : graph_remove_edges_over_blobs(values_verbs_, arguments, view);
+}
+
+template <blobs_verbs_t const& values_verbs_, auto resolve_>
+status_t graph_write_vertices_over_blobs(ustore_graph_write_vertices_t const& arguments, view_t const& view) noexcept {
+    status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count,
+                                       ustore_modality_graph_k, view);
+    return resolved.failed() ? resolved : graph_write_vertices_over_blobs(values_verbs_, arguments, view);
+}
+
+template <blobs_verbs_t const& values_verbs_, auto resolve_>
+status_t graph_remove_vertices_over_blobs(ustore_graph_remove_vertices_t const& arguments,
+                                          view_t const& view) noexcept {
+    status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count,
+                                       ustore_modality_graph_k, view);
+    return resolved.failed() ? resolved : graph_remove_vertices_over_blobs(values_verbs_, arguments, view);
+}
+
+template <blobs_verbs_t const& values_verbs_, auto resolve_>
+status_t pages_import_over_blobs(ustore_pages_import_t const& arguments, strings_arg_t const& values,
+                                 view_t const& view) noexcept {
+    status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count,
+                                       ustore_modality_pages_k, view);
+    return resolved.failed() ? resolved : pages_import_over_blobs(values_verbs_, arguments, values, view);
+}
+
+template <blobs_verbs_t const& values_verbs_, auto resolve_>
+status_t pages_insert_over_blobs(ustore_pages_insert_t const& arguments, strings_arg_t const& values,
+                                 view_t const& view) noexcept {
+    status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count,
+                                       ustore_modality_pages_k, view);
+    return resolved.failed() ? resolved : pages_insert_over_blobs(values_verbs_, arguments, values, view);
+}
+
+template <blobs_verbs_t const& values_verbs_, auto resolve_>
+status_t pages_remove_over_blobs(ustore_pages_remove_t const& arguments, view_t const& view) noexcept {
+    status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count,
+                                       ustore_modality_pages_k, view);
+    return resolved.failed() ? resolved : pages_remove_over_blobs(values_verbs_, arguments, view);
+}
+
+template <blobs_verbs_t const& values_verbs_, auto resolve_>
+status_t pages_move_over_blobs(ustore_pages_move_t const& arguments, view_t const& view) noexcept {
+    status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count,
+                                       ustore_modality_pages_k, view);
+    return resolved.failed() ? resolved : pages_move_over_blobs(values_verbs_, arguments, view);
+}
+
+template <blobs_verbs_t const& values_verbs_, auto resolve_>
+status_t pages_splice_over_blobs(ustore_pages_splice_t const& arguments, strings_arg_t const& values,
+                                 view_t const& view) noexcept {
+    status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count,
+                                       ustore_modality_pages_k, view);
+    return resolved.failed() ? resolved : pages_splice_over_blobs(values_verbs_, arguments, values, view);
+}
+
+template <blobs_verbs_t const& values_verbs_, auto resolve_>
+status_t pages_set_attributes_over_blobs(ustore_pages_set_attributes_t const& arguments, strings_arg_t const& fields,
+                                         strings_arg_t const& values, view_t const& view) noexcept {
+    status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count,
+                                       ustore_modality_pages_k, view);
+    return resolved.failed() ? resolved
+                             : pages_set_attributes_over_blobs(values_verbs_, arguments, fields, values, view);
+}
+
+template <blobs_verbs_t const& values_verbs_, auto resolve_>
+status_t pages_remove_attributes_over_blobs(ustore_pages_remove_attributes_t const& arguments,
+                                            strings_arg_t const& fields, view_t const& view) noexcept {
+    status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count,
+                                       ustore_modality_pages_k, view);
+    return resolved.failed() ? resolved : pages_remove_attributes_over_blobs(values_verbs_, arguments, fields, view);
+}
+
+template <blobs_verbs_t const& values_verbs_, auto resolve_>
+status_t pages_read_over_blobs(ustore_pages_read_t const& arguments, view_t const& view) noexcept {
+    status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count,
+                                       ustore_modality_pages_k, view);
+    return resolved.failed() ? resolved : pages_read_over_blobs(values_verbs_, arguments, view);
+}
+
+/** Removes the whole values a removal of collections holding @p modality_ names through @p values_verbs_, after
+ *  @p resolve_ refuses every collection holding another modality: the documents of @c ustore_docs_remove. */
+template <blobs_verbs_t const& values_verbs_, auto resolve_, ustore_modality_t modality_, typename arguments_type_>
+status_t remove_over_blobs(arguments_type_ const& arguments, view_t const& view) noexcept {
+    status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count, modality_, view);
+    if (resolved.failed()) return resolved;
+    ustore_blobs_remove_t const remove {
+        .database = arguments.database,
+        .executor = arguments.executor,
+        .outcome = arguments.outcome,
+        .completion = arguments.completion,
+        .transaction = arguments.transaction,
+        .count = arguments.count,
+        .collections = arguments.collections,
+        .keys = arguments.keys,
+        .durability = arguments.durability,
+        .watch = arguments.watch,
+    };
+    return values_verbs_.remove(remove, view);
+}
+
+/** Scans the keys of collections holding @p modality_ through @p values_verbs_, after @p resolve_ refuses every
+ *  collection holding another modality: the documents, vertices and pages of the scans of those modalities. */
+template <blobs_verbs_t const& values_verbs_, auto resolve_, ustore_modality_t modality_, typename arguments_type_>
+status_t scan_over_blobs(arguments_type_ const& arguments, view_t const& view) noexcept {
+    status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count, modality_, view);
+    if (resolved.failed()) return resolved;
+    ustore_blobs_scan_t const scan {
+        .database = arguments.database,
+        .executor = arguments.executor,
+        .outcome = arguments.outcome,
+        .completion = arguments.completion,
+        .view = arguments.view,
+        .count = arguments.count,
+        .collections = arguments.collections,
+        .start_keys = arguments.start_keys,
+        .offsets = arguments.offsets,
+        .keys = arguments.keys,
+        .arena = arguments.arena,
+        .wanted = arguments.wanted,
+        .mode = arguments.mode,
+        .progress = arguments.progress,
+        .progress_state = arguments.progress_state,
+    };
+    return values_verbs_.scan(scan, view);
+}
 
 /** The edits one page call made to one page, in task order, as a chain of `ustore/pages/page_edits.hpp`. */
 struct page_edits_t {
@@ -212,26 +472,30 @@ struct page_edits_t {
     std::span<utilities::byte_t const> chain;
 };
 
-/** Commits the edit chains of one page call at once, as an engine keeping a page as its edits does. */
-using page_edits_commit_t = status_t (*)(ustore_database_t, std::span<page_edits_t const>, ustore_durability_t,
-                                         view_t const&) noexcept;
-
-/** The page edit calls of an engine keeping a page as its edits, which `src/pages.cpp` serves through the engine's
- *  own reads, handing the edits of every call to @c commit; reads stay `pages_read_in_page_values`, as the engine's
- *  reads fold the edits into the tree. */
-status_t pages_import_in_page_edits(ustore_pages_import_t const&, strings_arg_t const& values, view_t const&,
-                                    page_edits_commit_t commit) noexcept;
-status_t pages_insert_in_page_edits(ustore_pages_insert_t const&, strings_arg_t const& values, view_t const&,
-                                    page_edits_commit_t commit) noexcept;
-status_t pages_remove_in_page_edits(ustore_pages_remove_t const&, view_t const&, page_edits_commit_t commit) noexcept;
-status_t pages_move_in_page_edits(ustore_pages_move_t const&, view_t const&, page_edits_commit_t commit) noexcept;
-status_t pages_splice_in_page_edits(ustore_pages_splice_t const&, strings_arg_t const& values, view_t const&,
-                                    page_edits_commit_t commit) noexcept;
-status_t pages_set_attributes_in_page_edits(ustore_pages_set_attributes_t const&, strings_arg_t const& fields,
-                                            strings_arg_t const& values, view_t const&,
-                                            page_edits_commit_t commit) noexcept;
-status_t pages_remove_attributes_in_page_edits(ustore_pages_remove_attributes_t const&, strings_arg_t const& fields,
-                                               view_t const&, page_edits_commit_t commit) noexcept;
+/** The edit chains of the page edit calls of an engine keeping a page as its edits, which `src/pages.cpp` checks and
+ *  applies over the pages read unwatched through @p values_verbs, so concurrent edits of one page both land, leaving
+ *  the chain of every page the call touched in the scratch of the call for the engine to commit. */
+expected<std::span<page_edits_t const>> pages_import_edits(blobs_verbs_t const& values_verbs,
+                                                           ustore_pages_import_t const&, strings_arg_t const& values,
+                                                           view_t const&) noexcept;
+expected<std::span<page_edits_t const>> pages_insert_edits(blobs_verbs_t const& values_verbs,
+                                                           ustore_pages_insert_t const&, strings_arg_t const& values,
+                                                           view_t const&) noexcept;
+expected<std::span<page_edits_t const>> pages_remove_edits(blobs_verbs_t const& values_verbs,
+                                                           ustore_pages_remove_t const&, view_t const&) noexcept;
+expected<std::span<page_edits_t const>> pages_move_edits(blobs_verbs_t const& values_verbs, ustore_pages_move_t const&,
+                                                         view_t const&) noexcept;
+expected<std::span<page_edits_t const>> pages_splice_edits(blobs_verbs_t const& values_verbs,
+                                                           ustore_pages_splice_t const&, strings_arg_t const& values,
+                                                           view_t const&) noexcept;
+expected<std::span<page_edits_t const>> pages_set_attributes_edits(blobs_verbs_t const& values_verbs,
+                                                                   ustore_pages_set_attributes_t const&,
+                                                                   strings_arg_t const& fields,
+                                                                   strings_arg_t const& values, view_t const&) noexcept;
+expected<std::span<page_edits_t const>> pages_remove_attributes_edits(blobs_verbs_t const& values_verbs,
+                                                                      ustore_pages_remove_attributes_t const&,
+                                                                      strings_arg_t const& fields,
+                                                                      view_t const&) noexcept;
 
 /** Mints a UUIDv7 for a new collection, refusing when the system gives no entropy. */
 expected<ustore_collection_id_t> mint_collection_id() noexcept;

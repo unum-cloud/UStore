@@ -490,22 +490,34 @@ std::size_t database_failed_reports_zeroed(config_t const& config) {
     failures += expect_failure(outcome);
     failures += expect_eq(commit_stamp, 0u);
 
-    // A gist fails on a document that does not parse
+    // A gist fails on a document whose path outgrows the longest one a gist exports
     auto [arena, arena_status] = arena_t::make();
     failures += expect(arena_status.succeeded());
+    auto [documents, documents_status] = create_collection(database, "failed.documents", ustore_modality_docs_k);
+    failures += expect(documents_status.succeeded());
     ustore_key_t const key = key_from_integer(450);
-    failures += write_text(database, {&key, 1}, "{not json");
+    std::string const document = fmt::format(R"({{"{}":1}})", std::string(600, 'a'));
+    strided_strings<std::string> const document_strings {{&document, 0}};
+    ustore_docs_write_t write {.database = database,
+                               .outcome = &outcome,
+                               .count = 1,
+                               .collections = {&documents, 0},
+                               .keys = {&key, 0},
+                               .values = document_strings.view()};
+    ustore_docs_write(&write);
+    failures += expect_success(outcome);
     ustore_size_t paths = 7;
     ustore_strings_view_t fields {};
     ustore_docs_gist_t gist {.database = database,
                              .outcome = &outcome,
                              .count = 1,
+                             .collections = {&documents, 0},
                              .keys = {&key, 0},
                              .fields = &fields,
                              .written = &paths,
                              .arena = arena};
     ustore_docs_gist(&gist);
-    failures += expect_status(outcome, status_code_t::malformed_k);
+    failures += expect_status(outcome, status_code_t::capacity_exhausted_k);
     failures += expect_eq(paths, 0u);
 
     if (database.supports_collections()) {
@@ -712,14 +724,19 @@ std::size_t arena_aligned_outputs(config_t const& config) {
                                                      R"({"born":1906,"height":1.6,"name":"grace"})",
                                                      R"({"born":1918})"};
     strided_strings<std::string_view> const values {strided(documents).begin()};
+    auto [docs, docs_status] = create_collection(database, "aligned.docs", ustore_modality_docs_k);
+    failures += expect(docs_status.succeeded());
+    if (failures != 0) return failures;
     ustore_outcome_t outcome {};
-    ustore_blobs_write_t write {};
-    write.database = database;
-    write.outcome = &outcome;
-    write.count = keys.size();
-    write.keys = {keys.data(), sizeof(ustore_key_t)};
-    write.values = values.view();
-    ustore_blobs_write(&write);
+    ustore_docs_write_t write {
+        .database = database,
+        .outcome = &outcome,
+        .count = keys.size(),
+        .collections = {&docs, 0},
+        .keys = {keys.data(), sizeof(ustore_key_t)},
+        .values = values.view(),
+    };
+    ustore_docs_write(&write);
     failures += expect_success(outcome);
 
     std::array<std::string_view, 3> const fields {"born", "height", "name"};
@@ -731,6 +748,7 @@ std::size_t arena_aligned_outputs(config_t const& config) {
         .database = database,
         .outcome = &outcome,
         .count = keys.size(),
+        .collections = {&docs, 0},
         .keys = {keys.data(), sizeof(ustore_key_t)},
         .fields_count = fields.size(),
         .fields = fields_strings.view(),
@@ -877,6 +895,18 @@ std::size_t arena_outputs_only(config_t const& config) {
     write.values = values.view();
     ustore_blobs_write(&write);
     failures += expect_success(outcome);
+    auto [docs, docs_status] = create_collection(database, "outputs.docs", ustore_modality_docs_k);
+    failures += expect(docs_status.succeeded());
+    ustore_docs_write_t write_documents {
+        .database = database,
+        .outcome = &outcome,
+        .count = docs_count,
+        .collections = {&docs, 0},
+        .keys = {keys.data(), sizeof(ustore_key_t)},
+        .values = values.view(),
+    };
+    ustore_docs_write(&write_documents);
+    failures += expect_success(outcome);
 
     // Three edges between three vertices, and a fourth vertex no edge reaches, which reads as missing
     std::array<ustore_key_t, 3> const sources {key_from_integer(1300), key_from_integer(1300), key_from_integer(1301)};
@@ -980,6 +1010,7 @@ std::size_t arena_outputs_only(config_t const& config) {
             .outcome = &outcome,
             .view = view,
             .count = docs_count,
+            .collections = {&docs, 0},
             .keys = {keys.data(), sizeof(ustore_key_t)},
             .fields_count = fields.size(),
             .fields = fields_strings.view(),
@@ -1070,6 +1101,7 @@ std::size_t arena_outputs_only(config_t const& config) {
             .outcome = &outcome,
             .view = view,
             .count = docs_count,
+            .collections = {&docs, 0},
             .keys = {keys.data(), sizeof(ustore_key_t)},
             .fields = name_fields.view(),
             .presences = &names.presences,
@@ -1101,6 +1133,7 @@ std::size_t arena_outputs_only(config_t const& config) {
             .outcome = &outcome,
             .view = view,
             .count = docs_count,
+            .collections = {&docs, 0},
             .keys = {keys.data(), sizeof(ustore_key_t)},
             .fields = &paths,
             .written = &written,
@@ -1191,6 +1224,7 @@ std::size_t arena_outputs_only(config_t const& config) {
                 .outcome = &outcome,
                 .view = view,
                 .count = docs_count,
+                .collections = {&docs, 0},
                 .keys = {keys.data(), sizeof(ustore_key_t)},
                 .fields_count = text_types.size(),
                 .fields = biographies.view(),
@@ -1268,8 +1302,14 @@ status_t scan_reporting_progress(ustore_blobs_scan_t const& arguments, view_t co
 /** Leaves the stand-in database to the case holding it. */
 void leave_database(ustore_database_t) noexcept {}
 
+/** The stand-in engine's only database verb, which leaves the database to the case. */
+database_verbs_t const progress_database_verbs_k {.database_free = &leave_database};
+
+/** The stand-in engine's only blobs verb, a scan reporting its progress once. */
+blobs_verbs_t const progress_blobs_verbs_k {.scan = &scan_reporting_progress};
+
 /** An engine serving only scans, each reporting its progress once, so a call stays unfinished while a case needs. */
-engine_t const progress_engine_k {.blobs_scan = &scan_reporting_progress, .database_free = &leave_database};
+engine_t const progress_engine_k {.database = &progress_database_verbs_k, .blobs = &progress_blobs_verbs_k};
 
 /** How far a scan held inside its progress callback got. */
 enum class hold_stage_t : std::uint32_t {
@@ -2085,6 +2125,10 @@ std::size_t database_zeroed_fields(config_t const& config) {
     failures += expect(arena_status.succeeded());
     if (failures != 0) return failures;
 
+    auto [docs, docs_status] = create_collection(database, "zeroed.docs", ustore_modality_docs_k);
+    failures += expect(docs_status.succeeded());
+    if (failures != 0) return failures;
+
     ustore_key_t const key = key_from_integer(1800);
     std::string_view const document = R"({"a":1})";
     strided_strings<std::string_view> const documents {{&document, 0}};
@@ -2093,6 +2137,7 @@ std::size_t database_zeroed_fields(config_t const& config) {
         .database = database,
         .outcome = &outcome,
         .count = 1,
+        .collections = {&docs, 0},
         .keys = {&key, 0},
         .values = documents.view(),
     };
@@ -2104,6 +2149,7 @@ std::size_t database_zeroed_fields(config_t const& config) {
         .database = database,
         .outcome = &outcome,
         .count = 1,
+        .collections = {&docs, 0},
         .keys = {&key, 0},
         .presences = &columns.presences,
         .values = &columns.values,
@@ -2115,6 +2161,149 @@ std::size_t database_zeroed_fields(config_t const& config) {
     if (failures != 0) return failures;
     failures += expect_eq(columns.presences[0] & 1, 1);
     failures += expect_eq(columns.value(0), document);
+    return failures;
+}
+
+/** The verbs of every modality refuse a collection holding another one, so a document's bytes stay out of reach of
+ *  the blobs verbs and a blobs collection takes no documents. */
+case_result_t database_modality_refusals(config_t const& config) {
+    std::size_t failures = 0;
+    auto [database, open_status] = open_database<database_t>(config);
+    auto [arena, arena_status] = arena_t::make();
+    failures += expect(open_status.succeeded() && arena_status.succeeded());
+    if (failures != 0) return failures;
+    if (!database.supports_collections())
+        return case_result_t::skipped("the engine keeps no named collections", failures);
+    auto [blobs, blobs_status] = create_collection(database, "modality.blobs", ustore_modality_blobs_k);
+    auto [docs, docs_status] = create_collection(database, "modality.docs", ustore_modality_docs_k);
+    auto [graph, graph_status] = create_collection(database, "modality.graph", ustore_modality_graph_k);
+    failures += expect(blobs_status.succeeded() && docs_status.succeeded() && graph_status.succeeded());
+    if (failures != 0) return failures;
+
+    ustore_key_t const key = key_from_integer(1900);
+    std::string_view const document = R"({"a":1})";
+    strided_strings<std::string_view> const documents {{&document, 0}};
+    ustore_outcome_t outcome {};
+    ustore_docs_write_t write_document {
+        .database = database,
+        .outcome = &outcome,
+        .count = 1,
+        .collections = {&docs, 0},
+        .keys = {&key, 0},
+        .values = documents.view(),
+    };
+    ustore_docs_write(&write_document);
+    failures += expect_success(outcome);
+
+    read_columns_t columns;
+    ustore_blobs_read_t read = read_of(database, {&key, 1}, columns, arena, outcome);
+    read.collections = {&docs, 0};
+    ustore_blobs_read(&read);
+    failures += expect_status(status_t {outcome}, status_code_t::invalid_argument_k);
+
+    write_document.collections = {&blobs, 0};
+    ustore_docs_write(&write_document);
+    failures += expect_status(status_t {outcome}, status_code_t::invalid_argument_k);
+
+    ustore_graph_write_edges_t write_edge {
+        .database = database,
+        .outcome = &outcome,
+        .count = 1,
+        .collections = {&docs, 0},
+        .sources = {&key, 0},
+        .targets = {&key, 0},
+    };
+    ustore_graph_write_edges(&write_edge);
+    failures += expect_status(status_t {outcome}, status_code_t::invalid_argument_k);
+
+    ustore_pages_import_t import {};
+    import.database = database, import.outcome = &outcome, import.count = 1, import.collections = {&graph, 0};
+    import.keys = {&key, 0}, import.values = documents.view(), import.encoding = ustore_page_encoding_xml_k;
+    ustore_pages_import(&import);
+    failures += expect_status(status_t {outcome}, status_code_t::invalid_argument_k);
+    return failures;
+}
+
+/** The documents, the vertices and the pages each list their own keys, a vertex without edges included, and a
+ *  document removal takes its key away, while no modality lists the keys of another. */
+case_result_t database_modality_keys(config_t const& config) {
+    std::size_t failures = 0;
+    auto [database, open_status] = open_database<database_t>(config);
+    auto [arena, arena_status] = arena_t::make();
+    failures += expect(open_status.succeeded() && arena_status.succeeded());
+    if (failures != 0) return failures;
+    if (!database.supports_collections())
+        return case_result_t::skipped("the engine keeps no named collections", failures);
+    auto [docs, docs_status] = create_collection(database, "keys.docs", ustore_modality_docs_k);
+    auto [graph, graph_status] = create_collection(database, "keys.graph", ustore_modality_graph_k);
+    auto [pages, pages_status] = create_collection(database, "keys.pages", ustore_modality_pages_k);
+    failures += expect(docs_status.succeeded() && graph_status.succeeded() && pages_status.succeeded());
+    if (failures != 0) return failures;
+
+    std::array<ustore_key_t, 2> const keys {key_from_integer(1950), key_from_integer(1951)};
+    std::string_view const text = R"({"a":1})";
+    strided_strings<std::string_view> const repeated {{&text, 0}};
+    ustore_outcome_t outcome {};
+    ustore_docs_write_t write_documents {.database = database,
+                                         .outcome = &outcome,
+                                         .count = keys.size(),
+                                         .collections = {&docs, 0},
+                                         .keys = {keys.data(), sizeof(ustore_key_t)},
+                                         .values = repeated.view()};
+    ustore_docs_write(&write_documents);
+    failures += expect_success(outcome);
+    ustore_graph_write_vertices_t write_vertices {.database = database,
+                                                  .outcome = &outcome,
+                                                  .count = keys.size(),
+                                                  .collections = {&graph, 0},
+                                                  .vertices = {keys.data(), sizeof(ustore_key_t)}};
+    ustore_graph_write_vertices(&write_vertices);
+    failures += expect_success(outcome);
+    std::string_view const markup = "<a/>";
+    strided_strings<std::string_view> const markups {{&markup, 0}};
+    ustore_pages_import_t import {};
+    import.database = database, import.outcome = &outcome, import.count = keys.size(), import.collections = {&pages, 0};
+    import.keys = {keys.data(), sizeof(ustore_key_t)}, import.values = markups.view();
+    import.encoding = ustore_page_encoding_xml_k;
+    ustore_pages_import(&import);
+    failures += expect_success(outcome);
+
+    // Lists the keys of one collection through @p scan, comparing them to @p wanted or the status to @p refused
+    auto expect_listed = [&]<typename scan_type_>(void (*scan)(scan_type_*), ustore_collection_id_t collection,
+                                                  std::span<ustore_key_t const> wanted,
+                                                  status_code_t refused = status_code_t::success_k) {
+        ustore_length_t const* offsets = nullptr;
+        ustore_key_t const* found = nullptr;
+        scan_type_ arguments {};
+        arguments.database = database, arguments.outcome = &outcome, arguments.count = 1;
+        arguments.collections = {&collection, 0}, arguments.offsets = &offsets, arguments.keys = &found;
+        arguments.arena = arena, arguments.wanted = 8;
+        scan(&arguments);
+        if (refused != status_code_t::success_k) return expect_status(status_t {outcome}, refused);
+        std::size_t listing_failures = expect_success(outcome) + expect(offsets != nullptr);
+        if (listing_failures) return listing_failures;
+        std::span<ustore_key_t const> const listed {found + offsets[0], found + offsets[1]};
+        return expect(std::equal(listed.begin(), listed.end(), wanted.begin(), wanted.end()));
+    };
+    failures += expect_listed(&ustore_docs_scan, docs, keys);
+    failures += expect_listed(&ustore_graph_scan_vertices, graph, keys);
+    failures += expect_listed(&ustore_pages_scan, pages, keys);
+    failures += expect_listed(&ustore_blobs_scan, docs, {}, status_code_t::invalid_argument_k);
+    failures += expect_listed(&ustore_docs_scan, graph, {}, status_code_t::invalid_argument_k);
+    failures += expect_listed(&ustore_graph_scan_vertices, pages, {}, status_code_t::invalid_argument_k);
+    failures += expect_listed(&ustore_pages_scan, docs, {}, status_code_t::invalid_argument_k);
+
+    ustore_docs_remove_t remove {.database = database,
+                                 .outcome = &outcome,
+                                 .count = 1,
+                                 .collections = {&docs, 0},
+                                 .keys = {keys.data(), sizeof(ustore_key_t)}};
+    ustore_docs_remove(&remove);
+    failures += expect_success(outcome);
+    failures += expect_listed(&ustore_docs_scan, docs, std::span {keys}.subspan(1));
+    remove.collections = {&graph, 0};
+    ustore_docs_remove(&remove);
+    failures += expect_status(status_t {outcome}, status_code_t::invalid_argument_k);
     return failures;
 }
 
@@ -2639,6 +2828,9 @@ case_result_t pages_refusals(config_t const& config) {
     if (failures != 0) return failures;
     failures += expect(owner.clear(ustore_drop_collection_k).succeeded());
     ustore_database_t const database = owner;
+    auto [pages, pages_status] = create_collection(database, "pages", ustore_modality_pages_k);
+    failures += expect(pages_status.succeeded());
+    if (failures != 0) return failures;
 
     ustore_key_t const page = key_from_integer(901);
     ustore_key_t const missing = key_from_integer(902);
@@ -2648,7 +2840,7 @@ case_result_t pages_refusals(config_t const& config) {
         strided_strings<std::string_view> const values {{&markup, 0}};
         ustore_outcome_t outcome {};
         ustore_pages_import_t import {};
-        import.database = database, import.outcome = &outcome, import.count = 1;
+        import.database = database, import.outcome = &outcome, import.count = 1, import.collections = {&pages, 0};
         import.keys = {key, 0}, import.values = values.view();
         std::memcpy(reinterpret_cast<std::byte*>(&import.encoding), &encoding, sizeof(encoding));
         ustore_pages_import(&import);
@@ -2673,7 +2865,8 @@ case_result_t pages_refusals(config_t const& config) {
     ustore_key_t const* effective = nullptr;
     ustore_outcome_t outcome {};
     ustore_pages_insert_t insert {};
-    insert.database = database, insert.outcome = &outcome, insert.count = 1, insert.keys = {&missing, 0};
+    insert.database = database, insert.outcome = &outcome, insert.count = 1, insert.collections = {&pages, 0};
+    insert.keys = {&missing, 0};
     insert.values = fragments.view(), insert.encoding = ustore_page_encoding_xml_k;
     insert.effective_keys = &effective, insert.arena = arena;
     ustore_pages_insert(&insert);
@@ -2689,13 +2882,15 @@ case_result_t pages_refusals(config_t const& config) {
     failures += expect(effective != nullptr);
 
     ustore_pages_remove_t remove {};
-    remove.database = database, remove.outcome = &outcome, remove.count = 1, remove.keys = {&page, 0};
+    remove.database = database, remove.outcome = &outcome, remove.count = 1, remove.collections = {&pages, 0};
+    remove.keys = {&page, 0};
     ustore_pages_remove(&remove);
     failures += refused(outcome, status_code_t::invalid_argument_k);
 
     ustore_key_t const element = page;
     ustore_pages_splice_t splice {};
-    splice.database = database, splice.outcome = &outcome, splice.count = 1, splice.keys = {&missing, 0};
+    splice.database = database, splice.outcome = &outcome, splice.count = 1, splice.collections = {&pages, 0};
+    splice.keys = {&missing, 0};
     splice.elements = {&element, 0};
     ustore_pages_splice(&splice);
     failures += refused(outcome, status_code_t::not_found_k);
@@ -2703,8 +2898,8 @@ case_result_t pages_refusals(config_t const& config) {
     ustore_octet_t const* presences = nullptr;
     ustore_strings_view_t values {};
     ustore_pages_read_t read {};
-    read.database = database, read.outcome = &outcome, read.count = 1, read.keys = {&page, 0};
-    read.presences = &presences, read.values = &values, read.arena = arena;
+    read.database = database, read.outcome = &outcome, read.count = 1, read.collections = {&pages, 0};
+    read.keys = {&page, 0}, read.presences = &presences, read.values = &values, read.arena = arena;
     read.outputs_encoding = ustore_page_encoding_html_k;
     ustore_pages_read(&read);
     failures += refused(outcome, status_code_t::unsupported_k);
@@ -3478,6 +3673,8 @@ int main(int argc, char** argv) {
     report(totals, "database.write_broadcast", database_write_broadcast, config);
     report(totals, "database.unknown_layout", database_unknown_layout, config);
     report(totals, "database.zeroed_fields", database_zeroed_fields, config);
+    report(totals, "database.modality_refusals", database_modality_refusals, config);
+    report(totals, "database.modality_keys", database_modality_keys, config);
     report(totals, "database.strings_layouts", database_strings_layouts, config);
     report(totals, "database.measure_whole", database_measure_whole, config);
     report(totals, "database.remove", database_remove, config);

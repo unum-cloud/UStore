@@ -64,11 +64,11 @@ constexpr std::string_view commands_k = R"(Commands:
   collection create --collection <name>
   collection drop --collection <name>
   collection list
-  collection import --input <file> --id-field <field> --memory-limit <size> [--collection <name>]
-  collection export --output <file> --memory-limit <size> [--collection <name>]
+  collection import --input <file> --id-field <field> --memory-limit <size> --collection <name>
+  collection export --output <file> --memory-limit <size> --collection <name>
   snapshot save <path>
 
-Files end in .ndjson or .csv, and a command without --collection acts on the main collection.)";
+Files end in .ndjson or .csv, and every collection a command creates holds documents.)";
 
 #pragma region Parsing
 
@@ -95,7 +95,7 @@ struct command_line_t {
     /** The engine to open and the options of its init call. */
     engine_options_t engine;
 
-    /** Collection name, empty for the main collection. */
+    /** Collection name. */
     std::string_view collection;
 
     /** File a document import reads. */
@@ -132,14 +132,14 @@ struct command_line_t {
             return nullptr;
         }
         if (action == "import") {
-            if (line.input.empty() || line.id_field.empty() || line.memory_limit.value == 0)
-                return "An import needs --input, --id-field and --memory-limit";
+            if (line.input.empty() || line.id_field.empty() || line.memory_limit.value == 0 || line.collection.empty())
+                return "An import needs --input, --id-field, --memory-limit and --collection";
             line.command = command_t::collection_import_k;
             return nullptr;
         }
         if (action == "export") {
-            if (line.output.empty() || line.memory_limit.value == 0)
-                return "An export needs --output and --memory-limit";
+            if (line.output.empty() || line.memory_limit.value == 0 || line.collection.empty())
+                return "An export needs --output, --memory-limit and --collection";
             line.command = command_t::collection_export_k;
             return nullptr;
         }
@@ -171,13 +171,9 @@ void print_failure(char const* what, ustore_outcome_t const& outcome) noexcept {
     fmt::println(style_of(tone_t::failure_k), "{}: {}", what, outcome.message);
 }
 
-/** Resolves @p name to a collection ID through a one-off arena, the main collection for an empty name. */
+/** Resolves @p name to a collection ID through a one-off arena. */
 void find_collection(ustore_database_t database, std::string_view name, ustore_collection_id_t& id,
                      ustore_outcome_t* outcome) noexcept {
-    if (name.empty()) {
-        id = ustore_collection_main_k;
-        return;
-    }
     auto [arena, arena_status] = arena_t::make();
     if (arena_status.failed()) {
         *outcome = arena_status;
@@ -200,7 +196,7 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
     else id = ids[0];
 }
 
-/** Creates a collection under @p name. */
+/** Creates a collection of documents under @p name. */
 [[nodiscard]] bool create_collection(ustore_database_t database, std::string_view name) noexcept {
     ustore_outcome_t outcome {};
     ustore_collection_id_t id {};
@@ -208,6 +204,7 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
     create.database = database;
     create.outcome = &outcome;
     create.name = bytes_of(name);
+    create.modality = ustore_modality_docs_k;
     create.collection = &id;
     ustore_collection_create(&create);
     if (failed(outcome)) {
@@ -365,7 +362,7 @@ int main(int argc, char* argv[]) {
         {"--engine", "name", "engine to open: ram, rocksdb, leveldb or nvme", &line.engine.name},
         {"--isolation", "name", "isolation of the transactions of ram", &line.engine.isolation},
         {"--engine-transport", "name", "transport of nvme", &line.engine.transport},
-        {"--collection", "name", "collection a command acts on, the main one when omitted", &line.collection},
+        {"--collection", "name", "collection a command acts on", &line.collection},
         {"--input", "file", "file a collection import reads", &line.input},
         {"--output", "file", "file a collection export writes", &line.output},
         {"--id-field", "field", "field holding the keys of imported documents", &line.id_field},

@@ -694,6 +694,36 @@ PyObject* ustore_py_api_docs_write(PyObject* self, PyObject* const* args, Py_ssi
                            (ustore_docs_modification_t)modification, call);
 }
 
+char const doc_docs_remove[] =                                                                  //
+    "docs_remove(keys, *, collection=None, durability=Durability.BUFFERED) answers None.\n"     //
+    "\n"                                                                                        //
+    "Removes a batch of whole documents, or one given on its own; a patch or a merge removes\n" //
+    "fields inside them instead.\n"                                                             //
+    "\n"                                                                                        //
+    "Args:\n"                                                                                   //
+    "  keys (KeyLike | Sequence[KeyLike] | buffer): The keys of the documents to remove.\n"     //
+    "  collection (UUID | str, optional): The docs collection, by identifier or by name.\n"     //
+    "  durability (Durability, optional): `Durability.FLUSHED` reaches the drive before\n"      //
+    "    returning.";
+
+PyObject* ustore_py_api_docs_remove(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                                    PyObject* args_names_tuple) {
+    ustore_py_context_t context;
+    if (ustore_py_context_from_object(self, &context) != 0 || ustore_py_context_writable(&context) != 0) return NULL;
+    if (ustore_py_args_names_count_checked("docs_remove", positional_args_count, args_names_tuple, 1) < 0) return NULL;
+
+    ustore_py_verb_options_t options;
+    if (ustore_py_verb_options_from_keywords(&context, args, positional_args_count, args_names_tuple, &options) != 0)
+        return NULL;
+
+    ustore_py_remove_call_t stack;
+    ustore_py_remove_call_t* const call = ustore_py_call_open(&context, &ustore_py_remove_verb, &stack);
+    if (!call) return NULL;
+    if (ustore_py_keys_from_subscript(args[0], &call->keys) < 0)
+        return ustore_py_call_discard(&context, &ustore_py_remove_verb, call);
+    return ustore_py_values_remove(&context, &options, ustore_modality_docs_k, call);
+}
+
 #pragma endregion Writes
 
 #pragma region Reads
@@ -914,6 +944,32 @@ PyObject* ustore_py_api_docs_gist(PyObject* self, PyObject* const* args, Py_ssiz
         .arena = ustore_py_arena_handle(call->call.arena),
     };
     return ustore_py_call_run(&context, &gist_verb, call, &gist);
+}
+
+char const doc_docs_scan[] =                                                                      //
+    "docs_scan(start, wanted, arena, *, collection=None, mode=ScanMode.ORDERED, progress=None)\n" //
+    "answers a Keys tape.\n"                                                                      //
+    "\n"                                                                                          //
+    "Lists up to `wanted` document keys from `start` upwards, as `scan` lists the keys of\n"      //
+    "blobs. Documents are not exported, so a `docs_read` follows the scan.\n"                     //
+    "\n"                                                                                          //
+    "Args:\n"                                                                                     //
+    "  start (KeyLike): The smallest key the scan may return.\n"                                  //
+    "  wanted (int): Most keys the scan returns.\n"                                               //
+    "  arena (Arena): Where the keys land, rewound by this call.\n"                               //
+    "  collection (UUID | str, optional): The docs collection, by identifier or by name.\n"       //
+    "  mode (ScanMode, optional): In what order the keys come, as `scan` takes it.\n"             //
+    "  progress (Callable[[int, int], bool | None], optional): Called with the scans\n"           //
+    "    finished and the scans in all; a falsy answer other than None cancels the call.\n"       //
+    "Returns:\n"                                                                                  //
+    "  Keys: One run of keys, in ascending order.\n"                                              //
+    "Raises:\n"                                                                                   //
+    "  CancelledError: The progress callable stopped the scan.";
+
+PyObject* ustore_py_api_docs_scan(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                                  PyObject* args_names_tuple) {
+    return ustore_py_api_scan_of(self, args, positional_args_count, args_names_tuple, "docs_scan",
+                                 ustore_modality_docs_k);
 }
 
 #pragma endregion Reads

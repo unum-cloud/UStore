@@ -337,6 +337,8 @@ static PyObject* Collection_sample_keys(Collection* self, PyObject* const* args,
 static char const doc_Collection_scan[] =                                                   //
     "scan(start, wanted, arena) answers a Keys tape of up to `wanted` keys from `start`.\n" //
     "\n"                                                                                    //
+    "Scans the keys of blobs, the documents or the vertices, as the collection holds.\n"    //
+    "\n"                                                                                    //
     "Args:\n"                                                                               //
     "  start (KeyLike): The smallest key the scan may return.\n"                            //
     "  wanted (int): Most keys the scan returns.\n"                                         //
@@ -354,7 +356,11 @@ static PyObject* Collection_scan(Collection* self, PyObject* const* args, Py_ssi
     ustore_py_verb_options_t options;
     if (collection_resolve(self, ustore_modality_any_k, collection_missing_refused_k, &context, &options) != 0)
         return NULL;
-    return ustore_py_keys_scan(&context, &options, &start, wanted, ustore_scan_ordered_k, NULL, args[2]);
+    ustore_modality_t held = ustore_modality_any_k;
+    ustore_py_critical_section_begin_((PyObject*)self);
+    held = self->modality;
+    ustore_py_critical_section_end_();
+    return ustore_py_keys_scan(&context, &options, held, &start, wanted, ustore_scan_ordered_k, NULL, args[2]);
 }
 
 static char const doc_Collection[] =                                                           //
@@ -466,7 +472,7 @@ static int collection_view_remove(CollectionView* self, PyObject* key, ustore_mo
         ustore_py_call_discard(&context, &ustore_py_remove_verb, &call);
         return -1;
     }
-    return answered_nothing(ustore_py_values_remove(&context, &options, &call));
+    return answered_nothing(ustore_py_values_remove(&context, &options, modality, &call));
 }
 
 /**

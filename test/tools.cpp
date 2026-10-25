@@ -248,16 +248,17 @@ class test_database_t {
         ustore_collection_drop(&drop);
     }
 
-    /** Creates an anonymous graph collection, answering its ID, or the main one after reporting why it could not. */
-    [[nodiscard]] ustore_collection_id_t create_graph(ustore_outcome_t& outcome) noexcept {
-        ustore_collection_id_t graph = ustore_collection_main_k;
+    /** Creates an anonymous collection holding @p modality, answering its ID, or the main one after reporting why it
+     *  could not. */
+    [[nodiscard]] ustore_collection_id_t create(ustore_modality_t modality, ustore_outcome_t& outcome) noexcept {
+        ustore_collection_id_t created = ustore_collection_main_k;
         ustore_collection_create_t create {};
         create.database = database_;
         create.outcome = &outcome;
-        create.modality = ustore_modality_graph_k;
-        create.collection = &graph;
+        create.modality = modality;
+        create.collection = &created;
         ustore_collection_create(&create);
-        return graph;
+        return created;
     }
 
     /** Drops @p collection together with its name. */
@@ -494,7 +495,7 @@ struct edge_row_t {
 
     std::size_t failures = 0;
     ustore_outcome_t outcome {};
-    ustore_collection_id_t const graph = database.create_graph(outcome);
+    ustore_collection_id_t const graph = database.create(ustore_modality_graph_k, outcome);
     failures += expect_success(outcome);
 
     ustore_graph_import_t importing {};
@@ -543,10 +544,13 @@ struct edge_row_t {
 
     std::size_t failures = 0;
     ustore_outcome_t outcome {};
+    ustore_collection_id_t const documents = database.create(ustore_modality_docs_k, outcome);
+    failures += expect_success(outcome);
+
     ustore_docs_import_t importing {};
     importing.database = database.get();
     importing.outcome = &outcome;
-    importing.collection = ustore_collection_main_k;
+    importing.collection = documents;
     importing.path = bytes_of(input);
     importing.max_batch_size = max_batch_size_k;
     importing.fields_count = selects ? fields.size() : 0;
@@ -558,7 +562,7 @@ struct edge_row_t {
     ustore_docs_export_t exporting {};
     exporting.database = database.get();
     exporting.outcome = &outcome;
-    exporting.collection = ustore_collection_main_k;
+    exporting.collection = documents;
     exporting.path = bytes_of(output);
     exporting.max_batch_size = max_batch_size_k;
     exporting.fields_count = importing.fields_count;
@@ -584,7 +588,7 @@ struct edge_row_t {
 
     std::size_t failures = 0;
     ustore_outcome_t outcome {};
-    ustore_collection_id_t const graph = database.create_graph(outcome);
+    ustore_collection_id_t const graph = database.create(ustore_modality_graph_k, outcome);
     failures += expect_success(outcome);
     ustore_graph_import_t valid {};
     valid.database = database.get();
@@ -634,10 +638,12 @@ struct edge_row_t {
 
     std::size_t failures = 0;
     ustore_outcome_t outcome {};
+    ustore_collection_id_t const graph = database.create(ustore_modality_graph_k, outcome);
+    failures += expect_success(outcome);
     ustore_graph_export_t valid {};
     valid.database = database.get();
     valid.outcome = &outcome;
-    valid.collection = ustore_collection_main_k;
+    valid.collection = graph;
     valid.path = bytes_of(output);
     valid.max_batch_size = max_batch_size_k;
     valid.source_id_field = bytes_of(source_field_k);
@@ -687,10 +693,12 @@ struct edge_row_t {
     std::size_t failures = 0;
     ustore_outcome_t outcome {};
     strided_strings<std::string_view> const names {strided(selected_columns_k).begin()};
+    ustore_collection_id_t const documents = database.create(ustore_modality_docs_k, outcome);
+    failures += expect_success(outcome);
     ustore_docs_import_t valid {};
     valid.database = database.get();
     valid.outcome = &outcome;
-    valid.collection = ustore_collection_main_k;
+    valid.collection = documents;
     valid.path = bytes_of(input);
     valid.max_batch_size = max_batch_size_k;
     valid.fields_count = std::size(selected_columns_k);
@@ -740,10 +748,12 @@ struct edge_row_t {
     std::size_t failures = 0;
     ustore_outcome_t outcome {};
     strided_strings<std::string_view> const names {strided(selected_columns_k).begin()};
+    ustore_collection_id_t const documents = database.create(ustore_modality_docs_k, outcome);
+    failures += expect_success(outcome);
     ustore_docs_export_t valid {};
     valid.database = database.get();
     valid.outcome = &outcome;
-    valid.collection = ustore_collection_main_k;
+    valid.collection = documents;
     valid.path = bytes_of(output);
     valid.max_batch_size = max_batch_size_k;
     valid.fields_count = std::size(selected_columns_k);
@@ -797,7 +807,7 @@ template <typename... arguments_type_>
     return built ? std::system(line.c_str()) : -1;
 }
 
-/** Creates, imports into, exports and drops a named collection, then imports and exports the main one. */
+/** Creates, imports into, exports and drops a named collection, and refuses an import naming no collection. */
 [[nodiscard]] std::size_t cli_round_trip(fixture_paths_t const& paths, config_t const& config,
                                          char const* cli) noexcept {
     std::size_t failures = 0;
@@ -842,14 +852,9 @@ template <typename... arguments_type_>
         }
     }
 
-    failures += expect_eq(run_command(cli, "--engine", engine, "--directory", directory, "collection", "import",
-                                      "--input", input, "--id-field", "id", "--memory-limit", "1MB"),
-                          0);
-    failures += expect_eq(run_command(cli, "--engine", engine, "--directory", directory, "collection", "export",
-                                      "--output", output, "--memory-limit", "1MB"),
-                          0);
-    failures += check_documents(output, input, field_selection_t::whole_k);
-    [[maybe_unused]] int const removed_main = std::remove(output);
+    // Documents live only in collections of documents, so an import naming none is refused
+    failures += expect(run_command(cli, "--engine", engine, "--directory", directory, "collection", "import", "--input",
+                                   input, "--id-field", "id", "--memory-limit", "1MB") != 0);
     return failures;
 }
 

@@ -2,7 +2,7 @@
  *  @file cpp/ustore/blobs_range.hpp
  *  @author Ash Vardanian
  *  @date June 26, 2022
- *  @brief A cursor over the keys and values of one binary collection, the streams built on it, and slices.
+ *  @brief A cursor over the keys and values of one binary collection, the streams of keys and pairs, and slices.
  */
 
 #pragma once
@@ -107,36 +107,92 @@ class blobs_cursor_t {
     }
 };
 
-/** A stream over the keys of one collection that pulls them in pages from a cursor.
- *  It keeps the cursor and the arena holding the page in hand, so it moves but never copies, and prefers @c seek to
- *  being rebuilt. As shorthand for a range-based loop, which has no place for an arena, it owns that one arena for
- *  its lifetime, where @c blobs_cursor_t takes the caller's per pull. A page short of the read-ahead ends the stream,
- *  and a default-constructed stream is at the end. */
+/** Scans up to @p wanted keys of @p collection from @p start into @p arena through @p scan_, the scan of one modality
+ *  keyed by UUIDs, at the view @p receiver reads. */
+template <typename scan_type_, void (*scan_)(scan_type_*)>
+expected<std::span<ustore_key_t const>> scan_keys_through(receiver_t receiver, ustore_collection_id_t collection,
+                                                          ustore_key_t start, std::size_t wanted,
+                                                          arena_t& arena) noexcept {
+    ustore_length_t const* offsets = nullptr;
+    ustore_key_t const* keys = nullptr;
+    ustore_outcome_t outcome {};
+    scan_type_ scan {};
+    scan.database = receiver.database;
+    scan.executor = receiver.executor;
+    scan.outcome = &outcome;
+    scan.view = receiver.view(ustore_watch_keys_k);
+    scan.count = 1;
+    scan.collections = {&collection, 0};
+    scan.start_keys = {&start, 0};
+    scan.offsets = &offsets;
+    scan.keys = &keys;
+    scan.arena = arena;
+    scan.wanted = wanted;
+    scan_(&scan);
+    if (status_t const status {outcome}; status.failed()) return status;
+    if (!offsets) return std::span<ustore_key_t const> {};
+    return std::span<ustore_key_t const> {keys + offsets[0], keys + offsets[1]};
+}
+
+/** Scans up to @p wanted keys of @p collection, which holds @p modality, from @p start into @p arena through the scan
+ *  of that modality: the documents, the vertices, the pages or the keys of blobs. */
+inline expected<std::span<ustore_key_t const>> scan_keys(receiver_t receiver, ustore_modality_t modality,
+                                                         ustore_collection_id_t collection, ustore_key_t start,
+                                                         std::size_t wanted, arena_t& arena) noexcept {
+    switch (modality) {
+    case ustore_modality_docs_k:
+        return scan_keys_through<ustore_docs_scan_t, &ustore_docs_scan>(receiver, collection, start, wanted, arena);
+    case ustore_modality_graph_k:
+        return scan_keys_through<ustore_graph_scan_vertices_t, &ustore_graph_scan_vertices>(receiver, collection, start,
+                                                                                            wanted, arena);
+    case ustore_modality_pages_k:
+        return scan_keys_through<ustore_pages_scan_t, &ustore_pages_scan>(receiver, collection, start, wanted, arena);
+    default:
+        return scan_keys_through<ustore_blobs_scan_t, &ustore_blobs_scan>(receiver, collection, start, wanted, arena);
+    }
+}
+
+/** A stream over the keys of one collection that pulls them in pages through the scan of its modality, each page
+ *  resuming past the last key of the one before it. It keeps the arena holding the page in hand, so it moves but never
+ *  copies, and prefers @c seek to being rebuilt. As shorthand for a range-based loop, which has no place for an arena,
+ *  it owns that one arena for its lifetime. A page short of the read-ahead ends the stream, and a default-constructed
+ *  stream is at the end. */
 class keys_stream_t {
 
     friend class graph_stream_t;
 
     receiver_t receiver_ {};
     ustore_collection_id_t collection_ {ustore_collection_main_k};
+    ustore_modality_t modality_ {ustore_modality_blobs_k};
 
-    blobs_cursor_t cursor_;
     arena_t arena_;
     std::size_t read_ahead_ {1};
 
     std::span<ustore_key_t const> fetched_keys_ {};
     std::size_t fetched_offset_ {0};
 
-    keys_stream_t(receiver_t receiver, ustore_collection_id_t collection, arena_t arena,
+    keys_stream_t(receiver_t receiver, ustore_collection_id_t collection, ustore_modality_t modality, arena_t arena,
                   std::size_t read_ahead) noexcept
-        : receiver_(receiver), collection_(collection), arena_(std::move(arena)),
+        : receiver_(receiver), collection_(collection), modality_(modality), arena_(std::move(arena)),
           read_ahead_(read_ahead ? read_ahead : 1) {}
 
-    status_t prefetch() noexcept {
-        auto [found_keys, pull_status] = cursor_.next(read_ahead_, arena_);
-        if (pull_status.failed()) return pull_status;
+    /** Pulls the page starting at @p start, rewinding the arena that held the page before it. */
+    status_t fetch(ustore_key_t start) noexcept {
+        auto [found_keys, scan_status] = scan_keys(receiver_, modality_, collection_, start, read_ahead_, arena_);
+        if (scan_status.failed()) return scan_status;
         fetched_keys_ = found_keys;
         fetched_offset_ = 0;
         return {};
+    }
+
+    /** Pulls the page past the one in hand, which is empty once that page ended at the largest key. */
+    status_t prefetch() noexcept {
+        if (fetched_keys_.empty() || fetched_keys_.back() == largest_key_k) {
+            fetched_keys_ = {};
+            fetched_offset_ = 0;
+            return {};
+        }
+        return fetch(key_after(fetched_keys_.back()));
     }
 
   public:
@@ -152,24 +208,20 @@ class keys_stream_t {
     keys_stream_t(keys_stream_t const&) = delete;
     keys_stream_t& operator=(keys_stream_t const&) = delete;
 
-    /** Opens a stream over the keys of @p collection from @p start, pulling @p read_ahead of them a page into an
-     *  arena of its own, made where the executor of @p receiver computes. */
+    /** Opens a stream over the keys of @p collection, which holds @p modality, from @p start, pulling @p read_ahead of
+     *  them a page into an arena of its own, made where the executor of @p receiver computes. */
     static expected<keys_stream_t> make(receiver_t receiver, ustore_collection_id_t collection, ustore_key_t start,
-                                        std::size_t read_ahead = default_read_ahead_k) noexcept {
+                                        std::size_t read_ahead = default_read_ahead_k,
+                                        ustore_modality_t modality = ustore_modality_blobs_k) noexcept {
         auto [arena, arena_status] = arena_t::make(receiver.executor);
         if (arena_status.failed()) return arena_status;
-        keys_stream_t stream {receiver, collection, std::move(arena), read_ahead};
+        keys_stream_t stream {receiver, collection, modality, std::move(arena), read_ahead};
         if (status_t const sought = stream.seek(start); sought.failed()) return sought;
         return stream;
     }
 
-    /** Restarts the stream at @p key, through a cursor opened there. */
-    status_t seek(ustore_key_t key) noexcept {
-        auto [cursor, cursor_status] = blobs_cursor_t::make(receiver_, collection_, key);
-        if (cursor_status.failed()) return cursor_status;
-        cursor_ = std::move(cursor);
-        return prefetch();
-    }
+    /** Restarts the stream at @p key. */
+    status_t seek(ustore_key_t key) noexcept { return fetch(key); }
 
     status_t advance() noexcept {
         if (fetched_offset_ + 1 < fetched_keys_.size()) ++fetched_offset_;
@@ -325,28 +377,33 @@ struct size_estimates_t {
     size_range_t bytes_on_disk;
 };
 
-/** A slice of keys in one collection, which streams its keys or pairs and estimates its size. */
+/** A slice of keys in one collection, which streams its keys through the scan of the collection's @c modality, and,
+ *  in a blobs collection, streams its pairs and estimates its size. */
 class blobs_range_t {
 
     receiver_t receiver_;
     ustore_collection_id_t collection_;
     ustore_key_t start_key_;
     ustore_key_t end_key_;
+    ustore_modality_t modality_;
 
   public:
     blobs_range_t(receiver_t receiver, ustore_collection_id_t collection = ustore_collection_main_k,
-                  ustore_key_t start_key = smallest_key_k, ustore_key_t end_key = largest_key_k) noexcept
-        : receiver_(receiver), collection_(collection), start_key_(start_key), end_key_(end_key) {}
+                  ustore_key_t start_key = smallest_key_k, ustore_key_t end_key = largest_key_k,
+                  ustore_modality_t modality = ustore_modality_blobs_k) noexcept
+        : receiver_(receiver), collection_(collection), start_key_(start_key), end_key_(end_key), modality_(modality) {}
 
     receiver_t receiver() const noexcept { return receiver_; }
     ustore_collection_id_t collection() const noexcept { return collection_; }
 
     expected<keys_stream_t> keys_begin(std::size_t read_ahead = keys_stream_t::default_read_ahead_k) noexcept {
-        return keys_stream_t::make(receiver_, collection_, start_key_, read_ahead);
+        return keys_stream_t::make(receiver_, collection_, start_key_, read_ahead, modality_);
     }
 
     /** The first key at or past the upper bound, which an unbounded range never fetches. */
-    expected<keys_stream_t> keys_end() noexcept { return keys_stream_t::make(receiver_, collection_, end_key_, 1); }
+    expected<keys_stream_t> keys_end() noexcept {
+        return keys_stream_t::make(receiver_, collection_, end_key_, 1, modality_);
+    }
 
     expected<pairs_stream_t> pairs_begin(std::size_t read_ahead = pairs_stream_t::default_read_ahead_k) noexcept {
         return pairs_stream_t::make(receiver_, collection_, start_key_, read_ahead);

@@ -16,9 +16,11 @@ UStore's sources split into four folders:
 - `db.h`: databases, collections, snapshots, transactions, views, strided runs of keys and enum spellings.
 - `blobs.h`: binary values, through `ustore_blobs_write`, `_remove`, `_read`, `_scan`, `_sample`, `_measure` and cursors.
 - `strings.h`: string-keyed values, through `ustore_strings_write`, `_remove`, `_read`, `_scan` and cursors.
-- `docs.h`: JSON documents, through `ustore_docs_write`, `ustore_docs_read`, `ustore_docs_gist` and `ustore_docs_gather`.
-- `graph.h`: graph edges and vertices.
-- `pages.h`: ordered documents, through one verb per edit and `ustore_pages_read`.
+- `docs.h`: JSON documents, through `ustore_docs_write`, `_read`, `_gist`, `_gather`, `_remove` and `_scan`.
+- `graph.h`: graph edges and vertices, and the scans of the vertices.
+- `pages.h`: ordered documents, through one verb per edit, `ustore_pages_read` and `ustore_pages_scan`.
+
+Every verb serves only collections of its own modality, and answers `ustore_status_invalid_argument_k` for a collection holding another.
 
 ## Installation
 
@@ -469,10 +471,11 @@ The callback runs on the thread that runs the call, the caller's for a blocking 
 A document collection stores JSON text, so reading a document back through `ustore_blobs_read` may not return the exact bytes written.
 A field addresses a value inside a document, either as a top-level key such as `_id` or as an RFC 6901 JSON Pointer such as `/posts/0/text`, while an empty field or a zeroed `fields` view addresses the whole document.
 
-- `ustore_docs_write` upserts, updates or inserts whole documents or fields, or applies RFC 6902 patches or RFC 7386 merge patches, as its `modification` selects; whole documents are removed with `ustore_blobs_remove`.
+- `ustore_docs_write` upserts, updates or inserts whole documents or fields, or applies RFC 6902 patches or RFC 7386 merge patches, as its `modification` selects.
 - `ustore_docs_read` reads whole documents or fields, as JSON or as values printed into text.
 - `ustore_docs_gist` lists the unique JSON Pointers to the leaves of the requested documents.
 - `ustore_docs_gather` reads many fields of many documents into typed columns, with validity, conversion and collision bitmaps per column.
+- `ustore_docs_remove` removes whole documents, and `ustore_docs_scan` lists their keys as `ustore_blobs_scan` lists the keys of blobs.
 
 ```c
 ustore_key_t key = {.uuid.bytes[15] = 1};
@@ -517,6 +520,7 @@ Several edges between the same two vertices need distinct edge identifiers, and 
 - `ustore_graph_read_edges` exports the degree and the edges of every requested vertex in the requested role.
 - `ustore_graph_remove_edges` removes edges and keeps their vertices.
 - `ustore_graph_remove_vertices` removes vertices together with all their edges.
+- `ustore_graph_scan_vertices` lists the vertices, those without edges included, as `ustore_blobs_scan` lists keys; a missing vertex reads with the degree `ustore_vertex_degree_missing_k`.
 
 ```c
 typedef struct triplet_t {
@@ -580,7 +584,7 @@ A scan lists up to `wanted` strings under every prefix as one tape, split by tas
 ## Pages
 
 A pages collection stores ordered documents, edited by one verb per kind of edit, each taking only its own fields: `ustore_pages_import`, `_insert`, `_remove`, `_move`, `_splice`, `_set_attributes` and `_remove_attributes`.
-`ustore_pages_read` reads documents back into an arena.
+`ustore_pages_read` reads documents back into an arena, and `ustore_pages_scan` lists the keys of the pages.
 A page stores only its current shape, so no call lists the edits that produced it.
 Every engine serves them, importing and rendering XML and plain text, while HTML, Markdown and the JSON tree answer `ustore_status_unsupported_k`.
 An edit watches the page it rewrites, except on a pages collection of the NVMe engine, which keeps the edits themselves, so two transactions editing one page both commit.

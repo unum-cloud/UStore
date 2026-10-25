@@ -279,7 +279,7 @@ class docs_ref : public docs_read_ref<locations_type_> {
                 return status_t {status_code_t::invalid_argument_k, "A field is removed by a patch or a merge"};
 
         ustore_outcome_t outcome {};
-        ustore_blobs_remove_t remove {};
+        ustore_docs_remove_t remove {};
         remove.database = this->receiver_.database;
         remove.executor = this->receiver_.executor;
         remove.outcome = &outcome;
@@ -288,7 +288,7 @@ class docs_ref : public docs_read_ref<locations_type_> {
         remove.collections = {collections.get(), collections.stride()};
         remove.keys = {keys.get(), keys.stride()};
         remove.durability = durability;
-        ustore_blobs_remove(&remove);
+        ustore_docs_remove(&remove);
         return status_t {outcome};
     }
 

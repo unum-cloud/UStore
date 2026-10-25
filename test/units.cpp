@@ -1233,7 +1233,9 @@ std::size_t database_docs_flat(config_t const& config) {
     if (failures != 0) return failures;
     failures += expect(database.clear(ustore_drop_collection_k).succeeded());
 
-    docs_collection_t collection = database.main<docs_collection_t>();
+    auto [collection, collection_status] = database.create<docs_collection_t>("docs");
+    failures += expect(collection_status.succeeded());
+    if (failures != 0) return failures;
     failures += expect(collection[key_from_integer(1)].assign(flat_documents_k[0]).succeeded());
     failures += expect(collection[key_from_integer(2)].assign(flat_documents_k[1]).succeeded());
     failures += expect(collection[key_from_integer(3)].assign(flat_documents_k[2]).succeeded());
@@ -1256,7 +1258,9 @@ std::size_t database_docs_nested_batch(config_t const& config) {
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
     failures += expect(database.clear(ustore_drop_collection_k).succeeded());
-    docs_collection_t collection = database.main<docs_collection_t>();
+    auto [collection, collection_status] = database.create<docs_collection_t>("docs");
+    failures += expect(collection_status.succeeded());
+    if (failures != 0) return failures;
 
     documents_tape_t tape;
     ustore_strings_view_t const values = tape.values();
@@ -1310,7 +1314,9 @@ std::size_t database_docs_modify(config_t const& config) {
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
     failures += expect(database.clear(ustore_drop_collection_k).succeeded());
-    docs_collection_t collection = database.main<docs_collection_t>();
+    auto [collection, collection_status] = database.create<docs_collection_t>("docs");
+    failures += expect(collection_status.succeeded());
+    if (failures != 0) return failures;
     failures += expect(collection[key_from_integer(1)].assign(nested_documents_k[0].data()).succeeded());
     failures += expect(json_equal(as_text(*collection[key_from_integer(1)].value()), nested_documents_k[0]));
 
@@ -1478,7 +1484,9 @@ std::size_t database_docs_merge_and_patch(config_t const& config) {
     failures += expect(open_status.succeeded());
     if (failures != 0) return failures;
     failures += expect(database.clear(ustore_drop_collection_k).succeeded());
-    docs_collection_t collection = database.main<docs_collection_t>();
+    auto [collection, collection_status] = database.create<docs_collection_t>("docs");
+    failures += expect(collection_status.succeeded());
+    if (failures != 0) return failures;
 
     failures += check_modification_cases(collection, document_modification_t::patch_k);
     failures += check_modification_cases(collection, document_modification_t::merge_k);
@@ -1493,7 +1501,9 @@ std::size_t database_docs_table(config_t const& config) {
     if (failures != 0) return failures;
     failures += expect(database.clear(ustore_drop_collection_k).succeeded());
 
-    docs_collection_t collection = database.main<docs_collection_t>();
+    auto [collection, collection_status] = database.create<docs_collection_t>("docs");
+    failures += expect(collection_status.succeeded());
+    if (failures != 0) return failures;
     char const* const alice = R"({"person":"Alice","age":27,"height":1})";
     char const* const bob = R"({"person":"Bob","age":"27","weight":2})";
     char const* const carl = R"({"person":"Carl","age":24})";
@@ -2439,7 +2449,6 @@ case_result_t database_pages_random_streams(config_t const& config) {
     if (failures != 0) return failures;
     failures += expect(database.clear(ustore_drop_collection_k).succeeded());
     if (!serves_pages(database)) return case_result_t::skipped("the engine serves no pages yet", failures);
-    bool const collections = database.supports_collections();
     bool const snapshots = database.supports_snapshots();
 
     std::mt19937_64 random(42);
@@ -2449,11 +2458,10 @@ case_result_t database_pages_random_streams(config_t const& config) {
         failures += expect(arena_status.succeeded());
         if (failures) return failures;
         client.arena = std::move(arena);
-        if (collections && stream_index % 2) {
-            auto [created, create_status] = create_pages_collection(database, fmt::format("pages-{}", stream_index));
-            failures += expect(create_status.succeeded());
-            client.collection = created;
-        }
+        auto [created, create_status] = create_pages_collection(database, fmt::format("pages-{}", stream_index));
+        failures += expect(create_status.succeeded());
+        if (failures) return failures;
+        client.collection = created;
 
         page_stream_t stream(random, stream_index);
         ustore_snapshot_t snapshot = nullptr;
@@ -2602,7 +2610,8 @@ case_result_t database_pages_random_streams(config_t const& config) {
 }
 
 /** Edits of one page in a transaction stay invisible until it commits, and a concurrent transaction that edited the
- *  same page fails to commit, since every edit watches the page it rewrites. */
+ *  same page either fails to commit, where every edit watches the page it rewrites, or lands beside the first, where
+ *  the engine keeps a page as its edits. */
 case_result_t database_pages_transactions(config_t const& config) {
     std::size_t failures = 0;
     auto [database, open_status] = open_database<database_t>(config);
@@ -2612,9 +2621,10 @@ case_result_t database_pages_transactions(config_t const& config) {
     if (!serves_pages(database)) return case_result_t::skipped("the engine serves no pages yet", failures);
     if (!database.supports_transactions()) return case_result_t::skipped("the engine keeps no transactions", failures);
 
-    pages_client_t head {database};
+    auto [pages, pages_status] = create_pages_collection(database, "pages");
+    pages_client_t head {database, pages};
     auto [arena, arena_status] = arena_t::make();
-    failures += expect(arena_status.succeeded());
+    failures += expect(pages_status.succeeded() && arena_status.succeeded());
     if (failures) return failures;
     head.arena = std::move(arena);
     element_key_t const page = element_key_of(key_from_integer(7));
@@ -2624,8 +2634,8 @@ case_result_t database_pages_transactions(config_t const& config) {
     auto [second, second_status] = database.transaction();
     failures += expect(first_status.succeeded() && second_status.succeeded());
     if (failures) return failures;
-    pages_client_t first_client {database, ustore_collection_main_k, first.transaction()};
-    pages_client_t second_client {database, ustore_collection_main_k, second.transaction()};
+    pages_client_t first_client {database, pages, first.transaction()};
+    pages_client_t second_client {database, pages, second.transaction()};
     auto [first_arena, first_arena_status] = arena_t::make();
     auto [second_arena, second_arena_status] = arena_t::make();
     failures += expect(first_arena_status.succeeded() && second_arena_status.succeeded());
@@ -2648,8 +2658,11 @@ case_result_t database_pages_transactions(config_t const& config) {
                           std::string("<p>two</p><doc><p>one</p></doc>"));
     failures += expect(first.commit().has_value());
     failures += expect_eq(head.read(page), std::string("<p>two</p><doc><p>one</p></doc>"));
-    failures += expect(!second.commit().has_value());
-    failures += expect_eq(head.read(page), std::string("<p>two</p><doc><p>one</p></doc>"));
+
+    // A page rewritten whole conflicts, while a page kept as its edits lands both, folded in commit order
+    bool const both_landed = second.commit().has_value();
+    failures += expect_eq(head.read(page), std::string(both_landed ? "lead<p>two</p><doc><p>one</p></doc>"
+                                                                   : "<p>two</p><doc><p>one</p></doc>"));
     return failures;
 }
 
@@ -2663,15 +2676,16 @@ case_result_t database_pages_all_or_nothing(config_t const& config) {
     failures += expect(database.clear(ustore_drop_collection_k).succeeded());
     if (!serves_pages(database)) return case_result_t::skipped("the engine serves no pages yet", failures);
 
-    pages_client_t client {database};
+    auto [pages, pages_status] = create_pages_collection(database, "pages");
+    pages_client_t client {database, pages};
     auto [arena, arena_status] = arena_t::make();
-    failures += expect(arena_status.succeeded());
+    failures += expect(pages_status.succeeded() && arena_status.succeeded());
     if (failures) return failures;
     client.arena = std::move(arena);
-    blobs_collection_t collection = database.main();
     auto stored_keys = [&] {
         std::vector<ustore_key_t> keys;
-        auto [stream, stream_status] = keys_stream_t::make(database.receiver(), collection, smallest_key_k, 256);
+        auto [stream, stream_status] = keys_stream_t::make(database.receiver(), pages, smallest_key_k, 256,
+                                                           ustore_modality_pages_k);
         failures += expect(stream_status.succeeded());
         for (; stream_status.succeeded() && !stream.is_end(); ++stream) keys.push_back(stream.key());
         return keys;
@@ -2712,8 +2726,14 @@ status_t scan_reporting_progress(ustore_blobs_scan_t const& arguments, view_t co
 /** Leaves the stand-in database to the case holding it. */
 void leave_database(ustore_database_t) noexcept {}
 
+/** The stand-in engine's only database verb, which leaves the database to the case. */
+database_verbs_t const progress_database_verbs_k {.database_free = &leave_database};
+
+/** The stand-in engine's only blobs verb, a scan reporting its progress once. */
+blobs_verbs_t const progress_blobs_verbs_k {.scan = &scan_reporting_progress};
+
 /** An engine serving only scans, each reporting its progress once, so a call stays unfinished while a case needs. */
-engine_t const progress_engine_k {.blobs_scan = &scan_reporting_progress, .database_free = &leave_database};
+engine_t const progress_engine_k {.database = &progress_database_verbs_k, .blobs = &progress_blobs_verbs_k};
 
 /** How far a scan held inside its progress callback got. */
 enum class hold_stage_t : std::uint32_t {
@@ -2857,8 +2877,12 @@ std::size_t executor_deferred_docs(config_t const& config) {
     failures += expect(arena_status.succeeded());
     if (failures != 0) return failures;
 
+    failures += expect(database.create<docs_collection_t>("docs").has_value());
+    auto [collection, collection_status] = database.deferred(executor).find<docs_collection_t>("docs");
+    failures += expect(collection_status.succeeded());
+    if (failures != 0) return failures;
+
     std::array<ustore_key_t, 2> const keys {key_from_integer(81), key_from_integer(82)};
-    deferred_docs_collection_t collection = database.deferred(executor).main<docs_collection_t>();
     values_tape_t documents;
     failures += fill_tape(documents, {flat_documents_k[0], flat_documents_k[1]});
     failures += expect(collection.write(keys, std::move(documents)).wait().succeeded());

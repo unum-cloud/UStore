@@ -414,7 +414,7 @@ inline void hold(ustore_database_t database, void* opened) noexcept {
 
 /** Drops one hold on @p database, if any, closing it through its engine with the last. */
 inline void release_hold(ustore_database_t database) noexcept {
-    if (database && drop_hold(database)) engine_of(database).database_free(database);
+    if (database && drop_hold(database)) engine_of(database).database->database_free(database);
 }
 
 /** Drops one hold on the transaction or snapshot @p view names, if any, freeing it through its engine with the last,
@@ -423,8 +423,8 @@ inline void release_parent(view_t const& view) noexcept {
     void* const parent = view.transaction ? static_cast<void*>(view.transaction) : view.snapshot;
     if (!parent || !drop_hold(parent)) return;
     ustore_database_t const database = handle_cast<handle_t>(parent)->database;
-    if (view.transaction) engine_of(parent).transaction_free(view.transaction);
-    else engine_of(parent).snapshot_free(view.snapshot);
+    if (view.transaction) engine_of(parent).database->transaction_free(view.transaction);
+    else engine_of(parent).database->snapshot_free(view.snapshot);
     release_hold(database);
 }
 
@@ -495,8 +495,20 @@ inline void clear_outputs(ustore_docs_gist_t const& arguments) noexcept {
 
 inline void clear_outputs(ustore_docs_gather_t const& arguments) noexcept { clear(arguments.columns); }
 
+inline void clear_outputs(ustore_docs_scan_t const& arguments) noexcept {
+    clear(arguments.offsets), clear(arguments.keys);
+}
+
 inline void clear_outputs(ustore_graph_read_edges_t const& arguments) noexcept {
     clear(arguments.degrees_per_vertex), clear(arguments.edges_offsets), clear(arguments.edges_per_vertex);
+}
+
+inline void clear_outputs(ustore_graph_scan_vertices_t const& arguments) noexcept {
+    clear(arguments.offsets), clear(arguments.keys);
+}
+
+inline void clear_outputs(ustore_pages_scan_t const& arguments) noexcept {
+    clear(arguments.offsets), clear(arguments.keys);
 }
 
 inline void clear_outputs(ustore_pages_insert_t const& arguments) noexcept { clear(arguments.effective_keys); }
@@ -642,15 +654,17 @@ status_t pull(engine_t const& engine, ustore_strings_cursor_next_t const& argume
 
 #pragma endregion Cursors
 
-/** Serves @p arguments on the engine of their database through @p slot_, in the scratch and on the executor thread
- *  @p runner names, refusing what no engine may see, and handing every ragged input to the engine readable in any
- *  layout. A pull serves through its cursor, whose walk @p slot_ lists. */
-template <auto slot_, typename arguments_type_>
+/** Serves @p arguments on the engine of their database through @p verb_ of its @p table_, in the scratch and on the
+ *  executor thread @p runner names, refusing what no engine may see, and handing every ragged input to the engine
+ *  readable in any layout. A pull serves through its cursor, whose walk @p verb_ lists. */
+template <auto table_, auto verb_, typename arguments_type_>
 status_t serve(arguments_type_ const& arguments, view_t const& runner) noexcept {
     ustore_database_t const database = database_of(arguments);
     if (!database) return {status_code_t::uninitialized_k, "The database is uninitialized"};
     engine_t const& engine = engine_of(database);
-    if (!(engine.*slot_)) return {status_code_t::unsupported_k, "The engine does not implement this call"};
+    auto const* verbs = engine.*table_;
+    if (!verbs) return {status_code_t::unsupported_k, "The engine keeps no collections of that modality"};
+    if (!(verbs->*verb_)) return {status_code_t::unsupported_k, "The engine does not implement this call"};
     if constexpr (changes_database_k<arguments_type_>)
         if (handle_cast<handle_t>(database)->access == access_t::read_only_k)
             return {status_code_t::read_only_k, "The database was opened read-only"};
@@ -672,12 +686,12 @@ status_t serve(arguments_type_ const& arguments, view_t const& runner) noexcept 
         ustore_transaction_t const reused = arguments.transaction ? *arguments.transaction : nullptr;
         if (reused && handle_cast<handle_t>(reused)->database != arguments.database)
             return {status_code_t::invalid_argument_k, "The transaction belongs to another database"};
-        status_t const status = (engine.*slot_)(arguments, view);
+        status_t const status = (verbs->*verb_)(arguments, view);
         if (!status.failed() && !reused) hold(arguments.database, *arguments.transaction);
         return status;
     }
     else if constexpr (std::is_same_v<arguments_type_, ustore_snapshot_init_t>) {
-        status_t const status = (engine.*slot_)(arguments, view);
+        status_t const status = (verbs->*verb_)(arguments, view);
         if (!status.failed()) hold(arguments.database, *arguments.snapshot);
         return status;
     }
@@ -689,9 +703,9 @@ status_t serve(arguments_type_ const& arguments, view_t const& runner) noexcept 
             if (status_t const status = gather_strings(inputs[index], scratch, strings[index]); status.failed())
                 return status;
         return std::apply(
-            [&](auto const&... gathered) noexcept { return (engine.*slot_)(arguments, gathered..., view); }, strings);
+            [&](auto const&... gathered) noexcept { return (verbs->*verb_)(arguments, gathered..., view); }, strings);
     }
-    else return (engine.*slot_)(arguments, view);
+    else return (verbs->*verb_)(arguments, view);
 }
 
 /** Finishes a call: the message, then the status with release ordering, then a wake for whoever waits on it. */
@@ -727,10 +741,11 @@ using deferred_arguments_t = std::variant<
     ustore_collection_drop_t, ustore_transaction_init_t, ustore_transaction_stage_t, ustore_transaction_commit_t,
     ustore_transaction_rollback_t, ustore_blobs_write_t, ustore_blobs_remove_t, ustore_blobs_read_t,
     ustore_blobs_scan_t, ustore_blobs_sample_t, ustore_blobs_measure_t, ustore_docs_write_t, ustore_docs_read_t,
-    ustore_docs_gist_t, ustore_docs_gather_t, ustore_graph_read_edges_t, ustore_graph_write_edges_t,
-    ustore_graph_remove_edges_t, ustore_graph_write_vertices_t, ustore_graph_remove_vertices_t, ustore_pages_import_t,
-    ustore_pages_insert_t, ustore_pages_remove_t, ustore_pages_move_t, ustore_pages_splice_t,
-    ustore_pages_set_attributes_t, ustore_pages_remove_attributes_t, ustore_pages_read_t, ustore_strings_write_t,
+    ustore_docs_gist_t, ustore_docs_gather_t, ustore_docs_remove_t, ustore_docs_scan_t, ustore_graph_read_edges_t,
+    ustore_graph_write_edges_t, ustore_graph_remove_edges_t, ustore_graph_write_vertices_t,
+    ustore_graph_remove_vertices_t, ustore_graph_scan_vertices_t, ustore_pages_import_t, ustore_pages_insert_t,
+    ustore_pages_remove_t, ustore_pages_move_t, ustore_pages_splice_t, ustore_pages_set_attributes_t,
+    ustore_pages_remove_attributes_t, ustore_pages_read_t, ustore_pages_scan_t, ustore_strings_write_t,
     ustore_strings_remove_t, ustore_strings_read_t, ustore_strings_scan_t, ustore_blobs_cursor_next_t,
     ustore_strings_cursor_next_t, routed_init<ustore_database_init_ram_t>, routed_init<ustore_database_open_ram_t>,
     routed_init<ustore_database_open_rocksdb_t>, routed_init<ustore_database_view_rocksdb_t>,
@@ -1039,12 +1054,12 @@ inline pool_view_t view_of(std::variant<executor_t, lent_pool_t> const& pool) no
     return std::visit([](auto const& alternative) noexcept { return alternative.view(); }, pool);
 }
 
-/** Serves @p arguments on the engine of @p slot_ in the scratch and on the thread @p runner names and releases their
- *  claims, leaving the outputs of a failed call null or zero, and answers the status their outcome is to finish
- *  with. */
-template <typename arguments_type_, auto slot_>
+/** Serves @p arguments through @p verb_ of the engine's @p table_ in the scratch and on the thread @p runner names and
+ *  releases their claims, leaving the outputs of a failed call null or zero, and answers the status their outcome is
+ *  to finish with. */
+template <typename arguments_type_, auto table_, auto verb_>
 status_t serve_and_release(arguments_type_& arguments, view_t const& runner) noexcept {
-    status_t const status = serve<slot_>(arguments, runner);
+    status_t const status = serve<table_, verb_>(arguments, runner);
     if constexpr (requires { clear_outputs(arguments); })
         if (status.failed()) clear_outputs(arguments);
     release_claims(arguments);
@@ -1142,12 +1157,13 @@ void dispatch(call_type_* call) noexcept {
     submit<call_type_, serve_>(*executor, call);
 }
 
-/** Leaves the outputs of @p arguments null or zero and claims what they hold, then dispatches them to @p slot_. */
-template <auto slot_, typename arguments_type_>
+/** Leaves the outputs of @p arguments null or zero and claims what they hold, then dispatches them to @p verb_ of
+ *  @p table_. */
+template <auto table_, auto verb_, typename arguments_type_>
 void route(arguments_type_* arguments) noexcept {
     if constexpr (requires { clear_outputs(*arguments); }) clear_outputs(*arguments);
     if (status_t const claimed = take_claims(*arguments); claimed.failed()) return finish(*arguments->outcome, claimed);
-    dispatch<arguments_type_, &serve_and_release<arguments_type_, slot_>>(arguments);
+    dispatch<arguments_type_, &serve_and_release<arguments_type_, table_, verb_>>(arguments);
 }
 
 template <typename arguments_type_>
@@ -1164,17 +1180,18 @@ void route_init(arguments_type_* arguments, status_t (*open)(arguments_type_ con
 #pragma region Cursor Lifetimes
 
 /** Opens a cursor of @p cursor_type_ over the walk @p arguments describe, holding their database and the transaction
- *  or snapshot their view reads through, and refusing a database whose engine lacks @p slot_ or a view of another
- *  database. */
-template <typename cursor_type_, auto slot_, typename arguments_type_>
+ *  or snapshot their view reads through, and refusing a database whose engine lacks @p verb_ of @p table_ or a view of
+ *  another database. */
+template <typename cursor_type_, auto table_, auto verb_, typename arguments_type_>
 expected<cursor_type_*> open_cursor(arguments_type_ const& arguments) noexcept {
     if (!arguments.cursor)
         return status_t {status_code_t::invalid_argument_k, "The call needs an output for the cursor"};
     *arguments.cursor = nullptr;
     ustore_database_t const database = arguments.database;
     if (!database) return status_t {status_code_t::uninitialized_k, "The database is uninitialized"};
-    if (!(engine_of(database).*slot_))
-        return status_t {status_code_t::unsupported_k, "The engine does not implement this call"};
+    auto const* verbs = engine_of(database).*table_;
+    if (!verbs) return status_t {status_code_t::unsupported_k, "The engine keeps no collections of that modality"};
+    if (!(verbs->*verb_)) return status_t {status_code_t::unsupported_k, "The engine does not implement this call"};
     view_t view;
     if (!decode_view(arguments.view, view))
         return status_t {status_code_t::invalid_argument_k, "The view was made by neither view constructor"};

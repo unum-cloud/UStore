@@ -6,18 +6,17 @@
  *      engine's table.
  *
  *  `src/nvme/variants.hpp` includes this file right before its table, as these calls build on its accesses, its
- *  writes and its catalog lookups. In a write addressing only docs collections, an upsert of a whole document writes
- *  it, JSON as written and any other type printed as JSON, and reads nothing. An update, an insertion, a patch, a
- *  merge, and an upsert of a field each append one @c json_delta_t to the document's change delta, after
- *  replaying it over the document as the transaction sees it, read and watched. A modification that would fail
- *  answers as the read-modify-write of `src/docs.cpp` does and never lands, and a commit that changed the document
- *  since conflicts, so no change delta carries a @c json_delta_t that fails.
+ *  writes and its catalog lookups. A write addressing any collection but a docs one is refused. An upsert of a whole
+ *  document writes it, JSON as written and any other type printed as JSON, and reads nothing. An update, an
+ *  insertion, a patch, a merge, and an upsert of a field each append one @c json_delta_t to the document's change
+ *  delta, after replaying it over the document as the transaction sees it, read and watched. A modification that
+ *  would fail answers as the read-modify-write of `src/docs.cpp` does and never lands, and a commit that changed the
+ *  document since conflicts, so no change delta carries a @c json_delta_t that fails.
  *
  *  The tasks of one call on one document apply in task order, each seeing the ones before it, and a call whose tasks
  *  leave a document known whole, past a whole upsert or over a document of no bytes, writes that document, since a
- *  change delta over no bytes would fold as over a missing document. A write addressing any other collection,
- *  the main one included, takes the read-modify-write of `src/docs.cpp` whole, as RAM does. Reads stay with
- *  `src/docs.cpp`, which reads through the engine's own blobs reads, folding the deltas.
+ *  change delta over no bytes would fold as over a missing document. Reads take the read paths of `src/docs.cpp`
+ *  over the engine's own reads of the docs store, which fold the deltas.
  */
 
 #pragma once
@@ -42,20 +41,6 @@ using docs::json_fold_t;
 
 /** The fold every change delta of a docs collection is written for. */
 inline constexpr json_fold_t docs_fold_k {};
-
-/** Whether every task of @p collections names a collection the catalog lists as holding @p modality, as @p view
- *  reads it, looking each run of tasks on one collection up once; a collection the catalog misses answers false, so
- *  the shared path refuses it as it would on any engine. */
-template <cpu_class_t cpu_class_>
-bool holds_only(database_state<cpu_class_>& state, view_t const& view,
-                strided_iterator<ustore_collection_id_t const> collections, std::size_t count,
-                ustore_modality_t modality) noexcept {
-    auto const admits = [modality](ustore_modality_t held) noexcept -> status_t {
-        if (held != modality) return {status_code_t::invalid_argument_k, "The collection holds another modality"};
-        return {};
-    };
-    return resolve_runs(state, view, collections, count, admits).succeeded();
-}
 
 /** One task of a docs write: the document it addresses, its delta, and its place in the call, which orders the deltas
  *  of one document. */
@@ -119,8 +104,7 @@ status_t write_document(call_access<cpu_class_> const& access, document_deltas_t
     return access.transaction->change(collection, key, chain, docs_fold_k);
 }
 
-/** Implements @c ustore_docs_write, appending the deltas of a write addressing only docs collections and taking the
- *  read-modify-write of `src/docs.cpp` for any other. */
+/** Implements @c ustore_docs_write, appending the deltas of a write addressing only docs collections. */
 template <cpu_class_t cpu_class_>
 status_t docs_write(ustore_docs_write_t const& arguments, strings_arg_t const& fields, strings_arg_t const& values,
                     view_t const& view) noexcept {
@@ -131,9 +115,10 @@ status_t docs_write(ustore_docs_write_t const& arguments, strings_arg_t const& f
     if (!arguments.keys.data && id_field.empty())
         return {status_code_t::invalid_argument_k, "Documents without keys need an id field"};
     database_state<cpu_class_>& state = state_of<cpu_class_>(arguments);
-    strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
-    if (!holds_only(state, view, collections, count, ustore_modality_docs_k))
-        return docs_write_in_json_values(arguments, fields, values, view);
+    if (status_t const resolved = resolve_runs(state, view, strided(arguments.collections), count,
+                                               ustore_modality_docs_k);
+        resolved.failed())
+        return resolved;
     if (arguments.modification > ustore_docs_modify_merge_k)
         return {status_code_t::invalid_argument_k, "Unknown modification"};
 

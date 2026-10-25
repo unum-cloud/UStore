@@ -242,12 +242,32 @@ status_t resolve_collections(database_t& database, strided_iterator<ustore_colle
         ustore_collection_id_t const collection = collections ? collections[task_index] : ustore_collection_main_k;
         auto [entry, look_up_status] = look_up(database, collection, held);
         if (look_up_status.failed()) return look_up_status;
-        if (entry_layout_of(entry.modality) != layout)
-            return {status_code_t::invalid_argument_k, layout == entry_layout_t::strings_to_uuids_k
-                                                           ? "The collection holds no strings"
-                                                           : "The collection holds strings"};
+        if (entry_layout_of(entry.modality) != layout) return collection_holds_another_modality();
     }
     return {};
+}
+
+/** Refuses a batch addressing a collection the catalog does not list or one @c admit_modality refuses for
+ *  @p modality, looking each run of tasks on one collection up once. */
+status_t refuse_modalities(ustore_database_t handle, ustore_collections_view_t collections, ustore_size_t count,
+                           ustore_modality_t modality) {
+    database_t& database = *handle_cast<database_t>(handle);
+    strided_iterator<ustore_collection_id_t const> const tasks = strided(collections);
+    std::string held;
+    for (std::size_t task_index = 0; task_index != count; ++task_index) {
+        if (task_index != 0 && tasks && tasks[task_index] == tasks[task_index - 1]) continue;
+        auto [entry, look_up_status] = look_up(database, tasks ? tasks[task_index] : ustore_collection_main_k, held);
+        if (look_up_status.failed()) return look_up_status;
+        if (status_t const admitted = admit_modality(entry.modality, modality); admitted.failed()) return admitted;
+        if (!tasks) break;
+    }
+    return {};
+}
+
+/** The resolver of this engine, which every checked verb and every layer over blobs runs first. */
+status_t resolve_modality(ustore_database_t database, ustore_collections_view_t collections, ustore_size_t count,
+                          ustore_modality_t modality, view_t const&) noexcept {
+    return guarded<&refuse_modalities>(database, collections, count, modality);
 }
 
 /** Points @p options at the snapshot @p view names, leaving them at the head for any other view. */
@@ -1004,45 +1024,89 @@ void snapshot_free(ustore_snapshot_t handle) noexcept {
 
 #pragma endregion Memory
 
-engine_t const engine_k {
-    .database_describe = &guarded<&database_describe>,
-    .database_clear = &guarded<&database_clear>,
-    .database_compact = &guarded<&database_compact>,
+/** The database verbs of this engine. */
+database_verbs_t const database_verbs_k {
+    .describe = &guarded<&database_describe>,
+    .clear = &guarded<&database_clear>,
+    .compact = &guarded<&database_compact>,
     .snapshot_init = &guarded<&snapshot_init>,
     .snapshot_save = &guarded<&snapshot_save>,
     .collection_list = &guarded<&collection_list>,
     .collection_create = &guarded<&collection_create>,
     .collection_find = &guarded<&collection_find>,
     .collection_drop = &guarded<&collection_drop>,
-    .blobs_write = &guarded<&blobs_write>,
-    .blobs_remove = &guarded<&blobs_remove>,
-    .blobs_read = &guarded<&blobs_read>,
-    .blobs_scan = &guarded<&blobs_scan>,
-    .blobs_sample = &guarded<&blobs_sample>,
-    .blobs_measure = &guarded<&blobs_measure>,
-    .docs_write = &docs_write_in_json_values,
-    .docs_read = &docs_read_in_json_values,
-    .docs_gist = &docs_gist_in_json_values,
-    .docs_gather = &docs_gather_in_json_values,
-    .graph_read_edges = &graph_read_edges_in_vertex_values,
-    .graph_write_edges = &graph_write_edges_in_vertex_values,
-    .graph_remove_edges = &graph_remove_edges_in_vertex_values,
-    .graph_write_vertices = &graph_write_vertices_in_vertex_values,
-    .graph_remove_vertices = &graph_remove_vertices_in_vertex_values,
-    .pages_import = &pages_import_in_page_values,
-    .pages_insert = &pages_insert_in_page_values,
-    .pages_remove = &pages_remove_in_page_values,
-    .pages_move = &pages_move_in_page_values,
-    .pages_splice = &pages_splice_in_page_values,
-    .pages_set_attributes = &pages_set_attributes_in_page_values,
-    .pages_remove_attributes = &pages_remove_attributes_in_page_values,
-    .pages_read = &pages_read_in_page_values,
-    .strings_write = &guarded<&strings_write>,
-    .strings_remove = &guarded<&strings_remove>,
-    .strings_read = &guarded<&strings_read>,
-    .strings_scan = &guarded<&strings_scan>,
     .snapshot_free = &snapshot_free,
     .database_free = &database_free,
+};
+
+/** The unchecked whole-value verbs of every collection keyed by UUIDs, which the layers over blobs reach. */
+constexpr blobs_verbs_t values_verbs_k {
+    .write = &guarded<&blobs_write>,
+    .remove = &guarded<&blobs_remove>,
+    .read = &guarded<&blobs_read>,
+    .scan = &guarded<&blobs_scan>,
+    .sample = &guarded<&blobs_sample>,
+    .measure = &guarded<&blobs_measure>,
+};
+
+/** The verbs of this engine's blobs collections. */
+blobs_verbs_t const blobs_verbs_k {
+    .write = &guarded_by<ustore_modality_blobs_k, &resolve_modality, values_verbs_k.write>,
+    .remove = &guarded_by<ustore_modality_blobs_k, &resolve_modality, values_verbs_k.remove>,
+    .read = &guarded_by<ustore_modality_blobs_k, &resolve_modality, values_verbs_k.read>,
+    .scan = &guarded_by<ustore_modality_blobs_k, &resolve_modality, values_verbs_k.scan>,
+    .sample = &guarded_by<ustore_modality_blobs_k, &resolve_modality, values_verbs_k.sample>,
+    .measure = &guarded_by<ustore_modality_blobs_k, &resolve_modality, values_verbs_k.measure>,
+};
+
+/** The verbs of this engine's strings collections. */
+strings_verbs_t const strings_verbs_k {
+    .write = &guarded<&strings_write>,
+    .remove = &guarded<&strings_remove>,
+    .read = &guarded<&strings_read>,
+    .scan = &guarded<&strings_scan>,
+};
+
+/** The verbs of this engine's documents collections. */
+docs_verbs_t const docs_verbs_k {
+    .write = &docs_write_over_blobs<values_verbs_k, &resolve_modality>,
+    .read = &docs_read_over_blobs<values_verbs_k, &resolve_modality>,
+    .gist = &docs_gist_over_blobs<values_verbs_k, &resolve_modality>,
+    .gather = &docs_gather_over_blobs<values_verbs_k, &resolve_modality>,
+    .remove = &remove_over_blobs<values_verbs_k, &resolve_modality, ustore_modality_docs_k>,
+    .scan = &scan_over_blobs<values_verbs_k, &resolve_modality, ustore_modality_docs_k>,
+};
+
+/** The verbs of this engine's graph collections. */
+graph_verbs_t const graph_verbs_k {
+    .read_edges = &graph_read_edges_over_blobs<values_verbs_k, &resolve_modality>,
+    .write_edges = &graph_write_edges_over_blobs<values_verbs_k, &resolve_modality>,
+    .remove_edges = &graph_remove_edges_over_blobs<values_verbs_k, &resolve_modality>,
+    .write_vertices = &graph_write_vertices_over_blobs<values_verbs_k, &resolve_modality>,
+    .remove_vertices = &graph_remove_vertices_over_blobs<values_verbs_k, &resolve_modality>,
+    .scan_vertices = &scan_over_blobs<values_verbs_k, &resolve_modality, ustore_modality_graph_k>,
+};
+
+/** The verbs of this engine's pages collections. */
+pages_verbs_t const pages_verbs_k {
+    .import = &pages_import_over_blobs<values_verbs_k, &resolve_modality>,
+    .insert = &pages_insert_over_blobs<values_verbs_k, &resolve_modality>,
+    .remove = &pages_remove_over_blobs<values_verbs_k, &resolve_modality>,
+    .move = &pages_move_over_blobs<values_verbs_k, &resolve_modality>,
+    .splice = &pages_splice_over_blobs<values_verbs_k, &resolve_modality>,
+    .set_attributes = &pages_set_attributes_over_blobs<values_verbs_k, &resolve_modality>,
+    .remove_attributes = &pages_remove_attributes_over_blobs<values_verbs_k, &resolve_modality>,
+    .read = &pages_read_over_blobs<values_verbs_k, &resolve_modality>,
+    .scan = &scan_over_blobs<values_verbs_k, &resolve_modality, ustore_modality_pages_k>,
+};
+
+engine_t const engine_k {
+    .database = &database_verbs_k,
+    .blobs = &blobs_verbs_k,
+    .strings = &strings_verbs_k,
+    .docs = &docs_verbs_k,
+    .graph = &graph_verbs_k,
+    .pages = &pages_verbs_k,
 };
 
 } // namespace unum::ustore::oracles::leveldb

@@ -324,6 +324,109 @@ typedef struct ustore_docs_gather_t {
  */
 USTORE_EXPORT void ustore_docs_gather(ustore_docs_gather_t* arguments);
 
+/** The arguments of @c ustore_docs_remove, which removes whole documents in a batch. */
+typedef struct ustore_docs_remove_t {
+
+    /** An open database. */
+    ustore_database_t database;
+
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call returns final, the default, or once submitted. */
+    ustore_completion_t completion;
+
+    /** Transaction the removals join, where @c NULL removes at the head. */
+    ustore_transaction_t transaction;
+
+    /** Number of tasks, one per document. */
+    ustore_size_t count;
+
+    /** Collections of the documents, where @c NULL data stands for the main collection. */
+    ustore_collections_view_t collections;
+
+    /** Keys of the documents to remove. */
+    ustore_keys_view_t keys;
+
+    /** How durable the removals are once the call finishes at the head; a transaction's commit decides its own. */
+    ustore_durability_t durability;
+
+    /** Whether the @c transaction records the removed keys for conflicts. */
+    ustore_watch_t watch;
+
+} ustore_docs_remove_t;
+
+/**
+ *  @brief Removes a batch of whole documents.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ */
+USTORE_EXPORT void ustore_docs_remove(ustore_docs_remove_t* arguments);
+
+/**
+ *  @brief The arguments of @c ustore_docs_scan, which lists up to @c wanted document keys from a start key in every
+ *      collection.
+ *
+ *  Documents are not exported, so a read or a gather follows the scan. Consistent iterators over concurrent state
+ *  are costly, so scans paginate instead.
+ */
+typedef struct ustore_docs_scan_t {
+
+    /** An open database. */
+    ustore_database_t database;
+
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call returns final, the default, or once submitted. */
+    ustore_completion_t completion;
+
+    /** What the call sees, where @c NULL is the head. */
+    ustore_view_t view;
+
+    /** Number of scans. */
+    ustore_size_t count;
+
+    /** Collections to scan, where @c NULL data stands for the main collection. */
+    ustore_collections_view_t collections;
+
+    /** Smallest key every scan may return, where @c NULL data starts at the first key. */
+    ustore_keys_view_t start_keys;
+
+    /** Output for @c count plus one offsets into @c keys, the last one closing the final scan, inside @c arena. */
+    ustore_length_t const** offsets;
+
+    /** Output for the found keys, scan after scan, inside @c arena. */
+    ustore_key_t const** keys;
+
+    /** Rewound by this call, then holding every output it writes; @c NULL is refused. */
+    ustore_arena_t arena;
+
+    /** Most keys every scan returns. */
+    ustore_size_t wanted;
+
+    /** In what order the keys come. */
+    ustore_scan_mode_t mode;
+
+    /** Optional callback reporting the scans finished. */
+    ustore_progress_callback_t progress;
+
+    /** Opaque pointer passed to @c progress. */
+    void* progress_state;
+
+} ustore_docs_scan_t;
+
+/**
+ *  @brief Scans a batch of document key ranges.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ */
+USTORE_EXPORT void ustore_docs_scan(ustore_docs_scan_t* arguments);
+
 #ifdef __cplusplus
 }
 #endif

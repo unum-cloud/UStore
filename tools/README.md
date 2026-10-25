@@ -16,7 +16,7 @@ build_release/build/bin/ustore_cli --engine rocksdb --directory /dev/shm/ustore 
 
 | Command                | Action                                                                              |
 | :--------------------- | :---------------------------------------------------------------------------------- |
-| `collection create`    | Creates the collection named by `--collection`                                      |
+| `collection create`    | Creates the documents collection named by `--collection`                            |
 | `collection drop`      | Drops the collection named by `--collection`                                        |
 | `collection list`      | Prints the ID as canonical UUID text, the name and the modality of every collection |
 | `collection import`    | Imports `--input` as documents keyed by `--id-field`, `--memory-limit` per batch    |
@@ -26,7 +26,7 @@ build_release/build/bin/ustore_cli --engine rocksdb --directory /dev/shm/ustore 
 | Flag                    | Meaning                                                              |
 | :---------------------- | :------------------------------------------------------------------- |
 | `--directory <path>`    | Database directory; required                                         |
-| `--collection <name>`   | Collection a command acts on; the main collection when omitted       |
+| `--collection <name>`   | Collection a command acts on; required                               |
 | `--input <file>`        | File a collection import reads                                       |
 | `--output <file>`       | File a collection export writes                                      |
 | `--id-field <field>`    | Field holding the keys of imported documents, integers or UUID text  |

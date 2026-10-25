@@ -114,7 +114,7 @@ Commits are ordered by the stamps the ledger issues, which keeps a transaction t
 
 ## The C ABI
 
-`variants.hpp` serves every slot of `src/engine.hpp`'s `engine_t` the RAM engine serves over one `database`, its graph, docs and pages collections through stores of their own, and `src/docs.cpp` and `src/pages.cpp` keep documents and pages of every other collection as whole values, exactly as they do for LevelDB.
+`variants.hpp` fills every verb table of `src/engine.hpp` the RAM engine fills over one `database`, its graph, docs and pages collections through stores of their own, each refusing collections of any other modality.
 `USTORE_BUILD_NVME` adds the engine to the `ustore` library and `nvme` to the engines every suite runs with `--engine`.
 
 - An open names a directory, which becomes the metadata directory; a data directory it does not name defaults to `data` beneath it, and a capacity it does not name defaults to one gibibyte.

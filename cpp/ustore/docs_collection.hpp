@@ -14,8 +14,7 @@
 #include <type_traits>      // `std::remove_cvref_t`
 #include <utility>          // `std::forward`, `std::move`
 
-#include "ustore/blobs_collection.hpp" // `blobs_read_t`, `blobs_remove_t`
-#include "ustore/blobs_range.hpp"      // `blobs_range_t`, `keys_range_t`, `size_range_t`
+#include "ustore/blobs_range.hpp" // `blobs_range_t`, `keys_range_t`, `size_range_t`
 #include "ustore/docs.h"
 #include "ustore/docs_ref.hpp"   // `docs_read_ref`, `docs_ref`
 #include "ustore/docs_table.hpp" // `docs_table_t`, `field_type_t`
@@ -96,7 +95,7 @@ class docs_read_collection_t {
 
     blobs_range_t members( //
         ustore_key_t start_key = smallest_key_k, ustore_key_t end_key = largest_key_k) const noexcept {
-        return {receiver_, collection_, start_key, end_key};
+        return {receiver_, collection_, start_key, end_key, modality_k};
     }
 
     keys_range_t keys( //
@@ -104,10 +103,11 @@ class docs_read_collection_t {
         return {members(start_key, end_key)};
     }
 
+    /** Counts the documents by streaming through their keys, both bounds being the count. */
     expected<size_range_t> size_range() const noexcept {
-        auto [estimates, size_range_status] = members().size_estimates();
-        if (size_range_status.failed()) return size_range_status;
-        return estimates.cardinality;
+        auto [count, count_status] = keys().size();
+        if (count_status.failed()) return count_status;
+        return size_range_t {count, count};
     }
 
     /** Estimates the number of documents as the middle of @c size_range. */
@@ -258,6 +258,18 @@ struct docs_write_t {
     strided_strings<value_view_t> repeated {};
 
     static void submit(arguments_t& arguments) noexcept { ustore_docs_write(&arguments); }
+    answer_t finish() && noexcept { return {}; }
+};
+
+/** What a deferred @c ustore_docs_remove keeps beside its keys: the collection. */
+struct docs_remove_t {
+    using arguments_t = ustore_docs_remove_t;
+    using answer_t = status_t;
+
+    /** Collection every key lives in. */
+    ustore_collection_id_t collection {};
+
+    static void submit(arguments_t& arguments) noexcept { ustore_docs_remove(&arguments); }
     answer_t finish() && noexcept { return {}; }
 };
 
@@ -510,9 +522,21 @@ class deferred_docs_collection_t : public deferred_docs_read_collection_t {
      *  @param[in] durability Whether the call finishes only after the data reaches the disk.
      */
     template <owned_array_concept<ustore_key_t> keys_type_>
-    deferred<blobs_remove_t> remove(keys_type_ keys,
-                                    ustore_durability_t durability = ustore_durability_buffered_k) const noexcept {
-        return deferred_blobs_collection_t {receiver_, collection_}.remove(std::move(keys), durability);
+    deferred<docs_remove_t> remove(keys_type_ keys,
+                                   ustore_durability_t durability = ustore_durability_buffered_k) const noexcept {
+        return deferred<docs_remove_t>::submit(
+            [&](docs_remove_t& verb, ustore_docs_remove_t& arguments, keys_type_ const& owned) noexcept {
+                verb.collection = collection_;
+                arguments.database = receiver_.database;
+                arguments.executor = receiver_.executor;
+                arguments.transaction = receiver_.transaction;
+                arguments.count = owned.size();
+                arguments.collections = {&verb.collection, 0};
+                arguments.keys = {owned.data(), sizeof(ustore_key_t)};
+                arguments.durability = durability;
+                return status_t {};
+            },
+            std::move(keys));
     }
 };
 

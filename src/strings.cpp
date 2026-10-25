@@ -23,7 +23,7 @@ status_t pull(engine_t const& engine, ustore_strings_cursor_next_t const& argume
               view_t const& view) noexcept {
     if (!arguments.strings || !arguments.written)
         return {status_code_t::invalid_argument_k, "Need outputs for the strings and the count written"};
-    if (arguments.values && !engine.strings_read)
+    if (arguments.values && !engine.strings->read)
         return {status_code_t::unsupported_k, "The engine does not implement this call"};
     ustore_bytes_view_t const prefix = bytes_of(std::string_view {cursor.prefix});
     ustore_bytes_view_t const start = bytes_of(std::string_view {cursor.start});
@@ -37,8 +37,8 @@ status_t pull(engine_t const& engine, ustore_strings_cursor_next_t const& argume
                                           .strings = &listed.view,
                                           .arena = view.scratch,
                                           .wanted = arguments.wanted};
-        status_t const status = engine.strings_scan(scan, strings_arg_t::from_views(&prefix),
-                                                    strings_arg_t::from_views(&start), view);
+        status_t const status = engine.strings->scan(scan, strings_arg_t::from_views(&prefix),
+                                                     strings_arg_t::from_views(&start), view);
         if (status.failed()) return status;
     }
     std::size_t const written = offsets ? offsets[1] : 0;
@@ -48,7 +48,7 @@ status_t pull(engine_t const& engine, ustore_strings_cursor_next_t const& argume
                                           .collections = {&cursor.collection, 0},
                                           .values = arguments.values,
                                           .arena = arguments.arena};
-        if (status_t const status = engine.strings_read(read, listed, view); status.failed()) return status;
+        if (status_t const status = engine.strings->read(read, listed, view); status.failed()) return status;
     }
     std::size_t bytes = 0;
     for (std::size_t index = 0; index != written; ++index) bytes += listed[index].length;
@@ -78,14 +78,25 @@ bool copy_bytes(ustore_bytes_view_t bytes, sz::string_t& copy) noexcept {
 
 } // namespace unum::ustore
 
-void ustore_strings_write(ustore_strings_write_t* arguments) { route<&engine_t::strings_write>(arguments); }
-void ustore_strings_remove(ustore_strings_remove_t* arguments) { route<&engine_t::strings_remove>(arguments); }
-void ustore_strings_read(ustore_strings_read_t* arguments) { route<&engine_t::strings_read>(arguments); }
-void ustore_strings_scan(ustore_strings_scan_t* arguments) { route<&engine_t::strings_scan>(arguments); }
-void ustore_strings_cursor_next(ustore_strings_cursor_next_t* arguments) { route<&engine_t::strings_scan>(arguments); }
+void ustore_strings_write(ustore_strings_write_t* arguments) {
+    route<&engine_t::strings, &strings_verbs_t::write>(arguments);
+}
+void ustore_strings_remove(ustore_strings_remove_t* arguments) {
+    route<&engine_t::strings, &strings_verbs_t::remove>(arguments);
+}
+void ustore_strings_read(ustore_strings_read_t* arguments) {
+    route<&engine_t::strings, &strings_verbs_t::read>(arguments);
+}
+void ustore_strings_scan(ustore_strings_scan_t* arguments) {
+    route<&engine_t::strings, &strings_verbs_t::scan>(arguments);
+}
+void ustore_strings_cursor_next(ustore_strings_cursor_next_t* arguments) {
+    route<&engine_t::strings, &strings_verbs_t::scan>(arguments);
+}
 
 void ustore_strings_cursor_init(ustore_strings_cursor_init_t* arguments) {
-    auto [cursor, status] = open_cursor<ustore_strings_cursor_handle_t, &engine_t::strings_scan>(*arguments);
+    auto [cursor,
+          status] = open_cursor<ustore_strings_cursor_handle_t, &engine_t::strings, &strings_verbs_t::scan>(*arguments);
     if (status.failed()) return finish(*arguments->outcome, status);
     if (!copy_bytes(arguments->prefix, cursor->prefix) || !copy_bytes(arguments->start_string, cursor->start)) {
         free_cursor(cursor);

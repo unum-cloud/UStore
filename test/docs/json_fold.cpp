@@ -69,24 +69,10 @@ class reference_t {
                 ustore_key_t key = key_from_integer(7)) noexcept
         : database_(database), collection_(collection), key_(key) {}
 
-    /** Stores @p bytes as they are, or removes the document without them. */
+    /** Stores the JSON document @p bytes as written, or removes the document without them. */
     status_t reset(std::optional<std::string> const& bytes) noexcept {
-        ustore_outcome_t outcome {};
-        if (!bytes) {
-            ustore_blobs_remove_t remove {};
-            remove.database = database_, remove.outcome = &outcome, remove.transaction = transaction;
-            remove.count = 1, remove.collections = {&collection_, 0}, remove.keys = {&key_, 0};
-            ustore_blobs_remove(&remove);
-            return status_t {outcome};
-        }
-        std::string_view const text = *bytes;
-        strided_strings<std::string_view> const values {{&text, 0}};
-        ustore_blobs_write_t write {};
-        write.database = database_, write.outcome = &outcome, write.transaction = transaction;
-        write.count = 1, write.collections = {&collection_, 0}, write.keys = {&key_, 0};
-        write.values = values.view();
-        ustore_blobs_write(&write);
-        return status_t {outcome};
+        if (!bytes) return remove();
+        return modify(ustore_docs_modify_upsert_k, {}, *bytes, ustore_docs_field_type_json_k);
     }
 
     /** Writes @p value of @p type into @p field with @p modification, the call a delta stands for. */
@@ -106,22 +92,29 @@ class reference_t {
         return status_t {outcome};
     }
 
-    /** Removes the document as `ustore_blobs_remove` does. */
-    status_t remove() noexcept { return reset(std::nullopt); }
+    /** Removes the document whole through `ustore_docs_remove`. */
+    status_t remove() noexcept {
+        ustore_outcome_t outcome {};
+        ustore_docs_remove_t remove {};
+        remove.database = database_, remove.outcome = &outcome, remove.transaction = transaction;
+        remove.count = 1, remove.collections = {&collection_, 0}, remove.keys = {&key_, 0};
+        ustore_docs_remove(&remove);
+        return status_t {outcome};
+    }
 
-    /** The stored bytes, or nothing for a missing document. */
+    /** The stored bytes, read whole as JSON, which pass through as stored, or nothing for a missing document. */
     std::optional<std::string> read() noexcept {
         auto [arena, arena_status] = arena_t::make();
         if (arena_status.failed()) return std::nullopt;
         ustore_outcome_t outcome {};
         ustore_octet_t const* presences = nullptr;
         ustore_strings_view_t values {};
-        ustore_blobs_read_t read {};
+        ustore_docs_read_t read {};
         read.database = database_, read.outcome = &outcome;
         read.view = transaction ? ustore_transaction_view(transaction, ustore_watch_none_k) : nullptr;
         read.count = 1, read.collections = {&collection_, 0}, read.keys = {&key_, 0};
         read.presences = &presences, read.values = &values, read.arena = arena;
-        ustore_blobs_read(&read);
+        ustore_docs_read(&read);
         if (status_t {outcome}.failed() || !presences || !(presences[0] & 1)) return std::nullopt;
         return std::string(string_of(tape_string(values, 0)));
     }
@@ -583,10 +576,9 @@ std::size_t json_fold_reference(config_t const& config, std::uint64_t seed) {
         reference_t reference {database, collection};
 
         std::optional<std::string> base;
-        std::uint64_t const start = random.below(6);
-        if (start == 1) base = "";
-        else if (start == 2) base = writer.odd();
-        else if (start > 2) base = writer.document();
+        // Only the docs verbs reach a docs collection, so the engine's bases are documents or none, while empty and
+        // malformed bases stay with the composition rounds below
+        if (random.below(6) > 2) base = writer.document();
         failures += expect(reference.reset(base).succeeded());
         std::vector<pending_t> pending;
         std::vector<json_delta_t> history;
@@ -908,11 +900,8 @@ case_result_t json_fold_maintenance(config_t const& config, std::uint64_t seed) 
             bool const parses = !current || json_parse(std::string_view(*current), arena).status().succeeded();
             operation_t const operation = random_operation(
                 random, writer, parses ? typed_upserts_t::allowed_k : typed_upserts_t::refused_k);
-            // A whole write lands through a blobs write a third of the time, which takes text that is no JSON as well
-            bool const as_blob = operation.modification == delta_modification_t::write_k && random.below(3) == 0;
             auto const apply = [&](reference_t& reference) {
                 if (operation.modification == delta_modification_t::remove_k) return reference.remove();
-                if (as_blob) return reference.reset(operation.value);
                 if (operation.modification == delta_modification_t::write_k)
                     return reference.modify(ustore_docs_modify_upsert_k, {}, operation.value,
                                             ustore_docs_field_type_json_k);

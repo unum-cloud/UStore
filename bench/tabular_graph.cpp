@@ -122,6 +122,9 @@ struct tabular_t {
     /** Open database. */
     ustore_database_t database = nullptr;
 
+    /** The docs collection the document benchmarks import into and export from. */
+    ustore_collection_id_t docs = ustore_collection_main_k;
+
     /** The graph collection the graph benchmarks import into and export from. */
     ustore_collection_id_t graph = ustore_collection_main_k;
 
@@ -227,7 +230,7 @@ void bench_docs_import(executor_t& executor, tabular_t const& tabular, settings_
             ustore_docs_import_t importing {};
             importing.database = tabular.database;
             importing.outcome = &outcome;
-            importing.collection = ustore_collection_main_k;
+            importing.collection = tabular.docs;
             importing.path = bytes_of(tabular.path(file));
             importing.max_batch_size = settings.memory_limit.value;
             importing.id_field = bytes_of(settings.id_field);
@@ -277,7 +280,7 @@ void bench_docs_export(executor_t& executor, tabular_t const& tabular, settings_
             exporting.database = tabular.database;
             exporting.outcome = &outcome;
             exporting.arena = arena;
-            exporting.collection = ustore_collection_main_k;
+            exporting.collection = tabular.docs;
             exporting.path = bytes_of(output.view());
             exporting.max_batch_size = settings.memory_limit.value;
             ustore_docs_export(&exporting);
@@ -375,11 +378,16 @@ int main(int argc, char** argv) {
     ustore_collection_create_t create {};
     create.database = tabular.database;
     create.outcome = &outcome;
-    create.modality = ustore_modality_graph_k;
-    create.collection = &tabular.graph;
+    create.modality = ustore_modality_docs_k;
+    create.collection = &tabular.docs;
     ustore_collection_create(&create);
+    if (outcome.status == ustore_status_success_k) {
+        create.modality = ustore_modality_graph_k;
+        create.collection = &tabular.graph;
+        ustore_collection_create(&create);
+    }
     if (outcome.status != ustore_status_success_k) {
-        fmt::println(stderr, "Failed to create the graph collection: {}", outcome.message);
+        fmt::println(stderr, "Failed to create the docs and graph collections: {}", outcome.message);
         ustore_database_free(tabular.database);
         return 1;
     }
@@ -398,7 +406,7 @@ int main(int argc, char** argv) {
     std::string const graph_export_name = fmt::format("graph_export_{}", format);
     if (settings.selects(docs_import_name)) bench_docs_import(executor, tabular, settings, docs_import_name);
     if (settings.selects(docs_export_name)) bench_docs_export(executor, tabular, settings, docs_export_name);
-    clear_collection(tabular.database, ustore_collection_main_k);
+    clear_collection(tabular.database, tabular.docs);
     if (settings.selects(graph_import_name)) bench_graph_import(executor, tabular, settings, graph_import_name);
     if (settings.selects(graph_export_name)) bench_graph_export(executor, tabular, settings, graph_export_name);
     clear_collection(tabular.database, tabular.graph);

@@ -22,9 +22,8 @@
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 #include <stringzilla/stringzilla.hpp> // `sz::string_t`, `sz::string_view_t`
 
-#include "ustore/blobs.h"    // `ustore_blobs_scan_t`
-#include "ustore/docs.h"     // `ustore_docs_write_t`, `ustore_docs_read_t`
-#include "ustore/graph.h"    // `ustore_graph_write_edges_t`
+#include "ustore/docs.h"     // `ustore_docs_write_t`, `ustore_docs_read_t`, `ustore_docs_scan_t`
+#include "ustore/graph.h"    // `ustore_graph_write_edges_t`, `ustore_graph_scan_vertices_t`
 #include "ustore/ranges.hpp" // `bits_view_t`, `tape_string`, `u64_tape`
 #include "ustore/types.hpp"  // `sz`, `st`
 
@@ -605,7 +604,8 @@ void import_csv_documents(ustore_docs_import_t const& task, field_list_t fields,
 }
 
 /**
- *  @brief Scans the collection of @p task in key order, handing every batch of keys to @p consume.
+ *  @brief Scans the collection of @p task in key order through @p scan_, the scan of its modality, handing every batch
+ *      of keys to @p consume.
  *
  *  The keys land in a private arena, since @p consume reads them into the arena of the task, which a call never takes
  *  inputs from. Stops at the end of the collection, at the first failure, or once a batch comes back short.
@@ -613,7 +613,7 @@ void import_csv_documents(ustore_docs_import_t const& task, field_list_t fields,
  *  @param[in] batch_size Keys one scan returns, which bounds the memory the batch occupies.
  *  @param[in] consume Receives each batch of keys and reports its own failures into the task's outcome.
  */
-template <typename task_type_, typename consumer_type_>
+template <typename scan_type_, void (*scan_)(scan_type_*), typename task_type_, typename consumer_type_>
 void scan_keys(task_type_ const& task, ustore_size_t batch_size, consumer_type_&& consume) noexcept {
     task_arena_t const keys_arena {nullptr, task.outcome};
     if (failed(task.outcome)) return;
@@ -621,7 +621,7 @@ void scan_keys(task_type_ const& task, ustore_size_t batch_size, consumer_type_&
     while (true) {
         ustore_length_t const* offsets = nullptr;
         ustore_key_t const* page = nullptr;
-        ustore_blobs_scan_t scan {};
+        scan_type_ scan {};
         scan.database = task.database;
         scan.outcome = task.outcome;
         scan.view = task.view;
@@ -632,7 +632,7 @@ void scan_keys(task_type_ const& task, ustore_size_t batch_size, consumer_type_&
         scan.keys = &page;
         scan.arena = keys_arena.get();
         scan.wanted = batch_size;
-        ustore_blobs_scan(&scan);
+        scan_(&scan);
         if (failed(task.outcome) || !offsets || offsets[1] == offsets[0]) return;
 
         ustore_length_t const count = offsets[1] - offsets[0];
@@ -883,7 +883,7 @@ void ustore_docs_export(ustore_docs_export_t* task_pointer) {
             }
         }
     };
-    scan_keys(task, documents_per_read_k, export_batch);
+    scan_keys<ustore_docs_scan_t, &ustore_docs_scan>(task, documents_per_read_k, export_batch);
     output.finish(task.outcome);
 }
 
@@ -1027,7 +1027,7 @@ void ustore_graph_export(ustore_graph_export_t* task_pointer) {
             }
         }
     };
-    scan_keys(task, batch_size, export_batch);
+    scan_keys<ustore_graph_scan_vertices_t, &ustore_graph_scan_vertices>(task, batch_size, export_batch);
     output.finish(task.outcome);
 }
 

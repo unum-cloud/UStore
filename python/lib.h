@@ -1203,23 +1203,29 @@ typedef struct ustore_py_remove_call_t {
 extern ustore_py_verb_t const ustore_py_remove_verb;
 
 /**
- *  @brief Removes the keys gathered into @p call with their values or documents: the core of `remove` and of `del`
- *      on every view.
+ *  @brief Removes the keys gathered into @p call with their values, or the documents when @p modality is docs: the
+ *      core of `remove`, `docs_remove` and of `del` on every view.
  *  @return None, or the @c Deferred of it, or NULL with an exception set.
  */
 PyObject* ustore_py_values_remove(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
-                                  ustore_py_remove_call_t* call);
+                                  ustore_modality_t modality, ustore_py_remove_call_t* call);
 
 /**
- *  @brief Lists up to @p wanted keys from @p start upwards: the core of `scan` and of `Collection.scan`.
+ *  @brief Lists up to @p wanted keys from @p start upwards through the scan of @p modality: the core of `scan`,
+ *      `docs_scan`, `graph_scan_vertices` and of `Collection.scan`.
  *  @param[in] mode In what order the keys come.
  *  @param[in] progress The callable the scan reports to, borrowed, or NULL for none.
  *  @param[in] arena The @c Arena the keys land in, claimed here.
  *  @return A new @c Keys of one task, or its @c Deferred, or NULL with an exception set.
  */
 PyObject* ustore_py_keys_scan(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
-                              ustore_key_t const* start, size_t wanted, ustore_scan_mode_t mode, PyObject* progress,
-                              PyObject* arena);
+                              ustore_modality_t modality, ustore_key_t const* start, size_t wanted,
+                              ustore_scan_mode_t mode, PyObject* progress, PyObject* arena);
+
+/** Parses the arguments of one scan, as `scan` takes them, and runs it through the scan of @p modality: the body of
+ *  `scan`, `docs_scan` and `graph_scan_vertices`, whose name @p name spells. */
+PyObject* ustore_py_api_scan_of(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                                PyObject* args_names_tuple, char const* name, ustore_modality_t modality);
 
 /**
  *  @brief Draws up to @p wanted keys at random: the core of `sample`, `Collection.sample_keys` and
@@ -1304,12 +1310,15 @@ extern char const doc_docs_write[];
 extern char const doc_docs_read[];
 extern char const doc_docs_gist[];
 extern char const doc_docs_gather[];
+extern char const doc_docs_remove[];
+extern char const doc_docs_scan[];
 extern char const doc_graph_read_edges[];
 extern char const doc_graph_degrees[];
 extern char const doc_graph_write_edges[];
 extern char const doc_graph_remove_edges[];
 extern char const doc_graph_write_vertices[];
 extern char const doc_graph_remove_vertices[];
+extern char const doc_graph_scan_vertices[];
 
 PyObject* ustore_py_api_read(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
                              PyObject* args_names_tuple);
@@ -1343,6 +1352,10 @@ PyObject* ustore_py_api_docs_gist(PyObject* self, PyObject* const* args, Py_ssiz
                                   PyObject* args_names_tuple);
 PyObject* ustore_py_api_docs_gather(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
                                     PyObject* args_names_tuple);
+PyObject* ustore_py_api_docs_remove(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                                    PyObject* args_names_tuple);
+PyObject* ustore_py_api_docs_scan(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                                  PyObject* args_names_tuple);
 PyObject* ustore_py_api_graph_read_edges(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
                                          PyObject* args_names_tuple);
 PyObject* ustore_py_api_graph_degrees(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
@@ -1355,6 +1368,8 @@ PyObject* ustore_py_api_graph_write_vertices(PyObject* self, PyObject* const* ar
                                              PyObject* args_names_tuple);
 PyObject* ustore_py_api_graph_remove_vertices(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
                                               PyObject* args_names_tuple);
+PyObject* ustore_py_api_graph_scan_vertices(PyObject* self, PyObject* const* args, Py_ssize_t positional_args_count,
+                                            PyObject* args_names_tuple);
 
 #pragma endregion Verbs
 

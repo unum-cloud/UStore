@@ -621,12 +621,34 @@ class _Reads:
         *,
         collection: CollectionLike = None,
     ) -> Columns: ...
+    def docs_scan(
+        self,
+        start: KeyLike,
+        wanted: int,
+        arena: Arena,
+        /,
+        *,
+        collection: CollectionLike = None,
+        mode: ScanMode = ScanMode.ORDERED,
+        progress: Progress | None = None,
+    ) -> Keys: ...
     def graph_read_edges(
         self, vertices: KeysLike, arena: Arena, /, *, role: Role = Role.ANY, collection: CollectionLike = None
     ) -> Neighborhoods: ...
     def graph_degrees(
         self, vertices: KeysLike, arena: Arena, /, *, role: Role = Role.ANY, collection: CollectionLike = None
     ) -> tuple[int | None, ...]: ...
+    def graph_scan_vertices(
+        self,
+        start: KeyLike,
+        wanted: int,
+        arena: Arena,
+        /,
+        *,
+        collection: CollectionLike = None,
+        mode: ScanMode = ScanMode.ORDERED,
+        progress: Progress | None = None,
+    ) -> Keys: ...
 
 @type_check_only
 class _Receivers:
@@ -665,7 +687,7 @@ class _Writes(_Reads):
         collection: CollectionLike = None,
         durability: Durability = Durability.BUFFERED,
     ) -> None:
-        """Removes keys with their values or documents."""
+        """Removes keys with their values."""
     def docs_write(
         self,
         keys: KeysLike | None,
@@ -678,6 +700,14 @@ class _Writes(_Reads):
         id_field: str | None = None,
         durability: Durability = Durability.BUFFERED,
     ) -> None: ...
+    def docs_remove(
+        self,
+        keys: KeyLike | KeysLike,
+        *,
+        collection: CollectionLike = None,
+        durability: Durability = Durability.BUFFERED,
+    ) -> None:
+        """Removes whole documents."""
     def graph_write_edges(
         self,
         sources: KeysLike,
@@ -987,12 +1017,34 @@ class DeferredView:
         *,
         collection: CollectionLike = None,
     ) -> Deferred[Columns]: ...
+    def docs_scan(
+        self,
+        start: KeyLike,
+        wanted: int,
+        arena: Arena,
+        /,
+        *,
+        collection: CollectionLike = None,
+        mode: ScanMode = ScanMode.ORDERED,
+        progress: Progress | None = None,
+    ) -> Deferred[Keys]: ...
     def graph_read_edges(
         self, vertices: KeysLike, arena: Arena, /, *, role: Role = Role.ANY, collection: CollectionLike = None
     ) -> Deferred[Neighborhoods]: ...
     def graph_degrees(
         self, vertices: KeysLike, arena: Arena, /, *, role: Role = Role.ANY, collection: CollectionLike = None
     ) -> Deferred[tuple[int | None, ...]]: ...
+    def graph_scan_vertices(
+        self,
+        start: KeyLike,
+        wanted: int,
+        arena: Arena,
+        /,
+        *,
+        collection: CollectionLike = None,
+        mode: ScanMode = ScanMode.ORDERED,
+        progress: Progress | None = None,
+    ) -> Deferred[Keys]: ...
     def collection_find(self, name: str, arena: Arena, /) -> Deferred[UUID]: ...
     def collection_list(self, arena: Arena, /) -> Deferred[tuple[UUID, ...]]: ...
     def save(self, path: PathLikeOrStr, /, *, progress: Progress | None = None) -> Deferred[None]: ...
@@ -1032,6 +1084,13 @@ class DeferredView:
         modification: Modification = Modification.UPSERT,
         type: FieldType = FieldType.JSON,
         id_field: str | None = None,
+        durability: Durability = Durability.BUFFERED,
+    ) -> Deferred[None]: ...
+    def docs_remove(
+        self,
+        keys: KeyLike | KeysLike,
+        *,
+        collection: CollectionLike = None,
         durability: Durability = Durability.BUFFERED,
     ) -> Deferred[None]: ...
     def graph_write_edges(

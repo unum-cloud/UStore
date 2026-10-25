@@ -292,11 +292,18 @@ int main(void) {
     failures += expect(degrees && degrees[0] == 2 && degrees[1] == 1 && degrees[2] == 1, __LINE__);
 
     // Documents take their field names as a tape and gather one typed column per field
+    ustore_collection_id_t docs = {{{0}}};
+    create.name = bytes_of("docs");
+    create.modality = ustore_modality_docs_k;
+    create.collection = &docs;
+    ustore_collection_create(&create);
+    failures += expect_success(&outcome, __LINE__);
     ustore_key_t const document_key = key_from(9);
     char const* const documents[1] = {"{\"year\":1815,\"name\":\"ada\"}"};
     ustore_docs_write_t write_documents = {.database = database,
                                            .outcome = &outcome,
                                            .count = 1,
+                                           .collections = {&docs, 0},
                                            .keys = {&document_key, 0},
                                            .values = accessor_of(documents)};
     ustore_docs_write(&write_documents);
@@ -308,6 +315,7 @@ int main(void) {
     ustore_docs_gather_t gather = {.database = database,
                                    .outcome = &outcome,
                                    .count = 1,
+                                   .collections = {&docs, 0},
                                    .keys = {&document_key, 0},
                                    .fields_count = 2,
                                    .fields = u32_tape_of(fields_joined, fields_offsets),
@@ -321,11 +329,18 @@ int main(void) {
     failures += expect(year == 1815 && tape_holds(&columns[1].strings, 0, "ada"), __LINE__);
 
     // A page imports from XML, takes an insertion after a Nil anchor, and renders back whole and by the inserted key
+    ustore_collection_id_t pages = {{{0}}};
+    create.name = bytes_of("pages");
+    create.modality = ustore_modality_pages_k;
+    create.collection = &pages;
+    ustore_collection_create(&create);
+    failures += expect_success(&outcome, __LINE__);
     ustore_key_t const page_key = key_from(10);
     char const* const markups[1] = {"<doc><p>one</p></doc>"};
     ustore_pages_import_t import_page = {.database = database,
                                          .outcome = &outcome,
                                          .count = 1,
+                                         .collections = {&pages, 0},
                                          .keys = {&page_key, 0},
                                          .values = accessor_of(markups),
                                          .encoding = ustore_page_encoding_xml_k};
@@ -336,6 +351,7 @@ int main(void) {
     ustore_pages_insert_t insert_page = {.database = database,
                                          .outcome = &outcome,
                                          .count = 1,
+                                         .collections = {&pages, 0},
                                          .keys = {&page_key, 0},
                                          .values = accessor_of(fragments),
                                          .encoding = ustore_page_encoding_xml_k,
@@ -348,6 +364,7 @@ int main(void) {
     ustore_pages_read_t read_page = {.database = database,
                                      .outcome = &outcome,
                                      .count = 1,
+                                     .collections = {&pages, 0},
                                      .keys = {&page_key, 0},
                                      .values = &values,
                                      .arena = arena,

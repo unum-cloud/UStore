@@ -6,7 +6,7 @@ from collections.abc import Iterable, Iterator
 from operator import index
 from uuid import UUID
 
-from ustore.lib import Arena, Database, Snapshot, Transaction, View
+from ustore.lib import Arena, Database, Modality, Snapshot, Transaction, View
 
 type KeyLike = UUID | int | str | bytes
 
@@ -32,11 +32,20 @@ def is_one_key(key: object) -> bool:
 
 
 def scan_keys(
-    view: Database | Transaction | Snapshot | View, collection: UUID | str | None = None, page: int = PAGE_KEYS
+    view: Database | Transaction | Snapshot | View,
+    collection: UUID | str | None = None,
+    page: int = PAGE_KEYS,
+    modality: Modality = Modality.BLOBS,
 ) -> Iterator[UUID]:
-    """Yields every key of `collection` in ascending order through one cursor, holding one page of them at a time in
-    one arena, made where the view's calls run, for the walk's whole life."""
+    """Yields every key of `collection`, which holds `modality`, in ascending order through the scans of that
+    modality, each page resuming past the last key of the one before it, holding one page at a time in one arena,
+    made where the view's calls run, for the walk's whole life."""
     arena = Arena(view.executor if isinstance(view, View) else None)
-    with view.cursor(collection=collection) as cursor:
-        while found := cursor.next(page, arena):
-            yield from found
+    scan = {Modality.DOCS: view.docs_scan, Modality.GRAPH: view.graph_scan_vertices}.get(modality, view.scan)
+    start = KEY_MIN
+    while True:
+        found = scan(start, page, arena, collection=collection)[0]
+        yield from found
+        if len(found) < page or found[-1] == KEY_MAX:
+            return
+        start = UUID(int=found[-1].int + 1)

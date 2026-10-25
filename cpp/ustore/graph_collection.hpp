@@ -15,8 +15,7 @@
 #include <type_traits> // `std::is_same_v`
 #include <utility>     // `std::forward`, `std::move`, `std::swap`
 
-#include "ustore/blobs_range.hpp" // `keys_range_t`
-#include "ustore/blobs_ref.hpp"   // `blobs_read_ref`
+#include "ustore/blobs_range.hpp" // `blobs_range_t`, `keys_range_t`, `keys_stream_t`
 #include "ustore/graph.h"
 #include "ustore/graph_stream.hpp" // `graph_stream_t`
 #include "ustore/ranges.hpp"       // `range`, `strided`, `exported_edges`, `bits_view_t`, `owned_array_concept`
@@ -102,31 +101,40 @@ class graph_read_collection_t {
         return std::span<ustore_vertex_degree_t const> {found, found ? vertices.size() : 0};
     }
 
-    /** Checks whether @p vertex is present through a one-off arena, including a vertex without edges. */
+    /** Checks whether @p vertex is present through a one-off arena, including a vertex without edges, as a vertex whose
+     *  degree is known. */
     expected<bool> present(ustore_key_t vertex, ustore_watch_t watch = ustore_watch_keys_k) noexcept {
-        return blobs_read_ref<collection_key_field_t>(receiver_, collection_key_field_t {collection_, vertex})
-            .present(watch);
+        auto [found, degree_status] = degree(vertex, ustore_vertex_role_any_k, watch);
+        if (degree_status.failed()) return degree_status;
+        return found != ustore_vertex_degree_missing_k;
     }
 
-    /** Checks which vertices are present into @p arena, including those without any edges. */
+    /** Marks in @p presences, one bit per vertex, which of @p vertices are present, including those without any edges,
+     *  reading their degrees into @p arena. */
     expected<bits_view_t> present( //
-        strided_span<ustore_key_t const> const& vertices, arena_t& arena,
+        strided_span<ustore_key_t const> const& vertices, std::span<ustore_octet_t> presences, arena_t& arena,
         ustore_watch_t watch = ustore_watch_keys_k) noexcept {
-        place_batch_t places;
-        places.collections_begin = {&collection_, 0};
-        places.keys_begin = vertices.begin();
-        places.count = vertices.count();
-        return blobs_read_ref<place_batch_t>(receiver_, std::move(places)).present(arena, watch);
+        if (presences.size() * bits_in_byte_k < vertices.size())
+            return status_t {status_code_t::invalid_argument_k, "Need a bit of presence for every vertex"};
+        auto [found, degrees_status] = degrees(vertices, arena, {}, watch);
+        if (degrees_status.failed()) return degrees_status;
+        for (ustore_octet_t& octet : presences) octet = 0;
+        for (std::size_t index = 0; index != found.size(); ++index)
+            if (found[index] != ustore_vertex_degree_missing_k)
+                presences[index / bits_in_byte_k] |= static_cast<ustore_octet_t>(1u << (index % bits_in_byte_k));
+        return bits_view_t {presences.data()};
     }
 
     expected<keys_stream_t> vertex_stream(
         std::size_t vertices_read_ahead = keys_stream_t::default_read_ahead_k) const noexcept {
-        blobs_range_t members(receiver_, collection_);
+        blobs_range_t members(receiver_, collection_, smallest_key_k, largest_key_k, modality_k);
         return members.keys_begin(vertices_read_ahead);
     }
 
     /** Counts the vertices by streaming through all of them. */
-    expected<std::size_t> size() noexcept { return keys_range_t {blobs_range_t {receiver_, collection_}}.size(); }
+    expected<std::size_t> size() noexcept {
+        return keys_range_t {blobs_range_t {receiver_, collection_, smallest_key_k, largest_key_k, modality_k}}.size();
+    }
 
     /** Counts the edges by streaming through the outgoing edges of every vertex. */
     expected<std::size_t> number_of_edges() noexcept {

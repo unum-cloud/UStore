@@ -167,7 +167,7 @@ auto present = friends.present(key_from_integer(3));
 
 The neighbors land in the arena the call is given, while `degree` and `present` of one vertex copy a scalar out of a one-off arena.
 Upserting an edge upserts its vertices, removing an edge keeps them, and removing a vertex removes every edge that touches it.
-The C ABI behind these calls is five functions: `ustore_graph_read_edges`, `ustore_graph_write_edges`, `ustore_graph_remove_edges`, `ustore_graph_write_vertices` and `ustore_graph_remove_vertices`.
+The C ABI behind these calls is six functions: `ustore_graph_read_edges`, `ustore_graph_write_edges`, `ustore_graph_remove_edges`, `ustore_graph_write_vertices`, `ustore_graph_remove_vertices` and `ustore_graph_scan_vertices`.
 
 Documents and graphs share one key type, so a user's profile and a user's vertex carry the same key, in one box, inside one transaction.
 

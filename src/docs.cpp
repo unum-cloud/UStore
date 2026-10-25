@@ -2,10 +2,10 @@
  *  @file src/docs.cpp
  *  @author Ash Vardanian
  *  @date December 26, 2022
- *  @brief Documents modality on yyjson and StringZilla, running on top of any engine that implements <ustore/db.h>.
+ *  @brief Documents modality on yyjson and StringZilla, over the whole-value verbs of the one engine serving it.
  *
  *  Documents are stored as JSON text.
- *  Whole-document reads and upserts pass straight through to the engine's own read and write.
+ *  Whole-document reads and upserts pass straight through to the engine's own unchecked read and write.
  *  Field reads and gathers locate their fields with one StringZilla subdocuments pass over the documents read.
  *  They parse with yyjson only a batch that pass cannot read as yyjson would.
  *  Gists and modifications parse every document with yyjson.
@@ -36,7 +36,7 @@
 #include "ustore/utilities/algorithm.hpp"   // `offset_in_sorted`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_grow`, `arena_allocator`, `growing_strings`
 
-#include "engine.hpp"            // `engine_of`, `view_t`, `docs_write_in_json_values`
+#include "engine.hpp"            // `blobs_verbs_t`, `view_t`, `docs_write_over_blobs`
 #include "lib.hpp"               // `route`, `enumerator_spelling`, `name_in`, `value_in`, `stringzilla_capabilities`
 #include "utilities/batches.hpp" // `strings_arg_t`, `places_of`
 #include "utilities/outputs.hpp" // `read_outputs_t`
@@ -73,10 +73,10 @@ static bool addresses_fields(strings_arg_t const& fields, std::size_t count) noe
     return false;
 }
 
-/** Reads the binary documents at @p places through @p view with the engine's own read, which appends to the scratch
- *  of @p view rather than rewinding it, answering the tape and presences as read. */
-static expected<json_documents_t> read_document_tape(ustore_database_t database, place_batch_t const& places,
-                                                     view_t const& view) noexcept {
+/** Reads the binary documents at @p places through @p view with the engine's own @p values_verbs, which append to the
+ *  scratch of @p view rather than rewinding it, answering the tape and presences as read. */
+static expected<json_documents_t> read_document_tape(blobs_verbs_t const& values_verbs, ustore_database_t database,
+                                                     place_batch_t const& places, view_t const& view) noexcept {
     json_documents_t documents;
     documents.count = places.count;
     ustore_blobs_read_t read {};
@@ -87,14 +87,14 @@ static expected<json_documents_t> read_document_tape(ustore_database_t database,
     read.presences = &documents.presences;
     read.values = &documents.tape;
     read.arena = view.scratch;
-    if (status_t const status = engine_of(database).blobs_read(read, view); status.failed()) return status;
+    if (status_t const status = values_verbs.read(read, view); status.failed()) return status;
     return documents;
 }
 
 /** Reads the binary documents at @p places through @p view, as @c read_document_tape does, viewing them as values. */
-static expected<values_view_t> read_documents(ustore_database_t database, place_batch_t const& places,
-                                              view_t const& view) noexcept {
-    auto [documents, status] = read_document_tape(database, places, view);
+static expected<values_view_t> read_documents(blobs_verbs_t const& values_verbs, ustore_database_t database,
+                                              place_batch_t const& places, view_t const& view) noexcept {
+    auto [documents, status] = read_document_tape(values_verbs, database, places, view);
     if (status.failed()) return status;
     return values_view_t {places.count, documents.presences, documents.tape};
 }
@@ -114,11 +114,12 @@ static expected<yyjson_val*> parse_field(std::string_view document, std::string_
  *  and an insertion of a whole document that already exists.
  */
 template <document_callback callback_type_>
-static status_t read_each_document(ustore_database_t database, place_batch_t const& places, strings_arg_t const& fields,
+static status_t read_each_document(blobs_verbs_t const& values_verbs, ustore_database_t database,
+                                   place_batch_t const& places, strings_arg_t const& fields,
                                    modification_t modification, view_t const& view,
                                    callback_type_&& callback) noexcept {
 
-    auto [found, status] = read_documents(database, places, view);
+    auto [found, status] = read_documents(values_verbs, database, places, view);
     if (status.failed()) return status;
 
     bool const replaces_existing = modification == modification_t::update_k || modification == modification_t::patch_k;
@@ -152,12 +153,12 @@ struct task_documents_t {
 };
 
 /** Reads every distinct document the tasks at @p places address once. */
-static expected<task_documents_t> read_distinct_documents(ustore_database_t database, place_batch_t const& places,
-                                                          view_t const& view) noexcept {
+static expected<task_documents_t> read_distinct_documents(blobs_verbs_t const& values_verbs, ustore_database_t database,
+                                                          place_batch_t const& places, view_t const& view) noexcept {
 
     task_documents_t read;
     if (all_ascending(places.keys_begin, places.count)) {
-        auto [documents, status] = read_document_tape(database, places, view);
+        auto [documents, status] = read_document_tape(values_verbs, database, places, view);
         if (status.failed()) return status;
         read.documents = documents;
         return read;
@@ -168,7 +169,7 @@ static expected<task_documents_t> read_distinct_documents(ustore_database_t data
     transform_n(places, places.count, distinct.begin(), [](place_t const& place) { return place.collection_key(); });
     std::size_t const distinct_count = sort_and_deduplicate(distinct.begin(), distinct.end());
     if (distinct_count == places.count) {
-        auto [documents, status] = read_document_tape(database, places, view);
+        auto [documents, status] = read_document_tape(values_verbs, database, places, view);
         if (status.failed()) return status;
         read.documents = documents;
         return read;
@@ -181,7 +182,7 @@ static expected<task_documents_t> read_distinct_documents(ustore_database_t data
     distinct_places.keys_begin = sorted_strided.members(&collection_key_t::key).begin();
     distinct_places.count = static_cast<ustore_size_t>(distinct_count);
 
-    auto [documents, documents_status] = read_document_tape(database, distinct_places, view);
+    auto [documents, documents_status] = read_document_tape(values_verbs, database, distinct_places, view);
     if (documents_status.failed()) return documents_status;
     auto [documents_of_tasks, mapping_status] = arena_allocate<std::size_t>(view.scratch, places.count);
     if (mapping_status.failed()) return mapping_status;
@@ -220,11 +221,11 @@ static expected<task_fields_t> distinct_fields(strings_arg_t const& fields, std:
 
 #pragma region Writing
 
-/** Parses, modifies and writes back the documents at @p places through the engine's own read and write. */
-static status_t read_modify_write(ustore_database_t database, place_batch_t const& places, strings_arg_t const& fields,
-                                  strings_arg_t const& values, modification_t modification,
-                                  ustore_docs_field_type_t type, ustore_durability_t durability,
-                                  view_t const& view) noexcept {
+/** Parses, modifies and writes back the documents at @p places through the engine's own @p values_verbs. */
+static status_t read_modify_write(blobs_verbs_t const& values_verbs, ustore_database_t database,
+                                  place_batch_t const& places, strings_arg_t const& fields, strings_arg_t const& values,
+                                  modification_t modification, ustore_docs_field_type_t type,
+                                  ustore_durability_t durability, view_t const& view) noexcept {
 
     ustore_arena_t const scratch = view.scratch;
     growing_strings<arena_allocator<byte_t>> modified {scratch};
@@ -249,7 +250,8 @@ static status_t read_modify_write(ustore_database_t database, place_batch_t cons
     // A transaction watches the documents it rewrites, whatever the caller asked of the writes
     view_t watching = view;
     watching.watch = ustore_watch_keys_k;
-    if (status_t const status = read_each_document(database, places, fields, modification, watching, modify_one);
+    if (status_t const status = read_each_document(values_verbs, database, places, fields, modification, watching,
+                                                   modify_one);
         status.failed())
         return status;
 
@@ -262,7 +264,7 @@ static status_t read_modify_write(ustore_database_t database, place_batch_t cons
     write.keys = places.keys();
     write.values = modified_values.view;
     write.durability = durability;
-    return engine_of(database).blobs_write(write, modified_values, view);
+    return values_verbs.write(write, modified_values, view);
 }
 
 #pragma endregion Writing
@@ -324,8 +326,8 @@ static status_t gist_paths(yyjson_val* node, field_path_buffer_t& path, sorted_p
 
 #pragma region Document Calls
 
-status_t docs_write_in_json_values(ustore_docs_write_t const& arguments, strings_arg_t const& fields,
-                                   strings_arg_t const& values, view_t const& view) noexcept {
+status_t docs_write_over_blobs(blobs_verbs_t const& values_verbs, ustore_docs_write_t const& arguments,
+                               strings_arg_t const& fields, strings_arg_t const& values, view_t const& view) noexcept {
     if (!arguments.count) return {};
     if (!values) return {status_code_t::invalid_argument_k, "No values were provided"};
     std::string_view const id_field = string_of(arguments.id_field);
@@ -344,7 +346,7 @@ status_t docs_write_in_json_values(ustore_docs_write_t const& arguments, strings
 
     if (addresses_fields(fields, arguments.count) || arguments.type != ustore_docs_field_type_json_k ||
         arguments.modification != ustore_docs_modify_upsert_k)
-        return read_modify_write(arguments.database, places, fields, values,
+        return read_modify_write(values_verbs, arguments.database, places, fields, values,
                                  static_cast<modification_t>(arguments.modification), arguments.type,
                                  arguments.durability, view);
 
@@ -360,11 +362,11 @@ status_t docs_write_in_json_values(ustore_docs_write_t const& arguments, strings
     write.keys = places.keys();
     write.values = arguments.values;
     write.durability = arguments.durability;
-    return engine_of(arguments.database).blobs_write(write, values, view);
+    return values_verbs.write(write, values, view);
 }
 
-status_t docs_read_in_json_values(ustore_docs_read_t const& arguments, strings_arg_t const& fields,
-                                  view_t const& view) noexcept {
+status_t docs_read_over_blobs(blobs_verbs_t const& values_verbs, ustore_docs_read_t const& arguments,
+                              strings_arg_t const& fields, view_t const& view) noexcept {
     if (!arguments.count) return {};
 
     if (!addresses_fields(fields, arguments.count) && arguments.outputs_type == ustore_docs_field_type_json_k) {
@@ -377,7 +379,7 @@ status_t docs_read_in_json_values(ustore_docs_read_t const& arguments, strings_a
         read.lengths = arguments.lengths;
         read.values = arguments.values;
         read.arena = arguments.arena;
-        return engine_of(arguments.database).blobs_read(read, view);
+        return values_verbs.read(read, view);
     }
     if (arguments.outputs_type != ustore_docs_field_type_json_k &&
         arguments.outputs_type != ustore_docs_field_type_str_k)
@@ -413,7 +415,7 @@ status_t docs_read_in_json_values(ustore_docs_read_t const& arguments, strings_a
         return {};
     };
 
-    auto [read, read_status] = read_distinct_documents(arguments.database, places, view);
+    auto [read, read_status] = read_distinct_documents(values_verbs, arguments.database, places, view);
     if (read_status.failed()) return read_status;
     auto [task_fields, fields_status] = distinct_fields(fields, arguments.count, view.scratch);
     if (fields_status.failed()) return fields_status;
@@ -439,11 +441,12 @@ status_t docs_read_in_json_values(ustore_docs_read_t const& arguments, strings_a
     return outputs.finish(arguments);
 }
 
-status_t docs_gist_in_json_values(ustore_docs_gist_t const& arguments, view_t const& view) noexcept {
+status_t docs_gist_over_blobs(blobs_verbs_t const& values_verbs, ustore_docs_gist_t const& arguments,
+                              view_t const& view) noexcept {
     if (arguments.written) *arguments.written = 0;
     if (!arguments.count) return {};
 
-    auto [found, found_status] = read_documents(arguments.database, places_of(arguments), view);
+    auto [found, found_status] = read_documents(values_verbs, arguments.database, places_of(arguments), view);
     if (found_status.failed()) return found_status;
 
     // The paths and their offsets grow side by side in scratch, and only their final lengths reach the arena
@@ -467,8 +470,8 @@ status_t docs_gist_in_json_values(ustore_docs_gist_t const& arguments, view_t co
     return {};
 }
 
-status_t docs_gather_in_json_values(ustore_docs_gather_t const& arguments, strings_arg_t const& fields,
-                                    view_t const& view) noexcept {
+status_t docs_gather_over_blobs(blobs_verbs_t const& values_verbs, ustore_docs_gather_t const& arguments,
+                                strings_arg_t const& fields, view_t const& view) noexcept {
     if (!arguments.count || !arguments.fields_count) return {};
 
     if (!arguments.columns) return {status_code_t::invalid_argument_k, "Need an output for the columns"};
@@ -477,7 +480,8 @@ status_t docs_gather_in_json_values(ustore_docs_gather_t const& arguments, strin
 
     std::size_t const fields_count = arguments.fields_count;
     std::size_t const docs_count = arguments.count;
-    auto [documents, documents_status] = read_document_tape(arguments.database, places_of(arguments), view);
+    auto [documents, documents_status] = read_document_tape(values_verbs, arguments.database, places_of(arguments),
+                                                            view);
     if (documents_status.failed()) return documents_status;
 
     // One subdocuments pass resolves every cell, field after field, where yyjson would parse every document once
@@ -631,10 +635,12 @@ constexpr enumerator_spelling<ustore_docs_modification_t> docs_modification_name
 
 } // namespace unum::ustore
 
-void ustore_docs_write(ustore_docs_write_t* arguments) { route<&engine_t::docs_write>(arguments); }
-void ustore_docs_read(ustore_docs_read_t* arguments) { route<&engine_t::docs_read>(arguments); }
-void ustore_docs_gist(ustore_docs_gist_t* arguments) { route<&engine_t::docs_gist>(arguments); }
-void ustore_docs_gather(ustore_docs_gather_t* arguments) { route<&engine_t::docs_gather>(arguments); }
+void ustore_docs_write(ustore_docs_write_t* arguments) { route<&engine_t::docs, &docs_verbs_t::write>(arguments); }
+void ustore_docs_read(ustore_docs_read_t* arguments) { route<&engine_t::docs, &docs_verbs_t::read>(arguments); }
+void ustore_docs_gist(ustore_docs_gist_t* arguments) { route<&engine_t::docs, &docs_verbs_t::gist>(arguments); }
+void ustore_docs_gather(ustore_docs_gather_t* arguments) { route<&engine_t::docs, &docs_verbs_t::gather>(arguments); }
+void ustore_docs_remove(ustore_docs_remove_t* arguments) { route<&engine_t::docs, &docs_verbs_t::remove>(arguments); }
+void ustore_docs_scan(ustore_docs_scan_t* arguments) { route<&engine_t::docs, &docs_verbs_t::scan>(arguments); }
 
 char const* ustore_docs_field_type_name(ustore_docs_field_type_t field_type) {
     return name_in(docs_field_type_names_k, field_type);

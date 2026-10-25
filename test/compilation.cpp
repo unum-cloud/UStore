@@ -275,7 +275,8 @@ std::size_t wrappers_compile(config_t const& config) {
     }
 
     // Deferred documents, graphs and strings, each verb taking owned inputs
-    deferred_docs_collection_t deferred_documents = deferred_head.main<docs_collection_t>();
+    failures += expect(database.find_or_create<docs_collection_t>("docs").has_value());
+    deferred_docs_collection_t deferred_documents = *deferred_head.find<docs_collection_t>("docs");
     values_tape_t documents;
     failures += fill_tape(documents, {R"({"hello":"world"})", R"({"hello":"again"})"});
     failures += expect(deferred_documents.write(owned_keys, std::move(documents)).wait().succeeded());
@@ -334,14 +335,15 @@ std::size_t wrappers_compile(config_t const& config) {
         snapshot_t snapshot = *database.on(executor).snapshot();
         [[maybe_unused]] read_stamp_t const snapshot_stamp = snapshot.read_stamp();
         [[maybe_unused]] auto const snapshot_value = snapshot.main().at(key_from_integer(42)).value();
-        [[maybe_unused]] docs_read_collection_t const snapshot_documents = snapshot.main<docs_collection_t>();
+        [[maybe_unused]] expected<docs_read_collection_t> const snapshot_documents = snapshot.find<docs_collection_t>(
+            "docs");
         [[maybe_unused]] expected<graph_read_collection_t> const snapshot_graph = snapshot.find<graph_collection_t>();
         [[maybe_unused]] expected<strings_read_collection_t> const snapshot_strings =
             snapshot.find<strings_collection_t>("strings");
         deferred_blobs_read_collection_t deferred_snapshot = snapshot.deferred(executor).main();
         failures += expect(deferred_snapshot.read(owned_keys, arena).wait().has_value());
         deferred_docs_read_collection_t deferred_snapshot_documents =
-            snapshot.deferred(executor).main<docs_collection_t>();
+            *snapshot.deferred(executor).find<docs_collection_t>("docs");
         failures += expect(deferred_snapshot_documents.read(owned_keys, arena).wait().has_value());
         if (config.directory()) {
             path_t const saved {config.directory(), "saved"};
