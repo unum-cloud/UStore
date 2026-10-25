@@ -66,12 +66,16 @@ struct database_types {
     using blobs_store_of = nvme_store<key_slot<stored_key_t, value_layout_>, volume_t, atomic_reference, waiter_t,
                                       last_write_fold_t, no_device_fold_t>;
     using strings_store_t = strings::nvme_store<volume_t, atomic_reference, waiter_t>;
-    using database_t = basic_database<
-        stored_key_t, volume_t, atomic_reference, waiter_t, strings_store_t,
-        blobs_store_of<value_layout_t::inline_1_byte_k>, blobs_store_of<value_layout_t::inline_4_bytes_k>,
-        blobs_store_of<value_layout_t::inline_8_bytes_k>, blobs_store_of<value_layout_t::inline_16_bytes_k>,
-        blobs_store_of<value_layout_t::inline_32_bytes_k>, blobs_store_of<value_layout_t::inline_64_bytes_k>,
-        blobs_store_of<value_layout_t::fixed_width_k>, blobs_store_of<value_layout_t::variable_width_k>>;
+    template <typename... stores_>
+    using database_of =
+        basic_database<stored_key_t, volume_t, atomic_reference, waiter_t, layout_store_tags<stores_...>, stores_...>;
+    using database_t =
+        database_of<strings_store_t, blobs_store_of<value_layout_t::inline_1_byte_k>,
+                    blobs_store_of<value_layout_t::inline_4_bytes_k>, blobs_store_of<value_layout_t::inline_8_bytes_k>,
+                    blobs_store_of<value_layout_t::inline_16_bytes_k>,
+                    blobs_store_of<value_layout_t::inline_32_bytes_k>,
+                    blobs_store_of<value_layout_t::inline_64_bytes_k>, blobs_store_of<value_layout_t::fixed_width_k>,
+                    blobs_store_of<value_layout_t::variable_width_k>>;
     using transaction_t = typename database_t::transaction_t;
 
     /** A fixture, the router over its one volume, and the database mounted over the router. */
@@ -122,7 +126,9 @@ expected<collection_id_t> create_named(store_type_& store, string_view_t name,
                                        collection_config_t const& config) noexcept {
     collection_id_t collection_id;
     std::memcpy(collection_id.uuid.bytes, uuid_generator().bytes, sizeof(collection_id.uuid.bytes));
-    if (status_t const created = store.create_collection(collection_id, name, ustore_modality_blobs_k, config);
+    value_layout_t const layout = resolve_value_layout(config.lsm_tree.lsm_level_0.sorted_run.value_size);
+    if (status_t const created = store.create_collection(collection_id, name, static_cast<std::uint16_t>(layout),
+                                                         config);
         created.failed())
         return created;
     return collection_id;
@@ -549,9 +555,9 @@ std::size_t catalog_survives_reopen(mount_type_ const& mount) {
     failures += expect_eq(restored.memory_runs_max_deltas, std::size_t {4096});
     failures += expect_eq(store.buffer_size_for_any_stored_value(any_collection_id_t {*numbers}),
                           stored_value_size_t {8});
-    ustore_modality_t modality {};
-    failures += expect(store.collection_modality(*blobs, modality).succeeded());
-    failures += expect(modality == ustore_modality_blobs_k);
+    std::uint16_t store_tag = 0;
+    failures += expect(store.collection_store_tag(*blobs, store_tag).succeeded());
+    failures += expect_eq(store_tag, static_cast<std::uint16_t>(value_layout_t::variable_width_k));
 
     // Every run the close left behind is back, and the reads below tell their levels apart.
     failures += expect_eq(run_count_of((*stack)->router.volume(volume_id_t {0})), runs_before);
@@ -564,13 +570,29 @@ std::size_t catalog_survives_reopen(mount_type_ const& mount) {
     failures += expect(store.unmount().succeeded());
     (*reopened).reset();
 
-    // A database with no store for the blobs refuses the catalog naming them, and leaves it whole for one that has.
-    using numbers_only_t = basic_database<stored_key_t, typename types_t::volume_t, atomic_reference, waiter_t,
-                                          typename types_t::template blobs_store_of<value_layout_t::inline_8_bytes_k>>;
+    // A database of fewer stores refuses a catalog naming a store it lacks, and leaves it whole for one that has.
+    using numbers_only_t = typename types_t::template database_of<
+        typename types_t::template blobs_store_of<value_layout_t::inline_8_bytes_k>>;
     {
         numbers_only_t narrow {(*stack)->fixture->resources};
         failures += expect_status(narrow.mount((*stack)->router, (*stack)->fixture->channels, test_database_config()),
-                                  status_code_t::unsupported_k);
+                                  status_code_t::malformed_k);
+    }
+
+    // A database listing its stores in another order mounts every collection in the store its tag names.
+    using reordered_t = typename types_t::template database_of<
+        typename types_t::template blobs_store_of<value_layout_t::variable_width_k>,
+        typename types_t::template blobs_store_of<value_layout_t::fixed_width_k>,
+        typename types_t::template blobs_store_of<value_layout_t::inline_8_bytes_k>>;
+    {
+        reordered_t reordered {(*stack)->fixture->resources};
+        failures += expect(
+            reordered.mount((*stack)->router, (*stack)->fixture->channels, test_database_config()).succeeded());
+        failures += expect_eq(reordered.size(), std::size_t {3});
+        failures += expect_eq(reordered.buffer_size_for_any_stored_value(any_collection_id_t {*numbers}),
+                              stored_value_size_t {8});
+        for (std::uint64_t key = 0; key != 4; ++key) failures += check_painted(reordered, named, key, 3);
+        failures += expect(reordered.unmount().succeeded());
     }
     expected<std::unique_ptr<database_t>> again = open_database(**stack);
     failures += expect(again.has_value());
@@ -598,10 +620,11 @@ std::size_t strings_survive_reopen(mount_type_ const& mount) {
 
     collection_id_t names;
     std::memcpy(names.uuid.bytes, uuid_generator().bytes, sizeof(names.uuid.bytes));
-    failures += expect(
-        (*stack)
-            ->store->create_collection(names, "names", ustore_modality_strings_k, test_config(sizeof(ustore_uuid_t), 0))
-            .succeeded());
+    failures += expect((*stack)
+                           ->store
+                           ->create_collection(names, "names", static_cast<std::uint16_t>(value_layout_t::uuid_k),
+                                               test_config(sizeof(ustore_uuid_t), 0))
+                           .succeeded());
     if (failures != 0) return failures;
 
     std::array<std::string, strings_k> texts;

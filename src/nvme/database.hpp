@@ -9,7 +9,7 @@
 #pragma once
 
 #include <cstddef> // `std::size_t`
-#include <cstdint> // `std::uint8_t`, `std::uint64_t`
+#include <cstdint> // `std::uint8_t`, `std::uint16_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`
 
 #include <algorithm>   // `std::max`, `std::min`, `std::sort`
@@ -20,7 +20,8 @@
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 #include <type_traits> // `std::is_same_v`, `std::remove_reference_t`
-#include <utility>     // `std::in_range`, `std::move`
+#include <utility>     // `std::in_range`, `std::make_index_sequence`, `std::move`
+#include <variant>     // `std::variant_alternative_t`, `std::variant_size_v`
 
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`
 
@@ -101,13 +102,51 @@ using strings_store_of =
     strings::nvme_store<typename storage_mount_of<cpu_class_>::volume_t,
                         atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>>;
 
+/** The tag a collection holding @p modality with values of @p layout persists, naming its store whatever order
+ *  @c database_of lists its stores in: the modality in the high byte and the value layout in the low one. */
+constexpr std::uint16_t store_tag_of(ustore_modality_t modality, value_layout_t layout) noexcept {
+    return static_cast<std::uint16_t>(static_cast<unsigned>(modality) << 8 | static_cast<unsigned>(layout));
+}
+
+/** What the collections of the store @p store_tag names hold. */
+constexpr ustore_modality_t modality_of(std::uint16_t store_tag) noexcept {
+    return static_cast<ustore_modality_t>(store_tag >> 8);
+}
+
+/** The tag of every store of @c database_of, in the order it lists them. */
+inline constexpr std::uint16_t store_tags_k[] {
+    store_tag_of(ustore_modality_strings_k, value_layout_t::uuid_k),
+    store_tag_of(ustore_modality_graph_k, value_layout_t::variable_width_k),
+    store_tag_of(ustore_modality_docs_k, value_layout_t::variable_width_k),
+    store_tag_of(ustore_modality_pages_k, value_layout_t::variable_width_k),
+    store_tag_of(ustore_modality_blobs_k, value_layout_t::inline_1_byte_k),
+    store_tag_of(ustore_modality_blobs_k, value_layout_t::inline_4_bytes_k),
+    store_tag_of(ustore_modality_blobs_k, value_layout_t::inline_8_bytes_k),
+    store_tag_of(ustore_modality_blobs_k, value_layout_t::inline_16_bytes_k),
+    store_tag_of(ustore_modality_blobs_k, value_layout_t::inline_32_bytes_k),
+    store_tag_of(ustore_modality_blobs_k, value_layout_t::inline_64_bytes_k),
+    store_tag_of(ustore_modality_blobs_k, value_layout_t::fixed_width_k),
+    store_tag_of(ustore_modality_blobs_k, value_layout_t::variable_width_k),
+};
+
+/** Where among the stores of @c database_of each tag's store sits. */
+struct store_tags_t {
+
+    /** The index of the store @p store_tag names, or the count of the stores for a tag naming none. */
+    static constexpr std::size_t index_of(std::uint16_t store_tag) noexcept {
+        std::size_t index = 0;
+        while (index != std::size(store_tags_k) && store_tags_k[index] != store_tag) ++index;
+        return index;
+    }
+};
+
 /** The database every call of @p cpu_class_ runs against, whose volumes live in files, owning its words through the
- *  class's atomic reference and waiting through its waiter, and whose collections live in the one store serving
- *  their modality and value layout, a pair no store serves being refused. */
+ *  class's atomic reference and waiting through its waiter, and whose collections live in the store their tag names,
+ *  a pair of modality and value layout no store keeps being refused. */
 template <cpu_class_t cpu_class_>
 using database_of =
     basic_database<stored_key_t, typename storage_mount_of<cpu_class_>::volume_t,
-                   atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>,
+                   atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>, store_tags_t,
                    strings_store_of<cpu_class_>, graph_store_of<cpu_class_>, docs_store_of<cpu_class_>,
                    pages_store_of<cpu_class_>, blobs_store_of<cpu_class_, value_layout_t::inline_1_byte_k>,
                    blobs_store_of<cpu_class_, value_layout_t::inline_4_bytes_k>,
@@ -117,6 +156,17 @@ using database_of =
                    blobs_store_of<cpu_class_, value_layout_t::inline_64_bytes_k>,
                    blobs_store_of<cpu_class_, value_layout_t::fixed_width_k>,
                    blobs_store_of<cpu_class_, value_layout_t::variable_width_k>>;
+
+static_assert(
+    []<std::size_t... indices_>(std::index_sequence<indices_...>) noexcept {
+        using stores_t = typename database_of<cpu_class_t::serial_k>::any_collection_t;
+        return sizeof...(indices_) == std::variant_size_v<stores_t> &&
+               ((static_cast<std::uint16_t>(
+                     std::variant_alternative_t<indices_, stores_t>::key_slot_t::value_layout_k) ==
+                 (store_tags_k[indices_] & 0xFF)) &&
+                ...);
+    }(std::make_index_sequence<std::size(store_tags_k)> {}),
+    "Every store of the database has its tag, in the order it lists them");
 
 /** One transaction over the collections of that database. */
 template <cpu_class_t cpu_class_>
@@ -733,6 +783,30 @@ status_t serve_write(database_state<cpu_class_>& state, view_t const& view, usto
 
 #pragma region Collections
 
+/** What @p collection of the store of @p state holds, which the store its tag names tells. */
+template <cpu_class_t cpu_class_>
+status_t collection_modality(database_state<cpu_class_>& state, collection_id_t const& collection,
+                             ustore_modality_t& modality) noexcept {
+    std::uint16_t store_tag = 0;
+    if (status_t const held = state.store->collection_store_tag(collection, store_tag); held.failed()) return held;
+    modality = modality_of(store_tag);
+    return {};
+}
+
+/** Creates the collection @p collection named @p name, holding @p modality, shaped as @p shape, in the store tagged
+ *  for values of one 16-byte key for strings and of the layout of their width otherwise. */
+template <cpu_class_t cpu_class_>
+status_t create_collection(database_state<cpu_class_>& state, collection_id_t const& collection, std::string_view name,
+                           ustore_modality_t modality, collection_config_t const& shape) noexcept {
+    value_layout_t const layout = entry_layout_of(modality) == entry_layout_t::strings_to_uuids_k
+                                      ? value_layout_t::uuid_k
+                                      : resolve_value_layout(shape.lsm_tree.lsm_level_0.sorted_run.value_size);
+    std::uint16_t const store_tag = store_tag_of(modality, layout);
+    if (store_tags_t::index_of(store_tag) == std::size(store_tags_k))
+        return {status_code_t::unsupported_k, "No store keeps a collection of that modality and layout"};
+    return state.store->create_collection(collection, string_view_t {name}, store_tag, shape);
+}
+
 /** What the engine knows of a listed collection: its modality, which the store records, and its name, which the
  *  collections system collection records, empty for an anonymous one. */
 struct collections_entry_t {
@@ -747,8 +821,7 @@ expected<collections_entry_t> read_collections_entry(database_state<cpu_class_>&
                                                      ustore_collection_id_t const& collection,
                                                      value_view_t held) noexcept {
     collections_entry_t entry {ustore_modality_t {}, std::string_view {held}};
-    if (status_t const known = state.store->collection_modality(collection, entry.modality); known.failed())
-        return known;
+    if (status_t const known = collection_modality(state, collection, entry.modality); known.failed()) return known;
     return entry;
 }
 
@@ -1273,8 +1346,8 @@ status_t collection_create(ustore_collection_create_t const& arguments, view_t c
     collection_config_t const shape = entry_layout_of(arguments.modality) == entry_layout_t::strings_to_uuids_k
                                           ? strings_shape_of(state.collection_shape)
                                           : state.collection_shape;
-    if (status_t const made = state.store->create_collection(created, string_view_t {text, sizeof(text)},
-                                                             arguments.modality, shape);
+    if (status_t const made = create_collection(state, created, std::string_view {text, sizeof(text)},
+                                                arguments.modality, shape);
         made.failed())
         return made;
 
@@ -1352,7 +1425,7 @@ status_t collection_find(ustore_collection_find_t const& arguments, strings_arg_
             return looked;
         // A drop unnames a collection before the store lets it go, so a name whose store is gone is a drop in flight
         ustore_modality_t modality {};
-        if (present && state.store->collection_modality(found, modality).failed()) present = false;
+        if (present && collection_modality(state, found, modality).failed()) present = false;
         outputs.assign(index, present ? found : ustore_collection_id_t {}, modality, present);
     }
     outputs.finish(arguments);
@@ -1517,7 +1590,7 @@ template <cpu_class_t cpu_class_>
 status_t reserve_collection(database_state<cpu_class_>& state, collection_id_t const& collection, std::string_view name,
                             ustore_modality_t modality, collection_config_t const& shape) noexcept {
     if (state.store->has_collection(collection)) return {};
-    return state.store->create_collection(collection, string_view_t {name}, modality, shape);
+    return create_collection(state, collection, name, modality, shape);
 }
 
 /** Drops every collection of the store the collections system collection does not list, which a crash between a
@@ -1685,12 +1758,12 @@ template <cpu_class_t cpu_class_>
 status_t save_collection(call_access<cpu_class_> const& access, collection_ids_t const& collection,
                          database_state<cpu_class_>& target, progress_t& progress) noexcept {
     database_of<cpu_class_>& store = *access.state.store;
-    ustore_modality_t modality {};
-    if (status_t const held = store.collection_modality(collection.id, modality); held.failed()) return held;
+    std::uint16_t store_tag = 0;
+    if (status_t const held = store.collection_store_tag(collection.id, store_tag); held.failed()) return held;
     if (!target.store->has_collection(collection.id)) {
         collection_config_t config;
         if (status_t const shaped = store.collection_config(collection.id, config); shaped.failed()) return shaped;
-        if (status_t const made = target.store->create_collection(collection.id, collection.name.view(), modality,
+        if (status_t const made = target.store->create_collection(collection.id, collection.name.view(), store_tag,
                                                                   config);
             made.failed())
             return made;
@@ -1700,7 +1773,7 @@ status_t save_collection(call_access<cpu_class_> const& access, collection_ids_t
     collection_config_t config;
     if (status_t const shaped = target.store->collection_config(collection.id, config); shaped.failed()) return shaped;
     std::size_t const window = config.memory_runs_max_deltas;
-    if (entry_layout_of(modality) == entry_layout_t::strings_to_uuids_k)
+    if (entry_layout_of(modality_of(store_tag)) == entry_layout_t::strings_to_uuids_k)
         return save_strings(access, collection.id, target, window, progress);
     st::basic_vector<stored_key_t> keys;
     st::basic_vector<byte_t> value;
@@ -1764,7 +1837,7 @@ status_t snapshot_save(ustore_snapshot_save_t const& arguments, view_t const& vi
     if (arguments.progress)
         for (collection_ids_t const& collection : held) {
             ustore_modality_t modality {};
-            if (status_t const known = source.store->collection_modality(collection.id, modality); known.failed())
+            if (status_t const known = collection_modality(source, collection.id, modality); known.failed())
                 return known;
             status_t const measured = entry_layout_of(modality) == entry_layout_t::strings_to_uuids_k
                                           ? walk_strings(access, collection.id, {}, {}, access.stamp,

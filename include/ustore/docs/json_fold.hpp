@@ -532,9 +532,6 @@ status_t merge_open_chain(deltas_type_& deltas, keep_type_& keep, ustore_arena_t
 /** The fold of docs, fitting the fold concept of `ustore/utilities/folds.hpp`: apply, compose and closes. */
 struct json_fold_t {
 
-    /** Whether a collection of @p modality folds document deltas, which docs alone do. */
-    static constexpr bool serves(ustore_modality_t modality) noexcept { return modality == ustore_modality_docs_k; }
-
     /**
      *  @brief The document @p base becomes once every delta of @p deltas applies, oldest first.
      *  @return @p base itself without deltas, the document in @p arena, @c status_code_t::not_found_k for a missing

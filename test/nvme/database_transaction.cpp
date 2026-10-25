@@ -66,12 +66,15 @@ struct database_types {
     template <value_layout_t value_layout_>
     using blobs_store_of = nvme_store<key_slot<stored_key_t, value_layout_>, volume_t, atomic_reference, waiter_t,
                                       last_write_fold_t, no_device_fold_t>;
-    using database_t = basic_database<
-        stored_key_t, volume_t, atomic_reference, waiter_t, blobs_store_of<value_layout_t::inline_1_byte_k>,
-        blobs_store_of<value_layout_t::inline_4_bytes_k>, blobs_store_of<value_layout_t::inline_8_bytes_k>,
-        blobs_store_of<value_layout_t::inline_16_bytes_k>, blobs_store_of<value_layout_t::inline_32_bytes_k>,
-        blobs_store_of<value_layout_t::inline_64_bytes_k>, blobs_store_of<value_layout_t::fixed_width_k>,
-        blobs_store_of<value_layout_t::variable_width_k>>;
+    template <typename... stores_>
+    using database_of =
+        basic_database<stored_key_t, volume_t, atomic_reference, waiter_t, layout_store_tags<stores_...>, stores_...>;
+    using database_t =
+        database_of<blobs_store_of<value_layout_t::inline_1_byte_k>, blobs_store_of<value_layout_t::inline_4_bytes_k>,
+                    blobs_store_of<value_layout_t::inline_8_bytes_k>, blobs_store_of<value_layout_t::inline_16_bytes_k>,
+                    blobs_store_of<value_layout_t::inline_32_bytes_k>,
+                    blobs_store_of<value_layout_t::inline_64_bytes_k>, blobs_store_of<value_layout_t::fixed_width_k>,
+                    blobs_store_of<value_layout_t::variable_width_k>>;
     using transaction_t = typename database_t::transaction_t;
     using transaction_unique_ptr_t = typename database_t::transaction_unique_ptr_t;
 
@@ -395,8 +398,10 @@ template <typename database_type_>
     for (shape_t const shape : every_shape_k) {
         collection_id_t const collection_id = minted_collection_id();
         std::string_view const name = name_of(shape);
-        status_t const created = store.create_collection(collection_id, string_view_t {name}, ustore_modality_blobs_k,
-                                                         collection_config_of(shape));
+        collection_config_t const config = collection_config_of(shape);
+        value_layout_t const layout = resolve_value_layout(config.lsm_tree.lsm_level_0.sorted_run.value_size);
+        status_t const created = store.create_collection(collection_id, string_view_t {name},
+                                                         static_cast<std::uint16_t>(layout), config);
         failures += expect(created.succeeded());
         named.ids[static_cast<std::size_t>(shape)] = collection_id;
     }

@@ -572,9 +572,6 @@ struct adjacency_fold_t {
     /** Bytes of every change delta, one width for all, so a device merge can compose chains in place. */
     static constexpr std::size_t change_bytes_k = half_edge_delta_bytes_k;
 
-    /** Whether a collection of @p modality folds half-edges, which a graph alone does. */
-    static constexpr bool serves(ustore_modality_t modality) noexcept { return modality == ustore_modality_graph_k; }
-
     /**
      *  @brief The value @p base becomes once every delta of @p deltas applies, oldest first.
      *  @return The value in a block of @p allocator, @p base itself without changes, or no bytes when no half-edge is

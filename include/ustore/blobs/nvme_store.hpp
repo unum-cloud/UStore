@@ -468,12 +468,6 @@ class nvme_store {
         return mounted;
     }
 
-    /** Whether a collection of @p modality whose values follow @p layout is one this store keeps: a modality its fold
-     *  folds, in the value layout of its key slots. */
-    [[nodiscard]] static bool serves(ustore_modality_t modality, value_layout_t layout) noexcept {
-        return fold_t::serves(modality) && layout == value_layout_k;
-    }
-
     /** Returns every run to the volume and forgets every memory run, which destroys the data and which only a
      *  collection no reader reaches and no commit names may. */
     status_t destroy(io_channel_t& channel) noexcept { return runs_.destroy(channel); }

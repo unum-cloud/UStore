@@ -260,12 +260,6 @@ class nvme_store {
         return mounted;
     }
 
-    /** Whether a collection of @p modality with values of @p layout is one this store keeps: the strings modality,
-     *  every value of which is one 16-byte key. */
-    [[nodiscard]] static bool serves(ustore_modality_t modality, value_layout_t layout) noexcept {
-        return modality == ustore_modality_strings_k && layout == value_layout_t::uuid_k;
-    }
-
     /** Returns every run to the volume and forgets every memory run, which destroys the data and which only a store no
      *  reader reaches and no commit names may. */
     status_t destroy(io_channel_t& channel) noexcept { return runs_.destroy(channel); }

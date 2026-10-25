@@ -13,7 +13,7 @@
 #pragma once
 
 #include <cstddef> // `std::size_t`
-#include <cstdint> // `std::uint8_t`, `std::uint64_t`
+#include <cstdint> // `std::uint8_t`, `std::uint16_t`, `std::uint64_t`
 #include <cstdio>  // `std::remove`
 #include <cstring> // `std::memset`
 
@@ -69,6 +69,19 @@ using resources_shared_ptr_t = resources_shared_ptr<atomic_reference, waiter_t>;
 using commit_ledger_t = commit_ledger<atomic_reference, waiter_t>;
 using stamp_pin_t = stamp_pin<atomic_reference, waiter_t>;
 using countdown_t = countdown<atomic_reference, waiter_t>;
+
+/** Where among @p stores_ each tag's store sits, every store of a suite's database tagged by its value layout. */
+template <typename... stores_>
+struct layout_store_tags {
+
+    /** The index of the store whose values follow the layout @p store_tag spells, or the count of the stores. */
+    static constexpr std::size_t index_of(std::uint16_t store_tag) noexcept {
+        std::uint16_t const tags[] {static_cast<std::uint16_t>(stores_::key_slot_t::value_layout_k)...};
+        std::size_t index = 0;
+        while (index != sizeof...(stores_) && tags[index] != store_tag) ++index;
+        return index;
+    }
+};
 
 #pragma endregion Instantiation
 

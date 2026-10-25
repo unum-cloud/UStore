@@ -45,9 +45,9 @@
 #include <memory>      // `std::unique_ptr`
 #include <new>         // `std::nothrow`, placement `new`
 #include <span>        // `std::span`
-#include <type_traits> // `std::remove_reference_t`
-#include <utility>     // `std::exchange`, `std::forward`, `std::move`, `std::swap`
-#include <variant>     // `std::variant`, `std::visit`, `std::get_if`
+#include <type_traits> // `std::integral_constant`, `std::remove_reference_t`
+#include <utility>     // `std::exchange`, `std::forward`, `std::index_sequence_for`, `std::move`, `std::swap`
+#include <variant>     // `std::variant`, `std::variant_alternative_t`, `std::visit`, `std::get_if`
 
 #include <smashtable/basic_hash_table.hpp> // `st::hash_map`, `st::assume_reserved`
 #include <smashtable/basic_vector.hpp>     // `st::basic_vector`
@@ -1478,8 +1478,8 @@ struct collection_record_t {
     /** Bytes of @c name_storage the name occupies. */
     std::uint16_t name_bytes = 0;
 
-    /** The @c ustore_modality_t the collection holds, which with its value layout picks the store a mount opens. */
-    std::uint16_t modality = 0;
+    /** The tag of the store a mount opens the collection in, which its creator picked and the database never reads. */
+    std::uint16_t store_tag = 0;
 
     /** The name a caller reaches the collection by, held inline and never terminated. */
     std::array<char, collection_name_max_bytes_k> name_storage {};
@@ -1576,18 +1576,17 @@ class maintenance_claim {
  */
 template <typename store_type_>
 concept nvme_store_concept = requires(
-    store_type_& store, store_type_ const& viewed, ustore_modality_t modality, value_layout_t layout,
-    typename store_type_::volume_t& volume, collection_config_t const& config,
-    typename store_type_::constraint_t& constraint, typename store_type_::ledger_t& ledger, io_channel_t& channel,
-    lsm_tree_publication_hook_t const& published, std::span<int const> devices,
-    std::span<lsm_tree_run_record_t const> runs, st::basic_vector<lsm_tree_run_record_t>& listed,
-    typename store_type_::stored_key_t stored_key, std::span<typename store_type_::stored_key_t const> stored_keys,
+    store_type_& store, store_type_ const& viewed, typename store_type_::volume_t& volume,
+    collection_config_t const& config, typename store_type_::constraint_t& constraint,
+    typename store_type_::ledger_t& ledger, io_channel_t& channel, lsm_tree_publication_hook_t const& published,
+    std::span<int const> devices, std::span<lsm_tree_run_record_t const> runs,
+    st::basic_vector<lsm_tree_run_record_t>& listed, typename store_type_::stored_key_t stored_key,
+    std::span<typename store_type_::stored_key_t const> stored_keys,
     std::span<keyed_delta<typename store_type_::stored_key_t>> deltas, std::span<byte_t const> stored_values,
     std::span<stored_value_size_t const> sizes, std::span<byte_t> into, stored_value_size_t& size,
     typename store_type_::sealed_commit_t& sealed, transaction_stamp_t stamp, std::size_t thread_index) {
     typename store_type_::key_slot_t;
     typename store_type_::fold_t;
-    { store_type_::serves(modality, layout) } noexcept -> std::same_as<bool>;
     { store_type_::mount(volume, config, constraint, ledger) } noexcept -> std::same_as<expected<store_type_>>;
     { store.restore(channel, runs) } noexcept -> std::same_as<status_t>;
     { store.truncate_above(channel, channel, stamp, published) } noexcept -> std::same_as<status_t>;
@@ -1622,15 +1621,16 @@ concept nvme_store_concept = requires(
  *  @brief Named collections of one database, the schema that resolves them and the transactions they share.
  *  @tparam stored_key_ The key every collection of this database is addressed by.
  *  @tparam volume_type_ The volume every run of every collection lives on.
- *  @tparam stores_ The stores a collection may live in, of which a create and a mount take the first that serves its
- *      modality and value layout.
+ *  @tparam store_tags_ Where among @p stores_ the store a tag names sits, through a static @c index_of answering
+ *      the count of @p stores_ for a tag naming none.
+ *  @tparam stores_ The stores a collection may live in, of which a create and a mount take the one its tag names.
  *
  *  The router and the channels are borrowed and must outlive the database, and so must the budget the
  *  collections charge their memory to. A database is pinned rather than movable, because its registry
  *  and every live transaction name it.
  */
 template <typename stored_key_, typename volume_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_, nvme_store_concept... stores_>
+          typename waiter_type_, typename store_tags_, nvme_store_concept... stores_>
 class basic_database {
   public:
 
@@ -1672,7 +1672,7 @@ class basic_database {
     /** One stamp a snapshot, a transaction or a scan holds against the ledger. */
     using pin_t = stamp_pin<atomic_reference_, waiter_type_>;
 
-    /** One collection, held by the store its modality and value layout picked when it was created. */
+    /** One collection, held by the store its tag names. */
     using any_collection_t = std::variant<stores_...>;
 
     /** One entry of the schema: what a collection is called, how it is shaped, and the collection itself. */
@@ -1684,8 +1684,8 @@ class basic_database {
         /** The name a caller reaches this collection by. */
         string_t name;
 
-        /** What this collection holds, which with its value layout picked its store. */
-        ustore_modality_t modality {};
+        /** The tag of the store holding this collection, which its creator picked. */
+        std::uint16_t store_tag = 0;
 
         /** The bounds this collection was mounted with. */
         collection_config_t config {};
@@ -1806,12 +1806,12 @@ class basic_database {
         return {};
     }
 
-    /** What @p collection_id holds, which a copy of it is created with. */
-    status_t collection_modality(collection_id_t collection_id, ustore_modality_t& modality) noexcept {
+    /** The store tag @p collection_id was created with, which a copy of it is created with. */
+    status_t collection_store_tag(collection_id_t collection_id, std::uint16_t& store_tag) noexcept {
         reader_t const inside = ledger_.epochs().enter();
         collection_entry_t const* const found = entry_with_id_in_(collection_entries_(), collection_id);
         if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
-        modality = found->modality;
+        store_tag = found->store_tag;
         return {};
     }
 
@@ -1858,19 +1858,21 @@ class basic_database {
      *  @brief Catalogs a new collection @p name under @p collection_id, shaped by @p config.
      *  @param[in] collection_id The UUID the caller minted, which addresses the collection for as long as it lives.
      *  @param[in] name The name callers reach the collection by, which no other collection may hold.
-     *  @param[in] modality What the collection holds, which with its value layout picks its store.
+     *  @param[in] store_tag The tag of the store the collection lives in, which @c store_tags_ places.
      *  @param[in] config The memory-run bounds, the cache bound and the shape of the tree below.
      *
-     *  @note The value layout follows from @c config's value size, so a width of eight bytes is stored
-     *      inside the key slots and a width of none is a collection of values that differ.
+     *  @note @p store_tag names a store whose value layout fits @c config's value size, so a width of eight bytes is
+     *      stored inside the key slots and a width of none is a collection of values that differ.
      */
-    status_t create_collection(collection_id_t collection_id, string_view_t name, ustore_modality_t modality,
+    status_t create_collection(collection_id_t collection_id, string_view_t name, std::uint16_t store_tag,
                                collection_config_t const& config) noexcept {
         if (name.empty()) return status_t {status_code_t::invalid_argument_k, "A collection is named by a byte"};
         if (name.size() > collection_name_max_bytes_k)
             return status_t {status_code_t::invalid_argument_k, "A collection name is shorter than that"};
         if (collection_id == collection_invalid_id_k)
             return status_t {status_code_t::invalid_argument_k, "That ID names no collection"};
+        if (store_tags_::index_of(store_tag) >= sizeof...(stores_))
+            return status_t {status_code_t::invalid_argument_k, "That tag names no store this database keeps"};
         expected<claimed_channel_t> claimed = claim_channel_();
         if (!claimed) return claimed.status();
         if (entry_named_in_(collection_entries_(), name) != nullptr ||
@@ -1885,7 +1887,7 @@ class basic_database {
         entry->id = collection_id;
         if (sz::failed(entry->name.assign(name)))
             return status_t {status_code_t::out_of_memory_k, "No room for a collection's name"};
-        entry->modality = modality;
+        entry->store_tag = store_tag;
         entry->config = config;
         entry->volume = placed;
         if (status_t const mounted = mount_collection_(*entry); mounted.failed()) return mounted;
@@ -2803,25 +2805,21 @@ class basic_database {
         return collections_.size();
     }
 
-    /** Mounts @p entry's collection on its volume in the first of @c stores_ that serves its modality in its value
-     *  layout, which is one 16-byte key for strings and picked by the value size otherwise, refusing a collection no
-     *  store serves. */
+    /** Mounts @p entry's collection on its volume in the one of @c stores_ its tag names, which the caller checked. */
     status_t mount_collection_(collection_entry_t& entry) noexcept {
-        value_layout_t const layout = entry.modality == ustore_modality_strings_k
-                                          ? value_layout_t::uuid_k
-                                          : resolve_value_layout(
-                                                entry.config.lsm_tree.lsm_level_0.sorted_run.value_size);
-        status_t mounted {status_code_t::unsupported_k, "No store serves a collection of that modality and layout"};
-        bool picked = false;
-        auto rung = [&]<typename store_type_>(std::type_identity<store_type_>) noexcept {
-            if (picked || !store_type_::serves(entry.modality, layout)) return;
-            picked = true;
-            auto [store, mount_status] = store_type_::mount(router_->volume(entry.volume), entry.config,
-                                                            resources_->memory_constraint, ledger_);
+        status_t mounted;
+        std::size_t const picked = store_tags_::index_of(entry.store_tag);
+        auto rung = [&]<std::size_t index_>(std::integral_constant<std::size_t, index_>) noexcept {
+            if (picked != index_) return;
+            using store_t = std::variant_alternative_t<index_, any_collection_t>;
+            auto [store, mount_status] = store_t::mount(router_->volume(entry.volume), entry.config,
+                                                        resources_->memory_constraint, ledger_);
             mounted = mount_status;
-            if (mount_status.succeeded()) entry.held.template emplace<store_type_>(std::move(store));
+            if (mount_status.succeeded()) entry.held.template emplace<index_>(std::move(store));
         };
-        (rung(std::type_identity<stores_> {}), ...);
+        [&]<std::size_t... indices_>(std::index_sequence<indices_...>) noexcept {
+            (rung(std::integral_constant<std::size_t, indices_> {}), ...);
+        }(std::index_sequence_for<stores_...> {});
         return mounted;
     }
 
@@ -2912,7 +2910,7 @@ class basic_database {
             std::memcpy(record.name_storage.data(), entry.name.data(), entry.name.size());
             record.name_bytes = static_cast<std::uint16_t>(entry.name.size());
             record.volume = static_cast<std::uint16_t>(entry.volume);
-            record.modality = static_cast<std::uint16_t>(entry.modality);
+            record.store_tag = entry.store_tag;
             record.value_size = entry.config.lsm_tree.lsm_level_0.sorted_run.value_size;
             record.value_max_size = entry.config.lsm_tree.lsm_level_0.sorted_run.value_max_size;
             record.level_enlarge_factor = entry.config.lsm_tree.level_enlarge_factor;
@@ -3033,13 +3031,15 @@ class basic_database {
                     std::span<lsm_tree_run_record_t const> runs) noexcept {
         if (static_cast<std::size_t>(record.volume) >= router_->size())
             return {status_code_t::malformed_k, "The schema names a volume this mount did not open"};
+        if (store_tags_::index_of(record.store_tag) >= sizeof...(stores_))
+            return {status_code_t::malformed_k, "The schema names a store this database does not keep"};
 
         entry_pointer_t entry {new (std::nothrow) collection_entry_t {}};
         if (!entry) return {status_code_t::out_of_memory_k, "No room for another collection"};
         entry->id = record.id;
         if (sz::failed(entry->name.assign(record.name())))
             return {status_code_t::out_of_memory_k, "No room for a collection's name"};
-        entry->modality = static_cast<ustore_modality_t>(record.modality);
+        entry->store_tag = record.store_tag;
         entry->config = record.config();
         entry->volume = static_cast<volume_id_t>(record.volume);
         if (status_t const mounted = mount_collection_(*entry); mounted.failed()) return mounted;
