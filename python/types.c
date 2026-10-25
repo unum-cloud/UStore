@@ -21,7 +21,7 @@ static PyObject* ErrorType = NULL;
 static PyObject* ConflictErrorType = NULL;
 
 /** The class each failing status raises, indexed by status; success and deferred never raise. */
-static PyObject* status_error_types[ustore_status_read_only_k + 1];
+static PyObject* status_error_types[ustore_status_capacity_exhausted_k + 1];
 
 /** One failing status, the dotted name of the class it raises, the bases it derives, and its doc. */
 static struct {
@@ -37,16 +37,26 @@ static struct {
 } const status_errors[] = {
     {ustore_status_out_of_memory_k, "ustore.OutOfMemoryError", &ErrorType, &PyExc_MemoryError,
      "An allocation could not be satisfied."},
-    {ustore_status_invalid_argument_k, "ustore.InvalidArgumentError", &ErrorType, &PyExc_ValueError,
-     "An argument is null, contradicts another one, or carries a choice the call does not accept."},
-    {ustore_status_uninitialized_k, "ustore.UninitializedError", &ErrorType, NULL,
-     "The call needs a handle that is closed or was never opened, or reads a result a later call rewound."},
-    {ustore_status_unsupported_k, "ustore.UnsupportedError", &ErrorType, &PyExc_NotImplementedError,
-     "The engine or this build does not implement what the call asks for."},
+    {ustore_status_read_only_k, "ustore.ReadOnlyError", &ErrorType, NULL,
+     "The call would change a database opened read-only, as Database.view_rocksdb opens one."},
     {ustore_status_io_k, "ustore.InputOutputError", &ErrorType, &PyExc_OSError,
      "A file or directory could not be opened, read, written, or closed."},
+    {ustore_status_device_k, "ustore.DeviceError", &ErrorType, NULL,
+     "A device could not be selected or claimed, or the call's executor, database and arena live apart."},
     {ustore_status_malformed_k, "ustore.MalformedError", &ErrorType, &PyExc_ValueError,
      "Stored or supplied data could not be decoded, like a corrupted file or an invalid document."},
+    {ustore_status_internal_k, "ustore.InternalError", &ErrorType, NULL,
+     "The engine failed in a way no other status names, which points at a defect."},
+    {ustore_status_uninitialized_k, "ustore.UninitializedError", &ErrorType, NULL,
+     "The call needs a handle that is closed or was never opened, or reads a result a later call rewound."},
+    {ustore_status_contended_k, "ustore.ContendedError", &ErrorType, NULL,
+     "A full deferred table, or an arena or transaction serving another call, refused the call instead of waiting."},
+    {ustore_status_cancelled_k, "ustore.CancelledError", &ErrorType, NULL,
+     "A progress callback stopped the call, which unwound and published nothing."},
+    {ustore_status_unsupported_k, "ustore.UnsupportedError", &ErrorType, &PyExc_NotImplementedError,
+     "The engine or this build does not implement what the call asks for."},
+    {ustore_status_invalid_argument_k, "ustore.InvalidArgumentError", &ErrorType, &PyExc_ValueError,
+     "An argument is null, contradicts another one, or carries a choice the call does not accept."},
     {ustore_status_not_found_k, "ustore.NotFoundError", &ErrorType, &PyExc_KeyError,
      "A collection, a directory, or a document a modification needs does not exist."},
     {ustore_status_already_exists_k, "ustore.AlreadyExistsError", &ErrorType, &PyExc_ValueError,
@@ -59,16 +69,6 @@ static struct {
      "A concurrent writer inserted into a range this transaction scanned; retry the transaction."},
     {ustore_status_capacity_exhausted_k, "ustore.CapacityExhaustedError", &ErrorType, &PyExc_OverflowError,
      "A hard design ceiling was reached."},
-    {ustore_status_device_k, "ustore.DeviceError", &ErrorType, NULL,
-     "A device could not be selected or claimed, or the call's executor, database and arena live apart."},
-    {ustore_status_internal_k, "ustore.InternalError", &ErrorType, NULL,
-     "The engine failed in a way no other status names, which points at a defect."},
-    {ustore_status_contended_k, "ustore.ContendedError", &ErrorType, NULL,
-     "A full deferred table, or an arena or transaction serving another call, refused the call instead of waiting."},
-    {ustore_status_cancelled_k, "ustore.CancelledError", &ErrorType, NULL,
-     "A progress callback stopped the call, which unwound and published nothing."},
-    {ustore_status_read_only_k, "ustore.ReadOnlyError", &ErrorType, NULL,
-     "The call would change a database opened read-only, as Database.view_rocksdb opens one."},
 };
 
 int ustore_py_raise(ustore_status_t status, char const* format, ...) {

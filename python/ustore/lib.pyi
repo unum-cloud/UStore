@@ -55,22 +55,22 @@ class Status(IntEnum):
     SUCCESS = 0
     DEFERRED = 1
     OUT_OF_MEMORY = 2
-    INVALID_ARGUMENT = 3
-    UNINITIALIZED = 4
-    UNSUPPORTED = 5
-    IO = 6
-    MALFORMED = 7
-    NOT_FOUND = 8
-    ALREADY_EXISTS = 9
-    WRITE_CONFLICT = 10
-    READ_CONFLICT = 11
-    PHANTOM_CONFLICT = 12
-    CAPACITY_EXHAUSTED = 13
-    DEVICE = 14
-    INTERNAL = 15
-    CONTENDED = 16
-    CANCELLED = 17
-    READ_ONLY = 18
+    READ_ONLY = 6
+    IO = 7
+    DEVICE = 8
+    MALFORMED = 9
+    INTERNAL = 10
+    UNINITIALIZED = 12
+    CONTENDED = 14
+    CANCELLED = 15
+    UNSUPPORTED = 16
+    INVALID_ARGUMENT = 17
+    NOT_FOUND = 18
+    ALREADY_EXISTS = 19
+    WRITE_CONFLICT = 20
+    READ_CONFLICT = 21
+    PHANTOM_CONFLICT = 22
+    CAPACITY_EXHAUSTED = 23
 
 class Mood(IntEnum):
     """What an executor's threads do once it next goes idle, valued as `ustore_mood_t`."""

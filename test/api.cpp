@@ -2737,15 +2737,19 @@ case_result_t database_find_at_snapshot(config_t const& config) {
 /** Every status spelling reads back as its status, while a value or a name no status carries maps onto none. */
 std::size_t status_names(config_t const&) {
     std::size_t failures = 0;
-    auto const spelled = [](std::string_view name) noexcept {
-        return ustore_bytes_view_t {reinterpret_cast<std::uint8_t const*>(name.data()), name.size()};
-    };
-    for (int status = ustore_status_success_k; status <= ustore_status_read_only_k; ++status)
-        failures += expect(ustore_status_from_name(spelled(ustore_status_name(static_cast<ustore_status_t>(status)))) ==
-                           status);
+    std::size_t spelled = 0;
+    // Values no status carries reach the library as a C caller passes them, never loaded as the enum here
+    for (int value = 0; value != 64; ++value) {
+        std::string_view const name = ustore_status_name(static_cast<ustore_status_t>(value));
+        if (name == "unrecognized") continue;
+        ++spelled;
+        failures += expect(ustore_status_from_name(bytes_of(name)) == value);
+    }
+    failures += expect_eq(spelled, std::size_t {19});
     failures += expect(std::string_view {ustore_status_name(ustore_status_deferred_k)} == "deferred");
-    failures += expect(std::string_view {ustore_status_name(static_cast<ustore_status_t>(42))} == "unrecognized");
-    failures += expect(ustore_status_from_name(spelled("unrecognized")) == ustore_status_invalid_argument_k);
+    failures += expect(std::string_view {ustore_status_name(ustore_status_read_only_k)} == "read-only");
+    failures += expect(ustore_status_from_name(bytes_of(std::string_view {"unrecognized"})) ==
+                       ustore_status_invalid_argument_k);
     return failures;
 }
 

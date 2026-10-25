@@ -250,7 +250,8 @@ typedef struct ustore_strings_view_t {
 
 } ustore_strings_view_t;
 
-/** What went wrong, in one vocabulary shared by every engine and binding. */
+/** What went wrong, in one vocabulary shared by every engine and binding. Shared statuses carry USearch's numbers,
+ *  leaving 3, 4, 5, 11 and 13 unused, and UStore's own follow from 18. */
 typedef enum ustore_status_t {
 
     /** The call succeeded; @c message carries nothing. */
@@ -262,57 +263,57 @@ typedef enum ustore_status_t {
     /** An allocation could not be satisfied. */
     ustore_status_out_of_memory_k = 2,
 
-    /** An argument is null, contradicts another one, or carries a choice the call does not accept, like a collection
-     *  of another modality, a name reserved for a system collection, or a batch of strings in an unknown layout. */
-    ustore_status_invalid_argument_k = 3,
-
-    /** The call needs a database or transaction that was never opened. */
-    ustore_status_uninitialized_k = 4,
-
-    /** The engine or build does not implement what the call asks for, like io_uring on a kernel without it. */
-    ustore_status_unsupported_k = 5,
+    /** The call would change a database opened read-only, as @c ustore_database_view_rocksdb opens one. */
+    ustore_status_read_only_k = 6,
 
     /** A file or directory could not be opened, read, written, or closed. */
-    ustore_status_io_k = 6,
-
-    /** Stored or supplied data could not be decoded, like a corrupted file or an invalid document. */
-    ustore_status_malformed_k = 7,
-
-    /** A collection, a directory, or a document a modification needs does not exist, while a read marks a missing
-     *  key with an unset presence bit instead. */
-    ustore_status_not_found_k = 8,
-
-    /** A collection name or a document the call creates is already taken. */
-    ustore_status_already_exists_k = 9,
-
-    /** A concurrent writer changed a key this transaction wrote; retry the transaction. */
-    ustore_status_write_conflict_k = 10,
-
-    /** A concurrent writer changed a key this transaction read; retry the transaction. */
-    ustore_status_read_conflict_k = 11,
-
-    /** A concurrent writer inserted into a range this transaction scanned; retry the transaction. */
-    ustore_status_phantom_conflict_k = 12,
-
-    /** A hard design ceiling was reached. */
-    ustore_status_capacity_exhausted_k = 13,
+    ustore_status_io_k = 7,
 
     /** A device could not be selected, or its memory could not be claimed, or the call's executor, database and
      *  arena belong to different residencies or devices. */
-    ustore_status_device_k = 14,
+    ustore_status_device_k = 8,
+
+    /** Stored or supplied data could not be decoded, like a corrupted file or an invalid document. */
+    ustore_status_malformed_k = 9,
 
     /** The engine failed in a way no other status names, which points at a defect. */
-    ustore_status_internal_k = 15,
+    ustore_status_internal_k = 10,
+
+    /** The call needs a database or transaction that was never opened. */
+    ustore_status_uninitialized_k = 12,
 
     /** The call was refused rather than waited for: its executor's deferred table is full, its arena or its
      *  transaction serves another call, or it drains or blocks from a callback its own executor runs. */
-    ustore_status_contended_k = 16,
+    ustore_status_contended_k = 14,
 
     /** A progress callback stopped the call, which unwound and published nothing. */
-    ustore_status_cancelled_k = 17,
+    ustore_status_cancelled_k = 15,
 
-    /** The call would change a database opened read-only, as @c ustore_database_view_rocksdb opens one. */
-    ustore_status_read_only_k = 18,
+    /** The engine or build does not implement what the call asks for, like io_uring on a kernel without it. */
+    ustore_status_unsupported_k = 16,
+
+    /** An argument is null, contradicts another one, or carries a choice the call does not accept, like a collection
+     *  of another modality, a name reserved for a system collection, or a batch of strings in an unknown layout. */
+    ustore_status_invalid_argument_k = 17,
+
+    /** A collection, a directory, or a document a modification needs does not exist, while a read marks a missing
+     *  key with an unset presence bit instead. */
+    ustore_status_not_found_k = 18,
+
+    /** A collection name or a document the call creates is already taken. */
+    ustore_status_already_exists_k = 19,
+
+    /** A concurrent writer changed a key this transaction wrote; retry the transaction. */
+    ustore_status_write_conflict_k = 20,
+
+    /** A concurrent writer changed a key this transaction read; retry the transaction. */
+    ustore_status_read_conflict_k = 21,
+
+    /** A concurrent writer inserted into a range this transaction scanned; retry the transaction. */
+    ustore_status_phantom_conflict_k = 22,
+
+    /** A hard design ceiling was reached. */
+    ustore_status_capacity_exhausted_k = 23,
 
 } ustore_status_t;
 

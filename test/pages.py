@@ -34,7 +34,6 @@ if LIBRARY_PATH is None or not LIBRARY_PATH.exists():
     pytest.skip("no shared library to call the pages ABI through", allow_module_level=True)
 LIBRARY = ctypes.CDLL(str(LIBRARY_PATH))
 
-SUCCESS, INVALID_ARGUMENT, UNSUPPORTED, MALFORMED, NOT_FOUND = 0, 3, 5, 7, 8
 HTML, XML, MARKDOWN, TEXT, JSON = 0, 1, 2, 3, 4
 IMPORT, INSERT, REMOVE, MOVE, SPLICE, SET_ATTRIBUTES, REMOVE_ATTRIBUTES = range(7)
 U32_TAPE, U64_TAPE = 0, 1
@@ -48,6 +47,13 @@ class Outcome(Structure):
 
 class BytesView(Structure):
     _fields_ = [("data", c_void_p), ("length", c_uint64)]
+
+
+LIBRARY.ustore_status_from_name.argtypes = [BytesView]
+SUCCESS, INVALID_ARGUMENT, UNSUPPORTED, MALFORMED, NOT_FOUND = (
+    LIBRARY.ustore_status_from_name(BytesView(ctypes.cast(name, c_void_p), len(name)))
+    for name in (b"success", b"invalid-argument", b"unsupported", b"malformed", b"not-found")
+)
 
 
 class StridedView(Structure):

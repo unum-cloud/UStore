@@ -235,22 +235,22 @@ finally:
 `SUCCESS` and `DEFERRED` raise nothing, and every other member has its own class, which also derives the built-in naming the same fault where one exists:
 
 - `OUT_OF_MEMORY` → `OutOfMemoryError`, a `MemoryError`
-- `INVALID_ARGUMENT` → `InvalidArgumentError`, a `ValueError`
-- `UNINITIALIZED` → `UninitializedError`
-- `UNSUPPORTED` → `UnsupportedError`, a `NotImplementedError`
+- `READ_ONLY` → `ReadOnlyError`
 - `IO` → `InputOutputError`, an `OSError`
+- `DEVICE` → `DeviceError`
 - `MALFORMED` → `MalformedError`, a `ValueError`
+- `INTERNAL` → `InternalError`
+- `UNINITIALIZED` → `UninitializedError`
+- `CONTENDED` → `ContendedError`
+- `CANCELLED` → `CancelledError`
+- `UNSUPPORTED` → `UnsupportedError`, a `NotImplementedError`
+- `INVALID_ARGUMENT` → `InvalidArgumentError`, a `ValueError`
 - `NOT_FOUND` → `NotFoundError`, a `KeyError`
 - `ALREADY_EXISTS` → `AlreadyExistsError`, a `ValueError`
 - `WRITE_CONFLICT` → `WriteConflictError`, a `ConflictError`
 - `READ_CONFLICT` → `ReadConflictError`, a `ConflictError`
 - `PHANTOM_CONFLICT` → `PhantomConflictError`, a `ConflictError`
 - `CAPACITY_EXHAUSTED` → `CapacityExhaustedError`, an `OverflowError`
-- `DEVICE` → `DeviceError`
-- `INTERNAL` → `InternalError`
-- `CONTENDED` → `ContendedError`
-- `CANCELLED` → `CancelledError`
-- `READ_ONLY` → `ReadOnlyError`
 
 So `except KeyError` catches a missing collection, and `except ConflictError` is the one clause a retry loop needs for the three conflicts.
 A database `view_rocksdb` opened raises `ReadOnlyError` from every call that would change it: writes, removes, transactions, collection creates and drops, clears and compactions.

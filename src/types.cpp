@@ -12,11 +12,10 @@
 #include <algorithm>   // `std::find`, `std::max`, `std::reverse`
 #include <array>       // `std::array`
 #include <atomic>      // `std::atomic_ref`, `std::memory_order_release`
-#include <bit>         // `std::bit_ceil`, `std::bit_cast`
+#include <bit>         // `std::bit_ceil`
 #include <new>         // `std::nothrow`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
-#include <type_traits> // `std::underlying_type_t`
 #include <utility>     // `std::move`
 #include <variant>     // `std::variant`, `std::get_if`
 
@@ -38,27 +37,27 @@ namespace unum::ustore {
 constexpr std::size_t vram_scratch_limit_default_k = std::size_t {256} << 20;
 #endif
 
-/** The canonical spelling of every status, indexed by its value. */
-constexpr std::array<std::string_view, ustore_status_read_only_k + 1> status_names_k {
-    "success",
-    "deferred",
-    "out-of-memory",
-    "invalid-argument",
-    "uninitialized",
-    "unsupported",
-    "io",
-    "malformed",
-    "not-found",
-    "already-exists",
-    "write-conflict",
-    "read-conflict",
-    "phantom-conflict",
-    "capacity-exhausted",
-    "device",
-    "internal",
-    "contended",
-    "cancelled",
-    "read-only",
+/** The canonical spelling of every status. */
+constexpr enumerator_spelling<ustore_status_t> status_names_k[] {
+    {ustore_status_success_k, "success"},
+    {ustore_status_deferred_k, "deferred"},
+    {ustore_status_out_of_memory_k, "out-of-memory"},
+    {ustore_status_read_only_k, "read-only"},
+    {ustore_status_io_k, "io"},
+    {ustore_status_device_k, "device"},
+    {ustore_status_malformed_k, "malformed"},
+    {ustore_status_internal_k, "internal"},
+    {ustore_status_uninitialized_k, "uninitialized"},
+    {ustore_status_contended_k, "contended"},
+    {ustore_status_cancelled_k, "cancelled"},
+    {ustore_status_unsupported_k, "unsupported"},
+    {ustore_status_invalid_argument_k, "invalid-argument"},
+    {ustore_status_not_found_k, "not-found"},
+    {ustore_status_already_exists_k, "already-exists"},
+    {ustore_status_write_conflict_k, "write-conflict"},
+    {ustore_status_read_conflict_k, "read-conflict"},
+    {ustore_status_phantom_conflict_k, "phantom-conflict"},
+    {ustore_status_capacity_exhausted_k, "capacity-exhausted"},
 };
 
 /** The canonical spelling of every mood. */
@@ -277,16 +276,12 @@ ustore_status_t ustore_outcome_status(ustore_outcome_t* outcome) {
     return std::atomic_ref<ustore_status_t> {outcome->status}.load(std::memory_order_acquire);
 }
 
-char const* ustore_status_name(ustore_status_t status) {
-    // A C caller may pass any integer, which C++ may not load as the enum, so its bits are read instead
-    std::size_t const index = std::bit_cast<std::underlying_type_t<ustore_status_t>>(status);
-    return index < status_names_k.size() ? status_names_k[index].data() : "unrecognized";
-}
+char const* ustore_status_name(ustore_status_t status) { return name_in(status_names_k, status); }
 
 ustore_status_t ustore_status_from_name(ustore_bytes_view_t name) {
     std::string_view const text {reinterpret_cast<char const*>(name.data), name.length};
-    for (std::size_t index = 0; index != status_names_k.size(); ++index)
-        if (status_names_k[index] == text) return static_cast<ustore_status_t>(index);
+    for (enumerator_spelling<ustore_status_t> const& spelling : status_names_k)
+        if (spelling.name == text) return spelling.value;
     return ustore_status_invalid_argument_k;
 }
 

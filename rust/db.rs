@@ -678,38 +678,38 @@ pub enum Status {
     Deferred = 1,
     /// An allocation could not be satisfied.
     OutOfMemory = 2,
-    /// An argument is null, contradicts another one, or carries unaccepted options.
-    InvalidArgument = 3,
-    /// The call needs a database or transaction that was never opened.
-    Uninitialized = 4,
-    /// The engine or build does not implement what the call asks for.
-    Unsupported = 5,
-    /// A file or directory could not be opened, read, written, or closed.
-    Io = 6,
-    /// Stored or supplied data could not be decoded.
-    Malformed = 7,
-    /// A snapshot, collection, or document the call addresses does not exist.
-    NotFound = 8,
-    /// A snapshot, collection, or document the call creates already exists.
-    AlreadyExists = 9,
-    /// A concurrent writer changed a key this transaction wrote.
-    WriteConflict = 10,
-    /// A concurrent writer changed a key this transaction read.
-    ReadConflict = 11,
-    /// A concurrent writer inserted into a range this transaction scanned.
-    PhantomConflict = 12,
-    /// A hard design ceiling was reached.
-    CapacityExhausted = 13,
-    /// A device could not be selected, or its memory could not be claimed.
-    Device = 14,
-    /// The engine failed in a way no other status names.
-    Internal = 15,
-    /// The call was refused rather than waited for.
-    Contended = 16,
-    /// A progress callback stopped the call, which published nothing.
-    Cancelled = 17,
     /// The call would change a database opened read-only, as [`Database::view_rocksdb`] opens one.
-    ReadOnly = 18,
+    ReadOnly = 6,
+    /// A file or directory could not be opened, read, written, or closed.
+    Io = 7,
+    /// A device could not be selected, or its memory could not be claimed.
+    Device = 8,
+    /// Stored or supplied data could not be decoded.
+    Malformed = 9,
+    /// The engine failed in a way no other status names.
+    Internal = 10,
+    /// The call needs a database or transaction that was never opened.
+    Uninitialized = 12,
+    /// The call was refused rather than waited for.
+    Contended = 14,
+    /// A progress callback stopped the call, which published nothing.
+    Cancelled = 15,
+    /// The engine or build does not implement what the call asks for.
+    Unsupported = 16,
+    /// An argument is null, contradicts another one, or carries unaccepted options.
+    InvalidArgument = 17,
+    /// A snapshot, collection, or document the call addresses does not exist.
+    NotFound = 18,
+    /// A snapshot, collection, or document the call creates already exists.
+    AlreadyExists = 19,
+    /// A concurrent writer changed a key this transaction wrote.
+    WriteConflict = 20,
+    /// A concurrent writer changed a key this transaction read.
+    ReadConflict = 21,
+    /// A concurrent writer inserted into a range this transaction scanned.
+    PhantomConflict = 22,
+    /// A hard design ceiling was reached.
+    CapacityExhausted = 23,
 }
 
 impl Status {
@@ -719,21 +719,21 @@ impl Status {
             0 => return Ok(()),
             1 => Status::Deferred,
             2 => Status::OutOfMemory,
-            3 => Status::InvalidArgument,
-            4 => Status::Uninitialized,
-            5 => Status::Unsupported,
-            6 => Status::Io,
-            7 => Status::Malformed,
-            8 => Status::NotFound,
-            9 => Status::AlreadyExists,
-            10 => Status::WriteConflict,
-            11 => Status::ReadConflict,
-            12 => Status::PhantomConflict,
-            13 => Status::CapacityExhausted,
-            14 => Status::Device,
-            16 => Status::Contended,
-            17 => Status::Cancelled,
-            18 => Status::ReadOnly,
+            6 => Status::ReadOnly,
+            7 => Status::Io,
+            8 => Status::Device,
+            9 => Status::Malformed,
+            12 => Status::Uninitialized,
+            14 => Status::Contended,
+            15 => Status::Cancelled,
+            16 => Status::Unsupported,
+            17 => Status::InvalidArgument,
+            18 => Status::NotFound,
+            19 => Status::AlreadyExists,
+            20 => Status::WriteConflict,
+            21 => Status::ReadConflict,
+            22 => Status::PhantomConflict,
+            23 => Status::CapacityExhausted,
             _ => Status::Internal,
         };
         Err(status)
@@ -4283,7 +4283,7 @@ mod tests {
     #[test]
     fn statuses_map_spell_and_tolerate_newer_libraries() {
         let written = ffi::ustore_outcome_t {
-            status: ffi::ustore_status_t(8),
+            status: ffi::ustore_status_t(Status::NotFound as ffi::ustore_enum_t),
             message: c"No such collection".as_ptr(),
         };
         let failure = check(written).unwrap_err();
@@ -4293,7 +4293,7 @@ mod tests {
         assert_eq!(failure.status.to_string(), "not-found");
 
         let contended = ffi::ustore_outcome_t {
-            status: ffi::ustore_status_t(16),
+            status: ffi::ustore_status_t(Status::Contended as ffi::ustore_enum_t),
             message: c"The arena serves another call".as_ptr(),
         };
         assert_eq!(check(contended).unwrap_err().status, Status::Contended);

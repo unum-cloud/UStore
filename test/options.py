@@ -140,7 +140,8 @@ def test_modes_refuse_bools_and_text(database, blobs, call):
 
 def test_members_are_named_by_the_library():
     """Every member is named after the C spelling of its enumerator, upper-cased with dashes as underscores."""
-    assert (ustore.Status.READ_ONLY, ustore.Isolation.STRICT_SERIALIZABLE, ustore.Transport.LINUX_URING) == (18, 0, 2)
+    assert max(ustore.Status) is ustore.Status.CAPACITY_EXHAUSTED
+    assert (ustore.Isolation.STRICT_SERIALIZABLE, ustore.Transport.LINUX_URING) == (0, 2)
     assert [engine.name for engine in ustore.Engine] == ["RAM", "ROCKSDB", "LEVELDB", "NVME"]
     assert ustore.version().count(".") == 2
 
