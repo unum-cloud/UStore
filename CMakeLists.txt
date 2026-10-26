@@ -287,12 +287,13 @@ if (USTORE_BUILD_CUDA AND CMAKE_CUDA_COMPILER)
     target_compile_definitions(ustore_nvme_compaction PUBLIC USTORE_WITH_CUDA=1)
 endif ()
 
-# The NVMe engine compiles one variant per CPU class, in `src/nvme/variants_<class>.cpp`, and its open picks the newest
-# one the running CPU admits. A class is its parent plus the ForkUnion capabilities its waiter and atomic reference add,
-# restated here row for row from `parent_class_of`, `waiter_for_cpu_class` and `atomic_ref_for_cpu_class` of
-# `src/lib.hpp`. It exists only when its parent does and the toolchain compiles one of those capabilities, which every
-# UStore unit reads as `USTORE_TARGET_<CLASS>`, collected in `ustore_cpu_gates_`. ForkUnion spells each instruction in
-# the assembly itself, so a class needs no flags of its own, and the `serial` class is the floor every CPU runs.
+# The RAM and NVMe engines compile one variant per CPU class, in `src/<engine>/variants_<class>.cpp`, and their opens
+# pick the newest one the running CPU admits. A class is its parent plus the ForkUnion capabilities its waiter and
+# atomic reference add, restated here row for row from `parent_class_of`, `waiter_for_cpu_class` and
+# `atomic_ref_for_cpu_class` of `src/lib.hpp`. It exists only when its parent does and the toolchain compiles one of
+# those capabilities, which every UStore unit reads as `USTORE_TARGET_<CLASS>`, collected in `ustore_cpu_gates_`.
+# ForkUnion spells each instruction in the assembly itself, so a class needs no flags of its own, and the `serial` class
+# is the floor every CPU runs.
 set(ustore_class_serial_exists_ TRUE)
 set(ustore_cpu_classes_ serial)
 set(ustore_cpu_gates_)
@@ -358,6 +359,16 @@ set(ustore_dependencies_ ${ustore_sibling_archives_} yyjson fmt)
 set(ustore_engine_archives_)
 set(ustore_engine_definitions_)
 set(ustore_compiled_objects_)
+
+foreach (class_ IN LISTS ustore_cpu_classes_)
+    list(APPEND ustore_ram_variants_ src/ram/variants_${class_}.cpp)
+endforeach ()
+# Both libraries link one copy of every CPU class's engine, compiled position-independent once
+add_library(ustore_ram_variants OBJECT ${ustore_lib_c_exclusion_} ${ustore_ram_variants_})
+set_target_properties(ustore_ram_variants PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(ustore_ram_variants PRIVATE Threads::Threads smashtable::header ${ustore_dependencies_})
+list(APPEND ustore_sources_ $<TARGET_OBJECTS:ustore_ram_variants>)
+list(APPEND ustore_compiled_objects_ ustore_ram_variants)
 
 # The NVMe engine mounts its volumes on files, so it builds everywhere the siblings do; the io_uring transport beside it
 # compiles on every platform and only opens a ring on Linux.

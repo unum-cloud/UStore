@@ -152,13 +152,10 @@ using claim_t = order_t::snapshot_claim_t;
 template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_>
 struct collection_store;
 
-/** What the collections system collection records of a collection: what it holds, its name, and the store its
- *  entries live in. */
+/** What the collections system collection records of a collection: its name, and the store its entries live in,
+ *  whose kind says what it holds. */
 template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_>
 struct collection_entry {
-
-    /** What the collection holds, which picked the kind of its store. */
-    ustore_modality_t modality {};
 
     /** The name of the collection, empty for one created without. */
     blob_t name;
@@ -177,7 +174,7 @@ template <isolation_t isolation_, template <typename> typename atomic_reference_
 using collections_by_id_store = ordered_store<collections_pair<isolation_, atomic_reference_, waiter_type_>,
                                               uuid_order_t, uuid_hash_t, isolation_, atomic_reference_, waiter_type_>;
 
-/** The store of one collection, of the kind its modality picks, which a drop retires rather than frees. */
+/** The store of one collection, of the kind its creator picked, which a drop retires rather than frees. */
 template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_>
 struct collection_store {
 
@@ -197,6 +194,13 @@ struct collection_store {
 
     template <typename kind_type_>
     collection_store(std::in_place_type_t<kind_type_> kind, order_t& order) noexcept : entries(kind, order) {}
+
+    /** Allocates the store of a collection keeping its entries in a @p kind_ store, or answers null. */
+    template <template <isolation_t, template <typename> typename, typename> typename kind_>
+    static collection_store* allocate(order_t& order) noexcept {
+        return new (std::nothrow)
+            collection_store(std::in_place_type<kind_<isolation_, atomic_reference_, waiter_type_>>, order);
+    }
 };
 
 /** A transaction over both system collections and every collection store it reaches, published under one stamp. */
@@ -267,27 +271,6 @@ inline st::expected<string_key_t> string_key_from(std::string_view text) noexcep
     auto [copied, copy_blob_status] = copy_blob(value_view_t {text});
     if (st::failed(copy_blob_status)) return copy_blob_status;
     return string_key_t {std::move(copied)};
-}
-
-/** Allocates the store a collection holding @p modality keeps its entries in, or answers null. */
-template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_>
-collection_store<isolation_, atomic_reference_, waiter_type_>* allocate_store(order_t& order,
-                                                                              ustore_modality_t modality) noexcept {
-    using store_t = collection_store<isolation_, atomic_reference_, waiter_type_>;
-    if (modality == ustore_modality_strings_k)
-        return new (std::nothrow)
-            store_t(std::in_place_type<keys_by_string_store<isolation_, atomic_reference_, waiter_type_>>, order);
-    if (modality == ustore_modality_graph_k)
-        return new (std::nothrow)
-            store_t(std::in_place_type<half_edges_store<isolation_, atomic_reference_, waiter_type_>>, order);
-    if (modality == ustore_modality_docs_k)
-        return new (std::nothrow)
-            store_t(std::in_place_type<documents_by_key_store<isolation_, atomic_reference_, waiter_type_>>, order);
-    if (modality == ustore_modality_pages_k)
-        return new (std::nothrow)
-            store_t(std::in_place_type<pages_by_key_store<isolation_, atomic_reference_, waiter_type_>>, order);
-    return new (std::nothrow)
-        store_t(std::in_place_type<values_by_key_store<isolation_, atomic_reference_, waiter_type_>>, order);
 }
 
 } // namespace unum::ustore::blobs

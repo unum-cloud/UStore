@@ -63,22 +63,22 @@ struct documents_in_store {
 };
 
 /** Implements @c ustore_docs_write, modifying the documents in place inside one transaction. */
-template <isolation_t isolation_>
-status_t serve(database_state<isolation_>& state, ustore_docs_write_t const& arguments, strings_arg_t const& fields,
-               strings_arg_t const& values, view_t const& view) noexcept {
+template <cpu_class_t cpu_class_, isolation_t isolation_>
+status_t serve(database_state<cpu_class_, isolation_>& state, ustore_docs_write_t const& arguments,
+               strings_arg_t const& fields, strings_arg_t const& values, view_t const& view) noexcept {
     if (!arguments.count) return {};
-    return serve_read_modify_write(state, arguments.durability, view,
-                                   [&](transaction_source<isolation_>& source, store_status_t& failure) noexcept {
-                                       documents_in_store<transaction_source<isolation_>> const documents {source,
-                                                                                                           failure};
-                                       return write_documents(documents, arguments, fields, values, view);
-                                   });
+    return serve_read_modify_write(
+        state, arguments.durability, view,
+        [&](transaction_source<cpu_class_, isolation_>& source, store_status_t& failure) noexcept {
+            documents_in_store<transaction_source<cpu_class_, isolation_>> const documents {source, failure};
+            return write_documents(documents, arguments, fields, values, view);
+        });
 }
 
 /** Implements @c ustore_docs_read, copying whole JSON documents as stored and exporting the fields of any other. */
-template <isolation_t isolation_>
-status_t serve(database_state<isolation_>& state, ustore_docs_read_t const& arguments, strings_arg_t const& fields,
-               view_t const& view) noexcept {
+template <cpu_class_t cpu_class_, isolation_t isolation_>
+status_t serve(database_state<cpu_class_, isolation_>& state, ustore_docs_read_t const& arguments,
+               strings_arg_t const& fields, view_t const& view) noexcept {
     if (!arguments.count) return {};
     if (reads_whole_documents(arguments, fields)) return read_values<document_pair_t>(state, arguments, view);
     return with_source(state, view, [&]<typename source_type_>(source_type_& source) noexcept -> status_t {
@@ -88,8 +88,9 @@ status_t serve(database_state<isolation_>& state, ustore_docs_read_t const& argu
 }
 
 /** Implements @c ustore_docs_gist. */
-template <isolation_t isolation_>
-status_t serve(database_state<isolation_>& state, ustore_docs_gist_t const& arguments, view_t const& view) noexcept {
+template <cpu_class_t cpu_class_, isolation_t isolation_>
+status_t serve(database_state<cpu_class_, isolation_>& state, ustore_docs_gist_t const& arguments,
+               view_t const& view) noexcept {
     return with_source(state, view, [&]<typename source_type_>(source_type_& source) noexcept -> status_t {
         store_status_t failure = store_status_t::success_k;
         return gist_documents(documents_in_store<source_type_> {source, failure}, arguments, view);
@@ -97,9 +98,9 @@ status_t serve(database_state<isolation_>& state, ustore_docs_gist_t const& argu
 }
 
 /** Implements @c ustore_docs_gather. */
-template <isolation_t isolation_>
-status_t serve(database_state<isolation_>& state, ustore_docs_gather_t const& arguments, strings_arg_t const& fields,
-               view_t const& view) noexcept {
+template <cpu_class_t cpu_class_, isolation_t isolation_>
+status_t serve(database_state<cpu_class_, isolation_>& state, ustore_docs_gather_t const& arguments,
+               strings_arg_t const& fields, view_t const& view) noexcept {
     return with_source(state, view, [&]<typename source_type_>(source_type_& source) noexcept -> status_t {
         store_status_t failure = store_status_t::success_k;
         return gather_documents(documents_in_store<source_type_> {source, failure}, arguments, fields, view);
@@ -107,23 +108,41 @@ status_t serve(database_state<isolation_>& state, ustore_docs_gather_t const& ar
 }
 
 /** Implements @c ustore_docs_remove, committing a batch outside a transaction atomically. */
-template <isolation_t isolation_>
-status_t serve(database_state<isolation_>& state, ustore_docs_remove_t const& arguments, view_t const& view) noexcept {
+template <cpu_class_t cpu_class_, isolation_t isolation_>
+status_t serve(database_state<cpu_class_, isolation_>& state, ustore_docs_remove_t const& arguments,
+               view_t const& view) noexcept {
     return remove_keys<document_pair_t>(state, arguments, view);
 }
 
 /** Implements @c ustore_docs_scan as ordered walks of each collection's keys. */
-template <isolation_t isolation_>
-status_t serve(database_state<isolation_>& state, ustore_docs_scan_t const& arguments, view_t const& view) noexcept {
+template <cpu_class_t cpu_class_, isolation_t isolation_>
+status_t serve(database_state<cpu_class_, isolation_>& state, ustore_docs_scan_t const& arguments,
+               view_t const& view) noexcept {
     return scan_keys<document_pair_t>(state, arguments, view);
 }
 
 /** Implements @c ustore_docs_sample as a reservoir filled from a walk of each collection's keys. */
-template <isolation_t isolation_>
-status_t serve(database_state<isolation_>& state, ustore_docs_sample_t const& arguments, view_t const& view) noexcept {
+template <cpu_class_t cpu_class_, isolation_t isolation_>
+status_t serve(database_state<cpu_class_, isolation_>& state, ustore_docs_sample_t const& arguments,
+               view_t const& view) noexcept {
     return sample_keys<document_pair_t>(state, arguments, view);
 }
 
 #pragma endregion Document Calls
+
+#pragma region Table
+
+template <cpu_class_t cpu_class_, isolation_t isolation_>
+docs_verbs_t const ram_variant<cpu_class_, isolation_>::docs_verbs_k {
+    .write = &serve_database<cpu_class_, isolation_, ustore_docs_write_t, strings_arg_t, strings_arg_t>,
+    .read = &serve_database<cpu_class_, isolation_, ustore_docs_read_t, strings_arg_t>,
+    .gist = &serve_database<cpu_class_, isolation_, ustore_docs_gist_t>,
+    .gather = &serve_database<cpu_class_, isolation_, ustore_docs_gather_t, strings_arg_t>,
+    .remove = &serve_database<cpu_class_, isolation_, ustore_docs_remove_t>,
+    .scan = &serve_database<cpu_class_, isolation_, ustore_docs_scan_t>,
+    .sample = &serve_database<cpu_class_, isolation_, ustore_docs_sample_t>,
+};
+
+#pragma endregion Table
 
 } // namespace unum::ustore::ram

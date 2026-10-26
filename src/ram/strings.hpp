@@ -43,9 +43,9 @@ store_status_t stage_string_runs(source_type_& source, strided_iterator<ustore_c
 }
 
 /** Implements @c ustore_strings_write, committing a batch outside a transaction atomically. */
-template <isolation_t isolation_>
-status_t serve(database_state<isolation_>& state, ustore_strings_write_t const& arguments, strings_arg_t const& texts,
-               view_t const& view) noexcept {
+template <cpu_class_t cpu_class_, isolation_t isolation_>
+status_t serve(database_state<cpu_class_, isolation_>& state, ustore_strings_write_t const& arguments,
+               strings_arg_t const& texts, view_t const& view) noexcept {
     if (!arguments.count) return {};
     strided_iterator<ustore_key_t const> const values = strided(arguments.values);
     if (!texts || !values) return {status_code_t::invalid_argument_k, "Need the strings and their values"};
@@ -60,9 +60,9 @@ status_t serve(database_state<isolation_>& state, ustore_strings_write_t const& 
 
 /** Implements @c ustore_strings_remove, committing a batch outside a transaction atomically, where a string already
  *  gone stays gone. */
-template <isolation_t isolation_>
-status_t serve(database_state<isolation_>& state, ustore_strings_remove_t const& arguments, strings_arg_t const& texts,
-               view_t const& view) noexcept {
+template <cpu_class_t cpu_class_, isolation_t isolation_>
+status_t serve(database_state<cpu_class_, isolation_>& state, ustore_strings_remove_t const& arguments,
+               strings_arg_t const& texts, view_t const& view) noexcept {
     if (!arguments.count) return {};
     if (!texts) return {status_code_t::invalid_argument_k, "No strings were provided"};
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
@@ -75,9 +75,9 @@ status_t serve(database_state<isolation_>& state, ustore_strings_remove_t const&
 }
 
 /** Implements @c ustore_strings_read, writing the key every string maps onto into the caller's arena. */
-template <isolation_t isolation_>
-status_t serve(database_state<isolation_>& state, ustore_strings_read_t const& arguments, strings_arg_t const& texts,
-               view_t const& view) noexcept {
+template <cpu_class_t cpu_class_, isolation_t isolation_>
+status_t serve(database_state<cpu_class_, isolation_>& state, ustore_strings_read_t const& arguments,
+               strings_arg_t const& texts, view_t const& view) noexcept {
     if (!arguments.count) return {};
     if (!texts) return {status_code_t::invalid_argument_k, "No strings were provided"};
     strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
@@ -103,9 +103,9 @@ status_t serve(database_state<isolation_>& state, ustore_strings_read_t const& a
 }
 
 /** Implements @c ustore_strings_scan as ordered walks of each collection's strings. */
-template <isolation_t isolation_>
-status_t serve(database_state<isolation_>& state, ustore_strings_scan_t const& arguments, strings_arg_t const& prefixes,
-               strings_arg_t const& starts, view_t const& view) noexcept {
+template <cpu_class_t cpu_class_, isolation_t isolation_>
+status_t serve(database_state<cpu_class_, isolation_>& state, ustore_strings_scan_t const& arguments,
+               strings_arg_t const& prefixes, strings_arg_t const& starts, view_t const& view) noexcept {
     if (!arguments.count) return {};
     if (!arguments.offsets || !arguments.strings)
         return {status_code_t::invalid_argument_k, "Need outputs for the offsets and the strings"};
@@ -142,5 +142,17 @@ status_t serve(database_state<isolation_>& state, ustore_strings_scan_t const& a
 }
 
 #pragma endregion Strings Calls
+
+#pragma region Table
+
+template <cpu_class_t cpu_class_, isolation_t isolation_>
+strings_verbs_t const ram_variant<cpu_class_, isolation_>::strings_verbs_k {
+    .write = &serve_database<cpu_class_, isolation_, ustore_strings_write_t, strings_arg_t>,
+    .remove = &serve_database<cpu_class_, isolation_, ustore_strings_remove_t, strings_arg_t>,
+    .read = &serve_database<cpu_class_, isolation_, ustore_strings_read_t, strings_arg_t>,
+    .scan = &serve_database<cpu_class_, isolation_, ustore_strings_scan_t, strings_arg_t, strings_arg_t>,
+};
+
+#pragma endregion Table
 
 } // namespace unum::ustore::ram

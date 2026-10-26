@@ -8,67 +8,83 @@
  *  mapped onto values for blobs, onto JSON text for documents and onto dense element trees for pages, strings mapped
  *  onto 16-byte keys for strings, and the half-edges of a graph. Documents and pages are edited in place, each edit
  *  reading, modifying and writing them back inside one transaction. No stored key carries its collection. The
- *  `_collections` system collection maps every collection's UUID onto its modality, its name and its store, and the
- *  `_names` system collection, a store of the strings kind, maps every name onto its collection's UUID. Every store
- *  is built into one commit order, so a transaction spanning any number of them publishes under one stamp and a
- *  snapshot reads all of them at it. Dropping a collection retires its store at the drop's stamp, and the store is
- *  freed once no reader holds an older one. A database with a directory persists as one binary image, rewritten whole
- *  on a flush and on close.
+ *  `_collections` system collection maps every collection's UUID onto its name and its store, whose kind says its
+ *  modality, and the `_names` system collection, a store of the strings kind, maps every name onto its collection's
+ *  UUID. Every store is built into one commit order, so a transaction spanning any number of them publishes under one
+ *  stamp and a snapshot reads all of them at it. Dropping a collection retires its store at the drop's stamp, and the
+ *  store is freed once no reader holds an older one. A database with a directory persists as one binary image,
+ *  rewritten whole on a flush and on close.
+ *
+ *  Every CPU class this build compiled has a variant per isolation level, its calls instantiated in
+ *  `src/ram/variants_<class>.cpp` with the class's atomic reference and waiter, which the partition locks own their
+ *  words through. An open walks the classes newest first and takes the first one the machine confirms, ending on the
+ *  serial floor, and every handle the variant hands out carries its table.
  */
 
-#include <atomic>      // `std::memory_order`
-#include <new>         // `std::nothrow`
 #include <string_view> // `std::string_view`
 
 #include "ustore/db.h"
 
-#include "engine.hpp" // `engine_t`, `handle_cast`, `c_handle`, `guarded_by`
-#include "lib.hpp"    // `route_init`
+#include "lib.hpp" // `route_init`, `cpu_class_t`, `rung_advances`, `forkunion_admits`
 
-#include "database.hpp" // `database_state`, `transaction_handle`, `snapshot_handle`, `resolve_modality`, `persist`
-#include "blobs.hpp"    // the `serve` overloads of the blobs calls
-#include "strings.hpp"  // the `serve` overloads of the strings calls
-#include "docs.hpp"     // the `serve` overloads of the documents calls
-#include "graph.hpp"    // the `serve` overloads of the graph calls
-#include "pages.hpp"    // the `serve` overloads of the pages calls
+#include "database.hpp" // `ram_variant`
 
 namespace unum::ustore::ram {
 
-#pragma region Dispatch
+#if USTORE_TARGET_INTEL_SIERRA
+extern template struct ram_variant<cpu_class_t::intel_sierra_k, isolation_t::snapshot_k>;
+extern template struct ram_variant<cpu_class_t::intel_sierra_k, isolation_t::strict_serializable_k>;
+#endif // USTORE_TARGET_INTEL_SIERRA
+#if USTORE_TARGET_INTEL_HASWELL
+extern template struct ram_variant<cpu_class_t::intel_haswell_k, isolation_t::snapshot_k>;
+extern template struct ram_variant<cpu_class_t::intel_haswell_k, isolation_t::strict_serializable_k>;
+#endif // USTORE_TARGET_INTEL_HASWELL
+#if USTORE_TARGET_AWS_G5
+extern template struct ram_variant<cpu_class_t::aws_g5_k, isolation_t::snapshot_k>;
+extern template struct ram_variant<cpu_class_t::aws_g5_k, isolation_t::strict_serializable_k>;
+#endif // USTORE_TARGET_AWS_G5
+#if USTORE_TARGET_APPLE_M2
+extern template struct ram_variant<cpu_class_t::apple_m2_k, isolation_t::snapshot_k>;
+extern template struct ram_variant<cpu_class_t::apple_m2_k, isolation_t::strict_serializable_k>;
+#endif // USTORE_TARGET_APPLE_M2
+#if USTORE_TARGET_AWS_G2
+extern template struct ram_variant<cpu_class_t::aws_g2_k, isolation_t::snapshot_k>;
+extern template struct ram_variant<cpu_class_t::aws_g2_k, isolation_t::strict_serializable_k>;
+#endif // USTORE_TARGET_AWS_G2
+extern template struct ram_variant<cpu_class_t::serial_k, isolation_t::snapshot_k>;
+extern template struct ram_variant<cpu_class_t::serial_k, isolation_t::strict_serializable_k>;
 
-/** Serves a call on the database @p arguments address, whose handle the table of @p isolation_ stamped, with the
- *  ragged inputs the router gathered for it. */
-template <isolation_t isolation_, typename arguments_type_, typename... strings_types_>
-status_t serve_database(arguments_type_ const& arguments, strings_types_ const&... strings,
-                        view_t const& view) noexcept {
-    return serve(*handle_cast<database_state<isolation_>>(database_of(arguments)), arguments, strings..., view);
+/** Opens a database of @p cpu_class_ at @p isolation into @p database: the class a rung takes, and the unconditional
+ *  serial floor every ladder ends on. */
+template <cpu_class_t cpu_class_>
+status_t open_admitted(ustore_database_t* database, ustore_isolation_t isolation, std::string_view directory) noexcept {
+    if (isolation == ustore_isolation_snapshot_k)
+        return ram_variant<cpu_class_, isolation_t::snapshot_k>::open(database, directory);
+    return ram_variant<cpu_class_, isolation_t::strict_serializable_k>::open(database, directory);
 }
 
-/** Allocates a database at @p isolation_ and loads the image of @p directory. */
-template <isolation_t isolation_>
-expected<ustore_database_t> make_database(std::string_view directory) noexcept {
-    auto* const database = new (std::nothrow) database_state<isolation_>();
-    if (!database) return status_t {status_code_t::out_of_memory_k, "Failed to allocate the database"};
-    if (status_t const status = open_database(*database, directory); status.failed()) {
-        delete database;
-        return status;
+/** One rung: taken when the machine confirms the class, else falls through; a class the build left out, or one
+ *  picking its parent's waiter and atomics, is skipped without instantiating its variant. */
+template <cpu_class_t cpu_class_, cpu_class_t next_class_, cpu_class_t... lower_classes_>
+status_t open_admitted(ustore_database_t* database, ustore_isolation_t isolation, std::string_view directory) noexcept {
+    if constexpr (rung_advances<cpu_class_>()) {
+        if (forkunion_admits<cpu_class_>()) return open_admitted<cpu_class_>(database, isolation, directory);
     }
-    return c_handle<ustore_database_t>(database);
+    else static_assert(!cpu_class_compiled(cpu_class_), "A compiled class no longer advances past the one below");
+    return open_admitted<next_class_, lower_classes_...>(database, isolation, directory);
 }
 
-/** Opens the database @p arguments describe into their output, which stays null unless the open succeeds, persisting
- *  in @p directory unless it is empty. */
+/** Opens the database @p arguments describe into their output, which stays null unless the open succeeds, with the
+ *  newest class the machine admits, each lineage newest first, persisting in @p directory unless it is empty. */
 template <typename arguments_type_>
 status_t open_in(arguments_type_ const& arguments, std::string_view directory) noexcept {
     if (!arguments.database) return {status_code_t::invalid_argument_k, "Need an output for the database"};
     if (arguments.isolation != ustore_isolation_strict_serializable_k &&
         arguments.isolation != ustore_isolation_snapshot_k)
         return {status_code_t::invalid_argument_k, "Unknown isolation"};
-    auto [database, status] = arguments.isolation == ustore_isolation_snapshot_k
-                                  ? make_database<isolation_t::snapshot_k>(directory)
-                                  : make_database<isolation_t::strict_serializable_k>(directory);
-    *arguments.database = database;
-    return status;
+    return open_admitted<cpu_class_t::intel_sierra_k, cpu_class_t::intel_haswell_k, cpu_class_t::aws_g5_k,
+                         cpu_class_t::apple_m2_k, cpu_class_t::aws_g2_k, cpu_class_t::serial_k>(
+        arguments.database, arguments.isolation, directory);
 }
 
 status_t init(ustore_database_init_ram_t const& arguments, view_t const&) noexcept { return open_in(arguments, {}); }
@@ -77,130 +93,6 @@ status_t open(ustore_database_open_ram_t const& arguments, view_t const&) noexce
     if (!arguments.directory.length) return {status_code_t::invalid_argument_k, "A database needs a directory"};
     return open_in(arguments, string_of(arguments.directory));
 }
-
-/** Frees @p transaction, releasing the stamp it claimed, and the stores only it still reached. */
-template <isolation_t isolation_>
-void transaction_free(ustore_transaction_t transaction) noexcept {
-    auto* const handle = handle_cast<transaction_handle<isolation_>>(transaction);
-    database_state<isolation_>& state = handle->state;
-    delete handle;
-    free_unreachable(state);
-}
-
-/** Gives back the count @p snapshot holds and frees it, releasing the stamp it claimed, and the stores only it still
- *  reached. */
-template <isolation_t isolation_>
-void snapshot_free(ustore_snapshot_t snapshot) noexcept {
-    auto* const handle = handle_cast<snapshot_handle<isolation_>>(snapshot);
-    database_state<isolation_>& state = handle->state;
-    ram_atomic_ref<std::size_t>(state.open_snapshots).fetch_sub(1, std::memory_order_release);
-    delete handle;
-    free_unreachable(state);
-}
-
-/** Persists @p database ahead of freeing it, which every snapshot and transaction of it must precede. */
-template <isolation_t isolation_>
-void database_free(ustore_database_t database) noexcept {
-    auto* const state = handle_cast<database_state<isolation_>>(database);
-    [[maybe_unused]] status_t const persisted = persist(*state);
-    delete state;
-}
-
-/** The database verbs of this engine at @p isolation_. */
-template <isolation_t isolation_>
-database_verbs_t const database_verbs_k {
-    .describe = &serve_database<isolation_, ustore_database_describe_t>,
-    .clear = &serve_database<isolation_, ustore_database_clear_t>,
-    .compact = &serve_database<isolation_, ustore_database_compact_t>,
-    .snapshot_init = &serve_database<isolation_, ustore_snapshot_init_t>,
-    .snapshot_save = &serve_database<isolation_, ustore_snapshot_save_t>,
-    .collection_list = &serve_database<isolation_, ustore_collection_list_t>,
-    .collection_create = &serve_database<isolation_, ustore_collection_create_t>,
-    .collection_find = &serve_database<isolation_, ustore_collection_find_t, strings_arg_t>,
-    .collection_drop = &serve_database<isolation_, ustore_collection_drop_t>,
-    .transaction_init = &serve_database<isolation_, ustore_transaction_init_t>,
-    .transaction_stage = &serve_database<isolation_, ustore_transaction_stage_t>,
-    .transaction_commit = &serve_database<isolation_, ustore_transaction_commit_t>,
-    .transaction_rollback = &serve_database<isolation_, ustore_transaction_rollback_t>,
-    .transaction_free = &transaction_free<isolation_>,
-    .snapshot_free = &snapshot_free<isolation_>,
-    .database_free = &database_free<isolation_>,
-};
-
-/** The verbs of this engine's blobs collections at @p isolation_. */
-template <isolation_t isolation_>
-blobs_verbs_t const blobs_verbs_k {
-    .write = &guarded_by<ustore_modality_blobs_k, &resolve_modality<isolation_>,
-                         &serve_database<isolation_, ustore_blobs_write_t, strings_arg_t>>,
-    .remove = &guarded_by<ustore_modality_blobs_k, &resolve_modality<isolation_>,
-                          &serve_database<isolation_, ustore_blobs_remove_t>>,
-    .read = &guarded_by<ustore_modality_blobs_k, &resolve_modality<isolation_>,
-                        &serve_database<isolation_, ustore_blobs_read_t>>,
-    .scan = &guarded_by<ustore_modality_blobs_k, &resolve_modality<isolation_>,
-                        &serve_database<isolation_, ustore_blobs_scan_t>>,
-    .sample = &guarded_by<ustore_modality_blobs_k, &resolve_modality<isolation_>,
-                          &serve_database<isolation_, ustore_blobs_sample_t>>,
-    .measure = &guarded_by<ustore_modality_blobs_k, &resolve_modality<isolation_>,
-                           &serve_database<isolation_, ustore_blobs_measure_t>>,
-};
-
-/** The verbs of this engine's strings collections at @p isolation_. */
-template <isolation_t isolation_>
-strings_verbs_t const strings_verbs_k {
-    .write = &serve_database<isolation_, ustore_strings_write_t, strings_arg_t>,
-    .remove = &serve_database<isolation_, ustore_strings_remove_t, strings_arg_t>,
-    .read = &serve_database<isolation_, ustore_strings_read_t, strings_arg_t>,
-    .scan = &serve_database<isolation_, ustore_strings_scan_t, strings_arg_t, strings_arg_t>,
-};
-
-/** The verbs of this engine's documents collections at @p isolation_. */
-template <isolation_t isolation_>
-docs_verbs_t const docs_verbs_k {
-    .write = &serve_database<isolation_, ustore_docs_write_t, strings_arg_t, strings_arg_t>,
-    .read = &serve_database<isolation_, ustore_docs_read_t, strings_arg_t>,
-    .gist = &serve_database<isolation_, ustore_docs_gist_t>,
-    .gather = &serve_database<isolation_, ustore_docs_gather_t, strings_arg_t>,
-    .remove = &serve_database<isolation_, ustore_docs_remove_t>,
-    .scan = &serve_database<isolation_, ustore_docs_scan_t>,
-    .sample = &serve_database<isolation_, ustore_docs_sample_t>,
-};
-
-/** The verbs of this engine's graph collections at @p isolation_. */
-template <isolation_t isolation_>
-graph_verbs_t const graph_verbs_k {
-    .read_edges = &serve_database<isolation_, ustore_graph_read_edges_t>,
-    .write_edges = &serve_database<isolation_, ustore_graph_write_edges_t>,
-    .remove_edges = &serve_database<isolation_, ustore_graph_remove_edges_t>,
-    .write_vertices = &serve_database<isolation_, ustore_graph_write_vertices_t>,
-    .remove_vertices = &serve_database<isolation_, ustore_graph_remove_vertices_t>,
-    .scan_vertices = &serve_database<isolation_, ustore_graph_scan_vertices_t>,
-};
-
-/** The verbs of this engine's pages collections at @p isolation_. */
-template <isolation_t isolation_>
-pages_verbs_t const pages_verbs_k {
-    .import = &serve_database<isolation_, ustore_pages_import_t, strings_arg_t>,
-    .insert = &serve_database<isolation_, ustore_pages_insert_t, strings_arg_t>,
-    .remove = &serve_database<isolation_, ustore_pages_remove_t>,
-    .move = &serve_database<isolation_, ustore_pages_move_t>,
-    .splice = &serve_database<isolation_, ustore_pages_splice_t, strings_arg_t>,
-    .set_attributes = &serve_database<isolation_, ustore_pages_set_attributes_t, strings_arg_t, strings_arg_t>,
-    .remove_attributes = &serve_database<isolation_, ustore_pages_remove_attributes_t, strings_arg_t>,
-    .read = &serve_database<isolation_, ustore_pages_read_t>,
-    .scan = &serve_database<isolation_, ustore_pages_scan_t>,
-};
-
-template <isolation_t isolation_>
-engine_t const engine_k {
-    .database = &database_verbs_k<isolation_>,
-    .blobs = &blobs_verbs_k<isolation_>,
-    .strings = &strings_verbs_k<isolation_>,
-    .docs = &docs_verbs_k<isolation_>,
-    .graph = &graph_verbs_k<isolation_>,
-    .pages = &pages_verbs_k<isolation_>,
-};
-
-#pragma endregion Dispatch
 
 } // namespace unum::ustore::ram
 
@@ -211,3 +103,5 @@ using namespace unum::ustore::ram;
 void ustore_database_init_ram(ustore_database_init_ram_t* arguments) { route_init(arguments, &init); }
 
 void ustore_database_open_ram(ustore_database_open_ram_t* arguments) { route_init(arguments, &open); }
+
+#pragma endregion C ABI

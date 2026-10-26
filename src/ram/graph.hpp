@@ -29,8 +29,8 @@ namespace unum::ustore::ram {
 #pragma region Graph Calls
 
 /** Implements @c ustore_graph_read_edges as walks of each vertex's half-edges in the roles it asks for. */
-template <isolation_t isolation_>
-status_t serve(database_state<isolation_>& state, ustore_graph_read_edges_t const& arguments,
+template <cpu_class_t cpu_class_, isolation_t isolation_>
+status_t serve(database_state<cpu_class_, isolation_>& state, ustore_graph_read_edges_t const& arguments,
                view_t const& view) noexcept {
     if (!arguments.count) return {};
     if (!arguments.vertices.data || !arguments.degrees_per_vertex)
@@ -77,8 +77,8 @@ status_t serve(database_state<isolation_>& state, ustore_graph_read_edges_t cons
 }
 
 /** Implements @c ustore_graph_write_edges, filing every edge under both of its ends. */
-template <isolation_t isolation_>
-status_t serve(database_state<isolation_>& state, ustore_graph_write_edges_t const& arguments,
+template <cpu_class_t cpu_class_, isolation_t isolation_>
+status_t serve(database_state<cpu_class_, isolation_>& state, ustore_graph_write_edges_t const& arguments,
                view_t const& view) noexcept {
     if (!arguments.count) return {};
     if (!arguments.sources.data || !arguments.targets.data)
@@ -94,8 +94,8 @@ status_t serve(database_state<isolation_>& state, ustore_graph_write_edges_t con
 }
 
 /** Implements @c ustore_graph_remove_edges, erasing every edge under both of its ends and keeping the vertices. */
-template <isolation_t isolation_>
-status_t serve(database_state<isolation_>& state, ustore_graph_remove_edges_t const& arguments,
+template <cpu_class_t cpu_class_, isolation_t isolation_>
+status_t serve(database_state<cpu_class_, isolation_>& state, ustore_graph_remove_edges_t const& arguments,
                view_t const& view) noexcept {
     if (!arguments.count) return {};
     if (!arguments.sources.data || !arguments.targets.data)
@@ -111,8 +111,8 @@ status_t serve(database_state<isolation_>& state, ustore_graph_remove_edges_t co
 }
 
 /** Implements @c ustore_graph_write_vertices, adding every vertex that is not one already. */
-template <isolation_t isolation_>
-status_t serve(database_state<isolation_>& state, ustore_graph_write_vertices_t const& arguments,
+template <cpu_class_t cpu_class_, isolation_t isolation_>
+status_t serve(database_state<cpu_class_, isolation_>& state, ustore_graph_write_vertices_t const& arguments,
                view_t const& view) noexcept {
     if (!arguments.count) return {};
     if (!arguments.vertices.data) return {status_code_t::invalid_argument_k, "No vertices were provided"};
@@ -132,8 +132,8 @@ status_t serve(database_state<isolation_>& state, ustore_graph_write_vertices_t 
 
 /** Implements @c ustore_graph_remove_vertices, erasing the edges every neighbor files of each vertex in its role,
  *  then every entry of the vertex. */
-template <isolation_t isolation_>
-status_t serve(database_state<isolation_>& state, ustore_graph_remove_vertices_t const& arguments,
+template <cpu_class_t cpu_class_, isolation_t isolation_>
+status_t serve(database_state<cpu_class_, isolation_>& state, ustore_graph_remove_vertices_t const& arguments,
                view_t const& view) noexcept {
     if (!arguments.count) return {};
     if (!arguments.vertices.data) return {status_code_t::invalid_argument_k, "No vertices were provided"};
@@ -156,12 +156,26 @@ status_t serve(database_state<isolation_>& state, ustore_graph_remove_vertices_t
 }
 
 /** Implements @c ustore_graph_scan_vertices as ordered walks of each graph's vertex entries. */
-template <isolation_t isolation_>
-status_t serve(database_state<isolation_>& state, ustore_graph_scan_vertices_t const& arguments,
+template <cpu_class_t cpu_class_, isolation_t isolation_>
+status_t serve(database_state<cpu_class_, isolation_>& state, ustore_graph_scan_vertices_t const& arguments,
                view_t const& view) noexcept {
     return scan_keys<half_edge_t>(state, arguments, view);
 }
 
 #pragma endregion Graph Calls
+
+#pragma region Table
+
+template <cpu_class_t cpu_class_, isolation_t isolation_>
+graph_verbs_t const ram_variant<cpu_class_, isolation_>::graph_verbs_k {
+    .read_edges = &serve_database<cpu_class_, isolation_, ustore_graph_read_edges_t>,
+    .write_edges = &serve_database<cpu_class_, isolation_, ustore_graph_write_edges_t>,
+    .remove_edges = &serve_database<cpu_class_, isolation_, ustore_graph_remove_edges_t>,
+    .write_vertices = &serve_database<cpu_class_, isolation_, ustore_graph_write_vertices_t>,
+    .remove_vertices = &serve_database<cpu_class_, isolation_, ustore_graph_remove_vertices_t>,
+    .scan_vertices = &serve_database<cpu_class_, isolation_, ustore_graph_scan_vertices_t>,
+};
+
+#pragma endregion Table
 
 } // namespace unum::ustore::ram
